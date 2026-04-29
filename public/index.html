@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Onlinod Console</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">O</div>
+        <div>
+          <strong>Onlinod</strong>
+          <span>backend console</span>
+        </div>
+      </div>
+
+      <button class="nav active" data-panel="auth">Auth</button>
+      <button class="nav" data-panel="workspace">Workspace</button>
+      <button class="nav" data-panel="creators">Creators</button>
+      <button class="nav" data-panel="debug">Debug</button>
+
+      <div class="status-card">
+        <span class="dot" id="apiDot"></span>
+        <div>
+          <strong id="apiStatus">checking</strong>
+          <small id="apiUrl"></small>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1>Onlinod Web Console</h1>
+          <p>Registration, login, creator accounts and API debug surface.</p>
+        </div>
+        <div class="session-pill" id="sessionPill">not logged in</div>
+      </header>
+
+      <section class="panel active" id="panel-auth">
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head">
+              <h2>Register</h2>
+              <span>owner + agency</span>
+            </div>
+
+            <label>Email</label>
+            <input id="regEmail" placeholder="owner@onlinod.dev">
+
+            <label>Password</label>
+            <input id="regPassword" type="password" value="12345678">
+
+            <label>Name</label>
+            <input id="regName" value="Owner">
+
+            <label>Agency</label>
+            <input id="regAgency" value="Onlinod Agency">
+
+            <button class="primary" id="btnRegister">Create account</button>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>Login</h2>
+              <span>verified users only</span>
+            </div>
+
+            <label>Email</label>
+            <input id="loginEmail" placeholder="owner@onlinod.dev">
+
+            <label>Password</label>
+            <input id="loginPassword" type="password" value="12345678">
+
+            <button class="primary" id="btnLogin">Login</button>
+            <button id="btnLogout">Logout</button>
+            <button id="btnRefreshToken">Refresh access token</button>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>Verify email</h2>
+              <span>dev mode uses JSON code</span>
+            </div>
+
+            <label>Email</label>
+            <input id="verifyEmail" placeholder="owner@onlinod.dev">
+
+            <label>Verification code</label>
+            <input id="verifyCode" placeholder="6-digit code">
+
+            <button class="primary" id="btnVerifyCode">Verify by code</button>
+            <button id="btnResendVerify">Resend verification</button>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>Password reset</h2>
+              <span>forgot / reset</span>
+            </div>
+
+            <label>Email</label>
+            <input id="forgotEmail" placeholder="owner@onlinod.dev">
+
+            <button id="btnForgot">Send reset link</button>
+
+            <label>Reset token</label>
+            <input id="resetToken" placeholder="token from debug JSON">
+
+            <label>New password</label>
+            <input id="resetPassword" type="password" value="12345678">
+
+            <button class="primary" id="btnReset">Reset password</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-workspace">
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head">
+              <h2>Current session</h2>
+              <span>/api/auth/me</span>
+            </div>
+            <button class="primary" id="btnMe">Load me</button>
+            <button id="btnHealth">Health check</button>
+            <div class="kv">
+              <span>User</span><b id="meUser">—</b>
+              <span>Agency</span><b id="meAgency">—</b>
+              <span>Role</span><b id="meRole">—</b>
+              <span>Email verified</span><b id="meVerified">—</b>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>Electron next</h2>
+              <span>integration target</span>
+            </div>
+            <div class="note">
+              Electron will call the same endpoints:
+              login → me → creators list → sync HQ state.
+            </div>
+            <pre class="mini">POST /api/auth/login
+GET  /api/auth/me
+GET  /api/creators
+POST /api/creators</pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-creators">
+        <div class="grid two">
+          <div class="card">
+            <div class="card-head">
+              <h2>Add model account</h2>
+              <span>creator CRM record</span>
+            </div>
+
+            <label>Display name</label>
+            <input id="creatorName" placeholder="Mira">
+
+            <label>Username</label>
+            <input id="creatorUsername" placeholder="myro_slava">
+
+            <label>Status</label>
+            <select id="creatorStatus">
+              <option value="draft">draft</option>
+              <option value="ready">ready</option>
+              <option value="not_creator">not_creator</option>
+              <option value="auth_failed">auth_failed</option>
+              <option value="disabled">disabled</option>
+            </select>
+
+            <label>Partition</label>
+            <input id="creatorPartition" placeholder="persist:acct_xxx">
+
+            <button class="primary" id="btnAddCreator">Add creator</button>
+            <button id="btnLoadCreators">Refresh list</button>
+          </div>
+
+          <div class="card table-card">
+            <div class="card-head">
+              <h2>Creators</h2>
+              <span id="creatorCount">0 records</span>
+            </div>
+            <div class="table" id="creatorsTable"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-debug">
+        <div class="card">
+          <div class="card-head">
+            <h2>Debug output</h2>
+            <span>last API response</span>
+          </div>
+          <div class="debug-actions">
+            <button id="btnCopyDebug">Copy JSON</button>
+            <button id="btnClearDebug">Clear</button>
+          </div>
+          <pre id="debugBox">{}</pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
