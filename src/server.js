@@ -6,6 +6,7 @@ const path = require("node:path");
 
 const authRoutes = require("./routes/auth");
 const creatorRoutes = require("./routes/creators");
+const creatorImportRoutes = require("./routes/creator-import");
 const creatorConnectRoutes = require("./routes/creator-connect");
 const accessSnapshotRoutes = require("./routes/access-snapshots");
 
@@ -29,7 +30,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     status: "healthy",
     service: "onlinod-backend",
-    version: "0.6.1",
+    version: "0.6.2",
     time: new Date().toISOString(),
   });
 });
@@ -38,12 +39,13 @@ app.get("/api", (_req, res) => {
   res.json({
     ok: true,
     service: "onlinod-backend",
-    version: "0.6.1",
+    version: "0.6.2",
   });
 });
 
 app.use("/api/auth", authRoutes);
 app.use("/api/creators", creatorRoutes);
+app.use("/api/creators", creatorImportRoutes);
 app.use("/api/creator-connect", creatorConnectRoutes);
 app.use("/api", accessSnapshotRoutes);
 
