@@ -107,9 +107,7 @@ async function importCreatorsIntoAgency({ agencyId, userId, creators, includeSna
             avatarUrl: item.avatarUrl || existing.avatarUrl,
             partition: item.partition || existing.partition,
             status: item.status || existing.status,
-            unreadCount: item.unreadCount,
-            subscribersCount: item.subscribersCount,
-          },
+},
         });
 
         const snapshotRecord =
@@ -147,9 +145,7 @@ async function importCreatorsIntoAgency({ agencyId, userId, creators, includeSna
           avatarUrl: item.avatarUrl,
           partition: item.partition,
           status: item.status,
-          unreadCount: item.unreadCount,
-          subscribersCount: item.subscribersCount,
-        },
+},
       });
 
       const snapshotRecord =
@@ -292,6 +288,9 @@ function normalizeCreator(input) {
     headerUrl: toNullableString(input.header),
     partition: toNullableString(input.partition),
     status: normalizeStatus(input.status, hasSnapshotCookies),
+    // Metrics are intentionally not written into CreatorAccount here.
+    // Current Prisma schema stores identity/access on CreatorAccount;
+    // runtime metrics can be stored separately later.
     unreadCount: toNumber(input.chatMessagesCount),
     subscribersCount: toNumber(input.subscribersCount),
     snapshot,
