@@ -355,6 +355,32 @@
   }
 
 
+
+  async function copyMigrationUrlForElectron(url) {
+    const text = String(url || "").trim();
+    if (!text) return false;
+
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (_) {
+      try {
+        const area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "readonly");
+        area.style.position = "fixed";
+        area.style.left = "-9999px";
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand("copy");
+        area.remove();
+        return true;
+      } catch (_) {
+        return false;
+      }
+    }
+  }
+
   async function pollAutoMigrationStatus(token) {
     const statusEl = document.getElementById("migrationStatusText");
     if (!token) return;
@@ -438,11 +464,26 @@
       }, null, 2);
     }
 
+    const copied = await copyMigrationUrlForElectron(start.migrateUrl);
+
+    if (status) {
+      status.textContent = JSON.stringify({
+        status: "opening Electron",
+        migrateUrl: start.migrateUrl,
+        clipboardFallback: copied,
+        expiresAt: start.expiresAt,
+      }, null, 2);
+    }
+
     try {
       window.location.href = start.migrateUrl;
     } catch (_) {}
 
-    window.OnlinodRouter.toast("Opening Electron for migration…");
+    window.OnlinodRouter.toast(
+      copied
+        ? "Opening Electron for migration… fallback copied"
+        : "Opening Electron for migration…"
+    );
 
     pollAutoMigrationStatus(start.token).catch((err) => {
       if (status) {
