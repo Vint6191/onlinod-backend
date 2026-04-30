@@ -34,6 +34,7 @@ model User {
   name            String?
   avatarUrl       String?
   emailVerifiedAt DateTime?
+  isSuperAdmin   Boolean   @default(false)
   lastLoginAt     DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
@@ -51,7 +52,10 @@ model User {
 model Agency {
   id        String   @id @default(cuid())
   name      String
-  plan      String   @default("dev")
+  plan      String   @default("trial")
+  status    String   @default("TRIAL")
+  trialEndsAt DateTime?
+  currentPeriodEnd DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -61,6 +65,9 @@ model Agency {
   accessSnapshots AccessSnapshot[]
   workerDevices WorkerDevice[]
   auditLogs AuditLog[]
+  subscriptions AgencySubscription[]
+  creatorBillingProfiles CreatorBillingProfile[]
+  adminActionLogs AdminActionLog[]
 }
 
 model AgencyMember {
@@ -99,6 +106,7 @@ model CreatorAccount {
 
   @@index([agencyId])
   @@index([status])
+  billingProfile CreatorBillingProfile?
 }
 
 model AuthToken {
@@ -244,6 +252,150 @@ model AuditLog {
 
   @@index([agencyId])
   @@index([actorUserId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  GRACE
+  CANCELLED
+  LOCKED
+}
+
+enum BillingMode {
+  MANUAL
+  STRIPE
+  CRYPTO
+  FREE_INTERNAL
+}
+
+enum CreatorBillingTier {
+  STARTER
+  GROWTH
+  PRO
+  ELITE
+  CUSTOM
+}
+
+enum BillingPeriod {
+  MONTHLY
+  THREE_MONTHS
+  SIX_MONTHS
+}
+
+
+model AdminUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  role         String   @default("SUPER_ADMIN")
+  active       Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions AdminSession[]
+
+  @@index([email])
+  @@index([active])
+}
+
+model AdminSession {
+  id           String   @id @default(cuid())
+  adminUserId  String
+  tokenHash    String   @unique
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  ip           String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  @@index([adminUserId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+model AgencySubscription {
+  id        String @id @default(cuid())
+  agencyId String
+
+  status    SubscriptionStatus @default(TRIAL)
+  billingMode BillingMode @default(MANUAL)
+  billingPeriod BillingPeriod @default(MONTHLY)
+
+  corePricePerCreatorCents Int @default(2000)
+  trialEndsAt DateTime?
+  graceUntil DateTime?
+  currentPeriodStart DateTime?
+  currentPeriodEnd DateTime?
+
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([status])
+  @@index([currentPeriodEnd])
+}
+
+model CreatorBillingProfile {
+  id        String @id @default(cuid())
+  agencyId  String
+  creatorId String @unique
+
+  tier CreatorBillingTier @default(STARTER)
+  tierMode String @default("MANUAL")
+  corePriceCents Int @default(2000)
+
+  revenue30dCents Int @default(0)
+
+  aiChatterEnabled Boolean @default(false)
+  aiChatterPriceCents Int @default(10000)
+
+  outreachEnabled Boolean @default(false)
+  outreachPriceCents Int @default(2900)
+
+  billingExcluded Boolean @default(false)
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([tier])
+  @@index([billingExcluded])
+}
+
+model AdminActionLog {
+  id          String   @id @default(cuid())
+  adminUserId String
+  agencyId    String?
+  action      String
+  targetType  String?
+  targetId    String?
+  before      Json?
+  after       Json?
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  agency Agency? @relation(fields: [agencyId], references: [id], onDelete: SetNull)
+
+  @@index([adminUserId])
+  @@index([agencyId])
   @@index([action])
   @@index([targetType, targetId])
   @@index([createdAt])
