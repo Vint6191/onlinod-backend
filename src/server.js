@@ -6,9 +6,10 @@ const path = require("node:path");
 
 const authRoutes = require("./routes/auth");
 const creatorRoutes = require("./routes/creators");
-const creatorImportRoutes = require("./routes/creator-import");
 const creatorConnectRoutes = require("./routes/creator-connect");
 const accessSnapshotRoutes = require("./routes/access-snapshots");
+const adminRoutes = require("./routes/admin");
+const adminAuthRoutes = require("./routes/admin-auth");
 
 const app = express();
 
@@ -30,7 +31,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     status: "healthy",
     service: "onlinod-backend",
-    version: "0.6.2",
+    version: "0.7.1",
     time: new Date().toISOString(),
   });
 });
@@ -39,18 +40,13 @@ app.get("/api", (_req, res) => {
   res.json({
     ok: true,
     service: "onlinod-backend",
-    version: "0.6.2",
+    version: "0.7.1",
   });
 });
 
 app.use("/api/auth", authRoutes);
-// DEV-only migration namespace. Kept away from /api/creators/* so creator auth middleware cannot intercept token-based migration complete.
-app.use("/api/dev-migration", creatorImportRoutes);
-// DEV migration routes must be registered before general creator routes.
-// General creator routes attach auth middleware broadly and can otherwise
- // reject /api/creators/import-local/complete-auto before it reaches
- // token-based migration auth.
-app.use("/api/creators", creatorImportRoutes);
+app.use("/api/admin-auth", adminAuthRoutes);
+app.use("/api/admin", adminRoutes);
 app.use("/api/creators", creatorRoutes);
 app.use("/api/creator-connect", creatorConnectRoutes);
 app.use("/api", accessSnapshotRoutes);
