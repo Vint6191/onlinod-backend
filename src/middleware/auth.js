@@ -1,0 +1,68 @@
+const prisma = require("../prisma");
+const { verifyAccessToken } = require("../utils/tokens");
+
+async function authRequired(req, res, next) {
+  try {
+    const header = req.headers.authorization || "";
+    const match = header.match(/^Bearer\s+(.+)$/i);
+
+    if (!match) {
+      return res.status(401).json({
+        ok: false,
+        code: "AUTH_REQUIRED",
+        error: "Authorization token is required",
+      });
+    }
+
+    const token = match[1];
+    const decoded = verifyAccessToken(token);
+
+    const membership = await prisma.agencyMember.findFirst({
+      where: {
+        userId: decoded.userId,
+        agencyId: decoded.agencyId,
+      },
+      include: {
+        user: true,
+        agency: true,
+      },
+    });
+
+    if (!membership) {
+      return res.status(401).json({
+        ok: false,
+        code: "SESSION_INVALID",
+        error: "Session is invalid",
+      });
+    }
+
+    if (!membership.user.emailVerifiedAt) {
+      return res.status(403).json({
+        ok: false,
+        code: "EMAIL_NOT_VERIFIED",
+        error: "Email is not verified",
+      });
+    }
+
+    req.auth = {
+      userId: membership.userId,
+      agencyId: membership.agencyId,
+      role: membership.role,
+      permissions: membership.permissions || {},
+      user: membership.user,
+      agency: membership.agency,
+    };
+
+    return next();
+  } catch (err) {
+    return res.status(401).json({
+      ok: false,
+      code: "AUTH_INVALID",
+      error: "Invalid or expired access token",
+    });
+  }
+}
+
+module.exports = {
+  authRequired,
+};

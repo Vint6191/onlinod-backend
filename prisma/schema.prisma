@@ -1,0 +1,250 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  MANAGER
+  OPERATOR
+}
+
+enum CreatorStatus {
+  DRAFT
+  READY
+  NOT_CREATOR
+  AUTH_FAILED
+  DISABLED
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  passwordHash    String
+  name            String?
+  avatarUrl       String?
+  emailVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  memberships     AgencyMember[]
+  authTokens      AuthToken[]
+  refreshSessions RefreshSession[]
+  createdConnectSessions CreatorConnectSession[] @relation("ConnectSessionCreator")
+  claimedConnectSessions CreatorConnectSession[] @relation("ConnectSessionClaimer")
+  accessSnapshots AccessSnapshot[] @relation("SnapshotCreator")
+  workerDevices WorkerDevice[]
+  auditLogs AuditLog[]
+}
+
+model Agency {
+  id        String   @id @default(cuid())
+  name      String
+  plan      String   @default("dev")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members  AgencyMember[]
+  creators CreatorAccount[]
+  connectSessions CreatorConnectSession[]
+  accessSnapshots AccessSnapshot[]
+  workerDevices WorkerDevice[]
+  auditLogs AuditLog[]
+}
+
+model AgencyMember {
+  id          String   @id @default(cuid())
+  agencyId    String
+  userId      String
+  role        UserRole @default(OWNER)
+  permissions Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, userId])
+  @@index([agencyId])
+  @@index([userId])
+}
+
+model CreatorAccount {
+  id          String        @id @default(cuid())
+  agencyId    String
+  displayName String
+  username    String?
+  avatarUrl   String?
+  remoteId    String?
+  partition   String?
+  status      CreatorStatus @default(DRAFT)
+  notes       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  connectSessions CreatorConnectSession[]
+  accessSnapshots AccessSnapshot[]
+
+  @@index([agencyId])
+  @@index([status])
+}
+
+model AuthToken {
+  id        String        @id @default(cuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String        @unique
+  codeHash  String?
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([type])
+  @@index([expiresAt])
+}
+
+model RefreshSession {
+  id         String    @id @default(cuid())
+  userId     String
+  agencyId   String
+  tokenHash  String    @unique
+  userAgent  String?
+  ipAddress  String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([agencyId])
+  @@index([expiresAt])
+}
+
+
+enum ConnectSessionStatus {
+  PENDING
+  CLAIMED
+  COMPLETED
+  EXPIRED
+  CANCELLED
+}
+
+enum AccessSnapshotType {
+  OF_ACCESS
+}
+
+
+model CreatorConnectSession {
+  id                String               @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  createdByUserId   String
+  claimedByUserId   String?
+  claimedByDeviceId String?
+  tokenHash         String               @unique
+  status            ConnectSessionStatus @default(PENDING)
+  connectUrl        String?
+  expiresAt         DateTime
+  createdAt         DateTime             @default(now())
+  claimedAt         DateTime?
+  completedAt       DateTime?
+  cancelledAt       DateTime?
+
+  agency        Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator       CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  createdByUser User           @relation("ConnectSessionCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  claimedByUser User?          @relation("ConnectSessionClaimer", fields: [claimedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId])
+  @@index([creatorId])
+  @@index([createdByUserId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+model AccessSnapshot {
+  id              String             @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  createdByUserId String
+  deviceId        String?
+  type            AccessSnapshotType @default(OF_ACCESS)
+  payloadVersion  Int                @default(1)
+  encryptedPayload String
+  iv              String
+  tag             String
+  algorithm       String             @default("aes-256-gcm")
+  userAgentHash   String?
+  remoteId        String?
+  username        String?
+  active          Boolean            @default(true)
+  expiresAt       DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime           @default(now())
+
+  agency        Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator       CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  createdByUser User           @relation("SnapshotCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([creatorId])
+  @@index([createdByUserId])
+  @@index([active])
+  @@index([createdAt])
+}
+
+model WorkerDevice {
+  id         String   @id @default(cuid())
+  agencyId   String
+  userId     String
+  deviceName String?
+  platform   String?
+  appVersion String?
+  lastSeenAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([userId])
+  @@index([lastSeenAt])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  agencyId    String
+  actorUserId String?
+  action      String
+  targetType  String?
+  targetId    String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId])
+  @@index([actorUserId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
