@@ -393,7 +393,7 @@
 
       try {
         status = await window.OnlinodApi.request(
-          `/api/creators/import-local/status-auto?token=${encodeURIComponent(token)}`
+          `/api/dev-migration/import-local/status-auto?token=${encodeURIComponent(token)}`
         );
       } catch (err) {
         status = {
@@ -448,7 +448,7 @@
     const status = document.getElementById("migrationStatusText");
     if (status) status.textContent = "starting migration session…";
 
-    const start = await window.OnlinodApi.request("/api/creators/import-local/start-auto", {
+    const start = await window.OnlinodApi.request("/api/dev-migration/import-local/start-auto", {
       method: "POST",
       body: {},
     });
