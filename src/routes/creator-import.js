@@ -22,12 +22,16 @@ function createDevMigrationToken({ agencyId, userId }) {
     userId,
     expiresAt,
     createdAt: Date.now(),
+    status: "PENDING",
+    result: null,
+    error: null,
+    completedAt: null,
   });
 
   return { token, expiresAt };
 }
 
-function consumeDevMigrationToken(token) {
+function getDevMigrationSession(token) {
   const clean = String(token || "").trim();
   if (!clean) return null;
 
@@ -35,13 +39,48 @@ function consumeDevMigrationToken(token) {
   if (!session) return null;
 
   if (session.expiresAt < Date.now()) {
-    devMigrationSessions.delete(clean);
+    session.status = session.status === "COMPLETED" ? session.status : "EXPIRED";
+    session.error = session.error || "Migration token expired";
+    return session;
+  }
+
+  return session;
+}
+
+function consumeDevMigrationToken(token) {
+  const session = getDevMigrationSession(token);
+  if (!session) return null;
+
+  if (session.status === "EXPIRED" || session.status === "COMPLETED") {
     return null;
   }
 
-  // One-time token.
-  devMigrationSessions.delete(clean);
+  session.status = "RUNNING";
+  session.startedAt = Date.now();
   return session;
+}
+
+function finishDevMigrationToken(token, result) {
+  const session = devMigrationSessions.get(String(token || "").trim());
+  if (!session) return;
+
+  session.status = result?.ok ? "COMPLETED" : "FAILED";
+  session.result = result || null;
+  session.error = result?.ok ? null : result?.error || "Migration failed";
+  session.completedAt = Date.now();
+}
+
+function failDevMigrationToken(token, err) {
+  const session = devMigrationSessions.get(String(token || "").trim());
+  if (!session) return;
+
+  session.status = "FAILED";
+  session.error = String(err?.message || err || "Migration failed");
+  session.result = {
+    ok: false,
+    error: session.error,
+  };
+  session.completedAt = Date.now();
 }
 
 async function importCreatorsIntoAgency({ agencyId, userId, creators, includeSnapshots = true }) {
@@ -367,6 +406,10 @@ router.post("/import-local", authRequired, async (req, res) => {
 
     return res.json(result);
   } catch (err) {
+    try {
+      failDevMigrationToken(req.body?.token, err);
+    } catch (_) {}
+
     if (err?.issues) {
       return res.status(400).json({
         ok: false,
@@ -409,6 +452,48 @@ router.post("/import-local/start-auto", authRequired, async (req, res) => {
   }
 });
 
+
+router.get("/import-local/status-auto", authRequired, async (req, res) => {
+  try {
+    const token = String(req.query?.token || "").trim();
+    const session = getDevMigrationSession(token);
+
+    if (!session) {
+      return res.status(404).json({
+        ok: false,
+        code: "MIGRATION_SESSION_NOT_FOUND",
+        error: "Migration session not found",
+      });
+    }
+
+    if (session.agencyId !== req.auth.agencyId || session.userId !== req.auth.userId) {
+      return res.status(403).json({
+        ok: false,
+        code: "FORBIDDEN",
+        error: "Migration session belongs to another user/workspace",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      status: session.status,
+      expiresAt: session.expiresAt,
+      createdAt: session.createdAt,
+      startedAt: session.startedAt || null,
+      completedAt: session.completedAt || null,
+      result: session.result || null,
+      error: session.error || null,
+    });
+  } catch (err) {
+    console.error("[creators/import-local/status-auto] failed:", err);
+    return res.status(500).json({
+      ok: false,
+      code: "MIGRATION_STATUS_FAILED",
+      error: err?.message || "Failed to read migration status",
+    });
+  }
+});
+
 router.post("/import-local/complete-auto", async (req, res) => {
   try {
     const token = String(req.body?.token || "").trim();
@@ -434,10 +519,14 @@ router.post("/import-local/complete-auto", async (req, res) => {
       includeSnapshots: input.includeSnapshots !== false,
     });
 
-    return res.json({
+    const response = {
       ...result,
       mode: "auto_dev_migration",
-    });
+    };
+
+    finishDevMigrationToken(token, response);
+
+    return res.json(response);
   } catch (err) {
     if (err?.issues) {
       return res.status(400).json({
