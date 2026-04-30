@@ -44,8 +44,14 @@ app.get("/api", (_req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
-app.use("/api/creators", creatorRoutes);
+// DEV-only migration namespace. Kept away from /api/creators/* so creator auth middleware cannot intercept token-based migration complete.
+app.use("/api/dev-migration", creatorImportRoutes);
+// DEV migration routes must be registered before general creator routes.
+// General creator routes attach auth middleware broadly and can otherwise
+ // reject /api/creators/import-local/complete-auto before it reaches
+ // token-based migration auth.
 app.use("/api/creators", creatorImportRoutes);
+app.use("/api/creators", creatorRoutes);
 app.use("/api/creator-connect", creatorConnectRoutes);
 app.use("/api", accessSnapshotRoutes);
 
