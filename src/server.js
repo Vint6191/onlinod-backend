@@ -74,4 +74,6 @@ app.use((err, _req, res, _next) => {
 
 const port = Number(process.env.PORT || 10000);
 
+app.listen(port, () => {
+  console.log(`Onlinod backend running on port ${port}`);
 });
