@@ -354,6 +354,60 @@
     modal.setAttribute("aria-hidden", "true");
   }
 
+
+  async function pollAutoMigrationStatus(token) {
+    const statusEl = document.getElementById("migrationStatusText");
+    if (!token) return;
+
+    const started = Date.now();
+    const timeoutMs = 120000;
+
+    while (Date.now() - started < timeoutMs) {
+      let status;
+
+      try {
+        status = await window.OnlinodApi.request(
+          `/api/creators/import-local/status-auto?token=${encodeURIComponent(token)}`
+        );
+      } catch (err) {
+        status = {
+          ok: false,
+          error: err?.message || String(err),
+        };
+      }
+
+      if (statusEl) {
+        statusEl.textContent = JSON.stringify(status, null, 2);
+      }
+
+      if (status?.ok && status.status === "COMPLETED") {
+        await loadCreators();
+        closeImportCreatorsModal();
+        render(document.getElementById("app"));
+        renderRoute("creatorAnalytics");
+
+        const r = status.result || {};
+        window.OnlinodRouter.toast(
+          `Migration done: creators ${r.imported || 0}, snapshots ${r.snapshotsImported || 0}`
+        );
+        return;
+      }
+
+      if (status?.ok && (status.status === "FAILED" || status.status === "EXPIRED")) {
+        window.OnlinodRouter.toast(status.error || `Migration ${status.status.toLowerCase()}`);
+        return;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+
+    if (statusEl) {
+      statusEl.textContent = "Migration timeout. Electron opened, but backend did not receive completed migration.";
+    }
+
+    window.OnlinodRouter.toast("Migration timeout");
+  }
+
   async function importCreatorsFromJson() {
     if (!isDevToolsEnabled()) {
       window.OnlinodRouter.toast("Dev import is disabled");
@@ -389,6 +443,15 @@
     } catch (_) {}
 
     window.OnlinodRouter.toast("Opening Electron for migration…");
+
+    pollAutoMigrationStatus(start.token).catch((err) => {
+      if (status) {
+        status.textContent = JSON.stringify({
+          ok: false,
+          error: err?.message || String(err),
+        }, null, 2);
+      }
+    });
   }
 
   async function addCreatorFromModal() {
