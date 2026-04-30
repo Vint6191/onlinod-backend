@@ -403,7 +403,12 @@
       }
 
       if (statusEl) {
-        statusEl.textContent = JSON.stringify(status, null, 2);
+        const current = window.OnlinodState.currentLocalMigration || {};
+        statusEl.textContent = JSON.stringify({
+          migrateUrl: current.migrateUrl || null,
+          clipboardFallback: current.clipboardFallback === true,
+          backendStatus: status,
+        }, null, 2);
       }
 
       if (status?.ok && status.status === "COMPLETED") {
@@ -465,6 +470,7 @@
     }
 
     const copied = await copyMigrationUrlForElectron(start.migrateUrl);
+    window.OnlinodState.currentLocalMigration.clipboardFallback = copied;
 
     if (status) {
       status.textContent = JSON.stringify({
