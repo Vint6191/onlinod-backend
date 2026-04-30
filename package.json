@@ -1,7 +1,7 @@
 {
   "name": "onlinod-backend",
-  "version": "0.6.1",
-  "description": "Onlinod backend API + public creator connect token flow",
+  "version": "0.7.1",
+  "description": "Onlinod backend API + internal admin with dedicated admin login",
   "main": "src/server.js",
   "scripts": {
     "dev": "node src/server.js",
