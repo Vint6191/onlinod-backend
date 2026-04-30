@@ -99,6 +99,25 @@
     return creators;
   }
 
+  function isDevToolsEnabled() {
+    try {
+      const params = new URLSearchParams(window.location.search || "");
+      if (params.get("dev") === "1") return true;
+      if (localStorage.getItem("ONLINOD_DEV_TOOLS") === "1") return true;
+    } catch (_) {}
+
+    return false;
+  }
+
+  function enableDevOnlyControls(root) {
+    if (!isDevToolsEnabled()) return;
+
+    root.querySelectorAll("[data-dev-only], #btnOpenImportCreators").forEach((el) => {
+      el.style.display = "";
+      el.hidden = false;
+    });
+  }
+
   function shell(inner) {
     const state = window.OnlinodState;
     const userInitial = String(state.user?.email || "AT").slice(0, 2).toUpperCase();
@@ -130,6 +149,7 @@
             </div>
 
             <div class="on-search">⌕ jump to… <span style="margin-left:auto">⌘K</span></div>
+            <button class="on-btn" id="btnOpenImportCreators" style="height:32px;margin:0;display:none;">dev migrate</button>
             <button class="on-btn" id="btnToggleDebug" style="height:32px;margin:0;">debug</button>
             <div class="on-user-chip">${window.OnlinodRouter.escapeHtml(userInitial)}</div>
           </header>
@@ -204,6 +224,29 @@
             <div class="on-btn-row">
               <button class="on-btn primary" id="btnModalAddCreator">Start Connect</button>
               <button class="on-btn" id="btnCancelAddCreator">Cancel</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="on-modal-backdrop" id="importCreatorsModal" data-dev-only aria-hidden="true">
+          <div class="on-modal">
+            <div class="on-modal-head">
+              <div>
+                <strong>DEV migration: local creators + snapshots</strong>
+                <span>Temporary internal tool. Electron uploads local snapshots directly.</span>
+              </div>
+              <button id="btnCloseImportCreators">×</button>
+            </div>
+
+            <div class="on-connect-status active">
+              <strong>Automatic dev migration</strong>
+              <span>No JSON. No DevTools. This opens Electron and Electron uploads local snapshots directly to backend.</span>
+              <pre id="migrationStatusText">idle</pre>
+            </div>
+
+            <div class="on-btn-row">
+              <button class="on-btn primary" id="btnImportCreators">Start auto migration</button>
+              <button class="on-btn" id="btnCancelImportCreators">Cancel</button>
             </div>
           </div>
         </section>
@@ -290,6 +333,62 @@
     if (!modal) return;
     modal.classList.remove("active");
     modal.setAttribute("aria-hidden", "true");
+  }
+
+  function openImportCreatorsModal() {
+    if (!isDevToolsEnabled()) {
+      window.OnlinodRouter.toast("Dev import is disabled");
+      return;
+    }
+
+    const modal = document.getElementById("importCreatorsModal");
+    if (!modal) return;
+    modal.classList.add("active");
+    modal.setAttribute("aria-hidden", "false");
+  }
+
+  function closeImportCreatorsModal() {
+    const modal = document.getElementById("importCreatorsModal");
+    if (!modal) return;
+    modal.classList.remove("active");
+    modal.setAttribute("aria-hidden", "true");
+  }
+
+  async function importCreatorsFromJson() {
+    if (!isDevToolsEnabled()) {
+      window.OnlinodRouter.toast("Dev import is disabled");
+      return;
+    }
+
+    const status = document.getElementById("migrationStatusText");
+    if (status) status.textContent = "starting migration session…";
+
+    const start = await window.OnlinodApi.request("/api/creators/import-local/start-auto", {
+      method: "POST",
+      body: {},
+    });
+
+    if (!start?.ok) {
+      if (status) status.textContent = JSON.stringify(start, null, 2);
+      window.OnlinodRouter.toast(start?.error || "Migration start failed");
+      return;
+    }
+
+    window.OnlinodState.currentLocalMigration = start;
+
+    if (status) {
+      status.textContent = JSON.stringify({
+        status: "opening Electron",
+        migrateUrl: start.migrateUrl,
+        expiresAt: start.expiresAt,
+      }, null, 2);
+    }
+
+    try {
+      window.location.href = start.migrateUrl;
+    } catch (_) {}
+
+    window.OnlinodRouter.toast("Opening Electron for migration…");
   }
 
   async function addCreatorFromModal() {
@@ -393,6 +492,8 @@
   }
 
   function bindShell(root) {
+    enableDevOnlyControls(root);
+
     root.querySelectorAll("[data-route]").forEach((el) => {
       el.addEventListener("click", () => renderRoute(el.dataset.route || "home"));
     });
@@ -447,6 +548,25 @@
 
     const simulateConnect = root.querySelector("#btnSimulateConnect");
     if (simulateConnect) simulateConnect.addEventListener("click", simulateConnectComplete);
+
+    const openImport = root.querySelector("#btnOpenImportCreators");
+    if (openImport) openImport.addEventListener("click", openImportCreatorsModal);
+
+    const closeImport = root.querySelector("#btnCloseImportCreators");
+    if (closeImport) closeImport.addEventListener("click", closeImportCreatorsModal);
+
+    const cancelImport = root.querySelector("#btnCancelImportCreators");
+    if (cancelImport) cancelImport.addEventListener("click", closeImportCreatorsModal);
+
+    const importModal = root.querySelector("#importCreatorsModal");
+    if (importModal) {
+      importModal.addEventListener("click", (event) => {
+        if (event.target === importModal) closeImportCreatorsModal();
+      });
+    }
+
+    const importCreators = root.querySelector("#btnImportCreators");
+    if (importCreators) importCreators.addEventListener("click", importCreatorsFromJson);
 
     const debug = root.querySelector("#btnToggleDebug");
     if (debug) {
