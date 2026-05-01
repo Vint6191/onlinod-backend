@@ -134,8 +134,6 @@ model AuthToken {
   @@index([userId])
   @@index([type])
   @@index([expiresAt])
-  @@index([deviceId])
-  @@index([impersonatedByAdminId])
 }
 
 model RefreshSession {
@@ -203,8 +201,6 @@ model CreatorConnectSession {
   @@index([createdByUserId])
   @@index([status])
   @@index([expiresAt])
-  @@index([deviceId])
-  @@index([impersonatedByAdminId])
 }
 
 model AccessSnapshot {
