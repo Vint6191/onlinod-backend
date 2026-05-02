@@ -127,9 +127,7 @@ router.post("/claim", async (req, res) => {
 
     // What creators can this device/user work on right now?
     //
-    // Original pack referenced DeviceCreatorBinding, but our current schema
-    // does not have that table. Use the worker's active agency membership
-    // and assignedCreators scope instead. The Electron job runner still
+    // Use the worker's active agency membership and assignedCreators scope. The Electron job runner still
     // validates the local manifest before doing OF requests; if there is no
     // usable partition, the job reports a normal failure/backoff.
     const member = await prisma.agencyMember.findFirst({
