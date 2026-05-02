@@ -932,12 +932,42 @@ router.patch("/users/:id", async (req, res) => {
 router.post("/users/:id/force-logout", async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.params.id } });
-    if (!user) return res.status(404).json({ ok: false, code: "USER_NOT_FOUND", error: "User not found" });
+    if (!user) {
+      return res.status(404).json({ ok: false, code: "USER_NOT_FOUND", error: "User not found" });
+    }
 
-    const result = await prisma.refreshSession.updateMany({
-      where: { userId: user.id, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
+    const now = new Date();
+
+    const [sessionResult, devices] = await Promise.all([
+      prisma.refreshSession.updateMany({
+        where: { userId: user.id, revokedAt: null },
+        data: { revokedAt: now },
+      }),
+      prisma.workerDevice.findMany({
+        where: { userId: user.id },
+        select: { id: true, agencyId: true },
+      }),
+    ]);
+
+    let queuedDeviceCommands = 0;
+
+    if (devices.length) {
+      const created = await prisma.deviceCommand.createMany({
+        data: devices.map((device) => ({
+          deviceId: device.id,
+          agencyId: device.agencyId,
+          command: "FORCE_LOGOUT",
+          payload: {
+            reason: req.body?.reason || "admin force logout",
+            userId: user.id,
+            issuedAt: now.toISOString(),
+          },
+          issuedByAdmin: req.admin?.id || null,
+        })),
+      });
+
+      queuedDeviceCommands = created.count || 0;
+    }
 
     await adminLog(req, {
       agencyId: null,
@@ -945,13 +975,26 @@ router.post("/users/:id/force-logout", async (req, res) => {
       targetType: "user",
       targetId: user.id,
       before: null,
-      after: { revokedSessions: result.count },
+      after: {
+        revokedSessions: sessionResult.count,
+        queuedDeviceCommands,
+        devices: devices.map((item) => item.id),
+      },
       reason: req.body?.reason || null,
     });
 
-    return res.json({ ok: true, revokedSessions: result.count });
+    return res.json({
+      ok: true,
+      revokedSessions: sessionResult.count,
+      queuedDeviceCommands,
+      devicesCount: devices.length,
+    });
   } catch (err) {
-    return res.status(500).json({ ok: false, code: "USER_FORCE_LOGOUT_FAILED", error: err?.message || "Failed" });
+    return res.status(500).json({
+      ok: false,
+      code: "USER_FORCE_LOGOUT_FAILED",
+      error: err?.message || "Failed",
+    });
   }
 });
 
