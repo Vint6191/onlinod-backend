@@ -181,16 +181,6 @@ router.post("/earnings/upsert", async (req, res) => {
     if (!ctx) return;
     const { creator } = ctx;
 
-    // Optional sanity: device should have a binding to this creator.
-    // We don't reject if missing — chatter might be working off a recent
-    // binding that just expired. Just log warn.
-    const binding = await prisma.deviceCreatorBinding.findUnique({
-      where: { deviceId_creatorId: { deviceId: device.id, creatorId: creator.id } },
-    });
-    if (!binding) {
-      console.warn(`[stats/earnings] device ${device.id} reporting for creator ${creator.id} without active binding`);
-    }
-
     const data = {
       creatorId: creator.id,
       agencyId: creator.agencyId,
@@ -545,13 +535,15 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
 
     const now = new Date();
 
-    // Are there chatter machines online for this creator?
+    // Are there online desktop devices in this creator's agency?
+    //
+    // Current schema has WorkerDevice.lastSeenAt, not a separate device binding table.
+    // Jobs claim itself scopes work by agency membership + assignedCreators.
     const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
-    const onlineBindings = await prisma.deviceCreatorBinding.count({
+    const onlineBindings = await prisma.workerDevice.count({
       where: {
-        creatorId: creator.id,
-        ofStatus: "READY",
-        device: { lastHeartbeatAt: { gte: fiveMinAgo } },
+        agencyId: creator.agencyId,
+        lastSeenAt: { gte: fiveMinAgo },
       },
     });
 
