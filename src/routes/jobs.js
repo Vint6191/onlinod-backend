@@ -121,7 +121,7 @@ router.post("/claim", async (req, res) => {
 
     // Heartbeat must be recent — if device hasn't sent heartbeat in
     // 5 min we don't trust it for new jobs.
-    if (!device.lastHeartbeatAt || device.lastHeartbeatAt < fiveMinAgo) {
+    if (!device.lastSeenAt || device.lastSeenAt < fiveMinAgo) {
       return res.json({ ok: true, job: null, reason: "device-stale" });
     }
 
