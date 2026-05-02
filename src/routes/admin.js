@@ -817,12 +817,12 @@ router.get("/users", async (req, res) => {
       orderBy: { createdAt: "desc" },
       take: 500,
       include: {
-        _count: { select: { agencies: true } },
+        _count: { select: { memberships: true } },
       },
     });
 
     if (noAgency) {
-      users = users.filter((u) => u._count.agencies === 0);
+      users = users.filter((u) => u._count.memberships === 0);
     }
 
     return res.json({
@@ -836,7 +836,7 @@ router.get("/users", async (req, res) => {
         disabledAt: u.disabledAt,
         lastLoginAt: u.lastLoginAt,
         createdAt: u.createdAt,
-        agenciesCount: u._count.agencies,
+        agenciesCount: u._count.memberships,
       })),
     });
   } catch (err) {
@@ -849,7 +849,7 @@ router.get("/users/:id", async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { id: req.params.id },
       include: {
-        agencies: { include: { agency: true } },
+        memberships: { include: { agency: true } },
       },
     });
     if (!user) return res.status(404).json({ ok: false, code: "USER_NOT_FOUND", error: "User not found" });
@@ -873,7 +873,7 @@ router.get("/users/:id", async (req, res) => {
         lastLoginAt: user.lastLoginAt,
         createdAt: user.createdAt,
       },
-      memberships: user.agencies.map((m) => ({
+      memberships: user.memberships.map((m) => ({
         id: m.id,
         agency: { id: m.agency.id, name: m.agency.name, status: m.agency.status, deletedAt: m.agency.deletedAt },
         role: m.role,
