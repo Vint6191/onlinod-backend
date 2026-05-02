@@ -1,1 +1,0 @@
-(async function(){"use strict";try{if(OnlinodState.accessToken){await OnlinodHomePage.bootstrap();OnlinodState.view='home'}}catch(e){console.warn('[APP] bootstrap failed:',e);OnlinodSession.clearSession()}OnlinodRouter.render();})();
