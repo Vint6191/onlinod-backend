@@ -45,6 +45,22 @@ async function authRequired(req, res, next) {
       });
     }
 
+    // Admin force-logout must invalidate already-issued access tokens too.
+    // Revoking refresh sessions is not enough because access tokens remain
+    // valid until their exp. JWT iat is seconds, sessionsRevokedAt is ms.
+    if (membership.user.sessionsRevokedAt) {
+      const tokenIssuedAtMs = Number(decoded.iat || 0) * 1000;
+      const revokedAtMs = new Date(membership.user.sessionsRevokedAt).getTime();
+
+      if (!tokenIssuedAtMs || tokenIssuedAtMs <= revokedAtMs) {
+        return res.status(401).json({
+          ok: false,
+          code: "SESSION_REVOKED",
+          error: "Session was revoked. Please sign in again.",
+        });
+      }
+    }
+
     if (!membership.user.emailVerifiedAt) {
       return res.status(403).json({
         ok: false,
