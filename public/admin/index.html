@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Onlinod Admin</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+
+  <link rel="stylesheet" href="/admin/admin.css">
+</head>
+<body>
+  <div id="app"></div>
+
+  <!-- Core: load order matters. Each script declares globals on window. -->
+  <script src="/admin/core/admin-state.js"></script>
+  <script src="/admin/core/admin-api.js"></script>
+  <script src="/admin/core/admin-utils.js"></script>
+  <script src="/admin/core/admin-router.js"></script>
+
+  <!-- Pages -->
+  <script src="/admin/pages/admin-login-page.js"></script>
+
+  <!-- Modules -->
+  <script src="/admin/modules/admin-shell/admin-shell.js"></script>
+  <script src="/admin/modules/admin-dashboard/admin-dashboard.js"></script>
+  <script src="/admin/modules/admin-agencies/admin-agencies.js"></script>
+
+  <!-- Agency detail (split into 4 files) -->
+  <script src="/admin/modules/admin-agency-detail/admin-agency-detail-actions.js"></script>
+  <script src="/admin/modules/admin-agency-detail/admin-agency-detail-overview.js"></script>
+  <script src="/admin/modules/admin-agency-detail/admin-agency-detail-tabs.js"></script>
+  <script src="/admin/modules/admin-agency-detail/admin-agency-detail.js"></script>
+
+  <!-- Cross-agency listings -->
+  <script src="/admin/modules/admin-users/admin-users.js"></script>
+  <script src="/admin/modules/admin-creators/admin-creators.js"></script>
+  <script src="/admin/modules/admin-devices/admin-devices.js"></script>
+
+  <!-- Audit / Admins / System -->
+  <script src="/admin/modules/admin-audit/admin-audit.js"></script>
+  <script src="/admin/modules/admin-admins/admin-admins.js"></script>
+  <script src="/admin/modules/admin-system/admin-system.js"></script>
+
+  <!-- Bootstrap -->
+  <script src="/admin/admin-app.js"></script>
+</body>
+</html>

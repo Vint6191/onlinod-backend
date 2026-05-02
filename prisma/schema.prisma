@@ -1,0 +1,630 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+  MANAGER
+  OPERATOR
+}
+
+enum CreatorStatus {
+  DRAFT
+  READY
+  NOT_CREATOR
+  AUTH_FAILED
+  DISABLED
+}
+
+enum AuthTokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+model User {
+  id              String    @id @default(cuid())
+  email           String    @unique
+  passwordHash    String
+  name            String?
+  avatarUrl       String?
+  emailVerifiedAt DateTime?
+  isSuperAdmin   Boolean   @default(false)
+  lastLoginAt     DateTime?
+  disabledAt     DateTime?
+  disabledReason String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  memberships     AgencyMember[]
+  authTokens      AuthToken[]
+  refreshSessions RefreshSession[]
+  createdConnectSessions CreatorConnectSession[] @relation("ConnectSessionCreator")
+  claimedConnectSessions CreatorConnectSession[] @relation("ConnectSessionClaimer")
+  accessSnapshots AccessSnapshot[] @relation("SnapshotCreator")
+  workerDevices WorkerDevice[]
+  auditLogs AuditLog[]
+  invitationsSent AgencyInvitation[] @relation("AgencyInvitationInvitedBy")
+
+  @@index([disabledAt])
+}
+
+model Agency {
+  id        String   @id @default(cuid())
+  name      String
+  plan      String   @default("trial")
+  status    String   @default("TRIAL")
+  trialEndsAt DateTime?
+  currentPeriodEnd DateTime?
+  deletedAt     DateTime?
+  deletedReason String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members  AgencyMember[]
+  creators CreatorAccount[]
+  connectSessions CreatorConnectSession[]
+  accessSnapshots AccessSnapshot[]
+  workerDevices WorkerDevice[]
+  auditLogs AuditLog[]
+  subscriptions AgencySubscription[]
+  creatorBillingProfiles CreatorBillingProfile[]
+  adminActionLogs AdminActionLog[]
+  customRoles            AgencyCustomRole[]
+  roleOverrides          AgencyRoleOverride[]
+  subPermissionOverrides AgencySubPermissionOverride[]
+  invitations            AgencyInvitation[]
+  earningsSnapshots  CreatorEarningsSnapshot[]
+  campaignsSnapshots CreatorCampaignsSnapshot[]
+  jobs               JobInstance[]
+
+  @@index([deletedAt])
+}
+
+model AgencyMember {
+  id          String   @id @default(cuid())
+  agencyId    String
+  userId      String
+  role        UserRole @default(OWNER)
+  permissions Json?
+  roleKey          String?
+  displayName      String?
+  initials         String?
+  tone             String?
+  commission       Json?
+  assignedCreators Json?
+  statusBadge      Json?
+  lastSeenLabel    String?
+  isTest           Boolean   @default(false)
+  deletedAt        DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, userId])
+  @@index([agencyId])
+  @@index([userId])
+  @@index([roleKey])
+  @@index([deletedAt])
+}
+
+model CreatorAccount {
+  id          String        @id @default(cuid())
+  agencyId    String
+  displayName String
+  username    String?
+  avatarUrl   String?
+  remoteId    String?
+  partition   String?
+  status      CreatorStatus @default(DRAFT)
+  notes       String?
+  deletedAt   DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  connectSessions CreatorConnectSession[]
+  accessSnapshots AccessSnapshot[]
+  earningsSnapshots  CreatorEarningsSnapshot[]
+  campaignsSnapshot  CreatorCampaignsSnapshot?
+  jobs               JobInstance[]
+
+  @@index([agencyId])
+  @@index([status])
+  @@index([deletedAt])
+  billingProfile CreatorBillingProfile?
+}
+
+model AuthToken {
+  id        String        @id @default(cuid())
+  userId    String
+  type      AuthTokenType
+  tokenHash String        @unique
+  codeHash  String?
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime      @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([type])
+  @@index([expiresAt])
+}
+
+model RefreshSession {
+  id         String    @id @default(cuid())
+  userId     String
+  agencyId   String
+  tokenHash  String    @unique
+  userAgent  String?
+  ipAddress  String?
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  deviceId   String?
+  client     String?
+  rememberDevice Boolean @default(false)
+  impersonatedByAdminId String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([agencyId])
+  @@index([expiresAt])
+  @@index([deviceId])
+  @@index([impersonatedByAdminId])
+}
+
+
+enum ConnectSessionStatus {
+  PENDING
+  CLAIMED
+  COMPLETED
+  EXPIRED
+  CANCELLED
+}
+
+enum AccessSnapshotType {
+  OF_ACCESS
+}
+
+
+model CreatorConnectSession {
+  id                String               @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  createdByUserId   String
+  claimedByUserId   String?
+  claimedByDeviceId String?
+  tokenHash         String               @unique
+  status            ConnectSessionStatus @default(PENDING)
+  connectUrl        String?
+  expiresAt         DateTime
+  createdAt         DateTime             @default(now())
+  claimedAt         DateTime?
+  completedAt       DateTime?
+  cancelledAt       DateTime?
+
+  agency        Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator       CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  createdByUser User           @relation("ConnectSessionCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+  claimedByUser User?          @relation("ConnectSessionClaimer", fields: [claimedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId])
+  @@index([creatorId])
+  @@index([createdByUserId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+model AccessSnapshot {
+  id              String             @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  createdByUserId String
+  deviceId        String?
+  type            AccessSnapshotType @default(OF_ACCESS)
+  payloadVersion  Int                @default(1)
+  encryptedPayload String
+  iv              String
+  tag             String
+  algorithm       String             @default("aes-256-gcm")
+  userAgentHash   String?
+  remoteId        String?
+  username        String?
+  active          Boolean            @default(true)
+  expiresAt       DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime           @default(now())
+
+  agency        Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator       CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  createdByUser User           @relation("SnapshotCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([creatorId])
+  @@index([createdByUserId])
+  @@index([active])
+  @@index([createdAt])
+}
+
+model WorkerDevice {
+  id         String   @id @default(cuid())
+  agencyId   String
+  userId     String
+  deviceName String?
+  platform   String?
+  appVersion String?
+  lastSeenAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([userId])
+  @@index([lastSeenAt])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  agencyId    String
+  actorUserId String?
+  action      String
+  targetType  String?
+  targetId    String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId])
+  @@index([actorUserId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  GRACE
+  CANCELLED
+  LOCKED
+}
+
+enum BillingMode {
+  MANUAL
+  STRIPE
+  CRYPTO
+  FREE_INTERNAL
+}
+
+enum CreatorBillingTier {
+  STARTER
+  GROWTH
+  PRO
+  ELITE
+  CUSTOM
+}
+
+enum BillingPeriod {
+  MONTHLY
+  THREE_MONTHS
+  SIX_MONTHS
+}
+
+
+model AdminUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  role         String   @default("SUPER_ADMIN")
+  active       Boolean  @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions AdminSession[]
+
+  @@index([email])
+  @@index([active])
+}
+
+model AdminSession {
+  id           String   @id @default(cuid())
+  adminUserId  String
+  tokenHash    String   @unique
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  ip           String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  adminUser AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  @@index([adminUserId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+}
+
+model AgencySubscription {
+  id        String @id @default(cuid())
+  agencyId String
+
+  status    SubscriptionStatus @default(TRIAL)
+  billingMode BillingMode @default(MANUAL)
+  billingPeriod BillingPeriod @default(MONTHLY)
+
+  corePricePerCreatorCents Int @default(2000)
+  trialEndsAt DateTime?
+  graceUntil DateTime?
+  currentPeriodStart DateTime?
+  currentPeriodEnd DateTime?
+
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([status])
+  @@index([currentPeriodEnd])
+}
+
+model CreatorBillingProfile {
+  id        String @id @default(cuid())
+  agencyId  String
+  creatorId String @unique
+
+  tier CreatorBillingTier @default(STARTER)
+  tierMode String @default("MANUAL")
+  corePriceCents Int @default(2000)
+
+  revenue30dCents Int @default(0)
+
+  aiChatterEnabled Boolean @default(false)
+  aiChatterPriceCents Int @default(10000)
+
+  outreachEnabled Boolean @default(false)
+  outreachPriceCents Int @default(2900)
+
+  billingExcluded Boolean @default(false)
+  notes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([tier])
+  @@index([billingExcluded])
+}
+
+model AdminActionLog {
+  id          String   @id @default(cuid())
+  adminUserId String
+  agencyId    String?
+  action      String
+  targetType  String?
+  targetId    String?
+  before      Json?
+  after       Json?
+  reason      String?
+  createdAt   DateTime @default(now())
+
+  agency Agency? @relation(fields: [agencyId], references: [id], onDelete: SetNull)
+
+  @@index([adminUserId])
+  @@index([agencyId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+}
+
+
+model AgencyCustomRole {
+  id              String   @id @default(cuid())
+  agencyId        String
+  key             String
+  label           String
+  tone            String?
+  description     String?
+  access          Json     @default("{}")
+  basedOn         String?
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, key])
+  @@index([agencyId])
+}
+
+model AgencyRoleOverride {
+  id        String   @id @default(cuid())
+  agencyId  String
+  roleKey   String
+  access    Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, roleKey])
+}
+
+model AgencySubPermissionOverride {
+  id         String   @id @default(cuid())
+  agencyId   String
+  roleKey    String
+  subPermKey String
+  value      Boolean
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, roleKey, subPermKey])
+  @@index([agencyId])
+}
+
+model AgencyInvitation {
+  id               String    @id @default(cuid())
+  agencyId         String
+  tokenHash        String    @unique
+  email            String?
+  roleKey          String
+  displayName      String?
+  assignedCreators Json?
+  commission       Json?
+  invitedByUserId  String
+  expiresAt        DateTime
+  claimedAt        DateTime?
+  claimedByUserId  String?
+  claimedMemberId  String?
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  agency    Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  invitedBy User   @relation("AgencyInvitationInvitedBy", fields: [invitedByUserId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([email])
+  @@index([expiresAt])
+}
+
+model CreatorEarningsSnapshot {
+  id                 String    @id @default(cuid())
+  creatorId          String
+  agencyId           String
+  rangeKey           String
+  rangeStartAt       DateTime?
+  rangeEndAt         DateTime?
+  totalCents         BigInt    @default(0)
+  grossCents         BigInt    @default(0)
+  deltaCents         BigInt    @default(0)
+  salesCount         Int       @default(0)
+  uniqueFans         Int       @default(0)
+  avgSaleCents       Int       @default(0)
+  fanLtvCents        Int       @default(0)
+  raw                Json?
+  capturedAt         DateTime  @default(now())
+  capturedByDeviceId String?
+  capturedByUserId   String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, rangeKey])
+  @@index([agencyId])
+  @@index([capturedAt])
+}
+
+model CreatorCampaignsSnapshot {
+  id                 String   @id @default(cuid())
+  creatorId          String   @unique
+  agencyId           String
+  rangeKey           String   @default("7d")
+  campaigns          Json     @default("[]")
+  totalActive        Int      @default(0)
+  totalClaimers      Int      @default(0)
+  totalClicks        Int      @default(0)
+  capturedAt         DateTime @default(now())
+  capturedByDeviceId String?
+  capturedByUserId   String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId])
+}
+
+model JobInstance {
+  id                String    @id @default(cuid())
+  jobKey            String
+  scope             String
+  creatorId         String?
+  agencyId          String?
+  params            Json?
+  status            String    @default("SCHEDULED")
+  priority          Int       @default(0)
+  scheduledAt       DateTime  @default(now())
+  nextRunAt         DateTime  @default(now())
+  claimedAt         DateTime?
+  claimedByDeviceId String?
+  leaseUntil        DateTime?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  lastError         String?
+  attempts          Int       @default(0)
+  result            Json?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  agency  Agency?         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextRunAt])
+  @@index([creatorId])
+  @@index([agencyId])
+  @@index([jobKey])
+  @@index([claimedByDeviceId])
+  @@index([leaseUntil])
+}
+
+model DeviceCommand {
+  id            String    @id @default(cuid())
+  deviceId      String
+  agencyId      String
+  command       String
+  payload       Json?
+  issuedByAdmin String?
+  issuedByUser  String?
+  createdAt     DateTime  @default(now())
+  deliveredAt   DateTime?
+  ackedAt       DateTime?
+  result        Json?
+
+  @@index([deviceId])
+  @@index([agencyId])
+  @@index([deliveredAt])
+}
+
+
+model ImpersonationToken {
+  id             String    @id @default(cuid())
+  tokenHash      String    @unique
+  adminUserId    String
+  targetUserId   String
+  targetAgencyId String
+  expiresAt      DateTime
+  claimedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([targetUserId])
+  @@index([expiresAt])
+}
