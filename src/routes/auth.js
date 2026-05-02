@@ -1,5 +1,6 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
+const crypto = require("node:crypto");
 const { z } = require("zod");
 
 const prisma = require("../prisma");
@@ -24,6 +25,7 @@ const registerSchema = z.object({
   password: z.string().min(8),
   name: z.string().min(1).max(80).optional(),
   agencyName: z.string().min(1).max(120).optional(),
+  inviteToken: z.string().min(10).optional().nullable(),
 });
 
 const loginSchema = z.object({
@@ -54,6 +56,59 @@ const resetPasswordSchema = z.object({
   password: z.string().min(8),
 });
 
+
+function hashInviteToken(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function roleKeyToLegacy(roleKey) {
+  const k = String(roleKey || "").toLowerCase();
+  if (k === "owner") return "OWNER";
+  if (k === "manager") return "MANAGER";
+  if (k === "supervisor") return "MANAGER";
+  if (k === "analyst") return "OPERATOR";
+  if (k === "chatter") return "OPERATOR";
+  if (k === "sexter") return "OPERATOR";
+  return "OPERATOR";
+}
+
+function initialsFrom(value) {
+  return String(value || "??").trim().slice(0, 2).toUpperCase();
+}
+
+async function loadValidInvitation(token, tx = prisma) {
+  const rawToken = String(token || "").trim();
+  if (!rawToken) return null;
+
+  const inv = await tx.agencyInvitation.findUnique({
+    where: { tokenHash: hashInviteToken(rawToken) },
+    include: { agency: true },
+  });
+
+  if (!inv) {
+    return { ok: false, status: 404, code: "INVITE_NOT_FOUND", error: "Invitation not found" };
+  }
+
+  if (inv.revokedAt) {
+    return { ok: false, status: 409, code: "INVITE_REVOKED", error: "Invitation was revoked" };
+  }
+
+  if (inv.claimedAt) {
+    return { ok: false, status: 409, code: "INVITE_CLAIMED", error: "Invitation already claimed" };
+  }
+
+  if (inv.expiresAt < new Date()) {
+    return { ok: false, status: 410, code: "INVITE_EXPIRED", error: "Invitation expired" };
+  }
+
+  if (inv.agency?.deletedAt) {
+    return { ok: false, status: 409, code: "AGENCY_DELETED", error: "Agency was deleted" };
+  }
+
+  return { ok: true, invitation: inv };
+}
+
+
 function validationError(res, err) {
   return res.status(400).json({
     ok: false,
@@ -67,14 +122,37 @@ router.post("/register", async (req, res) => {
   try {
     const input = registerSchema.parse(req.body);
     const email = input.email.toLowerCase().trim();
+    const inviteToken = String(input.inviteToken || "").trim();
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
       return res.status(409).json({
         ok: false,
         code: "EMAIL_TAKEN",
-        error: "Email is already registered",
+        error: inviteToken
+          ? "Email is already registered. Sign in first, then accept the invitation."
+          : "Email is already registered",
+        inviteLoginRequired: !!inviteToken,
       });
+    }
+
+    let invitationCheck = null;
+    if (inviteToken) {
+      invitationCheck = await loadValidInvitation(inviteToken);
+      if (!invitationCheck?.ok) {
+        return res.status(invitationCheck.status || 400).json(invitationCheck);
+      }
+
+      if (invitationCheck.invitation.email) {
+        const inviteEmail = String(invitationCheck.invitation.email).toLowerCase().trim();
+        if (inviteEmail !== email) {
+          return res.status(403).json({
+            ok: false,
+            code: "EMAIL_MISMATCH",
+            error: "This invitation was sent to a different email address",
+          });
+        }
+      }
     }
 
     const passwordHash = await bcrypt.hash(input.password, 12);
@@ -87,6 +165,50 @@ router.post("/register", async (req, res) => {
           name: input.name || null,
         },
       });
+
+      if (inviteToken) {
+        const checked = await loadValidInvitation(inviteToken, tx);
+        if (!checked?.ok) {
+          const err = new Error(checked?.error || "Invitation is no longer valid");
+          err.status = checked?.status || 400;
+          err.code = checked?.code || "INVITE_INVALID";
+          throw err;
+        }
+
+        const inv = checked.invitation;
+        const member = await tx.agencyMember.create({
+          data: {
+            userId: user.id,
+            agencyId: inv.agencyId,
+            role: roleKeyToLegacy(inv.roleKey),
+            roleKey: inv.roleKey,
+            displayName: inv.displayName || input.name || null,
+            initials: initialsFrom(inv.displayName || input.name || email),
+            tone: "amber",
+            commission: inv.commission || { kind: "none" },
+            assignedCreators: inv.assignedCreators ?? "all",
+            permissions: {},
+            lastSeenLabel: "just joined",
+          },
+        });
+
+        await tx.agencyInvitation.update({
+          where: { id: inv.id },
+          data: {
+            claimedAt: new Date(),
+            claimedByUserId: user.id,
+            claimedMemberId: member.id,
+          },
+        });
+
+        return {
+          user,
+          agency: inv.agency,
+          member,
+          invitationClaimed: true,
+          inviteRoleKey: inv.roleKey,
+        };
+      }
 
       const agency = await tx.agency.create({
         data: {
@@ -106,7 +228,7 @@ router.post("/register", async (req, res) => {
         },
       });
 
-      return { user, agency, member };
+      return { user, agency, member, invitationClaimed: false };
     });
 
     const verification = await issueEmailVerification(result.user);
@@ -118,11 +240,16 @@ router.post("/register", async (req, res) => {
       user: publicUser(result.user),
       agency: result.agency,
       role: result.member.role,
+      roleKey: result.member.roleKey || result.inviteRoleKey || null,
+      invitationClaimed: result.invitationClaimed === true,
       devVerificationUrl: verification.emailResult?.skipped ? verification.emailResult?.verifyUrl : undefined,
       devVerificationCode: verification.emailResult?.skipped ? verification.code : undefined,
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
+    if (err?.code && String(err.code).startsWith("INVITE_")) {
+      return res.status(err.status || 400).json({ ok: false, code: err.code, error: err.message });
+    }
     console.error("[auth/register] failed:", err);
     return res.status(500).json({ ok: false, code: "REGISTER_FAILED", error: "Registration failed" });
   }
