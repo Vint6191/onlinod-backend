@@ -33,7 +33,7 @@ function sha256(value) {
 }
 
 function actorUserId(req) {
-  return req.auth?.userId || actorUserId(req) || null;
+  return req.auth?.userId || req.user?.id || null;
 }
 
 function roleKeyToLegacy(roleKey) {
