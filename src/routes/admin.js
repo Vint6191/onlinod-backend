@@ -938,7 +938,11 @@ router.post("/users/:id/force-logout", async (req, res) => {
 
     const now = new Date();
 
-    const [sessionResult, devices] = await Promise.all([
+    const [updatedUser, sessionResult, devices] = await Promise.all([
+      prisma.user.update({
+        where: { id: user.id },
+        data: { sessionsRevokedAt: now },
+      }),
       prisma.refreshSession.updateMany({
         where: { userId: user.id, revokedAt: null },
         data: { revokedAt: now },
@@ -960,6 +964,7 @@ router.post("/users/:id/force-logout", async (req, res) => {
           payload: {
             reason: req.body?.reason || "admin force logout",
             userId: user.id,
+            sessionsRevokedAt: now.toISOString(),
             issuedAt: now.toISOString(),
           },
           issuedByAdmin: req.admin?.id || null,
@@ -974,8 +979,11 @@ router.post("/users/:id/force-logout", async (req, res) => {
       action: "admin.user_force_logout",
       targetType: "user",
       targetId: user.id,
-      before: null,
+      before: {
+        sessionsRevokedAt: user.sessionsRevokedAt || null,
+      },
       after: {
+        sessionsRevokedAt: updatedUser.sessionsRevokedAt,
         revokedSessions: sessionResult.count,
         queuedDeviceCommands,
         devices: devices.map((item) => item.id),
@@ -985,6 +993,7 @@ router.post("/users/:id/force-logout", async (req, res) => {
 
     return res.json({
       ok: true,
+      sessionsRevokedAt: updatedUser.sessionsRevokedAt,
       revokedSessions: sessionResult.count,
       queuedDeviceCommands,
       devicesCount: devices.length,
