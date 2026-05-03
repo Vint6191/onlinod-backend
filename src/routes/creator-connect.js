@@ -6,6 +6,7 @@ const { authRequired } = require("../middleware/auth");
 const { randomToken, sha256, addMinutes } = require("../utils/crypto");
 const { encryptSnapshot, hashUserAgent } = require("../services/snapshot-crypto");
 const { audit } = require("../services/audit-service");
+const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
 
 const router = express.Router();
 
@@ -53,6 +54,20 @@ function appBaseUrl(req) {
 
 function makePartition(creatorId) {
   return `persist:creator_${creatorId}`;
+}
+
+async function scheduleJobsAfterReady(creator) {
+  if (!creator?.id || !creator?.agencyId) return;
+
+  try {
+    await scheduleInitialJobsForCreator({
+      creatorId: creator.id,
+      agencyId: creator.agencyId,
+      priority: 50,
+    });
+  } catch (err) {
+    console.warn("[creator-connect] schedule jobs failed:", err?.message || err);
+  }
 }
 
 
@@ -219,6 +234,8 @@ async function completeSessionWithSnapshot({ session, snapshot, deviceId, actorU
       session: updatedSession,
     };
   });
+
+  await scheduleJobsAfterReady(result.creator);
 
   await audit({
     agencyId: session.agencyId,
@@ -854,6 +871,8 @@ router.post("/:id/complete", async (req, res) => {
       };
     });
 
+    await scheduleJobsAfterReady(result.creator);
+
     await audit({
       agencyId: req.auth.agencyId,
       actorUserId: req.auth.userId,
@@ -1003,6 +1022,8 @@ router.post("/:id/simulate-complete", async (req, res) => {
         session: updatedSession,
       };
     });
+
+    await scheduleJobsAfterReady(result.creator);
 
     await audit({
       agencyId: req.auth.agencyId,
