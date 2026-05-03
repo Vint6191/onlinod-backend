@@ -92,10 +92,15 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
  * Look up by (jobKey, creatorId, params.rangeKey) and decide whether to create a job.
  * Skips if:
  *  - There's already a SCHEDULED or CLAIMED job for this combo
- *  - There's a DONE job completed within FRESHNESS_WINDOW_MS
+ *  - There's a DONE job completed within freshnessWindowMs (defaults to FRESHNESS_WINDOW_MS).
+ *
+ * Pass `freshnessWindowMs` explicitly when on-demand callers (e.g. /home/summary
+ * trying to backfill a missing range) want a stricter "fresh" definition than
+ * the recurring sweeper's 1-hour window.
  */
-async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, now }) {
+async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, now, freshnessWindowMs }) {
   const rangeKey = params?.rangeKey || null;
+  const window = Number.isFinite(freshnessWindowMs) ? freshnessWindowMs : FRESHNESS_WINDOW_MS;
 
   // Find any existing job for this creator+jobKey+rangeKey.
   const existing = await prisma.jobInstance.findMany({
@@ -120,7 +125,7 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
   }
 
   // Check: recently done?
-  const freshnessThreshold = new Date(now.getTime() - FRESHNESS_WINDOW_MS);
+  const freshnessThreshold = new Date(now.getTime() - window);
   const recentlyDone = matching.find(
     (j) => j.status === "DONE" && j.completedAt && j.completedAt > freshnessThreshold
   );
@@ -233,9 +238,11 @@ function stopRecurringScheduler() {
 
 module.exports = {
   scheduleInitialJobsForCreator,
+  ensureSingleJob,
   runRecurringSweep,
   startRecurringScheduler,
   stopRecurringScheduler,
   TRACKED_RANGES,
   RECURRING_INTERVAL_MS,
+  FRESHNESS_WINDOW_MS,
 };
