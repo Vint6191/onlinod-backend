@@ -75,7 +75,7 @@ function validationError(res, err) {
 }
 
 function actorUserId(req) {
-  return req.auth?.userId || actorUserId(req);
+  return req.auth?.userId || req.user?.id || null;
 }
 
 // Map an AgencyMember row to the shape the renderer expects.

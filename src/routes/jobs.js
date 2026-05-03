@@ -169,12 +169,32 @@ router.post("/claim", async (req, res) => {
       };
     }
 
-    const visibleCreators = await prisma.creatorAccount.findMany({
+    const scopedCreators = await prisma.creatorAccount.findMany({
       where: creatorWhere,
       select: { id: true },
     });
 
-    const visibleCreatorIds = visibleCreators.map((item) => item.id);
+    const scopedCreatorIds = scopedCreators.map((item) => item.id);
+
+    const bindings = await prisma.deviceCreatorBinding.findMany({
+      where: {
+        agencyId: device.agencyId,
+        deviceId: device.id,
+        status: "ACTIVE",
+        creatorId: { in: scopedCreatorIds.length ? scopedCreatorIds : ["__none__"] },
+      },
+      select: { creatorId: true },
+    });
+
+    let visibleCreatorIds = bindings.map((item) => item.creatorId);
+
+    // Backward-compatible fallback while older Electron builds/dev flows
+    // may not publish bindings yet. Owners/managers can still claim jobs
+    // scoped by membership, but heartbeat bindings remain the preferred path.
+    if (!visibleCreatorIds.length && isBroadScope) {
+      visibleCreatorIds = scopedCreatorIds;
+    }
+
     if (!visibleCreatorIds.length) {
       return res.json({ ok: true, job: null, reason: "no-creators-visible" });
     }

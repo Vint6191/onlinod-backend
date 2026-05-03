@@ -50,6 +50,10 @@ model User {
   accessSnapshots AccessSnapshot[] @relation("SnapshotCreator")
   workerDevices WorkerDevice[]
   auditLogs AuditLog[]
+  teamActivityEvents TeamActivityEvent[]
+  messageTemplateUsageEvents MessageTemplateUsageEvent[]
+  automationRuns AutomationRun[]
+  automationLogs AutomationLog[]
   invitationsSent AgencyInvitation[] @relation("AgencyInvitationInvitedBy")
 
   @@index([disabledAt])
@@ -83,6 +87,18 @@ model Agency {
   earningsSnapshots  CreatorEarningsSnapshot[]
   campaignsSnapshots CreatorCampaignsSnapshot[]
   jobs               JobInstance[]
+  deviceCreatorBindings DeviceCreatorBinding[]
+  teamActivityEvents TeamActivityEvent[]
+  analyticsSnapshots AnalyticsSnapshot[]
+  workspaceSettings WorkspaceSetting[]
+  moduleSettings ModuleSetting[]
+  messageTemplateGroups MessageTemplateGroup[]
+  messageTemplates MessageTemplate[]
+  messageTemplateUsageEvents MessageTemplateUsageEvent[]
+  automationRules AutomationRule[]
+  automationRuns AutomationRun[]
+  automationLogs AutomationLog[]
+  vaultUnsortedSnapshots VaultUnsortedSnapshot[]
 
   @@index([deletedAt])
 }
@@ -136,6 +152,10 @@ model CreatorAccount {
   earningsSnapshots  CreatorEarningsSnapshot[]
   campaignsSnapshot  CreatorCampaignsSnapshot?
   jobs               JobInstance[]
+  deviceCreatorBindings DeviceCreatorBinding[]
+  teamActivityEvents TeamActivityEvent[]
+  messageTemplateUsageEvents MessageTemplateUsageEvent[]
+  vaultUnsortedSnapshots VaultUnsortedSnapshot[]
 
   @@index([agencyId])
   @@index([status])
@@ -271,6 +291,8 @@ model WorkerDevice {
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  creatorBindings DeviceCreatorBinding[]
+  teamActivityEvents TeamActivityEvent[]
 
   @@index([agencyId])
   @@index([userId])
@@ -629,3 +651,248 @@ model ImpersonationToken {
   @@index([targetUserId])
   @@index([expiresAt])
 }
+
+model DeviceCreatorBinding {
+  id        String   @id @default(cuid())
+  deviceId  String
+  creatorId String
+  agencyId  String
+  status    String   @default("ACTIVE")
+  remoteId  String?
+  username  String?
+  lastSeenAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  device  WorkerDevice   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([deviceId, creatorId])
+  @@index([agencyId])
+  @@index([creatorId])
+  @@index([lastSeenAt])
+}
+
+model TeamActivityEvent {
+  id         String   @id @default(cuid())
+  agencyId   String
+  deviceId   String?
+  userId     String?
+  memberId   String?
+  accountId  String?
+  creatorId  String?
+  creatorRef String?
+  fanId      String?
+  type       String
+  ts         DateTime
+  localId    String?
+  extra      Json?
+  source     String   @default("electron")
+  createdAt  DateTime @default(now())
+
+  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user    User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  device  WorkerDevice?   @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+
+  @@unique([agencyId, deviceId, localId])
+  @@index([agencyId, ts])
+  @@index([agencyId, memberId, ts])
+  @@index([agencyId, creatorId, ts])
+  @@index([agencyId, accountId, ts])
+  @@index([agencyId, type, ts])
+}
+
+model AnalyticsSnapshot {
+  id         String   @id @default(cuid())
+  agencyId   String
+  scope      String
+  rangeKey   String
+  payload    Json
+  capturedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, scope, rangeKey])
+  @@index([agencyId, scope])
+  @@index([capturedAt])
+}
+
+model WorkspaceSetting {
+  id        String   @id @default(cuid())
+  agencyId  String
+  key       String
+  value     Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, key])
+  @@index([agencyId])
+}
+
+model ModuleSetting {
+  id        String   @id @default(cuid())
+  agencyId  String
+  moduleKey String
+  enabled   Boolean  @default(true)
+  status    String   @default("partial")
+  config    Json     @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, moduleKey])
+  @@index([agencyId])
+  @@index([moduleKey])
+}
+
+model MessageTemplateGroup {
+  id        String   @id @default(cuid())
+  agencyId  String
+  name      String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  templates MessageTemplate[]
+
+  @@index([agencyId])
+}
+
+model MessageTemplate {
+  id        String   @id @default(cuid())
+  agencyId  String
+  groupId   String?
+  title     String
+  body      String
+  priceCents Int?
+  tags      Json     @default("[]")
+  creatorScope Json?
+  status    String   @default("active")
+  createdByUserId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  group MessageTemplateGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  usageEvents MessageTemplateUsageEvent[]
+
+  @@index([agencyId])
+  @@index([groupId])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+model MessageTemplateUsageEvent {
+  id         String   @id @default(cuid())
+  agencyId   String
+  templateId String
+  userId     String?
+  memberId   String?
+  creatorId  String?
+  fanId      String?
+  usedAt     DateTime @default(now())
+  metadata   Json?
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  template MessageTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId, usedAt])
+  @@index([templateId])
+  @@index([memberId])
+}
+
+model AutomationRule {
+  id        String   @id @default(cuid())
+  agencyId  String
+  name      String
+  enabled   Boolean  @default(false)
+  trigger   Json     @default("{}")
+  action    Json     @default("{}")
+  creatorScope Json?
+  safety    Json?
+  createdByUserId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  runs AutomationRun[]
+
+  @@index([agencyId])
+  @@index([enabled])
+  @@index([deletedAt])
+}
+
+model AutomationRun {
+  id        String   @id @default(cuid())
+  agencyId  String
+  ruleId    String?
+  status    String   @default("SCHEDULED")
+  startedAt DateTime?
+  completedAt DateTime?
+  result    Json?
+  error     String?
+  createdByUserId String?
+  createdAt DateTime @default(now())
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  rule AutomationRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  user User? @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+  logs AutomationLog[]
+
+  @@index([agencyId, status])
+  @@index([ruleId])
+  @@index([createdAt])
+}
+
+model AutomationLog {
+  id        String   @id @default(cuid())
+  agencyId  String
+  runId     String?
+  level     String   @default("info")
+  message   String
+  metadata  Json?
+  createdByUserId String?
+  createdAt DateTime @default(now())
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  run AutomationRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
+  user User? @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId, createdAt])
+  @@index([runId])
+}
+
+model VaultUnsortedSnapshot {
+  id        String   @id @default(cuid())
+  agencyId  String
+  creatorId String
+  payload   Json     @default("{}")
+  itemsCount Int     @default(0)
+  unsortedCount Int  @default(0)
+  sortedCount Int    @default(0)
+  capturedAt DateTime @default(now())
+  updatedByUserId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId])
+  @@index([agencyId])
+  @@index([creatorId])
+  @@index([capturedAt])
+}
+
