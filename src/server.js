@@ -18,15 +18,18 @@ const invitationRoutes = require("./routes/invitations");
 const statsRoutes = require("./routes/stats");
 const jobsRoutes = require("./routes/jobs");
 const { authRequired } = require("./middleware/auth");
+const { startRecurringScheduler } = require("./services/job-scheduler");
 
 const app = express();
 
 app.set("trust proxy", 1);
 
-app.use(cors({
-  origin: true,
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -67,10 +70,16 @@ app.use("/api/creator-connect", creatorConnectRoutes);
 app.use("/api", accessSnapshotRoutes);
 
 app.get("*", (req, res, next) => {
-  if (req.path.startsWith("/api/") || req.path.startsWith("/uploads/")) return next();
+  if (req.path.startsWith("/api/") || req.path.startsWith("/uploads/")) {
+    return next();
+  }
 
   // Admin frontend — own SPA at /admin/* and /admin-login.
-  if (req.path.startsWith("/admin") || req.path === "/admin-login" || req.path.startsWith("/admin-login")) {
+  if (
+    req.path.startsWith("/admin") ||
+    req.path === "/admin-login" ||
+    req.path.startsWith("/admin-login")
+  ) {
     return res.sendFile(path.join(__dirname, "..", "public", "admin", "index.html"));
   }
 
@@ -101,3 +110,5 @@ const port = Number(process.env.PORT || 10000);
 app.listen(port, () => {
   console.log(`Onlinod backend running on port ${port}`);
 });
+
+startRecurringScheduler();
