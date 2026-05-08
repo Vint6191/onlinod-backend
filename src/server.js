@@ -27,8 +27,10 @@ const teamAnalyticsRoutes = require("./routes/team-analytics");
 const homeRoutes = require("./routes/home");
 const telemetryRoutes = require("./routes/telemetry");
 const analyticsRoutes = require("./routes/analytics");
+const presenceRoutes = require("./routes/presence");
 const { authRequired } = require("./middleware/auth");
 const { startRecurringScheduler } = require("./services/job-scheduler");
+const { startPresenceScheduler } = require("./services/presence-scheduler");
 
 const app = express();
 
@@ -77,6 +79,7 @@ app.use("/api/stats", authRequired, statsRoutes);
 app.use("/api/jobs", authRequired, jobsRoutes);
 app.use("/api/telemetry", authRequired, telemetryRoutes);
 app.use("/api/analytics", authRequired, analyticsRoutes);
+app.use("/api/presence", authRequired, presenceRoutes);
 app.use("/api/home", authRequired, homeRoutes);
 app.use("/api/team/analytics", authRequired, teamAnalyticsRoutes);
 app.use("/api/audit", authRequired, auditRoutes);
@@ -132,3 +135,4 @@ app.listen(port, () => {
 });
 
 startRecurringScheduler();
+startPresenceScheduler();

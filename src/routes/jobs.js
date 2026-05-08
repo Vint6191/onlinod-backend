@@ -31,6 +31,7 @@
 const express = require("express");
 const { z }   = require("zod");
 const prisma  = require("../prisma");
+const { applyPresenceJobResult } = require("../services/presence-service");
 
 const router = express.Router();
 
@@ -311,6 +312,11 @@ router.post("/:id/report", async (req, res) => {
     }
 
     if (input.ok) {
+      let sideEffect = null;
+      if (job.jobKey === "refresh_online_presence") {
+        sideEffect = await applyPresenceJobResult({ job, deviceId: input.deviceId, result: input.result || {} });
+      }
+
       const updated = await prisma.jobInstance.update({
         where: { id: job.id },
         data: {
@@ -322,7 +328,7 @@ router.post("/:id/report", async (req, res) => {
         },
       });
 
-      return res.json({ ok: true, job: { id: updated.id, status: updated.status } });
+      return res.json({ ok: true, job: { id: updated.id, status: updated.status }, sideEffect });
     }
 
     // Failure — backoff.

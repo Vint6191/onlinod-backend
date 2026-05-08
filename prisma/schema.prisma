@@ -99,6 +99,8 @@ model Agency {
   automationRuns AutomationRun[]
   automationLogs AutomationLog[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
+  presenceSnapshots CreatorPresenceSnapshot[]
+  presenceUsers     CreatorPresenceUser[]
 
   @@index([deletedAt])
 }
@@ -156,6 +158,8 @@ model CreatorAccount {
   teamActivityEvents TeamActivityEvent[]
   messageTemplateUsageEvents MessageTemplateUsageEvent[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
+  presenceSnapshot CreatorPresenceSnapshot?
+  presenceUsers    CreatorPresenceUser[]
 
   @@index([agencyId])
   @@index([status])
@@ -293,6 +297,8 @@ model WorkerDevice {
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   creatorBindings DeviceCreatorBinding[]
   teamActivityEvents TeamActivityEvent[]
+  presenceSnapshotsUpdated CreatorPresenceSnapshot[] @relation("PresenceSnapshotUpdatedByDevice")
+  presenceUsersUpdated     CreatorPresenceUser[]     @relation("PresenceUserUpdatedByDevice")
 
   @@index([agencyId])
   @@index([userId])
@@ -896,3 +902,66 @@ model VaultUnsortedSnapshot {
   @@index([capturedAt])
 }
 
+
+
+model CreatorPresenceSnapshot {
+  id                String   @id @default(cuid())
+  agencyId          String
+  creatorId         String   @unique
+  status            String   @default("FRESH")
+  onlineCount       Int      @default(0)
+  staleCount        Int      @default(0)
+  offlineCount      Int      @default(0)
+  capturedAt        DateTime @default(now())
+  expiresAt         DateTime?
+  source            String   @default("backend")
+  updatedByDeviceId String?
+  metadata          Json     @default("{}")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agency          Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator         CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  updatedByDevice WorkerDevice?  @relation("PresenceSnapshotUpdatedByDevice", fields: [updatedByDeviceId], references: [id], onDelete: SetNull)
+
+  @@unique([agencyId, creatorId])
+  @@index([agencyId])
+  @@index([capturedAt])
+  @@index([expiresAt])
+  @@index([updatedByDeviceId])
+}
+
+model CreatorPresenceUser {
+  id                String   @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  fanId             String
+  username          String?
+  name              String?
+  avatarUrl         String?
+  totalSpentCents   Int      @default(0)
+  subscribeAt       DateTime?
+  duration          String?
+  status            String   @default("online")
+  source            String   @default("api_snapshot")
+  lastOnlineAt      DateTime?
+  lastOfflineAt     DateTime?
+  lastCheckedAt     DateTime?
+  lastSnapshotAt    DateTime?
+  updatedByDeviceId String?
+  metadata          Json     @default("{}")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agency          Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator         CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  updatedByDevice WorkerDevice?  @relation("PresenceUserUpdatedByDevice", fields: [updatedByDeviceId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, fanId])
+  @@index([agencyId])
+  @@index([creatorId, status])
+  @@index([fanId])
+  @@index([lastOnlineAt])
+  @@index([lastCheckedAt])
+  @@index([updatedByDeviceId])
+}
