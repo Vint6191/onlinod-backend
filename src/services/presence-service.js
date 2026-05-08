@@ -246,7 +246,27 @@ async function applyPresenceSnapshotProgressive({
 
   const at = toDate(capturedAt, new Date());
   const startedAt = toDate(refreshStartedAt, at) || at;
-  const meta = { ...metadata, progressive: true, done: !!done, refreshId, page, refreshStartedAt: startedAt.toISOString() };
+  const pageNumber = Number(page || 0);
+  const meta = { ...metadata, progressive: true, done: !!done, refreshId, page: pageNumber || null, refreshStartedAt: startedAt.toISOString() };
+
+  // On the first progressive page, old "online" rows are no longer confirmed.
+  // Keep them visible as stale while the new API pages arrive, then complete()
+  // will mark rows absent from this refresh as offline.
+  if (!done && (pageNumber <= 1 || metadata?.mode === "append_first")) {
+    await prisma.creatorPresenceUser.updateMany({
+      where: {
+        agencyId,
+        creatorId,
+        status: { in: ["online", "stale"] },
+      },
+      data: {
+        status: "stale",
+        source: "api_snapshot_refresh_started",
+        lastCheckedAt: startedAt,
+        updatedByDeviceId: deviceId,
+      },
+    });
+  }
 
   const { normalized } = await upsertPresenceRows({
     agencyId,
@@ -382,16 +402,20 @@ async function listPresence({ agencyId, creatorId, status = "visible", limit = 5
 async function applyPresenceJobResult({ job, deviceId, result }) {
   if (!job?.creatorId || !job?.agencyId) return { ok: false, code: "JOB_SCOPE_INVALID" };
 
-  if (result?.progressive === true) {
-    const snapshot = await recomputeSnapshotCounts({
-      agencyId: job.agencyId,
-      creatorId: job.creatorId,
-      capturedAt: toDate(result?.capturedAt, new Date()),
-      source: "scheduled_api_snapshot_report",
-      deviceId,
-      metadata: { jobId: job.id, pages: result?.pages || null, reason: result?.reason || null, progressive: true, reportOnly: true, done: true },
+  if (result?.progressive === true || result?.reportOnly === true) {
+    // Progressive pages were already written through /presence/:creatorId/snapshot.
+    // Job report is only an acknowledgement; do not overwrite rows with users: [].
+    const snapshot = await prisma.creatorPresenceSnapshot.findUnique({
+      where: { agencyId_creatorId: { agencyId: job.agencyId, creatorId: job.creatorId } },
     });
-    return { ok: true, snapshot, loaded: result?.onlineCount || 0, reportOnly: true };
+
+    return {
+      ok: true,
+      snapshot,
+      loaded: result?.onlineCount || 0,
+      pages: result?.pages || 0,
+      reportOnly: true,
+    };
   }
 
   const users = Array.isArray(result?.users) ? result.users : Array.isArray(result?.onlineUsers) ? result.onlineUsers : [];
