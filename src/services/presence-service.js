@@ -83,7 +83,14 @@ function snapshotFreshness(snapshot) {
   const ageMs = captured ? Math.max(0, now - captured) : null;
 
   if (snapshot.status === "REFRESHING") {
-    return { state: "refreshing", isFresh: true, isMissing: false, isStale: false, ageMs };
+    const stillFresh = expires ? expires > now : captured ? ageMs <= SNAPSHOT_TTL_MS : false;
+    return {
+      state: stillFresh ? "refreshing" : "stale",
+      isFresh: stillFresh,
+      isMissing: false,
+      isStale: !stillFresh,
+      ageMs,
+    };
   }
 
   const fresh = expires ? expires > now : captured ? ageMs <= SNAPSHOT_TTL_MS : false;
@@ -104,11 +111,11 @@ async function assertCreatorAccess({ agencyId, creatorId }) {
 }
 
 async function recomputeSnapshotCounts({ agencyId, creatorId, capturedAt = new Date(), source = "backend", deviceId = null, metadata = {} }) {
-  const [onlineCount, staleCount, offlineCount] = await Promise.all([
-    prisma.creatorPresenceUser.count({ where: { agencyId, creatorId, status: "online" } }),
-    prisma.creatorPresenceUser.count({ where: { agencyId, creatorId, status: "stale" } }),
-    prisma.creatorPresenceUser.count({ where: { agencyId, creatorId, status: "offline" } }),
-  ]);
+  const onlineCount = await prisma.creatorPresenceUser.count({ where: { agencyId, creatorId, status: "online" } });
+  // v5: no stale/offline rows are kept in the online-users module. Fields remain
+  // for DB/API compatibility, but they are always zeroed by recompute.
+  const staleCount = 0;
+  const offlineCount = 0;
 
   const progressive = metadata?.progressive === true;
   const done = metadata?.done === true;
@@ -204,28 +211,20 @@ async function applyPresenceSnapshot({ agencyId, creatorId, deviceId = null, use
   const at = toDate(capturedAt, new Date());
   const { normalized, seenIds } = await upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, source, metadata });
 
-  let markedOffline = 0;
+  let removedAbsent = 0;
   if (markAbsentOffline) {
-    const update = await prisma.creatorPresenceUser.updateMany({
+    const deleted = await prisma.creatorPresenceUser.deleteMany({
       where: {
         agencyId,
         creatorId,
-        status: { in: ["online", "stale"] },
         ...(seenIds.size ? { fanId: { notIn: Array.from(seenIds) } } : {}),
       },
-      data: {
-        status: "offline",
-        source: "api_snapshot_absent",
-        lastOfflineAt: at,
-        lastCheckedAt: at,
-        updatedByDeviceId: deviceId,
-      },
     });
-    markedOffline = update.count;
+    removedAbsent = deleted.count;
   }
 
-  const snapshot = await recomputeSnapshotCounts({ agencyId, creatorId, capturedAt: at, source, deviceId, metadata: { ...metadata, loaded: normalized.length, markedOffline } });
-  return { ok: true, creator, snapshot, loaded: normalized.length, markedOffline };
+  const snapshot = await recomputeSnapshotCounts({ agencyId, creatorId, capturedAt: at, source, deviceId, metadata: { ...metadata, loaded: normalized.length, removedAbsent } });
+  return { ok: true, creator, snapshot, loaded: normalized.length, removedAbsent, markedOffline: 0 };
 }
 
 async function applyPresenceSnapshotProgressive({
@@ -249,23 +248,10 @@ async function applyPresenceSnapshotProgressive({
   const pageNumber = Number(page || 0);
   const meta = { ...metadata, progressive: true, done: !!done, refreshId, page: pageNumber || null, refreshStartedAt: startedAt.toISOString() };
 
-  // On the first progressive page, old "online" rows are no longer confirmed.
-  // Keep them visible as stale while the new API pages arrive, then complete()
-  // will mark rows absent from this refresh as offline.
+  // v5: no stale phase. The first progressive packet clears old rows;
+  // following packets append confirmed online users.
   if (!done && (pageNumber <= 1 || metadata?.mode === "append_first")) {
-    await prisma.creatorPresenceUser.updateMany({
-      where: {
-        agencyId,
-        creatorId,
-        status: { in: ["online", "stale"] },
-      },
-      data: {
-        status: "stale",
-        source: "api_snapshot_refresh_started",
-        lastCheckedAt: startedAt,
-        updatedByDeviceId: deviceId,
-      },
-    });
+    await prisma.creatorPresenceUser.deleteMany({ where: { agencyId, creatorId } });
   }
 
   const { normalized } = await upsertPresenceRows({
@@ -278,27 +264,19 @@ async function applyPresenceSnapshotProgressive({
     metadata: meta,
   });
 
-  let markedOffline = 0;
+  let removedAbsent = 0;
   if (done) {
-    const update = await prisma.creatorPresenceUser.updateMany({
+    const deleted = await prisma.creatorPresenceUser.deleteMany({
       where: {
         agencyId,
         creatorId,
-        status: { in: ["online", "stale"] },
         OR: [
           { lastSnapshotAt: null },
           { lastSnapshotAt: { lt: startedAt } },
         ],
       },
-      data: {
-        status: "offline",
-        source: "api_snapshot_absent_complete",
-        lastOfflineAt: at,
-        lastCheckedAt: at,
-        updatedByDeviceId: deviceId,
-      },
     });
-    markedOffline = update.count;
+    removedAbsent = deleted.count;
   }
 
   const snapshot = await recomputeSnapshotCounts({
@@ -307,10 +285,38 @@ async function applyPresenceSnapshotProgressive({
     capturedAt: at,
     source,
     deviceId,
-    metadata: { ...meta, loaded: normalized.length, markedOffline },
+    metadata: { ...meta, loaded: normalized.length, removedAbsent },
   });
 
-  return { ok: true, creator, snapshot, loaded: normalized.length, markedOffline, done: !!done };
+  return { ok: true, creator, snapshot, loaded: normalized.length, removedAbsent, markedOffline: 0, done: !!done };
+}
+
+
+async function markPresenceRefreshQueued({ agencyId, creatorId, deviceId = null, reason = "manual_presence_refresh", refreshId = null }) {
+  const creator = await assertCreatorAccess({ agencyId, creatorId });
+  if (!creator) return { ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" };
+
+  const at = new Date();
+
+  // v5: queued refresh clears visible rows instead of turning them into stale.
+  await prisma.creatorPresenceUser.deleteMany({ where: { agencyId, creatorId } });
+
+  const snapshot = await recomputeSnapshotCounts({
+    agencyId,
+    creatorId,
+    capturedAt: at,
+    source: "presence_refresh_queued",
+    deviceId,
+    metadata: {
+      progressive: true,
+      done: false,
+      queued: true,
+      reason,
+      refreshId,
+    },
+  });
+
+  return { ok: true, creator, snapshot, queued: true };
 }
 
 async function applyPresenceEvents({ agencyId, creatorId, deviceId = null, events = [] }) {
@@ -357,11 +363,7 @@ async function applyPresenceEvents({ agencyId, creatorId, deviceId = null, event
       for (const rawId of offlineIds) {
         const fanId = fanIdOf(rawId);
         if (!fanId) continue;
-        await prisma.creatorPresenceUser.upsert({
-          where: { creatorId_fanId: { creatorId, fanId } },
-          create: { agencyId, creatorId, fanId, username: `u${fanId}`, name: `u${fanId}`, status: "offline", source: "presence_check", lastOfflineAt: at, lastCheckedAt: at, updatedByDeviceId: deviceId, metadata: {} },
-          update: { status: "offline", source: "presence_check", lastOfflineAt: at, lastCheckedAt: at, updatedByDeviceId: deviceId },
-        });
+        await prisma.creatorPresenceUser.deleteMany({ where: { agencyId, creatorId, fanId } });
         offline += 1;
       }
     }
@@ -381,6 +383,7 @@ async function listPresence({ agencyId, creatorId, status = "visible", limit = 5
   // Do not show old snapshot as truth. Missing/stale returns empty users;
   // client should queue/await refresh. REFRESHING is considered fresh because
   // progressive pages are current and should be shown immediately.
+  // v5 never exposes stale/offline rows to the online list.
   if (!freshness.isFresh) {
     return { ok: true, creator, snapshot, freshness, users: [] };
   }
@@ -388,11 +391,11 @@ async function listPresence({ agencyId, creatorId, status = "visible", limit = 5
   const where = { agencyId, creatorId };
   if (status === "online") where.status = "online";
   else if (status === "offline") where.status = "offline";
-  else if (status === "visible") where.status = { in: ["online", "stale"] };
+  else if (status === "visible") where.status = "online";
 
   const users = await prisma.creatorPresenceUser.findMany({
     where,
-    orderBy: [{ status: "asc" }, { totalSpentCents: "desc" }, { lastOnlineAt: "desc" }],
+    orderBy: [{ totalSpentCents: "desc" }, { lastOnlineAt: "desc" }],
     take: Math.min(2000, Math.max(1, Number(limit || 500))),
   });
 
@@ -436,6 +439,7 @@ module.exports = {
   applyPresenceSnapshot,
   applyPresenceSnapshotProgressive,
   applyPresenceEvents,
+  markPresenceRefreshQueued,
   listPresence,
   recomputeSnapshotCounts,
   applyPresenceJobResult,
