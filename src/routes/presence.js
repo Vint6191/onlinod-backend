@@ -8,6 +8,7 @@ const {
   applyPresenceSnapshot,
   applyPresenceSnapshotProgressive,
   applyPresenceEvents,
+  markPresenceRefreshQueued,
   listPresence,
 } = require("../services/presence-service");
 const { ensurePresenceJobForCreator } = require("../services/presence-scheduler");
@@ -115,13 +116,25 @@ router.post("/creators/:creatorId/events", assertCreator, async (req, res) => {
 
 router.post("/creators/:creatorId/refresh", assertCreator, async (req, res) => {
   try {
+    const reason = req.body?.reason || "manual_presence_refresh";
+    const refreshId = req.body?.refreshId || `queued_${req.creator.id}_${Date.now()}`;
+
+    const marked = await markPresenceRefreshQueued({
+      agencyId: agencyId(req),
+      creatorId: req.creator.id,
+      deviceId: req.body?.deviceId || null,
+      reason,
+      refreshId,
+    });
+
     const result = await ensurePresenceJobForCreator({
       creatorId: req.creator.id,
       agencyId: agencyId(req),
       priority: Number(req.body?.priority || 120),
-      reason: req.body?.reason || "manual_presence_refresh",
+      reason,
     });
-    return res.json({ ok: true, ...result });
+
+    return res.json({ ok: true, refreshId, marked, ...result });
   } catch (err) {
     console.error("[presence/refresh] failed:", err);
     return res.status(500).json({ ok: false, code: "PRESENCE_REFRESH_FAILED", error: "Failed to queue refresh" });
