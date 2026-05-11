@@ -101,6 +101,7 @@ model Agency {
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
   presenceSnapshots CreatorPresenceSnapshot[]
   presenceUsers     CreatorPresenceUser[]
+  moneyAttributions MoneyAttribution[]
 
   @@index([deletedAt])
 }
@@ -964,4 +965,42 @@ model CreatorPresenceUser {
   @@index([lastOnlineAt])
   @@index([lastCheckedAt])
   @@index([updatedByDeviceId])
+}
+
+
+model MoneyAttribution {
+  id          String   @id @default(cuid())
+  agencyId    String
+  eventHash   String
+  eventType   String
+  amountCents Int
+  currency    String   @default("USD")
+  occurredAt  DateTime
+  capturedAt  DateTime @default(now())
+
+  creatorId   String?
+  accountId   String?
+  fanId       String?
+
+  state            String  @default("auto")
+  attributedToMemberId String?
+  attributedToUserId   String?
+
+  locked       Boolean  @default(false)
+  lockedAt     DateTime?
+  history      Json     @default("[]")
+
+  autoAttributedToMemberId String?
+  autoAttributedToUserId   String?
+  autoReason               String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  agency  Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, eventHash])
+  @@index([agencyId, occurredAt])
+  @@index([agencyId, attributedToMemberId, occurredAt])
+  @@index([agencyId, locked, occurredAt])
 }

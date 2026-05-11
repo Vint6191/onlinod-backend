@@ -472,7 +472,7 @@ async function buildHomeSummary({ agencyId, rangeKey = "7d" }) {
   const seatsLimit = subscription?.seatsLimit || null;
 
   const snapshotMessages = snapshotPart(snapshot, "messages", {
-    total: 0, team: 0, bot: 0, source: "snapshot_missing",
+    total: 0, team: 0, bot: 0, incoming: 0, source: "snapshot_missing",
   });
   const snapshotWorkers = snapshotPart(snapshot, "workers", {});
   const snapshotHealth = snapshotPart(snapshot, "health", {});
@@ -529,10 +529,11 @@ async function buildHomeSummary({ agencyId, rangeKey = "7d" }) {
       source: "creator_earnings_snapshots",
     },
     messages: {
-      total:  Number(snapshotMessages.total || 0),
-      team:   Number(snapshotMessages.team  || 0),
-      bot:    Number(snapshotMessages.bot   || 0),
-      source: snapshotMessages.source || "analytics_snapshot",
+      total:    Number(snapshotMessages.total    || 0),
+      team:     Number(snapshotMessages.team     || 0),
+      bot:      Number(snapshotMessages.bot      || 0),
+      incoming: Number(snapshotMessages.incoming || 0),
+      source:   snapshotMessages.source || "analytics_snapshot",
     },
     seats: {
       used: members.length,
