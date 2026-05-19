@@ -102,6 +102,8 @@ model Agency {
   presenceSnapshots CreatorPresenceSnapshot[]
   presenceUsers     CreatorPresenceUser[]
   moneyAttributions MoneyAttribution[]
+  mediaAssets       CreatorMediaAsset[]
+  mediaDeliveryEvents CreatorMediaDeliveryEvent[]
 
   @@index([deletedAt])
 }
@@ -161,6 +163,8 @@ model CreatorAccount {
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
   presenceSnapshot CreatorPresenceSnapshot?
   presenceUsers    CreatorPresenceUser[]
+  mediaAssets      CreatorMediaAsset[]
+  mediaDeliveryEvents CreatorMediaDeliveryEvent[]
 
   @@index([agencyId])
   @@index([status])
@@ -1003,4 +1007,55 @@ model MoneyAttribution {
   @@index([agencyId, occurredAt])
   @@index([agencyId, attributedToMemberId, occurredAt])
   @@index([agencyId, locked, occurredAt])
+}
+
+model CreatorMediaAsset {
+  id          String   @id @default(cuid())
+  agencyId    String
+  creatorId   String
+  mediaId     String
+
+  type              String?
+  durationSec       Int?
+  costCents         Int?
+  targetPriceCents  Int?
+  tags              Json     @default("[]")
+  metadata          Json     @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, mediaId])
+  @@index([agencyId])
+  @@index([creatorId])
+  @@index([mediaId])
+}
+
+model CreatorMediaDeliveryEvent {
+  id        String   @id @default(cuid())
+  agencyId  String
+  creatorId String
+
+  messageId String
+  mediaId   String
+
+  packSize             Int    @default(1)
+  packagePriceCents    Int    @default(0)
+  allocatedAmountCents Int    @default(0)
+  status               String @default("not_opened")
+  source               String @default("electron")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, messageId, mediaId])
+  @@index([agencyId])
+  @@index([creatorId, mediaId])
+  @@index([creatorId, status])
 }
