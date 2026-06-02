@@ -37,7 +37,12 @@ router.post("/deliveries/upsert", async (req, res) => {
     const fanId = cleanString(req.body?.fanId || req.body?.userId, 80);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
-    const id = cleanString(req.body?.id, 100);
+    // Electron присылает свой локальный id вида "bd_...", который НЕ является
+    // серверным cuid. Доверяем id только если это похоже на серверный ключ
+    // (cuid: начинается с 'c', без префикса 'bd_'/'local'/'tmp'). Иначе игнорируем,
+    // чтобы дедуп ушёл в ветку по messageId, а не делал create по несуществующему id.
+    const rawId = cleanString(req.body?.id, 100);
+    const id = rawId && !/^(bd_|local|tmp|temp)/i.test(rawId) ? rawId : "";
     const data = {
       agencyId: req.auth.agencyId,
       creatorId,
@@ -76,7 +81,7 @@ router.post("/deliveries/upsert", async (req, res) => {
     } else {
       item = await prisma.automationDelivery.create({ data });
     }
-    return res.json({ ok: true, item });
+    return res.json({ ok: true, item, _dedup: "v2-messageId" });
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_UPSERT_FAILED"); }
 });
 
