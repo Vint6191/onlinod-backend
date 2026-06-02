@@ -56,9 +56,26 @@ router.post("/deliveries/upsert", async (req, res) => {
       error: optionalString(req.body?.error, 2000),
       createdByUserId: req.auth.userId,
     };
-    const item = id
-      ? await prisma.automationDelivery.upsert({ where: { id }, create: data, update: { ...data, agencyId: undefined, creatorId: undefined, fanId: undefined } })
-      : await prisma.automationDelivery.create({ data });
+    // Dedup logic:
+    // 1) explicit server id -> upsert by primary key
+    // 2) else if messageId present -> find existing row for this creator+messageId and update it
+    //    (prevents the sweep from inserting a fresh clone on every tick)
+    // 3) else -> create (drafts / no message yet)
+    const updateData = { ...data, agencyId: undefined, creatorId: undefined, fanId: undefined };
+    let item;
+    if (id) {
+      item = await prisma.automationDelivery.upsert({ where: { id }, create: data, update: updateData });
+    } else if (data.messageId) {
+      const existing = await prisma.automationDelivery.findFirst({
+        where: { agencyId: req.auth.agencyId, creatorId, messageId: data.messageId },
+        select: { id: true },
+      });
+      item = existing
+        ? await prisma.automationDelivery.update({ where: { id: existing.id }, data: updateData })
+        : await prisma.automationDelivery.create({ data });
+    } else {
+      item = await prisma.automationDelivery.create({ data });
+    }
     return res.json({ ok: true, item });
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_UPSERT_FAILED"); }
 });
