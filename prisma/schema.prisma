@@ -1468,6 +1468,7 @@ model AutomationDelivery {
 
   @@index([agencyId, status])
   @@index([creatorId, fanId])
+  @@index([creatorId, messageId])
   @@index([ruleId])
   @@index([sentAt])
 }
