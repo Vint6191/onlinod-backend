@@ -29,6 +29,13 @@ const homeRoutes = require("./routes/home");
 const telemetryRoutes = require("./routes/telemetry");
 const analyticsRoutes = require("./routes/analytics");
 const presenceRoutes = require("./routes/presence");
+const contentStoreRoutes = require("./routes/content-store");
+const crmStoreRoutes = require("./routes/crm-store");
+const fanListsRoutes = require("./routes/fan-lists");
+const segmentsRoutes = require("./routes/segments");
+const campaignsRoutes = require("./routes/campaigns");
+const automationStoreRoutes = require("./routes/automation-store");
+const vaultSalesRoutes = require("./routes/vault-sales");
 const { authRequired } = require("./middleware/auth");
 const { startRecurringScheduler } = require("./services/job-scheduler");
 const { startPresenceScheduler } = require("./services/presence-scheduler");
@@ -55,7 +62,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     status: "healthy",
     service: "onlinod-backend",
-    version: "0.7.1",
+    version: "0.8.0-server-stores",
     time: new Date().toISOString(),
   });
 });
@@ -64,7 +71,7 @@ app.get("/api", (_req, res) => {
   res.json({
     ok: true,
     service: "onlinod-backend",
-    version: "0.7.1",
+    version: "0.8.0-server-stores",
   });
 });
 
@@ -81,6 +88,13 @@ app.use("/api/jobs", authRequired, jobsRoutes);
 app.use("/api/telemetry", authRequired, telemetryRoutes);
 app.use("/api/analytics", authRequired, analyticsRoutes);
 app.use("/api/presence", authRequired, presenceRoutes);
+app.use("/api/server/content", authRequired, contentStoreRoutes);
+app.use("/api/server/crm", authRequired, crmStoreRoutes);
+app.use("/api/server/fan-lists", authRequired, fanListsRoutes);
+app.use("/api/server/segments", authRequired, segmentsRoutes);
+app.use("/api/server/campaigns", authRequired, campaignsRoutes);
+app.use("/api/server/automation", authRequired, automationStoreRoutes);
+app.use("/api/server/vault-sales", authRequired, vaultSalesRoutes);
 app.use("/api/home", authRequired, homeRoutes);
 app.use("/api/team/analytics", authRequired, teamAnalyticsRoutes);
 app.use("/api/team/claims", authRequired, teamClaimsRoutes);

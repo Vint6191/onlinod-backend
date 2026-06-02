@@ -104,6 +104,22 @@ model Agency {
   moneyAttributions MoneyAttribution[]
   mediaAssets       CreatorMediaAsset[]
   mediaDeliveryEvents CreatorMediaDeliveryEvent[]
+  contentCollections ContentCollection[]
+  crmProfiles CrmProfile[]
+  crmProfileTags CrmProfileTag[]
+  crmProfileRawTags CrmProfileRawTag[]
+  crmNotes CrmNote[]
+  crmAnalysisRuns CrmAnalysisRun[]
+  fanLists FanList[]
+  fanListMembers FanListMember[]
+  savedSegments SavedSegment[]
+  campaignDrafts CampaignDraft[]
+  campaignQueueStatuses CampaignQueueStatus[]
+  automationDeliveries AutomationDelivery[]
+  hiddenOnlineUsers HiddenOnlineUser[]
+  followBackTasks FollowBackTask[]
+  vaultPurchaseMessages VaultPurchaseMessage[]
+  vaultMediaSales VaultMediaSale[]
 
   @@index([deletedAt])
 }
@@ -165,6 +181,20 @@ model CreatorAccount {
   presenceUsers    CreatorPresenceUser[]
   mediaAssets      CreatorMediaAsset[]
   mediaDeliveryEvents CreatorMediaDeliveryEvent[]
+  contentCollections ContentCollection[]
+  crmProfiles CrmProfile[]
+  crmNotes CrmNote[]
+  crmAnalysisRuns CrmAnalysisRun[]
+  fanLists FanList[]
+  fanListMembers FanListMember[]
+  savedSegments SavedSegment[]
+  campaignDrafts CampaignDraft[]
+  campaignQueueStatuses CampaignQueueStatus[]
+  automationDeliveries AutomationDelivery[]
+  hiddenOnlineUsers HiddenOnlineUser[]
+  followBackTasks FollowBackTask[]
+  vaultPurchaseMessages VaultPurchaseMessage[]
+  vaultMediaSales VaultMediaSale[]
 
   @@index([agencyId])
   @@index([status])
@@ -1050,6 +1080,492 @@ model CreatorMediaDeliveryEvent {
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, messageId, mediaId])
+  @@index([agencyId])
+  @@index([creatorId, mediaId])
+  @@index([creatorId, status])
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ONLINOD SERVER STORES v1
+// Server is the source of truth for content, CRM, lists, campaign drafts,
+// automation state, and vault sales/intel metadata. Electron keeps only
+// session/cookies/runtime cache and executes OF requests.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ContentCollection {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String?
+  kind            String   @default("message_library") // message_library | bump | campaign_draft | custom
+  title           String
+  description     String?
+  tags            Json     @default("[]")
+  status          String   @default("active") // active | archived | deleted
+  clientId        String?
+  createdByUserId String?
+  updatedByUserId String?
+  deletedAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+  blocks  ContentBlock[]
+
+  @@unique([agencyId, clientId])
+  @@index([agencyId, kind, status])
+  @@index([creatorId, kind, status])
+  @@index([updatedAt])
+  @@index([deletedAt])
+}
+
+model ContentBlock {
+  id              String   @id @default(cuid())
+  collectionId    String
+  order           Int      @default(0)
+  role            String   @default("message")
+  title           String?
+  text            String   @default("")
+  priceCents      Int      @default(0)
+  currency        String   @default("USD")
+  lockedText      Boolean  @default(false)
+  media           Json     @default("[]")
+  note            String?
+  metadata        Json     @default("{}")
+  clientId        String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  collection ContentCollection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+
+  @@unique([collectionId, clientId])
+  @@index([collectionId, order])
+}
+
+model ContentUsageEvent {
+  id             String   @id @default(cuid())
+  agencyId       String
+  collectionId   String?
+  blockId        String?
+  creatorId      String?
+  fanId          String?
+  dialogId       String?
+  eventType      String   @default("used")
+  metadata       Json     @default("{}")
+  createdByUserId String?
+  createdAt      DateTime @default(now())
+
+  @@index([agencyId, createdAt])
+  @@index([collectionId])
+  @@index([creatorId, fanId])
+}
+
+model CrmProfile {
+  id                 String   @id @default(cuid())
+  agencyId           String
+  creatorId          String
+  fanId              String
+  dialogId           String   @default("")
+  username           String?
+  name               String?
+  preferredName      String?
+  age                String?
+  location           String?
+  country            String?
+  city               String?
+  timezone           String?
+  nativeLanguage     String?
+  chatLanguage       String?
+  profession         String?
+  spenderTier        String?
+  stage              String?
+  fanRole            String?
+  controlPreference  String?
+  creatorRole        String?
+  tone               String?
+  dynamicSummary     String?
+  aiSummary          String?
+  info               Json     @default("{}")
+  ppvStats           Json     @default("{}")
+  messageStats       Json     @default("{}")
+  source             String   @default("electron")
+  analyzedAt         DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  tags    CrmProfileTag[]
+  rawTags CrmProfileRawTag[]
+  notes   CrmNote[]
+  runs    CrmAnalysisRun[]
+
+  @@unique([creatorId, fanId])
+  @@index([agencyId])
+  @@index([creatorId])
+  @@index([creatorId, dialogId])
+  @@index([country])
+  @@index([city])
+  @@index([nativeLanguage])
+  @@index([chatLanguage])
+  @@index([fanRole])
+  @@index([updatedAt])
+}
+
+model CrmProfileTag {
+  id              String   @id @default(cuid())
+  agencyId        String
+  profileId       String
+  tagKey          String
+  label           String
+  kind            String   @default("fetish") // fetish | content | preference | tool | format | dynamic
+  category        String?
+  facets          Json     @default("[]")
+  intensity       String?
+  nicheLevel      String?
+  broadcastPolicy String?
+  confidence      Float?
+  source          String   @default("ai")
+  negative        Boolean  @default(false)
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency     @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  profile CrmProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, tagKey, kind, source])
+  @@index([agencyId, tagKey])
+  @@index([agencyId, category])
+  @@index([agencyId, kind])
+  @@index([broadcastPolicy])
+  @@index([nicheLevel])
+}
+
+model CrmProfileRawTag {
+  id          String   @id @default(cuid())
+  agencyId    String
+  profileId   String
+  rawLabel    String
+  mappedKey   String?
+  kind        String?
+  status      String   @default("needs_review") // mapped | needs_review | negative | ignored
+  confidence  Float?
+  metadata    Json     @default("{}")
+  createdAt   DateTime @default(now())
+
+  agency  Agency     @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  profile CrmProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, status])
+  @@index([profileId])
+  @@index([mappedKey])
+}
+
+model CrmNote {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  profileId       String
+  kind            String   @default("auto") // auto | manual | summary | warning
+  text            String
+  metadata        Json     @default("{}")
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  profile CrmProfile     @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, creatorId])
+  @@index([profileId, kind])
+  @@index([deletedAt])
+}
+
+model CrmAnalysisRun {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  profileId       String?
+  dialogId        String?
+  fanId           String?
+  status          String   @default("done") // queued | running | done | failed
+  model           String?
+  promptVersion   String?
+  analysis        Json     @default("{}")
+  error           String?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+
+  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  profile CrmProfile?     @relation(fields: [profileId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId, creatorId, createdAt])
+  @@index([profileId])
+  @@index([status])
+}
+
+model FanList {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String?
+  name            String
+  description     String?
+  type            String   @default("manual") // manual | dynamic | imported | system
+  filters         Json     @default("{}")
+  status          String   @default("active")
+  createdByUserId String?
+  deletedAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+  members FanListMember[]
+
+  @@index([agencyId, type, status])
+  @@index([creatorId])
+  @@index([deletedAt])
+}
+
+model FanListMember {
+  id              String   @id @default(cuid())
+  agencyId        String
+  listId          String
+  creatorId       String?
+  fanId           String
+  dialogId        String?
+  username        String?
+  name            String?
+  source          String   @default("manual")
+  matchedReasons  Json     @default("[]")
+  metadata        Json     @default("{}")
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+
+  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  list    FanList         @relation(fields: [listId], references: [id], onDelete: Cascade)
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+
+  @@unique([listId, fanId])
+  @@index([agencyId, fanId])
+  @@index([creatorId, fanId])
+}
+
+model SavedSegment {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String?
+  name            String
+  description     String?
+  filters         Json     @default("{}")
+  safety          Json     @default("{}")
+  preview         Json     @default("{}")
+  status          String   @default("active")
+  createdByUserId String?
+  deletedAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
+  campaignDrafts CampaignDraft[]
+
+  @@index([agencyId, status])
+  @@index([creatorId])
+  @@index([deletedAt])
+}
+
+model CampaignDraft {
+  id                  String   @id @default(cuid())
+  agencyId            String
+  creatorId           String
+  segmentId           String?
+  contentCollectionId String?
+  title               String?
+  text                String   @default("")
+  priceCents          Int      @default(0)
+  currency            String   @default("USD")
+  lockedText          Boolean  @default(false)
+  media               Json     @default("[]")
+  previews            Json     @default("[]")
+  filters             Json     @default("{}")
+  manualUserIds       Json     @default("[]")
+  status              String   @default("draft") // draft | queued | sent | archived | deleted
+  createdByUserId     String?
+  deletedAt           DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  agency    Agency              @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator   CreatorAccount      @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  segment   SavedSegment?       @relation(fields: [segmentId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId, status])
+  @@index([creatorId, status])
+  @@index([segmentId])
+  @@index([deletedAt])
+}
+
+model CampaignQueueStatus {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  draftId         String?
+  ofQueueId       String
+  status          String   @default("active") // active | done | canceled | failed
+  audienceCount   Int      @default(0)
+  priceCents      Int      @default(0)
+  mediaCount      Int      @default(0)
+  payload         Json     @default("{}")
+  lastOfResponse  Json     @default("{}")
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, ofQueueId])
+  @@index([agencyId, status])
+  @@index([creatorId, status])
+}
+
+model AutomationDelivery {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  ruleId          String?
+  contentCollectionId String?
+  fanId           String
+  dialogId        String?
+  trigger         String?
+  status          String   @default("scheduled") // scheduled | sent | skipped | failed | canceled
+  scheduledAt     DateTime?
+  sentAt          DateTime?
+  messageId       String?
+  priceCents      Int      @default(0)
+  media           Json     @default("[]")
+  result          Json     @default("{}")
+  error           String?
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, status])
+  @@index([creatorId, fanId])
+  @@index([ruleId])
+  @@index([sentAt])
+}
+
+model HiddenOnlineUser {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  fanId           String
+  dialogId        String?
+  username        String?
+  name            String?
+  totalSpentCents Int      @default(0)
+  status          String   @default("active") // active | ignored | blocked | removed
+  signals         Json     @default("[]")
+  metadata        Json     @default("{}")
+  lastSignalAt    DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, fanId])
+  @@index([agencyId, status])
+  @@index([creatorId, status])
+  @@index([lastSignalAt])
+}
+
+model FollowBackTask {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  fanId           String
+  dialogId        String?
+  username        String?
+  name            String?
+  action          String   @default("follow_back")
+  status          String   @default("pending") // pending | running | done | skipped | failed
+  reason          String?
+  result          Json     @default("{}")
+  error           String?
+  queuedAt        DateTime @default(now())
+  lastResultAt    DateTime?
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, fanId, action])
+  @@index([agencyId, status])
+  @@index([creatorId, status])
+}
+
+model VaultPurchaseMessage {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  fanId           String?
+  dialogId        String?
+  messageId       String
+  amountCents     Int      @default(0)
+  currency        String   @default("USD")
+  purchasedAt     DateTime?
+  resolved        Boolean  @default(false)
+  resolvedAt      DateTime?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, messageId])
+  @@index([agencyId])
+  @@index([creatorId, fanId])
+  @@index([purchasedAt])
+}
+
+model VaultMediaSale {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  messageId       String
+  mediaId         String
+  fanId           String?
+  dialogId        String?
+  status          String   @default("sold") // sold | not_opened | refunded | unknown
+  allocatedAmountCents Int @default(0)
+  packagePriceCents    Int @default(0)
+  packSize        Int      @default(1)
+  reason          String?
+  purchasedAt     DateTime?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
