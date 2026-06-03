@@ -2,7 +2,7 @@
 
 const express = require("express");
 const prisma = require("../prisma");
-const { cleanString, optionalString, jsonArray, jsonObject, centsFromAny, parseLimit, parseOffset, requireCreator, sendError } = require("../services/server-store-utils");
+const { cleanString, optionalString, jsonArray, jsonObject, centsFromAny, parseLimit, parseOffset, positiveInt, requireCreator, sendError } = require("../services/server-store-utils");
 
 const router = express.Router();
 
@@ -162,6 +162,76 @@ router.post("/follow-back/upsert", async (req, res) => {
     });
     return res.json({ ok: true, item });
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_UPSERT_FAILED"); }
+});
+
+// ─── Bump reply-rate aggregate ────────────────────────────────────────────────
+// Атомарный счётчик по (creatorId, templateId, day). Клиент шлёт по одному событию
+// на каждый переход бампа: sent при отправке, replied/canceled/expired/failed в финале.
+// Дубль-вызовы безопасны на уровне суммы только если клиент гарантирует один вызов
+// на переход (он гарантирует через флаг statCounted в локальной записи).
+const STAT_EVENTS = new Set(["sent", "replied", "canceled", "expired", "failed"]);
+
+router.post("/deliveries/stat-bump", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const event = cleanString(req.body?.event, 40);
+    if (!STAT_EVENTS.has(event)) {
+      return res.status(400).json({ ok: false, code: "BAD_EVENT", error: "event must be one of: " + Array.from(STAT_EVENTS).join(", ") });
+    }
+    const templateId = cleanString(req.body?.templateId, 100) || "";
+    // day: YYYY-MM-DD (UTC). Берём из тела если прислали, иначе серверный сегодняшний.
+    const day = cleanString(req.body?.day, 10) || new Date().toISOString().slice(0, 10);
+    const by = Math.max(1, Math.min(1000, positiveInt(req.body?.by, 1)));
+
+    const item = await prisma.bumpDeliveryStat.upsert({
+      where: { creatorId_templateId_day: { creatorId, templateId, day } },
+      create: {
+        agencyId: req.auth.agencyId, creatorId, templateId, day,
+        sent: event === "sent" ? by : 0,
+        replied: event === "replied" ? by : 0,
+        canceled: event === "canceled" ? by : 0,
+        expired: event === "expired" ? by : 0,
+        failed: event === "failed" ? by : 0,
+      },
+      update: { [event]: { increment: by } },
+    });
+    return res.json({ ok: true, item });
+  } catch (err) { return sendError(res, err, "BUMP_STAT_FAILED"); }
+});
+
+router.get("/deliveries/bump-stats", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.query?.creatorId, 100);
+    const fromDay = cleanString(req.query?.from, 10);
+    const toDay = cleanString(req.query?.to, 10);
+
+    const where = { agencyId: req.auth.agencyId };
+    if (creatorId) where.creatorId = creatorId;
+    if (fromDay || toDay) {
+      where.day = {};
+      if (fromDay) where.day.gte = fromDay;
+      if (toDay) where.day.lte = toDay;
+    }
+
+    const rows = await prisma.bumpDeliveryStat.findMany({ where, orderBy: { day: "desc" }, take: parseLimit(req.query?.limit, 500, 5000) });
+
+    // Сводки: всего и по шаблону.
+    const totals = { sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0 };
+    const byTemplate = {};
+    for (const r of rows) {
+      for (const k of ["sent", "replied", "canceled", "expired", "failed"]) totals[k] += r[k] || 0;
+      const t = r.templateId || "";
+      if (!byTemplate[t]) byTemplate[t] = { templateId: t, sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0 };
+      for (const k of ["sent", "replied", "canceled", "expired", "failed"]) byTemplate[t][k] += r[k] || 0;
+    }
+    const rate = (rep, sent) => (sent > 0 ? Math.round((rep / sent) * 10000) / 100 : 0);
+    totals.replyRate = rate(totals.replied, totals.sent);
+    const perTemplate = Object.values(byTemplate).map((t) => ({ ...t, replyRate: rate(t.replied, t.sent) }))
+      .sort((a, b) => b.replyRate - a.replyRate);
+
+    return res.json({ ok: true, totals, perTemplate, days: rows });
+  } catch (err) { return sendError(res, err, "BUMP_STATS_READ_FAILED"); }
 });
 
 module.exports = router;
