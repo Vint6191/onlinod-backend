@@ -176,6 +176,13 @@
     dataDeleteRecord:  (model, id, query) => request(`/api/admin/data/record/${encodeURIComponent(model)}/${encodeURIComponent(id)}`, { method: "DELETE", query }),
     dataBulkDelete:    (body)   => request("/api/admin/data/bulk-delete", { method: "POST", body }),
     dataPurgeDeliveries:(body)  => request("/api/admin/data/purge-deliveries", { method: "POST", body }),
+
+    // ─── billing management (admin-billing.js) ────────────────
+    billingOverview:   ()       => request("/api/admin/billing/overview"),
+    billingAgency:     (id)     => request(`/api/admin/billing/agency/${encodeURIComponent(id)}`),
+    billingTiers:      ()       => request("/api/admin/billing/tiers"),
+    billingSetCreator: (id, body) => request(`/api/admin/billing/creator/${encodeURIComponent(id)}`, { method: "PATCH", body }),
+    billingApplyTier:  (id, body) => request(`/api/admin/billing/agency/${encodeURIComponent(id)}/apply-tier`, { method: "POST", body }),
   };
 
   window.OnlinodAdminApi = api;

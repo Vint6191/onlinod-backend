@@ -10,6 +10,7 @@ const creatorConnectRoutes = require("./routes/creator-connect");
 const accessSnapshotRoutes = require("./routes/access-snapshots");
 const adminRoutes = require("./routes/admin");
 const adminDataRoutes = require("./routes/admin-data");
+const adminBillingRoutes = require("./routes/admin-billing");
 const adminAuthRoutes = require("./routes/admin-auth");
 const impersonateRoutes = require("./routes/impersonate");
 const workspaceRoutes = require("./routes/workspace");
@@ -80,6 +81,7 @@ app.get("/api", (_req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/admin-auth", adminAuthRoutes);
 app.use("/api/admin/data", adminDataRoutes);
+app.use("/api/admin/billing", adminBillingRoutes);
 app.use("/api/admin", adminRoutes);
 app.use("/api/impersonate", impersonateRoutes);
 app.use("/api/workspace", workspaceRoutes);

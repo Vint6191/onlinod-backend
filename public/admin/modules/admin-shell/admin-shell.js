@@ -26,6 +26,7 @@
     { key: "users",     label: "Users",     icon: "👤" },
     { key: "creators",  label: "Creators",  icon: "★" },
     { key: "data",      label: "Data",      icon: "⛁" },
+    { key: "billing",   label: "Billing",   icon: "$" },
     { key: "devices",   label: "Devices",   icon: "▤" },
     { key: "audit",     label: "Audit",     icon: "≡" },
     { key: "admins",    label: "Admins",    icon: "⛨" },
@@ -90,6 +91,7 @@
     // Detail pages highlight their parent section in the rail.
     if (active === "agency-detail") active = "agencies";
     if (active === "creator-detail" || active === "creators-detail") active = "creators";
+    if (active === "billing-detail") active = "billing";
 
     const items = SECTIONS.map((s) => `
       <div class="adm-rail-item ${s.key === active ? "active" : ""}" data-section="${r.escapeAttr(s.key)}">
@@ -216,6 +218,10 @@
     }
     if (section === "data") {
       window.OnlinodAdminData.render(main);
+      return;
+    }
+    if (section === "billing" || section === "billing-detail") {
+      window.OnlinodAdminBilling.render(main);
       return;
     }
     if (section === "creator-detail" || section === "creators-detail") {
