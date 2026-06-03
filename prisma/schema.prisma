@@ -1576,3 +1576,22 @@ model VaultMediaSale {
   @@index([creatorId, mediaId])
   @@index([creatorId, status])
 }
+
+model BumpDeliveryStat {
+  id          String   @id @default(cuid())
+  agencyId    String
+  creatorId   String
+  templateId  String   @default("")
+  day         String
+  sent        Int      @default(0)
+  replied     Int      @default(0)
+  canceled    Int      @default(0)
+  expired     Int      @default(0)
+  failed      Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([creatorId, templateId, day])
+  @@index([agencyId, day])
+  @@index([creatorId, day])
+}
