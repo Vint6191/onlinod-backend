@@ -25,6 +25,7 @@
     { key: "agencies",  label: "Agencies",  icon: "◫" },
     { key: "users",     label: "Users",     icon: "👤" },
     { key: "creators",  label: "Creators",  icon: "★" },
+    { key: "data",      label: "Data",      icon: "⛁" },
     { key: "devices",   label: "Devices",   icon: "▤" },
     { key: "audit",     label: "Audit",     icon: "≡" },
     { key: "admins",    label: "Admins",    icon: "⛨" },
@@ -68,7 +69,8 @@
 
         <div class="adm-topbar-search">
           <span>⌕</span>
-          <span>search agencies, users, creators…  (todo)</span>
+          <input id="admGlobalSearch" type="text" placeholder="search fan / @username / messageId / creator / agency…" autocomplete="off" />
+          <div class="adm-search-results" id="admSearchResults"></div>
         </div>
 
         <div class="adm-topbar-spacer"></div>
@@ -87,6 +89,7 @@
     let active = state.section || "dashboard";
     // Detail pages highlight their parent section in the rail.
     if (active === "agency-detail") active = "agencies";
+    if (active === "creator-detail" || active === "creators-detail") active = "creators";
 
     const items = SECTIONS.map((s) => `
       <div class="adm-rail-item ${s.key === active ? "active" : ""}" data-section="${r.escapeAttr(s.key)}">
@@ -114,6 +117,9 @@
       });
     });
 
+    // Global search
+    bindGlobalSearch(root);
+
     // Logout via the user pill
     const userMenu = root.querySelector("#admUserMenu");
     if (userMenu) {
@@ -125,6 +131,61 @@
         R().render();
       });
     }
+  }
+
+  let searchTimer = null;
+  function bindGlobalSearch(root) {
+    const input = root.querySelector("#admGlobalSearch");
+    const box   = root.querySelector("#admSearchResults");
+    if (!input || !box) return;
+    const A = () => window.OnlinodAdminApi;
+    const close = () => { box.classList.remove("active"); box.innerHTML = ""; };
+    input.addEventListener("input", () => {
+      const q = input.value.trim();
+      clearTimeout(searchTimer);
+      if (q.length < 2) { close(); return; }
+      searchTimer = setTimeout(async () => {
+        const r = await A().dataSearch(q);
+        if (!r || !r.ok) { close(); return; }
+        renderSearchResults(box, r.results || {});
+      }, 250);
+    });
+    input.addEventListener("keydown", (e) => { if (e.key === "Escape") { input.value = ""; close(); } });
+    document.addEventListener("click", (e) => { if (!box.contains(e.target) && e.target !== input) close(); });
+  }
+
+  function renderSearchResults(box, results) {
+    const R = () => window.OnlinodAdminRouter;
+    const esc = R().escapeHtml;
+    const groups = [];
+    const grp = (title, rows, mapFn) => {
+      if (!rows || !rows.length) return;
+      groups.push(`<div class="adm-search-group"><div class="adm-search-group-title">${esc(title)}</div>${rows.map(mapFn).join("")}</div>`);
+    };
+    grp("Agencies", results.agencies, (a) =>
+      `<div class="adm-search-row" data-go="agency" data-id="${esc(a.id)}"><b>${esc(a.name)}</b><span>${esc(a.plan || "")} · ${esc(a.status || "")}</span></div>`);
+    grp("Creators", results.creators, (c) =>
+      `<div class="adm-search-row" data-go="creator" data-id="${esc(c.id)}"><b>${esc(c.displayName || c.username || c.id)}</b><span>@${esc(c.username || "")} · ${esc(c.status || "")}</span></div>`);
+    grp("Users", results.users, (u) =>
+      `<div class="adm-search-row" data-go="user" data-id="${esc(u.id)}"><b>${esc(u.email)}</b><span>${esc(u.name || "")}</span></div>`);
+    grp("Fan profiles (CRM)", results.crmProfiles, (p) =>
+      `<div class="adm-search-row" data-go="creator" data-id="${esc(p.creatorId)}"><b>${esc(p.name || p.username || ("fan " + p.fanId))}</b><span>fan ${esc(p.fanId)} · creator ${esc(String(p.creatorId).slice(0,8))}…</span></div>`);
+    grp("Hidden online", results.hiddenOnline, (h) =>
+      `<div class="adm-search-row" data-go="creator" data-id="${esc(h.creatorId)}"><b>${esc(h.username || ("fan " + h.fanId))}</b><span>${esc(h.status || "")} · fan ${esc(h.fanId)}</span></div>`);
+    grp("Deliveries (by msg/fan)", results.deliveries, (d) =>
+      `<div class="adm-search-row" data-go="creator" data-id="${esc(d.creatorId)}"><b>fan ${esc(d.fanId)}</b><span>${esc(d.status || "")} · msg ${esc(d.messageId || "—")}</span></div>`);
+    box.innerHTML = groups.length ? groups.join("") : `<div class="adm-search-empty">nothing found</div>`;
+    box.classList.add("active");
+    box.querySelectorAll(".adm-search-row").forEach((el) => {
+      el.addEventListener("click", () => {
+        const go = el.dataset.go, id = el.dataset.id;
+        box.classList.remove("active");
+        const input = document.querySelector("#admGlobalSearch"); if (input) input.value = "";
+        if (go === "agency") R().pushAgencyDetail(id);
+        else if (go === "creator") R().pushDetail("creators", id);
+        else if (go === "user") R().pushSection("users");
+      });
+    });
   }
 
   function renderActivePage(root) {
@@ -151,6 +212,14 @@
     }
     if (section === "creators") {
       window.OnlinodAdminCreators.render(main);
+      return;
+    }
+    if (section === "data") {
+      window.OnlinodAdminData.render(main);
+      return;
+    }
+    if (section === "creator-detail" || section === "creators-detail") {
+      window.OnlinodAdminCreatorDetail.render(main);
       return;
     }
     if (section === "devices") {

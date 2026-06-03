@@ -155,6 +155,27 @@
     createAdminUser:  (body) => request("/api/admin/admin-users", { method: "POST", body }),
     patchAdminUser:   (id, body) => request(`/api/admin/admin-users/${encodeURIComponent(id)}`, { method: "PATCH", body }),
     resetAdminPwd:    (id, body) => request(`/api/admin/admin-users/${encodeURIComponent(id)}/reset-password`, { method: "POST", body }),
+
+    // ─── deep data explorer (admin-data.js) ───────────────────
+    dataSearch:        (q)      => request("/api/admin/data/search", { query: { q } }),
+    dataAnomalies:     ()       => request("/api/admin/data/anomalies"),
+    creatorOverview:   (id)     => request(`/api/admin/data/creator/${encodeURIComponent(id)}/overview`),
+    crmProfiles:       (query)  => request("/api/admin/data/crm-profiles", { query }),
+    crmProfile:        (id)     => request(`/api/admin/data/crm-profiles/${encodeURIComponent(id)}`),
+    crmTags:           (query)  => request("/api/admin/data/crm-tags", { query }),
+    crmNotes:          (query)  => request("/api/admin/data/crm-notes", { query }),
+    dataDeliveries:    (query)  => request("/api/admin/data/deliveries", { query }),
+    dataBumpStats:     (query)  => request("/api/admin/data/bump-stats", { query }),
+    dataHiddenOnline:  (query)  => request("/api/admin/data/hidden-online", { query }),
+    dataFollowBack:    (query)  => request("/api/admin/data/follow-back", { query }),
+    dataVaultSales:    (query)  => request("/api/admin/data/vault-sales", { query }),
+    dataVaultPurch:    (query)  => request("/api/admin/data/vault-purchases", { query }),
+    dataMoney:         (query)  => request("/api/admin/data/money", { query }),
+    dataContent:       (query)  => request("/api/admin/data/content", { query }),
+    dataInspect:       (model, id) => request(`/api/admin/data/inspect/${encodeURIComponent(model)}/${encodeURIComponent(id)}`),
+    dataDeleteRecord:  (model, id, query) => request(`/api/admin/data/record/${encodeURIComponent(model)}/${encodeURIComponent(id)}`, { method: "DELETE", query }),
+    dataBulkDelete:    (body)   => request("/api/admin/data/bulk-delete", { method: "POST", body }),
+    dataPurgeDeliveries:(body)  => request("/api/admin/data/purge-deliveries", { method: "POST", body }),
   };
 
   window.OnlinodAdminApi = api;

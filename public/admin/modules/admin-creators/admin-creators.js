@@ -152,7 +152,7 @@
     const u = U();
 
     return `
-      <tr data-agency-id="${r.escapeAttr(c.agencyId)}">
+      <tr data-agency-id="${r.escapeAttr(c.agencyId)}" data-creator-id="${r.escapeAttr(c.id)}">
         <td>
           <div class="adm-cell-name">
             ${u.letterAvatar(c.displayName, 26)}
@@ -215,11 +215,11 @@
       load(true);
     });
 
-    // Row click → jump to agency detail (Creators tab there).
-    main.querySelectorAll("tbody tr[data-agency-id]").forEach((tr) => {
+    // Row click → open the model's own detail page (deep data view).
+    main.querySelectorAll("tbody tr[data-creator-id]").forEach((tr) => {
       tr.addEventListener("click", () => {
-        const id = tr.dataset.agencyId;
-        if (id) R().pushAgencyDetail(id);
+        const cid = tr.dataset.creatorId;
+        if (cid) R().pushDetail("creators", cid);
       });
     });
   }
