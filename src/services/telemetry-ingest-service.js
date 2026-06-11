@@ -46,7 +46,11 @@ async function resolveCreator({ agencyId, event }) {
 }
 
 async function resolveMember({ agencyId, event, fallbackUserId }) {
-  const viewerId = cleanString(event.viewerId || event.memberId || event.userId, 160);
+  const viewerId = cleanString(
+    event.viewerId || event.memberId || event.userId ||
+    event.extra?.viewerId || event.extra?.memberId || event.extra?.userId,
+    160
+  );
   if (viewerId) {
     const direct = await prisma.agencyMember.findFirst({
       where: { agencyId, id: viewerId, deletedAt: null },

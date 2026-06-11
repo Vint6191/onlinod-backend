@@ -3,7 +3,7 @@
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 
-const TEAM_TELEMETRY_VERSION = "team_v6_engagement_reply_time";
+const TEAM_TELEMETRY_VERSION = "team_v8_member_agency_local_fresh";
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -47,7 +47,7 @@ function eventExtra(ev) {
 
 function isCurrentTelemetry(ev) {
   const extra = eventExtra(ev);
-  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v6";
+  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v8";
 }
 
 function memberShell(member) {
@@ -79,6 +79,8 @@ function emptyMetric() {
     chatOpened: 0,
     incomingMessages: 0,
     engagementReplies: 0,
+    backlogCleared: 0,
+    backlogMaxAgeSeconds: 0,
     uniqueFans: 0,
     creatorCoverage: 0,
     activeEvents: 0,
@@ -122,7 +124,7 @@ function cleanMetric(metric) {
   metric.totalMessages = metric.messagesSent + metric.massMessages;
   metric.uniqueFans = metric._fans.size;
   metric.creatorCoverage = metric._creators.size;
-  metric.activeEvents = metric.messagesSent + metric.massMessages + metric.incomingMessages + metric.dialogSessionsCount;
+  metric.activeEvents = metric.messagesSent + metric.massMessages + metric.incomingMessages + metric.dialogSessionsCount + metric.backlogCleared;
   metric.dialogDwellMinutes = Math.round(metric.dialogDwellSeconds / 60);
   metric.avgDialogDwellSeconds = metric.dialogSessionsCount > 0 ? metric.dialogDwellSeconds / metric.dialogSessionsCount : null;
   metric.avgResponseSeconds = mean(metric._responseSeconds);
@@ -327,13 +329,22 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
 
       const evTs = eventTs(ev);
       const pending = pendingByDialog.get(key);
+      if (pending && !pending.closed && Number(pending.firstSeenAt || 0) <= evTs) pending.closed = true;
+
+      const isBacklogReply = extra.isBacklogReply === true;
+      const isFreshReply = extra.isFreshReply === true || (extra.isBacklogReply !== true && extra.replySeconds !== null && extra.replySeconds !== undefined);
+      const backlogAgeSeconds = nullableNum(extra.backlogAgeSeconds);
+      if (isBacklogReply) {
+        if (m) {
+          m.backlogCleared += 1;
+          if (backlogAgeSeconds !== null) m.backlogMaxAgeSeconds = Math.max(num(m.backlogMaxAgeSeconds, 0), backlogAgeSeconds);
+        }
+        continue;
+      }
+
       const suppliedReplySeconds = nullableNum(extra.replySeconds);
-      if (pending && !pending.closed && Number(pending.firstSeenAt || 0) <= evTs) {
-        pending.closed = true;
-        const fromMs = Number(extra.fanMessageAtMs || pending.fanMessageAtMs || pending.firstSeenAt || evTs);
-        const seconds = suppliedReplySeconds !== null
-          ? Math.max(0, Math.round(suppliedReplySeconds))
-          : Math.max(0, Math.round((evTs - fromMs) / 1000));
+      if (isFreshReply && suppliedReplySeconds !== null) {
+        const seconds = Math.max(0, Math.round(suppliedReplySeconds));
         const senderMetric = m || metricFor(memberId);
         if (senderMetric) {
           senderMetric._responseSeconds.push(seconds);
@@ -452,7 +463,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     range: rangeForClient(computed.range),
     snapshot: null,
     members: rows,
-    source: "team_activity_event_v6",
+    source: "team_activity_event_v8",
   };
 }
 
@@ -467,6 +478,8 @@ function combineOverview(metricsList, membersCount) {
     chatOpened: 0,
     incomingMessages: 0,
     engagementReplies: 0,
+    backlogCleared: 0,
+    backlogMaxAgeSeconds: 0,
     uniqueFans: 0,
     activeCreators: 0,
     activeMembers: 0,
@@ -477,7 +490,7 @@ function combineOverview(metricsList, membersCount) {
     dollarsPerMessageCents: 0,
     avgResponseSeconds: null,
     slaReply15mPct: null,
-    source: "team_activity_event_v6",
+    source: "team_activity_event_v8",
   };
   const fans = new Set();
   const responses = [];
@@ -493,6 +506,8 @@ function combineOverview(metricsList, membersCount) {
     out.chatOpened += num(m.chatOpened, 0);
     out.incomingMessages += num(m.incomingMessages, 0);
     out.engagementReplies += num(m.engagementReplies, 0);
+    out.backlogCleared += num(m.backlogCleared, 0);
+    out.backlogMaxAgeSeconds = Math.max(num(out.backlogMaxAgeSeconds, 0), num(m.backlogMaxAgeSeconds, 0));
     out.revenueAttributedCents += num(m.revenueAttributedCents, 0);
     if (num(m.activeEvents, 0) > 0) out.activeMembers += 1;
     if (num(m.creatorCoverage, 0) > 0) out.activeCreators += num(m.creatorCoverage, 0);
@@ -538,6 +553,15 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
         memberId: row.member.id,
       });
     }
+    if (num(m.backlogCleared, 0) > 0) {
+      alerts.push({
+        id: `backlog_${row.member.id}`,
+        tone: "warn",
+        title: `${name}: ${m.backlogCleared} old backlog replies`,
+        text: "Old fan messages were answered but excluded from avg reply/SLA.",
+        memberId: row.member.id,
+      });
+    }
     if (nullableNum(m.avgResponseSeconds) !== null && num(m.avgResponseSeconds, 0) > 15 * 60) {
       alerts.push({
         id: `slow_reply_${row.member.id}`,
@@ -559,12 +583,12 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
       });
     }
   }
-  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v6" };
+  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v8" };
 }
 
 async function buildTeamFlags({ agencyId, rangeKey = "7d" }) {
   const alerts = await buildTeamAlerts({ agencyId, rangeKey });
-  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v6" };
+  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v8" };
 }
 
 module.exports = {
