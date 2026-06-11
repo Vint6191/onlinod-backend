@@ -3,7 +3,7 @@
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 
-const TEAM_TELEMETRY_VERSION = "team_v4_seen_exit";
+const TEAM_TELEMETRY_VERSION = "team_v5_ws_owner_focus";
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -45,9 +45,9 @@ function eventExtra(ev) {
   return ev?.extra && typeof ev.extra === "object" ? ev.extra : {};
 }
 
-function isV3(ev) {
+function isCurrentTelemetry(ev) {
   const extra = eventExtra(ev);
-  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v4";
+  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v5";
 }
 
 function memberShell(member) {
@@ -78,6 +78,7 @@ function emptyMetric() {
     storiesCreated: 0,
     chatOpened: 0,
     incomingMessages: 0,
+    engagementReplies: 0,
     uniqueFans: 0,
     creatorCoverage: 0,
     activeEvents: 0,
@@ -167,7 +168,7 @@ function logicalEventKey(ev) {
     return ["dialog_unread_seen", accountId, fanId, messageId || localSeed || ev.localId || ""].join("|");
   }
 
-  if (type === "fan_message_seen_active") {
+  if (type === "fan_message_seen_active" || type === "fan_message_after_last_responder" || type === "creator_fan_incoming_unassigned") {
     return [type, accountId, fanId, messageId || localSeed || ev.localId || ""].join("|");
   }
 
@@ -205,7 +206,7 @@ async function loadV3Events({ agencyId, range }) {
     orderBy: { ts: "asc" },
     take: 20000,
   });
-  return dedupeLogicalEvents(rows.filter(isV3));
+  return dedupeLogicalEvents(rows.filter(isCurrentTelemetry));
 }
 
 async function buildComputed({ agencyId, rangeKey = "7d" }) {
@@ -289,6 +290,21 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
       pending.fanId = fanId || pending.fanId;
       pending.accountId = accountId || pending.accountId;
       pending.firstSeenAt = Math.min(Number(pending.firstSeenAt || firstSeenAt), firstSeenAt);
+      continue;
+    }
+
+    if (type === "fan_message_after_last_responder") {
+      if (m) {
+        m.incomingMessages += incomingCount(extra);
+        m.engagementReplies += Math.max(1, num(extra.engagementCount, 1));
+      }
+      // Do NOT create pending/unanswered here: fan wrote in the background.
+      // Unanswered appears only after the chatter opens/sees it and leaves without reply.
+      continue;
+    }
+
+    if (type === "creator_fan_incoming_unassigned") {
+      // Global creator flow only. It must not inflate member incoming/unanswered.
       continue;
     }
 
@@ -377,9 +393,35 @@ async function getMoneyRevenueByMember({ agencyId, range }) {
   }
 }
 
+async function getMoneyRevenueByMemberDialog({ agencyId, range }) {
+  try {
+    const rows = await prisma.moneyAttribution.groupBy({
+      by: ["attributedToMemberId", "fanId"],
+      where: {
+        agencyId,
+        attributedToMemberId: { not: null },
+        fanId: { not: null },
+        ...whereForRange("occurredAt", range),
+      },
+      _sum: { amountCents: true },
+    });
+    const map = new Map();
+    for (const row of rows || []) {
+      if (!row.attributedToMemberId || !row.fanId) continue;
+      map.set(`${row.attributedToMemberId}|${row.fanId}`, num(row?._sum?.amountCents, 0));
+    }
+    return map;
+  } catch (_) {
+    return new Map();
+  }
+}
+
 async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
   const computed = await buildComputed({ agencyId, rangeKey });
-  const revenueByMember = await getMoneyRevenueByMember({ agencyId, range: computed.range });
+  const [revenueByMember, revenueByMemberDialog] = await Promise.all([
+    getMoneyRevenueByMember({ agencyId, range: computed.range }),
+    getMoneyRevenueByMemberDialog({ agencyId, range: computed.range }),
+  ]);
 
   const rows = computed.members.map((member) => {
     const shell = memberShell(member);
@@ -390,6 +432,13 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
       metrics.dollarsPerMessageCents = metrics.totalMessages > 0 ? Math.round(revenue / metrics.totalMessages) : 0;
       metrics.moneySource = "money_attribution";
     }
+    if (Array.isArray(metrics.topDialogSessions)) {
+      metrics.topDialogSessions = metrics.topDialogSessions.map((item) => {
+        const cents = revenueByMemberDialog.get(`${shell.id}|${item.fanId || ""}`) || 0;
+        const sharePct = metrics.dialogDwellSeconds > 0 ? Math.round((num(item.dwellSeconds, 0) / metrics.dialogDwellSeconds) * 100) : 0;
+        return { ...item, shiftRevenueCents: cents, shiftRevenueUsd: Math.round(cents) / 100, shiftTimeSharePct: sharePct };
+      });
+    }
     return { member: shell, metrics, rawSummary: null };
   });
 
@@ -398,7 +447,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     range: rangeForClient(computed.range),
     snapshot: null,
     members: rows,
-    source: "team_activity_event_v3",
+    source: "team_activity_event_v5",
   };
 }
 
@@ -412,6 +461,7 @@ function combineOverview(metricsList, membersCount) {
     storiesCreated: 0,
     chatOpened: 0,
     incomingMessages: 0,
+    engagementReplies: 0,
     uniqueFans: 0,
     activeCreators: 0,
     activeMembers: 0,
@@ -422,7 +472,7 @@ function combineOverview(metricsList, membersCount) {
     dollarsPerMessageCents: 0,
     avgResponseSeconds: null,
     slaReply15mPct: null,
-    source: "team_activity_event_v3",
+    source: "team_activity_event_v5",
   };
   const fans = new Set();
   const responses = [];
@@ -437,6 +487,7 @@ function combineOverview(metricsList, membersCount) {
     out.storiesCreated += num(m.storiesCreated, 0);
     out.chatOpened += num(m.chatOpened, 0);
     out.incomingMessages += num(m.incomingMessages, 0);
+    out.engagementReplies += num(m.engagementReplies, 0);
     out.revenueAttributedCents += num(m.revenueAttributedCents, 0);
     if (num(m.activeEvents, 0) > 0) out.activeMembers += 1;
     if (num(m.creatorCoverage, 0) > 0) out.activeCreators += num(m.creatorCoverage, 0);
@@ -491,13 +542,24 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
         memberId: row.member.id,
       });
     }
+    const topDialog = Array.isArray(m.topDialogSessions) ? m.topDialogSessions[0] : null;
+    if (topDialog && num(m.dialogDwellSeconds, 0) >= 15 * 60 && num(topDialog.shiftTimeSharePct, 0) >= 80) {
+      const dollars = (num(topDialog.shiftRevenueCents, 0) / 100).toFixed(2);
+      alerts.push({
+        id: `focus_dialog_${row.member.id}_${topDialog.fanId || "unknown"}`,
+        tone: num(topDialog.shiftRevenueCents, 0) > 0 ? "warn" : "danger",
+        title: `${name}: ${topDialog.shiftTimeSharePct}% shift time in one dialog`,
+        text: `Fan ${topDialog.fanId || "unknown"}: ${Math.round(num(topDialog.dwellSeconds, 0) / 60)} min, earned this shift $${dollars}.`,
+        memberId: row.member.id,
+      });
+    }
   }
-  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v3" };
+  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v5" };
 }
 
 async function buildTeamFlags({ agencyId, rangeKey = "7d" }) {
   const alerts = await buildTeamAlerts({ agencyId, rangeKey });
-  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v3" };
+  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v5" };
 }
 
 module.exports = {
