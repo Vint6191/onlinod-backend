@@ -153,13 +153,52 @@ function keyFor(ev) {
   return [String(ev.accountId || extra.accountId || ""), String(ev.fanId || extra.fanId || extra.dialogId || "")].join("|");
 }
 
+function logicalEventKey(ev) {
+  const extra = eventExtra(ev);
+  const type = String(ev.type || "");
+  const accountId = String(ev.accountId || extra.accountId || "");
+  const fanId = String(ev.fanId || extra.fanId || extra.dialogId || "");
+  const messageId = String(extra.messageId || "");
+  const localSeed = String(extra.localSeed || "");
+
+  if (type === "dialog_unread_opened") {
+    // Old broken build emitted every /messages history item with reason=messages_api.
+    // Those are not real opened-unread client markers and must not count.
+    if (String(extra.reason || "") === "messages_api") return null;
+    return [type, accountId, fanId, messageId || localSeed || ev.localId || ""].join("|");
+  }
+
+  if (type === "chat_message_sent_local") {
+    return [type, accountId, fanId, messageId || localSeed || ev.localId || ""].join("|");
+  }
+
+  if (type === "dialog_session") {
+    return [type, accountId, fanId, localSeed || extra.startedAt || ev.localId || ""].join("|");
+  }
+
+  return ev.localId || [type, accountId, fanId, new Date(ev.ts).getTime()].join("|");
+}
+
+function dedupeLogicalEvents(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const ev of rows || []) {
+    const key = logicalEventKey(ev);
+    if (!key) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ev);
+  }
+  return out;
+}
+
 async function loadV3Events({ agencyId, range }) {
   const rows = await prisma.teamActivityEvent.findMany({
     where: { agencyId, ...whereForRange("ts", range) },
     orderBy: { ts: "asc" },
     take: 20000,
   });
-  return rows.filter(isV3);
+  return dedupeLogicalEvents(rows.filter(isV3));
 }
 
 async function buildComputed({ agencyId, rangeKey = "7d" }) {
@@ -196,7 +235,9 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
 
     if (type === "dialog_unread_opened") {
       if (m) {
-        m.incomingMessages += Math.max(1, num(extra.unreadCount, 1));
+        // Count opened unread clients/dialogs, not raw OF unread message total.
+        // rawUnreadMessagesCount remains available in extra for debugging.
+        m.incomingMessages += 1;
         m.chatOpened += 1;
       }
       pending.push({
