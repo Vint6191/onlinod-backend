@@ -71,10 +71,26 @@ async function resolveMember({ agencyId, event, fallbackUserId }) {
   return null;
 }
 
+async function resolveDeviceId({ agencyId, deviceId }) {
+  const id = cleanString(deviceId, 160);
+  if (!id) return null;
+  try {
+    const device = await prisma.workerDevice.findFirst({
+      where: { id, agencyId },
+      select: { id: true },
+    });
+    return device?.id || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function ingestTeamEvents({ agencyId, deviceId, userId, events = [] }) {
   const input = Array.isArray(events) ? events : [];
   const normalized = [];
   let skipped = 0;
+  const resolvedDeviceId = await resolveDeviceId({ agencyId, deviceId });
+  const deviceKeyForDedup = cleanString(deviceId, 160) || "server";
 
   for (const event of input) {
     if (!event || typeof event !== "object") {
@@ -92,7 +108,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, events = [] }) {
     const creator = await resolveCreator({ agencyId, event });
     const member = await resolveMember({ agencyId, event, fallbackUserId: userId });
     const localId = cleanString(event.localId, 160) || hashEvent({
-      deviceId,
+      deviceId: deviceKeyForDedup,
       ts: ts.getTime(),
       type,
       viewerId: event.viewerId || event.memberId || event.userId || null,
@@ -103,7 +119,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, events = [] }) {
 
     normalized.push({
       agencyId,
-      deviceId: cleanString(deviceId, 160),
+      deviceId: resolvedDeviceId,
       userId: member?.userId || userId || null,
       memberId: member?.id || null,
       accountId: cleanString(event.accountId, 160),
