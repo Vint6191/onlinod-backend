@@ -263,6 +263,10 @@ function responseKey(event, memberId) {
   return [memberId || "", event.accountId || event.creatorId || event.creatorRef || "", event.fanId || ""].join("|");
 }
 
+function dialogFanKey(event) {
+  return [event.accountId || event.creatorId || event.creatorRef || "", event.fanId || ""].join("|");
+}
+
 async function loadEvents({ agencyId, range }) {
   return prisma.teamActivityEvent.findMany({
     where: { agencyId, ...whereForRange("ts", range) },
@@ -364,22 +368,29 @@ function computeFromEvents({ members, events, revenueByMember }) {
     }
 
     if (INCOMING_TYPES.has(type)) {
-      metrics.incomingMessages += 1;
+      // Incoming fan messages are a team queue signal. They must not be
+      // blindly assigned to whoever is currently logged in (usually owner),
+      // otherwise owner gets fake/random incoming+unanswered numbers.
       overview.incomingMessages += 1;
       if (event.fanId) {
-        const key = responseKey(event, memberId);
+        const key = dialogFanKey(event);
         if (!incomingByKey.has(key)) incomingByKey.set(key, []);
-        incomingByKey.get(key).push({ ts: new Date(event.ts).getTime(), answered: false, memberId: String(memberId) });
+        incomingByKey.get(key).push({
+          ts: new Date(event.ts).getTime(),
+          answered: false,
+          answeredByMemberId: null,
+        });
       }
     }
 
     if (OUTGOING_TYPES.has(type) && event.fanId) {
-      const key = responseKey(event, memberId);
+      const key = dialogFanKey(event);
       const waiting = incomingByKey.get(key) || [];
       const outgoingTs = new Date(event.ts).getTime();
       const candidate = waiting.find((item) => !item.answered && item.ts <= outgoingTs);
       if (candidate) {
         candidate.answered = true;
+        candidate.answeredByMemberId = String(memberId);
         const seconds = Math.max(0, Math.round((outgoingTs - candidate.ts) / 1000));
         responseSamples.get(String(memberId))?.push(seconds);
         allResponseSamples.push(seconds);
@@ -447,11 +458,11 @@ function computeFromEvents({ members, events, revenueByMember }) {
     if (!knownMember && memberId === "__unassigned__") ensure("__unassigned__");
   }
 
-  for (const [memberId, waiting] of incomingByKey.entries()) {
+  for (const [_key, waiting] of incomingByKey.entries()) {
     for (const item of waiting) {
       if (!item.answered) {
-        const metrics = ensure(item.memberId);
-        metrics.unansweredIncomingCount += 1;
+        // Keep unanswered as team-level until we have an explicit assignment/
+        // claim/last-responsible-member signal. Do not put it on owner.
         overview.unansweredIncomingCount += 1;
       }
     }

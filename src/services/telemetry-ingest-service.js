@@ -3,6 +3,40 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 
+const INCOMING_TYPES = new Set([
+  "incoming_message",
+  "message_received",
+  "chat_message_received",
+  "fan_message_received",
+]);
+
+const OUTGOING_TYPES = new Set([
+  "message_sent",
+  "chat_message_sent",
+  "ppv_message_sent",
+  "manual_message_sent",
+  "reply_sent",
+  "mass_message_sent",
+  "broadcast_message_sent",
+  "campaign_message_sent",
+  "bump_message_sent",
+  "bump_sent",
+]);
+
+function cleanLower(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function shouldResolveMemberForEvent(type) {
+  const t = cleanLower(type);
+  // Incoming fan messages must NOT be attributed to the currently logged-in
+  // owner/operator. They are queue/team signals. Replies are attributed to
+  // the operator who actually sent them.
+  if (INCOMING_TYPES.has(t)) return false;
+  return OUTGOING_TYPES.has(t) || t.includes("sent") || t.includes("reply") || t.includes("active") || t.includes("focus") || t.includes("opened");
+}
+
+
 function hashEvent(seed) {
   return crypto.createHash("sha256").update(JSON.stringify(seed)).digest("hex").slice(0, 40);
 }
@@ -106,7 +140,10 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, events = [] }) {
 
     const ts = safeDate(event.ts || event.createdAt || Date.now());
     const creator = await resolveCreator({ agencyId, event });
-    const member = await resolveMember({ agencyId, event, fallbackUserId: userId });
+    const shouldResolveMember = shouldResolveMemberForEvent(type);
+    const member = shouldResolveMember
+      ? await resolveMember({ agencyId, event, fallbackUserId: userId })
+      : null;
     const localId = cleanString(event.localId, 160) || hashEvent({
       deviceId: deviceKeyForDedup,
       ts: ts.getTime(),
@@ -120,7 +157,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, events = [] }) {
     normalized.push({
       agencyId,
       deviceId: resolvedDeviceId,
-      userId: member?.userId || userId || null,
+      userId: member?.userId || (shouldResolveMember ? (userId || null) : null),
       memberId: member?.id || null,
       accountId: cleanString(event.accountId, 160),
       creatorId: creator?.id || null,
