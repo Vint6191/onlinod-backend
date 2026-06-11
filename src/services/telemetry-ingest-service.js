@@ -5,22 +5,27 @@ const prisma = require("../prisma");
 
 const INCOMING_TYPES = new Set([
   "incoming_message",
+  "incoming_unread_seen",
   "message_received",
   "chat_message_received",
   "fan_message_received",
 ]);
 
-const OUTGOING_TYPES = new Set([
-  "message_sent",
-  "chat_message_sent",
-  "ppv_message_sent",
+// Member attribution is intentionally strict.
+// WebSocket "sent" echoes are NOT proof that this operator sent anything:
+// they also arrive when another browser/device sends a message or automation
+// fires. Only local API POST telemetry gets attributed to the current member.
+const LOCAL_OUTGOING_TYPES = new Set([
+  "chat_message_sent_local",
+  "message_sent_local",
+  "local_chat_message_sent",
   "manual_message_sent",
-  "reply_sent",
-  "mass_message_sent",
-  "broadcast_message_sent",
-  "campaign_message_sent",
-  "bump_message_sent",
-  "bump_sent",
+  "reply_sent_local",
+]);
+
+const LOCAL_MASS_TYPES = new Set([
+  "mass_message_sent_local",
+  "local_mass_message_sent",
 ]);
 
 function cleanLower(value) {
@@ -29,11 +34,17 @@ function cleanLower(value) {
 
 function shouldResolveMemberForEvent(type) {
   const t = cleanLower(type);
-  // Incoming fan messages must NOT be attributed to the currently logged-in
-  // owner/operator. They are queue/team signals. Replies are attributed to
-  // the operator who actually sent them.
   if (INCOMING_TYPES.has(t)) return false;
-  return OUTGOING_TYPES.has(t) || t.includes("sent") || t.includes("reply") || t.includes("active") || t.includes("focus") || t.includes("opened");
+
+  // Only local API send/dwell/focus events are attached to the current user.
+  // Do NOT use broad `t.includes("sent")`: that was the bug that turned
+  // fan messages / another-browser sends / bumps into owner stats.
+  if (LOCAL_OUTGOING_TYPES.has(t)) return true;
+  if (LOCAL_MASS_TYPES.has(t)) return true;
+  if (t === "dialog_session" || t === "dialog_focus" || t === "chat_focus") return true;
+  if (t === "active" || t === "activity" || t === "heartbeat" || t === "focus") return true;
+
+  return false;
 }
 
 

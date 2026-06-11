@@ -4,15 +4,20 @@ const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 const { getLatestPayload } = require("./analytics-snapshot-service");
 
+// Count operator sent messages ONLY from local API-send telemetry.
+// Do not count websocket creator echoes (chat_message_sent/ppv_message_sent),
+// because they also arrive for another browser/device and for automation.
 const OUTGOING_TYPES = new Set([
-  "message_sent",
-  "chat_message_sent",
-  "ppv_message_sent",
+  "chat_message_sent_local",
+  "message_sent_local",
+  "local_chat_message_sent",
   "manual_message_sent",
-  "reply_sent",
+  "reply_sent_local",
 ]);
 
 const MASS_TYPES = new Set([
+  "mass_message_sent_local",
+  "local_mass_message_sent",
   "mass_message_sent",
   "broadcast_message_sent",
   "campaign_message_sent",
@@ -22,6 +27,7 @@ const MASS_TYPES = new Set([
 
 const INCOMING_TYPES = new Set([
   "incoming_message",
+  "incoming_unread_seen",
   "message_received",
   "chat_message_received",
   "fan_message_received",
