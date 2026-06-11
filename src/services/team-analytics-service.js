@@ -3,7 +3,7 @@
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 
-const TEAM_TELEMETRY_VERSION = "team_v3";
+const TEAM_TELEMETRY_VERSION = "team_v4_seen_exit";
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -47,7 +47,7 @@ function eventExtra(ev) {
 
 function isV3(ev) {
   const extra = eventExtra(ev);
-  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v3";
+  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v4";
 }
 
 function memberShell(member) {
@@ -160,12 +160,19 @@ function logicalEventKey(ev) {
   const fanId = String(ev.fanId || extra.fanId || extra.dialogId || "");
   const messageId = String(extra.messageId || "");
   const localSeed = String(extra.localSeed || "");
+  const pendingSeed = String(extra.pendingSeed || "");
 
-  if (type === "dialog_unread_opened") {
-    // Old broken build emitted every /messages history item with reason=messages_api.
-    // Those are not real opened-unread client markers and must not count.
+  if (type === "dialog_unread_seen" || type === "dialog_unread_opened") {
     if (String(extra.reason || "") === "messages_api") return null;
+    return ["dialog_unread_seen", accountId, fanId, messageId || localSeed || ev.localId || ""].join("|");
+  }
+
+  if (type === "fan_message_seen_active") {
     return [type, accountId, fanId, messageId || localSeed || ev.localId || ""].join("|");
+  }
+
+  if (type === "dialog_unanswered_left") {
+    return [type, accountId, fanId, pendingSeed || localSeed || ev.localId || ""].join("|");
   }
 
   if (type === "chat_message_sent_local") {
@@ -218,7 +225,43 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     return metricsByMember.get(id);
   }
 
-  const pending = [];
+  function eventTs(ev) {
+    const t = new Date(ev.ts).getTime();
+    return Number.isFinite(t) ? t : Date.now();
+  }
+
+  function seenTs(ev, extra) {
+    const raw = extra.seenAt || extra.observedAt || extra.openedAt || ev.ts;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n > 0) return n;
+    const t = new Date(raw).getTime();
+    return Number.isFinite(t) ? t : eventTs(ev);
+  }
+
+  function incomingCount(extra) {
+    const n = Number(extra.incomingCount ?? extra.rawUnreadMessagesCount ?? extra.unreadCount ?? 1);
+    return Math.max(1, Number.isFinite(n) ? Math.round(n) : 1);
+  }
+
+  // account|fan -> pending seen dialog that may become unanswered only after leave.
+  const pendingByDialog = new Map();
+
+  function getPending(key, defaults = {}) {
+    let item = pendingByDialog.get(key);
+    if (!item || item.closed) {
+      item = {
+        key,
+        memberId: defaults.memberId || "",
+        fanId: defaults.fanId || "",
+        accountId: defaults.accountId || "",
+        firstSeenAt: defaults.firstSeenAt || Date.now(),
+        leftUnanswered: false,
+        closed: false,
+      };
+      pendingByDialog.set(key, item);
+    }
+    return item;
+  }
 
   for (const ev of events) {
     const extra = eventExtra(ev);
@@ -227,40 +270,49 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     const fanId = String(ev.fanId || extra.fanId || extra.dialogId || "").trim();
     const accountId = String(ev.accountId || extra.accountId || "").trim();
     const type = String(ev.type || "");
+    const key = keyFor(ev);
 
     if (m) {
       if (fanId) m._fans.add(fanId);
       if (accountId) m._creators.add(accountId);
     }
 
-    if (type === "dialog_unread_opened") {
+    if (type === "dialog_unread_seen" || type === "dialog_unread_opened" || type === "fan_message_seen_active") {
       if (m) {
-        // Count opened unread clients/dialogs, not raw OF unread message total.
-        // rawUnreadMessagesCount remains available in extra for debugging.
-        m.incomingMessages += 1;
-        m.chatOpened += 1;
+        m.incomingMessages += incomingCount(extra);
+        if (type !== "fan_message_seen_active") m.chatOpened += 1;
       }
-      pending.push({
-        key: keyFor(ev),
-        openerMemberId: memberId,
-        fanId,
-        accountId,
-        ts: new Date(ev.ts).getTime(),
-        messageId: extra.messageId || null,
-        closed: false,
-      });
+
+      const firstSeenAt = seenTs(ev, extra);
+      const pending = getPending(key, { memberId, fanId, accountId, firstSeenAt });
+      pending.memberId = memberId || pending.memberId;
+      pending.fanId = fanId || pending.fanId;
+      pending.accountId = accountId || pending.accountId;
+      pending.firstSeenAt = Math.min(Number(pending.firstSeenAt || firstSeenAt), firstSeenAt);
+      continue;
+    }
+
+    if (type === "dialog_unanswered_left") {
+      const leftAt = Number(extra.leftAt || eventTs(ev));
+      const firstSeenAt = seenTs(ev, extra);
+      const pending = getPending(key, { memberId, fanId, accountId, firstSeenAt });
+      pending.memberId = memberId || pending.memberId;
+      pending.fanId = fanId || pending.fanId;
+      pending.accountId = accountId || pending.accountId;
+      pending.firstSeenAt = Math.min(Number(pending.firstSeenAt || firstSeenAt), firstSeenAt);
+      pending.leftUnanswered = true;
+      pending.leftAt = leftAt;
       continue;
     }
 
     if (type === "chat_message_sent_local") {
       if (m) m.messagesSent += 1;
 
-      const evTs = new Date(ev.ts).getTime();
-      const k = keyFor(ev);
-      const open = pending.find((p) => !p.closed && p.key === k && p.ts <= evTs);
-      if (open) {
-        open.closed = true;
-        const seconds = Math.max(0, Math.round((evTs - open.ts) / 1000));
+      const evTs = eventTs(ev);
+      const pending = pendingByDialog.get(key);
+      if (pending && !pending.closed && Number(pending.firstSeenAt || 0) <= evTs) {
+        pending.closed = true;
+        const seconds = Math.max(0, Math.round((evTs - Number(pending.firstSeenAt || evTs)) / 1000));
         const senderMetric = m || metricFor(memberId);
         if (senderMetric) {
           senderMetric._responseSeconds.push(seconds);
@@ -291,9 +343,9 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     }
   }
 
-  for (const p of pending) {
-    if (!p.closed) {
-      const m = metricFor(p.openerMemberId);
+  for (const p of pendingByDialog.values()) {
+    if (!p.closed && p.leftUnanswered) {
+      const m = metricFor(p.memberId);
       if (m) m.unansweredIncomingCount += 1;
     }
   }
