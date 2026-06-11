@@ -3,7 +3,7 @@
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 
-const TEAM_TELEMETRY_VERSION = "team_v5_ws_owner_focus";
+const TEAM_TELEMETRY_VERSION = "team_v6_engagement_reply_time";
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -47,7 +47,7 @@ function eventExtra(ev) {
 
 function isCurrentTelemetry(ev) {
   const extra = eventExtra(ev);
-  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v5";
+  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v6";
 }
 
 function memberShell(member) {
@@ -279,17 +279,18 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     }
 
     if (type === "dialog_unread_seen" || type === "dialog_unread_opened" || type === "fan_message_seen_active") {
-      if (m) {
-        m.incomingMessages += incomingCount(extra);
-        if (type !== "fan_message_seen_active") m.chatOpened += 1;
-      }
+      // Seen/opened incoming is NOT member incoming anymore.
+      // It only creates a pending dialog. If the member leaves without reply -> unanswered.
+      if (m && type !== "fan_message_seen_active") m.chatOpened += 1;
 
       const firstSeenAt = seenTs(ev, extra);
+      const fanMessageAtMs = num(extra.fanMessageAtMs, 0) || firstSeenAt;
       const pending = getPending(key, { memberId, fanId, accountId, firstSeenAt });
       pending.memberId = memberId || pending.memberId;
       pending.fanId = fanId || pending.fanId;
       pending.accountId = accountId || pending.accountId;
       pending.firstSeenAt = Math.min(Number(pending.firstSeenAt || firstSeenAt), firstSeenAt);
+      pending.fanMessageAtMs = Math.min(Number(pending.fanMessageAtMs || fanMessageAtMs), fanMessageAtMs);
       continue;
     }
 
@@ -326,9 +327,13 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
 
       const evTs = eventTs(ev);
       const pending = pendingByDialog.get(key);
+      const suppliedReplySeconds = nullableNum(extra.replySeconds);
       if (pending && !pending.closed && Number(pending.firstSeenAt || 0) <= evTs) {
         pending.closed = true;
-        const seconds = Math.max(0, Math.round((evTs - Number(pending.firstSeenAt || evTs)) / 1000));
+        const fromMs = Number(extra.fanMessageAtMs || pending.fanMessageAtMs || pending.firstSeenAt || evTs);
+        const seconds = suppliedReplySeconds !== null
+          ? Math.max(0, Math.round(suppliedReplySeconds))
+          : Math.max(0, Math.round((evTs - fromMs) / 1000));
         const senderMetric = m || metricFor(memberId);
         if (senderMetric) {
           senderMetric._responseSeconds.push(seconds);
@@ -447,7 +452,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     range: rangeForClient(computed.range),
     snapshot: null,
     members: rows,
-    source: "team_activity_event_v5",
+    source: "team_activity_event_v6",
   };
 }
 
@@ -472,7 +477,7 @@ function combineOverview(metricsList, membersCount) {
     dollarsPerMessageCents: 0,
     avgResponseSeconds: null,
     slaReply15mPct: null,
-    source: "team_activity_event_v5",
+    source: "team_activity_event_v6",
   };
   const fans = new Set();
   const responses = [];
@@ -554,12 +559,12 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
       });
     }
   }
-  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v5" };
+  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v6" };
 }
 
 async function buildTeamFlags({ agencyId, rangeKey = "7d" }) {
   const alerts = await buildTeamAlerts({ agencyId, rangeKey });
-  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v5" };
+  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v6" };
 }
 
 module.exports = {
