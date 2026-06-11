@@ -4,15 +4,20 @@ const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 const { getLatestPayload } = require("./analytics-snapshot-service");
 
+// Count operator sent messages ONLY from local API-send telemetry.
+// Do not count websocket creator echoes (chat_message_sent/ppv_message_sent),
+// because they also arrive for another browser/device and for automation.
 const OUTGOING_TYPES = new Set([
-  "message_sent",
-  "chat_message_sent",
-  "ppv_message_sent",
+  "chat_message_sent_local",
+  "message_sent_local",
+  "local_chat_message_sent",
   "manual_message_sent",
-  "reply_sent",
+  "reply_sent_local",
 ]);
 
 const MASS_TYPES = new Set([
+  "mass_message_sent_local",
+  "local_mass_message_sent",
   "mass_message_sent",
   "broadcast_message_sent",
   "campaign_message_sent",
@@ -22,6 +27,9 @@ const MASS_TYPES = new Set([
 
 const INCOMING_TYPES = new Set([
   "incoming_message",
+  "incoming_unread_seen",
+  "dialog_unread_snapshot",
+  "dialog_unread_seen_local",
   "message_received",
   "chat_message_received",
   "fan_message_received",
@@ -143,6 +151,42 @@ function amountCentsFromExtra(extra = {}) {
   const dollars = firstNumber(e.amount, e.price, e.revenue, e.netAmount);
   if (dollars !== null) return Math.round(dollars * 100);
   return 0;
+}
+
+function millisFromValue(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) return n;
+  const d = new Date(value);
+  return Number.isFinite(d.getTime()) ? d.getTime() : null;
+}
+
+function incomingObservedTs(event) {
+  const e = safeObject(event.extra);
+  const observed = millisFromValue(e.observedAt || e.seenAt || e.openedAt || e.enteredAt);
+  if (observed !== null) return observed;
+  const ts = millisFromValue(event.ts);
+  return ts !== null ? ts : Date.now();
+}
+
+function unreadCountFromExtra(extra = {}) {
+  const e = safeObject(extra);
+  const n = firstNumber(e.unreadMessagesCount, e.unreadCount, e.count);
+  return n !== null && n > 0 ? Math.max(1, Math.round(n)) : 1;
+}
+
+function incomingMessageIdentity(event) {
+  const e = safeObject(event.extra);
+  const scope = event.accountId || event.creatorId || event.creatorRef || "";
+  const fan = event.fanId || "";
+  const messageId = String(e.messageId || e.lastMessageId || "").trim();
+  if (messageId) return `${scope}|${fan}|${messageId}`;
+  return `${scope}|${fan}|${event.id}`;
+}
+
+function isDetailedUnreadEvent(type) {
+  const t = cleanLower(type);
+  return t === "incoming_unread_seen" || t === "dialog_unread_seen_local";
 }
 
 function normalizeRoleKey(role, roleKey) {
@@ -281,6 +325,7 @@ async function loadEvents({ agencyId, range }) {
       fanId: true,
       type: true,
       ts: true,
+      source: true,
       extra: true,
     },
   });
@@ -321,6 +366,7 @@ function computeFromEvents({ members, events, revenueByMember }) {
   const creatorSets = new Map();
   const topDialogMap = new Map();
   const incomingByKey = new Map();
+  const incomingByIdentity = new Map();
   const responseSamples = new Map();
   const allResponseSamples = [];
   const overview = emptyMetrics();
@@ -368,30 +414,65 @@ function computeFromEvents({ members, events, revenueByMember }) {
     }
 
     if (INCOMING_TYPES.has(type)) {
-      // Incoming fan messages are a team queue signal. They must not be
-      // blindly assigned to whoever is currently logged in (usually owner),
-      // otherwise owner gets fake/random incoming+unanswered numbers.
-      overview.incomingMessages += 1;
-      if (event.fanId) {
-        const key = dialogFanKey(event);
-        if (!incomingByKey.has(key)) incomingByKey.set(key, []);
-        incomingByKey.get(key).push({
-          ts: new Date(event.ts).getTime(),
+      // Drop the bad legacy events from the previous patch: they used the fan
+      // message createdAt as reply timer start, which produced 5h+ fake avg
+      // replies. New events always carry observedAt/seenAt.
+      if (type === "incoming_unread_seen" && !e.observedAt && !e.seenAt && event.source === "of-api-chat-messages") {
+        continue;
+      }
+
+      const incomingCount = unreadCountFromExtra(e);
+      const incomingTs = incomingObservedTs(event);
+      const identity = incomingMessageIdentity(event);
+      const detailed = isDetailedUnreadEvent(type);
+      let item = incomingByIdentity.get(identity);
+
+      if (item) {
+        // /chats list can see the unread first, then /chats/:id/messages gives
+        // the real "operator opened this dialog" timestamp. Upgrade instead
+        // of double-counting the same last message.
+        item.count = Math.max(item.count || 1, incomingCount);
+        if (detailed && !item.detailed) {
+          item.ts = incomingTs;
+          item.detailed = true;
+          item.memberId = knownMember ? String(memberId) : item.memberId;
+        }
+      } else {
+        item = {
+          ts: incomingTs,
+          count: incomingCount,
           answered: false,
           answeredByMemberId: null,
-        });
+          memberId: knownMember ? String(memberId) : null,
+          detailed,
+        };
+        incomingByIdentity.set(identity, item);
+        if (event.fanId) {
+          const key = dialogFanKey(event);
+          if (!incomingByKey.has(key)) incomingByKey.set(key, []);
+          incomingByKey.get(key).push(item);
+        }
+
+        overview.incomingMessages += incomingCount;
+        if (knownMember) metrics.incomingMessages += incomingCount;
       }
     }
 
     if (OUTGOING_TYPES.has(type) && event.fanId) {
       const key = dialogFanKey(event);
       const waiting = incomingByKey.get(key) || [];
-      const outgoingTs = new Date(event.ts).getTime();
-      const candidate = waiting.find((item) => !item.answered && item.ts <= outgoingTs);
-      if (candidate) {
-        candidate.answered = true;
-        candidate.answeredByMemberId = String(memberId);
-        const seconds = Math.max(0, Math.round((outgoingTs - candidate.ts) / 1000));
+      const outgoingTs = millisFromValue(event.ts) || Date.now();
+      const candidates = waiting.filter((item) => !item.answered && item.ts <= outgoingTs);
+      if (candidates.length) {
+        // One operator reply resolves the open unread state for this fan/dialog.
+        // Response sample starts from when this dialog/unread was seen, not from
+        // the fan's original message timestamp hours earlier.
+        const base = Math.min(...candidates.map((item) => Number(item.ts || outgoingTs)));
+        for (const item of candidates) {
+          item.answered = true;
+          item.answeredByMemberId = String(memberId);
+        }
+        const seconds = Math.max(0, Math.round((outgoingTs - base) / 1000));
         responseSamples.get(String(memberId))?.push(seconds);
         allResponseSamples.push(seconds);
       }
@@ -461,9 +542,11 @@ function computeFromEvents({ members, events, revenueByMember }) {
   for (const [_key, waiting] of incomingByKey.entries()) {
     for (const item of waiting) {
       if (!item.answered) {
-        // Keep unanswered as team-level until we have an explicit assignment/
-        // claim/last-responsible-member signal. Do not put it on owner.
-        overview.unansweredIncomingCount += 1;
+        const count = Math.max(1, Math.round(Number(item.count || 1)));
+        overview.unansweredIncomingCount += count;
+        if (item.memberId && perMember.has(String(item.memberId))) {
+          perMember.get(String(item.memberId)).unansweredIncomingCount += count;
+        }
       }
     }
   }
