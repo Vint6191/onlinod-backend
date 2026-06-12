@@ -7,6 +7,12 @@ const {
   buildTeamAlerts,
   buildTeamFlags,
 } = require("../services/team-analytics-service");
+const {
+  listResolveJobs,
+  submitResolveResults,
+  listPpvConflicts,
+  resolvePpvConflict,
+} = require("../services/team-ppv-ledger-service");
 
 const router = express.Router();
 
@@ -26,6 +32,56 @@ function requireAgency(req, res) {
   }
   return id;
 }
+
+
+router.get("/ppv/resolve-jobs", async (req, res) => {
+  try {
+    const id = requireAgency(req, res); if (!id) return;
+    const jobs = await listResolveJobs({ agencyId: id, limit: req.query.limit || 100 });
+    return res.json({ ok: true, jobs });
+  } catch (err) {
+    return res.status(500).json({ ok: false, code: "PPV_RESOLVE_JOBS_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+router.post("/ppv/resolve-results", async (req, res) => {
+  try {
+    const id = requireAgency(req, res); if (!id) return;
+    const result = await submitResolveResults({
+      agencyId: id,
+      deviceId: req.auth.deviceId || req.body?.deviceId || null,
+      results: req.body?.results || [],
+    });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    return res.status(500).json({ ok: false, code: "PPV_RESOLVE_RESULTS_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+router.get("/ppv/conflicts", async (req, res) => {
+  try {
+    const id = requireAgency(req, res); if (!id) return;
+    const conflicts = await listPpvConflicts({ agencyId: id, limit: req.query.limit || 100 });
+    return res.json({ ok: true, conflicts });
+  } catch (err) {
+    return res.status(500).json({ ok: false, code: "PPV_CONFLICTS_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+router.post("/ppv/conflicts/:jobId/resolve", async (req, res) => {
+  try {
+    const id = requireAgency(req, res); if (!id) return;
+    const result = await resolvePpvConflict({
+      agencyId: id,
+      jobId: req.params.jobId,
+      memberId: req.body?.memberId || req.body?.attributedMemberId,
+      deviceId: req.auth.deviceId || req.body?.deviceId || null,
+    });
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    return res.status(500).json({ ok: false, code: "PPV_CONFLICT_RESOLVE_FAILED", error: err?.message || "Failed" });
+  }
+});
 
 router.get("/overview", async (req, res) => {
   try {

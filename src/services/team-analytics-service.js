@@ -3,7 +3,22 @@
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 
-const TEAM_TELEMETRY_VERSION = "team_v8_member_agency_local_fresh";
+const TEAM_TELEMETRY_VERSION = "team_v12_actual_backend_ppv_safe";
+const SUPPORTED_TEAM_TELEMETRY_VERSIONS = new Set([
+  "team_v8_member_agency_local_fresh",
+  "team_v9_message_ppv_ledger",
+  "team_v10_server_ppv_resolver",
+  "team_v11_ppv_safe_resolver",
+  TEAM_TELEMETRY_VERSION,
+]);
+const SUPPORTED_TEAM_TELEMETRY_SOURCES = new Set([
+  "electron_team_v8",
+  "electron_team_v9",
+  "electron_team_v10",
+  "electron_team_v11",
+  "electron_team_v12",
+  "server_ppv_resolver",
+]);
 
 function num(value, fallback = 0) {
   const n = Number(value);
@@ -47,7 +62,9 @@ function eventExtra(ev) {
 
 function isCurrentTelemetry(ev) {
   const extra = eventExtra(ev);
-  return extra.telemetryVersion === TEAM_TELEMETRY_VERSION || ev.source === "electron_team_v8";
+  const version = String(extra.telemetryVersion || "");
+  const source = String(ev.source || extra.source || "");
+  return SUPPORTED_TEAM_TELEMETRY_VERSIONS.has(version) || SUPPORTED_TEAM_TELEMETRY_SOURCES.has(source);
 }
 
 function memberShell(member) {
@@ -81,6 +98,10 @@ function emptyMetric() {
     engagementReplies: 0,
     backlogCleared: 0,
     backlogMaxAgeSeconds: 0,
+    ppvSentMessages: 0,
+    ppvSoldMessages: 0,
+    ppvRevenueCents: 0,
+    ppvOpenRatePct: null,
     uniqueFans: 0,
     creatorCoverage: 0,
     activeEvents: 0,
@@ -124,7 +145,7 @@ function cleanMetric(metric) {
   metric.totalMessages = metric.messagesSent + metric.massMessages;
   metric.uniqueFans = metric._fans.size;
   metric.creatorCoverage = metric._creators.size;
-  metric.activeEvents = metric.messagesSent + metric.massMessages + metric.incomingMessages + metric.dialogSessionsCount + metric.backlogCleared;
+  metric.activeEvents = metric.messagesSent + metric.massMessages + metric.incomingMessages + metric.dialogSessionsCount + metric.backlogCleared + metric.ppvSentMessages + metric.ppvSoldMessages;
   metric.dialogDwellMinutes = Math.round(metric.dialogDwellSeconds / 60);
   metric.avgDialogDwellSeconds = metric.dialogSessionsCount > 0 ? metric.dialogDwellSeconds / metric.dialogSessionsCount : null;
   metric.avgResponseSeconds = mean(metric._responseSeconds);
@@ -134,6 +155,7 @@ function cleanMetric(metric) {
   metric.slaReply5mPct = responseSamples > 0 ? (metric._sla5 / responseSamples) * 100 : null;
   metric.slaReply15mPct = responseSamples > 0 ? (metric._sla15 / responseSamples) * 100 : null;
   metric.dollarsPerMessageCents = metric.totalMessages > 0 ? Math.round(metric.revenueAttributedCents / metric.totalMessages) : 0;
+  metric.ppvOpenRatePct = metric.ppvSentMessages > 0 ? (metric.ppvSoldMessages / metric.ppvSentMessages) * 100 : null;
   metric.topDialogSessions = dialogSessions.map((item) => ({
     fanId: item.fanId || null,
     accountId: item.accountId || null,
@@ -176,6 +198,14 @@ function logicalEventKey(ev) {
 
   if (type === "dialog_unanswered_left") {
     return [type, accountId, fanId, pendingSeed || localSeed || ev.localId || ""].join("|");
+  }
+
+  if (type === "sent_message_recorded" || type === "ppv_message_sent_recorded") {
+    return [type, accountId, fanId, messageId || localSeed || ev.localId || ""].join("|");
+  }
+
+  if (type === "ppv_purchase_attributed" || type === "ppv_purchase_unresolved") {
+    return [type, accountId, fanId, messageId || extra.purchaseId || localSeed || ev.localId || ""].join("|");
   }
 
   if (type === "chat_message_sent_local") {
@@ -248,6 +278,33 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
 
   // account|fan -> pending seen dialog that may become unanswered only after leave.
   const pendingByDialog = new Map();
+  const sentByMessageId = new Map();
+  // A single OF purchase can appear as:
+  // - local attributed event from the worker that has the ledger row
+  // - unresolved event from another device
+  // - server resolver attributed event
+  // Count revenue ONCE per purchaseId, otherwise PPV revenue can silently x2/x3.
+  const seenPpvPurchaseIds = new Set();
+
+  for (const ev of events) {
+    const extra = eventExtra(ev);
+    const type = String(ev.type || "");
+    if (type !== "sent_message_recorded" && type !== "ppv_message_sent_recorded") continue;
+    const messageId = String(extra.messageId || "").trim();
+    if (!messageId) continue;
+    // message_id is the ownership source of truth. Keep the FIRST owner
+    // we saw; never let a later echo/resolver/retry race overwrite it.
+    if (!sentByMessageId.has(messageId)) {
+      sentByMessageId.set(messageId, {
+        memberId: String(ev.memberId || extra.memberId || extra.attributedMemberId || ""),
+        fanId: String(ev.fanId || extra.fanId || extra.dialogId || ""),
+        accountId: String(ev.accountId || extra.accountId || ""),
+        priceCents: num(extra.priceCents, 0),
+        isPpv: extra.isPpv === true || type === "ppv_message_sent_recorded",
+        shiftKey: extra.shiftKey || null,
+      });
+    }
+  }
 
   function getPending(key, defaults = {}) {
     let item = pendingByDialog.get(key);
@@ -321,6 +378,38 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
       pending.firstSeenAt = Math.min(Number(pending.firstSeenAt || firstSeenAt), firstSeenAt);
       pending.leftUnanswered = true;
       pending.leftAt = leftAt;
+      continue;
+    }
+
+    if (type === "sent_message_recorded" || type === "ppv_message_sent_recorded") {
+      if (m && (type === "ppv_message_sent_recorded" || extra.isPpv === true)) {
+        m.ppvSentMessages += 1;
+      }
+      continue;
+    }
+
+    if (type === "ppv_purchase_attributed" || type === "ppv_purchase_unresolved") {
+      const messageId = String(extra.messageId || "").trim();
+      const purchaseId = String(extra.purchaseId || extra.purchase_id || "").trim();
+      // Prefer real purchase_id. Fallback keeps the aggregation safe if an older
+      // event missed purchaseId but still has messageId + amount + purchasedAt.
+      const purchaseKey = purchaseId || [accountId, messageId, String(extra.amountCents || ""), String(extra.purchasedAt || extra.purchasedAtMs || eventTs(ev))].join("|");
+      if (purchaseKey) {
+        if (seenPpvPurchaseIds.has(purchaseKey)) continue;
+        seenPpvPurchaseIds.add(purchaseKey);
+      }
+
+      const owner = messageId ? sentByMessageId.get(messageId) : null;
+      const ownerMemberId = String(ev.memberId || extra.attributedMemberId || owner?.memberId || "").trim();
+      const ownerMetric = metricFor(ownerMemberId);
+      if (ownerMetric) {
+        const amount = Math.max(0, num(extra.amountCents, 0));
+        ownerMetric.ppvSoldMessages += 1;
+        ownerMetric.ppvRevenueCents += amount;
+        ownerMetric.revenueAttributedCents += amount;
+        if (fanId) ownerMetric._fans.add(fanId);
+        if (accountId) ownerMetric._creators.add(accountId);
+      }
       continue;
     }
 
@@ -463,7 +552,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     range: rangeForClient(computed.range),
     snapshot: null,
     members: rows,
-    source: "team_activity_event_v8",
+    source: "team_activity_event_v12",
   };
 }
 
@@ -480,6 +569,10 @@ function combineOverview(metricsList, membersCount) {
     engagementReplies: 0,
     backlogCleared: 0,
     backlogMaxAgeSeconds: 0,
+    ppvSentMessages: 0,
+    ppvSoldMessages: 0,
+    ppvRevenueCents: 0,
+    ppvOpenRatePct: null,
     uniqueFans: 0,
     activeCreators: 0,
     activeMembers: 0,
@@ -490,7 +583,7 @@ function combineOverview(metricsList, membersCount) {
     dollarsPerMessageCents: 0,
     avgResponseSeconds: null,
     slaReply15mPct: null,
-    source: "team_activity_event_v8",
+    source: "team_activity_event_v12",
   };
   const fans = new Set();
   const responses = [];
@@ -508,6 +601,9 @@ function combineOverview(metricsList, membersCount) {
     out.engagementReplies += num(m.engagementReplies, 0);
     out.backlogCleared += num(m.backlogCleared, 0);
     out.backlogMaxAgeSeconds = Math.max(num(out.backlogMaxAgeSeconds, 0), num(m.backlogMaxAgeSeconds, 0));
+    out.ppvSentMessages += num(m.ppvSentMessages, 0);
+    out.ppvSoldMessages += num(m.ppvSoldMessages, 0);
+    out.ppvRevenueCents += num(m.ppvRevenueCents, 0);
     out.revenueAttributedCents += num(m.revenueAttributedCents, 0);
     if (num(m.activeEvents, 0) > 0) out.activeMembers += 1;
     if (num(m.creatorCoverage, 0) > 0) out.activeCreators += num(m.creatorCoverage, 0);
@@ -524,6 +620,7 @@ function combineOverview(metricsList, membersCount) {
   out.avgResponseSeconds = mean(responses);
   out.slaReply15mPct = sla15Samples > 0 ? (sla15Good / sla15Samples) * 100 : null;
   out.dollarsPerMessageCents = out.totalMessages > 0 ? Math.round(out.revenueAttributedCents / out.totalMessages) : 0;
+  out.ppvOpenRatePct = out.ppvSentMessages > 0 ? (out.ppvSoldMessages / out.ppvSentMessages) * 100 : null;
   return out;
 }
 
@@ -541,6 +638,22 @@ async function buildTeamOverview({ agencyId, rangeKey = "7d" }) {
 async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
   const membersPayload = await buildTeamMembers({ agencyId, rangeKey });
   const alerts = [];
+  try {
+    const [jobConflicts, purchaseConflicts] = await Promise.all([
+      prisma.teamPpvResolveJob.count({ where: { agencyId, status: "conflict" } }),
+      prisma.teamPpvPurchaseLedger.count({ where: { agencyId, status: "conflict" } }),
+    ]);
+    const conflictCount = Math.max(num(jobConflicts, 0), num(purchaseConflicts, 0));
+    if (conflictCount > 0) {
+      alerts.push({
+        id: "ppv_conflicts",
+        tone: "danger",
+        title: `${conflictCount} PPV attribution conflicts`,
+        text: "Some PPV purchases were claimed by multiple workers and need manager review.",
+      });
+    }
+  } catch (_) {}
+
   for (const row of membersPayload.members) {
     const name = row.member?.name || "member";
     const m = row.metrics || {};
@@ -583,12 +696,12 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
       });
     }
   }
-  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v8" };
+  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v12" };
 }
 
 async function buildTeamFlags({ agencyId, rangeKey = "7d" }) {
   const alerts = await buildTeamAlerts({ agencyId, rangeKey });
-  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v8" };
+  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v12" };
 }
 
 module.exports = {

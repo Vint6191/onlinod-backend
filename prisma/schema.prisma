@@ -1595,3 +1595,104 @@ model BumpDeliveryStat {
   @@index([agencyId, day])
   @@index([creatorId, day])
 }
+
+model TeamSentMessageLedger {
+  id           String   @id @default(cuid())
+  agencyId     String
+  accountId    String   @default("unknown")
+  creatorId    String?
+  creatorRef   String?
+  memberId     String?
+  userId       String?
+  deviceId     String?
+  shiftKey     String?
+  dialogId     String?
+  fanId        String?
+
+  messageId    String?
+  localSeed    String
+  sentAt       DateTime
+
+  messageKind  String   @default("text")
+  isPpv        Boolean  @default(false)
+  priceCents   Int?
+  currency     String?
+  mediaCount   Int      @default(0)
+  mediaIds     Json?
+  campaignId   String?
+  source       String   @default("manual_chat")
+  telemetryEventId String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([agencyId, accountId, localSeed])
+  @@unique([agencyId, accountId, messageId])
+  @@index([agencyId, messageId])
+  @@index([agencyId, accountId, messageId])
+  @@index([agencyId, creatorId, sentAt])
+  @@index([agencyId, memberId, sentAt])
+  @@index([agencyId, isPpv, sentAt])
+  @@index([agencyId, dialogId, sentAt])
+}
+
+model TeamPpvPurchaseLedger {
+  id           String   @id @default(cuid())
+  agencyId     String
+  accountId    String   @default("unknown")
+  creatorId    String?
+  creatorRef   String?
+
+  purchaseId   String
+  messageId    String?
+  dialogId     String?
+  fanId        String?
+  buyerFanId   String?
+
+  amountCents  Int      @default(0)
+  currency     String   @default("USD")
+  purchasedAt  DateTime
+
+  status       String   @default("unresolved")
+  attributedMemberId String?
+  attributedUserId   String?
+  attributedShiftKey String?
+  resolvedAt   DateTime?
+  resolvedByDeviceId String?
+  resolvedSource String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([agencyId, purchaseId])
+  @@index([agencyId, messageId])
+  @@index([agencyId, status, purchasedAt])
+  @@index([agencyId, attributedMemberId, purchasedAt])
+}
+
+model TeamPpvResolveJob {
+  id           String   @id @default(cuid())
+  agencyId     String
+  accountId    String   @default("unknown")
+  creatorId    String?
+  creatorRef   String?
+  purchaseId   String
+  messageId    String
+  amountCents  Int      @default(0)
+  currency     String   @default("USD")
+  purchasedAt  DateTime?
+  status       String   @default("pending")
+  attempts     Int      @default(0)
+  expiresAt    DateTime?
+  resolvedAt   DateTime?
+  resolvedByMemberId String?
+  resolvedByDeviceId String?
+  result        Json?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([agencyId, purchaseId, messageId])
+  @@index([agencyId, status, createdAt])
+  @@index([agencyId, messageId])
+}
+

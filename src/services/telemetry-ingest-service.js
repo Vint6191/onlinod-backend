@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { applyLedgerSideEffects } = require("./team-ppv-ledger-service");
 
 function hashEvent(seed) {
   return crypto.createHash("sha256").update(JSON.stringify(seed)).digest("hex").slice(0, 40);
@@ -18,6 +19,24 @@ function cleanString(value, max = 512) {
   const s = String(value || "").trim();
   return s ? s.slice(0, max) : null;
 }
+
+
+function stripInternalValue(value) {
+  if (!value || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(stripInternalValue);
+  const out = {};
+  for (const [key, val] of Object.entries(value)) {
+    if (String(key).startsWith("__")) continue;
+    out[key] = stripInternalValue(val);
+  }
+  return out;
+}
+
+function stripInternalEventFields(event) {
+  const clean = stripInternalValue(event || {});
+  return clean && typeof clean === "object" ? clean : {};
+}
+
 
 async function resolveCreator({ agencyId, event }) {
   const candidates = [];
@@ -95,7 +114,8 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, events = [] }) {
   let skipped = 0;
   const safeDeviceId = await resolveExistingDeviceId({ agencyId, deviceId });
 
-  for (const event of input) {
+  for (const rawEvent of input) {
+    const event = stripInternalEventFields(rawEvent);
     if (!event || typeof event !== "object") {
       skipped += 1;
       continue;
@@ -153,11 +173,13 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, events = [] }) {
         });
         if (exists) {
           duplicated += 1;
+          try { await applyLedgerSideEffects({ ...row, id: exists.id }); } catch (ledgerErr) { console.error("[team-ledger] duplicate side effect failed:", ledgerErr?.message || ledgerErr); }
           continue;
         }
       }
-      await prisma.teamActivityEvent.create({ data: row });
+      const created = await prisma.teamActivityEvent.create({ data: row });
       inserted += 1;
+      try { await applyLedgerSideEffects({ ...row, id: created.id }); } catch (ledgerErr) { console.error("[team-ledger] side effect failed:", ledgerErr?.message || ledgerErr); }
     } catch (err) {
       if (err?.code === "P2002") duplicated += 1;
       else throw err;
