@@ -241,11 +241,24 @@ async function loadV3Events({ agencyId, range }) {
   return dedupeLogicalEvents(rows.filter(isCurrentTelemetry));
 }
 
+async function loadPpvPurchaseLedger({ agencyId, range }) {
+  try {
+    return await prisma.teamPpvPurchaseLedger.findMany({
+      where: { agencyId, ...whereForRange("purchasedAt", range) },
+      orderBy: { purchasedAt: "asc" },
+      take: 50000,
+    });
+  } catch (_) {
+    return [];
+  }
+}
+
 async function buildComputed({ agencyId, rangeKey = "7d" }) {
   const range = resolveRange(rangeKey);
-  const [members, events] = await Promise.all([
+  const [members, events, ppvPurchases] = await Promise.all([
     getMembersShell(agencyId),
     loadV3Events({ agencyId, range }),
+    loadPpvPurchaseLedger({ agencyId, range }),
   ]);
 
   const metricsByMember = new Map();
@@ -285,6 +298,30 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
   // - server resolver attributed event
   // Count revenue ONCE per purchaseId, otherwise PPV revenue can silently x2/x3.
   const seenPpvPurchaseIds = new Set();
+
+  // PPV ledger is the money source of truth. If a purchase exists in the
+  // ledger as conflict/unresolved/rejected, old activity events must NOT keep
+  // leaking revenue into member metrics. This is what makes Claims safe.
+  const ledgerPpvPurchaseIds = new Set();
+  for (const p of ppvPurchases || []) {
+    const purchaseId = String(p.purchaseId || "").trim();
+    if (purchaseId) ledgerPpvPurchaseIds.add(purchaseId);
+
+    const status = String(p.status || "").toLowerCase();
+    if (status !== "attributed" && status !== "resolved") continue;
+
+    const ownerMemberId = String(p.attributedMemberId || "").trim();
+    const ownerMetric = metricFor(ownerMemberId);
+    if (!ownerMetric) continue;
+
+    const amount = Math.max(0, num(p.amountCents, 0));
+    ownerMetric.ppvSoldMessages += 1;
+    ownerMetric.ppvRevenueCents += amount;
+    ownerMetric.revenueAttributedCents += amount;
+    if (p.fanId) ownerMetric._fans.add(String(p.fanId));
+    if (p.accountId) ownerMetric._creators.add(String(p.accountId));
+    if (purchaseId) seenPpvPurchaseIds.add(purchaseId);
+  }
 
   for (const ev of events) {
     const extra = eventExtra(ev);
@@ -391,6 +428,10 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     if (type === "ppv_purchase_attributed" || type === "ppv_purchase_unresolved") {
       const messageId = String(extra.messageId || "").trim();
       const purchaseId = String(extra.purchaseId || extra.purchase_id || "").trim();
+      // If the purchase is known to the ledger, the ledger already decided
+      // whether it is attributed, conflict, unresolved or rejected. Do not let
+      // legacy activity events override that decision.
+      if (purchaseId && ledgerPpvPurchaseIds.has(purchaseId)) continue;
       // Prefer real purchase_id. Fallback keeps the aggregation safe if an older
       // event missed purchaseId but still has messageId + amount + purchasedAt.
       const purchaseKey = purchaseId || [accountId, messageId, String(extra.amountCents || ""), String(extra.purchasedAt || extra.purchasedAtMs || eventTs(ev))].join("|");

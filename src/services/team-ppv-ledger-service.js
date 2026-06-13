@@ -66,6 +66,71 @@ function safeMediaIds(value) {
   return Array.from(new Set(value.map((v) => String(v || "").trim()).filter(Boolean))).slice(0, 100);
 }
 
+
+function candidateSentAtMs(value) {
+  const raw = value?.sentAtMs ?? value?.sent_at_ms ?? value?.sentAt ?? value?.sent_at ?? null;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return n;
+  const t = new Date(raw).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+function normalizeCandidate(value) {
+  if (!value || typeof value !== "object") return null;
+  const memberId = clean(
+    value.memberId || value.member_id || value.attributedMemberId || value.attributed_member_id ||
+    value.existingMemberId || value.incomingMemberId || null,
+    160
+  );
+  if (!memberId) return null;
+  return {
+    memberId,
+    userId: clean(value.userId || value.user_id || value.attributedUserId || value.attributed_user_id || null, 160),
+    deviceId: clean(value.deviceId || value.device_id || value.resolvedByDeviceId || value.resolved_by_device_id || null, 160),
+    shiftKey: clean(value.shiftKey || value.shift_key || value.attributedShiftKey || value.attributed_shift_key || null, 220),
+    sentAtMs: candidateSentAtMs(value),
+    source: clean(value.source || value.resolvedSource || value.resolved_source || "unknown", 80) || "unknown",
+  };
+}
+
+function mergeCandidates(...inputs) {
+  const out = new Map();
+  const push = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) push(item);
+      return;
+    }
+    const c = normalizeCandidate(value);
+    if (!c) return;
+    const key = [c.memberId, c.shiftKey || "", c.deviceId || ""].join("|");
+    const prev = out.get(key) || {};
+    out.set(key, {
+      memberId: c.memberId,
+      userId: prev.userId || c.userId || null,
+      deviceId: prev.deviceId || c.deviceId || null,
+      shiftKey: prev.shiftKey || c.shiftKey || null,
+      sentAtMs: prev.sentAtMs || c.sentAtMs || null,
+      source: prev.source && prev.source !== "unknown" ? prev.source : c.source,
+    });
+  };
+  for (const input of inputs) push(input);
+  return Array.from(out.values());
+}
+
+function conflictResult(prev, ...candidates) {
+  const base = prev && typeof prev === "object" && !Array.isArray(prev) ? { ...prev } : {};
+  base.conflict = true;
+  base.claimType = "ppv_attribution_conflict";
+  base.candidates = mergeCandidates(base.candidates, ...candidates);
+  return base;
+}
+
+function displayNameForMember(member) {
+  if (!member) return null;
+  return member.displayName || member.user?.name || member.user?.email || null;
+}
+
 async function findSentLedger({ agencyId, accountId, localSeed, messageId }) {
   if (messageId) {
     const byMessage = await prisma.teamSentMessageLedger.findFirst({
@@ -239,8 +304,27 @@ async function upsertPurchaseFromEvent(row) {
   }
 
   if (existing?.attributedMemberId && attributedMemberId && existing.attributedMemberId !== attributedMemberId) {
+    const existingCandidate = {
+      memberId: existing.attributedMemberId,
+      userId: existing.attributedUserId,
+      shiftKey: existing.attributedShiftKey,
+      deviceId: existing.resolvedByDeviceId,
+      source: existing.resolvedSource || "existing_purchase_ledger",
+    };
+    const incomingCandidate = {
+      memberId: attributedMemberId,
+      userId: attributedUserId,
+      shiftKey: payload.attributedShiftKey,
+      deviceId: payload.resolvedByDeviceId,
+      source: payload.resolvedSource || "incoming_telemetry",
+      sentAtMs: purchasedAt?.getTime?.() || null,
+    };
     await prisma.teamPpvPurchaseLedger.update({ where: { id: existing.id }, data: { status: "conflict" } });
     if (messageId) {
+      const prevJob = await prisma.teamPpvResolveJob.findUnique({
+        where: { agencyId_purchaseId_messageId: { agencyId, purchaseId, messageId } },
+      }).catch(() => null);
+      const result = conflictResult(prevJob?.result, existingCandidate, incomingCandidate);
       await prisma.teamPpvResolveJob.upsert({
         where: { agencyId_purchaseId_messageId: { agencyId, purchaseId, messageId } },
         create: {
@@ -255,10 +339,10 @@ async function upsertPurchaseFromEvent(row) {
           purchasedAt,
           status: "conflict",
           attempts: 1,
-          result: { existingMemberId: existing.attributedMemberId, incomingMemberId: attributedMemberId },
+          result,
           expiresAt: new Date(Date.now() + RESOLVE_JOB_EXPIRE_MS),
         },
-        update: { status: "conflict", attempts: { increment: 1 }, result: { existingMemberId: existing.attributedMemberId, incomingMemberId: attributedMemberId } },
+        update: { status: "conflict", attempts: { increment: 1 }, result },
       });
     }
     return existing;
@@ -373,6 +457,118 @@ async function createResolverActivityEvent(tx, { agencyId, deviceId, job, member
   });
 }
 
+function appendManualResolution(baseResult, manualResolution) {
+  const base = baseResult && typeof baseResult === "object" && !Array.isArray(baseResult)
+    ? { ...baseResult }
+    : {};
+  const prev = Array.isArray(base.manualResolutions)
+    ? base.manualResolutions
+    : (base.manualResolution ? [base.manualResolution] : []);
+  return {
+    ...base,
+    manualResolution,
+    manualResolutions: [...prev, manualResolution],
+  };
+}
+
+function manualResolutionHistory(result) {
+  if (!result || typeof result !== "object") return [];
+  if (Array.isArray(result.manualResolutions)) return result.manualResolutions;
+  return result.manualResolution ? [result.manualResolution] : [];
+}
+
+async function actorFromDevice(tx, { agencyId, deviceId }) {
+  const safeDeviceId = clean(deviceId, 160);
+  if (!safeDeviceId) return null;
+  const device = await tx.workerDevice.findFirst({
+    where: { agencyId, id: safeDeviceId },
+    include: { user: { select: { id: true, email: true, name: true } } },
+  });
+  if (!device?.userId) return null;
+  const member = await tx.agencyMember.findFirst({
+    where: { agencyId, userId: device.userId, deletedAt: null },
+    include: { user: { select: { id: true, email: true, name: true } } },
+  });
+  return {
+    userId: device.userId,
+    memberId: member?.id || null,
+    name: displayNameForMember(member) || device.user?.name || device.user?.email || null,
+  };
+}
+
+async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, job, action, selectedMemberId, candidates, reason }) {
+  const safeAction = clean(action, 40) || "assign";
+  const safeSelectedMemberId = clean(selectedMemberId, 160);
+  const uniqueCandidateIds = Array.from(new Set((candidates || []).map((c) => clean(c?.memberId, 160)).filter(Boolean)));
+  if (!uniqueCandidateIds.length) return 0;
+
+  const targetIds = safeAction === "assign"
+    ? uniqueCandidateIds.filter((id) => id !== safeSelectedMemberId)
+    : uniqueCandidateIds;
+  if (!targetIds.length) return 0;
+
+  const [members, selectedMember, actor] = await Promise.all([
+    tx.agencyMember.findMany({
+      where: { agencyId, id: { in: targetIds }, deletedAt: null },
+      include: { user: { select: { id: true, email: true, name: true } } },
+    }),
+    safeSelectedMemberId
+      ? tx.agencyMember.findFirst({
+          where: { agencyId, id: safeSelectedMemberId, deletedAt: null },
+          include: { user: { select: { id: true, email: true, name: true } } },
+        })
+      : null,
+    actorFromDevice(tx, { agencyId, deviceId }),
+  ]);
+  const memberById = new Map(members.map((m) => [m.id, m]));
+  const selectedName = displayNameForMember(selectedMember) || safeSelectedMemberId || null;
+  const actorName = actor?.name || actor?.memberId || actor?.userId || null;
+  let created = 0;
+
+  for (const targetMemberId of targetIds) {
+    const target = memberById.get(targetMemberId);
+    const localId = ["ppv_claim_notice", job.id, safeAction, targetMemberId, Date.now(), Math.random().toString(36).slice(2, 8)].join(":");
+    await tx.teamActivityEvent.create({
+      data: {
+        agencyId,
+        deviceId: clean(deviceId, 160),
+        userId: target?.userId || null,
+        memberId: targetMemberId,
+        accountId: job.accountId,
+        creatorId: job.creatorId || null,
+        creatorRef: job.creatorRef || null,
+        fanId: null,
+        type: "ppv_claim_resolution_notice",
+        ts: new Date(),
+        localId,
+        source: "server_ppv_claims",
+        extra: {
+          telemetryVersion: "team_v13_ppv_claims",
+          claimType: "ppv_attribution_conflict",
+          action: safeAction,
+          purchaseId: job.purchaseId,
+          messageId: job.messageId,
+          amountCents: job.amountCents,
+          currency: job.currency,
+          targetMemberId,
+          assignedMemberId: safeAction === "assign" ? safeSelectedMemberId : null,
+          assignedMemberName: safeAction === "assign" ? selectedName : null,
+          resolvedByDeviceId: clean(deviceId, 160),
+          resolvedByMemberId: actor?.memberId || null,
+          resolvedByUserId: actor?.userId || null,
+          resolvedByName: actorName,
+          reason: clean(reason, 1000),
+          text: safeAction === "assign"
+            ? `PPV ${(job.amountCents || 0) / 100} ${job.currency || "USD"} was assigned to ${selectedName || safeSelectedMemberId || "another member"}${actorName ? ` by ${actorName}` : ""}.`
+            : `PPV ${(job.amountCents || 0) / 100} ${job.currency || "USD"} claim was marked ${safeAction}${actorName ? ` by ${actorName}` : ""}.`,
+        },
+      },
+    });
+    created += 1;
+  }
+  return created;
+}
+
 async function submitResolveResults({ agencyId, deviceId, results = [] }) {
   const input = Array.isArray(results) ? results : [];
   let resolved = 0;
@@ -390,18 +586,48 @@ async function submitResolveResults({ agencyId, deviceId, results = [] }) {
       const job = await tx.teamPpvResolveJob.findFirst({
         where: { agencyId, ...(jobId ? { id: jobId } : { purchaseId, messageId }) },
       });
-      if (!job || job.status === "resolved") return "skipped";
+      if (!job) return "skipped";
       if (job.expiresAt && job.expiresAt < new Date()) {
         await tx.teamPpvResolveJob.update({ where: { id: job.id }, data: { status: "expired", attempts: { increment: 1 } } });
         return "skipped";
       }
 
+      const incomingCandidate = {
+        memberId,
+        shiftKey: clean(item.shiftKey, 220),
+        deviceId: clean(deviceId || item.deviceId, 160),
+        sentAtMs: item.sentAtMs || item.sent_at_ms || null,
+        source: clean(item.source || "local_worker_ledger", 80),
+      };
+
       const existingPurchase = await tx.teamPpvPurchaseLedger.findFirst({ where: { agencyId, purchaseId: job.purchaseId } });
       if (existingPurchase?.attributedMemberId && existingPurchase.attributedMemberId !== memberId) {
-        await tx.teamPpvResolveJob.update({ where: { id: job.id }, data: { status: "conflict", attempts: { increment: 1 }, result: item } });
+        const existingCandidate = {
+          memberId: existingPurchase.attributedMemberId,
+          userId: existingPurchase.attributedUserId,
+          shiftKey: existingPurchase.attributedShiftKey,
+          deviceId: existingPurchase.resolvedByDeviceId,
+          source: existingPurchase.resolvedSource || "existing_purchase_ledger",
+        };
+        const result = conflictResult(job.result, existingCandidate, incomingCandidate);
+        await tx.teamPpvResolveJob.update({
+          where: { id: job.id },
+          data: { status: "conflict", attempts: { increment: 1 }, result },
+        });
         await tx.teamPpvPurchaseLedger.update({ where: { id: existingPurchase.id }, data: { status: "conflict" } });
         return "conflict";
       }
+
+      if (String(job.status || "") === "conflict") {
+        const result = conflictResult(job.result, incomingCandidate);
+        await tx.teamPpvResolveJob.update({
+          where: { id: job.id },
+          data: { attempts: { increment: 1 }, result },
+        });
+        return "conflict";
+      }
+
+      if (String(job.status || "") === "resolved") return "skipped";
 
       await tx.teamPpvPurchaseLedger.upsert({
         where: { agencyId_purchaseId: { agencyId, purchaseId: job.purchaseId } },
@@ -440,11 +666,13 @@ async function submitResolveResults({ agencyId, deviceId, results = [] }) {
           resolvedAt: new Date(),
           resolvedByMemberId: memberId,
           resolvedByDeviceId: clean(deviceId || item.deviceId, 160),
-          result: item,
+          result: { ...incomingCandidate, autoResolved: true },
         },
       });
 
-      await createResolverActivityEvent(tx, { agencyId, deviceId, job, memberId, item });
+      // Do not create a provisional money event here. Team stats read PPV money
+      // from TeamPpvPurchaseLedger, so a later conflict can safely remove it
+      // from revenue until a manager closes the claim.
       return "resolved";
     });
 
@@ -455,86 +683,285 @@ async function submitResolveResults({ agencyId, deviceId, results = [] }) {
   return { received: input.length, resolved, conflicts, skipped };
 }
 
-async function listPpvConflicts({ agencyId, limit = 100 }) {
+async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false }) {
+  const statuses = includeClosed
+    ? ["conflict", "resolved", "rejected"]
+    : ["conflict"];
   const rows = await prisma.teamPpvResolveJob.findMany({
-    where: { agencyId, status: "conflict" },
+    where: { agencyId, status: { in: statuses } },
     orderBy: { updatedAt: "desc" },
     take: Math.max(1, Math.min(250, Number(limit) || 100)),
   });
-  return rows.map((r) => ({
-    id: r.id,
-    jobId: r.id,
-    purchaseId: r.purchaseId,
-    messageId: r.messageId,
-    amountCents: r.amountCents,
-    currency: r.currency,
-    purchasedAt: r.purchasedAt?.getTime?.() || null,
-    resolvedByMemberId: r.resolvedByMemberId || null,
-    result: r.result || null,
-    updatedAt: r.updatedAt?.getTime?.() || null,
-  }));
+
+  const purchaseIds = Array.from(new Set(rows.map((r) => r.purchaseId).filter(Boolean)));
+  const purchases = purchaseIds.length
+    ? await prisma.teamPpvPurchaseLedger.findMany({ where: { agencyId, purchaseId: { in: purchaseIds } } })
+    : [];
+  const purchaseById = new Map(purchases.map((p) => [p.purchaseId, p]));
+
+  const rawCandidates = rows.flatMap((r) => {
+    const result = r.result && typeof r.result === "object" ? r.result : {};
+    const p = purchaseById.get(r.purchaseId);
+    return mergeCandidates(
+      result.candidates,
+      result.existingMemberId ? { memberId: result.existingMemberId, source: "existing_result" } : null,
+      result.incomingMemberId ? { memberId: result.incomingMemberId, source: "incoming_result" } : null,
+      result.memberId ? { memberId: result.memberId, shiftKey: result.shiftKey, deviceId: result.deviceId, sentAtMs: result.sentAtMs, source: result.source } : null,
+      p?.attributedMemberId ? { memberId: p.attributedMemberId, userId: p.attributedUserId, shiftKey: p.attributedShiftKey, deviceId: p.resolvedByDeviceId, source: p.resolvedSource } : null
+    );
+  });
+  const memberIds = Array.from(new Set(rawCandidates.map((c) => c.memberId).filter(Boolean)));
+  const members = memberIds.length
+    ? await prisma.agencyMember.findMany({
+        where: { agencyId, id: { in: memberIds }, deletedAt: null },
+        include: { user: { select: { id: true, email: true, name: true } } },
+      })
+    : [];
+  const memberById = new Map(members.map((m) => [m.id, m]));
+
+  return rows.map((r) => {
+    const result = r.result && typeof r.result === "object" ? r.result : {};
+    const purchase = purchaseById.get(r.purchaseId) || null;
+    const candidates = mergeCandidates(
+      result.candidates,
+      result.existingMemberId ? { memberId: result.existingMemberId, source: "existing_result" } : null,
+      result.incomingMemberId ? { memberId: result.incomingMemberId, source: "incoming_result" } : null,
+      result.memberId ? { memberId: result.memberId, shiftKey: result.shiftKey, deviceId: result.deviceId, sentAtMs: result.sentAtMs, source: result.source } : null,
+      purchase?.attributedMemberId ? {
+        memberId: purchase.attributedMemberId,
+        userId: purchase.attributedUserId,
+        shiftKey: purchase.attributedShiftKey,
+        deviceId: purchase.resolvedByDeviceId,
+        source: purchase.resolvedSource,
+      } : null
+    ).map((c) => {
+      const member = memberById.get(c.memberId);
+      return {
+        ...c,
+        name: displayNameForMember(member) || c.memberId,
+        email: member?.user?.email || null,
+      };
+    });
+
+    return {
+      id: r.id,
+      jobId: r.id,
+      claimType: "ppv_attribution_conflict",
+      entityType: "ppv_purchase",
+      entityId: r.purchaseId,
+      status: r.status === "conflict" ? "open" : r.status,
+      jobStatus: r.status,
+      purchaseId: r.purchaseId,
+      messageId: r.messageId,
+      accountId: r.accountId,
+      creatorId: r.creatorId,
+      creatorRef: r.creatorRef,
+      amountCents: r.amountCents,
+      currency: r.currency,
+      purchasedAt: r.purchasedAt?.getTime?.() || null,
+      resolvedByMemberId: r.resolvedByMemberId || null,
+      purchaseStatus: purchase?.status || (r.status === "conflict" ? "conflict" : r.status),
+      canReopen: r.status !== "conflict",
+      candidates,
+      manualResolutions: manualResolutionHistory(r.result),
+      result: r.result || null,
+      resolvedAt: r.resolvedAt?.getTime?.() || null,
+      updatedAt: r.updatedAt?.getTime?.() || null,
+    };
+  });
 }
 
-async function resolvePpvConflict({ agencyId, jobId, memberId, deviceId }) {
+async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign", deviceId, reason = null }) {
   const safeJobId = clean(jobId, 160);
+  const safeAction = clean(action || (memberId ? "assign" : "unresolved"), 40) || "assign";
   const safeMemberId = clean(memberId, 160);
-  if (!safeJobId || !safeMemberId) return { resolved: 0, skipped: 1 };
+  const finalAction = safeAction === "reopen"
+    ? "reopen"
+    : (safeAction === "reject" ? "reject" : (safeAction === "unresolved" ? "unresolved" : "assign"));
+  if (!safeJobId) return { resolved: 0, skipped: 1 };
+  if (finalAction === "assign" && !safeMemberId) return { resolved: 0, skipped: 1 };
 
   const outcome = await prisma.$transaction(async (tx) => {
     const job = await tx.teamPpvResolveJob.findFirst({ where: { agencyId, id: safeJobId } });
     if (!job) return "skipped";
-    await tx.teamPpvPurchaseLedger.upsert({
-      where: { agencyId_purchaseId: { agencyId, purchaseId: job.purchaseId } },
-      create: {
+
+    const baseResult = job.result && typeof job.result === "object" ? job.result : {};
+    const manualResolution = {
+      manualResolution: true,
+      action: finalAction,
+      memberId: finalAction === "assign" ? safeMemberId : null,
+      reason: clean(reason, 1000),
+      resolvedByDeviceId: clean(deviceId, 160),
+      resolvedAt: new Date().toISOString(),
+    };
+    const nextResult = appendManualResolution(baseResult, manualResolution);
+    const candidates = mergeCandidates(
+      baseResult.candidates,
+      baseResult.existingMemberId ? { memberId: baseResult.existingMemberId, source: "existing_result" } : null,
+      baseResult.incomingMemberId ? { memberId: baseResult.incomingMemberId, source: "incoming_result" } : null,
+      baseResult.memberId ? { memberId: baseResult.memberId, shiftKey: baseResult.shiftKey, deviceId: baseResult.deviceId, sentAtMs: baseResult.sentAtMs, source: baseResult.source } : null,
+      safeMemberId ? { memberId: safeMemberId, source: "manual_selected" } : null
+    );
+
+    if (finalAction === "reopen") {
+      await tx.teamPpvPurchaseLedger.upsert({
+        where: { agencyId_purchaseId: { agencyId, purchaseId: job.purchaseId } },
+        create: {
+          agencyId,
+          accountId: job.accountId,
+          creatorId: job.creatorId,
+          creatorRef: job.creatorRef,
+          purchaseId: job.purchaseId,
+          messageId: job.messageId,
+          amountCents: job.amountCents,
+          currency: job.currency,
+          purchasedAt: job.purchasedAt || new Date(),
+          status: "conflict",
+          attributedMemberId: null,
+          resolvedAt: null,
+          resolvedByDeviceId: clean(deviceId, 160),
+          resolvedSource: "manual_claim_reopen",
+        },
+        update: {
+          status: "conflict",
+          attributedMemberId: null,
+          attributedUserId: null,
+          attributedShiftKey: null,
+          resolvedAt: null,
+          resolvedByDeviceId: clean(deviceId, 160),
+          resolvedSource: "manual_claim_reopen",
+        },
+      });
+
+      await tx.teamPpvResolveJob.update({
+        where: { id: job.id },
+        data: {
+          status: "conflict",
+          resolvedAt: null,
+          resolvedByMemberId: null,
+          resolvedByDeviceId: clean(deviceId, 160),
+          result: nextResult,
+        },
+      });
+
+      await createPpvClaimNoticeEvents(tx, {
         agencyId,
-        accountId: job.accountId,
-        creatorId: job.creatorId,
-        creatorRef: job.creatorRef,
-        purchaseId: job.purchaseId,
-        messageId: job.messageId,
-        amountCents: job.amountCents,
-        currency: job.currency,
-        purchasedAt: job.purchasedAt || new Date(),
-        status: "attributed",
-        attributedMemberId: safeMemberId,
-        resolvedAt: new Date(),
-        resolvedByDeviceId: clean(deviceId, 160),
-        resolvedSource: "manual_conflict_resolution",
-      },
-      update: {
-        status: "attributed",
-        attributedMemberId: safeMemberId,
-        resolvedAt: new Date(),
-        resolvedByDeviceId: clean(deviceId, 160),
-        resolvedSource: "manual_conflict_resolution",
-      },
-    });
+        deviceId,
+        job,
+        action: "reopen",
+        selectedMemberId: null,
+        candidates,
+        reason,
+      });
+
+      return finalAction;
+    }
+
+    if (finalAction === "assign") {
+      await tx.teamPpvPurchaseLedger.upsert({
+        where: { agencyId_purchaseId: { agencyId, purchaseId: job.purchaseId } },
+        create: {
+          agencyId,
+          accountId: job.accountId,
+          creatorId: job.creatorId,
+          creatorRef: job.creatorRef,
+          purchaseId: job.purchaseId,
+          messageId: job.messageId,
+          amountCents: job.amountCents,
+          currency: job.currency,
+          purchasedAt: job.purchasedAt || new Date(),
+          status: "attributed",
+          attributedMemberId: safeMemberId,
+          resolvedAt: new Date(),
+          resolvedByDeviceId: clean(deviceId, 160),
+          resolvedSource: "manual_claim_resolution",
+        },
+        update: {
+          status: "attributed",
+          attributedMemberId: safeMemberId,
+          resolvedAt: new Date(),
+          resolvedByDeviceId: clean(deviceId, 160),
+          resolvedSource: "manual_claim_resolution",
+        },
+      });
+    } else {
+      await tx.teamPpvPurchaseLedger.upsert({
+        where: { agencyId_purchaseId: { agencyId, purchaseId: job.purchaseId } },
+        create: {
+          agencyId,
+          accountId: job.accountId,
+          creatorId: job.creatorId,
+          creatorRef: job.creatorRef,
+          purchaseId: job.purchaseId,
+          messageId: job.messageId,
+          amountCents: job.amountCents,
+          currency: job.currency,
+          purchasedAt: job.purchasedAt || new Date(),
+          status: finalAction === "reject" ? "rejected" : "unresolved",
+          attributedMemberId: null,
+          resolvedAt: finalAction === "reject" ? new Date() : null,
+          resolvedByDeviceId: clean(deviceId, 160),
+          resolvedSource: finalAction === "reject" ? "manual_claim_reject" : "manual_claim_unresolved",
+        },
+        update: {
+          status: finalAction === "reject" ? "rejected" : "unresolved",
+          attributedMemberId: null,
+          attributedUserId: null,
+          attributedShiftKey: null,
+          resolvedAt: finalAction === "reject" ? new Date() : null,
+          resolvedByDeviceId: clean(deviceId, 160),
+          resolvedSource: finalAction === "reject" ? "manual_claim_reject" : "manual_claim_unresolved",
+        },
+      });
+    }
+
     await tx.teamPpvResolveJob.update({
       where: { id: job.id },
       data: {
-        status: "resolved",
+        status: finalAction === "reject" ? "rejected" : "resolved",
         resolvedAt: new Date(),
-        resolvedByMemberId: safeMemberId,
+        resolvedByMemberId: finalAction === "assign" ? safeMemberId : null,
         resolvedByDeviceId: clean(deviceId, 160),
-        result: { ...(job.result && typeof job.result === "object" ? job.result : {}), manualResolution: true, memberId: safeMemberId },
+        result: nextResult,
       },
     });
-    await createResolverActivityEvent(tx, { agencyId, deviceId, job, memberId: safeMemberId, item: { source: "manual_conflict_resolution" } });
-    return "resolved";
+
+    await createPpvClaimNoticeEvents(tx, {
+      agencyId,
+      deviceId,
+      job,
+      action: finalAction,
+      selectedMemberId: finalAction === "assign" ? safeMemberId : null,
+      candidates,
+      reason,
+    });
+
+    if (finalAction === "assign") {
+      await createResolverActivityEvent(tx, {
+        agencyId,
+        deviceId,
+        job,
+        memberId: safeMemberId,
+        item: { source: "manual_claim_resolution", reason },
+      });
+    }
+
+    return finalAction;
   });
 
-  return outcome === "resolved" ? { resolved: 1, skipped: 0 } : { resolved: 0, skipped: 1 };
+  if (outcome === "skipped") return { resolved: 0, skipped: 1 };
+  return { resolved: 1, skipped: 0, action: outcome };
 }
 
 async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS } = {}) {
   await expirePendingJobs({});
   const before = new Date(Date.now() - olderThanMs);
   await prisma.teamSentMessageLedger.deleteMany({ where: { sentAt: { lt: before } } });
-  await prisma.teamPpvPurchaseLedger.deleteMany({ where: { purchasedAt: { lt: before }, status: { in: ["resolved", "expired", "attributed", "unresolved"] } } });
+  await prisma.teamPpvPurchaseLedger.deleteMany({ where: { purchasedAt: { lt: before }, status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected"] } } });
   await prisma.teamPpvResolveJob.deleteMany({
     where: {
       OR: [{ expiresAt: { lt: new Date() } }, { createdAt: { lt: before } }],
-      status: { in: ["resolved", "expired"] },
+      status: { in: ["resolved", "expired", "rejected"] },
     },
   });
 }

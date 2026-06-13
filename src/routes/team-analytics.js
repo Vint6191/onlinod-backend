@@ -61,7 +61,8 @@ router.post("/ppv/resolve-results", async (req, res) => {
 router.get("/ppv/conflicts", async (req, res) => {
   try {
     const id = requireAgency(req, res); if (!id) return;
-    const conflicts = await listPpvConflicts({ agencyId: id, limit: req.query.limit || 100 });
+    const includeClosed = String(req.query.includeClosed || req.query.include_closed || "") === "1" || String(req.query.includeClosed || "").toLowerCase() === "true";
+    const conflicts = await listPpvConflicts({ agencyId: id, limit: req.query.limit || 100, includeClosed });
     return res.json({ ok: true, conflicts });
   } catch (err) {
     return res.status(500).json({ ok: false, code: "PPV_CONFLICTS_FAILED", error: err?.message || "Failed" });
@@ -75,6 +76,8 @@ router.post("/ppv/conflicts/:jobId/resolve", async (req, res) => {
       agencyId: id,
       jobId: req.params.jobId,
       memberId: req.body?.memberId || req.body?.attributedMemberId,
+      action: req.body?.action || (req.body?.memberId || req.body?.attributedMemberId ? "assign" : "unresolved"),
+      reason: req.body?.reason || null,
       deviceId: req.auth.deviceId || req.body?.deviceId || null,
     });
     return res.json({ ok: true, ...result });
