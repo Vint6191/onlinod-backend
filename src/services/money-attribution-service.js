@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { ingestTipEvent } = require("./team-tip-ledger-service");
 
 // --------------------------------------------------------------------
 // Constants — these MUST match electron/team-claims/claim-rules.js or
@@ -9,6 +10,7 @@ const prisma = require("../prisma");
 // --------------------------------------------------------------------
 const ATTRIBUTION_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 const GRACE_PERIOD_MS = 48 * 60 * 60 * 1000;      // 48 hours after the money event
+const LEGACY_ATTRIBUTION_RETENTION_DAYS = 180;
 
 const MONEY_EVENT_TYPES = new Set([
   "tip_received",
@@ -17,11 +19,19 @@ const MONEY_EVENT_TYPES = new Set([
 ]);
 
 // PPV attribution moved to TeamPpvPurchaseLedger / TeamPpvResolveJob.
-// Keep MoneyAttribution only for legacy non-PPV money types until tips/subs
-// get their own ledger.
+// Tips moved to TeamTipLedger in v16. MoneyAttribution is kept only as
+// a read-only legacy fallback for old tip rows until they are migrated.
+// Subscriptions are intentionally NOT Team member revenue; they belong to
+// the future Traffic / CreatorSubscription ledger.
 const LEGACY_CLAIMABLE_EVENT_TYPES = new Set([
   "tip_received",
-  "subscription_created",
+]);
+
+// Keep old subscription_created rows until Traffic/CreatorSubscriptionLedger
+// exists and a dedicated backfill can preserve historical subscription stats.
+const LEGACY_PURGEABLE_EVENT_TYPES = new Set([
+  "tip_received",
+  "ppv_purchase_received",
 ]);
 
 const ALLOWED_ACTIONS = new Set(["claim", "release", "manager_override"]);
@@ -213,6 +223,19 @@ async function ingestMoneyEvent({ agencyId, userId, payload }) {
     return { ok: false, code: "INVALID_EVENT_TYPE" };
   }
 
+  if (eventType === "tip_received") {
+    return ingestTipEvent({ agencyId, userId, payload });
+  }
+
+  if (eventType === "subscription_created") {
+    return {
+      ok: true,
+      ignored: true,
+      code: "SUBSCRIPTION_NOT_TEAM_MEMBER_REVENUE",
+      message: "Paid subscriptions belong to traffic / creator revenue, not chatter attribution. Free subscriptions are not revenue.",
+    };
+  }
+
   if (!isLegacyClaimableEventType(eventType)) {
     return {
       ok: true,
@@ -321,6 +344,13 @@ async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action
   }
 
   if (!isLegacyClaimableEventType(row.eventType)) {
+    if (row.eventType === "subscription_created") {
+      return {
+        ok: false,
+        code: "SUBSCRIPTION_NOT_TEAM_MEMBER_REVENUE",
+        error: "Subscriptions belong to traffic / creator revenue and are not claimable by chatters",
+      };
+    }
     return {
       ok: false,
       code: "PPV_CLAIMS_MOVED_TO_LEDGER",
@@ -348,7 +378,7 @@ async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action
       return {
         ok: false,
         code: "CLAIM_NOT_ELIGIBLE",
-        error: "You can claim only tips/subscriptions from dialogs you worked in the attribution window",
+        error: "You can claim only legacy tip rows from dialogs you worked in the attribution window",
       };
     }
     nextOwnerMemberId = actor.id;
@@ -451,24 +481,60 @@ async function listDisputable({ agencyId, range = "24h", limit = 200, actorMembe
 // schedule from the backend.
 // --------------------------------------------------------------------
 
-async function sweepLocks() {
+async function sweepLocks({ agencyId = null } = {}) {
   const cutoff = new Date(Date.now() - GRACE_PERIOD_MS);
+  const cleanAgency = cleanString(agencyId, 160);
   const result = await prisma.moneyAttribution.updateMany({
-    where: { locked: false, occurredAt: { lte: cutoff } },
+    where: {
+      locked: false,
+      occurredAt: { lte: cutoff },
+      ...(cleanAgency ? { agencyId: cleanAgency } : {}),
+    },
     data: { locked: true, lockedAt: new Date() },
   });
   return { locked: result.count };
 }
 
+
+async function purgeExpiredLegacyAttributions({ agencyId = null, retentionDays = LEGACY_ATTRIBUTION_RETENTION_DAYS, limit = 5000, dryRun = false } = {}) {
+  const cleanAgency = cleanString(agencyId, 160);
+  const safeRetentionDays = Math.max(1, Math.round(Number(retentionDays) || LEGACY_ATTRIBUTION_RETENTION_DAYS));
+  const safeLimit = Math.min(20000, Math.max(1, Math.round(Number(limit) || 5000)));
+  const cutoff = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
+
+  const rows = await prisma.moneyAttribution.findMany({
+    where: {
+      ...(cleanAgency ? { agencyId: cleanAgency } : {}),
+      eventType: { in: Array.from(LEGACY_PURGEABLE_EVENT_TYPES) },
+      occurredAt: { lt: cutoff },
+    },
+    select: { id: true },
+    orderBy: { occurredAt: "asc" },
+    take: safeLimit,
+  }).catch(() => []);
+
+  if (dryRun || rows.length === 0) {
+    return { ok: true, deleted: 0, matched: rows.length, retentionDays: safeRetentionDays, cutoff, dryRun: Boolean(dryRun) };
+  }
+
+  const result = await prisma.moneyAttribution.deleteMany({
+    where: { id: { in: rows.map((row) => row.id) } },
+  });
+  return { ok: true, deleted: result.count, matched: rows.length, retentionDays: safeRetentionDays, cutoff, dryRun: false };
+}
+
 module.exports = {
   ATTRIBUTION_WINDOW_MS,
   GRACE_PERIOD_MS,
+  LEGACY_ATTRIBUTION_RETENTION_DAYS,
   MONEY_EVENT_TYPES,
   LEGACY_CLAIMABLE_EVENT_TYPES,
+  LEGACY_PURGEABLE_EVENT_TYPES,
   ingestMoneyEvent,
   applyOverride,
   listDisputable,
   sweepLocks,
+  purgeExpiredLegacyAttributions,
   hashEvent,
   isLocked,
   isLegacyClaimableEventType,

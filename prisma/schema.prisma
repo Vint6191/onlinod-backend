@@ -1670,6 +1670,48 @@ model TeamPpvPurchaseLedger {
   @@index([agencyId, attributedMemberId, purchasedAt])
 }
 
+
+model TeamTipLedger {
+  id           String   @id @default(cuid())
+  agencyId     String
+  accountId    String   @default("unknown")
+  creatorId    String?
+  creatorRef   String?
+
+  eventHash    String
+  tipId        String
+  messageId    String?
+  dialogId     String?
+  fanId        String?
+
+  amountCents  Int      @default(0)
+  currency     String   @default("USD")
+  receivedAt   DateTime
+
+  status       String   @default("creator_revenue")
+  attributedMemberId String?
+  attributedUserId   String?
+  attributedShiftKey String?
+  resolvedAt   DateTime?
+  resolvedByMemberId String?
+  resolvedSource String?
+
+  candidates     Json?
+  weakCandidates Json?
+  result         Json?
+  history        Json     @default("[]")
+  source         String   @default("claims_ingest")
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([agencyId, eventHash])
+  @@index([agencyId, status, receivedAt])
+  @@index([agencyId, attributedMemberId, receivedAt])
+  @@index([agencyId, fanId, receivedAt])
+  @@index([agencyId, creatorId, receivedAt])
+}
+
 model TeamPpvResolveJob {
   id           String   @id @default(cuid())
   agencyId     String
