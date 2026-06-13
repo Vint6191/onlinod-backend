@@ -16,6 +16,14 @@ const MONEY_EVENT_TYPES = new Set([
   "subscription_created",
 ]);
 
+// PPV attribution moved to TeamPpvPurchaseLedger / TeamPpvResolveJob.
+// Keep MoneyAttribution only for legacy non-PPV money types until tips/subs
+// get their own ledger.
+const LEGACY_CLAIMABLE_EVENT_TYPES = new Set([
+  "tip_received",
+  "subscription_created",
+]);
+
 const ALLOWED_ACTIONS = new Set(["claim", "release", "manager_override"]);
 
 // --------------------------------------------------------------------
@@ -137,6 +145,57 @@ async function resolveMember({ agencyId, memberId, userId }) {
   return null;
 }
 
+function isLegacyClaimableEventType(eventType) {
+  return LEGACY_CLAIMABLE_EVENT_TYPES.has(String(eventType || ""));
+}
+
+async function memberHadRecentDialogWork({ agencyId, row, memberId }) {
+  if (!agencyId || !row || !memberId || !row.occurredAt) return false;
+
+  const occurredAt = new Date(row.occurredAt);
+  const occurredMs = occurredAt.getTime();
+  if (!Number.isFinite(occurredMs)) return false;
+
+  const from = new Date(occurredMs - ATTRIBUTION_WINDOW_MS);
+  const fanOrDialog = cleanString(row.fanId, 160);
+  const accountId = cleanString(row.accountId, 160);
+
+  const and = [];
+  if (accountId) and.push({ accountId });
+  if (fanOrDialog) {
+    and.push({
+      OR: [
+        { fanId: fanOrDialog },
+        { dialogId: fanOrDialog },
+      ],
+    });
+  }
+
+  const match = await prisma.teamSentMessageLedger.findFirst({
+    where: {
+      agencyId,
+      memberId,
+      sentAt: { gte: from, lte: occurredAt },
+      ...(and.length ? { AND: and } : {}),
+    },
+    select: { id: true },
+  }).catch(() => null);
+
+  return Boolean(match);
+}
+
+async function canActorClaimAttribution({ agencyId, row, actor }) {
+  if (!row || !actor) return false;
+  if (!isLegacyClaimableEventType(row.eventType)) return false;
+
+  // Current/auto owner can safely claim/release; otherwise require proof
+  // that this member actually worked this dialog shortly before the money event.
+  if (row.attributedToMemberId === actor.id) return true;
+  if (row.autoAttributedToMemberId === actor.id) return true;
+
+  return memberHadRecentDialogWork({ agencyId, row, memberId: actor.id });
+}
+
 // --------------------------------------------------------------------
 // Ingest a money event from Electron and apply auto-attribution
 // --------------------------------------------------------------------
@@ -152,6 +211,15 @@ async function ingestMoneyEvent({ agencyId, userId, payload }) {
   const eventType = cleanString(payload?.type, 80);
   if (!eventType || !MONEY_EVENT_TYPES.has(eventType)) {
     return { ok: false, code: "INVALID_EVENT_TYPE" };
+  }
+
+  if (!isLegacyClaimableEventType(eventType)) {
+    return {
+      ok: true,
+      ignored: true,
+      code: "PPV_MOVED_TO_TEAM_PPV_LEDGER",
+      message: "PPV attribution is handled by TeamPpvPurchaseLedger / TeamPpvResolveJob",
+    };
   }
 
   const amountCents = asAmountCents(payload);
@@ -252,6 +320,14 @@ async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action
     return { ok: false, code: "ATTRIBUTION_NOT_FOUND" };
   }
 
+  if (!isLegacyClaimableEventType(row.eventType)) {
+    return {
+      ok: false,
+      code: "PPV_CLAIMS_MOVED_TO_LEDGER",
+      error: "PPV attribution conflicts must be resolved through /api/team/analytics/ppv/conflicts",
+    };
+  }
+
   if (isLocked(row)) {
     return { ok: false, code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
   }
@@ -267,15 +343,14 @@ async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action
   let nextState = row.state;
 
   if (cleanAction === "claim") {
-    // The actor wants to take this money. They must be eligible:
-    // an "outgoing message to fanId in 2h before occurredAt" exists
-    // and was theirs. The backend trusts the Electron-supplied
-    // autoAttribution as eligibility hint: if the actor is the
-    // autoAttributedToMemberId OR was a candidate (any chatter who
-    // messaged within window), they can claim.
-    //
-    // For now we accept ANY claim — agency policy can layer eligibility
-    // via the manager_override path. Audit log preserves who did what.
+    const eligible = await canActorClaimAttribution({ agencyId, row, actor });
+    if (!eligible) {
+      return {
+        ok: false,
+        code: "CLAIM_NOT_ELIGIBLE",
+        error: "You can claim only tips/subscriptions from dialogs you worked in the attribution window",
+      };
+    }
     nextOwnerMemberId = actor.id;
     nextOwnerUserId = actor.userId;
     nextState = "claimed";
@@ -338,14 +413,26 @@ async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action
 // full visibility).
 // --------------------------------------------------------------------
 
-async function listDisputable({ agencyId, range = "24h", limit = 200 }) {
+async function listDisputable({ agencyId, range = "24h", limit = 200, actorMemberId = null, senior = false }) {
   const cutoff = new Date(Date.now() - GRACE_PERIOD_MS);
+  const where = {
+    agencyId,
+    eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
+    occurredAt: { gte: cutoff },
+    locked: false,
+  };
+
+  if (!senior) {
+    const ownId = cleanString(actorMemberId, 160);
+    if (!ownId) return [];
+    where.OR = [
+      { attributedToMemberId: ownId },
+      { autoAttributedToMemberId: ownId },
+    ];
+  }
+
   const rows = await prisma.moneyAttribution.findMany({
-    where: {
-      agencyId,
-      occurredAt: { gte: cutoff },
-      locked: false,
-    },
+    where,
     orderBy: { occurredAt: "desc" },
     take: Math.min(500, Math.max(1, Number(limit) || 200)),
   });
@@ -377,10 +464,13 @@ module.exports = {
   ATTRIBUTION_WINDOW_MS,
   GRACE_PERIOD_MS,
   MONEY_EVENT_TYPES,
+  LEGACY_CLAIMABLE_EVENT_TYPES,
   ingestMoneyEvent,
   applyOverride,
   listDisputable,
   sweepLocks,
   hashEvent,
   isLocked,
+  isLegacyClaimableEventType,
+  canActorClaimAttribution,
 };

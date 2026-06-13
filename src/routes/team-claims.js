@@ -8,10 +8,47 @@ const {
   listDisputable,
   sweepLocks,
   hashEvent,
+  LEGACY_CLAIMABLE_EVENT_TYPES,
 } = require("../services/money-attribution-service");
 const prisma = require("../prisma");
+const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 
 const router = express.Router();
+
+
+async function loadActorMember(req) {
+  if (!req.auth?.agencyId || !req.auth?.userId) return null;
+  return prisma.agencyMember.findFirst({
+    where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null },
+    select: { id: true, userId: true, roleKey: true, role: true },
+  });
+}
+
+async function requireSeniorClaimsManager(req, res) {
+  const member = await loadActorMember(req);
+  if (!member) {
+    res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
+    return null;
+  }
+  if (!isSeniorAgencyMember(member)) {
+    res.status(403).json({
+      ok: false,
+      code: "CLAIMS_MANAGER_REQUIRED",
+      error: "Only owner / manager / admin can view or resolve agency-wide claims",
+    });
+    return null;
+  }
+  return member;
+}
+
+function isLegacyClaimableRow(row) {
+  return row && LEGACY_CLAIMABLE_EVENT_TYPES.has(String(row.eventType || ""));
+}
+
+function isOwnClaimRow(row, memberId) {
+  if (!row || !memberId) return false;
+  return row.attributedToMemberId === memberId || row.autoAttributedToMemberId === memberId;
+}
 
 // --------------------------------------------------------------------
 // POST /api/team/claims/ingest
@@ -79,9 +116,9 @@ router.post("/ingest", async (req, res) => {
 // --------------------------------------------------------------------
 // POST /api/team/claims/override
 // --------------------------------------------------------------------
-// Manual claim/release/manager_override. Any agency member can claim
-// or release; manager_override requires the actor to have one of the
-// privileged roles.
+// Manual claim/release/manager_override.
+// Chatters can claim/release only eligible legacy tip/subscription rows.
+// manager_override is owner/manager-only. PPV is handled by PPV ledger.
 
 const overrideSchema = z.object({
   eventHash: z.string().min(1).max(80),
@@ -94,21 +131,20 @@ router.post("/override", async (req, res) => {
   try {
     const input = overrideSchema.parse(req.body || {});
 
-    // manager_override requires an admin/manager. Roles considered
-    // privileged: owner, manager. Anything else gets 403.
-    if (input.action === "manager_override") {
-      const member = await prisma.agencyMember.findFirst({
-        where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null },
-        select: { roleKey: true, role: true },
+    const actor = await loadActorMember(req);
+    if (!actor) {
+      return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
+    }
+
+    // Chatter actions are intentionally narrow: claim/release only their own
+    // eligible tip/subscription rows. Agency-wide dispute resolution stays
+    // owner/manager-only through manager_override and PPV Claims.
+    if (input.action === "manager_override" && !isSeniorAgencyMember(actor)) {
+      return res.status(403).json({
+        ok: false,
+        code: "MANAGER_OVERRIDE_FORBIDDEN",
+        error: "Only owner / manager / admin can apply manager_override",
       });
-      const roleKey = String(member?.roleKey || member?.role || "").toLowerCase();
-      if (!["owner", "manager", "admin"].includes(roleKey)) {
-        return res.status(403).json({
-          ok: false,
-          code: "MANAGER_OVERRIDE_FORBIDDEN",
-          error: "Only owner / manager / admin can apply manager_override",
-        });
-      }
     }
 
     const result = await applyOverride({
@@ -123,7 +159,7 @@ router.post("/override", async (req, res) => {
 
     if (!result.ok) {
       const status = result.code === "ATTRIBUTION_LOCKED" ? 409
-                   : result.code === "NOT_OWNER" ? 403
+                   : result.code === "NOT_OWNER" || result.code === "CLAIM_NOT_ELIGIBLE" || result.code === "PPV_CLAIMS_MOVED_TO_LEDGER" ? 403
                    : result.code === "ATTRIBUTION_NOT_FOUND" ? 404
                    : 400;
       return res.status(status).json(result);
@@ -152,14 +188,22 @@ router.post("/override", async (req, res) => {
 // GET /api/team/claims/disputable
 // --------------------------------------------------------------------
 // Money events from the last 48h that are still inside the dispute
-// window. Visible to ANY agency member.
+// window. Owner/manager sees all legacy tip/sub claims; chatters see only
+// their own eligible rows. PPV conflicts are not exposed here.
 
 router.get("/disputable", async (req, res) => {
   try {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit || 200)));
+    const actor = await loadActorMember(req);
+    if (!actor) {
+      return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
+    }
+    const senior = isSeniorAgencyMember(actor);
     const rows = await listDisputable({
       agencyId: req.auth.agencyId,
       limit,
+      actorMemberId: actor.id,
+      senior,
     });
     return res.json({
       ok: true,
@@ -187,23 +231,36 @@ router.get("/audit", async (req, res) => {
     const memberId = req.query.memberId ? String(req.query.memberId) : null;
     const days = Math.min(90, Math.max(1, Number(req.query.days || 7)));
     const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const actor = await loadActorMember(req);
+    if (!actor) {
+      return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
+    }
+    const senior = isSeniorAgencyMember(actor);
 
     if (eventHash) {
       const row = await prisma.moneyAttribution.findUnique({
         where: { agencyId_eventHash: { agencyId: req.auth.agencyId, eventHash } },
       });
-      if (!row) return res.json({ ok: true, attribution: null });
+      if (!row || !isLegacyClaimableRow(row)) return res.json({ ok: true, attribution: null });
+      if (!senior && !isOwnClaimRow(row, actor.id)) {
+        return res.status(403).json({ ok: false, code: "CLAIMS_AUDIT_FORBIDDEN" });
+      }
       return res.json({ ok: true, attribution: row });
     }
 
     if (memberId) {
+      const requestedMemberId = String(memberId || "");
+      if (!senior && requestedMemberId !== actor.id) {
+        return res.status(403).json({ ok: false, code: "CLAIMS_AUDIT_FORBIDDEN" });
+      }
       const rows = await prisma.moneyAttribution.findMany({
         where: {
           agencyId: req.auth.agencyId,
+          eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
           occurredAt: { gte: from },
           OR: [
-            { attributedToMemberId: memberId },
-            { autoAttributedToMemberId: memberId },
+            { attributedToMemberId: requestedMemberId },
+            { autoAttributedToMemberId: requestedMemberId },
           ],
         },
         orderBy: { occurredAt: "desc" },
@@ -212,11 +269,19 @@ router.get("/audit", async (req, res) => {
       return res.json({ ok: true, count: rows.length, attributions: rows });
     }
 
+    const where = {
+      agencyId: req.auth.agencyId,
+      eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
+      occurredAt: { gte: from },
+    };
+    if (!senior) {
+      where.OR = [
+        { attributedToMemberId: actor.id },
+        { autoAttributedToMemberId: actor.id },
+      ];
+    }
     const rows = await prisma.moneyAttribution.findMany({
-      where: {
-        agencyId: req.auth.agencyId,
-        occurredAt: { gte: from },
-      },
+      where,
       orderBy: { occurredAt: "desc" },
       take: 500,
     });
@@ -239,14 +304,8 @@ router.get("/audit", async (req, res) => {
 
 router.post("/sweep", async (req, res) => {
   try {
-    const member = await prisma.agencyMember.findFirst({
-      where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null },
-      select: { roleKey: true, role: true },
-    });
-    const roleKey = String(member?.roleKey || member?.role || "").toLowerCase();
-    if (!["owner", "manager", "admin"].includes(roleKey)) {
-      return res.status(403).json({ ok: false, code: "SWEEP_FORBIDDEN" });
-    }
+    const member = await requireSeniorClaimsManager(req, res);
+    if (!member) return;
     const result = await sweepLocks();
     return res.json({ ok: true, ...result });
   } catch (err) {

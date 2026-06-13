@@ -19,7 +19,14 @@
 
 const prisma = require("../prisma");
 
-const HIGH_PRIVILEGE_KEYS = new Set(["owner", "manager"]);
+const HIGH_PRIVILEGE_KEYS = new Set(["owner", "manager", "admin"]);
+
+
+function isSeniorAgencyMember(member) {
+  const role = String(member?.role || "").toUpperCase();
+  const roleKey = String(member?.roleKey || "").toLowerCase();
+  return role === "OWNER" || role === "MANAGER" || role === "ADMIN" || HIGH_PRIVILEGE_KEYS.has(roleKey);
+}
 
 async function loadMembership(userId, agencyId) {
   if (!userId || !agencyId) return null;
@@ -74,14 +81,11 @@ function teamWriteRequired() {
         return res.status(403).json({ ok: false, code: "NOT_A_MEMBER", error: "You are not a member of this agency" });
       }
 
-      const isOwnerLegacy = member.role === "OWNER";
-      const isHighPriv = HIGH_PRIVILEGE_KEYS.has(String(member.roleKey || "").toLowerCase());
-
-      if (!isOwnerLegacy && !isHighPriv) {
+      if (!isSeniorAgencyMember(member)) {
         return res.status(403).json({
           ok: false,
           code: "INSUFFICIENT_TEAM_ROLE",
-          error: "Only OWNER or manager can modify team",
+          error: "Only OWNER / manager / admin can modify team",
         });
       }
 
@@ -132,4 +136,6 @@ module.exports = {
   teamReadRequired,
   teamWriteRequired,
   rolesWriteRequired,
+  isSeniorAgencyMember,
+  HIGH_PRIVILEGE_KEYS,
 };

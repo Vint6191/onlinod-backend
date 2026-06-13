@@ -518,12 +518,30 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
   return { range, members, events, byMember };
 }
 
-async function getMoneyRevenueByMember({ agencyId, range }) {
+const LEGACY_NON_PPV_MONEY_TYPES = ["tip_received", "subscription_created"];
+const ATTRIBUTED_PPV_STATUSES = ["attributed", "resolved"];
+
+function addToMap(map, key, cents) {
+  const safeKey = String(key || "").trim();
+  if (!safeKey) return;
+  map.set(safeKey, (map.get(safeKey) || 0) + Math.max(0, num(cents, 0)));
+}
+
+function mergeRevenueMaps(...maps) {
+  const out = new Map();
+  for (const map of maps || []) {
+    for (const [key, value] of map?.entries?.() || []) addToMap(out, key, value);
+  }
+  return out;
+}
+
+async function getLegacyTipSubRevenueByMember({ agencyId, range }) {
   try {
     const rows = await prisma.moneyAttribution.groupBy({
       by: ["attributedToMemberId"],
       where: {
         agencyId,
+        eventType: { in: LEGACY_NON_PPV_MONEY_TYPES },
         attributedToMemberId: { not: null },
         ...whereForRange("occurredAt", range),
       },
@@ -531,7 +549,7 @@ async function getMoneyRevenueByMember({ agencyId, range }) {
     });
     const map = new Map();
     for (const row of rows || []) {
-      if (row.attributedToMemberId) map.set(String(row.attributedToMemberId), num(row?._sum?.amountCents, 0));
+      if (row.attributedToMemberId) addToMap(map, row.attributedToMemberId, row?._sum?.amountCents);
     }
     return map;
   } catch (_) {
@@ -539,12 +557,13 @@ async function getMoneyRevenueByMember({ agencyId, range }) {
   }
 }
 
-async function getMoneyRevenueByMemberDialog({ agencyId, range }) {
+async function getLegacyTipSubRevenueByMemberDialog({ agencyId, range }) {
   try {
     const rows = await prisma.moneyAttribution.groupBy({
       by: ["attributedToMemberId", "fanId"],
       where: {
         agencyId,
+        eventType: { in: LEGACY_NON_PPV_MONEY_TYPES },
         attributedToMemberId: { not: null },
         fanId: { not: null },
         ...whereForRange("occurredAt", range),
@@ -554,7 +573,53 @@ async function getMoneyRevenueByMemberDialog({ agencyId, range }) {
     const map = new Map();
     for (const row of rows || []) {
       if (!row.attributedToMemberId || !row.fanId) continue;
-      map.set(`${row.attributedToMemberId}|${row.fanId}`, num(row?._sum?.amountCents, 0));
+      addToMap(map, `${row.attributedToMemberId}|${row.fanId}`, row?._sum?.amountCents);
+    }
+    return map;
+  } catch (_) {
+    return new Map();
+  }
+}
+
+async function getPpvLedgerRevenueByMember({ agencyId, range }) {
+  try {
+    const rows = await prisma.teamPpvPurchaseLedger.groupBy({
+      by: ["attributedMemberId"],
+      where: {
+        agencyId,
+        status: { in: ATTRIBUTED_PPV_STATUSES },
+        attributedMemberId: { not: null },
+        ...whereForRange("purchasedAt", range),
+      },
+      _sum: { amountCents: true },
+    });
+    const map = new Map();
+    for (const row of rows || []) {
+      if (row.attributedMemberId) addToMap(map, row.attributedMemberId, row?._sum?.amountCents);
+    }
+    return map;
+  } catch (_) {
+    return new Map();
+  }
+}
+
+async function getPpvLedgerRevenueByMemberDialog({ agencyId, range }) {
+  try {
+    const rows = await prisma.teamPpvPurchaseLedger.findMany({
+      where: {
+        agencyId,
+        status: { in: ATTRIBUTED_PPV_STATUSES },
+        attributedMemberId: { not: null },
+        ...whereForRange("purchasedAt", range),
+      },
+      select: { attributedMemberId: true, fanId: true, buyerFanId: true, dialogId: true, amountCents: true },
+      take: 50000,
+    });
+    const map = new Map();
+    for (const row of rows || []) {
+      const fanKey = row.fanId || row.buyerFanId || row.dialogId;
+      if (!row.attributedMemberId || !fanKey) continue;
+      addToMap(map, `${row.attributedMemberId}|${fanKey}`, row.amountCents);
     }
     return map;
   } catch (_) {
@@ -564,10 +629,14 @@ async function getMoneyRevenueByMemberDialog({ agencyId, range }) {
 
 async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
   const computed = await buildComputed({ agencyId, rangeKey });
-  const [revenueByMember, revenueByMemberDialog] = await Promise.all([
-    getMoneyRevenueByMember({ agencyId, range: computed.range }),
-    getMoneyRevenueByMemberDialog({ agencyId, range: computed.range }),
+  const [ppvRevenueByMember, legacyTipSubRevenueByMember, ppvRevenueByMemberDialog, legacyTipSubRevenueByMemberDialog] = await Promise.all([
+    getPpvLedgerRevenueByMember({ agencyId, range: computed.range }),
+    getLegacyTipSubRevenueByMember({ agencyId, range: computed.range }),
+    getPpvLedgerRevenueByMemberDialog({ agencyId, range: computed.range }),
+    getLegacyTipSubRevenueByMemberDialog({ agencyId, range: computed.range }),
   ]);
+  const revenueByMember = mergeRevenueMaps(ppvRevenueByMember, legacyTipSubRevenueByMember);
+  const revenueByMemberDialog = mergeRevenueMaps(ppvRevenueByMemberDialog, legacyTipSubRevenueByMemberDialog);
 
   const rows = computed.members.map((member) => {
     const shell = memberShell(member);
@@ -576,7 +645,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     if (revenue > 0) {
       metrics.revenueAttributedCents = revenue;
       metrics.dollarsPerMessageCents = metrics.totalMessages > 0 ? Math.round(revenue / metrics.totalMessages) : 0;
-      metrics.moneySource = "money_attribution";
+      metrics.moneySource = "ppv_ledger_plus_legacy_tip_sub_claims";
     }
     if (Array.isArray(metrics.topDialogSessions)) {
       metrics.topDialogSessions = metrics.topDialogSessions.map((item) => {

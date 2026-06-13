@@ -1,6 +1,8 @@
 "use strict";
 
 const express = require("express");
+const prisma = require("../prisma");
+const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 const {
   buildTeamOverview,
   buildTeamMembers,
@@ -34,6 +36,33 @@ function requireAgency(req, res) {
 }
 
 
+async function requirePpvClaimsManager(req, res) {
+  const id = requireAgency(req, res);
+  if (!id) return null;
+
+  const member = await prisma.agencyMember.findFirst({
+    where: { agencyId: id, userId: req.auth?.userId, deletedAt: null },
+    select: { id: true, role: true, roleKey: true },
+  });
+
+  if (!member) {
+    res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
+    return null;
+  }
+
+  if (!isSeniorAgencyMember(member)) {
+    res.status(403).json({
+      ok: false,
+      code: "PPV_CLAIMS_MANAGER_REQUIRED",
+      error: "Only owner / manager / admin can view or resolve PPV attribution conflicts",
+    });
+    return null;
+  }
+
+  req.agencyMember = member;
+  return id;
+}
+
 router.get("/ppv/resolve-jobs", async (req, res) => {
   try {
     const id = requireAgency(req, res); if (!id) return;
@@ -60,7 +89,7 @@ router.post("/ppv/resolve-results", async (req, res) => {
 
 router.get("/ppv/conflicts", async (req, res) => {
   try {
-    const id = requireAgency(req, res); if (!id) return;
+    const id = await requirePpvClaimsManager(req, res); if (!id) return;
     const includeClosed = String(req.query.includeClosed || req.query.include_closed || "") === "1" || String(req.query.includeClosed || "").toLowerCase() === "true";
     const conflicts = await listPpvConflicts({ agencyId: id, limit: req.query.limit || 100, includeClosed });
     return res.json({ ok: true, conflicts });
@@ -71,7 +100,7 @@ router.get("/ppv/conflicts", async (req, res) => {
 
 router.post("/ppv/conflicts/:jobId/resolve", async (req, res) => {
   try {
-    const id = requireAgency(req, res); if (!id) return;
+    const id = await requirePpvClaimsManager(req, res); if (!id) return;
     const result = await resolvePpvConflict({
       agencyId: id,
       jobId: req.params.jobId,
