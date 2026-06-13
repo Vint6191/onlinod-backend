@@ -569,18 +569,22 @@ async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, job, action,
   return created;
 }
 
-async function submitResolveResults({ agencyId, deviceId, results = [] }) {
+async function submitResolveResults({ agencyId, deviceId, results = [], actorMemberId = null, actorUserId = null, senior = false }) {
   const input = Array.isArray(results) ? results : [];
+  const safeActorMemberId = clean(actorMemberId, 160);
+  const safeActorUserId = clean(actorUserId, 160);
+  const isSenior = Boolean(senior);
   let resolved = 0;
   let conflicts = 0;
   let skipped = 0;
+  let forbidden = 0;
 
   for (const item of input) {
     const jobId = clean(item.jobId || item.id, 160);
     const messageId = clean(item.messageId, 160);
     const purchaseId = clean(item.purchaseId, 220);
-    const memberId = clean(item.memberId || item.attributedMemberId, 160);
-    if (!messageId || !memberId || (!jobId && !purchaseId)) { skipped += 1; continue; }
+    const submittedMemberId = clean(item.memberId || item.attributedMemberId, 160);
+    if (!messageId || !submittedMemberId || (!jobId && !purchaseId)) { skipped += 1; continue; }
 
     const outcome = await prisma.$transaction(async (tx) => {
       const job = await tx.teamPpvResolveJob.findFirst({
@@ -592,11 +596,40 @@ async function submitResolveResults({ agencyId, deviceId, results = [] }) {
         return "skipped";
       }
 
+      // Non-senior workers may only submit PPV resolution for themselves,
+      // and only when the backend has proof that this member originally sent
+      // the purchased PPV message. This closes the forged worker-result window
+      // before a later conflict detector has to clean it up manually.
+      let proof = null;
+      let memberId = submittedMemberId;
+      if (!isSenior) {
+        if (!safeActorMemberId || submittedMemberId !== safeActorMemberId || messageId !== job.messageId) {
+          return "forbidden";
+        }
+        proof = await tx.teamSentMessageLedger.findFirst({
+          where: {
+            agencyId,
+            memberId: safeActorMemberId,
+            messageId: job.messageId,
+            ...(job.accountId ? { accountId: job.accountId } : {}),
+          },
+          select: { id: true, userId: true, deviceId: true, shiftKey: true, sentAt: true },
+        }).catch(() => null);
+        if (!proof) return "forbidden";
+        memberId = safeActorMemberId;
+      }
+
+      const resolvedDeviceId = clean(deviceId || item.deviceId || proof?.deviceId, 160);
+      const resolvedShiftKey = clean(item.shiftKey || proof?.shiftKey, 220);
+      const resolvedUserId = clean(proof?.userId || safeActorUserId, 160);
+      const resolvedSentAtMs = item.sentAtMs || item.sent_at_ms || (proof?.sentAt ? new Date(proof.sentAt).getTime() : null);
+
       const incomingCandidate = {
         memberId,
-        shiftKey: clean(item.shiftKey, 220),
-        deviceId: clean(deviceId || item.deviceId, 160),
-        sentAtMs: item.sentAtMs || item.sent_at_ms || null,
+        userId: resolvedUserId,
+        shiftKey: resolvedShiftKey,
+        deviceId: resolvedDeviceId,
+        sentAtMs: resolvedSentAtMs,
         source: clean(item.source || "local_worker_ledger", 80),
       };
 
@@ -643,17 +676,19 @@ async function submitResolveResults({ agencyId, deviceId, results = [] }) {
           purchasedAt: job.purchasedAt || new Date(),
           status: "attributed",
           attributedMemberId: memberId,
-          attributedShiftKey: clean(item.shiftKey, 220),
+          attributedUserId: resolvedUserId,
+          attributedShiftKey: resolvedShiftKey,
           resolvedAt: new Date(),
-          resolvedByDeviceId: clean(deviceId || item.deviceId, 160),
+          resolvedByDeviceId: resolvedDeviceId,
           resolvedSource: clean(item.source || "local_worker_ledger", 80),
         },
         update: {
           status: "attributed",
           attributedMemberId: memberId,
-          attributedShiftKey: clean(item.shiftKey, 220),
+          attributedUserId: resolvedUserId,
+          attributedShiftKey: resolvedShiftKey,
           resolvedAt: new Date(),
-          resolvedByDeviceId: clean(deviceId || item.deviceId, 160),
+          resolvedByDeviceId: resolvedDeviceId,
           resolvedSource: clean(item.source || "local_worker_ledger", 80),
         },
       });
@@ -665,8 +700,8 @@ async function submitResolveResults({ agencyId, deviceId, results = [] }) {
           attempts: { increment: 1 },
           resolvedAt: new Date(),
           resolvedByMemberId: memberId,
-          resolvedByDeviceId: clean(deviceId || item.deviceId, 160),
-          result: { ...incomingCandidate, autoResolved: true },
+          resolvedByDeviceId: resolvedDeviceId,
+          result: { ...incomingCandidate, autoResolved: true, verifiedBySentMessageLedger: Boolean(proof) },
         },
       });
 
@@ -678,9 +713,10 @@ async function submitResolveResults({ agencyId, deviceId, results = [] }) {
 
     if (outcome === "resolved") resolved += 1;
     else if (outcome === "conflict") conflicts += 1;
+    else if (outcome === "forbidden") forbidden += 1;
     else skipped += 1;
   }
-  return { received: input.length, resolved, conflicts, skipped };
+  return { received: input.length, resolved, conflicts, skipped, forbidden };
 }
 
 async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false }) {

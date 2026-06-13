@@ -35,6 +35,15 @@ function requireAgency(req, res) {
   return id;
 }
 
+async function loadAgencyMember(req, agencyIdValue) {
+  const id = agencyIdValue || agencyId(req);
+  if (!id || !req.auth?.userId) return null;
+  return prisma.agencyMember.findFirst({
+    where: { agencyId: id, userId: req.auth.userId, deletedAt: null },
+    select: { id: true, userId: true, role: true, roleKey: true },
+  });
+}
+
 
 async function requirePpvClaimsManager(req, res) {
   const id = requireAgency(req, res);
@@ -76,10 +85,18 @@ router.get("/ppv/resolve-jobs", async (req, res) => {
 router.post("/ppv/resolve-results", async (req, res) => {
   try {
     const id = requireAgency(req, res); if (!id) return;
+    const actor = await loadAgencyMember(req, id);
+    if (!actor) {
+      return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
+    }
+
     const result = await submitResolveResults({
       agencyId: id,
       deviceId: req.auth.deviceId || req.body?.deviceId || null,
       results: req.body?.results || [],
+      actorMemberId: actor.id,
+      actorUserId: actor.userId,
+      senior: isSeniorAgencyMember(actor),
     });
     return res.json({ ok: true, ...result });
   } catch (err) {

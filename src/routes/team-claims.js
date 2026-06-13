@@ -7,9 +7,18 @@ const {
   applyOverride,
   listDisputable,
   sweepLocks,
+  purgeExpiredLegacyAttributions,
   hashEvent,
   LEGACY_CLAIMABLE_EVENT_TYPES,
 } = require("../services/money-attribution-service");
+const {
+  applyTipOverride,
+  listTipClaims,
+  getTipClaimByHash,
+  listTipAudit,
+  migrateLegacyTipsToTipLedger,
+  purgeExpiredTipLedger,
+} = require("../services/team-tip-ledger-service");
 const prisma = require("../prisma");
 const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 
@@ -47,7 +56,19 @@ function isLegacyClaimableRow(row) {
 
 function isOwnClaimRow(row, memberId) {
   if (!row || !memberId) return false;
-  return row.attributedToMemberId === memberId || row.autoAttributedToMemberId === memberId;
+  if (row.attributedToMemberId === memberId || row.autoAttributedToMemberId === memberId) return true;
+  if (row.ledgerType === "tip") {
+    const candidates = []
+      .concat(Array.isArray(row.candidates) ? row.candidates : [])
+      .concat(Array.isArray(row.weakCandidates) ? row.weakCandidates : []);
+    return candidates.some((c) => String(c?.memberId || "") === String(memberId));
+  }
+  return false;
+}
+
+function hideMigratedLegacyRows(tipRows, legacyRows) {
+  const tipHashes = new Set((tipRows || []).map((row) => String(row?.eventHash || "")).filter(Boolean));
+  return (legacyRows || []).filter((row) => !tipHashes.has(String(row?.eventHash || "")));
 }
 
 // --------------------------------------------------------------------
@@ -69,6 +90,7 @@ const ingestSchema = z.object({
   currency: z.string().max(8).optional().nullable(),
   accountId: z.string().min(1).max(160),
   fanId: z.string().min(1).max(160),
+  dialogId: z.string().max(160).optional().nullable(),
   creatorRef: z.string().max(160).optional().nullable(),
 
   // Optional semantic identity from websocket-listener. These prevent
@@ -88,7 +110,25 @@ const ingestSchema = z.object({
 
 router.post("/ingest", async (req, res) => {
   try {
-    const payload = ingestSchema.parse(req.body || {});
+    const parsed = ingestSchema.parse(req.body || {});
+    const actor = await loadActorMember(req);
+    if (!actor) {
+      return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
+    }
+
+    // Do not trust chatter-submitted auto attribution. Senior users may
+    // import/repair events for another member, but a regular chatter can
+    // only submit himself as the auto-attributed actor. Tip auto-attribution
+    // is still recomputed from TeamSentMessageLedger on the backend; this
+    // clamp only prevents poisoned weak candidates / legacy fallback rows.
+    const payload = isSeniorAgencyMember(actor)
+      ? parsed
+      : {
+          ...parsed,
+          autoAttributedToMemberId: actor.id,
+          autoAttributedToUserId: actor.userId || null,
+        };
+
     const result = await ingestMoneyEvent({
       agencyId: req.auth.agencyId,
       userId: req.auth.userId,
@@ -117,8 +157,9 @@ router.post("/ingest", async (req, res) => {
 // POST /api/team/claims/override
 // --------------------------------------------------------------------
 // Manual claim/release/manager_override.
-// Chatters can claim/release only eligible legacy tip/subscription rows.
+// Chatters can claim/release only eligible tip rows tied to their work.
 // manager_override is owner/manager-only. PPV is handled by PPV ledger.
+// Subscriptions are not Team member revenue and are intentionally not claimable.
 
 const overrideSchema = z.object({
   eventHash: z.string().min(1).max(80),
@@ -137,7 +178,7 @@ router.post("/override", async (req, res) => {
     }
 
     // Chatter actions are intentionally narrow: claim/release only their own
-    // eligible tip/subscription rows. Agency-wide dispute resolution stays
+    // eligible tip rows. Agency-wide dispute resolution stays
     // owner/manager-only through manager_override and PPV Claims.
     if (input.action === "manager_override" && !isSeniorAgencyMember(actor)) {
       return res.status(403).json({
@@ -147,20 +188,35 @@ router.post("/override", async (req, res) => {
       });
     }
 
-    const result = await applyOverride({
+    let result = await applyTipOverride({
       agencyId: req.auth.agencyId,
       byUserId: req.auth.userId,
-      byMemberId: null, // actor is resolved from req.auth.userId; targetMemberId is only the new owner
+      byMemberId: actor.id,
       eventHash: input.eventHash,
       action: input.action,
       targetMemberId: input.targetMemberId,
       reason: input.reason,
+      senior: isSeniorAgencyMember(actor),
     });
+
+    // Cross-version fallback: old v15 tip rows may still live in
+    // MoneyAttribution until a one-time migration/backfill is run.
+    if (!result.ok && result.code === "TIP_NOT_FOUND") {
+      result = await applyOverride({
+        agencyId: req.auth.agencyId,
+        byUserId: req.auth.userId,
+        byMemberId: null, // actor is resolved from req.auth.userId; targetMemberId is only the new owner
+        eventHash: input.eventHash,
+        action: input.action,
+        targetMemberId: input.targetMemberId,
+        reason: input.reason,
+      });
+    }
 
     if (!result.ok) {
       const status = result.code === "ATTRIBUTION_LOCKED" ? 409
-                   : result.code === "NOT_OWNER" || result.code === "CLAIM_NOT_ELIGIBLE" || result.code === "PPV_CLAIMS_MOVED_TO_LEDGER" ? 403
-                   : result.code === "ATTRIBUTION_NOT_FOUND" ? 404
+                   : result.code === "NOT_OWNER" || result.code === "CLAIM_NOT_ELIGIBLE" || result.code === "TIP_CONFLICT_MANAGER_REQUIRED" || result.code === "PPV_CLAIMS_MOVED_TO_LEDGER" ? 403
+                   : result.code === "ATTRIBUTION_NOT_FOUND" || result.code === "TIP_NOT_FOUND" ? 404
                    : 400;
       return res.status(status).json(result);
     }
@@ -188,7 +244,7 @@ router.post("/override", async (req, res) => {
 // GET /api/team/claims/disputable
 // --------------------------------------------------------------------
 // Money events from the last 48h that are still inside the dispute
-// window. Owner/manager sees all legacy tip/sub claims; chatters see only
+// window. Owner/manager sees all tip claims; chatters see only
 // their own eligible rows. PPV conflicts are not exposed here.
 
 router.get("/disputable", async (req, res) => {
@@ -199,12 +255,23 @@ router.get("/disputable", async (req, res) => {
       return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     }
     const senior = isSeniorAgencyMember(actor);
-    const rows = await listDisputable({
-      agencyId: req.auth.agencyId,
-      limit,
-      actorMemberId: actor.id,
-      senior,
-    });
+    const [tipRows, legacyRows] = await Promise.all([
+      listTipClaims({
+        agencyId: req.auth.agencyId,
+        limit,
+        actorMemberId: actor.id,
+        senior,
+      }),
+      listDisputable({
+        agencyId: req.auth.agencyId,
+        limit,
+        actorMemberId: actor.id,
+        senior,
+      }),
+    ]);
+    const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)]
+      .sort((a, b) => new Date(b.occurredAt || b.receivedAt || 0).getTime() - new Date(a.occurredAt || a.receivedAt || 0).getTime())
+      .slice(0, limit);
     return res.json({
       ok: true,
       count: rows.length,
@@ -238,6 +305,14 @@ router.get("/audit", async (req, res) => {
     const senior = isSeniorAgencyMember(actor);
 
     if (eventHash) {
+      const tipRow = await getTipClaimByHash({ agencyId: req.auth.agencyId, eventHash });
+      if (tipRow) {
+        if (!senior && !isOwnClaimRow(tipRow, actor.id)) {
+          return res.status(403).json({ ok: false, code: "CLAIMS_AUDIT_FORBIDDEN" });
+        }
+        return res.json({ ok: true, attribution: tipRow });
+      }
+
       const row = await prisma.moneyAttribution.findUnique({
         where: { agencyId_eventHash: { agencyId: req.auth.agencyId, eventHash } },
       });
@@ -253,19 +328,30 @@ router.get("/audit", async (req, res) => {
       if (!senior && requestedMemberId !== actor.id) {
         return res.status(403).json({ ok: false, code: "CLAIMS_AUDIT_FORBIDDEN" });
       }
-      const rows = await prisma.moneyAttribution.findMany({
-        where: {
+      const [tipRows, legacyRows] = await Promise.all([
+        listTipAudit({
           agencyId: req.auth.agencyId,
-          eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
-          occurredAt: { gte: from },
-          OR: [
-            { attributedToMemberId: requestedMemberId },
-            { autoAttributedToMemberId: requestedMemberId },
-          ],
-        },
-        orderBy: { occurredAt: "desc" },
-        take: 500,
-      });
+          memberId: requestedMemberId,
+          from,
+          limit: 500,
+          senior,
+          actorMemberId: actor.id,
+        }),
+        prisma.moneyAttribution.findMany({
+          where: {
+            agencyId: req.auth.agencyId,
+            eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
+            occurredAt: { gte: from },
+            OR: [
+              { attributedToMemberId: requestedMemberId },
+              { autoAttributedToMemberId: requestedMemberId },
+            ],
+          },
+          orderBy: { occurredAt: "desc" },
+          take: 500,
+        }),
+      ]);
+      const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)].sort((a, b) => new Date(b.occurredAt || b.receivedAt || 0).getTime() - new Date(a.occurredAt || a.receivedAt || 0).getTime());
       return res.json({ ok: true, count: rows.length, attributions: rows });
     }
 
@@ -280,11 +366,21 @@ router.get("/audit", async (req, res) => {
         { autoAttributedToMemberId: actor.id },
       ];
     }
-    const rows = await prisma.moneyAttribution.findMany({
-      where,
-      orderBy: { occurredAt: "desc" },
-      take: 500,
-    });
+    const [tipRows, legacyRows] = await Promise.all([
+      listTipAudit({
+        agencyId: req.auth.agencyId,
+        from,
+        limit: 500,
+        senior,
+        actorMemberId: actor.id,
+      }),
+      prisma.moneyAttribution.findMany({
+        where,
+        orderBy: { occurredAt: "desc" },
+        take: 500,
+      }),
+    ]);
+    const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)].sort((a, b) => new Date(b.occurredAt || b.receivedAt || 0).getTime() - new Date(a.occurredAt || a.receivedAt || 0).getTime()).slice(0, 500);
     return res.json({ ok: true, count: rows.length, attributions: rows });
   } catch (err) {
     console.error("[claims/audit] failed:", err);
@@ -299,15 +395,55 @@ router.get("/audit", async (req, res) => {
 // --------------------------------------------------------------------
 // POST /api/team/claims/sweep (admin/cron)
 // --------------------------------------------------------------------
-// Lock attributions past the grace period. Safe to call repeatedly.
-// Suitable for a periodic job (every hour).
+// Claims maintenance. Safe to call repeatedly.
+// - migrate fresh legacy tip rows from MoneyAttribution to TeamTipLedger
+// - lock remaining legacy rows after the 48h grace period
+// - purge ledgers older than the 180-day retention window
 
 router.post("/sweep", async (req, res) => {
   try {
     const member = await requireSeniorClaimsManager(req, res);
     if (!member) return;
-    const result = await sweepLocks();
-    return res.json({ ok: true, ...result });
+    const retentionDays = Math.min(730, Math.max(1, Number(req.query.retentionDays || req.body?.retentionDays || 180)));
+    const limit = Math.min(20000, Math.max(1, Number(req.query.limit || req.body?.limit || 5000)));
+    const dryRun = String(req.query.dryRun || req.body?.dryRun || "").toLowerCase() === "true";
+
+    // Run legacy tip migration before legacy lock sweep. The migration reads
+    // and deletes MoneyAttribution tip rows; doing it in parallel with locks
+    // creates noisy write/delete races on the same rows.
+    const legacyTipMigration = await migrateLegacyTipsToTipLedger({
+      agencyId: req.auth.agencyId,
+      limit,
+      retentionDays,
+      dryRun,
+      deleteLegacy: true,
+    });
+    const legacyLocks = await sweepLocks({ agencyId: req.auth.agencyId });
+
+    const [tipLedgerPurge, legacyAttributionPurge] = await Promise.all([
+      purgeExpiredTipLedger({
+        agencyId: req.auth.agencyId,
+        retentionDays,
+        limit,
+        dryRun,
+      }),
+      purgeExpiredLegacyAttributions({
+        agencyId: req.auth.agencyId,
+        retentionDays,
+        limit,
+        dryRun,
+      }),
+    ]);
+
+    return res.json({
+      ok: Boolean(legacyTipMigration?.ok && tipLedgerPurge?.ok && legacyAttributionPurge?.ok),
+      retentionDays,
+      dryRun,
+      legacyTipMigration,
+      legacyLocks,
+      tipLedgerPurge,
+      legacyAttributionPurge,
+    });
   } catch (err) {
     return res.status(500).json({
       ok: false,
