@@ -248,7 +248,20 @@ router.post("/claim", async (req, res) => {
         continue;
       }
 
-      const claimed = await prisma.jobInstance.findUnique({ where: { id: candidate.id } });
+      const claimed = await prisma.jobInstance.findUnique({
+        where: { id: candidate.id },
+        include: {
+          creator: {
+            select: {
+              id: true,
+              remoteId: true,
+              username: true,
+              displayName: true,
+              partition: true,
+            },
+          },
+        },
+      });
 
       return res.json({
         ok: true,
@@ -259,6 +272,7 @@ router.post("/claim", async (req, res) => {
           creatorId: claimed.creatorId,
           agencyId: claimed.agencyId,
           params: claimed.params || {},
+          creator: claimed.creator || null,
           attempt: claimed.attempts + 1,
           leaseUntil: claimed.leaseUntil,
         },
@@ -355,6 +369,7 @@ router.post("/:id/report", async (req, res) => {
           status: "FAILED",
           attempts: newAttempts,
           lastError: input.error || "unknown error",
+          result: input.result || null,
           completedAt: new Date(),
           leaseUntil: null,
         },
@@ -368,6 +383,7 @@ router.post("/:id/report", async (req, res) => {
         status: "SCHEDULED",
         attempts: newAttempts,
         lastError: input.error || "unknown error",
+        result: input.result || null,
         nextRunAt: new Date(Date.now() + backoffMs),
         claimedAt: null,
         claimedByDeviceId: null,

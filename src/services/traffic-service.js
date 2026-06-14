@@ -839,7 +839,19 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false } = {})
     jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
     creatorId: creator.id,
     agencyId: creator.agencyId,
-    params: { hydrateFanValues: true, forceHydrate: force === true, hydrateLimit: force === true ? 5000 : 1000, valueTtlHours: 6, reason: "manual_traffic_refresh" },
+    params: {
+      hydrateFanValues: true,
+      forceHydrate: force === true,
+      hydrateLimit: force === true ? 5000 : 1000,
+      valueTtlHours: 6,
+      reason: "manual_traffic_refresh",
+      // Electron account manifests are local ids, while job.creatorId is the
+      // backend CreatorAccount.id. Keep remote hints in params so the worker
+      // can resolve the correct local OF partition without guessing.
+      creatorRemoteId: creator.remoteId || null,
+      creatorUsername: creator.username || null,
+      creatorDisplayName: creator.displayName || null,
+    },
     priority: 100,
     now: new Date(),
     freshnessWindowMs: force ? 0 : Math.min(60_000, TRAFFIC_REFRESH_WINDOW_MS),
