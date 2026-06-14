@@ -40,6 +40,28 @@ function dbNumber(value) {
   return Number.isFinite(n) ? n : 0;
 }
 
+function chunkArray(list = [], size = 500) {
+  const cleanSize = Math.max(1, Number(size) || 500);
+  const out = [];
+  for (let i = 0; i < list.length; i += cleanSize) out.push(list.slice(i, i + cleanSize));
+  return out;
+}
+
+function uniqueBy(list = [], keyFn = (x) => x) {
+  const map = new Map();
+  for (const item of Array.isArray(list) ? list : []) {
+    const key = keyFn(item);
+    if (!key) continue;
+    map.set(key, item);
+  }
+  return Array.from(map.values());
+}
+
+function isoOrNull(value) {
+  const d = asDate(value);
+  return d ? d.toISOString() : null;
+}
+
 function valueStatsSeed() {
   return {
     valueSnapshotMembers: 0,
@@ -110,6 +132,67 @@ function utcDay(value) {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
+
+async function recomputeTrafficDailyAggregate(tx, { agencyId, creatorId, sourceId, day }) {
+  if (!sourceId || !day) return null;
+  const dayStart = utcDay(day);
+  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+  const [subscriptionAgg, source] = await Promise.all([
+    tx.creatorSubscriptionLedger.aggregate({
+      where: {
+        agencyId,
+        creatorId,
+        sourceId,
+        occurredAt: { gte: dayStart, lt: dayEnd },
+      },
+      _count: { _all: true },
+      _sum: { amountCents: true },
+    }),
+    tx.trafficSource.findUnique({ where: { id: sourceId }, select: { costCents: true } }),
+  ]);
+
+  const paidSubs = Number(subscriptionAgg?._count?._all || 0);
+  const grossCents = Number(subscriptionAgg?._sum?.amountCents || 0);
+  const costCents = Number(source?.costCents || 0);
+
+  return tx.trafficDailyAggregate.upsert({
+    where: { sourceId_day: { sourceId, day: dayStart } },
+    create: {
+      agencyId,
+      creatorId,
+      sourceId,
+      day: dayStart,
+      paidSubs,
+      grossCents,
+      netCents: grossCents,
+      costCents,
+    },
+    update: {
+      paidSubs,
+      grossCents,
+      netCents: grossCents,
+      costCents,
+    },
+  });
+}
+
+async function applySubscriptionSideEffects(tx, { agencyId, creatorId, fanId, sourceId, occurredAt }) {
+  if (sourceId && fanId) {
+    await tx.trafficSourceMember.updateMany({
+      where: { agencyId, creatorId, sourceId, fanId },
+      data: {
+        lastRevenueAt: occurredAt,
+        convertedAt: occurredAt,
+        needsValueRefresh: true,
+      },
+    });
+  }
+
+  if (sourceId) {
+    await recomputeTrafficDailyAggregate(tx, { agencyId, creatorId, sourceId, day: occurredAt });
+  }
+}
+
 function rangeWindow(rangeKey = "all", now = new Date()) {
   const key = String(rangeKey || "all").toLowerCase();
   const end = new Date(now);
@@ -156,9 +239,13 @@ function compactJson(value, max = 12000) {
   if (!value || typeof value !== "object") return null;
   try {
     const s = JSON.stringify(value);
-    if (s.length > max) return { truncated: true };
+    if (s.length > max) {
+      console.warn(`[traffic] metadata dropped/truncated, size=${s.length}, max=${max}`);
+      return { truncated: true, originalSize: s.length };
+    }
     return value;
-  } catch (_) {
+  } catch (err) {
+    console.warn(`[traffic] metadata json failed: ${err?.message || err}`);
     return null;
   }
 }
@@ -217,6 +304,7 @@ function normalizeSnapshot(input = {}) {
   };
 }
 
+// Write/ingest path: device-bound, because Electron workers mutate traffic data from a local OF session.
 async function validateDeviceForCreator({ deviceId, userId, creatorId }) {
   const [device, creator] = await Promise.all([
     prisma.workerDevice.findUnique({ where: { id: deviceId } }),
@@ -285,6 +373,7 @@ async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, tt
   return out;
 }
 
+
 async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId, sources = [], members = [], hydrateLimit = 1000, forceHydrate = false }) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
   const agencyId = creator.agencyId;
@@ -340,55 +429,98 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
     sourceMap.set(`${row.sourceType}:${row.externalId}`, row);
   }
 
-  let memberUpserts = 0;
-  const memberFanIds = [];
+  const normalizedMembers = [];
+  const missingSourceKeys = new Map();
   for (const input of Array.isArray(members) ? members : []) {
     const member = normalizeMember(input);
     if (!member) continue;
-    let source = sourceMap.get(`${member.sourceType}:${member.sourceExternalId}`);
-    if (!source) {
-      source = await prisma.trafficSource.findUnique({
-        where: {
-          agencyId_creatorId_sourceType_externalId: {
-            agencyId,
-            creatorId: creator.id,
-            sourceType: member.sourceType,
-            externalId: member.sourceExternalId,
-          },
-        },
-      });
+    const key = `${member.sourceType}:${member.sourceExternalId}`;
+    normalizedMembers.push({ member, key });
+    if (!sourceMap.has(key)) {
+      missingSourceKeys.set(key, { sourceType: member.sourceType, externalId: member.sourceExternalId });
     }
-    if (!source) continue;
+  }
 
-    await prisma.trafficSourceMember.upsert({
+  const missingKeys = Array.from(missingSourceKeys.values());
+  for (const chunk of chunkArray(missingKeys, 200)) {
+    if (!chunk.length) continue;
+    const existingSources = await prisma.trafficSource.findMany({
       where: {
-        agencyId_creatorId_sourceId_fanId: {
-          agencyId,
-          creatorId: creator.id,
-          sourceId: source.id,
-          fanId: member.fanId,
-        },
-      },
-      create: {
         agencyId,
         creatorId: creator.id,
-        sourceId: source.id,
-        fanId: member.fanId,
-        firstSeenAt: member.claimedAt || now,
-        lastSeenAt: now,
-        claimedAt: member.claimedAt || null,
-        needsValueRefresh: true,
-        metadata: member.metadata,
-      },
-      update: {
-        lastSeenAt: now,
-        claimedAt: member.claimedAt || undefined,
-        metadata: member.metadata || undefined,
-        needsValueRefresh: forceHydrate ? true : undefined,
+        OR: chunk.map((item) => ({ sourceType: item.sourceType, externalId: item.externalId })),
       },
     });
-    memberUpserts += 1;
-    memberFanIds.push(member.fanId);
+    for (const row of existingSources) {
+      sourceMap.set(`${row.sourceType}:${row.externalId}`, row);
+    }
+  }
+
+  const memberRowsByKey = new Map();
+  for (const { member, key } of normalizedMembers) {
+    const source = sourceMap.get(key);
+    if (!source?.id) continue;
+    const dedupeKey = `${source.id}:${member.fanId}`;
+    const prev = memberRowsByKey.get(dedupeKey);
+    memberRowsByKey.set(dedupeKey, {
+      sourceId: source.id,
+      fanId: member.fanId,
+      claimedAt: member.claimedAt || prev?.claimedAt || null,
+      metadata: member.metadata || prev?.metadata || null,
+    });
+  }
+
+  const memberRows = Array.from(memberRowsByKey.values());
+  let memberUpserts = 0;
+  const memberFanIds = Array.from(new Set(memberRows.map((row) => row.fanId)));
+
+  if (memberRows.length) {
+    for (const chunk of chunkArray(memberRows, 1000)) {
+      const createData = chunk.map((row) => ({
+        agencyId,
+        creatorId: creator.id,
+        sourceId: row.sourceId,
+        fanId: row.fanId,
+        firstSeenAt: row.claimedAt || now,
+        lastSeenAt: now,
+        claimedAt: row.claimedAt || null,
+        needsValueRefresh: true,
+        metadata: row.metadata,
+        updatedAt: now,
+      }));
+
+      await prisma.trafficSourceMember.createMany({ data: createData, skipDuplicates: true });
+
+      const updatePayload = chunk.map((row) => ({
+        sourceId: row.sourceId,
+        fanId: row.fanId,
+        claimedAt: isoOrNull(row.claimedAt),
+        metadata: row.metadata || null,
+      }));
+
+      await prisma.$executeRaw`
+        UPDATE "TrafficSourceMember" AS m
+        SET
+          "lastSeenAt" = ${now},
+          "claimedAt" = COALESCE(x."claimedAt", m."claimedAt"),
+          "metadata" = CASE
+            WHEN x."metadata" IS NULL THEN m."metadata"
+            ELSE COALESCE(m."metadata", '{}'::jsonb) || x."metadata"
+          END,
+          "needsValueRefresh" = CASE
+            WHEN ${forceHydrate === true} THEN TRUE
+            ELSE m."needsValueRefresh"
+          END
+        FROM jsonb_to_recordset(${JSON.stringify(updatePayload)}::jsonb)
+          AS x("sourceId" text, "fanId" text, "claimedAt" timestamptz, "metadata" jsonb)
+        WHERE m."agencyId" = ${agencyId}
+          AND m."creatorId" = ${creator.id}
+          AND m."sourceId" = x."sourceId"
+          AND m."fanId" = x."fanId"
+      `;
+
+      memberUpserts += chunk.length;
+    }
   }
 
   const hydrateFanIds = await selectFanIdsNeedingValueRefresh({
@@ -409,73 +541,125 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
   };
 }
 
+
 async function upsertTrafficFanValueSnapshots({ deviceId, userId, creatorId, snapshots = [] }) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
   const agencyId = creator.agencyId;
-  const rows = (Array.isArray(snapshots) ? snapshots : []).map(normalizeSnapshot).filter(Boolean);
+  const now = new Date();
+  const rows = uniqueBy(
+    (Array.isArray(snapshots) ? snapshots : []).map(normalizeSnapshot).filter(Boolean).sort((a, b) => {
+      return (Number(asDate(a.fetchedAt)?.getTime() || 0) - Number(asDate(b.fetchedAt)?.getTime() || 0));
+    }),
+    (row) => row.fanId
+  );
+
+  if (!rows.length) {
+    return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted: 0 };
+  }
+
+  const fanIds = Array.from(new Set(rows.map((row) => row.fanId)));
   let upserted = 0;
-  const fanIds = [];
 
-  for (const row of rows) {
-    await prisma.trafficFanValueSnapshot.upsert({
-      where: { agencyId_creatorId_fanId: { agencyId, creatorId: creator.id, fanId: row.fanId } },
-      create: {
-        agencyId,
-        creatorId: creator.id,
-        fanId: row.fanId,
-        totalSummCents: row.totalSummCents,
-        messagesSummCents: row.messagesSummCents,
-        tipsSummCents: row.tipsSummCents,
-        subscribesSummCents: row.subscribesSummCents,
-        postsSummCents: row.postsSummCents,
-        streamsSummCents: row.streamsSummCents,
-        lastActivity: row.lastActivity,
-        fetchedAt: row.fetchedAt,
-        source: row.source,
-      },
-      update: {
-        totalSummCents: row.totalSummCents,
-        messagesSummCents: row.messagesSummCents,
-        tipsSummCents: row.tipsSummCents,
-        subscribesSummCents: row.subscribesSummCents,
-        postsSummCents: row.postsSummCents,
-        streamsSummCents: row.streamsSummCents,
-        lastActivity: row.lastActivity,
-        fetchedAt: row.fetchedAt,
-        source: row.source,
-      },
-    });
-    upserted += 1;
-    fanIds.push(row.fanId);
+  for (const chunk of chunkArray(rows, 500)) {
+    const createData = chunk.map((row) => ({
+      agencyId,
+      creatorId: creator.id,
+      fanId: row.fanId,
+      totalSummCents: row.totalSummCents,
+      messagesSummCents: row.messagesSummCents,
+      tipsSummCents: row.tipsSummCents,
+      subscribesSummCents: row.subscribesSummCents,
+      postsSummCents: row.postsSummCents,
+      streamsSummCents: row.streamsSummCents,
+      lastActivity: row.lastActivity,
+      fetchedAt: row.fetchedAt,
+      source: row.source,
+      updatedAt: now,
+    }));
 
-    const identity = {
-      ...(row.fanUsername ? { fanUsername: row.fanUsername } : {}),
-      ...(row.fanName ? { fanName: row.fanName } : {}),
-      ...(row.fanAvatar ? { fanAvatar: row.fanAvatar } : {}),
-    };
-    if (Object.keys(identity).length) {
+    await prisma.trafficFanValueSnapshot.createMany({ data: createData, skipDuplicates: true });
+
+    const updatePayload = chunk.map((row) => ({
+      fanId: row.fanId,
+      totalSummCents: row.totalSummCents,
+      messagesSummCents: row.messagesSummCents,
+      tipsSummCents: row.tipsSummCents,
+      subscribesSummCents: row.subscribesSummCents,
+      postsSummCents: row.postsSummCents,
+      streamsSummCents: row.streamsSummCents,
+      lastActivity: isoOrNull(row.lastActivity),
+      fetchedAt: isoOrNull(row.fetchedAt) || now.toISOString(),
+      source: row.source || "fan_value_core",
+    }));
+
+    await prisma.$executeRaw`
+      UPDATE "TrafficFanValueSnapshot" AS v
+      SET
+        "totalSummCents" = x."totalSummCents",
+        "messagesSummCents" = x."messagesSummCents",
+        "tipsSummCents" = x."tipsSummCents",
+        "subscribesSummCents" = x."subscribesSummCents",
+        "postsSummCents" = x."postsSummCents",
+        "streamsSummCents" = x."streamsSummCents",
+        "lastActivity" = x."lastActivity",
+        "fetchedAt" = x."fetchedAt",
+        "source" = COALESCE(x."source", v."source"),
+        "updatedAt" = NOW()
+      FROM jsonb_to_recordset(${JSON.stringify(updatePayload)}::jsonb)
+        AS x(
+          "fanId" text,
+          "totalSummCents" int,
+          "messagesSummCents" int,
+          "tipsSummCents" int,
+          "subscribesSummCents" int,
+          "postsSummCents" int,
+          "streamsSummCents" int,
+          "lastActivity" timestamptz,
+          "fetchedAt" timestamptz,
+          "source" text
+        )
+      WHERE v."agencyId" = ${agencyId}
+        AND v."creatorId" = ${creator.id}
+        AND v."fanId" = x."fanId"
+    `;
+
+    const identityPayload = chunk
+      .map((row) => {
+        const identity = {
+          ...(row.fanUsername ? { fanUsername: row.fanUsername } : {}),
+          ...(row.fanName ? { fanName: row.fanName } : {}),
+          ...(row.fanAvatar ? { fanAvatar: row.fanAvatar } : {}),
+        };
+        return Object.keys(identity).length ? { fanId: row.fanId, metadata: identity } : null;
+      })
+      .filter(Boolean);
+
+    if (identityPayload.length) {
       await prisma.$executeRaw`
-        UPDATE "TrafficSourceMember"
-        SET "metadata" = COALESCE("metadata", '{}'::jsonb) || ${JSON.stringify(identity)}::jsonb
-        WHERE "agencyId" = ${agencyId}
-          AND "creatorId" = ${creator.id}
-          AND "fanId" = ${row.fanId}
+        UPDATE "TrafficSourceMember" AS m
+        SET "metadata" = COALESCE(m."metadata", '{}'::jsonb) || x."metadata"
+        FROM jsonb_to_recordset(${JSON.stringify(identityPayload)}::jsonb)
+          AS x("fanId" text, "metadata" jsonb)
+        WHERE m."agencyId" = ${agencyId}
+          AND m."creatorId" = ${creator.id}
+          AND m."fanId" = x."fanId"
       `;
     }
+
+    upserted += chunk.length;
   }
 
-  if (fanIds.length) {
-    await prisma.trafficSourceMember.updateMany({
-      where: { agencyId, creatorId: creator.id, fanId: { in: Array.from(new Set(fanIds)) } },
-      data: {
-        lastValueFetchedAt: new Date(),
-        needsValueRefresh: false,
-      },
-    });
-  }
+  await prisma.trafficSourceMember.updateMany({
+    where: { agencyId, creatorId: creator.id, fanId: { in: fanIds } },
+    data: {
+      lastValueFetchedAt: now,
+      needsValueRefresh: false,
+    },
+  });
 
   return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted };
 }
+
 
 async function ingestSubscriptionEvent({ deviceId, userId, creatorId, accountId, event }) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
@@ -522,49 +706,42 @@ async function ingestSubscriptionEvent({ deviceId, userId, creatorId, accountId,
     metadata: compactJson(event?.metadata || null),
   };
 
-  let created = null;
   try {
-    created = await prisma.creatorSubscriptionLedger.create({ data });
-  } catch (err) {
-    if (err?.code === "P2002") {
-      return { ok: true, duplicate: true, eventHash };
-    }
-    throw err;
-  }
-
-  if (sourceMember?.id) {
-    await prisma.trafficSourceMember.update({
-      where: { id: sourceMember.id },
-      data: {
-        lastRevenueAt: occurredAt,
-        convertedAt: occurredAt,
-        needsValueRefresh: true,
-      },
-    });
-  }
-
-  if (created.sourceId) {
-    const day = utcDay(occurredAt);
-    await prisma.trafficDailyAggregate.upsert({
-      where: { sourceId_day: { sourceId: created.sourceId, day } },
-      create: {
+    const created = await prisma.$transaction(async (tx) => {
+      const row = await tx.creatorSubscriptionLedger.create({ data });
+      await applySubscriptionSideEffects(tx, {
         agencyId,
         creatorId: creator.id,
-        sourceId: created.sourceId,
-        day,
-        paidSubs: 1,
-        grossCents: amountCents,
-        netCents: amountCents,
-      },
-      update: {
-        paidSubs: { increment: 1 },
-        grossCents: { increment: amountCents },
-        netCents: { increment: amountCents },
-      },
+        fanId: row.fanId,
+        sourceId: row.sourceId,
+        occurredAt: row.occurredAt,
+      });
+      return row;
     });
-  }
 
-  return { ok: true, ledgerId: created.id, sourceId: created.sourceId, amountCents };
+    return { ok: true, ledgerId: created.id, sourceId: created.sourceId, amountCents };
+  } catch (err) {
+    if (err?.code !== "P2002") throw err;
+
+    const existing = await prisma.creatorSubscriptionLedger.findUnique({
+      where: { agencyId_eventHash: { agencyId, eventHash } },
+      select: { id: true, fanId: true, sourceId: true, occurredAt: true, amountCents: true },
+    });
+
+    if (existing) {
+      await prisma.$transaction(async (tx) => {
+        await applySubscriptionSideEffects(tx, {
+          agencyId,
+          creatorId: creator.id,
+          fanId: existing.fanId,
+          sourceId: existing.sourceId,
+          occurredAt: existing.occurredAt,
+        });
+      });
+    }
+
+    return { ok: true, duplicate: true, repaired: !!existing, eventHash };
+  }
 }
 
 async function assertTrafficViewer({ userId, creatorId }) {
@@ -577,7 +754,7 @@ async function assertTrafficViewer({ userId, creatorId }) {
 
   const member = await prisma.agencyMember.findFirst({
     where: { userId, agencyId: creator.agencyId, deletedAt: null, agency: { deletedAt: null } },
-    select: { id: true, roleKey: true },
+    select: { id: true, role: true, roleKey: true },
   });
   if (!member) {
     const err = new Error("Not a member of this agency");
@@ -970,6 +1147,7 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
       paidSubscriptions,
       revenueCents,
       costCents,
+      currency: source.currency || "USD",
       roiPercent,
       valueRoiPercent,
       valueSnapshotMembers: value.valueSnapshotMembers,
@@ -1109,6 +1287,130 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
   };
 }
 
+
+function isSeniorTrafficMember(member) {
+  const role = String(member?.role || "").toUpperCase();
+  const roleKey = String(member?.roleKey || "").toLowerCase();
+  return role === "OWNER" || role === "MANAGER" || role === "ADMIN" || ["owner", "manager", "admin"].includes(roleKey);
+}
+
+async function recomputeTrafficDailyAggregatesForSource({ agencyId, creatorId, sourceId, chunkSize = 30 } = {}) {
+  const cleanSourceId = clean(sourceId, 180);
+  if (!agencyId || !creatorId || !cleanSourceId) {
+    return { ok: false, days: 0, recomputedDays: 0, code: "BAD_RECOMPUTE_INPUT" };
+  }
+
+  const days = await prisma.trafficDailyAggregate.findMany({
+    where: { agencyId, creatorId, sourceId: cleanSourceId },
+    select: { day: true },
+    orderBy: { day: "desc" },
+  });
+
+  let recomputedDays = 0;
+  for (const chunk of chunkArray(days, chunkSize)) {
+    await prisma.$transaction(async (tx) => {
+      for (const { day } of chunk) {
+        await recomputeTrafficDailyAggregate(tx, {
+          agencyId,
+          creatorId,
+          sourceId: cleanSourceId,
+          day,
+        });
+        recomputedDays += 1;
+      }
+    }, {
+      maxWait: 10_000,
+      timeout: 60_000,
+    });
+  }
+
+  return { ok: true, days: days.length, recomputedDays };
+}
+
+async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents, currency }) {
+  const { creator, member } = await assertTrafficViewer({ userId, creatorId });
+
+  // Cost/ROI is a financial setting. Keep it owner/manager/admin-only so
+  // chatters cannot manipulate promo performance by zeroing source cost.
+  if (!isSeniorTrafficMember(member)) {
+    const err = new Error("Only OWNER / manager / admin can update traffic source cost");
+    err.code = "INSUFFICIENT_TEAM_ROLE";
+    throw err;
+  }
+
+  const cleanSourceId = clean(sourceId, 180);
+  if (!cleanSourceId) {
+    const err = new Error("Traffic source id is required");
+    err.code = "TRAFFIC_SOURCE_NOT_FOUND";
+    throw err;
+  }
+
+  const nextCostCents = cents(costCents);
+
+  // Keep the financial write itself short and atomic. Daily aggregates can span
+  // hundreds of days, so recomputing them inside the same transaction can hit
+  // Prisma/host transaction timeouts and roll back the actual cost update.
+  const updated = await prisma.$transaction(async (tx) => {
+    const source = await tx.trafficSource.findFirst({
+      where: {
+        id: cleanSourceId,
+        agencyId: creator.agencyId,
+        creatorId: creator.id,
+      },
+      select: {
+        id: true,
+        agencyId: true,
+        creatorId: true,
+        currency: true,
+      },
+    });
+
+    if (!source) {
+      const err = new Error("Traffic source not found");
+      err.code = "TRAFFIC_SOURCE_NOT_FOUND";
+      throw err;
+    }
+
+    return tx.trafficSource.update({
+      where: { id: source.id },
+      data: {
+        costCents: nextCostCents,
+        currency: clean(currency, 16) || source.currency || "USD",
+      },
+    });
+  }, {
+    maxWait: 10_000,
+    timeout: 20_000,
+  });
+
+  // TrafficDailyAggregate stores a denormalized costCents copy for fast
+  // dashboard reads. Recompute from the ledger source of truth in small
+  // transactions so old long-lived campaigns do not lock one huge transaction.
+  let recompute = { ok: true, days: 0, recomputedDays: 0 };
+  try {
+    recompute = await recomputeTrafficDailyAggregatesForSource({
+      agencyId: creator.agencyId,
+      creatorId: creator.id,
+      sourceId: updated.id,
+      chunkSize: 30,
+    });
+  } catch (err) {
+    console.warn("[traffic] source cost updated but aggregate recompute failed", {
+      sourceId: updated.id,
+      error: err?.message || String(err),
+    });
+    recompute = {
+      ok: false,
+      days: 0,
+      recomputedDays: 0,
+      code: err?.code || "TRAFFIC_AGGREGATE_RECOMPUTE_FAILED",
+      message: err?.message || String(err),
+    };
+  }
+
+  return { ok: true, source: updated, recompute };
+}
+
 function cleanHint(value, max = 255) {
   const s = String(value ?? "").trim();
   return s ? s.slice(0, max) : null;
@@ -1201,5 +1503,6 @@ module.exports = {
   ingestSubscriptionEvent,
   getTrafficOverview,
   getTrafficSourceMembers,
+  updateTrafficSourceCost,
   scheduleTrafficRefresh,
 };

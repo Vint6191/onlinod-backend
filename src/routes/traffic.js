@@ -8,6 +8,7 @@ const {
   ingestSubscriptionEvent,
   getTrafficOverview,
   getTrafficSourceMembers,
+  updateTrafficSourceCost,
   scheduleTrafficRefresh,
 } = require("../services/traffic-service");
 
@@ -28,8 +29,8 @@ function validationError(res, err) {
 
 function serviceError(res, err, fallbackCode) {
   const code = err?.code || fallbackCode || "TRAFFIC_FAILED";
-  const status = code === "NOT_YOUR_DEVICE" || code === "NOT_A_MEMBER" || code === "DEVICE_CREATOR_AGENCY_MISMATCH" ? 403
-    : code === "CREATOR_NOT_FOUND" ? 404
+  const status = code === "NOT_YOUR_DEVICE" || code === "NOT_A_MEMBER" || code === "DEVICE_CREATOR_AGENCY_MISMATCH" || code === "INSUFFICIENT_TEAM_ROLE" ? 403
+    : code === "CREATOR_NOT_FOUND" || code === "TRAFFIC_SOURCE_NOT_FOUND" ? 404
     : 500;
   return res.status(status).json({ ok: false, code, error: err?.message || "Traffic request failed" });
 }
@@ -177,6 +178,31 @@ router.get("/creators/:creatorId/overview", async (req, res) => {
   } catch (err) {
     console.error("[traffic/overview] failed:", err);
     return serviceError(res, err, "TRAFFIC_OVERVIEW_FAILED");
+  }
+});
+
+
+const sourceCostSchema = z.object({
+  costCents: z.number().int().nonnegative().optional(),
+  cost: z.union([z.number(), z.string()]).optional().nullable(),
+  currency: z.string().optional().nullable(),
+});
+
+router.patch("/creators/:creatorId/sources/:sourceId", async (req, res) => {
+  try {
+    const input = sourceCostSchema.parse(req.body || {});
+    const result = await updateTrafficSourceCost({
+      userId: actorUserId(req),
+      creatorId: req.params.creatorId,
+      sourceId: req.params.sourceId,
+      costCents: input.costCents ?? Math.round(Number(String(input.cost || 0).replace(/[^0-9.,-]/g, "").replace(",", ".")) * 100),
+      currency: input.currency || null,
+    });
+    return res.json(result);
+  } catch (err) {
+    if (err?.issues) return validationError(res, err);
+    console.error("[traffic/source-update] failed:", err);
+    return serviceError(res, err, "TRAFFIC_SOURCE_UPDATE_FAILED");
   }
 });
 
