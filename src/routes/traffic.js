@@ -39,6 +39,7 @@ const sourceScanSchema = z.object({
   accountId: z.string().optional().nullable(),
   jobId: z.string().optional().nullable(),
   hydrateLimit: z.number().int().min(0).max(5000).optional(),
+  forceHydrate: z.boolean().optional().default(false),
   sources: z.array(z.any()).max(1000).optional().default([]),
   members: z.array(z.any()).max(5000).optional().default([]),
 });
@@ -54,6 +55,7 @@ router.post("/sources/upsert", async (req, res) => {
       sources: input.sources,
       members: input.members,
       hydrateLimit: input.hydrateLimit ?? 1000,
+      forceHydrate: input.forceHydrate === true,
     });
     return res.json(result);
   } catch (err) {

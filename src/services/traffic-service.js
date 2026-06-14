@@ -251,7 +251,7 @@ async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, tt
   return out;
 }
 
-async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId, sources = [], members = [], hydrateLimit = 1000 }) {
+async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId, sources = [], members = [], hydrateLimit = 1000, forceHydrate = false }) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
   const agencyId = creator.agencyId;
   const now = new Date();
@@ -350,6 +350,7 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
         lastSeenAt: now,
         claimedAt: member.claimedAt || undefined,
         metadata: member.metadata || undefined,
+        needsValueRefresh: forceHydrate ? true : undefined,
       },
     });
     memberUpserts += 1;
@@ -804,7 +805,7 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false } = {})
     jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
     creatorId: creator.id,
     agencyId: creator.agencyId,
-    params: { hydrateFanValues: true, valueTtlHours: 6, reason: "manual_traffic_refresh" },
+    params: { hydrateFanValues: true, forceHydrate: force === true, hydrateLimit: force === true ? 5000 : 1000, valueTtlHours: 6, reason: "manual_traffic_refresh" },
     priority: 100,
     now: new Date(),
     freshnessWindowMs: force ? 0 : Math.min(60_000, TRAFFIC_REFRESH_WINDOW_MS),
