@@ -7,6 +7,7 @@ const {
   upsertTrafficFanValueSnapshots,
   ingestSubscriptionEvent,
   getTrafficOverview,
+  getTrafficSourceMembers,
   scheduleTrafficRefresh,
 } = require("../services/traffic-service");
 
@@ -176,6 +177,24 @@ router.get("/creators/:creatorId/overview", async (req, res) => {
   } catch (err) {
     console.error("[traffic/overview] failed:", err);
     return serviceError(res, err, "TRAFFIC_OVERVIEW_FAILED");
+  }
+});
+
+router.get("/creators/:creatorId/sources/:sourceId/members", async (req, res) => {
+  try {
+    const result = await getTrafficSourceMembers({
+      userId: actorUserId(req),
+      creatorId: req.params.creatorId,
+      sourceId: req.params.sourceId,
+      rangeKey: req.query.range || "7d",
+      limit: req.query.limit ? Number(req.query.limit) : 100,
+      offset: req.query.offset ? Number(req.query.offset) : 0,
+      onlyPaying: String(req.query.onlyPaying || req.query.paying || "").toLowerCase() === "true" || String(req.query.onlyPaying || req.query.paying || "") === "1",
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error("[traffic/source-members] failed:", err);
+    return serviceError(res, err, "TRAFFIC_SOURCE_MEMBERS_FAILED");
   }
 });
 

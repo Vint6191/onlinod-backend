@@ -55,6 +55,37 @@ function valueStatsSeed() {
   };
 }
 
+function extractMemberIdentity(metadata = {}) {
+  const meta = metadata && typeof metadata === "object" ? metadata : {};
+  const user = meta.user && typeof meta.user === "object" ? meta.user : {};
+  const fan = meta.fan && typeof meta.fan === "object" ? meta.fan : {};
+  const subscriber = meta.subscriber && typeof meta.subscriber === "object" ? meta.subscriber : {};
+
+  const username = clean(
+    meta.fanUsername || meta.username || meta.login ||
+    user.username || user.login ||
+    fan.username || fan.login ||
+    subscriber.username || subscriber.login,
+    120
+  );
+  const name = clean(
+    meta.fanName || meta.name || meta.displayName ||
+    user.name || user.displayName ||
+    fan.name || fan.displayName ||
+    subscriber.name || subscriber.displayName,
+    160
+  );
+  const avatarUrl = clean(
+    meta.fanAvatar || meta.avatarUrl || meta.avatar ||
+    user.avatar || user.avatarUrl || user.avatarThumbs?.c50 || user.avatarThumbs?.c144 ||
+    fan.avatar || fan.avatarUrl || fan.avatarThumbs?.c50 || fan.avatarThumbs?.c144 ||
+    subscriber.avatar || subscriber.avatarUrl || subscriber.avatarThumbs?.c50 || subscriber.avatarThumbs?.c144,
+    1000
+  );
+
+  return { username, name, avatarUrl };
+}
+
 function normalizeValueStatsRow(row = {}) {
   return {
     valueSnapshotMembers: dbNumber(row.valueSnapshotMembers),
@@ -171,6 +202,9 @@ function normalizeSnapshot(input = {}) {
   if (!fanId) return null;
   return {
     fanId,
+    fanUsername: clean(input.fanUsername || input.username || input.login, 120),
+    fanName: clean(input.fanName || input.name || input.displayName, 160),
+    fanAvatar: clean(input.fanAvatar || input.avatarUrl || input.avatar, 1000),
     totalSummCents: moneyCents(input.totalSumm ?? input.total),
     messagesSummCents: moneyCents(input.messagesSumm ?? input.messages),
     tipsSummCents: moneyCents(input.tipsSumm ?? input.tips),
@@ -413,6 +447,21 @@ async function upsertTrafficFanValueSnapshots({ deviceId, userId, creatorId, sna
     });
     upserted += 1;
     fanIds.push(row.fanId);
+
+    const identity = {
+      ...(row.fanUsername ? { fanUsername: row.fanUsername } : {}),
+      ...(row.fanName ? { fanName: row.fanName } : {}),
+      ...(row.fanAvatar ? { fanAvatar: row.fanAvatar } : {}),
+    };
+    if (Object.keys(identity).length) {
+      await prisma.$executeRaw`
+        UPDATE "TrafficSourceMember"
+        SET "metadata" = COALESCE("metadata", '{}'::jsonb) || ${JSON.stringify(identity)}::jsonb
+        WHERE "agencyId" = ${agencyId}
+          AND "creatorId" = ${creator.id}
+          AND "fanId" = ${row.fanId}
+      `;
+    }
   }
 
   if (fanIds.length) {
@@ -610,6 +659,233 @@ async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
   return {
     bySource,
     totals: normalizeValueStatsRow((totalRows || [])[0] || {}),
+  };
+}
+
+async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey = "7d", limit = 100, offset = 0, onlyPaying = false }) {
+  const { creator } = await assertTrafficViewer({ userId, creatorId });
+  const id = clean(sourceId, 180);
+  if (!id) {
+    const err = new Error("Source id is required");
+    err.code = "TRAFFIC_SOURCE_ID_REQUIRED";
+    throw err;
+  }
+
+  const take = Math.max(1, Math.min(500, Number(limit || 100)));
+  const skip = Math.max(0, Number(offset || 0));
+
+  if (id === "unattributed_paid_subscriptions") {
+    const range = rangeWindow(rangeKey);
+    const where = {
+      agencyId: creator.agencyId,
+      creatorId: creator.id,
+      sourceId: null,
+    };
+    if (range.start || range.end) {
+      where.occurredAt = {};
+      if (range.start) where.occurredAt.gte = range.start;
+      if (range.end) where.occurredAt.lt = range.end;
+    }
+
+    const [rows, totalCount] = await Promise.all([
+      prisma.creatorSubscriptionLedger.groupBy({
+        by: ["fanId"],
+        where,
+        _sum: { amountCents: true },
+        _count: { _all: true },
+        orderBy: { _sum: { amountCents: "desc" } },
+        take,
+        skip,
+      }),
+      prisma.creatorSubscriptionLedger.groupBy({ by: ["fanId"], where, _count: { _all: true } }),
+    ]);
+
+    const members = rows.map((row) => ({
+      fanId: String(row.fanId),
+      fanUsername: null,
+      fanName: null,
+      displayName: String(row.fanId),
+      totalSummCents: Number(row._sum?.amountCents || 0),
+      messagesSummCents: 0,
+      tipsSummCents: 0,
+      subscribesSummCents: Number(row._sum?.amountCents || 0),
+      postsSummCents: 0,
+      streamsSummCents: 0,
+      fetchedAt: null,
+      claimedAt: null,
+      firstSeenAt: null,
+      lastSeenAt: null,
+      pendingValue: false,
+      ledgerSubscriptions: Number(row._count?._all || 0),
+      ledgerRevenueCents: Number(row._sum?.amountCents || 0),
+    }));
+
+    return {
+      ok: true,
+      source: {
+        id,
+        sourceType: "paid_unknown",
+        sourceLabel: sourceLabel("paid_unknown"),
+        name: "Paid subscriptions · unknown source",
+        externalId: "unattributed",
+      },
+      totals: {
+        members: Number(totalCount?.length || 0),
+        fetched: members.length,
+        pending: 0,
+        buyers: members.filter((row) => Number(row.totalSummCents || 0) > 0).length,
+        fanValueCents: members.reduce((acc, row) => acc + Number(row.totalSummCents || 0), 0),
+        messagesSummCents: 0,
+        tipsSummCents: 0,
+        subscribesSummCents: members.reduce((acc, row) => acc + Number(row.subscribesSummCents || 0), 0),
+      },
+      members,
+      pagination: { limit: take, offset: skip, returned: members.length, hasMore: skip + members.length < Number(totalCount?.length || 0) },
+    };
+  }
+
+  const source = await prisma.trafficSource.findFirst({
+    where: { id, agencyId: creator.agencyId, creatorId: creator.id },
+    select: {
+      id: true,
+      sourceType: true,
+      externalId: true,
+      name: true,
+      status: true,
+      url: true,
+      costCents: true,
+      currency: true,
+      lastScannedAt: true,
+      updatedAt: true,
+    },
+  });
+
+  if (!source) {
+    const err = new Error("Traffic source not found");
+    err.code = "TRAFFIC_SOURCE_NOT_FOUND";
+    throw err;
+  }
+
+  const rows = await prisma.$queryRaw`
+    SELECT
+      m."fanId" AS "fanId",
+      m."metadata" AS "metadata",
+      m."firstSeenAt" AS "firstSeenAt",
+      m."lastSeenAt" AS "lastSeenAt",
+      m."claimedAt" AS "claimedAt",
+      m."convertedAt" AS "convertedAt",
+      m."lastValueFetchedAt" AS "lastValueFetchedAt",
+      m."needsValueRefresh" AS "needsValueRefresh",
+      COALESCE(v."totalSummCents", 0)::bigint AS "totalSummCents",
+      COALESCE(v."messagesSummCents", 0)::bigint AS "messagesSummCents",
+      COALESCE(v."tipsSummCents", 0)::bigint AS "tipsSummCents",
+      COALESCE(v."subscribesSummCents", 0)::bigint AS "subscribesSummCents",
+      COALESCE(v."postsSummCents", 0)::bigint AS "postsSummCents",
+      COALESCE(v."streamsSummCents", 0)::bigint AS "streamsSummCents",
+      v."fetchedAt" AS "fetchedAt",
+      COALESCE(l."paidSubscriptions", 0)::bigint AS "ledgerSubscriptions",
+      COALESCE(l."ledgerRevenueCents", 0)::bigint AS "ledgerRevenueCents"
+    FROM "TrafficSourceMember" m
+    LEFT JOIN "TrafficFanValueSnapshot" v
+      ON v."agencyId" = m."agencyId"
+     AND v."creatorId" = m."creatorId"
+     AND v."fanId" = m."fanId"
+    LEFT JOIN (
+      SELECT "fanId", COUNT(*)::bigint AS "paidSubscriptions", COALESCE(SUM("amountCents"), 0)::bigint AS "ledgerRevenueCents"
+      FROM "CreatorSubscriptionLedger"
+      WHERE "agencyId" = ${creator.agencyId}
+        AND "creatorId" = ${creator.id}
+        AND "sourceId" = ${source.id}
+      GROUP BY "fanId"
+    ) l ON l."fanId" = m."fanId"
+    WHERE m."agencyId" = ${creator.agencyId}
+      AND m."creatorId" = ${creator.id}
+      AND m."sourceId" = ${source.id}
+      AND (${onlyPaying === true} = false OR COALESCE(v."totalSummCents", 0) > 0)
+    ORDER BY COALESCE(v."totalSummCents", 0) DESC, m."lastSeenAt" DESC, m."fanId" ASC
+    LIMIT ${take}
+    OFFSET ${skip}
+  `;
+
+  const countRows = await prisma.$queryRaw`
+    SELECT
+      COUNT(*)::bigint AS "members",
+      COUNT(v."fanId")::bigint AS "fetched",
+      COUNT(CASE WHEN COALESCE(v."totalSummCents", 0) > 0 THEN 1 END)::bigint AS "buyers",
+      COALESCE(SUM(v."totalSummCents"), 0)::bigint AS "fanValueCents",
+      COALESCE(SUM(v."messagesSummCents"), 0)::bigint AS "messagesSummCents",
+      COALESCE(SUM(v."tipsSummCents"), 0)::bigint AS "tipsSummCents",
+      COALESCE(SUM(v."subscribesSummCents"), 0)::bigint AS "subscribesSummCents",
+      COALESCE(SUM(v."postsSummCents"), 0)::bigint AS "postsSummCents",
+      COALESCE(SUM(v."streamsSummCents"), 0)::bigint AS "streamsSummCents"
+    FROM "TrafficSourceMember" m
+    LEFT JOIN "TrafficFanValueSnapshot" v
+      ON v."agencyId" = m."agencyId"
+     AND v."creatorId" = m."creatorId"
+     AND v."fanId" = m."fanId"
+    WHERE m."agencyId" = ${creator.agencyId}
+      AND m."creatorId" = ${creator.id}
+      AND m."sourceId" = ${source.id}
+  `;
+
+  const totalsRow = (countRows || [])[0] || {};
+  const members = (rows || []).map((row) => {
+    const identity = extractMemberIdentity(row.metadata || {});
+    const username = identity.username || null;
+    const name = identity.name || null;
+    const displayName = username ? `@${username}` : (name || String(row.fanId || ""));
+    return {
+      fanId: String(row.fanId || ""),
+      fanUsername: username,
+      fanName: name,
+      avatarUrl: identity.avatarUrl || null,
+      displayName,
+      totalSummCents: dbNumber(row.totalSummCents),
+      messagesSummCents: dbNumber(row.messagesSummCents),
+      tipsSummCents: dbNumber(row.tipsSummCents),
+      subscribesSummCents: dbNumber(row.subscribesSummCents),
+      postsSummCents: dbNumber(row.postsSummCents),
+      streamsSummCents: dbNumber(row.streamsSummCents),
+      fetchedAt: row.fetchedAt || null,
+      pendingValue: !row.fetchedAt,
+      firstSeenAt: row.firstSeenAt || null,
+      lastSeenAt: row.lastSeenAt || null,
+      claimedAt: row.claimedAt || null,
+      convertedAt: row.convertedAt || null,
+      lastValueFetchedAt: row.lastValueFetchedAt || null,
+      needsValueRefresh: row.needsValueRefresh === true,
+      ledgerSubscriptions: dbNumber(row.ledgerSubscriptions),
+      ledgerRevenueCents: dbNumber(row.ledgerRevenueCents),
+    };
+  });
+
+  const totalMembers = dbNumber(totalsRow.members);
+  const fetched = dbNumber(totalsRow.fetched);
+  return {
+    ok: true,
+    source: {
+      ...source,
+      sourceLabel: sourceLabel(source.sourceType),
+    },
+    totals: {
+      members: totalMembers,
+      fetched,
+      pending: Math.max(0, totalMembers - fetched),
+      buyers: dbNumber(totalsRow.buyers),
+      fanValueCents: dbNumber(totalsRow.fanValueCents),
+      messagesSummCents: dbNumber(totalsRow.messagesSummCents),
+      tipsSummCents: dbNumber(totalsRow.tipsSummCents),
+      subscribesSummCents: dbNumber(totalsRow.subscribesSummCents),
+      postsSummCents: dbNumber(totalsRow.postsSummCents),
+      streamsSummCents: dbNumber(totalsRow.streamsSummCents),
+    },
+    members,
+    pagination: {
+      limit: take,
+      offset: skip,
+      returned: members.length,
+      hasMore: skip + members.length < (onlyPaying ? dbNumber(totalsRow.buyers) : totalMembers),
+    },
   };
 }
 
@@ -924,5 +1200,6 @@ module.exports = {
   upsertTrafficFanValueSnapshots,
   ingestSubscriptionEvent,
   getTrafficOverview,
+  getTrafficSourceMembers,
   scheduleTrafficRefresh,
 };
