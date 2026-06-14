@@ -143,6 +143,7 @@ async function recomputeTrafficDailyAggregate(tx, { agencyId, creatorId, sourceI
         agencyId,
         creatorId,
         sourceId,
+        amountCents: { gt: 0 },
         occurredAt: { gte: dayStart, lt: dayEnd },
       },
       _count: { _all: true },
@@ -410,6 +411,7 @@ async function repairUnattributedSubscriptionAttribution({
         WHERE l."agencyId" = ${cleanAgencyId}
           AND l."creatorId" = ${cleanCreatorId}
           AND l."sourceId" IS NULL
+          AND l."amountCents" > 0
           AND (${allowOrganicConfirmed === true} OR l."organicConfirmed" = false)
           AND l."fanId" = c."fanId"
         RETURNING l."sourceId", l."fanId", l."occurredAt"
@@ -480,6 +482,7 @@ async function repairUnattributedSubscriptionAttribution({
         WHERE l."agencyId" = ${cleanAgencyId}
           AND l."creatorId" = ${cleanCreatorId}
           AND l."sourceId" IS NULL
+          AND l."amountCents" > 0
           AND l."organicConfirmed" = false
           AND l."fanId" IN (${Prisma.join(chunk)})
           AND NOT EXISTS (
@@ -537,8 +540,13 @@ async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, tt
         fanId: { in: chunk },
         OR: [
           { needsValueRefresh: true },
-          { lastValueFetchedAt: null },
-          { lastValueFetchedAt: { lt: threshold } },
+          {
+            lastRevenueAt: { not: null },
+            OR: [
+              { lastValueFetchedAt: null },
+              { lastValueFetchedAt: { lt: threshold } },
+            ],
+          },
         ],
       },
       select: { fanId: true },
@@ -547,8 +555,7 @@ async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, tt
     const dirty = new Set(dirtyMembers.map((row) => String(row.fanId)));
 
     for (const fanId of chunk) {
-      const snap = byFan.get(fanId);
-      if (!snap || !snap.fetchedAt || snap.fetchedAt < threshold || dirty.has(fanId)) {
+      if (dirty.has(fanId)) {
         out.push(fanId);
         if (out.length >= limit) return out;
       }
@@ -669,7 +676,9 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
         firstSeenAt: row.claimedAt || now,
         lastSeenAt: now,
         claimedAt: row.claimedAt || null,
-        needsValueRefresh: true,
+        // Keep campaign/free claimers as attribution map only. Do not hydrate
+        // value for every free/organic non-buyer; paid events will mark dirty.
+        needsValueRefresh: false,
         metadata: row.metadata,
         updatedAt: now,
       }));
@@ -693,7 +702,7 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
             ELSE COALESCE(m."metadata", '{}'::jsonb) || x."metadata"
           END,
           "needsValueRefresh" = CASE
-            WHEN ${forceHydrate === true} THEN TRUE
+            WHEN ${forceHydrate === true} AND m."lastRevenueAt" IS NOT NULL THEN TRUE
             ELSE m."needsValueRefresh"
           END
         FROM jsonb_to_recordset(${JSON.stringify(updatePayload)}::jsonb)
@@ -912,8 +921,13 @@ async function getPendingTrafficValueFanIds({ deviceId, userId, creatorId, limit
       creatorId: creator.id,
       OR: [
         { needsValueRefresh: true },
-        { lastValueFetchedAt: null },
-        { lastValueFetchedAt: { lt: threshold } },
+        {
+          lastRevenueAt: { not: null },
+          OR: [
+            { lastValueFetchedAt: null },
+            { lastValueFetchedAt: { lt: threshold } },
+          ],
+        },
       ],
     },
     select: { fanId: true, lastRevenueAt: true, lastSeenAt: true, updatedAt: true },
@@ -991,11 +1005,19 @@ async function ingestSubscriptionEvent({ agencyId: agencyHint, deviceId, userId,
   const fanId = clean(event?.fanId, 180);
   const amountCents = cents(event?.amountCents) || moneyCents(event?.amount || event?.price);
   const occurredAt = asDate(event?.occurredAt || event?.createdAt || event?.ts) || new Date();
+  const eventTypeRaw = String(event?.eventType || event?.type || "").toLowerCase();
+  const explicitFreeSub = event?.isFreeSubscription === true || eventTypeRaw.includes("free");
 
-  // Product decision: free subscriptions without a tracked source are not stored.
-  // Paid subs are facts and go to the creator/traffic ledger.
-  if (!fanId || amountCents <= 0) {
-    return { ok: true, ignored: true, reason: !fanId ? "no_fan_id" : "free_subscription" };
+  // Product decision: CreatorSubscriptionLedger stores PAID subscription facts only.
+  // Free/organic subscribe noise can be hundreds per day, so we drop it here and
+  // keep only TrafficSourceMember as the attribution map for campaign claimers.
+  if (!fanId || explicitFreeSub || amountCents <= 0) {
+    return {
+      ok: true,
+      ignored: true,
+      reason: !fanId ? "no_fan_id" : "free_subscription",
+      amountCents,
+    };
   }
 
   const sourceMember = await prisma.trafficSourceMember.findFirst({
@@ -1134,6 +1156,7 @@ async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
   const uniqueSourceIds = Array.from(new Set((sourceIds || []).map((id) => clean(id, 180)).filter(Boolean)));
   const bySource = new Map();
   const totals = valueStatsSeed();
+  const valueThreshold = new Date(Date.now() - VALUE_SNAPSHOT_TTL_MS);
 
   if (!uniqueSourceIds.length) {
     return { bySource, totals };
@@ -1164,6 +1187,31 @@ async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
 
   for (const row of sourceRows || []) {
     bySource.set(String(row.sourceId), normalizeValueStatsRow(row));
+  }
+
+  const pendingRows = await prisma.$queryRaw`
+    SELECT
+      m."sourceId" AS "sourceId",
+      COUNT(*)::bigint AS "valuePendingMembers"
+    FROM "TrafficSourceMember" m
+    WHERE m."agencyId" = ${agencyId}
+      AND m."creatorId" = ${creatorId}
+      AND m."sourceId" IN (${Prisma.join(uniqueSourceIds)})
+      AND (
+        m."needsValueRefresh" = true
+        OR (
+          m."lastRevenueAt" IS NOT NULL
+          AND (m."lastValueFetchedAt" IS NULL OR m."lastValueFetchedAt" < ${valueThreshold})
+        )
+      )
+    GROUP BY m."sourceId"
+  `;
+
+  for (const row of pendingRows || []) {
+    const key = String(row.sourceId);
+    const stats = { ...valueStatsSeed(), ...(bySource.get(key) || {}) };
+    stats.valuePendingMembers = dbNumber(row.valuePendingMembers);
+    bySource.set(key, stats);
   }
 
   const totalRows = await prisma.$queryRaw`
@@ -1198,9 +1246,25 @@ async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
     ) x
   `;
 
+  const totalStats = normalizeValueStatsRow((totalRows || [])[0] || {});
+  const totalPendingRows = await prisma.$queryRaw`
+    SELECT COUNT(DISTINCT m."fanId")::bigint AS "valuePendingMembers"
+    FROM "TrafficSourceMember" m
+    WHERE m."agencyId" = ${agencyId}
+      AND m."creatorId" = ${creatorId}
+      AND (
+        m."needsValueRefresh" = true
+        OR (
+          m."lastRevenueAt" IS NOT NULL
+          AND (m."lastValueFetchedAt" IS NULL OR m."lastValueFetchedAt" < ${valueThreshold})
+        )
+      )
+  `;
+  totalStats.valuePendingMembers = dbNumber((totalPendingRows || [])[0]?.valuePendingMembers);
+
   return {
     bySource,
-    totals: normalizeValueStatsRow((totalRows || [])[0] || {}),
+    totals: totalStats,
   };
 }
 
@@ -1317,6 +1381,7 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
       m."claimedAt" AS "claimedAt",
       m."convertedAt" AS "convertedAt",
       m."lastValueFetchedAt" AS "lastValueFetchedAt",
+      m."lastRevenueAt" AS "lastRevenueAt",
       m."needsValueRefresh" AS "needsValueRefresh",
       COALESCE(v."totalSummCents", 0)::bigint AS "totalSummCents",
       COALESCE(v."messagesSummCents", 0)::bigint AS "messagesSummCents",
@@ -1338,6 +1403,7 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
       WHERE "agencyId" = ${creator.agencyId}
         AND "creatorId" = ${creator.id}
         AND "sourceId" = ${source.id}
+        AND "amountCents" > 0
       GROUP BY "fanId"
     ) l ON l."fanId" = m."fanId"
     WHERE m."agencyId" = ${creator.agencyId}
@@ -1354,6 +1420,7 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
       COUNT(*)::bigint AS "members",
       COUNT(v."fanId")::bigint AS "fetched",
       COUNT(CASE WHEN COALESCE(v."totalSummCents", 0) > 0 THEN 1 END)::bigint AS "buyers",
+      COUNT(CASE WHEN m."needsValueRefresh" = true OR (m."lastRevenueAt" IS NOT NULL AND (m."lastValueFetchedAt" IS NULL OR m."lastValueFetchedAt" < ${new Date(Date.now() - VALUE_SNAPSHOT_TTL_MS)}) ) THEN 1 END)::bigint AS "pendingValueMembers",
       COALESCE(SUM(v."totalSummCents"), 0)::bigint AS "fanValueCents",
       COALESCE(SUM(v."messagesSummCents"), 0)::bigint AS "messagesSummCents",
       COALESCE(SUM(v."tipsSummCents"), 0)::bigint AS "tipsSummCents",
@@ -1389,7 +1456,7 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
       postsSummCents: dbNumber(row.postsSummCents),
       streamsSummCents: dbNumber(row.streamsSummCents),
       fetchedAt: row.fetchedAt || null,
-      pendingValue: !row.fetchedAt,
+      pendingValue: row.needsValueRefresh === true || (!!asDate(row.lastRevenueAt) && (!asDate(row.lastValueFetchedAt) || asDate(row.lastValueFetchedAt) < new Date(Date.now() - VALUE_SNAPSHOT_TTL_MS))),
       firstSeenAt: row.firstSeenAt || null,
       lastSeenAt: row.lastSeenAt || null,
       claimedAt: row.claimedAt || null,
@@ -1412,7 +1479,7 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
     totals: {
       members: totalMembers,
       fetched,
-      pending: Math.max(0, totalMembers - fetched),
+      pending: dbNumber(totalsRow.pendingValueMembers),
       buyers: dbNumber(totalsRow.buyers),
       fanValueCents: dbNumber(totalsRow.fanValueCents),
       messagesSummCents: dbNumber(totalsRow.messagesSummCents),
@@ -1437,6 +1504,7 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
   const revenueWhere = {
     agencyId: creator.agencyId,
     creatorId: creator.id,
+    amountCents: { gt: 0 },
   };
   if (range.start || range.end) {
     revenueWhere.occurredAt = {};
@@ -1497,7 +1565,7 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
     const revenueCents = Number(rev?._sum?.amountCents || 0);
     const costCents = Number(source.costCents || 0);
     const value = { ...valueStatsSeed(), ...(valueStats.bySource.get(source.id) || {}) };
-    value.valuePendingMembers = Math.max(0, claimers - Number(value.valueSnapshotMembers || 0));
+    value.valuePendingMembers = Number(value.valuePendingMembers || 0);
     const roiPercent = costCents > 0 ? ((revenueCents - costCents) / costCents) * 100 : null;
     const valueRoiPercent = costCents > 0 ? ((Number(value.fanValueCents || 0) - costCents) / costCents) * 100 : null;
     return {
@@ -1603,7 +1671,7 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
   const trackedPaidSubscriptions = paidSubscriptions - unknownPaidSubscriptions;
   const uniqueValue = valueStats.totals || valueStatsSeed();
   const valueSnapshotMembers = Number(uniqueValue.valueSnapshotMembers || 0);
-  const valuePendingMembers = Math.max(0, membersCount - valueSnapshotMembers);
+  const valuePendingMembers = Number(uniqueValue.valuePendingMembers || 0);
   const valuePayingFans = Number(uniqueValue.valuePayingFans || 0);
 
   return {

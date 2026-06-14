@@ -327,6 +327,7 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     ppvCreatedOrUpdated: 0,
     tipCreatedOrUpdated: 0,
     subscriptionCreatedOrUpdated: 0,
+    subscriptionFreeIgnored: 0,
     trafficValueDirtyMembers: 0,
     trafficHydrateScheduled: false,
     deduped: 0,
@@ -418,6 +419,13 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
       }
 
       if (type.includes("subscription") || type.includes("subscrib")) {
+        const subscriptionAmountCents = amountCents(ev.amountCents) || amountDollarsToCents(ev.amount || ev.price);
+        if (subscriptionAmountCents <= 0) {
+          summary.subscriptionFreeIgnored += 1;
+          summary.skipped += 1;
+          continue;
+        }
+
         const subscriptionResult = await ingestSubscriptionEvent({
           agencyId: job.agencyId,
           deviceId,
@@ -427,7 +435,7 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
           event: {
             fanId: clean(ev.fanId || ev.dialogId, 160),
             eventType: clean(ev.eventType || "paid_subscribed", 80) || "paid_subscribed",
-            amountCents: amountCents(ev.amountCents) || amountDollarsToCents(ev.amount),
+            amountCents: subscriptionAmountCents,
             amount: ev.amount,
             price: ev.price,
             currency: clean(ev.currency || "USD", 8) || "USD",
