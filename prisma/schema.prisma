@@ -120,6 +120,7 @@ model Agency {
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
+  teamObservationStates TeamObservationState[]
 
   @@index([deletedAt])
 }
@@ -195,6 +196,7 @@ model CreatorAccount {
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
+  teamObservationStates TeamObservationState[]
 
   @@index([agencyId])
   @@index([status])
@@ -1634,6 +1636,45 @@ model TeamSentMessageLedger {
   @@index([agencyId, memberId, sentAt])
   @@index([agencyId, isPpv, sentAt])
   @@index([agencyId, dialogId, sentAt])
+}
+
+model TeamObservationState {
+  id        String   @id @default(cuid())
+  agencyId  String
+  creatorId String
+
+  accountId  String   @default("unknown")
+  creatorRef String?
+
+  lastHeartbeatAt     DateTime?
+  lastRealtimeEventAt DateTime?
+  lastObservedAt      DateTime?
+
+  lastPurchaseScanTo   DateTime?
+  lastTipScanTo        DateTime?
+  lastSuccessfulScanAt DateTime?
+
+  currentScanStatus String   @default("idle")
+  currentScanFrom   DateTime?
+  currentScanTo     DateTime?
+  currentScanTypes  Json?
+  lockedByDeviceId  String?
+  lockedUntil       DateTime?
+
+  lastScanSummary Json?
+  lastErrorCode   String?
+  lastErrorAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId])
+  @@index([agencyId, lastObservedAt])
+  @@index([agencyId, currentScanStatus])
+  @@index([lockedUntil])
 }
 
 model TeamPpvPurchaseLedger {

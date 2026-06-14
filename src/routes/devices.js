@@ -2,6 +2,7 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { authRequired } = require("../middleware/auth");
+const { updateObservationFromHeartbeat } = require("../services/team-observation-service");
 
 const router = express.Router();
 router.use(authRequired);
@@ -141,6 +142,18 @@ router.post("/heartbeat", async (req, res) => {
       accounts: input.accounts,
     });
 
+    let observation = null;
+    try {
+      observation = await updateObservationFromHeartbeat({
+        agencyId,
+        deviceId: input.deviceId,
+        accounts: input.accounts,
+      });
+    } catch (err) {
+      console.warn("[devices/heartbeat] observation update failed:", err?.message || err);
+      observation = { ok: false, code: "OBSERVATION_UPDATE_FAILED" };
+    }
+
     const commands = await prisma.deviceCommand.findMany({
       where: {
         deviceId: input.deviceId,
@@ -176,6 +189,7 @@ router.post("/heartbeat", async (req, res) => {
       revokedCreatorIds: Array.from(new Set(revokedCreatorIds)),
       revokedPartitions: Array.from(new Set(revokedPartitions)),
       commands,
+      observation,
       permissionsVersion: Date.now(),
     });
   } catch (err) {

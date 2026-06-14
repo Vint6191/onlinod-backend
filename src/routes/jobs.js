@@ -32,6 +32,7 @@ const express = require("express");
 const { z }   = require("zod");
 const prisma  = require("../prisma");
 const { applyPresenceJobResult } = require("../services/presence-service");
+const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("../services/team-observation-service");
 
 const router = express.Router();
 
@@ -316,6 +317,14 @@ router.post("/:id/report", async (req, res) => {
       if (job.jobKey === "refresh_online_presence") {
         sideEffect = await applyPresenceJobResult({ job, deviceId: input.deviceId, result: input.result || {} });
       }
+      if (job.jobKey === CATCHUP_JOB_KEY) {
+        sideEffect = await applyCatchupJobResult({
+          job,
+          deviceId: input.deviceId,
+          userId,
+          result: input.result || {},
+        });
+      }
 
       const updated = await prisma.jobInstance.update({
         where: { id: job.id },
@@ -332,6 +341,10 @@ router.post("/:id/report", async (req, res) => {
     }
 
     // Failure — backoff.
+    if (job.jobKey === CATCHUP_JOB_KEY) {
+      try { await recordCatchupJobFailure({ job, error: input.error || "unknown error" }); } catch (_) {}
+    }
+
     const newAttempts = job.attempts + 1;
     const backoffMs = RETRY_BACKOFF_MS * Math.pow(2, newAttempts - 1);
 
