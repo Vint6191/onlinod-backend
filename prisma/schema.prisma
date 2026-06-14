@@ -1801,6 +1801,11 @@ model CreatorSubscriptionLedger {
   source    String   @default("realtime")
   metadata  Json?
 
+  // Organic subs can stay unattributed forever. Track failed attribution
+  // repair attempts so future repair scans can skip confirmed organic rows.
+  attributionAttempts Int     @default(0)
+  organicConfirmed    Boolean @default(false)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1811,6 +1816,7 @@ model CreatorSubscriptionLedger {
   @@unique([agencyId, eventHash])
   @@index([agencyId, creatorId, fanId, occurredAt])
   @@index([agencyId, creatorId, sourceId, occurredAt])
+  @@index([agencyId, creatorId, organicConfirmed, attributionAttempts])
 }
 
 model TrafficDailyAggregate {

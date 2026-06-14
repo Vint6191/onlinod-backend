@@ -5,6 +5,8 @@ const { z } = require("zod");
 const {
   upsertTrafficSourceScan,
   upsertTrafficFanValueSnapshots,
+  getPendingTrafficValueFanIds,
+  markTrafficFanValueDirtyFromDevice,
   ingestSubscriptionEvent,
   getTrafficOverview,
   getTrafficSourceMembers,
@@ -168,6 +170,59 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
     if (err?.issues) return validationError(res, err);
     console.error("[traffic/refresh] failed:", err);
     return serviceError(res, err, "TRAFFIC_REFRESH_FAILED");
+  }
+});
+
+
+
+
+const markDirtySchema = z.object({
+  deviceId: z.string().min(1),
+  creatorId: z.string().min(1),
+  accountId: z.string().optional().nullable(),
+  fanId: z.string().min(1),
+  occurredAt: z.union([z.string(), z.number(), z.date()]).optional().nullable(),
+  reason: z.string().optional().nullable(),
+});
+
+router.post("/value-refresh/mark-dirty", async (req, res) => {
+  try {
+    const input = markDirtySchema.parse(req.body || {});
+    const result = await markTrafficFanValueDirtyFromDevice({
+      deviceId: input.deviceId,
+      userId: actorUserId(req),
+      creatorId: input.creatorId,
+      fanId: input.fanId,
+      occurredAt: input.occurredAt,
+      reason: input.reason || "realtime_revenue_dirty",
+    });
+    return res.json(result);
+  } catch (err) {
+    if (err?.issues) return validationError(res, err);
+    console.error("[traffic/value-refresh/mark-dirty] failed:", err);
+    return serviceError(res, err, "TRAFFIC_VALUE_MARK_DIRTY_FAILED");
+  }
+});
+
+const pendingValueRefreshSchema = z.object({
+  deviceId: z.string().min(1),
+  limit: z.number().int().min(1).max(5000).optional(),
+});
+
+router.post("/creators/:creatorId/value-refresh/pending", async (req, res) => {
+  try {
+    const input = pendingValueRefreshSchema.parse(req.body || {});
+    const result = await getPendingTrafficValueFanIds({
+      deviceId: input.deviceId,
+      userId: actorUserId(req),
+      creatorId: req.params.creatorId,
+      limit: input.limit || 1000,
+    });
+    return res.json(result);
+  } catch (err) {
+    if (err?.issues) return validationError(res, err);
+    console.error("[traffic/value-refresh/pending] failed:", err);
+    return serviceError(res, err, "TRAFFIC_VALUE_PENDING_FAILED");
   }
 });
 

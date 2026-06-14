@@ -330,6 +330,191 @@ async function validateDeviceForCreator({ deviceId, userId, creatorId }) {
   return { device, creator };
 }
 
+async function resolveTrafficIngestContext({ agencyId: agencyHint, deviceId, userId, creatorId }) {
+  const cleanAgencyId = clean(agencyHint, 180);
+  const cleanCreatorId = clean(creatorId, 180);
+
+  // Realtime Electron writes still use device-bound validation.
+  // Catch-up/import paths may be agency-scoped because the worker that scans
+  // missed notifications is not always the same local device bound to creator.
+  if (cleanAgencyId && cleanCreatorId) {
+    const creator = await prisma.creatorAccount.findUnique({ where: { id: cleanCreatorId } });
+    if (!creator || creator.deletedAt) {
+      const err = new Error("Creator not found");
+      err.code = "CREATOR_NOT_FOUND";
+      throw err;
+    }
+    if (creator.agencyId !== cleanAgencyId) {
+      const err = new Error("Creator and agency mismatch");
+      err.code = "CREATOR_AGENCY_MISMATCH";
+      throw err;
+    }
+    return { device: null, creator, agencyId: creator.agencyId, ingestMode: "agency_hint" };
+  }
+
+  const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
+  return { device, creator, agencyId: creator.agencyId, ingestMode: "device_bound" };
+}
+
+async function repairUnattributedSubscriptionAttribution({
+  agencyId,
+  creatorId,
+  fanIds = [],
+  chunkSize = 1000,
+  allowOrganicConfirmed = false,
+  trackOrganicMisses = true,
+  organicConfirmAfterAttempts = 5,
+  organicConfirmMinAgeMs = 24 * 60 * 60 * 1000,
+} = {}) {
+  const cleanAgencyId = clean(agencyId, 180);
+  const cleanCreatorId = clean(creatorId, 180);
+  const uniqueFanIds = Array.from(new Set((fanIds || []).map((id) => clean(id, 180)).filter(Boolean)));
+  if (!cleanAgencyId || !cleanCreatorId || !uniqueFanIds.length) {
+    return { ok: true, repaired: 0, affectedDays: 0 };
+  }
+
+  let repaired = 0;
+  let organicMisses = 0;
+  let organicConfirmed = 0;
+  const recomputeTargets = new Map();
+  const safeChunkSize = Math.max(1, Math.min(2000, Number(chunkSize || 1000)));
+  const organicAttemptLimit = Math.max(1, Math.min(50, Number(organicConfirmAfterAttempts || 5)));
+  const organicCutoff = new Date(Date.now() - Math.max(60_000, Number(organicConfirmMinAgeMs || 0)));
+
+  for (const chunk of chunkArray(uniqueFanIds, safeChunkSize)) {
+    if (!chunk.length) continue;
+
+    const rows = await prisma.$queryRaw`
+      WITH candidates AS (
+        SELECT DISTINCT ON (m."fanId")
+          m."fanId",
+          m."sourceId"
+        FROM "TrafficSourceMember" m
+        WHERE m."agencyId" = ${cleanAgencyId}
+          AND m."creatorId" = ${cleanCreatorId}
+          AND m."fanId" IN (${Prisma.join(chunk)})
+        ORDER BY
+          m."fanId",
+          m."claimedAt" DESC NULLS LAST,
+          m."lastSeenAt" DESC NULLS LAST,
+          m."createdAt" DESC
+      ),
+      updated AS (
+        UPDATE "CreatorSubscriptionLedger" AS l
+        SET
+          "sourceId" = c."sourceId",
+          "organicConfirmed" = false,
+          "attributionAttempts" = 0,
+          "updatedAt" = NOW()
+        FROM candidates c
+        WHERE l."agencyId" = ${cleanAgencyId}
+          AND l."creatorId" = ${cleanCreatorId}
+          AND l."sourceId" IS NULL
+          AND (${allowOrganicConfirmed === true} OR l."organicConfirmed" = false)
+          AND l."fanId" = c."fanId"
+        RETURNING l."sourceId", l."fanId", l."occurredAt"
+      )
+      SELECT
+        "sourceId",
+        "fanId",
+        date_trunc('day', "occurredAt") AS "day",
+        MIN("occurredAt") AS "firstOccurredAt",
+        MAX("occurredAt") AS "lastOccurredAt",
+        COUNT(*)::bigint AS "count"
+      FROM updated
+      GROUP BY "sourceId", "fanId", date_trunc('day', "occurredAt")
+    `;
+
+    const memberRepairPayload = [];
+    for (const row of rows || []) {
+      const sourceId = clean(row.sourceId, 180);
+      const fanId = clean(row.fanId, 180);
+      const day = asDate(row.day);
+      const count = Number(row.count || 0);
+      if (!sourceId || !fanId || !day) continue;
+      repaired += count;
+      recomputeTargets.set(`${sourceId}:${day.toISOString()}`, { sourceId, day });
+      memberRepairPayload.push({
+        sourceId,
+        fanId,
+        firstOccurredAt: isoOrNull(row.firstOccurredAt),
+        lastOccurredAt: isoOrNull(row.lastOccurredAt),
+      });
+    }
+
+    if (memberRepairPayload.length) {
+      await prisma.$executeRaw`
+        UPDATE "TrafficSourceMember" AS m
+        SET
+          "lastRevenueAt" = CASE
+            WHEN m."lastRevenueAt" IS NULL THEN x."lastOccurredAt"
+            WHEN x."lastOccurredAt" IS NULL THEN m."lastRevenueAt"
+            ELSE GREATEST(m."lastRevenueAt", x."lastOccurredAt")
+          END,
+          "convertedAt" = COALESCE(m."convertedAt", x."firstOccurredAt"),
+          "needsValueRefresh" = TRUE
+        FROM jsonb_to_recordset(${JSON.stringify(memberRepairPayload)}::jsonb)
+          AS x("sourceId" text, "fanId" text, "firstOccurredAt" timestamptz, "lastOccurredAt" timestamptz)
+        WHERE m."agencyId" = ${cleanAgencyId}
+          AND m."creatorId" = ${cleanCreatorId}
+          AND m."sourceId" = x."sourceId"
+          AND m."fanId" = x."fanId"
+      `;
+    }
+
+    // Organic discovery / external referrals will never appear in TrafficSourceMember.
+    // Count failed repair attempts and eventually mark them organicConfirmed so future
+    // live/catch-up duplicate repairs do not keep touching permanent sourceId=null rows.
+    if (trackOrganicMisses !== false) {
+      const missedRows = await prisma.$queryRaw`
+        UPDATE "CreatorSubscriptionLedger" AS l
+        SET
+          "attributionAttempts" = l."attributionAttempts" + 1,
+          "organicConfirmed" = CASE
+            WHEN l."occurredAt" < ${organicCutoff}
+             AND (l."attributionAttempts" + 1) >= ${organicAttemptLimit}
+            THEN true
+            ELSE l."organicConfirmed"
+          END,
+          "updatedAt" = NOW()
+        WHERE l."agencyId" = ${cleanAgencyId}
+          AND l."creatorId" = ${cleanCreatorId}
+          AND l."sourceId" IS NULL
+          AND l."organicConfirmed" = false
+          AND l."fanId" IN (${Prisma.join(chunk)})
+          AND NOT EXISTS (
+            SELECT 1
+            FROM "TrafficSourceMember" m
+            WHERE m."agencyId" = ${cleanAgencyId}
+              AND m."creatorId" = ${cleanCreatorId}
+              AND m."fanId" = l."fanId"
+          )
+        RETURNING l."fanId", l."organicConfirmed"
+      `;
+
+      const rows = Array.isArray(missedRows) ? missedRows : [];
+      organicMisses += rows.length;
+      organicConfirmed += rows.filter((row) => row?.organicConfirmed === true).length;
+    }
+  }
+
+  const targets = Array.from(recomputeTargets.values());
+  for (const chunk of chunkArray(targets, 30)) {
+    await prisma.$transaction(async (tx) => {
+      for (const target of chunk) {
+        await recomputeTrafficDailyAggregate(tx, {
+          agencyId: cleanAgencyId,
+          creatorId: cleanCreatorId,
+          sourceId: target.sourceId,
+          day: target.day,
+        });
+      }
+    }, { timeout: 60_000, maxWait: 10_000 });
+  }
+
+  return { ok: true, repaired, affectedDays: targets.length, organicMisses, organicConfirmed };
+}
+
 async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, ttlMs = VALUE_SNAPSHOT_TTL_MS, limit = 1000 }) {
   const uniqueFanIds = Array.from(new Set((fanIds || []).map((x) => clean(x, 180)).filter(Boolean)));
   if (!uniqueFanIds.length) return [];
@@ -523,6 +708,16 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
     }
   }
 
+  const attributionRepair = memberFanIds.length
+    ? await repairUnattributedSubscriptionAttribution({
+        agencyId,
+        creatorId: creator.id,
+        fanIds: memberFanIds,
+        allowOrganicConfirmed: true,
+        trackOrganicMisses: false,
+      }).catch((err) => ({ ok: false, error: err?.message || String(err), repaired: 0, affectedDays: 0 }))
+    : { ok: true, repaired: 0, affectedDays: 0 };
+
   const hydrateFanIds = await selectFanIdsNeedingValueRefresh({
     agencyId,
     creatorId: creator.id,
@@ -537,6 +732,7 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
     deviceId: device.id,
     sourcesUpserted: sourceRows.length,
     membersUpserted: memberUpserts,
+    attributionRepair,
     hydrateFanIds,
   };
 }
@@ -661,9 +857,137 @@ async function upsertTrafficFanValueSnapshots({ deviceId, userId, creatorId, sna
 }
 
 
-async function ingestSubscriptionEvent({ deviceId, userId, creatorId, accountId, event }) {
+async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt = null, reason = null } = {}) {
+  const cleanFanId = clean(fanId, 180);
+  if (!agencyId || !creatorId || !cleanFanId) {
+    return { ok: false, matched: 0, code: "BAD_TRAFFIC_DIRTY_INPUT" };
+  }
+
+  const when = asDate(occurredAt) || new Date();
+  const updated = await prisma.trafficSourceMember.updateMany({
+    where: { agencyId, creatorId, fanId: cleanFanId },
+    data: {
+      lastRevenueAt: when,
+      needsValueRefresh: true,
+    },
+  });
+
+  return { ok: true, matched: updated.count || 0, fanId: cleanFanId, reason: clean(reason, 80) };
+}
+
+
+async function markTrafficFanValueDirtyFromDevice({ deviceId, userId, creatorId, fanId, occurredAt = null, reason = "realtime_revenue" } = {}) {
+  const { creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
+  const dirty = await markTrafficFanValueDirty({
+    agencyId: creator.agencyId,
+    creatorId: creator.id,
+    fanId,
+    occurredAt,
+    reason,
+  });
+
+  let valueRefresh = null;
+  if (dirty?.matched) {
+    valueRefresh = await scheduleTrafficValueRefresh({
+      agencyId: creator.agencyId,
+      creatorId: creator.id,
+      accountId: creator.id,
+      creatorRef: creator.username || creator.displayName || null,
+      reason: clean(reason, 120) || "realtime_revenue_dirty",
+      priority: 95,
+    }).catch((err) => ({ ok: false, error: err?.message || String(err) }));
+  }
+
+  return { ok: true, ...dirty, valueRefresh };
+}
+
+async function getPendingTrafficValueFanIds({ deviceId, userId, creatorId, limit = 1000, ttlMs = VALUE_SNAPSHOT_TTL_MS } = {}) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
-  const agencyId = creator.agencyId;
+  const safeLimit = Math.max(1, Math.min(5000, Number(limit || 1000)));
+  const threshold = new Date(Date.now() - Math.max(60_000, Number(ttlMs || VALUE_SNAPSHOT_TTL_MS)));
+
+  const rows = await prisma.trafficSourceMember.findMany({
+    where: {
+      agencyId: creator.agencyId,
+      creatorId: creator.id,
+      OR: [
+        { needsValueRefresh: true },
+        { lastValueFetchedAt: null },
+        { lastValueFetchedAt: { lt: threshold } },
+      ],
+    },
+    select: { fanId: true, lastRevenueAt: true, lastSeenAt: true, updatedAt: true },
+    orderBy: [
+      { lastRevenueAt: "desc" },
+      { lastSeenAt: "desc" },
+      { updatedAt: "desc" },
+    ],
+    take: safeLimit * 3,
+  });
+
+  const fanIds = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const fanId = clean(row.fanId, 180);
+    if (!fanId || seen.has(fanId)) continue;
+    seen.add(fanId);
+    fanIds.push(fanId);
+    if (fanIds.length >= safeLimit) break;
+  }
+
+  return {
+    ok: true,
+    agencyId: creator.agencyId,
+    creatorId: creator.id,
+    deviceId: device.id,
+    fanIds,
+    pending: fanIds.length,
+    limit: safeLimit,
+    threshold: threshold.toISOString(),
+  };
+}
+
+async function scheduleTrafficValueRefresh({ agencyId, creatorId, accountId = null, creatorRef = null, reason = "traffic_value_dirty", priority = 95, now = new Date() } = {}) {
+  if (!agencyId || !creatorId) return { created: false, reason: "missing_scope" };
+
+  const cleanAccountId = clean(accountId || creatorId, 180) || creatorId;
+  const cleanCreatorRef = clean(creatorRef, 180);
+
+  return ensureSingleJob({
+    jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
+    creatorId,
+    agencyId,
+    params: {
+      hydrateOnly: true,
+      sourceScan: false,
+      hydrateFanValues: true,
+      hydrateLimit: 1000,
+      valueTtlHours: 6,
+      reason: clean(reason, 120) || "traffic_value_dirty",
+      accountId: cleanAccountId,
+      localAccountId: cleanAccountId,
+      accountManifestId: cleanAccountId,
+      creatorUsername: cleanCreatorRef,
+      username: cleanCreatorRef,
+      scheduledFromObservationAt: now.toISOString(),
+    },
+    priority,
+    now,
+    // Dirty value hydrate jobs are cheap and idempotent. Keep the cooldown short
+    // so live WS/catch-up revenue can refresh LTV without waiting for a full
+    // source/member rescan, while still avoiding one job per event.
+    freshnessWindowMs: 2 * 60 * 1000,
+  });
+}
+
+
+async function ingestSubscriptionEvent({ agencyId: agencyHint, deviceId, userId, creatorId, accountId, event }) {
+  const { creator, agencyId, ingestMode } = await resolveTrafficIngestContext({
+    agencyId: agencyHint,
+    deviceId,
+    userId,
+    creatorId,
+  });
   const fanId = clean(event?.fanId, 180);
   const amountCents = cents(event?.amountCents) || moneyCents(event?.amount || event?.price);
   const occurredAt = asDate(event?.occurredAt || event?.createdAt || event?.ts) || new Date();
@@ -719,7 +1043,28 @@ async function ingestSubscriptionEvent({ deviceId, userId, creatorId, accountId,
       return row;
     });
 
-    return { ok: true, ledgerId: created.id, sourceId: created.sourceId, amountCents };
+    let attributionRepair = null;
+    if (!created.sourceId) {
+      attributionRepair = await repairUnattributedSubscriptionAttribution({
+        agencyId,
+        creatorId: creator.id,
+        fanIds: [created.fanId],
+      }).catch((err) => ({ ok: false, error: err?.message || String(err), repaired: 0 }));
+    }
+
+    let valueRefresh = null;
+    if (created.sourceId || attributionRepair?.repaired > 0) {
+      valueRefresh = await scheduleTrafficValueRefresh({
+        agencyId,
+        creatorId: creator.id,
+        accountId: data.accountId,
+        creatorRef: creator.username || creator.displayName || null,
+        reason: "realtime_subscription_dirty",
+        priority: 105,
+      }).catch((err) => ({ ok: false, error: err?.message || String(err) }));
+    }
+
+    return { ok: true, ledgerId: created.id, sourceId: created.sourceId, amountCents, attributionRepair, valueRefresh, ingestMode };
   } catch (err) {
     if (err?.code !== "P2002") throw err;
 
@@ -740,7 +1085,27 @@ async function ingestSubscriptionEvent({ deviceId, userId, creatorId, accountId,
       });
     }
 
-    return { ok: true, duplicate: true, repaired: !!existing, eventHash };
+    const attributionRepair = existing && !existing.sourceId
+      ? await repairUnattributedSubscriptionAttribution({
+          agencyId,
+          creatorId: creator.id,
+          fanIds: [existing.fanId],
+        }).catch((err) => ({ ok: false, error: err?.message || String(err), repaired: 0 }))
+      : { ok: true, repaired: 0 };
+
+    let valueRefresh = null;
+    if (existing?.sourceId || attributionRepair?.repaired > 0) {
+      valueRefresh = await scheduleTrafficValueRefresh({
+        agencyId,
+        creatorId: creator.id,
+        accountId: clean(accountId || event?.accountId || creator.id, 180) || creator.id,
+        creatorRef: creator.username || creator.displayName || null,
+        reason: "duplicate_subscription_repair_dirty",
+        priority: 95,
+      }).catch((err) => ({ ok: false, error: err?.message || String(err) }));
+    }
+
+    return { ok: true, duplicate: true, repaired: !!existing, attributionRepair, eventHash, valueRefresh, ingestMode };
   }
 }
 
@@ -1500,9 +1865,14 @@ module.exports = {
   VALUE_SNAPSHOT_TTL_MS,
   upsertTrafficSourceScan,
   upsertTrafficFanValueSnapshots,
+  markTrafficFanValueDirty,
+  getPendingTrafficValueFanIds,
+  markTrafficFanValueDirtyFromDevice,
   ingestSubscriptionEvent,
   getTrafficOverview,
   getTrafficSourceMembers,
   updateTrafficSourceCost,
   scheduleTrafficRefresh,
+  scheduleTrafficValueRefresh,
+  repairUnattributedSubscriptionAttribution,
 };

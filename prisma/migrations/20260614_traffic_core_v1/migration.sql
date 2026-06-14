@@ -77,6 +77,8 @@ CREATE TABLE "CreatorSubscriptionLedger" (
   "eventHash" TEXT NOT NULL,
   "source" TEXT NOT NULL DEFAULT 'realtime',
   "metadata" JSONB,
+  "attributionAttempts" INTEGER NOT NULL DEFAULT 0,
+  "organicConfirmed" BOOLEAN NOT NULL DEFAULT false,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "updatedAt" TIMESTAMP(3) NOT NULL,
   CONSTRAINT "CreatorSubscriptionLedger_pkey" PRIMARY KEY ("id")
@@ -115,6 +117,7 @@ CREATE INDEX "TrafficFanValueSnapshot_agencyId_creatorId_fetchedAt_idx" ON "Traf
 CREATE UNIQUE INDEX "CreatorSubscriptionLedger_agencyId_eventHash_key" ON "CreatorSubscriptionLedger"("agencyId", "eventHash");
 CREATE INDEX "CreatorSubscriptionLedger_agencyId_creatorId_fanId_occurredAt_idx" ON "CreatorSubscriptionLedger"("agencyId", "creatorId", "fanId", "occurredAt");
 CREATE INDEX "CreatorSubscriptionLedger_agencyId_creatorId_sourceId_occurredAt_idx" ON "CreatorSubscriptionLedger"("agencyId", "creatorId", "sourceId", "occurredAt");
+CREATE INDEX "CreatorSubscriptionLedger_agencyId_creatorId_organicConfirmed_attributionAttempts_idx" ON "CreatorSubscriptionLedger"("agencyId", "creatorId", "organicConfirmed", "attributionAttempts");
 
 CREATE UNIQUE INDEX "TrafficDailyAggregate_sourceId_day_key" ON "TrafficDailyAggregate"("sourceId", "day");
 CREATE INDEX "TrafficDailyAggregate_agencyId_creatorId_day_idx" ON "TrafficDailyAggregate"("agencyId", "creatorId", "day");

@@ -4,6 +4,11 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { upsertPurchaseFromEvent } = require("./team-ppv-ledger-service");
 const { ingestTipEvent } = require("./team-tip-ledger-service");
+const {
+  ingestSubscriptionEvent,
+  markTrafficFanValueDirty,
+  scheduleTrafficValueRefresh,
+} = require("./traffic-service");
 
 const CATCHUP_JOB_KEY = "catchup_notifications_scan";
 const DEFAULT_BUFFER_MS = 2 * 60 * 60 * 1000;
@@ -100,7 +105,7 @@ async function findActiveCatchupJob({ agencyId, creatorId }) {
   });
 }
 
-async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, deviceId, from, to, types = ["purchases", "tips"], reason = "offline_gap", now = new Date() }) {
+async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, deviceId, from, to, types = ["purchases", "tips", "subscriptions"], reason = "offline_gap", now = new Date() }) {
   const active = await findActiveCatchupJob({ agencyId, creatorId });
   if (active) return { created: false, reason: "already_in_flight", jobId: active.id };
 
@@ -210,7 +215,7 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
   }).catch(() => null);
 
   const window = computeCatchupWindow(prev, now);
-  const scanTypes = ["purchases", "tips"];
+  const scanTypes = ["purchases", "tips", "subscriptions"];
 
   const updateData = {
     accountId,
@@ -321,10 +326,28 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     received: events.length,
     ppvCreatedOrUpdated: 0,
     tipCreatedOrUpdated: 0,
+    subscriptionCreatedOrUpdated: 0,
+    trafficValueDirtyMembers: 0,
+    trafficHydrateScheduled: false,
     deduped: 0,
     skipped: 0,
     errors: 0,
   };
+
+  const markTrafficDirty = async (ev, reason) => {
+    const fanId = clean(ev.fanId || ev.dialogId, 160);
+    if (!fanId) return null;
+    const dirty = await markTrafficFanValueDirty({
+      agencyId: job.agencyId,
+      creatorId: job.creatorId,
+      fanId,
+      occurredAt: dateOrNull(ev.receivedAt || ev.purchasedAt || ev.occurredAt || ev.ts) || now,
+      reason,
+    });
+    if (dirty?.matched) summary.trafficValueDirtyMembers += Number(dirty.matched || 0);
+    return dirty;
+  };
+
 
   for (const raw of events) {
     const ev = normalizeEvent(raw);
@@ -361,6 +384,7 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
           },
         });
         summary.ppvCreatedOrUpdated += 1;
+        await markTrafficDirty(ev, "catchup_ppv_purchase");
         continue;
       }
 
@@ -389,6 +413,38 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
         });
         if (tipResult?.deduped) summary.deduped += 1;
         else summary.tipCreatedOrUpdated += 1;
+        await markTrafficDirty(ev, "catchup_tip");
+        continue;
+      }
+
+      if (type.includes("subscription") || type.includes("subscrib")) {
+        const subscriptionResult = await ingestSubscriptionEvent({
+          agencyId: job.agencyId,
+          deviceId,
+          userId,
+          creatorId: job.creatorId,
+          accountId,
+          event: {
+            fanId: clean(ev.fanId || ev.dialogId, 160),
+            eventType: clean(ev.eventType || "paid_subscribed", 80) || "paid_subscribed",
+            amountCents: amountCents(ev.amountCents) || amountDollarsToCents(ev.amount),
+            amount: ev.amount,
+            price: ev.price,
+            currency: clean(ev.currency || "USD", 8) || "USD",
+            occurredAt: dateOrNull(ev.subscribedAt || ev.occurredAt || ev.ts) || now,
+            externalEventId: clean(ev.externalEventId || ev.notificationId || ev.localId, 220),
+            eventHash: clean(ev.eventHash, 220),
+            notificationId: clean(ev.notificationId, 220),
+            source: "catchup_notifications_scan",
+            metadata: {
+              fanUsername: clean(ev.fanUsername || ev.username, 120),
+              fanName: clean(ev.fanName || ev.name, 160),
+              targetUrl: clean(ev.targetUrl, 500),
+            },
+          },
+        });
+        if (subscriptionResult?.duplicate) summary.deduped += 1;
+        else if (!subscriptionResult?.ignored) summary.subscriptionCreatedOrUpdated += 1;
         continue;
       }
 
@@ -400,8 +456,22 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     }
   }
 
+  if (summary.trafficValueDirtyMembers > 0 || summary.subscriptionCreatedOrUpdated > 0) {
+    const scheduled = await scheduleTrafficValueRefresh({
+      agencyId: job.agencyId,
+      creatorId: job.creatorId,
+      accountId: clean(params.accountId || job.creatorId || "unknown", 160) || "unknown",
+      creatorRef: clean(params.creatorRef, 160),
+      reason: "catchup_revenue_dirty",
+      priority: 100,
+    }).catch((err) => ({ created: false, reason: err?.message || String(err) }));
+    summary.trafficHydrateScheduled = !!scheduled?.created;
+    summary.trafficHydrateJobId = scheduled?.jobId || null;
+    summary.trafficHydrateReason = scheduled?.reason || null;
+  }
+
   const scanTo = dateOrNull(params.to || result?.to) || now;
-  const types = Array.isArray(params.types) ? params.types.map(String) : ["purchases", "tips"];
+  const types = Array.isArray(params.types) ? params.types.map(String) : ["purchases", "tips", "subscriptions"];
   const data = {
     currentScanStatus: "idle",
     currentScanFrom: null,
