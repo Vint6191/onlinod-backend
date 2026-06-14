@@ -257,6 +257,36 @@ async function createResolveJobIfNeeded(payload) {
   });
 }
 
+
+async function findExistingPurchaseBySemanticKey({ agencyId, accountId, messageId, fanId, dialogId, amountCents, purchasedAt }) {
+  const safeMessageId = clean(messageId, 160);
+  if (!safeMessageId) return null;
+  const safeAgencyId = clean(agencyId, 160);
+  const safeAccountId = clean(accountId, 160) || "unknown";
+  const safeFanId = clean(fanId, 160);
+  const safeDialogId = clean(dialogId, 160);
+  const t = safeDate(purchasedAt).getTime();
+  const from = new Date(t - 24 * 60 * 60 * 1000);
+  const to = new Date(t + 24 * 60 * 60 * 1000);
+
+  const rows = await prisma.teamPpvPurchaseLedger.findMany({
+    where: {
+      agencyId: safeAgencyId,
+      accountId: safeAccountId,
+      messageId: safeMessageId,
+      purchasedAt: { gte: from, lte: to },
+      ...(Number(amountCents || 0) > 0 ? { amountCents: Number(amountCents) } : {}),
+    },
+    orderBy: { createdAt: "desc" },
+    take: 10,
+  }).catch(() => []);
+
+  return (rows || []).find((row) => {
+    if (!safeFanId && !safeDialogId) return true;
+    return !row.fanId || row.fanId === safeFanId || row.fanId === safeDialogId || row.dialogId === safeFanId || row.dialogId === safeDialogId;
+  }) || null;
+}
+
 async function upsertPurchaseFromEvent(row) {
   const event = row || {};
   const extra = extraOf(event);
@@ -264,7 +294,7 @@ async function upsertPurchaseFromEvent(row) {
   if (!agencyId) return null;
 
   const accountId = eventAccount(event);
-  const purchaseId = purchaseIdFromEvent(event);
+  let purchaseId = purchaseIdFromEvent(event);
   const messageId = eventMessageId(event);
   const amountCents = Math.max(0, int(extra.amountCents || extra.amount_cents || extra.priceCents || 0, 0));
   const purchasedAt = safeDate(extra.purchasedAt || extra.purchasedAtMs || extra.createdAt || event.ts);
@@ -294,9 +324,29 @@ async function upsertPurchaseFromEvent(row) {
     resolvedSource: attributedMemberId ? clean(extra.source || "telemetry", 80) : null,
   };
 
-  const existing = await prisma.teamPpvPurchaseLedger.findUnique({
+  let existing = await prisma.teamPpvPurchaseLedger.findUnique({
     where: { agencyId_purchaseId: { agencyId, purchaseId } },
   });
+
+  if (!existing && messageId) {
+    existing = await findExistingPurchaseBySemanticKey({
+      agencyId,
+      accountId,
+      messageId,
+      fanId: payload.fanId,
+      dialogId: payload.dialogId,
+      amountCents,
+      purchasedAt,
+    });
+
+    if (existing?.purchaseId) {
+      // Catch-up and realtime can expose different upstream ids for the same
+      // real purchase. Preserve the original ledger purchaseId and update that
+      // row instead of creating a second revenue row.
+      purchaseId = existing.purchaseId;
+      payload.purchaseId = existing.purchaseId;
+    }
+  }
 
   if (existing?.attributedMemberId && !attributedMemberId) {
     // Unresolved duplicate arrived after attribution. Do not downgrade a sale.

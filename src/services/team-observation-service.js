@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { upsertPurchaseFromEvent } = require("./team-ppv-ledger-service");
 const { ingestTipEvent } = require("./team-tip-ledger-service");
@@ -59,7 +60,9 @@ function amountDollarsToCents(value) {
 }
 
 function stableHashSeed(value) {
-  try { return JSON.stringify(value); } catch (_) { return String(value || ""); }
+  let raw = "";
+  try { raw = JSON.stringify(value); } catch (_) { raw = String(value || ""); }
+  return `ppv_${crypto.createHash("sha1").update(raw).digest("hex").slice(0, 24)}`;
 }
 
 function resolveAccountRefs(account = {}) {
@@ -97,32 +100,80 @@ async function findActiveCatchupJob({ agencyId, creatorId }) {
   });
 }
 
-async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, deviceId, from, to, types = ["purchases", "tips"], reason = "offline_gap" }) {
+async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, deviceId, from, to, types = ["purchases", "tips"], reason = "offline_gap", now = new Date() }) {
   const active = await findActiveCatchupJob({ agencyId, creatorId });
   if (active) return { created: false, reason: "already_in_flight", jobId: active.id };
 
-  const job = await prisma.jobInstance.create({
-    data: {
-      jobKey: CATCHUP_JOB_KEY,
-      scope: "creator",
+  const lockUntil = new Date(now.getTime() + DEFAULT_LOCK_MS);
+
+  // One-row state lock. This is intentionally not an audit/job log: it only
+  // prevents two devices from scheduling the same catch-up window at once.
+  const locked = await prisma.teamObservationState.updateMany({
+    where: {
       agencyId,
       creatorId,
-      priority: 80,
-      nextRunAt: new Date(),
-      params: {
-        accountId: accountId || creatorId,
-        creatorRef: creatorRef || null,
-        from: from.toISOString(),
-        to: to.toISOString(),
-        types,
-        reason,
-        bufferMinutes: Math.round(DEFAULT_BUFFER_MS / 60000),
-        requestedByDeviceId: deviceId || null,
-      },
+      OR: [
+        { lockedUntil: null },
+        { lockedUntil: { lt: now } },
+        { currentScanStatus: { in: ["idle", "error"] } },
+      ],
+    },
+    data: {
+      currentScanStatus: "queued",
+      currentScanFrom: from,
+      currentScanTo: to,
+      currentScanTypes: types,
+      lockedByDeviceId: clean(deviceId, 160),
+      lockedUntil,
+      lastErrorCode: null,
+      lastErrorAt: null,
     },
   });
 
-  return { created: true, jobId: job.id };
+  if (locked.count === 0) {
+    const state = await prisma.teamObservationState.findUnique({
+      where: { agencyId_creatorId: { agencyId, creatorId } },
+      select: { currentScanStatus: true, lockedUntil: true, lockedByDeviceId: true },
+    }).catch(() => null);
+    return { created: false, reason: "state_locked", state };
+  }
+
+  try {
+    const job = await prisma.jobInstance.create({
+      data: {
+        jobKey: CATCHUP_JOB_KEY,
+        scope: "creator",
+        agencyId,
+        creatorId,
+        priority: 80,
+        nextRunAt: new Date(),
+        params: {
+          accountId: accountId || creatorId,
+          creatorRef: creatorRef || null,
+          from: from.toISOString(),
+          to: to.toISOString(),
+          types,
+          reason,
+          bufferMinutes: Math.round(DEFAULT_BUFFER_MS / 60000),
+          requestedByDeviceId: deviceId || null,
+        },
+      },
+    });
+
+    return { created: true, jobId: job.id };
+  } catch (err) {
+    await prisma.teamObservationState.updateMany({
+      where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
+      data: {
+        currentScanStatus: "error",
+        lockedByDeviceId: null,
+        lockedUntil: null,
+        lastErrorCode: clean(err?.message || err, 500) || "catchup_schedule_failed",
+        lastErrorAt: new Date(),
+      },
+    }).catch(() => null);
+    throw err;
+  }
 }
 
 function computeCatchupWindow(prev, now = new Date()) {
@@ -160,8 +211,25 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
 
   const window = computeCatchupWindow(prev, now);
   const scanTypes = ["purchases", "tips"];
-  let scheduled = null;
 
+  const updateData = {
+    accountId,
+    creatorRef,
+    lastHeartbeatAt: now,
+    lastObservedAt: maxDate(now, prev?.lastObservedAt),
+  };
+
+  let state = await prisma.teamObservationState.upsert({
+    where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
+    create: {
+      agencyId,
+      creatorId: creator.id,
+      ...updateData,
+    },
+    update: updateData,
+  });
+
+  let scheduled = null;
   if (window.needed) {
     scheduled = await scheduleCatchupJob({
       agencyId,
@@ -173,35 +241,12 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
       to: window.to,
       types: scanTypes,
       reason: window.reason,
+      now,
     });
+    state = await prisma.teamObservationState.findUnique({
+      where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
+    }).catch(() => state);
   }
-
-  const updateData = {
-    accountId,
-    creatorRef,
-    lastHeartbeatAt: now,
-    lastObservedAt: maxDate(now, prev?.lastObservedAt),
-    ...(window.needed ? {
-      currentScanStatus: scheduled?.created ? "queued" : (prev?.currentScanStatus || "idle"),
-      currentScanFrom: window.from,
-      currentScanTo: window.to,
-      currentScanTypes: scanTypes,
-      lockedByDeviceId: scheduled?.created ? clean(deviceId, 160) : (prev?.lockedByDeviceId || null),
-      lockedUntil: scheduled?.created ? new Date(now.getTime() + DEFAULT_LOCK_MS) : (prev?.lockedUntil || null),
-      lastErrorCode: null,
-      lastErrorAt: null,
-    } : {}),
-  };
-
-  const state = await prisma.teamObservationState.upsert({
-    where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
-    create: {
-      agencyId,
-      creatorId: creator.id,
-      ...updateData,
-    },
-    update: updateData,
-  });
 
   return { ok: true, creatorId: creator.id, accountId, state, catchup: window.needed ? { ...window, scheduled } : { needed: false } };
 }
@@ -226,6 +271,36 @@ async function updateObservationFromHeartbeat({ agencyId, deviceId, accounts = [
     scheduled: results.filter((r) => r?.catchup?.scheduled?.created).length,
     results,
   };
+}
+
+
+async function recordRealtimeObservationPing({ agencyId, deviceId, account, now = new Date() }) {
+  const creator = await resolveCreatorForObservation({ agencyId, account });
+  if (!creator?.id) return { ok: false, code: "CREATOR_NOT_FOUND" };
+
+  const accountId = clean(account?.accountId || account?.creatorId || account?.backendCreatorId || creator.id, 160) || creator.id;
+  const creatorRef = clean(account?.username || creator.username || account?.displayName || creator.displayName || null, 160);
+
+  const state = await prisma.teamObservationState.upsert({
+    where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
+    create: {
+      agencyId,
+      creatorId: creator.id,
+      accountId,
+      creatorRef,
+      lastRealtimeEventAt: now,
+      lastObservedAt: now,
+      lockedByDeviceId: clean(deviceId, 160),
+    },
+    update: {
+      accountId,
+      creatorRef,
+      lastRealtimeEventAt: now,
+      lastObservedAt: now,
+    },
+  });
+
+  return { ok: true, creatorId: creator.id, accountId, state };
 }
 
 function eventList(result) {
@@ -271,7 +346,9 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
           ts: dateOrNull(ev.occurredAt || ev.purchasedAt || ev.ts)?.getTime?.() || Date.now(),
           localId: clean(ev.localId || ev.purchaseId || ev.notificationId || ev.messageId || null, 220),
           extra: {
-            purchaseId: clean(ev.purchaseId || ev.notificationId || ev.transactionId || ev.localId || null, 220) || stableHashSeed([accountId, ev.messageId, ev.fanId, ev.amountCents, ev.occurredAt]),
+            // Scanner already canonicalizes purchaseId to match realtime. Keep
+            // notificationId first as a final backend guard for old scanner builds.
+            purchaseId: clean(ev.notificationId || ev.purchaseId || ev.transactionId || ev.localId || null, 220) || stableHashSeed([accountId, ev.messageId, ev.fanId, ev.amountCents, ev.occurredAt]),
             notificationId: clean(ev.notificationId, 220),
             messageId: clean(ev.messageId, 160),
             dialogId: clean(ev.dialogId || ev.fanId, 160),
@@ -383,6 +460,7 @@ async function recordCatchupJobFailure({ job, error }) {
 module.exports = {
   CATCHUP_JOB_KEY,
   updateObservationFromHeartbeat,
+  recordRealtimeObservationPing,
   applyCatchupJobResult,
   recordCatchupJobFailure,
 };

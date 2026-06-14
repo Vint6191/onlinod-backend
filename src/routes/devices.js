@@ -2,7 +2,7 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { authRequired } = require("../middleware/auth");
-const { updateObservationFromHeartbeat } = require("../services/team-observation-service");
+const { updateObservationFromHeartbeat, recordRealtimeObservationPing } = require("../services/team-observation-service");
 
 const router = express.Router();
 router.use(authRequired);
@@ -199,6 +199,44 @@ router.post("/heartbeat", async (req, res) => {
 
     console.error("[devices/heartbeat] failed:", err);
     return res.status(500).json({ ok: false, code: "DEVICE_HEARTBEAT_FAILED", error: "Device heartbeat failed" });
+  }
+});
+
+const realtimePingSchema = z.object({
+  deviceId: z.string().min(3).max(160),
+  agencyId: z.string().optional().nullable(),
+  activeAgencyId: z.string().optional().nullable(),
+  accountId: z.string().optional().nullable(),
+  creatorId: z.string().optional().nullable(),
+  backendCreatorId: z.string().optional().nullable(),
+  remoteId: z.union([z.string(), z.number()]).optional().nullable(),
+  username: z.string().optional().nullable(),
+  displayName: z.string().optional().nullable(),
+}).passthrough();
+
+router.post("/realtime-ping", async (req, res) => {
+  try {
+    const input = realtimePingSchema.parse(req.body || {});
+    const agencyId = input.agencyId || input.activeAgencyId || req.auth.agencyId;
+
+    const device = await prisma.workerDevice.findUnique({ where: { id: input.deviceId } });
+    if (!device || device.userId !== req.auth.userId || device.agencyId !== agencyId) {
+      return res.status(403).json({ ok: false, code: "NOT_YOUR_DEVICE", error: "Invalid device" });
+    }
+
+    const result = await recordRealtimeObservationPing({
+      agencyId,
+      deviceId: input.deviceId,
+      account: input,
+    });
+
+    return res.json(result);
+  } catch (err) {
+    if (err?.issues) {
+      return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
+    }
+    console.error("[devices/realtime-ping] failed:", err);
+    return res.status(500).json({ ok: false, code: "REALTIME_PING_FAILED", error: "Realtime ping failed" });
   }
 });
 
