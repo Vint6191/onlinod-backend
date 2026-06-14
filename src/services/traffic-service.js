@@ -626,7 +626,7 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
     if (range.end) revenueWhere.occurredAt.lt = range.end;
   }
 
-  const [sources, membersCount, revenue] = await Promise.all([
+  const [sources, membersCount, revenue, lastTrafficJob] = await Promise.all([
     prisma.trafficSource.findMany({
       where: { agencyId: creator.agencyId, creatorId: creator.id },
       orderBy: [{ updatedAt: "desc" }],
@@ -641,6 +641,27 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
       where: revenueWhere,
       _sum: { amountCents: true },
       _count: { _all: true },
+    }),
+    prisma.jobInstance.findFirst({
+      where: {
+        agencyId: creator.agencyId,
+        creatorId: creator.id,
+        jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
+      },
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        status: true,
+        attempts: true,
+        createdAt: true,
+        claimedAt: true,
+        completedAt: true,
+        nextRunAt: true,
+        leaseUntil: true,
+        lastError: true,
+        result: true,
+        params: true,
+      },
     }),
   ]);
 
@@ -796,6 +817,19 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
     },
     buckets: Array.from(bucketsByType.values()).sort((a, b) => Number(b.revenueCents || 0) - Number(a.revenueCents || 0)),
     sources: rows.sort((a, b) => Number(b.revenueCents || 0) - Number(a.revenueCents || 0)),
+    lastTrafficJob: lastTrafficJob ? {
+      id: lastTrafficJob.id,
+      status: lastTrafficJob.status,
+      attempts: lastTrafficJob.attempts,
+      createdAt: lastTrafficJob.createdAt,
+      claimedAt: lastTrafficJob.claimedAt,
+      completedAt: lastTrafficJob.completedAt,
+      nextRunAt: lastTrafficJob.nextRunAt,
+      leaseUntil: lastTrafficJob.leaseUntil,
+      lastError: lastTrafficJob.lastError,
+      result: lastTrafficJob.result || null,
+      params: lastTrafficJob.params || null,
+    } : null,
   };
 }
 
