@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
 
@@ -30,6 +31,43 @@ function moneyCents(value) {
 function cents(value) {
   const n = Number(value || 0);
   return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
+}
+
+function dbNumber(value) {
+  if (typeof value === "bigint") return Number(value);
+  if (value && typeof value === "object" && typeof value.toNumber === "function") return value.toNumber();
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function valueStatsSeed() {
+  return {
+    valueSnapshotMembers: 0,
+    valuePendingMembers: 0,
+    valuePayingFans: 0,
+    fanValueCents: 0,
+    valueMessagesCents: 0,
+    valueTipsCents: 0,
+    valueSubscribesCents: 0,
+    valuePostsCents: 0,
+    valueStreamsCents: 0,
+    lastValueFetchedAt: null,
+  };
+}
+
+function normalizeValueStatsRow(row = {}) {
+  return {
+    valueSnapshotMembers: dbNumber(row.valueSnapshotMembers),
+    valuePendingMembers: 0,
+    valuePayingFans: dbNumber(row.valuePayingFans),
+    fanValueCents: dbNumber(row.fanValueCents),
+    valueMessagesCents: dbNumber(row.valueMessagesCents),
+    valueTipsCents: dbNumber(row.valueTipsCents),
+    valueSubscribesCents: dbNumber(row.valueSubscribesCents),
+    valuePostsCents: dbNumber(row.valuePostsCents),
+    valueStreamsCents: dbNumber(row.valueStreamsCents),
+    lastValueFetchedAt: row.lastValueFetchedAt || null,
+  };
 }
 
 function stableHash(parts) {
@@ -500,6 +538,80 @@ async function assertTrafficViewer({ userId, creatorId }) {
   return { creator, member };
 }
 
+async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
+  const uniqueSourceIds = Array.from(new Set((sourceIds || []).map((id) => clean(id, 180)).filter(Boolean)));
+  const bySource = new Map();
+  const totals = valueStatsSeed();
+
+  if (!uniqueSourceIds.length) {
+    return { bySource, totals };
+  }
+
+  const sourceRows = await prisma.$queryRaw`
+    SELECT
+      m."sourceId" AS "sourceId",
+      COUNT(v."fanId")::bigint AS "valueSnapshotMembers",
+      COUNT(CASE WHEN v."totalSummCents" > 0 THEN 1 END)::bigint AS "valuePayingFans",
+      COALESCE(SUM(v."totalSummCents"), 0)::bigint AS "fanValueCents",
+      COALESCE(SUM(v."messagesSummCents"), 0)::bigint AS "valueMessagesCents",
+      COALESCE(SUM(v."tipsSummCents"), 0)::bigint AS "valueTipsCents",
+      COALESCE(SUM(v."subscribesSummCents"), 0)::bigint AS "valueSubscribesCents",
+      COALESCE(SUM(v."postsSummCents"), 0)::bigint AS "valuePostsCents",
+      COALESCE(SUM(v."streamsSummCents"), 0)::bigint AS "valueStreamsCents",
+      MAX(v."fetchedAt") AS "lastValueFetchedAt"
+    FROM "TrafficSourceMember" m
+    LEFT JOIN "TrafficFanValueSnapshot" v
+      ON v."agencyId" = m."agencyId"
+     AND v."creatorId" = m."creatorId"
+     AND v."fanId" = m."fanId"
+    WHERE m."agencyId" = ${agencyId}
+      AND m."creatorId" = ${creatorId}
+      AND m."sourceId" IN (${Prisma.join(uniqueSourceIds)})
+    GROUP BY m."sourceId"
+  `;
+
+  for (const row of sourceRows || []) {
+    bySource.set(String(row.sourceId), normalizeValueStatsRow(row));
+  }
+
+  const totalRows = await prisma.$queryRaw`
+    SELECT
+      COUNT(*)::bigint AS "valueSnapshotMembers",
+      COUNT(CASE WHEN x."totalSummCents" > 0 THEN 1 END)::bigint AS "valuePayingFans",
+      COALESCE(SUM(x."totalSummCents"), 0)::bigint AS "fanValueCents",
+      COALESCE(SUM(x."messagesSummCents"), 0)::bigint AS "valueMessagesCents",
+      COALESCE(SUM(x."tipsSummCents"), 0)::bigint AS "valueTipsCents",
+      COALESCE(SUM(x."subscribesSummCents"), 0)::bigint AS "valueSubscribesCents",
+      COALESCE(SUM(x."postsSummCents"), 0)::bigint AS "valuePostsCents",
+      COALESCE(SUM(x."streamsSummCents"), 0)::bigint AS "valueStreamsCents",
+      MAX(x."fetchedAt") AS "lastValueFetchedAt"
+    FROM (
+      SELECT DISTINCT ON (m."fanId")
+        m."fanId",
+        v."totalSummCents",
+        v."messagesSummCents",
+        v."tipsSummCents",
+        v."subscribesSummCents",
+        v."postsSummCents",
+        v."streamsSummCents",
+        v."fetchedAt"
+      FROM "TrafficSourceMember" m
+      JOIN "TrafficFanValueSnapshot" v
+        ON v."agencyId" = m."agencyId"
+       AND v."creatorId" = m."creatorId"
+       AND v."fanId" = m."fanId"
+      WHERE m."agencyId" = ${agencyId}
+        AND m."creatorId" = ${creatorId}
+      ORDER BY m."fanId", v."fetchedAt" DESC
+    ) x
+  `;
+
+  return {
+    bySource,
+    totals: normalizeValueStatsRow((totalRows || [])[0] || {}),
+  };
+}
+
 async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
   const { creator } = await assertTrafficViewer({ userId, creatorId });
   const range = rangeWindow(rangeKey);
@@ -531,6 +643,12 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
     }),
   ]);
 
+  const valueStats = await getTrafficValueStats({
+    agencyId: creator.agencyId,
+    creatorId: creator.id,
+    sourceIds: sources.map((source) => source.id),
+  });
+
   const revenueBySource = new Map(revenue.map((row) => [row.sourceId || "", row]));
   const rows = sources.map((source) => {
     const rev = revenueBySource.get(source.id);
@@ -538,7 +656,10 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
     const paidSubscriptions = Number(rev?._count?._all || 0);
     const revenueCents = Number(rev?._sum?.amountCents || 0);
     const costCents = Number(source.costCents || 0);
+    const value = { ...valueStatsSeed(), ...(valueStats.bySource.get(source.id) || {}) };
+    value.valuePendingMembers = Math.max(0, claimers - Number(value.valueSnapshotMembers || 0));
     const roiPercent = costCents > 0 ? ((revenueCents - costCents) / costCents) * 100 : null;
+    const valueRoiPercent = costCents > 0 ? ((Number(value.fanValueCents || 0) - costCents) / costCents) * 100 : null;
     return {
       id: source.id,
       sourceType: source.sourceType,
@@ -552,6 +673,17 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
       revenueCents,
       costCents,
       roiPercent,
+      valueRoiPercent,
+      valueSnapshotMembers: value.valueSnapshotMembers,
+      valuePendingMembers: value.valuePendingMembers,
+      valuePayingFans: value.valuePayingFans,
+      fanValueCents: value.fanValueCents,
+      valueMessagesCents: value.valueMessagesCents,
+      valueTipsCents: value.valueTipsCents,
+      valueSubscribesCents: value.valueSubscribesCents,
+      valuePostsCents: value.valuePostsCents,
+      valueStreamsCents: value.valueStreamsCents,
+      lastValueFetchedAt: value.lastValueFetchedAt,
       lastScannedAt: source.lastScannedAt,
       updatedAt: source.updatedAt,
       bucket: "tracked_source",
@@ -575,6 +707,14 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
       revenueCents: unknownRevenueCents,
       costCents: 0,
       roiPercent: null,
+      valueRoiPercent: null,
+      valueSnapshotMembers: 0,
+      valuePendingMembers: 0,
+      valuePayingFans: unknownPaidSubscriptions,
+      fanValueCents: unknownRevenueCents,
+      valueMessagesCents: 0,
+      valueTipsCents: 0,
+      valueSubscribesCents: unknownRevenueCents,
       lastScannedAt: null,
       updatedAt: null,
       bucket: "unattributed_paid",
@@ -593,12 +733,26 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
       paidSubscriptions: 0,
       revenueCents: 0,
       costCents: 0,
+      valueSnapshotMembers: 0,
+      valuePendingMembers: 0,
+      valuePayingFans: 0,
+      fanValueCents: 0,
+      valueMessagesCents: 0,
+      valueTipsCents: 0,
+      valueSubscribesCents: 0,
     };
     cur.sources += row.isUnattributed ? 0 : 1;
     cur.claimers += Number(row.claimers || 0);
     cur.paidSubscriptions += Number(row.paidSubscriptions || 0);
     cur.revenueCents += Number(row.revenueCents || 0);
     cur.costCents += Number(row.costCents || 0);
+    cur.valueSnapshotMembers += Number(row.valueSnapshotMembers || 0);
+    cur.valuePendingMembers += Number(row.valuePendingMembers || 0);
+    cur.valuePayingFans += Number(row.valuePayingFans || 0);
+    cur.fanValueCents += Number(row.fanValueCents || 0);
+    cur.valueMessagesCents += Number(row.valueMessagesCents || 0);
+    cur.valueTipsCents += Number(row.valueTipsCents || 0);
+    cur.valueSubscribesCents += Number(row.valueSubscribesCents || 0);
     bucketsByType.set(key, cur);
   }
 
@@ -606,6 +760,10 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
   const paidSubscriptions = revenue.reduce((acc, row) => acc + Number(row._count?._all || 0), 0);
   const trackedRevenueCents = subscriptionRevenueCents - unknownRevenueCents;
   const trackedPaidSubscriptions = paidSubscriptions - unknownPaidSubscriptions;
+  const uniqueValue = valueStats.totals || valueStatsSeed();
+  const valueSnapshotMembers = Number(uniqueValue.valueSnapshotMembers || 0);
+  const valuePendingMembers = Math.max(0, membersCount - valueSnapshotMembers);
+  const valuePayingFans = Number(uniqueValue.valuePayingFans || 0);
 
   return {
     ok: true,
@@ -624,6 +782,16 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
       trackedPaidSubscriptions,
       unattributedRevenueCents: unknownRevenueCents,
       unattributedPaidSubscriptions: unknownPaidSubscriptions,
+      valueSnapshotMembers,
+      valuePendingMembers,
+      valuePayingFans,
+      fanValueCents: Number(uniqueValue.fanValueCents || 0),
+      valueMessagesCents: Number(uniqueValue.valueMessagesCents || 0),
+      valueTipsCents: Number(uniqueValue.valueTipsCents || 0),
+      valueSubscribesCents: Number(uniqueValue.valueSubscribesCents || 0),
+      valuePostsCents: Number(uniqueValue.valuePostsCents || 0),
+      valueStreamsCents: Number(uniqueValue.valueStreamsCents || 0),
+      lastValueFetchedAt: uniqueValue.lastValueFetchedAt || null,
     },
     buckets: Array.from(bucketsByType.values()).sort((a, b) => Number(b.revenueCents || 0) - Number(a.revenueCents || 0)),
     sources: rows.sort((a, b) => Number(b.revenueCents || 0) - Number(a.revenueCents || 0)),
