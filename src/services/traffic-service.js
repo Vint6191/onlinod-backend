@@ -110,8 +110,8 @@ function utcDay(value) {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
-function rangeWindow(rangeKey = "7d", now = new Date()) {
-  const key = String(rangeKey || "7d").toLowerCase();
+function rangeWindow(rangeKey = "all", now = new Date()) {
+  const key = String(rangeKey || "all").toLowerCase();
   const end = new Date(now);
   const start = new Date(now);
 
@@ -662,7 +662,7 @@ async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
   };
 }
 
-async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey = "7d", limit = 100, offset = 0, onlyPaying = false }) {
+async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey = "all", limit = 100, offset = 0, onlyPaying = false }) {
   const { creator } = await assertTrafficViewer({ userId, creatorId });
   const id = clean(sourceId, 180);
   if (!id) {
@@ -889,7 +889,7 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
   };
 }
 
-async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
+async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
   const { creator } = await assertTrafficViewer({ userId, creatorId });
   const range = rangeWindow(rangeKey);
   const revenueWhere = {
@@ -1091,8 +1091,8 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
       valueStreamsCents: Number(uniqueValue.valueStreamsCents || 0),
       lastValueFetchedAt: uniqueValue.lastValueFetchedAt || null,
     },
-    buckets: Array.from(bucketsByType.values()).sort((a, b) => Number(b.revenueCents || 0) - Number(a.revenueCents || 0)),
-    sources: rows.sort((a, b) => Number(b.revenueCents || 0) - Number(a.revenueCents || 0)),
+    buckets: Array.from(bucketsByType.values()).sort((a, b) => Number((b.fanValueCents || b.revenueCents) || 0) - Number((a.fanValueCents || a.revenueCents) || 0)),
+    sources: rows.sort((a, b) => Number((b.fanValueCents || b.revenueCents) || 0) - Number((a.fanValueCents || a.revenueCents) || 0)),
     lastTrafficJob: lastTrafficJob ? {
       id: lastTrafficJob.id,
       status: lastTrafficJob.status,

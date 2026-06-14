@@ -172,7 +172,7 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
 
 router.get("/creators/:creatorId/overview", async (req, res) => {
   try {
-    const result = await getTrafficOverview({ userId: actorUserId(req), creatorId: req.params.creatorId, rangeKey: req.query.range || "7d" });
+    const result = await getTrafficOverview({ userId: actorUserId(req), creatorId: req.params.creatorId, rangeKey: req.query.range || "all" });
     return res.json(result);
   } catch (err) {
     console.error("[traffic/overview] failed:", err);
@@ -186,7 +186,7 @@ router.get("/creators/:creatorId/sources/:sourceId/members", async (req, res) =>
       userId: actorUserId(req),
       creatorId: req.params.creatorId,
       sourceId: req.params.sourceId,
-      rangeKey: req.query.range || "7d",
+      rangeKey: req.query.range || "all",
       limit: req.query.limit ? Number(req.query.limit) : 100,
       offset: req.query.offset ? Number(req.query.offset) : 0,
       onlyPaying: String(req.query.onlyPaying || req.query.paying || "").toLowerCase() === "true" || String(req.query.onlyPaying || req.query.paying || "") === "1",
