@@ -52,8 +52,11 @@ const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
  * @param {number} [args.priority=50]
  * @returns {Promise<{ created: string[], skipped: string[] }>}
  */
-async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 50 }) {
+async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 50, creator = null }) {
   if (!creatorId || !agencyId) return { created: [], skipped: [] };
+  const creatorRemoteId = creator?.remoteId || creator?.userId || null;
+  const creatorUsername = creator?.username || null;
+  const creatorDisplayName = creator?.displayName || null;
 
   const created = [];
   const skipped = [];
@@ -91,7 +94,16 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
     jobKey: "traffic_sources_scan",
     creatorId,
     agencyId,
-    params: { hydrateFanValues: true, valueTtlHours: 6 },
+    params: {
+      hydrateFanValues: true,
+      valueTtlHours: 6,
+      creatorRemoteId,
+      remoteId: creatorRemoteId,
+      creatorUsername,
+      username: creatorUsername,
+      creatorDisplayName,
+      reason: "recurring_traffic_refresh",
+    },
     priority: Math.max(10, priority - 20),
     now,
     freshnessWindowMs: TRAFFIC_REFRESH_WINDOW_MS,
@@ -183,7 +195,7 @@ async function runRecurringSweep() {
       deletedAt: null,
       agency: { deletedAt: null },
     },
-    select: { id: true, agencyId: true },
+    select: { id: true, agencyId: true, remoteId: true, username: true, displayName: true },
   });
 
   let totalCreated = 0;
@@ -194,6 +206,7 @@ async function runRecurringSweep() {
       const result = await scheduleInitialJobsForCreator({
         creatorId: creator.id,
         agencyId: creator.agencyId,
+        creator,
         priority: 30, // recurring is lower priority than refresh-now (100) and creator-connect (50)
       });
       totalCreated += result.created.length;

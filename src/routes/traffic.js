@@ -39,7 +39,7 @@ const sourceScanSchema = z.object({
   accountId: z.string().optional().nullable(),
   jobId: z.string().optional().nullable(),
   hydrateLimit: z.number().int().min(0).max(5000).optional(),
-  forceHydrate: z.boolean().optional().default(false),
+  forceHydrate: z.boolean().optional(),
   sources: z.array(z.any()).max(1000).optional().default([]),
   members: z.array(z.any()).max(5000).optional().default([]),
 });
@@ -130,15 +130,40 @@ router.post("/subscriptions/ingest", async (req, res) => {
 });
 
 
+const trafficRefreshSchema = z.object({
+  force: z.boolean().optional(),
+  rangeKey: z.string().optional().nullable(),
+  accountId: z.string().optional().nullable(),
+  localAccountId: z.string().optional().nullable(),
+  accountManifestId: z.string().optional().nullable(),
+  creatorRemoteId: z.string().optional().nullable(),
+  remoteId: z.string().optional().nullable(),
+  creatorUsername: z.string().optional().nullable(),
+  username: z.string().optional().nullable(),
+  creatorDisplayName: z.string().optional().nullable(),
+}).passthrough();
+
 router.post("/creators/:creatorId/refresh", async (req, res) => {
   try {
+    const input = trafficRefreshSchema.parse(req.body || {});
     const result = await scheduleTrafficRefresh({
       userId: actorUserId(req),
       creatorId: req.params.creatorId,
-      force: req.body?.force === true,
+      force: input.force === true,
+      accountHints: {
+        accountId: input.accountId || input.localAccountId || input.accountManifestId || null,
+        localAccountId: input.localAccountId || input.accountId || input.accountManifestId || null,
+        accountManifestId: input.accountManifestId || input.localAccountId || input.accountId || null,
+        creatorRemoteId: input.creatorRemoteId || input.remoteId || null,
+        remoteId: input.remoteId || input.creatorRemoteId || null,
+        creatorUsername: input.creatorUsername || input.username || null,
+        username: input.username || input.creatorUsername || null,
+        creatorDisplayName: input.creatorDisplayName || null,
+      },
     });
     return res.json(result);
   } catch (err) {
+    if (err?.issues) return validationError(res, err);
     console.error("[traffic/refresh] failed:", err);
     return serviceError(res, err, "TRAFFIC_REFRESH_FAILED");
   }

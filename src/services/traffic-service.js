@@ -833,8 +833,33 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "7d" }) {
   };
 }
 
-async function scheduleTrafficRefresh({ userId, creatorId, force = false } = {}) {
+function cleanHint(value, max = 255) {
+  const s = String(value ?? "").trim();
+  return s ? s.slice(0, max) : null;
+}
+
+async function scheduleTrafficRefresh({ userId, creatorId, force = false, accountHints = {} } = {}) {
   const { creator } = await assertTrafficViewer({ userId, creatorId });
+
+  const localAccountId = cleanHint(
+    accountHints.localAccountId ||
+    accountHints.accountId ||
+    accountHints.accountManifestId ||
+    null
+  );
+  const remoteId = cleanHint(
+    accountHints.creatorRemoteId ||
+    accountHints.remoteId ||
+    creator.remoteId ||
+    null
+  );
+  const username = cleanHint(
+    accountHints.creatorUsername ||
+    accountHints.username ||
+    creator.username ||
+    null
+  );
+
   const decision = await ensureSingleJob({
     jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
     creatorId: creator.id,
@@ -846,11 +871,16 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false } = {})
       valueTtlHours: 6,
       reason: "manual_traffic_refresh",
       // Electron account manifests are local ids, while job.creatorId is the
-      // backend CreatorAccount.id. Keep remote hints in params so the worker
-      // can resolve the correct local OF partition without guessing.
-      creatorRemoteId: creator.remoteId || null,
-      creatorUsername: creator.username || null,
-      creatorDisplayName: creator.displayName || null,
+      // backend CreatorAccount.id. Pass the visible/local account id from the
+      // renderer when available, then remote hints as a fallback.
+      accountId: localAccountId,
+      localAccountId,
+      accountManifestId: localAccountId,
+      creatorRemoteId: remoteId,
+      remoteId,
+      creatorUsername: username,
+      username,
+      creatorDisplayName: cleanHint(accountHints.creatorDisplayName || creator.displayName || null),
     },
     priority: 100,
     now: new Date(),
