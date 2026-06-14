@@ -860,31 +860,59 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
     null
   );
 
+  const now = new Date();
+  const params = {
+    hydrateFanValues: true,
+    forceHydrate: force === true,
+    hydrateLimit: force === true ? 5000 : 1000,
+    valueTtlHours: 6,
+    reason: force === true ? "manual_traffic_refresh_force" : "manual_traffic_refresh",
+    manualRefreshAt: now.toISOString(),
+    // Electron account manifests are local ids, while job.creatorId is the
+    // backend CreatorAccount.id. Pass the visible/local account id from the
+    // renderer when available, then remote hints as a fallback.
+    accountId: localAccountId,
+    localAccountId,
+    accountManifestId: localAccountId,
+    creatorRemoteId: remoteId,
+    remoteId,
+    creatorUsername: username,
+    username,
+    creatorDisplayName: cleanHint(accountHints.creatorDisplayName || creator.displayName || null),
+  };
+
+  // Manual refresh must not reuse an older SCHEDULED/CLAIMED job that was
+  // created by an older app build without localAccountId. That is exactly how
+  // we ended up with "job scheduled · saved 0 · Account not found" forever:
+  // ensureSingleJob kept returning the stale in-flight job instead of creating
+  // a fresh one with the new account hints. The scan/upsert path is idempotent,
+  // so a duplicate manual job is safer than silently reusing stale params.
+  if (force === true) {
+    const job = await prisma.jobInstance.create({
+      data: {
+        jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
+        scope: "creator",
+        creatorId: creator.id,
+        agencyId: creator.agencyId,
+        params,
+        priority: 120,
+        scheduledAt: now,
+        nextRunAt: now,
+      },
+      select: { id: true, status: true, jobKey: true, createdAt: true, nextRunAt: true, params: true },
+    });
+
+    return { ok: true, created: true, forced: true, jobId: job.id, job };
+  }
+
   const decision = await ensureSingleJob({
     jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
     creatorId: creator.id,
     agencyId: creator.agencyId,
-    params: {
-      hydrateFanValues: true,
-      forceHydrate: force === true,
-      hydrateLimit: force === true ? 5000 : 1000,
-      valueTtlHours: 6,
-      reason: "manual_traffic_refresh",
-      // Electron account manifests are local ids, while job.creatorId is the
-      // backend CreatorAccount.id. Pass the visible/local account id from the
-      // renderer when available, then remote hints as a fallback.
-      accountId: localAccountId,
-      localAccountId,
-      accountManifestId: localAccountId,
-      creatorRemoteId: remoteId,
-      remoteId,
-      creatorUsername: username,
-      username,
-      creatorDisplayName: cleanHint(accountHints.creatorDisplayName || creator.displayName || null),
-    },
+    params,
     priority: 100,
-    now: new Date(),
-    freshnessWindowMs: force ? 0 : Math.min(60_000, TRAFFIC_REFRESH_WINDOW_MS),
+    now,
+    freshnessWindowMs: Math.min(60_000, TRAFFIC_REFRESH_WINDOW_MS),
   });
   return { ok: true, ...decision };
 }
