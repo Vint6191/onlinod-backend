@@ -39,6 +39,7 @@ const RECURRING_INTERVAL_MS = 60 * 60 * 1000;
 // How recently a "DONE" job counts as fresh enough to skip rescheduling.
 // Same as RECURRING_INTERVAL_MS — if we just refreshed, don't refresh again.
 const FRESHNESS_WINDOW_MS = RECURRING_INTERVAL_MS;
+const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 
 /**
@@ -83,6 +84,20 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   });
   if (campaignsDecision.created) created.push("fetch_campaigns");
   else skipped.push("fetch_campaigns");
+
+  // 3. traffic_sources_scan — source/member attribution index.
+  // Kept much cooler than earnings jobs because it can walk large trial/promo lists.
+  const trafficDecision = await ensureSingleJob({
+    jobKey: "traffic_sources_scan",
+    creatorId,
+    agencyId,
+    params: { hydrateFanValues: true, valueTtlHours: 6 },
+    priority: Math.max(10, priority - 20),
+    now,
+    freshnessWindowMs: TRAFFIC_REFRESH_WINDOW_MS,
+  });
+  if (trafficDecision.created) created.push("traffic_sources_scan");
+  else skipped.push("traffic_sources_scan");
 
   return { created, skipped };
 }
@@ -245,4 +260,5 @@ module.exports = {
   TRACKED_RANGES,
   RECURRING_INTERVAL_MS,
   FRESHNESS_WINDOW_MS,
+  TRAFFIC_REFRESH_WINDOW_MS,
 };

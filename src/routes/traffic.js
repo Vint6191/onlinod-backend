@@ -1,0 +1,155 @@
+"use strict";
+
+const express = require("express");
+const { z } = require("zod");
+const {
+  upsertTrafficSourceScan,
+  upsertTrafficFanValueSnapshots,
+  ingestSubscriptionEvent,
+  getTrafficOverview,
+  scheduleTrafficRefresh,
+} = require("../services/traffic-service");
+
+const router = express.Router();
+
+function actorUserId(req) {
+  return req.auth?.userId || req.user?.id || null;
+}
+
+function validationError(res, err) {
+  return res.status(400).json({
+    ok: false,
+    code: "VALIDATION_ERROR",
+    error: err.issues?.[0]?.message || "Validation error",
+    issues: err.issues || [],
+  });
+}
+
+function serviceError(res, err, fallbackCode) {
+  const code = err?.code || fallbackCode || "TRAFFIC_FAILED";
+  const status = code === "NOT_YOUR_DEVICE" || code === "NOT_A_MEMBER" || code === "DEVICE_CREATOR_AGENCY_MISMATCH" ? 403
+    : code === "CREATOR_NOT_FOUND" ? 404
+    : 500;
+  return res.status(status).json({ ok: false, code, error: err?.message || "Traffic request failed" });
+}
+
+const sourceScanSchema = z.object({
+  deviceId: z.string().min(1),
+  creatorId: z.string().min(1),
+  accountId: z.string().optional().nullable(),
+  jobId: z.string().optional().nullable(),
+  hydrateLimit: z.number().int().min(0).max(5000).optional(),
+  sources: z.array(z.any()).max(1000).optional().default([]),
+  members: z.array(z.any()).max(5000).optional().default([]),
+});
+
+router.post("/sources/upsert", async (req, res) => {
+  try {
+    const input = sourceScanSchema.parse(req.body || {});
+    const result = await upsertTrafficSourceScan({
+      deviceId: input.deviceId,
+      userId: actorUserId(req),
+      creatorId: input.creatorId,
+      accountId: input.accountId,
+      sources: input.sources,
+      members: input.members,
+      hydrateLimit: input.hydrateLimit ?? 1000,
+    });
+    return res.json(result);
+  } catch (err) {
+    if (err?.issues) return validationError(res, err);
+    console.error("[traffic/sources/upsert] failed:", err);
+    return serviceError(res, err, "TRAFFIC_SOURCES_UPSERT_FAILED");
+  }
+});
+
+const snapshotsSchema = z.object({
+  deviceId: z.string().min(1),
+  creatorId: z.string().min(1),
+  snapshots: z.array(z.any()).max(5000).optional().default([]),
+});
+
+router.post("/value-snapshots/upsert", async (req, res) => {
+  try {
+    const input = snapshotsSchema.parse(req.body || {});
+    const result = await upsertTrafficFanValueSnapshots({
+      deviceId: input.deviceId,
+      userId: actorUserId(req),
+      creatorId: input.creatorId,
+      snapshots: input.snapshots,
+    });
+    return res.json(result);
+  } catch (err) {
+    if (err?.issues) return validationError(res, err);
+    console.error("[traffic/value-snapshots/upsert] failed:", err);
+    return serviceError(res, err, "TRAFFIC_VALUE_SNAPSHOTS_UPSERT_FAILED");
+  }
+});
+
+const subscriptionIngestSchema = z.object({
+  deviceId: z.string().min(1),
+  creatorId: z.string().min(1),
+  accountId: z.string().optional().nullable(),
+  event: z.object({
+    fanId: z.string().min(1),
+    eventType: z.string().optional().nullable(),
+    amountCents: z.number().int().nonnegative().optional(),
+    amount: z.union([z.number(), z.string()]).optional().nullable(),
+    price: z.union([z.number(), z.string()]).optional().nullable(),
+    currency: z.string().optional().nullable(),
+    occurredAt: z.union([z.string(), z.number(), z.date()]).optional().nullable(),
+    createdAt: z.union([z.string(), z.number(), z.date()]).optional().nullable(),
+    ts: z.union([z.string(), z.number()]).optional().nullable(),
+    externalEventId: z.string().optional().nullable(),
+    eventHash: z.string().optional().nullable(),
+    toastId: z.string().optional().nullable(),
+    notificationId: z.string().optional().nullable(),
+    source: z.string().optional().nullable(),
+    metadata: z.any().optional(),
+  }).passthrough(),
+});
+
+router.post("/subscriptions/ingest", async (req, res) => {
+  try {
+    const input = subscriptionIngestSchema.parse(req.body || {});
+    const result = await ingestSubscriptionEvent({
+      deviceId: input.deviceId,
+      userId: actorUserId(req),
+      creatorId: input.creatorId,
+      accountId: input.accountId,
+      event: input.event,
+    });
+    return res.json(result);
+  } catch (err) {
+    if (err?.issues) return validationError(res, err);
+    console.error("[traffic/subscriptions/ingest] failed:", err);
+    return serviceError(res, err, "TRAFFIC_SUBSCRIPTION_INGEST_FAILED");
+  }
+});
+
+
+router.post("/creators/:creatorId/refresh", async (req, res) => {
+  try {
+    const result = await scheduleTrafficRefresh({
+      userId: actorUserId(req),
+      creatorId: req.params.creatorId,
+      force: req.body?.force === true,
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error("[traffic/refresh] failed:", err);
+    return serviceError(res, err, "TRAFFIC_REFRESH_FAILED");
+  }
+});
+
+router.get("/creators/:creatorId/overview", async (req, res) => {
+  try {
+    const result = await getTrafficOverview({ userId: actorUserId(req), creatorId: req.params.creatorId, rangeKey: req.query.range || "7d" });
+    return res.json(result);
+  } catch (err) {
+    console.error("[traffic/overview] failed:", err);
+    return serviceError(res, err, "TRAFFIC_OVERVIEW_FAILED");
+  }
+});
+
+module.exports = router;

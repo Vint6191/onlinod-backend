@@ -121,6 +121,11 @@ model Agency {
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
   teamObservationStates TeamObservationState[]
+  trafficSources TrafficSource[]
+  trafficSourceMembers TrafficSourceMember[]
+  trafficFanValueSnapshots TrafficFanValueSnapshot[]
+  creatorSubscriptionLedgers CreatorSubscriptionLedger[]
+  trafficDailyAggregates TrafficDailyAggregate[]
 
   @@index([deletedAt])
 }
@@ -197,6 +202,11 @@ model CreatorAccount {
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
   teamObservationStates TeamObservationState[]
+  trafficSources TrafficSource[]
+  trafficSourceMembers TrafficSourceMember[]
+  trafficFanValueSnapshots TrafficFanValueSnapshot[]
+  creatorSubscriptionLedgers CreatorSubscriptionLedger[]
+  trafficDailyAggregates TrafficDailyAggregate[]
 
   @@index([agencyId])
   @@index([status])
@@ -1675,6 +1685,159 @@ model TeamObservationState {
   @@index([agencyId, lastObservedAt])
   @@index([agencyId, currentScanStatus])
   @@index([lockedUntil])
+}
+
+model TrafficSource {
+  id         String   @id @default(cuid())
+  agencyId   String
+  creatorId  String
+  accountId  String   @default("unknown")
+
+  sourceType String
+  externalId String
+  name       String?
+  url        String?
+  status     String?
+
+  startedAt  DateTime?
+  endedAt    DateTime?
+  lastScannedAt DateTime?
+
+  costCents  Int      @default(0)
+  currency   String   @default("USD")
+
+  stats      Json?
+  metadata   Json?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  members TrafficSourceMember[]
+  subscriptionLedgers CreatorSubscriptionLedger[]
+  dailyAggregates TrafficDailyAggregate[]
+
+  @@unique([agencyId, creatorId, sourceType, externalId])
+  @@index([agencyId, creatorId, sourceType])
+  @@index([agencyId, creatorId, status])
+}
+
+model TrafficSourceMember {
+  id        String   @id @default(cuid())
+  agencyId  String
+  creatorId String
+  sourceId  String
+  fanId     String
+
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  claimedAt   DateTime?
+  convertedAt DateTime?
+
+  lastUserInfoFetchedAt DateTime?
+  lastValueFetchedAt    DateTime?
+  lastRevenueAt         DateTime?
+  needsValueRefresh     Boolean @default(true)
+
+  metadata Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  source  TrafficSource  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId, sourceId, fanId])
+  @@index([agencyId, creatorId, fanId])
+  @@index([sourceId, fanId])
+  @@index([needsValueRefresh, lastValueFetchedAt])
+}
+
+model TrafficFanValueSnapshot {
+  id        String   @id @default(cuid())
+  agencyId  String
+  creatorId String
+  fanId     String
+
+  totalSummCents      Int @default(0)
+  messagesSummCents   Int @default(0)
+  tipsSummCents       Int @default(0)
+  subscribesSummCents Int @default(0)
+  postsSummCents      Int @default(0)
+  streamsSummCents    Int @default(0)
+
+  lastActivity DateTime?
+  fetchedAt    DateTime @default(now())
+  source       String   @default("fan_value_core")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId, fanId])
+  @@index([agencyId, creatorId, fetchedAt])
+}
+
+model CreatorSubscriptionLedger {
+  id        String   @id @default(cuid())
+  agencyId  String
+  creatorId String
+  accountId String   @default("unknown")
+
+  fanId     String
+  sourceId  String?
+
+  eventType String
+  amountCents Int    @default(0)
+  currency  String   @default("USD")
+  occurredAt DateTime
+
+  externalEventId String?
+  eventHash String
+  source    String   @default("realtime")
+  metadata  Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  trafficSource TrafficSource? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  @@unique([agencyId, eventHash])
+  @@index([agencyId, creatorId, fanId, occurredAt])
+  @@index([agencyId, creatorId, sourceId, occurredAt])
+}
+
+model TrafficDailyAggregate {
+  id        String   @id @default(cuid())
+  agencyId  String
+  creatorId String
+  sourceId  String
+  day       DateTime
+
+  claimers  Int @default(0)
+  freeSubs  Int @default(0)
+  paidSubs  Int @default(0)
+  renewals  Int @default(0)
+  refunds   Int @default(0)
+
+  grossCents Int @default(0)
+  netCents   Int @default(0)
+  costCents  Int @default(0)
+
+  updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  source  TrafficSource  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceId, day])
+  @@index([agencyId, creatorId, day])
 }
 
 model TeamPpvPurchaseLedger {
