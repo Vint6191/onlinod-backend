@@ -63,7 +63,9 @@ router.delete("/bumps/:id", requireSeniorAutomationWriter, async (req, res) => {
 
 router.get("/jobs", async (req, res) => { try { return res.json(await automationServer.listJobs({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOBS_FAILED"); } });
 router.post("/jobs/enqueue", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.enqueueJob({ agencyId: req.auth.agencyId, userId: req.auth.userId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOB_ENQUEUE_FAILED"); } });
+router.post("/jobs/cancel", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.cancelJobs({ agencyId: req.auth.agencyId, userId: req.auth.userId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOB_CANCEL_FAILED"); } });
 router.post("/jobs/claim", async (req, res) => { try { return res.json(await automationServer.claimJobs({ agencyId: req.auth.agencyId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOB_CLAIM_FAILED"); } });
+router.get("/jobs/:id", async (req, res) => { try { return res.json(await automationServer.getJob({ agencyId: req.auth.agencyId, jobId: req.params.id })); } catch (err) { return sendError(res, err, "AUTOMATION_JOB_GET_FAILED"); } });
 router.post("/jobs/:id/result", async (req, res) => { try { return res.json(await automationServer.completeJob({ agencyId: req.auth.agencyId, jobId: req.params.id, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOB_RESULT_FAILED"); } });
 
 router.get("/events", async (req, res) => { try { return res.json(await automationServer.listEvents({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_EVENTS_FAILED"); } });
@@ -225,61 +227,112 @@ router.post("/hidden-online/:fanId/status", requireSeniorAutomationWriter, async
 });
 
 
+const FOLLOW_BACK_TERMINAL_STATUSES = new Set(["followed", "waiting_return", "final_unfollowed", "done", "completed"]);
+
 function followBackTerminalStatus(status) {
-  const s = String(status || "").trim().toLowerCase();
-  return s === "done" || s === "completed" || s === "followed" || s === "waiting_return" || s === "final_unfollowed";
+  return FOLLOW_BACK_TERMINAL_STATUSES.has(String(status || "").toLowerCase());
 }
 
-function compactWorkerResult(body = {}) {
-  const result = body?.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
-  const out = {
+function followBackStatus(value, fallback = "pending") {
+  const s = cleanString(value || fallback, 40).toLowerCase() || fallback;
+  return s;
+}
+
+function compactWorkerResult(input = {}) {
+  const result = input.result && typeof input.result === "object" && !Array.isArray(input.result) ? input.result : {};
+  return jsonObject({
     ...result,
-    source: result.source || "electron_follow_back_worker",
-    workerUpdatedAt: new Date().toISOString(),
-  };
-  const copyKeys = [
-    "skipReason", "failReason", "processedAt", "skippedAt", "failedAt", "lastSuccessAt",
-    "lastAttemptAt", "lastFollowBackAt", "lastRefollowNudgeAt", "waitReturnUntil",
-    "refollowStatus", "followBackStatus", "refollowNudgeCount", "bumpEligible",
-    "attentionStatus", "attentionLikesTarget", "attentionLikesDone", "attentionError",
-    "canChat", "canReceiveChatMessage", "reason", "actionReason", "decisionReason",
-  ];
-  for (const key of copyKeys) {
-    if (body?.[key] !== undefined && body?.[key] !== null) out[key] = body[key];
-  }
-  return jsonObject(out);
+    reason: input.reason || result.reason || null,
+    skipReason: input.skipReason || result.skipReason || null,
+    failReason: input.failReason || result.failReason || null,
+    actionReason: input.actionReason || result.actionReason || null,
+    decisionReason: input.decisionReason || result.decisionReason || null,
+    rawStatus: input.status || result.rawStatus || null,
+    claimedByDeviceId: result.claimedByDeviceId || input.claimedByDeviceId || input.deviceId || null,
+    claimedAt: result.claimedAt || input.claimedAt || null,
+    leaseUntil: result.leaseUntil || input.leaseUntil || null,
+    claimTimeoutSec: result.claimTimeoutSec || input.claimTimeoutSec || null,
+    refollowNudgeCount: input.refollowNudgeCount ?? result.refollowNudgeCount ?? null,
+    followBackStatus: input.followBackStatus || result.followBackStatus || null,
+    refollowStatus: input.refollowStatus || result.refollowStatus || null,
+    waitReturnUntil: input.waitReturnUntil || result.waitReturnUntil || null,
+    lastSuccessAt: input.lastSuccessAt || result.lastSuccessAt || null,
+    processedAt: input.processedAt || result.processedAt || null,
+    skippedAt: input.skippedAt || result.skippedAt || null,
+    failedAt: input.failedAt || result.failedAt || null,
+    attentionStatus: input.attentionStatus || result.attentionStatus || null,
+    attentionLikesTarget: input.attentionLikesTarget ?? result.attentionLikesTarget ?? 0,
+    attentionLikesDone: input.attentionLikesDone ?? result.attentionLikesDone ?? 0,
+    attentionError: input.attentionError || result.attentionError || null,
+    canChat: input.canChat ?? result.canChat ?? null,
+    canReceiveChatMessage: input.canReceiveChatMessage ?? result.canReceiveChatMessage ?? null,
+    bumpEligible: input.bumpEligible ?? result.bumpEligible ?? null,
+    subscriptionState: input.subscriptionState || result.subscriptionState || null,
+    subscribedBy: input.subscribedBy ?? result.subscribedBy ?? null,
+    subscribedByActive: input.subscribedByActive ?? result.subscribedByActive ?? null,
+    subscribedByExpire: input.subscribedByExpire ?? result.subscribedByExpire ?? null,
+    subscribedIsExpiredNow: input.subscribedIsExpiredNow ?? result.subscribedIsExpiredNow ?? null,
+    subscribedByExpireDate: input.subscribedByExpireDate || result.subscribedByExpireDate || null,
+    subscribedOn: input.subscribedOn ?? result.subscribedOn ?? null,
+    subscribedOnActive: input.subscribedOnActive ?? result.subscribedOnActive ?? null,
+    subscribedOnExpiredNow: input.subscribedOnExpiredNow ?? result.subscribedOnExpiredNow ?? null,
+    subscribedOnExpireDate: input.subscribedOnExpireDate || result.subscribedOnExpireDate || null,
+  });
 }
 
-async function upsertFollowBackWorkerItem({ req, creatorId, rawItem }) {
-  const body = rawItem || {};
+async function supersedeFollowBackAlternatives({ req, creatorId, fanId, action, status, reason }) {
+  const normalizedAction = cleanString(action || "", 80) || "follow_back";
+  const normalizedStatus = followBackStatus(status || "pending");
+  const realActions = ["follow_back", "refollow_nudge"];
+  let actionsToClose = [];
+  let closeReason = optionalString(reason, 500) || `superseded_by_${normalizedAction}`;
+
+  if (realActions.includes(normalizedAction) && ["pending", "followed", "waiting_return", "skipped"].includes(normalizedStatus)) {
+    actionsToClose = realActions.filter((x) => x !== normalizedAction);
+    closeReason = `superseded_by_${normalizedAction}`;
+  } else if (normalizedAction === "skip" || normalizedStatus === "skipped") {
+    actionsToClose = realActions;
+    closeReason = optionalString(reason, 500) || "superseded_by_skip_decision";
+  }
+
+  if (!actionsToClose.length) return;
+  await prisma.followBackTask.updateMany({
+    where: {
+      agencyId: req.auth.agencyId,
+      creatorId,
+      fanId,
+      action: { in: actionsToClose },
+      status: { in: ["pending", "running"] },
+    },
+    data: {
+      status: "skipped",
+      reason: closeReason,
+      error: null,
+      lastResultAt: new Date(),
+      result: jsonObject({ reason: closeReason, supersededByAction: normalizedAction, source: "follow_back_worker_supersede" }),
+    },
+  }).catch(() => null);
+}
+
+async function upsertFollowBackWorkerItem({ req, creatorId, rawItem = {} }) {
+  const body = rawItem && typeof rawItem === "object" ? rawItem : {};
   const fanId = cleanString(body.fanId || body.userId || body.id, 80);
-  const action = cleanString(body.action || "follow_back", 80) || "follow_back";
   if (!fanId) return null;
-
-  const incomingStatus = cleanString(body.status || "pending", 40) || "pending";
-  const existing = await prisma.followBackTask.findUnique({
-    where: { creatorId_fanId_action: { creatorId, fanId, action } },
-  });
-
-  const status = existing && followBackTerminalStatus(existing.status) && incomingStatus === "pending"
-    ? existing.status
-    : incomingStatus;
-
-  const reason = optionalString(
-    body.reason || body.skipReason || body.failReason || body.actionReason || body.decisionReason,
-    500
-  );
+  const action = cleanString(body.action || "follow_back", 80) || "follow_back";
+  const incomingStatus = followBackStatus(body.status || "pending");
+  const existing = await prisma.followBackTask.findUnique({ where: { creatorId_fanId_action: { creatorId, fanId, action } } });
+  const status = existing && followBackTerminalStatus(existing.status) && incomingStatus === "pending" ? existing.status : incomingStatus;
+  const reason = optionalString(body.reason || body.skipReason || body.failReason || body.actionReason || body.decisionReason, 500);
   const lastResultAt = parseDate(body.lastResultAt || body.processedAt || body.skippedAt || body.failedAt || body.updatedAt);
   const result = compactWorkerResult(body);
-
-  return prisma.followBackTask.upsert({
+  const item = await prisma.followBackTask.upsert({
     where: { creatorId_fanId_action: { creatorId, fanId, action } },
     create: {
       agencyId: req.auth.agencyId,
       creatorId,
       fanId,
       action,
-      dialogId: optionalString(body.dialogId, 80),
+      dialogId: optionalString(body.dialogId || body.fanId, 80),
       username: optionalString(body.username, 120),
       name: optionalString(body.name, 180),
       status,
@@ -300,6 +353,8 @@ async function upsertFollowBackWorkerItem({ req, creatorId, rawItem }) {
       lastResultAt: lastResultAt || undefined,
     },
   });
+  await supersedeFollowBackAlternatives({ req, creatorId, fanId, action, status, reason });
+  return item;
 }
 
 function isFollowBackClaimExpired(item, now = Date.now()) {
@@ -357,9 +412,10 @@ router.post("/follow-back/upsert", requireSeniorAutomationWriter, async (req, re
 });
 
 
+
 // Worker protocol: opened for authenticated Electron workers. Definition/destructive
 // writes stay senior-only, but workers must be able to mirror scan decisions,
-// claim one fan atomically, and report the result after OF action execution.
+// claim one fan atomically, release claims on Stop, and report OF results.
 router.post("/follow-back/worker/upsert-bulk", async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
@@ -384,8 +440,6 @@ router.post("/follow-back/worker/claim", async (req, res) => {
     const nowMs = Date.now();
     const staleBefore = new Date(nowMs - Math.max(60, Math.min(86400, positiveInt(req.body?.claimTimeoutSec, 600))) * 1000);
 
-    // DB-level stale recovery. JSON lease is primary; updatedAt fallback covers
-    // old rows that were marked running before worker leases existed.
     await prisma.$executeRaw`
       UPDATE "FollowBackTask"
       SET "status" = 'pending', "error" = 'claim expired; returned to queue', "lastResultAt" = NOW()
@@ -413,25 +467,16 @@ router.post("/follow-back/worker/claim", async (req, res) => {
     for (const candidate of candidates) {
       if (items.length >= limit) break;
       const meta = candidate.result && typeof candidate.result === "object" ? candidate.result : {};
-      if (candidate.status === "running") {
-        const sameDevice = String(meta.claimedByDeviceId || "") === deviceId;
-        if (!sameDevice && !isFollowBackClaimExpired(candidate, nowMs)) continue;
-      }
+      const sameDevice = String(meta.claimedByDeviceId || "") === deviceId;
+      if (candidate.status === "running" && !sameDevice) continue;
 
       const result = followBackClaimMeta(meta, req.body || {}, deviceId);
+      const where = candidate.status === "pending"
+        ? { id: candidate.id, agencyId: req.auth.agencyId, creatorId, status: "pending" }
+        : { id: candidate.id, agencyId: req.auth.agencyId, creatorId, status: "running" };
       const updated = await prisma.followBackTask.updateMany({
-        where: {
-          id: candidate.id,
-          agencyId: req.auth.agencyId,
-          creatorId,
-          status: candidate.status,
-        },
-        data: {
-          status: "running",
-          result,
-          error: null,
-          lastResultAt: new Date(),
-        },
+        where,
+        data: { status: "running", result, error: null, lastResultAt: new Date() },
       });
       if (updated.count > 0) {
         const item = await prisma.followBackTask.findUnique({ where: { id: candidate.id } });
@@ -441,6 +486,33 @@ router.post("/follow-back/worker/claim", async (req, res) => {
 
     return res.json({ ok: true, creatorId, deviceId, items, count: items.length });
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_WORKER_CLAIM_FAILED"); }
+});
+
+router.post("/follow-back/worker/release", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "", 120);
+    const reason = optionalString(req.body?.reason || "manual_stop", 500) || "manual_stop";
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+
+    const where = { agencyId: req.auth.agencyId, creatorId, status: "running" };
+    const running = await prisma.followBackTask.findMany({ where, take: 500 });
+    const releaseIds = running
+      .filter((item) => {
+        if (!deviceId) return true;
+        const result = item.result && typeof item.result === "object" ? item.result : {};
+        return String(result.claimedByDeviceId || "") === deviceId;
+      })
+      .map((item) => item.id);
+
+    if (!releaseIds.length) return res.json({ ok: true, creatorId, released: 0, items: [] });
+    await prisma.followBackTask.updateMany({
+      where: { agencyId: req.auth.agencyId, creatorId, id: { in: releaseIds }, status: "running" },
+      data: { status: "pending", error: reason, lastResultAt: new Date() },
+    });
+    const items = await prisma.followBackTask.findMany({ where: { agencyId: req.auth.agencyId, creatorId, id: { in: releaseIds } } });
+    return res.json({ ok: true, creatorId, released: items.length, items });
+  } catch (err) { return sendError(res, err, "FOLLOW_BACK_WORKER_RELEASE_FAILED"); }
 });
 
 router.post("/follow-back/worker/result", async (req, res) => {
@@ -454,7 +526,7 @@ router.post("/follow-back/worker/result", async (req, res) => {
     const existing = await prisma.followBackTask.findUnique({ where: { creatorId_fanId_action: { creatorId, fanId, action } } });
     if (!existing) return res.status(404).json({ ok: false, code: "FOLLOW_BACK_TASK_NOT_FOUND", error: "Follow-back task not found" });
 
-    const status = cleanString(req.body?.status || (req.body?.ok === false ? "failed" : "done"), 40) || "done";
+    const status = followBackStatus(req.body?.status || (req.body?.ok === false ? "failed" : "done"), "done");
     const result = compactWorkerResult({ ...(req.body || {}), result: { ...(existing.result && typeof existing.result === "object" ? existing.result : {}), ...(req.body?.result || {}) } });
     const reason = optionalString(req.body?.reason || req.body?.skipReason || req.body?.failReason || existing.reason, 500);
     const item = await prisma.followBackTask.update({
@@ -470,7 +542,6 @@ router.post("/follow-back/worker/result", async (req, res) => {
     return res.json({ ok: true, item });
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_WORKER_RESULT_FAILED"); }
 });
-
 
 router.post("/follow-back/clear", requireSeniorAutomationWriter, async (req, res) => {
   try {

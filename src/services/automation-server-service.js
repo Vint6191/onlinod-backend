@@ -312,13 +312,14 @@ async function enqueueJob({ agencyId, userId, input = {} }) {
   const data = normalizeJobInput(input, { agencyId, userId });
   let item;
   let alreadyActive = false;
+
   if (data.dedupeKey) {
     const existing = await prisma.automationJob.findUnique({
       where: { agencyId_dedupeKey: { agencyId, dedupeKey: data.dedupeKey } },
     });
 
-    // Do not let a second click or another device reset an active runner job.
-    // Stale active jobs are recovered by claimJobs via claimedAt timeout.
+    // A second Run click must not reset an active worker lease.
+    // Manual Stop explicitly cancels the job; after that this dedupe key can be reused.
     if (existing && ["claimed", "running"].includes(String(existing.status || ""))) {
       item = existing;
       alreadyActive = true;
@@ -342,6 +343,7 @@ async function enqueueJob({ agencyId, userId, input = {} }) {
   } else {
     item = await prisma.automationJob.create({ data });
   }
+
   return { ok: true, item, alreadyActive };
 }
 
@@ -398,6 +400,56 @@ async function claimJobs({ agencyId, input = {} }) {
     }
   }
   return { ok: true, items, count: items.length };
+}
+
+async function cancelJobs({ agencyId, userId, input = {} }) {
+  const creatorId = clean(input.creatorId || input.accountId, 100);
+  if (creatorId) await requireCreator(agencyId, creatorId);
+
+  const where = {
+    agencyId,
+    status: { in: ["scheduled", "claimed", "running"] },
+  };
+  const type = clean(input.type, 80);
+  const action = clean(input.action, 80);
+  const dedupeKey = clean(input.dedupeKey, 240);
+  const jobId = clean(input.jobId || input.id, 120);
+  if (jobId) where.id = jobId;
+  if (creatorId) where.creatorId = creatorId;
+  if (type) where.type = normalizeTaskType(type);
+  if (action) where.action = action;
+  if (dedupeKey) where.dedupeKey = dedupeKey;
+
+  const reason = optional(input.reason || "manual_stop", 2000) || "manual_stop";
+  const before = await prisma.automationJob.findMany({ where, take: parseLimit(input.limit, 50, 500) });
+  if (!before.length) return { ok: true, canceled: 0, items: [] };
+
+  const ids = before.map((x) => x.id);
+  await prisma.automationJob.updateMany({
+    where: { agencyId, id: { in: ids }, status: { in: ["scheduled", "claimed", "running"] } },
+    data: {
+      status: "canceled",
+      completedAt: new Date(),
+      claimedByDeviceId: null,
+      claimedAt: null,
+      error: reason,
+      result: compactJson({ canceledByUserId: userId || null, canceledAt: new Date().toISOString(), reason }, 4000),
+    },
+  });
+  const items = await prisma.automationJob.findMany({ where: { agencyId, id: { in: ids } } });
+  return { ok: true, canceled: items.length, items };
+}
+
+async function getJob({ agencyId, jobId }) {
+  const id = clean(jobId, 120);
+  const item = id ? await prisma.automationJob.findFirst({ where: { id, agencyId } }) : null;
+  if (!item) {
+    const err = new Error("Automation job not found");
+    err.status = 404;
+    err.code = "AUTOMATION_JOB_NOT_FOUND";
+    throw err;
+  }
+  return { ok: true, item };
 }
 
 async function completeJob({ agencyId, jobId, input = {} }) {
@@ -473,6 +525,8 @@ module.exports = {
   listJobs,
   enqueueJob,
   claimJobs,
+  cancelJobs,
+  getJob,
   completeJob,
   logEvent,
   listEvents,
