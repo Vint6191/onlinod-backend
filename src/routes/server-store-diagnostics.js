@@ -108,11 +108,14 @@ router.get("/status", async (req, res) => {
     modules.push(campaigns);
 
     const automation = await moduleCounts("Automation", "automation", [
+      { name: "tasks", model: "automationTask", where: { agencyId, deletedAt: null } },
+      { name: "jobs", model: "automationJob", where: { agencyId } },
+      { name: "events", model: "automationEvent", where: { agencyId } },
       { name: "deliveries", model: "automationDelivery", where: { agencyId } },
       { name: "hiddenOnline", model: "hiddenOnlineUser", where: { agencyId } },
       { name: "followBackTasks", model: "followBackTask", where: { agencyId } },
     ]);
-    automation.lastUpdatedAt = await safeLatest("automationDelivery", { agencyId }, "updatedAt") || await safeLatest("hiddenOnlineUser", { agencyId }, "updatedAt") || await safeLatest("followBackTask", { agencyId }, "updatedAt");
+    automation.lastUpdatedAt = await safeLatest("automationTask", { agencyId }, "updatedAt") || await safeLatest("automationJob", { agencyId }, "updatedAt") || await safeLatest("automationDelivery", { agencyId }, "updatedAt") || await safeLatest("hiddenOnlineUser", { agencyId }, "updatedAt") || await safeLatest("followBackTask", { agencyId }, "updatedAt");
     modules.push(automation);
 
     const vault = await moduleCounts("Vault sales", "vaultSales", [

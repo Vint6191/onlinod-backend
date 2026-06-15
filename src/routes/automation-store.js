@@ -3,14 +3,80 @@
 const express = require("express");
 const prisma = require("../prisma");
 const { cleanString, optionalString, jsonArray, jsonObject, centsFromAny, parseLimit, parseOffset, positiveInt, requireCreator, sendError } = require("../services/server-store-utils");
+const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+
+const automationServer = require("../services/automation-server-service");
 
 const router = express.Router();
+
+async function requireSeniorAutomationWriter(req, res, next) {
+  try {
+    const agencyId = req.auth?.agencyId;
+    const userId = req.auth?.userId || req.user?.id;
+    if (!agencyId || !userId) {
+      return res.status(401).json({ ok: false, code: "AUTH_REQUIRED", error: "Authentication required" });
+    }
+
+    const member = await prisma.agencyMember.findFirst({
+      where: { agencyId, userId, deletedAt: null, agency: { deletedAt: null } },
+      select: { id: true, role: true, roleKey: true },
+    });
+
+    if (!member) {
+      return res.status(403).json({ ok: false, code: "NOT_A_MEMBER", error: "You are not a member of this agency" });
+    }
+
+    if (!isSeniorAgencyMember(member)) {
+      return res.status(403).json({
+        ok: false,
+        code: "INSUFFICIENT_TEAM_ROLE",
+        error: "Only OWNER / MANAGER / ADMIN can modify automation",
+      });
+    }
+
+    req.agencyMember = member;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+
+// ─── Automation server core v1: generic tasks/jobs/events ────────────────
+router.get("/tasks", async (req, res) => { try { return res.json(await automationServer.listTasks({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_TASKS_FAILED"); } });
+router.post("/tasks", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.upsertTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_UPSERT_FAILED"); } });
+router.patch("/tasks/:id", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.patchTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, taskId: req.params.id, patch: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_PATCH_FAILED"); } });
+router.post("/tasks/:id/trash", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.trashTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, taskId: req.params.id })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_TRASH_FAILED"); } });
+router.post("/tasks/:id/restore", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.restoreTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, taskId: req.params.id })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_RESTORE_FAILED"); } });
+router.delete("/tasks/:id", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.trashTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, taskId: req.params.id, permanent: req.query?.permanent === "1" || req.query?.permanent === "true" })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_DELETE_FAILED"); } });
+
+// Bump template compatibility layer. These routes expose bump_online tasks in
+// the same shape expected by the Electron Automation UI/cache.
+router.get("/bumps", async (req, res) => { try { const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100); return res.json(await automationServer.listBumps({ agencyId: req.auth.agencyId, creatorId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_FAILED"); } });
+router.get("/bumps/:accountId", async (req, res) => { try { return res.json(await automationServer.listBumps({ agencyId: req.auth.agencyId, creatorId: cleanString(req.params.accountId, 100), query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_FAILED"); } });
+router.post("/bumps/upsert", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.body?.creatorId, 100); return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAVE_FAILED"); } });
+router.post("/bumps/:accountId/upsert", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId: cleanString(req.params.accountId, 100), input: { ...(req.body || {}), accountId: req.params.accountId } })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAVE_FAILED"); } });
+router.patch("/bumps/:id", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.body?.creatorId || req.query?.accountId, 100); return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, input: { ...(req.body || {}), id: req.params.id, accountId } })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_PATCH_FAILED"); } });
+router.post("/bumps/:id/trash", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.query?.accountId, 100); return res.json(await automationServer.trashBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, bumpId: req.params.id })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_TRASH_FAILED"); } });
+router.post("/bumps/:id/restore", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.query?.accountId, 100); return res.json(await automationServer.trashBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, bumpId: req.params.id, restore: true })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_RESTORE_FAILED"); } });
+router.delete("/bumps/:id", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.query?.accountId, 100); return res.json(await automationServer.trashBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, bumpId: req.params.id, permanent: true })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_DELETE_FAILED"); } });
+
+router.get("/jobs", async (req, res) => { try { return res.json(await automationServer.listJobs({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOBS_FAILED"); } });
+router.post("/jobs/enqueue", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.enqueueJob({ agencyId: req.auth.agencyId, userId: req.auth.userId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOB_ENQUEUE_FAILED"); } });
+router.post("/jobs/claim", async (req, res) => { try { return res.json(await automationServer.claimJobs({ agencyId: req.auth.agencyId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOB_CLAIM_FAILED"); } });
+router.post("/jobs/:id/result", async (req, res) => { try { return res.json(await automationServer.completeJob({ agencyId: req.auth.agencyId, jobId: req.params.id, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_JOB_RESULT_FAILED"); } });
+
+router.get("/events", async (req, res) => { try { return res.json(await automationServer.listEvents({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_EVENTS_FAILED"); } });
+router.post("/events", async (req, res) => { try { return res.json(await automationServer.logEvent({ agencyId: req.auth.agencyId, userId: req.auth.userId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_EVENT_LOG_FAILED"); } });
 
 function parseDate(value) {
   if (!value) return null;
   const d = new Date(value);
   return Number.isFinite(d.getTime()) ? d : null;
 }
+
+// Legacy server-state mutating routes are intentionally senior-only in v19.5.
+// Worker job protocol remains open through /jobs/claim, /jobs/:id/result and /events.
 
 router.get("/deliveries", async (req, res) => {
   try {
@@ -31,7 +97,7 @@ router.get("/deliveries", async (req, res) => {
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERIES_FAILED"); }
 });
 
-router.post("/deliveries/upsert", async (req, res) => {
+router.post("/deliveries/upsert", requireSeniorAutomationWriter, async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId, 100);
     const fanId = cleanString(req.body?.fanId || req.body?.userId, 80);
@@ -102,7 +168,7 @@ router.get("/hidden-online", async (req, res) => {
   } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_FAILED"); }
 });
 
-router.post("/hidden-online/upsert", async (req, res) => {
+router.post("/hidden-online/upsert", requireSeniorAutomationWriter, async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId, 100);
     const fanId = cleanString(req.body?.fanId || req.body?.userId, 80);
@@ -131,6 +197,33 @@ router.post("/hidden-online/upsert", async (req, res) => {
   } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_UPSERT_FAILED"); }
 });
 
+
+router.post("/hidden-online/clear", requireSeniorAutomationWriter, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const result = await prisma.hiddenOnlineUser.deleteMany({ where: { agencyId: req.auth.agencyId, creatorId } });
+    return res.json({ ok: true, creatorId, deleted: result.count, items: [], signals: [] });
+  } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_CLEAR_FAILED"); }
+});
+
+router.post("/hidden-online/:fanId/status", requireSeniorAutomationWriter, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    const fanId = cleanString(req.params.fanId || req.body?.fanId || req.body?.userId, 80);
+    const status = cleanString(req.body?.status || req.query?.status || "active", 40) || "active";
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
+    const existing = await prisma.hiddenOnlineUser.findUnique({ where: { creatorId_fanId: { creatorId, fanId } } });
+    if (!existing) return res.status(404).json({ ok: false, code: "HIDDEN_ONLINE_USER_NOT_FOUND", error: "Hidden online user not found" });
+    const item = await prisma.hiddenOnlineUser.update({
+      where: { id: existing.id },
+      data: { status, metadata: { ...(existing.metadata && typeof existing.metadata === "object" ? existing.metadata : {}), statusUpdatedAt: new Date().toISOString() } },
+    });
+    return res.json({ ok: true, item });
+  } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_STATUS_FAILED"); }
+});
+
 router.get("/follow-back", async (req, res) => {
   try {
     const where = { agencyId: req.auth.agencyId };
@@ -148,7 +241,7 @@ router.get("/follow-back", async (req, res) => {
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_FAILED"); }
 });
 
-router.post("/follow-back/upsert", async (req, res) => {
+router.post("/follow-back/upsert", requireSeniorAutomationWriter, async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId, 100);
     const fanId = cleanString(req.body?.fanId || req.body?.userId, 80);
@@ -164,6 +257,16 @@ router.post("/follow-back/upsert", async (req, res) => {
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_UPSERT_FAILED"); }
 });
 
+
+router.post("/follow-back/clear", requireSeniorAutomationWriter, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const result = await prisma.followBackTask.deleteMany({ where: { agencyId: req.auth.agencyId, creatorId } });
+    return res.json({ ok: true, creatorId, deleted: result.count, items: [] });
+  } catch (err) { return sendError(res, err, "FOLLOW_BACK_CLEAR_FAILED"); }
+});
+
 // ─── Bump reply-rate aggregate ────────────────────────────────────────────────
 // Атомарный счётчик по (creatorId, templateId, day). Клиент шлёт по одному событию
 // на каждый переход бампа: sent при отправке, replied/canceled/expired/failed в финале.
@@ -171,7 +274,7 @@ router.post("/follow-back/upsert", async (req, res) => {
 // на переход (он гарантирует через флаг statCounted в локальной записи).
 const STAT_EVENTS = new Set(["sent", "replied", "canceled", "expired", "failed"]);
 
-router.post("/deliveries/stat-bump", async (req, res) => {
+router.post("/deliveries/stat-bump", requireSeniorAutomationWriter, async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);

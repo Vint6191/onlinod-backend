@@ -16,6 +16,10 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const DEFAULT_BATCH_SIZE = 2000;
 const RETENTION_SETTING_KEY = "retention.policy.v1";
+// Cluster-wide unique identifier for the retention sweep advisory lock.
+// MUST NOT be changed across versions in production deployments — changing
+// this id temporarily defeats the lock during rolling upgrades. Keep the
+// original v18.26 id so old/new instances cannot run parallel sweeps.
 const RETENTION_ADVISORY_LOCK_ID = 91825026;
 
 const RETENTION_FIELDS = Object.freeze({
@@ -73,6 +77,34 @@ const RETENTION_FIELDS = Object.freeze({
     min: 30,
     max: 3650,
     hint: "sent, ppv purchase, unanswered/incoming attribution rows.",
+  },
+
+  automationJobDoneDays: {
+    label: "Automation completed jobs",
+    unit: "days",
+    env: "ONLINOD_AUTOMATION_JOB_DONE_DAYS",
+    fallback: 30,
+    min: 1,
+    max: 3650,
+    hint: "Done/failed/canceled/expired AutomationJob rows.",
+  },
+  automationEventDays: {
+    label: "Automation audit events",
+    unit: "days",
+    env: "ONLINOD_AUTOMATION_EVENT_DAYS",
+    fallback: 90,
+    min: 1,
+    max: 3650,
+    hint: "Compact AutomationEvent audit rows. No raw payload is stored.",
+  },
+  automationTaskTrashDays: {
+    label: "Trashed automation tasks",
+    unit: "days",
+    env: "ONLINOD_AUTOMATION_TASK_TRASH_DAYS",
+    fallback: 30,
+    min: 1,
+    max: 3650,
+    hint: "Hard-delete soft-deleted AutomationTask rows after this many days.",
   },
 
   trafficSourceMemberNoRevenueDays: {
@@ -205,6 +237,25 @@ async function resetRetentionSettings({ adminId = null } = {}) {
 async function resolveSweepConfig(overrides = {}) {
   const current = await getRetentionSettings();
   return normalizeRetentionSettings({ ...(current.settings || {}), ...(overrides || {}) }, current.settings || defaultRetentionSettings());
+}
+
+async function tryAcquireRetentionLock() {
+  try {
+    const rows = await prisma.$queryRaw`SELECT pg_try_advisory_lock(${RETENTION_ADVISORY_LOCK_ID}) AS locked`;
+    const row = Array.isArray(rows) ? rows[0] : null;
+    return row?.locked === true || row?.pg_try_advisory_lock === true;
+  } catch (err) {
+    console.warn("[retention] advisory lock acquire failed; running without lock:", err?.message || err);
+    return true;
+  }
+}
+
+async function releaseRetentionLock() {
+  try {
+    await prisma.$queryRaw`SELECT pg_advisory_unlock(${RETENTION_ADVISORY_LOCK_ID})`;
+  } catch (err) {
+    console.warn("[retention] advisory lock release failed:", err?.message || err);
+  }
 }
 
 function daysAgo(days) {
@@ -419,6 +470,56 @@ async function deleteZeroTrafficValueSnapshots({ batchSize, olderThan }) {
   return { label: "trafficFanValueSnapshot.zero_orphan", deleted: total };
 }
 
+async function runTeamLedgerRetentionSweep(options = {}) {
+  const result = await gcTeamLedgers({});
+  const items = [
+    { label: "teamSentMessageLedger", deleted: Number(result?.sentMessageLedger || 0) },
+    { label: "teamPpvPurchaseLedger", deleted: Number(result?.ppvPurchaseLedger || 0) },
+    { label: "teamPpvResolveJob", deleted: Number(result?.ppvResolveJob || 0) },
+  ];
+  return summarizeSweep("teamLedgers", items);
+}
+
+async function runAutomationRetentionSweep(options = {}) {
+  const cfg = await resolveSweepConfig(options);
+  const out = [];
+  const jobOlderThan = daysAgo(cfg.automationJobDoneDays);
+
+  out.push(await deleteByIdsInBatches({
+    model: prisma.automationJob,
+    batchSize: cfg.batchSize,
+    label: `automationJob.terminal_${cfg.automationJobDoneDays}d`,
+    orderBy: { updatedAt: "asc" },
+    where: {
+      status: { in: ["done", "failed", "canceled", "expired"] },
+      OR: [
+        { completedAt: { lt: jobOlderThan } },
+        { completedAt: null, updatedAt: { lt: jobOlderThan } },
+      ],
+    },
+  }));
+
+  out.push(await deleteByIdsInBatches({
+    model: prisma.automationEvent,
+    batchSize: cfg.batchSize,
+    label: `automationEvent.audit_${cfg.automationEventDays}d`,
+    orderBy: { createdAt: "asc" },
+    where: { createdAt: { lt: daysAgo(cfg.automationEventDays) } },
+  }));
+
+  out.push(await deleteByIdsInBatches({
+    model: prisma.automationTask,
+    batchSize: cfg.batchSize,
+    label: `automationTask.trash_${cfg.automationTaskTrashDays}d`,
+    orderBy: { deletedAt: "asc" },
+    where: {
+      deletedAt: { not: null, lt: daysAgo(cfg.automationTaskTrashDays) },
+    },
+  }));
+
+  return summarizeSweep("automation", out);
+}
+
 async function runTrafficRetentionSweep(options = {}) {
   const cfg = await resolveSweepConfig(options);
   const out = [];
@@ -458,70 +559,38 @@ async function runTrafficRetentionSweep(options = {}) {
   return summarizeSweep("traffic", out);
 }
 
-async function tryAcquireRetentionLock() {
-  try {
-    const rows = await prisma.$queryRaw`SELECT pg_try_advisory_lock(${RETENTION_ADVISORY_LOCK_ID}) AS acquired`;
-    return rows?.[0]?.acquired === true || rows?.[0]?.pg_try_advisory_lock === true;
-  } catch (err) {
-    console.warn("[retention] advisory lock failed, running without lock:", err?.message || err);
-    return true;
-  }
-}
-
-async function releaseRetentionLock() {
-  try {
-    await prisma.$queryRaw`SELECT pg_advisory_unlock(${RETENTION_ADVISORY_LOCK_ID})`;
-  } catch (err) {
-    console.warn("[retention] advisory unlock failed:", err?.message || err);
-  }
-}
-
-function normalizeTeamLedgerSweepResult(result) {
-  const sent = Number(result?.sentMessageLedger || 0);
-  const purchases = Number(result?.ppvPurchaseLedger || 0);
-  const resolveJobs = Number(result?.ppvResolveJob || 0);
-  return {
-    label: "teamLedgers",
-    totalDeleted: Number(result?.totalDeleted || sent + purchases + resolveJobs),
-    items: [
-      { label: "teamSentMessageLedger", deleted: sent },
-      { label: "teamPpvPurchaseLedger", deleted: purchases },
-      { label: "teamPpvResolveJob", deleted: resolveJobs },
-    ],
-  };
-}
-
-async function runRetentionSweepUnlocked(options = {}) {
-  const startedAt = Date.now();
-  const cfg = await resolveSweepConfig(options);
-  const [teamActivity, traffic, teamLedgersRaw] = await Promise.all([
-    runTeamActivityRetentionSweep(cfg),
-    runTrafficRetentionSweep(cfg),
-    gcTeamLedgers({ olderThanMs: Math.max(1, Number(cfg.teamAuditDays || 365)) * DAY_MS }),
-  ]);
-  const teamLedgers = normalizeTeamLedgerSweepResult(teamLedgersRaw);
-
-  return {
-    ok: true,
-    elapsedMs: Date.now() - startedAt,
-    totalDeleted: (teamActivity.totalDeleted || 0) + (traffic.totalDeleted || 0) + (teamLedgers.totalDeleted || 0),
-    teamActivity,
-    teamLedgers,
-    traffic,
-  };
-}
-
 async function runRetentionSweep(options = {}) {
   const startedAt = Date.now();
-  const locked = options?.useLock === false ? true : await tryAcquireRetentionLock();
-  if (!locked) {
-    return { ok: true, skipped: true, reason: "lock_held", elapsedMs: Date.now() - startedAt, totalDeleted: 0 };
+  const useLock = options?.useAdvisoryLock !== false;
+  let lockAcquired = false;
+
+  if (useLock) {
+    lockAcquired = await tryAcquireRetentionLock();
+    if (!lockAcquired) {
+      return { ok: true, skipped: true, reason: "lock_held", elapsedMs: Date.now() - startedAt, totalDeleted: 0 };
+    }
   }
 
   try {
-    return await runRetentionSweepUnlocked(options);
+    const [teamActivity, teamLedgers, traffic, automation] = await Promise.all([
+      runTeamActivityRetentionSweep(options),
+      runTeamLedgerRetentionSweep(options),
+      runTrafficRetentionSweep(options),
+      runAutomationRetentionSweep(options),
+    ]);
+
+    return {
+      ok: true,
+      elapsedMs: Date.now() - startedAt,
+      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0),
+      teamActivity,
+      teamLedgers,
+      traffic,
+      automation,
+      lock: useLock ? "advisory" : "disabled",
+    };
   } finally {
-    if (options?.useLock !== false) await releaseRetentionLock();
+    if (useLock && lockAcquired) await releaseRetentionLock();
   }
 }
 
@@ -532,14 +601,17 @@ function summarizeSweep(label, items) {
 
 module.exports = {
   RETENTION_SETTING_KEY,
-  RETENTION_ADVISORY_LOCK_ID,
   runRetentionSweep,
   runTeamActivityRetentionSweep,
+  runTeamLedgerRetentionSweep,
   runTrafficRetentionSweep,
+  runAutomationRetentionSweep,
   getRetentionSettings,
   updateRetentionSettings,
   resetRetentionSettings,
   defaultRetentionSettings,
   normalizeRetentionSettings,
   retentionSchema,
+  tryAcquireRetentionLock,
+  releaseRetentionLock,
 };

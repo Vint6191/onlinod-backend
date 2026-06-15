@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
+const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 
 const TRAFFIC_SOURCES_SCAN_JOB_KEY = "traffic_sources_scan";
 const VALUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
@@ -1747,11 +1748,6 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
 }
 
 
-function isSeniorTrafficMember(member) {
-  const role = String(member?.role || "").toUpperCase();
-  const roleKey = String(member?.roleKey || "").toLowerCase();
-  return role === "OWNER" || role === "MANAGER" || role === "ADMIN" || ["owner", "manager", "admin"].includes(roleKey);
-}
 
 async function recomputeTrafficDailyAggregatesForSource({ agencyId, creatorId, sourceId, chunkSize = 30 } = {}) {
   const cleanSourceId = clean(sourceId, 180);
@@ -1791,7 +1787,7 @@ async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents,
 
   // Cost/ROI is a financial setting. Keep it owner/manager/admin-only so
   // chatters cannot manipulate promo performance by zeroing source cost.
-  if (!isSeniorTrafficMember(member)) {
+  if (!isSeniorAgencyMember(member)) {
     const err = new Error("Only OWNER / manager / admin can update traffic source cost");
     err.code = "INSUFFICIENT_TEAM_ROLE";
     throw err;

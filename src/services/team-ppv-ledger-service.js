@@ -1063,7 +1063,6 @@ async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS } = {}) {
     sentMessageLedger: sent?.count || 0,
     ppvPurchaseLedger: purchases?.count || 0,
     ppvResolveJob: resolveJobs?.count || 0,
-    totalDeleted: (sent?.count || 0) + (purchases?.count || 0) + (resolveJobs?.count || 0),
   };
 }
 

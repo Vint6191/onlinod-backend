@@ -928,6 +928,108 @@ model AutomationLog {
   @@index([runId])
 }
 
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ONLINOD AUTOMATION SERVER CORE v1
+// Server-side source of truth for automation tasks/jobs/events. Electron remains
+// the OF worker and local cache fallback. No raw OF payload is stored here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AutomationTask {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String?
+  clientId        String?
+  type            String
+  title           String   @default("Untitled automation")
+  enabled         Boolean  @default(true)
+  status          String   @default("active") // active | paused | archived | deleted
+  config          Json     @default("{}")
+  triggers        Json     @default("{}")
+  rules           Json     @default("{}")
+  schedule        Json     @default("{}")
+  stats           Json     @default("{}")
+  metadata        Json     @default("{}")
+  createdByUserId String?
+  updatedByUserId String?
+  deletedAt       DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([agencyId, clientId])
+  @@index([agencyId, type, status])
+  @@index([creatorId, type, status])
+  @@index([enabled])
+  @@index([deletedAt])
+  @@index([status, deletedAt])
+  @@index([updatedAt])
+}
+
+model AutomationJob {
+  id                String   @id @default(cuid())
+  agencyId          String
+  taskId            String?
+  creatorId         String?
+  accountId         String?
+  fanId             String?
+  dialogId          String?
+  type              String
+  action            String   @default("run")
+  status            String   @default("scheduled") // scheduled | claimed | running | done | failed | canceled | expired
+  priority          Int      @default(0)
+  runAfter          DateTime @default(now())
+  claimedByDeviceId String?
+  claimedAt         DateTime?
+  attempts          Int      @default(0)
+  maxAttempts       Int      @default(3)
+  dedupeKey         String?
+  payload           Json     @default("{}")
+  result            Json     @default("{}")
+  error             String?
+  completedAt       DateTime?
+  createdByUserId   String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([agencyId, dedupeKey])
+  @@index([agencyId, status, runAfter])
+  @@index([agencyId, type, status])
+  @@index([creatorId, status])
+  @@index([taskId, status])
+  @@index([claimedByDeviceId, claimedAt])
+  @@index([status, completedAt])
+  @@index([status, updatedAt])
+  @@index([fanId])
+  @@index([createdAt])
+}
+
+model AutomationEvent {
+  id              String   @id @default(cuid())
+  agencyId        String
+  taskId          String?
+  jobId           String?
+  creatorId       String?
+  accountId       String?
+  fanId           String?
+  dialogId        String?
+  type            String
+  status          String   @default("info")
+  messageId       String?
+  amountCents     Int      @default(0)
+  metadata        Json     @default("{}")
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+
+  @@index([agencyId, createdAt])
+  @@index([agencyId, type, createdAt])
+  @@index([createdAt])
+  @@index([creatorId, fanId])
+  @@index([taskId])
+  @@index([jobId])
+  @@index([messageId])
+}
+
 model VaultUnsortedSnapshot {
   id        String   @id @default(cuid())
   agencyId  String
