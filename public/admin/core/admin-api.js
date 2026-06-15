@@ -112,6 +112,10 @@
     // dashboard / system
     dashboard:    ()       => request("/api/admin/dashboard"),
     systemHealth: ()       => request("/api/admin/system/health"),
+    retentionSettings: ()  => request("/api/admin/system/retention"),
+    saveRetentionSettings: (body) => request("/api/admin/system/retention", { method: "PATCH", body }),
+    resetRetentionSettings: () => request("/api/admin/system/retention/reset", { method: "POST" }),
+    runRetentionSweep: ()  => request("/api/admin/system/retention/run", { method: "POST" }),
     plans:        ()       => request("/api/admin/plans"),
 
     // agencies

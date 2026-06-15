@@ -236,15 +236,41 @@ function sourceLabel(sourceType) {
 }
 
 
-function compactJson(value, max = 12000) {
+const TRAFFIC_METADATA_RAW_KEY_RE = /^(raw|rawHtml|html|payload|body|response|request|headers|cookie|cookies|authorization|token|accessToken|refreshToken)$/i;
+const TRAFFIC_METADATA_RAW_HINT_RE = /(rawHtml|payload|headers|cookies?|authorization|accessToken|refreshToken)/i;
+
+function stripRawMetadata(value, depth = 0) {
+  if (!value || typeof value !== "object") return value;
+  if (depth >= 4) return null;
+
+  if (Array.isArray(value)) {
+    const out = value
+      .slice(0, 25)
+      .map((item) => stripRawMetadata(item, depth + 1))
+      .filter((item) => item !== undefined && item !== null);
+    return out.length ? out : null;
+  }
+
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (TRAFFIC_METADATA_RAW_KEY_RE.test(key) || TRAFFIC_METADATA_RAW_HINT_RE.test(key)) continue;
+    const next = stripRawMetadata(item, depth + 1);
+    if (next !== undefined && next !== null && next !== "") out[key] = next;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function compactJson(value, max = 4096) {
   if (!value || typeof value !== "object") return null;
   try {
-    const s = JSON.stringify(value);
+    const safeValue = stripRawMetadata(value);
+    if (!safeValue || typeof safeValue !== "object") return null;
+    const s = JSON.stringify(safeValue);
     if (s.length > max) {
       console.warn(`[traffic] metadata dropped/truncated, size=${s.length}, max=${max}`);
       return { truncated: true, originalSize: s.length };
     }
-    return value;
+    return safeValue;
   } catch (err) {
     console.warn(`[traffic] metadata json failed: ${err?.message || err}`);
     return null;
@@ -268,7 +294,7 @@ function normalizeSource(input = {}, { accountId } = {}) {
     costCents: cents(input.costCents) || moneyCents(input.cost),
     currency: clean(input.currency, 8) || "USD",
     stats: compactJson(input.stats || input.totals || input.metrics || null),
-    metadata: compactJson(input.metadata || input.rawMeta || null),
+    metadata: compactJson(input.metadata || null),
   };
 }
 

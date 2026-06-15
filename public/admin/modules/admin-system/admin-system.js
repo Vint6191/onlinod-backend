@@ -1,15 +1,7 @@
 /* public/admin/modules/admin-system/admin-system.js
    ────────────────────────────────────────────────────────────
-   System status panel.
-   
-   Backend GET /api/admin/system/health returns:
-     { ok, server: {version, node, uptime, memoryMb},
-            db: {ok, latencyMs, error?},
-            env: {hasResendKey, hasSnapshotKey, hasJwtSecret,
-                  publicBaseUrl, nodeEnv} }
-   
-   We render it as a grid of pills + a refresh button. Auto-polls
-   every 15s while the page is visible.
+   System status + retention controls.
+   Retention writes are SUPER_ADMIN-only on the backend.
    ──────────────────────────────────────────────────────────── */
 
 (function () {
@@ -25,6 +17,15 @@
     data: null,
     lastLoadedAt: 0,
     pollTimer: null,
+
+    retentionLoading: false,
+    retentionSaving: false,
+    retentionRunning: false,
+    retentionError: null,
+    retentionResult: null,
+    retentionData: null,
+    retentionDraft: null,
+    retentionDirty: false,
   };
 
   async function load(force) {
@@ -42,10 +43,95 @@
       state.error = result?.error || "Failed to load system health";
       state.data = null;
     } else {
-      // Backend may return ok:false when db is down — keep the data anyway.
       state.data = result;
       state.lastLoadedAt = Date.now();
       state.error = null;
+    }
+    rerender();
+  }
+
+  async function loadRetention(force) {
+    if (state.retentionLoading) return;
+    if (!force && state.retentionData) return;
+    if (state.retentionDirty && !force) return;
+
+    state.retentionLoading = true;
+    state.retentionError = null;
+    rerender();
+
+    const result = await A().retentionSettings();
+    state.retentionLoading = false;
+
+    if (!result?.ok) {
+      state.retentionError = result?.error || "Failed to load retention settings";
+    } else {
+      state.retentionData = result;
+      if (!state.retentionDirty) state.retentionDraft = { ...(result.settings || {}) };
+      state.retentionError = null;
+    }
+    rerender();
+  }
+
+  async function saveRetention() {
+    if (state.retentionSaving || !state.retentionDraft) return;
+    state.retentionSaving = true;
+    state.retentionError = null;
+    state.retentionResult = null;
+    rerender();
+
+    const result = await A().saveRetentionSettings({ settings: state.retentionDraft });
+    state.retentionSaving = false;
+
+    if (!result?.ok) {
+      state.retentionError = result?.error || "Failed to save retention settings";
+    } else {
+      state.retentionData = result;
+      state.retentionDraft = { ...(result.settings || {}) };
+      state.retentionDirty = false;
+      state.retentionResult = { ok: true, message: "Retention settings saved" };
+    }
+    rerender();
+  }
+
+  async function resetRetention() {
+    if (state.retentionSaving) return;
+    if (!confirm("Reset retention settings to env/default values?")) return;
+
+    state.retentionSaving = true;
+    state.retentionError = null;
+    state.retentionResult = null;
+    rerender();
+
+    const result = await A().resetRetentionSettings();
+    state.retentionSaving = false;
+
+    if (!result?.ok) {
+      state.retentionError = result?.error || "Failed to reset retention settings";
+    } else {
+      state.retentionData = result;
+      state.retentionDraft = { ...(result.settings || {}) };
+      state.retentionDirty = false;
+      state.retentionResult = { ok: true, message: "Retention settings reset" };
+    }
+    rerender();
+  }
+
+  async function runRetentionNow() {
+    if (state.retentionRunning) return;
+    if (!confirm("Run retention sweep now? This can delete old rows according to the current policy.")) return;
+
+    state.retentionRunning = true;
+    state.retentionError = null;
+    state.retentionResult = null;
+    rerender();
+
+    const result = await A().runRetentionSweep();
+    state.retentionRunning = false;
+
+    if (!result?.ok) {
+      state.retentionError = result?.error || "Retention sweep failed";
+    } else {
+      state.retentionResult = result;
     }
     rerender();
   }
@@ -79,18 +165,16 @@
 
   function render(main) {
     const r = R();
-    const u = U();
 
-    if (!state.data && !state.loading && !state.error) {
-      load(false);
-    }
+    if (!state.data && !state.loading && !state.error) load(false);
+    if (!state.retentionData && !state.retentionLoading && !state.retentionError) loadRetention(false);
     startPolling();
 
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
           <div class="adm-page-title">System</div>
-          <div class="adm-page-subtitle">~/admin/system · auto-refresh 15s</div>
+          <div class="adm-page-subtitle">~/admin/system · health auto-refresh 15s · retention policy editable</div>
         </div>
         <button class="adm-btn ghost" id="admSysRefresh">↻ refresh</button>
       </div>
@@ -104,9 +188,16 @@
           ? renderContent(state.data)
           : ""
       }
+
+      ${renderRetentionCard()}
     `;
 
-    main.querySelector("#admSysRefresh")?.addEventListener("click", () => load(true));
+    main.querySelector("#admSysRefresh")?.addEventListener("click", () => {
+      load(true);
+      loadRetention(true);
+    });
+
+    bindRetentionEvents(main);
   }
 
   function renderContent(d) {
@@ -174,6 +265,115 @@
         Last polled: ${r.escapeHtml(u.timeAgo(state.lastLoadedAt))}
       </div>
     `;
+  }
+
+  function renderRetentionCard() {
+    const r = R();
+    const data = state.retentionData || {};
+    const schema = data.schema || {};
+    const draft = state.retentionDraft || data.settings || {};
+    const source = data.source || "?";
+
+    const groups = [
+      ["Core", ["retentionSweepWindowHours", "batchSize"]],
+      ["Team activity", ["teamIntermediateDays", "teamSessionDays", "teamNoticeDays", "teamAuditDays"]],
+      ["Traffic", ["trafficSourceMemberNoRevenueDays", "trafficZeroSnapshotDays", "trafficDailyAggregateDays", "trafficPaidOrganicLedgerDays", "trafficFreeOrganicCleanupHours"]],
+    ];
+
+    return `
+      <div class="adm-card" style="margin-top:12px;">
+        <div class="adm-card-head">
+          <div>
+            <div class="adm-card-title">Retention policy</div>
+            <div style="color:var(--adm-muted);font-size:12px;margin-top:3px;">
+              Controls cleanup for TeamActivityEvent and Traffic tables. Source: ${r.escapeHtml(source)}${data.updatedAt ? ` · updated ${r.escapeHtml(U().timeAgo(data.updatedAt))}` : ""}
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
+            <button class="adm-btn ghost" id="admRetentionReload" ${state.retentionLoading ? "disabled" : ""}>reload</button>
+            <button class="adm-btn ghost" id="admRetentionReset" ${state.retentionSaving ? "disabled" : ""}>reset defaults</button>
+            <button class="adm-btn ghost" id="admRetentionRun" ${state.retentionRunning ? "disabled" : ""}>${state.retentionRunning ? "running…" : "run cleanup now"}</button>
+            <button class="adm-btn" id="admRetentionSave" ${state.retentionSaving || !state.retentionDirty ? "disabled" : ""}>${state.retentionSaving ? "saving…" : "save"}</button>
+          </div>
+        </div>
+
+        ${state.retentionError ? `<div class="adm-error" style="margin-bottom:10px;">${r.escapeHtml(state.retentionError)}</div>` : ""}
+        ${renderRetentionResult()}
+        ${state.retentionLoading && !state.retentionData ? `<div class="adm-loading">loading retention policy…</div>` : ""}
+
+        ${groups.map(([title, keys]) => `
+          <div style="margin-top:12px;">
+            <div style="font-weight:700;margin-bottom:8px;color:var(--adm-text);">${r.escapeHtml(title)}</div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px;">
+              ${keys.map((key) => retentionField(key, schema[key] || {}, draft[key])).join("")}
+            </div>
+          </div>
+        `).join("")}
+
+        <div style="margin-top:12px;color:var(--adm-muted);font-size:12px;line-height:1.5;">
+          0 is allowed only for paid organic ledger retention and means keep forever. Writes require SUPER_ADMIN.
+        </div>
+      </div>
+    `;
+  }
+
+  function retentionField(key, spec, value) {
+    const r = R();
+    const safeValue = value ?? spec.fallback ?? "";
+    return `
+      <label style="display:flex;flex-direction:column;gap:6px;padding:10px 12px;border-radius:9px;background:rgba(0,0,0,.18);border:1px solid var(--adm-line);">
+        <span style="display:flex;justify-content:space-between;gap:8px;align-items:center;">
+          <span style="font-size:12px;font-weight:700;color:var(--adm-text);">${r.escapeHtml(spec.label || key)}</span>
+          <span style="font-family:var(--adm-mono);font-size:10.5px;color:var(--adm-muted);">${r.escapeHtml(spec.unit || "")}</span>
+        </span>
+        <input class="adm-retention-input" data-key="${r.escapeHtml(key)}" type="number" min="${Number(spec.min ?? 0)}" max="${Number(spec.max ?? 999999)}" step="1" value="${r.escapeHtml(String(safeValue))}" style="width:100%;box-sizing:border-box;border-radius:7px;border:1px solid var(--adm-line);background:rgba(255,255,255,.04);color:var(--adm-text);padding:8px 10px;font-family:var(--adm-mono);">
+        <span style="font-size:11px;color:var(--adm-muted);line-height:1.35;">${r.escapeHtml(spec.hint || "")}</span>
+        <span style="font-size:10.5px;color:var(--adm-muted);font-family:var(--adm-mono);">min ${r.escapeHtml(String(spec.min ?? "?"))} · max ${r.escapeHtml(String(spec.max ?? "?"))} · default ${r.escapeHtml(String(spec.fallback ?? "?"))}</span>
+      </label>
+    `;
+  }
+
+  function renderRetentionResult() {
+    const r = R();
+    const result = state.retentionResult;
+    if (!result) return "";
+    if (result.message) {
+      return `<div class="adm-success" style="margin-bottom:10px;">${r.escapeHtml(result.message)}</div>`;
+    }
+    const total = Number(result.totalDeleted || 0);
+    const parts = [];
+    const addItems = (bucket) => {
+      for (const item of bucket?.items || []) {
+        parts.push(`${item.label}: ${item.deleted || 0}`);
+      }
+    };
+    addItems(result.teamActivity);
+    addItems(result.traffic);
+    return `
+      <div class="adm-success" style="margin-bottom:10px;">
+        Cleanup done: deleted ${r.escapeHtml(String(total))} rows${result.elapsedMs ? ` · ${r.escapeHtml(String(result.elapsedMs))}ms` : ""}
+        ${parts.length ? `<div style="font-family:var(--adm-mono);font-size:11px;margin-top:6px;color:var(--adm-text-soft);">${r.escapeHtml(parts.join(" · "))}</div>` : ""}
+      </div>
+    `;
+  }
+
+  function bindRetentionEvents(main) {
+    main.querySelector("#admRetentionReload")?.addEventListener("click", () => loadRetention(true));
+    main.querySelector("#admRetentionSave")?.addEventListener("click", saveRetention);
+    main.querySelector("#admRetentionReset")?.addEventListener("click", resetRetention);
+    main.querySelector("#admRetentionRun")?.addEventListener("click", runRetentionNow);
+
+    main.querySelectorAll(".adm-retention-input").forEach((input) => {
+      input.addEventListener("input", () => {
+        const key = input.dataset.key;
+        if (!key) return;
+        if (!state.retentionDraft) state.retentionDraft = { ...(state.retentionData?.settings || {}) };
+        state.retentionDraft[key] = Number(input.value);
+        state.retentionDirty = true;
+        const save = document.getElementById("admRetentionSave");
+        if (save) save.disabled = false;
+      });
+    });
   }
 
   function metricCard(label, value, sub) {

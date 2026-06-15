@@ -755,6 +755,7 @@ model TeamActivityEvent {
   @@index([agencyId, creatorId, ts])
   @@index([agencyId, accountId, ts])
   @@index([agencyId, type, ts])
+  @@index([type, ts])
 }
 
 model AnalyticsSnapshot {
@@ -1753,6 +1754,7 @@ model TrafficSourceMember {
   @@index([agencyId, creatorId, fanId])
   @@index([sourceId, fanId])
   @@index([needsValueRefresh, lastValueFetchedAt])
+  @@index([lastRevenueAt, lastSeenAt, needsValueRefresh])
 }
 
 model TrafficFanValueSnapshot {
@@ -1780,6 +1782,7 @@ model TrafficFanValueSnapshot {
 
   @@unique([agencyId, creatorId, fanId])
   @@index([agencyId, creatorId, fetchedAt])
+  @@index([fetchedAt])
 }
 
 model CreatorSubscriptionLedger {
@@ -1817,6 +1820,7 @@ model CreatorSubscriptionLedger {
   @@index([agencyId, creatorId, fanId, occurredAt])
   @@index([agencyId, creatorId, sourceId, occurredAt])
   @@index([agencyId, creatorId, organicConfirmed, attributionAttempts])
+  @@index([sourceId, organicConfirmed, amountCents, occurredAt])
 }
 
 model TrafficDailyAggregate {
@@ -1844,6 +1848,7 @@ model TrafficDailyAggregate {
 
   @@unique([sourceId, day])
   @@index([agencyId, creatorId, day])
+  @@index([day])
 }
 
 model TeamPpvPurchaseLedger {
@@ -1948,3 +1953,15 @@ model TeamPpvResolveJob {
   @@index([agencyId, messageId])
 }
 
+
+model SystemSetting {
+  id               String   @id @default(cuid())
+  key              String   @unique
+  value            Json
+  updatedByAdminId String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([key])
+  @@index([updatedAt])
+}

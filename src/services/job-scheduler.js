@@ -26,6 +26,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { runRetentionSweep, getRetentionSettings } = require("./retention-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -40,6 +41,39 @@ const RECURRING_INTERVAL_MS = 60 * 60 * 1000;
 // Same as RECURRING_INTERVAL_MS — if we just refreshed, don't refresh again.
 const FRESHNESS_WINDOW_MS = RECURRING_INTERVAL_MS;
 const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
+const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin setting can override
+let lastRetentionSweepAt = 0;
+
+async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) {
+  let retentionWindowMs = RETENTION_SWEEP_WINDOW_MS;
+  try {
+    const current = await getRetentionSettings();
+    const hours = Number(current?.settings?.retentionSweepWindowHours || 24);
+    if (Number.isFinite(hours) && hours > 0) {
+      retentionWindowMs = Math.max(1, Math.round(hours)) * 60 * 60 * 1000;
+    }
+  } catch (err) {
+    console.warn("[scheduler] retention settings read failed:", err?.message || err);
+  }
+
+  if (!force && lastRetentionSweepAt && now.getTime() - lastRetentionSweepAt < retentionWindowMs) {
+    return { ok: true, skipped: true, reason: "fresh", windowMs: retentionWindowMs };
+  }
+
+  lastRetentionSweepAt = now.getTime();
+  const startedAt = Date.now();
+
+  try {
+    const result = await runRetentionSweep({});
+    console.log(
+      `[scheduler] retention sweep done in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}`
+    );
+    return { ...result, windowMs: retentionWindowMs };
+  } catch (err) {
+    console.warn("[scheduler] retention sweep failed:", err?.message || err);
+    return { ok: false, error: err?.message || String(err), windowMs: retentionWindowMs };
+  }
+}
 
 
 /**
@@ -188,6 +222,7 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
  */
 async function runRecurringSweep() {
   const startedAt = Date.now();
+  const now = new Date();
 
   const creators = await prisma.creatorAccount.findMany({
     where: {
@@ -216,12 +251,19 @@ async function runRecurringSweep() {
     }
   }
 
+  const retention = await maybeRunRetentionSweep({ now });
+
   const elapsed = Date.now() - startedAt;
   console.log(
     `[scheduler] sweep done in ${elapsed}ms — creators=${creators.length}, jobs created=${totalCreated}, skipped=${totalSkipped}`
   );
 
-  return { creatorsScanned: creators.length, jobsCreated: totalCreated, jobsSkipped: totalSkipped };
+  return {
+    creatorsScanned: creators.length,
+    jobsCreated: totalCreated,
+    jobsSkipped: totalSkipped,
+    retention,
+  };
 }
 
 
@@ -274,4 +316,6 @@ module.exports = {
   RECURRING_INTERVAL_MS,
   FRESHNESS_WINDOW_MS,
   TRAFFIC_REFRESH_WINDOW_MS,
+  RETENTION_SWEEP_WINDOW_MS,
+  maybeRunRetentionSweep,
 };

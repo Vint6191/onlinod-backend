@@ -1042,14 +1042,29 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign"
 async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS } = {}) {
   await expirePendingJobs({});
   const before = new Date(Date.now() - olderThanMs);
-  await prisma.teamSentMessageLedger.deleteMany({ where: { sentAt: { lt: before } } });
-  await prisma.teamPpvPurchaseLedger.deleteMany({ where: { purchasedAt: { lt: before }, status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected"] } } });
-  await prisma.teamPpvResolveJob.deleteMany({
-    where: {
-      OR: [{ expiresAt: { lt: new Date() } }, { createdAt: { lt: before } }],
-      status: { in: ["resolved", "expired", "rejected"] },
-    },
-  });
+
+  const [sent, purchases, resolveJobs] = await Promise.all([
+    prisma.teamSentMessageLedger.deleteMany({ where: { sentAt: { lt: before } } }),
+    prisma.teamPpvPurchaseLedger.deleteMany({
+      where: {
+        purchasedAt: { lt: before },
+        status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected"] },
+      },
+    }),
+    prisma.teamPpvResolveJob.deleteMany({
+      where: {
+        OR: [{ expiresAt: { lt: new Date() } }, { createdAt: { lt: before } }],
+        status: { in: ["resolved", "expired", "rejected"] },
+      },
+    }),
+  ]);
+
+  return {
+    sentMessageLedger: sent?.count || 0,
+    ppvPurchaseLedger: purchases?.count || 0,
+    ppvResolveJob: resolveJobs?.count || 0,
+    totalDeleted: (sent?.count || 0) + (purchases?.count || 0) + (resolveJobs?.count || 0),
+  };
 }
 
 module.exports = {

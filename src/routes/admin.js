@@ -60,6 +60,7 @@ const { z }     = require("zod");
 const prisma    = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
 const { signAccessToken } = require("../utils/tokens");
+const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -339,6 +340,74 @@ router.get("/system/health", async (_req, res) => {
   }
 
   return res.json(result);
+});
+
+
+// ════════════════════════════════════════════════════════════
+// SYSTEM RETENTION SETTINGS
+// SUPER_ADMIN only for writes because these settings delete data.
+// ════════════════════════════════════════════════════════════
+
+router.get("/system/retention", async (_req, res) => {
+  try {
+    const result = await getRetentionSettings();
+    return res.json(result);
+  } catch (err) {
+    console.error("[admin/system/retention] failed:", err);
+    return res.status(500).json({ ok: false, code: "RETENTION_SETTINGS_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+router.patch("/system/retention", async (req, res) => {
+  if (!ensureSuperAdmin(req, res)) return;
+  try {
+    const settings = req.body?.settings && typeof req.body.settings === "object" ? req.body.settings : req.body || {};
+    const result = await updateRetentionSettings({ settings, adminId: req.admin.id });
+    await adminLog(req, {
+      action: "RETENTION_SETTINGS_UPDATE",
+      targetType: "system",
+      targetId: "retention.policy.v1",
+      meta: { settings: result.settings },
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error("[admin/system/retention PATCH] failed:", err);
+    return res.status(500).json({ ok: false, code: "RETENTION_SETTINGS_SAVE_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+router.post("/system/retention/reset", async (req, res) => {
+  if (!ensureSuperAdmin(req, res)) return;
+  try {
+    const result = await resetRetentionSettings({ adminId: req.admin.id });
+    await adminLog(req, {
+      action: "RETENTION_SETTINGS_RESET",
+      targetType: "system",
+      targetId: "retention.policy.v1",
+      meta: { source: result.source, settings: result.settings },
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error("[admin/system/retention reset] failed:", err);
+    return res.status(500).json({ ok: false, code: "RETENTION_SETTINGS_RESET_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+router.post("/system/retention/run", async (req, res) => {
+  if (!ensureSuperAdmin(req, res)) return;
+  try {
+    const result = await runRetentionSweep({});
+    await adminLog(req, {
+      action: "RETENTION_SWEEP_RUN",
+      targetType: "system",
+      targetId: "retention.policy.v1",
+      meta: { totalDeleted: result.totalDeleted || 0, elapsedMs: result.elapsedMs || 0 },
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error("[admin/system/retention run] failed:", err);
+    return res.status(500).json({ ok: false, code: "RETENTION_SWEEP_FAILED", error: err?.message || "Failed" });
+  }
 });
 
 
