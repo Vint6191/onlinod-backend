@@ -224,6 +224,105 @@ router.post("/hidden-online/:fanId/status", requireSeniorAutomationWriter, async
   } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_STATUS_FAILED"); }
 });
 
+
+function followBackTerminalStatus(status) {
+  const s = String(status || "").trim().toLowerCase();
+  return s === "done" || s === "completed" || s === "followed" || s === "waiting_return" || s === "final_unfollowed";
+}
+
+function compactWorkerResult(body = {}) {
+  const result = body?.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {};
+  const out = {
+    ...result,
+    source: result.source || "electron_follow_back_worker",
+    workerUpdatedAt: new Date().toISOString(),
+  };
+  const copyKeys = [
+    "skipReason", "failReason", "processedAt", "skippedAt", "failedAt", "lastSuccessAt",
+    "lastAttemptAt", "lastFollowBackAt", "lastRefollowNudgeAt", "waitReturnUntil",
+    "refollowStatus", "followBackStatus", "refollowNudgeCount", "bumpEligible",
+    "attentionStatus", "attentionLikesTarget", "attentionLikesDone", "attentionError",
+    "canChat", "canReceiveChatMessage", "reason", "actionReason", "decisionReason",
+  ];
+  for (const key of copyKeys) {
+    if (body?.[key] !== undefined && body?.[key] !== null) out[key] = body[key];
+  }
+  return jsonObject(out);
+}
+
+async function upsertFollowBackWorkerItem({ req, creatorId, rawItem }) {
+  const body = rawItem || {};
+  const fanId = cleanString(body.fanId || body.userId || body.id, 80);
+  const action = cleanString(body.action || "follow_back", 80) || "follow_back";
+  if (!fanId) return null;
+
+  const incomingStatus = cleanString(body.status || "pending", 40) || "pending";
+  const existing = await prisma.followBackTask.findUnique({
+    where: { creatorId_fanId_action: { creatorId, fanId, action } },
+  });
+
+  const status = existing && followBackTerminalStatus(existing.status) && incomingStatus === "pending"
+    ? existing.status
+    : incomingStatus;
+
+  const reason = optionalString(
+    body.reason || body.skipReason || body.failReason || body.actionReason || body.decisionReason,
+    500
+  );
+  const lastResultAt = parseDate(body.lastResultAt || body.processedAt || body.skippedAt || body.failedAt || body.updatedAt);
+  const result = compactWorkerResult(body);
+
+  return prisma.followBackTask.upsert({
+    where: { creatorId_fanId_action: { creatorId, fanId, action } },
+    create: {
+      agencyId: req.auth.agencyId,
+      creatorId,
+      fanId,
+      action,
+      dialogId: optionalString(body.dialogId, 80),
+      username: optionalString(body.username, 120),
+      name: optionalString(body.name, 180),
+      status,
+      reason,
+      result,
+      error: optionalString(body.error || body.failReason, 2000),
+      lastResultAt,
+      createdByUserId: req.auth.userId,
+    },
+    update: {
+      dialogId: body.dialogId === undefined ? undefined : optionalString(body.dialogId, 80),
+      username: body.username === undefined ? undefined : optionalString(body.username, 120),
+      name: body.name === undefined ? undefined : optionalString(body.name, 180),
+      status,
+      reason: reason === null ? undefined : reason,
+      result,
+      error: body.error === undefined && body.failReason === undefined ? undefined : optionalString(body.error || body.failReason, 2000),
+      lastResultAt: lastResultAt || undefined,
+    },
+  });
+}
+
+function isFollowBackClaimExpired(item, now = Date.now()) {
+  const result = item?.result && typeof item.result === "object" ? item.result : {};
+  const leaseUntil = result.leaseUntil ? new Date(result.leaseUntil).getTime() : 0;
+  if (Number.isFinite(leaseUntil) && leaseUntil > 0) return leaseUntil <= now;
+  const updatedAt = item?.updatedAt ? new Date(item.updatedAt).getTime() : 0;
+  return Number.isFinite(updatedAt) && updatedAt > 0 && now - updatedAt > 10 * 60 * 1000;
+}
+
+function followBackClaimMeta(existingResult = {}, body = {}, deviceId = "unknown") {
+  const now = new Date();
+  const timeoutSec = Math.max(60, Math.min(86400, positiveInt(body.claimTimeoutSec, 600)));
+  return jsonObject({
+    ...(existingResult && typeof existingResult === "object" ? existingResult : {}),
+    claimedByDeviceId: deviceId,
+    claimedAt: now.toISOString(),
+    leaseUntil: new Date(now.getTime() + timeoutSec * 1000).toISOString(),
+    claimTimeoutSec: timeoutSec,
+    claimSource: "follow_back_worker_claim",
+  });
+}
+
 router.get("/follow-back", async (req, res) => {
   try {
     const where = { agencyId: req.auth.agencyId };
@@ -255,6 +354,121 @@ router.post("/follow-back/upsert", requireSeniorAutomationWriter, async (req, re
     });
     return res.json({ ok: true, item });
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_UPSERT_FAILED"); }
+});
+
+
+// Worker protocol: opened for authenticated Electron workers. Definition/destructive
+// writes stay senior-only, but workers must be able to mirror scan decisions,
+// claim one fan atomically, and report the result after OF action execution.
+router.post("/follow-back/worker/upsert-bulk", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const written = [];
+    for (const raw of items.slice(0, 1000)) {
+      const item = await upsertFollowBackWorkerItem({ req, creatorId, rawItem: raw });
+      if (item) written.push(item);
+    }
+    return res.json({ ok: true, creatorId, count: written.length, items: written });
+  } catch (err) { return sendError(res, err, "FOLLOW_BACK_WORKER_UPSERT_FAILED"); }
+});
+
+router.post("/follow-back/worker/claim", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
+    const limit = parseLimit(req.body?.limit, 1, 10);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+
+    const nowMs = Date.now();
+    const staleBefore = new Date(nowMs - Math.max(60, Math.min(86400, positiveInt(req.body?.claimTimeoutSec, 600))) * 1000);
+
+    // DB-level stale recovery. JSON lease is primary; updatedAt fallback covers
+    // old rows that were marked running before worker leases existed.
+    await prisma.$executeRaw`
+      UPDATE "FollowBackTask"
+      SET "status" = 'pending', "error" = 'claim expired; returned to queue', "lastResultAt" = NOW()
+      WHERE "agencyId" = ${req.auth.agencyId}
+        AND "creatorId" = ${creatorId}
+        AND "status" = 'running'
+        AND (
+          ("result"->>'leaseUntil')::timestamptz < NOW()
+          OR (("result"->>'leaseUntil') IS NULL AND "updatedAt" < ${staleBefore})
+        )
+    `.catch(() => null);
+
+    const candidates = await prisma.followBackTask.findMany({
+      where: {
+        agencyId: req.auth.agencyId,
+        creatorId,
+        status: { in: ["pending", "running"] },
+        action: { in: ["follow_back", "refollow_nudge"] },
+      },
+      orderBy: [{ queuedAt: "asc" }, { updatedAt: "asc" }],
+      take: Math.max(10, limit * 8),
+    });
+
+    const items = [];
+    for (const candidate of candidates) {
+      if (items.length >= limit) break;
+      const meta = candidate.result && typeof candidate.result === "object" ? candidate.result : {};
+      if (candidate.status === "running") {
+        const sameDevice = String(meta.claimedByDeviceId || "") === deviceId;
+        if (!sameDevice && !isFollowBackClaimExpired(candidate, nowMs)) continue;
+      }
+
+      const result = followBackClaimMeta(meta, req.body || {}, deviceId);
+      const updated = await prisma.followBackTask.updateMany({
+        where: {
+          id: candidate.id,
+          agencyId: req.auth.agencyId,
+          creatorId,
+          status: candidate.status,
+        },
+        data: {
+          status: "running",
+          result,
+          error: null,
+          lastResultAt: new Date(),
+        },
+      });
+      if (updated.count > 0) {
+        const item = await prisma.followBackTask.findUnique({ where: { id: candidate.id } });
+        if (item) items.push(item);
+      }
+    }
+
+    return res.json({ ok: true, creatorId, deviceId, items, count: items.length });
+  } catch (err) { return sendError(res, err, "FOLLOW_BACK_WORKER_CLAIM_FAILED"); }
+});
+
+router.post("/follow-back/worker/result", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    const fanId = cleanString(req.body?.fanId || req.body?.userId, 80);
+    const action = cleanString(req.body?.action || "follow_back", 80) || "follow_back";
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
+
+    const existing = await prisma.followBackTask.findUnique({ where: { creatorId_fanId_action: { creatorId, fanId, action } } });
+    if (!existing) return res.status(404).json({ ok: false, code: "FOLLOW_BACK_TASK_NOT_FOUND", error: "Follow-back task not found" });
+
+    const status = cleanString(req.body?.status || (req.body?.ok === false ? "failed" : "done"), 40) || "done";
+    const result = compactWorkerResult({ ...(req.body || {}), result: { ...(existing.result && typeof existing.result === "object" ? existing.result : {}), ...(req.body?.result || {}) } });
+    const reason = optionalString(req.body?.reason || req.body?.skipReason || req.body?.failReason || existing.reason, 500);
+    const item = await prisma.followBackTask.update({
+      where: { id: existing.id },
+      data: {
+        status,
+        reason,
+        result,
+        error: optionalString(req.body?.error || req.body?.failReason, 2000),
+        lastResultAt: parseDate(req.body?.lastResultAt || req.body?.processedAt || req.body?.skippedAt || req.body?.failedAt) || new Date(),
+      },
+    });
+    return res.json({ ok: true, item });
+  } catch (err) { return sendError(res, err, "FOLLOW_BACK_WORKER_RESULT_FAILED"); }
 });
 
 

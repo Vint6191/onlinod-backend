@@ -311,25 +311,38 @@ async function enqueueJob({ agencyId, userId, input = {} }) {
   if (creatorId) await requireCreator(agencyId, creatorId);
   const data = normalizeJobInput(input, { agencyId, userId });
   let item;
+  let alreadyActive = false;
   if (data.dedupeKey) {
-    item = await prisma.automationJob.upsert({
+    const existing = await prisma.automationJob.findUnique({
       where: { agencyId_dedupeKey: { agencyId, dedupeKey: data.dedupeKey } },
-      create: data,
-      update: {
-        ...data,
-        agencyId: undefined,
-        createdByUserId: undefined,
-        status: "scheduled",
-        claimedByDeviceId: null,
-        claimedAt: null,
-        completedAt: null,
-        error: null,
-      },
     });
+
+    // Do not let a second click or another device reset an active runner job.
+    // Stale active jobs are recovered by claimJobs via claimedAt timeout.
+    if (existing && ["claimed", "running"].includes(String(existing.status || ""))) {
+      item = existing;
+      alreadyActive = true;
+    } else if (existing) {
+      item = await prisma.automationJob.update({
+        where: { id: existing.id },
+        data: {
+          ...data,
+          agencyId: undefined,
+          createdByUserId: undefined,
+          status: "scheduled",
+          claimedByDeviceId: null,
+          claimedAt: null,
+          completedAt: null,
+          error: null,
+        },
+      });
+    } else {
+      item = await prisma.automationJob.create({ data });
+    }
   } else {
     item = await prisma.automationJob.create({ data });
   }
-  return { ok: true, item };
+  return { ok: true, item, alreadyActive };
 }
 
 async function claimJobs({ agencyId, input = {} }) {
