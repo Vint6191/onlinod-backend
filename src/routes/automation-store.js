@@ -395,6 +395,103 @@ router.get("/follow-back", async (req, res) => {
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_FAILED"); }
 });
 
+
+router.get("/follow-back/diagnostics", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+
+    const runnableActions = ["follow_back", "refollow_nudge"];
+    const activeJobWhere = {
+      agencyId: req.auth.agencyId,
+      creatorId,
+      type: "follow_back",
+      action: "run_queue",
+      status: { in: ["scheduled", "claimed", "running"] },
+    };
+
+    const [groups, pendingRunnable, runningClaims, activeJobs, staleRunning] = await Promise.all([
+      prisma.followBackTask.groupBy({
+        by: ["status", "action"],
+        where: { agencyId: req.auth.agencyId, creatorId },
+        _count: { _all: true },
+      }),
+      prisma.followBackTask.count({
+        where: { agencyId: req.auth.agencyId, creatorId, status: "pending", action: { in: runnableActions } },
+      }),
+      prisma.followBackTask.findMany({
+        where: { agencyId: req.auth.agencyId, creatorId, status: "running", action: { in: runnableActions } },
+        orderBy: { updatedAt: "desc" },
+        take: 25,
+        select: { id: true, fanId: true, username: true, action: true, status: true, reason: true, error: true, result: true, updatedAt: true, lastResultAt: true },
+      }),
+      prisma.automationJob.findMany({
+        where: activeJobWhere,
+        orderBy: [{ claimedAt: "desc" }, { runAfter: "asc" }, { createdAt: "desc" }],
+        take: 20,
+        select: { id: true, type: true, action: true, status: true, dedupeKey: true, attempts: true, maxAttempts: true, claimedByDeviceId: true, claimedAt: true, runAfter: true, error: true, createdAt: true, updatedAt: true, completedAt: true, result: true },
+      }),
+      prisma.followBackTask.findMany({
+        where: { agencyId: req.auth.agencyId, creatorId, status: "running", action: { in: runnableActions } },
+        orderBy: { updatedAt: "asc" },
+        take: 100,
+        select: { id: true, fanId: true, action: true, result: true, updatedAt: true },
+      }).catch(() => []),
+    ]);
+
+    const counts = {};
+    for (const row of groups || []) {
+      const status = String(row.status || "unknown");
+      const action = String(row.action || "unknown");
+      const count = Number(row._count?._all || 0);
+      counts[status] = Number(counts[status] || 0) + count;
+      counts[`${status}:${action}`] = count;
+    }
+
+    const now = Date.now();
+    const running = (runningClaims || []).map((item) => {
+      const meta = item.result && typeof item.result === "object" ? item.result : {};
+      const leaseUntilMs = meta.leaseUntil ? new Date(meta.leaseUntil).getTime() : 0;
+      return {
+        id: item.id,
+        fanId: item.fanId,
+        username: item.username,
+        action: item.action,
+        status: item.status,
+        reason: item.reason,
+        error: item.error,
+        claimedByDeviceId: meta.claimedByDeviceId || null,
+        claimedAt: meta.claimedAt || null,
+        leaseUntil: meta.leaseUntil || null,
+        leaseExpired: leaseUntilMs > 0 ? leaseUntilMs <= now : false,
+        updatedAt: item.updatedAt,
+        lastResultAt: item.lastResultAt,
+      };
+    });
+
+    const staleRunningCount = (staleRunning || []).filter((item) => {
+      const meta = item.result && typeof item.result === "object" ? item.result : {};
+      const leaseUntilMs = meta.leaseUntil ? new Date(meta.leaseUntil).getTime() : 0;
+      if (leaseUntilMs > 0) return leaseUntilMs <= now;
+      const updatedAtMs = item.updatedAt ? new Date(item.updatedAt).getTime() : 0;
+      return updatedAtMs > 0 && now - updatedAtMs > 10 * 60 * 1000;
+    }).length;
+
+    return res.json({
+      ok: true,
+      creatorId,
+      counts,
+      pendingRunnable,
+      runningClaims: running,
+      runningClaimCount: running.length,
+      staleRunningCount,
+      activeRunJobs: activeJobs || [],
+      activeRunJobCount: (activeJobs || []).length,
+      serverTime: new Date().toISOString(),
+    });
+  } catch (err) { return sendError(res, err, "FOLLOW_BACK_DIAGNOSTICS_FAILED"); }
+});
+
 router.post("/follow-back/upsert", requireSeniorAutomationWriter, async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId, 100);
