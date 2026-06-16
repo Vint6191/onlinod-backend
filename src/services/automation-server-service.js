@@ -27,6 +27,22 @@ const TASK_TYPES = new Set([
 const JOB_STATUSES = new Set(["scheduled", "claimed", "running", "done", "failed", "canceled", "expired"]);
 const EVENT_STATUSES = new Set(["info", "ok", "failed", "skipped", "warning"]);
 const RAW_KEY_RE = /(^|_)(raw|html|payload|headers|cookies|token|authorization|password|secret)($|_)/i;
+const BUMP_TRASH_RETENTION_DAYS = 14;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function addDaysIso(date, days) {
+  const d = date instanceof Date ? date : new Date(date || Date.now());
+  const ms = Number.isFinite(d.getTime()) ? d.getTime() : Date.now();
+  return new Date(ms + Math.max(0, Number(days || 0)) * DAY_MS).toISOString();
+}
+
+function toPlainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function cleanJsonForPrisma(value = {}, max = 4000) {
+  return compactJson(value && typeof value === "object" && !Array.isArray(value) ? value : {}, max);
+}
 
 function clean(value, max = 5000) {
   return cleanString(value, max);
@@ -90,6 +106,8 @@ function normalizeBumpToTask(input = {}, accountId = null) {
   const triggers = input.triggers && typeof input.triggers === "object" ? input.triggers : { fanOnline: true };
   const rules = input.rules && typeof input.rules === "object" ? input.rules : {};
   const media = Array.isArray(input.media) ? input.media : Array.isArray(input.mediaFiles) ? input.mediaFiles : [];
+  const trashedAt = input.trashedAt || input.deletedAt || null;
+  const purgeAfter = input.purgeAfter || (trashedAt ? addDaysIso(trashedAt, BUMP_TRASH_RETENTION_DAYS) : null);
   const config = {
     schemaVersion: input.schemaVersion || 1,
     messageText: clean(input.messageText || input.text || "", 12000),
@@ -104,13 +122,21 @@ function normalizeBumpToTask(input = {}, accountId = null) {
     creatorId: input.creatorId || input.accountId || accountId || null,
     type: "bump_online",
     title,
-    enabled: input.enabled !== false && !input.trashedAt,
-    status: input.trashedAt ? "deleted" : "active",
+    enabled: input.enabled !== false && !trashedAt,
+    status: trashedAt ? "deleted" : (input.enabled === false ? "paused" : "active"),
     config,
     triggers,
     rules,
     stats: input.stats || {},
-    metadata: { legacyBump: true, createdAt: input.createdAt || null, updatedAt: input.updatedAt || null },
+    metadata: cleanJsonForPrisma({
+      ...(toPlainObject(input.metadata)),
+      legacyBump: true,
+      createdAt: input.createdAt || null,
+      updatedAt: input.updatedAt || null,
+      trashedAt,
+      purgeAfter,
+      trashRetentionDays: BUMP_TRASH_RETENTION_DAYS,
+    }),
   };
 }
 
@@ -119,6 +145,9 @@ function taskToBump(task) {
   const rules = task?.rules && typeof task.rules === "object" ? task.rules : {};
   const triggers = task?.triggers && typeof task.triggers === "object" ? task.triggers : {};
   const stats = task?.stats && typeof task.stats === "object" ? task.stats : {};
+  const metadata = task?.metadata && typeof task.metadata === "object" ? task.metadata : {};
+  const trashedAt = task?.deletedAt || task?.status === "deleted" ? (task.deletedAt || metadata.trashedAt || task.updatedAt) : null;
+  const purgeAfter = trashedAt ? (metadata.purgeAfter || addDaysIso(trashedAt, BUMP_TRASH_RETENTION_DAYS)) : null;
   return {
     schemaVersion: Number(config.schemaVersion || 1) || 1,
     id: task.clientId || task.id,
@@ -134,7 +163,8 @@ function taskToBump(task) {
     triggers,
     rules,
     stats,
-    trashedAt: task.deletedAt || task.status === "deleted" ? (task.deletedAt || task.updatedAt) : null,
+    trashedAt,
+    purgeAfter,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
   };
@@ -214,7 +244,23 @@ async function trashTask({ agencyId, userId, taskId, permanent = false }) {
     await prisma.automationTask.delete({ where: { id: existing.id } });
     return { ok: true, deleted: true };
   }
-  const item = await prisma.automationTask.update({ where: { id: existing.id }, data: { status: "deleted", enabled: false, deletedAt: new Date(), updatedByUserId: userId || null } });
+  const deletedAt = new Date();
+  const meta = toPlainObject(existing.metadata);
+  const item = await prisma.automationTask.update({
+    where: { id: existing.id },
+    data: {
+      status: "deleted",
+      enabled: false,
+      deletedAt,
+      updatedByUserId: userId || null,
+      metadata: cleanJsonForPrisma({
+        ...meta,
+        trashedAt: deletedAt.toISOString(),
+        purgeAfter: addDaysIso(deletedAt, BUMP_TRASH_RETENTION_DAYS),
+        trashRetentionDays: BUMP_TRASH_RETENTION_DAYS,
+      }),
+    },
+  });
   return { ok: true, item };
 }
 
@@ -227,11 +273,30 @@ async function restoreTask({ agencyId, userId, taskId }) {
     err.code = "AUTOMATION_TASK_NOT_FOUND";
     throw err;
   }
-  const item = await prisma.automationTask.update({ where: { id: existing.id }, data: { status: "active", deletedAt: null, updatedByUserId: userId || null } });
+  const meta = { ...toPlainObject(existing.metadata) };
+  delete meta.trashedAt;
+  delete meta.purgeAfter;
+  delete meta.trashRetentionDays;
+  const item = await prisma.automationTask.update({ where: { id: existing.id }, data: { status: "active", deletedAt: null, metadata: cleanJsonForPrisma(meta), updatedByUserId: userId || null } });
   return { ok: true, item };
 }
 
+async function gcExpiredBumps({ agencyId, creatorId = null } = {}) {
+  const cutoff = new Date(Date.now() - BUMP_TRASH_RETENTION_DAYS * DAY_MS);
+  const where = {
+    agencyId,
+    type: "bump_online",
+    deletedAt: { lte: cutoff },
+    status: "deleted",
+  };
+  const id = clean(creatorId, 100);
+  if (id) where.creatorId = id;
+  const result = await prisma.automationTask.deleteMany({ where });
+  return { ok: true, deleted: result.count, cutoff, trashRetentionDays: BUMP_TRASH_RETENTION_DAYS };
+}
+
 async function listBumps({ agencyId, creatorId, query = {} }) {
+  await gcExpiredBumps({ agencyId, creatorId }).catch(() => null);
   const result = await listTasks({ agencyId, query: { ...query, type: "bump_online", creatorId, includeDeleted: query.includeTrash ?? query.includeDeleted ?? true } });
   const includeTrash = query.includeTrash !== "false" && query.includeTrash !== false;
   const items = result.items.map(taskToBump).filter((item) => includeTrash || !item.trashedAt);
@@ -522,6 +587,7 @@ module.exports = {
   listBumps,
   saveBump,
   trashBump,
+  gcExpiredBumps,
   listJobs,
   enqueueJob,
   claimJobs,

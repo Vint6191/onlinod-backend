@@ -53,6 +53,7 @@ router.delete("/tasks/:id", requireSeniorAutomationWriter, async (req, res) => {
 // Bump template compatibility layer. These routes expose bump_online tasks in
 // the same shape expected by the Electron Automation UI/cache.
 router.get("/bumps", async (req, res) => { try { const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100); return res.json(await automationServer.listBumps({ agencyId: req.auth.agencyId, creatorId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_FAILED"); } });
+router.post("/bumps/gc", async (req, res) => { try { const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100); return res.json(await automationServer.gcExpiredBumps({ agencyId: req.auth.agencyId, creatorId })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_GC_FAILED"); } });
 router.get("/bumps/:accountId", async (req, res) => { try { return res.json(await automationServer.listBumps({ agencyId: req.auth.agencyId, creatorId: cleanString(req.params.accountId, 100), query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_FAILED"); } });
 router.post("/bumps/upsert", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.body?.creatorId, 100); return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAVE_FAILED"); } });
 router.post("/bumps/:accountId/upsert", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId: cleanString(req.params.accountId, 100), input: { ...(req.body || {}), accountId: req.params.accountId } })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAVE_FAILED"); } });
@@ -77,6 +78,41 @@ function parseDate(value) {
   return Number.isFinite(d.getTime()) ? d : null;
 }
 
+const BUMP_TERMINAL_DELIVERY_STATUSES = new Set(["replied", "canceled", "expired", "failed", "skipped"]);
+
+function bumpStatStatus(status) {
+  const s = cleanString(status, 40).toLowerCase();
+  if (s === "cancelled") return "canceled";
+  return s;
+}
+
+async function refreshBumpTaskStats({ agencyId, creatorId, templateId }) {
+  const cid = cleanString(creatorId, 100);
+  const tid = cleanString(templateId, 100);
+  if (!agencyId || !cid || !tid) return null;
+  const rows = await prisma.bumpDeliveryStat.findMany({
+    where: { agencyId, creatorId: cid, templateId: tid },
+    select: { sent: true, replied: true, canceled: true, expired: true, failed: true, day: true },
+  }).catch(() => []);
+  const stats = { sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, lastStatAt: new Date().toISOString() };
+  for (const row of rows || []) {
+    stats.sent += Number(row.sent || 0);
+    stats.replied += Number(row.replied || 0);
+    stats.canceled += Number(row.canceled || 0);
+    stats.expired += Number(row.expired || 0);
+    stats.failed += Number(row.failed || 0);
+  }
+  stats.replyRate = stats.sent > 0 ? Math.round((stats.replied / stats.sent) * 10000) / 10000 : 0;
+  const task = await prisma.automationTask.findFirst({
+    where: { agencyId, creatorId: cid, type: "bump_online", OR: [{ id: tid }, { clientId: tid }] },
+    select: { id: true, stats: true },
+  }).catch(() => null);
+  if (!task?.id) return stats;
+  const prev = task.stats && typeof task.stats === "object" && !Array.isArray(task.stats) ? task.stats : {};
+  await prisma.automationTask.update({ where: { id: task.id }, data: { stats: { ...prev, ...stats } } }).catch(() => null);
+  return stats;
+}
+
 // Legacy server-state mutating routes are intentionally senior-only in v19.5.
 // Worker job protocol remains open through /jobs/claim, /jobs/:id/result and /events.
 
@@ -99,7 +135,7 @@ router.get("/deliveries", async (req, res) => {
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERIES_FAILED"); }
 });
 
-router.post("/deliveries/upsert", requireSeniorAutomationWriter, async (req, res) => {
+router.post("/deliveries/upsert", async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId, 100);
     const fanId = cleanString(req.body?.fanId || req.body?.userId, 80);
@@ -115,7 +151,7 @@ router.post("/deliveries/upsert", requireSeniorAutomationWriter, async (req, res
       agencyId: req.auth.agencyId,
       creatorId,
       ruleId: optionalString(req.body?.ruleId, 100),
-      contentCollectionId: optionalString(req.body?.contentCollectionId, 100),
+      contentCollectionId: optionalString(req.body?.contentCollectionId || req.body?.templateId || req.body?.bumpId, 100),
       fanId,
       dialogId: optionalString(req.body?.dialogId, 80),
       trigger: optionalString(req.body?.trigger, 80),
@@ -149,7 +185,17 @@ router.post("/deliveries/upsert", requireSeniorAutomationWriter, async (req, res
     } else {
       item = await prisma.automationDelivery.create({ data });
     }
-    return res.json({ ok: true, item, _dedup: "v2-messageId" });
+
+    // Storage optimization: completed bump deliveries are not a forever ledger.
+    // The Electron client already increments BumpDeliveryStat once per transition;
+    // once a delivery is terminal, keep stats only and remove the pending row.
+    const terminalStatus = bumpStatStatus(data.status);
+    if (BUMP_TERMINAL_DELIVERY_STATUSES.has(terminalStatus) && item?.id) {
+      await prisma.automationDelivery.delete({ where: { id: item.id } }).catch(() => null);
+      return res.json({ ok: true, item: null, compacted: true, status: terminalStatus, _dedup: "v3-terminal-compact" });
+    }
+
+    return res.json({ ok: true, item, _dedup: "v3-messageId-pending-only" });
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_UPSERT_FAILED"); }
 });
 
@@ -656,7 +702,7 @@ router.post("/follow-back/clear", requireSeniorAutomationWriter, async (req, res
 // на переход (он гарантирует через флаг statCounted в локальной записи).
 const STAT_EVENTS = new Set(["sent", "replied", "canceled", "expired", "failed"]);
 
-router.post("/deliveries/stat-bump", requireSeniorAutomationWriter, async (req, res) => {
+router.post("/deliveries/stat-bump", async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
@@ -681,7 +727,8 @@ router.post("/deliveries/stat-bump", requireSeniorAutomationWriter, async (req, 
       },
       update: { [event]: { increment: by } },
     });
-    return res.json({ ok: true, item });
+    const taskStats = await refreshBumpTaskStats({ agencyId: req.auth.agencyId, creatorId, templateId });
+    return res.json({ ok: true, item, taskStats });
   } catch (err) { return sendError(res, err, "BUMP_STAT_FAILED"); }
 });
 
