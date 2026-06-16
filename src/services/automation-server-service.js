@@ -140,6 +140,82 @@ function normalizeBumpToTask(input = {}, accountId = null) {
   };
 }
 
+
+function statTemplateKeysForTask(task = {}) {
+  return Array.from(new Set([
+    clean(task.clientId, 120),
+    clean(task.id, 120),
+  ].filter(Boolean)));
+}
+
+function todayKeyUtc() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function mergeBumpStatRows(baseStats = {}, rows = []) {
+  const today = todayKeyUtc();
+  const stats = toPlainObject(baseStats);
+  const totals = { sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, sentToday: 0, repliedToday: 0 };
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const sent = Number(row?.sent || 0);
+    const replied = Number(row?.replied || 0);
+    totals.sent += sent;
+    totals.replied += replied;
+    totals.canceled += Number(row?.canceled || 0);
+    totals.expired += Number(row?.expired || 0);
+    totals.failed += Number(row?.failed || 0);
+    if (String(row?.day || "") === today) {
+      totals.sentToday += sent;
+      totals.repliedToday += replied;
+    }
+  }
+
+  if (rows && rows.length) {
+    stats.sent = totals.sent;
+    stats.replied = totals.replied;
+    stats.canceled = totals.canceled;
+    stats.expired = totals.expired;
+    stats.failed = totals.failed;
+    stats.sentToday = totals.sentToday;
+    stats.sent24h = totals.sentToday;
+    stats.repliedToday = totals.repliedToday;
+    stats.replies24h = totals.repliedToday;
+    stats.replyRate = totals.sent > 0 ? Math.round((totals.replied / totals.sent) * 10000) / 10000 : 0;
+    stats.lastStatAt = stats.lastStatAt || new Date().toISOString();
+  } else {
+    stats.sentToday = Number(stats.sentToday || stats.sent24h || 0);
+    stats.sent24h = Number(stats.sent24h || stats.sentToday || 0);
+    stats.repliedToday = Number(stats.repliedToday || stats.replies24h || 0);
+    stats.replies24h = Number(stats.replies24h || stats.repliedToday || 0);
+  }
+
+  return stats;
+}
+
+async function loadBumpStatsByTemplate({ agencyId, creatorId, tasks = [] } = {}) {
+  const keys = Array.from(new Set((tasks || []).flatMap(statTemplateKeysForTask))).filter(Boolean);
+  if (!agencyId || !keys.length) return new Map();
+  const where = { agencyId, templateId: { in: keys } };
+  const cid = clean(creatorId, 100);
+  if (cid) where.creatorId = cid;
+  const rows = await prisma.bumpDeliveryStat.findMany({ where }).catch(() => []);
+  const byTemplate = new Map();
+  for (const row of rows || []) {
+    const key = clean(row.templateId, 120);
+    if (!key) continue;
+    if (!byTemplate.has(key)) byTemplate.set(key, []);
+    byTemplate.get(key).push(row);
+  }
+  return byTemplate;
+}
+
+function taskToBumpWithStats(task, statsRows = []) {
+  const bump = taskToBump(task);
+  bump.stats = mergeBumpStatRows(bump.stats || {}, statsRows || []);
+  return bump;
+}
+
 function taskToBump(task) {
   const config = task?.config && typeof task.config === "object" ? task.config : {};
   const rules = task?.rules && typeof task.rules === "object" ? task.rules : {};
@@ -299,7 +375,12 @@ async function listBumps({ agencyId, creatorId, query = {} }) {
   await gcExpiredBumps({ agencyId, creatorId }).catch(() => null);
   const result = await listTasks({ agencyId, query: { ...query, type: "bump_online", creatorId, includeDeleted: query.includeTrash ?? query.includeDeleted ?? true } });
   const includeTrash = query.includeTrash !== "false" && query.includeTrash !== false;
-  const items = result.items.map(taskToBump).filter((item) => includeTrash || !item.trashedAt);
+  const statRowsByTemplate = await loadBumpStatsByTemplate({ agencyId, creatorId, tasks: result.items || [] });
+  const items = result.items.map((task) => {
+    const keys = statTemplateKeysForTask(task);
+    const rows = keys.flatMap((key) => statRowsByTemplate.get(key) || []);
+    return taskToBumpWithStats(task, rows);
+  }).filter((item) => includeTrash || !item.trashedAt);
   return { ok: true, accountId: String(creatorId || ""), items, count: items.length, source: "server" };
 }
 

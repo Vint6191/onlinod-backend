@@ -422,6 +422,75 @@ router.post("/deliveries/upsert", async (req, res) => {
 });
 
 
+// Test helper for environments without DB shell access. It does NOT delete
+// messages by itself. It only moves a small number of pending bump deliveries
+// into the due window so the normal distributed claim/sweep pipeline can be
+// tested from the desktop console. Senior automation writer is required.
+router.post("/deliveries/debug-force-due", requireSeniorAutomationWriter, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+
+    const limit = parseLimit(req.body?.limit, 1, 5);
+    const minutesAgo = Math.max(1, Math.min(60, positiveInt(req.body?.minutesAgo, 1)));
+    const now = new Date();
+    const forcedCancelAt = new Date(now.getTime() - minutesAgo * 60 * 1000);
+
+    const deliveryId = cleanString(req.body?.deliveryId || req.body?.id, 120);
+    const messageId = cleanString(req.body?.messageId, 120);
+    const fanId = cleanString(req.body?.fanId || req.body?.dialogId, 100);
+    const templateId = cleanString(req.body?.templateId || req.body?.bumpId, 100);
+
+    const where = {
+      agencyId: req.auth.agencyId,
+      creatorId,
+      status: { in: ["pending_reply", "sent", "checking_reply"] },
+      ...(deliveryId ? { id: deliveryId } : {}),
+      ...(messageId ? { messageId } : {}),
+      ...(fanId ? { OR: [{ fanId }, { dialogId: fanId }] } : {}),
+      ...(templateId ? { contentCollectionId: templateId } : {}),
+    };
+
+    const rows = await prisma.automationDelivery.findMany({
+      where,
+      orderBy: [{ sentAt: "desc" }, { createdAt: "desc" }],
+      take: limit,
+    });
+
+    const items = [];
+    for (const row of rows) {
+      const updated = await prisma.automationDelivery.update({
+        where: { id: row.id },
+        data: {
+          status: "pending_reply",
+          cancelAt: forcedCancelAt,
+          claimedByDeviceId: null,
+          claimedAt: null,
+          claimUntil: null,
+          lastCheckedAt: now,
+          error: null,
+          result: jsonObject({
+            ...deliveryMeta(row),
+            debugForcedDueAt: now.toISOString(),
+            debugForcedByUserId: req.auth?.userId || null,
+            previousCancelAt: row.cancelAt ? row.cancelAt.toISOString() : deliveryMeta(row).cancelAt || null,
+          }),
+        },
+      });
+      items.push(mapAutomationDelivery(updated));
+    }
+
+    return res.json({
+      ok: true,
+      creatorId,
+      count: items.length,
+      forcedCancelAt: forcedCancelAt.toISOString(),
+      items,
+      warning: "debug-force-due only makes rows claimable; normal claim/sweep still performs reply-check and delete",
+    });
+  } catch (err) { return sendError(res, err, "BUMP_DEBUG_FORCE_DUE_FAILED"); }
+});
+
 // Distributed bump cancel queue. Active AutomationDelivery rows are the queue:
 // pending_reply rows become claimable after cancelAt; a worker gets a short lease,
 // verifies reply, deletes the OF message if needed, then reports a terminal result.
@@ -1098,14 +1167,24 @@ router.get("/deliveries/bump-stats", async (req, res) => {
 
     const rows = await prisma.bumpDeliveryStat.findMany({ where, orderBy: { day: "desc" }, take: parseLimit(req.query?.limit, 500, 5000) });
 
-    // Сводки: всего и по шаблону.
-    const totals = { sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0 };
+    // Сводки: всего и по шаблону. sentToday/repliedToday are UTC-day buckets,
+    // the same compact source used by bump list counters.
+    const today = new Date().toISOString().slice(0, 10);
+    const totals = { sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, sentToday: 0, repliedToday: 0 };
     const byTemplate = {};
     for (const r of rows) {
       for (const k of ["sent", "replied", "canceled", "expired", "failed"]) totals[k] += r[k] || 0;
+      if (r.day === today) {
+        totals.sentToday += r.sent || 0;
+        totals.repliedToday += r.replied || 0;
+      }
       const t = r.templateId || "";
-      if (!byTemplate[t]) byTemplate[t] = { templateId: t, sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0 };
+      if (!byTemplate[t]) byTemplate[t] = { templateId: t, sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, sentToday: 0, repliedToday: 0 };
       for (const k of ["sent", "replied", "canceled", "expired", "failed"]) byTemplate[t][k] += r[k] || 0;
+      if (r.day === today) {
+        byTemplate[t].sentToday += r.sent || 0;
+        byTemplate[t].repliedToday += r.replied || 0;
+      }
     }
     const rate = (rep, sent) => (sent > 0 ? Math.round((rep / sent) * 10000) / 100 : 0);
     totals.replyRate = rate(totals.replied, totals.sent);
