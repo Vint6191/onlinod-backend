@@ -166,8 +166,32 @@ function compactTemplateIds(values = [], next = null, max = 50) {
   return out.slice(0, Math.max(1, Math.min(200, Number(max) || 50)));
 }
 
+function dateIso(value) {
+  const d = value instanceof Date ? value : parseDate(value);
+  return d && Number.isFinite(d.getTime()) ? d.toISOString() : null;
+}
+
+function maxIsoDate(...values) {
+  let best = null;
+  let bestMs = 0;
+  for (const value of values) {
+    const d = value instanceof Date ? value : parseDate(value);
+    const ms = d && Number.isFinite(d.getTime()) ? d.getTime() : 0;
+    if (ms > bestMs) { bestMs = ms; best = d; }
+  }
+  return best ? best.toISOString() : null;
+}
+
+function addHoursDate(value, hours) {
+  const d = value instanceof Date ? value : parseDate(value);
+  const h = Number(hours);
+  if (!d || !Number.isFinite(d.getTime()) || !Number.isFinite(h) || h <= 0) return null;
+  return new Date(d.getTime() + h * 60 * 60 * 1000);
+}
+
 function mapBumpFanState(row = {}) {
   if (!row || typeof row !== "object") return null;
+  const counters = row.counters && typeof row.counters === "object" && !Array.isArray(row.counters) ? row.counters : {};
   return {
     id: row.id,
     creatorId: row.creatorId,
@@ -179,32 +203,105 @@ function mapBumpFanState(row = {}) {
     lastFinalizedAt: row.lastFinalizedAt ? row.lastFinalizedAt.toISOString() : null,
     lastMessageId: row.lastMessageId || null,
     templateIds: Array.isArray(row.templateIds) ? row.templateIds : [],
-    counters: row.counters && typeof row.counters === "object" && !Array.isArray(row.counters) ? row.counters : {},
+    counters,
+    // Compact fan quiet-window state. Kept in counters JSON to avoid another DB migration.
+    lastRepliedAt: counters.lastRepliedAt || null,
+    lastCanceledAt: counters.lastCanceledAt || null,
+    lastExpiredAt: counters.lastExpiredAt || null,
+    repliedCooldownUntil: counters.repliedCooldownUntil || null,
+    sentCooldownUntil: counters.sentCooldownUntil || null,
+    sameTemplateCooldownUntil: counters.sameTemplateCooldownUntil || null,
+    nextAllowedAt: counters.nextAllowedAt || null,
+    quietReason: counters.quietReason || null,
     updatedAt: row.updatedAt ? row.updatedAt.toISOString() : null,
   };
 }
 
-async function upsertBumpFanState({ agencyId, creatorId, fanId, dialogId = null, templateId = "", status = "sent", sentAt = null, finalizedAt = null, messageId = null }) {
+async function upsertBumpFanState({
+  agencyId,
+  creatorId,
+  fanId,
+  dialogId = null,
+  templateId = "",
+  status = "sent",
+  sentAt = null,
+  finalizedAt = null,
+  messageId = null,
+  replyCooldownHours = 24,
+  sentCooldownHours = 6,
+  sameTemplateCooldownHours = null,
+  nextAllowedAt = null,
+  repliedCooldownUntil = null,
+  sentCooldownUntil = null,
+}) {
   const cid = cleanString(creatorId, 100);
   const fid = cleanString(fanId, 80);
   if (!agencyId || !cid || !fid) return null;
   const tid = cleanString(templateId, 100) || "";
+  const st = cleanString(status, 40) || "sent";
   const existing = await prisma.automationBumpFanState.findUnique({
     where: { creatorId_fanId: { creatorId: cid, fanId: fid } },
   }).catch(() => null);
   const templateIds = compactTemplateIds(existing?.templateIds || [], tid, 50);
-  const lastSentAt = parseDate(sentAt) || existing?.lastSentAt || null;
-  const lastFinalizedAt = parseDate(finalizedAt) || existing?.lastFinalizedAt || null;
-  const counters = existing?.counters && typeof existing.counters === "object" && !Array.isArray(existing.counters) ? existing.counters : {};
+  const sentDate = parseDate(sentAt) || existing?.lastSentAt || new Date();
+  const finalizedDate = parseDate(finalizedAt) || (["replied", "canceled", "expired", "failed"].includes(st) ? new Date() : existing?.lastFinalizedAt || null);
+  const prevCounters = existing?.counters && typeof existing.counters === "object" && !Array.isArray(existing.counters) ? existing.counters : {};
+
+  const replyHours = Math.max(0, Math.min(2160, Number(replyCooldownHours ?? 24) || 24));
+  const sentHours = Math.max(0, Math.min(720, Number(sentCooldownHours ?? 6) || 6));
+  const sameTplHours = sameTemplateCooldownHours === null || sameTemplateCooldownHours === undefined
+    ? null
+    : Math.max(0, Math.min(8760, Number(sameTemplateCooldownHours) || 0));
+
+  const computedSentUntil = addHoursDate(sentDate, sentHours);
+  const computedReplyUntil = st === "replied" ? addHoursDate(finalizedDate || sentDate, replyHours) : null;
+  const computedSameTemplateUntil = tid && sameTplHours !== null ? addHoursDate(sentDate, sameTplHours) : null;
+  const explicitNextAllowedAt = parseDate(nextAllowedAt);
+  const explicitRepliedUntil = parseDate(repliedCooldownUntil);
+  const explicitSentUntil = parseDate(sentCooldownUntil);
+
+  const nextAllowedIso = maxIsoDate(
+    prevCounters.nextAllowedAt,
+    explicitNextAllowedAt,
+    explicitRepliedUntil,
+    explicitSentUntil,
+    computedReplyUntil,
+    computedSentUntil
+  );
+  const repliedUntilIso = maxIsoDate(prevCounters.repliedCooldownUntil, explicitRepliedUntil, computedReplyUntil);
+  const sentUntilIso = maxIsoDate(prevCounters.sentCooldownUntil, explicitSentUntil, computedSentUntil);
+  const sameTemplateUntilIso = maxIsoDate(prevCounters.sameTemplateCooldownUntil, computedSameTemplateUntil);
+
+  const counters = {
+    ...prevCounters,
+    lastSentAt: dateIso(sentDate) || prevCounters.lastSentAt || null,
+    lastFinalizedAt: dateIso(finalizedDate) || prevCounters.lastFinalizedAt || null,
+    lastStatus: st,
+    lastMessageId: optionalString(messageId || existing?.lastMessageId, 100),
+    lastTemplateId: tid || existing?.lastTemplateId || null,
+    lastRepliedAt: st === "replied" ? (dateIso(finalizedDate) || new Date().toISOString()) : prevCounters.lastRepliedAt || null,
+    lastCanceledAt: st === "canceled" ? (dateIso(finalizedDate) || new Date().toISOString()) : prevCounters.lastCanceledAt || null,
+    lastExpiredAt: st === "expired" ? (dateIso(finalizedDate) || new Date().toISOString()) : prevCounters.lastExpiredAt || null,
+    repliedCooldownUntil: repliedUntilIso || prevCounters.repliedCooldownUntil || null,
+    sentCooldownUntil: sentUntilIso || prevCounters.sentCooldownUntil || null,
+    sameTemplateCooldownUntil: sameTemplateUntilIso || prevCounters.sameTemplateCooldownUntil || null,
+    nextAllowedAt: nextAllowedIso || prevCounters.nextAllowedAt || null,
+    quietReason: computedReplyUntil ? "replied" : "sent",
+    replyCooldownHours: replyHours,
+    sentCooldownHours: sentHours,
+    sameTemplateCooldownHours: sameTplHours,
+    updatedAt: new Date().toISOString(),
+  };
+
   const data = {
     agencyId,
     creatorId: cid,
     fanId: fid,
     dialogId: optionalString(dialogId || fid, 80),
     lastTemplateId: tid || existing?.lastTemplateId || null,
-    lastStatus: cleanString(status, 40) || existing?.lastStatus || "sent",
-    lastSentAt,
-    lastFinalizedAt,
+    lastStatus: st,
+    lastSentAt: sentDate,
+    lastFinalizedAt: finalizedDate,
     lastMessageId: optionalString(messageId || existing?.lastMessageId, 100),
     templateIds,
     counters,
@@ -291,6 +388,12 @@ router.post("/deliveries/fan-state/upsert", async (req, res) => {
       sentAt: req.body?.sentAt || null,
       finalizedAt: req.body?.finalizedAt || req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || null,
       messageId: req.body?.messageId || null,
+      replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
+      sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
+      sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
+      nextAllowedAt: req.body?.nextAllowedAt || null,
+      repliedCooldownUntil: req.body?.repliedCooldownUntil || null,
+      sentCooldownUntil: req.body?.sentCooldownUntil || null,
     });
     return res.json({ ok: true, item });
   } catch (err) { return sendError(res, err, "BUMP_FAN_STATE_UPSERT_FAILED"); }
@@ -391,6 +494,9 @@ router.post("/deliveries/upsert", async (req, res) => {
         templateId: templateIdForStat, status: terminalStatus, sentAt: updated.sentAt,
         finalizedAt: req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || new Date().toISOString(),
         messageId: updated.messageId,
+        replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
+        sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
+        sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
       }).catch(() => null);
       const day = cleanString(req.body?.day, 10) || (updated.sentAt ? updated.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
       const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId: templateIdForStat, day, event: terminalStatus, by: 1 });
@@ -416,6 +522,9 @@ router.post("/deliveries/upsert", async (req, res) => {
     await upsertBumpFanState({
       agencyId: req.auth.agencyId, creatorId, fanId: item.fanId, dialogId: item.dialogId || item.fanId,
       templateId: deliveryTemplateId(item), status: item.status || "sent", sentAt: item.sentAt, messageId: item.messageId,
+      replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
+      sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
+      sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
     }).catch(() => null);
     return res.json({ ok: true, item: mapAutomationDelivery(item), _dedup: "v5-messageId-pending-claimable-fanstate" });
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_UPSERT_FAILED"); }
@@ -611,6 +720,9 @@ router.post("/deliveries/cancel-result", async (req, res) => {
         templateId, status, sentAt: existing.sentAt,
         finalizedAt: req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || now.toISOString(),
         messageId: existing.messageId,
+        replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
+        sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
+        sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
       }).catch(() => null);
       const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: status, by: 1 });
       await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
