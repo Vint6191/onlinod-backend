@@ -94,13 +94,20 @@ async function refreshBumpTaskStats({ agencyId, creatorId, templateId }) {
     where: { agencyId, creatorId: cid, templateId: tid },
     select: { sent: true, replied: true, canceled: true, expired: true, failed: true, day: true },
   }).catch(() => []);
-  const stats = { sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, lastStatAt: new Date().toISOString() };
+  const today = new Date().toISOString().slice(0, 10);
+  const stats = { sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, sentToday: 0, repliedToday: 0, lastStatAt: new Date().toISOString() };
   for (const row of rows || []) {
-    stats.sent += Number(row.sent || 0);
-    stats.replied += Number(row.replied || 0);
+    const sent = Number(row.sent || 0);
+    const replied = Number(row.replied || 0);
+    stats.sent += sent;
+    stats.replied += replied;
     stats.canceled += Number(row.canceled || 0);
     stats.expired += Number(row.expired || 0);
     stats.failed += Number(row.failed || 0);
+    if (row.day === today) {
+      stats.sentToday += sent;
+      stats.repliedToday += replied;
+    }
   }
   stats.replyRate = stats.sent > 0 ? Math.round((stats.replied / stats.sent) * 10000) / 10000 : 0;
   const task = await prisma.automationTask.findFirst({
@@ -113,8 +120,181 @@ async function refreshBumpTaskStats({ agencyId, creatorId, templateId }) {
   return stats;
 }
 
+
+function deliveryMeta(item = {}) {
+  const result = item?.result && typeof item.result === "object" && !Array.isArray(item.result) ? item.result : {};
+  return result;
+}
+
+function deliveryTemplateId(item = {}) {
+  const meta = deliveryMeta(item);
+  return cleanString(item.contentCollectionId || item.templateId || item.bumpId || meta.templateId || meta.bumpId || meta.clientId, 100) || "";
+}
+
+function deliveryCancelAt(item = {}) {
+  const meta = deliveryMeta(item);
+  return item.cancelAt || meta.cancelAt || null;
+}
+
+function mapAutomationDelivery(item = {}) {
+  if (!item || typeof item !== "object") return item;
+  const meta = deliveryMeta(item);
+  const templateId = deliveryTemplateId(item);
+  return {
+    ...item,
+    templateId,
+    bumpId: templateId,
+    localDeliveryId: meta.localDeliveryId || meta.localId || null,
+    cancelAt: item.cancelAt || meta.cancelAt || null,
+    claimUntil: item.claimUntil || meta.claimUntil || null,
+    claimedByDeviceId: item.claimedByDeviceId || meta.claimedByDeviceId || null,
+    claimedAt: item.claimedAt || meta.claimedAt || null,
+  };
+}
+
+function compactTemplateIds(values = [], next = null, max = 50) {
+  const out = [];
+  const seen = new Set();
+  const push = (value) => {
+    const id = cleanString(value, 100);
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  };
+  push(next);
+  for (const value of Array.isArray(values) ? values : []) push(value);
+  return out.slice(0, Math.max(1, Math.min(200, Number(max) || 50)));
+}
+
+function mapBumpFanState(row = {}) {
+  if (!row || typeof row !== "object") return null;
+  return {
+    id: row.id,
+    creatorId: row.creatorId,
+    fanId: row.fanId,
+    dialogId: row.dialogId || row.fanId,
+    lastTemplateId: row.lastTemplateId || null,
+    lastStatus: row.lastStatus || null,
+    lastSentAt: row.lastSentAt ? row.lastSentAt.toISOString() : null,
+    lastFinalizedAt: row.lastFinalizedAt ? row.lastFinalizedAt.toISOString() : null,
+    lastMessageId: row.lastMessageId || null,
+    templateIds: Array.isArray(row.templateIds) ? row.templateIds : [],
+    counters: row.counters && typeof row.counters === "object" && !Array.isArray(row.counters) ? row.counters : {},
+    updatedAt: row.updatedAt ? row.updatedAt.toISOString() : null,
+  };
+}
+
+async function upsertBumpFanState({ agencyId, creatorId, fanId, dialogId = null, templateId = "", status = "sent", sentAt = null, finalizedAt = null, messageId = null }) {
+  const cid = cleanString(creatorId, 100);
+  const fid = cleanString(fanId, 80);
+  if (!agencyId || !cid || !fid) return null;
+  const tid = cleanString(templateId, 100) || "";
+  const existing = await prisma.automationBumpFanState.findUnique({
+    where: { creatorId_fanId: { creatorId: cid, fanId: fid } },
+  }).catch(() => null);
+  const templateIds = compactTemplateIds(existing?.templateIds || [], tid, 50);
+  const lastSentAt = parseDate(sentAt) || existing?.lastSentAt || null;
+  const lastFinalizedAt = parseDate(finalizedAt) || existing?.lastFinalizedAt || null;
+  const counters = existing?.counters && typeof existing.counters === "object" && !Array.isArray(existing.counters) ? existing.counters : {};
+  const data = {
+    agencyId,
+    creatorId: cid,
+    fanId: fid,
+    dialogId: optionalString(dialogId || fid, 80),
+    lastTemplateId: tid || existing?.lastTemplateId || null,
+    lastStatus: cleanString(status, 40) || existing?.lastStatus || "sent",
+    lastSentAt,
+    lastFinalizedAt,
+    lastMessageId: optionalString(messageId || existing?.lastMessageId, 100),
+    templateIds,
+    counters,
+  };
+  const row = await prisma.automationBumpFanState.upsert({
+    where: { creatorId_fanId: { creatorId: cid, fanId: fid } },
+    create: data,
+    update: { ...data, agencyId: undefined, creatorId: undefined, fanId: undefined },
+  });
+  return mapBumpFanState(row);
+}
+
+const STAT_EVENTS = new Set(["sent", "replied", "canceled", "expired", "failed"]);
+
+async function incrementBumpDeliveryStat({ agencyId, creatorId, templateId = "", day = null, event, by = 1 }) {
+  const ev = bumpStatStatus(event);
+  if (!STAT_EVENTS.has(ev)) {
+    const err = new Error("Bad bump stat event");
+    err.status = 400;
+    err.code = "BAD_EVENT";
+    throw err;
+  }
+  const cid = cleanString(creatorId, 100);
+  const tid = cleanString(templateId, 100) || "";
+  const statDay = cleanString(day, 10) || new Date().toISOString().slice(0, 10);
+  const incBy = Math.max(1, Math.min(1000, positiveInt(by, 1)));
+
+  const item = await prisma.bumpDeliveryStat.upsert({
+    where: { creatorId_templateId_day: { creatorId: cid, templateId: tid, day: statDay } },
+    create: {
+      agencyId, creatorId: cid, templateId: tid, day: statDay,
+      sent: ev === "sent" ? incBy : 0,
+      replied: ev === "replied" ? incBy : 0,
+      canceled: ev === "canceled" ? incBy : 0,
+      expired: ev === "expired" ? incBy : 0,
+      failed: ev === "failed" ? incBy : 0,
+    },
+    update: { [ev]: { increment: incBy } },
+  });
+  const taskStats = await refreshBumpTaskStats({ agencyId, creatorId: cid, templateId: tid });
+  return { item, taskStats };
+}
+
+async function findAutomationDeliveryForResult({ agencyId, creatorId, input = {} }) {
+  const id = cleanString(input.id || input.deliveryId || input.serverDeliveryId, 120);
+  const messageId = cleanString(input.messageId, 100);
+  if (id && !/^(bd_|local|tmp|temp)/i.test(id)) {
+    const byId = await prisma.automationDelivery.findFirst({ where: { id, agencyId, creatorId } });
+    if (byId) return byId;
+  }
+  if (messageId) {
+    return prisma.automationDelivery.findFirst({ where: { agencyId, creatorId, messageId } });
+  }
+  return null;
+}
+
 // Legacy server-state mutating routes are intentionally senior-only in v19.5.
 // Worker job protocol remains open through /jobs/claim, /jobs/:id/result and /events.
+
+router.get("/deliveries/fan-state", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
+    const fanId = cleanString(req.query.fanId || req.query.dialogId, 80);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
+    const item = await prisma.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId, fanId } } });
+    return res.json({ ok: true, item: mapBumpFanState(item), fanId, creatorId });
+  } catch (err) { return sendError(res, err, "BUMP_FAN_STATE_FAILED"); }
+});
+
+router.post("/deliveries/fan-state/upsert", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId, 100);
+    const fanId = cleanString(req.body?.fanId || req.body?.dialogId, 80);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
+    const item = await upsertBumpFanState({
+      agencyId: req.auth.agencyId,
+      creatorId,
+      fanId,
+      dialogId: req.body?.dialogId || fanId,
+      templateId: req.body?.templateId || req.body?.bumpId || req.body?.contentCollectionId || "",
+      status: req.body?.status || "sent",
+      sentAt: req.body?.sentAt || null,
+      finalizedAt: req.body?.finalizedAt || req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || null,
+      messageId: req.body?.messageId || null,
+    });
+    return res.json({ ok: true, item });
+  } catch (err) { return sendError(res, err, "BUMP_FAN_STATE_UPSERT_FAILED"); }
+});
 
 router.get("/deliveries", async (req, res) => {
   try {
@@ -127,10 +307,11 @@ router.get("/deliveries", async (req, res) => {
     if (fanId) where.fanId = fanId;
     const take = parseLimit(req.query.limit, 100, 500);
     const skip = parseOffset(req.query.offset);
-    const [items, count] = await Promise.all([
+    const [rows, count] = await Promise.all([
       prisma.automationDelivery.findMany({ where, orderBy: { createdAt: "desc" }, take, skip }),
       prisma.automationDelivery.count({ where }),
     ]);
+    const items = (rows || []).map(mapAutomationDelivery);
     return res.json({ ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERIES_FAILED"); }
 });
@@ -147,21 +328,40 @@ router.post("/deliveries/upsert", async (req, res) => {
     // чтобы дедуп ушёл в ветку по messageId, а не делал create по несуществующему id.
     const rawId = cleanString(req.body?.id, 100);
     const id = rawId && !/^(bd_|local|tmp|temp)/i.test(rawId) ? rawId : "";
+    const templateId = optionalString(req.body?.contentCollectionId || req.body?.templateId || req.body?.bumpId, 100);
+    const incomingResult = req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {};
+    const resultMeta = jsonObject({
+      ...incomingResult,
+      localDeliveryId: rawId && /^(bd_|local|tmp|temp)/i.test(rawId) ? rawId : (incomingResult.localDeliveryId || incomingResult.localId || null),
+      templateId: templateId || incomingResult.templateId || incomingResult.bumpId || null,
+      bumpId: templateId || incomingResult.bumpId || incomingResult.templateId || null,
+      queueId: req.body?.queueId ?? incomingResult.queueId ?? null,
+      cancelAt: req.body?.cancelAt || incomingResult.cancelAt || null,
+      cancelAfterHours: req.body?.cancelAfterHours ?? incomingResult.cancelAfterHours ?? null,
+      statCounted: req.body?.statCounted || incomingResult.statCounted || null,
+    });
     const data = {
       agencyId: req.auth.agencyId,
       creatorId,
       ruleId: optionalString(req.body?.ruleId, 100),
-      contentCollectionId: optionalString(req.body?.contentCollectionId || req.body?.templateId || req.body?.bumpId, 100),
+      contentCollectionId: templateId,
       fanId,
       dialogId: optionalString(req.body?.dialogId, 80),
       trigger: optionalString(req.body?.trigger, 80),
       status: cleanString(req.body?.status || "scheduled", 40) || "scheduled",
       scheduledAt: parseDate(req.body?.scheduledAt),
       sentAt: parseDate(req.body?.sentAt),
+      cancelAt: parseDate(req.body?.cancelAt || incomingResult.cancelAt),
+      claimedByDeviceId: optionalString(req.body?.claimedByDeviceId || incomingResult.claimedByDeviceId, 120),
+      claimedAt: parseDate(req.body?.claimedAt || incomingResult.claimedAt),
+      claimUntil: parseDate(req.body?.claimUntil || incomingResult.claimUntil),
+      lastCheckedAt: parseDate(req.body?.lastCheckedAt || incomingResult.lastCheckedAt),
+      attempts: req.body?.attempts === undefined ? undefined : positiveInt(req.body.attempts, 0),
+      maxAttempts: req.body?.maxAttempts === undefined ? undefined : Math.max(1, Math.min(50, positiveInt(req.body.maxAttempts, 5))),
       messageId: optionalString(req.body?.messageId, 100),
       priceCents: centsFromAny(req.body || {}, "priceCents", "price"),
       media: jsonArray(req.body?.media),
-      result: jsonObject(req.body?.result),
+      result: resultMeta,
       error: optionalString(req.body?.error, 2000),
       createdByUserId: req.auth.userId,
     };
@@ -170,7 +370,34 @@ router.post("/deliveries/upsert", async (req, res) => {
     // 2) else if messageId present -> find existing row for this creator+messageId and update it
     //    (prevents the sweep from inserting a fresh clone on every tick)
     // 3) else -> create (drafts / no message yet)
-    const updateData = { ...data, agencyId: undefined, creatorId: undefined, fanId: undefined };
+    const updateData = { ...data, agencyId: undefined, creatorId: undefined, fanId: undefined, createdByUserId: undefined };
+    for (const key of ["attempts", "maxAttempts"]) {
+      if (updateData[key] === undefined) delete updateData[key];
+    }
+    const terminalStatus = bumpStatStatus(data.status);
+    if (BUMP_TERMINAL_DELIVERY_STATUSES.has(terminalStatus)) {
+      const existing = id
+        ? await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId } })
+        : data.messageId
+          ? await prisma.automationDelivery.findFirst({ where: { agencyId: req.auth.agencyId, creatorId, messageId: data.messageId } })
+          : null;
+      if (!existing?.id) {
+        return res.json({ ok: true, item: null, alreadyCompacted: true, compacted: true, status: terminalStatus, _dedup: "v4-terminal-already-compacted" });
+      }
+      const updated = await prisma.automationDelivery.update({ where: { id: existing.id }, data: updateData });
+      const templateIdForStat = cleanString(req.body?.templateId || req.body?.bumpId || deliveryTemplateId(updated) || data.contentCollectionId, 100) || "";
+      await upsertBumpFanState({
+        agencyId: req.auth.agencyId, creatorId, fanId: updated.fanId, dialogId: updated.dialogId || updated.fanId,
+        templateId: templateIdForStat, status: terminalStatus, sentAt: updated.sentAt,
+        finalizedAt: req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || new Date().toISOString(),
+        messageId: updated.messageId,
+      }).catch(() => null);
+      const day = cleanString(req.body?.day, 10) || (updated.sentAt ? updated.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
+      const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId: templateIdForStat, day, event: terminalStatus, by: 1 });
+      await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
+      return res.json({ ok: true, item: null, compacted: true, status: terminalStatus, stat, _dedup: "v4-terminal-server-counted" });
+    }
+
     let item;
     if (id) {
       item = await prisma.automationDelivery.upsert({ where: { id }, create: data, update: updateData });
@@ -186,17 +413,157 @@ router.post("/deliveries/upsert", async (req, res) => {
       item = await prisma.automationDelivery.create({ data });
     }
 
-    // Storage optimization: completed bump deliveries are not a forever ledger.
-    // The Electron client already increments BumpDeliveryStat once per transition;
-    // once a delivery is terminal, keep stats only and remove the pending row.
-    const terminalStatus = bumpStatStatus(data.status);
-    if (BUMP_TERMINAL_DELIVERY_STATUSES.has(terminalStatus) && item?.id) {
-      await prisma.automationDelivery.delete({ where: { id: item.id } }).catch(() => null);
-      return res.json({ ok: true, item: null, compacted: true, status: terminalStatus, _dedup: "v3-terminal-compact" });
+    await upsertBumpFanState({
+      agencyId: req.auth.agencyId, creatorId, fanId: item.fanId, dialogId: item.dialogId || item.fanId,
+      templateId: deliveryTemplateId(item), status: item.status || "sent", sentAt: item.sentAt, messageId: item.messageId,
+    }).catch(() => null);
+    return res.json({ ok: true, item: mapAutomationDelivery(item), _dedup: "v5-messageId-pending-claimable-fanstate" });
+  } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_UPSERT_FAILED"); }
+});
+
+
+// Distributed bump cancel queue. Active AutomationDelivery rows are the queue:
+// pending_reply rows become claimable after cancelAt; a worker gets a short lease,
+// verifies reply, deletes the OF message if needed, then reports a terminal result.
+router.post("/deliveries/claim-cancel", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
+    const limit = parseLimit(req.body?.limit, 20, 100);
+    const timeoutSec = Math.max(30, Math.min(3600, positiveInt(req.body?.claimTimeoutSec, 120)));
+    const now = new Date();
+    const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
+    const fallbackReplyTimeoutHours = Math.max(1, Math.min(72, Number(req.body?.fallbackReplyTimeoutHours || 5)));
+    const fallbackBefore = new Date(now.getTime() - fallbackReplyTimeoutHours * 60 * 60 * 1000);
+
+    // Dead worker recovery: release expired leases back into pending queue.
+    await prisma.automationDelivery.updateMany({
+      where: {
+        agencyId: req.auth.agencyId,
+        creatorId,
+        status: "cancel_claimed",
+        OR: [{ claimUntil: { lt: now } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }],
+      },
+      data: {
+        status: "pending_reply",
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        error: "cancel claim expired; returned to queue",
+      },
+    }).catch(() => null);
+
+    const candidates = await prisma.automationDelivery.findMany({
+      where: {
+        agencyId: req.auth.agencyId,
+        creatorId,
+        status: { in: ["pending_reply", "sent", "checking_reply"] },
+        OR: [
+          { cancelAt: { lte: now } },
+          // Rows created before cancelAt migration: safe fallback, same old default timeout.
+          { cancelAt: null, sentAt: { lte: fallbackBefore } },
+        ],
+      },
+      orderBy: [{ cancelAt: "asc" }, { sentAt: "asc" }, { createdAt: "asc" }],
+      take: Math.max(limit * 6, limit),
+    });
+
+    const items = [];
+    const skippedMaxAttempts = [];
+    for (const candidate of candidates) {
+      if (items.length >= limit) break;
+      const maxAttempts = Math.max(1, Math.min(50, Number(candidate.maxAttempts || 5)));
+      const attempts = Math.max(0, Number(candidate.attempts || 0));
+      if (attempts >= maxAttempts) {
+        const templateId = deliveryTemplateId(candidate);
+        const day = candidate.sentAt ? candidate.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
+        await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: "failed", by: 1 }).catch(() => null);
+        await prisma.automationDelivery.delete({ where: { id: candidate.id } }).catch(() => null);
+        skippedMaxAttempts.push(candidate.id);
+        continue;
+      }
+      const updated = await prisma.automationDelivery.updateMany({
+        where: {
+          id: candidate.id,
+          agencyId: req.auth.agencyId,
+          creatorId,
+          status: { in: ["pending_reply", "sent", "checking_reply"] },
+          OR: [{ claimUntil: null }, { claimUntil: { lt: now } }],
+        },
+        data: {
+          status: "cancel_claimed",
+          claimedByDeviceId: deviceId,
+          claimedAt: now,
+          claimUntil,
+          lastCheckedAt: now,
+          attempts: { increment: 1 },
+          error: null,
+        },
+      });
+      if (updated.count > 0) {
+        const row = await prisma.automationDelivery.findUnique({ where: { id: candidate.id } });
+        if (row) items.push(mapAutomationDelivery(row));
+      }
     }
 
-    return res.json({ ok: true, item, _dedup: "v3-messageId-pending-only" });
-  } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_UPSERT_FAILED"); }
+    return res.json({ ok: true, creatorId, deviceId, count: items.length, items, claimUntil, skippedMaxAttemptsCount: skippedMaxAttempts.length });
+  } catch (err) { return sendError(res, err, "BUMP_CANCEL_CLAIM_FAILED"); }
+});
+
+router.post("/deliveries/cancel-result", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const existing = await findAutomationDeliveryForResult({ agencyId: req.auth.agencyId, creatorId, input: req.body || {} });
+    if (!existing) {
+      return res.json({ ok: true, alreadyCompacted: true, item: null, code: "DELIVERY_NOT_FOUND_OR_ALREADY_COMPACTED" });
+    }
+
+    const status = bumpStatStatus(req.body?.status || (req.body?.ok === false ? "failed" : "canceled"));
+    const now = new Date();
+    const prevMeta = deliveryMeta(existing);
+    const mergedResult = jsonObject({
+      ...prevMeta,
+      ...(req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {}),
+      finalSource: req.body?.source || req.body?.replySource || req.body?.cancelSource || "server_cancel_worker",
+      finalStatus: status,
+      finalizedAt: req.body?.finalizedAt || req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || now.toISOString(),
+      replyMessageId: req.body?.replyMessageId || prevMeta.replyMessageId || null,
+      deleteVerified: req.body?.deleteVerified ?? prevMeta.deleteVerified ?? null,
+      workerDeviceId: req.body?.deviceId || req.body?.claimedByDeviceId || existing.claimedByDeviceId || null,
+    });
+
+    if (BUMP_TERMINAL_DELIVERY_STATUSES.has(status)) {
+      const templateId = cleanString(req.body?.templateId || req.body?.bumpId || deliveryTemplateId(existing), 100) || "";
+      const day = cleanString(req.body?.day, 10) || (existing.sentAt ? existing.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
+      await upsertBumpFanState({
+        agencyId: req.auth.agencyId, creatorId, fanId: existing.fanId, dialogId: existing.dialogId || existing.fanId,
+        templateId, status, sentAt: existing.sentAt,
+        finalizedAt: req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || now.toISOString(),
+        messageId: existing.messageId,
+      }).catch(() => null);
+      const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: status, by: 1 });
+      await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
+      return res.json({ ok: true, compacted: true, status, item: null, stat, deliveryId: existing.id, templateId });
+    }
+
+    // Non-terminal result means transient failure / release lease back into queue.
+    const nextStatus = status === "cancel_claimed" ? "cancel_claimed" : "pending_reply";
+    const item = await prisma.automationDelivery.update({
+      where: { id: existing.id },
+      data: {
+        status: nextStatus,
+        claimedByDeviceId: nextStatus === "cancel_claimed" ? existing.claimedByDeviceId : null,
+        claimedAt: nextStatus === "cancel_claimed" ? existing.claimedAt : null,
+        claimUntil: nextStatus === "cancel_claimed" ? existing.claimUntil : null,
+        lastCheckedAt: now,
+        result: mergedResult,
+        error: optionalString(req.body?.error || req.body?.lastError || null, 2000),
+      },
+    });
+    return res.json({ ok: true, compacted: false, item: mapAutomationDelivery(item), released: nextStatus === "pending_reply" });
+  } catch (err) { return sendError(res, err, "BUMP_CANCEL_RESULT_FAILED"); }
 });
 
 router.get("/hidden-online", async (req, res) => {
@@ -696,39 +1063,22 @@ router.post("/follow-back/clear", requireSeniorAutomationWriter, async (req, res
 });
 
 // ─── Bump reply-rate aggregate ────────────────────────────────────────────────
-// Атомарный счётчик по (creatorId, templateId, day). Клиент шлёт по одному событию
-// на каждый переход бампа: sent при отправке, replied/canceled/expired/failed в финале.
-// Дубль-вызовы безопасны на уровне суммы только если клиент гарантирует один вызов
-// на переход (он гарантирует через флаг statCounted в локальной записи).
-const STAT_EVENTS = new Set(["sent", "replied", "canceled", "expired", "failed"]);
-
+// Атомарный счётчик по (creatorId, templateId, day). Клиент шлёт sent при отправке.
+// Серверный cancel-worker шлёт terminal статусы сам, чтобы другой worker мог закрыть
+// чужую доставку без локального raw-event журнала.
 router.post("/deliveries/stat-bump", async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
-    const event = cleanString(req.body?.event, 40);
+    const event = bumpStatStatus(req.body?.event);
     if (!STAT_EVENTS.has(event)) {
       return res.status(400).json({ ok: false, code: "BAD_EVENT", error: "event must be one of: " + Array.from(STAT_EVENTS).join(", ") });
     }
     const templateId = cleanString(req.body?.templateId, 100) || "";
-    // day: YYYY-MM-DD (UTC). Берём из тела если прислали, иначе серверный сегодняшний.
     const day = cleanString(req.body?.day, 10) || new Date().toISOString().slice(0, 10);
     const by = Math.max(1, Math.min(1000, positiveInt(req.body?.by, 1)));
-
-    const item = await prisma.bumpDeliveryStat.upsert({
-      where: { creatorId_templateId_day: { creatorId, templateId, day } },
-      create: {
-        agencyId: req.auth.agencyId, creatorId, templateId, day,
-        sent: event === "sent" ? by : 0,
-        replied: event === "replied" ? by : 0,
-        canceled: event === "canceled" ? by : 0,
-        expired: event === "expired" ? by : 0,
-        failed: event === "failed" ? by : 0,
-      },
-      update: { [event]: { increment: by } },
-    });
-    const taskStats = await refreshBumpTaskStats({ agencyId: req.auth.agencyId, creatorId, templateId });
-    return res.json({ ok: true, item, taskStats });
+    const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event, by });
+    return res.json({ ok: true, item: stat.item, taskStats: stat.taskStats });
   } catch (err) { return sendError(res, err, "BUMP_STAT_FAILED"); }
 });
 

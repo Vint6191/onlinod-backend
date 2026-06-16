@@ -1578,6 +1578,13 @@ model AutomationDelivery {
   status          String   @default("scheduled") // scheduled | sent | skipped | failed | canceled
   scheduledAt     DateTime?
   sentAt          DateTime?
+  cancelAt        DateTime?
+  claimedByDeviceId String?
+  claimedAt       DateTime?
+  claimUntil      DateTime?
+  lastCheckedAt   DateTime?
+  attempts        Int      @default(0)
+  maxAttempts     Int      @default(5)
   messageId       String?
   priceCents      Int      @default(0)
   media           Json     @default("[]")
@@ -1593,8 +1600,36 @@ model AutomationDelivery {
   @@index([agencyId, status])
   @@index([creatorId, fanId])
   @@index([creatorId, messageId])
+  @@index([creatorId, status, cancelAt])
+  @@index([claimUntil])
   @@index([ruleId])
   @@index([sentAt])
+  @@index([cancelAt])
+}
+
+model AutomationBumpFanState {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  fanId           String
+  dialogId        String?
+  lastTemplateId  String?
+  lastStatus      String?
+  lastSentAt      DateTime?
+  lastFinalizedAt DateTime?
+  lastMessageId   String?
+  templateIds     Json     @default("[]")
+  counters        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, fanId])
+  @@index([agencyId])
+  @@index([creatorId, updatedAt])
+  @@index([lastSentAt])
 }
 
 model HiddenOnlineUser {
