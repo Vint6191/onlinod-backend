@@ -1221,11 +1221,14 @@ model ContentCollection {
   title           String
   description     String?
   tags            Json     @default("[]")
-  status          String   @default("active") // active | archived | deleted
+  status          String   @default("active") // active | archived | trash | deleted
+  metadata        Json     @default("{}")
   clientId        String?
   createdByUserId String?
   updatedByUserId String?
   deletedAt       DateTime?
+  purgeAfter      DateTime?
+  trashedByUserId String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -1238,6 +1241,7 @@ model ContentCollection {
   @@index([creatorId, kind, status])
   @@index([updatedAt])
   @@index([deletedAt])
+  @@index([purgeAfter])
 }
 
 model ContentBlock {
@@ -1254,6 +1258,10 @@ model ContentBlock {
   note            String?
   metadata        Json     @default("{}")
   clientId        String?
+  status          String   @default("active") // active | trash
+  deletedAt       DateTime?
+  purgeAfter      DateTime?
+  trashedByUserId String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -1261,6 +1269,7 @@ model ContentBlock {
 
   @@unique([collectionId, clientId])
   @@index([collectionId, order])
+  @@index([status, purgeAfter])
 }
 
 model ContentUsageEvent {
