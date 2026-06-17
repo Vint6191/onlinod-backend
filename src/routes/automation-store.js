@@ -1628,6 +1628,28 @@ router.post("/hidden-online/scan-jobs/claim", async (req, res) => {
       data: { status: "hidden_scan_queued", claimedByDeviceId: null, claimedAt: null, claimUntil: null, error: "hidden scan claim expired; returned to queue" },
     }).catch(() => null);
 
+    // If the same desktop worker already owns a live scan lease, hand it back
+    // instead of forcing the UI into "waiting for worker" until the lease expires.
+    // This makes restarts/ticks/chunk loops idempotent for one-worker studios.
+    const owned = await prisma.automationDelivery.findFirst({
+      where: {
+        agencyId: req.auth.agencyId,
+        creatorId,
+        status: "hidden_scan_claimed",
+        trigger: "hidden_online_scan",
+        claimedByDeviceId: deviceId,
+        OR: [{ claimUntil: { gt: now } }, { claimUntil: null }],
+      },
+      orderBy: [{ updatedAt: "desc" }],
+    });
+    if (owned?.id) {
+      const updatedOwned = await prisma.automationDelivery.update({
+        where: { id: owned.id },
+        data: { claimUntil, lastCheckedAt: now, error: null },
+      });
+      return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updatedOwned), items: [mapAutomationDelivery(updatedOwned)], scanState: hiddenScanState(updatedOwned), claimUntil, continued: true });
+    }
+
     const row = await prisma.automationDelivery.findFirst({
       where: { agencyId: req.auth.agencyId, creatorId, status: "hidden_scan_queued", scheduledAt: { lte: now }, trigger: "hidden_online_scan" },
       orderBy: [{ scheduledAt: "asc" }, { updatedAt: "asc" }],
@@ -1680,7 +1702,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       keepClaim,
       claimUntil: keepClaim ? keepClaimUntil.toISOString() : null,
     });
-    const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 1000);
+    const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 250);
     const item = await prisma.automationDelivery.update({
       where: { id: row.id },
       data: {
