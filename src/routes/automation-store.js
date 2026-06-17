@@ -1016,7 +1016,32 @@ function hiddenScanJobId(creatorId) {
 
 function hiddenScanState(row = {}) {
   const meta = deliveryMeta(row);
-  return meta && typeof meta === "object" ? meta : {};
+  const rawStatus = String(row?.status || "").toLowerCase();
+  const out = meta && typeof meta === "object" && !Array.isArray(meta) ? { ...meta } : {};
+
+  // Expose server job status to desktop UI. The previous version returned only
+  // row.result, so freshly queued/claimed jobs could look idle until the first
+  // progress page was posted. Hidden scan is server-owned, so the visible
+  // progress state must reflect AutomationDelivery.status too.
+  if (!out.status) {
+    if (rawStatus === "hidden_scan_claimed") out.status = "running";
+    else if (rawStatus === "hidden_scan_queued") out.status = "queued";
+    else if (rawStatus === "hidden_scan_paused") out.status = "paused";
+    else if (rawStatus === "hidden_scan_done") out.status = "done";
+    else if (rawStatus === "failed") out.status = "failed";
+    else if (rawStatus) out.status = rawStatus;
+    else out.status = "idle";
+  }
+
+  out.serverStatus = rawStatus || out.serverStatus || null;
+  if (row?.id && !out.jobId) out.jobId = row.id;
+  if (row?.scheduledAt && !out.nextScanAt) out.nextScanAt = row.scheduledAt.toISOString ? row.scheduledAt.toISOString() : row.scheduledAt;
+  if (row?.claimedByDeviceId && !out.claimedByDeviceId) out.claimedByDeviceId = row.claimedByDeviceId;
+  if (row?.claimUntil && !out.claimUntil) out.claimUntil = row.claimUntil.toISOString ? row.claimUntil.toISOString() : row.claimUntil;
+  if (row?.lastCheckedAt && !out.lastCheckedAt) out.lastCheckedAt = row.lastCheckedAt.toISOString ? row.lastCheckedAt.toISOString() : row.lastCheckedAt;
+  if (row?.error && !out.lastError) out.lastError = row.error;
+
+  return out;
 }
 
 function hiddenCandidateStatus(value) {
