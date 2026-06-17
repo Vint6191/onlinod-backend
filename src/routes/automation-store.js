@@ -367,6 +367,7 @@ const BUMP_TRIGGER_KEYS = Object.freeze({
   ONLINE: "fanOnline",
   LIKE: "fanLikedPost",
   SUBSCRIBED: "fanSubscribed",
+  HIDDEN: "hiddenOnlineSignal",
 });
 
 function normalizeBumpTrigger(value) {
@@ -376,6 +377,7 @@ function normalizeBumpTrigger(value) {
   if (raw === BUMP_TRIGGER_KEYS.ONLINE || lower === "online" || lower === "presence_online" || lower === "fan_online") return BUMP_TRIGGER_KEYS.ONLINE;
   if (raw === BUMP_TRIGGER_KEYS.LIKE || lower === "like" || lower === "post_like" || lower === "fan_liked_post" || lower === "fanlikedpost") return BUMP_TRIGGER_KEYS.LIKE;
   if (raw === BUMP_TRIGGER_KEYS.SUBSCRIBED || lower === "subscribe" || lower === "subscription" || lower === "subscription_created" || lower === "new_subscriber" || lower === "fansubscribed") return BUMP_TRIGGER_KEYS.SUBSCRIBED;
+  if (raw === BUMP_TRIGGER_KEYS.HIDDEN || lower === "hidden" || lower === "hidden_online" || lower === "hiddenonlinesignal" || lower === "hidden_online_signal") return BUMP_TRIGGER_KEYS.HIDDEN;
   return BUMP_TRIGGER_KEYS.ONLINE;
 }
 
@@ -997,6 +999,342 @@ router.post("/deliveries/cancel-result", async (req, res) => {
     });
     return res.json({ ok: true, compacted: false, item: mapAutomationDelivery(item), released: nextStatus === "pending_reply" });
   } catch (err) { return sendError(res, err, "BUMP_CANCEL_RESULT_FAILED"); }
+});
+
+
+
+// ─── Hidden Online server scan queue v19.32.1 ─────────────────────────────
+// Hidden online is intentionally server-owned: desktop workers only claim scan
+// chunks and upload compact candidate rows. We keep one mutable row per fan in
+// HiddenOnlineUser and reuse AutomationDelivery as the distributed job/queue
+// table, so no local-only state and no event-log explosion.
+const HIDDEN_SCAN_STATUSES = ["hidden_scan_queued", "hidden_scan_claimed", "hidden_scan_paused"];
+
+function hiddenScanJobId(creatorId) {
+  return `hidden_scan_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 90)}`;
+}
+
+function hiddenScanState(row = {}) {
+  const meta = deliveryMeta(row);
+  return meta && typeof meta === "object" ? meta : {};
+}
+
+function hiddenCandidateStatus(value) {
+  const s = cleanString(value || "active", 40).toLowerCase() || "active";
+  if (["ignored", "blocked", "removed", "excluded"].includes(s)) return s;
+  if (["queued", "cooling", "eligible"].includes(s)) return "active";
+  return "active";
+}
+
+function hiddenCandidateCompact(input = {}) {
+  const fanId = cleanString(input.fanId || input.userId || input.id || input.dialogId, 80);
+  if (!fanId) return null;
+  const metadata = jsonObject(input.metadata || {});
+  const now = new Date().toISOString();
+  return {
+    fanId,
+    dialogId: optionalString(input.dialogId || input.withUserId || fanId, 80),
+    username: optionalString(input.username || input.fanUsername, 120),
+    name: optionalString(input.name || input.fanName || input.displayName, 180),
+    totalSpentCents: Number(input.totalSpentCents || input.spendTotalCents || input.spentCents || 0) || 0,
+    status: hiddenCandidateStatus(input.status),
+    lastSignalAt: parseDate(input.lastSignalAt || input.lastScannedAt || input.scannedAt) || new Date(),
+    metadata: {
+      ...metadata,
+      source: metadata.source || input.source || "hidden_online_scan",
+      reason: metadata.reason || input.reason || "hidden lastSeen=null",
+      lastScannedAt: input.lastScannedAt || input.scannedAt || now,
+      lastSeen: input.lastSeen === undefined ? (metadata.lastSeen ?? null) : input.lastSeen,
+      canReceiveChatMessage: input.canReceiveChatMessage ?? metadata.canReceiveChatMessage ?? null,
+      lastOutgoingAt: input.lastOutgoingAt || metadata.lastOutgoingAt || null,
+      lastIncomingAt: input.lastIncomingAt || metadata.lastIncomingAt || null,
+      nextEligibleAt: input.nextEligibleAt || metadata.nextEligibleAt || null,
+      lastHiddenQueuedAt: input.lastHiddenQueuedAt || metadata.lastHiddenQueuedAt || null,
+      hiddenCadenceHours: Number(input.hiddenCadenceHours || metadata.hiddenCadenceHours || 3) || 3,
+    },
+  };
+}
+
+async function upsertHiddenCandidateRows({ agencyId, creatorId, items = [], scanJobId = null }) {
+  const out = { inserted: 0, updated: 0, items: [] };
+  for (const raw of Array.isArray(items) ? items : []) {
+    const item = hiddenCandidateCompact(raw);
+    if (!item?.fanId) continue;
+    const existing = await prisma.hiddenOnlineUser.findUnique({ where: { creatorId_fanId: { creatorId, fanId: item.fanId } } }).catch(() => null);
+    const prevMeta = existing?.metadata && typeof existing.metadata === "object" && !Array.isArray(existing.metadata) ? existing.metadata : {};
+    const status = existing && ["ignored", "blocked", "removed", "excluded"].includes(String(existing.status || ""))
+      ? existing.status
+      : item.status;
+    const saved = await prisma.hiddenOnlineUser.upsert({
+      where: { creatorId_fanId: { creatorId, fanId: item.fanId } },
+      create: {
+        agencyId,
+        creatorId,
+        fanId: item.fanId,
+        dialogId: item.dialogId,
+        username: item.username,
+        name: item.name,
+        totalSpentCents: item.totalSpentCents,
+        status,
+        signals: [],
+        metadata: jsonObject({ ...item.metadata, scanJobId }),
+        lastSignalAt: item.lastSignalAt,
+      },
+      update: {
+        dialogId: item.dialogId || undefined,
+        username: item.username || undefined,
+        name: item.name || undefined,
+        totalSpentCents: raw?.totalSpentCents === undefined && raw?.spendTotalCents === undefined && raw?.spentCents === undefined ? undefined : item.totalSpentCents,
+        status,
+        // Keep compact. Do not append signal history here.
+        signals: [],
+        metadata: jsonObject({ ...prevMeta, ...item.metadata, scanJobId }),
+        lastSignalAt: item.lastSignalAt,
+      },
+    });
+    if (existing?.id) out.updated += 1; else out.inserted += 1;
+    out.items.push(saved);
+  }
+  return out;
+}
+
+router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const now = new Date();
+    const scanEveryDays = Math.max(1, Math.min(30, positiveInt(req.body?.scanEveryDays, 7)));
+    const limit = Math.max(20, Math.min(100, positiveInt(req.body?.limit, 100)));
+    const fullScan = req.body?.fullScan === true || req.body?.force === true;
+    const id = hiddenScanJobId(creatorId);
+    const existing = await prisma.automationDelivery.findUnique({ where: { id } }).catch(() => null);
+    const prev = hiddenScanState(existing || {});
+    const dueAt = existing?.scheduledAt || null;
+    const due = !dueAt || dueAt <= now || req.body?.manual === true || fullScan;
+    if (existing?.id && !due && !["hidden_scan_paused", "hidden_scan_done", "failed"].includes(String(existing.status || ""))) {
+      return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || null, code: "HIDDEN_SCAN_NOT_DUE" });
+    }
+
+    const state = jsonObject({
+      ...prev,
+      hiddenScan: true,
+      scanEveryDays,
+      limit,
+      sourceType: cleanString(req.body?.type || req.body?.subscriberType || prev.sourceType || "all", 40) || "all",
+      nextOffset: fullScan ? 0 : Math.max(0, Number(prev.nextOffset || 0) || 0),
+      fullScan,
+      manual: req.body?.manual === true,
+      enqueuedAt: now.toISOString(),
+      lastError: null,
+    });
+    const item = await prisma.automationDelivery.upsert({
+      where: { id },
+      create: {
+        id,
+        agencyId: req.auth.agencyId,
+        creatorId,
+        fanId: "__hidden_scan__",
+        trigger: "hidden_online_scan",
+        status: "hidden_scan_queued",
+        scheduledAt: now,
+        maxAttempts: 100000,
+        result: state,
+        createdByUserId: req.auth.userId || null,
+      },
+      update: {
+        status: "hidden_scan_queued",
+        scheduledAt: now,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        error: null,
+        result: state,
+      },
+    });
+    return res.json({ ok: true, creatorId, queued: true, item: mapAutomationDelivery(item), scanState: hiddenScanState(item) });
+  } catch (err) { return sendError(res, err, "HIDDEN_SCAN_ENQUEUE_FAILED"); }
+});
+
+router.post("/hidden-online/scan-jobs/claim", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
+    const timeoutSec = Math.max(60, Math.min(3600, positiveInt(req.body?.claimTimeoutSec, 300)));
+    const now = new Date();
+    const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
+
+    await prisma.automationDelivery.updateMany({
+      where: { agencyId: req.auth.agencyId, creatorId, status: "hidden_scan_claimed", OR: [{ claimUntil: { lt: now } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
+      data: { status: "hidden_scan_queued", claimedByDeviceId: null, claimedAt: null, claimUntil: null, error: "hidden scan claim expired; returned to queue" },
+    }).catch(() => null);
+
+    const row = await prisma.automationDelivery.findFirst({
+      where: { agencyId: req.auth.agencyId, creatorId, status: "hidden_scan_queued", scheduledAt: { lte: now }, trigger: "hidden_online_scan" },
+      orderBy: [{ scheduledAt: "asc" }, { updatedAt: "asc" }],
+    });
+    if (!row) {
+      const next = await prisma.automationDelivery.findFirst({ where: { agencyId: req.auth.agencyId, creatorId, trigger: "hidden_online_scan" }, orderBy: { scheduledAt: "asc" } });
+      return res.json({ ok: true, creatorId, count: 0, items: [], item: null, nextScanAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null });
+    }
+    const updated = await prisma.automationDelivery.update({
+      where: { id: row.id },
+      data: { status: "hidden_scan_claimed", claimedByDeviceId: deviceId, claimedAt: now, claimUntil, lastCheckedAt: now, attempts: { increment: 1 }, error: null },
+    });
+    return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updated), items: [mapAutomationDelivery(updated)], scanState: hiddenScanState(updated), claimUntil });
+  } catch (err) { return sendError(res, err, "HIDDEN_SCAN_CLAIM_FAILED"); }
+});
+
+router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const id = cleanString(req.body?.jobId || req.body?.id || hiddenScanJobId(creatorId), 120);
+    const now = new Date();
+    const row = await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId, trigger: "hidden_online_scan" } });
+    if (!row) return res.status(404).json({ ok: false, code: "HIDDEN_SCAN_JOB_NOT_FOUND", error: "Hidden scan job not found" });
+    const prev = hiddenScanState(row);
+    const upsert = await upsertHiddenCandidateRows({ agencyId: req.auth.agencyId, creatorId, items: req.body?.items || req.body?.candidates || [], scanJobId: row.id });
+    const scanned = Number(prev.scanned || 0) + Math.max(0, Number(req.body?.scanned || req.body?.pageSize || 0) || 0);
+    const hiddenSeen = Number(prev.hiddenSeen || 0) + Math.max(0, Number(req.body?.hiddenSeen || upsert.items.length || 0) || 0);
+    const pages = Number(prev.pages || 0) + Math.max(1, Number(req.body?.pages || 1) || 1);
+    const hasMore = req.body?.hasMore === true;
+    const done = req.body?.done === true || hasMore === false;
+    const scanEveryDays = Math.max(1, Math.min(30, positiveInt(req.body?.scanEveryDays || prev.scanEveryDays, 7)));
+    const nextOffset = Math.max(0, Number(req.body?.nextOffset ?? prev.nextOffset ?? 0) || 0);
+    const state = jsonObject({
+      ...prev,
+      scanned,
+      hiddenSeen,
+      inserted: Number(prev.inserted || 0) + upsert.inserted,
+      updated: Number(prev.updated || 0) + upsert.updated,
+      pages,
+      nextOffset,
+      hasMore,
+      status: done ? "done" : "queued",
+      lastPageAt: now.toISOString(),
+      finishedAt: done ? now.toISOString() : prev.finishedAt || null,
+      lastError: req.body?.error || null,
+    });
+    const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 1000);
+    const item = await prisma.automationDelivery.update({
+      where: { id: row.id },
+      data: {
+        status: done ? "hidden_scan_done" : "hidden_scan_queued",
+        scheduledAt: nextScheduledAt,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        lastCheckedAt: now,
+        result: state,
+        error: req.body?.error ? optionalString(req.body.error, 2000) : null,
+      },
+    });
+    const counts = await prisma.hiddenOnlineUser.groupBy({ by: ["status"], where: { agencyId: req.auth.agencyId, creatorId }, _count: { _all: true } }).catch(() => []);
+    return res.json({ ok: true, creatorId, item: mapAutomationDelivery(item), scanState: hiddenScanState(item), upsert, counts, nextScanAt: nextScheduledAt.toISOString() });
+  } catch (err) { return sendError(res, err, "HIDDEN_SCAN_PROGRESS_FAILED"); }
+});
+
+router.get("/hidden-online/scan-state", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const job = await prisma.automationDelivery.findUnique({ where: { id: hiddenScanJobId(creatorId) } }).catch(() => null);
+    const [total, active, ignored, blocked] = await Promise.all([
+      prisma.hiddenOnlineUser.count({ where: { agencyId: req.auth.agencyId, creatorId } }),
+      prisma.hiddenOnlineUser.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "active" } }),
+      prisma.hiddenOnlineUser.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "ignored" } }),
+      prisma.hiddenOnlineUser.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "blocked" } }),
+    ]);
+    return res.json({ ok: true, creatorId, item: mapAutomationDelivery(job), scanState: hiddenScanState(job || {}), counts: { total, active, ignored, blocked } });
+  } catch (err) { return sendError(res, err, "HIDDEN_SCAN_STATE_FAILED"); }
+});
+
+router.post("/hidden-online/queue-eligible", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const now = new Date();
+    const range = onlineSpacingRange(req.body || {});
+    const limit = Math.max(1, Math.min(200, positiveInt(req.body?.limit, 50)));
+    const cadenceHours = Math.max(1, Math.min(168, Number(req.body?.cadenceHours || req.body?.hiddenCadenceHours || 3) || 3));
+    const replyTimeoutHours = Math.max(1, Math.min(24, Number(req.body?.replyTimeoutHours || req.body?.hiddenReplyTimeoutHours || 1) || 1));
+
+    const candidates = await prisma.hiddenOnlineUser.findMany({
+      where: { agencyId: req.auth.agencyId, creatorId, status: "active" },
+      orderBy: [{ lastSignalAt: "desc" }, { updatedAt: "desc" }],
+      take: Math.max(limit * 5, limit),
+    });
+    const activeRows = await prisma.automationDelivery.findMany({
+      where: { agencyId: req.auth.agencyId, creatorId, fanId: { in: candidates.map((x) => x.fanId) }, status: { in: ONLINE_SEND_ACTIVE_STATUSES } },
+      select: { fanId: true, status: true },
+    });
+    const activeByFan = new Map(activeRows.map((x) => [String(x.fanId), x]));
+    const picked = [];
+    const skipped = [];
+    for (const c of candidates) {
+      if (picked.length >= limit) break;
+      const meta = c.metadata && typeof c.metadata === "object" && !Array.isArray(c.metadata) ? c.metadata : {};
+      const nextEligibleAt = parseDate(meta.nextEligibleAt || meta.hiddenNextEligibleAt || null);
+      if (nextEligibleAt && nextEligibleAt > now) { skipped.push({ fanId: c.fanId, code: "COOLING", nextEligibleAt: nextEligibleAt.toISOString() }); continue; }
+      if (activeByFan.has(String(c.fanId))) { skipped.push({ fanId: c.fanId, code: "ACTIVE_OR_ALREADY_QUEUED", status: activeByFan.get(String(c.fanId))?.status || null }); continue; }
+      picked.push(c);
+    }
+
+    if (!picked.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped, code: "NO_ELIGIBLE_HIDDEN_ONLINE" });
+
+    const result = await prisma.$transaction(async (tx) => {
+      const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now });
+      let cursor = onlineGateNextAllowed(gate, now);
+      const items = [];
+      for (const c of picked) {
+        const scheduledAt = new Date(Math.max(cursor.getTime(), now.getTime()));
+        const meta = c.metadata && typeof c.metadata === "object" && !Array.isArray(c.metadata) ? c.metadata : {};
+        const item = await tx.automationDelivery.create({
+          data: {
+            agencyId: req.auth.agencyId,
+            creatorId,
+            fanId: c.fanId,
+            dialogId: c.dialogId || c.fanId,
+            trigger: BUMP_TRIGGER_KEYS.HIDDEN,
+            status: "online_queued",
+            scheduledAt,
+            maxAttempts: 3,
+            result: jsonObject({
+              eventQueue: true,
+              hiddenOnlineQueue: true,
+              triggerKey: BUMP_TRIGGER_KEYS.HIDDEN,
+              trigger: BUMP_TRIGGER_KEYS.HIDDEN,
+              eventType: "hidden_online_candidate",
+              sourceCandidateId: c.id,
+              reason: meta.reason || "hidden online candidate",
+              replyTimeoutHours,
+              hiddenReplyTimeoutHours: replyTimeoutHours,
+              hiddenCadenceHours: cadenceHours,
+              minFanSpacingSec: range.min,
+              maxFanSpacingSec: range.max,
+              queuedAt: now.toISOString(),
+            }),
+            createdByUserId: req.auth.userId || null,
+          },
+        });
+        items.push(item);
+        const nextEligibleAt = new Date(now.getTime() + cadenceHours * 60 * 60 * 1000).toISOString();
+        await tx.hiddenOnlineUser.update({
+          where: { id: c.id },
+          data: { metadata: jsonObject({ ...meta, lastHiddenQueuedAt: now.toISOString(), nextEligibleAt, hiddenCadenceHours: cadenceHours, hiddenReplyTimeoutHours: replyTimeoutHours }) },
+        });
+        cursor = new Date(scheduledAt.getTime() + randomOnlineSpacingMs(range));
+      }
+      await tx.automationDelivery.update({
+        where: { id: gate.id },
+        data: { scheduledAt: cursor, result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }) },
+      });
+      return { items, gateNextAllowedAt: cursor };
+    }, { timeout: 15000 });
+
+    return res.json({ ok: true, creatorId, triggerKey: BUMP_TRIGGER_KEYS.HIDDEN, count: result.items.length, items: result.items.map(mapAutomationDelivery), skipped, skippedCount: skipped.length, gateNextAllowedAt: result.gateNextAllowedAt.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, cadenceHours, replyTimeoutHours });
+  } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_QUEUE_ELIGIBLE_FAILED"); }
 });
 
 router.get("/hidden-online", async (req, res) => {
