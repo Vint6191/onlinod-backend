@@ -361,6 +361,77 @@ async function findAutomationDeliveryForResult({ agencyId, creatorId, input = {}
 // Legacy server-state mutating routes are intentionally senior-only in v19.5.
 // Worker job protocol remains open through /jobs/claim, /jobs/:id/result and /events.
 
+
+function onlineQueueFanIds(value) {
+  const source = Array.isArray(value) ? value : [];
+  const out = [];
+  const seen = new Set();
+  for (const item of source) {
+    const raw = item && typeof item === "object" ? (item.fanId || item.userId || item.id || item.dialogId) : item;
+    const id = cleanString(raw, 80);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function onlineSpacingRange(input = {}) {
+  const min = Math.max(15, Math.min(3600, positiveInt(input.minFanSpacingSec ?? input.onlineFanSpacingSec ?? input.batchSpacingSec, 15)));
+  const rawMax = positiveInt(input.maxFanSpacingSec ?? input.onlineFanMaxSpacingSec ?? input.batchMaxSpacingSec, 30);
+  const max = Math.max(min, Math.min(3600, rawMax || 30));
+  return { min, max };
+}
+
+function randomOnlineSpacingMs(range = {}) {
+  const min = Math.max(15, Number(range.min) || 15);
+  const max = Math.max(min, Number(range.max) || 30);
+  const sec = min + Math.floor(Math.random() * (max - min + 1));
+  return sec * 1000;
+}
+
+function onlineGateId(creatorId) {
+  return `online_gate_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80)}`;
+}
+
+async function acquireOnlineGate(tx, { agencyId, creatorId, now }) {
+  const id = onlineGateId(creatorId);
+  let row = await tx.automationDelivery.findUnique({ where: { id } }).catch(() => null);
+  if (!row) {
+    try {
+      row = await tx.automationDelivery.create({
+        data: {
+          id,
+          agencyId,
+          creatorId,
+          fanId: "__online_gate__",
+          dialogId: null,
+          trigger: "fanOnline_gate",
+          status: "online_gate",
+          scheduledAt: now,
+          lastCheckedAt: now,
+          result: { onlineGate: true, nextAllowedAt: now.toISOString() },
+        },
+      });
+    } catch (_) {
+      row = await tx.automationDelivery.findUnique({ where: { id } }).catch(() => null);
+    }
+  }
+
+  if (!row) throw new Error("ONLINE_GATE_UNAVAILABLE");
+  // UPDATE locks the gate row inside the transaction on PostgreSQL, giving us
+  // one global cursor per creator/account for online bump sends.
+  return tx.automationDelivery.update({ where: { id }, data: { lastCheckedAt: now } });
+}
+
+function onlineGateNextAllowed(row, now) {
+  const meta = deliveryMeta(row);
+  const t = new Date(meta.nextAllowedAt || row?.scheduledAt || 0).getTime();
+  return Number.isFinite(t) && t > now.getTime() ? new Date(t) : now;
+}
+
+const ONLINE_SEND_ACTIVE_STATUSES = ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
+
 router.get("/deliveries/fan-state", async (req, res) => {
   try {
     const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
@@ -598,6 +669,159 @@ router.post("/deliveries/debug-force-due", requireSeniorAutomationWriter, async 
       warning: "debug-force-due only makes rows claimable; normal claim/sweep still performs reply-check and delete",
     });
   } catch (err) { return sendError(res, err, "BUMP_DEBUG_FORCE_DUE_FAILED"); }
+});
+
+
+// Distributed online bump scheduler. Workers report online fan batches; server
+// dedupes fanIds and assigns global scheduledAt slots with 15–30s spacing so
+// several employees/devices cannot burst-send at the same time.
+router.post("/deliveries/online-batch", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const fanIds = onlineQueueFanIds(req.body?.fanIds || req.body?.onlineIds || req.body?.ids || []);
+    if (!fanIds.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped: [], code: "ONLINE_BATCH_EMPTY" });
+
+    const range = onlineSpacingRange(req.body || {});
+    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
+    const batchId = cleanString(req.body?.batchId, 120) || `online_batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = new Date();
+
+    const result = await prisma.$transaction(async (tx) => {
+      const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now });
+      const activeRows = await tx.automationDelivery.findMany({
+        where: { agencyId: req.auth.agencyId, creatorId, fanId: { in: fanIds }, status: { in: ONLINE_SEND_ACTIVE_STATUSES } },
+        select: { id: true, fanId: true, status: true, scheduledAt: true, sentAt: true, createdAt: true },
+      });
+      const activeByFan = new Map(activeRows.map((x) => [String(x.fanId), x]));
+      let cursor = onlineGateNextAllowed(gate, now);
+      const items = [];
+      const skipped = [];
+
+      for (const fanId of fanIds) {
+        if (activeByFan.has(String(fanId))) {
+          skipped.push({ fanId, code: "ACTIVE_OR_ALREADY_QUEUED", status: activeByFan.get(String(fanId))?.status || null });
+          continue;
+        }
+
+        const scheduledAt = new Date(Math.max(cursor.getTime(), now.getTime()));
+        const item = await tx.automationDelivery.create({
+          data: {
+            agencyId: req.auth.agencyId,
+            creatorId,
+            fanId,
+            dialogId: fanId,
+            trigger: "fanOnline",
+            status: "online_queued",
+            scheduledAt,
+            maxAttempts: 3,
+            claimedByDeviceId: null,
+            result: jsonObject({
+              onlineQueue: true,
+              batchId,
+              sourceDeviceId: deviceId,
+              minFanSpacingSec: range.min,
+              maxFanSpacingSec: range.max,
+              queuedAt: now.toISOString(),
+            }),
+            createdByUserId: req.auth.userId,
+          },
+        });
+        items.push(item);
+        activeByFan.set(String(fanId), item);
+        cursor = new Date(scheduledAt.getTime() + randomOnlineSpacingMs(range));
+      }
+
+      await tx.automationDelivery.update({
+        where: { id: gate.id },
+        data: {
+          scheduledAt: cursor,
+          result: jsonObject({ ...deliveryMeta(gate), onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }),
+        },
+      });
+
+      const nextScheduledAt = items[0]?.scheduledAt || await tx.automationDelivery.findFirst({
+        where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued" },
+        orderBy: { scheduledAt: "asc" },
+        select: { scheduledAt: true },
+      }).then((x) => x?.scheduledAt || null);
+
+      return { items, skipped, nextScheduledAt, gateNextAllowedAt: cursor };
+    }, { timeout: 15000 });
+
+    return res.json({
+      ok: true,
+      creatorId,
+      mode: "server_online_queue",
+      count: result.items.length,
+      items: result.items.map(mapAutomationDelivery),
+      skipped: result.skipped,
+      skippedCount: result.skipped.length,
+      nextScheduledAt: result.nextScheduledAt ? result.nextScheduledAt.toISOString() : null,
+      gateNextAllowedAt: result.gateNextAllowedAt ? result.gateNextAllowedAt.toISOString() : null,
+      minFanSpacingSec: range.min,
+      maxFanSpacingSec: range.max,
+    });
+  } catch (err) { return sendError(res, err, "BUMP_ONLINE_BATCH_FAILED"); }
+});
+
+router.post("/deliveries/claim-online-send", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
+    const limit = parseLimit(req.body?.limit, 1, 10);
+    const timeoutSec = Math.max(30, Math.min(1800, positiveInt(req.body?.claimTimeoutSec, 180)));
+    const now = new Date();
+    const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
+
+    await prisma.automationDelivery.updateMany({
+      where: { agencyId: req.auth.agencyId, creatorId, status: "online_claimed", OR: [{ claimUntil: { lt: now } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
+      data: { status: "online_queued", claimedByDeviceId: null, claimedAt: null, claimUntil: null, error: "online claim expired; returned to queue" },
+    }).catch(() => null);
+
+    const candidates = await prisma.automationDelivery.findMany({
+      where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", scheduledAt: { lte: now } },
+      orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
+      take: Math.max(limit * 4, limit),
+    });
+
+    const items = [];
+    for (const candidate of candidates) {
+      if (items.length >= limit) break;
+      const updated = await prisma.automationDelivery.updateMany({
+        where: { id: candidate.id, agencyId: req.auth.agencyId, creatorId, status: "online_queued", OR: [{ claimUntil: null }, { claimUntil: { lt: now } }] },
+        data: { status: "online_claimed", claimedByDeviceId: deviceId, claimedAt: now, claimUntil, lastCheckedAt: now, attempts: { increment: 1 }, error: null },
+      });
+      if (updated.count > 0) {
+        const row = await prisma.automationDelivery.findUnique({ where: { id: candidate.id } });
+        if (row) items.push(mapAutomationDelivery(row));
+      }
+    }
+
+    const next = await prisma.automationDelivery.findFirst({
+      where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued" },
+      orderBy: { scheduledAt: "asc" },
+      select: { scheduledAt: true },
+    });
+
+    return res.json({ ok: true, creatorId, deviceId, count: items.length, items, claimUntil, nextScheduledAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null });
+  } catch (err) { return sendError(res, err, "BUMP_ONLINE_CLAIM_FAILED"); }
+});
+
+router.post("/deliveries/online-send-result", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const id = cleanString(req.body?.id || req.body?.deliveryId || req.body?.serverDeliveryId, 120);
+    if (!id) return res.status(400).json({ ok: false, code: "ONLINE_QUEUE_ID_MISSING", error: "delivery id is required" });
+    const row = await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "online_queued"] } } });
+    if (!row) return res.json({ ok: true, alreadyDone: true, item: null, code: "ONLINE_QUEUE_ROW_NOT_FOUND" });
+    const status = cleanString(req.body?.status || (req.body?.ok === false ? "failed" : "done"), 40) || "done";
+    const meta = jsonObject({ ...deliveryMeta(row), ...(req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {}), finalStatus: status, finalizedAt: new Date().toISOString(), workerDeviceId: req.body?.deviceId || row.claimedByDeviceId || null });
+    await prisma.automationDelivery.delete({ where: { id: row.id } }).catch(() => null);
+    return res.json({ ok: true, compacted: true, status, item: null, deliveryId: row.id, result: meta });
+  } catch (err) { return sendError(res, err, "BUMP_ONLINE_RESULT_FAILED"); }
 });
 
 // Distributed bump cancel queue. Active AutomationDelivery rows are the queue:
