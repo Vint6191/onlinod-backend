@@ -1227,6 +1227,9 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const done = req.body?.done === true || hasMore === false;
     const scanEveryDays = Math.max(1, Math.min(30, positiveInt(req.body?.scanEveryDays || prev.scanEveryDays, 7)));
     const nextOffset = Math.max(0, Number(req.body?.nextOffset ?? prev.nextOffset ?? 0) || 0);
+    const keepClaim = req.body?.keepClaim === true && !done && !req.body?.error;
+    const claimTimeoutSec = Math.max(60, Math.min(3600, positiveInt(req.body?.claimTimeoutSec, 300)));
+    const keepClaimUntil = new Date(now.getTime() + claimTimeoutSec * 1000);
     const state = jsonObject({
       ...prev,
       scanned,
@@ -1236,20 +1239,22 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       pages,
       nextOffset,
       hasMore,
-      status: done ? "done" : "queued",
+      status: done ? "done" : (keepClaim ? "scanning" : "queued"),
       lastPageAt: now.toISOString(),
       finishedAt: done ? now.toISOString() : prev.finishedAt || null,
       lastError: req.body?.error || null,
+      keepClaim,
+      claimUntil: keepClaim ? keepClaimUntil.toISOString() : null,
     });
     const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 1000);
     const item = await prisma.automationDelivery.update({
       where: { id: row.id },
       data: {
-        status: done ? "hidden_scan_done" : "hidden_scan_queued",
-        scheduledAt: nextScheduledAt,
-        claimedByDeviceId: null,
-        claimedAt: null,
-        claimUntil: null,
+        status: done ? "hidden_scan_done" : (keepClaim ? "hidden_scan_claimed" : "hidden_scan_queued"),
+        scheduledAt: keepClaim ? now : nextScheduledAt,
+        claimedByDeviceId: keepClaim ? (row.claimedByDeviceId || cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown") : null,
+        claimedAt: keepClaim ? (row.claimedAt || now) : null,
+        claimUntil: keepClaim ? keepClaimUntil : null,
         lastCheckedAt: now,
         result: state,
         error: req.body?.error ? optionalString(req.body.error, 2000) : null,
