@@ -54,6 +54,34 @@ router.delete("/tasks/:id", requireSeniorAutomationWriter, async (req, res) => {
 // the same shape expected by the Electron Automation UI/cache.
 router.get("/bumps", async (req, res) => { try { const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100); return res.json(await automationServer.listBumps({ agencyId: req.auth.agencyId, creatorId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_FAILED"); } });
 router.post("/bumps/gc", async (req, res) => { try { const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100); return res.json(await automationServer.gcExpiredBumps({ agencyId: req.auth.agencyId, creatorId })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_GC_FAILED"); } });
+
+router.get("/bump-safety", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.query?.creatorId || req.query?.accountId || req.body?.creatorId || req.body?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const item = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
+    return res.json({ ok: true, creatorId, item, globalSafety: item, ...item });
+  } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAFETY_GET_FAILED"); }
+});
+
+router.put("/bump-safety", requireSeniorAutomationWriter, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const item = await saveBumpSafety({ agencyId: req.auth.agencyId, creatorId, userId: req.auth.userId, input: req.body || {} });
+    return res.json({ ok: true, creatorId, item, globalSafety: item, ...item });
+  } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAFETY_SAVE_FAILED"); }
+});
+
+router.post("/bump-safety", requireSeniorAutomationWriter, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const item = await saveBumpSafety({ agencyId: req.auth.agencyId, creatorId, userId: req.auth.userId, input: req.body || {} });
+    return res.json({ ok: true, creatorId, item, globalSafety: item, ...item });
+  } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAFETY_SAVE_FAILED"); }
+});
+
 router.get("/bumps/:accountId", async (req, res) => { try { return res.json(await automationServer.listBumps({ agencyId: req.auth.agencyId, creatorId: cleanString(req.params.accountId, 100), query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_FAILED"); } });
 router.post("/bumps/upsert", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.body?.creatorId, 100); return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAVE_FAILED"); } });
 router.post("/bumps/:accountId/upsert", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId: cleanString(req.params.accountId, 100), input: { ...(req.body || {}), accountId: req.params.accountId } })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAVE_FAILED"); } });
@@ -408,6 +436,89 @@ function onlineSpacingRange(input = {}) {
   const rawMax = positiveInt(input.maxFanSpacingSec ?? input.onlineFanMaxSpacingSec ?? input.batchMaxSpacingSec, 10);
   const max = Math.max(min, Math.min(3600, rawMax || 10));
   return { min, max };
+}
+
+
+const DEFAULT_BUMP_GLOBAL_SAFETY = Object.freeze({
+  replyCooldownHours: 24,
+  sentCooldownHours: 6,
+  minFanSpacingSec: 3,
+  maxFanSpacingSec: 10,
+  maxActiveHiddenQueued: 30,
+  hiddenRefillSize: 10,
+});
+
+function bumpSafetyClientId(creatorId) {
+  return `bump_safety:${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 90)}`;
+}
+
+function normalizeBumpSafety(input = {}) {
+  const src = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  const replyCooldownHours = Math.max(0, Math.min(2160, Number(src.replyCooldownHours ?? src.fanReplyCooldownHours ?? src.afterReplyCooldownHours ?? DEFAULT_BUMP_GLOBAL_SAFETY.replyCooldownHours) || 0));
+  const sentCooldownHours = Math.max(0, Math.min(720, Number(src.sentCooldownHours ?? src.fanSentCooldownHours ?? src.afterSendCooldownHours ?? DEFAULT_BUMP_GLOBAL_SAFETY.sentCooldownHours) || 0));
+  const minFanSpacingSec = Math.max(3, Math.min(3600, positiveInt(src.minFanSpacingSec ?? src.onlineFanSpacingSec ?? src.batchSpacingSec ?? src.eventSendIntervalMinSec, DEFAULT_BUMP_GLOBAL_SAFETY.minFanSpacingSec)));
+  const rawMax = positiveInt(src.maxFanSpacingSec ?? src.onlineFanMaxSpacingSec ?? src.batchMaxSpacingSec ?? src.eventSendIntervalMaxSec, DEFAULT_BUMP_GLOBAL_SAFETY.maxFanSpacingSec);
+  const maxFanSpacingSec = Math.max(minFanSpacingSec, Math.min(3600, rawMax || DEFAULT_BUMP_GLOBAL_SAFETY.maxFanSpacingSec));
+  const maxActiveHiddenQueued = Math.max(5, Math.min(200, positiveInt(src.maxActiveHiddenQueued ?? src.hiddenMaxActiveQueued ?? src.hiddenQueueCap, DEFAULT_BUMP_GLOBAL_SAFETY.maxActiveHiddenQueued)));
+  const hiddenRefillSize = Math.max(1, Math.min(maxActiveHiddenQueued, positiveInt(src.hiddenRefillSize ?? src.hiddenRefill ?? src.hiddenQueueRefill, DEFAULT_BUMP_GLOBAL_SAFETY.hiddenRefillSize)));
+  return {
+    replyCooldownHours,
+    sentCooldownHours,
+    minFanSpacingSec,
+    maxFanSpacingSec,
+    maxActiveHiddenQueued,
+    hiddenRefillSize,
+    // Backward/diagnostic aliases used by DevTools checks and older UI code.
+    eventSendIntervalMinSec: minFanSpacingSec,
+    eventSendIntervalMaxSec: maxFanSpacingSec,
+    onlineFanSpacingSec: minFanSpacingSec,
+    onlineFanMaxSpacingSec: maxFanSpacingSec,
+    updatedAt: src.updatedAt || null,
+  };
+}
+
+async function readBumpSafety({ agencyId, creatorId }) {
+  const cid = cleanString(creatorId, 100);
+  if (!agencyId || !cid) return normalizeBumpSafety({});
+  const clientId = bumpSafetyClientId(cid);
+  const task = await prisma.automationTask.findFirst({
+    where: { agencyId, creatorId: cid, clientId, type: "bump_safety", deletedAt: null },
+    orderBy: { updatedAt: "desc" },
+  }).catch(() => null);
+  const src = task?.config && typeof task.config === "object" && !Array.isArray(task.config) ? task.config : {};
+  return normalizeBumpSafety({ ...src, updatedAt: task?.updatedAt ? task.updatedAt.toISOString() : src.updatedAt || null });
+}
+
+async function saveBumpSafety({ agencyId, creatorId, userId, input = {} }) {
+  const cid = cleanString(creatorId, 100);
+  if (!agencyId || !cid) throw new Error("CREATOR_ID_REQUIRED");
+  const safety = normalizeBumpSafety({ ...(input || {}), updatedAt: new Date().toISOString() });
+  const clientId = bumpSafetyClientId(cid);
+  const data = {
+    agencyId,
+    creatorId: cid,
+    clientId,
+    type: "bump_safety",
+    title: "Bump global safety",
+    enabled: true,
+    status: "active",
+    config: safety,
+    rules: safety,
+    schedule: {},
+    triggers: {},
+    stats: {},
+    metadata: { schemaVersion: 1, globalBumpSafety: true, updatedAt: safety.updatedAt },
+    updatedByUserId: userId || null,
+  };
+
+  const existing = await prisma.automationTask.findFirst({ where: { agencyId, clientId }, select: { id: true } }).catch(() => null);
+  let task;
+  if (existing?.id) {
+    task = await prisma.automationTask.update({ where: { id: existing.id }, data });
+  } else {
+    task = await prisma.automationTask.create({ data: { ...data, createdByUserId: userId || null } });
+  }
+  return normalizeBumpSafety({ ...(task.config || safety), updatedAt: task.updatedAt ? task.updatedAt.toISOString() : safety.updatedAt });
 }
 
 function randomOnlineSpacingMs(range = {}) {
@@ -769,7 +880,8 @@ router.post("/deliveries/online-batch", async (req, res) => {
     const fanIds = onlineQueueFanIds(req.body?.fanIds || req.body?.onlineIds || req.body?.ids || []);
     if (!fanIds.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped: [], code: "BUMP_EVENT_BATCH_EMPTY" });
 
-    const range = onlineSpacingRange(req.body || {});
+    const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
+    const range = onlineSpacingRange({ ...(req.body || {}), ...(globalSafety || {}) });
     const triggerKey = normalizeBumpTrigger(req.body?.triggerType || req.body?.triggerKey || req.body?.trigger || req.body?.event?.triggerKey || req.body?.event?.type);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
     const batchId = cleanString(req.body?.batchId, 120) || eventQueueBatchId(triggerKey);
@@ -867,7 +979,8 @@ router.post("/deliveries/claim-online-send", async (req, res) => {
     const requestedLimit = parseLimit(req.body?.limit, 1, 20);
     const timeoutSec = Math.max(30, Math.min(300, positiveInt(req.body?.claimTimeoutSec, 75)));
     const maxReserved = Math.max(1, Math.min(3, positiveInt(req.body?.maxSendReservedPerAccount, 1)));
-    const hiddenCap = hiddenQueueCap(req.body || {});
+    const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
+    const hiddenCap = hiddenQueueCap({ ...(req.body || {}), ...(globalSafety || {}) });
     const now = new Date();
     const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
 
@@ -1396,9 +1509,10 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const now = new Date();
-    const range = onlineSpacingRange(req.body || {});
+    const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
+    const range = onlineSpacingRange({ ...(req.body || {}), ...(globalSafety || {}) });
     const requestedLimit = Math.max(1, Math.min(200, positiveInt(req.body?.limit, 20)));
-    const maxActiveHiddenQueued = hiddenQueueCap(req.body || {});
+    const maxActiveHiddenQueued = hiddenQueueCap({ ...(req.body || {}), ...(globalSafety || {}) });
     const cadenceHours = Math.max(1, Math.min(168, Number(req.body?.cadenceHours || req.body?.hiddenCadenceHours || 3) || 3));
     const replyTimeoutHours = Math.max(1, Math.min(24, Number(req.body?.replyTimeoutHours || req.body?.hiddenReplyTimeoutHours || 1) || 1));
 
