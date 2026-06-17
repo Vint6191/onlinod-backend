@@ -362,6 +362,31 @@ async function findAutomationDeliveryForResult({ agencyId, creatorId, input = {}
 // Worker job protocol remains open through /jobs/claim, /jobs/:id/result and /events.
 
 
+
+const BUMP_TRIGGER_KEYS = Object.freeze({
+  ONLINE: "fanOnline",
+  LIKE: "fanLikedPost",
+  SUBSCRIBED: "fanSubscribed",
+});
+
+function normalizeBumpTrigger(value) {
+  const raw = cleanString(value, 80);
+  const lower = String(raw || "").toLowerCase();
+  if (!raw) return BUMP_TRIGGER_KEYS.ONLINE;
+  if (raw === BUMP_TRIGGER_KEYS.ONLINE || lower === "online" || lower === "presence_online" || lower === "fan_online") return BUMP_TRIGGER_KEYS.ONLINE;
+  if (raw === BUMP_TRIGGER_KEYS.LIKE || lower === "like" || lower === "post_like" || lower === "fan_liked_post" || lower === "fanlikedpost") return BUMP_TRIGGER_KEYS.LIKE;
+  if (raw === BUMP_TRIGGER_KEYS.SUBSCRIBED || lower === "subscribe" || lower === "subscription" || lower === "subscription_created" || lower === "new_subscriber" || lower === "fansubscribed") return BUMP_TRIGGER_KEYS.SUBSCRIBED;
+  return BUMP_TRIGGER_KEYS.ONLINE;
+}
+
+function eventGateId(creatorId) {
+  return `bump_event_gate_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80)}`;
+}
+
+function eventQueueBatchId(prefix = "event") {
+  return `bump_${String(prefix || "event").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 24)}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function onlineQueueFanIds(value) {
   const source = Array.isArray(value) ? value : [];
   const out = [];
@@ -390,12 +415,8 @@ function randomOnlineSpacingMs(range = {}) {
   return sec * 1000;
 }
 
-function onlineGateId(creatorId) {
-  return `online_gate_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80)}`;
-}
-
 async function acquireOnlineGate(tx, { agencyId, creatorId, now }) {
-  const id = onlineGateId(creatorId);
+  const id = eventGateId(creatorId);
   let row = await tx.automationDelivery.findUnique({ where: { id } }).catch(() => null);
   if (!row) {
     try {
@@ -404,9 +425,9 @@ async function acquireOnlineGate(tx, { agencyId, creatorId, now }) {
           id,
           agencyId,
           creatorId,
-          fanId: "__online_gate__",
+          fanId: "__bump_event_gate__",
           dialogId: null,
-          trigger: "fanOnline_gate",
+          trigger: "bumpEvent_gate",
           status: "online_gate",
           scheduledAt: now,
           lastCheckedAt: now,
@@ -672,7 +693,7 @@ router.post("/deliveries/debug-force-due", requireSeniorAutomationWriter, async 
 });
 
 
-// Distributed online bump scheduler. Workers report online fan batches; server
+// Distributed bump event scheduler. Workers report online/like/subscription fan batches; server
 // dedupes fanIds and assigns global scheduledAt slots with 15–30s spacing so
 // several employees/devices cannot burst-send at the same time.
 router.post("/deliveries/online-batch", async (req, res) => {
@@ -680,11 +701,12 @@ router.post("/deliveries/online-batch", async (req, res) => {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const fanIds = onlineQueueFanIds(req.body?.fanIds || req.body?.onlineIds || req.body?.ids || []);
-    if (!fanIds.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped: [], code: "ONLINE_BATCH_EMPTY" });
+    if (!fanIds.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped: [], code: "BUMP_EVENT_BATCH_EMPTY" });
 
     const range = onlineSpacingRange(req.body || {});
+    const triggerKey = normalizeBumpTrigger(req.body?.triggerType || req.body?.triggerKey || req.body?.trigger || req.body?.event?.triggerKey || req.body?.event?.type);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const batchId = cleanString(req.body?.batchId, 120) || `online_batch_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const batchId = cleanString(req.body?.batchId, 120) || eventQueueBatchId(triggerKey);
     const now = new Date();
 
     const result = await prisma.$transaction(async (tx) => {
@@ -711,13 +733,18 @@ router.post("/deliveries/online-batch", async (req, res) => {
             creatorId,
             fanId,
             dialogId: fanId,
-            trigger: "fanOnline",
+            trigger: triggerKey,
             status: "online_queued",
             scheduledAt,
             maxAttempts: 3,
             claimedByDeviceId: null,
             result: jsonObject({
-              onlineQueue: true,
+              onlineQueue: triggerKey === BUMP_TRIGGER_KEYS.ONLINE,
+              eventQueue: true,
+              triggerKey,
+              trigger: triggerKey,
+              eventType: req.body?.event?.type || req.body?.eventType || null,
+              externalEventId: req.body?.event?.externalEventId || req.body?.externalEventId || null,
               batchId,
               sourceDeviceId: deviceId,
               minFanSpacingSec: range.min,
@@ -736,7 +763,7 @@ router.post("/deliveries/online-batch", async (req, res) => {
         where: { id: gate.id },
         data: {
           scheduledAt: cursor,
-          result: jsonObject({ ...deliveryMeta(gate), onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }),
+          result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }),
         },
       });
 
@@ -752,7 +779,8 @@ router.post("/deliveries/online-batch", async (req, res) => {
     return res.json({
       ok: true,
       creatorId,
-      mode: "server_online_queue",
+      mode: "server_event_queue",
+      triggerKey,
       count: result.items.length,
       items: result.items.map(mapAutomationDelivery),
       skipped: result.skipped,
@@ -762,7 +790,7 @@ router.post("/deliveries/online-batch", async (req, res) => {
       minFanSpacingSec: range.min,
       maxFanSpacingSec: range.max,
     });
-  } catch (err) { return sendError(res, err, "BUMP_ONLINE_BATCH_FAILED"); }
+  } catch (err) { return sendError(res, err, "BUMP_EVENT_BATCH_FAILED"); }
 });
 
 router.post("/deliveries/claim-online-send", async (req, res) => {
