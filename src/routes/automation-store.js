@@ -630,6 +630,91 @@ async function deferHiddenQueueOverflow(prisma, { agencyId, creatorId, cap = 30,
 
 const ONLINE_SEND_ACTIVE_STATUSES = ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
 
+const REALTIME_BLOCKING_STATUSES = ["online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
+
+function realtimeFanLockKey({ agencyId, creatorId, fanId }) {
+  return `bump_rt:${String(agencyId || "")}:${String(creatorId || "")}:${String(fanId || "")}`.slice(0, 250);
+}
+
+function futureDateFromIso(value) {
+  const d = parseDate(value);
+  return d && d.getTime() > Date.now() ? d : null;
+}
+
+function bumpFanStateQuietUntil(row, { replyCooldownHours = 24, sentCooldownHours = 6, sameTemplateCooldownHours = null, templateId = "" } = {}) {
+  if (!row) return { blocked: false, until: null, reason: null };
+  const counters = row.counters && typeof row.counters === "object" && !Array.isArray(row.counters) ? row.counters : {};
+  const candidates = [
+    futureDateFromIso(counters.nextAllowedAt),
+    futureDateFromIso(counters.repliedCooldownUntil),
+    futureDateFromIso(counters.sentCooldownUntil),
+  ].filter(Boolean);
+
+  const nowMs = Date.now();
+  const lastSentAt = row.lastSentAt || counters.lastSentAt || null;
+  const sentBase = parseDate(lastSentAt);
+  const sentHours = Math.max(0, Math.min(720, Number(sentCooldownHours ?? 6) || 0));
+  if (sentBase && sentHours > 0) {
+    const d = new Date(sentBase.getTime() + sentHours * 60 * 60 * 1000);
+    if (d.getTime() > nowMs) candidates.push(d);
+  }
+
+  const sameTplHours = sameTemplateCooldownHours === null || sameTemplateCooldownHours === undefined ? null : Math.max(0, Math.min(8760, Number(sameTemplateCooldownHours) || 0));
+  if (sameTplHours !== null && templateId && String(row.lastTemplateId || counters.lastTemplateId || "") === String(templateId || "") && sentBase && sameTplHours > 0) {
+    const d = new Date(sentBase.getTime() + sameTplHours * 60 * 60 * 1000);
+    if (d.getTime() > nowMs) candidates.push(d);
+  }
+
+  const lastStatus = cleanString(row.lastStatus || counters.lastStatus, 40);
+  const repliedBase = parseDate(row.lastFinalizedAt || counters.lastRepliedAt || counters.lastFinalizedAt || null);
+  const replyHours = Math.max(0, Math.min(2160, Number(replyCooldownHours ?? 24) || 0));
+  if (lastStatus === "replied" && repliedBase && replyHours > 0) {
+    const d = new Date(repliedBase.getTime() + replyHours * 60 * 60 * 1000);
+    if (d.getTime() > nowMs) candidates.push(d);
+  }
+
+  if (!candidates.length) return { blocked: false, until: null, reason: null };
+  const max = candidates.sort((a, b) => b.getTime() - a.getTime())[0];
+  return { blocked: true, until: max, reason: counters.quietReason || (lastStatus === "replied" ? "replied" : "sent") };
+}
+
+async function createOrUpdateDelayedRealtimeRow(tx, { agencyId, creatorId, fanId, dialogId, triggerKey, scheduledAt, templateId, templateTitle, deviceId, now, meta = {}, existingQueued = null, createdByUserId = null }) {
+  const data = {
+    agencyId,
+    creatorId,
+    fanId,
+    dialogId: dialogId || fanId,
+    contentCollectionId: templateId || null,
+    trigger: triggerKey,
+    status: "online_queued",
+    scheduledAt,
+    maxAttempts: 3,
+    claimedByDeviceId: null,
+    claimedAt: null,
+    claimUntil: null,
+    result: jsonObject({
+      realtimeFastLaneFallback: true,
+      triggerKey,
+      trigger: triggerKey,
+      templateId: templateId || null,
+      bumpId: templateId || null,
+      templateTitle: templateTitle || null,
+      sourceDeviceId: deviceId || null,
+      queuedAt: now.toISOString(),
+      delayedUntil: scheduledAt.toISOString(),
+      ...meta,
+    }),
+    createdByUserId,
+  };
+  if (existingQueued?.id) {
+    return tx.automationDelivery.update({
+      where: { id: existingQueued.id },
+      data: { ...data, agencyId: undefined, creatorId: undefined, fanId: undefined, createdByUserId: undefined },
+    });
+  }
+  return tx.automationDelivery.create({ data });
+}
+
 router.get("/deliveries/fan-state", async (req, res) => {
   try {
     const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
@@ -869,6 +954,131 @@ router.post("/deliveries/debug-force-due", requireSeniorAutomationWriter, async 
   } catch (err) { return sendError(res, err, "BUMP_DEBUG_FORCE_DUE_FAILED"); }
 });
 
+
+
+// Realtime fast-lane reservation. Desktop sends live online/like/sub bumps only after
+// this atomic server grant. It prevents duplicate sends across 1..100 workers while
+// avoiding the slow persistent scheduler for true realtime triggers.
+router.post("/deliveries/realtime-reserve", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const fanId = cleanString(req.body?.fanId || req.body?.dialogId || req.body?.userId, 80);
+    if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
+
+    const dialogId = cleanString(req.body?.dialogId || fanId, 80) || fanId;
+    const triggerKey = normalizeBumpTrigger(req.body?.triggerKey || req.body?.trigger || req.body?.event?.triggerKey || BUMP_TRIGGER_KEYS.ONLINE);
+    const templateId = cleanString(req.body?.templateId || req.body?.bumpId || req.body?.contentCollectionId, 100) || "";
+    const templateTitle = cleanString(req.body?.templateTitle || req.body?.title, 300) || "";
+    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
+    const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
+    const range = onlineSpacingRange({ ...(globalSafety || {}), ...(req.body || {}) });
+    const replyCooldownHours = Math.max(0, Math.min(2160, Number(req.body?.replyCooldownHours ?? globalSafety.replyCooldownHours ?? 24) || 0));
+    const sentCooldownHours = Math.max(0, Math.min(720, Number(req.body?.sentCooldownHours ?? globalSafety.sentCooldownHours ?? 6) || 0));
+    const sameTemplateCooldownHours = req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null;
+    const cancelAfterHours = Math.max(1, Math.min(72, Number(req.body?.cancelAfterHours || req.body?.replyTimeoutHours || 5) || 5));
+    const now = new Date();
+    const requestedCancelAt = parseDate(req.body?.cancelAt);
+    const cancelAt = requestedCancelAt || new Date(now.getTime() + cancelAfterHours * 60 * 60 * 1000);
+
+    const out = await prisma.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe("SELECT pg_advisory_xact_lock(hashtext($1))", realtimeFanLockKey({ agencyId: req.auth.agencyId, creatorId, fanId })).catch(() => null);
+
+      const blocking = await tx.automationDelivery.findFirst({
+        where: { agencyId: req.auth.agencyId, creatorId, fanId, status: { in: REALTIME_BLOCKING_STATUSES } },
+        orderBy: [{ updatedAt: "desc" }],
+      });
+      if (blocking) {
+        return { ok: true, allowed: false, blocked: true, code: "BUMP_ALREADY_ACTIVE_SERVER", item: mapAutomationDelivery(blocking), status: blocking.status };
+      }
+
+      const existingQueued = await tx.automationDelivery.findFirst({
+        where: { agencyId: req.auth.agencyId, creatorId, fanId, status: "online_queued" },
+        orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
+      });
+
+      const fanState = await tx.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId, fanId } } }).catch(() => null);
+      const quiet = bumpFanStateQuietUntil(fanState, { replyCooldownHours, sentCooldownHours, sameTemplateCooldownHours, templateId });
+      if (quiet.blocked && quiet.until) {
+        const delayed = await createOrUpdateDelayedRealtimeRow(tx, {
+          agencyId: req.auth.agencyId, creatorId, fanId, dialogId, triggerKey, scheduledAt: quiet.until,
+          templateId, templateTitle, deviceId, now, existingQueued, createdByUserId: req.auth.userId,
+          meta: { reason: "fan_quiet_window", quietUntil: quiet.until.toISOString(), quietReason: quiet.reason || null },
+        });
+        return { ok: true, allowed: false, queued: true, delayed: true, code: "BUMP_FAN_QUIET_WINDOW_QUEUED", delayedUntil: quiet.until.toISOString(), item: mapAutomationDelivery(delayed) };
+      }
+
+      const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now });
+      const nextAllowed = onlineGateNextAllowed(gate, now);
+      const gateDelayMs = nextAllowed.getTime() - now.getTime();
+      if (gateDelayMs > 500) {
+        const delayed = await createOrUpdateDelayedRealtimeRow(tx, {
+          agencyId: req.auth.agencyId, creatorId, fanId, dialogId, triggerKey, scheduledAt: nextAllowed,
+          templateId, templateTitle, deviceId, now, existingQueued, createdByUserId: req.auth.userId,
+          meta: { reason: "account_send_gate", gateNextAllowedAt: nextAllowed.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max },
+        });
+        const cursor = new Date(nextAllowed.getTime() + randomOnlineSpacingMs(range));
+        await tx.automationDelivery.update({ where: { id: gate.id }, data: { scheduledAt: cursor, result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }) } });
+        return { ok: true, allowed: false, queued: true, delayed: true, code: "BUMP_DELAYED_BY_SERVER_GATE", delayedUntil: nextAllowed.toISOString(), item: mapAutomationDelivery(delayed), gateNextAllowedAt: cursor.toISOString() };
+      }
+
+      const reservedAt = now;
+      const reservationData = {
+        agencyId: req.auth.agencyId,
+        creatorId,
+        fanId,
+        dialogId,
+        contentCollectionId: templateId || null,
+        trigger: triggerKey,
+        status: "send_reserved",
+        scheduledAt: now,
+        sentAt: reservedAt,
+        cancelAt,
+        claimedByDeviceId: deviceId,
+        claimedAt: now,
+        claimUntil: new Date(now.getTime() + 90 * 1000),
+        maxAttempts: 3,
+        result: jsonObject({
+          realtimeFastLane: true,
+          reservation: true,
+          triggerKey,
+          trigger: triggerKey,
+          templateId: templateId || null,
+          bumpId: templateId || null,
+          templateTitle: templateTitle || null,
+          sourceDeviceId: deviceId,
+          reservedAt: reservedAt.toISOString(),
+          cancelAfterHours,
+          cancelAt: cancelAt.toISOString(),
+          replyCooldownHours,
+          sentCooldownHours,
+          sameTemplateCooldownHours,
+          minFanSpacingSec: range.min,
+          maxFanSpacingSec: range.max,
+          ...(req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {}),
+        }),
+        createdByUserId: req.auth.userId,
+      };
+
+      const row = existingQueued?.id
+        ? await tx.automationDelivery.update({ where: { id: existingQueued.id }, data: { ...reservationData, agencyId: undefined, creatorId: undefined, fanId: undefined, createdByUserId: undefined } })
+        : await tx.automationDelivery.create({ data: reservationData });
+
+      const cursor = new Date(now.getTime() + randomOnlineSpacingMs(range));
+      await tx.automationDelivery.update({ where: { id: gate.id }, data: { scheduledAt: cursor, result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }) } });
+
+      await upsertBumpFanState({
+        agencyId: req.auth.agencyId, creatorId, fanId, dialogId, templateId,
+        status: "send_reserved", sentAt: reservedAt, messageId: null,
+        replyCooldownHours, sentCooldownHours, sameTemplateCooldownHours,
+      }).catch(() => null);
+
+      return { ok: true, allowed: true, deliveryId: row.id, item: mapAutomationDelivery(row), cancelAt: cancelAt.toISOString(), gateNextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max };
+    }, { timeout: 15000 });
+
+    return res.json({ ...out, creatorId, fanId, triggerKey, serverGateReserved: out.allowed === true, realtimeFastLane: true });
+  } catch (err) { return sendError(res, err, "BUMP_REALTIME_RESERVE_FAILED"); }
+});
 
 // Distributed bump event scheduler. Workers report online/like/subscription fan batches; server
 // dedupes fanIds and assigns global scheduledAt slots with configurable 3s+ spacing so
