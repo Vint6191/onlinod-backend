@@ -404,14 +404,14 @@ function onlineQueueFanIds(value) {
 }
 
 function onlineSpacingRange(input = {}) {
-  const min = Math.max(15, Math.min(3600, positiveInt(input.minFanSpacingSec ?? input.onlineFanSpacingSec ?? input.batchSpacingSec, 15)));
+  const min = Math.max(3, Math.min(3600, positiveInt(input.minFanSpacingSec ?? input.onlineFanSpacingSec ?? input.batchSpacingSec, 15)));
   const rawMax = positiveInt(input.maxFanSpacingSec ?? input.onlineFanMaxSpacingSec ?? input.batchMaxSpacingSec, 30);
   const max = Math.max(min, Math.min(3600, rawMax || 30));
   return { min, max };
 }
 
 function randomOnlineSpacingMs(range = {}) {
-  const min = Math.max(15, Number(range.min) || 15);
+  const min = Math.max(3, Number(range.min) || 15);
   const max = Math.max(min, Number(range.max) || 30);
   const sec = min + Math.floor(Math.random() * (max - min + 1));
   return sec * 1000;
