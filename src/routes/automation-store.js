@@ -404,15 +404,15 @@ function onlineQueueFanIds(value) {
 }
 
 function onlineSpacingRange(input = {}) {
-  const min = Math.max(3, Math.min(3600, positiveInt(input.minFanSpacingSec ?? input.onlineFanSpacingSec ?? input.batchSpacingSec, 15)));
-  const rawMax = positiveInt(input.maxFanSpacingSec ?? input.onlineFanMaxSpacingSec ?? input.batchMaxSpacingSec, 30);
-  const max = Math.max(min, Math.min(3600, rawMax || 30));
+  const min = Math.max(3, Math.min(3600, positiveInt(input.minFanSpacingSec ?? input.onlineFanSpacingSec ?? input.batchSpacingSec, 3)));
+  const rawMax = positiveInt(input.maxFanSpacingSec ?? input.onlineFanMaxSpacingSec ?? input.batchMaxSpacingSec, 10);
+  const max = Math.max(min, Math.min(3600, rawMax || 10));
   return { min, max };
 }
 
 function randomOnlineSpacingMs(range = {}) {
-  const min = Math.max(3, Number(range.min) || 15);
-  const max = Math.max(min, Number(range.max) || 30);
+  const min = Math.max(3, Number(range.min) || 3);
+  const max = Math.max(min, Number(range.max) || 10);
   const sec = min + Math.floor(Math.random() * (max - min + 1));
   return sec * 1000;
 }
@@ -484,6 +484,37 @@ function bySendPriority(a, b) {
 
 function hiddenQueueCap(input = {}) {
   return Math.max(5, Math.min(200, positiveInt(input.maxActiveHiddenQueued ?? input.hiddenMaxActiveQueued ?? input.hiddenQueueCap, 30)));
+}
+
+
+async function deferHiddenQueueOverflow(prisma, { agencyId, creatorId, cap = 30, now = new Date(), deferMs = 60 * 60 * 1000 } = {}) {
+  const maxActive = Math.max(5, Math.min(200, Number(cap) || 30));
+  const hiddenRows = await prisma.automationDelivery.findMany({
+    where: {
+      agencyId,
+      creatorId,
+      trigger: BUMP_TRIGGER_KEYS.HIDDEN,
+      status: "online_queued",
+    },
+    orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
+    select: { id: true },
+    take: Math.max(maxActive + 250, maxActive),
+  }).catch(() => []);
+
+  const overflow = hiddenRows.slice(maxActive).map((x) => x.id).filter(Boolean);
+  if (!overflow.length) return { deferred: 0, maxActive };
+
+  const deferredAt = new Date(now.getTime() + deferMs);
+  const updated = await prisma.automationDelivery.updateMany({
+    where: { id: { in: overflow }, agencyId, creatorId, status: "online_queued" },
+    data: {
+      scheduledAt: deferredAt,
+      error: "hidden queue overflow; deferred by cap",
+      result: { hiddenDeferredByCap: true, deferredAt: deferredAt.toISOString(), maxActiveHiddenQueued: maxActive },
+    },
+  }).catch(() => ({ count: 0 }));
+
+  return { deferred: updated.count || 0, maxActive };
 }
 
 const ONLINE_SEND_ACTIVE_STATUSES = ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
@@ -729,7 +760,7 @@ router.post("/deliveries/debug-force-due", requireSeniorAutomationWriter, async 
 
 
 // Distributed bump event scheduler. Workers report online/like/subscription fan batches; server
-// dedupes fanIds and assigns global scheduledAt slots with 15–30s spacing so
+// dedupes fanIds and assigns global scheduledAt slots with configurable 3s+ spacing so
 // several employees/devices cannot burst-send at the same time.
 router.post("/deliveries/online-batch", async (req, res) => {
   try {
@@ -833,27 +864,72 @@ router.post("/deliveries/claim-online-send", async (req, res) => {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const limit = parseLimit(req.body?.limit, 1, 20);
-    const timeoutSec = Math.max(30, Math.min(1800, positiveInt(req.body?.claimTimeoutSec, 180)));
+    const requestedLimit = parseLimit(req.body?.limit, 1, 20);
+    const timeoutSec = Math.max(30, Math.min(300, positiveInt(req.body?.claimTimeoutSec, 75)));
+    const maxReserved = Math.max(1, Math.min(3, positiveInt(req.body?.maxSendReservedPerAccount, 1)));
+    const hiddenCap = hiddenQueueCap(req.body || {});
     const now = new Date();
     const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
 
     await prisma.automationDelivery.updateMany({
-      where: { agencyId: req.auth.agencyId, creatorId, status: "online_claimed", OR: [{ claimUntil: { lt: now } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
+      where: { agencyId: req.auth.agencyId, creatorId, status: "online_claimed", OR: [{ claimUntil: { lt: now } }, { claimedAt: { lt: new Date(now.getTime() - 120 * 1000) } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
       data: { status: "online_queued", claimedByDeviceId: null, claimedAt: null, claimUntil: null, error: "online claim expired; returned to queue" },
     }).catch(() => null);
+
+    // Recovery for old clients/old code paths: send_reserved must be a very short
+    // state right before OF sendMessage, not a second queue. If no messageId was
+    // produced quickly, return it to the event queue.
+    await prisma.automationDelivery.updateMany({
+      where: {
+        agencyId: req.auth.agencyId,
+        creatorId,
+        status: "send_reserved",
+        messageId: null,
+        updatedAt: { lt: new Date(now.getTime() - 90 * 1000) },
+      },
+      data: {
+        status: "online_queued",
+        scheduledAt: now,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        error: "stale send reservation released back to queue",
+      },
+    }).catch(() => null);
+
+    const hiddenDeferred = await deferHiddenQueueOverflow(prisma, {
+      agencyId: req.auth.agencyId,
+      creatorId,
+      cap: hiddenCap,
+      now,
+      deferMs: 60 * 60 * 1000,
+    });
+
+    const reservedCount = await prisma.automationDelivery.count({
+      where: { agencyId: req.auth.agencyId, creatorId, status: "send_reserved", messageId: null },
+    }).catch(() => 0);
+
+    const effectiveLimit = Math.min(requestedLimit, Math.max(0, maxReserved - reservedCount), 1);
+    if (effectiveLimit <= 0) {
+      const next = await prisma.automationDelivery.findFirst({
+        where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued" },
+        orderBy: { scheduledAt: "asc" },
+        select: { scheduledAt: true },
+      });
+      return res.json({ ok: true, creatorId, deviceId, count: 0, items: [], claimUntil, nextScheduledAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null, reservedCount, maxReserved, hiddenDeferred });
+    }
 
     const candidates = await prisma.automationDelivery.findMany({
       where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", scheduledAt: { lte: now } },
       orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
-      take: Math.max(limit * 12, limit),
+      take: Math.max(requestedLimit * 20, 50),
     });
 
     candidates.sort(bySendPriority);
 
     const items = [];
     for (const candidate of candidates) {
-      if (items.length >= limit) break;
+      if (items.length >= effectiveLimit) break;
       const updated = await prisma.automationDelivery.updateMany({
         where: { id: candidate.id, agencyId: req.auth.agencyId, creatorId, status: "online_queued", OR: [{ claimUntil: null }, { claimUntil: { lt: now } }] },
         data: { status: "online_claimed", claimedByDeviceId: deviceId, claimedAt: now, claimUntil, lastCheckedAt: now, attempts: { increment: 1 }, error: null },
@@ -870,7 +946,7 @@ router.post("/deliveries/claim-online-send", async (req, res) => {
       select: { scheduledAt: true },
     });
 
-    return res.json({ ok: true, creatorId, deviceId, count: items.length, items, claimUntil, nextScheduledAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null });
+    return res.json({ ok: true, creatorId, deviceId, count: items.length, items, claimUntil, nextScheduledAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null, requestedLimit, effectiveLimit, reservedCount, maxReserved, hiddenDeferred });
   } catch (err) { return sendError(res, err, "BUMP_ONLINE_CLAIM_FAILED"); }
 });
 
