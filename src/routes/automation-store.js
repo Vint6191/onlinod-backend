@@ -453,6 +453,39 @@ function onlineGateNextAllowed(row, now) {
   return Number.isFinite(t) && t > now.getTime() ? new Date(t) : now;
 }
 
+
+const BUMP_TRIGGER_PRIORITY = Object.freeze({
+  [BUMP_TRIGGER_KEYS.SUBSCRIBED]: 400,
+  [BUMP_TRIGGER_KEYS.LIKE]: 300,
+  [BUMP_TRIGGER_KEYS.ONLINE]: 200,
+  [BUMP_TRIGGER_KEYS.HIDDEN]: 100,
+});
+
+function bumpTriggerPriority(trigger) {
+  return BUMP_TRIGGER_PRIORITY[normalizeBumpTrigger(trigger)] || 0;
+}
+
+function deliveryTriggerPriority(row) {
+  const meta = deliveryMeta(row);
+  return bumpTriggerPriority(row?.trigger || meta.triggerKey || meta.trigger || meta.eventType);
+}
+
+function bySendPriority(a, b) {
+  const pa = deliveryTriggerPriority(a);
+  const pb = deliveryTriggerPriority(b);
+  if (pa !== pb) return pb - pa;
+  const sa = new Date(a?.scheduledAt || a?.createdAt || 0).getTime() || 0;
+  const sb = new Date(b?.scheduledAt || b?.createdAt || 0).getTime() || 0;
+  if (sa !== sb) return sa - sb;
+  const ca = new Date(a?.createdAt || 0).getTime() || 0;
+  const cb = new Date(b?.createdAt || 0).getTime() || 0;
+  return ca - cb;
+}
+
+function hiddenQueueCap(input = {}) {
+  return Math.max(5, Math.min(200, positiveInt(input.maxActiveHiddenQueued ?? input.hiddenMaxActiveQueued ?? input.hiddenQueueCap, 30)));
+}
+
 const ONLINE_SEND_ACTIVE_STATUSES = ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
 
 router.get("/deliveries/fan-state", async (req, res) => {
@@ -800,7 +833,7 @@ router.post("/deliveries/claim-online-send", async (req, res) => {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const limit = parseLimit(req.body?.limit, 1, 10);
+    const limit = parseLimit(req.body?.limit, 1, 20);
     const timeoutSec = Math.max(30, Math.min(1800, positiveInt(req.body?.claimTimeoutSec, 180)));
     const now = new Date();
     const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
@@ -813,8 +846,10 @@ router.post("/deliveries/claim-online-send", async (req, res) => {
     const candidates = await prisma.automationDelivery.findMany({
       where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", scheduledAt: { lte: now } },
       orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
-      take: Math.max(limit * 4, limit),
+      take: Math.max(limit * 12, limit),
     });
+
+    candidates.sort(bySendPriority);
 
     const items = [];
     for (const candidate of candidates) {
@@ -1286,9 +1321,19 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const now = new Date();
     const range = onlineSpacingRange(req.body || {});
-    const limit = Math.max(1, Math.min(200, positiveInt(req.body?.limit, 50)));
+    const requestedLimit = Math.max(1, Math.min(200, positiveInt(req.body?.limit, 20)));
+    const maxActiveHiddenQueued = hiddenQueueCap(req.body || {});
     const cadenceHours = Math.max(1, Math.min(168, Number(req.body?.cadenceHours || req.body?.hiddenCadenceHours || 3) || 3));
     const replyTimeoutHours = Math.max(1, Math.min(24, Number(req.body?.replyTimeoutHours || req.body?.hiddenReplyTimeoutHours || 1) || 1));
+
+    const activeHiddenQueued = await prisma.automationDelivery.count({
+      where: { agencyId: req.auth.agencyId, creatorId, trigger: BUMP_TRIGGER_KEYS.HIDDEN, status: { in: ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"] } },
+    });
+    const availableSlots = Math.max(0, maxActiveHiddenQueued - activeHiddenQueued);
+    const limit = Math.min(requestedLimit, availableSlots);
+    if (limit <= 0) {
+      return res.json({ ok: true, creatorId, count: 0, items: [], skipped: [], code: "HIDDEN_QUEUE_CAP_REACHED", activeHiddenQueued, maxActiveHiddenQueued });
+    }
 
     const candidates = await prisma.hiddenOnlineUser.findMany({
       where: { agencyId: req.auth.agencyId, creatorId, status: "active" },
@@ -1363,7 +1408,7 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
       return { items, gateNextAllowedAt: cursor };
     }, { timeout: 15000 });
 
-    return res.json({ ok: true, creatorId, triggerKey: BUMP_TRIGGER_KEYS.HIDDEN, count: result.items.length, items: result.items.map(mapAutomationDelivery), skipped, skippedCount: skipped.length, gateNextAllowedAt: result.gateNextAllowedAt.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, cadenceHours, replyTimeoutHours });
+    return res.json({ ok: true, creatorId, triggerKey: BUMP_TRIGGER_KEYS.HIDDEN, count: result.items.length, items: result.items.map(mapAutomationDelivery), skipped, skippedCount: skipped.length, gateNextAllowedAt: result.gateNextAllowedAt.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, cadenceHours, replyTimeoutHours, activeHiddenQueued, maxActiveHiddenQueued });
   } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_QUEUE_ELIGIBLE_FAILED"); }
 });
 
@@ -1745,7 +1790,7 @@ router.post("/follow-back/worker/claim", async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const limit = parseLimit(req.body?.limit, 1, 10);
+    const limit = parseLimit(req.body?.limit, 1, 20);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
 
     const nowMs = Date.now();
