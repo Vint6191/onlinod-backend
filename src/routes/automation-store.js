@@ -1443,6 +1443,44 @@ router.post("/deliveries/cancel-result", async (req, res) => {
 // HiddenOnlineUser and reuse AutomationDelivery as the distributed job/queue
 // table, so no local-only state and no event-log explosion.
 const HIDDEN_SCAN_STATUSES = ["hidden_scan_queued", "hidden_scan_claimed", "hidden_scan_paused"];
+const HIDDEN_SCAN_CLAIM_DEFAULT_SEC = 90;
+const HIDDEN_SCAN_CLAIM_MIN_SEC = 30;
+const HIDDEN_SCAN_CLAIM_MAX_SEC = 600;
+
+function hiddenScanClaimTimeoutSec(value) {
+  return Math.max(HIDDEN_SCAN_CLAIM_MIN_SEC, Math.min(HIDDEN_SCAN_CLAIM_MAX_SEC, positiveInt(value, HIDDEN_SCAN_CLAIM_DEFAULT_SEC)));
+}
+
+function hiddenScanTakeoverInSec(row, now = new Date()) {
+  if (!row?.claimUntil) return 0;
+  return Math.max(0, Math.ceil((new Date(row.claimUntil).getTime() - now.getTime()) / 1000));
+}
+
+async function releaseExpiredHiddenScanClaims({ agencyId, creatorId, now = new Date(), timeoutSec = HIDDEN_SCAN_CLAIM_DEFAULT_SEC } = {}) {
+  if (!agencyId || !creatorId) return { count: 0 };
+  const staleUpdatedBefore = new Date(now.getTime() - Math.max(30, timeoutSec) * 1000);
+  return prisma.automationDelivery.updateMany({
+    where: {
+      agencyId,
+      creatorId,
+      status: "hidden_scan_claimed",
+      trigger: "hidden_online_scan",
+      OR: [
+        { claimUntil: { lt: now } },
+        { claimUntil: null, updatedAt: { lt: staleUpdatedBefore } },
+      ],
+    },
+    data: {
+      status: "hidden_scan_queued",
+      scheduledAt: now,
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      lastCheckedAt: now,
+      error: "hidden scan worker lost; lease expired and job returned to queue for takeover",
+    },
+  }).catch(() => ({ count: 0 }));
+}
 
 function hiddenScanJobId(creatorId) {
   return `hidden_scan_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 90)}`;
@@ -1472,6 +1510,9 @@ function hiddenScanState(row = {}) {
   if (row?.scheduledAt && !out.nextScanAt) out.nextScanAt = row.scheduledAt.toISOString ? row.scheduledAt.toISOString() : row.scheduledAt;
   if (row?.claimedByDeviceId && !out.claimedByDeviceId) out.claimedByDeviceId = row.claimedByDeviceId;
   if (row?.claimUntil && !out.claimUntil) out.claimUntil = row.claimUntil.toISOString ? row.claimUntil.toISOString() : row.claimUntil;
+  if (rawStatus === "hidden_scan_claimed") out.takeoverInSec = hiddenScanTakeoverInSec(row);
+  if (rawStatus === "hidden_scan_claimed" && out.takeoverInSec > 0 && !out.workerStatus) out.workerStatus = "claimed";
+  if (rawStatus === "hidden_scan_queued" && !out.workerStatus) out.workerStatus = "takeover_ready";
   if (row?.lastCheckedAt && !out.lastCheckedAt) out.lastCheckedAt = row.lastCheckedAt.toISOString ? row.lastCheckedAt.toISOString() : row.lastCheckedAt;
   if (row?.error && !out.lastError) out.lastError = row.error;
 
@@ -1619,14 +1660,11 @@ router.post("/hidden-online/scan-jobs/claim", async (req, res) => {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const timeoutSec = Math.max(60, Math.min(3600, positiveInt(req.body?.claimTimeoutSec, 300)));
+    const timeoutSec = hiddenScanClaimTimeoutSec(req.body?.claimTimeoutSec);
     const now = new Date();
     const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
 
-    await prisma.automationDelivery.updateMany({
-      where: { agencyId: req.auth.agencyId, creatorId, status: "hidden_scan_claimed", OR: [{ claimUntil: { lt: now } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
-      data: { status: "hidden_scan_queued", claimedByDeviceId: null, claimedAt: null, claimUntil: null, error: "hidden scan claim expired; returned to queue" },
-    }).catch(() => null);
+    const released = await releaseExpiredHiddenScanClaims({ agencyId: req.auth.agencyId, creatorId, now, timeoutSec });
 
     // If the same desktop worker already owns a live scan lease, hand it back
     // instead of forcing the UI into "waiting for worker" until the lease expires.
@@ -1647,7 +1685,7 @@ router.post("/hidden-online/scan-jobs/claim", async (req, res) => {
         where: { id: owned.id },
         data: { claimUntil, lastCheckedAt: now, error: null },
       });
-      return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updatedOwned), items: [mapAutomationDelivery(updatedOwned)], scanState: hiddenScanState(updatedOwned), claimUntil, continued: true });
+      return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updatedOwned), items: [mapAutomationDelivery(updatedOwned)], scanState: hiddenScanState(updatedOwned), claimUntil, continued: true, releasedExpired: released?.count || 0, takeoverInSec: timeoutSec });
     }
 
     const row = await prisma.automationDelivery.findFirst({
@@ -1656,13 +1694,13 @@ router.post("/hidden-online/scan-jobs/claim", async (req, res) => {
     });
     if (!row) {
       const next = await prisma.automationDelivery.findFirst({ where: { agencyId: req.auth.agencyId, creatorId, trigger: "hidden_online_scan" }, orderBy: { scheduledAt: "asc" } });
-      return res.json({ ok: true, creatorId, count: 0, items: [], item: null, nextScanAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null });
+      return res.json({ ok: true, creatorId, count: 0, items: [], item: null, nextScanAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null, releasedExpired: released?.count || 0 });
     }
     const updated = await prisma.automationDelivery.update({
       where: { id: row.id },
       data: { status: "hidden_scan_claimed", claimedByDeviceId: deviceId, claimedAt: now, claimUntil, lastCheckedAt: now, attempts: { increment: 1 }, error: null },
     });
-    return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updated), items: [mapAutomationDelivery(updated)], scanState: hiddenScanState(updated), claimUntil });
+    return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updated), items: [mapAutomationDelivery(updated)], scanState: hiddenScanState(updated), claimUntil, releasedExpired: released?.count || 0, takeoverInSec: timeoutSec });
   } catch (err) { return sendError(res, err, "HIDDEN_SCAN_CLAIM_FAILED"); }
 });
 
@@ -1674,6 +1712,17 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const now = new Date();
     const row = await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId, trigger: "hidden_online_scan" } });
     if (!row) return res.status(404).json({ ok: false, code: "HIDDEN_SCAN_JOB_NOT_FOUND", error: "Hidden scan job not found" });
+    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "", 120);
+    if (String(row.status || "") === "hidden_scan_claimed") {
+      const owner = cleanString(row.claimedByDeviceId || "", 120);
+      if (owner && deviceId && owner !== deviceId) {
+        return res.status(409).json({ ok: false, code: "HIDDEN_SCAN_STALE_WORKER", error: "Hidden scan claim is owned by another worker", ownerDeviceId: owner, deviceId });
+      }
+      if (row.claimUntil && row.claimUntil < now) {
+        await releaseExpiredHiddenScanClaims({ agencyId: req.auth.agencyId, creatorId, now });
+        return res.status(409).json({ ok: false, code: "HIDDEN_SCAN_CLAIM_EXPIRED", error: "Hidden scan claim expired; another worker may take over", claimUntil: row.claimUntil.toISOString ? row.claimUntil.toISOString() : row.claimUntil });
+      }
+    }
     const prev = hiddenScanState(row);
     const upsert = await upsertHiddenCandidateRows({ agencyId: req.auth.agencyId, creatorId, items: req.body?.items || req.body?.candidates || [], scanJobId: row.id });
     const scanned = Number(prev.scanned || 0) + Math.max(0, Number(req.body?.scanned || req.body?.pageSize || 0) || 0);
@@ -1684,7 +1733,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const scanEveryDays = Math.max(1, Math.min(30, positiveInt(req.body?.scanEveryDays || prev.scanEveryDays, 7)));
     const nextOffset = Math.max(0, Number(req.body?.nextOffset ?? prev.nextOffset ?? 0) || 0);
     const keepClaim = req.body?.keepClaim === true && !done && !req.body?.error;
-    const claimTimeoutSec = Math.max(60, Math.min(3600, positiveInt(req.body?.claimTimeoutSec, 300)));
+    const claimTimeoutSec = hiddenScanClaimTimeoutSec(req.body?.claimTimeoutSec);
     const keepClaimUntil = new Date(now.getTime() + claimTimeoutSec * 1000);
     const state = jsonObject({
       ...prev,
@@ -1708,7 +1757,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       data: {
         status: done ? "hidden_scan_done" : (keepClaim ? "hidden_scan_claimed" : "hidden_scan_queued"),
         scheduledAt: keepClaim ? now : nextScheduledAt,
-        claimedByDeviceId: keepClaim ? (row.claimedByDeviceId || cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown") : null,
+        claimedByDeviceId: keepClaim ? (row.claimedByDeviceId || deviceId || "unknown") : null,
         claimedAt: keepClaim ? (row.claimedAt || now) : null,
         claimUntil: keepClaim ? keepClaimUntil : null,
         lastCheckedAt: now,
@@ -1725,6 +1774,8 @@ router.get("/hidden-online/scan-state", async (req, res) => {
   try {
     const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const now = new Date();
+    await releaseExpiredHiddenScanClaims({ agencyId: req.auth.agencyId, creatorId, now });
     const job = await prisma.automationDelivery.findUnique({ where: { id: hiddenScanJobId(creatorId) } }).catch(() => null);
     const [total, active, ignored, blocked] = await Promise.all([
       prisma.hiddenOnlineUser.count({ where: { agencyId: req.auth.agencyId, creatorId } }),
