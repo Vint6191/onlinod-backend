@@ -1695,6 +1695,12 @@ function hiddenScanState(row = {}) {
   if (row?.error) out.lastError = row.error;
   if (rawStatus === "hidden_scan_done") out.keepClaim = false;
 
+  if (rawStatus === "hidden_scan_queued" && out.pausedForPriority === true) {
+    out.status = "paused";
+    out.workerStatus = "paused_for_bumps";
+    out.pauseReason = out.pauseReason || "bump_backpressure";
+  }
+
   return out;
 }
 
@@ -2068,6 +2074,47 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       }
     }
     const prev = hiddenScanState(row);
+    const pauseForPriority = req.body?.pauseForPriority === true || req.body?.releaseOnly === true || String(req.body?.pauseReason || "") === "bump_backpressure";
+    if (pauseForPriority) {
+      const scanEveryDays = Math.max(1, Math.min(30, positiveInt(req.body?.scanEveryDays || prev.scanEveryDays, 7)));
+      const nextOffset = Math.max(0, Number(req.body?.nextOffset ?? prev.nextOffset ?? 0) || 0);
+      const pauseMs = Math.max(5000, Math.min(5 * 60 * 1000, positiveInt(req.body?.priorityPauseMs || req.body?.pauseMs, 45000)));
+      const nextPageAt = new Date(now.getTime() + pauseMs);
+      const state = jsonObject({
+        ...prev,
+        hiddenScan: true,
+        scanEveryDays,
+        status: "paused",
+        serverStatus: "hidden_scan_queued",
+        workerStatus: "paused_for_bumps",
+        hasMore: req.body?.hasMore !== false,
+        keepClaim: false,
+        pausedForPriority: true,
+        pauseReason: cleanString(req.body?.pauseReason || "bump_backpressure", 120) || "bump_backpressure",
+        priorityPauseMs: pauseMs,
+        nextOffset,
+        nextPageAt: nextPageAt.toISOString(),
+        lastCheckedAt: now.toISOString(),
+        lastError: null,
+        claimedByDeviceId: null,
+        claimUntil: null,
+      });
+      const item = await prisma.automationDelivery.update({
+        where: { id: row.id },
+        data: {
+          status: "hidden_scan_queued",
+          scheduledAt: nextPageAt,
+          claimedByDeviceId: null,
+          claimedAt: null,
+          claimUntil: null,
+          lastCheckedAt: now,
+          result: state,
+          error: null,
+        },
+      });
+      return res.json({ ok: true, creatorId, pausedForPriority: true, item: mapAutomationDelivery(item), scanState: hiddenScanState(item), upsert: { inserted: 0, updated: 0, items: [] }, counts: [], nextPageAt: nextPageAt.toISOString() });
+    }
+
     const upsert = await upsertHiddenCandidateRows({ agencyId: req.auth.agencyId, creatorId, items: req.body?.items || req.body?.candidates || [], scanJobId: row.id });
     const scanned = Number(prev.scanned || 0) + Math.max(0, Number(req.body?.scanned || req.body?.pageSize || 0) || 0);
     const hiddenSeen = Number(prev.hiddenSeen || 0) + Math.max(0, Number(req.body?.hiddenSeen || upsert.items.length || 0) || 0);
