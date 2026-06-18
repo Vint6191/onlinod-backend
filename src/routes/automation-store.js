@@ -726,6 +726,11 @@ async function deferHiddenQueueOverflow(prisma, { agencyId, creatorId, cap = 30,
 
 const ONLINE_SEND_ACTIVE_STATUSES = ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
 
+// Hidden active cap is a SEND-PIPELINE cap, not a 6h reply-wait cap.
+// pending_reply/sent/checking_reply are already delivered and only wait for
+// reply/delete; counting them here blocks a single worker for hours.
+const HIDDEN_SEND_SLOT_STATUSES = ["online_queued", "online_claimed", "send_reserved"];
+
 const REALTIME_BLOCKING_STATUSES = ["online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
 
 function realtimeFanLockKey({ agencyId, creatorId, fanId }) {
@@ -2217,7 +2222,7 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
     ) || 6));
 
     const activeHiddenQueued = await prisma.automationDelivery.count({
-      where: { agencyId: req.auth.agencyId, creatorId, trigger: BUMP_TRIGGER_KEYS.HIDDEN, status: { in: ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"] } },
+      where: { agencyId: req.auth.agencyId, creatorId, trigger: BUMP_TRIGGER_KEYS.HIDDEN, status: { in: HIDDEN_SEND_SLOT_STATUSES } },
     });
     const availableSlots = Math.max(0, maxActiveHiddenQueued - activeHiddenQueued);
     const limit = Math.min(requestedLimit, availableSlots);
