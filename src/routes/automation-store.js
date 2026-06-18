@@ -446,6 +446,10 @@ const DEFAULT_BUMP_GLOBAL_SAFETY = Object.freeze({
   maxFanSpacingSec: 10,
   maxActiveHiddenQueued: 30,
   hiddenRefillSize: 10,
+  // Hidden Online has its own lifecycle. These are global per-creator rules,
+  // not per-template, so studios can tune 2k+ hidden fans without editing every bump.
+  hiddenReplyTimeoutHours: 6,
+  hiddenRetryAfterNoReplyHours: 12,
 });
 
 function bumpSafetyClientId(creatorId) {
@@ -459,8 +463,22 @@ function normalizeBumpSafety(input = {}) {
   const minFanSpacingSec = Math.max(3, Math.min(3600, positiveInt(src.minFanSpacingSec ?? src.onlineFanSpacingSec ?? src.batchSpacingSec ?? src.eventSendIntervalMinSec, DEFAULT_BUMP_GLOBAL_SAFETY.minFanSpacingSec)));
   const rawMax = positiveInt(src.maxFanSpacingSec ?? src.onlineFanMaxSpacingSec ?? src.batchMaxSpacingSec ?? src.eventSendIntervalMaxSec, DEFAULT_BUMP_GLOBAL_SAFETY.maxFanSpacingSec);
   const maxFanSpacingSec = Math.max(minFanSpacingSec, Math.min(3600, rawMax || DEFAULT_BUMP_GLOBAL_SAFETY.maxFanSpacingSec));
-  const maxActiveHiddenQueued = Math.max(5, Math.min(200, positiveInt(src.maxActiveHiddenQueued ?? src.hiddenMaxActiveQueued ?? src.hiddenQueueCap, DEFAULT_BUMP_GLOBAL_SAFETY.maxActiveHiddenQueued)));
+  const maxActiveHiddenQueued = Math.max(1, Math.min(500, positiveInt(src.maxActiveHiddenQueued ?? src.hiddenMaxActiveQueued ?? src.hiddenQueueCap, DEFAULT_BUMP_GLOBAL_SAFETY.maxActiveHiddenQueued)));
   const hiddenRefillSize = Math.max(1, Math.min(maxActiveHiddenQueued, positiveInt(src.hiddenRefillSize ?? src.hiddenRefill ?? src.hiddenQueueRefill, DEFAULT_BUMP_GLOBAL_SAFETY.hiddenRefillSize)));
+  const hiddenReplyTimeoutHours = Math.max(1, Math.min(72, Number(
+    src.hiddenReplyTimeoutHours ??
+    src.hiddenDeleteAfterNoReplyHours ??
+    src.hiddenNoReplyDeleteAfterHours ??
+    src.hiddenDeleteAfterHours ??
+    DEFAULT_BUMP_GLOBAL_SAFETY.hiddenReplyTimeoutHours
+  ) || DEFAULT_BUMP_GLOBAL_SAFETY.hiddenReplyTimeoutHours));
+  const hiddenRetryAfterNoReplyHours = Math.max(1, Math.min(720, Number(
+    src.hiddenRetryAfterNoReplyHours ??
+    src.hiddenNoReplyRetryHours ??
+    src.hiddenRetryHours ??
+    src.hiddenCadenceHours ??
+    DEFAULT_BUMP_GLOBAL_SAFETY.hiddenRetryAfterNoReplyHours
+  ) || DEFAULT_BUMP_GLOBAL_SAFETY.hiddenRetryAfterNoReplyHours));
   return {
     replyCooldownHours,
     sentCooldownHours,
@@ -468,6 +486,12 @@ function normalizeBumpSafety(input = {}) {
     maxFanSpacingSec,
     maxActiveHiddenQueued,
     hiddenRefillSize,
+    hiddenReplyTimeoutHours,
+    hiddenDeleteAfterNoReplyHours: hiddenReplyTimeoutHours,
+    hiddenNoReplyDeleteAfterHours: hiddenReplyTimeoutHours,
+    hiddenRetryAfterNoReplyHours,
+    hiddenNoReplyRetryHours: hiddenRetryAfterNoReplyHours,
+    hiddenCadenceHours: hiddenRetryAfterNoReplyHours,
     // Backward/diagnostic aliases used by DevTools checks and older UI code.
     eventSendIntervalMinSec: minFanSpacingSec,
     eventSendIntervalMaxSec: maxFanSpacingSec,
@@ -594,12 +618,12 @@ function bySendPriority(a, b) {
 }
 
 function hiddenQueueCap(input = {}) {
-  return Math.max(5, Math.min(200, positiveInt(input.maxActiveHiddenQueued ?? input.hiddenMaxActiveQueued ?? input.hiddenQueueCap, 30)));
+  return Math.max(1, Math.min(500, positiveInt(input.maxActiveHiddenQueued ?? input.hiddenMaxActiveQueued ?? input.hiddenQueueCap, 30)));
 }
 
 
 async function deferHiddenQueueOverflow(prisma, { agencyId, creatorId, cap = 30, now = new Date(), deferMs = 60 * 60 * 1000 } = {}) {
-  const maxActive = Math.max(5, Math.min(200, Number(cap) || 30));
+  const maxActive = Math.max(1, Math.min(500, Number(cap) || 30));
   const hiddenRows = await prisma.automationDelivery.findMany({
     where: {
       agencyId,
@@ -1377,6 +1401,53 @@ router.post("/deliveries/claim-cancel", async (req, res) => {
   } catch (err) { return sendError(res, err, "BUMP_CANCEL_CLAIM_FAILED"); }
 });
 
+async function updateHiddenCandidateAfterBumpFinal({ agencyId, creatorId, existing, status, finalizedAt, replyCooldownHours = 24, safety = null } = {}) {
+  try {
+    if (!existing || normalizeBumpTrigger(existing.trigger) !== BUMP_TRIGGER_KEYS.HIDDEN) return null;
+    const fanId = cleanString(existing.fanId || existing.dialogId, 80);
+    if (!agencyId || !creatorId || !fanId) return null;
+    const meta = deliveryMeta(existing);
+    const base = parseDate(finalizedAt) || new Date();
+    const hiddenRetryAfterNoReplyHours = Math.max(1, Math.min(720, Number(
+      meta.hiddenRetryAfterNoReplyHours ?? meta.hiddenNoReplyRetryHours ?? meta.hiddenCadenceHours ?? safety?.hiddenRetryAfterNoReplyHours ?? 12
+    ) || 12));
+    const hiddenReplyTimeoutHours = Math.max(1, Math.min(72, Number(
+      meta.hiddenDeleteAfterNoReplyHours ?? meta.hiddenNoReplyDeleteAfterHours ?? meta.hiddenReplyTimeoutHours ?? safety?.hiddenReplyTimeoutHours ?? 6
+    ) || 6));
+    const replyQuietHours = Math.max(0, Math.min(2160, Number(replyCooldownHours ?? safety?.replyCooldownHours ?? 24) || 0));
+    const nextMs = status === "replied"
+      ? base.getTime() + replyQuietHours * 60 * 60 * 1000
+      : status === "canceled"
+        ? base.getTime() + hiddenRetryAfterNoReplyHours * 60 * 60 * 1000
+        : base.getTime() + Math.min(hiddenRetryAfterNoReplyHours, 6) * 60 * 60 * 1000;
+    const nextEligibleAt = new Date(nextMs).toISOString();
+    const row = await prisma.hiddenOnlineUser.findFirst({ where: { agencyId, creatorId, fanId } }).catch(() => null);
+    if (!row) return null;
+    const prev = row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata) ? row.metadata : {};
+    return prisma.hiddenOnlineUser.update({
+      where: { id: row.id },
+      data: {
+        lastSignalAt: row.lastSignalAt || existing.sentAt || base,
+        metadata: jsonObject({
+          ...prev,
+          lastHiddenFinalStatus: status,
+          lastHiddenFinalizedAt: base.toISOString(),
+          lastHiddenSentAt: existing.sentAt ? existing.sentAt.toISOString() : (prev.lastHiddenSentAt || null),
+          lastHiddenMessageId: existing.messageId || prev.lastHiddenMessageId || null,
+          nextEligibleAt,
+          hiddenCadenceHours: hiddenRetryAfterNoReplyHours,
+          hiddenRetryAfterNoReplyHours,
+          hiddenReplyTimeoutHours,
+          hiddenDeleteAfterNoReplyHours: hiddenReplyTimeoutHours,
+          hiddenReplyQuietHours: status === "replied" ? replyQuietHours : prev.hiddenReplyQuietHours || null,
+        }),
+      },
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
 router.post("/deliveries/cancel-result", async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
@@ -1403,15 +1474,20 @@ router.post("/deliveries/cancel-result", async (req, res) => {
     if (BUMP_TERMINAL_DELIVERY_STATUSES.has(status)) {
       const templateId = cleanString(req.body?.templateId || req.body?.bumpId || deliveryTemplateId(existing), 100) || "";
       const day = cleanString(req.body?.day, 10) || (existing.sentAt ? existing.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
+      const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId }).catch(() => normalizeBumpSafety({}));
+      const finalizedAt = req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || now.toISOString();
+      const replyCooldownHours = req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? globalSafety.replyCooldownHours ?? 24;
+      const sentCooldownHours = req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? globalSafety.sentCooldownHours ?? 6;
       await upsertBumpFanState({
         agencyId: req.auth.agencyId, creatorId, fanId: existing.fanId, dialogId: existing.dialogId || existing.fanId,
         templateId, status, sentAt: existing.sentAt,
-        finalizedAt: req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || now.toISOString(),
+        finalizedAt,
         messageId: existing.messageId,
-        replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
-        sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
+        replyCooldownHours,
+        sentCooldownHours,
         sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
       }).catch(() => null);
+      await updateHiddenCandidateAfterBumpFinal({ agencyId: req.auth.agencyId, creatorId, existing, status, finalizedAt, replyCooldownHours, safety: globalSafety }).catch(() => null);
       const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: status, by: 1 });
       await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
       return res.json({ ok: true, compacted: true, status, item: null, stat, deliveryId: existing.id, templateId });
@@ -1611,6 +1687,34 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
     const prev = hiddenScanState(existing || {});
     const dueAt = existing?.scheduledAt || null;
     const due = !dueAt || dueAt <= now || req.body?.manual === true || fullScan;
+
+    // Never let an auto enqueue/reset steal a live hidden scan from a worker.
+    // Earlier versions could call enqueue while a page worker was still running,
+    // reset hidden_scan_claimed back to hidden_scan_queued, and the UI showed
+    // "waiting for worker" between chunks. Keep the lease owner until it expires.
+    if (existing?.id && String(existing.status || "") === "hidden_scan_claimed" && existing.claimUntil && existing.claimUntil > now && req.body?.forceTakeover !== true) {
+      return res.json({
+        ok: true,
+        creatorId,
+        item: mapAutomationDelivery(existing),
+        queued: false,
+        alreadyActive: true,
+        code: "HIDDEN_SCAN_ALREADY_CLAIMED",
+        scanState: hiddenScanState(existing),
+        claimUntil: existing.claimUntil.toISOString ? existing.claimUntil.toISOString() : existing.claimUntil,
+        takeoverInSec: hiddenScanTakeoverInSec(existing, now),
+      });
+    }
+
+    // If the old owner is dead, release it before deciding whether to requeue.
+    if (existing?.id && String(existing.status || "") === "hidden_scan_claimed") {
+      await releaseExpiredHiddenScanClaims({ agencyId: req.auth.agencyId, creatorId, now });
+      const freshExisting = await prisma.automationDelivery.findUnique({ where: { id } }).catch(() => null);
+      if (freshExisting?.id && String(freshExisting.status || "") === "hidden_scan_claimed" && freshExisting.claimUntil && freshExisting.claimUntil > now && req.body?.forceTakeover !== true) {
+        return res.json({ ok: true, creatorId, item: mapAutomationDelivery(freshExisting), queued: false, alreadyActive: true, code: "HIDDEN_SCAN_ALREADY_CLAIMED", scanState: hiddenScanState(freshExisting), claimUntil: freshExisting.claimUntil.toISOString ? freshExisting.claimUntil.toISOString() : freshExisting.claimUntil, takeoverInSec: hiddenScanTakeoverInSec(freshExisting, now) });
+      }
+    }
+
     if (existing?.id && !due && !["hidden_scan_paused", "hidden_scan_done", "failed"].includes(String(existing.status || ""))) {
       return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || null, code: "HIDDEN_SCAN_NOT_DUE" });
     }
@@ -1794,10 +1898,24 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
     const now = new Date();
     const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
     const range = onlineSpacingRange({ ...(req.body || {}), ...(globalSafety || {}) });
-    const requestedLimit = Math.max(1, Math.min(200, positiveInt(req.body?.limit, 20)));
+    const requestedLimit = Math.max(1, Math.min(200, positiveInt(req.body?.limit ?? req.body?.hiddenRefillSize ?? globalSafety.hiddenRefillSize, globalSafety.hiddenRefillSize || 10)));
     const maxActiveHiddenQueued = hiddenQueueCap({ ...(req.body || {}), ...(globalSafety || {}) });
-    const cadenceHours = Math.max(1, Math.min(168, Number(req.body?.cadenceHours || req.body?.hiddenCadenceHours || 3) || 3));
-    const replyTimeoutHours = Math.max(1, Math.min(24, Number(req.body?.replyTimeoutHours || req.body?.hiddenReplyTimeoutHours || 1) || 1));
+    const cadenceHours = Math.max(1, Math.min(720, Number(
+      req.body?.hiddenRetryAfterNoReplyHours ??
+      req.body?.hiddenNoReplyRetryHours ??
+      req.body?.hiddenCadenceHours ??
+      req.body?.cadenceHours ??
+      globalSafety.hiddenRetryAfterNoReplyHours ??
+      12
+    ) || 12));
+    const replyTimeoutHours = Math.max(1, Math.min(72, Number(
+      req.body?.hiddenDeleteAfterNoReplyHours ??
+      req.body?.hiddenNoReplyDeleteAfterHours ??
+      req.body?.hiddenReplyTimeoutHours ??
+      req.body?.replyTimeoutHours ??
+      globalSafety.hiddenReplyTimeoutHours ??
+      6
+    ) || 6));
 
     const activeHiddenQueued = await prisma.automationDelivery.count({
       where: { agencyId: req.auth.agencyId, creatorId, trigger: BUMP_TRIGGER_KEYS.HIDDEN, status: { in: ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"] } },
@@ -1858,7 +1976,11 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
               reason: meta.reason || "hidden online candidate",
               replyTimeoutHours,
               hiddenReplyTimeoutHours: replyTimeoutHours,
+              hiddenDeleteAfterNoReplyHours: replyTimeoutHours,
+              hiddenNoReplyDeleteAfterHours: replyTimeoutHours,
               hiddenCadenceHours: cadenceHours,
+              hiddenRetryAfterNoReplyHours: cadenceHours,
+              hiddenNoReplyRetryHours: cadenceHours,
               minFanSpacingSec: range.min,
               maxFanSpacingSec: range.max,
               queuedAt: now.toISOString(),
@@ -1867,10 +1989,24 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
           },
         });
         items.push(item);
-        const nextEligibleAt = new Date(now.getTime() + cadenceHours * 60 * 60 * 1000).toISOString();
+        // While the outgoing hidden bump is pending we also block this candidate until
+        // delete-after-no-reply + retry-after-no-reply. cancel-result will refresh this
+        // value from the real finalizedAt timestamp, but this conservative value prevents
+        // requeue storms if a worker dies before reporting final cancel/reply.
+        const hiddenPendingUntil = new Date(scheduledAt.getTime() + replyTimeoutHours * 60 * 60 * 1000).toISOString();
+        const nextEligibleAt = new Date(scheduledAt.getTime() + (replyTimeoutHours + cadenceHours) * 60 * 60 * 1000).toISOString();
         await tx.hiddenOnlineUser.update({
           where: { id: c.id },
-          data: { metadata: jsonObject({ ...meta, lastHiddenQueuedAt: now.toISOString(), nextEligibleAt, hiddenCadenceHours: cadenceHours, hiddenReplyTimeoutHours: replyTimeoutHours }) },
+          data: { metadata: jsonObject({
+            ...meta,
+            lastHiddenQueuedAt: now.toISOString(),
+            hiddenPendingUntil,
+            nextEligibleAt,
+            hiddenCadenceHours: cadenceHours,
+            hiddenRetryAfterNoReplyHours: cadenceHours,
+            hiddenReplyTimeoutHours: replyTimeoutHours,
+            hiddenDeleteAfterNoReplyHours: replyTimeoutHours,
+          }) },
         });
         cursor = new Date(scheduledAt.getTime() + randomOnlineSpacingMs(range));
       }
@@ -1881,7 +2017,25 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
       return { items, gateNextAllowedAt: cursor };
     }, { timeout: 15000 });
 
-    return res.json({ ok: true, creatorId, triggerKey: BUMP_TRIGGER_KEYS.HIDDEN, count: result.items.length, items: result.items.map(mapAutomationDelivery), skipped, skippedCount: skipped.length, gateNextAllowedAt: result.gateNextAllowedAt.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, cadenceHours, replyTimeoutHours, activeHiddenQueued, maxActiveHiddenQueued });
+    return res.json({
+      ok: true,
+      creatorId,
+      triggerKey: BUMP_TRIGGER_KEYS.HIDDEN,
+      count: result.items.length,
+      items: result.items.map(mapAutomationDelivery),
+      skipped,
+      skippedCount: skipped.length,
+      gateNextAllowedAt: result.gateNextAllowedAt.toISOString(),
+      minFanSpacingSec: range.min,
+      maxFanSpacingSec: range.max,
+      cadenceHours,
+      replyTimeoutHours,
+      hiddenRetryAfterNoReplyHours: cadenceHours,
+      hiddenDeleteAfterNoReplyHours: replyTimeoutHours,
+      hiddenRefillSize: requestedLimit,
+      activeHiddenQueued,
+      maxActiveHiddenQueued,
+    });
   } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_QUEUE_ELIGIBLE_FAILED"); }
 });
 
