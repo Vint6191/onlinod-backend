@@ -1659,7 +1659,23 @@ function hiddenScanState(row = {}) {
 
   out.serverStatus = rawStatus || out.serverStatus || null;
   if (row?.id) out.jobId = row.id;
-  if (row?.scheduledAt) out.nextScanAt = row.scheduledAt.toISOString ? row.scheduledAt.toISOString() : row.scheduledAt;
+
+  // `scheduledAt` has two different meanings depending on row status:
+  // - done/idle rows: next weekly scan time
+  // - queued/running rows with hasMore=true: next page/chunk continuation time
+  // Do not expose a page continuation timestamp as nextScanAt, otherwise the
+  // auto-enqueue path can treat it as the next weekly scan and restart work on
+  // every desktop restart.
+  const scheduledIso = row?.scheduledAt ? (row.scheduledAt.toISOString ? row.scheduledAt.toISOString() : row.scheduledAt) : null;
+  const isCompletedScanState = rawStatus === "hidden_scan_done" || out.hasMore === false || out.status === "done" || out.serverStatus === "hidden_scan_done";
+  if (scheduledIso) {
+    if (isCompletedScanState || rawStatus === "failed") out.nextScanAt = scheduledIso;
+    else {
+      out.nextPageAt = scheduledIso;
+      // Drop stale v19.32.18/19 page timestamps that were stored under nextScanAt.
+      if (out.nextScanAt && Date.parse(out.nextScanAt) <= Date.now() + 10 * 60 * 1000) delete out.nextScanAt;
+    }
+  }
   if (row?.lastCheckedAt) out.lastCheckedAt = row.lastCheckedAt.toISOString ? row.lastCheckedAt.toISOString() : row.lastCheckedAt;
 
   if (rawStatus === "hidden_scan_claimed") {
@@ -1680,6 +1696,91 @@ function hiddenScanState(row = {}) {
   if (rawStatus === "hidden_scan_done") out.keepClaim = false;
 
   return out;
+}
+
+function dateMsSafe(value) {
+  if (!value) return 0;
+  const raw = value instanceof Date ? value.getTime() : Date.parse(String(value));
+  return Number.isFinite(raw) ? raw : 0;
+}
+
+function addDays(dateMs, days) {
+  return new Date(Number(dateMs || 0) + Math.max(1, Number(days) || 1) * 24 * 60 * 60 * 1000);
+}
+
+function hiddenScanLooksCompleted(row = {}, state = {}) {
+  const rowStatus = String(row?.status || "").toLowerCase();
+  const stateStatus = String(state?.status || "").toLowerCase();
+  const serverStatus = String(state?.serverStatus || "").toLowerCase();
+  return rowStatus === "hidden_scan_done" ||
+    serverStatus === "hidden_scan_done" ||
+    stateStatus === "done" ||
+    state?.hasMore === false ||
+    Boolean(state?.finishedAt);
+}
+
+function hiddenScanLastSuccessMs(row = {}, state = {}) {
+  return dateMsSafe(state?.finishedAt) ||
+    dateMsSafe(state?.lastPageAt) ||
+    dateMsSafe(row?.lastCheckedAt) ||
+    dateMsSafe(row?.updatedAt) ||
+    dateMsSafe(row?.scheduledAt);
+}
+
+async function repairFreshHiddenScanDone({ existing, state, agencyId, creatorId, scanEveryDays, now, limit }) {
+  if (!existing?.id || !hiddenScanLooksCompleted(existing, state)) return null;
+  const lastSuccessMs = hiddenScanLastSuccessMs(existing, state);
+  if (!lastSuccessMs) return null;
+  const repairedDueAt = addDays(lastSuccessMs, scanEveryDays);
+  if (repairedDueAt <= now) return null;
+
+  const repairedState = jsonObject({
+    ...state,
+    hiddenScan: true,
+    scanEveryDays,
+    limit: Number(state.limit || limit) || limit,
+    status: "done",
+    serverStatus: "hidden_scan_done",
+    workerStatus: "done",
+    hasMore: false,
+    keepClaim: false,
+    claimedByDeviceId: null,
+    claimUntil: null,
+    nextPageAt: null,
+    nextScanAt: repairedDueAt.toISOString(),
+    finishedAt: state.finishedAt || new Date(lastSuccessMs).toISOString(),
+    lastPageAt: state.lastPageAt || new Date(lastSuccessMs).toISOString(),
+    lastError: null,
+  });
+
+  const shouldRepair = String(existing.status || "") !== "hidden_scan_done" ||
+    !existing.scheduledAt ||
+    existing.scheduledAt <= now ||
+    Math.abs(existing.scheduledAt.getTime() - repairedDueAt.getTime()) > 60_000 ||
+    existing.claimUntil ||
+    existing.claimedByDeviceId ||
+    state.workerStatus === "claimed" ||
+    state.claimUntil ||
+    state.nextPageAt ||
+    (state.nextScanAt && Date.parse(state.nextScanAt) <= now.getTime() + 10 * 60 * 1000);
+
+  const repaired = shouldRepair
+    ? await prisma.automationDelivery.update({
+        where: { id: existing.id },
+        data: {
+          status: "hidden_scan_done",
+          scheduledAt: repairedDueAt,
+          claimedByDeviceId: null,
+          claimedAt: null,
+          claimUntil: null,
+          lastCheckedAt: new Date(lastSuccessMs),
+          error: null,
+          result: repairedState,
+        },
+      })
+    : existing;
+
+  return { item: repaired, nextScanAt: repairedDueAt.toISOString(), repaired: shouldRepair, scanState: hiddenScanState(repaired) };
 }
 
 function hiddenCandidateStatus(value) {
@@ -1775,48 +1876,34 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
     const prev = hiddenScanState(existing || {});
     let dueAt = existing?.scheduledAt || null;
 
-    // If the old stable job says done but scheduledAt/nextScanAt was stale from
-    // a previous bad run, DO NOT auto-restart the scan on desktop restart. Repair
-    // nextScanAt from the last successful page/finish time and return not-due.
-    // Manual/fullScan still intentionally starts a new run.
-    if (existing?.id && String(existing.status || "") === "hidden_scan_done" && req.body?.manual !== true && !fullScan) {
-      const lastDoneMs = Date.parse(prev.finishedAt || prev.lastPageAt || (existing.lastCheckedAt?.toISOString ? existing.lastCheckedAt.toISOString() : existing.lastCheckedAt) || (existing.updatedAt?.toISOString ? existing.updatedAt.toISOString() : existing.updatedAt) || "");
-      if (Number.isFinite(lastDoneMs) && lastDoneMs > 0) {
-        const repairedDueAt = new Date(lastDoneMs + scanEveryDays * 24 * 60 * 60 * 1000);
-        if (repairedDueAt > now) {
-          const repairedState = jsonObject({
-            ...prev,
-            hiddenScan: true,
-            scanEveryDays,
-            limit: Number(prev.limit || limit) || limit,
-            status: "done",
-            serverStatus: "hidden_scan_done",
-            workerStatus: "done",
-            keepClaim: false,
-            claimedByDeviceId: null,
-            claimUntil: null,
-            nextScanAt: repairedDueAt.toISOString(),
-            lastError: null,
-          });
-          const shouldRepair = !dueAt || dueAt <= now || Math.abs(dueAt.getTime() - repairedDueAt.getTime()) > 60_000 || prev.workerStatus === "claimed" || prev.claimUntil || prev.claimedByDeviceId;
-          const repaired = shouldRepair
-            ? await prisma.automationDelivery.update({
-                where: { id: existing.id },
-                data: {
-                  status: "hidden_scan_done",
-                  scheduledAt: repairedDueAt,
-                  claimedByDeviceId: null,
-                  claimedAt: null,
-                  claimUntil: null,
-                  error: null,
-                  result: repairedState,
-                },
-              })
-            : existing;
-          return res.json({ ok: true, creatorId, item: mapAutomationDelivery(repaired), queued: false, nextScanAt: repairedDueAt.toISOString(), code: "HIDDEN_SCAN_NOT_DUE", repaired: shouldRepair, scanState: hiddenScanState(repaired) });
-        }
-        dueAt = repairedDueAt;
+    // Auto-worker must never convert a fresh completed scan into a new run just
+    // because an old result.nextScanAt/scheduledAt was page-level or stale.
+    // Repair any completed-ish state (row done OR result done/hasMore=false)
+    // from the last successful page/finish timestamp and return not-due until
+    // scanEveryDays really elapsed. Manual/fullScan still intentionally starts.
+    if (existing?.id && req.body?.manual !== true && !fullScan) {
+      const repairedDone = await repairFreshHiddenScanDone({
+        existing,
+        state: prev,
+        agencyId: req.auth.agencyId,
+        creatorId,
+        scanEveryDays,
+        now,
+        limit,
+      });
+      if (repairedDone) {
+        return res.json({
+          ok: true,
+          creatorId,
+          item: mapAutomationDelivery(repairedDone.item),
+          queued: false,
+          nextScanAt: repairedDone.nextScanAt,
+          code: "HIDDEN_SCAN_NOT_DUE",
+          repaired: repairedDone.repaired,
+          scanState: repairedDone.scanState,
+        });
       }
+      if (hiddenScanLooksCompleted(existing, prev) && existing?.scheduledAt) dueAt = existing.scheduledAt;
     }
 
     const due = !dueAt || dueAt <= now || req.body?.manual === true || fullScan;
@@ -1848,8 +1935,11 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
       }
     }
 
-    if (existing?.id && !due && !["hidden_scan_paused", "hidden_scan_done", "failed"].includes(String(existing.status || ""))) {
-      return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || null, code: "HIDDEN_SCAN_NOT_DUE" });
+    // If auto scheduling says not due, return not-due for every non-live row.
+    // Older code excluded hidden_scan_done here, which immediately re-queued a
+    // completed scan even when scheduledAt was already repaired into the future.
+    if (existing?.id && !due && req.body?.manual !== true && !fullScan) {
+      return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || prev.nextScanAt || null, code: "HIDDEN_SCAN_NOT_DUE", scanState: hiddenScanState(existing) });
     }
 
     const resetRun = !existing?.id || fullScan || req.body?.manual === true || String(existing?.status || "") === "hidden_scan_done" || String(existing?.status || "") === "failed";
@@ -1989,7 +2079,12 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const keepClaim = req.body?.keepClaim === true && !done && !req.body?.error;
     const claimTimeoutSec = hiddenScanClaimTimeoutSec(req.body?.claimTimeoutSec);
     const keepClaimUntil = new Date(now.getTime() + claimTimeoutSec * 1000);
-    const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 250);
+    const nextPageAt = new Date(now.getTime() + 250);
+    const nextWeeklyScanAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : null;
+    const preservedWeeklyNextScanAt = !done && prev.nextScanAt && Date.parse(prev.nextScanAt) > now.getTime() + 10 * 60 * 1000
+      ? new Date(Date.parse(prev.nextScanAt))
+      : null;
+    const rowScheduledAt = done ? nextWeeklyScanAt : (keepClaim ? (row.scheduledAt || now) : nextPageAt);
     const state = jsonObject({
       ...prev,
       scanned,
@@ -2003,7 +2098,10 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       serverStatus: done ? "hidden_scan_done" : (keepClaim ? "hidden_scan_claimed" : "hidden_scan_queued"),
       workerStatus: done ? "done" : (keepClaim ? "claimed" : "takeover_ready"),
       lastPageAt: now.toISOString(),
-      nextScanAt: nextScheduledAt.toISOString(),
+      nextPageAt: done ? null : nextPageAt.toISOString(),
+      // nextScanAt is ONLY the next weekly scan-run time. It is never the
+      // next page/chunk continuation timestamp.
+      nextScanAt: done ? nextWeeklyScanAt.toISOString() : (preservedWeeklyNextScanAt ? preservedWeeklyNextScanAt.toISOString() : null),
       finishedAt: done ? now.toISOString() : null,
       lastError: req.body?.error || null,
       keepClaim,
@@ -2014,7 +2112,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       where: { id: row.id },
       data: {
         status: done ? "hidden_scan_done" : (keepClaim ? "hidden_scan_claimed" : "hidden_scan_queued"),
-        scheduledAt: keepClaim ? now : nextScheduledAt,
+        scheduledAt: rowScheduledAt,
         claimedByDeviceId: keepClaim ? (row.claimedByDeviceId || deviceId || "unknown") : null,
         claimedAt: keepClaim ? (row.claimedAt || now) : null,
         claimUntil: keepClaim ? keepClaimUntil : null,
@@ -2024,7 +2122,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       },
     });
     const counts = await prisma.hiddenOnlineUser.groupBy({ by: ["status"], where: { agencyId: req.auth.agencyId, creatorId }, _count: { _all: true } }).catch(() => []);
-    return res.json({ ok: true, creatorId, item: mapAutomationDelivery(item), scanState: hiddenScanState(item), upsert, counts, nextScanAt: nextScheduledAt.toISOString() });
+    return res.json({ ok: true, creatorId, item: mapAutomationDelivery(item), scanState: hiddenScanState(item), upsert, counts, nextScanAt: nextWeeklyScanAt ? nextWeeklyScanAt.toISOString() : (preservedWeeklyNextScanAt ? preservedWeeklyNextScanAt.toISOString() : null), nextPageAt: !done ? nextPageAt.toISOString() : null });
   } catch (err) { return sendError(res, err, "HIDDEN_SCAN_PROGRESS_FAILED"); }
 });
 
