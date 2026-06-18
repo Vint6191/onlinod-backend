@@ -152,6 +152,33 @@ function todayKeyUtc() {
   return new Date().toISOString().slice(0, 10);
 }
 
+
+function liveDeliverySentStatAlreadyCounted(row = {}) {
+  const meta = toPlainObject(row?.result || {});
+  if (meta.sentStatCounted === true || meta.serverSentStatCounted === true) return true;
+  if (meta.statCounted === true || meta.statCounted === "sent") return true;
+  const events = toPlainObject(meta.statEvents || {});
+  return events.sent === true;
+}
+
+function syntheticStatRowsFromLiveDeliveries(rows = []) {
+  const byKey = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (!row?.id || liveDeliverySentStatAlreadyCounted(row)) continue;
+    if (!row.messageId && !row.sentAt) continue;
+    const templateId = clean(row.contentCollectionId || "", 120);
+    if (!templateId) continue;
+    const day = row.sentAt instanceof Date && Number.isFinite(row.sentAt.getTime())
+      ? row.sentAt.toISOString().slice(0, 10)
+      : todayKeyUtc();
+    const key = `${templateId}:${day}`;
+    const prev = byKey.get(key) || { templateId, day, sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0 };
+    prev.sent += 1;
+    byKey.set(key, prev);
+  }
+  return Array.from(byKey.values());
+}
+
 function mergeBumpStatRows(baseStats = {}, rows = []) {
   const today = todayKeyUtc();
   const stats = toPlainObject(baseStats);
@@ -199,9 +226,22 @@ async function loadBumpStatsByTemplate({ agencyId, creatorId, tasks = [] } = {})
   const where = { agencyId, templateId: { in: keys } };
   const cid = clean(creatorId, 100);
   if (cid) where.creatorId = cid;
-  const rows = await prisma.bumpDeliveryStat.findMany({ where }).catch(() => []);
+  const [rows, liveRows] = await Promise.all([
+    prisma.bumpDeliveryStat.findMany({ where }).catch(() => []),
+    prisma.automationDelivery.findMany({
+      where: {
+        agencyId,
+        ...(cid ? { creatorId: cid } : {}),
+        contentCollectionId: { in: keys },
+        status: { in: ["sent", "pending_reply", "checking_reply", "cancel_claimed"] },
+        OR: [{ messageId: { not: null } }, { sentAt: { not: null } }],
+      },
+      select: { id: true, contentCollectionId: true, sentAt: true, messageId: true, result: true },
+      take: 50000,
+    }).catch(() => []),
+  ]);
   const byTemplate = new Map();
-  for (const row of rows || []) {
+  for (const row of [...(rows || []), ...syntheticStatRowsFromLiveDeliveries(liveRows || [])]) {
     const key = clean(row.templateId, 120);
     if (!key) continue;
     if (!byTemplate.has(key)) byTemplate.set(key, []);

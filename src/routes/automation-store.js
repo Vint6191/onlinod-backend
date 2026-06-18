@@ -107,6 +107,7 @@ function parseDate(value) {
 }
 
 const BUMP_TERMINAL_DELIVERY_STATUSES = new Set(["replied", "canceled", "expired", "failed", "skipped"]);
+const BUMP_SENT_ACTIVE_STATUSES = new Set(["sent", "pending_reply", "checking_reply", "cancel_claimed"]);
 
 function bumpStatStatus(status) {
   const s = cleanString(status, 40).toLowerCase();
@@ -371,6 +372,77 @@ async function incrementBumpDeliveryStat({ agencyId, creatorId, templateId = "",
   });
   const taskStats = await refreshBumpTaskStats({ agencyId, creatorId: cid, templateId: tid });
   return { item, taskStats };
+}
+
+
+function deliverySentStatAlreadyCounted(row = {}) {
+  const meta = deliveryMeta(row);
+  if (meta.sentStatCounted === true || meta.serverSentStatCounted === true) return true;
+  if (meta.statCounted === true || meta.statCounted === "sent") return true;
+  const events = meta.statEvents && typeof meta.statEvents === "object" && !Array.isArray(meta.statEvents) ? meta.statEvents : null;
+  return events?.sent === true;
+}
+
+function shouldCountDeliveryAsSent(row = {}) {
+  if (!row?.id) return false;
+  const status = bumpStatStatus(row.status || "");
+  if (!BUMP_SENT_ACTIVE_STATUSES.has(status) && !BUMP_TERMINAL_DELIVERY_STATUSES.has(status)) return false;
+  if (!row.sentAt && !row.messageId) return false;
+  const templateId = deliveryTemplateId(row);
+  if (!templateId) return false;
+  return !deliverySentStatAlreadyCounted(row);
+}
+
+async function ensureBumpSentStatCounted({ agencyId, creatorId, row, templateId = null, source = "server_delivery_upsert" } = {}) {
+  if (!agencyId || !creatorId || !row?.id || !shouldCountDeliveryAsSent(row)) return null;
+  const tid = cleanString(templateId || deliveryTemplateId(row), 100) || "";
+  if (!tid) return null;
+  const day = row.sentAt ? row.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
+  const stat = await incrementBumpDeliveryStat({ agencyId, creatorId, templateId: tid, day, event: "sent", by: 1 });
+  const meta = deliveryMeta(row);
+  await prisma.automationDelivery.update({
+    where: { id: row.id },
+    data: {
+      result: jsonObject({
+        ...meta,
+        sentStatCounted: true,
+        serverSentStatCounted: true,
+        sentStatCountedAt: new Date().toISOString(),
+        sentStatSource: source,
+        statEvents: { ...(meta.statEvents && typeof meta.statEvents === "object" && !Array.isArray(meta.statEvents) ? meta.statEvents : {}), sent: true },
+      }),
+    },
+  }).catch(() => null);
+  return stat;
+}
+
+function liveSentStatDay(row = {}) {
+  const d = row?.sentAt || row?.createdAt || null;
+  return d instanceof Date && Number.isFinite(d.getTime()) ? d.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
+}
+
+async function loadUncountedLiveSentRows({ agencyId, creatorId = null, fromDay = null, toDay = null, templateIds = null, limit = 10000 } = {}) {
+  const where = {
+    agencyId,
+    status: { in: Array.from(BUMP_SENT_ACTIVE_STATUSES) },
+    OR: [{ messageId: { not: null } }, { sentAt: { not: null } }],
+  };
+  const cid = cleanString(creatorId, 100);
+  if (cid) where.creatorId = cid;
+  const tids = Array.isArray(templateIds) ? templateIds.map((x) => cleanString(x, 100)).filter(Boolean) : [];
+  if (tids.length) where.contentCollectionId = { in: tids };
+  if (fromDay || toDay) {
+    where.sentAt = {};
+    if (fromDay) where.sentAt.gte = new Date(`${fromDay}T00:00:00.000Z`);
+    if (toDay) where.sentAt.lte = new Date(`${toDay}T23:59:59.999Z`);
+  }
+  const rows = await prisma.automationDelivery.findMany({
+    where,
+    select: { id: true, agencyId: true, creatorId: true, contentCollectionId: true, status: true, sentAt: true, createdAt: true, messageId: true, result: true },
+    orderBy: { sentAt: "desc" },
+    take: Math.max(1, Math.min(50000, positiveInt(limit, 10000))),
+  }).catch(() => []);
+  return (rows || []).filter((row) => shouldCountDeliveryAsSent(row));
 }
 
 async function findAutomationDeliveryForResult({ agencyId, creatorId, input = {} }) {
@@ -876,6 +948,7 @@ router.post("/deliveries/upsert", async (req, res) => {
         sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
         sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
       }).catch(() => null);
+      await ensureBumpSentStatCounted({ agencyId: req.auth.agencyId, creatorId, row: updated, templateId: templateIdForStat, source: "terminal_upsert_before_compact" }).catch(() => null);
       const day = cleanString(req.body?.day, 10) || (updated.sentAt ? updated.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
       const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId: templateIdForStat, day, event: terminalStatus, by: 1 });
       await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
@@ -896,6 +969,8 @@ router.post("/deliveries/upsert", async (req, res) => {
     } else {
       item = await prisma.automationDelivery.create({ data });
     }
+
+    await ensureBumpSentStatCounted({ agencyId: req.auth.agencyId, creatorId, row: item, templateId: deliveryTemplateId(item), source: "delivery_upsert_sent" }).catch(() => null);
 
     await upsertBumpFanState({
       agencyId: req.auth.agencyId, creatorId, fanId: item.fanId, dialogId: item.dialogId || item.fanId,
@@ -1367,6 +1442,7 @@ router.post("/deliveries/claim-cancel", async (req, res) => {
       const attempts = Math.max(0, Number(candidate.attempts || 0));
       if (attempts >= maxAttempts) {
         const templateId = deliveryTemplateId(candidate);
+        await ensureBumpSentStatCounted({ agencyId: req.auth.agencyId, creatorId, row: candidate, templateId, source: "max_attempts_before_failed" }).catch(() => null);
         const day = candidate.sentAt ? candidate.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
         await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: "failed", by: 1 }).catch(() => null);
         await prisma.automationDelivery.delete({ where: { id: candidate.id } }).catch(() => null);
@@ -1488,6 +1564,7 @@ router.post("/deliveries/cancel-result", async (req, res) => {
         sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
       }).catch(() => null);
       await updateHiddenCandidateAfterBumpFinal({ agencyId: req.auth.agencyId, creatorId, existing, status, finalizedAt, replyCooldownHours, safety: globalSafety }).catch(() => null);
+      await ensureBumpSentStatCounted({ agencyId: req.auth.agencyId, creatorId, row: existing, templateId, source: "cancel_result_before_compact" }).catch(() => null);
       const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: status, by: 1 });
       await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
       return res.json({ ok: true, compacted: true, status, item: null, stat, deliveryId: existing.id, templateId });
@@ -2570,6 +2647,13 @@ router.get("/deliveries/bump-stats", async (req, res) => {
     }
 
     const rows = await prisma.bumpDeliveryStat.findMany({ where, orderBy: { day: "desc" }, take: parseLimit(req.query?.limit, 500, 5000) });
+    const liveSentRows = await loadUncountedLiveSentRows({
+      agencyId: req.auth.agencyId,
+      creatorId,
+      fromDay,
+      toDay,
+      limit: parseLimit(req.query?.liveLimit, 10000, 50000),
+    });
 
     // Сводки: всего и по шаблону. sentToday/repliedToday are UTC-day buckets,
     // the same compact source used by bump list counters.
@@ -2590,12 +2674,22 @@ router.get("/deliveries/bump-stats", async (req, res) => {
         byTemplate[t].repliedToday += r.replied || 0;
       }
     }
+    for (const row of liveSentRows || []) {
+      const day = liveSentStatDay(row);
+      const t = deliveryTemplateId(row) || "";
+      totals.sent += 1;
+      if (day === today) totals.sentToday += 1;
+      if (!byTemplate[t]) byTemplate[t] = { templateId: t, sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, sentToday: 0, repliedToday: 0 };
+      byTemplate[t].sent += 1;
+      if (day === today) byTemplate[t].sentToday += 1;
+    }
+
     const rate = (rep, sent) => (sent > 0 ? Math.round((rep / sent) * 10000) / 100 : 0);
     totals.replyRate = rate(totals.replied, totals.sent);
     const perTemplate = Object.values(byTemplate).map((t) => ({ ...t, replyRate: rate(t.replied, t.sent) }))
       .sort((a, b) => b.replyRate - a.replyRate);
 
-    return res.json({ ok: true, totals, perTemplate, days: rows });
+    return res.json({ ok: true, totals, perTemplate, days: rows, liveUncountedSent: liveSentRows.length });
   } catch (err) { return sendError(res, err, "BUMP_STATS_READ_FAILED"); }
 });
 
