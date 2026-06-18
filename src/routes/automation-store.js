@@ -1644,30 +1644,38 @@ function hiddenScanState(row = {}) {
   const rawStatus = String(row?.status || "").toLowerCase();
   const out = meta && typeof meta === "object" && !Array.isArray(meta) ? { ...meta } : {};
 
-  // Expose server job status to desktop UI. The previous version returned only
-  // row.result, so freshly queued/claimed jobs could look idle until the first
-  // progress page was posted. Hidden scan is server-owned, so the visible
-  // progress state must reflect AutomationDelivery.status too.
-  if (!out.status) {
-    if (rawStatus === "hidden_scan_claimed") out.status = "running";
-    else if (rawStatus === "hidden_scan_queued") out.status = "queued";
-    else if (rawStatus === "hidden_scan_paused") out.status = "paused";
-    else if (rawStatus === "hidden_scan_done") out.status = "done";
-    else if (rawStatus === "failed") out.status = "failed";
-    else if (rawStatus) out.status = rawStatus;
-    else out.status = "idle";
-  }
+  // Server row status is authoritative. Old result JSON can contain stale
+  // status/workerStatus/claim fields because we reuse a stable hidden_scan_* job
+  // id. Never let those stale fields make a completed scan look claimed/running.
+  if (rawStatus === "hidden_scan_claimed") out.status = "running";
+  else if (rawStatus === "hidden_scan_queued") out.status = "queued";
+  else if (rawStatus === "hidden_scan_paused") out.status = "paused";
+  else if (rawStatus === "hidden_scan_done") out.status = "done";
+  else if (rawStatus === "failed") out.status = "failed";
+  else if (rawStatus) out.status = rawStatus;
+  else out.status = out.status || "idle";
 
   out.serverStatus = rawStatus || out.serverStatus || null;
-  if (row?.id && !out.jobId) out.jobId = row.id;
-  if (row?.scheduledAt && !out.nextScanAt) out.nextScanAt = row.scheduledAt.toISOString ? row.scheduledAt.toISOString() : row.scheduledAt;
-  if (row?.claimedByDeviceId && !out.claimedByDeviceId) out.claimedByDeviceId = row.claimedByDeviceId;
-  if (row?.claimUntil && !out.claimUntil) out.claimUntil = row.claimUntil.toISOString ? row.claimUntil.toISOString() : row.claimUntil;
-  if (rawStatus === "hidden_scan_claimed") out.takeoverInSec = hiddenScanTakeoverInSec(row);
-  if (rawStatus === "hidden_scan_claimed" && out.takeoverInSec > 0 && !out.workerStatus) out.workerStatus = "claimed";
-  if (rawStatus === "hidden_scan_queued" && !out.workerStatus) out.workerStatus = "takeover_ready";
-  if (row?.lastCheckedAt && !out.lastCheckedAt) out.lastCheckedAt = row.lastCheckedAt.toISOString ? row.lastCheckedAt.toISOString() : row.lastCheckedAt;
-  if (row?.error && !out.lastError) out.lastError = row.error;
+  if (row?.id) out.jobId = row.id;
+  if (row?.scheduledAt) out.nextScanAt = row.scheduledAt.toISOString ? row.scheduledAt.toISOString() : row.scheduledAt;
+  if (row?.lastCheckedAt) out.lastCheckedAt = row.lastCheckedAt.toISOString ? row.lastCheckedAt.toISOString() : row.lastCheckedAt;
+
+  if (rawStatus === "hidden_scan_claimed") {
+    out.claimedByDeviceId = row?.claimedByDeviceId || null;
+    out.claimUntil = row?.claimUntil ? (row.claimUntil.toISOString ? row.claimUntil.toISOString() : row.claimUntil) : null;
+    out.takeoverInSec = hiddenScanTakeoverInSec(row);
+    out.workerStatus = out.takeoverInSec > 0 ? "claimed" : "takeover_ready";
+  } else {
+    out.claimedByDeviceId = null;
+    out.claimUntil = null;
+    out.takeoverInSec = 0;
+    if (rawStatus === "hidden_scan_done") out.workerStatus = "done";
+    else if (rawStatus === "hidden_scan_queued") out.workerStatus = "takeover_ready";
+    else if (rawStatus === "hidden_scan_paused") out.workerStatus = "paused";
+  }
+
+  if (row?.error) out.lastError = row.error;
+  if (rawStatus === "hidden_scan_done") out.keepClaim = false;
 
   return out;
 }
@@ -1703,7 +1711,8 @@ function hiddenCandidateCompact(input = {}) {
       lastIncomingAt: input.lastIncomingAt || metadata.lastIncomingAt || null,
       nextEligibleAt: input.nextEligibleAt || metadata.nextEligibleAt || null,
       lastHiddenQueuedAt: input.lastHiddenQueuedAt || metadata.lastHiddenQueuedAt || null,
-      hiddenCadenceHours: Number(input.hiddenCadenceHours || metadata.hiddenCadenceHours || 3) || 3,
+      hiddenCadenceHours: Math.max(1, Math.min(720, Number(input.hiddenRetryAfterNoReplyHours ?? input.hiddenNoReplyRetryHours ?? input.hiddenCadenceHours ?? metadata.hiddenRetryAfterNoReplyHours ?? metadata.hiddenNoReplyRetryHours ?? metadata.hiddenCadenceHours ?? 12) || 12)),
+      hiddenRetryAfterNoReplyHours: Math.max(1, Math.min(720, Number(input.hiddenRetryAfterNoReplyHours ?? input.hiddenNoReplyRetryHours ?? input.hiddenCadenceHours ?? metadata.hiddenRetryAfterNoReplyHours ?? metadata.hiddenNoReplyRetryHours ?? metadata.hiddenCadenceHours ?? 12) || 12)),
     },
   };
 }
@@ -1796,16 +1805,34 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
       return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || null, code: "HIDDEN_SCAN_NOT_DUE" });
     }
 
+    // Starting a new due/manual/full scan must reset current-run counters.
+    // The job id is stable, so carrying prev.scanned/pages/hiddenSeen forward
+    // made the UI show impossible values like 29k scanned for a 16k account.
+    const sourceType = cleanString(req.body?.type || req.body?.subscriberType || prev.sourceType || "all", 40) || "all";
     const state = jsonObject({
-      ...prev,
       hiddenScan: true,
       scanEveryDays,
       limit,
-      sourceType: cleanString(req.body?.type || req.body?.subscriberType || prev.sourceType || "all", 40) || "all",
-      nextOffset: fullScan ? 0 : Math.max(0, Number(prev.nextOffset || 0) || 0),
+      sourceType,
+      nextOffset: 0,
       fullScan,
       manual: req.body?.manual === true,
+      status: "queued",
+      serverStatus: "hidden_scan_queued",
+      workerStatus: "takeover_ready",
+      pages: 0,
+      scanned: 0,
+      hiddenSeen: 0,
+      inserted: 0,
+      updated: 0,
+      hasMore: true,
+      keepClaim: false,
+      claimedByDeviceId: null,
+      claimUntil: null,
       enqueuedAt: now.toISOString(),
+      startedAt: null,
+      lastPageAt: null,
+      finishedAt: null,
       lastError: null,
     });
     const item = await prisma.automationDelivery.upsert({
@@ -1916,6 +1943,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const keepClaim = req.body?.keepClaim === true && !done && !req.body?.error;
     const claimTimeoutSec = hiddenScanClaimTimeoutSec(req.body?.claimTimeoutSec);
     const keepClaimUntil = new Date(now.getTime() + claimTimeoutSec * 1000);
+    const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 250);
     const state = jsonObject({
       ...prev,
       scanned,
@@ -1926,13 +1954,16 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       nextOffset,
       hasMore,
       status: done ? "done" : (keepClaim ? "scanning" : "queued"),
+      serverStatus: done ? "hidden_scan_done" : (keepClaim ? "hidden_scan_claimed" : "hidden_scan_queued"),
+      workerStatus: done ? "done" : (keepClaim ? "claimed" : "takeover_ready"),
       lastPageAt: now.toISOString(),
-      finishedAt: done ? now.toISOString() : prev.finishedAt || null,
+      nextScanAt: nextScheduledAt.toISOString(),
+      finishedAt: done ? now.toISOString() : null,
       lastError: req.body?.error || null,
       keepClaim,
+      claimedByDeviceId: keepClaim ? (row.claimedByDeviceId || deviceId || "unknown") : null,
       claimUntil: keepClaim ? keepClaimUntil.toISOString() : null,
     });
-    const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 250);
     const item = await prisma.automationDelivery.update({
       where: { id: row.id },
       data: {
