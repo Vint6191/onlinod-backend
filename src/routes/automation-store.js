@@ -1640,13 +1640,15 @@ function hiddenScanJobId(creatorId) {
 }
 
 function hiddenScanState(row = {}) {
+  if (!row?.id) return { status: "idle", serverStatus: null };
   const meta = deliveryMeta(row);
   const rawStatus = String(row?.status || "").toLowerCase();
   const out = meta && typeof meta === "object" && !Array.isArray(meta) ? { ...meta } : {};
 
-  // Server row status is authoritative. Old result JSON can contain stale
-  // status/workerStatus/claim fields because we reuse a stable hidden_scan_* job
-  // id. Never let those stale fields make a completed scan look claimed/running.
+  // Server row status is authoritative. The hidden scan job id is stable
+  // (hidden_scan_<creatorId>), so result JSON may keep stale worker fields from
+  // a previous run. Never let old result.status/workerStatus/claim fields make
+  // a completed scan look claimed/running.
   if (rawStatus === "hidden_scan_claimed") out.status = "running";
   else if (rawStatus === "hidden_scan_queued") out.status = "queued";
   else if (rawStatus === "hidden_scan_paused") out.status = "paused";
@@ -1771,7 +1773,52 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
     const id = hiddenScanJobId(creatorId);
     const existing = await prisma.automationDelivery.findUnique({ where: { id } }).catch(() => null);
     const prev = hiddenScanState(existing || {});
-    const dueAt = existing?.scheduledAt || null;
+    let dueAt = existing?.scheduledAt || null;
+
+    // If the old stable job says done but scheduledAt/nextScanAt was stale from
+    // a previous bad run, DO NOT auto-restart the scan on desktop restart. Repair
+    // nextScanAt from the last successful page/finish time and return not-due.
+    // Manual/fullScan still intentionally starts a new run.
+    if (existing?.id && String(existing.status || "") === "hidden_scan_done" && req.body?.manual !== true && !fullScan) {
+      const lastDoneMs = Date.parse(prev.finishedAt || prev.lastPageAt || (existing.lastCheckedAt?.toISOString ? existing.lastCheckedAt.toISOString() : existing.lastCheckedAt) || (existing.updatedAt?.toISOString ? existing.updatedAt.toISOString() : existing.updatedAt) || "");
+      if (Number.isFinite(lastDoneMs) && lastDoneMs > 0) {
+        const repairedDueAt = new Date(lastDoneMs + scanEveryDays * 24 * 60 * 60 * 1000);
+        if (repairedDueAt > now) {
+          const repairedState = jsonObject({
+            ...prev,
+            hiddenScan: true,
+            scanEveryDays,
+            limit: Number(prev.limit || limit) || limit,
+            status: "done",
+            serverStatus: "hidden_scan_done",
+            workerStatus: "done",
+            keepClaim: false,
+            claimedByDeviceId: null,
+            claimUntil: null,
+            nextScanAt: repairedDueAt.toISOString(),
+            lastError: null,
+          });
+          const shouldRepair = !dueAt || dueAt <= now || Math.abs(dueAt.getTime() - repairedDueAt.getTime()) > 60_000 || prev.workerStatus === "claimed" || prev.claimUntil || prev.claimedByDeviceId;
+          const repaired = shouldRepair
+            ? await prisma.automationDelivery.update({
+                where: { id: existing.id },
+                data: {
+                  status: "hidden_scan_done",
+                  scheduledAt: repairedDueAt,
+                  claimedByDeviceId: null,
+                  claimedAt: null,
+                  claimUntil: null,
+                  error: null,
+                  result: repairedState,
+                },
+              })
+            : existing;
+          return res.json({ ok: true, creatorId, item: mapAutomationDelivery(repaired), queued: false, nextScanAt: repairedDueAt.toISOString(), code: "HIDDEN_SCAN_NOT_DUE", repaired: shouldRepair, scanState: hiddenScanState(repaired) });
+        }
+        dueAt = repairedDueAt;
+      }
+    }
+
     const due = !dueAt || dueAt <= now || req.body?.manual === true || fullScan;
 
     // Never let an auto enqueue/reset steal a live hidden scan from a worker.
@@ -1805,33 +1852,32 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
       return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || null, code: "HIDDEN_SCAN_NOT_DUE" });
     }
 
-    // Starting a new due/manual/full scan must reset current-run counters.
-    // The job id is stable, so carrying prev.scanned/pages/hiddenSeen forward
-    // made the UI show impossible values like 29k scanned for a 16k account.
+    const resetRun = !existing?.id || fullScan || req.body?.manual === true || String(existing?.status || "") === "hidden_scan_done" || String(existing?.status || "") === "failed";
     const sourceType = cleanString(req.body?.type || req.body?.subscriberType || prev.sourceType || "all", 40) || "all";
     const state = jsonObject({
+      ...(resetRun ? {} : prev),
       hiddenScan: true,
       scanEveryDays,
       limit,
       sourceType,
-      nextOffset: 0,
+      nextOffset: resetRun ? 0 : Math.max(0, Number(prev.nextOffset || 0) || 0),
       fullScan,
       manual: req.body?.manual === true,
       status: "queued",
       serverStatus: "hidden_scan_queued",
       workerStatus: "takeover_ready",
-      pages: 0,
-      scanned: 0,
-      hiddenSeen: 0,
-      inserted: 0,
-      updated: 0,
+      pages: resetRun ? 0 : Math.max(0, Number(prev.pages || 0) || 0),
+      scanned: resetRun ? 0 : Math.max(0, Number(prev.scanned || 0) || 0),
+      hiddenSeen: resetRun ? 0 : Math.max(0, Number(prev.hiddenSeen || 0) || 0),
+      inserted: resetRun ? 0 : Math.max(0, Number(prev.inserted || 0) || 0),
+      updated: resetRun ? 0 : Math.max(0, Number(prev.updated || 0) || 0),
       hasMore: true,
       keepClaim: false,
       claimedByDeviceId: null,
       claimUntil: null,
       enqueuedAt: now.toISOString(),
-      startedAt: null,
-      lastPageAt: null,
+      startedAt: resetRun ? null : prev.startedAt || null,
+      lastPageAt: resetRun ? null : prev.lastPageAt || null,
       finishedAt: null,
       lastError: null,
     });
