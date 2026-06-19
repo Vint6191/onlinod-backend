@@ -382,6 +382,257 @@ async function findAutomationDeliveryForResult({ agencyId, creatorId, input = {}
   return null;
 }
 
+
+// v19.34.0: AutomationDelivery state-machine guard.
+// This table is still used by legacy desktop clients, so the repair is intentionally
+// schema-free: terminal/lifecycle metadata lives in result JSON and terminal rows
+// are kept as tombstones instead of being deleted immediately.
+const AUTOMATION_SEND_CLAIM_STATUSES = new Set(["online_claimed", "send_reserved"]);
+const AUTOMATION_CANCEL_CLAIM_STATUSES = new Set(["cancel_claimed"]);
+const AUTOMATION_HIDDEN_SCAN_CLAIM_STATUSES = new Set(["hidden_scan_claimed"]);
+const AUTOMATION_ANY_CLAIM_STATUSES = new Set([
+  ...AUTOMATION_SEND_CLAIM_STATUSES,
+  ...AUTOMATION_CANCEL_CLAIM_STATUSES,
+  ...AUTOMATION_HIDDEN_SCAN_CLAIM_STATUSES,
+]);
+const AUTOMATION_TERMINAL_ROW_STATUSES = new Set(["replied", "canceled", "expired", "failed", "skipped"]);
+
+function stripUndefinedFields(input = {}) {
+  const out = {};
+  for (const [key, value] of Object.entries(input || {})) {
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
+}
+
+function deliveryStatAlreadyCounted(row = {}) {
+  const meta = deliveryMeta(row);
+  return Boolean(meta.statCounted === true || meta.statCountedAt || meta.statCountedStatus);
+}
+
+function normalizeDeliveryWriteData(data = {}) {
+  const next = { ...(data || {}) };
+  const status = bumpStatStatus(next.status || "");
+  if (AUTOMATION_ANY_CLAIM_STATUSES.has(status) && (!next.claimUntil || !next.claimedByDeviceId)) {
+    const meta = deliveryMeta(next);
+    next.result = jsonObject({
+      ...meta,
+      leaseRejected: true,
+      leaseRejectedAt: new Date().toISOString(),
+      requestedStatus: status,
+      leaseRejectedReason: "claimed/reserved status requires claimedByDeviceId and claimUntil",
+    });
+    if (AUTOMATION_CANCEL_CLAIM_STATUSES.has(status)) next.status = "pending_reply";
+    else if (AUTOMATION_HIDDEN_SCAN_CLAIM_STATUSES.has(status)) next.status = "hidden_scan_queued";
+    else next.status = "online_queued";
+    next.claimedByDeviceId = null;
+    next.claimedAt = null;
+    next.claimUntil = null;
+  }
+  return next;
+}
+
+async function createAutomationDeliverySafe(data = {}) {
+  try {
+    return await prisma.automationDelivery.create({ data });
+  } catch (err) {
+    if (err?.code === "P2002" && data.id) {
+      const existing = await prisma.automationDelivery.findUnique({ where: { id: data.id } }).catch(() => null);
+      if (existing) return existing;
+    }
+    throw err;
+  }
+}
+
+async function saveAutomationDeliveryIdempotent({ agencyId, creatorId, id = "", messageId = "", data = {}, updateData = {} }) {
+  const safeData = normalizeDeliveryWriteData(data);
+  const safeUpdate = stripUndefinedFields(normalizeDeliveryWriteData(updateData));
+  const cid = cleanString(creatorId, 100);
+  const did = cleanString(id, 120);
+  const mid = cleanString(messageId, 100);
+
+  if (did) {
+    const updated = await prisma.automationDelivery.updateMany({
+      where: { id: did, agencyId, creatorId: cid },
+      data: safeUpdate,
+    });
+    if (updated.count > 0) {
+      const row = await prisma.automationDelivery.findUnique({ where: { id: did } }).catch(() => null);
+      if (row) return row;
+    }
+    const foreign = await prisma.automationDelivery.findUnique({ where: { id: did }, select: { id: true, agencyId: true, creatorId: true } }).catch(() => null);
+    if (foreign?.id && (foreign.agencyId !== agencyId || foreign.creatorId !== cid)) {
+      const err = new Error("delivery id belongs to another creator");
+      err.status = 409;
+      err.code = "DELIVERY_ID_CONFLICT";
+      throw err;
+    }
+    return createAutomationDeliverySafe({ ...safeData, id: did });
+  }
+
+  if (mid) {
+    const updated = await prisma.automationDelivery.updateMany({
+      where: { agencyId, creatorId: cid, messageId: mid },
+      data: safeUpdate,
+    });
+    if (updated.count > 0) {
+      const row = await prisma.automationDelivery.findFirst({
+        where: { agencyId, creatorId: cid, messageId: mid },
+        orderBy: { updatedAt: "desc" },
+      }).catch(() => null);
+      if (row) return row;
+    }
+    return createAutomationDeliverySafe(safeData);
+  }
+
+  return createAutomationDeliverySafe(safeData);
+}
+
+async function markAutomationDeliveryTerminal({ req, creatorId, row, status, input = {}, source = "automation_state_machine" }) {
+  const terminalStatus = bumpStatStatus(status);
+  if (!row?.id || !BUMP_TERMINAL_DELIVERY_STATUSES.has(terminalStatus)) {
+    return { ok: false, code: "BAD_TERMINAL_DELIVERY", item: row ? mapAutomationDelivery(row) : null };
+  }
+  const now = new Date();
+  const prevMeta = deliveryMeta(row);
+  const inputResult = input?.result && typeof input.result === "object" && !Array.isArray(input.result) ? input.result : {};
+  const alreadyCounted = deliveryStatAlreadyCounted(row);
+  const templateId = cleanString(input?.templateId || input?.bumpId || deliveryTemplateId(row), 100) || "";
+  const day = cleanString(input?.day, 10) || (row.sentAt ? row.sentAt.toISOString().slice(0, 10) : now.toISOString().slice(0, 10));
+  let stat = null;
+
+  if (!alreadyCounted && STAT_EVENTS.has(terminalStatus)) {
+    await upsertBumpFanState({
+      agencyId: req.auth.agencyId,
+      creatorId,
+      fanId: row.fanId,
+      dialogId: row.dialogId || row.fanId,
+      templateId,
+      status: terminalStatus,
+      sentAt: row.sentAt,
+      finalizedAt: input?.repliedAt || input?.canceledAt || input?.failedAt || input?.finalizedAt || now.toISOString(),
+      messageId: row.messageId,
+      replyCooldownHours: input?.replyCooldownHours ?? input?.fanReplyCooldownHours ?? input?.afterReplyCooldownHours ?? 24,
+      sentCooldownHours: input?.sentCooldownHours ?? input?.fanSentCooldownHours ?? input?.afterSendCooldownHours ?? 6,
+      sameTemplateCooldownHours: input?.sameTemplateCooldownHours ?? input?.cooldownHours ?? null,
+    }).catch(() => null);
+    stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: terminalStatus, by: 1 }).catch((err) => ({ ok: false, error: String(err?.message || err) }));
+  }
+
+  const mergedResult = jsonObject({
+    ...prevMeta,
+    ...inputResult,
+    finalSource: input?.source || input?.replySource || input?.cancelSource || source,
+    finalStatus: terminalStatus,
+    terminalStatus,
+    lifecycle: "terminal",
+    terminalAt: input?.terminalAt || input?.repliedAt || input?.canceledAt || input?.failedAt || input?.finalizedAt || now.toISOString(),
+    finalizedAt: input?.finalizedAt || input?.repliedAt || input?.canceledAt || input?.failedAt || now.toISOString(),
+    replyMessageId: input?.replyMessageId || prevMeta.replyMessageId || null,
+    deleteVerified: input?.deleteVerified ?? prevMeta.deleteVerified ?? null,
+    workerDeviceId: input?.deviceId || input?.claimedByDeviceId || row.claimedByDeviceId || null,
+    statCounted: alreadyCounted || STAT_EVENTS.has(terminalStatus),
+    statCountedStatus: prevMeta.statCountedStatus || (STAT_EVENTS.has(terminalStatus) ? terminalStatus : null),
+    statCountedAt: prevMeta.statCountedAt || (STAT_EVENTS.has(terminalStatus) ? now.toISOString() : null),
+    statSkipped: !STAT_EVENTS.has(terminalStatus),
+  });
+
+  const updated = await prisma.automationDelivery.updateMany({
+    where: { id: row.id, agencyId: req.auth.agencyId, creatorId },
+    data: {
+      status: terminalStatus,
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      lastCheckedAt: now,
+      result: mergedResult,
+      error: optionalString(input?.error || input?.lastError || null, 2000),
+    },
+  });
+  if (updated.count <= 0) {
+    return { ok: true, alreadyCompacted: true, item: null, code: "DELIVERY_TERMINAL_RACE_LOST", status: terminalStatus, stat };
+  }
+  const item = await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null);
+  return { ok: true, compacted: false, terminal: true, status: terminalStatus, item: item ? mapAutomationDelivery(item) : null, stat, alreadyCounted };
+}
+
+async function repairAutomationDeliveries({ agencyId, creatorId, now = new Date(), timeoutSec = 180 } = {}) {
+  const cid = cleanString(creatorId, 100);
+  const staleBefore = new Date(now.getTime() - Math.max(30, Number(timeoutSec) || 180) * 1000);
+  const report = { repairedOnlineClaims: 0, repairedCancelClaims: 0, repairedHiddenScanClaims: 0, fixedQueuedWithMessageId: 0, fixedPendingWithoutMessageId: 0 };
+
+  const online = await prisma.automationDelivery.updateMany({
+    where: {
+      agencyId,
+      creatorId: cid,
+      status: { in: ["online_claimed", "send_reserved"] },
+      OR: [{ claimUntil: { lt: now } }, { claimUntil: null }, { claimedByDeviceId: null }],
+    },
+    data: {
+      status: "online_queued",
+      sentAt: null,
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      scheduledAt: now,
+      lastCheckedAt: now,
+      error: "stale online/send claim repaired; returned to queue",
+    },
+  }).catch(() => ({ count: 0 }));
+  report.repairedOnlineClaims = online.count || 0;
+
+  const cancel = await prisma.automationDelivery.updateMany({
+    where: {
+      agencyId,
+      creatorId: cid,
+      status: "cancel_claimed",
+      OR: [{ claimUntil: { lt: now } }, { claimUntil: null }, { claimedByDeviceId: null }],
+    },
+    data: {
+      status: "pending_reply",
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      lastCheckedAt: now,
+      error: "stale cancel claim repaired; returned to pending_reply",
+    },
+  }).catch(() => ({ count: 0 }));
+  report.repairedCancelClaims = cancel.count || 0;
+
+  const scan = await prisma.automationDelivery.updateMany({
+    where: {
+      agencyId,
+      creatorId: cid,
+      trigger: "hidden_online_scan",
+      status: "hidden_scan_claimed",
+      OR: [{ claimUntil: { lt: now } }, { claimUntil: null }, { claimedByDeviceId: null }, { updatedAt: { lt: staleBefore } }],
+    },
+    data: {
+      status: "hidden_scan_queued",
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      lastCheckedAt: now,
+      error: "stale hidden scan claim repaired; returned to queue",
+    },
+  }).catch(() => ({ count: 0 }));
+  report.repairedHiddenScanClaims = scan.count || 0;
+
+  const queuedWithMessage = await prisma.automationDelivery.updateMany({
+    where: { agencyId, creatorId: cid, status: "online_queued", messageId: { not: null } },
+    data: { status: "pending_reply", claimedByDeviceId: null, claimedAt: null, claimUntil: null, lastCheckedAt: now, error: null },
+  }).catch(() => ({ count: 0 }));
+  report.fixedQueuedWithMessageId = queuedWithMessage.count || 0;
+
+  const pendingNoMessage = await prisma.automationDelivery.updateMany({
+    where: { agencyId, creatorId: cid, status: "pending_reply", messageId: null, sentAt: null },
+    data: { status: "online_queued", scheduledAt: now, claimedByDeviceId: null, claimedAt: null, claimUntil: null, lastCheckedAt: now, error: "pending_reply without messageId/sentAt repaired; returned to queue" },
+  }).catch(() => ({ count: 0 }));
+  report.fixedPendingWithoutMessageId = pendingNoMessage.count || 0;
+
+  return report;
+}
+
 // Legacy server-state mutating routes are intentionally senior-only in v19.5.
 // Worker job protocol remains open through /jobs/claim, /jobs/:id/result and /events.
 
@@ -517,6 +768,45 @@ router.post("/deliveries/fan-state/upsert", async (req, res) => {
   } catch (err) { return sendError(res, err, "BUMP_FAN_STATE_UPSERT_FAILED"); }
 });
 
+router.post("/deliveries/repair", requireSeniorAutomationWriter, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const report = await repairAutomationDeliveries({ agencyId: req.auth.agencyId, creatorId, timeoutSec: positiveInt(req.body?.timeoutSec, 180) });
+    return res.json({ ok: true, creatorId, report });
+  } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_REPAIR_FAILED"); }
+});
+
+router.get("/deliveries/health", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const now = new Date();
+    const [byStatus, byTrigger, staleClaims, dueHot, dueHidden, pendingReply, terminalToday] = await Promise.all([
+      prisma.automationDelivery.groupBy({ by: ["status"], where: { agencyId: req.auth.agencyId, creatorId }, _count: { _all: true } }).catch(() => []),
+      prisma.automationDelivery.groupBy({ by: ["trigger"], where: { agencyId: req.auth.agencyId, creatorId }, _count: { _all: true } }).catch(() => []),
+      prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "send_reserved", "cancel_claimed", "hidden_scan_claimed"] }, OR: [{ claimUntil: null }, { claimUntil: { lt: now } }, { claimedByDeviceId: null }] } }).catch(() => 0),
+      prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", trigger: { in: ["fanOnline", "fanSubscribed", "fanLikedPost"] }, scheduledAt: { lte: now } } }).catch(() => 0),
+      prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", trigger: "hiddenOnlineSignal", scheduledAt: { lte: now } } }).catch(() => 0),
+      prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "pending_reply" } }).catch(() => 0),
+      prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: { in: Array.from(AUTOMATION_TERMINAL_ROW_STATUSES) }, updatedAt: { gte: new Date(now.toISOString().slice(0,10) + "T00:00:00.000Z") } } }).catch(() => 0),
+    ]);
+    return res.json({
+      ok: true,
+      creatorId,
+      deliveries: {
+        byStatus: Object.fromEntries((byStatus || []).map((x) => [x.status || "null", x._count?._all || 0])),
+        byTrigger: Object.fromEntries((byTrigger || []).map((x) => [x.trigger || "null", x._count?._all || 0])),
+        staleClaims,
+        dueHot,
+        dueHidden,
+        pendingReply,
+        terminalToday,
+      },
+    });
+  } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_HEALTH_FAILED"); }
+});
+
 router.get("/deliveries", async (req, res) => {
   try {
     const where = { agencyId: req.auth.agencyId };
@@ -543,25 +833,28 @@ router.post("/deliveries/upsert", async (req, res) => {
     const fanId = cleanString(req.body?.fanId || req.body?.userId, 80);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
-    // Electron присылает свой локальный id вида "bd_...", который НЕ является
-    // серверным cuid. Доверяем id только если это похоже на серверный ключ
-    // (cuid: начинается с 'c', без префикса 'bd_'/'local'/'tmp'). Иначе игнорируем,
-    // чтобы дедуп ушёл в ветку по messageId, а не делал create по несуществующему id.
+
+    // Electron может прислать локальный id вида bd_/local/tmp. Такой id не
+    // является серверным primary key, поэтому дедупим его через messageId.
     const rawId = cleanString(req.body?.id, 100);
     const id = rawId && !/^(bd_|local|tmp|temp)/i.test(rawId) ? rawId : "";
     const templateId = optionalString(req.body?.contentCollectionId || req.body?.templateId || req.body?.bumpId, 100);
     const incomingResult = req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {};
     const resultMeta = jsonObject({
       ...incomingResult,
+      lifecycle: incomingResult.lifecycle || "active",
       localDeliveryId: rawId && /^(bd_|local|tmp|temp)/i.test(rawId) ? rawId : (incomingResult.localDeliveryId || incomingResult.localId || null),
       templateId: templateId || incomingResult.templateId || incomingResult.bumpId || null,
       bumpId: templateId || incomingResult.bumpId || incomingResult.templateId || null,
       queueId: req.body?.queueId ?? incomingResult.queueId ?? null,
       cancelAt: req.body?.cancelAt || incomingResult.cancelAt || null,
       cancelAfterHours: req.body?.cancelAfterHours ?? incomingResult.cancelAfterHours ?? null,
-      statCounted: req.body?.statCounted || incomingResult.statCounted || null,
+      statCounted: incomingResult.statCounted || null,
+      statCountedAt: incomingResult.statCountedAt || null,
+      statCountedStatus: incomingResult.statCountedStatus || null,
     });
-    const data = {
+
+    let data = normalizeDeliveryWriteData({
       agencyId: req.auth.agencyId,
       creatorId,
       ruleId: optionalString(req.body?.ruleId, 100),
@@ -585,81 +878,45 @@ router.post("/deliveries/upsert", async (req, res) => {
       result: resultMeta,
       error: optionalString(req.body?.error, 2000),
       createdByUserId: req.auth.userId,
-    };
-    // Dedup logic:
-    // 1) explicit server id -> upsert by primary key
-    // 2) else if messageId present -> find existing row for this creator+messageId and update it
-    //    (prevents the sweep from inserting a fresh clone on every tick)
-    // 3) else -> create (drafts / no message yet)
-    const updateData = { ...data, agencyId: undefined, creatorId: undefined, fanId: undefined, createdByUserId: undefined };
-    for (const key of ["attempts", "maxAttempts"]) {
-      if (updateData[key] === undefined) delete updateData[key];
-    }
+    });
+
+    const updateData = stripUndefinedFields({ ...data, agencyId: undefined, creatorId: undefined, fanId: undefined, createdByUserId: undefined });
     const terminalStatus = bumpStatStatus(data.status);
+
+    // Terminal writes are state transitions, not deletes. Keeping a tombstone row
+    // makes late local fire-and-forget updates idempotent and avoids P2025 races.
     if (BUMP_TERMINAL_DELIVERY_STATUSES.has(terminalStatus)) {
       const existing = id
         ? await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId } })
         : data.messageId
-          ? await prisma.automationDelivery.findFirst({ where: { agencyId: req.auth.agencyId, creatorId, messageId: data.messageId } })
+          ? await prisma.automationDelivery.findFirst({ where: { agencyId: req.auth.agencyId, creatorId, messageId: data.messageId }, orderBy: { updatedAt: "desc" } })
           : null;
       if (!existing?.id) {
-        return res.json({ ok: true, item: null, alreadyCompacted: true, compacted: true, status: terminalStatus, _dedup: "v4-terminal-already-compacted" });
+        return res.json({ ok: true, item: null, alreadyCompacted: true, terminal: true, status: terminalStatus, code: "TERMINAL_DELIVERY_NOT_FOUND" });
       }
-      const updated = await prisma.automationDelivery.update({ where: { id: existing.id }, data: updateData });
-      const templateIdForStat = cleanString(req.body?.templateId || req.body?.bumpId || deliveryTemplateId(updated) || data.contentCollectionId, 100) || "";
+      const final = await markAutomationDeliveryTerminal({ req, creatorId, row: existing, status: terminalStatus, input: req.body || {}, source: "delivery_upsert_terminal" });
+      return res.json({ ...final, _dedup: "v19.34-terminal-tombstone" });
+    }
+
+    const item = await saveAutomationDeliveryIdempotent({
+      agencyId: req.auth.agencyId,
+      creatorId,
+      id,
+      messageId: data.messageId,
+      data,
+      updateData,
+    });
+
+    if (item && !AUTOMATION_TERMINAL_ROW_STATUSES.has(bumpStatStatus(item.status || ""))) {
       await upsertBumpFanState({
-        agencyId: req.auth.agencyId, creatorId, fanId: updated.fanId, dialogId: updated.dialogId || updated.fanId,
-        templateId: templateIdForStat, status: terminalStatus, sentAt: updated.sentAt,
-        finalizedAt: req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || new Date().toISOString(),
-        messageId: updated.messageId,
+        agencyId: req.auth.agencyId, creatorId, fanId: item.fanId, dialogId: item.dialogId || item.fanId,
+        templateId: deliveryTemplateId(item), status: item.status || "sent", sentAt: item.sentAt, messageId: item.messageId,
         replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
         sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
         sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
       }).catch(() => null);
-      const day = cleanString(req.body?.day, 10) || (updated.sentAt ? updated.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
-      const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId: templateIdForStat, day, event: terminalStatus, by: 1 });
-      await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
-      return res.json({ ok: true, item: null, compacted: true, status: terminalStatus, stat, _dedup: "v4-terminal-server-counted" });
     }
-
-    let item;
-    if (id) {
-      // v19.33.9: avoid Prisma upsert(create) for user/server supplied IDs.
-      // In Neon/Prisma this sometimes throws P2016 "Expected a valid parent ID"
-      // when the row is missing and the model has required parent relations.
-      // Explicit find -> update/create is slower but deterministic.
-      const existingById = await prisma.automationDelivery.findUnique({
-        where: { id },
-        select: { id: true, agencyId: true, creatorId: true },
-      }).catch(() => null);
-      if (existingById?.id) {
-        if (existingById.agencyId !== req.auth.agencyId || existingById.creatorId !== creatorId) {
-          return res.status(409).json({ ok: false, code: "DELIVERY_ID_CONFLICT", error: "delivery id belongs to another creator" });
-        }
-        item = await prisma.automationDelivery.update({ where: { id: existingById.id }, data: updateData });
-      } else {
-        item = await prisma.automationDelivery.create({ data: { ...data, id } });
-      }
-    } else if (data.messageId) {
-      const existing = await prisma.automationDelivery.findFirst({
-        where: { agencyId: req.auth.agencyId, creatorId, messageId: data.messageId },
-        select: { id: true },
-      });
-      item = existing
-        ? await prisma.automationDelivery.update({ where: { id: existing.id }, data: updateData })
-        : await prisma.automationDelivery.create({ data });
-    } else {
-      item = await prisma.automationDelivery.create({ data });
-    }
-
-    await upsertBumpFanState({
-      agencyId: req.auth.agencyId, creatorId, fanId: item.fanId, dialogId: item.dialogId || item.fanId,
-      templateId: deliveryTemplateId(item), status: item.status || "sent", sentAt: item.sentAt, messageId: item.messageId,
-      replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
-      sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
-      sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
-    }).catch(() => null);
-    return res.json({ ok: true, item: mapAutomationDelivery(item), _dedup: "v5-messageId-pending-claimable-fanstate" });
+    return res.json({ ok: true, item: mapAutomationDelivery(item), _dedup: "v19.34-state-machine-idempotent" });
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_UPSERT_FAILED"); }
 });
 
@@ -912,12 +1169,100 @@ router.post("/deliveries/online-send-result", async (req, res) => {
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const id = cleanString(req.body?.id || req.body?.deliveryId || req.body?.serverDeliveryId, 120);
     if (!id) return res.status(400).json({ ok: false, code: "ONLINE_QUEUE_ID_MISSING", error: "delivery id is required" });
-    const row = await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "online_queued", "send_reserved"] } } });
+
+    const row = await prisma.automationDelivery.findFirst({
+      where: { id, agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "online_queued", "send_reserved", "pending_reply", "failed", "skipped"] } },
+    });
     if (!row) return res.json({ ok: true, alreadyDone: true, item: null, code: "ONLINE_QUEUE_ROW_NOT_FOUND" });
+
     const status = cleanString(req.body?.status || (req.body?.ok === false ? "failed" : "done"), 40) || "done";
-    const meta = jsonObject({ ...deliveryMeta(row), ...(req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {}), finalStatus: status, finalizedAt: new Date().toISOString(), workerDeviceId: req.body?.deviceId || row.claimedByDeviceId || null });
-    await prisma.automationDelivery.delete({ where: { id: row.id } }).catch(() => null);
-    return res.json({ ok: true, compacted: true, status, item: null, deliveryId: row.id, result: meta });
+    const now = new Date();
+    const inputResult = req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {};
+    const resultItem = inputResult.item && typeof inputResult.item === "object" && !Array.isArray(inputResult.item) ? inputResult.item : {};
+    const responseData = inputResult.data && typeof inputResult.data === "object" && !Array.isArray(inputResult.data) ? inputResult.data : {};
+    const messageId = cleanString(req.body?.messageId || resultItem.messageId || inputResult.messageId || responseData.id || responseData.messageId, 100);
+    const sentAt = parseDate(req.body?.sentAt || resultItem.sentAt || inputResult.sentAt || responseData.createdAt) || row.sentAt || now;
+    const cancelAt = parseDate(req.body?.cancelAt || resultItem.cancelAt || inputResult.cancelAt) || row.cancelAt || null;
+    const meta = jsonObject({
+      ...deliveryMeta(row),
+      ...inputResult,
+      sendResultStatus: status,
+      lastSendResultAt: now.toISOString(),
+      workerDeviceId: req.body?.deviceId || row.claimedByDeviceId || null,
+      messageId: messageId || row.messageId || null,
+      lifecycle: status === "done" ? "waiting_reply" : "active",
+    });
+
+    if (status === "done") {
+      if (!messageId && !row.messageId) {
+        // Do not create a pending_reply that cannot ever be cancelled/checked.
+        // Requeue with a short delay and explicit error instead.
+        const nextAt = new Date(now.getTime() + 120 * 1000);
+        const updated = await prisma.automationDelivery.updateMany({
+          where: { id: row.id, agencyId: req.auth.agencyId, creatorId },
+          data: {
+            status: "online_queued",
+            scheduledAt: nextAt,
+            sentAt: null,
+            claimedByDeviceId: null,
+            claimedAt: null,
+            claimUntil: null,
+            lastCheckedAt: now,
+            result: jsonObject({ ...meta, sendResultProblem: "missing_message_id", retryAt: nextAt.toISOString() }),
+            error: "online send returned done without messageId; returned to queue",
+          },
+        });
+        const item = updated.count > 0 ? await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null) : null;
+        return res.json({ ok: true, repaired: true, requeued: true, status: "online_queued", item: item ? mapAutomationDelivery(item) : null, code: "ONLINE_SEND_DONE_WITHOUT_MESSAGE_ID" });
+      }
+
+      const updated = await prisma.automationDelivery.updateMany({
+        where: { id: row.id, agencyId: req.auth.agencyId, creatorId },
+        data: {
+          status: "pending_reply",
+          messageId: messageId || row.messageId,
+          sentAt,
+          cancelAt,
+          claimedByDeviceId: null,
+          claimedAt: null,
+          claimUntil: null,
+          lastCheckedAt: now,
+          result: meta,
+          error: null,
+        },
+      });
+      const item = updated.count > 0 ? await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null) : null;
+      return res.json({ ok: true, compacted: false, status: "pending_reply", item: item ? mapAutomationDelivery(item) : null, deliveryId: row.id, result: meta });
+    }
+
+    if (status === "skipped") {
+      const final = await markAutomationDeliveryTerminal({ req, creatorId, row, status: "skipped", input: { ...(req.body || {}), result: meta }, source: "online_send_result_skipped" });
+      return res.json({ ...final, deliveryId: row.id });
+    }
+
+    const attempts = Math.max(0, Number(row.attempts || 0));
+    const maxAttempts = Math.max(1, Math.min(50, Number(row.maxAttempts || 5)));
+    if (attempts >= maxAttempts) {
+      const final = await markAutomationDeliveryTerminal({ req, creatorId, row, status: "failed", input: { ...(req.body || {}), result: meta }, source: "online_send_result_max_attempts" });
+      return res.json({ ...final, deliveryId: row.id, maxAttemptsReached: true });
+    }
+
+    const retryAt = new Date(now.getTime() + Math.min(15 * 60 * 1000, Math.max(30 * 1000, attempts * 60 * 1000)));
+    const updated = await prisma.automationDelivery.updateMany({
+      where: { id: row.id, agencyId: req.auth.agencyId, creatorId },
+      data: {
+        status: "online_queued",
+        scheduledAt: retryAt,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        lastCheckedAt: now,
+        result: jsonObject({ ...meta, retryAt: retryAt.toISOString(), retryReason: status || "failed" }),
+        error: optionalString(req.body?.error || inputResult.error || inputResult.code || "online send failed; returned to queue", 2000),
+      },
+    });
+    const item = updated.count > 0 ? await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null) : null;
+    return res.json({ ok: true, compacted: false, requeued: true, status: "online_queued", retryAt: retryAt.toISOString(), item: item ? mapAutomationDelivery(item) : null, deliveryId: row.id, result: meta });
   } catch (err) { return sendError(res, err, "BUMP_ONLINE_RESULT_FAILED"); }
 });
 
@@ -975,10 +1320,14 @@ router.post("/deliveries/claim-cancel", async (req, res) => {
       const maxAttempts = Math.max(1, Math.min(50, Number(candidate.maxAttempts || 5)));
       const attempts = Math.max(0, Number(candidate.attempts || 0));
       if (attempts >= maxAttempts) {
-        const templateId = deliveryTemplateId(candidate);
-        const day = candidate.sentAt ? candidate.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-        await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: "failed", by: 1 }).catch(() => null);
-        await prisma.automationDelivery.delete({ where: { id: candidate.id } }).catch(() => null);
+        await markAutomationDeliveryTerminal({
+          req,
+          creatorId,
+          row: candidate,
+          status: "failed",
+          input: { result: { reason: "cancel_max_attempts", attempts, maxAttempts }, failedAt: now.toISOString() },
+          source: "cancel_claim_max_attempts",
+        }).catch(() => null);
         skippedMaxAttempts.push(candidate.id);
         continue;
       }
@@ -1016,7 +1365,7 @@ router.post("/deliveries/cancel-result", async (req, res) => {
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const existing = await findAutomationDeliveryForResult({ agencyId: req.auth.agencyId, creatorId, input: req.body || {} });
     if (!existing) {
-      return res.json({ ok: true, alreadyCompacted: true, item: null, code: "DELIVERY_NOT_FOUND_OR_ALREADY_COMPACTED" });
+      return res.json({ ok: true, alreadyCompacted: true, item: null, code: "DELIVERY_NOT_FOUND_OR_ALREADY_TERMINAL" });
     }
 
     const status = bumpStatStatus(req.body?.status || (req.body?.ok === false ? "failed" : "canceled"));
@@ -1034,26 +1383,14 @@ router.post("/deliveries/cancel-result", async (req, res) => {
     });
 
     if (BUMP_TERMINAL_DELIVERY_STATUSES.has(status)) {
-      const templateId = cleanString(req.body?.templateId || req.body?.bumpId || deliveryTemplateId(existing), 100) || "";
-      const day = cleanString(req.body?.day, 10) || (existing.sentAt ? existing.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
-      await upsertBumpFanState({
-        agencyId: req.auth.agencyId, creatorId, fanId: existing.fanId, dialogId: existing.dialogId || existing.fanId,
-        templateId, status, sentAt: existing.sentAt,
-        finalizedAt: req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || now.toISOString(),
-        messageId: existing.messageId,
-        replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
-        sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
-        sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
-      }).catch(() => null);
-      const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: status, by: 1 });
-      await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
-      return res.json({ ok: true, compacted: true, status, item: null, stat, deliveryId: existing.id, templateId });
+      const final = await markAutomationDeliveryTerminal({ req, creatorId, row: existing, status, input: { ...(req.body || {}), result: mergedResult }, source: "cancel_result_terminal" });
+      return res.json({ ...final, deliveryId: existing.id, templateId: deliveryTemplateId(existing) });
     }
 
     // Non-terminal result means transient failure / release lease back into queue.
     const nextStatus = status === "cancel_claimed" ? "cancel_claimed" : "pending_reply";
-    const item = await prisma.automationDelivery.update({
-      where: { id: existing.id },
+    const updated = await prisma.automationDelivery.updateMany({
+      where: { id: existing.id, agencyId: req.auth.agencyId, creatorId },
       data: {
         status: nextStatus,
         claimedByDeviceId: nextStatus === "cancel_claimed" ? existing.claimedByDeviceId : null,
@@ -1064,13 +1401,11 @@ router.post("/deliveries/cancel-result", async (req, res) => {
         error: optionalString(req.body?.error || req.body?.lastError || null, 2000),
       },
     });
-    return res.json({ ok: true, compacted: false, item: mapAutomationDelivery(item), released: nextStatus === "pending_reply" });
+    const item = updated.count > 0 ? await prisma.automationDelivery.findUnique({ where: { id: existing.id } }).catch(() => null) : null;
+    return res.json({ ok: true, compacted: false, item: item ? mapAutomationDelivery(item) : null, released: nextStatus === "pending_reply" });
   } catch (err) { return sendError(res, err, "BUMP_CANCEL_RESULT_FAILED"); }
 });
 
-
-
-// ─── Hidden Online server scan queue v19.32.1 ─────────────────────────────
 // Hidden online is intentionally server-owned: desktop workers only claim scan
 // chunks and upload compact candidate rows. We keep one mutable row per fan in
 // HiddenOnlineUser and reuse AutomationDelivery as the distributed job/queue
@@ -1219,30 +1554,34 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
       enqueuedAt: now.toISOString(),
       lastError: null,
     });
-    const item = await prisma.automationDelivery.upsert({
-      where: { id },
-      create: {
-        id,
-        agencyId: req.auth.agencyId,
-        creatorId,
-        fanId: "__hidden_scan__",
-        trigger: "hidden_online_scan",
-        status: "hidden_scan_queued",
-        scheduledAt: now,
-        maxAttempts: 100000,
-        result: state,
-        createdByUserId: req.auth.userId || null,
-      },
-      update: {
-        status: "hidden_scan_queued",
-        scheduledAt: now,
-        claimedByDeviceId: null,
-        claimedAt: null,
-        claimUntil: null,
-        error: null,
-        result: state,
-      },
+    const hiddenScanData = {
+      id,
+      agencyId: req.auth.agencyId,
+      creatorId,
+      fanId: "__hidden_scan__",
+      trigger: "hidden_online_scan",
+      status: "hidden_scan_queued",
+      scheduledAt: now,
+      maxAttempts: 100000,
+      result: state,
+      createdByUserId: req.auth.userId || null,
+    };
+    const hiddenScanUpdate = {
+      status: "hidden_scan_queued",
+      scheduledAt: now,
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      error: null,
+      result: state,
+    };
+    const updatedScan = await prisma.automationDelivery.updateMany({
+      where: { id, agencyId: req.auth.agencyId, creatorId },
+      data: hiddenScanUpdate,
     });
+    const item = updatedScan.count > 0
+      ? await prisma.automationDelivery.findUnique({ where: { id } })
+      : await createAutomationDeliverySafe(hiddenScanData);
     return res.json({ ok: true, creatorId, queued: true, item: mapAutomationDelivery(item), scanState: hiddenScanState(item) });
   } catch (err) { return sendError(res, err, "HIDDEN_SCAN_ENQUEUE_FAILED"); }
 });
@@ -1269,10 +1608,12 @@ router.post("/hidden-online/scan-jobs/claim", async (req, res) => {
       const next = await prisma.automationDelivery.findFirst({ where: { agencyId: req.auth.agencyId, creatorId, trigger: "hidden_online_scan" }, orderBy: { scheduledAt: "asc" } });
       return res.json({ ok: true, creatorId, count: 0, items: [], item: null, nextScanAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null });
     }
-    const updated = await prisma.automationDelivery.update({
-      where: { id: row.id },
+    const claimed = await prisma.automationDelivery.updateMany({
+      where: { id: row.id, agencyId: req.auth.agencyId, creatorId, status: "hidden_scan_queued" },
       data: { status: "hidden_scan_claimed", claimedByDeviceId: deviceId, claimedAt: now, claimUntil, lastCheckedAt: now, attempts: { increment: 1 }, error: null },
     });
+    if (claimed.count <= 0) return res.json({ ok: true, creatorId, count: 0, items: [], item: null, code: "HIDDEN_SCAN_CLAIM_RACE_LOST" });
+    const updated = await prisma.automationDelivery.findUnique({ where: { id: row.id } });
     return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updated), items: [mapAutomationDelivery(updated)], scanState: hiddenScanState(updated), claimUntil });
   } catch (err) { return sendError(res, err, "HIDDEN_SCAN_CLAIM_FAILED"); }
 });
@@ -1333,8 +1674,8 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       finishedAt: done ? now.toISOString() : prev.finishedAt || null,
       lastError: errorText || null,
     });
-    const item = await prisma.automationDelivery.update({
-      where: { id: row.id },
+    const progressed = await prisma.automationDelivery.updateMany({
+      where: { id: row.id, agencyId: req.auth.agencyId, creatorId, trigger: "hidden_online_scan" },
       data: {
         status: done ? "hidden_scan_done" : "hidden_scan_queued",
         scheduledAt: nextScheduledAt,
@@ -1346,8 +1687,9 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
         error: req.body?.error ? optionalString(req.body.error, 2000) : null,
       },
     });
+    const item = progressed.count > 0 ? await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null) : null;
     const counts = await prisma.hiddenOnlineUser.groupBy({ by: ["status"], where: { agencyId: req.auth.agencyId, creatorId }, _count: { _all: true } }).catch(() => []);
-    return res.json({ ok: true, creatorId, item: mapAutomationDelivery(item), scanState: hiddenScanState(item), upsert, counts, nextScanAt: nextScheduledAt.toISOString() });
+    return res.json({ ok: true, creatorId, item: item ? mapAutomationDelivery(item) : null, scanState: hiddenScanState(item), upsert, counts, nextScanAt: nextScheduledAt.toISOString(), raceLost: progressed.count <= 0 });
   } catch (err) { return sendError(res, err, "HIDDEN_SCAN_PROGRESS_FAILED"); }
 });
 
