@@ -829,9 +829,31 @@ router.post("/deliveries/claim-online-send", async (req, res) => {
     const now = new Date();
     const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
 
+    // v19.33.7: repair stale online send reservations before claiming.
+    // Older desktop builds could create `send_reserved` rows with no claimUntil
+    // (legacy realtime reservation fallback). Those rows never expired and fell
+    // out of the normal claim flow forever. Treat every expired/null lease on
+    // online_claimed/send_reserved as retryable queue work.
     await prisma.automationDelivery.updateMany({
-      where: { agencyId: req.auth.agencyId, creatorId, status: "online_claimed", OR: [{ claimUntil: { lt: now } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
-      data: { status: "online_queued", claimedByDeviceId: null, claimedAt: null, claimUntil: null, error: "online claim expired; returned to queue" },
+      where: {
+        agencyId: req.auth.agencyId,
+        creatorId,
+        status: { in: ["online_claimed", "send_reserved"] },
+        OR: [
+          { claimUntil: { lt: now } },
+          { claimUntil: null },
+        ],
+      },
+      data: {
+        status: "online_queued",
+        sentAt: null,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        lastCheckedAt: now,
+        scheduledAt: now,
+        error: "stale online/send reservation repaired; returned to queue",
+      },
     }).catch(() => null);
 
     // v19.33.4: a backlog of hiddenOnlineSignal rows must not keep fresh
@@ -875,7 +897,7 @@ router.post("/deliveries/online-send-result", async (req, res) => {
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const id = cleanString(req.body?.id || req.body?.deliveryId || req.body?.serverDeliveryId, 120);
     if (!id) return res.status(400).json({ ok: false, code: "ONLINE_QUEUE_ID_MISSING", error: "delivery id is required" });
-    const row = await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "online_queued"] } } });
+    const row = await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "online_queued", "send_reserved"] } } });
     if (!row) return res.json({ ok: true, alreadyDone: true, item: null, code: "ONLINE_QUEUE_ROW_NOT_FOUND" });
     const status = cleanString(req.body?.status || (req.body?.ok === false ? "failed" : "done"), 40) || "done";
     const meta = jsonObject({ ...deliveryMeta(row), ...(req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {}), finalStatus: status, finalizedAt: new Date().toISOString(), workerDeviceId: req.body?.deviceId || row.claimedByDeviceId || null });
@@ -1278,9 +1300,18 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       hasMore,
       status: stateStatus,
       workerStatus,
-      pausedForPriority: pauseForPriority || undefined,
+      serverStatus: done ? "hidden_scan_done" : "hidden_scan_queued",
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      // Do not keep a stale `local_bump_queue` pause reason after the page
+      // finished. The UI used that stale reason to show a fake waiting-worker
+      // state even while the scheduler was correctly processing scan pages.
+      pauseReason: pauseForPriority ? "local_bump_queue" : null,
+      pausedForPriority: pauseForPriority || false,
       backoffMs: backoffMs || undefined,
       nextPageAt: done ? null : nextScheduledAt.toISOString(),
+      nextScanAt: done ? nextScheduledAt.toISOString() : null,
       lastPageAt: now.toISOString(),
       finishedAt: done ? now.toISOString() : prev.finishedAt || null,
       lastError: errorText || null,
