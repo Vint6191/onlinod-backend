@@ -1257,6 +1257,16 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const done = req.body?.done === true || hasMore === false;
     const scanEveryDays = Math.max(1, Math.min(30, positiveInt(req.body?.scanEveryDays || prev.scanEveryDays, 7)));
     const nextOffset = Math.max(0, Number(req.body?.nextOffset ?? prev.nextOffset ?? 0) || 0);
+    const errorText = cleanString(req.body?.error || "", 2000);
+    const pauseForPriority = req.body?.pauseForPriority === true;
+    const requestedBackoffMs = Math.max(0, Math.min(24 * 60 * 60 * 1000, Number(req.body?.backoffMs || req.body?.priorityPauseMs || 0) || 0));
+    const authBackoffMs = errorText && /invalid|expired|access token|auth|unauthorized|forbidden/i.test(errorText) ? 10 * 60 * 1000 : 0;
+    const backoffMs = done ? 0 : Math.max(requestedBackoffMs, authBackoffMs, pauseForPriority ? 45 * 1000 : 0);
+    const stateStatus = done ? "done" : (backoffMs > 0 ? "cooldown" : "queued");
+    const workerStatus = cleanString(req.body?.workerStatus || (pauseForPriority ? "paused_for_bumps" : (errorText ? "error_backoff" : "queued")), 80);
+    const nextScheduledAt = done
+      ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000)
+      : new Date(now.getTime() + (backoffMs > 0 ? backoffMs : 1000));
     const state = jsonObject({
       ...prev,
       scanned,
@@ -1266,12 +1276,15 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       pages,
       nextOffset,
       hasMore,
-      status: done ? "done" : "queued",
+      status: stateStatus,
+      workerStatus,
+      pausedForPriority: pauseForPriority || undefined,
+      backoffMs: backoffMs || undefined,
+      nextPageAt: done ? null : nextScheduledAt.toISOString(),
       lastPageAt: now.toISOString(),
       finishedAt: done ? now.toISOString() : prev.finishedAt || null,
-      lastError: req.body?.error || null,
+      lastError: errorText || null,
     });
-    const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 1000);
     const item = await prisma.automationDelivery.update({
       where: { id: row.id },
       data: {
