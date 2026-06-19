@@ -54,34 +54,6 @@ router.delete("/tasks/:id", requireSeniorAutomationWriter, async (req, res) => {
 // the same shape expected by the Electron Automation UI/cache.
 router.get("/bumps", async (req, res) => { try { const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100); return res.json(await automationServer.listBumps({ agencyId: req.auth.agencyId, creatorId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_FAILED"); } });
 router.post("/bumps/gc", async (req, res) => { try { const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100); return res.json(await automationServer.gcExpiredBumps({ agencyId: req.auth.agencyId, creatorId })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_GC_FAILED"); } });
-
-router.get("/bump-safety", async (req, res) => {
-  try {
-    const creatorId = cleanString(req.query?.creatorId || req.query?.accountId || req.body?.creatorId || req.body?.accountId, 100);
-    await requireCreator(prisma, req.auth.agencyId, creatorId);
-    const item = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
-    return res.json({ ok: true, creatorId, item, globalSafety: item, ...item });
-  } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAFETY_GET_FAILED"); }
-});
-
-router.put("/bump-safety", requireSeniorAutomationWriter, async (req, res) => {
-  try {
-    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
-    await requireCreator(prisma, req.auth.agencyId, creatorId);
-    const item = await saveBumpSafety({ agencyId: req.auth.agencyId, creatorId, userId: req.auth.userId, input: req.body || {} });
-    return res.json({ ok: true, creatorId, item, globalSafety: item, ...item });
-  } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAFETY_SAVE_FAILED"); }
-});
-
-router.post("/bump-safety", requireSeniorAutomationWriter, async (req, res) => {
-  try {
-    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
-    await requireCreator(prisma, req.auth.agencyId, creatorId);
-    const item = await saveBumpSafety({ agencyId: req.auth.agencyId, creatorId, userId: req.auth.userId, input: req.body || {} });
-    return res.json({ ok: true, creatorId, item, globalSafety: item, ...item });
-  } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAFETY_SAVE_FAILED"); }
-});
-
 router.get("/bumps/:accountId", async (req, res) => { try { return res.json(await automationServer.listBumps({ agencyId: req.auth.agencyId, creatorId: cleanString(req.params.accountId, 100), query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMPS_FAILED"); } });
 router.post("/bumps/upsert", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.body?.creatorId, 100); return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAVE_FAILED"); } });
 router.post("/bumps/:accountId/upsert", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.saveBump({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId: cleanString(req.params.accountId, 100), input: { ...(req.body || {}), accountId: req.params.accountId } })); } catch (err) { return sendError(res, err, "AUTOMATION_BUMP_SAVE_FAILED"); } });
@@ -107,7 +79,6 @@ function parseDate(value) {
 }
 
 const BUMP_TERMINAL_DELIVERY_STATUSES = new Set(["replied", "canceled", "expired", "failed", "skipped"]);
-const BUMP_SENT_ACTIVE_STATUSES = new Set(["sent", "pending_reply", "checking_reply", "cancel_claimed"]);
 
 function bumpStatStatus(status) {
   const s = cleanString(status, 40).toLowerCase();
@@ -163,6 +134,30 @@ function deliveryTemplateId(item = {}) {
 function deliveryCancelAt(item = {}) {
   const meta = deliveryMeta(item);
   return item.cancelAt || meta.cancelAt || null;
+}
+
+function automationDeliveryTriggerPriority(row = {}) {
+  const raw = String(row.trigger || row.eventType || row.triggerKey || "").trim();
+  const lower = raw.toLowerCase();
+  // v19.33.4 business order: once due, online is the hottest action.
+  // scheduledAt still controls the configured online delay; this priority only
+  // decides among rows that are already due.
+  if (raw === "fanOnline" || lower.includes("online") || lower.includes("presence")) return 0;
+  if (raw === "fanSubscribed" || lower.includes("subscrib") || lower.includes("new_sub")) return 10;
+  if (raw === "fanLikedPost" || lower.includes("liked") || lower.includes("post_like") || lower.includes("favorite")) return 20;
+  if (raw === "hiddenOnlineSignal" || lower.includes("hidden")) return 50;
+  return 80;
+}
+
+function automationDeliveryTimeMs(value) {
+  const t = new Date(value || 0).getTime();
+  return Number.isFinite(t) ? t : 0;
+}
+
+function sortAutomationSendCandidates(a, b) {
+  return (automationDeliveryTriggerPriority(a) - automationDeliveryTriggerPriority(b))
+    || (automationDeliveryTimeMs(a.scheduledAt) - automationDeliveryTimeMs(b.scheduledAt))
+    || (automationDeliveryTimeMs(a.createdAt) - automationDeliveryTimeMs(b.createdAt));
 }
 
 function mapAutomationDelivery(item = {}) {
@@ -374,77 +369,6 @@ async function incrementBumpDeliveryStat({ agencyId, creatorId, templateId = "",
   return { item, taskStats };
 }
 
-
-function deliverySentStatAlreadyCounted(row = {}) {
-  const meta = deliveryMeta(row);
-  if (meta.sentStatCounted === true || meta.serverSentStatCounted === true) return true;
-  if (meta.statCounted === true || meta.statCounted === "sent") return true;
-  const events = meta.statEvents && typeof meta.statEvents === "object" && !Array.isArray(meta.statEvents) ? meta.statEvents : null;
-  return events?.sent === true;
-}
-
-function shouldCountDeliveryAsSent(row = {}) {
-  if (!row?.id) return false;
-  const status = bumpStatStatus(row.status || "");
-  if (!BUMP_SENT_ACTIVE_STATUSES.has(status) && !BUMP_TERMINAL_DELIVERY_STATUSES.has(status)) return false;
-  if (!row.sentAt && !row.messageId) return false;
-  const templateId = deliveryTemplateId(row);
-  if (!templateId) return false;
-  return !deliverySentStatAlreadyCounted(row);
-}
-
-async function ensureBumpSentStatCounted({ agencyId, creatorId, row, templateId = null, source = "server_delivery_upsert" } = {}) {
-  if (!agencyId || !creatorId || !row?.id || !shouldCountDeliveryAsSent(row)) return null;
-  const tid = cleanString(templateId || deliveryTemplateId(row), 100) || "";
-  if (!tid) return null;
-  const day = row.sentAt ? row.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-  const stat = await incrementBumpDeliveryStat({ agencyId, creatorId, templateId: tid, day, event: "sent", by: 1 });
-  const meta = deliveryMeta(row);
-  await prisma.automationDelivery.update({
-    where: { id: row.id },
-    data: {
-      result: jsonObject({
-        ...meta,
-        sentStatCounted: true,
-        serverSentStatCounted: true,
-        sentStatCountedAt: new Date().toISOString(),
-        sentStatSource: source,
-        statEvents: { ...(meta.statEvents && typeof meta.statEvents === "object" && !Array.isArray(meta.statEvents) ? meta.statEvents : {}), sent: true },
-      }),
-    },
-  }).catch(() => null);
-  return stat;
-}
-
-function liveSentStatDay(row = {}) {
-  const d = row?.sentAt || row?.createdAt || null;
-  return d instanceof Date && Number.isFinite(d.getTime()) ? d.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
-}
-
-async function loadUncountedLiveSentRows({ agencyId, creatorId = null, fromDay = null, toDay = null, templateIds = null, limit = 10000 } = {}) {
-  const where = {
-    agencyId,
-    status: { in: Array.from(BUMP_SENT_ACTIVE_STATUSES) },
-    OR: [{ messageId: { not: null } }, { sentAt: { not: null } }],
-  };
-  const cid = cleanString(creatorId, 100);
-  if (cid) where.creatorId = cid;
-  const tids = Array.isArray(templateIds) ? templateIds.map((x) => cleanString(x, 100)).filter(Boolean) : [];
-  if (tids.length) where.contentCollectionId = { in: tids };
-  if (fromDay || toDay) {
-    where.sentAt = {};
-    if (fromDay) where.sentAt.gte = new Date(`${fromDay}T00:00:00.000Z`);
-    if (toDay) where.sentAt.lte = new Date(`${toDay}T23:59:59.999Z`);
-  }
-  const rows = await prisma.automationDelivery.findMany({
-    where,
-    select: { id: true, agencyId: true, creatorId: true, contentCollectionId: true, status: true, sentAt: true, createdAt: true, messageId: true, result: true },
-    orderBy: { sentAt: "desc" },
-    take: Math.max(1, Math.min(50000, positiveInt(limit, 10000))),
-  }).catch(() => []);
-  return (rows || []).filter((row) => shouldCountDeliveryAsSent(row));
-}
-
 async function findAutomationDeliveryForResult({ agencyId, creatorId, input = {} }) {
   const id = cleanString(input.id || input.deliveryId || input.serverDeliveryId, 120);
   const messageId = cleanString(input.messageId, 100);
@@ -504,122 +428,15 @@ function onlineQueueFanIds(value) {
 }
 
 function onlineSpacingRange(input = {}) {
-  const min = Math.max(3, Math.min(3600, positiveInt(input.minFanSpacingSec ?? input.onlineFanSpacingSec ?? input.batchSpacingSec, 3)));
-  const rawMax = positiveInt(input.maxFanSpacingSec ?? input.onlineFanMaxSpacingSec ?? input.batchMaxSpacingSec, 10);
-  const max = Math.max(min, Math.min(3600, rawMax || 10));
+  const min = Math.max(15, Math.min(3600, positiveInt(input.minFanSpacingSec ?? input.onlineFanSpacingSec ?? input.batchSpacingSec, 15)));
+  const rawMax = positiveInt(input.maxFanSpacingSec ?? input.onlineFanMaxSpacingSec ?? input.batchMaxSpacingSec, 30);
+  const max = Math.max(min, Math.min(3600, rawMax || 30));
   return { min, max };
 }
 
-
-const DEFAULT_BUMP_GLOBAL_SAFETY = Object.freeze({
-  replyCooldownHours: 24,
-  sentCooldownHours: 6,
-  minFanSpacingSec: 3,
-  maxFanSpacingSec: 10,
-  maxActiveHiddenQueued: 30,
-  hiddenRefillSize: 10,
-  // Hidden Online has its own lifecycle. These are global per-creator rules,
-  // not per-template, so studios can tune 2k+ hidden fans without editing every bump.
-  hiddenReplyTimeoutHours: 6,
-  hiddenRetryAfterNoReplyHours: 12,
-});
-
-function bumpSafetyClientId(creatorId) {
-  return `bump_safety:${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 90)}`;
-}
-
-function normalizeBumpSafety(input = {}) {
-  const src = input && typeof input === "object" && !Array.isArray(input) ? input : {};
-  const replyCooldownHours = Math.max(0, Math.min(2160, Number(src.replyCooldownHours ?? src.fanReplyCooldownHours ?? src.afterReplyCooldownHours ?? DEFAULT_BUMP_GLOBAL_SAFETY.replyCooldownHours) || 0));
-  const sentCooldownHours = Math.max(0, Math.min(720, Number(src.sentCooldownHours ?? src.fanSentCooldownHours ?? src.afterSendCooldownHours ?? DEFAULT_BUMP_GLOBAL_SAFETY.sentCooldownHours) || 0));
-  const minFanSpacingSec = Math.max(3, Math.min(3600, positiveInt(src.minFanSpacingSec ?? src.onlineFanSpacingSec ?? src.batchSpacingSec ?? src.eventSendIntervalMinSec, DEFAULT_BUMP_GLOBAL_SAFETY.minFanSpacingSec)));
-  const rawMax = positiveInt(src.maxFanSpacingSec ?? src.onlineFanMaxSpacingSec ?? src.batchMaxSpacingSec ?? src.eventSendIntervalMaxSec, DEFAULT_BUMP_GLOBAL_SAFETY.maxFanSpacingSec);
-  const maxFanSpacingSec = Math.max(minFanSpacingSec, Math.min(3600, rawMax || DEFAULT_BUMP_GLOBAL_SAFETY.maxFanSpacingSec));
-  const maxActiveHiddenQueued = Math.max(1, Math.min(500, positiveInt(src.maxActiveHiddenQueued ?? src.hiddenMaxActiveQueued ?? src.hiddenQueueCap, DEFAULT_BUMP_GLOBAL_SAFETY.maxActiveHiddenQueued)));
-  const hiddenRefillSize = Math.max(1, Math.min(maxActiveHiddenQueued, positiveInt(src.hiddenRefillSize ?? src.hiddenRefill ?? src.hiddenQueueRefill, DEFAULT_BUMP_GLOBAL_SAFETY.hiddenRefillSize)));
-  const hiddenReplyTimeoutHours = Math.max(1, Math.min(72, Number(
-    src.hiddenReplyTimeoutHours ??
-    src.hiddenDeleteAfterNoReplyHours ??
-    src.hiddenNoReplyDeleteAfterHours ??
-    src.hiddenDeleteAfterHours ??
-    DEFAULT_BUMP_GLOBAL_SAFETY.hiddenReplyTimeoutHours
-  ) || DEFAULT_BUMP_GLOBAL_SAFETY.hiddenReplyTimeoutHours));
-  const hiddenRetryAfterNoReplyHours = Math.max(1, Math.min(720, Number(
-    src.hiddenRetryAfterNoReplyHours ??
-    src.hiddenNoReplyRetryHours ??
-    src.hiddenRetryHours ??
-    src.hiddenCadenceHours ??
-    DEFAULT_BUMP_GLOBAL_SAFETY.hiddenRetryAfterNoReplyHours
-  ) || DEFAULT_BUMP_GLOBAL_SAFETY.hiddenRetryAfterNoReplyHours));
-  return {
-    replyCooldownHours,
-    sentCooldownHours,
-    minFanSpacingSec,
-    maxFanSpacingSec,
-    maxActiveHiddenQueued,
-    hiddenRefillSize,
-    hiddenReplyTimeoutHours,
-    hiddenDeleteAfterNoReplyHours: hiddenReplyTimeoutHours,
-    hiddenNoReplyDeleteAfterHours: hiddenReplyTimeoutHours,
-    hiddenRetryAfterNoReplyHours,
-    hiddenNoReplyRetryHours: hiddenRetryAfterNoReplyHours,
-    hiddenCadenceHours: hiddenRetryAfterNoReplyHours,
-    // Backward/diagnostic aliases used by DevTools checks and older UI code.
-    eventSendIntervalMinSec: minFanSpacingSec,
-    eventSendIntervalMaxSec: maxFanSpacingSec,
-    onlineFanSpacingSec: minFanSpacingSec,
-    onlineFanMaxSpacingSec: maxFanSpacingSec,
-    updatedAt: src.updatedAt || null,
-  };
-}
-
-async function readBumpSafety({ agencyId, creatorId }) {
-  const cid = cleanString(creatorId, 100);
-  if (!agencyId || !cid) return normalizeBumpSafety({});
-  const clientId = bumpSafetyClientId(cid);
-  const task = await prisma.automationTask.findFirst({
-    where: { agencyId, creatorId: cid, clientId, type: "bump_safety", deletedAt: null },
-    orderBy: { updatedAt: "desc" },
-  }).catch(() => null);
-  const src = task?.config && typeof task.config === "object" && !Array.isArray(task.config) ? task.config : {};
-  return normalizeBumpSafety({ ...src, updatedAt: task?.updatedAt ? task.updatedAt.toISOString() : src.updatedAt || null });
-}
-
-async function saveBumpSafety({ agencyId, creatorId, userId, input = {} }) {
-  const cid = cleanString(creatorId, 100);
-  if (!agencyId || !cid) throw new Error("CREATOR_ID_REQUIRED");
-  const safety = normalizeBumpSafety({ ...(input || {}), updatedAt: new Date().toISOString() });
-  const clientId = bumpSafetyClientId(cid);
-  const data = {
-    agencyId,
-    creatorId: cid,
-    clientId,
-    type: "bump_safety",
-    title: "Bump global safety",
-    enabled: true,
-    status: "active",
-    config: safety,
-    rules: safety,
-    schedule: {},
-    triggers: {},
-    stats: {},
-    metadata: { schemaVersion: 1, globalBumpSafety: true, updatedAt: safety.updatedAt },
-    updatedByUserId: userId || null,
-  };
-
-  const existing = await prisma.automationTask.findFirst({ where: { agencyId, clientId }, select: { id: true } }).catch(() => null);
-  let task;
-  if (existing?.id) {
-    task = await prisma.automationTask.update({ where: { id: existing.id }, data });
-  } else {
-    task = await prisma.automationTask.create({ data: { ...data, createdByUserId: userId || null } });
-  }
-  return normalizeBumpSafety({ ...(task.config || safety), updatedAt: task.updatedAt ? task.updatedAt.toISOString() : safety.updatedAt });
-}
-
 function randomOnlineSpacingMs(range = {}) {
-  const min = Math.max(3, Number(range.min) || 3);
-  const max = Math.max(min, Number(range.max) || 10);
+  const min = Math.max(15, Number(range.min) || 15);
+  const max = Math.max(min, Number(range.max) || 30);
   const sec = min + Math.floor(Math.random() * (max - min + 1));
   return sec * 1000;
 }
@@ -660,161 +477,7 @@ function onlineGateNextAllowed(row, now) {
   return Number.isFinite(t) && t > now.getTime() ? new Date(t) : now;
 }
 
-
-const BUMP_TRIGGER_PRIORITY = Object.freeze({
-  [BUMP_TRIGGER_KEYS.SUBSCRIBED]: 400,
-  [BUMP_TRIGGER_KEYS.LIKE]: 300,
-  [BUMP_TRIGGER_KEYS.ONLINE]: 200,
-  [BUMP_TRIGGER_KEYS.HIDDEN]: 100,
-});
-
-function bumpTriggerPriority(trigger) {
-  return BUMP_TRIGGER_PRIORITY[normalizeBumpTrigger(trigger)] || 0;
-}
-
-function deliveryTriggerPriority(row) {
-  const meta = deliveryMeta(row);
-  return bumpTriggerPriority(row?.trigger || meta.triggerKey || meta.trigger || meta.eventType);
-}
-
-function bySendPriority(a, b) {
-  const pa = deliveryTriggerPriority(a);
-  const pb = deliveryTriggerPriority(b);
-  if (pa !== pb) return pb - pa;
-  const sa = new Date(a?.scheduledAt || a?.createdAt || 0).getTime() || 0;
-  const sb = new Date(b?.scheduledAt || b?.createdAt || 0).getTime() || 0;
-  if (sa !== sb) return sa - sb;
-  const ca = new Date(a?.createdAt || 0).getTime() || 0;
-  const cb = new Date(b?.createdAt || 0).getTime() || 0;
-  return ca - cb;
-}
-
-function hiddenQueueCap(input = {}) {
-  return Math.max(1, Math.min(500, positiveInt(input.maxActiveHiddenQueued ?? input.hiddenMaxActiveQueued ?? input.hiddenQueueCap, 30)));
-}
-
-
-async function deferHiddenQueueOverflow(prisma, { agencyId, creatorId, cap = 30, now = new Date(), deferMs = 60 * 60 * 1000 } = {}) {
-  const maxActive = Math.max(1, Math.min(500, Number(cap) || 30));
-  const hiddenRows = await prisma.automationDelivery.findMany({
-    where: {
-      agencyId,
-      creatorId,
-      trigger: BUMP_TRIGGER_KEYS.HIDDEN,
-      status: "online_queued",
-    },
-    orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
-    select: { id: true },
-    take: Math.max(maxActive + 250, maxActive),
-  }).catch(() => []);
-
-  const overflow = hiddenRows.slice(maxActive).map((x) => x.id).filter(Boolean);
-  if (!overflow.length) return { deferred: 0, maxActive };
-
-  const deferredAt = new Date(now.getTime() + deferMs);
-  const updated = await prisma.automationDelivery.updateMany({
-    where: { id: { in: overflow }, agencyId, creatorId, status: "online_queued" },
-    data: {
-      scheduledAt: deferredAt,
-      error: "hidden queue overflow; deferred by cap",
-      result: { hiddenDeferredByCap: true, deferredAt: deferredAt.toISOString(), maxActiveHiddenQueued: maxActive },
-    },
-  }).catch(() => ({ count: 0 }));
-
-  return { deferred: updated.count || 0, maxActive };
-}
-
 const ONLINE_SEND_ACTIVE_STATUSES = ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
-
-// Hidden active cap is a SEND-PIPELINE cap, not a 6h reply-wait cap.
-// pending_reply/sent/checking_reply are already delivered and only wait for
-// reply/delete; counting them here blocks a single worker for hours.
-const HIDDEN_SEND_SLOT_STATUSES = ["online_queued", "online_claimed", "send_reserved"];
-
-const REALTIME_BLOCKING_STATUSES = ["online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
-
-function realtimeFanLockKey({ agencyId, creatorId, fanId }) {
-  return `bump_rt:${String(agencyId || "")}:${String(creatorId || "")}:${String(fanId || "")}`.slice(0, 250);
-}
-
-function futureDateFromIso(value) {
-  const d = parseDate(value);
-  return d && d.getTime() > Date.now() ? d : null;
-}
-
-function bumpFanStateQuietUntil(row, { replyCooldownHours = 24, sentCooldownHours = 6, sameTemplateCooldownHours = null, templateId = "" } = {}) {
-  if (!row) return { blocked: false, until: null, reason: null };
-  const counters = row.counters && typeof row.counters === "object" && !Array.isArray(row.counters) ? row.counters : {};
-  const candidates = [
-    futureDateFromIso(counters.nextAllowedAt),
-    futureDateFromIso(counters.repliedCooldownUntil),
-    futureDateFromIso(counters.sentCooldownUntil),
-  ].filter(Boolean);
-
-  const nowMs = Date.now();
-  const lastSentAt = row.lastSentAt || counters.lastSentAt || null;
-  const sentBase = parseDate(lastSentAt);
-  const sentHours = Math.max(0, Math.min(720, Number(sentCooldownHours ?? 6) || 0));
-  if (sentBase && sentHours > 0) {
-    const d = new Date(sentBase.getTime() + sentHours * 60 * 60 * 1000);
-    if (d.getTime() > nowMs) candidates.push(d);
-  }
-
-  const sameTplHours = sameTemplateCooldownHours === null || sameTemplateCooldownHours === undefined ? null : Math.max(0, Math.min(8760, Number(sameTemplateCooldownHours) || 0));
-  if (sameTplHours !== null && templateId && String(row.lastTemplateId || counters.lastTemplateId || "") === String(templateId || "") && sentBase && sameTplHours > 0) {
-    const d = new Date(sentBase.getTime() + sameTplHours * 60 * 60 * 1000);
-    if (d.getTime() > nowMs) candidates.push(d);
-  }
-
-  const lastStatus = cleanString(row.lastStatus || counters.lastStatus, 40);
-  const repliedBase = parseDate(row.lastFinalizedAt || counters.lastRepliedAt || counters.lastFinalizedAt || null);
-  const replyHours = Math.max(0, Math.min(2160, Number(replyCooldownHours ?? 24) || 0));
-  if (lastStatus === "replied" && repliedBase && replyHours > 0) {
-    const d = new Date(repliedBase.getTime() + replyHours * 60 * 60 * 1000);
-    if (d.getTime() > nowMs) candidates.push(d);
-  }
-
-  if (!candidates.length) return { blocked: false, until: null, reason: null };
-  const max = candidates.sort((a, b) => b.getTime() - a.getTime())[0];
-  return { blocked: true, until: max, reason: counters.quietReason || (lastStatus === "replied" ? "replied" : "sent") };
-}
-
-async function createOrUpdateDelayedRealtimeRow(tx, { agencyId, creatorId, fanId, dialogId, triggerKey, scheduledAt, templateId, templateTitle, deviceId, now, meta = {}, existingQueued = null, createdByUserId = null }) {
-  const data = {
-    agencyId,
-    creatorId,
-    fanId,
-    dialogId: dialogId || fanId,
-    contentCollectionId: templateId || null,
-    trigger: triggerKey,
-    status: "online_queued",
-    scheduledAt,
-    maxAttempts: 3,
-    claimedByDeviceId: null,
-    claimedAt: null,
-    claimUntil: null,
-    result: jsonObject({
-      realtimeFastLaneFallback: true,
-      triggerKey,
-      trigger: triggerKey,
-      templateId: templateId || null,
-      bumpId: templateId || null,
-      templateTitle: templateTitle || null,
-      sourceDeviceId: deviceId || null,
-      queuedAt: now.toISOString(),
-      delayedUntil: scheduledAt.toISOString(),
-      ...meta,
-    }),
-    createdByUserId,
-  };
-  if (existingQueued?.id) {
-    return tx.automationDelivery.update({
-      where: { id: existingQueued.id },
-      data: { ...data, agencyId: undefined, creatorId: undefined, fanId: undefined, createdByUserId: undefined },
-    });
-  }
-  return tx.automationDelivery.create({ data });
-}
 
 router.get("/deliveries/fan-state", async (req, res) => {
   try {
@@ -953,7 +616,6 @@ router.post("/deliveries/upsert", async (req, res) => {
         sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
         sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
       }).catch(() => null);
-      await ensureBumpSentStatCounted({ agencyId: req.auth.agencyId, creatorId, row: updated, templateId: templateIdForStat, source: "terminal_upsert_before_compact" }).catch(() => null);
       const day = cleanString(req.body?.day, 10) || (updated.sentAt ? updated.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
       const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId: templateIdForStat, day, event: terminalStatus, by: 1 });
       await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
@@ -974,8 +636,6 @@ router.post("/deliveries/upsert", async (req, res) => {
     } else {
       item = await prisma.automationDelivery.create({ data });
     }
-
-    await ensureBumpSentStatCounted({ agencyId: req.auth.agencyId, creatorId, row: item, templateId: deliveryTemplateId(item), source: "delivery_upsert_sent" }).catch(() => null);
 
     await upsertBumpFanState({
       agencyId: req.auth.agencyId, creatorId, fanId: item.fanId, dialogId: item.dialogId || item.fanId,
@@ -1059,133 +719,8 @@ router.post("/deliveries/debug-force-due", requireSeniorAutomationWriter, async 
 });
 
 
-
-// Realtime fast-lane reservation. Desktop sends live online/like/sub bumps only after
-// this atomic server grant. It prevents duplicate sends across 1..100 workers while
-// avoiding the slow persistent scheduler for true realtime triggers.
-router.post("/deliveries/realtime-reserve", async (req, res) => {
-  try {
-    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
-    await requireCreator(prisma, req.auth.agencyId, creatorId);
-    const fanId = cleanString(req.body?.fanId || req.body?.dialogId || req.body?.userId, 80);
-    if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
-
-    const dialogId = cleanString(req.body?.dialogId || fanId, 80) || fanId;
-    const triggerKey = normalizeBumpTrigger(req.body?.triggerKey || req.body?.trigger || req.body?.event?.triggerKey || BUMP_TRIGGER_KEYS.ONLINE);
-    const templateId = cleanString(req.body?.templateId || req.body?.bumpId || req.body?.contentCollectionId, 100) || "";
-    const templateTitle = cleanString(req.body?.templateTitle || req.body?.title, 300) || "";
-    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
-    const range = onlineSpacingRange({ ...(globalSafety || {}), ...(req.body || {}) });
-    const replyCooldownHours = Math.max(0, Math.min(2160, Number(req.body?.replyCooldownHours ?? globalSafety.replyCooldownHours ?? 24) || 0));
-    const sentCooldownHours = Math.max(0, Math.min(720, Number(req.body?.sentCooldownHours ?? globalSafety.sentCooldownHours ?? 6) || 0));
-    const sameTemplateCooldownHours = req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null;
-    const cancelAfterHours = Math.max(1, Math.min(72, Number(req.body?.cancelAfterHours || req.body?.replyTimeoutHours || 5) || 5));
-    const now = new Date();
-    const requestedCancelAt = parseDate(req.body?.cancelAt);
-    const cancelAt = requestedCancelAt || new Date(now.getTime() + cancelAfterHours * 60 * 60 * 1000);
-
-    const out = await prisma.$transaction(async (tx) => {
-      await tx.$queryRawUnsafe("SELECT pg_advisory_xact_lock(hashtext($1))", realtimeFanLockKey({ agencyId: req.auth.agencyId, creatorId, fanId })).catch(() => null);
-
-      const blocking = await tx.automationDelivery.findFirst({
-        where: { agencyId: req.auth.agencyId, creatorId, fanId, status: { in: REALTIME_BLOCKING_STATUSES } },
-        orderBy: [{ updatedAt: "desc" }],
-      });
-      if (blocking) {
-        return { ok: true, allowed: false, blocked: true, code: "BUMP_ALREADY_ACTIVE_SERVER", item: mapAutomationDelivery(blocking), status: blocking.status };
-      }
-
-      const existingQueued = await tx.automationDelivery.findFirst({
-        where: { agencyId: req.auth.agencyId, creatorId, fanId, status: "online_queued" },
-        orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
-      });
-
-      const fanState = await tx.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId, fanId } } }).catch(() => null);
-      const quiet = bumpFanStateQuietUntil(fanState, { replyCooldownHours, sentCooldownHours, sameTemplateCooldownHours, templateId });
-      if (quiet.blocked && quiet.until) {
-        const delayed = await createOrUpdateDelayedRealtimeRow(tx, {
-          agencyId: req.auth.agencyId, creatorId, fanId, dialogId, triggerKey, scheduledAt: quiet.until,
-          templateId, templateTitle, deviceId, now, existingQueued, createdByUserId: req.auth.userId,
-          meta: { reason: "fan_quiet_window", quietUntil: quiet.until.toISOString(), quietReason: quiet.reason || null },
-        });
-        return { ok: true, allowed: false, queued: true, delayed: true, code: "BUMP_FAN_QUIET_WINDOW_QUEUED", delayedUntil: quiet.until.toISOString(), item: mapAutomationDelivery(delayed) };
-      }
-
-      const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now });
-      const nextAllowed = onlineGateNextAllowed(gate, now);
-      const gateDelayMs = nextAllowed.getTime() - now.getTime();
-      if (gateDelayMs > 500) {
-        const delayed = await createOrUpdateDelayedRealtimeRow(tx, {
-          agencyId: req.auth.agencyId, creatorId, fanId, dialogId, triggerKey, scheduledAt: nextAllowed,
-          templateId, templateTitle, deviceId, now, existingQueued, createdByUserId: req.auth.userId,
-          meta: { reason: "account_send_gate", gateNextAllowedAt: nextAllowed.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max },
-        });
-        const cursor = new Date(nextAllowed.getTime() + randomOnlineSpacingMs(range));
-        await tx.automationDelivery.update({ where: { id: gate.id }, data: { scheduledAt: cursor, result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }) } });
-        return { ok: true, allowed: false, queued: true, delayed: true, code: "BUMP_DELAYED_BY_SERVER_GATE", delayedUntil: nextAllowed.toISOString(), item: mapAutomationDelivery(delayed), gateNextAllowedAt: cursor.toISOString() };
-      }
-
-      const reservedAt = now;
-      const reservationData = {
-        agencyId: req.auth.agencyId,
-        creatorId,
-        fanId,
-        dialogId,
-        contentCollectionId: templateId || null,
-        trigger: triggerKey,
-        status: "send_reserved",
-        scheduledAt: now,
-        sentAt: reservedAt,
-        cancelAt,
-        claimedByDeviceId: deviceId,
-        claimedAt: now,
-        claimUntil: new Date(now.getTime() + 90 * 1000),
-        maxAttempts: 3,
-        result: jsonObject({
-          realtimeFastLane: true,
-          reservation: true,
-          triggerKey,
-          trigger: triggerKey,
-          templateId: templateId || null,
-          bumpId: templateId || null,
-          templateTitle: templateTitle || null,
-          sourceDeviceId: deviceId,
-          reservedAt: reservedAt.toISOString(),
-          cancelAfterHours,
-          cancelAt: cancelAt.toISOString(),
-          replyCooldownHours,
-          sentCooldownHours,
-          sameTemplateCooldownHours,
-          minFanSpacingSec: range.min,
-          maxFanSpacingSec: range.max,
-          ...(req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {}),
-        }),
-        createdByUserId: req.auth.userId,
-      };
-
-      const row = existingQueued?.id
-        ? await tx.automationDelivery.update({ where: { id: existingQueued.id }, data: { ...reservationData, agencyId: undefined, creatorId: undefined, fanId: undefined, createdByUserId: undefined } })
-        : await tx.automationDelivery.create({ data: reservationData });
-
-      const cursor = new Date(now.getTime() + randomOnlineSpacingMs(range));
-      await tx.automationDelivery.update({ where: { id: gate.id }, data: { scheduledAt: cursor, result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }) } });
-
-      await upsertBumpFanState({
-        agencyId: req.auth.agencyId, creatorId, fanId, dialogId, templateId,
-        status: "send_reserved", sentAt: reservedAt, messageId: null,
-        replyCooldownHours, sentCooldownHours, sameTemplateCooldownHours,
-      }).catch(() => null);
-
-      return { ok: true, allowed: true, deliveryId: row.id, item: mapAutomationDelivery(row), cancelAt: cancelAt.toISOString(), gateNextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max };
-    }, { timeout: 15000 });
-
-    return res.json({ ...out, creatorId, fanId, triggerKey, serverGateReserved: out.allowed === true, realtimeFastLane: true });
-  } catch (err) { return sendError(res, err, "BUMP_REALTIME_RESERVE_FAILED"); }
-});
-
 // Distributed bump event scheduler. Workers report online/like/subscription fan batches; server
-// dedupes fanIds and assigns global scheduledAt slots with configurable 3s+ spacing so
+// dedupes fanIds and assigns global scheduledAt slots with 15–30s spacing so
 // several employees/devices cannot burst-send at the same time.
 router.post("/deliveries/online-batch", async (req, res) => {
   try {
@@ -1194,8 +729,7 @@ router.post("/deliveries/online-batch", async (req, res) => {
     const fanIds = onlineQueueFanIds(req.body?.fanIds || req.body?.onlineIds || req.body?.ids || []);
     if (!fanIds.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped: [], code: "BUMP_EVENT_BATCH_EMPTY" });
 
-    const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
-    const range = onlineSpacingRange({ ...(req.body || {}), ...(globalSafety || {}) });
+    const range = onlineSpacingRange(req.body || {});
     const triggerKey = normalizeBumpTrigger(req.body?.triggerType || req.body?.triggerKey || req.body?.trigger || req.body?.event?.triggerKey || req.body?.event?.type);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
     const batchId = cleanString(req.body?.batchId, 120) || eventQueueBatchId(triggerKey);
@@ -1290,73 +824,31 @@ router.post("/deliveries/claim-online-send", async (req, res) => {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const requestedLimit = parseLimit(req.body?.limit, 1, 20);
-    const timeoutSec = Math.max(30, Math.min(300, positiveInt(req.body?.claimTimeoutSec, 75)));
-    const maxReserved = Math.max(1, Math.min(3, positiveInt(req.body?.maxSendReservedPerAccount, 1)));
-    const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
-    const hiddenCap = hiddenQueueCap({ ...(req.body || {}), ...(globalSafety || {}) });
+    const limit = parseLimit(req.body?.limit, 1, 10);
+    const timeoutSec = Math.max(30, Math.min(1800, positiveInt(req.body?.claimTimeoutSec, 180)));
     const now = new Date();
     const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
 
     await prisma.automationDelivery.updateMany({
-      where: { agencyId: req.auth.agencyId, creatorId, status: "online_claimed", OR: [{ claimUntil: { lt: now } }, { claimedAt: { lt: new Date(now.getTime() - 120 * 1000) } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
+      where: { agencyId: req.auth.agencyId, creatorId, status: "online_claimed", OR: [{ claimUntil: { lt: now } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
       data: { status: "online_queued", claimedByDeviceId: null, claimedAt: null, claimUntil: null, error: "online claim expired; returned to queue" },
     }).catch(() => null);
 
-    // Recovery for old clients/old code paths: send_reserved must be a very short
-    // state right before OF sendMessage, not a second queue. If no messageId was
-    // produced quickly, return it to the event queue.
-    await prisma.automationDelivery.updateMany({
-      where: {
-        agencyId: req.auth.agencyId,
-        creatorId,
-        status: "send_reserved",
-        messageId: null,
-        updatedAt: { lt: new Date(now.getTime() - 90 * 1000) },
-      },
-      data: {
-        status: "online_queued",
-        scheduledAt: now,
-        claimedByDeviceId: null,
-        claimedAt: null,
-        claimUntil: null,
-        error: "stale send reservation released back to queue",
-      },
-    }).catch(() => null);
-
-    const hiddenDeferred = await deferHiddenQueueOverflow(prisma, {
-      agencyId: req.auth.agencyId,
-      creatorId,
-      cap: hiddenCap,
-      now,
-      deferMs: 60 * 60 * 1000,
-    });
-
-    const reservedCount = await prisma.automationDelivery.count({
-      where: { agencyId: req.auth.agencyId, creatorId, status: "send_reserved", messageId: null },
-    }).catch(() => 0);
-
-    const effectiveLimit = Math.min(requestedLimit, Math.max(0, maxReserved - reservedCount), 1);
-    if (effectiveLimit <= 0) {
-      const next = await prisma.automationDelivery.findFirst({
-        where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued" },
-        orderBy: { scheduledAt: "asc" },
-        select: { scheduledAt: true },
-      });
-      return res.json({ ok: true, creatorId, deviceId, count: 0, items: [], claimUntil, nextScheduledAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null, reservedCount, maxReserved, hiddenDeferred });
-    }
-
+    // v19.33.4: a backlog of hiddenOnlineSignal rows must not keep fresh
+    // fanOnline/fanSubscribed/fanLikedPost rows behind it. scheduledAt still
+    // controls the configured online delay; among rows already due, claim by
+    // business priority first, then by scheduledAt. Fetch a wider window because
+    // old hidden rows can otherwise hide newer realtime rows from the candidate set.
     const candidates = await prisma.automationDelivery.findMany({
       where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", scheduledAt: { lte: now } },
       orderBy: [{ scheduledAt: "asc" }, { createdAt: "asc" }],
-      take: Math.max(requestedLimit * 20, 50),
+      take: Math.max(limit * 100, 100),
     });
-
-    candidates.sort(bySendPriority);
+    candidates.sort(sortAutomationSendCandidates);
 
     const items = [];
     for (const candidate of candidates) {
-      if (items.length >= effectiveLimit) break;
+      if (items.length >= limit) break;
       const updated = await prisma.automationDelivery.updateMany({
         where: { id: candidate.id, agencyId: req.auth.agencyId, creatorId, status: "online_queued", OR: [{ claimUntil: null }, { claimUntil: { lt: now } }] },
         data: { status: "online_claimed", claimedByDeviceId: deviceId, claimedAt: now, claimUntil, lastCheckedAt: now, attempts: { increment: 1 }, error: null },
@@ -1373,7 +865,7 @@ router.post("/deliveries/claim-online-send", async (req, res) => {
       select: { scheduledAt: true },
     });
 
-    return res.json({ ok: true, creatorId, deviceId, count: items.length, items, claimUntil, nextScheduledAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null, requestedLimit, effectiveLimit, reservedCount, maxReserved, hiddenDeferred });
+    return res.json({ ok: true, creatorId, deviceId, count: items.length, items, claimUntil, nextScheduledAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null });
   } catch (err) { return sendError(res, err, "BUMP_ONLINE_CLAIM_FAILED"); }
 });
 
@@ -1447,7 +939,6 @@ router.post("/deliveries/claim-cancel", async (req, res) => {
       const attempts = Math.max(0, Number(candidate.attempts || 0));
       if (attempts >= maxAttempts) {
         const templateId = deliveryTemplateId(candidate);
-        await ensureBumpSentStatCounted({ agencyId: req.auth.agencyId, creatorId, row: candidate, templateId, source: "max_attempts_before_failed" }).catch(() => null);
         const day = candidate.sentAt ? candidate.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10);
         await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: "failed", by: 1 }).catch(() => null);
         await prisma.automationDelivery.delete({ where: { id: candidate.id } }).catch(() => null);
@@ -1482,53 +973,6 @@ router.post("/deliveries/claim-cancel", async (req, res) => {
   } catch (err) { return sendError(res, err, "BUMP_CANCEL_CLAIM_FAILED"); }
 });
 
-async function updateHiddenCandidateAfterBumpFinal({ agencyId, creatorId, existing, status, finalizedAt, replyCooldownHours = 24, safety = null } = {}) {
-  try {
-    if (!existing || normalizeBumpTrigger(existing.trigger) !== BUMP_TRIGGER_KEYS.HIDDEN) return null;
-    const fanId = cleanString(existing.fanId || existing.dialogId, 80);
-    if (!agencyId || !creatorId || !fanId) return null;
-    const meta = deliveryMeta(existing);
-    const base = parseDate(finalizedAt) || new Date();
-    const hiddenRetryAfterNoReplyHours = Math.max(1, Math.min(720, Number(
-      meta.hiddenRetryAfterNoReplyHours ?? meta.hiddenNoReplyRetryHours ?? meta.hiddenCadenceHours ?? safety?.hiddenRetryAfterNoReplyHours ?? 12
-    ) || 12));
-    const hiddenReplyTimeoutHours = Math.max(1, Math.min(72, Number(
-      meta.hiddenDeleteAfterNoReplyHours ?? meta.hiddenNoReplyDeleteAfterHours ?? meta.hiddenReplyTimeoutHours ?? safety?.hiddenReplyTimeoutHours ?? 6
-    ) || 6));
-    const replyQuietHours = Math.max(0, Math.min(2160, Number(replyCooldownHours ?? safety?.replyCooldownHours ?? 24) || 0));
-    const nextMs = status === "replied"
-      ? base.getTime() + replyQuietHours * 60 * 60 * 1000
-      : status === "canceled"
-        ? base.getTime() + hiddenRetryAfterNoReplyHours * 60 * 60 * 1000
-        : base.getTime() + Math.min(hiddenRetryAfterNoReplyHours, 6) * 60 * 60 * 1000;
-    const nextEligibleAt = new Date(nextMs).toISOString();
-    const row = await prisma.hiddenOnlineUser.findFirst({ where: { agencyId, creatorId, fanId } }).catch(() => null);
-    if (!row) return null;
-    const prev = row.metadata && typeof row.metadata === "object" && !Array.isArray(row.metadata) ? row.metadata : {};
-    return prisma.hiddenOnlineUser.update({
-      where: { id: row.id },
-      data: {
-        lastSignalAt: row.lastSignalAt || existing.sentAt || base,
-        metadata: jsonObject({
-          ...prev,
-          lastHiddenFinalStatus: status,
-          lastHiddenFinalizedAt: base.toISOString(),
-          lastHiddenSentAt: existing.sentAt ? existing.sentAt.toISOString() : (prev.lastHiddenSentAt || null),
-          lastHiddenMessageId: existing.messageId || prev.lastHiddenMessageId || null,
-          nextEligibleAt,
-          hiddenCadenceHours: hiddenRetryAfterNoReplyHours,
-          hiddenRetryAfterNoReplyHours,
-          hiddenReplyTimeoutHours,
-          hiddenDeleteAfterNoReplyHours: hiddenReplyTimeoutHours,
-          hiddenReplyQuietHours: status === "replied" ? replyQuietHours : prev.hiddenReplyQuietHours || null,
-        }),
-      },
-    });
-  } catch (_) {
-    return null;
-  }
-}
-
 router.post("/deliveries/cancel-result", async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
@@ -1555,21 +999,15 @@ router.post("/deliveries/cancel-result", async (req, res) => {
     if (BUMP_TERMINAL_DELIVERY_STATUSES.has(status)) {
       const templateId = cleanString(req.body?.templateId || req.body?.bumpId || deliveryTemplateId(existing), 100) || "";
       const day = cleanString(req.body?.day, 10) || (existing.sentAt ? existing.sentAt.toISOString().slice(0, 10) : new Date().toISOString().slice(0, 10));
-      const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId }).catch(() => normalizeBumpSafety({}));
-      const finalizedAt = req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || now.toISOString();
-      const replyCooldownHours = req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? globalSafety.replyCooldownHours ?? 24;
-      const sentCooldownHours = req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? globalSafety.sentCooldownHours ?? 6;
       await upsertBumpFanState({
         agencyId: req.auth.agencyId, creatorId, fanId: existing.fanId, dialogId: existing.dialogId || existing.fanId,
         templateId, status, sentAt: existing.sentAt,
-        finalizedAt,
+        finalizedAt: req.body?.repliedAt || req.body?.canceledAt || req.body?.failedAt || now.toISOString(),
         messageId: existing.messageId,
-        replyCooldownHours,
-        sentCooldownHours,
+        replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
+        sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
         sameTemplateCooldownHours: req.body?.sameTemplateCooldownHours ?? req.body?.cooldownHours ?? null,
       }).catch(() => null);
-      await updateHiddenCandidateAfterBumpFinal({ agencyId: req.auth.agencyId, creatorId, existing, status, finalizedAt, replyCooldownHours, safety: globalSafety }).catch(() => null);
-      await ensureBumpSentStatCounted({ agencyId: req.auth.agencyId, creatorId, row: existing, templateId, source: "cancel_result_before_compact" }).catch(() => null);
       const stat = await incrementBumpDeliveryStat({ agencyId: req.auth.agencyId, creatorId, templateId, day, event: status, by: 1 });
       await prisma.automationDelivery.delete({ where: { id: existing.id } }).catch(() => null);
       return res.json({ ok: true, compacted: true, status, item: null, stat, deliveryId: existing.id, templateId });
@@ -1601,197 +1039,39 @@ router.post("/deliveries/cancel-result", async (req, res) => {
 // HiddenOnlineUser and reuse AutomationDelivery as the distributed job/queue
 // table, so no local-only state and no event-log explosion.
 const HIDDEN_SCAN_STATUSES = ["hidden_scan_queued", "hidden_scan_claimed", "hidden_scan_paused"];
-const HIDDEN_SCAN_CLAIM_DEFAULT_SEC = 90;
-const HIDDEN_SCAN_CLAIM_MIN_SEC = 30;
-const HIDDEN_SCAN_CLAIM_MAX_SEC = 600;
-
-function hiddenScanClaimTimeoutSec(value) {
-  return Math.max(HIDDEN_SCAN_CLAIM_MIN_SEC, Math.min(HIDDEN_SCAN_CLAIM_MAX_SEC, positiveInt(value, HIDDEN_SCAN_CLAIM_DEFAULT_SEC)));
-}
-
-function hiddenScanTakeoverInSec(row, now = new Date()) {
-  if (!row?.claimUntil) return 0;
-  return Math.max(0, Math.ceil((new Date(row.claimUntil).getTime() - now.getTime()) / 1000));
-}
-
-async function releaseExpiredHiddenScanClaims({ agencyId, creatorId, now = new Date(), timeoutSec = HIDDEN_SCAN_CLAIM_DEFAULT_SEC } = {}) {
-  if (!agencyId || !creatorId) return { count: 0 };
-  const staleUpdatedBefore = new Date(now.getTime() - Math.max(30, timeoutSec) * 1000);
-  return prisma.automationDelivery.updateMany({
-    where: {
-      agencyId,
-      creatorId,
-      status: "hidden_scan_claimed",
-      trigger: "hidden_online_scan",
-      OR: [
-        { claimUntil: { lt: now } },
-        { claimUntil: null, updatedAt: { lt: staleUpdatedBefore } },
-      ],
-    },
-    data: {
-      status: "hidden_scan_queued",
-      scheduledAt: now,
-      claimedByDeviceId: null,
-      claimedAt: null,
-      claimUntil: null,
-      lastCheckedAt: now,
-      error: "hidden scan worker lost; lease expired and job returned to queue for takeover",
-    },
-  }).catch(() => ({ count: 0 }));
-}
 
 function hiddenScanJobId(creatorId) {
   return `hidden_scan_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 90)}`;
 }
 
 function hiddenScanState(row = {}) {
-  if (!row?.id) return { status: "idle", serverStatus: null };
   const meta = deliveryMeta(row);
   const rawStatus = String(row?.status || "").toLowerCase();
   const out = meta && typeof meta === "object" && !Array.isArray(meta) ? { ...meta } : {};
 
-  // Server row status is authoritative. The hidden scan job id is stable
-  // (hidden_scan_<creatorId>), so result JSON may keep stale worker fields from
-  // a previous run. Never let old result.status/workerStatus/claim fields make
-  // a completed scan look claimed/running.
-  if (rawStatus === "hidden_scan_claimed") out.status = "running";
-  else if (rawStatus === "hidden_scan_queued") out.status = "queued";
-  else if (rawStatus === "hidden_scan_paused") out.status = "paused";
-  else if (rawStatus === "hidden_scan_done") out.status = "done";
-  else if (rawStatus === "failed") out.status = "failed";
-  else if (rawStatus) out.status = rawStatus;
-  else out.status = out.status || "idle";
+  // Expose server job status to desktop UI. The previous version returned only
+  // row.result, so freshly queued/claimed jobs could look idle until the first
+  // progress page was posted. Hidden scan is server-owned, so the visible
+  // progress state must reflect AutomationDelivery.status too.
+  if (!out.status) {
+    if (rawStatus === "hidden_scan_claimed") out.status = "running";
+    else if (rawStatus === "hidden_scan_queued") out.status = "queued";
+    else if (rawStatus === "hidden_scan_paused") out.status = "paused";
+    else if (rawStatus === "hidden_scan_done") out.status = "done";
+    else if (rawStatus === "failed") out.status = "failed";
+    else if (rawStatus) out.status = rawStatus;
+    else out.status = "idle";
+  }
 
   out.serverStatus = rawStatus || out.serverStatus || null;
-  if (row?.id) out.jobId = row.id;
-
-  // `scheduledAt` has two different meanings depending on row status:
-  // - done/idle rows: next weekly scan time
-  // - queued/running rows with hasMore=true: next page/chunk continuation time
-  // Do not expose a page continuation timestamp as nextScanAt, otherwise the
-  // auto-enqueue path can treat it as the next weekly scan and restart work on
-  // every desktop restart.
-  const scheduledIso = row?.scheduledAt ? (row.scheduledAt.toISOString ? row.scheduledAt.toISOString() : row.scheduledAt) : null;
-  const isCompletedScanState = rawStatus === "hidden_scan_done" || out.hasMore === false || out.status === "done" || out.serverStatus === "hidden_scan_done";
-  if (scheduledIso) {
-    if (isCompletedScanState || rawStatus === "failed") out.nextScanAt = scheduledIso;
-    else {
-      out.nextPageAt = scheduledIso;
-      // Drop stale v19.32.18/19 page timestamps that were stored under nextScanAt.
-      if (out.nextScanAt && Date.parse(out.nextScanAt) <= Date.now() + 10 * 60 * 1000) delete out.nextScanAt;
-    }
-  }
-  if (row?.lastCheckedAt) out.lastCheckedAt = row.lastCheckedAt.toISOString ? row.lastCheckedAt.toISOString() : row.lastCheckedAt;
-
-  if (rawStatus === "hidden_scan_claimed") {
-    out.claimedByDeviceId = row?.claimedByDeviceId || null;
-    out.claimUntil = row?.claimUntil ? (row.claimUntil.toISOString ? row.claimUntil.toISOString() : row.claimUntil) : null;
-    out.takeoverInSec = hiddenScanTakeoverInSec(row);
-    out.workerStatus = out.takeoverInSec > 0 ? "claimed" : "takeover_ready";
-  } else {
-    out.claimedByDeviceId = null;
-    out.claimUntil = null;
-    out.takeoverInSec = 0;
-    if (rawStatus === "hidden_scan_done") out.workerStatus = "done";
-    else if (rawStatus === "hidden_scan_queued") out.workerStatus = "takeover_ready";
-    else if (rawStatus === "hidden_scan_paused") out.workerStatus = "paused";
-  }
-
-  if (row?.error) out.lastError = row.error;
-  if (rawStatus === "hidden_scan_done") out.keepClaim = false;
-
-  if (rawStatus === "hidden_scan_queued" && out.pausedForPriority === true) {
-    out.status = "paused";
-    out.workerStatus = "paused_for_bumps";
-    out.pauseReason = out.pauseReason || "bump_backpressure";
-  }
+  if (row?.id && !out.jobId) out.jobId = row.id;
+  if (row?.scheduledAt && !out.nextScanAt) out.nextScanAt = row.scheduledAt.toISOString ? row.scheduledAt.toISOString() : row.scheduledAt;
+  if (row?.claimedByDeviceId && !out.claimedByDeviceId) out.claimedByDeviceId = row.claimedByDeviceId;
+  if (row?.claimUntil && !out.claimUntil) out.claimUntil = row.claimUntil.toISOString ? row.claimUntil.toISOString() : row.claimUntil;
+  if (row?.lastCheckedAt && !out.lastCheckedAt) out.lastCheckedAt = row.lastCheckedAt.toISOString ? row.lastCheckedAt.toISOString() : row.lastCheckedAt;
+  if (row?.error && !out.lastError) out.lastError = row.error;
 
   return out;
-}
-
-function dateMsSafe(value) {
-  if (!value) return 0;
-  const raw = value instanceof Date ? value.getTime() : Date.parse(String(value));
-  return Number.isFinite(raw) ? raw : 0;
-}
-
-function addDays(dateMs, days) {
-  return new Date(Number(dateMs || 0) + Math.max(1, Number(days) || 1) * 24 * 60 * 60 * 1000);
-}
-
-function hiddenScanLooksCompleted(row = {}, state = {}) {
-  const rowStatus = String(row?.status || "").toLowerCase();
-  const stateStatus = String(state?.status || "").toLowerCase();
-  const serverStatus = String(state?.serverStatus || "").toLowerCase();
-  return rowStatus === "hidden_scan_done" ||
-    serverStatus === "hidden_scan_done" ||
-    stateStatus === "done" ||
-    state?.hasMore === false ||
-    Boolean(state?.finishedAt);
-}
-
-function hiddenScanLastSuccessMs(row = {}, state = {}) {
-  return dateMsSafe(state?.finishedAt) ||
-    dateMsSafe(state?.lastPageAt) ||
-    dateMsSafe(row?.lastCheckedAt) ||
-    dateMsSafe(row?.updatedAt) ||
-    dateMsSafe(row?.scheduledAt);
-}
-
-async function repairFreshHiddenScanDone({ existing, state, agencyId, creatorId, scanEveryDays, now, limit }) {
-  if (!existing?.id || !hiddenScanLooksCompleted(existing, state)) return null;
-  const lastSuccessMs = hiddenScanLastSuccessMs(existing, state);
-  if (!lastSuccessMs) return null;
-  const repairedDueAt = addDays(lastSuccessMs, scanEveryDays);
-  if (repairedDueAt <= now) return null;
-
-  const repairedState = jsonObject({
-    ...state,
-    hiddenScan: true,
-    scanEveryDays,
-    limit: Number(state.limit || limit) || limit,
-    status: "done",
-    serverStatus: "hidden_scan_done",
-    workerStatus: "done",
-    hasMore: false,
-    keepClaim: false,
-    claimedByDeviceId: null,
-    claimUntil: null,
-    nextPageAt: null,
-    nextScanAt: repairedDueAt.toISOString(),
-    finishedAt: state.finishedAt || new Date(lastSuccessMs).toISOString(),
-    lastPageAt: state.lastPageAt || new Date(lastSuccessMs).toISOString(),
-    lastError: null,
-  });
-
-  const shouldRepair = String(existing.status || "") !== "hidden_scan_done" ||
-    !existing.scheduledAt ||
-    existing.scheduledAt <= now ||
-    Math.abs(existing.scheduledAt.getTime() - repairedDueAt.getTime()) > 60_000 ||
-    existing.claimUntil ||
-    existing.claimedByDeviceId ||
-    state.workerStatus === "claimed" ||
-    state.claimUntil ||
-    state.nextPageAt ||
-    (state.nextScanAt && Date.parse(state.nextScanAt) <= now.getTime() + 10 * 60 * 1000);
-
-  const repaired = shouldRepair
-    ? await prisma.automationDelivery.update({
-        where: { id: existing.id },
-        data: {
-          status: "hidden_scan_done",
-          scheduledAt: repairedDueAt,
-          claimedByDeviceId: null,
-          claimedAt: null,
-          claimUntil: null,
-          lastCheckedAt: new Date(lastSuccessMs),
-          error: null,
-          result: repairedState,
-        },
-      })
-    : existing;
-
-  return { item: repaired, nextScanAt: repairedDueAt.toISOString(), repaired: shouldRepair, scanState: hiddenScanState(repaired) };
 }
 
 function hiddenCandidateStatus(value) {
@@ -1825,8 +1105,7 @@ function hiddenCandidateCompact(input = {}) {
       lastIncomingAt: input.lastIncomingAt || metadata.lastIncomingAt || null,
       nextEligibleAt: input.nextEligibleAt || metadata.nextEligibleAt || null,
       lastHiddenQueuedAt: input.lastHiddenQueuedAt || metadata.lastHiddenQueuedAt || null,
-      hiddenCadenceHours: Math.max(1, Math.min(720, Number(input.hiddenRetryAfterNoReplyHours ?? input.hiddenNoReplyRetryHours ?? input.hiddenCadenceHours ?? metadata.hiddenRetryAfterNoReplyHours ?? metadata.hiddenNoReplyRetryHours ?? metadata.hiddenCadenceHours ?? 12) || 12)),
-      hiddenRetryAfterNoReplyHours: Math.max(1, Math.min(720, Number(input.hiddenRetryAfterNoReplyHours ?? input.hiddenNoReplyRetryHours ?? input.hiddenCadenceHours ?? metadata.hiddenRetryAfterNoReplyHours ?? metadata.hiddenNoReplyRetryHours ?? metadata.hiddenCadenceHours ?? 12) || 12)),
+      hiddenCadenceHours: Number(input.hiddenCadenceHours || metadata.hiddenCadenceHours || 3) || 3,
     },
   };
 }
@@ -1885,101 +1164,22 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
     const id = hiddenScanJobId(creatorId);
     const existing = await prisma.automationDelivery.findUnique({ where: { id } }).catch(() => null);
     const prev = hiddenScanState(existing || {});
-    let dueAt = existing?.scheduledAt || null;
-
-    // Auto-worker must never convert a fresh completed scan into a new run just
-    // because an old result.nextScanAt/scheduledAt was page-level or stale.
-    // Repair any completed-ish state (row done OR result done/hasMore=false)
-    // from the last successful page/finish timestamp and return not-due until
-    // scanEveryDays really elapsed. Manual/fullScan still intentionally starts.
-    if (existing?.id && req.body?.manual !== true && !fullScan) {
-      const repairedDone = await repairFreshHiddenScanDone({
-        existing,
-        state: prev,
-        agencyId: req.auth.agencyId,
-        creatorId,
-        scanEveryDays,
-        now,
-        limit,
-      });
-      if (repairedDone) {
-        return res.json({
-          ok: true,
-          creatorId,
-          item: mapAutomationDelivery(repairedDone.item),
-          queued: false,
-          nextScanAt: repairedDone.nextScanAt,
-          code: "HIDDEN_SCAN_NOT_DUE",
-          repaired: repairedDone.repaired,
-          scanState: repairedDone.scanState,
-        });
-      }
-      if (hiddenScanLooksCompleted(existing, prev) && existing?.scheduledAt) dueAt = existing.scheduledAt;
-    }
-
+    const dueAt = existing?.scheduledAt || null;
     const due = !dueAt || dueAt <= now || req.body?.manual === true || fullScan;
-
-    // Never let an auto enqueue/reset steal a live hidden scan from a worker.
-    // Earlier versions could call enqueue while a page worker was still running,
-    // reset hidden_scan_claimed back to hidden_scan_queued, and the UI showed
-    // "waiting for worker" between chunks. Keep the lease owner until it expires.
-    if (existing?.id && String(existing.status || "") === "hidden_scan_claimed" && existing.claimUntil && existing.claimUntil > now && req.body?.forceTakeover !== true) {
-      return res.json({
-        ok: true,
-        creatorId,
-        item: mapAutomationDelivery(existing),
-        queued: false,
-        alreadyActive: true,
-        code: "HIDDEN_SCAN_ALREADY_CLAIMED",
-        scanState: hiddenScanState(existing),
-        claimUntil: existing.claimUntil.toISOString ? existing.claimUntil.toISOString() : existing.claimUntil,
-        takeoverInSec: hiddenScanTakeoverInSec(existing, now),
-      });
+    if (existing?.id && !due && !["hidden_scan_paused", "hidden_scan_done", "failed"].includes(String(existing.status || ""))) {
+      return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || null, code: "HIDDEN_SCAN_NOT_DUE" });
     }
 
-    // If the old owner is dead, release it before deciding whether to requeue.
-    if (existing?.id && String(existing.status || "") === "hidden_scan_claimed") {
-      await releaseExpiredHiddenScanClaims({ agencyId: req.auth.agencyId, creatorId, now });
-      const freshExisting = await prisma.automationDelivery.findUnique({ where: { id } }).catch(() => null);
-      if (freshExisting?.id && String(freshExisting.status || "") === "hidden_scan_claimed" && freshExisting.claimUntil && freshExisting.claimUntil > now && req.body?.forceTakeover !== true) {
-        return res.json({ ok: true, creatorId, item: mapAutomationDelivery(freshExisting), queued: false, alreadyActive: true, code: "HIDDEN_SCAN_ALREADY_CLAIMED", scanState: hiddenScanState(freshExisting), claimUntil: freshExisting.claimUntil.toISOString ? freshExisting.claimUntil.toISOString() : freshExisting.claimUntil, takeoverInSec: hiddenScanTakeoverInSec(freshExisting, now) });
-      }
-    }
-
-    // If auto scheduling says not due, return not-due for every non-live row.
-    // Older code excluded hidden_scan_done here, which immediately re-queued a
-    // completed scan even when scheduledAt was already repaired into the future.
-    if (existing?.id && !due && req.body?.manual !== true && !fullScan) {
-      return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || prev.nextScanAt || null, code: "HIDDEN_SCAN_NOT_DUE", scanState: hiddenScanState(existing) });
-    }
-
-    const resetRun = !existing?.id || fullScan || req.body?.manual === true || String(existing?.status || "") === "hidden_scan_done" || String(existing?.status || "") === "failed";
-    const sourceType = cleanString(req.body?.type || req.body?.subscriberType || prev.sourceType || "all", 40) || "all";
     const state = jsonObject({
-      ...(resetRun ? {} : prev),
+      ...prev,
       hiddenScan: true,
       scanEveryDays,
       limit,
-      sourceType,
-      nextOffset: resetRun ? 0 : Math.max(0, Number(prev.nextOffset || 0) || 0),
+      sourceType: cleanString(req.body?.type || req.body?.subscriberType || prev.sourceType || "all", 40) || "all",
+      nextOffset: fullScan ? 0 : Math.max(0, Number(prev.nextOffset || 0) || 0),
       fullScan,
       manual: req.body?.manual === true,
-      status: "queued",
-      serverStatus: "hidden_scan_queued",
-      workerStatus: "takeover_ready",
-      pages: resetRun ? 0 : Math.max(0, Number(prev.pages || 0) || 0),
-      scanned: resetRun ? 0 : Math.max(0, Number(prev.scanned || 0) || 0),
-      hiddenSeen: resetRun ? 0 : Math.max(0, Number(prev.hiddenSeen || 0) || 0),
-      inserted: resetRun ? 0 : Math.max(0, Number(prev.inserted || 0) || 0),
-      updated: resetRun ? 0 : Math.max(0, Number(prev.updated || 0) || 0),
-      hasMore: true,
-      keepClaim: false,
-      claimedByDeviceId: null,
-      claimUntil: null,
       enqueuedAt: now.toISOString(),
-      startedAt: resetRun ? null : prev.startedAt || null,
-      lastPageAt: resetRun ? null : prev.lastPageAt || null,
-      finishedAt: null,
       lastError: null,
     });
     const item = await prisma.automationDelivery.upsert({
@@ -2015,33 +1215,14 @@ router.post("/hidden-online/scan-jobs/claim", async (req, res) => {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const timeoutSec = hiddenScanClaimTimeoutSec(req.body?.claimTimeoutSec);
+    const timeoutSec = Math.max(60, Math.min(3600, positiveInt(req.body?.claimTimeoutSec, 300)));
     const now = new Date();
     const claimUntil = new Date(now.getTime() + timeoutSec * 1000);
 
-    const released = await releaseExpiredHiddenScanClaims({ agencyId: req.auth.agencyId, creatorId, now, timeoutSec });
-
-    // If the same desktop worker already owns a live scan lease, hand it back
-    // instead of forcing the UI into "waiting for worker" until the lease expires.
-    // This makes restarts/ticks/chunk loops idempotent for one-worker studios.
-    const owned = await prisma.automationDelivery.findFirst({
-      where: {
-        agencyId: req.auth.agencyId,
-        creatorId,
-        status: "hidden_scan_claimed",
-        trigger: "hidden_online_scan",
-        claimedByDeviceId: deviceId,
-        OR: [{ claimUntil: { gt: now } }, { claimUntil: null }],
-      },
-      orderBy: [{ updatedAt: "desc" }],
-    });
-    if (owned?.id) {
-      const updatedOwned = await prisma.automationDelivery.update({
-        where: { id: owned.id },
-        data: { claimUntil, lastCheckedAt: now, error: null },
-      });
-      return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updatedOwned), items: [mapAutomationDelivery(updatedOwned)], scanState: hiddenScanState(updatedOwned), claimUntil, continued: true, releasedExpired: released?.count || 0, takeoverInSec: timeoutSec });
-    }
+    await prisma.automationDelivery.updateMany({
+      where: { agencyId: req.auth.agencyId, creatorId, status: "hidden_scan_claimed", OR: [{ claimUntil: { lt: now } }, { claimUntil: null, updatedAt: { lt: new Date(now.getTime() - timeoutSec * 1000) } }] },
+      data: { status: "hidden_scan_queued", claimedByDeviceId: null, claimedAt: null, claimUntil: null, error: "hidden scan claim expired; returned to queue" },
+    }).catch(() => null);
 
     const row = await prisma.automationDelivery.findFirst({
       where: { agencyId: req.auth.agencyId, creatorId, status: "hidden_scan_queued", scheduledAt: { lte: now }, trigger: "hidden_online_scan" },
@@ -2049,13 +1230,13 @@ router.post("/hidden-online/scan-jobs/claim", async (req, res) => {
     });
     if (!row) {
       const next = await prisma.automationDelivery.findFirst({ where: { agencyId: req.auth.agencyId, creatorId, trigger: "hidden_online_scan" }, orderBy: { scheduledAt: "asc" } });
-      return res.json({ ok: true, creatorId, count: 0, items: [], item: null, nextScanAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null, releasedExpired: released?.count || 0 });
+      return res.json({ ok: true, creatorId, count: 0, items: [], item: null, nextScanAt: next?.scheduledAt ? next.scheduledAt.toISOString() : null });
     }
     const updated = await prisma.automationDelivery.update({
       where: { id: row.id },
       data: { status: "hidden_scan_claimed", claimedByDeviceId: deviceId, claimedAt: now, claimUntil, lastCheckedAt: now, attempts: { increment: 1 }, error: null },
     });
-    return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updated), items: [mapAutomationDelivery(updated)], scanState: hiddenScanState(updated), claimUntil, releasedExpired: released?.count || 0, takeoverInSec: timeoutSec });
+    return res.json({ ok: true, creatorId, count: 1, item: mapAutomationDelivery(updated), items: [mapAutomationDelivery(updated)], scanState: hiddenScanState(updated), claimUntil });
   } catch (err) { return sendError(res, err, "HIDDEN_SCAN_CLAIM_FAILED"); }
 });
 
@@ -2067,59 +1248,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const now = new Date();
     const row = await prisma.automationDelivery.findFirst({ where: { id, agencyId: req.auth.agencyId, creatorId, trigger: "hidden_online_scan" } });
     if (!row) return res.status(404).json({ ok: false, code: "HIDDEN_SCAN_JOB_NOT_FOUND", error: "Hidden scan job not found" });
-    const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "", 120);
-    if (String(row.status || "") === "hidden_scan_claimed") {
-      const owner = cleanString(row.claimedByDeviceId || "", 120);
-      if (owner && deviceId && owner !== deviceId) {
-        return res.status(409).json({ ok: false, code: "HIDDEN_SCAN_STALE_WORKER", error: "Hidden scan claim is owned by another worker", ownerDeviceId: owner, deviceId });
-      }
-      if (row.claimUntil && row.claimUntil < now) {
-        await releaseExpiredHiddenScanClaims({ agencyId: req.auth.agencyId, creatorId, now });
-        return res.status(409).json({ ok: false, code: "HIDDEN_SCAN_CLAIM_EXPIRED", error: "Hidden scan claim expired; another worker may take over", claimUntil: row.claimUntil.toISOString ? row.claimUntil.toISOString() : row.claimUntil });
-      }
-    }
     const prev = hiddenScanState(row);
-    const pauseForPriority = req.body?.pauseForPriority === true || req.body?.releaseOnly === true || String(req.body?.pauseReason || "") === "bump_backpressure";
-    if (pauseForPriority) {
-      const scanEveryDays = Math.max(1, Math.min(30, positiveInt(req.body?.scanEveryDays || prev.scanEveryDays, 7)));
-      const nextOffset = Math.max(0, Number(req.body?.nextOffset ?? prev.nextOffset ?? 0) || 0);
-      const pauseMs = Math.max(5000, Math.min(5 * 60 * 1000, positiveInt(req.body?.priorityPauseMs || req.body?.pauseMs, 45000)));
-      const nextPageAt = new Date(now.getTime() + pauseMs);
-      const state = jsonObject({
-        ...prev,
-        hiddenScan: true,
-        scanEveryDays,
-        status: "paused",
-        serverStatus: "hidden_scan_queued",
-        workerStatus: "paused_for_bumps",
-        hasMore: req.body?.hasMore !== false,
-        keepClaim: false,
-        pausedForPriority: true,
-        pauseReason: cleanString(req.body?.pauseReason || "bump_backpressure", 120) || "bump_backpressure",
-        priorityPauseMs: pauseMs,
-        nextOffset,
-        nextPageAt: nextPageAt.toISOString(),
-        lastCheckedAt: now.toISOString(),
-        lastError: null,
-        claimedByDeviceId: null,
-        claimUntil: null,
-      });
-      const item = await prisma.automationDelivery.update({
-        where: { id: row.id },
-        data: {
-          status: "hidden_scan_queued",
-          scheduledAt: nextPageAt,
-          claimedByDeviceId: null,
-          claimedAt: null,
-          claimUntil: null,
-          lastCheckedAt: now,
-          result: state,
-          error: null,
-        },
-      });
-      return res.json({ ok: true, creatorId, pausedForPriority: true, item: mapAutomationDelivery(item), scanState: hiddenScanState(item), upsert: { inserted: 0, updated: 0, items: [] }, counts: [], nextPageAt: nextPageAt.toISOString() });
-    }
-
     const upsert = await upsertHiddenCandidateRows({ agencyId: req.auth.agencyId, creatorId, items: req.body?.items || req.body?.candidates || [], scanJobId: row.id });
     const scanned = Number(prev.scanned || 0) + Math.max(0, Number(req.body?.scanned || req.body?.pageSize || 0) || 0);
     const hiddenSeen = Number(prev.hiddenSeen || 0) + Math.max(0, Number(req.body?.hiddenSeen || upsert.items.length || 0) || 0);
@@ -2128,15 +1257,6 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const done = req.body?.done === true || hasMore === false;
     const scanEveryDays = Math.max(1, Math.min(30, positiveInt(req.body?.scanEveryDays || prev.scanEveryDays, 7)));
     const nextOffset = Math.max(0, Number(req.body?.nextOffset ?? prev.nextOffset ?? 0) || 0);
-    const keepClaim = req.body?.keepClaim === true && !done && !req.body?.error;
-    const claimTimeoutSec = hiddenScanClaimTimeoutSec(req.body?.claimTimeoutSec);
-    const keepClaimUntil = new Date(now.getTime() + claimTimeoutSec * 1000);
-    const nextPageAt = new Date(now.getTime() + 250);
-    const nextWeeklyScanAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : null;
-    const preservedWeeklyNextScanAt = !done && prev.nextScanAt && Date.parse(prev.nextScanAt) > now.getTime() + 10 * 60 * 1000
-      ? new Date(Date.parse(prev.nextScanAt))
-      : null;
-    const rowScheduledAt = done ? nextWeeklyScanAt : (keepClaim ? (row.scheduledAt || now) : nextPageAt);
     const state = jsonObject({
       ...prev,
       scanned,
@@ -2146,35 +1266,27 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       pages,
       nextOffset,
       hasMore,
-      status: done ? "done" : (keepClaim ? "scanning" : "queued"),
-      serverStatus: done ? "hidden_scan_done" : (keepClaim ? "hidden_scan_claimed" : "hidden_scan_queued"),
-      workerStatus: done ? "done" : (keepClaim ? "claimed" : "takeover_ready"),
+      status: done ? "done" : "queued",
       lastPageAt: now.toISOString(),
-      nextPageAt: done ? null : nextPageAt.toISOString(),
-      // nextScanAt is ONLY the next weekly scan-run time. It is never the
-      // next page/chunk continuation timestamp.
-      nextScanAt: done ? nextWeeklyScanAt.toISOString() : (preservedWeeklyNextScanAt ? preservedWeeklyNextScanAt.toISOString() : null),
-      finishedAt: done ? now.toISOString() : null,
+      finishedAt: done ? now.toISOString() : prev.finishedAt || null,
       lastError: req.body?.error || null,
-      keepClaim,
-      claimedByDeviceId: keepClaim ? (row.claimedByDeviceId || deviceId || "unknown") : null,
-      claimUntil: keepClaim ? keepClaimUntil.toISOString() : null,
     });
+    const nextScheduledAt = done ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000) : new Date(now.getTime() + 1000);
     const item = await prisma.automationDelivery.update({
       where: { id: row.id },
       data: {
-        status: done ? "hidden_scan_done" : (keepClaim ? "hidden_scan_claimed" : "hidden_scan_queued"),
-        scheduledAt: rowScheduledAt,
-        claimedByDeviceId: keepClaim ? (row.claimedByDeviceId || deviceId || "unknown") : null,
-        claimedAt: keepClaim ? (row.claimedAt || now) : null,
-        claimUntil: keepClaim ? keepClaimUntil : null,
+        status: done ? "hidden_scan_done" : "hidden_scan_queued",
+        scheduledAt: nextScheduledAt,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
         lastCheckedAt: now,
         result: state,
         error: req.body?.error ? optionalString(req.body.error, 2000) : null,
       },
     });
     const counts = await prisma.hiddenOnlineUser.groupBy({ by: ["status"], where: { agencyId: req.auth.agencyId, creatorId }, _count: { _all: true } }).catch(() => []);
-    return res.json({ ok: true, creatorId, item: mapAutomationDelivery(item), scanState: hiddenScanState(item), upsert, counts, nextScanAt: nextWeeklyScanAt ? nextWeeklyScanAt.toISOString() : (preservedWeeklyNextScanAt ? preservedWeeklyNextScanAt.toISOString() : null), nextPageAt: !done ? nextPageAt.toISOString() : null });
+    return res.json({ ok: true, creatorId, item: mapAutomationDelivery(item), scanState: hiddenScanState(item), upsert, counts, nextScanAt: nextScheduledAt.toISOString() });
   } catch (err) { return sendError(res, err, "HIDDEN_SCAN_PROGRESS_FAILED"); }
 });
 
@@ -2182,8 +1294,6 @@ router.get("/hidden-online/scan-state", async (req, res) => {
   try {
     const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
-    const now = new Date();
-    await releaseExpiredHiddenScanClaims({ agencyId: req.auth.agencyId, creatorId, now });
     const job = await prisma.automationDelivery.findUnique({ where: { id: hiddenScanJobId(creatorId) } }).catch(() => null);
     const [total, active, ignored, blocked] = await Promise.all([
       prisma.hiddenOnlineUser.count({ where: { agencyId: req.auth.agencyId, creatorId } }),
@@ -2200,35 +1310,10 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const now = new Date();
-    const globalSafety = await readBumpSafety({ agencyId: req.auth.agencyId, creatorId });
-    const range = onlineSpacingRange({ ...(req.body || {}), ...(globalSafety || {}) });
-    const requestedLimit = Math.max(1, Math.min(200, positiveInt(req.body?.limit ?? req.body?.hiddenRefillSize ?? globalSafety.hiddenRefillSize, globalSafety.hiddenRefillSize || 10)));
-    const maxActiveHiddenQueued = hiddenQueueCap({ ...(req.body || {}), ...(globalSafety || {}) });
-    const cadenceHours = Math.max(1, Math.min(720, Number(
-      req.body?.hiddenRetryAfterNoReplyHours ??
-      req.body?.hiddenNoReplyRetryHours ??
-      req.body?.hiddenCadenceHours ??
-      req.body?.cadenceHours ??
-      globalSafety.hiddenRetryAfterNoReplyHours ??
-      12
-    ) || 12));
-    const replyTimeoutHours = Math.max(1, Math.min(72, Number(
-      req.body?.hiddenDeleteAfterNoReplyHours ??
-      req.body?.hiddenNoReplyDeleteAfterHours ??
-      req.body?.hiddenReplyTimeoutHours ??
-      req.body?.replyTimeoutHours ??
-      globalSafety.hiddenReplyTimeoutHours ??
-      6
-    ) || 6));
-
-    const activeHiddenQueued = await prisma.automationDelivery.count({
-      where: { agencyId: req.auth.agencyId, creatorId, trigger: BUMP_TRIGGER_KEYS.HIDDEN, status: { in: HIDDEN_SEND_SLOT_STATUSES } },
-    });
-    const availableSlots = Math.max(0, maxActiveHiddenQueued - activeHiddenQueued);
-    const limit = Math.min(requestedLimit, availableSlots);
-    if (limit <= 0) {
-      return res.json({ ok: true, creatorId, count: 0, items: [], skipped: [], code: "HIDDEN_QUEUE_CAP_REACHED", activeHiddenQueued, maxActiveHiddenQueued });
-    }
+    const range = onlineSpacingRange(req.body || {});
+    const limit = Math.max(1, Math.min(200, positiveInt(req.body?.limit, 50)));
+    const cadenceHours = Math.max(1, Math.min(168, Number(req.body?.cadenceHours || req.body?.hiddenCadenceHours || 3) || 3));
+    const replyTimeoutHours = Math.max(1, Math.min(24, Number(req.body?.replyTimeoutHours || req.body?.hiddenReplyTimeoutHours || 1) || 1));
 
     const candidates = await prisma.hiddenOnlineUser.findMany({
       where: { agencyId: req.auth.agencyId, creatorId, status: "active" },
@@ -2280,11 +1365,7 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
               reason: meta.reason || "hidden online candidate",
               replyTimeoutHours,
               hiddenReplyTimeoutHours: replyTimeoutHours,
-              hiddenDeleteAfterNoReplyHours: replyTimeoutHours,
-              hiddenNoReplyDeleteAfterHours: replyTimeoutHours,
               hiddenCadenceHours: cadenceHours,
-              hiddenRetryAfterNoReplyHours: cadenceHours,
-              hiddenNoReplyRetryHours: cadenceHours,
               minFanSpacingSec: range.min,
               maxFanSpacingSec: range.max,
               queuedAt: now.toISOString(),
@@ -2293,24 +1374,10 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
           },
         });
         items.push(item);
-        // While the outgoing hidden bump is pending we also block this candidate until
-        // delete-after-no-reply + retry-after-no-reply. cancel-result will refresh this
-        // value from the real finalizedAt timestamp, but this conservative value prevents
-        // requeue storms if a worker dies before reporting final cancel/reply.
-        const hiddenPendingUntil = new Date(scheduledAt.getTime() + replyTimeoutHours * 60 * 60 * 1000).toISOString();
-        const nextEligibleAt = new Date(scheduledAt.getTime() + (replyTimeoutHours + cadenceHours) * 60 * 60 * 1000).toISOString();
+        const nextEligibleAt = new Date(now.getTime() + cadenceHours * 60 * 60 * 1000).toISOString();
         await tx.hiddenOnlineUser.update({
           where: { id: c.id },
-          data: { metadata: jsonObject({
-            ...meta,
-            lastHiddenQueuedAt: now.toISOString(),
-            hiddenPendingUntil,
-            nextEligibleAt,
-            hiddenCadenceHours: cadenceHours,
-            hiddenRetryAfterNoReplyHours: cadenceHours,
-            hiddenReplyTimeoutHours: replyTimeoutHours,
-            hiddenDeleteAfterNoReplyHours: replyTimeoutHours,
-          }) },
+          data: { metadata: jsonObject({ ...meta, lastHiddenQueuedAt: now.toISOString(), nextEligibleAt, hiddenCadenceHours: cadenceHours, hiddenReplyTimeoutHours: replyTimeoutHours }) },
         });
         cursor = new Date(scheduledAt.getTime() + randomOnlineSpacingMs(range));
       }
@@ -2321,25 +1388,7 @@ router.post("/hidden-online/queue-eligible", async (req, res) => {
       return { items, gateNextAllowedAt: cursor };
     }, { timeout: 15000 });
 
-    return res.json({
-      ok: true,
-      creatorId,
-      triggerKey: BUMP_TRIGGER_KEYS.HIDDEN,
-      count: result.items.length,
-      items: result.items.map(mapAutomationDelivery),
-      skipped,
-      skippedCount: skipped.length,
-      gateNextAllowedAt: result.gateNextAllowedAt.toISOString(),
-      minFanSpacingSec: range.min,
-      maxFanSpacingSec: range.max,
-      cadenceHours,
-      replyTimeoutHours,
-      hiddenRetryAfterNoReplyHours: cadenceHours,
-      hiddenDeleteAfterNoReplyHours: replyTimeoutHours,
-      hiddenRefillSize: requestedLimit,
-      activeHiddenQueued,
-      maxActiveHiddenQueued,
-    });
+    return res.json({ ok: true, creatorId, triggerKey: BUMP_TRIGGER_KEYS.HIDDEN, count: result.items.length, items: result.items.map(mapAutomationDelivery), skipped, skippedCount: skipped.length, gateNextAllowedAt: result.gateNextAllowedAt.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, cadenceHours, replyTimeoutHours });
   } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_QUEUE_ELIGIBLE_FAILED"); }
 });
 
@@ -2721,7 +1770,7 @@ router.post("/follow-back/worker/claim", async (req, res) => {
   try {
     const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
     const deviceId = cleanString(req.body?.deviceId || req.body?.claimedByDeviceId || "unknown", 120) || "unknown";
-    const limit = parseLimit(req.body?.limit, 1, 20);
+    const limit = parseLimit(req.body?.limit, 1, 10);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
 
     const nowMs = Date.now();
@@ -2874,13 +1923,6 @@ router.get("/deliveries/bump-stats", async (req, res) => {
     }
 
     const rows = await prisma.bumpDeliveryStat.findMany({ where, orderBy: { day: "desc" }, take: parseLimit(req.query?.limit, 500, 5000) });
-    const liveSentRows = await loadUncountedLiveSentRows({
-      agencyId: req.auth.agencyId,
-      creatorId,
-      fromDay,
-      toDay,
-      limit: parseLimit(req.query?.liveLimit, 10000, 50000),
-    });
 
     // Сводки: всего и по шаблону. sentToday/repliedToday are UTC-day buckets,
     // the same compact source used by bump list counters.
@@ -2901,22 +1943,12 @@ router.get("/deliveries/bump-stats", async (req, res) => {
         byTemplate[t].repliedToday += r.replied || 0;
       }
     }
-    for (const row of liveSentRows || []) {
-      const day = liveSentStatDay(row);
-      const t = deliveryTemplateId(row) || "";
-      totals.sent += 1;
-      if (day === today) totals.sentToday += 1;
-      if (!byTemplate[t]) byTemplate[t] = { templateId: t, sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, sentToday: 0, repliedToday: 0 };
-      byTemplate[t].sent += 1;
-      if (day === today) byTemplate[t].sentToday += 1;
-    }
-
     const rate = (rep, sent) => (sent > 0 ? Math.round((rep / sent) * 10000) / 100 : 0);
     totals.replyRate = rate(totals.replied, totals.sent);
     const perTemplate = Object.values(byTemplate).map((t) => ({ ...t, replyRate: rate(t.replied, t.sent) }))
       .sort((a, b) => b.replyRate - a.replyRate);
 
-    return res.json({ ok: true, totals, perTemplate, days: rows, liveUncountedSent: liveSentRows.length });
+    return res.json({ ok: true, totals, perTemplate, days: rows });
   } catch (err) { return sendError(res, err, "BUMP_STATS_READ_FAILED"); }
 });
 
