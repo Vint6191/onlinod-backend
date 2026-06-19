@@ -624,7 +624,22 @@ router.post("/deliveries/upsert", async (req, res) => {
 
     let item;
     if (id) {
-      item = await prisma.automationDelivery.upsert({ where: { id }, create: data, update: updateData });
+      // v19.33.9: avoid Prisma upsert(create) for user/server supplied IDs.
+      // In Neon/Prisma this sometimes throws P2016 "Expected a valid parent ID"
+      // when the row is missing and the model has required parent relations.
+      // Explicit find -> update/create is slower but deterministic.
+      const existingById = await prisma.automationDelivery.findUnique({
+        where: { id },
+        select: { id: true, agencyId: true, creatorId: true },
+      }).catch(() => null);
+      if (existingById?.id) {
+        if (existingById.agencyId !== req.auth.agencyId || existingById.creatorId !== creatorId) {
+          return res.status(409).json({ ok: false, code: "DELIVERY_ID_CONFLICT", error: "delivery id belongs to another creator" });
+        }
+        item = await prisma.automationDelivery.update({ where: { id: existingById.id }, data: updateData });
+      } else {
+        item = await prisma.automationDelivery.create({ data: { ...data, id } });
+      }
     } else if (data.messageId) {
       const existing = await prisma.automationDelivery.findFirst({
         where: { agencyId: req.auth.agencyId, creatorId, messageId: data.messageId },
@@ -1283,9 +1298,11 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const pauseForPriority = req.body?.pauseForPriority === true;
     const requestedBackoffMs = Math.max(0, Math.min(24 * 60 * 60 * 1000, Number(req.body?.backoffMs || req.body?.priorityPauseMs || 0) || 0));
     const authBackoffMs = errorText && /invalid|expired|access token|auth|unauthorized|forbidden/i.test(errorText) ? 10 * 60 * 1000 : 0;
-    const backoffMs = done ? 0 : Math.max(requestedBackoffMs, authBackoffMs, pauseForPriority ? 45 * 1000 : 0);
+    const browserBackoffMs = errorText && /browser tab.*not found|tab for account.*not found|account browser page.*not on onlyfans|page is not on onlyfans/i.test(errorText) ? 15 * 60 * 1000 : 0;
+    const browserMissing = browserBackoffMs > 0 || String(req.body?.workerStatus || "").toLowerCase().includes("browser_tab_missing");
+    const backoffMs = done ? 0 : Math.max(requestedBackoffMs, authBackoffMs, browserBackoffMs, pauseForPriority ? 45 * 1000 : 0);
     const stateStatus = done ? "done" : (backoffMs > 0 ? "cooldown" : "queued");
-    const workerStatus = cleanString(req.body?.workerStatus || (pauseForPriority ? "paused_for_bumps" : (errorText ? "error_backoff" : "queued")), 80);
+    const workerStatus = cleanString(req.body?.workerStatus || (browserMissing ? "browser_tab_missing" : pauseForPriority ? "paused_for_bumps" : (errorText ? "error_backoff" : "queued")), 80);
     const nextScheduledAt = done
       ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000)
       : new Date(now.getTime() + (backoffMs > 0 ? backoffMs : 1000));
@@ -1307,7 +1324,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       // Do not keep a stale `local_bump_queue` pause reason after the page
       // finished. The UI used that stale reason to show a fake waiting-worker
       // state even while the scheduler was correctly processing scan pages.
-      pauseReason: pauseForPriority ? "local_bump_queue" : null,
+      pauseReason: browserMissing ? "browser_tab_missing" : (pauseForPriority ? "local_bump_queue" : null),
       pausedForPriority: pauseForPriority || false,
       backoffMs: backoffMs || undefined,
       nextPageAt: done ? null : nextScheduledAt.toISOString(),
