@@ -1638,12 +1638,14 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
     const errorText = cleanString(req.body?.error || "", 2000);
     const pauseForPriority = req.body?.pauseForPriority === true;
     const requestedBackoffMs = Math.max(0, Math.min(24 * 60 * 60 * 1000, Number(req.body?.backoffMs || req.body?.priorityPauseMs || 0) || 0));
-    const authBackoffMs = errorText && /invalid|expired|access token|auth|unauthorized|forbidden/i.test(errorText) ? 10 * 60 * 1000 : 0;
+    const runtimeAuthMissing = Boolean(errorText && /runtime auth context.*missing|auth context.*missing|runtime context.*missing/i.test(errorText)) || String(req.body?.workerStatus || "").toLowerCase().includes("auth_context_wait");
+    const authBackoffMs = errorText && !runtimeAuthMissing && /invalid|expired|access token|auth|unauthorized|forbidden/i.test(errorText) ? 10 * 60 * 1000 : 0;
+    const runtimeAuthBackoffMs = runtimeAuthMissing ? 5 * 60 * 1000 : 0;
     const browserBackoffMs = errorText && /browser tab.*not found|tab for account.*not found|account browser page.*not on onlyfans|page is not on onlyfans/i.test(errorText) ? 15 * 60 * 1000 : 0;
     const browserMissing = browserBackoffMs > 0 || String(req.body?.workerStatus || "").toLowerCase().includes("browser_tab_missing");
-    const backoffMs = done ? 0 : Math.max(requestedBackoffMs, authBackoffMs, browserBackoffMs, pauseForPriority ? 45 * 1000 : 0);
+    const backoffMs = done ? 0 : Math.max(requestedBackoffMs, runtimeAuthBackoffMs, authBackoffMs, browserBackoffMs, pauseForPriority ? 45 * 1000 : 0);
     const stateStatus = done ? "done" : (backoffMs > 0 ? "cooldown" : "queued");
-    const workerStatus = cleanString(req.body?.workerStatus || (browserMissing ? "browser_tab_missing" : pauseForPriority ? "paused_for_bumps" : (errorText ? "error_backoff" : "queued")), 80);
+    const workerStatus = cleanString(req.body?.workerStatus || (runtimeAuthMissing ? "auth_context_wait" : browserMissing ? "browser_tab_missing" : pauseForPriority ? "paused_for_bumps" : (errorText ? "error_backoff" : "queued")), 80);
     const nextScheduledAt = done
       ? new Date(now.getTime() + scanEveryDays * 24 * 60 * 60 * 1000)
       : new Date(now.getTime() + (backoffMs > 0 ? backoffMs : 1000));
@@ -1665,7 +1667,7 @@ router.post("/hidden-online/scan-jobs/progress", async (req, res) => {
       // Do not keep a stale `local_bump_queue` pause reason after the page
       // finished. The UI used that stale reason to show a fake waiting-worker
       // state even while the scheduler was correctly processing scan pages.
-      pauseReason: browserMissing ? "browser_tab_missing" : (pauseForPriority ? "local_bump_queue" : null),
+      pauseReason: runtimeAuthMissing ? "runtime_auth_context_missing" : browserMissing ? "browser_tab_missing" : (pauseForPriority ? "local_bump_queue" : null),
       pausedForPriority: pauseForPriority || false,
       backoffMs: backoffMs || undefined,
       nextPageAt: done ? null : nextScheduledAt.toISOString(),
