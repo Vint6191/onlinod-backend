@@ -397,6 +397,33 @@ const AUTOMATION_ANY_CLAIM_STATUSES = new Set([
 ]);
 const AUTOMATION_TERMINAL_ROW_STATUSES = new Set(["replied", "canceled", "expired", "failed", "skipped"]);
 
+// v19.34.2: send results now distinguish hard terminal outcomes from
+// soft scheduling pressure and unknown post-send states. Soft limits stay in
+// the active queue; request timeouts become send_unknown so we never blindly
+// retry a message that OF may already have accepted.
+const AUTOMATION_SOFT_RETRY_CODES = new Set([
+  "BUMP_HOURLY_LIMIT",
+  "BUMP_DAILY_LIMIT",
+  "BUMP_COOLDOWN",
+  "LOCAL_BUMP_SEND_SPACING_WAIT",
+  "LOCAL_BUMP_SEND_NOT_DUE",
+  "BUMP_SEND_ALREADY_RUNNING",
+  "BUMP_FAN_QUIET_WINDOW",
+  "FAN_QUIET_WINDOW",
+  "ACCOUNT_COOLDOWN",
+  "BUMP_ACCOUNT_COOLDOWN",
+  "BUMP_DELAYED_BY_SERVER_GATE",
+]);
+const AUTOMATION_SEND_UNKNOWN_CODES = new Set([
+  "REQUEST_TIMEOUT",
+  "REQUEST_FAILED",
+  "ONLINE_BUMP_SEND_EXCEPTION",
+  "BROWSER_API_REQUEST_TIMEOUT",
+  "NETWORK_ERROR",
+  "ETIMEDOUT",
+  "ECONNRESET",
+]);
+
 function stripUndefinedFields(input = {}) {
   const out = {};
   for (const [key, value] of Object.entries(input || {})) {
@@ -408,6 +435,39 @@ function stripUndefinedFields(input = {}) {
 function deliveryStatAlreadyCounted(row = {}) {
   const meta = deliveryMeta(row);
   return Boolean(meta.statCounted === true || meta.statCountedAt || meta.statCountedStatus);
+}
+
+function automationResultCode(input = {}, meta = {}) {
+  return cleanString(
+    input.code || input.resultCode || input.statusCode || input.errorCode ||
+    meta.code || meta.resultCode || meta.statusCode || meta.errorCode ||
+    meta.retryReason || meta.sendResultStatus || "",
+    120
+  ).toUpperCase();
+}
+
+function isSoftRetryResult(status = "", code = "") {
+  const s = cleanString(status, 40).toLowerCase();
+  const c = cleanString(code, 120).toUpperCase();
+  return s === "retry_wait" || s === "soft_retry" || s === "soft_limited" || AUTOMATION_SOFT_RETRY_CODES.has(c);
+}
+
+function isSendUnknownResult(status = "", code = "", input = {}, meta = {}) {
+  const s = cleanString(status, 40).toLowerCase();
+  const c = cleanString(code, 120).toUpperCase();
+  if (s === "send_unknown" || s === "unknown" || AUTOMATION_SEND_UNKNOWN_CODES.has(c)) return true;
+  const text = String(input.error || input.message || meta.error || meta.message || meta.lastError || "").toLowerCase();
+  return text.includes("timed out") || text.includes("timeout") || text.includes("network") || text.includes("socket hang up");
+}
+
+function automationRetryAt(input = {}, meta = {}, fallbackMs = 5 * 60 * 1000) {
+  const raw = input.retryAt || input.nextScheduledAt || input.nextDueAt || input.nextAllowedAt ||
+    meta.retryAt || meta.nextScheduledAt || meta.nextDueAt || meta.nextAllowedAt ||
+    meta.quietUntil || meta.verifyAt || null;
+  const parsed = parseDate(raw);
+  if (parsed && parsed.getTime() > Date.now()) return parsed;
+  const wait = Math.max(30 * 1000, Math.min(24 * 60 * 60 * 1000, Number(input.waitMs || input.retryAfterMs || meta.waitMs || meta.retryAfterMs || fallbackMs) || fallbackMs));
+  return new Date(Date.now() + wait);
 }
 
 function normalizeDeliveryWriteData(data = {}) {
@@ -728,7 +788,7 @@ function onlineGateNextAllowed(row, now) {
   return Number.isFinite(t) && t > now.getTime() ? new Date(t) : now;
 }
 
-const ONLINE_SEND_ACTIVE_STATUSES = ["online_queued", "online_claimed", "send_reserved", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
+const ONLINE_SEND_ACTIVE_STATUSES = ["online_queued", "online_claimed", "send_reserved", "send_unknown", "retry_wait", "pending_reply", "sent", "checking_reply", "cancel_claimed"];
 
 router.get("/deliveries/fan-state", async (req, res) => {
   try {
@@ -782,7 +842,7 @@ router.get("/deliveries/health", async (req, res) => {
     const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
     const now = new Date();
-    const [byStatus, byTrigger, staleClaims, dueHot, dueHidden, pendingReply, terminalToday] = await Promise.all([
+    const [byStatus, byTrigger, staleClaims, dueHot, dueHidden, pendingReply, terminalToday, retryWait, sendUnknown, softLimited] = await Promise.all([
       prisma.automationDelivery.groupBy({ by: ["status"], where: { agencyId: req.auth.agencyId, creatorId }, _count: { _all: true } }).catch(() => []),
       prisma.automationDelivery.groupBy({ by: ["trigger"], where: { agencyId: req.auth.agencyId, creatorId }, _count: { _all: true } }).catch(() => []),
       prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "send_reserved", "cancel_claimed", "hidden_scan_claimed"] }, OR: [{ claimUntil: null }, { claimUntil: { lt: now } }, { claimedByDeviceId: null }] } }).catch(() => 0),
@@ -790,6 +850,9 @@ router.get("/deliveries/health", async (req, res) => {
       prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", trigger: "hiddenOnlineSignal", scheduledAt: { lte: now } } }).catch(() => 0),
       prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "pending_reply" } }).catch(() => 0),
       prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: { in: Array.from(AUTOMATION_TERMINAL_ROW_STATUSES) }, updatedAt: { gte: new Date(now.toISOString().slice(0,10) + "T00:00:00.000Z") } } }).catch(() => 0),
+      prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", result: { path: ["softRetry"], equals: true } } }).catch(() => 0),
+      prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "send_unknown" } }).catch(() => 0),
+      prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", OR: Array.from(AUTOMATION_SOFT_RETRY_CODES).map((code) => ({ result: { path: ["retryReason"], equals: code } })) } }).catch(() => 0),
     ]);
     return res.json({
       ok: true,
@@ -802,6 +865,9 @@ router.get("/deliveries/health", async (req, res) => {
         dueHidden,
         pendingReply,
         terminalToday,
+        retryWait,
+        sendUnknown,
+        softLimited,
       },
     });
   } catch (err) { return sendError(res, err, "AUTOMATION_DELIVERY_HEALTH_FAILED"); }
@@ -1171,7 +1237,7 @@ router.post("/deliveries/online-send-result", async (req, res) => {
     if (!id) return res.status(400).json({ ok: false, code: "ONLINE_QUEUE_ID_MISSING", error: "delivery id is required" });
 
     const row = await prisma.automationDelivery.findFirst({
-      where: { id, agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "online_queued", "send_reserved", "pending_reply", "failed", "skipped"] } },
+      where: { id, agencyId: req.auth.agencyId, creatorId, status: { in: ["online_claimed", "online_queued", "send_reserved", "pending_reply", "failed", "skipped", "retry_wait", "send_unknown"] } },
     });
     if (!row) return res.json({ ok: true, alreadyDone: true, item: null, code: "ONLINE_QUEUE_ROW_NOT_FOUND" });
 
@@ -1192,6 +1258,65 @@ router.post("/deliveries/online-send-result", async (req, res) => {
       messageId: messageId || row.messageId || null,
       lifecycle: status === "done" ? "waiting_reply" : "active",
     });
+    const resultCode = automationResultCode(req.body || {}, meta);
+
+    if (isSoftRetryResult(status, resultCode)) {
+      const retryAt = automationRetryAt(req.body || {}, meta, resultCode === "BUMP_HOURLY_LIMIT" ? 60 * 60 * 1000 : 5 * 60 * 1000);
+      const nextMeta = jsonObject({
+        ...meta,
+        lifecycle: "active",
+        softRetry: true,
+        retryReason: resultCode || status || "SOFT_RETRY",
+        retryAt: retryAt.toISOString(),
+        terminalAt: null,
+        finalStatus: null,
+      });
+      const updated = await prisma.automationDelivery.updateMany({
+        where: { id: row.id, agencyId: req.auth.agencyId, creatorId },
+        data: {
+          status: "online_queued",
+          scheduledAt: retryAt,
+          sentAt: null,
+          claimedByDeviceId: null,
+          claimedAt: null,
+          claimUntil: null,
+          lastCheckedAt: now,
+          result: nextMeta,
+          error: optionalString(resultCode || "soft retry; returned to queue", 2000),
+        },
+      });
+      const item = updated.count > 0 ? await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null) : null;
+      return res.json({ ok: true, compacted: false, requeued: true, status: "online_queued", retryAt: retryAt.toISOString(), item: item ? mapAutomationDelivery(item) : null, deliveryId: row.id, result: nextMeta, code: resultCode || "SOFT_RETRY" });
+    }
+
+    if (isSendUnknownResult(status, resultCode, req.body || {}, meta)) {
+      const verifyAt = automationRetryAt(req.body || {}, meta, 5 * 60 * 1000);
+      const nextMeta = jsonObject({
+        ...meta,
+        lifecycle: "send_unknown",
+        sendUnknown: true,
+        verifyAt: verifyAt.toISOString(),
+        retryAt: verifyAt.toISOString(),
+        retryReason: resultCode || status || "SEND_UNKNOWN",
+        terminalAt: null,
+        finalStatus: null,
+      });
+      const updated = await prisma.automationDelivery.updateMany({
+        where: { id: row.id, agencyId: req.auth.agencyId, creatorId },
+        data: {
+          status: "send_unknown",
+          scheduledAt: verifyAt,
+          claimedByDeviceId: null,
+          claimedAt: null,
+          claimUntil: null,
+          lastCheckedAt: now,
+          result: nextMeta,
+          error: optionalString(req.body?.error || inputResult.error || resultCode || "send result unknown; verification required", 2000),
+        },
+      });
+      const item = updated.count > 0 ? await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null) : null;
+      return res.json({ ok: true, compacted: false, sendUnknown: true, status: "send_unknown", verifyAt: verifyAt.toISOString(), item: item ? mapAutomationDelivery(item) : null, deliveryId: row.id, result: nextMeta, code: resultCode || "SEND_UNKNOWN" });
+    }
 
     if (status === "done") {
       if (!messageId && !row.messageId) {
