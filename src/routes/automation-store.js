@@ -1662,10 +1662,34 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
     const existing = await prisma.automationDelivery.findUnique({ where: { id } }).catch(() => null);
     const prev = hiddenScanState(existing || {});
     const dueAt = existing?.scheduledAt || null;
-    const due = !dueAt || dueAt <= now || req.body?.manual === true || fullScan;
-    if (existing?.id && !due && !["hidden_scan_paused", "hidden_scan_done", "failed"].includes(String(existing.status || ""))) {
-      return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || null, code: "HIDDEN_SCAN_NOT_DUE" });
+    const manual = req.body?.manual === true;
+    const due = !dueAt || dueAt <= now || manual || fullScan;
+
+    // v19.34.9: hidden scan is one pass. A completed hasMore=false job must
+    // stay done until its next scheduled scan or an explicit manual/full scan.
+    // Older logic excluded hidden_scan_done from the not-due return path, so
+    // every scheduler tick resurrected a completed scan and cursor/pages ran
+    // away (offset 900k+ / pages 9000+ with only a few thousand scanned).
+    if (existing?.id && String(existing.status || "") === "hidden_scan_done" && !due) {
+      return res.json({
+        ok: true,
+        creatorId,
+        item: mapAutomationDelivery(existing),
+        queued: false,
+        nextScanAt: dueAt?.toISOString?.() || prev.nextScanAt || null,
+        code: "HIDDEN_SCAN_DONE_NOT_DUE",
+        scanState: hiddenScanState(existing),
+      });
     }
+
+    if (existing?.id && !due && !["hidden_scan_paused", "failed"].includes(String(existing.status || ""))) {
+      return res.json({ ok: true, creatorId, item: mapAutomationDelivery(existing), queued: false, nextScanAt: dueAt?.toISOString?.() || null, code: "HIDDEN_SCAN_NOT_DUE", scanState: hiddenScanState(existing) });
+    }
+
+    const prevPages = Math.max(0, Number(prev.pages || 0) || 0);
+    const prevOffset = Math.max(0, Number(prev.nextOffset || prev.offset || 0) || 0);
+    const prevScanned = Math.max(0, Number(prev.scanned || 0) || 0);
+    const runawayCursor = (prevPages >= 2000 || prevOffset >= 200000) && (prevOffset <= 0 || (prevScanned / prevOffset) < 0.25);
 
     const state = jsonObject({
       ...prev,
@@ -1673,9 +1697,10 @@ router.post("/hidden-online/scan-jobs/enqueue", async (req, res) => {
       scanEveryDays,
       limit,
       sourceType: cleanString(req.body?.type || req.body?.subscriberType || prev.sourceType || "all", 40) || "all",
-      nextOffset: fullScan ? 0 : Math.max(0, Number(prev.nextOffset || 0) || 0),
+      nextOffset: (fullScan || runawayCursor) ? 0 : Math.max(0, Number(prev.nextOffset || 0) || 0),
       fullScan,
-      manual: req.body?.manual === true,
+      manual,
+      repairedRunawayCursor: runawayCursor || undefined,
       enqueuedAt: now.toISOString(),
       lastError: null,
     });
