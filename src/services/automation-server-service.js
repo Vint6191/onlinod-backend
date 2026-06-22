@@ -26,6 +26,7 @@ const TASK_TYPES = new Set([
   "hidden_online_list_sync",
   "follow_back",
   "sfs_hunter",
+  "sfs_comment",
   "ai_chatter",
   "social_action",
   "custom",
@@ -454,6 +455,125 @@ async function trashBump({ agencyId, userId, accountId, bumpId, permanent = fals
   return { ok: true, accountId: String(accountId || task.creatorId || ""), item: result.item ? taskToBump(result.item) : null, items };
 }
 
+function normalizeSfsCommentToTask(input = {}, accountId = null) {
+  const id = clean(input.id || input.clientId, 120);
+  const commentText = clean(input.commentText || input.messageText || input.text || "", 5000);
+  const title = clean(input.title || commentText.slice(0, 80) || "SFS comment", 180) || "SFS comment";
+  const trashedAt = input.trashedAt || input.deletedAt || null;
+  const dailyUseLimit = clampInt(input.dailyUseLimit || input.rules?.dailyUseLimit, 20, 1, 100);
+  const weight = clampInt(input.weight || input.rules?.weight, 1, 1, 100);
+  const config = {
+    schemaVersion: input.schemaVersion || 1,
+    templateType: "sfs_comment",
+    commentText,
+    // SFS comment templates are intentionally text-only. Media/price stay out
+    // of this payload so future worker logic cannot accidentally treat these
+    // as normal bump messages.
+    media: [],
+    price: 0,
+    currency: "USD",
+  };
+  return {
+    id: id || undefined,
+    clientId: id || undefined,
+    creatorId: input.creatorId || input.accountId || accountId || null,
+    type: "sfs_comment",
+    title,
+    enabled: input.enabled !== false && !trashedAt,
+    status: trashedAt ? "deleted" : (input.enabled === false ? "paused" : "active"),
+    config,
+    triggers: {},
+    rules: {
+      dailyUseLimit,
+      weight,
+      forbidSameTemplateBackToBack: input.rules?.forbidSameTemplateBackToBack !== false,
+    },
+    stats: input.stats || {},
+    metadata: cleanJsonForPrisma({
+      ...(toPlainObject(input.metadata)),
+      sfsCommentTemplate: true,
+      mediaDisabled: true,
+      priceDisabled: true,
+      createdAt: input.createdAt || null,
+      updatedAt: input.updatedAt || null,
+      trashedAt,
+      purgeAfter: input.purgeAfter || (trashedAt ? addDaysIso(trashedAt, BUMP_TRASH_RETENTION_DAYS) : null),
+      trashRetentionDays: BUMP_TRASH_RETENTION_DAYS,
+    }),
+  };
+}
+
+function taskToSfsComment(task = {}) {
+  const cfg = toPlainObject(task.config);
+  const rules = toPlainObject(task.rules);
+  const meta = toPlainObject(task.metadata);
+  const trashedAt = meta.trashedAt || (task.status === "deleted" && task.deletedAt ? task.deletedAt.toISOString() : null);
+  return {
+    schemaVersion: cfg.schemaVersion || 1,
+    id: task.clientId || task.id,
+    serverId: task.id,
+    accountId: task.creatorId || "",
+    creatorId: task.creatorId || "",
+    templateType: "sfs_comment",
+    enabled: task.enabled !== false && task.status !== "deleted",
+    title: task.title || "SFS comment",
+    commentText: cfg.commentText || cfg.messageText || "",
+    messageText: cfg.commentText || cfg.messageText || "",
+    text: cfg.commentText || cfg.messageText || "",
+    media: [],
+    price: 0,
+    dailyUseLimit: clampInt(rules.dailyUseLimit, 20, 1, 100),
+    weight: clampInt(rules.weight, 1, 1, 100),
+    rules: {
+      ...rules,
+      dailyUseLimit: clampInt(rules.dailyUseLimit, 20, 1, 100),
+      weight: clampInt(rules.weight, 1, 1, 100),
+      forbidSameTemplateBackToBack: rules.forbidSameTemplateBackToBack !== false,
+    },
+    stats: toPlainObject(task.stats),
+    trashedAt,
+    purgeAfter: meta.purgeAfter || null,
+    createdAt: task.createdAt ? task.createdAt.toISOString() : (meta.createdAt || null),
+    updatedAt: task.updatedAt ? task.updatedAt.toISOString() : (meta.updatedAt || null),
+  };
+}
+
+async function listSfsComments({ agencyId, creatorId, query = {} }) {
+  const result = await listTasks({ agencyId, query: { ...query, type: "sfs_comment", creatorId, includeDeleted: query.includeTrash ?? query.includeDeleted ?? true } });
+  const includeTrash = query.includeTrash !== "false" && query.includeTrash !== false;
+  const items = result.items.map(taskToSfsComment).filter((item) => includeTrash || !item.trashedAt);
+  return { ok: true, accountId: String(creatorId || ""), creatorId: String(creatorId || ""), items, count: items.length, source: "server" };
+}
+
+async function saveSfsComment({ agencyId, userId, accountId, input = {} }) {
+  const text = clean(input.commentText || input.messageText || input.text || "", 5000);
+  if (!text) {
+    const err = new Error("Comment text is required");
+    err.status = 400;
+    err.code = "SFS_COMMENT_TEXT_REQUIRED";
+    throw err;
+  }
+  const taskInput = normalizeSfsCommentToTask({ ...(input || {}), commentText: text }, accountId);
+  const result = await upsertTask({ agencyId, userId, input: taskInput });
+  return { ok: true, accountId: String(accountId || taskInput.creatorId || ""), item: taskToSfsComment(result.item), task: result.item };
+}
+
+async function trashSfsComment({ agencyId, userId, accountId, templateId, permanent = false, restore = false }) {
+  const id = clean(templateId, 120);
+  let task = await prisma.automationTask.findFirst({ where: { agencyId, OR: [{ id }, { clientId: id }], type: "sfs_comment" } });
+  if (!task) {
+    const err = new Error("SFS comment template not found");
+    err.status = 404;
+    err.code = "SFS_COMMENT_NOT_FOUND";
+    throw err;
+  }
+  const result = restore
+    ? await restoreTask({ agencyId, userId, taskId: task.id })
+    : await trashTask({ agencyId, userId, taskId: task.id, permanent });
+  const items = accountId ? (await listSfsComments({ agencyId, creatorId: accountId, query: { includeTrash: true } })).items : [];
+  return { ok: true, accountId: String(accountId || task.creatorId || ""), item: result.item ? taskToSfsComment(result.item) : null, items };
+}
+
 function normalizeJobStatus(value, fallback = "scheduled") {
   const status = clean(value || fallback, 40).toLowerCase() || fallback;
   return JOB_STATUSES.has(status) ? status : fallback;
@@ -716,6 +836,9 @@ module.exports = {
   listBumps,
   saveBump,
   trashBump,
+  listSfsComments,
+  saveSfsComment,
+  trashSfsComment,
   gcExpiredBumps,
   listJobs,
   enqueueJob,
