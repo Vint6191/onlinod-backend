@@ -13,12 +13,19 @@ const {
   requireCreator: sharedRequireCreator,
 } = require("./server-store-utils");
 
+const TASK_TYPE_ALIASES = Object.freeze({
+  winback: "sfs_hunter",
+  sfshunter: "sfs_hunter",
+  sfs: "sfs_hunter",
+  sfs_hunter: "sfs_hunter",
+});
+
 const TASK_TYPES = new Set([
   "bump_online",
   "hidden_online_scan",
   "hidden_online_list_sync",
   "follow_back",
-  "winback",
+  "sfs_hunter",
   "ai_chatter",
   "social_action",
   "custom",
@@ -54,7 +61,8 @@ function optional(value, max = 5000) {
 
 function normalizeTaskType(value) {
   const type = clean(value || "custom", 80).toLowerCase() || "custom";
-  return TASK_TYPES.has(type) ? type : "custom";
+  const normalized = TASK_TYPE_ALIASES[type] || type;
+  return TASK_TYPES.has(normalized) ? normalized : "custom";
 }
 
 function normalizeStatus(value, fallback = "active") {
