@@ -789,6 +789,419 @@ async function completeJob({ agencyId, jobId, input = {} }) {
   return { ok: true, item };
 }
 
+// =============================================================================
+// SFS Hunter v19.36 — server-owned target queue / forever ledger
+// =============================================================================
+const SFS_TYPE = "sfs_hunter";
+const SFS_ACTION_TARGET = "sfs_comment_target";
+const SFS_ACTION_UNFOLLOW = "sfs_unfollow_due";
+const SFS_ACTION_USED_MARKER = "sfs_used_marker";
+const SFS_DEFAULTS = Object.freeze({
+  enabled: false,
+  dailyLimit: 20,
+  maxDailyLimit: 100,
+  wallScanPosts: 40,
+  maxPinnedPosts: 5,
+  commentsMode: "all_pinned",
+  actionDelayMinSec: 10,
+  actionDelayMaxSec: 30,
+  commentDelayMinSec: 15,
+  commentDelayMaxSec: 45,
+  unfollowMinMinutes: 15,
+  unfollowMaxMinutes: 60,
+  onlyFreeTargets: true,
+  requirePinnedPosts: true,
+  skipIfCommentExists: true,
+  useTargetForever: true,
+});
+
+function normalizeSfsSettings(input = {}, prev = {}) {
+  const src = { ...(SFS_DEFAULTS || {}), ...(toPlainObject(prev)), ...(toPlainObject(input)) };
+  const dailyLimit = clampInt(src.dailyLimit, SFS_DEFAULTS.dailyLimit, 1, SFS_DEFAULTS.maxDailyLimit);
+  const unfollowMin = clampInt(src.unfollowMinMinutes, SFS_DEFAULTS.unfollowMinMinutes, 1, 240);
+  const unfollowMax = clampInt(src.unfollowMaxMinutes, SFS_DEFAULTS.unfollowMaxMinutes, unfollowMin, 360);
+  const actionMin = clampInt(src.actionDelayMinSec, SFS_DEFAULTS.actionDelayMinSec, 1, 300);
+  const actionMax = clampInt(src.actionDelayMaxSec, SFS_DEFAULTS.actionDelayMaxSec, actionMin, 600);
+  const commentMin = clampInt(src.commentDelayMinSec, SFS_DEFAULTS.commentDelayMinSec, 1, 600);
+  const commentMax = clampInt(src.commentDelayMaxSec, SFS_DEFAULTS.commentDelayMaxSec, commentMin, 900);
+  return {
+    ...SFS_DEFAULTS,
+    ...src,
+    enabled: boolValue(src.enabled, false),
+    dailyLimit,
+    maxDailyLimit: SFS_DEFAULTS.maxDailyLimit,
+    wallScanPosts: clampInt(src.wallScanPosts, SFS_DEFAULTS.wallScanPosts, 1, 100),
+    maxPinnedPosts: clampInt(src.maxPinnedPosts, SFS_DEFAULTS.maxPinnedPosts, 1, 10),
+    commentsMode: "all_pinned",
+    actionDelayMinSec: actionMin,
+    actionDelayMaxSec: actionMax,
+    commentDelayMinSec: commentMin,
+    commentDelayMaxSec: commentMax,
+    unfollowMinMinutes: unfollowMin,
+    unfollowMaxMinutes: unfollowMax,
+    onlyFreeTargets: boolValue(src.onlyFreeTargets, true),
+    requirePinnedPosts: boolValue(src.requirePinnedPosts, true),
+    skipIfCommentExists: boolValue(src.skipIfCommentExists, true),
+    useTargetForever: true,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function sfsSettingsClientId(creatorId) {
+  return `sfs_hunter_settings:${clean(creatorId, 100)}`;
+}
+
+async function getSfsHunterSettings({ agencyId, creatorId }) {
+  const cid = clean(creatorId, 100);
+  if (!agencyId || !cid) return { ok: false, code: "CREATOR_ID_MISSING", settings: normalizeSfsSettings() };
+  const task = await prisma.automationTask.findFirst({
+    where: { agencyId, creatorId: cid, type: SFS_TYPE, clientId: sfsSettingsClientId(cid) },
+  }).catch(() => null);
+  const settings = normalizeSfsSettings(task?.config || {});
+  return { ok: true, creatorId: cid, settings, item: task || null };
+}
+
+async function saveSfsHunterSettings({ agencyId, userId, creatorId, input = {} }) {
+  const cid = clean(creatorId || input.creatorId || input.accountId, 100);
+  if (!agencyId || !cid) {
+    const err = new Error("creatorId is required");
+    err.status = 400;
+    err.code = "CREATOR_ID_MISSING";
+    throw err;
+  }
+  await requireCreator(agencyId, cid);
+  const prev = await getSfsHunterSettings({ agencyId, creatorId: cid });
+  const settings = normalizeSfsSettings(input.settings || input, prev.settings || {});
+  const clientId = sfsSettingsClientId(cid);
+  const existing = await prisma.automationTask.findFirst({ where: { agencyId, clientId } }).catch(() => null);
+  const data = {
+    agencyId,
+    creatorId: cid,
+    clientId,
+    type: SFS_TYPE,
+    title: "SFS Hunter",
+    enabled: settings.enabled,
+    status: settings.enabled ? "active" : "paused",
+    config: compactJson(settings, 8000),
+    triggers: compactJson({ wallScan: true, commentTargets: true, unfollowDue: true }, 2000),
+    rules: compactJson({ dailyLimit: settings.dailyLimit, maxPinnedPosts: settings.maxPinnedPosts }, 2000),
+    metadata: compactJson({ sfsHunterSettings: true, updatedAt: new Date().toISOString() }, 2000),
+    updatedByUserId: userId || null,
+  };
+  const item = existing
+    ? await prisma.automationTask.update({ where: { id: existing.id }, data: { ...data, agencyId: undefined, createdByUserId: undefined } })
+    : await prisma.automationTask.create({ data: { ...data, createdByUserId: userId || null } });
+  return { ok: true, creatorId: cid, settings, item };
+}
+
+function extractSfsUsernamesFromText(value = "") {
+  const text = String(value || "");
+  const out = new Set();
+  const add = (raw) => {
+    const u = clean(String(raw || "").replace(/^@+/, "").replace(/^\/+/, ""), 80).toLowerCase();
+    if (!u || u.length < 2) return;
+    if (["api2", "my", "posts", "chats", "settings", "users", "messages", "notifications"].includes(u)) return;
+    if (!/^[a-z0-9_.-]{2,80}$/i.test(u)) return;
+    out.add(u);
+  };
+  for (const m of text.matchAll(/(?:^|[^a-zA-Z0-9_])@([a-zA-Z0-9_.-]{2,80})/g)) add(m[1]);
+  for (const m of text.matchAll(/href=["']\/?([a-zA-Z0-9_.-]{2,80})["']/gi)) add(m[1]);
+  return Array.from(out);
+}
+
+function sfsUsernameDedupeKey(creatorId, username) {
+  return `sfs_target_username:${clean(creatorId, 100)}:${clean(username, 80).toLowerCase()}`;
+}
+
+function sfsTargetIdDedupeKey(creatorId, targetUserId) {
+  return `sfs_target_id:${clean(creatorId, 100)}:${clean(targetUserId, 100)}`;
+}
+
+function sfsUnfollowDedupeKey(creatorId, targetUserId) {
+  return `sfs_unfollow:${clean(creatorId, 100)}:${clean(targetUserId, 100)}`;
+}
+
+async function ingestSfsTargets({ agencyId, userId, input = {} }) {
+  const creatorId = clean(input.creatorId || input.accountId, 100);
+  if (!agencyId || !creatorId) {
+    const err = new Error("creatorId is required");
+    err.status = 400;
+    err.code = "CREATOR_ID_MISSING";
+    throw err;
+  }
+  await requireCreator(agencyId, creatorId);
+  const settings = (await getSfsHunterSettings({ agencyId, creatorId })).settings;
+  const sourcePosts = Array.isArray(input.sourcePosts) ? input.sourcePosts : [];
+  const directTargets = Array.isArray(input.targets) ? input.targets : [];
+  const found = new Map();
+  const register = (username, meta = {}) => {
+    const u = clean(username, 80).replace(/^@+/, "").replace(/^\/+/, "").toLowerCase();
+    if (!u || !/^[a-z0-9_.-]{2,80}$/i.test(u)) return;
+    const prev = found.get(u) || { username: u, sourcePostIds: [], sourceTexts: [] };
+    if (meta.sourcePostId && !prev.sourcePostIds.includes(String(meta.sourcePostId))) prev.sourcePostIds.push(String(meta.sourcePostId));
+    if (meta.sourceText && prev.sourceTexts.length < 3) prev.sourceTexts.push(clean(meta.sourceText, 1000));
+    found.set(u, prev);
+  };
+  for (const t of directTargets) register(typeof t === "string" ? t : (t.username || t.targetUsername), t || {});
+  for (const post of sourcePosts) {
+    const text = String(post?.rawText || post?.text || post?.description || "");
+    for (const username of extractSfsUsernamesFromText(text)) register(username, { sourcePostId: post?.id || post?.postId, sourceText: text });
+  }
+  const usernames = Array.from(found.keys()).slice(0, 500);
+  const items = [];
+  let created = 0;
+  let skipped = 0;
+  for (const username of usernames) {
+    const dedupeKey = sfsUsernameDedupeKey(creatorId, username);
+    const existing = await prisma.automationJob.findUnique({ where: { agencyId_dedupeKey: { agencyId, dedupeKey } } }).catch(() => null);
+    if (existing) { skipped += 1; continue; }
+    const meta = found.get(username) || { username };
+    const item = await prisma.automationJob.create({
+      data: {
+        agencyId,
+        creatorId,
+        accountId: creatorId,
+        type: SFS_TYPE,
+        action: SFS_ACTION_TARGET,
+        status: settings.enabled ? "scheduled" : "scheduled",
+        priority: 0,
+        runAfter: new Date(),
+        maxAttempts: 3,
+        dedupeKey,
+        payload: compactJson({
+          targetUsername: username,
+          sourcePostIds: meta.sourcePostIds || [],
+          sourceTexts: meta.sourceTexts || [],
+          stage: "discovered",
+          discoveredAt: new Date().toISOString(),
+        }, 12000),
+        result: compactJson({}, 1000),
+        createdByUserId: userId || null,
+      },
+    });
+    created += 1;
+    items.push(item);
+  }
+  return { ok: true, creatorId, found: usernames.length, created, skipped, items };
+}
+
+async function sfsDoneTodayCount({ agencyId, creatorId }) {
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  return prisma.automationJob.count({
+    where: {
+      agencyId,
+      creatorId,
+      type: SFS_TYPE,
+      action: SFS_ACTION_TARGET,
+      status: "done",
+      completedAt: { gte: start },
+    },
+  }).catch(() => 0);
+}
+
+async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
+  const cid = clean(creatorId, 100);
+  const settings = (await getSfsHunterSettings({ agencyId, creatorId: cid })).settings;
+  const jobs = await prisma.automationJob.findMany({
+    where: { agencyId, creatorId: cid, type: SFS_TYPE, action: { in: [SFS_ACTION_TARGET, SFS_ACTION_UNFOLLOW] } },
+    orderBy: { updatedAt: "desc" },
+    take: parseLimit(query.limit, 100, 300),
+  }).catch(() => []);
+  const counts = {
+    discovered: 0,
+    queued: 0,
+    claimed: 0,
+    waitingUnfollow: 0,
+    doneForever: 0,
+    failed: 0,
+    skipped: 0,
+    canceled: 0,
+    commentedToday: await sfsDoneTodayCount({ agencyId, creatorId: cid }),
+  };
+  for (const j of jobs) {
+    if (j.action === SFS_ACTION_UNFOLLOW && ["scheduled", "claimed", "running"].includes(j.status)) counts.waitingUnfollow += 1;
+    if (j.action === SFS_ACTION_TARGET && j.status === "scheduled") counts.queued += 1;
+    if (j.status === "claimed" || j.status === "running") counts.claimed += 1;
+    if (j.status === "done") counts.doneForever += 1;
+    if (j.status === "failed") counts.failed += 1;
+    if (String(j.result?.reason || j.error || "").includes("SKIP") || j.status === "expired") counts.skipped += 1;
+    if (j.status === "canceled") counts.canceled += 1;
+  }
+  const templates = await listSfsComments({ agencyId, creatorId: cid, query: { includeTrash: false, limit: 200 } }).catch(() => ({ items: [] }));
+  return { ok: true, creatorId: cid, settings, counts, templates: templates.items || [], items: jobs };
+}
+
+async function resetStaleSfsClaims({ agencyId, claimTimeoutSec = 600 }) {
+  const staleBefore = new Date(Date.now() - clampInt(claimTimeoutSec, 600, 60, 86400) * 1000);
+  await prisma.automationJob.updateMany({
+    where: { agencyId, type: SFS_TYPE, status: { in: ["claimed", "running"] }, claimedAt: { lt: staleBefore } },
+    data: { status: "scheduled", claimedByDeviceId: null, claimedAt: null, error: "claim expired; returned to SFS queue" },
+  }).catch(() => null);
+}
+
+async function claimSfsTarget({ agencyId, input = {} }) {
+  const creatorId = clean(input.creatorId || input.accountId, 100);
+  const deviceId = clean(input.deviceId || input.claimedByDeviceId || "unknown", 120) || "unknown";
+  const settings = (await getSfsHunterSettings({ agencyId, creatorId })).settings;
+  if (!settings.enabled) return { ok: true, code: "SFS_DISABLED", items: [], settings };
+  const templates = (await listSfsComments({ agencyId, creatorId, query: { includeTrash: false, limit: 200 } }).catch(() => ({ items: [] }))).items || [];
+  const enabledTemplates = templates.filter((x) => x && x.enabled !== false && !x.trashedAt && clean(x.commentText || x.text, 5000));
+  if (!enabledTemplates.length) return { ok: true, code: "NO_SFS_TEMPLATES", items: [], settings };
+  const doneToday = await sfsDoneTodayCount({ agencyId, creatorId });
+  if (doneToday >= Number(settings.dailyLimit || 20)) return { ok: true, code: "DAILY_LIMIT_REACHED", items: [], settings, doneToday };
+  await resetStaleSfsClaims({ agencyId, claimTimeoutSec: input.claimTimeoutSec || 600 });
+  const candidates = await prisma.automationJob.findMany({
+    where: { agencyId, creatorId, type: SFS_TYPE, action: SFS_ACTION_TARGET, status: "scheduled", runAfter: { lte: new Date() } },
+    orderBy: [{ priority: "desc" }, { runAfter: "asc" }, { createdAt: "asc" }],
+    take: 5,
+  });
+  const items = [];
+  for (const c of candidates) {
+    const updated = await prisma.automationJob.updateMany({ where: { id: c.id, agencyId, status: "scheduled" }, data: { status: "claimed", claimedByDeviceId: deviceId, claimedAt: new Date(), attempts: { increment: 1 } } });
+    if (updated.count > 0) {
+      const item = await prisma.automationJob.findUnique({ where: { id: c.id } });
+      if (item) items.push(item);
+      break;
+    }
+  }
+  return { ok: true, items, count: items.length, settings, templates: enabledTemplates, doneToday };
+}
+
+async function markSfsTargetUsed({ agencyId, creatorId, targetUserId, targetUsername, sourceJobId = null, result = {} }) {
+  const tid = clean(targetUserId, 100);
+  if (!tid) return null;
+  const dedupeKey = sfsTargetIdDedupeKey(creatorId, tid);
+  const existing = await prisma.automationJob.findUnique({ where: { agencyId_dedupeKey: { agencyId, dedupeKey } } }).catch(() => null);
+  if (existing) return existing;
+  return prisma.automationJob.create({
+    data: {
+      agencyId,
+      creatorId,
+      accountId: creatorId,
+      type: SFS_TYPE,
+      action: SFS_ACTION_USED_MARKER,
+      status: "done",
+      priority: -100,
+      runAfter: new Date(),
+      maxAttempts: 1,
+      dedupeKey,
+      payload: compactJson({ targetUserId: tid, targetUsername: clean(targetUsername, 80), sourceJobId }, 2000),
+      result: compactJson({ ...(toPlainObject(result)), usedForeverAt: new Date().toISOString() }, 4000),
+      completedAt: new Date(),
+    },
+  }).catch(() => null);
+}
+
+async function completeSfsTarget({ agencyId, jobId, input = {} }) {
+  const id = clean(jobId || input.jobId || input.id, 120);
+  const existing = id ? await prisma.automationJob.findFirst({ where: { id, agencyId, type: SFS_TYPE, action: SFS_ACTION_TARGET } }) : null;
+  if (!existing) {
+    const err = new Error("SFS target job not found");
+    err.status = 404;
+    err.code = "SFS_TARGET_JOB_NOT_FOUND";
+    throw err;
+  }
+  const payload = toPlainObject(existing.payload);
+  const result = toPlainObject(input.result || input);
+  const targetUserId = clean(input.targetUserId || result.targetUserId || payload.targetUserId, 100);
+  const targetUsername = clean(input.targetUsername || result.targetUsername || payload.targetUsername, 80);
+  if (targetUserId) await markSfsTargetUsed({ agencyId, creatorId: existing.creatorId, targetUserId, targetUsername, sourceJobId: existing.id, result });
+  const status = input.ok === false || input.status === "failed" ? "failed" : "done";
+  const item = await prisma.automationJob.update({
+    where: { id: existing.id },
+    data: {
+      status,
+      result: compactJson(result, 12000),
+      error: optional(input.error || result.error, 2000),
+      completedAt: new Date(),
+      claimedByDeviceId: null,
+      claimedAt: existing.claimedAt,
+      payload: compactJson({ ...payload, targetUserId: targetUserId || payload.targetUserId || null, targetUsername: targetUsername || payload.targetUsername || null, stage: status === "done" ? "done_forever" : "failed" }, 12000),
+    },
+  });
+  const unfollowAt = safeDate(input.unfollowAt || result.unfollowAt, null);
+  if (status === "done" && targetUserId && unfollowAt) {
+    const dedupeKey = sfsUnfollowDedupeKey(existing.creatorId, targetUserId);
+    const prev = await prisma.automationJob.findUnique({ where: { agencyId_dedupeKey: { agencyId, dedupeKey } } }).catch(() => null);
+    const data = {
+      agencyId,
+      creatorId: existing.creatorId,
+      accountId: existing.creatorId,
+      fanId: targetUserId,
+      type: SFS_TYPE,
+      action: SFS_ACTION_UNFOLLOW,
+      status: "scheduled",
+      priority: -10,
+      runAfter: unfollowAt,
+      maxAttempts: 5,
+      dedupeKey,
+      payload: compactJson({ targetUserId, targetUsername, sourceTargetJobId: existing.id, unfollowAt: unfollowAt.toISOString() }, 4000),
+      result: compactJson({}, 1000),
+    };
+    if (!prev) await prisma.automationJob.create({ data }).catch(() => null);
+    else if (!["done", "canceled"].includes(prev.status)) await prisma.automationJob.update({ where: { id: prev.id }, data: { runAfter: unfollowAt, status: "scheduled", payload: data.payload } }).catch(() => null);
+  }
+  return { ok: true, item };
+}
+
+async function claimSfsUnfollow({ agencyId, input = {} }) {
+  const creatorId = clean(input.creatorId || input.accountId, 100);
+  const deviceId = clean(input.deviceId || input.claimedByDeviceId || "unknown", 120) || "unknown";
+  await resetStaleSfsClaims({ agencyId, claimTimeoutSec: input.claimTimeoutSec || 600 });
+  const candidates = await prisma.automationJob.findMany({
+    where: { agencyId, creatorId, type: SFS_TYPE, action: SFS_ACTION_UNFOLLOW, status: "scheduled", runAfter: { lte: new Date() } },
+    orderBy: [{ runAfter: "asc" }, { createdAt: "asc" }],
+    take: 5,
+  });
+  const items = [];
+  for (const c of candidates) {
+    const updated = await prisma.automationJob.updateMany({ where: { id: c.id, agencyId, status: "scheduled" }, data: { status: "claimed", claimedByDeviceId: deviceId, claimedAt: new Date(), attempts: { increment: 1 } } });
+    if (updated.count > 0) {
+      const item = await prisma.automationJob.findUnique({ where: { id: c.id } });
+      if (item) items.push(item);
+      break;
+    }
+  }
+  return { ok: true, items, count: items.length };
+}
+
+async function completeSfsUnfollow({ agencyId, jobId, input = {} }) {
+  const id = clean(jobId || input.jobId || input.id, 120);
+  const existing = id ? await prisma.automationJob.findFirst({ where: { id, agencyId, type: SFS_TYPE, action: SFS_ACTION_UNFOLLOW } }) : null;
+  if (!existing) {
+    const err = new Error("SFS unfollow job not found");
+    err.status = 404;
+    err.code = "SFS_UNFOLLOW_JOB_NOT_FOUND";
+    throw err;
+  }
+  const result = toPlainObject(input.result || input);
+  const status = input.ok === false || input.status === "failed" ? "failed" : "done";
+  const item = await prisma.automationJob.update({
+    where: { id: existing.id },
+    data: {
+      status,
+      result: compactJson(result, 8000),
+      error: optional(input.error || result.error, 2000),
+      completedAt: new Date(),
+      claimedByDeviceId: null,
+    },
+  });
+  return { ok: true, item };
+}
+
+async function checkSfsTargetUsed({ agencyId, creatorId, targetUserId = null, targetUsername = null }) {
+  const cid = clean(creatorId, 100);
+  const tid = clean(targetUserId, 100);
+  const username = clean(targetUsername, 80).toLowerCase();
+  const keys = [];
+  if (tid) keys.push(sfsTargetIdDedupeKey(cid, tid));
+  if (username) keys.push(sfsUsernameDedupeKey(cid, username));
+  if (!keys.length) return { ok: true, used: false };
+  const item = await prisma.automationJob.findFirst({ where: { agencyId, dedupeKey: { in: keys } } }).catch(() => null);
+  return { ok: true, used: !!item, item, reason: item ? "ALREADY_USED_FOREVER" : null };
+}
+
 async function logEvent({ agencyId, userId, input = {} }) {
   const item = await prisma.automationEvent.create({
     data: {
@@ -839,6 +1252,15 @@ module.exports = {
   listSfsComments,
   saveSfsComment,
   trashSfsComment,
+  checkSfsTargetUsed,
+  completeSfsUnfollow,
+  claimSfsUnfollow,
+  completeSfsTarget,
+  claimSfsTarget,
+  ingestSfsTargets,
+  listSfsHunterState,
+  saveSfsHunterSettings,
+  getSfsHunterSettings,
   gcExpiredBumps,
   listJobs,
   enqueueJob,
