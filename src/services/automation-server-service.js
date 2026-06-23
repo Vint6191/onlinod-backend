@@ -988,7 +988,7 @@ async function ingestSfsTargets({ agencyId, userId, input = {} }) {
 async function sfsDoneTodayCount({ agencyId, creatorId }) {
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
-  return prisma.automationJob.count({
+  const rows = await prisma.automationJob.findMany({
     where: {
       agencyId,
       creatorId,
@@ -997,7 +997,10 @@ async function sfsDoneTodayCount({ agencyId, creatorId }) {
       status: "done",
       completedAt: { gte: start },
     },
-  }).catch(() => 0);
+    select: { result: true },
+    take: 1000,
+  }).catch(() => []);
+  return rows.filter((row) => Number(toPlainObject(row.result).commentsSent || 0) > 0).length;
 }
 
 async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
@@ -1020,12 +1023,14 @@ async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
     commentedToday: await sfsDoneTodayCount({ agencyId, creatorId: cid }),
   };
   for (const j of jobs) {
+    const result = toPlainObject(j.result);
+    const commentsSent = Number(result.commentsSent || 0);
     if (j.action === SFS_ACTION_UNFOLLOW && ["scheduled", "claimed", "running"].includes(j.status)) counts.waitingUnfollow += 1;
     if (j.action === SFS_ACTION_TARGET && j.status === "scheduled") counts.queued += 1;
     if (j.status === "claimed" || j.status === "running") counts.claimed += 1;
-    if (j.status === "done") counts.doneForever += 1;
+    if (j.status === "done" && commentsSent > 0) counts.doneForever += 1;
     if (j.status === "failed") counts.failed += 1;
-    if (String(j.result?.reason || j.error || "").includes("SKIP") || j.status === "expired") counts.skipped += 1;
+    if (j.status === "skipped" || String(result.reason || j.error || "").includes("SKIP") || j.status === "expired") counts.skipped += 1;
     if (j.status === "canceled") counts.canceled += 1;
   }
   const templates = await listSfsComments({ agencyId, creatorId: cid, query: { includeTrash: false, limit: 200 } }).catch(() => ({ items: [] }));
@@ -1106,8 +1111,15 @@ async function completeSfsTarget({ agencyId, jobId, input = {} }) {
   const result = toPlainObject(input.result || input);
   const targetUserId = clean(input.targetUserId || result.targetUserId || payload.targetUserId, 100);
   const targetUsername = clean(input.targetUsername || result.targetUsername || payload.targetUsername, 80);
-  if (targetUserId) await markSfsTargetUsed({ agencyId, creatorId: existing.creatorId, targetUserId, targetUsername, sourceJobId: existing.id, result });
-  const status = input.ok === false || input.status === "failed" ? "failed" : "done";
+  const requestedStatus = clean(input.status || result.status, 40).toLowerCase();
+  const commentsSent = Number(result.commentsSent || 0);
+  const status = input.ok === false || requestedStatus === "failed"
+    ? "failed"
+    : requestedStatus === "skipped" || (requestedStatus !== "done" && commentsSent <= 0 && result.reason && String(result.reason) !== "SFS_COMMENTS_SENT")
+      ? "skipped"
+      : "done";
+  const shouldMarkUsed = !!targetUserId && status !== "failed" && input.markUsedForever !== false;
+  if (shouldMarkUsed) await markSfsTargetUsed({ agencyId, creatorId: existing.creatorId, targetUserId, targetUsername, sourceJobId: existing.id, result });
   const item = await prisma.automationJob.update({
     where: { id: existing.id },
     data: {
@@ -1117,11 +1129,17 @@ async function completeSfsTarget({ agencyId, jobId, input = {} }) {
       completedAt: new Date(),
       claimedByDeviceId: null,
       claimedAt: existing.claimedAt,
-      payload: compactJson({ ...payload, targetUserId: targetUserId || payload.targetUserId || null, targetUsername: targetUsername || payload.targetUsername || null, stage: status === "done" ? "done_forever" : "failed" }, 12000),
+      payload: compactJson({
+        ...payload,
+        targetUserId: targetUserId || payload.targetUserId || null,
+        targetUsername: targetUsername || payload.targetUsername || null,
+        stage: status === "done" ? "done_forever" : (status === "skipped" ? "skipped_forever" : status),
+        lastReason: result.reason || payload.lastReason || null,
+      }, 12000),
     },
   });
   const unfollowAt = safeDate(input.unfollowAt || result.unfollowAt, null);
-  if (status === "done" && targetUserId && unfollowAt) {
+  if (["done", "skipped"].includes(status) && targetUserId && unfollowAt) {
     const dedupeKey = sfsUnfollowDedupeKey(existing.creatorId, targetUserId);
     const prev = await prisma.automationJob.findUnique({ where: { agencyId_dedupeKey: { agencyId, dedupeKey } } }).catch(() => null);
     const data = {
