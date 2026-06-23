@@ -32,7 +32,7 @@ const TASK_TYPES = new Set([
   "custom",
 ]);
 
-const JOB_STATUSES = new Set(["scheduled", "claimed", "running", "done", "failed", "canceled", "expired"]);
+const JOB_STATUSES = new Set(["scheduled", "claimed", "running", "done", "skipped", "failed", "canceled", "expired"]);
 const EVENT_STATUSES = new Set(["info", "ok", "failed", "skipped", "warning"]);
 const RAW_KEY_RE = /(^|_)(raw|html|payload|headers|cookies|token|authorization|password|secret)($|_)/i;
 const BUMP_TRASH_RETENTION_DAYS = 14;
@@ -985,6 +985,18 @@ async function ingestSfsTargets({ agencyId, userId, input = {} }) {
   return { ok: true, creatorId, found: usernames.length, created, skipped, items };
 }
 
+function sfsResultComments(result = {}) {
+  const r = toPlainObject(result);
+  const comments = Array.isArray(r.comments) ? r.comments : [];
+  return comments.filter((x) => x && (x.commentId || x.id));
+}
+
+function isSfsCommentSuccess(result = {}) {
+  const r = toPlainObject(result);
+  const commentsSent = Number(r.commentsSent || 0);
+  return String(r.reason || "") === "SFS_COMMENTS_SENT" && commentsSent > 0 && sfsResultComments(r).length > 0;
+}
+
 async function sfsDoneTodayCount({ agencyId, creatorId }) {
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
@@ -1000,7 +1012,7 @@ async function sfsDoneTodayCount({ agencyId, creatorId }) {
     select: { result: true },
     take: 1000,
   }).catch(() => []);
-  return rows.filter((row) => Number(toPlainObject(row.result).commentsSent || 0) > 0).length;
+  return rows.filter((row) => isSfsCommentSuccess(row.result)).length;
 }
 
 async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
@@ -1025,16 +1037,44 @@ async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
   for (const j of jobs) {
     const result = toPlainObject(j.result);
     const commentsSent = Number(result.commentsSent || 0);
+    const success = j.action === SFS_ACTION_TARGET && j.status === "done" && isSfsCommentSuccess(result);
+    const skippedResult = j.action === SFS_ACTION_TARGET && (
+      j.status === "skipped" ||
+      j.status === "expired" ||
+      (j.status === "done" && !success && (commentsSent <= 0 || String(result.reason || "")))
+    );
     if (j.action === SFS_ACTION_UNFOLLOW && ["scheduled", "claimed", "running"].includes(j.status)) counts.waitingUnfollow += 1;
     if (j.action === SFS_ACTION_TARGET && j.status === "scheduled") counts.queued += 1;
     if (j.status === "claimed" || j.status === "running") counts.claimed += 1;
-    if (j.status === "done" && commentsSent > 0) counts.doneForever += 1;
+    if (success) counts.doneForever += 1;
     if (j.status === "failed") counts.failed += 1;
-    if (j.status === "skipped" || String(result.reason || j.error || "").includes("SKIP") || j.status === "expired") counts.skipped += 1;
+    if (skippedResult) counts.skipped += 1;
     if (j.status === "canceled") counts.canceled += 1;
   }
   const templates = await listSfsComments({ agencyId, creatorId: cid, query: { includeTrash: false, limit: 200 } }).catch(() => ({ items: [] }));
-  return { ok: true, creatorId: cid, settings, counts, templates: templates.items || [], items: jobs };
+  const normalizedJobs = jobs.map((j) => {
+    if (j.action !== SFS_ACTION_TARGET) return j;
+    const result = toPlainObject(j.result);
+    const payload = toPlainObject(j.payload);
+    const success = j.status === "done" && isSfsCommentSuccess(result);
+    if (j.status === "done" && !success) {
+      return {
+        ...j,
+        status: "skipped",
+        payload: {
+          ...payload,
+          stage: "skipped_forever",
+          lastReason: result.reason || payload.lastReason || "SFS_NO_COMMENTS_SENT",
+        },
+        result,
+      };
+    }
+    if (success && payload.stage !== "done_forever") {
+      return { ...j, payload: { ...payload, stage: "done_forever" }, result };
+    }
+    return j;
+  });
+  return { ok: true, creatorId: cid, settings, counts, templates: templates.items || [], items: normalizedJobs };
 }
 
 async function resetStaleSfsClaims({ agencyId, claimTimeoutSec = 600 }) {
@@ -1113,11 +1153,12 @@ async function completeSfsTarget({ agencyId, jobId, input = {} }) {
   const targetUsername = clean(input.targetUsername || result.targetUsername || payload.targetUsername, 80);
   const requestedStatus = clean(input.status || result.status, 40).toLowerCase();
   const commentsSent = Number(result.commentsSent || 0);
+  const successfulComment = String(result.reason || "") === "SFS_COMMENTS_SENT" && commentsSent > 0 && sfsResultComments(result).length > 0;
   const status = input.ok === false || requestedStatus === "failed"
     ? "failed"
-    : requestedStatus === "skipped" || (requestedStatus !== "done" && commentsSent <= 0 && result.reason && String(result.reason) !== "SFS_COMMENTS_SENT")
-      ? "skipped"
-      : "done";
+    : successfulComment
+      ? "done"
+      : "skipped";
   const shouldMarkUsed = !!targetUserId && status !== "failed" && input.markUsedForever !== false;
   if (shouldMarkUsed) await markSfsTargetUsed({ agencyId, creatorId: existing.creatorId, targetUserId, targetUsername, sourceJobId: existing.id, result });
   const item = await prisma.automationJob.update({
@@ -1133,7 +1174,7 @@ async function completeSfsTarget({ agencyId, jobId, input = {} }) {
         ...payload,
         targetUserId: targetUserId || payload.targetUserId || null,
         targetUsername: targetUsername || payload.targetUsername || null,
-        stage: status === "done" ? "done_forever" : (status === "skipped" ? "skipped_forever" : status),
+        stage: status === "done" && successfulComment ? "done_forever" : (status === "skipped" ? "skipped_forever" : status),
         lastReason: result.reason || payload.lastReason || null,
       }, 12000),
     },
