@@ -796,6 +796,7 @@ const SFS_TYPE = "sfs_hunter";
 const SFS_ACTION_TARGET = "sfs_comment_target";
 const SFS_ACTION_UNFOLLOW = "sfs_unfollow_due";
 const SFS_ACTION_USED_MARKER = "sfs_used_marker";
+const SFS_ACTION_COMMENT_LIKE = "sfs_comment_like";
 const SFS_DEFAULTS = Object.freeze({
   enabled: false,
   dailyLimit: 20,
@@ -813,6 +814,7 @@ const SFS_DEFAULTS = Object.freeze({
   requirePinnedPosts: true,
   skipIfCommentExists: true,
   useTargetForever: true,
+  commentLikesEnabled: true,
 });
 
 function normalizeSfsSettings(input = {}, prev = {}) {
@@ -843,6 +845,7 @@ function normalizeSfsSettings(input = {}, prev = {}) {
     requirePinnedPosts: boolValue(src.requirePinnedPosts, true),
     skipIfCommentExists: boolValue(src.skipIfCommentExists, true),
     useTargetForever: true,
+    commentLikesEnabled: boolValue(src.commentLikesEnabled, true),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -921,6 +924,42 @@ function sfsUnfollowDedupeKey(creatorId, targetUserId) {
   return `sfs_unfollow:${clean(creatorId, 100)}:${clean(targetUserId, 100)}`;
 }
 
+function sfsCommentLikeDedupeKey(creatorId, targetUserId, postId, commentId) {
+  return `sfs_comment_like:${clean(creatorId, 100)}:${clean(targetUserId, 100)}:${clean(postId, 100)}:${clean(commentId, 100)}`;
+}
+
+function normalizeSfsCommentLikeRows({ creatorId, targetUserId, targetUsername, postId, comments = [] } = {}) {
+  const cid = clean(creatorId, 100);
+  const tid = clean(targetUserId, 100);
+  const username = clean(targetUsername, 80).toLowerCase();
+  const defaultPostId = clean(postId, 100);
+  const rows = [];
+  for (const raw of Array.isArray(comments) ? comments : []) {
+    const commentId = clean(raw?.commentId || raw?.id, 100);
+    const pid = clean(raw?.postId || defaultPostId, 100);
+    if (!cid || !tid || !pid || !commentId) continue;
+    rows.push({
+      creatorId: cid,
+      targetUserId: tid,
+      targetUsername: clean(raw?.targetUsername || username, 80).toLowerCase(),
+      postId: pid,
+      commentId,
+      authorId: clean(raw?.authorId || raw?.userId, 100),
+      authorUsername: clean(raw?.authorUsername || raw?.username, 80).toLowerCase(),
+      text: clean(raw?.text || raw?.commentText, 500),
+      postedAt: raw?.postedAt || null,
+      likedAt: raw?.likedAt || new Date().toISOString(),
+      dedupeKey: sfsCommentLikeDedupeKey(cid, tid, pid, commentId),
+    });
+  }
+  const seen = new Set();
+  return rows.filter((row) => {
+    if (seen.has(row.dedupeKey)) return false;
+    seen.add(row.dedupeKey);
+    return true;
+  });
+}
+
 async function ingestSfsTargets({ agencyId, userId, input = {} }) {
   const creatorId = clean(input.creatorId || input.accountId, 100);
   if (!agencyId || !creatorId) {
@@ -997,6 +1036,12 @@ function sfsExistingComments(result = {}) {
   return rows.filter((x) => x && (x.commentId || x.id));
 }
 
+function sfsLikedComments(result = {}) {
+  const r = toPlainObject(result);
+  const rows = Array.isArray(r.likedComments) ? r.likedComments : [];
+  return rows.filter((x) => x && (x.commentId || x.id));
+}
+
 function isSfsCommentSuccess(result = {}) {
   const r = toPlainObject(result);
   const commentsSent = Number(r.commentsSent || 0);
@@ -1008,8 +1053,13 @@ function isSfsAlreadyCommented(result = {}) {
   return String(r.reason || "") === "SFS_ALREADY_COMMENTED" && sfsExistingComments(r).length > 0;
 }
 
+function isSfsCommentLikeSuccess(result = {}) {
+  const r = toPlainObject(result);
+  return String(r.reason || "") === "SFS_COMMENT_LIKES_SENT" && sfsLikedComments(r).length > 0;
+}
+
 function isSfsDoneForever(result = {}) {
-  return isSfsCommentSuccess(result) || isSfsAlreadyCommented(result);
+  return isSfsCommentSuccess(result) || isSfsAlreadyCommented(result) || isSfsCommentLikeSuccess(result);
 }
 
 async function sfsDoneTodayCount({ agencyId, creatorId }) {
@@ -1048,10 +1098,12 @@ async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
     skipped: 0,
     canceled: 0,
     commentedToday: await sfsDoneTodayCount({ agencyId, creatorId: cid }),
+    likedComments: 0,
   };
   for (const j of jobs) {
     const result = toPlainObject(j.result);
     const commentsSent = Number(result.commentsSent || 0);
+    if (j.action === SFS_ACTION_TARGET) counts.likedComments += sfsLikedComments(result).length;
     const success = j.action === SFS_ACTION_TARGET && j.status === "done" && isSfsDoneForever(result);
     const skippedResult = j.action === SFS_ACTION_TARGET && (
       j.status === "skipped" ||
@@ -1170,9 +1222,10 @@ async function completeSfsTarget({ agencyId, jobId, input = {} }) {
   const commentsSent = Number(result.commentsSent || 0);
   const successfulComment = String(result.reason || "") === "SFS_COMMENTS_SENT" && commentsSent > 0 && sfsResultComments(result).length > 0;
   const alreadyCommented = isSfsAlreadyCommented(result);
+  const successfulLikes = isSfsCommentLikeSuccess(result);
   const status = input.ok === false || requestedStatus === "failed"
     ? "failed"
-    : (successfulComment || alreadyCommented)
+    : (successfulComment || alreadyCommented || successfulLikes)
       ? "done"
       : "skipped";
   const shouldMarkUsed = !!targetUserId && status !== "failed" && input.markUsedForever !== false;
@@ -1265,6 +1318,83 @@ async function completeSfsUnfollow({ agencyId, jobId, input = {} }) {
   return { ok: true, item };
 }
 
+async function checkSfsCommentLikes({ agencyId, input = {} }) {
+  const creatorId = clean(input.creatorId || input.accountId, 100);
+  const rows = normalizeSfsCommentLikeRows({
+    creatorId,
+    targetUserId: input.targetUserId,
+    targetUsername: input.targetUsername,
+    postId: input.postId,
+    comments: input.comments || input.rows || [],
+  });
+  if (!agencyId || !creatorId || !rows.length) return { ok: true, usedCommentIds: [], used: [], rows: [] };
+  const keys = rows.map((row) => row.dedupeKey);
+  const found = await prisma.automationJob.findMany({
+    where: { agencyId, type: SFS_TYPE, action: SFS_ACTION_COMMENT_LIKE, dedupeKey: { in: keys } },
+    select: { dedupeKey: true, payload: true, result: true },
+    take: Math.min(1000, keys.length),
+  }).catch(() => []);
+  const usedKeys = new Set(found.map((x) => x.dedupeKey));
+  return {
+    ok: true,
+    rows,
+    used: rows.filter((row) => usedKeys.has(row.dedupeKey)),
+    usedCommentIds: rows.filter((row) => usedKeys.has(row.dedupeKey)).map((row) => row.commentId),
+  };
+}
+
+async function markSfsCommentLikes({ agencyId, input = {} }) {
+  const creatorId = clean(input.creatorId || input.accountId, 100);
+  const rows = normalizeSfsCommentLikeRows({
+    creatorId,
+    targetUserId: input.targetUserId,
+    targetUsername: input.targetUsername,
+    postId: input.postId,
+    comments: input.comments || input.rows || [],
+  });
+  if (!agencyId || !creatorId || !rows.length) return { ok: true, created: 0, skipped: 0, items: [] };
+  const items = [];
+  let created = 0;
+  let skipped = 0;
+  for (const row of rows) {
+    const existing = await prisma.automationJob.findUnique({ where: { agencyId_dedupeKey: { agencyId, dedupeKey: row.dedupeKey } } }).catch(() => null);
+    if (existing) { skipped += 1; items.push(existing); continue; }
+    const item = await prisma.automationJob.create({
+      data: {
+        agencyId,
+        creatorId: row.creatorId,
+        accountId: row.creatorId,
+        fanId: row.authorId || null,
+        type: SFS_TYPE,
+        action: SFS_ACTION_COMMENT_LIKE,
+        status: "done",
+        priority: -100,
+        runAfter: new Date(),
+        maxAttempts: 1,
+        dedupeKey: row.dedupeKey,
+        payload: compactJson({
+          targetUserId: row.targetUserId,
+          targetUsername: row.targetUsername,
+          postId: row.postId,
+          commentId: row.commentId,
+          authorId: row.authorId,
+          authorUsername: row.authorUsername,
+        }, 4000),
+        result: compactJson({
+          reason: "SFS_COMMENT_LIKE_OK",
+          text: row.text,
+          postedAt: row.postedAt,
+          likedAt: row.likedAt,
+        }, 4000),
+        completedAt: new Date(),
+      },
+    }).catch(() => null);
+    if (item) { created += 1; items.push(item); }
+    else skipped += 1;
+  }
+  return { ok: true, created, skipped, items };
+}
+
 async function checkSfsTargetUsed({ agencyId, creatorId, targetUserId = null, targetUsername = null }) {
   const cid = clean(creatorId, 100);
   const tid = clean(targetUserId, 100);
@@ -1328,6 +1458,8 @@ module.exports = {
   saveSfsComment,
   trashSfsComment,
   checkSfsTargetUsed,
+  checkSfsCommentLikes,
+  markSfsCommentLikes,
   completeSfsUnfollow,
   claimSfsUnfollow,
   completeSfsTarget,
