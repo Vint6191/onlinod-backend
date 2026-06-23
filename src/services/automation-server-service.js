@@ -991,10 +991,25 @@ function sfsResultComments(result = {}) {
   return comments.filter((x) => x && (x.commentId || x.id));
 }
 
+function sfsExistingComments(result = {}) {
+  const r = toPlainObject(result);
+  const rows = Array.isArray(r.existingComments) ? r.existingComments : [];
+  return rows.filter((x) => x && (x.commentId || x.id));
+}
+
 function isSfsCommentSuccess(result = {}) {
   const r = toPlainObject(result);
   const commentsSent = Number(r.commentsSent || 0);
   return String(r.reason || "") === "SFS_COMMENTS_SENT" && commentsSent > 0 && sfsResultComments(r).length > 0;
+}
+
+function isSfsAlreadyCommented(result = {}) {
+  const r = toPlainObject(result);
+  return String(r.reason || "") === "SFS_ALREADY_COMMENTED" && sfsExistingComments(r).length > 0;
+}
+
+function isSfsDoneForever(result = {}) {
+  return isSfsCommentSuccess(result) || isSfsAlreadyCommented(result);
 }
 
 async function sfsDoneTodayCount({ agencyId, creatorId }) {
@@ -1037,7 +1052,7 @@ async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
   for (const j of jobs) {
     const result = toPlainObject(j.result);
     const commentsSent = Number(result.commentsSent || 0);
-    const success = j.action === SFS_ACTION_TARGET && j.status === "done" && isSfsCommentSuccess(result);
+    const success = j.action === SFS_ACTION_TARGET && j.status === "done" && isSfsDoneForever(result);
     const skippedResult = j.action === SFS_ACTION_TARGET && (
       j.status === "skipped" ||
       j.status === "expired" ||
@@ -1056,7 +1071,7 @@ async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
     if (j.action !== SFS_ACTION_TARGET) return j;
     const result = toPlainObject(j.result);
     const payload = toPlainObject(j.payload);
-    const success = j.status === "done" && isSfsCommentSuccess(result);
+    const success = j.status === "done" && isSfsDoneForever(result);
     if (j.status === "done" && !success) {
       return {
         ...j,
@@ -1077,8 +1092,8 @@ async function listSfsHunterState({ agencyId, creatorId, query = {} }) {
   return { ok: true, creatorId: cid, settings, counts, templates: templates.items || [], items: normalizedJobs };
 }
 
-async function resetStaleSfsClaims({ agencyId, claimTimeoutSec = 600 }) {
-  const staleBefore = new Date(Date.now() - clampInt(claimTimeoutSec, 600, 60, 86400) * 1000);
+async function resetStaleSfsClaims({ agencyId, claimTimeoutSec = 180 }) {
+  const staleBefore = new Date(Date.now() - clampInt(claimTimeoutSec, 180, 60, 86400) * 1000);
   await prisma.automationJob.updateMany({
     where: { agencyId, type: SFS_TYPE, status: { in: ["claimed", "running"] }, claimedAt: { lt: staleBefore } },
     data: { status: "scheduled", claimedByDeviceId: null, claimedAt: null, error: "claim expired; returned to SFS queue" },
@@ -1154,9 +1169,10 @@ async function completeSfsTarget({ agencyId, jobId, input = {} }) {
   const requestedStatus = clean(input.status || result.status, 40).toLowerCase();
   const commentsSent = Number(result.commentsSent || 0);
   const successfulComment = String(result.reason || "") === "SFS_COMMENTS_SENT" && commentsSent > 0 && sfsResultComments(result).length > 0;
+  const alreadyCommented = isSfsAlreadyCommented(result);
   const status = input.ok === false || requestedStatus === "failed"
     ? "failed"
-    : successfulComment
+    : (successfulComment || alreadyCommented)
       ? "done"
       : "skipped";
   const shouldMarkUsed = !!targetUserId && status !== "failed" && input.markUsedForever !== false;
@@ -1174,7 +1190,7 @@ async function completeSfsTarget({ agencyId, jobId, input = {} }) {
         ...payload,
         targetUserId: targetUserId || payload.targetUserId || null,
         targetUsername: targetUsername || payload.targetUsername || null,
-        stage: status === "done" && successfulComment ? "done_forever" : (status === "skipped" ? "skipped_forever" : status),
+        stage: status === "done" ? "done_forever" : (status === "skipped" ? "skipped_forever" : status),
         lastReason: result.reason || payload.lastReason || null,
       }, 12000),
     },
