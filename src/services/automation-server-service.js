@@ -808,20 +808,21 @@ const SFS_DEFAULTS = Object.freeze({
   actionDelayMaxSec: 30,
   commentDelayMinSec: 15,
   commentDelayMaxSec: 45,
-  unfollowMinMinutes: 15,
-  unfollowMaxMinutes: 60,
+  unfollowMinMinutes: 3,
+  unfollowMaxMinutes: 10,
   onlyFreeTargets: true,
   requirePinnedPosts: true,
   skipIfCommentExists: true,
   useTargetForever: true,
+  huntingEnabled: true,
   commentLikesEnabled: true,
 });
 
 function normalizeSfsSettings(input = {}, prev = {}) {
   const src = { ...(SFS_DEFAULTS || {}), ...(toPlainObject(prev)), ...(toPlainObject(input)) };
   const dailyLimit = clampInt(src.dailyLimit, SFS_DEFAULTS.dailyLimit, 1, SFS_DEFAULTS.maxDailyLimit);
-  const unfollowMin = clampInt(src.unfollowMinMinutes, SFS_DEFAULTS.unfollowMinMinutes, 1, 240);
-  const unfollowMax = clampInt(src.unfollowMaxMinutes, SFS_DEFAULTS.unfollowMaxMinutes, unfollowMin, 360);
+  const unfollowMin = clampInt(src.unfollowMinMinutes, SFS_DEFAULTS.unfollowMinMinutes, 1, 10);
+  const unfollowMax = clampInt(src.unfollowMaxMinutes, SFS_DEFAULTS.unfollowMaxMinutes, unfollowMin, 10);
   const actionMin = clampInt(src.actionDelayMinSec, SFS_DEFAULTS.actionDelayMinSec, 1, 300);
   const actionMax = clampInt(src.actionDelayMaxSec, SFS_DEFAULTS.actionDelayMaxSec, actionMin, 600);
   const commentMin = clampInt(src.commentDelayMinSec, SFS_DEFAULTS.commentDelayMinSec, 1, 600);
@@ -845,6 +846,7 @@ function normalizeSfsSettings(input = {}, prev = {}) {
     requirePinnedPosts: boolValue(src.requirePinnedPosts, true),
     skipIfCommentExists: boolValue(src.skipIfCommentExists, true),
     useTargetForever: true,
+    huntingEnabled: boolValue(src.huntingEnabled, true),
     commentLikesEnabled: boolValue(src.commentLikesEnabled, true),
     updatedAt: new Date().toISOString(),
   };
@@ -1156,7 +1158,7 @@ async function claimSfsTarget({ agencyId, input = {} }) {
   const creatorId = clean(input.creatorId || input.accountId, 100);
   const deviceId = clean(input.deviceId || input.claimedByDeviceId || "unknown", 120) || "unknown";
   const settings = (await getSfsHunterSettings({ agencyId, creatorId })).settings;
-  if (!settings.enabled) return { ok: true, code: "SFS_DISABLED", items: [], settings };
+  if (!settings.enabled || settings.huntingEnabled === false) return { ok: true, code: "SFS_DISABLED", items: [], settings };
   const templates = (await listSfsComments({ agencyId, creatorId, query: { includeTrash: false, limit: 200 } }).catch(() => ({ items: [] }))).items || [];
   const enabledTemplates = templates.filter((x) => x && x.enabled !== false && !x.trashedAt && clean(x.commentText || x.text, 5000));
   if (!enabledTemplates.length) return { ok: true, code: "NO_SFS_TEMPLATES", items: [], settings };
