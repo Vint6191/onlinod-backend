@@ -1666,6 +1666,53 @@ function hiddenScanState(row = {}) {
   return out;
 }
 
+function hiddenCandidateMoneyCents(input = {}) {
+  const metadata = jsonObject(input.metadata || {});
+  const raw = jsonObject(input.raw || input.payload || {});
+  const d = jsonObject(input.subscribedOnData || raw.subscribedOnData || metadata.subscribedOnData || {});
+  const moneyNumber = (value) => {
+    if (value === undefined || value === null || value === "") return 0;
+    if (typeof value === "string") return Number(value.replace(/[^\d.,-]/g, "").replace(",", ".")) || 0;
+    return Number(value) || 0;
+  };
+  const cents = Math.max(
+    moneyNumber(input.totalSpentCents),
+    moneyNumber(input.spendTotalCents),
+    moneyNumber(input.spentCents),
+    moneyNumber(metadata.totalSpentCents),
+    moneyNumber(raw.totalSpentCents),
+    moneyNumber(raw.spendTotalCents),
+    moneyNumber(raw.spentCents)
+  );
+  if (cents > 0) return Math.round(cents);
+  const dollars = Math.max(
+    moneyNumber(d.totalSumm ?? input.totalSumm ?? metadata.totalSumm ?? raw.totalSumm ?? input.totalSpent ?? raw.totalSpent),
+    moneyNumber(d.messagesSumm ?? input.messagesSumm ?? metadata.messagesSumm ?? raw.messagesSumm) +
+      moneyNumber(d.tipsSumm ?? input.tipsSumm ?? metadata.tipsSumm ?? raw.tipsSumm) +
+      moneyNumber(d.postsSumm ?? input.postsSumm ?? metadata.postsSumm ?? raw.postsSumm) +
+      moneyNumber(d.streamsSumm ?? input.streamsSumm ?? metadata.streamsSumm ?? raw.streamsSumm) +
+      moneyNumber(d.subscribesSumm ?? input.subscribesSumm ?? metadata.subscribesSumm ?? raw.subscribesSumm)
+  );
+  return dollars > 0 ? Math.round(dollars * 100) : 0;
+}
+
+function automationDeliveryDateIso(row = {}) {
+  return dateIso(row.sentAt || row.updatedAt || row.createdAt || row.scheduledAt || row.cancelAt);
+}
+
+function latestByFanId(rows = []) {
+  const map = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const fanId = cleanString(row?.fanId, 80);
+    if (!fanId) continue;
+    const prev = map.get(fanId);
+    const rowMs = parseDate(row.sentAt || row.updatedAt || row.createdAt || row.scheduledAt || row.cancelAt)?.getTime() || 0;
+    const prevMs = prev ? (parseDate(prev.sentAt || prev.updatedAt || prev.createdAt || prev.scheduledAt || prev.cancelAt)?.getTime() || 0) : 0;
+    if (!prev || rowMs >= prevMs) map.set(fanId, row);
+  }
+  return map;
+}
+
 function hiddenCandidateStatus(value) {
   const s = cleanString(value || "active", 40).toLowerCase() || "active";
   if (["ignored", "blocked", "removed", "excluded"].includes(s)) return s;
@@ -1683,7 +1730,7 @@ function hiddenCandidateCompact(input = {}) {
     dialogId: optionalString(input.dialogId || input.withUserId || fanId, 80),
     username: optionalString(input.username || input.fanUsername, 120),
     name: optionalString(input.name || input.fanName || input.displayName, 180),
-    totalSpentCents: Number(input.totalSpentCents || input.spendTotalCents || input.spentCents || 0) || 0,
+    totalSpentCents: hiddenCandidateMoneyCents(input),
     status: hiddenCandidateStatus(input.status),
     lastSignalAt: parseDate(input.lastSignalAt || input.lastScannedAt || input.scannedAt) || new Date(),
     metadata: {
@@ -2191,7 +2238,55 @@ router.get("/hidden-online", async (req, res) => {
       prisma.hiddenOnlineUser.findMany({ where, orderBy: [{ lastSignalAt: "desc" }, { updatedAt: "desc" }], take, skip }),
       prisma.hiddenOnlineUser.count({ where }),
     ]);
-    return res.json({ ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
+
+    const fanIds = items.map((x) => String(x.fanId || "")).filter(Boolean);
+    let latestHiddenByFan = new Map();
+    let activeHiddenByFan = new Map();
+    if (fanIds.length && creatorId) {
+      const rows = await prisma.automationDelivery.findMany({
+        where: {
+          agencyId: req.auth.agencyId,
+          creatorId,
+          fanId: { in: fanIds },
+          OR: [
+            { trigger: BUMP_TRIGGER_KEYS.HIDDEN },
+            { result: { path: ["triggerKey"], equals: BUMP_TRIGGER_KEYS.HIDDEN } },
+            { result: { path: ["hiddenOnlineQueue"], equals: true } },
+            { result: { path: ["manualHiddenBump"], equals: true } },
+          ],
+        },
+        orderBy: [{ sentAt: "desc" }, { updatedAt: "desc" }],
+        take: Math.min(5000, Math.max(fanIds.length * 20, 200)),
+      }).catch(() => []);
+      latestHiddenByFan = latestByFanId(rows);
+      for (const row of rows) {
+        const fanId = String(row.fanId || "");
+        const status = String(row.status || "").toLowerCase();
+        if (!fanId || activeHiddenByFan.has(fanId)) continue;
+        if (["online_queued", "scheduled", "retry", "sent", "checking_reply", "pending_reply", "claimed"].includes(status)) activeHiddenByFan.set(fanId, row);
+      }
+    }
+
+    const enriched = items.map((item) => {
+      const fanId = String(item.fanId || "");
+      const meta = jsonObject(item.metadata || {});
+      const latest = latestHiddenByFan.get(fanId) || null;
+      const active = activeHiddenByFan.get(fanId) || null;
+      return {
+        ...item,
+        totalSpentCents: Number(item.totalSpentCents || 0) || hiddenCandidateMoneyCents(item),
+        lastHiddenBumpAt: dateIso(latest?.sentAt) || dateIso(meta.lastHiddenSentAt) || dateIso(meta.lastHiddenQueuedAt) || automationDeliveryDateIso(latest) || null,
+        lastHiddenQueuedAt: dateIso(meta.lastHiddenQueuedAt) || dateIso(latest?.createdAt) || null,
+        lastHiddenStatus: latest?.status || meta.lastHiddenStatus || null,
+        lastHiddenMessageId: latest?.messageId || meta.lastHiddenMessageId || null,
+        lastHiddenDeliveryId: latest?.id || null,
+        hiddenActiveStatus: active?.status || null,
+        hiddenActiveDeliveryId: active?.id || null,
+        nextEligibleAt: dateIso(meta.nextEligibleAt || meta.hiddenNextEligibleAt) || null,
+      };
+    });
+
+    return res.json({ ok: true, items: enriched, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
   } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_FAILED"); }
 });
 
