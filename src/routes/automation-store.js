@@ -159,7 +159,9 @@ function deliveryCancelAt(item = {}) {
 }
 
 function automationDeliveryTriggerPriority(row = {}) {
-  const raw = String(row.trigger || row.eventType || row.triggerKey || "").trim();
+  const meta = deliveryMeta(row);
+  if (meta.manualUrgent === true || meta.manualHiddenBump === true || meta.urgent === true) return -5;
+  const raw = String(row.trigger || row.eventType || row.triggerKey || meta.triggerKey || meta.trigger || "").trim();
   const lower = raw.toLowerCase();
   // v19.33.4 business order: once due, online is the hottest action.
   // scheduledAt still controls the configured online delay; this priority only
@@ -1951,6 +1953,142 @@ router.get("/hidden-online/scan-state", async (req, res) => {
     ]);
     return res.json({ ok: true, creatorId, item: mapAutomationDelivery(job), scanState: hiddenScanState(job || {}), counts: { total, active, ignored, blocked } });
   } catch (err) { return sendError(res, err, "HIDDEN_SCAN_STATE_FAILED"); }
+});
+
+
+router.post("/hidden-online/manual-bump", requireSeniorAutomationWriter, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    const fanId = cleanString(req.body?.fanId || req.body?.userId || req.query?.fanId || req.query?.userId, 80);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
+
+    const now = new Date();
+    const cancelNow = new Date(now.getTime() - 60 * 1000);
+    const username = optionalString(req.body?.username || req.body?.fanUsername, 120);
+    const name = optionalString(req.body?.name || req.body?.fanName || req.body?.displayName, 180);
+
+    const result = await prisma.$transaction(async (tx) => {
+      const cancelable = await tx.automationDelivery.findMany({
+        where: {
+          agencyId: req.auth.agencyId,
+          creatorId,
+          fanId,
+          status: { in: ["pending_reply", "sent", "checking_reply"] },
+        },
+        orderBy: [{ sentAt: "desc" }, { createdAt: "desc" }],
+        take: 10,
+      });
+
+      const cancelItems = [];
+      for (const row of cancelable) {
+        const updated = await tx.automationDelivery.update({
+          where: { id: row.id },
+          data: {
+            status: "pending_reply",
+            cancelAt: cancelNow,
+            claimedByDeviceId: null,
+            claimedAt: null,
+            claimUntil: null,
+            lastCheckedAt: now,
+            error: null,
+            result: jsonObject({
+              ...deliveryMeta(row),
+              manualHiddenBumpCancelQueuedAt: now.toISOString(),
+              manualHiddenBumpFanId: fanId,
+              previousCancelAt: row.cancelAt ? row.cancelAt.toISOString() : deliveryMeta(row).cancelAt || null,
+            }),
+          },
+        });
+        cancelItems.push(updated);
+      }
+
+      const replacedQueued = await tx.automationDelivery.updateMany({
+        where: {
+          agencyId: req.auth.agencyId,
+          creatorId,
+          fanId,
+          status: { in: ["online_queued", "retry_wait", "send_unknown"] },
+        },
+        data: {
+          status: "skipped",
+          lastCheckedAt: now,
+          error: "manual_hidden_bump_replaced",
+        },
+      });
+
+      const sendItem = await tx.automationDelivery.create({
+        data: {
+          agencyId: req.auth.agencyId,
+          creatorId,
+          fanId,
+          dialogId: cleanString(req.body?.dialogId || fanId, 80),
+          trigger: BUMP_TRIGGER_KEYS.HIDDEN,
+          status: "online_queued",
+          scheduledAt: now,
+          maxAttempts: 5,
+          result: jsonObject({
+            eventQueue: true,
+            hiddenOnlineQueue: true,
+            manualHiddenBump: true,
+            manualUrgent: true,
+            triggerKey: BUMP_TRIGGER_KEYS.HIDDEN,
+            trigger: BUMP_TRIGGER_KEYS.HIDDEN,
+            eventType: "manual_hidden_online_bump",
+            reason: "manual hidden online bump button",
+            queuedAt: now.toISOString(),
+            source: "hidden_online_tab",
+            replaceQueuedCount: replacedQueued.count || 0,
+            cancelQueuedCount: cancelItems.length,
+          }),
+          createdByUserId: req.auth.userId || null,
+        },
+      });
+
+      const existing = await tx.hiddenOnlineUser.findUnique({ where: { creatorId_fanId: { creatorId, fanId } } }).catch(() => null);
+      if (existing?.id) {
+        const meta = existing.metadata && typeof existing.metadata === "object" && !Array.isArray(existing.metadata) ? existing.metadata : {};
+        await tx.hiddenOnlineUser.update({
+          where: { id: existing.id },
+          data: {
+            username: username || existing.username || undefined,
+            name: name || existing.name || undefined,
+            lastSignalAt: existing.lastSignalAt || now,
+            metadata: jsonObject({ ...meta, lastManualHiddenBumpAt: now.toISOString(), manualHiddenBumpDeliveryId: sendItem.id }),
+          },
+        });
+      } else {
+        await tx.hiddenOnlineUser.create({
+          data: {
+            agencyId: req.auth.agencyId,
+            creatorId,
+            fanId,
+            dialogId: cleanString(req.body?.dialogId || fanId, 80),
+            username,
+            name,
+            totalSpentCents: Number(req.body?.totalSpentCents || 0) || 0,
+            status: "active",
+            signals: [],
+            metadata: jsonObject({ source: "manual_hidden_online_bump", lastManualHiddenBumpAt: now.toISOString(), manualHiddenBumpDeliveryId: sendItem.id }),
+            lastSignalAt: now,
+          },
+        });
+      }
+
+      return { sendItem, cancelItems, replacedQueuedCount: replacedQueued.count || 0 };
+    }, { timeout: 15000 });
+
+    return res.json({
+      ok: true,
+      creatorId,
+      fanId,
+      code: "HIDDEN_MANUAL_BUMP_QUEUED",
+      send: mapAutomationDelivery(result.sendItem),
+      cancelQueued: result.cancelItems.length,
+      cancelItems: result.cancelItems.map(mapAutomationDelivery),
+      replacedQueuedCount: result.replacedQueuedCount,
+    });
+  } catch (err) { return sendError(res, err, "HIDDEN_MANUAL_BUMP_FAILED"); }
 });
 
 router.post("/hidden-online/queue-eligible", async (req, res) => {
