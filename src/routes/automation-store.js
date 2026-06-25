@@ -92,6 +92,7 @@ router.post("/jobs/:id/result", async (req, res) => { try { return res.json(awai
 
 router.get("/events", async (req, res) => { try { return res.json(await automationServer.listEvents({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_EVENTS_FAILED"); } });
 router.post("/events", async (req, res) => { try { return res.json(await automationServer.logEvent({ agencyId: req.auth.agencyId, userId: req.auth.userId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_EVENT_LOG_FAILED"); } });
+router.get("/activity", async (req, res) => { try { return res.json(await automationServer.listActivity({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_ACTIVITY_FAILED"); } });
 
 function parseDate(value) {
   if (!value) return null;
@@ -195,6 +196,46 @@ function mapAutomationDelivery(item = {}) {
     claimedByDeviceId: item.claimedByDeviceId || meta.claimedByDeviceId || null,
     claimedAt: item.claimedAt || meta.claimedAt || null,
   };
+}
+
+
+function automationActivityModuleForDelivery(row = {}) {
+  const trig = String(row?.trigger || deliveryMeta(row)?.triggerKey || "").toLowerCase();
+  return trig.includes("hidden") ? "hidden" : "bump";
+}
+
+async function logAutomationActivitySafe({ req, creatorId, module = "automation", action = "activity", status = "info", row = null, input = {}, metadata = {} } = {}) {
+  try {
+    const meta = {
+      module,
+      action,
+      ...(metadata && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : {}),
+    };
+    if (row) {
+      meta.deliveryId = row.id || meta.deliveryId || null;
+      meta.templateId = deliveryTemplateId(row) || meta.templateId || null;
+      meta.triggerKey = row.trigger || meta.triggerKey || null;
+      meta.fanUsername = meta.fanUsername || deliveryMeta(row).fanUsername || deliveryMeta(row).username || null;
+      meta.reason = meta.reason || input?.reason || input?.code || input?.error || row.error || null;
+    }
+    await automationServer.logEvent({
+      agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      input: {
+        creatorId,
+        accountId: creatorId,
+        taskId: meta.templateId || input?.taskId || null,
+        jobId: input?.jobId || meta.jobId || null,
+        fanId: row?.fanId || input?.fanId || meta.fanId || null,
+        dialogId: row?.dialogId || input?.dialogId || meta.dialogId || null,
+        type: `${module}_${action}`,
+        status,
+        messageId: row?.messageId || input?.messageId || meta.messageId || null,
+        amountCents: Number(input?.amountCents ?? row?.priceCents ?? meta.amountCents ?? 0) || 0,
+        metadata: meta,
+      },
+    });
+  } catch (_) {}
 }
 
 function compactTemplateIds(values = [], next = null, max = 50) {
@@ -634,6 +675,25 @@ async function markAutomationDeliveryTerminal({ req, creatorId, row, status, inp
     return { ok: true, alreadyCompacted: true, item: null, code: "DELIVERY_TERMINAL_RACE_LOST", status: terminalStatus, stat };
   }
   const item = await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null);
+  if (item) {
+    const module = automationActivityModuleForDelivery(item);
+    let action = terminalStatus;
+    const metaForActivity = deliveryMeta(item);
+    if (terminalStatus === "replied") action = "replied";
+    else if (terminalStatus === "canceled") action = "canceled";
+    else if (terminalStatus === "failed") action = "failed";
+    else if (terminalStatus === "skipped") action = "skipped";
+    await logAutomationActivitySafe({
+      req,
+      creatorId,
+      module,
+      action,
+      status: terminalStatus === "failed" ? "failed" : terminalStatus === "skipped" ? "skipped" : "ok",
+      row: item,
+      input: { ...(input || {}), amountCents: item.priceCents || metaForActivity.amountCents || 0 },
+      metadata: { terminalStatus, reason: metaForActivity.reason || metaForActivity.finalStatus || input?.reason || input?.code || null },
+    });
+  }
   return { ok: true, compacted: false, terminal: true, status: terminalStatus, item: item ? mapAutomationDelivery(item) : null, stat, alreadyCounted };
 }
 
@@ -1378,6 +1438,18 @@ router.post("/deliveries/online-send-result", async (req, res) => {
         },
       });
       const item = updated.count > 0 ? await prisma.automationDelivery.findUnique({ where: { id: row.id } }).catch(() => null) : null;
+      if (item) {
+        await logAutomationActivitySafe({
+          req,
+          creatorId,
+          module: automationActivityModuleForDelivery(item),
+          action: "sent",
+          status: "ok",
+          row: item,
+          input: { ...(req.body || {}), messageId: messageId || row.messageId, amountCents: item.priceCents || 0 },
+          metadata: { resultCode: resultCode || "BUMP_SENT", sentAt: sentAt?.toISOString?.() || sentAt, cancelAt: cancelAt?.toISOString?.() || cancelAt },
+        });
+      }
       return res.json({ ok: true, compacted: false, status: "pending_reply", item: item ? mapAutomationDelivery(item) : null, deliveryId: row.id, result: meta });
     }
 
@@ -2450,6 +2522,15 @@ router.post("/follow-back/worker/result", async (req, res) => {
         error: optionalString(req.body?.error || req.body?.failReason, 2000),
         lastResultAt: parseDate(req.body?.lastResultAt || req.body?.processedAt || req.body?.skippedAt || req.body?.failedAt) || new Date(),
       },
+    });
+    await logAutomationActivitySafe({
+      req,
+      creatorId,
+      module: "follow_back",
+      action: status === "done" ? "done" : status === "failed" ? "failed" : status === "skipped" ? "skipped" : status,
+      status: status === "failed" ? "failed" : status === "skipped" ? "skipped" : "ok",
+      input: { fanId, amountCents: 0 },
+      metadata: { fanId, fanUsername: item.username || item.name || null, action: item.action, reason: reason || item.error || null, taskId: item.id },
     });
     return res.json({ ok: true, item });
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_WORKER_RESULT_FAILED"); }

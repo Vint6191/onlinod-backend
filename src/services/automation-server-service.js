@@ -1272,6 +1272,37 @@ async function completeSfsTarget({ agencyId, jobId, input = {} }) {
     if (!prev) await prisma.automationJob.create({ data }).catch(() => null);
     else if (!["done", "canceled"].includes(prev.status)) await prisma.automationJob.update({ where: { id: prev.id }, data: { runAfter: unfollowAt, status: "scheduled", payload: data.payload } }).catch(() => null);
   }
+  const likedComments = Number(result.likedComments || result.likesSent || result.liked || 0) || 0;
+  const existingComments = Number(result.existingComments || result.alreadyCommented || 0) || 0;
+  let action = "skipped";
+  if (status === "failed") action = "failed";
+  else if (successfulComment) action = "comment_sent";
+  else if (alreadyCommented) action = "already_commented";
+  else if (successfulLikes) action = "likes_sent";
+  else if (status === "done") action = "done";
+  await logEvent({
+    agencyId,
+    userId: null,
+    input: {
+      creatorId: existing.creatorId,
+      accountId: existing.creatorId,
+      jobId: existing.id,
+      fanId: targetUserId || null,
+      type: `sfs_${action}`,
+      status: status === "failed" ? "failed" : status === "skipped" ? "skipped" : "ok",
+      metadata: {
+        module: "sfs",
+        action,
+        targetUserId: targetUserId || null,
+        targetUsername: targetUsername || null,
+        commentsSent,
+        existingComments,
+        likedComments,
+        reason: result.reason || null,
+        unfollowAt: unfollowAt?.toISOString?.() || result.unfollowAt || null,
+      },
+    },
+  }).catch(() => null);
   return { ok: true, item };
 }
 
@@ -1317,6 +1348,26 @@ async function completeSfsUnfollow({ agencyId, jobId, input = {} }) {
       claimedByDeviceId: null,
     },
   });
+  const payload = toPlainObject(existing.payload || {});
+  await logEvent({
+    agencyId,
+    userId: null,
+    input: {
+      creatorId: existing.creatorId,
+      accountId: existing.creatorId,
+      jobId: existing.id,
+      fanId: payload.targetUserId || existing.fanId || null,
+      type: status === "done" ? "sfs_unfollowed" : "sfs_unfollow_failed",
+      status: status === "done" ? "ok" : "failed",
+      metadata: {
+        module: "sfs",
+        action: status === "done" ? "unfollowed" : "unfollow_failed",
+        targetUserId: payload.targetUserId || existing.fanId || null,
+        targetUsername: payload.targetUsername || null,
+        reason: result.reason || result.error || input.error || null,
+      },
+    },
+  }).catch(() => null);
   return { ok: true, item };
 }
 
@@ -1409,6 +1460,236 @@ async function checkSfsTargetUsed({ agencyId, creatorId, targetUserId = null, ta
   return { ok: true, used: !!item, item, reason: item ? "ALREADY_USED_FOREVER" : null };
 }
 
+
+function activityModuleFromType(type = "", meta = {}) {
+  const t = clean(type, 100).toLowerCase();
+  const m = clean(meta.module || meta.scope || "", 60).toLowerCase();
+  if (m) return m;
+  if (t.startsWith("sfs_")) return "sfs";
+  if (t.startsWith("hidden_")) return "hidden";
+  if (t.startsWith("follow_back")) return "follow_back";
+  if (t.startsWith("bump_")) return "bump";
+  if (t.includes("hidden")) return "hidden";
+  if (t.includes("sfs")) return "sfs";
+  if (t.includes("follow")) return "follow_back";
+  if (t.includes("bump")) return "bump";
+  return "automation";
+}
+
+function activityActionFromType(type = "", meta = {}) {
+  const action = clean(meta.action || meta.event || "", 80);
+  if (action) return action;
+  const t = clean(type, 100).toLowerCase();
+  if (t.startsWith("bump_")) return t.slice(5);
+  if (t.startsWith("hidden_")) return t.slice(7);
+  if (t.startsWith("sfs_")) return t.slice(4);
+  if (t.startsWith("follow_back_")) return t.slice("follow_back_".length);
+  return t || "activity";
+}
+
+function activityTitle({ module = "automation", action = "activity", meta = {}, fanId = null } = {}) {
+  const fan = clean(meta.fanUsername || meta.username || meta.handle || meta.fanName || meta.name || fanId || "", 100);
+  const target = clean(meta.targetUsername || meta.targetName || meta.targetUserId || "", 100);
+  if (module === "bump" || module === "hidden") {
+    if (action === "sent") return fan ? `sent to @${fan.replace(/^@+/, "")}` : "bump sent";
+    if (action === "replied") return fan ? `@${fan.replace(/^@+/, "")} replied` : "fan replied";
+    if (action === "bought") return fan ? `@${fan.replace(/^@+/, "")} bought` : "bump bought";
+    if (action === "canceled") return fan ? `canceled for @${fan.replace(/^@+/, "")}` : "bump canceled";
+    if (action === "failed") return fan ? `failed for @${fan.replace(/^@+/, "")}` : "bump failed";
+    if (action === "skipped") return fan ? `skipped @${fan.replace(/^@+/, "")}` : "bump skipped";
+  }
+  if (module === "sfs") {
+    if (action === "comment_sent") return target ? `commented @${target.replace(/^@+/, "")}` : "SFS comment sent";
+    if (action === "already_commented") return target ? `already commented @${target.replace(/^@+/, "")}` : "SFS comment exists";
+    if (action === "likes_sent") return target ? `liked comments @${target.replace(/^@+/, "")}` : "SFS likes sent";
+    if (action === "skipped") return target ? `skipped @${target.replace(/^@+/, "")}` : "SFS skipped";
+    if (action === "unfollowed") return target ? `unfollowed @${target.replace(/^@+/, "")}` : "SFS unfollowed";
+  }
+  if (module === "follow_back") {
+    if (action === "done" || action === "followed") return fan ? `followed @${fan.replace(/^@+/, "")}` : "follow-back done";
+    if (action === "skipped") return fan ? `skipped @${fan.replace(/^@+/, "")}` : "follow-back skipped";
+    if (action === "failed") return fan ? `failed @${fan.replace(/^@+/, "")}` : "follow-back failed";
+  }
+  return meta.title || meta.label || `${module}.${action}`;
+}
+
+function activityResultText({ module = "automation", action = "activity", status = "info", amountCents = 0, meta = {} } = {}) {
+  const reason = clean(meta.reason || meta.code || meta.error || meta.finalStatus || "", 120);
+  if (module === "bump" || module === "hidden") {
+    if (action === "replied") return meta.replyTimeText || "replied";
+    if (action === "bought") return `bought $${Math.round(Number(amountCents || meta.amountCents || 0) / 100)}`;
+    if (action === "sent") return "sent";
+    if (action === "canceled") return "canceled";
+    if (status === "failed" || action === "failed") return reason || "failed";
+  }
+  if (module === "sfs") {
+    if (action === "comment_sent") return `${Number(meta.commentsSent || 1)} comment${Number(meta.commentsSent || 1) === 1 ? "" : "s"}`;
+    if (action === "already_commented") return `${Number(meta.existingComments || 1)} existed`;
+    if (action === "likes_sent") return `${Number(meta.likedComments || meta.likesSent || 0)} likes`;
+    if (action === "unfollowed") return "unfollowed";
+    if (action === "skipped") return reason || "skipped";
+  }
+  if (module === "follow_back") {
+    if (action === "done" || action === "followed") return "followed";
+    if (action === "skipped") return reason || "skipped";
+    if (action === "failed") return reason || "failed";
+  }
+  return reason || status || action || "activity";
+}
+
+function automationActivityFromEvent(row = {}) {
+  const meta = toPlainObject(row.metadata || {});
+  const module = activityModuleFromType(row.type, meta);
+  const action = activityActionFromType(row.type, meta);
+  const status = clean(row.status || meta.status || "info", 40) || "info";
+  return {
+    id: row.id,
+    createdAt: row.createdAt,
+    ts: row.createdAt,
+    module,
+    action,
+    status,
+    creatorId: row.creatorId || row.accountId || meta.creatorId || meta.accountId || null,
+    accountId: row.accountId || row.creatorId || meta.accountId || meta.creatorId || null,
+    fanId: row.fanId || meta.fanId || null,
+    fanUsername: meta.fanUsername || meta.username || meta.handle || null,
+    targetUserId: meta.targetUserId || null,
+    targetUsername: meta.targetUsername || null,
+    templateId: meta.templateId || meta.bumpId || row.taskId || null,
+    deliveryId: meta.deliveryId || null,
+    jobId: row.jobId || meta.jobId || null,
+    messageId: row.messageId || meta.messageId || null,
+    postId: meta.postId || null,
+    commentId: meta.commentId || null,
+    amountCents: Number(row.amountCents || meta.amountCents || 0) || 0,
+    reason: meta.reason || meta.code || meta.error || null,
+    title: activityTitle({ module, action, meta, fanId: row.fanId }),
+    result: activityResultText({ module, action, status, amountCents: row.amountCents, meta }),
+    meta,
+  };
+}
+
+function automationActivityFromDelivery(row = {}) {
+  const meta = toPlainObject(row.result || {});
+  const trigger = clean(row.trigger || meta.triggerKey || "", 80);
+  const module = trigger === "hiddenOnlineSignal" || String(trigger).toLowerCase().includes("hidden") ? "hidden" : "bump";
+  const status = clean(row.status || "scheduled", 40).toLowerCase();
+  let action = status;
+  if (["pending_reply", "sent", "checking_reply"].includes(status)) action = "sent";
+  if (status === "online_queued" || status === "scheduled") action = "queued";
+  const createdAt = row.sentAt || row.updatedAt || row.createdAt;
+  const m = { ...meta, fanUsername: meta.fanUsername || meta.username || row.fanId, templateId: row.contentCollectionId, deliveryId: row.id, reason: meta.finalStatus || row.error || null };
+  return {
+    id: `delivery:${row.id}`,
+    createdAt,
+    ts: createdAt,
+    module,
+    action,
+    status: status === "failed" ? "failed" : status === "skipped" ? "skipped" : "info",
+    creatorId: row.creatorId,
+    accountId: row.creatorId,
+    fanId: row.fanId,
+    fanUsername: m.fanUsername,
+    templateId: row.contentCollectionId,
+    deliveryId: row.id,
+    messageId: row.messageId,
+    amountCents: Number(row.priceCents || 0) || 0,
+    reason: row.error || meta.error || meta.reason || null,
+    title: activityTitle({ module, action, meta: m, fanId: row.fanId }),
+    result: activityResultText({ module, action, status, amountCents: row.priceCents, meta: m }),
+    meta: m,
+  };
+}
+
+function automationActivityFromFollowBack(row = {}) {
+  const meta = toPlainObject(row.result || {});
+  const status = clean(row.status || "pending", 40).toLowerCase();
+  const action = status === "done" ? "done" : status === "failed" ? "failed" : status === "skipped" ? "skipped" : "queued";
+  const m = { ...meta, fanUsername: row.username || row.name || row.fanId, reason: row.reason || row.error || meta.reason || null };
+  return {
+    id: `follow:${row.id}`,
+    createdAt: row.lastResultAt || row.updatedAt || row.createdAt,
+    ts: row.lastResultAt || row.updatedAt || row.createdAt,
+    module: "follow_back",
+    action,
+    status: status === "failed" ? "failed" : status === "skipped" ? "skipped" : status === "done" ? "ok" : "info",
+    creatorId: row.creatorId,
+    accountId: row.creatorId,
+    fanId: row.fanId,
+    fanUsername: row.username || row.name || null,
+    reason: row.reason || row.error || null,
+    title: activityTitle({ module: "follow_back", action, meta: m, fanId: row.fanId }),
+    result: activityResultText({ module: "follow_back", action, status, meta: m }),
+    meta: m,
+  };
+}
+
+function automationActivityFromSfsJob(row = {}) {
+  const payload = toPlainObject(row.payload || {});
+  const result = toPlainObject(row.result || {});
+  const meta = { ...payload, ...result, targetUsername: result.targetUsername || payload.targetUsername, targetUserId: result.targetUserId || payload.targetUserId, jobId: row.id };
+  const status = clean(row.status || "scheduled", 40).toLowerCase();
+  let action = "queued";
+  const reason = clean(result.reason || "", 120);
+  if (status === "done") {
+    if (Number(result.commentsSent || 0) > 0) action = "comment_sent";
+    else if (Number(result.existingComments || 0) > 0 || reason === "SFS_ALREADY_COMMENTED") action = "already_commented";
+    else if (Number(result.likedComments || result.likesSent || 0) > 0) action = "likes_sent";
+    else action = "done";
+  } else if (status === "skipped") action = "skipped";
+  else if (status === "failed") action = "failed";
+  return {
+    id: `sfs:${row.id}`,
+    createdAt: row.completedAt || row.updatedAt || row.createdAt,
+    ts: row.completedAt || row.updatedAt || row.createdAt,
+    module: "sfs",
+    action,
+    status: status === "failed" ? "failed" : status === "skipped" ? "skipped" : status === "done" ? "ok" : "info",
+    creatorId: row.creatorId || row.accountId,
+    accountId: row.accountId || row.creatorId,
+    targetUserId: meta.targetUserId || null,
+    targetUsername: meta.targetUsername || null,
+    jobId: row.id,
+    reason: reason || null,
+    title: activityTitle({ module: "sfs", action, meta }),
+    result: activityResultText({ module: "sfs", action, status, meta }),
+    meta,
+  };
+}
+
+async function listActivity({ agencyId, query = {} }) {
+  const creatorId = clean(query.creatorId || query.accountId, 100);
+  const moduleFilter = clean(query.module, 60).toLowerCase();
+  const take = parseLimit(query.limit, 60, 200);
+  const sinceHours = clampInt(query.sinceHours, 72, 1, 24 * 30);
+  const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
+  const eventWhere = { agencyId, createdAt: { gte: since } };
+  if (creatorId) eventWhere.OR = [{ creatorId }, { accountId: creatorId }];
+  const [events, deliveries, follows, sfsJobs] = await Promise.all([
+    prisma.automationEvent.findMany({ where: eventWhere, orderBy: { createdAt: "desc" }, take: Math.min(500, take * 5) }).catch(() => []),
+    prisma.automationDelivery.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), OR: [{ updatedAt: { gte: since } }, { sentAt: { gte: since } }, { createdAt: { gte: since } }] }, orderBy: { updatedAt: "desc" }, take: Math.min(200, take * 3) }).catch(() => []),
+    prisma.followBackTask.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), updatedAt: { gte: since } }, orderBy: { updatedAt: "desc" }, take: Math.min(100, take * 2) }).catch(() => []),
+    prisma.automationJob.findMany({ where: { agencyId, ...(creatorId ? { OR: [{ creatorId }, { accountId: creatorId }] } : {}), type: "sfs_hunter", updatedAt: { gte: since } }, orderBy: { updatedAt: "desc" }, take: Math.min(150, take * 3) }).catch(() => []),
+  ]);
+  const rows = [];
+  for (const row of events || []) rows.push(automationActivityFromEvent(row));
+  for (const row of deliveries || []) rows.push(automationActivityFromDelivery(row));
+  for (const row of follows || []) rows.push(automationActivityFromFollowBack(row));
+  for (const row of sfsJobs || []) rows.push(automationActivityFromSfsJob(row));
+  const seen = new Set();
+  const out = [];
+  for (const row of rows.sort((a, b) => (Date.parse(b.ts || b.createdAt || 0) || 0) - (Date.parse(a.ts || a.createdAt || 0) || 0))) {
+    if (!row?.id) continue;
+    if (moduleFilter && String(row.module || "") !== moduleFilter) continue;
+    const key = `${row.module}:${row.action}:${row.deliveryId || row.jobId || row.commentId || row.id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(row);
+    if (out.length >= take) break;
+  }
+  return { ok: true, items: out, count: out.length, source: "automation_activity_v1" };
+}
+
 async function logEvent({ agencyId, userId, input = {} }) {
   const item = await prisma.automationEvent.create({
     data: {
@@ -1479,5 +1760,6 @@ module.exports = {
   completeJob,
   logEvent,
   listEvents,
+  listActivity,
   taskToBump,
 };
