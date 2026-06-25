@@ -816,6 +816,8 @@ const SFS_DEFAULTS = Object.freeze({
   useTargetForever: true,
   huntingEnabled: true,
   commentLikesEnabled: true,
+  commentLikesPerPost: 8,
+  commentLikesDailyCap: 800,
 });
 
 function normalizeSfsSettings(input = {}, prev = {}) {
@@ -848,6 +850,8 @@ function normalizeSfsSettings(input = {}, prev = {}) {
     useTargetForever: true,
     huntingEnabled: boolValue(src.huntingEnabled, true),
     commentLikesEnabled: boolValue(src.commentLikesEnabled, true),
+    commentLikesPerPost: clampInt(src.commentLikesPerPost, SFS_DEFAULTS.commentLikesPerPost, 1, 50),
+    commentLikesDailyCap: clampInt(src.commentLikesDailyCap, SFS_DEFAULTS.commentLikesDailyCap, 0, 10000),
     updatedAt: new Date().toISOString(),
   };
 }
@@ -1448,6 +1452,26 @@ async function markSfsCommentLikes({ agencyId, input = {} }) {
   return { ok: true, created, skipped, items };
 }
 
+
+async function countSfsCommentLikes({ agencyId, query = {} }) {
+  const creatorId = clean(query.creatorId || query.accountId, 100);
+  if (!agencyId || !creatorId) return { ok: true, count: 0, creatorId };
+  const rawDate = clean(query.date, 20) || new Date().toISOString().slice(0, 10);
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(rawDate) ? rawDate : new Date().toISOString().slice(0, 10);
+  const start = new Date(`${day}T00:00:00.000Z`);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  const where = {
+    agencyId,
+    creatorId,
+    type: SFS_TYPE,
+    action: SFS_ACTION_COMMENT_LIKE,
+    status: "done",
+    completedAt: { gte: start, lt: end },
+  };
+  const count = await prisma.automationJob.count({ where }).catch(() => 0);
+  return { ok: true, creatorId, date: day, count };
+}
+
 async function checkSfsTargetUsed({ agencyId, creatorId, targetUserId = null, targetUsername = null }) {
   const cid = clean(creatorId, 100);
   const tid = clean(targetUserId, 100);
@@ -1743,6 +1767,7 @@ module.exports = {
   checkSfsTargetUsed,
   checkSfsCommentLikes,
   markSfsCommentLikes,
+  countSfsCommentLikes,
   completeSfsUnfollow,
   claimSfsUnfollow,
   completeSfsTarget,
