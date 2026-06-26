@@ -1698,6 +1698,90 @@ function hiddenCandidateMoneyCents(input = {}) {
   return dollars > 0 ? Math.round(dollars * 100) : 0;
 }
 
+function automationIntelNumber(value, fallback = 0) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const n = typeof value === "number" ? value : Number(String(value).replace(/[^0-9.,-]/g, "").replace(",", "."));
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function automationIntelCents(input = {}) {
+  const item = input && typeof input === "object" ? input : {};
+  const direct = automationIntelNumber(item.totalSpentCents ?? item.spendTotalCents ?? item.spentCents, 0);
+  if (direct > 0) return Math.max(0, Math.round(direct));
+  const total = automationIntelNumber(item.totalSumm ?? item.totalSpent, 0);
+  const parts = automationIntelNumber(item.messagesSumm, 0) + automationIntelNumber(item.tipsSumm, 0) + automationIntelNumber(item.postsSumm, 0) + automationIntelNumber(item.streamsSumm, 0) + automationIntelNumber(item.subscribesSumm, 0);
+  return Math.max(0, Math.round(Math.max(total, parts) * 100));
+}
+
+function compactAutomationFanIntel(input = {}) {
+  const src = input && typeof input === "object" ? input : {};
+  const fanId = cleanString(src.fanId || src.userId || src.id || "", 80);
+  if (!fanId) return null;
+  const totalSpentCents = automationIntelCents(src);
+  return jsonObject({
+    fanId,
+    username: optionalString(src.username, 120),
+    name: optionalString(src.name, 180),
+    displayName: optionalString(src.displayName, 180),
+    avatarUrl: optionalString(src.avatarUrl || src.avatar, 1000),
+    avatarThumbUrl: optionalString(src.avatarThumbUrl || src.avatarThumb, 1000),
+    subscribedAt: optionalString(src.subscribedAt || src.subscribeAt, 80),
+    subscribedUntil: optionalString(src.subscribedUntil || src.subscribedOnExpireDate || src.expiredAt, 80),
+    subscribedDurationText: optionalString(src.subscribedDurationText || src.duration, 80),
+    subDays: Number.isFinite(Number(src.subDays)) ? Number(src.subDays) : null,
+    totalSumm: automationIntelNumber(src.totalSumm, totalSpentCents / 100),
+    messagesSumm: automationIntelNumber(src.messagesSumm, 0),
+    tipsSumm: automationIntelNumber(src.tipsSumm, 0),
+    postsSumm: automationIntelNumber(src.postsSumm, 0),
+    streamsSumm: automationIntelNumber(src.streamsSumm, 0),
+    subscribesSumm: automationIntelNumber(src.subscribesSumm, 0),
+    totalSpentCents,
+    messagesSpentCents: Math.max(0, Math.round(Number(src.messagesSpentCents || 0) || automationIntelNumber(src.messagesSumm, 0) * 100)),
+    tipsSpentCents: Math.max(0, Math.round(Number(src.tipsSpentCents || 0) || automationIntelNumber(src.tipsSumm, 0) * 100)),
+    postsSpentCents: Math.max(0, Math.round(Number(src.postsSpentCents || 0) || automationIntelNumber(src.postsSumm, 0) * 100)),
+    streamsSpentCents: Math.max(0, Math.round(Number(src.streamsSpentCents || 0) || automationIntelNumber(src.streamsSumm, 0) * 100)),
+    subscribesSpentCents: Math.max(0, Math.round(Number(src.subscribesSpentCents || 0) || automationIntelNumber(src.subscribesSumm, 0) * 100)),
+    joinDate: optionalString(src.joinDate, 80),
+    lastSeen: optionalString(src.lastSeen, 80),
+    canChat: src.canChat === undefined ? null : src.canChat !== false,
+    canReceiveChatMessage: src.canReceiveChatMessage === undefined ? null : src.canReceiveChatMessage !== false,
+    isBlocked: src.isBlocked === true,
+    isRestricted: src.isRestricted === true,
+    isPerformer: src.isPerformer === true,
+    isVerified: src.isVerified === true,
+    canEarn: src.canEarn === true,
+    fetchedAt: optionalString(src.fetchedAt, 80) || new Date().toISOString(),
+    source: optionalString(src.source, 80) || "fan_intel_provider",
+  });
+}
+
+function mergeIntelIntoPublicRow(row = {}) {
+  const item = row && typeof row === "object" ? row : {};
+  const meta = jsonObject(item.metadata || {});
+  const result = jsonObject(item.result || {});
+  const intel = compactAutomationFanIntel(item.fanIntel || meta.fanIntel || result.fanIntel || meta || result || {});
+  if (!intel) return item;
+  return {
+    ...item,
+    username: item.username || intel.username || null,
+    name: item.name || intel.displayName || intel.name || null,
+    displayName: intel.displayName || null,
+    avatarUrl: intel.avatarUrl || null,
+    avatarThumbUrl: intel.avatarThumbUrl || intel.avatarUrl || null,
+    totalSpentCents: Number(item.totalSpentCents || 0) || Number(intel.totalSpentCents || 0) || 0,
+    totalSumm: intel.totalSumm || 0,
+    messagesSumm: intel.messagesSumm || 0,
+    tipsSumm: intel.tipsSumm || 0,
+    subscribedAt: intel.subscribedAt || null,
+    subscribedUntil: intel.subscribedUntil || null,
+    subscribedDurationText: intel.subscribedDurationText || null,
+    subDays: intel.subDays ?? null,
+    lastSeen: intel.lastSeen || null,
+    fanIntelFetchedAt: intel.fetchedAt || null,
+    fanIntel: intel,
+  };
+}
+
 function automationDeliveryDateIso(row = {}) {
   return dateIso(row.sentAt || row.updatedAt || row.createdAt || row.scheduledAt || row.cancelAt);
 }
@@ -2274,7 +2358,7 @@ router.get("/hidden-online", async (req, res) => {
       const meta = jsonObject(item.metadata || {});
       const latest = latestHiddenByFan.get(fanId) || null;
       const active = activeHiddenByFan.get(fanId) || null;
-      return {
+      return mergeIntelIntoPublicRow({
         ...item,
         totalSpentCents: Number(item.totalSpentCents || 0) || hiddenCandidateMoneyCents(item),
         lastHiddenBumpAt: dateIso(latest?.sentAt) || dateIso(meta.lastHiddenSentAt) || dateIso(meta.lastHiddenQueuedAt) || automationDeliveryDateIso(latest) || null,
@@ -2285,7 +2369,7 @@ router.get("/hidden-online", async (req, res) => {
         hiddenActiveStatus: active?.status || null,
         hiddenActiveDeliveryId: active?.id || null,
         nextEligibleAt: dateIso(meta.nextEligibleAt || meta.hiddenNextEligibleAt) || null,
-      };
+      });
     });
 
     return res.json({ ok: true, items: enriched, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
@@ -2319,6 +2403,42 @@ router.post("/hidden-online/upsert", requireSeniorAutomationWriter, async (req, 
     });
     return res.json({ ok: true, item });
   } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_UPSERT_FAILED"); }
+});
+
+
+router.post("/hidden-online/intel-bulk", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const inputItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const updated = [];
+    for (const raw of inputItems.slice(0, 1000)) {
+      const intel = compactAutomationFanIntel(raw);
+      if (!intel?.fanId) continue;
+      const existing = await prisma.hiddenOnlineUser.findUnique({
+        where: { creatorId_fanId: { creatorId, fanId: intel.fanId } },
+      });
+      if (!existing || existing.agencyId !== req.auth.agencyId) continue;
+      const prevMeta = jsonObject(existing.metadata || {});
+      const name = intel.displayName || intel.name || existing.name || null;
+      const next = await prisma.hiddenOnlineUser.update({
+        where: { id: existing.id },
+        data: {
+          username: intel.username || existing.username || null,
+          name,
+          totalSpentCents: Math.max(Number(existing.totalSpentCents || 0), Number(intel.totalSpentCents || 0)),
+          metadata: jsonObject({
+            ...prevMeta,
+            ...intel,
+            fanIntel: intel,
+            fanIntelFetchedAt: intel.fetchedAt,
+          }),
+        },
+      });
+      updated.push(mergeIntelIntoPublicRow(next));
+    }
+    return res.json({ ok: true, creatorId, count: updated.length, items: updated });
+  } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_INTEL_BULK_FAILED"); }
 });
 
 
@@ -2446,7 +2566,13 @@ async function upsertFollowBackWorkerItem({ req, creatorId, rawItem = {} }) {
   const status = existing && followBackTerminalStatus(existing.status) && incomingStatus === "pending" ? existing.status : incomingStatus;
   const reason = optionalString(body.reason || body.skipReason || body.failReason || body.actionReason || body.decisionReason, 500);
   const lastResultAt = parseDate(body.lastResultAt || body.processedAt || body.skippedAt || body.failedAt || body.updatedAt);
-  const result = compactWorkerResult(body);
+  const result = compactWorkerResult({
+    ...body,
+    result: {
+      ...(existing?.result && typeof existing.result === "object" && !Array.isArray(existing.result) ? existing.result : {}),
+      ...(body.result && typeof body.result === "object" && !Array.isArray(body.result) ? body.result : {}),
+    },
+  });
   const item = await prisma.followBackTask.upsert({
     where: { creatorId_fanId_action: { creatorId, fanId, action } },
     create: {
@@ -2513,7 +2639,7 @@ router.get("/follow-back", async (req, res) => {
       prisma.followBackTask.findMany({ where, orderBy: { queuedAt: "desc" }, take, skip }),
       prisma.followBackTask.count({ where }),
     ]);
-    return res.json({ ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
+    return res.json({ ok: true, items: items.map(mergeIntelIntoPublicRow), count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_FAILED"); }
 });
 
@@ -2628,6 +2754,46 @@ router.post("/follow-back/upsert", requireSeniorAutomationWriter, async (req, re
     });
     return res.json({ ok: true, item });
   } catch (err) { return sendError(res, err, "FOLLOW_BACK_UPSERT_FAILED"); }
+});
+
+
+router.post("/follow-back/intel-bulk", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const inputItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    const updated = [];
+    for (const raw of inputItems.slice(0, 1000)) {
+      const intel = compactAutomationFanIntel(raw);
+      if (!intel?.fanId) continue;
+      const rows = await prisma.followBackTask.findMany({
+        where: { agencyId: req.auth.agencyId, creatorId, fanId: intel.fanId },
+        take: 20,
+      });
+      for (const existing of rows) {
+        const prevResult = jsonObject(existing.result || {});
+        const next = await prisma.followBackTask.update({
+          where: { id: existing.id },
+          data: {
+            username: intel.username || existing.username || null,
+            name: intel.displayName || intel.name || existing.name || null,
+            result: compactWorkerResult({
+              result: {
+                ...prevResult,
+                fanIntel: intel,
+                fanIntelFetchedAt: intel.fetchedAt,
+                subscribedAt: intel.subscribedAt || prevResult.subscribedAt || null,
+                subscribedDurationText: intel.subscribedDurationText || prevResult.subscribedDurationText || null,
+                totalSpentCents: intel.totalSpentCents || prevResult.totalSpentCents || 0,
+              },
+            }),
+          },
+        });
+        updated.push(mergeIntelIntoPublicRow(next));
+      }
+    }
+    return res.json({ ok: true, creatorId, count: updated.length, items: updated });
+  } catch (err) { return sendError(res, err, "FOLLOW_BACK_INTEL_BULK_FAILED"); }
 });
 
 
