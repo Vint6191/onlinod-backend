@@ -13,6 +13,10 @@ function registerDeliveryRoutes(router, deps) {
     AUTOMATION_TERMINAL_ROW_STATUSES, AUTOMATION_SOFT_RETRY_CODES, ONLINE_SEND_ACTIVE_STATUSES,
   } = deps;
 
+  const TERMINAL_ROW_STATUSES = AUTOMATION_TERMINAL_ROW_STATUSES instanceof Set
+    ? AUTOMATION_TERMINAL_ROW_STATUSES
+    : new Set(["replied", "canceled", "expired", "failed", "skipped"]);
+
 router.get("/deliveries/fan-state", async (req, res) => {
     try {
       const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
@@ -72,7 +76,7 @@ router.get("/deliveries/fan-state", async (req, res) => {
         prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", trigger: { in: ["fanOnline", "fanSubscribed", "fanLikedPost"] }, scheduledAt: { lte: now } } }).catch(() => 0),
         prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", trigger: "hiddenOnlineSignal", scheduledAt: { lte: now } } }).catch(() => 0),
         prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "pending_reply" } }).catch(() => 0),
-        prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: { in: Array.from(AUTOMATION_TERMINAL_ROW_STATUSES) }, updatedAt: { gte: new Date(now.toISOString().slice(0,10) + "T00:00:00.000Z") } } }).catch(() => 0),
+        prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: { in: Array.from(TERMINAL_ROW_STATUSES) }, updatedAt: { gte: new Date(now.toISOString().slice(0,10) + "T00:00:00.000Z") } } }).catch(() => 0),
         prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", result: { path: ["softRetry"], equals: true } } }).catch(() => 0),
         prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "send_unknown" } }).catch(() => 0),
         prisma.automationDelivery.count({ where: { agencyId: req.auth.agencyId, creatorId, status: "online_queued", OR: Array.from(AUTOMATION_SOFT_RETRY_CODES).map((code) => ({ result: { path: ["retryReason"], equals: code } })) } }).catch(() => 0),
@@ -196,7 +200,7 @@ router.get("/deliveries/fan-state", async (req, res) => {
         updateData,
       });
   
-      if (item && !AUTOMATION_TERMINAL_ROW_STATUSES.has(bumpStatStatus(item.status || ""))) {
+      if (item && !TERMINAL_ROW_STATUSES.has(bumpStatStatus(item.status || ""))) {
         await upsertBumpFanState({
           agencyId: req.auth.agencyId, creatorId, fanId: item.fanId, dialogId: item.dialogId || item.fanId,
           templateId: deliveryTemplateId(item), status: item.status || "sent", sentAt: item.sentAt, messageId: item.messageId,
