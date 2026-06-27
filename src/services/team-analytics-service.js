@@ -83,7 +83,7 @@ async function getMembersShell(agencyId) {
     where: { agencyId, deletedAt: null },
     include: { user: { select: { id: true, email: true, name: true } } },
     orderBy: { createdAt: "asc" },
-  });
+    take: 10000});
 }
 
 function emptyMetric() {

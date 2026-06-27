@@ -260,8 +260,8 @@ router.get("/filter-options", async (req, res) => {
     const profileWhere = { agencyId, ...(creatorId ? { creatorId } : {}) };
     const tagWhere = { agencyId, ...(creatorId ? { profile: { creatorId } } : {}) };
     const [profiles, tags] = await Promise.all([
-      prisma.crmProfile.findMany({ where: profileWhere, select: { country: true, city: true, nativeLanguage: true, chatLanguage: true, fanRole: true, creatorRole: true, tone: true } }),
-      prisma.crmProfileTag.findMany({ where: tagWhere, select: { tagKey: true, label: true, kind: true, category: true, nicheLevel: true, broadcastPolicy: true } }),
+      prisma.crmProfile.findMany({ where: profileWhere, select: { country: true, city: true, nativeLanguage: true, chatLanguage: true, fanRole: true, creatorRole: true, tone: true } , take: 10000}),
+      prisma.crmProfileTag.findMany({ where: tagWhere, select: { tagKey: true, label: true, kind: true, category: true, nicheLevel: true, broadcastPolicy: true } , take: 10000}),
     ]);
     const counts = (items, key) => {
       const m = new Map();

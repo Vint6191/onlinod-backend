@@ -106,6 +106,15 @@ const RETENTION_FIELDS = Object.freeze({
     max: 3650,
     hint: "Hard-delete soft-deleted AutomationTask rows after this many days.",
   },
+  auditLogDays: {
+    label: "Audit logs",
+    unit: "days",
+    env: "ONLINOD_AUDIT_LOG_DAYS",
+    fallback: 365,
+    min: 30,
+    max: 3650,
+    hint: "AuditLog and AdminActionLog retention. Keep long for investigations.",
+  },
 
   trafficSourceMemberNoRevenueDays: {
     label: "Dead source members without revenue",
@@ -559,6 +568,30 @@ async function runTrafficRetentionSweep(options = {}) {
   return summarizeSweep("traffic", out);
 }
 
+async function runAuditLogRetentionSweep(options = {}) {
+  const cfg = await resolveSweepConfig(options);
+  const olderThan = daysAgo(cfg.auditLogDays);
+  const out = [];
+
+  out.push(await deleteByIdsInBatches({
+    model: prisma.auditLog,
+    batchSize: cfg.batchSize,
+    label: `auditLog.old_${cfg.auditLogDays}d`,
+    orderBy: { createdAt: "asc" },
+    where: { createdAt: { lt: olderThan } },
+  }));
+
+  out.push(await deleteByIdsInBatches({
+    model: prisma.adminActionLog,
+    batchSize: cfg.batchSize,
+    label: `adminActionLog.old_${cfg.auditLogDays}d`,
+    orderBy: { createdAt: "asc" },
+    where: { createdAt: { lt: olderThan } },
+  }));
+
+  return summarizeSweep("auditLogs", out);
+}
+
 async function runRetentionSweep(options = {}) {
   const startedAt = Date.now();
   const useLock = options?.useAdvisoryLock !== false;
@@ -572,21 +605,23 @@ async function runRetentionSweep(options = {}) {
   }
 
   try {
-    const [teamActivity, teamLedgers, traffic, automation] = await Promise.all([
+    const [teamActivity, teamLedgers, traffic, automation, auditLogs] = await Promise.all([
       runTeamActivityRetentionSweep(options),
       runTeamLedgerRetentionSweep(options),
       runTrafficRetentionSweep(options),
       runAutomationRetentionSweep(options),
+      runAuditLogRetentionSweep(options),
     ]);
 
     return {
       ok: true,
       elapsedMs: Date.now() - startedAt,
-      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0),
+      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0) + (auditLogs.totalDeleted || 0),
       teamActivity,
       teamLedgers,
       traffic,
       automation,
+      auditLogs,
       lock: useLock ? "advisory" : "disabled",
     };
   } finally {
@@ -606,6 +641,7 @@ module.exports = {
   runTeamLedgerRetentionSweep,
   runTrafficRetentionSweep,
   runAutomationRetentionSweep,
+  runAuditLogRetentionSweep,
   getRetentionSettings,
   updateRetentionSettings,
   resetRetentionSettings,

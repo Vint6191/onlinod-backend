@@ -60,4 +60,5 @@ module.exports = {
   signAccessToken,
   verifyAccessToken,
   refreshTokenDays,
+  assertStrongSecret,
 };

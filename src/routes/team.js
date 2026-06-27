@@ -141,21 +141,21 @@ router.get("/state", teamReadRequired(), async (req, res) => {
         where: { agencyId, deletedAt: null },
         include: { user: true },
         orderBy: { createdAt: "asc" },
-      }),
+        take: 10000}),
       prisma.agencyCustomRole.findMany({
         where: { agencyId },
         orderBy: { createdAt: "asc" },
-      }),
+        take: 10000}),
       prisma.agencyRoleOverride.findMany({
         where: { agencyId },
-      }),
+        take: 10000}),
       prisma.agencySubPermissionOverride.findMany({
         where: { agencyId },
-      }),
+        take: 10000}),
       prisma.agencyInvitation.findMany({
         where: { agencyId, claimedAt: null, revokedAt: null, expiresAt: { gt: new Date() } },
         orderBy: { createdAt: "desc" },
-      }),
+        take: 10000}),
     ]);
 
     // Reshape into the structure that
@@ -654,7 +654,7 @@ router.get("/invitations", teamReadRequired(), async (req, res) => {
       where,
       orderBy: { createdAt: "desc" },
       include: { invitedBy: { select: { id: true, email: true, name: true } } },
-    });
+      take: 10000});
 
     return res.json({
       ok: true,

@@ -312,7 +312,7 @@ router.get("/creator/:id/overview", async (req, res) => {
       prisma.vaultMediaSale.count({ where: { creatorId } }),
       prisma.vaultPurchaseMessage.count({ where: { creatorId } }),
       prisma.contentCollection.count({ where: { creatorId, deletedAt: null } }),
-      prisma.bumpDeliveryStat.findMany({ where: { creatorId } }),
+      prisma.bumpDeliveryStat.findMany({ where: { creatorId } , take: 10000}),
       prisma.moneyAttribution.aggregate({ where: { creatorId }, _sum: { amountCents: true } }),
     ]);
 
@@ -510,7 +510,7 @@ router.post("/purge-deliveries", async (req, res) => {
         where: { messageId: { not: null }, ...(creatorId ? { creatorId } : {}) },
         select: { id: true, creatorId: true, messageId: true, updatedAt: true },
         orderBy: { updatedAt: "desc" },
-      });
+        take: 10000});
       const seen = new Set();
       const toDelete = [];
       for (const r of rows) {

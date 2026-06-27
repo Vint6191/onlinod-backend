@@ -68,7 +68,7 @@ async function sweepExpiredLeases() {
       leaseUntil: { lt: now },
     },
     select: { id: true, attempts: true },
-  });
+    take: 10000});
 
   if (!expired.length) return 0;
 
@@ -174,7 +174,7 @@ router.post("/claim", async (req, res) => {
     const scopedCreators = await prisma.creatorAccount.findMany({
       where: creatorWhere,
       select: { id: true },
-    });
+      take: 10000});
 
     const scopedCreatorIds = scopedCreators.map((item) => item.id);
 
@@ -186,7 +186,7 @@ router.post("/claim", async (req, res) => {
         creatorId: { in: scopedCreatorIds.length ? scopedCreatorIds : ["__none__"] },
       },
       select: { creatorId: true },
-    });
+      take: 10000});
 
     let visibleCreatorIds = bindings.map((item) => item.creatorId);
 
@@ -412,7 +412,7 @@ router.get("/pending", async (req, res) => {
     const memberships = await prisma.agencyMember.findMany({
       where: { userId: actorUserId(req), deletedAt: null },
       select: { agencyId: true },
-    });
+      take: 10000});
     const agencyIds = memberships.map((m) => m.agencyId);
 
     if (!agencyIds.length) return res.json({ ok: true, jobs: [] });

@@ -424,7 +424,7 @@ router.get("/creators/:creatorId/overview", async (req, res) => {
       prisma.creatorEarningsSnapshot.findMany({
         where: { creatorId: ctx.creator.id },
         select: { rangeKey: true, capturedAt: true, totalCents: true },
-      }),
+        take: 10000}),
     ]);
 
     return res.json({
@@ -478,7 +478,7 @@ router.get("/agencies/:agencyId/earnings/summary", async (req, res) => {
         creator: { select: { id: true, displayName: true, username: true, avatarUrl: true, status: true } },
       },
       orderBy: { totalCents: "desc" },
-    });
+      take: 10000});
 
     let totalCents = 0n;
     let salesCount = 0;
@@ -554,7 +554,7 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         creatorId: creator.id,
         status: { in: ["SCHEDULED", "FAILED"] },
       },
-    });
+      take: 10000});
 
     const matchingEarningsJob = earningsJobs.find((j) => {
       try {
@@ -654,7 +654,7 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
     const creators = await prisma.creatorAccount.findMany({
       where: { agencyId: ctx.agency.id, deletedAt: null, status: "READY" },
       select: { id: true, agencyId: true },
-    });
+      take: 10000});
 
     const now = new Date();
     let scheduled = 0;
@@ -670,7 +670,7 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
           creatorId: creator.id,
           status: { in: ["SCHEDULED", "FAILED"] },
         },
-      });
+        take: 10000});
       const matching = earnings.find((j) => (j.params || {}).rangeKey === range);
 
       if (matching) {

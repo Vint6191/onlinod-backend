@@ -300,7 +300,7 @@ router.get("/deliveries/fan-state", async (req, res) => {
         const activeRows = await tx.automationDelivery.findMany({
           where: { agencyId: req.auth.agencyId, creatorId, fanId: { in: fanIds }, status: { in: ONLINE_SEND_ACTIVE_STATUSES } },
           select: { id: true, fanId: true, status: true, scheduledAt: true, sentAt: true, createdAt: true },
-        });
+          take: 10000});
         const activeByFan = new Map(activeRows.map((x) => [String(x.fanId), x]));
         let cursor = onlineGateNextAllowed(gate, now);
         const items = [];

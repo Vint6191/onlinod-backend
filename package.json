@@ -15,7 +15,8 @@
     "prisma:push": "prisma db push",
     "postinstall": "prisma generate",
     "lint": "eslint \"src/**/*.js\"",
-    "format:check": "prettier --check \"src/**/*.js\""
+    "format:check": "prettier --check \"src/**/*.js\"",
+    "test": "node --test \"src/**/*.test.js\""
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

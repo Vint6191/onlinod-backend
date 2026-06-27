@@ -620,7 +620,7 @@ function registerHiddenOnlineRoutes(router, deps) {
       const activeRows = await prisma.automationDelivery.findMany({
         where: { agencyId: req.auth.agencyId, creatorId, fanId: { in: candidates.map((x) => x.fanId) }, status: { in: ONLINE_SEND_ACTIVE_STATUSES } },
         select: { fanId: true, status: true },
-      });
+        take: 10000});
       const activeByFan = new Map(activeRows.map((x) => [String(x.fanId), x]));
       const picked = [];
       const skipped = [];

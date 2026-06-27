@@ -234,7 +234,7 @@ async function verifyEmailByCode({ email, code }) {
       expiresAt: { gt: new Date() },
     },
     orderBy: { createdAt: "desc" },
-  });
+    take: 10000});
 
   const codeHash = sha256(code);
   const record = records.find((item) => item.codeHash === codeHash);

@@ -240,7 +240,7 @@ async function loadBumpStatsByTemplate({ agencyId, creatorId, tasks = [] } = {})
   const cid = clean(creatorId, 100);
   if (cid) where.creatorId = cid;
   const [rows, liveRows] = await Promise.all([
-    prisma.bumpDeliveryStat.findMany({ where }).catch(() => []),
+    prisma.bumpDeliveryStat.findMany({ where , take: 10000}).catch(() => []),
     prisma.automationDelivery.findMany({
       where: {
         agencyId,
@@ -770,7 +770,7 @@ async function cancelJobs({ agencyId, userId, input = {} }) {
       result: compactJson({ canceledByUserId: userId || null, canceledAt: new Date().toISOString(), reason }, 4000),
     },
   });
-  const items = await prisma.automationJob.findMany({ where: { agencyId, id: { in: ids } } });
+  const items = await prisma.automationJob.findMany({ where: { agencyId, id: { in: ids } } , take: 10000});
   return { ok: true, canceled: items.length, items };
 }
 

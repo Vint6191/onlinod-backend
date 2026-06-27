@@ -32,7 +32,7 @@ async function runPresenceSweep() {
     },
     select: { creatorId: true, agencyId: true },
     distinct: ["creatorId"],
-  });
+    take: 10000});
 
   let created = 0;
   let skipped = 0;

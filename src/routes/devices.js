@@ -281,7 +281,7 @@ router.get("/mine", async (req, res) => {
           orderBy: { updatedAt: "desc" },
         },
       },
-    });
+      take: 10000});
 
     return res.json({ ok: true, devices });
   } catch (err) {

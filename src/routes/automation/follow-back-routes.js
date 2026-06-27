@@ -504,7 +504,7 @@ const FOLLOW_BACK_TERMINAL_STATUSES = new Set(["followed", "waiting_return", "fi
         where: { agencyId: req.auth.agencyId, creatorId, id: { in: releaseIds }, status: "running" },
         data: { status: "pending", error: reason, lastResultAt: new Date() },
       });
-      const items = await prisma.followBackTask.findMany({ where: { agencyId: req.auth.agencyId, creatorId, id: { in: releaseIds } } });
+      const items = await prisma.followBackTask.findMany({ where: { agencyId: req.auth.agencyId, creatorId, id: { in: releaseIds } } , take: 10000});
       return res.json({ ok: true, creatorId, released: items.length, items });
     } catch (err) { return sendError(res, err, "FOLLOW_BACK_WORKER_RELEASE_FAILED"); }
   });

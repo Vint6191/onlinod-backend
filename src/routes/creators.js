@@ -101,7 +101,7 @@ router.get("/", async (req, res) => {
     const creators = await prisma.creatorAccount.findMany({
       where: { agencyId: req.auth.agencyId, deletedAt: null },
       orderBy: { createdAt: "desc" },
-    });
+      take: 10000});
 
     return res.json({ ok: true, creators });
   } catch (err) {

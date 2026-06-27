@@ -231,7 +231,7 @@ async function runRecurringSweep() {
       agency: { deletedAt: null },
     },
     select: { id: true, agencyId: true, remoteId: true, username: true, displayName: true },
-  });
+    take: 10000});
 
   let totalCreated = 0;
   let totalSkipped = 0;

@@ -42,7 +42,7 @@ router.get("/creators/:creatorId/access-snapshots", async (req, res) => {
         createdAt: true,
         deviceId: true,
       },
-    });
+      take: 10000});
 
     return res.json({ ok: true, snapshots });
   } catch (err) {

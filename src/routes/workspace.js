@@ -58,7 +58,7 @@ router.get("/context", async (req, res) => {
       },
       include: { agency: true, user: true },
       orderBy: { createdAt: "asc" },
-    });
+      take: 10000});
 
     const activeMember = memberships.find((item) => item.agencyId === req.auth.agencyId) || memberships[0] || null;
 

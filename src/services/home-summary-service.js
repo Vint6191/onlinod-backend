@@ -201,7 +201,7 @@ async function resolveAndScheduleSnapshots(agencyId, requestedRange, creators) {
     ? await prisma.creatorEarningsSnapshot.findMany({
         where: { agencyId, rangeKey: requestedRange, creatorId: { in: creatorIds } },
         orderBy: { capturedAt: "desc" },
-      })
+        take: 10000})
     : [];
 
   // Latest snapshot per creator (findMany came back sorted desc, so first wins).
@@ -380,7 +380,7 @@ async function buildPreviousRevenue(agencyId, prevRangeKey, allCreators) {
   const snaps = await prisma.creatorEarningsSnapshot.findMany({
     where: { agencyId, rangeKey: prevRangeKey, creatorId: { in: creatorIds } },
     orderBy: { capturedAt: "desc" },
-  });
+    take: 10000});
 
   const seen = new Set();
   let totalCents = 0;
@@ -422,14 +422,14 @@ async function buildHomeSummary({ agencyId, rangeKey = "7d" }) {
         id: true, roleKey: true, displayName: true,
         user: { select: { email: true, name: true } },
       },
-    }),
+      take: 10000}),
     prisma.creatorAccount.findMany({
       where: { agencyId, deletedAt: null },
       select: {
         id: true, displayName: true, username: true,
         avatarUrl: true, status: true, remoteId: true,
       },
-    }),
+      take: 10000}),
     prisma.jobInstance
       .groupBy({
         by: ["status"],
@@ -443,7 +443,7 @@ async function buildHomeSummary({ agencyId, rangeKey = "7d" }) {
         id: true, userId: true, deviceName: true,
         platform: true, appVersion: true, lastSeenAt: true,
       },
-    }),
+      take: 10000}),
     prisma.auditLog.findMany({
       where: { agencyId },
       orderBy: { createdAt: "desc" },

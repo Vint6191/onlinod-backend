@@ -96,7 +96,7 @@ async function refreshBumpTaskStats({ agencyId, creatorId, templateId }) {
   const rows = await prisma.bumpDeliveryStat.findMany({
     where: { agencyId, creatorId: cid, templateId: tid },
     select: { sent: true, replied: true, canceled: true, expired: true, failed: true, day: true },
-  }).catch(() => []);
+    take: 10000}).catch(() => []);
   const today = new Date().toISOString().slice(0, 10);
   const stats = { sent: 0, replied: 0, canceled: 0, expired: 0, failed: 0, sentToday: 0, repliedToday: 0, lastStatAt: new Date().toISOString() };
   for (const row of rows || []) {

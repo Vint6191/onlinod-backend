@@ -590,7 +590,7 @@ async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, job, action,
     tx.agencyMember.findMany({
       where: { agencyId, id: { in: targetIds }, deletedAt: null },
       include: { user: { select: { id: true, email: true, name: true } } },
-    }),
+      take: 10000}),
     safeSelectedMemberId
       ? tx.agencyMember.findFirst({
           where: { agencyId, id: safeSelectedMemberId, deletedAt: null },
@@ -808,7 +808,7 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false }
 
   const purchaseIds = Array.from(new Set(rows.map((r) => r.purchaseId).filter(Boolean)));
   const purchases = purchaseIds.length
-    ? await prisma.teamPpvPurchaseLedger.findMany({ where: { agencyId, purchaseId: { in: purchaseIds } } })
+    ? await prisma.teamPpvPurchaseLedger.findMany({ where: { agencyId, purchaseId: { in: purchaseIds } } , take: 10000})
     : [];
   const purchaseById = new Map(purchases.map((p) => [p.purchaseId, p]));
 
@@ -828,7 +828,7 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false }
     ? await prisma.agencyMember.findMany({
         where: { agencyId, id: { in: memberIds }, deletedAt: null },
         include: { user: { select: { id: true, email: true, name: true } } },
-      })
+        take: 10000})
     : [];
   const memberById = new Map(members.map((m) => [m.id, m]));
 

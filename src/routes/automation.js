@@ -31,7 +31,7 @@ router.use((req, _res, next) => {
 router.get("/state", async (req, res) => {
   try {
     const [rules, runs] = await Promise.all([
-      prisma.automationRule.findMany({ where: { agencyId: req.auth.agencyId, deletedAt: null }, orderBy: { updatedAt: "desc" } }),
+      prisma.automationRule.findMany({ where: { agencyId: req.auth.agencyId, deletedAt: null }, orderBy: { updatedAt: "desc" } , take: 10000}),
       prisma.automationRun.findMany({ where: { agencyId: req.auth.agencyId }, orderBy: { createdAt: "desc" }, take: 30 }),
     ]);
     return res.json({ ok: true, rules, runs });

@@ -9,7 +9,7 @@ router.get("/workspace", async (req, res) => {
   try {
     const [agency, settings, subscription] = await Promise.all([
       prisma.agency.findUnique({ where: { id: req.auth.agencyId } }),
-      prisma.workspaceSetting.findMany({ where: { agencyId: req.auth.agencyId } }),
+      prisma.workspaceSetting.findMany({ where: { agencyId: req.auth.agencyId } , take: 10000}),
       prisma.agencySubscription.findFirst({ where: { agencyId: req.auth.agencyId }, orderBy: { createdAt: "desc" } }),
     ]);
     return res.json({
@@ -40,7 +40,7 @@ router.patch("/workspace", async (req, res) => {
       });
     }
 
-    const settings = await prisma.workspaceSetting.findMany({ where: { agencyId: req.auth.agencyId } });
+    const settings = await prisma.workspaceSetting.findMany({ where: { agencyId: req.auth.agencyId } , take: 10000});
     return res.json({ ok: true, settings: Object.fromEntries(settings.map((item) => [item.key, item.value])) });
   } catch (err) {
     return res.status(500).json({ ok: false, code: "WORKSPACE_SETTINGS_UPDATE_FAILED", error: err?.message || "Failed" });

@@ -557,7 +557,7 @@ async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, tt
     const snapshots = await prisma.trafficFanValueSnapshot.findMany({
       where: { agencyId, creatorId, fanId: { in: chunk } },
       select: { fanId: true, fetchedAt: true },
-    });
+      take: 10000});
     const byFan = new Map(snapshots.map((row) => [String(row.fanId), row]));
 
     const dirtyMembers = await prisma.trafficSourceMember.findMany({
@@ -720,7 +720,7 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
         creatorId: creator.id,
         OR: chunk.map((item) => ({ sourceType: item.sourceType, externalId: item.externalId })),
       },
-    });
+      take: 10000});
     for (const row of existingSources) {
       sourceMap.set(`${row.sourceType}:${row.externalId}`, row);
     }
@@ -1810,7 +1810,7 @@ async function recomputeTrafficDailyAggregatesForSource({ agencyId, creatorId, s
     where: { agencyId, creatorId, sourceId: cleanSourceId },
     select: { day: true },
     orderBy: { day: "desc" },
-  });
+    take: 10000});
 
   let recomputedDays = 0;
   for (const chunk of chunkArray(days, chunkSize)) {

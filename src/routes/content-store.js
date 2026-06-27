@@ -272,12 +272,12 @@ async function purgeExpiredMessageLibraryTrash(agencyId) {
       ],
     },
     select: { id: true },
-  });
+    take: 10000});
 
   const allCollections = await prisma.contentCollection.findMany({
     where: { agencyId, kind: MESSAGE_LIBRARY_KIND },
     select: { id: true },
-  });
+    take: 10000});
   const collectionIds = allCollections.map((item) => item.id);
 
   const expiredBlocks = collectionIds.length

@@ -766,7 +766,7 @@ router.get("/agencies/:id/members", async (req, res) => {
       where: { agencyId: req.params.id },
       include: { user: true },
       orderBy: { createdAt: "asc" },
-    });
+      take: 10000});
     return res.json({ ok: true, members });
   } catch (err) {
     return res.status(500).json({ ok: false, code: "MEMBERS_LIST_FAILED", error: err?.message || "Failed" });
@@ -1047,7 +1047,7 @@ router.post("/users/:id/force-logout", async (req, res) => {
       prisma.workerDevice.findMany({
         where: { userId: user.id },
         select: { id: true, agencyId: true },
-      }),
+        take: 10000}),
     ]);
 
     let queuedDeviceCommands = 0;
@@ -1510,7 +1510,7 @@ router.get("/admin-users", async (_req, res) => {
         id: true, email: true, name: true, role: true, active: true,
         lastLoginAt: true, createdAt: true,
       },
-    });
+      take: 10000});
     return res.json({ ok: true, admins });
   } catch (err) {
     return res.status(500).json({ ok: false, code: "ADMIN_USERS_LIST_FAILED", error: err?.message || "Failed" });

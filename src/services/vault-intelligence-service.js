@@ -224,7 +224,7 @@ async function getMediaAnalytics({ agencyId, creatorId, mediaIds = [] }) {
         creatorId: creator.id,
         ...(ids.length ? { mediaId: { in: ids } } : {}),
       },
-    }),
+      take: 10000}),
   ]);
 
   const out = new Map();

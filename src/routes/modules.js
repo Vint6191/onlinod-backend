@@ -8,7 +8,7 @@ const router = express.Router();
 
 router.get("/state", async (req, res) => {
   try {
-    const settings = await prisma.moduleSetting.findMany({ where: { agencyId: req.auth.agencyId } });
+    const settings = await prisma.moduleSetting.findMany({ where: { agencyId: req.auth.agencyId } , take: 10000});
     const byKey = new Map(settings.map((item) => [item.moduleKey, item]));
     const modules = getModuleRegistry().map((item) => {
       const setting = byKey.get(item.key);

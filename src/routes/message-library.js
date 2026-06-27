@@ -8,8 +8,8 @@ const router = express.Router();
 router.get("/state", async (req, res) => {
   try {
     const [groups, templates] = await Promise.all([
-      prisma.messageTemplateGroup.findMany({ where: { agencyId: req.auth.agencyId }, orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }] }),
-      prisma.messageTemplate.findMany({ where: { agencyId: req.auth.agencyId, deletedAt: null }, orderBy: { updatedAt: "desc" } }),
+      prisma.messageTemplateGroup.findMany({ where: { agencyId: req.auth.agencyId }, orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }] , take: 10000}),
+      prisma.messageTemplate.findMany({ where: { agencyId: req.auth.agencyId, deletedAt: null }, orderBy: { updatedAt: "desc" } , take: 10000}),
     ]);
     return res.json({ ok: true, groups, templates });
   } catch (err) {

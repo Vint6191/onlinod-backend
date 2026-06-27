@@ -482,7 +482,7 @@ async function enrichTipRows(rows, agencyId) {
     ? await prisma.agencyMember.findMany({
         where: { agencyId, id: { in: memberIds }, deletedAt: null },
         include: { user: { select: { id: true, email: true, name: true } } },
-      }).catch(() => [])
+        take: 10000}).catch(() => [])
     : [];
   const membersById = new Map(members.map((m) => [m.id, m]));
   return rows.map((row) => tipRowForClaims(row, membersById));
@@ -796,7 +796,7 @@ async function findExistingTipHashesForLegacyRows(tx, legacyRows) {
       const rows = await tx.teamTipLedger.findMany({
         where: { agencyId, eventHash: { in: chunk } },
         select: { agencyId: true, eventHash: true },
-      });
+        take: 10000});
       for (const row of rows || []) existing.add(`${row.agencyId}|${row.eventHash}`);
     }
   }
