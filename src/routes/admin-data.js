@@ -35,9 +35,11 @@
 const express = require("express");
 const prisma = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
+const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
 
 const router = express.Router();
 router.use(adminRequired);
+router.use(adminHttpAuditMiddleware);
 
 // ── helpers ───────────────────────────────────────────────────
 function clamp(n, lo, hi, dflt) {

@@ -600,52 +600,103 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
 
   const sourceRows = [];
   const sourceMap = new Map();
+  const normalizedSourcesByKey = new Map();
 
   for (const input of Array.isArray(sources) ? sources : []) {
     const normalized = normalizeSource(input, { accountId });
     if (!normalized) continue;
-    const row = await prisma.trafficSource.upsert({
+    normalizedSourcesByKey.set(`${normalized.sourceType}:${normalized.externalId}`, normalized);
+  }
+
+  const normalizedSources = Array.from(normalizedSourcesByKey.values());
+
+  for (const chunk of chunkArray(normalizedSources, 500)) {
+    if (!chunk.length) continue;
+
+    const createData = chunk.map((row) => ({
+      agencyId,
+      creatorId: creator.id,
+      accountId: row.accountId,
+      sourceType: row.sourceType,
+      externalId: row.externalId,
+      name: row.name,
+      url: row.url,
+      status: row.status,
+      startedAt: row.startedAt,
+      endedAt: row.endedAt,
+      lastScannedAt: now,
+      costCents: row.costCents,
+      currency: row.currency,
+      stats: row.stats,
+      metadata: row.metadata,
+    }));
+
+    await prisma.trafficSource.createMany({ data: createData, skipDuplicates: true });
+
+    const updatePayload = chunk.map((row) => ({
+      sourceType: row.sourceType,
+      externalId: row.externalId,
+      accountId: row.accountId,
+      name: row.name,
+      url: row.url,
+      status: row.status,
+      startedAt: isoOrNull(row.startedAt),
+      endedAt: isoOrNull(row.endedAt),
+      costCents: row.costCents,
+      currency: row.currency,
+      stats: row.stats || null,
+      metadata: row.metadata || null,
+    }));
+
+    await prisma.$executeRaw`
+      UPDATE "TrafficSource" AS s
+      SET
+        "accountId" = COALESCE(x."accountId", s."accountId"),
+        "name" = x."name",
+        "url" = x."url",
+        "status" = x."status",
+        "startedAt" = x."startedAt",
+        "endedAt" = x."endedAt",
+        "lastScannedAt" = ${now},
+        "costCents" = COALESCE(x."costCents", 0),
+        "currency" = COALESCE(x."currency", s."currency", 'USD'),
+        "stats" = x."stats",
+        "metadata" = x."metadata",
+        "updatedAt" = NOW()
+      FROM jsonb_to_recordset(${JSON.stringify(updatePayload)}::jsonb)
+        AS x(
+          "sourceType" text,
+          "externalId" text,
+          "accountId" text,
+          "name" text,
+          "url" text,
+          "status" text,
+          "startedAt" timestamptz,
+          "endedAt" timestamptz,
+          "costCents" int,
+          "currency" text,
+          "stats" jsonb,
+          "metadata" jsonb
+        )
+      WHERE s."agencyId" = ${agencyId}
+        AND s."creatorId" = ${creator.id}
+        AND s."sourceType" = x."sourceType"
+        AND s."externalId" = x."externalId"
+    `;
+
+    const rows = await prisma.trafficSource.findMany({
       where: {
-        agencyId_creatorId_sourceType_externalId: {
-          agencyId,
-          creatorId: creator.id,
-          sourceType: normalized.sourceType,
-          externalId: normalized.externalId,
-        },
-      },
-      create: {
         agencyId,
         creatorId: creator.id,
-        accountId: normalized.accountId,
-        sourceType: normalized.sourceType,
-        externalId: normalized.externalId,
-        name: normalized.name,
-        url: normalized.url,
-        status: normalized.status,
-        startedAt: normalized.startedAt,
-        endedAt: normalized.endedAt,
-        lastScannedAt: now,
-        costCents: normalized.costCents,
-        currency: normalized.currency,
-        stats: normalized.stats,
-        metadata: normalized.metadata,
+        OR: chunk.map((row) => ({ sourceType: row.sourceType, externalId: row.externalId })),
       },
-      update: {
-        accountId: normalized.accountId,
-        name: normalized.name,
-        url: normalized.url,
-        status: normalized.status,
-        startedAt: normalized.startedAt,
-        endedAt: normalized.endedAt,
-        lastScannedAt: now,
-        costCents: normalized.costCents,
-        currency: normalized.currency,
-        stats: normalized.stats,
-        metadata: normalized.metadata,
-      },
+      take: chunk.length,
     });
-    sourceRows.push(row);
-    sourceMap.set(`${row.sourceType}:${row.externalId}`, row);
+
+    for (const row of rows) {
+      sourceRows.push(row);
+      sourceMap.set(`${row.sourceType}:${row.externalId}`, row);
+    }
   }
 
   const normalizedMembers = [];
