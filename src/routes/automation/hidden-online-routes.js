@@ -624,33 +624,64 @@ function registerHiddenOnlineRoutes(router, deps) {
         take: Math.min(5000, candidateTake),
       });
       const fanIds = candidates.map((x) => x.fanId).filter(Boolean);
-      const activeRows = fanIds.length ? await prisma.automationDelivery.findMany({
-        where: {
-          agencyId: req.auth.agencyId,
-          creatorId,
-          fanId: { in: fanIds },
-          OR: [
-            { status: { in: ["online_queued", "scheduled", "retry_wait", "send_unknown", "claimed", "checking_reply"] } },
-            { status: { in: ["sent", "pending_reply"] }, OR: [{ cancelAt: null }, { cancelAt: { gt: now } }] },
-          ],
-        },
-        select: { fanId: true, status: true, cancelAt: true, trigger: true },
-        take: 10000,
-      }) : [];
+      const hiddenCooldownSince = new Date(now.getTime() - cadenceHours * 60 * 60 * 1000);
+      const [activeRows, recentHiddenRows] = fanIds.length ? await Promise.all([
+        prisma.automationDelivery.findMany({
+          where: {
+            agencyId: req.auth.agencyId,
+            creatorId,
+            fanId: { in: fanIds },
+            OR: [
+              { status: { in: ["online_queued", "scheduled", "retry_wait", "send_unknown", "claimed", "online_claimed", "send_reserved", "checking_reply"] } },
+              { status: { in: ["sent", "pending_reply"] }, OR: [{ cancelAt: null }, { cancelAt: { gt: now } }] },
+            ],
+          },
+          select: { fanId: true, status: true, cancelAt: true, trigger: true, createdAt: true, sentAt: true },
+          take: 10000,
+        }),
+        prisma.automationDelivery.findMany({
+          where: {
+            agencyId: req.auth.agencyId,
+            creatorId,
+            fanId: { in: fanIds },
+            trigger: BUMP_TRIGGER_KEYS.HIDDEN,
+            OR: [
+              { createdAt: { gte: hiddenCooldownSince } },
+              { sentAt: { gte: hiddenCooldownSince } },
+              { scheduledAt: { gte: hiddenCooldownSince } },
+            ],
+          },
+          select: { fanId: true, status: true, trigger: true, createdAt: true, sentAt: true, scheduledAt: true, cancelAt: true },
+          orderBy: [{ createdAt: "desc" }],
+          take: 10000,
+        }),
+      ]) : [[], []];
       const activeByFan = new Map(activeRows.map((x) => [String(x.fanId), x]));
+      const recentHiddenByFan = new Map();
+      for (const row of recentHiddenRows || []) {
+        const fid = String(row.fanId || "");
+        if (!fid || recentHiddenByFan.has(fid)) continue;
+        recentHiddenByFan.set(fid, row);
+      }
       const picked = [];
       const skipped = [];
       const skippedCounts = {};
       const pushSkip = (row) => {
-        skipped.push(row);
-        const code = String(row?.code || "SKIPPED");
+        const code = String(row?.code || row?.reason || "SKIPPED");
+        skipped.push({ reason: code, ...row, code });
         skippedCounts[code] = (skippedCounts[code] || 0) + 1;
       };
       for (const c of candidates) {
         if (picked.length >= limit) break;
-        const meta = c.metadata && typeof c.metadata === "object" && !Array.isArray(c.metadata) ? c.metadata : {};
-        const nextEligibleAt = parseDate(meta.nextEligibleAt || meta.hiddenNextEligibleAt || null);
-        if (nextEligibleAt && nextEligibleAt > now) { pushSkip({ fanId: c.fanId, code: "COOLING", nextEligibleAt: nextEligibleAt.toISOString() }); continue; }
+        const recentHidden = recentHiddenByFan.get(String(c.fanId));
+        if (recentHidden) {
+          const baseAt = parseDate(recentHidden.sentAt || recentHidden.createdAt || recentHidden.scheduledAt || recentHidden.cancelAt) || now;
+          const nextEligibleAt = new Date(baseAt.getTime() + cadenceHours * 60 * 60 * 1000);
+          if (nextEligibleAt > now) {
+            pushSkip({ fanId: c.fanId, code: "COOLING", nextEligibleAt: nextEligibleAt.toISOString(), lastHiddenAt: baseAt.toISOString(), status: recentHidden.status || null, trigger: recentHidden.trigger || null, cancelAt: recentHidden.cancelAt ? recentHidden.cancelAt.toISOString() : null });
+            continue;
+          }
+        }
         const active = activeByFan.get(String(c.fanId));
         if (active) { pushSkip({ fanId: c.fanId, code: "ACTIVE_OR_ALREADY_QUEUED", status: active.status || null, trigger: active.trigger || null, cancelAt: active.cancelAt ? active.cancelAt.toISOString() : null }); continue; }
         picked.push(c);
