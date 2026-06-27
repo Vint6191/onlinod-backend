@@ -3,7 +3,7 @@
 function registerFollowBackRoutes(router, deps) {
   const {
     prisma, cleanString, optionalString, jsonObject, parseLimit, parseOffset, positiveInt, requireCreator, sendError, requireSeniorAutomationWriter,
-    parseDate, mergeIntelIntoPublicRow, logAutomationActivitySafe,
+    parseDate, logAutomationActivitySafe,
   } = deps;
 
   function automationIntelNumber(value, fallback = 0) {
@@ -49,6 +49,33 @@ function registerFollowBackRoutes(router, deps) {
       fetchedAt: optionalString(src.fetchedAt, 80) || new Date().toISOString(),
       source: optionalString(src.source, 80) || "fan_intel_provider",
     });
+  }
+
+  function mergeIntelIntoPublicRow(row = {}) {
+    const item = row && typeof row === "object" ? row : {};
+    const meta = jsonObject(item.metadata || {});
+    const result = jsonObject(item.result || {});
+    const intel = compactAutomationFanIntel(item.fanIntel || meta.fanIntel || result.fanIntel || meta || result || {});
+    if (!intel) return item;
+    return {
+      ...item,
+      username: item.username || intel.username || null,
+      name: item.name || intel.displayName || intel.name || null,
+      displayName: intel.displayName || null,
+      avatarUrl: intel.avatarUrl || null,
+      avatarThumbUrl: intel.avatarThumbUrl || intel.avatarUrl || null,
+      totalSpentCents: Number(item.totalSpentCents || 0) || Number(intel.totalSpentCents || 0) || 0,
+      totalSumm: intel.totalSumm || 0,
+      messagesSumm: intel.messagesSumm || 0,
+      tipsSumm: intel.tipsSumm || 0,
+      subscribedAt: intel.subscribedAt || null,
+      subscribedUntil: intel.subscribedUntil || null,
+      subscribedDurationText: intel.subscribedDurationText || null,
+      subDays: intel.subDays ?? null,
+      lastSeen: intel.lastSeen || null,
+      fanIntelFetchedAt: intel.fetchedAt || null,
+      fanIntel: intel,
+    };
   }
 
 const FOLLOW_BACK_TERMINAL_STATUSES = new Set(["followed", "waiting_return", "final_unfollowed", "done", "completed"]);

@@ -912,7 +912,6 @@ registerHiddenOnlineRoutes(router, {
 registerFollowBackRoutes(router, {
   ...automationRouteDeps,
   parseDate,
-  mergeIntelIntoPublicRow,
   logAutomationActivitySafe,
 });
 
