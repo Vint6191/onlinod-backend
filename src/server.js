@@ -46,8 +46,17 @@ const { authRequired } = require("./middleware/auth");
 const { createIdempotencyMiddleware } = require("./middleware/idempotency");
 const prisma = require("./prisma");
 const logger = require("./utils/logger");
+const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
 const { startRecurringScheduler } = require("./services/job-scheduler");
 const { startPresenceScheduler } = require("./services/presence-scheduler");
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("unhandled promise rejection", { error: String(reason?.message || reason), stack: reason?.stack || null });
+});
+
+process.on("uncaughtException", (err) => {
+  logger.error("uncaught exception", { error: String(err?.message || err), stack: err?.stack || null });
+});
 
 const app = express();
 
@@ -145,6 +154,19 @@ app.get("/health", async (_req, res) => {
       database: "error",
       time: new Date().toISOString(),
     });
+  }
+});
+
+app.get("/health/details", async (_req, res) => {
+  if (process.env.ONLINOD_EXPOSE_HEALTH_DETAILS !== "1") {
+    return res.status(404).json({ ok: false, code: "NOT_FOUND" });
+  }
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return res.json(buildBackendHealthSnapshot({ database: "ok" }));
+  } catch (err) {
+    logger.warn("health details database check failed", { error: err?.message || String(err) });
+    return res.status(503).json(buildBackendHealthSnapshot({ database: "error" }));
   }
 });
 
