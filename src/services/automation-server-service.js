@@ -37,6 +37,8 @@ const EVENT_STATUSES = new Set(["info", "ok", "failed", "skipped", "warning"]);
 const RAW_KEY_RE = /(^|_)(raw|html|payload|headers|cookies|token|authorization|password|secret)($|_)/i;
 const BUMP_TRASH_RETENTION_DAYS = 14;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const ACTIVITY_CACHE_TTL_MS = 30 * 1000;
+const activityCache = new Map();
 
 function addDaysIso(date, days) {
   const d = date instanceof Date ? date : new Date(date || Date.now());
@@ -693,27 +695,43 @@ async function claimJobs({ agencyId, input = {} }) {
       AND "attempts" >= "maxAttempts"
   `.catch(() => null);
 
-  const where = { agencyId, status: "scheduled", runAfter: { lte: now } };
-  if (types.length) where.type = { in: types };
-  if (creatorId) where.creatorId = creatorId;
-  const candidates = await prisma.automationJob.findMany({
-    where,
-    orderBy: [{ priority: "desc" }, { runAfter: "asc" }, { createdAt: "asc" }],
-    take: limit,
-    select: { id: true },
-  });
-  const items = [];
-  for (const candidate of candidates) {
-    const updated = await prisma.automationJob.updateMany({
-      where: { id: candidate.id, agencyId, status: "scheduled" },
-      data: { status: "claimed", claimedByDeviceId: deviceId, claimedAt: now, attempts: { increment: 1 } },
-    });
-    if (updated.count > 0) {
-      const job = await prisma.automationJob.findUnique({ where: { id: candidate.id } });
-      if (job) items.push(job);
-    }
+  const params = [agencyId, now, limit, deviceId];
+  const filters = [];
+  if (creatorId) {
+    params.push(creatorId);
+    filters.push(`AND "creatorId" = $${params.length}`);
   }
-  return { ok: true, items, count: items.length };
+  if (types.length) {
+    const placeholders = types.map((type) => {
+      params.push(type);
+      return `$${params.length}`;
+    }).join(", ");
+    filters.push(`AND "type" IN (${placeholders})`);
+  }
+
+  const items = await prisma.$queryRawUnsafe(`
+    UPDATE "AutomationJob"
+    SET
+      "status" = 'claimed',
+      "claimedByDeviceId" = $4,
+      "claimedAt" = NOW(),
+      "attempts" = "attempts" + 1,
+      "updatedAt" = NOW()
+    WHERE "id" IN (
+      SELECT "id"
+      FROM "AutomationJob"
+      WHERE "agencyId" = $1
+        AND "status" = 'scheduled'
+        AND "runAfter" <= $2
+        ${filters.join("\n        ")}
+      ORDER BY "priority" DESC, "runAfter" ASC, "createdAt" ASC
+      LIMIT $3
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING *
+  `, ...params).catch(() => []);
+
+  return { ok: true, items: Array.isArray(items) ? items : [], count: Array.isArray(items) ? items.length : 0 };
 }
 
 async function cancelJobs({ agencyId, userId, input = {} }) {
@@ -1686,14 +1704,19 @@ async function listActivity({ agencyId, query = {} }) {
   const moduleFilter = clean(query.module, 60).toLowerCase();
   const take = parseLimit(query.limit, 60, 200);
   const sinceHours = clampInt(query.sinceHours, 72, 1, 24 * 30);
+  const cacheKey = `${agencyId}:${creatorId || "all"}:${moduleFilter || "all"}:${take}:${sinceHours}`;
+  const cached = activityCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < ACTIVITY_CACHE_TTL_MS) {
+    return { ...cached.value, cached: true, cacheTtlMs: ACTIVITY_CACHE_TTL_MS };
+  }
   const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
   const eventWhere = { agencyId, createdAt: { gte: since } };
   if (creatorId) eventWhere.OR = [{ creatorId }, { accountId: creatorId }];
   const [events, deliveries, follows, sfsJobs] = await Promise.all([
-    prisma.automationEvent.findMany({ where: eventWhere, orderBy: { createdAt: "desc" }, take: Math.min(500, take * 5) }).catch(() => []),
-    prisma.automationDelivery.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), OR: [{ updatedAt: { gte: since } }, { sentAt: { gte: since } }, { createdAt: { gte: since } }] }, orderBy: { updatedAt: "desc" }, take: Math.min(200, take * 3) }).catch(() => []),
-    prisma.followBackTask.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), updatedAt: { gte: since } }, orderBy: { updatedAt: "desc" }, take: Math.min(100, take * 2) }).catch(() => []),
-    prisma.automationJob.findMany({ where: { agencyId, ...(creatorId ? { OR: [{ creatorId }, { accountId: creatorId }] } : {}), type: "sfs_hunter", updatedAt: { gte: since } }, orderBy: { updatedAt: "desc" }, take: Math.min(150, take * 3) }).catch(() => []),
+    prisma.automationEvent.findMany({ where: eventWhere, orderBy: { createdAt: "desc" }, take: Math.min(120, Math.ceil(take * 1.5)) }).catch(() => []),
+    prisma.automationDelivery.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), OR: [{ updatedAt: { gte: since } }, { sentAt: { gte: since } }, { createdAt: { gte: since } }] }, orderBy: { updatedAt: "desc" }, take: Math.min(90, Math.ceil(take * 1.5)) }).catch(() => []),
+    prisma.followBackTask.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), updatedAt: { gte: since } }, orderBy: { updatedAt: "desc" }, take: Math.min(90, Math.ceil(take * 1.5)) }).catch(() => []),
+    prisma.automationJob.findMany({ where: { agencyId, ...(creatorId ? { OR: [{ creatorId }, { accountId: creatorId }] } : {}), type: "sfs_hunter", updatedAt: { gte: since } }, orderBy: { updatedAt: "desc" }, take: Math.min(90, Math.ceil(take * 1.5)) }).catch(() => []),
   ]);
   const rows = [];
   for (const row of events || []) rows.push(automationActivityFromEvent(row));
@@ -1711,7 +1734,15 @@ async function listActivity({ agencyId, query = {} }) {
     out.push(row);
     if (out.length >= take) break;
   }
-  return { ok: true, items: out, count: out.length, source: "automation_activity_v1" };
+  const value = { ok: true, items: out, count: out.length, source: "automation_activity_v1" };
+  activityCache.set(cacheKey, { ts: Date.now(), value });
+  if (activityCache.size > 250) {
+    const cutoff = Date.now() - ACTIVITY_CACHE_TTL_MS * 2;
+    for (const [key, rec] of activityCache) {
+      if (!rec || rec.ts < cutoff || activityCache.size > 300) activityCache.delete(key);
+    }
+  }
+  return value;
 }
 
 async function logEvent({ agencyId, userId, input = {} }) {
