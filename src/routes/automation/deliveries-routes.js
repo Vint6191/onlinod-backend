@@ -8,7 +8,7 @@ function registerDeliveryRoutes(router, deps) {
     refreshBumpTaskStats, compactTemplateIds, dateIso, maxIsoDate, addHoursDate, mapBumpFanState, upsertBumpFanState,
     incrementBumpDeliveryStat, findAutomationDeliveryForResult, stripUndefinedFields, deliveryStatAlreadyCounted, automationResultCode,
     isSoftRetryResult, isSendUnknownResult, automationRetryAt, normalizeDeliveryWriteData, createAutomationDeliverySafe,
-    saveAutomationDeliveryIdempotent, markAutomationDeliveryTerminal, repairAutomationDeliveries, normalizeBumpTrigger,
+    saveAutomationDeliveryIdempotent, markAutomationDeliveryTerminal, repairAutomationDeliveries, BUMP_TRIGGER_KEYS, normalizeBumpTrigger,
     eventGateId, eventQueueBatchId, onlineQueueFanIds, onlineSpacingRange, randomOnlineSpacingMs, acquireOnlineGate, onlineGateNextAllowed,
     AUTOMATION_TERMINAL_ROW_STATUSES, AUTOMATION_SOFT_RETRY_CODES, ONLINE_SEND_ACTIVE_STATUSES,
   } = deps;

@@ -823,6 +823,7 @@ function createDeliveryHelpers(deps = {}) {
     saveAutomationDeliveryIdempotent,
     markAutomationDeliveryTerminal,
     repairAutomationDeliveries,
+    BUMP_TRIGGER_KEYS,
     normalizeBumpTrigger,
     eventGateId,
     eventQueueBatchId,
