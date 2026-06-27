@@ -98,6 +98,34 @@ async function adminLog(req, data) {
   }
 }
 
+function adminAuditMiddleware(req, res, next) {
+  const startedAt = Date.now();
+  res.on("finish", () => {
+    if (!req.admin?.id) return;
+    const pathForAction = String(req.route?.path || req.path || "unknown")
+      .replace(/[^a-zA-Z0-9:_/-]+/g, "_")
+      .slice(0, 140);
+
+    const agencyIdForLog = req.params?.agencyId || (/^\/agencies\//.test(String(req.path || "")) ? req.params?.id : null);
+
+    adminLog(req, {
+      agencyId: agencyIdForLog || null,
+      action: `admin.http.${String(req.method || "GET").toLowerCase()}.${pathForAction}`,
+      targetType: "admin_route",
+      targetId: req.params?.id || req.params?.memberId || req.params?.userId || req.params?.creatorId || null,
+      after: {
+        method: req.method,
+        path: req.originalUrl || req.url,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - startedAt,
+      },
+    });
+  });
+  next();
+}
+
+router.use(adminAuditMiddleware);
+
 function ensureSuperAdmin(req, res) {
   if (req.admin?.role && req.admin.role !== "SUPER_ADMIN") {
     res.status(403).json({

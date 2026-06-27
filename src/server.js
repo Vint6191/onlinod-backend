@@ -2,6 +2,8 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const path = require("node:path");
 
 const authRoutes = require("./routes/auth");
@@ -23,6 +25,7 @@ const vaultUnsortedRoutes = require("./routes/vault-unsorted");
 const messageLibraryRoutes = require("./routes/message-library");
 const settingsRoutes = require("./routes/settings");
 const modulesRoutes = require("./routes/modules");
+const systemRoutes = require("./routes/system");
 const auditRoutes = require("./routes/audit");
 const teamAnalyticsRoutes = require("./routes/team-analytics");
 const teamClaimsRoutes = require("./routes/team-claims");
@@ -40,6 +43,7 @@ const vaultSalesRoutes = require("./routes/vault-sales");
 const trafficRoutes = require("./routes/traffic");
 const serverStoreDiagnosticsRoutes = require("./routes/server-store-diagnostics");
 const { authRequired } = require("./middleware/auth");
+const prisma = require("./prisma");
 const { startRecurringScheduler } = require("./services/job-scheduler");
 const { startPresenceScheduler } = require("./services/presence-scheduler");
 
@@ -47,27 +51,98 @@ const app = express();
 
 app.set("trust proxy", 1);
 
+const DEFAULT_ALLOWED_ORIGINS = [
+  "https://app.onlinod.com",
+  "https://onlinod.com",
+  "https://www.onlinod.com",
+  "null",
+];
+
+function readAllowedOrigins() {
+  const extra = String(process.env.CORS_ORIGINS || "")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
+  return new Set([...DEFAULT_ALLOWED_ORIGINS, ...extra]);
+}
+
+function isAllowedDevOrigin(origin) {
+  if (process.env.NODE_ENV === "production") return false;
+  return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(String(origin || ""));
+}
+
 app.use(
-  cors({
-    origin: true,
-    credentials: true,
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
   })
 );
+
+app.use(
+  cors({
+    credentials: true,
+    origin(origin, cb) {
+      // Native Electron/file requests often have no Origin. Keep them working,
+      // but do not allow arbitrary browser origins to use credentialed CORS.
+      if (!origin) return cb(null, true);
+      if (origin === "null" || String(origin).startsWith("file://")) return cb(null, true);
+      if (readAllowedOrigins().has(origin) || isAllowedDevOrigin(origin)) return cb(null, true);
+      return cb(new Error(`CORS origin blocked: ${origin}`));
+    },
+  })
+);
+
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Number(process.env.API_RATE_LIMIT_PER_MIN || 1000),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Number(process.env.AUTH_RATE_LIMIT_PER_15_MIN || 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+});
+
+app.use("/api", apiLimiter);
+app.use("/api/auth/login", authLimiter);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 
-app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
+app.use("/uploads", express.static(path.join(__dirname, "..", "uploads"), {
+  setHeaders(res) {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'none'; script-src 'none'; sandbox");
+  },
+}));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    status: "healthy",
-    service: "onlinod-backend",
-    version: "0.8.0-server-stores",
-    time: new Date().toISOString(),
-  });
+app.get("/health", async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return res.json({
+      ok: true,
+      status: "healthy",
+      service: "onlinod-backend",
+      version: "0.8.0-server-stores",
+      database: "ok",
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("[health] database check failed:", err?.message || err);
+    return res.status(503).json({
+      ok: false,
+      status: "unhealthy",
+      service: "onlinod-backend",
+      version: "0.8.0-server-stores",
+      database: "error",
+      time: new Date().toISOString(),
+    });
+  }
 });
 
 app.get("/api", (_req, res) => {
@@ -78,6 +153,7 @@ app.get("/api", (_req, res) => {
   });
 });
 
+app.use("/api/system", systemRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/admin-auth", adminAuthRoutes);
 app.use("/api/admin/data", adminDataRoutes);
@@ -152,9 +228,30 @@ app.use((err, _req, res, _next) => {
 
 const port = Number(process.env.PORT || 10000);
 
-app.listen(port, () => {
+const httpServer = app.listen(port, () => {
   console.log(`Onlinod backend running on port ${port}`);
 });
 
 startRecurringScheduler();
 startPresenceScheduler();
+
+async function gracefulShutdown(signal) {
+  console.log(`[server] ${signal} received, shutting down gracefully`);
+  httpServer.close(async () => {
+    try {
+      await prisma.$disconnect();
+    } catch (err) {
+      console.warn("[server] prisma disconnect failed:", err?.message || err);
+    } finally {
+      process.exit(0);
+    }
+  });
+
+  setTimeout(() => {
+    console.warn("[server] graceful shutdown timed out");
+    process.exit(1);
+  }, 10_000).unref?.();
+}
+
+process.once("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+process.once("SIGINT", () => void gracefulShutdown("SIGINT"));

@@ -262,17 +262,27 @@ async function verifyEmailByCode({ email, code }) {
 }
 
 async function refreshAccessToken({ refreshToken, req, deviceId = null, client = null }) {
+  const tokenHash = sha256(refreshToken);
+
   const session = await prisma.refreshSession.findUnique({
-    where: {
-      tokenHash: sha256(refreshToken),
-    },
-    include: {
-      user: true,
-    },
+    where: { tokenHash },
+    include: { user: true },
   });
 
-  if (!session || session.revokedAt || session.expiresAt < new Date()) {
+  const now = new Date();
+
+  if (!session || session.expiresAt < now) {
     return { ok: false, code: "REFRESH_INVALID", error: "Refresh token is invalid or expired" };
+  }
+
+  if (session.revokedAt) {
+    // Reuse detection: an already-rotated token was presented again. Assume
+    // compromise and revoke all currently active sessions for this user.
+    await prisma.refreshSession.updateMany({
+      where: { userId: session.userId, revokedAt: null },
+      data: { revokedAt: now },
+    });
+    return { ok: false, code: "REFRESH_REUSED", error: "Refresh token reuse detected. Please sign in again." };
   }
 
   if (session.user.disabledAt) {
@@ -292,16 +302,50 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
     return { ok: false, code: "SESSION_AGENCY_INVALID", error: "Session agency is invalid" };
   }
 
-  await prisma.refreshSession.update({
-    where: { id: session.id },
-    data: {
-      lastUsedAt: new Date(),
-      ipAddress: req?.ip || session.ipAddress,
-      userAgent: req?.headers?.["user-agent"] || session.userAgent,
-      deviceId: deviceId || session.deviceId,
-      client: client || session.client,
-    },
+  const nextRefreshToken = randomToken(48);
+  const nextExpiresAt = addDays(refreshDaysForRememberDevice(session.rememberDevice));
+
+  const rotated = await prisma.$transaction(async (tx) => {
+    const revoked = await tx.refreshSession.updateMany({
+      where: { id: session.id, revokedAt: null },
+      data: {
+        revokedAt: now,
+        lastUsedAt: now,
+        ipAddress: req?.ip || session.ipAddress,
+        userAgent: req?.headers?.["user-agent"] || session.userAgent,
+        deviceId: deviceId || session.deviceId,
+        client: client || session.client,
+      },
+    });
+
+    if (revoked.count !== 1) return false;
+
+    await tx.refreshSession.create({
+      data: {
+        userId: session.userId,
+        agencyId: session.agencyId,
+        tokenHash: sha256(nextRefreshToken),
+        userAgent: req?.headers?.["user-agent"] || session.userAgent,
+        ipAddress: req?.ip || session.ipAddress,
+        expiresAt: nextExpiresAt,
+        rememberDevice: session.rememberDevice === true,
+        deviceId: deviceId || session.deviceId,
+        client: client || session.client,
+        impersonatedByAdminId: session.impersonatedByAdminId || null,
+        lastUsedAt: now,
+      },
+    });
+
+    return true;
   });
+
+  if (!rotated) {
+    await prisma.refreshSession.updateMany({
+      where: { userId: session.userId, revokedAt: null },
+      data: { revokedAt: now },
+    });
+    return { ok: false, code: "REFRESH_REUSED", error: "Refresh token reuse detected. Please sign in again." };
+  }
 
   const accessToken = signAccessToken({
     userId: session.userId,
@@ -313,8 +357,8 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
     ok: true,
     accessToken,
     accessTokenExpiresAt: accessTokenExpiry(accessToken),
-    refreshToken,
-    refreshTokenExpiresAt: session.expiresAt,
+    refreshToken: nextRefreshToken,
+    refreshTokenExpiresAt: nextExpiresAt,
     user: session.user,
     membership,
   };

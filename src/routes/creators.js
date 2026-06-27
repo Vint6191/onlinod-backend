@@ -12,20 +12,45 @@ const router = express.Router();
 const uploadsDir = path.join(__dirname, "..", "..", "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
 
+const ALLOWED_AVATAR_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
+const ALLOWED_AVATAR_MIME = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+
+function avatarExtension(file) {
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  return ALLOWED_AVATAR_EXTENSIONS.has(ext) ? ext : ".jpg";
+}
+
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || "").toLowerCase() || ".jpg";
-    cb(null, `avatar_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+    cb(null, `avatar_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${avatarExtension(file)}`);
   },
 });
+
+function looksLikeAllowedImage(filePath, mimeType) {
+  const header = fs.readFileSync(filePath).subarray(0, 16);
+  const hex = header.toString("hex");
+  const ascii = header.toString("ascii");
+
+  if (mimeType === "image/jpeg") return header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff;
+  if (mimeType === "image/png") return hex.startsWith("89504e470d0a1a0a");
+  if (mimeType === "image/gif") return ascii.startsWith("GIF87a") || ascii.startsWith("GIF89a");
+  if (mimeType === "image/webp") return ascii.startsWith("RIFF") && header.subarray(8, 12).toString("ascii") === "WEBP";
+  return false;
+}
+
+function safeUnlink(filePath) {
+  try { if (filePath) fs.unlinkSync(filePath); } catch (_) {}
+}
 
 const upload = multer({
   storage,
   limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (!String(file.mimetype || "").startsWith("image/")) {
-      return cb(new Error("Only image files are allowed"));
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    const mime = String(file.mimetype || "").toLowerCase();
+    if (!ALLOWED_AVATAR_EXTENSIONS.has(ext) || !ALLOWED_AVATAR_MIME.has(mime)) {
+      return cb(new Error("Only jpg, png, webp or gif image files are allowed"));
     }
     cb(null, true);
   },
@@ -224,6 +249,12 @@ router.post("/:id/avatar", upload.single("avatar"), async (req, res) => {
 
     if (!req.file) {
       return res.status(400).json({ ok: false, code: "AVATAR_MISSING", error: "Avatar file is required" });
+    }
+
+    const mime = String(req.file.mimetype || "").toLowerCase();
+    if (!looksLikeAllowedImage(req.file.path, mime)) {
+      safeUnlink(req.file.path);
+      return res.status(400).json({ ok: false, code: "AVATAR_INVALID", error: "Avatar file content is not a valid image" });
     }
 
     const avatarUrl = `${publicBaseUrl(req)}/uploads/${req.file.filename}`;
