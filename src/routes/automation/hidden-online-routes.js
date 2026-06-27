@@ -613,28 +613,50 @@ function registerHiddenOnlineRoutes(router, deps) {
       const cadenceHours = Math.max(1, Math.min(168, Number(req.body?.cadenceHours || req.body?.hiddenCadenceHours || 3) || 3));
       const replyTimeoutHours = Math.max(1, Math.min(24, Number(req.body?.replyTimeoutHours || req.body?.hiddenReplyTimeoutHours || 1) || 1));
   
+      // Pull a wide candidate window. The previous limit*5 window could be
+      // fully occupied by fresh fanOnline/pending_reply rows, so hidden refill
+      // returned NO_ELIGIBLE even though thousands of older hidden candidates
+      // were available deeper in the list.
+      const candidateTake = Math.max(limit * 50, limit, 1000);
       const candidates = await prisma.hiddenOnlineUser.findMany({
         where: { agencyId: req.auth.agencyId, creatorId, status: "active" },
         orderBy: [{ lastSignalAt: "desc" }, { updatedAt: "desc" }],
-        take: Math.max(limit * 5, limit),
+        take: Math.min(5000, candidateTake),
       });
-      const activeRows = await prisma.automationDelivery.findMany({
-        where: { agencyId: req.auth.agencyId, creatorId, fanId: { in: candidates.map((x) => x.fanId) }, status: { in: ACTIVE_ONLINE_SEND_STATUSES } },
-        select: { fanId: true, status: true },
-        take: 10000});
+      const fanIds = candidates.map((x) => x.fanId).filter(Boolean);
+      const activeRows = fanIds.length ? await prisma.automationDelivery.findMany({
+        where: {
+          agencyId: req.auth.agencyId,
+          creatorId,
+          fanId: { in: fanIds },
+          OR: [
+            { status: { in: ["online_queued", "scheduled", "retry_wait", "send_unknown", "claimed", "checking_reply"] } },
+            { status: { in: ["sent", "pending_reply"] }, OR: [{ cancelAt: null }, { cancelAt: { gt: now } }] },
+          ],
+        },
+        select: { fanId: true, status: true, cancelAt: true, trigger: true },
+        take: 10000,
+      }) : [];
       const activeByFan = new Map(activeRows.map((x) => [String(x.fanId), x]));
       const picked = [];
       const skipped = [];
+      const skippedCounts = {};
+      const pushSkip = (row) => {
+        skipped.push(row);
+        const code = String(row?.code || "SKIPPED");
+        skippedCounts[code] = (skippedCounts[code] || 0) + 1;
+      };
       for (const c of candidates) {
         if (picked.length >= limit) break;
         const meta = c.metadata && typeof c.metadata === "object" && !Array.isArray(c.metadata) ? c.metadata : {};
         const nextEligibleAt = parseDate(meta.nextEligibleAt || meta.hiddenNextEligibleAt || null);
-        if (nextEligibleAt && nextEligibleAt > now) { skipped.push({ fanId: c.fanId, code: "COOLING", nextEligibleAt: nextEligibleAt.toISOString() }); continue; }
-        if (activeByFan.has(String(c.fanId))) { skipped.push({ fanId: c.fanId, code: "ACTIVE_OR_ALREADY_QUEUED", status: activeByFan.get(String(c.fanId))?.status || null }); continue; }
+        if (nextEligibleAt && nextEligibleAt > now) { pushSkip({ fanId: c.fanId, code: "COOLING", nextEligibleAt: nextEligibleAt.toISOString() }); continue; }
+        const active = activeByFan.get(String(c.fanId));
+        if (active) { pushSkip({ fanId: c.fanId, code: "ACTIVE_OR_ALREADY_QUEUED", status: active.status || null, trigger: active.trigger || null, cancelAt: active.cancelAt ? active.cancelAt.toISOString() : null }); continue; }
         picked.push(c);
       }
   
-      if (!picked.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped, code: "NO_ELIGIBLE_HIDDEN_ONLINE" });
+      if (!picked.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped, skippedCount: skipped.length, skippedCounts, candidateWindow: candidates.length, activeChecked: activeRows.length, code: "NO_ELIGIBLE_HIDDEN_ONLINE" });
   
       const result = await prisma.$transaction(async (tx) => {
         const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now });
@@ -686,7 +708,7 @@ function registerHiddenOnlineRoutes(router, deps) {
         return { items, gateNextAllowedAt: cursor };
       }, { timeout: 15000 });
   
-      return res.json({ ok: true, creatorId, triggerKey: BUMP_TRIGGER_KEYS.HIDDEN, count: result.items.length, items: result.items.map(mapAutomationDelivery), skipped, skippedCount: skipped.length, gateNextAllowedAt: result.gateNextAllowedAt.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, cadenceHours, replyTimeoutHours });
+      return res.json({ ok: true, creatorId, triggerKey: BUMP_TRIGGER_KEYS.HIDDEN, count: result.items.length, items: result.items.map(mapAutomationDelivery), skipped, skippedCount: skipped.length, skippedCounts, candidateWindow: candidates.length, activeChecked: activeRows.length, gateNextAllowedAt: result.gateNextAllowedAt.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, cadenceHours, replyTimeoutHours });
     } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_QUEUE_ELIGIBLE_FAILED"); }
   });
   
