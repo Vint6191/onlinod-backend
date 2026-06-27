@@ -45,6 +45,16 @@ function cleanString(value, max = 200) {
   return s ? s.slice(0, max) : null;
 }
 
+async function findMoneyAttributionForUpdate(tx, { agencyId, eventHash }) {
+  const rows = await tx.$queryRaw`
+    SELECT * FROM "MoneyAttribution"
+    WHERE "agencyId" = ${agencyId} AND "eventHash" = ${eventHash}
+    FOR UPDATE
+    LIMIT 1
+  `;
+  return rows?.[0] || null;
+}
+
 function hashEvent({
   agencyId,
   accountId,
@@ -331,110 +341,114 @@ async function ingestMoneyEvent({ agencyId, userId, payload }) {
 
 async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action, targetMemberId, reason }) {
   const cleanAction = cleanString(action, 24);
+  const safeHash = cleanString(eventHash, 80);
   if (!cleanAction || !ALLOWED_ACTIONS.has(cleanAction)) {
     return { ok: false, code: "INVALID_ACTION" };
   }
-
-  const row = await prisma.moneyAttribution.findUnique({
-    where: { agencyId_eventHash: { agencyId, eventHash: cleanString(eventHash, 80) } },
-  });
-
-  if (!row) {
+  if (!safeHash) {
     return { ok: false, code: "ATTRIBUTION_NOT_FOUND" };
   }
 
-  if (!isLegacyClaimableEventType(row.eventType)) {
-    if (row.eventType === "subscription_created") {
-      return {
-        ok: false,
-        code: "SUBSCRIPTION_NOT_TEAM_MEMBER_REVENUE",
-        error: "Subscriptions belong to traffic / creator revenue and are not claimable by chatters",
-      };
-    }
-    return {
-      ok: false,
-      code: "PPV_CLAIMS_MOVED_TO_LEDGER",
-      error: "PPV attribution conflicts must be resolved through /api/team/analytics/ppv/conflicts",
-    };
-  }
-
-  if (isLocked(row)) {
-    return { ok: false, code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
-  }
-
-  // Resolve actor (the chatter / manager performing the action).
+  // Resolve actor before taking the row lock. The financial row itself is
+  // locked below, so concurrent claim/release/manager_override requests are
+  // serialized before checks + update are applied.
   const actor = await resolveMember({ agencyId, memberId: byMemberId, userId: byUserId });
   if (!actor) {
     return { ok: false, code: "ACTOR_NOT_AGENCY_MEMBER" };
   }
 
-  let nextOwnerMemberId = row.attributedToMemberId;
-  let nextOwnerUserId = row.attributedToUserId;
-  let nextState = row.state;
+  const outcome = await prisma.$transaction(async (tx) => {
+    const row = await findMoneyAttributionForUpdate(tx, { agencyId, eventHash: safeHash });
 
-  if (cleanAction === "claim") {
-    const eligible = await canActorClaimAttribution({ agencyId, row, actor });
-    if (!eligible) {
+    if (!row) {
+      return { ok: false, code: "ATTRIBUTION_NOT_FOUND" };
+    }
+
+    if (!isLegacyClaimableEventType(row.eventType)) {
+      if (row.eventType === "subscription_created") {
+        return {
+          ok: false,
+          code: "SUBSCRIPTION_NOT_TEAM_MEMBER_REVENUE",
+          error: "Subscriptions belong to traffic / creator revenue and are not claimable by chatters",
+        };
+      }
       return {
         ok: false,
-        code: "CLAIM_NOT_ELIGIBLE",
-        error: "You can claim only legacy tip rows from dialogs you worked in the attribution window",
+        code: "PPV_CLAIMS_MOVED_TO_LEDGER",
+        error: "PPV attribution conflicts must be resolved through /api/team/analytics/ppv/conflicts",
       };
     }
-    nextOwnerMemberId = actor.id;
-    nextOwnerUserId = actor.userId;
-    nextState = "claimed";
-  } else if (cleanAction === "release") {
-    // Owner gives up the money. Goes back to auto-attribution if
-    // someone was eligible there, otherwise unattributed.
-    if (row.attributedToMemberId !== actor.id) {
-      return { ok: false, code: "NOT_OWNER", error: "Only the current owner can release" };
+
+    if (isLocked(row)) {
+      return { ok: false, code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
     }
-    nextOwnerMemberId = row.autoAttributedToMemberId !== actor.id
-      ? row.autoAttributedToMemberId
-      : null;
-    nextOwnerUserId = row.autoAttributedToUserId !== actor.userId
-      ? row.autoAttributedToUserId
-      : null;
-    nextState = nextOwnerMemberId ? "released" : "unattributed";
-  } else if (cleanAction === "manager_override") {
-    // Manager / owner sets the attribution to anyone (or null).
-    // Authorisation is enforced at the route level (requireManager).
-    if (targetMemberId) {
-      const target = await resolveMember({ agencyId, memberId: targetMemberId });
-      if (!target) {
-        return { ok: false, code: "TARGET_NOT_AGENCY_MEMBER" };
+
+    let nextOwnerMemberId = row.attributedToMemberId;
+    let nextOwnerUserId = row.attributedToUserId;
+    let nextState = row.state;
+
+    if (cleanAction === "claim") {
+      const eligible = await canActorClaimAttribution({ agencyId, row, actor });
+      if (!eligible) {
+        return {
+          ok: false,
+          code: "CLAIM_NOT_ELIGIBLE",
+          error: "You can claim only legacy tip rows from dialogs you worked in the attribution window",
+        };
       }
-      nextOwnerMemberId = target.id;
-      nextOwnerUserId = target.userId;
-    } else {
-      nextOwnerMemberId = null;
-      nextOwnerUserId = null;
+      nextOwnerMemberId = actor.id;
+      nextOwnerUserId = actor.userId;
+      nextState = "claimed";
+    } else if (cleanAction === "release") {
+      if (row.attributedToMemberId !== actor.id) {
+        return { ok: false, code: "NOT_OWNER", error: "Only the current owner can release" };
+      }
+      nextOwnerMemberId = row.autoAttributedToMemberId !== actor.id
+        ? row.autoAttributedToMemberId
+        : null;
+      nextOwnerUserId = row.autoAttributedToUserId !== actor.userId
+        ? row.autoAttributedToUserId
+        : null;
+      nextState = nextOwnerMemberId ? "released" : "unattributed";
+    } else if (cleanAction === "manager_override") {
+      if (targetMemberId) {
+        const target = await resolveMember({ agencyId, memberId: targetMemberId });
+        if (!target) {
+          return { ok: false, code: "TARGET_NOT_AGENCY_MEMBER" };
+        }
+        nextOwnerMemberId = target.id;
+        nextOwnerUserId = target.userId;
+      } else {
+        nextOwnerMemberId = null;
+        nextOwnerUserId = null;
+      }
+      nextState = "manager";
     }
-    nextState = "manager";
-  }
 
-  const newHistory = pushHistory(row, {
-    action: cleanAction,
-    byMemberId: actor.id,
-    byUserId: actor.userId,
-    reason: cleanString(reason, 200),
-    prevOwner: row.attributedToMemberId,
-    nextOwner: nextOwnerMemberId,
-    source: "manual_override",
+    const newHistory = pushHistory(row, {
+      action: cleanAction,
+      byMemberId: actor.id,
+      byUserId: actor.userId,
+      reason: cleanString(reason, 200),
+      prevOwner: row.attributedToMemberId,
+      nextOwner: nextOwnerMemberId,
+      source: "manual_override",
+    });
+
+    const updated = await tx.moneyAttribution.update({
+      where: { id: row.id },
+      data: {
+        state: nextState,
+        attributedToMemberId: nextOwnerMemberId,
+        attributedToUserId: nextOwnerUserId,
+        history: newHistory,
+      },
+    });
+
+    return { ok: true, attribution: updated };
   });
 
-  const updated = await prisma.moneyAttribution.update({
-    where: { id: row.id },
-    data: {
-      state: nextState,
-      attributedToMemberId: nextOwnerMemberId,
-      attributedToUserId: nextOwnerUserId,
-      history: newHistory,
-    },
-  });
-
-  return { ok: true, attribution: updated };
+  return outcome?.ok ? outcome : { ok: false, code: outcome?.code || "OVERRIDE_FAILED", error: outcome?.error || "Failed" };
 }
 
 // --------------------------------------------------------------------

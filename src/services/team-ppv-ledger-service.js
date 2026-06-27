@@ -11,6 +11,35 @@ function clean(value, max = 255) {
   return s ? s.slice(0, max) : null;
 }
 
+async function findPpvResolveJobForUpdate(tx, { agencyId, jobId, purchaseId, messageId }) {
+  if (jobId) {
+    const rows = await tx.$queryRaw`
+      SELECT * FROM "TeamPpvResolveJob"
+      WHERE "agencyId" = ${agencyId} AND "id" = ${jobId}
+      FOR UPDATE
+      LIMIT 1
+    `;
+    return rows?.[0] || null;
+  }
+  const rows = await tx.$queryRaw`
+    SELECT * FROM "TeamPpvResolveJob"
+    WHERE "agencyId" = ${agencyId} AND "purchaseId" = ${purchaseId} AND "messageId" = ${messageId}
+    FOR UPDATE
+    LIMIT 1
+  `;
+  return rows?.[0] || null;
+}
+
+async function findPpvPurchaseForUpdate(tx, { agencyId, purchaseId }) {
+  const rows = await tx.$queryRaw`
+    SELECT * FROM "TeamPpvPurchaseLedger"
+    WHERE "agencyId" = ${agencyId} AND "purchaseId" = ${purchaseId}
+    FOR UPDATE
+    LIMIT 1
+  `;
+  return rows?.[0] || null;
+}
+
 function safeDate(value, fallback = Date.now()) {
   const n = Number(value);
   if (Number.isFinite(n) && n > 0) return new Date(n);
@@ -637,9 +666,7 @@ async function submitResolveResults({ agencyId, deviceId, results = [], actorMem
     if (!messageId || !submittedMemberId || (!jobId && !purchaseId)) { skipped += 1; continue; }
 
     const outcome = await prisma.$transaction(async (tx) => {
-      const job = await tx.teamPpvResolveJob.findFirst({
-        where: { agencyId, ...(jobId ? { id: jobId } : { purchaseId, messageId }) },
-      });
+      const job = await findPpvResolveJobForUpdate(tx, { agencyId, jobId, purchaseId, messageId });
       if (!job) return "skipped";
       if (job.expiresAt && job.expiresAt < new Date()) {
         await tx.teamPpvResolveJob.update({ where: { id: job.id }, data: { status: "expired", attempts: { increment: 1 } } });
@@ -683,7 +710,7 @@ async function submitResolveResults({ agencyId, deviceId, results = [], actorMem
         source: clean(item.source || "local_worker_ledger", 80),
       };
 
-      const existingPurchase = await tx.teamPpvPurchaseLedger.findFirst({ where: { agencyId, purchaseId: job.purchaseId } });
+      const existingPurchase = await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
       if (existingPurchase?.attributedMemberId && existingPurchase.attributedMemberId !== memberId) {
         const existingCandidate = {
           memberId: existingPurchase.attributedMemberId,
@@ -868,8 +895,10 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign"
   if (finalAction === "assign" && !safeMemberId) return { resolved: 0, skipped: 1 };
 
   const outcome = await prisma.$transaction(async (tx) => {
-    const job = await tx.teamPpvResolveJob.findFirst({ where: { agencyId, id: safeJobId } });
+    const job = await findPpvResolveJobForUpdate(tx, { agencyId, jobId: safeJobId });
     if (!job) return "skipped";
+
+    await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
 
     const baseResult = job.result && typeof job.result === "object" ? job.result : {};
     const manualResolution = {

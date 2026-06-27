@@ -15,6 +15,16 @@ function clean(value, max = 255) {
   return s ? s.slice(0, max) : null;
 }
 
+async function findTipLedgerForUpdate(tx, { agencyId, eventHash }) {
+  const rows = await tx.$queryRaw`
+    SELECT * FROM "TeamTipLedger"
+    WHERE "agencyId" = ${agencyId} AND "eventHash" = ${eventHash}
+    FOR UPDATE
+    LIMIT 1
+  `;
+  return rows?.[0] || null;
+}
+
 function int(value, fallback = 0) {
   const n = Number(value);
   return Number.isFinite(n) ? Math.round(n) : fallback;
@@ -582,9 +592,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
   if (!actor) return { ok: false, code: "ACTOR_NOT_AGENCY_MEMBER" };
 
   const outcome = await prisma.$transaction(async (tx) => {
-    const row = await tx.teamTipLedger.findUnique({
-      where: { agencyId_eventHash: { agencyId, eventHash: safeHash } },
-    });
+    const row = await findTipLedgerForUpdate(tx, { agencyId, eventHash: safeHash });
     if (!row) return { code: "TIP_NOT_FOUND" };
     if (isLocked(row)) return { code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
 

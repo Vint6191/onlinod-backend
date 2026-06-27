@@ -43,6 +43,7 @@ const vaultSalesRoutes = require("./routes/vault-sales");
 const trafficRoutes = require("./routes/traffic");
 const serverStoreDiagnosticsRoutes = require("./routes/server-store-diagnostics");
 const { authRequired } = require("./middleware/auth");
+const { createIdempotencyMiddleware } = require("./middleware/idempotency");
 const prisma = require("./prisma");
 const { startRecurringScheduler } = require("./services/job-scheduler");
 const { startPresenceScheduler } = require("./services/presence-scheduler");
@@ -112,6 +113,7 @@ app.use("/api/auth/login", authLimiter);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
+app.use("/api", createIdempotencyMiddleware());
 
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads"), {
   setHeaders(res) {
