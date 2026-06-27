@@ -38,7 +38,9 @@ const RAW_KEY_RE = /(^|_)(raw|html|payload|headers|cookies|token|authorization|p
 const BUMP_TRASH_RETENTION_DAYS = 14;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVITY_CACHE_TTL_MS = 30 * 1000;
+const EVENTS_CACHE_TTL_MS = 15 * 1000;
 const activityCache = new Map();
+const eventsCache = new Map();
 
 function addDaysIso(date, days) {
   const d = date instanceof Date ? date : new Date(date || Date.now());
@@ -1776,11 +1778,24 @@ async function listEvents({ agencyId, query = {} }) {
   if (fanId) where.fanId = fanId;
   const take = parseLimit(query.limit, 100, 500);
   const skip = parseOffset(query.offset);
+  const cacheKey = `${agencyId}:${type || "all"}:${creatorId || "all"}:${fanId || "all"}:${take}:${skip}`;
+  const cached = eventsCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < EVENTS_CACHE_TTL_MS) {
+    return { ...cached.value, cached: true, cacheTtlMs: EVENTS_CACHE_TTL_MS };
+  }
   const [items, count] = await Promise.all([
     prisma.automationEvent.findMany({ where, orderBy: { createdAt: "desc" }, take, skip }),
     prisma.automationEvent.count({ where }),
   ]);
-  return { ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count };
+  const value = { ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count };
+  eventsCache.set(cacheKey, { ts: Date.now(), value });
+  if (eventsCache.size > 250) {
+    const cutoff = Date.now() - EVENTS_CACHE_TTL_MS * 2;
+    for (const [key, rec] of eventsCache) {
+      if (!rec || rec.ts < cutoff || eventsCache.size > 300) eventsCache.delete(key);
+    }
+  }
+  return value;
 }
 
 module.exports = {
