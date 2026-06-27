@@ -301,13 +301,19 @@ router.get("/deliveries/fan-state", async (req, res) => {
       const now = new Date();
   
       const result = await prisma.$transaction(async (tx) => {
-        const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now });
+        const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now, scope: "live" });
         const activeRows = await tx.automationDelivery.findMany({
           where: { agencyId: req.auth.agencyId, creatorId, fanId: { in: fanIds }, status: { in: ONLINE_SEND_ACTIVE_STATUSES } },
           select: { id: true, fanId: true, status: true, scheduledAt: true, sentAt: true, createdAt: true },
           take: 10000});
         const activeByFan = new Map(activeRows.map((x) => [String(x.fanId), x]));
         let cursor = onlineGateNextAllowed(gate, now);
+        const maxCarrySec = Math.max(30, Math.min(180, positiveInt(req.body?.maxGateCarrySec || req.body?.liveMaxGateCarrySec, 60)));
+        let gateWasClamped = false;
+        if (cursor.getTime() - now.getTime() > maxCarrySec * 1000) {
+          cursor = now;
+          gateWasClamped = true;
+        }
         const items = [];
         const skipped = [];
   
@@ -354,7 +360,7 @@ router.get("/deliveries/fan-state", async (req, res) => {
           where: { id: gate.id },
           data: {
             scheduledAt: cursor,
-            result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }),
+            result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, gateScope: "live", nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString(), gateWasClamped }),
           },
         });
   
@@ -378,6 +384,7 @@ router.get("/deliveries/fan-state", async (req, res) => {
         skippedCount: result.skipped.length,
         nextScheduledAt: result.nextScheduledAt ? result.nextScheduledAt.toISOString() : null,
         gateNextAllowedAt: result.gateNextAllowedAt ? result.gateNextAllowedAt.toISOString() : null,
+        liveGateMaxCarrySec: 60,
         minFanSpacingSec: range.min,
         maxFanSpacingSec: range.max,
       });

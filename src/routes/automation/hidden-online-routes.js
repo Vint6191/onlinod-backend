@@ -659,7 +659,7 @@ function registerHiddenOnlineRoutes(router, deps) {
       if (!picked.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped, skippedCount: skipped.length, skippedCounts, candidateWindow: candidates.length, activeChecked: activeRows.length, code: "NO_ELIGIBLE_HIDDEN_ONLINE" });
   
       const result = await prisma.$transaction(async (tx) => {
-        const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now });
+        const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now, scope: "hidden" });
         let cursor = onlineGateNextAllowed(gate, now);
         const items = [];
         for (const c of picked) {
@@ -678,6 +678,8 @@ function registerHiddenOnlineRoutes(router, deps) {
               result: jsonObject({
                 eventQueue: true,
                 hiddenOnlineQueue: true,
+                queuePriority: "background",
+                gateScope: "hidden",
                 triggerKey: BUMP_TRIGGER_KEYS.HIDDEN,
                 trigger: BUMP_TRIGGER_KEYS.HIDDEN,
                 eventType: "hidden_online_candidate",
@@ -703,7 +705,7 @@ function registerHiddenOnlineRoutes(router, deps) {
         }
         await tx.automationDelivery.update({
           where: { id: gate.id },
-          data: { scheduledAt: cursor, result: jsonObject({ ...deliveryMeta(gate), eventGate: true, onlineGate: true, nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }) },
+          data: { scheduledAt: cursor, result: jsonObject({ ...deliveryMeta(gate), eventGate: true, hiddenGate: true, onlineGate: false, gateScope: "hidden", nextAllowedAt: cursor.toISOString(), minFanSpacingSec: range.min, maxFanSpacingSec: range.max, updatedAt: now.toISOString() }) },
         });
         return { items, gateNextAllowedAt: cursor };
       }, { timeout: 15000 });

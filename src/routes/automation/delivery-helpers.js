@@ -717,8 +717,12 @@ function createDeliveryHelpers(deps = {}) {
     return BUMP_TRIGGER_KEYS.ONLINE;
   }
 
-  function eventGateId(creatorId) {
-    return `bump_event_gate_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80)}`;
+  function eventGateId(creatorId, scope = "live") {
+    const safeCreatorId = String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+    const safeScope = String(scope || "live").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 32);
+    return safeScope && safeScope !== "live"
+      ? `bump_event_gate_${safeCreatorId}_${safeScope}`
+      : `bump_event_gate_${safeCreatorId}`;
   }
 
   function eventQueueBatchId(prefix = "event") {
@@ -753,8 +757,10 @@ function createDeliveryHelpers(deps = {}) {
     return sec * 1000;
   }
 
-  async function acquireOnlineGate(tx, { agencyId, creatorId, now }) {
-    const id = eventGateId(creatorId);
+  async function acquireOnlineGate(tx, { agencyId, creatorId, now, scope = "live" }) {
+    const gateScope = String(scope || "live").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 32) || "live";
+    const id = eventGateId(creatorId, gateScope);
+    const isHiddenGate = gateScope === "hidden";
     let row = await tx.automationDelivery.findUnique({ where: { id } }).catch(() => null);
     if (!row) {
       try {
@@ -763,13 +769,13 @@ function createDeliveryHelpers(deps = {}) {
             id,
             agencyId,
             creatorId,
-            fanId: "__bump_event_gate__",
+            fanId: isHiddenGate ? "__hidden_bump_event_gate__" : "__bump_event_gate__",
             dialogId: null,
-            trigger: "bumpEvent_gate",
+            trigger: isHiddenGate ? "hiddenEvent_gate" : "bumpEvent_gate",
             status: "online_gate",
             scheduledAt: now,
             lastCheckedAt: now,
-            result: { onlineGate: true, nextAllowedAt: now.toISOString() },
+            result: { onlineGate: !isHiddenGate, hiddenGate: isHiddenGate, gateScope, nextAllowedAt: now.toISOString() },
           },
         });
       } catch (_) {
@@ -779,7 +785,8 @@ function createDeliveryHelpers(deps = {}) {
 
     if (!row) throw new Error("ONLINE_GATE_UNAVAILABLE");
     // UPDATE locks the gate row inside the transaction on PostgreSQL, giving us
-    // one global cursor per creator/account for online bump sends.
+    // one cursor per creator/account/scope. Hidden now has its own cursor and
+    // cannot push fresh live/like/subscription events 20+ minutes into future.
     return tx.automationDelivery.update({ where: { id }, data: { lastCheckedAt: now } });
   }
 
