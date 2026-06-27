@@ -5,6 +5,29 @@ const prisma = require("../prisma");
 
 const router = express.Router();
 
+// Deprecated legacy automation router. New desktop automation uses
+// routes/automation-store.js. Keep this mounted for compatibility, but make
+// usage visible so it can be removed safely after a quiet period.
+const legacyRouteHits = new Map();
+function markLegacyRoute(req) {
+  try {
+    const key = `${String(req.method || "GET").toUpperCase()} ${String(req.route?.path || req.path || "")}`;
+    const now = Date.now();
+    const hit = legacyRouteHits.get(key) || { count: 0, firstAt: now, lastAt: 0 };
+    hit.count += 1;
+    hit.lastAt = now;
+    legacyRouteHits.set(key, hit);
+    if (hit.count === 1 || hit.count % 100 === 0) {
+      console.warn("[automation:legacy-router] route still in use", { key, count: hit.count, firstAt: hit.firstAt, lastAt: hit.lastAt });
+    }
+  } catch (_) {}
+}
+
+router.use((req, _res, next) => {
+  markLegacyRoute(req);
+  next();
+});
+
 router.get("/state", async (req, res) => {
   try {
     const [rules, runs] = await Promise.all([
