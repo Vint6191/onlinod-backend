@@ -4,6 +4,7 @@ function registerHiddenOnlineRoutes(router, deps) {
   const {
     prisma, cleanString, optionalString, jsonArray, jsonObject, parseLimit, parseOffset, positiveInt, requireCreator, sendError, requireSeniorAutomationWriter,
     parseDate, dateIso, deliveryMeta, mapAutomationDelivery, createAutomationDeliverySafe, onlineSpacingRange, randomOnlineSpacingMs, acquireOnlineGate, onlineGateNextAllowed,
+    ONLINE_SEND_ACTIVE_STATUSES,
   } = deps;
 
 // Hidden online is intentionally server-owned: desktop workers only claim scan

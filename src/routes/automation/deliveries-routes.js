@@ -10,6 +10,7 @@ function registerDeliveryRoutes(router, deps) {
     isSoftRetryResult, isSendUnknownResult, automationRetryAt, normalizeDeliveryWriteData, createAutomationDeliverySafe,
     saveAutomationDeliveryIdempotent, markAutomationDeliveryTerminal, repairAutomationDeliveries, normalizeBumpTrigger,
     eventGateId, eventQueueBatchId, onlineQueueFanIds, onlineSpacingRange, randomOnlineSpacingMs, acquireOnlineGate, onlineGateNextAllowed,
+    AUTOMATION_TERMINAL_ROW_STATUSES, AUTOMATION_SOFT_RETRY_CODES, ONLINE_SEND_ACTIVE_STATUSES,
   } = deps;
 
 router.get("/deliveries/fan-state", async (req, res) => {
