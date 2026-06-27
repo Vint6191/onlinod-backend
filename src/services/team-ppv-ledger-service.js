@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { serializableTxOptions } = require("../utils/prisma-transaction");
 
 const RAW_LEDGER_RETENTION_DAYS = 180;
 const RAW_LEDGER_RETENTION_MS = RAW_LEDGER_RETENTION_DAYS * 86400000;
@@ -786,7 +787,7 @@ async function submitResolveResults({ agencyId, deviceId, results = [], actorMem
       // from TeamPpvPurchaseLedger, so a later conflict can safely remove it
       // from revenue until a manager closes the claim.
       return "resolved";
-    });
+    }, serializableTxOptions());
 
     if (outcome === "resolved") resolved += 1;
     else if (outcome === "conflict") conflicts += 1;
@@ -1062,7 +1063,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign"
     }
 
     return finalAction;
-  });
+  }, serializableTxOptions());
 
   if (outcome === "skipped") return { resolved: 0, skipped: 1 };
   return { resolved: 1, skipped: 0, action: outcome };

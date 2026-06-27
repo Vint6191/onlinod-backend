@@ -45,6 +45,7 @@ const serverStoreDiagnosticsRoutes = require("./routes/server-store-diagnostics"
 const { authRequired } = require("./middleware/auth");
 const { createIdempotencyMiddleware } = require("./middleware/idempotency");
 const prisma = require("./prisma");
+const logger = require("./utils/logger");
 const { startRecurringScheduler } = require("./services/job-scheduler");
 const { startPresenceScheduler } = require("./services/presence-scheduler");
 
@@ -231,14 +232,14 @@ app.use((err, _req, res, _next) => {
 const port = Number(process.env.PORT || 10000);
 
 const httpServer = app.listen(port, () => {
-  console.log(`Onlinod backend running on port ${port}`);
+  logger.info("backend listening", { port });
 });
 
 startRecurringScheduler();
 startPresenceScheduler();
 
 async function gracefulShutdown(signal) {
-  console.log(`[server] ${signal} received, shutting down gracefully`);
+  logger.info("shutdown requested", { signal });
   httpServer.close(async () => {
     try {
       await prisma.$disconnect();
@@ -250,7 +251,7 @@ async function gracefulShutdown(signal) {
   });
 
   setTimeout(() => {
-    console.warn("[server] graceful shutdown timed out");
+    logger.warn("graceful shutdown timed out");
     process.exit(1);
   }, 10_000).unref?.();
 }

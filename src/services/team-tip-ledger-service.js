@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { serializableTxOptions } = require("../utils/prisma-transaction");
 
 const TIP_ATTRIBUTION_WINDOW_MS = 10 * 60 * 1000;
 const TIP_SOFT_REVIEW_WINDOW_MS = 15 * 60 * 1000;
@@ -681,7 +682,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
     }
 
     return { ok: true, row: updated };
-  });
+  }, serializableTxOptions());
 
   if (!outcome?.ok) return { ok: false, code: outcome?.code || "TIP_OVERRIDE_FAILED", error: outcome?.error || "Failed" };
   const [attribution] = await enrichTipRows([outcome.row], agencyId);
@@ -908,7 +909,7 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
         skippedExisting: existingLegacyIds.length,
         failedCreateCount: Math.max(0, rowsToCreate.length - createdCount),
       };
-    });
+    }, serializableTxOptions());
 
     return {
       ok: result.failedCreateCount === 0,

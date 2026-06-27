@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { ingestTipEvent } = require("./team-tip-ledger-service");
 
 // --------------------------------------------------------------------
@@ -446,7 +447,7 @@ async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action
     });
 
     return { ok: true, attribution: updated };
-  });
+  }, serializableTxOptions());
 
   return outcome?.ok ? outcome : { ok: false, code: outcome?.code || "OVERRIDE_FAILED", error: outcome?.error || "Failed" };
 }
