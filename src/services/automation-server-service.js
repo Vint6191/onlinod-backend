@@ -1748,6 +1748,9 @@ async function listActivity({ agencyId, query = {} }) {
 }
 
 async function logEvent({ agencyId, userId, input = {} }) {
+  eventsCache.clear();
+  activityCache.clear();
+
   const item = await prisma.automationEvent.create({
     data: {
       agencyId,
