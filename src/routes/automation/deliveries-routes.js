@@ -730,6 +730,86 @@ router.get("/deliveries/fan-state", async (req, res) => {
     } catch (err) { return sendError(res, err, "BUMP_CANCEL_CLAIM_FAILED"); }
   });
   
+  router.post("/deliveries/mark-replied", async (req, res) => {
+    try {
+      const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+      const fanId = cleanString(req.body?.fanId || req.body?.dialogId || req.body?.userId, 80);
+      await requireCreator(prisma, req.auth.agencyId, creatorId);
+      if (!fanId) return res.status(400).json({ ok: false, code: "FAN_ID_MISSING", error: "fanId is required" });
+
+      const now = new Date();
+      const repliedAt = parseDate(req.body?.repliedAt || req.body?.createdAt || req.body?.eventCreatedAt) || now;
+      const replyMessageId = cleanString(req.body?.replyMessageId || req.body?.eventMessageId || req.body?.messageId, 100) || null;
+      const maxAgeHours = Math.max(1, Math.min(168, positiveInt(req.body?.maxAgeHours, 48)));
+      const cutoff = new Date(repliedAt.getTime() - maxAgeHours * 60 * 60 * 1000);
+
+      const where = {
+        agencyId: req.auth.agencyId,
+        creatorId,
+        fanId,
+        status: { in: ["pending_reply", "sent", "checking_reply", "cancel_claimed"] },
+        OR: [
+          { sentAt: null },
+          { sentAt: { lte: repliedAt, gte: cutoff } },
+          { createdAt: { lte: repliedAt, gte: cutoff } },
+        ],
+      };
+
+      const rows = await prisma.automationDelivery.findMany({
+        where,
+        orderBy: [{ sentAt: "desc" }, { createdAt: "desc" }],
+        take: Math.max(1, Math.min(10, positiveInt(req.body?.limit, 5))),
+      });
+
+      if (!rows.length) {
+        // Still update fan-state so future sends see a reply quiet-window even
+        // when the desktop that sent the bump had no local cache or the row was
+        // already compacted by another worker.
+        await upsertBumpFanState({
+          agencyId: req.auth.agencyId,
+          creatorId,
+          fanId,
+          dialogId: cleanString(req.body?.dialogId || fanId, 80),
+          templateId: cleanString(req.body?.templateId || req.body?.bumpId || "", 100),
+          status: "replied",
+          sentAt: null,
+          finalizedAt: repliedAt.toISOString(),
+          messageId: replyMessageId,
+          replyCooldownHours: req.body?.replyCooldownHours ?? req.body?.fanReplyCooldownHours ?? req.body?.afterReplyCooldownHours ?? 24,
+          sentCooldownHours: req.body?.sentCooldownHours ?? req.body?.fanSentCooldownHours ?? req.body?.afterSendCooldownHours ?? 6,
+        }).catch(() => null);
+        return res.json({ ok: true, creatorId, fanId, count: 0, items: [], code: "NO_PENDING_REPLY_FOR_FAN", repliedAt: repliedAt.toISOString() });
+      }
+
+      const items = [];
+      for (const row of rows) {
+        const final = await markAutomationDeliveryTerminal({
+          req,
+          creatorId,
+          row,
+          status: "replied",
+          input: {
+            ...(req.body || {}),
+            status: "replied",
+            repliedAt: repliedAt.toISOString(),
+            replyMessageId,
+            source: req.body?.source || req.body?.replySource || "realtime_reply_marker",
+            result: {
+              ...(req.body?.result && typeof req.body.result === "object" && !Array.isArray(req.body.result) ? req.body.result : {}),
+              replyMessageId,
+              finalSource: req.body?.source || req.body?.replySource || "realtime_reply_marker",
+              markerRoute: "deliveries/mark-replied",
+            },
+          },
+          source: "realtime_reply_marker",
+        });
+        if (final?.item) items.push(final.item);
+      }
+
+      return res.json({ ok: true, creatorId, fanId, count: items.length, items, repliedAt: repliedAt.toISOString(), replyMessageId });
+    } catch (err) { return sendError(res, err, "BUMP_MARK_REPLIED_FAILED"); }
+  });
+
   router.post("/deliveries/cancel-result", async (req, res) => {
     try {
       const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
