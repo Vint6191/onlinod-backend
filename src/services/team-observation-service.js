@@ -2,12 +2,12 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { upsertPurchaseFromEvent } = require("./team-ppv-ledger-service");
 const { ingestTipEvent } = require("./team-tip-ledger-service");
 const {
   ingestSubscriptionEvent,
   markTrafficFanValueDirty,
-  scheduleTrafficValueRefresh,
 } = require("./traffic-service");
 
 const CATCHUP_JOB_KEY = "catchup_notifications_scan";
@@ -144,6 +144,21 @@ async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, 
   }
 
   try {
+    const params = {
+      accountId: accountId || creatorId,
+      creatorRef: creatorRef || null,
+      from: from.toISOString(),
+      to: to.toISOString(),
+      types,
+      reason,
+      bufferMinutes: Math.round(DEFAULT_BUFFER_MS / 60000),
+      requestedByDeviceId: deviceId || null,
+    };
+    const idempotencyKey = buildJobIdempotencyKey({
+      jobKey: CATCHUP_JOB_KEY, scope: "creator", creatorId, agencyId,
+      params: { from: params.from, to: params.to, types: params.types },
+      bucketAt: from, bucketMs: 0,
+    });
     const job = await prisma.jobInstance.create({
       data: {
         jobKey: CATCHUP_JOB_KEY,
@@ -151,22 +166,28 @@ async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, 
         agencyId,
         creatorId,
         priority: 80,
+        idempotencyKey,
         nextRunAt: new Date(),
-        params: {
-          accountId: accountId || creatorId,
-          creatorRef: creatorRef || null,
-          from: from.toISOString(),
-          to: to.toISOString(),
-          types,
-          reason,
-          bufferMinutes: Math.round(DEFAULT_BUFFER_MS / 60000),
-          requestedByDeviceId: deviceId || null,
-        },
+        params,
       },
     });
 
     return { created: true, jobId: job.id };
   } catch (err) {
+    if (err?.code === "P2002") {
+      const existing = await prisma.jobInstance.findUnique({ where: { idempotencyKey } }).catch(() => null);
+      await prisma.teamObservationState.updateMany({
+        where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
+        data: {
+          currentScanStatus: existing?.status === "DONE" ? "idle" : "queued",
+          lockedByDeviceId: null,
+          lockedUntil: null,
+          lastErrorCode: null,
+          lastErrorAt: null,
+        },
+      }).catch(() => null);
+      return { created: false, reason: "idempotency_race", jobId: existing?.id || null };
+    }
     await prisma.teamObservationState.updateMany({
       where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
       data: {
@@ -464,19 +485,10 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     }
   }
 
-  if (summary.trafficValueDirtyMembers > 0 || summary.subscriptionCreatedOrUpdated > 0) {
-    const scheduled = await scheduleTrafficValueRefresh({
-      agencyId: job.agencyId,
-      creatorId: job.creatorId,
-      accountId: clean(params.accountId || job.creatorId || "unknown", 160) || "unknown",
-      creatorRef: clean(params.creatorRef, 160),
-      reason: "catchup_revenue_dirty",
-      priority: 100,
-    }).catch((err) => ({ created: false, reason: err?.message || String(err) }));
-    summary.trafficHydrateScheduled = !!scheduled?.created;
-    summary.trafficHydrateJobId = scheduled?.jobId || null;
-    summary.trafficHydrateReason = scheduled?.reason || null;
-  }
+  // P9 wave 1 is read-only discovery. Revenue events mark existing traffic
+  // members dirty, but fan-value hydration is intentionally deferred to the
+  // later Fan Intel/Vault wave instead of spawning a hidden second scanner.
+  summary.trafficHydrateScheduled = false;
 
   const scanTo = dateOrNull(params.to || result?.to) || now;
   const types = Array.isArray(params.types) ? params.types.map(String) : ["purchases", "tips", "subscriptions"];

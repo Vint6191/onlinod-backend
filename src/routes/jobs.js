@@ -1,38 +1,16 @@
-/* src/routes/jobs.js
-   ────────────────────────────────────────────────────────────
-   Job claim/report endpoints. The Electron jobs-runner loop
-   calls these:
-   
-     POST /claim    — give me a job to do
-                      Backend looks for SCHEDULED jobs whose
-                      creator is bound to the calling device.
-                      Picks highest priority, oldest. Marks
-                      CLAIMED with a 5-minute lease.
-   
-     POST /:id/report — I finished (ok or error)
-                      Backend transitions to DONE / FAILED with
-                      backoff for retries.
-   
-   Lease expiration:
-     Every claim call also runs a quick sweeper that resets
-     CLAIMED jobs whose leaseUntil < now back to SCHEDULED.
-     This handles workers that crashed or got disconnected mid-job.
-   
-   Schedule auto-creation:
-     When a creator becomes READY (via creator-connect), we should
-     auto-schedule a first earnings job so owner UI has data without
-     anyone clicking refresh. That hook lives in creator-connect.js
-     (separate patch).
-   ────────────────────────────────────────────────────────────
-*/
-
 "use strict";
 
 const express = require("express");
-const { z }   = require("zod");
-const prisma  = require("../prisma");
-const { applyPresenceJobResult } = require("../services/presence-service");
-const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("../services/team-observation-service");
+const { z } = require("zod");
+const prisma = require("../prisma");
+const {
+  JobLeaseError,
+  claimJob,
+  renewLease,
+  completeJob,
+  failJob,
+  releaseJob,
+} = require("../services/job-lease-service");
 
 const router = express.Router();
 
@@ -41,416 +19,290 @@ function actorUserId(req) {
 }
 
 function actorAgencyId(req) {
-  return req.auth?.agencyId || req.user?.activeAgencyId || req.body?.agencyId || req.query?.agencyId || null;
+  return req.auth?.agencyId || req.user?.activeAgencyId || req.query?.agencyId || null;
 }
 
-const LEASE_MS = 5 * 60 * 1000;       // 5 minutes
-const RETRY_BACKOFF_MS = 60 * 1000;   // 1 minute base
-const MAX_ATTEMPTS = 5;
-
-
-function validationError(res, err) {
+function validationError(res, error) {
   return res.status(400).json({
     ok: false,
     code: "VALIDATION_ERROR",
-    error: err.issues?.[0]?.message || "Validation error",
+    error: error.issues?.[0]?.message || "Validation error",
   });
 }
 
-// Sweep: any CLAIMED job whose leaseUntil is in the past goes back
-// to SCHEDULED (with attempts++, so we don't infinite-loop on a
-// stuck one).
-async function sweepExpiredLeases() {
-  const now = new Date();
-  const expired = await prisma.jobInstance.findMany({
-    where: {
-      status: "CLAIMED",
-      leaseUntil: { lt: now },
-    },
-    select: { id: true, attempts: true },
-    take: 10000});
-
-  if (!expired.length) return 0;
-
-  await Promise.all(expired.map((j) =>
-    prisma.jobInstance.update({
-      where: { id: j.id },
-      data: {
-        status: "SCHEDULED",
-        claimedAt: null,
-        claimedByDeviceId: null,
-        leaseUntil: null,
-        attempts: { increment: 1 },
-        nextRunAt: new Date(Date.now() + RETRY_BACKOFF_MS),
-        lastError: "lease expired",
-      },
-    })
-  ));
-
-  return expired.length;
+function leaseError(res, error) {
+  if (error instanceof JobLeaseError) {
+    return res.status(error.status || 409).json({
+      ok: false,
+      code: error.code,
+      error: error.message,
+    });
+  }
+  throw error;
 }
 
-
-// ════════════════════════════════════════════════════════════
-// POST /claim
-//
-// Body: { deviceId }
-// Response shapes:
-//   { ok: true, job: null }                  — no work available
-//   { ok: true, job: { id, jobKey, ... } }   — got a job
-// ════════════════════════════════════════════════════════════
+const deviceSchema = z.string().min(1).max(200);
+const tokenSchema = z.string().min(20).max(500);
+const workIdSchema = z.string().min(1).max(200).optional().nullable();
+const leaseRevisionSchema = z.number().int().positive();
+const progressSchema = z.object({
+  percent: z.number().finite().min(0).max(100).optional(),
+  current: z.number().finite().min(0).optional(),
+  total: z.number().finite().min(0).optional(),
+  message: z.string().max(500).optional(),
+}).passthrough().optional().nullable();
 
 const claimSchema = z.object({
-  deviceId: z.string().min(1),
+  deviceId: deviceSchema,
+  leaseMs: z.number().int().min(30_000).max(15 * 60_000).optional(),
+  jobKeys: z.array(z.string().min(1).max(120)).min(1).max(100),
 });
 
-router.post("/claim", async (req, res) => {
+const leaseMutationSchema = z.object({
+  deviceId: deviceSchema,
+  leaseToken: tokenSchema,
+  leaseRevision: leaseRevisionSchema,
+  leaseMs: z.number().int().min(30_000).max(15 * 60_000).optional(),
+  workId: workIdSchema,
+  progress: progressSchema,
+  continuation: z.unknown().optional(),
+});
+
+const completeSchema = z.object({
+  deviceId: deviceSchema,
+  leaseToken: tokenSchema,
+  leaseRevision: leaseRevisionSchema,
+  workId: workIdSchema,
+  progress: progressSchema,
+  result: z.unknown().optional(),
+});
+
+
+const releaseSchema = z.object({
+  deviceId: deviceSchema,
+  leaseToken: tokenSchema,
+  leaseRevision: leaseRevisionSchema,
+  workId: workIdSchema,
+  reason: z.string().min(1).max(2000),
+  runAfterMs: z.number().int().min(1_000).max(15 * 60_000).optional(),
+});
+
+const failSchema = z.object({
+  deviceId: deviceSchema,
+  leaseToken: tokenSchema,
+  leaseRevision: leaseRevisionSchema,
+  workId: workIdSchema,
+  error: z.string().min(1).max(2000),
+  result: z.unknown().optional(),
+  retryable: z.boolean().optional(),
+});
+
+router.post("/claim", async (req, res, next) => {
   try {
     const input = claimSchema.parse(req.body);
-    const userId = actorUserId(req);
-
-    // Validate device.
-    const device = await prisma.workerDevice.findUnique({ where: { id: input.deviceId } });
-    if (!device || device.userId !== userId) {
-      return res.status(403).json({ ok: false, code: "NOT_YOUR_DEVICE", error: "Invalid device" });
-    }
-
-    // Reset stale leases first.
-    await sweepExpiredLeases();
-
-    const now = new Date();
-    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
-
-    // Heartbeat must be recent — if device hasn't sent heartbeat in
-    // 5 min we don't trust it for new jobs.
-    if (!device.lastSeenAt || device.lastSeenAt < fiveMinAgo) {
-      return res.json({ ok: true, job: null, reason: "device-stale" });
-    }
-
-    // What creators can this device/user work on right now?
-    //
-    // Use the worker's active agency membership and assignedCreators scope. The Electron job runner still
-    // validates the local manifest before doing OF requests; if there is no
-    // usable partition, the job reports a normal failure/backoff.
-    const member = await prisma.agencyMember.findFirst({
-      where: {
-        agencyId: device.agencyId,
-        userId,
-        deletedAt: null,
-        agency: { deletedAt: null },
-      },
+    const claimed = await claimJob({
+      userId: actorUserId(req),
+      deviceId: input.deviceId,
+      leaseMs: input.leaseMs,
+      jobKeys: input.jobKeys,
     });
-
-    if (!member) {
-      return res.json({ ok: true, job: null, reason: "not-a-member" });
-    }
-
-    const roleKey = String(member.roleKey || "").toLowerCase();
-    const isBroadScope =
-      member.role === "OWNER" ||
-      member.role === "MANAGER" ||
-      roleKey === "owner" ||
-      roleKey === "manager" ||
-      !member.assignedCreators ||
-      member.assignedCreators === "all";
-
-    let creatorWhere = {
-      agencyId: device.agencyId,
-      deletedAt: null,
-      status: "READY",
-    };
-
-    if (!isBroadScope) {
-      const assigned = Array.isArray(member.assignedCreators)
-        ? member.assignedCreators.map((id) => String(id || "").trim()).filter(Boolean)
-        : [];
-
-      creatorWhere = {
-        ...creatorWhere,
-        id: { in: assigned.length ? assigned : ["__none__"] },
-      };
-    }
-
-    const scopedCreators = await prisma.creatorAccount.findMany({
-      where: creatorWhere,
-      select: { id: true },
-      take: 10000});
-
-    const scopedCreatorIds = scopedCreators.map((item) => item.id);
-
-    const bindings = await prisma.deviceCreatorBinding.findMany({
-      where: {
-        agencyId: device.agencyId,
-        deviceId: device.id,
-        status: "ACTIVE",
-        creatorId: { in: scopedCreatorIds.length ? scopedCreatorIds : ["__none__"] },
-      },
-      select: { creatorId: true },
-      take: 10000});
-
-    let visibleCreatorIds = bindings.map((item) => item.creatorId);
-
-    // Backward-compatible fallback while older Electron builds/dev flows
-    // may not publish bindings yet. Owners/managers can still claim jobs
-    // scoped by membership, but heartbeat bindings remain the preferred path.
-    if (!visibleCreatorIds.length && isBroadScope) {
-      visibleCreatorIds = scopedCreatorIds;
-    }
-
-    if (!visibleCreatorIds.length) {
-      return res.json({ ok: true, job: null, reason: "no-creators-visible" });
-    }
-
-    // Find the best candidate job.
-    //
-    // We do a SELECT first (high-pri, oldest scheduled, creatorId in our
-    // visible set), then a CONDITIONAL UPDATE WHERE status='SCHEDULED'
-    // to claim it. If two devices race, only one's UPDATE will succeed —
-    // the other gets rowsAffected=0 and we loop.
-    //
-    // We cap attempts at 3 to avoid pathological hot loops.
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const candidate = await prisma.jobInstance.findFirst({
-        where: {
-          status: "SCHEDULED",
-          nextRunAt: { lte: now },
-          attempts: { lt: MAX_ATTEMPTS },
-          OR: [
-            { creatorId: { in: visibleCreatorIds } },
-            { scope: "agency", agencyId: device.agencyId, creatorId: null },
-            { scope: "global", creatorId: null, agencyId: null },
-          ],
-        },
-        orderBy: [
-          { priority: "desc" },
-          { nextRunAt: "asc" },
-        ],
-      });
-
-      if (!candidate) {
-        return res.json({ ok: true, job: null, reason: "no-work" });
-      }
-
-      // Try to claim atomically.
-      const claimResult = await prisma.jobInstance.updateMany({
-        where: { id: candidate.id, status: "SCHEDULED" },
-        data: {
-          status: "CLAIMED",
-          claimedAt: now,
-          claimedByDeviceId: device.id,
-          leaseUntil: new Date(now.getTime() + LEASE_MS),
-        },
-      });
-
-      if (claimResult.count === 0) {
-        // Someone else got it. Try next candidate.
-        continue;
-      }
-
-      const claimed = await prisma.jobInstance.findUnique({
-        where: { id: candidate.id },
-        include: {
-          creator: {
-            select: {
-              id: true,
-              remoteId: true,
-              username: true,
-              displayName: true,
-              partition: true,
-            },
-          },
-        },
-      });
-
-      return res.json({
-        ok: true,
-        job: {
-          id: claimed.id,
-          jobKey: claimed.jobKey,
-          scope: claimed.scope,
-          creatorId: claimed.creatorId,
-          agencyId: claimed.agencyId,
-          params: claimed.params || {},
-          creator: claimed.creator || null,
-          attempt: claimed.attempts + 1,
-          leaseUntil: claimed.leaseUntil,
-        },
-      });
-    }
-
-    return res.json({ ok: true, job: null, reason: "race-lost" });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    console.error("[jobs/claim] failed:", err);
-    return res.status(500).json({ ok: false, code: "CLAIM_FAILED", error: err?.message || "Failed" });
+    return res.json({ ok: true, ...claimed });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
   }
 });
 
-
-// ════════════════════════════════════════════════════════════
-// POST /:id/report
-//
-// Body: { ok: true|false, error?: string, deviceId, result? }
-// ════════════════════════════════════════════════════════════
-
-const reportSchema = z.object({
-  deviceId: z.string().min(1),
-  ok:       z.boolean(),
-  error:    z.string().max(2000).optional().nullable(),
-  result:   z.any().optional(),
-});
-
-router.post("/:id/report", async (req, res) => {
+router.post("/:id/lease/renew", async (req, res, next) => {
   try {
-    const input = reportSchema.parse(req.body);
-    const userId = actorUserId(req);
-
-    const job = await prisma.jobInstance.findUnique({ where: { id: req.params.id } });
-    if (!job) {
-      return res.status(404).json({ ok: false, code: "JOB_NOT_FOUND", error: "Job not found" });
-    }
-
-    // Validate that the reporting device actually claimed this job.
-    if (job.claimedByDeviceId && job.claimedByDeviceId !== input.deviceId) {
-      return res.status(409).json({
-        ok: false,
-        code: "JOB_CLAIMED_BY_OTHER",
-        error: "Job is claimed by a different device",
-      });
-    }
-
-    // Validate device ownership.
-    const device = await prisma.workerDevice.findUnique({ where: { id: input.deviceId } });
-    if (!device || device.userId !== userId) {
-      return res.status(403).json({ ok: false, code: "NOT_YOUR_DEVICE", error: "Invalid device" });
-    }
-
-    if (input.ok) {
-      let sideEffect = null;
-      if (job.jobKey === "refresh_online_presence") {
-        sideEffect = await applyPresenceJobResult({ job, deviceId: input.deviceId, result: input.result || {} });
-      }
-      if (job.jobKey === CATCHUP_JOB_KEY) {
-        sideEffect = await applyCatchupJobResult({
-          job,
-          deviceId: input.deviceId,
-          userId,
-          result: input.result || {},
-        });
-      }
-
-      const updated = await prisma.jobInstance.update({
-        where: { id: job.id },
-        data: {
-          status: "DONE",
-          completedAt: new Date(),
-          leaseUntil: null,
-          result: input.result || null,
-          lastError: null,
-        },
-      });
-
-      return res.json({ ok: true, job: { id: updated.id, status: updated.status }, sideEffect });
-    }
-
-    // Failure — backoff.
-    if (job.jobKey === CATCHUP_JOB_KEY) {
-      try { await recordCatchupJobFailure({ job, error: input.error || "unknown error" }); } catch (_) {}
-    }
-
-    const newAttempts = job.attempts + 1;
-    const backoffMs = RETRY_BACKOFF_MS * Math.pow(2, newAttempts - 1);
-
-    if (newAttempts >= MAX_ATTEMPTS) {
-      const updated = await prisma.jobInstance.update({
-        where: { id: job.id },
-        data: {
-          status: "FAILED",
-          attempts: newAttempts,
-          lastError: input.error || "unknown error",
-          result: input.result || null,
-          completedAt: new Date(),
-          leaseUntil: null,
-        },
-      });
-      return res.json({ ok: true, job: { id: updated.id, status: updated.status, terminal: true } });
-    }
-
-    const updated = await prisma.jobInstance.update({
-      where: { id: job.id },
-      data: {
-        status: "SCHEDULED",
-        attempts: newAttempts,
-        lastError: input.error || "unknown error",
-        result: input.result || null,
-        nextRunAt: new Date(Date.now() + backoffMs),
-        claimedAt: null,
-        claimedByDeviceId: null,
-        leaseUntil: null,
-      },
+    const input = leaseMutationSchema.parse(req.body);
+    const lease = await renewLease({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      deviceId: input.deviceId,
+      leaseToken: input.leaseToken,
+      leaseRevision: input.leaseRevision,
+      leaseMs: input.leaseMs,
+      workId: input.workId,
+      progress: input.progress,
+      continuation: input.continuation,
     });
-
-    return res.json({ ok: true, job: { id: updated.id, status: updated.status, retryAt: updated.nextRunAt } });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    console.error("[jobs/report] failed:", err);
-    return res.status(500).json({ ok: false, code: "REPORT_FAILED", error: err?.message || "Failed" });
+    return res.json({ ok: true, lease });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
   }
 });
 
-
-// ════════════════════════════════════════════════════════════
-// GET /pending — debug / admin helper
-//
-// Lists pending jobs visible to the caller (their agencies only).
-// Useful for debugging "why isn't refresh updating data".
-// ════════════════════════════════════════════════════════════
-
-router.get("/pending", async (req, res) => {
+router.post("/:id/progress", async (req, res, next) => {
   try {
-    const memberships = await prisma.agencyMember.findMany({
-      where: { userId: actorUserId(req), deletedAt: null },
-      select: { agencyId: true },
-      take: 10000});
-    const agencyIds = memberships.map((m) => m.agencyId);
+    const input = leaseMutationSchema.parse(req.body);
+    const lease = await renewLease({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      deviceId: input.deviceId,
+      leaseToken: input.leaseToken,
+      leaseRevision: input.leaseRevision,
+      leaseMs: input.leaseMs,
+      workId: input.workId,
+      progress: input.progress,
+      continuation: input.continuation,
+    });
+    return res.json({ ok: true, lease });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
+  }
+});
 
-    if (!agencyIds.length) return res.json({ ok: true, jobs: [] });
+router.post("/:id/complete", async (req, res, next) => {
+  try {
+    const input = completeSchema.parse(req.body);
+    const completed = await completeJob({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      deviceId: input.deviceId,
+      leaseToken: input.leaseToken,
+      leaseRevision: input.leaseRevision,
+      workId: input.workId,
+      result: input.result,
+      progress: input.progress,
+    });
+    return res.json({ ok: true, ...completed });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
+  }
+});
 
+router.post("/:id/release", async (req, res, next) => {
+  try {
+    const input = releaseSchema.parse(req.body);
+    const released = await releaseJob({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      ...input,
+    });
+    return res.json({ ok: true, job: released });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
+  }
+});
+
+router.post("/:id/fail", async (req, res, next) => {
+  try {
+    const input = failSchema.parse(req.body);
+    const failed = await failJob({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      deviceId: input.deviceId,
+      leaseToken: input.leaseToken,
+      leaseRevision: input.leaseRevision,
+      workId: input.workId,
+      error: input.error,
+      result: input.result,
+      retryable: input.retryable,
+    });
+    return res.json({ ok: true, job: failed });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
+  }
+});
+
+// Compatibility endpoint for clients transitioning from the old report route.
+// It is intentionally fenced: deviceId alone is no longer sufficient.
+router.post("/:id/report", async (req, res, next) => {
+  try {
+    const body = req.body || {};
+    if (body.ok === false) {
+      const input = failSchema.parse({
+        deviceId: body.deviceId,
+        leaseToken: body.leaseToken,
+        leaseRevision: body.leaseRevision,
+        workId: body.workId,
+        error: body.error || "unknown error",
+        result: body.result,
+        retryable: body.retryable,
+      });
+      const failed = await failJob({
+        jobId: req.params.id,
+        userId: actorUserId(req),
+        ...input,
+      });
+      return res.json({ ok: true, job: failed, compatibility: true });
+    }
+
+    const input = completeSchema.parse({
+      deviceId: body.deviceId,
+      leaseToken: body.leaseToken,
+      leaseRevision: body.leaseRevision,
+      workId: body.workId,
+      progress: body.progress,
+      result: body.result,
+    });
+    const completed = await completeJob({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      ...input,
+    });
+    return res.json({ ok: true, ...completed, compatibility: true });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
+  }
+});
+
+router.get("/pending", async (req, res, next) => {
+  try {
+    const agencyId = actorAgencyId(req);
+    if (!agencyId) {
+      return res.status(400).json({ ok: false, code: "AGENCY_REQUIRED", error: "Agency is required" });
+    }
+
+    const status = String(req.query.status || "").trim().toUpperCase();
+    const allowedStatuses = new Set(["SCHEDULED", "CLAIMED", "DONE", "FAILED", "CANCELLED"]);
+    const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
     const jobs = await prisma.jobInstance.findMany({
       where: {
-        agencyId: { in: agencyIds },
-        status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] },
+        agencyId,
+        ...(allowedStatuses.has(status) ? { status } : { status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } }),
       },
-      orderBy: [{ priority: "desc" }, { nextRunAt: "asc" }],
-      take: 200,
-      include: {
-        creator: { select: { id: true, displayName: true, username: true } },
+      orderBy: [{ status: "asc" }, { priority: "desc" }, { nextRunAt: "asc" }],
+      take: limit,
+      select: {
+        id: true,
+        idempotencyKey: true,
+        jobKey: true,
+        scope: true,
+        creatorId: true,
+        agencyId: true,
+        status: true,
+        priority: true,
+        attempts: true,
+        params: true,
+        workId: true,
+        continuation: true,
+        progress: true,
+        lastProgressAt: true,
+        claimedAt: true,
+        claimedByDeviceId: true,
+        leaseUntil: true,
+        leaseRevision: true,
+        nextRunAt: true,
+        startedAt: true,
+        completedAt: true,
+        lastError: true,
+        createdAt: true,
+        updatedAt: true,
       },
     });
 
-    return res.json({
-      ok: true,
-      jobs: jobs.map((j) => ({
-        id: j.id,
-        jobKey: j.jobKey,
-        scope: j.scope,
-        status: j.status,
-        priority: j.priority,
-        creator: j.creator,
-        agencyId: j.agencyId,
-        params: j.params,
-        attempts: j.attempts,
-        nextRunAt: j.nextRunAt,
-        lastError: j.lastError,
-        claimedByDeviceId: j.claimedByDeviceId,
-        leaseUntil: j.leaseUntil,
-      })),
-    });
-  } catch (err) {
-    return res.status(500).json({ ok: false, code: "PENDING_FAILED", error: err?.message || "Failed" });
+    return res.json({ ok: true, jobs });
+  } catch (error) {
+    return next(error);
   }
 });
-
 
 module.exports = router;

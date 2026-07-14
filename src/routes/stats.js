@@ -25,6 +25,7 @@
 const express = require("express");
 const { z }   = require("zod");
 const prisma  = require("../prisma");
+const { scheduleJobNow } = require("../services/job-scheduler");
 
 const router = express.Router();
 
@@ -159,7 +160,6 @@ const earningsUpsertSchema = z.object({
     uniqueFans: z.number().int().nonnegative(),
   }),
   raw:    z.any().optional(),
-  jobId:  z.string().optional(),  // optional — links snapshot to the job that produced it
 });
 
 router.post("/earnings/upsert", async (req, res) => {
@@ -206,19 +206,6 @@ router.post("/earnings/upsert", async (req, res) => {
       update: data,
     });
 
-    // If this was triggered by a job, mark the job DONE.
-    if (input.jobId) {
-      try {
-        await prisma.jobInstance.update({
-          where: { id: input.jobId },
-          data: {
-            status: "DONE",
-            completedAt: new Date(),
-            result: { snapshotId: snapshot.id, total: data.totalCents, salesCount: data.salesCount },
-          },
-        });
-      } catch (_) { /* job might not exist — that's fine */ }
-    }
 
     return res.json({
       ok: true,
@@ -245,7 +232,6 @@ const campaignsUpsertSchema = z.object({
   creatorId: z.string().min(1),
   rangeKey:  z.string().optional(),
   campaigns: z.array(z.any()).max(2000),
-  jobId:     z.string().optional(),
 });
 
 router.post("/campaigns/upsert", async (req, res) => {
@@ -288,18 +274,6 @@ router.post("/campaigns/upsert", async (req, res) => {
       update: data,
     });
 
-    if (input.jobId) {
-      try {
-        await prisma.jobInstance.update({
-          where: { id: input.jobId },
-          data: {
-            status: "DONE",
-            completedAt: new Date(),
-            result: { snapshotId: snapshot.id, campaignCount: input.campaigns.length },
-          },
-        });
-      } catch (_) {}
-    }
 
     return res.json({
       ok: true,
@@ -534,101 +508,38 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
     }
 
     const now = new Date();
+    const [earnings, campaigns] = await Promise.all([
+      scheduleJobNow({
+        jobKey: "fetch_earnings", creatorId: creator.id, agencyId: creator.agencyId,
+        params: { rangeKey: range }, priority: 100, now, bucketMs: 60_000,
+      }),
+      scheduleJobNow({
+        jobKey: "fetch_campaigns", creatorId: creator.id, agencyId: creator.agencyId,
+        params: { rangeKey: range }, priority: 100, now, bucketMs: 60_000,
+      }),
+    ]);
 
-    // Are there online desktop devices in this creator's agency?
-    //
-    // Current schema has WorkerDevice.lastSeenAt, not a separate device binding table.
-    // Jobs claim itself scopes work by agency membership + assignedCreators.
-    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
-    const onlineBindings = await prisma.workerDevice.count({
+    const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
+    const onlineBindings = await prisma.deviceCreatorBinding.count({
       where: {
+        creatorId: creator.id,
         agencyId: creator.agencyId,
-        lastSeenAt: { gte: fiveMinAgo },
+        status: "ACTIVE",
+        lastSeenAt: { gte: freshAfter },
+        device: { lastSeenAt: { gte: freshAfter } },
       },
     });
-
-    // Schedule earnings job (or bump existing).
-    const earningsJobs = await prisma.jobInstance.findMany({
-      where: {
-        jobKey: "fetch_earnings",
-        creatorId: creator.id,
-        status: { in: ["SCHEDULED", "FAILED"] },
-      },
-      take: 10000});
-
-    const matchingEarningsJob = earningsJobs.find((j) => {
-      try {
-        return (j.params || {}).rangeKey === range;
-      } catch (_) { return false; }
-    });
-
-    let earningsJob = matchingEarningsJob;
-    if (earningsJob) {
-      earningsJob = await prisma.jobInstance.update({
-        where: { id: earningsJob.id },
-        data: {
-          status: "SCHEDULED",
-          priority: 100,
-          nextRunAt: now,
-          lastError: null,
-        },
-      });
-    } else {
-      earningsJob = await prisma.jobInstance.create({
-        data: {
-          jobKey: "fetch_earnings",
-          scope: "creator",
-          creatorId: creator.id,
-          agencyId: creator.agencyId,
-          params: { rangeKey: range },
-          status: "SCHEDULED",
-          priority: 100,
-          scheduledAt: now,
-          nextRunAt: now,
-        },
-      });
-    }
-
-    // Schedule campaigns job too — same pattern, but it has no rangeKey.
-    let campaignsJob = await prisma.jobInstance.findFirst({
-      where: {
-        jobKey: "fetch_campaigns",
-        creatorId: creator.id,
-        status: { in: ["SCHEDULED", "FAILED"] },
-      },
-    });
-
-    if (campaignsJob) {
-      campaignsJob = await prisma.jobInstance.update({
-        where: { id: campaignsJob.id },
-        data: { status: "SCHEDULED", priority: 100, nextRunAt: now, lastError: null },
-      });
-    } else {
-      campaignsJob = await prisma.jobInstance.create({
-        data: {
-          jobKey: "fetch_campaigns",
-          scope: "creator",
-          creatorId: creator.id,
-          agencyId: creator.agencyId,
-          params: { rangeKey: range },
-          status: "SCHEDULED",
-          priority: 100,
-          scheduledAt: now,
-          nextRunAt: now,
-        },
-      });
-    }
 
     return res.json({
       ok: true,
       onlineWorkers: onlineBindings,
       jobs: [
-        { id: earningsJob.id,  jobKey: "fetch_earnings",  rangeKey: range },
-        { id: campaignsJob.id, jobKey: "fetch_campaigns" },
+        { id: earnings.job.id, jobKey: "fetch_earnings", rangeKey: range, reason: earnings.reason },
+        { id: campaigns.job.id, jobKey: "fetch_campaigns", rangeKey: range, reason: campaigns.reason },
       ],
       message: onlineBindings === 0
-        ? "Job scheduled, but no online workers see this creator right now."
-        : `Job scheduled. ${onlineBindings} worker(s) can pick it up.`,
+        ? "Jobs scheduled, but no READY desktop binding currently sees this creator."
+        : `Jobs scheduled. ${onlineBindings} READY worker binding(s) can pick them up.`,
     });
   } catch (err) {
     console.error("[stats/refresh-creator] failed:", err);
@@ -654,56 +565,43 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
     const creators = await prisma.creatorAccount.findMany({
       where: { agencyId: ctx.agency.id, deletedAt: null, status: "READY" },
       select: { id: true, agencyId: true },
-      take: 10000});
+      take: 10000,
+    });
 
     const now = new Date();
-    let scheduled = 0;
-
-    // For each creator, schedule both jobs. We do upsert-like behavior by
-    // hand because params is JSON — Prisma's compound unique index doesn't
-    // help us here.
+    let jobsScheduled = 0;
+    let alreadyClaimed = 0;
     for (const creator of creators) {
-      // earnings
-      const earnings = await prisma.jobInstance.findMany({
-        where: {
-          jobKey: "fetch_earnings",
+      for (const spec of [
+        { jobKey: "fetch_earnings", params: { rangeKey: range } },
+        { jobKey: "fetch_campaigns", params: { rangeKey: range } },
+      ]) {
+        const scheduled = await scheduleJobNow({
+          jobKey: spec.jobKey,
           creatorId: creator.id,
-          status: { in: ["SCHEDULED", "FAILED"] },
-        },
-        take: 10000});
-      const matching = earnings.find((j) => (j.params || {}).rangeKey === range);
-
-      if (matching) {
-        await prisma.jobInstance.update({
-          where: { id: matching.id },
-          data: { status: "SCHEDULED", priority: 50, nextRunAt: now, lastError: null },
+          agencyId: creator.agencyId,
+          params: spec.params,
+          priority: 50,
+          now,
+          bucketMs: 60_000,
         });
-      } else {
-        await prisma.jobInstance.create({
-          data: {
-            jobKey: "fetch_earnings",
-            scope: "creator",
-            creatorId: creator.id,
-            agencyId: creator.agencyId,
-            params: { rangeKey: range },
-            priority: 50,
-            scheduledAt: now,
-            nextRunAt: now,
-          },
-        });
+        if (scheduled.reason === "already_claimed") alreadyClaimed += 1;
+        else jobsScheduled += 1;
       }
-      scheduled += 1;
     }
 
     return res.json({
       ok: true,
-      creatorsScheduled: scheduled,
+      creatorsScheduled: creators.length,
+      jobsScheduled,
+      alreadyClaimed,
     });
   } catch (err) {
     console.error("[stats/refresh-agency] failed:", err);
     return res.status(500).json({ ok: false, code: "AGENCY_REFRESH_FAILED", error: err?.message || "Failed" });
   }
 });
+
 
 
 module.exports = router;

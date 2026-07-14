@@ -16,7 +16,8 @@
     "postinstall": "prisma generate",
     "lint": "eslint \"src/**/*.js\"",
     "format:check": "prettier --check \"src/**/*.js\"",
-    "test": "node --test \"src/**/*.test.js\""
+    "test": "node --test \"src/**/*.test.js\"",
+    "audit:p9": "node scripts/audit-p9-readonly.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

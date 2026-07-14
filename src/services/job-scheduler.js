@@ -27,6 +27,7 @@
 
 const prisma = require("../prisma");
 const { runRetentionSweep, getRetentionSettings } = require("./retention-service");
+const { buildJobIdempotencyKey } = require("./job-idempotency");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -129,7 +130,8 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
     creatorId,
     agencyId,
     params: {
-      hydrateFanValues: true,
+      hydrateFanValues: false,
+      hydrateLimit: 0,
       valueTtlHours: 6,
       creatorRemoteId,
       remoteId: creatorRemoteId,
@@ -162,8 +164,30 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
 async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, now, freshnessWindowMs }) {
   const rangeKey = params?.rangeKey || null;
   const window = Number.isFinite(freshnessWindowMs) ? freshnessWindowMs : FRESHNESS_WINDOW_MS;
+  const idempotencyKey = buildJobIdempotencyKey({
+    jobKey,
+    scope: "creator",
+    creatorId,
+    agencyId,
+    params: params || {},
+    bucketAt: now,
+    bucketMs: window,
+  });
 
-  // Find any existing job for this creator+jobKey+rangeKey.
+  // Prefer the explicit idempotency key. Older rows without one are still
+  // considered by the compatibility rangeKey scan below.
+  const keyed = await prisma.jobInstance.findFirst({
+    where: { idempotencyKey },
+    orderBy: { createdAt: "desc" },
+  });
+  if (keyed && (keyed.status === "SCHEDULED" || keyed.status === "CLAIMED")) {
+    return { created: false, reason: "already_in_flight", jobId: keyed.id };
+  }
+  if (keyed && keyed.status === "DONE" && keyed.completedAt && keyed.completedAt > new Date(now.getTime() - window)) {
+    return { created: false, reason: "recently_done", jobId: keyed.id };
+  }
+
+  // Find any existing legacy job for this creator+jobKey+rangeKey.
   const existing = await prisma.jobInstance.findMany({
     where: {
       jobKey,
@@ -194,21 +218,106 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
     return { created: false, reason: "recently_done", jobId: recentlyDone.id };
   }
 
-  // Create.
-  const created = await prisma.jobInstance.create({
-    data: {
-      jobKey,
-      scope: "creator",
-      creatorId,
-      agencyId,
-      params: params || {},
-      priority,
-      scheduledAt: now,
-      nextRunAt: now,
-    },
+  // Create. The database unique key closes the race between multiple
+  // backend instances running the same scheduler bucket.
+  try {
+    const created = await prisma.jobInstance.create({
+      data: {
+        jobKey,
+        scope: "creator",
+        creatorId,
+        agencyId,
+        idempotencyKey,
+        params: params || {},
+        priority,
+        scheduledAt: now,
+        nextRunAt: now,
+      },
+    });
+    return { created: true, jobId: created.id };
+  } catch (err) {
+    if (err?.code !== "P2002") throw err;
+    const raced = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
+    return { created: false, reason: "idempotency_race", jobId: raced?.id || null };
+  }
+}
+
+async function scheduleJobNow({
+  jobKey,
+  creatorId,
+  agencyId,
+  params = {},
+  priority = 100,
+  now = new Date(),
+  bucketMs = 60_000,
+} = {}) {
+  const idempotencyKey = buildJobIdempotencyKey({
+    jobKey,
+    scope: "creator",
+    creatorId,
+    agencyId,
+    params,
+    bucketAt: now,
+    bucketMs,
   });
 
-  return { created: true, jobId: created.id };
+  for (let race = 0; race < 3; race += 1) {
+    const existing = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
+    if (existing) {
+      if (existing.status === "CLAIMED") {
+        return { job: existing, created: false, reason: "already_claimed" };
+      }
+      const reset = await prisma.jobInstance.updateMany({
+        where: { id: existing.id, status: { not: "CLAIMED" } },
+        data: {
+          status: "SCHEDULED",
+          params,
+          priority,
+          scheduledAt: now,
+          nextRunAt: now,
+          claimedAt: null,
+          claimedByDeviceId: null,
+          leaseUntil: null,
+          leaseTokenHash: null,
+          workId: null,
+          continuation: null,
+          progress: null,
+          lastProgressAt: null,
+          completedAt: null,
+          lastError: null,
+          attempts: 0,
+          result: null,
+        },
+      });
+      if (!reset.count) continue;
+      const job = await prisma.jobInstance.findUnique({ where: { id: existing.id } });
+      return { job, created: false, reason: "rescheduled" };
+    }
+
+    try {
+      const job = await prisma.jobInstance.create({
+        data: {
+          jobKey,
+          scope: "creator",
+          creatorId,
+          agencyId,
+          idempotencyKey,
+          params,
+          status: "SCHEDULED",
+          priority,
+          scheduledAt: now,
+          nextRunAt: now,
+        },
+      });
+      return { job, created: true, reason: "created" };
+    } catch (error) {
+      if (error?.code !== "P2002") throw error;
+    }
+  }
+
+  const job = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
+  if (!job) throw new Error(`Failed to schedule ${jobKey}: idempotency race did not converge`);
+  return { job, created: false, reason: job.status === "CLAIMED" ? "already_claimed" : "race_reused" };
 }
 
 
@@ -309,6 +418,7 @@ function stopRecurringScheduler() {
 module.exports = {
   scheduleInitialJobsForCreator,
   ensureSingleJob,
+  scheduleJobNow,
   runRecurringSweep,
   startRecurringScheduler,
   stopRecurringScheduler,

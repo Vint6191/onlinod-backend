@@ -647,6 +647,7 @@ model JobInstance {
   scope             String
   creatorId         String?
   agencyId          String?
+  idempotencyKey    String?   @unique
   params            Json?
   status            String    @default("SCHEDULED")
   priority          Int       @default(0)
@@ -655,6 +656,12 @@ model JobInstance {
   claimedAt         DateTime?
   claimedByDeviceId String?
   leaseUntil        DateTime?
+  leaseTokenHash    String?
+  leaseRevision     Int       @default(0)
+  workId            String?
+  continuation      Json?
+  progress          Json?
+  lastProgressAt    DateTime?
   startedAt         DateTime?
   completedAt       DateTime?
   lastError         String?
@@ -670,6 +677,7 @@ model JobInstance {
   @@index([creatorId])
   @@index([agencyId])
   @@index([jobKey])
+  @@index([agencyId, idempotencyKey])
   @@index([claimedByDeviceId])
   @@index([leaseUntil])
 }

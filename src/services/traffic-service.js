@@ -4,9 +4,11 @@ const crypto = require("node:crypto");
 const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
+const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 
 const TRAFFIC_SOURCES_SCAN_JOB_KEY = "traffic_sources_scan";
+const TRAFFIC_VALUE_REFRESH_JOB_KEY = "traffic_fan_value_refresh";
 const VALUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
 
 function clean(value, max = 255) {
@@ -1046,7 +1048,7 @@ async function scheduleTrafficValueRefresh({ agencyId, creatorId, accountId = nu
   const cleanCreatorRef = clean(creatorRef, 180);
 
   return ensureSingleJob({
-    jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
+    jobKey: TRAFFIC_VALUE_REFRESH_JOB_KEY,
     creatorId,
     agencyId,
     params: {
@@ -1946,9 +1948,9 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
 
   const now = new Date();
   const params = {
-    hydrateFanValues: true,
-    forceHydrate: force === true,
-    hydrateLimit: force === true ? 5000 : 1000,
+    hydrateFanValues: false,
+    forceHydrate: false,
+    hydrateLimit: 0,
     valueTtlHours: 6,
     reason: force === true ? "manual_traffic_refresh_force" : "manual_traffic_refresh",
     manualRefreshAt: now.toISOString(),
@@ -1972,17 +1974,25 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
   // a fresh one with the new account hints. The scan/upsert path is idempotent,
   // so a duplicate manual job is safer than silently reusing stale params.
   if (force === true) {
-    const job = await prisma.jobInstance.create({
-      data: {
+    const idempotencyKey = buildJobIdempotencyKey({
+      jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY, scope: "creator", creatorId: creator.id, agencyId: creator.agencyId,
+      params: { manualRefreshAt: params.manualRefreshAt, reason: params.reason },
+      bucketAt: now, bucketMs: 0,
+    });
+    const job = await prisma.jobInstance.upsert({
+      where: { idempotencyKey },
+      create: {
         jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
         scope: "creator",
         creatorId: creator.id,
         agencyId: creator.agencyId,
+        idempotencyKey,
         params,
         priority: 120,
         scheduledAt: now,
         nextRunAt: now,
       },
+      update: { status: "SCHEDULED", priority: 120, nextRunAt: now, params, lastError: null },
       select: { id: true, status: true, jobKey: true, createdAt: true, nextRunAt: true, params: true },
     });
 
@@ -2003,6 +2013,7 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
 
 module.exports = {
   TRAFFIC_SOURCES_SCAN_JOB_KEY,
+  TRAFFIC_VALUE_REFRESH_JOB_KEY,
   VALUE_SNAPSHOT_TTL_MS,
   upsertTrafficSourceScan,
   upsertTrafficFanValueSnapshots,
