@@ -1,0 +1,298 @@
+"use strict";
+
+const express = require("express");
+const { z } = require("zod");
+const prisma = require("../prisma");
+const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const {
+  getAutomationControlSnapshot,
+  setAutomationControl,
+  requireCreator,
+} = require("../services/automation-control-service");
+const {
+  ActionDeliveryError,
+  claimActionDelivery,
+  renewActionLease,
+  startActionDelivery,
+  validateActionDelivery,
+  completeActionDelivery,
+  failActionDelivery,
+  releaseActionDelivery,
+  listActionDeliveries,
+  retryActionDelivery,
+  retrySafeFailures,
+  cancelActionDelivery,
+  releaseClaimByAdmin,
+} = require("../services/automation-action-delivery-service");
+const {
+  planFollowBack,
+  ensureAutomaticFollowBack,
+  setCandidateState,
+  retryCandidateDelivery,
+  listFollowBack,
+  getAutomationOverview,
+} = require("../services/follow-back-service");
+
+const router = express.Router();
+
+function validationError(res, error) {
+  return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+}
+function serviceError(res, error, fallback = "AUTOMATION_REQUEST_FAILED") {
+  const code = error?.code || fallback;
+  const status = Number(error?.status) || (code === "CREATOR_NOT_FOUND" || code === "candidate_not_found" || code === "DELIVERY_NOT_FOUND" ? 404 : 500);
+  return res.status(status).json({ ok: false, code, error: error?.message || "Automation request failed" });
+}
+async function seniorRequired(req, res, next) {
+  try {
+    const member = await prisma.agencyMember.findFirst({
+      where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null, agency: { deletedAt: null } },
+    });
+    if (!member || !isSeniorAgencyMember(member)) {
+      return res.status(403).json({ ok: false, code: "WRITE_AUTOMATION_FORBIDDEN", error: "Only owner, admin or manager may change or run write automation" });
+    }
+    req.automationMember = member;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+router.get("/overview/:creatorId", async (req, res) => {
+  try {
+    await requireCreator(req.auth.agencyId, req.params.creatorId);
+    return res.json(await getAutomationOverview({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId }));
+  } catch (error) { return serviceError(res, error, "AUTOMATION_OVERVIEW_FAILED"); }
+});
+
+router.get("/controls/:creatorId", async (req, res) => {
+  try {
+    return res.json({ ok: true, snapshot: await getAutomationControlSnapshot({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId }) });
+  } catch (error) { return serviceError(res, error, "AUTOMATION_CONTROLS_FAILED"); }
+});
+
+const controlSchema = z.object({
+  scope: z.enum(["workspace", "creator", "module"]),
+  creatorId: z.string().min(1).max(160).optional().nullable(),
+  moduleKey: z.enum(["follow_back"]).optional().nullable(),
+  enabled: z.boolean().optional(),
+  settings: z.record(z.unknown()).optional(),
+});
+router.patch("/controls", seniorRequired, async (req, res) => {
+  try {
+    const input = controlSchema.parse(req.body || {});
+    const result = await setAutomationControl({
+      agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      scope: input.scope,
+      creatorId: input.creatorId || null,
+      moduleKey: input.moduleKey || null,
+      enabled: input.enabled,
+      settings: input.settings,
+    });
+    const planning = input.creatorId
+      ? await ensureAutomaticFollowBack({
+          agencyId: req.auth.agencyId,
+          creatorId: input.creatorId,
+          source: "control_update",
+        })
+      : null;
+    return res.json({ ...result, planning });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "AUTOMATION_CONTROL_UPDATE_FAILED");
+  }
+});
+
+const listFollowSchema = z.object({
+  search: z.string().max(160).optional(),
+  state: z.string().max(60).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+router.get("/follow-back/:creatorId", async (req, res) => {
+  try {
+    const query = listFollowSchema.parse(req.query || {});
+    return res.json(await listFollowBack({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      search: query.search || "",
+      state: query.state || null,
+      offset: query.offset || 0,
+      limit: query.limit || 100,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "FOLLOW_BACK_LIST_FAILED");
+  }
+});
+
+const planSchema = z.object({ fanId: z.string().min(1).max(160).optional(), source: z.string().max(80).optional() });
+router.post("/follow-back/:creatorId/plan", seniorRequired, async (req, res) => {
+  try {
+    const input = planSchema.parse(req.body || {});
+    return res.status(202).json(await planFollowBack({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      userId: req.auth.userId,
+      fanId: input.fanId || null,
+      source: input.source || (input.fanId ? "manual_fan" : "manual_run"),
+      priority: input.fanId ? 100 : 70,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "FOLLOW_BACK_PLAN_FAILED");
+  }
+});
+
+const candidateActionSchema = z.object({ action: z.enum(["ignore", "block", "restore", "follow", "retry"]) });
+router.post("/follow-back/:creatorId/candidates/:fanId/action", seniorRequired, async (req, res) => {
+  try {
+    const input = candidateActionSchema.parse(req.body || {});
+    if (input.action === "retry") {
+      return res.status(202).json(await retryCandidateDelivery({
+        agencyId: req.auth.agencyId,
+        creatorId: req.params.creatorId,
+        fanId: req.params.fanId,
+      }));
+    }
+    if (input.action === "follow") {
+      return res.status(202).json(await planFollowBack({
+        agencyId: req.auth.agencyId,
+        creatorId: req.params.creatorId,
+        userId: req.auth.userId,
+        fanId: req.params.fanId,
+        source: "candidate_follow_now",
+        priority: 100,
+      }));
+    }
+    return res.json(await setCandidateState({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      fanId: req.params.fanId,
+      action: input.action,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "FOLLOW_BACK_ACTION_FAILED");
+  }
+});
+
+const deliveryQuerySchema = z.object({
+  creatorId: z.string().max(160).optional(),
+  moduleKey: z.string().max(80).optional(),
+  actionType: z.string().max(80).optional(),
+  status: z.string().max(80).optional(),
+  deviceId: z.string().max(160).optional(),
+  fan: z.string().max(160).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+router.get("/deliveries", async (req, res) => {
+  try {
+    const query = deliveryQuerySchema.parse(req.query || {});
+    return res.json(await listActionDeliveries({
+      agencyId: req.auth.agencyId,
+      creatorId: query.creatorId || null,
+      moduleKey: query.moduleKey || null,
+      actionType: query.actionType || null,
+      status: query.status || null,
+      deviceId: query.deviceId || null,
+      fan: query.fan || null,
+      offset: query.offset || 0,
+      limit: query.limit || 100,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "AUTOMATION_DELIVERIES_FAILED");
+  }
+});
+
+router.post("/deliveries/retry-safe", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({
+      creatorId: z.string().max(160).optional().nullable(),
+      moduleKey: z.string().max(80).optional().nullable(),
+      limit: z.number().int().min(1).max(500).optional(),
+    }).parse(req.body || {});
+    return res.json(await retrySafeFailures({
+      agencyId: req.auth.agencyId,
+      creatorId: input.creatorId || null,
+      moduleKey: input.moduleKey || null,
+      limit: input.limit || 100,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "AUTOMATION_RETRY_SAFE_FAILED");
+  }
+});
+
+router.post("/deliveries/:id/retry", seniorRequired, async (req, res) => {
+  try { return res.json(await retryActionDelivery({ agencyId: req.auth.agencyId, deliveryId: req.params.id })); }
+  catch (error) { return serviceError(res, error, "AUTOMATION_DELIVERY_RETRY_FAILED"); }
+});
+router.post("/deliveries/:id/cancel", seniorRequired, async (req, res) => {
+  try { return res.json(await cancelActionDelivery({ agencyId: req.auth.agencyId, deliveryId: req.params.id, reason: req.body?.reason || "manual_cancel" })); }
+  catch (error) { return serviceError(res, error, "AUTOMATION_DELIVERY_CANCEL_FAILED"); }
+});
+router.post("/deliveries/:id/release", seniorRequired, async (req, res) => {
+  try { return res.json(await releaseClaimByAdmin({ agencyId: req.auth.agencyId, deliveryId: req.params.id })); }
+  catch (error) { return serviceError(res, error, "AUTOMATION_DELIVERY_RELEASE_FAILED"); }
+});
+
+const workerLeaseSchema = z.object({
+  deviceId: z.string().min(3).max(160),
+  leaseToken: z.string().min(16).max(500),
+  leaseRevision: z.number().int().min(1),
+  leaseMs: z.number().int().min(30_000).max(10 * 60_000).optional(),
+});
+router.post("/worker/claim", async (req, res) => {
+  try {
+    const input = z.object({
+      deviceId: z.string().min(3).max(160),
+      leaseMs: z.number().int().min(30_000).max(10 * 60_000).optional(),
+      actionTypes: z.array(z.enum(["FOLLOW_BACK"])).min(1).max(20).optional(),
+    }).parse(req.body || {});
+    return res.json({ ok: true, ...(await claimActionDelivery({ userId: req.auth.userId, deviceId: input.deviceId, leaseMs: input.leaseMs, actionTypes: input.actionTypes })) });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "ACTION_DELIVERY_CLAIM_FAILED");
+  }
+});
+router.post("/worker/:id/renew", async (req, res) => {
+  try { const input = workerLeaseSchema.parse(req.body || {}); return res.json(await renewActionLease({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
+  catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_RENEW_FAILED"); }
+});
+router.post("/worker/:id/start", async (req, res) => {
+  try { const input = workerLeaseSchema.parse(req.body || {}); return res.json(await startActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
+  catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_START_FAILED"); }
+});
+router.post("/worker/:id/validate", async (req, res) => {
+  try { const input = workerLeaseSchema.parse(req.body || {}); return res.json(await validateActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
+  catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_VALIDATE_FAILED"); }
+});
+router.post("/worker/:id/complete", async (req, res) => {
+  try {
+    const input = workerLeaseSchema.extend({ status: z.enum(["COMPLETED", "SKIPPED"]).optional(), outcomeCode: z.string().max(120).optional().nullable(), result: z.record(z.unknown()).optional() }).parse(req.body || {});
+    return res.json(await completeActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input }));
+  } catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_COMPLETE_FAILED"); }
+});
+router.post("/worker/:id/fail", async (req, res) => {
+  try {
+    const input = workerLeaseSchema.extend({ failureCode: z.string().min(1).max(120), error: z.string().max(2000).optional(), retryable: z.boolean().optional(), retryAfterMs: z.number().int().min(0).max(24 * 60 * 60_000).optional(), result: z.record(z.unknown()).optional() }).parse(req.body || {});
+    return res.json(await failActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input }));
+  } catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_FAIL_FAILED"); }
+});
+router.post("/worker/:id/release", async (req, res) => {
+  try {
+    const input = workerLeaseSchema.extend({ reason: z.string().min(1).max(500), runAfterMs: z.number().int().min(0).max(24 * 60 * 60_000).optional() }).parse(req.body || {});
+    return res.json(await releaseActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input }));
+  } catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_RELEASE_FAILED"); }
+});
+
+router.use((error, _req, res, _next) => {
+  if (error instanceof ActionDeliveryError) return serviceError(res, error);
+  return serviceError(res, error);
+});
+
+module.exports = router;

@@ -1,0 +1,679 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const prisma = require("../prisma");
+const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { assertAutomationEnabled } = require("./automation-control-service");
+
+const CLAIMABLE_STATUSES = ["QUEUED", "RETRY_SCHEDULED"];
+const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"];
+const DEFAULT_LEASE_MS = 3 * 60_000;
+const MIN_LEASE_MS = 30_000;
+const MAX_LEASE_MS = 10 * 60_000;
+
+class ActionDeliveryError extends Error {
+  constructor(code, message, status = 409) {
+    super(message);
+    this.name = "ActionDeliveryError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
+function clean(value, max = 1000) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
+function hashToken(token) { return crypto.createHash("sha256").update(String(token)).digest("hex"); }
+function tokenMatches(token, expectedHash) {
+  if (!expectedHash) return false;
+  const actual = Buffer.from(hashToken(token), "hex");
+  const expected = Buffer.from(String(expectedHash), "hex");
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+function leaseDuration(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return DEFAULT_LEASE_MS;
+  return Math.max(MIN_LEASE_MS, Math.min(MAX_LEASE_MS, Math.floor(parsed)));
+}
+function retryDelayMs(attempt, failureCode, retryAfterMs) {
+  const explicit = Number(retryAfterMs);
+  if (Number.isFinite(explicit) && explicit > 0) return Math.max(5_000, Math.min(24 * 60 * 60_000, Math.floor(explicit)));
+  if (failureCode === "rate_limited") return Math.min(60 * 60_000, 60_000 * Math.max(1, attempt) ** 2);
+  return Math.min(30 * 60_000, 30_000 * Math.max(1, attempt));
+}
+function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
+function nextDayStart(date = new Date()) { const out = dayStart(date); out.setDate(out.getDate() + 1); return out; }
+
+async function requireOwnedSeniorDevice({ userId, deviceId }) {
+  const device = await prisma.workerDevice.findUnique({ where: { id: deviceId } });
+  if (!device || device.userId !== userId) throw new ActionDeliveryError("NOT_YOUR_DEVICE", "Invalid device", 403);
+  const member = await prisma.agencyMember.findFirst({
+    where: { agencyId: device.agencyId, userId, deletedAt: null, agency: { deletedAt: null } },
+  });
+  if (!member) throw new ActionDeliveryError("DEVICE_AGENCY_ACCESS_REVOKED", "Device agency access was revoked", 403);
+  if (!isSeniorAgencyMember(member)) throw new ActionDeliveryError("WRITE_AUTOMATION_FORBIDDEN", "Only owner, admin or manager may execute write automation", 403);
+  return { device, member };
+}
+
+async function scopedReadyCreatorIds({ userId, device }) {
+  const member = await prisma.agencyMember.findFirst({
+    where: { agencyId: device.agencyId, userId, deletedAt: null, agency: { deletedAt: null } },
+  });
+  if (!member) return [];
+  const roleKey = String(member.roleKey || "").toLowerCase();
+  const broad = member.role === "OWNER" || member.role === "MANAGER" || member.role === "ADMIN"
+    || ["owner", "manager", "admin"].includes(roleKey)
+    || !member.assignedCreators || member.assignedCreators === "all";
+  const visible = await prisma.creatorAccount.findMany({
+    where: {
+      agencyId: device.agencyId,
+      deletedAt: null,
+      status: "READY",
+      ...(!broad ? { id: { in: Array.isArray(member.assignedCreators) ? member.assignedCreators.map(String).filter(Boolean) : ["__none__"] } } : {}),
+    },
+    select: { id: true },
+    take: 10000,
+  });
+  const ids = visible.map((item) => item.id);
+  if (!ids.length) return [];
+  const freshAfter = new Date(Date.now() - 2 * 60_000);
+  const bindings = await prisma.deviceCreatorBinding.findMany({
+    where: {
+      agencyId: device.agencyId,
+      deviceId: device.id,
+      status: "ACTIVE",
+      lastSeenAt: { gte: freshAfter },
+      creatorId: { in: ids },
+    },
+    select: { creatorId: true },
+    take: 10000,
+  });
+  return bindings.map((item) => item.creatorId);
+}
+
+async function sweepExpiredActionLeases(now = new Date()) {
+  const rows = await prisma.automationDelivery.findMany({
+    where: { status: { in: ["CLAIMED", "RUNNING"] }, claimUntil: { lt: now }, moduleKey: { not: "bumps" } },
+    select: { id: true, attempts: true, maxAttempts: true, result: true, leaseRevision: true },
+    take: 10000,
+  });
+  let changed = 0;
+  for (const row of rows) {
+    const terminal = row.attempts >= row.maxAttempts;
+    const updated = await prisma.automationDelivery.updateMany({
+      where: {
+        id: row.id,
+        status: { in: ["CLAIMED", "RUNNING"] },
+        leaseRevision: row.leaseRevision,
+        claimUntil: { lt: now },
+      },
+      data: terminal
+        ? {
+            status: "FAILED",
+            failureCode: "lease_lost",
+            lastError: "Action lease expired",
+            finishedAt: now,
+            claimedByDeviceId: null,
+            claimedAt: null,
+            claimUntil: null,
+            leaseTokenHash: null,
+            leaseRevision: { increment: 1 },
+            result: { ...object(row.result), leaseExpiredAt: now.toISOString() },
+          }
+        : {
+            status: "RETRY_SCHEDULED",
+            failureCode: "lease_lost",
+            lastError: "Action lease expired",
+            notBefore: new Date(now.getTime() + retryDelayMs(row.attempts || 1, "lease_lost")),
+            claimedByDeviceId: null,
+            claimedAt: null,
+            claimUntil: null,
+            leaseTokenHash: null,
+            leaseRevision: { increment: 1 },
+            result: { ...object(row.result), leaseExpiredAt: now.toISOString() },
+          },
+    });
+    if (updated.count) changed += 1;
+  }
+  return changed;
+}
+
+async function fairCandidates({ agencyId, creatorIds, actionTypes, now }) {
+  const candidates = await prisma.automationDelivery.findMany({
+    where: {
+      agencyId,
+      creatorId: { in: creatorIds },
+      actionType: { in: actionTypes },
+      status: { in: CLAIMABLE_STATUSES },
+      notBefore: { lte: now },
+    },
+    orderBy: [{ priority: "desc" }, { notBefore: "asc" }, { createdAt: "asc" }],
+    take: 100,
+  });
+  const withinAttempts = candidates.filter((item) => item.attempts < item.maxAttempts);
+  if (!withinAttempts.length) return [];
+  const creatorSet = [...new Set(withinAttempts.map((item) => item.creatorId))];
+  const touches = await prisma.automationDelivery.groupBy({
+    by: ["creatorId"],
+    where: { agencyId, creatorId: { in: creatorSet }, status: { in: ["CLAIMED", "RUNNING", "COMPLETED"] } },
+    _max: { claimedAt: true, finishedAt: true },
+  });
+  const lastTouch = new Map(touches.map((row) => [row.creatorId, Math.max(
+    row._max.claimedAt?.getTime?.() || 0,
+    row._max.finishedAt?.getTime?.() || 0,
+  )]));
+  return withinAttempts.sort((a, b) =>
+    b.priority - a.priority
+    || (lastTouch.get(a.creatorId) || 0) - (lastTouch.get(b.creatorId) || 0)
+    || a.notBefore.getTime() - b.notBefore.getTime()
+    || a.createdAt.getTime() - b.createdAt.getTime());
+}
+
+async function updateCandidateProgress(delivery, status, failureCode = null) {
+  if (!delivery || delivery.moduleKey !== "follow_back" || !(delivery.targetId || delivery.fanId)) return;
+  await prisma.followBackCandidate.updateMany({
+    where: {
+      agencyId: delivery.agencyId,
+      creatorId: delivery.creatorId,
+      fanId: delivery.targetId || delivery.fanId,
+    },
+    data: {
+      state: status,
+      latestDeliveryId: delivery.id,
+      latestActionType: delivery.actionType,
+      latestStatus: status,
+      latestError: failureCode,
+    },
+  });
+}
+
+async function deferOrSkipFollowBackClaim(delivery, control, now) {
+  if (delivery.actionType !== "FOLLOW_BACK") return false;
+  const state = await prisma.subscriberDirectoryState.findFirst({
+    where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, status: "READY" },
+    select: { currentRunId: true },
+  });
+  const candidate = await prisma.followBackCandidate.findFirst({
+    where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId || delivery.fanId },
+  });
+  let code = null;
+  let terminalStatus = "SKIPPED";
+  if (!candidate) code = "invalid_target";
+  else if (candidate.blocked) { code = "blocked"; terminalStatus = "CANCELED"; }
+  else if (candidate.ignored) { code = "ignored"; terminalStatus = "CANCELED"; }
+  else if (!state?.currentRunId || candidate.snapshotRunId !== state.currentRunId || candidate.state === "STALE") code = "stale_candidate";
+  else if (candidate.subscribedByCreator === true) code = "already_followed";
+
+  if (code) {
+    const updated = await prisma.automationDelivery.updateMany({
+      where: { id: delivery.id, status: { in: CLAIMABLE_STATUSES } },
+      data: {
+        status: terminalStatus,
+        failureCode: code,
+        lastError: code,
+        finishedAt: now,
+        claimUntil: null,
+        leaseTokenHash: null,
+        leaseRevision: { increment: 1 },
+      },
+    });
+    if (updated.count) {
+      const latest = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+      await updateCandidateFromTerminal(latest, terminalStatus, code);
+    }
+    return true;
+  }
+
+  const dailyLimit = Number(control.modules?.follow_back?.settings?.dailyLimit || 0);
+  const completedToday = await prisma.automationDelivery.count({
+    where: {
+      agencyId: delivery.agencyId,
+      creatorId: delivery.creatorId,
+      moduleKey: "follow_back",
+      actionType: "FOLLOW_BACK",
+      status: "COMPLETED",
+      finishedAt: { gte: dayStart(now) },
+    },
+  });
+  if (completedToday >= dailyLimit) {
+    const updated = await prisma.automationDelivery.updateMany({
+      where: { id: delivery.id, status: { in: CLAIMABLE_STATUSES } },
+      data: {
+        status: "RETRY_SCHEDULED",
+        failureCode: "daily_limit",
+        lastError: "Follow Back daily limit reached",
+        notBefore: nextDayStart(now),
+      },
+    });
+    if (updated.count) {
+      const latest = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+      await updateCandidateProgress(latest, "RETRY_SCHEDULED", "daily_limit");
+    }
+    return true;
+  }
+  return false;
+}
+
+async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["FOLLOW_BACK"] }) {
+  const { device } = await requireOwnedSeniorDevice({ userId, deviceId });
+  await sweepExpiredActionLeases();
+  if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60_000)) return { delivery: null, reason: "device_stale" };
+  const creatorIds = await scopedReadyCreatorIds({ userId, device });
+  if (!creatorIds.length) return { delivery: null, reason: "no_ready_creator" };
+  const allowedActionTypes = [...new Set((Array.isArray(actionTypes) ? actionTypes : []).map((item) => clean(item, 80)).filter(Boolean))];
+  if (!allowedActionTypes.length) return { delivery: null, reason: "no_capabilities" };
+  const now = new Date();
+  const candidates = await fairCandidates({ agencyId: device.agencyId, creatorIds, actionTypes: allowedActionTypes, now });
+  for (const candidate of candidates) {
+    let control;
+    try {
+      control = await assertAutomationEnabled({ agencyId: candidate.agencyId, creatorId: candidate.creatorId, moduleKey: candidate.moduleKey });
+    } catch {
+      continue;
+    }
+    if (await deferOrSkipFollowBackClaim(candidate, control, now)) continue;
+    const leaseToken = crypto.randomBytes(32).toString("base64url");
+    const claimUntil = new Date(now.getTime() + leaseDuration(leaseMs));
+    try {
+      const updated = await prisma.automationDelivery.updateMany({
+        where: {
+          id: candidate.id,
+          status: { in: CLAIMABLE_STATUSES },
+          notBefore: { lte: now },
+          claimUntil: null,
+        },
+        data: {
+          status: "CLAIMED",
+          claimedByDeviceId: device.id,
+          claimedAt: now,
+          claimUntil,
+          leaseTokenHash: hashToken(leaseToken),
+          leaseRevision: { increment: 1 },
+          attempts: { increment: 1 },
+          failureCode: null,
+          lastError: null,
+        },
+      });
+      if (!updated.count) continue;
+      const claimed = await prisma.automationDelivery.findUnique({ where: { id: candidate.id } });
+      if (!claimed) continue;
+      await updateCandidateProgress(claimed, "CLAIMED");
+      return {
+        reason: "claimed",
+        delivery: {
+          id: claimed.id,
+          agencyId: claimed.agencyId,
+          creatorId: claimed.creatorId,
+          moduleKey: claimed.moduleKey,
+          actionType: claimed.actionType,
+          targetId: claimed.targetId || claimed.fanId,
+          fanId: claimed.fanId,
+          dialogId: claimed.dialogId,
+          idempotencyKey: claimed.idempotencyKey,
+          generation: claimed.generation,
+          priority: claimed.priority,
+          payload: object(claimed.payload),
+          attempt: claimed.attempts,
+          maxAttempts: claimed.maxAttempts,
+          notBefore: claimed.notBefore,
+          leaseUntil: claimed.claimUntil,
+          leaseToken,
+          leaseRevision: claimed.leaseRevision,
+        },
+      };
+    } catch (error) {
+      // The partial creator lease index intentionally turns a multi-device race
+      // into a harmless loser. Continue looking for another creator.
+      if (error?.code === "P2002" || String(error?.message || "").includes("creator_write_lease_unique")) continue;
+      throw error;
+    }
+  }
+  return { delivery: null, reason: "no_work" };
+}
+
+async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, allowTerminal = false, allowExpired = false }) {
+  const { device } = await requireOwnedSeniorDevice({ userId, deviceId });
+  const delivery = await prisma.automationDelivery.findUnique({ where: { id: deliveryId } });
+  if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  if (delivery.agencyId !== device.agencyId) throw new ActionDeliveryError("DELIVERY_DEVICE_AGENCY_MISMATCH", "Delivery belongs to another agency", 403);
+  const terminal = TERMINAL_STATUSES.includes(delivery.status);
+  if (!(delivery.status === "CLAIMED" || delivery.status === "RUNNING" || (allowTerminal && terminal))) {
+    throw new ActionDeliveryError("DELIVERY_NOT_CLAIMED", `Delivery status is ${delivery.status}`);
+  }
+  if (delivery.claimedByDeviceId !== deviceId) throw new ActionDeliveryError("DELIVERY_CLAIMED_BY_OTHER", "Delivery is claimed by another device");
+  if (!tokenMatches(leaseToken, delivery.leaseTokenHash)) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery lease token is stale");
+  if (!Number.isInteger(leaseRevision) || delivery.leaseRevision !== leaseRevision) throw new ActionDeliveryError("DELIVERY_LEASE_REVISION_STALE", "Delivery lease revision is stale");
+  if (!allowExpired && !terminal && (!delivery.claimUntil || delivery.claimUntil.getTime() <= Date.now())) {
+    throw new ActionDeliveryError("DELIVERY_LEASE_EXPIRED", "Delivery lease expired");
+  }
+  return delivery;
+}
+
+async function renewActionLease(input) {
+  const delivery = await requireLease(input);
+  await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  const now = new Date();
+  const result = await prisma.automationDelivery.updateMany({
+    where: {
+      id: delivery.id,
+      status: { in: ["CLAIMED", "RUNNING"] },
+      claimedByDeviceId: input.deviceId,
+      leaseTokenHash: hashToken(input.leaseToken),
+      leaseRevision: input.leaseRevision,
+      claimUntil: { gt: now },
+    },
+    data: { claimUntil: new Date(now.getTime() + leaseDuration(input.leaseMs)), lastCheckedAt: now },
+  });
+  if (!result.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery lease changed before renewal");
+  return { ok: true, id: delivery.id, leaseRevision: delivery.leaseRevision, leaseUntil: new Date(now.getTime() + leaseDuration(input.leaseMs)) };
+}
+
+async function startActionDelivery(input) {
+  const delivery = await requireLease(input);
+  await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  if (delivery.notBefore.getTime() > Date.now()) throw new ActionDeliveryError("DELIVERY_NOT_DUE", "Delivery is not due yet");
+  if (delivery.status === "RUNNING") return { ok: true, delivery };
+  const updated = await prisma.automationDelivery.updateMany({
+    where: { id: delivery.id, status: "CLAIMED", leaseRevision: input.leaseRevision, claimedByDeviceId: input.deviceId },
+    data: { status: "RUNNING", lastCheckedAt: new Date() },
+  });
+  if (!updated.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before start");
+  const running = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+  await updateCandidateProgress(running, "RUNNING");
+  return { ok: true, delivery: running };
+}
+
+async function validateActionDelivery(input) {
+  const delivery = await requireLease(input);
+  const control = await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  return { ok: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, control: control.effective };
+}
+
+async function updateCandidateFromTerminal(delivery, status, failureCode) {
+  if (delivery.moduleKey !== "follow_back" || !delivery.targetId) return;
+  const candidateState = status === "COMPLETED"
+    ? "FOLLOWED"
+    : status === "SKIPPED"
+      ? (failureCode === "already_followed" ? "FOLLOWED" : "SKIPPED")
+      : status;
+  await prisma.followBackCandidate.updateMany({
+    where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId },
+    data: {
+      state: candidateState,
+      subscribedByCreator: status === "COMPLETED" || failureCode === "already_followed" ? true : undefined,
+      latestDeliveryId: delivery.id,
+      latestActionType: delivery.actionType,
+      latestStatus: status,
+      latestError: failureCode || null,
+      eligibilityReason: status === "COMPLETED" || failureCode === "already_followed" ? "already_followed" : undefined,
+    },
+  });
+}
+
+async function completeActionDelivery(input) {
+  const delivery = await requireLease({ ...input, allowTerminal: true });
+  if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
+  const now = new Date();
+  const result = object(input.result);
+  const outcomeCode = clean(input.outcomeCode, 120) || clean(result.code, 120) || null;
+  const terminalStatus = input.status === "SKIPPED" ? "SKIPPED" : "COMPLETED";
+  const updated = await prisma.automationDelivery.updateMany({
+    where: {
+      id: delivery.id,
+      status: { in: ["CLAIMED", "RUNNING"] },
+      claimedByDeviceId: input.deviceId,
+      leaseTokenHash: hashToken(input.leaseToken),
+      leaseRevision: input.leaseRevision,
+    },
+    data: {
+      status: terminalStatus,
+      failureCode: terminalStatus === "SKIPPED" ? outcomeCode : null,
+      lastError: null,
+      result,
+      finishedAt: now,
+      lastCheckedAt: now,
+      claimUntil: null,
+      // Keep the hashed token/device/revision for idempotent completion retries.
+    },
+  });
+  if (!updated.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before completion");
+  const finalDelivery = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+  await updateCandidateFromTerminal(finalDelivery, terminalStatus, outcomeCode);
+  return { ok: true, duplicate: false, delivery: finalDelivery };
+}
+
+async function failActionDelivery(input) {
+  const delivery = await requireLease(input);
+  const now = new Date();
+  const failureCode = clean(input.failureCode, 120) || "unknown";
+  const lastError = clean(input.error, 2000) || failureCode;
+  const retryable = input.retryable === true && delivery.attempts < delivery.maxAttempts;
+  const nextStatus = retryable ? "RETRY_SCHEDULED" : "FAILED";
+  const nextNotBefore = retryable ? new Date(now.getTime() + retryDelayMs(delivery.attempts, failureCode, input.retryAfterMs)) : delivery.notBefore;
+  const result = { ...object(delivery.result), ...object(input.result), failedAt: now.toISOString(), retryable };
+  const changed = await prisma.automationDelivery.updateMany({
+    where: {
+      id: delivery.id,
+      status: { in: ["CLAIMED", "RUNNING"] },
+      claimedByDeviceId: input.deviceId,
+      leaseTokenHash: hashToken(input.leaseToken),
+      leaseRevision: input.leaseRevision,
+    },
+    data: {
+      status: nextStatus,
+      failureCode,
+      lastError,
+      result,
+      notBefore: nextNotBefore,
+      finishedAt: retryable ? null : now,
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      leaseTokenHash: null,
+      leaseRevision: { increment: 1 },
+      lastCheckedAt: now,
+    },
+  });
+  if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before failure update");
+  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+  if (retryable) await updateCandidateProgress(updated, "RETRY_SCHEDULED", failureCode);
+  else await updateCandidateFromTerminal(updated, "FAILED", failureCode);
+  return { ok: true, retryable, retryAt: retryable ? nextNotBefore : null, delivery: updated };
+}
+
+async function releaseActionDelivery(input) {
+  const delivery = await requireLease({ ...input, allowExpired: true });
+  const now = new Date();
+  const runAfterMs = Math.max(0, Math.min(24 * 60 * 60_000, Number(input.runAfterMs) || 0));
+  const changed = await prisma.automationDelivery.updateMany({
+    where: {
+      id: delivery.id,
+      status: { in: ["CLAIMED", "RUNNING"] },
+      claimedByDeviceId: input.deviceId,
+      leaseTokenHash: hashToken(input.leaseToken),
+      leaseRevision: input.leaseRevision,
+    },
+    data: {
+      status: "QUEUED",
+      notBefore: new Date(now.getTime() + runAfterMs),
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      leaseTokenHash: null,
+      leaseRevision: { increment: 1 },
+      failureCode: null,
+      lastError: clean(input.reason, 500),
+      result: { ...object(delivery.result), releasedAt: now.toISOString(), releaseReason: clean(input.reason, 500) },
+    },
+  });
+  if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before release");
+  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+  await updateCandidateProgress(updated, "QUEUED", clean(input.reason, 500));
+  return { ok: true, delivery: updated };
+}
+
+async function listActionDeliveries({ agencyId, creatorId, moduleKey, actionType, status, deviceId, fan, offset = 0, limit = 100 }) {
+  const take = Math.max(1, Math.min(500, Number(limit) || 100));
+  const skip = Math.max(0, Number(offset) || 0);
+  const search = clean(fan, 160);
+  const where = {
+    agencyId,
+    ...(creatorId ? { creatorId } : {}),
+    ...(moduleKey ? { moduleKey } : {}),
+    ...(actionType ? { actionType } : {}),
+    ...(status ? { status: Array.isArray(status) ? { in: status } : status } : {}),
+    ...(deviceId ? { claimedByDeviceId: deviceId } : {}),
+    ...(search ? { OR: [{ fanId: { contains: search, mode: "insensitive" } }, { targetId: { contains: search, mode: "insensitive" } }] } : {}),
+  };
+  const [items, count] = await Promise.all([
+    prisma.automationDelivery.findMany({
+      where,
+      orderBy: [{ priority: "desc" }, { notBefore: "asc" }, { createdAt: "desc" }],
+      skip,
+      take,
+      select: {
+        id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, targetId: true, fanId: true,
+        dialogId: true, idempotencyKey: true, generation: true, priority: true, payload: true, status: true,
+        scheduledAt: true, notBefore: true, attempts: true, maxAttempts: true, claimedByDeviceId: true,
+        claimedAt: true, claimUntil: true, leaseRevision: true, failureCode: true, lastError: true, result: true,
+        createdAt: true, updatedAt: true, finishedAt: true,
+      },
+    }),
+    prisma.automationDelivery.count({ where }),
+  ]);
+  return { ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count };
+}
+
+async function retryActionDelivery({ agencyId, deliveryId }) {
+  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
+  if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  if (!["FAILED", "SKIPPED", "CANCELED", "PAUSED"].includes(delivery.status)) {
+    throw new ActionDeliveryError("DELIVERY_NOT_RETRYABLE", `Delivery status ${delivery.status} cannot be retried`);
+  }
+  if (delivery.failureCode && ["permission_denied", "invalid_payload", "fan_not_found", "blocked", "creator_revoked"].includes(delivery.failureCode)) {
+    throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Failure ${delivery.failureCode} requires a new action generation`);
+  }
+  await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  const retryAt = new Date();
+  const changed = await prisma.automationDelivery.updateMany({
+    where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
+    data: {
+      status: "QUEUED",
+      attempts: 0,
+      notBefore: retryAt,
+      failureCode: null,
+      lastError: null,
+      finishedAt: null,
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      leaseTokenHash: null,
+      leaseRevision: { increment: 1 },
+      result: { ...object(delivery.result), retriedAt: retryAt.toISOString() },
+    },
+  });
+  if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before retry");
+  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+  await updateCandidateProgress(updated, "QUEUED");
+  return { ok: true, delivery: updated };
+}
+
+async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_cancel" }) {
+  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
+  if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
+  const finishedAt = new Date();
+  const changed = await prisma.automationDelivery.updateMany({
+    where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
+    data: {
+      status: "CANCELED",
+      failureCode: "canceled",
+      lastError: clean(reason, 500),
+      finishedAt,
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      leaseTokenHash: null,
+      leaseRevision: { increment: 1 },
+    },
+  });
+  if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before cancel");
+  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+  await updateCandidateFromTerminal(updated, "CANCELED", "canceled");
+  return { ok: true, duplicate: false, delivery: updated };
+}
+
+async function releaseClaimByAdmin({ agencyId, deliveryId }) {
+  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
+  if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  if (!["CLAIMED", "RUNNING"].includes(delivery.status)) return { ok: true, duplicate: true, delivery };
+  const changed = await prisma.automationDelivery.updateMany({
+    where: { id: delivery.id, status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
+    data: {
+      status: "QUEUED",
+      notBefore: new Date(Date.now() + 15_000),
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      leaseTokenHash: null,
+      leaseRevision: { increment: 1 },
+      lastError: "Claim released by administrator",
+    },
+  });
+  if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before administrative release");
+  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+  await updateCandidateProgress(updated, "QUEUED", "claim_released");
+  return { ok: true, delivery: updated };
+}
+
+async function retrySafeFailures({ agencyId, creatorId = null, moduleKey = null, limit = 100 }) {
+  const safeCodes = [
+    "network_error",
+    "timeout",
+    "rate_limited",
+    "temporary_of_error",
+    "backend_temporary_error",
+    "creator_unavailable",
+    "lease_lost",
+    "unknown",
+  ];
+  const rows = await prisma.automationDelivery.findMany({
+    where: {
+      agencyId,
+      status: "FAILED",
+      failureCode: { in: safeCodes },
+      ...(creatorId ? { creatorId } : {}),
+      ...(moduleKey ? { moduleKey } : {}),
+    },
+    orderBy: { updatedAt: "asc" },
+    take: Math.max(1, Math.min(500, Number(limit) || 100)),
+    select: { id: true },
+  });
+  const results = [];
+  for (const row of rows) {
+    try {
+      results.push(await retryActionDelivery({ agencyId, deliveryId: row.id }));
+    } catch (error) {
+      results.push({ ok: false, deliveryId: row.id, code: error?.code || "retry_failed", error: error?.message || String(error) });
+    }
+  }
+  return { ok: true, requested: rows.length, retried: results.filter((item) => item.ok).length, results };
+}
+
+module.exports = {
+  ActionDeliveryError,
+  CLAIMABLE_STATUSES,
+  TERMINAL_STATUSES,
+  sweepExpiredActionLeases,
+  claimActionDelivery,
+  renewActionLease,
+  startActionDelivery,
+  validateActionDelivery,
+  completeActionDelivery,
+  failActionDelivery,
+  releaseActionDelivery,
+  listActionDeliveries,
+  retryActionDelivery,
+  retrySafeFailures,
+  cancelActionDelivery,
+  releaseClaimByAdmin,
+};

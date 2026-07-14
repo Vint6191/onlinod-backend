@@ -29,6 +29,7 @@ const prisma = require("../prisma");
 const { runRetentionSweep, getRetentionSettings } = require("./retention-service");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
+const { ensureAutomaticFollowBack } = require("./follow-back-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -158,6 +159,16 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   });
   if (subscriberDecision.created) created.push("subscriber_directory_scan");
   else skipped.push("subscriber_directory_scan");
+
+  // Follow Back candidate planning is backend orchestration over the already
+  // published Subscriber Directory projection. It never starts another OF scan.
+  const followBackDecision = await ensureAutomaticFollowBack({
+    agencyId,
+    creatorId,
+    source: "recurring_scheduler",
+  });
+  if (followBackDecision.created) created.push("follow_back_plan");
+  else skipped.push(`follow_back_plan:${followBackDecision.reason}`);
 
   return { created, skipped };
 }

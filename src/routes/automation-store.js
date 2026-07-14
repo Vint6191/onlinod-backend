@@ -14,7 +14,6 @@ const { registerJobRoutes } = require("./automation/jobs-routes");
 const { registerEventRoutes } = require("./automation/events-routes");
 const { registerDeliveryRoutes } = require("./automation/deliveries-routes");
 const { registerHiddenOnlineRoutes } = require("./automation/hidden-online-routes");
-const { registerFollowBackRoutes } = require("./automation/follow-back-routes");
 const { registerBumpStatsRoutes } = require("./automation/bump-stats-routes");
 
 const router = express.Router();
@@ -78,7 +77,8 @@ registerJobRoutes(router, automationRouteDeps);
 registerEventRoutes(router, automationRouteDeps);
 registerDeliveryRoutes(router, automationDeliveryRouteDeps);
 registerHiddenOnlineRoutes(router, automationDeliveryRouteDeps);
-registerFollowBackRoutes(router, automationDeliveryRouteDeps);
+// P10: legacy Alpha Follow Back routes are intentionally not registered.
+// The only executable path is /api/automation -> AutomationDelivery write control plane.
 registerBumpStatsRoutes(router, automationDeliveryRouteDeps);
 
 module.exports = router;

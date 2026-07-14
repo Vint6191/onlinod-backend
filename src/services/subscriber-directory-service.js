@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { refreshFollowBackProjection } = require("./follow-back-service");
 
 const SUBSCRIBER_DIRECTORY_JOB_KEY = "subscriber_directory_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING"];
@@ -401,7 +402,14 @@ async function publishRun(db, run, { jobId, scanEveryDays }) {
     run.creatorId
   );
 
-  return summary;
+  const followBackProjection = await refreshFollowBackProjection({
+    db,
+    agencyId: run.agencyId,
+    creatorId: run.creatorId,
+    runId: run.id,
+  });
+
+  return { ...summary, followBackProjection };
 }
 
 async function applySubscriberScanChunk({ db, job, chunkResult }) {

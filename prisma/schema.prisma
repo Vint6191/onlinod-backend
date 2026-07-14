@@ -116,6 +116,8 @@ model Agency {
   campaignDrafts CampaignDraft[]
   campaignQueueStatuses CampaignQueueStatus[]
   automationDeliveries AutomationDelivery[]
+  automationControls AutomationControlState[]
+  followBackCandidates FollowBackCandidate[]
   automationBumpFanStates AutomationBumpFanState[]
   hiddenOnlineUsers HiddenOnlineUser[]
   subscriberScanRuns SubscriberScanRun[]
@@ -200,6 +202,8 @@ model CreatorAccount {
   campaignDrafts CampaignDraft[]
   campaignQueueStatuses CampaignQueueStatus[]
   automationDeliveries AutomationDelivery[]
+  automationControls AutomationControlState[]
+  followBackCandidates FollowBackCandidate[]
   automationBumpFanStates AutomationBumpFanState[]
   hiddenOnlineUsers HiddenOnlineUser[]
   subscriberScanRuns SubscriberScanRun[]
@@ -1581,44 +1585,122 @@ model CampaignQueueStatus {
 }
 
 model AutomationDelivery {
-  id              String   @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  ruleId          String?
+  id                  String   @id @default(cuid())
+  agencyId            String
+  creatorId           String
+  moduleKey           String   @default("bumps")
+  actionType          String   @default("SEND_MESSAGE")
+  targetId            String?
+  idempotencyKey      String?  @unique
+  generation          Int      @default(1)
+  priority            Int      @default(0)
+  payload             Json     @default("{}")
+  ruleId              String?
   contentCollectionId String?
-  fanId           String
-  dialogId        String?
-  trigger         String?
-  status          String   @default("scheduled") // scheduled | sent | skipped | failed | canceled
-  scheduledAt     DateTime?
-  sentAt          DateTime?
-  cancelAt        DateTime?
-  claimedByDeviceId String?
-  claimedAt       DateTime?
-  claimUntil      DateTime?
-  lastCheckedAt   DateTime?
-  attempts        Int      @default(0)
-  maxAttempts     Int      @default(5)
-  messageId       String?
-  priceCents      Int      @default(0)
-  media           Json     @default("[]")
-  result          Json     @default("{}")
-  error           String?
-  createdByUserId String?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  fanId               String
+  dialogId            String?
+  trigger             String?
+  status              String   @default("scheduled") // P10: QUEUED | CLAIMED | RUNNING | RETRY_SCHEDULED | COMPLETED | FAILED | SKIPPED | CANCELED | PAUSED. Legacy bump rows keep old values until P11 migration.
+  scheduledAt         DateTime?
+  notBefore           DateTime @default(now())
+  sentAt              DateTime?
+  cancelAt            DateTime?
+  claimedByDeviceId   String?
+  claimedAt           DateTime?
+  claimUntil          DateTime?
+  leaseTokenHash      String?
+  leaseRevision       Int      @default(0)
+  lastCheckedAt       DateTime?
+  attempts            Int      @default(0)
+  maxAttempts         Int      @default(5)
+  failureCode         String?
+  lastError           String?
+  messageId           String?
+  priceCents          Int      @default(0)
+  media               Json     @default("[]")
+  result              Json     @default("{}")
+  error               String?  // legacy alias; new write control plane uses lastError
+  finishedAt          DateTime?
+  createdByUserId     String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
   agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
   @@index([agencyId, status])
+  @@index([agencyId, moduleKey, actionType, status])
   @@index([creatorId, fanId])
+  @@index([creatorId, targetId])
+  @@index([creatorId, status, notBefore])
   @@index([creatorId, messageId])
   @@index([creatorId, status, cancelAt])
+  @@index([claimedByDeviceId, status])
   @@index([claimUntil])
   @@index([ruleId])
   @@index([sentAt])
   @@index([cancelAt])
+  @@index([finishedAt])
+}
+
+model AutomationControlState {
+  id              String   @id @default(cuid())
+  agencyId        String
+  scopeKey        String
+  creatorId       String?
+  moduleKey       String?
+  enabled         Boolean  @default(true)
+  settings        Json     @default("{}")
+  updatedByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, scopeKey])
+  @@index([agencyId, creatorId])
+  @@index([agencyId, moduleKey])
+}
+
+model FollowBackCandidate {
+  id                    String   @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  fanId                 String
+  dialogId              String?
+  username              String?
+  displayName           String?
+  avatarUrl             String?
+  subscriptionType      String?
+  isActive              Boolean?
+  canReceiveChatMessage Boolean?
+  subscribedByCreator   Boolean?
+  discoveredAt          DateTime @default(now())
+  lastSeenAt            DateTime?
+  eligibilityReason     String?
+  ignored               Boolean  @default(false)
+  blocked               Boolean  @default(false)
+  state                 String   @default("CANDIDATE")
+  generation            Int      @default(1)
+  cooldownUntil         DateTime?
+  snapshotRunId         String?
+  latestDeliveryId      String?
+  latestActionType      String?
+  latestStatus          String?
+  latestError           String?
+  metadata              Json     @default("{}")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, fanId])
+  @@index([agencyId, creatorId, state])
+  @@index([creatorId, eligibilityReason])
+  @@index([creatorId, cooldownUntil])
+  @@index([snapshotRunId])
 }
 
 model AutomationBumpFanState {
