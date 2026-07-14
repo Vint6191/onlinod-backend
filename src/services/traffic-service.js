@@ -26,7 +26,11 @@ function asDate(value) {
 
 function moneyCents(value) {
   if (value === null || value === undefined || value === "") return 0;
-  const n = Number(String(value).replace(/[^0-9.,-]/g, "").replace(",", "."));
+  const n = Number(
+    String(value)
+      .replace(/[^0-9.,-]/g, "")
+      .replace(",", ".")
+  );
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.round(n * 100));
 }
@@ -87,24 +91,45 @@ function extractMemberIdentity(metadata = {}) {
   const subscriber = meta.subscriber && typeof meta.subscriber === "object" ? meta.subscriber : {};
 
   const username = clean(
-    meta.fanUsername || meta.username || meta.login ||
-    user.username || user.login ||
-    fan.username || fan.login ||
-    subscriber.username || subscriber.login,
+    meta.fanUsername ||
+      meta.username ||
+      meta.login ||
+      user.username ||
+      user.login ||
+      fan.username ||
+      fan.login ||
+      subscriber.username ||
+      subscriber.login,
     120
   );
   const name = clean(
-    meta.fanName || meta.name || meta.displayName ||
-    user.name || user.displayName ||
-    fan.name || fan.displayName ||
-    subscriber.name || subscriber.displayName,
+    meta.fanName ||
+      meta.name ||
+      meta.displayName ||
+      user.name ||
+      user.displayName ||
+      fan.name ||
+      fan.displayName ||
+      subscriber.name ||
+      subscriber.displayName,
     160
   );
   const avatarUrl = clean(
-    meta.fanAvatar || meta.avatarUrl || meta.avatar ||
-    user.avatar || user.avatarUrl || user.avatarThumbs?.c50 || user.avatarThumbs?.c144 ||
-    fan.avatar || fan.avatarUrl || fan.avatarThumbs?.c50 || fan.avatarThumbs?.c144 ||
-    subscriber.avatar || subscriber.avatarUrl || subscriber.avatarThumbs?.c50 || subscriber.avatarThumbs?.c144,
+    meta.fanAvatar ||
+      meta.avatarUrl ||
+      meta.avatar ||
+      user.avatar ||
+      user.avatarUrl ||
+      user.avatarThumbs?.c50 ||
+      user.avatarThumbs?.c144 ||
+      fan.avatar ||
+      fan.avatarUrl ||
+      fan.avatarThumbs?.c50 ||
+      fan.avatarThumbs?.c144 ||
+      subscriber.avatar ||
+      subscriber.avatarUrl ||
+      subscriber.avatarThumbs?.c50 ||
+      subscriber.avatarThumbs?.c144,
     1000
   );
 
@@ -127,14 +152,16 @@ function normalizeValueStatsRow(row = {}) {
 }
 
 function stableHash(parts) {
-  return crypto.createHash("sha1").update((parts || []).map((x) => String(x ?? "")).join("|"), "utf8").digest("hex");
+  return crypto
+    .createHash("sha1")
+    .update((parts || []).map((x) => String(x ?? "")).join("|"), "utf8")
+    .digest("hex");
 }
 
 function utcDay(value) {
   const d = asDate(value) || new Date();
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
-
 
 async function recomputeTrafficDailyAggregate(tx, { agencyId, creatorId, sourceId, day }) {
   if (!sourceId || !day) return null;
@@ -238,8 +265,8 @@ function sourceLabel(sourceType) {
   return type || "traffic source";
 }
 
-
-const TRAFFIC_METADATA_RAW_KEY_RE = /^(raw|rawHtml|html|payload|body|response|request|headers|cookie|cookies|authorization|token|accessToken|refreshToken)$/i;
+const TRAFFIC_METADATA_RAW_KEY_RE =
+  /^(raw|rawHtml|html|payload|body|response|request|headers|cookie|cookies|authorization|token|accessToken|refreshToken)$/i;
 const TRAFFIC_METADATA_RAW_HINT_RE = /(rawHtml|payload|headers|cookies?|authorization|accessToken|refreshToken)/i;
 
 function stripRawMetadata(value, depth = 0) {
@@ -532,22 +559,31 @@ async function repairUnattributedSubscriptionAttribution({
 
   const targets = Array.from(recomputeTargets.values());
   for (const chunk of chunkArray(targets, 30)) {
-    await prisma.$transaction(async (tx) => {
-      for (const target of chunk) {
-        await recomputeTrafficDailyAggregate(tx, {
-          agencyId: cleanAgencyId,
-          creatorId: cleanCreatorId,
-          sourceId: target.sourceId,
-          day: target.day,
-        });
-      }
-    }, { timeout: 60_000, maxWait: 10_000 });
+    await prisma.$transaction(
+      async (tx) => {
+        for (const target of chunk) {
+          await recomputeTrafficDailyAggregate(tx, {
+            agencyId: cleanAgencyId,
+            creatorId: cleanCreatorId,
+            sourceId: target.sourceId,
+            day: target.day,
+          });
+        }
+      },
+      { timeout: 60_000, maxWait: 10_000 }
+    );
   }
 
   return { ok: true, repaired, affectedDays: targets.length, organicMisses, organicConfirmed };
 }
 
-async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, ttlMs = VALUE_SNAPSHOT_TTL_MS, limit = 1000 }) {
+async function selectFanIdsNeedingValueRefresh({
+  agencyId,
+  creatorId,
+  fanIds,
+  ttlMs = VALUE_SNAPSHOT_TTL_MS,
+  limit = 1000,
+}) {
   const uniqueFanIds = Array.from(new Set((fanIds || []).map((x) => clean(x, 180)).filter(Boolean)));
   if (!uniqueFanIds.length) return [];
 
@@ -556,12 +592,6 @@ async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, tt
 
   for (let i = 0; i < uniqueFanIds.length; i += 500) {
     const chunk = uniqueFanIds.slice(i, i + 500);
-    const snapshots = await prisma.trafficFanValueSnapshot.findMany({
-      where: { agencyId, creatorId, fanId: { in: chunk } },
-      select: { fanId: true, fetchedAt: true },
-      take: 10000});
-    const byFan = new Map(snapshots.map((row) => [String(row.fanId), row]));
-
     const dirtyMembers = await prisma.trafficSourceMember.findMany({
       where: {
         agencyId,
@@ -571,10 +601,7 @@ async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, tt
           { needsValueRefresh: true },
           {
             lastRevenueAt: { not: null },
-            OR: [
-              { lastValueFetchedAt: null },
-              { lastValueFetchedAt: { lt: threshold } },
-            ],
+            OR: [{ lastValueFetchedAt: null }, { lastValueFetchedAt: { lt: threshold } }],
           },
         ],
       },
@@ -594,8 +621,16 @@ async function selectFanIdsNeedingValueRefresh({ agencyId, creatorId, fanIds, tt
   return out;
 }
 
-
-async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId, sources = [], members = [], hydrateLimit = 1000, forceHydrate = false }) {
+async function upsertTrafficSourceScan({
+  deviceId,
+  userId,
+  creatorId,
+  accountId,
+  sources = [],
+  members = [],
+  hydrateLimit = 1000,
+  forceHydrate = false,
+}) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
   const agencyId = creator.agencyId;
   const now = new Date();
@@ -722,7 +757,8 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
         creatorId: creator.id,
         OR: chunk.map((item) => ({ sourceType: item.sourceType, externalId: item.externalId })),
       },
-      take: 10000});
+      take: 10000,
+    });
     for (const row of existingSources) {
       sourceMap.set(`${row.sourceType}:${row.externalId}`, row);
     }
@@ -826,15 +862,17 @@ async function upsertTrafficSourceScan({ deviceId, userId, creatorId, accountId,
   };
 }
 
-
 async function upsertTrafficFanValueSnapshots({ deviceId, userId, creatorId, snapshots = [] }) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
   const agencyId = creator.agencyId;
   const now = new Date();
   const rows = uniqueBy(
-    (Array.isArray(snapshots) ? snapshots : []).map(normalizeSnapshot).filter(Boolean).sort((a, b) => {
-      return (Number(asDate(a.fetchedAt)?.getTime() || 0) - Number(asDate(b.fetchedAt)?.getTime() || 0));
-    }),
+    (Array.isArray(snapshots) ? snapshots : [])
+      .map(normalizeSnapshot)
+      .filter(Boolean)
+      .sort((a, b) => {
+        return Number(asDate(a.fetchedAt)?.getTime() || 0) - Number(asDate(b.fetchedAt)?.getTime() || 0);
+      }),
     (row) => row.fanId
   );
 
@@ -945,7 +983,6 @@ async function upsertTrafficFanValueSnapshots({ deviceId, userId, creatorId, sna
   return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted };
 }
 
-
 async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt = null, reason = null } = {}) {
   const cleanFanId = clean(fanId, 180);
   if (!agencyId || !creatorId || !cleanFanId) {
@@ -964,8 +1001,14 @@ async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt
   return { ok: true, matched: updated.count || 0, fanId: cleanFanId, reason: clean(reason, 80) };
 }
 
-
-async function markTrafficFanValueDirtyFromDevice({ deviceId, userId, creatorId, fanId, occurredAt = null, reason = "realtime_revenue" } = {}) {
+async function markTrafficFanValueDirtyFromDevice({
+  deviceId,
+  userId,
+  creatorId,
+  fanId,
+  occurredAt = null,
+  reason = "realtime_revenue",
+} = {}) {
   const { creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
   const dirty = await markTrafficFanValueDirty({
     agencyId: creator.agencyId,
@@ -990,7 +1033,13 @@ async function markTrafficFanValueDirtyFromDevice({ deviceId, userId, creatorId,
   return { ok: true, ...dirty, valueRefresh };
 }
 
-async function getPendingTrafficValueFanIds({ deviceId, userId, creatorId, limit = 1000, ttlMs = VALUE_SNAPSHOT_TTL_MS } = {}) {
+async function getPendingTrafficValueFanIds({
+  deviceId,
+  userId,
+  creatorId,
+  limit = 1000,
+  ttlMs = VALUE_SNAPSHOT_TTL_MS,
+} = {}) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
   const safeLimit = Math.max(1, Math.min(5000, Number(limit || 1000)));
   const threshold = new Date(Date.now() - Math.max(60_000, Number(ttlMs || VALUE_SNAPSHOT_TTL_MS)));
@@ -1003,19 +1052,12 @@ async function getPendingTrafficValueFanIds({ deviceId, userId, creatorId, limit
         { needsValueRefresh: true },
         {
           lastRevenueAt: { not: null },
-          OR: [
-            { lastValueFetchedAt: null },
-            { lastValueFetchedAt: { lt: threshold } },
-          ],
+          OR: [{ lastValueFetchedAt: null }, { lastValueFetchedAt: { lt: threshold } }],
         },
       ],
     },
     select: { fanId: true, lastRevenueAt: true, lastSeenAt: true, updatedAt: true },
-    orderBy: [
-      { lastRevenueAt: "desc" },
-      { lastSeenAt: "desc" },
-      { updatedAt: "desc" },
-    ],
+    orderBy: [{ lastRevenueAt: "desc" }, { lastSeenAt: "desc" }, { updatedAt: "desc" }],
     take: safeLimit * 3,
   });
 
@@ -1041,7 +1083,15 @@ async function getPendingTrafficValueFanIds({ deviceId, userId, creatorId, limit
   };
 }
 
-async function scheduleTrafficValueRefresh({ agencyId, creatorId, accountId = null, creatorRef = null, reason = "traffic_value_dirty", priority = 95, now = new Date() } = {}) {
+async function scheduleTrafficValueRefresh({
+  agencyId,
+  creatorId,
+  accountId = null,
+  creatorRef = null,
+  reason = "traffic_value_dirty",
+  priority = 95,
+  now = new Date(),
+} = {}) {
   if (!agencyId || !creatorId) return { created: false, reason: "missing_scope" };
 
   const cleanAccountId = clean(accountId || creatorId, 180) || creatorId;
@@ -1074,7 +1124,6 @@ async function scheduleTrafficValueRefresh({ agencyId, creatorId, accountId = nu
   });
 }
 
-
 async function ingestSubscriptionEvent({ agencyId: agencyHint, deviceId, userId, creatorId, accountId, event }) {
   const { creator, agencyId, ingestMode } = await resolveTrafficIngestContext({
     agencyId: agencyHint,
@@ -1106,15 +1155,17 @@ async function ingestSubscriptionEvent({ agencyId: agencyHint, deviceId, userId,
     select: { id: true, sourceId: true },
   });
 
-  const eventHash = clean(event?.eventHash, 220) || stableHash([
-    "subscription",
-    agencyId,
-    creator.id,
-    fanId,
-    amountCents,
-    occurredAt.toISOString(),
-    event?.externalEventId || event?.toastId || event?.notificationId || "",
-  ]);
+  const eventHash =
+    clean(event?.eventHash, 220) ||
+    stableHash([
+      "subscription",
+      agencyId,
+      creator.id,
+      fanId,
+      amountCents,
+      occurredAt.toISOString(),
+      event?.externalEventId || event?.toastId || event?.notificationId || "",
+    ]);
 
   const data = {
     agencyId,
@@ -1166,7 +1217,15 @@ async function ingestSubscriptionEvent({ agencyId: agencyHint, deviceId, userId,
       }).catch((err) => ({ ok: false, error: err?.message || String(err) }));
     }
 
-    return { ok: true, ledgerId: created.id, sourceId: created.sourceId, amountCents, attributionRepair, valueRefresh, ingestMode };
+    return {
+      ok: true,
+      ledgerId: created.id,
+      sourceId: created.sourceId,
+      amountCents,
+      attributionRepair,
+      valueRefresh,
+      ingestMode,
+    };
   } catch (err) {
     if (err?.code !== "P2002") throw err;
 
@@ -1187,13 +1246,14 @@ async function ingestSubscriptionEvent({ agencyId: agencyHint, deviceId, userId,
       });
     }
 
-    const attributionRepair = existing && !existing.sourceId
-      ? await repairUnattributedSubscriptionAttribution({
-          agencyId,
-          creatorId: creator.id,
-          fanIds: [existing.fanId],
-        }).catch((err) => ({ ok: false, error: err?.message || String(err), repaired: 0 }))
-      : { ok: true, repaired: 0 };
+    const attributionRepair =
+      existing && !existing.sourceId
+        ? await repairUnattributedSubscriptionAttribution({
+            agencyId,
+            creatorId: creator.id,
+            fanIds: [existing.fanId],
+          }).catch((err) => ({ ok: false, error: err?.message || String(err), repaired: 0 }))
+        : { ok: true, repaired: 0 };
 
     let valueRefresh = null;
     if (existing?.sourceId || attributionRepair?.repaired > 0) {
@@ -1348,7 +1408,15 @@ async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
   };
 }
 
-async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey = "all", limit = 100, offset = 0, onlyPaying = false }) {
+async function getTrafficSourceMembers({
+  userId,
+  creatorId,
+  sourceId,
+  rangeKey = "all",
+  limit = 100,
+  offset = 0,
+  onlyPaying = false,
+}) {
   const { creator } = await assertTrafficViewer({ userId, creatorId });
   const id = clean(sourceId, 180);
   if (!id) {
@@ -1426,7 +1494,12 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
         subscribesSummCents: members.reduce((acc, row) => acc + Number(row.subscribesSummCents || 0), 0),
       },
       members,
-      pagination: { limit: take, offset: skip, returned: members.length, hasMore: skip + members.length < Number(totalCount?.length || 0) },
+      pagination: {
+        limit: take,
+        offset: skip,
+        returned: members.length,
+        hasMore: skip + members.length < Number(totalCount?.length || 0),
+      },
     };
   }
 
@@ -1522,7 +1595,7 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
     const identity = extractMemberIdentity(row.metadata || {});
     const username = identity.username || null;
     const name = identity.name || null;
-    const displayName = username ? `@${username}` : (name || String(row.fanId || ""));
+    const displayName = username ? `@${username}` : name || String(row.fanId || "");
     return {
       fanId: String(row.fanId || ""),
       fanUsername: username,
@@ -1536,7 +1609,11 @@ async function getTrafficSourceMembers({ userId, creatorId, sourceId, rangeKey =
       postsSummCents: dbNumber(row.postsSummCents),
       streamsSummCents: dbNumber(row.streamsSummCents),
       fetchedAt: row.fetchedAt || null,
-      pendingValue: row.needsValueRefresh === true || (!!asDate(row.lastRevenueAt) && (!asDate(row.lastValueFetchedAt) || asDate(row.lastValueFetchedAt) < new Date(Date.now() - VALUE_SNAPSHOT_TTL_MS))),
+      pendingValue:
+        row.needsValueRefresh === true ||
+        (!!asDate(row.lastRevenueAt) &&
+          (!asDate(row.lastValueFetchedAt) ||
+            asDate(row.lastValueFetchedAt) < new Date(Date.now() - VALUE_SNAPSHOT_TTL_MS))),
       firstSeenAt: row.firstSeenAt || null,
       lastSeenAt: row.lastSeenAt || null,
       claimedAt: row.claimedAt || null,
@@ -1782,25 +1859,29 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
       valueStreamsCents: Number(uniqueValue.valueStreamsCents || 0),
       lastValueFetchedAt: uniqueValue.lastValueFetchedAt || null,
     },
-    buckets: Array.from(bucketsByType.values()).sort((a, b) => Number((b.fanValueCents || b.revenueCents) || 0) - Number((a.fanValueCents || a.revenueCents) || 0)),
-    sources: rows.sort((a, b) => Number((b.fanValueCents || b.revenueCents) || 0) - Number((a.fanValueCents || a.revenueCents) || 0)),
-    lastTrafficJob: lastTrafficJob ? {
-      id: lastTrafficJob.id,
-      status: lastTrafficJob.status,
-      attempts: lastTrafficJob.attempts,
-      createdAt: lastTrafficJob.createdAt,
-      claimedAt: lastTrafficJob.claimedAt,
-      completedAt: lastTrafficJob.completedAt,
-      nextRunAt: lastTrafficJob.nextRunAt,
-      leaseUntil: lastTrafficJob.leaseUntil,
-      lastError: lastTrafficJob.lastError,
-      result: lastTrafficJob.result || null,
-      params: lastTrafficJob.params || null,
-    } : null,
+    buckets: Array.from(bucketsByType.values()).sort(
+      (a, b) => Number(b.fanValueCents || b.revenueCents || 0) - Number(a.fanValueCents || a.revenueCents || 0)
+    ),
+    sources: rows.sort(
+      (a, b) => Number(b.fanValueCents || b.revenueCents || 0) - Number(a.fanValueCents || a.revenueCents || 0)
+    ),
+    lastTrafficJob: lastTrafficJob
+      ? {
+          id: lastTrafficJob.id,
+          status: lastTrafficJob.status,
+          attempts: lastTrafficJob.attempts,
+          createdAt: lastTrafficJob.createdAt,
+          claimedAt: lastTrafficJob.claimedAt,
+          completedAt: lastTrafficJob.completedAt,
+          nextRunAt: lastTrafficJob.nextRunAt,
+          leaseUntil: lastTrafficJob.leaseUntil,
+          lastError: lastTrafficJob.lastError,
+          result: lastTrafficJob.result || null,
+          params: lastTrafficJob.params || null,
+        }
+      : null,
   };
 }
-
-
 
 async function recomputeTrafficDailyAggregatesForSource({ agencyId, creatorId, sourceId, chunkSize = 30 } = {}) {
   const cleanSourceId = clean(sourceId, 180);
@@ -1812,24 +1893,28 @@ async function recomputeTrafficDailyAggregatesForSource({ agencyId, creatorId, s
     where: { agencyId, creatorId, sourceId: cleanSourceId },
     select: { day: true },
     orderBy: { day: "desc" },
-    take: 10000});
+    take: 10000,
+  });
 
   let recomputedDays = 0;
   for (const chunk of chunkArray(days, chunkSize)) {
-    await prisma.$transaction(async (tx) => {
-      for (const { day } of chunk) {
-        await recomputeTrafficDailyAggregate(tx, {
-          agencyId,
-          creatorId,
-          sourceId: cleanSourceId,
-          day,
-        });
-        recomputedDays += 1;
+    await prisma.$transaction(
+      async (tx) => {
+        for (const { day } of chunk) {
+          await recomputeTrafficDailyAggregate(tx, {
+            agencyId,
+            creatorId,
+            sourceId: cleanSourceId,
+            day,
+          });
+          recomputedDays += 1;
+        }
+      },
+      {
+        maxWait: 10_000,
+        timeout: 60_000,
       }
-    }, {
-      maxWait: 10_000,
-      timeout: 60_000,
-    });
+    );
   }
 
   return { ok: true, days: days.length, recomputedDays };
@@ -1858,38 +1943,41 @@ async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents,
   // Keep the financial write itself short and atomic. Daily aggregates can span
   // hundreds of days, so recomputing them inside the same transaction can hit
   // Prisma/host transaction timeouts and roll back the actual cost update.
-  const updated = await prisma.$transaction(async (tx) => {
-    const source = await tx.trafficSource.findFirst({
-      where: {
-        id: cleanSourceId,
-        agencyId: creator.agencyId,
-        creatorId: creator.id,
-      },
-      select: {
-        id: true,
-        agencyId: true,
-        creatorId: true,
-        currency: true,
-      },
-    });
+  const updated = await prisma.$transaction(
+    async (tx) => {
+      const source = await tx.trafficSource.findFirst({
+        where: {
+          id: cleanSourceId,
+          agencyId: creator.agencyId,
+          creatorId: creator.id,
+        },
+        select: {
+          id: true,
+          agencyId: true,
+          creatorId: true,
+          currency: true,
+        },
+      });
 
-    if (!source) {
-      const err = new Error("Traffic source not found");
-      err.code = "TRAFFIC_SOURCE_NOT_FOUND";
-      throw err;
+      if (!source) {
+        const err = new Error("Traffic source not found");
+        err.code = "TRAFFIC_SOURCE_NOT_FOUND";
+        throw err;
+      }
+
+      return tx.trafficSource.update({
+        where: { id: source.id },
+        data: {
+          costCents: nextCostCents,
+          currency: clean(currency, 16) || source.currency || "USD",
+        },
+      });
+    },
+    {
+      maxWait: 10_000,
+      timeout: 20_000,
     }
-
-    return tx.trafficSource.update({
-      where: { id: source.id },
-      data: {
-        costCents: nextCostCents,
-        currency: clean(currency, 16) || source.currency || "USD",
-      },
-    });
-  }, {
-    maxWait: 10_000,
-    timeout: 20_000,
-  });
+  );
 
   // TrafficDailyAggregate stores a denormalized costCents copy for fast
   // dashboard reads. Recompute from the ledger source of truth in small
@@ -1928,23 +2016,10 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
   const { creator } = await assertTrafficViewer({ userId, creatorId });
 
   const localAccountId = cleanHint(
-    accountHints.localAccountId ||
-    accountHints.accountId ||
-    accountHints.accountManifestId ||
-    null
+    accountHints.localAccountId || accountHints.accountId || accountHints.accountManifestId || null
   );
-  const remoteId = cleanHint(
-    accountHints.creatorRemoteId ||
-    accountHints.remoteId ||
-    creator.remoteId ||
-    null
-  );
-  const username = cleanHint(
-    accountHints.creatorUsername ||
-    accountHints.username ||
-    creator.username ||
-    null
-  );
+  const remoteId = cleanHint(accountHints.creatorRemoteId || accountHints.remoteId || creator.remoteId || null);
+  const username = cleanHint(accountHints.creatorUsername || accountHints.username || creator.username || null);
 
   const now = new Date();
   const params = {
@@ -1975,9 +2050,13 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
   // so a duplicate manual job is safer than silently reusing stale params.
   if (force === true) {
     const idempotencyKey = buildJobIdempotencyKey({
-      jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY, scope: "creator", creatorId: creator.id, agencyId: creator.agencyId,
+      jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
+      scope: "creator",
+      creatorId: creator.id,
+      agencyId: creator.agencyId,
       params: { manualRefreshAt: params.manualRefreshAt, reason: params.reason },
-      bucketAt: now, bucketMs: 0,
+      bucketAt: now,
+      bucketMs: 0,
     });
     const job = await prisma.jobInstance.upsert({
       where: { idempotencyKey },

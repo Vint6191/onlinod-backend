@@ -23,8 +23,8 @@
 "use strict";
 
 const express = require("express");
-const { z }   = require("zod");
-const prisma  = require("../prisma");
+const { z } = require("zod");
+const prisma = require("../prisma");
 const { scheduleJobNow } = require("../services/job-scheduler");
 
 const router = express.Router();
@@ -33,18 +33,11 @@ function actorUserId(req) {
   return req.auth?.userId || req.user?.id || null;
 }
 
-function actorAgencyId(req) {
-  return req.auth?.agencyId || req.user?.activeAgencyId || req.body?.agencyId || req.query?.agencyId || null;
-}
-
-
 // ════════════════════════════════════════════════════════════
 // Helpers
 // ════════════════════════════════════════════════════════════
 
-const VALID_RANGES = new Set([
-  "24h", "7d", "30d", "90d", "180d", "365d", "ytd", "prev_year", "all",
-]);
+const VALID_RANGES = new Set(["24h", "7d", "30d", "90d", "180d", "365d", "ytd", "prev_year", "all"]);
 
 function validationError(res, err) {
   return res.status(400).json({
@@ -137,29 +130,30 @@ async function loadAgencyAccess(req, res, agencyId) {
   return { agency, member };
 }
 
-
 // ════════════════════════════════════════════════════════════
 // POST /earnings/upsert — chatter machine writes earnings result
 // ════════════════════════════════════════════════════════════
 
 const earningsUpsertSchema = z.object({
-  deviceId:   z.string().min(1),  // who is reporting
-  creatorId:  z.string().min(1),
-  rangeKey:   z.string().refine((v) => VALID_RANGES.has(v), "Invalid rangeKey"),
-  range: z.object({
-    startDate: z.string(),
-    endDate:   z.string(),
-  }).optional(),
+  deviceId: z.string().min(1), // who is reporting
+  creatorId: z.string().min(1),
+  rangeKey: z.string().refine((v) => VALID_RANGES.has(v), "Invalid rangeKey"),
+  range: z
+    .object({
+      startDate: z.string(),
+      endDate: z.string(),
+    })
+    .optional(),
   summary: z.object({
-    total:      z.number(),
-    gross:      z.number().optional(),
-    delta:      z.number().optional(),
-    avgSale:    z.number().optional(),
-    fanLtv:     z.number().optional(),
+    total: z.number(),
+    gross: z.number().optional(),
+    delta: z.number().optional(),
+    avgSale: z.number().optional(),
+    fanLtv: z.number().optional(),
     salesCount: z.number().int().nonnegative(),
     uniqueFans: z.number().int().nonnegative(),
   }),
-  raw:    z.any().optional(),
+  raw: z.any().optional(),
 });
 
 router.post("/earnings/upsert", async (req, res) => {
@@ -186,12 +180,12 @@ router.post("/earnings/upsert", async (req, res) => {
       agencyId: creator.agencyId,
       rangeKey: input.rangeKey,
       rangeStartAt: input.range?.startDate ? new Date(input.range.startDate) : null,
-      rangeEndAt:   input.range?.endDate   ? new Date(input.range.endDate)   : null,
-      totalCents:  Math.round(input.summary.total),
-      grossCents:  Math.round(input.summary.gross || 0),
-      deltaCents:  Math.round(input.summary.delta || 0),
+      rangeEndAt: input.range?.endDate ? new Date(input.range.endDate) : null,
+      totalCents: Math.round(input.summary.total),
+      grossCents: Math.round(input.summary.gross || 0),
+      deltaCents: Math.round(input.summary.delta || 0),
       avgSaleCents: Math.round(input.summary.avgSale || 0),
-      fanLtvCents:  Math.round(input.summary.fanLtv || 0),
+      fanLtvCents: Math.round(input.summary.fanLtv || 0),
       salesCount: input.summary.salesCount,
       uniqueFans: input.summary.uniqueFans,
       raw: input.raw || null,
@@ -205,7 +199,6 @@ router.post("/earnings/upsert", async (req, res) => {
       create: data,
       update: data,
     });
-
 
     return res.json({
       ok: true,
@@ -222,15 +215,14 @@ router.post("/earnings/upsert", async (req, res) => {
   }
 });
 
-
 // ════════════════════════════════════════════════════════════
 // POST /campaigns/upsert
 // ════════════════════════════════════════════════════════════
 
 const campaignsUpsertSchema = z.object({
-  deviceId:  z.string().min(1),
+  deviceId: z.string().min(1),
   creatorId: z.string().min(1),
-  rangeKey:  z.string().optional(),
+  rangeKey: z.string().optional(),
   campaigns: z.array(z.any()).max(2000),
 });
 
@@ -248,11 +240,13 @@ router.post("/campaigns/upsert", async (req, res) => {
     if (!ctx) return;
     const { creator } = ctx;
 
-    let active = 0, claimers = 0, clicks = 0;
+    let active = 0,
+      claimers = 0,
+      clicks = 0;
     for (const c of input.campaigns) {
       if (c?.is_active) active += 1;
       claimers += Number(c?.claimers_count || 0);
-      clicks   += Number(c?.clicks_count   || 0);
+      clicks += Number(c?.clicks_count || 0);
     }
 
     const data = {
@@ -273,7 +267,6 @@ router.post("/campaigns/upsert", async (req, res) => {
       create: data,
       update: data,
     });
-
 
     return res.json({
       ok: true,
@@ -297,7 +290,6 @@ router.post("/campaigns/upsert", async (req, res) => {
     });
   }
 });
-
 
 // ════════════════════════════════════════════════════════════
 // GET /creators/:creatorId/earnings?range=7d
@@ -332,7 +324,6 @@ router.get("/creators/:creatorId/earnings", async (req, res) => {
     return res.status(500).json({ ok: false, code: "EARNINGS_GET_FAILED", error: err?.message || "Failed" });
   }
 });
-
 
 // ════════════════════════════════════════════════════════════
 // GET /creators/:creatorId/campaigns
@@ -373,7 +364,6 @@ router.get("/creators/:creatorId/campaigns", async (req, res) => {
   }
 });
 
-
 // ════════════════════════════════════════════════════════════
 // GET /creators/:creatorId/overview — earnings + campaigns combined
 // ════════════════════════════════════════════════════════════
@@ -398,7 +388,8 @@ router.get("/creators/:creatorId/overview", async (req, res) => {
       prisma.creatorEarningsSnapshot.findMany({
         where: { creatorId: ctx.creator.id },
         select: { rangeKey: true, capturedAt: true, totalCents: true },
-        take: 10000}),
+        take: 10000,
+      }),
     ]);
 
     return res.json({
@@ -430,7 +421,6 @@ router.get("/creators/:creatorId/overview", async (req, res) => {
   }
 });
 
-
 // ════════════════════════════════════════════════════════════
 // GET /agencies/:agencyId/earnings/summary?range=7d
 // — Aggregated view for owner dashboard.
@@ -452,7 +442,8 @@ router.get("/agencies/:agencyId/earnings/summary", async (req, res) => {
         creator: { select: { id: true, displayName: true, username: true, avatarUrl: true, status: true } },
       },
       orderBy: { totalCents: "desc" },
-      take: 10000});
+      take: 10000,
+    });
 
     let totalCents = 0n;
     let salesCount = 0;
@@ -489,7 +480,6 @@ router.get("/agencies/:agencyId/earnings/summary", async (req, res) => {
   }
 });
 
-
 // ════════════════════════════════════════════════════════════
 // POST /creators/:creatorId/refresh — owner clicks "refresh now"
 // Bumps priority + nextRunAt for all jobs of this creator.
@@ -510,12 +500,22 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
     const now = new Date();
     const [earnings, campaigns] = await Promise.all([
       scheduleJobNow({
-        jobKey: "fetch_earnings", creatorId: creator.id, agencyId: creator.agencyId,
-        params: { rangeKey: range }, priority: 100, now, bucketMs: 60_000,
+        jobKey: "fetch_earnings",
+        creatorId: creator.id,
+        agencyId: creator.agencyId,
+        params: { rangeKey: range },
+        priority: 100,
+        now,
+        bucketMs: 60_000,
       }),
       scheduleJobNow({
-        jobKey: "fetch_campaigns", creatorId: creator.id, agencyId: creator.agencyId,
-        params: { rangeKey: range }, priority: 100, now, bucketMs: 60_000,
+        jobKey: "fetch_campaigns",
+        creatorId: creator.id,
+        agencyId: creator.agencyId,
+        params: { rangeKey: range },
+        priority: 100,
+        now,
+        bucketMs: 60_000,
       }),
     ]);
 
@@ -537,16 +537,16 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         { id: earnings.job.id, jobKey: "fetch_earnings", rangeKey: range, reason: earnings.reason },
         { id: campaigns.job.id, jobKey: "fetch_campaigns", rangeKey: range, reason: campaigns.reason },
       ],
-      message: onlineBindings === 0
-        ? "Jobs scheduled, but no READY desktop binding currently sees this creator."
-        : `Jobs scheduled. ${onlineBindings} READY worker binding(s) can pick them up.`,
+      message:
+        onlineBindings === 0
+          ? "Jobs scheduled, but no READY desktop binding currently sees this creator."
+          : `Jobs scheduled. ${onlineBindings} READY worker binding(s) can pick them up.`,
     });
   } catch (err) {
     console.error("[stats/refresh-creator] failed:", err);
     return res.status(500).json({ ok: false, code: "REFRESH_FAILED", error: err?.message || "Failed" });
   }
 });
-
 
 // ════════════════════════════════════════════════════════════
 // POST /agencies/:agencyId/refresh — owner clicks "refresh all creators"
@@ -601,7 +601,5 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
     return res.status(500).json({ ok: false, code: "AGENCY_REFRESH_FAILED", error: err?.message || "Failed" });
   }
 });
-
-
 
 module.exports = router;

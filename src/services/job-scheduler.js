@@ -28,6 +28,7 @@
 const prisma = require("../prisma");
 const { runRetentionSweep, getRetentionSettings } = require("./retention-service");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
+const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -146,6 +147,17 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   });
   if (trafficDecision.created) created.push("traffic_sources_scan");
   else skipped.push("traffic_sources_scan");
+
+  // 4. Subscriber Directory — one shared weekly source for Hidden Online,
+  // Follow Back candidates and future subscriber-driven modules.
+  const subscriberDecision = await ensureSubscriberScanDue({
+    agencyId,
+    creatorId,
+    priority: Math.max(5, priority - 30),
+    now,
+  });
+  if (subscriberDecision.created) created.push("subscriber_directory_scan");
+  else skipped.push("subscriber_directory_scan");
 
   return { created, skipped };
 }

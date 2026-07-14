@@ -6,9 +6,7 @@ function createDeliveryHelpers(deps = {}) {
     automationServer,
     cleanString,
     optionalString,
-    jsonArray,
     jsonObject,
-    centsFromAny,
     positiveInt,
   } = deps;
 
@@ -155,7 +153,9 @@ function createDeliveryHelpers(deps = {}) {
           metadata: meta,
         },
       });
-    } catch (_) {}
+    } catch {
+      // Telemetry is best-effort and must never break automation delivery writes.
+    }
   }
 
   function compactTemplateIds(values = [], next = null, max = 50) {
@@ -465,7 +465,7 @@ function createDeliveryHelpers(deps = {}) {
         leaseRejectedReason: "claimed/reserved status requires claimedByDeviceId and claimUntil",
       });
       if (AUTOMATION_CANCEL_CLAIM_STATUSES.has(status)) next.status = "pending_reply";
-      else if (AUTOMATION_HIDDEN_SCAN_CLAIM_STATUSES.has(status)) next.status = "hidden_scan_queued";
+      else if (AUTOMATION_HIDDEN_SCAN_CLAIM_STATUSES.has(status)) next.status = "canceled";
       else next.status = "online_queued";
       next.claimedByDeviceId = null;
       next.claimedAt = null;
@@ -617,9 +617,8 @@ function createDeliveryHelpers(deps = {}) {
     return { ok: true, compacted: false, terminal: true, status: terminalStatus, item: item ? mapAutomationDelivery(item) : null, stat, alreadyCounted };
   }
 
-  async function repairAutomationDeliveries({ agencyId, creatorId, now = new Date(), timeoutSec = 180 } = {}) {
+  async function repairAutomationDeliveries({ agencyId, creatorId, now = new Date() } = {}) {
     const cid = cleanString(creatorId, 100);
-    const staleBefore = new Date(now.getTime() - Math.max(30, Number(timeoutSec) || 180) * 1000);
     const report = { repairedOnlineClaims: 0, repairedCancelClaims: 0, repairedHiddenScanClaims: 0, fixedQueuedWithMessageId: 0, fixedPendingWithoutMessageId: 0 };
 
     const online = await prisma.automationDelivery.updateMany({
@@ -660,24 +659,9 @@ function createDeliveryHelpers(deps = {}) {
     }).catch(() => ({ count: 0 }));
     report.repairedCancelClaims = cancel.count || 0;
 
-    const scan = await prisma.automationDelivery.updateMany({
-      where: {
-        agencyId,
-        creatorId: cid,
-        trigger: "hidden_online_scan",
-        status: "hidden_scan_claimed",
-        OR: [{ claimUntil: { lt: now } }, { claimUntil: null }, { claimedByDeviceId: null }, { updatedAt: { lt: staleBefore } }],
-      },
-      data: {
-        status: "hidden_scan_queued",
-        claimedByDeviceId: null,
-        claimedAt: null,
-        claimUntil: null,
-        lastCheckedAt: now,
-        error: "stale hidden scan claim repaired; returned to queue",
-      },
-    }).catch(() => ({ count: 0 }));
-    report.repairedHiddenScanClaims = scan.count || 0;
+    // Legacy Hidden Online scan deliveries are retired by the P9 migration.
+    // Never resurrect them into a second subscriber scanner.
+    report.repairedHiddenScanClaims = 0;
 
     const queuedWithMessage = await prisma.automationDelivery.updateMany({
       where: { agencyId, creatorId: cid, status: "online_queued", messageId: { not: null } },
@@ -778,7 +762,7 @@ function createDeliveryHelpers(deps = {}) {
             result: { onlineGate: !isHiddenGate, hiddenGate: isHiddenGate, gateScope, nextAllowedAt: now.toISOString() },
           },
         });
-      } catch (_) {
+      } catch {
         row = await tx.automationDelivery.findUnique({ where: { id } }).catch(() => null);
       }
     }

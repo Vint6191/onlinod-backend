@@ -2,7 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
-const { applyJobResult, recordJobFailure } = require("./job-result-service");
+const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-result-service");
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
@@ -214,6 +214,43 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   const updated = await prisma.jobInstance.findUnique({ where: { id: job.id } });
   return { id: updated.id, status: updated.status, leaseUntil: updated.leaseUntil, leaseRevision: updated.leaseRevision, progress: updated.progress, continuation: updated.continuation };
 }
+async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation, chunkResult }) {
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
+  const now = new Date();
+  const tokenHash = hashToken(leaseToken);
+  return prisma.$transaction(async (tx) => {
+    const updatedFence = await tx.jobInstance.updateMany({
+      where: {
+        id: job.id,
+        status: "CLAIMED",
+        claimedByDeviceId: deviceId,
+        leaseTokenHash: tokenHash,
+        leaseRevision,
+        leaseUntil: { gt: now },
+      },
+      data: {
+        leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
+        workId: clean(workId, 200) || job.workId,
+        progress: safeProgress(progress) ?? job.progress,
+        continuation: continuation === undefined ? job.continuation : continuation,
+        lastProgressAt: now,
+      },
+    });
+    if (!updatedFence.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before progress");
+    const sideEffect = await applyJobChunk({ db: tx, job, deviceId, userId, chunkResult });
+    const updated = await tx.jobInstance.findUnique({ where: { id: job.id } });
+    return {
+      id: updated.id,
+      status: updated.status,
+      leaseUntil: updated.leaseUntil,
+      leaseRevision: updated.leaseRevision,
+      progress: updated.progress,
+      continuation: updated.continuation,
+      sideEffect,
+    };
+  });
+}
+
 async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, result, progress }) {
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
   const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
@@ -248,7 +285,11 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
     data,
   });
   if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before failure report");
-  try { await recordJobFailure({ job, error: errorText }); } catch (_) {}
+  try {
+    await recordJobFailure({ job, error: errorText, terminal });
+  } catch {
+    // Failure projection is best-effort after the fenced job transition succeeds.
+  }
   return { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", terminal, retryAt: terminal ? null : data.nextRunAt };
 }
 
@@ -278,4 +319,4 @@ async function releaseJob({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before release");
   return { id: job.id, status: "SCHEDULED", retryAt: new Date(now.getTime() + delay), attempts: job.attempts };
 }
-module.exports = { JobLeaseError, claimJob, renewLease, completeJob, failJob, releaseJob, sweepExpiredLeases };
+module.exports = { JobLeaseError, claimJob, renewLease, progressJob, completeJob, failJob, releaseJob, sweepExpiredLeases };

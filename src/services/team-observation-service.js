@@ -5,10 +5,7 @@ const prisma = require("../prisma");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { upsertPurchaseFromEvent } = require("./team-ppv-ledger-service");
 const { ingestTipEvent } = require("./team-tip-ledger-service");
-const {
-  ingestSubscriptionEvent,
-  markTrafficFanValueDirty,
-} = require("./traffic-service");
+const { ingestSubscriptionEvent, markTrafficFanValueDirty } = require("./traffic-service");
 
 const CATCHUP_JOB_KEY = "catchup_notifications_scan";
 const DEFAULT_BUFFER_MS = 2 * 60 * 60 * 1000;
@@ -40,33 +37,35 @@ function maxDate(...values) {
   return best;
 }
 
-function minDate(...values) {
-  let best = null;
-  for (const value of values) {
-    const d = dateOrNull(value);
-    if (!d) continue;
-    if (!best || d.getTime() < best.getTime()) best = d;
-  }
-  return best;
-}
-
 function amountCents(value) {
   if (value === null || value === undefined || value === "") return 0;
-  const n = Number(String(value).replace(/[^0-9.,-]/g, "").replace(",", "."));
+  const n = Number(
+    String(value)
+      .replace(/[^0-9.,-]/g, "")
+      .replace(",", ".")
+  );
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.round(n));
 }
 
 function amountDollarsToCents(value) {
   if (value === null || value === undefined || value === "") return 0;
-  const n = Number(String(value).replace(/[^0-9.,-]/g, "").replace(",", "."));
+  const n = Number(
+    String(value)
+      .replace(/[^0-9.,-]/g, "")
+      .replace(",", ".")
+  );
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.round(n * 100));
 }
 
 function stableHashSeed(value) {
   let raw = "";
-  try { raw = JSON.stringify(value); } catch (_) { raw = String(value || ""); }
+  try {
+    raw = JSON.stringify(value);
+  } catch {
+    raw = String(value || "");
+  }
   return `ppv_${crypto.createHash("sha1").update(raw).digest("hex").slice(0, 24)}`;
 }
 
@@ -105,7 +104,18 @@ async function findActiveCatchupJob({ agencyId, creatorId }) {
   });
 }
 
-async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, deviceId, from, to, types = ["purchases", "tips", "subscriptions"], reason = "offline_gap", now = new Date() }) {
+async function scheduleCatchupJob({
+  agencyId,
+  creatorId,
+  accountId,
+  creatorRef,
+  deviceId,
+  from,
+  to,
+  types = ["purchases", "tips", "subscriptions"],
+  reason = "offline_gap",
+  now = new Date(),
+}) {
   const active = await findActiveCatchupJob({ agencyId, creatorId });
   if (active) return { created: false, reason: "already_in_flight", jobId: active.id };
 
@@ -117,11 +127,7 @@ async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, 
     where: {
       agencyId,
       creatorId,
-      OR: [
-        { lockedUntil: null },
-        { lockedUntil: { lt: now } },
-        { currentScanStatus: { in: ["idle", "error"] } },
-      ],
+      OR: [{ lockedUntil: null }, { lockedUntil: { lt: now } }, { currentScanStatus: { in: ["idle", "error"] } }],
     },
     data: {
       currentScanStatus: "queued",
@@ -129,20 +135,23 @@ async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, 
       currentScanTo: to,
       currentScanTypes: types,
       lockedByDeviceId: clean(deviceId, 160),
-      lockedUntil,
+      lockedUntil: lockUntil,
       lastErrorCode: null,
       lastErrorAt: null,
     },
   });
 
   if (locked.count === 0) {
-    const state = await prisma.teamObservationState.findUnique({
-      where: { agencyId_creatorId: { agencyId, creatorId } },
-      select: { currentScanStatus: true, lockedUntil: true, lockedByDeviceId: true },
-    }).catch(() => null);
+    const state = await prisma.teamObservationState
+      .findUnique({
+        where: { agencyId_creatorId: { agencyId, creatorId } },
+        select: { currentScanStatus: true, lockedUntil: true, lockedByDeviceId: true },
+      })
+      .catch(() => null);
     return { created: false, reason: "state_locked", state };
   }
 
+  let idempotencyKey = null;
   try {
     const params = {
       accountId: accountId || creatorId,
@@ -154,10 +163,14 @@ async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, 
       bufferMinutes: Math.round(DEFAULT_BUFFER_MS / 60000),
       requestedByDeviceId: deviceId || null,
     };
-    const idempotencyKey = buildJobIdempotencyKey({
-      jobKey: CATCHUP_JOB_KEY, scope: "creator", creatorId, agencyId,
+    idempotencyKey = buildJobIdempotencyKey({
+      jobKey: CATCHUP_JOB_KEY,
+      scope: "creator",
+      creatorId,
+      agencyId,
       params: { from: params.from, to: params.to, types: params.types },
-      bucketAt: from, bucketMs: 0,
+      bucketAt: from,
+      bucketMs: 0,
     });
     const job = await prisma.jobInstance.create({
       data: {
@@ -176,34 +189,43 @@ async function scheduleCatchupJob({ agencyId, creatorId, accountId, creatorRef, 
   } catch (err) {
     if (err?.code === "P2002") {
       const existing = await prisma.jobInstance.findUnique({ where: { idempotencyKey } }).catch(() => null);
-      await prisma.teamObservationState.updateMany({
-        where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
-        data: {
-          currentScanStatus: existing?.status === "DONE" ? "idle" : "queued",
-          lockedByDeviceId: null,
-          lockedUntil: null,
-          lastErrorCode: null,
-          lastErrorAt: null,
-        },
-      }).catch(() => null);
+      await prisma.teamObservationState
+        .updateMany({
+          where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
+          data: {
+            currentScanStatus: existing?.status === "DONE" ? "idle" : "queued",
+            lockedByDeviceId: null,
+            lockedUntil: null,
+            lastErrorCode: null,
+            lastErrorAt: null,
+          },
+        })
+        .catch(() => null);
       return { created: false, reason: "idempotency_race", jobId: existing?.id || null };
     }
-    await prisma.teamObservationState.updateMany({
-      where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
-      data: {
-        currentScanStatus: "error",
-        lockedByDeviceId: null,
-        lockedUntil: null,
-        lastErrorCode: clean(err?.message || err, 500) || "catchup_schedule_failed",
-        lastErrorAt: new Date(),
-      },
-    }).catch(() => null);
+    await prisma.teamObservationState
+      .updateMany({
+        where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
+        data: {
+          currentScanStatus: "error",
+          lockedByDeviceId: null,
+          lockedUntil: null,
+          lastErrorCode: clean(err?.message || err, 500) || "catchup_schedule_failed",
+          lastErrorAt: new Date(),
+        },
+      })
+      .catch(() => null);
     throw err;
   }
 }
 
 function computeCatchupWindow(prev, now = new Date()) {
-  const lastObserved = maxDate(prev?.lastObservedAt, prev?.lastRealtimeEventAt, prev?.lastHeartbeatAt, prev?.lastSuccessfulScanAt);
+  const lastObserved = maxDate(
+    prev?.lastObservedAt,
+    prev?.lastRealtimeEventAt,
+    prev?.lastHeartbeatAt,
+    prev?.lastSuccessfulScanAt
+  );
   const firstRun = !prev || !lastObserved;
   const gapMs = lastObserved ? now.getTime() - lastObserved.getTime() : DEFAULT_BUFFER_MS;
   if (!firstRun && gapMs < DEFAULT_OFFLINE_GAP_MS) {
@@ -228,12 +250,18 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
   const creator = await resolveCreatorForObservation({ agencyId, account });
   if (!creator?.id) return { ok: false, code: "CREATOR_NOT_FOUND" };
 
-  const accountId = clean(account?.accountId || account?.creatorId || account?.backendCreatorId || creator.id, 160) || creator.id;
-  const creatorRef = clean(account?.username || creator.username || account?.displayName || creator.displayName || null, 160);
+  const accountId =
+    clean(account?.accountId || account?.creatorId || account?.backendCreatorId || creator.id, 160) || creator.id;
+  const creatorRef = clean(
+    account?.username || creator.username || account?.displayName || creator.displayName || null,
+    160
+  );
 
-  const prev = await prisma.teamObservationState.findUnique({
-    where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
-  }).catch(() => null);
+  const prev = await prisma.teamObservationState
+    .findUnique({
+      where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
+    })
+    .catch(() => null);
 
   const window = computeCatchupWindow(prev, now);
   const scanTypes = ["purchases", "tips", "subscriptions"];
@@ -269,12 +297,20 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
       reason: window.reason,
       now,
     });
-    state = await prisma.teamObservationState.findUnique({
-      where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
-    }).catch(() => state);
+    state = await prisma.teamObservationState
+      .findUnique({
+        where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
+      })
+      .catch(() => state);
   }
 
-  return { ok: true, creatorId: creator.id, accountId, state, catchup: window.needed ? { ...window, scheduled } : { needed: false } };
+  return {
+    ok: true,
+    creatorId: creator.id,
+    accountId,
+    state,
+    catchup: window.needed ? { ...window, scheduled } : { needed: false },
+  };
 }
 
 async function updateObservationFromHeartbeat({ agencyId, deviceId, accounts = [] }) {
@@ -299,13 +335,16 @@ async function updateObservationFromHeartbeat({ agencyId, deviceId, accounts = [
   };
 }
 
-
 async function recordRealtimeObservationPing({ agencyId, deviceId, account, now = new Date() }) {
   const creator = await resolveCreatorForObservation({ agencyId, account });
   if (!creator?.id) return { ok: false, code: "CREATOR_NOT_FOUND" };
 
-  const accountId = clean(account?.accountId || account?.creatorId || account?.backendCreatorId || creator.id, 160) || creator.id;
-  const creatorRef = clean(account?.username || creator.username || account?.displayName || creator.displayName || null, 160);
+  const accountId =
+    clean(account?.accountId || account?.creatorId || account?.backendCreatorId || creator.id, 160) || creator.id;
+  const creatorRef = clean(
+    account?.username || creator.username || account?.displayName || creator.displayName || null,
+    160
+  );
 
   const state = await prisma.teamObservationState.upsert({
     where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
@@ -370,7 +409,6 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     return dirty;
   };
 
-
   for (const raw of events) {
     const ev = normalizeEvent(raw);
     const type = String(ev.type || ev.eventType || "").toLowerCase();
@@ -393,7 +431,9 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
           extra: {
             // Scanner already canonicalizes purchaseId to match realtime. Keep
             // notificationId first as a final backend guard for old scanner builds.
-            purchaseId: clean(ev.notificationId || ev.purchaseId || ev.transactionId || ev.localId || null, 220) || stableHashSeed([accountId, ev.messageId, ev.fanId, ev.amountCents, ev.occurredAt]),
+            purchaseId:
+              clean(ev.notificationId || ev.purchaseId || ev.transactionId || ev.localId || null, 220) ||
+              stableHashSeed([accountId, ev.messageId, ev.fanId, ev.amountCents, ev.occurredAt]),
             notificationId: clean(ev.notificationId, 220),
             messageId: clean(ev.messageId, 160),
             dialogId: clean(ev.dialogId || ev.fanId, 160),
@@ -501,7 +541,13 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     lockedUntil: null,
     lastSuccessfulScanAt: now,
     lastObservedAt: maxDate(scanTo, now),
-    lastScanSummary: { ...summary, jobId: job.id, from: params.from || null, to: params.to || null, scanner: result?.scanner || null },
+    lastScanSummary: {
+      ...summary,
+      jobId: job.id,
+      from: params.from || null,
+      to: params.to || null,
+      scanner: result?.scanner || null,
+    },
     lastErrorCode: null,
     lastErrorAt: null,
     ...(types.includes("purchases") ? { lastPurchaseScanTo: scanTo } : {}),

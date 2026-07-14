@@ -4,6 +4,13 @@ const prisma = require("../prisma");
 const { applyPresenceJobResult } = require("./presence-service");
 const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("./team-observation-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
+const {
+  SUBSCRIBER_DIRECTORY_JOB_KEY,
+  applySubscriberScanChunk,
+  applySubscriberScanCompletion,
+  recordSubscriberScanFailure,
+  cleanupSubscriberScanHistory,
+} = require("./subscriber-directory-service");
 
 const EARNINGS_JOB_KEY = "fetch_earnings";
 const CAMPAIGNS_JOB_KEY = "fetch_campaigns";
@@ -110,18 +117,34 @@ async function applyTrafficResult({ job, deviceId, userId, result }) {
   return { type: "traffic", ...asObject(applied) };
 }
 
+async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
+  if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
+    return applySubscriberScanChunk({ db, job, deviceId, userId, chunkResult });
+  }
+  if (chunkResult !== undefined && chunkResult !== null) {
+    throw new Error(`No backend chunk applier registered for ${job.jobKey}`);
+  }
+  return null;
+}
+
 async function applyJobResult({ job, deviceId, userId, result }) {
   if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ job, deviceId, userId, result });
   if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ job, deviceId, userId, result });
   if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ job, deviceId, userId, result });
   if (job.jobKey === PRESENCE_JOB_KEY) return applyPresenceJobResult({ job, deviceId, result: result || {} });
   if (job.jobKey === CATCHUP_JOB_KEY) return applyCatchupJobResult({ job, deviceId, userId, result: result || {} });
+  if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
+    const applied = await applySubscriberScanCompletion({ job, deviceId, userId, result: result || {} });
+    cleanupSubscriberScanHistory({ creatorId: job.creatorId }).catch(() => null);
+    return applied;
+  }
   throw new Error(`No backend result applier registered for ${job.jobKey}`);
 }
 
-async function recordJobFailure({ job, error }) {
+async function recordJobFailure({ job, error, terminal = true }) {
   if (job.jobKey === CATCHUP_JOB_KEY) return recordCatchupJobFailure({ job, error });
+  if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) return recordSubscriberScanFailure({ job, error, terminal });
   return null;
 }
 
-module.exports = { EARNINGS_JOB_KEY, CAMPAIGNS_JOB_KEY, applyJobResult, recordJobFailure };
+module.exports = { EARNINGS_JOB_KEY, CAMPAIGNS_JOB_KEY, applyJobChunk, applyJobResult, recordJobFailure };

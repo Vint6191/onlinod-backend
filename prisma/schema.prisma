@@ -118,6 +118,8 @@ model Agency {
   automationDeliveries AutomationDelivery[]
   automationBumpFanStates AutomationBumpFanState[]
   hiddenOnlineUsers HiddenOnlineUser[]
+  subscriberScanRuns SubscriberScanRun[]
+  subscriberDirectoryStates SubscriberDirectoryState[]
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
@@ -200,6 +202,8 @@ model CreatorAccount {
   automationDeliveries AutomationDelivery[]
   automationBumpFanStates AutomationBumpFanState[]
   hiddenOnlineUsers HiddenOnlineUser[]
+  subscriberScanRuns SubscriberScanRun[]
+  subscriberDirectoryStates SubscriberDirectoryState[]
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
@@ -1640,6 +1644,114 @@ model AutomationBumpFanState {
   @@index([agencyId])
   @@index([creatorId, updatedAt])
   @@index([lastSentAt])
+}
+
+model SubscriberScanRun {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  jobId           String?  @unique
+  mode            String   @default("full")
+  sourceType      String   @default("all")
+  status          String   @default("QUEUED") // QUEUED | RUNNING | PUBLISHED | FAILED | SUPERSEDED
+  pageLimit       Int      @default(100)
+  nextOffset      Int      @default(0)
+  scannedCount    Int      @default(0)
+  pageCount       Int      @default(0)
+  hiddenCount     Int      @default(0)
+  hasMore         Boolean?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  publishedAt     DateTime?
+  lastError       String?
+  summary         Json     @default("{}")
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  pages   SubscriberScanPage[]
+  items   SubscriberScanItem[]
+
+  @@index([agencyId, creatorId, status])
+  @@index([creatorId, createdAt])
+  @@index([status, updatedAt])
+}
+
+model SubscriberScanPage {
+  id          String   @id @default(cuid())
+  runId       String
+  offset      Int
+  nextOffset  Int
+  itemCount   Int      @default(0)
+  hiddenCount Int      @default(0)
+  hasMore     Boolean
+  contentHash String
+  receivedAt  DateTime @default(now())
+
+  run SubscriberScanRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, offset])
+  @@index([runId, receivedAt])
+}
+
+model SubscriberScanItem {
+  id                    String   @id @default(cuid())
+  runId                 String
+  agencyId              String
+  creatorId             String
+  fanId                 String
+  dialogId              String?
+  username              String?
+  name                  String?
+  avatarUrl             String?
+  totalSpentCents       Int      @default(0)
+  lastSeenAt            DateTime?
+  lastSeenIsNull        Boolean  @default(false)
+  canReceiveChatMessage Boolean?
+  isActive              Boolean?
+  subscribedOn          Boolean?
+  subscribedBy          Boolean?
+  subscriptionType      String?
+  contentHash           String
+  metadata              Json     @default("{}")
+  observedAt            DateTime @default(now())
+
+  run SubscriberScanRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, fanId])
+  @@index([runId, lastSeenIsNull])
+  @@index([creatorId, fanId])
+  @@index([agencyId, creatorId])
+}
+
+model SubscriberDirectoryState {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String   @unique
+  currentRunId    String?
+  previousRunId   String?
+  lastJobId       String?
+  status          String   @default("EMPTY") // EMPTY | SCANNING | READY | FAILED
+  scanEveryDays   Int      @default(7)
+  nextScanAt      DateTime?
+  publishedAt     DateTime?
+  totalCount      Int      @default(0)
+  hiddenCount     Int      @default(0)
+  addedCount      Int      @default(0)
+  changedCount    Int      @default(0)
+  disappearedCount Int    @default(0)
+  summary         Json     @default("{}")
+  lastError       String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, status])
+  @@index([nextScanAt])
 }
 
 model HiddenOnlineUser {

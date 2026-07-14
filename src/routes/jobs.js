@@ -7,6 +7,7 @@ const {
   JobLeaseError,
   claimJob,
   renewLease,
+  progressJob,
   completeJob,
   failJob,
   releaseJob,
@@ -66,6 +67,7 @@ const leaseMutationSchema = z.object({
   workId: workIdSchema,
   progress: progressSchema,
   continuation: z.unknown().optional(),
+  chunkResult: z.unknown().optional(),
 });
 
 const completeSchema = z.object({
@@ -137,7 +139,7 @@ router.post("/:id/lease/renew", async (req, res, next) => {
 router.post("/:id/progress", async (req, res, next) => {
   try {
     const input = leaseMutationSchema.parse(req.body);
-    const lease = await renewLease({
+    const lease = await progressJob({
       jobId: req.params.id,
       userId: actorUserId(req),
       deviceId: input.deviceId,
@@ -147,6 +149,7 @@ router.post("/:id/progress", async (req, res, next) => {
       workId: input.workId,
       progress: input.progress,
       continuation: input.continuation,
+      chunkResult: input.chunkResult,
     });
     return res.json({ ok: true, lease });
   } catch (error) {
