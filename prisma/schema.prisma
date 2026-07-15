@@ -119,6 +119,8 @@ model Agency {
   automationControls AutomationControlState[]
   followBackCandidates FollowBackCandidate[]
   automationBumpFanStates AutomationBumpFanState[]
+  automationContentCandidates AutomationContentCandidate[]
+  automationContentDiscoveryStates AutomationContentDiscoveryState[]
   hiddenOnlineUsers HiddenOnlineUser[]
   subscriberScanRuns SubscriberScanRun[]
   subscriberDirectoryStates SubscriberDirectoryState[]
@@ -205,6 +207,8 @@ model CreatorAccount {
   automationControls AutomationControlState[]
   followBackCandidates FollowBackCandidate[]
   automationBumpFanStates AutomationBumpFanState[]
+  automationContentCandidates AutomationContentCandidate[]
+  automationContentDiscoveryStates AutomationContentDiscoveryState[]
   hiddenOnlineUsers HiddenOnlineUser[]
   subscriberScanRuns SubscriberScanRun[]
   subscriberDirectoryStates SubscriberDirectoryState[]
@@ -1744,6 +1748,74 @@ model AutomationBumpFanState {
   @@index([creatorId, pendingCancelAt])
   @@index([creatorId, cooldownUntil])
   @@index([creatorId, lastOnlineAt])
+}
+
+model AutomationContentCandidate {
+  id                  String   @id @default(cuid())
+  agencyId            String
+  creatorId           String
+  ownerFanId          String
+  contentId           String
+  contentType         String   @default("post")
+  username            String?
+  displayName         String?
+  avatarUrl           String?
+  source              String   @default("subscriber_directory")
+  publishedAt         DateTime?
+  discoveredAt        DateTime @default(now())
+  lastSeenAt          DateTime @default(now())
+  canToggleFavorite   Boolean?
+  canViewMedia        Boolean?
+  isFavorite          Boolean?
+  state               String   @default("DISCOVERED")
+  eligibilityReason   String?
+  skipReason          String?
+  generation          Int      @default(1)
+  cooldownUntil       DateTime?
+  snapshotRunId       String?
+  latestDeliveryId    String?
+  latestActionType    String?
+  latestStatus        String?
+  latestError         String?
+  metadata            Json     @default("{}")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, contentType, contentId])
+  @@index([agencyId, creatorId, state])
+  @@index([creatorId, ownerFanId])
+  @@index([creatorId, publishedAt])
+  @@index([creatorId, cooldownUntil])
+  @@index([snapshotRunId])
+}
+
+model AutomationContentDiscoveryState {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  ownerFanId      String
+  sourceKey       String   @default("fan_posts")
+  snapshotRunId   String?
+  status          String   @default("DISCOVERED")
+  contentCount    Int      @default(0)
+  sourceErrors    Json     @default("[]")
+  lastScannedAt   DateTime?
+  lastSuccessAt   DateTime?
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, ownerFanId, sourceKey])
+  @@index([agencyId, creatorId, status])
+  @@index([creatorId, snapshotRunId])
+  @@index([creatorId, lastSuccessAt])
+  @@index([creatorId, lastScannedAt])
 }
 
 model SubscriberScanRun {

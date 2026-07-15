@@ -6,6 +6,7 @@ const JOB_CATALOG = Object.freeze({
   traffic_sources_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
   catchup_notifications_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
   subscriber_directory_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
+  likes_content_discovery: Object.freeze({ wave: "read-only", scope: "creator" }),
 });
 
 const CLAIMABLE_DESKTOP_JOB_KEYS = Object.freeze(Object.keys(JOB_CATALOG));

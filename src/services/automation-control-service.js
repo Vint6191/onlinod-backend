@@ -4,7 +4,8 @@ const prisma = require("../prisma");
 
 const FOLLOW_BACK_MODULE_KEY = "follow_back";
 const BUMPS_MODULE_KEY = "bumps";
-const SUPPORTED_MODULE_KEYS = new Set([FOLLOW_BACK_MODULE_KEY, BUMPS_MODULE_KEY]);
+const { LIKES_MODULE_KEY, LIKES_DISCOVERY_JOB_KEY } = require("./likes-constants");
+const SUPPORTED_MODULE_KEYS = new Set([FOLLOW_BACK_MODULE_KEY, BUMPS_MODULE_KEY, LIKES_MODULE_KEY]);
 const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"];
 const QUEUED_DELIVERY_STATUSES = ["QUEUED", "RETRY_SCHEDULED"];
 
@@ -54,6 +55,27 @@ const DEFAULT_BUMP_SETTINGS = Object.freeze({
   candidateBatchSize: 50,
   verifyRecentMessagesLimit: 20,
 });
+const DEFAULT_LIKES_SETTINGS = Object.freeze({
+  enabled: false,
+  automatic: false,
+  activeSubscribers: true,
+  freeSubscribers: true,
+  paidSubscribers: true,
+  expiredSubscribers: false,
+  dailyLimit: 100,
+  minimumIntervalMs: 8_000,
+  maximumIntervalMs: 35_000,
+  randomJitter: true,
+  maxAttempts: 3,
+  postsPerFanMin: 1,
+  postsPerFanMax: 3,
+  discoveryPostLimit: 10,
+  contentMaxAgeDays: 90,
+  discoveryBatchSize: 50,
+  discoveryFreshnessHours: 24,
+  onlyUnliked: true,
+});
+
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -141,9 +163,38 @@ function normalizeBumpSettings(value) {
   };
 }
 
+function normalizeLikesSettings(value) {
+  const input = object(value);
+  const minimumIntervalMs = int(input.minimumIntervalMs, DEFAULT_LIKES_SETTINGS.minimumIntervalMs, 3_000, 30 * 60_000);
+  const maximumIntervalMs = int(input.maximumIntervalMs, DEFAULT_LIKES_SETTINGS.maximumIntervalMs, minimumIntervalMs, 60 * 60_000);
+  const postsPerFanMin = int(input.postsPerFanMin, DEFAULT_LIKES_SETTINGS.postsPerFanMin, 1, 10);
+  const postsPerFanMax = int(input.postsPerFanMax, DEFAULT_LIKES_SETTINGS.postsPerFanMax, postsPerFanMin, 10);
+  return {
+    enabled: bool(input.enabled, DEFAULT_LIKES_SETTINGS.enabled),
+    automatic: bool(input.automatic, DEFAULT_LIKES_SETTINGS.automatic),
+    activeSubscribers: bool(input.activeSubscribers, DEFAULT_LIKES_SETTINGS.activeSubscribers),
+    freeSubscribers: bool(input.freeSubscribers, DEFAULT_LIKES_SETTINGS.freeSubscribers),
+    paidSubscribers: bool(input.paidSubscribers, DEFAULT_LIKES_SETTINGS.paidSubscribers),
+    expiredSubscribers: bool(input.expiredSubscribers, DEFAULT_LIKES_SETTINGS.expiredSubscribers),
+    dailyLimit: int(input.dailyLimit, DEFAULT_LIKES_SETTINGS.dailyLimit, 0, 100_000),
+    minimumIntervalMs,
+    maximumIntervalMs,
+    randomJitter: bool(input.randomJitter, DEFAULT_LIKES_SETTINGS.randomJitter),
+    maxAttempts: int(input.maxAttempts, DEFAULT_LIKES_SETTINGS.maxAttempts, 1, 10),
+    postsPerFanMin,
+    postsPerFanMax,
+    discoveryPostLimit: int(input.discoveryPostLimit, DEFAULT_LIKES_SETTINGS.discoveryPostLimit, 1, 50),
+    contentMaxAgeDays: int(input.contentMaxAgeDays, DEFAULT_LIKES_SETTINGS.contentMaxAgeDays, 1, 3650),
+    discoveryBatchSize: int(input.discoveryBatchSize, DEFAULT_LIKES_SETTINGS.discoveryBatchSize, 1, 500),
+    discoveryFreshnessHours: int(input.discoveryFreshnessHours, DEFAULT_LIKES_SETTINGS.discoveryFreshnessHours, 1, 24 * 30),
+    onlyUnliked: bool(input.onlyUnliked, DEFAULT_LIKES_SETTINGS.onlyUnliked),
+  };
+}
+
 function normalizeModuleSettings(moduleKey, value) {
   if (moduleKey === FOLLOW_BACK_MODULE_KEY) return normalizeFollowBackSettings(value);
   if (moduleKey === BUMPS_MODULE_KEY) return normalizeBumpSettings(value);
+  if (moduleKey === LIKES_MODULE_KEY) return normalizeLikesSettings(value);
   return object(value);
 }
 
@@ -162,6 +213,7 @@ async function getRows({ agencyId, creatorId, db = prisma }) {
     creatorScopeKey(creatorId),
     moduleScopeKey(creatorId, FOLLOW_BACK_MODULE_KEY),
     moduleScopeKey(creatorId, BUMPS_MODULE_KEY),
+    moduleScopeKey(creatorId, LIKES_MODULE_KEY),
   ];
   const rows = await db.automationControlState.findMany({ where: { agencyId, scopeKey: { in: scopeKeys } } });
   return new Map(rows.map((row) => [row.scopeKey, row]));
@@ -186,13 +238,16 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
   const creatorRow = rows.get(creatorScopeKey(creatorId));
   const followBackRow = rows.get(moduleScopeKey(creatorId, FOLLOW_BACK_MODULE_KEY));
   const bumpsRow = rows.get(moduleScopeKey(creatorId, BUMPS_MODULE_KEY));
+  const likesRow = rows.get(moduleScopeKey(creatorId, LIKES_MODULE_KEY));
   const workspaceSettings = normalizeWorkspaceSettings(workspace?.settings);
   const followBackSettings = normalizeFollowBackSettings(followBackRow?.settings);
   const bumpSettings = normalizeBumpSettings(bumpsRow?.settings);
+  const likesSettings = normalizeLikesSettings(likesRow?.settings);
   const workspaceEnabled = workspace?.enabled !== false;
   const creatorEnabled = creatorRow?.enabled !== false;
   const followBack = moduleSnapshot(followBackRow, followBackSettings, workspaceEnabled, creatorEnabled);
   const bumps = moduleSnapshot(bumpsRow, bumpSettings, workspaceEnabled, creatorEnabled);
+  const likes = moduleSnapshot(likesRow, likesSettings, workspaceEnabled, creatorEnabled);
   return {
     creator,
     workspace: { enabled: workspaceEnabled, settings: workspaceSettings, updatedAt: workspace?.updatedAt || null },
@@ -200,12 +255,14 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
     modules: {
       [FOLLOW_BACK_MODULE_KEY]: followBack,
       [BUMPS_MODULE_KEY]: bumps,
+      [LIKES_MODULE_KEY]: likes,
     },
     effective: {
       workspaceEnabled,
       creatorEnabled,
       followBackEnabled: followBack.effectiveEnabled,
       bumpsEnabled: bumps.effectiveEnabled,
+      likesEnabled: likes.effectiveEnabled,
     },
   };
 }
@@ -237,6 +294,7 @@ async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey
 function effectiveModuleEnabled(snapshot, moduleKey) {
   if (moduleKey === FOLLOW_BACK_MODULE_KEY) return snapshot.effective.followBackEnabled;
   if (moduleKey === BUMPS_MODULE_KEY) return snapshot.effective.bumpsEnabled;
+  if (moduleKey === LIKES_MODULE_KEY) return snapshot.effective.likesEnabled;
   return snapshot.effective.workspaceEnabled && snapshot.effective.creatorEnabled;
 }
 
@@ -291,6 +349,37 @@ async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKe
     if (rows.length < 1000) break;
   }
   return resumed;
+}
+
+async function cancelAutomationJobsForControl({ agencyId, creatorId = null, moduleKey = null, reason, failureCode, db = prisma }) {
+  const jobKeys = moduleKey === LIKES_MODULE_KEY
+    ? [LIKES_DISCOVERY_JOB_KEY]
+    : moduleKey
+      ? []
+      : [LIKES_DISCOVERY_JOB_KEY];
+  if (!jobKeys.length) return 0;
+  const now = new Date();
+  const changed = await db.jobInstance.updateMany({
+    where: {
+      agencyId,
+      ...(creatorId ? { creatorId } : {}),
+      jobKey: { in: jobKeys },
+      status: { in: ["SCHEDULED", "CLAIMED", "RUNNING"] },
+    },
+    data: {
+      status: "CANCELED",
+      claimedAt: null,
+      claimedByDeviceId: null,
+      leaseUntil: null,
+      leaseTokenHash: null,
+      workId: null,
+      leaseRevision: { increment: 1 },
+      completedAt: now,
+      lastError: reason,
+      result: { controlFailureCode: failureCode, canceledAt: now.toISOString() },
+    },
+  });
+  return changed.count;
 }
 
 async function setAutomationControl({ agencyId, userId, scope, creatorId = null, moduleKey = null, enabled, settings, db = prisma }) {
@@ -353,11 +442,20 @@ async function setAutomationControl({ agencyId, userId, scope, creatorId = null,
         failureCode: disableCode,
         db,
       });
+  const changedJobs = nextEnabled
+    ? 0
+    : await cancelAutomationJobsForControl({
+        ...deliveryScope,
+        reason: `${scopeKey} disabled`,
+        failureCode: disableCode,
+        db,
+      });
 
   return {
     ok: true,
     control: row,
     changedDeliveries,
+    changedJobs,
     snapshot: creatorId ? await getAutomationControlSnapshot({ agencyId, creatorId, db }) : null,
   };
 }
@@ -375,15 +473,18 @@ async function assertAutomationEnabled({ agencyId, creatorId, moduleKey, db = pr
 module.exports = {
   FOLLOW_BACK_MODULE_KEY,
   BUMPS_MODULE_KEY,
+  LIKES_MODULE_KEY,
   SUPPORTED_MODULE_KEYS,
   ACTIVE_DELIVERY_STATUSES,
   QUEUED_DELIVERY_STATUSES,
   DEFAULT_WORKSPACE_SETTINGS,
   DEFAULT_FOLLOW_BACK_SETTINGS,
   DEFAULT_BUMP_SETTINGS,
+  DEFAULT_LIKES_SETTINGS,
   normalizeWorkspaceSettings,
   normalizeFollowBackSettings,
   normalizeBumpSettings,
+  normalizeLikesSettings,
   getAutomationControlSnapshot,
   setAutomationControl,
   assertAutomationEnabled,

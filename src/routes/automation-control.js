@@ -39,6 +39,13 @@ const {
   triggerPendingReplyScan,
   ensureAutomaticBumps,
 } = require("../services/bump-service");
+const {
+  scheduleLikesDiscovery,
+  planLikes,
+  ensureAutomaticLikes,
+  listLikes,
+  setLikeCandidateState,
+} = require("../services/likes-service");
 
 const router = express.Router();
 
@@ -81,7 +88,7 @@ router.get("/controls/:creatorId", async (req, res) => {
 const controlSchema = z.object({
   scope: z.enum(["workspace", "creator", "module"]),
   creatorId: z.string().min(1).max(160).optional().nullable(),
-  moduleKey: z.enum(["follow_back", "bumps"]).optional().nullable(),
+  moduleKey: z.enum(["follow_back", "bumps", "likes"]).optional().nullable(),
   enabled: z.boolean().optional(),
   settings: z.record(z.unknown()).optional(),
 });
@@ -101,7 +108,8 @@ router.patch("/controls", seniorRequired, async (req, res) => {
     if (input.creatorId) {
       const runFollowBack = input.scope !== "module" || input.moduleKey === "follow_back";
       const runBumps = input.scope !== "module" || input.moduleKey === "bumps";
-      const [followBack, bumps] = await Promise.all([
+      const runLikes = input.scope !== "module" || input.moduleKey === "likes";
+      const [followBack, bumps, likes] = await Promise.all([
         runFollowBack ? ensureAutomaticFollowBack({
           agencyId: req.auth.agencyId,
           creatorId: input.creatorId,
@@ -113,8 +121,13 @@ router.patch("/controls", seniorRequired, async (req, res) => {
           userId: req.auth.userId,
           source: "control_update",
         }) : null,
+        runLikes ? ensureAutomaticLikes({
+          agencyId: req.auth.agencyId,
+          creatorId: input.creatorId,
+          source: "control_update",
+        }) : null,
       ]);
-      planning = { followBack, bumps };
+      planning = { followBack, bumps, likes };
     }
     return res.json({ ...result, planning });
   } catch (error) {
@@ -277,6 +290,94 @@ router.post("/bumps/:creatorId/reply-scan", seniorRequired, async (req, res) => 
   }
 });
 
+const likesListSchema = z.object({
+  search: z.string().max(160).optional(),
+  state: z.string().max(60).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+router.get("/likes/:creatorId", async (req, res) => {
+  try {
+    const query = likesListSchema.parse(req.query || {});
+    return res.json(await listLikes({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      search: query.search || "",
+      state: query.state || null,
+      offset: query.offset || 0,
+      limit: query.limit || 100,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "LIKES_LIST_FAILED");
+  }
+});
+router.post("/likes/:creatorId/discover", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({
+      fanIds: z.array(z.string().min(1).max(160)).max(1000).optional(),
+      force: z.boolean().optional(),
+      maxFans: z.number().int().min(1).max(5000).optional(),
+      source: z.string().max(80).optional(),
+    }).parse(req.body || {});
+    return res.status(202).json(await scheduleLikesDiscovery({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      userId: req.auth.userId,
+      fanIds: input.fanIds || [],
+      force: input.force === true,
+      maxFans: input.maxFans || 500,
+      source: input.source || "manual_discovery",
+      priority: 90,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "LIKES_DISCOVERY_FAILED");
+  }
+});
+router.post("/likes/:creatorId/plan", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({ candidateIds: z.array(z.string().min(1).max(160)).max(500).optional(), source: z.string().max(80).optional() }).parse(req.body || {});
+    return res.status(202).json(await planLikes({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      userId: req.auth.userId,
+      candidateIds: input.candidateIds || [],
+      source: input.source || "manual_run",
+      manual: true,
+      priority: input.candidateIds?.length ? 100 : 70,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "LIKES_PLAN_FAILED");
+  }
+});
+router.post("/likes/:creatorId/candidates/:candidateId/action", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({ action: z.enum(["ignore", "block", "restore", "like", "retry"]) }).parse(req.body || {});
+    const candidate = await prisma.automationContentCandidate.findFirst({
+      where: { id: req.params.candidateId, agencyId: req.auth.agencyId, creatorId: req.params.creatorId },
+    });
+    if (!candidate) return res.status(404).json({ ok: false, code: "candidate_not_found", error: "Like candidate not found" });
+    if (input.action === "like") {
+      return res.status(202).json(await planLikes({
+        agencyId: req.auth.agencyId, creatorId: req.params.creatorId, userId: req.auth.userId,
+        candidateIds: [candidate.id], source: "candidate_like_now", manual: true, priority: 100,
+      }));
+    }
+    if (input.action === "retry") {
+      if (!candidate.latestDeliveryId) return res.status(409).json({ ok: false, code: "no_delivery", error: "Candidate has no delivery to retry" });
+      return res.status(202).json(await retryActionDelivery({ agencyId: req.auth.agencyId, deliveryId: candidate.latestDeliveryId }));
+    }
+    return res.json({ ok: true, candidate: await setLikeCandidateState({
+      agencyId: req.auth.agencyId, creatorId: req.params.creatorId, candidateId: candidate.id, action: input.action,
+    }) });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "LIKES_ACTION_FAILED");
+  }
+});
+
 const deliveryQuerySchema = z.object({
   creatorId: z.string().max(160).optional(),
   moduleKey: z.string().max(80).optional(),
@@ -350,7 +451,7 @@ router.post("/worker/claim", async (req, res) => {
     const input = z.object({
       deviceId: z.string().min(3).max(160),
       leaseMs: z.number().int().min(30_000).max(10 * 60_000).optional(),
-      actionTypes: z.array(z.enum(["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE"])).min(1).max(20).optional(),
+      actionTypes: z.array(z.enum(["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST"])).min(1).max(20).optional(),
     }).parse(req.body || {});
     return res.json({ ok: true, ...(await claimActionDelivery({ userId: req.auth.userId, deviceId: input.deviceId, leaseMs: input.leaseMs, actionTypes: input.actionTypes })) });
   } catch (error) {

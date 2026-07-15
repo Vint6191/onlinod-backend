@@ -31,6 +31,7 @@ const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
 const { ensureAutomaticFollowBack } = require("./follow-back-service");
 const { ensureAutomaticBumps } = require("./bump-service");
+const { ensureAutomaticLikes } = require("./likes-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -178,6 +179,14 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   });
   if (bumpDecision.created) created.push(`bumps_plan:${bumpDecision.planned}`);
   else skipped.push(`bumps_plan:${bumpDecision.reason}`);
+
+  const likesDecision = await ensureAutomaticLikes({
+    agencyId,
+    creatorId,
+    source: "recurring_scheduler",
+  });
+  if (likesDecision.created) created.push("likes_plan");
+  else skipped.push(`likes_plan:${likesDecision.reason}`);
 
   return { created, skipped };
 }
