@@ -38,6 +38,7 @@ const {
 } = require("../services/follow-back-service");
 const {
   planBumps,
+  planConfiguredBumpsNow,
   processRuntimeEvents,
   getBumpOverview,
   triggerPendingReplyScan,
@@ -377,6 +378,25 @@ router.post("/bumps/:creatorId/plan", seniorRequired, async (req, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "BUMPS_PLAN_FAILED");
+  }
+});
+router.post("/bumps/:creatorId/plan-auto", seniorRequired, async (req, res) => {
+  try {
+    await requireCreator(req.auth.agencyId, req.params.creatorId);
+    const result = await planConfiguredBumpsNow({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      userId: req.auth.userId,
+      source: "manual_plan_now",
+    });
+    await automationAudit({
+      agencyId: req.auth.agencyId, actorUserId: req.auth.userId, creatorId: req.params.creatorId,
+      moduleKey: "bumps", action: "bumps.plan_now", targetType: "creator", targetId: req.params.creatorId,
+      details: { planned: result.planned || 0, reason: result.reason || null, skipCounts: result.skipCounts || {} },
+    });
+    return res.status(202).json(result);
+  } catch (error) {
+    return serviceError(res, error, "BUMPS_PLAN_AUTO_FAILED");
   }
 });
 router.post("/bumps/:creatorId/events", seniorRequired, async (req, res) => {

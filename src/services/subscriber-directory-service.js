@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { refreshFollowBackProjection } = require("./follow-back-service");
 const { refreshFollowAutomationProjection } = require("./follow-automation-service");
+const { ensureAutomaticBumps } = require("./bump-service");
 
 const SUBSCRIBER_DIRECTORY_JOB_KEY = "subscriber_directory_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING"];
@@ -480,12 +481,42 @@ async function applySubscriberScanChunk({ db, job, chunkResult }) {
   return { duplicate: false, published: true, nextOffset, hasMore: false, summary };
 }
 
-async function applySubscriberScanCompletion({ job, result }) {
+async function applySubscriberScanCompletion({ job, userId = null, result }) {
   const runId = clean(job.params?.scanRunId, 120);
   const run = runId ? await prisma.subscriberScanRun.findUnique({ where: { id: runId } }) : null;
   if (!run || run.status !== "PUBLISHED")
     throw new Error("Subscriber directory snapshot was not published before job completion");
-  return { type: "subscriber_directory", runId: run.id, summary: run.summary || {}, result: object(result) };
+
+  // Subscriber-driven write automation must be planned immediately after the
+  // immutable snapshot is published. Previously Bumps waited for the hourly
+  // recurring scheduler, so Hidden Online could finish scanning while the
+  // SEND_MESSAGE queue remained empty. Planning failures must never downgrade
+  // or fail a successfully published read-only snapshot.
+  let bumpPlanning = null;
+  try {
+    bumpPlanning = await ensureAutomaticBumps({
+      agencyId: run.agencyId,
+      creatorId: run.creatorId,
+      userId,
+      source: "subscriber_snapshot_published",
+    });
+  } catch (error) {
+    bumpPlanning = {
+      ok: false,
+      created: false,
+      reason: error?.code || "bump_planning_failed",
+      error: clean(error?.message || error, 500),
+      sources: [],
+    };
+  }
+
+  return {
+    type: "subscriber_directory",
+    runId: run.id,
+    summary: run.summary || {},
+    bumpPlanning,
+    result: object(result),
+  };
 }
 
 async function recordSubscriberScanFailure({ job, error, terminal = true }) {

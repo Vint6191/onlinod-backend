@@ -77,3 +77,33 @@ test("Bump candidate eligibility is server-side and explicit", () => {
   assert.equal(eligibility({ candidate: candidate({ metadata: { lastSeenIsNull: false } }), fanState: null, settings, source: "hidden_online", now }), "stale_candidate");
   assert.equal(eligibility({ candidate: candidate({ metadata: { lastSeenIsNull: true } }), fanState: null, settings, source: "hidden_online", now }), null);
 });
+
+test("Bump planning diagnostics aggregate explicit skip codes", () => {
+  const previousLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "../prisma" && parent?.filename?.endsWith("bump-service.js")) return {};
+    if (request === "./automation-pacing-service" && parent?.filename?.endsWith("bump-service.js")) {
+      return { nextAutomationWriteSlot: async () => new Date() };
+    }
+    if (request === "./automation-control-service" && parent?.filename?.endsWith("bump-service.js")) {
+      return {
+        BUMPS_MODULE_KEY: "bumps",
+        assertAutomationEnabled: async () => ({}),
+        getAutomationControlSnapshot: async () => ({}),
+        requireCreator: async () => ({}),
+      };
+    }
+    return previousLoad.call(this, request, parent, isMain);
+  };
+  delete require.cache[require.resolve("./bump-service")];
+  const { summarizePlanningSkips } = require("./bump-service");
+  Module._load = previousLoad;
+
+  assert.deepEqual(
+    summarizePlanningSkips([
+      { ok: true, skipped: [{ code: "cooldown" }, { code: "cooldown" }, { code: "no_template" }] },
+      { ok: false, code: "snapshot_not_ready", skipped: [] },
+    ]),
+    { cooldown: 2, no_template: 1, snapshot_not_ready: 1 },
+  );
+});

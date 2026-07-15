@@ -31,7 +31,7 @@ function actionFromRequest(req) {
   if (/\/deliveries\/[^/]+\/cancel$/.test(path)) return "delivery.canceled";
   if (/\/deliveries\/[^/]+\/release$/.test(path)) return "delivery.claim_released";
   if (path.endsWith("/discover")) return `${moduleFromPath(path) || "module"}.discovery_started`;
-  if (path.endsWith("/plan")) return `${moduleFromPath(path) || "module"}.run_started`;
+  if (path.endsWith("/plan") || path.endsWith("/plan-auto")) return `${moduleFromPath(path) || "module"}.run_started`;
   if (path.includes("/candidates/") && candidateAction) return `${moduleFromPath(path) || "module"}.candidate_${candidateAction}`;
   if (path.includes("/scan") || path.includes("scan-jobs/enqueue")) return `${moduleFromPath(path) || "module"}.scan_started`;
   if (path.includes("/trash")) return `${moduleFromPath(path) || "template"}.template_trashed`;
@@ -69,6 +69,9 @@ function shouldAudit(req) {
   if (String(req.path || "").includes("/controls")) return false;
   const path = String(req.path || "");
   if (path.startsWith("/worker/") || path === "/worker/claim") return false;
+  // Runtime event ingestion is machine telemetry, not a user business action.
+  // Auditing every WS flush produced hundreds of meaningless mutation.post rows.
+  if (path.endsWith("/events")) return false;
   if (path.includes("/result") || path.includes("/intel-bulk") || path.includes("/worker/")) return false;
   return true;
 }
@@ -107,4 +110,5 @@ module.exports = {
   moduleFromPath,
   actionFromRequest,
   safeDetails,
+  shouldAudit,
 };

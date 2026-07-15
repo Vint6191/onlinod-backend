@@ -36,6 +36,36 @@ function sourcePriority(source, manual = false) {
   return 45;
 }
 
+async function readyWorkerCount({ agencyId, creatorId, db = prisma }) {
+  const freshAfter = new Date(Date.now() - 2 * 60_000);
+  return db.deviceCreatorBinding.count({
+    where: {
+      agencyId, creatorId, status: "ACTIVE", lastSeenAt: { gte: freshAfter },
+      device: { agencyId, lastSeenAt: { gte: freshAfter } },
+    },
+  });
+}
+
+function configuredSnapshotSources(settings) {
+  const requested = [];
+  if (settings.hiddenOnlineEnabled) requested.push("hidden_online");
+  if (settings.paidSubscribersEnabled) requested.push("paid_subscriber");
+  if (settings.freeSubscribersEnabled) requested.push("free_subscriber");
+  return requested;
+}
+
+function summarizePlanningSkips(sources = []) {
+  const counts = {};
+  for (const source of Array.isArray(sources) ? sources : []) {
+    if (!source?.ok && source?.code) counts[source.code] = (counts[source.code] || 0) + 1;
+    for (const row of Array.isArray(source?.skipped) ? source.skipped : []) {
+      const code = clean(row?.code, 120) || "skipped";
+      counts[code] = (counts[code] || 0) + 1;
+    }
+  }
+  return counts;
+}
+
 async function activeTemplates({ agencyId, creatorId, source, db = prisma }) {
   const rows = await db.automationTask.findMany({
     where: { agencyId, creatorId, type: "bump_online", enabled: true, status: "active", deletedAt: null },
@@ -716,15 +746,22 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
   return summary;
 }
 
-async function ensureAutomaticBumps({ agencyId, creatorId, userId = null, source = "recurring_scheduler", db = prisma }) {
+async function planConfiguredBumpSources({
+  agencyId, creatorId, userId = null, source = "manual", requireAutomatic = true, manual = false, db = prisma,
+}) {
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
-  if (!control.effective.bumpsEnabled) return { ok: true, created: false, reason: "module_disabled", sources: [] };
+  if (!control.effective.bumpsEnabled) {
+    return { ok: true, created: false, reason: "module_disabled", planned: 0, sources: [], readyDevices: 0, skipCounts: { module_disabled: 1 } };
+  }
   const settings = control.modules.bumps.settings;
-  if (!settings.automatic) return { ok: true, created: false, reason: "automatic_disabled", sources: [] };
-  const requested = [];
-  if (settings.hiddenOnlineEnabled) requested.push("hidden_online");
-  if (settings.paidSubscribersEnabled) requested.push("paid_subscriber");
-  if (settings.freeSubscribersEnabled) requested.push("free_subscriber");
+  if (requireAutomatic && !settings.automatic) {
+    return { ok: true, created: false, reason: "automatic_disabled", planned: 0, sources: [], readyDevices: await readyWorkerCount({ agencyId, creatorId, db }), skipCounts: { automatic_disabled: 1 } };
+  }
+  const requested = configuredSnapshotSources(settings);
+  if (!requested.length) {
+    return { ok: true, created: false, reason: "no_sources_enabled", planned: 0, sources: [], readyDevices: await readyWorkerCount({ agencyId, creatorId, db }), skipCounts: { no_sources_enabled: 1 } };
+  }
+
   const sources = [];
   let planned = 0;
   for (const candidateSource of requested) {
@@ -732,21 +769,39 @@ async function ensureAutomaticBumps({ agencyId, creatorId, userId = null, source
       const result = await planBumps({
         agencyId, creatorId, userId, source: candidateSource,
         limit: Math.min(settings.candidateBatchSize, Math.max(1, settings.dailyLimit)),
-        manual: false, db,
+        manual, db,
       });
       sources.push({ source: candidateSource, ok: true, planned: result.planned || 0, skipped: result.skipped || [] });
       planned += Number(result.planned || 0);
     } catch (error) {
-      sources.push({ source: candidateSource, ok: false, code: error?.code || "planning_failed", error: String(error?.message || error).slice(0, 500) });
+      sources.push({ source: candidateSource, ok: false, code: error?.code || "planning_failed", error: String(error?.message || error).slice(0, 500), skipped: [] });
     }
   }
-  return { ok: true, created: planned > 0, reason: source, planned, sources };
+  const skipCounts = summarizePlanningSkips(sources);
+  const readyDevices = await readyWorkerCount({ agencyId, creatorId, db });
+  const firstFailure = Object.keys(skipCounts)[0] || null;
+  return {
+    ok: true, created: planned > 0,
+    reason: planned > 0 ? source : (firstFailure || "no_eligible_candidates"),
+    planned, sources, requestedSources: requested, readyDevices, skipCounts,
+  };
+}
+
+async function ensureAutomaticBumps({ agencyId, creatorId, userId = null, source = "recurring_scheduler", db = prisma }) {
+  return planConfiguredBumpSources({ agencyId, creatorId, userId, source, requireAutomatic: true, manual: false, db });
+}
+
+async function planConfiguredBumpsNow({ agencyId, creatorId, userId = null, source = "manual_plan_now", db = prisma }) {
+  return planConfiguredBumpSources({ agencyId, creatorId, userId, source, requireAutomatic: false, manual: true, db });
 }
 
 async function getBumpOverview({ agencyId, creatorId, db = prisma }) {
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   const now = new Date();
-  const [templates, fanStates, queued, claimed, running, completed, failed, replied, canceled] = await Promise.all([
+  const settings = control.modules.bumps.settings;
+  const snapshot = await currentSubscriberRun({ agencyId, creatorId, db });
+  const snapshotSources = configuredSnapshotSources(settings);
+  const [templates, fanStates, queued, claimed, running, completed, failed, replied, canceled, readyDevices] = await Promise.all([
     db.automationTask.count({ where: { agencyId, creatorId, type: "bump_online", deletedAt: null } }),
     db.automationBumpFanState.count({ where: { agencyId, creatorId } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: { in: ["QUEUED", "RETRY_SCHEDULED"] } } }),
@@ -756,9 +811,59 @@ async function getBumpOverview({ agencyId, creatorId, db = prisma }) {
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: "FAILED", updatedAt: { gte: dayStart(now) } } }),
     db.bumpDeliveryStat.aggregate({ where: { agencyId, creatorId }, _sum: { replied: true } }),
     db.bumpDeliveryStat.aggregate({ where: { agencyId, creatorId }, _sum: { canceled: true } }),
+    readyWorkerCount({ agencyId, creatorId, db }),
   ]);
+
+  const templateCounts = {};
+  for (const source of ["online", "hidden_online", "paid_subscriber", "free_subscriber", "subscription_event"]) {
+    templateCounts[source] = (await activeTemplates({ agencyId, creatorId, source, db })).length;
+  }
+
+  const candidateCounts = { online: 0, hidden_online: 0, paid_subscriber: 0, free_subscriber: 0 };
+  candidateCounts.online = await db.automationBumpFanState.count({
+    where: {
+      agencyId, creatorId,
+      lastOnlineAt: { gte: new Date(now.getTime() - settings.onlineObservationTtlMs) },
+    },
+  });
+  if (snapshot?.currentRunId) {
+    const base = { agencyId, creatorId, runId: snapshot.currentRunId };
+    [candidateCounts.hidden_online, candidateCounts.paid_subscriber, candidateCounts.free_subscriber] = await Promise.all([
+      db.subscriberScanItem.count({ where: { ...base, lastSeenIsNull: true } }),
+      db.subscriberScanItem.count({ where: { ...base, subscriptionType: { in: ["paid", "active_paid"] } } }),
+      db.subscriberScanItem.count({ where: { ...base, subscriptionType: { in: ["free", "active_free"] } } }),
+    ]);
+  }
+
+  const reasons = [];
+  if (!control.effective.bumpsEnabled) reasons.push("module_disabled");
+  if (!settings.automatic) reasons.push("automatic_disabled");
+  if (!snapshot?.currentRunId && snapshotSources.length) reasons.push("snapshot_not_ready");
+  if (!snapshotSources.length && !settings.onlineEnabled && !settings.subscriptionEventsEnabled) reasons.push("no_sources_enabled");
+  const enabledSources = [
+    ...(settings.onlineEnabled ? ["online"] : []),
+    ...snapshotSources,
+    ...(settings.subscriptionEventsEnabled ? ["subscription_event"] : []),
+  ];
+  if (enabledSources.length && enabledSources.every((source) => Number(templateCounts[source] || 0) === 0)) reasons.push("no_template");
+  const snapshotCandidateTotal = snapshotSources.reduce((sum, source) => sum + Number(candidateCounts[source] || 0), 0);
+  if (snapshot?.currentRunId && snapshotSources.length && snapshotCandidateTotal === 0) reasons.push("no_candidates");
+  if (!readyDevices) reasons.push("no_ready_worker");
+
   return {
     ok: true, creatorId, control,
+    worker: { ready: readyDevices > 0, readyDevices },
+    planning: {
+      ready: reasons.length === 0,
+      primaryReason: reasons[0] || "ready",
+      reasons,
+      automatic: settings.automatic === true,
+      snapshotRunId: snapshot?.currentRunId || null,
+      snapshotPublishedAt: snapshot?.publishedAt || null,
+      enabledSources,
+      templateCounts,
+      candidateCounts,
+    },
     metrics: { templates, fanStates, queued, claimed, running, sentToday: completed, failedToday: failed, replied: replied._sum.replied || 0, canceled: canceled._sum.canceled || 0 },
   };
 }
@@ -768,6 +873,8 @@ module.exports = {
   DELETE_ACTION,
   ACTIVE_ACTION_STATUSES,
   planBumps,
+  planConfiguredBumpsNow,
+  summarizePlanningSkips,
   recordOnlineObservations,
   processRuntimeEvents,
   ensureAutomaticBumps,

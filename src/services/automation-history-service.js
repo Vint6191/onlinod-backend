@@ -229,6 +229,7 @@ async function listAutomationAudit({ agencyId, creatorId, moduleKey = null, curs
   const where = {
     agencyId,
     action: { startsWith: "automation." },
+    NOT: { action: { startsWith: "automation.mutation." } },
     OR: [
       { targetId: creatorId },
       { metadata: { path: ["creatorId"], equals: creatorId } },
