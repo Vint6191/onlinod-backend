@@ -116,6 +116,7 @@ model Agency {
   campaignDrafts CampaignDraft[]
   campaignQueueStatuses CampaignQueueStatus[]
   automationDeliveries AutomationDelivery[]
+  automationMonthlyAggregates AutomationMonthlyAggregate[]
   automationControls AutomationControlState[]
   followBackCandidates FollowBackCandidate[]
   followAutomationCandidates FollowAutomationCandidate[]
@@ -206,6 +207,7 @@ model CreatorAccount {
   campaignDrafts CampaignDraft[]
   campaignQueueStatuses CampaignQueueStatus[]
   automationDeliveries AutomationDelivery[]
+  automationMonthlyAggregates AutomationMonthlyAggregate[]
   automationControls AutomationControlState[]
   followBackCandidates FollowBackCandidate[]
   followAutomationCandidates FollowAutomationCandidate[]
@@ -384,6 +386,7 @@ model AuditLog {
   actor  User?  @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
 
   @@index([agencyId])
+  @@index([agencyId, createdAt])
   @@index([actorUserId])
   @@index([action])
   @@index([targetType, targetId])
@@ -1649,6 +1652,38 @@ model AutomationDelivery {
   @@index([sentAt])
   @@index([cancelAt])
   @@index([finishedAt])
+}
+
+model AutomationMonthlyAggregate {
+  id          String   @id @default(cuid())
+  agencyId    String
+  creatorId   String
+  moduleKey   String
+  actionType  String
+  periodStart DateTime
+  total       Int      @default(0)
+  completed   Int      @default(0)
+  failed      Int      @default(0)
+  skipped     Int      @default(0)
+  canceled    Int      @default(0)
+  sent        Int      @default(0)
+  replied     Int      @default(0)
+  followed    Int      @default(0)
+  unfollowed  Int      @default(0)
+  liked       Int      @default(0)
+  commented   Int      @default(0)
+  firstAt     DateTime?
+  lastAt      DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, moduleKey, actionType, periodStart])
+  @@index([agencyId, periodStart])
+  @@index([creatorId, periodStart])
+  @@index([creatorId, moduleKey, periodStart])
 }
 
 model AutomationControlState {

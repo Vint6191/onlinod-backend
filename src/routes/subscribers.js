@@ -4,6 +4,9 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { requireCreator } = require("../services/server-store-utils");
+const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { automationCreatorParamRequired } = require("../middleware/automation-permissions");
+const { attachAutomationAudit } = require("../middleware/automation-audit");
 const {
   scheduleSubscriberScan,
   getSubscriberDirectoryStatus,
@@ -12,6 +15,16 @@ const {
 } = require("../services/subscriber-directory-service");
 
 const router = express.Router();
+attachAutomationAudit(router);
+router.param("creatorId", automationCreatorParamRequired());
+
+function seniorRequired(req, res, next) {
+  const member = req.auth?.membership || req.member;
+  if (!member || !isSeniorAgencyMember(member)) {
+    return res.status(403).json({ ok: false, code: "WRITE_AUTOMATION_FORBIDDEN", error: "Only owner, admin or manager may change or run write automation" });
+  }
+  return next();
+}
 
 function validationError(res, error) {
   return res.status(400).json({
@@ -41,10 +54,10 @@ const scanSchema = z.object({
   scanEveryDays: z.number().int().min(1).max(30).optional(),
 });
 
-router.post("/:creatorId/scan", async (req, res) => {
+router.post("/:creatorId/scan", seniorRequired, async (req, res) => {
   try {
     const input = scanSchema.parse(req.body || {});
-    const creator = await requireCreator(prisma, req.auth.agencyId, req.params.creatorId);
+    const creator = req.automationCreator || await requireCreator(prisma, req.auth.agencyId, req.params.creatorId);
     const result = await scheduleSubscriberScan({
       agencyId: req.auth.agencyId,
       creatorId: creator.id,
@@ -67,7 +80,7 @@ router.post("/:creatorId/scan", async (req, res) => {
 
 router.get("/:creatorId/status", async (req, res) => {
   try {
-    const creator = await requireCreator(prisma, req.auth.agencyId, req.params.creatorId);
+    const creator = req.automationCreator || await requireCreator(prisma, req.auth.agencyId, req.params.creatorId);
     return res.json(await getSubscriberDirectoryStatus({ agencyId: req.auth.agencyId, creatorId: creator.id }));
   } catch (error) {
     return serviceError(res, error, "SUBSCRIBER_STATUS_FAILED");
@@ -85,7 +98,7 @@ const hiddenQuerySchema = z.object({
 router.get("/:creatorId/hidden-online", async (req, res) => {
   try {
     const query = hiddenQuerySchema.parse(req.query || {});
-    const creator = await requireCreator(prisma, req.auth.agencyId, req.params.creatorId);
+    const creator = req.automationCreator || await requireCreator(prisma, req.auth.agencyId, req.params.creatorId);
     return res.json(
       await listHiddenOnline({
         agencyId: req.auth.agencyId,
@@ -105,10 +118,10 @@ router.get("/:creatorId/hidden-online", async (req, res) => {
 
 const statusSchema = z.object({ status: z.enum(["active", "ignored", "blocked"]) });
 
-router.patch("/:creatorId/hidden-online/:fanId/status", async (req, res) => {
+router.patch("/:creatorId/hidden-online/:fanId/status", seniorRequired, async (req, res) => {
   try {
     const input = statusSchema.parse(req.body || {});
-    const creator = await requireCreator(prisma, req.auth.agencyId, req.params.creatorId);
+    const creator = req.automationCreator || await requireCreator(prisma, req.auth.agencyId, req.params.creatorId);
     return res.json(
       await setHiddenOnlineStatus({
         agencyId: req.auth.agencyId,

@@ -34,7 +34,6 @@ const TASK_TYPES = new Set([
 
 const JOB_STATUSES = new Set(["scheduled", "claimed", "running", "done", "skipped", "failed", "canceled", "expired"]);
 const EVENT_STATUSES = new Set(["info", "ok", "failed", "skipped", "warning"]);
-const RAW_KEY_RE = /(^|_)(raw|html|payload|headers|cookies|token|authorization|password|secret)($|_)/i;
 const BUMP_TRASH_RETENTION_DAYS = 14;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVITY_CACHE_TTL_MS = 30 * 1000;
@@ -1645,62 +1644,6 @@ function automationActivityFromDelivery(row = {}) {
   };
 }
 
-function automationActivityFromFollowBack(row = {}) {
-  const meta = toPlainObject(row.result || {});
-  const status = clean(row.status || "pending", 40).toLowerCase();
-  const action = status === "done" ? "done" : status === "failed" ? "failed" : status === "skipped" ? "skipped" : "queued";
-  const m = { ...meta, fanUsername: row.username || row.name || row.fanId, reason: row.reason || row.error || meta.reason || null };
-  return {
-    id: `follow:${row.id}`,
-    createdAt: row.lastResultAt || row.updatedAt || row.createdAt,
-    ts: row.lastResultAt || row.updatedAt || row.createdAt,
-    module: "follow_back",
-    action,
-    status: status === "failed" ? "failed" : status === "skipped" ? "skipped" : status === "done" ? "ok" : "info",
-    creatorId: row.creatorId,
-    accountId: row.creatorId,
-    fanId: row.fanId,
-    fanUsername: row.username || row.name || null,
-    reason: row.reason || row.error || null,
-    title: activityTitle({ module: "follow_back", action, meta: m, fanId: row.fanId }),
-    result: activityResultText({ module: "follow_back", action, status, meta: m }),
-    meta: m,
-  };
-}
-
-function automationActivityFromSfsJob(row = {}) {
-  const payload = toPlainObject(row.payload || {});
-  const result = toPlainObject(row.result || {});
-  const meta = { ...payload, ...result, targetUsername: result.targetUsername || payload.targetUsername, targetUserId: result.targetUserId || payload.targetUserId, jobId: row.id };
-  const status = clean(row.status || "scheduled", 40).toLowerCase();
-  let action = "queued";
-  const reason = clean(result.reason || "", 120);
-  if (status === "done") {
-    if (Number(result.commentsSent || 0) > 0) action = "comment_sent";
-    else if (Number(result.existingComments || 0) > 0 || reason === "SFS_ALREADY_COMMENTED") action = "already_commented";
-    else if (Number(result.likedComments || result.likesSent || 0) > 0) action = "likes_sent";
-    else action = "done";
-  } else if (status === "skipped") action = "skipped";
-  else if (status === "failed") action = "failed";
-  return {
-    id: `sfs:${row.id}`,
-    createdAt: row.completedAt || row.updatedAt || row.createdAt,
-    ts: row.completedAt || row.updatedAt || row.createdAt,
-    module: "sfs",
-    action,
-    status: status === "failed" ? "failed" : status === "skipped" ? "skipped" : status === "done" ? "ok" : "info",
-    creatorId: row.creatorId || row.accountId,
-    accountId: row.accountId || row.creatorId,
-    targetUserId: meta.targetUserId || null,
-    targetUsername: meta.targetUsername || null,
-    jobId: row.id,
-    reason: reason || null,
-    title: activityTitle({ module: "sfs", action, meta }),
-    result: activityResultText({ module: "sfs", action, status, meta }),
-    meta,
-  };
-}
-
 async function listActivity({ agencyId, query = {} }) {
   const creatorId = clean(query.creatorId || query.accountId, 100);
   const moduleFilter = clean(query.module, 60).toLowerCase();
@@ -1714,17 +1657,28 @@ async function listActivity({ agencyId, query = {} }) {
   const since = new Date(Date.now() - sinceHours * 60 * 60 * 1000);
   const eventWhere = { agencyId, createdAt: { gte: since } };
   if (creatorId) eventWhere.OR = [{ creatorId }, { accountId: creatorId }];
-  const [events, deliveries, follows, sfsJobs] = await Promise.all([
-    prisma.automationEvent.findMany({ where: eventWhere, orderBy: { createdAt: "desc" }, take: Math.min(120, Math.ceil(take * 1.5)) }).catch(() => []),
-    prisma.automationDelivery.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), OR: [{ updatedAt: { gte: since } }, { sentAt: { gte: since } }, { createdAt: { gte: since } }] }, orderBy: { updatedAt: "desc" }, take: Math.min(90, Math.ceil(take * 1.5)) }).catch(() => []),
-    prisma.followBackTask.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), updatedAt: { gte: since } }, orderBy: { updatedAt: "desc" }, take: Math.min(90, Math.ceil(take * 1.5)) }).catch(() => []),
-    prisma.automationJob.findMany({ where: { agencyId, ...(creatorId ? { OR: [{ creatorId }, { accountId: creatorId }] } : {}), type: "sfs_hunter", updatedAt: { gte: since } }, orderBy: { updatedAt: "desc" }, take: Math.min(90, Math.ceil(take * 1.5)) }).catch(() => []),
+  const auditWhere = { agencyId, action: { startsWith: "automation." }, createdAt: { gte: since } };
+  if (creatorId) auditWhere.OR = [
+    { targetId: creatorId },
+    { metadata: { path: ["creatorId"], equals: creatorId } },
+  ];
+  const [events, deliveries, audits] = await Promise.all([
+    prisma.automationEvent.findMany({ where: eventWhere, orderBy: { createdAt: "desc" }, take: Math.min(60, take) }).catch(() => []),
+    prisma.automationDelivery.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), OR: [{ updatedAt: { gte: since } }, { sentAt: { gte: since } }, { createdAt: { gte: since } }] }, orderBy: { updatedAt: "desc" }, take: Math.min(120, Math.ceil(take * 2)) }).catch(() => []),
+    prisma.auditLog.findMany({ where: auditWhere, orderBy: { createdAt: "desc" }, take: Math.min(120, Math.ceil(take * 1.5)) }).catch(() => []),
   ]);
   const rows = [];
   for (const row of events || []) rows.push(automationActivityFromEvent(row));
   for (const row of deliveries || []) rows.push(automationActivityFromDelivery(row));
-  for (const row of follows || []) rows.push(automationActivityFromFollowBack(row));
-  for (const row of sfsJobs || []) rows.push(automationActivityFromSfsJob(row));
+  for (const row of audits || []) {
+    const meta = toPlainObject(row.metadata);
+    rows.push({
+      id: `audit:${row.id}`, createdAt: row.createdAt, ts: row.createdAt, module: meta.moduleKey || "automation",
+      action: String(row.action || "automation.event").replace(/^automation\./, ""), status: "info",
+      creatorId: meta.creatorId || row.targetId || null, accountId: meta.creatorId || row.targetId || null,
+      title: String(row.action || "Automation action"), result: meta.details?.action || meta.details?.path || "Recorded by backend", meta,
+    });
+  }
   const seen = new Set();
   const out = [];
   for (const row of rows.sort((a, b) => (Date.parse(b.ts || b.createdAt || 0) || 0) - (Date.parse(a.ts || a.createdAt || 0) || 0))) {

@@ -974,13 +974,13 @@ async function releaseActionDelivery(input) {
   return { ok: true, delivery: updated };
 }
 
-async function listActionDeliveries({ agencyId, creatorId, moduleKey, actionType, status, deviceId, fan, offset = 0, limit = 100 }) {
+async function listActionDeliveries({ agencyId, creatorId, creatorIds = null, moduleKey, actionType, status, deviceId, fan, offset = 0, limit = 100 }) {
   const take = Math.max(1, Math.min(500, Number(limit) || 100));
   const skip = Math.max(0, Number(offset) || 0);
   const search = clean(fan, 160);
   const where = {
     agencyId,
-    ...(creatorId ? { creatorId } : {}),
+    ...(creatorId ? { creatorId } : Array.isArray(creatorIds) ? { creatorId: { in: creatorIds } } : {}),
     ...(moduleKey ? { moduleKey } : {}),
     ...(actionType ? { actionType } : {}),
     ...(status ? { status: Array.isArray(status) ? { in: status } : status } : {}),

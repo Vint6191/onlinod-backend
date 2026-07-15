@@ -11,6 +11,7 @@
 
 const prisma = require("../prisma");
 const { gcTeamLedgers } = require("./team-ppv-ledger-service");
+const { compactAutomationDeliveries } = require("./automation-history-service");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
@@ -77,6 +78,25 @@ const RETENTION_FIELDS = Object.freeze({
     min: 30,
     max: 3650,
     hint: "sent, ppv purchase, unanswered/incoming attribution rows.",
+  },
+
+  automationDeliveryDetailedDays: {
+    label: "Automation detailed delivery history",
+    unit: "days",
+    env: "ONLINOD_AUTOMATION_DELIVERY_DETAILED_DAYS",
+    fallback: 90,
+    min: 7,
+    max: 3650,
+    hint: "Terminal write deliveries are compacted into monthly aggregates after this period.",
+  },
+  automationAggregateDays: {
+    label: "Automation monthly aggregates",
+    unit: "days",
+    env: "ONLINOD_AUTOMATION_AGGREGATE_DAYS",
+    fallback: 1095,
+    min: 365,
+    max: 3650,
+    hint: "Retention for compact monthly Automation metrics.",
   },
 
   automationJobDoneDays: {
@@ -479,7 +499,7 @@ async function deleteZeroTrafficValueSnapshots({ batchSize, olderThan }) {
   return { label: "trafficFanValueSnapshot.zero_orphan", deleted: total };
 }
 
-async function runTeamLedgerRetentionSweep(options = {}) {
+async function runTeamLedgerRetentionSweep(_options = {}) {
   const result = await gcTeamLedgers({});
   const items = [
     { label: "teamSentMessageLedger", deleted: Number(result?.sentMessageLedger || 0) },
@@ -493,6 +513,19 @@ async function runAutomationRetentionSweep(options = {}) {
   const cfg = await resolveSweepConfig(options);
   const out = [];
   const jobOlderThan = daysAgo(cfg.automationJobDoneDays);
+
+  out.push(await compactAutomationDeliveries({
+    olderThan: daysAgo(cfg.automationDeliveryDetailedDays),
+    batchSize: cfg.batchSize,
+  }));
+
+  out.push(await deleteByIdsInBatches({
+    model: prisma.automationMonthlyAggregate,
+    batchSize: cfg.batchSize,
+    label: `automationMonthlyAggregate.old_${cfg.automationAggregateDays}d`,
+    orderBy: { periodStart: "asc" },
+    where: { periodStart: { lt: daysAgo(cfg.automationAggregateDays) } },
+  }));
 
   out.push(await deleteByIdsInBatches({
     model: prisma.automationJob,

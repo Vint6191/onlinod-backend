@@ -4,6 +4,10 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { automationCreatorParamRequired, allowedCreatorScope } = require("../middleware/automation-permissions");
+const { attachAutomationAudit } = require("../middleware/automation-audit");
+const { getAutomationMetrics, listAutomationAudit } = require("../services/automation-history-service");
+const { automationAudit, compactControl } = require("../services/automation-audit-service");
 const {
   getAutomationControlSnapshot,
   setAutomationControl,
@@ -57,6 +61,8 @@ const {
 } = require("../services/follow-automation-service");
 
 const router = express.Router();
+attachAutomationAudit(router);
+router.param("creatorId", automationCreatorParamRequired());
 
 function validationError(res, error) {
   return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
@@ -68,9 +74,7 @@ function serviceError(res, error, fallback = "AUTOMATION_REQUEST_FAILED") {
 }
 async function seniorRequired(req, res, next) {
   try {
-    const member = await prisma.agencyMember.findFirst({
-      where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null, agency: { deletedAt: null } },
-    });
+    const member = req.auth?.membership || req.member;
     if (!member || !isSeniorAgencyMember(member)) {
       return res.status(403).json({ ok: false, code: "WRITE_AUTOMATION_FORBIDDEN", error: "Only owner, admin or manager may change or run write automation" });
     }
@@ -83,7 +87,6 @@ async function seniorRequired(req, res, next) {
 
 router.get("/overview/:creatorId", async (req, res) => {
   try {
-    await requireCreator(req.auth.agencyId, req.params.creatorId);
     return res.json(await getAutomationOverview({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId }));
   } catch (error) { return serviceError(res, error, "AUTOMATION_OVERVIEW_FAILED"); }
 });
@@ -92,6 +95,40 @@ router.get("/controls/:creatorId", async (req, res) => {
   try {
     return res.json({ ok: true, snapshot: await getAutomationControlSnapshot({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId }) });
   } catch (error) { return serviceError(res, error, "AUTOMATION_CONTROLS_FAILED"); }
+});
+
+router.get("/metrics/:creatorId", async (req, res) => {
+  try {
+    const query = z.object({
+      from: z.string().datetime().optional(),
+      to: z.string().datetime().optional(),
+      months: z.coerce.number().int().min(1).max(60).optional(),
+    }).parse(req.query || {});
+    return res.json(await getAutomationMetrics({
+      agencyId: req.auth.agencyId, creatorId: req.params.creatorId,
+      from: query.from || null, to: query.to || null, months: query.months || 12,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "AUTOMATION_METRICS_FAILED");
+  }
+});
+
+router.get("/audit/:creatorId", async (req, res) => {
+  try {
+    const query = z.object({
+      moduleKey: z.string().max(80).optional(),
+      cursor: z.string().datetime().optional(),
+      limit: z.coerce.number().int().min(1).max(250).optional(),
+    }).parse(req.query || {});
+    return res.json(await listAutomationAudit({
+      agencyId: req.auth.agencyId, creatorId: req.params.creatorId,
+      moduleKey: query.moduleKey || null, cursor: query.cursor || null, limit: query.limit || 100,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "AUTOMATION_AUDIT_FAILED");
+  }
 });
 
 const controlSchema = z.object({
@@ -104,6 +141,11 @@ const controlSchema = z.object({
 router.patch("/controls", seniorRequired, async (req, res) => {
   try {
     const input = controlSchema.parse(req.body || {});
+    let beforeControl = null;
+    if (input.creatorId) {
+      await allowedCreatorScope({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, requestedCreatorId: input.creatorId });
+      beforeControl = compactControl(await getAutomationControlSnapshot({ agencyId: req.auth.agencyId, creatorId: input.creatorId }));
+    }
     const result = await setAutomationControl({
       agencyId: req.auth.agencyId,
       userId: req.auth.userId,
@@ -146,6 +188,13 @@ router.patch("/controls", seniorRequired, async (req, res) => {
       ]);
       planning = { followBack, bumps, likes, followAutomation, sfs };
     }
+    await automationAudit({
+      agencyId: req.auth.agencyId, actorUserId: req.auth.userId, creatorId: input.creatorId || null,
+      moduleKey: input.moduleKey || null, action: input.enabled === false ? "control.disabled" : input.enabled === true ? "control.enabled" : "control.settings_changed",
+      targetType: input.scope, targetId: input.creatorId || input.moduleKey || req.auth.agencyId,
+      before: beforeControl, after: input.creatorId ? compactControl(result.snapshot) : { enabled: input.enabled },
+      details: { scope: input.scope, settingsKeys: Object.keys(input.settings || {}).slice(0, 80) },
+    });
     return res.json({ ...result, planning });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
@@ -534,9 +583,15 @@ router.post("/sfs/:creatorId/candidates/:candidateId/action", seniorRequired, as
 router.get("/deliveries", async (req, res) => {
   try {
     const query = deliveryQuerySchema.parse(req.query || {});
+    const scope = await allowedCreatorScope({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      requestedCreatorId: query.creatorId || null,
+    });
     return res.json(await listActionDeliveries({
       agencyId: req.auth.agencyId,
       creatorId: query.creatorId || null,
+      creatorIds: scope.creatorIds,
       moduleKey: query.moduleKey || null,
       actionType: query.actionType || null,
       status: query.status || null,
@@ -594,7 +649,7 @@ router.post("/worker/claim", async (req, res) => {
     const input = z.object({
       deviceId: z.string().min(3).max(160),
       leaseMs: z.number().int().min(30_000).max(10 * 60_000).optional(),
-      actionTypes: z.array(z.enum(["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST", "UNFOLLOW_FAN", "FOLLOW_FAN"])).min(1).max(20).optional(),
+      actionTypes: z.array(z.enum(["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST", "UNFOLLOW_FAN", "FOLLOW_FAN", "SFS_FOLLOW_TARGET", "SFS_COMMENT_POST", "SFS_LIKE_COMMENT", "SFS_UNFOLLOW_TARGET"])).min(1).max(20).optional(),
     }).parse(req.body || {});
     return res.json({ ok: true, ...(await claimActionDelivery({ userId: req.auth.userId, deviceId: input.deviceId, leaseMs: input.leaseMs, actionTypes: input.actionTypes })) });
   } catch (error) {
