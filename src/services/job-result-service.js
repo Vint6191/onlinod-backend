@@ -11,6 +11,10 @@ const {
   recordLikesDiscoveryFailure,
 } = require("./likes-service");
 const {
+  SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY,
+  applySfsDiscoveryChunk, applySfsDiscoveryCompletion, applySfsTargetScanCompletion, recordSfsJobFailure,
+} = require("./sfs-service");
+const {
   SUBSCRIBER_DIRECTORY_JOB_KEY,
   applySubscriberScanChunk,
   applySubscriberScanCompletion,
@@ -130,6 +134,7 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) {
     return applyLikesDiscoveryChunk({ db, job, deviceId, userId, chunkResult });
   }
+  if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryChunk({ db, job, deviceId, userId, chunkResult });
   if (chunkResult !== undefined && chunkResult !== null) {
     throw new Error(`No backend chunk applier registered for ${job.jobKey}`);
   }
@@ -143,6 +148,8 @@ async function applyJobResult({ job, deviceId, userId, result }) {
   if (job.jobKey === PRESENCE_JOB_KEY) return applyPresenceJobResult({ job, deviceId, result: result || {} });
   if (job.jobKey === CATCHUP_JOB_KEY) return applyCatchupJobResult({ job, deviceId, userId, result: result || {} });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return applyLikesDiscoveryCompletion({ job, deviceId, userId, result: result || {} });
+  if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryCompletion({ job, deviceId, userId, result: result || {} });
+  if (job.jobKey === SFS_TARGET_SCAN_JOB_KEY) return applySfsTargetScanCompletion({ job, deviceId, userId, result: result || {} });
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
     const applied = await applySubscriberScanCompletion({ job, deviceId, userId, result: result || {} });
     cleanupSubscriberScanHistory({ creatorId: job.creatorId }).catch(() => null);
@@ -155,6 +162,7 @@ async function recordJobFailure({ job, error, terminal = true }) {
   if (job.jobKey === CATCHUP_JOB_KEY) return recordCatchupJobFailure({ job, error });
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) return recordSubscriberScanFailure({ job, error, terminal });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return recordLikesDiscoveryFailure({ job, error, terminal });
+  if ([SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY].includes(job.jobKey)) return recordSfsJobFailure({ job, error, terminal });
   return null;
 }
 

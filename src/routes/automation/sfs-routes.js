@@ -1,5 +1,7 @@
 "use strict";
 
+const { adoptLegacySfsUnfollow } = require("../../services/sfs-service");
+
 function registerSfsRoutes(router, deps) {
   const { automationServer, sendError, cleanString, requireSeniorAutomationWriter } = deps;
 
@@ -9,19 +11,36 @@ function registerSfsRoutes(router, deps) {
   router.post("/sfs-comments/:id/restore", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.query?.accountId, 100); return res.json(await automationServer.trashSfsComment({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, templateId: req.params.id, restore: true })); } catch (err) { return sendError(res, err, "AUTOMATION_SFS_COMMENT_RESTORE_FAILED"); } });
   router.delete("/sfs-comments/:id", requireSeniorAutomationWriter, async (req, res) => { try { const accountId = cleanString(req.body?.accountId || req.query?.accountId, 100); return res.json(await automationServer.trashSfsComment({ agencyId: req.auth.agencyId, userId: req.auth.userId, accountId, templateId: req.params.id, permanent: true })); } catch (err) { return sendError(res, err, "AUTOMATION_SFS_COMMENT_DELETE_FAILED"); } });
 
-  router.get("/sfs-hunter/state", async (req, res) => { try { const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100); return res.json(await automationServer.listSfsHunterState({ agencyId: req.auth.agencyId, creatorId, query: req.query || {} })); } catch (err) { return sendError(res, err, "SFS_HUNTER_STATE_FAILED"); } });
-  router.get("/sfs-hunter/settings", async (req, res) => { try { const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100); return res.json(await automationServer.getSfsHunterSettings({ agencyId: req.auth.agencyId, creatorId })); } catch (err) { return sendError(res, err, "SFS_HUNTER_SETTINGS_FAILED"); } });
-  router.put("/sfs-hunter/settings", requireSeniorAutomationWriter, async (req, res) => { try { const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100); return res.json(await automationServer.saveSfsHunterSettings({ agencyId: req.auth.agencyId, userId: req.auth.userId, creatorId, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_HUNTER_SETTINGS_SAVE_FAILED"); } });
-  router.post("/sfs-hunter/targets/ingest", async (req, res) => { try { return res.json(await automationServer.ingestSfsTargets({ agencyId: req.auth.agencyId, userId: req.auth.userId, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_TARGETS_INGEST_FAILED"); } });
-  router.post("/sfs-hunter/targets/claim", async (req, res) => { try { return res.json(await automationServer.claimSfsTarget({ agencyId: req.auth.agencyId, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_TARGET_CLAIM_FAILED"); } });
-  router.post("/sfs-hunter/targets/:id/result", async (req, res) => { try { return res.json(await automationServer.completeSfsTarget({ agencyId: req.auth.agencyId, jobId: req.params.id, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_TARGET_RESULT_FAILED"); } });
-  router.post("/sfs-hunter/unfollow/claim", async (req, res) => { try { return res.json(await automationServer.claimSfsUnfollow({ agencyId: req.auth.agencyId, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_UNFOLLOW_CLAIM_FAILED"); } });
-  router.post("/sfs-hunter/unfollow/:id/result", async (req, res) => { try { return res.json(await automationServer.completeSfsUnfollow({ agencyId: req.auth.agencyId, jobId: req.params.id, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_UNFOLLOW_RESULT_FAILED"); } });
-  router.get("/sfs-hunter/used/check", async (req, res) => { try { const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100); return res.json(await automationServer.checkSfsTargetUsed({ agencyId: req.auth.agencyId, creatorId, targetUserId: req.query.targetUserId, targetUsername: req.query.targetUsername || req.query.username })); } catch (err) { return sendError(res, err, "SFS_USED_CHECK_FAILED"); } });
-  router.post("/sfs-hunter/comment-likes/check", async (req, res) => { try { return res.json(await automationServer.checkSfsCommentLikes({ agencyId: req.auth.agencyId, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_COMMENT_LIKES_CHECK_FAILED"); } });
-  router.get("/sfs-hunter/comment-likes/daily-count", async (req, res) => { try { return res.json(await automationServer.countSfsCommentLikes({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "SFS_COMMENT_LIKES_DAILY_COUNT_FAILED"); } });
-  router.post("/sfs-hunter/comment-likes/mark", async (req, res) => { try { return res.json(await automationServer.markSfsCommentLikes({ agencyId: req.auth.agencyId, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_COMMENT_LIKES_MARK_FAILED"); } });
-  router.post("/sfs-hunter/comment-likes/record", async (req, res) => { try { return res.json(await automationServer.markSfsCommentLikes({ agencyId: req.auth.agencyId, input: req.body || {} })); } catch (err) { return sendError(res, err, "SFS_COMMENT_LIKES_RECORD_FAILED"); } });
+
+  // P14: legacy Alpha claim/settings routes are physically disabled. Two
+  // completion-only routes remain as a drain adapter for work that was already
+  // running during deploy; they never create new legacy claims.
+  router.post("/sfs-hunter/targets/:id/result", async (req, res) => {
+    try {
+      const completed = await automationServer.completeSfsTarget({ agencyId: req.auth.agencyId, jobId: req.params.id, input: req.body || {} });
+      const item = completed?.item || {};
+      const payload = item.payload && typeof item.payload === "object" ? item.payload : {};
+      const result = item.result && typeof item.result === "object" ? item.result : {};
+      const inputResult = req.body?.result && typeof req.body.result === "object" ? req.body.result : req.body || {};
+      const creatorId = cleanString(item.creatorId || item.accountId, 100);
+      const targetUserId = cleanString(inputResult.targetUserId || result.targetUserId || payload.targetUserId || item.fanId, 100);
+      const targetUsername = cleanString(inputResult.targetUsername || result.targetUsername || payload.targetUsername, 80);
+      const unfollowAt = inputResult.unfollowAt || result.unfollowAt || payload.unfollowAt || null;
+      const adopted = creatorId && targetUserId && unfollowAt
+        ? await adoptLegacySfsUnfollow({ agencyId: req.auth.agencyId, creatorId, targetUserId, targetUsername, runAfter: unfollowAt, sourceJobId: item.id })
+        : null;
+      return res.json({ ...completed, p14Cleanup: adopted });
+    } catch (err) { return sendError(res, err, "SFS_TARGET_RESULT_DRAIN_FAILED"); }
+  });
+  router.post("/sfs-hunter/unfollow/:id/result", async (req, res) => {
+    try {
+      return res.json(await automationServer.completeSfsUnfollow({ agencyId: req.auth.agencyId, jobId: req.params.id, input: req.body || {} }));
+    } catch (err) { return sendError(res, err, "SFS_UNFOLLOW_RESULT_DRAIN_FAILED"); }
+  });
+
+  // SFS templates remain available here; all new execution lives under
+  // /api/automation/sfs and uses JobInstance + AutomationDelivery only.
+
 }
 
 module.exports = { registerSfsRoutes };

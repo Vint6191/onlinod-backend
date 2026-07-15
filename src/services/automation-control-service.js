@@ -6,7 +6,9 @@ const FOLLOW_BACK_MODULE_KEY = "follow_back";
 const BUMPS_MODULE_KEY = "bumps";
 const { LIKES_MODULE_KEY, LIKES_DISCOVERY_JOB_KEY } = require("./likes-constants");
 const { FOLLOW_AUTOMATION_MODULE_KEY, UNFOLLOW_FAN_ACTION_TYPE, FOLLOW_FAN_ACTION_TYPE } = require("./follow-automation-constants");
-const SUPPORTED_MODULE_KEYS = new Set([FOLLOW_BACK_MODULE_KEY, BUMPS_MODULE_KEY, LIKES_MODULE_KEY, FOLLOW_AUTOMATION_MODULE_KEY]);
+const { SFS_MODULE_KEY, SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY, SFS_UNFOLLOW_TARGET_ACTION_TYPE } = require("./sfs-constants");
+const { DEFAULT_SFS_SETTINGS, normalizeSfsSettings } = require("./sfs-rules");
+const SUPPORTED_MODULE_KEYS = new Set([FOLLOW_BACK_MODULE_KEY, BUMPS_MODULE_KEY, LIKES_MODULE_KEY, FOLLOW_AUTOMATION_MODULE_KEY, SFS_MODULE_KEY]);
 const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"];
 const QUEUED_DELIVERY_STATUSES = ["QUEUED", "RETRY_SCHEDULED"];
 
@@ -236,6 +238,7 @@ function normalizeModuleSettings(moduleKey, value) {
   if (moduleKey === BUMPS_MODULE_KEY) return normalizeBumpSettings(value);
   if (moduleKey === LIKES_MODULE_KEY) return normalizeLikesSettings(value);
   if (moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) return normalizeFollowAutomationSettings(value);
+  if (moduleKey === SFS_MODULE_KEY) return normalizeSfsSettings(value);
   return object(value);
 }
 
@@ -256,6 +259,7 @@ async function getRows({ agencyId, creatorId, db = prisma }) {
     moduleScopeKey(creatorId, BUMPS_MODULE_KEY),
     moduleScopeKey(creatorId, LIKES_MODULE_KEY),
     moduleScopeKey(creatorId, FOLLOW_AUTOMATION_MODULE_KEY),
+    moduleScopeKey(creatorId, SFS_MODULE_KEY),
   ];
   const rows = await db.automationControlState.findMany({ where: { agencyId, scopeKey: { in: scopeKeys } } });
   return new Map(rows.map((row) => [row.scopeKey, row]));
@@ -282,17 +286,20 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
   const bumpsRow = rows.get(moduleScopeKey(creatorId, BUMPS_MODULE_KEY));
   const likesRow = rows.get(moduleScopeKey(creatorId, LIKES_MODULE_KEY));
   const followRow = rows.get(moduleScopeKey(creatorId, FOLLOW_AUTOMATION_MODULE_KEY));
+  const sfsRow = rows.get(moduleScopeKey(creatorId, SFS_MODULE_KEY));
   const workspaceSettings = normalizeWorkspaceSettings(workspace?.settings);
   const followBackSettings = normalizeFollowBackSettings(followBackRow?.settings);
   const bumpSettings = normalizeBumpSettings(bumpsRow?.settings);
   const likesSettings = normalizeLikesSettings(likesRow?.settings);
   const followSettings = normalizeFollowAutomationSettings(followRow?.settings);
+  const sfsSettings = normalizeSfsSettings(sfsRow?.settings);
   const workspaceEnabled = workspace?.enabled !== false;
   const creatorEnabled = creatorRow?.enabled !== false;
   const followBack = moduleSnapshot(followBackRow, followBackSettings, workspaceEnabled, creatorEnabled);
   const bumps = moduleSnapshot(bumpsRow, bumpSettings, workspaceEnabled, creatorEnabled);
   const likes = moduleSnapshot(likesRow, likesSettings, workspaceEnabled, creatorEnabled);
   const follow = moduleSnapshot(followRow, followSettings, workspaceEnabled, creatorEnabled);
+  const sfs = moduleSnapshot(sfsRow, sfsSettings, workspaceEnabled, creatorEnabled);
   return {
     creator,
     workspace: { enabled: workspaceEnabled, settings: workspaceSettings, updatedAt: workspace?.updatedAt || null },
@@ -302,6 +309,7 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
       [BUMPS_MODULE_KEY]: bumps,
       [LIKES_MODULE_KEY]: likes,
       [FOLLOW_AUTOMATION_MODULE_KEY]: follow,
+      [SFS_MODULE_KEY]: sfs,
     },
     effective: {
       workspaceEnabled,
@@ -310,6 +318,7 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
       bumpsEnabled: bumps.effectiveEnabled,
       likesEnabled: likes.effectiveEnabled,
       followEnabled: follow.effectiveEnabled,
+      sfsEnabled: sfs.effectiveEnabled,
     },
   };
 }
@@ -330,6 +339,11 @@ async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey
         // Workspace/creator disable still pauses every write, including recovery.
         ...(moduleKey === FOLLOW_AUTOMATION_MODULE_KEY
           ? [{ NOT: { moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE } }]
+          : []),
+        // SFS_UNFOLLOW_TARGET is a safety cleanup after a temporary follow.
+        // Module-only disable must not strand the creator following the target.
+        ...(moduleKey === SFS_MODULE_KEY
+          ? [{ NOT: { moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE } }]
           : []),
       ],
     },
@@ -353,6 +367,7 @@ function effectiveModuleEnabled(snapshot, moduleKey) {
   if (moduleKey === BUMPS_MODULE_KEY) return snapshot.effective.bumpsEnabled;
   if (moduleKey === LIKES_MODULE_KEY) return snapshot.effective.likesEnabled;
   if (moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) return snapshot.effective.followEnabled;
+  if (moduleKey === SFS_MODULE_KEY) return snapshot.effective.sfsEnabled;
   return snapshot.effective.workspaceEnabled && snapshot.effective.creatorEnabled;
 }
 
@@ -412,9 +427,11 @@ async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKe
 async function cancelAutomationJobsForControl({ agencyId, creatorId = null, moduleKey = null, reason, failureCode, db = prisma }) {
   const jobKeys = moduleKey === LIKES_MODULE_KEY
     ? [LIKES_DISCOVERY_JOB_KEY]
-    : moduleKey
-      ? []
-      : [LIKES_DISCOVERY_JOB_KEY];
+    : moduleKey === SFS_MODULE_KEY
+      ? [SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY]
+      : moduleKey
+        ? []
+        : [LIKES_DISCOVERY_JOB_KEY, SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY];
   if (!jobKeys.length) return 0;
   const now = new Date();
   const changed = await db.jobInstance.updateMany({
@@ -533,6 +550,7 @@ module.exports = {
   BUMPS_MODULE_KEY,
   LIKES_MODULE_KEY,
   FOLLOW_AUTOMATION_MODULE_KEY,
+  SFS_MODULE_KEY,
   SUPPORTED_MODULE_KEYS,
   ACTIVE_DELIVERY_STATUSES,
   QUEUED_DELIVERY_STATUSES,
@@ -541,11 +559,13 @@ module.exports = {
   DEFAULT_BUMP_SETTINGS,
   DEFAULT_LIKES_SETTINGS,
   DEFAULT_FOLLOW_AUTOMATION_SETTINGS,
+  DEFAULT_SFS_SETTINGS,
   normalizeWorkspaceSettings,
   normalizeFollowBackSettings,
   normalizeBumpSettings,
   normalizeLikesSettings,
   normalizeFollowAutomationSettings,
+  normalizeSfsSettings,
   getAutomationControlSnapshot,
   setAutomationControl,
   assertAutomationEnabled,

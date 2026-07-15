@@ -47,6 +47,9 @@ const {
   setLikeCandidateState,
 } = require("../services/likes-service");
 const {
+  scheduleSfsDiscovery, planSfsTargets, ensureAutomaticSfs, listSfs, setSfsCandidateState,
+} = require("../services/sfs-service");
+const {
   planFollowAutomation,
   ensureAutomaticFollowAutomation,
   listFollowAutomation,
@@ -94,7 +97,7 @@ router.get("/controls/:creatorId", async (req, res) => {
 const controlSchema = z.object({
   scope: z.enum(["workspace", "creator", "module"]),
   creatorId: z.string().min(1).max(160).optional().nullable(),
-  moduleKey: z.enum(["follow_back", "bumps", "likes", "follow"]).optional().nullable(),
+  moduleKey: z.enum(["follow_back", "bumps", "likes", "follow", "sfs"]).optional().nullable(),
   enabled: z.boolean().optional(),
   settings: z.record(z.unknown()).optional(),
 });
@@ -116,7 +119,8 @@ router.patch("/controls", seniorRequired, async (req, res) => {
       const runBumps = input.scope !== "module" || input.moduleKey === "bumps";
       const runLikes = input.scope !== "module" || input.moduleKey === "likes";
       const runFollowAutomation = input.scope !== "module" || input.moduleKey === "follow";
-      const [followBack, bumps, likes, followAutomation] = await Promise.all([
+      const runSfs = input.scope !== "module" || input.moduleKey === "sfs";
+      const [followBack, bumps, likes, followAutomation, sfs] = await Promise.all([
         runFollowBack ? ensureAutomaticFollowBack({
           agencyId: req.auth.agencyId,
           creatorId: input.creatorId,
@@ -138,8 +142,9 @@ router.patch("/controls", seniorRequired, async (req, res) => {
           creatorId: input.creatorId,
           source: "control_update",
         }) : null,
+        runSfs ? ensureAutomaticSfs({ agencyId: req.auth.agencyId, creatorId: input.creatorId, source: "control_update" }) : null,
       ]);
-      planning = { followBack, bumps, likes, followAutomation };
+      planning = { followBack, bumps, likes, followAutomation, sfs };
     }
     return res.json({ ...result, planning });
   } catch (error) {
@@ -473,6 +478,59 @@ const deliveryQuerySchema = z.object({
   offset: z.coerce.number().int().min(0).optional(),
   limit: z.coerce.number().int().min(1).max(500).optional(),
 });
+const sfsListSchema = z.object({
+  search: z.string().max(160).optional(),
+  state: z.string().max(60).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+router.get("/sfs/:creatorId", async (req, res) => {
+  try {
+    const query = sfsListSchema.parse(req.query || {});
+    return res.json(await listSfs({
+      agencyId: req.auth.agencyId, creatorId: req.params.creatorId, search: query.search || "",
+      state: query.state || null, offset: query.offset || 0, limit: query.limit || 100,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "SFS_LIST_FAILED");
+  }
+});
+router.post("/sfs/:creatorId/discover", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({ force: z.boolean().optional(), source: z.string().max(80).optional() }).parse(req.body || {});
+    return res.status(202).json(await scheduleSfsDiscovery({
+      agencyId: req.auth.agencyId, creatorId: req.params.creatorId, userId: req.auth.userId,
+      force: input.force === true, source: input.source || "manual_ui", priority: 90,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "SFS_DISCOVERY_FAILED");
+  }
+});
+router.post("/sfs/:creatorId/plan", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({ candidateId: z.string().max(160).optional(), source: z.string().max(80).optional(), limit: z.coerce.number().int().min(1).max(100).optional() }).parse(req.body || {});
+    return res.status(202).json(await planSfsTargets({
+      agencyId: req.auth.agencyId, creatorId: req.params.creatorId, userId: req.auth.userId,
+      candidateId: input.candidateId || null, source: input.source || (input.candidateId ? "candidate_run" : "manual_run"),
+      priority: input.candidateId ? 100 : 70, limit: input.limit || 20,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "SFS_PLAN_FAILED");
+  }
+});
+router.post("/sfs/:creatorId/candidates/:candidateId/action", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({ action: z.enum(["ignore", "block", "restore", "run", "retry"]) }).parse(req.body || {});
+    return res.json(await setSfsCandidateState({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId, candidateId: req.params.candidateId, action: input.action }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "SFS_CANDIDATE_ACTION_FAILED");
+  }
+});
+
 router.get("/deliveries", async (req, res) => {
   try {
     const query = deliveryQuerySchema.parse(req.query || {});

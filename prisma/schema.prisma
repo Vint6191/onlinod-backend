@@ -119,6 +119,7 @@ model Agency {
   automationControls AutomationControlState[]
   followBackCandidates FollowBackCandidate[]
   followAutomationCandidates FollowAutomationCandidate[]
+  sfsTargetCandidates SfsTargetCandidate[]
   automationBumpFanStates AutomationBumpFanState[]
   automationContentCandidates AutomationContentCandidate[]
   automationContentDiscoveryStates AutomationContentDiscoveryState[]
@@ -208,6 +209,7 @@ model CreatorAccount {
   automationControls AutomationControlState[]
   followBackCandidates FollowBackCandidate[]
   followAutomationCandidates FollowAutomationCandidate[]
+  sfsTargetCandidates SfsTargetCandidate[]
   automationBumpFanStates AutomationBumpFanState[]
   automationContentCandidates AutomationContentCandidate[]
   automationContentDiscoveryStates AutomationContentDiscoveryState[]
@@ -1755,6 +1757,54 @@ model FollowAutomationCandidate {
   @@index([creatorId, cooldownUntil])
   @@index([creatorId, waitReturnUntil])
   @@index([snapshotRunId])
+}
+
+model SfsTargetCandidate {
+  id                       String   @id @default(cuid())
+  agencyId                 String
+  creatorId                String
+  targetUserId             String?
+  username                 String
+  displayName              String?
+  avatarUrl                String?
+  subscribePriceCents      Int      @default(0)
+  isWantComments           Boolean?
+  creatorFollowing         Boolean?
+  sourcePostIds            Json     @default("[]")
+  state                    String   @default("CANDIDATE")
+  phase                    String   @default("DISCOVERY")
+  eligibilityReason        String?
+  ignored                  Boolean  @default(false)
+  blocked                  Boolean  @default(false)
+  usedForever              Boolean  @default(false)
+  generation               Int      @default(0)
+  cooldownUntil            DateTime?
+  latestDeliveryId         String?
+  latestActionType         String?
+  latestStatus             String?
+  latestError              String?
+  scanJobId                String?
+  safetyUnfollowDeliveryId String?
+  commentsPlanned          Int      @default(0)
+  likesPlanned             Int      @default(0)
+  unfollowAt               DateTime?
+  discoveredAt             DateTime @default(now())
+  lastSeenAt               DateTime @default(now())
+  completedAt              DateTime?
+  metadata                 Json     @default("{}")
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, username])
+  @@index([agencyId, creatorId, state])
+  @@index([creatorId, targetUserId])
+  @@index([creatorId, phase])
+  @@index([creatorId, usedForever])
+  @@index([creatorId, unfollowAt])
+  @@index([scanJobId])
 }
 
 model AutomationBumpFanState {

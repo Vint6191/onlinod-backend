@@ -33,6 +33,7 @@ const { ensureAutomaticFollowBack } = require("./follow-back-service");
 const { ensureAutomaticBumps } = require("./bump-service");
 const { ensureAutomaticLikes } = require("./likes-service");
 const { ensureAutomaticFollowAutomation } = require("./follow-automation-service");
+const { ensureAutomaticSfs } = require("./sfs-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -196,6 +197,10 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   });
   if (followAutomationDecision.created) created.push("follow_automation_plan");
   else skipped.push(`follow_automation_plan:${followAutomationDecision.reason}`);
+
+  const sfsDecision = await ensureAutomaticSfs({ agencyId, creatorId, source: "recurring_scheduler" });
+  if (sfsDecision?.planning?.created || sfsDecision?.discovery?.created) created.push("sfs_plan");
+  else skipped.push(`sfs_plan:${sfsDecision?.planning?.reason || sfsDecision?.discovery?.reason || sfsDecision?.reason || "skipped"}`);
 
   return { created, skipped };
 }
