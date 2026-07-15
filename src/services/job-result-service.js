@@ -22,6 +22,14 @@ const {
   cleanupSubscriberScanHistory,
 } = require("./subscriber-directory-service");
 
+const {
+  DIALOG_INTELLIGENCE_JOB_KEY,
+  applyDialogIntelligenceChunk,
+  applyPurchaseSignalsChunk,
+  completeDialogIntelligenceJob,
+  recordDialogIntelligenceFailure,
+} = require("./dialog-intelligence-service");
+
 const EARNINGS_JOB_KEY = "fetch_earnings";
 const CAMPAIGNS_JOB_KEY = "fetch_campaigns";
 const PRESENCE_JOB_KEY = "refresh_online_presence";
@@ -128,6 +136,12 @@ async function applyTrafficResult({ job, deviceId, userId, result }) {
 }
 
 async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
+  if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
+    return applyDialogIntelligenceChunk({ db, job, deviceId, userId, chunkResult });
+  }
+  if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "dialog_purchase_signals") {
+    return applyPurchaseSignalsChunk({ db, job, deviceId, userId, chunkResult });
+  }
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
     return applySubscriberScanChunk({ db, job, deviceId, userId, chunkResult });
   }
@@ -141,7 +155,10 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   return null;
 }
 
-async function applyJobResult({ job, deviceId, userId, result }) {
+async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
+  if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
+    return completeDialogIntelligenceJob({ db, job, deviceId, userId, result: result || {} });
+  }
   if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ job, deviceId, userId, result });
   if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ job, deviceId, userId, result });
   if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ job, deviceId, userId, result });
@@ -159,6 +176,9 @@ async function applyJobResult({ job, deviceId, userId, result }) {
 }
 
 async function recordJobFailure({ job, error, terminal = true }) {
+  if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
+    return recordDialogIntelligenceFailure({ job, error, terminal });
+  }
   if (job.jobKey === CATCHUP_JOB_KEY) return recordCatchupJobFailure({ job, error });
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) return recordSubscriberScanFailure({ job, error, terminal });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return recordLikesDiscoveryFailure({ job, error, terminal });

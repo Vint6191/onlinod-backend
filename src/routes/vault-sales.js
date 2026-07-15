@@ -4,6 +4,10 @@ const express = require("express");
 const prisma = require("../prisma");
 const { cleanString, optionalString, jsonArray, jsonObject, centsFromAny, parseLimit, parseOffset, requireCreator, sendError } = require("../services/server-store-utils");
 
+const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { audit } = require("../services/audit-service");
+const { rebuildCreatorAggregates, scheduleDialogScan } = require("../services/dialog-intelligence-service");
+
 const router = express.Router();
 
 function parseDate(value) {
@@ -11,6 +15,21 @@ function parseDate(value) {
   const d = new Date(value);
   return Number.isFinite(d.getTime()) ? d : null;
 }
+
+const LEGACY_VAULT_SALES_MUTATIONS = new Set([
+  "POST /purchase-messages/upsert",
+  "POST /purchase-messages/bulk",
+  "POST /media-sales/upsert",
+  "POST /media-sales/bulk",
+]);
+router.use((req, res, next) => {
+  if (!LEGACY_VAULT_SALES_MUTATIONS.has(`${req.method} ${req.path}`)) return next();
+  return res.status(410).json({
+    ok: false,
+    code: "LEGACY_VAULT_SALES_DISABLED",
+    error: "Legacy Alpha Vault Sales ingestion is disabled; use Dialog Intelligence projection endpoints.",
+  });
+});
 
 router.get("/purchase-messages", async (req, res) => {
   try {
@@ -151,6 +170,133 @@ router.get("/summary/:creatorId", async (req, res) => {
     ]);
     return res.json({ ok: true, summary: { creatorId, messageCount: messageAgg._count._all || 0, grossCents: messageAgg._sum.amountCents || 0, soldMediaCount: soldCount, allocatedCents: saleAgg._sum.allocatedAmountCents || 0, pendingCount } });
   } catch (err) { return sendError(res, err, "VAULT_SALES_SUMMARY_FAILED"); }
+});
+
+
+function seniorRequired(req, res, next) {
+  const member = req.auth?.membership || req.member;
+  if (!member || !isSeniorAgencyMember(member)) {
+    return res.status(403).json({ ok: false, code: "VAULT_SALES_WRITE_FORBIDDEN", error: "Owner, admin or manager permission is required" });
+  }
+  return next();
+}
+
+router.get("/v2/summary/:creatorId", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.params.creatorId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const soldWhere = {
+      agencyId: req.auth.agencyId,
+      creatorId,
+      isOpened: true,
+      isFree: false,
+      priceCents: { gt: 0 },
+      status: { notIn: ["REFUNDED", "INVALID", "EXCLUDED_FAN_MEDIA"] },
+    };
+    const [sold, opened, notOpened, free, unresolved, buyers, deletedBuyers, assets, lastSale] = await Promise.all([
+      prisma.vaultPurchaseLedger.aggregate({ where: soldWhere, _sum: { priceCents: true }, _count: { _all: true } }),
+      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, isOpened: true, isFree: false } }),
+      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, isOpened: false, isFree: false, priceCents: { gt: 0 } } }),
+      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, OR: [{ isFree: true }, { priceCents: { lte: 0 } }] } }),
+      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, resolveState: { not: "RESOLVED" } } }),
+      prisma.vaultPurchaseLedger.findMany({ where: soldWhere, distinct: ["buyerId"], select: { buyerId: true }, take: 100000 }),
+      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, buyerDeleted: true } }),
+      prisma.vaultAssetSalesAggregate.count({ where: { agencyId: req.auth.agencyId, creatorId, soldCount: { gt: 0 } } }),
+      prisma.vaultPurchaseLedger.findFirst({ where: soldWhere, orderBy: { purchasedAt: "desc" }, select: { purchasedAt: true } }),
+    ]);
+    return res.json({
+      ok: true,
+      summary: {
+        creatorId,
+        soldAssets: assets,
+        totalSales: sold._count._all || 0,
+        revenueCents: sold._sum.priceCents || 0,
+        opened: opened,
+        notOpened,
+        free,
+        unresolved,
+        uniqueBuyers: buyers.filter((item) => item.buyerId).length,
+        deletedBuyers,
+        lastSaleAt: lastSale?.purchasedAt || null,
+      },
+    });
+  } catch (err) { return sendError(res, err, "VAULT_SALES_V2_SUMMARY_FAILED"); }
+});
+
+router.get("/v2/assets", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.query.creatorId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const take = parseLimit(req.query.limit, 100, 250);
+    const skip = parseOffset(req.query.offset);
+    const mediaType = cleanString(req.query.mediaType, 80);
+    const where = { agencyId: req.auth.agencyId, creatorId, ...(mediaType ? { mediaType } : {}) };
+    const [items, count] = await Promise.all([
+      prisma.vaultAssetSalesAggregate.findMany({ where, orderBy: [{ totalRevenueCents: "desc" }, { lastSoldAt: "desc" }], skip, take }),
+      prisma.vaultAssetSalesAggregate.count({ where }),
+    ]);
+    return res.json({ ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count });
+  } catch (err) { return sendError(res, err, "VAULT_SALES_V2_ASSETS_FAILED"); }
+});
+
+router.get("/v2/purchases", async (req, res) => {
+  try {
+    const creatorId = cleanString(req.query.creatorId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const take = parseLimit(req.query.limit, 100, 250);
+    const skip = parseOffset(req.query.offset);
+    const status = cleanString(req.query.status, 60);
+    const buyerId = cleanString(req.query.buyerId, 160);
+    const assetId = cleanString(req.query.assetId, 240);
+    const from = parseDate(req.query.from);
+    const to = parseDate(req.query.to);
+    const where = {
+      agencyId: req.auth.agencyId,
+      creatorId,
+      ...(status ? { status } : {}),
+      ...(buyerId ? { buyerId } : {}),
+      ...(from || to ? { purchasedAt: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } : {}),
+      ...(assetId ? { media: { some: { assetId } } } : {}),
+    };
+    const [items, count] = await Promise.all([
+      prisma.vaultPurchaseLedger.findMany({ where, orderBy: [{ purchasedAt: "desc" }, { id: "desc" }], skip, take, include: { media: true } }),
+      prisma.vaultPurchaseLedger.count({ where }),
+    ]);
+    return res.json({ ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count });
+  } catch (err) { return sendError(res, err, "VAULT_SALES_V2_PURCHASES_FAILED"); }
+});
+
+router.post("/v2/reconcile/:creatorId", seniorRequired, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.params.creatorId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const signals = await prisma.dialogPurchaseSignal.findMany({
+      where: { agencyId: req.auth.agencyId, creatorId, resolveState: { not: "RESOLVED" }, dialogId: { not: null }, sourceMessageId: { not: null } },
+      orderBy: { lastSeenAt: "asc" },
+      take: Math.max(1, Math.min(1000, Number(req.body?.limit) || 250)),
+    });
+    let scheduled = 0;
+    for (const signal of signals) {
+      const result = await scheduleDialogScan({
+        agencyId: req.auth.agencyId, creatorId, dialogId: signal.dialogId, fanId: signal.buyerId,
+        mode: "targeted", targetMessageId: signal.sourceMessageId, source: "vault_reconciliation",
+        priority: 120, userId: req.auth.userId,
+      });
+      if (result.created) scheduled += 1;
+    }
+    await audit({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, action: "vault_sales.reconciliation_started", targetType: "creator", targetId: creatorId, metadata: { selected: signals.length, scheduled } });
+    return res.status(202).json({ ok: true, selected: signals.length, scheduled });
+  } catch (err) { return sendError(res, err, "VAULT_SALES_RECONCILE_FAILED"); }
+});
+
+router.post("/v2/rebuild/:creatorId", seniorRequired, async (req, res) => {
+  try {
+    const creatorId = cleanString(req.params.creatorId, 100);
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const result = await rebuildCreatorAggregates({ agencyId: req.auth.agencyId, creatorId });
+    await audit({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, action: "vault_sales.aggregate_rebuilt", targetType: "creator", targetId: creatorId, metadata: result });
+    return res.json(result);
+  } catch (err) { return sendError(res, err, "VAULT_SALES_REBUILD_FAILED"); }
 });
 
 module.exports = router;

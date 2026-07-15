@@ -136,6 +136,25 @@ const RETENTION_FIELDS = Object.freeze({
     hint: "AuditLog and AdminActionLog retention. Keep long for investigations.",
   },
 
+  dialogScanChunkDays: {
+    label: "Dialog scan chunk commits",
+    unit: "days",
+    env: "ONLINOD_DIALOG_SCAN_CHUNK_DAYS",
+    fallback: 30,
+    min: 1,
+    max: 365,
+    hint: "Technical idempotency/progress commits only; normalized Dialog Ledger is retained.",
+  },
+  dialogScanRunDays: {
+    label: "Dialog scan run history",
+    unit: "days",
+    env: "ONLINOD_DIALOG_SCAN_RUN_DAYS",
+    fallback: 180,
+    min: 7,
+    max: 3650,
+    hint: "Terminal run metadata only; messages, purchases and aggregates are retained.",
+  },
+
   trafficSourceMemberNoRevenueDays: {
     label: "Dead source members without revenue",
     unit: "days",
@@ -601,6 +620,29 @@ async function runTrafficRetentionSweep(options = {}) {
   return summarizeSweep("traffic", out);
 }
 
+async function runDialogIntelligenceRetentionSweep(options = {}) {
+  const cfg = await resolveSweepConfig(options);
+  const out = [];
+  out.push(await deleteByIdsInBatches({
+    model: prisma.dialogScanChunkCommit,
+    batchSize: cfg.batchSize,
+    label: `dialogScanChunkCommit.old_${cfg.dialogScanChunkDays}d`,
+    orderBy: { committedAt: "asc" },
+    where: { committedAt: { lt: daysAgo(cfg.dialogScanChunkDays) } },
+  }));
+  out.push(await deleteByIdsInBatches({
+    model: prisma.dialogScanRun,
+    batchSize: cfg.batchSize,
+    label: `dialogScanRun.terminal_${cfg.dialogScanRunDays}d`,
+    orderBy: { updatedAt: "asc" },
+    where: {
+      status: { in: ["COMPLETED", "FAILED", "CANCELED"] },
+      updatedAt: { lt: daysAgo(cfg.dialogScanRunDays) },
+    },
+  }));
+  return summarizeSweep("dialogIntelligence", out);
+}
+
 async function runAuditLogRetentionSweep(options = {}) {
   const cfg = await resolveSweepConfig(options);
   const olderThan = daysAgo(cfg.auditLogDays);
@@ -638,22 +680,24 @@ async function runRetentionSweep(options = {}) {
   }
 
   try {
-    const [teamActivity, teamLedgers, traffic, automation, auditLogs] = await Promise.all([
+    const [teamActivity, teamLedgers, traffic, automation, dialogIntelligence, auditLogs] = await Promise.all([
       runTeamActivityRetentionSweep(options),
       runTeamLedgerRetentionSweep(options),
       runTrafficRetentionSweep(options),
       runAutomationRetentionSweep(options),
+      runDialogIntelligenceRetentionSweep(options),
       runAuditLogRetentionSweep(options),
     ]);
 
     return {
       ok: true,
       elapsedMs: Date.now() - startedAt,
-      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0) + (auditLogs.totalDeleted || 0),
+      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0) + (dialogIntelligence.totalDeleted || 0) + (auditLogs.totalDeleted || 0),
       teamActivity,
       teamLedgers,
       traffic,
       automation,
+      dialogIntelligence,
       auditLogs,
       lock: useLock ? "advisory" : "disabled",
     };
@@ -674,6 +718,7 @@ module.exports = {
   runTeamLedgerRetentionSweep,
   runTrafficRetentionSweep,
   runAutomationRetentionSweep,
+  runDialogIntelligenceRetentionSweep,
   runAuditLogRetentionSweep,
   getRetentionSettings,
   updateRetentionSettings,

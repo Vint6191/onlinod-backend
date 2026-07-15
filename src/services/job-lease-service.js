@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-result-service");
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
+const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 const MIN_LEASE_MS = 30 * 1000;
@@ -238,6 +239,28 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     });
     if (!updatedFence.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before progress");
     const sideEffect = await applyJobChunk({ db: tx, job, deviceId, userId, chunkResult });
+    if (sideEffect?.completeAfterCommit === true) {
+      await tx.jobInstance.update({
+        where: { id: job.id },
+        data: {
+          continuation: {
+            driverPhase: "complete",
+            result: sideEffect.completionResult || {},
+            progress: safeProgress(progress) ?? job.progress,
+          },
+        },
+      });
+    } else if (sideEffect?.jobContinuationOverride) {
+      await tx.jobInstance.update({
+        where: { id: job.id },
+        data: {
+          continuation: {
+            driverPhase: "execute",
+            jobContinuation: sideEffect.jobContinuationOverride,
+          },
+        },
+      });
+    }
     const updated = await tx.jobInstance.findUnique({ where: { id: job.id } });
     return {
       id: updated.id,
@@ -253,16 +276,46 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
 
 async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, result, progress }) {
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
-  const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
   const now = new Date();
-  const updated = await prisma.jobInstance.updateMany({
-    where: { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: hashToken(leaseToken), leaseRevision, leaseUntil: { gt: now } },
-    data: {
-      status: "DONE", completedAt: now, leaseUntil: null, leaseTokenHash: null, workId: clean(workId, 200) || job.workId,
-      continuation: null, progress: safeProgress(progress) || { percent: 100, message: "completed" }, lastProgressAt: now,
-      result: result || null, lastError: null,
-    },
-  });
+  const fenceWhere = {
+    id: job.id,
+    status: "CLAIMED",
+    claimedByDeviceId: deviceId,
+    leaseTokenHash: hashToken(leaseToken),
+    leaseRevision,
+    leaseUntil: { gt: now },
+  };
+  const completionData = {
+    status: "DONE",
+    completedAt: now,
+    leaseUntil: null,
+    leaseTokenHash: null,
+    workId: clean(workId, 200) || job.workId,
+    continuation: null,
+    progress: safeProgress(progress) || { percent: 100, message: "completed" },
+    lastProgressAt: now,
+    result: result || null,
+    lastError: null,
+  };
+
+  // Dialog completion mutates its durable run/state. Fence the lease first and
+  // perform both transitions in the same PostgreSQL transaction so a reclaimed
+  // worker cannot close the run or move its watermark.
+  if (job.jobKey === "dialog_intelligence_scan") {
+    return prisma.$transaction(async (tx) => {
+      const { sideEffect } = await completeDialogJobFenced({
+        tx,
+        fenceWhere,
+        completionData,
+        staleError: () => new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion"),
+        applySideEffect: (db) => applyJobResult({ db, job, deviceId, userId, result: result || {} }),
+      });
+      return { job: { id: job.id, status: "DONE" }, sideEffect };
+    });
+  }
+
+  const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
+  const updated = await prisma.jobInstance.updateMany({ where: fenceWhere, data: completionData });
   if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion");
   return { job: { id: job.id, status: "DONE" }, sideEffect };
 }

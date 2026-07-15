@@ -5,6 +5,7 @@ const JOB_CATALOG = Object.freeze({
   fetch_campaigns: Object.freeze({ wave: "read-only", scope: "creator" }),
   traffic_sources_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
   catchup_notifications_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
+  dialog_intelligence_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
   subscriber_directory_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
   likes_content_discovery: Object.freeze({ wave: "read-only", scope: "creator" }),
   sfs_target_discovery: Object.freeze({ wave: "read-only", scope: "creator" }),

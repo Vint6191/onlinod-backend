@@ -130,6 +130,16 @@ model Agency {
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
+  dialogScanStates DialogScanState[]
+  dialogScanRuns DialogScanRun[]
+  dialogScanChunkCommits DialogScanChunkCommit[]
+  dialogReconciliationTargets DialogReconciliationTarget[]
+  dialogMessageLedgers DialogMessageLedger[]
+  dialogMessageMedia DialogMessageMedia[]
+  dialogPurchaseSignals DialogPurchaseSignal[]
+  vaultPurchaseLedgers VaultPurchaseLedger[]
+  vaultPurchaseMediaRelations VaultPurchaseMedia[]
+  vaultAssetSalesAggregates VaultAssetSalesAggregate[]
   teamObservationStates TeamObservationState[]
   trafficSources TrafficSource[]
   trafficSourceMembers TrafficSourceMember[]
@@ -221,6 +231,16 @@ model CreatorAccount {
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
+  dialogScanStates DialogScanState[]
+  dialogScanRuns DialogScanRun[]
+  dialogScanChunkCommits DialogScanChunkCommit[]
+  dialogReconciliationTargets DialogReconciliationTarget[]
+  dialogMessageLedgers DialogMessageLedger[]
+  dialogMessageMedia DialogMessageMedia[]
+  dialogPurchaseSignals DialogPurchaseSignal[]
+  vaultPurchaseLedgers VaultPurchaseLedger[]
+  vaultPurchaseMediaRelations VaultPurchaseMedia[]
+  vaultAssetSalesAggregates VaultAssetSalesAggregate[]
   teamObservationStates TeamObservationState[]
   trafficSources TrafficSource[]
   trafficSourceMembers TrafficSourceMember[]
@@ -2163,6 +2183,335 @@ model VaultMediaSale {
   @@index([agencyId])
   @@index([creatorId, mediaId])
   @@index([creatorId, status])
+}
+
+
+model DialogScanState {
+  id                    String   @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  dialogId              String
+  fanId                 String?
+  initialScanComplete   Boolean  @default(false)
+  status                String   @default("IDLE")
+  generation            Int      @default(0)
+  scanMode              String   @default("initial")
+  newestMessageId       String?
+  newestMessageAt       DateTime?
+  oldestMessageId       String?
+  oldestMessageAt       DateTime?
+  forwardCursor         String?
+  backwardCursor        String?
+  confirmedWatermarkMessageId String?
+  confirmedWatermarkAt  DateTime?
+  incrementalGapOpen    Boolean  @default(false)
+  lastFullScanAt        DateTime?
+  lastIncrementalScanAt DateTime?
+  lastWsEventAt         DateTime?
+  lastCatchupAt         DateTime?
+  lastError             String?
+  activeRunId           String?
+  activeJobId           String?
+  pagesProcessed        Int      @default(0)
+  messagesProcessed     Int      @default(0)
+  mediaProcessed        Int      @default(0)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, dialogId])
+  @@index([agencyId, status])
+  @@index([creatorId, status])
+  @@index([activeRunId])
+  @@index([activeJobId])
+}
+
+model DialogReconciliationTarget {
+  id              String    @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  dialogId        String
+  messageId       String
+  fanId           String?
+  source          String    @default("targeted_reconciliation")
+  status          String    @default("PENDING")
+  priority        Int       @default(120)
+  attempts        Int       @default(0)
+  requestedAt     DateTime  @default(now())
+  lastAttemptAt   DateTime?
+  resolvedAt      DateTime?
+  lastError       String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, dialogId, messageId])
+  @@index([agencyId, status, priority, requestedAt])
+  @@index([creatorId, dialogId, status, priority, requestedAt])
+}
+
+model DialogScanRun {
+  id                    String    @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  dialogId              String
+  fanId                 String?
+  jobId                 String?   @unique
+  mode                  String
+  source                String    @default("manual")
+  status                String    @default("QUEUED")
+  generation            Int       @default(0)
+  continuation          Json?
+  progress              Json?
+  pagesProcessed        Int       @default(0)
+  messagesProcessed     Int       @default(0)
+  mediaProcessed        Int       @default(0)
+  purchaseSignals       Int       @default(0)
+  startedAt             DateTime?
+  completedAt           DateTime?
+  pausedAt              DateTime?
+  canceledAt            DateTime?
+  createdByUserId       String?
+  createdByDeviceId     String?
+  lastWorkerDeviceId    String?
+  lastError             String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  chunks  DialogScanChunkCommit[]
+
+  @@index([agencyId, status])
+  @@index([creatorId, dialogId, status])
+  @@index([jobId])
+  @@index([createdAt])
+}
+
+model DialogScanChunkCommit {
+  id            String   @id @default(cuid())
+  agencyId      String
+  creatorId     String
+  runId         String
+  jobId         String
+  dialogId      String
+  chunkKey      String
+  mode          String
+  cursorIn      String?
+  cursorOut     String?
+  page          Int      @default(0)
+  messageCount  Int      @default(0)
+  mediaCount    Int      @default(0)
+  hasMore       Boolean  @default(false)
+  committedAt   DateTime @default(now())
+  result        Json     @default("{}")
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  run     DialogScanRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, chunkKey])
+  @@index([jobId])
+  @@index([creatorId, dialogId, committedAt])
+}
+
+model DialogMessageLedger {
+  id            String    @id @default(cuid())
+  agencyId      String
+  creatorId     String
+  dialogId      String
+  messageId     String
+  fanId         String?
+  senderId      String?
+  recipientId   String?
+  direction     String
+  messageType   String     @default("message")
+  text          String?
+  priceCents    Int        @default(0)
+  currency      String     @default("USD")
+  isFree        Boolean    @default(false)
+  isOpened      Boolean    @default(false)
+  isFromCreator Boolean    @default(false)
+  isFromFan     Boolean    @default(false)
+  createdAtOf   DateTime
+  changedAtOf   DateTime?
+  deletedAt     DateTime?
+  source        String
+  firstSeenAt   DateTime   @default(now())
+  lastSeenAt    DateTime   @default(now())
+  contentHash   String?
+  metadata      Json       @default("{}")
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  agency    Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator   CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  media     DialogMessageMedia[]
+  purchases VaultPurchaseLedger[]
+
+  @@unique([creatorId, messageId])
+  @@index([agencyId, dialogId, createdAtOf])
+  @@index([creatorId, dialogId, createdAtOf])
+  @@index([creatorId, fanId, createdAtOf])
+  @@index([creatorId, isOpened, changedAtOf])
+  @@index([deletedAt])
+}
+
+model DialogMessageMedia {
+  id              String    @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  messageLedgerId String
+  messageId       String
+  mediaId         String
+  assetId         String?
+  mediaType       String?
+  ownerId         String?
+  ownership       String     @default("UNKNOWN")
+  isFanMedia      Boolean    @default(false)
+  preview         Json       @default("{}")
+  durationMs      Int?
+  canView         Boolean?
+  firstSeenAt     DateTime   @default(now())
+  lastSeenAt      DateTime   @default(now())
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  agency        Agency              @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator       CreatorAccount      @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  messageLedger DialogMessageLedger @relation(fields: [messageLedgerId], references: [id], onDelete: Cascade)
+
+  @@unique([messageLedgerId, mediaId])
+  @@unique([creatorId, messageId, mediaId])
+  @@index([creatorId, assetId])
+  @@index([creatorId, isFanMedia])
+}
+
+model DialogPurchaseSignal {
+  id               String   @id @default(cuid())
+  agencyId         String
+  creatorId        String
+  idempotencyKey   String   @unique
+  sourceEventId    String?
+  sourceMessageId  String?
+  dialogId         String?
+  buyerId          String?
+  buyerUsername    String?
+  buyerDisplayName String?
+  buyerDeleted     Boolean  @default(false)
+  occurredAt       DateTime
+  amountCents      Int      @default(0)
+  currency         String   @default("USD")
+  source           String   @default("notification")
+  resolveState     String   @default("PENDING")
+  firstSeenAt      DateTime @default(now())
+  lastSeenAt       DateTime @default(now())
+  resolvedAt       DateTime?
+  metadata         Json     @default("{}")
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, sourceEventId])
+  @@index([creatorId, sourceMessageId])
+  @@index([creatorId, dialogId, occurredAt])
+  @@index([resolveState, lastSeenAt])
+}
+
+model VaultPurchaseLedger {
+  id               String    @id @default(cuid())
+  agencyId         String
+  creatorId        String
+  messageLedgerId  String?
+  idempotencyKey   String    @unique
+  sourceEventId    String?
+  sourceMessageId  String?
+  dialogId         String?
+  buyerId          String?
+  buyerUsername    String?
+  buyerDisplayName String?
+  purchasedAt      DateTime
+  priceCents       Int       @default(0)
+  currency         String    @default("USD")
+  isOpened         Boolean   @default(false)
+  isFree           Boolean   @default(false)
+  status           String
+  resolveState     String
+  buyerDeleted     Boolean   @default(false)
+  sourceDeleted    Boolean   @default(false)
+  firstSeenAt      DateTime  @default(now())
+  lastSeenAt       DateTime  @default(now())
+  resolvedAt       DateTime?
+  metadata         Json      @default("{}")
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  agency        Agency               @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator       CreatorAccount       @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  messageLedger DialogMessageLedger? @relation(fields: [messageLedgerId], references: [id], onDelete: SetNull)
+  media         VaultPurchaseMedia[]
+
+  @@unique([creatorId, sourceEventId])
+  @@index([agencyId, creatorId, purchasedAt])
+  @@index([creatorId, status, purchasedAt])
+  @@index([creatorId, sourceMessageId])
+  @@index([creatorId, buyerId])
+}
+
+model VaultPurchaseMedia {
+  id               String   @id @default(cuid())
+  agencyId         String
+  creatorId        String
+  purchaseId       String
+  mediaId          String
+  assetId          String?
+  mediaType        String?
+  isFanMedia       Boolean  @default(false)
+  resolutionStatus String   @default("RESOLVED")
+  allocatedCents   Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  agency   Agency              @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator  CreatorAccount      @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  purchase VaultPurchaseLedger @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  @@unique([purchaseId, mediaId])
+  @@index([creatorId, assetId])
+  @@index([creatorId, resolutionStatus])
+}
+
+model VaultAssetSalesAggregate {
+  id              String    @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  assetId         String
+  mediaId         String?
+  mediaType       String?
+  preview         Json      @default("{}")
+  soldCount       Int       @default(0)
+  totalRevenueCents Int     @default(0)
+  uniqueBuyers    Int       @default(0)
+  averagePriceCents Int     @default(0)
+  openedCount     Int       @default(0)
+  notOpenedCount  Int       @default(0)
+  freeCount       Int       @default(0)
+  lastSoldAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, assetId])
+  @@index([agencyId, creatorId, totalRevenueCents])
+  @@index([creatorId, lastSoldAt])
 }
 
 model BumpDeliveryStat {
