@@ -30,6 +30,7 @@ const { runRetentionSweep, getRetentionSettings } = require("./retention-service
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
 const { ensureAutomaticFollowBack } = require("./follow-back-service");
+const { ensureAutomaticBumps } = require("./bump-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -169,6 +170,14 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   });
   if (followBackDecision.created) created.push("follow_back_plan");
   else skipped.push(`follow_back_plan:${followBackDecision.reason}`);
+
+  const bumpDecision = await ensureAutomaticBumps({
+    agencyId,
+    creatorId,
+    source: "recurring_scheduler",
+  });
+  if (bumpDecision.created) created.push(`bumps_plan:${bumpDecision.planned}`);
+  else skipped.push(`bumps_plan:${bumpDecision.reason}`);
 
   return { created, skipped };
 }

@@ -704,6 +704,20 @@ async function setHiddenOnlineStatus({ agencyId, creatorId, fanId, status }) {
       lastSignalAt: item.observedAt,
     },
   });
+  await prisma.automationBumpFanState.upsert({
+    where: { creatorId_fanId: { creatorId, fanId } },
+    create: {
+      agencyId, creatorId, fanId, dialogId: item.dialogId || fanId,
+      ignored: normalizedStatus === "ignored",
+      blocked: normalizedStatus === "blocked",
+      metadata: { source: "hidden_online_status", statusChangedAt: new Date().toISOString() },
+    },
+    update: {
+      dialogId: item.dialogId || fanId,
+      ignored: normalizedStatus === "ignored",
+      blocked: normalizedStatus === "blocked",
+    },
+  });
   return { ok: true, creatorId, fanId, status: row.status, item: row };
 }
 

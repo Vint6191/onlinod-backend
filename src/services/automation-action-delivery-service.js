@@ -4,6 +4,15 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 const { assertAutomationEnabled } = require("./automation-control-service");
+const { claimPacingRetryAt } = require("./automation-pacing-service");
+const {
+  validateBumpDelivery,
+  finalizeBumpSend,
+  finalizeBumpDelete,
+  finalizeBumpFailure,
+  finalizeBumpTerminal,
+  prepareBumpRetry,
+} = require("./bump-service");
 
 const CLAIMABLE_STATUSES = ["QUEUED", "RETRY_SCHEDULED"];
 const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"];
@@ -39,6 +48,11 @@ function retryDelayMs(attempt, failureCode, retryAfterMs) {
   if (Number.isFinite(explicit) && explicit > 0) return Math.max(5_000, Math.min(24 * 60 * 60_000, Math.floor(explicit)));
   if (failureCode === "rate_limited") return Math.min(60 * 60_000, 60_000 * Math.max(1, attempt) ** 2);
   return Math.min(30 * 60_000, 30_000 * Math.max(1, attempt));
+}
+function validDate(value, fallback = null) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed : fallback;
 }
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
 function nextDayStart(date = new Date()) { const out = dayStart(date); out.setDate(out.getDate() + 1); return out; }
@@ -92,8 +106,11 @@ async function scopedReadyCreatorIds({ userId, device }) {
 
 async function sweepExpiredActionLeases(now = new Date()) {
   const rows = await prisma.automationDelivery.findMany({
-    where: { status: { in: ["CLAIMED", "RUNNING"] }, claimUntil: { lt: now }, moduleKey: { not: "bumps" } },
-    select: { id: true, attempts: true, maxAttempts: true, result: true, leaseRevision: true },
+    where: { status: { in: ["CLAIMED", "RUNNING"] }, claimUntil: { lt: now } },
+    select: {
+      id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true,
+      payload: true, contentCollectionId: true, attempts: true, maxAttempts: true, result: true, leaseRevision: true,
+    },
     take: 10000,
   });
   let changed = 0;
@@ -132,7 +149,13 @@ async function sweepExpiredActionLeases(now = new Date()) {
             result: { ...object(row.result), leaseExpiredAt: now.toISOString() },
           },
     });
-    if (updated.count) changed += 1;
+    if (updated.count) {
+      changed += 1;
+      if (terminal && row.moduleKey === "bumps") {
+        const latest = await prisma.automationDelivery.findUnique({ where: { id: row.id } });
+        await finalizeBumpFailure({ delivery: latest, failureCode: "lease_lost", retryable: false });
+      }
+    }
   }
   return changed;
 }
@@ -253,7 +276,46 @@ async function deferOrSkipFollowBackClaim(delivery, control, now) {
   return false;
 }
 
-async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["FOLLOW_BACK"] }) {
+async function applyBumpValidationTransition(delivery, validation, now = new Date()) {
+  if (!delivery || delivery.moduleKey !== "bumps" || validation?.ok !== false) return false;
+  const terminal = validation.terminal === true;
+  const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
+  return prisma.$transaction(async (tx) => {
+    const changed = await tx.automationDelivery.updateMany({
+      where: {
+        id: delivery.id,
+        status: { in: [...CLAIMABLE_STATUSES, "CLAIMED", "RUNNING"] },
+        leaseRevision: delivery.leaseRevision,
+      },
+      data: {
+        status,
+        failureCode: validation.code || "bump_validation_failed",
+        lastError: validation.code || "bump_validation_failed",
+        notBefore: terminal ? delivery.notBefore : (validation.retryAt || new Date(now.getTime() + 30_000)),
+        finishedAt: terminal ? now : null,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        leaseTokenHash: null,
+        leaseRevision: { increment: 1 },
+        lastCheckedAt: now,
+      },
+    });
+    if (!changed.count) return false;
+    if (terminal) {
+      const latest = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+      await finalizeBumpTerminal({
+        delivery: latest,
+        status,
+        failureCode: validation.code || "bump_validation_failed",
+        db: tx,
+      });
+    }
+    return true;
+  });
+}
+
+async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE"] }) {
   const { device } = await requireOwnedSeniorDevice({ userId, deviceId });
   await sweepExpiredActionLeases();
   if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60_000)) return { delivery: null, reason: "device_stale" };
@@ -271,6 +333,35 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
       continue;
     }
     if (await deferOrSkipFollowBackClaim(candidate, control, now)) continue;
+    const actionSettings = candidate.moduleKey === "bumps"
+      ? control.modules.bumps.settings
+      : candidate.moduleKey === "follow_back"
+        ? control.modules.follow_back.settings
+        : {
+            minimumIntervalMs: control.workspace.settings.globalWriteMinIntervalMs,
+            maximumIntervalMs: control.workspace.settings.globalWriteMaxIntervalMs,
+            randomJitter: control.workspace.settings.randomJitter,
+          };
+    const pacingRetryAt = await claimPacingRetryAt({
+      delivery: candidate,
+      workspaceSettings: control.workspace.settings,
+      actionSettings,
+      now,
+    });
+    if (pacingRetryAt) {
+      await prisma.automationDelivery.updateMany({
+        where: { id: candidate.id, status: { in: CLAIMABLE_STATUSES }, leaseRevision: candidate.leaseRevision },
+        data: { status: "RETRY_SCHEDULED", notBefore: pacingRetryAt, failureCode: "write_pacing", lastError: null },
+      });
+      continue;
+    }
+    if (candidate.moduleKey === "bumps") {
+      const validation = await validateBumpDelivery({ delivery: candidate, control, now });
+      if (validation.ok === false) {
+        await applyBumpValidationTransition(candidate, validation, now);
+        continue;
+      }
+    }
     const leaseToken = crypto.randomBytes(32).toString("base64url");
     const claimUntil = new Date(now.getTime() + leaseDuration(leaseMs));
     try {
@@ -312,6 +403,14 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
           generation: claimed.generation,
           priority: claimed.priority,
           payload: object(claimed.payload),
+          result: object(claimed.result),
+          createdAt: claimed.createdAt,
+          scheduledAt: claimed.scheduledAt,
+          messageId: claimed.messageId,
+          sentAt: claimed.sentAt,
+          cancelAt: claimed.cancelAt,
+          contentCollectionId: claimed.contentCollectionId,
+          trigger: claimed.trigger,
           attempt: claimed.attempts,
           maxAttempts: claimed.maxAttempts,
           notBefore: claimed.notBefore,
@@ -372,9 +471,18 @@ async function startActionDelivery(input) {
   await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
   if (delivery.notBefore.getTime() > Date.now()) throw new ActionDeliveryError("DELIVERY_NOT_DUE", "Delivery is not due yet");
   if (delivery.status === "RUNNING") return { ok: true, delivery };
+  const now = new Date();
   const updated = await prisma.automationDelivery.updateMany({
     where: { id: delivery.id, status: "CLAIMED", leaseRevision: input.leaseRevision, claimedByDeviceId: input.deviceId },
-    data: { status: "RUNNING", lastCheckedAt: new Date() },
+    data: {
+      status: "RUNNING",
+      lastCheckedAt: now,
+      result: {
+        ...object(delivery.result),
+        attemptStartedAt: now.toISOString(),
+        attemptLeaseRevision: delivery.leaseRevision,
+      },
+    },
   });
   if (!updated.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before start");
   const running = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
@@ -385,6 +493,13 @@ async function startActionDelivery(input) {
 async function validateActionDelivery(input) {
   const delivery = await requireLease(input);
   const control = await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  if (delivery.moduleKey === "bumps") {
+    const validation = await validateBumpDelivery({ delivery, control, now: new Date() });
+    if (validation.ok === false) {
+      await applyBumpValidationTransition(delivery, validation, new Date());
+      throw new ActionDeliveryError(validation.code || "BUMP_VALIDATION_FAILED", validation.code || "Bump delivery validation failed");
+    }
+  }
   return { ok: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, control: control.effective };
 }
 
@@ -416,27 +531,45 @@ async function completeActionDelivery(input) {
   const result = object(input.result);
   const outcomeCode = clean(input.outcomeCode, 120) || clean(result.code, 120) || null;
   const terminalStatus = input.status === "SKIPPED" ? "SKIPPED" : "COMPLETED";
-  const updated = await prisma.automationDelivery.updateMany({
-    where: {
-      id: delivery.id,
-      status: { in: ["CLAIMED", "RUNNING"] },
-      claimedByDeviceId: input.deviceId,
-      leaseTokenHash: hashToken(input.leaseToken),
-      leaseRevision: input.leaseRevision,
-    },
-    data: {
-      status: terminalStatus,
-      failureCode: terminalStatus === "SKIPPED" ? outcomeCode : null,
-      lastError: null,
-      result,
-      finishedAt: now,
-      lastCheckedAt: now,
-      claimUntil: null,
-      // Keep the hashed token/device/revision for idempotent completion retries.
-    },
-  });
-  if (!updated.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before completion");
-  const finalDelivery = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
+  const finalDelivery = await prisma.$transaction(async (tx) => {
+    const changed = await tx.automationDelivery.updateMany({
+      where: {
+        id: delivery.id,
+        status: { in: ["CLAIMED", "RUNNING"] },
+        claimedByDeviceId: input.deviceId,
+        leaseTokenHash: hashToken(input.leaseToken),
+        leaseRevision: input.leaseRevision,
+      },
+      data: {
+        status: terminalStatus,
+        failureCode: terminalStatus === "SKIPPED" ? outcomeCode : null,
+        lastError: null,
+        result,
+        messageId: clean(result.messageId, 160) || delivery.messageId,
+        sentAt: delivery.actionType === "SEND_MESSAGE" ? validDate(result.sentAt, now) : delivery.sentAt,
+        cancelAt: validDate(result.cancelAt, delivery.cancelAt),
+        finishedAt: now,
+        lastCheckedAt: now,
+        claimUntil: null,
+      },
+    });
+    if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before completion");
+    const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    if (current?.moduleKey === "bumps") {
+      if (current.actionType === "SEND_MESSAGE" && terminalStatus === "COMPLETED") {
+        const finalized = await finalizeBumpSend({ delivery: current, result, db: tx });
+        if (finalized) {
+          await tx.automationDelivery.update({
+            where: { id: current.id },
+            data: { messageId: finalized.messageId, sentAt: finalized.sentAt, cancelAt: finalized.cancelAt },
+          });
+        }
+      } else if (current.actionType === "DELETE_MESSAGE") {
+        await finalizeBumpDelete({ delivery: current, result, outcomeCode, db: tx });
+      }
+    }
+    return tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+  }, { timeout: 30_000 });
   await updateCandidateFromTerminal(finalDelivery, terminalStatus, outcomeCode);
   return { ok: true, duplicate: false, delivery: finalDelivery };
 }
@@ -449,7 +582,13 @@ async function failActionDelivery(input) {
   const retryable = input.retryable === true && delivery.attempts < delivery.maxAttempts;
   const nextStatus = retryable ? "RETRY_SCHEDULED" : "FAILED";
   const nextNotBefore = retryable ? new Date(now.getTime() + retryDelayMs(delivery.attempts, failureCode, input.retryAfterMs)) : delivery.notBefore;
-  const result = { ...object(delivery.result), ...object(input.result), failedAt: now.toISOString(), retryable };
+  const result = {
+    ...object(delivery.result),
+    ...object(input.result),
+    failureCode,
+    failedAt: now.toISOString(),
+    retryable,
+  };
   const changed = await prisma.automationDelivery.updateMany({
     where: {
       id: delivery.id,
@@ -476,7 +615,10 @@ async function failActionDelivery(input) {
   if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before failure update");
   const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
   if (retryable) await updateCandidateProgress(updated, "RETRY_SCHEDULED", failureCode);
-  else await updateCandidateFromTerminal(updated, "FAILED", failureCode);
+  else {
+    await updateCandidateFromTerminal(updated, "FAILED", failureCode);
+    await finalizeBumpFailure({ delivery: updated, failureCode, retryable: false });
+  }
   return { ok: true, retryable, retryAt: retryable ? nextNotBefore : null, delivery: updated };
 }
 
@@ -500,6 +642,7 @@ async function releaseActionDelivery(input) {
       claimUntil: null,
       leaseTokenHash: null,
       leaseRevision: { increment: 1 },
+      attempts: { decrement: 1 },
       failureCode: null,
       lastError: clean(input.reason, 500),
       result: { ...object(delivery.result), releasedAt: now.toISOString(), releaseReason: clean(input.reason, 500) },
@@ -535,6 +678,7 @@ async function listActionDeliveries({ agencyId, creatorId, moduleKey, actionType
         dialogId: true, idempotencyKey: true, generation: true, priority: true, payload: true, status: true,
         scheduledAt: true, notBefore: true, attempts: true, maxAttempts: true, claimedByDeviceId: true,
         claimedAt: true, claimUntil: true, leaseRevision: true, failureCode: true, lastError: true, result: true,
+        messageId: true, sentAt: true, cancelAt: true, contentCollectionId: true, trigger: true,
         createdAt: true, updatedAt: true, finishedAt: true,
       },
     }),
@@ -552,27 +696,41 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
   if (delivery.failureCode && ["permission_denied", "invalid_payload", "fan_not_found", "blocked", "creator_revoked"].includes(delivery.failureCode)) {
     throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Failure ${delivery.failureCode} requires a new action generation`);
   }
-  await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
-  const retryAt = new Date();
-  const changed = await prisma.automationDelivery.updateMany({
-    where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
-    data: {
-      status: "QUEUED",
-      attempts: 0,
-      notBefore: retryAt,
-      failureCode: null,
-      lastError: null,
-      finishedAt: null,
-      claimedByDeviceId: null,
-      claimedAt: null,
-      claimUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-      result: { ...object(delivery.result), retriedAt: retryAt.toISOString() },
-    },
+  const control = await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  let retryAt = new Date();
+  if (delivery.moduleKey === "bumps") {
+    const validation = await validateBumpDelivery({ delivery, control, now: retryAt });
+    if (validation.ok === false && validation.terminal === true) {
+      throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Bump delivery is no longer valid: ${validation.code || "validation_failed"}`);
+    }
+    if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
+  }
+  const updated = await prisma.$transaction(async (tx) => {
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
+      data: {
+        status: "QUEUED",
+        attempts: 0,
+        notBefore: retryAt,
+        failureCode: null,
+        lastError: null,
+        finishedAt: null,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        leaseTokenHash: null,
+        leaseRevision: { increment: 1 },
+        result: { ...object(delivery.result), retriedAt: retryAt.toISOString() },
+      },
+    });
+    if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before retry");
+    const latest = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    if (latest?.moduleKey === "bumps") {
+      const prepared = await prepareBumpRetry({ delivery: latest, db: tx });
+      if (!prepared?.changed) throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", "Bump fan state no longer permits retry");
+    }
+    return latest;
   });
-  if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before retry");
-  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
   await updateCandidateProgress(updated, "QUEUED");
   return { ok: true, delivery: updated };
 }
@@ -582,22 +740,28 @@ async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_can
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   const finishedAt = new Date();
-  const changed = await prisma.automationDelivery.updateMany({
-    where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
-    data: {
-      status: "CANCELED",
-      failureCode: "canceled",
-      lastError: clean(reason, 500),
-      finishedAt,
-      claimedByDeviceId: null,
-      claimedAt: null,
-      claimUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-    },
+  const updated = await prisma.$transaction(async (tx) => {
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
+      data: {
+        status: "CANCELED",
+        failureCode: "canceled",
+        lastError: clean(reason, 500),
+        finishedAt,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        leaseTokenHash: null,
+        leaseRevision: { increment: 1 },
+      },
+    });
+    if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before cancel");
+    const latest = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    if (latest?.moduleKey === "bumps") {
+      await finalizeBumpTerminal({ delivery: latest, status: "CANCELED", failureCode: "canceled", db: tx });
+    }
+    return latest;
   });
-  if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before cancel");
-  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
   await updateCandidateFromTerminal(updated, "CANCELED", "canceled");
   return { ok: true, duplicate: false, delivery: updated };
 }
@@ -616,6 +780,7 @@ async function releaseClaimByAdmin({ agencyId, deliveryId }) {
       claimUntil: null,
       leaseTokenHash: null,
       leaseRevision: { increment: 1 },
+      attempts: { decrement: 1 },
       lastError: "Claim released by administrator",
     },
   });

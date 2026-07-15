@@ -32,6 +32,13 @@ const {
   listFollowBack,
   getAutomationOverview,
 } = require("../services/follow-back-service");
+const {
+  planBumps,
+  processRuntimeEvents,
+  getBumpOverview,
+  triggerPendingReplyScan,
+  ensureAutomaticBumps,
+} = require("../services/bump-service");
 
 const router = express.Router();
 
@@ -74,7 +81,7 @@ router.get("/controls/:creatorId", async (req, res) => {
 const controlSchema = z.object({
   scope: z.enum(["workspace", "creator", "module"]),
   creatorId: z.string().min(1).max(160).optional().nullable(),
-  moduleKey: z.enum(["follow_back"]).optional().nullable(),
+  moduleKey: z.enum(["follow_back", "bumps"]).optional().nullable(),
   enabled: z.boolean().optional(),
   settings: z.record(z.unknown()).optional(),
 });
@@ -90,13 +97,25 @@ router.patch("/controls", seniorRequired, async (req, res) => {
       enabled: input.enabled,
       settings: input.settings,
     });
-    const planning = input.creatorId
-      ? await ensureAutomaticFollowBack({
+    let planning = null;
+    if (input.creatorId) {
+      const runFollowBack = input.scope !== "module" || input.moduleKey === "follow_back";
+      const runBumps = input.scope !== "module" || input.moduleKey === "bumps";
+      const [followBack, bumps] = await Promise.all([
+        runFollowBack ? ensureAutomaticFollowBack({
           agencyId: req.auth.agencyId,
           creatorId: input.creatorId,
           source: "control_update",
-        })
-      : null;
+        }) : null,
+        runBumps ? ensureAutomaticBumps({
+          agencyId: req.auth.agencyId,
+          creatorId: input.creatorId,
+          userId: req.auth.userId,
+          source: "control_update",
+        }) : null,
+      ]);
+      planning = { followBack, bumps };
+    }
     return res.json({ ...result, planning });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
@@ -178,6 +197,86 @@ router.post("/follow-back/:creatorId/candidates/:fanId/action", seniorRequired, 
   }
 });
 
+
+const bumpPlanSchema = z.object({
+  source: z.enum(["online", "hidden_online", "paid_subscriber", "free_subscriber", "subscription_event", "manual"]).optional(),
+  fanIds: z.array(z.string().min(1).max(160)).max(500).optional(),
+  limit: z.number().int().min(1).max(500).optional(),
+  manual: z.boolean().optional(),
+});
+router.get("/bumps/:creatorId/overview", async (req, res) => {
+  try {
+    await requireCreator(req.auth.agencyId, req.params.creatorId);
+    return res.json(await getBumpOverview({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId }));
+  } catch (error) { return serviceError(res, error, "BUMPS_OVERVIEW_FAILED"); }
+});
+router.post("/bumps/:creatorId/plan", seniorRequired, async (req, res) => {
+  try {
+    const input = bumpPlanSchema.parse(req.body || {});
+    return res.status(202).json(await planBumps({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      userId: req.auth.userId,
+      source: input.source || "manual",
+      fanIds: input.fanIds || [],
+      limit: input.limit || null,
+      manual: input.manual !== false,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "BUMPS_PLAN_FAILED");
+  }
+});
+router.post("/bumps/:creatorId/events", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({
+      deviceId: z.string().min(1).max(160),
+      events: z.array(z.record(z.unknown())).max(500),
+    }).parse(req.body || {});
+    const freshAfter = new Date(Date.now() - 5 * 60_000);
+    const binding = await prisma.deviceCreatorBinding.findFirst({
+      where: {
+        agencyId: req.auth.agencyId,
+        creatorId: req.params.creatorId,
+        deviceId: input.deviceId,
+        status: "ACTIVE",
+        lastSeenAt: { gte: freshAfter },
+        device: { agencyId: req.auth.agencyId, userId: req.auth.userId, lastSeenAt: { gte: freshAfter } },
+      },
+      select: { id: true },
+    });
+    if (!binding) {
+      return res.status(403).json({
+        ok: false,
+        code: "RUNTIME_EVENT_DEVICE_NOT_READY",
+        error: "Runtime events require a fresh active device/creator binding",
+      });
+    }
+    return res.json(await processRuntimeEvents({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      userId: req.auth.userId,
+      events: input.events,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "BUMPS_EVENTS_FAILED");
+  }
+});
+router.post("/bumps/:creatorId/reply-scan", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({ limit: z.number().int().min(1).max(500).optional() }).parse(req.body || {});
+    return res.status(202).json(await triggerPendingReplyScan({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      limit: input.limit || 100,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "BUMPS_REPLY_SCAN_FAILED");
+  }
+});
+
 const deliveryQuerySchema = z.object({
   creatorId: z.string().max(160).optional(),
   moduleKey: z.string().max(80).optional(),
@@ -251,7 +350,7 @@ router.post("/worker/claim", async (req, res) => {
     const input = z.object({
       deviceId: z.string().min(3).max(160),
       leaseMs: z.number().int().min(30_000).max(10 * 60_000).optional(),
-      actionTypes: z.array(z.enum(["FOLLOW_BACK"])).min(1).max(20).optional(),
+      actionTypes: z.array(z.enum(["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE"])).min(1).max(20).optional(),
     }).parse(req.body || {});
     return res.json({ ok: true, ...(await claimActionDelivery({ userId: req.auth.userId, deviceId: input.deviceId, leaseMs: input.leaseMs, actionTypes: input.actionTypes })) });
   } catch (error) {

@@ -1704,20 +1704,35 @@ model FollowBackCandidate {
 }
 
 model AutomationBumpFanState {
-  id              String   @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  fanId           String
-  dialogId        String?
-  lastTemplateId  String?
-  lastStatus      String?
-  lastSentAt      DateTime?
-  lastFinalizedAt DateTime?
-  lastMessageId   String?
-  templateIds     Json     @default("[]")
-  counters        Json     @default("{}")
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id                    String   @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  fanId                 String
+  dialogId              String?
+  lastTemplateId        String?
+  lastStatus            String?
+  lastSentAt            DateTime?
+  lastAnySentAt         DateTime?
+  lastAnyRepliedAt      DateTime?
+  lastBumpSentAt        DateTime?
+  lastTemplateSentAt    DateTime?
+  lastFinalizedAt       DateTime?
+  lastMessageId         String?
+  lastReplyMessageId    String?
+  pendingMessageId      String?
+  pendingDeliveryId     String?
+  pendingCancelAt       DateTime?
+  cooldownUntil         DateTime?
+  templateCooldownUntil DateTime?
+  lastOnlineAt          DateTime?
+  sendGeneration        Int      @default(0)
+  ignored               Boolean  @default(false)
+  blocked               Boolean  @default(false)
+  templateIds           Json     @default("[]")
+  counters              Json     @default("{}")
+  metadata              Json     @default("{}")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
   agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
@@ -1726,6 +1741,9 @@ model AutomationBumpFanState {
   @@index([agencyId])
   @@index([creatorId, updatedAt])
   @@index([lastSentAt])
+  @@index([creatorId, pendingCancelAt])
+  @@index([creatorId, cooldownUntil])
+  @@index([creatorId, lastOnlineAt])
 }
 
 model SubscriberScanRun {

@@ -3,6 +3,8 @@
 const prisma = require("../prisma");
 
 const FOLLOW_BACK_MODULE_KEY = "follow_back";
+const BUMPS_MODULE_KEY = "bumps";
+const SUPPORTED_MODULE_KEYS = new Set([FOLLOW_BACK_MODULE_KEY, BUMPS_MODULE_KEY]);
 const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"];
 const QUEUED_DELIVERY_STATUSES = ["QUEUED", "RETRY_SCHEDULED"];
 
@@ -28,6 +30,29 @@ const DEFAULT_FOLLOW_BACK_SETTINGS = Object.freeze({
   refollowCooldownDays: 14,
   attentionTouchEnabled: false,
   likesEnabled: false,
+});
+
+const DEFAULT_BUMP_SETTINGS = Object.freeze({
+  enabled: false,
+  automatic: false,
+  onlineEnabled: true,
+  hiddenOnlineEnabled: true,
+  paidSubscribersEnabled: true,
+  freeSubscribersEnabled: true,
+  subscriptionEventsEnabled: true,
+  dailyLimit: 250,
+  minimumIntervalMs: 15_000,
+  maximumIntervalMs: 30_000,
+  randomJitter: true,
+  maxAttempts: 3,
+  deleteAfterNoReplyMs: 60 * 60_000,
+  hiddenRetryIntervalMs: 3 * 60 * 60_000,
+  afterReplyCooldownMs: 24 * 60 * 60_000,
+  afterSendCooldownMs: 6 * 60 * 60_000,
+  sameTemplateCooldownMs: 24 * 60 * 60_000,
+  onlineObservationTtlMs: 2 * 60_000,
+  candidateBatchSize: 50,
+  verifyRecentMessagesLimit: 20,
 });
 
 function object(value) {
@@ -83,6 +108,45 @@ function normalizeFollowBackSettings(value) {
   };
 }
 
+function normalizeBumpSettings(value) {
+  const input = object(value);
+  const minimumIntervalMs = int(input.minimumIntervalMs, DEFAULT_BUMP_SETTINGS.minimumIntervalMs, 15_000, 30 * 60_000);
+  const maximumIntervalMs = int(
+    input.maximumIntervalMs,
+    DEFAULT_BUMP_SETTINGS.maximumIntervalMs,
+    Math.max(minimumIntervalMs, DEFAULT_BUMP_SETTINGS.maximumIntervalMs),
+    60 * 60_000,
+  );
+  return {
+    enabled: bool(input.enabled, DEFAULT_BUMP_SETTINGS.enabled),
+    automatic: bool(input.automatic, DEFAULT_BUMP_SETTINGS.automatic),
+    onlineEnabled: bool(input.onlineEnabled, DEFAULT_BUMP_SETTINGS.onlineEnabled),
+    hiddenOnlineEnabled: bool(input.hiddenOnlineEnabled, DEFAULT_BUMP_SETTINGS.hiddenOnlineEnabled),
+    paidSubscribersEnabled: bool(input.paidSubscribersEnabled, DEFAULT_BUMP_SETTINGS.paidSubscribersEnabled),
+    freeSubscribersEnabled: bool(input.freeSubscribersEnabled, DEFAULT_BUMP_SETTINGS.freeSubscribersEnabled),
+    subscriptionEventsEnabled: bool(input.subscriptionEventsEnabled, DEFAULT_BUMP_SETTINGS.subscriptionEventsEnabled),
+    dailyLimit: int(input.dailyLimit, DEFAULT_BUMP_SETTINGS.dailyLimit, 0, 100_000),
+    minimumIntervalMs,
+    maximumIntervalMs,
+    randomJitter: bool(input.randomJitter, DEFAULT_BUMP_SETTINGS.randomJitter),
+    maxAttempts: int(input.maxAttempts, DEFAULT_BUMP_SETTINGS.maxAttempts, 1, 10),
+    deleteAfterNoReplyMs: int(input.deleteAfterNoReplyMs, DEFAULT_BUMP_SETTINGS.deleteAfterNoReplyMs, 60_000, 14 * 24 * 60 * 60_000),
+    hiddenRetryIntervalMs: int(input.hiddenRetryIntervalMs, DEFAULT_BUMP_SETTINGS.hiddenRetryIntervalMs, 5 * 60_000, 30 * 24 * 60 * 60_000),
+    afterReplyCooldownMs: int(input.afterReplyCooldownMs, DEFAULT_BUMP_SETTINGS.afterReplyCooldownMs, 0, 90 * 24 * 60 * 60_000),
+    afterSendCooldownMs: int(input.afterSendCooldownMs, DEFAULT_BUMP_SETTINGS.afterSendCooldownMs, 0, 90 * 24 * 60 * 60_000),
+    sameTemplateCooldownMs: int(input.sameTemplateCooldownMs, DEFAULT_BUMP_SETTINGS.sameTemplateCooldownMs, 0, 90 * 24 * 60 * 60_000),
+    onlineObservationTtlMs: int(input.onlineObservationTtlMs, DEFAULT_BUMP_SETTINGS.onlineObservationTtlMs, 30_000, 60 * 60_000),
+    candidateBatchSize: int(input.candidateBatchSize, DEFAULT_BUMP_SETTINGS.candidateBatchSize, 1, 500),
+    verifyRecentMessagesLimit: int(input.verifyRecentMessagesLimit, DEFAULT_BUMP_SETTINGS.verifyRecentMessagesLimit, 5, 100),
+  };
+}
+
+function normalizeModuleSettings(moduleKey, value) {
+  if (moduleKey === FOLLOW_BACK_MODULE_KEY) return normalizeFollowBackSettings(value);
+  if (moduleKey === BUMPS_MODULE_KEY) return normalizeBumpSettings(value);
+  return object(value);
+}
+
 async function requireCreator(agencyId, creatorId, db = prisma) {
   const creator = await db.creatorAccount.findFirst({
     where: { id: creatorId, agencyId, deletedAt: null },
@@ -93,9 +157,26 @@ async function requireCreator(agencyId, creatorId, db = prisma) {
 }
 
 async function getRows({ agencyId, creatorId, db = prisma }) {
-  const scopeKeys = [workspaceScopeKey(), creatorScopeKey(creatorId), moduleScopeKey(creatorId, FOLLOW_BACK_MODULE_KEY)];
+  const scopeKeys = [
+    workspaceScopeKey(),
+    creatorScopeKey(creatorId),
+    moduleScopeKey(creatorId, FOLLOW_BACK_MODULE_KEY),
+    moduleScopeKey(creatorId, BUMPS_MODULE_KEY),
+  ];
   const rows = await db.automationControlState.findMany({ where: { agencyId, scopeKey: { in: scopeKeys } } });
   return new Map(rows.map((row) => [row.scopeKey, row]));
+}
+
+function moduleSnapshot(row, settings, workspaceEnabled, creatorEnabled) {
+  const configuredEnabled = row?.enabled === true;
+  const enabled = configuredEnabled && settings.enabled === true;
+  return {
+    enabled,
+    configuredEnabled,
+    settings: { ...settings, enabled },
+    updatedAt: row?.updatedAt || null,
+    effectiveEnabled: workspaceEnabled && creatorEnabled && enabled,
+  };
 }
 
 async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }) {
@@ -103,28 +184,28 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
   const rows = await getRows({ agencyId, creatorId, db });
   const workspace = rows.get(workspaceScopeKey());
   const creatorRow = rows.get(creatorScopeKey(creatorId));
-  const followBack = rows.get(moduleScopeKey(creatorId, FOLLOW_BACK_MODULE_KEY));
+  const followBackRow = rows.get(moduleScopeKey(creatorId, FOLLOW_BACK_MODULE_KEY));
+  const bumpsRow = rows.get(moduleScopeKey(creatorId, BUMPS_MODULE_KEY));
   const workspaceSettings = normalizeWorkspaceSettings(workspace?.settings);
-  const followBackSettings = normalizeFollowBackSettings(followBack?.settings);
+  const followBackSettings = normalizeFollowBackSettings(followBackRow?.settings);
+  const bumpSettings = normalizeBumpSettings(bumpsRow?.settings);
   const workspaceEnabled = workspace?.enabled !== false;
   const creatorEnabled = creatorRow?.enabled !== false;
-  const moduleEnabled = followBack?.enabled === true && followBackSettings.enabled === true;
+  const followBack = moduleSnapshot(followBackRow, followBackSettings, workspaceEnabled, creatorEnabled);
+  const bumps = moduleSnapshot(bumpsRow, bumpSettings, workspaceEnabled, creatorEnabled);
   return {
     creator,
     workspace: { enabled: workspaceEnabled, settings: workspaceSettings, updatedAt: workspace?.updatedAt || null },
     creatorControl: { enabled: creatorEnabled, settings: object(creatorRow?.settings), updatedAt: creatorRow?.updatedAt || null },
     modules: {
-      [FOLLOW_BACK_MODULE_KEY]: {
-        enabled: moduleEnabled,
-        configuredEnabled: followBack?.enabled === true,
-        settings: { ...followBackSettings, enabled: moduleEnabled },
-        updatedAt: followBack?.updatedAt || null,
-      },
+      [FOLLOW_BACK_MODULE_KEY]: followBack,
+      [BUMPS_MODULE_KEY]: bumps,
     },
     effective: {
       workspaceEnabled,
       creatorEnabled,
-      followBackEnabled: workspaceEnabled && creatorEnabled && moduleEnabled,
+      followBackEnabled: followBack.effectiveEnabled,
+      bumpsEnabled: bumps.effectiveEnabled,
     },
   };
 }
@@ -153,6 +234,12 @@ async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey
   return updated.count;
 }
 
+function effectiveModuleEnabled(snapshot, moduleKey) {
+  if (moduleKey === FOLLOW_BACK_MODULE_KEY) return snapshot.effective.followBackEnabled;
+  if (moduleKey === BUMPS_MODULE_KEY) return snapshot.effective.bumpsEnabled;
+  return snapshot.effective.workspaceEnabled && snapshot.effective.creatorEnabled;
+}
+
 async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKey = null, db = prisma }) {
   const enabled = new Map();
   let cursorId = null;
@@ -178,9 +265,7 @@ async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKe
       if (!enabled.has(key)) {
         try {
           const snapshot = await getAutomationControlSnapshot({ agencyId, creatorId: row.creatorId, db });
-          enabled.set(key, row.moduleKey === FOLLOW_BACK_MODULE_KEY
-            ? snapshot.effective.followBackEnabled
-            : snapshot.effective.workspaceEnabled && snapshot.effective.creatorEnabled);
+          enabled.set(key, effectiveModuleEnabled(snapshot, row.moduleKey));
         } catch {
           enabled.set(key, false);
         }
@@ -195,7 +280,8 @@ async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKe
           status: "QUEUED",
           failureCode: null,
           lastError: null,
-          notBefore: now,
+          // Preserve the original server schedule. Future DELETE_MESSAGE actions
+          // must not become immediately due merely because Automation resumed.
           lastCheckedAt: now,
         },
       });
@@ -213,7 +299,7 @@ async function setAutomationControl({ agencyId, userId, scope, creatorId = null,
     throw Object.assign(new Error("Invalid automation control scope"), { code: "INVALID_CONTROL_SCOPE", status: 400 });
   }
   if (normalizedScope !== "workspace") await requireCreator(agencyId, creatorId, db);
-  if (normalizedScope === "module" && moduleKey !== FOLLOW_BACK_MODULE_KEY) {
+  if (normalizedScope === "module" && !SUPPORTED_MODULE_KEYS.has(moduleKey)) {
     throw Object.assign(new Error("Unsupported module key"), { code: "UNSUPPORTED_MODULE", status: 400 });
   }
 
@@ -226,7 +312,7 @@ async function setAutomationControl({ agencyId, userId, scope, creatorId = null,
   const nextSettings = normalizedScope === "workspace"
     ? normalizeWorkspaceSettings(settings === undefined ? existing?.settings : settings)
     : normalizedScope === "module"
-      ? normalizeFollowBackSettings(settings === undefined ? existing?.settings : settings)
+      ? normalizeModuleSettings(moduleKey, settings === undefined ? existing?.settings : settings)
       : object(settings === undefined ? existing?.settings : settings);
   const nextEnabled = enabled === undefined ? existing?.enabled !== false : enabled === true;
   if (normalizedScope === "module") nextSettings.enabled = nextEnabled;
@@ -280,20 +366,24 @@ async function assertAutomationEnabled({ agencyId, creatorId, moduleKey, db = pr
   const snapshot = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   if (!snapshot.effective.workspaceEnabled) throw Object.assign(new Error("Automation workspace is disabled"), { code: "workspace_disabled", status: 409 });
   if (!snapshot.effective.creatorEnabled) throw Object.assign(new Error("Creator automation is disabled"), { code: "creator_disabled", status: 409 });
-  if (moduleKey === FOLLOW_BACK_MODULE_KEY && !snapshot.effective.followBackEnabled) {
-    throw Object.assign(new Error("Follow Back is disabled"), { code: "module_disabled", status: 409 });
+  if (!effectiveModuleEnabled(snapshot, moduleKey)) {
+    throw Object.assign(new Error(`${moduleKey || "Automation module"} is disabled`), { code: "module_disabled", status: 409 });
   }
   return snapshot;
 }
 
 module.exports = {
   FOLLOW_BACK_MODULE_KEY,
+  BUMPS_MODULE_KEY,
+  SUPPORTED_MODULE_KEYS,
   ACTIVE_DELIVERY_STATUSES,
   QUEUED_DELIVERY_STATUSES,
   DEFAULT_WORKSPACE_SETTINGS,
   DEFAULT_FOLLOW_BACK_SETTINGS,
+  DEFAULT_BUMP_SETTINGS,
   normalizeWorkspaceSettings,
   normalizeFollowBackSettings,
+  normalizeBumpSettings,
   getAutomationControlSnapshot,
   setAutomationControl,
   assertAutomationEnabled,

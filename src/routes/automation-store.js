@@ -12,9 +12,7 @@ const { registerBumpRoutes } = require("./automation/bumps-routes");
 const { registerSfsRoutes } = require("./automation/sfs-routes");
 const { registerJobRoutes } = require("./automation/jobs-routes");
 const { registerEventRoutes } = require("./automation/events-routes");
-const { registerDeliveryRoutes } = require("./automation/deliveries-routes");
 const { registerHiddenOnlineRoutes } = require("./automation/hidden-online-routes");
-const { registerBumpStatsRoutes } = require("./automation/bump-stats-routes");
 
 const router = express.Router();
 
@@ -75,10 +73,10 @@ registerBumpRoutes(router, automationRouteDeps);
 registerSfsRoutes(router, automationRouteDeps);
 registerJobRoutes(router, automationRouteDeps);
 registerEventRoutes(router, automationRouteDeps);
-registerDeliveryRoutes(router, automationDeliveryRouteDeps);
+// P11: legacy Alpha bump delivery routes are physically not registered.
 registerHiddenOnlineRoutes(router, automationDeliveryRouteDeps);
 // P10: legacy Alpha Follow Back routes are intentionally not registered.
 // The only executable path is /api/automation -> AutomationDelivery write control plane.
-registerBumpStatsRoutes(router, automationDeliveryRouteDeps);
+// P11 stats are written only by the fenced /api/automation control plane.
 
 module.exports = router;

@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const {
   FOLLOW_BACK_MODULE_KEY,
   getAutomationControlSnapshot,
@@ -17,7 +18,6 @@ const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDUL
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
 function monthStart(date = new Date()) { return new Date(date.getFullYear(), date.getMonth(), 1); }
-function randomBetween(min, max) { const lo = Math.max(0, Math.floor(min)); const hi = Math.max(lo, Math.floor(max)); return lo + Math.floor(Math.random() * (hi - lo + 1)); }
 async function refreshFollowBackProjection({ db = prisma, agencyId, creatorId, runId }) {
   const run = await db.subscriberScanRun.findFirst({
     where: { id: runId, agencyId, creatorId, status: "PUBLISHED" },
@@ -121,27 +121,6 @@ async function readyWorkerCount({ agencyId, creatorId, db = prisma }) {
   });
 }
 
-async function nextNotBefore({ db, agencyId, creatorId, actionType, workspaceSettings, moduleSettings, now = new Date() }) {
-  const latest = await db.automationDelivery.findFirst({
-    where: { agencyId, creatorId, status: { notIn: ["CANCELED", "SKIPPED"] } },
-    orderBy: [{ notBefore: "desc" }, { finishedAt: "desc" }, { createdAt: "desc" }],
-    select: { notBefore: true, finishedAt: true },
-  });
-  const actionLatest = await db.automationDelivery.findFirst({
-    where: { agencyId, creatorId, actionType, status: { notIn: ["CANCELED", "SKIPPED"] } },
-    orderBy: [{ notBefore: "desc" }, { finishedAt: "desc" }, { createdAt: "desc" }],
-    select: { notBefore: true, finishedAt: true },
-  });
-  const globalDelay = workspaceSettings.randomJitter
-    ? randomBetween(workspaceSettings.globalWriteMinIntervalMs, workspaceSettings.globalWriteMaxIntervalMs)
-    : workspaceSettings.globalWriteMinIntervalMs;
-  const actionDelay = moduleSettings.randomJitter
-    ? randomBetween(moduleSettings.minimumIntervalMs, moduleSettings.maximumIntervalMs)
-    : moduleSettings.minimumIntervalMs;
-  const globalBase = Math.max(latest?.notBefore?.getTime?.() || 0, latest?.finishedAt?.getTime?.() || 0);
-  const actionBase = Math.max(actionLatest?.notBefore?.getTime?.() || 0, actionLatest?.finishedAt?.getTime?.() || 0);
-  return new Date(Math.max(now.getTime(), globalBase + globalDelay, actionBase + actionDelay));
-}
 
 function automaticEligibilityWhere(settings, now = new Date()) {
   const and = [
@@ -273,13 +252,13 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
         continue;
       }
 
-      const notBefore = await nextNotBefore({
+      const notBefore = await nextAutomationWriteSlot({
         db,
         agencyId,
         creatorId,
         actionType: FOLLOW_BACK_ACTION_TYPE,
         workspaceSettings: control.workspace.settings,
-        moduleSettings: settings,
+        actionSettings: settings,
       });
       try {
         const delivery = await db.automationDelivery.create({

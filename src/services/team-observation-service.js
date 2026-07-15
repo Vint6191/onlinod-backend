@@ -6,6 +6,7 @@ const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { upsertPurchaseFromEvent } = require("./team-ppv-ledger-service");
 const { ingestTipEvent } = require("./team-tip-ledger-service");
 const { ingestSubscriptionEvent, markTrafficFanValueDirty } = require("./traffic-service");
+const { processRuntimeEvents: processBumpRuntimeEvents } = require("./bump-service");
 
 const CATCHUP_JOB_KEY = "catchup_notifications_scan";
 const DEFAULT_BUFFER_MS = 2 * 60 * 60 * 1000;
@@ -382,6 +383,7 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
   const params = job?.params && typeof job.params === "object" ? job.params : {};
   const events = eventList(result);
   const now = new Date();
+  const bumpSubscriptionEvents = [];
   const summary = {
     received: events.length,
     ppvCreatedOrUpdated: 0,
@@ -393,6 +395,9 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     deduped: 0,
     skipped: 0,
     errors: 0,
+    bumpSubscriptionEvents: 0,
+    bumpPlanned: 0,
+    bumpErrors: 0,
   };
 
   const markTrafficDirty = async (ev, reason) => {
@@ -480,6 +485,25 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
       }
 
       if (type.includes("subscription") || type.includes("subscrib")) {
+        const subscriptionFanId = clean(ev.fanId || ev.dialogId, 160);
+        if (subscriptionFanId && bumpSubscriptionEvents.length < 500) {
+          bumpSubscriptionEvents.push({
+            type: "subscription_created",
+            fanId: subscriptionFanId,
+            dialogId: clean(ev.dialogId || subscriptionFanId, 160) || subscriptionFanId,
+            createdAt: dateOrNull(ev.subscribedAt || ev.occurredAt || ev.ts) || now,
+            source: "catchup_notifications_scan",
+            fanSnapshot: {
+              id: subscriptionFanId,
+              username: clean(ev.fanUsername || ev.username, 120),
+              name: clean(ev.fanName || ev.name, 160),
+              subscriptionType: String(ev.eventType || type).toLowerCase().includes("paid") ? "paid" : "free",
+              isActive: true,
+              canReceiveChatMessage: true,
+              dialogId: clean(ev.dialogId || subscriptionFanId, 160) || subscriptionFanId,
+            },
+          });
+        }
         const subscriptionAmountCents = amountCents(ev.amountCents) || amountDollarsToCents(ev.amount || ev.price);
         if (subscriptionAmountCents <= 0) {
           summary.subscriptionFreeIgnored += 1;
@@ -522,6 +546,27 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
       summary.errors += 1;
       if (!summary.errorSamples) summary.errorSamples = [];
       if (summary.errorSamples.length < 5) summary.errorSamples.push(err?.message || String(err));
+    }
+  }
+
+  if (bumpSubscriptionEvents.length) {
+    summary.bumpSubscriptionEvents = bumpSubscriptionEvents.length;
+    try {
+      const bumpResult = await processBumpRuntimeEvents({
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        userId,
+        events: bumpSubscriptionEvents,
+      });
+      summary.bumpPlanned = Number(bumpResult?.planned || 0);
+      summary.bumpErrors = Array.isArray(bumpResult?.errors) ? bumpResult.errors.length : 0;
+    } catch (error) {
+      // Revenue catchup must remain durable even when Automation is disabled or
+      // temporarily unavailable. The next published snapshot/recurring planner
+      // can rediscover the same fan without losing the ledger event.
+      summary.bumpErrors += 1;
+      if (!summary.errorSamples) summary.errorSamples = [];
+      if (summary.errorSamples.length < 5) summary.errorSamples.push(`bump:${error?.message || String(error)}`);
     }
   }
 
