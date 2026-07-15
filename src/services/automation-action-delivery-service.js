@@ -3,7 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { isSeniorAgencyMember } = require("../middleware/team-permissions");
-const { assertAutomationEnabled } = require("./automation-control-service");
+const { assertAutomationEnabled, getAutomationControlSnapshot } = require("./automation-control-service");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
 const {
   validateBumpDelivery,
@@ -20,6 +20,20 @@ const {
   finalizeLikeTerminal,
   prepareLikeRetry,
 } = require("./likes-service");
+const {
+  validateFollowAutomationDelivery,
+  finalizeFollowAutomationSuccess,
+  finalizeFollowAutomationFailure,
+  finalizeFollowAutomationTerminal,
+  prepareFollowAutomationRetry,
+} = require("./follow-automation-service");
+const {
+  FOLLOW_AUTOMATION_MODULE_KEY,
+  UNFOLLOW_FAN_ACTION_TYPE,
+  FOLLOW_FAN_ACTION_TYPE,
+  isFollowRecoveryDelivery,
+  mustPreserveRefollowSaga,
+} = require("./follow-automation-constants");
 
 const CLAIMABLE_STATUSES = ["QUEUED", "RETRY_SCHEDULED"];
 const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"];
@@ -63,6 +77,34 @@ function validDate(value, fallback = null) {
 }
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
 function nextDayStart(date = new Date()) { const out = dayStart(date); out.setDate(out.getDate() + 1); return out; }
+
+
+async function assertDeliveryControl(delivery, { allowRunningUnfollow = false } = {}) {
+  if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  const recovery = isFollowRecoveryDelivery(delivery);
+  const runningUnfollow = allowRunningUnfollow
+    && delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY
+    && delivery.actionType === UNFOLLOW_FAN_ACTION_TYPE
+    && delivery.status === "RUNNING";
+  if (!recovery && !runningUnfollow) {
+    return assertAutomationEnabled({
+      agencyId: delivery.agencyId,
+      creatorId: delivery.creatorId,
+      moduleKey: delivery.moduleKey,
+    });
+  }
+  const snapshot = await getAutomationControlSnapshot({
+    agencyId: delivery.agencyId,
+    creatorId: delivery.creatorId,
+  });
+  if (!snapshot.effective.workspaceEnabled) {
+    throw new ActionDeliveryError("workspace_disabled", "Automation workspace is disabled");
+  }
+  if (!snapshot.effective.creatorEnabled) {
+    throw new ActionDeliveryError("creator_disabled", "Creator automation is disabled");
+  }
+  return snapshot;
+}
 
 async function requireOwnedSeniorDevice({ userId, deviceId }) {
   const device = await prisma.workerDevice.findUnique({ where: { id: deviceId } });
@@ -116,13 +158,14 @@ async function sweepExpiredActionLeases(now = new Date()) {
     where: { status: { in: ["CLAIMED", "RUNNING"] }, claimUntil: { lt: now } },
     select: {
       id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true,
-      payload: true, contentCollectionId: true, attempts: true, maxAttempts: true, result: true, leaseRevision: true,
+      payload: true, contentCollectionId: true, status: true, failureCode: true, attempts: true, maxAttempts: true, result: true, leaseRevision: true,
     },
     take: 10000,
   });
   let changed = 0;
   for (const row of rows) {
-    const terminal = row.attempts >= row.maxAttempts;
+    const safetySaga = mustPreserveRefollowSaga(row, "lease_lost");
+    const terminal = !safetySaga && row.attempts >= row.maxAttempts;
     const updated = await prisma.automationDelivery.updateMany({
       where: {
         id: row.id,
@@ -170,6 +213,13 @@ async function sweepExpiredActionLeases(now = new Date()) {
           result: latest?.result || {},
         });
       }
+      if (row.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
+        await finalizeFollowAutomationFailure({
+          delivery: latest,
+          failureCode: "lease_lost",
+          retryable: !terminal,
+        });
+      }
     }
   }
   return changed;
@@ -187,7 +237,7 @@ async function fairCandidates({ agencyId, creatorIds, actionTypes, now }) {
     orderBy: [{ priority: "desc" }, { notBefore: "asc" }, { createdAt: "asc" }],
     take: 100,
   });
-  const withinAttempts = candidates.filter((item) => item.attempts < item.maxAttempts);
+  const withinAttempts = candidates.filter((item) => item.attempts < item.maxAttempts || mustPreserveRefollowSaga(item));
   if (!withinAttempts.length) return [];
   const creatorSet = [...new Set(withinAttempts.map((item) => item.creatorId))];
   const touches = await prisma.automationDelivery.groupBy({
@@ -240,9 +290,33 @@ async function updateLikeCandidateProgress(delivery, status, failureCode = null)
   });
 }
 
+async function updateFollowAutomationCandidateProgress(delivery, status, failureCode = null) {
+  if (!delivery || delivery.moduleKey !== FOLLOW_AUTOMATION_MODULE_KEY) return;
+  const fanId = delivery.targetId || delivery.fanId;
+  if (!fanId) return;
+  const phase = delivery.actionType === FOLLOW_FAN_ACTION_TYPE
+    ? (status === "FAILED" ? "RECOVERY" : "FOLLOW")
+    : "UNFOLLOW";
+  const state = delivery.actionType === FOLLOW_FAN_ACTION_TYPE
+    ? (status === "RUNNING" ? "FOLLOWING" : "QUEUED_FOLLOW")
+    : (status === "RUNNING" ? "UNFOLLOWING" : "QUEUED_UNFOLLOW");
+  await prisma.followAutomationCandidate.updateMany({
+    where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId },
+    data: {
+      state,
+      phase,
+      latestDeliveryId: delivery.id,
+      latestActionType: delivery.actionType,
+      latestStatus: status,
+      latestError: failureCode,
+    },
+  });
+}
+
 async function updateModuleCandidateProgress(delivery, status, failureCode = null) {
   await updateCandidateProgress(delivery, status, failureCode);
   await updateLikeCandidateProgress(delivery, status, failureCode);
+  await updateFollowAutomationCandidateProgress(delivery, status, failureCode);
 }
 
 async function deferOrSkipFollowBackClaim(delivery, control, now) {
@@ -384,7 +458,48 @@ async function applyLikeValidationTransition(delivery, validation, now = new Dat
   });
 }
 
-async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST"] }) {
+async function applyFollowAutomationValidationTransition(delivery, validation, now = new Date()) {
+  if (!delivery || delivery.moduleKey !== FOLLOW_AUTOMATION_MODULE_KEY || validation?.ok !== false) return false;
+  const terminal = validation.terminal === true;
+  const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
+  return prisma.$transaction(async (tx) => {
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: { in: [...CLAIMABLE_STATUSES, "CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
+      data: {
+        status,
+        failureCode: validation.code || "follow_validation_failed",
+        lastError: validation.code || "follow_validation_failed",
+        notBefore: terminal ? delivery.notBefore : (validation.retryAt || new Date(now.getTime() + 30_000)),
+        finishedAt: terminal ? now : null,
+        claimedByDeviceId: null,
+        claimedAt: null,
+        claimUntil: null,
+        leaseTokenHash: null,
+        leaseRevision: { increment: 1 },
+        lastCheckedAt: now,
+        result: { ...object(delivery.result), validationCode: validation.code || "follow_validation_failed" },
+      },
+    });
+    if (!changed.count) return false;
+    const latest = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    if (terminal) {
+      await finalizeFollowAutomationTerminal({
+        delivery: latest,
+        status,
+        failureCode: validation.code || "follow_validation_failed",
+        db: tx,
+      });
+    } else {
+      await tx.followAutomationCandidate.updateMany({
+        where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId || delivery.fanId },
+        data: { latestStatus: status, latestError: validation.code || "follow_validation_failed" },
+      });
+    }
+    return true;
+  });
+}
+
+async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST", "UNFOLLOW_FAN", "FOLLOW_FAN"] }) {
   const { device } = await requireOwnedSeniorDevice({ userId, deviceId });
   await sweepExpiredActionLeases();
   if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60_000)) return { delivery: null, reason: "device_stale" };
@@ -397,7 +512,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
   for (const candidate of candidates) {
     let control;
     try {
-      control = await assertAutomationEnabled({ agencyId: candidate.agencyId, creatorId: candidate.creatorId, moduleKey: candidate.moduleKey });
+      control = await assertDeliveryControl(candidate);
     } catch {
       continue;
     }
@@ -408,6 +523,8 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
         ? control.modules.follow_back.settings
         : candidate.moduleKey === "likes"
           ? control.modules.likes.settings
+          : candidate.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY
+            ? control.modules.follow.settings
           : {
             minimumIntervalMs: control.workspace.settings.globalWriteMinIntervalMs,
             maximumIntervalMs: control.workspace.settings.globalWriteMaxIntervalMs,
@@ -437,6 +554,13 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
       const validation = await validateLikeDelivery({ delivery: candidate, control, now });
       if (validation.ok === false) {
         await applyLikeValidationTransition(candidate, validation, now);
+        continue;
+      }
+    }
+    if (candidate.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
+      const validation = await validateFollowAutomationDelivery({ delivery: candidate, control, now });
+      if (validation.ok === false) {
+        await applyFollowAutomationValidationTransition(candidate, validation, now);
         continue;
       }
     }
@@ -527,7 +651,7 @@ async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRev
 
 async function renewActionLease(input) {
   const delivery = await requireLease(input);
-  await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  await assertDeliveryControl(delivery, { allowRunningUnfollow: true });
   const now = new Date();
   const result = await prisma.automationDelivery.updateMany({
     where: {
@@ -546,7 +670,7 @@ async function renewActionLease(input) {
 
 async function startActionDelivery(input) {
   const delivery = await requireLease(input);
-  await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  await assertDeliveryControl(delivery);
   if (delivery.notBefore.getTime() > Date.now()) throw new ActionDeliveryError("DELIVERY_NOT_DUE", "Delivery is not due yet");
   if (delivery.status === "RUNNING") return { ok: true, delivery };
   const now = new Date();
@@ -570,7 +694,7 @@ async function startActionDelivery(input) {
 
 async function validateActionDelivery(input) {
   const delivery = await requireLease(input);
-  const control = await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  const control = await assertDeliveryControl(delivery);
   if (delivery.moduleKey === "bumps") {
     const validation = await validateBumpDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
@@ -583,6 +707,13 @@ async function validateActionDelivery(input) {
     if (validation.ok === false) {
       await applyLikeValidationTransition(delivery, validation, new Date());
       throw new ActionDeliveryError(validation.code || "LIKE_VALIDATION_FAILED", validation.code || "Like delivery validation failed");
+    }
+  }
+  if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
+    const validation = await validateFollowAutomationDelivery({ delivery, control, now: new Date() });
+    if (validation.ok === false) {
+      await applyFollowAutomationValidationTransition(delivery, validation, new Date());
+      throw new ActionDeliveryError(validation.code || "FOLLOW_AUTOMATION_VALIDATION_FAILED", validation.code || "Follow Automation delivery validation failed");
     }
   }
   return { ok: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, control: control.effective };
@@ -657,6 +788,13 @@ async function completeActionDelivery(input) {
       if (terminalStatus === "COMPLETED") await finalizeLikeSuccess({ delivery: current, outcomeCode, result, db: tx });
       else await finalizeLikeTerminal({ delivery: current, status: terminalStatus, failureCode: outcomeCode, result, db: tx });
     }
+    if (current?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
+      if (terminalStatus === "COMPLETED") {
+        await finalizeFollowAutomationSuccess({ delivery: current, outcomeCode, result, db: tx, now });
+      } else {
+        await finalizeFollowAutomationTerminal({ delivery: current, status: terminalStatus, failureCode: outcomeCode, db: tx });
+      }
+    }
     return tx.automationDelivery.findUnique({ where: { id: delivery.id } });
   }, { timeout: 30_000 });
   await updateCandidateFromTerminal(finalDelivery, terminalStatus, outcomeCode);
@@ -668,7 +806,8 @@ async function failActionDelivery(input) {
   const now = new Date();
   const failureCode = clean(input.failureCode, 120) || "unknown";
   const lastError = clean(input.error, 2000) || failureCode;
-  const retryable = input.retryable === true && delivery.attempts < delivery.maxAttempts;
+  const safetyRecovery = mustPreserveRefollowSaga(delivery, failureCode);
+  const retryable = input.retryable === true && (safetyRecovery || delivery.attempts < delivery.maxAttempts);
   const nextStatus = retryable ? "RETRY_SCHEDULED" : "FAILED";
   const nextNotBefore = retryable ? new Date(now.getTime() + retryDelayMs(delivery.attempts, failureCode, input.retryAfterMs)) : delivery.notBefore;
   const result = {
@@ -706,10 +845,12 @@ async function failActionDelivery(input) {
   if (retryable) {
     await updateModuleCandidateProgress(updated, "RETRY_SCHEDULED", failureCode);
     if (updated?.moduleKey === "likes") await finalizeLikeFailure({ delivery: updated, failureCode, retryable: true, result });
+    if (updated?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await finalizeFollowAutomationFailure({ delivery: updated, failureCode, retryable: true });
   } else {
     await updateCandidateFromTerminal(updated, "FAILED", failureCode);
     if (updated?.moduleKey === "bumps") await finalizeBumpFailure({ delivery: updated, failureCode, retryable: false });
     if (updated?.moduleKey === "likes") await finalizeLikeFailure({ delivery: updated, failureCode, retryable: false, result });
+    if (updated?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await finalizeFollowAutomationFailure({ delivery: updated, failureCode, retryable: false });
   }
   return { ok: true, retryable, retryAt: retryable ? nextNotBefore : null, delivery: updated };
 }
@@ -788,7 +929,7 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
   if (delivery.failureCode && ["permission_denied", "invalid_payload", "fan_not_found", "blocked", "creator_revoked"].includes(delivery.failureCode)) {
     throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Failure ${delivery.failureCode} requires a new action generation`);
   }
-  const control = await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: delivery.moduleKey });
+  const control = await assertDeliveryControl(delivery);
   let retryAt = new Date();
   if (delivery.moduleKey === "bumps") {
     const validation = await validateBumpDelivery({ delivery, control, now: retryAt });
@@ -826,6 +967,13 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
     }
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }
+  if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
+    const validation = await validateFollowAutomationDelivery({ delivery, control, now: retryAt });
+    if (validation.ok === false && validation.terminal === true) {
+      throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Follow Automation delivery is no longer valid: ${validation.code || "validation_failed"}`);
+    }
+    if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
+  }
   const updated = await prisma.$transaction(async (tx) => {
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -851,6 +999,7 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
       if (!prepared?.changed) throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", "Bump fan state no longer permits retry");
     }
     if (latest?.moduleKey === "likes") await prepareLikeRetry({ delivery: latest, db: tx });
+    if (latest?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await prepareFollowAutomationRetry({ delivery: latest, db: tx });
     return latest;
   });
   await updateModuleCandidateProgress(updated, "QUEUED");
@@ -861,6 +1010,12 @@ async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_can
   const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
+  if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY && delivery.actionType === FOLLOW_FAN_ACTION_TYPE) {
+    throw new ActionDeliveryError("UNSAFE_RECOVERY_CANCEL", "A compensating refollow action cannot be canceled");
+  }
+  if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY && delivery.actionType === UNFOLLOW_FAN_ACTION_TYPE && ["CLAIMED", "RUNNING"].includes(delivery.status)) {
+    throw new ActionDeliveryError("UNSAFE_REFOLLOW_CANCEL", "A started refollow cycle cannot be canceled before recovery");
+  }
   const finishedAt = new Date();
   const updated = await prisma.$transaction(async (tx) => {
     const changed = await tx.automationDelivery.updateMany({
@@ -884,6 +1039,9 @@ async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_can
     }
     if (latest?.moduleKey === "likes") {
       await finalizeLikeTerminal({ delivery: latest, status: "CANCELED", failureCode: "canceled", result: latest.result || {}, db: tx });
+    }
+    if (latest?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
+      await finalizeFollowAutomationTerminal({ delivery: latest, status: "CANCELED", failureCode: "canceled", db: tx });
     }
     return latest;
   });

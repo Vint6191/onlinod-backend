@@ -5,7 +5,8 @@ const prisma = require("../prisma");
 const FOLLOW_BACK_MODULE_KEY = "follow_back";
 const BUMPS_MODULE_KEY = "bumps";
 const { LIKES_MODULE_KEY, LIKES_DISCOVERY_JOB_KEY } = require("./likes-constants");
-const SUPPORTED_MODULE_KEYS = new Set([FOLLOW_BACK_MODULE_KEY, BUMPS_MODULE_KEY, LIKES_MODULE_KEY]);
+const { FOLLOW_AUTOMATION_MODULE_KEY, UNFOLLOW_FAN_ACTION_TYPE, FOLLOW_FAN_ACTION_TYPE } = require("./follow-automation-constants");
+const SUPPORTED_MODULE_KEYS = new Set([FOLLOW_BACK_MODULE_KEY, BUMPS_MODULE_KEY, LIKES_MODULE_KEY, FOLLOW_AUTOMATION_MODULE_KEY]);
 const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"];
 const QUEUED_DELIVERY_STATUSES = ["QUEUED", "RETRY_SCHEDULED"];
 
@@ -55,6 +56,22 @@ const DEFAULT_BUMP_SETTINGS = Object.freeze({
   candidateBatchSize: 50,
   verifyRecentMessagesLimit: 20,
 });
+const DEFAULT_FOLLOW_AUTOMATION_SETTINGS = Object.freeze({
+  enabled: false,
+  automatic: false,
+  refollowEnabled: false,
+  dailyLimit: 25,
+  minimumIntervalMs: 15_000,
+  maximumIntervalMs: 60_000,
+  randomJitter: true,
+  maxAttempts: 3,
+  recoveryMaxAttempts: 10,
+  refollowPauseMinMs: 15_000,
+  refollowPauseMaxMs: 60_000,
+  refollowCooldownDays: 14,
+  maxNudgesPerFan: 1,
+});
+
 const DEFAULT_LIKES_SETTINGS = Object.freeze({
   enabled: false,
   automatic: false,
@@ -163,6 +180,29 @@ function normalizeBumpSettings(value) {
   };
 }
 
+function normalizeFollowAutomationSettings(value) {
+  const input = object(value);
+  const minimumIntervalMs = int(input.minimumIntervalMs, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.minimumIntervalMs, 15_000, 30 * 60_000);
+  const maximumIntervalMs = int(input.maximumIntervalMs, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.maximumIntervalMs, minimumIntervalMs, 60 * 60_000);
+  const refollowPauseMinMs = int(input.refollowPauseMinMs, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.refollowPauseMinMs, 15_000, 10 * 60_000);
+  const refollowPauseMaxMs = int(input.refollowPauseMaxMs, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.refollowPauseMaxMs, refollowPauseMinMs, 30 * 60_000);
+  return {
+    enabled: bool(input.enabled, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.enabled),
+    automatic: bool(input.automatic, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.automatic),
+    refollowEnabled: bool(input.refollowEnabled, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.refollowEnabled),
+    dailyLimit: int(input.dailyLimit, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.dailyLimit, 0, 10_000),
+    minimumIntervalMs,
+    maximumIntervalMs,
+    randomJitter: bool(input.randomJitter, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.randomJitter),
+    maxAttempts: int(input.maxAttempts, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.maxAttempts, 1, 10),
+    recoveryMaxAttempts: int(input.recoveryMaxAttempts, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.recoveryMaxAttempts, 1, 25),
+    refollowPauseMinMs,
+    refollowPauseMaxMs,
+    refollowCooldownDays: int(input.refollowCooldownDays, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.refollowCooldownDays, 1, 365),
+    maxNudgesPerFan: int(input.maxNudgesPerFan, DEFAULT_FOLLOW_AUTOMATION_SETTINGS.maxNudgesPerFan, 1, 20),
+  };
+}
+
 function normalizeLikesSettings(value) {
   const input = object(value);
   const minimumIntervalMs = int(input.minimumIntervalMs, DEFAULT_LIKES_SETTINGS.minimumIntervalMs, 3_000, 30 * 60_000);
@@ -195,6 +235,7 @@ function normalizeModuleSettings(moduleKey, value) {
   if (moduleKey === FOLLOW_BACK_MODULE_KEY) return normalizeFollowBackSettings(value);
   if (moduleKey === BUMPS_MODULE_KEY) return normalizeBumpSettings(value);
   if (moduleKey === LIKES_MODULE_KEY) return normalizeLikesSettings(value);
+  if (moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) return normalizeFollowAutomationSettings(value);
   return object(value);
 }
 
@@ -214,6 +255,7 @@ async function getRows({ agencyId, creatorId, db = prisma }) {
     moduleScopeKey(creatorId, FOLLOW_BACK_MODULE_KEY),
     moduleScopeKey(creatorId, BUMPS_MODULE_KEY),
     moduleScopeKey(creatorId, LIKES_MODULE_KEY),
+    moduleScopeKey(creatorId, FOLLOW_AUTOMATION_MODULE_KEY),
   ];
   const rows = await db.automationControlState.findMany({ where: { agencyId, scopeKey: { in: scopeKeys } } });
   return new Map(rows.map((row) => [row.scopeKey, row]));
@@ -239,15 +281,18 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
   const followBackRow = rows.get(moduleScopeKey(creatorId, FOLLOW_BACK_MODULE_KEY));
   const bumpsRow = rows.get(moduleScopeKey(creatorId, BUMPS_MODULE_KEY));
   const likesRow = rows.get(moduleScopeKey(creatorId, LIKES_MODULE_KEY));
+  const followRow = rows.get(moduleScopeKey(creatorId, FOLLOW_AUTOMATION_MODULE_KEY));
   const workspaceSettings = normalizeWorkspaceSettings(workspace?.settings);
   const followBackSettings = normalizeFollowBackSettings(followBackRow?.settings);
   const bumpSettings = normalizeBumpSettings(bumpsRow?.settings);
   const likesSettings = normalizeLikesSettings(likesRow?.settings);
+  const followSettings = normalizeFollowAutomationSettings(followRow?.settings);
   const workspaceEnabled = workspace?.enabled !== false;
   const creatorEnabled = creatorRow?.enabled !== false;
   const followBack = moduleSnapshot(followBackRow, followBackSettings, workspaceEnabled, creatorEnabled);
   const bumps = moduleSnapshot(bumpsRow, bumpSettings, workspaceEnabled, creatorEnabled);
   const likes = moduleSnapshot(likesRow, likesSettings, workspaceEnabled, creatorEnabled);
+  const follow = moduleSnapshot(followRow, followSettings, workspaceEnabled, creatorEnabled);
   return {
     creator,
     workspace: { enabled: workspaceEnabled, settings: workspaceSettings, updatedAt: workspace?.updatedAt || null },
@@ -256,6 +301,7 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
       [FOLLOW_BACK_MODULE_KEY]: followBack,
       [BUMPS_MODULE_KEY]: bumps,
       [LIKES_MODULE_KEY]: likes,
+      [FOLLOW_AUTOMATION_MODULE_KEY]: follow,
     },
     effective: {
       workspaceEnabled,
@@ -263,6 +309,7 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
       followBackEnabled: followBack.effectiveEnabled,
       bumpsEnabled: bumps.effectiveEnabled,
       likesEnabled: likes.effectiveEnabled,
+      followEnabled: follow.effectiveEnabled,
     },
   };
 }
@@ -275,6 +322,16 @@ async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey
       status: { in: ACTIVE_DELIVERY_STATUSES },
       ...(creatorId ? { creatorId } : {}),
       ...(moduleKey ? { moduleKey } : {}),
+      AND: [
+        // A RUNNING unfollow may already have changed OF state. Let it report completion
+        // so the compensating FOLLOW_FAN step can be created atomically.
+        { NOT: { moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: UNFOLLOW_FAN_ACTION_TYPE, status: "RUNNING" } },
+        // Disabling only the follow module must not strand an already-started saga.
+        // Workspace/creator disable still pauses every write, including recovery.
+        ...(moduleKey === FOLLOW_AUTOMATION_MODULE_KEY
+          ? [{ NOT: { moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE } }]
+          : []),
+      ],
     },
     data: {
       status: "PAUSED",
@@ -295,6 +352,7 @@ function effectiveModuleEnabled(snapshot, moduleKey) {
   if (moduleKey === FOLLOW_BACK_MODULE_KEY) return snapshot.effective.followBackEnabled;
   if (moduleKey === BUMPS_MODULE_KEY) return snapshot.effective.bumpsEnabled;
   if (moduleKey === LIKES_MODULE_KEY) return snapshot.effective.likesEnabled;
+  if (moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) return snapshot.effective.followEnabled;
   return snapshot.effective.workspaceEnabled && snapshot.effective.creatorEnabled;
 }
 
@@ -474,6 +532,7 @@ module.exports = {
   FOLLOW_BACK_MODULE_KEY,
   BUMPS_MODULE_KEY,
   LIKES_MODULE_KEY,
+  FOLLOW_AUTOMATION_MODULE_KEY,
   SUPPORTED_MODULE_KEYS,
   ACTIVE_DELIVERY_STATUSES,
   QUEUED_DELIVERY_STATUSES,
@@ -481,10 +540,12 @@ module.exports = {
   DEFAULT_FOLLOW_BACK_SETTINGS,
   DEFAULT_BUMP_SETTINGS,
   DEFAULT_LIKES_SETTINGS,
+  DEFAULT_FOLLOW_AUTOMATION_SETTINGS,
   normalizeWorkspaceSettings,
   normalizeFollowBackSettings,
   normalizeBumpSettings,
   normalizeLikesSettings,
+  normalizeFollowAutomationSettings,
   getAutomationControlSnapshot,
   setAutomationControl,
   assertAutomationEnabled,

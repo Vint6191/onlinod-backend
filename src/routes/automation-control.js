@@ -46,6 +46,12 @@ const {
   listLikes,
   setLikeCandidateState,
 } = require("../services/likes-service");
+const {
+  planFollowAutomation,
+  ensureAutomaticFollowAutomation,
+  listFollowAutomation,
+  setFollowAutomationCandidateState,
+} = require("../services/follow-automation-service");
 
 const router = express.Router();
 
@@ -88,7 +94,7 @@ router.get("/controls/:creatorId", async (req, res) => {
 const controlSchema = z.object({
   scope: z.enum(["workspace", "creator", "module"]),
   creatorId: z.string().min(1).max(160).optional().nullable(),
-  moduleKey: z.enum(["follow_back", "bumps", "likes"]).optional().nullable(),
+  moduleKey: z.enum(["follow_back", "bumps", "likes", "follow"]).optional().nullable(),
   enabled: z.boolean().optional(),
   settings: z.record(z.unknown()).optional(),
 });
@@ -109,7 +115,8 @@ router.patch("/controls", seniorRequired, async (req, res) => {
       const runFollowBack = input.scope !== "module" || input.moduleKey === "follow_back";
       const runBumps = input.scope !== "module" || input.moduleKey === "bumps";
       const runLikes = input.scope !== "module" || input.moduleKey === "likes";
-      const [followBack, bumps, likes] = await Promise.all([
+      const runFollowAutomation = input.scope !== "module" || input.moduleKey === "follow";
+      const [followBack, bumps, likes, followAutomation] = await Promise.all([
         runFollowBack ? ensureAutomaticFollowBack({
           agencyId: req.auth.agencyId,
           creatorId: input.creatorId,
@@ -126,8 +133,13 @@ router.patch("/controls", seniorRequired, async (req, res) => {
           creatorId: input.creatorId,
           source: "control_update",
         }) : null,
+        runFollowAutomation ? ensureAutomaticFollowAutomation({
+          agencyId: req.auth.agencyId,
+          creatorId: input.creatorId,
+          source: "control_update",
+        }) : null,
       ]);
-      planning = { followBack, bumps, likes };
+      planning = { followBack, bumps, likes, followAutomation };
     }
     return res.json({ ...result, planning });
   } catch (error) {
@@ -207,6 +219,79 @@ router.post("/follow-back/:creatorId/candidates/:fanId/action", seniorRequired, 
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "FOLLOW_BACK_ACTION_FAILED");
+  }
+});
+
+
+const followAutomationListSchema = z.object({
+  search: z.string().max(160).optional(),
+  state: z.string().max(60).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+});
+router.get("/follow/:creatorId", async (req, res) => {
+  try {
+    const query = followAutomationListSchema.parse(req.query || {});
+    return res.json(await listFollowAutomation({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      search: query.search || "",
+      state: query.state || null,
+      offset: query.offset || 0,
+      limit: query.limit || 100,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "FOLLOW_AUTOMATION_LIST_FAILED");
+  }
+});
+router.post("/follow/:creatorId/plan", seniorRequired, async (req, res) => {
+  try {
+    const input = planSchema.parse(req.body || {});
+    return res.status(202).json(await planFollowAutomation({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      userId: req.auth.userId,
+      fanId: input.fanId || null,
+      source: input.source || (input.fanId ? "candidate_refollow_now" : "manual_run"),
+      priority: input.fanId ? 100 : 70,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "FOLLOW_AUTOMATION_PLAN_FAILED");
+  }
+});
+router.post("/follow/:creatorId/candidates/:fanId/action", seniorRequired, async (req, res) => {
+  try {
+    const input = z.object({ action: z.enum(["ignore", "block", "restore", "refollow", "retry"]) }).parse(req.body || {});
+    if (input.action === "refollow") {
+      return res.status(202).json(await planFollowAutomation({
+        agencyId: req.auth.agencyId,
+        creatorId: req.params.creatorId,
+        userId: req.auth.userId,
+        fanId: req.params.fanId,
+        source: "candidate_refollow_now",
+        priority: 100,
+      }));
+    }
+    if (input.action === "retry") {
+      const candidate = await prisma.followAutomationCandidate.findFirst({
+        where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, fanId: req.params.fanId },
+        select: { latestDeliveryId: true },
+      });
+      if (!candidate) return res.status(404).json({ ok: false, code: "candidate_not_found", error: "Follow Automation candidate not found" });
+      if (!candidate.latestDeliveryId) return res.status(409).json({ ok: false, code: "no_delivery", error: "Candidate has no delivery to retry" });
+      return res.status(202).json(await retryActionDelivery({ agencyId: req.auth.agencyId, deliveryId: candidate.latestDeliveryId }));
+    }
+    return res.json({ ok: true, candidate: await setFollowAutomationCandidateState({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      fanId: req.params.fanId,
+      action: input.action,
+    }) });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "FOLLOW_AUTOMATION_ACTION_FAILED");
   }
 });
 
@@ -451,7 +536,7 @@ router.post("/worker/claim", async (req, res) => {
     const input = z.object({
       deviceId: z.string().min(3).max(160),
       leaseMs: z.number().int().min(30_000).max(10 * 60_000).optional(),
-      actionTypes: z.array(z.enum(["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST"])).min(1).max(20).optional(),
+      actionTypes: z.array(z.enum(["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST", "UNFOLLOW_FAN", "FOLLOW_FAN"])).min(1).max(20).optional(),
     }).parse(req.body || {});
     return res.json({ ok: true, ...(await claimActionDelivery({ userId: req.auth.userId, deviceId: input.deviceId, leaseMs: input.leaseMs, actionTypes: input.actionTypes })) });
   } catch (error) {

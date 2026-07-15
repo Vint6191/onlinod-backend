@@ -118,6 +118,7 @@ model Agency {
   automationDeliveries AutomationDelivery[]
   automationControls AutomationControlState[]
   followBackCandidates FollowBackCandidate[]
+  followAutomationCandidates FollowAutomationCandidate[]
   automationBumpFanStates AutomationBumpFanState[]
   automationContentCandidates AutomationContentCandidate[]
   automationContentDiscoveryStates AutomationContentDiscoveryState[]
@@ -206,6 +207,7 @@ model CreatorAccount {
   automationDeliveries AutomationDelivery[]
   automationControls AutomationControlState[]
   followBackCandidates FollowBackCandidate[]
+  followAutomationCandidates FollowAutomationCandidate[]
   automationBumpFanStates AutomationBumpFanState[]
   automationContentCandidates AutomationContentCandidate[]
   automationContentDiscoveryStates AutomationContentDiscoveryState[]
@@ -1704,6 +1706,54 @@ model FollowBackCandidate {
   @@index([agencyId, creatorId, state])
   @@index([creatorId, eligibilityReason])
   @@index([creatorId, cooldownUntil])
+  @@index([snapshotRunId])
+}
+
+model FollowAutomationCandidate {
+  id                    String   @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  fanId                 String
+  dialogId              String?
+  username              String?
+  displayName           String?
+  avatarUrl             String?
+  subscriptionType      String?
+  isActive              Boolean?
+  subscribedByCreator   Boolean?
+  subscribedOn          Boolean?
+  subscribePriceCents   Int      @default(0)
+  ofBlocked             Boolean  @default(false)
+  restricted            Boolean  @default(false)
+  performer             Boolean  @default(false)
+  discoveredAt          DateTime @default(now())
+  lastSeenAt            DateTime?
+  eligibilityReason     String?
+  ignored               Boolean  @default(false)
+  blocked               Boolean  @default(false)
+  state                 String   @default("CANDIDATE")
+  phase                 String   @default("IDLE")
+  generation            Int      @default(0)
+  nudgeCount            Int      @default(0)
+  cooldownUntil         DateTime?
+  waitReturnUntil       DateTime?
+  snapshotRunId         String?
+  latestDeliveryId      String?
+  latestActionType      String?
+  latestStatus          String?
+  latestError           String?
+  metadata              Json     @default("{}")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, fanId])
+  @@index([agencyId, creatorId, state])
+  @@index([creatorId, phase])
+  @@index([creatorId, cooldownUntil])
+  @@index([creatorId, waitReturnUntil])
   @@index([snapshotRunId])
 }
 
