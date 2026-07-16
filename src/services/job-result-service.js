@@ -28,7 +28,6 @@ const {
   applyVaultUnsortedCompletion,
   recordVaultUnsortedFailure,
 } = require("./vault-unsorted-service");
-
 const {
   DIALOG_INTELLIGENCE_JOB_KEY,
   applyDialogIntelligenceChunk,

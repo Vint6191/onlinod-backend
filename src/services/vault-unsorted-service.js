@@ -55,6 +55,8 @@ function snapshotPayload(snapshot, patch = {}) {
     kind: "vault_unsorted_snapshot",
     messagesFolderId: clean(patch.messagesFolderId ?? payload.messagesFolderId, 240),
     updatedAt: patch.updatedAt || new Date().toISOString(),
+    lastFullScanAt: patch.lastFullScanAt === undefined ? (payload.lastFullScanAt || null) : patch.lastFullScanAt,
+    lastIncrementalScanAt: patch.lastIncrementalScanAt === undefined ? (payload.lastIncrementalScanAt || null) : patch.lastIncrementalScanAt,
     scan: {
       status: normalizeStatus(patch.scanStatus ?? scan.status),
       mode: normalizeMode(patch.mode ?? scan.mode),
@@ -95,6 +97,8 @@ function publicSnapshot(snapshot) {
     messagesFolderId: payload.messagesFolderId,
     capturedAt: iso(snapshot.capturedAt),
     updatedAt: iso(snapshot.updatedAt),
+    lastFullScanAt: payload.lastFullScanAt || null,
+    lastIncrementalScanAt: payload.lastIncrementalScanAt || null,
     scan: payload.scan,
   };
 }
@@ -136,10 +140,10 @@ async function updateSnapshot(db, { agencyId, creatorId, userId = null, patch = 
   });
 }
 
-async function getVaultUnsortedState({ agencyId, creatorId }) {
+async function getVaultUnsortedState({ agencyId, creatorId, db = prisma }) {
   const [snapshot, activeJob] = await Promise.all([
-    prisma.vaultUnsortedSnapshot.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } }),
-    loadActiveJob(prisma, creatorId),
+    db.vaultUnsortedSnapshot.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } }),
+    loadActiveJob(db, creatorId),
   ]);
   return { ok: true, creatorId, snapshot: publicSnapshot(snapshot), activeJob: publicJob(activeJob) };
 }
@@ -476,6 +480,8 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
       scanned: integer(payload.scanned),
       knownStreak: integer(payload.knownStreak),
       completedAt: new Date().toISOString(),
+      lastFullScanAt: mode === "full" ? new Date().toISOString() : undefined,
+      lastIncrementalScanAt: mode === "incremental" ? new Date().toISOString() : undefined,
       lastError: null,
     },
     countOverride: nextCounts,

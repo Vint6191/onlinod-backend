@@ -15,6 +15,10 @@ const {
   cancelVaultUnsortedScan,
   markVaultUnsortedItems,
 } = require("../services/vault-unsorted-service");
+const {
+  getNeverUsedPipelineState,
+  listVaultNeverUsedMedia,
+} = require("../services/vault-never-used-service");
 
 const { automationCreatorParamRequired } = require("../middleware/automation-permissions");
 
@@ -27,6 +31,11 @@ const unsortedStartSchema = z.object({
 });
 const unsortedListSchema = z.object({
   offset: z.number().int().min(0).max(1_000_000).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
+  type: z.enum(["photo", "video", "audio", "gif", "unknown"]).optional().nullable(),
+});
+const neverUsedListSchema = z.object({
+  offset: z.number().int().min(0).max(10_000_000).optional(),
   limit: z.number().int().min(1).max(100).optional(),
   type: z.enum(["photo", "video", "audio", "gif", "unknown"]).optional().nullable(),
 });
@@ -126,12 +135,33 @@ router.post("/:creatorId/unsorted/items/mark", async (req, res) => {
   }
 });
 
+
+router.get("/:creatorId/never-used", async (req, res) => {
+  try { return res.json(await getNeverUsedPipelineState({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId })); }
+  catch (error) { return sendError(res, error, "VAULT_NEVER_USED_PIPELINE_FAILED"); }
+});
+
+router.post("/:creatorId/never-used/items", async (req, res) => {
+  try {
+    const input = neverUsedListSchema.parse(req.body || {});
+    return res.json(await listVaultNeverUsedMedia({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      ...input,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "VAULT_NEVER_USED_LIST_FAILED");
+  }
+});
+
 router.post("/:creatorId/intelligence", async (req, res) => {
   try {
     const result = await getVaultDirectoryIntelligence({
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
       mediaIds: req.body?.mediaIds || [],
+      includePipeline: req.body?.includePipeline !== false,
     });
     return res.json(result);
   } catch (error) {
@@ -145,6 +175,7 @@ router.post("/:creatorId/protection-check", async (req, res) => {
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
       mediaIds: req.body?.mediaIds || [],
+      includePipeline: req.body?.includePipeline !== false,
     });
     return res.json(result);
   } catch (error) {
