@@ -23,6 +23,13 @@ const {
 } = require("./subscriber-directory-service");
 
 const {
+  VAULT_UNSORTED_JOB_KEY,
+  applyVaultUnsortedChunk,
+  applyVaultUnsortedCompletion,
+  recordVaultUnsortedFailure,
+} = require("./vault-unsorted-service");
+
+const {
   DIALOG_INTELLIGENCE_JOB_KEY,
   applyDialogIntelligenceChunk,
   applyPurchaseSignalsChunk,
@@ -139,6 +146,9 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
     return applyDialogIntelligenceChunk({ db, job, deviceId, userId, chunkResult });
   }
+  if (job.jobKey === VAULT_UNSORTED_JOB_KEY) {
+    return applyVaultUnsortedChunk({ db, job, deviceId, userId, chunkResult });
+  }
   if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "dialog_purchase_signals") {
     return applyPurchaseSignalsChunk({ db, job, deviceId, userId, chunkResult });
   }
@@ -158,6 +168,9 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
 async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
     return completeDialogIntelligenceJob({ db, job, deviceId, userId, result: result || {} });
+  }
+  if (job.jobKey === VAULT_UNSORTED_JOB_KEY) {
+    return applyVaultUnsortedCompletion({ db, job, deviceId, userId, result: result || {} });
   }
   if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ job, deviceId, userId, result });
   if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ job, deviceId, userId, result });
@@ -179,6 +192,7 @@ async function recordJobFailure({ job, error, terminal = true }) {
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
     return recordDialogIntelligenceFailure({ job, error, terminal });
   }
+  if (job.jobKey === VAULT_UNSORTED_JOB_KEY) return recordVaultUnsortedFailure({ job, error, terminal });
   if (job.jobKey === CATCHUP_JOB_KEY) return recordCatchupJobFailure({ job, error });
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) return recordSubscriberScanFailure({ job, error, terminal });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return recordLikesDiscoveryFailure({ job, error, terminal });

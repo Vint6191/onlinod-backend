@@ -99,6 +99,7 @@ model Agency {
   automationRuns AutomationRun[]
   automationLogs AutomationLog[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
+  vaultUnsortedItems     VaultUnsortedItem[]
   presenceSnapshots CreatorPresenceSnapshot[]
   presenceUsers     CreatorPresenceUser[]
   moneyAttributions MoneyAttribution[]
@@ -203,6 +204,7 @@ model CreatorAccount {
   teamActivityEvents TeamActivityEvent[]
   messageTemplateUsageEvents MessageTemplateUsageEvent[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
+  vaultUnsortedItems     VaultUnsortedItem[]
   presenceSnapshot CreatorPresenceSnapshot?
   presenceUsers    CreatorPresenceUser[]
   mediaAssets      CreatorMediaAsset[]
@@ -1102,6 +1104,31 @@ model VaultUnsortedSnapshot {
 }
 
 
+
+model VaultUnsortedItem {
+  id            String   @id @default(cuid())
+  agencyId      String
+  creatorId     String
+  mediaId       String
+  status        String   @default("UNSORTED")
+  mediaType     String   @default("unknown")
+  thumbUrl      String?
+  duration      Int      @default(0)
+  folderIds     Json     @default("[]")
+  firstSeenAt   DateTime @default(now())
+  lastSeenAt    DateTime @default(now())
+  lastSeenJobId String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId, mediaId])
+  @@index([agencyId, creatorId, status, lastSeenAt])
+  @@index([creatorId, status, lastSeenAt])
+  @@index([lastSeenJobId])
+}
 
 model CreatorPresenceSnapshot {
   id                String   @id @default(cuid())

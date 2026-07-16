@@ -298,9 +298,9 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     lastError: null,
   };
 
-  // Dialog completion mutates its durable run/state. Fence the lease first and
-  // perform both transitions in the same PostgreSQL transaction so a reclaimed
-  // worker cannot close the run or move its watermark.
+  // Jobs whose completion mutates durable projections must fence the lease
+  // before applying those mutations. Otherwise a reclaimed worker could write
+  // a stale snapshot after another device has already taken ownership.
   if (job.jobKey === "dialog_intelligence_scan") {
     return prisma.$transaction(async (tx) => {
       const { sideEffect } = await completeDialogJobFenced({
@@ -310,6 +310,15 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         staleError: () => new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion"),
         applySideEffect: (db) => applyJobResult({ db, job, deviceId, userId, result: result || {} }),
       });
+      return { job: { id: job.id, status: "DONE" }, sideEffect };
+    });
+  }
+
+  if (job.jobKey === "vault_unsorted_scan") {
+    return prisma.$transaction(async (tx) => {
+      const updated = await tx.jobInstance.updateMany({ where: fenceWhere, data: completionData });
+      if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion");
+      const sideEffect = await applyJobResult({ db: tx, job, deviceId, userId, result: result || {} });
       return { job: { id: job.id, status: "DONE" }, sideEffect };
     });
   }
