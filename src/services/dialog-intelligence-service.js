@@ -406,6 +406,46 @@ async function scheduleDialogScan(input) {
   }
 }
 
+async function autoRecoverDialogDiscoveryTx(db, input) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorId = clean(input.creatorId, 160);
+  if (!agencyId || !creatorId) return { ok: true, recovered: false, reason: "missing_scope" };
+
+  const latestRun = await db.dialogScanRun.findFirst({
+    where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!latestRun || clean(latestRun.status, 40).toUpperCase() !== "FAILED" || !latestRun.jobId) {
+    return { ok: true, recovered: false, reason: "no_failed_discovery" };
+  }
+
+  const failedJob = await db.jobInstance.findUnique({ where: { id: latestRun.jobId } });
+  const failure = object(object(failedJob?.result).failure);
+  const code = clean(failure.code, 160);
+  if (code !== "DIALOG_DISCOVERY_EMPTY_PAGE_WITH_HAS_MORE") {
+    return { ok: true, recovered: false, reason: "failure_not_auto_recoverable" };
+  }
+
+  const params = object(failedJob?.params);
+  const resumed = await scheduleDialogScanTx(db, {
+    agencyId,
+    creatorId,
+    dialogId: "__dialog_discovery__",
+    mode: "discovery",
+    childMode: clean(params.childMode, 40) || "initial",
+    source: clean(input.source, 80) || "automatic_dialog_tail_verification",
+    priority: integer(input.priority, 90, 0, 200),
+    pageLimit: integer(params.pageLimit, 50, 1, 100),
+    maxPages: integer(params.maxPages, 5000, 1, 10000),
+    generation: integer(params.generation, latestRun.generation || 0, 0, 2_000_000_000),
+  });
+  return { ok: true, recovered: true, reason: resumed.reason || "resumed", runId: resumed.run?.id || latestRun.id, jobId: resumed.job?.id || null };
+}
+
+async function autoRecoverDialogDiscovery(input) {
+  return prisma.$transaction((tx) => autoRecoverDialogDiscoveryTx(tx, input));
+}
+
 function normalizedMessage(input, job) {
   const raw = object(input);
   const messageId = clean(raw.messageId ?? raw.id, 240);
@@ -1314,6 +1354,8 @@ module.exports = {
   purchaseIdempotencyKey,
   scheduleDialogScan,
   scheduleDialogScanTx,
+  autoRecoverDialogDiscovery,
+  autoRecoverDialogDiscoveryTx,
   applyDialogIntelligenceChunk,
   applyPurchaseSignalsChunk,
   completeDialogIntelligenceJob,

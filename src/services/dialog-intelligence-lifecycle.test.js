@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const prismaModule = require.resolve("../prisma");
 require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
-const { scheduleDialogScanTx } = require("./dialog-intelligence-service");
+const { scheduleDialogScanTx, autoRecoverDialogDiscoveryTx } = require("./dialog-intelligence-service");
 
 function fakeDb(options = {}) {
   const calls = { runsCreated: [], runsUpdated: [], jobsCreated: [], jobsUpdated: [], statesUpserted: [], statesUpdated: [], targetsUpserted: [] };
@@ -15,6 +15,7 @@ function fakeDb(options = {}) {
   const activeJob = options.activeJob || null;
   const failedJob = options.failedJob || null;
   const state = options.state || null;
+  const latest = options.latest || active || failed || null;
   return {
     calls,
     creatorAccount: { findFirst: async () => ({ id: "creator-1", agencyId: "agency-1", remoteId: "of-1", status: "READY" }) },
@@ -34,7 +35,7 @@ function fakeDb(options = {}) {
       updateMany: async (value) => { calls.statesUpdated.push(value); return { count: 1 }; },
     },
     dialogScanRun: {
-      findFirst: async ({ where } = {}) => where?.status === "FAILED" ? failed : active,
+      findFirst: async ({ where } = {}) => where?.status === "FAILED" ? failed : (where?.dialogId === "__dialog_discovery__" ? latest : active),
       create: async ({ data }) => {
         const row = { id: `run-${++runCounter}`, jobId: null, pagesProcessed: 0, continuation: {}, ...data };
         calls.runsCreated.push(row);
@@ -147,6 +148,35 @@ test("recoverable failed discovery resumes the same checkpoint instead of rebuil
   assert.equal(db.calls.jobsCreated.length, 1);
   assert.deepEqual(db.calls.jobsCreated[0].continuation, failed.continuation);
   assert.equal(db.calls.jobsCreated[0].params.scanRunId, "run-failed");
+});
+
+
+
+test("status polling automatically revives the contradictory empty discovery tail", async () => {
+  const failed = {
+    id: "run-failed", jobId: "job-failed", status: "FAILED", mode: "discovery",
+    dialogId: "__dialog_discovery__", pagesProcessed: 1151, generation: 7,
+    continuation: {
+      stage: "DIALOG_DISCOVERY", mode: "discovery", dialogId: "__dialog_discovery__",
+      offset: 21590, page: 1151, dialogsFound: 15243, childMode: "initial", maxPages: 5000,
+    },
+    progress: { pages: 1151, nextOffset: 21590, dialogsFound: 15243 },
+  };
+  const failedJob = {
+    id: "job-failed", status: "FAILED", priority: 90,
+    params: { dialogId: "__dialog_discovery__", mode: "discovery", childMode: "initial", pageLimit: 50, maxPages: 5000, generation: 7 },
+    continuation: failed.continuation,
+    result: { failure: { code: "DIALOG_DISCOVERY_EMPTY_PAGE_WITH_HAS_MORE", retryable: false } },
+  };
+  const db = fakeDb({ failed, latest: failed, failedJob, state: { generation: 7 } });
+  const result = await autoRecoverDialogDiscoveryTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1", source: "status_poll", priority: 90,
+  });
+  assert.equal(result.recovered, true);
+  assert.equal(db.calls.jobsCreated.length, 1);
+  assert.deepEqual(db.calls.jobsCreated[0].continuation, failed.continuation);
+  assert.equal(db.calls.jobsCreated[0].params.scanRunId, "run-failed");
+  assert.equal(db.calls.runsUpdated.at(-1).data.status, "QUEUED");
 });
 
 test("purchase target is queued inside an active initial run without damaging continuation", async () => {

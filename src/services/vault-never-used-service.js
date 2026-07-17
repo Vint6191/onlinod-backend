@@ -2,7 +2,10 @@
 
 const prisma = require("../prisma");
 const { getVaultUnsortedState } = require("./vault-unsorted-service");
-const { DIALOG_INTELLIGENCE_JOB_KEY } = require("./dialog-intelligence-service");
+const {
+  DIALOG_INTELLIGENCE_JOB_KEY,
+  autoRecoverDialogDiscoveryTx,
+} = require("./dialog-intelligence-service");
 
 const PROJECTION_CHUNK_SIZE = 5000;
 const LIST_SCAN_CHUNK_SIZE = 500;
@@ -690,6 +693,19 @@ async function loadPipelineSources({ agencyId, creatorId, db }) {
 }
 
 async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now = new Date(), staleAfter = null }) {
+  // A contradictory OF tail response (empty list + hasMore=true) is handled as
+  // an internal recovery state. Status polling revives the preserved discovery
+  // checkpoint automatically; operators never need to restart or rebuild it.
+  try {
+    await autoRecoverDialogDiscoveryTx(db, {
+      agencyId,
+      creatorId,
+      source: "never_used_status_auto_recovery",
+      priority: 90,
+    });
+  } catch {
+    // Status remains readable even if best-effort recovery cannot be scheduled.
+  }
   const { messages, dialogs, salesAt } = await loadPipelineSources({ agencyId, creatorId, db });
   const messagesComplete = Boolean(messages.snapshot?.lastFullScanAt && messages.snapshot?.scan?.status === "COMPLETED");
   const dialogsComplete = Boolean(
