@@ -302,6 +302,7 @@ async function scheduleDialogScanTx(db, input) {
         scanRunId: run.id, dialogId, fanId: clean(input.fanId, 160), mode,
         source: clean(input.source, 80) || "manual", pageLimit: integer(input.pageLimit, 50, 1, 100),
         targetMessageId, childMode: clean(input.childMode, 40) || null,
+        childPriority: integer(input.childPriority, clean(input.childMode, 40) === "initial" ? 60 : 50, 0, 200),
         overlapPages: integer(input.overlapPages, 2, 0, 10), knownMessageThreshold, maxPages,
         generation: integer(input.generation, state?.generation || 0, 0, 2_000_000_000),
       },
@@ -585,6 +586,54 @@ async function projectSignal(db, signal) {
   return { purchase, status, affectedAssets: [...affectedAssets] };
 }
 
+
+async function scheduleNextPlannedDialogTx(db, input) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorId = clean(input.creatorId, 160);
+  const generation = integer(input.generation, 0);
+  const childMode = clean(input.childMode, 40) || "initial";
+  if (!agencyId || !creatorId) return { created: false, reason: "missing_scope" };
+
+  const active = await db.dialogScanRun.findFirst({
+    where: {
+      agencyId,
+      creatorId,
+      dialogId: { not: "__dialog_discovery__" },
+      generation,
+      status: { in: ACTIVE_RUN_STATUSES },
+    },
+    orderBy: { createdAt: "asc" },
+  });
+  if (active) return { created: false, reason: "history_job_active", run: active };
+
+  const planned = await db.dialogScanState.findFirst({
+    where: {
+      agencyId,
+      creatorId,
+      dialogId: { not: "__dialog_discovery__" },
+      generation,
+      status: "PLANNED",
+      ...(childMode === "initial" ? { initialScanComplete: false } : {}),
+    },
+    orderBy: [{ createdAt: "asc" }, { dialogId: "asc" }],
+  });
+  if (!planned) return { created: false, reason: "history_plan_drained" };
+
+  return scheduleDialogScanTx(db, {
+    agencyId,
+    creatorId,
+    dialogId: planned.dialogId,
+    fanId: planned.fanId,
+    mode: childMode === "initial" && planned.initialScanComplete ? "incremental" : childMode,
+    source: clean(input.source, 80) || "dialog_discovery_plan",
+    priority: integer(input.priority, childMode === "initial" ? 60 : 50, 0, 200),
+    generation,
+    overlapPages: integer(input.overlapPages, 2, 0, 10),
+    knownMessageThreshold: integer(input.knownMessageThreshold, 3, 1, 100),
+    maxPages: integer(input.maxPages, childMode === "initial" ? 5000 : 1000, 1, 10000),
+  });
+}
+
 async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const chunk = object(chunkResult);
   const params = object(job.params);
@@ -597,7 +646,8 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const run = await db.dialogScanRun.findFirst({ where: { id: runId, creatorId: job.creatorId, agencyId: job.agencyId } });
   if (!run) throw new Error("Dialog discovery run not found");
   const childMode = clean(chunk.childMode ?? params.childMode, 40) || "incremental";
-  let scheduled = 0;
+  const generation = integer(params.generation ?? run.generation, run.generation || 0);
+  let planned = 0;
   let discovered = 0;
   for (const raw of list(chunk.dialogs).slice(0, 500)) {
     const row = object(raw);
@@ -605,30 +655,42 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
     if (!dialogId || dialogId === discoveryDialogId) continue;
     const fanId = clean(row.fanId, 160);
     discovered += 1;
+    const existingState = await db.dialogScanState.findUnique({
+      where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId } },
+    });
+    const alreadyInitial = existingState?.initialScanComplete === true;
+    const shouldPlan = childMode === "initial" ? !alreadyInitial : true;
+    // Creator-wide scans are strict two-phase plans. Discovery never leaves a
+    // dialog in QUEUED/RUNNING from an older plan; no history job exists until
+    // the discovery run completes with hasMore=false.
+    const nextStatus = shouldPlan ? "PLANNED" : "READY";
     await db.dialogScanState.upsert({
       where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId } },
-      create: { agencyId: job.agencyId, creatorId: job.creatorId, dialogId, fanId, status: "IDLE", scanMode: childMode },
-      update: { fanId: fanId || undefined },
+      create: {
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        dialogId,
+        fanId,
+        status: shouldPlan ? "PLANNED" : "READY",
+        scanMode: childMode,
+        generation,
+      },
+      update: {
+        fanId: fanId || undefined,
+        scanMode: childMode,
+        generation,
+        status: nextStatus,
+        activeRunId: null,
+        activeJobId: null,
+        lastError: null,
+      },
     });
-    const state = await db.dialogScanState.findUnique({ where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId } } });
-    const effectiveMode = childMode === "initial" && state?.initialScanComplete ? "incremental" : childMode;
-    const scheduledResult = await scheduleDialogScanTx(db, {
-      agencyId: job.agencyId,
-      creatorId: job.creatorId,
-      dialogId,
-      fanId,
-      mode: effectiveMode,
-      source: clean(params.source, 80) || "dialog_discovery",
-      priority: integer(params.childPriority, effectiveMode === "initial" ? 60 : 50, 0, 200),
-      generation: integer(params.generation, 0),
-      overlapPages: integer(params.overlapPages, 2, 0, 10),
-    });
-    if (scheduledResult.created) scheduled += 1;
+    if (shouldPlan) planned += 1;
   }
   const page = integer(chunk.page, 0);
   const hasMore = chunk.hasMore === true;
   const cursorOut = clean(chunk.cursorOut, 240);
-  const result = { discovered, scheduled, hasMore, page, cursorOut, childMode };
+  const result = { discovered, planned, scheduled: 0, hasMore, page, cursorOut, childMode, generation };
   const commit = await db.dialogScanChunkCommit.create({
     data: {
       agencyId: job.agencyId, creatorId: job.creatorId, runId, jobId: job.id, dialogId: discoveryDialogId,
@@ -1051,7 +1113,41 @@ async function completeDialogIntelligenceJob({ db = prisma, job, deviceId, resul
       lastError: null,
     },
   });
-  return { type: "dialog_intelligence", runId, dialogId, completedAt: now.toISOString() };
+
+  let next = null;
+  if (run.mode === "discovery") {
+    next = await scheduleNextPlannedDialogTx(db, {
+      agencyId: job.agencyId,
+      creatorId: job.creatorId,
+      generation: integer(params.generation ?? run.generation, run.generation || 0),
+      childMode: clean(params.childMode, 40) || "initial",
+      source: clean(params.source, 80) || "dialog_discovery_complete",
+      priority: integer(params.childPriority, clean(params.childMode, 40) === "initial" ? 60 : 50, 0, 200),
+      overlapPages: integer(params.overlapPages, 2, 0, 10),
+      knownMessageThreshold: integer(params.knownMessageThreshold, 3, 1, 100),
+      maxPages: integer(params.maxPages, clean(params.childMode, 40) === "initial" ? 5000 : 1000, 1, 10000),
+    });
+  } else if (["initial", "incremental"].includes(run.mode)) {
+    next = await scheduleNextPlannedDialogTx(db, {
+      agencyId: job.agencyId,
+      creatorId: job.creatorId,
+      generation: run.generation,
+      childMode: run.mode,
+      source: "dialog_history_sequence",
+      priority: run.mode === "initial" ? 60 : 50,
+      overlapPages: integer(params.overlapPages, 2, 0, 10),
+      knownMessageThreshold: integer(params.knownMessageThreshold, 3, 1, 100),
+      maxPages: integer(params.maxPages, run.mode === "initial" ? 5000 : 1000, 1, 10000),
+    });
+  }
+
+  return {
+    type: "dialog_intelligence",
+    runId,
+    dialogId,
+    completedAt: now.toISOString(),
+    next: next ? { created: next.created === true, reason: next.reason || null, runId: next.run?.id || null, jobId: next.job?.id || null } : null,
+  };
 }
 
 async function recordDialogIntelligenceFailure({ job, error, terminal }) {
@@ -1060,7 +1156,9 @@ async function recordDialogIntelligenceFailure({ job, error, terminal }) {
   const dialogId = clean(params.dialogId, 180);
   if (!job.creatorId || !runId || !dialogId) return null;
   const status = terminal ? "FAILED" : "QUEUED";
+  let next = null;
   await prisma.$transaction(async (tx) => {
+    const run = await tx.dialogScanRun.findUnique({ where: { id: runId } });
     await tx.dialogScanRun.updateMany({
       where: { id: runId },
       data: { status, completedAt: terminal ? new Date() : null, lastError: clean(error, 2000) },
@@ -1069,8 +1167,25 @@ async function recordDialogIntelligenceFailure({ job, error, terminal }) {
       where: { creatorId: job.creatorId, dialogId },
       data: { status, lastError: clean(error, 2000), activeRunId: terminal ? null : undefined, activeJobId: terminal ? null : undefined },
     });
+    if (terminal && run && dialogId !== "__dialog_discovery__" && ["initial", "incremental"].includes(run.mode)) {
+      next = await scheduleNextPlannedDialogTx(tx, {
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        generation: run.generation,
+        childMode: run.mode,
+        source: "dialog_history_after_failure",
+        priority: run.mode === "initial" ? 60 : 50,
+        overlapPages: integer(params.overlapPages, 2, 0, 10),
+        knownMessageThreshold: integer(params.knownMessageThreshold, 3, 1, 100),
+        maxPages: integer(params.maxPages, run.mode === "initial" ? 5000 : 1000, 1, 10000),
+      });
+    }
   });
-  return { runId, status };
+  return {
+    runId,
+    status,
+    next: next ? { created: next.created === true, reason: next.reason || null, runId: next.run?.id || null, jobId: next.job?.id || null } : null,
+  };
 }
 
 async function ingestWsMessages({ agencyId, creatorId, dialogId, fanId = null, messages }) {

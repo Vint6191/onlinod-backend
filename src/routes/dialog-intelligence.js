@@ -91,6 +91,51 @@ async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
   return { paused: runs.length, runs };
 }
 
+async function supersedeHistoryRunsForCreatorPlan({ agencyId, creatorId, reason }) {
+  const runs = await prisma.dialogScanRun.findMany({
+    where: {
+      agencyId,
+      creatorId,
+      dialogId: { not: "__dialog_discovery__" },
+      mode: { in: ["initial", "incremental"] },
+      status: { in: ["QUEUED", "RUNNING", "PAUSED"] },
+    },
+    orderBy: { createdAt: "asc" },
+    take: 10000,
+    select: { id: true, jobId: true },
+  });
+  if (!runs.length) return { cancelled: 0 };
+  const jobIds = runs.map((run) => run.jobId).filter(Boolean);
+  const runIds = runs.map((run) => run.id);
+  const now = new Date();
+  await prisma.$transaction(async (tx) => {
+    if (jobIds.length) {
+      await tx.jobInstance.updateMany({
+        where: { id: { in: jobIds }, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
+        data: {
+          status: "CANCELLED",
+          completedAt: now,
+          lastError: reason,
+          claimedByDeviceId: null,
+          leaseUntil: null,
+          leaseTokenHash: null,
+          workId: null,
+          leaseRevision: { increment: 1 },
+        },
+      });
+    }
+    await tx.dialogScanRun.updateMany({
+      where: { id: { in: runIds } },
+      data: { status: "CANCELLED", completedAt: now, pausedAt: null, lastError: reason },
+    });
+    await tx.dialogScanState.updateMany({
+      where: { agencyId, creatorId, activeRunId: { in: runIds } },
+      data: { status: "IDLE", activeRunId: null, activeJobId: null, lastError: null },
+    });
+  });
+  return { cancelled: runs.length };
+}
+
 async function resumeCreatorRuns({ agencyId, creatorId }) {
   const runs = await prisma.dialogScanRun.findMany({
     where: { agencyId, creatorId, status: "PAUSED" },
@@ -142,6 +187,22 @@ router.post("/creators/:creatorId/scans", async (req, res) => {
     if (childMode === "initial" && !isSeniorAgencyMember(req.auth?.membership || req.member)) {
       return res.status(403).json({ ok: false, code: "DIALOG_FULL_SCAN_FORBIDDEN", error: "Owner, admin or manager permission is required for a full scan" });
     }
+    const activeDiscovery = await prisma.dialogScanRun.findFirst({
+      where: {
+        agencyId: req.auth.agencyId,
+        creatorId: req.params.creatorId,
+        dialogId: "__dialog_discovery__",
+        status: { in: ["QUEUED", "RUNNING", "PAUSED"] },
+      },
+      select: { id: true },
+    });
+    const superseded = activeDiscovery
+      ? { cancelled: 0 }
+      : await supersedeHistoryRunsForCreatorPlan({
+          agencyId: req.auth.agencyId,
+          creatorId: req.params.creatorId,
+          reason: "superseded by a new complete dialog discovery plan",
+        });
     const result = await scheduleDialogScan({
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
@@ -149,7 +210,7 @@ router.post("/creators/:creatorId/scans", async (req, res) => {
       mode: "discovery",
       childMode,
       source: input.source || "manual_creator_scan",
-      generation: input.generation || 0,
+      generation: input.generation || Math.floor(Date.now() / 1000),
       pageLimit: input.pageLimit || 50,
       overlapPages: input.overlapPages ?? 2,
       maxPages: input.maxPages ?? (childMode === "initial" ? 5000 : 1000),
@@ -166,7 +227,7 @@ router.post("/creators/:creatorId/scans", async (req, res) => {
         metadata: { runId: result.run?.id, mode: childMode, source: input.source || "manual_creator_scan" },
       });
     }
-    return res.status(result.created ? 202 : 200).json(result);
+    return res.status(result.created ? 202 : 200).json({ ...result, supersededHistoryRuns: superseded.cancelled });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "DIALOG_CREATOR_SCAN_START_FAILED");
