@@ -25,6 +25,9 @@ function dbFixture({
   soldIds = [],
   dialogActiveJobs = [],
   unsortedActiveJob = null,
+  dialogStates: suppliedDialogStates = null,
+  discoveryRuns: suppliedDiscoveryRuns = null,
+  activeRuns: suppliedActiveRuns = null,
 } = {}) {
   const catalogRows = suppliedRows || (complete ? [
     { id: "row-used", mediaId: "used", mediaType: "video", status: "SORTED", thumbUrl: "used.jpg", folderIds: ["folder-a"], duration: 2, lastSeenAt: date(), updatedAt: date() },
@@ -32,6 +35,18 @@ function dbFixture({
     { id: "row-sorted-unused", mediaId: "sorted-unused", mediaType: "photo", status: "SORTED", thumbUrl: "sorted.jpg", folderIds: ["folder-b"], duration: 0, lastSeenAt: date(), updatedAt: date() },
   ] : []);
   const visibleCatalog = catalogRows.filter((row) => row.status !== "HIDDEN");
+  const defaultDialogStates = complete ? [{
+    dialogId: "dialog-1", scanMode: "initial", initialScanComplete: true, status: "COMPLETED",
+    activeRunId: null, activeJobId: null, pagesProcessed: 3, messagesProcessed: 90,
+    lastError: null, lastFullScanAt: date(), lastIncrementalScanAt: null, updatedAt: date(),
+  }] : [];
+  const dialogStates = suppliedDialogStates || defaultDialogStates;
+  const discoveryRuns = suppliedDiscoveryRuns || (complete ? [{
+    id: "disc", jobId: "disc-job", dialogId: "__dialog_discovery__", mode: "discovery",
+    status: "COMPLETED", progress: { pages: 1, dialogs: dialogStates.length }, pagesProcessed: 1,
+    purchaseSignals: dialogStates.length, completedAt: date(), updatedAt: date(), lastError: null,
+  }] : []);
+  const activeRuns = suppliedActiveRuns || [];
   const used = new Set(usedIds);
   const sold = new Set(soldIds);
 
@@ -98,13 +113,19 @@ function dbFixture({
       async findFirst() { return sold.size ? { updatedAt: date() } : null; },
     },
     dialogScanState: {
-      async findMany() {
-        return complete ? [{ initialScanComplete: true, status: "COMPLETED", pagesProcessed: 3, messagesProcessed: 90, lastError: null, lastFullScanAt: date(), lastIncrementalScanAt: null, updatedAt: date() }] : [];
-      },
+      async findMany() { return dialogStates; },
     },
     dialogScanRun: {
-      async findMany() { return complete ? [{ id: "disc", jobId: "disc-job", status: "COMPLETED", pagesProcessed: 1, purchaseSignals: 1, completedAt: date(), updatedAt: date() }] : []; },
-      async findFirst() { return complete ? { updatedAt: date(), completedAt: date(), lastError: null } : null; },
+      async findMany(args) {
+        if (args.where?.dialogId === "__dialog_discovery__") return discoveryRuns;
+        if (args.where?.status?.in) return activeRuns;
+        return [];
+      },
+      async findFirst() {
+        const rows = [...activeRuns, ...discoveryRuns];
+        const latest = rows.sort((a, b) => Number(new Date(b.updatedAt || 0)) - Number(new Date(a.updatedAt || 0)))[0];
+        return latest ? { updatedAt: latest.updatedAt, completedAt: latest.completedAt || null, lastError: latest.lastError || null } : null;
+      },
     },
     jobInstance: {
       async findMany(args) {
@@ -197,6 +218,61 @@ test("scheduled durable work is shown as WAITING_FOR_WORKER", async () => {
   const result = await getNeverUsedPipelineState({ agencyId: "agency-1", creatorId: "creator-1", db: dbFixture({ complete: true, dialogActiveJobs: activeJobs }), now: date(60_000) });
   assert.equal(result.pipeline.stage, "WAITING_FOR_WORKER");
   assert.equal(result.pipeline.projection.deferred, true);
+});
+
+test("creator context wait is diagnostic, not RETRYING", async () => {
+  const waitingJob = {
+    id: "job-wait", status: "SCHEDULED", params: { dialogId: "dialog-2", mode: "initial", scanRunId: "run-wait" },
+    progress: { waitKind: "creator_context", waitReason: "Creator execution context unavailable", retryAt: date(5_000).toISOString() },
+    claimedByDeviceId: null, leaseUntil: null, nextRunAt: date(5_000), attempts: 0, lastError: null,
+    lastProgressAt: date(), createdAt: date(), updatedAt: date(),
+  };
+  const state = {
+    dialogId: "dialog-2", scanMode: "initial", initialScanComplete: false, status: "RUNNING",
+    activeRunId: "run-wait", activeJobId: "job-wait", pagesProcessed: 2, messagesProcessed: 100,
+    lastError: null, lastFullScanAt: null, lastIncrementalScanAt: null, updatedAt: date(),
+  };
+  const run = {
+    id: "run-wait", jobId: "job-wait", dialogId: "dialog-2", mode: "initial", status: "RUNNING",
+    progress: { pages: 2, rawMessages: 50, messages: 50, skippedMessages: 0, cursorType: "firstId" },
+    pagesProcessed: 2, messagesProcessed: 100, lastError: null, updatedAt: date(),
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1", creatorId: "creator-1",
+    db: dbFixture({ complete: true, dialogActiveJobs: [waitingJob], dialogStates: [state], activeRuns: [run] }),
+    now: date(1_000),
+  });
+  assert.equal(result.pipeline.stage, "WAITING_FOR_CREATOR_CONTEXT");
+  assert.equal(result.pipeline.dialogs.queue.waitingContext, 1);
+  assert.equal(result.pipeline.dialogs.queue.retrying, 0);
+  assert.equal(result.pipeline.dialogs.current.waitKind, "creator_context");
+  assert.equal(result.pipeline.dialogs.current.committedMessages, 50);
+});
+
+test("a real failed attempt is shown as RETRYING with queue diagnostics", async () => {
+  const retryJob = {
+    id: "job-retry", status: "SCHEDULED", params: { dialogId: "dialog-2", mode: "initial", scanRunId: "run-retry" },
+    progress: { pages: 2 }, claimedByDeviceId: null, leaseUntil: null, nextRunAt: date(60_000),
+    attempts: 1, lastError: "HTTP 500", lastProgressAt: date(), createdAt: date(), updatedAt: date(),
+  };
+  const state = {
+    dialogId: "dialog-2", scanMode: "initial", initialScanComplete: false, status: "RUNNING",
+    activeRunId: "run-retry", activeJobId: "job-retry", pagesProcessed: 2, messagesProcessed: 100,
+    lastError: null, lastFullScanAt: null, lastIncrementalScanAt: null, updatedAt: date(),
+  };
+  const run = {
+    id: "run-retry", jobId: "job-retry", dialogId: "dialog-2", mode: "initial", status: "RUNNING",
+    progress: { pages: 2 }, pagesProcessed: 2, messagesProcessed: 100, lastError: null, updatedAt: date(),
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1", creatorId: "creator-1",
+    db: dbFixture({ complete: true, dialogActiveJobs: [retryJob], dialogStates: [state], activeRuns: [run] }),
+    now: date(1_000),
+  });
+  assert.equal(result.pipeline.stage, "RETRYING");
+  assert.equal(result.pipeline.dialogs.queue.retrying, 1);
+  assert.equal(result.pipeline.dialogs.queue.waitingContext, 0);
+  assert.equal(result.pipeline.dialogs.current.lastError, "HTTP 500");
 });
 
 test("projection queries evidence in bounded chunks", async () => {

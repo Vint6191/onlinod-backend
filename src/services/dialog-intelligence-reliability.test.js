@@ -132,7 +132,15 @@ function chunkDbFixture() {
     },
     dialogScanRun: {
       findFirst: async () => run,
-      update: async ({ data }) => { Object.assign(run, data.continuation ? { continuation: data.continuation } : {}, { status: data.status || run.status }); return run; },
+      update: async ({ data }) => {
+        if (data.pagesProcessed?.increment) run.pagesProcessed += data.pagesProcessed.increment;
+        if (data.messagesProcessed?.increment) run.messagesProcessed += data.messagesProcessed.increment;
+        if (data.mediaProcessed?.increment) run.mediaProcessed = (run.mediaProcessed || 0) + data.mediaProcessed.increment;
+        if (data.continuation) run.continuation = data.continuation;
+        if (data.progress) run.progress = data.progress;
+        if (data.status) run.status = data.status;
+        return run;
+      },
     },
     dialogMessageLedger: {
       findUnique: async ({ where }) => messages.get(where.creatorId_messageId.messageId) || null,
@@ -171,7 +179,16 @@ function chunkDbFixture() {
     },
     dialogScanState: {
       findUnique: async () => state,
-      upsert: async () => state,
+      upsert: async ({ create, update }) => {
+        if (!state.dialogId) Object.assign(state, create);
+        if (update.pagesProcessed?.increment) state.pagesProcessed = (state.pagesProcessed || 0) + update.pagesProcessed.increment;
+        if (update.messagesProcessed?.increment) state.messagesProcessed = (state.messagesProcessed || 0) + update.messagesProcessed.increment;
+        if (update.mediaProcessed?.increment) state.mediaProcessed = (state.mediaProcessed || 0) + update.mediaProcessed.increment;
+        for (const [key, value] of Object.entries(update)) {
+          if (value !== undefined && !(value && typeof value === "object" && "increment" in value)) state[key] = value;
+        }
+        return state;
+      },
     },
   };
   return { db, targets, commits, calls, run };
@@ -221,6 +238,52 @@ test("durable target survives restart, resolves after commit, and duplicate repl
   assert.equal(fixture.calls.commitCreates, 1);
   assert.equal(fixture.calls.messageUpserts, 1);
   assert.equal(fixture.calls.targetResolves, 1);
+});
+
+test("a 50-message OF page increments durable run and dialog counters by 50", async () => {
+  const prismaModule = require.resolve("../prisma");
+  require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
+  delete require.cache[require.resolve("./dialog-intelligence-service")];
+  const { applyDialogIntelligenceChunk } = require("./dialog-intelligence-service");
+  const fixture = chunkDbFixture();
+  fixture.run.pagesProcessed = 0;
+  fixture.run.messagesProcessed = 0;
+  fixture.db.dialogScanState.findUnique = async () => ({
+    creatorId: "creator-1", dialogId: "dialog-1", generation: 1,
+    pagesProcessed: 0, messagesProcessed: 0, mediaProcessed: 0,
+  });
+  const messages = Array.from({ length: 50 }, (_, index) => ({
+    messageId: `message-${index + 1}`,
+    dialogId: "dialog-1",
+    createdAtOf: new Date(Date.UTC(2026, 6, 15, 10, 0, 50 - index)).toISOString(),
+    direction: index % 2 ? "INBOUND" : "OUTBOUND",
+    priceCents: 0,
+    isOpened: false,
+    isFree: true,
+    contentHash: `hash-${index + 1}`,
+    media: [],
+  }));
+  const job = {
+    id: "job-50", agencyId: "agency-1", creatorId: "creator-1",
+    params: { scanRunId: "run-1", dialogId: "dialog-1", mode: "initial", generation: 1 },
+    continuation: { driverPhase: "execute", jobContinuation: { mode: "initial", cursor: null, page: 0 } },
+  };
+  const result = await applyDialogIntelligenceChunk({
+    db: fixture.db,
+    job,
+    deviceId: "device-a",
+    chunkResult: {
+      kind: "dialog_message_page", runId: "run-1", dialogId: "dialog-1", mode: "initial",
+      chunkKey: "page-50", page: 1, cursorIn: null, cursorOut: "message-50", hasMore: true,
+      messages,
+      continuation: { mode: "initial", cursor: "message-50", page: 1 },
+      progress: { pages: 1, rawMessages: 50, messages: 50, skippedMessages: 0 },
+    },
+  });
+  assert.equal(result.messageCount, 50);
+  assert.equal(fixture.calls.messageUpserts, 50);
+  assert.equal(fixture.run.pagesProcessed, 1);
+  assert.equal(fixture.run.messagesProcessed, 50);
 });
 
 test("stale worker cannot complete or mutate a reclaimed dialog run", async () => {

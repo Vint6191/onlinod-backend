@@ -1,0 +1,109 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+
+function tokenHash(value) {
+  return crypto.createHash("sha256").update(String(value)).digest("hex");
+}
+
+function loadService(fixture) {
+  const prismaModule = require.resolve("../prisma");
+  const resultModule = require.resolve("./job-result-service");
+  const catalogModule = require.resolve("./job-catalog");
+  const fenceModule = require.resolve("./dialog-job-completion-fence");
+  require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: fixture.db };
+  require.cache[resultModule] = {
+    id: resultModule, filename: resultModule, loaded: true,
+    exports: { applyJobChunk: async () => ({}), applyJobResult: async () => ({}), recordJobFailure: async () => ({}) },
+  };
+  require.cache[catalogModule] = {
+    id: catalogModule, filename: catalogModule, loaded: true,
+    exports: { filterClaimableDesktopJobKeys: (keys) => keys || [] },
+  };
+  require.cache[fenceModule] = {
+    id: fenceModule, filename: fenceModule, loaded: true,
+    exports: { completeDialogJobFenced: async () => ({}) },
+  };
+  delete require.cache[require.resolve("./job-lease-service")];
+  return require("./job-lease-service");
+}
+
+function fixture() {
+  const token = "lease-token";
+  const job = {
+    id: "job-1", agencyId: "agency-1", status: "CLAIMED", claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token), leaseRevision: 3, leaseUntil: new Date(Date.now() + 60_000),
+    attempts: 2, progress: { current: 4, total: 10 }, workId: "work-old",
+  };
+  let update = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { update = args; return { count: 1 }; },
+    },
+  };
+  return { db, job, token, update: () => update };
+}
+
+test("creator context release preserves attempts and records a non-error wait diagnostic", async () => {
+  const item = fixture();
+  const { releaseJob } = loadService(item);
+  const before = Date.now();
+  const result = await releaseJob({
+    jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token,
+    leaseRevision: 3, workId: "work-new",
+    reason: "Creator execution context unavailable during chunk: CREATOR_PAGE_NOT_READY",
+    runAfterMs: 5_000,
+  });
+  const update = item.update();
+  assert.equal(result.status, "SCHEDULED");
+  assert.equal(result.attempts, 2);
+  assert.equal(update.data.status, "SCHEDULED");
+  assert.equal(update.data.lastError, null);
+  assert.equal(update.data.progress.waitKind, "creator_context");
+  assert.match(update.data.progress.waitReason, /CREATOR_PAGE_NOT_READY/);
+  assert.equal(Object.hasOwn(update.data, "attempts"), false);
+  const delay = new Date(update.data.nextRunAt).getTime() - before;
+  assert.ok(delay >= 4_500 && delay <= 6_500, `unexpected delay ${delay}`);
+});
+
+test("claim clears stale wait diagnostics before a worker resumes the job", async () => {
+  const now = new Date();
+  const candidate = {
+    id: "job-claim", jobKey: "dialog_intelligence_scan", scope: "creator", creatorId: "creator-1", agencyId: "agency-1",
+    idempotencyKey: "claim-key", params: { dialogId: "dialog-1" }, priority: 60, attempts: 0,
+    leaseRevision: 1, startedAt: null, workId: null, continuation: null,
+    progress: { current: 2, total: 10, waitKind: "creator_context", waitReason: "old wait", waitingSince: now.toISOString(), retryAt: now.toISOString() },
+  };
+  let updateData = null;
+  const claimed = {
+    ...candidate,
+    status: "CLAIMED", claimedAt: now, claimedByDeviceId: "device-1", leaseUntil: new Date(now.getTime() + 60_000),
+    leaseRevision: 2, progress: { current: 2, total: 10 }, creator: { id: "creator-1" },
+  };
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: now }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all" }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+    deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
+    jobInstance: {
+      updateMany: async ({ data }) => { updateData = data; return { count: 1 }; },
+      findFirst: async () => candidate,
+      findUnique: async () => claimed,
+    },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({
+    userId: "user-1", deviceId: "device-1", leaseMs: 60_000,
+    jobKeys: ["dialog_intelligence_scan"],
+  });
+  assert.equal(result.reason, "claimed");
+  assert.equal(updateData.progress.current, 2);
+  assert.equal(updateData.progress.total, 10);
+  assert.equal(Object.hasOwn(updateData.progress, "waitKind"), false);
+  assert.equal(Object.hasOwn(updateData.progress, "waitReason"), false);
+});

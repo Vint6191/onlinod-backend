@@ -76,12 +76,16 @@ async function requireCreator(db, agencyId, creatorId) {
 }
 
 async function dialogPipelineState(db, agencyId, creatorId) {
-  const [states, discoveryRuns, activeJobs, latestRun] = await Promise.all([
+  const [states, discoveryRuns, activeRuns, activeJobs, latestRun] = await Promise.all([
     db.dialogScanState.findMany({
       where: { agencyId, creatorId, dialogId: { not: "__dialog_discovery__" } },
       select: {
+        dialogId: true,
+        scanMode: true,
         initialScanComplete: true,
         status: true,
+        activeRunId: true,
+        activeJobId: true,
         pagesProcessed: true,
         messagesProcessed: true,
         lastError: true,
@@ -98,10 +102,30 @@ async function dialogPipelineState(db, agencyId, creatorId) {
       select: {
         id: true,
         jobId: true,
+        mode: true,
         status: true,
+        progress: true,
         pagesProcessed: true,
         purchaseSignals: true,
         completedAt: true,
+        updatedAt: true,
+        lastError: true,
+      },
+    }),
+    db.dialogScanRun.findMany({
+      where: { agencyId, creatorId, status: { in: ["QUEUED", "RUNNING", "PAUSED"] } },
+      orderBy: { updatedAt: "desc" },
+      take: 1000,
+      select: {
+        id: true,
+        jobId: true,
+        dialogId: true,
+        mode: true,
+        status: true,
+        progress: true,
+        pagesProcessed: true,
+        messagesProcessed: true,
+        lastError: true,
         updatedAt: true,
       },
     }),
@@ -121,8 +145,11 @@ async function dialogPipelineState(db, agencyId, creatorId) {
         progress: true,
         claimedByDeviceId: true,
         leaseUntil: true,
+        nextRunAt: true,
         attempts: true,
         lastError: true,
+        lastProgressAt: true,
+        createdAt: true,
         updatedAt: true,
       },
     }),
@@ -142,51 +169,126 @@ async function dialogPipelineState(db, agencyId, creatorId) {
       })
     : [];
   const paramsByJobId = new Map(discoveryJobs.map((job) => [job.id, object(job.params)]));
+  const runsById = new Map(activeRuns.map((run) => [run.id, run]));
 
   let discoveryCompleted = false;
   let discoveryCompletedAt = null;
+  let latestInitialDiscoveryRun = null;
   for (const run of discoveryRuns) {
-    if (run.status !== "COMPLETED") continue;
     const params = paramsByJobId.get(run.jobId) || {};
     if (params.childMode !== "initial") continue;
-    discoveryCompleted = true;
-    discoveryCompletedAt = iso(run.completedAt || run.updatedAt);
-    break;
+    if (!latestInitialDiscoveryRun) latestInitialDiscoveryRun = run;
+    if (run.status === "COMPLETED") {
+      discoveryCompleted = true;
+      discoveryCompletedAt = iso(run.completedAt || run.updatedAt);
+      break;
+    }
   }
+
+  const waitKindOf = (job) => clean(object(job?.progress).waitKind, 80).toLowerCase();
+  const waitingContextJobs = activeJobs.filter((job) => job.status === "SCHEDULED" && waitKindOf(job) === "creator_context");
+  const retryingJobs = activeJobs.filter((job) => job.status === "SCHEDULED" && Boolean(job.lastError));
+  const queuedJobs = activeJobs.filter((job) => job.status === "SCHEDULED" && !waitingContextJobs.includes(job) && !retryingJobs.includes(job));
+  const runningJobs = activeJobs.filter((job) => job.status === "CLAIMED");
 
   const discovered = states.length;
   const initialComplete = states.filter((state) => state.initialScanComplete === true).length;
-  const active = states.filter((state) => ["QUEUED", "RUNNING", "PAUSED"].includes(state.status)).length;
-  const paused = states.some((state) => state.status === "PAUSED");
+  const pausedCount = states.filter((state) => state.status === "PAUSED").length;
   const failed = states.filter((state) => state.status === "FAILED").length;
+  const pending = Math.max(0, discovered - initialComplete - failed);
   const pagesCommitted = states.reduce((sum, state) => sum + number(state.pagesProcessed), 0);
   const messagesCommitted = states.reduce((sum, state) => sum + number(state.messagesProcessed), 0);
   const discoveryJob = activeJobs.find((job) => clean(object(job.params).dialogId) === "__dialog_discovery__") || null;
-  const activeJob = discoveryJob || activeJobs[0] || null;
+  const historyJobs = activeJobs.filter((job) => clean(object(job.params).dialogId) !== "__dialog_discovery__");
+  const discoveryRunning = discoveryJob?.status === "CLAIMED";
+  const historyRunning = historyJobs.some((job) => job.status === "CLAIMED");
+  const currentJob = runningJobs.find((job) => clean(object(job.params).dialogId) !== "__dialog_discovery__")
+    || runningJobs[0]
+    || waitingContextJobs[0]
+    || retryingJobs[0]
+    || queuedJobs[0]
+    || null;
+  const currentParams = object(currentJob?.params);
+  const currentRun = runsById.get(clean(currentParams.scanRunId, 160)) || null;
+  const currentProgress = object(currentRun?.progress || currentJob?.progress);
   const successfulStateTimes = states
     .filter((state) => state.initialScanComplete === true)
     .map((state) => state.lastIncrementalScanAt || state.lastFullScanAt)
     .filter(Boolean);
+  const failedState = states
+    .filter((state) => state.status === "FAILED" && state.lastError)
+    .sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))[0] || null;
+  const lastError = currentJob?.lastError || currentRun?.lastError || (activeJobs.length ? null : failedState?.lastError) || null;
+  const lastUpdatedAt = mostRecent([
+    currentJob?.lastProgressAt,
+    currentJob?.updatedAt,
+    currentRun?.updatedAt,
+    latestRun?.updatedAt,
+    ...states.slice(0, 20).map((state) => state.updatedAt),
+  ]);
 
   return {
     discovered,
     initialComplete,
-    active,
-    paused,
+    active: activeJobs.length + pausedCount,
+    paused: pausedCount > 0,
     failed,
+    pending,
     pagesCommitted,
     messagesCommitted,
     discoveryCompleted,
-    activeJobStatus: activeJob?.status || null,
-    claimedByDeviceId: activeJob?.claimedByDeviceId || null,
-    leaseUntil: iso(activeJob?.leaseUntil),
-    retries: number(activeJob?.attempts),
-    lastError: activeJob?.lastError || latestRun?.lastError || states.find((state) => state.lastError)?.lastError || null,
-    lastUpdatedAt: iso(activeJob?.updatedAt || latestRun?.updatedAt || states[0]?.updatedAt),
+    activeJobStatus: currentJob?.status || null,
+    claimedByDeviceId: currentJob?.claimedByDeviceId || null,
+    leaseUntil: iso(currentJob?.leaseUntil),
+    nextRunAt: iso(currentJob?.nextRunAt),
+    retries: number(currentJob?.attempts),
+    lastError,
+    lastUpdatedAt,
     lastSuccessfulScanAt: mostRecent([discoveryCompletedAt, ...successfulStateTimes]),
-    activeJob,
-    discoveryActive: Boolean(discoveryJob),
-    historyActive: activeJobs.some((job) => clean(object(job.params).dialogId) !== "__dialog_discovery__"),
+    activeJob: currentJob,
+    discoveryActive: discoveryRunning,
+    historyActive: historyRunning,
+    queue: {
+      total: discovered,
+      completed: initialComplete,
+      pending,
+      queued: queuedJobs.filter((job) => clean(object(job.params).dialogId) !== "__dialog_discovery__").length,
+      running: runningJobs.filter((job) => clean(object(job.params).dialogId) !== "__dialog_discovery__").length,
+      waitingContext: waitingContextJobs.filter((job) => clean(object(job.params).dialogId) !== "__dialog_discovery__").length,
+      retrying: retryingJobs.filter((job) => clean(object(job.params).dialogId) !== "__dialog_discovery__").length,
+      paused: pausedCount,
+      failed,
+    },
+    discovery: {
+      completed: discoveryCompleted,
+      active: Boolean(discoveryJob),
+      running: discoveryRunning,
+      status: discoveryJob?.status || latestInitialDiscoveryRun?.status || null,
+      pages: number(latestInitialDiscoveryRun?.pagesProcessed),
+      dialogsFound: number(latestInitialDiscoveryRun?.purchaseSignals, discovered),
+      progress: object(latestInitialDiscoveryRun?.progress || discoveryJob?.progress),
+    },
+    current: currentJob ? {
+      dialogId: clean(currentParams.dialogId, 180) || currentRun?.dialogId || null,
+      mode: clean(currentParams.mode, 40) || currentRun?.mode || null,
+      jobStatus: currentJob.status,
+      runStatus: currentRun?.status || null,
+      page: number(currentProgress.pages ?? currentRun?.pagesProcessed),
+      rawMessages: number(currentProgress.rawMessages),
+      committedMessages: number(currentProgress.messages),
+      skippedMessages: number(currentProgress.skippedMessages),
+      cursorType: clean(currentProgress.cursorType, 40) || null,
+      cursorIn: clean(currentProgress.cursorIn, 240) || null,
+      cursorOut: clean(currentProgress.cursor, 240) || null,
+      claimedByDeviceId: currentJob.claimedByDeviceId || null,
+      leaseUntil: iso(currentJob.leaseUntil),
+      nextRunAt: iso(currentJob.nextRunAt),
+      retries: number(currentJob.attempts),
+      waitKind: waitKindOf(currentJob) || null,
+      waitReason: clean(object(currentJob.progress).waitReason, 500) || null,
+      lastError: currentJob.lastError || currentRun?.lastError || null,
+      lastProgressAt: iso(currentJob.lastProgressAt || currentRun?.updatedAt || currentJob.updatedAt),
+    } : null,
   };
 }
 
@@ -366,17 +468,25 @@ function jobStatus(value) {
 function stageFrom({ messages, dialogs, authoritative, stale }) {
   const scanStatus = jobStatus(messages?.snapshot?.scan?.status || "IDLE");
   const messagesJob = jobStatus(messages?.activeJob?.status);
+  const messagesWaitKind = clean(object(messages?.activeJob?.progress).waitKind, 80).toLowerCase();
   const dialogJob = jobStatus(dialogs.activeJobStatus);
-  if (scanStatus === "FAILED" || dialogs.failed > 0) return "FAILED";
-  if ((messagesJob === "SCHEDULED" && messages?.activeJob?.lastError) || (dialogJob === "SCHEDULED" && dialogs.lastError)) return "RETRYING";
+  const dialogWaitKind = clean(dialogs.current?.waitKind, 80).toLowerCase();
+  const messagesRetrying = messagesJob === "SCHEDULED" && Boolean(messages?.activeJob?.lastError);
+  const messagesWaitingContext = messagesJob === "SCHEDULED" && messagesWaitKind === "creator_context";
+  const dialogRetrying = dialogJob === "SCHEDULED" && Boolean(dialogs.current?.lastError || dialogs.lastError);
+  const dialogWaitingContext = dialogJob === "SCHEDULED" && dialogWaitKind === "creator_context";
   if (scanStatus === "PAUSED" || dialogs.paused) return "PAUSED";
   if (messagesJob === "CLAIMED" || scanStatus === "RUNNING") return "UPDATING_MESSAGES_CATALOG";
   if (dialogJob === "CLAIMED" && dialogs.discoveryActive) return "DISCOVERING_DIALOGS";
-  if (dialogJob === "CLAIMED" || dialogs.historyActive || dialogs.active > 0) return "SCANNING_DIALOG_HISTORY";
-  if ([messagesJob, dialogJob].some((status) => status === "SCHEDULED") || scanStatus === "QUEUED") return "WAITING_FOR_WORKER";
+  if (dialogJob === "CLAIMED" || dialogs.queue.running > 0 || dialogs.historyActive) return "SCANNING_DIALOG_HISTORY";
+  if (messagesWaitingContext || dialogWaitingContext || dialogs.queue.waitingContext > 0) return "WAITING_FOR_CREATOR_CONTEXT";
+  if (messagesRetrying || dialogRetrying || dialogs.queue.retrying > 0) return "RETRYING";
+  if (messagesJob === "SCHEDULED" || dialogJob === "SCHEDULED" || dialogs.queue.queued > 0 || scanStatus === "QUEUED") return "WAITING_FOR_WORKER";
+  if (scanStatus === "FAILED" || (dialogs.failed > 0 && dialogs.active === 0)) return "FAILED";
   if (scanStatus === "CANCELLED") return "CANCELLED";
   if (authoritative && stale) return "STALE";
   if (authoritative) return "UP_TO_DATE";
+  if (dialogs.discovered > dialogs.initialComplete || (dialogs.discovery.status && !dialogs.discoveryCompleted)) return "STALLED";
   return "NOT_SCANNED";
 }
 
@@ -425,7 +535,9 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
     "DISCOVERING_DIALOGS",
     "SCANNING_DIALOG_HISTORY",
     "WAITING_FOR_WORKER",
+    "WAITING_FOR_CREATOR_CONTEXT",
     "RETRYING",
+    "STALLED",
   ].includes(stage);
   const fingerprint = projectionFingerprint(messages.snapshot, dialogs, salesAt);
   const projection = authoritative && !workActive
@@ -435,14 +547,14 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   let progressPercent = 0;
   let progressIndeterminate = false;
   if (messagesComplete) progressPercent += 35;
-  else if (["UPDATING_MESSAGES_CATALOG", "WAITING_FOR_WORKER", "RETRYING"].includes(stage)) {
+  else if (["UPDATING_MESSAGES_CATALOG", "WAITING_FOR_WORKER", "WAITING_FOR_CREATOR_CONTEXT", "RETRYING", "STALLED"].includes(stage)) {
     progressPercent = 5;
     progressIndeterminate = true;
   }
   if (messagesComplete && dialogs.discoveryCompleted) progressPercent = Math.max(progressPercent, 40);
   if (dialogs.discovered > 0) {
     progressPercent = Math.max(progressPercent, 40 + Math.round((dialogs.initialComplete / dialogs.discovered) * 55));
-  } else if (messagesComplete && ["DISCOVERING_DIALOGS", "WAITING_FOR_WORKER"].includes(stage)) {
+  } else if (messagesComplete && ["DISCOVERING_DIALOGS", "WAITING_FOR_WORKER", "WAITING_FOR_CREATOR_CONTEXT", "STALLED"].includes(stage)) {
     progressIndeterminate = true;
   }
   if (authoritative) progressPercent = 100;
@@ -471,16 +583,21 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
         active: dialogs.active,
         paused: dialogs.paused,
         failed: dialogs.failed,
+        pending: dialogs.pending,
         pagesCommitted: dialogs.pagesCommitted,
         messagesCommitted: dialogs.messagesCommitted,
         discoveryCompleted: dialogs.discoveryCompleted,
         activeJobStatus: dialogs.activeJobStatus,
         claimedByDeviceId: dialogs.claimedByDeviceId,
         leaseUntil: dialogs.leaseUntil,
+        nextRunAt: dialogs.nextRunAt,
         retries: dialogs.retries,
         lastError: dialogs.lastError,
         lastUpdatedAt: dialogs.lastUpdatedAt,
         lastSuccessfulScanAt: dialogs.lastSuccessfulScanAt,
+        queue: dialogs.queue,
+        discovery: dialogs.discovery,
+        current: dialogs.current,
       },
       freshness: {
         messagesAt: iso(messagesAt),

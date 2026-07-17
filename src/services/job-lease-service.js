@@ -24,6 +24,23 @@ function clean(value, max = 500) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : null;
 }
+function object(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function waitKind(reason) {
+  const text = String(reason || "").toLowerCase();
+  if (text.includes("creator execution context unavailable")) return "creator_context";
+  if (text.includes("worker stopped") || text.includes("worker disabled")) return "worker_shutdown";
+  return "worker_release";
+}
+function clearWaitProgress(value) {
+  const progress = { ...object(value) };
+  delete progress.waitKind;
+  delete progress.waitReason;
+  delete progress.waitingSince;
+  delete progress.retryAt;
+  return Object.keys(progress).length ? progress : null;
+}
 function hashToken(token) {
   return crypto.createHash("sha256").update(String(token)).digest("hex");
 }
@@ -167,6 +184,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys }) {
       data: {
         status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,
         leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 }, startedAt: candidate.startedAt || now, lastError: null,
+        progress: clearWaitProgress(candidate.progress),
       },
     });
     if (!updated.count) continue;
@@ -370,7 +388,17 @@ async function releaseJob({ jobId, userId, deviceId, leaseToken, leaseRevision, 
     data: {
       status: "SCHEDULED",
       nextRunAt: new Date(now.getTime() + delay),
-      lastError: clean(reason, 2000) || "worker released lease",
+      // A cooperative lease release is not a failed attempt. Keep the reason in
+      // bounded progress diagnostics so the UI can say what it is waiting for,
+      // but never poison the whole pipeline with a fake RETRYING state.
+      lastError: null,
+      progress: {
+        ...object(job.progress),
+        waitKind: waitKind(reason),
+        waitReason: clean(reason, 500) || "worker released lease",
+        waitingSince: now.toISOString(),
+        retryAt: new Date(now.getTime() + delay).toISOString(),
+      },
       claimedAt: null,
       claimedByDeviceId: null,
       leaseUntil: null,

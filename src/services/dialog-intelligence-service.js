@@ -204,7 +204,10 @@ async function scheduleDialogScanTx(db, input) {
       stage: active.mode === "targeted" ? "TARGETED_RECONCILIATION" : "DIALOG_SCAN",
       mode: active.mode,
       dialogId,
-      cursor: active.mode === "initial" ? clean(state?.backwardCursor, 240) : clean(state?.forwardCursor || state?.newestMessageId, 240),
+      // Chat pagination always starts from the newest page. A saved page cursor
+      // is used only to resume an interrupted run; the confirmed watermark is
+      // kept separately and must never become the request anchor.
+      cursor: active.mode === "initial" ? clean(state?.backwardCursor, 240) : null,
       offset: 0,
       page: integer(active.pagesProcessed, 0),
       watermark: clean(state?.confirmedWatermarkMessageId || state?.forwardCursor || state?.newestMessageId, 240),
@@ -286,8 +289,9 @@ async function scheduleDialogScanTx(db, input) {
       progress: { stage: mode === "discovery" ? "DIALOG_DISCOVERY" : mode === "targeted" ? "TARGETED_RECONCILIATION" : "DIALOG_SCAN", pages: 0, messages: 0 },
     },
   });
+  const forceFull = requestedMode === "full";
   const initialCursor = clean(input.cursor, 240)
-    || (mode === "initial" ? clean(state?.backwardCursor, 240) : clean(state?.forwardCursor || state?.newestMessageId, 240));
+    || (mode === "initial" && !forceFull ? clean(state?.backwardCursor, 240) : null);
   const knownMessageThreshold = integer(input.knownMessageThreshold, 3, 1, 100);
   const maxPages = integer(input.maxPages, mode === "initial" ? 5000 : mode === "discovery" ? 1000 : 1000, 1, 10000);
   const job = await db.jobInstance.create({
