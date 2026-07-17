@@ -11,7 +11,9 @@ function fakeDb(options = {}) {
   let runCounter = 0;
   let jobCounter = 0;
   const active = options.active || null;
+  const failed = options.failed || null;
   const activeJob = options.activeJob || null;
+  const failedJob = options.failedJob || null;
   const state = options.state || null;
   return {
     calls,
@@ -32,7 +34,7 @@ function fakeDb(options = {}) {
       updateMany: async (value) => { calls.statesUpdated.push(value); return { count: 1 }; },
     },
     dialogScanRun: {
-      findFirst: async () => active,
+      findFirst: async ({ where } = {}) => where?.status === "FAILED" ? failed : active,
       create: async ({ data }) => {
         const row = { id: `run-${++runCounter}`, jobId: null, pagesProcessed: 0, continuation: {}, ...data };
         calls.runsCreated.push(row);
@@ -45,7 +47,10 @@ function fakeDb(options = {}) {
       },
     },
     jobInstance: {
-      findUnique: async () => activeJob,
+      findUnique: async ({ where } = {}) => {
+        if (failedJob && where?.id === failedJob.id) return failedJob;
+        return activeJob;
+      },
       create: async ({ data }) => {
         const row = { id: `job-${++jobCounter}`, priority: 0, params: {}, continuation: null, ...data };
         calls.jobsCreated.push(row);
@@ -113,6 +118,35 @@ test("partially scanned paused dialog resumes the same run and continuation", as
   assert.equal(result.run.id, "run-paused");
   assert.deepEqual(db.calls.jobsCreated[0].continuation, active.continuation);
   assert.equal(db.calls.runsCreated.length, 0);
+});
+
+test("recoverable failed discovery resumes the same checkpoint instead of rebuilding the dialog list", async () => {
+  const failed = {
+    id: "run-failed", jobId: "job-failed", status: "FAILED", mode: "discovery",
+    dialogId: "__dialog_discovery__", pagesProcessed: 1151, generation: 7,
+    continuation: {
+      stage: "DIALOG_DISCOVERY", mode: "discovery", dialogId: "__dialog_discovery__",
+      offset: 21590, page: 1151, dialogsFound: 15243, childMode: "initial", maxPages: 5000,
+    },
+    progress: { pages: 1151, nextOffset: 21590, dialogsFound: 15243 },
+  };
+  const failedJob = {
+    id: "job-failed", status: "FAILED", priority: 90,
+    params: { dialogId: "__dialog_discovery__", mode: "discovery", childMode: "initial", pageLimit: 50 },
+    continuation: failed.continuation,
+    result: { failure: { code: "DIALOG_DISCOVERY_EMPTY_PAGE_WITH_HAS_MORE", retryable: false } },
+  };
+  const db = fakeDb({ failed, failedJob, state: { generation: 7 } });
+  const result = await scheduleDialogScanTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1", dialogId: "__dialog_discovery__",
+    mode: "discovery", childMode: "initial", source: "never_used_pipeline", priority: 90,
+  });
+  assert.equal(result.resumed, true);
+  assert.equal(result.run.id, "run-failed");
+  assert.equal(db.calls.runsCreated.length, 0);
+  assert.equal(db.calls.jobsCreated.length, 1);
+  assert.deepEqual(db.calls.jobsCreated[0].continuation, failed.continuation);
+  assert.equal(db.calls.jobsCreated[0].params.scanRunId, "run-failed");
 });
 
 test("purchase target is queued inside an active initial run without damaging continuation", async () => {

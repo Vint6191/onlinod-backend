@@ -161,10 +161,31 @@ async function scheduleDialogScanTx(db, input) {
       })
     : null;
 
-  const active = await db.dialogScanRun.findFirst({
+  let active = await db.dialogScanRun.findFirst({
     where: { agencyId, creatorId, dialogId, status: { in: ACTIVE_RUN_STATUSES } },
     orderBy: { createdAt: "desc" },
   });
+
+  // Manual/automatic non-destructive starts may recover a terminal job from its
+  // last committed continuation. This is intentionally narrow: explicit full
+  // rescans still create a clean generation, while transient/retryable failures
+  // (including an OF empty page that still advertises hasMore=true) continue
+  // from the durable offset instead of throwing away thousands of list pages.
+  if (!active && input.forceChildFull !== true) {
+    const failedRun = await db.dialogScanRun.findFirst({
+      where: { agencyId, creatorId, dialogId, status: "FAILED" },
+      orderBy: { createdAt: "desc" },
+    });
+    const failedJob = failedRun?.jobId
+      ? await db.jobInstance.findUnique({ where: { id: failedRun.jobId } })
+      : null;
+    const failure = object(object(failedJob?.result).failure);
+    const failureCode = clean(failure.code, 160);
+    const checkpointRecoverable = failure.retryable === true
+      || failureCode === "DIALOG_DISCOVERY_EMPTY_PAGE_WITH_HAS_MORE";
+    if (failedRun && checkpointRecoverable) active = failedRun;
+  }
+
   if (active) {
     const activeJob = active.jobId ? await db.jobInstance.findUnique({ where: { id: active.jobId } }) : null;
     if (activeJob && ["SCHEDULED", "CLAIMED"].includes(activeJob.status)) {
@@ -200,16 +221,28 @@ async function scheduleDialogScanTx(db, input) {
 
     // Resume the same durable run and continuation instead of replacing it.
     const resumeContinuation = object(active.continuation);
+    const activeProgress = object(active.progress);
+    const activeJobParams = object(activeJob?.params);
     const fallbackResumeContinuation = {
-      stage: active.mode === "targeted" ? "TARGETED_RECONCILIATION" : "DIALOG_SCAN",
+      stage: active.mode === "discovery"
+        ? "DIALOG_DISCOVERY"
+        : active.mode === "targeted" ? "TARGETED_RECONCILIATION" : "DIALOG_SCAN",
       mode: active.mode,
       dialogId,
       // Chat pagination always starts from the newest page. A saved page cursor
       // is used only to resume an interrupted run; the confirmed watermark is
       // kept separately and must never become the request anchor.
       cursor: active.mode === "initial" ? clean(state?.backwardCursor, 240) : null,
-      offset: 0,
-      page: integer(active.pagesProcessed, 0),
+      offset: active.mode === "discovery"
+        ? integer(activeProgress.nextOffset ?? object(active.continuation).offset, 0)
+        : 0,
+      page: integer(active.pagesProcessed ?? activeProgress.pages, 0),
+      childMode: active.mode === "discovery"
+        ? clean(activeJobParams.childMode ?? input.childMode, 40)
+        : null,
+      dialogsFound: active.mode === "discovery"
+        ? integer(activeProgress.dialogsFound ?? object(active.continuation).dialogsFound, 0)
+        : 0,
       watermark: clean(state?.confirmedWatermarkMessageId || state?.forwardCursor || state?.newestMessageId, 240),
       watermarkAt: dateOrNull(state?.confirmedWatermarkAt || state?.newestMessageAt)?.toISOString() || null,
       watermarkReached: false,
