@@ -331,3 +331,112 @@ test("a terminal failure marks one dialog failed and immediately advances to the
   assert.equal(failure.next.created, true);
   assert.equal([...db._runs.values()].some((run) => run.dialogId === "dialog-b" && run.status === "QUEUED"), true);
 });
+
+
+test("explicit full discovery replans completed dialogs and resets current-plan counters", async () => {
+  resetDb();
+  const { job } = seedDiscovery(88);
+  job.params.forceChildFull = true;
+  db._states.set("creator-1:dialog-a", {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-a",
+    fanId: "fan-old",
+    generation: 12,
+    status: "READY",
+    scanMode: "initial",
+    initialScanComplete: true,
+    pagesProcessed: 99,
+    messagesProcessed: 9999,
+    mediaProcessed: 123,
+    backwardCursor: "old-cursor",
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+
+  await applyDialogIntelligenceChunk({
+    db,
+    job,
+    deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page",
+      runId: "discovery-run",
+      chunkKey: "page-0",
+      page: 0,
+      childMode: "initial",
+      forceChildFull: true,
+      hasMore: false,
+      cursorIn: "0",
+      cursorOut: "",
+      continuation: { mode: "discovery", page: 1, offset: 1 },
+      progress: { pages: 1, dialogsFound: 1, hasMore: false, nextOffset: 1 },
+      dialogs: [{ dialogId: "dialog-a", fanId: "fan-new" }],
+    },
+  });
+
+  const state = db._states.get("creator-1:dialog-a");
+  assert.equal(state.status, "PLANNED");
+  assert.equal(state.generation, 88);
+  assert.equal(state.initialScanComplete, false);
+  assert.equal(state.pagesProcessed, 0);
+  assert.equal(state.messagesProcessed, 0);
+  assert.equal(state.mediaProcessed, 0);
+  assert.equal(state.backwardCursor, null);
+});
+
+test("an orphaned active history run is failed and cannot block the next planned dialog", async () => {
+  resetDb();
+  const { job } = seedDiscovery(99);
+  db._runs.set("orphan-run", {
+    id: "orphan-run",
+    jobId: "missing-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-a",
+    mode: "initial",
+    status: "RUNNING",
+    generation: 99,
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+  db._states.set("creator-1:dialog-a", {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-a",
+    generation: 99,
+    status: "RUNNING",
+    scanMode: "initial",
+    initialScanComplete: false,
+    activeRunId: "orphan-run",
+    activeJobId: "missing-job",
+    pagesProcessed: 0,
+    messagesProcessed: 0,
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+  db._states.set("creator-1:dialog-b", {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-b",
+    generation: 99,
+    status: "PLANNED",
+    scanMode: "initial",
+    initialScanComplete: false,
+    pagesProcessed: 0,
+    messagesProcessed: 0,
+    createdAt: new Date(1),
+    updatedAt: new Date(1),
+  });
+
+  const completion = await completeDialogIntelligenceJob({
+    db,
+    job,
+    deviceId: "device-1",
+    result: { pages: 1, dialogsFound: 2, hasMore: false },
+  });
+
+  assert.equal(db._runs.get("orphan-run").status, "FAILED");
+  assert.equal(db._states.get("creator-1:dialog-a").status, "FAILED");
+  assert.equal(completion.next.created, true);
+  assert.equal(completion.next.runId, [...db._runs.values()].find((run) => run.dialogId === "dialog-b")?.id);
+});

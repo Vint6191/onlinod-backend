@@ -71,7 +71,8 @@ async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
       await tx.jobInstance.updateMany({
         where: { id: { in: jobIds }, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
         data: {
-          status: "CANCELLED", completedAt: new Date(), lastError: reason,
+          status: "CANCELLED", completedAt: new Date(), lastError: null,
+          result: { control: { kind: "paused", reason, at: new Date().toISOString() } },
           claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
           leaseRevision: { increment: 1 },
         },
@@ -80,24 +81,24 @@ async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
     if (runs.length) {
       await tx.dialogScanRun.updateMany({
         where: { id: { in: runs.map((run) => run.id) } },
-        data: { status: "PAUSED", pausedAt: new Date(), lastError: reason },
+        data: { status: "PAUSED", pausedAt: new Date(), lastError: null },
       });
       await tx.dialogScanState.updateMany({
         where: { agencyId, creatorId, activeRunId: { in: runs.map((run) => run.id) } },
-        data: { status: "PAUSED", activeJobId: null, lastError: reason },
+        data: { status: "PAUSED", activeJobId: null, lastError: null },
       });
     }
   });
   return { paused: runs.length, runs };
 }
 
-async function supersedeHistoryRunsForCreatorPlan({ agencyId, creatorId, reason }) {
+async function supersedeHistoryRunsForCreatorPlan({ agencyId, creatorId, reason, includeDiscovery = false }) {
   const runs = await prisma.dialogScanRun.findMany({
     where: {
       agencyId,
       creatorId,
-      dialogId: { not: "__dialog_discovery__" },
-      mode: { in: ["initial", "incremental"] },
+      ...(includeDiscovery ? {} : { dialogId: { not: "__dialog_discovery__" } }),
+      mode: { in: includeDiscovery ? ["discovery", "initial", "incremental"] : ["initial", "incremental"] },
       status: { in: ["QUEUED", "RUNNING", "PAUSED"] },
     },
     orderBy: { createdAt: "asc" },
@@ -115,7 +116,8 @@ async function supersedeHistoryRunsForCreatorPlan({ agencyId, creatorId, reason 
         data: {
           status: "CANCELLED",
           completedAt: now,
-          lastError: reason,
+          lastError: null,
+          result: { control: { kind: "superseded", reason, at: now.toISOString() } },
           claimedByDeviceId: null,
           leaseUntil: null,
           leaseTokenHash: null,
@@ -126,7 +128,7 @@ async function supersedeHistoryRunsForCreatorPlan({ agencyId, creatorId, reason 
     }
     await tx.dialogScanRun.updateMany({
       where: { id: { in: runIds } },
-      data: { status: "CANCELLED", completedAt: now, pausedAt: null, lastError: reason },
+      data: { status: "CANCELLED", completedAt: now, pausedAt: null, lastError: null },
     });
     await tx.dialogScanState.updateMany({
       where: { agencyId, creatorId, activeRunId: { in: runIds } },
@@ -137,53 +139,126 @@ async function supersedeHistoryRunsForCreatorPlan({ agencyId, creatorId, reason 
 }
 
 async function resumeCreatorRuns({ agencyId, creatorId }) {
-  const runs = await prisma.dialogScanRun.findMany({
-    where: { agencyId, creatorId, status: "PAUSED" },
-    orderBy: { updatedAt: "asc" },
-    take: 1000,
-  });
-  const resumed = [];
-  await prisma.$transaction(async (tx) => {
-    for (const run of runs) {
-      const oldJob = run.jobId ? await tx.jobInstance.findUnique({ where: { id: run.jobId } }) : null;
-      const job = await tx.jobInstance.create({
-        data: {
-          jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
-          scope: "creator",
-          creatorId: run.creatorId,
-          agencyId: run.agencyId,
-          idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${run.id}:${Date.now()}:${resumed.length}`,
-          params: {
-            ...((oldJob?.params && typeof oldJob.params === "object") ? oldJob.params : {}),
-            scanRunId: run.id,
-            dialogId: run.dialogId,
-            mode: run.mode,
+  return prisma.$transaction(async (tx) => {
+    const runs = await tx.dialogScanRun.findMany({
+      where: { agencyId, creatorId, status: "PAUSED" },
+      orderBy: [{ generation: "desc" }, { updatedAt: "asc" }],
+      take: 1000,
+    });
+    if (!runs.length) return { resumed: 0, normalized: 0, items: [] };
+
+    // A creator pipeline is strictly sequential. Legacy builds could pause
+    // several discovery/history runs at once and then resume every one of
+    // them, recreating the exact parallel queue this pipeline is meant to
+    // eliminate. Resume one authoritative run and turn the remaining paused
+    // history rows back into plan entries.
+    const latestDiscovery = await tx.dialogScanRun.findFirst({
+      where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+      orderBy: [{ generation: "desc" }, { createdAt: "desc" }],
+      select: { id: true, generation: true, status: true },
+    });
+    const latestDiscoveryStatus = clean(latestDiscovery?.status, 40).toUpperCase();
+    let selectedGeneration = latestDiscovery?.generation ?? runs[0]?.generation ?? 0;
+    let selected = latestDiscoveryStatus === "PAUSED"
+      ? runs.find((run) => run.id === latestDiscovery.id) || null
+      : null;
+
+    // If the authoritative discovery is already live, stale paused rows must
+    // be cleaned up but no second job may be started beside it.
+    const discoveryAlreadyLive = ["QUEUED", "RUNNING"].includes(latestDiscoveryStatus);
+    if (!selected && !discoveryAlreadyLive) {
+      selected = runs.find((run) => run.dialogId !== "__dialog_discovery__" && run.generation === selectedGeneration)
+        || (!latestDiscovery
+          ? runs
+            .filter((run) => run.dialogId === "__dialog_discovery__")
+            .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))[0]
+          : null)
+        || runs.find((run) => run.dialogId !== "__dialog_discovery__")
+        || null;
+      selectedGeneration = selected?.generation ?? selectedGeneration;
+    }
+
+    const extraRuns = selected ? runs.filter((run) => run.id !== selected.id) : runs;
+    const now = new Date();
+    for (const run of extraRuns) {
+      if (run.jobId) {
+        await tx.jobInstance.updateMany({
+          where: { id: run.jobId, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
+          data: {
+            status: "CANCELLED",
+            completedAt: now,
+            lastError: null,
+            result: { control: { kind: "normalized", reason: "sequential dialog plan recovery", at: now.toISOString() } },
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+            workId: null,
+            leaseRevision: { increment: 1 },
           },
-          continuation: oldJob?.continuation || run.continuation || null,
-          progress: oldJob?.progress || run.progress || null,
-          status: "SCHEDULED",
-          priority: oldJob?.priority || 70,
-          scheduledAt: new Date(),
-          nextRunAt: new Date(),
-        },
-      });
+        });
+      }
       await tx.dialogScanRun.update({
         where: { id: run.id },
-        data: { status: "QUEUED", jobId: job.id, pausedAt: null, lastError: null },
+        data: { status: "CANCELLED", completedAt: now, pausedAt: null, lastError: null },
       });
       await tx.dialogScanState.updateMany({
-        where: { creatorId: run.creatorId, dialogId: run.dialogId },
-        data: { status: "QUEUED", activeJobId: job.id, activeRunId: run.id, lastError: null },
+        where: { agencyId, creatorId, activeRunId: run.id },
+        data: {
+          status: run.dialogId !== "__dialog_discovery__" && run.generation === selectedGeneration ? "PLANNED" : "IDLE",
+          activeRunId: null,
+          activeJobId: null,
+          lastError: null,
+        },
       });
-      resumed.push({ runId: run.id, jobId: job.id });
     }
+
+    if (!selected) {
+      return { resumed: 0, normalized: extraRuns.length, items: [] };
+    }
+
+    const oldJob = selected.jobId ? await tx.jobInstance.findUnique({ where: { id: selected.jobId } }) : null;
+    const job = await tx.jobInstance.create({
+      data: {
+        jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
+        scope: "creator",
+        creatorId: selected.creatorId,
+        agencyId: selected.agencyId,
+        idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${selected.id}:${Date.now()}`,
+        params: {
+          ...((oldJob?.params && typeof oldJob.params === "object") ? oldJob.params : {}),
+          scanRunId: selected.id,
+          dialogId: selected.dialogId,
+          mode: selected.mode,
+        },
+        continuation: oldJob?.continuation || selected.continuation || null,
+        progress: oldJob?.progress || selected.progress || null,
+        status: "SCHEDULED",
+        priority: oldJob?.priority || 70,
+        scheduledAt: now,
+        nextRunAt: now,
+      },
+    });
+    await tx.dialogScanRun.update({
+      where: { id: selected.id },
+      data: { status: "QUEUED", jobId: job.id, pausedAt: null, completedAt: null, lastError: null },
+    });
+    await tx.dialogScanState.updateMany({
+      where: { agencyId, creatorId, dialogId: selected.dialogId },
+      data: { status: "QUEUED", activeJobId: job.id, activeRunId: selected.id, lastError: null },
+    });
+    return {
+      resumed: 1,
+      normalized: extraRuns.length,
+      items: [{ runId: selected.id, jobId: job.id, dialogId: selected.dialogId, generation: selected.generation }],
+    };
   });
-  return { resumed: resumed.length, items: resumed };
 }
+
 router.post("/creators/:creatorId/scans", async (req, res) => {
   try {
     const input = creatorScanSchema.parse(req.body || {});
     const childMode = input.mode === "full" ? "initial" : (input.mode || "incremental");
+    const forceChildFull = input.mode === "full";
     if (childMode === "initial" && !isSeniorAgencyMember(req.auth?.membership || req.member)) {
       return res.status(403).json({ ok: false, code: "DIALOG_FULL_SCAN_FORBIDDEN", error: "Owner, admin or manager permission is required for a full scan" });
     }
@@ -196,9 +271,20 @@ router.post("/creators/:creatorId/scans", async (req, res) => {
       },
       select: { id: true },
     });
-    const superseded = activeDiscovery
-      ? { cancelled: 0 }
-      : await supersedeHistoryRunsForCreatorPlan({
+    // "full" is an explicit destructive restart. It must never resume a stale
+    // or paused discovery generation, otherwise the UI can stay attached to an
+    // old poisoned plan forever. Normal initial/incremental starts still resume
+    // healthy durable work.
+    const superseded = forceChildFull
+      ? await supersedeHistoryRunsForCreatorPlan({
+          agencyId: req.auth.agencyId,
+          creatorId: req.params.creatorId,
+          reason: "superseded by an explicit full dialog rescan",
+          includeDiscovery: true,
+        })
+      : activeDiscovery
+        ? { cancelled: 0 }
+        : await supersedeHistoryRunsForCreatorPlan({
           agencyId: req.auth.agencyId,
           creatorId: req.params.creatorId,
           reason: "superseded by a new complete dialog discovery plan",
@@ -209,6 +295,7 @@ router.post("/creators/:creatorId/scans", async (req, res) => {
       dialogId: "__dialog_discovery__",
       mode: "discovery",
       childMode,
+      forceChildFull,
       source: input.source || "manual_creator_scan",
       generation: input.generation || Math.floor(Date.now() / 1000),
       pageLimit: input.pageLimit || 50,
@@ -227,7 +314,7 @@ router.post("/creators/:creatorId/scans", async (req, res) => {
         metadata: { runId: result.run?.id, mode: childMode, source: input.source || "manual_creator_scan" },
       });
     }
-    return res.status(result.created ? 202 : 200).json({ ...result, supersededHistoryRuns: superseded.cancelled });
+    return res.status(result.created ? 202 : 200).json({ ...result, supersededHistoryRuns: superseded.cancelled, forceChildFull });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "DIALOG_CREATOR_SCAN_START_FAILED");
@@ -454,12 +541,20 @@ router.post("/creators/:creatorId/cancel", seniorRequired, async (req, res) => {
       if (jobIds.length) {
         await tx.jobInstance.updateMany({
           where: { id: { in: jobIds }, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
-          data: { status: "CANCELLED", completedAt: new Date(), lastError: reason, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null },
+          data: {
+            status: "CANCELLED",
+            completedAt: new Date(),
+            lastError: null,
+            result: { control: { kind: "cancelled", reason, at: new Date().toISOString() } },
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+          },
         });
       }
       if (runs.length) {
-        await tx.dialogScanRun.updateMany({ where: { id: { in: runs.map((run) => run.id) } }, data: { status: "CANCELED", canceledAt: new Date(), completedAt: new Date(), lastError: reason } });
-        await tx.dialogScanState.updateMany({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, activeRunId: { in: runs.map((run) => run.id) } }, data: { status: "IDLE", activeRunId: null, activeJobId: null, lastError: reason } });
+        await tx.dialogScanRun.updateMany({ where: { id: { in: runs.map((run) => run.id) } }, data: { status: "CANCELLED", canceledAt: new Date(), completedAt: new Date(), lastError: null } });
+        await tx.dialogScanState.updateMany({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, activeRunId: { in: runs.map((run) => run.id) } }, data: { status: "IDLE", activeRunId: null, activeJobId: null, lastError: null } });
       }
     });
     await audit({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, action: "dialog_intelligence.scan_canceled", targetType: "creator", targetId: req.params.creatorId, metadata: { runs: runs.length, reason } });
@@ -479,13 +574,21 @@ router.post("/creators/:creatorId/dialogs/:dialogId/cancel", seniorRequired, asy
       if (active.jobId) {
         await tx.jobInstance.updateMany({
           where: { id: active.jobId, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
-          data: { status: "CANCELLED", completedAt: new Date(), lastError: reason, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null },
+          data: {
+            status: "CANCELLED",
+            completedAt: new Date(),
+            lastError: null,
+            result: { control: { kind: "cancelled", reason, at: new Date().toISOString() } },
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+          },
         });
       }
-      await tx.dialogScanRun.update({ where: { id: active.id }, data: { status: "CANCELED", canceledAt: new Date(), completedAt: new Date(), lastError: reason } });
+      await tx.dialogScanRun.update({ where: { id: active.id }, data: { status: "CANCELLED", canceledAt: new Date(), completedAt: new Date(), lastError: null } });
       await tx.dialogScanState.updateMany({
         where: { creatorId: req.params.creatorId, dialogId: req.params.dialogId },
-        data: { status: "IDLE", activeRunId: null, activeJobId: null, lastError: reason },
+        data: { status: "IDLE", activeRunId: null, activeJobId: null, lastError: null },
       });
     });
     await audit({
@@ -502,12 +605,13 @@ router.patch("/control", seniorRequired, async (req, res) => {
   try {
     const input = controlSchema.parse(req.body || {});
     const before = await moduleControl(prisma, req.auth.agencyId);
-    const result = await prisma.$transaction(async (tx) => {
+    const transition = await prisma.$transaction(async (tx) => {
       const setting = await tx.moduleSetting.upsert({
         where: { agencyId_moduleKey: { agencyId: req.auth.agencyId, moduleKey: "dialog_intelligence" } },
         create: { agencyId: req.auth.agencyId, moduleKey: "dialog_intelligence", enabled: input.enabled, status: input.enabled ? "active" : "disabled", config: input.settings || {} },
         update: { enabled: input.enabled, status: input.enabled ? "active" : "disabled", ...(input.settings ? { config: input.settings } : {}) },
       });
+      let pausedCreatorIds = [];
       if (!input.enabled) {
         const jobs = await tx.jobInstance.findMany({
           where: { agencyId: req.auth.agencyId, jobKey: DIALOG_INTELLIGENCE_JOB_KEY, status: { in: ["SCHEDULED", "CLAIMED"] } },
@@ -515,43 +619,57 @@ router.patch("/control", seniorRequired, async (req, res) => {
         });
         const ids = jobs.map((job) => job.id);
         if (ids.length) {
+          const now = new Date();
           await tx.jobInstance.updateMany({
             where: { id: { in: ids } },
-            data: { status: "CANCELLED", completedAt: new Date(), lastError: "dialog intelligence disabled", claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null },
-          });
-          await tx.dialogScanRun.updateMany({ where: { jobId: { in: ids } }, data: { status: "PAUSED", pausedAt: new Date(), lastError: "dialog intelligence disabled" } });
-          await tx.dialogScanState.updateMany({ where: { agencyId: req.auth.agencyId, activeJobId: { in: ids } }, data: { status: "PAUSED", activeJobId: null } });
-        }
-      } else {
-        const pausedRuns = await tx.dialogScanRun.findMany({
-          where: { agencyId: req.auth.agencyId, status: "PAUSED" },
-          orderBy: { updatedAt: "asc" },
-          take: 1000,
-        });
-        for (const run of pausedRuns) {
-          const oldJob = run.jobId ? await tx.jobInstance.findUnique({ where: { id: run.jobId } }) : null;
-          const job = await tx.jobInstance.create({
             data: {
-              jobKey: DIALOG_INTELLIGENCE_JOB_KEY, scope: "creator", creatorId: run.creatorId, agencyId: run.agencyId,
-              idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${run.id}:${Date.now()}`,
-              params: { ...((oldJob?.params && typeof oldJob.params === "object") ? oldJob.params : {}), scanRunId: run.id, dialogId: run.dialogId, mode: run.mode },
-              continuation: oldJob?.continuation || run.continuation || null,
-              progress: oldJob?.progress || run.progress || null,
-              status: "SCHEDULED", priority: oldJob?.priority || 70, scheduledAt: new Date(), nextRunAt: new Date(),
+              status: "CANCELLED",
+              completedAt: now,
+              lastError: null,
+              result: { control: { kind: "module_disabled", reason: "dialog intelligence disabled", at: now.toISOString() } },
+              claimedByDeviceId: null,
+              leaseUntil: null,
+              leaseTokenHash: null,
+              workId: null,
+              leaseRevision: { increment: 1 },
             },
           });
-          await tx.dialogScanRun.update({ where: { id: run.id }, data: { status: "QUEUED", jobId: job.id, pausedAt: null, lastError: null } });
-          await tx.dialogScanState.updateMany({ where: { creatorId: run.creatorId, dialogId: run.dialogId }, data: { status: "QUEUED", activeJobId: job.id, activeRunId: run.id, lastError: null } });
+          await tx.dialogScanRun.updateMany({
+            where: { jobId: { in: ids } },
+            data: { status: "PAUSED", pausedAt: now, lastError: null },
+          });
+          await tx.dialogScanState.updateMany({
+            where: { agencyId: req.auth.agencyId, activeJobId: { in: ids } },
+            data: { status: "PAUSED", activeJobId: null, lastError: null },
+          });
         }
+      } else {
+        const paused = await tx.dialogScanRun.findMany({
+          where: { agencyId: req.auth.agencyId, status: "PAUSED" },
+          select: { creatorId: true },
+          take: 10000,
+        });
+        pausedCreatorIds = [...new Set(paused.map((run) => run.creatorId).filter(Boolean))];
       }
-      return setting;
+      return { setting, pausedCreatorIds };
     });
+
+    // Resume at most one authoritative run per creator. resumeCreatorRuns also
+    // normalizes legacy duplicate paused runs back into a sequential plan.
+    const resumed = [];
+    if (input.enabled) {
+      for (const creatorId of transition.pausedCreatorIds) {
+        resumed.push({ creatorId, ...(await resumeCreatorRuns({ agencyId: req.auth.agencyId, creatorId })) });
+      }
+    }
+
     await audit({
       agencyId: req.auth.agencyId, actorUserId: req.auth.userId,
       action: input.enabled ? "dialog_intelligence.module_enabled" : "dialog_intelligence.module_disabled",
-      targetType: "module", targetId: "dialog_intelligence", metadata: { before, after: { enabled: result.enabled, config: result.config } },
+      targetType: "module", targetId: "dialog_intelligence",
+      metadata: { before, after: { enabled: transition.setting.enabled, config: transition.setting.config }, resumed },
     });
-    return res.json({ ok: true, setting: result });
+    return res.json({ ok: true, setting: transition.setting, resumed });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "DIALOG_CONTROL_UPDATE_FAILED");

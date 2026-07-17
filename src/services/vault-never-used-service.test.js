@@ -292,3 +292,95 @@ test("projection queries evidence in bounded chunks", async () => {
   assert.deepEqual(batchSizes, [PROJECTION_CHUNK_SIZE, 1]);
   assert.ok(batchSizes.every((size) => size <= PROJECTION_CHUNK_SIZE));
 });
+
+
+test("a user pause is a PAUSED control state, not a fake OnlyFans error", async () => {
+  const pausedRun = {
+    id: "disc-paused",
+    jobId: "disc-job",
+    dialogId: "__dialog_discovery__",
+    mode: "discovery",
+    status: "PAUSED",
+    generation: 71,
+    progress: { pages: 1, dialogsFound: 1, hasMore: true, nextOffset: 10 },
+    pagesProcessed: 1,
+    purchaseSignals: 1,
+    createdAt: date(),
+    updatedAt: date(1_000),
+    completedAt: null,
+    lastError: "paused from Vault Asset Sales",
+  };
+  const state = {
+    dialogId: "dialog-1",
+    generation: 71,
+    scanMode: "initial",
+    initialScanComplete: false,
+    status: "PLANNED",
+    activeRunId: null,
+    activeJobId: null,
+    pagesProcessed: 0,
+    messagesProcessed: 0,
+    lastError: null,
+    lastFullScanAt: null,
+    lastIncrementalScanAt: null,
+    createdAt: date(),
+    updatedAt: date(500),
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: dbFixture({ discoveryRuns: [pausedRun], dialogStates: [state] }),
+    now: date(2_000),
+  });
+  assert.equal(result.pipeline.stage, "PAUSED");
+  assert.equal(result.pipeline.dialogs.discovery.paused, true);
+  assert.equal(result.pipeline.dialogs.discovery.error, null);
+  assert.equal(result.pipeline.dialogs.discovery.lastError, null);
+  assert.equal(result.pipeline.dialogs.lastError, null);
+});
+
+test("an untouched discovery run keeps hasMore unknown and excludes stale generation-zero states", async () => {
+  const untouchedRun = {
+    id: "disc-empty",
+    jobId: "disc-job",
+    dialogId: "__dialog_discovery__",
+    mode: "discovery",
+    status: "RUNNING",
+    generation: 0,
+    progress: {},
+    pagesProcessed: 0,
+    purchaseSignals: 0,
+    createdAt: date(10_000),
+    updatedAt: date(10_000),
+    completedAt: null,
+    lastError: null,
+  };
+  const staleState = {
+    dialogId: "dialog-old",
+    generation: 0,
+    scanMode: "initial",
+    initialScanComplete: true,
+    status: "COMPLETED",
+    activeRunId: null,
+    activeJobId: null,
+    pagesProcessed: 1485,
+    messagesProcessed: 8176,
+    lastError: null,
+    lastFullScanAt: date(),
+    lastIncrementalScanAt: null,
+    createdAt: date(),
+    updatedAt: date(),
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: dbFixture({ discoveryRuns: [untouchedRun], dialogStates: [staleState] }),
+    now: date(11_000),
+  });
+  assert.equal(result.pipeline.dialogs.discovery.hasMoreKnown, false);
+  assert.equal(result.pipeline.dialogs.discovery.hasMore, null);
+  assert.equal(result.pipeline.dialogs.discovery.dialogsFound, 0);
+  assert.equal(result.pipeline.dialogs.messagesCommitted, 0);
+  assert.equal(result.pipeline.dialogs.pagesCommitted, 0);
+  assert.equal(result.pipeline.authoritative, false);
+});

@@ -241,6 +241,7 @@ async function scheduleDialogScanTx(db, input) {
           knownMessageThreshold: integer(input.knownMessageThreshold, 3, 1, 100),
           maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : 1000, 1, 10000),
           generation: integer(input.generation, state?.generation || active.generation || 0, 0, 2_000_000_000),
+          forceChildFull: input.forceChildFull === true || object(activeJob?.params).forceChildFull === true,
         },
         continuation: scheduledResumeContinuation,
         status: "SCHEDULED",
@@ -302,6 +303,7 @@ async function scheduleDialogScanTx(db, input) {
         scanRunId: run.id, dialogId, fanId: clean(input.fanId, 160), mode,
         source: clean(input.source, 80) || "manual", pageLimit: integer(input.pageLimit, 50, 1, 100),
         targetMessageId, childMode: clean(input.childMode, 40) || null,
+        forceChildFull: input.forceChildFull === true,
         childPriority: integer(input.childPriority, clean(input.childMode, 40) === "initial" ? 60 : 50, 0, 200),
         overlapPages: integer(input.overlapPages, 2, 0, 10), knownMessageThreshold, maxPages,
         generation: integer(input.generation, state?.generation || 0, 0, 2_000_000_000),
@@ -594,17 +596,47 @@ async function scheduleNextPlannedDialogTx(db, input) {
   const childMode = clean(input.childMode, 40) || "initial";
   if (!agencyId || !creatorId) return { created: false, reason: "missing_scope" };
 
-  const active = await db.dialogScanRun.findFirst({
-    where: {
-      agencyId,
-      creatorId,
-      dialogId: { not: "__dialog_discovery__" },
-      generation,
-      status: { in: ACTIVE_RUN_STATUSES },
-    },
-    orderBy: { createdAt: "asc" },
-  });
-  if (active) return { created: false, reason: "history_job_active", run: active };
+  // A creator plan is deliberately sequential: there may be only one live
+  // history run for the current generation. Old builds could leave a run in
+  // QUEUED/RUNNING after its JobInstance was already cancelled or deleted.
+  // Such an orphan must not block the whole plan forever.
+  for (let guard = 0; guard < 100; guard += 1) {
+    const active = await db.dialogScanRun.findFirst({
+      where: {
+        agencyId,
+        creatorId,
+        dialogId: { not: "__dialog_discovery__" },
+        generation,
+        status: { in: ACTIVE_RUN_STATUSES },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    if (!active) break;
+    if (active.status === "PAUSED") {
+      return { created: false, reason: "history_plan_paused", run: active };
+    }
+    const activeJob = active.jobId
+      ? await db.jobInstance.findUnique({ where: { id: active.jobId } })
+      : null;
+    if (activeJob && ["SCHEDULED", "CLAIMED"].includes(activeJob.status)) {
+      return { created: false, reason: "history_job_active", run: active, job: activeJob };
+    }
+
+    const orphanReason = "orphaned history run recovered: active run has no live job";
+    await db.dialogScanRun.update({
+      where: { id: active.id },
+      data: { status: "FAILED", completedAt: new Date(), lastError: orphanReason },
+    });
+    await db.dialogScanState.updateMany({
+      where: { creatorId, dialogId: active.dialogId },
+      data: {
+        status: "FAILED",
+        activeRunId: null,
+        activeJobId: null,
+        lastError: orphanReason,
+      },
+    });
+  }
 
   const planned = await db.dialogScanState.findFirst({
     where: {
@@ -615,7 +647,10 @@ async function scheduleNextPlannedDialogTx(db, input) {
       status: "PLANNED",
       ...(childMode === "initial" ? { initialScanComplete: false } : {}),
     },
-    orderBy: [{ createdAt: "asc" }, { dialogId: "asc" }],
+    // updatedAt is refreshed while discovery walks the list page-by-page, so
+    // this preserves the frozen discovery order much better than the row's
+    // original creation date (which may be months old).
+    orderBy: [{ updatedAt: "asc" }, { dialogId: "asc" }],
   });
   if (!planned) return { created: false, reason: "history_plan_drained" };
 
@@ -646,6 +681,7 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const run = await db.dialogScanRun.findFirst({ where: { id: runId, creatorId: job.creatorId, agencyId: job.agencyId } });
   if (!run) throw new Error("Dialog discovery run not found");
   const childMode = clean(chunk.childMode ?? params.childMode, 40) || "incremental";
+  const forceChildFull = chunk.forceChildFull === true || params.forceChildFull === true;
   const generation = integer(params.generation ?? run.generation, run.generation || 0);
   let planned = 0;
   let discovered = 0;
@@ -659,7 +695,7 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
       where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId } },
     });
     const alreadyInitial = existingState?.initialScanComplete === true;
-    const shouldPlan = childMode === "initial" ? !alreadyInitial : true;
+    const shouldPlan = childMode === "initial" ? (forceChildFull || !alreadyInitial) : true;
     // Creator-wide scans are strict two-phase plans. Discovery never leaves a
     // dialog in QUEUED/RUNNING from an older plan; no history job exists until
     // the discovery run completes with hasMore=false.
@@ -674,12 +710,22 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
         status: shouldPlan ? "PLANNED" : "READY",
         scanMode: childMode,
         generation,
+        initialScanComplete: forceChildFull ? false : alreadyInitial,
+        pagesProcessed: 0,
+        messagesProcessed: 0,
+        mediaProcessed: 0,
       },
       update: {
         fanId: fanId || undefined,
         scanMode: childMode,
         generation,
         status: nextStatus,
+        initialScanComplete: forceChildFull ? false : undefined,
+        pagesProcessed: 0,
+        messagesProcessed: 0,
+        mediaProcessed: 0,
+        backwardCursor: forceChildFull ? null : undefined,
+        incrementalGapOpen: childMode === "incremental" ? true : false,
         activeRunId: null,
         activeJobId: null,
         lastError: null,
@@ -690,7 +736,7 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const page = integer(chunk.page, 0);
   const hasMore = chunk.hasMore === true;
   const cursorOut = clean(chunk.cursorOut, 240);
-  const result = { discovered, planned, scheduled: 0, hasMore, page, cursorOut, childMode, generation };
+  const result = { discovered, planned, scheduled: 0, hasMore, page, cursorOut, childMode, forceChildFull, generation };
   const commit = await db.dialogScanChunkCommit.create({
     data: {
       agencyId: job.agencyId, creatorId: job.creatorId, runId, jobId: job.id, dialogId: discoveryDialogId,
