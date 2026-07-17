@@ -13,7 +13,10 @@ const { restartCreatorDialogPlanTx } = require("./dialog-intelligence-service");
 function matchesValue(actual, expected) {
   if (expected && typeof expected === "object" && !Array.isArray(expected)) {
     if (Array.isArray(expected.in)) return expected.in.includes(actual);
-    if (Object.hasOwn(expected, "not")) return actual !== expected.not;
+    if (Object.hasOwn(expected, "not")) {
+      if (expected.not === null) return actual !== null && actual !== undefined;
+      return actual !== expected.not;
+    }
     if (Object.hasOwn(expected, "lt")) return Number(actual) < Number(expected.lt);
   }
   return actual === expected;
@@ -21,6 +24,10 @@ function matchesValue(actual, expected) {
 
 function matches(row, where = {}) {
   for (const [key, expected] of Object.entries(where || {})) {
+    if (key === "OR") {
+      if (!Array.isArray(expected) || !expected.some((branch) => matches(row, branch))) return false;
+      continue;
+    }
     if (key === "id" && expected?.in) {
       if (!expected.in.includes(row.id)) return false;
       continue;
@@ -66,8 +73,8 @@ function createDb({ enabled = true } = {}) {
     },
   ];
   const jobs = [
-    { id: "old-discovery-job", status: "CLAIMED", leaseRevision: 3, params: { scanRunId: "old-discovery", dialogId: "__dialog_discovery__" }, continuation: { mode: "discovery", page: 1288, offset: 1590, dialogsFound: 12804 } },
-    { id: "old-history-job", status: "SCHEDULED", leaseRevision: 1, params: { scanRunId: "old-history", dialogId: "dialog-1" } },
+    { id: "old-discovery-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "dialog_intelligence_scan", status: "CLAIMED", leaseRevision: 3, params: { scanRunId: "old-discovery", dialogId: "__dialog_discovery__" }, continuation: { mode: "discovery", page: 1288, offset: 1590, dialogsFound: 12804 } },
+    { id: "old-history-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "dialog_intelligence_scan", status: "SCHEDULED", leaseRevision: 1, params: { scanRunId: "old-history", dialogId: "dialog-1" } },
   ];
   const states = [
     {
@@ -194,6 +201,40 @@ test("explicit full creator rescan supersedes the old plan and creates its repla
 });
 
 
+
+test("full rescan supersedes every active row beyond the legacy 10k cap", async () => {
+  const db = createDb();
+  const extra = 10_050;
+  for (let index = 0; index < extra; index += 1) {
+    const runId = `bulk-run-${index}`;
+    const jobId = `bulk-job-${index}`;
+    const dialogId = `bulk-dialog-${index}`;
+    db._runs.push({
+      id: runId, jobId, agencyId: "agency-1", creatorId: "creator-1",
+      dialogId, mode: "initial", status: "QUEUED", generation: db._oldGeneration,
+      createdAt: new Date("2026-07-17T16:02:00.000Z"), updatedAt: new Date("2026-07-17T16:02:00.000Z"),
+    });
+    db._jobs.push({
+      id: jobId, agencyId: "agency-1", creatorId: "creator-1", jobKey: "dialog_intelligence_scan",
+      status: "SCHEDULED", leaseRevision: 0, params: { scanRunId: runId, dialogId },
+    });
+    db._states.push({
+      id: `bulk-state-${index}`, agencyId: "agency-1", creatorId: "creator-1", dialogId,
+      status: "QUEUED", generation: db._oldGeneration, activeRunId: runId, activeJobId: jobId,
+      initialScanComplete: false,
+    });
+  }
+
+  const result = await restartCreatorDialogPlanTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1", childMode: "initial", forceChildFull: true,
+  });
+
+  assert.equal(result.supersededHistoryRuns, extra + 2);
+  assert.equal(db._runs.filter((row) => row.status === "CANCELLED").length, extra + 2);
+  assert.equal(db._jobs.filter((row) => row.status === "CANCELLED").length, extra + 2);
+  assert.equal(db._states.filter((row) => row.activeRunId || row.activeJobId).length, 1);
+});
+
 test("compact generations continue independently of legacy Unix timestamp generations", async () => {
   const db = createDb();
   db._runs.push({
@@ -221,5 +262,7 @@ test("disabled module does not cancel the existing creator plan", async () => {
 test("creator scan route no longer uses Unix seconds as a visible request counter", () => {
   const route = fs.readFileSync(path.resolve(__dirname, "../routes/dialog-intelligence.js"), "utf8");
   assert.match(route, /restartCreatorDialogPlan\(/);
+  assert.match(route, /DIALOG_CONTROL_TRANSACTION_OPTIONS/);
   assert.doesNotMatch(route, /Math\.floor\(Date\.now\(\)\s*\/\s*1000\)/);
+  assert.doesNotMatch(route, /jobIds\s*=\s*runs\.map/);
 });

@@ -4,6 +4,7 @@ const prisma = require("../prisma");
 
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING", "PAUSED"];
+const DIALOG_CONTROL_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -487,7 +488,32 @@ function numberOrZero(value) {
 }
 
 async function supersedeCreatorDialogPlanTx(db, { agencyId, creatorId, reason, includeDiscovery = false }) {
-  const runs = await db.dialogScanRun.findMany({
+  // Never materialize thousands of run/job ids into an interactive transaction.
+  // Large creator plans can contain 10k+ rows; the previous `findMany -> IN (...)`
+  // path regularly exceeded Prisma's 5s interactive transaction timeout before
+  // the replacement discovery run could be created. Set-based updates keep the
+  // restart atomic and cover every active row instead of silently truncating at 10k.
+  const now = new Date();
+  const jobResult = await db.jobInstance.updateMany({
+    where: {
+      agencyId,
+      creatorId,
+      jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
+      status: { in: ["SCHEDULED", "CLAIMED"] },
+    },
+    data: {
+      status: "CANCELLED",
+      completedAt: now,
+      lastError: null,
+      result: { control: { kind: "superseded", reason, at: now.toISOString() } },
+      claimedByDeviceId: null,
+      leaseUntil: null,
+      leaseTokenHash: null,
+      workId: null,
+      leaseRevision: { increment: 1 },
+    },
+  });
+  const runResult = await db.dialogScanRun.updateMany({
     where: {
       agencyId,
       creatorId,
@@ -495,40 +521,25 @@ async function supersedeCreatorDialogPlanTx(db, { agencyId, creatorId, reason, i
       mode: { in: includeDiscovery ? ["discovery", "initial", "incremental"] : ["initial", "incremental"] },
       status: { in: ACTIVE_RUN_STATUSES },
     },
-    orderBy: { createdAt: "asc" },
-    take: 10_000,
-    select: { id: true, jobId: true },
+    data: { status: "CANCELLED", canceledAt: now, completedAt: now, pausedAt: null, lastError: null },
   });
-  if (!runs.length) return { cancelled: 0 };
-
-  const jobIds = runs.map((run) => run.jobId).filter(Boolean);
-  const runIds = runs.map((run) => run.id);
-  const now = new Date();
-  if (jobIds.length) {
-    await db.jobInstance.updateMany({
-      where: { id: { in: jobIds }, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
-      data: {
-        status: "CANCELLED",
-        completedAt: now,
-        lastError: null,
-        result: { control: { kind: "superseded", reason, at: now.toISOString() } },
-        claimedByDeviceId: null,
-        leaseUntil: null,
-        leaseTokenHash: null,
-        workId: null,
-        leaseRevision: { increment: 1 },
-      },
-    });
-  }
-  await db.dialogScanRun.updateMany({
-    where: { id: { in: runIds } },
-    data: { status: "CANCELLED", completedAt: now, pausedAt: null, lastError: null },
-  });
-  await db.dialogScanState.updateMany({
-    where: { agencyId, creatorId, activeRunId: { in: runIds } },
+  const stateResult = await db.dialogScanState.updateMany({
+    where: {
+      agencyId,
+      creatorId,
+      OR: [
+        { status: { in: ACTIVE_RUN_STATUSES } },
+        { activeRunId: { not: null } },
+        { activeJobId: { not: null } },
+      ],
+    },
     data: { status: "IDLE", activeRunId: null, activeJobId: null, lastError: null },
   });
-  return { cancelled: runs.length };
+  return {
+    cancelled: runResult.count,
+    cancelledJobs: jobResult.count,
+    resetStates: stateResult.count,
+  };
 }
 
 async function restartCreatorDialogPlanTx(db, input) {
@@ -588,7 +599,7 @@ async function restartCreatorDialogPlanTx(db, input) {
 
 async function restartCreatorDialogPlan(input) {
   try {
-    return await prisma.$transaction((tx) => restartCreatorDialogPlanTx(tx, input));
+    return await prisma.$transaction((tx) => restartCreatorDialogPlanTx(tx, input), DIALOG_CONTROL_TRANSACTION_OPTIONS);
   } catch (error) {
     if (error?.code !== "P2002") throw error;
     const active = await prisma.dialogScanRun.findFirst({
@@ -1709,6 +1720,7 @@ async function rebuildCreatorAggregates({ agencyId, creatorId }) {
 module.exports = {
   DIALOG_INTELLIGENCE_JOB_KEY,
   ACTIVE_RUN_STATUSES,
+  DIALOG_CONTROL_TRANSACTION_OPTIONS,
   classifyPurchase,
   purchaseCountsAsRevenue,
   purchaseIdempotencyKey,
