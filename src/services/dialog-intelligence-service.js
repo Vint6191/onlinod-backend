@@ -470,12 +470,15 @@ async function nextCreatorDialogPlanGenerationTx(db, { agencyId, creatorId, requ
   if (requestedGeneration !== null && requestedGeneration !== undefined) {
     return integer(requestedGeneration, 0, 0, 2_000_000_000);
   }
+  // Legacy builds used Unix seconds as the generation, producing values around
+  // 1.7 billion. New plans deliberately ignore those legacy timestamp ids and
+  // continue a compact monotonic sequence instead.
   const latest = await db.dialogScanRun.findFirst({
-    where: { agencyId, creatorId },
+    where: { agencyId, creatorId, generation: { lt: 1_000_000_000 } },
     orderBy: [{ generation: "desc" }, { createdAt: "desc" }],
     select: { generation: true },
   });
-  return integer(numberOrZero(latest?.generation) + 1, 1, 1, 2_000_000_000);
+  return integer(numberOrZero(latest?.generation) + 1, 1, 1, 999_999_999);
 }
 
 function numberOrZero(value) {

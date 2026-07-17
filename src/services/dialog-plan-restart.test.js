@@ -14,6 +14,7 @@ function matchesValue(actual, expected) {
   if (expected && typeof expected === "object" && !Array.isArray(expected)) {
     if (Array.isArray(expected.in)) return expected.in.includes(actual);
     if (Object.hasOwn(expected, "not")) return actual !== expected.not;
+    if (Object.hasOwn(expected, "lt")) return Number(actual) < Number(expected.lt);
   }
   return actual === expected;
 }
@@ -28,7 +29,7 @@ function matches(row, where = {}) {
       if (!expected.in.includes(row.activeRunId)) return false;
       continue;
     }
-    if (key === "status" || key === "mode" || key === "dialogId") {
+    if (key === "status" || key === "mode" || key === "dialogId" || key === "generation") {
       if (!matchesValue(row[key], expected)) return false;
       continue;
     }
@@ -65,7 +66,7 @@ function createDb({ enabled = true } = {}) {
     },
   ];
   const jobs = [
-    { id: "old-discovery-job", status: "CLAIMED", leaseRevision: 3, params: { scanRunId: "old-discovery", dialogId: "__dialog_discovery__" } },
+    { id: "old-discovery-job", status: "CLAIMED", leaseRevision: 3, params: { scanRunId: "old-discovery", dialogId: "__dialog_discovery__" }, continuation: { mode: "discovery", page: 1288, offset: 1590, dialogsFound: 12804 } },
     { id: "old-history-job", status: "SCHEDULED", leaseRevision: 1, params: { scanRunId: "old-history", dialogId: "dialog-1" } },
   ];
   const states = [
@@ -173,7 +174,7 @@ test("explicit full creator rescan supersedes the old plan and creates its repla
 
   assert.equal(result.created, true);
   assert.equal(result.supersededHistoryRuns, 2);
-  assert.equal(result.generation, db._oldGeneration + 1);
+  assert.equal(result.generation, 1);
   assert.equal(db._runs.find((row) => row.id === "old-discovery").status, "CANCELLED");
   assert.equal(db._runs.find((row) => row.id === "old-history").status, "CANCELLED");
 
@@ -181,10 +182,29 @@ test("explicit full creator rescan supersedes the old plan and creates its repla
   assert.ok(replacement);
   assert.equal(replacement.dialogId, "__dialog_discovery__");
   assert.equal(replacement.status, "QUEUED");
-  assert.equal(replacement.generation, db._oldGeneration + 1);
+  assert.equal(replacement.generation, 1);
+  const replacementJob = db._jobs.find((row) => row.id.startsWith("new-job-"));
+  assert.ok(replacementJob);
+  assert.equal(replacementJob.continuation.page, 0);
+  assert.equal(replacementJob.continuation.offset, 0);
+  assert.equal(replacementJob.continuation.dialogId, "__dialog_discovery__");
   const discoveryState = db._states.find((row) => row.dialogId === "__dialog_discovery__");
   assert.equal(discoveryState.status, "QUEUED");
   assert.equal(discoveryState.activeRunId, replacement.id);
+});
+
+
+test("compact generations continue independently of legacy Unix timestamp generations", async () => {
+  const db = createDb();
+  db._runs.push({
+    id: "compact-old", jobId: null, agencyId: "agency-1", creatorId: "creator-1",
+    dialogId: "dialog-compact", mode: "initial", status: "COMPLETED", generation: 7,
+    createdAt: new Date("2026-07-16T16:00:00.000Z"), updatedAt: new Date("2026-07-16T16:00:00.000Z"),
+  });
+  const result = await restartCreatorDialogPlanTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1", childMode: "initial", forceChildFull: true,
+  });
+  assert.equal(result.generation, 8);
 });
 
 test("disabled module does not cancel the existing creator plan", async () => {
