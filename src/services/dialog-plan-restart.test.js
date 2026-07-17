@@ -164,7 +164,7 @@ function createDb({ enabled = true } = {}) {
   return db;
 }
 
-test("explicit full creator rescan supersedes the old plan and creates its replacement in the same tx body", async () => {
+test("duplicate full creator rescan joins the live plan instead of cancelling it", async () => {
   const db = createDb();
   const result = await restartCreatorDialogPlanTx(db, {
     agencyId: "agency-1",
@@ -179,8 +179,43 @@ test("explicit full creator rescan supersedes the old plan and creates its repla
     userId: "user-1",
   });
 
+  assert.equal(result.created, false);
+  assert.equal(result.reason, "full_rescan_already_active");
+  assert.equal(result.run.id, "old-discovery");
+  assert.equal(result.job.id, "old-discovery-job");
+  assert.equal(result.generation, db._oldGeneration);
+  assert.equal(result.supersededHistoryRuns, 0);
+  assert.equal(db._runs.find((row) => row.id === "old-discovery").status, "RUNNING");
+  assert.equal(db._runs.find((row) => row.id === "old-history").status, "QUEUED");
+  assert.equal(db._runs.filter((row) => row.id.startsWith("new-run-")).length, 0);
+});
+
+test("full rescan after cancellation creates a clean replacement in the same tx body", async () => {
+  const db = createDb();
+  const oldDiscovery = db._runs.find((row) => row.id === "old-discovery");
+  const oldDiscoveryJob = db._jobs.find((row) => row.id === "old-discovery-job");
+  const discoveryState = db._states.find((row) => row.id === "discovery-state");
+  oldDiscovery.status = "CANCELLED";
+  oldDiscoveryJob.status = "CANCELLED";
+  discoveryState.status = "IDLE";
+  discoveryState.activeRunId = null;
+  discoveryState.activeJobId = null;
+
+  const result = await restartCreatorDialogPlanTx(db, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    childMode: "initial",
+    forceChildFull: true,
+    source: "vault_sales_ui",
+    pageLimit: 50,
+    overlapPages: 2,
+    maxPages: 5000,
+    priority: 90,
+    userId: "user-1",
+  });
+
   assert.equal(result.created, true);
-  assert.equal(result.supersededHistoryRuns, 2);
+  assert.equal(result.supersededHistoryRuns, 1);
   assert.equal(result.generation, 1);
   assert.equal(db._runs.find((row) => row.id === "old-discovery").status, "CANCELLED");
   assert.equal(db._runs.find((row) => row.id === "old-history").status, "CANCELLED");
@@ -195,7 +230,6 @@ test("explicit full creator rescan supersedes the old plan and creates its repla
   assert.equal(replacementJob.continuation.page, 0);
   assert.equal(replacementJob.continuation.offset, 0);
   assert.equal(replacementJob.continuation.dialogId, "__dialog_discovery__");
-  const discoveryState = db._states.find((row) => row.dialogId === "__dialog_discovery__");
   assert.equal(discoveryState.status, "QUEUED");
   assert.equal(discoveryState.activeRunId, replacement.id);
 });
@@ -204,6 +238,12 @@ test("explicit full creator rescan supersedes the old plan and creates its repla
 
 test("full rescan supersedes every active row beyond the legacy 10k cap", async () => {
   const db = createDb();
+  db._runs.find((row) => row.id === "old-discovery").status = "CANCELLED";
+  db._jobs.find((row) => row.id === "old-discovery-job").status = "CANCELLED";
+  const discoveryState = db._states.find((row) => row.id === "discovery-state");
+  discoveryState.status = "IDLE";
+  discoveryState.activeRunId = null;
+  discoveryState.activeJobId = null;
   const extra = 10_050;
   for (let index = 0; index < extra; index += 1) {
     const runId = `bulk-run-${index}`;
@@ -229,7 +269,7 @@ test("full rescan supersedes every active row beyond the legacy 10k cap", async 
     agencyId: "agency-1", creatorId: "creator-1", childMode: "initial", forceChildFull: true,
   });
 
-  assert.equal(result.supersededHistoryRuns, extra + 2);
+  assert.equal(result.supersededHistoryRuns, extra + 1);
   assert.equal(db._runs.filter((row) => row.status === "CANCELLED").length, extra + 2);
   assert.equal(db._jobs.filter((row) => row.status === "CANCELLED").length, extra + 2);
   assert.equal(db._states.filter((row) => row.activeRunId || row.activeJobId).length, 1);
@@ -237,6 +277,12 @@ test("full rescan supersedes every active row beyond the legacy 10k cap", async 
 
 test("compact generations continue independently of legacy Unix timestamp generations", async () => {
   const db = createDb();
+  db._runs.find((row) => row.id === "old-discovery").status = "CANCELLED";
+  db._jobs.find((row) => row.id === "old-discovery-job").status = "CANCELLED";
+  const discoveryState = db._states.find((row) => row.id === "discovery-state");
+  discoveryState.status = "IDLE";
+  discoveryState.activeRunId = null;
+  discoveryState.activeJobId = null;
   db._runs.push({
     id: "compact-old", jobId: null, agencyId: "agency-1", creatorId: "creator-1",
     dialogId: "dialog-compact", mode: "initial", status: "COMPLETED", generation: 7,

@@ -562,8 +562,33 @@ async function restartCreatorDialogPlanTx(db, input) {
       status: { in: ACTIVE_RUN_STATUSES },
     },
     orderBy: { createdAt: "desc" },
-    select: { id: true, generation: true },
   });
+  const activeDiscoveryJob = activeDiscovery?.jobId
+    ? await db.jobInstance.findUnique({ where: { id: activeDiscovery.jobId } })
+    : null;
+  const liveFullRescan = forceChildFull
+    && activeDiscovery
+    && ["QUEUED", "RUNNING"].includes(clean(activeDiscovery.status, 40).toUpperCase())
+    && activeDiscoveryJob
+    && ["SCHEDULED", "CLAIMED"].includes(clean(activeDiscoveryJob.status, 40).toUpperCase());
+
+  // Full rescan is destructive because it supersedes the current creator plan.
+  // A duplicated UI/RPC request, a second Desktop, or a retried POST must never
+  // cancel a healthy scan that has already progressed for hours. Operators can
+  // still intentionally restart it by pressing Cancel all first; once the live
+  // discovery is terminal, a new full generation is created normally.
+  if (liveFullRescan) {
+    return {
+      ok: true,
+      created: false,
+      reason: "full_rescan_already_active",
+      run: activeDiscovery,
+      job: activeDiscoveryJob,
+      generation: activeDiscovery.generation,
+      supersededHistoryRuns: 0,
+    };
+  }
+
   const generation = input.generation !== null && input.generation !== undefined
     ? integer(input.generation, 0, 0, 2_000_000_000)
     : (!forceChildFull && activeDiscovery
