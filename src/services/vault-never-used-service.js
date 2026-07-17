@@ -220,6 +220,7 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   const jobDiscoveryProgress = object(discoveryJob?.progress);
   const discoveryProgress = { ...jobDiscoveryProgress, ...runDiscoveryProgress };
   const discoveryFailureRaw = object(object(discoveryJob?.result).failure);
+  const discoveryControlRaw = object(object(discoveryJob?.result).control);
   const runDiscoveryStatus = jobStatus(latestInitialDiscoveryRun?.status);
   const jobDiscoveryStatus = jobStatus(discoveryJob?.status);
   const terminalDiscoveryStatuses = new Set(["PAUSED", "FAILED", "COMPLETED", "CANCELLED", "CANCELED"]);
@@ -438,6 +439,11 @@ async function dialogPipelineState(db, agencyId, creatorId) {
       retries: number(discoveryJob?.attempts),
       lastError: discoveryError?.detail || null,
       error: discoveryError,
+      control: Object.keys(discoveryControlRaw).length ? {
+        kind: clean(discoveryControlRaw.kind, 80) || null,
+        reason: clean(discoveryControlRaw.reason, 500) || null,
+        at: iso(discoveryControlRaw.at),
+      } : null,
       progress: discoveryProgress,
     },
     current: currentJob ? {

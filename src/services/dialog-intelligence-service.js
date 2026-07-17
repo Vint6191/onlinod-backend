@@ -466,6 +466,151 @@ async function scheduleDialogScanTx(db, input) {
   return { ok: true, created: true, reason: "created", run: linkedRun, job };
 }
 
+async function nextCreatorDialogPlanGenerationTx(db, { agencyId, creatorId, requestedGeneration = null }) {
+  if (requestedGeneration !== null && requestedGeneration !== undefined) {
+    return integer(requestedGeneration, 0, 0, 2_000_000_000);
+  }
+  const latest = await db.dialogScanRun.findFirst({
+    where: { agencyId, creatorId },
+    orderBy: [{ generation: "desc" }, { createdAt: "desc" }],
+    select: { generation: true },
+  });
+  return integer(numberOrZero(latest?.generation) + 1, 1, 1, 2_000_000_000);
+}
+
+function numberOrZero(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+async function supersedeCreatorDialogPlanTx(db, { agencyId, creatorId, reason, includeDiscovery = false }) {
+  const runs = await db.dialogScanRun.findMany({
+    where: {
+      agencyId,
+      creatorId,
+      ...(includeDiscovery ? {} : { dialogId: { not: "__dialog_discovery__" } }),
+      mode: { in: includeDiscovery ? ["discovery", "initial", "incremental"] : ["initial", "incremental"] },
+      status: { in: ACTIVE_RUN_STATUSES },
+    },
+    orderBy: { createdAt: "asc" },
+    take: 10_000,
+    select: { id: true, jobId: true },
+  });
+  if (!runs.length) return { cancelled: 0 };
+
+  const jobIds = runs.map((run) => run.jobId).filter(Boolean);
+  const runIds = runs.map((run) => run.id);
+  const now = new Date();
+  if (jobIds.length) {
+    await db.jobInstance.updateMany({
+      where: { id: { in: jobIds }, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
+      data: {
+        status: "CANCELLED",
+        completedAt: now,
+        lastError: null,
+        result: { control: { kind: "superseded", reason, at: now.toISOString() } },
+        claimedByDeviceId: null,
+        leaseUntil: null,
+        leaseTokenHash: null,
+        workId: null,
+        leaseRevision: { increment: 1 },
+      },
+    });
+  }
+  await db.dialogScanRun.updateMany({
+    where: { id: { in: runIds } },
+    data: { status: "CANCELLED", completedAt: now, pausedAt: null, lastError: null },
+  });
+  await db.dialogScanState.updateMany({
+    where: { agencyId, creatorId, activeRunId: { in: runIds } },
+    data: { status: "IDLE", activeRunId: null, activeJobId: null, lastError: null },
+  });
+  return { cancelled: runs.length };
+}
+
+async function restartCreatorDialogPlanTx(db, input) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorId = clean(input.creatorId, 160);
+  if (!agencyId || !creatorId) throw new Error("agencyId and creatorId are required");
+
+  await assertCreator(db, agencyId, creatorId);
+  const control = await moduleControl(db, agencyId);
+  if (!control.enabled) {
+    return { ok: true, created: false, reason: "module_disabled", supersededHistoryRuns: 0 };
+  }
+
+  const forceChildFull = input.forceChildFull === true;
+  const activeDiscovery = await db.dialogScanRun.findFirst({
+    where: {
+      agencyId,
+      creatorId,
+      dialogId: "__dialog_discovery__",
+      status: { in: ACTIVE_RUN_STATUSES },
+    },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, generation: true },
+  });
+  const generation = input.generation !== null && input.generation !== undefined
+    ? integer(input.generation, 0, 0, 2_000_000_000)
+    : (!forceChildFull && activeDiscovery
+      ? integer(activeDiscovery.generation, 0, 0, 2_000_000_000)
+      : await nextCreatorDialogPlanGenerationTx(db, { agencyId, creatorId }));
+
+  const superseded = forceChildFull
+    ? await supersedeCreatorDialogPlanTx(db, {
+        agencyId,
+        creatorId,
+        reason: "superseded by an explicit full dialog rescan",
+        includeDiscovery: true,
+      })
+    : activeDiscovery
+      ? { cancelled: 0 }
+      : await supersedeCreatorDialogPlanTx(db, {
+          agencyId,
+          creatorId,
+          reason: "superseded by a new complete dialog discovery plan",
+          includeDiscovery: false,
+        });
+
+  const result = await scheduleDialogScanTx(db, {
+    ...input,
+    agencyId,
+    creatorId,
+    dialogId: "__dialog_discovery__",
+    mode: "discovery",
+    generation,
+  });
+  return { ...result, generation, supersededHistoryRuns: superseded.cancelled };
+}
+
+async function restartCreatorDialogPlan(input) {
+  try {
+    return await prisma.$transaction((tx) => restartCreatorDialogPlanTx(tx, input));
+  } catch (error) {
+    if (error?.code !== "P2002") throw error;
+    const active = await prisma.dialogScanRun.findFirst({
+      where: {
+        agencyId: input.agencyId,
+        creatorId: input.creatorId,
+        dialogId: "__dialog_discovery__",
+        status: { in: ACTIVE_RUN_STATUSES },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    if (!active) throw error;
+    const job = active.jobId ? await prisma.jobInstance.findUnique({ where: { id: active.jobId } }) : null;
+    return {
+      ok: true,
+      created: false,
+      reason: "concurrent_creator_plan_won",
+      run: active,
+      job,
+      generation: active.generation,
+      supersededHistoryRuns: 0,
+    };
+  }
+}
+
 async function scheduleDialogScan(input) {
   try {
     return await prisma.$transaction((tx) => scheduleDialogScanTx(tx, input));
@@ -1566,6 +1711,10 @@ module.exports = {
   purchaseIdempotencyKey,
   scheduleDialogScan,
   scheduleDialogScanTx,
+  restartCreatorDialogPlan,
+  restartCreatorDialogPlanTx,
+  supersedeCreatorDialogPlanTx,
+  nextCreatorDialogPlanGenerationTx,
   autoRecoverDialogDiscovery,
   autoRecoverDialogDiscoveryTx,
   repairRegressedDialogDiscoveryTx,
