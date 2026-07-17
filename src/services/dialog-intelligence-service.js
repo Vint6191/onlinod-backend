@@ -62,6 +62,76 @@ function jobContinuationValue(value) {
   return continuation;
 }
 
+function nonNegativeIntegerOrNull(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+async function durableDialogDiscoveryCheckpoint(db, input) {
+  const run = input?.run;
+  if (!run?.id || typeof db?.dialogScanChunkCommit?.findMany !== "function") return null;
+  const commits = await db.dialogScanChunkCommit.findMany({
+    where: { runId: run.id, mode: "discovery" },
+    select: { cursorOut: true, page: true },
+    take: 10_000,
+  });
+  let offset = -1;
+  let page = 0;
+  for (const commit of commits || []) {
+    const cursorOut = nonNegativeIntegerOrNull(commit?.cursorOut);
+    if (cursorOut == null) continue;
+    const nextPage = integer(commit?.page, 0) + 1;
+    if (cursorOut > offset) {
+      offset = cursorOut;
+      page = nextPage;
+    } else if (cursorOut === offset) {
+      page = page > 0 ? Math.min(page, nextPage) : nextPage;
+    }
+  }
+  if (offset < 0) return null;
+
+  const runProgress = object(run.progress);
+  const runContinuation = object(run.continuation);
+  let dialogsFound = Math.max(
+    integer(runProgress.dialogsFound ?? runProgress.dialogs, 0),
+    integer(runContinuation.dialogsFound, 0),
+  );
+  if (typeof db?.dialogScanState?.count === "function") {
+    const generation = integer(input.generation ?? run.generation, run.generation || 0);
+    const count = await db.dialogScanState.count({
+      where: {
+        agencyId: input.agencyId,
+        creatorId: input.creatorId,
+        dialogId: { not: "__dialog_discovery__" },
+        generation,
+      },
+    });
+    dialogsFound = Math.max(dialogsFound, integer(count, 0));
+  }
+  return { offset, page, dialogsFound };
+}
+
+function discoveryResumeContinuation({ resumeContinuation, fallbackResumeContinuation, checkpoint }) {
+  const resume = object(resumeContinuation);
+  const fallback = object(fallbackResumeContinuation);
+  let merged = Object.keys(resume).length ? { ...resume } : { ...fallback };
+  for (const key of ["stage", "mode", "dialogId", "offset", "page", "childMode", "dialogsFound", "maxPages"]) {
+    if (merged[key] == null && fallback[key] != null) merged[key] = fallback[key];
+  }
+  if (checkpoint && integer(merged.offset, 0) < checkpoint.offset) {
+    merged = {
+      ...merged,
+      offset: checkpoint.offset,
+      page: checkpoint.page,
+      dialogsFound: Math.max(integer(merged.dialogsFound, 0), checkpoint.dialogsFound),
+      emptyPageAttempts: 0,
+      tailProbeBaseOffset: null,
+      tailProbeIndex: 0,
+    };
+  }
+  return merged;
+}
+
 async function enqueueReconciliationTarget(db, input) {
   const agencyId = clean(input.agencyId, 160);
   const creatorId = clean(input.creatorId, 160);
@@ -251,7 +321,17 @@ async function scheduleDialogScanTx(db, input) {
       knownMessageThreshold: integer(input.knownMessageThreshold, 3, 1, 100),
       maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : 1000, 1, 10000),
     };
-    const baseResumeContinuation = Object.keys(resumeContinuation).length ? resumeContinuation : fallbackResumeContinuation;
+    const discoveryCheckpoint = active.mode === "discovery"
+      ? await durableDialogDiscoveryCheckpoint(db, {
+          agencyId,
+          creatorId,
+          run: active,
+          generation: integer(input.generation, state?.generation || active.generation || 0),
+        })
+      : null;
+    const baseResumeContinuation = active.mode === "discovery"
+      ? discoveryResumeContinuation({ resumeContinuation, fallbackResumeContinuation, checkpoint: discoveryCheckpoint })
+      : (Object.keys(resumeContinuation).length ? resumeContinuation : fallbackResumeContinuation);
     const scheduledResumeContinuation = durableTarget
       ? targetedContinuation(durableTarget, baseResumeContinuation, fallbackResumeContinuation.knownMessageThreshold)
       : baseResumeContinuation;
@@ -404,6 +484,138 @@ async function scheduleDialogScan(input) {
     const job = active.jobId ? await prisma.jobInstance.findUnique({ where: { id: active.jobId } }) : null;
     return { ok: true, created: false, reason: "concurrent_scan_won", run: active, job };
   }
+}
+
+async function repairRegressedDialogDiscoveryTx(db, input) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorId = clean(input.creatorId, 160);
+  if (!agencyId || !creatorId) return { ok: true, repaired: false, reason: "missing_scope" };
+
+  const run = await db.dialogScanRun.findFirst({
+    where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!run?.jobId) return { ok: true, repaired: false, reason: "no_discovery_run" };
+  const job = await db.jobInstance.findUnique({ where: { id: run.jobId } });
+  if (!job || !["SCHEDULED", "CLAIMED"].includes(clean(job.status, 40).toUpperCase())) {
+    return { ok: true, repaired: false, reason: "discovery_not_active" };
+  }
+
+  const params = object(job.params);
+  const generation = integer(params.generation ?? run.generation, run.generation || 0);
+  const jobContinuation = jobContinuationValue(job.continuation);
+  const jobProgress = object(job.progress);
+  const runContinuation = object(run.continuation);
+  const runProgress = object(run.progress);
+  const currentOffset = nonNegativeIntegerOrNull(jobContinuation.offset)
+    ?? nonNegativeIntegerOrNull(jobProgress.nextOffset)
+    ?? nonNegativeIntegerOrNull(jobProgress.offset)
+    ?? 0;
+  const hintedDialogsFound = Math.max(
+    integer(jobContinuation.dialogsFound, 0),
+    integer(jobProgress.dialogsFound ?? jobProgress.dialogs, 0),
+    integer(runContinuation.dialogsFound, 0),
+    integer(runProgress.dialogsFound ?? runProgress.dialogs, 0),
+  );
+  // In a valid offset-based traversal the absolute API offset cannot be lower
+  // than the number of unique dialogs already accumulated. Avoid reading the
+  // chunk ledger on every status poll unless this monotonicity invariant is
+  // actually broken (or a non-empty run somehow returned to offset zero).
+  const suspiciousRegression = currentOffset < hintedDialogsFound
+    || (currentOffset === 0 && integer(run.pagesProcessed, 0) > 0);
+  if (!suspiciousRegression) {
+    return { ok: true, repaired: false, reason: "checkpoint_not_suspicious", currentOffset, dialogsFound: hintedDialogsFound };
+  }
+
+  const checkpoint = await durableDialogDiscoveryCheckpoint(db, { agencyId, creatorId, run, generation });
+  if (!checkpoint || checkpoint.offset <= 0) return { ok: true, repaired: false, reason: "no_durable_checkpoint" };
+  if (currentOffset >= checkpoint.offset) {
+    return { ok: true, repaired: false, reason: "checkpoint_not_regressed", currentOffset, checkpointOffset: checkpoint.offset };
+  }
+
+  const fallback = {
+    stage: "DIALOG_DISCOVERY",
+    mode: "discovery",
+    dialogId: "__dialog_discovery__",
+    offset: checkpoint.offset,
+    page: checkpoint.page,
+    childMode: clean(params.childMode, 40) || clean(runContinuation.childMode, 40) || "initial",
+    dialogsFound: checkpoint.dialogsFound,
+    maxPages: integer(params.maxPages ?? runContinuation.maxPages, 5000, 1, 10000),
+  };
+  const repairedContinuation = discoveryResumeContinuation({
+    resumeContinuation: { ...runContinuation, ...jobContinuation },
+    fallbackResumeContinuation: fallback,
+    checkpoint,
+  });
+  const repairedProgress = {
+    ...object(run.progress),
+    ...jobProgress,
+    stage: "DIALOG_DISCOVERY",
+    mode: "discovery",
+    pages: checkpoint.page,
+    current: checkpoint.page,
+    total: Math.max(checkpoint.page, 1),
+    dialogs: checkpoint.dialogsFound,
+    dialogsFound: checkpoint.dialogsFound,
+    dialogsOnPage: 0,
+    offset: checkpoint.offset,
+    nextOffset: checkpoint.offset,
+    hasMore: true,
+    message: `Dialog checkpoint restored · page ${checkpoint.page} · offset ${checkpoint.offset}`,
+    checkpointRecovered: true,
+    checkpointRegressedFrom: currentOffset,
+  };
+  const now = new Date();
+  await db.jobInstance.update({
+    where: { id: job.id },
+    data: {
+      status: "SCHEDULED",
+      nextRunAt: now,
+      claimedAt: null,
+      claimedByDeviceId: null,
+      leaseUntil: null,
+      leaseTokenHash: null,
+      leaseRevision: { increment: 1 },
+      workId: null,
+      continuation: repairedContinuation,
+      progress: repairedProgress,
+      lastProgressAt: now,
+      completedAt: null,
+      lastError: null,
+    },
+  });
+  await db.dialogScanRun.update({
+    where: { id: run.id },
+    data: {
+      status: "QUEUED",
+      continuation: repairedContinuation,
+      progress: repairedProgress,
+      pagesProcessed: checkpoint.page,
+      completedAt: null,
+      lastError: null,
+    },
+  });
+  await db.dialogScanState.updateMany({
+    where: { creatorId, dialogId: "__dialog_discovery__" },
+    data: {
+      status: "QUEUED",
+      activeRunId: run.id,
+      activeJobId: job.id,
+      lastError: null,
+    },
+  });
+  return {
+    ok: true,
+    repaired: true,
+    reason: "discovery_checkpoint_regression_repaired",
+    runId: run.id,
+    jobId: job.id,
+    fromOffset: currentOffset,
+    toOffset: checkpoint.offset,
+    page: checkpoint.page,
+    dialogsFound: checkpoint.dialogsFound,
+  };
 }
 
 async function autoRecoverDialogDiscoveryTx(db, input) {
@@ -1356,6 +1568,7 @@ module.exports = {
   scheduleDialogScanTx,
   autoRecoverDialogDiscovery,
   autoRecoverDialogDiscoveryTx,
+  repairRegressedDialogDiscoveryTx,
   applyDialogIntelligenceChunk,
   applyPurchaseSignalsChunk,
   completeDialogIntelligenceJob,

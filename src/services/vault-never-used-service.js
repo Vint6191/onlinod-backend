@@ -5,6 +5,7 @@ const { getVaultUnsortedState } = require("./vault-unsorted-service");
 const {
   DIALOG_INTELLIGENCE_JOB_KEY,
   autoRecoverDialogDiscoveryTx,
+  repairRegressedDialogDiscoveryTx,
 } = require("./dialog-intelligence-service");
 
 const PROJECTION_CHUNK_SIZE = 5000;
@@ -697,6 +698,7 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   // an internal recovery state. Status polling revives the preserved discovery
   // checkpoint automatically; operators never need to restart or rebuild it.
   try {
+    await repairRegressedDialogDiscoveryTx(db, { agencyId, creatorId });
     await autoRecoverDialogDiscoveryTx(db, {
       agencyId,
       creatorId,

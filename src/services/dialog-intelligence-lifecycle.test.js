@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const prismaModule = require.resolve("../prisma");
 require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
-const { scheduleDialogScanTx, autoRecoverDialogDiscoveryTx } = require("./dialog-intelligence-service");
+const { scheduleDialogScanTx, autoRecoverDialogDiscoveryTx, repairRegressedDialogDiscoveryTx } = require("./dialog-intelligence-service");
 
 function fakeDb(options = {}) {
   const calls = { runsCreated: [], runsUpdated: [], jobsCreated: [], jobsUpdated: [], statesUpserted: [], statesUpdated: [], targetsUpserted: [] };
@@ -31,8 +31,12 @@ function fakeDb(options = {}) {
     },
     dialogScanState: {
       findUnique: async () => state,
+      count: async () => Number(options.stateCount || 0),
       upsert: async (value) => { calls.statesUpserted.push(value); return value; },
       updateMany: async (value) => { calls.statesUpdated.push(value); return { count: 1 }; },
+    },
+    dialogScanChunkCommit: {
+      findMany: async () => options.commits || [],
     },
     dialogScanRun: {
       findFirst: async ({ where } = {}) => where?.status === "FAILED" ? failed : (where?.dialogId === "__dialog_discovery__" ? latest : active),
@@ -177,6 +181,49 @@ test("status polling automatically revives the contradictory empty discovery tai
   assert.deepEqual(db.calls.jobsCreated[0].continuation, failed.continuation);
   assert.equal(db.calls.jobsCreated[0].params.scanRunId, "run-failed");
   assert.equal(db.calls.runsUpdated.at(-1).data.status, "QUEUED");
+});
+
+
+
+test("active discovery whose continuation restarted at zero is fenced and restored from committed chunks", async () => {
+  const active = {
+    id: "run-regressed", jobId: "job-regressed", status: "RUNNING", mode: "discovery",
+    dialogId: "__dialog_discovery__", pagesProcessed: 1200, generation: 7,
+    continuation: {
+      stage: "DIALOG_DISCOVERY", mode: "discovery", dialogId: "__dialog_discovery__",
+      offset: 600, page: 1200, dialogsFound: 15242, childMode: "initial", maxPages: 5000,
+    },
+    progress: { pages: 1200, nextOffset: 600, dialogsFound: 15242 },
+  };
+  const activeJob = {
+    id: "job-regressed", status: "CLAIMED", priority: 90, leaseRevision: 4,
+    params: { dialogId: "__dialog_discovery__", mode: "discovery", childMode: "initial", pageLimit: 50, maxPages: 5000, generation: 7 },
+    continuation: active.continuation,
+    progress: active.progress,
+  };
+  const db = fakeDb({
+    active,
+    latest: active,
+    activeJob,
+    stateCount: 15242,
+    commits: [
+      { cursorOut: "21540", page: 1149 },
+      { cursorOut: "21590", page: 1150 },
+      { cursorOut: "600", page: 1199 },
+    ],
+  });
+  const result = await repairRegressedDialogDiscoveryTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1",
+  });
+  assert.equal(result.repaired, true);
+  assert.equal(result.fromOffset, 600);
+  assert.equal(result.toOffset, 21590);
+  assert.equal(db.calls.jobsUpdated.at(-1).data.status, "SCHEDULED");
+  assert.deepEqual(db.calls.jobsUpdated.at(-1).data.leaseRevision, { increment: 1 });
+  assert.equal(db.calls.jobsUpdated.at(-1).data.continuation.offset, 21590);
+  assert.equal(db.calls.jobsUpdated.at(-1).data.continuation.page, 1151);
+  assert.equal(db.calls.runsUpdated.at(-1).data.pagesProcessed, 1151);
+  assert.equal(db.calls.runsUpdated.at(-1).data.progress.nextOffset, 21590);
 });
 
 test("purchase target is queued inside an active initial run without damaging continuation", async () => {
