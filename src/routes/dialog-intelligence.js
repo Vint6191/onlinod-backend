@@ -384,7 +384,7 @@ router.get("/creators/:creatorId/dialogs/:dialogId/state", async (req, res) => {
       }),
       moduleControl(prisma, req.auth.agencyId),
       prisma.dialogMessageLedger.count({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, dialogId: req.params.dialogId } }),
-      prisma.dialogMessageMedia.count({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, message: { dialogId: req.params.dialogId } } }),
+      prisma.dialogMessageMedia.count({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, messageLedger: { dialogId: req.params.dialogId } } }),
     ]);
     let job = null;
     if (activeRun?.jobId) {
