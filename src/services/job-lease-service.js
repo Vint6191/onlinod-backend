@@ -68,6 +68,41 @@ function safeProgress(value) {
   if (message) out.message = message;
   return Object.keys(out).length ? out : null;
 }
+
+/**
+ * JobInstance.continuation historically existed in two shapes: a plain
+ * domain continuation and the Desktop driver envelope. Older Desktop builds
+ * could repeatedly wrap an already-enveloped value after a restart:
+ * execute -> execute -> execute -> domain state. Prisma/PostgreSQL eventually
+ * rejects that deeply nested JSON with "recursion limit exceeded".
+ *
+ * Normalize iteratively (never recursively) so an existing poisoned job is
+ * healed by its next progress/renewal request. The domain payload itself stays
+ * transport-neutral; this boundary is also the future server-worker handoff.
+ */
+function normalizeLeaseContinuation(value) {
+  let current = value;
+  for (let depth = 0; depth < 10000; depth += 1) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) return current ?? null;
+    const phase = current.driverPhase;
+    if (phase === "complete") {
+      return {
+        driverPhase: "complete",
+        result: current.result ?? null,
+        progress: safeProgress(current.progress) ?? current.progress ?? null,
+      };
+    }
+    if (phase !== "execute") return current;
+    const nested = current.jobContinuation ?? null;
+    if (nested && typeof nested === "object" && !Array.isArray(nested)
+      && (nested.driverPhase === "execute" || nested.driverPhase === "complete")) {
+      current = nested;
+      continue;
+    }
+    return { driverPhase: "execute", jobContinuation: nested };
+  }
+  throw new JobLeaseError("JOB_CONTINUATION_TOO_DEEP", "Job continuation nesting is invalid", 409);
+}
 async function requireOwnedDevice({ userId, deviceId }) {
   const device = await prisma.workerDevice.findUnique({ where: { id: deviceId } });
   if (!device || device.userId !== userId) throw new JobLeaseError("NOT_YOUR_DEVICE", "Invalid device", 403);
@@ -198,7 +233,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys }) {
         id: claimed.id, jobKey: claimed.jobKey, scope: claimed.scope, creatorId: claimed.creatorId, agencyId: claimed.agencyId,
         idempotencyKey: claimed.idempotencyKey, params: claimed.params || {}, priority: claimed.priority, creator: claimed.creator || null,
         attempt: claimed.attempts + 1, leaseUntil: claimed.leaseUntil, leaseToken, leaseRevision: claimed.leaseRevision,
-        workId: claimed.workId, continuation: claimed.continuation, progress: claimed.progress,
+        workId: claimed.workId, continuation: normalizeLeaseContinuation(claimed.continuation), progress: claimed.progress,
       },
       reason: "claimed",
     };
@@ -215,23 +250,40 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   if (!tokenMatches(leaseToken, job.leaseTokenHash)) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease token is stale");
   if (!Number.isInteger(leaseRevision) || job.leaseRevision !== leaseRevision) throw new JobLeaseError("JOB_LEASE_REVISION_STALE", "Job lease revision is stale");
   if (!allowExpired && (!job.leaseUntil || job.leaseUntil.getTime() <= Date.now())) throw new JobLeaseError("JOB_LEASE_EXPIRED", "Job lease expired");
+  // Normalize in memory before any lease/result service consumes this job. This
+  // protects side effects from legacy execute->execute nesting even before the
+  // next durable checkpoint rewrites the database row in canonical form.
+  job.continuation = normalizeLeaseContinuation(job.continuation);
   return job;
 }
 async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation }) {
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
   const now = new Date();
   const tokenHash = hashToken(leaseToken);
+  const data = {
+    leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
+  };
+  if (workId !== undefined) data.workId = clean(workId, 200) || job.workId;
+  const normalizedProgress = safeProgress(progress);
+  if (normalizedProgress) data.progress = normalizedProgress;
+  if (continuation !== undefined) data.continuation = normalizeLeaseContinuation(continuation);
+  if (normalizedProgress || continuation !== undefined) data.lastProgressAt = now;
+  // A pure keepalive must update only leaseUntil. Rewriting an unchanged JSON
+  // continuation made one poisoned legacy value break every heartbeat forever.
   const result = await prisma.jobInstance.updateMany({
     where: { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: tokenHash, leaseRevision, leaseUntil: { gt: now } },
-    data: {
-      leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)), workId: clean(workId, 200) || job.workId,
-      progress: safeProgress(progress) ?? job.progress, continuation: continuation === undefined ? job.continuation : continuation,
-      lastProgressAt: progress === undefined && continuation === undefined ? job.lastProgressAt : now,
-    },
+    data,
   });
   if (!result.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before renewal");
   const updated = await prisma.jobInstance.findUnique({ where: { id: job.id } });
-  return { id: updated.id, status: updated.status, leaseUntil: updated.leaseUntil, leaseRevision: updated.leaseRevision, progress: updated.progress, continuation: updated.continuation };
+  return {
+    id: updated.id,
+    status: updated.status,
+    leaseUntil: updated.leaseUntil,
+    leaseRevision: updated.leaseRevision,
+    progress: updated.progress,
+    continuation: normalizeLeaseContinuation(updated.continuation),
+  };
 }
 async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation, chunkResult }) {
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
@@ -251,7 +303,7 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
         workId: clean(workId, 200) || job.workId,
         progress: safeProgress(progress) ?? job.progress,
-        continuation: continuation === undefined ? job.continuation : continuation,
+        continuation: continuation === undefined ? job.continuation : normalizeLeaseContinuation(continuation),
         lastProgressAt: now,
       },
     });
@@ -409,4 +461,4 @@ async function releaseJob({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before release");
   return { id: job.id, status: "SCHEDULED", retryAt: new Date(now.getTime() + delay), attempts: job.attempts };
 }
-module.exports = { JobLeaseError, claimJob, renewLease, progressJob, completeJob, failJob, releaseJob, sweepExpiredLeases };
+module.exports = { JobLeaseError, claimJob, renewLease, progressJob, completeJob, failJob, releaseJob, sweepExpiredLeases, normalizeLeaseContinuation };

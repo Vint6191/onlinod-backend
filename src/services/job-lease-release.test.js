@@ -107,3 +107,44 @@ test("claim clears stale wait diagnostics before a worker resumes the job", asyn
   assert.equal(Object.hasOwn(updateData.progress, "waitKind"), false);
   assert.equal(Object.hasOwn(updateData.progress, "waitReason"), false);
 });
+
+test("lease-only renew does not rewrite progress or continuation JSON", async () => {
+  const item = fixture();
+  item.job.continuation = { driverPhase: "execute", jobContinuation: { mode: "initial", page: 7 } };
+  const { renewLease } = loadService(item);
+  await renewLease({
+    jobId: item.job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: item.token,
+    leaseRevision: 3,
+    leaseMs: 60_000,
+  });
+  const update = item.update();
+  assert.equal(Object.hasOwn(update.data, "continuation"), false);
+  assert.equal(Object.hasOwn(update.data, "progress"), false);
+  assert.equal(Object.hasOwn(update.data, "lastProgressAt"), false);
+  assert.ok(update.data.leaseUntil instanceof Date);
+});
+
+test("renew flattens a legacy deeply nested driver continuation", async () => {
+  const item = fixture();
+  const domain = { stage: "DIALOG_SCAN", mode: "initial", dialogId: "dialog-1", page: 12, cursor: "m-500" };
+  let nested = domain;
+  for (let index = 0; index < 2_000; index += 1) {
+    nested = { driverPhase: "execute", jobContinuation: nested };
+  }
+  const { renewLease } = loadService(item);
+  await renewLease({
+    jobId: item.job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: item.token,
+    leaseRevision: 3,
+    leaseMs: 60_000,
+    continuation: nested,
+  });
+  const saved = item.update().data.continuation;
+  assert.deepEqual(saved, { driverPhase: "execute", jobContinuation: domain });
+  assert.doesNotThrow(() => JSON.stringify(saved));
+});
