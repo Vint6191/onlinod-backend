@@ -279,10 +279,16 @@ router.post("/creators/:creatorId/dialogs/:dialogId/scans", async (req, res) => 
         where: { creatorId_dialogId: { creatorId: req.params.creatorId, dialogId: req.params.dialogId } },
         select: { initialScanComplete: true },
       });
+      // Full history is local per Desktop. A member opening a dialog on a
+      // machine whose local SQLite is empty must be allowed to rebuild that
+      // local ledger even when another Desktop completed the server-side scan
+      // checkpoint earlier. Explicit/manual full rescans remain senior-only.
       const lifecycleInitial = requestedMode === "initial"
         && lifecycleSources.has(input.source || "")
         && currentState?.initialScanComplete !== true;
-      if (!lifecycleInitial) {
+      const lifecycleLocalFull = requestedMode === "full"
+        && lifecycleSources.has(input.source || "");
+      if (!lifecycleInitial && !lifecycleLocalFull) {
         return res.status(403).json({ ok: false, code: "DIALOG_SCAN_WRITE_FORBIDDEN", error: "Owner, admin or manager permission is required for this scan mode" });
       }
     }
@@ -322,16 +328,18 @@ router.post("/creators/:creatorId/dialogs/:dialogId/scans", async (req, res) => 
 
 router.get("/creators/:creatorId/dialogs/:dialogId/state", async (req, res) => {
   try {
-    const [state, activeRun, control, messageCount, mediaCount] = await Promise.all([
+    const [state, activeRun, control] = await Promise.all([
       prisma.dialogScanState.findUnique({ where: { creatorId_dialogId: { creatorId: req.params.creatorId, dialogId: req.params.dialogId } } }),
       prisma.dialogScanRun.findFirst({
         where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, dialogId: req.params.dialogId, status: { in: ["QUEUED", "RUNNING", "PAUSED"] } },
         orderBy: { createdAt: "desc" },
       }),
       moduleControl(prisma, req.auth.agencyId),
-      prisma.dialogMessageLedger.count({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, dialogId: req.params.dialogId } }),
-      prisma.dialogMessageMedia.count({ where: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, messageLedger: { dialogId: req.params.dialogId } } }),
     ]);
+    // Full message/media rows are local-only. These counters are compact scan
+    // telemetry and do not query the legacy server ledger.
+    const messageCount = Number(state?.messagesProcessed || 0);
+    const mediaCount = Number(state?.mediaProcessed || 0);
     let job = null;
     if (activeRun?.jobId) {
       job = await prisma.jobInstance.findUnique({
@@ -344,44 +352,18 @@ router.get("/creators/:creatorId/dialogs/:dialogId/state", async (req, res) => {
 });
 
 router.get("/creators/:creatorId/dialogs/:dialogId/messages", async (req, res) => {
-  try {
-    const query = z.object({
-      offset: z.coerce.number().int().min(0).optional(),
-      limit: z.coerce.number().int().min(1).max(250).optional(),
-      after: z.string().datetime().optional(),
-      before: z.string().datetime().optional(),
-      changedAfter: z.string().datetime().optional(),
-      includeText: z.enum(["true", "false"]).optional(),
-      order: z.enum(["asc", "desc"]).optional(),
-      messageIds: z.string().max(12000).optional(),
-    }).parse(req.query || {});
-    const offset = query.offset || 0;
-    const limit = query.limit || 100;
-    const messageIds = (query.messageIds || "").split(",").map((value) => clean(value, 240)).filter(Boolean).slice(0, 100);
-    const where = {
-      agencyId: req.auth.agencyId,
-      creatorId: req.params.creatorId,
-      dialogId: req.params.dialogId,
-      ...(messageIds.length ? { messageId: { in: messageIds } } : {}),
-      ...(query.after || query.before ? { createdAtOf: { ...(query.after ? { gt: new Date(query.after) } : {}), ...(query.before ? { lt: new Date(query.before) } : {}) } } : {}),
-      ...(query.changedAfter ? { OR: [{ changedAtOf: { gt: new Date(query.changedAfter) } }, { firstSeenAt: { gt: new Date(query.changedAfter) } }] } : {}),
-    };
-    const [items, count] = await Promise.all([
-      prisma.dialogMessageLedger.findMany({
-        where,
-        orderBy: [{ createdAtOf: query.order === "desc" ? "desc" : "asc" }, { messageId: query.order === "desc" ? "desc" : "asc" }],
-        skip: offset,
-        take: limit,
-        include: { media: true },
-      }),
-      prisma.dialogMessageLedger.count({ where }),
-    ]);
-    const safeItems = items.map((item) => query.includeText === "false" ? { ...item, text: null } : item);
-    return res.json({ ok: true, items: safeItems, count, offset, nextOffset: offset + items.length, hasMore: offset + items.length < count });
-  } catch (error) {
-    if (error instanceof z.ZodError) return validationError(res, error);
-    return serviceError(res, error, "DIALOG_MESSAGES_LIST_FAILED");
-  }
+  // Compatibility surface only. Full chat history is canonical in the
+  // Desktop's dialog-messages.sqlite and is intentionally not served from
+  // PostgreSQL anymore.
+  return res.json({
+    ok: true,
+    localOnly: true,
+    items: [],
+    count: 0,
+    offset: 0,
+    nextOffset: 0,
+    hasMore: false,
+  });
 });
 
 router.get("/creators/:creatorId/runs", async (req, res) => {

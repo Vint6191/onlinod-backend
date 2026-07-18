@@ -1236,63 +1236,57 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
 
   const existing = await db.dialogScanChunkCommit.findUnique({ where: { runId_chunkKey: { runId, chunkKey } } });
   if (existing) {
-    // A lost HTTP response must be replayable. The saved result contains the
-    // exact committed IDs/continuation required to hydrate the local cache and
-    // wake CRM without applying projections twice.
+    // Lost responses remain replayable, but the saved result contains only
+    // compact local-commit metadata. Raw conversations never enter PostgreSQL.
     return { duplicate: true, replayedCommit: true, chunkId: existing.id, ...object(existing.result) };
   }
 
   const run = await db.dialogScanRun.findFirst({ where: { id: runId, creatorId: job.creatorId, agencyId: job.agencyId } });
   if (!run) throw new Error("Dialog scan run not found");
   const observedAt = new Date();
-  let messageCount = 0;
-  let mediaCount = 0;
-  let inserted = 0;
-  let updated = 0;
-  let unchanged = 0;
-  const messageIds = [];
-  const changedMessageIds = [];
-  const observations = [];
+
+  // Desktop commits the complete OF page to dialog-messages.sqlite before it
+  // reports progress. The backend receives only counts, IDs and observations
+  // required for leases, continuation and deterministic incremental stopping.
+  const messageIds = [...new Set(list(chunk.messageIds).map((value) => clean(value, 240)).filter(Boolean))].slice(0, 500);
+  const changedMessageIds = [...new Set(list(chunk.changedMessageIds).map((value) => clean(value, 240)).filter(Boolean))].slice(0, 500);
+  const observations = list(chunk.observations).slice(0, 500).map((value) => {
+    const item = object(value);
+    const createdAt = dateOrNull(item.createdAtOf);
+    return {
+      known: item.known === true,
+      changed: item.changed === true,
+      messageId: clean(item.messageId, 240),
+      createdAtOf: createdAt ? createdAt.toISOString() : null,
+    };
+  }).filter((item) => item.messageId);
+  const messageCount = integer(chunk.messageCount, messageIds.length, 0, 500);
+  const mediaCount = integer(chunk.mediaCount, 0, 0, 100_000);
+  const inserted = integer(chunk.inserted, 0, 0, 500);
+  const updated = integer(chunk.updated, 0, 0, 500);
+  const unchanged = integer(chunk.unchanged, Math.max(0, messageCount - inserted - updated), 0, 500);
+
   let newest = null;
   let oldest = null;
-
-  for (const raw of list(chunk.messages)) {
-    const applied = await upsertMessage(db, { agencyId: job.agencyId, creatorId: job.creatorId, job, raw, observedAt });
-    if (!applied) continue;
-    messageCount += 1;
-    mediaCount += applied.mediaCount;
-    messageIds.push(applied.ledger.messageId);
-    if (applied.isNew) inserted += 1;
-    else if (applied.businessChanged) updated += 1;
-    else unchanged += 1;
-    if (applied.isNew || applied.businessChanged) changedMessageIds.push(applied.ledger.messageId);
-    observations.push({
-      known: !applied.isNew,
-      changed: applied.businessChanged,
-      messageId: applied.ledger.messageId,
-      createdAtOf: applied.ledger.createdAtOf,
-    });
-    if (!newest || applied.ledger.createdAtOf > newest.createdAtOf) newest = applied.ledger;
-    if (!oldest || applied.ledger.createdAtOf < oldest.createdAtOf) oldest = applied.ledger;
+  for (const item of observations) {
+    const createdAtOf = dateOrNull(item.createdAtOf);
+    if (!createdAtOf) continue;
+    const candidate = { messageId: item.messageId, createdAtOf };
+    if (!newest || createdAtOf > newest.createdAtOf) newest = candidate;
+    if (!oldest || createdAtOf < oldest.createdAtOf) oldest = candidate;
+  }
+  const declaredNewestId = clean(chunk.newestMessageId, 240);
+  const declaredOldestId = clean(chunk.oldestMessageId, 240);
+  if (declaredNewestId) {
+    const observation = observations.find((item) => item.messageId === declaredNewestId);
+    newest = { messageId: declaredNewestId, createdAtOf: dateOrNull(observation?.createdAtOf) || newest?.createdAtOf || observedAt };
+  }
+  if (declaredOldestId) {
+    const observation = observations.find((item) => item.messageId === declaredOldestId);
+    oldest = { messageId: declaredOldestId, createdAtOf: dateOrNull(observation?.createdAtOf) || oldest?.createdAtOf || observedAt };
   }
 
   const targetMessageId = clean(chunk.targetMessageId, 240);
-  if (chunk.targetMissing === true && targetMessageId) {
-    await db.dialogPurchaseSignal.updateMany({
-      where: { creatorId: job.creatorId, sourceMessageId: targetMessageId },
-      data: { resolveState: "DELETED_MESSAGE", lastSeenAt: observedAt },
-    });
-  }
-
-  const signalMessageIds = [...new Set([...messageIds, ...(targetMessageId ? [targetMessageId] : [])])];
-  const signals = signalMessageIds.length
-    ? await db.dialogPurchaseSignal.findMany({ where: { creatorId: job.creatorId, sourceMessageId: { in: signalMessageIds } }, take: 10_000 })
-    : [];
-  let projected = 0;
-  for (const signal of signals) {
-    await projectSignal(db, signal);
-    projected += 1;
-  }
 
   const mode = clean(chunk.mode ?? run.mode, 40) || "initial";
   const currentContinuation = jobContinuationValue(job.continuation);
@@ -1350,9 +1344,8 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   submittedContinuation.watermarkReached = known.watermarkReached;
   submittedContinuation.pageOldestAt = known.pageOldestAt;
 
-  // Resolve the current durable target only after its message/media/projection
-  // transaction has succeeded. A transient OF error produces no chunk commit,
-  // so the row remains PENDING and survives process/lease restarts.
+  // A targeted row becomes complete only after Desktop has durably committed
+  // the target result locally and this compact checkpoint is accepted.
   if (isTargeted && targetMessageId) {
     await db.dialogReconciliationTarget.updateMany({
       where: {
@@ -1394,7 +1387,8 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
     inserted,
     updated,
     unchanged,
-    projected,
+    projected: 0,
+    localOnly: true,
     hasMore,
     page,
     cursorOut,
@@ -1458,6 +1452,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
       continuation: durableContinuation,
       progress: {
         ...object(chunk.progress),
+        storage: "local_sqlite",
         knownUnchangedStreak: known.streak,
         watermarkReached: known.watermarkReached,
         inserted,
@@ -1500,8 +1495,6 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
     newestMessageAt: newest && (!state?.newestMessageAt || newest.createdAtOf >= state.newestMessageAt) ? newest.createdAtOf : undefined,
     oldestMessageId: oldest && (!state?.oldestMessageAt || oldest.createdAtOf <= state.oldestMessageAt) ? oldest.messageId : undefined,
     oldestMessageAt: oldest && (!state?.oldestMessageAt || oldest.createdAtOf <= state.oldestMessageAt) ? oldest.createdAtOf : undefined,
-    // The confirmed forward watermark moves only when the whole incremental
-    // run completes. This prevents a failed page from creating a scan gap.
     forwardCursor: undefined,
     backwardCursor: mode === "initial" ? cursorOut || undefined : undefined,
     activeRunId: runId,
@@ -1520,7 +1513,6 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
 
   return { duplicate: false, replayedCommit: false, chunkId: commit.id, ...responseResult };
 }
-
 function normalizedSignal(raw, job) {
   const input = object(raw);
   const creatorId = clean(job.creatorId ?? input.creatorId, 160);
@@ -1545,40 +1537,35 @@ function normalizedSignal(raw, job) {
 async function applyPurchaseSignalsChunk({ db, job, chunkResult, userId = null }) {
   const chunk = object(chunkResult);
   const agencyId = clean(job.agencyId, 160);
-  if (!agencyId) return { accepted: 0, projected: 0, scheduled: 0, disabled: false };
+  if (!agencyId) return { accepted: 0, projected: 0, scheduled: 0, disabled: false, localOnly: true };
   const control = await moduleControl(db, agencyId);
-  if (!control.enabled) return { accepted: 0, projected: 0, scheduled: 0, disabled: true };
+  if (!control.enabled) return { accepted: 0, projected: 0, scheduled: 0, disabled: true, localOnly: true };
   const raws = chunk.kind === "dialog_purchase_signals" ? list(chunk.signals) : [];
   let accepted = 0;
-  let projected = 0;
   let scheduled = 0;
   for (const raw of raws) {
     const signal = normalizedSignal(raw, job);
     if (!signal) continue;
-    const stored = await db.dialogPurchaseSignal.upsert({
-      where: { idempotencyKey: signal.idempotencyKey },
-      create: { ...signal, resolveState: "PENDING" },
-      update: {
-        sourceMessageId: signal.sourceMessageId || undefined, dialogId: signal.dialogId || undefined,
-        buyerId: signal.buyerId || undefined, buyerUsername: signal.buyerUsername || undefined,
-        buyerDisplayName: signal.buyerDisplayName || undefined, buyerDeleted: signal.buyerDeleted,
-        occurredAt: signal.occurredAt, amountCents: signal.amountCents, currency: signal.currency,
-        lastSeenAt: new Date(), metadata: signal.metadata,
-      },
-    });
     accepted += 1;
-    const projection = await projectSignal(db, stored);
-    if (projection) projected += 1;
-    if (signal.dialogId && signal.sourceMessageId && projection?.status === "UNRESOLVED_MESSAGE") {
+    // Purchase facts, prices and Vault projections are local-only. PostgreSQL
+    // retains only the durable reconciliation target/job needed to resolve a
+    // notification's source message on another worker after a restart.
+    if (signal.dialogId && signal.sourceMessageId) {
       const result = await scheduleDialogScanTx(db, {
-        agencyId: signal.agencyId, creatorId: signal.creatorId, dialogId: signal.dialogId,
-        fanId: signal.buyerId, mode: "targeted", targetMessageId: signal.sourceMessageId,
-        source: "purchase_notification", priority: 120, userId,
+        agencyId: signal.agencyId,
+        creatorId: signal.creatorId,
+        dialogId: signal.dialogId,
+        fanId: signal.buyerId,
+        mode: "targeted",
+        targetMessageId: signal.sourceMessageId,
+        source: "local_purchase_notification",
+        priority: 120,
+        userId,
       });
       if (result.created || result.reason === "targeted_reconciliation_queued") scheduled += 1;
     }
   }
-  return { accepted, projected, scheduled };
+  return { accepted, projected: 0, scheduled, localOnly: true };
 }
 
 async function completeDialogIntelligenceJob({ db = prisma, job, deviceId, result }) {
@@ -1704,31 +1691,21 @@ async function recordDialogIntelligenceFailure({ job, error, terminal }) {
 }
 
 async function ingestWsMessages({ agencyId, creatorId, dialogId, fanId = null, messages }) {
-  return prisma.$transaction(async (tx) => {
-    await assertCreator(tx, agencyId, creatorId);
-    const control = await moduleControl(tx, agencyId);
-    if (!control.enabled) return { ok: true, disabled: true, messageCount: 0, mediaCount: 0, projected: 0 };
-    const observedAt = new Date();
-    const fakeJob = { params: { dialogId, fanId } };
-    let messageCount = 0;
-    let mediaCount = 0;
-    const messageIds = [];
-    for (const raw of list(messages).slice(0, 500)) {
-      const applied = await upsertMessage(tx, { agencyId, creatorId, job: fakeJob, raw: { ...object(raw), source: "websocket" }, observedAt });
-      if (!applied) continue;
-      messageCount += 1;
-      mediaCount += applied.mediaCount;
-      messageIds.push(applied.ledger.messageId);
-    }
-    const signals = messageIds.length ? await tx.dialogPurchaseSignal.findMany({ where: { creatorId, sourceMessageId: { in: messageIds } } }) : [];
-    for (const signal of signals) await projectSignal(tx, signal);
-    await tx.dialogScanState.upsert({
-      where: { creatorId_dialogId: { creatorId, dialogId } },
-      create: { agencyId, creatorId, dialogId, fanId, status: "IDLE", lastWsEventAt: observedAt, messagesProcessed: messageCount, mediaProcessed: mediaCount },
-      update: { fanId: fanId || undefined, lastWsEventAt: observedAt, messagesProcessed: { increment: messageCount }, mediaProcessed: { increment: mediaCount } },
-    });
-    return { ok: true, messageCount, mediaCount, projected: signals.length };
-  });
+  // Compatibility endpoint for Desktop builds deployed before the local-ledger
+  // rollback. Acknowledge the payload without persisting raw chat content so a
+  // rolling backend deploy cannot continue growing DialogMessageLedger.
+  return {
+    ok: true,
+    localOnly: true,
+    ignored: true,
+    agencyId: clean(agencyId, 160),
+    creatorId: clean(creatorId, 160),
+    dialogId: clean(dialogId, 180),
+    fanId: clean(fanId, 160),
+    messageCount: list(messages).length,
+    mediaCount: 0,
+    projected: 0,
+  };
 }
 
 async function rebuildCreatorAggregates({ agencyId, creatorId }) {

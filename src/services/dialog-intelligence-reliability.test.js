@@ -213,10 +213,18 @@ test("durable target survives restart, resolves after commit, and duplicate repl
     kind: "dialog_message_page", runId: "run-1", dialogId: "dialog-1", mode: "targeted",
     chunkKey: "target-chunk-1", page: 0, cursorIn: null, cursorOut: null, hasMore: false,
     targetMessageId: "message-target",
-    messages: [{
-      messageId: "message-target", dialogId: "dialog-1", createdAtOf: "2026-07-15T10:00:00.000Z",
-      direction: "OUTBOUND", priceCents: 2500, isOpened: true, isFree: false, contentHash: "hash-1", media: [],
+    messageCount: 1,
+    mediaCount: 0,
+    inserted: 1,
+    updated: 0,
+    unchanged: 0,
+    messageIds: ["message-target"],
+    changedMessageIds: ["message-target"],
+    observations: [{
+      messageId: "message-target", createdAtOf: "2026-07-15T10:00:00.000Z", known: false, changed: true,
     }],
+    newestMessageId: "message-target",
+    oldestMessageId: "message-target",
     continuation: { mode: "targeted", targetMessageId: "message-target", resumeState },
     progress: { pages: 1 },
   };
@@ -236,7 +244,7 @@ test("durable target survives restart, resolves after commit, and duplicate repl
   assert.deepEqual(replay.changedMessageIds, ["message-target"]);
   assert.deepEqual(replay.jobContinuationOverride, resumeState);
   assert.equal(fixture.calls.commitCreates, 1);
-  assert.equal(fixture.calls.messageUpserts, 1);
+  assert.equal(fixture.calls.messageUpserts, 0);
   assert.equal(fixture.calls.targetResolves, 1);
 });
 
@@ -275,13 +283,27 @@ test("a 50-message OF page increments durable run and dialog counters by 50", as
     chunkResult: {
       kind: "dialog_message_page", runId: "run-1", dialogId: "dialog-1", mode: "initial",
       chunkKey: "page-50", page: 1, cursorIn: null, cursorOut: "message-50", hasMore: true,
-      messages,
+      messageCount: messages.length,
+      mediaCount: 0,
+      inserted: messages.length,
+      updated: 0,
+      unchanged: 0,
+      messageIds: messages.map((message) => message.messageId),
+      changedMessageIds: messages.map((message) => message.messageId),
+      observations: messages.map((message) => ({
+        messageId: message.messageId,
+        createdAtOf: message.createdAtOf,
+        known: false,
+        changed: true,
+      })),
+      newestMessageId: messages[0].messageId,
+      oldestMessageId: messages[messages.length - 1].messageId,
       continuation: { mode: "initial", cursor: "message-50", page: 1 },
       progress: { pages: 1, rawMessages: 50, messages: 50, skippedMessages: 0 },
     },
   });
   assert.equal(result.messageCount, 50);
-  assert.equal(fixture.calls.messageUpserts, 50);
+  assert.equal(fixture.calls.messageUpserts, 0);
   assert.equal(fixture.run.pagesProcessed, 1);
   assert.equal(fixture.run.messagesProcessed, 50);
 });
