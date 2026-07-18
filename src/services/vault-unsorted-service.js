@@ -65,6 +65,8 @@ function snapshotPayload(snapshot, patch = {}) {
       pages: integer(patch.pages ?? scan.pages),
       scanned: integer(patch.scanned ?? scan.scanned),
       knownStreak: integer(patch.knownStreak ?? scan.knownStreak),
+      expectedCount: integer(patch.expectedCount ?? scan.expectedCount),
+      published: patch.published === undefined ? (scan.published !== false) : patch.published === true,
       startedAt: patch.startedAt === undefined ? (scan.startedAt || null) : patch.startedAt,
       completedAt: patch.completedAt === undefined ? (scan.completedAt || null) : patch.completedAt,
       lastError: patch.lastError === undefined ? (scan.lastError || null) : patch.lastError,
@@ -472,6 +474,8 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
         pages: 0,
         scanned: 0,
         knownStreak: 0,
+        expectedCount: integer(continuation.expectedCount),
+        published: false,
         startedAt: new Date().toISOString(),
         completedAt: null,
         lastError: null,
@@ -538,6 +542,8 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
       pages,
       scanned,
       knownStreak,
+      expectedCount: integer(continuation.expectedCount ?? chunk.expectedMediaCount),
+      published: false,
       lastError: null,
     },
     countOverride: nextCounts,
@@ -551,6 +557,8 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
         pages,
         scanned,
         knownStreak,
+        expectedMediaCount: integer(continuation.expectedCount ?? chunk.expectedMediaCount),
+        messagesFolderId: clean(continuation.messagesFolderId, 240),
         stoppedReason: stopForKnown ? `known_streak_${knownLimit}` : stopForMaxPages ? "max_pages" : !hasMore ? "of_has_more_false" : "empty_page",
       },
       kind,
@@ -563,7 +571,44 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
   if (!job.creatorId || !job.agencyId) throw new Error("Vault Unsorted job is missing creator scope");
   const payload = object(result);
   const mode = normalizeMode(payload.mode || job.params?.mode);
+  const expectedMediaCount = integer(payload.expectedMediaCount, 0, 0, 10_000_000);
+  let seenByJob = 0;
   if (mode === "full") {
+    seenByJob = await db.vaultUnsortedItem.count({
+      where: { agencyId: job.agencyId, creatorId: job.creatorId, lastSeenJobId: job.id },
+    });
+    if (expectedMediaCount > 0 && seenByJob < expectedMediaCount) {
+      const detail = `Messages catalog incomplete: expected ${expectedMediaCount}, received ${seenByJob}; previous complete catalog preserved`;
+      const preservedCounts = await counts(db, job.agencyId, job.creatorId);
+      const preservedSnapshot = await updateSnapshot(db, {
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        userId,
+        patch: {
+          scanStatus: "FAILED",
+          mode,
+          jobId: job.id,
+          pages: integer(payload.pages),
+          scanned: integer(payload.scanned),
+          knownStreak: integer(payload.knownStreak),
+          expectedCount: expectedMediaCount,
+          published: false,
+          completedAt: new Date().toISOString(),
+          lastError: detail,
+        },
+        countOverride: preservedCounts,
+      });
+      return {
+        type: "vault_unsorted",
+        snapshot: publicSnapshot(preservedSnapshot),
+        ...payload,
+        published: false,
+        incomplete: true,
+        expectedMediaCount,
+        seenByJob,
+        error: detail,
+      };
+    }
     await db.vaultUnsortedItem.deleteMany({
       where: { agencyId: job.agencyId, creatorId: job.creatorId, NOT: { lastSeenJobId: job.id } },
     });
@@ -580,6 +625,8 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
       pages: integer(payload.pages),
       scanned: integer(payload.scanned),
       knownStreak: integer(payload.knownStreak),
+      expectedCount: expectedMediaCount,
+      published: true,
       completedAt: new Date().toISOString(),
       lastFullScanAt: mode === "full" ? new Date().toISOString() : undefined,
       lastIncrementalScanAt: mode === "incremental" ? new Date().toISOString() : undefined,
@@ -587,7 +634,7 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
     },
     countOverride: nextCounts,
   });
-  return { type: "vault_unsorted", snapshot: publicSnapshot(snapshot), ...payload };
+  return { type: "vault_unsorted", snapshot: publicSnapshot(snapshot), ...payload, published: true, expectedMediaCount, seenByJob };
 }
 
 async function recordVaultUnsortedFailure({ job, error, terminal }) {

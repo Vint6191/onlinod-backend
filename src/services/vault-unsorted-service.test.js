@@ -30,7 +30,11 @@ function fixture(existingIds = []) {
   const calls = { deleteMany: [], upserts: 0 };
   const db = {
     vaultUnsortedItem: {
-      count: async ({ where }) => [...rows.values()].filter((row) => !where.status || row.status === where.status).length,
+      count: async ({ where }) => [...rows.values()].filter((row) => {
+        if (where.status && row.status !== where.status) return false;
+        if (where.lastSeenJobId && row.lastSeenJobId !== where.lastSeenJobId) return false;
+        return true;
+      }).length,
       findMany: async ({ where }) => [...rows.values()]
         .filter((row) => where.mediaId?.in?.includes(row.mediaId))
         .map((row) => ({ mediaId: row.mediaId })),
@@ -138,6 +142,30 @@ test("full completion prunes rows not stamped by the completed job generation", 
   assert.deepEqual([...fx.rows.keys()], ["fresh"]);
   assert.equal(result.snapshot.itemsCount, 1);
   assert.equal(result.snapshot.scan.status, "COMPLETED");
+});
+
+
+
+test("incomplete full completion preserves the previous catalog instead of shrinking it", async () => {
+  const fx = fixture(["fresh-1", "fresh-2", "previous-only"]);
+  fx.rows.get("fresh-1").lastSeenJobId = "job-1";
+  fx.rows.get("fresh-2").lastSeenJobId = "job-1";
+  fx.rows.get("previous-only").lastSeenJobId = "old-job";
+  const fullJob = { ...job, params: { ...job.params, mode: "full" } };
+
+  const result = await applyVaultUnsortedCompletion({
+    db: fx.db,
+    job: fullJob,
+    result: { mode: "full", pages: 45, scanned: 1777, expectedMediaCount: 2104, knownStreak: 0 },
+  });
+
+  assert.equal(fx.calls.deleteMany.length, 0, "a partial generation must never prune the last complete catalog");
+  assert.deepEqual([...fx.rows.keys()], ["fresh-1", "fresh-2", "previous-only"]);
+  assert.equal(result.published, false);
+  assert.equal(result.incomplete, true);
+  assert.equal(result.seenByJob, 2);
+  assert.equal(result.snapshot.scan.status, "FAILED");
+  assert.match(result.snapshot.scan.lastError, /expected 2104, received 2/);
 });
 
 test("snapshot payload is compact and does not embed thousands of media rows", () => {

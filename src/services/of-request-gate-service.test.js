@@ -1,0 +1,96 @@
+"use strict";
+
+const test = require("node:test");
+const assert = require("node:assert/strict");
+
+function loadService(fixture) {
+  const prismaModule = require.resolve("../prisma");
+  require.cache[prismaModule] = {
+    id: prismaModule,
+    filename: prismaModule,
+    loaded: true,
+    exports: fixture.db,
+  };
+  delete require.cache[require.resolve("./of-request-gate-service")];
+  return require("./of-request-gate-service");
+}
+
+function databaseFixture(accessCalls) {
+  return {
+    workerDevice: {
+      findFirst: async ({ where }) => {
+        accessCalls.device += 1;
+        return { id: where.id, userId: where.userId, agencyId: "agency-1", lastSeenAt: new Date() };
+      },
+    },
+    creatorAccount: {
+      findFirst: async () => { accessCalls.creator += 1; return { id: "creator-1" }; },
+    },
+    deviceCreatorBinding: {
+      findFirst: async () => { accessCalls.binding += 1; return { id: "binding-1" }; },
+    },
+    $queryRawUnsafe: async () => { throw new Error("gate must not write PostgreSQL on every OF request"); },
+  };
+}
+
+async function started(service, deviceId, permitId) {
+  return service.acknowledgeOfRequestStarted({
+    userId: "user-1",
+    deviceId,
+    creatorId: "creator-1",
+    permitId,
+  });
+}
+
+test("global OF gate prioritizes writes and spaces actual starts by 700ms without per-request DB writes", async () => {
+  const accessCalls = { device: 0, creator: 0, binding: 0 };
+  const service = loadService({ db: databaseFixture(accessCalls) });
+  service._test.reset();
+
+  const backgroundPromise = service.acquireOfRequestSlot({
+    userId: "user-1", deviceId: "device-background", creatorId: "creator-1",
+    priority: "background", operation: "dialog.scan", timeoutMs: 5_000,
+  });
+  const writePromise = service.acquireOfRequestSlot({
+    userId: "user-1", deviceId: "device-write", creatorId: "creator-1",
+    priority: "critical_write", operation: "bump.send", timeoutMs: 5_000,
+  });
+
+  const writePermit = await writePromise;
+  let backgroundResolved = false;
+  void backgroundPromise.then(() => { backgroundResolved = true; });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(backgroundResolved, false, "next permit must wait until previous transport-start acknowledgement");
+
+  const firstStart = await started(service, "device-write", writePermit.permitId);
+  const backgroundPermit = await backgroundPromise;
+  const secondStart = await started(service, "device-background", backgroundPermit.permitId);
+
+  const spacing = new Date(secondStart.startedAt).getTime() - new Date(firstStart.startedAt).getTime();
+  assert.ok(spacing >= 700, `expected >=700ms between acknowledged starts, got ${spacing}`);
+  assert.equal(writePermit.intervalMs, 700);
+  assert.equal(backgroundPermit.intervalMs, 700);
+  assert.equal(service.getOfRequestGateSnapshot().coordinator, "single_backend_process_memory_two_phase");
+});
+
+test("gate caches device/creator access validation for acquire and started acknowledgement", async () => {
+  const accessCalls = { device: 0, creator: 0, binding: 0 };
+  const service = loadService({ db: databaseFixture(accessCalls) });
+  service._test.reset();
+
+  const permitOne = await service.acquireOfRequestSlot({
+    userId: "user-1", deviceId: "device-1", creatorId: "creator-1",
+    priority: "normal", operation: "one", timeoutMs: 5_000,
+  });
+  await started(service, "device-1", permitOne.permitId);
+
+  const permitTwo = await service.acquireOfRequestSlot({
+    userId: "user-1", deviceId: "device-1", creatorId: "creator-1",
+    priority: "normal", operation: "two", timeoutMs: 5_000,
+  });
+  await service.cancelOfRequestPermit({
+    userId: "user-1", deviceId: "device-1", creatorId: "creator-1", permitId: permitTwo.permitId,
+  });
+
+  assert.deepEqual(accessCalls, { device: 1, creator: 1, binding: 1 });
+});

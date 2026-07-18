@@ -5,6 +5,7 @@ const { getVaultUnsortedState } = require("./vault-unsorted-service");
 const {
   DIALOG_INTELLIGENCE_JOB_KEY,
   autoRecoverDialogDiscoveryTx,
+  autoRecoverDialogHistoryTx,
   repairRegressedDialogDiscoveryTx,
 } = require("./dialog-intelligence-service");
 
@@ -713,6 +714,12 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
       creatorId,
       source: "never_used_status_auto_recovery",
       priority: 90,
+    });
+    await autoRecoverDialogHistoryTx(db, {
+      agencyId,
+      creatorId,
+      source: "never_used_status_history_recovery",
+      priority: 60,
     });
   } catch {
     // Status remains readable even if best-effort recovery cannot be scheduled.

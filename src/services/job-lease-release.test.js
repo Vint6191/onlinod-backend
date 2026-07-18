@@ -149,7 +149,7 @@ test("renew flattens a legacy deeply nested driver continuation", async () => {
   assert.doesNotThrow(() => JSON.stringify(saved));
 });
 
-test("claim excludes creators that already own a live lease", async () => {
+test("claim allows another device workflow for the same creator and honors only caller exclusions", async () => {
   const now = new Date();
   const candidate = {
     id: "job-creator-2", jobKey: "dialog_intelligence_scan", scope: "creator", creatorId: "creator-2", agencyId: "agency-1",
@@ -157,13 +157,14 @@ test("claim excludes creators that already own a live lease", async () => {
     leaseRevision: 1, startedAt: null, workId: null, continuation: null, progress: null,
   };
   let candidateWhere = null;
+  let legacyLiveLeaseQueryCalled = false;
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: now }) },
     agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all" }) },
     creatorAccount: { findMany: async () => [{ id: "creator-1" }, { id: "creator-2" }] },
     deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }, { creatorId: "creator-2" }] },
     jobInstance: {
-      findMany: async () => [{ creatorId: "creator-1" }],
+      findMany: async () => { legacyLiveLeaseQueryCalled = true; return [{ creatorId: "creator-1" }]; },
       findFirst: async ({ where }) => { candidateWhere = where; return candidate; },
       updateMany: async ({ where }) => where?.id === candidate.id ? { count: 1 } : { count: 0 },
       findUnique: async () => ({
@@ -176,9 +177,11 @@ test("claim excludes creators that already own a live lease", async () => {
   const result = await claimJob({
     userId: "user-1", deviceId: "device-1", leaseMs: 60_000,
     jobKeys: ["dialog_intelligence_scan"],
+    excludedCreatorIds: ["creator-1"],
   });
   assert.equal(result.job.creatorId, "creator-2");
   assert.deepEqual(candidateWhere.creatorId.in, ["creator-2"]);
+  assert.equal(legacyLiveLeaseQueryCalled, false, "server must not globally lock a creator because another device owns a different workflow");
 });
 
 test("live progress preserves dialog diagnostics without rewriting continuation", async () => {

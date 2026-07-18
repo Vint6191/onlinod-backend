@@ -682,6 +682,8 @@ model CreatorCampaignsSnapshot {
   @@index([agencyId])
 }
 
+
+
 model JobInstance {
   id                String    @id @default(cuid())
   jobKey            String
@@ -1118,6 +1120,7 @@ model VaultUnsortedItem {
   firstSeenAt   DateTime @default(now())
   lastSeenAt    DateTime @default(now())
   lastSeenJobId String?
+  pendingScanToken String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -1128,6 +1131,7 @@ model VaultUnsortedItem {
   @@index([agencyId, creatorId, status, lastSeenAt])
   @@index([creatorId, status, lastSeenAt])
   @@index([lastSeenJobId])
+  @@index([pendingScanToken])
 }
 
 model CreatorPresenceSnapshot {

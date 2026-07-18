@@ -429,7 +429,7 @@ test("explicit full discovery replans completed dialogs and resets current-plan 
   assert.equal(state.backwardCursor, null);
 });
 
-test("an orphaned active history run is failed and cannot block the next planned dialog", async () => {
+test("an orphaned active history attempt is re-planned and cannot block the frozen dialog list", async () => {
   resetDb();
   const { job } = seedDiscovery(99);
   db._runs.set("orphan-run", {
@@ -481,7 +481,7 @@ test("an orphaned active history run is failed and cannot block the next planned
   });
 
   assert.equal(db._runs.get("orphan-run").status, "FAILED");
-  assert.equal(db._states.get("creator-1:dialog-a").status, "FAILED");
+  assert.notEqual(db._states.get("creator-1:dialog-a").status, "FAILED");
   assert.equal(completion.next.created, true);
-  assert.equal(completion.next.runId, [...db._runs.values()].find((run) => run.dialogId === "dialog-b")?.id);
+  assert.ok(["dialog-a", "dialog-b"].includes([...db._runs.values()].find((run) => run.id === completion.next.runId)?.dialogId));
 });

@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const prismaModule = require.resolve("../prisma");
 require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
-const { scheduleDialogScanTx, autoRecoverDialogDiscoveryTx, repairRegressedDialogDiscoveryTx } = require("./dialog-intelligence-service");
+const { scheduleDialogScanTx, autoRecoverDialogDiscoveryTx, autoRecoverDialogHistoryTx, repairRegressedDialogDiscoveryTx } = require("./dialog-intelligence-service");
 
 function fakeDb(options = {}) {
   const calls = { runsCreated: [], runsUpdated: [], jobsCreated: [], jobsUpdated: [], statesUpserted: [], statesUpdated: [], targetsUpserted: [] };
@@ -31,6 +31,7 @@ function fakeDb(options = {}) {
     },
     dialogScanState: {
       findUnique: async () => state,
+      findFirst: async ({ where } = {}) => where?.status === "PLANNED" ? (options.planned || null) : null,
       count: async () => Number(options.stateCount || 0),
       upsert: async (value) => { calls.statesUpserted.push(value); return value; },
       updateMany: async (value) => { calls.statesUpdated.push(value); return { count: 1 }; },
@@ -39,7 +40,12 @@ function fakeDb(options = {}) {
       findMany: async () => options.commits || [],
     },
     dialogScanRun: {
-      findFirst: async ({ where } = {}) => where?.status === "FAILED" ? failed : (where?.dialogId === "__dialog_discovery__" ? latest : active),
+      findFirst: async ({ where } = {}) => {
+        if (where?.status === "FAILED") return failed;
+        if (where?.dialogId === "__dialog_discovery__") return latest;
+        if (where?.dialogId?.not === "__dialog_discovery__") return active;
+        return active;
+      },
       create: async ({ data }) => {
         const row = { id: `run-${++runCounter}`, jobId: null, pagesProcessed: 0, continuation: {}, ...data };
         calls.runsCreated.push(row);
@@ -267,4 +273,44 @@ test("legacy cursor-stalled discovery is automatically resumed from its durable 
   assert.deepEqual(db.calls.jobsCreated[0].continuation, failed.continuation);
   assert.equal(db.calls.jobsCreated[0].params.scanRunId, "run-cursor-stalled");
   assert.equal(db.calls.runsUpdated.at(-1).data.status, "QUEUED");
+});
+
+
+test("status polling materializes the first planned history job after discovery froze the list", async () => {
+  const discovery = {
+    id: "discovery-complete",
+    jobId: "discovery-job",
+    status: "COMPLETED",
+    mode: "discovery",
+    dialogId: "__dialog_discovery__",
+    generation: 12,
+    createdAt: new Date("2026-07-18T18:00:00.000Z"),
+  };
+  const discoveryJob = {
+    id: "discovery-job",
+    status: "DONE",
+    params: { childMode: "initial", overlapPages: 2, knownMessageThreshold: 3, maxPages: 5000 },
+  };
+  const planned = {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "fan-1012608174",
+    fanId: "fan-1012608174",
+    scanMode: "initial",
+    generation: 12,
+    status: "PLANNED",
+    initialScanComplete: false,
+  };
+  const db = fakeDb({ latest: discovery, failedJob: discoveryJob, planned, state: planned });
+  const result = await autoRecoverDialogHistoryTx(db, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    source: "status_poll",
+  });
+
+  assert.equal(result.recovered, true);
+  assert.equal(db.calls.jobsCreated.length, 1);
+  assert.equal(db.calls.jobsCreated[0].params.dialogId, "fan-1012608174");
+  assert.equal(db.calls.jobsCreated[0].params.mode, "initial");
+  assert.equal(db.calls.jobsCreated[0].params.generation, 12);
 });

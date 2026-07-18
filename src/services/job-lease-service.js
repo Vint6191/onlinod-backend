@@ -224,22 +224,12 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       .map((value) => String(value || "").trim())
       .filter(Boolean),
   );
-  // One creator has one authenticated browser/request lane. Do not lease a
-  // second job that can only wait behind the first one. Besides fixing false
-  // RUNNING states in the UI, this keeps multi-device work from splitting one
-  // creator across several concurrent local stores.
-  const claimedCreators = typeof prisma.jobInstance.findMany === "function"
-    ? await prisma.jobInstance.findMany({
-        where: {
-          status: "CLAIMED",
-          leaseUntil: { gt: now },
-          creatorId: { in: creatorIds },
-        },
-        select: { creatorId: true },
-        take: 10_000,
-      })
-    : [];
-  for (const row of claimedCreators) if (row.creatorId) explicitlyExcluded.add(row.creatorId);
+  // Do not globally lock a creator at the durable-job layer. Different devices
+  // may prepare independent workflows (for example dialog history and the
+  // Messages catalog), while writes use their own delivery worker. Physical OF
+  // request starts are globally serialized by the shared request-gate service at 700ms.
+  // A Desktop still sends excludedCreatorIds for lanes it cannot execute locally,
+  // preventing parked leases without blocking useful work on another device.
   const eligibleCreatorIds = creatorIds.filter((creatorId) => !explicitlyExcluded.has(creatorId));
   if (!eligibleCreatorIds.length) return { job: null, reason: "creators-busy" };
   for (let race = 0; race < 5; race += 1) {

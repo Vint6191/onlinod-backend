@@ -856,6 +856,69 @@ async function autoRecoverDialogDiscovery(input) {
   return prisma.$transaction((tx) => autoRecoverDialogDiscoveryTx(tx, input));
 }
 
+/**
+ * Discovery and history are intentionally separated: discovery freezes a
+ * PLANNED list, then exactly one history job is materialized at a time. A
+ * failed completion side effect or an old orphaned run could leave thousands
+ * of PLANNED rows with no live JobInstance. Status polling must repair that
+ * durable plan automatically instead of rendering RECOVERY REQUIRED forever.
+ */
+async function autoRecoverDialogHistoryTx(db, input) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorId = clean(input.creatorId, 160);
+  if (!agencyId || !creatorId) return { ok: true, recovered: false, reason: "missing_scope" };
+
+  const latestDiscovery = await db.dialogScanRun.findFirst({
+    where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!latestDiscovery || clean(latestDiscovery.status, 40).toUpperCase() !== "COMPLETED") {
+    return { ok: true, recovered: false, reason: "discovery_not_complete" };
+  }
+
+  const generation = integer(latestDiscovery.generation, 0, 0, 2_000_000_000);
+  const planned = await db.dialogScanState.findFirst({
+    where: {
+      agencyId,
+      creatorId,
+      dialogId: { not: "__dialog_discovery__" },
+      generation,
+      status: "PLANNED",
+    },
+    orderBy: [{ updatedAt: "asc" }, { dialogId: "asc" }],
+  });
+  if (!planned) return { ok: true, recovered: false, reason: "history_plan_drained" };
+
+  const discoveryJob = latestDiscovery.jobId
+    ? await db.jobInstance.findUnique({ where: { id: latestDiscovery.jobId } })
+    : null;
+  const params = object(discoveryJob?.params);
+  const childMode = clean(params.childMode, 40) || clean(planned.scanMode, 40) || "initial";
+  const next = await scheduleNextPlannedDialogTx(db, {
+    agencyId,
+    creatorId,
+    generation,
+    childMode,
+    source: clean(input.source, 80) || "automatic_dialog_history_recovery",
+    priority: integer(input.priority, childMode === "initial" ? 60 : 50, 0, 200),
+    overlapPages: integer(params.overlapPages, 2, 0, 10),
+    knownMessageThreshold: integer(params.knownMessageThreshold, 3, 1, 100),
+    maxPages: integer(params.maxPages, childMode === "initial" ? 5000 : 1000, 1, 10000),
+  });
+  return {
+    ok: true,
+    recovered: next.created === true || next.resumed === true,
+    reason: next.reason || "history_progress_checked",
+    runId: next.run?.id || null,
+    jobId: next.job?.id || null,
+    dialogId: next.run?.dialogId || planned.dialogId,
+  };
+}
+
+async function autoRecoverDialogHistory(input) {
+  return prisma.$transaction((tx) => autoRecoverDialogHistoryTx(tx, input));
+}
+
 function normalizedMessage(input, job) {
   const raw = object(input);
   const messageId = clean(raw.messageId ?? raw.id, 240);
@@ -1110,13 +1173,17 @@ async function scheduleNextPlannedDialogTx(db, input) {
       where: { id: active.id },
       data: { status: "FAILED", completedAt: new Date(), lastError: orphanReason },
     });
+    // The dead execution attempt is terminal for audit purposes, but the dialog
+    // itself is not a failed scan. Put it back into the frozen plan so it is
+    // retried by a fresh JobInstance and the final Never Used projection can
+    // still become authoritative without a manual full rebuild.
     await db.dialogScanState.updateMany({
       where: { creatorId, dialogId: active.dialogId },
       data: {
-        status: "FAILED",
+        status: "PLANNED",
         activeRunId: null,
         activeJobId: null,
-        lastError: orphanReason,
+        lastError: null,
       },
     });
   }
@@ -1831,6 +1898,8 @@ module.exports = {
   nextCreatorDialogPlanGenerationTx,
   autoRecoverDialogDiscovery,
   autoRecoverDialogDiscoveryTx,
+  autoRecoverDialogHistory,
+  autoRecoverDialogHistoryTx,
   repairRegressedDialogDiscoveryTx,
   applyDialogIntelligenceChunk,
   applyPurchaseSignalsChunk,
