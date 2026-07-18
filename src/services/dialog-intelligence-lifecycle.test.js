@@ -276,7 +276,7 @@ test("legacy cursor-stalled discovery is automatically resumed from its durable 
 });
 
 
-test("status polling materializes the first planned history job after discovery froze the list", async () => {
+test("status polling exposes the frozen plan to batch CRM workers without creating a per-dialog job", async () => {
   const discovery = {
     id: "discovery-complete",
     jobId: "discovery-job",
@@ -308,9 +308,10 @@ test("status polling materializes the first planned history job after discovery 
     source: "status_poll",
   });
 
-  assert.equal(result.recovered, true);
-  assert.equal(db.calls.jobsCreated.length, 1);
-  assert.equal(db.calls.jobsCreated[0].params.dialogId, "fan-1012608174");
-  assert.equal(db.calls.jobsCreated[0].params.mode, "initial");
-  assert.equal(db.calls.jobsCreated[0].params.generation, 12);
+  assert.equal(result.recovered, false);
+  assert.equal(result.reason, "history_batch_ready");
+  assert.equal(result.dialogId, "fan-1012608174");
+  assert.equal(result.generation, 12);
+  assert.equal(db.calls.jobsCreated.length, 0);
+  assert.equal(db.calls.runsCreated.length, 0);
 });

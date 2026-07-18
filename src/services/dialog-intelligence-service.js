@@ -857,11 +857,11 @@ async function autoRecoverDialogDiscovery(input) {
 }
 
 /**
- * Discovery and history are intentionally separated: discovery freezes a
- * PLANNED list, then exactly one history job is materialized at a time. A
- * failed completion side effect or an old orphaned run could leave thousands
- * of PLANNED rows with no live JobInstance. Status polling must repair that
- * durable plan automatically instead of rendering RECOVERY REQUIRED forever.
+ * Discovery freezes a durable PLANNED list. Desktop claims that list in
+ * batches and feeds every dialog id to the existing local CRM scanner. Status
+ * polling must never materialize a per-dialog JobInstance. It only removes
+ * legacy attempts left by older builds so they cannot keep rows RUNNING and
+ * block the batch claimant forever.
  */
 async function autoRecoverDialogHistoryTx(db, input) {
   const agencyId = clean(input.agencyId, 160);
@@ -877,41 +877,94 @@ async function autoRecoverDialogHistoryTx(db, input) {
   }
 
   const generation = integer(latestDiscovery.generation, 0, 0, 2_000_000_000);
+  let cleanedLegacyRuns = 0;
+
+  // Older releases created one JobInstance per dialog. Cancel every remaining
+  // attempt from the current frozen generation and return its dialog to
+  // PLANNED. The synthetic batch run is deliberately excluded.
+  for (let guard = 0; guard < 1_000; guard += 1) {
+    const legacyRun = await db.dialogScanRun.findFirst({
+      where: {
+        agencyId,
+        creatorId,
+        dialogId: { notIn: ["__dialog_discovery__", "__dialog_history_batch__"] },
+        generation,
+        status: { in: ACTIVE_RUN_STATUSES },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+    if (!legacyRun || legacyRun.dialogId === "__dialog_history_batch__") break;
+
+    const legacyJob = legacyRun.jobId
+      ? await db.jobInstance.findUnique({ where: { id: legacyRun.jobId } })
+      : null;
+    if (legacyJob && ["SCHEDULED", "CLAIMED"].includes(clean(legacyJob.status, 40).toUpperCase())) {
+      const jobData = {
+        status: "CANCELLED",
+        completedAt: new Date(),
+        leaseUntil: null,
+        claimedAt: null,
+        claimedByDeviceId: null,
+        leaseTokenHash: null,
+        workId: null,
+        lastError: "LEGACY_PER_DIALOG_JOB_REPLACED_BY_BATCH",
+      };
+      if (typeof db.jobInstance.updateMany === "function") {
+        await db.jobInstance.updateMany({ where: { id: legacyJob.id }, data: jobData });
+      } else if (typeof db.jobInstance.update === "function") {
+        await db.jobInstance.update({ where: { id: legacyJob.id }, data: jobData });
+      }
+    }
+
+    await db.dialogScanRun.update({
+      where: { id: legacyRun.id },
+      data: {
+        status: "FAILED",
+        completedAt: new Date(),
+        lastError: "LEGACY_PER_DIALOG_RUN_REPLANNED_FOR_BATCH",
+      },
+    });
+    await db.dialogScanState.updateMany({
+      where: { agencyId, creatorId, dialogId: legacyRun.dialogId },
+      data: {
+        status: "PLANNED",
+        activeRunId: null,
+        activeJobId: null,
+        lastError: null,
+      },
+    });
+    cleanedLegacyRuns += 1;
+  }
+
   const planned = await db.dialogScanState.findFirst({
     where: {
       agencyId,
       creatorId,
-      dialogId: { not: "__dialog_discovery__" },
+      dialogId: { notIn: ["__dialog_discovery__", "__dialog_history_batch__"] },
       generation,
       status: "PLANNED",
     },
     orderBy: [{ updatedAt: "asc" }, { dialogId: "asc" }],
   });
-  if (!planned) return { ok: true, recovered: false, reason: "history_plan_drained" };
+  if (!planned) {
+    return {
+      ok: true,
+      recovered: cleanedLegacyRuns > 0,
+      reason: "history_plan_drained",
+      cleanedLegacyRuns,
+      generation,
+    };
+  }
 
-  const discoveryJob = latestDiscovery.jobId
-    ? await db.jobInstance.findUnique({ where: { id: latestDiscovery.jobId } })
-    : null;
-  const params = object(discoveryJob?.params);
-  const childMode = clean(params.childMode, 40) || clean(planned.scanMode, 40) || "initial";
-  const next = await scheduleNextPlannedDialogTx(db, {
-    agencyId,
-    creatorId,
-    generation,
-    childMode,
-    source: clean(input.source, 80) || "automatic_dialog_history_recovery",
-    priority: integer(input.priority, childMode === "initial" ? 60 : 50, 0, 200),
-    overlapPages: integer(params.overlapPages, 2, 0, 10),
-    knownMessageThreshold: integer(params.knownMessageThreshold, 3, 1, 100),
-    maxPages: integer(params.maxPages, childMode === "initial" ? 5000 : 1000, 1, 10000),
-  });
   return {
     ok: true,
-    recovered: next.created === true || next.resumed === true,
-    reason: next.reason || "history_progress_checked",
-    runId: next.run?.id || null,
-    jobId: next.job?.id || null,
-    dialogId: next.run?.dialogId || planned.dialogId,
+    recovered: cleanedLegacyRuns > 0,
+    reason: "history_batch_ready",
+    runId: null,
+    jobId: null,
+    dialogId: planned.dialogId,
+    generation,
+    cleanedLegacyRuns,
   };
 }
 
@@ -1780,32 +1833,12 @@ async function completeDialogIntelligenceJob({ db = prisma, job, deviceId, resul
     },
   });
 
-  let next = null;
-  if (run.mode === "discovery") {
-    next = await scheduleNextPlannedDialogTx(db, {
-      agencyId: job.agencyId,
-      creatorId: job.creatorId,
-      generation: integer(params.generation ?? run.generation, run.generation || 0),
-      childMode: clean(params.childMode, 40) || "initial",
-      source: clean(params.source, 80) || "dialog_discovery_complete",
-      priority: integer(params.childPriority, clean(params.childMode, 40) === "initial" ? 60 : 50, 0, 200),
-      overlapPages: integer(params.overlapPages, 2, 0, 10),
-      knownMessageThreshold: integer(params.knownMessageThreshold, 3, 1, 100),
-      maxPages: integer(params.maxPages, clean(params.childMode, 40) === "initial" ? 5000 : 1000, 1, 10000),
-    });
-  } else if (["initial", "incremental"].includes(run.mode)) {
-    next = await scheduleNextPlannedDialogTx(db, {
-      agencyId: job.agencyId,
-      creatorId: job.creatorId,
-      generation: run.generation,
-      childMode: run.mode,
-      source: "dialog_history_sequence",
-      priority: run.mode === "initial" ? 60 : 50,
-      overlapPages: integer(params.overlapPages, 2, 0, 10),
-      knownMessageThreshold: integer(params.knownMessageThreshold, 3, 1, 100),
-      maxPages: integer(params.maxPages, run.mode === "initial" ? 5000 : 1000, 1, 10000),
-    });
-  }
+  // Discovery freezes PLANNED rows. Desktop claims those rows in batches and
+  // runs the existing local CRM scanner. Completing one run must never spawn a
+  // second per-dialog worker or serialize the plan through Render.
+  const next = run.mode === "discovery"
+    ? { created: false, reason: "history_batch_ready" }
+    : null;
 
   return {
     type: "dialog_intelligence",
@@ -1833,19 +1866,8 @@ async function recordDialogIntelligenceFailure({ job, error, terminal }) {
       where: { creatorId: job.creatorId, dialogId },
       data: { status, lastError: clean(error, 2000), activeRunId: terminal ? null : undefined, activeJobId: terminal ? null : undefined },
     });
-    if (terminal && run && dialogId !== "__dialog_discovery__" && ["initial", "incremental"].includes(run.mode)) {
-      next = await scheduleNextPlannedDialogTx(tx, {
-        agencyId: job.agencyId,
-        creatorId: job.creatorId,
-        generation: run.generation,
-        childMode: run.mode,
-        source: "dialog_history_after_failure",
-        priority: run.mode === "initial" ? 60 : 50,
-        overlapPages: integer(params.overlapPages, 2, 0, 10),
-        knownMessageThreshold: integer(params.knownMessageThreshold, 3, 1, 100),
-        maxPages: integer(params.maxPages, run.mode === "initial" ? 5000 : 1000, 1, 10000),
-      });
-    }
+    // Failed legacy per-dialog runs are terminal audit rows only. The dialog
+    // plan is reclaimed by the batch coordinator; do not spawn another job.
   });
   return {
     runId,

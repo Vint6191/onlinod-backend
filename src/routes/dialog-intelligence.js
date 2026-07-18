@@ -16,6 +16,14 @@ const {
   moduleControl,
 } = require("../services/dialog-intelligence-service");
 
+const {
+  DIALOG_HISTORY_BATCH_DIALOG_ID,
+  claimDialogHistoryBatch,
+  renewDialogHistoryBatch,
+  completeDialogHistoryBatch,
+  releaseDialogHistoryBatch,
+} = require("../services/dialog-history-batch-service");
+
 const router = express.Router();
 router.param("creatorId", automationCreatorParamRequired());
 
@@ -105,56 +113,74 @@ async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
 
 async function resumeCreatorRuns({ agencyId, creatorId }) {
   return prisma.$transaction(async (tx) => {
-    const runs = await tx.dialogScanRun.findMany({
+    const pausedRuns = await tx.dialogScanRun.findMany({
       where: { agencyId, creatorId, status: "PAUSED" },
       orderBy: [{ generation: "desc" }, { updatedAt: "asc" }],
       take: 1000,
     });
-    if (!runs.length) return { resumed: 0, normalized: 0, items: [] };
+    if (!pausedRuns.length) return { resumed: 0, normalized: 0, items: [] };
 
-    // A creator pipeline is strictly sequential. Legacy builds could pause
-    // several discovery/history runs at once and then resume every one of
-    // them, recreating the exact parallel queue this pipeline is meant to
-    // eliminate. Resume one authoritative run and turn the remaining paused
-    // history rows back into plan entries.
-    const latestDiscovery = await tx.dialogScanRun.findFirst({
-      where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
-      orderBy: [{ generation: "desc" }, { createdAt: "desc" }],
-      select: { id: true, generation: true, status: true },
-    });
-    const latestDiscoveryStatus = clean(latestDiscovery?.status, 40).toUpperCase();
-    let selectedGeneration = latestDiscovery?.generation ?? runs[0]?.generation ?? 0;
-    let selected = latestDiscoveryStatus === "PAUSED"
-      ? runs.find((run) => run.id === latestDiscovery.id) || null
-      : null;
-
-    // If the authoritative discovery is already live, stale paused rows must
-    // be cleaned up but no second job may be started beside it.
-    const discoveryAlreadyLive = ["QUEUED", "RUNNING"].includes(latestDiscoveryStatus);
-    if (!selected && !discoveryAlreadyLive) {
-      selected = runs.find((run) => run.dialogId !== "__dialog_discovery__" && run.generation === selectedGeneration)
-        || (!latestDiscovery
-          ? runs
-            .filter((run) => run.dialogId === "__dialog_discovery__")
-            .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))[0]
-          : null)
-        || runs.find((run) => run.dialogId !== "__dialog_discovery__")
-        || null;
-      selectedGeneration = selected?.generation ?? selectedGeneration;
-    }
-
-    const extraRuns = selected ? runs.filter((run) => run.id !== selected.id) : runs;
     const now = new Date();
-    for (const run of extraRuns) {
+    const pausedDiscoveryRuns = pausedRuns
+      .filter((run) => run.dialogId === "__dialog_discovery__")
+      .sort((a, b) => {
+        const generationDelta = Number(b.generation || 0) - Number(a.generation || 0);
+        if (generationDelta !== 0) return generationDelta;
+        return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+      });
+    const selectedDiscovery = pausedDiscoveryRuns[0] || null;
+    const historyRuns = pausedRuns.filter((run) => run.dialogId !== "__dialog_discovery__");
+
+    // History is never resumed as a per-dialog JobInstance. Return every paused
+    // legacy or synthetic batch claim to the frozen PLANNED list. A ready
+    // Desktop will claim a fresh compact batch and feed it to the existing CRM
+    // scanner without a server round-trip between dialogs.
+    for (const run of historyRuns) {
       if (run.jobId) {
         await tx.jobInstance.updateMany({
           where: { id: run.jobId, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
           data: {
             status: "CANCELLED",
             completedAt: now,
-            lastError: null,
-            result: { control: { kind: "normalized", reason: "sequential dialog plan recovery", at: now.toISOString() } },
+            lastError: "Legacy per-dialog history run returned to batch plan",
+            result: { control: { kind: "normalized", reason: "dialog history resumes by batch claim", at: now.toISOString() } },
             claimedByDeviceId: null,
+            claimedAt: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+            workId: null,
+            leaseRevision: { increment: 1 },
+          },
+        });
+      }
+      await tx.dialogScanState.updateMany({
+        where: { agencyId, creatorId, activeRunId: run.id },
+        data: { status: "PLANNED", activeRunId: null, activeJobId: null, lastError: null },
+      });
+      await tx.dialogScanRun.update({
+        where: { id: run.id },
+        data: {
+          status: "CANCELLED",
+          pausedAt: null,
+          completedAt: now,
+          lastError: "Paused dialog history returned to batch plan",
+        },
+      });
+    }
+
+    // Only discovery still owns a normal durable JobInstance because it must
+    // enumerate/freeze the dialog list before batches can be claimed.
+    for (const staleDiscovery of pausedDiscoveryRuns.slice(1)) {
+      if (staleDiscovery.jobId) {
+        await tx.jobInstance.updateMany({
+          where: { id: staleDiscovery.jobId, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
+          data: {
+            status: "CANCELLED",
+            completedAt: now,
+            lastError: null,
+            result: { control: { kind: "normalized", reason: "newer discovery run selected", at: now.toISOString() } },
+            claimedByDeviceId: null,
+            claimedAt: null,
             leaseUntil: null,
             leaseTokenHash: null,
             workId: null,
@@ -163,40 +189,33 @@ async function resumeCreatorRuns({ agencyId, creatorId }) {
         });
       }
       await tx.dialogScanRun.update({
-        where: { id: run.id },
-        data: { status: "CANCELLED", completedAt: now, pausedAt: null, lastError: null },
-      });
-      await tx.dialogScanState.updateMany({
-        where: { agencyId, creatorId, activeRunId: run.id },
-        data: {
-          status: run.dialogId !== "__dialog_discovery__" && run.generation === selectedGeneration ? "PLANNED" : "IDLE",
-          activeRunId: null,
-          activeJobId: null,
-          lastError: null,
-        },
+        where: { id: staleDiscovery.id },
+        data: { status: "CANCELLED", pausedAt: null, completedAt: now, lastError: null },
       });
     }
 
-    if (!selected) {
-      return { resumed: 0, normalized: extraRuns.length, items: [] };
+    if (!selectedDiscovery) {
+      return { resumed: 0, normalized: historyRuns.length, items: [] };
     }
 
-    const oldJob = selected.jobId ? await tx.jobInstance.findUnique({ where: { id: selected.jobId } }) : null;
+    const oldJob = selectedDiscovery.jobId
+      ? await tx.jobInstance.findUnique({ where: { id: selectedDiscovery.jobId } })
+      : null;
     const job = await tx.jobInstance.create({
       data: {
         jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
         scope: "creator",
-        creatorId: selected.creatorId,
-        agencyId: selected.agencyId,
-        idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${selected.id}:${Date.now()}`,
+        creatorId: selectedDiscovery.creatorId,
+        agencyId: selectedDiscovery.agencyId,
+        idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${selectedDiscovery.id}:${Date.now()}`,
         params: {
           ...((oldJob?.params && typeof oldJob.params === "object") ? oldJob.params : {}),
-          scanRunId: selected.id,
-          dialogId: selected.dialogId,
-          mode: selected.mode,
+          scanRunId: selectedDiscovery.id,
+          dialogId: "__dialog_discovery__",
+          mode: "discovery",
         },
-        continuation: oldJob?.continuation || selected.continuation || null,
-        progress: oldJob?.progress || selected.progress || null,
+        continuation: oldJob?.continuation || selectedDiscovery.continuation || null,
+        progress: oldJob?.progress || selectedDiscovery.progress || null,
         status: "SCHEDULED",
         priority: oldJob?.priority || 70,
         scheduledAt: now,
@@ -204,19 +223,24 @@ async function resumeCreatorRuns({ agencyId, creatorId }) {
       },
     });
     await tx.dialogScanRun.update({
-      where: { id: selected.id },
+      where: { id: selectedDiscovery.id },
       data: { status: "QUEUED", jobId: job.id, pausedAt: null, completedAt: null, lastError: null },
     });
     await tx.dialogScanState.updateMany({
-      where: { agencyId, creatorId, dialogId: selected.dialogId },
-      data: { status: "QUEUED", activeJobId: job.id, activeRunId: selected.id, lastError: null },
+      where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+      data: { status: "QUEUED", activeJobId: job.id, activeRunId: selectedDiscovery.id, lastError: null },
     });
     return {
       resumed: 1,
-      normalized: extraRuns.length,
-      items: [{ runId: selected.id, jobId: job.id, dialogId: selected.dialogId, generation: selected.generation }],
+      normalized: historyRuns.length + Math.max(0, pausedDiscoveryRuns.length - 1),
+      items: [{
+        runId: selectedDiscovery.id,
+        jobId: job.id,
+        dialogId: "__dialog_discovery__",
+        generation: selectedDiscovery.generation,
+      }],
     };
-  });
+  }, DIALOG_CONTROL_TRANSACTION_OPTIONS);
 }
 
 router.post("/creators/:creatorId/scans", async (req, res) => {
@@ -426,6 +450,97 @@ router.post("/creators/:creatorId/ingest/ws", async (req, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "DIALOG_WS_INGEST_FAILED");
+  }
+});
+
+
+const dialogBatchClaimSchema = z.object({
+  deviceId: z.string().min(1).max(200),
+  creatorIds: z.array(z.string().min(1).max(160)).min(1).max(1000),
+  batchSize: z.number().int().min(1).max(100).optional(),
+  leaseMs: z.number().int().min(60_000).max(30 * 60_000).optional(),
+});
+const dialogBatchLeaseSchema = z.object({
+  deviceId: z.string().min(1).max(200),
+  leaseToken: z.string().min(16).max(500),
+  leaseMs: z.number().int().min(60_000).max(30 * 60_000).optional(),
+});
+const dialogBatchCompleteSchema = dialogBatchLeaseSchema.extend({
+  results: z.array(z.object({
+    dialogId: z.string().min(1).max(180),
+    ok: z.boolean(),
+    retryable: z.boolean().optional(),
+    pages: z.number().int().min(0).max(100000).optional(),
+    messages: z.number().int().min(0).max(100000000).optional(),
+    inserted: z.number().int().min(0).max(100000000).optional(),
+    updated: z.number().int().min(0).max(100000000).optional(),
+    error: z.string().max(2000).optional().nullable(),
+    reusedLocal: z.boolean().optional(),
+  })).min(1).max(100),
+});
+const dialogBatchReleaseSchema = dialogBatchLeaseSchema.extend({
+  reason: z.string().max(2000).optional(),
+});
+
+router.post("/batches/claim", async (req, res) => {
+  try {
+    const input = dialogBatchClaimSchema.parse(req.body || {});
+    const result = await claimDialogHistoryBatch({
+      agencyId: req.auth.agencyId,
+      deviceId: input.deviceId,
+      creatorIds: input.creatorIds,
+      batchSize: input.batchSize,
+      leaseMs: input.leaseMs,
+    });
+    return res.status(result.batch ? 202 : 200).json(result);
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "DIALOG_BATCH_CLAIM_FAILED");
+  }
+});
+
+router.post("/batches/:batchId/renew", async (req, res) => {
+  try {
+    const input = dialogBatchLeaseSchema.parse(req.body || {});
+    const result = await renewDialogHistoryBatch({
+      agencyId: req.auth.agencyId,
+      batchId: req.params.batchId,
+      ...input,
+    });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "DIALOG_BATCH_RENEW_FAILED");
+  }
+});
+
+router.post("/batches/:batchId/complete", async (req, res) => {
+  try {
+    const input = dialogBatchCompleteSchema.parse(req.body || {});
+    const result = await completeDialogHistoryBatch({
+      agencyId: req.auth.agencyId,
+      batchId: req.params.batchId,
+      ...input,
+    });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "DIALOG_BATCH_COMPLETE_FAILED");
+  }
+});
+
+router.post("/batches/:batchId/release", async (req, res) => {
+  try {
+    const input = dialogBatchReleaseSchema.parse(req.body || {});
+    const result = await releaseDialogHistoryBatch({
+      agencyId: req.auth.agencyId,
+      batchId: req.params.batchId,
+      ...input,
+    });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "DIALOG_BATCH_RELEASE_FAILED");
   }
 });
 

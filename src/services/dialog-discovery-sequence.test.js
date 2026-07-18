@@ -11,6 +11,7 @@ const {
   applyDialogIntelligenceChunk,
   completeDialogIntelligenceJob,
   recordDialogIntelligenceFailure,
+  autoRecoverDialogHistoryTx,
 } = require("./dialog-intelligence-service");
 
 function createDb() {
@@ -29,6 +30,7 @@ function createDb() {
     if (where.creatorId && run.creatorId !== where.creatorId) return false;
     if (typeof where.dialogId === "string" && run.dialogId !== where.dialogId) return false;
     if (where.dialogId?.not && run.dialogId === where.dialogId.not) return false;
+    if (where.dialogId?.notIn && where.dialogId.notIn.includes(run.dialogId)) return false;
     if (where.generation !== undefined && run.generation !== where.generation) return false;
     if (where.status?.in && !where.status.in.includes(run.status)) return false;
     return true;
@@ -160,9 +162,13 @@ function createDb() {
       updateMany: async ({ where, data }) => {
         let count = 0;
         for (const row of states.values()) {
+          if (where.agencyId && row.agencyId !== where.agencyId) continue;
           if (where.creatorId && row.creatorId !== where.creatorId) continue;
           if (typeof where.dialogId === "string" && row.dialogId !== where.dialogId) continue;
           if (where.dialogId?.in && !where.dialogId.in.includes(row.dialogId)) continue;
+          if (where.dialogId?.notIn && where.dialogId.notIn.includes(row.dialogId)) continue;
+          if (where.status && row.status !== where.status) continue;
+          if (where.activeRunId && row.activeRunId !== where.activeRunId) continue;
           applyData(row, data);
           count += 1;
         }
@@ -180,6 +186,12 @@ function createDb() {
         const row = jobs.get(where.id);
         if (!row) throw new Error(`job ${where.id} missing`);
         return applyData(row, data);
+      },
+      updateMany: async ({ where, data }) => {
+        const row = jobs.get(where.id);
+        if (!row) return { count: 0 };
+        applyData(row, data);
+        return { count: 1 };
       },
     },
     $transaction: async (fn) => fn(api),
@@ -292,7 +304,7 @@ test("an asynchronous 100-dialog discovery batch advances durable page counters 
   assert.equal(db._runs.get("discovery-run").pagesProcessed, 10);
 });
 
-test("hasMore=false freezes the full list and starts exactly one history dialog", async () => {
+test("hasMore=false freezes the full list for batch CRM claims without creating history jobs", async () => {
   resetDb();
   const { job } = seedDiscovery();
   for (const dialogId of ["dialog-a", "dialog-b", "dialog-c"]) {
@@ -318,65 +330,56 @@ test("hasMore=false freezes the full list and starts exactly one history dialog"
     deviceId: "device-1",
     result: { pages: 4, dialogsFound: 3, hasMore: false },
   });
-  assert.equal(completion.next.created, true);
+  assert.equal(completion.next.created, false);
+  assert.equal(completion.next.reason, "history_batch_ready");
   const historyRuns = [...db._runs.values()].filter((run) => run.dialogId !== "__dialog_discovery__");
-  assert.equal(historyRuns.length, 1);
-  assert.equal(historyRuns[0].dialogId, "dialog-a");
-  assert.equal([...db._jobs.values()].filter((row) => row.id !== "discovery-job").length, 1);
-
-  const firstJob = [...db._jobs.values()].find((row) => row.id !== "discovery-job");
-  const firstRun = historyRuns[0];
-  const next = await completeDialogIntelligenceJob({
-    db,
-    job: { ...firstJob, agencyId: "agency-1", creatorId: "creator-1" },
-    deviceId: "device-1",
-    result: { pages: 2, scanNewestMessageId: "m-9", scanNewestMessageAt: new Date().toISOString() },
-  });
-  assert.equal(next.next.created, true);
-  const after = [...db._runs.values()].filter((run) => run.dialogId !== "__dialog_discovery__");
-  assert.equal(after.length, 2);
-  assert.deepEqual(after.map((run) => run.dialogId), ["dialog-a", "dialog-b"]);
-  assert.equal(after.filter((run) => ["QUEUED", "RUNNING", "PAUSED"].includes(run.status)).length, 1);
+  assert.equal(historyRuns.length, 0);
+  assert.equal([...db._jobs.values()].filter((row) => row.id !== "discovery-job").length, 0);
+  assert.deepEqual(
+    [...db._states.values()].filter((row) => row.dialogId !== "__dialog_discovery__").map((row) => row.status),
+    ["PLANNED", "PLANNED", "PLANNED"],
+  );
 });
 
-test("a terminal failure marks one dialog failed and immediately advances to the next", async () => {
+test("a terminal legacy dialog failure never spawns another per-dialog worker", async () => {
   resetDb();
-  seedDiscovery();
-  for (const dialogId of ["dialog-a", "dialog-b"]) {
-    db._states.set(`creator-1:${dialogId}`, {
-      agencyId: "agency-1",
-      creatorId: "creator-1",
-      dialogId,
-      fanId: null,
-      generation: 77,
-      status: "PLANNED",
-      scanMode: "initial",
-      initialScanComplete: false,
-      pagesProcessed: 0,
-      messagesProcessed: 0,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    });
-  }
-  // Create the first history run through discovery completion.
-  await completeDialogIntelligenceJob({
-    db,
-    job: db._jobs.get("discovery-job"),
-    deviceId: "device-1",
-    result: { hasMore: false },
+  const { job } = seedDiscovery();
+  db._runs.set("legacy-run", {
+    id: "legacy-run",
+    jobId: "legacy-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-a",
+    mode: "initial",
+    status: "RUNNING",
+    generation: 77,
+    createdAt: new Date(),
+    updatedAt: new Date(),
   });
-  const first = [...db._runs.values()].find((run) => run.dialogId === "dialog-a");
-  const firstJob = db._jobs.get(first.jobId);
+  db._jobs.set("legacy-job", {
+    id: "legacy-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    status: "CLAIMED",
+    params: { scanRunId: "legacy-run", dialogId: "dialog-a" },
+  });
+  db._states.set("creator-1:dialog-a", {
+    agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-a",
+    generation: 77, status: "RUNNING", scanMode: "initial", initialScanComplete: false,
+    activeRunId: "legacy-run", activeJobId: "legacy-job", pagesProcessed: 0, messagesProcessed: 0,
+    createdAt: new Date(), updatedAt: new Date(),
+  });
+  const beforeJobs = db._jobs.size;
   const failure = await recordDialogIntelligenceFailure({
-    job: { ...firstJob, agencyId: "agency-1", creatorId: "creator-1" },
+    job: { ...db._jobs.get("legacy-job"), agencyId: "agency-1", creatorId: "creator-1" },
     error: "HTTP 422 invalid dialog",
     terminal: true,
   });
   assert.equal(db._states.get("creator-1:dialog-a").status, "FAILED");
-  assert.equal(failure.next.created, true);
-  assert.equal([...db._runs.values()].some((run) => run.dialogId === "dialog-b" && run.status === "QUEUED"), true);
+  assert.equal(failure.next, null);
+  assert.equal(db._jobs.size, beforeJobs);
+  assert.equal(job.id, "discovery-job");
 });
-
 
 test("explicit full discovery replans completed dialogs and resets current-plan counters", async () => {
   resetDb();
@@ -429,9 +432,10 @@ test("explicit full discovery replans completed dialogs and resets current-plan 
   assert.equal(state.backwardCursor, null);
 });
 
-test("an orphaned active history attempt is re-planned and cannot block the frozen dialog list", async () => {
+test("status recovery retires an orphaned legacy attempt and leaves the dialog claimable by a batch", async () => {
   resetDb();
-  const { job } = seedDiscovery(99);
+  seedDiscovery(99);
+  db._runs.get("discovery-run").status = "COMPLETED";
   db._runs.set("orphan-run", {
     id: "orphan-run",
     jobId: "missing-job",
@@ -473,15 +477,17 @@ test("an orphaned active history attempt is re-planned and cannot block the froz
     updatedAt: new Date(1),
   });
 
-  const completion = await completeDialogIntelligenceJob({
-    db,
-    job,
-    deviceId: "device-1",
-    result: { pages: 1, dialogsFound: 2, hasMore: false },
+  const recovery = await autoRecoverDialogHistoryTx(db, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    source: "status_poll",
   });
 
   assert.equal(db._runs.get("orphan-run").status, "FAILED");
-  assert.notEqual(db._states.get("creator-1:dialog-a").status, "FAILED");
-  assert.equal(completion.next.created, true);
-  assert.ok(["dialog-a", "dialog-b"].includes([...db._runs.values()].find((run) => run.id === completion.next.runId)?.dialogId));
+  assert.equal(db._states.get("creator-1:dialog-a").status, "PLANNED");
+  assert.equal(db._states.get("creator-1:dialog-a").activeRunId, null);
+  assert.equal(recovery.recovered, true);
+  assert.equal(recovery.reason, "history_batch_ready");
+  assert.equal(recovery.cleanedLegacyRuns, 1);
+  assert.equal([...db._jobs.values()].filter((row) => row.id !== "discovery-job").length, 0);
 });

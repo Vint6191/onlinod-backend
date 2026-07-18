@@ -8,6 +8,7 @@ const {
   autoRecoverDialogHistoryTx,
   repairRegressedDialogDiscoveryTx,
 } = require("./dialog-intelligence-service");
+const { DIALOG_HISTORY_BATCH_DIALOG_ID } = require("./dialog-history-batch-service");
 
 const PROJECTION_CHUNK_SIZE = 5000;
 const LIST_SCAN_CHUNK_SIZE = 500;
@@ -139,10 +140,12 @@ async function dialogPipelineState(db, agencyId, creatorId) {
         mode: true,
         status: true,
         generation: true,
+        continuation: true,
         progress: true,
         pagesProcessed: true,
         messagesProcessed: true,
         lastError: true,
+        lastWorkerDeviceId: true,
         createdAt: true,
         updatedAt: true,
       },
@@ -282,6 +285,16 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   const activePlanRuns = activeRuns.filter(
     (run) => planGeneration <= 0 || number(run.generation, -1) === planGeneration,
   );
+  const activeBatchRuns = activePlanRuns.filter((run) => (
+    run.dialogId === DIALOG_HISTORY_BATCH_DIALOG_ID
+      && ["QUEUED", "RUNNING"].includes(jobStatus(run.status))
+  ));
+  const currentBatchRun = activeBatchRuns[0] || null;
+  const currentBatchContinuation = object(currentBatchRun?.continuation);
+  const currentBatchProgress = object(currentBatchRun?.progress);
+  const currentBatchDialogs = Array.isArray(currentBatchContinuation.dialogs)
+    ? currentBatchContinuation.dialogs
+    : [];
   const waitKindOf = (job) => clean(object(job?.progress).waitKind, 80).toLowerCase();
   const waitingContextJobs = historyActiveJobs.filter(
     (job) => job.status === "SCHEDULED" && waitKindOf(job) === "creator_context",
@@ -373,9 +386,10 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   } : null;
   const lastError = discoveryError?.detail
     || currentError?.detail
-    || (historyActiveJobs.length ? null : failedState?.lastError)
+    || ((historyActiveJobs.length || activeBatchRuns.length) ? null : failedState?.lastError)
     || null;
   const lastUpdatedAt = mostRecent([
+    currentBatchRun?.updatedAt,
     discoveryJob?.lastProgressAt,
     discoveryJob?.updatedAt,
     latestInitialDiscoveryRun?.updatedAt,
@@ -389,16 +403,16 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   return {
     discovered,
     initialComplete,
-    active: historyActiveJobs.length + (discoveryActive ? 1 : 0) + pausedCount,
+    active: historyActiveJobs.length + activeBatchRuns.length + (discoveryActive ? 1 : 0) + pausedCount,
     paused: pausedCount > 0 || discoveryPaused,
     failed,
     pending,
     pagesCommitted,
     messagesCommitted,
     discoveryCompleted,
-    activeJobStatus: currentJob?.status || discoveryStatus || null,
-    claimedByDeviceId: currentJob?.claimedByDeviceId || discoveryJob?.claimedByDeviceId || null,
-    leaseUntil: iso(currentJob?.leaseUntil || discoveryJob?.leaseUntil),
+    activeJobStatus: currentJob?.status || (currentBatchRun ? "CLAIMED" : null) || discoveryStatus || null,
+    claimedByDeviceId: currentJob?.claimedByDeviceId || clean(currentBatchContinuation.claimedByDeviceId, 200) || discoveryJob?.claimedByDeviceId || null,
+    leaseUntil: iso(currentJob?.leaseUntil || currentBatchContinuation.leaseUntil || discoveryJob?.leaseUntil),
     nextRunAt: iso(currentJob?.nextRunAt || discoveryJob?.nextRunAt),
     retries: number(currentJob?.attempts ?? discoveryJob?.attempts),
     lastError,
@@ -408,14 +422,14 @@ async function dialogPipelineState(db, agencyId, creatorId) {
       ...successfulStateTimes,
     ]),
     discoveryActive,
-    historyActive: runningJobs.length > 0,
+    historyActive: runningJobs.length > 0 || activeBatchRuns.length > 0,
     queue: {
       total: discovered,
       completed,
       pending,
       planned,
-      queued: queuedJobs.length,
-      running: runningJobs.length,
+      queued: queuedJobs.length + activeBatchRuns.filter((run) => jobStatus(run.status) === "QUEUED").length,
+      running: runningJobs.length + activeBatchRuns.filter((run) => jobStatus(run.status) === "RUNNING").length,
       waitingContext: waitingContextJobs.length,
       retrying: retryingJobs.length,
       paused: pausedCount,
@@ -471,6 +485,30 @@ async function dialogPipelineState(db, agencyId, creatorId) {
       lastError: currentError?.detail || null,
       error: currentError,
       lastProgressAt: iso(currentJob.lastProgressAt || currentRun?.updatedAt || currentJob.updatedAt),
+    } : currentBatchRun ? {
+      dialogId: null,
+      mode: clean(currentBatchContinuation.mode, 40) || currentBatchRun.mode || "initial",
+      jobStatus: "CLAIMED",
+      runStatus: currentBatchRun.status,
+      page: 0,
+      rawMessages: 0,
+      committedMessages: 0,
+      skippedMessages: 0,
+      cursorType: null,
+      cursorIn: null,
+      cursorOut: null,
+      claimedByDeviceId: clean(currentBatchContinuation.claimedByDeviceId, 200) || currentBatchRun.lastWorkerDeviceId || null,
+      leaseUntil: iso(currentBatchContinuation.leaseUntil),
+      nextRunAt: null,
+      retries: 0,
+      waitKind: null,
+      waitReason: null,
+      lastError: currentBatchRun.lastError || null,
+      error: null,
+      batchId: currentBatchRun.id,
+      batchSize: currentBatchDialogs.length,
+      batchCompleted: number(currentBatchProgress.completed),
+      lastProgressAt: iso(currentBatchRun.updatedAt),
     } : null,
     lastFailure,
   };
