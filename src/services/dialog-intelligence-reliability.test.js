@@ -191,7 +191,7 @@ function chunkDbFixture() {
       },
     },
   };
-  return { db, targets, commits, calls, run };
+  return { db, targets, commits, calls, run, state };
 }
 
 test("durable target survives restart, resolves after commit, and duplicate replay returns saved metadata", async () => {
@@ -306,6 +306,67 @@ test("a 50-message OF page increments durable run and dialog counters by 50", as
   assert.equal(fixture.calls.messageUpserts, 0);
   assert.equal(fixture.run.pagesProcessed, 1);
   assert.equal(fixture.run.messagesProcessed, 50);
+});
+
+test("initial history batch advances durable counters once for multiple locally committed pages", async () => {
+  const prismaModule = require.resolve("../prisma");
+  require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
+  delete require.cache[require.resolve("./dialog-intelligence-service")];
+  const { applyDialogIntelligenceChunk } = require("./dialog-intelligence-service");
+  const fixture = chunkDbFixture();
+  fixture.run.pagesProcessed = 0;
+  fixture.run.messagesProcessed = 0;
+  fixture.state.pagesProcessed = 0;
+  fixture.state.messagesProcessed = 0;
+  fixture.state.mediaProcessed = 0;
+  const job = {
+    id: "job-batch", agencyId: "agency-1", creatorId: "creator-1",
+    params: { scanRunId: "run-1", dialogId: "dialog-1", mode: "initial", generation: 1 },
+    continuation: { driverPhase: "execute", jobContinuation: { mode: "initial", cursor: null, page: 0 } },
+  };
+  const result = await applyDialogIntelligenceChunk({
+    db: fixture.db,
+    job,
+    deviceId: "device-a",
+    chunkResult: {
+      kind: "dialog_message_batch",
+      runId: "run-1",
+      dialogId: "dialog-1",
+      mode: "initial",
+      chunkKey: "batch-pages-0-3",
+      page: 0,
+      pageStart: 0,
+      pageEnd: 4,
+      pagesInBatch: 4,
+      cursorIn: null,
+      cursorOut: "message-200",
+      hasMore: true,
+      messageCount: 200,
+      mediaCount: 12,
+      inserted: 180,
+      updated: 10,
+      unchanged: 10,
+      messageIds: ["message-1", "message-200"],
+      changedMessageIds: ["message-1"],
+      observations: [
+        { messageId: "message-1", createdAtOf: "2026-07-15T10:00:00.000Z", known: false, changed: true },
+        { messageId: "message-200", createdAtOf: "2026-07-14T10:00:00.000Z", known: false, changed: true },
+      ],
+      newestMessageId: "message-1",
+      oldestMessageId: "message-200",
+      continuation: { mode: "initial", cursor: "message-200", page: 4 },
+      progress: { pages: 4, messages: 200 },
+    },
+  });
+  assert.equal(result.pagesInBatch, 4);
+  assert.equal(result.messageCount, 200);
+  assert.equal(fixture.run.pagesProcessed, 4);
+  assert.equal(fixture.run.messagesProcessed, 200);
+  assert.equal(fixture.state.pagesProcessed, 4);
+  assert.equal(fixture.state.messagesProcessed, 200);
+  assert.equal(fixture.state.mediaProcessed, 12);
+  assert.equal(fixture.calls.commitCreates, 1);
+  assert.equal(fixture.calls.messageUpserts, 0);
 });
 
 test("stale worker cannot complete or mutate a reclaimed dialog run", async () => {

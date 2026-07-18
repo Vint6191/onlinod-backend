@@ -1309,7 +1309,8 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
 async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) {
   const chunk = object(chunkResult);
   if (chunk.kind === "dialog_discovery_page") return applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult });
-  if (chunk.kind !== "dialog_message_page") throw new Error("Unsupported dialog intelligence chunk");
+  const isMessageBatch = chunk.kind === "dialog_message_batch";
+  if (chunk.kind !== "dialog_message_page" && !isMessageBatch) throw new Error("Unsupported dialog intelligence chunk");
   const params = object(job.params);
   const runId = clean(chunk.runId ?? params.scanRunId, 160);
   const dialogId = clean(chunk.dialogId ?? params.dialogId, 180);
@@ -1327,12 +1328,18 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   if (!run) throw new Error("Dialog scan run not found");
   const observedAt = new Date();
 
-  // Desktop commits the complete OF page to dialog-messages.sqlite before it
-  // reports progress. The backend receives only counts, IDs and observations
+  // Desktop commits complete OF pages to dialog-messages.sqlite before it
+  // reports progress. Initial full-history scans may combine several locally
+  // durable pages into one compact checkpoint so Render/PostgreSQL is not in the
+  // hot path of every page. The backend receives only counts, IDs and observations
   // required for leases, continuation and deterministic incremental stopping.
-  const messageIds = [...new Set(list(chunk.messageIds).map((value) => clean(value, 240)).filter(Boolean))].slice(0, 500);
-  const changedMessageIds = [...new Set(list(chunk.changedMessageIds).map((value) => clean(value, 240)).filter(Boolean))].slice(0, 500);
-  const observations = list(chunk.observations).slice(0, 500).map((value) => {
+  //
+  // FUTURE SERVER MIGRATION FOUNDATION: dialog_message_batch is transport-neutral.
+  // A future server-backed message sink can consume the same page/session boundary
+  // without changing OnlyFans pagination or CRM analysis contracts.
+  const messageIds = [...new Set(list(chunk.messageIds).map((value) => clean(value, 240)).filter(Boolean))].slice(0, 2000);
+  const changedMessageIds = [...new Set(list(chunk.changedMessageIds).map((value) => clean(value, 240)).filter(Boolean))].slice(0, 2000);
+  const observations = list(chunk.observations).slice(0, 2000).map((value) => {
     const item = object(value);
     const createdAt = dateOrNull(item.createdAtOf);
     return {
@@ -1342,11 +1349,12 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
       createdAtOf: createdAt ? createdAt.toISOString() : null,
     };
   }).filter((item) => item.messageId);
-  const messageCount = integer(chunk.messageCount, messageIds.length, 0, 500);
+  const pagesInBatch = isMessageBatch ? integer(chunk.pagesInBatch, 1, 1, 100) : 1;
+  const messageCount = integer(chunk.messageCount, messageIds.length, 0, 10_000);
   const mediaCount = integer(chunk.mediaCount, 0, 0, 100_000);
-  const inserted = integer(chunk.inserted, 0, 0, 500);
-  const updated = integer(chunk.updated, 0, 0, 500);
-  const unchanged = integer(chunk.unchanged, Math.max(0, messageCount - inserted - updated), 0, 500);
+  const inserted = integer(chunk.inserted, 0, 0, 10_000);
+  const updated = integer(chunk.updated, 0, 0, 10_000);
+  const unchanged = integer(chunk.unchanged, Math.max(0, messageCount - inserted - updated), 0, 10_000);
 
   let newest = null;
   let oldest = null;
@@ -1371,10 +1379,13 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   const targetMessageId = clean(chunk.targetMessageId, 240);
 
   const mode = clean(chunk.mode ?? run.mode, 40) || "initial";
+  if (isMessageBatch && mode !== "initial") {
+    throw new Error("Dialog message batching is supported only for initial full-history scans");
+  }
   const currentContinuation = jobContinuationValue(job.continuation);
   const submittedContinuation = { ...object(chunk.continuation) };
   const isTargeted = mode === "targeted" || mode === "reconcile";
-  const page = integer(chunk.page, 0);
+  const page = integer(chunk.pageStart ?? chunk.page, 0);
   const cursorOut = clean(chunk.cursorOut, 240);
 
   if (!submittedContinuation.scanNewestMessageId && newest?.messageId) {
@@ -1466,6 +1477,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   const result = {
     messageCount,
     mediaCount,
+    pagesInBatch,
     inserted,
     updated,
     unchanged,
@@ -1473,6 +1485,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
     localOnly: true,
     hasMore,
     page,
+    pageEnd: integer(chunk.pageEnd, page + pagesInBatch, page + 1, 100_000),
     cursorOut,
     messageIds,
     changedMessageIds,
@@ -1496,7 +1509,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
       runId,
       dialogId,
       mode: run.mode,
-      pages: integer(run.pagesProcessed, 0) + 1,
+      pages: integer(run.pagesProcessed, 0) + pagesInBatch,
       stoppedReason: result.stoppedReason,
       scanNewestMessageId: clean(submittedContinuation.scanNewestMessageId, 240),
       scanNewestMessageAt: clean(submittedContinuation.scanNewestMessageAt, 80),
@@ -1528,7 +1541,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
       status: "RUNNING",
       startedAt: run.startedAt || observedAt,
       lastWorkerDeviceId: clean(deviceId, 200),
-      pagesProcessed: { increment: 1 },
+      pagesProcessed: { increment: pagesInBatch },
       messagesProcessed: { increment: messageCount },
       mediaProcessed: { increment: mediaCount },
       continuation: durableContinuation,
@@ -1540,6 +1553,8 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
         inserted,
         updated,
         unchanged,
+        pagesInBatch,
+        checkpointMode: isMessageBatch ? "history_batch" : "history_page",
       },
       lastError: null,
     },
@@ -1564,7 +1579,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
     backwardCursor: mode === "initial" ? cursorOut : null,
     activeRunId: runId,
     activeJobId: job.id,
-    pagesProcessed: 1,
+    pagesProcessed: pagesInBatch,
     messagesProcessed: messageCount,
     mediaProcessed: mediaCount,
     incrementalGapOpen: mode === "incremental",
@@ -1581,7 +1596,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
     backwardCursor: mode === "initial" ? cursorOut || undefined : undefined,
     activeRunId: runId,
     activeJobId: job.id,
-    pagesProcessed: { increment: 1 },
+    pagesProcessed: { increment: pagesInBatch },
     messagesProcessed: { increment: messageCount },
     mediaProcessed: { increment: mediaCount },
     incrementalGapOpen: mode === "incremental" ? true : undefined,
