@@ -320,7 +320,7 @@ async function scheduleDialogScanTx(db, input) {
       overlapPages: integer(input.overlapPages, 2, 1, 10),
       knownUnchangedStreak: 0,
       knownMessageThreshold: integer(input.knownMessageThreshold, 3, 1, 100),
-      maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : 1000, 1, 10000),
+      maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : active.mode === "discovery" ? 10000 : 1000, 1, 10000),
     };
     const discoveryCheckpoint = active.mode === "discovery"
       ? await durableDialogDiscoveryCheckpoint(db, {
@@ -351,12 +351,12 @@ async function scheduleDialogScanTx(db, input) {
           mode: active.mode,
           source: clean(input.source, 80) || "startup_resume",
           pageLimit: integer(input.pageLimit, 50, 1, 100),
-          discoveryBatchSize: active.mode === "discovery" ? integer(input.discoveryBatchSize ?? object(activeJob?.params).discoveryBatchSize, 300, 50, 500) : undefined,
+          discoveryBatchSize: active.mode === "discovery" ? integer(input.discoveryBatchSize ?? object(activeJob?.params).discoveryBatchSize, 100, 25, 100) : undefined,
           discoveryBatchMaxApiPages: active.mode === "discovery" ? integer(input.discoveryBatchMaxApiPages ?? object(activeJob?.params).discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
-          discoveryBatchTimeBudgetMs: active.mode === "discovery" ? integer(input.discoveryBatchTimeBudgetMs ?? object(activeJob?.params).discoveryBatchTimeBudgetMs, 120000, 15000, 150000) : undefined,
+          discoveryExecutionTimeBudgetMs: active.mode === "discovery" ? integer(input.discoveryExecutionTimeBudgetMs ?? object(activeJob?.params).discoveryExecutionTimeBudgetMs, 2700000, 60000, 3000000) : undefined,
           overlapPages: integer(input.overlapPages, 2, 0, 10),
           knownMessageThreshold: integer(input.knownMessageThreshold, 3, 1, 100),
-          maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : 1000, 1, 10000),
+          maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : active.mode === "discovery" ? 10000 : 1000, 1, 10000),
           generation: integer(input.generation, state?.generation || active.generation || 0, 0, 2_000_000_000),
           forceChildFull: input.forceChildFull === true || object(activeJob?.params).forceChildFull === true,
         },
@@ -411,7 +411,7 @@ async function scheduleDialogScanTx(db, input) {
   const initialCursor = clean(input.cursor, 240)
     || (mode === "initial" && !forceFull ? clean(state?.backwardCursor, 240) : null);
   const knownMessageThreshold = integer(input.knownMessageThreshold, 3, 1, 100);
-  const maxPages = integer(input.maxPages, mode === "initial" ? 5000 : mode === "discovery" ? 1000 : 1000, 1, 10000);
+  const maxPages = integer(input.maxPages, mode === "initial" ? 5000 : mode === "discovery" ? 10000 : 1000, 1, 10000);
   const job = await db.jobInstance.create({
     data: {
       jobKey: DIALOG_INTELLIGENCE_JOB_KEY, scope: "creator", creatorId, agencyId,
@@ -419,9 +419,9 @@ async function scheduleDialogScanTx(db, input) {
       params: {
         scanRunId: run.id, dialogId, fanId: clean(input.fanId, 160), mode,
         source: clean(input.source, 80) || "manual", pageLimit: integer(input.pageLimit, 50, 1, 100),
-        discoveryBatchSize: mode === "discovery" ? integer(input.discoveryBatchSize, 300, 50, 500) : undefined,
+        discoveryBatchSize: mode === "discovery" ? integer(input.discoveryBatchSize, 100, 25, 100) : undefined,
         discoveryBatchMaxApiPages: mode === "discovery" ? integer(input.discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
-        discoveryBatchTimeBudgetMs: mode === "discovery" ? integer(input.discoveryBatchTimeBudgetMs, 120000, 15000, 150000) : undefined,
+        discoveryExecutionTimeBudgetMs: mode === "discovery" ? integer(input.discoveryExecutionTimeBudgetMs, 2700000, 60000, 3000000) : undefined,
         targetMessageId, childMode: clean(input.childMode, 40) || null,
         forceChildFull: input.forceChildFull === true,
         childPriority: integer(input.childPriority, clean(input.childMode, 40) === "initial" ? 60 : 50, 0, 200),
@@ -1158,9 +1158,14 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const childMode = clean(chunk.childMode ?? params.childMode, 40) || "incremental";
   const forceChildFull = chunk.forceChildFull === true || params.forceChildFull === true;
   const generation = integer(params.generation ?? run.generation, run.generation || 0);
-  // Desktop now sends discovery results in batches of up to 300 dialogs. Keep
-  // the legacy per-row path only for test doubles / old Prisma adapters; real
-  // PostgreSQL uses one findMany + createMany + at most two updateMany calls.
+  // Desktop queues compact discovery results in asynchronous batches of up to
+  // 100 dialogs while its OnlyFans pagination continues without waiting for us.
+  // Keep the legacy per-row path only for test doubles / old Prisma adapters;
+  // real PostgreSQL uses one findMany + createMany + at most two updateMany calls.
+  //
+  // FUTURE SERVER MIGRATION FOUNDATION: this function deliberately accepts a
+  // transport-neutral discovery plan. Raw conversations remain local-only today;
+  // a future server scanner/storage tier can be attached behind this boundary.
   const uniqueDialogs = new Map();
   for (const raw of list(chunk.dialogs).slice(0, 500)) {
     const row = object(raw);
@@ -1270,7 +1275,7 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   }
   const pageStart = integer(chunk.pageStart ?? chunk.page, 0);
   const pageEnd = integer(chunk.pageEnd, pageStart);
-  const pagesInBatch = integer(chunk.pagesInBatch, Math.max(1, pageEnd - pageStart), 1, 500);
+  const pagesInBatch = integer(chunk.pagesInBatch, Math.max(0, pageEnd - pageStart), 0, 500);
   const page = pageEnd;
   const hasMore = chunk.hasMore === true;
   const cursorOut = clean(chunk.cursorOut, 240);

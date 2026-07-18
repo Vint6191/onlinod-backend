@@ -273,23 +273,23 @@ test("discovery pages build only a PLANNED list and never schedule history early
   assert.equal([...db._runs.values()].filter((run) => run.dialogId !== "__dialog_discovery__").length, 0);
 });
 
-test("a 300-dialog discovery batch advances durable page counters in one commit", async () => {
+test("an asynchronous 100-dialog discovery batch advances durable page counters in one commit", async () => {
   resetDb();
   const { job } = seedDiscovery();
   const result = await applyDialogIntelligenceChunk({
     db, job, deviceId: "device-1",
     chunkResult: {
       kind: "dialog_discovery_page", runId: "discovery-run", chunkKey: "batch-0",
-      page: 0, pageStart: 0, pageEnd: 30, pagesInBatch: 30, childMode: "initial", hasMore: true,
-      cursorIn: "0", cursorOut: "300",
-      continuation: { mode: "discovery", page: 30, offset: 300, dialogsFound: 2 },
-      progress: { pages: 30, pagesInBatch: 30, dialogsFound: 2, hasMore: true, nextOffset: 300 },
+      page: 0, pageStart: 0, pageEnd: 10, pagesInBatch: 10, childMode: "initial", hasMore: true,
+      cursorIn: "0", cursorOut: "100",
+      continuation: { mode: "discovery", page: 10, offset: 100, dialogsFound: 2 },
+      progress: { pages: 10, pagesInBatch: 10, dialogsFound: 2, hasMore: true, nextOffset: 100 },
       dialogs: [{ dialogId: "dialog-a", fanId: "fan-a" }, { dialogId: "dialog-b", fanId: "fan-b" }],
     },
   });
-  assert.equal(result.pagesInBatch, 30);
-  assert.equal(result.pageEnd, 30);
-  assert.equal(db._runs.get("discovery-run").pagesProcessed, 30);
+  assert.equal(result.pagesInBatch, 10);
+  assert.equal(result.pageEnd, 10);
+  assert.equal(db._runs.get("discovery-run").pagesProcessed, 10);
 });
 
 test("hasMore=false freezes the full list and starts exactly one history dialog", async () => {

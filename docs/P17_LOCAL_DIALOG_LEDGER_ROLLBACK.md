@@ -57,3 +57,20 @@ scripts/p17_inspect_and_cleanup_legacy_dialog_ledger.sql
 ```
 
 Запишите `row_count` и `total_size`, подождите хотя бы один рабочий цикл сканера и выполните read-only блок повторно. Очистку запускайте только если значения legacy message/media/purchase таблиц больше не растут.
+
+
+## Foundation for the later server move
+
+The local-first phase is temporary and exists to avoid paying for a large database
+before the product needs centralized history. New code must preserve these seams:
+
+- OnlyFans scanners emit normalized, transport-neutral pages/batches.
+- Desktop repositories own the current SQLite implementation.
+- Backend discovery endpoints accept compact plans/checkpoints, not raw chat text.
+- CRM/AI consumes repository contracts rather than SQLite table names.
+- Future centralized storage replaces the repository/reporting sinks behind those
+  contracts; pagination and CRM business logic must not be rewritten.
+
+Dialog discovery uploads are asynchronous batches of 100. They are serialized in
+server order, but the OnlyFans pagination loop does not wait for each upload. The
+final freeze waits for the outbox to drain so the server plan is complete.

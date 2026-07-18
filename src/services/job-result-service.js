@@ -142,6 +142,10 @@ async function applyTrafficResult({ job, deviceId, userId, result }) {
 }
 
 async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
+  // Async scanners may have already flushed every compact batch and use the
+  // final progress call only to switch driverPhase to complete. No payload is a
+  // valid no-op; never route it into a job-specific chunk parser.
+  if (chunkResult === undefined || chunkResult === null) return null;
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
     return applyDialogIntelligenceChunk({ db, job, deviceId, userId, chunkResult });
   }
