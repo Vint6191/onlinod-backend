@@ -660,7 +660,7 @@ function stageFrom({ messages, dialogs, authoritative, stale }) {
   const dialogWaitingContext = dialogJob === "SCHEDULED" && dialogWaitKind === "creator_context";
 
   if (scanStatus === "PAUSED" || dialogs.paused || dialogs.discovery?.paused) return "PAUSED";
-  if (messagesJob === "CLAIMED" || scanStatus === "RUNNING") return "UPDATING_MESSAGES_CATALOG";
+  if (messagesJob === "CLAIMED") return "UPDATING_MESSAGES_CATALOG";
 
   // Discovery is a strict first phase. No dialog-history state may mask it.
   if (!dialogs.discoveryCompleted) {

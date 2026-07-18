@@ -141,11 +141,72 @@ async function updateSnapshot(db, { agencyId, creatorId, userId = null, patch = 
   });
 }
 
+async function reconcileOrphanedSnapshot(db, { agencyId, creatorId, snapshot, activeJob }) {
+  if (!snapshot || activeJob) return snapshot;
+  const payload = snapshotPayload(snapshot);
+  const scanStatus = normalizeStatus(payload.scan.status);
+  if (!["RUNNING", "QUEUED"].includes(scanStatus)) return snapshot;
+
+  // A snapshot is a projection of a durable JobInstance, never an independent
+  // lock. Older failures could leave scan.status=RUNNING after the job had
+  // already become terminal or disappeared. That stale flag masked dialog
+  // history forever and made the UI claim that two scanners were active.
+  const jobId = clean(payload.scan.jobId, 240);
+  const findUnique = db.jobInstance && typeof db.jobInstance.findUnique === "function"
+    ? db.jobInstance.findUnique.bind(db.jobInstance)
+    : null;
+  if (!jobId || !findUnique) return snapshot;
+
+  const job = await findUnique({ where: { id: jobId } });
+  if (job && ACTIVE_JOB_STATUSES.includes(String(job.status || "").toUpperCase())) return snapshot;
+
+  const result = object(job?.result);
+  const progress = object(job?.progress);
+  const mode = normalizeMode(result.mode || job?.params?.mode || payload.scan.mode);
+  const completedAt = iso(job?.completedAt) || new Date().toISOString();
+  let patch;
+  if (String(job?.status || "").toUpperCase() === "DONE") {
+    patch = {
+      scanStatus: "COMPLETED",
+      mode,
+      jobId,
+      pages: integer(result.pages ?? progress.pages ?? payload.scan.pages),
+      scanned: integer(result.scanned ?? progress.current ?? progress.scanned ?? payload.scan.scanned),
+      knownStreak: integer(result.knownStreak ?? progress.knownStreak ?? payload.scan.knownStreak),
+      completedAt,
+      lastFullScanAt: mode === "full" ? completedAt : undefined,
+      lastIncrementalScanAt: mode === "incremental" ? completedAt : undefined,
+      lastError: null,
+    };
+  } else if (String(job?.status || "").toUpperCase() === "CANCELLED") {
+    patch = {
+      scanStatus: String(job?.lastError || "").toLowerCase().includes("paused") ? "PAUSED" : "CANCELLED",
+      jobId,
+      completedAt,
+      lastError: null,
+    };
+  } else {
+    patch = {
+      scanStatus: "FAILED",
+      jobId: jobId || null,
+      completedAt,
+      lastError: clean(job?.lastError, 2000) || "Messages catalog job is no longer active",
+    };
+  }
+  return updateSnapshot(db, { agencyId, creatorId, patch });
+}
+
 async function getVaultUnsortedState({ agencyId, creatorId, db = prisma }) {
-  const [snapshot, activeJob] = await Promise.all([
+  const [loadedSnapshot, activeJob] = await Promise.all([
     db.vaultUnsortedSnapshot.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } }),
     loadActiveJob(db, creatorId),
   ]);
+  const snapshot = await reconcileOrphanedSnapshot(db, {
+    agencyId,
+    creatorId,
+    snapshot: loadedSnapshot,
+    activeJob,
+  });
   return { ok: true, creatorId, snapshot: publicSnapshot(snapshot), activeJob: publicJob(activeJob) };
 }
 

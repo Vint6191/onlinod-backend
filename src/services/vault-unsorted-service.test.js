@@ -16,6 +16,7 @@ delete require.cache[require.resolve("./vault-unsorted-service")];
 const {
   applyVaultUnsortedChunk,
   applyVaultUnsortedCompletion,
+  getVaultUnsortedState,
   snapshotPayload,
 } = require("./vault-unsorted-service");
 
@@ -177,4 +178,68 @@ test("Messages catalog writes one parameterized PostgreSQL UPSERT per OF page", 
   assert.equal(fx.calls.upserts, 0);
   assert.match(rawSql, /ON CONFLICT \("agencyId", "creatorId", "mediaId"\) DO UPDATE/);
   assert.equal(rawParams.length, 3 * 14);
+});
+
+
+test("orphaned RUNNING Messages snapshot is reconciled from its terminal job", async () => {
+  const fx = fixture(["m1"]);
+  const started = new Date("2026-07-18T10:00:00.000Z");
+  let snapshot = {
+    id: "snapshot-1",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    itemsCount: 1,
+    unsortedCount: 1,
+    sortedCount: 0,
+    capturedAt: started,
+    updatedAt: started,
+    payload: {
+      schema: 3,
+      kind: "vault_unsorted_snapshot",
+      messagesFolderId: "messages",
+      lastFullScanAt: null,
+      lastIncrementalScanAt: null,
+      scan: {
+        status: "RUNNING",
+        mode: "full",
+        jobId: "job-done",
+        pages: 10,
+        scanned: 400,
+        knownStreak: 0,
+        startedAt: started.toISOString(),
+        completedAt: null,
+        lastError: null,
+      },
+    },
+  };
+  fx.db.vaultUnsortedSnapshot.findUnique = async () => snapshot;
+  fx.db.vaultUnsortedSnapshot.upsert = async ({ create, update }) => {
+    snapshot = snapshot ? { ...snapshot, ...update, updatedAt: new Date() } : { ...create };
+    return snapshot;
+  };
+  fx.db.jobInstance = {
+    async findFirst() { return null; },
+    async findUnique() {
+      return {
+        id: "job-done",
+        status: "DONE",
+        params: { mode: "full" },
+        result: { mode: "full", pages: 12, scanned: 480, knownStreak: 0 },
+        progress: { current: 480, pages: 12 },
+        completedAt: new Date("2026-07-18T10:15:00.000Z"),
+      };
+    },
+  };
+
+  const state = await getVaultUnsortedState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: fx.db,
+  });
+
+  assert.equal(state.activeJob, null);
+  assert.equal(state.snapshot.scan.status, "COMPLETED");
+  assert.equal(state.snapshot.scan.pages, 12);
+  assert.equal(state.snapshot.scan.scanned, 480);
+  assert.equal(state.snapshot.lastFullScanAt, "2026-07-18T10:15:00.000Z");
 });
