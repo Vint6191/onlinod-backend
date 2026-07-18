@@ -57,15 +57,38 @@ function leaseDuration(value) {
 }
 function safeProgress(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const source = object(value);
   const out = {};
-  const percent = Number(value.percent);
-  const current = Number(value.current);
-  const total = Number(value.total);
-  const message = clean(value.message, 500);
-  if (Number.isFinite(percent)) out.percent = Math.max(0, Math.min(100, percent));
-  if (Number.isFinite(current)) out.current = Math.max(0, current);
-  if (Number.isFinite(total)) out.total = Math.max(0, total);
-  if (message) out.message = message;
+  const numericFields = [
+    "percent", "current", "total", "pages", "rawMessages", "messages",
+    "skippedMessages", "media", "offset", "status", "pageStart", "pageEnd",
+    "pagesInBatch", "messageCount", "mediaCount", "inserted", "updated",
+    "unchanged", "localUncheckpointedMessages", "scanned", "knownStreak",
+  ];
+  for (const field of numericFields) {
+    const parsed = Number(source[field]);
+    if (!Number.isFinite(parsed)) continue;
+    out[field] = field === "percent"
+      ? Math.max(0, Math.min(100, parsed))
+      : Math.max(0, parsed);
+  }
+  const stringLimits = {
+    message: 500,
+    stage: 80,
+    mode: 40,
+    dialogId: 200,
+    cursorType: 40,
+    cursorIn: 300,
+    cursor: 300,
+    endpointKey: 160,
+    storage: 80,
+    checkpointMode: 80,
+  };
+  for (const [field, max] of Object.entries(stringLimits)) {
+    const normalized = clean(source[field], max);
+    if (normalized) out[field] = normalized;
+  }
+  if (source.live === true) out.live = true;
   return Object.keys(out).length ? out : null;
 }
 
@@ -187,7 +210,7 @@ async function sweepExpiredLeases(now = new Date()) {
   });
   return terminal.count + retry.count;
 }
-async function claimJob({ userId, deviceId, leaseMs, jobKeys }) {
+async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds = [] }) {
   const device = await requireOwnedDevice({ userId, deviceId });
   await sweepExpiredLeases();
   if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60 * 1000)) return { job: null, reason: "device-stale" };
@@ -196,11 +219,34 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys }) {
   const allowedJobKeys = filterClaimableDesktopJobKeys(jobKeys);
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
   const now = new Date();
+  const explicitlyExcluded = new Set(
+    (Array.isArray(excludedCreatorIds) ? excludedCreatorIds : [])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean),
+  );
+  // One creator has one authenticated browser/request lane. Do not lease a
+  // second job that can only wait behind the first one. Besides fixing false
+  // RUNNING states in the UI, this keeps multi-device work from splitting one
+  // creator across several concurrent local stores.
+  const claimedCreators = typeof prisma.jobInstance.findMany === "function"
+    ? await prisma.jobInstance.findMany({
+        where: {
+          status: "CLAIMED",
+          leaseUntil: { gt: now },
+          creatorId: { in: creatorIds },
+        },
+        select: { creatorId: true },
+        take: 10_000,
+      })
+    : [];
+  for (const row of claimedCreators) if (row.creatorId) explicitlyExcluded.add(row.creatorId);
+  const eligibleCreatorIds = creatorIds.filter((creatorId) => !explicitlyExcluded.has(creatorId));
+  if (!eligibleCreatorIds.length) return { job: null, reason: "creators-busy" };
   for (let race = 0; race < 5; race += 1) {
     const candidate = await prisma.jobInstance.findFirst({
       where: {
         status: "SCHEDULED", nextRunAt: { lte: now }, attempts: { lt: MAX_ATTEMPTS }, jobKey: { in: allowedJobKeys },
-        creatorId: { in: creatorIds },
+        creatorId: { in: eligibleCreatorIds },
       },
       orderBy: [{ priority: "desc" }, { nextRunAt: "asc" }],
     });
@@ -214,7 +260,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys }) {
         nextRunAt: { lte: now },
         attempts: { lt: MAX_ATTEMPTS },
         jobKey: { in: allowedJobKeys },
-        creatorId: { in: creatorIds },
+        creatorId: { in: eligibleCreatorIds },
       },
       data: {
         status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,

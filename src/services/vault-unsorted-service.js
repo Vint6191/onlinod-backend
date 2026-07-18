@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 
@@ -331,6 +332,63 @@ function normalizeChunkItem(value) {
   };
 }
 
+async function upsertVaultUnsortedItems(db, { agencyId, creatorId, jobId, items, now }) {
+  if (!items.length) return;
+  // Render/Neon latency made the old per-row loop the dominant cost of the
+  // Messages catalog: one OF page of 40 media caused forty sequential UPSERTs.
+  // PostgreSQL can apply the whole page atomically in one parameterized
+  // statement. Keep the Prisma fallback only for lightweight unit-test doubles.
+  if (typeof db.$executeRawUnsafe === "function") {
+    const params = [];
+    const rows = items.map((item) => {
+      const values = [
+        crypto.randomUUID(), agencyId, creatorId, item.mediaId, item.status,
+        item.mediaType, item.thumbUrl, item.duration, JSON.stringify(item.folderIds),
+        now, now, jobId, now, now,
+      ];
+      const base = params.length;
+      params.push(...values);
+      const refs = values.map((_, index) => `$${base + index + 1}`);
+      refs[8] = `${refs[8]}::jsonb`;
+      return `(${refs.join(", ")})`;
+    });
+    const sql = `
+      INSERT INTO "VaultUnsortedItem" (
+        "id", "agencyId", "creatorId", "mediaId", "status", "mediaType",
+        "thumbUrl", "duration", "folderIds", "firstSeenAt", "lastSeenAt",
+        "lastSeenJobId", "createdAt", "updatedAt"
+      ) VALUES ${rows.join(", ")}
+      ON CONFLICT ("agencyId", "creatorId", "mediaId") DO UPDATE SET
+        "status" = EXCLUDED."status",
+        "mediaType" = EXCLUDED."mediaType",
+        "thumbUrl" = EXCLUDED."thumbUrl",
+        "duration" = EXCLUDED."duration",
+        "folderIds" = EXCLUDED."folderIds",
+        "lastSeenAt" = EXCLUDED."lastSeenAt",
+        "lastSeenJobId" = EXCLUDED."lastSeenJobId",
+        "updatedAt" = EXCLUDED."updatedAt"
+    `;
+    await db.$executeRawUnsafe(sql, ...params);
+    return;
+  }
+  for (const item of items) {
+    await db.vaultUnsortedItem.upsert({
+      where: { agencyId_creatorId_mediaId: { agencyId, creatorId, mediaId: item.mediaId } },
+      create: {
+        agencyId, creatorId, mediaId: item.mediaId, status: item.status,
+        mediaType: item.mediaType, thumbUrl: item.thumbUrl, duration: item.duration,
+        folderIds: item.folderIds, firstSeenAt: now, lastSeenAt: now,
+        lastSeenJobId: jobId,
+      },
+      update: {
+        status: item.status, mediaType: item.mediaType, thumbUrl: item.thumbUrl,
+        duration: item.duration, folderIds: item.folderIds, lastSeenAt: now,
+        lastSeenJobId: jobId,
+      },
+    });
+  }
+}
+
 async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
   if (!job.creatorId || !job.agencyId) throw new Error("Vault Unsorted job is missing creator scope");
   const chunk = object(chunkResult);
@@ -383,32 +441,14 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
   for (const item of items) {
     const wasKnown = existing.has(item.mediaId);
     knownStreak = mode === "incremental" && wasKnown ? knownStreak + 1 : 0;
-    await db.vaultUnsortedItem.upsert({
-      where: { agencyId_creatorId_mediaId: { agencyId: job.agencyId, creatorId: job.creatorId, mediaId: item.mediaId } },
-      create: {
-        agencyId: job.agencyId,
-        creatorId: job.creatorId,
-        mediaId: item.mediaId,
-        status: item.status,
-        mediaType: item.mediaType,
-        thumbUrl: item.thumbUrl,
-        duration: item.duration,
-        folderIds: item.folderIds,
-        firstSeenAt: now,
-        lastSeenAt: now,
-        lastSeenJobId: job.id,
-      },
-      update: {
-        status: item.status,
-        mediaType: item.mediaType,
-        thumbUrl: item.thumbUrl,
-        duration: item.duration,
-        folderIds: item.folderIds,
-        lastSeenAt: now,
-        lastSeenJobId: job.id,
-      },
-    });
   }
+  await upsertVaultUnsortedItems(db, {
+    agencyId: job.agencyId,
+    creatorId: job.creatorId,
+    jobId: job.id,
+    items,
+    now,
+  });
   const pages = integer(continuation.pages, 0) + 1;
   const scanned = integer(continuation.scanned, 0) + items.length;
   const hasMore = chunk.hasMore === true;

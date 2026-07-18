@@ -147,3 +147,34 @@ test("snapshot payload is compact and does not embed thousands of media rows", (
   assert.equal(Object.hasOwn(payload, "items"), false);
   assert.equal(Object.hasOwn(payload, "media"), false);
 });
+
+test("Messages catalog writes one parameterized PostgreSQL UPSERT per OF page", async () => {
+  const fx = fixture([]);
+  let rawCalls = 0;
+  let rawSql = "";
+  let rawParams = [];
+  fx.db.$executeRawUnsafe = async (sql, ...params) => {
+    rawCalls += 1;
+    rawSql = sql;
+    rawParams = params;
+    return 3;
+  };
+  await applyVaultUnsortedChunk({
+    db: fx.db,
+    job: { ...job, params: { ...job.params, mode: "full" } },
+    chunkResult: {
+      kind: "vault_unsorted_media_page",
+      continuation: {
+        phase: "media", mode: "full", messagesFolderId: "messages",
+        offset: 0, pages: 0, scanned: 0, knownStreak: 0,
+      },
+      items: ["m1", "m2", "m3"].map((mediaId) => ({ mediaId, status: "UNSORTED", mediaType: "photo", folderIds: [] })),
+      hasMore: true,
+      nextOffset: 3,
+    },
+  });
+  assert.equal(rawCalls, 1);
+  assert.equal(fx.calls.upserts, 0);
+  assert.match(rawSql, /ON CONFLICT \("agencyId", "creatorId", "mediaId"\) DO UPDATE/);
+  assert.equal(rawParams.length, 3 * 14);
+});

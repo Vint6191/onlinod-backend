@@ -303,9 +303,12 @@ async function dialogPipelineState(db, agencyId, creatorId) {
     || null;
   const currentParams = object(currentJob?.params);
   const currentRun = runsById.get(clean(currentParams.scanRunId, 160)) || null;
+  // Job progress is the live worker heartbeat; run progress is the last
+  // durable checkpoint. The live value must win or the UI appears frozen at
+  // page 0 until a ten-page checkpoint is committed.
   const currentProgress = {
-    ...object(currentJob?.progress),
     ...object(currentRun?.progress),
+    ...object(currentJob?.progress),
   };
   const currentFailure = object(object(currentJob?.result).failure);
 

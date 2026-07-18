@@ -148,3 +148,66 @@ test("renew flattens a legacy deeply nested driver continuation", async () => {
   assert.deepEqual(saved, { driverPhase: "execute", jobContinuation: domain });
   assert.doesNotThrow(() => JSON.stringify(saved));
 });
+
+test("claim excludes creators that already own a live lease", async () => {
+  const now = new Date();
+  const candidate = {
+    id: "job-creator-2", jobKey: "dialog_intelligence_scan", scope: "creator", creatorId: "creator-2", agencyId: "agency-1",
+    idempotencyKey: "claim-2", params: { dialogId: "dialog-2" }, priority: 60, attempts: 0,
+    leaseRevision: 1, startedAt: null, workId: null, continuation: null, progress: null,
+  };
+  let candidateWhere = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: now }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all" }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }, { id: "creator-2" }] },
+    deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }, { creatorId: "creator-2" }] },
+    jobInstance: {
+      findMany: async () => [{ creatorId: "creator-1" }],
+      findFirst: async ({ where }) => { candidateWhere = where; return candidate; },
+      updateMany: async ({ where }) => where?.id === candidate.id ? { count: 1 } : { count: 0 },
+      findUnique: async () => ({
+        ...candidate, status: "CLAIMED", claimedAt: now, claimedByDeviceId: "device-1",
+        leaseUntil: new Date(now.getTime() + 60_000), leaseRevision: 2, creator: { id: "creator-2" },
+      }),
+    },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({
+    userId: "user-1", deviceId: "device-1", leaseMs: 60_000,
+    jobKeys: ["dialog_intelligence_scan"],
+  });
+  assert.equal(result.job.creatorId, "creator-2");
+  assert.deepEqual(candidateWhere.creatorId.in, ["creator-2"]);
+});
+
+test("live progress preserves dialog diagnostics without rewriting continuation", async () => {
+  const item = fixture();
+  const { renewLease } = loadService(item);
+  await renewLease({
+    jobId: item.job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: item.token,
+    leaseRevision: 3,
+    leaseMs: 60_000,
+    progress: {
+      percent: 7,
+      message: "Full dialog page 7",
+      pages: 7,
+      messages: 350,
+      localUncheckpointedMessages: 50,
+      dialogId: "dialog-1",
+      storage: "local_sqlite",
+      live: true,
+    },
+  });
+  const update = item.update();
+  assert.equal(update.data.progress.pages, 7);
+  assert.equal(update.data.progress.messages, 350);
+  assert.equal(update.data.progress.localUncheckpointedMessages, 50);
+  assert.equal(update.data.progress.dialogId, "dialog-1");
+  assert.equal(update.data.progress.storage, "local_sqlite");
+  assert.equal(update.data.progress.live, true);
+  assert.equal(Object.hasOwn(update.data, "continuation"), false);
+});

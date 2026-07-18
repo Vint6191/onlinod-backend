@@ -57,6 +57,7 @@ const claimSchema = z.object({
   deviceId: deviceSchema,
   leaseMs: z.number().int().min(30_000).max(15 * 60_000).optional(),
   jobKeys: z.array(z.string().min(1).max(120)).min(1).max(100),
+  excludedCreatorIds: z.array(z.string().min(1).max(200)).max(1_000).optional(),
 });
 
 const leaseMutationSchema = z.object({
@@ -107,6 +108,7 @@ router.post("/claim", async (req, res, next) => {
       deviceId: input.deviceId,
       leaseMs: input.leaseMs,
       jobKeys: input.jobKeys,
+      excludedCreatorIds: input.excludedCreatorIds,
     });
     return res.json({ ok: true, ...claimed });
   } catch (error) {
