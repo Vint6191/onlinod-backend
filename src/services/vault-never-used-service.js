@@ -700,9 +700,9 @@ async function loadPipelineSources({ agencyId, creatorId, db }) {
 }
 
 async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now = new Date(), staleAfter = null }) {
-  // A contradictory OF tail response (empty list + hasMore=true) is handled as
-  // an internal recovery state. Status polling revives the preserved discovery
-  // checkpoint automatically; operators never need to restart or rebuild it.
+  // Recoverable OF discovery anomalies are internal continuation states. Status
+  // polling revives the preserved durable checkpoint automatically; operators
+  // never need to restart or rebuild thousands of already discovered dialogs.
   try {
     await repairRegressedDialogDiscoveryTx(db, { agencyId, creatorId });
     await autoRecoverDialogDiscoveryTx(db, {

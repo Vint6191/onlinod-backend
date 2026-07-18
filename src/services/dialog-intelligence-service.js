@@ -5,6 +5,14 @@ const prisma = require("../prisma");
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING", "PAUSED"];
 const DIALOG_CONTROL_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
+const RECOVERABLE_DISCOVERY_FAILURE_CODES = new Set([
+  "DIALOG_DISCOVERY_EMPTY_PAGE_WITH_HAS_MORE",
+  // Compatibility with the async-100 build that treated an echoed OF offset as
+  // a terminal cursor failure. New Desktop builds own the offset cursor and no
+  // longer emit this error, but existing failed runs must resume from their last
+  // durable 100-dialog checkpoint instead of forcing a destructive full rescan.
+  "DIALOG_DISCOVERY_CURSOR_STALLED",
+]);
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -253,7 +261,7 @@ async function scheduleDialogScanTx(db, input) {
     const failure = object(object(failedJob?.result).failure);
     const failureCode = clean(failure.code, 160);
     const checkpointRecoverable = failure.retryable === true
-      || failureCode === "DIALOG_DISCOVERY_EMPTY_PAGE_WITH_HAS_MORE";
+      || RECOVERABLE_DISCOVERY_FAILURE_CODES.has(failureCode);
     if (failedRun && checkpointRecoverable) active = failedRun;
   }
 
@@ -824,7 +832,7 @@ async function autoRecoverDialogDiscoveryTx(db, input) {
   const failedJob = await db.jobInstance.findUnique({ where: { id: latestRun.jobId } });
   const failure = object(object(failedJob?.result).failure);
   const code = clean(failure.code, 160);
-  if (code !== "DIALOG_DISCOVERY_EMPTY_PAGE_WITH_HAS_MORE") {
+  if (!RECOVERABLE_DISCOVERY_FAILURE_CODES.has(code)) {
     return { ok: true, recovered: false, reason: "failure_not_auto_recoverable" };
   }
 
@@ -835,7 +843,7 @@ async function autoRecoverDialogDiscoveryTx(db, input) {
     dialogId: "__dialog_discovery__",
     mode: "discovery",
     childMode: clean(params.childMode, 40) || "initial",
-    source: clean(input.source, 80) || "automatic_dialog_tail_verification",
+    source: clean(input.source, 80) || "automatic_dialog_discovery_recovery",
     priority: integer(input.priority, 90, 0, 200),
     pageLimit: integer(params.pageLimit, 50, 1, 100),
     maxPages: integer(params.maxPages, 5000, 1, 10000),

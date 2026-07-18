@@ -241,3 +241,30 @@ test("purchase target is queued inside an active initial run without damaging co
   assert.deepEqual(active.continuation, { mode: "initial", cursor: "cursor-5", page: 5 });
   assert.equal(db.calls.runsCreated.length, 0);
 });
+
+test("legacy cursor-stalled discovery is automatically resumed from its durable checkpoint", async () => {
+  const failed = {
+    id: "run-cursor-stalled", jobId: "job-cursor-stalled", status: "FAILED", mode: "discovery",
+    dialogId: "__dialog_discovery__", pagesProcessed: 1220, generation: 9,
+    continuation: {
+      stage: "DIALOG_DISCOVERY", mode: "discovery", dialogId: "__dialog_discovery__",
+      offset: 23750, page: 1220, dialogsFound: 15941, childMode: "initial", maxPages: 10000,
+    },
+    progress: { pages: 1220, nextOffset: 23750, dialogsFound: 15941 },
+  };
+  const failedJob = {
+    id: "job-cursor-stalled", status: "FAILED", priority: 90,
+    params: { dialogId: "__dialog_discovery__", mode: "discovery", childMode: "initial", pageLimit: 50, maxPages: 10000, generation: 9 },
+    continuation: failed.continuation,
+    result: { failure: { code: "DIALOG_DISCOVERY_CURSOR_STALLED", retryable: false } },
+  };
+  const db = fakeDb({ failed, latest: failed, failedJob, state: { generation: 9 } });
+  const result = await autoRecoverDialogDiscoveryTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1", source: "status_poll", priority: 90,
+  });
+  assert.equal(result.recovered, true);
+  assert.equal(db.calls.jobsCreated.length, 1);
+  assert.deepEqual(db.calls.jobsCreated[0].continuation, failed.continuation);
+  assert.equal(db.calls.jobsCreated[0].params.scanRunId, "run-cursor-stalled");
+  assert.equal(db.calls.runsUpdated.at(-1).data.status, "QUEUED");
+});
