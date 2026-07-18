@@ -99,6 +99,31 @@ function createDb() {
     },
     dialogScanState: {
       findUnique: async ({ where }) => states.get(`${where.creatorId_dialogId.creatorId}:${where.creatorId_dialogId.dialogId}`) || null,
+      findMany: async ({ where, select }) => [...states.values()]
+        .filter((row) => {
+          if (where.creatorId && row.creatorId !== where.creatorId) return false;
+          if (where.dialogId?.in && !where.dialogId.in.includes(row.dialogId)) return false;
+          return true;
+        })
+        .map((row) => select
+          ? Object.fromEntries(Object.keys(select).filter((key) => select[key]).map((key) => [key, row[key]]))
+          : row),
+      createMany: async ({ data, skipDuplicates }) => {
+        let count = 0;
+        for (const input of data) {
+          const key = `${input.creatorId}:${input.dialogId}`;
+          if (states.has(key)) {
+            if (!skipDuplicates) throw new Error(`duplicate state ${key}`);
+            continue;
+          }
+          states.set(key, {
+            initialScanComplete: false, pagesProcessed: 0, messagesProcessed: 0,
+            createdAt: new Date(), updatedAt: new Date(), ...input,
+          });
+          count += 1;
+        }
+        return { count };
+      },
       findFirst: async ({ where }) => {
         return [...states.values()]
           .filter((row) => {
@@ -136,7 +161,8 @@ function createDb() {
         let count = 0;
         for (const row of states.values()) {
           if (where.creatorId && row.creatorId !== where.creatorId) continue;
-          if (where.dialogId && row.dialogId !== where.dialogId) continue;
+          if (typeof where.dialogId === "string" && row.dialogId !== where.dialogId) continue;
+          if (where.dialogId?.in && !where.dialogId.in.includes(row.dialogId)) continue;
           applyData(row, data);
           count += 1;
         }
@@ -245,6 +271,25 @@ test("discovery pages build only a PLANNED list and never schedule history early
   assert.equal(db._states.get("creator-1:dialog-a").status, "PLANNED");
   assert.equal(db._states.get("creator-1:dialog-b").status, "PLANNED");
   assert.equal([...db._runs.values()].filter((run) => run.dialogId !== "__dialog_discovery__").length, 0);
+});
+
+test("a 300-dialog discovery batch advances durable page counters in one commit", async () => {
+  resetDb();
+  const { job } = seedDiscovery();
+  const result = await applyDialogIntelligenceChunk({
+    db, job, deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page", runId: "discovery-run", chunkKey: "batch-0",
+      page: 0, pageStart: 0, pageEnd: 30, pagesInBatch: 30, childMode: "initial", hasMore: true,
+      cursorIn: "0", cursorOut: "300",
+      continuation: { mode: "discovery", page: 30, offset: 300, dialogsFound: 2 },
+      progress: { pages: 30, pagesInBatch: 30, dialogsFound: 2, hasMore: true, nextOffset: 300 },
+      dialogs: [{ dialogId: "dialog-a", fanId: "fan-a" }, { dialogId: "dialog-b", fanId: "fan-b" }],
+    },
+  });
+  assert.equal(result.pagesInBatch, 30);
+  assert.equal(result.pageEnd, 30);
+  assert.equal(db._runs.get("discovery-run").pagesProcessed, 30);
 });
 
 test("hasMore=false freezes the full list and starts exactly one history dialog", async () => {

@@ -351,6 +351,9 @@ async function scheduleDialogScanTx(db, input) {
           mode: active.mode,
           source: clean(input.source, 80) || "startup_resume",
           pageLimit: integer(input.pageLimit, 50, 1, 100),
+          discoveryBatchSize: active.mode === "discovery" ? integer(input.discoveryBatchSize ?? object(activeJob?.params).discoveryBatchSize, 300, 50, 500) : undefined,
+          discoveryBatchMaxApiPages: active.mode === "discovery" ? integer(input.discoveryBatchMaxApiPages ?? object(activeJob?.params).discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
+          discoveryBatchTimeBudgetMs: active.mode === "discovery" ? integer(input.discoveryBatchTimeBudgetMs ?? object(activeJob?.params).discoveryBatchTimeBudgetMs, 120000, 15000, 150000) : undefined,
           overlapPages: integer(input.overlapPages, 2, 0, 10),
           knownMessageThreshold: integer(input.knownMessageThreshold, 3, 1, 100),
           maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : 1000, 1, 10000),
@@ -416,6 +419,9 @@ async function scheduleDialogScanTx(db, input) {
       params: {
         scanRunId: run.id, dialogId, fanId: clean(input.fanId, 160), mode,
         source: clean(input.source, 80) || "manual", pageLimit: integer(input.pageLimit, 50, 1, 100),
+        discoveryBatchSize: mode === "discovery" ? integer(input.discoveryBatchSize, 300, 50, 500) : undefined,
+        discoveryBatchMaxApiPages: mode === "discovery" ? integer(input.discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
+        discoveryBatchTimeBudgetMs: mode === "discovery" ? integer(input.discoveryBatchTimeBudgetMs, 120000, 15000, 150000) : undefined,
         targetMessageId, childMode: clean(input.childMode, 40) || null,
         forceChildFull: input.forceChildFull === true,
         childPriority: integer(input.childPriority, clean(input.childMode, 40) === "initial" ? 60 : 50, 0, 200),
@@ -1152,60 +1158,123 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const childMode = clean(chunk.childMode ?? params.childMode, 40) || "incremental";
   const forceChildFull = chunk.forceChildFull === true || params.forceChildFull === true;
   const generation = integer(params.generation ?? run.generation, run.generation || 0);
-  let planned = 0;
-  let discovered = 0;
+  // Desktop now sends discovery results in batches of up to 300 dialogs. Keep
+  // the legacy per-row path only for test doubles / old Prisma adapters; real
+  // PostgreSQL uses one findMany + createMany + at most two updateMany calls.
+  const uniqueDialogs = new Map();
   for (const raw of list(chunk.dialogs).slice(0, 500)) {
     const row = object(raw);
     const dialogId = clean(row.dialogId, 180);
     if (!dialogId || dialogId === discoveryDialogId) continue;
-    const fanId = clean(row.fanId, 160);
-    discovered += 1;
-    const existingState = await db.dialogScanState.findUnique({
-      where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId } },
-    });
-    const alreadyInitial = existingState?.initialScanComplete === true;
-    const shouldPlan = childMode === "initial" ? (forceChildFull || !alreadyInitial) : true;
-    // Creator-wide scans are strict two-phase plans. Discovery never leaves a
-    // dialog in QUEUED/RUNNING from an older plan; no history job exists until
-    // the discovery run completes with hasMore=false.
-    const nextStatus = shouldPlan ? "PLANNED" : "READY";
-    await db.dialogScanState.upsert({
-      where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId } },
-      create: {
-        agencyId: job.agencyId,
-        creatorId: job.creatorId,
-        dialogId,
-        fanId,
-        status: shouldPlan ? "PLANNED" : "READY",
-        scanMode: childMode,
-        generation,
-        initialScanComplete: forceChildFull ? false : alreadyInitial,
-        pagesProcessed: 0,
-        messagesProcessed: 0,
-        mediaProcessed: 0,
-      },
-      update: {
-        fanId: fanId || undefined,
-        scanMode: childMode,
-        generation,
-        status: nextStatus,
-        initialScanComplete: forceChildFull ? false : undefined,
-        pagesProcessed: 0,
-        messagesProcessed: 0,
-        mediaProcessed: 0,
-        backwardCursor: forceChildFull ? null : undefined,
-        incrementalGapOpen: childMode === "incremental" ? true : false,
-        activeRunId: null,
-        activeJobId: null,
-        lastError: null,
-      },
-    });
-    if (shouldPlan) planned += 1;
+    uniqueDialogs.set(dialogId, { dialogId, fanId: clean(row.fanId, 160) });
   }
-  const page = integer(chunk.page, 0);
+  const discoveryRows = [...uniqueDialogs.values()];
+  const discovered = discoveryRows.length;
+  let planned = 0;
+  const supportsBulkPlan = typeof db.dialogScanState.findMany === "function"
+    && typeof db.dialogScanState.createMany === "function"
+    && typeof db.dialogScanState.updateMany === "function";
+
+  if (supportsBulkPlan && discoveryRows.length > 0) {
+    const dialogIds = discoveryRows.map((row) => row.dialogId);
+    const existingRows = await db.dialogScanState.findMany({
+      where: { creatorId: job.creatorId, dialogId: { in: dialogIds } },
+      select: { dialogId: true, initialScanComplete: true },
+    });
+    const existingById = new Map(existingRows.map((row) => [row.dialogId, row]));
+    const createRows = [];
+    const plannedExistingIds = [];
+    const readyExistingIds = [];
+
+    for (const row of discoveryRows) {
+      const existingState = existingById.get(row.dialogId);
+      const alreadyInitial = existingState?.initialScanComplete === true;
+      const shouldPlan = childMode === "initial" ? (forceChildFull || !alreadyInitial) : true;
+      if (shouldPlan) planned += 1;
+      if (!existingState) {
+        createRows.push({
+          agencyId: job.agencyId,
+          creatorId: job.creatorId,
+          dialogId: row.dialogId,
+          fanId: row.fanId,
+          status: shouldPlan ? "PLANNED" : "READY",
+          scanMode: childMode,
+          generation,
+          initialScanComplete: false,
+          pagesProcessed: 0,
+          messagesProcessed: 0,
+          mediaProcessed: 0,
+          incrementalGapOpen: childMode === "incremental",
+        });
+      } else if (shouldPlan) {
+        plannedExistingIds.push(row.dialogId);
+      } else {
+        readyExistingIds.push(row.dialogId);
+      }
+    }
+
+    if (createRows.length > 0) {
+      await db.dialogScanState.createMany({ data: createRows, skipDuplicates: true });
+    }
+    const commonUpdate = {
+      scanMode: childMode,
+      generation,
+      pagesProcessed: 0,
+      messagesProcessed: 0,
+      mediaProcessed: 0,
+      incrementalGapOpen: childMode === "incremental",
+      activeRunId: null,
+      activeJobId: null,
+      lastError: null,
+    };
+    if (plannedExistingIds.length > 0) {
+      await db.dialogScanState.updateMany({
+        where: { creatorId: job.creatorId, dialogId: { in: plannedExistingIds } },
+        data: {
+          ...commonUpdate,
+          status: "PLANNED",
+          initialScanComplete: forceChildFull ? false : undefined,
+          backwardCursor: forceChildFull ? null : undefined,
+        },
+      });
+    }
+    if (readyExistingIds.length > 0) {
+      await db.dialogScanState.updateMany({
+        where: { creatorId: job.creatorId, dialogId: { in: readyExistingIds } },
+        data: { ...commonUpdate, status: "READY" },
+      });
+    }
+  } else {
+    for (const row of discoveryRows) {
+      const existingState = await db.dialogScanState.findUnique({
+        where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId: row.dialogId } },
+      });
+      const alreadyInitial = existingState?.initialScanComplete === true;
+      const shouldPlan = childMode === "initial" ? (forceChildFull || !alreadyInitial) : true;
+      await db.dialogScanState.upsert({
+        where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId: row.dialogId } },
+        create: {
+          agencyId: job.agencyId, creatorId: job.creatorId, dialogId: row.dialogId, fanId: row.fanId,
+          status: shouldPlan ? "PLANNED" : "READY", scanMode: childMode, generation,
+          initialScanComplete: forceChildFull ? false : alreadyInitial, pagesProcessed: 0, messagesProcessed: 0, mediaProcessed: 0,
+        },
+        update: {
+          fanId: row.fanId || undefined, scanMode: childMode, generation, status: shouldPlan ? "PLANNED" : "READY",
+          initialScanComplete: forceChildFull ? false : undefined, pagesProcessed: 0, messagesProcessed: 0, mediaProcessed: 0,
+          backwardCursor: forceChildFull ? null : undefined, incrementalGapOpen: childMode === "incremental",
+          activeRunId: null, activeJobId: null, lastError: null,
+        },
+      });
+      if (shouldPlan) planned += 1;
+    }
+  }
+  const pageStart = integer(chunk.pageStart ?? chunk.page, 0);
+  const pageEnd = integer(chunk.pageEnd, pageStart);
+  const pagesInBatch = integer(chunk.pagesInBatch, Math.max(1, pageEnd - pageStart), 1, 500);
+  const page = pageEnd;
   const hasMore = chunk.hasMore === true;
   const cursorOut = clean(chunk.cursorOut, 240);
-  const result = { discovered, planned, scheduled: 0, hasMore, page, cursorOut, childMode, forceChildFull, generation };
+  const result = { discovered, planned, scheduled: 0, hasMore, page, pageStart, pageEnd, pagesInBatch, cursorOut, childMode, forceChildFull, generation };
   const commit = await db.dialogScanChunkCommit.create({
     data: {
       agencyId: job.agencyId, creatorId: job.creatorId, runId, jobId: job.id, dialogId: discoveryDialogId,
@@ -1217,7 +1286,7 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
     where: { id: runId },
     data: {
       status: "RUNNING", startedAt: run.startedAt || new Date(), lastWorkerDeviceId: clean(deviceId, 200),
-      pagesProcessed: { increment: 1 }, continuation: object(chunk.continuation), progress: object(chunk.progress),
+      pagesProcessed: { increment: pagesInBatch }, continuation: object(chunk.continuation), progress: object(chunk.progress),
       purchaseSignals: { increment: discovered }, lastError: null,
     },
   });
