@@ -379,6 +379,7 @@ test("usage batches commit one bounded source transaction and bulk projection at
   assert.equal(transactionCalls.length, 2);
   assert.equal(transactionCalls.every((options) => options.maxWait === 10_000 && options.timeout === 30_000), true);
   assert.equal(usageLocks.length, 2);
+  assert.equal(usageLocks.every((call) => /pg_advisory_xact_lock[\s\S]*::text/.test(call[0])), true);
   assert.equal(bulkUsageUpdates.length, 2);
   assert.match(bulkUsageUpdates[0].query, /jsonb_to_recordset/);
   assert.equal(assets.get("m1").sentCount, 5);

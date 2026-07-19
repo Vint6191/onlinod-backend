@@ -175,6 +175,7 @@ test("one claim reserves one compact batch and creates no JobInstance", async ()
   assert.equal([...db._states.values()].filter((row) => row.status === "RUNNING").length, 3);
   assert.equal([...db._states.values()].filter((row) => row.status === "PLANNED").length, 2);
   assert.equal(db._locks.length, 1);
+  assert.match(db._locks[0][0], /pg_advisory_xact_lock[\s\S]*::text/);
   assert.equal(db._locks[0][1], "dialog_history_batch_claim:agency-1");
 });
 

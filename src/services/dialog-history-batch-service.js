@@ -74,7 +74,7 @@ async function lockDialogHistoryBatchClaimsTx(db, agencyId) {
   // Prisma logs. Test doubles without raw-query support remain usable.
   if (typeof db.$queryRawUnsafe !== "function") return;
   await db.$queryRawUnsafe(
-    "SELECT pg_advisory_xact_lock(hashtext($1))",
+    "SELECT pg_advisory_xact_lock(hashtext($1))::text AS \"acquired\"",
     `dialog_history_batch_claim:${agencyId}`,
   );
 }

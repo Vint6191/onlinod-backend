@@ -458,7 +458,7 @@ async function recomputeUsage(db, agencyId, creatorId, mediaIds) {
 async function lockMediaLibraryUsageTx(db, agencyId, creatorId) {
   if (typeof db.$queryRawUnsafe !== "function") return;
   await db.$queryRawUnsafe(
-    "SELECT pg_advisory_xact_lock(hashtext($1))",
+    "SELECT pg_advisory_xact_lock(hashtext($1))::text AS \"acquired\"",
     `media_library_usage:${agencyId}:${creatorId}`,
   );
 }
