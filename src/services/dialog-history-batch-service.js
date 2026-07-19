@@ -5,6 +5,10 @@ const prisma = require("../prisma");
 
 const DIALOG_HISTORY_BATCH_DIALOG_ID = "__dialog_history_batch__";
 const ACTIVE_BATCH_STATUSES = ["QUEUED", "RUNNING"];
+// The database partial unique index also treats PAUSED as active. A paused
+// creator must therefore stay unavailable to the batch claimer until the
+// explicit resume flow returns that run to the frozen plan.
+const CLAIM_BLOCKING_BATCH_STATUSES = ["QUEUED", "RUNNING", "PAUSED"];
 const DEFAULT_BATCH_SIZE = 25;
 const DEFAULT_LEASE_MS = 10 * 60_000;
 const MIN_LEASE_MS = 60_000;
@@ -61,6 +65,18 @@ async function assertAllowedCreators(db, agencyId, creatorIds) {
     take: ids.length,
   });
   return rows.map((row) => row.id);
+}
+
+async function lockDialogHistoryBatchClaimsTx(db, agencyId) {
+  // Serialise the short claim transaction across every backend instance for an
+  // agency. The unique index remains the final safety fence, while this lock
+  // prevents normal concurrent polling from surfacing an expected P2002 in
+  // Prisma logs. Test doubles without raw-query support remain usable.
+  if (typeof db.$queryRawUnsafe !== "function") return;
+  await db.$queryRawUnsafe(
+    "SELECT pg_advisory_xact_lock(hashtext($1))",
+    `dialog_history_batch_claim:${agencyId}`,
+  );
 }
 
 async function recoverExpiredDialogHistoryBatchesTx(db, input = {}) {
@@ -125,7 +141,20 @@ async function claimDialogHistoryBatchTx(db, input) {
   const allowedCreatorIds = await assertAllowedCreators(db, agencyId, input.creatorIds);
   if (!allowedCreatorIds.length) return { ok: true, batch: null, reason: "no_ready_creators" };
 
+  await lockDialogHistoryBatchClaimsTx(db, agencyId);
   await recoverExpiredDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
+
+  const blockingRuns = await db.dialogScanRun.findMany({
+    where: {
+      agencyId,
+      creatorId: { in: allowedCreatorIds },
+      dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID,
+      status: { in: CLAIM_BLOCKING_BATCH_STATUSES },
+    },
+    select: { creatorId: true },
+    take: allowedCreatorIds.length,
+  });
+  const blockedCreatorIds = new Set(blockingRuns.map((run) => clean(run.creatorId, 160)).filter(Boolean));
 
   // Discovery writes PLANNED rows page-by-page, but they are not claimable until
   // the newest discovery generation is fully frozen. This prevents a second
@@ -134,6 +163,7 @@ async function claimDialogHistoryBatchTx(db, input) {
   let first = null;
   let completedDiscovery = null;
   for (const candidateCreatorId of allowedCreatorIds) {
+    if (blockedCreatorIds.has(candidateCreatorId)) continue;
     const latestDiscovery = await db.dialogScanRun.findFirst({
       where: { agencyId, creatorId: candidateCreatorId, dialogId: "__dialog_discovery__" },
       orderBy: { createdAt: "desc" },
@@ -154,7 +184,13 @@ async function claimDialogHistoryBatchTx(db, input) {
     completedDiscovery = latestDiscovery;
     break;
   }
-  if (!first || !completedDiscovery) return { ok: true, batch: null, reason: "no_frozen_dialog_batch_ready" };
+  if (!first || !completedDiscovery) {
+    return {
+      ok: true,
+      batch: null,
+      reason: blockedCreatorIds.size ? "creator_batch_already_active" : "no_frozen_dialog_batch_ready",
+    };
+  }
 
   const creatorId = first.creatorId;
   const generation = integer(completedDiscovery.generation, integer(first.generation, 0));
@@ -270,7 +306,17 @@ async function claimDialogHistoryBatchTx(db, input) {
 }
 
 async function claimDialogHistoryBatch(input) {
-  return prisma.$transaction((tx) => claimDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+  try {
+    return await prisma.$transaction((tx) => claimDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+  } catch (error) {
+    // A rolling deploy can briefly overlap an older instance that does not yet
+    // take the advisory lock. The partial unique index still chooses one
+    // winner; the loser is an idle claim response, not a failed scan.
+    if (error?.code === "P2002") {
+      return { ok: true, batch: null, reason: "creator_batch_already_active" };
+    }
+    throw error;
+  }
 }
 
 async function requireBatchLeaseTx(db, input, options = {}) {

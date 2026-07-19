@@ -45,10 +45,16 @@ function matches(row, where = {}) {
 function createDb() {
   const states = new Map();
   const runs = new Map();
+  const locks = [];
   let runSeq = 0;
   const api = {
     _states: states,
     _runs: runs,
+    _locks: locks,
+    $queryRawUnsafe: async (...args) => {
+      locks.push(args);
+      return [{ pg_advisory_xact_lock: null }];
+    },
     creatorAccount: {
       findMany: async ({ where }) => where.id.in.map((id) => ({ id })),
     },
@@ -168,6 +174,40 @@ test("one claim reserves one compact batch and creates no JobInstance", async ()
   assert.equal(run.status, "RUNNING");
   assert.equal([...db._states.values()].filter((row) => row.status === "RUNNING").length, 3);
   assert.equal([...db._states.values()].filter((row) => row.status === "PLANNED").length, 2);
+  assert.equal(db._locks.length, 1);
+  assert.equal(db._locks[0][1], "dialog_history_batch_claim:agency-1");
+});
+
+test("an active or paused creator batch blocks a second claim without touching the plan", async () => {
+  for (const status of ["RUNNING", "PAUSED"]) {
+    const db = createDb();
+    seedPlanned(db, 2);
+    seedCompletedDiscovery(db);
+    db._runs.set(`existing-${status}`, {
+      id: `existing-${status}`,
+      agencyId: "agency-1",
+      creatorId: "creator-1",
+      dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID,
+      status,
+      continuation: {
+        leaseUntil: new Date(Date.now() + 600_000).toISOString(),
+      },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await claimDialogHistoryBatchTx(db, {
+      agencyId: "agency-1",
+      deviceId: "device-b",
+      creatorIds: ["creator-1"],
+      batchSize: 2,
+    });
+
+    assert.equal(result.batch, null);
+    assert.equal(result.reason, "creator_batch_already_active");
+    assert.equal([...db._runs.values()].filter((row) => row.dialogId === DIALOG_HISTORY_BATCH_DIALOG_ID).length, 1);
+    assert.equal([...db._states.values()].every((row) => row.status === "PLANNED"), true);
+  }
 });
 
 test("one completion report closes the whole batch and is idempotent", async () => {
