@@ -158,7 +158,7 @@ test("metadata enrichment never activates catalog membership and older JSON cann
   assert.deepEqual(queried.items.map((item) => item.onlyfansMediaId), ["placeholder", "metadata-only"]);
 });
 
-function usageDb() {
+function usageDb({ rawSql = false } = {}) {
   const assets = new Map([
     ["m1", {
       id: "asset-m1",
@@ -178,6 +178,9 @@ function usageDb() {
   ]);
   const contributions = [];
   const sourceStates = new Map();
+  const transactionCalls = [];
+  const usageLocks = [];
+  const bulkUsageUpdates = [];
 
   const matchesMedia = (where, mediaId) => {
     if (where.mediaId?.in && !where.mediaId.in.includes(mediaId)) return false;
@@ -275,9 +278,27 @@ function usageDb() {
         return [...grouped.values()];
       },
     },
-    async $transaction(callback) { return callback(db); },
+    async $transaction(callback, options) {
+      transactionCalls.push(options || null);
+      return callback(db);
+    },
   };
-  return { db, assets, contributions };
+  if (rawSql) {
+    db.$queryRawUnsafe = async (...args) => {
+      usageLocks.push(args);
+      return [{ pg_advisory_xact_lock: null }];
+    };
+    db.$executeRawUnsafe = async (query, agencyId, creatorId, payload) => {
+      const projections = JSON.parse(payload);
+      bulkUsageUpdates.push({ query, agencyId, creatorId, projections });
+      for (const projection of projections) {
+        const asset = assets.get(projection.mediaId);
+        if (asset && asset.agencyId === agencyId && asset.creatorId === creatorId) Object.assign(asset, projection);
+      }
+      return projections.length;
+    };
+  }
+  return { db, assets, contributions, transactionCalls, usageLocks, bulkUsageUpdates };
 }
 
 test("usage sources replace atomically, reject stale revisions, and retain missing ids only as inactive placeholders", async () => {
@@ -330,4 +351,36 @@ test("usage sources replace atomically, reject stale revisions, and retain missi
   });
   assert.equal(stale.staleSources, 1);
   assert.equal(assets.get("m1").sentCount, 5);
+});
+
+test("usage batches commit one bounded source transaction and bulk projection at a time", async () => {
+  const { db, assets, transactionCalls, usageLocks, bulkUsageUpdates } = usageDb({ rawSql: true });
+  const result = await replaceUsageSources({
+    agencyId: AGENCY_ID,
+    creatorId: CREATOR_ID,
+    db,
+    sources: [
+      {
+        sourceKey: "opaque-dialog-a",
+        sourceRevision: "2026-07-19T12:00:00.000Z",
+        capturedAt: "2026-07-19T12:00:00.000Z",
+        items: [{ mediaId: "m1", sentCount: 2, soldCount: 1, notOpenedCount: 0, freeCount: 0, revenueCents: 500, uniqueBuyers: 1 }],
+      },
+      {
+        sourceKey: "opaque-dialog-b",
+        sourceRevision: "2026-07-19T12:01:00.000Z",
+        capturedAt: "2026-07-19T12:01:00.000Z",
+        items: [{ mediaId: "m1", sentCount: 3, soldCount: 0, notOpenedCount: 0, freeCount: 3, revenueCents: 0, uniqueBuyers: 0 }],
+      },
+    ],
+  });
+
+  assert.equal(result.acceptedSources, 2);
+  assert.equal(transactionCalls.length, 2);
+  assert.equal(transactionCalls.every((options) => options.maxWait === 10_000 && options.timeout === 30_000), true);
+  assert.equal(usageLocks.length, 2);
+  assert.equal(bulkUsageUpdates.length, 2);
+  assert.match(bulkUsageUpdates[0].query, /jsonb_to_recordset/);
+  assert.equal(assets.get("m1").sentCount, 5);
+  assert.equal(assets.get("m1").revenueCents, 500);
 });

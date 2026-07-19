@@ -7,6 +7,7 @@ const MAX_MEDIA_IDS = 5000;
 const MAX_IMPORT_ITEMS = 2000;
 const MAX_USAGE_SOURCES = 25;
 const MAX_USAGE_ITEMS_PER_SOURCE = 2000;
+const MEDIA_LIBRARY_USAGE_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 30_000 });
 const MEDIA_TYPES = new Set(["photo", "video", "audio", "gif", "unknown"]);
 const ACCESS_TYPES = new Set(["free", "paid"]);
 const STORYLINE_ROLES = new Set(["main", "additional"]);
@@ -382,24 +383,186 @@ async function recomputeUsage(db, agencyId, creatorId, mediaIds) {
     },
     _max: { lastSoldAt: true, capturedAt: true },
   });
-  for (const group of groups) {
+  const projections = groups.map((group) => {
     const soldCount = integer(group._sum?.soldCount);
     const revenueCents = integer(group._sum?.revenueCents);
+    return {
+      mediaId: clean(group.mediaId, 240),
+      sentCount: integer(group._sum?.sentCount, 0, 0, 2_000_000_000),
+      soldCount: integer(soldCount, 0, 0, 2_000_000_000),
+      notOpenedCount: integer(group._sum?.notOpenedCount, 0, 0, 2_000_000_000),
+      freeCount: integer(group._sum?.freeCount, 0, 0, 2_000_000_000),
+      revenueCents: integer(revenueCents, 0, 0, 2_000_000_000),
+      averagePriceCents: soldCount > 0 ? integer(Math.round(revenueCents / soldCount), 0, 0, 2_000_000_000) : 0,
+      uniqueBuyers: integer(group._sum?.uniqueBuyers, 0, 0, 2_000_000_000),
+      lastSoldAt: iso(group._max?.lastSoldAt),
+      usageUpdatedAt: iso(group._max?.capturedAt || now),
+    };
+  }).filter((group) => group.mediaId);
+
+  if (projections.length && typeof db.$executeRawUnsafe === "function") {
+    // Prisma's per-row update loop is prohibitively expensive against hosted
+    // Postgres. The values were already normalized above; jsonb_to_recordset
+    // applies every aggregate in one parameterized UPDATE.
+    await db.$executeRawUnsafe(`
+      UPDATE "CreatorMediaAsset" AS asset
+      SET
+        "sentCount" = projection."sentCount",
+        "soldCount" = projection."soldCount",
+        "notOpenedCount" = projection."notOpenedCount",
+        "freeCount" = projection."freeCount",
+        "revenueCents" = projection."revenueCents",
+        "averagePriceCents" = projection."averagePriceCents",
+        "uniqueBuyers" = projection."uniqueBuyers",
+        "lastSoldAt" = projection."lastSoldAt",
+        "usageUpdatedAt" = projection."usageUpdatedAt",
+        "updatedAt" = NOW()
+      FROM jsonb_to_recordset($3::jsonb) AS projection(
+        "mediaId" text,
+        "sentCount" integer,
+        "soldCount" integer,
+        "notOpenedCount" integer,
+        "freeCount" integer,
+        "revenueCents" integer,
+        "averagePriceCents" integer,
+        "uniqueBuyers" integer,
+        "lastSoldAt" timestamptz,
+        "usageUpdatedAt" timestamptz
+      )
+      WHERE asset."agencyId" = $1
+        AND asset."creatorId" = $2
+        AND asset."mediaId" = projection."mediaId"
+    `, agencyId, creatorId, JSON.stringify(projections));
+    return;
+  }
+
+  // Test doubles and non-Postgres adapters keep the portable fallback.
+  for (const projection of projections) {
     await db.creatorMediaAsset.updateMany({
-      where: { agencyId, creatorId, mediaId: group.mediaId },
+      where: { agencyId, creatorId, mediaId: projection.mediaId },
       data: {
-        sentCount: integer(group._sum?.sentCount),
-        soldCount,
-        notOpenedCount: integer(group._sum?.notOpenedCount),
-        freeCount: integer(group._sum?.freeCount),
-        revenueCents,
-        averagePriceCents: soldCount > 0 ? Math.round(revenueCents / soldCount) : 0,
-        uniqueBuyers: integer(group._sum?.uniqueBuyers),
-        lastSoldAt: group._max?.lastSoldAt || null,
-        usageUpdatedAt: group._max?.capturedAt || now,
+        sentCount: projection.sentCount,
+        soldCount: projection.soldCount,
+        notOpenedCount: projection.notOpenedCount,
+        freeCount: projection.freeCount,
+        revenueCents: projection.revenueCents,
+        averagePriceCents: projection.averagePriceCents,
+        uniqueBuyers: projection.uniqueBuyers,
+        lastSoldAt: date(projection.lastSoldAt),
+        usageUpdatedAt: date(projection.usageUpdatedAt, now),
       },
     });
   }
+}
+
+async function lockMediaLibraryUsageTx(db, agencyId, creatorId) {
+  if (typeof db.$queryRawUnsafe !== "function") return;
+  await db.$queryRawUnsafe(
+    "SELECT pg_advisory_xact_lock(hashtext($1))",
+    `media_library_usage:${agencyId}:${creatorId}`,
+  );
+}
+
+async function replaceUsageSourceTx(tx, { agencyId, creatorId, source }) {
+  await lockMediaLibraryUsageTx(tx, agencyId, creatorId);
+  const state = await tx.creatorMediaUsageSourceState.findUnique({
+    where: { creatorId_sourceKey: { creatorId, sourceKey: source.sourceKey } },
+  });
+  if (state && compareRevisions(source.sourceRevision, state.sourceRevision) <= 0) {
+    return { accepted: false, stale: true, acceptedItems: 0, missingMediaIds: [] };
+  }
+
+  const affected = new Set();
+  const missing = new Set();
+  const existing = await tx.creatorMediaUsageContribution.findMany({
+    where: { agencyId, creatorId, sourceKey: source.sourceKey },
+    select: { mediaId: true },
+    take: MAX_USAGE_ITEMS_PER_SOURCE,
+  });
+  for (const row of existing) affected.add(String(row.mediaId));
+
+  const incomingIds = source.items.map((item) => item.mediaId);
+  const activeAssets = incomingIds.length ? await tx.creatorMediaAsset.findMany({
+    where: { agencyId, creatorId, catalogActive: true, mediaId: { in: incomingIds } },
+    select: { id: true, mediaId: true },
+    take: incomingIds.length,
+  }) : [];
+  const activeMediaIds = new Set(activeAssets.map((asset) => String(asset.mediaId)));
+  for (const mediaId of incomingIds) {
+    if (!activeMediaIds.has(mediaId)) missing.add(mediaId);
+  }
+
+  if (incomingIds.length) {
+    await tx.creatorMediaAsset.createMany({
+      data: incomingIds.map((mediaId) => ({
+        id: crypto.randomUUID(),
+        agencyId,
+        creatorId,
+        mediaId,
+        catalogActive: false,
+        sortingStatus: "UNSORTED",
+        firstSeenAt: source.capturedAt,
+        lastSeenAt: source.capturedAt,
+      })),
+      skipDuplicates: true,
+    });
+  }
+
+  const assets = incomingIds.length ? await tx.creatorMediaAsset.findMany({
+    where: { agencyId, creatorId, mediaId: { in: incomingIds } },
+    select: { id: true, mediaId: true },
+    take: incomingIds.length,
+  }) : [];
+  const assetByMediaId = new Map(assets.map((asset) => [String(asset.mediaId), asset]));
+  await tx.creatorMediaUsageContribution.deleteMany({
+    where: { agencyId, creatorId, sourceKey: source.sourceKey },
+  });
+
+  const rows = [];
+  for (const item of source.items) {
+    const asset = assetByMediaId.get(item.mediaId);
+    if (!asset) continue;
+    affected.add(item.mediaId);
+    rows.push({
+      id: crypto.randomUUID(),
+      agencyId,
+      creatorId,
+      assetId: asset.id,
+      mediaId: item.mediaId,
+      sourceKey: source.sourceKey,
+      sourceRevision: source.sourceRevision,
+      sentCount: item.sentCount,
+      soldCount: item.soldCount,
+      notOpenedCount: item.notOpenedCount,
+      freeCount: item.freeCount,
+      revenueCents: item.revenueCents,
+      uniqueBuyers: item.uniqueBuyers,
+      lastSoldAt: item.lastSoldAt,
+      capturedAt: source.capturedAt,
+    });
+  }
+  if (rows.length) await tx.creatorMediaUsageContribution.createMany({ data: rows });
+  await tx.creatorMediaUsageSourceState.upsert({
+    where: { creatorId_sourceKey: { creatorId, sourceKey: source.sourceKey } },
+    create: {
+      agencyId,
+      creatorId,
+      sourceKey: source.sourceKey,
+      sourceRevision: source.sourceRevision,
+      capturedAt: source.capturedAt,
+    },
+    update: {
+      sourceRevision: source.sourceRevision,
+      capturedAt: source.capturedAt,
+    },
+  });
+  await recomputeUsage(tx, agencyId, creatorId, [...affected]);
+  return {
+    accepted: true,
+    stale: false,
+    acceptedItems: rows.length,
+    missingMediaIds: [...missing],
+  };
 }
 
 async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma }) {
@@ -419,101 +582,24 @@ async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma }
   };
   if (!normalized.length) return result;
 
-  await db.$transaction(async (tx) => {
-    const affected = new Set();
-    const missing = new Set();
-    for (const source of normalized) {
-      const state = await tx.creatorMediaUsageSourceState.findUnique({
-        where: { creatorId_sourceKey: { creatorId: id, sourceKey: source.sourceKey } },
-      });
-      if (state && compareRevisions(source.sourceRevision, state.sourceRevision) <= 0) {
-        result.staleSources += 1;
-        continue;
-      }
-      const existing = await tx.creatorMediaUsageContribution.findMany({
-        where: { agencyId, creatorId: id, sourceKey: source.sourceKey },
-        select: { mediaId: true },
-        take: MAX_USAGE_ITEMS_PER_SOURCE,
-      });
-      for (const row of existing) affected.add(String(row.mediaId));
-      const incomingIds = source.items.map((item) => item.mediaId);
-      const activeAssets = incomingIds.length ? await tx.creatorMediaAsset.findMany({
-        where: { agencyId, creatorId: id, catalogActive: true, mediaId: { in: incomingIds } },
-        select: { id: true, mediaId: true },
-        take: incomingIds.length,
-      }) : [];
-      const activeMediaIds = new Set(activeAssets.map((asset) => String(asset.mediaId)));
-      for (const mediaId of incomingIds) {
-        if (!activeMediaIds.has(mediaId)) missing.add(mediaId);
-      }
-      if (incomingIds.length) {
-        await tx.creatorMediaAsset.createMany({
-          data: incomingIds.map((mediaId) => ({
-            id: crypto.randomUUID(),
-            agencyId,
-            creatorId: id,
-            mediaId,
-            catalogActive: false,
-            sortingStatus: "UNSORTED",
-            firstSeenAt: source.capturedAt,
-            lastSeenAt: source.capturedAt,
-          })),
-          skipDuplicates: true,
-        });
-      }
-      const assets = incomingIds.length ? await tx.creatorMediaAsset.findMany({
-        where: { agencyId, creatorId: id, mediaId: { in: incomingIds } },
-        select: { id: true, mediaId: true },
-        take: incomingIds.length,
-      }) : [];
-      const assetByMediaId = new Map(assets.map((asset) => [String(asset.mediaId), asset]));
-      await tx.creatorMediaUsageContribution.deleteMany({
-        where: { agencyId, creatorId: id, sourceKey: source.sourceKey },
-      });
-      const rows = [];
-      for (const item of source.items) {
-        const asset = assetByMediaId.get(item.mediaId);
-        if (!asset) continue;
-        affected.add(item.mediaId);
-        rows.push({
-          id: crypto.randomUUID(),
-          agencyId,
-          creatorId: id,
-          assetId: asset.id,
-          mediaId: item.mediaId,
-          sourceKey: source.sourceKey,
-          sourceRevision: source.sourceRevision,
-          sentCount: item.sentCount,
-          soldCount: item.soldCount,
-          notOpenedCount: item.notOpenedCount,
-          freeCount: item.freeCount,
-          revenueCents: item.revenueCents,
-          uniqueBuyers: item.uniqueBuyers,
-          lastSoldAt: item.lastSoldAt,
-          capturedAt: source.capturedAt,
-        });
-      }
-      if (rows.length) await tx.creatorMediaUsageContribution.createMany({ data: rows });
-      await tx.creatorMediaUsageSourceState.upsert({
-        where: { creatorId_sourceKey: { creatorId: id, sourceKey: source.sourceKey } },
-        create: {
-          agencyId,
-          creatorId: id,
-          sourceKey: source.sourceKey,
-          sourceRevision: source.sourceRevision,
-          capturedAt: source.capturedAt,
-        },
-        update: {
-          sourceRevision: source.sourceRevision,
-          capturedAt: source.capturedAt,
-        },
-      });
-      result.acceptedSources += 1;
-      result.acceptedItems += rows.length;
+  const missing = new Set();
+  // One source is the atomic unit. If source N fails, sources 1..N-1 remain
+  // committed and the caller can safely retry the whole request: their durable
+  // revisions make them cheap stale no-ops on the next attempt.
+  for (const source of normalized) {
+    const sourceResult = await db.$transaction(
+      (tx) => replaceUsageSourceTx(tx, { agencyId, creatorId: id, source }),
+      MEDIA_LIBRARY_USAGE_TRANSACTION_OPTIONS,
+    );
+    if (sourceResult.stale) {
+      result.staleSources += 1;
+      continue;
     }
-    await recomputeUsage(tx, agencyId, id, [...affected]);
-    result.missingMediaIds = [...missing];
-  });
+    result.acceptedSources += 1;
+    result.acceptedItems += sourceResult.acceptedItems;
+    for (const mediaId of sourceResult.missingMediaIds) missing.add(mediaId);
+  }
+  result.missingMediaIds = [...missing];
   return result;
 }
 
