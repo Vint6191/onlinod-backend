@@ -13,7 +13,6 @@ const {
   pauseVaultUnsortedScan,
   resumeVaultUnsortedScan,
   cancelVaultUnsortedScan,
-  markVaultUnsortedItems,
 } = require("../services/vault-unsorted-service");
 const {
   getNeverUsedPipelineState,
@@ -38,10 +37,6 @@ const neverUsedListSchema = z.object({
   offset: z.number().int().min(0).max(10_000_000).optional(),
   limit: z.number().int().min(1).max(100).optional(),
   type: z.enum(["photo", "video", "audio", "gif", "unknown"]).optional().nullable(),
-});
-const unsortedMarkSchema = z.object({
-  mediaIds: z.array(z.string().min(1).max(240)).min(1).max(10_000),
-  status: z.enum(["SORTED", "UNSORTED", "HIDDEN"]),
 });
 
 router.param("creatorId", automationCreatorParamRequired());
@@ -119,22 +114,6 @@ router.post("/:creatorId/unsorted/cancel", async (req, res) => {
     return sendError(res, error, "VAULT_UNSORTED_CANCEL_FAILED");
   }
 });
-
-router.post("/:creatorId/unsorted/items/mark", async (req, res) => {
-  try {
-    const input = unsortedMarkSchema.parse(req.body || {});
-    return res.json(await markVaultUnsortedItems({
-      agencyId: req.auth.agencyId,
-      creatorId: req.params.creatorId,
-      mediaIds: input.mediaIds,
-      status: input.status,
-    }));
-  } catch (error) {
-    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
-    return sendError(res, error, "VAULT_UNSORTED_MARK_FAILED");
-  }
-});
-
 
 router.get("/:creatorId/never-used", async (req, res) => {
   try { return res.json(await getNeverUsedPipelineState({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId })); }

@@ -30,7 +30,9 @@ test("dialog and purchase ledgers have DB-backed idempotency constraints", () =>
   assert.match(modelBody("DialogPurchaseSignal"), /idempotencyKey\s+String\s+@unique/);
   assert.match(modelBody("VaultPurchaseLedger"), /idempotencyKey\s+String\s+@unique/);
   assert.match(modelBody("VaultPurchaseMedia"), /@@unique\(\[purchaseId, mediaId\]\)/);
-  assert.match(modelBody("VaultAssetSalesAggregate"), /@@unique\(\[creatorId, assetId\]\)/);
+  assert.match(modelBody("CreatorMediaAsset"), /@@unique\(\[creatorId, mediaId\]\)/);
+  assert.match(modelBody("CreatorMediaUsageContribution"), /@@unique\(\[creatorId, sourceKey, mediaId\]\)/);
+  assert.match(modelBody("CreatorMediaUsageSourceState"), /@@unique\(\[creatorId, sourceKey\]\)/);
   assert.match(modelBody("DialogReconciliationTarget"), /@@unique\(\[creatorId, dialogId, messageId\]\)/);
 });
 

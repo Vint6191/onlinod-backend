@@ -30,11 +30,17 @@ function dbFixture({
   activeRuns: suppliedActiveRuns = null,
 } = {}) {
   const catalogRows = suppliedRows || (complete ? [
-    { id: "row-used", mediaId: "used", mediaType: "video", status: "SORTED", thumbUrl: "used.jpg", folderIds: ["folder-a"], duration: 2, lastSeenAt: date(), updatedAt: date() },
-    { id: "row-unused", mediaId: "unused", mediaType: "photo", status: "UNSORTED", thumbUrl: "unused.jpg", folderIds: [], duration: 0, lastSeenAt: date(), updatedAt: date() },
-    { id: "row-sorted-unused", mediaId: "sorted-unused", mediaType: "photo", status: "SORTED", thumbUrl: "sorted.jpg", folderIds: ["folder-b"], duration: 0, lastSeenAt: date(), updatedAt: date() },
+    { id: "row-used", mediaId: "used", mediaType: "video", sortingStatus: "SORTED", thumbUrl: "used.jpg", folderIds: ["folder-a"], durationSec: 2, lastSeenAt: date(), updatedAt: date() },
+    { id: "row-unused", mediaId: "unused", mediaType: "photo", sortingStatus: "UNSORTED", thumbUrl: "unused.jpg", folderIds: [], durationSec: 0, lastSeenAt: date(), updatedAt: date() },
+    { id: "row-sorted-unused", mediaId: "sorted-unused", mediaType: "photo", sortingStatus: "SORTED", thumbUrl: "sorted.jpg", folderIds: ["folder-b"], durationSec: 0, lastSeenAt: date(), updatedAt: date() },
   ] : []);
-  const visibleCatalog = catalogRows.filter((row) => row.status !== "HIDDEN");
+  const used = new Set([...usedIds, ...soldIds]);
+  const visibleCatalog = catalogRows.map((row) => ({
+    ...row,
+    catalogActive: row.catalogActive !== false,
+    sentCount: used.has(row.mediaId) ? 1 : 0,
+    usageUpdatedAt: date(),
+  })).filter((row) => row.catalogActive);
   const defaultDialogStates = complete ? [{
     dialogId: "dialog-1", scanMode: "initial", initialScanComplete: true, status: "COMPLETED",
     activeRunId: null, activeJobId: null, pagesProcessed: 3, messagesProcessed: 90,
@@ -47,8 +53,6 @@ function dbFixture({
     purchaseSignals: dialogStates.length, completedAt: date(), updatedAt: date(), lastError: null,
   }] : []);
   const activeRuns = suppliedActiveRuns || [];
-  const used = new Set(usedIds);
-  const sold = new Set(soldIds);
 
   function matchesCursor(rows, args) {
     const cursor = args.cursor?.id;
@@ -61,11 +65,10 @@ function dbFixture({
     if (ids) rows = rows.filter((row) => ids.includes(row.mediaId));
     const type = args.where?.mediaType;
     if (type) rows = rows.filter((row) => row.mediaType === type);
+    if (args.where?.catalogActive !== undefined) rows = rows.filter((row) => row.catalogActive === args.where.catalogActive);
+    if (args.where?.sentCount === 0) rows = rows.filter((row) => row.sentCount === 0);
+    if (args.where?.sentCount?.gt !== undefined) rows = rows.filter((row) => row.sentCount > args.where.sentCount.gt);
     return rows;
-  }
-  function evidenceRows(args, evidenceSet, field) {
-    const ids = args.where?.[field]?.in || [];
-    return ids.filter((id) => evidenceSet.has(id)).map((id) => ({ [field]: id, updatedAt: date() }));
   }
 
   return {
@@ -75,8 +78,8 @@ function dbFixture({
         if (!complete) return null;
         return {
           id: "messages", creatorId: "creator-1", itemsCount: visibleCatalog.length,
-          unsortedCount: visibleCatalog.filter((row) => row.status === "UNSORTED").length,
-          sortedCount: visibleCatalog.filter((row) => row.status === "SORTED").length,
+          unsortedCount: visibleCatalog.filter((row) => row.sortingStatus === "UNSORTED").length,
+          sortedCount: visibleCatalog.filter((row) => row.sortingStatus === "SORTED").length,
           capturedAt: date(), updatedAt: date(),
           payload: {
             schema: 3, kind: "vault_unsorted_snapshot", messagesFolderId: "messages",
@@ -86,7 +89,7 @@ function dbFixture({
         };
       },
     },
-    vaultUnsortedItem: {
+    creatorMediaAsset: {
       async findMany(args) {
         const rows = filterCatalog(args);
         if (args.orderBy?.[0]?.lastSeenAt) {
@@ -96,21 +99,10 @@ function dbFixture({
         return matchesCursor(rows, args);
       },
       async count(args) { return filterCatalog(args).length; },
-    },
-    dialogMessageMedia: {
-      async findMany(args) {
-        if (args.where?.mediaId?.in) return evidenceRows(args, used, "mediaId");
-        if (args.where?.assetId?.in) return evidenceRows(args, used, "assetId");
-        return [];
+      async findFirst() {
+        const row = visibleCatalog.find((item) => item.usageUpdatedAt);
+        return row ? { usageUpdatedAt: row.usageUpdatedAt } : null;
       },
-    },
-    vaultAssetSalesAggregate: {
-      async findMany(args) {
-        if (args.where?.mediaId?.in) return evidenceRows(args, sold, "mediaId");
-        if (args.where?.assetId?.in) return evidenceRows(args, sold, "assetId");
-        return [];
-      },
-      async findFirst() { return sold.size ? { updatedAt: date() } : null; },
     },
     dialogScanState: {
       async findMany() { return dialogStates; },
@@ -183,10 +175,10 @@ test("Never Used pagination never skips candidates inside an over-fetched catalo
     id: `row-${String(index).padStart(3, "0")}`,
     mediaId: `media-${String(index).padStart(3, "0")}`,
     mediaType: "photo",
-    status: index % 2 ? "SORTED" : "UNSORTED",
+    sortingStatus: index % 2 ? "SORTED" : "UNSORTED",
     thumbUrl: "",
     folderIds: [],
-    duration: 0,
+    durationSec: 0,
     lastSeenAt: date(75 - index),
     updatedAt: date(),
   }));
@@ -275,21 +267,22 @@ test("a real failed attempt is shown as RETRYING with queue diagnostics", async 
   assert.equal(result.pipeline.dialogs.current.lastError, "HTTP 500");
 });
 
-test("projection queries evidence in bounded chunks", async () => {
+test("projection reads canonical Media Library rows in bounded chunks", async () => {
   const count = PROJECTION_CHUNK_SIZE + 1;
   const rows = Array.from({ length: count }, (_, index) => ({
-    id: `row-${String(index).padStart(6, "0")}`, mediaId: `media-${index}`, mediaType: "photo", status: index % 2 ? "SORTED" : "UNSORTED", updatedAt: date(), lastSeenAt: date(), folderIds: [], duration: 0,
+    id: `row-${String(index).padStart(6, "0")}`, mediaId: `media-${index}`, mediaType: "photo", sortingStatus: index % 2 ? "SORTED" : "UNSORTED", updatedAt: date(), lastSeenAt: date(), folderIds: [], durationSec: 0,
   }));
   const db = dbFixture({ complete: true, catalogRows: rows, usedIds: [] });
   const batchSizes = [];
-  db.dialogMessageMedia.findMany = async (args) => {
-    if (args.where?.mediaId?.in) batchSizes.push(args.where.mediaId.in.length);
-    return [];
+  const originalFindMany = db.creatorMediaAsset.findMany;
+  db.creatorMediaAsset.findMany = async (args) => {
+    if (args.orderBy?.id === "asc") batchSizes.push(args.take);
+    return originalFindMany(args);
   };
   const result = await projectionCounts(db, "agency-1", "creator-1");
   assert.equal(result.catalogMedia, count);
   assert.equal(result.neverUsed, count);
-  assert.deepEqual(batchSizes, [PROJECTION_CHUNK_SIZE, 1]);
+  assert.deepEqual(batchSizes, [PROJECTION_CHUNK_SIZE, PROJECTION_CHUNK_SIZE]);
   assert.ok(batchSizes.every((size) => size <= PROJECTION_CHUNK_SIZE));
 });
 

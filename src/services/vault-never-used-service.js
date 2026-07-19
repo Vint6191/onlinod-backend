@@ -536,49 +536,22 @@ function emptyProjection(snapshot = null, { deferred = false } = {}) {
 
 async function usedMediaIdsForBatch(db, agencyId, creatorId, ids) {
   if (!ids.length) return { ids: new Set(), updatedAt: null };
-  const creatorEvidence = {
-    agencyId,
-    creatorId,
-    OR: [{ ownership: "CREATOR" }, { isFanMedia: false, messageLedger: { isFromCreator: true } }],
-  };
-  const [ledgerMedia, ledgerAssets, salesMedia, salesAssets] = await Promise.all([
-    db.dialogMessageMedia.findMany({
-      where: { ...creatorEvidence, mediaId: { in: ids } },
-      distinct: ["mediaId"],
-      select: { mediaId: true, updatedAt: true },
-      take: ids.length,
-    }),
-    db.dialogMessageMedia.findMany({
-      where: { ...creatorEvidence, assetId: { in: ids } },
-      distinct: ["assetId"],
-      select: { assetId: true, updatedAt: true },
-      take: ids.length,
-    }),
-    db.vaultAssetSalesAggregate.findMany({
-      where: { agencyId, creatorId, mediaId: { in: ids } },
-      distinct: ["mediaId"],
-      select: { mediaId: true, updatedAt: true },
-      take: ids.length,
-    }),
-    db.vaultAssetSalesAggregate.findMany({
-      where: { agencyId, creatorId, assetId: { in: ids } },
-      distinct: ["assetId"],
-      select: { assetId: true, updatedAt: true },
-      take: ids.length,
-    }),
-  ]);
-
-  const candidateIds = new Set(ids);
-  const used = new Set();
-  const freshness = [];
-  for (const row of [...ledgerMedia, ...ledgerAssets, ...salesMedia, ...salesAssets]) {
-    for (const value of [row.mediaId, row.assetId]) {
-      const id = clean(value);
-      if (id && candidateIds.has(id)) used.add(id);
-    }
-    const updatedAt = timestamp(row.updatedAt);
-    if (Number.isFinite(updatedAt)) freshness.push(updatedAt);
-  }
+  const rows = await db.creatorMediaAsset.findMany({
+    where: {
+      agencyId,
+      creatorId,
+      catalogActive: true,
+      sentCount: { gt: 0 },
+      mediaId: { in: ids },
+    },
+    select: { mediaId: true, usageUpdatedAt: true, updatedAt: true },
+    take: ids.length,
+  });
+  const used = new Set(rows.map((row) => clean(row.mediaId)).filter(Boolean));
+  const freshness = rows
+    .flatMap((row) => [row.usageUpdatedAt, row.updatedAt])
+    .map(timestamp)
+    .filter(Number.isFinite);
   return {
     ids: used,
     updatedAt: freshness.length ? new Date(Math.max(...freshness)).toISOString() : null,
@@ -594,19 +567,14 @@ async function projectionCounts(db, agencyId, creatorId) {
   let cursorId = null;
 
   for (;;) {
-    const page = await db.vaultUnsortedItem.findMany({
-      where: { agencyId, creatorId, status: { not: "HIDDEN" } },
-      select: { id: true, mediaId: true, mediaType: true, updatedAt: true },
+    const page = await db.creatorMediaAsset.findMany({
+      where: { agencyId, creatorId, catalogActive: true },
+      select: { id: true, mediaId: true, mediaType: true, updatedAt: true, usageUpdatedAt: true, sentCount: true },
       orderBy: { id: "asc" },
       take: PROJECTION_CHUNK_SIZE,
       ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
     });
     if (!page.length) break;
-
-    const ids = page.map((row) => clean(row.mediaId)).filter(Boolean);
-    const used = await usedMediaIdsForBatch(db, agencyId, creatorId, ids);
-    const usedAt = timestamp(used.updatedAt);
-    if (Number.isFinite(usedAt)) newestEvidenceAt = Math.max(newestEvidenceAt, usedAt);
 
     for (const row of page) {
       const id = clean(row.mediaId);
@@ -618,8 +586,10 @@ async function projectionCounts(db, agencyId, creatorId) {
 
       const rowAt = timestamp(row.updatedAt);
       if (Number.isFinite(rowAt)) newestEvidenceAt = Math.max(newestEvidenceAt, rowAt);
+      const usageAt = timestamp(row.usageUpdatedAt);
+      if (Number.isFinite(usageAt)) newestEvidenceAt = Math.max(newestEvidenceAt, usageAt);
 
-      if (used.ids.has(id)) {
+      if (number(row.sentCount) > 0) {
         usedCreatorMedia += 1;
       } else {
         neverUsedByType.all += 1;
@@ -662,12 +632,12 @@ function projectionFingerprint(messagesSnapshot, dialogs, salesUpdatedAt) {
 }
 
 async function latestSalesUpdatedAt(db, agencyId, creatorId) {
-  const row = await db.vaultAssetSalesAggregate.findFirst({
-    where: { agencyId, creatorId },
-    orderBy: { updatedAt: "desc" },
-    select: { updatedAt: true },
+  const row = await db.creatorMediaAsset.findFirst({
+    where: { agencyId, creatorId, catalogActive: true, usageUpdatedAt: { not: null } },
+    orderBy: { usageUpdatedAt: "desc" },
+    select: { usageUpdatedAt: true },
   });
-  return iso(row?.updatedAt);
+  return iso(row?.usageUpdatedAt);
 }
 
 async function cachedProjection(db, agencyId, creatorId, fingerprint) {
@@ -880,10 +850,10 @@ function rowToMedia(row) {
     type,
     name: `${type === "unknown" ? "media" : type} #${row.mediaId}`,
     createdAt: null,
-    duration: integer(row.duration, 0, 0, 24 * 60 * 60),
+    duration: integer(row.durationSec, 0, 0, 24 * 60 * 60),
     thumbUrl: row.thumbUrl || "",
-    previewUrl: row.thumbUrl || "",
-    fullUrl: row.thumbUrl || "",
+    previewUrl: row.previewUrl || row.thumbUrl || "",
+    fullUrl: row.fullUrl || row.previewUrl || row.thumbUrl || "",
     folderIds: Array.isArray(row.folderIds) ? row.folderIds : [],
     lastSeenAt: iso(row.lastSeenAt),
   };
@@ -913,45 +883,29 @@ async function listVaultNeverUsedMedia({ agencyId, creatorId, offset = 0, limit 
   const where = {
     agencyId,
     creatorId,
-    status: { not: "HIDDEN" },
+    catalogActive: true,
+    sentCount: 0,
     ...(mediaType ? { mediaType } : {}),
   };
-  const catalogTotal = await db.vaultUnsortedItem.count({ where });
-  let scanOffset = safeOffset;
-  const media = [];
-
-  while (scanOffset < catalogTotal && media.length < safeLimit) {
-    const rows = await db.vaultUnsortedItem.findMany({
+  const [rows, total] = await Promise.all([
+    db.creatorMediaAsset.findMany({
       where,
       orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }],
-      skip: scanOffset,
-      take: Math.min(LIST_SCAN_CHUNK_SIZE, catalogTotal - scanOffset),
-    });
-    if (!rows.length) break;
-    const used = await usedMediaIdsForBatch(db, agencyId, creatorId, rows.map((row) => String(row.mediaId)));
-    let processedRows = 0;
-    for (const row of rows) {
-      processedRows += 1;
-      if (!used.ids.has(String(row.mediaId))) media.push(rowToMedia(row));
-      if (media.length >= safeLimit) break;
-    }
-    // nextOffset is a continuation over the Messages catalog, not a result-row
-    // offset. Advance only past rows actually inspected so a dense Never Used
-    // page cannot skip unprocessed candidates from an over-fetched DB batch.
-    scanOffset += processedRows;
-  }
-
-  const total = mediaType
-    ? number(pipeline.projection?.byType?.[mediaType])
-    : number(pipeline.projection?.neverUsed);
+      skip: safeOffset,
+      take: safeLimit,
+    }),
+    db.creatorMediaAsset.count({ where }),
+  ]);
+  const media = rows.map(rowToMedia);
+  const nextOffset = safeOffset + media.length;
   return {
     ok: true,
     creatorId,
     media,
     total,
     offset: safeOffset,
-    nextOffset: scanOffset,
-    hasMore: scanOffset < catalogTotal,
+    nextOffset,
+    hasMore: nextOffset < total,
     pipeline,
   };
 }

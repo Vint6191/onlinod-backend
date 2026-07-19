@@ -6,7 +6,12 @@ const { cleanString, optionalString, jsonArray, jsonObject, centsFromAny, parseL
 
 const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 const { audit } = require("../services/audit-service");
-const { rebuildCreatorAggregates, scheduleDialogScan } = require("../services/dialog-intelligence-service");
+const { scheduleDialogScan } = require("../services/dialog-intelligence-service");
+const {
+  getMediaSalesSummary,
+  listMediaSalesAssets,
+  rebuildMediaUsage,
+} = require("../services/media-library-service");
 
 const router = express.Router();
 
@@ -185,41 +190,10 @@ router.get("/v2/summary/:creatorId", async (req, res) => {
   try {
     const creatorId = cleanString(req.params.creatorId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
-    const soldWhere = {
+    return res.json(await getMediaSalesSummary({
       agencyId: req.auth.agencyId,
       creatorId,
-      isOpened: true,
-      isFree: false,
-      priceCents: { gt: 0 },
-      status: { notIn: ["REFUNDED", "INVALID", "EXCLUDED_FAN_MEDIA"] },
-    };
-    const [sold, opened, notOpened, free, unresolved, buyers, deletedBuyers, assets, lastSale] = await Promise.all([
-      prisma.vaultPurchaseLedger.aggregate({ where: soldWhere, _sum: { priceCents: true }, _count: { _all: true } }),
-      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, isOpened: true, isFree: false } }),
-      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, isOpened: false, isFree: false, priceCents: { gt: 0 } } }),
-      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, OR: [{ isFree: true }, { priceCents: { lte: 0 } }] } }),
-      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, resolveState: { not: "RESOLVED" } } }),
-      prisma.vaultPurchaseLedger.findMany({ where: soldWhere, distinct: ["buyerId"], select: { buyerId: true }, take: 100000 }),
-      prisma.vaultPurchaseLedger.count({ where: { agencyId: req.auth.agencyId, creatorId, buyerDeleted: true } }),
-      prisma.vaultAssetSalesAggregate.count({ where: { agencyId: req.auth.agencyId, creatorId, soldCount: { gt: 0 } } }),
-      prisma.vaultPurchaseLedger.findFirst({ where: soldWhere, orderBy: { purchasedAt: "desc" }, select: { purchasedAt: true } }),
-    ]);
-    return res.json({
-      ok: true,
-      summary: {
-        creatorId,
-        soldAssets: assets,
-        totalSales: sold._count._all || 0,
-        revenueCents: sold._sum.priceCents || 0,
-        opened: opened,
-        notOpened,
-        free,
-        unresolved,
-        uniqueBuyers: buyers.filter((item) => item.buyerId).length,
-        deletedBuyers,
-        lastSaleAt: lastSale?.purchasedAt || null,
-      },
-    });
+    }));
   } catch (err) { return sendError(res, err, "VAULT_SALES_V2_SUMMARY_FAILED"); }
 });
 
@@ -230,12 +204,13 @@ router.get("/v2/assets", async (req, res) => {
     const take = parseLimit(req.query.limit, 100, 250);
     const skip = parseOffset(req.query.offset);
     const mediaType = cleanString(req.query.mediaType, 80);
-    const where = { agencyId: req.auth.agencyId, creatorId, ...(mediaType ? { mediaType } : {}) };
-    const [items, count] = await Promise.all([
-      prisma.vaultAssetSalesAggregate.findMany({ where, orderBy: [{ totalRevenueCents: "desc" }, { lastSoldAt: "desc" }], skip, take }),
-      prisma.vaultAssetSalesAggregate.count({ where }),
-    ]);
-    return res.json({ ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count });
+    return res.json(await listMediaSalesAssets({
+      agencyId: req.auth.agencyId,
+      creatorId,
+      offset: skip,
+      limit: take,
+      mediaType: mediaType || null,
+    }));
   } catch (err) { return sendError(res, err, "VAULT_SALES_V2_ASSETS_FAILED"); }
 });
 
@@ -293,7 +268,7 @@ router.post("/v2/rebuild/:creatorId", seniorRequired, async (req, res) => {
   try {
     const creatorId = cleanString(req.params.creatorId, 100);
     await requireCreator(prisma, req.auth.agencyId, creatorId);
-    const result = await rebuildCreatorAggregates({ agencyId: req.auth.agencyId, creatorId });
+    const result = await rebuildMediaUsage({ agencyId: req.auth.agencyId, creatorId });
     await audit({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, action: "vault_sales.aggregate_rebuilt", targetType: "creator", targetId: creatorId, metadata: result });
     return res.json(result);
   } catch (err) { return sendError(res, err, "VAULT_SALES_REBUILD_FAILED"); }

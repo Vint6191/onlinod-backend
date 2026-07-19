@@ -17,36 +17,58 @@ const {
 
 function date(value = "2026-07-16T12:00:00.000Z") { return new Date(value); }
 
+function matchesWhere(row, where = {}) {
+  if (where.catalogActive !== undefined && row.catalogActive !== where.catalogActive) return false;
+  if (where.mediaId?.in && !where.mediaId.in.includes(row.mediaId)) return false;
+  if (where.sentCount?.gt !== undefined && row.sentCount <= where.sentCount.gt) return false;
+  if (where.soldCount?.gt !== undefined && row.soldCount <= where.soldCount.gt) return false;
+  return true;
+}
+
 function fakeDb() {
   const catalog = [
-    { id: "c1", mediaId: "m1", mediaType: "video", status: "SORTED", updatedAt: date(), lastSeenAt: date() },
-    { id: "c3", mediaId: "m3", mediaType: "photo", status: "UNSORTED", updatedAt: date(), lastSeenAt: date() },
+    {
+      id: "c1", mediaId: "m1", mediaType: "video", catalogActive: true,
+      sortingStatus: "SORTED", sentCount: 3, soldCount: 2, notOpenedCount: 1,
+      freeCount: 0, revenueCents: 5000, averagePriceCents: 2500,
+      uniqueBuyers: 2, lastSoldAt: date(), thumbUrl: "https://cdn/x.jpg",
+      previewUrl: "https://cdn/x-preview.jpg", fullUrl: "https://cdn/x-full.jpg",
+      updatedAt: date(), usageUpdatedAt: date(), lastSeenAt: date(),
+    },
+    {
+      id: "c3", mediaId: "m3", mediaType: "photo", catalogActive: true,
+      sortingStatus: "UNSORTED", sentCount: 0, soldCount: 0, notOpenedCount: 0,
+      freeCount: 0, revenueCents: 0, averagePriceCents: 0, uniqueBuyers: 0,
+      lastSoldAt: null, thumbUrl: null, previewUrl: null, fullUrl: null,
+      updatedAt: date(), usageUpdatedAt: date(), lastSeenAt: date(),
+    },
   ];
-  const used = new Set(["m1"]);
-  function evidence(args, field) {
-    const ids = args.where?.[field]?.in || [];
-    return ids.filter((id) => used.has(id)).map((id) => ({ [field]: id, updatedAt: date() }));
-  }
   return {
     creatorAccount: { async findFirst() { return { id: "creator-1" }; } },
-    dialogMessageMedia: {
+    creatorMediaAsset: {
+      async count({ where }) { return catalog.filter((row) => matchesWhere(row, where)).length; },
+      async aggregate({ where }) {
+        const rows = catalog.filter((row) => matchesWhere(row, where));
+        return {
+          _sum: {
+            soldCount: rows.reduce((sum, row) => sum + row.soldCount, 0),
+            revenueCents: rows.reduce((sum, row) => sum + row.revenueCents, 0),
+          },
+          _max: { lastSoldAt: rows.map((row) => row.lastSoldAt).filter(Boolean).sort().at(-1) || null },
+        };
+      },
       async findMany(args) {
-        if (args.where?.mediaId?.in) return evidence(args, "mediaId");
-        if (args.where?.assetId?.in) return evidence(args, "assetId");
-        return [{ mediaId: "m1" }];
+        return catalog.filter((row) => matchesWhere(row, args.where)).slice(0, args.take || catalog.length);
       },
-      async groupBy(args) {
-        const field = args.by[0];
-        const ids = args.where?.[field]?.in || [];
-        return ids.filter((id) => used.has(id)).map((id) => ({ [field]: id, _count: { _all: 3 } }));
+      async findFirst({ where }) {
+        return catalog.filter((row) => matchesWhere(row, where))[0] || null;
       },
-      async findFirst() { return { updatedAt: date() }; },
     },
     vaultUnsortedSnapshot: {
       async findUnique() {
         return {
-          id: "messages", creatorId: "creator-1", itemsCount: catalog.length, unsortedCount: 1, sortedCount: 1,
-          capturedAt: date(), updatedAt: date(),
+          id: "messages", creatorId: "creator-1", itemsCount: catalog.length,
+          unsortedCount: 1, sortedCount: 1, capturedAt: date(), updatedAt: date(),
           payload: {
             schema: 3, kind: "vault_unsorted_snapshot", messagesFolderId: "messages",
             lastFullScanAt: date().toISOString(), lastIncrementalScanAt: null,
@@ -54,28 +76,6 @@ function fakeDb() {
           },
         };
       },
-    },
-    vaultUnsortedItem: {
-      async findMany(args) {
-        let rows = catalog;
-        const ids = args.where?.mediaId?.in;
-        if (ids) rows = rows.filter((row) => ids.includes(row.mediaId));
-        const cursor = args.cursor?.id;
-        const start = cursor ? rows.findIndex((row) => row.id === cursor) + Number(args.skip || 0) : Number(args.skip || 0);
-        return rows.slice(Math.max(0, start), Math.max(0, start) + Number(args.take || rows.length));
-      },
-      async count() { return catalog.length; },
-    },
-    vaultAssetSalesAggregate: {
-      async aggregate() { return { _sum: { totalRevenueCents: 5000, soldCount: 2 }, _max: { lastSoldAt: date() } }; },
-      async count() { return 1; },
-      async findMany(args) {
-        if (args.take === 100) return [{ assetId: "m1", mediaId: "m1", mediaType: "video", soldCount: 2, totalRevenueCents: 5000, averagePriceCents: 2500, uniqueBuyers: 2, notOpenedCount: 1, freeCount: 0, preview: { thumbUrl: "https://cdn/x.jpg" }, lastSoldAt: date(), updatedAt: date() }];
-        if (args.where?.mediaId?.in) return evidence(args, "mediaId");
-        if (args.where?.assetId?.in) return evidence(args, "assetId");
-        return [];
-      },
-      async findFirst() { return { updatedAt: date() }; },
     },
     dialogScanState: {
       async findMany() { return [{ initialScanComplete: true, status: "COMPLETED", pagesProcessed: 3, messagesProcessed: 90, lastError: null, lastFullScanAt: date(), lastIncrementalScanAt: null, updatedAt: date() }]; },
@@ -98,7 +98,7 @@ test("cleanMediaIds deduplicates and bounds input", () => {
   assert.deepEqual(cleanMediaIds(["m1", "m1", "", "m2"], 2), ["m1", "m2"]);
 });
 
-test("Messages catalog is candidate inventory, but catalog membership itself is not usage", async () => {
+test("Media Library membership is protection while usage stays independently aggregated", async () => {
   const result = await getVaultDirectoryIntelligence({
     agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["m1", "m2", "m3"], db: fakeDb(),
   });
@@ -109,7 +109,7 @@ test("Messages catalog is candidate inventory, but catalog membership itself is 
   assert.equal(byId.get("m3").usageState, "NEVER_USED");
   assert.equal(byId.get("m3").inMessagesCatalog, true);
   assert.equal(byId.get("m2").usageState, "NOT_APPLICABLE");
-  assert.equal(byId.get("m2").neverUsed, false);
+  assert.equal(result.summary.protectedMediaCount, 2);
 });
 
 test("catalog media stays pending until initial Messages and dialog scans are authoritative", async () => {
@@ -121,7 +121,9 @@ test("catalog media stays pending until initial Messages and dialog scans are au
   assert.equal(result.analytics[0].neverUsed, false);
 });
 
-test("protection check returns only creator-owned dialog media", async () => {
-  const result = await checkProtectedVaultMedia({ agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["m1", "m2"], db: fakeDb() });
-  assert.deepEqual(result.protectedMediaIds, ["m1"]);
+test("protection check returns every requested active Media Library id", async () => {
+  const result = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["m1", "m2", "m3"], db: fakeDb(),
+  });
+  assert.deepEqual(result.protectedMediaIds, ["m1", "m3"]);
 });

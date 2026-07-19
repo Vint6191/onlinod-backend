@@ -99,12 +99,13 @@ model Agency {
   automationRuns AutomationRun[]
   automationLogs AutomationLog[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
-  vaultUnsortedItems     VaultUnsortedItem[]
   presenceSnapshots CreatorPresenceSnapshot[]
   presenceUsers     CreatorPresenceUser[]
   moneyAttributions MoneyAttribution[]
   mediaAssets       CreatorMediaAsset[]
-  mediaDeliveryEvents CreatorMediaDeliveryEvent[]
+  mediaUsageContributions CreatorMediaUsageContribution[]
+  mediaUsageSourceStates CreatorMediaUsageSourceState[]
+  mediaLibraryScanItems MediaLibraryScanItem[]
   contentCollections ContentCollection[]
   crmProfiles CrmProfile[]
   crmProfileTags CrmProfileTag[]
@@ -140,7 +141,6 @@ model Agency {
   dialogPurchaseSignals DialogPurchaseSignal[]
   vaultPurchaseLedgers VaultPurchaseLedger[]
   vaultPurchaseMediaRelations VaultPurchaseMedia[]
-  vaultAssetSalesAggregates VaultAssetSalesAggregate[]
   teamObservationStates TeamObservationState[]
   trafficSources TrafficSource[]
   trafficSourceMembers TrafficSourceMember[]
@@ -204,11 +204,12 @@ model CreatorAccount {
   teamActivityEvents TeamActivityEvent[]
   messageTemplateUsageEvents MessageTemplateUsageEvent[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
-  vaultUnsortedItems     VaultUnsortedItem[]
   presenceSnapshot CreatorPresenceSnapshot?
   presenceUsers    CreatorPresenceUser[]
   mediaAssets      CreatorMediaAsset[]
-  mediaDeliveryEvents CreatorMediaDeliveryEvent[]
+  mediaUsageContributions CreatorMediaUsageContribution[]
+  mediaUsageSourceStates CreatorMediaUsageSourceState[]
+  mediaLibraryScanItems MediaLibraryScanItem[]
   contentCollections ContentCollection[]
   crmProfiles CrmProfile[]
   crmNotes CrmNote[]
@@ -242,7 +243,6 @@ model CreatorAccount {
   dialogPurchaseSignals DialogPurchaseSignal[]
   vaultPurchaseLedgers VaultPurchaseLedger[]
   vaultPurchaseMediaRelations VaultPurchaseMedia[]
-  vaultAssetSalesAggregates VaultAssetSalesAggregate[]
   teamObservationStates TeamObservationState[]
   trafficSources TrafficSource[]
   trafficSourceMembers TrafficSourceMember[]
@@ -1107,33 +1107,6 @@ model VaultUnsortedSnapshot {
 
 
 
-model VaultUnsortedItem {
-  id            String   @id @default(cuid())
-  agencyId      String
-  creatorId     String
-  mediaId       String
-  status        String   @default("UNSORTED")
-  mediaType     String   @default("unknown")
-  thumbUrl      String?
-  duration      Int      @default(0)
-  folderIds     Json     @default("[]")
-  firstSeenAt   DateTime @default(now())
-  lastSeenAt    DateTime @default(now())
-  lastSeenJobId String?
-  pendingScanToken String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@unique([agencyId, creatorId, mediaId])
-  @@index([agencyId, creatorId, status, lastSeenAt])
-  @@index([creatorId, status, lastSeenAt])
-  @@index([lastSeenJobId])
-  @@index([pendingScanToken])
-}
-
 model CreatorPresenceSnapshot {
   id                String   @id @default(cuid())
   agencyId          String
@@ -1235,54 +1208,128 @@ model MoneyAttribution {
 }
 
 model CreatorMediaAsset {
-  id          String   @id @default(cuid())
-  agencyId    String
-  creatorId   String
-  mediaId     String
+  id                String   @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  mediaId           String
 
-  type              String?
-  durationSec       Int?
-  costCents         Int?
-  targetPriceCents  Int?
-  tags              Json     @default("[]")
+  catalogActive     Boolean  @default(false)
+  sortingStatus     String   @default("UNSORTED")
+  mediaType         String   @default("unknown")
+  durationSec       Int      @default(0)
+  thumbUrl          String?
+  previewUrl        String?
+  fullUrl           String?
+  folderIds         Json     @default("[]")
+
+  description       String?
+  manualTags        Json     @default("[]")
+  visibleBodyParts  Json     @default("[]")
+  accessType        String   @default("paid")
+  minPriceCents     Int      @default(0)
+  idealPriceCents   Int      @default(0)
+  storylineName     String?
+  storylineOrder    Int?
+  storylineRole     String?
   metadata          Json     @default("{}")
+  metadataUpdatedAt DateTime?
+  metadataUpdatedByUserId String?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  sentCount         Int      @default(0)
+  soldCount         Int      @default(0)
+  notOpenedCount    Int      @default(0)
+  freeCount         Int      @default(0)
+  revenueCents      Int      @default(0)
+  averagePriceCents Int      @default(0)
+  uniqueBuyers      Int      @default(0)
+  lastSoldAt        DateTime?
+  usageUpdatedAt    DateTime?
 
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  firstSeenAt       DateTime @default(now())
+  lastSeenAt        DateTime @default(now())
+  lastSeenJobId     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agency             Agency                          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator            CreatorAccount                  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  usageContributions CreatorMediaUsageContribution[]
 
   @@unique([creatorId, mediaId])
-  @@index([agencyId])
-  @@index([creatorId])
-  @@index([mediaId])
+  @@index([agencyId, creatorId, catalogActive, sortingStatus, lastSeenAt])
+  @@index([creatorId, catalogActive, sentCount, lastSeenAt])
+  @@index([creatorId, catalogActive, revenueCents])
+  @@index([lastSeenJobId])
 }
 
-model CreatorMediaDeliveryEvent {
-  id        String   @id @default(cuid())
-  agencyId  String
-  creatorId String
+model CreatorMediaUsageContribution {
+  id                String   @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  assetId           String
+  mediaId           String
+  sourceKey         String
+  sourceRevision    String
+  sentCount         Int      @default(0)
+  soldCount         Int      @default(0)
+  notOpenedCount    Int      @default(0)
+  freeCount         Int      @default(0)
+  revenueCents      Int      @default(0)
+  uniqueBuyers      Int      @default(0)
+  lastSoldAt        DateTime?
+  capturedAt        DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
-  messageId String
-  mediaId   String
+  agency  Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount    @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  asset   CreatorMediaAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
 
-  packSize             Int    @default(1)
-  packagePriceCents    Int    @default(0)
-  allocatedAmountCents Int    @default(0)
-  status               String @default("not_opened")
-  source               String @default("electron")
+  @@unique([creatorId, sourceKey, mediaId])
+  @@index([creatorId, sourceKey])
+  @@index([creatorId, mediaId])
+  @@index([assetId])
+}
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+model CreatorMediaUsageSourceState {
+  id             String   @id @default(cuid())
+  agencyId       String
+  creatorId      String
+  sourceKey      String
+  sourceRevision String
+  capturedAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
-  @@unique([creatorId, messageId, mediaId])
-  @@index([agencyId])
-  @@index([creatorId, mediaId])
-  @@index([creatorId, status])
+  @@unique([creatorId, sourceKey])
+  @@index([agencyId, creatorId, updatedAt])
+}
+
+model MediaLibraryScanItem {
+  id            String   @id @default(cuid())
+  agencyId      String
+  creatorId     String
+  jobId         String
+  mediaId       String
+  sortingStatus String   @default("UNSORTED")
+  mediaType     String   @default("unknown")
+  durationSec   Int      @default(0)
+  thumbUrl      String?
+  previewUrl    String?
+  fullUrl       String?
+  folderIds     Json     @default("[]")
+  seenAt        DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([jobId, mediaId])
+  @@index([agencyId, creatorId, jobId])
 }
 
 
@@ -2527,35 +2574,6 @@ model VaultPurchaseMedia {
   @@unique([purchaseId, mediaId])
   @@index([creatorId, assetId])
   @@index([creatorId, resolutionStatus])
-}
-
-/// LEGACY/DORMANT materialized aggregate. Current builds calculate Vault sales
-/// from the local canonical ledger and do not rebuild this table.
-model VaultAssetSalesAggregate {
-  id              String    @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  assetId         String
-  mediaId         String?
-  mediaType       String?
-  preview         Json      @default("{}")
-  soldCount       Int       @default(0)
-  totalRevenueCents Int     @default(0)
-  uniqueBuyers    Int       @default(0)
-  averagePriceCents Int     @default(0)
-  openedCount     Int       @default(0)
-  notOpenedCount  Int       @default(0)
-  freeCount       Int       @default(0)
-  lastSoldAt      DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@unique([creatorId, assetId])
-  @@index([agencyId, creatorId, totalRevenueCents])
-  @@index([creatorId, lastSoldAt])
 }
 
 model BumpDeliveryStat {

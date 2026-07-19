@@ -113,8 +113,8 @@ async function loadActiveJob(db, creatorId) {
 }
 async function counts(db, agencyId, creatorId) {
   const [itemsCount, unsortedCount] = await Promise.all([
-    db.vaultUnsortedItem.count({ where: { agencyId, creatorId } }),
-    db.vaultUnsortedItem.count({ where: { agencyId, creatorId, status: "UNSORTED" } }),
+    db.creatorMediaAsset.count({ where: { agencyId, creatorId, catalogActive: true } }),
+    db.creatorMediaAsset.count({ where: { agencyId, creatorId, catalogActive: true, sortingStatus: "UNSORTED" } }),
   ]);
   return { itemsCount, unsortedCount, sortedCount: Math.max(0, itemsCount - unsortedCount) };
 }
@@ -218,25 +218,25 @@ async function listVaultUnsortedMedia({ agencyId, creatorId, offset = 0, limit =
   const mediaType = ["photo", "video", "audio", "gif", "unknown"].includes(clean(type, 20).toLowerCase())
     ? clean(type, 20).toLowerCase()
     : null;
-  const where = { agencyId, creatorId, status: "UNSORTED", ...(mediaType ? { mediaType } : {}) };
+  const where = { agencyId, creatorId, catalogActive: true, sortingStatus: "UNSORTED", ...(mediaType ? { mediaType } : {}) };
   const [rows, total] = await Promise.all([
-    prisma.vaultUnsortedItem.findMany({
+    prisma.creatorMediaAsset.findMany({
       where,
       orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }],
       skip: safeOffset,
       take: safeLimit,
     }),
-    prisma.vaultUnsortedItem.count({ where }),
+    prisma.creatorMediaAsset.count({ where }),
   ]);
   const items = rows.map((row) => ({
     id: row.mediaId,
     type: row.mediaType || "unknown",
     name: `${row.mediaType || "media"} #${row.mediaId}`,
     createdAt: null,
-    duration: row.duration || 0,
+    duration: row.durationSec || 0,
     thumbUrl: row.thumbUrl || "",
-    previewUrl: row.thumbUrl || "",
-    fullUrl: row.thumbUrl || "",
+    previewUrl: row.previewUrl || row.thumbUrl || "",
+    fullUrl: row.fullUrl || row.previewUrl || row.thumbUrl || "",
     folderIds: Array.isArray(row.folderIds) ? row.folderIds : [],
     lastSeenAt: iso(row.lastSeenAt),
   }));
@@ -344,6 +344,10 @@ async function resumeVaultUnsortedScan({ agencyId, creatorId, userId }) {
       nextRunAt: now,
     },
   });
+  await prisma.mediaLibraryScanItem.updateMany({
+    where: { agencyId, creatorId, jobId: paused.id },
+    data: { jobId: job.id },
+  });
   const snapshot = await updateSnapshot(prisma, {
     agencyId,
     creatorId,
@@ -369,6 +373,7 @@ async function cancelVaultUnsortedScan({ agencyId, creatorId, userId }) {
       },
     });
   }
+  await prisma.mediaLibraryScanItem.deleteMany({ where: { agencyId, creatorId } });
   const snapshot = await updateSnapshot(prisma, {
     agencyId,
     creatorId,
@@ -390,42 +395,70 @@ function normalizeChunkItem(value) {
     status: row.sorted === true || clean(row.status, 30).toUpperCase() === "SORTED" ? "SORTED" : "UNSORTED",
     mediaType,
     thumbUrl: clean(row.thumbUrl || row.thumb, 4000) || null,
+    previewUrl: clean(row.previewUrl || row.preview || row.thumbUrl || row.thumb, 4000) || null,
+    fullUrl: clean(row.fullUrl || row.url || row.previewUrl || row.thumbUrl || row.thumb, 4000) || null,
     duration: integer(row.duration, 0, 0, 24 * 60 * 60),
     folderIds: uniqueStrings(row.folderIds, 500),
   };
 }
 
-async function upsertVaultUnsortedItems(db, { agencyId, creatorId, jobId, items, now }) {
+async function upsertMediaLibraryScanItems(db, { agencyId, creatorId, jobId, mode, items, now }) {
   if (!items.length) return;
-  // Render/Neon latency made the old per-row loop the dominant cost of the
-  // Messages catalog: one OF page of 40 media caused forty sequential UPSERTs.
-  // PostgreSQL can apply the whole page atomically in one parameterized
-  // statement. Keep the Prisma fallback only for lightweight unit-test doubles.
+  const fullScan = mode === "full";
+  // A full generation is written only to staging. The published Media Library
+  // stays byte-for-byte stable until the expected count fence passes in the
+  // completion transaction. Incremental pages can safely update live rows.
   if (typeof db.$executeRawUnsafe === "function") {
     const params = [];
     const rows = items.map((item) => {
-      const values = [
-        crypto.randomUUID(), agencyId, creatorId, item.mediaId, item.status,
-        item.mediaType, item.thumbUrl, item.duration, JSON.stringify(item.folderIds),
-        now, now, jobId, now, now,
-      ];
+      const values = fullScan
+        ? [
+            crypto.randomUUID(), agencyId, creatorId, item.mediaId, item.status,
+            item.mediaType, item.duration, item.thumbUrl, item.previewUrl, item.fullUrl,
+            JSON.stringify(item.folderIds), now, jobId, now, now,
+          ]
+        : [
+            crypto.randomUUID(), agencyId, creatorId, item.mediaId, true, item.status,
+            item.mediaType, item.duration, item.thumbUrl, item.previewUrl, item.fullUrl,
+            JSON.stringify(item.folderIds), now, jobId, now, now,
+          ];
       const base = params.length;
       params.push(...values);
       const refs = values.map((_, index) => `$${base + index + 1}`);
-      refs[8] = `${refs[8]}::jsonb`;
+      refs[fullScan ? 10 : 11] = `${refs[fullScan ? 10 : 11]}::jsonb`;
       return `(${refs.join(", ")})`;
     });
-    const sql = `
-      INSERT INTO "VaultUnsortedItem" (
-        "id", "agencyId", "creatorId", "mediaId", "status", "mediaType",
-        "thumbUrl", "duration", "folderIds", "firstSeenAt", "lastSeenAt",
-        "lastSeenJobId", "createdAt", "updatedAt"
+    const sql = fullScan ? `
+      INSERT INTO "MediaLibraryScanItem" (
+        "id", "agencyId", "creatorId", "mediaId", "sortingStatus", "mediaType",
+        "durationSec", "thumbUrl", "previewUrl", "fullUrl", "folderIds",
+        "seenAt", "jobId", "createdAt", "updatedAt"
       ) VALUES ${rows.join(", ")}
-      ON CONFLICT ("agencyId", "creatorId", "mediaId") DO UPDATE SET
-        "status" = EXCLUDED."status",
+      ON CONFLICT ("jobId", "mediaId") DO UPDATE SET
+        "sortingStatus" = EXCLUDED."sortingStatus",
         "mediaType" = EXCLUDED."mediaType",
+        "durationSec" = EXCLUDED."durationSec",
         "thumbUrl" = EXCLUDED."thumbUrl",
-        "duration" = EXCLUDED."duration",
+        "previewUrl" = EXCLUDED."previewUrl",
+        "fullUrl" = EXCLUDED."fullUrl",
+        "folderIds" = EXCLUDED."folderIds",
+        "seenAt" = EXCLUDED."seenAt",
+        "updatedAt" = EXCLUDED."updatedAt"
+    ` : `
+      INSERT INTO "CreatorMediaAsset" (
+        "id", "agencyId", "creatorId", "mediaId", "catalogActive", "sortingStatus", "mediaType",
+        "durationSec", "thumbUrl", "previewUrl", "fullUrl", "folderIds",
+        "lastSeenAt", "lastSeenJobId", "createdAt", "updatedAt"
+      ) VALUES ${rows.join(", ")}
+      ON CONFLICT ("creatorId", "mediaId") DO UPDATE SET
+        "agencyId" = EXCLUDED."agencyId",
+        "catalogActive" = true,
+        "sortingStatus" = EXCLUDED."sortingStatus",
+        "mediaType" = EXCLUDED."mediaType",
+        "durationSec" = EXCLUDED."durationSec",
+        "thumbUrl" = EXCLUDED."thumbUrl",
+        "previewUrl" = EXCLUDED."previewUrl",
+        "fullUrl" = EXCLUDED."fullUrl",
         "folderIds" = EXCLUDED."folderIds",
         "lastSeenAt" = EXCLUDED."lastSeenAt",
         "lastSeenJobId" = EXCLUDED."lastSeenJobId",
@@ -435,20 +468,31 @@ async function upsertVaultUnsortedItems(db, { agencyId, creatorId, jobId, items,
     return;
   }
   for (const item of items) {
-    await db.vaultUnsortedItem.upsert({
-      where: { agencyId_creatorId_mediaId: { agencyId, creatorId, mediaId: item.mediaId } },
-      create: {
-        agencyId, creatorId, mediaId: item.mediaId, status: item.status,
-        mediaType: item.mediaType, thumbUrl: item.thumbUrl, duration: item.duration,
-        folderIds: item.folderIds, firstSeenAt: now, lastSeenAt: now,
-        lastSeenJobId: jobId,
-      },
-      update: {
-        status: item.status, mediaType: item.mediaType, thumbUrl: item.thumbUrl,
-        duration: item.duration, folderIds: item.folderIds, lastSeenAt: now,
-        lastSeenJobId: jobId,
-      },
-    });
+    const data = {
+      agencyId,
+      creatorId,
+      mediaId: item.mediaId,
+      sortingStatus: item.status,
+      mediaType: item.mediaType,
+      durationSec: item.duration,
+      thumbUrl: item.thumbUrl,
+      previewUrl: item.previewUrl,
+      fullUrl: item.fullUrl,
+      folderIds: item.folderIds,
+    };
+    if (fullScan) {
+      await db.mediaLibraryScanItem.upsert({
+        where: { jobId_mediaId: { jobId, mediaId: item.mediaId } },
+        create: { ...data, jobId, seenAt: now },
+        update: { ...data, seenAt: now },
+      });
+    } else {
+      await db.creatorMediaAsset.upsert({
+        where: { creatorId_mediaId: { creatorId, mediaId: item.mediaId } },
+        create: { ...data, catalogActive: true, firstSeenAt: now, lastSeenAt: now, lastSeenJobId: jobId },
+        update: { ...data, catalogActive: true, lastSeenAt: now, lastSeenJobId: jobId },
+      });
+    }
   }
 }
 
@@ -462,6 +506,11 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
     // A full scan is generation-based: keep the last complete projection visible
     // while the new job walks Messages, stamp every seen row with this job id,
     // and prune stale rows only in the fenced completion transaction.
+    if (mode === "full") {
+      await db.mediaLibraryScanItem.deleteMany({
+        where: { agencyId: job.agencyId, creatorId: job.creatorId },
+      });
+    }
     await updateSnapshot(db, {
       agencyId: job.agencyId,
       creatorId: job.creatorId,
@@ -495,8 +544,8 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
   const items = (Array.isArray(chunk.items) ? chunk.items : []).map(normalizeChunkItem).filter(Boolean).slice(0, VAULT_UNSORTED_PAGE_SIZE);
   const ids = items.map((item) => item.mediaId);
   const existingRows = ids.length
-    ? await db.vaultUnsortedItem.findMany({
-        where: { agencyId: job.agencyId, creatorId: job.creatorId, mediaId: { in: ids } },
+    ? await db.creatorMediaAsset.findMany({
+        where: { agencyId: job.agencyId, creatorId: job.creatorId, catalogActive: true, mediaId: { in: ids } },
         select: { mediaId: true },
       })
     : [];
@@ -507,10 +556,11 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
     const wasKnown = existing.has(item.mediaId);
     knownStreak = mode === "incremental" && wasKnown ? knownStreak + 1 : 0;
   }
-  await upsertVaultUnsortedItems(db, {
+  await upsertMediaLibraryScanItems(db, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     jobId: job.id,
+    mode,
     items,
     now,
   });
@@ -567,6 +617,100 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
   return { jobContinuationOverride: nextContinuation, kind };
 }
 
+async function publishFullGeneration(db, job) {
+  if (typeof db.$executeRawUnsafe === "function") {
+    await db.$executeRawUnsafe(`
+      INSERT INTO "CreatorMediaAsset" (
+        "id", "agencyId", "creatorId", "mediaId", "catalogActive",
+        "sortingStatus", "mediaType", "durationSec", "thumbUrl", "previewUrl",
+        "fullUrl", "folderIds", "firstSeenAt", "lastSeenAt", "lastSeenJobId",
+        "createdAt", "updatedAt"
+      )
+      SELECT
+        stage."id", stage."agencyId", stage."creatorId", stage."mediaId", true,
+        stage."sortingStatus", stage."mediaType", stage."durationSec",
+        stage."thumbUrl", stage."previewUrl", stage."fullUrl", stage."folderIds",
+        stage."seenAt", stage."seenAt", stage."jobId", stage."createdAt", stage."updatedAt"
+      FROM "MediaLibraryScanItem" stage
+      WHERE stage."agencyId" = $1 AND stage."creatorId" = $2 AND stage."jobId" = $3
+      ON CONFLICT ("creatorId", "mediaId") DO UPDATE SET
+        "agencyId" = EXCLUDED."agencyId",
+        "catalogActive" = true,
+        "sortingStatus" = EXCLUDED."sortingStatus",
+        "mediaType" = EXCLUDED."mediaType",
+        "durationSec" = EXCLUDED."durationSec",
+        "thumbUrl" = EXCLUDED."thumbUrl",
+        "previewUrl" = EXCLUDED."previewUrl",
+        "fullUrl" = EXCLUDED."fullUrl",
+        "folderIds" = EXCLUDED."folderIds",
+        "lastSeenAt" = EXCLUDED."lastSeenAt",
+        "lastSeenJobId" = EXCLUDED."lastSeenJobId",
+        "updatedAt" = EXCLUDED."updatedAt"
+    `, job.agencyId, job.creatorId, job.id);
+    await db.$executeRawUnsafe(`
+      DELETE FROM "CreatorMediaAsset" asset
+      WHERE asset."agencyId" = $1
+        AND asset."creatorId" = $2
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "MediaLibraryScanItem" stage
+          WHERE stage."jobId" = $3
+            AND stage."agencyId" = asset."agencyId"
+            AND stage."creatorId" = asset."creatorId"
+            AND stage."mediaId" = asset."mediaId"
+        )
+    `, job.agencyId, job.creatorId, job.id);
+    await db.mediaLibraryScanItem.deleteMany({ where: { jobId: job.id } });
+    return;
+  }
+
+  const rows = await db.mediaLibraryScanItem.findMany({
+    where: { agencyId: job.agencyId, creatorId: job.creatorId, jobId: job.id },
+    take: 10_000_000,
+  });
+  for (const row of rows) {
+    await db.creatorMediaAsset.upsert({
+      where: { creatorId_mediaId: { creatorId: job.creatorId, mediaId: row.mediaId } },
+      create: {
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        mediaId: row.mediaId,
+        catalogActive: true,
+        sortingStatus: row.sortingStatus,
+        mediaType: row.mediaType,
+        durationSec: row.durationSec,
+        thumbUrl: row.thumbUrl,
+        previewUrl: row.previewUrl,
+        fullUrl: row.fullUrl,
+        folderIds: row.folderIds,
+        firstSeenAt: row.seenAt,
+        lastSeenAt: row.seenAt,
+        lastSeenJobId: job.id,
+      },
+      update: {
+        catalogActive: true,
+        sortingStatus: row.sortingStatus,
+        mediaType: row.mediaType,
+        durationSec: row.durationSec,
+        thumbUrl: row.thumbUrl,
+        previewUrl: row.previewUrl,
+        fullUrl: row.fullUrl,
+        folderIds: row.folderIds,
+        lastSeenAt: row.seenAt,
+        lastSeenJobId: job.id,
+      },
+    });
+  }
+  await db.creatorMediaAsset.deleteMany({
+    where: {
+      agencyId: job.agencyId,
+      creatorId: job.creatorId,
+      mediaId: { notIn: rows.map((row) => row.mediaId) },
+    },
+  });
+  await db.mediaLibraryScanItem.deleteMany({ where: { jobId: job.id } });
+}
+
 async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }) {
   if (!job.creatorId || !job.agencyId) throw new Error("Vault Unsorted job is missing creator scope");
   const payload = object(result);
@@ -574,11 +718,12 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
   const expectedMediaCount = integer(payload.expectedMediaCount, 0, 0, 10_000_000);
   let seenByJob = 0;
   if (mode === "full") {
-    seenByJob = await db.vaultUnsortedItem.count({
-      where: { agencyId: job.agencyId, creatorId: job.creatorId, lastSeenJobId: job.id },
+    seenByJob = await db.mediaLibraryScanItem.count({
+      where: { agencyId: job.agencyId, creatorId: job.creatorId, jobId: job.id },
     });
     if (expectedMediaCount > 0 && seenByJob < expectedMediaCount) {
       const detail = `Messages catalog incomplete: expected ${expectedMediaCount}, received ${seenByJob}; previous complete catalog preserved`;
+      await db.mediaLibraryScanItem.deleteMany({ where: { jobId: job.id } });
       const preservedCounts = await counts(db, job.agencyId, job.creatorId);
       const preservedSnapshot = await updateSnapshot(db, {
         agencyId: job.agencyId,
@@ -609,9 +754,7 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
         error: detail,
       };
     }
-    await db.vaultUnsortedItem.deleteMany({
-      where: { agencyId: job.agencyId, creatorId: job.creatorId, NOT: { lastSeenJobId: job.id } },
-    });
+    await publishFullGeneration(db, job);
   }
   const nextCounts = await counts(db, job.agencyId, job.creatorId);
   const snapshot = await updateSnapshot(db, {
@@ -639,6 +782,7 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
 
 async function recordVaultUnsortedFailure({ job, error, terminal }) {
   if (!job.creatorId || !job.agencyId) return null;
+  if (terminal) await prisma.mediaLibraryScanItem.deleteMany({ where: { jobId: job.id } });
   const snapshot = await updateSnapshot(prisma, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
@@ -651,24 +795,6 @@ async function recordVaultUnsortedFailure({ job, error, terminal }) {
     },
   });
   return { type: "vault_unsorted_failure", snapshot: publicSnapshot(snapshot) };
-}
-
-async function markVaultUnsortedItems({ agencyId, creatorId, mediaIds, status }) {
-  const ids = uniqueStrings(mediaIds, 10_000);
-  if (!ids.length) return { ok: true, updated: 0 };
-  const normalizedStatus = clean(status, 30).toUpperCase();
-  if (normalizedStatus === "HIDDEN") {
-    const deleted = await prisma.vaultUnsortedItem.deleteMany({ where: { agencyId, creatorId, mediaId: { in: ids } } });
-    await updateSnapshot(prisma, { agencyId, creatorId });
-    return { ok: true, updated: deleted.count };
-  }
-  const target = normalizedStatus === "SORTED" ? "SORTED" : "UNSORTED";
-  const updated = await prisma.vaultUnsortedItem.updateMany({
-    where: { agencyId, creatorId, mediaId: { in: ids } },
-    data: { status: target, lastSeenAt: new Date() },
-  });
-  await updateSnapshot(prisma, { agencyId, creatorId });
-  return { ok: true, updated: updated.count };
 }
 
 module.exports = {
@@ -685,7 +811,6 @@ module.exports = {
   applyVaultUnsortedChunk,
   applyVaultUnsortedCompletion,
   recordVaultUnsortedFailure,
-  markVaultUnsortedItems,
   publicSnapshot,
   snapshotPayload,
 };

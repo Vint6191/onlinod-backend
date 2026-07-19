@@ -1070,53 +1070,6 @@ async function upsertMessage(db, { agencyId, creatorId, job, raw, observedAt }) 
   return { ledger, message, mediaCount: message.media.length, isNew: !existing, businessChanged };
 }
 
-async function rebuildAssetAggregate(db, agencyId, creatorId, assetId) {
-  if (!assetId) return null;
-  const relations = await db.vaultPurchaseMedia.findMany({
-    where: { agencyId, creatorId, assetId, isFanMedia: false },
-    include: { purchase: true },
-    take: 100_000,
-  });
-  let soldCount = 0;
-  let totalRevenueCents = 0;
-  let openedCount = 0;
-  let notOpenedCount = 0;
-  let freeCount = 0;
-  let lastSoldAt = null;
-  const buyers = new Set();
-  for (const relation of relations) {
-    const purchase = relation.purchase;
-    if (purchase.isFree || purchase.priceCents <= 0 || purchase.status === "FREE") freeCount += 1;
-    else if (purchase.isOpened) openedCount += 1;
-    else notOpenedCount += 1;
-    if (purchaseCountsAsRevenue(purchase)) {
-      soldCount += 1;
-      totalRevenueCents += integer(relation.allocatedCents, 0);
-      if (purchase.buyerId) buyers.add(purchase.buyerId);
-      if (!lastSoldAt || purchase.purchasedAt > lastSoldAt) lastSoldAt = purchase.purchasedAt;
-    }
-  }
-  const media = await db.dialogMessageMedia.findFirst({
-    where: { agencyId, creatorId, assetId, isFanMedia: false },
-    orderBy: { lastSeenAt: "desc" },
-  });
-  return db.vaultAssetSalesAggregate.upsert({
-    where: { creatorId_assetId: { creatorId, assetId } },
-    create: {
-      agencyId, creatorId, assetId, mediaId: media?.mediaId || null, mediaType: media?.mediaType || null,
-      preview: object(media?.preview), soldCount, totalRevenueCents, uniqueBuyers: buyers.size,
-      averagePriceCents: soldCount > 0 ? Math.round(totalRevenueCents / soldCount) : 0,
-      openedCount, notOpenedCount, freeCount, lastSoldAt,
-    },
-    update: {
-      mediaId: media?.mediaId || undefined, mediaType: media?.mediaType || undefined, preview: object(media?.preview),
-      soldCount, totalRevenueCents, uniqueBuyers: buyers.size,
-      averagePriceCents: soldCount > 0 ? Math.round(totalRevenueCents / soldCount) : 0,
-      openedCount, notOpenedCount, freeCount, lastSoldAt,
-    },
-  });
-}
-
 async function projectSignal(db, signal) {
   const message = signal.sourceMessageId
     ? await db.dialogMessageLedger.findUnique({ where: messageUnique(signal.creatorId, signal.sourceMessageId), include: { media: true } })
@@ -1183,7 +1136,6 @@ async function projectSignal(db, signal) {
     where: { id: signal.id },
     data: { resolveState, resolvedAt: resolveState === "RESOLVED" ? new Date() : null, lastSeenAt: new Date() },
   });
-  for (const assetId of affectedAssets) await rebuildAssetAggregate(db, signal.agencyId, signal.creatorId, assetId);
   return { purchase, status, affectedAssets: [...affectedAssets] };
 }
 
@@ -1894,17 +1846,6 @@ async function ingestWsMessages({ agencyId, creatorId, dialogId, fanId = null, m
   };
 }
 
-async function rebuildCreatorAggregates({ agencyId, creatorId }) {
-  const rows = await prisma.vaultPurchaseMedia.findMany({
-    where: { agencyId, creatorId, isFanMedia: false, assetId: { not: null } },
-    distinct: ["assetId"],
-    select: { assetId: true },
-    take: 100_000,
-  });
-  for (const row of rows) await rebuildAssetAggregate(prisma, agencyId, creatorId, row.assetId);
-  return { ok: true, rebuilt: rows.length };
-}
-
 module.exports = {
   DIALOG_INTELLIGENCE_JOB_KEY,
   ACTIVE_RUN_STATUSES,
@@ -1928,6 +1869,5 @@ module.exports = {
   completeDialogIntelligenceJob,
   recordDialogIntelligenceFailure,
   ingestWsMessages,
-  rebuildCreatorAggregates,
   moduleControl,
 };
