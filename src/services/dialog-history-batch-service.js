@@ -41,6 +41,16 @@ function leaseMs(value) {
 function batchSize(value) {
   return integer(value, DEFAULT_BATCH_SIZE, 1, 100);
 }
+function effectiveDialogMode(state, fallback = "initial") {
+  const scanMode = clean(state?.scanMode, 40)?.toLowerCase();
+  if (scanMode === "incremental") return "incremental";
+  if (scanMode === "initial" || scanMode === "full") {
+    return state?.initialScanComplete === true ? "incremental" : "initial";
+  }
+  return state?.initialScanComplete === true
+    ? "incremental"
+    : clean(fallback, 40)?.toLowerCase() === "incremental" ? "incremental" : "initial";
+}
 function compactResult(raw) {
   const value = object(raw);
   return {
@@ -255,6 +265,102 @@ async function normalizeOrphanedDialogHistoryBatchesTx(db, input = {}) {
   return { normalized, dialogCount };
 }
 
+async function reclaimOwnedDialogHistoryBatchTx(db, input = {}) {
+  const agencyId = clean(input.agencyId, 160);
+  const deviceId = clean(input.deviceId, 200);
+  const creatorIds = [...new Set(list(input.creatorIds).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 1_000);
+  if (!agencyId || !deviceId || !creatorIds.length) return null;
+
+  const runs = await db.dialogScanRun.findMany({
+    where: {
+      agencyId,
+      creatorId: { in: creatorIds },
+      dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID,
+      status: { in: ACTIVE_BATCH_STATUSES },
+    },
+    orderBy: { updatedAt: "asc" },
+    take: creatorIds.length,
+  });
+
+  for (const run of runs) {
+    const continuation = object(run.continuation);
+    if (clean(continuation.claimedByDeviceId, 200) !== deviceId) continue;
+    const leaseUntil = dateOrNull(continuation.leaseUntil);
+    if (!leaseUntil || leaseUntil.getTime() <= Date.now()) continue;
+
+    const ownedStates = await db.dialogScanState.findMany({
+      where: { agencyId, creatorId: run.creatorId, activeRunId: run.id },
+      take: 100,
+    });
+    if (!ownedStates.length) continue;
+
+    const stateByDialogId = new Map(ownedStates.map((state) => [clean(state.dialogId, 180), state]));
+    const priorItems = list(continuation.dialogs).map((value) => object(value));
+    const orderedDialogIds = [];
+    for (const item of priorItems) {
+      const dialogId = clean(item.dialogId, 180);
+      if (dialogId && stateByDialogId.has(dialogId) && !orderedDialogIds.includes(dialogId)) orderedDialogIds.push(dialogId);
+    }
+    for (const state of ownedStates) {
+      const dialogId = clean(state.dialogId, 180);
+      if (dialogId && !orderedDialogIds.includes(dialogId)) orderedDialogIds.push(dialogId);
+    }
+
+    const priorByDialogId = new Map(priorItems.map((item) => [clean(item.dialogId, 180), item]));
+    const dialogs = orderedDialogIds.map((dialogId) => {
+      const state = stateByDialogId.get(dialogId);
+      const prior = priorByDialogId.get(dialogId) || {};
+      return {
+        dialogId,
+        fanId: clean(state?.fanId ?? prior.fanId, 180) || dialogId,
+        mode: effectiveDialogMode(state, prior.mode),
+      };
+    });
+    if (!dialogs.length) continue;
+
+    const token = randomBytes(32).toString("base64url");
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + leaseMs(input.leaseMs));
+    const leaseRevision = integer(continuation.leaseRevision, 1, 1) + 1;
+    const nextContinuation = {
+      ...continuation,
+      claimedByDeviceId: deviceId,
+      leaseTokenHash: hashToken(token),
+      leaseRevision,
+      leaseUntil: expiresAt.toISOString(),
+      dialogs,
+      reattachedAt: now.toISOString(),
+    };
+
+    await db.dialogScanState.updateMany({
+      where: { agencyId, creatorId: run.creatorId, activeRunId: run.id },
+      data: { status: "RUNNING", activeJobId: null, lastError: null },
+    });
+    const updatedRun = await db.dialogScanRun.update({
+      where: { id: run.id },
+      data: {
+        status: "RUNNING",
+        continuation: nextContinuation,
+        lastWorkerDeviceId: deviceId,
+        lastError: null,
+      },
+    });
+
+    return {
+      id: updatedRun.id,
+      creatorId: updatedRun.creatorId,
+      generation: integer(updatedRun.generation, 0),
+      mode: dialogs[0]?.mode || "initial",
+      dialogs,
+      leaseToken: token,
+      leaseRevision,
+      leaseUntil: expiresAt.toISOString(),
+    };
+  }
+
+  return null;
+}
+
 async function claimDialogHistoryBatchTx(db, input) {
   const agencyId = clean(input.agencyId, 160);
   const deviceId = clean(input.deviceId, 200);
@@ -270,6 +376,17 @@ async function claimDialogHistoryBatchTx(db, input) {
   await lockDialogHistoryBatchClaimsTx(db, agencyId);
   await recoverExpiredDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
   await normalizeOrphanedDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
+
+  // The lease token lives only in the Desktop process. If that process crashes
+  // or restarts, the same stable deviceId must be able to reattach to its own
+  // still-live batch instead of waiting for the full lease window to expire.
+  const reclaimed = await reclaimOwnedDialogHistoryBatchTx(db, {
+    agencyId,
+    deviceId,
+    creatorIds: allowedCreatorIds,
+    leaseMs: input.leaseMs,
+  });
+  if (reclaimed) return { ok: true, reason: "reclaimed", batch: reclaimed };
 
   const blockingRuns = await db.dialogScanRun.findMany({
     where: {
@@ -321,7 +438,6 @@ async function claimDialogHistoryBatchTx(db, input) {
 
   const creatorId = first.creatorId;
   const generation = integer(completedDiscovery.generation, integer(first.generation, 0));
-  const mode = clean(first.scanMode, 40) || (first.initialScanComplete ? "incremental" : "initial");
   const wanted = batchSize(input.batchSize);
   const candidates = await db.dialogScanState.findMany({
     where: {
@@ -330,7 +446,6 @@ async function claimDialogHistoryBatchTx(db, input) {
       generation,
       dialogId: { notIn: ["__dialog_discovery__", DIALOG_HISTORY_BATCH_DIALOG_ID] },
       status: "PLANNED",
-      ...(mode === "initial" ? { initialScanComplete: false } : {}),
     },
     orderBy: [{ updatedAt: "asc" }, { dialogId: "asc" }],
     take: wanted * 3,
@@ -346,7 +461,7 @@ async function claimDialogHistoryBatchTx(db, input) {
       creatorId,
       dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID,
       fanId: null,
-      mode: `${mode}_batch`,
+      mode: "dialog_history_batch",
       source: "dialog_history_batch_claim",
       status: "RUNNING",
       generation,
@@ -356,7 +471,7 @@ async function claimDialogHistoryBatchTx(db, input) {
         leaseTokenHash: hashToken(token),
         leaseRevision: 1,
         leaseUntil: expiresAt.toISOString(),
-        mode,
+        mode: effectiveDialogMode(first),
         dialogs: [],
       },
       progress: { current: 0, total: 0, completed: 0, failed: 0, message: "Dialog batch claimed" },
@@ -369,11 +484,12 @@ async function claimDialogHistoryBatchTx(db, input) {
   const claimed = [];
   for (const state of candidates) {
     if (claimed.length >= wanted) break;
+    const itemMode = effectiveDialogMode(state);
     const updated = await db.dialogScanState.updateMany({
       where: { id: state.id, status: "PLANNED" },
       data: {
         status: "RUNNING",
-        scanMode: mode,
+        scanMode: itemMode,
         activeRunId: run.id,
         activeJobId: null,
         lastError: null,
@@ -383,7 +499,7 @@ async function claimDialogHistoryBatchTx(db, input) {
       claimed.push({
         dialogId: state.dialogId,
         fanId: state.fanId || state.dialogId,
-        mode: mode === "initial" && state.initialScanComplete ? "incremental" : mode,
+        mode: itemMode,
       });
     }
   }
@@ -399,7 +515,7 @@ async function claimDialogHistoryBatchTx(db, input) {
     leaseTokenHash: hashToken(token),
     leaseRevision: 1,
     leaseUntil: expiresAt.toISOString(),
-    mode,
+    mode: claimed[0]?.mode || "initial",
     dialogs: claimed,
   };
   const updatedRun = await db.dialogScanRun.update({
@@ -423,7 +539,7 @@ async function claimDialogHistoryBatchTx(db, input) {
       id: updatedRun.id,
       creatorId,
       generation,
-      mode,
+      mode: claimed[0]?.mode || "initial",
       dialogs: claimed,
       leaseToken: token,
       leaseRevision: 1,
@@ -553,10 +669,15 @@ async function completeDialogHistoryBatchTx(tx, input) {
     if (clean(run.status, 40).toUpperCase() === "COMPLETED") {
       return { ok: true, ...object(continuation.completedSummary), replayed: true };
     }
-    const claimedDialogs = list(continuation.dialogs)
+    const claimedItems = list(continuation.dialogs)
       .map((item) => object(item))
-      .map((item) => clean(item.dialogId, 180))
-      .filter(Boolean);
+      .map((item) => ({
+        dialogId: clean(item.dialogId, 180),
+        mode: clean(item.mode, 40)?.toLowerCase() === "incremental" ? "incremental" : "initial",
+      }))
+      .filter((item) => item.dialogId);
+    const claimedDialogs = claimedItems.map((item) => item.dialogId);
+    const claimedModeByDialogId = new Map(claimedItems.map((item) => [item.dialogId, item.mode]));
     const results = new Map(
       list(input.results)
         .slice(0, 100)
@@ -591,11 +712,13 @@ async function completeDialogHistoryBatchTx(tx, input) {
       updated += result.updated;
       if (result.ok) {
         completed += 1;
+        const itemMode = claimedModeByDialogId.get(dialogId)
+          || (String(run.mode).startsWith("incremental") ? "incremental" : "initial");
         await tx.dialogScanState.updateMany({
           where: { agencyId: run.agencyId, creatorId: run.creatorId, dialogId, activeRunId: run.id },
           data: {
             status: "READY",
-            ...(String(run.mode).startsWith("initial")
+            ...(itemMode === "initial"
               ? { initialScanComplete: true, lastFullScanAt: now }
               : { lastIncrementalScanAt: now }),
             pagesProcessed: { increment: result.pages },
@@ -736,4 +859,5 @@ module.exports = {
   releaseDialogHistoryBatch,
   recoverExpiredDialogHistoryBatchesTx,
   normalizeOrphanedDialogHistoryBatchesTx,
+  reclaimOwnedDialogHistoryBatchTx,
 };

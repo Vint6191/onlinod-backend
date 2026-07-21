@@ -101,14 +101,26 @@ async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
         agencyId,
         creatorId,
         OR: [
-          { status: { in: ["QUEUED", "RUNNING"] } },
+          // A frozen batch backlog is represented by PLANNED rows before a
+          // Desktop claims it. Pausing only QUEUED/RUNNING rows left that
+          // backlog claimable and the UI stuck on "waiting for worker".
+          { status: { in: ["PLANNED", "QUEUED", "RUNNING"] } },
           { activeRunId: { not: null } },
           { activeJobId: { not: null } },
         ],
       },
+      // Keep activeRunId for an already claimed batch/discovery run so resume
+      // can normalize it deterministically. Standalone PLANNED rows have no
+      // activeRunId and are resumed directly back to PLANNED below.
       data: { status: "PAUSED", activeJobId: null, lastError: null },
     });
-    return { paused: runs.count, pausedJobs: jobs.count, resetStates: states.count, runs: [] };
+    return {
+      paused: runs.count + states.count,
+      pausedRuns: runs.count,
+      pausedJobs: jobs.count,
+      pausedStates: states.count,
+      runs: [],
+    };
   }, DIALOG_CONTROL_TRANSACTION_OPTIONS);
 }
 
@@ -119,7 +131,6 @@ async function resumeCreatorRuns({ agencyId, creatorId }) {
       orderBy: [{ generation: "desc" }, { updatedAt: "asc" }],
       take: 1000,
     });
-    if (!pausedRuns.length) return { resumed: 0, normalized: 0, items: [] };
 
     const now = new Date();
     const pausedDiscoveryRuns = pausedRuns
@@ -195,8 +206,32 @@ async function resumeCreatorRuns({ agencyId, creatorId }) {
       });
     }
 
+    // Rows paused while they were still waiting in the frozen batch list have
+    // no active run to normalize. Resume them explicitly; otherwise a creator
+    // with only PLANNED backlog can never leave PAUSED and can never be claimed.
+    const standaloneHistory = await tx.dialogScanState.updateMany({
+      where: {
+        agencyId,
+        creatorId,
+        status: "PAUSED",
+        dialogId: { notIn: ["__dialog_discovery__", DIALOG_HISTORY_BATCH_DIALOG_ID] },
+        activeRunId: null,
+      },
+      data: {
+        status: "PLANNED",
+        activeRunId: null,
+        activeJobId: null,
+        lastError: null,
+      },
+    });
+
     if (!selectedDiscovery) {
-      return { resumed: 0, normalized: historyRuns.length, items: [] };
+      return {
+        resumed: standaloneHistory.count,
+        resumedStates: standaloneHistory.count,
+        normalized: historyRuns.length,
+        items: [],
+      };
     }
 
     const oldJob = selectedDiscovery.jobId
@@ -232,7 +267,8 @@ async function resumeCreatorRuns({ agencyId, creatorId }) {
       data: { status: "QUEUED", activeJobId: job.id, activeRunId: selectedDiscovery.id, lastError: null },
     });
     return {
-      resumed: 1,
+      resumed: 1 + standaloneHistory.count,
+      resumedStates: standaloneHistory.count,
       normalized: historyRuns.length + Math.max(0, pausedDiscoveryRuns.length - 1),
       items: [{
         runId: selectedDiscovery.id,
@@ -590,7 +626,14 @@ router.post("/creators/:creatorId/pause", seniorRequired, async (req, res) => {
       action: "dialog_intelligence.scan_paused", targetType: "creator", targetId: req.params.creatorId,
       metadata: { paused: result.paused, reason },
     });
-    return res.json({ ok: true, paused: result.paused, runIds: result.runs.map((run) => run.id) });
+    return res.json({
+      ok: true,
+      paused: result.paused,
+      pausedRuns: result.pausedRuns || 0,
+      pausedJobs: result.pausedJobs || 0,
+      pausedStates: result.pausedStates || 0,
+      runIds: result.runs.map((run) => run.id),
+    });
   } catch (error) { return serviceError(res, error, "DIALOG_CREATOR_SCAN_PAUSE_FAILED"); }
 });
 

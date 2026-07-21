@@ -14,6 +14,7 @@ const {
   releaseDialogHistoryBatchTx,
   recoverExpiredDialogHistoryBatchesTx,
   normalizeOrphanedDialogHistoryBatchesTx,
+  reclaimOwnedDialogHistoryBatchTx,
 } = require("./dialog-history-batch-service");
 
 function applyData(row, data) {
@@ -179,6 +180,82 @@ test("one claim reserves one compact batch and creates no JobInstance", async ()
   assert.equal(db._locks.length, 1);
   assert.match(db._locks[0][0], /pg_advisory_xact_lock[\s\S]*::text/);
   assert.equal(db._locks[0][1], "dialog_history_batch_claim:agency-1");
+});
+
+test("the same stable device reattaches to its live batch after a Desktop restart", async () => {
+  const db = createDb();
+  seedPlanned(db, 3);
+  seedCompletedDiscovery(db);
+
+  const first = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    creatorIds: ["creator-1"],
+    batchSize: 3,
+    leaseMs: 600_000,
+  });
+  const oldToken = first.batch.leaseToken;
+
+  const reclaimed = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    creatorIds: ["creator-1"],
+    batchSize: 3,
+    leaseMs: 600_000,
+  });
+
+  assert.equal(reclaimed.reason, "reclaimed");
+  assert.equal(reclaimed.batch.id, first.batch.id);
+  assert.notEqual(reclaimed.batch.leaseToken, oldToken);
+  assert.deepEqual(reclaimed.batch.dialogs.map((item) => item.dialogId), ["dialog-01", "dialog-02", "dialog-03"]);
+  assert.equal([...db._states.values()].every((row) => row.status === "RUNNING"), true);
+
+  const otherDevice = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-b",
+    creatorIds: ["creator-1"],
+    batchSize: 3,
+  });
+  assert.equal(otherDevice.batch, null);
+  assert.equal(otherDevice.reason, "creator_batch_already_active");
+});
+
+test("a contradictory PLANNED initial tail is claimed per item instead of draining forever", async () => {
+  const db = createDb();
+  seedPlanned(db, 2);
+  seedCompletedDiscovery(db);
+  const alreadyInitial = db._states.get("dialog-01");
+  alreadyInitial.initialScanComplete = true;
+  alreadyInitial.scanMode = "initial";
+
+  const claim = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    creatorIds: ["creator-1"],
+    batchSize: 2,
+  });
+
+  assert.equal(claim.reason, "claimed");
+  assert.deepEqual(claim.batch.dialogs.map((item) => [item.dialogId, item.mode]), [
+    ["dialog-01", "incremental"],
+    ["dialog-02", "initial"],
+  ]);
+
+  await completeDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    batchId: claim.batch.id,
+    leaseToken: claim.batch.leaseToken,
+    results: [
+      { dialogId: "dialog-01", ok: true, pages: 1, messages: 2 },
+      { dialogId: "dialog-02", ok: true, pages: 2, messages: 10 },
+    ],
+  });
+
+  assert.ok(db._states.get("dialog-01").lastIncrementalScanAt instanceof Date);
+  assert.equal(db._states.get("dialog-01").initialScanComplete, true);
+  assert.ok(db._states.get("dialog-02").lastFullScanAt instanceof Date);
+  assert.equal(db._states.get("dialog-02").initialScanComplete, true);
 });
 
 test("an active or paused creator batch that still owns dialogs blocks a second claim", async () => {
