@@ -11,6 +11,8 @@ const MIN_LEASE_MS = 30 * 1000;
 const MAX_LEASE_MS = 15 * 60 * 1000;
 const RETRY_BACKOFF_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
+const JOB_CHUNK_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 30_000 });
+const JOB_COMPLETION_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
 
 class JobLeaseError extends Error {
   constructor(code, message, status = 409) {
@@ -325,6 +327,12 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
   const now = new Date();
   const tokenHash = hashToken(leaseToken);
+  const nextLeaseUntil = new Date(now.getTime() + leaseDuration(leaseMs));
+  const normalizedProgress = safeProgress(progress) ?? job.progress;
+  const requestedContinuation = continuation === undefined
+    ? job.continuation
+    : normalizeLeaseContinuation(continuation);
+
   return prisma.$transaction(async (tx) => {
     const updatedFence = await tx.jobInstance.updateMany({
       where: {
@@ -336,28 +344,30 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         leaseUntil: { gt: now },
       },
       data: {
-        leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
+        leaseUntil: nextLeaseUntil,
         workId: clean(workId, 200) || job.workId,
-        progress: safeProgress(progress) ?? job.progress,
-        continuation: continuation === undefined ? job.continuation : normalizeLeaseContinuation(continuation),
+        progress: normalizedProgress,
+        continuation: requestedContinuation,
         lastProgressAt: now,
       },
     });
     if (!updatedFence.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before progress");
+
     const sideEffect = await applyJobChunk({ db: tx, job, deviceId, userId, chunkResult });
+    let updated = null;
     if (sideEffect?.completeAfterCommit === true) {
-      await tx.jobInstance.update({
+      updated = await tx.jobInstance.update({
         where: { id: job.id },
         data: {
           continuation: {
             driverPhase: "complete",
             result: sideEffect.completionResult || {},
-            progress: safeProgress(progress) ?? job.progress,
+            progress: normalizedProgress,
           },
         },
       });
     } else if (sideEffect?.jobContinuationOverride) {
-      await tx.jobInstance.update({
+      updated = await tx.jobInstance.update({
         where: { id: job.id },
         data: {
           continuation: {
@@ -367,7 +377,20 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         },
       });
     }
-    const updated = await tx.jobInstance.findUnique({ where: { id: job.id } });
+
+    // update() already returns the row. Avoid a final findUnique round-trip on
+    // every checkpoint; hosted Postgres latency made that redundant read part
+    // of the 5-second Prisma transaction timeout failure.
+    if (!updated) {
+      updated = {
+        id: job.id,
+        status: job.status,
+        leaseUntil: nextLeaseUntil,
+        leaseRevision: job.leaseRevision,
+        progress: normalizedProgress,
+        continuation: requestedContinuation,
+      };
+    }
     return {
       id: updated.id,
       status: updated.status,
@@ -377,7 +400,7 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       continuation: updated.continuation,
       sideEffect,
     };
-  });
+  }, JOB_CHUNK_TRANSACTION_OPTIONS);
 }
 
 async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, result, progress }) {
@@ -417,7 +440,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         applySideEffect: (db) => applyJobResult({ db, job, deviceId, userId, result: result || {} }),
       });
       return { job: { id: job.id, status: "DONE" }, sideEffect };
-    });
+    }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   }
 
   if (job.jobKey === "vault_unsorted_scan") {
@@ -426,7 +449,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion");
       const sideEffect = await applyJobResult({ db: tx, job, deviceId, userId, result: result || {} });
       return { job: { id: job.id, status: "DONE" }, sideEffect };
-    });
+    }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   }
 
   const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });

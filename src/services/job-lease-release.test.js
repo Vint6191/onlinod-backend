@@ -16,7 +16,11 @@ function loadService(fixture) {
   require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: fixture.db };
   require.cache[resultModule] = {
     id: resultModule, filename: resultModule, loaded: true,
-    exports: { applyJobChunk: async () => ({}), applyJobResult: async () => ({}), recordJobFailure: async () => ({}) },
+    exports: {
+      applyJobChunk: fixture.applyJobChunk || (async () => ({})),
+      applyJobResult: fixture.applyJobResult || (async () => ({})),
+      recordJobFailure: async () => ({}),
+    },
   };
   require.cache[catalogModule] = {
     id: catalogModule, filename: catalogModule, loaded: true,
@@ -213,4 +217,106 @@ test("live progress preserves dialog diagnostics without rewriting continuation"
   assert.equal(update.data.progress.storage, "local_sqlite");
   assert.equal(update.data.progress.live, true);
   assert.equal(Object.hasOwn(update.data, "continuation"), false);
+});
+
+
+test("progress checkpoint uses bounded transaction options and reuses update result", async () => {
+  const token = "lease-token";
+  const now = new Date();
+  const job = {
+    id: "job-progress", agencyId: "agency-1", creatorId: "creator-1", jobKey: "vault_unsorted_scan",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 4,
+    leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, progress: { current: 40 },
+    continuation: { driverPhase: "execute", jobContinuation: { offset: 40 } }, workId: "work-old",
+  };
+  let transactionOptions = null;
+  let findUniqueCalls = 0;
+  let updateCalls = 0;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => { findUniqueCalls += 1; return job; },
+      updateMany: async () => ({ count: 1 }),
+      update: async ({ data }) => {
+        updateCalls += 1;
+        return {
+          ...job,
+          leaseUntil: new Date(now.getTime() + 120_000),
+          progress: { current: 80 },
+          continuation: data.continuation,
+        };
+      },
+    },
+    $transaction: async (callback, options) => {
+      transactionOptions = options;
+      return callback(db);
+    },
+  };
+  const { progressJob } = loadService({
+    db,
+    applyJobChunk: async () => ({ jobContinuationOverride: { offset: 80 } }),
+  });
+  const result = await progressJob({
+    jobId: job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: token,
+    leaseRevision: 4,
+    leaseMs: 60_000,
+    workId: "work-next",
+    progress: { current: 80 },
+    continuation: { driverPhase: "execute", jobContinuation: { offset: 80 } },
+    chunkResult: { kind: "vault_unsorted_media_page" },
+  });
+  assert.deepEqual(transactionOptions, { maxWait: 10_000, timeout: 30_000 });
+  assert.equal(findUniqueCalls, 1, "requireLease is the only job read");
+  assert.equal(updateCalls, 1, "the continuation update result is reused as the response row");
+  assert.deepEqual(result.continuation, { driverPhase: "execute", jobContinuation: { offset: 80 } });
+});
+
+
+test("vault completion keeps publication fenced with a longer bounded transaction", async () => {
+  const token = "lease-token";
+  const now = new Date();
+  const job = {
+    id: "job-complete", agencyId: "agency-1", creatorId: "creator-1", jobKey: "vault_unsorted_scan",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 5,
+    leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, progress: { current: 800 },
+    continuation: { driverPhase: "complete" }, workId: "work-complete",
+  };
+  let transactionOptions = null;
+  let appliedInsideTransaction = false;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async () => ({ count: 1 }),
+    },
+    $transaction: async (callback, options) => {
+      transactionOptions = options;
+      return callback(db);
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async ({ db: transactionDb }) => {
+      appliedInsideTransaction = transactionDb === db;
+      return { type: "vault_unsorted" };
+    },
+  });
+  const result = await completeJob({
+    jobId: job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: token,
+    leaseRevision: 5,
+    workId: "work-complete",
+    progress: { current: 800, percent: 100 },
+    result: { mode: "full", scanned: 800 },
+  });
+  assert.deepEqual(transactionOptions, { maxWait: 10_000, timeout: 60_000 });
+  assert.equal(appliedInsideTransaction, true);
+  assert.equal(result.job.status, "DONE");
 });

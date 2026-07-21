@@ -143,6 +143,121 @@ async function updateSnapshot(db, { agencyId, creatorId, userId = null, patch = 
   });
 }
 
+/**
+ * A running page checkpoint must not perform several snapshot round trips.
+ * Full scans write to staging, so published counts cannot change until final
+ * publication and are intentionally left untouched. Incremental scans mutate
+ * the published catalog; one indexed aggregate inside the snapshot UPDATE
+ * refreshes those counts exactly without separate COUNT/read/upsert queries.
+ */
+async function updateRunningSnapshotProgress(db, {
+  agencyId,
+  creatorId,
+  userId = null,
+  mode,
+  jobId,
+  messagesFolderId,
+  pages,
+  scanned,
+  knownStreak,
+  expectedCount,
+}) {
+  const normalizedMode = normalizeMode(mode);
+  const updatedAt = new Date().toISOString();
+
+  if (typeof db.$executeRawUnsafe === "function") {
+    const recountPublishedCatalog = normalizedMode === "incremental";
+    const countCte = recountPublishedCatalog ? `
+      WITH catalog_counts AS (
+        SELECT
+          COUNT(*)::integer AS "itemsCount",
+          COUNT(*) FILTER (WHERE "sortingStatus" = 'UNSORTED')::integer AS "unsortedCount"
+        FROM "CreatorMediaAsset"
+        WHERE "agencyId" = $1
+          AND "creatorId" = $2
+          AND "catalogActive" = true
+      )
+    ` : "";
+    const countAssignments = recountPublishedCatalog ? `,
+        "itemsCount" = catalog_counts."itemsCount",
+        "unsortedCount" = catalog_counts."unsortedCount",
+        "sortedCount" = GREATEST(0, catalog_counts."itemsCount" - catalog_counts."unsortedCount")
+    ` : "";
+    const countFrom = recountPublishedCatalog ? "FROM catalog_counts" : "";
+    const updatedRows = await db.$executeRawUnsafe(`
+      ${countCte}
+      UPDATE "VaultUnsortedSnapshot"
+      SET
+        "payload" = (
+          jsonb_set(
+            jsonb_set(
+              COALESCE("payload", '{}'::jsonb),
+              '{messagesFolderId}',
+              to_jsonb($3::text),
+              true
+            ),
+            '{updatedAt}',
+            to_jsonb($4::text),
+            true
+          )
+          || jsonb_build_object(
+            'scan',
+            COALESCE("payload"->'scan', '{}'::jsonb)
+            || jsonb_build_object(
+              'status', 'RUNNING',
+              'mode', $5::text,
+              'jobId', $6::text,
+              'pages', $7::integer,
+              'scanned', $8::integer,
+              'knownStreak', $9::integer,
+              'expectedCount', $10::integer,
+              'published', false,
+              'lastError', NULL
+            )
+          )
+        ),
+        "updatedByUserId" = COALESCE(NULLIF($11::text, ''), "updatedByUserId"),
+        "capturedAt" = NOW(),
+        "updatedAt" = NOW()
+        ${countAssignments}
+      ${countFrom}
+      WHERE "agencyId" = $1 AND "creatorId" = $2
+    `,
+    agencyId,
+    creatorId,
+    clean(messagesFolderId, 240),
+    updatedAt,
+    normalizedMode,
+    clean(jobId, 240),
+    integer(pages),
+    integer(scanned),
+    integer(knownStreak),
+    integer(expectedCount),
+    clean(userId, 240) || null);
+    if (Number(updatedRows) > 0) return null;
+  }
+
+  // Portable fallback for tests/non-Postgres adapters and self-healing if an
+  // old job somehow resumes after its snapshot row was deleted.
+  return updateSnapshot(db, {
+    agencyId,
+    creatorId,
+    userId,
+    patch: {
+      scanStatus: "RUNNING",
+      mode: normalizedMode,
+      jobId,
+      messagesFolderId,
+      pages,
+      scanned,
+      knownStreak,
+      expectedCount,
+      published: false,
+      lastError: null,
+    },
+  });
+}
+
 async function reconcileOrphanedSnapshot(db, { agencyId, creatorId, snapshot, activeJob }) {
   if (!snapshot || activeJob) return snapshot;
   const payload = snapshotPayload(snapshot);
@@ -543,13 +658,15 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
   const mode = normalizeMode(continuation.mode || job.params?.mode);
   const items = (Array.isArray(chunk.items) ? chunk.items : []).map(normalizeChunkItem).filter(Boolean).slice(0, VAULT_UNSORTED_PAGE_SIZE);
   const ids = items.map((item) => item.mediaId);
-  const existingRows = ids.length
+  // Full scans write to staging and never use known-streak detection. Avoid a
+  // pointless read from the published catalog on every full-scan page.
+  const existingRows = mode === "incremental" && ids.length
     ? await db.creatorMediaAsset.findMany({
         where: { agencyId: job.agencyId, creatorId: job.creatorId, catalogActive: true, mediaId: { in: ids } },
         select: { mediaId: true },
       })
     : [];
-  const existing = new Set(existingRows.map((row) => row.mediaId));
+  const existing = new Set(existingRows.map((row) => String(row.mediaId)));
   let knownStreak = integer(continuation.knownStreak, 0, 0, VAULT_UNSORTED_KNOWN_STREAK);
   const now = new Date();
   for (const item of items) {
@@ -579,24 +696,17 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
     scanned,
     knownStreak,
   };
-  const nextCounts = await counts(db, job.agencyId, job.creatorId);
-  await updateSnapshot(db, {
+  await updateRunningSnapshotProgress(db, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     userId,
-    patch: {
-      scanStatus: "RUNNING",
-      mode,
-      jobId: job.id,
-      messagesFolderId: continuation.messagesFolderId,
-      pages,
-      scanned,
-      knownStreak,
-      expectedCount: integer(continuation.expectedCount ?? chunk.expectedMediaCount),
-      published: false,
-      lastError: null,
-    },
-    countOverride: nextCounts,
+    mode,
+    jobId: job.id,
+    messagesFolderId: continuation.messagesFolderId,
+    pages,
+    scanned,
+    knownStreak,
+    expectedCount: integer(continuation.expectedCount ?? chunk.expectedMediaCount),
   });
   const complete = !hasMore || stopForKnown || stopForMaxPages || items.length === 0;
   if (complete) {

@@ -32,7 +32,10 @@ function fixture(existingIds = []) {
   }]));
   const stage = new Map();
   let snapshot = null;
-  const calls = { assetDeleteMany: [], stageDeleteMany: [], assetUpserts: 0, stageUpserts: 0 };
+  const calls = {
+    assetDeleteMany: [], stageDeleteMany: [], assetUpserts: 0, stageUpserts: 0,
+    assetCounts: 0, assetFindMany: 0,
+  };
 
   function assetMatches(row, where = {}) {
     if (where.catalogActive !== undefined && row.catalogActive !== where.catalogActive) return false;
@@ -44,10 +47,16 @@ function fixture(existingIds = []) {
 
   const db = {
     creatorMediaAsset: {
-      count: async ({ where }) => [...assets.values()].filter((row) => assetMatches(row, where)).length,
-      findMany: async ({ where }) => [...assets.values()]
-        .filter((row) => assetMatches(row, where))
-        .map((row) => ({ ...row })),
+      count: async ({ where }) => {
+        calls.assetCounts += 1;
+        return [...assets.values()].filter((row) => assetMatches(row, where)).length;
+      },
+      findMany: async ({ where }) => {
+        calls.assetFindMany += 1;
+        return [...assets.values()]
+          .filter((row) => assetMatches(row, where))
+          .map((row) => ({ ...row }));
+      },
       upsert: async ({ where, create, update }) => {
         const mediaId = where.creatorId_mediaId.mediaId;
         assets.set(mediaId, assets.has(mediaId) ? { ...assets.get(mediaId), ...update } : { id: `asset-${mediaId}`, ...create });
@@ -187,16 +196,12 @@ test("snapshot payload is compact and does not embed thousands of media rows", (
   assert.equal(Object.hasOwn(payload, "media"), false);
 });
 
-test("Messages catalog writes one parameterized staging UPSERT per OF page", async () => {
+test("full Messages page uses one staging UPSERT plus one lightweight snapshot UPDATE", async () => {
   const fx = fixture([]);
-  let rawCalls = 0;
-  let rawSql = "";
-  let rawParams = [];
+  const rawCalls = [];
   fx.db.$executeRawUnsafe = async (sql, ...params) => {
-    rawCalls += 1;
-    rawSql = sql;
-    rawParams = params;
-    return 3;
+    rawCalls.push({ sql, params });
+    return 1;
   };
   await applyVaultUnsortedChunk({
     db: fx.db,
@@ -209,11 +214,49 @@ test("Messages catalog writes one parameterized staging UPSERT per OF page", asy
       nextOffset: 3,
     },
   });
-  assert.equal(rawCalls, 1);
+  assert.equal(rawCalls.length, 2);
   assert.equal(fx.calls.stageUpserts, 0);
-  assert.match(rawSql, /INSERT INTO "MediaLibraryScanItem"/);
-  assert.match(rawSql, /ON CONFLICT \("jobId", "mediaId"\) DO UPDATE/);
-  assert.equal(rawParams.length, 3 * 15);
+  assert.equal(fx.calls.assetFindMany, 0, "full pages must not read the published catalog");
+  assert.equal(fx.calls.assetCounts, 0, "full pages must not recount the published catalog");
+  assert.match(rawCalls[0].sql, /INSERT INTO "MediaLibraryScanItem"/);
+  assert.match(rawCalls[0].sql, /ON CONFLICT \("jobId", "mediaId"\) DO UPDATE/);
+  assert.equal(rawCalls[0].params.length, 3 * 15);
+  assert.match(rawCalls[1].sql, /UPDATE "VaultUnsortedSnapshot"/);
+  assert.match(rawCalls[1].sql, /jsonb_build_object/);
+  assert.doesNotMatch(rawCalls[1].sql, /catalog_counts/);
+  assert.equal(rawCalls[1].params.length, 11);
+});
+
+test("incremental page refreshes exact published counts in the snapshot UPDATE", async () => {
+  const fx = fixture(["known-unsorted"]);
+  const rawCalls = [];
+  fx.db.$executeRawUnsafe = async (sql, ...params) => {
+    rawCalls.push({ sql, params });
+    return 1;
+  };
+  await applyVaultUnsortedChunk({
+    db: fx.db,
+    job,
+    chunkResult: {
+      kind: "vault_unsorted_media_page",
+      continuation: { phase: "media", mode: "incremental", messagesFolderId: "messages", offset: 0, pages: 0, scanned: 0, knownStreak: 0 },
+      items: [
+        { mediaId: "known-unsorted", status: "SORTED", folderIds: ["custom"] },
+        { mediaId: "new-sorted", status: "SORTED", folderIds: ["custom"] },
+      ],
+      hasMore: true,
+      nextOffset: 2,
+    },
+  });
+  assert.equal(fx.calls.assetFindMany, 1);
+  assert.equal(fx.calls.assetCounts, 0, "incremental pages must not issue separate Prisma COUNT calls");
+  assert.equal(rawCalls.length, 2);
+  const snapshotCall = rawCalls.find((entry) => /UPDATE "VaultUnsortedSnapshot"/.test(entry.sql));
+  assert.ok(snapshotCall);
+  assert.match(snapshotCall.sql, /WITH catalog_counts AS/);
+  assert.match(snapshotCall.sql, /COUNT\(\*\) FILTER \(WHERE "sortingStatus" = 'UNSORTED'\)/);
+  assert.match(snapshotCall.sql, /"itemsCount" = catalog_counts\."itemsCount"/);
+  assert.equal(snapshotCall.params.length, 11);
 });
 
 test("orphaned RUNNING Messages snapshot is reconciled from its terminal job", async () => {
