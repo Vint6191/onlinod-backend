@@ -703,13 +703,12 @@ function stageFrom({ messages, dialogs, authoritative, stale }) {
   if (messagesWaitingContext || dialogWaitingContext || dialogs.queue.waitingContext > 0) return "WAITING_FOR_CREATOR_CONTEXT";
   if (messagesRetrying || dialogRetrying || dialogs.queue.retrying > 0) return "RETRYING";
   if (messagesJob === "SCHEDULED" || dialogJob === "SCHEDULED" || dialogs.queue.queued > 0 || scanStatus === "QUEUED") return "WAITING_FOR_WORKER";
-  if (dialogs.queue.planned > 0 && dialogs.active === 0) return "STALLED";
+  if (dialogs.queue.planned > 0 && dialogs.active === 0) return "WAITING_FOR_WORKER";
   if (scanStatus === "FAILED" || (dialogs.failed > 0 && dialogs.pending === 0 && dialogs.active === 0)) return "FAILED";
   if (scanStatus === "CANCELLED") return "CANCELLED";
-  if (dialogs.unavailable > 0 && dialogs.pending === 0 && dialogs.active === 0) return "PARTIAL";
   if (authoritative && stale) return "STALE";
   if (authoritative) return "UP_TO_DATE";
-  if (dialogs.pending > 0) return "STALLED";
+  if (dialogs.pending > 0) return "WAITING_FOR_WORKER";
   return "NOT_SCANNED";
 }
 
@@ -754,14 +753,12 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   );
   const dialogsComplete = Boolean(
     dialogsDrained
-      && dialogs.unavailable === 0
-      && dialogs.initialComplete === dialogs.discovered,
+      && dialogs.initialComplete + dialogs.unavailable === dialogs.discovered,
   );
   const authoritative = messagesComplete && dialogsComplete;
   const reasons = [];
   if (!messagesComplete) reasons.push("Messages catalog initial scan is incomplete");
   if (!dialogsDrained) reasons.push("dialog history initial scan is incomplete");
-  if (dialogs.unavailable > 0) reasons.push(`${dialogs.unavailable} dialog(s) are inaccessible and could not be verified`);
 
   const messagesAt = messages.snapshot?.lastIncrementalScanAt || messages.snapshot?.lastFullScanAt || null;
   const dialogsAt = dialogs.lastSuccessfulScanAt || null;

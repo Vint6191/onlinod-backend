@@ -152,7 +152,7 @@ test("Messages full catalog plus initial dialog history makes the result authori
   assert.equal(result.pipeline.projection.neverUsed, 2);
 });
 
-test("inaccessible dialogs drain the queue without making Never Used authoritative", async () => {
+test("inaccessible dialogs drain the queue and do not block the projection", async () => {
   const dialogStates = [
     {
       dialogId: "dialog-ready", scanMode: "initial", initialScanComplete: true, status: "READY",
@@ -171,12 +171,13 @@ test("inaccessible dialogs drain the queue without making Never Used authoritati
     db: dbFixture({ complete: true, dialogStates }),
     now: date(60_000),
   });
-  assert.equal(result.pipeline.stage, "PARTIAL");
-  assert.equal(result.pipeline.authoritative, false);
+  assert.equal(result.pipeline.stage, "UP_TO_DATE");
+  assert.equal(result.pipeline.authoritative, true);
   assert.equal(result.pipeline.dialogs.pending, 0);
   assert.equal(result.pipeline.dialogs.unavailable, 1);
   assert.equal(result.pipeline.dialogs.queue.unavailable, 1);
-  assert.match(result.pipeline.provisionalReason, /1 dialog\(s\) are inaccessible/i);
+  assert.equal(result.pipeline.provisionalReason, null);
+  assert.equal(result.pipeline.projection.complete, true);
 });
 
 test("both SORTED and UNSORTED Messages items are creator candidates; membership is not usage", async () => {
@@ -230,6 +231,23 @@ test("an authoritative result becomes STALE after the bounded freshness window",
   const result = await getNeverUsedPipelineState({ agencyId: "agency-1", creatorId: "creator-1", db: dbFixture({ complete: true }), now: date(4 * 60 * 60 * 1000), staleAfter: 3 * 60 * 60 * 1000 });
   assert.equal(result.pipeline.stage, "STALE");
   assert.match(result.pipeline.staleReason, /Messages catalog/i);
+});
+
+test("a frozen PLANNED backlog is waiting for a batch worker, not a recovery failure", async () => {
+  const plannedState = {
+    dialogId: "dialog-planned", scanMode: "initial", initialScanComplete: false, status: "PLANNED",
+    activeRunId: null, activeJobId: null, pagesProcessed: 0, messagesProcessed: 0,
+    lastError: null, lastFullScanAt: null, lastIncrementalScanAt: null, updatedAt: date(),
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: dbFixture({ complete: true, dialogStates: [plannedState] }),
+    now: date(60_000),
+  });
+  assert.equal(result.pipeline.stage, "WAITING_FOR_WORKER");
+  assert.equal(result.pipeline.dialogs.queue.planned, 1);
+  assert.equal(result.pipeline.projection.deferred, true);
 });
 
 test("scheduled durable work is shown as WAITING_FOR_WORKER", async () => {
