@@ -247,10 +247,10 @@ test("live batch progress exposes the real dialog and renews the lease", async (
 
 test("one completion report closes the whole batch and is idempotent", async () => {
   const db = createDb();
-  seedPlanned(db, 3);
+  seedPlanned(db, 4);
   seedCompletedDiscovery(db);
   const claim = await claimDialogHistoryBatchTx(db, {
-    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 3,
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 4,
   });
   const input = {
     agencyId: "agency-1",
@@ -260,24 +260,29 @@ test("one completion report closes the whole batch and is idempotent", async () 
     results: [
       { dialogId: "dialog-01", ok: true, pages: 4, messages: 120, inserted: 120 },
       { dialogId: "dialog-02", ok: false, retryable: true, error: "HTTP_429" },
-      { dialogId: "dialog-03", ok: false, retryable: false, error: "DIALOG_NOT_FOUND" },
+      { dialogId: "dialog-03", ok: false, retryable: false, unavailable: true, code: "DIALOG_UNAVAILABLE", status: 403, error: "geo blocked" },
+      { dialogId: "dialog-04", ok: false, retryable: false, code: "INVALID_SCAN_WORK", error: "bad payload" },
     ],
   };
 
   const completed = await completeDialogHistoryBatchTx(db, input);
   assert.deepEqual(
-    { completed: completed.completed, replanned: completed.replanned, failed: completed.failed },
-    { completed: 1, replanned: 1, failed: 1 },
+    { completed: completed.completed, replanned: completed.replanned, unavailable: completed.unavailable, failed: completed.failed },
+    { completed: 1, replanned: 1, unavailable: 1, failed: 1 },
   );
   assert.equal(db._states.get("dialog-01").status, "READY");
   assert.equal(db._states.get("dialog-01").initialScanComplete, true);
   assert.equal(db._states.get("dialog-02").status, "PLANNED");
-  assert.equal(db._states.get("dialog-03").status, "FAILED");
+  assert.equal(db._states.get("dialog-03").status, "UNAVAILABLE");
+  assert.match(db._states.get("dialog-03").lastError, /DIALOG_UNAVAILABLE.*HTTP 403.*geo blocked/);
+  assert.equal(db._states.get("dialog-04").status, "FAILED");
   assert.equal(db._runs.get(claim.batch.id).status, "COMPLETED");
+  assert.equal(db._runs.get(claim.batch.id).progress.skipped, 1);
 
   const replay = await completeDialogHistoryBatchTx(db, input);
   assert.equal(replay.replayed, true);
   assert.equal(replay.completed, 1);
+  assert.equal(replay.unavailable, 1);
   assert.equal(db._states.get("dialog-01").messagesProcessed, 120);
 });
 

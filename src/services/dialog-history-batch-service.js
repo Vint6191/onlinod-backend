@@ -52,6 +52,9 @@ function compactResult(raw) {
     inserted: integer(value.inserted, 0, 0, 100_000_000),
     updated: integer(value.updated, 0, 0, 100_000_000),
     error: clean(value.error, 2_000),
+    code: clean(value.code, 120),
+    status: value.status == null ? null : integer(value.status, 0, 0, 599),
+    unavailable: value.unavailable === true || clean(value.code, 120) === "DIALOG_UNAVAILABLE",
     reusedLocal: value.reusedLocal === true,
   };
 }
@@ -67,6 +70,7 @@ function compactBatchProgress(raw, previous = {}) {
     completed: integer(value.completed ?? before.completed, 0, 0, total || 100),
     failed: integer(value.failed ?? before.failed, 0, 0, total || 100),
     replanned: integer(value.replanned ?? before.replanned, 0, 0, total || 100),
+    skipped: integer(value.skipped ?? before.skipped, 0, 0, total || 100),
     dialogId: clean(value.dialogId, 180),
     fanId: clean(value.fanId, 180),
     stage,
@@ -464,6 +468,7 @@ async function completeDialogHistoryBatchTx(tx, input) {
     let completed = 0;
     let replanned = 0;
     let failed = 0;
+    let unavailable = 0;
     let pages = 0;
     let messages = 0;
     let inserted = 0;
@@ -500,6 +505,23 @@ async function completeDialogHistoryBatchTx(tx, input) {
             lastError: null,
           },
         });
+      } else if (result.unavailable === true) {
+        unavailable += 1;
+        const reason = [result.code || "DIALOG_UNAVAILABLE", result.status ? `HTTP ${result.status}` : null, result.error]
+          .filter(Boolean)
+          .join(": ")
+          .slice(0, 2_000);
+        await tx.dialogScanState.updateMany({
+          where: { agencyId: run.agencyId, creatorId: run.creatorId, dialogId, activeRunId: run.id },
+          data: {
+            // Terminal only for this discovery generation. A later discovery
+            // can plan the dialog again if the block/geo restriction changes.
+            status: "UNAVAILABLE",
+            activeRunId: null,
+            activeJobId: null,
+            lastError: reason || "DIALOG_UNAVAILABLE",
+          },
+        });
       } else if (result.retryable !== false) {
         replanned += 1;
         await tx.dialogScanState.updateMany({
@@ -531,6 +553,7 @@ async function completeDialogHistoryBatchTx(tx, input) {
       completed,
       replanned,
       failed,
+      unavailable,
       pages,
       messages,
       inserted,
@@ -549,9 +572,10 @@ async function completeDialogHistoryBatchTx(tx, input) {
           completed,
           replanned,
           failed,
+          skipped: unavailable,
           pages,
           messages,
-          message: `Dialog batch complete · ${completed}/${claimedDialogs.length}`,
+          message: `Dialog batch complete · ${completed} completed · ${unavailable} unavailable`,
         },
         pagesProcessed: pages,
         messagesProcessed: messages,

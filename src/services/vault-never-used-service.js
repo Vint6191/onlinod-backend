@@ -331,8 +331,9 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   const completed = planStates.filter((state) => ["READY", "COMPLETED"].includes(clean(state.status, 40).toUpperCase())).length;
   const pausedCount = planStates.filter((state) => state.status === "PAUSED").length;
   const failed = planStates.filter((state) => state.status === "FAILED").length;
+  const unavailable = planStates.filter((state) => state.status === "UNAVAILABLE").length;
   const planned = planStates.filter((state) => state.status === "PLANNED").length;
-  const pending = Math.max(0, discovered - completed - failed);
+  const pending = Math.max(0, discovered - completed - failed - unavailable);
   const pagesCommitted = planStates.reduce((sum, state) => sum + number(state.pagesProcessed), 0);
   const messagesCommitted = planStates.reduce((sum, state) => sum + number(state.messagesProcessed), 0);
   const successfulStateTimes = planStates
@@ -406,6 +407,7 @@ async function dialogPipelineState(db, agencyId, creatorId) {
     active: historyActiveJobs.length + activeBatchRuns.length + (discoveryActive ? 1 : 0) + pausedCount,
     paused: pausedCount > 0 || discoveryPaused,
     failed,
+    unavailable,
     pending,
     pagesCommitted,
     messagesCommitted,
@@ -434,6 +436,7 @@ async function dialogPipelineState(db, agencyId, creatorId) {
       retrying: retryingJobs.length,
       paused: pausedCount,
       failed,
+      unavailable,
     },
     discovery: {
       completed: discoveryCompleted,
@@ -515,6 +518,7 @@ async function dialogPipelineState(db, agencyId, creatorId) {
       batchCompleted: number(currentBatchProgress.completed),
       batchFailed: number(currentBatchProgress.failed),
       batchReplanned: number(currentBatchProgress.replanned),
+      batchSkipped: number(currentBatchProgress.skipped),
       lastProgressAt: iso(currentBatchProgress.updatedAt || currentBatchRun.updatedAt),
     } : null,
     lastFailure,
@@ -702,6 +706,7 @@ function stageFrom({ messages, dialogs, authoritative, stale }) {
   if (dialogs.queue.planned > 0 && dialogs.active === 0) return "STALLED";
   if (scanStatus === "FAILED" || (dialogs.failed > 0 && dialogs.pending === 0 && dialogs.active === 0)) return "FAILED";
   if (scanStatus === "CANCELLED") return "CANCELLED";
+  if (dialogs.unavailable > 0 && dialogs.pending === 0 && dialogs.active === 0) return "PARTIAL";
   if (authoritative && stale) return "STALE";
   if (authoritative) return "UP_TO_DATE";
   if (dialogs.pending > 0) return "STALLED";
@@ -741,16 +746,22 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   }
   const { messages, dialogs, salesAt } = await loadPipelineSources({ agencyId, creatorId, db });
   const messagesComplete = Boolean(messages.snapshot?.lastFullScanAt && messages.snapshot?.scan?.status === "COMPLETED");
-  const dialogsComplete = Boolean(
+  const dialogsDrained = Boolean(
     dialogs.discoveryCompleted
       && dialogs.active === 0
       && dialogs.failed === 0
+      && dialogs.pending === 0,
+  );
+  const dialogsComplete = Boolean(
+    dialogsDrained
+      && dialogs.unavailable === 0
       && dialogs.initialComplete === dialogs.discovered,
   );
   const authoritative = messagesComplete && dialogsComplete;
   const reasons = [];
   if (!messagesComplete) reasons.push("Messages catalog initial scan is incomplete");
-  if (!dialogsComplete) reasons.push("dialog history initial scan is incomplete");
+  if (!dialogsDrained) reasons.push("dialog history initial scan is incomplete");
+  if (dialogs.unavailable > 0) reasons.push(`${dialogs.unavailable} dialog(s) are inaccessible and could not be verified`);
 
   const messagesAt = messages.snapshot?.lastIncrementalScanAt || messages.snapshot?.lastFullScanAt || null;
   const dialogsAt = dialogs.lastSuccessfulScanAt || null;
@@ -791,7 +802,7 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   }
   if (messagesComplete && dialogs.discoveryCompleted) progressPercent = Math.max(progressPercent, 40);
   if (dialogs.discovered > 0) {
-    progressPercent = Math.max(progressPercent, 40 + Math.round((dialogs.queue.completed / dialogs.discovered) * 55));
+    progressPercent = Math.max(progressPercent, 40 + Math.round(((dialogs.queue.completed + dialogs.queue.unavailable) / dialogs.discovered) * 55));
   } else if (messagesComplete && ["DISCOVERING_DIALOGS", "WAITING_FOR_WORKER", "WAITING_FOR_CREATOR_CONTEXT", "STALLED"].includes(stage)) {
     progressIndeterminate = true;
   }
@@ -821,6 +832,7 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
         active: dialogs.active,
         paused: dialogs.paused,
         failed: dialogs.failed,
+        unavailable: dialogs.unavailable,
         pending: dialogs.pending,
         pagesCommitted: dialogs.pagesCommitted,
         messagesCommitted: dialogs.messagesCommitted,

@@ -152,6 +152,33 @@ test("Messages full catalog plus initial dialog history makes the result authori
   assert.equal(result.pipeline.projection.neverUsed, 2);
 });
 
+test("inaccessible dialogs drain the queue without making Never Used authoritative", async () => {
+  const dialogStates = [
+    {
+      dialogId: "dialog-ready", scanMode: "initial", initialScanComplete: true, status: "READY",
+      activeRunId: null, activeJobId: null, pagesProcessed: 2, messagesProcessed: 50,
+      lastError: null, lastFullScanAt: date(), lastIncrementalScanAt: null, updatedAt: date(),
+    },
+    {
+      dialogId: "dialog-blocked", scanMode: "initial", initialScanComplete: false, status: "UNAVAILABLE",
+      activeRunId: null, activeJobId: null, pagesProcessed: 0, messagesProcessed: 0,
+      lastError: "DIALOG_UNAVAILABLE: HTTP 403", lastFullScanAt: null, lastIncrementalScanAt: null, updatedAt: date(),
+    },
+  ];
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: dbFixture({ complete: true, dialogStates }),
+    now: date(60_000),
+  });
+  assert.equal(result.pipeline.stage, "PARTIAL");
+  assert.equal(result.pipeline.authoritative, false);
+  assert.equal(result.pipeline.dialogs.pending, 0);
+  assert.equal(result.pipeline.dialogs.unavailable, 1);
+  assert.equal(result.pipeline.dialogs.queue.unavailable, 1);
+  assert.match(result.pipeline.provisionalReason, /1 dialog\(s\) are inaccessible/i);
+});
+
 test("both SORTED and UNSORTED Messages items are creator candidates; membership is not usage", async () => {
   const result = await projectionCounts(dbFixture({ complete: true }), "agency-1", "creator-1");
   assert.equal(result.catalogMedia, 3);
