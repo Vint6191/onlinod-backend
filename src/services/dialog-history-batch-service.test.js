@@ -13,6 +13,7 @@ const {
   completeDialogHistoryBatchTx,
   releaseDialogHistoryBatchTx,
   recoverExpiredDialogHistoryBatchesTx,
+  normalizeOrphanedDialogHistoryBatchesTx,
 } = require("./dialog-history-batch-service");
 
 function applyData(row, data) {
@@ -180,23 +181,28 @@ test("one claim reserves one compact batch and creates no JobInstance", async ()
   assert.equal(db._locks[0][1], "dialog_history_batch_claim:agency-1");
 });
 
-test("an active or paused creator batch blocks a second claim without touching the plan", async () => {
+test("an active or paused creator batch that still owns dialogs blocks a second claim", async () => {
   for (const status of ["RUNNING", "PAUSED"]) {
     const db = createDb();
     seedPlanned(db, 2);
     seedCompletedDiscovery(db);
-    db._runs.set(`existing-${status}`, {
-      id: `existing-${status}`,
+    const runId = `existing-${status}`;
+    db._runs.set(runId, {
+      id: runId,
       agencyId: "agency-1",
       creatorId: "creator-1",
       dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID,
       status,
+      generation: 7,
       continuation: {
         leaseUntil: new Date(Date.now() + 600_000).toISOString(),
       },
       createdAt: new Date(),
       updatedAt: new Date(),
     });
+    const owned = db._states.get("dialog-01");
+    owned.status = status;
+    owned.activeRunId = runId;
 
     const result = await claimDialogHistoryBatchTx(db, {
       agencyId: "agency-1",
@@ -207,9 +213,67 @@ test("an active or paused creator batch blocks a second claim without touching t
 
     assert.equal(result.batch, null);
     assert.equal(result.reason, "creator_batch_already_active");
-    assert.equal([...db._runs.values()].filter((row) => row.dialogId === DIALOG_HISTORY_BATCH_DIALOG_ID).length, 1);
-    assert.equal([...db._states.values()].every((row) => row.status === "PLANNED"), true);
+    assert.equal(db._runs.get(runId).status, status);
+    assert.equal(db._states.get("dialog-01").activeRunId, runId);
   }
+});
+
+test("a stale synthetic batch from an older generation is cancelled before claiming current PLANNED rows", async () => {
+  const db = createDb();
+  seedPlanned(db, 2, 8);
+  seedCompletedDiscovery(db, 8);
+  db._runs.set("stale-batch", {
+    id: "stale-batch",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID,
+    status: "RUNNING",
+    generation: 7,
+    continuation: { leaseUntil: new Date(Date.now() + 600_000).toISOString() },
+    createdAt: new Date(1),
+    updatedAt: new Date(1),
+  });
+
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-b",
+    creatorIds: ["creator-1"],
+    batchSize: 2,
+  });
+
+  assert.equal(result.reason, "claimed");
+  assert.equal(result.batch.dialogs.length, 2);
+  assert.equal(db._runs.get("stale-batch").status, "CANCELLED");
+  assert.equal(db._runs.get("stale-batch").lastError, "DIALOG_HISTORY_BATCH_SUPERSEDED");
+});
+
+test("an orphaned paused batch with no owned PAUSED dialogs cannot block forever", async () => {
+  const db = createDb();
+  seedPlanned(db, 1);
+  seedCompletedDiscovery(db);
+  db._runs.set("paused-orphan", {
+    id: "paused-orphan",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID,
+    status: "PAUSED",
+    generation: 7,
+    continuation: { leaseUntil: new Date(Date.now() + 600_000).toISOString() },
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+
+  const normalized = await normalizeOrphanedDialogHistoryBatchesTx(db, {
+    agencyId: "agency-1",
+    creatorIds: ["creator-1"],
+  });
+  assert.equal(normalized.normalized, 1);
+  assert.equal(db._runs.get("paused-orphan").status, "CANCELLED");
+
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 1,
+  });
+  assert.equal(result.reason, "claimed");
 });
 
 
@@ -313,4 +377,16 @@ test("expired or explicitly released batches return their dialogs to PLANNED", a
   assert.equal(recovered.dialogCount, 2);
   assert.equal(run.status, "FAILED");
   assert.equal([...db._states.values()].filter((row) => row.status === "PLANNED").length, 4);
+
+  const third = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-c", creatorIds: ["creator-1"], batchSize: 1,
+  });
+  const missingLeaseRun = db._runs.get(third.batch.id);
+  missingLeaseRun.continuation = { ...missingLeaseRun.continuation, leaseUntil: null };
+  const missingLease = await recoverExpiredDialogHistoryBatchesTx(db, {
+    agencyId: "agency-1", creatorIds: ["creator-1"], now: new Date(),
+  });
+  assert.equal(missingLease.recovered, 1);
+  assert.equal(missingLeaseRun.status, "FAILED");
+  assert.equal(missingLeaseRun.lastError, "DIALOG_HISTORY_BATCH_LEASE_MISSING");
 });

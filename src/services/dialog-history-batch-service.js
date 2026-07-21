@@ -126,7 +126,10 @@ async function recoverExpiredDialogHistoryBatchesTx(db, input = {}) {
   for (const run of runs) {
     const continuation = object(run.continuation);
     const expiresAt = dateOrNull(continuation.leaseUntil);
-    if (!expiresAt || expiresAt.getTime() > now.getTime()) continue;
+    // A RUNNING/QUEUED synthetic batch without a valid lease can never be
+    // renewed or released by a Desktop. Treat it exactly like an expired lease
+    // instead of allowing it to block the creator forever.
+    if (expiresAt && expiresAt.getTime() > now.getTime()) continue;
     const reset = await db.dialogScanState.updateMany({
       where: { agencyId, creatorId: run.creatorId, activeRunId: run.id },
       data: {
@@ -141,7 +144,14 @@ async function recoverExpiredDialogHistoryBatchesTx(db, input = {}) {
       data: {
         status: "FAILED",
         completedAt: now,
-        lastError: "DIALOG_HISTORY_BATCH_LEASE_EXPIRED",
+        lastError: expiresAt
+          ? "DIALOG_HISTORY_BATCH_LEASE_EXPIRED"
+          : "DIALOG_HISTORY_BATCH_LEASE_MISSING",
+        continuation: {
+          ...continuation,
+          leaseUntil: null,
+          normalizedAt: now.toISOString(),
+        },
         progress: {
           ...object(run.progress),
           expired: true,
@@ -154,6 +164,95 @@ async function recoverExpiredDialogHistoryBatchesTx(db, input = {}) {
     dialogCount += reset.count;
   }
   return { recovered, dialogCount };
+}
+
+async function normalizeOrphanedDialogHistoryBatchesTx(db, input = {}) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorIds = [...new Set(list(input.creatorIds).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 1_000);
+  if (!agencyId) return { normalized: 0, dialogCount: 0 };
+  const now = input.now instanceof Date ? input.now : new Date();
+  const runs = await db.dialogScanRun.findMany({
+    where: {
+      agencyId,
+      dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID,
+      status: { in: CLAIM_BLOCKING_BATCH_STATUSES },
+      ...(creatorIds.length ? { creatorId: { in: creatorIds } } : {}),
+    },
+    orderBy: { updatedAt: "asc" },
+    take: 1_000,
+  });
+  const latestDiscoveryByCreator = new Map();
+  let normalized = 0;
+  let dialogCount = 0;
+
+  for (const run of runs) {
+    let latestDiscovery = latestDiscoveryByCreator.get(run.creatorId);
+    if (latestDiscovery === undefined) {
+      latestDiscovery = await db.dialogScanRun.findFirst({
+        where: { agencyId, creatorId: run.creatorId, dialogId: "__dialog_discovery__" },
+        orderBy: { createdAt: "desc" },
+      });
+      latestDiscoveryByCreator.set(run.creatorId, latestDiscovery || null);
+    }
+
+    const ownedStates = await db.dialogScanState.findMany({
+      where: { agencyId, creatorId: run.creatorId, activeRunId: run.id },
+      take: 101,
+    });
+    const status = clean(run.status, 40).toUpperCase();
+    const latestGeneration = integer(latestDiscovery?.generation, -1, -1);
+    const runGeneration = integer(run.generation, -1, -1);
+    const superseded = latestDiscovery
+      && clean(latestDiscovery.status, 40).toUpperCase() === "COMPLETED"
+      && latestGeneration >= 0
+      && runGeneration !== latestGeneration;
+    const ownsNoDialogs = ownedStates.length === 0;
+    const pausedWithoutPausedDialogs = status === "PAUSED"
+      && !ownedStates.some((state) => clean(state.status, 40).toUpperCase() === "PAUSED");
+
+    if (!superseded && !ownsNoDialogs && !pausedWithoutPausedDialogs) continue;
+
+    const reset = await db.dialogScanState.updateMany({
+      where: { agencyId, creatorId: run.creatorId, activeRunId: run.id },
+      data: {
+        status: "PLANNED",
+        activeRunId: null,
+        activeJobId: null,
+        lastError: null,
+      },
+    });
+    const reason = superseded
+      ? "DIALOG_HISTORY_BATCH_SUPERSEDED"
+      : pausedWithoutPausedDialogs
+        ? "DIALOG_HISTORY_BATCH_PAUSED_ORPHAN"
+        : "DIALOG_HISTORY_BATCH_ORPHANED";
+    await db.dialogScanRun.update({
+      where: { id: run.id },
+      data: {
+        status: "CANCELLED",
+        completedAt: now,
+        pausedAt: null,
+        lastError: reason,
+        continuation: {
+          ...object(run.continuation),
+          leaseUntil: null,
+          normalizedAt: now.toISOString(),
+          normalizedReason: reason,
+        },
+        progress: {
+          ...object(run.progress),
+          normalized: true,
+          normalizedAt: now.toISOString(),
+          normalizedReason: reason,
+          releasedDialogs: reset.count,
+        },
+      },
+    });
+    normalized += 1;
+    dialogCount += reset.count;
+  }
+
+  return { normalized, dialogCount };
 }
 
 async function claimDialogHistoryBatchTx(db, input) {
@@ -170,6 +269,7 @@ async function claimDialogHistoryBatchTx(db, input) {
 
   await lockDialogHistoryBatchClaimsTx(db, agencyId);
   await recoverExpiredDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
+  await normalizeOrphanedDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
 
   const blockingRuns = await db.dialogScanRun.findMany({
     where: {
@@ -635,4 +735,5 @@ module.exports = {
   releaseDialogHistoryBatchTx,
   releaseDialogHistoryBatch,
   recoverExpiredDialogHistoryBatchesTx,
+  normalizeOrphanedDialogHistoryBatchesTx,
 };
