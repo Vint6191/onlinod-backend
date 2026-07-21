@@ -9,6 +9,7 @@ delete require.cache[require.resolve("./dialog-history-batch-service")];
 const {
   DIALOG_HISTORY_BATCH_DIALOG_ID,
   claimDialogHistoryBatchTx,
+  progressDialogHistoryBatchTx,
   completeDialogHistoryBatchTx,
   releaseDialogHistoryBatchTx,
   recoverExpiredDialogHistoryBatchesTx,
@@ -209,6 +210,39 @@ test("an active or paused creator batch blocks a second claim without touching t
     assert.equal([...db._runs.values()].filter((row) => row.dialogId === DIALOG_HISTORY_BATCH_DIALOG_ID).length, 1);
     assert.equal([...db._states.values()].every((row) => row.status === "PLANNED"), true);
   }
+});
+
+
+test("live batch progress exposes the real dialog and renews the lease", async () => {
+  const db = createDb();
+  seedPlanned(db, 2);
+  seedCompletedDiscovery(db);
+  const claim = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 2, leaseMs: 60_000,
+  });
+  const beforeLease = new Date(claim.batch.leaseUntil).getTime();
+  const progress = await progressDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    batchId: claim.batch.id,
+    leaseToken: claim.batch.leaseToken,
+    leaseMs: 120_000,
+    progress: {
+      current: 0, total: 2, completed: 0, failed: 0, replanned: 0,
+      dialogId: "dialog-01", fanId: "fan-1", stage: "scanning",
+      pages: 3, messages: 147, media: 12, message: "Dialog 1/2 · 147 messages",
+    },
+  });
+
+  assert.equal(progress.ok, true);
+  assert.equal(progress.progress.dialogId, "dialog-01");
+  assert.equal(progress.progress.fanId, "fan-1");
+  assert.equal(progress.progress.stage, "scanning");
+  assert.equal(progress.progress.pages, 3);
+  assert.equal(progress.progress.messages, 147);
+  assert.equal(progress.progress.media, 12);
+  assert.ok(new Date(progress.leaseUntil).getTime() > beforeLease);
+  assert.deepEqual(db._runs.get(claim.batch.id).progress, progress.progress);
 });
 
 test("one completion report closes the whole batch and is idempotent", async () => {

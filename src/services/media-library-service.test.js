@@ -4,10 +4,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const prismaModule = require.resolve("../prisma");
+require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
+delete require.cache[require.resolve("./media-library-service")];
 const {
   getMediaMetadata,
   upsertMediaMetadata,
-  importMediaMetadata,
   replaceUsageSources,
 } = require("./media-library-service");
 
@@ -46,6 +48,14 @@ function metadataDb(seed = []) {
       async findUnique({ where }) {
         return assets.get(where.creatorId_mediaId.mediaId) || null;
       },
+      async findFirst({ where }) {
+        return [...assets.values()].find((asset) => (
+          asset.agencyId === where.agencyId
+          && asset.creatorId === where.creatorId
+          && asset.mediaId === where.mediaId
+          && (where.catalogActive === undefined || asset.catalogActive === where.catalogActive)
+        )) || null;
+      },
       async findMany({ where }) {
         const ids = new Set(where.mediaId?.in || []);
         return [...assets.values()].filter((asset) => (
@@ -54,21 +64,11 @@ function metadataDb(seed = []) {
           && (!ids.size || ids.has(asset.mediaId))
         ));
       },
-      async upsert({ where, create, update }) {
-        const mediaId = where.creatorId_mediaId.mediaId;
-        const previous = assets.get(mediaId);
-        const next = previous
-          ? { ...previous, ...update, updatedAt: new Date() }
-          : {
-              id: `asset-${mediaId}`,
-              createdAt: new Date(),
-              updatedAt: new Date(),
-              manualTags: [],
-              visibleBodyParts: [],
-              metadata: {},
-              ...create,
-            };
-        assets.set(mediaId, next);
+      async update({ where, data }) {
+        const previous = [...assets.values()].find((asset) => asset.id === where.id);
+        if (!previous) throw new Error(`asset ${where.id} missing`);
+        const next = { ...previous, ...data, updatedAt: new Date() };
+        assets.set(next.mediaId, next);
         return next;
       },
     },
@@ -77,69 +77,38 @@ function metadataDb(seed = []) {
   return { db, assets };
 }
 
-test("metadata enrichment never activates catalog membership and older JSON cannot win", async () => {
-  const newer = new Date("2026-07-20T00:00:00.000Z");
+test("legacy JSON metadata import endpoint is removed from the server runtime", () => {
+  const route = fs.readFileSync(path.resolve(__dirname, "../routes/media-library.js"), "utf8");
+  const service = fs.readFileSync(path.resolve(__dirname, "media-library-service.js"), "utf8");
+  assert.doesNotMatch(route, /metadata\/import/);
+  assert.doesNotMatch(route, /importMediaMetadata/);
+  assert.doesNotMatch(service, /importMediaMetadata/);
+});
+
+test("server metadata edits enrich only an existing active catalog row", async () => {
   const { db, assets } = metadataDb([{
-    id: "asset-current",
+    id: "asset-active",
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
-    mediaId: "current",
+    mediaId: "active-media",
     catalogActive: true,
+    sortingStatus: "UNSORTED",
     mediaType: "photo",
-    durationSec: 0,
-    description: "new server description",
-    manualTags: ["new"],
+    manualTags: [],
     visibleBodyParts: [],
-    accessType: "paid",
-    minPriceCents: 0,
-    idealPriceCents: 0,
-    storylineName: null,
-    storylineOrder: null,
-    storylineRole: null,
-    metadataUpdatedAt: newer,
-    createdAt: newer,
-    updatedAt: newer,
+    metadata: {},
+    createdAt: new Date(),
+    updatedAt: new Date(),
   }]);
-
-  const imported = await importMediaMetadata({
-    agencyId: AGENCY_ID,
-    creatorId: CREATOR_ID,
-    db,
-    items: [
-      {
-        onlyfansMediaId: "current",
-        mediaType: "video",
-        description: "stale JSON description",
-        manualTags: ["old"],
-        updatedAt: "2026-07-19T00:00:00.000Z",
-      },
-      {
-        onlyfansMediaId: "placeholder",
-        mediaType: "video",
-        description: "imported metadata",
-        manualTags: [" My Tag ", "my tag"],
-        updatedAt: "2026-07-19T01:00:00.000Z",
-      },
-    ],
-  });
-
-  assert.equal(imported.accepted, 1);
-  assert.equal(imported.skippedOlder, 1);
-  assert.deepEqual(imported.importedMediaIds, ["current", "placeholder"]);
-  assert.equal(assets.get("current").description, "new server description");
-  assert.equal(assets.get("current").catalogActive, true);
-  assert.equal(assets.get("placeholder").catalogActive, false);
-  assert.deepEqual(assets.get("placeholder").manualTags, ["my_tag"]);
-
   const saved = await upsertMediaMetadata({
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
-    mediaId: "metadata-only",
+    mediaId: "active-media",
     db,
     input: {
       mediaType: "photo",
       description: "manager note",
-      manualTags: [],
+      manualTags: [" My Tag ", "my tag"],
       visibleBodyParts: [],
       accessType: "paid",
       minPrice: 0,
@@ -147,15 +116,32 @@ test("metadata enrichment never activates catalog membership and older JSON cann
     },
   });
   assert.equal(saved.ok, true);
-  assert.equal(assets.get("metadata-only").catalogActive, false);
+  assert.equal(assets.get("active-media").catalogActive, true);
+  assert.equal(assets.get("active-media").description, "manager note");
+  assert.deepEqual(assets.get("active-media").manualTags, ["my_tag"]);
 
   const queried = await getMediaMetadata({
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
-    mediaIds: ["placeholder", "metadata-only"],
+    mediaIds: ["active-media"],
     db,
   });
-  assert.deepEqual(queried.items.map((item) => item.onlyfansMediaId), ["placeholder", "metadata-only"]);
+  assert.deepEqual(queried.items.map((item) => item.onlyfansMediaId), ["active-media"]);
+});
+
+test("metadata editing cannot create catalog rows", async () => {
+  const { db, assets } = metadataDb([]);
+  await assert.rejects(
+    () => upsertMediaMetadata({
+      agencyId: AGENCY_ID,
+      creatorId: CREATOR_ID,
+      mediaId: "metadata-only",
+      db,
+      input: { mediaType: "photo", description: "must not create inventory" },
+    }),
+    (error) => error?.code === "MEDIA_NOT_IN_CATALOG" && error?.status === 409,
+  );
+  assert.equal(assets.has("metadata-only"), false);
 });
 
 function usageDb({ rawSql = false } = {}) {

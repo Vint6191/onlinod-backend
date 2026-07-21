@@ -73,7 +73,15 @@ function fixture(existingIds = []) {
         }
         return { count };
       },
-      updateMany: async () => ({ count: 0 }),
+      updateMany: async ({ where = {}, data = {} }) => {
+        let count = 0;
+        for (const [mediaId, row] of assets) {
+          if (!assetMatches(row, where)) continue;
+          assets.set(mediaId, { ...row, ...data });
+          count += 1;
+        }
+        return { count };
+      },
     },
     mediaLibraryScanItem: {
       count: async ({ where }) => [...stage.values()].filter((row) => row.jobId === where.jobId).length,
@@ -153,8 +161,9 @@ test("full scan keeps the last complete generation visible until fenced completi
   assert.equal(fx.getSnapshot().payload.scan.status, "RUNNING");
 });
 
-test("full completion atomically publishes staging and prunes every absent row", async () => {
+test("verified full completion refreshes observed rows without shrinking the canonical catalog", async () => {
   const fx = fixture(["fresh", "stale"]);
+  fx.assets.get("stale").description = "keep me";
   fx.stage.set("fresh", {
     id: "stage-fresh", agencyId: "agency-1", creatorId: "creator-1", jobId: "job-1", mediaId: "fresh",
     sortingStatus: "SORTED", mediaType: "video", durationSec: 2, thumbUrl: null, previewUrl: null, fullUrl: null,
@@ -162,29 +171,60 @@ test("full completion atomically publishes staging and prunes every absent row",
   });
   const fullJob = { ...job, params: { ...job.params, mode: "full" } };
   const result = await applyVaultUnsortedCompletion({ db: fx.db, job: fullJob, result: { mode: "full", pages: 2, scanned: 1, expectedMediaCount: 1, knownStreak: 0 } });
-  assert.equal(fx.calls.assetDeleteMany.length, 1);
-  assert.deepEqual([...fx.assets.keys()], ["fresh"]);
-  assert.equal(result.snapshot.itemsCount, 1);
+  assert.equal(fx.calls.assetDeleteMany.length, 0);
+  assert.equal(fx.assets.get("fresh").catalogActive, true);
+  assert.equal(fx.assets.get("stale").catalogActive, true);
+  assert.equal(fx.assets.get("stale").description, "keep me");
+  assert.equal(result.snapshot.itemsCount, 2);
   assert.equal(result.snapshot.scan.status, "COMPLETED");
+  assert.equal(result.snapshot.scan.publicationMode, "exact");
+  assert.equal(result.snapshot.scan.catalogVerified, true);
 });
 
-test("incomplete full completion preserves the previous catalog instead of shrinking it", async () => {
+test("incomplete full completion merges observed rows and preserves the previous catalog", async () => {
   const fx = fixture(["fresh-1", "fresh-2", "previous-only"]);
   for (const mediaId of ["fresh-1", "fresh-2"]) {
-    fx.stage.set(mediaId, { id: `stage-${mediaId}`, agencyId: "agency-1", creatorId: "creator-1", jobId: "job-1", mediaId });
+    fx.stage.set(mediaId, {
+      id: `stage-${mediaId}`, agencyId: "agency-1", creatorId: "creator-1", jobId: "job-1", mediaId,
+      sortingStatus: "UNSORTED", mediaType: "photo", durationSec: 0, thumbUrl: null, previewUrl: null, fullUrl: null,
+      folderIds: [], seenAt: new Date(), createdAt: new Date(), updatedAt: new Date(),
+    });
   }
   const fullJob = { ...job, params: { ...job.params, mode: "full" } };
   const result = await applyVaultUnsortedCompletion({
     db: fx.db,
     job: fullJob,
-    result: { mode: "full", pages: 45, scanned: 1777, expectedMediaCount: 2104, knownStreak: 0 },
+    result: { mode: "full", pages: 45, scanned: 1777, expectedMediaCount: 2104, knownStreak: 0, sourceIncomplete: true },
   });
   assert.equal(fx.calls.assetDeleteMany.length, 0);
-  assert.deepEqual([...fx.assets.keys()], ["fresh-1", "fresh-2", "previous-only"]);
-  assert.equal(result.published, false);
+  assert.equal([...fx.assets.values()].filter((row) => row.catalogActive).length, 3);
+  assert.equal(fx.assets.get("previous-only").catalogActive, true);
+  assert.equal(result.published, true);
+  assert.equal(result.publicationMode, "merge");
   assert.equal(result.incomplete, true);
   assert.equal(result.seenByJob, 2);
-  assert.match(result.snapshot.scan.lastError, /expected 2104, received 2/);
+  assert.match(result.warning, /expected 2104, received 2/);
+  assert.equal(result.snapshot.scan.status, "COMPLETED");
+  assert.equal(result.snapshot.scan.publicationMode, "merge");
+});
+
+test("unknown source total is merge-only and can never shrink an existing catalog", async () => {
+  const fx = fixture(["old-1", "old-2"]);
+  fx.stage.set("new-1", {
+    id: "stage-new-1", agencyId: "agency-1", creatorId: "creator-1", jobId: "job-1", mediaId: "new-1",
+    sortingStatus: "UNSORTED", mediaType: "photo", durationSec: 0, thumbUrl: null, previewUrl: null, fullUrl: null,
+    folderIds: [], seenAt: new Date(), createdAt: new Date(), updatedAt: new Date(),
+  });
+  const fullJob = { ...job, params: { ...job.params, mode: "full" } };
+  const result = await applyVaultUnsortedCompletion({
+    db: fx.db,
+    job: fullJob,
+    result: { mode: "full", pages: 18, scanned: 1, expectedMediaCount: 0, knownStreak: 0 },
+  });
+  assert.equal([...fx.assets.values()].filter((row) => row.catalogActive).length, 3);
+  assert.equal(result.publicationMode, "merge");
+  assert.equal(result.incomplete, true);
+  assert.match(result.warning, /total is unavailable/);
 });
 
 test("snapshot payload is compact and does not embed thousands of media rows", () => {
@@ -278,7 +318,7 @@ test("orphaned RUNNING Messages snapshot is reconciled from its terminal job", a
   fx.db.jobInstance = {
     async findFirst() { return null; },
     async findUnique() {
-      return { id: "job-done", status: "DONE", params: { mode: "full" }, result: { mode: "full", pages: 12, scanned: 480, knownStreak: 0 }, progress: { current: 480, pages: 12 }, completedAt: new Date("2026-07-18T10:15:00.000Z") };
+      return { id: "job-done", status: "DONE", params: { mode: "full" }, result: { mode: "full", publicationMode: "exact", pages: 12, scanned: 480, knownStreak: 0 }, progress: { current: 480, pages: 12 }, completedAt: new Date("2026-07-18T10:15:00.000Z") };
     },
   };
   const state = await getVaultUnsortedState({ agencyId: "agency-1", creatorId: "creator-1", db: fx.db });
@@ -287,4 +327,39 @@ test("orphaned RUNNING Messages snapshot is reconciled from its terminal job", a
   assert.equal(state.snapshot.scan.pages, 12);
   assert.equal(state.snapshot.scan.scanned, 480);
   assert.equal(state.snapshot.lastFullScanAt, "2026-07-18T10:15:00.000Z");
+});
+
+test("orphan reconciliation never upgrades a merge-only full scan to verified", async () => {
+  const fx = fixture(["m1"]);
+  const started = new Date("2026-07-18T10:00:00.000Z");
+  let snapshot = {
+    id: "snapshot-1", agencyId: "agency-1", creatorId: "creator-1", itemsCount: 1, unsortedCount: 1, sortedCount: 0,
+    capturedAt: started, updatedAt: started,
+    payload: {
+      schema: 3, kind: "vault_unsorted_snapshot", messagesFolderId: "messages", lastFullScanAt: null, lastIncrementalScanAt: null,
+      scan: { status: "RUNNING", mode: "full", jobId: "job-merge", pages: 10, scanned: 400, knownStreak: 0, startedAt: started.toISOString(), completedAt: null, lastError: null },
+    },
+  };
+  fx.db.vaultUnsortedSnapshot.findUnique = async () => snapshot;
+  fx.db.vaultUnsortedSnapshot.upsert = async ({ create, update }) => {
+    snapshot = snapshot ? { ...snapshot, ...update, updatedAt: new Date() } : { ...create };
+    return snapshot;
+  };
+  fx.db.jobInstance = {
+    async findFirst() { return null; },
+    async findUnique() {
+      return {
+        id: "job-merge", status: "DONE", params: { mode: "full" },
+        result: { mode: "full", publicationMode: "merge", incomplete: true, warning: "source incomplete", pages: 12, scanned: 480 },
+        completedAt: new Date("2026-07-18T10:15:00.000Z"),
+      };
+    },
+  };
+  const state = await getVaultUnsortedState({ agencyId: "agency-1", creatorId: "creator-1", db: fx.db });
+  assert.equal(state.snapshot.scan.status, "COMPLETED");
+  assert.equal(state.snapshot.scan.publicationMode, "merge");
+  assert.equal(state.snapshot.scan.catalogVerified, false);
+  assert.equal(state.snapshot.lastFullScanAt, null);
+  assert.equal(state.snapshot.lastMergeScanAt, "2026-07-18T10:15:00.000Z");
+  assert.equal(state.snapshot.scan.warning, "source incomplete");
 });

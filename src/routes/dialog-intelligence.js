@@ -20,6 +20,7 @@ const {
   DIALOG_HISTORY_BATCH_DIALOG_ID,
   claimDialogHistoryBatch,
   renewDialogHistoryBatch,
+  progressDialogHistoryBatch,
   completeDialogHistoryBatch,
   releaseDialogHistoryBatch,
 } = require("../services/dialog-history-batch-service");
@@ -465,6 +466,23 @@ const dialogBatchLeaseSchema = z.object({
   leaseToken: z.string().min(16).max(500),
   leaseMs: z.number().int().min(60_000).max(30 * 60_000).optional(),
 });
+const dialogBatchProgressSchema = dialogBatchLeaseSchema.extend({
+  progress: z.object({
+    current: z.number().int().min(0).max(100),
+    total: z.number().int().min(0).max(100),
+    completed: z.number().int().min(0).max(100).optional(),
+    failed: z.number().int().min(0).max(100).optional(),
+    replanned: z.number().int().min(0).max(100).optional(),
+    dialogId: z.string().max(180).optional().nullable(),
+    fanId: z.string().max(180).optional().nullable(),
+    stage: z.enum(["starting", "scanning", "syncing_usage", "completed", "failed", "stalled"]).optional(),
+    pages: z.number().int().min(0).max(100000).optional(),
+    messages: z.number().int().min(0).max(100000000).optional(),
+    media: z.number().int().min(0).max(100000000).optional(),
+    lastError: z.string().max(2000).optional().nullable(),
+    message: z.string().max(500).optional(),
+  }),
+});
 const dialogBatchCompleteSchema = dialogBatchLeaseSchema.extend({
   results: z.array(z.object({
     dialogId: z.string().min(1).max(180),
@@ -511,6 +529,21 @@ router.post("/batches/:batchId/renew", async (req, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "DIALOG_BATCH_RENEW_FAILED");
+  }
+});
+
+router.post("/batches/:batchId/progress", async (req, res) => {
+  try {
+    const input = dialogBatchProgressSchema.parse(req.body || {});
+    const result = await progressDialogHistoryBatch({
+      agencyId: req.auth.agencyId,
+      batchId: req.params.batchId,
+      ...input,
+    });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "DIALOG_BATCH_PROGRESS_FAILED");
   }
 });
 

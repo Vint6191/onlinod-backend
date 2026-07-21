@@ -55,6 +55,29 @@ function compactResult(raw) {
     reusedLocal: value.reusedLocal === true,
   };
 }
+function compactBatchProgress(raw, previous = {}) {
+  const value = object(raw);
+  const before = object(previous);
+  const total = integer(value.total ?? before.total, 0, 0, 100);
+  const current = integer(value.current ?? before.current, 0, 0, total || 100);
+  const stage = clean(value.stage, 40) || clean(before.stage, 40) || "scanning";
+  return {
+    current,
+    total,
+    completed: integer(value.completed ?? before.completed, 0, 0, total || 100),
+    failed: integer(value.failed ?? before.failed, 0, 0, total || 100),
+    replanned: integer(value.replanned ?? before.replanned, 0, 0, total || 100),
+    dialogId: clean(value.dialogId, 180),
+    fanId: clean(value.fanId, 180),
+    stage,
+    pages: integer(value.pages, 0, 0, 100_000),
+    messages: integer(value.messages, 0, 0, 100_000_000),
+    media: integer(value.media, 0, 0, 100_000_000),
+    lastError: clean(value.lastError, 2_000),
+    message: clean(value.message, 500) || `Dialog batch ${stage} · ${current}/${total}`,
+    updatedAt: new Date().toISOString(),
+  };
+}
 
 async function assertAllowedCreators(db, agencyId, creatorIds) {
   const ids = [...new Set(list(creatorIds).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 1_000);
@@ -392,6 +415,35 @@ async function renewDialogHistoryBatch(input) {
   return prisma.$transaction((tx) => renewDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
 }
 
+async function progressDialogHistoryBatchTx(tx, input) {
+  const { run, continuation } = await requireBatchLeaseTx(tx, input);
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + leaseMs(input.leaseMs));
+  const nextContinuation = {
+    ...continuation,
+    leaseUntil: expiresAt.toISOString(),
+  };
+  const progress = compactBatchProgress(input.progress, run.progress);
+  await tx.dialogScanRun.update({
+    where: { id: run.id },
+    data: {
+      continuation: nextContinuation,
+      progress,
+      lastWorkerDeviceId: clean(input.deviceId, 200),
+    },
+  });
+  return {
+    ok: true,
+    batchId: run.id,
+    leaseUntil: expiresAt.toISOString(),
+    progress,
+  };
+}
+
+async function progressDialogHistoryBatch(input) {
+  return prisma.$transaction((tx) => progressDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+}
+
 async function completeDialogHistoryBatchTx(tx, input) {
   const { run, continuation } = await requireBatchLeaseTx(tx, input, { allowCompleted: true });
     if (clean(run.status, 40).toUpperCase() === "COMPLETED") {
@@ -552,6 +604,8 @@ module.exports = {
   claimDialogHistoryBatch,
   renewDialogHistoryBatchTx,
   renewDialogHistoryBatch,
+  progressDialogHistoryBatchTx,
+  progressDialogHistoryBatch,
   completeDialogHistoryBatchTx,
   completeDialogHistoryBatch,
   releaseDialogHistoryBatchTx,

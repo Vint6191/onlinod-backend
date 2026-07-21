@@ -7,7 +7,6 @@ const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 const {
   getMediaMetadata,
   upsertMediaMetadata,
-  importMediaMetadata,
   listStorylines,
   replaceUsageSources,
   mutateFolderMembership,
@@ -33,13 +32,6 @@ const metadataSchema = z.object({
   storylineName: z.string().max(200).nullable().optional(),
   storylineOrder: z.number().int().min(-100000).max(100000).nullable().optional(),
   storylineRole: z.enum(["main", "additional"]).nullable().optional(),
-});
-const importSchema = z.object({
-  items: z.array(metadataSchema.extend({
-    onlyfansMediaId: z.string().min(1).max(240),
-    createdAt: z.string().datetime({ offset: true }).max(100).optional(),
-    updatedAt: z.string().datetime({ offset: true }).max(100).optional(),
-  })).max(2000),
 });
 const usageItemSchema = z.object({
   mediaId: z.string().min(1).max(240),
@@ -128,20 +120,6 @@ router.put("/:creatorId/assets/:mediaId/metadata", async (req, res) => {
     }));
   } catch (error) {
     return sendError(res, error, "MEDIA_LIBRARY_METADATA_UPDATE_FAILED");
-  }
-});
-
-router.post("/:creatorId/metadata/import", async (req, res) => {
-  try {
-    const input = importSchema.parse(req.body || {});
-    return res.json(await importMediaMetadata({
-      agencyId: req.auth.agencyId,
-      creatorId: req.params.creatorId,
-      items: input.items,
-      userId: req.auth.userId,
-    }));
-  } catch (error) {
-    return sendError(res, error, "MEDIA_LIBRARY_METADATA_IMPORT_FAILED");
   }
 });
 

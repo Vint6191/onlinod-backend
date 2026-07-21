@@ -58,6 +58,7 @@ function snapshotPayload(snapshot, patch = {}) {
     updatedAt: patch.updatedAt || new Date().toISOString(),
     lastFullScanAt: patch.lastFullScanAt === undefined ? (payload.lastFullScanAt || null) : patch.lastFullScanAt,
     lastIncrementalScanAt: patch.lastIncrementalScanAt === undefined ? (payload.lastIncrementalScanAt || null) : patch.lastIncrementalScanAt,
+    lastMergeScanAt: patch.lastMergeScanAt === undefined ? (payload.lastMergeScanAt || null) : patch.lastMergeScanAt,
     scan: {
       status: normalizeStatus(patch.scanStatus ?? scan.status),
       mode: normalizeMode(patch.mode ?? scan.mode),
@@ -67,6 +68,13 @@ function snapshotPayload(snapshot, patch = {}) {
       knownStreak: integer(patch.knownStreak ?? scan.knownStreak),
       expectedCount: integer(patch.expectedCount ?? scan.expectedCount),
       published: patch.published === undefined ? (scan.published !== false) : patch.published === true,
+      publicationMode: ["exact", "merge"].includes(clean(patch.publicationMode ?? scan.publicationMode, 20))
+        ? clean(patch.publicationMode ?? scan.publicationMode, 20)
+        : null,
+      catalogVerified: patch.catalogVerified === undefined
+        ? (scan.catalogVerified === undefined ? Boolean(payload.lastFullScanAt) : scan.catalogVerified === true)
+        : patch.catalogVerified === true,
+      warning: patch.warning === undefined ? (scan.warning || null) : patch.warning,
       startedAt: patch.startedAt === undefined ? (scan.startedAt || null) : patch.startedAt,
       completedAt: patch.completedAt === undefined ? (scan.completedAt || null) : patch.completedAt,
       lastError: patch.lastError === undefined ? (scan.lastError || null) : patch.lastError,
@@ -102,6 +110,7 @@ function publicSnapshot(snapshot) {
     updatedAt: iso(snapshot.updatedAt),
     lastFullScanAt: payload.lastFullScanAt || null,
     lastIncrementalScanAt: payload.lastIncrementalScanAt || null,
+    lastMergeScanAt: payload.lastMergeScanAt || null,
     scan: payload.scan,
   };
 }
@@ -283,6 +292,8 @@ async function reconcileOrphanedSnapshot(db, { agencyId, creatorId, snapshot, ac
   const completedAt = iso(job?.completedAt) || new Date().toISOString();
   let patch;
   if (String(job?.status || "").toUpperCase() === "DONE") {
+    const publicationMode = clean(result.publicationMode, 20) === "exact" ? "exact" : "merge";
+    const exactFullPublication = mode === "full" && publicationMode === "exact";
     patch = {
       scanStatus: "COMPLETED",
       mode,
@@ -290,8 +301,13 @@ async function reconcileOrphanedSnapshot(db, { agencyId, creatorId, snapshot, ac
       pages: integer(result.pages ?? progress.pages ?? payload.scan.pages),
       scanned: integer(result.scanned ?? progress.current ?? progress.scanned ?? payload.scan.scanned),
       knownStreak: integer(result.knownStreak ?? progress.knownStreak ?? payload.scan.knownStreak),
+      published: true,
+      publicationMode: mode === "full" ? publicationMode : "merge",
+      ...(exactFullPublication ? { catalogVerified: true } : {}),
+      warning: clean(result.warning, 2_000) || null,
       completedAt,
-      lastFullScanAt: mode === "full" ? completedAt : undefined,
+      lastFullScanAt: exactFullPublication ? completedAt : undefined,
+      lastMergeScanAt: mode === "full" && !exactFullPublication ? completedAt : undefined,
       lastIncrementalScanAt: mode === "incremental" ? completedAt : undefined,
       lastError: null,
     };
@@ -373,6 +389,10 @@ async function scheduleVaultUnsortedScan({ agencyId, creatorId, userId, mode = "
     const snapshot = await prisma.vaultUnsortedSnapshot.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } });
     return { ok: true, created: false, reason: "already_in_flight", job: publicJob(active), snapshot: publicSnapshot(snapshot) };
   }
+  const existingSnapshot = await prisma.vaultUnsortedSnapshot.findUnique({
+    where: { agencyId_creatorId: { agencyId, creatorId } },
+  });
+  const preferredMessagesFolderId = clean(snapshotPayload(existingSnapshot).messagesFolderId, 240);
   const scheduled = await scheduleJobNow({
     jobKey: VAULT_UNSORTED_JOB_KEY,
     creatorId,
@@ -380,6 +400,7 @@ async function scheduleVaultUnsortedScan({ agencyId, creatorId, userId, mode = "
     params: {
       mode: normalizedMode,
       source: clean(source, 80) || "vault_ui",
+      ...(preferredMessagesFolderId ? { preferredMessagesFolderId } : {}),
       pageLimit: VAULT_UNSORTED_PAGE_SIZE,
       listsLimit: VAULT_UNSORTED_LISTS_PAGE_SIZE,
       knownStreakLimit: VAULT_UNSORTED_KNOWN_STREAK,
@@ -720,6 +741,8 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
         expectedMediaCount: integer(continuation.expectedCount ?? chunk.expectedMediaCount),
         messagesFolderId: clean(continuation.messagesFolderId, 240),
         stoppedReason: stopForKnown ? `known_streak_${knownLimit}` : stopForMaxPages ? "max_pages" : !hasMore ? "of_has_more_false" : "empty_page",
+        sourceIncomplete: chunk.sourceIncomplete === true,
+        incompleteReason: clean(chunk.incompleteReason, 2_000) || null,
       },
       kind,
     };
@@ -756,19 +779,6 @@ async function publishFullGeneration(db, job) {
         "lastSeenAt" = EXCLUDED."lastSeenAt",
         "lastSeenJobId" = EXCLUDED."lastSeenJobId",
         "updatedAt" = EXCLUDED."updatedAt"
-    `, job.agencyId, job.creatorId, job.id);
-    await db.$executeRawUnsafe(`
-      DELETE FROM "CreatorMediaAsset" asset
-      WHERE asset."agencyId" = $1
-        AND asset."creatorId" = $2
-        AND NOT EXISTS (
-          SELECT 1
-          FROM "MediaLibraryScanItem" stage
-          WHERE stage."jobId" = $3
-            AND stage."agencyId" = asset."agencyId"
-            AND stage."creatorId" = asset."creatorId"
-            AND stage."mediaId" = asset."mediaId"
-        )
     `, job.agencyId, job.creatorId, job.id);
     await db.mediaLibraryScanItem.deleteMany({ where: { jobId: job.id } });
     return;
@@ -811,13 +821,6 @@ async function publishFullGeneration(db, job) {
       },
     });
   }
-  await db.creatorMediaAsset.deleteMany({
-    where: {
-      agencyId: job.agencyId,
-      creatorId: job.creatorId,
-      mediaId: { notIn: rows.map((row) => row.mediaId) },
-    },
-  });
   await db.mediaLibraryScanItem.deleteMany({ where: { jobId: job.id } });
 }
 
@@ -827,46 +830,33 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
   const mode = normalizeMode(payload.mode || job.params?.mode);
   const expectedMediaCount = integer(payload.expectedMediaCount, 0, 0, 10_000_000);
   let seenByJob = 0;
+  let exactPublication = false;
+  let warning = null;
+
   if (mode === "full") {
     seenByJob = await db.mediaLibraryScanItem.count({
       where: { agencyId: job.agencyId, creatorId: job.creatorId, jobId: job.id },
     });
-    if (expectedMediaCount > 0 && seenByJob < expectedMediaCount) {
-      const detail = `Messages catalog incomplete: expected ${expectedMediaCount}, received ${seenByJob}; previous complete catalog preserved`;
-      await db.mediaLibraryScanItem.deleteMany({ where: { jobId: job.id } });
-      const preservedCounts = await counts(db, job.agencyId, job.creatorId);
-      const preservedSnapshot = await updateSnapshot(db, {
-        agencyId: job.agencyId,
-        creatorId: job.creatorId,
-        userId,
-        patch: {
-          scanStatus: "FAILED",
-          mode,
-          jobId: job.id,
-          pages: integer(payload.pages),
-          scanned: integer(payload.scanned),
-          knownStreak: integer(payload.knownStreak),
-          expectedCount: expectedMediaCount,
-          published: false,
-          completedAt: new Date().toISOString(),
-          lastError: detail,
-        },
-        countOverride: preservedCounts,
-      });
-      return {
-        type: "vault_unsorted",
-        snapshot: publicSnapshot(preservedSnapshot),
-        ...payload,
-        published: false,
-        incomplete: true,
-        expectedMediaCount,
-        seenByJob,
-        error: detail,
-      };
+    exactPublication = expectedMediaCount > 0
+      && seenByJob >= expectedMediaCount
+      && payload.sourceIncomplete !== true;
+
+    if (!exactPublication) {
+      warning = clean(payload.incompleteReason, 2_000)
+        || (expectedMediaCount > 0
+          ? `Messages catalog incomplete: expected ${expectedMediaCount}, received ${seenByJob}; previous catalog rows preserved`
+          : `Messages catalog total is unavailable; merged ${seenByJob} observed media without removing previous catalog rows`);
     }
+
+    // Full scans are discovery/refresh operations, never destructive inventory
+    // replacement. Merge every observed row into the canonical server catalog
+    // and preserve all previously discovered ids and user-authored metadata.
+    // The only supported destructive path is an explicit media deletion.
     await publishFullGeneration(db, job);
   }
+
   const nextCounts = await counts(db, job.agencyId, job.creatorId);
+  const completedAt = new Date().toISOString();
   const snapshot = await updateSnapshot(db, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
@@ -880,14 +870,28 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
       knownStreak: integer(payload.knownStreak),
       expectedCount: expectedMediaCount,
       published: true,
-      completedAt: new Date().toISOString(),
-      lastFullScanAt: mode === "full" ? new Date().toISOString() : undefined,
-      lastIncrementalScanAt: mode === "incremental" ? new Date().toISOString() : undefined,
+      publicationMode: mode === "full" ? (exactPublication ? "exact" : "merge") : "merge",
+      ...(mode === "full" && exactPublication ? { catalogVerified: true } : {}),
+      warning,
+      completedAt,
+      lastFullScanAt: mode === "full" && exactPublication ? completedAt : undefined,
+      lastMergeScanAt: mode === "full" && !exactPublication ? completedAt : undefined,
+      lastIncrementalScanAt: mode === "incremental" ? completedAt : undefined,
       lastError: null,
     },
     countOverride: nextCounts,
   });
-  return { type: "vault_unsorted", snapshot: publicSnapshot(snapshot), ...payload, published: true, expectedMediaCount, seenByJob };
+  return {
+    type: "vault_unsorted",
+    snapshot: publicSnapshot(snapshot),
+    ...payload,
+    published: true,
+    publicationMode: mode === "full" ? (exactPublication ? "exact" : "merge") : "merge",
+    incomplete: mode === "full" && !exactPublication,
+    expectedMediaCount,
+    seenByJob,
+    warning,
+  };
 }
 
 async function recordVaultUnsortedFailure({ job, error, terminal }) {

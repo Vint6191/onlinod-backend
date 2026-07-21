@@ -4,7 +4,6 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 
 const MAX_MEDIA_IDS = 5000;
-const MAX_IMPORT_ITEMS = 2000;
 const MAX_USAGE_SOURCES = 25;
 const MAX_USAGE_ITEMS_PER_SOURCE = 2000;
 const MEDIA_LIBRARY_USAGE_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 30_000 });
@@ -157,8 +156,8 @@ async function getMediaMetadata({ agencyId, creatorId, mediaIds, db = prisma }) 
   const ids = cleanMediaIds(mediaIds);
   if (!ids.length) return { ok: true, creatorId: id, items: [] };
   const assets = await db.creatorMediaAsset.findMany({
-    // Explicit metadata lookup is allowed for an imported placeholder. Only a
-    // Messages catalog scan may activate/protect it.
+    // Reads may include inactive usage placeholders so callers can preserve
+    // known metadata, but only an active catalog row can be edited.
     where: { agencyId, creatorId: id, mediaId: { in: ids } },
     take: ids.length,
   });
@@ -178,91 +177,33 @@ async function upsertMediaMetadata({ agencyId, creatorId, mediaId, input, userId
     error.code = "MEDIA_ID_MISSING";
     throw error;
   }
+
+  // Metadata enriches an existing canonical catalog row. It must never create
+  // inventory, reactivate a hidden row, or turn an old JSON/local reference
+  // into server catalog membership. Unsorted discovery is the only automatic
+  // catalog writer; explicit media deletion is the only destructive writer.
+  const existing = await db.creatorMediaAsset.findFirst({
+    where: { agencyId, creatorId: id, mediaId: cleanMediaId, catalogActive: true },
+    select: { id: true },
+  });
+  if (!existing) {
+    const error = new Error("Media is not present in the active server catalog");
+    error.code = "MEDIA_NOT_IN_CATALOG";
+    error.status = 409;
+    throw error;
+  }
+
   const now = new Date();
   const metadata = normalizeMetadata(input);
-  const asset = await db.creatorMediaAsset.upsert({
-    where: { creatorId_mediaId: { creatorId: id, mediaId: cleanMediaId } },
-    create: {
-      agencyId,
-      creatorId: id,
-      mediaId: cleanMediaId,
-      // Metadata is user-authored enrichment, never proof of catalog
-      // membership. Messages remains the sole activation authority.
-      catalogActive: false,
-      sortingStatus: "UNSORTED",
-      firstSeenAt: now,
-      lastSeenAt: now,
-      metadataUpdatedAt: now,
-      metadataUpdatedByUserId: userId || null,
-      ...metadata,
-    },
-    update: {
+  const asset = await db.creatorMediaAsset.update({
+    where: { id: existing.id },
+    data: {
       metadataUpdatedAt: now,
       metadataUpdatedByUserId: userId || null,
       ...metadata,
     },
   });
   return { ok: true, creatorId: id, item: assetToMetadata(asset) };
-}
-
-async function importMediaMetadata({ agencyId, creatorId, items, userId = null, db = prisma }) {
-  const id = await requireCreator(db, agencyId, creatorId);
-  const inputItems = Array.isArray(items) ? items.slice(0, MAX_IMPORT_ITEMS) : [];
-  let accepted = 0;
-  let skippedOlder = 0;
-  const importedIds = [];
-  await db.$transaction(async (tx) => {
-    for (const raw of inputItems) {
-      const input = object(raw);
-      const mediaId = clean(input.onlyfansMediaId || input.mediaId, 240);
-      if (!mediaId) continue;
-      const sourceUpdatedAt = date(input.updatedAt, new Date());
-      const sourceCreatedAt = date(input.createdAt, sourceUpdatedAt);
-      const existing = await tx.creatorMediaAsset.findUnique({
-        where: { creatorId_mediaId: { creatorId: id, mediaId } },
-        select: { metadataUpdatedAt: true },
-      });
-      if (existing?.metadataUpdatedAt && sourceUpdatedAt <= existing.metadataUpdatedAt) {
-        skippedOlder += 1;
-        importedIds.push(mediaId);
-        continue;
-      }
-      const metadata = normalizeMetadata(input);
-      await tx.creatorMediaAsset.upsert({
-        where: { creatorId_mediaId: { creatorId: id, mediaId } },
-        create: {
-          agencyId,
-          creatorId: id,
-          mediaId,
-          // Imported JSON is metadata only. The authoritative Messages scan
-          // decides whether the media still exists and may protect it.
-          catalogActive: false,
-          sortingStatus: "UNSORTED",
-          firstSeenAt: sourceCreatedAt,
-          lastSeenAt: sourceUpdatedAt,
-          createdAt: sourceCreatedAt,
-          metadataUpdatedAt: sourceUpdatedAt,
-          metadataUpdatedByUserId: userId || null,
-          ...metadata,
-        },
-        update: {
-          metadataUpdatedAt: sourceUpdatedAt,
-          metadataUpdatedByUserId: userId || null,
-          ...metadata,
-        },
-      });
-      accepted += 1;
-      importedIds.push(mediaId);
-    }
-  });
-  return {
-    ok: true,
-    creatorId: id,
-    received: inputItems.length,
-    accepted,
-    skippedOlder,
-    importedMediaIds: importedIds,
-  };
 }
 
 async function listStorylines({ agencyId, creatorId, db = prisma }) {
@@ -746,14 +687,12 @@ async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 1
 
 module.exports = {
   MAX_MEDIA_IDS,
-  MAX_IMPORT_ITEMS,
   MAX_USAGE_SOURCES,
   MAX_USAGE_ITEMS_PER_SOURCE,
   cleanMediaIds,
   assetToMetadata,
   getMediaMetadata,
   upsertMediaMetadata,
-  importMediaMetadata,
   listStorylines,
   replaceUsageSources,
   mutateFolderMembership,
