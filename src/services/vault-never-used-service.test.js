@@ -250,6 +250,23 @@ test("a frozen PLANNED backlog is waiting for a batch worker, not a recovery fai
   assert.equal(result.pipeline.projection.deferred, true);
 });
 
+test("legacy IDLE rows are not rendered as phantom pending worker backlog", async () => {
+  const idleState = {
+    dialogId: "dialog-idle", scanMode: "initial", initialScanComplete: false, status: "IDLE",
+    activeRunId: null, activeJobId: null, pagesProcessed: 0, messagesProcessed: 0,
+    lastError: null, lastFullScanAt: null, lastIncrementalScanAt: null, updatedAt: date(),
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: dbFixture({ complete: true, dialogStates: [idleState] }),
+    now: date(60_000),
+  });
+  assert.equal(result.pipeline.dialogs.pending, 0);
+  assert.equal(result.pipeline.dialogs.queue.planned, 0);
+  assert.notEqual(result.pipeline.stage, "WAITING_FOR_WORKER");
+});
+
 test("scheduled durable work is shown as WAITING_FOR_WORKER", async () => {
   const activeJobs = [{ id: "job-1", status: "SCHEDULED", params: { dialogId: "__dialog_discovery__" }, progress: {}, claimedByDeviceId: null, leaseUntil: null, attempts: 0, lastError: null, updatedAt: date() }];
   const result = await getNeverUsedPipelineState({ agencyId: "agency-1", creatorId: "creator-1", db: dbFixture({ complete: true, dialogActiveJobs: activeJobs }), now: date(60_000) });
@@ -375,6 +392,38 @@ test("a user pause is a PAUSED control state, not a fake OnlyFans error", async 
   assert.equal(result.pipeline.dialogs.discovery.error, null);
   assert.equal(result.pipeline.dialogs.discovery.lastError, null);
   assert.equal(result.pipeline.dialogs.lastError, null);
+});
+
+test("completed discovery keeps a durable history pause control", async () => {
+  const pausedHistory = {
+    id: "disc-complete-paused-history",
+    jobId: "disc-job",
+    dialogId: "__dialog_discovery__",
+    mode: "discovery",
+    status: "COMPLETED",
+    generation: 72,
+    continuation: { historyControl: { state: "PAUSED", reason: "paused by user", at: date().toISOString() } },
+    progress: { pages: 1, dialogsFound: 1, hasMore: false },
+    pagesProcessed: 1,
+    purchaseSignals: 1,
+    createdAt: date(),
+    updatedAt: date(1_000),
+    completedAt: date(1_000),
+    lastError: null,
+  };
+  const state = {
+    dialogId: "dialog-1", generation: 72, scanMode: "initial", initialScanComplete: false, status: "PAUSED",
+    activeRunId: null, activeJobId: null, pagesProcessed: 0, messagesProcessed: 0,
+    lastError: null, lastFullScanAt: null, lastIncrementalScanAt: null, createdAt: date(), updatedAt: date(),
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1", creatorId: "creator-1",
+    db: dbFixture({ complete: true, discoveryRuns: [pausedHistory], dialogStates: [state] }),
+    now: date(2_000),
+  });
+  assert.equal(result.pipeline.stage, "PAUSED");
+  assert.equal(result.pipeline.dialogs.discovery.control.kind, "PAUSED");
+  assert.equal(result.pipeline.dialogs.discovery.control.reason, "paused by user");
 });
 
 test("an untouched discovery run keeps hasMore unknown and excludes stale generation-zero states", async () => {

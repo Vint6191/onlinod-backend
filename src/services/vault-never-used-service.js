@@ -225,6 +225,8 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   const discoveryProgress = { ...jobDiscoveryProgress, ...runDiscoveryProgress };
   const discoveryFailureRaw = object(object(discoveryJob?.result).failure);
   const discoveryControlRaw = object(object(discoveryJob?.result).control);
+  const historyControlRaw = object(object(latestInitialDiscoveryRun?.continuation).historyControl);
+  const historyControlState = clean(historyControlRaw.state, 40).toUpperCase();
   const runDiscoveryStatus = jobStatus(latestInitialDiscoveryRun?.status);
   const jobDiscoveryStatus = jobStatus(discoveryJob?.status);
   const terminalDiscoveryStatuses = new Set(["PAUSED", "FAILED", "COMPLETED", "CANCELLED", "CANCELED"]);
@@ -333,7 +335,12 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   const failed = planStates.filter((state) => state.status === "FAILED").length;
   const unavailable = planStates.filter((state) => state.status === "UNAVAILABLE").length;
   const planned = planStates.filter((state) => state.status === "PLANNED").length;
-  const pending = Math.max(0, discovered - completed - failed - unavailable);
+  const queuedStates = planStates.filter((state) => state.status === "QUEUED").length;
+  const runningStates = planStates.filter((state) => state.status === "RUNNING").length;
+  // Pending must describe executable or explicitly paused work. The previous
+  // subtraction formula counted legacy IDLE rows as pending even though neither
+  // claim nor pause could select them, producing an eternal phantom worker wait.
+  const pending = planned + queuedStates + runningStates + pausedCount;
   const pagesCommitted = planStates.reduce((sum, state) => sum + number(state.pagesProcessed), 0);
   const messagesCommitted = planStates.reduce((sum, state) => sum + number(state.messagesProcessed), 0);
   const successfulStateTimes = planStates
@@ -405,7 +412,7 @@ async function dialogPipelineState(db, agencyId, creatorId) {
     discovered,
     initialComplete,
     active: historyActiveJobs.length + activeBatchRuns.length + (discoveryActive ? 1 : 0) + pausedCount,
-    paused: pausedCount > 0 || discoveryPaused,
+    paused: pausedCount > 0 || discoveryPaused || historyControlState === "PAUSED",
     failed,
     unavailable,
     pending,
@@ -460,7 +467,11 @@ async function dialogPipelineState(db, agencyId, creatorId) {
       retries: number(discoveryJob?.attempts),
       lastError: discoveryError?.detail || null,
       error: discoveryError,
-      control: Object.keys(discoveryControlRaw).length ? {
+      control: Object.keys(historyControlRaw).length ? {
+        kind: historyControlState || null,
+        reason: clean(historyControlRaw.reason, 500) || null,
+        at: iso(historyControlRaw.at),
+      } : Object.keys(discoveryControlRaw).length ? {
         kind: clean(discoveryControlRaw.kind, 80) || null,
         reason: clean(discoveryControlRaw.reason, 500) || null,
         at: iso(discoveryControlRaw.at),
@@ -678,8 +689,10 @@ function stageFrom({ messages, dialogs, authoritative, stale }) {
   const messagesWaitingContext = messagesJob === "SCHEDULED" && messagesWaitKind === "creator_context";
   const dialogRetrying = dialogJob === "SCHEDULED" && Boolean(dialogs.current?.lastError);
   const dialogWaitingContext = dialogJob === "SCHEDULED" && dialogWaitKind === "creator_context";
+  const historyControl = clean(dialogs.discovery?.control?.kind, 40).toUpperCase();
 
-  if (scanStatus === "PAUSED" || dialogs.paused || dialogs.discovery?.paused) return "PAUSED";
+  if (historyControl === "CANCELLED" || historyControl === "CANCELED") return "CANCELLED";
+  if (scanStatus === "PAUSED" || dialogs.paused || dialogs.discovery?.paused || historyControl === "PAUSED") return "PAUSED";
   if (messagesJob === "CLAIMED") return "UPDATING_MESSAGES_CATALOG";
 
   // Discovery is a strict first phase. No dialog-history state may mask it.

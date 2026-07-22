@@ -45,6 +45,36 @@ function clean(value, max = 240) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : null;
 }
+function object(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+async function latestDiscoveryPlanTx(tx, agencyId, creatorId) {
+  return tx.dialogScanRun.findFirst({
+    where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+async function setHistoryPlanControlTx(tx, { agencyId, creatorId, state, reason, now = new Date() }) {
+  const discovery = await latestDiscoveryPlanTx(tx, agencyId, creatorId);
+  if (!discovery) return null;
+  const continuation = object(discovery.continuation);
+  await tx.dialogScanRun.update({
+    where: { id: discovery.id },
+    data: {
+      continuation: {
+        ...continuation,
+        historyControl: {
+          state: clean(state, 40)?.toUpperCase() || "ACTIVE",
+          reason: clean(reason, 500),
+          at: now.toISOString(),
+        },
+      },
+    },
+  });
+  return discovery;
+}
 
 const scanSchema = z.object({
   mode: z.enum(["initial", "full", "incremental", "targeted", "reconcile"]).optional(),
@@ -73,6 +103,13 @@ const creatorScanSchema = z.object({
 async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
   const now = new Date();
   return prisma.$transaction(async (tx) => {
+    const discovery = await setHistoryPlanControlTx(tx, {
+      agencyId,
+      creatorId,
+      state: "PAUSED",
+      reason,
+      now,
+    });
     const jobs = await tx.jobInstance.updateMany({
       where: {
         agencyId,
@@ -100,11 +137,13 @@ async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
       where: {
         agencyId,
         creatorId,
+        ...(discovery ? { generation: Number(discovery.generation || 0) } : {}),
+        dialogId: { notIn: ["__dialog_discovery__", DIALOG_HISTORY_BATCH_DIALOG_ID] },
         OR: [
-          // A frozen batch backlog is represented by PLANNED rows before a
-          // Desktop claims it. Pausing only QUEUED/RUNNING rows left that
-          // backlog claimable and the UI stuck on "waiting for worker".
-          { status: { in: ["PLANNED", "QUEUED", "RUNNING"] } },
+          // IDLE inside the current frozen generation is a stranded legacy
+          // state, not a terminal result. Pause must own it too or the UI can
+          // report pending work while the control endpoint changes zero rows.
+          { status: { in: ["IDLE", "PLANNED", "QUEUED", "RUNNING"] } },
           { activeRunId: { not: null } },
           { activeJobId: { not: null } },
         ],
@@ -133,6 +172,13 @@ async function resumeCreatorRuns({ agencyId, creatorId }) {
     });
 
     const now = new Date();
+    await setHistoryPlanControlTx(tx, {
+      agencyId,
+      creatorId,
+      state: "ACTIVE",
+      reason: "resumed by user",
+      now,
+    });
     const pausedDiscoveryRuns = pausedRuns
       .filter((run) => run.dialogId === "__dialog_discovery__")
       .sort((a, b) => {
@@ -656,6 +702,13 @@ router.post("/creators/:creatorId/cancel", seniorRequired, async (req, res) => {
     const reason = clean(req.body?.reason, 500) || "creator scan canceled by user";
     const now = new Date();
     const result = await prisma.$transaction(async (tx) => {
+      const discovery = await setHistoryPlanControlTx(tx, {
+        agencyId: req.auth.agencyId,
+        creatorId: req.params.creatorId,
+        state: "CANCELLED",
+        reason,
+        now,
+      });
       // Scope-based updates are intentional. A creator can have more than 10k
       // planned dialog rows, and building a giant id list used to expire the
       // interactive transaction before its first update completed.
@@ -690,8 +743,10 @@ router.post("/creators/:creatorId/cancel", seniorRequired, async (req, res) => {
         where: {
           agencyId: req.auth.agencyId,
           creatorId: req.params.creatorId,
+          ...(discovery ? { generation: Number(discovery.generation || 0) } : {}),
+          dialogId: { notIn: ["__dialog_discovery__", DIALOG_HISTORY_BATCH_DIALOG_ID] },
           OR: [
-            { status: { in: ["QUEUED", "RUNNING", "PAUSED"] } },
+            { status: { in: ["IDLE", "PLANNED", "QUEUED", "RUNNING", "PAUSED"] } },
             { activeRunId: { not: null } },
             { activeJobId: { not: null } },
           ],

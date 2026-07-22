@@ -155,6 +155,45 @@ test("PLANNED rows stay unavailable until the newest discovery generation is fro
   assert.equal([...db._states.values()].every((row) => row.status === "PLANNED"), true);
 });
 
+test("stranded IDLE rows in the completed generation are repaired and claimed", async () => {
+  const db = createDb();
+  seedPlanned(db, 3);
+  seedCompletedDiscovery(db);
+  for (const state of db._states.values()) state.status = "IDLE";
+
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    creatorIds: ["creator-1"],
+    batchSize: 3,
+  });
+
+  assert.equal(result.reason, "claimed");
+  assert.deepEqual(result.batch.dialogs.map((item) => item.dialogId), ["dialog-01", "dialog-02", "dialog-03"]);
+  assert.equal([...db._states.values()].every((row) => row.status === "RUNNING"), true);
+});
+
+test("durably cancelled history plan does not resurrect IDLE rows", async () => {
+  const db = createDb();
+  seedPlanned(db, 1);
+  seedCompletedDiscovery(db);
+  db._states.get("dialog-01").status = "IDLE";
+  db._runs.get("discovery-7").continuation = {
+    historyControl: { state: "CANCELLED", reason: "cancelled by user" },
+  };
+
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    creatorIds: ["creator-1"],
+    batchSize: 1,
+  });
+
+  assert.equal(result.batch, null);
+  assert.equal(result.reason, "dialog_history_cancelled");
+  assert.equal(db._states.get("dialog-01").status, "IDLE");
+});
+
 test("one claim reserves one compact batch and creates no JobInstance", async () => {
   const db = createDb();
   seedPlanned(db, 5);

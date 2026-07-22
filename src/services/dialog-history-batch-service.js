@@ -2,6 +2,7 @@
 
 const { createHash, randomBytes } = require("node:crypto");
 const prisma = require("../prisma");
+const { repairStrandedDialogHistoryStatesTx, dialogHistoryControl } = require("./dialog-intelligence-service");
 
 const DIALOG_HISTORY_BATCH_DIALOG_ID = "__dialog_history_batch__";
 const ACTIVE_BATCH_STATUSES = ["QUEUED", "RUNNING"];
@@ -376,6 +377,9 @@ async function claimDialogHistoryBatchTx(db, input) {
   await lockDialogHistoryBatchClaimsTx(db, agencyId);
   await recoverExpiredDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
   await normalizeOrphanedDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
+  for (const creatorId of allowedCreatorIds) {
+    await repairStrandedDialogHistoryStatesTx(db, { agencyId, creatorId });
+  }
 
   // The lease token lives only in the Desktop process. If that process crashes
   // or restarts, the same stable deviceId must be able to reattach to its own
@@ -406,6 +410,7 @@ async function claimDialogHistoryBatchTx(db, input) {
   // enumerating dialogs.
   let first = null;
   let completedDiscovery = null;
+  const controlledCreators = new Map();
   for (const candidateCreatorId of allowedCreatorIds) {
     if (blockedCreatorIds.has(candidateCreatorId)) continue;
     const latestDiscovery = await db.dialogScanRun.findFirst({
@@ -413,6 +418,11 @@ async function claimDialogHistoryBatchTx(db, input) {
       orderBy: { createdAt: "desc" },
     });
     if (!latestDiscovery || clean(latestDiscovery.status, 40).toUpperCase() !== "COMPLETED") continue;
+    const controlState = dialogHistoryControl(latestDiscovery).state;
+    if (["PAUSED", "CANCELLED", "CANCELED"].includes(controlState)) {
+      controlledCreators.set(candidateCreatorId, controlState);
+      continue;
+    }
     const candidate = await db.dialogScanState.findFirst({
       where: {
         agencyId,
@@ -432,7 +442,13 @@ async function claimDialogHistoryBatchTx(db, input) {
     return {
       ok: true,
       batch: null,
-      reason: blockedCreatorIds.size ? "creator_batch_already_active" : "no_frozen_dialog_batch_ready",
+      reason: blockedCreatorIds.size
+        ? "creator_batch_already_active"
+        : [...controlledCreators.values()].includes("PAUSED")
+          ? "dialog_history_paused"
+          : ([...controlledCreators.values()].includes("CANCELLED") || [...controlledCreators.values()].includes("CANCELED"))
+            ? "dialog_history_cancelled"
+            : "no_frozen_dialog_batch_ready",
     };
   }
 

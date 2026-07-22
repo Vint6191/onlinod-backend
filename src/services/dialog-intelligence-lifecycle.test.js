@@ -34,7 +34,11 @@ function fakeDb(options = {}) {
       findFirst: async ({ where } = {}) => where?.status === "PLANNED" ? (options.planned || null) : null,
       count: async () => Number(options.stateCount || 0),
       upsert: async (value) => { calls.statesUpserted.push(value); return value; },
-      updateMany: async (value) => { calls.statesUpdated.push(value); return { count: 1 }; },
+      updateMany: async (value) => {
+        calls.statesUpdated.push(value);
+        if (value?.where?.status === "IDLE") return { count: Number(options.strandedIdleCount || 0) };
+        return { count: 1 };
+      },
     },
     dialogScanChunkCommit: {
       findMany: async () => options.commits || [],

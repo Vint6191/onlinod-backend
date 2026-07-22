@@ -856,6 +856,62 @@ async function autoRecoverDialogDiscovery(input) {
   return prisma.$transaction((tx) => autoRecoverDialogDiscoveryTx(tx, input));
 }
 
+function dialogHistoryControl(run) {
+  const control = object(object(run?.continuation).historyControl);
+  return {
+    state: clean(control.state, 40)?.toUpperCase() || null,
+    reason: clean(control.reason, 500),
+    at: clean(control.at, 80),
+  };
+}
+
+/**
+ * A frozen discovery generation may contain legacy IDLE rows after an old
+ * cancel/recovery path cleared the execution pointers without returning the
+ * dialog to PLANNED. Those rows are neither terminal nor claimable, which used
+ * to produce a phantom "pending" count forever. IDLE is valid only when the
+ * whole history plan is durably paused/cancelled; otherwise it is repaired back
+ * into the frozen batch plan.
+ */
+async function repairStrandedDialogHistoryStatesTx(db, input = {}) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorId = clean(input.creatorId, 160);
+  if (!agencyId || !creatorId) return { repaired: 0, reason: "missing_scope", generation: 0 };
+
+  const latestDiscovery = input.latestDiscovery || await db.dialogScanRun.findFirst({
+    where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!latestDiscovery || clean(latestDiscovery.status, 40)?.toUpperCase() !== "COMPLETED") {
+    return { repaired: 0, reason: "discovery_not_complete", generation: integer(latestDiscovery?.generation, 0) };
+  }
+
+  const generation = integer(latestDiscovery.generation, 0, 0, 2_000_000_000);
+  const control = dialogHistoryControl(latestDiscovery);
+  if (["PAUSED", "CANCELLED", "CANCELED"].includes(control.state)) {
+    return { repaired: 0, reason: `history_${control.state.toLowerCase()}`, generation, control };
+  }
+
+  const result = await db.dialogScanState.updateMany({
+    where: {
+      agencyId,
+      creatorId,
+      generation,
+      dialogId: { notIn: ["__dialog_discovery__", "__dialog_history_batch__"] },
+      status: "IDLE",
+      activeRunId: null,
+      activeJobId: null,
+    },
+    data: { status: "PLANNED", lastError: null },
+  });
+  return {
+    repaired: result.count,
+    reason: result.count > 0 ? "stranded_idle_replanned" : "no_stranded_idle",
+    generation,
+    control,
+  };
+}
+
 /**
  * Discovery freezes a durable PLANNED list. Desktop claims that list in
  * batches and feeds every dialog id to the existing local CRM scanner. Status
@@ -877,6 +933,11 @@ async function autoRecoverDialogHistoryTx(db, input) {
   }
 
   const generation = integer(latestDiscovery.generation, 0, 0, 2_000_000_000);
+  const stranded = await repairStrandedDialogHistoryStatesTx(db, {
+    agencyId,
+    creatorId,
+    latestDiscovery,
+  });
   let cleanedLegacyRuns = 0;
 
   // Older releases created one JobInstance per dialog. Cancel every remaining
@@ -949,17 +1010,21 @@ async function autoRecoverDialogHistoryTx(db, input) {
   if (!planned) {
     return {
       ok: true,
-      recovered: cleanedLegacyRuns > 0,
-      reason: "history_plan_drained",
+      recovered: cleanedLegacyRuns > 0 || stranded.repaired > 0,
+      reason: stranded.reason === "history_paused" || stranded.reason === "history_cancelled" || stranded.reason === "history_canceled"
+        ? stranded.reason
+        : "history_plan_drained",
       cleanedLegacyRuns,
+      repairedStrandedStates: stranded.repaired,
       generation,
     };
   }
 
   return {
     ok: true,
-    recovered: cleanedLegacyRuns > 0,
+    recovered: cleanedLegacyRuns > 0 || stranded.repaired > 0,
     reason: "history_batch_ready",
+    repairedStrandedStates: stranded.repaired,
     runId: null,
     jobId: null,
     dialogId: planned.dialogId,
@@ -1863,6 +1928,8 @@ module.exports = {
   autoRecoverDialogDiscoveryTx,
   autoRecoverDialogHistory,
   autoRecoverDialogHistoryTx,
+  repairStrandedDialogHistoryStatesTx,
+  dialogHistoryControl,
   repairRegressedDialogDiscoveryTx,
   applyDialogIntelligenceChunk,
   applyPurchaseSignalsChunk,

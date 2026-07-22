@@ -7,8 +7,9 @@ const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "dialog-intelligence.js"), "utf8");
 
-test("pause includes frozen PLANNED dialog-history backlog", () => {
-  assert.match(source, /status:\s*\{\s*in:\s*\["PLANNED",\s*"QUEUED",\s*"RUNNING"\]\s*\}/);
+test("pause owns stranded IDLE plus frozen PLANNED dialog-history backlog", () => {
+  assert.match(source, /status:\s*\{\s*in:\s*\["IDLE",\s*"PLANNED",\s*"QUEUED",\s*"RUNNING"\]\s*\}/);
+  assert.match(source, /historyControl:[\s\S]*state:\s*clean\(state/);
   assert.match(source, /data:\s*\{\s*status:\s*"PAUSED",\s*activeJobId:\s*null/);
 });
 
