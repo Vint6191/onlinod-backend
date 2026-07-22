@@ -67,6 +67,8 @@ function compactResult(raw) {
     messages: integer(value.messages, 0, 0, 100_000_000),
     inserted: integer(value.inserted, 0, 0, 100_000_000),
     updated: integer(value.updated, 0, 0, 100_000_000),
+    newestMessageId: clean(value.newestMessageId, 240),
+    newestMessageAt: dateOrNull(value.newestMessageAt),
     error: clean(value.error, 2_000),
     code: clean(value.code, 120),
     status: value.status == null ? null : integer(value.status, 0, 0, 599),
@@ -744,6 +746,14 @@ async function completeDialogHistoryBatchTx(tx, input) {
               : { lastIncrementalScanAt: now }),
             pagesProcessed: { increment: result.pages },
             messagesProcessed: { increment: result.messages },
+            newestMessageId: result.newestMessageId || undefined,
+            newestMessageAt: result.newestMessageAt || undefined,
+            confirmedWatermarkMessageId: result.newestMessageId || undefined,
+            confirmedWatermarkAt: result.newestMessageAt || undefined,
+            forwardCursor: itemMode === "incremental" && result.newestMessageId
+              ? result.newestMessageId
+              : undefined,
+            incrementalGapOpen: itemMode === "incremental" ? false : undefined,
             activeRunId: null,
             activeJobId: null,
             lastError: null,

@@ -13,6 +13,7 @@ function loadService(fixture) {
   const resultModule = require.resolve("./job-result-service");
   const catalogModule = require.resolve("./job-catalog");
   const fenceModule = require.resolve("./dialog-job-completion-fence");
+  const dailyModule = require.resolve("./vault-intelligence-daily-service");
   require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: fixture.db };
   require.cache[resultModule] = {
     id: resultModule, filename: resultModule, loaded: true,
@@ -29,6 +30,13 @@ function loadService(fixture) {
   require.cache[fenceModule] = {
     id: fenceModule, filename: fenceModule, loaded: true,
     exports: { completeDialogJobFenced: async () => ({}) },
+  };
+  require.cache[dailyModule] = {
+    id: dailyModule, filename: dailyModule, loaded: true,
+    exports: {
+      ensureDailyVaultIntelligenceCycle: fixture.ensureDailyVaultIntelligenceCycle
+        || (async () => ({ ok: true, created: 0, reason: "not_due" })),
+    },
   };
   delete require.cache[require.resolve("./job-lease-service")];
   return require("./job-lease-service");
@@ -319,4 +327,64 @@ test("vault completion keeps publication fenced with a longer bounded transactio
   assert.deepEqual(transactionOptions, { maxWait: 10_000, timeout: 60_000 });
   assert.equal(appliedInsideTransaction, true);
   assert.equal(result.job.status, "DONE");
+});
+
+test("daily catalog completion starts dialog discovery only after the catalog transaction commits", async () => {
+  const token = "lease-token";
+  const now = new Date();
+  const job = {
+    id: "daily-catalog-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    jobKey: "vault_unsorted_scan",
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 6,
+    leaseUntil: new Date(now.getTime() + 60_000),
+    attempts: 0,
+    params: { mode: "full", source: "daily_vault_intelligence" },
+    progress: { current: 2_017 },
+    continuation: { driverPhase: "complete" },
+    workId: "daily-work",
+  };
+  let inTransaction = false;
+  let dailyCalledInsideTransaction = null;
+  let dailyInput = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async () => ({ count: 1 }),
+    },
+    $transaction: async (callback) => {
+      inTransaction = true;
+      try { return await callback(db); }
+      finally { inTransaction = false; }
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => ({ type: "vault_unsorted", publicationMode: "merge" }),
+    ensureDailyVaultIntelligenceCycle: async (input) => {
+      dailyCalledInsideTransaction = inTransaction;
+      dailyInput = input;
+      return { ok: true, created: 1, dialogs: { created: true } };
+    },
+  });
+  const result = await completeJob({
+    jobId: job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: token,
+    leaseRevision: 6,
+    workId: "daily-work",
+    result: { mode: "full", scanned: 2_017 },
+    progress: { current: 2_017, percent: 100 },
+  });
+  assert.equal(dailyCalledInsideTransaction, false);
+  assert.equal(dailyInput.forceDialogs, true);
+  assert.equal(dailyInput.creatorId, "creator-1");
+  assert.equal(result.dailyContinuation.created, 1);
 });

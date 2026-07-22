@@ -444,12 +444,34 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   }
 
   if (job.jobKey === "vault_unsorted_scan") {
-    return prisma.$transaction(async (tx) => {
+    const completed = await prisma.$transaction(async (tx) => {
       const updated = await tx.jobInstance.updateMany({ where: fenceWhere, data: completionData });
       if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion");
       const sideEffect = await applyJobResult({ db: tx, job, deviceId, userId, result: result || {} });
       return { job: { id: job.id, status: "DONE" }, sideEffect };
     }, JOB_COMPLETION_TRANSACTION_OPTIONS);
+    // Daily maintenance is intentionally sequential: refresh the full media
+    // catalog first, then rebuild the shuffled dialog list. Schedule phase two
+    // only after the catalog transaction has committed, never from inside the
+    // interactive transaction above. If scheduling is temporarily unavailable,
+    // the hourly scheduler will retry from the same durable timestamps.
+    if (clean(job.params?.source, 80) === "daily_vault_intelligence") {
+      try {
+        const { ensureDailyVaultIntelligenceCycle } = require("./vault-intelligence-daily-service");
+        completed.dailyContinuation = await ensureDailyVaultIntelligenceCycle({
+          agencyId: job.agencyId,
+          creatorId: job.creatorId,
+          now: new Date(),
+          forceDialogs: true,
+        });
+      } catch (error) {
+        console.warn("[daily-vault-intelligence] dialog phase scheduling failed after catalog completion:", {
+          creatorId: job.creatorId,
+          error: error?.message || String(error),
+        });
+      }
+    }
+    return completed;
   }
 
   const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });

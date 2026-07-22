@@ -1,18 +1,18 @@
 /* src/services/job-scheduler.js
    ────────────────────────────────────────────────────────────
    Job auto-scheduling.
-   
+
    Used in two places:
-   
+
    1. creator-connect.js — after a creator transitions to READY,
       we schedule initial fetch_earnings + fetch_campaigns jobs
       so the owner UI sees data without anyone clicking refresh.
-   
+
    2. server.js startup — the recurring scheduler runs every
       `RECURRING_INTERVAL_MS` (default 1 hour) and creates fresh
       scheduled jobs for any READY creator that doesn't have a
       scheduled or recently-completed job already.
-   
+
    Why this design:
    - JobInstance has no unique constraint on (creator, jobKey, params).
      We dedupe in code: if there's already a SCHEDULED or recently-DONE
@@ -399,6 +399,8 @@ async function runRecurringSweep() {
 
   let totalCreated = 0;
   let totalSkipped = 0;
+  let dailyCyclesStarted = 0;
+  let dailyCyclesSkipped = 0;
 
   for (const creator of creators) {
     try {
@@ -411,7 +413,27 @@ async function runRecurringSweep() {
       totalCreated += result.created.length;
       totalSkipped += result.skipped.length;
     } catch (err) {
-      console.warn("[scheduler] sweep creator failed:", creator.id, err?.message || err);
+      console.warn("[scheduler] regular creator jobs failed:", creator.id, err?.message || err);
+    }
+
+    // Daily Vault Intelligence is an independent maintenance lane. A failure in
+    // earnings/campaign/automation scheduling must never suppress the catalog
+    // and dialog freshness cycle for the same creator.
+    try {
+      // Load lazily to avoid a module cycle: vault-unsorted-service uses
+      // scheduleJobNow from this module, while the daily coordinator composes
+      // that catalog job with a dialog discovery generation.
+      const { ensureDailyVaultIntelligenceCycle } = require("./vault-intelligence-daily-service");
+      const daily = await ensureDailyVaultIntelligenceCycle({
+        agencyId: creator.agencyId,
+        creatorId: creator.id,
+        now,
+      });
+      if (Number(daily?.created || 0) > 0) dailyCyclesStarted += 1;
+      else dailyCyclesSkipped += 1;
+    } catch (err) {
+      dailyCyclesSkipped += 1;
+      console.warn("[scheduler] daily Vault Intelligence failed:", creator.id, err?.message || err);
     }
   }
 
@@ -419,13 +441,15 @@ async function runRecurringSweep() {
 
   const elapsed = Date.now() - startedAt;
   console.log(
-    `[scheduler] sweep done in ${elapsed}ms — creators=${creators.length}, jobs created=${totalCreated}, skipped=${totalSkipped}`
+    `[scheduler] sweep done in ${elapsed}ms — creators=${creators.length}, jobs created=${totalCreated}, skipped=${totalSkipped}, daily started=${dailyCyclesStarted}, daily skipped=${dailyCyclesSkipped}`
   );
 
   return {
     creatorsScanned: creators.length,
     jobsCreated: totalCreated,
     jobsSkipped: totalSkipped,
+    dailyCyclesStarted,
+    dailyCyclesSkipped,
     retention,
   };
 }

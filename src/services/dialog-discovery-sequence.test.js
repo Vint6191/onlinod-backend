@@ -206,7 +206,7 @@ function resetDb() {
   db._commits.clear();
 }
 
-function seedDiscovery(generation = 77) {
+function seedDiscovery(generation = 77, childMode = "initial") {
   const run = {
     id: "discovery-run",
     jobId: "discovery-job",
@@ -234,7 +234,7 @@ function seedDiscovery(generation = 77) {
       scanRunId: run.id,
       dialogId: "__dialog_discovery__",
       mode: "discovery",
-      childMode: "initial",
+      childMode,
       childPriority: 60,
       generation,
       pageLimit: 50,
@@ -490,4 +490,240 @@ test("status recovery retires an orphaned legacy attempt and leaves the dialog c
   assert.equal(recovery.reason, "history_batch_ready");
   assert.equal(recovery.cleanedLegacyRuns, 1);
   assert.equal([...db._jobs.values()].filter((row) => row.id !== "discovery-job").length, 0);
+});
+
+test("daily discovery keeps an unchanged completed dialog READY without resetting counters", async () => {
+  resetDb();
+  const { job } = seedDiscovery(120, "incremental");
+  db._states.set("creator-1:dialog-a", {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-a",
+    fanId: "fan-a",
+    generation: 119,
+    status: "READY",
+    scanMode: "incremental",
+    initialScanComplete: true,
+    confirmedWatermarkMessageId: "message-100",
+    confirmedWatermarkAt: new Date("2026-07-22T09:00:00.000Z"),
+    newestMessageId: "message-100",
+    newestMessageAt: new Date("2026-07-22T09:00:00.000Z"),
+    pagesProcessed: 33,
+    messagesProcessed: 750,
+    mediaProcessed: 42,
+    incrementalGapOpen: false,
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+
+  const result = await applyDialogIntelligenceChunk({
+    db,
+    job,
+    deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page",
+      runId: "discovery-run",
+      chunkKey: "daily-unchanged",
+      page: 0,
+      childMode: "incremental",
+      hasMore: false,
+      dialogs: [{
+        dialogId: "dialog-a",
+        fanId: "fan-a",
+        latestMessageId: "message-100",
+        latestMessageAt: "2026-07-22T09:00:00.000Z",
+      }],
+    },
+  });
+
+  const state = db._states.get("creator-1:dialog-a");
+  assert.equal(result.planned, 0);
+  assert.equal(result.unchanged, 1);
+  assert.equal(state.status, "READY");
+  assert.equal(state.generation, 120);
+  assert.equal(state.pagesProcessed, 33);
+  assert.equal(state.messagesProcessed, 750);
+  assert.equal(state.mediaProcessed, 42);
+  assert.equal(state.incrementalGapOpen, false);
+});
+
+test("daily discovery plans only a changed completed dialog for incremental history", async () => {
+  resetDb();
+  const { job } = seedDiscovery(121, "incremental");
+  db._states.set("creator-1:dialog-a", {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-a",
+    fanId: "fan-a",
+    generation: 120,
+    status: "READY",
+    scanMode: "incremental",
+    initialScanComplete: true,
+    confirmedWatermarkMessageId: "message-100",
+    confirmedWatermarkAt: new Date("2026-07-22T09:00:00.000Z"),
+    newestMessageId: "message-100",
+    newestMessageAt: new Date("2026-07-22T09:00:00.000Z"),
+    pagesProcessed: 33,
+    messagesProcessed: 750,
+    mediaProcessed: 42,
+    incrementalGapOpen: false,
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+
+  const result = await applyDialogIntelligenceChunk({
+    db,
+    job,
+    deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page",
+      runId: "discovery-run",
+      chunkKey: "daily-changed",
+      page: 0,
+      childMode: "incremental",
+      hasMore: false,
+      dialogs: [{
+        dialogId: "dialog-a",
+        fanId: "fan-a",
+        latestMessageId: "message-101",
+        latestMessageAt: "2026-07-22T12:00:00.000Z",
+      }],
+    },
+  });
+
+  const state = db._states.get("creator-1:dialog-a");
+  assert.equal(result.planned, 1);
+  assert.equal(result.unchanged, 0);
+  assert.equal(state.status, "PLANNED");
+  assert.equal(state.scanMode, "incremental");
+  assert.equal(state.generation, 121);
+  assert.equal(state.incrementalGapOpen, true);
+  assert.equal(state.pagesProcessed, 33, "daily delta planning preserves historical counters");
+  assert.equal(state.messagesProcessed, 750);
+  assert.equal(state.mediaProcessed, 42);
+});
+
+test("legacy completed dialogs bootstrap from their full-scan timestamp instead of all being rescanned once", async () => {
+  resetDb();
+  const { job } = seedDiscovery(122, "incremental");
+  db._states.set("creator-1:dialog-legacy", {
+    agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-legacy", fanId: "fan-legacy",
+    generation: 121, status: "READY", scanMode: "initial", initialScanComplete: true,
+    confirmedWatermarkMessageId: null, confirmedWatermarkAt: null, newestMessageId: null, newestMessageAt: null,
+    lastFullScanAt: new Date("2026-07-22T10:00:00.000Z"), lastIncrementalScanAt: null,
+    pagesProcessed: 10, messagesProcessed: 200, mediaProcessed: 5, incrementalGapOpen: false,
+    createdAt: new Date(0), updatedAt: new Date(0),
+  });
+  const result = await applyDialogIntelligenceChunk({
+    db, job, deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page", runId: "discovery-run", chunkKey: "legacy-watermark-old",
+      page: 0, childMode: "incremental", hasMore: false,
+      dialogs: [{ dialogId: "dialog-legacy", fanId: "fan-legacy", latestMessageId: "message-200", latestMessageAt: "2026-07-22T09:59:00.000Z" }],
+    },
+  });
+  assert.equal(result.planned, 0);
+  assert.equal(result.unchanged, 1);
+  assert.equal(db._states.get("creator-1:dialog-legacy").status, "READY");
+});
+
+test("legacy completed dialogs with a marker newer than their last scan are planned incrementally", async () => {
+  resetDb();
+  const { job } = seedDiscovery(123, "incremental");
+  db._states.set("creator-1:dialog-legacy", {
+    agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-legacy", fanId: "fan-legacy",
+    generation: 122, status: "READY", scanMode: "initial", initialScanComplete: true,
+    confirmedWatermarkMessageId: null, confirmedWatermarkAt: null, newestMessageId: null, newestMessageAt: null,
+    lastFullScanAt: new Date("2026-07-22T10:00:00.000Z"), lastIncrementalScanAt: null,
+    pagesProcessed: 10, messagesProcessed: 200, mediaProcessed: 5, incrementalGapOpen: false,
+    createdAt: new Date(0), updatedAt: new Date(0),
+  });
+  const result = await applyDialogIntelligenceChunk({
+    db, job, deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page", runId: "discovery-run", chunkKey: "legacy-watermark-new",
+      page: 0, childMode: "incremental", hasMore: false,
+      dialogs: [{ dialogId: "dialog-legacy", fanId: "fan-legacy", latestMessageId: "message-201", latestMessageAt: "2026-07-22T10:01:00.000Z" }],
+    },
+  });
+  assert.equal(result.planned, 1);
+  assert.equal(db._states.get("creator-1:dialog-legacy").status, "PLANNED");
+  assert.equal(db._states.get("creator-1:dialog-legacy").scanMode, "incremental");
+});
+
+test("a new dialog found by a daily list rebuild is planned as an initial scan", async () => {
+  resetDb();
+  const { job } = seedDiscovery(122, "incremental");
+  const result = await applyDialogIntelligenceChunk({
+    db,
+    job,
+    deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page",
+      runId: "discovery-run",
+      chunkKey: "daily-new-dialog",
+      page: 0,
+      childMode: "incremental",
+      hasMore: false,
+      dialogs: [{
+        dialogId: "dialog-new",
+        fanId: "fan-new",
+        latestMessageId: "new-message-1",
+        latestMessageAt: "2026-07-22T12:00:00.000Z",
+      }],
+    },
+  });
+  const state = db._states.get("creator-1:dialog-new");
+  assert.equal(result.planned, 1);
+  assert.equal(state.status, "PLANNED");
+  assert.equal(state.scanMode, "initial");
+  assert.equal(state.initialScanComplete, false);
+  assert.equal(state.newestMessageId, "new-message-1");
+});
+
+test("an unchanged unavailable dialog stays terminal during daily maintenance", async () => {
+  resetDb();
+  const { job } = seedDiscovery(123, "incremental");
+  db._states.set("creator-1:dialog-gone", {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-gone",
+    fanId: "fan-gone",
+    generation: 122,
+    status: "UNAVAILABLE",
+    scanMode: "incremental",
+    initialScanComplete: false,
+    newestMessageId: "last-visible-message",
+    newestMessageAt: new Date("2026-07-20T10:00:00.000Z"),
+    pagesProcessed: 0,
+    messagesProcessed: 0,
+    mediaProcessed: 0,
+    incrementalGapOpen: false,
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  });
+  const result = await applyDialogIntelligenceChunk({
+    db,
+    job,
+    deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page",
+      runId: "discovery-run",
+      chunkKey: "daily-unavailable",
+      page: 0,
+      childMode: "incremental",
+      hasMore: false,
+      dialogs: [{
+        dialogId: "dialog-gone",
+        fanId: "fan-gone",
+        latestMessageId: "last-visible-message",
+        latestMessageAt: "2026-07-20T10:00:00.000Z",
+      }],
+    },
+  });
+  const state = db._states.get("creator-1:dialog-gone");
+  assert.equal(result.planned, 0);
+  assert.equal(result.unavailableUnchanged, 1);
+  assert.equal(state.status, "UNAVAILABLE");
+  assert.equal(state.generation, 123);
 });

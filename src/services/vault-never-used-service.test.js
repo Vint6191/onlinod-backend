@@ -345,6 +345,59 @@ test("an authoritative result becomes STALE after the bounded freshness window",
   assert.match(result.pipeline.staleReason, /Messages catalog/i);
 });
 
+test("the default freshness window is one day and never triggers a three-hour renderer rescan", async () => {
+  const fresh = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: dbFixture({ complete: true }),
+    now: date(23 * 60 * 60 * 1000),
+  });
+  assert.equal(fresh.pipeline.stage, "UP_TO_DATE");
+  assert.equal(fresh.pipeline.freshness.staleAfterMs, 24 * 60 * 60 * 1000);
+
+  const stale = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: dbFixture({ complete: true }),
+    now: date(25 * 60 * 60 * 1000),
+  });
+  assert.equal(stale.pipeline.stage, "STALE");
+});
+
+test("a recent non-destructive daily catalog merge refreshes freshness without erasing the verified baseline", async () => {
+  const refreshedAt = date(25 * 60 * 60 * 1000);
+  const db = dbFixture({
+    complete: true,
+    dialogStates: [{
+      dialogId: "dialog-1", scanMode: "incremental", initialScanComplete: true, status: "COMPLETED",
+      activeRunId: null, activeJobId: null, pagesProcessed: 1, messagesProcessed: 0,
+      lastError: null, lastFullScanAt: date(), lastIncrementalScanAt: refreshedAt, updatedAt: refreshedAt,
+    }],
+    discoveryRuns: [{
+      id: "disc-daily", jobId: "disc-job-daily", dialogId: "__dialog_discovery__", mode: "discovery",
+      status: "COMPLETED", progress: { pages: 1, dialogs: 1 }, pagesProcessed: 1, purchaseSignals: 1,
+      completedAt: refreshedAt, updatedAt: refreshedAt, lastError: null,
+    }],
+  });
+  const originalFindUnique = db.vaultUnsortedSnapshot.findUnique;
+  db.vaultUnsortedSnapshot.findUnique = async (...args) => {
+    const row = await originalFindUnique(...args);
+    row.payload.lastFullScanAt = date().toISOString();
+    row.payload.lastMergeScanAt = refreshedAt.toISOString();
+    row.payload.scan.completedAt = row.payload.lastMergeScanAt;
+    row.updatedAt = date(25 * 60 * 60 * 1000);
+    return row;
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db,
+    now: date(26 * 60 * 60 * 1000),
+  });
+  assert.equal(result.pipeline.stage, "UP_TO_DATE");
+  assert.equal(result.pipeline.freshness.messagesAt, refreshedAt.toISOString());
+});
+
 test("a frozen PLANNED backlog is waiting for a batch worker, not a recovery failure", async () => {
   const plannedState = {
     dialogId: "dialog-planned", scanMode: "initial", initialScanComplete: false, status: "PLANNED",
@@ -377,6 +430,47 @@ test("legacy IDLE rows are not rendered as phantom pending worker backlog", asyn
   assert.equal(result.pipeline.dialogs.pending, 0);
   assert.equal(result.pipeline.dialogs.queue.planned, 0);
   assert.notEqual(result.pipeline.stage, "WAITING_FOR_WORKER");
+});
+
+test("an active daily discovery preserves published dialog and message counters", async () => {
+  const oldAt = date();
+  const activeAt = date(24 * 60 * 60 * 1000);
+  const dialogStates = [
+    {
+      dialogId: "dialog-a", generation: 7, scanMode: "initial", initialScanComplete: true, status: "READY",
+      activeRunId: null, activeJobId: null, pagesProcessed: 2, messagesProcessed: 50,
+      lastError: null, lastFullScanAt: oldAt, lastIncrementalScanAt: null, createdAt: oldAt, updatedAt: oldAt,
+    },
+    {
+      dialogId: "dialog-b", generation: 7, scanMode: "initial", initialScanComplete: true, status: "READY",
+      activeRunId: null, activeJobId: null, pagesProcessed: 3, messagesProcessed: 70,
+      lastError: null, lastFullScanAt: oldAt, lastIncrementalScanAt: null, createdAt: oldAt, updatedAt: oldAt,
+    },
+  ];
+  const activeRun = {
+    id: "disc-daily", jobId: "disc-daily-job", dialogId: "__dialog_discovery__", mode: "discovery",
+    status: "RUNNING", generation: 8, continuation: {}, progress: { pages: 1, dialogs: 25 },
+    pagesProcessed: 1, purchaseSignals: 25, createdAt: activeAt, updatedAt: activeAt, completedAt: null, lastError: null,
+  };
+  const previousRun = {
+    id: "disc-old", jobId: "disc-old-job", dialogId: "__dialog_discovery__", mode: "discovery",
+    status: "COMPLETED", generation: 7, continuation: {}, progress: { pages: 1, dialogs: 2, hasMore: false },
+    pagesProcessed: 1, purchaseSignals: 2, createdAt: oldAt, updatedAt: oldAt, completedAt: oldAt, lastError: null,
+  };
+  const activeJob = {
+    id: "disc-daily-job", status: "CLAIMED", params: { dialogId: "__dialog_discovery__", scanRunId: "disc-daily", childMode: "incremental" },
+    progress: { pages: 1, dialogs: 25 }, claimedByDeviceId: "device-a", leaseUntil: date(24 * 60 * 60 * 1000 + 60_000),
+    attempts: 0, lastError: null, createdAt: activeAt, updatedAt: activeAt,
+  };
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db: dbFixture({ complete: true, dialogStates, discoveryRuns: [activeRun, previousRun], dialogActiveJobs: [activeJob] }),
+    now: activeAt,
+  });
+  assert.equal(result.pipeline.stage, "DISCOVERING_DIALOGS");
+  assert.equal(result.pipeline.dialogs.discovered, 2);
+  assert.equal(result.pipeline.dialogs.messagesCommitted, 120);
 });
 
 test("scheduled durable work is shown as WAITING_FOR_WORKER", async () => {

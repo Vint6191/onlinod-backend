@@ -1289,6 +1289,84 @@ async function scheduleNextPlannedDialogTx(db, input) {
   });
 }
 
+function discoveryMarker(row) {
+  return {
+    messageId: clean(row.latestMessageId ?? row.lastMessageId, 240),
+    messageAt: dateOrNull(row.latestMessageAt ?? row.lastMessageAt),
+  };
+}
+
+function knownDialogMarker(state) {
+  return {
+    messageId: clean(state?.confirmedWatermarkMessageId || state?.newestMessageId, 240),
+    messageAt: dateOrNull(state?.confirmedWatermarkAt || state?.newestMessageAt),
+  };
+}
+
+function markerChanged(state, row) {
+  const incoming = discoveryMarker(row);
+  const known = knownDialogMarker(state);
+  const lastSuccessfulScanAt = dateOrNull(state?.lastIncrementalScanAt || state?.lastFullScanAt);
+  if (incoming.messageId) {
+    if (known.messageId) return incoming.messageId !== known.messageId;
+    if (incoming.messageAt && known.messageAt) return incoming.messageAt.getTime() > known.messageAt.getTime();
+    // Existing installations completed their first 16k-dialog pass before the
+    // backend stored message-id watermarks. If the list marker predates that
+    // proven full-scan completion, the local SQLite history already contains it
+    // and a one-time 16k-dialog delta sweep would be pure waste. A marker newer
+    // than the successful scan still plans a normal incremental read.
+    if (incoming.messageAt && lastSuccessfulScanAt) {
+      return incoming.messageAt.getTime() > lastSuccessfulScanAt.getTime();
+    }
+    return true;
+  }
+  if (incoming.messageAt) {
+    if (!known.messageAt) return true;
+    return incoming.messageAt.getTime() > known.messageAt.getTime();
+  }
+  return null;
+}
+
+function discoveryPlanDecision(state, row, { childMode, forceChildFull }) {
+  if (!state) {
+    return { shouldPlan: true, scanMode: 'initial', nextStatus: 'PLANNED', reason: 'new_dialog' };
+  }
+  const currentStatus = clean(state.status, 40).toUpperCase();
+  const initialComplete = state.initialScanComplete === true;
+  if (childMode === 'initial') {
+    const shouldPlan = forceChildFull || !initialComplete;
+    return {
+      shouldPlan,
+      scanMode: 'initial',
+      nextStatus: shouldPlan ? 'PLANNED' : (currentStatus === 'UNAVAILABLE' ? 'UNAVAILABLE' : 'READY'),
+      reason: shouldPlan ? (forceChildFull ? 'forced_full' : 'initial_incomplete') : 'initial_already_complete',
+    };
+  }
+
+  if (!initialComplete) {
+    const changed = markerChanged(state, row);
+    if (currentStatus === 'UNAVAILABLE' && changed !== true) {
+      return { shouldPlan: false, scanMode: 'initial', nextStatus: 'UNAVAILABLE', reason: 'unavailable_unchanged' };
+    }
+    return { shouldPlan: true, scanMode: 'initial', nextStatus: 'PLANNED', reason: 'initial_incomplete' };
+  }
+
+  if (['FAILED', 'PLANNED', 'QUEUED', 'RUNNING', 'IDLE'].includes(currentStatus) || state.incrementalGapOpen === true) {
+    return { shouldPlan: true, scanMode: 'incremental', nextStatus: 'PLANNED', reason: 'unfinished_incremental' };
+  }
+
+  const changed = markerChanged(state, row);
+  if (currentStatus === 'UNAVAILABLE') {
+    return changed === true
+      ? { shouldPlan: true, scanMode: 'incremental', nextStatus: 'PLANNED', reason: 'unavailable_changed' }
+      : { shouldPlan: false, scanMode: 'incremental', nextStatus: 'UNAVAILABLE', reason: changed === false ? 'unavailable_unchanged' : 'unavailable_without_marker' };
+  }
+  if (changed === false) {
+    return { shouldPlan: false, scanMode: 'incremental', nextStatus: 'READY', reason: 'watermark_unchanged' };
+  }
+  return { shouldPlan: true, scanMode: 'incremental', nextStatus: 'PLANNED', reason: changed === true ? 'watermark_changed' : 'watermark_unknown' };
+}
+
 async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const chunk = object(chunkResult);
   const params = object(job.params);
@@ -1316,82 +1394,144 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
     const row = object(raw);
     const dialogId = clean(row.dialogId, 180);
     if (!dialogId || dialogId === discoveryDialogId) continue;
-    uniqueDialogs.set(dialogId, { dialogId, fanId: clean(row.fanId, 160) });
+    uniqueDialogs.set(dialogId, {
+      dialogId,
+      fanId: clean(row.fanId, 160),
+      latestMessageId: clean(row.latestMessageId, 240),
+      latestMessageAt: dateOrNull(row.latestMessageAt),
+    });
   }
   const discoveryRows = [...uniqueDialogs.values()];
   const discovered = discoveryRows.length;
   let planned = 0;
-  const supportsBulkPlan = typeof db.dialogScanState.findMany === "function"
-    && typeof db.dialogScanState.createMany === "function"
-    && typeof db.dialogScanState.updateMany === "function";
+  let unchanged = 0;
+  let unavailableUnchanged = 0;
+  const supportsBulkPlan = typeof db.dialogScanState.findMany === 'function'
+    && typeof db.dialogScanState.createMany === 'function'
+    && typeof db.dialogScanState.updateMany === 'function';
 
   if (supportsBulkPlan && discoveryRows.length > 0) {
     const dialogIds = discoveryRows.map((row) => row.dialogId);
     const existingRows = await db.dialogScanState.findMany({
       where: { creatorId: job.creatorId, dialogId: { in: dialogIds } },
-      select: { dialogId: true, initialScanComplete: true },
+      select: {
+        dialogId: true,
+        fanId: true,
+        status: true,
+        scanMode: true,
+        initialScanComplete: true,
+        newestMessageId: true,
+        newestMessageAt: true,
+        confirmedWatermarkMessageId: true,
+        confirmedWatermarkAt: true,
+        lastFullScanAt: true,
+        lastIncrementalScanAt: true,
+        incrementalGapOpen: true,
+      },
     });
     const existingById = new Map(existingRows.map((row) => [row.dialogId, row]));
     const createRows = [];
-    const plannedExistingIds = [];
-    const readyExistingIds = [];
+    const planInitialIds = [];
+    const planIncrementalIds = [];
+    const readyIds = [];
+    const unavailableIds = [];
+    const exceptionUpdates = [];
 
     for (const row of discoveryRows) {
       const existingState = existingById.get(row.dialogId);
-      const alreadyInitial = existingState?.initialScanComplete === true;
-      const shouldPlan = childMode === "initial" ? (forceChildFull || !alreadyInitial) : true;
-      if (shouldPlan) planned += 1;
+      const decision = discoveryPlanDecision(existingState, row, { childMode, forceChildFull });
+      const marker = discoveryMarker(row);
+      if (decision.shouldPlan) planned += 1;
+      else if (decision.nextStatus === 'UNAVAILABLE') unavailableUnchanged += 1;
+      else unchanged += 1;
+
       if (!existingState) {
         createRows.push({
           agencyId: job.agencyId,
           creatorId: job.creatorId,
           dialogId: row.dialogId,
           fanId: row.fanId,
-          status: shouldPlan ? "PLANNED" : "READY",
-          scanMode: childMode,
+          status: decision.nextStatus,
+          scanMode: decision.scanMode,
           generation,
           initialScanComplete: false,
+          newestMessageId: marker.messageId || null,
+          newestMessageAt: marker.messageAt || null,
           pagesProcessed: 0,
           messagesProcessed: 0,
           mediaProcessed: 0,
-          incrementalGapOpen: childMode === "incremental",
+          incrementalGapOpen: decision.shouldPlan && decision.scanMode === 'incremental',
         });
-      } else if (shouldPlan) {
-        plannedExistingIds.push(row.dialogId);
-      } else {
-        readyExistingIds.push(row.dialogId);
+        continue;
+      }
+
+      if (decision.shouldPlan && decision.scanMode === 'initial') planInitialIds.push(row.dialogId);
+      else if (decision.shouldPlan) planIncrementalIds.push(row.dialogId);
+      else if (decision.nextStatus === 'UNAVAILABLE') unavailableIds.push(row.dialogId);
+      else readyIds.push(row.dialogId);
+
+      const fanIdChanged = Boolean(row.fanId && row.fanId !== clean(existingState.fanId, 160));
+      if (fanIdChanged || (existingState.initialScanComplete !== true && (marker.messageId || marker.messageAt))) {
+        exceptionUpdates.push({
+          dialogId: row.dialogId,
+          fanId: fanIdChanged ? row.fanId : null,
+          messageId: marker.messageId,
+          messageAt: marker.messageAt,
+          writeMarker: existingState.initialScanComplete !== true,
+        });
       }
     }
 
-    if (createRows.length > 0) {
-      await db.dialogScanState.createMany({ data: createRows, skipDuplicates: true });
-    }
-    const commonUpdate = {
-      scanMode: childMode,
-      generation,
-      pagesProcessed: 0,
-      messagesProcessed: 0,
-      mediaProcessed: 0,
-      incrementalGapOpen: childMode === "incremental",
-      activeRunId: null,
-      activeJobId: null,
-      lastError: null,
-    };
-    if (plannedExistingIds.length > 0) {
+    if (createRows.length > 0) await db.dialogScanState.createMany({ data: createRows, skipDuplicates: true });
+    if (planInitialIds.length > 0) {
       await db.dialogScanState.updateMany({
-        where: { creatorId: job.creatorId, dialogId: { in: plannedExistingIds } },
+        where: { creatorId: job.creatorId, dialogId: { in: planInitialIds } },
         data: {
-          ...commonUpdate,
-          status: "PLANNED",
+          status: 'PLANNED', scanMode: 'initial', generation,
           initialScanComplete: forceChildFull ? false : undefined,
+          pagesProcessed: 0, messagesProcessed: 0, mediaProcessed: 0,
           backwardCursor: forceChildFull ? null : undefined,
+          incrementalGapOpen: false, activeRunId: null, activeJobId: null, lastError: null,
         },
       });
     }
-    if (readyExistingIds.length > 0) {
+    if (planIncrementalIds.length > 0) {
       await db.dialogScanState.updateMany({
-        where: { creatorId: job.creatorId, dialogId: { in: readyExistingIds } },
-        data: { ...commonUpdate, status: "READY" },
+        where: { creatorId: job.creatorId, dialogId: { in: planIncrementalIds } },
+        data: {
+          status: 'PLANNED', scanMode: 'incremental', generation,
+          incrementalGapOpen: true, activeRunId: null, activeJobId: null, lastError: null,
+        },
+      });
+    }
+    if (readyIds.length > 0) {
+      await db.dialogScanState.updateMany({
+        where: { creatorId: job.creatorId, dialogId: { in: readyIds } },
+        data: {
+          status: 'READY', scanMode: childMode === 'initial' ? 'initial' : 'incremental', generation,
+          incrementalGapOpen: false, activeRunId: null, activeJobId: null, lastError: null,
+        },
+      });
+    }
+    if (unavailableIds.length > 0) {
+      await db.dialogScanState.updateMany({
+        where: { creatorId: job.creatorId, dialogId: { in: unavailableIds } },
+        data: {
+          status: 'UNAVAILABLE', generation, incrementalGapOpen: false, activeRunId: null, activeJobId: null,
+        },
+      });
+    }
+    // Only incomplete/unavailable rows need a discovery marker separate from a
+    // confirmed local watermark. There are normally only a handful of these,
+    // so keep the hot path bulk-only and update this small exceptional set.
+    for (const marker of exceptionUpdates) {
+      await db.dialogScanState.update({
+        where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId: marker.dialogId } },
+        data: {
+          fanId: marker.fanId || undefined,
+          newestMessageId: marker.writeMarker ? marker.messageId || undefined : undefined,
+          newestMessageAt: marker.writeMarker ? marker.messageAt || undefined : undefined,
+        },
       });
     }
   } else {
@@ -1399,23 +1539,32 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
       const existingState = await db.dialogScanState.findUnique({
         where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId: row.dialogId } },
       });
-      const alreadyInitial = existingState?.initialScanComplete === true;
-      const shouldPlan = childMode === "initial" ? (forceChildFull || !alreadyInitial) : true;
+      const decision = discoveryPlanDecision(existingState, row, { childMode, forceChildFull });
+      const marker = discoveryMarker(row);
+      const resetCounters = forceChildFull || decision.scanMode === 'initial';
       await db.dialogScanState.upsert({
         where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId: row.dialogId } },
         create: {
           agencyId: job.agencyId, creatorId: job.creatorId, dialogId: row.dialogId, fanId: row.fanId,
-          status: shouldPlan ? "PLANNED" : "READY", scanMode: childMode, generation,
-          initialScanComplete: forceChildFull ? false : alreadyInitial, pagesProcessed: 0, messagesProcessed: 0, mediaProcessed: 0,
+          status: decision.nextStatus, scanMode: decision.scanMode, generation, initialScanComplete: false,
+          newestMessageId: marker.messageId || null, newestMessageAt: marker.messageAt || null,
+          pagesProcessed: 0, messagesProcessed: 0, mediaProcessed: 0,
+          incrementalGapOpen: decision.shouldPlan && decision.scanMode === 'incremental',
         },
         update: {
-          fanId: row.fanId || undefined, scanMode: childMode, generation, status: shouldPlan ? "PLANNED" : "READY",
-          initialScanComplete: forceChildFull ? false : undefined, pagesProcessed: 0, messagesProcessed: 0, mediaProcessed: 0,
-          backwardCursor: forceChildFull ? null : undefined, incrementalGapOpen: childMode === "incremental",
-          activeRunId: null, activeJobId: null, lastError: null,
+          fanId: row.fanId || undefined, status: decision.nextStatus, scanMode: decision.scanMode, generation,
+          ...(forceChildFull ? { initialScanComplete: false, backwardCursor: null } : {}),
+          ...(resetCounters ? { pagesProcessed: 0, messagesProcessed: 0, mediaProcessed: 0 } : {}),
+          incrementalGapOpen: decision.shouldPlan && decision.scanMode === 'incremental',
+          activeRunId: null, activeJobId: null, lastError: decision.shouldPlan ? null : undefined,
+          ...(existingState?.initialScanComplete === true ? {} : {
+            newestMessageId: marker.messageId || undefined, newestMessageAt: marker.messageAt || undefined,
+          }),
         },
       });
-      if (shouldPlan) planned += 1;
+      if (decision.shouldPlan) planned += 1;
+      else if (decision.nextStatus === 'UNAVAILABLE') unavailableUnchanged += 1;
+      else unchanged += 1;
     }
   }
   const pageStart = integer(chunk.pageStart ?? chunk.page, 0);
@@ -1424,7 +1573,7 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const page = pageEnd;
   const hasMore = chunk.hasMore === true;
   const cursorOut = clean(chunk.cursorOut, 240);
-  const result = { discovered, planned, scheduled: 0, hasMore, page, pageStart, pageEnd, pagesInBatch, cursorOut, childMode, forceChildFull, generation };
+  const result = { discovered, planned, unchanged, unavailableUnchanged, scheduled: 0, hasMore, page, pageStart, pageEnd, pagesInBatch, cursorOut, childMode, forceChildFull, generation };
   const commit = await db.dialogScanChunkCommit.create({
     data: {
       agencyId: job.agencyId, creatorId: job.creatorId, runId, jobId: job.id, dialogId: discoveryDialogId,

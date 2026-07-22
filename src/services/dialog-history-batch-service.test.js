@@ -438,7 +438,7 @@ test("one completion report closes the whole batch and is idempotent", async () 
     batchId: claim.batch.id,
     leaseToken: claim.batch.leaseToken,
     results: [
-      { dialogId: "dialog-01", ok: true, pages: 4, messages: 120, inserted: 120 },
+      { dialogId: "dialog-01", ok: true, pages: 4, messages: 120, inserted: 120, newestMessageId: "message-120", newestMessageAt: "2026-07-22T12:00:00.000Z" },
       { dialogId: "dialog-02", ok: false, retryable: true, error: "HTTP_429" },
       { dialogId: "dialog-03", ok: false, retryable: false, unavailable: true, code: "DIALOG_UNAVAILABLE", status: 403, error: "geo blocked" },
       { dialogId: "dialog-04", ok: false, retryable: false, code: "INVALID_SCAN_WORK", error: "bad payload" },
@@ -452,6 +452,10 @@ test("one completion report closes the whole batch and is idempotent", async () 
   );
   assert.equal(db._states.get("dialog-01").status, "READY");
   assert.equal(db._states.get("dialog-01").initialScanComplete, true);
+  assert.equal(db._states.get("dialog-01").newestMessageId, "message-120");
+  assert.equal(db._states.get("dialog-01").confirmedWatermarkMessageId, "message-120");
+  assert.equal(db._states.get("dialog-01").newestMessageAt.toISOString(), "2026-07-22T12:00:00.000Z");
+  assert.equal(db._states.get("dialog-01").confirmedWatermarkAt.toISOString(), "2026-07-22T12:00:00.000Z");
   assert.equal(db._states.get("dialog-02").status, "PLANNED");
   assert.equal(db._states.get("dialog-03").status, "UNAVAILABLE");
   assert.match(db._states.get("dialog-03").lastError, /DIALOG_UNAVAILABLE.*HTTP 403.*geo blocked/);

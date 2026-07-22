@@ -13,7 +13,10 @@ const { isTerminalDialogText } = require("./dialog-terminal-outcome");
 
 const PROJECTION_CHUNK_SIZE = 5000;
 const LIST_SCAN_CHUNK_SIZE = 500;
-const DEFAULT_STALE_AFTER_MS = 3 * 60 * 60 * 1000;
+// Freshness is maintained by the backend-owned daily cycle. Renderer status
+// polling must never turn a three-hour display threshold into an unsolicited
+// heavy rescan.
+const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 const PROJECTION_CACHE_LIMIT = 500;
 const MEDIA_TYPES = new Set(["photo", "video", "audio", "gif", "unknown"]);
 const projectionCache = new Map();
@@ -315,11 +318,19 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   const discoveryStartedAt = timestamp(latestInitialDiscoveryRun?.createdAt);
   const planStates = !latestInitialDiscoveryRun
     ? []
-    : planGeneration > 0
-      ? states.filter((state) => number(state.generation) === planGeneration)
-      : Number.isFinite(discoveryStartedAt)
-        ? states.filter((state) => timestamp(state.updatedAt) >= discoveryStartedAt)
-        : states;
+    // While a new shuffled-list discovery is being built, keep projecting the
+    // already published creator state instead of visually resetting 16k dialogs
+    // and hundreds of thousands of messages to zero. DialogScanState is one row
+    // per dialog, so `states` is the stable union of the previous frozen plan
+    // and the rows already touched by the in-flight generation. Claiming still
+    // remains fenced on the completed generation below.
+    : discoveryActive
+      ? states
+      : planGeneration > 0
+        ? states.filter((state) => number(state.generation) === planGeneration)
+        : Number.isFinite(discoveryStartedAt)
+          ? states.filter((state) => timestamp(state.updatedAt) >= discoveryStartedAt)
+          : states;
 
   const historyActiveJobs = activeJobs.filter((job) => {
     const params = object(job.params);
@@ -689,6 +700,7 @@ function projectionFingerprint(messagesSnapshot, dialogs, salesUpdatedAt) {
     messagesSnapshot?.updatedAt || "",
     messagesSnapshot?.lastFullScanAt || "",
     messagesSnapshot?.lastIncrementalScanAt || "",
+    messagesSnapshot?.lastMergeScanAt || "",
     dialogs.lastUpdatedAt || "",
     dialogs.lastSuccessfulScanAt || "",
     salesUpdatedAt || "",
@@ -816,7 +828,7 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   if (!messagesComplete) reasons.push("Messages catalog initial scan is incomplete");
   if (!dialogsDrained) reasons.push("dialog history initial scan is incomplete");
 
-  const messagesAt = messages.snapshot?.lastIncrementalScanAt || messages.snapshot?.lastFullScanAt || null;
+  const messagesAt = messages.snapshot?.lastIncrementalScanAt || messages.snapshot?.lastMergeScanAt || messages.snapshot?.lastFullScanAt || null;
   const dialogsAt = dialogs.lastSuccessfulScanAt || null;
   const sourceOldestAt = authoritative ? oldest([messagesAt, dialogsAt]) : null;
   const thresholdMs = staleAfterMs(staleAfter);
