@@ -7,6 +7,7 @@ const {
   autoRecoverDialogDiscoveryTx,
   autoRecoverDialogHistoryTx,
   repairRegressedDialogDiscoveryTx,
+  finalizeCommittedDialogDiscoveryTx,
 } = require("./dialog-intelligence-service");
 const { DIALOG_HISTORY_BATCH_DIALOG_ID } = require("./dialog-history-batch-service");
 const { isTerminalDialogText } = require("./dialog-terminal-outcome");
@@ -795,6 +796,10 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   // never need to restart or rebuild thousands of already discovered dialogs.
   try {
     await resolveLegacyTerminalDialogFailures(db, agencyId, creatorId);
+    // Final hasMore=false discovery chunks are already durable. Repair the
+    // narrow lost-completion gap before any cursor-regression recovery can
+    // accidentally reschedule the fully collected list from page zero.
+    await finalizeCommittedDialogDiscoveryTx(db, { agencyId, creatorId, now });
     await repairRegressedDialogDiscoveryTx(db, { agencyId, creatorId });
     await autoRecoverDialogDiscoveryTx(db, {
       agencyId,

@@ -48,11 +48,15 @@ function matches(row, where = {}) {
 function createDb() {
   const states = new Map();
   const runs = new Map();
+  const jobs = new Map();
+  const commits = new Map();
   const locks = [];
   let runSeq = 0;
   const api = {
     _states: states,
     _runs: runs,
+    _jobs: jobs,
+    _commits: commits,
     _locks: locks,
     $queryRawUnsafe: async (...args) => {
       locks.push(args);
@@ -63,6 +67,29 @@ function createDb() {
     },
     moduleSetting: {
       findUnique: async () => ({ enabled: true }),
+    },
+    dialogScanChunkCommit: {
+      findFirst: async ({ where }) => [...commits.values()].find((row) => {
+        if (where.runId && row.runId !== where.runId) return false;
+        if (where.mode && row.mode !== where.mode) return false;
+        if (where.hasMore !== undefined && row.hasMore !== where.hasMore) return false;
+        return true;
+      }) || null,
+    },
+    jobInstance: {
+      findUnique: async ({ where }) => jobs.get(where.id) || null,
+      updateMany: async ({ where, data }) => {
+        const row = jobs.get(where.id);
+        if (!row) return { count: 0 };
+        if (typeof where.status === "string" && row.status !== where.status) return { count: 0 };
+        if (where.status?.in && !where.status.in.includes(row.status)) return { count: 0 };
+        if (row.status === "CLAIMED" && where.OR) {
+          const now = where.OR.find((item) => item.leaseUntil?.lte)?.leaseUntil?.lte || null;
+          if (row.leaseUntil && now && row.leaseUntil > now) return { count: 0 };
+        }
+        applyData(row, data);
+        return { count: 1 };
+      },
     },
     dialogScanState: {
       findFirst: async ({ where }) => [...states.values()].filter((row) => matches(row, where))[0] || null,
@@ -153,6 +180,32 @@ test("PLANNED rows stay unavailable until the newest discovery generation is fro
   assert.equal(result.batch, null);
   assert.equal(result.reason, "no_frozen_dialog_batch_ready");
   assert.equal([...db._states.values()].every((row) => row.status === "PLANNED"), true);
+});
+
+test("batch claim finalizes a committed terminal discovery boundary before looking for PLANNED rows", async () => {
+  const db = createDb();
+  seedPlanned(db, 2, 17);
+  seedCompletedDiscovery(db, 17, "QUEUED");
+  const run = db._runs.get("discovery-17");
+  run.jobId = "discovery-job-17";
+  run.progress = { pages: 321, dialogsFound: 16021, hasMore: false, nextOffset: 16021 };
+  db._jobs.set("discovery-job-17", {
+    id: "discovery-job-17", status: "SCHEDULED", leaseUntil: null,
+    agencyId: "agency-1", creatorId: "creator-1",
+  });
+  db._commits.set("terminal-17", {
+    id: "terminal-17", runId: run.id, mode: "discovery", hasMore: false,
+    page: 321, result: { page: 321, hasMore: false, discovered: 21 },
+  });
+
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 2,
+  });
+
+  assert.equal(db._jobs.get("discovery-job-17").status, "DONE");
+  assert.equal(run.status, "COMPLETED");
+  assert.equal(result.reason, "claimed");
+  assert.deepEqual(result.batch.dialogs.map((item) => item.dialogId), ["dialog-01", "dialog-02"]);
 });
 
 test("stranded IDLE rows in the completed generation are repaired and claimed", async () => {

@@ -76,6 +76,142 @@ function nonNegativeIntegerOrNull(value) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
+async function finalDialogDiscoveryCommit(db, runId) {
+  const cleanRunId = clean(runId, 160);
+  if (!cleanRunId || !db?.dialogScanChunkCommit) return null;
+  // hasMore has a database default of false, so require the compact result JSON
+  // to explicitly carry hasMore=false as well. This prevents an ancient or
+  // malformed commit that omitted the field from being mistaken for the tail.
+  if (typeof db.dialogScanChunkCommit.findMany === "function") {
+    const rows = await db.dialogScanChunkCommit.findMany({
+      where: { runId: cleanRunId, mode: "discovery", hasMore: false },
+      orderBy: { committedAt: "desc" },
+      take: 20,
+    });
+    return (rows || []).find((row) => object(row?.result).hasMore === false) || null;
+  }
+  if (typeof db.dialogScanChunkCommit.findFirst === "function") {
+    const row = await db.dialogScanChunkCommit.findFirst({
+      where: { runId: cleanRunId, mode: "discovery", hasMore: false },
+      orderBy: { committedAt: "desc" },
+    });
+    return object(row?.result).hasMore === false ? row : null;
+  }
+  return null;
+}
+
+/**
+ * A discovery page with hasMore=false is the durable terminal boundary. Every
+ * dialog row in that page has already been committed in the same transaction,
+ * so a lost Desktop completion request must not leave the creator forever in
+ * SCHEDULED/QUEUED after the complete list is already frozen.
+ *
+ * Only an unclaimed scheduled job or an expired claimed lease is repaired. A
+ * live worker keeps ownership and finishes through the normal fenced path.
+ */
+async function finalizeCommittedDialogDiscoveryTx(db, input = {}) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorId = clean(input.creatorId, 160);
+  if (!agencyId || !creatorId) return { finalized: false, reason: "missing_scope" };
+
+  const run = input.run || await db.dialogScanRun.findFirst({
+    where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!run) return { finalized: false, reason: "no_discovery_run" };
+
+  const now = dateOrNull(input.now) || new Date();
+  const job = run.jobId && typeof db.jobInstance?.findUnique === "function"
+    ? await db.jobInstance.findUnique({ where: { id: run.jobId } })
+    : null;
+  const runStatus = clean(run.status, 40)?.toUpperCase() || null;
+  const jobStatus = clean(job?.status, 40)?.toUpperCase() || null;
+  if (runStatus === "COMPLETED" && !["SCHEDULED", "CLAIMED"].includes(jobStatus)) {
+    return { finalized: false, reason: "already_completed", runId: run.id, jobId: job?.id || null };
+  }
+  if (!["QUEUED", "RUNNING", "COMPLETED"].includes(runStatus)) {
+    return { finalized: false, reason: `run_${String(runStatus || "unknown").toLowerCase()}`, runId: run.id, jobId: job?.id || null };
+  }
+
+  const terminalCommit = await finalDialogDiscoveryCommit(db, run.id);
+  if (!terminalCommit) return { finalized: false, reason: "terminal_boundary_not_committed", runId: run.id };
+
+  const leaseUntil = dateOrNull(job?.leaseUntil);
+  const liveClaim = jobStatus === "CLAIMED" && leaseUntil && leaseUntil.getTime() > now.getTime();
+  if (liveClaim) {
+    return { finalized: false, reason: "live_worker_finishing", runId: run.id, jobId: job.id };
+  }
+  if (["CANCELLED", "CANCELED", "FAILED"].includes(jobStatus)) {
+    return { finalized: false, reason: `terminal_job_${jobStatus.toLowerCase()}`, runId: run.id, jobId: job.id };
+  }
+
+  const commitResult = object(terminalCommit.result);
+  const runProgress = object(run.progress);
+  const completionResult = {
+    ...runProgress,
+    ...commitResult,
+    runId: run.id,
+    mode: "discovery",
+    hasMore: false,
+    pages: Math.max(integer(run.pagesProcessed, 0), integer(runProgress.pages, 0), integer(commitResult.page, 0)),
+    dialogsFound: Math.max(
+      integer(run.purchaseSignals, 0),
+      integer(runProgress.dialogsFound ?? runProgress.dialogs, 0),
+      integer(commitResult.discovered, 0),
+    ),
+  };
+
+  if (job && ["SCHEDULED", "CLAIMED"].includes(jobStatus)) {
+    const where = jobStatus === "SCHEDULED"
+      ? { id: job.id, status: "SCHEDULED" }
+      : { id: job.id, status: "CLAIMED", OR: [{ leaseUntil: null }, { leaseUntil: { lte: now } }] };
+    const updated = await db.jobInstance.updateMany({
+      where,
+      data: {
+        status: "DONE",
+        completedAt: now,
+        continuation: null,
+        progress: completionResult,
+        result: completionResult,
+        lastProgressAt: now,
+        claimedAt: null,
+        claimedByDeviceId: null,
+        leaseUntil: null,
+        leaseTokenHash: null,
+        workId: null,
+        lastError: null,
+      },
+    });
+    if (!updated.count) {
+      return { finalized: false, reason: "job_ownership_changed", runId: run.id, jobId: job.id };
+    }
+  }
+
+  if (clean(run.status, 40)?.toUpperCase() !== "COMPLETED") {
+    await db.dialogScanRun.update({
+      where: { id: run.id },
+      data: {
+        status: "COMPLETED",
+        completedAt: now,
+        progress: completionResult,
+        lastError: null,
+      },
+    });
+  }
+  await db.dialogScanState.updateMany({
+    where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+    data: { status: "READY", activeRunId: null, activeJobId: null, lastError: null },
+  });
+  return {
+    finalized: true,
+    reason: "terminal_boundary_finalized",
+    runId: run.id,
+    jobId: job?.id || null,
+    generation: integer(run.generation, 0),
+    completionResult,
+  };
+}
+
 async function durableDialogDiscoveryCheckpoint(db, input) {
   const run = input?.run;
   if (!run?.id || typeof db?.dialogScanChunkCommit?.findMany !== "function") return null;
@@ -705,6 +841,20 @@ async function repairRegressedDialogDiscoveryTx(db, input) {
   const jobProgress = object(job.progress);
   const runContinuation = object(run.continuation);
   const runProgress = object(run.progress);
+  // A committed hasMore=false page is terminal, not a regressed cursor. Never
+  // turn the tiny completion-handshake gap into a brand-new discovery job.
+  if (jobProgress.hasMore === false || runProgress.hasMore === false) {
+    const terminalCommit = await finalDialogDiscoveryCommit(db, run.id);
+    if (terminalCommit) {
+      return {
+        ok: true,
+        repaired: false,
+        reason: "terminal_boundary_already_committed",
+        runId: run.id,
+        jobId: job.id,
+      };
+    }
+  }
   const currentOffset = nonNegativeIntegerOrNull(jobContinuation.offset)
     ?? nonNegativeIntegerOrNull(jobProgress.nextOffset)
     ?? nonNegativeIntegerOrNull(jobProgress.offset)
@@ -2080,6 +2230,7 @@ module.exports = {
   repairStrandedDialogHistoryStatesTx,
   dialogHistoryControl,
   repairRegressedDialogDiscoveryTx,
+  finalizeCommittedDialogDiscoveryTx,
   applyDialogIntelligenceChunk,
   applyPurchaseSignalsChunk,
   completeDialogIntelligenceJob,

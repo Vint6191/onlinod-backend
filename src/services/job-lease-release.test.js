@@ -388,3 +388,61 @@ test("daily catalog completion starts dialog discovery only after the catalog tr
   assert.equal(dailyInput.creatorId, "creator-1");
   assert.equal(result.dailyContinuation.created, 1);
 });
+
+test("discovery-only claim fences the shared dialog job key to the discovery sentinel", async () => {
+  const now = new Date();
+  const candidate = {
+    id: "job-discovery", jobKey: "dialog_intelligence_scan", scope: "creator",
+    creatorId: "creator-1", agencyId: "agency-1", idempotencyKey: "discovery-key",
+    params: { dialogId: "__dialog_discovery__", scanRunId: "run-discovery", mode: "discovery" },
+    priority: 70, attempts: 0, leaseRevision: 1, startedAt: null, workId: null,
+    continuation: null, progress: null,
+  };
+  let selectedWhere = null;
+  let fencedWhere = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: now }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all" }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+    deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
+    jobInstance: {
+      findFirst: async ({ where }) => { selectedWhere = where; return candidate; },
+      updateMany: async ({ where }) => {
+        if (where?.id === candidate.id) fencedWhere = where;
+        return { count: 1 };
+      },
+      findUnique: async () => ({
+        ...candidate,
+        status: "CLAIMED",
+        claimedAt: now,
+        claimedByDeviceId: "device-1",
+        leaseUntil: new Date(now.getTime() + 60_000),
+        leaseRevision: 2,
+        creator: { id: "creator-1" },
+      }),
+    },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseMs: 60_000,
+    jobKeys: ["fetch_earnings", "dialog_intelligence_scan"],
+    dialogDiscoveryOnly: true,
+  });
+
+  assert.equal(result.reason, "claimed");
+  const expectedConstraint = {
+    OR: [
+      { jobKey: { not: "dialog_intelligence_scan" } },
+      {
+        jobKey: "dialog_intelligence_scan",
+        params: { path: ["dialogId"], equals: "__dialog_discovery__" },
+      },
+    ],
+  };
+  assert.deepEqual(selectedWhere.AND, [expectedConstraint]);
+  assert.deepEqual(fencedWhere.AND, [expectedConstraint]);
+  assert.deepEqual(selectedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
+  assert.deepEqual(fencedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
+});

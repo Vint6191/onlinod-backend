@@ -2,7 +2,11 @@
 
 const { createHash, randomBytes } = require("node:crypto");
 const prisma = require("../prisma");
-const { repairStrandedDialogHistoryStatesTx, dialogHistoryControl } = require("./dialog-intelligence-service");
+const {
+  repairStrandedDialogHistoryStatesTx,
+  dialogHistoryControl,
+  finalizeCommittedDialogDiscoveryTx,
+} = require("./dialog-intelligence-service");
 const { isTerminalDialogOutcome } = require("./dialog-terminal-outcome");
 
 const DIALOG_HISTORY_BATCH_DIALOG_ID = "__dialog_history_batch__";
@@ -382,6 +386,12 @@ async function claimDialogHistoryBatchTx(db, input) {
   if (!allowedCreatorIds.length) return { ok: true, batch: null, reason: "no_ready_creators" };
 
   await lockDialogHistoryBatchClaimsTx(db, agencyId);
+  // The final discovery page may be committed even when the Desktop loses the
+  // separate completion response. Finalize that durable boundary here too, so
+  // the batch worker does not depend on someone opening the Vault status UI.
+  for (const creatorId of allowedCreatorIds) {
+    await finalizeCommittedDialogDiscoveryTx(db, { agencyId, creatorId });
+  }
   await recoverExpiredDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
   await normalizeOrphanedDialogHistoryBatchesTx(db, { agencyId, creatorIds: allowedCreatorIds });
   for (const creatorId of allowedCreatorIds) {

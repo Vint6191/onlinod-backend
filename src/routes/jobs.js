@@ -58,6 +58,11 @@ const claimSchema = z.object({
   leaseMs: z.number().int().min(30_000).max(15 * 60_000).optional(),
   jobKeys: z.array(z.string().min(1).max(120)).min(1).max(100),
   excludedCreatorIds: z.array(z.string().min(1).max(200)).max(1_000).optional(),
+  // The generic read worker also executes creator-wide dialog discovery, while
+  // per-dialog history is leased by DialogHistoryBatchRunner. This flag lets a
+  // Desktop request the shared job key without accidentally claiming legacy
+  // per-dialog jobs that belong to the batch pipeline.
+  dialogDiscoveryOnly: z.boolean().optional(),
 });
 
 const leaseMutationSchema = z.object({
@@ -109,6 +114,7 @@ router.post("/claim", async (req, res, next) => {
       leaseMs: input.leaseMs,
       jobKeys: input.jobKeys,
       excludedCreatorIds: input.excludedCreatorIds,
+      dialogDiscoveryOnly: input.dialogDiscoveryOnly === true,
     });
     return res.json({ ok: true, ...claimed });
   } catch (error) {

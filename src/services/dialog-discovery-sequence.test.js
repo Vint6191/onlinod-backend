@@ -12,6 +12,8 @@ const {
   completeDialogIntelligenceJob,
   recordDialogIntelligenceFailure,
   autoRecoverDialogHistoryTx,
+  finalizeCommittedDialogDiscoveryTx,
+  repairRegressedDialogDiscoveryTx,
 } = require("./dialog-intelligence-service");
 
 function createDb() {
@@ -58,8 +60,22 @@ function createDb() {
     dialogReconciliationTarget: { upsert: async () => { throw new Error("not used"); } },
     dialogScanChunkCommit: {
       findUnique: async ({ where }) => commits.get(`${where.runId_chunkKey.runId}:${where.runId_chunkKey.chunkKey}`) || null,
+      findFirst: async ({ where }) => [...commits.values()]
+        .filter((row) => {
+          if (where.runId && row.runId !== where.runId) return false;
+          if (where.mode && row.mode !== where.mode) return false;
+          if (where.hasMore !== undefined && row.hasMore !== where.hasMore) return false;
+          return true;
+        })
+        .sort((a, b) => Number(b.committedAt || 0) - Number(a.committedAt || 0))[0] || null,
+      findMany: async ({ where }) => [...commits.values()].filter((row) => {
+        if (where.runId && row.runId !== where.runId) return false;
+        if (where.mode && row.mode !== where.mode) return false;
+        if (where.hasMore !== undefined && row.hasMore !== where.hasMore) return false;
+        return true;
+      }),
       create: async ({ data }) => {
-        const row = { id: `commit-${++commitSeq}`, ...data };
+        const row = { id: `commit-${++commitSeq}`, committedAt: new Date(), ...data };
         commits.set(`${data.runId}:${data.chunkKey}`, row);
         return row;
       },
@@ -490,6 +506,107 @@ test("status recovery retires an orphaned legacy attempt and leaves the dialog c
   assert.equal(recovery.reason, "history_batch_ready");
   assert.equal(recovery.cleanedLegacyRuns, 1);
   assert.equal([...db._jobs.values()].filter((row) => row.id !== "discovery-job").length, 0);
+});
+
+
+
+test("a committed hasMore=false discovery boundary finalizes a stranded scheduled job", async () => {
+  resetDb();
+  const { job, run } = seedDiscovery(101, "incremental");
+  job.status = "SCHEDULED";
+  job.leaseUntil = null;
+  run.status = "QUEUED";
+
+  await applyDialogIntelligenceChunk({
+    db, job, deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page", runId: run.id, chunkKey: "terminal-daily",
+      page: 0, pageStart: 0, pageEnd: 1, pagesInBatch: 1, childMode: "incremental", hasMore: false,
+      cursorIn: "0", cursorOut: "1",
+      continuation: { mode: "discovery", page: 1, offset: 1, dialogsFound: 1 },
+      progress: { pages: 1, dialogsFound: 1, hasMore: false, nextOffset: 1 },
+      dialogs: [{ dialogId: "dialog-new", fanId: "fan-new", latestMessageId: "m-1", latestMessageAt: "2026-07-22T00:00:00.000Z" }],
+    },
+  });
+
+  // Reproduce the production gap: the final page is durable, but the separate
+  // Desktop completion request never changed the run/job terminal states.
+  run.status = "QUEUED";
+  db._states.get("creator-1:__dialog_discovery__").status = "QUEUED";
+  const result = await finalizeCommittedDialogDiscoveryTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1", now: new Date("2026-07-22T01:00:00.000Z"),
+  });
+
+  assert.equal(result.finalized, true);
+  assert.equal(job.status, "DONE");
+  assert.equal(run.status, "COMPLETED");
+  assert.equal(run.progress.hasMore, false);
+  assert.equal(db._states.get("creator-1:__dialog_discovery__").status, "READY");
+  assert.equal(db._states.get("creator-1:dialog-new").status, "PLANNED");
+});
+
+test("a legacy commit with default hasMore=false but no explicit terminal result is ignored", async () => {
+  resetDb();
+  const { job, run } = seedDiscovery(104, "incremental");
+  job.status = "SCHEDULED";
+  run.status = "QUEUED";
+  db._commits.set(`${run.id}:legacy-default-false`, {
+    id: "legacy-default-false", runId: run.id, chunkKey: "legacy-default-false", mode: "discovery",
+    hasMore: false, result: {}, committedAt: new Date(),
+  });
+
+  const result = await finalizeCommittedDialogDiscoveryTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1", now: new Date("2026-07-22T01:00:00.000Z"),
+  });
+  assert.equal(result.finalized, false);
+  assert.equal(result.reason, "terminal_boundary_not_committed");
+  assert.equal(job.status, "SCHEDULED");
+  assert.equal(run.status, "QUEUED");
+});
+
+test("terminal discovery recovery never steals a live claimed lease", async () => {
+  resetDb();
+  const { job, run } = seedDiscovery(102, "incremental");
+  job.status = "CLAIMED";
+  job.leaseUntil = new Date("2026-07-22T02:00:00.000Z");
+  await applyDialogIntelligenceChunk({
+    db, job, deviceId: "device-1",
+    chunkResult: {
+      kind: "dialog_discovery_page", runId: run.id, chunkKey: "terminal-live",
+      page: 0, pageStart: 0, pageEnd: 1, pagesInBatch: 1, childMode: "incremental", hasMore: false,
+      cursorIn: "0", cursorOut: "1", continuation: { mode: "discovery", page: 1, offset: 1, dialogsFound: 0 },
+      progress: { pages: 1, dialogsFound: 0, hasMore: false, nextOffset: 1 }, dialogs: [],
+    },
+  });
+  run.status = "RUNNING";
+
+  const result = await finalizeCommittedDialogDiscoveryTx(db, {
+    agencyId: "agency-1", creatorId: "creator-1", now: new Date("2026-07-22T01:00:00.000Z"),
+  });
+  assert.equal(result.finalized, false);
+  assert.equal(result.reason, "live_worker_finishing");
+  assert.equal(job.status, "CLAIMED");
+  assert.equal(run.status, "RUNNING");
+});
+
+test("cursor regression repair ignores a committed terminal discovery page", async () => {
+  resetDb();
+  const { job, run } = seedDiscovery(103, "incremental");
+  job.status = "SCHEDULED";
+  job.continuation = { driverPhase: "complete", result: { hasMore: false } };
+  job.progress = { pages: 1, dialogsFound: 16021, hasMore: false, nextOffset: 0 };
+  run.status = "QUEUED";
+  run.progress = { pages: 1, dialogsFound: 16021, hasMore: false, nextOffset: 0 };
+  db._commits.set(`${run.id}:terminal-regression`, {
+    id: "commit-terminal-regression", runId: run.id, chunkKey: "terminal-regression", mode: "discovery",
+    hasMore: false, cursorOut: "16021", page: 1, result: { hasMore: false, page: 1 }, committedAt: new Date(),
+  });
+
+  const result = await repairRegressedDialogDiscoveryTx(db, { agencyId: "agency-1", creatorId: "creator-1" });
+  assert.equal(result.repaired, false);
+  assert.equal(result.reason, "terminal_boundary_already_committed");
+  assert.equal(job.status, "SCHEDULED");
+  assert.equal(run.status, "QUEUED");
 });
 
 test("daily discovery keeps an unchanged completed dialog READY without resetting counters", async () => {

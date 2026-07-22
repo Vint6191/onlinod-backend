@@ -13,6 +13,8 @@ const RETRY_BACKOFF_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const JOB_CHUNK_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 30_000 });
 const JOB_COMPLETION_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
+const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
+const DIALOG_DISCOVERY_DIALOG_ID = "__dialog_discovery__";
 
 class JobLeaseError extends Error {
   constructor(code, message, status = 409) {
@@ -56,6 +58,34 @@ function leaseDuration(value) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return DEFAULT_LEASE_MS;
   return Math.max(MIN_LEASE_MS, Math.min(MAX_LEASE_MS, Math.floor(parsed)));
+}
+
+function dialogDiscoveryClaimConstraint(enabled) {
+  if (enabled !== true) return null;
+  return {
+    OR: [
+      // Every non-dialog job requested by this worker remains claimable.
+      { jobKey: { not: DIALOG_INTELLIGENCE_JOB_KEY } },
+      // The shared dialog job key is claimable only for creator-wide discovery.
+      // Per-dialog history is owned exclusively by DialogHistoryBatchRunner.
+      {
+        jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
+        params: { path: ["dialogId"], equals: DIALOG_DISCOVERY_DIALOG_ID },
+      },
+    ],
+  };
+}
+
+function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly }) {
+  const discoveryConstraint = dialogDiscoveryClaimConstraint(dialogDiscoveryOnly);
+  return {
+    status: "SCHEDULED",
+    nextRunAt: { lte: now },
+    attempts: { lt: MAX_ATTEMPTS },
+    jobKey: { in: allowedJobKeys },
+    creatorId: { in: eligibleCreatorIds },
+    ...(discoveryConstraint ? { AND: [discoveryConstraint] } : {}),
+  };
 }
 function safeProgress(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -212,7 +242,7 @@ async function sweepExpiredLeases(now = new Date()) {
   });
   return terminal.count + retry.count;
 }
-async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds = [] }) {
+async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds = [], dialogDiscoveryOnly = false }) {
   const device = await requireOwnedDevice({ userId, deviceId });
   await sweepExpiredLeases();
   if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60 * 1000)) return { job: null, reason: "device-stale" };
@@ -235,11 +265,14 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   const eligibleCreatorIds = creatorIds.filter((creatorId) => !explicitlyExcluded.has(creatorId));
   if (!eligibleCreatorIds.length) return { job: null, reason: "creators-busy" };
   for (let race = 0; race < 5; race += 1) {
+    const candidateWhere = claimCandidateWhere({
+      allowedJobKeys,
+      eligibleCreatorIds,
+      now,
+      dialogDiscoveryOnly,
+    });
     const candidate = await prisma.jobInstance.findFirst({
-      where: {
-        status: "SCHEDULED", nextRunAt: { lte: now }, attempts: { lt: MAX_ATTEMPTS }, jobKey: { in: allowedJobKeys },
-        creatorId: { in: eligibleCreatorIds },
-      },
+      where: candidateWhere,
       orderBy: [{ priority: "desc" }, { nextRunAt: "asc" }],
     });
     if (!candidate) return { job: null, reason: "no-work" };
@@ -248,11 +281,12 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     const updated = await prisma.jobInstance.updateMany({
       where: {
         id: candidate.id,
-        status: "SCHEDULED",
-        nextRunAt: { lte: now },
-        attempts: { lt: MAX_ATTEMPTS },
-        jobKey: { in: allowedJobKeys },
-        creatorId: { in: eligibleCreatorIds },
+        ...claimCandidateWhere({
+          allowedJobKeys,
+          eligibleCreatorIds,
+          now,
+          dialogDiscoveryOnly,
+        }),
       },
       data: {
         status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,
@@ -542,4 +576,16 @@ async function releaseJob({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before release");
   return { id: job.id, status: "SCHEDULED", retryAt: new Date(now.getTime() + delay), attempts: job.attempts };
 }
-module.exports = { JobLeaseError, claimJob, renewLease, progressJob, completeJob, failJob, releaseJob, sweepExpiredLeases, normalizeLeaseContinuation };
+module.exports = {
+  JobLeaseError,
+  claimJob,
+  renewLease,
+  progressJob,
+  completeJob,
+  failJob,
+  releaseJob,
+  sweepExpiredLeases,
+  normalizeLeaseContinuation,
+  dialogDiscoveryClaimConstraint,
+  claimCandidateWhere,
+};
