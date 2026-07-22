@@ -81,6 +81,71 @@ async function requireCreator(db, agencyId, creatorId) {
   return creator;
 }
 
+const TERMINAL_DIALOG_FAILURE_MARKERS = [
+  "DIALOG_UNAVAILABLE",
+  "DIALOG_BATCH_ITEM_ID_MISSING",
+  "DIALOG_EMPTY",
+  "DIALOG_EMPTY_RESPONSE_UNCONFIRMED",
+  "DIALOG_NOT_FOUND",
+  "DIALOG_TARGET_NOT_FOUND",
+  "USER_NOT_FOUND",
+  "HTTP 403",
+  "HTTP 404",
+  "HTTP 410",
+  "geo block",
+  "geoblock",
+  "region-restricted",
+  "region restricted",
+  "user deleted",
+  "user is deleted",
+  "user blocked",
+  "user is blocked",
+  "dialog not found",
+  "chat not found",
+  "target not found",
+  "no longer available",
+];
+
+function isTerminalDialogFailureText(value) {
+  const text = clean(value, 2_000).toLowerCase();
+  if (!text) return false;
+  return TERMINAL_DIALOG_FAILURE_MARKERS.some((marker) => text.includes(marker.toLowerCase()));
+}
+
+async function resolveLegacyTerminalDialogFailures(db, agencyId, creatorId) {
+  if (typeof db?.dialogScanState?.findMany !== "function" || typeof db?.dialogScanState?.updateMany !== "function") {
+    return 0;
+  }
+  const failedRows = await db.dialogScanState.findMany({
+    where: {
+      agencyId,
+      creatorId,
+      status: "FAILED",
+      activeRunId: null,
+      activeJobId: null,
+    },
+    select: { dialogId: true, lastError: true },
+    take: 10_000,
+  });
+  const dialogIds = failedRows
+    .filter((row) => isTerminalDialogFailureText(row.lastError))
+    .map((row) => clean(row.dialogId, 180))
+    .filter(Boolean);
+  if (!dialogIds.length) return 0;
+  const result = await db.dialogScanState.updateMany({
+    where: {
+      agencyId,
+      creatorId,
+      dialogId: { in: dialogIds },
+      status: "FAILED",
+      activeRunId: null,
+      activeJobId: null,
+    },
+    data: { status: "UNAVAILABLE" },
+  });
+  return number(result?.count);
+}
+
 async function dialogPipelineState(db, agencyId, creatorId) {
   const [states, discoveryRuns, activeRuns, activeJobs, latestRun] = await Promise.all([
     db.dialogScanState.findMany({
@@ -740,6 +805,7 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   // polling revives the preserved durable checkpoint automatically; operators
   // never need to restart or rebuild thousands of already discovered dialogs.
   try {
+    await resolveLegacyTerminalDialogFailures(db, agencyId, creatorId);
     await repairRegressedDialogDiscoveryTx(db, { agencyId, creatorId });
     await autoRecoverDialogDiscoveryTx(db, {
       agencyId,

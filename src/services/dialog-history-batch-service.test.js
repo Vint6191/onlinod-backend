@@ -466,6 +466,34 @@ test("one completion report closes the whole batch and is idempotent", async () 
   assert.equal(db._states.get("dialog-01").messagesProcessed, 120);
 });
 
+test("terminal phantom dialog results are resolved as unavailable instead of failing the creator scan", async () => {
+  const db = createDb();
+  seedPlanned(db, 1);
+  seedCompletedDiscovery(db);
+  const claim = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 1,
+  });
+
+  const completed = await completeDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    batchId: claim.batch.id,
+    leaseToken: claim.batch.leaseToken,
+    results: [{
+      dialogId: "dialog-01",
+      ok: false,
+      retryable: false,
+      code: "DIALOG_BATCH_ITEM_ID_MISSING",
+      error: "Historical dialog no longer has an addressable target",
+    }],
+  });
+
+  assert.equal(completed.failed, 0);
+  assert.equal(completed.unavailable, 1);
+  assert.equal(db._states.get("dialog-01").status, "UNAVAILABLE");
+  assert.equal(db._runs.get(claim.batch.id).lastError, null);
+});
+
 test("expired or explicitly released batches return their dialogs to PLANNED", async () => {
   const db = createDb();
   seedPlanned(db, 4);

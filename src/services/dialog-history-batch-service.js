@@ -52,6 +52,39 @@ function effectiveDialogMode(state, fallback = "initial") {
     ? "incremental"
     : clean(fallback, 40)?.toLowerCase() === "incremental" ? "incremental" : "initial";
 }
+const TERMINAL_DIALOG_ABSENCE_CODES = new Set([
+  "DIALOG_BATCH_ITEM_ID_MISSING",
+  "DIALOG_EMPTY",
+  "DIALOG_EMPTY_RESPONSE_UNCONFIRMED",
+  "DIALOG_NOT_FOUND",
+  "DIALOG_TARGET_NOT_FOUND",
+  "USER_NOT_FOUND",
+]);
+
+function isTerminalDialogAbsence(value) {
+  const source = object(value);
+  const code = clean(source.code, 120)?.toUpperCase() || "";
+  const status = source.status == null ? null : integer(source.status, 0, 0, 599);
+  const detail = `${code} ${clean(source.error, 2_000) || ""}`.toLowerCase();
+  if (source.unavailable === true || /^DIALOG_UNAVAILABLE(?:_|$)/.test(code)) return true;
+  if ([403, 404, 410].includes(status)) return true;
+  if (TERMINAL_DIALOG_ABSENCE_CODES.has(code)) return true;
+  return [
+    "geo block",
+    "geoblock",
+    "region-restricted",
+    "region restricted",
+    "user deleted",
+    "user is deleted",
+    "user blocked",
+    "user is blocked",
+    "dialog not found",
+    "chat not found",
+    "target not found",
+    "no longer available",
+  ].some((marker) => detail.includes(marker));
+}
+
 function compactResult(raw) {
   const value = object(raw);
   return {
@@ -65,7 +98,7 @@ function compactResult(raw) {
     error: clean(value.error, 2_000),
     code: clean(value.code, 120),
     status: value.status == null ? null : integer(value.status, 0, 0, 599),
-    unavailable: value.unavailable === true || clean(value.code, 120) === "DIALOG_UNAVAILABLE",
+    unavailable: isTerminalDialogAbsence(value),
     reusedLocal: value.reusedLocal === true,
   };
 }

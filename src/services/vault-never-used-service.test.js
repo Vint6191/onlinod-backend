@@ -105,7 +105,26 @@ function dbFixture({
       },
     },
     dialogScanState: {
-      async findMany() { return dialogStates; },
+      async findMany(args = {}) {
+        let rows = dialogStates;
+        if (args.where?.status) rows = rows.filter((row) => row.status === args.where.status);
+        if (args.where?.activeRunId === null) rows = rows.filter((row) => row.activeRunId == null);
+        if (args.where?.activeJobId === null) rows = rows.filter((row) => row.activeJobId == null);
+        return rows;
+      },
+      async updateMany(args = {}) {
+        const ids = new Set(args.where?.dialogId?.in || []);
+        let count = 0;
+        for (const row of dialogStates) {
+          if (args.where?.status && row.status !== args.where.status) continue;
+          if (args.where?.activeRunId === null && row.activeRunId != null) continue;
+          if (args.where?.activeJobId === null && row.activeJobId != null) continue;
+          if (ids.size && !ids.has(row.dialogId)) continue;
+          Object.assign(row, args.data || {});
+          count += 1;
+        }
+        return { count };
+      },
     },
     dialogScanRun: {
       async findMany(args) {
@@ -178,6 +197,36 @@ test("inaccessible dialogs drain the queue and do not block the projection", asy
   assert.equal(result.pipeline.dialogs.queue.unavailable, 1);
   assert.equal(result.pipeline.provisionalReason, null);
   assert.equal(result.pipeline.projection.complete, true);
+});
+
+test("legacy terminal phantom failures are normalized to unavailable and finish successfully", async () => {
+  const dialogStates = [
+    {
+      dialogId: "dialog-ready", scanMode: "initial", initialScanComplete: true, status: "READY",
+      activeRunId: null, activeJobId: null, pagesProcessed: 2, messagesProcessed: 50,
+      lastError: null, lastFullScanAt: date(), lastIncrementalScanAt: null, updatedAt: date(),
+    },
+    {
+      dialogId: "dialog-phantom", scanMode: "initial", initialScanComplete: false, status: "FAILED",
+      activeRunId: null, activeJobId: null, pagesProcessed: 0, messagesProcessed: 0,
+      lastError: "DIALOG_BATCH_ITEM_ID_MISSING: historical target not found",
+      lastFullScanAt: null, lastIncrementalScanAt: null, updatedAt: date(),
+    },
+  ];
+  const db = dbFixture({ complete: true, dialogStates });
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db,
+    now: date(60_000),
+  });
+
+  assert.equal(dialogStates[1].status, "UNAVAILABLE");
+  assert.equal(result.pipeline.stage, "UP_TO_DATE");
+  assert.equal(result.pipeline.authoritative, true);
+  assert.equal(result.pipeline.dialogs.failed, 0);
+  assert.equal(result.pipeline.dialogs.unavailable, 1);
+  assert.equal(result.pipeline.dialogs.pending, 0);
 });
 
 test("both SORTED and UNSORTED Messages items are creator candidates; membership is not usage", async () => {
