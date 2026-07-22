@@ -3,6 +3,7 @@
 const { createHash, randomBytes } = require("node:crypto");
 const prisma = require("../prisma");
 const { repairStrandedDialogHistoryStatesTx, dialogHistoryControl } = require("./dialog-intelligence-service");
+const { isTerminalDialogOutcome } = require("./dialog-terminal-outcome");
 
 const DIALOG_HISTORY_BATCH_DIALOG_ID = "__dialog_history_batch__";
 const ACTIVE_BATCH_STATUSES = ["QUEUED", "RUNNING"];
@@ -52,42 +53,8 @@ function effectiveDialogMode(state, fallback = "initial") {
     ? "incremental"
     : clean(fallback, 40)?.toLowerCase() === "incremental" ? "incremental" : "initial";
 }
-const TERMINAL_DIALOG_ABSENCE_CODES = new Set([
-  "DIALOG_BATCH_ITEM_ID_MISSING",
-  "DIALOG_EMPTY",
-  "DIALOG_EMPTY_RESPONSE_UNCONFIRMED",
-  "DIALOG_NOT_FOUND",
-  "DIALOG_TARGET_NOT_FOUND",
-  "USER_NOT_FOUND",
-]);
-
 function isTerminalDialogAbsence(value) {
-  const source = object(value);
-  const code = clean(source.code, 120)?.toUpperCase() || "";
-  const status = source.status == null ? null : integer(source.status, 0, 0, 599);
-  const detail = `${code} ${clean(source.error, 2_000) || ""}`.toLowerCase();
-  if (source.unavailable === true || /^DIALOG_UNAVAILABLE(?:_|$)/.test(code)) return true;
-  if ([403, 404, 410].includes(status)) return true;
-  if (TERMINAL_DIALOG_ABSENCE_CODES.has(code)) return true;
-  // Older Desktop builds sometimes placed a terminal machine code in the
-  // human-readable error field instead of result.code. Treat those tokens as
-  // structured terminal outcomes too, otherwise a phantom dialog becomes a
-  // permanent FAILED row even though the worker correctly stopped retrying it.
-  if ([...TERMINAL_DIALOG_ABSENCE_CODES].some((marker) => detail.includes(marker.toLowerCase()))) return true;
-  return [
-    "geo block",
-    "geoblock",
-    "region-restricted",
-    "region restricted",
-    "user deleted",
-    "user is deleted",
-    "user blocked",
-    "user is blocked",
-    "dialog not found",
-    "chat not found",
-    "target not found",
-    "no longer available",
-  ].some((marker) => detail.includes(marker));
+  return isTerminalDialogOutcome(value);
 }
 
 function compactResult(raw) {

@@ -9,6 +9,7 @@ const {
   repairRegressedDialogDiscoveryTx,
 } = require("./dialog-intelligence-service");
 const { DIALOG_HISTORY_BATCH_DIALOG_ID } = require("./dialog-history-batch-service");
+const { isTerminalDialogText } = require("./dialog-terminal-outcome");
 
 const PROJECTION_CHUNK_SIZE = 5000;
 const LIST_SCAN_CHUNK_SIZE = 500;
@@ -81,35 +82,8 @@ async function requireCreator(db, agencyId, creatorId) {
   return creator;
 }
 
-const TERMINAL_DIALOG_FAILURE_MARKERS = [
-  "DIALOG_UNAVAILABLE",
-  "DIALOG_BATCH_ITEM_ID_MISSING",
-  "DIALOG_EMPTY",
-  "DIALOG_EMPTY_RESPONSE_UNCONFIRMED",
-  "DIALOG_NOT_FOUND",
-  "DIALOG_TARGET_NOT_FOUND",
-  "USER_NOT_FOUND",
-  "HTTP 403",
-  "HTTP 404",
-  "HTTP 410",
-  "geo block",
-  "geoblock",
-  "region-restricted",
-  "region restricted",
-  "user deleted",
-  "user is deleted",
-  "user blocked",
-  "user is blocked",
-  "dialog not found",
-  "chat not found",
-  "target not found",
-  "no longer available",
-];
-
 function isTerminalDialogFailureText(value) {
-  const text = clean(value, 2_000).toLowerCase();
-  if (!text) return false;
-  return TERMINAL_DIALOG_FAILURE_MARKERS.some((marker) => text.includes(marker.toLowerCase()));
+  return isTerminalDialogText(value);
 }
 
 async function resolveLegacyTerminalDialogFailures(db, agencyId, creatorId) {
