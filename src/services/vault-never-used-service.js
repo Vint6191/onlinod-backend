@@ -121,8 +121,6 @@ async function resolveLegacyTerminalDialogFailures(db, agencyId, creatorId) {
       agencyId,
       creatorId,
       status: "FAILED",
-      activeRunId: null,
-      activeJobId: null,
     },
     select: { dialogId: true, lastError: true },
     take: 10_000,
@@ -138,10 +136,15 @@ async function resolveLegacyTerminalDialogFailures(db, agencyId, creatorId) {
       creatorId,
       dialogId: { in: dialogIds },
       status: "FAILED",
+    },
+    data: {
+      status: "UNAVAILABLE",
+      // FAILED is terminal, so any ownership pointer left behind is stale.
+      // Clear it while repairing the row; otherwise claim/pause/projection can
+      // disagree forever about who owns this dialog.
       activeRunId: null,
       activeJobId: null,
     },
-    data: { status: "UNAVAILABLE" },
   });
   return number(result?.count);
 }

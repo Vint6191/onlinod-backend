@@ -69,6 +69,11 @@ function isTerminalDialogAbsence(value) {
   if (source.unavailable === true || /^DIALOG_UNAVAILABLE(?:_|$)/.test(code)) return true;
   if ([403, 404, 410].includes(status)) return true;
   if (TERMINAL_DIALOG_ABSENCE_CODES.has(code)) return true;
+  // Older Desktop builds sometimes placed a terminal machine code in the
+  // human-readable error field instead of result.code. Treat those tokens as
+  // structured terminal outcomes too, otherwise a phantom dialog becomes a
+  // permanent FAILED row even though the worker correctly stopped retrying it.
+  if ([...TERMINAL_DIALOG_ABSENCE_CODES].some((marker) => detail.includes(marker.toLowerCase()))) return true;
   return [
     "geo block",
     "geoblock",

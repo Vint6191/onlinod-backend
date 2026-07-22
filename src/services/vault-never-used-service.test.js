@@ -229,6 +229,38 @@ test("legacy terminal phantom failures are normalized to unavailable and finish 
   assert.equal(result.pipeline.dialogs.pending, 0);
 });
 
+
+test("legacy terminal phantom failure is repaired even with stale ownership pointers", async () => {
+  const dialogStates = [
+    {
+      dialogId: "dialog-ready", scanMode: "initial", initialScanComplete: true, status: "READY",
+      activeRunId: null, activeJobId: null, pagesProcessed: 2, messagesProcessed: 50,
+      lastError: null, lastFullScanAt: date(), lastIncrementalScanAt: null, updatedAt: date(),
+    },
+    {
+      dialogId: "dialog-phantom", scanMode: "initial", initialScanComplete: false, status: "FAILED",
+      activeRunId: "stale-batch", activeJobId: "stale-job", pagesProcessed: 0, messagesProcessed: 0,
+      lastError: "DIALOG_BATCH_ITEM_ID_MISSING",
+      lastFullScanAt: null, lastIncrementalScanAt: null, updatedAt: date(),
+    },
+  ];
+  const db = dbFixture({ complete: true, dialogStates });
+  const result = await getNeverUsedPipelineState({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    db,
+    now: date(60_000),
+  });
+
+  assert.equal(dialogStates[1].status, "UNAVAILABLE");
+  assert.equal(dialogStates[1].activeRunId, null);
+  assert.equal(dialogStates[1].activeJobId, null);
+  assert.equal(result.pipeline.stage, "UP_TO_DATE");
+  assert.equal(result.pipeline.authoritative, true);
+  assert.equal(result.pipeline.dialogs.failed, 0);
+  assert.equal(result.pipeline.dialogs.unavailable, 1);
+});
+
 test("both SORTED and UNSORTED Messages items are creator candidates; membership is not usage", async () => {
   const result = await projectionCounts(dbFixture({ complete: true }), "agency-1", "creator-1");
   assert.equal(result.catalogMedia, 3);
