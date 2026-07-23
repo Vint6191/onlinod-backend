@@ -50,6 +50,14 @@ function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
 
+
+const tolerantNullableDatetimeSchema = z.preprocess((value) => {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const date = value instanceof Date ? value : new Date(String(value));
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}, z.string().datetime().optional().nullable());
+
 async function latestDiscoveryPlanTx(tx, agencyId, creatorId) {
   return tx.dialogScanRun.findFirst({
     where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
@@ -586,7 +594,7 @@ const dialogBatchCompleteSchema = dialogBatchLeaseSchema.extend({
     skippedHistory: z.number().int().min(0).max(100000000).optional(),
     localMessageCount: z.number().int().min(0).max(100000000).optional(),
     newestMessageId: z.string().max(240).optional().nullable(),
-    newestMessageAt: z.string().datetime().optional().nullable(),
+    newestMessageAt: tolerantNullableDatetimeSchema,
     error: z.string().max(2000).optional().nullable(),
     code: z.string().max(120).optional().nullable(),
     status: z.number().int().min(0).max(599).optional().nullable(),
@@ -600,7 +608,7 @@ const dialogLocalCountReconcileSchema = z.object({
     dialogId: z.string().min(1).max(180),
     messages: z.number().int().min(0).max(100000000),
     newestMessageId: z.string().max(240).optional().nullable(),
-    newestMessageAt: z.string().datetime().optional().nullable(),
+    newestMessageAt: tolerantNullableDatetimeSchema,
   })).min(1).max(500),
 });
 
