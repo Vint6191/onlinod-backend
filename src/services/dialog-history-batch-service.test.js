@@ -11,6 +11,7 @@ const {
   claimDialogHistoryBatchTx,
   progressDialogHistoryBatchTx,
   completeDialogHistoryBatchTx,
+  reconcileDialogLocalCountsTx,
   releaseDialogHistoryBatchTx,
   recoverExpiredDialogHistoryBatchesTx,
   normalizeOrphanedDialogHistoryBatchesTx,
@@ -521,6 +522,102 @@ test("one completion report closes the whole batch and is idempotent", async () 
   assert.equal(replay.completed, 1);
   assert.equal(replay.unavailable, 1);
   assert.equal(db._states.get("dialog-01").messagesProcessed, 120);
+});
+
+test("new desktop completion reconciles the durable message counter to local SQLite", async () => {
+  const db = createDb();
+  seedPlanned(db, 1);
+  seedCompletedDiscovery(db);
+  const state = db._states.get("dialog-01");
+  state.scanMode = "incremental";
+  state.initialScanComplete = true;
+  state.messagesProcessed = 2_000;
+
+  const claim = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 1,
+  });
+  const completed = await completeDialogHistoryBatchTx(db, {
+    agencyId: "agency-1",
+    deviceId: "device-a",
+    batchId: claim.batch.id,
+    leaseToken: claim.batch.leaseToken,
+    results: [{
+      dialogId: "dialog-01",
+      ok: true,
+      pages: 1,
+      messages: 10,
+      received: 11,
+      inserted: 10,
+      updated: 0,
+      duplicates: 1,
+      skippedHistory: 39,
+      localMessageCount: 120,
+      newestMessageId: "message-120",
+      newestMessageAt: "2026-07-23T12:00:00.000Z",
+    }],
+  });
+
+  assert.equal(completed.messages, 10);
+  assert.equal(completed.received, 11);
+  assert.equal(completed.duplicates, 1);
+  assert.equal(db._states.get("dialog-01").messagesProcessed, 120);
+  assert.equal(db._runs.get(claim.batch.id).messagesProcessed, 10);
+  assert.equal(db._states.get("dialog-01").confirmedWatermarkMessageId, "message-120");
+});
+
+test("local count reconciliation updates absolute counters without an OF scan", async () => {
+  let rawCall = null;
+  const tx = {
+    creatorAccount: {
+      async findMany() { return [{ id: "creator-1" }]; },
+    },
+    async $executeRawUnsafe(...args) {
+      rawCall = args;
+      return 2;
+    },
+  };
+
+  const result = await reconcileDialogLocalCountsTx(tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    entries: [
+      {
+        dialogId: "dialog-01",
+        messages: 120,
+        newestMessageId: "message-120",
+        newestMessageAt: "2026-07-23T11:00:00.000Z",
+      },
+      {
+        dialogId: "dialog-02",
+        messages: 45,
+        newestMessageId: "message-45",
+        newestMessageAt: "2026-07-23T10:00:00.000Z",
+      },
+      {
+        dialogId: "dialog-01",
+        messages: 121,
+        newestMessageId: "message-121",
+        newestMessageAt: "2026-07-23T12:00:00.000Z",
+      },
+    ],
+  });
+
+  assert.equal(result.received, 2);
+  assert.equal(result.updated, 2);
+  assert.match(rawCall[0], /UPDATE "DialogScanState"/);
+  assert.match(rawCall[0], /local_count\.newest_message_at > state\."newestMessageAt"/);
+  assert.deepEqual(rawCall.slice(1), [
+    "agency-1",
+    "creator-1",
+    "dialog-01",
+    121,
+    "message-121",
+    new Date("2026-07-23T12:00:00.000Z"),
+    "dialog-02",
+    45,
+    "message-45",
+    new Date("2026-07-23T10:00:00.000Z"),
+  ]);
 });
 
 test("terminal phantom dialog results are resolved as unavailable instead of failing the creator scan", async () => {

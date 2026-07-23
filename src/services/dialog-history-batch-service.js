@@ -69,8 +69,14 @@ function compactResult(raw) {
     retryable: value.retryable !== false,
     pages: integer(value.pages, 0, 0, 100_000),
     messages: integer(value.messages, 0, 0, 100_000_000),
+    received: integer(value.received, 0, 0, 100_000_000),
     inserted: integer(value.inserted, 0, 0, 100_000_000),
     updated: integer(value.updated, 0, 0, 100_000_000),
+    duplicates: integer(value.duplicates, 0, 0, 100_000_000),
+    skippedHistory: integer(value.skippedHistory, 0, 0, 100_000_000),
+    localMessageCount: value.localMessageCount == null
+      ? null
+      : integer(value.localMessageCount, 0, 0, 100_000_000),
     newestMessageId: clean(value.newestMessageId, 240),
     newestMessageAt: dateOrNull(value.newestMessageAt),
     error: clean(value.error, 2_000),
@@ -86,6 +92,9 @@ function compactBatchProgress(raw, previous = {}) {
   const total = integer(value.total ?? before.total, 0, 0, 100);
   const current = integer(value.current ?? before.current, 0, 0, total || 100);
   const stage = clean(value.stage, 40) || clean(before.stage, 40) || "scanning";
+  const messages = integer(value.messages ?? before.messages, 0, 0, 100_000_000);
+  const receivedSource = value.received ?? before.received;
+  const insertedSource = value.inserted ?? before.inserted;
   return {
     current,
     total,
@@ -96,9 +105,14 @@ function compactBatchProgress(raw, previous = {}) {
     dialogId: clean(value.dialogId, 180),
     fanId: clean(value.fanId, 180),
     stage,
-    pages: integer(value.pages, 0, 0, 100_000),
-    messages: integer(value.messages, 0, 0, 100_000_000),
-    media: integer(value.media, 0, 0, 100_000_000),
+    pages: integer(value.pages ?? before.pages, 0, 0, 100_000),
+    messages,
+    received: receivedSource == null ? messages : integer(receivedSource, 0, 0, 100_000_000),
+    inserted: insertedSource == null ? messages : integer(insertedSource, 0, 0, 100_000_000),
+    updated: integer(value.updated ?? before.updated, 0, 0, 100_000_000),
+    duplicates: integer(value.duplicates ?? before.duplicates, 0, 0, 100_000_000),
+    skippedHistory: integer(value.skippedHistory ?? before.skippedHistory, 0, 0, 100_000_000),
+    media: integer(value.media ?? before.media, 0, 0, 100_000_000),
     lastError: clean(value.lastError, 2_000),
     message: clean(value.message, 500) || `Dialog batch ${stage} · ${current}/${total}`,
     updatedAt: new Date().toISOString(),
@@ -725,8 +739,11 @@ async function completeDialogHistoryBatchTx(tx, input) {
     let unavailable = 0;
     let pages = 0;
     let messages = 0;
+    let received = 0;
     let inserted = 0;
     let updated = 0;
+    let duplicates = 0;
+    let skippedHistory = 0;
 
     for (const dialogId of claimedDialogs) {
       const result = results.get(dialogId) || {
@@ -735,14 +752,21 @@ async function completeDialogHistoryBatchTx(tx, input) {
         retryable: true,
         pages: 0,
         messages: 0,
+        received: 0,
         inserted: 0,
         updated: 0,
+        duplicates: 0,
+        skippedHistory: 0,
+        localMessageCount: null,
         error: "DIALOG_BATCH_RESULT_MISSING",
       };
       pages += result.pages;
       messages += result.messages;
+      received += result.received;
       inserted += result.inserted;
       updated += result.updated;
+      duplicates += result.duplicates;
+      skippedHistory += result.skippedHistory;
       if (result.ok) {
         completed += 1;
         const itemMode = claimedModeByDialogId.get(dialogId)
@@ -755,7 +779,12 @@ async function completeDialogHistoryBatchTx(tx, input) {
               ? { initialScanComplete: true, lastFullScanAt: now }
               : { lastIncrementalScanAt: now }),
             pagesProcessed: { increment: result.pages },
-            messagesProcessed: { increment: result.messages },
+            // New desktop builds report the authoritative local SQLite count.
+            // Keep the increment fallback only for rolling-deploy compatibility
+            // with an older client that does not send localMessageCount yet.
+            messagesProcessed: result.localMessageCount == null
+              ? { increment: result.messages }
+              : result.localMessageCount,
             newestMessageId: result.newestMessageId || undefined,
             newestMessageAt: result.newestMessageAt || undefined,
             confirmedWatermarkMessageId: result.newestMessageId || undefined,
@@ -820,8 +849,11 @@ async function completeDialogHistoryBatchTx(tx, input) {
       unavailable,
       pages,
       messages,
+      received,
       inserted,
       updated,
+      duplicates,
+      skippedHistory,
       completedAt: now.toISOString(),
       localStorage: true,
     };
@@ -839,6 +871,11 @@ async function completeDialogHistoryBatchTx(tx, input) {
           skipped: unavailable,
           pages,
           messages,
+          received,
+          inserted,
+          updated,
+          duplicates,
+          skippedHistory,
           message: `Dialog batch complete · ${completed} completed · ${unavailable} unavailable`,
         },
         pagesProcessed: pages,
@@ -853,6 +890,83 @@ async function completeDialogHistoryBatchTx(tx, input) {
 
 async function completeDialogHistoryBatch(input) {
   return prisma.$transaction((tx) => completeDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+}
+
+async function reconcileDialogLocalCountsTx(tx, input) {
+  const agencyId = clean(input.agencyId, 160);
+  const creatorId = clean(input.creatorId, 160);
+  const allowed = await assertAllowedCreators(tx, agencyId, [creatorId]);
+  if (!creatorId || !allowed.includes(creatorId)) {
+    const error = new Error("Creator is unavailable for local dialog reconciliation");
+    error.code = "CREATOR_NOT_FOUND";
+    error.status = 404;
+    throw error;
+  }
+
+  const counts = new Map();
+  for (const raw of list(input.entries).slice(0, 500)) {
+    const entry = object(raw);
+    const dialogId = clean(entry.dialogId, 180);
+    if (!dialogId) continue;
+    counts.set(dialogId, {
+      dialogId,
+      messages: integer(entry.messages, 0, 0, 100_000_000),
+      newestMessageId: clean(entry.newestMessageId, 240),
+      newestMessageAt: dateOrNull(entry.newestMessageAt),
+    });
+  }
+  const entries = [...counts.values()];
+  if (!entries.length) return { ok: true, creatorId, received: 0, updated: 0 };
+
+  const params = [agencyId, creatorId];
+  const values = entries.map((entry, index) => {
+    const base = 3 + index * 4;
+    params.push(
+      entry.dialogId,
+      entry.messages,
+      entry.newestMessageId,
+      entry.newestMessageAt,
+    );
+    return `($${base}::text, $${base + 1}::integer, $${base + 2}::text, $${base + 3}::timestamptz)`;
+  });
+  const updated = await tx.$executeRawUnsafe(
+    `
+      UPDATE "DialogScanState" AS state
+      SET "messagesProcessed" = local_count.messages,
+          "updatedAt" = NOW()
+      FROM (VALUES ${values.join(", ")})
+        AS local_count(dialog_id, messages, newest_message_id, newest_message_at)
+      WHERE state."agencyId" = $1
+        AND state."creatorId" = $2
+        AND state."dialogId" = local_count.dialog_id
+        AND (
+          state."newestMessageId" IS NULL
+          OR state."newestMessageId" = local_count.newest_message_id
+          OR (
+            local_count.newest_message_at IS NOT NULL
+            AND (
+              state."newestMessageAt" IS NULL
+              OR local_count.newest_message_at > state."newestMessageAt"
+            )
+          )
+        )
+    `,
+    ...params,
+  );
+
+  return {
+    ok: true,
+    creatorId,
+    received: entries.length,
+    updated: integer(updated, 0, 0, entries.length),
+  };
+}
+
+async function reconcileDialogLocalCounts(input) {
+  return prisma.$transaction(
+    (tx) => reconcileDialogLocalCountsTx(tx, input),
+    BATCH_TRANSACTION_OPTIONS,
+  );
 }
 
 async function releaseDialogHistoryBatchTx(tx, input) {
@@ -896,6 +1010,8 @@ module.exports = {
   progressDialogHistoryBatch,
   completeDialogHistoryBatchTx,
   completeDialogHistoryBatch,
+  reconcileDialogLocalCountsTx,
+  reconcileDialogLocalCounts,
   releaseDialogHistoryBatchTx,
   releaseDialogHistoryBatch,
   recoverExpiredDialogHistoryBatchesTx,

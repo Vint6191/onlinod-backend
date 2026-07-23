@@ -22,6 +22,7 @@ const {
   renewDialogHistoryBatch,
   progressDialogHistoryBatch,
   completeDialogHistoryBatch,
+  reconcileDialogLocalCounts,
   releaseDialogHistoryBatch,
 } = require("../services/dialog-history-batch-service");
 
@@ -561,6 +562,11 @@ const dialogBatchProgressSchema = dialogBatchLeaseSchema.extend({
     stage: z.enum(["starting", "scanning", "syncing_usage", "completed", "failed", "stalled", "unavailable"]).optional(),
     pages: z.number().int().min(0).max(100000).optional(),
     messages: z.number().int().min(0).max(100000000).optional(),
+    received: z.number().int().min(0).max(100000000).optional(),
+    inserted: z.number().int().min(0).max(100000000).optional(),
+    updated: z.number().int().min(0).max(100000000).optional(),
+    duplicates: z.number().int().min(0).max(100000000).optional(),
+    skippedHistory: z.number().int().min(0).max(100000000).optional(),
     media: z.number().int().min(0).max(100000000).optional(),
     lastError: z.string().max(2000).optional().nullable(),
     message: z.string().max(500).optional(),
@@ -573,8 +579,14 @@ const dialogBatchCompleteSchema = dialogBatchLeaseSchema.extend({
     retryable: z.boolean().optional(),
     pages: z.number().int().min(0).max(100000).optional(),
     messages: z.number().int().min(0).max(100000000).optional(),
+    received: z.number().int().min(0).max(100000000).optional(),
     inserted: z.number().int().min(0).max(100000000).optional(),
     updated: z.number().int().min(0).max(100000000).optional(),
+    duplicates: z.number().int().min(0).max(100000000).optional(),
+    skippedHistory: z.number().int().min(0).max(100000000).optional(),
+    localMessageCount: z.number().int().min(0).max(100000000).optional(),
+    newestMessageId: z.string().max(240).optional().nullable(),
+    newestMessageAt: z.string().datetime().optional().nullable(),
     error: z.string().max(2000).optional().nullable(),
     code: z.string().max(120).optional().nullable(),
     status: z.number().int().min(0).max(599).optional().nullable(),
@@ -582,6 +594,16 @@ const dialogBatchCompleteSchema = dialogBatchLeaseSchema.extend({
     reusedLocal: z.boolean().optional(),
   })).min(1).max(100),
 });
+const dialogLocalCountReconcileSchema = z.object({
+  deviceId: z.string().min(1).max(200),
+  entries: z.array(z.object({
+    dialogId: z.string().min(1).max(180),
+    messages: z.number().int().min(0).max(100000000),
+    newestMessageId: z.string().max(240).optional().nullable(),
+    newestMessageAt: z.string().datetime().optional().nullable(),
+  })).min(1).max(500),
+});
+
 const dialogBatchReleaseSchema = dialogBatchLeaseSchema.extend({
   reason: z.string().max(2000).optional(),
 });
@@ -645,6 +667,22 @@ router.post("/batches/:batchId/complete", async (req, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "DIALOG_BATCH_COMPLETE_FAILED");
+  }
+});
+
+router.post("/creators/:creatorId/local-counts/reconcile", async (req, res) => {
+  try {
+    const input = dialogLocalCountReconcileSchema.parse(req.body || {});
+    const result = await reconcileDialogLocalCounts({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      deviceId: input.deviceId,
+      entries: input.entries,
+    });
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "DIALOG_LOCAL_COUNT_RECONCILE_FAILED");
   }
 });
 
