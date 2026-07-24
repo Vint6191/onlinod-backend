@@ -421,7 +421,7 @@ async function claimDialogHistoryBatchTx(db, input) {
     creatorIds: allowedCreatorIds,
     leaseMs: input.leaseMs,
   });
-  if (reclaimed) return { ok: true, reason: "reclaimed", batch: reclaimed };
+  if (reclaimed) return { ok: true, reason: "reclaimed", batch: reclaimed, settledCreators: [] };
 
   const blockingRuns = await db.dialogScanRun.findMany({
     where: {
@@ -442,6 +442,7 @@ async function claimDialogHistoryBatchTx(db, input) {
   let first = null;
   let completedDiscovery = null;
   const controlledCreators = new Map();
+  const settledCreators = [];
   for (const candidateCreatorId of allowedCreatorIds) {
     if (blockedCreatorIds.has(candidateCreatorId)) continue;
     const latestDiscovery = await db.dialogScanRun.findFirst({
@@ -464,15 +465,25 @@ async function claimDialogHistoryBatchTx(db, input) {
       },
       orderBy: [{ updatedAt: "asc" }, { dialogId: "asc" }],
     });
-    if (!candidate) continue;
-    first = candidate;
-    completedDiscovery = latestDiscovery;
-    break;
+    if (!candidate) {
+      const settledAt = dateOrNull(latestDiscovery.completedAt || latestDiscovery.updatedAt || latestDiscovery.createdAt);
+      settledCreators.push({
+        creatorId: candidateCreatorId,
+        generation: integer(latestDiscovery.generation, 0),
+        settledAt: settledAt ? settledAt.toISOString() : null,
+      });
+      continue;
+    }
+    if (!first) {
+      first = candidate;
+      completedDiscovery = latestDiscovery;
+    }
   }
   if (!first || !completedDiscovery) {
     return {
       ok: true,
       batch: null,
+      settledCreators,
       reason: blockedCreatorIds.size
         ? "creator_batch_already_active"
         : [...controlledCreators.values()].includes("PAUSED")
@@ -582,6 +593,7 @@ async function claimDialogHistoryBatchTx(db, input) {
   return {
     ok: true,
     reason: "claimed",
+    settledCreators,
     batch: {
       id: updatedRun.id,
       creatorId,
@@ -913,29 +925,96 @@ async function reconcileDialogLocalCountsTx(tx, input) {
       messages: integer(entry.messages, 0, 0, 100_000_000),
       newestMessageId: clean(entry.newestMessageId, 240),
       newestMessageAt: dateOrNull(entry.newestMessageAt),
+      confirmWatermark: entry.confirmWatermark === true,
     });
   }
   const entries = [...counts.values()];
   if (!entries.length) return { ok: true, creatorId, received: 0, updated: 0 };
 
-  const params = [agencyId, creatorId];
+  const source = clean(input.source, 40) === "runtime_ws" ? "runtime_ws" : "startup_reconcile";
+  const params = [agencyId, creatorId, source];
   const values = entries.map((entry, index) => {
-    const base = 3 + index * 4;
+    const base = 4 + index * 5;
     params.push(
       entry.dialogId,
       entry.messages,
       entry.newestMessageId,
       entry.newestMessageAt,
+      entry.confirmWatermark,
     );
-    return `($${base}::text, $${base + 1}::integer, $${base + 2}::text, $${base + 3}::timestamptz)`;
+    return `($${base}::text, $${base + 1}::integer, $${base + 2}::text, $${base + 3}::timestamptz, $${base + 4}::boolean)`;
   });
+  // Message timestamps have second-level precision in WS payloads, so two
+  // consecutive messages can share newest_message_at. Compare their opaque IDs
+  // as a tiebreaker and never let an older local database regress a confirmed
+  // server watermark. OF message IDs are decimal; the lexical fallback keeps
+  // tests and any future opaque identifiers deterministic.
+  const markerIdIsGreaterThanConfirmed = `
+    CASE
+      WHEN local_count.newest_message_id ~ '^[0-9]+$'
+       AND state."confirmedWatermarkMessageId" ~ '^[0-9]+$'
+        THEN local_count.newest_message_id::numeric > state."confirmedWatermarkMessageId"::numeric
+      ELSE local_count.newest_message_id > state."confirmedWatermarkMessageId"
+    END
+  `;
+  const markerIdIsGreaterThanDiscovery = `
+    CASE
+      WHEN local_count.newest_message_id ~ '^[0-9]+$'
+       AND state."newestMessageId" ~ '^[0-9]+$'
+        THEN local_count.newest_message_id::numeric > state."newestMessageId"::numeric
+      ELSE local_count.newest_message_id > state."newestMessageId"
+    END
+  `;
+  const markerAdvancesConfirmed = `
+    local_count.confirm_watermark = TRUE
+    AND local_count.newest_message_id IS NOT NULL
+    AND (
+      state."confirmedWatermarkMessageId" IS NULL
+      OR state."confirmedWatermarkMessageId" = local_count.newest_message_id
+      OR (
+        local_count.newest_message_at IS NOT NULL
+        AND (
+          state."confirmedWatermarkAt" IS NULL
+          OR local_count.newest_message_at > state."confirmedWatermarkAt"
+          OR (
+            local_count.newest_message_at = state."confirmedWatermarkAt"
+            AND (${markerIdIsGreaterThanConfirmed})
+          )
+        )
+      )
+      OR (
+        local_count.newest_message_at IS NULL
+        AND state."confirmedWatermarkAt" IS NULL
+        AND (${markerIdIsGreaterThanConfirmed})
+      )
+    )
+  `;
+
   const updated = await tx.$executeRawUnsafe(
     `
       UPDATE "DialogScanState" AS state
       SET "messagesProcessed" = local_count.messages,
+          "confirmedWatermarkMessageId" = CASE
+            WHEN (${markerAdvancesConfirmed})
+              THEN local_count.newest_message_id
+            ELSE state."confirmedWatermarkMessageId"
+          END,
+          "confirmedWatermarkAt" = CASE
+            WHEN (${markerAdvancesConfirmed})
+              THEN COALESCE(local_count.newest_message_at, state."confirmedWatermarkAt")
+            ELSE state."confirmedWatermarkAt"
+          END,
+          "lastWsEventAt" = CASE
+            WHEN $3::text = 'runtime_ws'
+              THEN GREATEST(
+                COALESCE(state."lastWsEventAt", '-infinity'::timestamptz),
+                COALESCE(local_count.newest_message_at, NOW())
+              )
+            ELSE state."lastWsEventAt"
+          END,
           "updatedAt" = NOW()
       FROM (VALUES ${values.join(", ")})
-        AS local_count(dialog_id, messages, newest_message_id, newest_message_at)
+        AS local_count(dialog_id, messages, newest_message_id, newest_message_at, confirm_watermark)
       WHERE state."agencyId" = $1
         AND state."creatorId" = $2
         AND state."dialogId" = local_count.dialog_id
@@ -947,6 +1026,10 @@ async function reconcileDialogLocalCountsTx(tx, input) {
             AND (
               state."newestMessageAt" IS NULL
               OR local_count.newest_message_at > state."newestMessageAt"
+              OR (
+                local_count.newest_message_at = state."newestMessageAt"
+                AND (${markerIdIsGreaterThanDiscovery})
+              )
             )
           )
         )

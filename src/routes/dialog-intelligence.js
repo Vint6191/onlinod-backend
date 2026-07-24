@@ -604,11 +604,13 @@ const dialogBatchCompleteSchema = dialogBatchLeaseSchema.extend({
 });
 const dialogLocalCountReconcileSchema = z.object({
   deviceId: z.string().min(1).max(200),
+  source: z.enum(["startup_reconcile", "runtime_ws"]).optional(),
   entries: z.array(z.object({
     dialogId: z.string().min(1).max(180),
     messages: z.number().int().min(0).max(100000000),
     newestMessageId: z.string().max(240).optional().nullable(),
     newestMessageAt: tolerantNullableDatetimeSchema,
+    confirmWatermark: z.boolean().optional(),
   })).min(1).max(500),
 });
 
@@ -685,6 +687,7 @@ router.post("/creators/:creatorId/local-counts/reconcile", async (req, res) => {
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
       deviceId: input.deviceId,
+      source: input.source || "startup_reconcile",
       entries: input.entries,
     });
     return res.json(result);

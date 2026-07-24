@@ -145,6 +145,7 @@ function seedCompletedDiscovery(db, generation = 7, status = "COMPLETED") {
     mode: "discovery",
     status,
     generation,
+    completedAt: status === "COMPLETED" ? new Date(1000) : null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
   });
@@ -181,6 +182,20 @@ test("PLANNED rows stay unavailable until the newest discovery generation is fro
   assert.equal(result.batch, null);
   assert.equal(result.reason, "no_frozen_dialog_batch_ready");
   assert.equal([...db._states.values()].every((row) => row.status === "PLANNED"), true);
+});
+
+test("completed discovery with no planned dialogs reports creator coverage as settled", async () => {
+  const db = createDb();
+  seedCompletedDiscovery(db, 7, "COMPLETED");
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 2,
+  });
+  assert.equal(result.batch, null);
+  assert.deepEqual(result.settledCreators, [{
+    creatorId: "creator-1",
+    generation: 7,
+    settledAt: "1970-01-01T00:00:01.000Z",
+  }]);
 });
 
 test("batch claim finalizes a committed terminal discovery boundary before looking for PLANNED rows", async () => {
@@ -580,6 +595,7 @@ test("local count reconciliation updates absolute counters without an OF scan", 
   const result = await reconcileDialogLocalCountsTx(tx, {
     agencyId: "agency-1",
     creatorId: "creator-1",
+    source: "runtime_ws",
     entries: [
       {
         dialogId: "dialog-01",
@@ -592,12 +608,14 @@ test("local count reconciliation updates absolute counters without an OF scan", 
         messages: 45,
         newestMessageId: "message-45",
         newestMessageAt: "2026-07-23T10:00:00.000Z",
+        confirmWatermark: false,
       },
       {
         dialogId: "dialog-01",
         messages: 121,
         newestMessageId: "message-121",
         newestMessageAt: "2026-07-23T12:00:00.000Z",
+        confirmWatermark: true,
       },
     ],
   });
@@ -605,18 +623,26 @@ test("local count reconciliation updates absolute counters without an OF scan", 
   assert.equal(result.received, 2);
   assert.equal(result.updated, 2);
   assert.match(rawCall[0], /UPDATE "DialogScanState"/);
+  assert.match(rawCall[0], /"confirmedWatermarkMessageId"/);
+  assert.match(rawCall[0], /"confirmedWatermarkAt"/);
+  assert.match(rawCall[0], /"lastWsEventAt"/);
+  assert.match(rawCall[0], /confirm_watermark/);
+  assert.match(rawCall[0], /local_count\.confirm_watermark = TRUE/);
   assert.match(rawCall[0], /local_count\.newest_message_at > state\."newestMessageAt"/);
   assert.deepEqual(rawCall.slice(1), [
     "agency-1",
     "creator-1",
+    "runtime_ws",
     "dialog-01",
     121,
     "message-121",
     new Date("2026-07-23T12:00:00.000Z"),
+    true,
     "dialog-02",
     45,
     "message-45",
     new Date("2026-07-23T10:00:00.000Z"),
+    false,
   ]);
 });
 
