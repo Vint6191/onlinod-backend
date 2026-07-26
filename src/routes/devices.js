@@ -26,6 +26,12 @@ const heartbeatSchema = z.object({
     username: z.string().optional().nullable(),
     displayName: z.string().optional().nullable(),
     status: z.string().optional().nullable(),
+    runtimeReady: z.boolean().optional().default(false),
+    wsConnected: z.boolean().optional().default(false),
+    realtimeHealthy: z.boolean().optional().default(false),
+    lastWsFrameAt: z.string().datetime().optional().nullable(),
+    lastRuntimeEventAt: z.string().datetime().optional().nullable(),
+    backgroundMode: z.boolean().optional().default(false),
   }).passthrough()).optional().default([]),
 });
 
@@ -70,13 +76,19 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
       continue;
     }
 
-    const previousCoverage = await prisma.deviceCreatorBinding.aggregate({
-      where: { agencyId, creatorId: creator.id },
-      _max: { lastSeenAt: true },
-    });
-    const lastCoveredAt = previousCoverage?._max?.lastSeenAt || null;
-    if (hasLongOfflineGap(lastCoveredAt, now, OFFLINE_DIALOG_RECOVERY_GAP_MS)) {
-      recoveryCandidates.set(creator.id, { creatorId: creator.id, lastCoveredAt });
+    // DeviceCreatorBinding.lastSeenAt means the Chromium/API execution context
+    // can claim work. It is not proof that WebSocket observation was healthy.
+    // Dialog recovery is therefore based only on the durable realtime
+    // observation timestamp, and only when a healthy listener comes back.
+    if (account?.realtimeHealthy === true) {
+      const observation = await prisma.teamObservationState.findUnique({
+        where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
+        select: { lastRealtimeEventAt: true },
+      }).catch(() => null);
+      const lastCoveredAt = observation?.lastRealtimeEventAt || null;
+      if (hasLongOfflineGap(lastCoveredAt, now, OFFLINE_DIALOG_RECOVERY_GAP_MS)) {
+        recoveryCandidates.set(creator.id, { creatorId: creator.id, lastCoveredAt });
+      }
     }
 
     await prisma.deviceCreatorBinding.upsert({
@@ -188,13 +200,27 @@ router.post("/heartbeat", async (req, res) => {
       }
     }
 
+    const realtimeAccounts = input.accounts.filter((account) => account?.realtimeHealthy === true);
     let observation = null;
     try {
+      // Notification catch-up and dialog recovery use the same truthful
+      // realtime coverage set. A merely loaded/authenticated tab no longer
+      // masks a dead WebSocket.
       observation = await updateObservationFromHeartbeat({
         agencyId,
         deviceId: input.deviceId,
-        accounts: input.accounts,
+        accounts: realtimeAccounts,
       });
+      const realtimePings = [];
+      for (const account of realtimeAccounts) {
+        realtimePings.push(await recordRealtimeObservationPing({
+          agencyId,
+          deviceId: input.deviceId,
+          account,
+          now: heartbeatAt,
+        }));
+      }
+      observation.realtimeHealthy = realtimePings.filter((item) => item?.ok).length;
     } catch (err) {
       console.warn("[devices/heartbeat] observation update failed:", err?.message || err);
       observation = { ok: false, code: "OBSERVATION_UPDATE_FAILED" };
