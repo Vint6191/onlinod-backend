@@ -484,27 +484,10 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       const sideEffect = await applyJobResult({ db: tx, job, deviceId, userId, result: result || {} });
       return { job: { id: job.id, status: "DONE" }, sideEffect };
     }, JOB_COMPLETION_TRANSACTION_OPTIONS);
-    // Daily maintenance is intentionally sequential: refresh the full media
-    // catalog first, then rebuild the shuffled dialog list. Schedule phase two
-    // only after the catalog transaction has committed, never from inside the
-    // interactive transaction above. If scheduling is temporarily unavailable,
-    // the hourly scheduler will retry from the same durable timestamps.
-    if (clean(job.params?.source, 80) === "daily_vault_intelligence") {
-      try {
-        const { ensureDailyVaultIntelligenceCycle } = require("./vault-intelligence-daily-service");
-        completed.dailyContinuation = await ensureDailyVaultIntelligenceCycle({
-          agencyId: job.agencyId,
-          creatorId: job.creatorId,
-          now: new Date(),
-          forceDialogs: true,
-        });
-      } catch (error) {
-        console.warn("[daily-vault-intelligence] dialog phase scheduling failed after catalog completion:", {
-          creatorId: job.creatorId,
-          error: error?.message || String(error),
-        });
-      }
-    }
+    // Dialog history is realtime-first. Completing the daily media catalog must
+    // not automatically start a creator-wide dialog discovery anymore. A dialog
+    // recovery plan is scheduled only by the long-offline coverage detector or
+    // by an explicit operator action.
     return completed;
   }
 

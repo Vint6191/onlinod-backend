@@ -329,7 +329,7 @@ test("vault completion keeps publication fenced with a longer bounded transactio
   assert.equal(result.job.status, "DONE");
 });
 
-test("daily catalog completion starts dialog discovery only after the catalog transaction commits", async () => {
+test("daily catalog completion does not auto-start dialog discovery", async () => {
   const token = "lease-token";
   const now = new Date();
   const job = {
@@ -348,9 +348,7 @@ test("daily catalog completion starts dialog discovery only after the catalog tr
     continuation: { driverPhase: "complete" },
     workId: "daily-work",
   };
-  let inTransaction = false;
-  let dailyCalledInsideTransaction = null;
-  let dailyInput = null;
+  let dailyCalls = 0;
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
@@ -358,19 +356,14 @@ test("daily catalog completion starts dialog discovery only after the catalog tr
       findUnique: async () => job,
       updateMany: async () => ({ count: 1 }),
     },
-    $transaction: async (callback) => {
-      inTransaction = true;
-      try { return await callback(db); }
-      finally { inTransaction = false; }
-    },
+    $transaction: async (callback) => callback(db),
   };
   const { completeJob } = loadService({
     db,
     applyJobResult: async () => ({ type: "vault_unsorted", publicationMode: "merge" }),
-    ensureDailyVaultIntelligenceCycle: async (input) => {
-      dailyCalledInsideTransaction = inTransaction;
-      dailyInput = input;
-      return { ok: true, created: 1, dialogs: { created: true } };
+    ensureDailyVaultIntelligenceCycle: async () => {
+      dailyCalls += 1;
+      return { ok: true, created: 1 };
     },
   });
   const result = await completeJob({
@@ -383,10 +376,8 @@ test("daily catalog completion starts dialog discovery only after the catalog tr
     result: { mode: "full", scanned: 2_017 },
     progress: { current: 2_017, percent: 100 },
   });
-  assert.equal(dailyCalledInsideTransaction, false);
-  assert.equal(dailyInput.forceDialogs, true);
-  assert.equal(dailyInput.creatorId, "creator-1");
-  assert.equal(result.dailyContinuation.created, 1);
+  assert.equal(dailyCalls, 0);
+  assert.equal(Object.hasOwn(result, "dailyContinuation"), false);
 });
 
 test("discovery-only claim fences the shared dialog job key to the discovery sentinel", async () => {

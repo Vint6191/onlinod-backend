@@ -904,6 +904,79 @@ async function completeDialogHistoryBatch(input) {
   return prisma.$transaction((tx) => completeDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
 }
 
+
+async function realtimeWatermarkFenceTx(db, { agencyId, creatorId }) {
+  const [baseline, latestDiscovery] = await Promise.all([
+    db.dialogScanRun.findFirst({
+      where: {
+        agencyId,
+        creatorId,
+        dialogId: "__dialog_discovery__",
+        status: "COMPLETED",
+      },
+      orderBy: { completedAt: "desc" },
+      select: { id: true, source: true, generation: true, completedAt: true, createdAt: true },
+    }),
+    db.dialogScanRun.findFirst({
+      where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, source: true, generation: true, status: true, completedAt: true, createdAt: true },
+    }),
+  ]);
+  if (!baseline) {
+    return {
+      allowed: false,
+      reason: "baseline_missing",
+      recoveryRunId: null,
+      recoveryGeneration: null,
+    };
+  }
+
+  const latestStatus = clean(latestDiscovery?.status, 40)?.toUpperCase() || "";
+  if (latestDiscovery && latestDiscovery.id !== baseline.id && latestStatus !== "COMPLETED") {
+    const recovery = clean(latestDiscovery.source, 80) === "offline_gap_recovery";
+    return {
+      allowed: false,
+      reason: recovery
+        ? `offline_recovery_${latestStatus.toLowerCase() || "active"}`
+        : `dialog_discovery_${latestStatus.toLowerCase() || "active"}`,
+      recoveryRunId: latestDiscovery.id,
+      recoveryGeneration: integer(latestDiscovery.generation, 0),
+    };
+  }
+
+  // Discovery completion freezes the cheap list of heads. The watermark becomes
+  // contiguous only after every history row planned from that generation has
+  // reached READY/UNAVAILABLE. This also fences explicit manual scans, not just
+  // automatic long-offline recovery.
+  const unfinished = await db.dialogScanState.findFirst({
+    where: {
+      agencyId,
+      creatorId,
+      generation: integer(baseline.generation, 0),
+      dialogId: { notIn: ["__dialog_discovery__", DIALOG_HISTORY_BATCH_DIALOG_ID] },
+      status: { in: ["PLANNED", "QUEUED", "RUNNING", "PAUSED", "FAILED", "IDLE"] },
+    },
+    select: { id: true, dialogId: true, status: true },
+  });
+  const recovery = clean(baseline.source, 80) === "offline_gap_recovery";
+  if (unfinished) {
+    return {
+      allowed: false,
+      reason: recovery ? "offline_recovery_history_pending" : "dialog_discovery_history_pending",
+      recoveryRunId: baseline.id,
+      recoveryGeneration: integer(baseline.generation, 0),
+    };
+  }
+
+  return {
+    allowed: true,
+    reason: recovery ? "offline_recovery_settled" : "continuous_coverage",
+    recoveryRunId: recovery ? baseline.id : null,
+    recoveryGeneration: recovery ? integer(baseline.generation, 0) : null,
+  };
+}
+
 async function reconcileDialogLocalCountsTx(tx, input) {
   const agencyId = clean(input.agencyId, 160);
   const creatorId = clean(input.creatorId, 160);
@@ -915,23 +988,73 @@ async function reconcileDialogLocalCountsTx(tx, input) {
     throw error;
   }
 
+  const source = clean(input.source, 40) === "runtime_ws" ? "runtime_ws" : "startup_reconcile";
+  const watermarkFence = source === "runtime_ws"
+    ? await realtimeWatermarkFenceTx(tx, { agencyId, creatorId })
+    : { allowed: false, reason: "startup_reconcile", recoveryRunId: null, recoveryGeneration: null };
+
   const counts = new Map();
   for (const raw of list(input.entries).slice(0, 500)) {
     const entry = object(raw);
     const dialogId = clean(entry.dialogId, 180);
     if (!dialogId) continue;
+    const newestMessageId = clean(entry.newestMessageId, 240);
     counts.set(dialogId, {
       dialogId,
       messages: integer(entry.messages, 0, 0, 100_000_000),
-      newestMessageId: clean(entry.newestMessageId, 240),
+      newestMessageId,
       newestMessageAt: dateOrNull(entry.newestMessageAt),
-      confirmWatermark: entry.confirmWatermark === true,
+      requestedWatermark: entry.confirmWatermark === true,
+      confirmWatermark: entry.confirmWatermark === true
+        && watermarkFence.allowed === true
+        && Boolean(newestMessageId),
     });
   }
   const entries = [...counts.values()];
-  if (!entries.length) return { ok: true, creatorId, received: 0, updated: 0 };
+  if (!entries.length) {
+    return {
+      ok: true,
+      creatorId,
+      received: 0,
+      updated: 0,
+      watermarkConfirmationAllowed: watermarkFence.allowed === true,
+      watermarkConfirmationReason: watermarkFence.reason,
+      recoveryRunId: watermarkFence.recoveryRunId,
+    };
+  }
 
-  const source = clean(input.source, 40) === "runtime_ws" ? "runtime_ws" : "startup_reconcile";
+  if (source === "runtime_ws" && typeof tx.dialogScanState.createMany === "function") {
+    // Create brand-new live dialogs only when the durable all-device coverage
+    // fence accepts the WS head. During an offline recovery we leave missing
+    // rows absent: discovery will either create/scan them or the pending local
+    // watermark will retry after recovery settles. This avoids turning a
+    // partially observed gap into an authoritative initial baseline.
+    const trustedNewDialogs = entries.filter((entry) => entry.confirmWatermark === true);
+    if (trustedNewDialogs.length > 0) {
+      const now = new Date();
+      await tx.dialogScanState.createMany({
+        data: trustedNewDialogs.map((entry) => ({
+          agencyId,
+          creatorId,
+          dialogId: entry.dialogId,
+          fanId: entry.dialogId,
+          initialScanComplete: true,
+          status: "READY",
+          generation: 0,
+          scanMode: "incremental",
+          newestMessageId: entry.newestMessageId,
+          newestMessageAt: entry.newestMessageAt,
+          confirmedWatermarkMessageId: entry.newestMessageId,
+          confirmedWatermarkAt: entry.newestMessageAt,
+          incrementalGapOpen: false,
+          lastWsEventAt: entry.newestMessageAt || now,
+          messagesProcessed: entry.messages,
+        })),
+        skipDuplicates: true,
+      });
+    }
+  }
+
   const params = [agencyId, creatorId, source];
   const values = entries.map((entry, index) => {
     const base = 4 + index * 5;
@@ -1042,6 +1165,11 @@ async function reconcileDialogLocalCountsTx(tx, input) {
     creatorId,
     received: entries.length,
     updated: integer(updated, 0, 0, entries.length),
+    watermarkConfirmationAllowed: watermarkFence.allowed === true,
+    watermarkConfirmationReason: watermarkFence.reason,
+    recoveryRunId: watermarkFence.recoveryRunId,
+    requestedWatermarks: entries.filter((entry) => entry.requestedWatermark).length,
+    confirmedWatermarks: entries.filter((entry) => entry.confirmWatermark).length,
   };
 }
 
@@ -1093,6 +1221,7 @@ module.exports = {
   progressDialogHistoryBatch,
   completeDialogHistoryBatchTx,
   completeDialogHistoryBatch,
+  realtimeWatermarkFenceTx,
   reconcileDialogLocalCountsTx,
   reconcileDialogLocalCounts,
   releaseDialogHistoryBatchTx,

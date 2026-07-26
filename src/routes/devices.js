@@ -3,6 +3,11 @@ const { z } = require("zod");
 const prisma = require("../prisma");
 const { authRequired } = require("../middleware/auth");
 const { updateObservationFromHeartbeat, recordRealtimeObservationPing } = require("../services/team-observation-service");
+const {
+  OFFLINE_DIALOG_RECOVERY_GAP_MS,
+  hasLongOfflineGap,
+  scheduleOfflineDialogRecovery,
+} = require("../services/dialog-offline-recovery-service");
 
 const router = express.Router();
 router.use(authRequired);
@@ -25,11 +30,12 @@ const heartbeatSchema = z.object({
 });
 
 
-async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts }) {
+async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = new Date() }) {
   const list = Array.isArray(accounts) ? accounts : [];
   let accepted = 0;
   let rejected = 0;
   const seenCreatorIds = [];
+  const recoveryCandidates = new Map();
 
   for (const account of list) {
     const status = String(account?.status || "").toUpperCase();
@@ -64,6 +70,15 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts }) {
       continue;
     }
 
+    const previousCoverage = await prisma.deviceCreatorBinding.aggregate({
+      where: { agencyId, creatorId: creator.id },
+      _max: { lastSeenAt: true },
+    });
+    const lastCoveredAt = previousCoverage?._max?.lastSeenAt || null;
+    if (hasLongOfflineGap(lastCoveredAt, now, OFFLINE_DIALOG_RECOVERY_GAP_MS)) {
+      recoveryCandidates.set(creator.id, { creatorId: creator.id, lastCoveredAt });
+    }
+
     await prisma.deviceCreatorBinding.upsert({
       where: { deviceId_creatorId: { deviceId, creatorId: creator.id } },
       create: {
@@ -73,13 +88,13 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts }) {
         status: "ACTIVE",
         remoteId,
         username,
-        lastSeenAt: new Date(),
+        lastSeenAt: now,
       },
       update: {
         status: "ACTIVE",
         remoteId,
         username,
-        lastSeenAt: new Date(),
+        lastSeenAt: now,
       },
     });
 
@@ -97,7 +112,12 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts }) {
     data: { status: "STALE" },
   });
 
-  return { accepted, rejected, visibleCreatorIds: seenCreatorIds };
+  return {
+    accepted,
+    rejected,
+    visibleCreatorIds: seenCreatorIds,
+    recoveryCandidates: [...recoveryCandidates.values()],
+  };
 }
 
 router.post("/heartbeat", async (req, res) => {
@@ -136,11 +156,37 @@ router.post("/heartbeat", async (req, res) => {
       },
     });
 
+    const heartbeatAt = new Date();
     const bindings = await syncDeviceCreatorBindings({
       agencyId,
       deviceId: input.deviceId,
       accounts: input.accounts,
+      now: heartbeatAt,
     });
+
+    const dialogRecovery = [];
+    for (const candidate of bindings.recoveryCandidates || []) {
+      try {
+        dialogRecovery.push(await scheduleOfflineDialogRecovery({
+          agencyId,
+          creatorId: candidate.creatorId,
+          lastCoveredAt: candidate.lastCoveredAt,
+          now: heartbeatAt,
+        }));
+      } catch (error) {
+        console.warn("[devices/heartbeat] offline dialog recovery scheduling failed:", {
+          creatorId: candidate.creatorId,
+          error: error?.message || String(error),
+        });
+        dialogRecovery.push({
+          ok: false,
+          created: false,
+          creatorId: candidate.creatorId,
+          reason: "recovery_schedule_failed",
+          error: error?.message || String(error),
+        });
+      }
+    }
 
     let observation = null;
     try {
@@ -184,7 +230,12 @@ router.post("/heartbeat", async (req, res) => {
     return res.json({
       ok: true,
       device,
-      bindings,
+      bindings: {
+        accepted: bindings.accepted,
+        rejected: bindings.rejected,
+        visibleCreatorIds: bindings.visibleCreatorIds,
+      },
+      dialogRecovery,
       forceLogout,
       revokedCreatorIds: Array.from(new Set(revokedCreatorIds)),
       revokedPartitions: Array.from(new Set(revokedPartitions)),

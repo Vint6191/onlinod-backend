@@ -119,7 +119,10 @@ async function ensureDailyVaultIntelligenceCycle({
   }
 
   const catalogDue = isDue(state.catalogCompletedAt, now, intervalMs);
-  const dialogsDue = forceDialogs === true || isDue(state.discoveryCompletedAt, now, intervalMs);
+  // Dialog history is maintained by realtime WS. Automatic discovery is only
+  // allowed when a caller explicitly requests recovery (for example after every
+  // device for the creator was offline for more than one hour).
+  const dialogsDue = forceDialogs === true;
   if (!catalogDue && !dialogsDue) {
     return {
       ok: true,
@@ -127,6 +130,7 @@ async function ensureDailyVaultIntelligenceCycle({
       reason: "fresh",
       catalogCompletedAt: state.catalogCompletedAt.toISOString(),
       discoveryCompletedAt: state.discoveryCompletedAt.toISOString(),
+      dialogMaintenance: "realtime_ws",
     };
   }
 
@@ -171,10 +175,9 @@ async function ensureDailyVaultIntelligenceCycle({
   }
 
   if (dialogsDue) {
-    // A due catalog refresh is the first phase of the daily cycle. Do not run
-    // dialog discovery concurrently with a full Vault traversal: both consume
-    // the same creator runtime and OF read budget. Completion of the catalog
-    // job immediately re-enters this coordinator and starts discovery.
+    // Explicit recovery still waits for the catalog lane because both consume
+    // the same creator runtime and OF read budget. Ordinary daily maintenance no
+    // longer reaches this branch: realtime WS owns dialog freshness.
     if (state.activeCatalogJob || result.catalog?.created === true) {
       result.dialogs = { created: false, reason: "waiting_for_catalog" };
     } else if (state.historyControl.state === "PAUSED") {

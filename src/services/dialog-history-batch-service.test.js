@@ -12,6 +12,7 @@ const {
   progressDialogHistoryBatchTx,
   completeDialogHistoryBatchTx,
   reconcileDialogLocalCountsTx,
+  realtimeWatermarkFenceTx,
   releaseDialogHistoryBatchTx,
   recoverExpiredDialogHistoryBatchesTx,
   normalizeOrphanedDialogHistoryBatchesTx,
@@ -580,19 +581,44 @@ test("new desktop completion reconciles the durable message counter to local SQL
   assert.equal(db._states.get("dialog-01").confirmedWatermarkMessageId, "message-120");
 });
 
-test("local count reconciliation updates absolute counters without an OF scan", async () => {
-  let rawCall = null;
+function localCountTx({ recovery = null, unfinished = null } = {}) {
+  const rawCalls = [];
+  const creates = [];
   const tx = {
     creatorAccount: {
       async findMany() { return [{ id: "creator-1" }]; },
     },
+    dialogScanRun: {
+      async findFirst({ where }) {
+        const baseline = {
+          id: "baseline-run",
+          source: "manual",
+          generation: 7,
+          status: "COMPLETED",
+          completedAt: new Date("2026-07-22T00:00:00.000Z"),
+          createdAt: new Date("2026-07-21T00:00:00.000Z"),
+        };
+        if (where.status === "COMPLETED") {
+          return recovery?.status === "COMPLETED" ? recovery : baseline;
+        }
+        return recovery || baseline;
+      },
+    },
+    dialogScanState: {
+      async findFirst() { return unfinished; },
+      async createMany(args) { creates.push(args); return { count: args.data.length }; },
+    },
     async $executeRawUnsafe(...args) {
-      rawCall = args;
+      rawCalls.push(args);
       return 2;
     },
   };
+  return { tx, rawCalls, creates };
+}
 
-  const result = await reconcileDialogLocalCountsTx(tx, {
+test("realtime local counts advance watermarks when coverage is continuous", async () => {
+  const fixture = localCountTx();
+  const result = await reconcileDialogLocalCountsTx(fixture.tx, {
     agencyId: "agency-1",
     creatorId: "creator-1",
     source: "runtime_ws",
@@ -600,20 +626,21 @@ test("local count reconciliation updates absolute counters without an OF scan", 
       {
         dialogId: "dialog-01",
         messages: 120,
-        newestMessageId: "message-120",
+        newestMessageId: "120",
         newestMessageAt: "2026-07-23T11:00:00.000Z",
+        confirmWatermark: true,
       },
       {
         dialogId: "dialog-02",
         messages: 45,
-        newestMessageId: "message-45",
+        newestMessageId: "45",
         newestMessageAt: "2026-07-23T10:00:00.000Z",
         confirmWatermark: false,
       },
       {
         dialogId: "dialog-01",
         messages: 121,
-        newestMessageId: "message-121",
+        newestMessageId: "121",
         newestMessageAt: "2026-07-23T12:00:00.000Z",
         confirmWatermark: true,
       },
@@ -622,28 +649,103 @@ test("local count reconciliation updates absolute counters without an OF scan", 
 
   assert.equal(result.received, 2);
   assert.equal(result.updated, 2);
+  assert.equal(result.watermarkConfirmationAllowed, true);
+  assert.equal(result.watermarkConfirmationReason, "continuous_coverage");
+  assert.equal(result.requestedWatermarks, 1);
+  assert.equal(result.confirmedWatermarks, 1);
+  assert.equal(fixture.creates.length, 1);
+  assert.deepEqual(fixture.creates[0].data.map((row) => row.dialogId), ["dialog-01"]);
+  assert.equal(fixture.creates[0].data[0].initialScanComplete, true);
+  const rawCall = fixture.rawCalls[0];
   assert.match(rawCall[0], /UPDATE "DialogScanState"/);
   assert.match(rawCall[0], /"confirmedWatermarkMessageId"/);
-  assert.match(rawCall[0], /"confirmedWatermarkAt"/);
   assert.match(rawCall[0], /"lastWsEventAt"/);
-  assert.match(rawCall[0], /confirm_watermark/);
-  assert.match(rawCall[0], /local_count\.confirm_watermark = TRUE/);
-  assert.match(rawCall[0], /local_count\.newest_message_at > state\."newestMessageAt"/);
   assert.deepEqual(rawCall.slice(1), [
     "agency-1",
     "creator-1",
     "runtime_ws",
     "dialog-01",
     121,
-    "message-121",
+    "121",
     new Date("2026-07-23T12:00:00.000Z"),
     true,
     "dialog-02",
     45,
-    "message-45",
+    "45",
     new Date("2026-07-23T10:00:00.000Z"),
     false,
   ]);
+});
+
+test("active offline recovery accepts counts but fences realtime watermarks", async () => {
+  const fixture = localCountTx({
+    recovery: {
+      id: "recovery-run",
+      source: "offline_gap_recovery",
+      generation: 8,
+      status: "RUNNING",
+      createdAt: new Date("2026-07-23T12:00:00.000Z"),
+    },
+  });
+  const result = await reconcileDialogLocalCountsTx(fixture.tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    source: "runtime_ws",
+    entries: [{
+      dialogId: "dialog-new",
+      messages: 1,
+      newestMessageId: "900",
+      newestMessageAt: "2026-07-23T12:01:00.000Z",
+      confirmWatermark: true,
+    }],
+  });
+  assert.equal(result.watermarkConfirmationAllowed, false);
+  assert.equal(result.watermarkConfirmationReason, "offline_recovery_running");
+  assert.equal(result.requestedWatermarks, 1);
+  assert.equal(result.confirmedWatermarks, 0);
+  assert.equal(fixture.creates.length, 0, "an unverified new dialog must not become an initial baseline");
+  assert.equal(fixture.rawCalls[0].at(-1), false, "SQL receives confirm_watermark=false");
+});
+
+test("completed recovery keeps the fence closed while planned histories remain", async () => {
+  const fixture = localCountTx({
+    recovery: {
+      id: "recovery-run",
+      source: "offline_gap_recovery",
+      generation: 8,
+      status: "COMPLETED",
+      completedAt: new Date("2026-07-23T12:00:00.000Z"),
+      createdAt: new Date("2026-07-23T11:00:00.000Z"),
+    },
+    unfinished: { id: "state-1", dialogId: "dialog-gap", status: "PLANNED" },
+  });
+  const fence = await realtimeWatermarkFenceTx(fixture.tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+  });
+  assert.equal(fence.allowed, false);
+  assert.equal(fence.reason, "offline_recovery_history_pending");
+});
+
+test("settled offline recovery reopens realtime watermark confirmation", async () => {
+  const fixture = localCountTx({
+    recovery: {
+      id: "recovery-run",
+      source: "offline_gap_recovery",
+      generation: 8,
+      status: "COMPLETED",
+      completedAt: new Date("2026-07-23T12:00:00.000Z"),
+      createdAt: new Date("2026-07-23T11:00:00.000Z"),
+    },
+    unfinished: null,
+  });
+  const fence = await realtimeWatermarkFenceTx(fixture.tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+  });
+  assert.equal(fence.allowed, true);
+  assert.equal(fence.reason, "offline_recovery_settled");
+  assert.equal(fence.recoveryRunId, "recovery-run");
 });
 
 test("terminal phantom dialog results are resolved as unavailable instead of failing the creator scan", async () => {

@@ -664,6 +664,60 @@ test("daily discovery keeps an unchanged completed dialog READY without resettin
   assert.equal(state.incrementalGapOpen, false);
 });
 
+test("unchanged list heads clear stale planned/failed/idle states without message API work", async () => {
+  for (const status of ["PLANNED", "FAILED", "IDLE", "RUNNING", "QUEUED"]) {
+    resetDb();
+    const { job } = seedDiscovery(121, "incremental");
+    db._states.set("creator-1:dialog-a", {
+      agencyId: "agency-1",
+      creatorId: "creator-1",
+      dialogId: "dialog-a",
+      fanId: "fan-a",
+      generation: 120,
+      status,
+      scanMode: "incremental",
+      initialScanComplete: true,
+      confirmedWatermarkMessageId: "message-100",
+      confirmedWatermarkAt: new Date("2026-07-22T09:00:00.000Z"),
+      newestMessageId: "message-100",
+      newestMessageAt: new Date("2026-07-22T09:00:00.000Z"),
+      pagesProcessed: 33,
+      messagesProcessed: 750,
+      mediaProcessed: 42,
+      incrementalGapOpen: true,
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    });
+
+    const result = await applyDialogIntelligenceChunk({
+      db,
+      job,
+      deviceId: "device-1",
+      chunkResult: {
+        kind: "dialog_discovery_page",
+        runId: "discovery-run",
+        chunkKey: `unchanged-stale-${status.toLowerCase()}`,
+        page: 0,
+        childMode: "incremental",
+        hasMore: false,
+        dialogs: [{
+          dialogId: "dialog-a",
+          fanId: "fan-a",
+          latestMessageId: "message-100",
+          latestMessageAt: "2026-07-22T09:00:00.000Z",
+        }],
+      },
+    });
+
+    const state = db._states.get("creator-1:dialog-a");
+    assert.equal(result.planned, 0, status);
+    assert.equal(result.unchanged, 1, status);
+    assert.equal(state.status, "READY", status);
+    assert.equal(state.incrementalGapOpen, false, status);
+    assert.equal(state.messagesProcessed, 750, status);
+  }
+});
+
 test("daily discovery plans only a changed completed dialog for incremental history", async () => {
   resetDb();
   const { job } = seedDiscovery(121, "incremental");

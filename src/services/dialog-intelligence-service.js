@@ -1501,10 +1501,6 @@ function discoveryPlanDecision(state, row, { childMode, forceChildFull }) {
     return { shouldPlan: true, scanMode: 'initial', nextStatus: 'PLANNED', reason: 'initial_incomplete' };
   }
 
-  if (['FAILED', 'PLANNED', 'QUEUED', 'RUNNING', 'IDLE'].includes(currentStatus) || state.incrementalGapOpen === true) {
-    return { shouldPlan: true, scanMode: 'incremental', nextStatus: 'PLANNED', reason: 'unfinished_incremental' };
-  }
-
   const changed = markerChanged(state, row);
   if (currentStatus === 'UNAVAILABLE') {
     return changed === true
@@ -1512,9 +1508,20 @@ function discoveryPlanDecision(state, row, { childMode, forceChildFull }) {
       : { shouldPlan: false, scanMode: 'incremental', nextStatus: 'UNAVAILABLE', reason: changed === false ? 'unavailable_unchanged' : 'unavailable_without_marker' };
   }
   if (changed === false) {
+    // Status is not evidence that the OF head changed. Old interrupted plans and
+    // legacy IDLE/FAILED rows must collapse back to READY when the chat-list head
+    // is identical to the confirmed local SQLite watermark.
     return { shouldPlan: false, scanMode: 'incremental', nextStatus: 'READY', reason: 'watermark_unchanged' };
   }
-  return { shouldPlan: true, scanMode: 'incremental', nextStatus: 'PLANNED', reason: changed === true ? 'watermark_changed' : 'watermark_unknown' };
+  if (changed === true) {
+    return { shouldPlan: true, scanMode: 'incremental', nextStatus: 'PLANNED', reason: 'watermark_changed' };
+  }
+  return {
+    shouldPlan: true,
+    scanMode: 'incremental',
+    nextStatus: 'PLANNED',
+    reason: state.incrementalGapOpen === true ? 'unfinished_incremental_without_marker' : 'watermark_unknown',
+  };
 }
 
 async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
