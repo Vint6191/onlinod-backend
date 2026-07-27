@@ -6,6 +6,15 @@ const { restartCreatorDialogPlan } = require("./dialog-intelligence-service");
 const OFFLINE_DIALOG_RECOVERY_GAP_MS = 60 * 60 * 1000;
 const OFFLINE_DIALOG_RECOVERY_SOURCE = "offline_gap_recovery";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING", "PAUSED"];
+const UNFINISHED_HISTORY_STATUSES = ["PLANNED", "QUEUED", "RUNNING", "PAUSED", "FAILED", "IDLE", "CANCELLED", "CANCELED"];
+const COVERAGE_RELEASE_REASONS = new Set([
+  // These are the only decisions that prove there is no unresolved historical
+  // hole left to fence. Every scheduling, module-control, race or baseline
+  // failure keeps the previous contiguous boundary for a later retry.
+  "gap_already_recovered",
+  "gap_below_threshold",
+  "coverage_unknown",
+]);
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -33,6 +42,30 @@ function hasLongOfflineGap(lastCoveredAt, now = new Date(), thresholdMs = OFFLIN
   const gap = offlineGapMs(lastCoveredAt, now);
   return gap !== null && gap >= Math.max(1, Number(thresholdMs) || OFFLINE_DIALOG_RECOVERY_GAP_MS);
 }
+function shouldPreserveRealtimeCoverage(result) {
+  if (!result || typeof result !== "object") return false;
+  const reason = clean(result.reason, 80);
+  return !COVERAGE_RELEASE_REASONS.has(reason);
+}
+
+async function completedBaselineSettledAfterGap({ db, agencyId, creatorId, baseline, lastCoveredAt }) {
+  const coveredAt = dateOrNull(lastCoveredAt);
+  const settledAt = dateOrNull(baseline?.completedAt || baseline?.updatedAt || baseline?.createdAt);
+  if (!coveredAt || !settledAt || settledAt.getTime() <= coveredAt.getTime()) return false;
+  const generation = Number(baseline?.generation);
+  if (!Number.isInteger(generation) || generation < 0 || !db?.dialogScanState?.findFirst) return false;
+  const unfinished = await db.dialogScanState.findFirst({
+    where: {
+      agencyId,
+      creatorId,
+      generation,
+      dialogId: { notIn: ["__dialog_discovery__", "__dialog_history_batch__"] },
+      status: { in: UNFINISHED_HISTORY_STATUSES },
+    },
+    select: { id: true },
+  });
+  return !unfinished;
+}
 
 async function scheduleOfflineDialogRecovery({
   agencyId,
@@ -59,7 +92,7 @@ async function scheduleOfflineDialogRecovery({
     db.dialogScanRun.findFirst({
       where: { agencyId: agency, creatorId: creator, dialogId: "__dialog_discovery__", status: "COMPLETED" },
       orderBy: { completedAt: "desc" },
-      select: { id: true, generation: true, completedAt: true },
+      select: { id: true, source: true, generation: true, completedAt: true, createdAt: true, updatedAt: true },
     }),
     db.dialogScanRun.findFirst({
       where: {
@@ -94,6 +127,27 @@ async function scheduleOfflineDialogRecovery({
     };
   }
 
+  // Do not schedule the same historical gap again after a discovery and every
+  // history row from that generation have already settled. The heartbeat may
+  // now advance the contiguous realtime coverage timestamp safely.
+  if (await completedBaselineSettledAfterGap({
+    db,
+    agencyId: agency,
+    creatorId: creator,
+    baseline: completedBaseline,
+    lastCoveredAt,
+  })) {
+    return {
+      ok: true,
+      created: false,
+      reason: "gap_already_recovered",
+      gapMs,
+      runId: completedBaseline.id,
+      generation: completedBaseline.generation,
+      settledAt: dateOrNull(completedBaseline.completedAt)?.toISOString() || null,
+    };
+  }
+
   const result = await schedule({
     agencyId: agency,
     creatorId: creator,
@@ -123,4 +177,5 @@ module.exports = {
   offlineGapMs,
   hasLongOfflineGap,
   scheduleOfflineDialogRecovery,
+  shouldPreserveRealtimeCoverage,
 };

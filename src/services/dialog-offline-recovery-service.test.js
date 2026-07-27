@@ -17,20 +17,23 @@ const {
   OFFLINE_DIALOG_RECOVERY_GAP_MS,
   hasLongOfflineGap,
   scheduleOfflineDialogRecovery,
+  shouldPreserveRealtimeCoverage,
 } = require("./dialog-offline-recovery-service");
 
 const NOW = new Date("2026-07-25T10:00:00.000Z");
 
-function dbFixture({ baseline = true, latest = null, active = null } = {}) {
+function dbFixture({ baseline = true, latest = null, active = null, unfinished = null, completedBaseline = null } = {}) {
   return {
     dialogScanRun: {
       async findFirst({ where }) {
         if (where.status === "COMPLETED") {
-          return baseline ? {
+          return baseline ? (completedBaseline || {
             id: "baseline-run",
+            source: "initial_full_scan",
             generation: 7,
+            createdAt: new Date("2026-07-24T00:00:00.000Z"),
             completedAt: new Date("2026-07-24T00:00:00.000Z"),
-          } : null;
+          }) : null;
         }
         if (where.status?.in) return active;
         return latest || (baseline ? {
@@ -42,6 +45,9 @@ function dbFixture({ baseline = true, latest = null, active = null } = {}) {
           updatedAt: new Date("2026-07-24T00:00:00.000Z"),
         } : null);
       },
+    },
+    dialogScanState: {
+      async findFirst() { return unfinished; },
     },
   };
 }
@@ -132,4 +138,142 @@ test("paused or already active history is not duplicated by heartbeat recovery",
   });
   assert.equal(active.reason, "already_in_flight");
   assert.equal(calls, 0);
+});
+
+
+test("a settled scan completed after the offline boundary closes the same gap exactly once", async () => {
+  let calls = 0;
+  const lastCoveredAt = new Date(NOW.getTime() - 2 * 60 * 60_000);
+  const result = await scheduleOfflineDialogRecovery({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    lastCoveredAt,
+    now: NOW,
+    db: dbFixture({
+      completedBaseline: {
+        id: "recovery-complete",
+        source: "offline_gap_recovery",
+        generation: 9,
+        createdAt: new Date(NOW.getTime() - 45 * 60_000),
+        completedAt: new Date(NOW.getTime() - 5 * 60_000),
+      },
+      latest: {
+        id: "recovery-complete",
+        source: "offline_gap_recovery",
+        generation: 9,
+        status: "COMPLETED",
+        continuation: {},
+        createdAt: new Date(NOW.getTime() - 45 * 60_000),
+        updatedAt: new Date(NOW.getTime() - 5 * 60_000),
+      },
+    }),
+    schedule: async () => { calls += 1; return { ok: true, created: true }; },
+  });
+  assert.equal(result.created, false);
+  assert.equal(result.reason, "gap_already_recovered");
+  assert.equal(calls, 0);
+  assert.equal(shouldPreserveRealtimeCoverage(result), false);
+});
+
+test("completed discovery does not close coverage while its planned history remains", async () => {
+  let calls = 0;
+  const result = await scheduleOfflineDialogRecovery({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    lastCoveredAt: new Date(NOW.getTime() - 2 * 60 * 60_000),
+    now: NOW,
+    db: dbFixture({
+      completedBaseline: {
+        id: "recovery-heads-only",
+        source: "offline_gap_recovery",
+        generation: 10,
+        createdAt: new Date(NOW.getTime() - 40 * 60_000),
+        completedAt: new Date(NOW.getTime() - 10 * 60_000),
+      },
+      latest: {
+        id: "recovery-heads-only",
+        source: "offline_gap_recovery",
+        generation: 10,
+        status: "COMPLETED",
+        continuation: {},
+      },
+      unfinished: { id: "dialog-pending" },
+    }),
+    schedule: async () => { calls += 1; return { ok: true, created: true }; },
+  });
+  assert.equal(result.created, true);
+  assert.equal(calls, 1);
+  assert.equal(shouldPreserveRealtimeCoverage(result), true);
+});
+
+test("only an explicitly recovered or non-existent gap releases the old contiguous boundary", () => {
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "history_paused" }), true);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "history_cancelled" }), true);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "already_in_flight" }), true);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: false, created: false, reason: "recovery_schedule_failed" }), true);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "module_disabled" }), true);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "concurrent_creator_plan_won" }), true);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "durable_run_resumed" }), true);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "baseline_missing" }), true);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "gap_already_recovered" }), false);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "gap_below_threshold" }), false);
+  assert.equal(shouldPreserveRealtimeCoverage({ ok: true, created: false, reason: "coverage_unknown" }), false);
+});
+
+
+test("generation zero is a valid settled recovery generation", async () => {
+  let calls = 0;
+  const result = await scheduleOfflineDialogRecovery({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    lastCoveredAt: new Date(NOW.getTime() - 2 * 60 * 60_000),
+    now: NOW,
+    db: dbFixture({
+      completedBaseline: {
+        id: "recovery-generation-zero",
+        source: "offline_gap_recovery",
+        generation: 0,
+        completedAt: new Date(NOW.getTime() - 5 * 60_000),
+      },
+      latest: {
+        id: "recovery-generation-zero",
+        status: "COMPLETED",
+        generation: 0,
+        continuation: {},
+      },
+    }),
+    schedule: async () => { calls += 1; return { ok: true, created: true }; },
+  });
+  assert.equal(result.reason, "gap_already_recovered");
+  assert.equal(calls, 0);
+});
+
+
+test("a cancelled child history row keeps the recovered boundary fenced", async () => {
+  let calls = 0;
+  const result = await scheduleOfflineDialogRecovery({
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    lastCoveredAt: new Date(NOW.getTime() - 2 * 60 * 60_000),
+    now: NOW,
+    db: dbFixture({
+      completedBaseline: {
+        id: "recovery-with-cancelled-child",
+        source: "offline_gap_recovery",
+        generation: 11,
+        completedAt: new Date(NOW.getTime() - 5 * 60_000),
+      },
+      latest: {
+        id: "recovery-with-cancelled-child",
+        status: "COMPLETED",
+        generation: 11,
+        continuation: {},
+      },
+      unfinished: { id: "cancelled-dialog", status: "CANCELLED" },
+    }),
+    schedule: async () => { calls += 1; return { ok: true, created: true }; },
+  });
+  assert.equal(result.created, true);
+  assert.equal(calls, 1);
+  assert.equal(shouldPreserveRealtimeCoverage(result), true);
 });

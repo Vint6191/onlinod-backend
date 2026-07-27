@@ -79,14 +79,14 @@ function resolveAccountRefs(account = {}) {
   return { remoteId, username, candidateIds };
 }
 
-async function resolveCreatorForObservation({ agencyId, account }) {
+async function resolveCreatorForObservation({ agencyId, account, db = prisma }) {
   const { remoteId, username, candidateIds } = resolveAccountRefs(account);
   const or = [];
   if (candidateIds.length) or.push({ id: { in: candidateIds } });
   if (remoteId) or.push({ remoteId });
   if (username) or.push({ username });
   if (!or.length) return null;
-  return prisma.creatorAccount.findFirst({
+  return db.creatorAccount.findFirst({
     where: { agencyId, deletedAt: null, OR: or },
     select: { id: true, username: true, remoteId: true, displayName: true },
   });
@@ -336,8 +336,15 @@ async function updateObservationFromHeartbeat({ agencyId, deviceId, accounts = [
   };
 }
 
-async function recordRealtimeObservationPing({ agencyId, deviceId, account, now = new Date() }) {
-  const creator = await resolveCreatorForObservation({ agencyId, account });
+async function recordRealtimeObservationPing({
+  agencyId,
+  deviceId,
+  account,
+  now = new Date(),
+  advanceRealtimeCoverage = true,
+  db = prisma,
+}) {
+  const creator = await resolveCreatorForObservation({ agencyId, account, db });
   if (!creator?.id) return { ok: false, code: "CREATOR_NOT_FOUND" };
 
   const accountId =
@@ -347,26 +354,37 @@ async function recordRealtimeObservationPing({ agencyId, deviceId, account, now 
     160
   );
 
-  const state = await prisma.teamObservationState.upsert({
+  const coverageData = advanceRealtimeCoverage === true
+    ? { lastRealtimeEventAt: now }
+    : {};
+  const state = await db.teamObservationState.upsert({
     where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
     create: {
       agencyId,
       creatorId: creator.id,
       accountId,
       creatorRef,
-      lastRealtimeEventAt: now,
+      lastHeartbeatAt: now,
       lastObservedAt: now,
       lockedByDeviceId: clean(deviceId, 160),
+      ...coverageData,
     },
     update: {
       accountId,
       creatorRef,
-      lastRealtimeEventAt: now,
+      lastHeartbeatAt: now,
       lastObservedAt: now,
+      ...coverageData,
     },
   });
 
-  return { ok: true, creatorId: creator.id, accountId, state };
+  return {
+    ok: true,
+    creatorId: creator.id,
+    accountId,
+    coverageAdvanced: advanceRealtimeCoverage === true,
+    state,
+  };
 }
 
 function eventList(result) {

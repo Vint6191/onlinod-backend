@@ -44,6 +44,7 @@ const {
   triggerPendingReplyScan,
   ensureAutomaticBumps,
 } = require("../services/bump-service");
+const { sanitizeAutomationRuntimeEvents } = require("../services/automation-runtime-event-contract");
 const {
   scheduleLikesDiscovery,
   planLikes,
@@ -405,6 +406,10 @@ router.post("/bumps/:creatorId/events", seniorRequired, async (req, res) => {
       deviceId: z.string().min(1).max(160),
       events: z.array(z.record(z.unknown())).max(500),
     }).parse(req.body || {});
+    // Defense in depth: even an older desktop build may submit the full
+    // normalized WS event. Strip message text, media and profile payloads
+    // before any Automation service can observe them.
+    const safeEvents = sanitizeAutomationRuntimeEvents(input.events, 500);
     const freshAfter = new Date(Date.now() - 5 * 60_000);
     const binding = await prisma.deviceCreatorBinding.findFirst({
       where: {
@@ -428,7 +433,7 @@ router.post("/bumps/:creatorId/events", seniorRequired, async (req, res) => {
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
       userId: req.auth.userId,
-      events: input.events,
+      events: safeEvents,
     }));
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);

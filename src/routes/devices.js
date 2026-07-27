@@ -7,6 +7,7 @@ const {
   OFFLINE_DIALOG_RECOVERY_GAP_MS,
   hasLongOfflineGap,
   scheduleOfflineDialogRecovery,
+  shouldPreserveRealtimeCoverage,
 } = require("../services/dialog-offline-recovery-service");
 
 const router = express.Router();
@@ -42,6 +43,7 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
   let rejected = 0;
   const seenCreatorIds = [];
   const recoveryCandidates = new Map();
+  const resolvedAccounts = [];
 
   for (const account of list) {
     const status = String(account?.status || "").toUpperCase();
@@ -111,6 +113,14 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
     });
 
     seenCreatorIds.push(creator.id);
+    resolvedAccounts.push({
+      creatorId: creator.id,
+      account: {
+        ...account,
+        creatorId: creator.id,
+        backendCreatorId: creator.id,
+      },
+    });
     accepted += 1;
   }
 
@@ -129,6 +139,7 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
     rejected,
     visibleCreatorIds: seenCreatorIds,
     recoveryCandidates: [...recoveryCandidates.values()],
+    resolvedAccounts,
   };
 }
 
@@ -177,30 +188,36 @@ router.post("/heartbeat", async (req, res) => {
     });
 
     const dialogRecovery = [];
+    const recoveryDecisions = new Map();
     for (const candidate of bindings.recoveryCandidates || []) {
+      let result;
       try {
-        dialogRecovery.push(await scheduleOfflineDialogRecovery({
+        result = await scheduleOfflineDialogRecovery({
           agencyId,
           creatorId: candidate.creatorId,
           lastCoveredAt: candidate.lastCoveredAt,
           now: heartbeatAt,
-        }));
+        });
       } catch (error) {
         console.warn("[devices/heartbeat] offline dialog recovery scheduling failed:", {
           creatorId: candidate.creatorId,
           error: error?.message || String(error),
         });
-        dialogRecovery.push({
+        result = {
           ok: false,
           created: false,
           creatorId: candidate.creatorId,
           reason: "recovery_schedule_failed",
           error: error?.message || String(error),
-        });
+        };
       }
+      recoveryDecisions.set(candidate.creatorId, result);
+      dialogRecovery.push(result);
     }
 
-    const realtimeAccounts = input.accounts.filter((account) => account?.realtimeHealthy === true);
+    const realtimeBindings = (bindings.resolvedAccounts || [])
+      .filter((entry) => entry?.account?.realtimeHealthy === true);
+    const realtimeAccounts = realtimeBindings.map((entry) => entry.account);
     let observation = null;
     try {
       // Notification catch-up and dialog recovery use the same truthful
@@ -212,15 +229,23 @@ router.post("/heartbeat", async (req, res) => {
         accounts: realtimeAccounts,
       });
       const realtimePings = [];
-      for (const account of realtimeAccounts) {
+      for (const entry of realtimeBindings) {
+        const decision = recoveryDecisions.get(entry.creatorId) || null;
         realtimePings.push(await recordRealtimeObservationPing({
           agencyId,
           deviceId: input.deviceId,
-          account,
+          account: entry.account,
           now: heartbeatAt,
+          // lastRealtimeEventAt means contiguous, reconciled coverage. A live
+          // WS can be healthy again while an older offline hole is paused,
+          // cancelled, running or waiting to be scheduled. Preserve the old
+          // boundary until that hole is actually settled.
+          advanceRealtimeCoverage: !shouldPreserveRealtimeCoverage(decision),
         }));
       }
       observation.realtimeHealthy = realtimePings.filter((item) => item?.ok).length;
+      observation.realtimeCoverageAdvanced = realtimePings.filter((item) => item?.coverageAdvanced).length;
+      observation.realtimeCoverageFenced = realtimePings.filter((item) => item?.ok && !item?.coverageAdvanced).length;
     } catch (err) {
       console.warn("[devices/heartbeat] observation update failed:", err?.message || err);
       observation = { ok: false, code: "OBSERVATION_UPDATE_FAILED" };
@@ -279,43 +304,15 @@ router.post("/heartbeat", async (req, res) => {
   }
 });
 
-const realtimePingSchema = z.object({
-  deviceId: z.string().min(3).max(160),
-  agencyId: z.string().optional().nullable(),
-  activeAgencyId: z.string().optional().nullable(),
-  accountId: z.string().optional().nullable(),
-  creatorId: z.string().optional().nullable(),
-  backendCreatorId: z.string().optional().nullable(),
-  remoteId: z.union([z.string(), z.number()]).optional().nullable(),
-  username: z.string().optional().nullable(),
-  displayName: z.string().optional().nullable(),
-}).passthrough();
-
-router.post("/realtime-ping", async (req, res) => {
-  try {
-    const input = realtimePingSchema.parse(req.body || {});
-    const agencyId = input.agencyId || input.activeAgencyId || req.auth.agencyId;
-
-    const device = await prisma.workerDevice.findUnique({ where: { id: input.deviceId } });
-    if (!device || device.userId !== req.auth.userId || device.agencyId !== agencyId) {
-      return res.status(403).json({ ok: false, code: "NOT_YOUR_DEVICE", error: "Invalid device" });
-    }
-
-    const result = await recordRealtimeObservationPing({
-      agencyId,
-      deviceId: input.deviceId,
-      account: input,
-    });
-
-    return res.json(result);
-  } catch (err) {
-    if (err?.issues) {
-      return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
-    }
-    console.error("[devices/realtime-ping] failed:", err);
-    return res.status(500).json({ ok: false, code: "REALTIME_PING_FAILED", error: "Realtime ping failed" });
-  }
-});
+// Legacy endpoint intentionally cannot mutate realtime coverage. Older builds
+// used it as a blind keepalive and could erase a creator-wide offline gap even
+// while dialog recovery was paused or fenced. Current desktop builds report
+// truthful WS health only through /heartbeat.
+router.post("/realtime-ping", (_req, res) => res.status(410).json({
+  ok: false,
+  code: "REALTIME_PING_DEPRECATED",
+  error: "Use device heartbeat with truthful realtime health",
+}));
 
 router.post("/commands/:id/ack", async (req, res) => {
   try {
