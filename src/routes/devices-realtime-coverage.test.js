@@ -22,3 +22,10 @@ test("heartbeat can fence contiguous coverage while recovery is unresolved", () 
   assert.match(source, /advanceRealtimeCoverage:\s*!shouldPreserveRealtimeCoverage\(decision\)/);
   assert.match(source, /realtimeCoverageFenced/);
 });
+
+
+test("heartbeat validates the inbound frame timestamp and fences poisoned future coverage", () => {
+  assert.match(source, /realtimeFrameSampleAt\(account, now\)/);
+  assert.match(source, /!lastCoveredAt[\s\S]*hasRealtimeCoverageClockSkew\(lastCoveredAt, now\)/);
+  assert.match(source, /realtimeBindings[\s\S]*realtimeFrameSampleAt\(entry\.account, heartbeatAt\)/);
+});

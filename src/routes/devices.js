@@ -2,10 +2,11 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { authRequired } = require("../middleware/auth");
-const { updateObservationFromHeartbeat, recordRealtimeObservationPing } = require("../services/team-observation-service");
+const { updateObservationFromHeartbeat, recordRealtimeObservationPing, realtimeFrameSampleAt } = require("../services/team-observation-service");
 const {
   OFFLINE_DIALOG_RECOVERY_GAP_MS,
   hasLongOfflineGap,
+  hasRealtimeCoverageClockSkew,
   scheduleOfflineDialogRecovery,
   shouldPreserveRealtimeCoverage,
 } = require("../services/dialog-offline-recovery-service");
@@ -82,13 +83,18 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
     // can claim work. It is not proof that WebSocket observation was healthy.
     // Dialog recovery is therefore based only on the durable realtime
     // observation timestamp, and only when a healthy listener comes back.
-    if (account?.realtimeHealthy === true) {
+    const realtimeFrameAt = account?.realtimeHealthy === true
+      ? realtimeFrameSampleAt(account, now)
+      : null;
+    if (realtimeFrameAt) {
       const observation = await prisma.teamObservationState.findUnique({
         where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
         select: { lastRealtimeEventAt: true },
       }).catch(() => null);
       const lastCoveredAt = observation?.lastRealtimeEventAt || null;
-      if (hasLongOfflineGap(lastCoveredAt, now, OFFLINE_DIALOG_RECOVERY_GAP_MS)) {
+      if (!lastCoveredAt
+        || hasLongOfflineGap(lastCoveredAt, now, OFFLINE_DIALOG_RECOVERY_GAP_MS)
+        || hasRealtimeCoverageClockSkew(lastCoveredAt, now)) {
         recoveryCandidates.set(creator.id, { creatorId: creator.id, lastCoveredAt });
       }
     }
@@ -119,6 +125,8 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
         ...account,
         creatorId: creator.id,
         backendCreatorId: creator.id,
+        realtimeHealthy: Boolean(realtimeFrameAt),
+        lastWsFrameAt: realtimeFrameAt?.toISOString() || null,
       },
     });
     accepted += 1;
@@ -216,7 +224,8 @@ router.post("/heartbeat", async (req, res) => {
     }
 
     const realtimeBindings = (bindings.resolvedAccounts || [])
-      .filter((entry) => entry?.account?.realtimeHealthy === true);
+      .filter((entry) => entry?.account?.realtimeHealthy === true
+        && Boolean(realtimeFrameSampleAt(entry.account, heartbeatAt)));
     const realtimeAccounts = realtimeBindings.map((entry) => entry.account);
     let observation = null;
     try {

@@ -199,6 +199,29 @@ test("completed discovery with no planned dialogs reports creator coverage as se
   }]);
 });
 
+test("cancelled child history is never reported as settled creator coverage", async () => {
+  const db = createDb();
+  seedCompletedDiscovery(db, 7, "COMPLETED");
+  db._states.set("dialog-cancelled", {
+    id: "state-cancelled",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    dialogId: "dialog-cancelled",
+    fanId: "fan-cancelled",
+    generation: 7,
+    status: "CANCELLED",
+    activeRunId: null,
+    activeJobId: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 2,
+  });
+  assert.equal(result.batch, null);
+  assert.deepEqual(result.settledCreators, []);
+});
+
 test("batch claim finalizes a committed terminal discovery boundary before looking for PLANNED rows", async () => {
   const db = createDb();
   seedPlanned(db, 2, 17);
@@ -581,12 +604,18 @@ test("new desktop completion reconciles the durable message counter to local SQL
   assert.equal(db._states.get("dialog-01").confirmedWatermarkMessageId, "message-120");
 });
 
-function localCountTx({ recovery = null, unfinished = null } = {}) {
+function localCountTx({ recovery = null, completed = null, latest = null, latestAfter = undefined, unfinished = null, realtimeCoveredAt = new Date() } = {}) {
   const rawCalls = [];
   const creates = [];
+  let latestReads = 0;
   const tx = {
     creatorAccount: {
       async findMany() { return [{ id: "creator-1" }]; },
+    },
+    teamObservationState: {
+      async findUnique() {
+        return realtimeCoveredAt ? { lastRealtimeEventAt: realtimeCoveredAt } : null;
+      },
     },
     dialogScanRun: {
       async findFirst({ where }) {
@@ -599,9 +628,11 @@ function localCountTx({ recovery = null, unfinished = null } = {}) {
           createdAt: new Date("2026-07-21T00:00:00.000Z"),
         };
         if (where.status === "COMPLETED") {
-          return recovery?.status === "COMPLETED" ? recovery : baseline;
+          return completed || (recovery?.status === "COMPLETED" ? recovery : baseline);
         }
-        return recovery || baseline;
+        latestReads += 1;
+        if (latestReads > 1 && latestAfter !== undefined) return latestAfter;
+        return latest || recovery || completed || baseline;
       },
     },
     dialogScanState: {
@@ -727,6 +758,38 @@ test("completed recovery keeps the fence closed while planned histories remain",
   assert.equal(fence.reason, "offline_recovery_history_pending");
 });
 
+test("cancelled recovery history keeps realtime watermarks fenced", async () => {
+  const fixture = localCountTx({
+    recovery: {
+      id: "recovery-run",
+      source: "offline_gap_recovery",
+      generation: 8,
+      status: "COMPLETED",
+      completedAt: new Date(),
+      createdAt: new Date(Date.now() - 60_000),
+    },
+    unfinished: { id: "state-cancelled", dialogId: "dialog-gap", status: "CANCELLED" },
+  });
+  const fence = await realtimeWatermarkFenceTx(fixture.tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+  });
+  assert.equal(fence.allowed, false);
+  assert.equal(fence.reason, "offline_recovery_history_pending");
+});
+
+test("stale all-device realtime coverage blocks watermark confirmation before heartbeat recovery", async () => {
+  const fixture = localCountTx({
+    realtimeCoveredAt: new Date(Date.now() - 2 * 60 * 60_000),
+  });
+  const fence = await realtimeWatermarkFenceTx(fixture.tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+  });
+  assert.equal(fence.allowed, false);
+  assert.equal(fence.reason, "realtime_coverage_gap");
+});
+
 test("settled offline recovery reopens realtime watermark confirmation", async () => {
   const fixture = localCountTx({
     recovery: {
@@ -746,6 +809,67 @@ test("settled offline recovery reopens realtime watermark confirmation", async (
   assert.equal(fence.allowed, true);
   assert.equal(fence.reason, "offline_recovery_settled");
   assert.equal(fence.recoveryRunId, "recovery-run");
+});
+
+test("a newer completed discovery keeps an older recovery generation from confirming realtime watermarks", async () => {
+  const oldRecovery = {
+    id: "recovery-generation-8",
+    source: "offline_gap_recovery",
+    generation: 8,
+    status: "COMPLETED",
+    completedAt: new Date("2026-07-23T12:00:00.000Z"),
+    createdAt: new Date("2026-07-23T11:00:00.000Z"),
+  };
+  const newerDiscovery = {
+    id: "manual-generation-9",
+    source: "manual",
+    generation: 9,
+    status: "COMPLETED",
+    completedAt: new Date("2026-07-23T12:30:00.000Z"),
+    createdAt: new Date("2026-07-23T12:10:00.000Z"),
+  };
+  const fixture = localCountTx({
+    completed: oldRecovery,
+    latest: newerDiscovery,
+    // No generation-8 state remains after the generation-9 upsert. Absence of
+    // old mutable rows is not proof that generation 8 settled successfully.
+    unfinished: null,
+  });
+  const fence = await realtimeWatermarkFenceTx(fixture.tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+  });
+  assert.equal(fence.allowed, false);
+  assert.equal(fence.reason, "dialog_discovery_completed");
+  assert.equal(fence.recoveryRunId, "manual-generation-9");
+});
+
+test("a discovery that starts during the mutable state check keeps realtime watermarks fenced", async () => {
+  const recovery = {
+    id: "recovery-generation-10",
+    source: "offline_gap_recovery",
+    generation: 10,
+    status: "COMPLETED",
+    completedAt: new Date("2026-07-23T12:00:00.000Z"),
+    createdAt: new Date("2026-07-23T11:00:00.000Z"),
+  };
+  const fixture = localCountTx({
+    recovery,
+    unfinished: null,
+    latestAfter: {
+      id: "manual-generation-11",
+      source: "manual",
+      generation: 11,
+      status: "RUNNING",
+    },
+  });
+  const fence = await realtimeWatermarkFenceTx(fixture.tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+  });
+  assert.equal(fence.allowed, false);
+  assert.equal(fence.reason, "dialog_discovery_running");
+  assert.equal(fence.recoveryRunId, "manual-generation-11");
 });
 
 test("terminal phantom dialog results are resolved as unavailable instead of failing the creator scan", async () => {
@@ -871,4 +995,103 @@ test("expired or explicitly released batches return their dialogs to PLANNED", a
   assert.equal(missingLease.recovered, 1);
   assert.equal(missingLeaseRun.status, "FAILED");
   assert.equal(missingLeaseRun.lastError, "DIALOG_HISTORY_BATCH_LEASE_MISSING");
+});
+
+test("settledCreators is withheld when a newer discovery starts during mutable state verification", async () => {
+  const db = createDb();
+  seedCompletedDiscovery(db, 7, "COMPLETED");
+  const originalFindFirst = db.dialogScanState.findFirst;
+  let advanced = false;
+  db.dialogScanState.findFirst = async (args) => {
+    const result = await originalFindFirst(args);
+    if (!advanced && Array.isArray(args?.where?.status?.in)) {
+      advanced = true;
+      db._runs.delete("discovery-7");
+      db._runs.set("discovery-8", {
+        id: "discovery-8",
+        agencyId: "agency-1",
+        creatorId: "creator-1",
+        dialogId: "__dialog_discovery__",
+        source: "manual",
+        status: "RUNNING",
+        generation: 8,
+        continuation: {},
+        createdAt: new Date(2000),
+        updatedAt: new Date(2000),
+      });
+    }
+    return result;
+  };
+
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 2,
+  });
+  assert.equal(result.batch, null);
+  assert.deepEqual(result.settledCreators, []);
+});
+
+test("settledCreators is withheld when the authoritative plan is paused during verification", async () => {
+  const db = createDb();
+  seedCompletedDiscovery(db, 7, "COMPLETED");
+  const originalFindFirst = db.dialogScanState.findFirst;
+  let paused = false;
+  db.dialogScanState.findFirst = async (args) => {
+    const result = await originalFindFirst(args);
+    if (!paused && Array.isArray(args?.where?.status?.in)) {
+      paused = true;
+      db._runs.get("discovery-7").continuation = { historyControl: { state: "PAUSED" } };
+    }
+    return result;
+  };
+
+  const result = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 2,
+  });
+  assert.equal(result.batch, null);
+  assert.deepEqual(result.settledCreators, []);
+  assert.equal(result.reason, "dialog_history_paused");
+});
+
+test("realtime watermark remains fenced when the same completed generation is paused during state verification", async () => {
+  const db = createDb();
+  seedCompletedDiscovery(db, 7, "COMPLETED");
+  const run = db._runs.get("discovery-7");
+  run.source = "offline_gap_recovery";
+  run.continuation = {};
+  run.createdAt = new Date("2026-07-27T09:00:00.000Z");
+  run.completedAt = new Date("2026-07-27T09:30:00.000Z");
+  db.teamObservationState = {
+    findUnique: async () => ({ lastRealtimeEventAt: new Date("2026-07-27T09:45:00.000Z") }),
+  };
+  const originalFindFirst = db.dialogScanState.findFirst;
+  let paused = false;
+  db.dialogScanState.findFirst = async (args) => {
+    const result = await originalFindFirst(args);
+    if (!paused && Array.isArray(args?.where?.status?.in)) {
+      paused = true;
+      run.continuation = { historyControl: { state: "PAUSED" } };
+    }
+    return result;
+  };
+
+  const result = await realtimeWatermarkFenceTx(db, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    now: new Date("2026-07-27T10:00:00.000Z"),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.reason, "dialog_history_paused");
+});
+
+
+test("a far-future realtime boundary cannot confirm local watermarks", async () => {
+  const fixture = localCountTx({
+    realtimeCoveredAt: new Date(Date.now() + 60_000),
+  });
+  const fence = await realtimeWatermarkFenceTx(fixture.tx, {
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+  });
+  assert.equal(fence.allowed, false);
+  assert.equal(fence.reason, "realtime_coverage_clock_skew");
 });

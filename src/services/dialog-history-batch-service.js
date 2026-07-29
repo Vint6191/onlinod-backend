@@ -20,6 +20,11 @@ const DEFAULT_LEASE_MS = 10 * 60_000;
 const MIN_LEASE_MS = 60_000;
 const MAX_LEASE_MS = 30 * 60_000;
 const BATCH_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
+const REALTIME_COVERAGE_GAP_MS = 60 * 60 * 1000;
+const REALTIME_COVERAGE_CLOCK_SKEW_MS = 30 * 1000;
+const UNSETTLED_DIALOG_HISTORY_STATUSES = [
+  "PLANNED", "QUEUED", "RUNNING", "PAUSED", "FAILED", "IDLE", "CANCELLED", "CANCELED",
+];
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -466,12 +471,44 @@ async function claimDialogHistoryBatchTx(db, input) {
       orderBy: [{ updatedAt: "asc" }, { dialogId: "asc" }],
     });
     if (!candidate) {
-      const settledAt = dateOrNull(latestDiscovery.completedAt || latestDiscovery.updatedAt || latestDiscovery.createdAt);
-      settledCreators.push({
-        creatorId: candidateCreatorId,
-        generation: integer(latestDiscovery.generation, 0),
-        settledAt: settledAt ? settledAt.toISOString() : null,
+      const unsettled = await db.dialogScanState.findFirst({
+        where: {
+          agencyId,
+          creatorId: candidateCreatorId,
+          generation: integer(latestDiscovery.generation, 0),
+          dialogId: { notIn: ["__dialog_discovery__", DIALOG_HISTORY_BATCH_DIALOG_ID] },
+          status: { in: UNSETTLED_DIALOG_HISTORY_STATUSES },
+        },
+        select: { id: true, status: true },
       });
+      if (!unsettled) {
+        // DialogScanState is mutable across generations. A newer discovery can
+        // move every row after the state query and make the old generation look
+        // empty. Re-read the authoritative head before telling Desktop that WS
+        // coverage is settled, and re-check manual pause/cancel controls too.
+        const latestAfterStateCheck = await db.dialogScanRun.findFirst({
+          where: { agencyId, creatorId: candidateCreatorId, dialogId: "__dialog_discovery__" },
+          orderBy: { createdAt: "desc" },
+          select: { id: true, generation: true, status: true, continuation: true, completedAt: true, updatedAt: true, createdAt: true },
+        });
+        const latestAfterControl = dialogHistoryControl(latestAfterStateCheck).state;
+        if (!latestAfterStateCheck
+          || latestAfterStateCheck.id !== latestDiscovery.id
+          || integer(latestAfterStateCheck.generation, -1) !== integer(latestDiscovery.generation, 0)
+          || clean(latestAfterStateCheck.status, 40).toUpperCase() !== "COMPLETED"
+          || ["PAUSED", "CANCELLED", "CANCELED"].includes(latestAfterControl)) {
+          if (["PAUSED", "CANCELLED", "CANCELED"].includes(latestAfterControl)) {
+            controlledCreators.set(candidateCreatorId, latestAfterControl);
+          }
+          continue;
+        }
+        const settledAt = dateOrNull(latestAfterStateCheck.completedAt || latestAfterStateCheck.updatedAt || latestAfterStateCheck.createdAt);
+        settledCreators.push({
+          creatorId: candidateCreatorId,
+          generation: integer(latestAfterStateCheck.generation, 0),
+          settledAt: settledAt ? settledAt.toISOString() : null,
+        });
+      }
       continue;
     }
     if (!first) {
@@ -905,8 +942,8 @@ async function completeDialogHistoryBatch(input) {
 }
 
 
-async function realtimeWatermarkFenceTx(db, { agencyId, creatorId }) {
-  const [baseline, latestDiscovery] = await Promise.all([
+async function realtimeWatermarkFenceTx(db, { agencyId, creatorId, now = new Date() }) {
+  const [baseline, latestDiscovery, observation] = await Promise.all([
     db.dialogScanRun.findFirst({
       where: {
         agencyId,
@@ -915,14 +952,44 @@ async function realtimeWatermarkFenceTx(db, { agencyId, creatorId }) {
         status: "COMPLETED",
       },
       orderBy: { completedAt: "desc" },
-      select: { id: true, source: true, generation: true, completedAt: true, createdAt: true },
+      select: { id: true, source: true, generation: true, status: true, continuation: true, completedAt: true, createdAt: true },
     }),
     db.dialogScanRun.findFirst({
       where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
       orderBy: { createdAt: "desc" },
-      select: { id: true, source: true, generation: true, status: true, completedAt: true, createdAt: true },
+      select: { id: true, source: true, generation: true, status: true, continuation: true, completedAt: true, createdAt: true },
+    }),
+    db.teamObservationState.findUnique({
+      where: { agencyId_creatorId: { agencyId, creatorId } },
+      select: { lastRealtimeEventAt: true },
     }),
   ]);
+  const current = dateOrNull(now) || new Date();
+  const realtimeCoveredAt = dateOrNull(observation?.lastRealtimeEventAt);
+  if (!realtimeCoveredAt) {
+    return {
+      allowed: false,
+      reason: "realtime_coverage_unknown",
+      recoveryRunId: null,
+      recoveryGeneration: null,
+    };
+  }
+  if (realtimeCoveredAt.getTime() > current.getTime() + REALTIME_COVERAGE_CLOCK_SKEW_MS) {
+    return {
+      allowed: false,
+      reason: "realtime_coverage_clock_skew",
+      recoveryRunId: null,
+      recoveryGeneration: null,
+    };
+  }
+  if (current.getTime() - realtimeCoveredAt.getTime() >= REALTIME_COVERAGE_GAP_MS) {
+    return {
+      allowed: false,
+      reason: "realtime_coverage_gap",
+      recoveryRunId: null,
+      recoveryGeneration: null,
+    };
+  }
   if (!baseline) {
     return {
       allowed: false,
@@ -933,15 +1000,25 @@ async function realtimeWatermarkFenceTx(db, { agencyId, creatorId }) {
   }
 
   const latestStatus = clean(latestDiscovery?.status, 40)?.toUpperCase() || "";
-  if (latestDiscovery && latestDiscovery.id !== baseline.id && latestStatus !== "COMPLETED") {
+  if (latestDiscovery && latestDiscovery.id !== baseline.id) {
     const recovery = clean(latestDiscovery.source, 80) === "offline_gap_recovery";
     return {
       allowed: false,
       reason: recovery
-        ? `offline_recovery_${latestStatus.toLowerCase() || "active"}`
-        : `dialog_discovery_${latestStatus.toLowerCase() || "active"}`,
+        ? `offline_recovery_${latestStatus.toLowerCase() || "newer_generation"}`
+        : `dialog_discovery_${latestStatus.toLowerCase() || "newer_generation"}`,
       recoveryRunId: latestDiscovery.id,
       recoveryGeneration: integer(latestDiscovery.generation, 0),
+    };
+  }
+
+  const authoritativeControl = dialogHistoryControl(latestDiscovery || baseline).state;
+  if (["PAUSED", "CANCELLED", "CANCELED"].includes(authoritativeControl)) {
+    return {
+      allowed: false,
+      reason: authoritativeControl === "PAUSED" ? "dialog_history_paused" : "dialog_history_cancelled",
+      recoveryRunId: baseline.id,
+      recoveryGeneration: integer(baseline.generation, 0),
     };
   }
 
@@ -955,7 +1032,7 @@ async function realtimeWatermarkFenceTx(db, { agencyId, creatorId }) {
       creatorId,
       generation: integer(baseline.generation, 0),
       dialogId: { notIn: ["__dialog_discovery__", DIALOG_HISTORY_BATCH_DIALOG_ID] },
-      status: { in: ["PLANNED", "QUEUED", "RUNNING", "PAUSED", "FAILED", "IDLE"] },
+      status: { in: UNSETTLED_DIALOG_HISTORY_STATUSES },
     },
     select: { id: true, dialogId: true, status: true },
   });
@@ -966,6 +1043,35 @@ async function realtimeWatermarkFenceTx(db, { agencyId, creatorId }) {
       reason: recovery ? "offline_recovery_history_pending" : "dialog_discovery_history_pending",
       recoveryRunId: baseline.id,
       recoveryGeneration: integer(baseline.generation, 0),
+    };
+  }
+
+  // DialogScanState rows are mutable and can be moved to a newer generation by
+  // a concurrent discovery. Confirm the authoritative head again after the
+  // state query so an old generation cannot look empty because it was replaced.
+  const latestAfterStateCheck = await db.dialogScanRun.findFirst({
+    where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, source: true, generation: true, status: true, continuation: true },
+  });
+  const latestAfterControl = dialogHistoryControl(latestAfterStateCheck).state;
+  if (!latestAfterStateCheck
+    || latestAfterStateCheck.id !== baseline.id
+    || integer(latestAfterStateCheck.generation, -1) !== integer(baseline.generation, 0)
+    || clean(latestAfterStateCheck.status, 40).toUpperCase() !== "COMPLETED"
+    || ["PAUSED", "CANCELLED", "CANCELED"].includes(latestAfterControl)) {
+    const recovery = clean(latestAfterStateCheck?.source, 80) === "offline_gap_recovery";
+    const status = clean(latestAfterStateCheck?.status, 40)?.toUpperCase() || "NEWER_GENERATION";
+    const reason = ["PAUSED", "CANCELLED", "CANCELED"].includes(latestAfterControl)
+      ? (latestAfterControl === "PAUSED" ? "dialog_history_paused" : "dialog_history_cancelled")
+      : recovery
+        ? `offline_recovery_${status.toLowerCase()}`
+        : `dialog_discovery_${status.toLowerCase()}`;
+    return {
+      allowed: false,
+      reason,
+      recoveryRunId: latestAfterStateCheck?.id || null,
+      recoveryGeneration: latestAfterStateCheck ? integer(latestAfterStateCheck.generation, 0) : null,
     };
   }
 

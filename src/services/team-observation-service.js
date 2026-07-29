@@ -13,6 +13,8 @@ const DEFAULT_BUFFER_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_OFFLINE_GAP_MS = 10 * 60 * 1000;
 const DEFAULT_MAX_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 const DEFAULT_LOCK_MS = 10 * 60 * 1000;
+const REALTIME_FRAME_FRESH_MS = 3 * 60 * 1000;
+const REALTIME_CLOCK_SKEW_MS = 30 * 1000;
 
 function clean(value, max = 255) {
   const s = String(value ?? "").trim();
@@ -36,6 +38,16 @@ function maxDate(...values) {
     if (!best || d.getTime() > best.getTime()) best = d;
   }
   return best;
+}
+
+
+function realtimeFrameSampleAt(account, now = new Date()) {
+  const current = dateOrNull(now) || new Date();
+  const frameAt = dateOrNull(account?.lastWsFrameAt);
+  if (!frameAt) return null;
+  const ageMs = current.getTime() - frameAt.getTime();
+  if (ageMs < -REALTIME_CLOCK_SKEW_MS || ageMs > REALTIME_FRAME_FRESH_MS) return null;
+  return frameAt.getTime() > current.getTime() ? current : frameAt;
 }
 
 function amountCents(value) {
@@ -353,36 +365,64 @@ async function recordRealtimeObservationPing({
     account?.username || creator.username || account?.displayName || creator.displayName || null,
     160
   );
+  const current = dateOrNull(now) || new Date();
+  const frameAt = realtimeFrameSampleAt(account, current);
+  const coverageAt = advanceRealtimeCoverage === true ? frameAt : null;
 
-  const coverageData = advanceRealtimeCoverage === true
-    ? { lastRealtimeEventAt: now }
-    : {};
-  const state = await db.teamObservationState.upsert({
+  // Heartbeat receipt time proves only that the desktop process answered. The
+  // contiguous realtime boundary may advance no further than the actual inbound
+  // frame sampled by that heartbeat. This also makes a request started before
+  // sleep harmless when it completes after resume.
+  let state = await db.teamObservationState.upsert({
     where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
     create: {
       agencyId,
       creatorId: creator.id,
       accountId,
       creatorRef,
-      lastHeartbeatAt: now,
-      lastObservedAt: now,
+      lastHeartbeatAt: current,
+      lastObservedAt: current,
       lockedByDeviceId: clean(deviceId, 160),
-      ...coverageData,
+      ...(coverageAt ? { lastRealtimeEventAt: coverageAt } : {}),
     },
     update: {
       accountId,
       creatorRef,
-      lastHeartbeatAt: now,
-      lastObservedAt: now,
-      ...coverageData,
+      lastHeartbeatAt: current,
+      lastObservedAt: current,
     },
   });
+
+  if (coverageAt && db.teamObservationState.updateMany) {
+    // Multiple devices can heartbeat concurrently. Never let a delayed older
+    // sample move the creator-wide boundary backwards. A previously polluted
+    // far-future timestamp is the one exception and is repaired by the next
+    // valid frame.
+    await db.teamObservationState.updateMany({
+      where: {
+        agencyId,
+        creatorId: creator.id,
+        OR: [
+          { lastRealtimeEventAt: null },
+          { lastRealtimeEventAt: { lt: coverageAt } },
+          { lastRealtimeEventAt: { gt: new Date(current.getTime() + REALTIME_CLOCK_SKEW_MS) } },
+        ],
+      },
+      data: { lastRealtimeEventAt: coverageAt },
+    });
+    if (db.teamObservationState.findUnique) {
+      state = await db.teamObservationState.findUnique({
+        where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
+      }).catch(() => state);
+    }
+  }
 
   return {
     ok: true,
     creatorId: creator.id,
     accountId,
-    coverageAdvanced: advanceRealtimeCoverage === true,
+    coverageAdvanced: Boolean(coverageAt),
+    coverageAt: coverageAt?.toISOString() || null,
     state,
   };
 }
@@ -660,6 +700,7 @@ module.exports = {
   CATCHUP_JOB_KEY,
   updateObservationFromHeartbeat,
   recordRealtimeObservationPing,
+  realtimeFrameSampleAt,
   applyCatchupJobResult,
   recordCatchupJobFailure,
 };
