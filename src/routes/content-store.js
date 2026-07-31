@@ -80,7 +80,7 @@ router.get("/collections", async (req, res) => {
     const q = cleanString(req.query.q, 120);
 
     if (kind) where.kind = kind;
-    if (creatorId) where.creatorId = creatorId;
+    where.creatorId = creatorId;
     if (status) where.status = status;
     if (q) {
       where.OR = [
@@ -222,6 +222,8 @@ router.post("/collections/:id/usage", async (req, res) => {
 const MESSAGE_LIBRARY_KIND = "message_library_script";
 
 const MESSAGE_LIBRARY_TRASH_RETENTION_DAYS = 14;
+const MESSAGE_LIBRARY_PURGE_INTERVAL_MS = 10 * 60 * 1000;
+const messageLibraryPurgeStateByAgency = new Map();
 const MESSAGE_LIBRARY_MANAGER_PERMISSION_KEYS = [
   "message_library.manage",
   "messageLibrary.manage",
@@ -257,6 +259,12 @@ function assertMessageLibraryManager(req) {
   err.status = 403;
   err.code = "MESSAGE_LIBRARY_MANAGER_REQUIRED";
   throw err;
+}
+
+async function requireMessageLibraryCreator(req) {
+  const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
+  await requireCreator(prisma, req.auth.agencyId, creatorId);
+  return creatorId;
 }
 
 async function purgeExpiredMessageLibraryTrash(agencyId) {
@@ -299,6 +307,29 @@ async function purgeExpiredMessageLibraryTrash(agencyId) {
   return { ok: true, scriptsDeleted: collectionDelete.count || 0, blocksDeleted: expiredBlocks.count || 0 };
 }
 
+async function maybePurgeExpiredMessageLibraryTrash(agencyId, { force = false } = {}) {
+  const key = String(agencyId || "").trim();
+  if (!key) return { ok: true, skipped: true, reason: "agency_missing", scriptsDeleted: 0, blocksDeleted: 0 };
+
+  const now = Date.now();
+  const previous = messageLibraryPurgeStateByAgency.get(key) || null;
+  if (previous?.promise) return previous.promise;
+  if (!force && previous?.completedAt && now - previous.completedAt < MESSAGE_LIBRARY_PURGE_INTERVAL_MS) {
+    return { ok: true, skipped: true, reason: "throttled", scriptsDeleted: 0, blocksDeleted: 0 };
+  }
+
+  const promise = purgeExpiredMessageLibraryTrash(key);
+  messageLibraryPurgeStateByAgency.set(key, { completedAt: previous?.completedAt || 0, promise });
+  try {
+    const result = await promise;
+    messageLibraryPurgeStateByAgency.set(key, { completedAt: Date.now(), promise: null });
+    return result;
+  } catch (error) {
+    messageLibraryPurgeStateByAgency.delete(key);
+    throw error;
+  }
+}
+
 function asDateOrNull(value) {
   if (!value) return null;
   const date = new Date(value);
@@ -318,11 +349,110 @@ function centsFromDollars(value) {
 }
 
 function normalizeMlTags(value = []) {
-  return jsonArray(value).map((x) => cleanString(x, 60)).filter(Boolean).slice(0, 20);
+  const out = [];
+  const seen = new Set();
+  for (const item of jsonArray(value)) {
+    const tag = cleanString(item, 60);
+    const key = tag.toLowerCase();
+    if (!tag || seen.has(key)) continue;
+    seen.add(key);
+    out.push(tag);
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+function mlText(value, max = 12000) {
+  const text = String(value == null ? "" : value);
+  return text.length > max ? text.slice(0, max) : text;
+}
+
+const MESSAGE_LIBRARY_MEDIA_SENSITIVE_KEY = /(^|_)(authorization|cookie|cookies|token|password|secret)($|_)/i;
+
+function isMlMediaSensitiveKey(value) {
+  const normalized = String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[-\s]+/g, "_")
+    .toLowerCase();
+  return MESSAGE_LIBRARY_MEDIA_SENSITIVE_KEY.test(normalized);
+}
+
+function pruneMlMediaValue(value, depth = 0) {
+  if (depth > 6 || value === undefined) return undefined;
+  if (value === null || typeof value !== "object") {
+    if (typeof value === "string") return value.length > 4000 ? value.slice(0, 4000) : value;
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 100).map((item) => pruneMlMediaValue(item, depth + 1)).filter((item) => item !== undefined);
+  }
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key === "__proto__" || key === "prototype" || key === "constructor" || isMlMediaSensitiveKey(key)) continue;
+    const next = pruneMlMediaValue(item, depth + 1);
+    if (next !== undefined) out[key] = next;
+  }
+  return out;
+}
+
+function compactMlMediaRaw(value) {
+  const raw = pruneMlMediaValue(jsonObject(value));
+  try {
+    return JSON.stringify(raw || {}).length <= 50000 ? raw : {};
+  } catch (_) {
+    return {};
+  }
 }
 
 function normalizeMlMedia(value = []) {
-  return jsonArray(value).slice(0, 100);
+  const out = [];
+  const seen = new Set();
+  for (const item of jsonArray(value)) {
+    const row = jsonObject(item);
+    const raw = compactMlMediaRaw(row.raw);
+    const id = cleanString(row.id || row.mediaId || row.media_id || row.sourceId || raw.id, 120);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      type: cleanString(row.type || row.mediaType || row.media_type || raw.type || "media", 40) || "media",
+      thumb: cleanString(row.thumb || row.thumbUrl || row.previewUrl || row.url || raw.thumb || raw.previewUrl || raw.url, 4000),
+      playUrl: optionalString(row.playUrl || row.fullUrl || raw.playUrl || raw.fullUrl || raw.url, 4000),
+      duration: Math.max(0, Number(row.duration || row.dur || raw.duration || 0) || 0),
+      raw: Object.keys(raw).length ? raw : null,
+    });
+    if (out.length >= 100) break;
+  }
+  return out;
+}
+
+function assertUniqueMlBlockClientIds(blocks) {
+  const seen = new Set();
+  for (const block of blocks) {
+    if (!block.clientId || seen.has(block.clientId)) {
+      const err = new Error("Every Message Library block must have a unique id");
+      err.status = 400;
+      err.code = "MESSAGE_LIBRARY_BLOCK_ID_DUPLICATE";
+      throw err;
+    }
+    seen.add(block.clientId);
+  }
+}
+
+function normalizeMlUsageMetadata(body, scriptId, messageId) {
+  const metadata = jsonObject(body.metadata);
+  return {
+    source: cleanString(body.source || metadata.source || "electron-message-library", 100) || "electron-message-library",
+    scriptId: scriptId || null,
+    messageId: messageId || null,
+    draftId: optionalString(body.draftId, 120),
+    realMessageId: optionalString(body.realMessageId || body.purchaseMessageId, 120),
+    amount: Math.max(0, Number(body.amount || metadata.amount || 0) || 0),
+    currency: cleanString(body.currency || metadata.currency || "USD", 10).toUpperCase() || "USD",
+    mediaCount: Math.max(0, Math.min(100, Math.floor(Number(metadata.mediaCount || 0) || 0))),
+    price: Math.max(0, Number(metadata.price || 0) || 0),
+    lockedText: metadata.lockedText === true,
+  };
 }
 
 function messageFromBlock(block = {}, index = 0) {
@@ -336,7 +466,8 @@ function messageFromBlock(block = {}, index = 0) {
     text: block.text || "",
     price: dollarsFromCents(block.priceCents),
     currency: block.currency || "USD",
-    media: jsonArray(block.media),
+    lockedText: block.lockedText === true,
+    media: normalizeMlMedia(block.media),
     note: block.note || "",
     stats: jsonObject(metadata.stats),
     status: block.status || (block.deletedAt ? "trash" : "active"),
@@ -366,7 +497,7 @@ function scriptFromCollection(collection = {}) {
     title: collection.title || "Untitled script",
     folderId: metadata.folderId || "scripts",
     description: collection.description || "",
-    tags: jsonArray(collection.tags),
+    tags: normalizeMlTags(collection.tags),
     messages,
     stats: jsonObject(metadata.stats),
     status: collection.status || (collection.deletedAt ? "trash" : "active"),
@@ -386,7 +517,7 @@ function normalizeMlMessage(message = {}, index = 0) {
     order: Number.isFinite(Number(message.order)) ? Number(message.order) : index,
     role: cleanString(message.role || "message", 40) || "message",
     title: optionalString(message.title || message.role || `Message ${index + 1}`, 180),
-    text: cleanString(message.text || message.messageText || message.body || "", 12000),
+    text: mlText(message.text ?? message.messageText ?? message.body ?? "", 12000),
     priceCents: message.priceCents !== undefined ? centsFromAny(message, "priceCents", "price") : centsFromDollars(message.price),
     currency: cleanString(message.currency || "USD", 10).toUpperCase() || "USD",
     lockedText: message.lockedText === true,
@@ -402,10 +533,11 @@ function normalizeMlMessage(message = {}, index = 0) {
   };
 }
 
-function normalizeMlScriptPayload(req, { patch = false } = {}) {
+async function normalizeMlScriptPayload(req, { patch = false } = {}) {
   const body = req.body || {};
   const scriptId = cleanString(body.id || body.clientId || body.scriptId, 120) || `script_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const creatorId = cleanString(body.creatorId || body.accountId || req.query.creatorId, 100) || null;
+  const creatorId = cleanString(body.creatorId || body.accountId || req.query.creatorId, 100);
+  await requireCreator(prisma, req.auth.agencyId, creatorId);
   const restoreFromTrash = body.trashedAt === null || body.status === "active";
   const trashedAt = restoreFromTrash ? null : asDateOrNull(body.trashedAt);
   const enabled = body.enabled !== false && !trashedAt;
@@ -443,22 +575,33 @@ function normalizeMlScriptPayload(req, { patch = false } = {}) {
   }
 
   const blocks = Array.isArray(body.messages) ? body.messages : Array.isArray(body.blocks) ? body.blocks : [];
-  return { scriptId, data, blocks: blocks.map(normalizeMlMessage) };
+  const normalizedBlocks = blocks.map(normalizeMlMessage);
+  assertUniqueMlBlockClientIds(normalizedBlocks);
+  return { scriptId, data, blocks: normalizedBlocks };
 }
 
 async function upsertMessageLibraryScript(req) {
-  const normalized = normalizeMlScriptPayload(req);
+  const normalized = await normalizeMlScriptPayload(req);
   const existing = await prisma.contentCollection.findFirst({
     where: { agencyId: req.auth.agencyId, clientId: normalized.scriptId, kind: MESSAGE_LIBRARY_KIND },
     include: { blocks: true },
   });
+  if (existing && String(existing.creatorId || "") !== String(normalized.data.creatorId || "")) {
+    const err = new Error("Message Library script belongs to another creator");
+    err.status = 409;
+    err.code = "MESSAGE_LIBRARY_SCRIPT_CREATOR_MISMATCH";
+    throw err;
+  }
 
   return prisma.$transaction(async (tx) => {
     let collection;
     if (existing) {
+      const updateData = { ...normalized.data };
+      delete updateData.agencyId;
+      delete updateData.createdByUserId;
       collection = await tx.contentCollection.update({
         where: { id: existing.id },
-        data: normalized.data,
+        data: updateData,
       });
     } else {
       collection = await tx.contentCollection.create({ data: normalized.data });
@@ -511,9 +654,11 @@ async function upsertMessageLibraryScript(req) {
 
 router.get("/message-library/scripts", async (req, res) => {
   try {
-    await purgeExpiredMessageLibraryTrash(req.auth.agencyId);
+    const creatorId = await requireMessageLibraryCreator(req);
+    // Trash retention is maintenance, not a dependency of reads. A temporary
+    // cleanup failure must never make the authoritative library unavailable.
+    await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId).catch(() => null);
     const includeTrash = req.query.includeTrash === "true" || req.query.includeTrash === "1";
-    const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
     const where = {
       agencyId: req.auth.agencyId,
       kind: MESSAGE_LIBRARY_KIND,
@@ -521,13 +666,18 @@ router.get("/message-library/scripts", async (req, res) => {
     if (!includeTrash) where.deletedAt = null;
     if (creatorId) where.creatorId = creatorId;
 
-    const items = await prisma.contentCollection.findMany({
-      where,
-      include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
-      orderBy: [{ updatedAt: "desc" }],
-      take: parseLimit(req.query.limit, 500, 1000),
-      skip: parseOffset(req.query.offset),
-    });
+    const take = parseLimit(req.query.limit, 500, 1000);
+    const skip = parseOffset(req.query.offset);
+    const [items, count] = await Promise.all([
+      prisma.contentCollection.findMany({
+        where,
+        include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
+        orderBy: [{ updatedAt: "desc" }],
+        take,
+        skip,
+      }),
+      prisma.contentCollection.count({ where }),
+    ]);
 
     return res.json({
       ok: true,
@@ -535,7 +685,9 @@ router.get("/message-library/scripts", async (req, res) => {
       creatorId: creatorId || null,
       accountId: creatorId || null,
       items: items.map(scriptFromCollection),
-      count: items.length,
+      count,
+      nextOffset: skip + items.length,
+      hasMore: skip + items.length < count,
     });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_SCRIPTS_FAILED");
@@ -567,8 +719,9 @@ router.delete("/message-library/scripts/:id", async (req, res) => {
   try {
     assertMessageLibraryManager(req);
     const id = cleanString(req.params.id, 120);
+    const creatorId = await requireMessageLibraryCreator(req);
     const existing = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: id, kind: MESSAGE_LIBRARY_KIND },
+      where: { agencyId: req.auth.agencyId, clientId: id, kind: MESSAGE_LIBRARY_KIND, creatorId },
     });
     if (!existing) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
 
@@ -595,8 +748,9 @@ router.post("/message-library/scripts/:id/restore", async (req, res) => {
   try {
     assertMessageLibraryManager(req);
     const id = cleanString(req.params.id, 120);
+    const creatorId = await requireMessageLibraryCreator(req);
     const existing = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: id, kind: MESSAGE_LIBRARY_KIND },
+      where: { agencyId: req.auth.agencyId, clientId: id, kind: MESSAGE_LIBRARY_KIND, creatorId },
     });
     if (!existing) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
     const item = await prisma.contentCollection.update({
@@ -610,13 +764,35 @@ router.post("/message-library/scripts/:id/restore", async (req, res) => {
   }
 });
 
+router.delete("/message-library/scripts/:id/permanent", async (req, res) => {
+  try {
+    assertMessageLibraryManager(req);
+    const id = cleanString(req.params.id, 120);
+    const creatorId = await requireMessageLibraryCreator(req);
+    const existing = await prisma.contentCollection.findFirst({
+      where: { agencyId: req.auth.agencyId, clientId: id, kind: MESSAGE_LIBRARY_KIND, creatorId },
+      include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
+    });
+    if (!existing) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
+    if (!existing.deletedAt && existing.status !== "trash" && existing.status !== "deleted") {
+      return res.status(409).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_TRASHED", error: "Move the script to trash before deleting it forever" });
+    }
+    const item = scriptFromCollection(existing);
+    await prisma.contentCollection.delete({ where: { id: existing.id } });
+    return res.json({ ok: true, permanent: true, item });
+  } catch (err) {
+    return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_PERMANENT_DELETE_FAILED");
+  }
+});
+
 router.delete("/message-library/scripts/:scriptId/messages/:messageId", async (req, res) => {
   try {
     assertMessageLibraryManager(req);
     const scriptId = cleanString(req.params.scriptId, 120);
     const messageId = cleanString(req.params.messageId, 120);
+    const creatorId = await requireMessageLibraryCreator(req);
     const collection = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: scriptId, kind: MESSAGE_LIBRARY_KIND },
+      where: { agencyId: req.auth.agencyId, clientId: scriptId, kind: MESSAGE_LIBRARY_KIND, creatorId },
       include: { blocks: true },
     });
     if (!collection) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
@@ -638,8 +814,9 @@ router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", as
     assertMessageLibraryManager(req);
     const scriptId = cleanString(req.params.scriptId, 120);
     const messageId = cleanString(req.params.messageId, 120);
+    const creatorId = await requireMessageLibraryCreator(req);
     const collection = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: scriptId, kind: MESSAGE_LIBRARY_KIND },
+      where: { agencyId: req.auth.agencyId, clientId: scriptId, kind: MESSAGE_LIBRARY_KIND, creatorId },
       include: { blocks: true },
     });
     if (!collection) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
@@ -658,7 +835,7 @@ router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", as
 router.post("/message-library/purge-expired", async (req, res) => {
   try {
     assertMessageLibraryManager(req);
-    const result = await purgeExpiredMessageLibraryTrash(req.auth.agencyId);
+    const result = await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId, { force: true });
     return res.json(result);
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_PURGE_EXPIRED_FAILED");
@@ -668,10 +845,16 @@ router.post("/message-library/purge-expired", async (req, res) => {
 router.get("/message-library/usage", async (req, res) => {
   try {
     const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
-    const where = { agencyId: req.auth.agencyId };
-    if (creatorId) where.creatorId = creatorId;
+    if (creatorId) await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const collections = await prisma.contentCollection.findMany({
+      where: { agencyId: req.auth.agencyId, kind: MESSAGE_LIBRARY_KIND, ...(creatorId ? { creatorId } : {}) },
+      select: { id: true },
+      take: 10000,
+    });
+    const collectionIds = collections.map((item) => item.id);
+    if (!collectionIds.length) return res.json({ ok: true, source: "server", events: [], count: 0 });
     const events = await prisma.contentUsageEvent.findMany({
-      where,
+      where: { agencyId: req.auth.agencyId, collectionId: { in: collectionIds }, ...(creatorId ? { creatorId } : {}) },
       orderBy: [{ createdAt: "desc" }],
       take: parseLimit(req.query.limit, 500, 2000),
       skip: parseOffset(req.query.offset),
@@ -687,38 +870,45 @@ router.post("/message-library/usage", async (req, res) => {
     const body = req.body || {};
     const scriptId = cleanString(body.scriptId || body.collectionId, 120);
     const messageId = cleanString(body.messageId || body.blockId, 120);
-    const creatorId = cleanString(body.creatorId || body.accountId, 100) || null;
+    const creatorId = cleanString(body.creatorId || body.accountId, 100);
+    if (!scriptId || !creatorId) {
+      const err = new Error("creatorId and scriptId are required");
+      err.status = 400;
+      err.code = "MESSAGE_LIBRARY_USAGE_KEYS_MISSING";
+      throw err;
+    }
+    await requireCreator(prisma, req.auth.agencyId, creatorId);
 
-    let collection = null;
-    let block = null;
-    if (scriptId) {
-      collection = await prisma.contentCollection.findFirst({
-        where: { agencyId: req.auth.agencyId, kind: MESSAGE_LIBRARY_KIND, clientId: scriptId },
-        include: { blocks: true },
-      });
-      block = collection?.blocks?.find((x) => String(x.clientId || x.id) === String(messageId)) || null;
+    const collection = await prisma.contentCollection.findFirst({
+      where: { agencyId: req.auth.agencyId, kind: MESSAGE_LIBRARY_KIND, clientId: scriptId, creatorId },
+      include: { blocks: true },
+    });
+    if (!collection) {
+      const err = new Error("Message Library script not found for this creator");
+      err.status = 404;
+      err.code = "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND";
+      throw err;
+    }
+    const block = messageId
+      ? collection.blocks.find((item) => String(item.clientId || item.id) === String(messageId)) || null
+      : null;
+    if (messageId && !block) {
+      const err = new Error("Message Library block not found");
+      err.status = 404;
+      err.code = "MESSAGE_LIBRARY_BLOCK_NOT_FOUND";
+      throw err;
     }
 
     const event = await prisma.contentUsageEvent.create({
       data: {
         agencyId: req.auth.agencyId,
-        collectionId: collection?.id || null,
-        blockId: block?.id || messageId || null,
+        collectionId: collection.id,
+        blockId: block?.id || null,
         creatorId,
-        fanId: optionalString(body.fanId || body.dialogId, 80),
+        fanId: optionalString(body.fanId, 80),
         dialogId: optionalString(body.dialogId, 80),
         eventType: cleanString(body.eventType || body.status || "used", 40) || "used",
-        metadata: {
-          ...jsonObject(body.metadata),
-          source: body.source || "electron-message-library",
-          scriptId: scriptId || null,
-          messageId: messageId || null,
-          draftId: body.draftId || null,
-          realMessageId: body.realMessageId || body.purchaseMessageId || null,
-          amount: Number(body.amount || 0) || 0,
-          currency: body.currency || "USD",
-          raw: jsonObject(body.rawEvent || body.raw || {}),
-        },
+        metadata: normalizeMlUsageMetadata(body, scriptId, messageId),
         createdByUserId: req.auth.userId,
       },
     });
