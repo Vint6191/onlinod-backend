@@ -26,8 +26,24 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("../services/job-scheduler");
+const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-analytics-permissions");
+const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
 
 const router = express.Router();
+
+
+function requireEarningsPermission(res, member) {
+  if (canViewEarnings(member)) return true;
+  res.status(403).json({ ok: false, code: "EARNINGS_VIEW_FORBIDDEN", error: "Earnings permission is required" });
+  return false;
+}
+
+function requireRefreshPermission(res, member) {
+  if (canRefreshAnalytics(member)) return true;
+  res.status(403).json({ ok: false, code: "ANALYTICS_REFRESH_FORBIDDEN", error: "Owner, admin, manager or analytics refresh permission is required" });
+  return false;
+}
+
 
 function actorUserId(req) {
   return req.auth?.userId || req.user?.id || null;
@@ -57,6 +73,16 @@ function bigToNum(v) {
   return Number(v);
 }
 
+function sanitizeCampaigns(value) {
+  const clean = sanitizeAnalyticsRaw(value, {
+    maxDepth: 10,
+    maxArrayLength: 2000,
+    maxObjectKeys: 500,
+    maxStringLength: 10_000,
+  });
+  return Array.isArray(clean) ? clean : [];
+}
+
 function snapshotForClient(s) {
   if (!s) return null;
   return {
@@ -76,6 +102,7 @@ function snapshotForClient(s) {
     },
     capturedAt: s.capturedAt,
     capturedByDeviceId: s.capturedByDeviceId,
+    raw: sanitizeAnalyticsRaw(s.raw),
     staleSeconds: Math.max(0, Math.floor((Date.now() - new Date(s.capturedAt).getTime()) / 1000)),
   };
 }
@@ -188,7 +215,7 @@ router.post("/earnings/upsert", async (req, res) => {
       fanLtvCents: Math.round(input.summary.fanLtv || 0),
       salesCount: input.summary.salesCount,
       uniqueFans: input.summary.uniqueFans,
-      raw: input.raw || null,
+      raw: sanitizeAnalyticsRaw(input.raw),
       capturedAt: new Date(),
       capturedByDeviceId: device.id,
       capturedByUserId: userId,
@@ -240,10 +267,11 @@ router.post("/campaigns/upsert", async (req, res) => {
     if (!ctx) return;
     const { creator } = ctx;
 
+    const cleanCampaigns = sanitizeCampaigns(input.campaigns);
     let active = 0,
       claimers = 0,
       clicks = 0;
-    for (const c of input.campaigns) {
+    for (const c of cleanCampaigns) {
       if (c?.is_active) active += 1;
       claimers += Number(c?.claimers_count || 0);
       clicks += Number(c?.clicks_count || 0);
@@ -253,7 +281,7 @@ router.post("/campaigns/upsert", async (req, res) => {
       creatorId: creator.id,
       agencyId: creator.agencyId,
       rangeKey: input.rangeKey || "7d",
-      campaigns: input.campaigns,
+      campaigns: cleanCampaigns,
       totalActive: active,
       totalClaimers: claimers,
       totalClicks: clicks,
@@ -274,7 +302,7 @@ router.post("/campaigns/upsert", async (req, res) => {
         id: snapshot.id,
         creatorId: snapshot.creatorId,
         rangeKey: snapshot.rangeKey,
-        campaigns: snapshot.campaigns,
+        campaigns: sanitizeCampaigns(snapshot.campaigns),
         totals: { active, claimers, clicks },
         capturedAt: snapshot.capturedAt,
         staleSeconds: 0,
@@ -299,6 +327,7 @@ router.get("/creators/:creatorId/earnings", async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
     if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
 
     const range = String(req.query.range || "7d");
     if (!VALID_RANGES.has(range)) {
@@ -333,6 +362,7 @@ router.get("/creators/:creatorId/campaigns", async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
     if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
 
     const snapshot = await prisma.creatorCampaignsSnapshot.findUnique({
       where: { creatorId: ctx.creator.id },
@@ -348,7 +378,7 @@ router.get("/creators/:creatorId/campaigns", async (req, res) => {
         id: snapshot.id,
         creatorId: snapshot.creatorId,
         rangeKey: snapshot.rangeKey,
-        campaigns: snapshot.campaigns || [],
+        campaigns: sanitizeCampaigns(snapshot.campaigns),
         totals: {
           active: snapshot.totalActive,
           claimers: snapshot.totalClaimers,
@@ -372,6 +402,7 @@ router.get("/creators/:creatorId/overview", async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
     if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
 
     const range = String(req.query.range || "7d");
     if (!VALID_RANGES.has(range)) {
@@ -403,7 +434,7 @@ router.get("/creators/:creatorId/overview", async (req, res) => {
       earnings: snapshotForClient(earnings),
       campaigns: campaigns
         ? {
-            campaigns: campaigns.campaigns || [],
+            campaigns: sanitizeCampaigns(campaigns.campaigns),
             totals: { active: campaigns.totalActive, claimers: campaigns.totalClaimers, clicks: campaigns.totalClicks },
             capturedAt: campaigns.capturedAt,
             staleSeconds: Math.max(0, Math.floor((Date.now() - new Date(campaigns.capturedAt).getTime()) / 1000)),
@@ -430,6 +461,7 @@ router.get("/agencies/:agencyId/earnings/summary", async (req, res) => {
   try {
     const ctx = await loadAgencyAccess(req, res, req.params.agencyId);
     if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
 
     const range = String(req.query.range || "7d");
     if (!VALID_RANGES.has(range)) {
@@ -490,6 +522,7 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
     if (!ctx) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
     const { creator } = ctx;
 
     const range = String(req.body?.rangeKey || req.query?.rangeKey || "7d");
@@ -556,6 +589,7 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
   try {
     const ctx = await loadAgencyAccess(req, res, req.params.agencyId);
     if (!ctx) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
 
     const range = String(req.body?.rangeKey || req.query?.rangeKey || "7d");
     if (!VALID_RANGES.has(range)) {
@@ -571,30 +605,64 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
     const now = new Date();
     let jobsScheduled = 0;
     let alreadyClaimed = 0;
-    for (const creator of creators) {
-      for (const spec of [
-        { jobKey: "fetch_earnings", params: { rangeKey: range } },
-        { jobKey: "fetch_campaigns", params: { rangeKey: range } },
-      ]) {
-        const scheduled = await scheduleJobNow({
-          jobKey: spec.jobKey,
-          creatorId: creator.id,
-          agencyId: creator.agencyId,
-          params: spec.params,
-          priority: 50,
-          now,
-          bucketMs: 60_000,
-        });
-        if (scheduled.reason === "already_claimed") alreadyClaimed += 1;
-        else jobsScheduled += 1;
+    const failedCreators = [];
+    const batchSize = 20;
+
+    // Do not schedule 4,000 jobs sequentially for a 2,000-creator agency, but
+    // also avoid one unbounded Promise.all that can stampede the database.
+    for (let offset = 0; offset < creators.length; offset += batchSize) {
+      const batch = creators.slice(offset, offset + batchSize);
+      const settled = await Promise.allSettled(
+        batch.map(async (creator) => {
+          const scheduled = await Promise.all([
+            scheduleJobNow({
+              jobKey: "fetch_earnings",
+              creatorId: creator.id,
+              agencyId: creator.agencyId,
+              params: { rangeKey: range },
+              priority: 50,
+              now,
+              bucketMs: 60_000,
+            }),
+            scheduleJobNow({
+              jobKey: "fetch_campaigns",
+              creatorId: creator.id,
+              agencyId: creator.agencyId,
+              params: { rangeKey: range },
+              priority: 50,
+              now,
+              bucketMs: 60_000,
+            }),
+          ]);
+          return { creatorId: creator.id, scheduled };
+        })
+      );
+
+      for (let index = 0; index < settled.length; index += 1) {
+        const result = settled[index];
+        const creatorId = batch[index]?.id || null;
+        if (result.status === "rejected") {
+          failedCreators.push({
+            creatorId,
+            code: String(result.reason?.code || "ANALYTICS_JOB_SCHEDULE_FAILED"),
+          });
+          continue;
+        }
+        for (const scheduled of result.value.scheduled) {
+          if (scheduled.reason === "already_claimed") alreadyClaimed += 1;
+          else jobsScheduled += 1;
+        }
       }
     }
 
     return res.json({
       ok: true,
-      creatorsScheduled: creators.length,
+      creatorsScheduled: creators.length - failedCreators.length,
+      creatorsRequested: creators.length,
       jobsScheduled,
       alreadyClaimed,
+      failedCount: failedCreators.length,
+      failures: failedCreators.slice(0, 50),
     });
   } catch (err) {
     console.error("[stats/refresh-agency] failed:", err);

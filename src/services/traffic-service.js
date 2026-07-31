@@ -5,11 +5,13 @@ const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
-const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { canViewTraffic, canRefreshTraffic, canManageTrafficCosts } = require("./creator-analytics-permissions");
 
 const TRAFFIC_SOURCES_SCAN_JOB_KEY = "traffic_sources_scan";
 const TRAFFIC_VALUE_REFRESH_JOB_KEY = "traffic_fan_value_refresh";
 const VALUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
+
+
 
 function clean(value, max = 255) {
   const s = String(value ?? "").trim();
@@ -1281,11 +1283,17 @@ async function assertTrafficViewer({ userId, creatorId }) {
 
   const member = await prisma.agencyMember.findFirst({
     where: { userId, agencyId: creator.agencyId, deletedAt: null, agency: { deletedAt: null } },
-    select: { id: true, role: true, roleKey: true },
+    select: { id: true, role: true, roleKey: true, permissions: true },
   });
   if (!member) {
     const err = new Error("Not a member of this agency");
     err.code = "NOT_A_MEMBER";
+    throw err;
+  }
+
+  if (!canViewTraffic(member)) {
+    const err = new Error("Traffic analytics permission is required");
+    err.code = "TRAFFIC_VIEW_FORBIDDEN";
     throw err;
   }
 
@@ -1925,8 +1933,8 @@ async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents,
 
   // Cost/ROI is a financial setting. Keep it owner/manager/admin-only so
   // chatters cannot manipulate promo performance by zeroing source cost.
-  if (!isSeniorAgencyMember(member)) {
-    const err = new Error("Only OWNER / manager / admin can update traffic source cost");
+  if (!canManageTrafficCosts(member)) {
+    const err = new Error("Only OWNER / manager / admin or traffic cost permission can update traffic source cost");
     err.code = "INSUFFICIENT_TEAM_ROLE";
     throw err;
   }
@@ -2013,7 +2021,12 @@ function cleanHint(value, max = 255) {
 }
 
 async function scheduleTrafficRefresh({ userId, creatorId, force = false, accountHints = {} } = {}) {
-  const { creator } = await assertTrafficViewer({ userId, creatorId });
+  const { creator, member } = await assertTrafficViewer({ userId, creatorId });
+  if (!canRefreshTraffic(member)) {
+    const err = new Error("Traffic refresh permission is required");
+    err.code = "TRAFFIC_REFRESH_FORBIDDEN";
+    throw err;
+  }
 
   const localAccountId = cleanHint(
     accountHints.localAccountId || accountHints.accountId || accountHints.accountManifestId || null

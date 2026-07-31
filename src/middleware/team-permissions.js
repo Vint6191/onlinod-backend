@@ -18,15 +18,7 @@
 "use strict";
 
 const prisma = require("../prisma");
-
-const HIGH_PRIVILEGE_KEYS = new Set(["owner", "manager", "admin"]);
-
-
-function isSeniorAgencyMember(member) {
-  const role = String(member?.role || "").toUpperCase();
-  const roleKey = String(member?.roleKey || "").toLowerCase();
-  return role === "OWNER" || role === "MANAGER" || role === "ADMIN" || HIGH_PRIVILEGE_KEYS.has(roleKey);
-}
+const { HIGH_PRIVILEGE_KEYS, isSeniorAgencyMember } = require("./agency-member-role");
 
 async function loadMembership(userId, agencyId) {
   if (!userId || !agencyId) return null;

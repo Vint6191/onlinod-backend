@@ -31,7 +31,7 @@ function validationError(res, err) {
 
 function serviceError(res, err, fallbackCode) {
   const code = err?.code || fallbackCode || "TRAFFIC_FAILED";
-  const status = code === "NOT_YOUR_DEVICE" || code === "NOT_A_MEMBER" || code === "DEVICE_CREATOR_AGENCY_MISMATCH" || code === "INSUFFICIENT_TEAM_ROLE" ? 403
+  const status = code === "NOT_YOUR_DEVICE" || code === "NOT_A_MEMBER" || code === "DEVICE_CREATOR_AGENCY_MISMATCH" || code === "INSUFFICIENT_TEAM_ROLE" || code === "TRAFFIC_VIEW_FORBIDDEN" || code === "TRAFFIC_REFRESH_FORBIDDEN" ? 403
     : code === "CREATOR_NOT_FOUND" || code === "TRAFFIC_SOURCE_NOT_FOUND" ? 404
     : 500;
   return res.status(status).json({ ok: false, code, error: err?.message || "Traffic request failed" });
