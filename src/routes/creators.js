@@ -9,6 +9,7 @@ const { authRequired } = require("../middleware/auth");
 const { creatorManagementRequired } = require("../middleware/creator-management-permissions");
 const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
+const { agencyRemovalPhrase, removeCreatorFromAssignedCreators } = require("../services/creator-agency-removal");
 
 const router = express.Router();
 
@@ -77,6 +78,12 @@ const completeRuntimeSchema = z.object({
   partition: z.string().min(1).max(220),
 });
 
+const agencyRemovalSchema = z.object({
+  phrase: z.string().min(1).max(240),
+  acknowledgeAgencyRemoval: z.literal(true),
+  acknowledgeSessionRevocation: z.literal(true),
+});
+
 function normalizeUsername(value) {
   const clean = String(value || "").trim().replace(/^@+/, "");
   return clean ? clean.toLowerCase() : null;
@@ -85,6 +92,12 @@ function normalizeUsername(value) {
 function makePartition(creatorId) {
   return `persist:acct_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_")}`;
 }
+
+
+function jsonRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
 
 async function findCreatorConflict({ agencyId, remoteId = null, username = null, excludeId = null }) {
   const or = [];
@@ -252,11 +265,11 @@ router.patch("/:id", creatorManagementRequired, async (req, res) => {
 
 router.delete("/:id", creatorManagementRequired, async (req, res) => {
   try {
+    const input = agencyRemovalSchema.parse(req.body);
     const existing = await prisma.creatorAccount.findFirst({
       where: {
         id: req.params.id,
         agencyId: req.auth.agencyId,
-        deletedAt: null,
       },
     });
 
@@ -264,40 +277,94 @@ router.delete("/:id", creatorManagementRequired, async (req, res) => {
       return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
     }
 
-    const confirmation = String(req.body?.confirmation || "").trim();
-    if (confirmation !== existing.id) {
-      return res.status(400).json({ ok: false, code: "CREATOR_DELETE_CONFIRMATION_REQUIRED", error: "Creator deletion confirmation does not match" });
+    let expectedPhrase;
+    try {
+      expectedPhrase = agencyRemovalPhrase(existing);
+    } catch (_) {
+      return res.status(409).json({ ok: false, code: "CREATOR_USERNAME_REQUIRED_FOR_REMOVAL", error: "Creator username is required before removal" });
+    }
+    if (input.phrase !== expectedPhrase) {
+      return res.status(400).json({ ok: false, code: "CREATOR_DELETE_PHRASE_REQUIRED", error: "Agency removal phrase does not match", expectedPhrase });
     }
 
-    const deletedAt = new Date();
-    const creator = await prisma.$transaction(async (tx) => {
-      const updated = await tx.creatorAccount.update({
-        where: { id: existing.id },
-        data: { deletedAt, status: "DISABLED" },
+    if (existing.deletedAt) {
+      return res.json({
+        ok: true,
+        creatorId: existing.id,
+        partition: existing.partition,
+        removedFromMemberAssignments: 0,
+        historyPreserved: true,
+        alreadyRemoved: true,
       });
-      await tx.accessSnapshot.updateMany({ where: { creatorId: existing.id, active: true }, data: { active: false, revokedAt: deletedAt } });
+    }
+
+    const removedAt = new Date();
+    const result = await prisma.$transaction(async (tx) => {
+      const members = await tx.agencyMember.findMany({
+        where: { agencyId: req.auth.agencyId, deletedAt: null },
+        select: { id: true, assignedCreators: true },
+        take: 10000,
+      });
+      let removedFromMemberAssignments = 0;
+      for (const member of members) {
+        const next = removeCreatorFromAssignedCreators(member.assignedCreators, existing.id);
+        if (!next.changed) continue;
+        await tx.agencyMember.update({ where: { id: member.id }, data: { assignedCreators: next.value } });
+        removedFromMemberAssignments += 1;
+      }
+
+      await tx.accessSnapshot.updateMany({ where: { creatorId: existing.id, active: true }, data: { active: false, revokedAt: removedAt } });
       await tx.deviceCreatorBinding.updateMany({ where: { creatorId: existing.id }, data: { status: "REVOKED" } });
-      await tx.creatorConnectSession.updateMany({ where: { creatorId: existing.id, status: { in: ["PENDING", "CLAIMED"] } }, data: { status: "CANCELLED", cancelledAt: deletedAt } });
+      await tx.creatorConnectSession.updateMany({ where: { creatorId: existing.id, status: { in: ["PENDING", "CLAIMED"] } }, data: { status: "CANCELLED", cancelledAt: removedAt } });
       await tx.jobInstance.updateMany({
         where: { creatorId: existing.id, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
-        data: { status: "CANCELLED", completedAt: deletedAt, leaseUntil: null, leaseTokenHash: null, claimedAt: null, claimedByDeviceId: null },
+        data: { status: "CANCELLED", completedAt: removedAt, leaseUntil: null, leaseTokenHash: null, claimedAt: null, claimedByDeviceId: null },
       });
-      return updated;
-    });
 
-    await audit({
-      agencyId: req.auth.agencyId,
-      actorUserId: req.auth.userId,
-      action: "creator.deleted",
-      targetType: "creator",
-      targetId: creator.id,
-      metadata: { username: creator.username, partition: creator.partition },
-    });
+      await tx.creatorAccount.update({
+        where: { id: existing.id },
+        data: { status: "DISABLED", deletedAt: removedAt },
+      });
+      await tx.auditLog.create({
+        data: {
+          agencyId: req.auth.agencyId,
+          actorUserId: req.auth.userId,
+          action: "creator.removed_from_agency",
+          targetType: "creator",
+          targetId: existing.id,
+          metadata: {
+            username: existing.username,
+            remoteId: existing.remoteId,
+            partition: existing.partition,
+            removedFromMemberAssignments,
+            historyPreserved: true,
+            messageHistoryPreserved: true,
+            crmDataPreserved: true,
+          },
+        },
+      });
+      return { removedFromMemberAssignments };
+    }, { maxWait: 10_000, timeout: 120_000 });
 
-    return res.json({ ok: true, creatorId: creator.id, creator });
+    return res.json({
+      ok: true,
+      creatorId: existing.id,
+      partition: existing.partition,
+      removedFromMemberAssignments: result.removedFromMemberAssignments,
+      historyPreserved: true,
+    });
   } catch (err) {
+    if (err?.issues) {
+      return res.status(400).json({
+        ok: false,
+        code: "VALIDATION_ERROR",
+        error: err.issues[0]?.message || "Validation error",
+        issues: err.issues,
+      });
+    }
+
     console.error("[creators/delete] failed:", err);
-    return res.status(500).json({ ok: false, code: "CREATOR_DELETE_FAILED", error: "Failed to delete creator" });
+    return res.status(500).json({ ok: false, code: "CREATOR_DELETE_FAILED", error: "Failed to remove creator from agency" });
   }
 });
 
