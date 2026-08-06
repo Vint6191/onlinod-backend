@@ -7,6 +7,7 @@ const { upsertPurchaseFromEvent } = require("./team-ppv-ledger-service");
 const { ingestTipEvent } = require("./team-tip-ledger-service");
 const { ingestSubscriptionEvent, markTrafficFanValueDirty } = require("./traffic-service");
 const { processRuntimeEvents: processBumpRuntimeEvents } = require("./bump-service");
+const { ingestNotificationFacts } = require("./notification-facts-service");
 
 const CATCHUP_JOB_KEY = "catchup_notifications_scan";
 const DEFAULT_BUFFER_MS = 2 * 60 * 60 * 1000;
@@ -437,17 +438,178 @@ function normalizeEvent(payload = {}) {
   return { ...payload, ...extra };
 }
 
-async function applyCatchupJobResult({ job, deviceId, userId, result }) {
+const NOTIFICATION_COMPATIBILITY_PAGE_SIZE = 500;
+const BUMP_COMPATIBILITY_PAGE_SIZE = 200;
+const LEGACY_SUBSCRIPTION_EVENT_TYPES = Object.freeze({
+  SUBSCRIBED_FREE: "free_subscribed",
+  SUBSCRIBED_PAID: "paid_subscribed",
+  RENEWED: "subscription_renewed",
+  RESUBSCRIBED: "subscription_resubscribed",
+  EXPIRED: "subscription_expired",
+  AUTO_RENEW_ENABLED: "auto_renew_enabled",
+  AUTO_RENEW_DISABLED: "auto_renew_disabled",
+  REFUNDED: "subscription_refunded",
+});
+
+function compatibilityEventKey(event) {
+  const direct = clean(
+    event?.notificationId
+      || event?.tipId
+      || event?.purchaseId
+      || event?.eventHash
+      || event?.externalEventId,
+    220,
+  );
+  if (direct) return direct;
+  const transactionId = clean(event?.transactionId, 180);
+  if (!transactionId) return null;
+  const eventType = clean(event?.eventType || event?.type || "event", 80) || "event";
+  return clean(`${transactionId}:${eventType}`, 220);
+}
+
+function projectTipCompatibilityEvent(row) {
+  return {
+    eventType: "tip_received",
+    fanId: row.fan?.onlyFansUserId || null,
+    fanUsername: row.fan?.username || null,
+    fanName: row.fan?.displayName || null,
+    dialogId: row.fan?.onlyFansUserId || null,
+    messageId: row.messageId || null,
+    amountCents: row.amountCents,
+    currency: row.currency,
+    occurredAt: row.tippedAt,
+    receivedAt: row.tippedAt,
+    notificationId: row.externalNotificationId || null,
+    transactionId: row.externalTransactionId || null,
+    tipId: row.externalNotificationId || row.externalTransactionId || row.eventFingerprint,
+    eventHash: row.eventFingerprint,
+    source: "notification_facts_ledger_projection",
+  };
+}
+
+function projectSubscriptionCompatibilityEvent(row) {
+  return {
+    eventType: LEGACY_SUBSCRIPTION_EVENT_TYPES[row.eventType] || String(row.eventType || "").toLowerCase(),
+    fanId: row.fan?.onlyFansUserId || null,
+    fanUsername: row.fan?.username || null,
+    fanName: row.fan?.displayName || null,
+    dialogId: row.fan?.onlyFansUserId || null,
+    amountCents: row.observedPriceCents,
+    currency: row.currency,
+    occurredAt: row.occurredAt,
+    subscribedAt: row.occurredAt,
+    notificationId: row.externalNotificationId || null,
+    transactionId: row.externalTransactionId || null,
+    externalEventId: row.externalNotificationId || row.eventFingerprint,
+    eventHash: row.eventFingerprint,
+    source: "notification_facts_ledger_projection",
+  };
+}
+
+async function* iterateModelRows({ model, where, select }) {
+  let cursor = null;
+  while (true) {
+    const rows = await model.findMany({
+      where,
+      orderBy: { id: "asc" },
+      take: NOTIFICATION_COMPATIBILITY_PAGE_SIZE,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      select: { id: true, ...select },
+    });
+    for (const row of rows) yield row;
+    if (rows.length < NOTIFICATION_COMPATIBILITY_PAGE_SIZE) break;
+    const nextCursor = rows.at(-1)?.id;
+    if (!nextCursor || nextCursor === cursor) {
+      throw Object.assign(new Error("Notification compatibility pagination cursor stalled"), {
+        code: "NOTIFICATION_COMPATIBILITY_CURSOR_STALLED",
+      });
+    }
+    cursor = nextCursor;
+  }
+}
+
+async function* iterateLedgerCompatibilityEvents({ db, job, legacyEvents }) {
+  const seen = new Set();
+  const yieldUnique = function* (events) {
+    for (const event of events) {
+      const key = compatibilityEventKey(event)
+        || stableHashSeed([event?.eventType, event?.fanId, event?.messageId, event?.amountCents, event?.occurredAt]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      yield event;
+    }
+  };
+
+  yield* yieldUnique(legacyEvents);
+  if (!db?.creatorTip?.findMany || !db?.creatorSubscriptionEvent?.findMany) return;
+
+  const tipRows = iterateModelRows({
+    model: db.creatorTip,
+    where: { creatorId: job.creatorId, sourceJobId: job.id },
+    select: {
+      eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
+      messageId: true, amountCents: true, currency: true, tippedAt: true,
+      fan: { select: { onlyFansUserId: true, username: true, displayName: true } },
+    },
+  });
+  for await (const row of tipRows) yield* yieldUnique([projectTipCompatibilityEvent(row)]);
+
+  const subscriptionRows = iterateModelRows({
+    model: db.creatorSubscriptionEvent,
+    where: { creatorId: job.creatorId, sourceJobId: job.id },
+    select: {
+      eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
+      eventType: true, observedPriceCents: true, currency: true, occurredAt: true,
+      fan: { select: { onlyFansUserId: true, username: true, displayName: true } },
+    },
+  });
+  for await (const row of subscriptionRows) yield* yieldUnique([projectSubscriptionCompatibilityEvent(row)]);
+}
+
+async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, result }) {
   const params = job?.params && typeof job.params === "object" ? job.params : {};
   const events = eventList(result);
   const now = new Date();
   const bumpSubscriptionEvents = [];
+  const ledger = await ingestNotificationFacts({
+    job,
+    deviceId,
+    db,
+    result: {
+      ...result,
+      // Schema-3 collectors commit facts page-by-page and completion carries
+      // an explicit empty array. Legacy schema-1/2 continuations are discarded
+      // by the desktop protocol fence before reaching this boundary.
+      events,
+      // Preserve the collector-owned run identity. The notification ingest
+      // contract rejects a generic completion key because it cannot be fenced
+      // from another scan pass of the same JobInstance.
+      batchKey: result?.batchKey,
+      finalizeCoverage: true,
+    },
+  });
+
   const summary = {
-    received: events.length,
+    received: Number.isInteger(result?.totalAcceptedEvents) && result.totalAcceptedEvents >= 0
+      ? result.totalAcceptedEvents
+      : events.length,
+    analyticsBatchId: ledger.batchId,
+    analyticsBatchStatus: ledger.status,
+    analyticsInserted: ledger.inserted,
+    analyticsUpdated: ledger.updated,
+    analyticsUnchanged: ledger.unchanged,
+    analyticsRejected: ledger.rejected,
+    analyticsCoverageComplete: ledger.coverageComplete === true,
+    analyticsCoverageByType: ledger.coverageByType || {},
+    analyticsReplay: ledger.replayed === true,
+    compatibilityCandidates: 0,
+    compatibilityProcessed: 0,
+    compatibilityTruncated: false,
     ppvCreatedOrUpdated: 0,
     tipCreatedOrUpdated: 0,
     subscriptionCreatedOrUpdated: 0,
     subscriptionFreeIgnored: 0,
+    subscriptionRefundIgnored: 0,
     trafficValueDirtyMembers: 0,
     trafficHydrateScheduled: false,
     deduped: 0,
@@ -456,6 +618,28 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     bumpSubscriptionEvents: 0,
     bumpPlanned: 0,
     bumpErrors: 0,
+  };
+
+  const flushBumpSubscriptionEvents = async () => {
+    if (!bumpSubscriptionEvents.length) return;
+    const batch = bumpSubscriptionEvents.splice(0, BUMP_COMPATIBILITY_PAGE_SIZE);
+    summary.bumpSubscriptionEvents += batch.length;
+    try {
+      const bumpResult = await processBumpRuntimeEvents({
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        userId,
+        events: batch,
+      });
+      summary.bumpPlanned += Number(bumpResult?.planned || 0);
+      summary.bumpErrors += Array.isArray(bumpResult?.errors) ? bumpResult.errors.length : 0;
+    } catch (error) {
+      // Bump automation is a compatibility side effect, not the source of
+      // truth for the notification ledger. Record it without discarding facts.
+      summary.bumpErrors += 1;
+      if (!summary.errorSamples) summary.errorSamples = [];
+      if (summary.errorSamples.length < 5) summary.errorSamples.push(`bump:${error?.message || String(error)}`);
+    }
   };
 
   const markTrafficDirty = async (ev, reason) => {
@@ -472,7 +656,9 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     return dirty;
   };
 
-  for (const raw of events) {
+  for await (const raw of iterateLedgerCompatibilityEvents({ db, job, legacyEvents: events })) {
+    summary.compatibilityCandidates += 1;
+    summary.compatibilityProcessed += 1;
     const ev = normalizeEvent(raw);
     const type = String(ev.type || ev.eventType || "").toLowerCase();
     const accountId = clean(ev.accountId || params.accountId || job.creatorId || "unknown", 160) || "unknown";
@@ -544,7 +730,10 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
 
       if (type.includes("subscription") || type.includes("subscrib")) {
         const subscriptionFanId = clean(ev.fanId || ev.dialogId, 160);
-        if (subscriptionFanId && bumpSubscriptionEvents.length < 500) {
+        const subscriptionLifecycleType = String(ev.eventType || type).toLowerCase();
+        const shouldPlanBump = /(subscribed|resubscribed|renewed)/.test(subscriptionLifecycleType)
+          && !/(expired|refund|chargeback|auto.?renew)/.test(subscriptionLifecycleType);
+        if (subscriptionFanId && shouldPlanBump) {
           bumpSubscriptionEvents.push({
             type: "subscription_created",
             fanId: subscriptionFanId,
@@ -561,6 +750,16 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
               dialogId: clean(ev.dialogId || subscriptionFanId, 160) || subscriptionFanId,
             },
           });
+          if (bumpSubscriptionEvents.length >= BUMP_COMPATIBILITY_PAGE_SIZE) await flushBumpSubscriptionEvents();
+        }
+        if (/(refund|chargeback|reversal)/.test(subscriptionLifecycleType)) {
+          // The legacy CreatorSubscriptionLedger is positive-revenue only and
+          // its aggregates do not filter eventType. Projecting a refund there
+          // would increase historical subscription revenue. The relational
+          // CreatorSubscriptionEvent remains the authoritative refund record.
+          summary.subscriptionRefundIgnored += 1;
+          summary.skipped += 1;
+          continue;
         }
         const subscriptionAmountCents = amountCents(ev.amountCents) || amountDollarsToCents(ev.amount || ev.price);
         if (subscriptionAmountCents <= 0) {
@@ -607,26 +806,7 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     }
   }
 
-  if (bumpSubscriptionEvents.length) {
-    summary.bumpSubscriptionEvents = bumpSubscriptionEvents.length;
-    try {
-      const bumpResult = await processBumpRuntimeEvents({
-        agencyId: job.agencyId,
-        creatorId: job.creatorId,
-        userId,
-        events: bumpSubscriptionEvents,
-      });
-      summary.bumpPlanned = Number(bumpResult?.planned || 0);
-      summary.bumpErrors = Array.isArray(bumpResult?.errors) ? bumpResult.errors.length : 0;
-    } catch (error) {
-      // Revenue catchup must remain durable even when Automation is disabled or
-      // temporarily unavailable. The next published snapshot/recurring planner
-      // can rediscover the same fan without losing the ledger event.
-      summary.bumpErrors += 1;
-      if (!summary.errorSamples) summary.errorSamples = [];
-      if (summary.errorSamples.length < 5) summary.errorSamples.push(`bump:${error?.message || String(error)}`);
-    }
-  }
+  await flushBumpSubscriptionEvents();
 
   // P9 wave 1 is read-only discovery. Revenue events mark existing traffic
   // members dirty, but fan-value hydration is intentionally deferred to the
@@ -634,30 +814,56 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
   summary.trafficHydrateScheduled = false;
 
   const scanTo = dateOrNull(params.to || result?.to) || now;
-  const types = Array.isArray(params.types) ? params.types.map(String) : ["purchases", "tips", "subscriptions"];
+  const types = Array.isArray(params.types)
+    ? [...new Set(params.types.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))]
+    : ["purchases", "tips", "subscriptions"];
+  const coverageByType = ledger.coverageByType || {};
+  const typeComplete = (type) => coverageByType[type] === "complete";
+  const allRequestedComplete = types.length > 0 && types.every(typeComplete);
+  const compatibilityComplete = summary.errors === 0;
+  const fullySuccessful = ledger.status === "COMMITTED"
+    && allRequestedComplete
+    && compatibilityComplete
+    && ledger.rejected === 0;
   const data = {
-    currentScanStatus: "idle",
-    currentScanFrom: null,
-    currentScanTo: null,
-    currentScanTypes: null,
+    currentScanStatus: fullySuccessful ? "idle" : "error",
+    currentScanFrom: fullySuccessful ? null : dateOrNull(params.from),
+    currentScanTo: fullySuccessful ? null : scanTo,
+    currentScanTypes: fullySuccessful ? null : types,
     lockedByDeviceId: null,
     lockedUntil: null,
-    lastSuccessfulScanAt: now,
-    lastObservedAt: maxDate(scanTo, now),
+    ...(fullySuccessful ? {
+      lastSuccessfulScanAt: now,
+      lastObservedAt: maxDate(scanTo, now),
+      lastErrorCode: null,
+      lastErrorAt: null,
+    } : {
+      lastErrorCode: summary.errors > 0
+        ? "notification_compatibility_partial"
+        : ledger.rejected > 0
+          ? "notification_rows_rejected"
+          : "notification_scan_partial",
+      lastErrorAt: now,
+    }),
     lastScanSummary: {
       ...summary,
       jobId: job.id,
       from: params.from || null,
       to: params.to || null,
       scanner: result?.scanner || null,
+      requestedTypes: types,
+      coverageByType,
+      fullySuccessful,
     },
-    lastErrorCode: null,
-    lastErrorAt: null,
-    ...(types.includes("purchases") ? { lastPurchaseScanTo: scanTo } : {}),
-    ...(types.includes("tips") ? { lastTipScanTo: scanTo } : {}),
+    ...(types.includes("purchases") && typeComplete("purchases") && ledger.rejected === 0
+      ? { lastPurchaseScanTo: scanTo }
+      : {}),
+    ...(types.includes("tips") && typeComplete("tips") && ledger.rejected === 0
+      ? { lastTipScanTo: scanTo }
+      : {}),
   };
 
-  await prisma.teamObservationState.upsert({
+  await db.teamObservationState.upsert({
     where: { agencyId_creatorId: { agencyId: job.agencyId, creatorId: job.creatorId } },
     create: {
       agencyId: job.agencyId,
@@ -668,8 +874,7 @@ async function applyCatchupJobResult({ job, deviceId, userId, result }) {
     },
     update: data,
   });
-
-  return { ok: summary.errors === 0, summary };
+  return { ok: fullySuccessful, summary };
 }
 
 async function recordCatchupJobFailure({ job, error }) {

@@ -437,3 +437,204 @@ test("discovery-only claim fences the shared dialog job key to the discovery sen
   assert.deepEqual(selectedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
   assert.deepEqual(fencedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
 });
+
+test("notification completion reserves a new lease revision before durable side effects", async () => {
+  const token = "notification-lease-token";
+  const now = new Date();
+  const job = {
+    id: "notification-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 7,
+    leaseUntil: new Date(now.getTime() + 60_000),
+    attempts: 0,
+    params: {
+      from: "2026-08-01T00:00:00.000Z",
+      to: "2026-08-02T00:00:00.000Z",
+      types: ["purchases", "tips", "subscriptions"],
+    },
+    progress: { current: 3, total: 3 },
+    continuation: { driverPhase: "complete" },
+    workId: "notification-work",
+  };
+  const order = [];
+  const updates = [];
+  const db = {
+    workerDevice: {
+      findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }),
+    },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => {
+        updates.push(args);
+        if (updates.length === 1) order.push("reserved");
+        if (updates.length === 2) order.push("completed");
+        return { count: 1 };
+      },
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async ({ db: suppliedDb }) => {
+      assert.equal(suppliedDb, undefined, "notification side effects intentionally run after the short reservation update");
+      order.push("side-effect");
+      return { type: "catchup_notifications", ok: true };
+    },
+  });
+
+  const result = await completeJob({
+    jobId: job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: token,
+    leaseRevision: 7,
+    workId: "notification-work",
+    result: { collectorVersion: "notifications-catchup-v3", totalAcceptedEvents: 0 },
+    progress: { current: 3, total: 3, percent: 100 },
+  });
+
+  assert.deepEqual(order, ["reserved", "side-effect", "completed"]);
+  assert.deepEqual(updates[0].where, {
+    id: job.id,
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 7,
+    leaseUntil: { gt: updates[0].where.leaseUntil.gt },
+  });
+  assert.deepEqual(updates[0].data.leaseRevision, { increment: 1 });
+  assert.equal(updates[1].where.leaseRevision, 8);
+  assert.equal(updates[1].data.status, "DONE");
+  assert.equal(result.job.status, "DONE");
+});
+
+test("partial notification completion is rescheduled instead of being marked DONE", async () => {
+  const token = "notification-partial-token";
+  const now = new Date();
+  const job = {
+    id: "notification-partial-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 3,
+    leaseUntil: new Date(now.getTime() + 60_000),
+    attempts: 0,
+    params: { from: "2026-08-01T00:00:00.000Z", to: "2026-08-02T00:00:00.000Z", types: ["tips"] },
+    progress: { current: 1, total: 1 },
+    continuation: { driverPhase: "complete" },
+    workId: "notification-partial-work",
+  };
+  const updates = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => ({
+      type: "catchup_notifications",
+      ok: false,
+      summary: {
+        analyticsCoverageComplete: false,
+        requestedTypes: ["purchases", "tips"],
+        analyticsCoverageByType: { purchases: "complete", tips: "partial" },
+      },
+    }),
+  });
+
+  const result = await completeJob({
+    jobId: job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: token,
+    leaseRevision: 3,
+    workId: job.workId,
+    result: {
+      collectorVersion: "notifications-catchup-v3",
+      scanRunId: "run-partial-1",
+      coverage: {
+        purchases: { status: "complete", reason: "source_exhausted", rejected: 0 },
+        tips: { status: "partial", reason: "page_limit", rejected: 0, cursorEnd: "tip-cursor-200" },
+      },
+    },
+    progress: { current: 1, total: 1, percent: 100 },
+  });
+
+  assert.equal(updates.length, 2);
+  assert.equal(updates[1].where.leaseRevision, 4);
+  assert.equal(updates[1].data.status, "SCHEDULED");
+  assert.equal(updates[1].data.attempts, 1);
+  assert.equal(updates[1].data.continuation, null);
+  assert.equal(updates[1].data.claimedByDeviceId, null);
+  assert.equal(updates[1].data.lastError, "notification_scan_partial");
+  assert.deepEqual(updates[1].data.params.types, ["tips"]);
+  assert.deepEqual(updates[1].data.params.resumeCursors, { tips: "tip-cursor-200" });
+  assert.ok(updates[1].data.nextRunAt instanceof Date);
+  assert.equal(result.job.status, "SCHEDULED");
+});
+
+test("fifth partial notification attempt becomes FAILED instead of looping forever", async () => {
+  const token = "notification-terminal-token";
+  const now = new Date();
+  const job = {
+    id: "notification-terminal-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 11,
+    leaseUntil: new Date(now.getTime() + 60_000),
+    attempts: 4,
+    params: { from: "2026-08-01T00:00:00.000Z", to: "2026-08-02T00:00:00.000Z", types: ["tips"] },
+    progress: { current: 1, total: 1 },
+    continuation: { driverPhase: "complete" },
+    workId: "notification-terminal-work",
+  };
+  const updates = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => ({
+      ok: false,
+      summary: { requestedTypes: ["tips"], analyticsCoverageByType: { tips: "partial" } },
+    }),
+  });
+
+  const result = await completeJob({
+    jobId: job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: token,
+    leaseRevision: 11,
+    workId: job.workId,
+    result: { coverage: { tips: { status: "partial", reason: "cursor_stalled", rejected: 0, cursorEnd: "same" } } },
+    progress: { current: 1, total: 1, percent: 100 },
+  });
+
+  assert.equal(updates[1].data.status, "FAILED");
+  assert.equal(updates[1].data.attempts, 5);
+  assert.equal(updates[1].data.nextRunAt, undefined);
+  assert.equal(result.job.status, "FAILED");
+  assert.equal(result.job.retryAt, null);
+});

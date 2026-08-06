@@ -1,8 +1,13 @@
 "use strict";
 
+const { parseStrictIsoDateTime } = require("./strict-date-time");
+
 const ANALYTICS_DATA_TYPES = Object.freeze([
   "EARNINGS",
   "NOTIFICATIONS",
+  "NOTIFICATION_PURCHASES",
+  "NOTIFICATION_TIPS",
+  "NOTIFICATION_SUBSCRIPTIONS",
   "CAMPAIGNS",
   "MESSAGES_DAILY",
 ]);
@@ -25,7 +30,6 @@ const ANALYTICS_INGEST_STATUSES = Object.freeze([
   "FAILED",
 ]);
 
-const ISO_DATE_TIME_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 class AnalyticsLedgerValidationError extends Error {
   constructor(issues) {
@@ -108,24 +112,9 @@ function requiredInteger(input, path, issues, { min = 0, max = 1_000_000 } = {})
 
 function optionalDateTime(input, path, issues) {
   if (input === undefined || input === null) return null;
-
-  if (input instanceof Date) {
-    const value = new Date(input.getTime());
-    if (Number.isNaN(value.getTime())) {
-      issues.push({ path, message: "Expected a valid date-time" });
-      return null;
-    }
-    return value;
-  }
-
-  if (typeof input !== "string" || !ISO_DATE_TIME_PATTERN.test(input)) {
-    issues.push({ path, message: "Expected an ISO 8601 date-time with an explicit timezone" });
-    return null;
-  }
-
-  const value = new Date(input);
-  if (Number.isNaN(value.getTime())) {
-    issues.push({ path, message: "Expected a valid date-time" });
+  const value = parseStrictIsoDateTime(input);
+  if (!value) {
+    issues.push({ path, message: "Expected a real ISO 8601 date-time with an explicit timezone" });
     return null;
   }
   return value;

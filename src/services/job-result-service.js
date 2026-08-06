@@ -3,6 +3,7 @@
 const prisma = require("../prisma");
 const { applyPresenceJobResult } = require("./presence-service");
 const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("./team-observation-service");
+const { ingestNotificationFacts } = require("./notification-facts-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
 const {
   LIKES_DISCOVERY_JOB_KEY,
@@ -152,6 +153,35 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   if (job.jobKey === VAULT_UNSORTED_JOB_KEY) {
     return applyVaultUnsortedChunk({ db, job, deviceId, userId, chunkResult });
   }
+  if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "notification_facts_page") {
+    const type = String(chunkResult.notificationType || "").trim().toLowerCase();
+    if (!["purchases", "tips", "subscriptions"].includes(type)) throw new Error("Unsupported notification facts page type");
+    const events = Array.isArray(chunkResult.events) ? chunkResult.events.slice(0, 100) : [];
+    if (events.length !== (Array.isArray(chunkResult.events) ? chunkResult.events.length : 0)) {
+      throw new Error("Notification facts page exceeds 100 events");
+    }
+    const ledger = await ingestNotificationFacts({
+      db, job, deviceId,
+      result: {
+        events,
+        notificationType: type,
+        batchKey: chunkResult.batchKey,
+        finalizeCoverage: false,
+        sourceTimezone: chunkResult.sourceTimezone,
+        scanRunId: chunkResult.scanRunId,
+        collectorVersion: chunkResult.collectorVersion,
+        schemaVersion: chunkResult.schemaVersion,
+        coverage: { [type]: { status: "partial" } },
+      },
+    });
+    const rawSignals = Array.isArray(chunkResult.purchaseSignals) ? chunkResult.purchaseSignals : [];
+    if (rawSignals.length > 100) throw new Error("Notification purchase signal page exceeds 100 events");
+    const signals = rawSignals;
+    const purchaseSignals = signals.length
+      ? await applyPurchaseSignalsChunk({ db, job, deviceId, userId, chunkResult: { kind: "dialog_purchase_signals", signals } })
+      : null;
+    return { type: "notification_facts_page", ledger, purchaseSignals };
+  }
   if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "dialog_purchase_signals") {
     return applyPurchaseSignalsChunk({ db, job, deviceId, userId, chunkResult });
   }
@@ -179,7 +209,7 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ job, deviceId, userId, result });
   if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ job, deviceId, userId, result });
   if (job.jobKey === PRESENCE_JOB_KEY) return applyPresenceJobResult({ job, deviceId, result: result || {} });
-  if (job.jobKey === CATCHUP_JOB_KEY) return applyCatchupJobResult({ job, deviceId, userId, result: result || {} });
+  if (job.jobKey === CATCHUP_JOB_KEY) return applyCatchupJobResult({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return applyLikesDiscoveryCompletion({ job, deviceId, userId, result: result || {} });
   if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryCompletion({ job, deviceId, userId, result: result || {} });
   if (job.jobKey === SFS_TARGET_SCAN_JOB_KEY) return applySfsTargetScanCompletion({ job, deviceId, userId, result: result || {} });

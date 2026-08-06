@@ -477,6 +477,96 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   }
 
+  if (job.jobKey === "catchup_notifications_scan") {
+    // Reserve completion ownership before any ledger/compatibility side effect.
+    // The compatibility projection can touch legacy tip/subscription ledgers,
+    // so keep the fenced completion lease at the maximum supported duration.
+    // Incrementing leaseRevision is the fence: only one concurrent completion
+    // request can cross it. If the process dies after writing facts, the job is
+    // safely reclaimed later and the notification ingest is idempotent by jobId.
+    const completionLeaseRevision = leaseRevision + 1;
+    const reserved = await prisma.jobInstance.updateMany({
+      where: fenceWhere,
+      data: {
+        leaseRevision: { increment: 1 },
+        leaseUntil: new Date(now.getTime() + MAX_LEASE_MS),
+        lastProgressAt: now,
+      },
+    });
+    if (!reserved.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before notification completion");
+
+    const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
+    const completionFence = {
+      id: job.id,
+      status: "CLAIMED",
+      claimedByDeviceId: deviceId,
+      leaseTokenHash: hashToken(leaseToken),
+      leaseRevision: completionLeaseRevision,
+    };
+    if (sideEffect?.ok !== true) {
+      const attempts = Number(job.attempts || 0) + 1;
+      const terminal = attempts >= MAX_ATTEMPTS;
+      const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
+      const existingParams = object(job.params);
+      const requestedTypes = Array.isArray(sideEffect?.summary?.requestedTypes)
+        ? sideEffect.summary.requestedTypes.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
+        : Array.isArray(existingParams.types) ? existingParams.types : [];
+      const persistedCoverage = object(sideEffect?.summary?.analyticsCoverageByType);
+      const partialTypes = requestedTypes.filter((type) => persistedCoverage[type] !== "complete");
+      const scannerCoverage = object(result?.coverage);
+      const resumeCursors = {};
+      for (const type of partialTypes) {
+        const typeCoverage = object(scannerCoverage[type]);
+        const reason = String(typeCoverage.reason || "").toLowerCase();
+        const rejected = Number(typeCoverage.rejected || 0);
+        const cursor = clean(typeCoverage.cursorEnd, 220);
+        if (cursor && rejected === 0 && ["page_limit", "event_limit"].includes(reason)) resumeCursors[type] = cursor;
+      }
+      const repairParams = {
+        ...existingParams,
+        ...(partialTypes.length ? { types: partialTypes } : {}),
+        ...(Object.keys(resumeCursors).length ? { resumeCursors } : { resumeCursors: null }),
+      };
+      const partial = await prisma.jobInstance.updateMany({
+        where: completionFence,
+        data: terminal ? {
+          status: "FAILED",
+          attempts,
+          completedAt: new Date(),
+          claimedAt: null,
+          claimedByDeviceId: null,
+          leaseUntil: null,
+          leaseTokenHash: null,
+          continuation: null,
+          workId: null,
+          result: { ...(result || {}), completionSideEffect: sideEffect || null },
+          params: repairParams,
+          lastError: "notification_scan_partial",
+        } : {
+          status: "SCHEDULED",
+          attempts,
+          nextRunAt: retryAt,
+          completedAt: null,
+          claimedAt: null,
+          claimedByDeviceId: null,
+          leaseUntil: null,
+          leaseTokenHash: null,
+          continuation: null,
+          workId: null,
+          result: { ...(result || {}), completionSideEffect: sideEffect || null },
+          params: repairParams,
+          lastError: "notification_scan_partial",
+          progress: { percent: 0, message: "notification scan scheduled for repair" },
+        },
+      });
+      if (!partial.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification partial-completion fence was lost");
+      return { job: { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", retryAt }, sideEffect };
+    }
+    const completed = await prisma.jobInstance.updateMany({ where: completionFence, data: completionData });
+    if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification completion fence was lost");
+    return { job: { id: job.id, status: "DONE" }, sideEffect };
+  }
+
   if (job.jobKey === "vault_unsorted_scan") {
     const completed = await prisma.$transaction(async (tx) => {
       const updated = await tx.jobInstance.updateMany({ where: fenceWhere, data: completionData });

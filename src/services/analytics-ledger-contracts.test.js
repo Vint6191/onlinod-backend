@@ -45,7 +45,7 @@ function validCoverage(overrides = {}) {
 }
 
 test("analytics ledger enums are explicit and stable", () => {
-  assert.deepEqual(ANALYTICS_DATA_TYPES, ["EARNINGS", "NOTIFICATIONS", "CAMPAIGNS", "MESSAGES_DAILY"]);
+  assert.deepEqual(ANALYTICS_DATA_TYPES, ["EARNINGS", "NOTIFICATIONS", "NOTIFICATION_PURCHASES", "NOTIFICATION_TIPS", "NOTIFICATION_SUBSCRIPTIONS", "CAMPAIGNS", "MESSAGES_DAILY"]);
   assert.deepEqual(ANALYTICS_COVERAGE_STATUSES, [
     "MISSING",
     "QUEUED",
@@ -195,4 +195,17 @@ test("complete and missing coverage reject contradictory metadata", () => {
     }),
   );
   assert.equal(complete.status, "COMPLETE");
+});
+
+test("ledger contracts reject impossible ISO calendar dates and invalid timezone offsets", () => {
+  for (const rangeFrom of [
+    "2026-02-30T12:00:00Z",
+    "2026-08-05T24:00:00Z",
+    "2026-08-05T12:00:00+14:01",
+  ]) {
+    assert.throws(
+      () => parseAnalyticsIngestEnvelope(validEnvelope({ rangeFrom })),
+      AnalyticsLedgerValidationError,
+    );
+  }
 });
