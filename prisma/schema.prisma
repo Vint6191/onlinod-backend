@@ -22,6 +22,32 @@ enum CreatorStatus {
   DISABLED
 }
 
+
+enum AnalyticsDataType {
+  EARNINGS
+  NOTIFICATIONS
+  CAMPAIGNS
+  MESSAGES_DAILY
+}
+
+enum AnalyticsCoverageStatus {
+  MISSING
+  QUEUED
+  SCANNING
+  PARTIAL
+  COMPLETE
+  FAILED
+  UNAVAILABLE
+}
+
+enum AnalyticsIngestStatus {
+  RECEIVED
+  COMMITTED
+  PARTIAL
+  REJECTED
+  FAILED
+}
+
 enum AuthTokenType {
   EMAIL_VERIFY
   PASSWORD_RESET
@@ -249,7 +275,11 @@ model CreatorAccount {
   trafficFanValueSnapshots TrafficFanValueSnapshot[]
   creatorSubscriptionLedgers CreatorSubscriptionLedger[]
   trafficDailyAggregates TrafficDailyAggregate[]
+  fans CreatorFan[]
+  analyticsIngestBatches AnalyticsIngestBatch[]
+  analyticsCoverage AnalyticsCoverage[]
 
+  @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
   @@index([status])
   @@index([deletedAt])
@@ -388,6 +418,7 @@ model WorkerDevice {
   teamActivityEvents TeamActivityEvent[]
   presenceSnapshotsUpdated CreatorPresenceSnapshot[] @relation("PresenceSnapshotUpdatedByDevice")
   presenceUsersUpdated     CreatorPresenceUser[]     @relation("PresenceUserUpdatedByDevice")
+  analyticsIngestBatches   AnalyticsIngestBatch[]
 
   @@index([agencyId])
   @@index([userId])
@@ -632,6 +663,92 @@ model AgencyInvitation {
   @@index([expiresAt])
 }
 
+model CreatorFan {
+  id             String   @id @default(cuid())
+  agencyId       String
+  creatorId      String
+  onlyFansUserId String
+  username       String?
+  displayName    String?
+  firstSeenAt    DateTime @default(now())
+  lastSeenAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([creatorId, onlyFansUserId])
+  @@index([agencyId, creatorId])
+  @@index([creatorId, lastSeenAt])
+}
+
+model AnalyticsIngestBatch {
+  id                 String                @id @default(cuid())
+  agencyId           String
+  creatorId          String
+  sourceDeviceId     String?
+  sourceJobId        String?
+  idempotencyKey     String                @unique
+  dataType           AnalyticsDataType
+  status             AnalyticsIngestStatus @default(RECEIVED)
+  rangeFrom          DateTime
+  rangeTo            DateTime
+  sourceTimezone     String
+  collectorVersion   String
+  schemaVersion      Int
+  payloadChecksum    String
+  receivedRows       Int                   @default(0)
+  insertedRows       Int                   @default(0)
+  updatedRows        Int                   @default(0)
+  unchangedRows      Int                   @default(0)
+  rejectedRows       Int                   @default(0)
+  startedAt          DateTime              @default(now())
+  completedAt        DateTime?
+  lastErrorCode      String?
+  lastErrorMessage   String?
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  sourceDevice WorkerDevice?  @relation(fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?   @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  coverage     AnalyticsCoverage[]
+
+  @@index([agencyId, creatorId, dataType, startedAt])
+  @@index([creatorId, dataType, status])
+  @@index([sourceDeviceId, startedAt])
+  @@index([sourceJobId])
+}
+
+model AnalyticsCoverage {
+  id                String                  @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  ingestBatchId     String?
+  dataType          AnalyticsDataType
+  coverageDate      DateTime                @db.Date
+  sourceTimezone    String
+  status            AnalyticsCoverageStatus @default(MISSING)
+  coveredFromAt     DateTime?
+  coveredToAt       DateTime?
+  sourceCursorStart String?
+  sourceCursorEnd   String?
+  lastVerifiedAt    DateTime?
+  lastErrorCode     String?
+  lastErrorMessage  String?
+  retryAfterAt      DateTime?
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+
+  creator     CreatorAccount        @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  ingestBatch AnalyticsIngestBatch? @relation(fields: [ingestBatchId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, dataType, coverageDate, sourceTimezone], map: "AnalyticsCoverage_creator_day_key")
+  @@index([agencyId, creatorId, dataType, coverageDate], map: "AnalyticsCoverage_agency_creator_type_day_idx")
+  @@index([creatorId, dataType, status, coverageDate], map: "AnalyticsCoverage_creator_type_status_day_idx")
+  @@index([ingestBatchId])
+}
+
 model CreatorEarningsSnapshot {
   id                 String    @id @default(cuid())
   creatorId          String
@@ -715,6 +832,7 @@ model JobInstance {
 
   creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: Cascade)
   agency  Agency?         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  analyticsIngestBatches AnalyticsIngestBatch[]
 
   @@index([status, nextRunAt])
   @@index([creatorId])
