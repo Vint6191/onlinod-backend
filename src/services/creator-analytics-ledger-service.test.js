@@ -19,7 +19,6 @@ const {
   readCreatorCoverage,
   readCampaignFans,
   rangeBounds,
-  notificationWindows,
 } = require("./creator-analytics-ledger-service");
 Module._load = originalLoad;
 
@@ -600,20 +599,6 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
   assert.match(calls[0][1], /^-?\d+$/);
 });
 
-
-test("all-time notification backfill is split into contiguous safe windows", () => {
-  const windows = notificationWindows("all", new Date("2026-08-06T12:00:00.000Z"));
-  assert.ok(windows.length > 1);
-  assert.equal(windows[0].start.toISOString(), "2016-01-01T00:00:00.000Z");
-  assert.equal(windows.at(-1).end.toISOString(), "2026-08-06T12:00:00.000Z");
-  for (let index = 0; index < windows.length; index += 1) {
-    const window = windows[index];
-    assert.ok(window.end >= window.start);
-    assert.ok(window.end.getTime() - window.start.getTime() < 365 * 86_400_000);
-    if (index > 0) assert.equal(window.start.getTime(), windows[index - 1].end.getTime() + 1);
-  }
-  assert.equal(notificationWindows("365d", new Date("2026-08-06T12:00:00.000Z")).length, 1);
-});
 
 test("coverage reader pages on the server and reports the real total", async () => {
   const date = new Date("2026-08-05T00:00:00.000Z");

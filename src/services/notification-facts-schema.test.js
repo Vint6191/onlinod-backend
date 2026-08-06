@@ -12,6 +12,7 @@ const originalMigration = read("prisma/migrations/20260806112000_notification_fa
 const coverageTypeMigration = read("prisma/migrations/20260806130000_notification_coverage_types/migration.sql");
 const v2Migration = read("prisma/migrations/20260806140000_notification_facts_v1_audited_v2/migration.sql");
 const v3Migration = read("prisma/migrations/20260806160000_notification_facts_v1_audited_v3/migration.sql");
+const allBackfillMigration = read("prisma/migrations/20260806220000_notification_all_backfill_v1/migration.sql");
 const service = read("src/services/notification-facts-service.js");
 const observation = read("src/services/team-observation-service.js");
 const leaseService = read("src/services/job-lease-service.js");
@@ -74,12 +75,19 @@ test("upgrade migrations purge untrusted protocols and enforce database invarian
   assert.match(v3Migration, /AnalyticsCoverage_notification_complete_day_check/);
   assert.match(v3Migration, /NOTIFICATION_DAY_INTERVAL_INVALIDATED/);
   assert.match(v3Migration, /"coveredFromAt" <= "coveredToAt"/);
+  assert.match(allBackfillMigration, /CREATE TABLE "CreatorNotificationSyncState"/);
+  assert.match(allBackfillMigration, /"fullBackfillVerifiedAt" TIMESTAMP\(3\)/);
+  assert.match(modelBody("CreatorNotificationSyncState"), /fullBackfillCompletedAt\s+DateTime\?/);
+  assert.match(modelBody("CreatorNotificationSyncState"), /fullBackfillVerifiedAt\s+DateTime\?/);
 });
 
 test("ingest is version-fenced, transactional, page-oriented and interval-aware", () => {
-  assert.match(service, /const SCHEMA_VERSION = 3/);
-  assert.match(service, /const COLLECTOR_VERSION = "notifications-catchup-v4"/);
-  assert.match(service, /notification-facts:\$\{job\.id\}:\$\{batchKey\}:v4/);
+  assert.match(service, /const SCHEMA_VERSION = 4/);
+  assert.match(service, /const COLLECTOR_VERSION = "notifications-all-v5"/);
+  assert.match(service, /const LEGACY_SCHEMA_VERSION = 3/);
+  assert.match(service, /const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4"/);
+  assert.match(service, /protocolSuffix = schemaVersion === LEGACY_SCHEMA_VERSION \? "v4" : "v5"/);
+  assert.match(service, /notification-facts:\$\{job\.id\}:\$\{batchKey\}:\$\{protocolSuffix\}/);
   assert.match(service, /db\.\$transaction/);
   assert.match(service, /createMany\(\{ data: creates\.map/);
   assert.match(service, /analyticsCoverage\.updateMany/);
@@ -96,12 +104,14 @@ test("ingest is version-fenced, transactional, page-oriented and interval-aware"
   assert.match(service, /NOTIFICATION_FINALIZE_FLAG_REQUIRED/);
   assert.match(service, /NOTIFICATION_COVERAGE_METADATA_INVALID/);
   assert.match(strictDates, /getUTCDate\(\) !== day/);
+  assert.match(jobResultService, /notification_facts_page_all/);
+  assert.match(jobResultService, /recordNotificationPageProgress/);
   assert.match(jobResultService, /notification_facts_page/);
   assert.match(jobResultService, /schemaVersion: chunkResult\.schemaVersion/);
   assert.match(jobResultService, /finalizeCoverage: false/);
 });
 
-test("completion preserves run identity, streams compatibility facts and repairs partial jobs", () => {
+test("completion preserves run identity, streams compatibility facts and treats schema-4 source traversal as technically done", () => {
   const ledgerAt = observation.indexOf("await ingestNotificationFacts");
   const compatibilityAt = observation.indexOf("for await (const raw of iterateLedgerCompatibilityEvents");
   assert.ok(ledgerAt >= 0 && compatibilityAt > ledgerAt);
@@ -112,6 +122,8 @@ test("completion preserves run identity, streams compatibility facts and repairs
   assert.match(observation, /analyticsCoverageByType/);
   assert.match(observation, /subscriptionRefundIgnored/);
   assert.match(observation, /notification_scan_partial/);
+  assert.match(observation, /sourceTraversalComplete/);
+  assert.match(observation, /result\?\.sourceExhausted === true/);
   assert.match(leaseService, /job\.jobKey === "catchup_notifications_scan"/);
   assert.match(leaseService, /leaseRevision: \{ increment: 1 \}/);
   assert.match(leaseService, /notification scan scheduled for repair/);

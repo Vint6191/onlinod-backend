@@ -4,6 +4,7 @@ const prisma = require("../prisma");
 const { applyPresenceJobResult } = require("./presence-service");
 const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("./team-observation-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
+const { recordNotificationPageProgress } = require("./notification-sync-state-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
 const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
 const {
@@ -184,6 +185,47 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   }
   if (job.jobKey === VAULT_UNSORTED_JOB_KEY) {
     return applyVaultUnsortedChunk({ db, job, deviceId, userId, chunkResult });
+  }
+  if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "notification_facts_page_all") {
+    const batches = Array.isArray(chunkResult.batches) ? chunkResult.batches : [];
+    if (batches.length > 5) throw new Error("Notification ALL page contains too many typed batches");
+    const seenTypes = new Set();
+    const applied = [];
+    for (const batch of batches) {
+      const type = String(batch?.notificationType || "").trim().toLowerCase();
+      if (!["purchases", "tips", "subscriptions", "likes", "comments"].includes(type)) {
+        throw new Error("Unsupported notification ALL typed batch");
+      }
+      if (seenTypes.has(type)) throw new Error(`Duplicate notification ALL typed batch: ${type}`);
+      seenTypes.add(type);
+      const events = Array.isArray(batch?.events) ? batch.events : [];
+      if (events.length > 100) throw new Error("Notification ALL typed batch exceeds 100 events");
+      let ledger = null;
+      if (events.length > 0) {
+        ledger = await ingestNotificationFacts({
+          db, job, deviceId,
+          result: {
+            events,
+            notificationType: type,
+            batchKey: batch.batchKey,
+            finalizeCoverage: false,
+            sourceTimezone: chunkResult.sourceTimezone,
+            scanRunId: chunkResult.scanRunId,
+            collectorVersion: chunkResult.collectorVersion,
+            schemaVersion: chunkResult.schemaVersion,
+            coverage: { [type]: { status: "partial" } },
+          },
+        });
+      }
+      const rawSignals = Array.isArray(batch?.purchaseSignals) ? batch.purchaseSignals : [];
+      if (rawSignals.length > 100) throw new Error("Notification ALL purchase signal page exceeds 100 events");
+      const purchaseSignals = rawSignals.length
+        ? await applyPurchaseSignalsChunk({ db, job, deviceId, userId, chunkResult: { kind: "dialog_purchase_signals", signals: rawSignals } })
+        : null;
+      applied.push({ notificationType: type, ledger, purchaseSignals });
+    }
+    const syncState = await recordNotificationPageProgress({ db, job, deviceId, chunk: chunkResult });
+    return { type: "notification_facts_page_all", batches: applied, syncStateId: syncState?.id || null };
   }
   if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "notification_facts_page") {
     const type = String(chunkResult.notificationType || "").trim().toLowerCase();

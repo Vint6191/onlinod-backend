@@ -4,9 +4,11 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 
-const SERVICE_VERSION = "notification-facts-v1-audited-v3";
-const SCHEMA_VERSION = 3;
-const COLLECTOR_VERSION = "notifications-catchup-v4";
+const SERVICE_VERSION = "notification-facts-v1-all-v5";
+const SCHEMA_VERSION = 4;
+const COLLECTOR_VERSION = "notifications-all-v5";
+const LEGACY_SCHEMA_VERSION = 3;
+const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4";
 const MAX_EVENTS_PER_BATCH = 2_000;
 const NOTIFICATION_TYPES = Object.freeze(["purchases", "tips", "subscriptions", "likes", "comments"]);
 const COVERAGE_DATA_TYPES = Object.freeze({
@@ -98,8 +100,9 @@ function subscriptionType(rawType, amountCents) {
   if (/renew/.test(type)) return "RENEWED";
   if (/free/.test(type)) return "SUBSCRIBED_FREE";
   if (/paid/.test(type)) return "SUBSCRIBED_PAID";
+  if (/unknown|price.?unavailable/.test(type)) return "SUBSCRIBED_UNKNOWN";
   if (/subscrib/.test(type)) {
-    if (amountCents === null) return null;
+    if (amountCents === null) return "SUBSCRIBED_UNKNOWN";
     return amountCents > 0 ? "SUBSCRIBED_PAID" : "SUBSCRIBED_FREE";
   }
   return null;
@@ -205,7 +208,7 @@ function normalizeEvent(raw, creatorId) {
     const eventType = subscriptionType(rawType, amountCents);
     if (!eventType) return reject("UNSUPPORTED_SUBSCRIPTION_EVENT_TYPE");
     if (eventType === "SUBSCRIBED_PAID" && (amountCents === null || amountCents <= 0)) return reject("INVALID_PAID_SUBSCRIPTION_AMOUNT");
-    const observedPriceCents = eventType === "SUBSCRIBED_FREE" ? 0 : amountCents;
+    const observedPriceCents = eventType === "SUBSCRIBED_FREE" ? 0 : eventType === "SUBSCRIBED_UNKNOWN" ? null : amountCents;
     const fingerprint = identityFingerprint("subscription", creatorId, event, occurredAt, observedPriceCents, eventType);
     return { kind: "subscription", fingerprint, ...common, amountCents: observedPriceCents, eventType, observedPriceCents };
   }
@@ -240,7 +243,7 @@ function resultCoverage(result, job) {
   const coverage = object(result?.coverage);
   return Object.fromEntries(requestedTypes(job).map((type) => [type, object(coverage[type]).status === "complete" ? "complete" : "partial"]));
 }
-const COMPLETE_COVERAGE_REASONS = new Set(["range_boundary_reached", "source_exhausted"]);
+const COMPLETE_COVERAGE_REASONS = new Set(["source_exhausted", "watermark_reached", "range_boundary_reached"]);
 const PARTIAL_COVERAGE_REASONS = new Set([
   "event_limit", "not_scanned", "missing_timestamps", "invalid_rows",
   "cursor_stalled", "page_limit", "coverage_unproven",
@@ -270,7 +273,7 @@ function validateFinalScannerCoverage(result, job, rangeFrom, rangeTo) {
         code: "NOTIFICATION_COVERAGE_METADATA_INVALID",
       });
     }
-    nonNegativeCoverageInteger(row.pages, `${type}.pages`, 10_000);
+    nonNegativeCoverageInteger(row.pages, `${type}.pages`, 1_000_000);
     nonNegativeCoverageInteger(row.events, `${type}.events`);
     const rejected = nonNegativeCoverageInteger(row.rejected, `${type}.rejected`);
     if (status === "complete" && rejected !== 0) {
@@ -478,7 +481,7 @@ function buildFactData({ fact, job, deviceId, fanIds, now }) {
     externalNotificationId: fact.externalNotificationId,
     collectedAt: now,
     sourceDeviceId: deviceId || null,
-    sourceJobId: job.id,
+    sourceJobId: job.sourceJobId === null ? null : job.id,
     createdAt: now,
     updatedAt: now,
   };
@@ -834,7 +837,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
     });
   }
   const incomingSchemaVersion = result?.schemaVersion;
-  if (!Number.isInteger(incomingSchemaVersion) || incomingSchemaVersion !== SCHEMA_VERSION) {
+  if (!Number.isInteger(incomingSchemaVersion) || ![LEGACY_SCHEMA_VERSION, SCHEMA_VERSION].includes(incomingSchemaVersion)) {
     throw Object.assign(new Error(`Unsupported notification schema version: ${incomingSchemaVersion ?? "<missing>"}`), {
       code: "NOTIFICATION_SCHEMA_VERSION_UNSUPPORTED",
     });
@@ -843,7 +846,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
   const scanRunIdRaw = typeof result?.scanRunId === "string" ? result.scanRunId.trim() : "";
   const scanRunId = scanRunIdRaw;
   if (!scanRunId || scanRunId.length > 80 || !/^[A-Za-z0-9._-]{8,80}$/.test(scanRunId)) {
-    throw Object.assign(new Error("Notification schema v3 requires a valid scanRunId"), {
+    throw Object.assign(new Error("Notification schema v4 requires a valid scanRunId"), {
       code: "NOTIFICATION_SCAN_RUN_ID_REQUIRED",
     });
   }
@@ -908,7 +911,8 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
       code: "NOTIFICATION_PAGE_BATCH_KEY_MISMATCH",
     });
   }
-  const idempotencyKey = `notification-facts:${job.id}:${batchKey}:v4`;
+  const protocolSuffix = schemaVersion === LEGACY_SCHEMA_VERSION ? "v4" : "v5";
+  const idempotencyKey = `notification-facts:${job.id}:${batchKey}:${protocolSuffix}`;
   if (idempotencyKey.length > 240) {
     throw Object.assign(new Error("Notification ingest idempotency key exceeds the ledger limit"), {
       code: "NOTIFICATION_IDEMPOTENCY_KEY_TOO_LONG",
@@ -917,7 +921,8 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
   const collectorVersionRaw = typeof result?.collectorVersion === "string"
     ? result.collectorVersion.trim()
     : "";
-  if (!collectorVersionRaw || collectorVersionRaw.length > 80 || collectorVersionRaw !== COLLECTOR_VERSION) {
+  const expectedCollectorVersion = schemaVersion === LEGACY_SCHEMA_VERSION ? LEGACY_COLLECTOR_VERSION : COLLECTOR_VERSION;
+  if (!collectorVersionRaw || collectorVersionRaw.length > 80 || collectorVersionRaw !== expectedCollectorVersion) {
     throw Object.assign(new Error("Notification collectorVersion is invalid or unsupported"), {
       code: "NOTIFICATION_COLLECTOR_VERSION_INVALID",
     });
@@ -935,7 +940,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
   }
 
   const initial = await ensureBatch(db, {
-    agencyId: job.agencyId, creatorId: job.creatorId, sourceDeviceId: deviceId || null, sourceJobId: job.id,
+    agencyId: job.agencyId, creatorId: job.creatorId, sourceDeviceId: deviceId || null, sourceJobId: job.sourceJobId === null ? null : job.id,
     idempotencyKey, dataType: "NOTIFICATIONS", status: "RECEIVED", rangeFrom, rangeTo, sourceTimezone,
     collectorVersion: collectorVersionRaw, schemaVersion, payloadChecksum,
     receivedRows: rawEvents.length + scannerRejectedTotal,
@@ -1004,7 +1009,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
       if (finalizeCoverage) {
         const priorBatches = typeof tx.analyticsIngestBatch.findMany === "function"
           ? await tx.analyticsIngestBatch.findMany({
-              where: { sourceJobId: job.id, id: { not: initial.batch.id } },
+              where: { sourceJobId: job.sourceJobId === null ? null : job.id, id: { not: initial.batch.id } },
               select: { idempotencyKey: true, status: true, rejectedRows: true },
             })
           : [];
@@ -1012,7 +1017,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
           const currentRunPageMarker = scanRunId ? `:run:${scanRunId}:page:${type}:` : `:page:${type}:`;
           const priorTypeFailed = priorBatches.some((batch) => {
             const key = String(batch.idempotencyKey || "");
-            return key.endsWith(":v4")
+            return (key.endsWith(":v4") || key.endsWith(":v5"))
               && key.includes(currentRunPageMarker)
               && (batch.status !== "COMMITTED" || Number(batch.rejectedRows || 0) > 0);
           });
@@ -1022,13 +1027,17 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
             : "partial";
         }
 
+        const notificationMode = object(job.params).notificationMode === "full" ? "full" : "catchup";
+        const coverageRangeFrom = notificationMode === "full"
+          ? new Date(Math.max(rangeFrom.getTime(), rangeTo.getTime() - 369 * 24 * 60 * 60 * 1000))
+          : rangeFrom;
         for (const type of requested) {
           const typeRejected = (perTypeInitialRejected[type] || 0) + (perTypePersistenceRejected[type] || 0);
           const persistedCoverage = await persistCoverageRows(tx, {
             job,
             batchId: initial.batch.id,
             type,
-            rangeFrom,
+            rangeFrom: coverageRangeFrom,
             rangeTo,
             sourceTimezone,
             scannerCoverage: object(object(result?.coverage)[type]),

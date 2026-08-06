@@ -8,6 +8,7 @@ const { ingestTipEvent } = require("./team-tip-ledger-service");
 const { ingestSubscriptionEvent, markTrafficFanValueDirty } = require("./traffic-service");
 const { processRuntimeEvents: processBumpRuntimeEvents } = require("./bump-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
+const { completeNotificationSync, recordNotificationSyncFailure } = require("./notification-sync-state-service");
 
 const CATCHUP_JOB_KEY = "catchup_notifications_scan";
 const DEFAULT_BUFFER_MS = 2 * 60 * 60 * 1000;
@@ -874,12 +875,22 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, resul
     },
     update: data,
   });
-  return { ok: fullySuccessful, summary };
+  await completeNotificationSync({ db, job, deviceId, result, successful: fullySuccessful });
+  // Schema-4 ALL collectors can only reach completion after the explicit OF
+  // source boundary. Rejected recognized facts remain visible as PARTIAL in the
+  // sync state, but repeating the entire historical traversal cannot repair a
+  // source row that lacks identity. Treat the transport as technically done and
+  // reserve JobInstance retries for actual exceptions / lost leases.
+  const sourceTraversalComplete = Number(result?.schemaVersion || 0) >= 4
+    && result?.sourceExhausted === true
+    && ["COMMITTED", "PARTIAL"].includes(ledger.status);
+  return { ok: sourceTraversalComplete || fullySuccessful, verified: fullySuccessful, sourceTraversalComplete, summary };
 }
 
 async function recordCatchupJobFailure({ job, error }) {
   if (!job?.agencyId || !job?.creatorId) return null;
   const params = job.params && typeof job.params === "object" ? job.params : {};
+  await recordNotificationSyncFailure({ db: prisma, job, error }).catch(() => null);
   return prisma.teamObservationState.upsert({
     where: { agencyId_creatorId: { agencyId: job.agencyId, creatorId: job.creatorId } },
     create: {

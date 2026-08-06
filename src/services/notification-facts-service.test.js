@@ -165,6 +165,9 @@ test("purchases keep post and message identities mutually exclusive and never pe
 test("tips and subscription lifecycle events preserve strict semantics", () => {
   assert.equal(normalizeEvent({ eventType: "tip_received", fanId: "fan", amountCents: 500, occurredAt }, creatorId).kind, "tip");
   assert.equal(normalizeEvent({ eventType: "free_subscribed", fanId: "fan", amountCents: 0, occurredAt }, creatorId).eventType, "SUBSCRIBED_FREE");
+  const unknown = normalizeEvent({ eventType: "subscription_subscribed_unknown", fanId: "fan", amountCents: null, occurredAt }, creatorId);
+  assert.equal(unknown.eventType, "SUBSCRIBED_UNKNOWN");
+  assert.equal(unknown.observedPriceCents, null);
   assert.equal(normalizeEvent({ eventType: "subscription_renewed", fanId: "fan", amountCents: 1000, occurredAt }, creatorId).eventType, "RENEWED");
   assert.equal(normalizeEvent({ eventType: "auto_renew_disabled", fanId: "fan", occurredAt }, creatorId).eventType, "AUTO_RENEW_DISABLED");
   assert.equal(normalizeEvent({ eventType: "subscription_expired", fanId: "fan", occurredAt }, creatorId).eventType, "EXPIRED");

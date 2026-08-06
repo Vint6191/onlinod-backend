@@ -23,12 +23,15 @@
 "use strict";
 
 const express = require("express");
+const crypto = require("node:crypto");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("../services/job-scheduler");
 const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-analytics-permissions");
 const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
-const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily, notificationWindows } = require("../services/creator-analytics-ledger-service");
+const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily } = require("../services/creator-analytics-ledger-service");
+const { buildNotificationScanParams, loadNotificationSyncState, recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
+const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = require("../services/notification-facts-service");
 
 const router = express.Router();
 
@@ -532,7 +535,13 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
     }
 
     const now = new Date();
-    const windows = notificationWindows(range, now);
+    const notificationState = await loadNotificationSyncState(prisma, creator.id);
+    const notificationParams = buildNotificationScanParams({
+      state: notificationState,
+      now,
+      reason: "creator_analytics_refresh",
+      analyticsRangeKey: range,
+    });
     const [earnings, campaigns, notifications] = await Promise.all([
       scheduleJobNow({
         jobKey: "fetch_earnings",
@@ -552,22 +561,15 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         now,
         bucketMs: 60_000,
       }),
-      Promise.all(windows.map((window, index) => scheduleJobNow({
+      scheduleJobNow({
         jobKey: "catchup_notifications_scan",
         creatorId: creator.id,
         agencyId: creator.agencyId,
-        params: {
-          from: window.start.toISOString(),
-          to: window.end.toISOString(),
-          types: ["purchases", "tips", "subscriptions", "likes", "comments"],
-          reason: "creator_analytics_refresh",
-          analyticsRangeKey: range,
-          backfillWindow: { index, total: windows.length },
-        },
+        params: notificationParams,
         priority: 95,
         now,
         bucketMs: 60_000,
-      }))),
+      }),
     ]);
 
     const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
@@ -587,7 +589,7 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
       jobs: [
         { id: earnings.job.id, jobKey: "fetch_earnings", rangeKey: range, reason: earnings.reason },
         { id: campaigns.job.id, jobKey: "fetch_campaigns", rangeKey: range, reason: campaigns.reason },
-        ...notifications.map((scheduled) => ({ id: scheduled.job.id, jobKey: "catchup_notifications_scan", rangeKey: range, reason: scheduled.reason })),
+        { id: notifications.job.id, jobKey: "catchup_notifications_scan", rangeKey: range, reason: notifications.reason, notificationMode: notificationParams.notificationMode },
       ],
       message:
         onlineBindings === 0
@@ -622,7 +624,10 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
     });
 
     const now = new Date();
-    const windows = notificationWindows(range, now);
+    const notificationStates = await prisma.creatorNotificationSyncState.findMany({
+      where: { creatorId: { in: creators.map((creator) => creator.id) } },
+    });
+    const notificationStateByCreator = new Map(notificationStates.map((state) => [state.creatorId, state]));
     let jobsScheduled = 0;
     let alreadyClaimed = 0;
     const failedCreators = [];
@@ -653,22 +658,20 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
               now,
               bucketMs: 60_000,
             }),
-            ...windows.map((window, index) => scheduleJobNow({
+            scheduleJobNow({
               jobKey: "catchup_notifications_scan",
               creatorId: creator.id,
               agencyId: creator.agencyId,
-              params: {
-                from: window.start.toISOString(),
-                to: window.end.toISOString(),
-                types: ["purchases", "tips", "subscriptions", "likes", "comments"],
+              params: buildNotificationScanParams({
+                state: notificationStateByCreator.get(creator.id) || null,
+                now,
                 reason: "agency_analytics_refresh",
                 analyticsRangeKey: range,
-                backfillWindow: { index, total: windows.length },
-              },
+              }),
               priority: 45,
               now,
               bucketMs: 60_000,
-            })),
+            }),
           ]);
           return { creatorId: creator.id, scheduled };
         })
@@ -708,6 +711,14 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
 
 
 // Relational Creator Analytics V1 read model and local-only message day aggregates.
+const liveNotificationSchema = z.object({
+  deviceId: z.string().min(3).max(160),
+  batchId: z.string().min(8).max(80).regex(/^[A-Za-z0-9._-]+$/),
+  observedAt: z.string().datetime({ offset: true }),
+  sourceTimezone: z.literal("UTC").default("UTC"),
+  events: z.array(z.record(z.unknown())).min(1).max(100),
+});
+
 const messagesDailySchema = z.object({
   deviceId: z.string().min(3).max(160),
   syncId: z.string().uuid(),
@@ -793,6 +804,96 @@ router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) =
   } catch (error) {
     console.error("[stats/campaign-fans] failed:", error);
     return res.status(500).json({ ok: false, code: "CAMPAIGN_FANS_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+
+router.post("/creators/:creatorId/notifications/live", async (req, res) => {
+  try {
+    const input = liveNotificationSchema.parse(req.body || {});
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    // Live websocket facts are reported by the authenticated device that owns
+    // the fresh creator binding. Chatter devices must not need the managerial
+    // "refresh analytics" permission merely to preserve realtime facts.
+    const userId = actorUserId(req);
+    const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
+    const device = await prisma.workerDevice.findFirst({
+      where: { id: input.deviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: { gte: freshAfter } },
+      select: { id: true },
+    });
+    if (!device) return res.status(403).json({ ok: false, code: "LIVE_NOTIFICATION_DEVICE_FORBIDDEN", error: "The reporting device is not owned by this agency member" });
+    const binding = await prisma.deviceCreatorBinding.findFirst({
+      where: {
+        deviceId: device.id,
+        creatorId: ctx.creator.id,
+        agencyId: ctx.creator.agencyId,
+        status: "ACTIVE",
+        lastSeenAt: { gte: freshAfter },
+      },
+      select: { id: true },
+    });
+    if (!binding) return res.status(409).json({ ok: false, code: "LIVE_NOTIFICATION_CREATOR_NOT_READY", error: "The reporting device has no fresh READY binding for this creator" });
+
+    const grouped = new Map();
+    const dates = [];
+    for (const raw of input.events) {
+      const normalized = normalizeNotificationFact(raw, ctx.creator.id);
+      if (!normalized.sourceType || normalized.rejected) {
+        return res.status(422).json({ ok: false, code: "LIVE_NOTIFICATION_EVENT_REJECTED", error: normalized.rejected || "Unsupported live notification event" });
+      }
+      if (!grouped.has(normalized.sourceType)) grouped.set(normalized.sourceType, []);
+      grouped.get(normalized.sourceType).push(raw);
+      if (normalized.occurredAt) dates.push(normalized.occurredAt);
+    }
+    const observedAt = new Date(input.observedAt);
+    const rangeFrom = dates.length ? new Date(Math.min(...dates.map((date) => date.getTime())) - 5 * 60 * 1000) : new Date(observedAt.getTime() - 5 * 60 * 1000);
+    const rangeTo = dates.length ? new Date(Math.max(...dates.map((date) => date.getTime())) + 5 * 60 * 1000) : new Date(observedAt.getTime() + 5 * 60 * 1000);
+    const logicalJob = {
+      id: `live_${input.batchId}`,
+      agencyId: ctx.creator.agencyId,
+      creatorId: ctx.creator.id,
+      sourceJobId: null,
+      params: {
+        from: rangeFrom.toISOString(),
+        to: rangeTo.toISOString(),
+        types: [...grouped.keys()],
+        notificationMode: "catchup",
+      },
+    };
+    const results = [];
+    for (const [type, events] of grouped) {
+      const typeHash = crypto.createHash("sha256").update(`${input.batchId}|${type}`).digest("hex").slice(0, 24);
+      const result = await ingestNotificationFacts({
+        db: prisma,
+        job: logicalJob,
+        deviceId: device.id,
+        result: {
+          events,
+          notificationType: type,
+          batchKey: `run:${input.batchId}:page:${type}:${typeHash}`,
+          finalizeCoverage: false,
+          sourceTimezone: input.sourceTimezone,
+          scanRunId: input.batchId,
+          collectorVersion: "notifications-all-v5",
+          schemaVersion: 4,
+          coverage: { [type]: { status: "partial" } },
+        },
+      });
+      results.push({ type, ...result });
+    }
+    await recordNotificationSocketEvent({
+      db: prisma,
+      agencyId: ctx.creator.agencyId,
+      creatorId: ctx.creator.id,
+      deviceId: device.id,
+      occurredAt: dates.length ? new Date(Math.max(...dates.map((date) => date.getTime()))) : observedAt,
+    });
+    return res.json({ ok: true, creatorId: ctx.creator.id, batchId: input.batchId, results });
+  } catch (error) {
+    if (error?.issues) return validationError(res, error);
+    console.error("[stats/notifications-live] failed:", error);
+    return res.status(500).json({ ok: false, code: error?.code || "LIVE_NOTIFICATION_INGEST_FAILED", error: error?.message || "Failed" });
   }
 });
 

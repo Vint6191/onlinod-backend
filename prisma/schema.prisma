@@ -63,6 +63,7 @@ enum CreatorSaleType {
 enum CreatorSubscriptionEventType {
   SUBSCRIBED_FREE
   SUBSCRIBED_PAID
+  SUBSCRIBED_UNKNOWN
   RENEWED
   RESUBSCRIBED
   EXPIRED
@@ -310,6 +311,7 @@ model CreatorAccount {
   campaigns CreatorCampaign[]
   campaignMemberships CreatorCampaignFan[]
   messagesDaily CreatorMessagesDaily[]
+  notificationSyncState CreatorNotificationSyncState?
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
@@ -728,6 +730,41 @@ model CreatorFan {
   @@unique([creatorId, id], map: "CreatorFan_creatorId_id_key")
   @@index([agencyId, creatorId])
   @@index([creatorId, lastSeenAt])
+}
+
+model CreatorNotificationSyncState {
+  id                      String                  @id @default(cuid())
+  agencyId                String
+  creatorId               String                  @unique
+  status                  AnalyticsCoverageStatus @default(MISSING)
+  mode                    String                  @default("full")
+  scanRunId               String?
+  nextCursor              String?
+  headNotificationId      String?
+  tailNotificationId      String?
+  oldestOccurredAt        DateTime?
+  newestOccurredAt        DateTime?
+  pagesScanned            Int                     @default(0)
+  eventsAccepted          Int                     @default(0)
+  eventsRejected          Int                     @default(0)
+  ignoredEvents           Int                     @default(0)
+  fullBackfillCompletedAt DateTime?
+  fullBackfillVerifiedAt  DateTime?
+  lastCatchupCompletedAt  DateTime?
+  lastSocketEventAt       DateTime?
+  lastErrorCode           String?
+  lastErrorMessage        String?
+  sourceDeviceId          String?
+  sourceJobId             String?
+  createdAt               DateTime                @default(now())
+  updatedAt               DateTime                @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId], map: "CreatorNotificationSyncState_agency_creator_key")
+  @@index([agencyId, status, updatedAt])
+  @@index([creatorId, fullBackfillCompletedAt], map: "CreatorNotificationSyncState_creator_full_idx")
+  @@index([sourceJobId])
 }
 
 model AnalyticsIngestBatch {

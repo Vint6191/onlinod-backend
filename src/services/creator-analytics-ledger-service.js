@@ -82,20 +82,6 @@ function rangeBounds(rangeKey, now = new Date()) {
   }
   return { key, start, end, dayStart: utcDay(start), dayEnd: utcDay(end) };
 }
-const MAX_NOTIFICATION_WINDOW_MS = 365 * 86_400_000;
-function notificationWindows(rangeKey, now = new Date()) {
-  const range = rangeBounds(rangeKey, now);
-  const windows = [];
-  let start = new Date(range.start);
-  const finalEnd = new Date(range.end);
-  while (start <= finalEnd) {
-    const end = new Date(Math.min(finalEnd.getTime(), start.getTime() + MAX_NOTIFICATION_WINDOW_MS - 1));
-    windows.push({ start, end });
-    start = new Date(end.getTime() + 1);
-  }
-  return windows;
-}
-
 function earningsJobBounds(job, observedAt) {
   const key = String(job?.params?.rangeKey || "7d").trim().toLowerCase();
   if (!EARNINGS_RANGE_KEYS.has(key)) throw new Error("Earnings job rangeKey is invalid");
@@ -1065,7 +1051,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
   const currentDay = utcDay(now);
   const currentDayInRange = currentDay >= range.dayStart && currentDay <= range.dayEnd;
-  const [earnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, completeEarningsDays, inProgressEarningsDays, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution] = await Promise.all([
+  const [earnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, completeEarningsDays, inProgressEarningsDays, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync] = await Promise.all([
     db.creatorEarningsDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }),
     db.creatorMessagesDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }),
     db.creatorPostLike.groupBy({ by: ["onlyFansPostId"], where: { creatorId, likedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
@@ -1083,6 +1069,9 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "MESSAGES_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
     readCampaignRevenue({ db, creatorId, start: range.start, end: range.end }),
     db.creatorCampaignFan.groupBy({ by: ["campaignId"], where: { creatorId, attributedAt: null }, _count: { _all: true } }),
+    db.creatorNotificationSyncState?.findUnique
+      ? db.creatorNotificationSyncState.findUnique({ where: { creatorId } })
+      : Promise.resolve(null),
   ]);
   const earningsKeys = ["subscriptionsCents", "messagesCents", "tipsCents", "postsCents", "streamsCents", "referralsCents", "totalCents"];
   const earningsAccumulator = earnings.reduce((acc, row) => {
@@ -1118,7 +1107,27 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     ok: true,
     creatorId,
     range: { key: range.key, startAt: range.start.toISOString(), endAt: range.end.toISOString() },
-    verification: { officialEarnings, officialMessages, earningsDays: verifiedEarningsDays, messageDays: verifiedMessageDays },
+    verification: {
+      officialEarnings,
+      officialMessages,
+      notificationFacts: Boolean(notificationSync?.fullBackfillVerifiedAt),
+      earningsDays: verifiedEarningsDays,
+      messageDays: verifiedMessageDays,
+    },
+    notificationSync: notificationSync ? {
+      status: notificationSync.status,
+      mode: notificationSync.mode,
+      pagesScanned: notificationSync.pagesScanned,
+      eventsAccepted: notificationSync.eventsAccepted,
+      eventsRejected: notificationSync.eventsRejected,
+      ignoredEvents: notificationSync.ignoredEvents,
+      fullBackfillCompletedAt: notificationSync.fullBackfillCompletedAt,
+      fullBackfillVerifiedAt: notificationSync.fullBackfillVerifiedAt,
+      lastCatchupCompletedAt: notificationSync.lastCatchupCompletedAt,
+      lastSocketEventAt: notificationSync.lastSocketEventAt,
+      lastErrorCode: notificationSync.lastErrorCode,
+      lastErrorMessage: notificationSync.lastErrorMessage,
+    } : null,
     totals: {
       ...earningsTotals,
       ...messageTotals,
@@ -1195,7 +1204,6 @@ module.exports = {
   normalizeCampaign,
   normalizeMessageDay,
   rangeBounds,
-  notificationWindows,
   EARNINGS_COLLECTOR_VERSION,
   EARNINGS_SCHEMA_VERSION,
   CAMPAIGN_COLLECTOR_VERSION,
