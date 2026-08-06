@@ -173,6 +173,114 @@ test("tips and subscription lifecycle events preserve strict semantics", () => {
   assert.equal(normalizeEvent({ eventType: "subscription_expired", fanId: "fan", occurredAt }, creatorId).eventType, "EXPIRED");
 });
 
+
+
+test("subscription identity dedupes websocket variants and Notifications ALL within the same UTC minute", () => {
+  const fromNewMessage = normalizeEvent({
+    eventType: "free_subscribed",
+    notificationId: "110375912038",
+    fanId: "93955631",
+    amountCents: 0,
+    occurredAt: "2026-05-12T16:03:00.000Z",
+  }, creatorId);
+  const fromSubscribedFrame = normalizeEvent({
+    eventType: "free_subscribed",
+    fanId: "93955631",
+    amountCents: 0,
+    occurredAt: "2026-05-12T16:03:55.000Z",
+  }, creatorId);
+  const fromNotificationsAll = normalizeEvent({
+    eventType: "free_subscribed",
+    notificationId: "110375912038",
+    externalEventId: "110375912038",
+    fanId: "93955631",
+    amountCents: 0,
+    occurredAt: "2026-05-12T16:03:00.000Z",
+  }, creatorId);
+  assert.equal(fromNewMessage.kind, "subscription");
+  assert.equal(fromNewMessage.fingerprint, fromSubscribedFrame.fingerprint);
+  assert.equal(fromNewMessage.fingerprint, fromNotificationsAll.fingerprint);
+});
+
+
+test("weaker subscribed frames cannot erase an authoritative notification identity", async () => {
+  const db = memoryDb();
+  const first = completeResult([{
+    eventType: "free_subscribed",
+    notificationId: "110375912038",
+    fanId: "93955631",
+    amountCents: 0,
+    subscribedAt: "2026-08-05T20:00:00.000Z",
+  }]);
+  await ingestNotificationFacts({ job: job({ id: "job-subscription-strong" }), deviceId: "device-1", result: first, db });
+
+  const secondRunId = "scan-run-test-0002";
+  const second = completeResult([{
+    eventType: "free_subscribed",
+    fanId: "93955631",
+    amountCents: 0,
+    subscribedAt: "2026-08-05T20:00:55.000Z",
+  }]);
+  second.scanRunId = secondRunId;
+  second.batchKey = `run:${secondRunId}:completion`;
+  await ingestNotificationFacts({ job: job({ id: "job-subscription-weak" }), deviceId: "device-1", result: second, db });
+
+  assert.equal(db.store.subscriptions.length, 1);
+  assert.equal(db.store.subscriptions[0].externalNotificationId, "110375912038");
+  assert.equal(db.store.subscriptions[0].occurredAt.toISOString(), "2026-08-05T20:00:00.000Z");
+  assert.equal(db.store.subscriptions[0].sourceJobId, "job-subscription-strong");
+});
+
+test("same-batch subscription variants keep the richest source identity", async () => {
+  const db = memoryDb();
+  const result = completeResult([
+    {
+      eventType: "free_subscribed",
+      notificationId: "110375912038",
+      fanId: "93955631",
+      amountCents: 0,
+      subscribedAt: "2026-08-05T20:00:00.000Z",
+    },
+    {
+      eventType: "free_subscribed",
+      fanId: "93955631",
+      amountCents: 0,
+      subscribedAt: "2026-08-05T20:00:55.000Z",
+    },
+  ]);
+  await ingestNotificationFacts({ job: job({ id: "job-subscription-batch" }), deviceId: "device-1", result, db });
+
+  assert.equal(db.store.subscriptions.length, 1);
+  assert.equal(db.store.subscriptions[0].externalNotificationId, "110375912038");
+  assert.equal(db.store.subscriptions[0].occurredAt.toISOString(), "2026-08-05T20:00:00.000Z");
+});
+
+
+test("different strong subscription ids in the same semantic minute fail closed", async () => {
+  const db = memoryDb();
+  const result = completeResult([
+    {
+      eventType: "free_subscribed",
+      notificationId: "notification-a",
+      fanId: "93955631",
+      amountCents: 0,
+      subscribedAt: "2026-08-05T20:00:00.000Z",
+    },
+    {
+      eventType: "free_subscribed",
+      notificationId: "notification-b",
+      fanId: "93955631",
+      amountCents: 0,
+      subscribedAt: "2026-08-05T20:00:30.000Z",
+    },
+  ]);
+  const response = await ingestNotificationFacts({ job: job({ id: "job-subscription-collision" }), deviceId: "device-1", result, db });
+
+  assert.equal(db.store.subscriptions.length, 1);
+  assert.equal(response.rejected, 1);
+  assert.equal(response.status, "PARTIAL");
+});
+
 test("strict normalization rejects coercion, missing timestamps and unknown money", () => {
   assert.equal(normalizeEvent({ eventType: "tip_received", fanId: "fan", amountCents: "500", occurredAt }, creatorId).rejected, "INVALID_TIP_AMOUNT_CENTS");
   assert.equal(normalizeEvent({ eventType: "tip_received", fanId: "fan", amountCents: 500, occurredAt: false }, creatorId).rejected, "INVALID_OCCURRED_AT");

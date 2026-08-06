@@ -32,6 +32,7 @@ const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize
 const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily } = require("../services/creator-analytics-ledger-service");
 const { buildNotificationScanParams, loadNotificationSyncState, recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
 const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = require("../services/notification-facts-service");
+const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
 
 const router = express.Router();
 
@@ -542,7 +543,7 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
       reason: "creator_analytics_refresh",
       analyticsRangeKey: range,
     });
-    const [earnings, campaigns, notifications] = await Promise.all([
+    const [earnings, campaigns, notifications, subscribers] = await Promise.all([
       scheduleJobNow({
         jobKey: "fetch_earnings",
         creatorId: creator.id,
@@ -570,6 +571,15 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         now,
         bucketMs: 60_000,
       }),
+      scheduleSubscriberScan({
+        agencyId: creator.agencyId,
+        creatorId: creator.id,
+        userId: actorUserId(req),
+        manual: true,
+        force: true,
+        priority: 90,
+        reason: "creator_analytics_refresh",
+      }),
     ]);
 
     const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
@@ -590,6 +600,7 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         { id: earnings.job.id, jobKey: "fetch_earnings", rangeKey: range, reason: earnings.reason },
         { id: campaigns.job.id, jobKey: "fetch_campaigns", rangeKey: range, reason: campaigns.reason },
         { id: notifications.job.id, jobKey: "catchup_notifications_scan", rangeKey: range, reason: notifications.reason, notificationMode: notificationParams.notificationMode },
+        { id: subscribers.job?.id || subscribers.run?.jobId || null, jobKey: "subscriber_directory_scan", rangeKey: "all", reason: subscribers.reason },
       ],
       message:
         onlineBindings === 0

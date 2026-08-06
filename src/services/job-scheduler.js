@@ -134,10 +134,15 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   // walks to explicit hasMore=false; later hourly runs stop at the last known
   // head notification and only close realtime/offline gaps.
   const notificationState = await loadNotificationSyncState(prisma, creatorId);
+  const notificationReason = notificationState?.fullBackfillVerifiedAt
+    ? "recurring_notification_catchup"
+    : notificationState?.fullBackfillCompletedAt
+      ? "notification_full_repair"
+      : "initial_notification_backfill";
   const notificationParams = buildNotificationScanParams({
     state: notificationState,
     now,
-    reason: notificationState?.fullBackfillCompletedAt ? "recurring_notification_catchup" : "initial_notification_backfill",
+    reason: notificationReason,
     analyticsRangeKey: "all",
   });
   const notificationDecision = await ensureSingleJob({

@@ -56,7 +56,10 @@ test("earnings, campaigns, overview and agency summary are permission guarded", 
 });
 
 test("creator and agency refresh routes are guarded and agency scheduling is bounded", () => {
-  assert.match(routeBody(stats, "post", "/creators/:creatorId/refresh"), /requireRefreshPermission\(res, ctx\.member\)/);
+  const creator = routeBody(stats, "post", "/creators/:creatorId/refresh");
+  assert.match(creator, /requireRefreshPermission\(res, ctx\.member\)/);
+  assert.match(creator, /scheduleSubscriberScan\(/);
+  assert.match(creator, /jobKey: "subscriber_directory_scan"/);
   const agency = routeBody(stats, "post", "/agencies/:agencyId/refresh");
   assert.match(agency, /requireRefreshPermission\(res, ctx\.member\)/);
   assert.match(agency, /const batchSize = range === "all" \? 5 : 20/);

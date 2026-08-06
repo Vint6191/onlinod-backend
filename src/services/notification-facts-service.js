@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 
-const SERVICE_VERSION = "notification-facts-v1-all-v5";
+const SERVICE_VERSION = "notification-facts-v1-all-v6";
 const SCHEMA_VERSION = 4;
 const COLLECTOR_VERSION = "notifications-all-v5";
 const LEGACY_SCHEMA_VERSION = 3;
@@ -75,18 +75,28 @@ function identityFingerprint(kind, creatorId, event, occurredAt, amountCents, ca
             : event.externalEventId,
     220,
   );
-  if ((kind === "like" || kind === "comment") && kindId) {
-    return sha256(`${kind}|${creatorId}|external|${kindId}`);
-  }
-  if (notificationId) return sha256(`${kind}|${creatorId}|notification|${notificationId}`);
-  if (kind === "subscription" && transactionId) {
-    return sha256(`${kind}|${creatorId}|transaction|${transactionId}|${canonicalEventType || "unknown"}`);
-  }
-  if (transactionId) return sha256(`${kind}|${creatorId}|transaction|${transactionId}`);
-  if (kindId) return sha256(`${kind}|${creatorId}|external|${kindId}|${canonicalEventType || ""}`);
   const fan = clean(event.fanId || event.dialogId, 180) || "";
   const target = clean(event.messageId || event.postId || event.commentId, 220) || "";
   const eventType = canonicalEventType || clean(event.eventType || event.type, 80) || "";
+  if ((kind === "like" || kind === "comment") && kindId) {
+    return sha256(`${kind}|${creatorId}|external|${kindId}`);
+  }
+  if (kind === "subscription") {
+    if (transactionId) return sha256(`${kind}|${creatorId}|transaction|${transactionId}|${eventType || "unknown"}`);
+    // OnlyFans emits the same subscription through new_message, subscribed and
+    // later Notifications ALL. Some variants have a notification id and some do
+    // not, but they agree on fan, lifecycle type, price and the UTC minute.
+    // Use that shared semantic identity so one subscription is stored once.
+    if (fan) {
+      const minute = Math.floor(occurredAt.getTime() / 60_000);
+      return sha256(`${kind}|${creatorId}|semantic|${fan}|${eventType}|${amountCents ?? ""}|${minute}`);
+    }
+    if (notificationId) return sha256(`${kind}|${creatorId}|notification|${notificationId}`);
+    if (kindId) return sha256(`${kind}|${creatorId}|external|${kindId}|${eventType}`);
+  }
+  if (notificationId) return sha256(`${kind}|${creatorId}|notification|${notificationId}`);
+  if (transactionId) return sha256(`${kind}|${creatorId}|transaction|${transactionId}`);
+  if (kindId) return sha256(`${kind}|${creatorId}|external|${kindId}|${canonicalEventType || ""}`);
   const second = Math.floor(occurredAt.getTime() / 1_000);
   return sha256(`${kind}|${creatorId}|fallback|${fan}|${target}|${eventType}|${amountCents ?? ""}|${second}`);
 }
@@ -471,6 +481,50 @@ function factIdentityTokens(fact) {
     ...(fact.kind !== "subscription" && fact.externalTransactionId ? [`t:${fact.externalTransactionId}`] : []),
   ];
 }
+function subscriptionFactStrength(fact) {
+  if (fact?.externalTransactionId) return 3;
+  if (fact?.externalNotificationId) return 2;
+  if (fact?.externalFanId) return 1;
+  return 0;
+}
+function subscriptionIdentityConflict(current, incoming) {
+  return Boolean(
+    current?.externalTransactionId && incoming?.externalTransactionId
+      && current.externalTransactionId !== incoming.externalTransactionId,
+  ) || Boolean(
+    current?.externalNotificationId && incoming?.externalNotificationId
+      && current.externalNotificationId !== incoming.externalNotificationId,
+  );
+}
+function mergeSubscriptionFacts(current, incoming) {
+  const incomingWins = subscriptionFactStrength(incoming) > subscriptionFactStrength(current);
+  const primary = incomingWins ? incoming : current;
+  const secondary = incomingWins ? current : incoming;
+  return {
+    ...secondary,
+    ...primary,
+    externalNotificationId: primary.externalNotificationId || secondary.externalNotificationId || null,
+    externalTransactionId: primary.externalTransactionId || secondary.externalTransactionId || null,
+    externalFanId: primary.externalFanId || secondary.externalFanId || null,
+    fanUsername: primary.fanUsername || secondary.fanUsername || null,
+    fanDisplayName: primary.fanDisplayName || secondary.fanDisplayName || null,
+  };
+}
+function mergeFactDataWithExisting(model, existing, incoming) {
+  if (model !== "creatorSubscriptionEvent" || !existing) return incoming;
+  const existingHasStrongIdentity = Boolean(existing.externalTransactionId || existing.externalNotificationId);
+  const incomingHasStrongIdentity = Boolean(incoming.externalTransactionId || incoming.externalNotificationId);
+  const preserveExistingSource = existingHasStrongIdentity && !incomingHasStrongIdentity;
+  return {
+    ...incoming,
+    externalNotificationId: existing.externalNotificationId || incoming.externalNotificationId || null,
+    externalTransactionId: existing.externalTransactionId || incoming.externalTransactionId || null,
+    occurredAt: preserveExistingSource ? existing.occurredAt : incoming.occurredAt,
+    sourceDeviceId: preserveExistingSource ? existing.sourceDeviceId : incoming.sourceDeviceId,
+    sourceJobId: preserveExistingSource ? existing.sourceJobId : incoming.sourceJobId,
+    collectedAt: preserveExistingSource ? existing.collectedAt : incoming.collectedAt,
+  };
+}
 function buildFactData({ fact, job, deviceId, fanIds, now }) {
   const identity = {
     id: crypto.randomUUID(),
@@ -634,7 +688,13 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanIds, now, 
     if (matches.size === 1) {
       const index = [...matches][0];
       if (collapsedFacts[index].fingerprint !== fact.fingerprint) { conflictingInputRows += 1; continue; }
-      collapsedFacts[index] = fact;
+      if (fact.kind === "subscription" && subscriptionIdentityConflict(collapsedFacts[index], fact)) {
+        conflictingInputRows += 1;
+        continue;
+      }
+      collapsedFacts[index] = fact.kind === "subscription"
+        ? mergeSubscriptionFacts(collapsedFacts[index], fact)
+        : fact;
       duplicateInputRows += 1;
       for (const token of tokens) tokenToIndex.set(token, index);
       continue;
@@ -676,8 +736,16 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanIds, now, 
       if (row) existingMatches.set(row.id, row);
     }
     if (existingMatches.size > 1) { rejected += 1; continue; }
-    const data = buildFactData({ fact, job, deviceId, fanIds, now });
     const row = existingMatches.size === 1 ? [...existingMatches.values()][0] : null;
+    if (model === "creatorSubscriptionEvent" && row && subscriptionIdentityConflict(row, fact)) {
+      rejected += 1;
+      continue;
+    }
+    const data = mergeFactDataWithExisting(
+      model,
+      row,
+      buildFactData({ fact, job, deviceId, fanIds, now }),
+    );
     if (!row) creates.push({ fact, data });
     else if (valuesEqual(row, data, compareKeys)) unchanged += 1;
     else updates.push({ id: row.id, data });
@@ -713,8 +781,13 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanIds, now, 
         }
         if (matches.size !== 1) { raceRejected += 1; continue; }
         const row = [...matches.values()][0];
-        if (!valuesEqual(row, item.data, compareKeys)) {
-          updates.push({ id: row.id, data: item.data });
+        if (model === "creatorSubscriptionEvent" && subscriptionIdentityConflict(row, item.fact)) {
+          raceRejected += 1;
+          continue;
+        }
+        const mergedData = mergeFactDataWithExisting(model, row, item.data);
+        if (!valuesEqual(row, mergedData, compareKeys)) {
+          updates.push({ id: row.id, data: mergedData });
           raceUpdated += 1;
         }
       }

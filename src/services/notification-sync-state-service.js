@@ -34,8 +34,8 @@ function runtimeRangeTo(now = new Date()) {
 }
 
 function buildNotificationScanParams({ state = null, now = new Date(), reason = "creator_analytics_refresh", analyticsRangeKey = "all" } = {}) {
-  const fullComplete = Boolean(state?.fullBackfillCompletedAt);
-  if (!fullComplete) {
+  const fullVerified = Boolean(state?.fullBackfillVerifiedAt);
+  if (!fullVerified) {
     return {
       from: FULL_HISTORY_FROM.toISOString(),
       to: runtimeRangeTo(now).toISOString(),
@@ -187,11 +187,10 @@ async function recordNotificationSocketEvent({ db, agencyId, creatorId, deviceId
   if (!db?.creatorNotificationSyncState?.upsert) return null;
   const at = strictDate(occurredAt) || new Date();
   const existing = await loadNotificationSyncState(db, creatorId);
-  const fullComplete = Boolean(existing?.fullBackfillCompletedAt);
   const fullVerified = Boolean(existing?.fullBackfillVerifiedAt);
   const data = {
     status: fullVerified ? "COMPLETE" : (existing?.status === "SCANNING" ? "SCANNING" : "PARTIAL"),
-    mode: fullComplete ? "live" : (existing?.mode || "full"),
+    mode: fullVerified ? "live" : (existing?.mode || "full"),
     lastSocketEventAt: at,
     newestOccurredAt: latestDate(existing?.newestOccurredAt, at),
     sourceDeviceId: clean(deviceId, 220),
