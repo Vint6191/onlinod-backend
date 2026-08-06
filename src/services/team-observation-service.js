@@ -126,7 +126,7 @@ async function scheduleCatchupJob({
   deviceId,
   from,
   to,
-  types = ["purchases", "tips", "subscriptions"],
+  types = ["purchases", "tips", "subscriptions", "likes", "comments"],
   reason = "offline_gap",
   now = new Date(),
 }) {
@@ -278,7 +278,7 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
     .catch(() => null);
 
   const window = computeCatchupWindow(prev, now);
-  const scanTypes = ["purchases", "tips", "subscriptions"];
+  const scanTypes = ["purchases", "tips", "subscriptions", "likes", "comments"];
 
   const updateData = {
     accountId,
@@ -816,7 +816,7 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, resul
   const scanTo = dateOrNull(params.to || result?.to) || now;
   const types = Array.isArray(params.types)
     ? [...new Set(params.types.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))]
-    : ["purchases", "tips", "subscriptions"];
+    : ["purchases", "tips", "subscriptions", "likes", "comments"];
   const coverageByType = ledger.coverageByType || {};
   const typeComplete = (type) => coverageByType[type] === "complete";
   const allRequestedComplete = types.length > 0 && types.every(typeComplete);

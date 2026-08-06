@@ -29,6 +29,8 @@ enum AnalyticsDataType {
   NOTIFICATION_PURCHASES
   NOTIFICATION_TIPS
   NOTIFICATION_SUBSCRIPTIONS
+  NOTIFICATION_LIKES
+  NOTIFICATION_COMMENTS
   CAMPAIGNS
   MESSAGES_DAILY
 }
@@ -302,6 +304,12 @@ model CreatorAccount {
   sales CreatorSale[]
   tips CreatorTip[]
   subscriptionEvents CreatorSubscriptionEvent[]
+  postLikes CreatorPostLike[]
+  postComments CreatorPostComment[]
+  earningsDaily CreatorEarningsDaily[]
+  campaigns CreatorCampaign[]
+  campaignMemberships CreatorCampaignFan[]
+  messagesDaily CreatorMessagesDaily[]
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
@@ -446,6 +454,12 @@ model WorkerDevice {
   creatorSalesCollected    CreatorSale[] @relation("CreatorSaleCollectedByDevice")
   creatorTipsCollected     CreatorTip[] @relation("CreatorTipCollectedByDevice")
   creatorSubscriptionEventsCollected CreatorSubscriptionEvent[] @relation("CreatorSubscriptionEventCollectedByDevice")
+  creatorPostLikesCollected CreatorPostLike[] @relation("CreatorPostLikeCollectedByDevice")
+  creatorPostCommentsCollected CreatorPostComment[] @relation("CreatorPostCommentCollectedByDevice")
+  creatorEarningsDailyCollected CreatorEarningsDaily[] @relation("CreatorEarningsDailyCollectedByDevice")
+  creatorCampaignsCollected CreatorCampaign[] @relation("CreatorCampaignCollectedByDevice")
+  creatorCampaignFansCollected CreatorCampaignFan[] @relation("CreatorCampaignFanCollectedByDevice")
+  creatorMessagesDailyCollected CreatorMessagesDaily[] @relation("CreatorMessagesDailyCollectedByDevice")
 
   @@index([agencyId])
   @@index([userId])
@@ -706,6 +720,9 @@ model CreatorFan {
   sales CreatorSale[]
   tips CreatorTip[]
   subscriptionEvents CreatorSubscriptionEvent[]
+  postLikes CreatorPostLike[]
+  postComments CreatorPostComment[]
+  campaignMemberships CreatorCampaignFan[]
 
   @@unique([creatorId, onlyFansUserId])
   @@unique([creatorId, id], map: "CreatorFan_creatorId_id_key")
@@ -878,6 +895,193 @@ model CreatorSubscriptionEvent {
   @@index([sourceJobId])
 }
 
+model CreatorPostLike {
+  id                     String   @id @default(cuid())
+  agencyId               String
+  creatorId              String
+  fanId                   String?
+  eventFingerprint       String
+  externalNotificationId String?
+  onlyFansLikeId         String?
+  onlyFansPostId         String
+  likedAt                DateTime
+  collectedAt            DateTime @default(now())
+  sourceDeviceId         String?
+  sourceJobId            String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  sourceDevice WorkerDevice?   @relation("CreatorPostLikeCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, eventFingerprint])
+  @@unique([creatorId, externalNotificationId])
+  @@unique([creatorId, onlyFansLikeId])
+  @@index([agencyId, creatorId, likedAt])
+  @@index([creatorId, fanId, likedAt])
+  @@index([creatorId, onlyFansPostId, likedAt])
+  @@index([sourceJobId])
+}
+
+model CreatorPostComment {
+  id                     String   @id @default(cuid())
+  agencyId               String
+  creatorId              String
+  fanId                   String?
+  eventFingerprint       String
+  externalNotificationId String?
+  onlyFansCommentId      String?
+  onlyFansPostId         String
+  commentedAt            DateTime
+  collectedAt            DateTime @default(now())
+  sourceDeviceId         String?
+  sourceJobId            String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  sourceDevice WorkerDevice?   @relation("CreatorPostCommentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, eventFingerprint])
+  @@unique([creatorId, externalNotificationId])
+  @@unique([creatorId, onlyFansCommentId])
+  @@index([agencyId, creatorId, commentedAt])
+  @@index([creatorId, fanId, commentedAt])
+  @@index([creatorId, onlyFansPostId, commentedAt])
+  @@index([sourceJobId])
+}
+
+model CreatorEarningsDaily {
+  id                 String   @id @default(cuid())
+  agencyId           String
+  creatorId          String
+  date               DateTime @db.Date
+  sourceTimezone     String   @default("UTC")
+  subscriptionsCents Int?
+  messagesCents      Int?
+  tipsCents          Int?
+  postsCents         Int?
+  streamsCents       Int?
+  referralsCents     Int?
+  totalCents         Int
+  currency           String   @default("USD")
+  sourceUpdatedAt    DateTime?
+  sourceScanRunId    String?
+  collectedAt        DateTime @default(now())
+  sourceDeviceId     String?
+  sourceJobId        String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  sourceDevice WorkerDevice?  @relation("CreatorEarningsDailyCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, date, sourceTimezone])
+  @@index([agencyId, creatorId, date])
+  @@index([creatorId, date])
+  @@index([creatorId, sourceScanRunId])
+  @@index([sourceJobId])
+}
+
+model CreatorCampaign {
+  id                 String   @id @default(cuid())
+  agencyId           String
+  creatorId          String
+  externalCampaignId String
+  name               String
+  campaignType       String?
+  trackingCode       String?
+  trackingUrl        String?
+  isActive           Boolean  @default(true)
+  startedAt          DateTime?
+  endedAt            DateTime?
+  claimersCount      Int?
+  clicksCount        Int?
+  sourceScanRunId    String?
+  sourceScanStartedAt DateTime?
+  collectedAt        DateTime @default(now())
+  sourceDeviceId     String?
+  sourceJobId        String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  sourceDevice WorkerDevice?  @relation("CreatorCampaignCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  fans         CreatorCampaignFan[]
+
+  @@unique([creatorId, externalCampaignId])
+  @@unique([creatorId, id], map: "CreatorCampaign_creatorId_id_key")
+  @@index([agencyId, creatorId, isActive])
+  @@index([creatorId, collectedAt])
+  @@index([creatorId, sourceScanStartedAt])
+  @@index([creatorId, sourceScanRunId])
+  @@index([sourceJobId])
+}
+
+model CreatorCampaignFan {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  campaignId      String
+  fanId           String
+  externalClaimerId String?
+  attributedAt    DateTime?
+  sourceScanRunId String?
+  sourceScanStartedAt DateTime?
+  collectedAt     DateTime @default(now())
+  sourceDeviceId  String?
+  sourceJobId     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  campaign     CreatorCampaign @relation(fields: [creatorId, campaignId], references: [creatorId, id], onDelete: Cascade)
+  fan          CreatorFan      @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  sourceDevice WorkerDevice?   @relation("CreatorCampaignFanCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([campaignId, fanId])
+  @@index([agencyId, creatorId, campaignId])
+  @@index([creatorId, fanId])
+  @@index([creatorId, campaignId, sourceScanStartedAt])
+  @@index([creatorId, campaignId, sourceScanRunId])
+  @@index([sourceJobId])
+}
+
+model CreatorMessagesDaily {
+  id                  String   @id @default(cuid())
+  agencyId            String
+  creatorId           String
+  date                DateTime @db.Date
+  sourceTimezone      String   @default("UTC")
+  incomingMessages    Int      @default(0)
+  outgoingMessages    Int      @default(0)
+  totalMessages       Int      @default(0)
+  uniqueDialogs       Int      @default(0)
+  uniqueIncomingFans  Int      @default(0)
+  uniqueOutgoingFans  Int      @default(0)
+  collectedAt         DateTime @default(now())
+  sourceDeviceId      String?
+  sourceJobId         String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  sourceDevice WorkerDevice?  @relation("CreatorMessagesDailyCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, date, sourceTimezone])
+  @@index([agencyId, creatorId, date])
+  @@index([creatorId, date])
+  @@index([sourceJobId])
+}
+
 model CreatorEarningsSnapshot {
   id                 String    @id @default(cuid())
   creatorId          String
@@ -965,6 +1169,12 @@ model JobInstance {
   creatorSales CreatorSale[]
   creatorTips CreatorTip[]
   creatorSubscriptionEvents CreatorSubscriptionEvent[]
+  creatorPostLikes CreatorPostLike[]
+  creatorPostComments CreatorPostComment[]
+  creatorEarningsDaily CreatorEarningsDaily[]
+  creatorCampaigns CreatorCampaign[]
+  creatorCampaignFans CreatorCampaignFan[]
+  creatorMessagesDaily CreatorMessagesDaily[]
 
   @@index([status, nextRunAt])
   @@index([creatorId])

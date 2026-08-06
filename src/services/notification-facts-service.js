@@ -8,11 +8,13 @@ const SERVICE_VERSION = "notification-facts-v1-audited-v3";
 const SCHEMA_VERSION = 3;
 const COLLECTOR_VERSION = "notifications-catchup-v4";
 const MAX_EVENTS_PER_BATCH = 2_000;
-const NOTIFICATION_TYPES = Object.freeze(["purchases", "tips", "subscriptions"]);
+const NOTIFICATION_TYPES = Object.freeze(["purchases", "tips", "subscriptions", "likes", "comments"]);
 const COVERAGE_DATA_TYPES = Object.freeze({
   purchases: "NOTIFICATION_PURCHASES",
   tips: "NOTIFICATION_TIPS",
   subscriptions: "NOTIFICATION_SUBSCRIPTIONS",
+  likes: "NOTIFICATION_LIKES",
+  comments: "NOTIFICATION_COMMENTS",
 });
 
 function clean(value, max = 220) {
@@ -63,7 +65,17 @@ function stableJson(value) {
 function identityFingerprint(kind, creatorId, event, occurredAt, amountCents, canonicalEventType = null) {
   const notificationId = clean(event.notificationId, 220);
   const transactionId = clean(event.transactionId, 220);
-  const kindId = clean(kind === "sale" ? event.purchaseId : kind === "tip" ? event.tipId : event.externalEventId, 220);
+  const kindId = clean(
+    kind === "sale" ? event.purchaseId
+      : kind === "tip" ? event.tipId
+        : kind === "like" ? event.likeId
+          : kind === "comment" ? event.commentId
+            : event.externalEventId,
+    220,
+  );
+  if ((kind === "like" || kind === "comment") && kindId) {
+    return sha256(`${kind}|${creatorId}|external|${kindId}`);
+  }
   if (notificationId) return sha256(`${kind}|${creatorId}|notification|${notificationId}`);
   if (kind === "subscription" && transactionId) {
     return sha256(`${kind}|${creatorId}|transaction|${transactionId}|${canonicalEventType || "unknown"}`);
@@ -71,7 +83,7 @@ function identityFingerprint(kind, creatorId, event, occurredAt, amountCents, ca
   if (transactionId) return sha256(`${kind}|${creatorId}|transaction|${transactionId}`);
   if (kindId) return sha256(`${kind}|${creatorId}|external|${kindId}|${canonicalEventType || ""}`);
   const fan = clean(event.fanId || event.dialogId, 180) || "";
-  const target = clean(event.messageId || event.postId, 220) || "";
+  const target = clean(event.messageId || event.postId || event.commentId, 220) || "";
   const eventType = canonicalEventType || clean(event.eventType || event.type, 80) || "";
   const second = Math.floor(occurredAt.getTime() / 1_000);
   return sha256(`${kind}|${creatorId}|fallback|${fan}|${target}|${eventType}|${amountCents ?? ""}|${second}`);
@@ -95,6 +107,8 @@ function subscriptionType(rawType, amountCents) {
 function sourceTypeForRawType(rawType) {
   if (rawType.includes("purchase") || rawType.includes("ppv")) return "purchases";
   if (rawType.includes("tip")) return "tips";
+  if (/comment/.test(rawType)) return "comments";
+  if (/(^|[^a-z])like(d|s|ing)?([^a-z]|$)|favorite/.test(rawType)) return "likes";
   if (/subscription|subscrib|renew|expire|auto.?renew|refund|chargeback|resub/.test(rawType)) return "subscriptions";
   return null;
 }
@@ -113,12 +127,12 @@ function normalizeEvent(raw, creatorId) {
     [event.notificationId, 220], [event.transactionId, 220],
     [event.purchaseId, 220], [event.tipId, 220], [event.externalEventId, 220],
     [event.fanId, 180], [event.dialogId, 180],
-    [event.messageId, 220], [event.postId, 220],
+    [event.messageId, 220], [event.postId, 220], [event.commentId, 220], [event.likeId, 220],
     [event.fanUsername || event.username, 200],
     [event.fanName || event.name, 500],
   ];
   if (boundedFields.some(([value, max]) => exceedsTextLimit(value, max))) return reject("FIELD_TOO_LONG");
-  const occurredAt = strictDate(event.purchasedAt || event.subscribedAt || event.receivedAt || event.occurredAt || event.ts);
+  const occurredAt = strictDate(event.purchasedAt || event.subscribedAt || event.likedAt || event.commentedAt || event.receivedAt || event.occurredAt || event.ts);
   if (!occurredAt) return reject("INVALID_OCCURRED_AT");
   const amountCents = centsOrNull(event.amountCents);
   const currencyCode = currency(event.currency);
@@ -162,6 +176,30 @@ function normalizeEvent(raw, creatorId) {
     return { kind: "tip", fingerprint, ...common, messageId: clean(event.messageId, 220) };
   }
 
+
+  if (sourceType === "likes") {
+    const likeId = clean(event.likeId, 220);
+    if (!common.externalNotificationId && !likeId) return reject("LIKE_SOURCE_IDENTITY_MISSING");
+    const onlyFansPostId = clean(event.postId, 220);
+    if (!onlyFansPostId) return reject("LIKE_POST_ID_MISSING");
+    const fingerprint = identityFingerprint("like", creatorId, event, occurredAt, null);
+    return {
+      kind: "like", fingerprint, ...common, amountCents: null, currency: null,
+      onlyFansPostId, likeId,
+    };
+  }
+
+  if (sourceType === "comments") {
+    const onlyFansCommentId = clean(event.commentId, 220);
+    if (!common.externalNotificationId && !onlyFansCommentId) return reject("COMMENT_SOURCE_IDENTITY_MISSING");
+    const onlyFansPostId = clean(event.postId, 220);
+    if (!onlyFansPostId) return reject("COMMENT_POST_ID_MISSING");
+    const fingerprint = identityFingerprint("comment", creatorId, event, occurredAt, null);
+    return {
+      kind: "comment", fingerprint, ...common, amountCents: null, currency: null,
+      onlyFansPostId, onlyFansCommentId, commentId: onlyFansCommentId,
+    };
+  }
   if (sourceType === "subscriptions") {
     if (!externalFanId && !common.externalNotificationId && !common.externalTransactionId) return reject("SUBSCRIPTION_IDENTITY_MISSING");
     const eventType = subscriptionType(rawType, amountCents);
@@ -425,29 +463,37 @@ function factIdentityTokens(fact) {
   return [
     `f:${fact.fingerprint}`,
     ...(fact.externalNotificationId ? [`n:${fact.externalNotificationId}`] : []),
+    ...(fact.kind === "like" && fact.likeId ? [`l:${fact.likeId}`] : []),
+    ...(fact.kind === "comment" && fact.onlyFansCommentId ? [`c:${fact.onlyFansCommentId}`] : []),
     ...(fact.kind !== "subscription" && fact.externalTransactionId ? [`t:${fact.externalTransactionId}`] : []),
   ];
 }
 function buildFactData({ fact, job, deviceId, fanIds, now }) {
-  const common = {
+  const identity = {
     id: crypto.randomUUID(),
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     fanId: fact.externalFanId ? fanIds.get(fact.externalFanId) || null : null,
     eventFingerprint: fact.fingerprint,
     externalNotificationId: fact.externalNotificationId,
-    externalTransactionId: fact.externalTransactionId,
-    currency: fact.currency,
     collectedAt: now,
     sourceDeviceId: deviceId || null,
     sourceJobId: job.id,
     createdAt: now,
     updatedAt: now,
   };
-  if (fact.kind === "sale") return { ...common, saleType: fact.saleType, messageId: fact.messageId, postId: fact.postId, amountCents: fact.amountCents, purchasedAt: fact.occurredAt };
-  if (fact.kind === "tip") return { ...common, messageId: fact.messageId, amountCents: fact.amountCents, tippedAt: fact.occurredAt };
-  return { ...common, eventType: fact.eventType, observedPriceCents: fact.observedPriceCents, currency: fact.currency, occurredAt: fact.occurredAt };
+  if (fact.kind === "like") return { ...identity, onlyFansLikeId: fact.likeId, onlyFansPostId: fact.onlyFansPostId, likedAt: fact.occurredAt };
+  if (fact.kind === "comment") return { ...identity, onlyFansCommentId: fact.onlyFansCommentId, onlyFansPostId: fact.onlyFansPostId, commentedAt: fact.occurredAt };
+  const financial = {
+    ...identity,
+    externalTransactionId: fact.externalTransactionId,
+    currency: fact.currency,
+  };
+  if (fact.kind === "sale") return { ...financial, saleType: fact.saleType, messageId: fact.messageId, postId: fact.postId, amountCents: fact.amountCents, purchasedAt: fact.occurredAt };
+  if (fact.kind === "tip") return { ...financial, messageId: fact.messageId, amountCents: fact.amountCents, tippedAt: fact.occurredAt };
+  return { ...financial, eventType: fact.eventType, observedPriceCents: fact.observedPriceCents, occurredAt: fact.occurredAt };
 }
+
 async function resolveFans(tx, { agencyId, creatorId, facts, now }) {
   const aggregate = new Map();
   for (const fact of facts) {
@@ -550,9 +596,20 @@ async function resolveFans(tx, { agencyId, creatorId, facts, now }) {
 async function existingFacts(tx, model, creatorId, facts) {
   const fingerprints = [...new Set(facts.map((fact) => fact.fingerprint))];
   const notifications = [...new Set(facts.map((fact) => fact.externalNotificationId).filter(Boolean))];
-  const transactions = [...new Set(facts.filter((fact) => fact.kind !== "subscription").map((fact) => fact.externalTransactionId).filter(Boolean))];
+  const likeIds = model === "creatorPostLike"
+    ? [...new Set(facts.map((fact) => fact.likeId).filter(Boolean))]
+    : [];
+  const commentIds = model === "creatorPostComment"
+    ? [...new Set(facts.map((fact) => fact.onlyFansCommentId).filter(Boolean))]
+    : [];
+  const modelHasTransaction = !["creatorSubscriptionEvent", "creatorPostLike", "creatorPostComment"].includes(model);
+  const transactions = modelHasTransaction
+    ? [...new Set(facts.map((fact) => fact.externalTransactionId).filter(Boolean))]
+    : [];
   const OR = [{ eventFingerprint: { in: fingerprints } }];
   if (notifications.length) OR.push({ externalNotificationId: { in: notifications } });
+  if (likeIds.length) OR.push({ onlyFansLikeId: { in: likeIds } });
+  if (commentIds.length) OR.push({ onlyFansCommentId: { in: commentIds } });
   if (transactions.length) OR.push({ externalTransactionId: { in: transactions } });
   return tx[model].findMany({ where: { creatorId, OR } });
 }
@@ -590,7 +647,9 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanIds, now, 
   for (const row of existing) {
     const tokens = [`f:${row.eventFingerprint}`];
     if (row.externalNotificationId) tokens.push(`n:${row.externalNotificationId}`);
-    if (model !== "creatorSubscriptionEvent" && row.externalTransactionId) tokens.push(`t:${row.externalTransactionId}`);
+    if (model === "creatorPostLike" && row.onlyFansLikeId) tokens.push(`l:${row.onlyFansLikeId}`);
+    if (model === "creatorPostComment" && row.onlyFansCommentId) tokens.push(`c:${row.onlyFansCommentId}`);
+    if (!["creatorSubscriptionEvent", "creatorPostLike", "creatorPostComment"].includes(model) && row.externalTransactionId) tokens.push(`t:${row.externalTransactionId}`);
     for (const token of tokens) byToken.set(token, row);
   }
   const seenInput = new Map();
@@ -636,7 +695,9 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanIds, now, 
       for (const row of reloaded) {
         const tokens = [`f:${row.eventFingerprint}`];
         if (row.externalNotificationId) tokens.push(`n:${row.externalNotificationId}`);
-        if (model !== "creatorSubscriptionEvent" && row.externalTransactionId) tokens.push(`t:${row.externalTransactionId}`);
+    if (model === "creatorPostLike" && row.onlyFansLikeId) tokens.push(`l:${row.onlyFansLikeId}`);
+    if (model === "creatorPostComment" && row.onlyFansCommentId) tokens.push(`c:${row.onlyFansCommentId}`);
+        if (!["creatorSubscriptionEvent", "creatorPostLike", "creatorPostComment"].includes(model) && row.externalTransactionId) tokens.push(`t:${row.externalTransactionId}`);
         for (const token of tokens) reloadedByToken.set(token, row);
       }
       let raceUpdated = 0;
@@ -896,6 +957,8 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
         sale: facts.filter((fact) => fact.kind === "sale"),
         tip: facts.filter((fact) => fact.kind === "tip"),
         subscription: facts.filter((fact) => fact.kind === "subscription"),
+        like: facts.filter((fact) => fact.kind === "like"),
+        comment: facts.filter((fact) => fact.kind === "comment"),
       };
       const sale = await persistFactGroup(tx, {
         model: "creatorSale", facts: groups.sale, job, deviceId, fanIds, now,
@@ -909,10 +972,20 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
         model: "creatorSubscriptionEvent", facts: groups.subscription, job, deviceId, fanIds, now,
         compareKeys: ["fanId", "externalNotificationId", "externalTransactionId", "eventType", "observedPriceCents", "currency", "occurredAt"],
       });
+      const like = await persistFactGroup(tx, {
+        model: "creatorPostLike", facts: groups.like, job, deviceId, fanIds, now,
+        compareKeys: ["fanId", "externalNotificationId", "onlyFansLikeId", "onlyFansPostId", "likedAt"],
+      });
+      const comment = await persistFactGroup(tx, {
+        model: "creatorPostComment", facts: groups.comment, job, deviceId, fanIds, now,
+        compareKeys: ["fanId", "externalNotificationId", "onlyFansCommentId", "onlyFansPostId", "commentedAt"],
+      });
       const perTypePersistenceRejected = {
         purchases: sale.rejected,
         tips: tip.rejected,
         subscriptions: subscription.rejected,
+        likes: like.rejected,
+        comments: comment.rejected,
       };
       const perTypeInitialRejected = Object.fromEntries(requested.map((type) => [type, scannerRejectedByType[type] || 0]));
       for (const row of initiallyRejected) {
@@ -920,10 +993,10 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
         else for (const type of requested) perTypeInitialRejected[type] += 1;
       }
       const counts = {
-        inserted: sale.inserted + tip.inserted + subscription.inserted,
-        updated: sale.updated + tip.updated + subscription.updated,
-        unchanged: sale.unchanged + tip.unchanged + subscription.unchanged,
-        rejected: scannerRejectedTotal + initiallyRejected.length + sale.rejected + tip.rejected + subscription.rejected,
+        inserted: sale.inserted + tip.inserted + subscription.inserted + like.inserted + comment.inserted,
+        updated: sale.updated + tip.updated + subscription.updated + like.updated + comment.updated,
+        unchanged: sale.unchanged + tip.unchanged + subscription.unchanged + like.unchanged + comment.unchanged,
+        rejected: scannerRejectedTotal + initiallyRejected.length + sale.rejected + tip.rejected + subscription.rejected + like.rejected + comment.rejected,
       };
       const scannerCoverage = resultCoverage(result, job);
       const coverageByType = Object.fromEntries(requested.map((type) => [type, scannerCoverage[type] || "partial"]));

@@ -33,6 +33,8 @@ test("notification facts are typed relational tables without JSON business stora
     assert.match(body, /CreatorFan\?\s+@relation\(fields: \[creatorId, fanId\], references: \[creatorId, id\], onDelete: NoAction\)/);
   }
   assert.match(modelBody("CreatorFan"), /@@unique\(\[creatorId, id\], map: "CreatorFan_creatorId_id_key"\)/);
+  assert.match(modelBody("CreatorPostLike"), /onlyFansLikeId\s+String\?/);
+  assert.match(modelBody("CreatorPostLike"), /@@unique\(\[creatorId, onlyFansLikeId\]\)/);
 });
 
 test("external identities remain traceable without collapsing subscription lifecycle events", () => {
@@ -84,6 +86,8 @@ test("ingest is version-fenced, transactional, page-oriented and interval-aware"
   assert.match(service, /NOTIFICATION_PURCHASES/);
   assert.match(service, /NOTIFICATION_TIPS/);
   assert.match(service, /NOTIFICATION_SUBSCRIPTIONS/);
+  assert.match(service, /onlyFansLikeId/);
+  assert.match(service, /`l:\$\{fact\.likeId\}`/);
   assert.match(service, /NOTIFICATION_TIMEZONE_UNSUPPORTED/);
   assert.match(service, /persistCoverageRows/);
   assert.match(service, /dayBounds/);

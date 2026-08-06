@@ -59,7 +59,8 @@ test("creator and agency refresh routes are guarded and agency scheduling is bou
   assert.match(routeBody(stats, "post", "/creators/:creatorId/refresh"), /requireRefreshPermission\(res, ctx\.member\)/);
   const agency = routeBody(stats, "post", "/agencies/:agencyId/refresh");
   assert.match(agency, /requireRefreshPermission\(res, ctx\.member\)/);
-  assert.match(agency, /const batchSize = 20/);
+  assert.match(agency, /const batchSize = range === "all" \? 5 : 20/);
+  assert.match(agency, /notificationWindows\(range, now\)/);
   assert.match(agency, /Promise\.allSettled/);
   assert.doesNotMatch(agency, /for \(const creator of creators\)[\s\S]*await scheduleJobNow/);
 });

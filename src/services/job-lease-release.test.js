@@ -575,17 +575,18 @@ test("partial notification completion is rescheduled instead of being marked DON
   assert.equal(updates.length, 2);
   assert.equal(updates[1].where.leaseRevision, 4);
   assert.equal(updates[1].data.status, "SCHEDULED");
-  assert.equal(updates[1].data.attempts, 1);
+  assert.equal(updates[1].data.attempts, 0);
   assert.equal(updates[1].data.continuation, null);
   assert.equal(updates[1].data.claimedByDeviceId, null);
   assert.equal(updates[1].data.lastError, "notification_scan_partial");
   assert.deepEqual(updates[1].data.params.types, ["tips"]);
   assert.deepEqual(updates[1].data.params.resumeCursors, { tips: "tip-cursor-200" });
+  assert.equal(updates[1].data.params.notificationRepairPass, 1);
   assert.ok(updates[1].data.nextRunAt instanceof Date);
   assert.equal(result.job.status, "SCHEDULED");
 });
 
-test("fifth partial notification attempt becomes FAILED instead of looping forever", async () => {
+test("fifth non-resumable partial notification attempt becomes FAILED instead of looping forever", async () => {
   const token = "notification-terminal-token";
   const now = new Date();
   const job = {
@@ -637,4 +638,70 @@ test("fifth partial notification attempt becomes FAILED instead of looping forev
   assert.equal(updates[1].data.nextRunAt, undefined);
   assert.equal(result.job.status, "FAILED");
   assert.equal(result.job.retryAt, null);
+});
+
+test("earnings completion reserves lease ownership before relational projection", async () => {
+  const token = "earnings-fence-token";
+  const now = new Date();
+  const job = {
+    id: "earnings-fence-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_earnings",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 9,
+    leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, params: { rangeKey: "7d" },
+    continuation: { driverPhase: "complete" }, workId: "earnings-work",
+  };
+  const order = [];
+  const updates = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); order.push(updates.length === 1 ? "reserved" : "completed"); return { count: 1 }; },
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => { order.push("projection"); return { ok: true, type: "earnings" }; },
+  });
+  const result = await completeJob({
+    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 9,
+    workId: job.workId, result: { schemaVersion: 3 }, progress: { percent: 100 },
+  });
+  assert.deepEqual(order, ["reserved", "projection", "completed"]);
+  assert.deepEqual(updates[0].data.leaseRevision, { increment: 1 });
+  assert.equal(updates[1].where.leaseRevision, 10);
+  assert.equal(updates[1].data.status, "DONE");
+  assert.equal(result.job.status, "DONE");
+});
+
+test("partial campaign proof is rescheduled instead of publishing DONE", async () => {
+  const token = "campaign-partial-token";
+  const now = new Date();
+  const job = {
+    id: "campaign-partial-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_campaigns",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 4,
+    leaseUntil: new Date(now.getTime() + 60_000), attempts: 1, params: { rangeKey: "30d" },
+    continuation: { driverPhase: "complete" }, workId: "campaign-work",
+  };
+  const updates = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
+    },
+  };
+  const { completeJob } = loadService({ db, applyJobResult: async () => ({ ok: false, type: "campaigns", completion: { complete: false } }) });
+  const result = await completeJob({
+    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 4,
+    workId: job.workId, result: { scanRunId: "scan-partial" }, progress: { percent: 100 },
+  });
+  assert.equal(updates.length, 2);
+  assert.equal(updates[1].where.leaseRevision, 5);
+  assert.equal(updates[1].data.status, "SCHEDULED");
+  assert.equal(updates[1].data.attempts, 2);
+  assert.equal(updates[1].data.continuation, null);
+  assert.equal(updates[1].data.lastError, "fetch_campaigns_partial");
+  assert.equal(result.job.status, "SCHEDULED");
 });

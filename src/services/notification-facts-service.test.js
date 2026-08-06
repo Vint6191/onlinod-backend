@@ -42,17 +42,19 @@ function matchWhere(row, where = {}) {
   return true;
 }
 function memoryDb() {
-  const store = { batches: [], fans: [], sales: [], tips: [], subscriptions: [], coverage: [] };
+  const store = { batches: [], fans: [], sales: [], tips: [], subscriptions: [], likes: [], comments: [], coverage: [] };
   let sequence = 0;
   const nextId = (prefix) => `${prefix}-${++sequence}`;
   const clone = (value) => structuredClone(value);
   const uniqueConflict = (name, rows, data) => {
     if (name === "fan") return rows.some((row) => row.creatorId === data.creatorId && row.onlyFansUserId === data.onlyFansUserId);
-    if (["sale", "tip", "subscription"].includes(name)) {
+    if (["sale", "tip", "subscription", "like", "comment"].includes(name)) {
       return rows.some((row) => row.creatorId === data.creatorId && (
         row.eventFingerprint === data.eventFingerprint
         || (data.externalNotificationId && row.externalNotificationId === data.externalNotificationId)
-        || (name !== "subscription" && data.externalTransactionId && row.externalTransactionId === data.externalTransactionId)
+        || (name === "like" && data.onlyFansLikeId && row.onlyFansLikeId === data.onlyFansLikeId)
+        || (name === "comment" && data.onlyFansCommentId && row.onlyFansCommentId === data.onlyFansCommentId)
+        || (!["subscription", "like", "comment"].includes(name) && data.externalTransactionId && row.externalTransactionId === data.externalTransactionId)
       ));
     }
     if (name === "coverage") {
@@ -109,6 +111,8 @@ function memoryDb() {
     creatorSale: model("sale", store.sales),
     creatorTip: model("tip", store.tips),
     creatorSubscriptionEvent: model("subscription", store.subscriptions),
+    creatorPostLike: model("like", store.likes),
+    creatorPostComment: model("comment", store.comments),
     analyticsCoverage: model("coverage", store.coverage),
     async $transaction(callback) { return callback(db); },
   };
@@ -170,7 +174,52 @@ test("strict normalization rejects coercion, missing timestamps and unknown mone
   assert.equal(normalizeEvent({ eventType: "tip_received", fanId: "fan", amountCents: "500", occurredAt }, creatorId).rejected, "INVALID_TIP_AMOUNT_CENTS");
   assert.equal(normalizeEvent({ eventType: "tip_received", fanId: "fan", amountCents: 500, occurredAt: false }, creatorId).rejected, "INVALID_OCCURRED_AT");
   assert.equal(normalizeEvent({ eventType: "ppv_purchase_unresolved", fanId: "fan", occurredAt }, creatorId).rejected, "INVALID_SALE_AMOUNT_CENTS");
-  assert.equal(normalizeEvent({ eventType: "like", fanId: "fan", amountCents: 0, occurredAt }, creatorId).rejected, "UNSUPPORTED_EVENT_TYPE");
+  assert.equal(normalizeEvent({ eventType: "like", fanId: "fan", amountCents: 0, occurredAt }, creatorId).rejected, "LIKE_SOURCE_IDENTITY_MISSING");
+  assert.equal(normalizeEvent({ eventType: "like", notificationId: "like-n", fanId: "fan", amountCents: 0, occurredAt }, creatorId).rejected, "LIKE_POST_ID_MISSING");
+  assert.equal(normalizeEvent({ eventType: "comment", fanId: "fan", occurredAt }, creatorId).rejected, "COMMENT_SOURCE_IDENTITY_MISSING");
+  assert.equal(normalizeEvent({ eventType: "comment", notificationId: "comment-n", fanId: "fan", occurredAt }, creatorId).rejected, "COMMENT_POST_ID_MISSING");
+});
+
+
+
+test("likes and comments normalize and ingest as relational post facts without comment text", async () => {
+  const like = normalizeEvent({ eventType: "post_liked", notificationId: "like-n", fanId: "fan-1", postId: "post-1", likeId: "like-1", occurredAt, text: "must-not-persist" }, creatorId);
+  const comment = normalizeEvent({ eventType: "post_commented", notificationId: "comment-n", fanId: "fan-2", postId: "post-1", commentId: "comment-1", occurredAt, text: "private comment body" }, creatorId);
+  assert.equal(like.kind, "like");
+  assert.equal(comment.kind, "comment");
+  assert.equal(Object.hasOwn(like, "text"), false);
+  assert.equal(Object.hasOwn(comment, "text"), false);
+
+  const db = memoryDb();
+  const scopedJob = job({ params: { from: "2026-08-05T00:00:00.000Z", to: "2026-08-05T23:59:59.999Z", types: ["likes", "comments"] } });
+  const result = completeResult([
+    { eventType: "post_liked", notificationId: "like-n", fanId: "fan-1", postId: "post-1", likeId: "like-1", occurredAt },
+    { eventType: "post_commented", notificationId: "comment-n", fanId: "fan-2", postId: "post-1", commentId: "comment-1", occurredAt },
+  ], {
+    likes: { status: "complete", reason: "source_exhausted", pages: 1, events: 1, rejected: 0 },
+    comments: { status: "complete", reason: "source_exhausted", pages: 1, events: 1, rejected: 0 },
+  });
+  result.coverage = { likes: result.coverage.likes, comments: result.coverage.comments };
+  const ingested = await ingestNotificationFacts({ job: scopedJob, deviceId: "device-1", result, db });
+  assert.equal(ingested.status, "COMMITTED");
+  assert.equal(db.store.likes.length, 1);
+  assert.equal(db.store.comments.length, 1);
+  assert.equal(db.store.likes[0].onlyFansPostId, "post-1");
+  assert.equal(db.store.likes[0].onlyFansLikeId, "like-1");
+  assert.equal(db.store.comments[0].onlyFansCommentId, "comment-1");
+  assert.equal(Object.hasOwn(db.store.comments[0], "text"), false);
+});
+
+test("likes and comments prefer concrete source IDs over notification envelope IDs", () => {
+  const date = new Date(occurredAt);
+  assert.equal(
+    identityFingerprint("like", creatorId, { notificationId: "envelope-a", likeId: "like-1" }, date, null),
+    identityFingerprint("like", creatorId, { notificationId: "envelope-b", likeId: "like-1" }, date, null),
+  );
+  assert.equal(
+    identityFingerprint("comment", creatorId, { notificationId: "envelope-a", commentId: "comment-1" }, date, null),
+    identityFingerprint("comment", creatorId, { notificationId: "envelope-b", commentId: "comment-1" }, date, null),
+  );
 });
 
 test("stable external notification identity ignores mutable amount corrections", () => {
@@ -384,7 +433,7 @@ test("idempotent completion replay reads persisted partial coverage instead of t
 test("unsupported job types and future schema versions fail closed", async () => {
   await assert.rejects(
     ingestNotificationFacts({
-      job: job({ id: "job-invalid-type", params: { from: "2026-08-05T00:00:00.000Z", to: "2026-08-05T23:59:59.999Z", types: ["likes"] } }),
+      job: job({ id: "job-invalid-type", params: { from: "2026-08-05T00:00:00.000Z", to: "2026-08-05T23:59:59.999Z", types: ["shares"] } }),
       result: completeResult([]),
       db: memoryDb(),
     }),

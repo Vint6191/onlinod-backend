@@ -28,6 +28,7 @@ const prisma = require("../prisma");
 const { scheduleJobNow } = require("../services/job-scheduler");
 const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-analytics-permissions");
 const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
+const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily, notificationWindows } = require("../services/creator-analytics-ledger-service");
 
 const router = express.Router();
 
@@ -531,7 +532,8 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
     }
 
     const now = new Date();
-    const [earnings, campaigns] = await Promise.all([
+    const windows = notificationWindows(range, now);
+    const [earnings, campaigns, notifications] = await Promise.all([
       scheduleJobNow({
         jobKey: "fetch_earnings",
         creatorId: creator.id,
@@ -550,6 +552,22 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         now,
         bucketMs: 60_000,
       }),
+      Promise.all(windows.map((window, index) => scheduleJobNow({
+        jobKey: "catchup_notifications_scan",
+        creatorId: creator.id,
+        agencyId: creator.agencyId,
+        params: {
+          from: window.start.toISOString(),
+          to: window.end.toISOString(),
+          types: ["purchases", "tips", "subscriptions", "likes", "comments"],
+          reason: "creator_analytics_refresh",
+          analyticsRangeKey: range,
+          backfillWindow: { index, total: windows.length },
+        },
+        priority: 95,
+        now,
+        bucketMs: 60_000,
+      }))),
     ]);
 
     const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
@@ -569,6 +587,7 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
       jobs: [
         { id: earnings.job.id, jobKey: "fetch_earnings", rangeKey: range, reason: earnings.reason },
         { id: campaigns.job.id, jobKey: "fetch_campaigns", rangeKey: range, reason: campaigns.reason },
+        ...notifications.map((scheduled) => ({ id: scheduled.job.id, jobKey: "catchup_notifications_scan", rangeKey: range, reason: scheduled.reason })),
       ],
       message:
         onlineBindings === 0
@@ -603,10 +622,11 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
     });
 
     const now = new Date();
+    const windows = notificationWindows(range, now);
     let jobsScheduled = 0;
     let alreadyClaimed = 0;
     const failedCreators = [];
-    const batchSize = 20;
+    const batchSize = range === "all" ? 5 : 20;
 
     // Do not schedule 4,000 jobs sequentially for a 2,000-creator agency, but
     // also avoid one unbounded Promise.all that can stampede the database.
@@ -633,6 +653,22 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
               now,
               bucketMs: 60_000,
             }),
+            ...windows.map((window, index) => scheduleJobNow({
+              jobKey: "catchup_notifications_scan",
+              creatorId: creator.id,
+              agencyId: creator.agencyId,
+              params: {
+                from: window.start.toISOString(),
+                to: window.end.toISOString(),
+                types: ["purchases", "tips", "subscriptions", "likes", "comments"],
+                reason: "agency_analytics_refresh",
+                analyticsRangeKey: range,
+                backfillWindow: { index, total: windows.length },
+              },
+              priority: 45,
+              now,
+              bucketMs: 60_000,
+            })),
           ]);
           return { creatorId: creator.id, scheduled };
         })
@@ -667,6 +703,138 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
   } catch (err) {
     console.error("[stats/refresh-agency] failed:", err);
     return res.status(500).json({ ok: false, code: "AGENCY_REFRESH_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+
+// Relational Creator Analytics V1 read model and local-only message day aggregates.
+const messagesDailySchema = z.object({
+  deviceId: z.string().min(3).max(160),
+  syncId: z.string().uuid(),
+  observedAt: z.string().datetime({ offset: true }),
+  sourceTimezone: z.literal("UTC").default("UTC"),
+  localCoverage: z.object({
+    complete: z.boolean(),
+    knownDialogs: z.number().int().nonnegative(),
+    incompleteDialogs: z.number().int().nonnegative(),
+  }).superRefine((value, ctx) => {
+    if (value.incompleteDialogs > value.knownDialogs) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "incompleteDialogs cannot exceed knownDialogs" });
+    const provable = value.knownDialogs > 0 && value.incompleteDialogs === 0;
+    if (value.complete !== provable) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "localCoverage.complete does not match dialog counters" });
+  }),
+  rows: z.array(z.object({
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    incomingMessages: z.number().int().nonnegative(),
+    outgoingMessages: z.number().int().nonnegative(),
+    totalMessages: z.number().int().nonnegative(),
+    uniqueDialogs: z.number().int().nonnegative(),
+    uniqueIncomingFans: z.number().int().nonnegative(),
+    uniqueOutgoingFans: z.number().int().nonnegative(),
+  })).max(50),
+});
+
+router.get("/creators/:creatorId/ledger-overview", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const rangeKey = String(req.query.range || "30d");
+    if (!VALID_RANGES.has(rangeKey)) {
+      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${rangeKey}` });
+    }
+    const overview = await readCreatorLedgerOverview({ creatorId: ctx.creator.id, rangeKey });
+    return res.json(overview);
+  } catch (error) {
+    console.error("[stats/ledger-overview] failed:", error);
+    return res.status(500).json({ ok: false, code: "CREATOR_LEDGER_OVERVIEW_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+
+router.get("/creators/:creatorId/ledger-coverage", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const rangeKey = String(req.query.range || "30d");
+    if (!VALID_RANGES.has(rangeKey)) {
+      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${rangeKey}` });
+    }
+    const limit = Math.max(1, Math.min(500, Number.parseInt(String(req.query.limit || "120"), 10) || 120));
+    const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
+    const page = await readCreatorCoverage({ creatorId: ctx.creator.id, rangeKey, limit, offset });
+    return res.json({ ok: true, creatorId: ctx.creator.id, ...page });
+  } catch (error) {
+    console.error("[stats/ledger-coverage] failed:", error);
+    return res.status(500).json({ ok: false, code: "CREATOR_LEDGER_COVERAGE_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+
+router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const limit = Math.max(1, Math.min(100, Number.parseInt(String(req.query.limit || "50"), 10) || 50));
+    const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
+    const campaignId = String(req.params.campaignId || "");
+    if (!campaignId || campaignId.length > 220) {
+      return res.status(400).json({ ok: false, code: "INVALID_CAMPAIGN_ID", error: "Invalid campaign id" });
+    }
+    const result = await readCampaignFans({
+      creatorId: ctx.creator.id,
+      campaignId,
+      limit,
+      offset,
+    });
+    if (!result) return res.status(404).json({ ok: false, code: "CAMPAIGN_NOT_FOUND", error: "Campaign not found for this creator" });
+    return res.json({ ok: true, creatorId: ctx.creator.id, ...result });
+  } catch (error) {
+    console.error("[stats/campaign-fans] failed:", error);
+    return res.status(500).json({ ok: false, code: "CAMPAIGN_FANS_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+router.post("/creators/:creatorId/messages-daily", async (req, res) => {
+  try {
+    const input = messagesDailySchema.parse(req.body || {});
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
+    const userId = actorUserId(req);
+    const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
+    const device = await prisma.workerDevice.findFirst({
+      where: { id: input.deviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: { gte: freshAfter } },
+      select: { id: true, lastSeenAt: true },
+    });
+    if (!device) return res.status(403).json({ ok: false, code: "MESSAGES_DAILY_DEVICE_FORBIDDEN", error: "The reporting device is not owned by this agency member" });
+    const binding = await prisma.deviceCreatorBinding.findFirst({
+      where: {
+        deviceId: device.id,
+        creatorId: ctx.creator.id,
+        agencyId: ctx.creator.agencyId,
+        status: "ACTIVE",
+        lastSeenAt: { gte: freshAfter },
+      },
+      select: { id: true },
+    });
+    if (!binding) return res.status(409).json({ ok: false, code: "MESSAGES_DAILY_CREATOR_NOT_READY", error: "The reporting device has no fresh READY binding for this creator" });
+    const rows = input.rows.map((row) => ({ ...row, sourceTimezone: input.sourceTimezone }));
+    const result = await upsertMessagesDaily({
+      agencyId: ctx.creator.agencyId,
+      creatorId: ctx.creator.id,
+      rows,
+      syncId: input.syncId,
+      observedAt: input.observedAt,
+      sourceDeviceId: device.id,
+      localCoverage: input.localCoverage,
+    });
+    return res.json({ ok: true, creatorId: ctx.creator.id, ...result });
+  } catch (error) {
+    if (error?.issues) return validationError(res, error);
+    console.error("[stats/messages-daily] failed:", error);
+    return res.status(500).json({ ok: false, code: "MESSAGES_DAILY_UPSERT_FAILED", error: error?.message || "Failed" });
   }
 });
 

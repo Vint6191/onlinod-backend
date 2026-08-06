@@ -5,6 +5,7 @@ const { applyPresenceJobResult } = require("./presence-service");
 const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("./team-observation-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
+const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
 const {
   LIKES_DISCOVERY_JOB_KEY,
   applyLikesDiscoveryChunk,
@@ -60,69 +61,94 @@ function dateOrNull(value) {
   return Number.isFinite(date.getTime()) ? date : null;
 }
 
-async function applyEarningsResult({ job, deviceId, userId, result }) {
+async function applyEarningsResult({ db = prisma, job, deviceId, userId, result }) {
   if (!job.creatorId || !job.agencyId) throw new Error("Earnings job is missing creator scope");
   const payload = asObject(result);
   const summary = asObject(payload.summary);
   const range = asObject(payload.range);
   const rangeKey = String(payload.rangeKey || job.params?.rangeKey || "7d").trim() || "7d";
-  const data = {
-    creatorId: job.creatorId,
-    agencyId: job.agencyId,
+  const dailyLedger = await completeEarningsScan({ db, job, deviceId, result: payload });
+  let snapshot = null;
+  const totalValue = summary.totalCents ?? summary.total;
+  const grossValue = summary.grossCents ?? summary.gross;
+  const deltaValue = summary.deltaCents ?? summary.delta;
+  const legacySalesCountKnown = Number.isInteger(summary.salesCount) && summary.salesCount >= 0;
+  const legacyUniqueFansKnown = Number.isInteger(summary.uniqueFans) && summary.uniqueFans >= 0;
+  const canWriteLegacySnapshot = dailyLedger.complete === true
+    && totalValue !== null && totalValue !== undefined
+    && grossValue !== null && grossValue !== undefined
+    && deltaValue !== null && deltaValue !== undefined
+    && legacySalesCountKnown
+    && legacyUniqueFansKnown;
+  if (canWriteLegacySnapshot) {
+    const data = {
+      creatorId: job.creatorId,
+      agencyId: job.agencyId,
+      rangeKey,
+      rangeStartAt: dateOrNull(range.startDate),
+      rangeEndAt: dateOrNull(range.endDate),
+      totalCents: BigInt(cents(totalValue)),
+      grossCents: BigInt(cents(grossValue)),
+      deltaCents: BigInt(cents(deltaValue)),
+      avgSaleCents: summary.avgSaleCents == null && summary.avgSale == null ? 0 : cents(summary.avgSaleCents ?? summary.avgSale),
+      fanLtvCents: summary.fanLtvCents == null && summary.fanLtv == null ? 0 : cents(summary.fanLtvCents ?? summary.fanLtv),
+      salesCount: integer(summary.salesCount),
+      uniqueFans: integer(summary.uniqueFans),
+      raw: null,
+      capturedAt: new Date(),
+      capturedByDeviceId: deviceId,
+      capturedByUserId: userId,
+    };
+    snapshot = await db.creatorEarningsSnapshot.upsert({
+      where: { creatorId_rangeKey: { creatorId: job.creatorId, rangeKey } },
+      create: data,
+      update: data,
+    });
+  }
+  return {
+    ok: dailyLedger.complete === true,
+    type: "earnings",
+    snapshotId: snapshot?.id || null,
     rangeKey,
-    rangeStartAt: dateOrNull(range.startDate),
-    rangeEndAt: dateOrNull(range.endDate),
-    totalCents: BigInt(cents(summary.totalCents ?? summary.total)),
-    grossCents: BigInt(cents(summary.grossCents ?? summary.gross)),
-    deltaCents: BigInt(cents(summary.deltaCents ?? summary.delta)),
-    avgSaleCents: cents(summary.avgSaleCents ?? summary.avgSale),
-    fanLtvCents: cents(summary.fanLtvCents ?? summary.fanLtv),
-    salesCount: integer(summary.salesCount),
-    uniqueFans: integer(summary.uniqueFans),
-    raw: payload.raw ?? null,
-    capturedAt: new Date(),
-    capturedByDeviceId: deviceId,
-    capturedByUserId: userId,
+    totalCents: totalValue == null ? null : cents(totalValue),
+    salesCount: legacySalesCountKnown ? summary.salesCount : null,
+    uniqueFans: legacyUniqueFansKnown ? summary.uniqueFans : null,
+    dailyLedger,
   };
-  const snapshot = await prisma.creatorEarningsSnapshot.upsert({
-    where: { creatorId_rangeKey: { creatorId: job.creatorId, rangeKey } },
-    create: data,
-    update: data,
-  });
-  return { type: "earnings", snapshotId: snapshot.id, rangeKey, totalCents: Number(data.totalCents), salesCount: data.salesCount };
 }
 
-async function applyCampaignsResult({ job, deviceId, userId, result }) {
+async function applyCampaignsResult({ db = prisma, job, deviceId, userId, result }) {
   if (!job.creatorId || !job.agencyId) throw new Error("Campaigns job is missing creator scope");
   const payload = asObject(result);
-  const campaigns = Array.isArray(payload.campaigns) ? payload.campaigns.slice(0, 2000) : [];
+  const completion = await completeCampaignScan({ db, job, deviceId, result: payload });
   const rangeKey = String(payload.rangeKey || job.params?.rangeKey || "7d").trim() || "7d";
-  let totalActive = 0;
-  let totalClaimers = 0;
-  let totalClicks = 0;
-  for (const campaign of campaigns) {
-    if (campaign?.is_active === true || campaign?.isActive === true) totalActive += 1;
-    totalClaimers += integer(campaign?.claimers_count ?? campaign?.claimersCount);
-    totalClicks += integer(campaign?.clicks_count ?? campaign?.clicksCount);
+  if (completion.complete !== true) {
+    return { ok: false, type: "campaigns", rangeKey, completion };
   }
-  const data = {
-    creatorId: job.creatorId,
-    agencyId: job.agencyId,
+
+  // The relational campaign/fan tables are the sole source of truth. Do not
+  // re-materialize the full campaign list into the legacy Json snapshot: that
+  // would recreate the opaque storage architecture this ledger replaces.
+  const [campaignCount, totalActive, fanGroups] = await Promise.all([
+    db.creatorCampaign.count({ where: { creatorId: job.creatorId } }),
+    db.creatorCampaign.count({ where: { creatorId: job.creatorId, isActive: true } }),
+    db.creatorCampaignFan.groupBy({
+      by: ["campaignId"],
+      where: { creatorId: job.creatorId },
+      _count: { _all: true },
+    }),
+  ]);
+  const totalClaimers = fanGroups.reduce((sum, row) => sum + Number(row._count?._all || 0), 0);
+  return {
+    ok: true,
+    type: "campaigns",
+    snapshotId: null,
     rangeKey,
-    campaigns,
+    campaignCount,
     totalActive,
     totalClaimers,
-    totalClicks,
-    capturedAt: new Date(),
-    capturedByDeviceId: deviceId,
-    capturedByUserId: userId,
+    completion,
   };
-  const snapshot = await prisma.creatorCampaignsSnapshot.upsert({
-    where: { creatorId: job.creatorId },
-    create: data,
-    update: data,
-  });
-  return { type: "campaigns", snapshotId: snapshot.id, rangeKey, campaignCount: campaigns.length, totalActive, totalClaimers, totalClicks };
 }
 
 async function applyTrafficResult({ job, deviceId, userId, result }) {
@@ -147,6 +173,12 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   // final progress call only to switch driverPhase to complete. No payload is a
   // valid no-op; never route it into a job-specific chunk parser.
   if (chunkResult === undefined || chunkResult === null) return null;
+  if (job.jobKey === EARNINGS_JOB_KEY && chunkResult?.kind === "earnings_daily_page") {
+    return ingestEarningsChunk({ db, job, deviceId, chunk: chunkResult });
+  }
+  if (job.jobKey === CAMPAIGNS_JOB_KEY && ["campaigns_page", "campaign_claimers_page"].includes(chunkResult?.kind)) {
+    return ingestCampaignChunk({ db, job, deviceId, chunk: chunkResult });
+  }
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
     return applyDialogIntelligenceChunk({ db, job, deviceId, userId, chunkResult });
   }
@@ -155,7 +187,7 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   }
   if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "notification_facts_page") {
     const type = String(chunkResult.notificationType || "").trim().toLowerCase();
-    if (!["purchases", "tips", "subscriptions"].includes(type)) throw new Error("Unsupported notification facts page type");
+    if (!["purchases", "tips", "subscriptions", "likes", "comments"].includes(type)) throw new Error("Unsupported notification facts page type");
     const events = Array.isArray(chunkResult.events) ? chunkResult.events.slice(0, 100) : [];
     if (events.length !== (Array.isArray(chunkResult.events) ? chunkResult.events.length : 0)) {
       throw new Error("Notification facts page exceeds 100 events");
@@ -205,8 +237,8 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   if (job.jobKey === VAULT_UNSORTED_JOB_KEY) {
     return applyVaultUnsortedCompletion({ db, job, deviceId, userId, result: result || {} });
   }
-  if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ job, deviceId, userId, result });
-  if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ job, deviceId, userId, result });
+  if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ db, job, deviceId, userId, result });
+  if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ db, job, deviceId, userId, result });
   if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ job, deviceId, userId, result });
   if (job.jobKey === PRESENCE_JOB_KEY) return applyPresenceJobResult({ job, deviceId, result: result || {} });
   if (job.jobKey === CATCHUP_JOB_KEY) return applyCatchupJobResult({ db, job, deviceId, userId, result: result || {} });

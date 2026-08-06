@@ -11,6 +11,7 @@ const MIN_LEASE_MS = 30 * 1000;
 const MAX_LEASE_MS = 15 * 60 * 1000;
 const RETRY_BACKOFF_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
+const MAX_NOTIFICATION_REPAIR_PASSES = 100;
 const JOB_CHUNK_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 30_000 });
 const JOB_COMPLETION_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
@@ -477,6 +478,71 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   }
 
+  if (["fetch_earnings", "fetch_campaigns"].includes(job.jobKey)) {
+    // These jobs write durable relational projections. Reserve completion
+    // ownership before any side effect so a reclaimed worker cannot publish a
+    // stale earnings/campaign snapshot after another device takes the lease.
+    const completionLeaseRevision = leaseRevision + 1;
+    const reserved = await prisma.jobInstance.updateMany({
+      where: fenceWhere,
+      data: {
+        leaseRevision: { increment: 1 },
+        leaseUntil: new Date(now.getTime() + MAX_LEASE_MS),
+        lastProgressAt: now,
+      },
+    });
+    if (!reserved.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before analytics completion");
+
+    const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
+    const completionFence = {
+      id: job.id,
+      status: "CLAIMED",
+      claimedByDeviceId: deviceId,
+      leaseTokenHash: hashToken(leaseToken),
+      leaseRevision: completionLeaseRevision,
+    };
+    if (sideEffect?.ok !== true) {
+      const attempts = Number(job.attempts || 0) + 1;
+      const terminal = attempts >= MAX_ATTEMPTS;
+      const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
+      const partial = await prisma.jobInstance.updateMany({
+        where: completionFence,
+        data: terminal ? {
+          status: "FAILED",
+          attempts,
+          completedAt: new Date(),
+          claimedAt: null,
+          claimedByDeviceId: null,
+          leaseUntil: null,
+          leaseTokenHash: null,
+          continuation: null,
+          workId: null,
+          result: { ...(result || {}), completionSideEffect: sideEffect || null },
+          lastError: `${job.jobKey}_partial`,
+        } : {
+          status: "SCHEDULED",
+          attempts,
+          nextRunAt: retryAt,
+          completedAt: null,
+          claimedAt: null,
+          claimedByDeviceId: null,
+          leaseUntil: null,
+          leaseTokenHash: null,
+          continuation: null,
+          workId: null,
+          result: { ...(result || {}), completionSideEffect: sideEffect || null },
+          lastError: `${job.jobKey}_partial`,
+          progress: { percent: 0, message: `${job.jobKey} scheduled for repair` },
+        },
+      });
+      if (!partial.count) throw new JobLeaseError("JOB_LEASE_STALE", "Analytics partial-completion fence was lost");
+      return { job: { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", retryAt }, sideEffect };
+    }
+    const completed = await prisma.jobInstance.updateMany({ where: completionFence, data: completionData });
+    if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Analytics completion fence was lost");
+    return { job: { id: job.id, status: "DONE" }, sideEffect };
+  }
+
   if (job.jobKey === "catchup_notifications_scan") {
     // Reserve completion ownership before any ledger/compatibility side effect.
     // The compatibility projection can touch legacy tip/subscription ledgers,
@@ -504,9 +570,6 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       leaseRevision: completionLeaseRevision,
     };
     if (sideEffect?.ok !== true) {
-      const attempts = Number(job.attempts || 0) + 1;
-      const terminal = attempts >= MAX_ATTEMPTS;
-      const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
       const existingParams = object(job.params);
       const requestedTypes = Array.isArray(sideEffect?.summary?.requestedTypes)
         ? sideEffect.summary.requestedTypes.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
@@ -522,10 +585,17 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         const cursor = clean(typeCoverage.cursorEnd, 220);
         if (cursor && rejected === 0 && ["page_limit", "event_limit"].includes(reason)) resumeCursors[type] = cursor;
       }
+      const resumable = partialTypes.length > 0 && Object.keys(resumeCursors).length === partialTypes.length;
+      const repairPass = resumable ? Number(existingParams.notificationRepairPass || 0) + 1 : 0;
+      const attempts = Number(job.attempts || 0) + (resumable ? 0 : 1);
+      const terminal = resumable ? repairPass >= MAX_NOTIFICATION_REPAIR_PASSES : attempts >= MAX_ATTEMPTS;
+      const backoffExponent = resumable ? Math.min(6, Math.max(0, repairPass - 1)) : Math.max(0, attempts - 1);
+      const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** backoffExponent));
       const repairParams = {
         ...existingParams,
         ...(partialTypes.length ? { types: partialTypes } : {}),
         ...(Object.keys(resumeCursors).length ? { resumeCursors } : { resumeCursors: null }),
+        notificationRepairPass: repairPass,
       };
       const partial = await prisma.jobInstance.updateMany({
         where: completionFence,
