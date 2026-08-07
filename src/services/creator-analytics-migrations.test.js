@@ -12,6 +12,7 @@ const migrationPaths = [
   "prisma/migrations/20260806190000_creator_analytics_relational_hardening/migration.sql",
   "prisma/migrations/20260806220000_notification_all_backfill_v1/migration.sql",
   "prisma/migrations/20260806221000_subscription_unknown_price/migration.sql",
+  "prisma/migrations/20260807143000_notification_scanner_manual_v1/migration.sql",
 ];
 const migrations = migrationPaths.map((relative) => ({ relative, text: fs.readFileSync(path.join(root, relative), "utf8") }));
 const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
@@ -74,6 +75,20 @@ test("notification ALL migration keeps resumable sync state relational and typed
   assert.match(sql, /superseded_by_notification_all_v4/);
   assert.match(schema, /model CreatorNotificationSyncState \{/);
   assert.doesNotMatch(sql, /payloadJson|rawJson|eventJson/i);
+});
+
+test("manual notification scanner audit is relational and fences old automatic jobs", () => {
+  const sql = migrations[5].text;
+  assert.match(sql, /CREATE TABLE "CreatorNotificationScanItem"/);
+  assert.match(sql, /"sourceJobId" TEXT NOT NULL/);
+  assert.match(sql, /"outcome" "CreatorNotificationScanOutcome" NOT NULL/);
+  assert.match(sql, /"amountCents" INTEGER/);
+  assert.match(sql, /"currency" TEXT/);
+  assert.match(sql, /"reasonCode" TEXT/);
+  assert.match(sql, /notification_scan_manual_only_v1/);
+  assert.match(sql, /WHERE "jobKey" = 'catchup_notifications_scan'/);
+  assert.doesNotMatch(sql, /\bJSONB?\b/i);
+  assert.match(schema, /model CreatorNotificationScanItem \{/);
 });
 
 test("analytics migrations contain no message bodies or JSON business payloads", () => {

@@ -571,6 +571,30 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     };
     if (sideEffect?.ok !== true) {
       const existingParams = object(job.params);
+      // Creator Analytics notification scans are manual during development.
+      // Reaching hasMore=false with rejected/ignored facts must stop and expose
+      // the PARTIAL result to the inspector; never silently schedule another
+      // full repair pass behind the operator's back.
+      if (existingParams.manualNotificationScan === true) {
+        const partial = await prisma.jobInstance.updateMany({
+          where: completionFence,
+          data: {
+            status: "DONE",
+            completedAt: new Date(),
+            claimedAt: null,
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+            continuation: null,
+            workId: null,
+            result: { ...(result || {}), completionSideEffect: sideEffect || null },
+            lastError: "notification_scan_partial",
+            progress: { percent: 100, message: "notification scan completed with rejected facts" },
+          },
+        });
+        if (!partial.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification manual completion fence was lost");
+        return { job: { id: job.id, status: "DONE" }, sideEffect };
+      }
       const requestedTypes = Array.isArray(sideEffect?.summary?.requestedTypes)
         ? sideEffect.summary.requestedTypes.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
         : Array.isArray(existingParams.types) ? existingParams.types : [];

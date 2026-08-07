@@ -33,6 +33,11 @@ const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsert
 const { buildNotificationScanParams, loadNotificationSyncState, recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
 const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = require("../services/notification-facts-service");
 const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
+const {
+  startManualNotificationScan,
+  stopManualNotificationScan,
+  readManualNotificationScan,
+} = require("../services/notification-scan-control-service");
 
 const router = express.Router();
 
@@ -815,6 +820,65 @@ router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) =
   } catch (error) {
     console.error("[stats/campaign-fans] failed:", error);
     return res.status(500).json({ ok: false, code: "CAMPAIGN_FANS_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+
+// Manual Notifications ALL scanner used by the Creator Analytics development
+// workspace. These endpoints deliberately schedule only the existing
+// catchup_notifications_scan JobInstance; they do not start earnings,
+// campaigns, subscribers, message aggregation, or any private worker loop.
+router.get("/creators/:creatorId/notification-scan", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const outcome = String(req.query.outcome || "ALL").trim().toUpperCase();
+    const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
+    const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
+    const result = await readManualNotificationScan({ creator: ctx.creator, outcome, limit, offset });
+    return res.json(result);
+  } catch (error) {
+    const message = error?.message || "Failed";
+    const validation = /invalid notification scan outcome/i.test(message);
+    console.error("[stats/notification-scan] failed:", error);
+    return res.status(validation ? 400 : 500).json({
+      ok: false,
+      code: validation ? "INVALID_NOTIFICATION_SCAN_FILTER" : "NOTIFICATION_SCAN_READ_FAILED",
+      error: message,
+    });
+  }
+});
+
+router.post("/creators/:creatorId/notification-scan/start", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
+    const started = await startManualNotificationScan({
+      creator: ctx.creator,
+      requestedByUserId: actorUserId(req),
+      now: new Date(),
+    });
+    const result = await readManualNotificationScan({ creator: ctx.creator, outcome: "ALL", limit: 100, offset: 0 });
+    return res.json({ ...result, action: started.action });
+  } catch (error) {
+    console.error("[stats/notification-scan/start] failed:", error);
+    return res.status(500).json({ ok: false, code: "NOTIFICATION_SCAN_START_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+router.post("/creators/:creatorId/notification-scan/stop", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
+    const stopped = await stopManualNotificationScan({ creatorId: ctx.creator.id, now: new Date() });
+    const result = await readManualNotificationScan({ creator: ctx.creator, outcome: "ALL", limit: 100, offset: 0 });
+    return res.json({ ...result, action: stopped.action });
+  } catch (error) {
+    console.error("[stats/notification-scan/stop] failed:", error);
+    return res.status(500).json({ ok: false, code: "NOTIFICATION_SCAN_STOP_FAILED", error: error?.message || "Failed" });
   }
 });
 

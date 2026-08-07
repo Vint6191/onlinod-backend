@@ -53,6 +53,20 @@ enum AnalyticsIngestStatus {
   FAILED
 }
 
+enum CreatorNotificationScanOutcome {
+  ACCEPTED
+  REJECTED
+  IGNORED
+}
+
+enum CreatorNotificationScanFactType {
+  PURCHASE
+  TIP
+  SUBSCRIPTION
+  LIKE
+  COMMENT
+}
+
 enum CreatorSaleType {
   MESSAGE
   POST
@@ -312,6 +326,7 @@ model CreatorAccount {
   campaignMemberships CreatorCampaignFan[]
   messagesDaily CreatorMessagesDaily[]
   notificationSyncState CreatorNotificationSyncState?
+  notificationScanItems CreatorNotificationScanItem[]
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
@@ -767,6 +782,39 @@ model CreatorNotificationSyncState {
   @@index([sourceJobId])
 }
 
+model CreatorNotificationScanItem {
+  id                    String                         @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  sourceJobId           String
+  scanRunId             String
+  page                  Int
+  ordinal               Int
+  notificationId        String?
+  sourceType            String?
+  sourceSubType         String?
+  factType              CreatorNotificationScanFactType?
+  occurredAt            DateTime?
+  fanOnlyFansUserId     String?
+  postId                String?
+  commentId             String?
+  messageId             String?
+  amountCents           Int?
+  currency              String?
+  outcome               CreatorNotificationScanOutcome
+  reasonCode            String?
+  createdAt             DateTime                       @default(now())
+
+  creator   CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  sourceJob JobInstance    @relation(fields: [sourceJobId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, scanRunId, page, ordinal], map: "CreatorNotificationScanItem_run_page_ordinal_key")
+  @@index([creatorId, sourceJobId, outcome, page], map: "CreatorNotificationScanItem_job_outcome_page_idx")
+  @@index([creatorId, scanRunId, page], map: "CreatorNotificationScanItem_run_page_idx")
+  @@index([sourceJobId], map: "CreatorNotificationScanItem_sourceJobId_idx")
+  @@index([creatorId, reasonCode], map: "CreatorNotificationScanItem_reason_idx")
+}
+
 model AnalyticsIngestBatch {
   id                 String                @id @default(cuid())
   agencyId           String
@@ -1212,6 +1260,7 @@ model JobInstance {
   creatorCampaigns CreatorCampaign[]
   creatorCampaignFans CreatorCampaignFan[]
   creatorMessagesDaily CreatorMessagesDaily[]
+  creatorNotificationScanItems CreatorNotificationScanItem[]
 
   @@index([status, nextRunAt])
   @@index([creatorId])

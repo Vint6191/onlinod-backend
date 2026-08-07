@@ -13,10 +13,13 @@ const coverageTypeMigration = read("prisma/migrations/20260806130000_notificatio
 const v2Migration = read("prisma/migrations/20260806140000_notification_facts_v1_audited_v2/migration.sql");
 const v3Migration = read("prisma/migrations/20260806160000_notification_facts_v1_audited_v3/migration.sql");
 const allBackfillMigration = read("prisma/migrations/20260806220000_notification_all_backfill_v1/migration.sql");
+const manualScannerMigration = read("prisma/migrations/20260807143000_notification_scanner_manual_v1/migration.sql");
 const service = read("src/services/notification-facts-service.js");
 const observation = read("src/services/team-observation-service.js");
 const leaseService = read("src/services/job-lease-service.js");
 const jobResultService = read("src/services/job-result-service.js");
+const scheduler = read("src/services/job-scheduler.js");
+const scanControl = read("src/services/notification-scan-control-service.js");
 const strictDates = read("src/services/strict-date-time.js");
 
 function modelBody(name) {
@@ -36,6 +39,16 @@ test("notification facts are typed relational tables without JSON business stora
   assert.match(modelBody("CreatorFan"), /@@unique\(\[creatorId, id\], map: "CreatorFan_creatorId_id_key"\)/);
   assert.match(modelBody("CreatorPostLike"), /onlyFansLikeId\s+String\?/);
   assert.match(modelBody("CreatorPostLike"), /@@unique\(\[creatorId, onlyFansLikeId\]\)/);
+
+  const scanItem = modelBody("CreatorNotificationScanItem");
+  assert.doesNotMatch(scanItem, /\bJson\??\b/);
+  for (const column of [
+    "sourceJobId", "scanRunId", "page", "ordinal", "notificationId",
+    "sourceType", "sourceSubType", "factType", "occurredAt",
+    "fanOnlyFansUserId", "postId", "commentId", "messageId", "amountCents", "currency", "outcome", "reasonCode",
+  ]) {
+    assert.match(scanItem, new RegExp(`\\b${column}\\b`));
+  }
 });
 
 test("external identities remain traceable without collapsing subscription lifecycle events", () => {
@@ -79,6 +92,9 @@ test("upgrade migrations purge untrusted protocols and enforce database invarian
   assert.match(allBackfillMigration, /"fullBackfillVerifiedAt" TIMESTAMP\(3\)/);
   assert.match(modelBody("CreatorNotificationSyncState"), /fullBackfillCompletedAt\s+DateTime\?/);
   assert.match(modelBody("CreatorNotificationSyncState"), /fullBackfillVerifiedAt\s+DateTime\?/);
+  assert.match(manualScannerMigration, /CREATE TABLE "CreatorNotificationScanItem"/);
+  assert.match(manualScannerMigration, /notification_scan_manual_only_v1/);
+  assert.doesNotMatch(manualScannerMigration, /\bJSONB?\b/i);
 });
 
 test("ingest is version-fenced, transactional, page-oriented and interval-aware", () => {
@@ -106,9 +122,24 @@ test("ingest is version-fenced, transactional, page-oriented and interval-aware"
   assert.match(strictDates, /getUTCDate\(\) !== day/);
   assert.match(jobResultService, /notification_facts_page_all/);
   assert.match(jobResultService, /recordNotificationPageProgress/);
+  assert.match(jobResultService, /recordNotificationScanItems/);
   assert.match(jobResultService, /notification_facts_page/);
   assert.match(jobResultService, /schemaVersion: chunkResult\.schemaVersion/);
   assert.match(jobResultService, /finalizeCoverage: false/);
+});
+
+
+
+test("automatic creator scheduling does not start notification history scans during development", () => {
+  const start = scheduler.indexOf("async function scheduleInitialJobsForCreator");
+  const end = scheduler.indexOf("async function ensureSingleJob", start);
+  assert.ok(start >= 0 && end > start, "scheduleInitialJobsForCreator body not found");
+  const body = scheduler.slice(start, end);
+  assert.doesNotMatch(body, /catchup_notifications_scan/);
+  assert.match(body, /Notification history collection is intentionally manual/);
+  assert.match(scanControl, /manualNotificationScan:\s*true/);
+  assert.match(scanControl, /scheduleJobNow/);
+  assert.match(scanControl, /status:\s*"PAUSED"/);
 });
 
 test("completion preserves run identity, streams compatibility facts and treats schema-4 source traversal as technically done", () => {
@@ -125,6 +156,8 @@ test("completion preserves run identity, streams compatibility facts and treats 
   assert.match(observation, /sourceTraversalComplete/);
   assert.match(observation, /result\?\.sourceExhausted === true/);
   assert.match(leaseService, /job\.jobKey === "catchup_notifications_scan"/);
+  assert.match(leaseService, /existingParams\.manualNotificationScan === true/);
+  assert.match(leaseService, /notification scan completed with rejected facts/);
   assert.match(leaseService, /leaseRevision: \{ increment: 1 \}/);
   assert.match(leaseService, /notification scan scheduled for repair/);
   assert.match(leaseService, /partialTypes/);

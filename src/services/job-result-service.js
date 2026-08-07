@@ -5,6 +5,7 @@ const { applyPresenceJobResult } = require("./presence-service");
 const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("./team-observation-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
 const { recordNotificationPageProgress } = require("./notification-sync-state-service");
+const { recordNotificationScanItems } = require("./notification-scan-control-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
 const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
 const {
@@ -224,8 +225,9 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
         : null;
       applied.push({ notificationType: type, ledger, purchaseSignals });
     }
+    const audit = await recordNotificationScanItems({ db, job, chunk: chunkResult });
     const syncState = await recordNotificationPageProgress({ db, job, deviceId, chunk: chunkResult });
-    return { type: "notification_facts_page_all", batches: applied, syncStateId: syncState?.id || null };
+    return { type: "notification_facts_page_all", batches: applied, audit, syncStateId: syncState?.id || null };
   }
   if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "notification_facts_page") {
     const type = String(chunkResult.notificationType || "").trim().toLowerCase();

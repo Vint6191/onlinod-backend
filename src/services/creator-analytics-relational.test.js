@@ -81,7 +81,7 @@ test("campaign transport is page-oriented and notification engagement is accepte
   assert.match(notificationSync, /notificationMode: "full"/);
   assert.match(notificationSync, /notificationMode: "catchup"/);
   assert.match(notificationSync, /stopAtNotificationId/);
-  assert.match(notificationSync, /pageLimit: 50/);
+  assert.match(notificationSync, /pageLimit: 10/);
   const liveStart = routes.indexOf('router.post("/creators/:creatorId/notifications/live"');
   const liveEnd = routes.indexOf('router.post("/creators/:creatorId/messages-daily"', liveStart);
   const liveRoute = routes.slice(liveStart, liveEnd);

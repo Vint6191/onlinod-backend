@@ -33,7 +33,6 @@ const { ensureAutomaticFollowBack } = require("./follow-back-service");
 const { ensureAutomaticBumps } = require("./bump-service");
 const { ensureAutomaticLikes } = require("./likes-service");
 const { ensureAutomaticFollowAutomation } = require("./follow-automation-service");
-const { buildNotificationScanParams, loadNotificationSyncState } = require("./notification-sync-state-service");
 const { ensureAutomaticSfs } = require("./sfs-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
@@ -130,33 +129,12 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   if (campaignsDecision.created) created.push("fetch_campaigns");
   else skipped.push("fetch_campaigns");
 
-  // 3. Notification facts use one resumable type=all stream. The first run
-  // walks to explicit hasMore=false; later hourly runs stop at the last known
-  // head notification and only close realtime/offline gaps.
-  const notificationState = await loadNotificationSyncState(prisma, creatorId);
-  const notificationReason = notificationState?.fullBackfillVerifiedAt
-    ? "recurring_notification_catchup"
-    : notificationState?.fullBackfillCompletedAt
-      ? "notification_full_repair"
-      : "initial_notification_backfill";
-  const notificationParams = buildNotificationScanParams({
-    state: notificationState,
-    now,
-    reason: notificationReason,
-    analyticsRangeKey: "all",
-  });
-  const notificationDecision = await ensureSingleJob({
-    jobKey: "catchup_notifications_scan",
-    creatorId,
-    agencyId,
-    params: notificationParams,
-    priority: Math.max(20, priority - 10),
-    now,
-  });
-  if (notificationDecision.created) created.push(`catchup_notifications_scan:${notificationParams.notificationMode}`);
-  else skipped.push(`catchup_notifications_scan:${notificationParams.notificationMode}`);
+  // Notification history collection is intentionally manual while Creator
+  // Analytics is under development. The existing JobInstance scheduler still
+  // executes scans started from the Creator Analytics UI, but READY/recurring
+  // sweeps must never create notification jobs on their own.
 
-  // 4. traffic_sources_scan — source/member attribution index.
+  // 3. traffic_sources_scan — source/member attribution index.
   // Kept much cooler than earnings jobs because it can walk large trial/promo lists.
   const trafficDecision = await ensureSingleJob({
     jobKey: "traffic_sources_scan",
