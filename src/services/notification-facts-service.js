@@ -4,9 +4,11 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 
-const SERVICE_VERSION = "notification-facts-v1-all-v6";
-const SCHEMA_VERSION = 4;
-const COLLECTOR_VERSION = "notifications-all-v5";
+const SERVICE_VERSION = "notification-facts-v1-history-v6";
+const SCHEMA_VERSION = 5;
+const COLLECTOR_VERSION = "notifications-history-v6";
+const ALL_SCHEMA_VERSION = 4;
+const ALL_COLLECTOR_VERSION = "notifications-all-v5";
 const LEGACY_SCHEMA_VERSION = 3;
 const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4";
 const MAX_EVENTS_PER_BATCH = 2_000;
@@ -910,7 +912,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
     });
   }
   const incomingSchemaVersion = result?.schemaVersion;
-  if (!Number.isInteger(incomingSchemaVersion) || ![LEGACY_SCHEMA_VERSION, SCHEMA_VERSION].includes(incomingSchemaVersion)) {
+  if (!Number.isInteger(incomingSchemaVersion) || ![LEGACY_SCHEMA_VERSION, ALL_SCHEMA_VERSION, SCHEMA_VERSION].includes(incomingSchemaVersion)) {
     throw Object.assign(new Error(`Unsupported notification schema version: ${incomingSchemaVersion ?? "<missing>"}`), {
       code: "NOTIFICATION_SCHEMA_VERSION_UNSUPPORTED",
     });
@@ -984,7 +986,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
       code: "NOTIFICATION_PAGE_BATCH_KEY_MISMATCH",
     });
   }
-  const protocolSuffix = schemaVersion === LEGACY_SCHEMA_VERSION ? "v4" : "v5";
+  const protocolSuffix = schemaVersion === LEGACY_SCHEMA_VERSION ? "v4" : schemaVersion === ALL_SCHEMA_VERSION ? "v5" : "v6";
   const idempotencyKey = `notification-facts:${job.id}:${batchKey}:${protocolSuffix}`;
   if (idempotencyKey.length > 240) {
     throw Object.assign(new Error("Notification ingest idempotency key exceeds the ledger limit"), {
@@ -994,7 +996,11 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
   const collectorVersionRaw = typeof result?.collectorVersion === "string"
     ? result.collectorVersion.trim()
     : "";
-  const expectedCollectorVersion = schemaVersion === LEGACY_SCHEMA_VERSION ? LEGACY_COLLECTOR_VERSION : COLLECTOR_VERSION;
+  const expectedCollectorVersion = schemaVersion === LEGACY_SCHEMA_VERSION
+    ? LEGACY_COLLECTOR_VERSION
+    : schemaVersion === ALL_SCHEMA_VERSION
+      ? ALL_COLLECTOR_VERSION
+      : COLLECTOR_VERSION;
   if (!collectorVersionRaw || collectorVersionRaw.length > 80 || collectorVersionRaw !== expectedCollectorVersion) {
     throw Object.assign(new Error("Notification collectorVersion is invalid or unsupported"), {
       code: "NOTIFICATION_COLLECTOR_VERSION_INVALID",
@@ -1090,7 +1096,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
           const currentRunPageMarker = scanRunId ? `:run:${scanRunId}:page:${type}:` : `:page:${type}:`;
           const priorTypeFailed = priorBatches.some((batch) => {
             const key = String(batch.idempotencyKey || "");
-            return (key.endsWith(":v4") || key.endsWith(":v5"))
+            return (key.endsWith(":v4") || key.endsWith(":v5") || key.endsWith(":v6"))
               && key.includes(currentRunPageMarker)
               && (batch.status !== "COMMITTED" || Number(batch.rejectedRows || 0) > 0);
           });

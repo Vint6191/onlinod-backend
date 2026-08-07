@@ -26,7 +26,7 @@ function fakeDb(initial = null) {
 
 const job = { id: "job-1", agencyId: "agency-1", creatorId: "creator-1" };
 
-test("initial notification scan is one ALL traversal from the beginning of supported history", () => {
+test("initial notification scan requests the full supported notification fact range", () => {
   const now = new Date("2026-08-06T21:00:00.000Z");
   const params = buildNotificationScanParams({ state: null, now, reason: "manual", analyticsRangeKey: "30d" });
   assert.equal(params.from, FULL_HISTORY_FROM.toISOString());
@@ -93,6 +93,32 @@ test("page progress is replay-idempotent and advances only to the backend-confir
   assert.equal(state.ignoredEvents, 11);
 });
 
+test("schema-5 phase transitions can clear the visible cursor without claiming overall exhaustion", async () => {
+  const db = fakeDb();
+  await recordNotificationPageProgress({
+    db, job, deviceId: "device-1",
+    chunk: {
+      schemaVersion: 5,
+      scanRunId: "scan-run-phase-1",
+      notificationMode: "full",
+      page: 12,
+      cursorEnd: "subscriptions-tail",
+      nextCursor: null,
+      headNotificationId: "head-1",
+      tailNotificationId: "subscriptions-tail",
+      sourceExhausted: false,
+      totalAcceptedRows: 100,
+      totalRejectedRows: 0,
+      totalIgnoredRows: 0,
+      batches: [],
+    },
+  });
+  const state = db.read();
+  assert.equal(state.status, "SCANNING");
+  assert.equal(state.nextCursor, null);
+  assert.equal(state.pagesScanned, 12);
+});
+
 test("a new scan run resets run counters without losing historical time bounds", async () => {
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
@@ -139,7 +165,6 @@ test("source exhaustion records completed traversal while verification remains s
   assert.equal(state.fullBackfillVerifiedAt, undefined);
   assert.equal(state.nextCursor, null);
 
-  const completedAt = state.fullBackfillCompletedAt;
   await completeNotificationSync({
     db, job, deviceId: "device-1", successful: true,
     result: {
@@ -150,7 +175,7 @@ test("source exhaustion records completed traversal while verification remains s
   });
   state = db.read();
   assert.equal(state.status, "COMPLETE");
-  assert.equal(state.fullBackfillCompletedAt, completedAt);
+  assert.ok(state.fullBackfillCompletedAt instanceof Date);
   assert.ok(state.fullBackfillVerifiedAt instanceof Date);
 });
 

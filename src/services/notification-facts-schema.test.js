@@ -98,11 +98,15 @@ test("upgrade migrations purge untrusted protocols and enforce database invarian
 });
 
 test("ingest is version-fenced, transactional, page-oriented and interval-aware", () => {
-  assert.match(service, /const SCHEMA_VERSION = 4/);
-  assert.match(service, /const COLLECTOR_VERSION = "notifications-all-v5"/);
+  assert.match(service, /const SCHEMA_VERSION = 5/);
+  assert.match(service, /const COLLECTOR_VERSION = "notifications-history-v6"/);
+  assert.match(service, /const ALL_SCHEMA_VERSION = 4/);
+  assert.match(service, /const ALL_COLLECTOR_VERSION = "notifications-all-v5"/);
   assert.match(service, /const LEGACY_SCHEMA_VERSION = 3/);
   assert.match(service, /const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4"/);
-  assert.match(service, /protocolSuffix = schemaVersion === LEGACY_SCHEMA_VERSION \? "v4" : "v5"/);
+  assert.match(service, /schemaVersion === ALL_SCHEMA_VERSION \? "v5" : "v6"/);
+  assert.match(service, /rangeTo\.getTime\(\) - 369/);
+  assert.match(service, /Notification coverage range exceeds 370 days/);
   assert.match(service, /notification-facts:\$\{job\.id\}:\$\{batchKey\}:\$\{protocolSuffix\}/);
   assert.match(service, /db\.\$transaction/);
   assert.match(service, /createMany\(\{ data: creates\.map/);
@@ -142,7 +146,7 @@ test("automatic creator scheduling does not start notification history scans dur
   assert.match(scanControl, /status:\s*"PAUSED"/);
 });
 
-test("completion preserves run identity, streams compatibility facts and treats schema-4 source traversal as technically done", () => {
+test("completion preserves run identity, streams compatibility facts and treats proven source traversal as technically done", () => {
   const ledgerAt = observation.indexOf("await ingestNotificationFacts");
   const compatibilityAt = observation.indexOf("for await (const raw of iterateLedgerCompatibilityEvents");
   assert.ok(ledgerAt >= 0 && compatibilityAt > ledgerAt);
