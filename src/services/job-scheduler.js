@@ -234,17 +234,26 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
     bucketMs: window,
   });
 
-  // Prefer the explicit idempotency key. Older rows without one are still
-  // considered by the compatibility rangeKey scan below.
-  const keyed = await prisma.jobInstance.findFirst({
-    where: { idempotencyKey },
-    orderBy: { createdAt: "desc" },
-  });
-  if (keyed && (keyed.status === "SCHEDULED" || keyed.status === "CLAIMED")) {
-    return { created: false, reason: "already_in_flight", jobId: keyed.id };
-  }
-  if (keyed && keyed.status === "DONE" && keyed.completedAt && keyed.completedAt > new Date(now.getTime() - window)) {
-    return { created: false, reason: "recently_done", jobId: keyed.id };
+  // Prefer the explicit idempotency key. Because idempotencyKey is unique,
+  // ANY row for the current bucket already owns that bucket. Do not attempt a
+  // second INSERT for FAILED/CANCELLED/other terminal rows: PostgreSQL would
+  // correctly reject it with P2002 and Prisma would emit a scary error log even
+  // when the application catches the exception. The next scheduler bucket gets
+  // a different key and is the normal retry boundary. Older rows without a key
+  // are still considered by the compatibility rangeKey scan below.
+  const keyed = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
+  if (keyed) {
+    if (keyed.status === "SCHEDULED" || keyed.status === "CLAIMED") {
+      return { created: false, reason: "already_in_flight", jobId: keyed.id };
+    }
+    if (keyed.status === "DONE" && keyed.completedAt && keyed.completedAt > new Date(now.getTime() - window)) {
+      return { created: false, reason: "recently_done", jobId: keyed.id };
+    }
+    return {
+      created: false,
+      reason: `same_bucket_${String(keyed.status || "terminal").toLowerCase()}`,
+      jobId: keyed.id,
+    };
   }
 
   // Find any existing legacy job for this creator+jobKey+rangeKey.
@@ -278,28 +287,26 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
     return { created: false, reason: "recently_done", jobId: recentlyDone.id };
   }
 
-  // Create. The database unique key closes the race between multiple
-  // backend instances running the same scheduler bucket.
-  try {
-    const created = await prisma.jobInstance.create({
-      data: {
-        jobKey,
-        scope: "creator",
-        creatorId,
-        agencyId,
-        idempotencyKey,
-        params: params || {},
-        priority,
-        scheduledAt: now,
-        nextRunAt: now,
-      },
-    });
-    return { created: true, jobId: created.id };
-  } catch (err) {
-    if (err?.code !== "P2002") throw err;
-    const raced = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
-    return { created: false, reason: "idempotency_race", jobId: raced?.id || null };
-  }
+  // Create without relying on an expected unique-constraint exception for the
+  // multi-process race. `skipDuplicates` maps to ON CONFLICT DO NOTHING on
+  // PostgreSQL, so a legitimate race stays silent in Prisma logs.
+  const inserted = await prisma.jobInstance.createMany({
+    data: [{
+      jobKey,
+      scope: "creator",
+      creatorId,
+      agencyId,
+      idempotencyKey,
+      params: params || {},
+      priority,
+      scheduledAt: now,
+      nextRunAt: now,
+    }],
+    skipDuplicates: true,
+  });
+  const stored = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
+  if (inserted.count > 0) return { created: true, jobId: stored?.id || null };
+  return { created: false, reason: "idempotency_race", jobId: stored?.id || null };
 }
 
 async function scheduleJobNow({
@@ -354,24 +361,25 @@ async function scheduleJobNow({
       return { job, created: false, reason: "rescheduled" };
     }
 
-    try {
-      const job = await prisma.jobInstance.create({
-        data: {
-          jobKey,
-          scope: "creator",
-          creatorId,
-          agencyId,
-          idempotencyKey,
-          params,
-          status: "SCHEDULED",
-          priority,
-          scheduledAt: now,
-          nextRunAt: now,
-        },
-      });
+    const inserted = await prisma.jobInstance.createMany({
+      data: [{
+        jobKey,
+        scope: "creator",
+        creatorId,
+        agencyId,
+        idempotencyKey,
+        params,
+        status: "SCHEDULED",
+        priority,
+        scheduledAt: now,
+        nextRunAt: now,
+      }],
+      skipDuplicates: true,
+    });
+    if (inserted.count > 0) {
+      const job = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
+      if (!job) throw new Error(`Failed to read newly scheduled ${jobKey}`);
       return { job, created: true, reason: "created" };
-    } catch (error) {
-      if (error?.code !== "P2002") throw error;
     }
   }
 
