@@ -41,7 +41,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
       to: runtimeRangeTo(now).toISOString(),
       types: ["purchases", "tips", "subscriptions", "likes", "comments"],
       notificationMode: "full",
-      pageLimit: 50,
+      pageLimit: 10,
       reason,
       analyticsRangeKey,
     };
@@ -54,7 +54,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
     to: runtimeRangeTo(now).toISOString(),
     types: ["purchases", "tips", "subscriptions", "likes", "comments"],
     notificationMode: "catchup",
-    pageLimit: 50,
+    pageLimit: 10,
     ...(stopAtNotificationId ? { stopAtNotificationId } : {}),
     reason,
     analyticsRangeKey,

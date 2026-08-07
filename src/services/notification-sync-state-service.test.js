@@ -33,7 +33,7 @@ test("initial notification scan is one ALL traversal from the beginning of suppo
   assert.equal(params.to, "2026-08-06T21:05:00.000Z");
   assert.equal(params.notificationMode, "full");
   assert.deepEqual(params.types, ["purchases", "tips", "subscriptions", "likes", "comments"]);
-  assert.equal(params.pageLimit, 50);
+  assert.equal(params.pageLimit, 10);
   assert.equal("backfillWindow" in params, false);
   assert.equal("resumeCursors" in params, false);
 });
