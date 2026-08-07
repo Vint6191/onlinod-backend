@@ -86,11 +86,8 @@ async function recordNotificationPageProgress({ db, job, deviceId, chunk }) {
   if (!db?.creatorNotificationSyncState?.upsert) return null;
   const mode = chunk?.notificationMode === "catchup" ? "catchup" : "full";
   const scanRunId = clean(chunk?.scanRunId, 80);
-  if (!scanRunId || !/^[A-Za-z0-9._-]{8,80}$/.test(scanRunId)) throw new Error("Notification history page requires a valid scanRunId");
+  if (!scanRunId || !/^[A-Za-z0-9._-]{8,80}$/.test(scanRunId)) throw new Error("Notification ALL page requires a valid scanRunId");
   const cursorEnd = clean(chunk?.cursorEnd, 220);
-  const nextCursor = Number(chunk?.schemaVersion || 0) >= 5
-    ? clean(chunk?.nextCursor, 220)
-    : cursorEnd;
   const headNotificationId = clean(chunk?.headNotificationId, 220);
   const tailNotificationId = clean(chunk?.tailNotificationId, 220);
   const sourceExhausted = chunk?.sourceExhausted === true;
@@ -105,7 +102,7 @@ async function recordNotificationPageProgress({ db, job, deviceId, chunk }) {
     status: "SCANNING",
     mode,
     scanRunId,
-    nextCursor: sourceExhausted ? null : nextCursor,
+    nextCursor: sourceExhausted ? null : cursorEnd,
     headNotificationId: headNotificationId || (sameRun ? existing?.headNotificationId : null) || existing?.headNotificationId || null,
     tailNotificationId: tailNotificationId || (sameRun ? existing?.tailNotificationId : null) || null,
     oldestOccurredAt: earliestDate(existing?.oldestOccurredAt, bounds.oldest),
@@ -151,14 +148,16 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
       : verified && mode === "catchup" && !fullHistoryVerified
         ? "Catch-up completed, but the initial full notification backfill still contains rejected facts"
         : sourceTraversalComplete
-          ? "Notification history reached every required source boundary, but one or more recognized facts were rejected"
-          : "Notification history scan did not reach every required source boundary",
+          ? "Notification ALL reached the source boundary, but one or more recognized facts were rejected"
+          : "Notification ALL scan did not reach a proven source boundary",
     sourceDeviceId: clean(deviceId, 220),
     sourceJobId: clean(job.id, 220),
     ...(sourceTraversalComplete && mode === "full" ? {
-      // A new full traversal supersedes older v4 "ALL recent" completions.
-      fullBackfillCompletedAt: now,
-      ...(verified ? { fullBackfillVerifiedAt: now } : {}),
+      fullBackfillCompletedAt: existing?.fullBackfillCompletedAt || now,
+      // A current full rebuild owns verification truth. A stale verification
+      // from the old ALL-only collector must not survive a newer partial full
+      // run, otherwise later scheduler passes incorrectly downgrade to catch-up.
+      fullBackfillVerifiedAt: verified ? now : null,
     } : {}),
     ...(sourceTraversalComplete && mode === "catchup" ? { lastCatchupCompletedAt: now } : {}),
   };

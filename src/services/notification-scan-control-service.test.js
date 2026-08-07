@@ -14,6 +14,7 @@ const servicePath = require.resolve("./notification-scan-control-service");
 
 let scheduledInput = null;
 let syncState = null;
+let buildStateSeen = undefined;
 cacheModule(prismaPath, {});
 cacheModule(schedulerPath, {
   async scheduleJobNow(input) {
@@ -36,6 +37,7 @@ cacheModule(schedulerPath, {
 cacheModule(syncPath, {
   async loadNotificationSyncState() { return syncState; },
   buildNotificationScanParams({ state }) {
+    buildStateSeen = state;
     return {
       from: "2016-01-01T00:00:00.000Z",
       to: "2026-08-07T14:00:00.000Z",
@@ -73,9 +75,10 @@ function manualJob(overrides = {}) {
   };
 }
 
-test("manual start schedules only the existing notification JobInstance lane", async () => {
+test("manual start always schedules a full-history rebuild even when legacy sync says verified", async () => {
   scheduledInput = null;
-  syncState = null;
+  buildStateSeen = undefined;
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
   const db = { jobInstance: { async findMany() { return []; } } };
   const result = await startManualNotificationScan({ db, creator, requestedByUserId: "user-1", now: new Date("2026-08-07T12:00:00.000Z") });
   assert.equal(result.action, "created");
@@ -85,12 +88,13 @@ test("manual start schedules only the existing notification JobInstance lane", a
   assert.equal(scheduledInput.params.manualNotificationScanVersion, 1);
   assert.equal(scheduledInput.params.notificationMode, "full");
   assert.equal(scheduledInput.params.analyticsRangeKey, "all");
+  assert.equal(buildStateSeen, null);
 });
 
-test("manual start resumes the same paused JobInstance without clearing its cursor", async () => {
+test("manual start resumes the same current-v6 paused JobInstance without clearing its cursor", async () => {
   const paused = manualJob({
     status: "PAUSED",
-    continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 4, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 } },
+    continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 6, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 } },
     progress: { current: 7, message: "page 7" },
     leaseRevision: 4,
   });
@@ -107,7 +111,39 @@ test("manual start resumes the same paused JobInstance without clearing its curs
   assert.equal(updateData.status, "SCHEDULED");
   assert.equal("continuation" in updateData, false);
   assert.equal("progress" in updateData, false);
-  assert.deepEqual(paused.continuation.jobContinuation, { schemaVersion: 4, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 });
+  assert.deepEqual(paused.continuation.jobContinuation, { schemaVersion: 6, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 });
+});
+
+test("manual start supersedes a paused catch-up or pre-v6 scan with a clean full-history job", async () => {
+  for (const paused of [
+    manualJob({
+      status: "PAUSED",
+      params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup" },
+      continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 6, fromId: "old-catchup" } },
+      leaseRevision: 2,
+    }),
+    manualJob({
+      status: "PAUSED",
+      params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "full" },
+      continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 5, fromId: "old-v5" } },
+      leaseRevision: 3,
+    }),
+  ]) {
+    scheduledInput = null;
+    let cancelled = null;
+    const db = {
+      jobInstance: {
+        async findMany() { return [paused]; },
+        async updateMany({ data }) { cancelled = data; return { count: 1 }; },
+      },
+    };
+    const result = await startManualNotificationScan({ db, creator, now: new Date("2026-08-07T12:00:00.000Z") });
+    assert.equal(result.action, "created");
+    assert.equal(cancelled.status, "CANCELLED");
+    assert.equal(cancelled.lastError, "superseded_by_manual_full_rebuild");
+    assert.equal(scheduledInput.params.notificationMode, "full");
+    assert.notEqual(result.job.id, paused.id);
+  }
 });
 
 test("manual stop fences a claimed lease but preserves progress and continuation", async () => {

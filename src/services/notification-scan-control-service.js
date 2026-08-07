@@ -56,6 +56,20 @@ function scanMode(job, sync) {
 function jobMessage(job) {
   return clean(object(job?.progress).message, 500);
 }
+function manualContinuationSchema(job) {
+  const envelope = object(job?.continuation);
+  const domain = envelope.driverPhase === "execute" ? object(envelope.jobContinuation) : envelope;
+  const value = Number(domain.schemaVersion);
+  return Number.isInteger(value) && value > 0 ? value : null;
+}
+function pausedManualJobNeedsFreshFull(job) {
+  const params = object(job?.params);
+  if (params.notificationMode !== "full") return true;
+  const schema = manualContinuationSchema(job);
+  // Current desktop full-history contract is v6. Pausing/resuming a pre-v6 run
+  // would preserve a cursor produced by the old ALL-only/alias-probing scanner.
+  return schema !== null && schema < 6;
+}
 
 async function recentManualJobs(db, creatorId, statuses = null, take = 40) {
   const rows = await db.jobInstance.findMany({
@@ -79,31 +93,58 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   const active = await findActiveManualJob(db, creator.id);
   if (active?.status === "PAUSED") {
-    const resumed = await db.jobInstance.update({
-      where: { id: active.id },
+    if (!pausedManualJobNeedsFreshFull(active)) {
+      const resumed = await db.jobInstance.update({
+        where: { id: active.id },
+        data: {
+          status: "SCHEDULED",
+          nextRunAt: now,
+          scheduledAt: now,
+          claimedAt: null,
+          claimedByDeviceId: null,
+          leaseUntil: null,
+          leaseTokenHash: null,
+          leaseRevision: { increment: 1 },
+          workId: null,
+          completedAt: null,
+          lastError: null,
+        },
+      });
+      return { job: resumed, action: "resumed" };
+    }
+    // Keep the old row for audit, but never resume a catch-up or pre-v6 cursor
+    // as the user's new full-history run. Supersede it and create a clean job.
+    const cancelled = await db.jobInstance.updateMany({
+      where: { id: active.id, status: "PAUSED" },
       data: {
-        status: "SCHEDULED",
-        nextRunAt: now,
-        scheduledAt: now,
+        status: "CANCELLED",
+        completedAt: now,
+        lastError: "superseded_by_manual_full_rebuild",
         claimedAt: null,
         claimedByDeviceId: null,
         leaseUntil: null,
         leaseTokenHash: null,
         leaseRevision: { increment: 1 },
         workId: null,
-        completedAt: null,
-        lastError: null,
       },
     });
-    return { job: resumed, action: "resumed" };
+    if (!cancelled.count) {
+      const current = await db.jobInstance.findUnique({ where: { id: active.id } });
+      if (current?.status === "CLAIMED") return { job: current, action: "already_running" };
+      if (current?.status === "SCHEDULED") return { job: current, action: "already_queued" };
+    }
+  } else if (active) {
+    return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
   }
-  if (active) return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
 
-  const state = await loadNotificationSyncState(db, creator.id);
+  // Creator Analytics START SCAN is an explicit full-history rebuild. Never
+  // downgrade a manual run to a short catch-up because an older collector left
+  // fullBackfillVerifiedAt behind. Catch-up remains a scheduler/live-recovery
+  // concern; the manual scanner must re-prove every native typed source.
   const manualRunToken = crypto.randomUUID();
   const params = {
     ...buildNotificationScanParams({
-      state,
+      state: null,
       now,
       reason: MANUAL_REASON,
       analyticsRangeKey: "all",
