@@ -4,9 +4,9 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 
-const SERVICE_VERSION = "notification-facts-v1-history-v6";
+const SERVICE_VERSION = "notification-facts-v1-history-v7-native-filters";
 const SCHEMA_VERSION = 5;
-const COLLECTOR_VERSION = "notifications-history-v6";
+const COLLECTOR_VERSION = "notifications-history-v7-native-filters";
 const ALL_SCHEMA_VERSION = 4;
 const ALL_COLLECTOR_VERSION = "notifications-all-v5";
 const LEGACY_SCHEMA_VERSION = 3;
