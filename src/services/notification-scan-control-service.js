@@ -9,6 +9,7 @@ const JOB_KEY = "catchup_notifications_scan";
 const MANUAL_REASON = "manual_creator_analytics_notification_scan";
 const ACTIVE_STATUSES = new Set(["SCHEDULED", "CLAIMED", "PAUSED"]);
 const OUTCOMES = new Set(["ACCEPTED", "REJECTED", "IGNORED"]);
+const MAX_AUDIT_ITEMS_PER_SOURCE_PAGE = 100;
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -198,7 +199,11 @@ async function recordNotificationScanItems({ db, job, chunk }) {
   const scanRunId = clean(chunk?.scanRunId, 80);
   if (!scanRunId || !/^[A-Za-z0-9._-]{8,80}$/.test(scanRunId)) throw new Error("Notification scan audit requires a valid scanRunId");
   const rawItems = Array.isArray(chunk?.auditItems) ? chunk.auditItems : [];
-  if (rawItems.length > 10) throw new Error("Notification scan page audit exceeds 10 rows");
+  if (rawItems.length > MAX_AUDIT_ITEMS_PER_SOURCE_PAGE) {
+    throw Object.assign(new Error(`Notification scan page audit exceeds ${MAX_AUDIT_ITEMS_PER_SOURCE_PAGE} rows`), {
+      code: "NOTIFICATION_SCAN_AUDIT_PAGE_TOO_LARGE",
+    });
+  }
   const rows = rawItems.map(normalizeAuditRow);
   if (!rows.length) return { received: 0, stored: 0 };
   const created = await db.creatorNotificationScanItem.createMany({

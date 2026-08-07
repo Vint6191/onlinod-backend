@@ -174,6 +174,57 @@ test("page audit stores typed relational columns only and remains idempotent", a
   }
 });
 
+
+test("page audit accepts OnlyFans source pages that exceed the requested limit but stay within the bounded transport cap", async () => {
+  let inserted = null;
+  const db = {
+    creatorNotificationScanItem: {
+      async createMany(input) { inserted = input; return { count: input.data.length }; },
+    },
+  };
+  const auditItems = Array.from({ length: 11 }, (_, ordinal) => ({
+    page: 1,
+    ordinal,
+    notificationId: `n-${ordinal + 1}`,
+    sourceType: "subscribed",
+    sourceSubType: "new_subscriber",
+    factType: "SUBSCRIPTION",
+    occurredAt: "2026-08-07T10:00:00.000Z",
+    fanOnlyFansUserId: `fan-${ordinal + 1}`,
+    postId: null,
+    commentId: null,
+    messageId: null,
+    amountCents: 0,
+    currency: "USD",
+    outcome: "ACCEPTED",
+    reasonCode: null,
+  }));
+  const result = await recordNotificationScanItems({
+    db,
+    job: manualJob(),
+    chunk: { scanRunId: "scan-run-1234", auditItems },
+  });
+  assert.deepEqual(result, { received: 11, stored: 11 });
+  assert.equal(inserted.data.length, 11);
+});
+
+test("page audit fails closed only above the relational ordinal/source-page cap", async () => {
+  const db = {
+    creatorNotificationScanItem: {
+      async createMany() { throw new Error("must not insert oversized page"); },
+    },
+  };
+  const auditItems = Array.from({ length: 101 }, (_, ordinal) => ({
+    page: 1, ordinal, notificationId: `n-${ordinal + 1}`, sourceType: "message", sourceSubType: "other",
+    factType: null, occurredAt: "2026-08-07T10:00:00.000Z", fanOnlyFansUserId: null, postId: null, commentId: null, messageId: null,
+    amountCents: null, currency: null, outcome: "IGNORED", reasonCode: "UNSUPPORTED_NOTIFICATION_TYPE",
+  }));
+  await assert.rejects(
+    recordNotificationScanItems({ db, job: manualJob(), chunk: { scanRunId: "scan-run-1234", auditItems } }),
+    (error) => error?.code === "NOTIFICATION_SCAN_AUDIT_PAGE_TOO_LARGE",
+  );
+});
+
 test("scanner read never presents stale legacy sync state as the current manual job", async () => {
   const job = manualJob({ status: "SCHEDULED", progress: null, startedAt: null, completedAt: null });
   syncState = {
