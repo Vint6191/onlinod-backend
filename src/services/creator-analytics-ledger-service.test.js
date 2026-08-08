@@ -13,6 +13,7 @@ const {
   ingestEarningsChunk,
   completeEarningsScan,
   ingestCampaignChunk,
+  ingestCampaignFanValueChunk,
   completeCampaignScan,
   upsertMessagesDaily,
   readCreatorLedgerOverview,
@@ -180,8 +181,8 @@ test("campaign completion proves every page batch before closing coverage", asyn
     updateMany: async ({ where }) => { inactiveWhere = where; return { count: 2 }; },
   };
   const payload = {
-    schemaVersion: 3,
-    collectorVersion: "campaigns-v4",
+    schemaVersion: 4,
+    collectorVersion: "campaigns-v5",
     scanRunId: "scan-1",
     scanStartedAt: "2026-08-06T11:00:00.000Z",
     observedAt: "2026-08-06T12:00:00.000Z",
@@ -217,8 +218,8 @@ test("campaign completion replay can promote a formerly partial audit batch", as
     payloadChecksum: null,
   };
   const payload = {
-    schemaVersion: 3,
-    collectorVersion: "campaigns-v4",
+    schemaVersion: 4,
+    collectorVersion: "campaigns-v5",
     scanRunId: "scan-2",
     scanStartedAt: "2026-08-06T11:00:00.000Z",
     observedAt: "2026-08-06T12:00:00.000Z",
@@ -257,7 +258,7 @@ test("campaign fan attribution keeps the earliest confirmed attribution date", a
   await ingestCampaignChunk({
     db: harness.db, job,
     chunk: {
-      kind: "campaign_claimers_page", schemaVersion: 3, collectorVersion: "campaigns-v4",
+      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v5",
       scanRunId: "scan-earliest", scanStartedAt: "2026-08-06T11:00:00.000Z", observedAt: "2026-08-06T12:00:00.000Z",
       batchKey: "run:scan-earliest:claimers:1", externalCampaignId: "campaign-1", campaignComplete: true, scannerRejected: 0,
       claimers: [{ user: { id: "fan-1" }, id: "claim-new", attributedAt: "2026-08-01T00:00:00.000Z" }],
@@ -282,8 +283,8 @@ test("campaign fan attribution is historical and is never pruned by a later empt
       job,
       chunk: {
         kind: "campaign_claimers_page",
-        schemaVersion: 3,
-        collectorVersion: "campaigns-v4",
+        schemaVersion: 4,
+        collectorVersion: "campaigns-v5",
         scanRunId: "scan-history",
         scanStartedAt: "2026-08-06T11:00:00.000Z",
         observedAt: "2026-08-06T12:00:00.000Z",
@@ -298,6 +299,50 @@ test("campaign fan attribution is historical and is never pruned by a later empt
   };
   assert.equal((await run(0)).pruneCalls, 0);
   assert.equal((await run(1)).pruneCalls, 0);
+});
+
+
+test("campaign fan value current snapshot stores fresh OF subscriber totals and preserves cents exactly", async () => {
+  let upsertData = null;
+  const db = {
+    $executeRawUnsafe: async () => 1,
+    creatorFan: {
+      findUnique: async () => ({ id: "fan-db-1" }),
+      update: async () => ({ id: "fan-db-1" }),
+    },
+    creatorFanValueCurrent: {
+      findUnique: async () => null,
+      upsert: async ({ create }) => { upsertData = create; return create; },
+    },
+  };
+  const result = await ingestCampaignFanValueChunk({
+    db, job, deviceId: "device-1",
+    chunk: {
+      kind: "campaign_fan_value",
+      schemaVersion: 4,
+      collectorVersion: "campaigns-v5",
+      scanRunId: "fan-value-run",
+      scanStartedAt: "2026-08-08T18:00:00.000Z",
+      observedAt: "2026-08-08T18:01:00.000Z",
+      batchKey: "run:fan-value-run:fan-value:abc",
+      fanOnlyFansUserId: "211347786",
+      available: true,
+      username: "u211347786",
+      displayName: "Benjamin",
+      totalNetCents: 187920,
+      messagesNetCents: 118480,
+      subscriptionsNetCents: 0,
+      tipsNetCents: 69440,
+      postsNetCents: 0,
+      streamsNetCents: 0,
+      lastActivityAt: "2025-05-16T16:01:25.000Z",
+    },
+  });
+  assert.equal(result.available, true);
+  assert.equal(upsertData.totalNetCents, 187920n);
+  assert.equal(upsertData.messagesNetCents, 118480n);
+  assert.equal(upsertData.tipsNetCents, 69440n);
+  assert.equal(upsertData.source, "ONLYFANS_SUBSCRIBER_PROFILE");
 });
 
 test("message-day sync records the reporting device and never closes the current UTC day", async () => {
@@ -497,8 +542,8 @@ test("chunk ingesters run inside the fenced Prisma transaction client without ne
     deviceId: "device-1",
     chunk: {
       kind: "campaigns_page",
-      schemaVersion: 3,
-      collectorVersion: "campaigns-v4",
+      schemaVersion: 4,
+      collectorVersion: "campaigns-v5",
       scanRunId: "run-fenced-campaigns",
     scanStartedAt: "2026-08-06T11:00:00.000Z",
       observedAt: "2026-08-06T12:00:00.000Z",
@@ -569,8 +614,8 @@ test("older campaign pages are superseded once a newer generation has reached in
     deviceId: "device-1",
     chunk: {
       kind: "campaigns_page",
-      schemaVersion: 3,
-      collectorVersion: "campaigns-v4",
+      schemaVersion: 4,
+      collectorVersion: "campaigns-v5",
       scanRunId: "older-run",
       scanStartedAt: "2026-08-06T11:00:00.000Z",
       observedAt: "2026-08-06T13:00:00.000Z",
@@ -597,8 +642,8 @@ test("older campaign completion cannot deactivate or overwrite coverage after a 
     job,
     deviceId: "device-1",
     result: {
-      schemaVersion: 3,
-      collectorVersion: "campaigns-v4",
+      schemaVersion: 4,
+      collectorVersion: "campaigns-v5",
       scanRunId: "older-run",
       scanStartedAt: "2026-08-06T11:00:00.000Z",
       observedAt: "2026-08-06T13:00:00.000Z",
@@ -626,8 +671,8 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
     job,
     chunk: {
       kind: "campaigns_page",
-      schemaVersion: 3,
-      collectorVersion: "campaigns-v4",
+      schemaVersion: 4,
+      collectorVersion: "campaigns-v5",
       scanRunId: "lock-run",
       scanStartedAt: "2026-08-06T11:00:00.000Z",
       observedAt: "2026-08-06T12:00:00.000Z",

@@ -6,8 +6,8 @@ const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
 
 const RANGE_DAYS = Object.freeze({ "24h": 1, "7d": 7, "30d": 30, "90d": 90, "180d": 180, "365d": 365 });
-const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v4";
-const CAMPAIGN_SCHEMA_VERSION = 3;
+const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v5";
+const CAMPAIGN_SCHEMA_VERSION = 4;
 const EARNINGS_COLLECTOR_VERSION = "earnings-v4";
 const EARNINGS_SCHEMA_VERSION = 4;
 const MESSAGES_COLLECTOR_VERSION = "local-dialog-messages-v2";
@@ -30,6 +30,11 @@ function integer(value, max = 2_147_483_647) {
 }
 function cents(value) {
   return integer(value);
+}
+function safeBigIntCents(value) {
+  if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n >= 0 ? BigInt(n) : null;
 }
 function strictDate(value) {
   return parseStrictIsoDateTime(value);
@@ -740,6 +745,92 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
   });
 }
 
+async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }) {
+  requireJob(job);
+  const payload = object(chunk);
+  if (text(payload.kind, 80) !== "campaign_fan_value") throw new Error("Unsupported campaign fan value chunk kind");
+  const batchKey = text(payload.batchKey, 500);
+  const scanRunId = text(payload.scanRunId, 120);
+  const scanStartedAt = strictDate(payload.scanStartedAt);
+  const observedAt = strictDate(payload.observedAt);
+  const onlyFansUserId = text(payload.fanOnlyFansUserId, 180);
+  if (
+    !batchKey || !scanRunId || !scanStartedAt || !observedAt || !onlyFansUserId || scanStartedAt > observedAt ||
+    payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || payload.collectorVersion !== CAMPAIGN_COLLECTOR_VERSION
+  ) {
+    throw new Error("Invalid campaign fan value chunk contract");
+  }
+  if (!batchKey.startsWith(`run:${scanRunId}:`)) throw new Error("Campaign fan value batch key does not match scan run");
+  if (payload.available !== true) {
+    return { replay: false, available: false, reasonCode: text(payload.reasonCode, 180) || "FAN_VALUE_UNAVAILABLE" };
+  }
+
+  const values = {
+    totalNetCents: safeBigIntCents(payload.totalNetCents),
+    messagesNetCents: safeBigIntCents(payload.messagesNetCents),
+    subscriptionsNetCents: safeBigIntCents(payload.subscriptionsNetCents),
+    tipsNetCents: safeBigIntCents(payload.tipsNetCents),
+    postsNetCents: safeBigIntCents(payload.postsNetCents),
+    streamsNetCents: safeBigIntCents(payload.streamsNetCents),
+  };
+  if (Object.values(values).some((value) => value === null)) throw new Error("Campaign fan value cents are invalid");
+  const lastActivityAt = payload.lastActivityAt == null ? null : strictDate(payload.lastActivityAt);
+  if (payload.lastActivityAt != null && !lastActivityAt) throw new Error("Campaign fan value lastActivityAt is invalid");
+  const username = text(payload.username, 200);
+  const displayName = text(payload.displayName, 500);
+
+  return inTransaction(db, async (tx) => {
+    await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
+    const fan = await tx.creatorFan.findUnique({
+      where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId } },
+      select: { id: true },
+    });
+    if (!fan) throw new Error("Campaign fan value references an unknown fan");
+
+    const existing = await tx.creatorFanValueCurrent.findUnique({
+      where: { creatorId_fanId: { creatorId: job.creatorId, fanId: fan.id } },
+      select: { id: true, fetchedAt: true },
+    });
+    if (existing?.fetchedAt && new Date(existing.fetchedAt).getTime() >= observedAt.getTime()) {
+      return { replay: true, available: true, fanId: fan.id, fetchedAt: existing.fetchedAt };
+    }
+
+    if (username || displayName) {
+      await tx.creatorFan.update({
+        where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId } },
+        data: {
+          ...(username ? { username } : {}),
+          ...(displayName ? { displayName } : {}),
+        },
+      });
+    }
+
+    const data = {
+      agencyId: job.agencyId,
+      creatorId: job.creatorId,
+      fanId: fan.id,
+      totalNetCents: values.totalNetCents,
+      messagesNetCents: values.messagesNetCents,
+      subscriptionsNetCents: values.subscriptionsNetCents,
+      tipsNetCents: values.tipsNetCents,
+      postsNetCents: values.postsNetCents,
+      streamsNetCents: values.streamsNetCents,
+      lastActivityAt,
+      fetchedAt: observedAt,
+      source: "ONLYFANS_SUBSCRIBER_PROFILE",
+      sourceDeviceId: deviceId || null,
+      sourceJobId: job.id,
+      scanRunId,
+    };
+    await tx.creatorFanValueCurrent.upsert({
+      where: { creatorId_fanId: { creatorId: job.creatorId, fanId: fan.id } },
+      create: data,
+      update: data,
+    });
+    return { replay: false, available: true, fanId: fan.id, fetchedAt: observedAt };
+  });
+}
+
 async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   requireJob(job);
   const payload = object(result);
@@ -758,7 +849,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   if (expectedCampaignBatches === null || expectedClaimerBatches === null || expectedCampaignCount === null) {
     throw new Error("Campaign completion counters are invalid");
   }
-  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v4`;
+  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v5`;
   if (key.length > 240) throw new Error("Campaign completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
@@ -1271,6 +1362,19 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
           displayName: true,
           firstSeenAt: true,
           lastSeenAt: true,
+          valueCurrent: {
+            select: {
+              totalNetCents: true,
+              messagesNetCents: true,
+              subscriptionsNetCents: true,
+              tipsNetCents: true,
+              postsNetCents: true,
+              streamsNetCents: true,
+              lastActivityAt: true,
+              fetchedAt: true,
+              source: true,
+            },
+          },
         },
       },
     },
@@ -1342,14 +1446,29 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
   const hasMore = rows.length > take;
   return {
     campaign,
-    fans: pageRows.map((row) => ({
-      id: row.id,
-      externalClaimerId: row.externalClaimerId,
-      attributedAt: row.attributedAt,
-      collectedAt: row.collectedAt,
-      fan: row.fan,
-      revenue: moneyByFan.get(String(row.fanId)) || zeroMoney,
-    })),
+    fans: pageRows.map((row) => {
+      const { valueCurrent, ...fan } = row.fan;
+      return {
+        id: row.id,
+        externalClaimerId: row.externalClaimerId,
+        attributedAt: row.attributedAt,
+        collectedAt: row.collectedAt,
+        fan,
+        fanValue: valueCurrent ? {
+          available: true,
+          totalNetCents: Number(valueCurrent.totalNetCents || 0),
+          messagesNetCents: Number(valueCurrent.messagesNetCents || 0),
+          subscriptionsNetCents: Number(valueCurrent.subscriptionsNetCents || 0),
+          tipsNetCents: Number(valueCurrent.tipsNetCents || 0),
+          postsNetCents: Number(valueCurrent.postsNetCents || 0),
+          streamsNetCents: Number(valueCurrent.streamsNetCents || 0),
+          lastActivityAt: valueCurrent.lastActivityAt,
+          fetchedAt: valueCurrent.fetchedAt,
+          source: valueCurrent.source,
+        } : null,
+        revenue: moneyByFan.get(String(row.fanId)) || zeroMoney,
+      };
+    }),
     pagination: { limit: take, offset: skip, returned: pageRows.length, hasMore },
   };
 }
@@ -1369,6 +1488,25 @@ async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, o
     db.creatorCampaignFan.count({ where: { creatorId } }),
   ]);
   const revenue = await readCampaignRevenue({ db, creatorId, start: null, end: null });
+  const currentValueRows = typeof db.$queryRawUnsafe === "function" ? await db.$queryRawUnsafe(`
+    SELECT
+      membership."campaignId",
+      COUNT(value."id")::bigint AS "ofValueKnownFans",
+      COUNT(*) FILTER (WHERE value."totalNetCents" > 0)::bigint AS "ofValuePayingFans",
+      COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "ofValueNetCents",
+      MAX(value."fetchedAt") AS "ofValueFetchedAt"
+    FROM "CreatorCampaignFan" AS membership
+    LEFT JOIN "CreatorFanValueCurrent" AS value
+      ON value."creatorId" = membership."creatorId" AND value."fanId" = membership."fanId"
+    WHERE membership."creatorId" = $1
+    GROUP BY membership."campaignId"
+  `, creatorId) : [];
+  const currentValueByCampaign = new Map(currentValueRows.map((row) => [String(row.campaignId), {
+    ofValueKnownFans: Number(row.ofValueKnownFans || 0),
+    ofValuePayingFans: Number(row.ofValuePayingFans || 0),
+    ofValueNetCents: Number(row.ofValueNetCents || 0),
+    ofValueFetchedAt: row.ofValueFetchedAt || null,
+  }]));
   const pageRows = rows.slice(0, take).map((row) => {
     const { _count, ...campaign } = row;
     const money = revenue.get(row.id) || {
@@ -1377,7 +1515,8 @@ async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, o
       pendingGrossCents: 0, pendingNetCents: 0, pendingTransactionsCount: 0,
       salesRevenueCents: 0, tipsRevenueCents: 0, subscriptionRevenueCents: 0,
     };
-    return { ...campaign, fansCount: Number(_count?.fans || 0), ...money };
+    const currentValue = currentValueByCampaign.get(row.id) || { ofValueKnownFans: 0, ofValuePayingFans: 0, ofValueNetCents: 0, ofValueFetchedAt: null };
+    return { ...campaign, fansCount: Number(_count?.fans || 0), ...money, ...currentValue };
   });
   const revenueSummary = [...revenue.values()].reduce((acc, item) => {
     acc.payingFans += Number(item.payingFans || 0);
@@ -1386,9 +1525,31 @@ async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, o
     acc.transactionsCount += Number(item.transactionsCount || 0);
     return acc;
   }, { payingFans: 0, settledNetCents: 0, pendingNetCents: 0, transactionsCount: 0 });
+  const currentValueSummaryRows = typeof db.$queryRawUnsafe === "function" ? await db.$queryRawUnsafe(`
+    SELECT
+      COUNT(value."id")::bigint AS "ofValueKnownFans",
+      COUNT(*) FILTER (WHERE value."totalNetCents" > 0)::bigint AS "ofValuePayingFans",
+      COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "ofValueNetCents",
+      MAX(value."fetchedAt") AS "ofValueFetchedAt"
+    FROM "CreatorFanValueCurrent" AS value
+    WHERE value."creatorId" = $1
+      AND EXISTS (
+        SELECT 1 FROM "CreatorCampaignFan" AS membership
+        WHERE membership."creatorId" = $1 AND membership."fanId" = value."fanId"
+      )
+  `, creatorId) : [];
+  const currentValueSummary = currentValueSummaryRows[0] || {};
   return {
     campaigns: pageRows,
-    summary: { campaigns: total, fans: totalFans, ...revenueSummary },
+    summary: {
+      campaigns: total,
+      fans: totalFans,
+      ...revenueSummary,
+      ofValueKnownFans: Number(currentValueSummary.ofValueKnownFans || 0),
+      ofValuePayingFans: Number(currentValueSummary.ofValuePayingFans || 0),
+      ofValueNetCents: Number(currentValueSummary.ofValueNetCents || 0),
+      ofValueFetchedAt: currentValueSummary.ofValueFetchedAt || null,
+    },
     pagination: { limit: take, offset: skip, returned: pageRows.length, total, hasMore: rows.length > take },
   };
 }
@@ -1397,6 +1558,7 @@ module.exports = {
   ingestEarningsChunk,
   completeEarningsScan,
   ingestCampaignChunk,
+  ingestCampaignFanValueChunk,
   completeCampaignScan,
   upsertMessagesDaily,
   readCreatorLedgerOverview,

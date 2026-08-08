@@ -167,6 +167,10 @@ function campaignForClient(row) {
     pendingTransactionsCount: integer(row.pendingTransactionsCount, 0),
     pendingGrossCents: Number(row.pendingGrossCents || 0),
     pendingNetCents: Number(row.pendingNetCents || 0),
+    ofValueKnownFans: integer(row.ofValueKnownFans, 0),
+    ofValuePayingFans: integer(row.ofValuePayingFans, 0),
+    ofValueNetCents: Number(row.ofValueNetCents || 0),
+    ofValueFetchedAt: iso(row.ofValueFetchedAt),
   };
 }
 
@@ -183,7 +187,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const continuation = continuationEnvelope.driverPhase === "execute" ? object(continuationEnvelope.jobContinuation) : continuationEnvelope;
   const page = await readCampaignsWithRevenue({ db, creatorId: creator.id, limit: safeLimit, offset: safeOffset });
   const campaignRows = page.campaigns.map(campaignForClient);
-  const totals = page.summary || { campaigns: campaignRows.length, fans: 0, payingFans: 0, settledNetCents: 0, pendingNetCents: 0, transactionsCount: 0 };
+  const totals = page.summary || { campaigns: campaignRows.length, fans: 0, payingFans: 0, settledNetCents: 0, pendingNetCents: 0, transactionsCount: 0, ofValueKnownFans: 0, ofValuePayingFans: 0, ofValueNetCents: 0, ofValueFetchedAt: null };
   const onlineWorkers = await countOnlineBindings(db, creator);
   const campaignRefs = Array.isArray(continuation.campaigns) ? continuation.campaigns : [];
   return {
@@ -201,6 +205,9 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     truncated: result.truncated === true || continuation.truncated === true,
     campaignScannerRejected: integer(result.campaignScannerRejected ?? continuation.campaignScannerRejected, 0, 100_000_000),
     claimerScannerRejected: integer(result.claimerScannerRejected ?? continuation.claimerScannerRejected, 0, 100_000_000),
+    fanValuesRequested: integer(result.fanValuesRequested ?? continuation.fanValuesRequested, 0, 100_000_000),
+    fanValuesFetched: integer(result.fanValuesFetched ?? continuation.fanValuesFetched, 0, 100_000_000),
+    fanValuesUnavailable: integer(result.fanValuesUnavailable ?? continuation.fanValuesUnavailable, 0, 100_000_000),
     startedAt: iso(job?.startedAt || job?.scheduledAt),
     completedAt: iso(job?.completedAt),
     lastProgressAt: iso(job?.lastProgressAt),
@@ -215,6 +222,10 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
       transactionsCount: integer(totals.transactionsCount, 0, 100_000_000),
       settledNetCents: Number(totals.settledNetCents || 0),
       pendingNetCents: Number(totals.pendingNetCents || 0),
+      ofValueKnownFans: integer(totals.ofValueKnownFans, 0, 100_000_000),
+      ofValuePayingFans: integer(totals.ofValuePayingFans, 0, 100_000_000),
+      ofValueNetCents: Number(totals.ofValueNetCents || 0),
+      ofValueFetchedAt: iso(totals.ofValueFetchedAt),
     },
     campaigns: campaignRows,
     pagination: page.pagination,

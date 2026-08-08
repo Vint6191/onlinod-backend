@@ -43,3 +43,22 @@ test("payout daily cache rebuild touches only actually changed UTC days", () => 
   assert.match(financial, /from: date, to: date/);
   assert.doesNotMatch(financial, /from: normalized\[0\]\.occurredAt, to: normalized\.at\(-1\)\.occurredAt/);
 });
+
+test("campaign scanner persists fresh OF fan value as typed current state, not on campaign membership", () => {
+  const schema = read("../prisma/schema.prisma");
+  const migration = read("../prisma/migrations/20260808184500_creator_fan_value_current_v1/migration.sql");
+  assert.match(schema, /model CreatorFanValueCurrent/);
+  assert.match(schema, /totalNetCents\s+BigInt/);
+  assert.match(schema, /messagesNetCents\s+BigInt/);
+  assert.match(schema, /subscriptionsNetCents\s+BigInt/);
+  assert.match(schema, /tipsNetCents\s+BigInt/);
+  assert.match(migration, /CREATE TABLE "CreatorFanValueCurrent"/);
+  assert.match(migration, /CreatorFanValueCurrent_agencyId_creatorId_fkey/);
+  assert.match(migration, /CreatorFanValueCurrent_creatorId_fanId_fkey/);
+  assert.match(migration, /CreatorFanValueCurrent_sourceDeviceId_fkey/);
+  assert.match(migration, /CreatorFanValueCurrent_sourceJobId_fkey/);
+  assert.match(ledger, /ingestCampaignFanValueChunk/);
+  assert.match(ledger, /ONLYFANS_SUBSCRIBER_PROFILE/);
+  assert.match(ledger, /ofValueNetCents/);
+  assert.doesNotMatch(schema.slice(schema.indexOf("model CreatorCampaignFan"), schema.indexOf("model CreatorEarningsDaily")), /totalNetCents|messagesNetCents|tipsNetCents/);
+});

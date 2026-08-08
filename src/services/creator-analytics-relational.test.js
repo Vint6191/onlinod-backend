@@ -58,13 +58,15 @@ test("campaign transport is page-oriented and notification engagement is accepte
   const resultService = fs.readFileSync(path.join(root, "src/services/job-result-service.js"), "utf8");
   assert.match(resultService, /campaigns_page/);
   assert.match(resultService, /campaign_claimers_page/);
+  assert.match(resultService, /campaign_fan_value/);
+  assert.match(resultService, /ingestCampaignFanValueChunk/);
   assert.match(resultService, /"likes", "comments"/);
   assert.match(resultService, /legacyUniqueFansKnown/);
   assert.match(resultService, /canWriteLegacySnapshot[\s\S]*legacySalesCountKnown[\s\S]*legacyUniqueFansKnown/);
   assert.match(resultService, /uniqueFans: legacyUniqueFansKnown \? summary\.uniqueFans : null/);
   const ledger = fs.readFileSync(path.join(root, "src/services/creator-analytics-ledger-service.js"), "utf8");
   assert.match(ledger, /Analytics idempotency conflict/);
-  assert.match(ledger, /campaigns-v4/);
+  assert.match(ledger, /campaigns-v5/);
   assert.match(ledger, /MESSAGES_DAILY/);
   assert.match(ledger, /LOCAL_MESSAGE_HISTORY_INCOMPLETE/);
   const routes = fs.readFileSync(path.join(root, 'src/routes/stats.js'), 'utf8');

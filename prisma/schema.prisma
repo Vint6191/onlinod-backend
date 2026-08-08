@@ -398,6 +398,7 @@ model CreatorAccount {
   notificationSyncState CreatorNotificationSyncState?
   notificationScanItems CreatorNotificationScanItem[]
   financialTransactions CreatorFinancialTransaction[]
+  fanValueCurrent CreatorFanValueCurrent[]
   earningsTotals CreatorEarningsTotal[]
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
@@ -551,6 +552,7 @@ model WorkerDevice {
   creatorMessagesDailyCollected CreatorMessagesDaily[] @relation("CreatorMessagesDailyCollectedByDevice")
   creatorPaidSubscriptionsCollected CreatorPaidSubscription[] @relation("CreatorPaidSubscriptionCollectedByDevice")
   creatorFinancialTransactionsCollected CreatorFinancialTransaction[] @relation("CreatorFinancialTransactionCollectedByDevice")
+  creatorFanValuesCollected CreatorFanValueCurrent[] @relation("CreatorFanValueCurrentCollectedByDevice")
   creatorEarningsTotalsCollected CreatorEarningsTotal[] @relation("CreatorEarningsTotalCollectedByDevice")
   creatorLocalMessageCoverage CreatorLocalMessageCoverage[]
   creatorFanLocalCoverage CreatorFanLocalCoverage[]
@@ -821,11 +823,44 @@ model CreatorFan {
   campaignMemberships CreatorCampaignFan[]
   localCoverage CreatorFanLocalCoverage[]
   financialTransactions CreatorFinancialTransaction[]
+  valueCurrent CreatorFanValueCurrent?
 
   @@unique([creatorId, onlyFansUserId])
   @@unique([creatorId, id], map: "CreatorFan_creatorId_id_key")
   @@index([agencyId, creatorId])
   @@index([creatorId, lastSeenAt])
+}
+
+model CreatorFanValueCurrent {
+  id                    String   @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  fanId                  String
+  totalNetCents          BigInt   @default(0)
+  messagesNetCents       BigInt   @default(0)
+  subscriptionsNetCents  BigInt   @default(0)
+  tipsNetCents           BigInt   @default(0)
+  postsNetCents          BigInt   @default(0)
+  streamsNetCents        BigInt   @default(0)
+  lastActivityAt         DateTime?
+  fetchedAt              DateTime
+  source                 String   @default("ONLYFANS_SUBSCRIBER_PROFILE")
+  sourceDeviceId         String?
+  sourceJobId            String?
+  scanRunId              String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  fan          CreatorFan     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: Cascade)
+  sourceDevice WorkerDevice?   @relation("CreatorFanValueCurrentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, fanId])
+  @@index([agencyId, creatorId, fetchedAt])
+  @@index([creatorId, totalNetCents])
+  @@index([sourceDeviceId])
+  @@index([sourceJobId])
 }
 
 model CreatorNotificationSyncState {
@@ -1595,6 +1630,7 @@ model JobInstance {
   creatorPaidSubscriptions CreatorPaidSubscription[]
   creatorNotificationScanItems CreatorNotificationScanItem[]
   creatorFinancialTransactions CreatorFinancialTransaction[]
+  creatorFanValues CreatorFanValueCurrent[]
   creatorEarningsTotals CreatorEarningsTotal[]
 
   @@index([status, nextRunAt])
