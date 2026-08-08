@@ -32,6 +32,8 @@ enum AnalyticsDataType {
   NOTIFICATION_LIKES
   NOTIFICATION_COMMENTS
   CAMPAIGNS
+  SALES
+  PAID_SUBSCRIPTIONS
   MESSAGES_DAILY
 }
 
@@ -84,6 +86,47 @@ enum CreatorSubscriptionEventType {
   AUTO_RENEW_ENABLED
   AUTO_RENEW_DISABLED
   REFUNDED
+}
+
+
+enum CreatorFactSource {
+  NOTIFICATION
+  LOCAL_MESSAGE_LEDGER
+  ONLYFANS_API
+  RECONCILIATION
+}
+
+enum CreatorPaidSubscriptionPaymentType {
+  INITIAL
+  RENEWAL
+  RESUBSCRIPTION
+}
+
+enum CreatorSubscriptionStateStatus {
+  UNKNOWN
+  ACTIVE
+  EXPIRED
+}
+
+enum CreatorCampaignAttributionSource {
+  ONLYFANS_TRACKING
+  NOTIFICATION
+  SUBSCRIPTION_RECORD
+  MANUAL
+  INFERRED
+}
+
+enum CreatorCampaignAttributionConfidence {
+  CONFIRMED
+  PROBABLE
+  WEAK
+}
+
+enum CreatorLocalCoverageStatus {
+  MISSING
+  PARTIAL
+  COMPLETE
+  FAILED
 }
 
 enum AuthTokenType {
@@ -319,12 +362,17 @@ model CreatorAccount {
   sales CreatorSale[]
   tips CreatorTip[]
   subscriptionEvents CreatorSubscriptionEvent[]
+  subscriptionStates CreatorSubscriptionState[]
+  paidSubscriptions CreatorPaidSubscription[]
   postLikes CreatorPostLike[]
   postComments CreatorPostComment[]
   earningsDaily CreatorEarningsDaily[]
   campaigns CreatorCampaign[]
   campaignMemberships CreatorCampaignFan[]
   messagesDaily CreatorMessagesDaily[]
+  dailyMetrics CreatorDailyMetrics[]
+  localMessageCoverage CreatorLocalMessageCoverage[]
+  fanLocalCoverage CreatorFanLocalCoverage[]
   notificationSyncState CreatorNotificationSyncState?
   notificationScanItems CreatorNotificationScanItem[]
 
@@ -477,6 +525,9 @@ model WorkerDevice {
   creatorCampaignsCollected CreatorCampaign[] @relation("CreatorCampaignCollectedByDevice")
   creatorCampaignFansCollected CreatorCampaignFan[] @relation("CreatorCampaignFanCollectedByDevice")
   creatorMessagesDailyCollected CreatorMessagesDaily[] @relation("CreatorMessagesDailyCollectedByDevice")
+  creatorPaidSubscriptionsCollected CreatorPaidSubscription[] @relation("CreatorPaidSubscriptionCollectedByDevice")
+  creatorLocalMessageCoverage CreatorLocalMessageCoverage[]
+  creatorFanLocalCoverage CreatorFanLocalCoverage[]
 
   @@index([agencyId])
   @@index([userId])
@@ -737,9 +788,12 @@ model CreatorFan {
   sales CreatorSale[]
   tips CreatorTip[]
   subscriptionEvents CreatorSubscriptionEvent[]
+  subscriptionState CreatorSubscriptionState?
+  paidSubscriptions CreatorPaidSubscription[]
   postLikes CreatorPostLike[]
   postComments CreatorPostComment[]
   campaignMemberships CreatorCampaignFan[]
+  localCoverage CreatorFanLocalCoverage[]
 
   @@unique([creatorId, onlyFansUserId])
   @@unique([creatorId, id], map: "CreatorFan_creatorId_id_key")
@@ -896,6 +950,8 @@ model CreatorSale {
   amountCents            Int
   currency               String           @default("USD")
   purchasedAt            DateTime
+  source                 CreatorFactSource @default(NOTIFICATION)
+  sourceUpdatedAt        DateTime?
   collectedAt            DateTime          @default(now())
   sourceDeviceId         String?
   sourceJobId            String?
@@ -929,6 +985,8 @@ model CreatorTip {
   amountCents            Int
   currency               String   @default("USD")
   tippedAt               DateTime
+  source                 CreatorFactSource @default(NOTIFICATION)
+  sourceUpdatedAt        DateTime?
   collectedAt            DateTime @default(now())
   sourceDeviceId         String?
   sourceJobId            String?
@@ -960,6 +1018,8 @@ model CreatorSubscriptionEvent {
   observedPriceCents     Int?
   currency               String                       @default("USD")
   occurredAt             DateTime
+  source                 CreatorFactSource             @default(NOTIFICATION)
+  sourceUpdatedAt        DateTime?
   collectedAt            DateTime                     @default(now())
   sourceDeviceId         String?
   sourceJobId            String?
@@ -970,13 +1030,80 @@ model CreatorSubscriptionEvent {
   fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorSubscriptionEventCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  stateUpdated CreatorSubscriptionState? @relation("CreatorSubscriptionStateUpdatedFrom")
+  paidSubscription CreatorPaidSubscription? @relation("CreatorPaidSubscriptionEvent")
+  campaignAttributions CreatorCampaignFan[] @relation("CreatorCampaignFanSubscriptionEvent")
 
+  @@unique([creatorId, id], map: "CreatorSubscriptionEvent_creatorId_id_key")
   @@unique([creatorId, eventFingerprint])
   @@unique([creatorId, externalNotificationId])
   @@index([creatorId, externalTransactionId])
   @@index([agencyId, creatorId, occurredAt])
   @@index([creatorId, fanId, occurredAt])
   @@index([creatorId, eventType, occurredAt])
+  @@index([sourceJobId])
+}
+
+
+model CreatorSubscriptionState {
+  id                 String                         @id @default(cuid())
+  agencyId           String
+  creatorId          String
+  fanId              String
+  status             CreatorSubscriptionStateStatus @default(UNKNOWN)
+  currentPriceCents  Int?
+  currency           String                         @default("USD")
+  startedAt          DateTime?
+  expiresAt          DateTime?
+  lastRenewedAt      DateTime?
+  endedAt            DateTime?
+  autoRenewEnabled   Boolean?
+  lastEventAt        DateTime
+  updatedFromEventId String?                         @unique
+  createdAt          DateTime                       @default(now())
+  updatedAt          DateTime                       @updatedAt
+
+  creator          CreatorAccount             @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  fan              CreatorFan                 @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  updatedFromEvent CreatorSubscriptionEvent?   @relation("CreatorSubscriptionStateUpdatedFrom", fields: [updatedFromEventId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, fanId])
+  @@index([agencyId, creatorId, status])
+  @@index([creatorId, lastEventAt])
+}
+
+model CreatorPaidSubscription {
+  id                     String                                @id @default(cuid())
+  agencyId               String
+  creatorId              String
+  fanId                   String?
+  eventFingerprint       String
+  externalTransactionId  String?
+  subscriptionEventId    String?                               @unique
+  paymentType            CreatorPaidSubscriptionPaymentType
+  amountCents            Int
+  currency               String                                @default("USD")
+  paidAt                 DateTime
+  periodFrom             DateTime?
+  periodTo               DateTime?
+  source                 CreatorFactSource                     @default(NOTIFICATION)
+  sourceUpdatedAt        DateTime?
+  collectedAt            DateTime                              @default(now())
+  sourceDeviceId         String?
+  sourceJobId            String?
+  createdAt              DateTime                              @default(now())
+  updatedAt              DateTime                              @updatedAt
+
+  creator           CreatorAccount            @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  fan               CreatorFan?               @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  subscriptionEvent CreatorSubscriptionEvent? @relation("CreatorPaidSubscriptionEvent", fields: [subscriptionEventId], references: [id], onDelete: SetNull)
+  sourceDevice      WorkerDevice?             @relation("CreatorPaidSubscriptionCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob         JobInstance?              @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, eventFingerprint])
+  @@unique([creatorId, externalTransactionId])
+  @@index([agencyId, creatorId, paidAt])
+  @@index([creatorId, fanId, paidAt])
   @@index([sourceJobId])
 }
 
@@ -1117,6 +1244,9 @@ model CreatorCampaignFan {
   fanId           String
   externalClaimerId String?
   attributedAt    DateTime?
+  attributionSource CreatorCampaignAttributionSource @default(ONLYFANS_TRACKING)
+  attributionConfidence CreatorCampaignAttributionConfidence @default(CONFIRMED)
+  subscriptionEventId String?
   sourceScanRunId String?
   sourceScanStartedAt DateTime?
   collectedAt     DateTime @default(now())
@@ -1128,12 +1258,14 @@ model CreatorCampaignFan {
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   campaign     CreatorCampaign @relation(fields: [creatorId, campaignId], references: [creatorId, id], onDelete: Cascade)
   fan          CreatorFan      @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  subscriptionEvent CreatorSubscriptionEvent? @relation("CreatorCampaignFanSubscriptionEvent", fields: [subscriptionEventId], references: [id], onDelete: SetNull)
   sourceDevice WorkerDevice?   @relation("CreatorCampaignFanCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
 
   @@unique([campaignId, fanId])
   @@index([agencyId, creatorId, campaignId])
   @@index([creatorId, fanId])
+  @@index([subscriptionEventId])
   @@index([creatorId, campaignId, sourceScanStartedAt])
   @@index([creatorId, campaignId, sourceScanRunId])
   @@index([sourceJobId])
@@ -1165,6 +1297,89 @@ model CreatorMessagesDaily {
   @@index([agencyId, creatorId, date])
   @@index([creatorId, date])
   @@index([sourceJobId])
+}
+
+
+model CreatorDailyMetrics {
+  id                         String   @id @default(cuid())
+  agencyId                   String
+  creatorId                  String
+  date                       DateTime @db.Date
+  sourceTimezone             String   @default("UTC")
+  incomingMessages           Int      @default(0)
+  outgoingMessages           Int      @default(0)
+  uniqueDialogs              Int      @default(0)
+  likes                      Int      @default(0)
+  uniqueLikingFans           Int      @default(0)
+  comments                   Int      @default(0)
+  uniqueCommentingFans       Int      @default(0)
+  newSubscribers             Int      @default(0)
+  renewals                   Int      @default(0)
+  expiredSubscribers         Int      @default(0)
+  autoRenewDisabled          Int      @default(0)
+  messageSales               Int      @default(0)
+  postSales                  Int      @default(0)
+  uniqueBuyers               Int      @default(0)
+  tipsCount                  Int      @default(0)
+  tipsCents                  Int      @default(0)
+  paidSubscriptions          Int      @default(0)
+  paidSubscriptionsCents     Int      @default(0)
+  salesCents                 Int      @default(0)
+  totalObservedRevenueCents  Int      @default(0)
+  calculatedAt               DateTime @default(now())
+  dataVersion                Int      @default(1)
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([creatorId, date, sourceTimezone])
+  @@index([agencyId, creatorId, date])
+  @@index([creatorId, date])
+}
+
+model CreatorLocalMessageCoverage {
+  id                 String                     @id @default(cuid())
+  agencyId           String
+  creatorId          String
+  deviceId           String
+  oldestMessageAt    DateTime?
+  newestMessageAt    DateTime?
+  dialogsCovered     Int                        @default(0)
+  messagesIndexed    Int                        @default(0)
+  coverageStatus     CreatorLocalCoverageStatus @default(MISSING)
+  lastVerifiedAt     DateTime
+  createdAt          DateTime                   @default(now())
+  updatedAt          DateTime                   @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  device  WorkerDevice   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, deviceId])
+  @@index([agencyId, creatorId, coverageStatus])
+  @@index([deviceId, lastVerifiedAt])
+}
+
+model CreatorFanLocalCoverage {
+  id              String   @id @default(cuid())
+  agencyId        String
+  creatorId       String
+  fanId           String
+  deviceId        String
+  oldestMessageAt DateTime?
+  newestMessageAt DateTime?
+  isComplete      Boolean  @default(false)
+  lastVerifiedAt  DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  fan     CreatorFan     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  device  WorkerDevice   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@unique([creatorId, fanId, deviceId])
+  @@index([agencyId, creatorId, isComplete])
+  @@index([deviceId, lastVerifiedAt])
 }
 
 model CreatorEarningsSnapshot {
@@ -1260,6 +1475,7 @@ model JobInstance {
   creatorCampaigns CreatorCampaign[]
   creatorCampaignFans CreatorCampaignFan[]
   creatorMessagesDaily CreatorMessagesDaily[]
+  creatorPaidSubscriptions CreatorPaidSubscription[]
   creatorNotificationScanItems CreatorNotificationScanItem[]
 
   @@index([status, nextRunAt])

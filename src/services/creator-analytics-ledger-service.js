@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
+const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
 
 const RANGE_DAYS = Object.freeze({ "24h": 1, "7d": 7, "30d": 30, "90d": 90, "180d": 180, "365d": 365 });
 const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v4";
@@ -874,7 +875,15 @@ async function upsertMessagesDaily({ db = prisma, agencyId, creatorId, rows, syn
   const knownDialogs = integer(coverageInput.knownDialogs, 10_000_000);
   const incompleteDialogs = integer(coverageInput.incompleteDialogs, 10_000_000);
   const localCoverageComplete = coverageInput.complete === true;
-  if (knownDialogs === null || incompleteDialogs === null || incompleteDialogs > knownDialogs) throw new Error("Messages daily local coverage counters are invalid");
+  const messagesIndexed = integer(coverageInput.messagesIndexed, 2_147_483_647);
+  const oldestMessageAt = coverageInput.oldestMessageAt === null || coverageInput.oldestMessageAt === undefined ? null : strictDate(coverageInput.oldestMessageAt);
+  const newestMessageAt = coverageInput.newestMessageAt === null || coverageInput.newestMessageAt === undefined ? null : strictDate(coverageInput.newestMessageAt);
+  if (knownDialogs === null || incompleteDialogs === null || incompleteDialogs > knownDialogs || messagesIndexed === null) throw new Error("Messages daily local coverage counters are invalid");
+  if ((coverageInput.oldestMessageAt !== null && coverageInput.oldestMessageAt !== undefined && !oldestMessageAt)
+    || (coverageInput.newestMessageAt !== null && coverageInput.newestMessageAt !== undefined && !newestMessageAt)
+    || (oldestMessageAt && newestMessageAt && oldestMessageAt > newestMessageAt)) {
+    throw new Error("Messages daily local coverage timestamps are invalid");
+  }
   if (localCoverageComplete !== (knownDialogs > 0 && incompleteDialogs === 0)) throw new Error("Messages daily local coverage proof is inconsistent");
   if (!cleanSyncId) throw new Error("Messages daily syncId is required");
   if (!observed) throw new Error("Messages daily observedAt must be an ISO date-time with timezone");
@@ -890,9 +899,15 @@ async function upsertMessagesDaily({ db = prisma, agencyId, creatorId, rows, syn
   }
   const rangeFrom = normalized[0]?.date || utcDay(observed);
   const rangeTo = normalized.length ? new Date(normalized.at(-1).date.getTime() + 86_400_000 - 1) : observed;
-  const payload = { rows: rawRows, syncId: cleanSyncId, observedAt: observed.toISOString(), localCoverage: { complete: localCoverageComplete, knownDialogs, incompleteDialogs } };
+  const payload = {
+    rows: rawRows, syncId: cleanSyncId, observedAt: observed.toISOString(),
+    localCoverage: {
+      complete: localCoverageComplete, knownDialogs, incompleteDialogs, messagesIndexed,
+      oldestMessageAt: oldestMessageAt?.toISOString() || null, newestMessageAt: newestMessageAt?.toISOString() || null,
+    },
+  };
   const idempotencyKey = `messages-daily:${creatorId}:${cleanSyncId}`;
-  return inTransaction(db, async (tx) => {
+  const result = await inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-messages-daily", creatorId);
     const { batch, replay } = await beginBatch(tx, {
       agencyId,
@@ -961,10 +976,29 @@ async function upsertMessagesDaily({ db = prisma, agencyId, creatorId, rows, syn
         verifiedAt: observed,
       });
     }
+    if (sourceDeviceId && tx.creatorLocalMessageCoverage) {
+      await upsertLocalMessageCoverage({
+        db: tx, agencyId, creatorId, deviceId: sourceDeviceId, complete: localCoverageComplete,
+        knownDialogs, incompleteDialogs, oldestMessageAt, newestMessageAt, messagesIndexed, verifiedAt: observed,
+      });
+    }
     const status = rejected === 0 ? "COMMITTED" : "PARTIAL";
     await finishBatch(tx, batch.id, { received: rawRows.length, inserted, updated, unchanged, rejected }, status, rejected ? "MESSAGES_DAILY_REJECTED_ROWS" : null);
-    return { received: rawRows.length, accepted: normalized.length, rejected, inserted, updated, unchanged, replay: false, localCoverageComplete, knownDialogs, incompleteDialogs };
+    return { received: rawRows.length, accepted: normalized.length, rejected, inserted, updated, unchanged, replay: false, localCoverageComplete, knownDialogs, incompleteDialogs, messagesIndexed, oldestMessageAt, newestMessageAt };
   });
+  // CreatorDailyMetrics is a disposable read cache. Rebuild only after the
+  // durable message-day transaction commits, so a cache SQL failure can never
+  // roll back primary message aggregates or local coverage metadata.
+  if (!result.replay && normalized.length && db.creatorDailyMetrics) {
+    try {
+      await rebuildCreatorDailyMetrics({
+        db, agencyId, creatorId, from: normalized[0].date, to: normalized.at(-1).date, now: observed,
+      });
+    } catch (projectionError) {
+      console.warn("[creator-analytics] daily metrics projection failed after messages ingest:", projectionError?.message || projectionError);
+    }
+  }
+  return result;
 }
 
 async function readCampaignRevenue({ db, creatorId, start, end }) {
@@ -979,13 +1013,11 @@ async function readCampaignRevenue({ db, creatorId, start, end }) {
       FROM "CreatorTip"
       WHERE "creatorId" = ${creatorId} AND "fanId" IS NOT NULL AND "tippedAt" BETWEEN ${start} AND ${end}
       UNION ALL
-      SELECT "fanId", "observedPriceCents" AS "amountCents", "occurredAt" AS occurred_at, 'subscription'::text AS kind
-      FROM "CreatorSubscriptionEvent"
+      SELECT "fanId", "amountCents", "paidAt" AS occurred_at, 'subscription'::text AS kind
+      FROM "CreatorPaidSubscription"
       WHERE "creatorId" = ${creatorId}
         AND "fanId" IS NOT NULL
-        AND "observedPriceCents" IS NOT NULL
-        AND "eventType" IN ('SUBSCRIBED_PAID', 'RENEWED', 'RESUBSCRIBED')
-        AND "occurredAt" BETWEEN ${start} AND ${end}
+        AND "paidAt" BETWEEN ${start} AND ${end}
     ), attributed AS (
       SELECT event.*, membership."campaignId"
       FROM financial_events AS event
@@ -1051,7 +1083,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
   const currentDay = utcDay(now);
   const currentDayInRange = currentDay >= range.dayStart && currentDay <= range.dayEnd;
-  const [earnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, completeEarningsDays, inProgressEarningsDays, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync] = await Promise.all([
+  const [earnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, completeEarningsDays, inProgressEarningsDays, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
     db.creatorEarningsDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }),
     db.creatorMessagesDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }),
     db.creatorPostLike.groupBy({ by: ["onlyFansPostId"], where: { creatorId, likedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
@@ -1072,6 +1104,18 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     db.creatorNotificationSyncState?.findUnique
       ? db.creatorNotificationSyncState.findUnique({ where: { creatorId } })
       : Promise.resolve(null),
+    db.creatorDailyMetrics?.findMany
+      ? db.creatorDailyMetrics.findMany({ where: { creatorId, date: dayBetween, sourceTimezone: "UTC" }, orderBy: { date: "asc" } })
+      : Promise.resolve([]),
+    db.creatorPaidSubscription?.aggregate
+      ? db.creatorPaidSubscription.aggregate({ where: { creatorId, paidAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } })
+      : Promise.resolve({ _sum: { amountCents: 0 }, _count: { _all: 0 } }),
+    db.creatorSubscriptionState?.groupBy
+      ? db.creatorSubscriptionState.groupBy({ by: ["status"], where: { creatorId }, _count: { _all: true } })
+      : Promise.resolve([]),
+    db.creatorLocalMessageCoverage?.findMany
+      ? db.creatorLocalMessageCoverage.findMany({ where: { creatorId }, orderBy: { lastVerifiedAt: "desc" } })
+      : Promise.resolve([]),
   ]);
   const earningsKeys = ["subscriptionsCents", "messagesCents", "tipsCents", "postsCents", "streamsCents", "referralsCents", "totalCents"];
   const earningsAccumulator = earnings.reduce((acc, row) => {
@@ -1123,6 +1167,8 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
       ignoredEvents: notificationSync.ignoredEvents,
       fullBackfillCompletedAt: notificationSync.fullBackfillCompletedAt,
       fullBackfillVerifiedAt: notificationSync.fullBackfillVerifiedAt,
+      oldestOccurredAt: notificationSync.oldestOccurredAt,
+      newestOccurredAt: notificationSync.newestOccurredAt,
       lastCatchupCompletedAt: notificationSync.lastCatchupCompletedAt,
       lastSocketEventAt: notificationSync.lastSocketEventAt,
       lastErrorCode: notificationSync.lastErrorCode,
@@ -1136,13 +1182,42 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
       salesCount: sales._count._all,
       tipsLedgerCents: tips._sum.amountCents || 0,
       tipsCount: tips._count._all,
+      paidSubscriptionsCents: paidSubscriptions._sum.amountCents || 0,
+      paidSubscriptionsCount: paidSubscriptions._count._all,
       likesCount,
       commentsCount,
     },
     daily: {
       earnings: earnings.map((row) => ({ ...row, date: row.date.toISOString().slice(0, 10) })),
       messages: messages.map((row) => ({ ...row, date: row.date.toISOString().slice(0, 10) })),
+      metrics: dailyMetrics.map((row) => ({ ...row, date: row.date.toISOString().slice(0, 10) })),
     },
+    availability: (() => {
+      const activityFrom = notificationSync?.oldestOccurredAt ? new Date(notificationSync.oldestOccurredAt) : null;
+      const endCandidates = [
+        notificationSync?.fullBackfillVerifiedAt,
+        notificationSync?.lastCatchupCompletedAt,
+        notificationSync?.lastSocketEventAt,
+        notificationSync?.newestOccurredAt,
+      ]
+        .filter(Boolean)
+        .map((value) => new Date(value))
+        .filter((value) => Number.isFinite(value.getTime()));
+      const activityTo = endCandidates.length
+        ? new Date(Math.max(...endCandidates.map((value) => value.getTime())))
+        : null;
+      const validFrom = activityFrom && Number.isFinite(activityFrom.getTime()) ? activityFrom : null;
+      const validRange = validFrom && activityTo && activityTo >= validFrom;
+      return {
+        activityFromAt: validFrom,
+        activityToAt: activityTo,
+        activityAvailableDays: validRange
+          ? Math.floor((activityTo.getTime() - validFrom.getTime()) / 86_400_000) + 1
+          : 0,
+      };
+    })(),
+    subscriptionStates,
+    localMessageCoverage,
     engagement: { likes, comments },
     subscriptions,
     campaigns: campaignRows,

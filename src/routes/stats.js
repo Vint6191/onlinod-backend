@@ -744,10 +744,16 @@ const messagesDailySchema = z.object({
     complete: z.boolean(),
     knownDialogs: z.number().int().nonnegative(),
     incompleteDialogs: z.number().int().nonnegative(),
+    messagesIndexed: z.number().int().nonnegative(),
+    oldestMessageAt: z.string().datetime({ offset: true }).nullable(),
+    newestMessageAt: z.string().datetime({ offset: true }).nullable(),
   }).superRefine((value, ctx) => {
     if (value.incompleteDialogs > value.knownDialogs) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "incompleteDialogs cannot exceed knownDialogs" });
     const provable = value.knownDialogs > 0 && value.incompleteDialogs === 0;
     if (value.complete !== provable) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "localCoverage.complete does not match dialog counters" });
+    if (value.oldestMessageAt && value.newestMessageAt && new Date(value.oldestMessageAt) > new Date(value.newestMessageAt)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "localCoverage oldestMessageAt cannot be after newestMessageAt" });
+    }
   }),
   rows: z.array(z.object({
     date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),

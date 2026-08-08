@@ -42,7 +42,7 @@ function matchWhere(row, where = {}) {
   return true;
 }
 function memoryDb() {
-  const store = { batches: [], fans: [], sales: [], tips: [], subscriptions: [], likes: [], comments: [], coverage: [] };
+  const store = { batches: [], fans: [], sales: [], tips: [], subscriptions: [], likes: [], comments: [], coverage: [], notificationSync: null };
   let sequence = 0;
   const nextId = (prefix) => `${prefix}-${++sequence}`;
   const clone = (value) => structuredClone(value);
@@ -114,6 +114,9 @@ function memoryDb() {
     creatorPostLike: model("like", store.likes),
     creatorPostComment: model("comment", store.comments),
     analyticsCoverage: model("coverage", store.coverage),
+    creatorNotificationSyncState: {
+      async findUnique() { return clone(store.notificationSync); },
+    },
     async $transaction(callback) { return callback(db); },
   };
   return db;
@@ -148,6 +151,15 @@ function completeResult(events, coverage = {}) {
     scanRunId, batchKey: `run:${scanRunId}:completion`, finalizeCoverage: true,
     coverage: baseCoverage,
     events,
+  };
+}
+
+function fullHistoryResult(events, coverage = {}) {
+  const result = completeResult(events, coverage);
+  return {
+    ...result,
+    collectorVersion: "notifications-history-v7-native-filters",
+    schemaVersion: 5,
   };
 }
 
@@ -842,6 +854,56 @@ test("events outside the exact requested interval are rejected", async () => {
   assert.equal(applied.status, "PARTIAL");
   assert.equal(applied.rejected, 1);
   assert.equal(db.store.tips.length, 0);
+});
+
+
+test("full-history source exhaustion records only the OnlyFans-exposed notification window", async () => {
+  const db = memoryDb();
+  db.store.notificationSync = { oldestOccurredAt: new Date("2026-02-05T10:00:00.000Z") };
+  const fullJob = job({
+    id: "job-full-retention-boundary",
+    params: {
+      from: "2025-01-01T00:00:00.000Z",
+      to: "2026-08-05T23:59:59.999Z",
+      types: ["tips"],
+      notificationMode: "full",
+    },
+  });
+  const result = fullHistoryResult([], {
+    tips: { status: "complete", reason: "source_exhausted", pages: 10, events: 0, rejected: 0 },
+  });
+  result.coverage = { tips: result.coverage.tips };
+  const applied = await ingestNotificationFacts({ job: fullJob, result, db });
+  assert.equal(applied.status, "COMMITTED");
+  assert.equal(applied.coverageComplete, true);
+  assert.ok(db.store.coverage.length > 100);
+  assert.ok(db.store.coverage.every((row) => new Date(row.coverageDate) >= new Date("2026-02-05T00:00:00.000Z")));
+  const boundary = db.store.coverage.find((row) => new Date(row.coverageDate).toISOString().slice(0, 10) === "2026-02-05");
+  assert.equal(boundary.status, "PARTIAL");
+  assert.equal(new Date(boundary.coveredFromAt).toISOString(), "2026-02-05T10:00:00.000Z");
+  const nextDay = db.store.coverage.find((row) => new Date(row.coverageDate).toISOString().slice(0, 10) === "2026-02-06");
+  assert.equal(nextDay.status, "COMPLETE");
+});
+
+test("an empty full-history stream reaches EOF without inventing pre-retention calendar coverage", async () => {
+  const db = memoryDb();
+  const fullJob = job({
+    id: "job-full-empty-retention",
+    params: {
+      from: "2025-01-01T00:00:00.000Z",
+      to: "2026-08-05T23:59:59.999Z",
+      types: ["tips"],
+      notificationMode: "full",
+    },
+  });
+  const result = fullHistoryResult([], {
+    tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 },
+  });
+  result.coverage = { tips: result.coverage.tips };
+  const applied = await ingestNotificationFacts({ job: fullJob, result, db });
+  assert.equal(applied.status, "COMMITTED");
+  assert.equal(applied.coverageComplete, true);
+  assert.equal(db.store.coverage.length, 0);
 });
 
 test("production transaction acquires the advisory lock before bulk fan/fact SQL", async () => {

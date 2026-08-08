@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
+const { projectSubscriptionFacts, rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 
 const SERVICE_VERSION = "notification-facts-v1-history-v7-native-filters";
 const SCHEMA_VERSION = 5;
@@ -345,13 +346,24 @@ function coverageIntervalsTouch(leftFrom, leftTo, rightFrom, rightTo) {
     && rightFrom.getTime() <= leftTo.getTime() + 1
     && leftFrom.getTime() <= rightTo.getTime() + 1;
 }
-function scannerEvidenceInterval(scannerCoverage, rangeFrom, rangeTo, complete) {
-  if (complete) return { from: rangeFrom, to: rangeTo };
+function scannerEvidenceInterval(scannerCoverage, rangeFrom, rangeTo, complete, sourceBoundaryAt = null, limitToSourceBoundary = false) {
+  const reason = String(scannerCoverage?.reason || "").toLowerCase();
+  if (complete) {
+    // Only a full historical notification backfill is bounded by OnlyFans'
+    // rolling source retention. Ordinary catch-up/repair jobs still prove the
+    // exact interval they explicitly requested.
+    if (limitToSourceBoundary && reason === "source_exhausted") {
+      const boundary = strictDate(sourceBoundaryAt) || strictDate(scannerCoverage?.oldestAt) || strictDate(scannerCoverage?.newestAt);
+      return boundary
+        ? { from: new Date(Math.max(rangeFrom.getTime(), boundary.getTime())), to: rangeTo }
+        : null;
+    }
+    return { from: rangeFrom, to: rangeTo };
+  }
   const oldest = strictDate(scannerCoverage?.oldestAt);
   const newest = strictDate(scannerCoverage?.newestAt);
   if (!oldest && !newest) return null;
   const from = oldest || newest;
-  const reason = String(scannerCoverage?.reason || "").toLowerCase();
   const to = ["page_limit", "event_limit", "cursor_stalled"].includes(reason)
     ? rangeTo
     : (newest || oldest);
@@ -362,13 +374,13 @@ function scannerEvidenceInterval(scannerCoverage, rangeFrom, rangeTo, complete) 
 }
 async function persistCoverageRows(tx, {
   job, batchId, type, rangeFrom, rangeTo, sourceTimezone, scannerCoverage,
-  scannerComplete, rejectedRows, now,
+  scannerComplete, rejectedRows, now, sourceBoundaryAt = null, limitToSourceBoundary = false,
 }) {
   const dataType = COVERAGE_DATA_TYPES[type];
-  const requestedDays = utcDays(rangeFrom, rangeTo);
+  const allRequestedDays = utcDays(rangeFrom, rangeTo);
   const existingRows = typeof tx.analyticsCoverage.findMany === "function"
     ? await tx.analyticsCoverage.findMany({
-        where: { creatorId: job.creatorId, dataType, coverageDate: { in: requestedDays }, sourceTimezone },
+        where: { creatorId: job.creatorId, dataType, coverageDate: { in: allRequestedDays }, sourceTimezone },
       })
     : [];
   const rawResumeCursor = object(object(job?.params).resumeCursors)[type];
@@ -380,14 +392,35 @@ async function persistCoverageRows(tx, {
   const resumeCursor = clean(rawResumeCursor, 220);
   const resumeCursorVerified = !resumeCursor || existingRows.some((row) => clean(row.sourceCursorEnd, 220) === resumeCursor);
   const effectiveScannerComplete = scannerComplete && resumeCursorVerified;
-  const evidence = scannerEvidenceInterval(scannerCoverage, rangeFrom, rangeTo, effectiveScannerComplete);
+  const effectiveEvidence = scannerEvidenceInterval(
+    scannerCoverage,
+    rangeFrom,
+    rangeTo,
+    effectiveScannerComplete,
+    sourceBoundaryAt,
+    limitToSourceBoundary,
+  );
+  const sourceExhaustedWithoutTimestamp = limitToSourceBoundary
+    && effectiveScannerComplete
+    && String(scannerCoverage?.reason || "").toLowerCase() === "source_exhausted"
+    && !effectiveEvidence;
+  if (sourceExhaustedWithoutTimestamp) {
+    // A genuinely empty full-history stream proves EOF, but it gives us no
+    // calendar timestamp from which to claim historical availability. The job
+    // may complete; AnalyticsCoverage must not invent months of empty history.
+    return { requestedIntervalComplete: true, resumeCursorVerified: true };
+  }
+
+  const requestedDays = limitToSourceBoundary && effectiveEvidence
+    ? utcDays(effectiveEvidence.from, rangeTo)
+    : allRequestedDays;
   const existingByDay = new Map(existingRows.map((row) => [new Date(row.coverageDate).toISOString().slice(0, 10), row]));
   const writes = [];
 
   for (const day of requestedDays) {
     const key = day.toISOString().slice(0, 10);
     const previous = existingByDay.get(key) || null;
-    const current = evidence ? clippedInterval(evidence.from, evidence.to, day) : null;
+    const current = effectiveEvidence ? clippedInterval(effectiveEvidence.from, effectiveEvidence.to, day) : null;
     let coveredFromAt = current?.from || null;
     let coveredToAt = current?.to || null;
     let discontiguous = false;
@@ -547,6 +580,8 @@ function buildFactData({ fact, job, deviceId, fanIds, now }) {
     ...identity,
     externalTransactionId: fact.externalTransactionId,
     currency: fact.currency,
+    source: "NOTIFICATION",
+    sourceUpdatedAt: null,
   };
   if (fact.kind === "sale") return { ...financial, saleType: fact.saleType, messageId: fact.messageId, postId: fact.postId, amountCents: fact.amountCents, purchasedAt: fact.occurredAt };
   if (fact.kind === "tip") return { ...financial, messageId: fact.messageId, amountCents: fact.amountCents, tippedAt: fact.occurredAt };
@@ -1056,6 +1091,19 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
         model: "creatorSubscriptionEvent", facts: groups.subscription, job, deviceId, fanIds, now,
         compareKeys: ["fanId", "externalNotificationId", "externalTransactionId", "eventType", "observedPriceCents", "currency", "occurredAt"],
       });
+      if (groups.subscription.length
+        && tx.creatorSubscriptionState
+        && tx.creatorPaidSubscription
+        && typeof tx.creatorSubscriptionEvent?.findMany === "function") {
+        const affectedFanIds = [...new Set(groups.subscription
+          .map((fact) => fact.externalFanId ? fanIds.get(fact.externalFanId) || null : null)
+          .filter(Boolean))];
+        if (affectedFanIds.length) {
+          await projectSubscriptionFacts({
+            db: tx, agencyId: job.agencyId, creatorId: job.creatorId, fanIds: affectedFanIds, now,
+          });
+        }
+      }
       const like = await persistFactGroup(tx, {
         model: "creatorPostLike", facts: groups.like, job, deviceId, fanIds, now,
         compareKeys: ["fanId", "externalNotificationId", "onlyFansLikeId", "onlyFansPostId", "likedAt"],
@@ -1110,6 +1158,13 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
         const coverageRangeFrom = notificationMode === "full"
           ? new Date(Math.max(rangeFrom.getTime(), rangeTo.getTime() - 369 * 24 * 60 * 60 * 1000))
           : rangeFrom;
+        const notificationSync = notificationMode === "full" && typeof tx.creatorNotificationSyncState?.findUnique === "function"
+          ? await tx.creatorNotificationSyncState.findUnique({
+              where: { creatorId: job.creatorId },
+              select: { oldestOccurredAt: true },
+            })
+          : null;
+        const sourceBoundaryAt = strictDate(notificationSync?.oldestOccurredAt);
         for (const type of requested) {
           const typeRejected = (perTypeInitialRejected[type] || 0) + (perTypePersistenceRejected[type] || 0);
           const persistedCoverage = await persistCoverageRows(tx, {
@@ -1123,6 +1178,8 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
             scannerComplete: coverageByType[type] === "complete",
             rejectedRows: typeRejected,
             now,
+            sourceBoundaryAt,
+            limitToSourceBoundary: notificationMode === "full",
           });
           if (!persistedCoverage.requestedIntervalComplete) coverageByType[type] = "partial";
         }
@@ -1151,6 +1208,35 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
       : await applyFacts(db);
 
     if (applied.replayed) return applied.response;
+    // CreatorDailyMetrics is a disposable read cache. Never roll back or reject
+    // durable primary facts because a cache rebuild failed. Full completion
+    // refreshes the exposed notification window; realtime pages refresh only
+    // their actually observed days.
+    const metricDates = facts.map((fact) => fact.occurredAt).filter(Boolean);
+    if ((finalizeCoverage || metricDates.length > 0) && db.creatorDailyMetrics) {
+      let metricsFrom = metricDates.length
+        ? new Date(Math.min(...metricDates.map((date) => date.getTime())))
+        : rangeFrom;
+      const metricsTo = finalizeCoverage
+        ? rangeTo
+        : new Date(Math.max(...metricDates.map((date) => date.getTime())));
+      if (finalizeCoverage && typeof db.creatorNotificationSyncState?.findUnique === "function") {
+        try {
+          const sync = await db.creatorNotificationSyncState.findUnique({
+            where: { creatorId: job.creatorId },
+            select: { oldestOccurredAt: true },
+          });
+          metricsFrom = strictDate(sync?.oldestOccurredAt) || metricsFrom;
+        } catch {
+          // Read-model projection remains best-effort; primary facts are already durable.
+        }
+      }
+      try {
+        await rebuildCreatorDailyMetrics({ db, agencyId: job.agencyId, creatorId: job.creatorId, from: metricsFrom, to: metricsTo, now });
+      } catch (projectionError) {
+        console.warn("[creator-analytics] daily metrics projection failed after notification ingest:", projectionError?.message || projectionError);
+      }
+    }
     return { batchId: applied.batch.id, replayed: false, status: applied.batch.status, ...applied.counts, coverageComplete: applied.complete, coverageByType: applied.coverageByType };
   } catch (error) {
     await db.analyticsIngestBatch.update({

@@ -312,7 +312,7 @@ test("message-day sync records the reporting device and never closes the current
     agencyId: "agency-1",
     creatorId: "creator-1",
     sourceDeviceId: "device-1",
-    localCoverage: { complete: true, knownDialogs: 2, incompleteDialogs: 0 },
+    localCoverage: { complete: true, knownDialogs: 2, incompleteDialogs: 0, messagesIndexed: 12, oldestMessageAt: "2026-08-01T00:00:00.000Z", newestMessageAt: "2026-08-06T17:00:00.000Z" },
     syncId: "6b9704f5-f5dc-42bd-976c-8f7c1873652f",
     observedAt: "2026-08-06T18:00:00.000Z",
     rows: [
@@ -329,6 +329,33 @@ test("message-day sync records the reporting device and never closes the current
 
 
 
+test("message-day sync commits primary facts even when disposable daily cache rebuild fails", async () => {
+  const harness = batchHarness();
+  harness.tx.creatorMessagesDaily = {
+    findUnique: async () => null,
+    upsert: async (args) => args.create,
+  };
+  harness.db.creatorDailyMetrics = { upsert: async () => { throw new Error("cache write should not be reached"); } };
+  harness.db.$queryRawUnsafe = async () => { throw new Error("simulated cache SQL failure"); };
+  const originalWarn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const result = await upsertMessagesDaily({
+      db: harness.db, agencyId: "agency-1", creatorId: "creator-1", sourceDeviceId: "device-1",
+      localCoverage: { complete: true, knownDialogs: 1, incompleteDialogs: 0, messagesIndexed: 3, oldestMessageAt: "2026-08-05T00:00:00.000Z", newestMessageAt: "2026-08-05T12:00:00.000Z" },
+      syncId: "11a15e3c-0e71-467b-85f3-4da2112fc6f4", observedAt: "2026-08-06T18:00:00.000Z",
+      rows: [{ date: "2026-08-05", sourceTimezone: "UTC", incomingMessages: 1, outgoingMessages: 2, totalMessages: 3, uniqueDialogs: 1, uniqueIncomingFans: 1, uniqueOutgoingFans: 1 }],
+    });
+    assert.equal(result.accepted, 1);
+    assert.equal(harness.updated.at(-1).status, "COMMITTED");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /daily metrics projection failed after messages ingest/);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
 test("message-day sync keeps every day partial while local history is incomplete", async () => {
   const harness = batchHarness();
   harness.tx.creatorMessagesDaily = {
@@ -337,7 +364,7 @@ test("message-day sync keeps every day partial while local history is incomplete
   };
   const result = await upsertMessagesDaily({
     db: harness.db, agencyId: "agency-1", creatorId: "creator-1", sourceDeviceId: "device-1",
-    localCoverage: { complete: false, knownDialogs: 3, incompleteDialogs: 1 },
+    localCoverage: { complete: false, knownDialogs: 3, incompleteDialogs: 1, messagesIndexed: 9, oldestMessageAt: "2026-08-01T00:00:00.000Z", newestMessageAt: "2026-08-06T17:00:00.000Z" },
     syncId: "2e8d315e-2ea0-44ad-965d-f350643786ac", observedAt: "2026-08-06T18:00:00.000Z",
     rows: [{ date: "2026-08-05", sourceTimezone: "UTC", incomingMessages: 1, outgoingMessages: 1, totalMessages: 2, uniqueDialogs: 1, uniqueIncomingFans: 1, uniqueOutgoingFans: 1 }],
   });
@@ -358,6 +385,18 @@ test("ledger overview preserves nullable earnings categories and counts only com
     creatorSubscriptionEvent: { groupBy: async () => [] },
     creatorCampaign: { findMany: async () => [{ id: "campaign-1", name: "A", isActive: true, collectedAt: date, _count: { fans: 2 } }] },
     creatorCampaignFan: { groupBy: async () => [{ campaignId: "campaign-1", _count: { _all: 1 } }] },
+    creatorNotificationSyncState: {
+      findUnique: async () => ({
+        status: "COMPLETE", mode: "full", pagesScanned: 100, eventsAccepted: 1000, eventsRejected: 0, ignoredEvents: 0,
+        fullBackfillCompletedAt: new Date("2026-08-06T11:00:00.000Z"),
+        fullBackfillVerifiedAt: new Date("2026-08-06T11:05:00.000Z"),
+        oldestOccurredAt: new Date("2026-02-05T08:00:00.000Z"),
+        newestOccurredAt: new Date("2026-08-05T22:00:00.000Z"),
+        lastCatchupCompletedAt: new Date("2026-08-06T10:00:00.000Z"),
+        lastSocketEventAt: new Date("2026-08-06T11:30:00.000Z"),
+        lastErrorCode: null, lastErrorMessage: null,
+      }),
+    },
     analyticsCoverage: {
       findMany: async () => [{ dataType: "EARNINGS", coverageDate: date, status: "COMPLETE" }],
       count: async ({ where }) => !where.dataType ? 1 : where.dataType === "EARNINGS" && where.status === "COMPLETE" ? 1 : 0,
@@ -377,6 +416,9 @@ test("ledger overview preserves nullable earnings categories and counts only com
   assert.equal(result.campaigns[0].totalRevenueCents, 1000);
   assert.equal(result.campaigns[0].unknownAttributionFans, 1);
   assert.equal(result.campaigns[0].revenueVerified, false);
+  assert.equal(result.availability.activityFromAt.toISOString(), "2026-02-05T08:00:00.000Z");
+  assert.equal(result.availability.activityToAt.toISOString(), "2026-08-06T11:30:00.000Z");
+  assert.equal(result.availability.activityAvailableDays, 183);
 });
 
 
@@ -693,7 +735,7 @@ test("an incomplete message ledger cannot downgrade a complete day from another 
     agencyId: "agency-1",
     creatorId: "creator-1",
     sourceDeviceId: "device-partial",
-    localCoverage: { complete: false, knownDialogs: 10, incompleteDialogs: 1 },
+    localCoverage: { complete: false, knownDialogs: 10, incompleteDialogs: 1, messagesIndexed: 100, oldestMessageAt: "2026-07-01T00:00:00.000Z", newestMessageAt: "2026-08-06T11:00:00.000Z" },
     syncId: "4c7df5b9-05c3-41cd-bbb7-8f793d3b255a",
     observedAt: "2026-08-06T12:00:00.000Z",
     rows: [{ date: "2026-08-05", sourceTimezone: "UTC", incomingMessages: 1, outgoingMessages: 1, totalMessages: 2, uniqueDialogs: 1, uniqueIncomingFans: 1, uniqueOutgoingFans: 1 }],
@@ -718,7 +760,7 @@ test("a complete local message proof can upgrade a newer partial row without los
     agencyId: "agency-1",
     creatorId: "creator-1",
     sourceDeviceId: "device-complete",
-    localCoverage: { complete: true, knownDialogs: 10, incompleteDialogs: 0 },
+    localCoverage: { complete: true, knownDialogs: 10, incompleteDialogs: 0, messagesIndexed: 120, oldestMessageAt: "2026-07-01T00:00:00.000Z", newestMessageAt: "2026-08-06T11:00:00.000Z" },
     syncId: "7bd268cf-dd83-457c-9757-17b5ca6b5716",
     observedAt: "2026-08-06T12:00:00.000Z",
     rows: [{ date: "2026-08-05", sourceTimezone: "UTC", incomingMessages: 2, outgoingMessages: 3, totalMessages: 5, uniqueDialogs: 2, uniqueIncomingFans: 1, uniqueOutgoingFans: 2 }],
