@@ -2,6 +2,42 @@
 -- Business analytics stays fully typed/relational. No raw notification/message
 -- payloads are added to Postgres. Local message text/media remain desktop-only.
 
+-- Recovery guard for a previously failed deployment of this exact migration.
+-- Prisma may leave a failed migration recorded and, depending on which statements
+-- reached PostgreSQL before the failure, some V2-only objects can already exist.
+-- These objects/columns are introduced only by this migration and are projections
+-- or provenance metadata, so reset them to the pre-migration state before replay.
+DROP TABLE IF EXISTS "CreatorFanLocalCoverage" CASCADE;
+DROP TABLE IF EXISTS "CreatorLocalMessageCoverage" CASCADE;
+DROP TABLE IF EXISTS "CreatorDailyMetrics" CASCADE;
+DROP TABLE IF EXISTS "CreatorPaidSubscription" CASCADE;
+DROP TABLE IF EXISTS "CreatorSubscriptionState" CASCADE;
+
+ALTER TABLE "CreatorCampaignFan"
+  DROP CONSTRAINT IF EXISTS "CreatorCampaignFan_subscriptionEvent_fkey",
+  DROP COLUMN IF EXISTS "subscriptionEventId",
+  DROP COLUMN IF EXISTS "attributionConfidence",
+  DROP COLUMN IF EXISTS "attributionSource";
+DROP INDEX IF EXISTS "CreatorCampaignFan_subscriptionEventId_idx";
+
+DROP INDEX IF EXISTS "CreatorSubscriptionEvent_creatorId_id_key";
+ALTER TABLE "CreatorSale"
+  DROP COLUMN IF EXISTS "sourceUpdatedAt",
+  DROP COLUMN IF EXISTS "source";
+ALTER TABLE "CreatorTip"
+  DROP COLUMN IF EXISTS "sourceUpdatedAt",
+  DROP COLUMN IF EXISTS "source";
+ALTER TABLE "CreatorSubscriptionEvent"
+  DROP COLUMN IF EXISTS "sourceUpdatedAt",
+  DROP COLUMN IF EXISTS "source";
+
+DROP TYPE IF EXISTS "CreatorLocalCoverageStatus";
+DROP TYPE IF EXISTS "CreatorCampaignAttributionConfidence";
+DROP TYPE IF EXISTS "CreatorCampaignAttributionSource";
+DROP TYPE IF EXISTS "CreatorSubscriptionStateStatus";
+DROP TYPE IF EXISTS "CreatorPaidSubscriptionPaymentType";
+DROP TYPE IF EXISTS "CreatorFactSource";
+
 CREATE TYPE "CreatorFactSource" AS ENUM (
   'NOTIFICATION',
   'LOCAL_MESSAGE_LEDGER',
@@ -281,41 +317,41 @@ ALTER TABLE "CreatorDailyMetrics"
 
 -- Materialize the disposable daily read cache from primary relational facts.
 WITH days AS (
-  SELECT "creatorId", "agencyId", "date" AS day FROM "CreatorMessagesDaily"
-  UNION SELECT "creatorId", "agencyId", date_trunc('day', "likedAt")::date FROM "CreatorPostLike"
-  UNION SELECT "creatorId", "agencyId", date_trunc('day', "commentedAt")::date FROM "CreatorPostComment"
-  UNION SELECT "creatorId", "agencyId", date_trunc('day', "occurredAt")::date FROM "CreatorSubscriptionEvent"
-  UNION SELECT "creatorId", "agencyId", date_trunc('day', "purchasedAt")::date FROM "CreatorSale"
-  UNION SELECT "creatorId", "agencyId", date_trunc('day', "tippedAt")::date FROM "CreatorTip"
-  UNION SELECT "creatorId", "agencyId", date_trunc('day', "paidAt")::date FROM "CreatorPaidSubscription"
+  SELECT "creatorId", "agencyId", "date" AS metric_day FROM "CreatorMessagesDaily"
+  UNION SELECT "creatorId", "agencyId", date_trunc('day', "likedAt")::date AS metric_day FROM "CreatorPostLike"
+  UNION SELECT "creatorId", "agencyId", date_trunc('day', "commentedAt")::date AS metric_day FROM "CreatorPostComment"
+  UNION SELECT "creatorId", "agencyId", date_trunc('day', "occurredAt")::date AS metric_day FROM "CreatorSubscriptionEvent"
+  UNION SELECT "creatorId", "agencyId", date_trunc('day', "purchasedAt")::date AS metric_day FROM "CreatorSale"
+  UNION SELECT "creatorId", "agencyId", date_trunc('day', "tippedAt")::date AS metric_day FROM "CreatorTip"
+  UNION SELECT "creatorId", "agencyId", date_trunc('day', "paidAt")::date AS metric_day FROM "CreatorPaidSubscription"
 ), message_agg AS (
-  SELECT "creatorId", "date" AS day, SUM("incomingMessages")::bigint incoming, SUM("outgoingMessages")::bigint outgoing, MAX("uniqueDialogs")::bigint dialogs
+  SELECT "creatorId", "date" AS metric_day, SUM("incomingMessages")::bigint incoming, SUM("outgoingMessages")::bigint outgoing, MAX("uniqueDialogs")::bigint dialogs
   FROM "CreatorMessagesDaily" GROUP BY "creatorId", "date"
 ), like_agg AS (
-  SELECT "creatorId", date_trunc('day', "likedAt")::date day, COUNT(*)::bigint count, COUNT(DISTINCT "fanId")::bigint fans
-  FROM "CreatorPostLike" GROUP BY "creatorId", day
+  SELECT "creatorId", date_trunc('day', "likedAt")::date AS metric_day, COUNT(*)::bigint count, COUNT(DISTINCT "fanId")::bigint fans
+  FROM "CreatorPostLike" GROUP BY "creatorId", date_trunc('day', "likedAt")::date
 ), comment_agg AS (
-  SELECT "creatorId", date_trunc('day', "commentedAt")::date day, COUNT(*)::bigint count, COUNT(DISTINCT "fanId")::bigint fans
-  FROM "CreatorPostComment" GROUP BY "creatorId", day
+  SELECT "creatorId", date_trunc('day', "commentedAt")::date AS metric_day, COUNT(*)::bigint count, COUNT(DISTINCT "fanId")::bigint fans
+  FROM "CreatorPostComment" GROUP BY "creatorId", date_trunc('day', "commentedAt")::date
 ), subscription_agg AS (
-  SELECT "creatorId", date_trunc('day', "occurredAt")::date day,
+  SELECT "creatorId", date_trunc('day', "occurredAt")::date AS metric_day,
     COUNT(*) FILTER (WHERE "eventType" IN ('SUBSCRIBED_FREE','SUBSCRIBED_PAID','SUBSCRIBED_UNKNOWN'))::bigint subscribed,
     COUNT(*) FILTER (WHERE "eventType"='RENEWED')::bigint renewed,
     COUNT(*) FILTER (WHERE "eventType"='EXPIRED')::bigint expired,
     COUNT(*) FILTER (WHERE "eventType"='AUTO_RENEW_DISABLED')::bigint auto_renew_disabled
-  FROM "CreatorSubscriptionEvent" GROUP BY "creatorId", day
+  FROM "CreatorSubscriptionEvent" GROUP BY "creatorId", date_trunc('day', "occurredAt")::date
 ), sale_agg AS (
-  SELECT "creatorId", date_trunc('day', "purchasedAt")::date day,
+  SELECT "creatorId", date_trunc('day', "purchasedAt")::date AS metric_day,
     COUNT(*) FILTER (WHERE "saleType"='MESSAGE')::bigint message_sales,
     COUNT(*) FILTER (WHERE "saleType"='POST')::bigint post_sales, COUNT(DISTINCT "fanId")::bigint buyers,
     COALESCE(SUM("amountCents"),0)::bigint cents
-  FROM "CreatorSale" GROUP BY "creatorId", day
+  FROM "CreatorSale" GROUP BY "creatorId", date_trunc('day', "purchasedAt")::date
 ), tip_agg AS (
-  SELECT "creatorId", date_trunc('day', "tippedAt")::date day, COUNT(*)::bigint count, COALESCE(SUM("amountCents"),0)::bigint cents
-  FROM "CreatorTip" GROUP BY "creatorId", day
+  SELECT "creatorId", date_trunc('day', "tippedAt")::date AS metric_day, COUNT(*)::bigint count, COALESCE(SUM("amountCents"),0)::bigint cents
+  FROM "CreatorTip" GROUP BY "creatorId", date_trunc('day', "tippedAt")::date
 ), paid_agg AS (
-  SELECT "creatorId", date_trunc('day', "paidAt")::date day, COUNT(*)::bigint count, COALESCE(SUM("amountCents"),0)::bigint cents
-  FROM "CreatorPaidSubscription" GROUP BY "creatorId", day
+  SELECT "creatorId", date_trunc('day', "paidAt")::date AS metric_day, COUNT(*)::bigint count, COALESCE(SUM("amountCents"),0)::bigint cents
+  FROM "CreatorPaidSubscription" GROUP BY "creatorId", date_trunc('day', "paidAt")::date
 )
 INSERT INTO "CreatorDailyMetrics" (
   "id", "agencyId", "creatorId", "date", "sourceTimezone", "incomingMessages", "outgoingMessages", "uniqueDialogs",
@@ -324,7 +360,7 @@ INSERT INTO "CreatorDailyMetrics" (
   "salesCents", "totalObservedRevenueCents", "calculatedAt", "dataVersion", "createdAt", "updatedAt"
 )
 SELECT
-  'cdm_' || md5(days."creatorId" || ':' || days.day::text), days."agencyId", days."creatorId", days.day, 'UTC',
+  'cdm_' || md5(days."creatorId" || ':' || days.metric_day::text), days."agencyId", days."creatorId", days.metric_day, 'UTC',
   COALESCE(message_agg.incoming,0), COALESCE(message_agg.outgoing,0), COALESCE(message_agg.dialogs,0),
   COALESCE(like_agg.count,0), COALESCE(like_agg.fans,0), COALESCE(comment_agg.count,0), COALESCE(comment_agg.fans,0),
   COALESCE(subscription_agg.subscribed,0), COALESCE(subscription_agg.renewed,0), COALESCE(subscription_agg.expired,0), COALESCE(subscription_agg.auto_renew_disabled,0),
@@ -333,13 +369,13 @@ SELECT
   COALESCE(sale_agg.cents,0), COALESCE(sale_agg.cents,0)+COALESCE(tip_agg.cents,0)+COALESCE(paid_agg.cents,0),
   CURRENT_TIMESTAMP, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
 FROM days
-LEFT JOIN message_agg ON message_agg."creatorId"=days."creatorId" AND message_agg.day=days.day
-LEFT JOIN like_agg ON like_agg."creatorId"=days."creatorId" AND like_agg.day=days.day
-LEFT JOIN comment_agg ON comment_agg."creatorId"=days."creatorId" AND comment_agg.day=days.day
-LEFT JOIN subscription_agg ON subscription_agg."creatorId"=days."creatorId" AND subscription_agg.day=days.day
-LEFT JOIN sale_agg ON sale_agg."creatorId"=days."creatorId" AND sale_agg.day=days.day
-LEFT JOIN tip_agg ON tip_agg."creatorId"=days."creatorId" AND tip_agg.day=days.day
-LEFT JOIN paid_agg ON paid_agg."creatorId"=days."creatorId" AND paid_agg.day=days.day
+LEFT JOIN message_agg ON message_agg."creatorId"=days."creatorId" AND message_agg.metric_day=days.metric_day
+LEFT JOIN like_agg ON like_agg."creatorId"=days."creatorId" AND like_agg.metric_day=days.metric_day
+LEFT JOIN comment_agg ON comment_agg."creatorId"=days."creatorId" AND comment_agg.metric_day=days.metric_day
+LEFT JOIN subscription_agg ON subscription_agg."creatorId"=days."creatorId" AND subscription_agg.metric_day=days.metric_day
+LEFT JOIN sale_agg ON sale_agg."creatorId"=days."creatorId" AND sale_agg.metric_day=days.metric_day
+LEFT JOIN tip_agg ON tip_agg."creatorId"=days."creatorId" AND tip_agg.metric_day=days.metric_day
+LEFT JOIN paid_agg ON paid_agg."creatorId"=days."creatorId" AND paid_agg.metric_day=days.metric_day
 ON CONFLICT ("creatorId", "date", "sourceTimezone") DO UPDATE SET
   "incomingMessages"=EXCLUDED."incomingMessages", "outgoingMessages"=EXCLUDED."outgoingMessages", "uniqueDialogs"=EXCLUDED."uniqueDialogs",
   likes=EXCLUDED.likes, "uniqueLikingFans"=EXCLUDED."uniqueLikingFans", comments=EXCLUDED.comments, "uniqueCommentingFans"=EXCLUDED."uniqueCommentingFans",
