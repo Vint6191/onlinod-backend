@@ -304,12 +304,18 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
   });
 
   if (affectedDates.length) {
-    const min = new Date(Math.min(...affectedDates.map((date) => date.getTime())));
-    const max = new Date(Math.max(...affectedDates.map((date) => date.getTime())));
-    try {
-      await rebuildCreatorDailyMetrics({ db, agencyId: job.agencyId, creatorId: job.creatorId, from: min, to: max, now });
-    } catch (error) {
-      console.warn("[creator-analytics] daily metrics projection failed after payout transaction ingest:", error?.message || error);
+    // A sparse payout page can span more than a year on low-volume historical
+    // accounts. CreatorDailyMetrics is a disposable cache, so rebuild only the
+    // UTC days that actually changed instead of filling the entire min..max
+    // interval and tripping the 370-day safety bound.
+    const uniqueDays = [...new Set(affectedDates.map((date) => date.toISOString().slice(0, 10)))].sort();
+    for (const day of uniqueDays) {
+      const date = new Date(`${day}T00:00:00.000Z`);
+      try {
+        await rebuildCreatorDailyMetrics({ db, agencyId: job.agencyId, creatorId: job.creatorId, from: date, to: date, now });
+      } catch (error) {
+        console.warn("[creator-analytics] daily metrics projection failed after payout transaction ingest:", error?.message || error);
+      }
     }
   }
 
@@ -356,24 +362,41 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const payload = object(result);
   const scanRunId = clean(payload.scanRunId, 120);
   if (!scanRunId) throw new Error("Financial transaction completion is missing scanRunId");
-  const [aggregate, count, chartTotal, storedOnly] = await Promise.all([
+  const baseWhere = { creatorId: job.creatorId, sourceJobId: job.id, scanRunId };
+  const settledWhere = { ...baseWhere, transactionStatus: "done" };
+  const [aggregate, count, settledAggregate, settledCount, chartTotal, storedOnly] = await Promise.all([
     db.creatorFinancialTransaction.aggregate({
-      where: { creatorId: job.creatorId, sourceJobId: job.id, scanRunId },
+      where: baseWhere,
       _sum: { amountCents: true, netCents: true, feeCents: true },
     }),
-    db.creatorFinancialTransaction.count({ where: { creatorId: job.creatorId, sourceJobId: job.id, scanRunId } }),
+    db.creatorFinancialTransaction.count({ where: baseWhere }),
+    db.creatorFinancialTransaction.aggregate({
+      where: settledWhere,
+      _sum: { amountCents: true, netCents: true, feeCents: true },
+    }),
+    db.creatorFinancialTransaction.count({ where: settledWhere }),
     db.creatorEarningsTotal.findUnique({ where: { creatorId_category: { creatorId: job.creatorId, category: "TOTAL" } } }),
-    db.creatorFinancialTransaction.count({ where: { creatorId: job.creatorId, sourceJobId: job.id, scanRunId, projectionStatus: "STORED_ONLY" } }),
+    db.creatorFinancialTransaction.count({ where: { ...baseWhere, projectionStatus: "STORED_ONLY" } }),
   ]);
   const grossCents = Number(aggregate?._sum?.amountCents || 0);
   const netCents = Number(aggregate?._sum?.netCents || 0);
   const feeCents = Number(aggregate?._sum?.feeCents || 0);
+  const settledGrossCents = Number(settledAggregate?._sum?.amountCents || 0);
+  const settledNetCents = Number(settledAggregate?._sum?.netCents || 0);
+  const settledFeeCents = Number(settledAggregate?._sum?.feeCents || 0);
+  const pendingCount = Math.max(0, count - settledCount);
+  const pendingGrossCents = grossCents - settledGrossCents;
+  const pendingNetCents = netCents - settledNetCents;
+  const pendingFeeCents = feeCents - settledFeeCents;
   const sourceBoundaryReached = payload.sourceBoundaryReached === true;
   const scannerRejected = integer(payload.scannerRejected, 0, 100_000_000);
   const chartReady = Boolean(chartTotal && chartTotal.sourceJobId === job.id && chartTotal.scanRunId === scanRunId);
-  const countMatched = chartReady ? count === Number(chartTotal.transactionsCount || 0) : false;
-  const grossMatched = chartReady ? grossCents === Number(chartTotal.grossCents || 0) : false;
-  const netMatched = chartReady ? netCents === Number(chartTotal.netCents || 0) : false;
+  // earnings/chart represents settled earnings. /payouts/transactions also
+  // includes loading/pending rows, so reconciliation must compare the chart to
+  // status=done only while still retaining every pending source fact.
+  const countMatched = chartReady ? settledCount === Number(chartTotal.transactionsCount || 0) : false;
+  const grossMatched = chartReady ? settledGrossCents === Number(chartTotal.grossCents || 0) : false;
+  const netMatched = chartReady ? settledNetCents === Number(chartTotal.netCents || 0) : false;
   const complete = sourceBoundaryReached && scannerRejected === 0 && chartReady && countMatched && grossMatched && netMatched;
   return {
     ok: true,
@@ -386,6 +409,14 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
     grossCents,
     netCents,
     feeCents,
+    settledTransactionsCount: settledCount,
+    settledGrossCents,
+    settledNetCents,
+    settledFeeCents,
+    pendingTransactionsCount: pendingCount,
+    pendingGrossCents,
+    pendingNetCents,
+    pendingFeeCents,
     storedOnly,
     reconciliation: {
       chartReady,

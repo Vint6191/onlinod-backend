@@ -152,16 +152,23 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
   const result = object(job?.result);
   let rows = [];
   let total = 0;
-  let summary = { transactionsCount: 0, grossCents: 0, netCents: 0, feeCents: 0, projected: 0, storedOnly: 0 };
+  let summary = {
+    transactionsCount: 0, grossCents: 0, netCents: 0, feeCents: 0, projected: 0, storedOnly: 0,
+    settledTransactionsCount: 0, settledGrossCents: 0, settledNetCents: 0,
+    pendingTransactionsCount: 0, pendingGrossCents: 0, pendingNetCents: 0,
+  };
   let typeSummary = [];
   let charts = [];
   let bounds = null;
   if (job) {
     const where = { creatorId: creator.id, sourceJobId: job.id, ...(clean(result.scanRunId, 120) ? { scanRunId: clean(result.scanRunId, 120) } : {}) };
-    const [items, count, aggregate, projectionGroups, typeGroups, chartRows, minMax] = await Promise.all([
+    const settledWhere = { ...where, transactionStatus: "done" };
+    const [items, count, aggregate, settledCount, settledAggregate, projectionGroups, typeGroups, chartRows, minMax] = await Promise.all([
       db.creatorFinancialTransaction.findMany({ where, orderBy: [{ page: "desc" }, { ordinal: "asc" }, { occurredAt: "desc" }], skip: safeOffset, take: safeLimit }),
       db.creatorFinancialTransaction.count({ where }),
       db.creatorFinancialTransaction.aggregate({ where, _sum: { amountCents: true, netCents: true, feeCents: true } }),
+      db.creatorFinancialTransaction.count({ where: settledWhere }),
+      db.creatorFinancialTransaction.aggregate({ where: settledWhere, _sum: { amountCents: true, netCents: true, feeCents: true } }),
       db.creatorFinancialTransaction.groupBy({ by: ["projectionStatus"], where, _count: { _all: true } }),
       db.creatorFinancialTransaction.groupBy({ by: ["transactionType", "factType", "projectionStatus", "reasonCode"], where, _count: { _all: true }, _sum: { amountCents: true, netCents: true } }),
       db.creatorEarningsTotal.findMany({ where: { creatorId: creator.id, sourceJobId: job.id }, orderBy: { category: "asc" } }),
@@ -169,13 +176,24 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     ]);
     rows = items.map(transactionForClient);
     total = count;
+    const grossCents = Number(aggregate?._sum?.amountCents || 0);
+    const netCents = Number(aggregate?._sum?.netCents || 0);
+    const feeCents = Number(aggregate?._sum?.feeCents || 0);
+    const settledGrossCents = Number(settledAggregate?._sum?.amountCents || 0);
+    const settledNetCents = Number(settledAggregate?._sum?.netCents || 0);
     summary = {
       transactionsCount: count,
-      grossCents: Number(aggregate?._sum?.amountCents || 0),
-      netCents: Number(aggregate?._sum?.netCents || 0),
-      feeCents: Number(aggregate?._sum?.feeCents || 0),
+      grossCents,
+      netCents,
+      feeCents,
       projected: Number(projectionGroups.find((group) => group.projectionStatus === "PROJECTED")?._count?._all || 0),
       storedOnly: Number(projectionGroups.find((group) => group.projectionStatus === "STORED_ONLY")?._count?._all || 0),
+      settledTransactionsCount: settledCount,
+      settledGrossCents,
+      settledNetCents,
+      pendingTransactionsCount: Math.max(0, count - settledCount),
+      pendingGrossCents: grossCents - settledGrossCents,
+      pendingNetCents: netCents - settledNetCents,
     };
     typeSummary = typeGroups.map((group) => ({
       transactionType: group.transactionType,
@@ -193,10 +211,26 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     bounds = minMax;
   }
   const onlineWorkers = await countOnlineBindings(db, creator);
-  const status = jobStatus(job);
   const continuationEnvelope = object(job?.continuation);
   const continuation = continuationEnvelope.driverPhase === "execute" ? object(continuationEnvelope.jobContinuation) : continuationEnvelope;
-  const reconciliation = object(result.reconciliation);
+  const totalChart = charts.find((row) => row.category === "TOTAL") || null;
+  const sourceBoundaryReached = result.sourceBoundaryReached === true;
+  const scannerRejected = integer(result.scannerRejected ?? continuation.scannerRejected, 0, 100_000_000);
+  const computedReconciliation = {
+    chartReady: Boolean(totalChart),
+    countMatched: Boolean(totalChart) && summary.settledTransactionsCount === Number(totalChart.transactionsCount || 0),
+    grossMatched: Boolean(totalChart) && summary.settledGrossCents === Number(totalChart.grossCents || 0),
+    netMatched: Boolean(totalChart) && summary.settledNetCents === Number(totalChart.netCents || 0),
+    chartCount: totalChart ? Number(totalChart.transactionsCount || 0) : null,
+    chartGrossCents: totalChart ? Number(totalChart.grossCents || 0) : null,
+    chartNetCents: totalChart ? Number(totalChart.netCents || 0) : null,
+  };
+  let status = jobStatus(job);
+  if (job?.status === "DONE") {
+    const verified = sourceBoundaryReached && scannerRejected === 0 && computedReconciliation.chartReady
+      && computedReconciliation.countMatched && computedReconciliation.grossMatched && computedReconciliation.netMatched;
+    status = verified ? "COMPLETE" : "PARTIAL";
+  }
   return {
     ok: true,
     creatorId: creator.id,
@@ -206,8 +240,8 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     phase: clean(continuation.phase, 40) || (status === "COMPLETE" || status === "PARTIAL" ? "complete" : "transactions"),
     pagesScanned: integer(continuation.page ?? progress.current, 0, 1_000_000),
     marker: clean(continuation.marker, 220),
-    sourceBoundaryReached: result.sourceBoundaryReached === true,
-    scannerRejected: integer(result.scannerRejected ?? continuation.scannerRejected, 0, 100_000_000),
+    sourceBoundaryReached,
+    scannerRejected,
     oldestOccurredAt: iso(bounds?._min?.occurredAt),
     newestOccurredAt: iso(bounds?._max?.occurredAt),
     startedAt: iso(job?.startedAt || job?.scheduledAt),
@@ -220,15 +254,7 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     summary,
     typeSummary,
     charts,
-    reconciliation: {
-      chartReady: reconciliation.chartReady === true,
-      countMatched: reconciliation.countMatched === true,
-      grossMatched: reconciliation.grossMatched === true,
-      netMatched: reconciliation.netMatched === true,
-      chartCount: reconciliation.chartCount == null ? null : integer(reconciliation.chartCount, 0, 100_000_000),
-      chartGrossCents: reconciliation.chartGrossCents == null ? null : signedInteger(reconciliation.chartGrossCents, 0, 2_147_483_647),
-      chartNetCents: reconciliation.chartNetCents == null ? null : signedInteger(reconciliation.chartNetCents, 0, 2_147_483_647),
-    },
+    reconciliation: computedReconciliation,
     items: rows,
     pagination: { limit: safeLimit, offset: safeOffset, returned: rows.length, total, hasMore: safeOffset + rows.length < total },
   };

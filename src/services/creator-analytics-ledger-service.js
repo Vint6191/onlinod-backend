@@ -1001,53 +1001,73 @@ async function upsertMessagesDaily({ db = prisma, agencyId, creatorId, rows, syn
   return result;
 }
 
-async function readCampaignRevenue({ db, creatorId, start, end }) {
-  if (typeof db.$queryRaw !== "function") return new Map();
-  const rows = await db.$queryRaw`
-    WITH financial_events AS (
-      SELECT "fanId", "amountCents", "purchasedAt" AS occurred_at, 'sale'::text AS kind
-      FROM "CreatorSale"
-      WHERE "creatorId" = ${creatorId} AND "fanId" IS NOT NULL AND "purchasedAt" BETWEEN ${start} AND ${end}
-      UNION ALL
-      SELECT "fanId", "amountCents", "tippedAt" AS occurred_at, 'tip'::text AS kind
-      FROM "CreatorTip"
-      WHERE "creatorId" = ${creatorId} AND "fanId" IS NOT NULL AND "tippedAt" BETWEEN ${start} AND ${end}
-      UNION ALL
-      SELECT "fanId", "amountCents", "paidAt" AS occurred_at, 'subscription'::text AS kind
-      FROM "CreatorPaidSubscription"
-      WHERE "creatorId" = ${creatorId}
-        AND "fanId" IS NOT NULL
-        AND "paidAt" BETWEEN ${start} AND ${end}
-    ), attributed AS (
-      SELECT event.*, membership."campaignId"
-      FROM financial_events AS event
+async function readCampaignRevenue({ db, creatorId, start = null, end = null }) {
+  const queryRaw = typeof db.$queryRawUnsafe === "function"
+    ? db.$queryRawUnsafe.bind(db)
+    : typeof db.$queryRaw === "function" ? db.$queryRaw.bind(db) : null;
+  if (!queryRaw) return new Map();
+  const rows = await queryRaw(`
+    WITH attributed AS (
+      SELECT
+        event."fanId",
+        event."amountCents",
+        event."netCents",
+        event."transactionStatus",
+        event."transactionType",
+        event."occurredAt" AS occurred_at,
+        membership."campaignId"
+      FROM "CreatorFinancialTransaction" AS event
       JOIN LATERAL (
         SELECT link."campaignId"
         FROM "CreatorCampaignFan" AS link
-        WHERE link."creatorId" = ${creatorId}
+        WHERE link."creatorId" = $1
           AND link."fanId" = event."fanId"
           AND link."attributedAt" IS NOT NULL
-          AND link."attributedAt" <= event.occurred_at
+          AND link."attributedAt" <= event."occurredAt"
         ORDER BY link."attributedAt" DESC, link."id" DESC
         LIMIT 1
       ) AS membership ON TRUE
+      WHERE event."creatorId" = $1
+        AND event."fanId" IS NOT NULL
+        AND ($2::timestamptz IS NULL OR event."occurredAt" >= $2::timestamptz)
+        AND ($3::timestamptz IS NULL OR event."occurredAt" <= $3::timestamptz)
     )
     SELECT
       "campaignId",
-      COALESCE(SUM("amountCents"), 0)::bigint AS "totalRevenueCents",
-      COALESCE(SUM("amountCents") FILTER (WHERE kind = 'sale'), 0)::bigint AS "salesRevenueCents",
-      COALESCE(SUM("amountCents") FILTER (WHERE kind = 'tip'), 0)::bigint AS "tipsRevenueCents",
-      COALESCE(SUM("amountCents") FILTER (WHERE kind = 'subscription'), 0)::bigint AS "subscriptionRevenueCents",
-      COUNT(*)::bigint AS "transactionsCount"
+      COALESCE(SUM("amountCents"), 0)::bigint AS "grossCents",
+      COALESCE(SUM("netCents"), 0)::bigint AS "netCents",
+      COUNT(*)::bigint AS "transactionsCount",
+      COUNT(DISTINCT "fanId")::bigint AS "payingFans",
+      COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledGrossCents",
+      COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledNetCents",
+      COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done')::bigint AS "settledTransactionsCount",
+      COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done'), 0)::bigint AS "pendingGrossCents",
+      COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done'), 0)::bigint AS "pendingNetCents",
+      COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done')::bigint AS "pendingTransactionsCount",
+      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" IN ('message','post','stream')), 0)::bigint AS "salesRevenueCents",
+      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" IN ('tip','tips')), 0)::bigint AS "tipsRevenueCents",
+      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" LIKE 'subscription%'), 0)::bigint AS "subscriptionRevenueCents"
     FROM attributed
     GROUP BY "campaignId"
-  `;
+  `, creatorId, start, end);
   return new Map(rows.map((row) => [String(row.campaignId), {
-    totalRevenueCents: Number(row.totalRevenueCents || 0),
+    // Preserve the old overview field name as settled NET revenue: this is the
+    // amount the creator actually earned, while gross/pending remain available
+    // explicitly for the new campaign scanner.
+    totalRevenueCents: Number(row.settledNetCents ?? row.totalRevenueCents ?? 0),
+    grossCents: Number(row.grossCents ?? row.totalRevenueCents ?? 0),
+    netCents: Number(row.netCents ?? row.totalRevenueCents ?? 0),
+    transactionsCount: Number(row.transactionsCount || 0),
+    payingFans: Number(row.payingFans || 0),
+    settledGrossCents: Number(row.settledGrossCents ?? row.totalRevenueCents ?? 0),
+    settledNetCents: Number(row.settledNetCents ?? row.totalRevenueCents ?? 0),
+    settledTransactionsCount: Number(row.settledTransactionsCount ?? row.transactionsCount ?? 0),
+    pendingGrossCents: Number(row.pendingGrossCents || 0),
+    pendingNetCents: Number(row.pendingNetCents || 0),
+    pendingTransactionsCount: Number(row.pendingTransactionsCount || 0),
     salesRevenueCents: Number(row.salesRevenueCents || 0),
     tipsRevenueCents: Number(row.tipsRevenueCents || 0),
     subscriptionRevenueCents: Number(row.subscriptionRevenueCents || 0),
-    transactionsCount: Number(row.transactionsCount || 0),
   }]));
 }
 
@@ -1234,6 +1254,12 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
     select: { id: true, externalCampaignId: true, name: true, isActive: true },
   });
   if (!campaign) return null;
+
+  // Read the page through Prisma so fan identity remains strongly typed, then
+  // aggregate money only for those fan ids. A payment belongs to the latest
+  // campaign attribution that existed before the payment, which prevents one
+  // transaction from being counted for multiple campaigns when the same fan
+  // later enters another tracking campaign.
   const rows = await db.creatorCampaignFan.findMany({
     where: { creatorId, campaignId: campaign.id },
     include: {
@@ -1252,17 +1278,118 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
     skip,
     take: take + 1,
   });
+  const pageRows = rows.slice(0, take);
+  const fanIds = pageRows.map((row) => row.fanId).filter(Boolean);
+  let moneyByFan = new Map();
+  const queryRaw = typeof db.$queryRawUnsafe === "function"
+    ? db.$queryRawUnsafe.bind(db)
+    : typeof db.$queryRaw === "function" ? db.$queryRaw.bind(db) : null;
+  if (fanIds.length && queryRaw) {
+    const moneyRows = await queryRaw(`
+      WITH attributed AS (
+        SELECT
+          event."fanId",
+          event."amountCents",
+          event."netCents",
+          event."transactionStatus",
+          membership."campaignId"
+        FROM "CreatorFinancialTransaction" AS event
+        JOIN LATERAL (
+          SELECT link."campaignId"
+          FROM "CreatorCampaignFan" AS link
+          WHERE link."creatorId" = $1
+            AND link."fanId" = event."fanId"
+            AND link."attributedAt" IS NOT NULL
+            AND link."attributedAt" <= event."occurredAt"
+          ORDER BY link."attributedAt" DESC, link."id" DESC
+          LIMIT 1
+        ) AS membership ON TRUE
+        WHERE event."creatorId" = $1
+          AND event."fanId" = ANY($3::text[])
+      )
+      SELECT
+        "fanId",
+        COALESCE(SUM("amountCents"), 0)::bigint AS "grossCents",
+        COALESCE(SUM("netCents"), 0)::bigint AS "netCents",
+        COUNT(*)::bigint AS "transactionsCount",
+        COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledGrossCents",
+        COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledNetCents",
+        COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done')::bigint AS "settledTransactionsCount",
+        COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done'), 0)::bigint AS "pendingGrossCents",
+        COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done'), 0)::bigint AS "pendingNetCents",
+        COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done')::bigint AS "pendingTransactionsCount"
+      FROM attributed
+      WHERE "campaignId" = $2
+      GROUP BY "fanId"
+    `, creatorId, campaign.id, fanIds);
+    moneyByFan = new Map(moneyRows.map((row) => [String(row.fanId), {
+      grossCents: Number(row.grossCents || 0),
+      netCents: Number(row.netCents || 0),
+      transactionsCount: Number(row.transactionsCount || 0),
+      settledGrossCents: Number(row.settledGrossCents || 0),
+      settledNetCents: Number(row.settledNetCents || 0),
+      settledTransactionsCount: Number(row.settledTransactionsCount || 0),
+      pendingGrossCents: Number(row.pendingGrossCents || 0),
+      pendingNetCents: Number(row.pendingNetCents || 0),
+      pendingTransactionsCount: Number(row.pendingTransactionsCount || 0),
+    }]));
+  }
+  const zeroMoney = {
+    grossCents: 0, netCents: 0, transactionsCount: 0,
+    settledGrossCents: 0, settledNetCents: 0, settledTransactionsCount: 0,
+    pendingGrossCents: 0, pendingNetCents: 0, pendingTransactionsCount: 0,
+  };
   const hasMore = rows.length > take;
   return {
     campaign,
-    fans: rows.slice(0, take).map((row) => ({
+    fans: pageRows.map((row) => ({
       id: row.id,
       externalClaimerId: row.externalClaimerId,
       attributedAt: row.attributedAt,
       collectedAt: row.collectedAt,
       fan: row.fan,
+      revenue: moneyByFan.get(String(row.fanId)) || zeroMoney,
     })),
-    pagination: { limit: take, offset: skip, returned: Math.min(rows.length, take), hasMore },
+    pagination: { limit: take, offset: skip, returned: pageRows.length, hasMore },
+  };
+}
+
+async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, offset = 0 }) {
+  const take = Math.max(1, Math.min(200, Number(limit) || 100));
+  const skip = Math.max(0, Math.min(1_000_000, Number(offset) || 0));
+  const [rows, total, totalFans] = await Promise.all([
+    db.creatorCampaign.findMany({
+      where: { creatorId },
+      include: { _count: { select: { fans: true } } },
+      orderBy: [{ isActive: "desc" }, { startedAt: "desc" }, { collectedAt: "desc" }, { id: "desc" }],
+      skip,
+      take: take + 1,
+    }),
+    db.creatorCampaign.count({ where: { creatorId } }),
+    db.creatorCampaignFan.count({ where: { creatorId } }),
+  ]);
+  const revenue = await readCampaignRevenue({ db, creatorId, start: null, end: null });
+  const pageRows = rows.slice(0, take).map((row) => {
+    const { _count, ...campaign } = row;
+    const money = revenue.get(row.id) || {
+      totalRevenueCents: 0, grossCents: 0, netCents: 0, transactionsCount: 0, payingFans: 0,
+      settledGrossCents: 0, settledNetCents: 0, settledTransactionsCount: 0,
+      pendingGrossCents: 0, pendingNetCents: 0, pendingTransactionsCount: 0,
+      salesRevenueCents: 0, tipsRevenueCents: 0, subscriptionRevenueCents: 0,
+    };
+    return { ...campaign, fansCount: Number(_count?.fans || 0), ...money };
+  });
+  const revenueSummary = [...revenue.values()].reduce((acc, item) => {
+    acc.payingFans += Number(item.payingFans || 0);
+    acc.settledNetCents += Number(item.settledNetCents || 0);
+    acc.pendingNetCents += Number(item.pendingNetCents || 0);
+    acc.transactionsCount += Number(item.transactionsCount || 0);
+    return acc;
+  }, { payingFans: 0, settledNetCents: 0, pendingNetCents: 0, transactionsCount: 0 });
+  return {
+    campaigns: pageRows,
+    summary: { campaigns: total, fans: totalFans, ...revenueSummary },
+    pagination: { limit: take, offset: skip, returned: pageRows.length, total, hasMore: rows.length > take },
   };
 }
 
@@ -1275,6 +1402,7 @@ module.exports = {
   readCreatorLedgerOverview,
   readCreatorCoverage,
   readCampaignFans,
+  readCampaignsWithRevenue,
   normalizeEarningsRow,
   normalizeCampaign,
   normalizeMessageDay,

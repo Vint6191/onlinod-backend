@@ -43,6 +43,11 @@ const {
   stopManualFinancialTransactionScan,
   readManualFinancialTransactionScan,
 } = require("../services/financial-transaction-scan-control-service");
+const {
+  startManualCampaignScan,
+  stopManualCampaignScan,
+  readManualCampaignScan,
+} = require("../services/campaign-scan-control-service");
 
 const router = express.Router();
 
@@ -937,6 +942,54 @@ router.post("/creators/:creatorId/financial-transaction-scan/stop", async (req, 
   } catch (error) {
     console.error("[stats/financial-transaction-scan/stop] failed:", error);
     return res.status(500).json({ ok: false, code: "FINANCIAL_TRANSACTION_SCAN_STOP_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+// Manual campaign/claimer scanner. Kept isolated from Notifications and the
+// all-in-one refresh endpoint so campaign development never replays unrelated
+// sources. The underlying fetch_campaigns collector already walks campaign
+// pages and each campaign's claimer pages to source exhaustion.
+router.get("/creators/:creatorId/campaign-scan", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
+    const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
+    return res.json(await readManualCampaignScan({ creator: ctx.creator, limit, offset }));
+  } catch (error) {
+    console.error("[stats/campaign-scan] failed:", error);
+    return res.status(500).json({ ok: false, code: "CAMPAIGN_SCAN_READ_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+router.post("/creators/:creatorId/campaign-scan/start", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
+    const started = await startManualCampaignScan({ creator: ctx.creator, requestedByUserId: actorUserId(req), now: new Date() });
+    const result = await readManualCampaignScan({ creator: ctx.creator, limit: 100, offset: 0 });
+    return res.json({ ...result, action: started.action });
+  } catch (error) {
+    console.error("[stats/campaign-scan/start] failed:", error);
+    return res.status(500).json({ ok: false, code: "CAMPAIGN_SCAN_START_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+router.post("/creators/:creatorId/campaign-scan/stop", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
+    const stopped = await stopManualCampaignScan({ creatorId: ctx.creator.id, now: new Date() });
+    const result = await readManualCampaignScan({ creator: ctx.creator, limit: 100, offset: 0 });
+    return res.json({ ...result, action: stopped.action });
+  } catch (error) {
+    console.error("[stats/campaign-scan/stop] failed:", error);
+    return res.status(500).json({ ok: false, code: "CAMPAIGN_SCAN_STOP_FAILED", error: error?.message || "Failed" });
   }
 });
 
