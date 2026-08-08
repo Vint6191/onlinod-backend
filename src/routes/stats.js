@@ -38,6 +38,11 @@ const {
   stopManualNotificationScan,
   readManualNotificationScan,
 } = require("../services/notification-scan-control-service");
+const {
+  startManualFinancialTransactionScan,
+  stopManualFinancialTransactionScan,
+  readManualFinancialTransactionScan,
+} = require("../services/financial-transaction-scan-control-service");
 
 const router = express.Router();
 
@@ -888,6 +893,52 @@ router.post("/creators/:creatorId/notification-scan/stop", async (req, res) => {
   }
 });
 
+
+// Manual all-time payout transaction scanner. It is intentionally separate
+// from Notifications so transaction experiments never rescan notification history.
+router.get("/creators/:creatorId/financial-transaction-scan", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
+    const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
+    return res.json(await readManualFinancialTransactionScan({ creator: ctx.creator, limit, offset }));
+  } catch (error) {
+    console.error("[stats/financial-transaction-scan] failed:", error);
+    return res.status(500).json({ ok: false, code: "FINANCIAL_TRANSACTION_SCAN_READ_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+router.post("/creators/:creatorId/financial-transaction-scan/start", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
+    const started = await startManualFinancialTransactionScan({ creator: ctx.creator, requestedByUserId: actorUserId(req), now: new Date() });
+    const result = await readManualFinancialTransactionScan({ creator: ctx.creator, limit: 100, offset: 0 });
+    return res.json({ ...result, action: started.action });
+  } catch (error) {
+    console.error("[stats/financial-transaction-scan/start] failed:", error);
+    return res.status(500).json({ ok: false, code: "FINANCIAL_TRANSACTION_SCAN_START_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+router.post("/creators/:creatorId/financial-transaction-scan/stop", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    if (!requireRefreshPermission(res, ctx.member)) return;
+    const stopped = await stopManualFinancialTransactionScan({ creatorId: ctx.creator.id, now: new Date() });
+    const result = await readManualFinancialTransactionScan({ creator: ctx.creator, limit: 100, offset: 0 });
+    return res.json({ ...result, action: stopped.action });
+  } catch (error) {
+    console.error("[stats/financial-transaction-scan/stop] failed:", error);
+    return res.status(500).json({ ok: false, code: "FINANCIAL_TRANSACTION_SCAN_STOP_FAILED", error: error?.message || "Failed" });
+  }
+});
 
 router.post("/creators/:creatorId/notifications/live", async (req, res) => {
   try {

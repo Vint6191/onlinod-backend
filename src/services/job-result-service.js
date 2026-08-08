@@ -6,6 +6,7 @@ const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = requ
 const { ingestNotificationFacts } = require("./notification-facts-service");
 const { recordNotificationPageProgress } = require("./notification-sync-state-service");
 const { recordNotificationScanItems } = require("./notification-scan-control-service");
+const { JOB_KEY: FINANCIAL_TRANSACTIONS_JOB_KEY, ingestFinancialTransactionsChunk, ingestFinancialChartChunk, completeFinancialTransactionsScan } = require("./financial-transactions-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
 const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
 const {
@@ -175,6 +176,12 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   // final progress call only to switch driverPhase to complete. No payload is a
   // valid no-op; never route it into a job-specific chunk parser.
   if (chunkResult === undefined || chunkResult === null) return null;
+  if (job.jobKey === FINANCIAL_TRANSACTIONS_JOB_KEY && chunkResult?.kind === "financial_transactions_page") {
+    return ingestFinancialTransactionsChunk({ db, job, deviceId, chunk: chunkResult });
+  }
+  if (job.jobKey === FINANCIAL_TRANSACTIONS_JOB_KEY && chunkResult?.kind === "financial_chart_total") {
+    return ingestFinancialChartChunk({ db, job, deviceId, chunk: chunkResult });
+  }
   if (job.jobKey === EARNINGS_JOB_KEY && chunkResult?.kind === "earnings_daily_page") {
     return ingestEarningsChunk({ db, job, deviceId, chunk: chunkResult });
   }
@@ -281,6 +288,7 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   if (job.jobKey === VAULT_UNSORTED_JOB_KEY) {
     return applyVaultUnsortedCompletion({ db, job, deviceId, userId, result: result || {} });
   }
+  if (job.jobKey === FINANCIAL_TRANSACTIONS_JOB_KEY) return completeFinancialTransactionsScan({ db, job, deviceId, result: result || {} });
   if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ db, job, deviceId, userId, result });
   if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ db, job, deviceId, userId, result });
   if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ job, deviceId, userId, result });

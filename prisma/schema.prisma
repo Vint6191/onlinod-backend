@@ -33,6 +33,7 @@ enum AnalyticsDataType {
   NOTIFICATION_COMMENTS
   CAMPAIGNS
   SALES
+  FINANCIAL_TRANSACTIONS
   PAID_SUBSCRIPTIONS
   MESSAGES_DAILY
 }
@@ -67,6 +68,27 @@ enum CreatorNotificationScanFactType {
   SUBSCRIPTION
   LIKE
   COMMENT
+}
+
+enum CreatorFinancialTransactionFactType {
+  SALE
+  TIP
+  PAID_SUBSCRIPTION
+  OTHER
+}
+
+enum CreatorFinancialTransactionProjectionStatus {
+  PROJECTED
+  STORED_ONLY
+}
+
+enum CreatorEarningsCategory {
+  TOTAL
+  SUBSCRIPTIONS
+  MESSAGES
+  TIPS
+  POSTS
+  STREAMS
 }
 
 enum CreatorSaleType {
@@ -375,6 +397,8 @@ model CreatorAccount {
   fanLocalCoverage CreatorFanLocalCoverage[]
   notificationSyncState CreatorNotificationSyncState?
   notificationScanItems CreatorNotificationScanItem[]
+  financialTransactions CreatorFinancialTransaction[]
+  earningsTotals CreatorEarningsTotal[]
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
@@ -526,6 +550,8 @@ model WorkerDevice {
   creatorCampaignFansCollected CreatorCampaignFan[] @relation("CreatorCampaignFanCollectedByDevice")
   creatorMessagesDailyCollected CreatorMessagesDaily[] @relation("CreatorMessagesDailyCollectedByDevice")
   creatorPaidSubscriptionsCollected CreatorPaidSubscription[] @relation("CreatorPaidSubscriptionCollectedByDevice")
+  creatorFinancialTransactionsCollected CreatorFinancialTransaction[] @relation("CreatorFinancialTransactionCollectedByDevice")
+  creatorEarningsTotalsCollected CreatorEarningsTotal[] @relation("CreatorEarningsTotalCollectedByDevice")
   creatorLocalMessageCoverage CreatorLocalMessageCoverage[]
   creatorFanLocalCoverage CreatorFanLocalCoverage[]
 
@@ -794,6 +820,7 @@ model CreatorFan {
   postComments CreatorPostComment[]
   campaignMemberships CreatorCampaignFan[]
   localCoverage CreatorFanLocalCoverage[]
+  financialTransactions CreatorFinancialTransaction[]
 
   @@unique([creatorId, onlyFansUserId])
   @@unique([creatorId, id], map: "CreatorFan_creatorId_id_key")
@@ -936,6 +963,78 @@ model AnalyticsCoverage {
   @@index([ingestBatchId])
 }
 
+model CreatorFinancialTransaction {
+  id                    String                                      @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  fanId                  String?
+  fanOnlyFansUserId      String?
+  externalTransactionId String
+  transactionType       String
+  factType               CreatorFinancialTransactionFactType        @default(OTHER)
+  projectionStatus       CreatorFinancialTransactionProjectionStatus @default(STORED_ONLY)
+  amountCents            Int
+  feeCents               Int?
+  netCents               Int?
+  taxCents               Int?
+  vatCents               Int?
+  mediaTaxCents          Int?
+  currency               String                                      @default("USD")
+  occurredAt             DateTime
+  transactionStatus      String?
+  sourceUpdatedAt        DateTime?
+  collectedAt            DateTime                                    @default(now())
+  sourceDeviceId         String?
+  sourceJobId            String?
+  scanRunId              String?
+  page                    Int?
+  ordinal                 Int?
+  reasonCode              String?
+  createdAt               DateTime                                    @default(now())
+  updatedAt               DateTime                                    @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  sourceDevice WorkerDevice?   @relation("CreatorFinancialTransactionCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, externalTransactionId])
+  @@index([agencyId, creatorId, occurredAt])
+  @@index([creatorId, fanId, occurredAt])
+  @@index([creatorId, transactionType, occurredAt])
+  @@index([creatorId, sourceJobId, page])
+  @@index([creatorId, scanRunId, page])
+  @@index([sourceJobId])
+}
+
+model CreatorEarningsTotal {
+  id                String                  @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  category          CreatorEarningsCategory
+  rangeFrom         DateTime
+  rangeTo           DateTime
+  grossCents        Int
+  netCents          Int
+  transactionsCount Int
+  currency          String                  @default("USD")
+  collectedAt       DateTime                @default(now())
+  sourceDeviceId    String?
+  sourceJobId       String?
+  scanRunId         String?
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  sourceDevice WorkerDevice?   @relation("CreatorEarningsTotalCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, category])
+  @@index([agencyId, creatorId, category])
+  @@index([creatorId, sourceJobId])
+  @@index([sourceJobId])
+}
+
 model CreatorSale {
   id                     String          @id @default(cuid())
   agencyId               String
@@ -948,6 +1047,12 @@ model CreatorSale {
   messageId              String?
   postId                 String?
   amountCents            Int
+  feeCents               Int?
+  netCents               Int?
+  taxCents               Int?
+  vatCents               Int?
+  mediaTaxCents          Int?
+  transactionStatus      String?
   currency               String           @default("USD")
   purchasedAt            DateTime
   source                 CreatorFactSource @default(NOTIFICATION)
@@ -983,6 +1088,12 @@ model CreatorTip {
   externalTransactionId  String?
   messageId              String?
   amountCents            Int
+  feeCents               Int?
+  netCents               Int?
+  taxCents               Int?
+  vatCents               Int?
+  mediaTaxCents          Int?
+  transactionStatus      String?
   currency               String   @default("USD")
   tippedAt               DateTime
   source                 CreatorFactSource @default(NOTIFICATION)
@@ -1082,6 +1193,12 @@ model CreatorPaidSubscription {
   subscriptionEventId    String?                               @unique
   paymentType            CreatorPaidSubscriptionPaymentType
   amountCents            Int
+  feeCents               Int?
+  netCents               Int?
+  taxCents               Int?
+  vatCents               Int?
+  mediaTaxCents          Int?
+  transactionStatus      String?
   currency               String                                @default("USD")
   paidAt                 DateTime
   periodFrom             DateTime?
@@ -1477,6 +1594,8 @@ model JobInstance {
   creatorMessagesDaily CreatorMessagesDaily[]
   creatorPaidSubscriptions CreatorPaidSubscription[]
   creatorNotificationScanItems CreatorNotificationScanItem[]
+  creatorFinancialTransactions CreatorFinancialTransaction[]
+  creatorEarningsTotals CreatorEarningsTotal[]
 
   @@index([status, nextRunAt])
   @@index([creatorId])
