@@ -67,6 +67,16 @@ test("ingest keeps unavailable-user and unknown-type transactions as durable fac
   assert.ok(sourceWrite >= 0 && projection > sourceWrite, "source transaction must be durable before business projection");
 });
 
+test("financial ingest is safe when job lease passes a Prisma TransactionClient", () => {
+  assert.match(service, /typeof db\.\$transaction === "function"/);
+  assert.match(service, /return callback\(db\)/);
+  assert.match(service, /await runInTransaction\(db, async \(tx\) =>/);
+  const ingestStart = service.indexOf("async function ingestFinancialTransactionsChunk");
+  const chartStart = service.indexOf("async function ingestFinancialChartChunk", ingestStart);
+  const ingestBody = service.slice(ingestStart, chartStart);
+  assert.doesNotMatch(ingestBody, /await db\.\$transaction\(/, "lease TransactionClient must not be nested in another transaction");
+});
+
 test("completion requires source exhaustion plus all-time chart reconciliation", () => {
   assert.match(service, /sourceBoundaryReached/);
   assert.match(service, /scannerRejected === 0/);

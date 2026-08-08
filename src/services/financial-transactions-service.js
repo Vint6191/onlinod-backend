@@ -227,6 +227,16 @@ function comparable(row) {
   ]);
 }
 
+async function runInTransaction(db, callback) {
+  // Job progress is already applied inside prisma.$transaction() and therefore
+  // passes Prisma's TransactionClient here. TransactionClient intentionally
+  // does not expose $transaction, so never try to nest one. Keep standalone
+  // callers atomic by opening a transaction only when the root Prisma client
+  // is supplied.
+  if (db && typeof db.$transaction === "function") return db.$transaction(callback);
+  return callback(db);
+}
+
 async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, chunk }) {
   if (!job?.creatorId || !job?.agencyId || !job?.id) throw new Error("Financial transaction ingest requires creator job scope");
   const scanRunId = clean(chunk?.scanRunId, 120);
@@ -250,7 +260,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
   let inserted = 0; let updated = 0; let unchanged = 0; let projected = 0; let storedOnly = 0;
   const affectedDates = [];
 
-  await db.$transaction(async (tx) => {
+  await runInTransaction(db, async (tx) => {
     const ids = accepted.map((row) => row.externalTransactionId);
     const existingRows = ids.length ? await tx.creatorFinancialTransaction.findMany({
       where: { creatorId: job.creatorId, externalTransactionId: { in: ids } },
