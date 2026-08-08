@@ -66,9 +66,10 @@ function pausedManualJobNeedsFreshFull(job) {
   const params = object(job?.params);
   if (params.notificationMode !== "full") return true;
   const schema = manualContinuationSchema(job);
-  // Current desktop full-history contract is v6. Pausing/resuming a pre-v6 run
-  // would preserve a cursor produced by the old ALL-only/alias-probing scanner.
-  return schema !== null && schema < 6;
+  // Current desktop full-history continuation contract is v7. Pausing/resuming
+  // a pre-v7 full run could preserve the old v6 final-ALL watermark completion,
+  // which did not prove that the unfiltered ALL source reached hasMore=false.
+  return schema !== null && schema < 7;
 }
 
 async function recentManualJobs(db, creatorId, statuses = null, take = 40) {
@@ -112,7 +113,7 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       });
       return { job: resumed, action: "resumed" };
     }
-    // Keep the old row for audit, but never resume a catch-up or pre-v6 cursor
+    // Keep the old row for audit, but never resume a catch-up or pre-v7 cursor
     // as the user's new full-history run. Supersede it and create a clean job.
     const cancelled = await db.jobInstance.updateMany({
       where: { id: active.id, status: "PAUSED" },

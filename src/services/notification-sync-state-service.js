@@ -129,8 +129,13 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
   const mode = result?.notificationMode === "catchup" ? "catchup" : "full";
   const existing = await loadNotificationSyncState(db, job.creatorId);
   const sourceExhausted = result?.sourceExhausted === true;
-  const verified = successful === true && sourceExhausted;
-  const sourceTraversalComplete = sourceExhausted === true;
+  const allSourceExhausted = result?.allSourceExhausted === true;
+  // A full backfill is verified only after both proof layers are complete:
+  // every typed source is exhausted by the desktop continuation and the final
+  // unfiltered ALL reconciliation independently reaches hasMore=false.
+  // Old v6 watermark completion is therefore never enough to certify FULL.
+  const sourceTraversalComplete = sourceExhausted && (mode !== "full" || allSourceExhausted);
+  const verified = successful === true && sourceTraversalComplete;
   const fullHistoryVerified = mode === "full" ? verified : Boolean(existing?.fullBackfillVerifiedAt);
   const overallComplete = verified && fullHistoryVerified;
   const data = {
@@ -154,11 +159,11 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
     sourceJobId: clean(job.id, 220),
     ...(sourceTraversalComplete && mode === "full" ? {
       fullBackfillCompletedAt: existing?.fullBackfillCompletedAt || now,
-      // A current full rebuild owns verification truth. A stale verification
-      // from the old ALL-only collector must not survive a newer partial full
-      // run, otherwise later scheduler passes incorrectly downgrade to catch-up.
       fullBackfillVerifiedAt: verified ? now : null,
     } : {}),
+    // A terminal full run owns verification truth. If it cannot prove the new
+    // six-source contract, stale proof from an older collector must be cleared.
+    ...(mode === "full" && !verified ? { fullBackfillVerifiedAt: null } : {}),
     ...(sourceTraversalComplete && mode === "catchup" ? { lastCatchupCompletedAt: now } : {}),
   };
   return db.creatorNotificationSyncState.upsert({

@@ -129,7 +129,7 @@ test("source exhaustion records completed traversal while verification remains s
   await completeNotificationSync({
     db, job, deviceId: "device-1", successful: false,
     result: {
-      notificationMode: "full", sourceExhausted: true, scanRunId: "scan-run-0001",
+      notificationMode: "full", sourceExhausted: true, allSourceExhausted: true, scanRunId: "scan-run-0001",
       headNotificationId: "head-1", tailNotificationId: "tail-1",
       coverage: { purchases: { pages: 20 } },
     },
@@ -145,7 +145,7 @@ test("source exhaustion records completed traversal while verification remains s
   await completeNotificationSync({
     db, job, deviceId: "device-1", successful: true,
     result: {
-      notificationMode: "full", sourceExhausted: true, scanRunId: "scan-run-0002",
+      notificationMode: "full", sourceExhausted: true, allSourceExhausted: true, scanRunId: "scan-run-0002",
       headNotificationId: "head-2", tailNotificationId: "tail-2",
       coverage: { purchases: { pages: 21 } },
     },
@@ -155,6 +155,27 @@ test("source exhaustion records completed traversal while verification remains s
   assert.equal(state.fullBackfillCompletedAt, completedAt);
   assert.ok(state.fullBackfillVerifiedAt instanceof Date);
   assert.ok(state.fullBackfillVerifiedAt.getTime() >= completedAt.getTime());
+});
+
+test("old full completion without ALL exhaustion cannot certify the six-source backfill", async () => {
+  const oldVerifiedAt = new Date("2026-08-01T00:00:00.000Z");
+  const db = fakeDb({
+    id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
+    scanRunId: "legacy-v6-run", fullBackfillCompletedAt: oldVerifiedAt, fullBackfillVerifiedAt: oldVerifiedAt,
+  });
+  await completeNotificationSync({
+    db, job, deviceId: "device-1", successful: true,
+    result: {
+      notificationMode: "full", sourceExhausted: true, scanRunId: "legacy-v6-run",
+      headNotificationId: "head-v6", tailNotificationId: "tail-v6",
+      coverage: { purchases: { pages: 20 } },
+    },
+  });
+  const state = db.read();
+  assert.equal(state.status, "PARTIAL");
+  assert.equal(state.fullBackfillVerifiedAt, null);
+  assert.equal(state.nextCursor, "tail-v6");
+  assert.equal(state.lastErrorCode, "NOTIFICATION_SCAN_PARTIAL");
 });
 
 test("live facts cannot falsely verify an incomplete historical backfill", async () => {
