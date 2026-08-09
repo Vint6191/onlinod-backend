@@ -76,3 +76,12 @@ test("campaign fan drill-down accepts the overview range and filters money by tr
   assert.match(ledger, /event\."occurredAt" >= \$4::timestamptz/);
   assert.match(ledger, /event\."occurredAt" <= \$5::timestamptz/);
 });
+
+test("campaign overview exposes current OF fan value even when claimer arrival timestamps are unavailable", () => {
+  assert.match(service, /readCampaignCurrentValues/);
+  assert.match(service, /CreatorFanValueCurrent/);
+  assert.match(service, /unknownAttributionFans/);
+  assert.match(service, /ofValueKnownFans/);
+  assert.match(service, /ofValuePayingFans/);
+  assert.match(service, /ofValueNetCents/);
+});
