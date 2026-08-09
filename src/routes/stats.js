@@ -693,17 +693,25 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
       }
     }
 
+    const creatorsScheduled = creators.length - failedCreators.length;
     return res.json({
       ok: true,
+      // Preserve the pre-Creator-Overview refresh contract used by Home while
+      // exposing the newer orchestration diagnostics additively. Do not rename
+      // these compatibility fields: HomeService normalizes creatorsScheduled.
       creators: creators.length,
+      creatorsScheduled,
+      creatorsRequested: creators.length,
       jobsScheduled,
       alreadyClaimed,
       analyticsCatchupsCreated,
       failedCreators,
+      failedCount: failedCreators.length,
+      failures: failedCreators.slice(0, 50),
     });
   } catch (err) {
     console.error("[stats/refresh-agency] failed:", err);
-    return res.status(500).json({ ok: false, code: "REFRESH_FAILED", error: err?.message || "Failed" });
+    return res.status(500).json({ ok: false, code: "AGENCY_REFRESH_FAILED", error: err?.message || "Failed" });
   }
 });
 

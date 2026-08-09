@@ -70,6 +70,14 @@ test("creator and agency refresh routes are guarded and agency scheduling is bou
   assert.doesNotMatch(agency, /notificationWindows\(/);
   assert.match(agency, /Promise\.allSettled/);
   assert.doesNotMatch(agency, /for \(const creator of creators\)[\s\S]*await scheduleJobNow/);
+  // Creator Analytics orchestration must stay additive to the Home dashboard
+  // API contract. HomeService still consumes creatorsScheduled/jobsScheduled/
+  // alreadyClaimed from this endpoint.
+  assert.match(agency, /creatorsScheduled/);
+  assert.match(agency, /creatorsRequested/);
+  assert.match(agency, /failedCount/);
+  assert.match(agency, /failures:/);
+  assert.match(agency, /AGENCY_REFRESH_FAILED/);
 });
 
 test("traffic reads and writes stay creator-bound and permission guarded", () => {
