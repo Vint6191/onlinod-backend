@@ -62,14 +62,16 @@ function manualContinuationSchema(job) {
   const value = Number(domain.schemaVersion);
   return Number.isInteger(value) && value > 0 ? value : null;
 }
-function pausedManualJobNeedsFreshFull(job) {
+function historicalBaselineReady(state) {
+  return Boolean(state?.fullBackfillVerifiedAt || state?.fullBackfillCompletedAt);
+}
+function pausedManualJobNeedsFreshRun(job, desiredMode) {
   const params = object(job?.params);
-  if (params.notificationMode !== "full") return true;
+  if (params.notificationMode !== desiredMode) return true;
   const schema = manualContinuationSchema(job);
-  // Current desktop continuation contract is v8. v8 adds the known-page
-  // boundary proof used by automatic catch-up. Never resume an older paused
-  // continuation under the new collector semantics; keep the row for audit and
-  // create a clean full run instead.
+  // Current desktop continuation contract is v8. v8 adds the page-level
+  // known-boundary proof. Never resume an older cursor under the new stopping
+  // semantics; keep the row for audit and create a clean run in the desired mode.
   return schema !== null && schema < 8;
 }
 
@@ -90,12 +92,37 @@ async function findActiveManualJob(db, creatorId) {
   const rows = await recentManualJobs(db, creatorId, ["SCHEDULED", "CLAIMED", "PAUSED"], 40);
   return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
 }
+async function findActiveNotificationJob(db, creatorId) {
+  const rows = await db.jobInstance.findMany({
+    where: {
+      creatorId,
+      jobKey: JOB_KEY,
+      status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] },
+    },
+    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+    take: 40,
+  });
+  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
+}
 
-async function startManualNotificationScan({ db = prisma, creator, requestedByUserId = null, now = new Date() }) {
+async function startManualNotificationScan({ db = prisma, creator, requestedByUserId = null, now = new Date(), forceFull = false }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
-  const active = await findActiveManualJob(db, creator.id);
-  if (active?.status === "PAUSED") {
-    if (!pausedManualJobNeedsFreshFull(active)) {
+  const syncState = await loadNotificationSyncState(db, creator.id);
+  const desiredMode = forceFull === true || !historicalBaselineReady(syncState) ? "full" : "catchup";
+  // START must never create a second notification walk beside an automatic
+  // initial/catch-up job. Prefer the user's manual row when present, otherwise
+  // adopt/fence the creator's already in-flight notification job.
+  const activeManual = await findActiveManualJob(db, creator.id);
+  const active = activeManual || await findActiveNotificationJob(db, creator.id);
+
+  if (active) {
+    const activeParams = object(active.params);
+    const activeMode = scanMode(active, null);
+    const sameMode = activeMode === desiredMode;
+    if (activeParams.forceNotificationFullRebuild === true && forceFull !== true) {
+      return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+    }
+    if (active.status === "PAUSED" && sameMode && !pausedManualJobNeedsFreshRun(active, desiredMode)) {
       const resumed = await db.jobInstance.update({
         where: { id: active.id },
         data: {
@@ -114,14 +141,19 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       });
       return { job: resumed, action: "resumed" };
     }
-    // Keep the old row for audit, but never resume a catch-up or pre-v8 cursor
-    // as the user's new full-history run. Supersede it and create a clean job.
+    if (active.status !== "PAUSED" && sameMode) {
+      return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+    }
+
+    // A stale manual FULL from the pre-catch-up UI must never wake up again once
+    // historical coverage already exists. Fence the old lease/cursor and create
+    // a clean run in the mode that is correct *now*.
     const cancelled = await db.jobInstance.updateMany({
-      where: { id: active.id, status: "PAUSED" },
+      where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
       data: {
         status: "CANCELLED",
         completedAt: now,
-        lastError: "superseded_by_manual_full_rebuild",
+        lastError: desiredMode === "catchup" ? "superseded_by_manual_catchup" : "superseded_by_manual_full_rebuild",
         claimedAt: null,
         claimedByDeviceId: null,
         leaseUntil: null,
@@ -135,18 +167,15 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       if (current?.status === "CLAIMED") return { job: current, action: "already_running" };
       if (current?.status === "SCHEDULED") return { job: current, action: "already_queued" };
     }
-  } else if (active) {
-    return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
   }
 
-  // Creator Analytics START SCAN is an explicit full-history rebuild. Never
-  // downgrade a manual run to a short catch-up because an older collector left
-  // fullBackfillVerifiedAt behind. Catch-up remains a scheduler/live-recovery
-  // concern; the manual scanner must re-prove every native typed source.
+  // START SCAN means "refresh notification facts". Once a historical baseline
+  // exists, that is a bounded HEAD catch-up. A deliberate destructive/full
+  // re-proof must opt in with forceFull; the ordinary UI never does so.
   const manualRunToken = crypto.randomUUID();
   const params = {
     ...buildNotificationScanParams({
-      state: null,
+      state: desiredMode === "catchup" ? syncState : null,
       now,
       reason: MANUAL_REASON,
       analyticsRangeKey: "all",
@@ -154,6 +183,7 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
     manualNotificationScan: true,
     manualNotificationScanVersion: 1,
     manualRunToken,
+    ...(forceFull === true ? { forceNotificationFullRebuild: true } : {}),
     requestedByUserId: clean(requestedByUserId, 220),
   };
   const scheduled = await scheduleJobNow({

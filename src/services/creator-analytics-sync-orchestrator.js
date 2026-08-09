@@ -67,6 +67,12 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
 function notificationHistoricalBaselineReady(state) {
   return Boolean(state?.fullBackfillVerifiedAt || state?.fullBackfillCompletedAt);
 }
+function notificationJobMode(params) {
+  // Desktop has always treated anything except an explicit catch-up marker as
+  // FULL. Mirror that fail-closed legacy contract on the backend so old queued
+  // rows with no notificationMode can never bypass the redundant-FULL fence.
+  return object(params).notificationMode === "catchup" ? "catchup" : "full";
+}
 
 async function cancelRedundantInitialNotificationJobs(db, creatorId, now = new Date()) {
   if (!db?.jobInstance?.findMany || !db?.jobInstance?.updateMany) return 0;
@@ -82,10 +88,10 @@ async function cancelRedundantInitialNotificationJobs(db, creatorId, now = new D
   let cancelled = 0;
   for (const job of rows) {
     const params = object(job.params);
-    // Never cancel a full rebuild the user explicitly started from the debug UI.
-    // Old automatic full jobs from pre-orchestrator builds may not have
-    // analyticsSyncKind at all, so manualNotificationScan is the reliable fence.
-    if (params.manualNotificationScan === true || params.notificationMode !== "full") continue;
+    // Once historical coverage exists, any ordinary FULL is redundant even if
+    // it came from the old manual scanner. Only a new, explicit force-full
+    // request is allowed to cross this fence.
+    if (params.forceNotificationFullRebuild === true || notificationJobMode(params) !== "full") continue;
     const result = await db.jobInstance.updateMany({
       where: { id: job.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
       data: {
@@ -189,8 +195,11 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
 async function recentKnownNotificationIds(db, creatorId) {
   if (!db?.creatorNotificationScanItem?.findMany) return [];
   const rows = await db.creatorNotificationScanItem.findMany({
-    where: { creatorId, notificationId: { not: null } },
-    orderBy: [{ createdAt: "desc" }],
+    where: { creatorId, notificationId: { not: null }, occurredAt: { not: null } },
+    // createdAt is ingest time and a fresh historical scan can make ancient
+    // notifications look "recent". The catch-up frontier must follow OF event
+    // time, otherwise the known-ID set can point at the tail of history.
+    orderBy: [{ occurredAt: "desc" }, { createdAt: "desc" }],
     take: 2_000,
     select: { notificationId: true },
   });

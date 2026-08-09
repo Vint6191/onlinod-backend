@@ -705,3 +705,86 @@ test("partial campaign proof is rescheduled instead of publishing DONE", async (
   assert.equal(updates[1].data.lastError, "fetch_campaigns_partial");
   assert.equal(result.job.status, "SCHEDULED");
 });
+
+test("claim fence cancels a legacy no-mode notification FULL once historical baseline exists", async () => {
+  const now = new Date();
+  const candidate = {
+    id: "legacy-no-mode-full", jobKey: "catchup_notifications_scan", scope: "creator", creatorId: "creator-1", agencyId: "agency-1",
+    idempotencyKey: "legacy-no-mode", params: { reason: "legacy_pre_mode_build" }, priority: 100, attempts: 0,
+    leaseRevision: 1, startedAt: null, workId: null, continuation: null, progress: null,
+  };
+  let candidateReads = 0;
+  let cancellation = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: now }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all" }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+    deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), fullBackfillVerifiedAt: null }) },
+    jobInstance: {
+      findFirst: async () => (candidateReads++ === 0 ? candidate : null),
+      updateMany: async (args) => {
+        if (args.where?.id === candidate.id) { cancellation = args; return { count: 1 }; }
+        return { count: 0 };
+      },
+    },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["catchup_notifications_scan"] });
+  assert.equal(result.job, null);
+  assert.equal(result.reason, "no-work");
+  assert.equal(cancellation.data.status, "CANCELLED");
+  assert.equal(cancellation.data.lastError, "superseded_by_existing_notification_history");
+});
+
+test("renew fence kills an already claimed legacy no-mode notification FULL after baseline appears", async () => {
+  const token = "legacy-no-mode-renew-token";
+  const now = new Date();
+  const job = {
+    id: "legacy-no-mode-renew", agencyId: "agency-1", creatorId: "creator-1", jobKey: "catchup_notifications_scan",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 5,
+    leaseUntil: new Date(now.getTime() + 60_000), params: { reason: "legacy_pre_mode_build" }, continuation: null, progress: null,
+  };
+  let cancellation = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), fullBackfillVerifiedAt: null }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { cancellation = args; return { count: 1 }; },
+    },
+  };
+  const { renewLease } = loadService({ db });
+  await assert.rejects(
+    renewLease({ jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 5, leaseMs: 60_000 }),
+    (error) => error?.code === "JOB_SUPERSEDED" && error?.status === 409,
+  );
+  assert.equal(cancellation.data.status, "CANCELLED");
+  assert.equal(cancellation.data.lastError, "superseded_by_existing_notification_history");
+});
+
+test("explicitly forced notification FULL is exempt from the legacy-mode lease fence", async () => {
+  const token = "forced-full-token";
+  const now = new Date();
+  const job = {
+    id: "forced-full-renew", agencyId: "agency-1", creatorId: "creator-1", jobKey: "catchup_notifications_scan",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 2,
+    leaseUntil: new Date(now.getTime() + 60_000), params: { forceNotificationFullRebuild: true }, continuation: null, progress: null,
+  };
+  let update = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillVerifiedAt: new Date("2026-08-08T00:00:00.000Z") }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { update = args; return { count: 1 }; },
+    },
+  };
+  const { renewLease } = loadService({ db });
+  const result = await renewLease({ jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 2, leaseMs: 60_000 });
+  assert.equal(result.status, "CLAIMED");
+  assert.ok(update.data.leaseUntil instanceof Date);
+  assert.equal(update.data.status, undefined);
+});

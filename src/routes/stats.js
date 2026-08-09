@@ -932,6 +932,7 @@ router.post("/creators/:creatorId/notification-scan/start", async (req, res) => 
       creator: ctx.creator,
       requestedByUserId: actorUserId(req),
       now: new Date(),
+      forceFull: req.body?.forceFull === true,
     });
     const result = await readManualNotificationScan({ creator: ctx.creator, outcome: "ALL", limit: 100, offset: 0 });
     return res.json({ ...result, action: started.action });

@@ -214,6 +214,41 @@ async function scopedCreatorIds({ userId, device }) {
   // recent heartbeat. Role visibility is necessary, but never sufficient.
   return bindings.map((item) => item.creatorId);
 }
+function notificationJobMode(params) {
+  // Keep backend lease semantics identical to Desktop's scanMode(): legacy
+  // notification rows without an explicit mode are FULL, never catch-up.
+  return object(params).notificationMode === "catchup" ? "catchup" : "full";
+}
+async function notificationFullIsRedundant(job) {
+  if (job?.jobKey !== "catchup_notifications_scan") return false;
+  const params = object(job.params);
+  if (notificationJobMode(params) !== "full" || params.forceNotificationFullRebuild === true) return false;
+  if (!prisma?.creatorNotificationSyncState?.findUnique) return false;
+  const state = await prisma.creatorNotificationSyncState.findUnique({
+    where: { creatorId: job.creatorId },
+    select: { fullBackfillCompletedAt: true, fullBackfillVerifiedAt: true },
+  });
+  return Boolean(state?.fullBackfillCompletedAt || state?.fullBackfillVerifiedAt);
+}
+async function cancelRedundantNotificationFull(job, now = new Date()) {
+  if (!(await notificationFullIsRedundant(job))) return false;
+  const cancelled = await prisma.jobInstance.updateMany({
+    where: { id: job.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+    data: {
+      status: "CANCELLED",
+      completedAt: now,
+      lastError: "superseded_by_existing_notification_history",
+      claimedAt: null,
+      claimedByDeviceId: null,
+      leaseUntil: null,
+      leaseTokenHash: null,
+      leaseRevision: { increment: 1 },
+      workId: null,
+    },
+  });
+  return Number(cancelled?.count || 0) > 0;
+}
+
 async function sweepExpiredLeases(now = new Date()) {
   const terminal = await prisma.jobInstance.updateMany({
     where: {
@@ -287,6 +322,10 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       orderBy: [{ priority: "desc" }, { nextRunAt: "asc" }],
     });
     if (!candidate) return { job: null, reason: "no-work" };
+    // Last-chance fence: an old FULL can remain queued while another run has
+    // already established the historical baseline. Re-check at claim time so
+    // a stale row can never wake up hours later and replay the whole history.
+    if (await cancelRedundantNotificationFull(candidate, now)) continue;
     const leaseToken = crypto.randomBytes(32).toString("base64url");
     const until = new Date(now.getTime() + leaseDuration(leaseMs));
     const updated = await prisma.jobInstance.updateMany({
@@ -342,6 +381,12 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
 async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation }) {
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
   const now = new Date();
+  // Also fence a FULL that became redundant *after* it was claimed (for
+  // example another worker completed the accepted baseline concurrently).
+  // Desktop treats 409 as a stale lease and stops the chunk immediately.
+  if (await cancelRedundantNotificationFull(job, now)) {
+    throw new JobLeaseError("JOB_SUPERSEDED", "Notification full scan was superseded by existing history", 409);
+  }
   const tokenHash = hashToken(leaseToken);
   const data = {
     leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),

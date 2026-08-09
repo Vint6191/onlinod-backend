@@ -164,6 +164,37 @@ test("a completed historical notification traversal is adopted and redundant aut
   assert.equal(scheduled.length, 0);
 });
 
+test("completed history also fences a legacy manual FULL that has no explicit force marker", async () => {
+  notificationState = {
+    fullBackfillCompletedAt: new Date("2026-08-08T10:00:00.000Z"),
+    headNotificationId: "known-head",
+  };
+  const active = [{
+    id: "legacy-manual-full",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    params: { notificationMode: "full", manualNotificationScan: true, manualNotificationScanVersion: 1 },
+  }];
+  const db = dbFixture({ financialReady: true, campaignReady: true, active });
+  const step = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now: new Date("2026-08-09T12:00:00.000Z") });
+  assert.equal(step.ready, true);
+  assert.equal(active[0].status, "CANCELLED");
+});
+
+test("completed history preserves only an explicitly forced FULL rebuild", async () => {
+  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-08T10:00:00.000Z") };
+  const active = [{
+    id: "forced-manual-full",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    params: { notificationMode: "full", manualNotificationScan: true, forceNotificationFullRebuild: true },
+  }];
+  const db = dbFixture({ financialReady: true, campaignReady: true, active });
+  const step = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now: new Date("2026-08-09T12:00:00.000Z") });
+  assert.equal(step.ready, true);
+  assert.equal(active[0].status, "CLAIMED");
+});
+
 test("campaign catch-up compares OF stats against actual stored memberships and keeps per-campaign known frontiers", async () => {
   const db = {
     creatorCampaign: {
@@ -235,4 +266,22 @@ test("recurring analytics uses fixed head catch-ups only after initial history i
   assert.equal(JSON.stringify(campaigns).includes("HOT"), false);
   assert.equal(JSON.stringify(campaigns).includes("WARM"), false);
   assert.equal(JSON.stringify(campaigns).includes("COLD"), false);
+});
+
+test("completed history also fences a legacy notification job with no explicit mode", async () => {
+  notificationState = {
+    fullBackfillCompletedAt: new Date("2026-08-08T10:00:00.000Z"),
+    headNotificationId: "known-head",
+  };
+  const active = [{
+    id: "legacy-no-mode-full",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    params: { reason: "legacy_pre_mode_build" },
+  }];
+  const db = dbFixture({ financialReady: true, campaignReady: true, active });
+  const step = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now: new Date("2026-08-09T12:00:00.000Z") });
+  assert.equal(step.ready, true);
+  assert.equal(active[0].status, "CANCELLED");
+  assert.equal(active[0].lastError, "superseded_by_existing_notification_history");
 });
