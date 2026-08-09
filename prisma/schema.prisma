@@ -400,6 +400,7 @@ model CreatorAccount {
   financialTransactions CreatorFinancialTransaction[]
   fanValueCurrent CreatorFanValueCurrent[]
   earningsTotals CreatorEarningsTotal[]
+  taskActivities CreatorTaskActivity[]
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
@@ -1640,6 +1641,30 @@ model JobInstance {
   @@index([agencyId, idempotencyKey])
   @@index([claimedByDeviceId])
   @@index([leaseUntil])
+}
+
+
+model CreatorTaskActivity {
+  id          String   @id @default(cuid())
+  agencyId    String
+  creatorId   String
+  jobId       String   @unique
+  jobKey      String
+  mode        String?
+  stage       String?
+  status      String
+  detail      String?
+  lastError   String?
+  startedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@index([agencyId, creatorId, updatedAt])
+  @@index([creatorId, updatedAt])
+  @@index([status, updatedAt])
 }
 
 model DeviceCommand {

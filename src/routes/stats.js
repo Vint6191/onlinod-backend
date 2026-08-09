@@ -30,6 +30,7 @@ const { scheduleJobNow } = require("../services/job-scheduler");
 const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-analytics-permissions");
 const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
 const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily } = require("../services/creator-analytics-ledger-service");
+const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity } = require("../services/creator-overview-service");
 const { buildNotificationScanParams, loadNotificationSyncState, recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
 const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = require("../services/notification-facts-service");
 const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
@@ -774,6 +775,55 @@ const messagesDailySchema = z.object({
     uniqueIncomingFans: z.number().int().nonnegative(),
     uniqueOutgoingFans: z.number().int().nonnegative(),
   })).max(50),
+});
+
+router.get("/creators/:creatorId/overview-v2", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const rangeKey = String(req.query.range || "30d");
+    if (!["7d", "30d", "90d", "180d", "365d"].includes(rangeKey)) {
+      return res.status(400).json({ ok: false, code: "INVALID_OVERVIEW_RANGE", error: `Invalid overview range: ${rangeKey}` });
+    }
+    const overview = await readCreatorOverview({ creatorId: ctx.creator.id, rangeKey });
+    return res.json(overview);
+  } catch (error) {
+    console.error("[stats/overview-v2] failed:", error);
+    return res.status(500).json({ ok: false, code: "CREATOR_OVERVIEW_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+router.get("/creators/:creatorId/current-task", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const task = await readCreatorCurrentTask({ creatorId: ctx.creator.id });
+    return res.json({ ok: true, creatorId: ctx.creator.id, task });
+  } catch (error) {
+    console.error("[stats/current-task] failed:", error);
+    return res.status(500).json({ ok: false, code: "CREATOR_CURRENT_TASK_FAILED", error: error?.message || "Failed" });
+  }
+});
+
+router.get("/creators/:creatorId/task-activity", async (req, res) => {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    if (!requireEarningsPermission(res, ctx.member)) return;
+    const day = String(req.query.day || "").trim() || null;
+    if (day && !/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+      return res.status(400).json({ ok: false, code: "INVALID_ACTIVITY_DAY", error: "day must be YYYY-MM-DD" });
+    }
+    const limit = Math.max(1, Math.min(5000, Number.parseInt(String(req.query.limit || "240"), 10) || 240));
+    const items = await readCreatorTaskActivity({ creatorId: ctx.creator.id, day, limit });
+    const days = [...new Set(items.map((item) => item.day).filter(Boolean))];
+    return res.json({ ok: true, creatorId: ctx.creator.id, retentionDays: 30, days, items });
+  } catch (error) {
+    console.error("[stats/task-activity] failed:", error);
+    return res.status(500).json({ ok: false, code: "CREATOR_TASK_ACTIVITY_FAILED", error: error?.message || "Failed" });
+  }
 });
 
 router.get("/creators/:creatorId/ledger-overview", async (req, res) => {

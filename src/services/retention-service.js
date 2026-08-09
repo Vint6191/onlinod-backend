@@ -667,6 +667,21 @@ async function runAuditLogRetentionSweep(options = {}) {
   return summarizeSweep("auditLogs", out);
 }
 
+
+async function runCreatorTaskActivityRetentionSweep(options = {}) {
+  const cfg = await resolveSweepConfig(options);
+  const items = [];
+  if (!prisma.creatorTaskActivity?.findMany) return summarizeSweep("creatorTaskActivity", items);
+  items.push(await deleteByIdsInBatches({
+    model: prisma.creatorTaskActivity,
+    batchSize: cfg.batchSize,
+    label: "creatorTaskActivity.30d",
+    orderBy: { updatedAt: "asc" },
+    where: { updatedAt: { lt: daysAgo(30) } },
+  }));
+  return summarizeSweep("creatorTaskActivity", items);
+}
+
 async function runRetentionSweep(options = {}) {
   const startedAt = Date.now();
   const useLock = options?.useAdvisoryLock !== false;
@@ -680,25 +695,27 @@ async function runRetentionSweep(options = {}) {
   }
 
   try {
-    const [teamActivity, teamLedgers, traffic, automation, dialogIntelligence, auditLogs] = await Promise.all([
+    const [teamActivity, teamLedgers, traffic, automation, dialogIntelligence, auditLogs, creatorTaskActivity] = await Promise.all([
       runTeamActivityRetentionSweep(options),
       runTeamLedgerRetentionSweep(options),
       runTrafficRetentionSweep(options),
       runAutomationRetentionSweep(options),
       runDialogIntelligenceRetentionSweep(options),
       runAuditLogRetentionSweep(options),
+      runCreatorTaskActivityRetentionSweep(options),
     ]);
 
     return {
       ok: true,
       elapsedMs: Date.now() - startedAt,
-      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0) + (dialogIntelligence.totalDeleted || 0) + (auditLogs.totalDeleted || 0),
+      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0) + (dialogIntelligence.totalDeleted || 0) + (auditLogs.totalDeleted || 0) + (creatorTaskActivity.totalDeleted || 0),
       teamActivity,
       teamLedgers,
       traffic,
       automation,
       dialogIntelligence,
       auditLogs,
+      creatorTaskActivity,
       lock: useLock ? "advisory" : "disabled",
     };
   } finally {
@@ -720,6 +737,7 @@ module.exports = {
   runAutomationRetentionSweep,
   runDialogIntelligenceRetentionSweep,
   runAuditLogRetentionSweep,
+  runCreatorTaskActivityRetentionSweep,
   getRetentionSettings,
   updateRetentionSettings,
   resetRetentionSettings,
