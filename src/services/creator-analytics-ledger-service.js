@@ -6,8 +6,8 @@ const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
 
 const RANGE_DAYS = Object.freeze({ "24h": 1, "7d": 7, "30d": 30, "90d": 90, "180d": 180, "365d": 365 });
-const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v6";
-const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", CAMPAIGN_COLLECTOR_VERSION]);
+const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v7";
+const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", CAMPAIGN_COLLECTOR_VERSION]);
 const CAMPAIGN_SCHEMA_VERSION = 4;
 const EARNINGS_COLLECTOR_VERSION = "earnings-v4";
 const EARNINGS_SCHEMA_VERSION = 4;
@@ -881,7 +881,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   if (expectedCampaignBatches === null || expectedClaimerBatches === null || expectedCampaignCount === null) {
     throw new Error("Campaign completion counters are invalid");
   }
-  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v6`;
+  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v7`;
   if (key.length > 240) throw new Error("Campaign completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);

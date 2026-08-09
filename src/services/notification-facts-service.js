@@ -5,9 +5,9 @@ const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { projectSubscriptionFacts, rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 
-const SERVICE_VERSION = "notification-facts-v1-history-v7-native-filters";
+const SERVICE_VERSION = "notification-facts-v1-history-v8-known-boundary";
 const SCHEMA_VERSION = 5;
-const COLLECTOR_VERSION = "notifications-history-v7-native-filters";
+const COLLECTOR_VERSION = "notifications-history-v8-known-boundary";
 const ALL_SCHEMA_VERSION = 4;
 const ALL_COLLECTOR_VERSION = "notifications-all-v5";
 const LEGACY_SCHEMA_VERSION = 3;

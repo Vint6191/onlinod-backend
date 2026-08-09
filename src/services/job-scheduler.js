@@ -5,8 +5,8 @@
    Used in two places:
 
    1. creator-connect.js — after a creator transitions to READY,
-      we schedule initial fetch_earnings + fetch_campaigns jobs
-      so the owner UI sees data without anyone clicking refresh.
+      we schedule lightweight dashboard earnings plus the strict Creator Analytics
+      initial sync pipeline so history begins without anyone clicking refresh.
 
    2. server.js startup — the recurring scheduler runs every
       `RECURRING_INTERVAL_MS` (default 1 hour) and creates fresh
@@ -84,16 +84,18 @@ async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) 
 
 
 /**
- * Schedule initial jobs for a single creator that just became READY.
- * Idempotent: if jobs already exist (SCHEDULED or recently DONE), we skip.
+ * Schedule jobs for a creator that is READY. Creator Analytics history is
+ * orchestrated separately as a strict Notifications -> Money -> Campaigns
+ * pipeline; recurring sweeps additionally schedule cheap head catch-ups.
  *
  * @param {object} args
  * @param {string} args.creatorId
  * @param {string} args.agencyId
  * @param {number} [args.priority=50]
+ * @param {boolean} [args.includeAnalyticsCatchups=false]
  * @returns {Promise<{ created: string[], skipped: string[] }>}
  */
-async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 50, creator = null }) {
+async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 50, creator = null, includeAnalyticsCatchups = false }) {
   if (!creatorId || !agencyId) return { created: [], skipped: [] };
   const creatorRemoteId = creator?.remoteId || creator?.userId || null;
   const creatorUsername = creator?.username || null;
@@ -103,7 +105,35 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   const skipped = [];
   const now = new Date();
 
-  // 1. fetch_earnings for each tracked range
+  // Creator Analytics bootstrap owns the creator background-read lane until its
+  // strict Notifications -> Financial -> Campaigns history sequence is proven.
+  // Do not pre-schedule unrelated read jobs here: a lower-priority job can be
+  // claimed while waiting and steal the lane between two bootstrap stages.
+  try {
+    const { ensureInitialCreatorAnalyticsSync, ensureRecurringCreatorAnalyticsCatchups } = require("./creator-analytics-sync-orchestrator");
+    const initial = await ensureInitialCreatorAnalyticsSync({
+      creatorId, agencyId, now, priority: Math.max(80, priority),
+    });
+    if (initial.created) created.push(`creator_analytics_initial:${initial.stage}`);
+    else skipped.push(`creator_analytics_initial:${initial.stage}:${initial.reason || "waiting"}`);
+    if (!initial.ready) return { created, skipped };
+
+    if (includeAnalyticsCatchups) {
+      const catchups = await ensureRecurringCreatorAnalyticsCatchups({
+        creatorId, agencyId, now, priority: Math.max(15, priority - 10),
+      });
+      created.push(...(catchups.created || []));
+      skipped.push(...(catchups.skipped || []));
+    }
+  } catch (err) {
+    skipped.push(`creator_analytics:${err?.message || "schedule_failed"}`);
+    // Fail closed for automatic read work. If bootstrap state cannot be proven,
+    // do not start other creator-wide OF scans that can race its recovery.
+    return { created, skipped };
+  }
+
+  // Lightweight dashboard earnings are refreshed only after the initial
+  // analytics history pipeline is complete.
   for (const rangeKey of TRACKED_RANGES) {
     const decision = await ensureSingleJob({
       jobKey: "fetch_earnings",
@@ -117,25 +147,8 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
     else skipped.push(`fetch_earnings:${rangeKey}`);
   }
 
-  // 2. fetch_campaigns (account-scoped, no rangeKey)
-  const campaignsDecision = await ensureSingleJob({
-    jobKey: "fetch_campaigns",
-    creatorId,
-    agencyId,
-    params: {},
-    priority,
-    now,
-  });
-  if (campaignsDecision.created) created.push("fetch_campaigns");
-  else skipped.push("fetch_campaigns");
-
-  // Notification history collection is intentionally manual while Creator
-  // Analytics is under development. The existing JobInstance scheduler still
-  // executes scans started from the Creator Analytics UI, but READY/recurring
-  // sweeps must never create notification jobs on their own.
-
-  // 3. traffic_sources_scan — source/member attribution index.
-  // Kept much cooler than earnings jobs because it can walk large trial/promo lists.
+  // Traffic/member attribution stays independent once bootstrap no longer owns
+  // the read lane.
   const trafficDecision = await ensureSingleJob({
     jobKey: "traffic_sources_scan",
     creatorId,
@@ -158,7 +171,7 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
   if (trafficDecision.created) created.push("traffic_sources_scan");
   else skipped.push("traffic_sources_scan");
 
-  // 4. Subscriber Directory — one shared weekly source for Hidden Online,
+  // Subscriber Directory — one shared weekly source for Hidden Online,
   // Follow Back candidates and future subscriber-driven modules.
   const subscriberDecision = await ensureSubscriberScanDue({
     agencyId,
@@ -422,6 +435,7 @@ async function runRecurringSweep() {
         agencyId: creator.agencyId,
         creator,
         priority: 30, // recurring is lower priority than refresh-now (100) and creator-connect (50)
+        includeAnalyticsCatchups: true,
       });
       totalCreated += result.created.length;
       totalSkipped += result.skipped.length;

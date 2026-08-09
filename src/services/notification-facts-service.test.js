@@ -158,7 +158,7 @@ function fullHistoryResult(events, coverage = {}) {
   const result = completeResult(events, coverage);
   return {
     ...result,
-    collectorVersion: "notifications-history-v7-native-filters",
+    collectorVersion: "notifications-history-v8-known-boundary",
     schemaVersion: 5,
   };
 }

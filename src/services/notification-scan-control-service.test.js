@@ -91,10 +91,10 @@ test("manual start always schedules a full-history rebuild even when legacy sync
   assert.equal(buildStateSeen, null);
 });
 
-test("manual start resumes the same current-v7 paused JobInstance without clearing its cursor", async () => {
+test("manual start resumes the same current-v8 paused JobInstance without clearing its cursor", async () => {
   const paused = manualJob({
     status: "PAUSED",
-    continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 7, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 } },
+    continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 8, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 } },
     progress: { current: 7, message: "page 7" },
     leaseRevision: 4,
   });
@@ -111,21 +111,21 @@ test("manual start resumes the same current-v7 paused JobInstance without cleari
   assert.equal(updateData.status, "SCHEDULED");
   assert.equal("continuation" in updateData, false);
   assert.equal("progress" in updateData, false);
-  assert.deepEqual(paused.continuation.jobContinuation, { schemaVersion: 7, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 });
+  assert.deepEqual(paused.continuation.jobContinuation, { schemaVersion: 8, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 });
 });
 
-test("manual start supersedes a paused catch-up or pre-v7 scan with a clean full-history job", async () => {
+test("manual start supersedes a paused catch-up or pre-v8 scan with a clean full-history job", async () => {
   for (const paused of [
     manualJob({
       status: "PAUSED",
       params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup" },
-      continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 7, fromId: "old-catchup" } },
+      continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 8, fromId: "old-catchup" } },
       leaseRevision: 2,
     }),
     manualJob({
       status: "PAUSED",
       params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "full" },
-      continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 6, fullStage: "final_catchup", fromId: "old-v6" } },
+      continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 7, fullStage: "all_reconciliation", fromId: "old-v7" } },
       leaseRevision: 3,
     }),
   ]) {

@@ -5,7 +5,7 @@ const prisma = require("../prisma");
 const { rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 
 const JOB_KEY = "financial_transactions_scan";
-const COLLECTOR_VERSION = "payout-transactions-v1";
+const COLLECTOR_VERSION = "payout-transactions-v2-catchup";
 const SCHEMA_VERSION = 1;
 const KNOWN_SALE_TYPES = new Map([
   ["message", "MESSAGE"],
@@ -59,6 +59,7 @@ const CHART_CATEGORY_MAP = Object.freeze({
 });
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
+function financialMode(job) { return object(job?.params).financialMode === "catchup" ? "catchup" : "full"; }
 function clean(value, max = 220) {
   if (value === null || value === undefined) return null;
   const text = String(value).trim();
@@ -306,7 +307,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
     for (const row of accepted) {
       const fan = await resolveFan(tx, job, row, now);
       const fanId = fan?.id || null;
-      const data = {
+      const commonData = {
         agencyId: job.agencyId, creatorId: job.creatorId, fanId,
         fanOnlyFansUserId: row.fanOnlyFansUserId || null,
         externalTransactionId: row.externalTransactionId,
@@ -316,16 +317,23 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
         amountCents: row.amountCents, feeCents: row.feeCents, netCents: row.netCents,
         taxCents: row.taxCents, vatCents: row.vatCents, mediaTaxCents: row.mediaTaxCents,
         currency: row.currency, occurredAt: row.occurredAt, transactionStatus: row.transactionStatus,
-        sourceUpdatedAt: null, collectedAt: now, sourceDeviceId: deviceId || null, sourceJobId: job.id,
-        scanRunId, page: row.page, ordinal: row.ordinal, reasonCode: row.reasonCode, updatedAt: now,
+        sourceUpdatedAt: null, collectedAt: now, sourceDeviceId: deviceId || null,
+        reasonCode: row.reasonCode, updatedAt: now,
       };
       const previous = existingById.get(row.externalTransactionId);
       if (!previous) {
+        const data = { ...commonData, sourceJobId: job.id, scanRunId, page: row.page, ordinal: row.ordinal };
         await tx.creatorFinancialTransaction.create({ data: { id: crypto.randomUUID(), createdAt: now, ...data } });
         inserted += 1;
       } else {
+        // Catch-up re-observes the head so status changes such as done -> undo
+        // are applied, but an overlap page must not steal provenance from the
+        // original full scan. Full rebuilds intentionally rebind provenance.
+        const data = financialMode(job) === "catchup"
+          ? commonData
+          : { ...commonData, sourceJobId: job.id, scanRunId, page: row.page, ordinal: row.ordinal };
         const previousComparable = comparable(previous);
-        const nextComparable = comparable({ ...data, occurredAt: row.occurredAt });
+        const nextComparable = comparable({ ...commonData, occurredAt: row.occurredAt });
         await tx.creatorFinancialTransaction.update({ where: { id: previous.id }, data });
         if (previousComparable === nextComparable) unchanged += 1; else updated += 1;
       }
@@ -398,6 +406,7 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const payload = object(result);
   const scanRunId = clean(payload.scanRunId, 120);
   if (!scanRunId) throw new Error("Financial transaction completion is missing scanRunId");
+  const mode = payload.financialMode === "catchup" || financialMode(job) === "catchup" ? "catchup" : "full";
   const baseWhere = { creatorId: job.creatorId, sourceJobId: job.id, scanRunId };
   const [aggregate, count, statusGroups, chartTotal, storedOnly] = await Promise.all([
     db.creatorFinancialTransaction.aggregate({
@@ -431,10 +440,13 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const countMatched = chartReady ? earningsTransactionsCount === Number(chartTotal.transactionsCount || 0) : false;
   const grossMatched = chartReady ? earningsGrossCents === Number(chartTotal.grossCents || 0) : false;
   const netMatched = chartReady ? earningsNetCents === Number(chartTotal.netCents || 0) : false;
-  const complete = sourceBoundaryReached && scannerRejected === 0 && chartReady && countMatched && grossMatched && netMatched;
+  const complete = mode === "catchup"
+    ? sourceBoundaryReached && scannerRejected === 0
+    : sourceBoundaryReached && scannerRejected === 0 && chartReady && countMatched && grossMatched && netMatched;
   return {
     ok: true,
     type: "financial_transactions",
+    mode,
     complete,
     scanRunId,
     sourceBoundaryReached,

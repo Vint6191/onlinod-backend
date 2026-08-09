@@ -75,6 +75,13 @@ test("ingest keeps unavailable-user and unknown-type transactions as durable fac
   assert.ok(sourceWrite >= 0 && projection > sourceWrite, "source transaction must be durable before business projection");
 });
 
+test("financial catch-up re-observes statuses without stealing full-scan provenance", () => {
+  assert.match(service, /financialMode\(job\) === "catchup"/);
+  assert.match(service, /Catch-up re-observes the head/);
+  assert.match(service, /\? commonData\s*:\s*\{ \.\.\.commonData, sourceJobId: job\.id, scanRunId/);
+  assert.match(service, /mode === "catchup"[\s\S]*sourceBoundaryReached && scannerRejected === 0/);
+});
+
 test("financial ingest is safe when job lease passes a Prisma TransactionClient", () => {
   assert.match(service, /typeof db\.\$transaction === "function"/);
   assert.match(service, /return callback\(db\)/);

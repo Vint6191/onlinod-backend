@@ -67,6 +67,7 @@ test("campaign transport is page-oriented and notification engagement is accepte
   assert.match(resultService, /uniqueFans: legacyUniqueFansKnown \? summary\.uniqueFans : null/);
   const ledger = fs.readFileSync(path.join(root, "src/services/creator-analytics-ledger-service.js"), "utf8");
   assert.match(ledger, /Analytics idempotency conflict/);
+  assert.match(ledger, /CAMPAIGN_COLLECTOR_VERSION = "campaigns-v7"/);
   assert.match(ledger, /campaigns-v6/);
   assert.match(ledger, /CAMPAIGN_COMPAT_COLLECTOR_VERSIONS/);
   assert.match(ledger, /MESSAGES_DAILY/);

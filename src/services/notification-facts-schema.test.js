@@ -20,6 +20,7 @@ const leaseService = read("src/services/job-lease-service.js");
 const jobResultService = read("src/services/job-result-service.js");
 const scheduler = read("src/services/job-scheduler.js");
 const scanControl = read("src/services/notification-scan-control-service.js");
+const analyticsOrchestrator = read("src/services/creator-analytics-sync-orchestrator.js");
 const strictDates = read("src/services/strict-date-time.js");
 
 function modelBody(name) {
@@ -99,7 +100,7 @@ test("upgrade migrations purge untrusted protocols and enforce database invarian
 
 test("ingest is version-fenced, transactional, page-oriented and interval-aware", () => {
   assert.match(service, /const SCHEMA_VERSION = 5/);
-  assert.match(service, /const COLLECTOR_VERSION = "notifications-history-v7-native-filters"/);
+  assert.match(service, /const COLLECTOR_VERSION = "notifications-history-v8-known-boundary"/);
   assert.match(service, /const ALL_SCHEMA_VERSION = 4/);
   assert.match(service, /const ALL_COLLECTOR_VERSION = "notifications-all-v5"/);
   assert.match(service, /const LEGACY_SCHEMA_VERSION = 3/);
@@ -134,13 +135,20 @@ test("ingest is version-fenced, transactional, page-oriented and interval-aware"
 
 
 
-test("automatic creator scheduling does not start notification history scans during development", () => {
+test("automatic creator scheduling delegates notification history to the strict analytics pipeline", () => {
   const start = scheduler.indexOf("async function scheduleInitialJobsForCreator");
   const end = scheduler.indexOf("async function ensureSingleJob", start);
   assert.ok(start >= 0 && end > start, "scheduleInitialJobsForCreator body not found");
   const body = scheduler.slice(start, end);
-  assert.doesNotMatch(body, /catchup_notifications_scan/);
-  assert.match(body, /Notification history collection is intentionally manual/);
+  assert.match(body, /ensureInitialCreatorAnalyticsSync/);
+  assert.match(body, /ensureRecurringCreatorAnalyticsCatchups/);
+  assert.match(body, /if \(!initial\.ready\) return \{ created, skipped \}/);
+  assert.ok(body.indexOf("ensureInitialCreatorAnalyticsSync") < body.indexOf("for (const rangeKey of TRACKED_RANGES)"), "bootstrap gate must run before dashboard earnings scheduling");
+  assert.doesNotMatch(body, /jobKey:\s*"fetch_campaigns"/);
+  assert.match(analyticsOrchestrator, /NOTIFICATION_JOB_KEY = "catchup_notifications_scan"/);
+  assert.match(analyticsOrchestrator, /analyticsSyncStage:\s*"notifications"/);
+  assert.match(analyticsOrchestrator, /analyticsSyncStage:\s*"financial"/);
+  assert.match(analyticsOrchestrator, /analyticsSyncStage:\s*"campaigns"/);
   assert.match(scanControl, /manualNotificationScan:\s*true/);
   assert.match(scanControl, /scheduleJobNow/);
   assert.match(scanControl, /status:\s*"PAUSED"/);

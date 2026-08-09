@@ -61,6 +61,16 @@ function leaseDuration(value) {
   return Math.max(MIN_LEASE_MS, Math.min(MAX_LEASE_MS, Math.floor(parsed)));
 }
 
+async function maybeAdvanceCreatorAnalyticsInitialSync(job, sideEffect) {
+  try {
+    const { advanceCreatorAnalyticsInitialSyncAfterCompletion } = require("./creator-analytics-sync-orchestrator");
+    return await advanceCreatorAnalyticsInitialSyncAfterCompletion({ job, sideEffect });
+  } catch (error) {
+    console.warn("[creator-analytics-sync] failed to advance initial pipeline:", job?.id || null, error?.message || error);
+    return null;
+  }
+}
+
 function dialogDiscoveryClaimConstraint(enabled) {
   if (enabled !== true) return null;
   return {
@@ -540,6 +550,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     }
     const completed = await prisma.jobInstance.updateMany({ where: completionFence, data: completionData });
     if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Analytics completion fence was lost");
+    await maybeAdvanceCreatorAnalyticsInitialSync(job, sideEffect);
     return { job: { id: job.id, status: "DONE" }, sideEffect };
   }
 
@@ -658,6 +669,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     }
     const completed = await prisma.jobInstance.updateMany({ where: completionFence, data: completionData });
     if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification completion fence was lost");
+    await maybeAdvanceCreatorAnalyticsInitialSync(job, sideEffect);
     return { job: { id: job.id, status: "DONE" }, sideEffect };
   }
 
@@ -678,6 +690,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
   const updated = await prisma.jobInstance.updateMany({ where: fenceWhere, data: completionData });
   if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion");
+  await maybeAdvanceCreatorAnalyticsInitialSync(job, sideEffect);
   return { job: { id: job.id, status: "DONE" }, sideEffect };
 }
 async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, error, result, retryable = true }) {
