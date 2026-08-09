@@ -14,6 +14,7 @@ function loadService(fixture) {
   const catalogModule = require.resolve("./job-catalog");
   const fenceModule = require.resolve("./dialog-job-completion-fence");
   const dailyModule = require.resolve("./vault-intelligence-daily-service");
+  const notificationSyncModule = require.resolve("./notification-sync-state-service");
   require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: fixture.db };
   require.cache[resultModule] = {
     id: resultModule, filename: resultModule, loaded: true,
@@ -36,6 +37,13 @@ function loadService(fixture) {
     exports: {
       ensureDailyVaultIntelligenceCycle: fixture.ensureDailyVaultIntelligenceCycle
         || (async () => ({ ok: true, created: 0, reason: "not_due" })),
+    },
+  };
+  require.cache[notificationSyncModule] = {
+    id: notificationSyncModule, filename: notificationSyncModule, loaded: true,
+    exports: {
+      completeNotificationSync: fixture.completeNotificationSync
+        || (async () => ({ id: "notification-sync-state" })),
     },
   };
   delete require.cache[require.resolve("./job-lease-service")];
@@ -511,6 +519,87 @@ test("notification completion reserves a new lease revision before durable side 
   assert.equal(updates[1].where.leaseRevision, 8);
   assert.equal(updates[1].data.status, "DONE");
   assert.equal(result.job.status, "DONE");
+});
+
+test("bounded notification catch-up marks DONE before deferred compatibility projection", async () => {
+  const token = "bounded-notification-token";
+  const now = new Date();
+  const job = {
+    id: "bounded-notification-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 5,
+    leaseUntil: new Date(now.getTime() + 60_000),
+    attempts: 0,
+    params: {
+      notificationMode: "catchup",
+      from: "2026-08-09T12:00:00.000Z",
+      to: "2026-08-09T14:00:00.000Z",
+      types: ["purchases", "tips", "subscriptions", "likes", "comments"],
+    },
+    progress: { current: 1, total: 1 },
+    continuation: { driverPhase: "complete" },
+    workId: "bounded-notification-work",
+  };
+  const updates = [];
+  const order = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); order.push("done-fence"); return { count: 1 }; },
+    },
+    $transaction: async (callback) => callback(db),
+  };
+  const { completeJob } = loadService({
+    db,
+    completeNotificationSync: async ({ db: suppliedDb, successful }) => {
+      assert.equal(suppliedDb, db);
+      assert.equal(successful, true);
+      order.push("sync-finalized");
+      return { id: "sync-1" };
+    },
+    applyJobResult: async () => {
+      order.push("compatibility");
+      return { type: "catchup_notifications", ok: true };
+    },
+  });
+
+  const result = await completeJob({
+    jobId: job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: token,
+    leaseRevision: 5,
+    workId: job.workId,
+    result: {
+      notificationMode: "catchup",
+      schemaVersion: 5,
+      sourceExhausted: true,
+      coverage: {
+        purchases: { status: "complete", rejected: 0 },
+        tips: { status: "complete", rejected: 0 },
+        subscriptions: { status: "complete", rejected: 0 },
+        likes: { status: "complete", rejected: 0 },
+        comments: { status: "complete", rejected: 0 },
+      },
+    },
+    progress: { current: 1, total: 1, percent: 100 },
+  });
+
+  assert.equal(result.job.status, "DONE");
+  assert.equal(result.sideEffect.compatibilityDeferred, true);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].data.status, "DONE");
+  assert.deepEqual(order.slice(0, 2), ["done-fence", "sync-finalized"]);
+  assert.equal(order.includes("compatibility"), false, "compatibility must not block completion response");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(order.includes("compatibility"), true);
 });
 
 test("partial notification completion is rescheduled instead of being marked DONE", async () => {

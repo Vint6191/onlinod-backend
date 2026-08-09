@@ -268,6 +268,31 @@ test("recurring analytics uses fixed head catch-ups only after initial history i
   assert.equal(JSON.stringify(campaigns).includes("COLD"), false);
 });
 
+
+
+test("a freshly completed notification catch-up cannot be immediately scheduled again", async () => {
+  notificationState = {
+    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+    lastCatchupCompletedAt: new Date("2026-08-09T11:58:00.000Z"),
+    headNotificationId: "fresh-head",
+  };
+  const db = dbFixture({ financialReady: true, campaignReady: true });
+  db.creatorNotificationScanItem = { async findMany() { return [{ notificationId: "fresh-head" }]; } };
+  db.creatorFinancialTransaction = { async findMany() { return []; } };
+  db.creatorCampaign = { async findMany() { return []; } };
+  db.$queryRawUnsafe = async () => [];
+
+  const result = await ensureRecurringCreatorAnalyticsCatchups({
+    db,
+    creatorId: "creator-1",
+    agencyId: "agency-1",
+    now: new Date("2026-08-09T12:00:00.000Z"),
+  });
+  assert.equal(result.ready, true);
+  assert.equal(scheduled.some((row) => row.jobKey === "catchup_notifications_scan"), false);
+  assert.ok(result.skipped.includes("notifications_catchup:fresh"));
+});
+
 test("completed history also fences a legacy notification job with no explicit mode", async () => {
   notificationState = {
     fullBackfillCompletedAt: new Date("2026-08-08T10:00:00.000Z"),

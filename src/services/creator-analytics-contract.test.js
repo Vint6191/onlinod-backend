@@ -63,8 +63,10 @@ test("creator and agency refresh routes are guarded and agency scheduling is bou
   const agency = routeBody(stats, "post", "/agencies/:agencyId/refresh");
   assert.match(agency, /requireRefreshPermission\(res, ctx\.member\)/);
   assert.match(agency, /const batchSize = range === "all" \? 5 : 20/);
-  assert.match(agency, /buildNotificationScanParams\(/);
-  assert.match(agency, /jobKey: "catchup_notifications_scan"/);
+  assert.match(creator, /ensureRecurringCreatorAnalyticsCatchups\(/);
+  assert.doesNotMatch(creator, /jobKey: "catchup_notifications_scan"/);
+  assert.match(agency, /ensureRecurringCreatorAnalyticsCatchups\(/);
+  assert.doesNotMatch(agency, /jobKey: "catchup_notifications_scan"/);
   assert.doesNotMatch(agency, /notificationWindows\(/);
   assert.match(agency, /Promise\.allSettled/);
   assert.doesNotMatch(agency, /for \(const creator of creators\)[\s\S]*await scheduleJobNow/);

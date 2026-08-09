@@ -78,8 +78,12 @@ test("campaign transport is page-oriented and notification engagement is accepte
   assert.match(routes, /code: "INVALID_RANGE"/);
   assert.match(routes, /code: "INVALID_CAMPAIGN_ID"/);
   assert.match(routes, /ledger-coverage/);
-  assert.match(routes, /buildNotificationScanParams/);
-  assert.match(routes, /jobKey: "catchup_notifications_scan"/);
+  assert.match(routes, /ensureRecurringCreatorAnalyticsCatchups/);
+  const creatorRefreshStart = routes.indexOf('router.post("/creators/:creatorId/refresh"');
+  const agencyRefreshStart = routes.indexOf('router.post("/agencies/:agencyId/refresh"');
+  const overviewStart = routes.indexOf('router.get("/creators/:creatorId/overview-v2"');
+  assert.ok(creatorRefreshStart >= 0 && agencyRefreshStart > creatorRefreshStart && overviewStart > agencyRefreshStart);
+  assert.doesNotMatch(routes.slice(creatorRefreshStart, overviewStart), /jobKey: "catchup_notifications_scan"/);
   assert.doesNotMatch(routes, /notificationWindows/);
   assert.doesNotMatch(routes, /backfillWindow/);
   const notificationSync = fs.readFileSync(path.join(root, "src/services/notification-sync-state-service.js"), "utf8");

@@ -5,6 +5,7 @@ const prisma = require("../prisma");
 const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-result-service");
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
+const { completeNotificationSync } = require("./notification-sync-state-service");
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 const MIN_LEASE_MS = 30 * 1000;
@@ -218,6 +219,23 @@ function notificationJobMode(params) {
   // Keep backend lease semantics identical to Desktop's scanMode(): legacy
   // notification rows without an explicit mode are FULL, never catch-up.
   return object(params).notificationMode === "catchup" ? "catchup" : "full";
+}
+function boundedNotificationCatchupCompletion(job, result) {
+  return job?.jobKey === "catchup_notifications_scan"
+    && notificationJobMode(job.params) === "catchup"
+    && Number(result?.schemaVersion || 0) >= 4
+    && result?.sourceExhausted === true;
+}
+function notificationScannerSuccessful(job, result) {
+  const params = object(job?.params);
+  const requested = Array.isArray(params.types)
+    ? [...new Set(params.types.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))]
+    : ["purchases", "tips", "subscriptions", "likes", "comments"];
+  const coverage = object(result?.coverage);
+  return result?.sourceExhausted === true && requested.length > 0 && requested.every((type) => {
+    const row = object(coverage[type]);
+    return row.status === "complete" && Number(row.rejected || 0) === 0;
+  });
 }
 async function notificationFullIsRedundant(job) {
   if (job?.jobKey !== "catchup_notifications_scan") return false;
@@ -600,6 +618,46 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   }
 
   if (job.jobKey === "catchup_notifications_scan") {
+    // Bounded HEAD catch-up pages are already atomically committed by /progress.
+    // Do not keep the JobInstance CLAIMED while legacy compatibility/read-cache
+    // projection runs: if that long response is lost, an expired lease can make
+    // the same HEAD page appear to restart. First commit the durable terminal job
+    // state + catch-up frontier in one short transaction, then project compatibility
+    // best-effort after the job is already DONE. Atomic notification facts remain
+    // the source of truth; compatibility/cache work must never hold the scan lease.
+    if (boundedNotificationCatchupCompletion(job, result)) {
+      const scannerSuccessful = notificationScannerSuccessful(job, result);
+      const fast = await prisma.$transaction(async (tx) => {
+        const completed = await tx.jobInstance.updateMany({ where: fenceWhere, data: completionData });
+        if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before bounded notification completion");
+        const syncState = await completeNotificationSync({
+          db: tx,
+          job,
+          deviceId,
+          result: result || {},
+          successful: scannerSuccessful,
+        });
+        return {
+          type: "catchup_notifications",
+          ok: true,
+          verified: scannerSuccessful,
+          sourceTraversalComplete: true,
+          compatibilityDeferred: true,
+          syncStateId: syncState?.id || null,
+        };
+      }, JOB_COMPLETION_TRANSACTION_OPTIONS);
+
+      setImmediate(() => {
+        applyJobResult({ job, deviceId, userId, result: result || {} }).catch((error) => {
+          console.warn("[notification-catchup] deferred compatibility projection failed:", job.id, error?.message || error);
+        });
+      });
+      return { job: { id: job.id, status: "DONE" }, sideEffect: fast };
+    }
+
+    // Full/legacy notification completion still reserves ownership before its
+    // durable verification projection. Only the bounded v4+ catch-up path above
+    // is allowed to detach compatibility work from the lease.
     // Reserve completion ownership before any ledger/compatibility side effect.
     // The compatibility projection can touch legacy tip/subscription ledgers,
     // so keep the fenced completion lease at the maximum supported duration.

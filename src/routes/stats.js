@@ -31,7 +31,8 @@ const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-an
 const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
 const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily } = require("../services/creator-analytics-ledger-service");
 const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity, readCreatorTaskActivityDays } = require("../services/creator-overview-service");
-const { buildNotificationScanParams, loadNotificationSyncState, recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
+const { recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
+const { ensureRecurringCreatorAnalyticsCatchups } = require("../services/creator-analytics-sync-orchestrator");
 const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = require("../services/notification-facts-service");
 const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
 const {
@@ -552,14 +553,11 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
     }
 
     const now = new Date();
-    const notificationState = await loadNotificationSyncState(prisma, creator.id);
-    const notificationParams = buildNotificationScanParams({
-      state: notificationState,
-      now,
-      reason: "creator_analytics_refresh",
-      analyticsRangeKey: range,
-    });
-    const [earnings, campaigns, notifications, subscribers] = await Promise.all([
+    // A generic UI refresh is not a second analytics scheduler. It may refresh
+    // the cheap range snapshot/subscriber directory, while notification,
+    // financial-transaction and campaign catch-ups remain exclusively owned by
+    // the Creator Analytics orchestrator and its freshness/initial-sync gates.
+    const [earnings, analyticsCatchups, subscribers] = await Promise.all([
       scheduleJobNow({
         jobKey: "fetch_earnings",
         creatorId: creator.id,
@@ -569,23 +567,11 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         now,
         bucketMs: 60_000,
       }),
-      scheduleJobNow({
-        jobKey: "fetch_campaigns",
+      ensureRecurringCreatorAnalyticsCatchups({
         creatorId: creator.id,
         agencyId: creator.agencyId,
-        params: { rangeKey: range },
-        priority: 100,
         now,
-        bucketMs: 60_000,
-      }),
-      scheduleJobNow({
-        jobKey: "catchup_notifications_scan",
-        creatorId: creator.id,
-        agencyId: creator.agencyId,
-        params: notificationParams,
         priority: 95,
-        now,
-        bucketMs: 60_000,
       }),
       scheduleSubscriberScan({
         agencyId: creator.agencyId,
@@ -614,14 +600,18 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
       onlineWorkers: onlineBindings,
       jobs: [
         { id: earnings.job.id, jobKey: "fetch_earnings", rangeKey: range, reason: earnings.reason },
-        { id: campaigns.job.id, jobKey: "fetch_campaigns", rangeKey: range, reason: campaigns.reason },
-        { id: notifications.job.id, jobKey: "catchup_notifications_scan", rangeKey: range, reason: notifications.reason, notificationMode: notificationParams.notificationMode },
         { id: subscribers.job?.id || subscribers.run?.jobId || null, jobKey: "subscriber_directory_scan", rangeKey: "all", reason: subscribers.reason },
       ],
+      analyticsCatchups: {
+        ready: analyticsCatchups.ready === true,
+        created: analyticsCatchups.created || [],
+        skipped: analyticsCatchups.skipped || [],
+        initial: analyticsCatchups.initial || null,
+      },
       message:
         onlineBindings === 0
-          ? "Jobs scheduled, but no READY desktop binding currently sees this creator."
-          : `Jobs scheduled. ${onlineBindings} READY worker binding(s) can pick them up.`,
+          ? "Refresh accepted, but no READY desktop binding currently sees this creator."
+          : `Refresh accepted. ${onlineBindings} READY worker binding(s) can pick up due work.`,
     });
   } catch (err) {
     console.error("[stats/refresh-creator] failed:", err);
@@ -651,22 +641,20 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
     });
 
     const now = new Date();
-    const notificationStates = await prisma.creatorNotificationSyncState.findMany({
-      where: { creatorId: { in: creators.map((creator) => creator.id) } },
-    });
-    const notificationStateByCreator = new Map(notificationStates.map((state) => [state.creatorId, state]));
     let jobsScheduled = 0;
     let alreadyClaimed = 0;
+    let analyticsCatchupsCreated = 0;
     const failedCreators = [];
     const batchSize = range === "all" ? 5 : 20;
 
-    // Do not schedule 4,000 jobs sequentially for a 2,000-creator agency, but
-    // also avoid one unbounded Promise.all that can stampede the database.
+    // Bounded batch fan-out is retained, but the three durable Creator
+    // Analytics history/catch-up jobs are no longer created here. Every creator
+    // delegates those decisions to the single lifecycle orchestrator.
     for (let offset = 0; offset < creators.length; offset += batchSize) {
       const batch = creators.slice(offset, offset + batchSize);
       const settled = await Promise.allSettled(
         batch.map(async (creator) => {
-          const scheduled = await Promise.all([
+          const [earnings, analyticsCatchups] = await Promise.all([
             scheduleJobNow({
               jobKey: "fetch_earnings",
               creatorId: creator.id,
@@ -676,31 +664,14 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
               now,
               bucketMs: 60_000,
             }),
-            scheduleJobNow({
-              jobKey: "fetch_campaigns",
+            ensureRecurringCreatorAnalyticsCatchups({
               creatorId: creator.id,
               agencyId: creator.agencyId,
-              params: { rangeKey: range },
-              priority: 50,
               now,
-              bucketMs: 60_000,
-            }),
-            scheduleJobNow({
-              jobKey: "catchup_notifications_scan",
-              creatorId: creator.id,
-              agencyId: creator.agencyId,
-              params: buildNotificationScanParams({
-                state: notificationStateByCreator.get(creator.id) || null,
-                now,
-                reason: "agency_analytics_refresh",
-                analyticsRangeKey: range,
-              }),
               priority: 45,
-              now,
-              bucketMs: 60_000,
             }),
           ]);
-          return { creatorId: creator.id, scheduled };
+          return { creatorId: creator.id, earnings, analyticsCatchups };
         })
       );
 
@@ -714,30 +685,28 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
           });
           continue;
         }
-        for (const scheduled of result.value.scheduled) {
-          if (scheduled.reason === "already_claimed") alreadyClaimed += 1;
-          else jobsScheduled += 1;
-        }
+        if (result.value.earnings.reason === "already_claimed") alreadyClaimed += 1;
+        else jobsScheduled += 1;
+        analyticsCatchupsCreated += Array.isArray(result.value.analyticsCatchups?.created)
+          ? result.value.analyticsCatchups.created.length
+          : 0;
       }
     }
 
     return res.json({
       ok: true,
-      creatorsScheduled: creators.length - failedCreators.length,
-      creatorsRequested: creators.length,
+      creators: creators.length,
       jobsScheduled,
       alreadyClaimed,
-      failedCount: failedCreators.length,
-      failures: failedCreators.slice(0, 50),
+      analyticsCatchupsCreated,
+      failedCreators,
     });
   } catch (err) {
     console.error("[stats/refresh-agency] failed:", err);
-    return res.status(500).json({ ok: false, code: "AGENCY_REFRESH_FAILED", error: err?.message || "Failed" });
+    return res.status(500).json({ ok: false, code: "REFRESH_FAILED", error: err?.message || "Failed" });
   }
 });
 
-
-// Relational Creator Analytics V1 read model and local-only message day aggregates.
 const liveNotificationSchema = z.object({
   deviceId: z.string().min(3).max(160),
   batchId: z.string().min(8).max(80).regex(/^[A-Za-z0-9._-]+$/),

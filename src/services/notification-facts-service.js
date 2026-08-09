@@ -1203,17 +1203,20 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
       });
       return { replayed: false, batch, counts, complete, coverageByType };
     };
-    const applied = typeof db.$transaction === "function"
+    const ownsTransactionBoundary = typeof db.$transaction === "function";
+    const applied = ownsTransactionBoundary
       ? await db.$transaction(applyFacts, { maxWait: 10_000, timeout: 60_000 })
       : await applyFacts(db);
 
     if (applied.replayed) return applied.response;
-    // CreatorDailyMetrics is a disposable read cache. Never roll back or reject
-    // durable primary facts because a cache rebuild failed. Full completion
-    // refreshes the exposed notification window; realtime pages refresh only
-    // their actually observed days.
+    // CreatorDailyMetrics is a disposable read cache. Page chunks are already
+    // executed inside the fenced /jobs/:id/progress transaction, so rebuilding
+    // that cache there unnecessarily keeps the lease transaction open and can
+    // make a committed notification page look hung to Desktop. Defer projection
+    // until a top-level ingest boundary (completion/realtime), where db owns its
+    // own transaction lifecycle. Primary facts remain authoritative either way.
     const metricDates = facts.map((fact) => fact.occurredAt).filter(Boolean);
-    if ((finalizeCoverage || metricDates.length > 0) && db.creatorDailyMetrics) {
+    if (ownsTransactionBoundary && (finalizeCoverage || metricDates.length > 0) && db.creatorDailyMetrics) {
       let metricsFrom = metricDates.length
         ? new Date(Math.min(...metricDates.map((date) => date.getTime())))
         : rangeFrom;

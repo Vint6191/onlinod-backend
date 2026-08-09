@@ -176,3 +176,12 @@ test("completion preserves run identity, streams compatibility facts and treats 
   assert.match(leaseService, /resumeCursors/);
   assert.match(leaseService, /status: "SCHEDULED"/);
 });
+
+
+test("notification catch-up has one scheduler owner and page ingest does not rebuild disposable daily cache inside the progress transaction", () => {
+  assert.match(observation, /creator_analytics_orchestrator_owned/);
+  assert.doesNotMatch(observation, /buildJobIdempotencyKey/);
+  assert.doesNotMatch(observation, /jobInstance\.create\(/);
+  assert.match(service, /const ownsTransactionBoundary = typeof db\.\$transaction === "function"/);
+  assert.match(service, /if \(ownsTransactionBoundary && \(finalizeCoverage \|\| metricDates\.length > 0\) && db\.creatorDailyMetrics\)/);
+});

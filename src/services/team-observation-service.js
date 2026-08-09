@@ -2,7 +2,6 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
-const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { upsertPurchaseFromEvent } = require("./team-ppv-ledger-service");
 const { ingestTipEvent } = require("./team-tip-ledger-service");
 const { ingestSubscriptionEvent, markTrafficFanValueDirty } = require("./traffic-service");
@@ -106,134 +105,6 @@ async function resolveCreatorForObservation({ agencyId, account, db = prisma }) 
   });
 }
 
-async function findActiveCatchupJob({ agencyId, creatorId }) {
-  return prisma.jobInstance.findFirst({
-    where: {
-      agencyId,
-      creatorId,
-      jobKey: CATCHUP_JOB_KEY,
-      status: { in: ["SCHEDULED", "CLAIMED"] },
-    },
-    orderBy: { createdAt: "desc" },
-    select: { id: true, status: true, nextRunAt: true, leaseUntil: true },
-  });
-}
-
-async function scheduleCatchupJob({
-  agencyId,
-  creatorId,
-  accountId,
-  creatorRef,
-  deviceId,
-  from,
-  to,
-  types = ["purchases", "tips", "subscriptions", "likes", "comments"],
-  reason = "offline_gap",
-  now = new Date(),
-}) {
-  const active = await findActiveCatchupJob({ agencyId, creatorId });
-  if (active) return { created: false, reason: "already_in_flight", jobId: active.id };
-
-  const lockUntil = new Date(now.getTime() + DEFAULT_LOCK_MS);
-
-  // One-row state lock. This is intentionally not an audit/job log: it only
-  // prevents two devices from scheduling the same catch-up window at once.
-  const locked = await prisma.teamObservationState.updateMany({
-    where: {
-      agencyId,
-      creatorId,
-      OR: [{ lockedUntil: null }, { lockedUntil: { lt: now } }, { currentScanStatus: { in: ["idle", "error"] } }],
-    },
-    data: {
-      currentScanStatus: "queued",
-      currentScanFrom: from,
-      currentScanTo: to,
-      currentScanTypes: types,
-      lockedByDeviceId: clean(deviceId, 160),
-      lockedUntil: lockUntil,
-      lastErrorCode: null,
-      lastErrorAt: null,
-    },
-  });
-
-  if (locked.count === 0) {
-    const state = await prisma.teamObservationState
-      .findUnique({
-        where: { agencyId_creatorId: { agencyId, creatorId } },
-        select: { currentScanStatus: true, lockedUntil: true, lockedByDeviceId: true },
-      })
-      .catch(() => null);
-    return { created: false, reason: "state_locked", state };
-  }
-
-  let idempotencyKey = null;
-  try {
-    const params = {
-      accountId: accountId || creatorId,
-      creatorRef: creatorRef || null,
-      from: from.toISOString(),
-      to: to.toISOString(),
-      types,
-      reason,
-      bufferMinutes: Math.round(DEFAULT_BUFFER_MS / 60000),
-      requestedByDeviceId: deviceId || null,
-    };
-    idempotencyKey = buildJobIdempotencyKey({
-      jobKey: CATCHUP_JOB_KEY,
-      scope: "creator",
-      creatorId,
-      agencyId,
-      params: { from: params.from, to: params.to, types: params.types },
-      bucketAt: from,
-      bucketMs: 0,
-    });
-    const job = await prisma.jobInstance.create({
-      data: {
-        jobKey: CATCHUP_JOB_KEY,
-        scope: "creator",
-        agencyId,
-        creatorId,
-        priority: 80,
-        idempotencyKey,
-        nextRunAt: new Date(),
-        params,
-      },
-    });
-
-    return { created: true, jobId: job.id };
-  } catch (err) {
-    if (err?.code === "P2002") {
-      const existing = await prisma.jobInstance.findUnique({ where: { idempotencyKey } }).catch(() => null);
-      await prisma.teamObservationState
-        .updateMany({
-          where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
-          data: {
-            currentScanStatus: existing?.status === "DONE" ? "idle" : "queued",
-            lockedByDeviceId: null,
-            lockedUntil: null,
-            lastErrorCode: null,
-            lastErrorAt: null,
-          },
-        })
-        .catch(() => null);
-      return { created: false, reason: "idempotency_race", jobId: existing?.id || null };
-    }
-    await prisma.teamObservationState
-      .updateMany({
-        where: { agencyId, creatorId, lockedByDeviceId: clean(deviceId, 160) },
-        data: {
-          currentScanStatus: "error",
-          lockedByDeviceId: null,
-          lockedUntil: null,
-          lastErrorCode: clean(err?.message || err, 500) || "catchup_schedule_failed",
-          lastErrorAt: new Date(),
-        },
-      })
-      .catch(() => null);
-    throw err;
-  }
-}
-
 function computeCatchupWindow(prev, now = new Date()) {
   const lastObserved = maxDate(
     prev?.lastObservedAt,
@@ -298,26 +169,14 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
     update: updateData,
   });
 
-  let scheduled = null;
-  if (window.needed) {
-    scheduled = await scheduleCatchupJob({
-      agencyId,
-      creatorId: creator.id,
-      accountId,
-      creatorRef,
-      deviceId,
-      from: window.from,
-      to: window.to,
-      types: scanTypes,
-      reason: window.reason,
-      now,
-    });
-    state = await prisma.teamObservationState
-      .findUnique({
-        where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
-      })
-      .catch(() => state);
-  }
+  // Creator Analytics is now the single owner of notification catch-up jobs.
+  // Team observation still records realtime/offline coverage, but it must not
+  // create a second catchup_notifications_scan producer with a different
+  // continuation contract. The recurring/initial analytics orchestrator decides
+  // when to schedule the bounded HEAD catch-up.
+  const scheduled = window.needed
+    ? { created: false, reason: 'creator_analytics_orchestrator_owned', jobId: null }
+    : null;
 
   return {
     ok: true,
