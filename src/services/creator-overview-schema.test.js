@@ -28,6 +28,7 @@ test("creator overview is a composed read model, not another raw analytics store
 test("one-year audience range stays locked until six-month backfill has accumulated another half year", () => {
   assert.match(service, /185 \* DAY_MS/);
   assert.match(service, /fullBackfillVerifiedAt/);
+  assert.match(service, /fullBackfillVerifiedAt \|\| ledger\.notificationSync\?\.fullBackfillCompletedAt/);
   assert.match(service, /oldestOccurredAt/);
   assert.match(service, /oneYearAvailable/);
   assert.match(service, /365d/);
@@ -58,4 +59,20 @@ test("activity log records executed work rather than filling history with untouc
   assert.match(migration, /NEW\."startedAt" IS NULL/);
   assert.match(migration, /NEW\."claimedAt" IS NULL/);
   assert.match(service, /status: \{ in: \["CLAIMED", "PAUSED", "DONE", "FAILED", "CANCELLED"\] \}/);
+});
+
+test("task activity day index is queried separately so the renderer never needs 2500 rows just to build day filters", () => {
+  assert.match(service, /readCreatorTaskActivityDays/);
+  assert.match(service, /GROUP BY 1/);
+  assert.match(routes, /readCreatorTaskActivityDays/);
+  assert.match(routes, /Promise\.all/);
+});
+
+test("campaign fan drill-down accepts the overview range and filters money by transaction occurredAt", () => {
+  const ledger = read("services/creator-analytics-ledger-service.js");
+  assert.match(routes, /INVALID_CAMPAIGN_FAN_RANGE/);
+  assert.match(routes, /rangeKey/);
+  assert.match(ledger, /rangeKey = null/);
+  assert.match(ledger, /event\."occurredAt" >= \$4::timestamptz/);
+  assert.match(ledger, /event\."occurredAt" <= \$5::timestamptz/);
 });

@@ -24,7 +24,7 @@ cacheModule(notificationStatePath, {
       from: "2016-01-01T00:00:00.000Z",
       to: "2026-08-09T12:00:00.000Z",
       types: ["purchases", "tips", "subscriptions", "likes", "comments"],
-      notificationMode: state?.fullBackfillVerifiedAt ? "catchup" : "full",
+      notificationMode: state?.fullBackfillVerifiedAt || state?.fullBackfillCompletedAt ? "catchup" : "full",
       pageLimit: 10,
       reason,
       analyticsRangeKey,
@@ -58,7 +58,16 @@ function dbFixture({ financialReady = false, campaignReady = false, active = [] 
       async findFirst({ where }) {
         return active.find((job) => job.jobKey === where.jobKey && ["SCHEDULED", "CLAIMED", "PAUSED"].includes(job.status)) || null;
       },
-      async findMany() { return []; },
+      async findMany({ where } = {}) {
+        if (where?.status?.in) return active.filter((job) => !where.jobKey || job.jobKey === where.jobKey);
+        return [];
+      },
+      async updateMany({ where, data }) {
+        const target = active.find((job) => job.id === where.id && where.status.in.includes(job.status));
+        if (!target) return { count: 0 };
+        Object.assign(target, data, { status: data.status });
+        return { count: 1 };
+      },
       async findUnique({ where }) {
         if (financialReady && where.id === "financial-full-job") return { status: "DONE", params: { financialMode: "full" } };
         return null;
@@ -133,6 +142,26 @@ test("initial pipeline advances only after a verified completion from the curren
   assert.equal(advanced.advanced, true);
   assert.equal(advanced.next.stage, "financial");
   assert.equal(scheduled.at(-1).jobKey, "financial_transactions_scan");
+});
+
+test("a completed historical notification traversal is adopted and redundant automatic full work is fenced", async () => {
+  notificationState = {
+    fullBackfillCompletedAt: new Date("2026-08-08T10:00:00.000Z"),
+    fullBackfillVerifiedAt: null,
+    headNotificationId: "known-head",
+  };
+  const active = [{
+    id: "legacy-auto-full",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    params: { notificationMode: "full", reason: "automatic_old_build" },
+  }];
+  const db = dbFixture({ financialReady: true, campaignReady: true, active });
+  const step = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now: new Date("2026-08-09T12:00:00.000Z") });
+  assert.equal(step.ready, true);
+  assert.equal(active[0].status, "CANCELLED");
+  assert.equal(active[0].lastError, "superseded_by_existing_notification_history");
+  assert.equal(scheduled.length, 0);
 });
 
 test("campaign catch-up compares OF stats against actual stored memberships and keeps per-campaign known frontiers", async () => {

@@ -53,7 +53,7 @@ test("after source traversal the next scan is a short ALL catch-up to the previo
   assert.equal(params.stopAtNotificationId, "notification-head-1");
 });
 
-test("a traversed but unverified full backfill is scheduled as a full repair", () => {
+test("a legacy completed traversal is adopted as the historical baseline instead of replaying full history", () => {
   const params = buildNotificationScanParams({
     state: {
       fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
@@ -63,9 +63,9 @@ test("a traversed but unverified full backfill is scheduled as a full repair", (
     },
     now: new Date("2026-08-06T21:00:00.000Z"),
   });
-  assert.equal(params.notificationMode, "full");
-  assert.equal(params.from, FULL_HISTORY_FROM.toISOString());
-  assert.equal("stopAtNotificationId" in params, false);
+  assert.equal(params.notificationMode, "catchup");
+  assert.equal(params.from, "2026-08-06T18:00:00.000Z");
+  assert.equal(params.stopAtNotificationId, "notification-head-1");
 });
 
 test("page progress is replay-idempotent and advances only to the backend-confirmed cursor", async () => {

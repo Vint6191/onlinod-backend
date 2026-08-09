@@ -112,6 +112,46 @@ async function readCreatorCurrentTask({ db = prisma, creatorId }) {
   };
 }
 
+async function readCreatorTaskActivityDays({ db = prisma, creatorId, now = new Date() }) {
+  const cutoff = new Date(now.getTime() - ACTIVITY_RETENTION_DAYS * DAY_MS);
+  if (typeof db?.$queryRawUnsafe === "function") {
+    try {
+      const rows = await db.$queryRawUnsafe(`
+        SELECT to_char(("updatedAt" AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day
+        FROM "CreatorTaskActivity"
+        WHERE "creatorId" = $1 AND "updatedAt" >= $2
+        GROUP BY 1
+        ORDER BY 1 DESC
+        LIMIT 30
+      `, creatorId, cutoff);
+      return (rows || []).map((row) => text(row.day, 10)).filter(Boolean);
+    } catch {
+      // Rolling deploy fallback below.
+    }
+  }
+  let rows = [];
+  try {
+    rows = db?.creatorTaskActivity?.findMany
+      ? await db.creatorTaskActivity.findMany({
+          where: { creatorId, updatedAt: { gte: cutoff } },
+          orderBy: [{ updatedAt: "desc" }],
+          take: 5000,
+          select: { updatedAt: true },
+        })
+      : [];
+  } catch {
+    rows = db?.jobInstance?.findMany
+      ? await db.jobInstance.findMany({
+          where: { creatorId, updatedAt: { gte: cutoff } },
+          orderBy: [{ updatedAt: "desc" }],
+          take: 5000,
+          select: { updatedAt: true },
+        })
+      : [];
+  }
+  return [...new Set(rows.map((row) => iso(row.updatedAt)?.slice(0, 10)).filter(Boolean))].slice(0, 30);
+}
+
 async function readCreatorTaskActivity({ db = prisma, creatorId, now = new Date(), day = null, limit = 240 }) {
   const cutoff = new Date(now.getTime() - ACTIVITY_RETENTION_DAYS * DAY_MS);
   const take = Math.max(1, Math.min(5000, Number(limit) || 240));
@@ -313,6 +353,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     isActive: row.isActive === true,
     startedAt: iso(row.startedAt),
     endedAt: iso(row.endedAt),
+    fansCount: int(row.fansCount),
     newFans: joinedByCampaign.get(String(row.id)) || 0,
     payingFans: int(row.payingFans),
     netCents: cents(row.netCents),
@@ -325,12 +366,14 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   const campaignFallbackPayers = campaigns.reduce((sum, row) => sum + row.payingFans, 0);
   const payingFans = await readCampaignPayingFanCount({ db, creatorId, start, end, fallback: campaignFallbackPayers });
 
-  const notificationVerifiedAt = ledger.notificationSync?.fullBackfillVerifiedAt ? new Date(ledger.notificationSync.fullBackfillVerifiedAt) : null;
+  const notificationBaselineAtRaw = ledger.notificationSync?.fullBackfillVerifiedAt || ledger.notificationSync?.fullBackfillCompletedAt || null;
+  const notificationBaselineAt = notificationBaselineAtRaw ? new Date(notificationBaselineAtRaw) : null;
+  const notificationBaselineComplete = Boolean(notificationBaselineAt);
   const oldestNotificationAt = ledger.notificationSync?.oldestOccurredAt ? new Date(ledger.notificationSync.oldestOccurredAt) : null;
   const oneYearStart = new Date(now.getTime() - 365 * DAY_MS);
-  const accumulatedFromInitialHalfYear = notificationVerifiedAt && notificationVerifiedAt.getTime() <= now.getTime() - 185 * DAY_MS;
+  const accumulatedFromInitialHalfYear = notificationBaselineAt && notificationBaselineAt.getTime() <= now.getTime() - 185 * DAY_MS;
   const explicitOneYearSpan = oldestNotificationAt && oldestNotificationAt <= oneYearStart;
-  const oneYearAvailable = Boolean(ledger.verification.notificationFacts && (accumulatedFromInitialHalfYear || explicitOneYearSpan));
+  const oneYearAvailable = Boolean(notificationBaselineComplete && (accumulatedFromInitialHalfYear || explicitOneYearSpan));
 
   const activity = subscriptionSummary(ledger.subscriptions);
   activity.likes = int(ledger.totals.likesCount);
@@ -359,7 +402,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
       { key: "365d", label: "1Y", enabled: oneYearAvailable, reason: oneYearAvailable ? null : "Available after ONLINOD has accumulated a full year of activity coverage" },
     ],
     coverage: {
-      notificationVerified: ledger.verification.notificationFacts,
+      notificationVerified: notificationBaselineComplete,
       earningsVerified: ledger.verification.officialEarnings,
       messagesVerified: ledger.verification.officialMessages,
       activityFromAt: iso(ledger.availability?.activityFromAt),
@@ -396,6 +439,7 @@ module.exports = {
   readCreatorOverview,
   readCreatorCurrentTask,
   readCreatorTaskActivity,
+  readCreatorTaskActivityDays,
   progressSnapshot,
   jobLabel,
 };

@@ -30,7 +30,7 @@ const { scheduleJobNow } = require("../services/job-scheduler");
 const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-analytics-permissions");
 const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
 const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily } = require("../services/creator-analytics-ledger-service");
-const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity } = require("../services/creator-overview-service");
+const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity, readCreatorTaskActivityDays } = require("../services/creator-overview-service");
 const { buildNotificationScanParams, loadNotificationSyncState, recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
 const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = require("../services/notification-facts-service");
 const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
@@ -817,8 +817,10 @@ router.get("/creators/:creatorId/task-activity", async (req, res) => {
       return res.status(400).json({ ok: false, code: "INVALID_ACTIVITY_DAY", error: "day must be YYYY-MM-DD" });
     }
     const limit = Math.max(1, Math.min(5000, Number.parseInt(String(req.query.limit || "240"), 10) || 240));
-    const items = await readCreatorTaskActivity({ creatorId: ctx.creator.id, day, limit });
-    const days = [...new Set(items.map((item) => item.day).filter(Boolean))];
+    const [items, days] = await Promise.all([
+      readCreatorTaskActivity({ creatorId: ctx.creator.id, day, limit }),
+      readCreatorTaskActivityDays({ creatorId: ctx.creator.id }),
+    ]);
     return res.json({ ok: true, creatorId: ctx.creator.id, retentionDays: 30, days, items });
   } catch (error) {
     console.error("[stats/task-activity] failed:", error);
@@ -875,11 +877,16 @@ router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) =
     if (!campaignId || campaignId.length > 220) {
       return res.status(400).json({ ok: false, code: "INVALID_CAMPAIGN_ID", error: "Invalid campaign id" });
     }
+    const rangeKey = String(req.query.range || "").trim() || null;
+    if (rangeKey && !["7d", "30d", "90d", "180d", "365d"].includes(rangeKey)) {
+      return res.status(400).json({ ok: false, code: "INVALID_CAMPAIGN_FAN_RANGE", error: `Invalid campaign fan range: ${rangeKey}` });
+    }
     const result = await readCampaignFans({
       creatorId: ctx.creator.id,
       campaignId,
       limit,
       offset,
+      rangeKey,
     });
     if (!result) return res.status(404).json({ ok: false, code: "CAMPAIGN_NOT_FOUND", error: "Campaign not found for this creator" });
     return res.json({ ok: true, creatorId: ctx.creator.id, ...result });

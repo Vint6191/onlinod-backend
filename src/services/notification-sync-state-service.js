@@ -34,8 +34,12 @@ function runtimeRangeTo(now = new Date()) {
 }
 
 function buildNotificationScanParams({ state = null, now = new Date(), reason = "creator_analytics_refresh", analyticsRangeKey = "all" } = {}) {
-  const fullVerified = Boolean(state?.fullBackfillVerifiedAt);
-  if (!fullVerified) {
+  // A completed historical traversal is enough to enter bounded catch-up mode.
+  // fullBackfillVerifiedAt is the stronger proof bit, but older collectors may
+  // have completed the full walk before the stricter verification contract was
+  // introduced. Never punish those creators by replaying the entire history.
+  const historicalBaseline = Boolean(state?.fullBackfillVerifiedAt || state?.fullBackfillCompletedAt);
+  if (!historicalBaseline) {
     return {
       from: FULL_HISTORY_FROM.toISOString(),
       to: runtimeRangeTo(now).toISOString(),

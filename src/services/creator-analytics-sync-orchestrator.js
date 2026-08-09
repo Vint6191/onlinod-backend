@@ -64,6 +64,47 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
   return scheduleNow({ jobKey, creatorId, agencyId, params, priority, now, bucketMs });
 }
 
+function notificationHistoricalBaselineReady(state) {
+  return Boolean(state?.fullBackfillVerifiedAt || state?.fullBackfillCompletedAt);
+}
+
+async function cancelRedundantInitialNotificationJobs(db, creatorId, now = new Date()) {
+  if (!db?.jobInstance?.findMany || !db?.jobInstance?.updateMany) return 0;
+  const rows = await db.jobInstance.findMany({
+    where: {
+      creatorId,
+      jobKey: NOTIFICATION_JOB_KEY,
+      status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] },
+    },
+    orderBy: [{ createdAt: "desc" }],
+    take: 20,
+  });
+  let cancelled = 0;
+  for (const job of rows) {
+    const params = object(job.params);
+    // Never cancel a full rebuild the user explicitly started from the debug UI.
+    // Old automatic full jobs from pre-orchestrator builds may not have
+    // analyticsSyncKind at all, so manualNotificationScan is the reliable fence.
+    if (params.manualNotificationScan === true || params.notificationMode !== "full") continue;
+    const result = await db.jobInstance.updateMany({
+      where: { id: job.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+      data: {
+        status: "CANCELLED",
+        completedAt: now,
+        lastError: "superseded_by_existing_notification_history",
+        claimedAt: null,
+        claimedByDeviceId: null,
+        leaseUntil: null,
+        leaseTokenHash: null,
+        leaseRevision: { increment: 1 },
+        workId: null,
+      },
+    });
+    cancelled += Number(result?.count || 0);
+  }
+  return cancelled;
+}
+
 async function financialInitialCoverageReady(db, creatorId) {
   if (!db?.creatorEarningsTotal?.findUnique || !db?.jobInstance?.findUnique) return false;
   const total = await db.creatorEarningsTotal.findUnique({
@@ -91,7 +132,12 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
   if (!creatorId || !agencyId) return { ready: false, stage: "invalid", created: false, reason: "missing_scope" };
 
   const notificationState = await loadNotificationSyncState(db, creatorId);
-  if (!notificationState?.fullBackfillVerifiedAt) {
+  if (notificationHistoricalBaselineReady(notificationState)) {
+    // Older builds may already have a complete full-history traversal while a
+    // newer bootstrap job was queued under the stricter verification contract.
+    // Fence that redundant full walk immediately; future work starts at HEAD.
+    await cancelRedundantInitialNotificationJobs(db, creatorId, now);
+  } else {
     const params = {
       ...buildNotificationScanParams({ state: notificationState, now, reason: "creator_initial_analytics_sync", analyticsRangeKey: "all" }),
       analyticsSyncKind: "initial",
@@ -251,7 +297,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
   ]);
 
   const lastNotificationCatchup = notificationJobs.find((job) => job.status === "DONE" && catchupParams(job.params) && object(job.params).notificationMode === "catchup" && job.completedAt);
-  if (notificationState?.fullBackfillVerifiedAt && due(notificationState.lastCatchupCompletedAt || lastNotificationCatchup?.completedAt, NOTIFICATION_CATCHUP_INTERVAL_MS, now)) {
+  if (notificationHistoricalBaselineReady(notificationState) && due(notificationState.lastCatchupCompletedAt || lastNotificationCatchup?.completedAt, NOTIFICATION_CATCHUP_INTERVAL_MS, now)) {
     const knownNotificationIds = await recentKnownNotificationIds(db, creatorId);
     const params = {
       ...buildNotificationScanParams({ state: notificationState, now, reason: "creator_analytics_catchup", analyticsRangeKey: "all" }),

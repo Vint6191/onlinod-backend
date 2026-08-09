@@ -1374,7 +1374,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   };
 }
 
-async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50, offset = 0 }) {
+async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50, offset = 0, rangeKey = null, now = new Date() }) {
   const take = Math.max(1, Math.min(100, Number(limit) || 50));
   const skip = Math.max(0, Math.min(1_000_000, Number(offset) || 0));
   const campaign = await db.creatorCampaign.findFirst({
@@ -1421,6 +1421,7 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
   });
   const pageRows = rows.slice(0, take);
   const fanIds = pageRows.map((row) => row.fanId).filter(Boolean);
+  const range = rangeKey ? rangeBounds(rangeKey, now) : null;
   let moneyByFan = new Map();
   const queryRaw = typeof db.$queryRawUnsafe === "function"
     ? db.$queryRawUnsafe.bind(db)
@@ -1447,6 +1448,8 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
         ) AS membership ON TRUE
         WHERE event."creatorId" = $1
           AND event."fanId" = ANY($3::text[])
+          AND ($4::timestamptz IS NULL OR event."occurredAt" >= $4::timestamptz)
+          AND ($5::timestamptz IS NULL OR event."occurredAt" <= $5::timestamptz)
       )
       SELECT
         "fanId",
@@ -1462,7 +1465,7 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
       FROM attributed
       WHERE "campaignId" = $2
       GROUP BY "fanId"
-    `, creatorId, campaign.id, fanIds);
+    `, creatorId, campaign.id, fanIds, range?.start || null, range?.end || null);
     moneyByFan = new Map(moneyRows.map((row) => [String(row.fanId), {
       grossCents: Number(row.grossCents || 0),
       netCents: Number(row.netCents || 0),
@@ -1483,6 +1486,7 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
   const hasMore = rows.length > take;
   return {
     campaign,
+    range: range ? { key: range.key, startAt: range.start.toISOString(), endAt: range.end.toISOString() } : null,
     fans: pageRows.map((row) => {
       const { valueCurrent, ...fan } = row.fan;
       return {
