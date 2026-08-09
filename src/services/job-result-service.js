@@ -8,7 +8,7 @@ const { recordNotificationPageProgress } = require("./notification-sync-state-se
 const { recordNotificationScanItems } = require("./notification-scan-control-service");
 const { JOB_KEY: FINANCIAL_TRANSACTIONS_JOB_KEY, ingestFinancialTransactionsChunk, ingestFinancialChartChunk, completeFinancialTransactionsScan } = require("./financial-transactions-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
-const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, ingestCampaignFanValueChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
+const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, ingestCampaignFanValueChunk, ingestCampaignFanValuesBatchChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
 const {
   LIKES_DISCOVERY_JOB_KEY,
   applyLikesDiscoveryChunk,
@@ -190,6 +190,9 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   }
   if (job.jobKey === CAMPAIGNS_JOB_KEY && chunkResult?.kind === "campaign_fan_value") {
     return ingestCampaignFanValueChunk({ db, job, deviceId, chunk: chunkResult });
+  }
+  if (job.jobKey === CAMPAIGNS_JOB_KEY && chunkResult?.kind === "campaign_fan_values_batch") {
+    return ingestCampaignFanValuesBatchChunk({ db, job, deviceId, chunk: chunkResult });
   }
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
     return applyDialogIntelligenceChunk({ db, job, deviceId, userId, chunkResult });

@@ -3,7 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
-const { JOB_KEY, SCHEMA_VERSION, COLLECTOR_VERSION } = require("./financial-transactions-service");
+const { JOB_KEY, SCHEMA_VERSION, COLLECTOR_VERSION, summarizeStatusGroups } = require("./financial-transactions-service");
 
 const MANUAL_REASON = "manual_creator_analytics_financial_transactions_scan";
 const ACTIVE_STATUSES = new Set(["SCHEDULED", "CLAIMED", "PAUSED"]);
@@ -154,21 +154,22 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
   let total = 0;
   let summary = {
     transactionsCount: 0, grossCents: 0, netCents: 0, feeCents: 0, projected: 0, storedOnly: 0,
+    earningsTransactionsCount: 0, earningsGrossCents: 0, earningsNetCents: 0,
     settledTransactionsCount: 0, settledGrossCents: 0, settledNetCents: 0,
     pendingTransactionsCount: 0, pendingGrossCents: 0, pendingNetCents: 0,
+    refundTransactionsCount: 0, refundGrossCents: 0, refundNetCents: 0,
   };
+  let statusSummary = [];
   let typeSummary = [];
   let charts = [];
   let bounds = null;
   if (job) {
     const where = { creatorId: creator.id, sourceJobId: job.id, ...(clean(result.scanRunId, 120) ? { scanRunId: clean(result.scanRunId, 120) } : {}) };
-    const settledWhere = { ...where, transactionStatus: "done" };
-    const [items, count, aggregate, settledCount, settledAggregate, projectionGroups, typeGroups, chartRows, minMax] = await Promise.all([
+    const [items, count, aggregate, statusGroups, projectionGroups, typeGroups, chartRows, minMax] = await Promise.all([
       db.creatorFinancialTransaction.findMany({ where, orderBy: [{ page: "desc" }, { ordinal: "asc" }, { occurredAt: "desc" }], skip: safeOffset, take: safeLimit }),
       db.creatorFinancialTransaction.count({ where }),
       db.creatorFinancialTransaction.aggregate({ where, _sum: { amountCents: true, netCents: true, feeCents: true } }),
-      db.creatorFinancialTransaction.count({ where: settledWhere }),
-      db.creatorFinancialTransaction.aggregate({ where: settledWhere, _sum: { amountCents: true, netCents: true, feeCents: true } }),
+      db.creatorFinancialTransaction.groupBy({ by: ["transactionStatus"], where, _count: { _all: true }, _sum: { amountCents: true, netCents: true, feeCents: true } }),
       db.creatorFinancialTransaction.groupBy({ by: ["projectionStatus"], where, _count: { _all: true } }),
       db.creatorFinancialTransaction.groupBy({ by: ["transactionType", "factType", "projectionStatus", "reasonCode"], where, _count: { _all: true }, _sum: { amountCents: true, netCents: true } }),
       db.creatorEarningsTotal.findMany({ where: { creatorId: creator.id, sourceJobId: job.id }, orderBy: { category: "asc" } }),
@@ -179,8 +180,8 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     const grossCents = Number(aggregate?._sum?.amountCents || 0);
     const netCents = Number(aggregate?._sum?.netCents || 0);
     const feeCents = Number(aggregate?._sum?.feeCents || 0);
-    const settledGrossCents = Number(settledAggregate?._sum?.amountCents || 0);
-    const settledNetCents = Number(settledAggregate?._sum?.netCents || 0);
+    const statusTotals = summarizeStatusGroups(statusGroups);
+    statusSummary = statusTotals.statusSummary;
     summary = {
       transactionsCount: count,
       grossCents,
@@ -188,12 +189,18 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
       feeCents,
       projected: Number(projectionGroups.find((group) => group.projectionStatus === "PROJECTED")?._count?._all || 0),
       storedOnly: Number(projectionGroups.find((group) => group.projectionStatus === "STORED_ONLY")?._count?._all || 0),
-      settledTransactionsCount: settledCount,
-      settledGrossCents,
-      settledNetCents,
-      pendingTransactionsCount: Math.max(0, count - settledCount),
-      pendingGrossCents: grossCents - settledGrossCents,
-      pendingNetCents: netCents - settledNetCents,
+      earningsTransactionsCount: Math.max(0, count - statusTotals.refundTransactionsCount),
+      earningsGrossCents: grossCents - statusTotals.refundGrossCents,
+      earningsNetCents: netCents - statusTotals.refundNetCents,
+      settledTransactionsCount: statusTotals.settledTransactionsCount,
+      settledGrossCents: statusTotals.settledGrossCents,
+      settledNetCents: statusTotals.settledNetCents,
+      pendingTransactionsCount: statusTotals.pendingTransactionsCount,
+      pendingGrossCents: statusTotals.pendingGrossCents,
+      pendingNetCents: statusTotals.pendingNetCents,
+      refundTransactionsCount: statusTotals.refundTransactionsCount,
+      refundGrossCents: statusTotals.refundGrossCents,
+      refundNetCents: statusTotals.refundNetCents,
     };
     typeSummary = typeGroups.map((group) => ({
       transactionType: group.transactionType,
@@ -218,9 +225,9 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
   const scannerRejected = integer(result.scannerRejected ?? continuation.scannerRejected, 0, 100_000_000);
   const computedReconciliation = {
     chartReady: Boolean(totalChart),
-    countMatched: Boolean(totalChart) && summary.settledTransactionsCount === Number(totalChart.transactionsCount || 0),
-    grossMatched: Boolean(totalChart) && summary.settledGrossCents === Number(totalChart.grossCents || 0),
-    netMatched: Boolean(totalChart) && summary.settledNetCents === Number(totalChart.netCents || 0),
+    countMatched: Boolean(totalChart) && summary.earningsTransactionsCount === Number(totalChart.transactionsCount || 0),
+    grossMatched: Boolean(totalChart) && summary.earningsGrossCents === Number(totalChart.grossCents || 0),
+    netMatched: Boolean(totalChart) && summary.earningsNetCents === Number(totalChart.netCents || 0),
     chartCount: totalChart ? Number(totalChart.transactionsCount || 0) : null,
     chartGrossCents: totalChart ? Number(totalChart.grossCents || 0) : null,
     chartNetCents: totalChart ? Number(totalChart.netCents || 0) : null,
@@ -252,6 +259,7 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     currentMessage: clean(progress.message, 500),
     onlineWorkers,
     summary,
+    statusSummary,
     typeSummary,
     charts,
     reconciliation: computedReconciliation,

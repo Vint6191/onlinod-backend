@@ -13,6 +13,42 @@ const KNOWN_SALE_TYPES = new Map([
   ["stream", "STREAM"],
 ]);
 const TIP_TYPES = new Set(["tip", "tips"]);
+
+const REFUND_TRANSACTION_STATUSES = new Set(["undo"]);
+const PAYOUT_PENDING_TRANSACTION_STATUSES = new Set(["loading"]);
+
+function normalizedStatus(value) {
+  return String(value || "").trim().toLowerCase();
+}
+function summarizeStatusGroups(groups = []) {
+  const statusSummary = [];
+  let refundTransactionsCount = 0, refundGrossCents = 0, refundNetCents = 0, refundFeeCents = 0;
+  let pendingTransactionsCount = 0, pendingGrossCents = 0, pendingNetCents = 0, pendingFeeCents = 0;
+  let settledTransactionsCount = 0, settledGrossCents = 0, settledNetCents = 0, settledFeeCents = 0;
+  for (const group of groups || []) {
+    const status = normalizedStatus(group.transactionStatus);
+    const count = Number(group?._count?._all || 0);
+    const grossCents = Number(group?._sum?.amountCents || 0);
+    const netCents = Number(group?._sum?.netCents || 0);
+    const feeCents = Number(group?._sum?.feeCents || 0);
+    statusSummary.push({ status: status || null, count, grossCents, netCents, feeCents });
+    if (status === "done") {
+      settledTransactionsCount += count; settledGrossCents += grossCents; settledNetCents += netCents; settledFeeCents += feeCents;
+    }
+    if (PAYOUT_PENDING_TRANSACTION_STATUSES.has(status)) {
+      pendingTransactionsCount += count; pendingGrossCents += grossCents; pendingNetCents += netCents; pendingFeeCents += feeCents;
+    }
+    if (REFUND_TRANSACTION_STATUSES.has(status)) {
+      refundTransactionsCount += count; refundGrossCents += grossCents; refundNetCents += netCents; refundFeeCents += feeCents;
+    }
+  }
+  return {
+    statusSummary: statusSummary.sort((a, b) => b.count - a.count || String(a.status || "").localeCompare(String(b.status || ""))),
+    settledTransactionsCount, settledGrossCents, settledNetCents, settledFeeCents,
+    pendingTransactionsCount, pendingGrossCents, pendingNetCents, pendingFeeCents,
+    refundTransactionsCount, refundGrossCents, refundNetCents, refundFeeCents,
+  };
+}
 const CHART_CATEGORY_MAP = Object.freeze({
   total: "TOTAL",
   subscribes: "SUBSCRIPTIONS",
@@ -363,40 +399,38 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const scanRunId = clean(payload.scanRunId, 120);
   if (!scanRunId) throw new Error("Financial transaction completion is missing scanRunId");
   const baseWhere = { creatorId: job.creatorId, sourceJobId: job.id, scanRunId };
-  const settledWhere = { ...baseWhere, transactionStatus: "done" };
-  const [aggregate, count, settledAggregate, settledCount, chartTotal, storedOnly] = await Promise.all([
+  const [aggregate, count, statusGroups, chartTotal, storedOnly] = await Promise.all([
     db.creatorFinancialTransaction.aggregate({
       where: baseWhere,
       _sum: { amountCents: true, netCents: true, feeCents: true },
     }),
     db.creatorFinancialTransaction.count({ where: baseWhere }),
-    db.creatorFinancialTransaction.aggregate({
-      where: settledWhere,
+    db.creatorFinancialTransaction.groupBy({
+      by: ["transactionStatus"],
+      where: baseWhere,
+      _count: { _all: true },
       _sum: { amountCents: true, netCents: true, feeCents: true },
     }),
-    db.creatorFinancialTransaction.count({ where: settledWhere }),
     db.creatorEarningsTotal.findUnique({ where: { creatorId_category: { creatorId: job.creatorId, category: "TOTAL" } } }),
     db.creatorFinancialTransaction.count({ where: { ...baseWhere, projectionStatus: "STORED_ONLY" } }),
   ]);
   const grossCents = Number(aggregate?._sum?.amountCents || 0);
   const netCents = Number(aggregate?._sum?.netCents || 0);
   const feeCents = Number(aggregate?._sum?.feeCents || 0);
-  const settledGrossCents = Number(settledAggregate?._sum?.amountCents || 0);
-  const settledNetCents = Number(settledAggregate?._sum?.netCents || 0);
-  const settledFeeCents = Number(settledAggregate?._sum?.feeCents || 0);
-  const pendingCount = Math.max(0, count - settledCount);
-  const pendingGrossCents = grossCents - settledGrossCents;
-  const pendingNetCents = netCents - settledNetCents;
-  const pendingFeeCents = feeCents - settledFeeCents;
+  const statusTotals = summarizeStatusGroups(statusGroups);
+  const earningsTransactionsCount = Math.max(0, count - statusTotals.refundTransactionsCount);
+  const earningsGrossCents = grossCents - statusTotals.refundGrossCents;
+  const earningsNetCents = netCents - statusTotals.refundNetCents;
+  const earningsFeeCents = feeCents - statusTotals.refundFeeCents;
   const sourceBoundaryReached = payload.sourceBoundaryReached === true;
   const scannerRejected = integer(payload.scannerRejected, 0, 100_000_000);
   const chartReady = Boolean(chartTotal && chartTotal.sourceJobId === job.id && chartTotal.scanRunId === scanRunId);
-  // earnings/chart represents settled earnings. /payouts/transactions also
-  // includes loading/pending rows, so reconciliation must compare the chart to
-  // status=done only while still retaining every pending source fact.
-  const countMatched = chartReady ? settledCount === Number(chartTotal.transactionsCount || 0) : false;
-  const grossMatched = chartReady ? settledGrossCents === Number(chartTotal.grossCents || 0) : false;
-  const netMatched = chartReady ? settledNetCents === Number(chartTotal.netCents || 0) : false;
+  // Live OF evidence from multiple creators shows earnings/chart includes both
+  // cleared (done) and payout-pending (loading) earnings, while status=undo is
+  // a refunded/reversed transaction and is excluded from chart earnings.
+  const countMatched = chartReady ? earningsTransactionsCount === Number(chartTotal.transactionsCount || 0) : false;
+  const grossMatched = chartReady ? earningsGrossCents === Number(chartTotal.grossCents || 0) : false;
+  const netMatched = chartReady ? earningsNetCents === Number(chartTotal.netCents || 0) : false;
   const complete = sourceBoundaryReached && scannerRejected === 0 && chartReady && countMatched && grossMatched && netMatched;
   return {
     ok: true,
@@ -409,14 +443,23 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
     grossCents,
     netCents,
     feeCents,
-    settledTransactionsCount: settledCount,
-    settledGrossCents,
-    settledNetCents,
-    settledFeeCents,
-    pendingTransactionsCount: pendingCount,
-    pendingGrossCents,
-    pendingNetCents,
-    pendingFeeCents,
+    earningsTransactionsCount,
+    earningsGrossCents,
+    earningsNetCents,
+    earningsFeeCents,
+    settledTransactionsCount: statusTotals.settledTransactionsCount,
+    settledGrossCents: statusTotals.settledGrossCents,
+    settledNetCents: statusTotals.settledNetCents,
+    settledFeeCents: statusTotals.settledFeeCents,
+    pendingTransactionsCount: statusTotals.pendingTransactionsCount,
+    pendingGrossCents: statusTotals.pendingGrossCents,
+    pendingNetCents: statusTotals.pendingNetCents,
+    pendingFeeCents: statusTotals.pendingFeeCents,
+    refundTransactionsCount: statusTotals.refundTransactionsCount,
+    refundGrossCents: statusTotals.refundGrossCents,
+    refundNetCents: statusTotals.refundNetCents,
+    refundFeeCents: statusTotals.refundFeeCents,
+    statusSummary: statusTotals.statusSummary,
     storedOnly,
     reconciliation: {
       chartReady,
@@ -438,4 +481,7 @@ module.exports = {
   ingestFinancialTransactionsChunk,
   ingestFinancialChartChunk,
   completeFinancialTransactionsScan,
+  summarizeStatusGroups,
+  REFUND_TRANSACTION_STATUSES,
+  PAYOUT_PENDING_TRANSACTION_STATUSES,
 };

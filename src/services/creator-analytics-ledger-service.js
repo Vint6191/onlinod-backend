@@ -6,7 +6,8 @@ const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
 
 const RANGE_DAYS = Object.freeze({ "24h": 1, "7d": 7, "30d": 30, "90d": 90, "180d": 180, "365d": 365 });
-const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v5";
+const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v6";
+const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", CAMPAIGN_COLLECTOR_VERSION]);
 const CAMPAIGN_SCHEMA_VERSION = 4;
 const EARNINGS_COLLECTOR_VERSION = "earnings-v4";
 const EARNINGS_SCHEMA_VERSION = 4;
@@ -539,7 +540,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
   const observedAt = strictDate(payload.observedAt);
   if (
     !batchKey || !scanRunId || !scanStartedAt || !observedAt || scanStartedAt > observedAt ||
-    payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || payload.collectorVersion !== CAMPAIGN_COLLECTOR_VERSION
+    payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
   ) {
     throw new Error("Invalid campaign chunk contract");
   }
@@ -745,6 +746,80 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
   });
 }
 
+function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
+  const item = object(payload);
+  const observedAt = strictDate(item.observedAt ?? inheritedObservedAt);
+  const onlyFansUserId = text(item.fanOnlyFansUserId, 180);
+  if (!observedAt || !onlyFansUserId) throw new Error("Invalid campaign fan value item contract");
+  if (item.available !== true) {
+    return { available: false, observedAt, onlyFansUserId, reasonCode: text(item.reasonCode, 180) || "FAN_VALUE_UNAVAILABLE" };
+  }
+  const values = {
+    totalNetCents: safeBigIntCents(item.totalNetCents),
+    messagesNetCents: safeBigIntCents(item.messagesNetCents),
+    subscriptionsNetCents: safeBigIntCents(item.subscriptionsNetCents),
+    tipsNetCents: safeBigIntCents(item.tipsNetCents),
+    postsNetCents: safeBigIntCents(item.postsNetCents),
+    streamsNetCents: safeBigIntCents(item.streamsNetCents),
+  };
+  if (Object.values(values).some((value) => value === null)) throw new Error("Campaign fan value cents are invalid");
+  const lastActivityAt = item.lastActivityAt == null ? null : strictDate(item.lastActivityAt);
+  if (item.lastActivityAt != null && !lastActivityAt) throw new Error("Campaign fan value lastActivityAt is invalid");
+  return {
+    available: true, observedAt, onlyFansUserId, values, lastActivityAt,
+    username: text(item.username, 200),
+    displayName: text(item.displayName, 500),
+  };
+}
+
+async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }) {
+  if (item.available !== true) return { available: false, reasonCode: item.reasonCode };
+  const fan = await tx.creatorFan.findUnique({
+    where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId: item.onlyFansUserId } },
+    select: { id: true },
+  });
+  if (!fan) return { available: false, reasonCode: "CAMPAIGN_FAN_NOT_FOUND" };
+
+  const existing = await tx.creatorFanValueCurrent.findUnique({
+    where: { creatorId_fanId: { creatorId: job.creatorId, fanId: fan.id } },
+    select: { id: true, fetchedAt: true },
+  });
+  if (existing?.fetchedAt && new Date(existing.fetchedAt).getTime() >= item.observedAt.getTime()) {
+    return { replay: true, available: true, fanId: fan.id, fetchedAt: existing.fetchedAt };
+  }
+
+  if (item.username || item.displayName) {
+    await tx.creatorFan.update({
+      where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId: item.onlyFansUserId } },
+      data: { ...(item.username ? { username: item.username } : {}), ...(item.displayName ? { displayName: item.displayName } : {}) },
+    });
+  }
+
+  const data = {
+    agencyId: job.agencyId,
+    creatorId: job.creatorId,
+    fanId: fan.id,
+    totalNetCents: item.values.totalNetCents,
+    messagesNetCents: item.values.messagesNetCents,
+    subscriptionsNetCents: item.values.subscriptionsNetCents,
+    tipsNetCents: item.values.tipsNetCents,
+    postsNetCents: item.values.postsNetCents,
+    streamsNetCents: item.values.streamsNetCents,
+    lastActivityAt: item.lastActivityAt,
+    fetchedAt: item.observedAt,
+    source: "ONLYFANS_SUBSCRIBER_PROFILE",
+    sourceDeviceId: deviceId || null,
+    sourceJobId: job.id,
+    scanRunId,
+  };
+  await tx.creatorFanValueCurrent.upsert({
+    where: { creatorId_fanId: { creatorId: job.creatorId, fanId: fan.id } },
+    create: data,
+    update: data,
+  });
+  return { replay: false, available: true, fanId: fan.id, fetchedAt: item.observedAt };
+}
+
 async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }) {
   requireJob(job);
   const payload = object(chunk);
@@ -753,81 +828,38 @@ async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }
   const scanRunId = text(payload.scanRunId, 120);
   const scanStartedAt = strictDate(payload.scanStartedAt);
   const observedAt = strictDate(payload.observedAt);
-  const onlyFansUserId = text(payload.fanOnlyFansUserId, 180);
   if (
-    !batchKey || !scanRunId || !scanStartedAt || !observedAt || !onlyFansUserId || scanStartedAt > observedAt ||
-    payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || payload.collectorVersion !== CAMPAIGN_COLLECTOR_VERSION
-  ) {
-    throw new Error("Invalid campaign fan value chunk contract");
-  }
+    !batchKey || !scanRunId || !scanStartedAt || !observedAt || scanStartedAt > observedAt ||
+    payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
+  ) throw new Error("Invalid campaign fan value chunk contract");
   if (!batchKey.startsWith(`run:${scanRunId}:`)) throw new Error("Campaign fan value batch key does not match scan run");
-  if (payload.available !== true) {
-    return { replay: false, available: false, reasonCode: text(payload.reasonCode, 180) || "FAN_VALUE_UNAVAILABLE" };
-  }
-
-  const values = {
-    totalNetCents: safeBigIntCents(payload.totalNetCents),
-    messagesNetCents: safeBigIntCents(payload.messagesNetCents),
-    subscriptionsNetCents: safeBigIntCents(payload.subscriptionsNetCents),
-    tipsNetCents: safeBigIntCents(payload.tipsNetCents),
-    postsNetCents: safeBigIntCents(payload.postsNetCents),
-    streamsNetCents: safeBigIntCents(payload.streamsNetCents),
-  };
-  if (Object.values(values).some((value) => value === null)) throw new Error("Campaign fan value cents are invalid");
-  const lastActivityAt = payload.lastActivityAt == null ? null : strictDate(payload.lastActivityAt);
-  if (payload.lastActivityAt != null && !lastActivityAt) throw new Error("Campaign fan value lastActivityAt is invalid");
-  const username = text(payload.username, 200);
-  const displayName = text(payload.displayName, 500);
-
+  const item = normalizeCampaignFanValueItem(payload, observedAt);
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
-    const fan = await tx.creatorFan.findUnique({
-      where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId } },
-      select: { id: true },
-    });
-    if (!fan) throw new Error("Campaign fan value references an unknown fan");
+    return upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item });
+  });
+}
 
-    const existing = await tx.creatorFanValueCurrent.findUnique({
-      where: { creatorId_fanId: { creatorId: job.creatorId, fanId: fan.id } },
-      select: { id: true, fetchedAt: true },
-    });
-    if (existing?.fetchedAt && new Date(existing.fetchedAt).getTime() >= observedAt.getTime()) {
-      return { replay: true, available: true, fanId: fan.id, fetchedAt: existing.fetchedAt };
-    }
-
-    if (username || displayName) {
-      await tx.creatorFan.update({
-        where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId } },
-        data: {
-          ...(username ? { username } : {}),
-          ...(displayName ? { displayName } : {}),
-        },
-      });
-    }
-
-    const data = {
-      agencyId: job.agencyId,
-      creatorId: job.creatorId,
-      fanId: fan.id,
-      totalNetCents: values.totalNetCents,
-      messagesNetCents: values.messagesNetCents,
-      subscriptionsNetCents: values.subscriptionsNetCents,
-      tipsNetCents: values.tipsNetCents,
-      postsNetCents: values.postsNetCents,
-      streamsNetCents: values.streamsNetCents,
-      lastActivityAt,
-      fetchedAt: observedAt,
-      source: "ONLYFANS_SUBSCRIBER_PROFILE",
-      sourceDeviceId: deviceId || null,
-      sourceJobId: job.id,
-      scanRunId,
-    };
-    await tx.creatorFanValueCurrent.upsert({
-      where: { creatorId_fanId: { creatorId: job.creatorId, fanId: fan.id } },
-      create: data,
-      update: data,
-    });
-    return { replay: false, available: true, fanId: fan.id, fetchedAt: observedAt };
+async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, chunk }) {
+  requireJob(job);
+  const payload = object(chunk);
+  if (text(payload.kind, 80) !== "campaign_fan_values_batch") throw new Error("Unsupported campaign fan values batch kind");
+  const batchKey = text(payload.batchKey, 500);
+  const scanRunId = text(payload.scanRunId, 120);
+  const scanStartedAt = strictDate(payload.scanStartedAt);
+  const observedAt = strictDate(payload.observedAt);
+  const values = array(payload.values);
+  if (
+    !batchKey || !scanRunId || !scanStartedAt || !observedAt || scanStartedAt > observedAt || values.length < 1 || values.length > 20 ||
+    payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
+  ) throw new Error("Invalid campaign fan values batch contract");
+  if (!batchKey.startsWith(`run:${scanRunId}:`)) throw new Error("Campaign fan values batch key does not match scan run");
+  const normalized = values.map((value) => normalizeCampaignFanValueItem(value, observedAt));
+  return inTransaction(db, async (tx) => {
+    await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
+    const applied = [];
+    for (const item of normalized) applied.push(await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }));
+    return { replay: applied.every((row) => row.replay === true), received: normalized.length, available: applied.filter((row) => row.available === true).length, unavailable: applied.filter((row) => row.available !== true).length, applied };
   });
 }
 
@@ -838,7 +870,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   const scanStartedAt = strictDate(payload.scanStartedAt);
   const observedAt = strictDate(payload.observedAt);
   if (
-    payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || payload.collectorVersion !== CAMPAIGN_COLLECTOR_VERSION ||
+    payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion) ||
     !scanRunId || !scanStartedAt || !observedAt || scanStartedAt > observedAt
   ) {
     throw new Error("Invalid campaign completion contract");
@@ -849,7 +881,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   if (expectedCampaignBatches === null || expectedClaimerBatches === null || expectedCampaignCount === null) {
     throw new Error("Campaign completion counters are invalid");
   }
-  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v5`;
+  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v6`;
   if (key.length > 240) throw new Error("Campaign completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
@@ -897,10 +929,15 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
       expectedCampaignCount,
       observedCampaignCount,
       allCommitted,
+      fanValuesComplete: payload.fanValuesComplete === true,
+      fanValuesRequested: integer(payload.fanValuesRequested, 100_000_000),
+      fanValuesFetched: integer(payload.fanValuesFetched, 100_000_000),
+      fanValuesUnavailable: integer(payload.fanValuesUnavailable, 100_000_000),
     };
     const complete =
       payload.campaignPagesComplete === true &&
       payload.claimersComplete === true &&
+      payload.fanValuesComplete === true &&
       payload.truncated !== true &&
       allCommitted &&
       campaignBatches.length === expectedCampaignBatches &&
@@ -1125,19 +1162,19 @@ async function readCampaignRevenue({ db, creatorId, start = null, end = null }) 
     )
     SELECT
       "campaignId",
-      COALESCE(SUM("amountCents"), 0)::bigint AS "grossCents",
-      COALESCE(SUM("netCents"), 0)::bigint AS "netCents",
-      COUNT(*)::bigint AS "transactionsCount",
-      COUNT(DISTINCT "fanId")::bigint AS "payingFans",
+      COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "grossCents",
+      COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "netCents",
+      COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo')::bigint AS "transactionsCount",
+      COUNT(DISTINCT "fanId") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo')::bigint AS "payingFans",
       COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledGrossCents",
       COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledNetCents",
       COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done')::bigint AS "settledTransactionsCount",
-      COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done'), 0)::bigint AS "pendingGrossCents",
-      COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done'), 0)::bigint AS "pendingNetCents",
-      COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done')::bigint AS "pendingTransactionsCount",
-      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" IN ('message','post','stream')), 0)::bigint AS "salesRevenueCents",
-      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" IN ('tip','tips')), 0)::bigint AS "tipsRevenueCents",
-      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" LIKE 'subscription%'), 0)::bigint AS "subscriptionRevenueCents"
+      COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading'), 0)::bigint AS "pendingGrossCents",
+      COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading'), 0)::bigint AS "pendingNetCents",
+      COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading')::bigint AS "pendingTransactionsCount",
+      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" IN ('message','post','stream') AND LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "salesRevenueCents",
+      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" IN ('tip','tips') AND LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "tipsRevenueCents",
+      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" LIKE 'subscription%' AND LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "subscriptionRevenueCents"
     FROM attributed
     GROUP BY "campaignId"
   `, creatorId, start, end);
@@ -1413,15 +1450,15 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
       )
       SELECT
         "fanId",
-        COALESCE(SUM("amountCents"), 0)::bigint AS "grossCents",
-        COALESCE(SUM("netCents"), 0)::bigint AS "netCents",
-        COUNT(*)::bigint AS "transactionsCount",
+        COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "grossCents",
+        COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "netCents",
+        COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo')::bigint AS "transactionsCount",
         COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledGrossCents",
         COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledNetCents",
         COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done')::bigint AS "settledTransactionsCount",
-        COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done'), 0)::bigint AS "pendingGrossCents",
-        COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done'), 0)::bigint AS "pendingNetCents",
-        COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'done')::bigint AS "pendingTransactionsCount"
+        COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading'), 0)::bigint AS "pendingGrossCents",
+        COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading'), 0)::bigint AS "pendingNetCents",
+        COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading')::bigint AS "pendingTransactionsCount"
       FROM attributed
       WHERE "campaignId" = $2
       GROUP BY "fanId"
@@ -1559,6 +1596,7 @@ module.exports = {
   completeEarningsScan,
   ingestCampaignChunk,
   ingestCampaignFanValueChunk,
+  ingestCampaignFanValuesBatchChunk,
   completeCampaignScan,
   upsertMessagesDaily,
   readCreatorLedgerOverview,

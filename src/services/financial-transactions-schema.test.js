@@ -85,14 +85,19 @@ test("financial ingest is safe when job lease passes a Prisma TransactionClient"
   assert.doesNotMatch(ingestBody, /await db\.\$transaction\(/, "lease TransactionClient must not be nested in another transaction");
 });
 
-test("completion requires source exhaustion plus all-time chart reconciliation", () => {
+test("completion reconciles OF earnings after undo refunds while keeping loading as payout pending", () => {
+  assert.match(service, /REFUND_TRANSACTION_STATUSES = new Set\(\["undo"\]\)/);
+  assert.match(service, /PAYOUT_PENDING_TRANSACTION_STATUSES = new Set\(\["loading"\]\)/);
+  assert.match(service, /earningsTransactionsCount = Math\.max\(0, count - statusTotals\.refundTransactionsCount\)/);
+  assert.match(service, /earningsGrossCents = grossCents - statusTotals\.refundGrossCents/);
+  assert.match(service, /earningsNetCents = netCents - statusTotals\.refundNetCents/);
+  assert.match(service, /countMatched = chartReady \? earningsTransactionsCount/);
   assert.match(service, /sourceBoundaryReached/);
   assert.match(service, /scannerRejected === 0/);
-  assert.match(service, /countMatched/);
-  assert.match(service, /grossMatched/);
-  assert.match(service, /netMatched/);
   assert.match(service, /chartTotal\.sourceJobId === job\.id/);
   assert.match(service, /chartTotal\.scanRunId === scanRunId/);
+  assert.match(control, /statusSummary/);
+  assert.match(control, /refundTransactionsCount/);
 });
 
 test("financial scanner has its own manual job and endpoints, independent of notifications", () => {

@@ -39,7 +39,7 @@ function jobStatus(job) {
   if (job.status === "CANCELLED") return "CANCELLED";
   if (job.status === "DONE") {
     const result = object(job.result);
-    const complete = result.campaignPagesComplete === true && result.claimersComplete === true && result.truncated !== true
+    const complete = result.campaignPagesComplete === true && result.claimersComplete === true && result.fanValuesComplete === true && result.truncated !== true
       && integer(result.campaignScannerRejected, 0) === 0 && integer(result.claimerScannerRejected, 0) === 0;
     return complete ? "COMPLETE" : "PARTIAL";
   }
@@ -104,6 +104,7 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
     maxPages: 40,
     claimerPageSize: 50,
     maxClaimerPages: 10_000,
+    fanValueBatchSize: 20,
   };
   const scheduled = await scheduleJobNow({
     jobKey: JOB_KEY,
@@ -205,9 +206,11 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     truncated: result.truncated === true || continuation.truncated === true,
     campaignScannerRejected: integer(result.campaignScannerRejected ?? continuation.campaignScannerRejected, 0, 100_000_000),
     claimerScannerRejected: integer(result.claimerScannerRejected ?? continuation.claimerScannerRejected, 0, 100_000_000),
+    fanValuesTotal: integer(result.fanValuesTotal ?? (Array.isArray(continuation.fanValueQueue) ? continuation.fanValueQueue.length : 0), 0, 100_000_000),
     fanValuesRequested: integer(result.fanValuesRequested ?? continuation.fanValuesRequested, 0, 100_000_000),
     fanValuesFetched: integer(result.fanValuesFetched ?? continuation.fanValuesFetched, 0, 100_000_000),
     fanValuesUnavailable: integer(result.fanValuesUnavailable ?? continuation.fanValuesUnavailable, 0, 100_000_000),
+    fanValuesComplete: result.fanValuesComplete === true,
     startedAt: iso(job?.startedAt || job?.scheduledAt),
     completedAt: iso(job?.completedAt),
     lastProgressAt: iso(job?.lastProgressAt),
