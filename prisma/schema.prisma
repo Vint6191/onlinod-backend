@@ -218,6 +218,8 @@ model Agency {
   jobs               JobInstance[]
   deviceCreatorBindings DeviceCreatorBinding[]
   teamActivityEvents TeamActivityEvent[]
+  teamPpvClaimAudits TeamPpvClaimAudit[]
+  teamMemberFunctions TeamMemberFunction[]
   analyticsSnapshots AnalyticsSnapshot[]
   workspaceSettings WorkspaceSetting[]
   moduleSettings ModuleSetting[]
@@ -301,12 +303,28 @@ model AgencyMember {
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  teamFunctions TeamMemberFunction[]
 
   @@unique([agencyId, userId])
   @@index([agencyId])
   @@index([userId])
   @@index([roleKey])
   @@index([deletedAt])
+}
+
+model TeamMemberFunction {
+  id          String   @id @default(cuid())
+  agencyId    String
+  memberId    String
+  functionKey String
+  createdAt   DateTime @default(now())
+
+  agency Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  member AgencyMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, memberId, functionKey])
+  @@index([agencyId, functionKey, memberId])
+  @@index([memberId])
 }
 
 model CreatorAccount {
@@ -1723,21 +1741,37 @@ model DeviceCreatorBinding {
 }
 
 model TeamActivityEvent {
-  id         String   @id @default(cuid())
-  agencyId   String
-  deviceId   String?
-  userId     String?
-  memberId   String?
-  accountId  String?
-  creatorId  String?
-  creatorRef String?
-  fanId      String?
-  type       String
-  ts         DateTime
-  localId    String?
-  extra      Json?
-  source     String   @default("electron")
-  createdAt  DateTime @default(now())
+  id                    String   @id @default(cuid())
+  agencyId              String
+  deviceId              String?
+  userId                String?
+  memberId              String?
+  accountId             String?
+  creatorId             String?
+  creatorRef            String?
+  fanId                  String?
+  type                   String
+  eventKind              String?
+  actionSource           String?
+  lifecycle              String?
+  dialogId               String?
+  messageId              String?
+  correlationId          String?
+  coverageId             String?
+  startedAt              DateTime?
+  endedAt                DateTime?
+  durationSeconds        Int?
+  automationDeliveryId   String?
+  broadcastDispatchId    String?
+  priceCents             Int?
+  currency               String?
+  isPpv                  Boolean  @default(false)
+  mediaCount             Int      @default(0)
+  ts                     DateTime
+  localId                String?
+  extra                  Json?
+  source                 String   @default("electron")
+  createdAt              DateTime @default(now())
 
   agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   user    User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
@@ -1750,6 +1784,13 @@ model TeamActivityEvent {
   @@index([agencyId, creatorId, ts])
   @@index([agencyId, accountId, ts])
   @@index([agencyId, type, ts])
+  @@index([agencyId, eventKind, ts])
+  @@index([agencyId, actionSource, ts])
+  @@index([agencyId, messageId])
+  @@index([agencyId, correlationId])
+  @@index([agencyId, coverageId, ts])
+  @@index([agencyId, automationDeliveryId])
+  @@index([agencyId, broadcastDispatchId])
   @@index([type, ts])
 }
 
@@ -3854,6 +3895,29 @@ model TeamTipLedger {
   @@index([agencyId, fanId, receivedAt])
   @@index([agencyId, creatorId, receivedAt])
 }
+
+model TeamPpvClaimAudit {
+  id               String   @id @default(cuid())
+  agencyId         String
+  jobId            String?
+  purchaseId       String
+  messageId        String?
+  action           String
+  actorMemberId    String
+  selectedMemberId String?
+  reason           String?
+  evidence         Json?
+  createdAt        DateTime @default(now())
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, createdAt])
+  @@index([agencyId, jobId, createdAt])
+  @@index([agencyId, purchaseId, createdAt])
+  @@index([agencyId, actorMemberId, createdAt])
+  @@index([agencyId, selectedMemberId, createdAt])
+}
+
 
 model TeamPpvResolveJob {
   id           String   @id @default(cuid())

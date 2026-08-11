@@ -588,6 +588,9 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
   if (!cleanAction || !["claim", "release", "manager_override"].includes(cleanAction)) {
     return { ok: false, code: "INVALID_ACTION" };
   }
+  if (cleanAction === "manager_override" && String(reason || "").trim().length < 3) {
+    return { ok: false, code: "RESOLUTION_REASON_REQUIRED", error: "A reason of at least 3 characters is required" };
+  }
 
   const actor = await resolveMember({ agencyId, memberId: byMemberId, userId: byUserId });
   if (!actor) return { ok: false, code: "ACTOR_NOT_AGENCY_MEMBER" };

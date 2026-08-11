@@ -29,6 +29,7 @@ router.post("/events/ingest", async (req, res) => {
       agencyId,
       deviceId: input.deviceId || req.auth.deviceId || null,
       userId: req.auth.userId,
+      memberId: req.auth.memberId || null,
       events: input.events,
     });
 

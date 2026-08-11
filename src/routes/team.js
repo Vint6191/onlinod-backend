@@ -52,6 +52,9 @@ const {
 
 const router = express.Router();
 
+const TEAM_FUNCTION_KEYS = Object.freeze(["CHATTER", "CONTENT", "SUPERVISOR"]);
+const TEAM_FUNCTION_KEY_SET = new Set(TEAM_FUNCTION_KEYS);
+
 
 // ════════════════════════════════════════════════════════════
 // Helpers
@@ -95,6 +98,7 @@ function memberToClient(m) {
     role: m.roleKey || legacyRoleToKey(m.role),
     legacyRole: m.role,
     assignedCreators: m.assignedCreators ?? "all",
+    functions: Array.from(new Set((m.teamFunctions || []).map((row) => String(row.functionKey || "").toUpperCase()).filter((key) => TEAM_FUNCTION_KEY_SET.has(key)))),
     commission: m.commission || { kind: "none" },
     statusBadge: m.statusBadge || null,
     lastSeenLabel: m.lastSeenLabel || null,
@@ -139,7 +143,7 @@ router.get("/state", teamReadRequired(), async (req, res) => {
     const [members, customRoles, roleOverrides, subOverrides, pendingInvitations] = await Promise.all([
       prisma.agencyMember.findMany({
         where: { agencyId, deletedAt: null },
-        include: { user: true },
+        include: { user: true, teamFunctions: { select: { functionKey: true } } },
         orderBy: { createdAt: "asc" },
         take: 10000}),
       prisma.agencyCustomRole.findMany({
@@ -449,13 +453,48 @@ router.patch("/members/:memberId", teamWriteRequired(), async (req, res) => {
     const updated = await prisma.agencyMember.update({
       where: { id: member.id },
       data,
-      include: { user: true },
+      include: { user: true, teamFunctions: { select: { functionKey: true } } },
     });
 
     return res.json({ ok: true, member: memberToClient(updated) });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     return res.status(500).json({ ok: false, code: "MEMBER_PATCH_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+const memberFunctionsSchema = z.object({
+  agencyId: z.string().min(1),
+  functions: z.array(z.enum(TEAM_FUNCTION_KEYS)).max(TEAM_FUNCTION_KEYS.length),
+});
+
+router.patch("/members/:memberId/functions", teamWriteRequired(), async (req, res) => {
+  try {
+    const input = memberFunctionsSchema.parse({ ...req.body, agencyId: req.agencyId });
+    const member = await prisma.agencyMember.findUnique({ where: { id: req.params.memberId } });
+    if (!member || member.agencyId !== req.agencyId || member.deletedAt) {
+      return res.status(404).json({ ok: false, code: "MEMBER_NOT_FOUND", error: "Member not found in this agency" });
+    }
+
+    const functions = Array.from(new Set(input.functions.map((key) => String(key).toUpperCase())));
+    await prisma.$transaction(async (tx) => {
+      await tx.teamMemberFunction.deleteMany({ where: { agencyId: req.agencyId, memberId: member.id } });
+      if (functions.length) {
+        await tx.teamMemberFunction.createMany({
+          data: functions.map((functionKey) => ({ agencyId: req.agencyId, memberId: member.id, functionKey })),
+          skipDuplicates: true,
+        });
+      }
+    });
+
+    const updated = await prisma.agencyMember.findUnique({
+      where: { id: member.id },
+      include: { user: true, teamFunctions: { select: { functionKey: true } } },
+    });
+    return res.json({ ok: true, member: memberToClient(updated) });
+  } catch (err) {
+    if (err?.issues) return validationError(res, err);
+    return res.status(500).json({ ok: false, code: "MEMBER_FUNCTIONS_FAILED", error: err?.message || "Failed" });
   }
 });
 
@@ -550,7 +589,7 @@ router.patch("/members/:memberId/role", teamWriteRequired(), async (req, res) =>
         roleKey: input.roleKey,
         role: roleKeyToLegacy(input.roleKey),
       },
-      include: { user: true },
+      include: { user: true, teamFunctions: { select: { functionKey: true } } },
     });
 
     return res.json({ ok: true, member: memberToClient(updated) });

@@ -3,12 +3,13 @@
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 
-const TEAM_TELEMETRY_VERSION = "team_v12_actual_backend_ppv_safe";
+const TEAM_TELEMETRY_VERSION = "team_v13_provenance";
 const SUPPORTED_TEAM_TELEMETRY_VERSIONS = new Set([
   "team_v8_member_agency_local_fresh",
   "team_v9_message_ppv_ledger",
   "team_v10_server_ppv_resolver",
   "team_v11_ppv_safe_resolver",
+  "team_v12_actual_backend_ppv_safe",
   TEAM_TELEMETRY_VERSION,
 ]);
 const SUPPORTED_TEAM_TELEMETRY_SOURCES = new Set([
@@ -17,6 +18,7 @@ const SUPPORTED_TEAM_TELEMETRY_SOURCES = new Set([
   "electron_team_v10",
   "electron_team_v11",
   "electron_team_v12",
+  "electron_team_v13",
   "server_ppv_resolver",
 ]);
 
@@ -60,11 +62,46 @@ function eventExtra(ev) {
   return ev?.extra && typeof ev.extra === "object" ? ev.extra : {};
 }
 
+function eventKind(ev) {
+  return String(ev?.eventKind || "").trim().toUpperCase();
+}
+
+function actionSource(ev) {
+  return String(ev?.actionSource || eventExtra(ev).actionSource || "").trim().toUpperCase();
+}
+
+function eventMessageId(ev) {
+  return String(ev?.messageId || eventExtra(ev).messageId || "").trim();
+}
+
+function eventDialogId(ev) {
+  return String(ev?.dialogId || ev?.fanId || eventExtra(ev).dialogId || eventExtra(ev).fanId || "").trim();
+}
+
 function isCurrentTelemetry(ev) {
   const extra = eventExtra(ev);
   const version = String(extra.telemetryVersion || "");
   const source = String(ev.source || extra.source || "");
   return SUPPORTED_TEAM_TELEMETRY_VERSIONS.has(version) || SUPPORTED_TEAM_TELEMETRY_SOURCES.has(source);
+}
+
+async function findAllById(model, args = {}, pageSize = 5000) {
+  const rows = [];
+  let cursorId = null;
+  const safePageSize = Math.max(100, Math.min(10000, Number(pageSize) || 5000));
+  for (;;) {
+    const page = await model.findMany({
+      ...args,
+      orderBy: { id: "asc" },
+      take: safePageSize,
+      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+    });
+    if (!page.length) break;
+    rows.push(...page);
+    cursorId = String(page[page.length - 1].id || "");
+    if (!cursorId || page.length < safePageSize) break;
+  }
+  return rows;
 }
 
 function memberShell(member) {
@@ -75,21 +112,28 @@ function memberShell(member) {
     email: member.user?.email || null,
     roleKey: member.roleKey || String(member.role || "").toLowerCase(),
     assignedCreators: member.assignedCreators ?? "all",
+    functions: Array.from(new Set((member.teamFunctions || []).map((row) => String(row.functionKey || "").toUpperCase()).filter(Boolean))),
   };
 }
 
 async function getMembersShell(agencyId) {
-  return prisma.agencyMember.findMany({
+  const rows = await findAllById(prisma.agencyMember, {
     where: { agencyId, deletedAt: null },
-    include: { user: { select: { id: true, email: true, name: true } } },
-    orderBy: { createdAt: "asc" },
-    take: 10000});
+    include: {
+      user: { select: { id: true, email: true, name: true } },
+      teamFunctions: { select: { functionKey: true } },
+    },
+  });
+  return rows.sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime());
 }
 
 function emptyMetric() {
   return {
     messagesSent: 0,
+    manualMessages: 0,
     massMessages: 0,
+    broadcastDispatches: 0,
+    automationDeliveries: 0,
     totalMessages: 0,
     postsCreated: 0,
     storiesCreated: 0,
@@ -142,6 +186,9 @@ function cleanMetric(metric) {
     .sort((a, b) => b.dwellSeconds - a.dwellSeconds)
     .slice(0, 10);
 
+  metric.manualMessages = metric.messagesSent;
+  // totalMessages remains a compatibility volume field. Efficiency metrics use
+  // only confirmed human/manual messages and never mass/broadcast deliveries.
   metric.totalMessages = metric.messagesSent + metric.massMessages;
   metric.uniqueFans = metric._fans.size;
   metric.creatorCoverage = metric._creators.size;
@@ -154,7 +201,7 @@ function cleanMetric(metric) {
   metric.responseSamples = responseSamples;
   metric.slaReply5mPct = responseSamples > 0 ? (metric._sla5 / responseSamples) * 100 : null;
   metric.slaReply15mPct = responseSamples > 0 ? (metric._sla15 / responseSamples) * 100 : null;
-  metric.dollarsPerMessageCents = metric.totalMessages > 0 ? Math.round(metric.revenueAttributedCents / metric.totalMessages) : 0;
+  metric.dollarsPerMessageCents = metric.messagesSent > 0 ? Math.round(metric.revenueAttributedCents / metric.messagesSent) : 0;
   metric.ppvOpenRatePct = metric.ppvSentMessages > 0 ? (metric.ppvSoldMessages / metric.ppvSentMessages) * 100 : null;
   metric.topDialogSessions = dialogSessions.map((item) => ({
     fanId: item.fanId || null,
@@ -186,6 +233,15 @@ function logicalEventKey(ev) {
   const messageId = String(extra.messageId || "");
   const localSeed = String(extra.localSeed || "");
   const pendingSeed = String(extra.pendingSeed || "");
+  const canonicalKind = eventKind(ev);
+  if (canonicalKind) {
+    return [
+      canonicalKind,
+      String(ev.accountId || extra.accountId || ""),
+      String(ev.fanId || ev.dialogId || extra.fanId || extra.dialogId || ""),
+      eventMessageId(ev) || String(ev.correlationId || ev.broadcastDispatchId || ev.automationDeliveryId || ev.localId || ""),
+    ].join("|");
+  }
 
   if (type === "dialog_unread_seen" || type === "dialog_unread_opened") {
     if (String(extra.reason || "") === "messages_api") return null;
@@ -233,21 +289,20 @@ function dedupeLogicalEvents(rows) {
 }
 
 async function loadV3Events({ agencyId, range }) {
-  const rows = await prisma.teamActivityEvent.findMany({
+  const rows = await findAllById(prisma.teamActivityEvent, {
     where: { agencyId, ...whereForRange("ts", range) },
-    orderBy: { ts: "asc" },
-    take: 20000,
   });
+  rows.sort((a, b) => new Date(a.ts || 0).getTime() - new Date(b.ts || 0).getTime());
   return dedupeLogicalEvents(rows.filter(isCurrentTelemetry));
 }
 
 async function loadPpvPurchaseLedger({ agencyId, range }) {
   try {
-    return await prisma.teamPpvPurchaseLedger.findMany({
+    const rows = await findAllById(prisma.teamPpvPurchaseLedger, {
       where: { agencyId, ...whereForRange("purchasedAt", range) },
-      orderBy: { purchasedAt: "asc" },
-      take: 50000,
     });
+    rows.sort((a, b) => new Date(a.purchasedAt || 0).getTime() - new Date(b.purchasedAt || 0).getTime());
+    return rows;
   } catch (_) {
     return [];
   }
@@ -326,19 +381,22 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
   for (const ev of events) {
     const extra = eventExtra(ev);
     const type = String(ev.type || "");
-    if (type !== "sent_message_recorded" && type !== "ppv_message_sent_recorded") continue;
-    const messageId = String(extra.messageId || "").trim();
+    const canonicalKind = eventKind(ev);
+    const isConfirmedSend = canonicalKind === "MESSAGE_SEND_CONFIRMED" && String(ev.lifecycle || "").toUpperCase() === "CONFIRMED";
+    if (!isConfirmedSend && type !== "sent_message_recorded" && type !== "ppv_message_sent_recorded") continue;
+    const messageId = eventMessageId(ev);
     if (!messageId) continue;
     // message_id is the ownership source of truth. Keep the FIRST owner
     // we saw; never let a later echo/resolver/retry race overwrite it.
     if (!sentByMessageId.has(messageId)) {
       sentByMessageId.set(messageId, {
         memberId: String(ev.memberId || extra.memberId || extra.attributedMemberId || ""),
-        fanId: String(ev.fanId || extra.fanId || extra.dialogId || ""),
+        fanId: String(ev.fanId || ev.dialogId || extra.fanId || extra.dialogId || ""),
         accountId: String(ev.accountId || extra.accountId || ""),
-        priceCents: num(extra.priceCents, 0),
-        isPpv: extra.isPpv === true || type === "ppv_message_sent_recorded",
+        priceCents: num(ev.priceCents ?? extra.priceCents, 0),
+        isPpv: ev.isPpv === true || extra.isPpv === true || type === "ppv_message_sent_recorded",
         shiftKey: extra.shiftKey || null,
+        actionSource: actionSource(ev) || null,
       });
     }
   }
@@ -367,11 +425,53 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     const fanId = String(ev.fanId || extra.fanId || extra.dialogId || "").trim();
     const accountId = String(ev.accountId || extra.accountId || "").trim();
     const type = String(ev.type || "");
+    const canonicalKind = eventKind(ev);
+    const canonicalSource = actionSource(ev);
     const key = keyFor(ev);
 
     if (m) {
       if (fanId) m._fans.add(fanId);
       if (accountId) m._creators.add(accountId);
+    }
+
+    if (canonicalKind === "FAN_MESSAGE_RECEIVED") {
+      // A fan incoming is a creator/dialog fact, never a chatter fact merely
+      // because that chatter happened to have the creator open.
+      continue;
+    }
+
+    if (canonicalKind === "MESSAGE_SEND_CONFIRMED") {
+      if (String(ev.lifecycle || "").toUpperCase() !== "CONFIRMED") continue;
+      if (canonicalSource === "MANUAL" && m) {
+        m.messagesSent += 1;
+        if (ev.isPpv === true || num(ev.priceCents, 0) > 0) m.ppvSentMessages += 1;
+        const pending = pendingByDialog.get(key);
+        if (pending && !pending.closed && Number(pending.firstSeenAt || 0) <= eventTs(ev)) pending.closed = true;
+      } else if (canonicalSource === "AUTOMATION" && m) {
+        // Normally automation has no human memberId by ingest policy. Keep this
+        // defensive branch so malformed legacy rows still cannot count manual.
+        m.automationDeliveries += 1;
+      }
+      continue;
+    }
+
+    if (canonicalKind === "BROADCAST_DISPATCH_CONFIRMED") {
+      if (m) m.broadcastDispatches += 1;
+      continue;
+    }
+
+    if (canonicalKind === "DIALOG_SESSION") {
+      if (m) {
+        const dwell = Math.max(0, num(ev.durationSeconds ?? extra.dwellSeconds, 0));
+        m.dialogDwellSeconds += dwell;
+        m.dialogSessionsCount += 1;
+        const dk = [accountId, eventDialogId(ev)].join("|");
+        const prev = m._dialogSessions.get(dk) || { fanId: fanId || eventDialogId(ev) || null, accountId: accountId || null, sessions: 0, dwellSeconds: 0 };
+        prev.sessions += 1;
+        prev.dwellSeconds += dwell;
+        m._dialogSessions.set(dk, prev);
+      }
+      continue;
     }
 
     if (type === "dialog_unread_seen" || type === "dialog_unread_opened" || type === "fan_message_seen_active") {
@@ -606,15 +706,14 @@ async function getPpvLedgerRevenueByMember({ agencyId, range }) {
 
 async function getPpvLedgerRevenueByMemberDialog({ agencyId, range }) {
   try {
-    const rows = await prisma.teamPpvPurchaseLedger.findMany({
+    const rows = await findAllById(prisma.teamPpvPurchaseLedger, {
       where: {
         agencyId,
         status: { in: ATTRIBUTED_PPV_STATUSES },
         attributedMemberId: { not: null },
         ...whereForRange("purchasedAt", range),
       },
-      select: { attributedMemberId: true, fanId: true, buyerFanId: true, dialogId: true, amountCents: true },
-      take: 50000,
+      select: { id: true, attributedMemberId: true, fanId: true, buyerFanId: true, dialogId: true, amountCents: true },
     });
     const map = new Map();
     for (const row of rows || []) {
@@ -652,15 +751,14 @@ async function getTipLedgerRevenueByMember({ agencyId, range }) {
 
 async function getTipLedgerRevenueByMemberDialog({ agencyId, range }) {
   try {
-    const rows = await prisma.teamTipLedger.findMany({
+    const rows = await findAllById(prisma.teamTipLedger, {
       where: {
         agencyId,
         status: { in: ATTRIBUTED_TIP_STATUSES },
         attributedMemberId: { not: null },
         ...whereForRange("receivedAt", range),
       },
-      select: { attributedMemberId: true, fanId: true, dialogId: true, amountCents: true },
-      take: 50000,
+      select: { id: true, attributedMemberId: true, fanId: true, dialogId: true, amountCents: true },
     });
     const map = new Map();
     for (const row of rows || []) {
@@ -701,7 +799,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     const revenue = revenueByMember.get(String(member.id)) || 0;
     if (revenue > 0) {
       metrics.revenueAttributedCents = revenue;
-      metrics.dollarsPerMessageCents = metrics.totalMessages > 0 ? Math.round(revenue / metrics.totalMessages) : 0;
+      metrics.dollarsPerMessageCents = metrics.messagesSent > 0 ? Math.round(revenue / metrics.messagesSent) : 0;
       metrics.moneySource = "ppv_ledger_plus_tip_ledger_with_legacy_tip_fallback";
     }
     if (Array.isArray(metrics.topDialogSessions)) {
@@ -719,7 +817,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     range: rangeForClient(computed.range),
     snapshot: null,
     members: rows,
-    source: "team_activity_event_v12",
+    source: "team_activity_event_v13",
   };
 }
 
@@ -727,7 +825,10 @@ function combineOverview(metricsList, membersCount) {
   const out = {
     totalMessages: 0,
     messagesSent: 0,
+    manualMessages: 0,
     massMessages: 0,
+    broadcastDispatches: 0,
+    automationDeliveries: 0,
     botMessages: 0,
     postsCreated: 0,
     storiesCreated: 0,
@@ -750,7 +851,7 @@ function combineOverview(metricsList, membersCount) {
     dollarsPerMessageCents: 0,
     avgResponseSeconds: null,
     slaReply15mPct: null,
-    source: "team_activity_event_v12",
+    source: "team_activity_event_v13",
   };
   const fans = new Set();
   const responses = [];
@@ -759,7 +860,10 @@ function combineOverview(metricsList, membersCount) {
 
   for (const m of metricsList) {
     out.messagesSent += num(m.messagesSent, 0);
+    out.manualMessages += num(m.messagesSent, 0);
     out.massMessages += num(m.massMessages, 0);
+    out.broadcastDispatches += num(m.broadcastDispatches, 0);
+    out.automationDeliveries += num(m.automationDeliveries, 0);
     out.totalMessages += num(m.totalMessages, 0);
     out.postsCreated += num(m.postsCreated, 0);
     out.storiesCreated += num(m.storiesCreated, 0);
@@ -786,7 +890,7 @@ function combineOverview(metricsList, membersCount) {
   }
   out.avgResponseSeconds = mean(responses);
   out.slaReply15mPct = sla15Samples > 0 ? (sla15Good / sla15Samples) * 100 : null;
-  out.dollarsPerMessageCents = out.totalMessages > 0 ? Math.round(out.revenueAttributedCents / out.totalMessages) : 0;
+  out.dollarsPerMessageCents = out.messagesSent > 0 ? Math.round(out.revenueAttributedCents / out.messagesSent) : 0;
   out.ppvOpenRatePct = out.ppvSentMessages > 0 ? (out.ppvSoldMessages / out.ppvSentMessages) * 100 : null;
   return out;
 }
@@ -872,12 +976,12 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
       });
     }
   }
-  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v12" };
+  return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v13" };
 }
 
 async function buildTeamFlags({ agencyId, rangeKey = "7d" }) {
   const alerts = await buildTeamAlerts({ agencyId, rangeKey });
-  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v12" };
+  return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v13" };
 }
 
 module.exports = {

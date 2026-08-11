@@ -77,6 +77,10 @@ function eventMessageId(event) {
   return clean(event?.messageId || extraOf(event).messageId || extraOf(event).message_id || null, 160);
 }
 
+function eventActionSource(event) {
+  return clean(event?.actionSource || extraOf(event).actionSource || extraOf(event).source || null, 80);
+}
+
 function purchaseIdFromEvent(event) {
   const extra = extraOf(event);
   return clean(
@@ -186,7 +190,7 @@ async function upsertSentMessageFromEvent(row) {
   const accountId = eventAccount(event);
   const messageId = eventMessageId(event);
   const localSeed = clean(
-    extra.localSeed || event.localId || messageId || [event.fanId || extra.dialogId || "dialog", event.ts || Date.now()].join(":"),
+    event.correlationId || extra.localSeed || event.localId || messageId || [event.dialogId || event.fanId || extra.dialogId || "dialog", event.ts || Date.now()].join(":"),
     220
   );
   if (!localSeed) return null;
@@ -200,19 +204,21 @@ async function upsertSentMessageFromEvent(row) {
     userId: clean(event.userId || extra.userId, 160),
     deviceId: clean(event.deviceId || extra.deviceId, 160),
     shiftKey: clean(extra.shiftKey || extra.shift_key, 220),
-    dialogId: clean(extra.dialogId || event.fanId || extra.fanId, 160),
-    fanId: clean(extra.fanId || event.fanId, 160),
+    dialogId: clean(event.dialogId || extra.dialogId || event.fanId || extra.fanId, 160),
+    fanId: clean(event.fanId || extra.fanId, 160),
     messageId,
     localSeed,
     sentAt: safeDate(extra.sentAt || extra.sentAtMs || event.ts),
-    messageKind: clean(extra.messageKind || extra.message_kind || (extra.isPpv ? "ppv" : "text"), 40) || "text",
-    isPpv: Boolean(extra.isPpv || extra.is_ppv || event.type === "ppv_message_sent_recorded"),
-    priceCents: extra.priceCents === null || extra.priceCents === undefined ? null : Math.max(0, int(extra.priceCents, 0)),
-    currency: clean(extra.currency || null, 16),
-    mediaCount: Math.max(0, int(extra.mediaCount || extra.media_count, 0)),
+    messageKind: clean(extra.messageKind || extra.message_kind || (event.isPpv === true || extra.isPpv ? "ppv" : "text"), 40) || "text",
+    isPpv: Boolean(event.isPpv === true || extra.isPpv || extra.is_ppv || event.type === "ppv_message_sent_recorded"),
+    priceCents: event.priceCents !== null && event.priceCents !== undefined
+      ? Math.max(0, int(event.priceCents, 0))
+      : (extra.priceCents === null || extra.priceCents === undefined ? null : Math.max(0, int(extra.priceCents, 0))),
+    currency: clean(event.currency || extra.currency || null, 16),
+    mediaCount: Math.max(0, int(event.mediaCount ?? extra.mediaCount ?? extra.media_count, 0)),
     mediaIds: safeMediaIds(extra.mediaIds),
     campaignId: clean(extra.campaignId || extra.campaign_id || null, 160),
-    source: clean(extra.source || "manual_chat", 80) || "manual_chat",
+    source: clean(eventActionSource(event)?.toLowerCase() || extra.source || "manual_chat", 80) || "manual_chat",
     telemetryEventId: clean(event.id || null, 160),
   };
 
@@ -454,8 +460,11 @@ async function upsertPurchaseFromEvent(row) {
 }
 
 async function applyLedgerSideEffects(row) {
-  if (!row || !row.type) return;
-  if (row.type === "sent_message_recorded" || row.type === "ppv_message_sent_recorded") {
+  if (!row || (!row.type && !row.eventKind)) return;
+  const eventKind = String(row.eventKind || "").toUpperCase();
+  if (row.type === "sent_message_recorded"
+      || row.type === "ppv_message_sent_recorded"
+      || (eventKind === "MESSAGE_SEND_CONFIRMED" && String(row.lifecycle || "").toUpperCase() === "CONFIRMED")) {
     await upsertSentMessageFromEvent(row);
   }
   if (row.type === "ppv_purchase_attributed" || row.type === "ppv_purchase_unresolved") {
@@ -576,7 +585,7 @@ async function actorFromDevice(tx, { agencyId, deviceId }) {
   };
 }
 
-async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, job, action, selectedMemberId, candidates, reason }) {
+async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, actorMemberId = null, job, action, selectedMemberId, candidates, reason }) {
   const safeAction = clean(action, 40) || "assign";
   const safeSelectedMemberId = clean(selectedMemberId, 160);
   const uniqueCandidateIds = Array.from(new Set((candidates || []).map((c) => clean(c?.memberId, 160)).filter(Boolean)));
@@ -598,7 +607,16 @@ async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, job, action,
           include: { user: { select: { id: true, email: true, name: true } } },
         })
       : null,
-    actorFromDevice(tx, { agencyId, deviceId }),
+    actorMemberId
+      ? tx.agencyMember.findFirst({
+          where: { agencyId, id: clean(actorMemberId, 160), deletedAt: null },
+          include: { user: { select: { id: true, email: true, name: true } } },
+        }).then((member) => member ? ({
+          memberId: member.id,
+          userId: member.userId,
+          name: displayNameForMember(member) || member.id,
+        }) : null)
+      : actorFromDevice(tx, { agencyId, deviceId }),
   ]);
   const memberById = new Map(members.map((m) => [m.id, m]));
   const selectedName = displayNameForMember(selectedMember) || safeSelectedMemberId || null;
@@ -812,6 +830,29 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false }
     ? await prisma.teamPpvPurchaseLedger.findMany({ where: { agencyId, purchaseId: { in: purchaseIds } } , take: 10000})
     : [];
   const purchaseById = new Map(purchases.map((p) => [p.purchaseId, p]));
+  const jobIds = rows.map((row) => row.id).filter(Boolean);
+  const auditRows = jobIds.length
+    ? await prisma.teamPpvClaimAudit.findMany({
+        where: { agencyId, jobId: { in: jobIds } },
+        orderBy: { createdAt: "asc" },
+        take: 10000,
+      }).catch(() => [])
+    : [];
+  const auditByJob = new Map();
+  for (const audit of auditRows || []) {
+    const key = String(audit.jobId || "");
+    if (!key) continue;
+    if (!auditByJob.has(key)) auditByJob.set(key, []);
+    auditByJob.get(key).push({
+      id: audit.id,
+      action: audit.action,
+      actorMemberId: audit.actorMemberId,
+      selectedMemberId: audit.selectedMemberId || null,
+      reason: audit.reason || null,
+      evidence: audit.evidence || null,
+      createdAt: audit.createdAt?.getTime?.() || null,
+    });
+  }
 
   const rawCandidates = rows.flatMap((r) => {
     const result = r.result && typeof r.result === "object" ? r.result : {};
@@ -878,6 +919,7 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false }
       canReopen: r.status !== "conflict",
       candidates,
       manualResolutions: manualResolutionHistory(r.result),
+      audit: auditByJob.get(String(r.id)) || [],
       result: r.result || null,
       resolvedAt: r.resolvedAt?.getTime?.() || null,
       updatedAt: r.updatedAt?.getTime?.() || null,
@@ -885,28 +927,69 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false }
   });
 }
 
-async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign", deviceId, reason = null }) {
+async function createPpvClaimAudit(tx, { agencyId, actorMemberId, job, action, selectedMemberId, reason, candidates, purchaseBefore }) {
+  const actorId = clean(actorMemberId, 160);
+  if (!actorId) return null;
+  return tx.teamPpvClaimAudit.create({
+    data: {
+      agencyId,
+      jobId: clean(job?.id, 160),
+      purchaseId: clean(job?.purchaseId, 220) || "unknown",
+      messageId: clean(job?.messageId, 220),
+      action: clean(action, 40) || "unresolved",
+      actorMemberId: actorId,
+      selectedMemberId: clean(selectedMemberId, 160),
+      reason: clean(reason, 1000),
+      evidence: {
+        jobStatusBefore: clean(job?.status, 80),
+        purchaseStatusBefore: clean(purchaseBefore?.status, 80),
+        candidates: Array.isArray(candidates) ? candidates : [],
+      },
+    },
+  });
+}
+
+async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = null, action = "assign", deviceId, reason = null }) {
   const safeJobId = clean(jobId, 160);
   const safeAction = clean(action || (memberId ? "assign" : "unresolved"), 40) || "assign";
   const safeMemberId = clean(memberId, 160);
   const finalAction = safeAction === "reopen"
     ? "reopen"
-    : (safeAction === "reject" ? "reject" : (safeAction === "unresolved" ? "unresolved" : "assign"));
-  if (!safeJobId) return { resolved: 0, skipped: 1 };
-  if (finalAction === "assign" && !safeMemberId) return { resolved: 0, skipped: 1 };
+    : (safeAction === "reject"
+      ? "reject"
+      : (safeAction === "creator_revenue"
+        ? "creator_revenue"
+        : (safeAction === "unresolved" ? "unresolved" : "assign")));
+  const safeActorMemberId = clean(actorMemberId, 160);
+  const safeReason = clean(reason, 1000);
+  if (!safeJobId) return { resolved: 0, skipped: 1, code: "PPV_CONFLICT_NOT_FOUND" };
+  if (!safeActorMemberId) return { resolved: 0, skipped: 1, code: "RESOLUTION_ACTOR_REQUIRED" };
+  if (finalAction === "assign" && !safeMemberId) return { resolved: 0, skipped: 1, code: "RESOLUTION_MEMBER_REQUIRED" };
+  if (["assign", "reject", "creator_revenue"].includes(finalAction) && (!safeReason || safeReason.length < 3)) {
+    return { resolved: 0, skipped: 1, code: "RESOLUTION_REASON_REQUIRED" };
+  }
 
   const outcome = await prisma.$transaction(async (tx) => {
     const job = await findPpvResolveJobForUpdate(tx, { agencyId, jobId: safeJobId });
     if (!job) return "skipped";
 
-    await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
+    const purchaseBefore = await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
+
+    if (finalAction === "assign") {
+      const selectedMember = await tx.agencyMember.findFirst({
+        where: { agencyId, id: safeMemberId, deletedAt: null },
+        select: { id: true },
+      });
+      if (!selectedMember) return "invalid_member";
+    }
 
     const baseResult = job.result && typeof job.result === "object" ? job.result : {};
     const manualResolution = {
       manualResolution: true,
       action: finalAction,
       memberId: finalAction === "assign" ? safeMemberId : null,
-      reason: clean(reason, 1000),
+      reason: safeReason,
+      actorMemberId: safeActorMemberId,
       resolvedByDeviceId: clean(deviceId, 160),
       resolvedAt: new Date().toISOString(),
     };
@@ -963,11 +1046,22 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign"
       await createPpvClaimNoticeEvents(tx, {
         agencyId,
         deviceId,
+        actorMemberId: safeActorMemberId,
         job,
         action: "reopen",
         selectedMemberId: null,
         candidates,
-        reason,
+        reason: safeReason,
+      });
+      await createPpvClaimAudit(tx, {
+        agencyId,
+        actorMemberId: safeActorMemberId,
+        job,
+        action: "reopen",
+        selectedMemberId: null,
+        reason: safeReason,
+        candidates,
+        purchaseBefore,
       });
 
       return finalAction;
@@ -1013,20 +1107,20 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign"
           amountCents: job.amountCents,
           currency: job.currency,
           purchasedAt: job.purchasedAt || new Date(),
-          status: finalAction === "reject" ? "rejected" : "unresolved",
+          status: finalAction === "reject" ? "rejected" : (finalAction === "creator_revenue" ? "creator_revenue" : "unresolved"),
           attributedMemberId: null,
-          resolvedAt: finalAction === "reject" ? new Date() : null,
+          resolvedAt: finalAction === "unresolved" ? null : new Date(),
           resolvedByDeviceId: clean(deviceId, 160),
-          resolvedSource: finalAction === "reject" ? "manual_claim_reject" : "manual_claim_unresolved",
+          resolvedSource: finalAction === "reject" ? "manual_claim_reject" : (finalAction === "creator_revenue" ? "manual_claim_creator_revenue" : "manual_claim_unresolved"),
         },
         update: {
-          status: finalAction === "reject" ? "rejected" : "unresolved",
+          status: finalAction === "reject" ? "rejected" : (finalAction === "creator_revenue" ? "creator_revenue" : "unresolved"),
           attributedMemberId: null,
           attributedUserId: null,
           attributedShiftKey: null,
-          resolvedAt: finalAction === "reject" ? new Date() : null,
+          resolvedAt: finalAction === "unresolved" ? null : new Date(),
           resolvedByDeviceId: clean(deviceId, 160),
-          resolvedSource: finalAction === "reject" ? "manual_claim_reject" : "manual_claim_unresolved",
+          resolvedSource: finalAction === "reject" ? "manual_claim_reject" : (finalAction === "creator_revenue" ? "manual_claim_creator_revenue" : "manual_claim_unresolved"),
         },
       });
     }
@@ -1045,11 +1139,22 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign"
     await createPpvClaimNoticeEvents(tx, {
       agencyId,
       deviceId,
+      actorMemberId: safeActorMemberId,
       job,
       action: finalAction,
       selectedMemberId: finalAction === "assign" ? safeMemberId : null,
       candidates,
-      reason,
+      reason: safeReason,
+    });
+    await createPpvClaimAudit(tx, {
+      agencyId,
+      actorMemberId: safeActorMemberId,
+      job,
+      action: finalAction,
+      selectedMemberId: finalAction === "assign" ? safeMemberId : null,
+      reason: safeReason,
+      candidates,
+      purchaseBefore,
     });
 
     if (finalAction === "assign") {
@@ -1058,7 +1163,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign"
         deviceId,
         job,
         memberId: safeMemberId,
-        item: { source: "manual_claim_resolution", reason },
+        item: { source: "manual_claim_resolution", reason: safeReason },
       });
     }
 
@@ -1066,6 +1171,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, action = "assign"
   }, serializableTxOptions());
 
   if (outcome === "skipped") return { resolved: 0, skipped: 1 };
+  if (outcome === "invalid_member") return { resolved: 0, skipped: 1, code: "RESOLUTION_MEMBER_INVALID" };
   return { resolved: 1, skipped: 0, action: outcome };
 }
 
@@ -1078,7 +1184,7 @@ async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS } = {}) {
     prisma.teamPpvPurchaseLedger.deleteMany({
       where: {
         purchasedAt: { lt: before },
-        status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected"] },
+        status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected", "creator_revenue"] },
       },
     }),
     prisma.teamPpvResolveJob.deleteMany({

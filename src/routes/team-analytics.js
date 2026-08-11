@@ -1,8 +1,9 @@
 "use strict";
 
 const express = require("express");
+const { z } = require("zod");
 const prisma = require("../prisma");
-const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-capabilities");
 const {
   buildTeamOverview,
   buildTeamMembers,
@@ -40,7 +41,7 @@ async function loadAgencyMember(req, agencyIdValue) {
   if (!id || !req.auth?.userId) return null;
   return prisma.agencyMember.findFirst({
     where: { agencyId: id, userId: req.auth.userId, deletedAt: null },
-    select: { id: true, userId: true, role: true, roleKey: true },
+    select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true },
   });
 }
 
@@ -51,7 +52,7 @@ async function requirePpvClaimsManager(req, res) {
 
   const member = await prisma.agencyMember.findFirst({
     where: { agencyId: id, userId: req.auth?.userId, deletedAt: null },
-    select: { id: true, role: true, roleKey: true },
+    select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true },
   });
 
   if (!member) {
@@ -59,11 +60,12 @@ async function requirePpvClaimsManager(req, res) {
     return null;
   }
 
-  if (!isSeniorAgencyMember(member)) {
+  const allowed = await canUseTeamCapability({ member, key: TEAM_CAPABILITIES.RESOLVE_ATTRIBUTION });
+  if (!allowed) {
     res.status(403).json({
       ok: false,
-      code: "PPV_CLAIMS_MANAGER_REQUIRED",
-      error: "Only owner / manager / admin can view or resolve PPV attribution conflicts",
+      code: "PPV_ATTRIBUTION_RESOLVE_REQUIRED",
+      error: "money.resolve_attribution permission is required",
     });
     return null;
   }
@@ -90,13 +92,14 @@ router.post("/ppv/resolve-results", async (req, res) => {
       return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     }
 
+    const canResolveAgencyWide = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RESOLVE_ATTRIBUTION });
     const result = await submitResolveResults({
       agencyId: id,
       deviceId: req.auth.deviceId || req.body?.deviceId || null,
       results: req.body?.results || [],
       actorMemberId: actor.id,
       actorUserId: actor.userId,
-      senior: isSeniorAgencyMember(actor),
+      senior: canResolveAgencyWide,
     });
     return res.json({ ok: true, ...result });
   } catch (err) {
@@ -115,19 +118,40 @@ router.get("/ppv/conflicts", async (req, res) => {
   }
 });
 
+const ppvConflictResolutionSchema = z.object({
+  action: z.enum(["assign", "unresolved", "creator_revenue", "reject", "reopen"]),
+  memberId: z.string().min(1).max(160).optional().nullable(),
+  reason: z.string().max(1000).optional().nullable(),
+}).superRefine((value, ctx) => {
+  if (value.action === "assign" && !String(value.memberId || "").trim()) {
+    ctx.addIssue({ code: "custom", path: ["memberId"], message: "memberId is required for assign" });
+  }
+  if (["assign", "reject", "creator_revenue"].includes(value.action) && String(value.reason || "").trim().length < 3) {
+    ctx.addIssue({ code: "custom", path: ["reason"], message: "A reason of at least 3 characters is required" });
+  }
+});
+
 router.post("/ppv/conflicts/:jobId/resolve", async (req, res) => {
   try {
     const id = await requirePpvClaimsManager(req, res); if (!id) return;
+    const input = ppvConflictResolutionSchema.parse({
+      action: req.body?.action || (req.body?.memberId || req.body?.attributedMemberId ? "assign" : "unresolved"),
+      memberId: req.body?.memberId || req.body?.attributedMemberId || null,
+      reason: req.body?.reason || null,
+    });
     const result = await resolvePpvConflict({
       agencyId: id,
       jobId: req.params.jobId,
-      memberId: req.body?.memberId || req.body?.attributedMemberId,
-      action: req.body?.action || (req.body?.memberId || req.body?.attributedMemberId ? "assign" : "unresolved"),
-      reason: req.body?.reason || null,
+      memberId: input.memberId,
+      actorMemberId: req.agencyMember.id,
+      action: input.action,
+      reason: input.reason,
       deviceId: req.auth.deviceId || req.body?.deviceId || null,
     });
+    if (result.code) return res.status(result.code === "PPV_CONFLICT_NOT_FOUND" ? 404 : 400).json({ ok: false, ...result });
     return res.json({ ok: true, ...result });
   } catch (err) {
+    if (err?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
     return res.status(500).json({ ok: false, code: "PPV_CONFLICT_RESOLVE_FAILED", error: err?.message || "Failed" });
   }
 });

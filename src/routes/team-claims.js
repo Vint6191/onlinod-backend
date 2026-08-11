@@ -20,7 +20,7 @@ const {
   purgeExpiredTipLedger,
 } = require("../services/team-tip-ledger-service");
 const prisma = require("../prisma");
-const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-capabilities");
 
 const router = express.Router();
 
@@ -29,21 +29,21 @@ async function loadActorMember(req) {
   if (!req.auth?.agencyId || !req.auth?.userId) return null;
   return prisma.agencyMember.findFirst({
     where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null },
-    select: { id: true, userId: true, roleKey: true, role: true },
+    select: { id: true, agencyId: true, userId: true, roleKey: true, role: true, permissions: true },
   });
 }
 
-async function requireSeniorClaimsManager(req, res) {
+async function requireClaimsCapability(req, res, key) {
   const member = await loadActorMember(req);
   if (!member) {
     res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     return null;
   }
-  if (!isSeniorAgencyMember(member)) {
+  if (!(await canUseTeamCapability({ member, key }))) {
     res.status(403).json({
       ok: false,
-      code: "CLAIMS_MANAGER_REQUIRED",
-      error: "Only owner / manager / admin can view or resolve agency-wide claims",
+      code: "CLAIMS_PERMISSION_REQUIRED",
+      error: `${key} permission is required`,
     });
     return null;
   }
@@ -121,7 +121,8 @@ router.post("/ingest", async (req, res) => {
     // only submit himself as the auto-attributed actor. Tip auto-attribution
     // is still recomputed from TeamSentMessageLedger on the backend; this
     // clamp only prevents poisoned weak candidates / legacy fallback rows.
-    const payload = isSeniorAgencyMember(actor)
+    const canOverrideAttribution = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION });
+    const payload = canOverrideAttribution
       ? parsed
       : {
           ...parsed,
@@ -166,6 +167,10 @@ const overrideSchema = z.object({
   action: z.enum(["claim", "release", "manager_override"]),
   reason: z.string().max(500).optional().nullable(),
   targetMemberId: z.string().max(160).optional().nullable(),
+}).superRefine((value, ctx) => {
+  if (value.action === "manager_override" && String(value.reason || "").trim().length < 3) {
+    ctx.addIssue({ code: "custom", path: ["reason"], message: "A reason of at least 3 characters is required for manager_override" });
+  }
 });
 
 router.post("/override", async (req, res) => {
@@ -180,12 +185,19 @@ router.post("/override", async (req, res) => {
     // Chatter actions are intentionally narrow: claim/release only their own
     // eligible tip rows. Agency-wide dispute resolution stays
     // owner/manager-only through manager_override and PPV Claims.
-    if (input.action === "manager_override" && !isSeniorAgencyMember(actor)) {
+    const canOverrideAttribution = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION });
+    if (input.action === "manager_override" && !canOverrideAttribution) {
       return res.status(403).json({
         ok: false,
-        code: "MANAGER_OVERRIDE_FORBIDDEN",
-        error: "Only owner / manager / admin can apply manager_override",
+        code: "ATTRIBUTION_OVERRIDE_FORBIDDEN",
+        error: "money.override_attribution permission is required",
       });
+    }
+    if (input.action === "claim" && !(await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.CLAIM_OWN }))) {
+      return res.status(403).json({ ok: false, code: "CLAIM_FORBIDDEN", error: "money.claim permission is required" });
+    }
+    if (input.action === "release" && !(await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RELEASE_OWN }))) {
+      return res.status(403).json({ ok: false, code: "RELEASE_FORBIDDEN", error: "money.release_own_claim permission is required" });
     }
 
     let result = await applyTipOverride({
@@ -196,7 +208,7 @@ router.post("/override", async (req, res) => {
       action: input.action,
       targetMemberId: input.targetMemberId,
       reason: input.reason,
-      senior: isSeniorAgencyMember(actor),
+      senior: canOverrideAttribution,
     });
 
     // Cross-version fallback: old v15 tip rows may still live in
@@ -254,7 +266,12 @@ router.get("/disputable", async (req, res) => {
     if (!actor) {
       return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     }
-    const senior = isSeniorAgencyMember(actor);
+    const senior = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_ATTRIBUTION });
+    const canClaimOwn = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.CLAIM_OWN });
+    const canReleaseOwn = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RELEASE_OWN });
+    if (!senior && !canClaimOwn && !canReleaseOwn) {
+      return res.status(403).json({ ok: false, code: "CLAIMS_VIEW_FORBIDDEN", error: "Claims permission is required" });
+    }
     const [tipRows, legacyRows] = await Promise.all([
       listTipClaims({
         agencyId: req.auth.agencyId,
@@ -302,7 +319,7 @@ router.get("/audit", async (req, res) => {
     if (!actor) {
       return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     }
-    const senior = isSeniorAgencyMember(actor);
+    const senior = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_AUDIT });
 
     if (eventHash) {
       const tipRow = await getTipClaimByHash({ agencyId: req.auth.agencyId, eventHash });
@@ -402,7 +419,7 @@ router.get("/audit", async (req, res) => {
 
 router.post("/sweep", async (req, res) => {
   try {
-    const member = await requireSeniorClaimsManager(req, res);
+    const member = await requireClaimsCapability(req, res, TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION);
     if (!member) return;
     const retentionDays = Math.min(730, Math.max(1, Number(req.query.retentionDays || req.body?.retentionDays || 180)));
     const limit = Math.min(20000, Math.max(1, Number(req.query.limit || req.body?.limit || 5000)));
