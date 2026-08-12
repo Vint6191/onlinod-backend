@@ -304,6 +304,7 @@ async function reconcileCreatorSaleToTeam({ db = prisma, saleId }) {
   const accountId = clean(sent?.accountId || sale.creatorId, 160) || sale.creatorId;
   const creatorRef = clean(sale.creator?.username || sale.creator?.displayName, 160);
   const sourceData = {
+    agencyId: sale.agencyId,
     accountId,
     creatorId: sale.creatorId,
     creatorRef,

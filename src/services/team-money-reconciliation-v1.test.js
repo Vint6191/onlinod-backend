@@ -134,6 +134,7 @@ test("exact CreatorSale.messageId + confirmed manual provenance attributes PPV t
   assert.equal(result.proposedStatus, "attributed");
   assert.equal(result.attributionBasis, "EXACT_MESSAGE_MANUAL");
   const row = fx.getPurchase();
+  assert.equal(row.agencyId, "agency-1", "PPV create payload must carry the required tenant boundary");
   assert.equal(row.attributedMemberId, "member-1");
   assert.equal(row.creatorSaleId, "sale-1");
   assert.equal(row.financialTransactionId, "financial-1");
