@@ -220,6 +220,9 @@ model Agency {
   teamActivityEvents TeamActivityEvent[]
   teamPpvClaimAudits TeamPpvClaimAudit[]
   teamMemberFunctions TeamMemberFunction[]
+  teamCoverageSessions TeamCoverageSession[]
+  teamDialogSessions TeamDialogSession[]
+  teamResponseCases TeamResponseCase[]
   analyticsSnapshots AnalyticsSnapshot[]
   workspaceSettings WorkspaceSetting[]
   moduleSettings ModuleSetting[]
@@ -304,6 +307,9 @@ model AgencyMember {
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   teamFunctions TeamMemberFunction[]
+  teamCoverageSessions TeamCoverageSession[]
+  teamDialogSessions TeamDialogSession[]
+  teamResponseCases TeamResponseCase[]
 
   @@unique([agencyId, userId])
   @@index([agencyId])
@@ -349,6 +355,9 @@ model CreatorAccount {
   jobs               JobInstance[]
   deviceCreatorBindings DeviceCreatorBinding[]
   teamActivityEvents TeamActivityEvent[]
+  teamCoverageSessions TeamCoverageSession[]
+  teamDialogSessions TeamDialogSession[]
+  teamResponseCases TeamResponseCase[]
   messageTemplateUsageEvents MessageTemplateUsageEvent[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
   presenceSnapshot CreatorPresenceSnapshot?
@@ -1051,6 +1060,7 @@ model CreatorFinancialTransaction {
   fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorFinancialTransactionCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  teamPpvPurchase TeamPpvPurchaseLedger?
 
   @@unique([creatorId, externalTransactionId])
   @@index([agencyId, creatorId, occurredAt])
@@ -1121,6 +1131,7 @@ model CreatorSale {
   fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorSaleCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  teamPpvPurchase TeamPpvPurchaseLedger?
 
   @@unique([creatorId, eventFingerprint])
   @@unique([creatorId, externalNotificationId])
@@ -1162,6 +1173,7 @@ model CreatorTip {
   fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorTipCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  teamTipAttribution TeamTipLedger?
 
   @@unique([creatorId, eventFingerprint])
   @@unique([creatorId, externalNotificationId])
@@ -3618,6 +3630,105 @@ model TeamSentMessageLedger {
   @@index([agencyId, dialogId, sentAt])
 }
 
+model TeamCoverageSession {
+  id          String   @id @default(cuid())
+  agencyId    String
+  creatorId   String
+  memberId    String
+  userId      String?
+  deviceId    String?
+  coverageId  String
+  startedAt   DateTime
+  endedAt     DateTime?
+  durationSeconds Int?
+  startReason String?
+  endReason   String?
+  source      String   @default("team_v13")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  member  AgencyMember   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, coverageId])
+  @@index([agencyId, memberId, startedAt])
+  @@index([agencyId, creatorId, startedAt])
+  @@index([agencyId, creatorId, memberId, startedAt])
+  @@index([endedAt])
+}
+
+model TeamDialogSession {
+  id          String   @id @default(cuid())
+  agencyId    String
+  creatorId   String
+  memberId    String
+  userId      String?
+  deviceId    String?
+  dialogId    String
+  fanId       String?
+  sessionId   String
+  coverageId  String?
+  startedAt   DateTime
+  endedAt     DateTime
+  wallSeconds Int      @default(0)
+  activeSeconds Int    @default(0)
+  seenAt      DateTime?
+  activityEvents Int   @default(0)
+  endReason   String?
+  source      String   @default("team_v13")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  member  AgencyMember   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, sessionId])
+  @@index([agencyId, memberId, startedAt])
+  @@index([agencyId, creatorId, dialogId, startedAt])
+  @@index([agencyId, memberId, creatorId, dialogId, startedAt])
+}
+
+model TeamResponseCase {
+  id                     String   @id @default(cuid())
+  agencyId               String
+  creatorId              String
+  memberId               String
+  dialogId               String
+  fanId                   String?
+  replyMessageId          String
+  firstIncomingMessageId  String?
+  incomingCount           Int      @default(1)
+  incomingAt              DateTime
+  lastIncomingAt          DateTime
+  replyAt                 DateTime
+  seenAt                  DateTime?
+  coverageId              String?
+  coverageStartedAt       DateTime?
+  handoffFromMemberId     String?
+  classification         String   @default("UNKNOWN")
+  wallClockSeconds        Int      @default(0)
+  coverageResponseSeconds Int?
+  seenResponseSeconds     Int?
+  slaEligible             Boolean  @default(false)
+  sla5Pass                Boolean?
+  sla15Pass               Boolean?
+  derivationVersion       String   @default("team_response_v1")
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  member  AgencyMember   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, replyMessageId])
+  @@index([agencyId, memberId, replyAt])
+  @@index([agencyId, creatorId, dialogId, replyAt])
+  @@index([agencyId, classification, replyAt])
+  @@index([agencyId, slaEligible, replyAt])
+}
+
 model TeamObservationState {
   id        String   @id @default(cuid())
   agencyId  String
@@ -3845,10 +3956,24 @@ model TeamPpvPurchaseLedger {
   resolvedByDeviceId String?
   resolvedSource String?
 
+  // Canonical Creator Analytics money source. These links are additive so
+  // historical Alpha rows remain readable while new PPV attribution is
+  // reconciled from the relational CreatorSale/financial ledger.
+  creatorSaleId          String? @unique
+  financialTransactionId String? @unique
+  financialStatus        String?
+  attributionBasis       String?
+
+  creatorSale          CreatorSale?                @relation(fields: [creatorSaleId], references: [id], onDelete: SetNull)
+  financialTransaction CreatorFinancialTransaction? @relation(fields: [financialTransactionId], references: [id], onDelete: SetNull)
+
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
   @@unique([agencyId, purchaseId])
+  @@index([agencyId, creatorSaleId])
+  @@index([agencyId, financialTransactionId])
+  @@index([agencyId, financialStatus, purchasedAt])
   @@index([agencyId, messageId])
   @@index([agencyId, status, purchasedAt])
   @@index([agencyId, attributedMemberId, purchasedAt])
@@ -3880,6 +4005,11 @@ model TeamTipLedger {
   resolvedByMemberId String?
   resolvedSource String?
 
+  creatorTipId     String? @unique
+  financialStatus  String?
+  attributionBasis String?
+  creatorTip       CreatorTip? @relation(fields: [creatorTipId], references: [id], onDelete: SetNull)
+
   candidates     Json?
   weakCandidates Json?
   result         Json?
@@ -3890,6 +4020,8 @@ model TeamTipLedger {
   updatedAt    DateTime @updatedAt
 
   @@unique([agencyId, eventHash])
+  @@index([agencyId, creatorTipId])
+  @@index([agencyId, financialStatus, receivedAt])
   @@index([agencyId, status, receivedAt])
   @@index([agencyId, attributedMemberId, receivedAt])
   @@index([agencyId, fanId, receivedAt])

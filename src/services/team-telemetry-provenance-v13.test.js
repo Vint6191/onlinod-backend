@@ -5,12 +5,14 @@ const assert = require("node:assert/strict");
 
 const prismaPath = require.resolve("../prisma");
 const ledgerPath = require.resolve("./team-ppv-ledger-service");
+const projectionPath = require.resolve("./team-response-projection-service");
 const servicePath = require.resolve("./telemetry-ingest-service");
 
 function loadService({ failSideEffects = 0, failCreatorLookup = false } = {}) {
   const created = [];
   const rows = [];
   const sideEffects = [];
+  const projections = [];
   const sideEffectState = { failuresRemaining: failSideEffects };
   const prisma = {
     workerDevice: {
@@ -48,6 +50,7 @@ function loadService({ failSideEffects = 0, failCreatorLookup = false } = {}) {
   delete require.cache[servicePath];
   delete require.cache[prismaPath];
   delete require.cache[ledgerPath];
+  delete require.cache[projectionPath];
   require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: prisma };
   require.cache[ledgerPath] = {
     id: ledgerPath,
@@ -61,8 +64,14 @@ function loadService({ failSideEffects = 0, failCreatorLookup = false } = {}) {
       }
     } },
   };
+  require.cache[projectionPath] = {
+    id: projectionPath,
+    filename: projectionPath,
+    loaded: true,
+    exports: { async applyTeamResponseProjection(row) { projections.push(row); } },
+  };
   const service = require(servicePath);
-  return { service, rows, created, sideEffects, sideEffectState };
+  return { service, rows, created, sideEffects, projections, sideEffectState };
 }
 
 function canonical(overrides = {}) {
@@ -234,4 +243,19 @@ test("v13 side-effect failure is retryable after raw event is durably inserted",
   assert.equal(retry.duplicated, 1);
   assert.equal(rows.length, 1);
   assert.equal(sideEffects.length, 2, "duplicate replay retries the idempotent ledger side effect");
+});
+
+test("v13 mixed batch returns exact per-row acknowledgement identities", async () => {
+  const { service, rows } = loadService();
+  const result = await ingest(service, [
+    canonical({ localId: "ack-good-1", messageId: "message-good-1" }),
+    canonical({ localId: "ack-bad-1", messageId: "message-bad-1", actorMemberId: "member-other" }),
+    canonical({ localId: "ack-good-2", messageId: "message-good-2" }),
+  ]);
+
+  assert.equal(result.inserted, 2);
+  assert.equal(result.skipped, 1);
+  assert.deepEqual(result.acknowledgedLocalIds.sort(), ["ack-good-1", "ack-good-2"]);
+  assert.deepEqual(result.rejectedEvents, [{ localId: "ack-bad-1", reason: "human_actor_mismatch" }]);
+  assert.equal(rows.length, 2);
 });

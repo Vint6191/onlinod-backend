@@ -57,3 +57,23 @@ test("ordinary chatter keeps own claim/release but cannot resolve agency-wide co
   assert.equal(await canUseTeamCapability({ member, key: TEAM_CAPABILITIES.RELEASE_OWN, prismaClient: noOverrides }), true);
   assert.equal(await canUseTeamCapability({ member, key: TEAM_CAPABILITIES.RESOLVE_ATTRIBUTION, prismaClient: noOverrides }), false);
 });
+
+test("team analytics view is senior-by-default but custom roles can receive it explicitly", async () => {
+  const chatter = { agencyId: "a", role: "OPERATOR", roleKey: "chatter", permissions: {} };
+  const manager = { agencyId: "a", role: "MANAGER", roleKey: "manager", permissions: {} };
+  assert.equal(await canUseTeamCapability({ member: chatter, key: TEAM_CAPABILITIES.VIEW_ANALYTICS, prismaClient: noOverrides }), false);
+  assert.equal(await canUseTeamCapability({ member: manager, key: TEAM_CAPABILITIES.VIEW_ANALYTICS, prismaClient: noOverrides }), true);
+
+  const custom = {
+    agencySubPermissionOverride: {
+      findUnique: async ({ where }) => where.agencyId_roleKey_subPermKey.subPermKey === TEAM_CAPABILITIES.VIEW_ANALYTICS
+        ? { value: true }
+        : null,
+    },
+  };
+  assert.equal(await canUseTeamCapability({
+    member: { agencyId: "a", role: "OPERATOR", roleKey: "qa_supervisor", permissions: {} },
+    key: TEAM_CAPABILITIES.VIEW_ANALYTICS,
+    prismaClient: custom,
+  }), true);
+});

@@ -12,6 +12,23 @@ function clean(value, max = 255) {
   return s ? s.slice(0, max) : null;
 }
 
+function normalizedCreatorScope(allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return null;
+  return Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)));
+}
+
+function creatorScopeWhere(allowedCreatorIds) {
+  const ids = normalizedCreatorScope(allowedCreatorIds);
+  if (ids === null) return {};
+  return { creatorId: { in: ids.length ? ids : ["__none__"] } };
+}
+
+function creatorAllowed(creatorId, allowedCreatorIds) {
+  const ids = normalizedCreatorScope(allowedCreatorIds);
+  if (ids === null) return true;
+  return ids.includes(String(creatorId || ""));
+}
+
 async function findPpvResolveJobForUpdate(tx, { agencyId, jobId, purchaseId, messageId }) {
   if (jobId) {
     const rows = await tx.$queryRaw`
@@ -485,12 +502,13 @@ async function expirePendingJobs({ agencyId = null } = {}) {
   }
 }
 
-async function listResolveJobs({ agencyId, limit = 100 }) {
+async function listResolveJobs({ agencyId, limit = 100, allowedCreatorIds = null }) {
   await expirePendingJobs({ agencyId });
   const now = new Date();
   const rows = await prisma.teamPpvResolveJob.findMany({
     where: {
       agencyId,
+      ...creatorScopeWhere(allowedCreatorIds),
       status: "pending",
       OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
     },
@@ -667,7 +685,7 @@ async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, actorMemberI
   return created;
 }
 
-async function submitResolveResults({ agencyId, deviceId, results = [], actorMemberId = null, actorUserId = null, senior = false }) {
+async function submitResolveResults({ agencyId, deviceId, results = [], actorMemberId = null, actorUserId = null, senior = false, allowedCreatorIds = null }) {
   const input = Array.isArray(results) ? results : [];
   const safeActorMemberId = clean(actorMemberId, 160);
   const safeActorUserId = clean(actorUserId, 160);
@@ -687,6 +705,7 @@ async function submitResolveResults({ agencyId, deviceId, results = [], actorMem
     const outcome = await prisma.$transaction(async (tx) => {
       const job = await findPpvResolveJobForUpdate(tx, { agencyId, jobId, purchaseId, messageId });
       if (!job) return "skipped";
+      if (!creatorAllowed(job.creatorId, allowedCreatorIds)) return "forbidden";
       if (job.expiresAt && job.expiresAt < new Date()) {
         await tx.teamPpvResolveJob.update({ where: { id: job.id }, data: { status: "expired", attempts: { increment: 1 } } });
         return "skipped";
@@ -815,12 +834,12 @@ async function submitResolveResults({ agencyId, deviceId, results = [], actorMem
   return { received: input.length, resolved, conflicts, skipped, forbidden };
 }
 
-async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false }) {
+async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false, allowedCreatorIds = null }) {
   const statuses = includeClosed
     ? ["conflict", "resolved", "rejected"]
     : ["conflict"];
   const rows = await prisma.teamPpvResolveJob.findMany({
-    where: { agencyId, status: { in: statuses } },
+    where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), status: { in: statuses } },
     orderBy: { updatedAt: "desc" },
     take: Math.max(1, Math.min(250, Number(limit) || 100)),
   });
@@ -949,7 +968,7 @@ async function createPpvClaimAudit(tx, { agencyId, actorMemberId, job, action, s
   });
 }
 
-async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = null, action = "assign", deviceId, reason = null }) {
+async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = null, action = "assign", deviceId, reason = null, allowedCreatorIds = null }) {
   const safeJobId = clean(jobId, 160);
   const safeAction = clean(action || (memberId ? "assign" : "unresolved"), 40) || "assign";
   const safeMemberId = clean(memberId, 160);
@@ -972,6 +991,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
   const outcome = await prisma.$transaction(async (tx) => {
     const job = await findPpvResolveJobForUpdate(tx, { agencyId, jobId: safeJobId });
     if (!job) return "skipped";
+    if (!creatorAllowed(job.creatorId, allowedCreatorIds)) return "creator_forbidden";
 
     const purchaseBefore = await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
 
@@ -1171,6 +1191,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
   }, serializableTxOptions());
 
   if (outcome === "skipped") return { resolved: 0, skipped: 1 };
+  if (outcome === "creator_forbidden") return { resolved: 0, skipped: 1, code: "CREATOR_ACCESS_FORBIDDEN" };
   if (outcome === "invalid_member") return { resolved: 0, skipped: 1, code: "RESOLUTION_MEMBER_INVALID" };
   return { resolved: 1, skipped: 0, action: outcome };
 }

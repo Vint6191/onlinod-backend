@@ -49,6 +49,7 @@ const RECURRING_INTERVAL_MS = 60 * 60 * 1000;
 const FRESHNESS_WINDOW_MS = RECURRING_INTERVAL_MS;
 const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
 const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin setting can override
+const TEAM_MONEY_BACKFILL_BATCH_SIZE = 250; // DB-only historical reconciliation, no OF requests
 let lastRetentionSweepAt = 0;
 
 async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) {
@@ -402,6 +403,32 @@ async function scheduleJobNow({
 }
 
 
+async function maybeReconcileHistoricalTeamMoney() {
+  try {
+    const { reconcileHistoricalTeamMoneyBatch } = require("./team-money-reconciliation-service");
+    const result = await reconcileHistoricalTeamMoneyBatch({
+      db: prisma,
+      saleLimit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
+      tipLimit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
+    });
+    if (!result?.skipped) {
+      const sales = result?.sales || {};
+      const tips = result?.tips || {};
+      if ((sales.selected || 0) > 0 || (tips.selected || 0) > 0 || (sales.failed || 0) > 0 || (tips.failed || 0) > 0) {
+        console.log(
+          `[scheduler] Team money backfill — sales linked=${sales.linked || 0}/${sales.selected || 0}, tips linked=${tips.linked || 0}/${tips.selected || 0}, failed=${(sales.failed || 0) + (tips.failed || 0)}`
+        );
+      }
+    }
+    return result;
+  } catch (err) {
+    // This is maintenance over already-stored canonical facts. Never suppress
+    // creator jobs because historical Team reconciliation temporarily failed.
+    console.warn("[scheduler] Team money backfill failed:", err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
 /**
  * Recurring scheduler — finds all READY creators across all agencies
  * and ensures they have scheduled jobs. Runs once on startup, then
@@ -464,7 +491,10 @@ async function runRecurringSweep() {
     }
   }
 
+  // Retention owns the detailed 180d boundary. Run it before the historical
+  // Team backfill so deleted old detail is not immediately recreated.
   const retention = await maybeRunRetentionSweep({ now });
+  const teamMoneyBackfill = await maybeReconcileHistoricalTeamMoney();
 
   const elapsed = Date.now() - startedAt;
   console.log(
@@ -478,6 +508,7 @@ async function runRecurringSweep() {
     dailyCyclesStarted,
     dailyCyclesSkipped,
     retention,
+    teamMoneyBackfill,
   };
 }
 
@@ -533,5 +564,7 @@ module.exports = {
   FRESHNESS_WINDOW_MS,
   TRAFFIC_REFRESH_WINDOW_MS,
   RETENTION_SWEEP_WINDOW_MS,
+  TEAM_MONEY_BACKFILL_BATCH_SIZE,
   maybeRunRetentionSweep,
+  maybeReconcileHistoricalTeamMoney,
 };

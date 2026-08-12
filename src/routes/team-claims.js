@@ -19,17 +19,43 @@ const {
   migrateLegacyTipsToTipLedger,
   purgeExpiredTipLedger,
 } = require("../services/team-tip-ledger-service");
+const { reconcileHistoricalTeamMoneyBatch } = require("../services/team-money-reconciliation-service");
 const prisma = require("../prisma");
 const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-capabilities");
 
 const router = express.Router();
 
+function memberCreatorScope(member) {
+  const isOwner = String(member?.role || "").toUpperCase() === "OWNER" || String(member?.roleKey || "").toLowerCase() === "owner";
+  if (isOwner) return null;
+  const raw = member?.assignedCreators;
+  if (raw === null || raw === undefined || raw === "all") return null;
+  if (Array.isArray(raw)) return Array.from(new Set(raw.map(String).map((id) => id.trim()).filter(Boolean)));
+  if (raw && typeof raw === "object") {
+    if (raw.all === true || raw.mode === "all") return null;
+    const ids = Array.isArray(raw.creatorIds) ? raw.creatorIds : (Array.isArray(raw.ids) ? raw.ids : []);
+    return Array.from(new Set(ids.map(String).map((id) => id.trim()).filter(Boolean)));
+  }
+  return [];
+}
+
+function creatorScopeWhere(allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return {};
+  const ids = Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)));
+  return { creatorId: { in: ids.length ? ids : ["__none__"] } };
+}
+
+function creatorAllowed(creatorId, allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return true;
+  const ids = new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean));
+  return ids.has(String(creatorId || ""));
+}
 
 async function loadActorMember(req) {
   if (!req.auth?.agencyId || !req.auth?.userId) return null;
   return prisma.agencyMember.findFirst({
     where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null },
-    select: { id: true, agencyId: true, userId: true, roleKey: true, role: true, permissions: true },
+    select: { id: true, agencyId: true, userId: true, roleKey: true, role: true, permissions: true, assignedCreators: true },
   });
 }
 
@@ -186,6 +212,7 @@ router.post("/override", async (req, res) => {
     // eligible tip rows. Agency-wide dispute resolution stays
     // owner/manager-only through manager_override and PPV Claims.
     const canOverrideAttribution = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION });
+    const allowedCreatorIds = memberCreatorScope(actor);
     if (input.action === "manager_override" && !canOverrideAttribution) {
       return res.status(403).json({
         ok: false,
@@ -209,6 +236,7 @@ router.post("/override", async (req, res) => {
       targetMemberId: input.targetMemberId,
       reason: input.reason,
       senior: canOverrideAttribution,
+      allowedCreatorIds,
     });
 
     // Cross-version fallback: old v15 tip rows may still live in
@@ -222,11 +250,13 @@ router.post("/override", async (req, res) => {
         action: input.action,
         targetMemberId: input.targetMemberId,
         reason: input.reason,
+        allowedCreatorIds,
       });
     }
 
     if (!result.ok) {
       const status = result.code === "ATTRIBUTION_LOCKED" ? 409
+                   : result.code === "CREATOR_ACCESS_FORBIDDEN" ? 403
                    : result.code === "NOT_OWNER" || result.code === "CLAIM_NOT_ELIGIBLE" || result.code === "TIP_CONFLICT_MANAGER_REQUIRED" || result.code === "PPV_CLAIMS_MOVED_TO_LEDGER" ? 403
                    : result.code === "ATTRIBUTION_NOT_FOUND" || result.code === "TIP_NOT_FOUND" ? 404
                    : 400;
@@ -269,6 +299,7 @@ router.get("/disputable", async (req, res) => {
     const senior = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_ATTRIBUTION });
     const canClaimOwn = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.CLAIM_OWN });
     const canReleaseOwn = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RELEASE_OWN });
+    const allowedCreatorIds = memberCreatorScope(actor);
     if (!senior && !canClaimOwn && !canReleaseOwn) {
       return res.status(403).json({ ok: false, code: "CLAIMS_VIEW_FORBIDDEN", error: "Claims permission is required" });
     }
@@ -278,12 +309,14 @@ router.get("/disputable", async (req, res) => {
         limit,
         actorMemberId: actor.id,
         senior,
+        allowedCreatorIds,
       }),
       listDisputable({
         agencyId: req.auth.agencyId,
         limit,
         actorMemberId: actor.id,
         senior,
+        allowedCreatorIds,
       }),
     ]);
     const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)]
@@ -320,9 +353,10 @@ router.get("/audit", async (req, res) => {
       return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     }
     const senior = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_AUDIT });
+    const allowedCreatorIds = memberCreatorScope(actor);
 
     if (eventHash) {
-      const tipRow = await getTipClaimByHash({ agencyId: req.auth.agencyId, eventHash });
+      const tipRow = await getTipClaimByHash({ agencyId: req.auth.agencyId, eventHash, allowedCreatorIds });
       if (tipRow) {
         if (!senior && !isOwnClaimRow(tipRow, actor.id)) {
           return res.status(403).json({ ok: false, code: "CLAIMS_AUDIT_FORBIDDEN" });
@@ -333,7 +367,7 @@ router.get("/audit", async (req, res) => {
       const row = await prisma.moneyAttribution.findUnique({
         where: { agencyId_eventHash: { agencyId: req.auth.agencyId, eventHash } },
       });
-      if (!row || !isLegacyClaimableRow(row)) return res.json({ ok: true, attribution: null });
+      if (!row || !isLegacyClaimableRow(row) || !creatorAllowed(row.creatorId, allowedCreatorIds)) return res.json({ ok: true, attribution: null });
       if (!senior && !isOwnClaimRow(row, actor.id)) {
         return res.status(403).json({ ok: false, code: "CLAIMS_AUDIT_FORBIDDEN" });
       }
@@ -353,10 +387,12 @@ router.get("/audit", async (req, res) => {
           limit: 500,
           senior,
           actorMemberId: actor.id,
+          allowedCreatorIds,
         }),
         prisma.moneyAttribution.findMany({
           where: {
             agencyId: req.auth.agencyId,
+            ...creatorScopeWhere(allowedCreatorIds),
             eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
             occurredAt: { gte: from },
             OR: [
@@ -374,6 +410,7 @@ router.get("/audit", async (req, res) => {
 
     const where = {
       agencyId: req.auth.agencyId,
+      ...creatorScopeWhere(allowedCreatorIds),
       eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
       occurredAt: { gte: from },
     };
@@ -390,6 +427,7 @@ router.get("/audit", async (req, res) => {
         limit: 500,
         senior,
         actorMemberId: actor.id,
+        allowedCreatorIds,
       }),
       prisma.moneyAttribution.findMany({
         where,
@@ -435,6 +473,14 @@ router.post("/sweep", async (req, res) => {
       dryRun,
       deleteLegacy: true,
     });
+    const canonicalMoneyBackfill = dryRun
+      ? { ok: true, skipped: true, reason: "DRY_RUN" }
+      : await reconcileHistoricalTeamMoneyBatch({
+          agencyId: req.auth.agencyId,
+          saleLimit: Math.min(1000, limit),
+          tipLimit: Math.min(1000, limit),
+          retentionDays,
+        });
     const legacyLocks = await sweepLocks({ agencyId: req.auth.agencyId });
 
     const [tipLedgerPurge, legacyAttributionPurge] = await Promise.all([
@@ -457,6 +503,7 @@ router.post("/sweep", async (req, res) => {
       retentionDays,
       dryRun,
       legacyTipMigration,
+      canonicalMoneyBackfill,
       legacyLocks,
       tipLedgerPurge,
       legacyAttributionPurge,

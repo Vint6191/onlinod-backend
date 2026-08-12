@@ -3,6 +3,7 @@
 const { isSeniorAgencyMember } = require("../middleware/agency-member-role");
 
 const TEAM_CAPABILITIES = Object.freeze({
+  VIEW_ANALYTICS: "team.analytics.view",
   VIEW_ATTRIBUTION: "money.view_attribution",
   CLAIM_OWN: "money.claim",
   RELEASE_OWN: "money.release_own_claim",

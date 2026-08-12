@@ -142,3 +142,21 @@ test("PPV creator_revenue closes chatter attribution without inventing an owner"
   assert.equal(state.auditRows[0].selectedMemberId, null);
   assert.equal(state.activityRows.length, 0, "creator revenue must not emit chatter revenue activity");
 });
+
+test("PPV manager cannot resolve a conflict outside assigned creator scope", async () => {
+  const { service, state } = loadService();
+  const result = await service.resolvePpvConflict({
+    agencyId: "agency-1",
+    jobId: "job-1",
+    memberId: "chatter-1",
+    actorMemberId: "manager-1",
+    action: "assign",
+    reason: "Reviewed exact sent-message evidence",
+    allowedCreatorIds: ["creator-2"],
+  });
+
+  assert.equal(result.code, "CREATOR_ACCESS_FORBIDDEN");
+  assert.equal(state.purchaseWrites.length, 0);
+  assert.equal(state.jobWrites.length, 0);
+  assert.equal(state.auditRows.length, 0);
+});

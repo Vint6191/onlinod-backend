@@ -46,6 +46,18 @@ function cleanString(value, max = 200) {
   return s ? s.slice(0, max) : null;
 }
 
+function creatorScopeWhere(allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return {};
+  const ids = Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)));
+  return { creatorId: { in: ids.length ? ids : ["__none__"] } };
+}
+
+function creatorAllowed(creatorId, allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return true;
+  const ids = new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean));
+  return ids.has(String(creatorId || ""));
+}
+
 async function findMoneyAttributionForUpdate(tx, { agencyId, eventHash }) {
   const rows = await tx.$queryRaw`
     SELECT * FROM "MoneyAttribution"
@@ -340,7 +352,7 @@ async function ingestMoneyEvent({ agencyId, userId, payload }) {
 // Apply a manual override (claim / release / manager_override)
 // --------------------------------------------------------------------
 
-async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action, targetMemberId, reason }) {
+async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action, targetMemberId, reason, allowedCreatorIds = null }) {
   const cleanAction = cleanString(action, 24);
   const safeHash = cleanString(eventHash, 80);
   if (!cleanAction || !ALLOWED_ACTIONS.has(cleanAction)) {
@@ -363,6 +375,9 @@ async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action
 
     if (!row) {
       return { ok: false, code: "ATTRIBUTION_NOT_FOUND" };
+    }
+    if (!creatorAllowed(row.creatorId, allowedCreatorIds)) {
+      return { ok: false, code: "CREATOR_ACCESS_FORBIDDEN" };
     }
 
     if (!isLegacyClaimableEventType(row.eventType)) {
@@ -458,10 +473,11 @@ async function applyOverride({ agencyId, byUserId, byMemberId, eventHash, action
 // full visibility).
 // --------------------------------------------------------------------
 
-async function listDisputable({ agencyId, range = "24h", limit = 200, actorMemberId = null, senior = false }) {
+async function listDisputable({ agencyId, range = "24h", limit = 200, actorMemberId = null, senior = false, allowedCreatorIds = null }) {
   const cutoff = new Date(Date.now() - GRACE_PERIOD_MS);
   const where = {
     agencyId,
+    ...creatorScopeWhere(allowedCreatorIds),
     eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
     occurredAt: { gte: cutoff },
     locked: false,

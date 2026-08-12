@@ -91,3 +91,78 @@ test("Team read models do not silently truncate activity or attribution ledgers"
   assert.match(analytics, /findAllById\(prisma\.teamPpvPurchaseLedger/);
   assert.match(analytics, /findAllById\(prisma\.teamTipLedger/);
 });
+
+
+test("Team response projection schema is additive, relational, and excludes accidental User relations", () => {
+  const schema = read("prisma/schema.prisma");
+  const coverage = schema.match(/model TeamCoverageSession \{[\s\S]*?\n\}/)?.[0] || "";
+  const dialog = schema.match(/model TeamDialogSession \{[\s\S]*?\n\}/)?.[0] || "";
+  const response = schema.match(/model TeamResponseCase \{[\s\S]*?\n\}/)?.[0] || "";
+  const user = schema.match(/model User \{[\s\S]*?\n\}/)?.[0] || "";
+
+  assert.match(coverage, /coverageId\s+String/);
+  assert.ok(coverage.includes("@@unique([agencyId, coverageId])"));
+  assert.match(dialog, /activeSeconds\s+Int/);
+  assert.match(dialog, /wallSeconds\s+Int/);
+  assert.match(response, /classification\s+String/);
+  assert.match(response, /wallClockSeconds\s+Int/);
+  assert.match(response, /coverageResponseSeconds\s+Int\?/);
+  assert.match(response, /seenResponseSeconds\s+Int\?/);
+  assert.match(response, /slaEligible\s+Boolean/);
+  assert.ok(response.includes("@@unique([agencyId, replyMessageId])"));
+  assert.doesNotMatch(user, /teamCoverageSessions|teamDialogSessions|teamResponseCases/);
+
+  const sql = read("prisma/migrations/20260812012000_team_response_projection_v1/migration.sql");
+  assert.doesNotMatch(sql, /DROP\s+(?:TABLE|COLUMN)/i);
+  for (const table of ["TeamCoverageSession", "TeamDialogSession", "TeamResponseCase"]) {
+    assert.ok(sql.includes(`CREATE TABLE "${table}"`), `missing ${table} migration`);
+  }
+  assert.ok(sql.includes('TeamResponseCase_agencyId_replyMessageId_key'));
+});
+
+test("response derivation explicitly separates fresh SLA from backlog and handoff", () => {
+  const projection = read("src/services/team-response-projection-service.js");
+  assert.match(projection, /classification = "FRESH"/);
+  assert.match(projection, /classification = "HANDOFF"/);
+  assert.match(projection, /classification = "BACKLOG"/);
+  assert.match(projection, /const slaEligible = classification === "FRESH"/);
+  assert.match(projection, /MAX_OPEN_COVERAGE_MS = 12 \* 60 \* 60 \* 1000/);
+});
+
+test("Team analytics reads are capability-gated and money visibility is independent", () => {
+  const capabilities = read("src/services/team-capabilities.js");
+  const route = read("src/routes/team-analytics.js");
+  const analytics = read("src/services/team-analytics-service.js");
+  assert.ok(capabilities.includes('VIEW_ANALYTICS: "team.analytics.view"'));
+  assert.ok(route.includes('TEAM_CAPABILITIES.VIEW_ANALYTICS'));
+  assert.ok(route.includes('TEAM_CAPABILITIES.VIEW_ATTRIBUTION'));
+  assert.ok(route.includes('TEAM_ANALYTICS_VIEW_REQUIRED'));
+  for (const builder of ["buildTeamOverview", "buildTeamMembers", "buildTeamAlerts", "buildTeamFlags"]) {
+    assert.match(route, new RegExp(`${builder}\\(\\{[^}]*includeMoney`, "s"));
+  }
+  assert.match(analytics, /if \(!includeMoney\) \{[\s\S]*metrics\.revenueAttributedCents = null/);
+  assert.match(analytics, /overview\.revenueAttributedCents = null/);
+});
+
+test("Team analytics creator scope fails closed for scoped members", () => {
+  const route = read("src/routes/team-analytics.js");
+  const analytics = read("src/services/team-analytics-service.js");
+  assert.match(route, /function analyticsCreatorScope\(member\)/);
+  assert.match(route, /if \(Array\.isArray\(raw\)\)/);
+  assert.match(route, /return \[\];/);
+  assert.match(analytics, /function creatorScopeWhere\(allowedCreatorIds\)/);
+  assert.ok(analytics.includes('{ creatorId: { in: ids.length ? ids : ["__none__"] } }'));
+  assert.match(analytics, /loadProjectedResponseCases\(\{ agencyId, range, allowedCreatorIds/);
+  assert.match(analytics, /getPpvLedgerRevenueByMember\(\{ agencyId, range: computed\.range, allowedCreatorIds \}\)/);
+});
+
+test("response/session diagnostics are behind Team analytics capability and creator scope", () => {
+  const route = read("src/routes/team-analytics.js");
+  const service = read("src/services/team-response-read-service.js");
+  for (const routeName of ["/responses", "/dialog-sessions", "/coverage-sessions"]) {
+    assert.ok(route.includes(`router.get("${routeName}"`));
+  }
+  assert.match(route, /router\.get\("\/responses"[\s\S]*requireTeamAnalyticsViewer/);
+  assert.match(service, /creatorId: \{ in: ids\.length \? ids : \["__none__"\] \}/);
+  assert.doesNotMatch(service, /messageText|bodyText|textContent/);
+});

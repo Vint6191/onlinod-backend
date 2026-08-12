@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { projectSubscriptionFacts, rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
+const { reconcileCreatorSalesToTeam, reconcileCreatorTipsToTeam } = require("./team-money-reconciliation-service");
 
 const SERVICE_VERSION = "notification-facts-v1-history-v8-known-boundary";
 const SCHEMA_VERSION = 5;
@@ -1087,6 +1088,18 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
         model: "creatorTip", facts: groups.tip, job, deviceId, fanIds, now,
         compareKeys: ["fanId", "externalNotificationId", "externalTransactionId", "messageId", "amountCents", "currency", "tippedAt"],
       });
+      // Team Analytics consumes the canonical CreatorSale ledger; it never
+      // runs a second OF money scanner. Reconcile inside the same transaction
+      // so a committed sale cannot exist without its exact-message Team side
+      // effect when Team models are available.
+      if (groups.sale.length) {
+        const persistedSales = await existingFacts(tx, "creatorSale", job.creatorId, groups.sale);
+        await reconcileCreatorSalesToTeam({ db: tx, saleIds: persistedSales.map((row) => row.id) });
+      }
+      if (groups.tip.length) {
+        const persistedTips = await existingFacts(tx, "creatorTip", job.creatorId, groups.tip);
+        await reconcileCreatorTipsToTeam({ db: tx, tipIds: persistedTips.map((row) => row.id) });
+      }
       const subscription = await persistFactGroup(tx, {
         model: "creatorSubscriptionEvent", facts: groups.subscription, job, deviceId, fanIds, now,
         compareKeys: ["fanId", "externalNotificationId", "externalTransactionId", "eventType", "observedPriceCents", "currency", "occurredAt"],

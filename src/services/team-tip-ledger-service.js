@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
+const { classifySentSource } = require("./team-money-reconciliation-service");
 
 const TIP_ATTRIBUTION_WINDOW_MS = 10 * 60 * 1000;
 const TIP_SOFT_REVIEW_WINDOW_MS = 15 * 60 * 1000;
@@ -14,6 +15,26 @@ const ATTRIBUTED_TIP_STATUSES = ["attributed", "claimed", "resolved"];
 function clean(value, max = 255) {
   const s = String(value ?? "").trim();
   return s ? s.slice(0, max) : null;
+}
+
+function creatorScopeWhere(allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return {};
+  const ids = Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)));
+  return { creatorId: { in: ids.length ? ids : ["__none__"] } };
+}
+
+function creatorAllowed(creatorId, allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return true;
+  const ids = new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean));
+  return ids.has(String(creatorId || ""));
+}
+
+function activeFinancialWhere() {
+  return { OR: [{ financialStatus: null }, { financialStatus: { not: "undo" } }] };
+}
+
+function financiallyActive(row) {
+  return String(row?.financialStatus || "").trim().toLowerCase() !== "undo";
 }
 
 async function findTipLedgerForUpdate(tx, { agencyId, eventHash }) {
@@ -251,12 +272,14 @@ async function findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId
 
   const rows = await prisma.teamSentMessageLedger.findMany({
     where,
-    select: { memberId: true, userId: true, deviceId: true, shiftKey: true, sentAt: true },
+    select: { memberId: true, userId: true, deviceId: true, shiftKey: true, sentAt: true, source: true },
     orderBy: { sentAt: "desc" },
     take: 200,
   }).catch(() => []);
 
-  const candidates = mergeCandidates(rows.map((row) => candidateFromSent(row, to)));
+  const candidates = mergeCandidates(rows
+    .filter((row) => classifySentSource(row) === "MANUAL")
+    .map((row) => candidateFromSent(row, to)));
   const primary = candidates.filter((c) => {
     if (!c.sentAtMs) return false;
     return to.getTime() - Number(c.sentAtMs) <= TIP_ATTRIBUTION_WINDOW_MS;
@@ -267,6 +290,29 @@ async function findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId
     return age > TIP_ATTRIBUTION_WINDOW_MS && age <= TIP_SOFT_REVIEW_WINDOW_MS;
   });
   return { primary, weak };
+}
+
+async function findExactTipMessageCandidate({ agencyId, creatorId, accountId, messageId }) {
+  const safeMessageId = clean(messageId, 160);
+  if (!safeMessageId) return { sent: null, sourceClass: "UNKNOWN", member: null };
+  let sent = null;
+  if (creatorId) {
+    sent = await prisma.teamSentMessageLedger.findFirst({
+      where: { agencyId, creatorId, messageId: safeMessageId },
+      orderBy: { sentAt: "asc" },
+    }).catch(() => null);
+  }
+  if (!sent && accountId) {
+    sent = await prisma.teamSentMessageLedger.findFirst({
+      where: { agencyId, accountId, messageId: safeMessageId, OR: [{ creatorId: null }, ...(creatorId ? [{ creatorId }] : [])] },
+      orderBy: { sentAt: "asc" },
+    }).catch(() => null);
+  }
+  const sourceClass = classifySentSource(sent);
+  const member = sourceClass === "MANUAL" && sent?.memberId
+    ? await resolveMember({ agencyId, memberId: sent.memberId, userId: sent.userId })
+    : null;
+  return { sent, sourceClass, member };
 }
 
 function fallbackWeakCandidateFromPayload({ payload, receivedAt }) {
@@ -326,42 +372,56 @@ async function ingestTipEvent({ agencyId, userId, payload }) {
   }
 
   const creator = await resolveCreator({ agencyId, payload });
+  const exact = await findExactTipMessageCandidate({
+    agencyId, creatorId: creator?.id || clean(payload?.creatorId, 160), accountId, messageId: payload?.messageId,
+  });
   const { primary, weak } = await findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId, receivedAt });
   const fallbackWeak = fallbackWeakCandidateFromPayload({ payload, receivedAt });
+  const exactCandidate = exact.member && exact.sent ? candidateFromSent(exact.sent, receivedAt) : null;
+  const candidates = mergeCandidates(exactCandidate, primary);
   const weakCandidates = mergeCandidates(weak, primary.length ? [] : fallbackWeak);
 
-  let status = "creator_revenue";
+  // Exact message provenance may auto-attribute. Recent-message timing is only
+  // evidence for Claims and is never enough to count chatter revenue by itself.
+  let status = "unresolved";
   let attributedMemberId = null;
   let attributedUserId = null;
   let attributedShiftKey = null;
-  let resolvedSource = "tip_no_recent_dialog_worker";
-  let autoReason = "no_message_in_10m_window";
+  let resolvedSource = "tip_unresolved_no_exact_message";
+  let autoReason = "no_exact_message_provenance";
 
-  if (primary.length === 1) {
+  if (exact.sourceClass === "MANUAL" && exact.member) {
     status = "attributed";
-    attributedMemberId = primary[0].memberId;
-    attributedUserId = primary[0].userId || null;
-    attributedShiftKey = primary[0].shiftKey || null;
-    resolvedSource = "tip_single_recent_dialog_worker";
-    autoReason = "single_recent_dialog_worker_10m";
+    attributedMemberId = exact.member.id;
+    attributedUserId = exact.member.userId || exact.sent?.userId || null;
+    attributedShiftKey = exact.sent?.shiftKey || null;
+    resolvedSource = "tip_exact_message_manual";
+    autoReason = "exact_message_manual";
+  } else if (exact.sourceClass === "NON_HUMAN") {
+    status = "creator_revenue";
+    resolvedSource = "tip_exact_message_non_human";
+    autoReason = "exact_message_non_human";
   } else if (primary.length > 1) {
     status = "conflict";
-    resolvedSource = "tip_multiple_recent_dialog_workers";
-    autoReason = "multiple_recent_dialog_workers_10m";
+    resolvedSource = "tip_recent_candidates_conflict";
+    autoReason = "multiple_recent_candidates_evidence_only";
+  } else if (primary.length === 1) {
+    autoReason = "single_recent_candidate_evidence_only";
   }
 
   const result = {
     claimType: "tip_attribution",
+    attributionMode: "exact_message_first",
     attributionWindowMinutes: 10,
     softReviewWindowMinutes: 15,
-    candidates: primary,
+    candidates,
     weakCandidates,
     autoReason,
   };
 
   const history = [{
     ts: Date.now(),
-    action: status === "attributed" ? "auto_attribution" : (status === "conflict" ? "auto_conflict" : "auto_creator_revenue"),
+    action: status === "attributed" ? "exact_auto_attribution" : (status === "conflict" ? "evidence_conflict" : (status === "creator_revenue" ? "exact_non_human_creator_revenue" : "unresolved_evidence")),
     reason: autoReason,
     prevOwner: null,
     nextOwner: attributedMemberId,
@@ -387,9 +447,10 @@ async function ingestTipEvent({ agencyId, userId, payload }) {
       attributedMemberId,
       attributedUserId,
       attributedShiftKey,
-      resolvedAt: status === "attributed" ? new Date() : null,
+      resolvedAt: ["attributed", "creator_revenue"].includes(status) ? new Date() : null,
       resolvedSource,
-      candidates: primary,
+      attributionBasis: autoReason,
+      candidates,
       weakCandidates,
       result,
       history,
@@ -401,7 +462,7 @@ async function ingestTipEvent({ agencyId, userId, payload }) {
 }
 
 async function canActorClaimTip({ agencyId, row, actor }) {
-  if (!row || !actor) return false;
+  if (!row || !actor || !financiallyActive(row)) return false;
   if (row.attributedMemberId === actor.id) return true;
   if (String(row.status || "") === "conflict") return false;
 
@@ -455,6 +516,8 @@ function tipRowForClaims(row, membersById = new Map()) {
     fanId: row.fanId,
     dialogId: row.dialogId,
     messageId: row.messageId,
+    financialStatus: row.financialStatus || null,
+    attributionBasis: row.attributionBasis || null,
     state: statusToState(row),
     status: row.status,
     locked,
@@ -489,11 +552,13 @@ async function enrichTipRows(rows, agencyId) {
   return rows.map((row) => tipRowForClaims(row, membersById));
 }
 
-async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, senior = false }) {
+async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, senior = false, allowedCreatorIds = null }) {
   const cutoff = new Date(Date.now() - TIP_CLAIM_GRACE_PERIOD_MS);
   const rows = await prisma.teamTipLedger.findMany({
     where: {
       agencyId,
+      ...creatorScopeWhere(allowedCreatorIds),
+      ...activeFinancialWhere(),
       receivedAt: { gte: cutoff },
     },
     orderBy: { receivedAt: "desc" },
@@ -517,18 +582,19 @@ async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, seni
   return enrichTipRows(visible.slice(0, Math.min(1000, Math.max(1, int(limit, 200)))), agencyId);
 }
 
-async function getTipClaimByHash({ agencyId, eventHash }) {
+async function getTipClaimByHash({ agencyId, eventHash, allowedCreatorIds = null }) {
   const row = await prisma.teamTipLedger.findUnique({
     where: { agencyId_eventHash: { agencyId, eventHash: clean(eventHash, 120) } },
   }).catch(() => null);
-  if (!row) return null;
+  if (!row || !creatorAllowed(row.creatorId, allowedCreatorIds)) return null;
   const [enriched] = await enrichTipRows([row], agencyId);
   return enriched || null;
 }
 
-async function listTipAudit({ agencyId, memberId = null, from, limit = 500, senior = false, actorMemberId = null }) {
+async function listTipAudit({ agencyId, memberId = null, from, limit = 500, senior = false, actorMemberId = null, allowedCreatorIds = null }) {
   const where = {
     agencyId,
+    ...creatorScopeWhere(allowedCreatorIds),
     ...(from ? { receivedAt: { gte: from } } : {}),
   };
   const rows = await prisma.teamTipLedger.findMany({
@@ -581,7 +647,7 @@ async function createTipClaimNoticeEvents(tx, { agencyId, row, action, selectedM
   }
 }
 
-async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, action, targetMemberId, reason, senior = false }) {
+async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, action, targetMemberId, reason, senior = false, allowedCreatorIds = null }) {
   const safeHash = clean(eventHash, 120);
   const cleanAction = clean(action, 24);
   if (!safeHash) return { ok: false, code: "TIP_NOT_FOUND" };
@@ -598,6 +664,8 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
   const outcome = await prisma.$transaction(async (tx) => {
     const row = await findTipLedgerForUpdate(tx, { agencyId, eventHash: safeHash });
     if (!row) return { code: "TIP_NOT_FOUND" };
+    if (!creatorAllowed(row.creatorId, allowedCreatorIds)) return { code: "CREATOR_ACCESS_FORBIDDEN" };
+    if (!financiallyActive(row)) return { code: "TIP_FINANCIAL_REVERSED", error: "This tip was reversed in the financial ledger" };
     if (isLocked(row)) return { code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
 
     let nextStatus = row.status;

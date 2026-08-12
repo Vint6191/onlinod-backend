@@ -58,6 +58,57 @@ function percentile(values, p) {
   return list[idx];
 }
 
+function buildProjectedResponseSummary(rows) {
+  const cases = Array.isArray(rows) ? rows : [];
+  const freshSeconds = [];
+  const coverageSeconds = [];
+  const seenSeconds = [];
+  let sla5Passes = 0;
+  let sla15Passes = 0;
+  let incomingHandled = 0;
+  const counts = { FRESH: 0, BACKLOG: 0, HANDOFF: 0, UNKNOWN: 0 };
+
+  for (const row of cases) {
+    const classification = String(row?.classification || "UNKNOWN").toUpperCase();
+    const key = Object.prototype.hasOwnProperty.call(counts, classification) ? classification : "UNKNOWN";
+    counts[key] += 1;
+    incomingHandled += Math.max(1, num(row?.incomingCount, 1));
+
+    const coverage = nullableNum(row?.coverageResponseSeconds);
+    const seen = nullableNum(row?.seenResponseSeconds);
+    if (coverage !== null) coverageSeconds.push(Math.max(0, coverage));
+    if (seen !== null) seenSeconds.push(Math.max(0, seen));
+
+    if (row?.slaEligible === true) {
+      const wall = nullableNum(row?.wallClockSeconds);
+      if (wall !== null) freshSeconds.push(Math.max(0, wall));
+      if (row?.sla5Pass === true) sla5Passes += 1;
+      if (row?.sla15Pass === true) sla15Passes += 1;
+    }
+  }
+
+  const responseSamples = freshSeconds.length;
+  return {
+    source: cases.length ? "team_response_case_v1" : "none",
+    cases: cases.length,
+    incomingHandled,
+    freshReplies: counts.FRESH,
+    backlogReplies: counts.BACKLOG,
+    handoffReplies: counts.HANDOFF,
+    unknownReplies: counts.UNKNOWN,
+    responseSamples,
+    avgResponseSeconds: mean(freshSeconds),
+    medianResponseSeconds: median(freshSeconds),
+    p90ResponseSeconds: percentile(freshSeconds, 90),
+    slaReply5mPct: responseSamples > 0 ? (sla5Passes / responseSamples) * 100 : null,
+    slaReply15mPct: responseSamples > 0 ? (sla15Passes / responseSamples) * 100 : null,
+    coverageResponseAvgSeconds: mean(coverageSeconds),
+    coverageResponseMedianSeconds: median(coverageSeconds),
+    seenResponseAvgSeconds: mean(seenSeconds),
+    seenResponseMedianSeconds: median(seenSeconds),
+  };
+}
+
 function eventExtra(ev) {
   return ev?.extra && typeof ev.extra === "object" ? ev.extra : {};
 }
@@ -83,6 +134,26 @@ function isCurrentTelemetry(ev) {
   const version = String(extra.telemetryVersion || "");
   const source = String(ev.source || extra.source || "");
   return SUPPORTED_TEAM_TELEMETRY_VERSIONS.has(version) || SUPPORTED_TEAM_TELEMETRY_SOURCES.has(source);
+}
+
+function creatorScopeWhere(allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return {};
+  const ids = Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)));
+  return { creatorId: { in: ids.length ? ids : ["__none__"] } };
+}
+
+function activePpvFinancialWhere() {
+  // Notification-only purchases do not have a payout status yet and remain
+  // valid revenue. A later payout `undo` is authoritative reversal evidence.
+  return { OR: [{ financialStatus: null }, { financialStatus: { not: "undo" } }] };
+}
+
+function ppvFinanciallyActive(row) {
+  return String(row?.financialStatus || "").trim().toLowerCase() !== "undo";
+}
+
+function activeTipFinancialWhere() {
+  return { OR: [{ financialStatus: null }, { financialStatus: { not: "undo" } }] };
 }
 
 async function findAllById(model, args = {}, pageSize = 5000) {
@@ -139,6 +210,9 @@ function emptyMetric() {
     storiesCreated: 0,
     chatOpened: 0,
     incomingMessages: 0,
+    unansweredIncomingCount: 0,
+    dialogDwellSeconds: 0,
+    dialogSessionsCount: 0,
     engagementReplies: 0,
     backlogCleared: 0,
     backlogMaxAgeSeconds: 0,
@@ -159,6 +233,14 @@ function emptyMetric() {
     medianResponseSeconds: null,
     p90ResponseSeconds: null,
     responseSamples: 0,
+    freshReplies: 0,
+    backlogReplies: 0,
+    handoffReplies: 0,
+    unknownReplies: 0,
+    coverageResponseAvgSeconds: null,
+    coverageResponseMedianSeconds: null,
+    seenResponseAvgSeconds: null,
+    seenResponseMedianSeconds: null,
     unansweredIncomingCount: 0,
     slaReply5mPct: null,
     slaReply15mPct: null,
@@ -174,6 +256,8 @@ function emptyMetric() {
     _fans: new Set(),
     _creators: new Set(),
     _responseSeconds: [],
+    _coverageResponseSeconds: [],
+    _seenResponseSeconds: [],
     _sla5: 0,
     _sla15: 0,
     _dialogSessions: new Map(),
@@ -199,6 +283,10 @@ function cleanMetric(metric) {
   metric.medianResponseSeconds = median(metric._responseSeconds);
   metric.p90ResponseSeconds = percentile(metric._responseSeconds, 90);
   metric.responseSamples = responseSamples;
+  metric.coverageResponseAvgSeconds = mean(metric._coverageResponseSeconds);
+  metric.coverageResponseMedianSeconds = median(metric._coverageResponseSeconds);
+  metric.seenResponseAvgSeconds = mean(metric._seenResponseSeconds);
+  metric.seenResponseMedianSeconds = median(metric._seenResponseSeconds);
   metric.slaReply5mPct = responseSamples > 0 ? (metric._sla5 / responseSamples) * 100 : null;
   metric.slaReply15mPct = responseSamples > 0 ? (metric._sla15 / responseSamples) * 100 : null;
   metric.dollarsPerMessageCents = metric.messagesSent > 0 ? Math.round(metric.revenueAttributedCents / metric.messagesSent) : 0;
@@ -214,6 +302,8 @@ function cleanMetric(metric) {
   delete metric._fans;
   delete metric._creators;
   delete metric._responseSeconds;
+  delete metric._coverageResponseSeconds;
+  delete metric._seenResponseSeconds;
   delete metric._sla5;
   delete metric._sla15;
   delete metric._dialogSessions;
@@ -288,18 +378,18 @@ function dedupeLogicalEvents(rows) {
   return out;
 }
 
-async function loadV3Events({ agencyId, range }) {
+async function loadV3Events({ agencyId, range, allowedCreatorIds = null }) {
   const rows = await findAllById(prisma.teamActivityEvent, {
-    where: { agencyId, ...whereForRange("ts", range) },
+    where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...whereForRange("ts", range) },
   });
   rows.sort((a, b) => new Date(a.ts || 0).getTime() - new Date(b.ts || 0).getTime());
   return dedupeLogicalEvents(rows.filter(isCurrentTelemetry));
 }
 
-async function loadPpvPurchaseLedger({ agencyId, range }) {
+async function loadPpvPurchaseLedger({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await findAllById(prisma.teamPpvPurchaseLedger, {
-      where: { agencyId, ...whereForRange("purchasedAt", range) },
+      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...whereForRange("purchasedAt", range) },
     });
     rows.sort((a, b) => new Date(a.purchasedAt || 0).getTime() - new Date(b.purchasedAt || 0).getTime());
     return rows;
@@ -308,12 +398,38 @@ async function loadPpvPurchaseLedger({ agencyId, range }) {
   }
 }
 
-async function buildComputed({ agencyId, rangeKey = "7d" }) {
+async function loadProjectedResponseCases({ agencyId, range, allowedCreatorIds = null }) {
+  try {
+    const rows = await findAllById(prisma.teamResponseCase, {
+      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...whereForRange("replyAt", range) },
+    });
+    rows.sort((a, b) => new Date(a.replyAt || 0).getTime() - new Date(b.replyAt || 0).getTime());
+    return rows;
+  } catch (_) {
+    return [];
+  }
+}
+
+async function loadProjectedDialogSessions({ agencyId, range, allowedCreatorIds = null }) {
+  try {
+    const rows = await findAllById(prisma.teamDialogSession, {
+      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...whereForRange("startedAt", range) },
+    });
+    rows.sort((a, b) => new Date(a.startedAt || 0).getTime() - new Date(b.startedAt || 0).getTime());
+    return rows;
+  } catch (_) {
+    return [];
+  }
+}
+
+async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = null }) {
   const range = resolveRange(rangeKey);
-  const [members, events, ppvPurchases] = await Promise.all([
+  const [members, events, ppvPurchases, responseCases, projectedDialogSessions] = await Promise.all([
     getMembersShell(agencyId),
-    loadV3Events({ agencyId, range }),
-    loadPpvPurchaseLedger({ agencyId, range }),
+    loadV3Events({ agencyId, range, allowedCreatorIds }),
+    loadPpvPurchaseLedger({ agencyId, range, allowedCreatorIds }),
+    loadProjectedResponseCases({ agencyId, range, allowedCreatorIds }),
+    loadProjectedDialogSessions({ agencyId, range, allowedCreatorIds }),
   ]);
 
   const metricsByMember = new Map();
@@ -359,6 +475,7 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
   // leaking revenue into member metrics. This is what makes Claims safe.
   const ledgerPpvPurchaseIds = new Set();
   for (const p of ppvPurchases || []) {
+    if (!ppvFinanciallyActive(p)) continue;
     const purchaseId = String(p.purchaseId || "").trim();
     if (purchaseId) ledgerPpvPurchaseIds.add(purchaseId);
 
@@ -376,6 +493,56 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     if (p.fanId) ownerMetric._fans.add(String(p.fanId));
     if (p.accountId) ownerMetric._creators.add(String(p.accountId));
     if (purchaseId) seenPpvPurchaseIds.add(purchaseId);
+  }
+
+  const hasProjectedResponses = responseCases.length > 0;
+  for (const response of responseCases) {
+    const m = metricFor(response.memberId);
+    if (!m) continue;
+    const incomingCount = Math.max(1, num(response.incomingCount, 1));
+    m.incomingMessages += incomingCount;
+    const classification = String(response.classification || "UNKNOWN").toUpperCase();
+    if (classification === "FRESH") m.freshReplies += 1;
+    else if (classification === "BACKLOG") {
+      m.backlogReplies += 1;
+      m.backlogCleared += 1;
+      m.backlogMaxAgeSeconds = Math.max(num(m.backlogMaxAgeSeconds, 0), num(response.wallClockSeconds, 0));
+    } else if (classification === "HANDOFF") {
+      m.handoffReplies += 1;
+      m.backlogCleared += 1;
+      m.backlogMaxAgeSeconds = Math.max(num(m.backlogMaxAgeSeconds, 0), num(response.wallClockSeconds, 0));
+    } else {
+      m.unknownReplies += 1;
+    }
+    const coverageSeconds = nullableNum(response.coverageResponseSeconds);
+    const seenSeconds = nullableNum(response.seenResponseSeconds);
+    if (coverageSeconds !== null) m._coverageResponseSeconds.push(Math.max(0, coverageSeconds));
+    if (seenSeconds !== null) m._seenResponseSeconds.push(Math.max(0, seenSeconds));
+    if (response.slaEligible === true) {
+      const seconds = Math.max(0, num(response.wallClockSeconds, 0));
+      m._responseSeconds.push(seconds);
+      if (response.sla5Pass === true) m._sla5 += 1;
+      if (response.sla15Pass === true) m._sla15 += 1;
+    }
+  }
+
+  const hasProjectedDialogSessions = projectedDialogSessions.length > 0;
+  for (const session of projectedDialogSessions) {
+    const m = metricFor(session.memberId);
+    if (!m) continue;
+    const activeSeconds = Math.max(0, num(session.activeSeconds, 0));
+    m.dialogDwellSeconds += activeSeconds;
+    m.dialogSessionsCount += 1;
+    const dk = [String(session.creatorId || ""), String(session.dialogId || "")].join("|");
+    const prev = m._dialogSessions.get(dk) || {
+      fanId: session.fanId || session.dialogId || null,
+      accountId: session.creatorId || null,
+      sessions: 0,
+      dwellSeconds: 0,
+    };
+    prev.sessions += 1;
+    prev.dwellSeconds += activeSeconds;
+    m._dialogSessions.set(dk, prev);
   }
 
   for (const ev of events) {
@@ -461,6 +628,7 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     }
 
     if (canonicalKind === "DIALOG_SESSION") {
+      if (hasProjectedDialogSessions) continue;
       if (m) {
         const dwell = Math.max(0, num(ev.durationSeconds ?? extra.dwellSeconds, 0));
         m.dialogDwellSeconds += dwell;
@@ -573,7 +741,7 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
       }
 
       const suppliedReplySeconds = nullableNum(extra.replySeconds);
-      if (isFreshReply && suppliedReplySeconds !== null) {
+      if (!hasProjectedResponses && isFreshReply && suppliedReplySeconds !== null) {
         const seconds = Math.max(0, Math.round(suppliedReplySeconds));
         const senderMetric = m || metricFor(memberId);
         if (senderMetric) {
@@ -612,10 +780,34 @@ async function buildComputed({ agencyId, rangeKey = "7d" }) {
     }
   }
 
+  // v13 response projection currently proves completed response episodes, but
+  // does not yet maintain an authoritative pending/unanswered queue. Once the
+  // projected response model is active, do not leak the older Alpha unread/open
+  // heuristic into a metric that looks authoritative. Null means deliberately
+  // unavailable until a dedicated pending projector exists.
+  if (hasProjectedResponses) {
+    for (const metric of metricsByMember.values()) metric.unansweredIncomingCount = null;
+  }
+
   const byMember = new Map();
   for (const [memberId, metric] of metricsByMember.entries()) byMember.set(memberId, cleanMetric(metric));
+  const responseSummary = buildProjectedResponseSummary(responseCases);
 
-  return { range, members, events, byMember };
+  return {
+    range,
+    members,
+    events,
+    byMember,
+    responseSummary,
+    projection: {
+      responseCases: responseCases.length,
+      dialogSessions: projectedDialogSessions.length,
+      responseSource: hasProjectedResponses ? "team_response_case_v1" : "legacy_event_fallback",
+      dialogSessionSource: hasProjectedDialogSessions ? "team_dialog_session_v1" : "event_fallback",
+      unansweredSource: hasProjectedResponses ? "not_projected" : "legacy_event_fallback",
+      creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
+    },
+  };
 }
 
 const LEGACY_TIP_MONEY_TYPES = ["tip_received"];
@@ -636,12 +828,13 @@ function mergeRevenueMaps(...maps) {
   return out;
 }
 
-async function getLegacyTipRevenueByMember({ agencyId, range }) {
+async function getLegacyTipRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await prisma.moneyAttribution.groupBy({
       by: ["attributedToMemberId"],
       where: {
         agencyId,
+        ...creatorScopeWhere(allowedCreatorIds),
         eventType: { in: LEGACY_TIP_MONEY_TYPES },
         attributedToMemberId: { not: null },
         ...whereForRange("occurredAt", range),
@@ -658,12 +851,13 @@ async function getLegacyTipRevenueByMember({ agencyId, range }) {
   }
 }
 
-async function getLegacyTipRevenueByMemberDialog({ agencyId, range }) {
+async function getLegacyTipRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await prisma.moneyAttribution.groupBy({
       by: ["attributedToMemberId", "fanId"],
       where: {
         agencyId,
+        ...creatorScopeWhere(allowedCreatorIds),
         eventType: { in: LEGACY_TIP_MONEY_TYPES },
         attributedToMemberId: { not: null },
         fanId: { not: null },
@@ -682,12 +876,14 @@ async function getLegacyTipRevenueByMemberDialog({ agencyId, range }) {
   }
 }
 
-async function getPpvLedgerRevenueByMember({ agencyId, range }) {
+async function getPpvLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await prisma.teamPpvPurchaseLedger.groupBy({
       by: ["attributedMemberId"],
       where: {
         agencyId,
+        ...creatorScopeWhere(allowedCreatorIds),
+        ...activePpvFinancialWhere(),
         status: { in: ATTRIBUTED_PPV_STATUSES },
         attributedMemberId: { not: null },
         ...whereForRange("purchasedAt", range),
@@ -704,11 +900,13 @@ async function getPpvLedgerRevenueByMember({ agencyId, range }) {
   }
 }
 
-async function getPpvLedgerRevenueByMemberDialog({ agencyId, range }) {
+async function getPpvLedgerRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await findAllById(prisma.teamPpvPurchaseLedger, {
       where: {
         agencyId,
+        ...creatorScopeWhere(allowedCreatorIds),
+        ...activePpvFinancialWhere(),
         status: { in: ATTRIBUTED_PPV_STATUSES },
         attributedMemberId: { not: null },
         ...whereForRange("purchasedAt", range),
@@ -727,12 +925,14 @@ async function getPpvLedgerRevenueByMemberDialog({ agencyId, range }) {
   }
 }
 
-async function getTipLedgerRevenueByMember({ agencyId, range }) {
+async function getTipLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await prisma.teamTipLedger.groupBy({
       by: ["attributedMemberId"],
       where: {
         agencyId,
+        ...creatorScopeWhere(allowedCreatorIds),
+        ...activeTipFinancialWhere(),
         status: { in: ATTRIBUTED_TIP_STATUSES },
         attributedMemberId: { not: null },
         ...whereForRange("receivedAt", range),
@@ -749,11 +949,13 @@ async function getTipLedgerRevenueByMember({ agencyId, range }) {
   }
 }
 
-async function getTipLedgerRevenueByMemberDialog({ agencyId, range }) {
+async function getTipLedgerRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await findAllById(prisma.teamTipLedger, {
       where: {
         agencyId,
+        ...creatorScopeWhere(allowedCreatorIds),
+        ...activeTipFinancialWhere(),
         status: { in: ATTRIBUTED_TIP_STATUSES },
         attributedMemberId: { not: null },
         ...whereForRange("receivedAt", range),
@@ -773,8 +975,8 @@ async function getTipLedgerRevenueByMemberDialog({ agencyId, range }) {
 }
 
 
-async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
-  const computed = await buildComputed({ agencyId, rangeKey });
+async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
+  const computed = await buildComputed({ agencyId, rangeKey, allowedCreatorIds });
   const [
     ppvRevenueByMember,
     tipLedgerRevenueByMember,
@@ -782,14 +984,14 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     ppvRevenueByMemberDialog,
     tipLedgerRevenueByMemberDialog,
     legacyTipRevenueByMemberDialog,
-  ] = await Promise.all([
-    getPpvLedgerRevenueByMember({ agencyId, range: computed.range }),
-    getTipLedgerRevenueByMember({ agencyId, range: computed.range }),
-    getLegacyTipRevenueByMember({ agencyId, range: computed.range }),
-    getPpvLedgerRevenueByMemberDialog({ agencyId, range: computed.range }),
-    getTipLedgerRevenueByMemberDialog({ agencyId, range: computed.range }),
-    getLegacyTipRevenueByMemberDialog({ agencyId, range: computed.range }),
-  ]);
+  ] = includeMoney ? await Promise.all([
+    getPpvLedgerRevenueByMember({ agencyId, range: computed.range, allowedCreatorIds }),
+    getTipLedgerRevenueByMember({ agencyId, range: computed.range, allowedCreatorIds }),
+    getLegacyTipRevenueByMember({ agencyId, range: computed.range, allowedCreatorIds }),
+    getPpvLedgerRevenueByMemberDialog({ agencyId, range: computed.range, allowedCreatorIds }),
+    getTipLedgerRevenueByMemberDialog({ agencyId, range: computed.range, allowedCreatorIds }),
+    getLegacyTipRevenueByMemberDialog({ agencyId, range: computed.range, allowedCreatorIds }),
+  ]) : [new Map(), new Map(), new Map(), new Map(), new Map(), new Map()];
   const revenueByMember = mergeRevenueMaps(ppvRevenueByMember, tipLedgerRevenueByMember, legacyTipRevenueByMember);
   const revenueByMemberDialog = mergeRevenueMaps(ppvRevenueByMemberDialog, tipLedgerRevenueByMemberDialog, legacyTipRevenueByMemberDialog);
 
@@ -797,16 +999,26 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     const shell = memberShell(member);
     const metrics = computed.byMember.get(String(member.id)) || cleanMetric(emptyMetric());
     const revenue = revenueByMember.get(String(member.id)) || 0;
-    if (revenue > 0) {
+    if (includeMoney && revenue > 0) {
       metrics.revenueAttributedCents = revenue;
       metrics.dollarsPerMessageCents = metrics.messagesSent > 0 ? Math.round(revenue / metrics.messagesSent) : 0;
       metrics.moneySource = "ppv_ledger_plus_tip_ledger_with_legacy_tip_fallback";
     }
+    if (!includeMoney) {
+      metrics.revenueAttributedCents = null;
+      metrics.dollarsPerMessageCents = null;
+      metrics.ppvRevenueCents = null;
+      metrics.ppvSoldMessages = null;
+      metrics.ppvOpenRatePct = null;
+      metrics.moneySource = null;
+    }
     if (Array.isArray(metrics.topDialogSessions)) {
       metrics.topDialogSessions = metrics.topDialogSessions.map((item) => {
-        const cents = revenueByMemberDialog.get(`${shell.id}|${item.fanId || ""}`) || 0;
+        const cents = includeMoney ? (revenueByMemberDialog.get(`${shell.id}|${item.fanId || ""}`) || 0) : null;
         const sharePct = metrics.dialogDwellSeconds > 0 ? Math.round((num(item.dwellSeconds, 0) / metrics.dialogDwellSeconds) * 100) : 0;
-        return { ...item, shiftRevenueCents: cents, shiftRevenueUsd: Math.round(cents) / 100, shiftTimeSharePct: sharePct };
+        return includeMoney
+          ? { ...item, shiftRevenueCents: cents, shiftRevenueUsd: Math.round(cents || 0) / 100, shiftTimeSharePct: sharePct }
+          : { ...item, shiftTimeSharePct: sharePct };
       });
     }
     return { member: shell, metrics, rawSummary: null };
@@ -818,6 +1030,9 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d" }) {
     snapshot: null,
     members: rows,
     source: "team_activity_event_v13",
+    projection: computed.projection,
+    responseSummary: computed.responseSummary,
+    moneyVisible: includeMoney === true,
   };
 }
 
@@ -850,6 +1065,18 @@ function combineOverview(metricsList, membersCount) {
     revenueAttributedCents: 0,
     dollarsPerMessageCents: 0,
     avgResponseSeconds: null,
+    medianResponseSeconds: null,
+    p90ResponseSeconds: null,
+    responseSamples: 0,
+    freshReplies: 0,
+    backlogReplies: 0,
+    handoffReplies: 0,
+    unknownReplies: 0,
+    coverageResponseAvgSeconds: null,
+    coverageResponseMedianSeconds: null,
+    seenResponseAvgSeconds: null,
+    seenResponseMedianSeconds: null,
+    slaReply5mPct: null,
     slaReply15mPct: null,
     source: "team_activity_event_v13",
   };
@@ -869,9 +1096,17 @@ function combineOverview(metricsList, membersCount) {
     out.storiesCreated += num(m.storiesCreated, 0);
     out.chatOpened += num(m.chatOpened, 0);
     out.incomingMessages += num(m.incomingMessages, 0);
+    out.unansweredIncomingCount += num(m.unansweredIncomingCount, 0);
+    out.dialogDwellSeconds += num(m.dialogDwellSeconds, 0);
+    out.dialogSessionsCount += num(m.dialogSessionsCount, 0);
     out.engagementReplies += num(m.engagementReplies, 0);
     out.backlogCleared += num(m.backlogCleared, 0);
     out.backlogMaxAgeSeconds = Math.max(num(out.backlogMaxAgeSeconds, 0), num(m.backlogMaxAgeSeconds, 0));
+    out.responseSamples += num(m.responseSamples, 0);
+    out.freshReplies += num(m.freshReplies, 0);
+    out.backlogReplies += num(m.backlogReplies, 0);
+    out.handoffReplies += num(m.handoffReplies, 0);
+    out.unknownReplies += num(m.unknownReplies, 0);
     out.ppvSentMessages += num(m.ppvSentMessages, 0);
     out.ppvSoldMessages += num(m.ppvSoldMessages, 0);
     out.ppvRevenueCents += num(m.ppvRevenueCents, 0);
@@ -895,44 +1130,75 @@ function combineOverview(metricsList, membersCount) {
   return out;
 }
 
-async function buildTeamOverview({ agencyId, rangeKey = "7d" }) {
-  const membersPayload = await buildTeamMembers({ agencyId, rangeKey });
+async function buildTeamOverview({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
+  const membersPayload = await buildTeamMembers({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
   const overview = combineOverview(membersPayload.members.map((r) => r.metrics), membersPayload.members.length);
+  const responseSummary = membersPayload.responseSummary;
+  if (responseSummary?.source === "team_response_case_v1") {
+    overview.incomingMessages = responseSummary.incomingHandled;
+    overview.freshReplies = responseSummary.freshReplies;
+    overview.backlogReplies = responseSummary.backlogReplies;
+    overview.handoffReplies = responseSummary.handoffReplies;
+    overview.unknownReplies = responseSummary.unknownReplies;
+    overview.responseSamples = responseSummary.responseSamples;
+    overview.avgResponseSeconds = responseSummary.avgResponseSeconds;
+    overview.medianResponseSeconds = responseSummary.medianResponseSeconds;
+    overview.p90ResponseSeconds = responseSummary.p90ResponseSeconds;
+    overview.slaReply5mPct = responseSummary.slaReply5mPct;
+    overview.slaReply15mPct = responseSummary.slaReply15mPct;
+    overview.coverageResponseAvgSeconds = responseSummary.coverageResponseAvgSeconds;
+    overview.coverageResponseMedianSeconds = responseSummary.coverageResponseMedianSeconds;
+    overview.seenResponseAvgSeconds = responseSummary.seenResponseAvgSeconds;
+    overview.seenResponseMedianSeconds = responseSummary.seenResponseMedianSeconds;
+    if (membersPayload.projection?.unansweredSource === "not_projected") overview.unansweredIncomingCount = null;
+  }
+  if (!includeMoney) {
+    overview.revenueAttributedCents = null;
+    overview.dollarsPerMessageCents = null;
+    overview.ppvRevenueCents = null;
+    overview.ppvSoldMessages = null;
+    overview.ppvOpenRatePct = null;
+  }
   return {
     ok: true,
     range: membersPayload.range,
     snapshot: null,
     overview,
+    projection: membersPayload.projection || null,
+    responseSummary: membersPayload.responseSummary || null,
+    moneyVisible: includeMoney === true,
   };
 }
 
-async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
-  const membersPayload = await buildTeamMembers({ agencyId, rangeKey });
+async function buildTeamAlerts({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
+  const membersPayload = await buildTeamMembers({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
   const alerts = [];
-  try {
-    const [jobConflicts, purchaseConflicts, tipConflicts] = await Promise.all([
-      prisma.teamPpvResolveJob.count({ where: { agencyId, status: "conflict" } }),
-      prisma.teamPpvPurchaseLedger.count({ where: { agencyId, status: "conflict" } }),
-      prisma.teamTipLedger.count({ where: { agencyId, status: "conflict" } }).catch(() => 0),
-    ]);
-    const conflictCount = Math.max(num(jobConflicts, 0), num(purchaseConflicts, 0));
-    if (conflictCount > 0) {
-      alerts.push({
-        id: "ppv_conflicts",
-        tone: "danger",
-        title: `${conflictCount} PPV attribution conflicts`,
-        text: "Some PPV purchases were claimed by multiple workers and need manager review.",
-      });
-    }
-    if (num(tipConflicts, 0) > 0) {
-      alerts.push({
-        id: "tip_conflicts",
-        tone: "warn",
-        title: `${tipConflicts} tip attribution conflicts`,
-        text: "Some tips have multiple recent chatters in the 10-minute window and need manager review.",
-      });
-    }
-  } catch (_) {}
+  if (includeMoney) {
+    try {
+      const [jobConflicts, purchaseConflicts, tipConflicts] = await Promise.all([
+        prisma.teamPpvResolveJob.count({ where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), status: "conflict" } }),
+        prisma.teamPpvPurchaseLedger.count({ where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activePpvFinancialWhere(), status: "conflict" } }),
+        prisma.teamTipLedger.count({ where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activeTipFinancialWhere(), status: "conflict" } }).catch(() => 0),
+      ]);
+      const conflictCount = Math.max(num(jobConflicts, 0), num(purchaseConflicts, 0));
+      if (conflictCount > 0) {
+        alerts.push({
+          id: "ppv_conflicts",
+          tone: "danger",
+          title: `${conflictCount} PPV attribution conflicts`,
+          text: "Some PPV purchases were claimed by multiple workers and need manager review.",
+        });
+      }
+      if (num(tipConflicts, 0) > 0) {
+        alerts.push({
+          id: "tip_conflicts",
+          tone: "warn",
+          title: `${tipConflicts} tip attribution conflicts`,
+          text: "Some tips have multiple recent chatters in the 10-minute window and need manager review.",
+        });
+      }
+    } catch (_) {}
+  }
 
   for (const row of membersPayload.members) {
     const name = row.member?.name || "member";
@@ -966,12 +1232,14 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
     }
     const topDialog = Array.isArray(m.topDialogSessions) ? m.topDialogSessions[0] : null;
     if (topDialog && num(m.dialogDwellSeconds, 0) >= 15 * 60 && num(topDialog.shiftTimeSharePct, 0) >= 80) {
-      const dollars = (num(topDialog.shiftRevenueCents, 0) / 100).toFixed(2);
+      const dollars = includeMoney ? (num(topDialog.shiftRevenueCents, 0) / 100).toFixed(2) : null;
       alerts.push({
         id: `focus_dialog_${row.member.id}_${topDialog.fanId || "unknown"}`,
-        tone: num(topDialog.shiftRevenueCents, 0) > 0 ? "warn" : "danger",
+        tone: includeMoney && num(topDialog.shiftRevenueCents, 0) > 0 ? "warn" : "danger",
         title: `${name}: ${topDialog.shiftTimeSharePct}% shift time in one dialog`,
-        text: `Fan ${topDialog.fanId || "unknown"}: ${Math.round(num(topDialog.dwellSeconds, 0) / 60)} min, earned this shift $${dollars}.`,
+        text: includeMoney
+          ? `Fan ${topDialog.fanId || "unknown"}: ${Math.round(num(topDialog.dwellSeconds, 0) / 60)} min, earned this shift $${dollars}.`
+          : `Fan ${topDialog.fanId || "unknown"}: ${Math.round(num(topDialog.dwellSeconds, 0) / 60)} min.`,
         memberId: row.member.id,
       });
     }
@@ -979,8 +1247,8 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d" }) {
   return { ok: true, range: membersPayload.range, snapshot: null, alerts, source: "team_activity_event_v13" };
 }
 
-async function buildTeamFlags({ agencyId, rangeKey = "7d" }) {
-  const alerts = await buildTeamAlerts({ agencyId, rangeKey });
+async function buildTeamFlags({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
+  const alerts = await buildTeamAlerts({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
   return { ok: true, range: alerts.range, snapshot: null, flags: alerts.alerts || [], source: "team_activity_event_v13" };
 }
 

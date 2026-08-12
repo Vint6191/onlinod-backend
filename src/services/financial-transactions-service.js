@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
+const { reconcileCreatorSaleToTeam, reconcileCreatorTipToTeam } = require("./team-money-reconciliation-service");
 
 const JOB_KEY = "financial_transactions_scan";
 const COLLECTOR_VERSION = "payout-transactions-v2-catchup";
@@ -338,7 +339,16 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
         if (previousComparable === nextComparable) unchanged += 1; else updated += 1;
       }
       if (row.projectionStatus === "PROJECTED") {
-        await projectKnownFact(tx, job, deviceId, row, fanId, now);
+        const projectedFact = await projectKnownFact(tx, job, deviceId, row, fanId, now);
+        if (row.factType === "SALE" && projectedFact?.id) {
+          // Exact Team PPV ownership is derived from CreatorSale.messageId.
+          // The payout row only enriches that canonical sale with financial
+          // status/identity; no chatter-recency heuristic is introduced here.
+          await reconcileCreatorSaleToTeam({ db: tx, saleId: projectedFact.id });
+        }
+        if (row.factType === "TIP" && projectedFact?.id) {
+          await reconcileCreatorTipToTeam({ db: tx, tipId: projectedFact.id });
+        }
         projected += 1;
         affectedDates.push(row.occurredAt);
       } else {

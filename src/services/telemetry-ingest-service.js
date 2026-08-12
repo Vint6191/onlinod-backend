@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { applyLedgerSideEffects } = require("./team-ppv-ledger-service");
+const { applyTeamResponseProjection } = require("./team-response-projection-service");
 
 const TEAM_V13_VERSION = "team_v13_provenance";
 const TEAM_V13_SOURCE = "electron_team_v13";
@@ -336,6 +337,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
   const normalized = [];
   let skipped = 0;
   const rejectedByReason = {};
+  const rejectedEvents = [];
   const safeDeviceId = await resolveExistingDeviceId({ agencyId, deviceId });
   const authenticatedMember = await resolveAuthenticatedMember({ agencyId, memberId, userId });
 
@@ -343,6 +345,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
     const event = stripInternalEventFields(rawEvent);
     if (!event || typeof event !== "object") {
       skipped += 1;
+      rejectedEvents.push({ localId: null, reason: "invalid_event" });
       continue;
     }
 
@@ -351,6 +354,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
       if (!creator) {
         skipped += 1;
         rejectedByReason.creator_not_found = (rejectedByReason.creator_not_found || 0) + 1;
+        rejectedEvents.push({ localId: cleanString(event.localId, 160), reason: "creator_not_found" });
         continue;
       }
       const result = normalizeCanonicalCore({
@@ -364,6 +368,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
         skipped += 1;
         const key = result.reason || "invalid_contract";
         rejectedByReason[key] = (rejectedByReason[key] || 0) + 1;
+        rejectedEvents.push({ localId: cleanString(event.localId, 160), reason: key });
         continue;
       }
       normalized.push(result.row);
@@ -373,6 +378,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
     const legacy = await normalizeLegacyEvent({ agencyId, safeDeviceId, deviceId, userId, event });
     if (!legacy) {
       skipped += 1;
+      rejectedEvents.push({ localId: cleanString(event.localId, 160), reason: "legacy_event_invalid" });
       continue;
     }
     normalized.push(legacy);
@@ -380,6 +386,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
 
   let inserted = 0;
   let duplicated = 0;
+  const acknowledgedLocalIds = [];
 
   for (const row of normalized) {
     try {
@@ -396,16 +403,37 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
           // ingestion semantics. If they fail, propagate the error so the
           // desktop keeps its outbox row and retries. On retry the raw event is
           // found by localId and the idempotent side effect is attempted again.
-          await applyLedgerSideEffects({ ...row, id: exists.id });
+          const replayRow = { ...row, id: exists.id };
+          await applyLedgerSideEffects(replayRow);
+          await applyTeamResponseProjection(replayRow);
+          if (row.localId) acknowledgedLocalIds.push(row.localId);
           continue;
         }
       }
       const created = await prisma.teamActivityEvent.create({ data: row });
       inserted += 1;
-      await applyLedgerSideEffects({ ...row, id: created.id });
+      const durableRow = { ...row, id: created.id };
+      await applyLedgerSideEffects(durableRow);
+      await applyTeamResponseProjection(durableRow);
+      if (row.localId) acknowledgedLocalIds.push(row.localId);
     } catch (err) {
-      if (err?.code === "P2002") duplicated += 1;
-      else throw err;
+      if (err?.code === "P2002") {
+        duplicated += 1;
+        // A concurrent writer may have won the unique race after our explicit
+        // pre-check. Do not acknowledge until the idempotent side effects have
+        // also been replayed for the durable row.
+        if (row.localId) {
+          const existing = await prisma.teamActivityEvent.findFirst({
+            where: { agencyId: row.agencyId, localId: row.localId },
+            select: { id: true },
+          });
+          if (!existing) throw err;
+          const replayRow = { ...row, id: existing.id };
+          await applyLedgerSideEffects(replayRow);
+          await applyTeamResponseProjection(replayRow);
+          acknowledgedLocalIds.push(row.localId);
+        }
+      } else throw err;
     }
   }
 
@@ -415,6 +443,8 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
     inserted,
     duplicated,
     skipped,
+    acknowledgedLocalIds,
+    rejectedEvents,
     ...(Object.keys(rejectedByReason).length ? { rejectedByReason } : {}),
   };
 }
