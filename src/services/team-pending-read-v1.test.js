@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: {} };
-const { listTeamPendingDialogs, summarizePendingRows, summarizePendingWhere } = require("./team-pending-read-service");
+const { listTeamPendingDialogs, summarizePendingRows, summarizePendingWhere, repairStaleLegacyBootstrapPending } = require("./team-pending-read-service");
 
 function makeDb() {
   const rows = [
@@ -52,6 +52,15 @@ function makeDb() {
         return members.filter((m) => m.agencyId === where.agencyId && where.id.in.includes(m.id));
       },
     },
+    creatorAccount: {
+      async findMany() { return [{ id: "creator-1", displayName: "Vilgelmina", username: "vilgelmina", avatarUrl: "https://img/creator.jpg" }]; },
+    },
+    creatorFan: {
+      async findMany() { return [{ creatorId: "creator-1", onlyFansUserId: "fan-1", username: "andrew", displayName: "Andrew" }]; },
+    },
+    followBackCandidate: {
+      async findMany() { return [{ creatorId: "creator-1", fanId: "fan-1", username: "andrew", displayName: "Andrew", avatarUrl: "https://img/fan.jpg", updatedAt: new Date("2026-08-12T09:30:00.000Z") }]; },
+    },
   };
 }
 
@@ -66,7 +75,13 @@ test("pending read model is current-queue, creator-scoped and exposes evidence w
   assert.equal(payload.summary.olderThan15m, 2);
   assert.equal(payload.summary.olderThan60m, 2);
   assert.equal(payload.summary.oldestPendingSeconds, 2 * 60 * 60);
-  assert.equal(payload.rows.find((row) => row.id === "p-1").ownerMemberName, "Marina");
+  const first = payload.rows.find((row) => row.id === "p-1");
+  assert.equal(first.ownerMemberName, "Marina");
+  assert.equal(first.creatorDisplayName, "Vilgelmina");
+  assert.equal(first.creatorUsername, "vilgelmina");
+  assert.equal(first.fanDisplayName, "Andrew");
+  assert.equal(first.fanUsername, "andrew");
+  assert.equal(first.fanAvatarUrl, "https://img/fan.jpg");
   assert.equal(Object.prototype.hasOwnProperty.call(payload.rows[0], "text"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(payload.rows[0], "messageText"), false);
 });
@@ -152,4 +167,34 @@ test("indexed member pending summary never widens owner scope", async () => {
   assert.equal(summary.unassignedDialogs, 0);
   assert.equal(summary.seenDialogs, 1);
   assert.equal(summary.oldestPendingSeconds, 30 * 60);
+});
+
+
+test("legacy bootstrap repair clears only ancient pending whose latest incoming is still the legacy bootstrap event", async () => {
+  const pending = [
+    { id: "old-bootstrap", agencyId: "agency-1", creatorId: "creator-1", status: "PENDING", lastIncomingAt: new Date("2026-01-01T00:00:00Z"), lastIncomingEventId: "event-old" },
+    { id: "old-live", agencyId: "agency-1", creatorId: "creator-1", status: "PENDING", lastIncomingAt: new Date("2026-01-01T00:00:00Z"), lastIncomingEventId: "event-live" },
+    { id: "recent-bootstrap", agencyId: "agency-1", creatorId: "creator-1", status: "PENDING", lastIncomingAt: new Date("2026-08-10T00:00:00Z"), lastIncomingEventId: "event-recent" },
+  ];
+  let cleared = [];
+  const db = {
+    teamPendingDialogState: {
+      async findMany({ where }) {
+        return pending.filter((row) => row.status === "PENDING" && row.lastIncomingAt <= where.lastIncomingAt.lte);
+      },
+      async updateMany({ where }) { cleared = where.id.in.slice(); return { count: cleared.length }; },
+    },
+    teamActivityEvent: {
+      async findMany() {
+        return [
+          { id: "event-old", ts: new Date("2026-01-01T00:00:00Z"), extra: { sourceDetail: "crm_pending_bootstrap_v1" } },
+          { id: "event-live", ts: new Date("2026-01-01T00:00:00Z"), extra: { sourceDetail: "creator_runtime_ws" } },
+          { id: "event-recent", ts: new Date("2026-08-10T00:00:00Z"), extra: { sourceDetail: "crm_pending_bootstrap_v1" } },
+        ];
+      },
+    },
+  };
+  const result = await repairStaleLegacyBootstrapPending({ agencyId: "agency-1", allowedCreatorIds: ["creator-1"], now: new Date("2026-08-12T10:00:00Z"), db });
+  assert.equal(result.cleared, 1);
+  assert.deepEqual(cleared, ["old-bootstrap"]);
 });
