@@ -104,7 +104,10 @@ async function requirePpvClaimsManager(req, res) {
     return null;
   }
 
-  const allowed = await canUseTeamCapability({ member, key: TEAM_CAPABILITIES.RESOLVE_ATTRIBUTION });
+  const [allowed, canViewAudit] = await Promise.all([
+    canUseTeamCapability({ member, key: TEAM_CAPABILITIES.RESOLVE_ATTRIBUTION }),
+    canUseTeamCapability({ member, key: TEAM_CAPABILITIES.VIEW_AUDIT }),
+  ]);
   if (!allowed) {
     res.status(403).json({
       ok: false,
@@ -115,7 +118,17 @@ async function requirePpvClaimsManager(req, res) {
   }
 
   req.agencyMember = member;
-  return { agencyId: id, member, allowedCreatorIds: analyticsCreatorScope(member) };
+  return { agencyId: id, member, canViewAudit, allowedCreatorIds: analyticsCreatorScope(member) };
+}
+
+function ppvClaimForViewer(row, canViewAudit) {
+  if (!row || canViewAudit) return row;
+  const result = row.result && typeof row.result === "object" && !Array.isArray(row.result) ? { ...row.result } : row.result;
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    delete result.manualResolution;
+    delete result.manualResolutions;
+  }
+  return { ...row, audit: [], manualResolutions: [], result: result || null };
 }
 
 router.get("/ppv/resolve-jobs", async (req, res) => {
@@ -162,12 +175,12 @@ router.get("/ppv/conflicts", async (req, res) => {
   try {
     const viewer = await requirePpvClaimsManager(req, res); if (!viewer) return;
     const includeClosed = String(req.query.includeClosed || req.query.include_closed || "") === "1" || String(req.query.includeClosed || "").toLowerCase() === "true";
-    const conflicts = await listPpvConflicts({
+    const conflicts = (await listPpvConflicts({
       agencyId: viewer.agencyId,
       limit: req.query.limit || 100,
       includeClosed,
       allowedCreatorIds: viewer.allowedCreatorIds,
-    });
+    })).map((row) => ppvClaimForViewer(row, viewer.canViewAudit));
     return res.json({ ok: true, conflicts });
   } catch (err) {
     return res.status(500).json({ ok: false, code: "PPV_CONFLICTS_FAILED", error: err?.message || "Failed" });

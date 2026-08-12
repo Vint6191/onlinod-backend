@@ -25,7 +25,7 @@ const ZONES = Object.freeze([
     permissions: Object.freeze([
       Object.freeze({ key: "money.view_earnings", label: "View creator earnings", requiredLevel: "view" }),
       Object.freeze({ key: "money.view_attribution", label: "View Team revenue attribution", requiredLevel: "view" }),
-      Object.freeze({ key: "money.claim", label: "Claim own PPV work", requiredLevel: "full" }),
+      Object.freeze({ key: "money.claim", label: "Claim own eligible tips", requiredLevel: "full" }),
       Object.freeze({ key: "money.release_own_claim", label: "Release own claim", requiredLevel: "full" }),
       Object.freeze({ key: "money.resolve_attribution", label: "Resolve attribution conflicts", requiredLevel: "destructive" }),
       Object.freeze({ key: "money.override_attribution", label: "Override resolved attribution", requiredLevel: "destructive" }),

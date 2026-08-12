@@ -97,6 +97,119 @@ function hideMigratedLegacyRows(tipRows, legacyRows) {
   return (legacyRows || []).filter((row) => !tipHashes.has(String(row?.eventHash || "")));
 }
 
+function stripManualResolutionPayload(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result || null;
+  const safe = { ...result };
+  delete safe.manualResolution;
+  delete safe.manualResolutions;
+  return safe;
+}
+
+function claimRowForViewer(row, { actorMemberId, canViewAudit }) {
+  if (!row || canViewAudit || isOwnClaimRow(row, actorMemberId)) return row;
+  return {
+    ...row,
+    history: [],
+    manualResolutions: [],
+    result: stripManualResolutionPayload(row.result),
+  };
+}
+
+async function claimsContext(req, actor) {
+  const [viewAttribution, claimOwn, releaseOwn, resolveAttribution, overrideAttribution, viewAudit] = await Promise.all([
+    canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_ATTRIBUTION }),
+    canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.CLAIM_OWN }),
+    canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RELEASE_OWN }),
+    canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RESOLVE_ATTRIBUTION }),
+    canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION }),
+    canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_AUDIT }),
+  ]);
+  const capabilities = { viewAttribution, claimOwn, releaseOwn, resolveAttribution, overrideAttribution, viewAudit };
+  // A write-only override permission must not implicitly disclose claim rows.
+  // The workspace opens only with an actual read/discovery capability;
+  // overrideAttribution remains an action capability layered on top.
+  const canViewClaims = viewAttribution || claimOwn || releaseOwn || resolveAttribution || viewAudit;
+  if (!canViewClaims) return { forbidden: true, capabilities };
+
+  const allowedCreatorIds = memberCreatorScope(actor);
+  const canResolveOthers = resolveAttribution || overrideAttribution;
+  const memberWhere = canResolveOthers
+    ? { agencyId: req.auth.agencyId, deletedAt: null }
+    : { agencyId: req.auth.agencyId, id: actor.id, deletedAt: null };
+
+  const [members, creators] = await Promise.all([
+    prisma.agencyMember.findMany({
+      where: memberWhere,
+      include: {
+        user: { select: { id: true, email: true, name: true, avatarUrl: true } },
+        teamFunctions: { select: { functionKey: true } },
+      },
+      orderBy: [{ deactivatedAt: "asc" }, { createdAt: "asc" }],
+      take: 10000,
+    }),
+    prisma.creatorAccount.findMany({
+      where: {
+        agencyId: req.auth.agencyId,
+        deletedAt: null,
+        ...(Array.isArray(allowedCreatorIds) ? { id: { in: allowedCreatorIds.length ? allowedCreatorIds : ["__none__"] } } : {}),
+      },
+      select: { id: true, displayName: true, username: true, avatarUrl: true },
+      orderBy: { displayName: "asc" },
+      take: 10000,
+    }),
+  ]);
+
+  return {
+    forbidden: false,
+    context: {
+      ok: true,
+      agencyId: req.auth.agencyId,
+      viewerMemberId: actor.id,
+      creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds : "all",
+      capabilities,
+      members: members.map((member) => ({
+        id: member.id,
+        userId: member.userId || null,
+        name: member.displayName || member.user?.name || member.user?.email || "member",
+        email: member.user?.email || null,
+        avatarUrl: member.user?.avatarUrl || null,
+        status: member.deactivatedAt ? "deactivated" : "active",
+        roleKey: String(member.roleKey || member.role || "chatter").toLowerCase(),
+        functions: Array.from(new Set((member.teamFunctions || []).map((row) => String(row.functionKey || "").trim().toUpperCase()).filter(Boolean))),
+      })),
+      creators: creators.map((creator) => ({
+        id: creator.id,
+        displayName: creator.displayName || creator.username || creator.id,
+        username: creator.username || null,
+        avatarUrl: creator.avatarUrl || null,
+      })),
+    },
+  };
+}
+
+// --------------------------------------------------------------------
+// GET /api/team/claims/context
+// --------------------------------------------------------------------
+// V9 desktop bootstrap. Returns only the server-authoritative capability
+// matrix and selector metadata needed by the Claims UI. Regular chatters
+// receive only their own member row; the agency member directory is exposed
+// only to viewers who can resolve/override attribution. Creator rows are
+// always intersected with the viewer's creator scope.
+router.get("/context", async (req, res) => {
+  try {
+    const actor = await loadActorMember(req);
+    if (!actor) return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
+    const result = await claimsContext(req, actor);
+    if (result.forbidden) {
+      return res.status(403).json({ ok: false, code: "CLAIMS_VIEW_FORBIDDEN", error: "Claims permission is required" });
+    }
+    return res.json(result.context);
+  } catch (err) {
+    console.error("[claims/context] failed:", err);
+    return res.status(500).json({ ok: false, code: "CLAIMS_CONTEXT_FAILED", error: err?.message || "Failed" });
+  }
+});
+
 // --------------------------------------------------------------------
 // POST /api/team/claims/ingest
 // --------------------------------------------------------------------
@@ -189,7 +302,7 @@ router.post("/ingest", async (req, res) => {
 // Subscriptions are not Team member revenue and are intentionally not claimable.
 
 const overrideSchema = z.object({
-  eventHash: z.string().min(1).max(80),
+  eventHash: z.string().min(1).max(120),
   action: z.enum(["claim", "release", "manager_override"]),
   reason: z.string().max(500).optional().nullable(),
   targetMemberId: z.string().max(160).optional().nullable(),
@@ -296,9 +409,12 @@ router.get("/disputable", async (req, res) => {
     if (!actor) {
       return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     }
-    const senior = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_ATTRIBUTION });
-    const canClaimOwn = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.CLAIM_OWN });
-    const canReleaseOwn = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RELEASE_OWN });
+    const [senior, canClaimOwn, canReleaseOwn, canViewAudit] = await Promise.all([
+      canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_ATTRIBUTION }),
+      canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.CLAIM_OWN }),
+      canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RELEASE_OWN }),
+      canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_AUDIT }),
+    ]);
     const allowedCreatorIds = memberCreatorScope(actor);
     if (!senior && !canClaimOwn && !canReleaseOwn) {
       return res.status(403).json({ ok: false, code: "CLAIMS_VIEW_FORBIDDEN", error: "Claims permission is required" });
@@ -321,7 +437,8 @@ router.get("/disputable", async (req, res) => {
     ]);
     const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)]
       .sort((a, b) => new Date(b.occurredAt || b.receivedAt || 0).getTime() - new Date(a.occurredAt || a.receivedAt || 0).getTime())
-      .slice(0, limit);
+      .slice(0, limit)
+      .map((row) => claimRowForViewer(row, { actorMemberId: actor.id, canViewAudit }));
     return res.json({
       ok: true,
       count: rows.length,
