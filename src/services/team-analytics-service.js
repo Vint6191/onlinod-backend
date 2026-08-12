@@ -2,6 +2,7 @@
 
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
+const { summarizePendingRows } = require("./team-pending-read-service");
 
 const TEAM_TELEMETRY_VERSION = "team_v13_provenance";
 const SUPPORTED_TEAM_TELEMETRY_VERSIONS = new Set([
@@ -211,6 +212,10 @@ function emptyMetric() {
     chatOpened: 0,
     incomingMessages: 0,
     unansweredIncomingCount: 0,
+    unansweredIncomingMessages: 0,
+    unansweredOlderThan15m: 0,
+    unansweredOlderThan60m: 0,
+    oldestUnansweredSeconds: null,
     dialogDwellSeconds: 0,
     dialogSessionsCount: 0,
     engagementReplies: 0,
@@ -242,6 +247,10 @@ function emptyMetric() {
     seenResponseAvgSeconds: null,
     seenResponseMedianSeconds: null,
     unansweredIncomingCount: 0,
+    unansweredIncomingMessages: 0,
+    unansweredOlderThan15m: 0,
+    unansweredOlderThan60m: 0,
+    oldestUnansweredSeconds: null,
     slaReply5mPct: null,
     slaReply15mPct: null,
     dialogDwellSeconds: 0,
@@ -422,14 +431,28 @@ async function loadProjectedDialogSessions({ agencyId, range, allowedCreatorIds 
   }
 }
 
+async function loadProjectedPendingStates({ agencyId, allowedCreatorIds = null }) {
+  try {
+    if (!prisma.teamPendingDialogState?.findMany) return { available: false, rows: [] };
+    const rows = await findAllById(prisma.teamPendingDialogState, {
+      where: { agencyId, status: "PENDING", ...creatorScopeWhere(allowedCreatorIds) },
+    });
+    rows.sort((a, b) => new Date(a.firstIncomingAt || 0).getTime() - new Date(b.firstIncomingAt || 0).getTime());
+    return { available: true, rows };
+  } catch (_) {
+    return { available: false, rows: [] };
+  }
+}
+
 async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = null }) {
   const range = resolveRange(rangeKey);
-  const [members, events, ppvPurchases, responseCases, projectedDialogSessions] = await Promise.all([
+  const [members, events, ppvPurchases, responseCases, projectedDialogSessions, pendingProjection] = await Promise.all([
     getMembersShell(agencyId),
     loadV3Events({ agencyId, range, allowedCreatorIds }),
     loadPpvPurchaseLedger({ agencyId, range, allowedCreatorIds }),
     loadProjectedResponseCases({ agencyId, range, allowedCreatorIds }),
     loadProjectedDialogSessions({ agencyId, range, allowedCreatorIds }),
+    loadProjectedPendingStates({ agencyId, allowedCreatorIds }),
   ]);
 
   const metricsByMember = new Map();
@@ -780,13 +803,45 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     }
   }
 
-  // v13 response projection currently proves completed response episodes, but
-  // does not yet maintain an authoritative pending/unanswered queue. Once the
-  // projected response model is active, do not leak the older Alpha unread/open
-  // heuristic into a metric that looks authoritative. Null means deliberately
-  // unavailable until a dedicated pending projector exists.
-  if (hasProjectedResponses) {
-    for (const metric of metricsByMember.values()) metric.unansweredIncomingCount = null;
+  const hasProjectedPending = pendingProjection?.available === true;
+  const pendingRows = hasProjectedPending ? (pendingProjection.rows || []) : [];
+  const pendingSummary = hasProjectedPending ? summarizePendingRows(pendingRows) : null;
+
+  if (hasProjectedPending) {
+    // Projected current queue replaces the older Alpha unread/open heuristic.
+    // Team-level unassigned rows stay visible in pendingSummary, but are never
+    // blamed on a chatter until trusted DIALOG_SEEN evidence assigns an owner.
+    for (const metric of metricsByMember.values()) {
+      metric.unansweredIncomingCount = 0;
+      metric.unansweredIncomingMessages = 0;
+      metric.unansweredOlderThan15m = 0;
+      metric.unansweredOlderThan60m = 0;
+      metric.oldestUnansweredSeconds = null;
+    }
+    const nowMs = Date.now();
+    for (const pending of pendingRows) {
+      const owner = metricFor(pending.ownerMemberId);
+      if (!owner) continue;
+      owner.unansweredIncomingCount += 1;
+      owner.unansweredIncomingMessages += Math.max(1, num(pending.incomingCount, 1));
+      const firstAt = new Date(pending.firstIncomingAt || 0).getTime();
+      if (Number.isFinite(firstAt) && firstAt > 0) {
+        const age = Math.max(0, Math.floor((nowMs - firstAt) / 1000));
+        if (age >= 15 * 60) owner.unansweredOlderThan15m += 1;
+        if (age >= 60 * 60) owner.unansweredOlderThan60m += 1;
+        owner.oldestUnansweredSeconds = owner.oldestUnansweredSeconds === null ? age : Math.max(owner.oldestUnansweredSeconds, age);
+      }
+    }
+  } else if (hasProjectedResponses) {
+    // Completed response cases are authoritative, so do not mix them with the
+    // legacy pending heuristic when the additive pending migration is missing.
+    for (const metric of metricsByMember.values()) {
+      metric.unansweredIncomingCount = null;
+      metric.unansweredIncomingMessages = null;
+      metric.unansweredOlderThan15m = null;
+      metric.unansweredOlderThan60m = null;
+      metric.oldestUnansweredSeconds = null;
+    }
   }
 
   const byMember = new Map();
@@ -799,12 +854,13 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     events,
     byMember,
     responseSummary,
+    pendingSummary,
     projection: {
       responseCases: responseCases.length,
       dialogSessions: projectedDialogSessions.length,
       responseSource: hasProjectedResponses ? "team_response_case_v1" : "legacy_event_fallback",
       dialogSessionSource: hasProjectedDialogSessions ? "team_dialog_session_v1" : "event_fallback",
-      unansweredSource: hasProjectedResponses ? "not_projected" : "legacy_event_fallback",
+      unansweredSource: hasProjectedPending ? "team_pending_dialog_v1" : (hasProjectedResponses ? "not_projected" : "legacy_event_fallback"),
       creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
     },
   };
@@ -1032,6 +1088,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
     source: "team_activity_event_v13",
     projection: computed.projection,
     responseSummary: computed.responseSummary,
+    pendingSummary: computed.pendingSummary || null,
     moneyVisible: includeMoney === true,
   };
 }
@@ -1049,6 +1106,14 @@ function combineOverview(metricsList, membersCount) {
     storiesCreated: 0,
     chatOpened: 0,
     incomingMessages: 0,
+    unansweredIncomingCount: 0,
+    unansweredIncomingMessages: 0,
+    unassignedUnansweredCount: 0,
+    unansweredOlderThan15m: 0,
+    unansweredOlderThan60m: 0,
+    oldestUnansweredSeconds: null,
+    dialogDwellSeconds: 0,
+    dialogSessionsCount: 0,
     engagementReplies: 0,
     backlogCleared: 0,
     backlogMaxAgeSeconds: 0,
@@ -1097,6 +1162,11 @@ function combineOverview(metricsList, membersCount) {
     out.chatOpened += num(m.chatOpened, 0);
     out.incomingMessages += num(m.incomingMessages, 0);
     out.unansweredIncomingCount += num(m.unansweredIncomingCount, 0);
+    out.unansweredIncomingMessages += num(m.unansweredIncomingMessages, 0);
+    out.unansweredOlderThan15m += num(m.unansweredOlderThan15m, 0);
+    out.unansweredOlderThan60m += num(m.unansweredOlderThan60m, 0);
+    const memberOldestUnanswered = nullableNum(m.oldestUnansweredSeconds);
+    if (memberOldestUnanswered !== null) out.oldestUnansweredSeconds = out.oldestUnansweredSeconds === null ? memberOldestUnanswered : Math.max(out.oldestUnansweredSeconds, memberOldestUnanswered);
     out.dialogDwellSeconds += num(m.dialogDwellSeconds, 0);
     out.dialogSessionsCount += num(m.dialogSessionsCount, 0);
     out.engagementReplies += num(m.engagementReplies, 0);
@@ -1150,7 +1220,21 @@ async function buildTeamOverview({ agencyId, rangeKey = "7d", includeMoney = tru
     overview.coverageResponseMedianSeconds = responseSummary.coverageResponseMedianSeconds;
     overview.seenResponseAvgSeconds = responseSummary.seenResponseAvgSeconds;
     overview.seenResponseMedianSeconds = responseSummary.seenResponseMedianSeconds;
-    if (membersPayload.projection?.unansweredSource === "not_projected") overview.unansweredIncomingCount = null;
+  }
+  if (membersPayload.pendingSummary?.source === "team_pending_dialog_v1") {
+    overview.unansweredIncomingCount = membersPayload.pendingSummary.pendingDialogs;
+    overview.unansweredIncomingMessages = membersPayload.pendingSummary.pendingIncomingMessages;
+    overview.unassignedUnansweredCount = membersPayload.pendingSummary.unassignedDialogs;
+    overview.unansweredOlderThan15m = membersPayload.pendingSummary.olderThan15m;
+    overview.unansweredOlderThan60m = membersPayload.pendingSummary.olderThan60m;
+    overview.oldestUnansweredSeconds = membersPayload.pendingSummary.oldestPendingSeconds;
+  } else if (membersPayload.projection?.unansweredSource === "not_projected") {
+    overview.unansweredIncomingCount = null;
+    overview.unansweredIncomingMessages = null;
+    overview.unassignedUnansweredCount = null;
+    overview.unansweredOlderThan15m = null;
+    overview.unansweredOlderThan60m = null;
+    overview.oldestUnansweredSeconds = null;
   }
   if (!includeMoney) {
     overview.revenueAttributedCents = null;
@@ -1166,6 +1250,7 @@ async function buildTeamOverview({ agencyId, rangeKey = "7d", includeMoney = tru
     overview,
     projection: membersPayload.projection || null,
     responseSummary: membersPayload.responseSummary || null,
+    pendingSummary: membersPayload.pendingSummary || null,
     moneyVisible: includeMoney === true,
   };
 }

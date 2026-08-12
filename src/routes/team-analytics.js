@@ -21,6 +21,7 @@ const {
   listTeamDialogSessions,
   listTeamCoverageSessions,
 } = require("../services/team-response-read-service");
+const { listTeamPendingDialogs } = require("../services/team-pending-read-service");
 
 const router = express.Router();
 
@@ -212,6 +213,21 @@ router.post("/ppv/conflicts/:jobId/resolve", async (req, res) => {
   } catch (err) {
     if (err?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
     return res.status(500).json({ ok: false, code: "PPV_CONFLICT_RESOLVE_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+router.get("/pending", async (req, res) => {
+  try {
+    const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
+    return res.json(await listTeamPendingDialogs({
+      agencyId: viewer.agencyId,
+      allowedCreatorIds: viewer.allowedCreatorIds,
+      memberId: req.query.memberId || null,
+      ownership: req.query.ownership || "all",
+      limit: req.query.limit || 100,
+    }));
+  } catch (err) {
+    return res.status(500).json({ ok: false, code: "TEAM_ANALYTICS_PENDING_FAILED", error: err?.message || "Failed" });
   }
 });
 

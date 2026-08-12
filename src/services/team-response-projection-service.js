@@ -190,7 +190,18 @@ async function findIncomingEpisode({ agencyId, creatorId, dialogId, fromExclusiv
     },
     orderBy: { ts: "asc" },
   });
-  return Array.isArray(rows) ? rows : [];
+  const out = [];
+  const seen = new Set();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    // Multiple agency devices can observe the same creator WS message. The OF
+    // messageId is the canonical fan-message identity; localId/id are safe
+    // fallbacks when OF did not expose one.
+    const key = clean(row?.messageId, 220) || clean(row?.localId, 220) || clean(row?.id, 220);
+    if (key && seen.has(key)) continue;
+    if (key) seen.add(key);
+    out.push(row);
+  }
+  return out;
 }
 
 async function findCoverageAt({ agencyId, creatorId, memberId, at, db }) {

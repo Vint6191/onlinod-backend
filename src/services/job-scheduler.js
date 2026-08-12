@@ -50,6 +50,7 @@ const FRESHNESS_WINDOW_MS = RECURRING_INTERVAL_MS;
 const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
 const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin setting can override
 const TEAM_MONEY_BACKFILL_BATCH_SIZE = 250; // DB-only historical reconciliation, no OF requests
+const TEAM_PENDING_BACKFILL_BATCH_SIZE = 500; // DB-only Team queue projection repair
 let lastRetentionSweepAt = 0;
 
 async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) {
@@ -429,6 +430,27 @@ async function maybeReconcileHistoricalTeamMoney() {
   }
 }
 
+async function maybeBackfillTeamPendingProjection() {
+  try {
+    const { backfillTeamPendingProjectionBatch } = require("./team-pending-projection-service");
+    const result = await backfillTeamPendingProjectionBatch({
+      db: prisma,
+      limit: TEAM_PENDING_BACKFILL_BATCH_SIZE,
+    });
+    if (!result?.skipped && Number(result?.selected || 0) > 0) {
+      console.log(
+        `[scheduler] Team pending projection — projected=${result.projected || 0}/${result.selected || 0}, dialogs=${result.dialogs || 0}`
+      );
+    }
+    return result;
+  } catch (err) {
+    // Repair runs only over already-durable Team facts. It must never suppress
+    // creator jobs or runtime automation when the derived queue is unavailable.
+    console.warn("[scheduler] Team pending projection backfill failed:", err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
 /**
  * Recurring scheduler — finds all READY creators across all agencies
  * and ensures they have scheduled jobs. Runs once on startup, then
@@ -495,6 +517,7 @@ async function runRecurringSweep() {
   // Team backfill so deleted old detail is not immediately recreated.
   const retention = await maybeRunRetentionSweep({ now });
   const teamMoneyBackfill = await maybeReconcileHistoricalTeamMoney();
+  const teamPendingBackfill = await maybeBackfillTeamPendingProjection();
 
   const elapsed = Date.now() - startedAt;
   console.log(
@@ -509,6 +532,7 @@ async function runRecurringSweep() {
     dailyCyclesSkipped,
     retention,
     teamMoneyBackfill,
+    teamPendingBackfill,
   };
 }
 

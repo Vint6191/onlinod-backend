@@ -299,3 +299,18 @@ test("stale orphan open coverage cannot make a later reply fresh or handoff fore
   assert.equal(result.coverageResponseSeconds, null);
   assert.equal(result.slaEligible, false);
 });
+
+test("same OF incoming observed by multiple devices counts once in a response episode", async () => {
+  const current = reply();
+  const { db } = makeDb({
+    ledgers: [current],
+    events: [
+      incoming("2026-08-12T09:00:00.000Z", { id: "event-device-a", messageId: "incoming-shared", deviceId: "device-a" }),
+      incoming("2026-08-12T09:00:01.000Z", { id: "event-device-b", messageId: "incoming-shared", deviceId: "device-b" }),
+    ],
+    coverages: [{ agencyId: "agency-1", creatorId: "creator-1", memberId: "member-a", coverageId: "cov-a", startedAt: date("2026-08-12T08:00:00.000Z"), endedAt: date("2026-08-12T10:00:00.000Z") }],
+  });
+  const result = await service.deriveResponseCaseForReply(current, db);
+  assert.equal(result.incomingCount, 1);
+  assert.equal(result.firstIncomingMessageId, "incoming-shared");
+});

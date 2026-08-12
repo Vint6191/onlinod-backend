@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { applyLedgerSideEffects } = require("./team-ppv-ledger-service");
 const { applyTeamResponseProjection } = require("./team-response-projection-service");
+const { applyTeamPendingProjection } = require("./team-pending-projection-service");
 
 const TEAM_V13_VERSION = "team_v13_provenance";
 const TEAM_V13_SOURCE = "electron_team_v13";
@@ -406,6 +407,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
           const replayRow = { ...row, id: exists.id };
           await applyLedgerSideEffects(replayRow);
           await applyTeamResponseProjection(replayRow);
+          await applyTeamPendingProjection(replayRow);
           if (row.localId) acknowledgedLocalIds.push(row.localId);
           continue;
         }
@@ -415,6 +417,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
       const durableRow = { ...row, id: created.id };
       await applyLedgerSideEffects(durableRow);
       await applyTeamResponseProjection(durableRow);
+      await applyTeamPendingProjection(durableRow);
       if (row.localId) acknowledgedLocalIds.push(row.localId);
     } catch (err) {
       if (err?.code === "P2002") {
@@ -431,6 +434,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, e
           const replayRow = { ...row, id: existing.id };
           await applyLedgerSideEffects(replayRow);
           await applyTeamResponseProjection(replayRow);
+          await applyTeamPendingProjection(replayRow);
           acknowledgedLocalIds.push(row.localId);
         }
       } else throw err;

@@ -223,6 +223,7 @@ model Agency {
   teamCoverageSessions TeamCoverageSession[]
   teamDialogSessions TeamDialogSession[]
   teamResponseCases TeamResponseCase[]
+  teamPendingDialogStates TeamPendingDialogState[]
   analyticsSnapshots AnalyticsSnapshot[]
   workspaceSettings WorkspaceSetting[]
   moduleSettings ModuleSetting[]
@@ -358,6 +359,7 @@ model CreatorAccount {
   teamCoverageSessions TeamCoverageSession[]
   teamDialogSessions TeamDialogSession[]
   teamResponseCases TeamResponseCase[]
+  teamPendingDialogStates TeamPendingDialogState[]
   messageTemplateUsageEvents MessageTemplateUsageEvent[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
   presenceSnapshot CreatorPresenceSnapshot?
@@ -1782,6 +1784,8 @@ model TeamActivityEvent {
   ts                     DateTime
   localId                String?
   extra                  Json?
+  pendingProjectionVersion String?
+  pendingProjectedAt      DateTime?
   source                 String   @default("electron")
   createdAt              DateTime @default(now())
 
@@ -1801,6 +1805,7 @@ model TeamActivityEvent {
   @@index([agencyId, messageId])
   @@index([agencyId, correlationId])
   @@index([agencyId, coverageId, ts])
+  @@index([agencyId, pendingProjectionVersion, ts])
   @@index([agencyId, automationDeliveryId])
   @@index([agencyId, broadcastDispatchId])
   @@index([type, ts])
@@ -3727,6 +3732,44 @@ model TeamResponseCase {
   @@index([agencyId, creatorId, dialogId, replyAt])
   @@index([agencyId, classification, replyAt])
   @@index([agencyId, slaEligible, replyAt])
+}
+
+model TeamPendingDialogState {
+  id                     String   @id @default(cuid())
+  agencyId               String
+  creatorId              String
+  dialogId               String
+  fanId                   String?
+  status                  String   @default("CLEAR")
+  episodeKey              String?
+  firstIncomingEventId    String?
+  lastIncomingEventId     String?
+  firstIncomingMessageId  String?
+  lastIncomingMessageId   String?
+  firstIncomingAt         DateTime?
+  lastIncomingAt          DateTime?
+  incomingCount           Int      @default(0)
+  firstSeenAt             DateTime?
+  firstSeenMemberId       String?
+  lastSeenAt              DateTime?
+  lastSeenMemberId        String?
+  ownerMemberId           String?
+  ownerAssignedAt         DateTime?
+  ownerReason             String?
+  replyAt                 DateTime?
+  replyMessageId          String?
+  repliedByMemberId       String?
+  derivationVersion       String   @default("team_pending_v1")
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId, dialogId])
+  @@index([agencyId, status, firstIncomingAt])
+  @@index([agencyId, ownerMemberId, status])
+  @@index([agencyId, creatorId, status, firstIncomingAt])
 }
 
 model TeamObservationState {
