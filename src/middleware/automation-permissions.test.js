@@ -4,9 +4,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { assignedCreatorIds, hasBroadCreatorAccess, canAccessCreator } = require("./automation-permissions");
 
-test("senior automation roles have broad creator access", () => {
+test("creator scope is authoritative even for manager roles; only owner is inherently broad", () => {
   assert.equal(hasBroadCreatorAccess({ role: "OWNER", assignedCreators: [] }), true);
-  assert.equal(hasBroadCreatorAccess({ roleKey: "manager", assignedCreators: ["a"] }), true);
+  assert.equal(hasBroadCreatorAccess({ roleKey: "manager", assignedCreators: ["a"] }), false);
+  assert.equal(hasBroadCreatorAccess({ roleKey: "manager", assignedCreators: "all" }), true);
 });
 
 test("assigned creator JSON variants are normalized", () => {

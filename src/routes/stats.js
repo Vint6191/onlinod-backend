@@ -28,6 +28,7 @@ const { z } = require("zod");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("../services/job-scheduler");
 const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-analytics-permissions");
+const { resolveEffectivePermissions } = require("../services/team-access-control");
 const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
 const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily } = require("../services/creator-analytics-ledger-service");
 const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity, readCreatorTaskActivityDays } = require("../services/creator-overview-service");
@@ -132,14 +133,17 @@ function snapshotForClient(s) {
 async function requireMembership(userId, agencyId) {
   if (!userId || !agencyId) return null;
 
-  return prisma.agencyMember.findFirst({
+  const member = await prisma.agencyMember.findFirst({
     where: {
       agencyId,
       userId,
       deletedAt: null,
+      deactivatedAt: null,
       agency: { deletedAt: null },
     },
   });
+  if (!member) return null;
+  return { ...member, permissions: await resolveEffectivePermissions({ member, db: prisma }) };
 }
 
 // Look up a creator by id and return both the creator and the

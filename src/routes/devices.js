@@ -158,7 +158,7 @@ router.post("/heartbeat", async (req, res) => {
 
     if (agencyId !== req.auth.agencyId) {
       const member = await prisma.agencyMember.findFirst({
-        where: { userId: req.auth.userId, agencyId, agency: { deletedAt: null } },
+        where: { userId: req.auth.userId, agencyId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
       });
 
       if (!member) {

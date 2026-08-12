@@ -81,7 +81,8 @@ test("creator and agency refresh routes are guarded and agency scheduling is bou
 });
 
 test("traffic reads and writes stay creator-bound and permission guarded", () => {
-  assert.match(trafficService, /if \(!canViewTraffic\(member\)\)/);
+  assert.match(trafficService, /resolveEffectivePermissions\(\{ member, db: prisma \}\)/);
+  assert.match(trafficService, /if \(!canViewTraffic\(effectiveMember\)\)/);
   assert.match(trafficService, /if \(!canManageTrafficCosts\(member\)\)/);
   assert.match(trafficService, /if \(!canRefreshTraffic\(member\)\)/);
   assert.match(trafficService, /where:\s*\{ id, agencyId: creator\.agencyId, creatorId: creator\.id \}/);

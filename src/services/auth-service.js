@@ -37,6 +37,8 @@ async function getPrimaryMembership(userId) {
   return prisma.agencyMember.findFirst({
     where: {
       userId,
+      deletedAt: null,
+      deactivatedAt: null,
       agency: { deletedAt: null },
     },
     include: { agency: true },
@@ -293,6 +295,8 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
     where: {
       userId: session.userId,
       agencyId: session.agencyId,
+      deletedAt: null,
+      deactivatedAt: null,
       agency: { deletedAt: null },
     },
     include: { agency: true },

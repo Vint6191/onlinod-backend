@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { isOwner, normalizeAssignedCreators } = require("./team-access-control");
 const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-result-service");
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
@@ -174,7 +175,7 @@ async function requireOwnedDevice({ userId, deviceId }) {
   const device = await prisma.workerDevice.findUnique({ where: { id: deviceId } });
   if (!device || device.userId !== userId) throw new JobLeaseError("NOT_YOUR_DEVICE", "Invalid device", 403);
   const member = await prisma.agencyMember.findFirst({
-    where: { agencyId: device.agencyId, userId, deletedAt: null, agency: { deletedAt: null } },
+    where: { agencyId: device.agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
     select: { id: true },
   });
   if (!member) throw new JobLeaseError("DEVICE_AGENCY_ACCESS_REVOKED", "Device agency access was revoked", 403);
@@ -182,17 +183,17 @@ async function requireOwnedDevice({ userId, deviceId }) {
 }
 async function scopedCreatorIds({ userId, device }) {
   const member = await prisma.agencyMember.findFirst({
-    where: { agencyId: device.agencyId, userId, deletedAt: null, agency: { deletedAt: null } },
+    where: { agencyId: device.agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
   });
   if (!member) return [];
-  const roleKey = String(member.roleKey || "").toLowerCase();
-  const broad = member.role === "OWNER" || member.role === "MANAGER" || roleKey === "owner" || roleKey === "manager" || !member.assignedCreators || member.assignedCreators === "all";
+  const scope = normalizeAssignedCreators(member.assignedCreators);
+  const broad = isOwner(member) || scope.mode === "all";
   const creators = await prisma.creatorAccount.findMany({
     where: {
       agencyId: device.agencyId,
       deletedAt: null,
       status: "READY",
-      ...(!broad ? { id: { in: Array.isArray(member.assignedCreators) ? member.assignedCreators.map(String).filter(Boolean) : ["__none__"] } } : {}),
+      ...(!broad ? { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } } : {}),
     },
     select: { id: true },
     take: 10000,

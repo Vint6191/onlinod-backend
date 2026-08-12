@@ -16,10 +16,10 @@ test("explicit flat and nested creator permissions are supported", () => {
   assert.equal(canManageCreators({ role: "CHATTER", permissions: {} }), false);
 });
 
-test("middleware fails closed without permission", () => {
+test("middleware fails closed on explicit canonical deny", async () => {
   let status = 0; let body = null; let called = false;
   const res = { status(value) { status = value; return this; }, json(value) { body = value; return this; } };
-  creatorManagementRequired({ auth: { membership: { role: "CHATTER", permissions: {} } } }, res, () => { called = true; });
+  await creatorManagementRequired({ auth: { membership: { role: "CHATTER", permissions: { "creators.manage": false } } } }, res, () => { called = true; });
   assert.equal(called, false);
   assert.equal(status, 403);
   assert.equal(body.code, "CREATOR_MANAGEMENT_FORBIDDEN");

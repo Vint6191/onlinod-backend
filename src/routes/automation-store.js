@@ -3,7 +3,7 @@
 const express = require("express");
 const prisma = require("../prisma");
 const { cleanString, optionalString, jsonArray, jsonObject, centsFromAny, parseLimit, parseOffset, positiveInt, requireCreator, sendError } = require("../services/server-store-utils");
-const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { canUsePermission } = require("../services/team-access-control");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { attachAutomationAudit } = require("../middleware/automation-audit");
 
@@ -30,11 +30,11 @@ async function requireSeniorAutomationWriter(req, res, next) {
       return res.status(403).json({ ok: false, code: "NOT_A_MEMBER", error: "You are not a member of this agency" });
     }
 
-    if (!isSeniorAgencyMember(member)) {
+    if (!(await canUsePermission({ member, key: "automation.manage", db: prisma }))) {
       return res.status(403).json({
         ok: false,
-        code: "INSUFFICIENT_TEAM_ROLE",
-        error: "Only OWNER / MANAGER / ADMIN can modify automation",
+        code: "WRITE_AUTOMATION_FORBIDDEN",
+        error: "automation.manage permission is required",
       });
     }
 

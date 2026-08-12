@@ -2,6 +2,7 @@
 
 const express = require("express");
 const prisma = require("../prisma");
+const { canUsePermission, directPermissionValue } = require("../services/team-access-control");
 const {
   cleanString,
   optionalString,
@@ -240,22 +241,25 @@ function trashPurgeAfter(trashedAt = new Date()) {
   return addDays(Number.isFinite(base.getTime()) ? base : new Date(), MESSAGE_LIBRARY_TRASH_RETENTION_DAYS);
 }
 
-function isMessageLibraryManager(req) {
-  const role = String(req.auth?.role || req.auth?.membership?.role || "").toUpperCase();
-  const roleKey = String(req.auth?.membership?.roleKey || req.auth?.roleKey || "").toLowerCase();
-  if (["OWNER", "ADMIN", "MANAGER"].includes(role)) return true;
-  if (["owner", "admin", "manager"].includes(roleKey)) return true;
-
-  const perms = req.auth?.permissions || req.auth?.membership?.permissions || {};
-  for (const key of MESSAGE_LIBRARY_MANAGER_PERMISSION_KEYS) {
-    if (perms?.[key] === true) return true;
+async function isMessageLibraryManager(req) {
+  const member = req.auth?.membership || req.member || (req.auth ? { agencyId: req.auth.agencyId, role: req.auth.role, roleKey: req.auth.roleKey, permissions: req.auth.permissions || {} } : null);
+  if (!member) return false;
+  const perms = member.permissions || {};
+  const canonical = directPermissionValue(perms, "message_library.manage");
+  if (canonical !== null) return canonical;
+  let sawLegacyDeny = false;
+  for (const key of MESSAGE_LIBRARY_MANAGER_PERMISSION_KEYS.filter((key) => key !== "message_library.manage")) {
+    const value = directPermissionValue(perms, key);
+    if (value === true) return true;
+    if (value === false) sawLegacyDeny = true;
   }
-  return false;
+  if (sawLegacyDeny) return false;
+  return canUsePermission({ member, key: "message_library.manage", db: prisma });
 }
 
-function assertMessageLibraryManager(req) {
-  if (isMessageLibraryManager(req)) return;
-  const err = new Error("Only managers/admins can modify the global Message Library");
+async function assertMessageLibraryManager(req) {
+  if (await isMessageLibraryManager(req)) return;
+  const err = new Error("Message Library management permission is required");
   err.status = 403;
   err.code = "MESSAGE_LIBRARY_MANAGER_REQUIRED";
   throw err;
@@ -696,7 +700,7 @@ router.get("/message-library/scripts", async (req, res) => {
 
 router.post("/message-library/scripts", async (req, res) => {
   try {
-    assertMessageLibraryManager(req);
+    await assertMessageLibraryManager(req);
     const item = await upsertMessageLibraryScript(req);
     return res.status(201).json({ ok: true, source: "server", item: scriptFromCollection(item) });
   } catch (err) {
@@ -706,7 +710,7 @@ router.post("/message-library/scripts", async (req, res) => {
 
 router.put("/message-library/scripts/:id", async (req, res) => {
   try {
-    assertMessageLibraryManager(req);
+    await assertMessageLibraryManager(req);
     req.body = { ...(req.body || {}), id: req.params.id };
     const item = await upsertMessageLibraryScript(req);
     return res.json({ ok: true, source: "server", item: scriptFromCollection(item) });
@@ -717,7 +721,7 @@ router.put("/message-library/scripts/:id", async (req, res) => {
 
 router.delete("/message-library/scripts/:id", async (req, res) => {
   try {
-    assertMessageLibraryManager(req);
+    await assertMessageLibraryManager(req);
     const id = cleanString(req.params.id, 120);
     const creatorId = await requireMessageLibraryCreator(req);
     const existing = await prisma.contentCollection.findFirst({
@@ -746,7 +750,7 @@ router.delete("/message-library/scripts/:id", async (req, res) => {
 
 router.post("/message-library/scripts/:id/restore", async (req, res) => {
   try {
-    assertMessageLibraryManager(req);
+    await assertMessageLibraryManager(req);
     const id = cleanString(req.params.id, 120);
     const creatorId = await requireMessageLibraryCreator(req);
     const existing = await prisma.contentCollection.findFirst({
@@ -766,7 +770,7 @@ router.post("/message-library/scripts/:id/restore", async (req, res) => {
 
 router.delete("/message-library/scripts/:id/permanent", async (req, res) => {
   try {
-    assertMessageLibraryManager(req);
+    await assertMessageLibraryManager(req);
     const id = cleanString(req.params.id, 120);
     const creatorId = await requireMessageLibraryCreator(req);
     const existing = await prisma.contentCollection.findFirst({
@@ -787,7 +791,7 @@ router.delete("/message-library/scripts/:id/permanent", async (req, res) => {
 
 router.delete("/message-library/scripts/:scriptId/messages/:messageId", async (req, res) => {
   try {
-    assertMessageLibraryManager(req);
+    await assertMessageLibraryManager(req);
     const scriptId = cleanString(req.params.scriptId, 120);
     const messageId = cleanString(req.params.messageId, 120);
     const creatorId = await requireMessageLibraryCreator(req);
@@ -811,7 +815,7 @@ router.delete("/message-library/scripts/:scriptId/messages/:messageId", async (r
 
 router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", async (req, res) => {
   try {
-    assertMessageLibraryManager(req);
+    await assertMessageLibraryManager(req);
     const scriptId = cleanString(req.params.scriptId, 120);
     const messageId = cleanString(req.params.messageId, 120);
     const creatorId = await requireMessageLibraryCreator(req);
@@ -834,7 +838,7 @@ router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", as
 
 router.post("/message-library/purge-expired", async (req, res) => {
   try {
-    assertMessageLibraryManager(req);
+    await assertMessageLibraryManager(req);
     const result = await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId, { force: true });
     return res.json(result);
   } catch (err) {

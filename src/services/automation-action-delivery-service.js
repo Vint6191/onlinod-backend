@@ -2,7 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
-const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { canUsePermission, isOwner, normalizeAssignedCreators } = require("./team-access-control");
 const { assertAutomationEnabled, getAutomationControlSnapshot } = require("./automation-control-service");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
 const {
@@ -122,28 +122,26 @@ async function requireOwnedSeniorDevice({ userId, deviceId }) {
   const device = await prisma.workerDevice.findUnique({ where: { id: deviceId } });
   if (!device || device.userId !== userId) throw new ActionDeliveryError("NOT_YOUR_DEVICE", "Invalid device", 403);
   const member = await prisma.agencyMember.findFirst({
-    where: { agencyId: device.agencyId, userId, deletedAt: null, agency: { deletedAt: null } },
+    where: { agencyId: device.agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
   });
   if (!member) throw new ActionDeliveryError("DEVICE_AGENCY_ACCESS_REVOKED", "Device agency access was revoked", 403);
-  if (!isSeniorAgencyMember(member)) throw new ActionDeliveryError("WRITE_AUTOMATION_FORBIDDEN", "Only owner, admin or manager may execute write automation", 403);
+  if (!(await canUsePermission({ member, key: "automation.manage", db: prisma }))) throw new ActionDeliveryError("WRITE_AUTOMATION_FORBIDDEN", "automation.manage permission is required", 403);
   return { device, member };
 }
 
 async function scopedReadyCreatorIds({ userId, device }) {
   const member = await prisma.agencyMember.findFirst({
-    where: { agencyId: device.agencyId, userId, deletedAt: null, agency: { deletedAt: null } },
+    where: { agencyId: device.agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
   });
   if (!member) return [];
-  const roleKey = String(member.roleKey || "").toLowerCase();
-  const broad = member.role === "OWNER" || member.role === "MANAGER" || member.role === "ADMIN"
-    || ["owner", "manager", "admin"].includes(roleKey)
-    || !member.assignedCreators || member.assignedCreators === "all";
+  const scope = normalizeAssignedCreators(member.assignedCreators);
+  const broad = isOwner(member) || scope.mode === "all";
   const visible = await prisma.creatorAccount.findMany({
     where: {
       agencyId: device.agencyId,
       deletedAt: null,
       status: "READY",
-      ...(!broad ? { id: { in: Array.isArray(member.assignedCreators) ? member.assignedCreators.map(String).filter(Boolean) : ["__none__"] } } : {}),
+      ...(!broad ? { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } } : {}),
     },
     select: { id: true },
     take: 10000,

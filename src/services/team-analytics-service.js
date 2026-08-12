@@ -183,6 +183,9 @@ function memberShell(member) {
     name: member.displayName || member.user?.name || member.user?.email || (String(member.role || "owner").toLowerCase() === "owner" ? "Owner" : "member"),
     email: member.user?.email || null,
     roleKey: member.roleKey || String(member.role || "").toLowerCase(),
+    status: member.deletedAt ? "removed" : (member.deactivatedAt ? "deactivated" : "active"),
+    deactivatedAt: member.deactivatedAt || null,
+    deletedAt: member.deletedAt || null,
     assignedCreators: member.assignedCreators ?? "all",
     functions: Array.from(new Set((member.teamFunctions || []).map((row) => String(row.functionKey || "").toUpperCase()).filter(Boolean))),
   };
@@ -190,7 +193,7 @@ function memberShell(member) {
 
 async function getMembersShell(agencyId) {
   const rows = await findAllById(prisma.agencyMember, {
-    where: { agencyId, deletedAt: null },
+    where: { agencyId },
     include: {
       user: { select: { id: true, email: true, name: true } },
       teamFunctions: { select: { functionKey: true } },
@@ -1031,6 +1034,18 @@ async function getTipLedgerRevenueByMemberDialog({ agencyId, range, allowedCreat
 }
 
 
+function memberHasHistoricalActivity(metrics, revenueCents = 0) {
+  if (Math.max(0, num(revenueCents, 0)) > 0) return true;
+  const numericKeys = [
+    "messagesSent", "manualMessages", "massMessages", "broadcastDispatches", "automationDeliveries",
+    "incomingMessages", "freshReplies", "backlogReplies", "handoffReplies", "unknownReplies",
+    "responseSamples", "dialogDwellSeconds", "dialogSessionsCount", "ppvSentMessages", "ppvSoldMessages",
+    "ppvRevenueCents", "revenueAttributedCents", "activeEvents", "activeMinutes", "chatOpened",
+    "engagementReplies", "backlogCleared",
+  ];
+  return numericKeys.some((key) => Math.max(0, num(metrics?.[key], 0)) > 0);
+}
+
 async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
   const computed = await buildComputed({ agencyId, rangeKey, allowedCreatorIds });
   const [
@@ -1077,8 +1092,8 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
           : { ...item, shiftTimeSharePct: sharePct };
       });
     }
-    return { member: shell, metrics, rawSummary: null };
-  });
+    return { member: shell, metrics, rawSummary: null, _historicalVisible: !member.deletedAt || memberHasHistoricalActivity(metrics, revenue) };
+  }).filter((row) => row._historicalVisible).map(({ _historicalVisible, ...row }) => row);
 
   return {
     ok: true,

@@ -17,6 +17,9 @@ const {
   refreshAccessToken,
   revokeRefreshToken,
 } = require("../services/auth-service");
+const { resolveEffectivePermissions, validateAssignedCreators } = require("../services/team-access-control");
+const { cleanFunctions, ensureRoleExists } = require("../services/team-administration-service");
+const { audit } = require("../services/audit-service");
 
 const router = express.Router();
 
@@ -176,29 +179,87 @@ router.post("/register", async (req, res) => {
         }
 
         const inv = checked.invitation;
+        let roleKey;
+        try {
+          roleKey = await ensureRoleExists({ agencyId: inv.agencyId, roleKey: inv.roleKey, db: tx });
+        } catch (_) {
+          const err = new Error("Invitation role is no longer available");
+          err.status = 409;
+          err.code = "INVITE_ROLE_STALE";
+          throw err;
+        }
+        if (roleKey === "owner") {
+          const err = new Error("Owner membership cannot be granted by invitation");
+          err.status = 409;
+          err.code = "INVITE_OWNER_FORBIDDEN";
+          throw err;
+        }
+
+        const creatorScope = await validateAssignedCreators({
+          agencyId: inv.agencyId,
+          assignedCreators: inv.assignedCreators ?? [],
+          db: tx,
+        });
+        if (!creatorScope.ok) {
+          const err = new Error("Invitation contains creators that are no longer available");
+          err.status = 409;
+          err.code = "INVITE_CREATOR_SCOPE_STALE";
+          err.details = { unknownCreatorIds: creatorScope.unknownCreatorIds };
+          throw err;
+        }
+        const functions = cleanFunctions(inv.functions);
         const member = await tx.agencyMember.create({
           data: {
             userId: user.id,
             agencyId: inv.agencyId,
-            role: roleKeyToLegacy(inv.roleKey),
-            roleKey: inv.roleKey,
+            role: roleKeyToLegacy(roleKey),
+            roleKey,
             displayName: inv.displayName || input.name || null,
             initials: initialsFrom(inv.displayName || input.name || email),
             tone: "amber",
             commission: inv.commission || { kind: "none" },
-            assignedCreators: inv.assignedCreators ?? "all",
+            assignedCreators: creatorScope.value,
             permissions: {},
             lastSeenLabel: "just joined",
           },
         });
+        if (functions.length) {
+          await tx.teamMemberFunction.createMany({
+            data: functions.map((functionKey) => ({ agencyId: inv.agencyId, memberId: member.id, functionKey })),
+            skipDuplicates: true,
+          });
+        }
 
-        await tx.agencyInvitation.update({
-          where: { id: inv.id },
+        const now = new Date();
+        const claimed = await tx.agencyInvitation.updateMany({
+          where: {
+            id: inv.id,
+            tokenHash: hashInviteToken(inviteToken),
+            claimedAt: null,
+            revokedAt: null,
+            expiresAt: { gt: now },
+          },
           data: {
-            claimedAt: new Date(),
+            claimedAt: now,
             claimedByUserId: user.id,
             claimedMemberId: member.id,
           },
+        });
+        if (claimed.count !== 1) {
+          const err = new Error("Invitation changed while registration was in progress");
+          err.status = 409;
+          err.code = "INVITE_CHANGED";
+          throw err;
+        }
+
+        await audit({
+          agencyId: inv.agencyId,
+          actorUserId: user.id,
+          action: "team.invitation.claimed",
+          targetType: "agency_member",
+          targetId: member.id,
+          metadata: { invitationId: inv.id, roleKey, functions, registrationFlow: true },
+          db: tx,
         });
 
         return {
@@ -206,7 +267,7 @@ router.post("/register", async (req, res) => {
           agency: inv.agency,
           member,
           invitationClaimed: true,
-          inviteRoleKey: inv.roleKey,
+          inviteRoleKey: roleKey,
         };
       }
 
@@ -369,6 +430,7 @@ router.post("/login", async (req, res) => {
       deviceId: input.deviceId || null,
       client: input.client || null,
     });
+    const effectivePermissions = await resolveEffectivePermissions({ member: membership, db: prisma });
 
     return res.json({
       ok: true,
@@ -382,7 +444,7 @@ router.post("/login", async (req, res) => {
       activeAgencyId: membership.agencyId,
       activeMemberId: membership.id,
       role: membership.role,
-      permissions: membership.permissions || {},
+      permissions: effectivePermissions,
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
@@ -401,6 +463,7 @@ router.post("/refresh", async (req, res) => {
       client: input.client || null,
     });
     if (!result.ok) return res.status(401).json(result);
+    const effectivePermissions = await resolveEffectivePermissions({ member: result.membership, db: prisma });
 
     return res.json({
       ok: true,
@@ -414,7 +477,7 @@ router.post("/refresh", async (req, res) => {
       activeAgencyId: result.membership.agencyId,
       activeMemberId: result.membership.id,
       role: result.membership.role,
-      permissions: result.membership.permissions || {},
+      permissions: effectivePermissions,
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
@@ -496,16 +559,22 @@ router.post("/reset-password", async (req, res) => {
 });
 
 router.get("/me", authRequired, async (req, res) => {
-  return res.json({
-    ok: true,
-    user: publicUser(req.auth.user),
-    agency: req.auth.agency,
-    activeAgency: req.auth.agency,
-    activeAgencyId: req.auth.agencyId,
-    activeMemberId: req.auth.memberId,
-    role: req.auth.role,
-    permissions: req.auth.permissions || {},
-  });
+  try {
+    const effectivePermissions = await resolveEffectivePermissions({ member: req.auth.membership, db: prisma });
+    return res.json({
+      ok: true,
+      user: publicUser(req.auth.user),
+      agency: req.auth.agency,
+      activeAgency: req.auth.agency,
+      activeAgencyId: req.auth.agencyId,
+      activeMemberId: req.auth.memberId,
+      role: req.auth.role,
+      permissions: effectivePermissions,
+    });
+  } catch (err) {
+    console.error("[auth/me] failed:", err);
+    return res.status(500).json({ ok: false, code: "AUTH_ME_FAILED", error: "Failed to load current permissions" });
+  }
 });
 
 module.exports = router;

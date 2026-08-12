@@ -54,7 +54,7 @@ function creatorAllowed(creatorId, allowedCreatorIds) {
 async function loadActorMember(req) {
   if (!req.auth?.agencyId || !req.auth?.userId) return null;
   return prisma.agencyMember.findFirst({
-    where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null },
+    where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null, deactivatedAt: null },
     select: { id: true, agencyId: true, userId: true, roleKey: true, role: true, permissions: true, assignedCreators: true },
   });
 }

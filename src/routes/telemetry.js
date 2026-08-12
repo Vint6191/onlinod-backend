@@ -21,7 +21,7 @@ router.post("/events/ingest", async (req, res) => {
 
     if (agencyId !== req.auth.agencyId) {
       const member = await prisma.agencyMember.findFirst({
-        where: { agencyId, userId: req.auth.userId, deletedAt: null, agency: { deletedAt: null } },
+        where: { agencyId, userId: req.auth.userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
       });
       if (!member) return res.status(403).json({ ok: false, code: "TELEMETRY_AGENCY_FORBIDDEN", error: "No access to agency" });
     }
@@ -59,7 +59,7 @@ function telemetryCreatorScope(member) {
 router.get("/events", async (req, res) => {
   try {
     const member = await prisma.agencyMember.findFirst({
-      where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null },
+      where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null, deactivatedAt: null },
       select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true },
     });
     if (!member) return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });

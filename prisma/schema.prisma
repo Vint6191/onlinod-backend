@@ -302,6 +302,7 @@ model AgencyMember {
   lastSeenLabel    String?
   isTest           Boolean   @default(false)
   deletedAt        DateTime?
+  deactivatedAt    DateTime?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -317,6 +318,7 @@ model AgencyMember {
   @@index([userId])
   @@index([roleKey])
   @@index([deletedAt])
+  @@index([deactivatedAt])
 }
 
 model TeamMemberFunction {
@@ -814,6 +816,7 @@ model AgencyInvitation {
   displayName      String?
   assignedCreators Json?
   commission       Json?
+  functions        Json?
   invitedByUserId  String
   expiresAt        DateTime
   claimedAt        DateTime?

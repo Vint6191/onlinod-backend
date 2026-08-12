@@ -29,13 +29,25 @@ const TRAFFIC_COST_PERMISSION_KEYS = [
   "creator_analytics.manage_traffic_costs",
 ];
 
-function hasExplicitPermission(member, keys) {
+function explicitPermissionDecision(member, keys) {
   const permissions = member?.permissions && typeof member.permissions === "object" ? member.permissions : {};
-  return keys.some((key) => permissions[key] === true);
+  let sawExplicit = false;
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(permissions, key)) continue;
+    if (permissions[key] === true) return true;
+    if (permissions[key] === false) sawExplicit = true;
+  }
+  return sawExplicit ? false : null;
+}
+
+function hasExplicitPermission(member, keys) {
+  return explicitPermissionDecision(member, keys) === true;
 }
 
 function hasRoleOrPermission(member, keys) {
-  return isSeniorAgencyMember(member) || hasExplicitPermission(member, keys);
+  const explicit = explicitPermissionDecision(member, keys);
+  if (explicit !== null) return explicit;
+  return isSeniorAgencyMember(member);
 }
 
 function canViewEarnings(member) {
@@ -64,6 +76,7 @@ module.exports = {
   TRAFFIC_VIEW_PERMISSION_KEYS,
   TRAFFIC_REFRESH_PERMISSION_KEYS,
   TRAFFIC_COST_PERMISSION_KEYS,
+  explicitPermissionDecision,
   hasExplicitPermission,
   canViewEarnings,
   canRefreshAnalytics,

@@ -7,6 +7,7 @@ const { z } = require("zod");
 const prisma = require("../prisma");
 const { authRequired } = require("../middleware/auth");
 const { creatorManagementRequired } = require("../middleware/creator-management-permissions");
+const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
 const { agencyRemovalPhrase, removeCreatorFromAssignedCreators } = require("../services/creator-agency-removal");
@@ -120,12 +121,34 @@ function publicBaseUrl(req) {
   return (process.env.PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`).replace(/\/+$/, "");
 }
 
+async function creatorAccessRequired(req, res, next) {
+  try {
+    req.authorizedCreator = await requireCreatorAccess({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership,
+      creatorId: req.params.id,
+    });
+    return next();
+  } catch (error) {
+    return res.status(Number(error?.status) || 403).json({
+      ok: false,
+      code: error?.code || "CREATOR_ACCESS_FORBIDDEN",
+      error: error?.message || "Creator access denied",
+    });
+  }
+}
+
 router.use(authRequired);
 
 router.get("/", async (req, res) => {
   try {
+    const scope = await allowedCreatorScope({ agencyId: req.auth.agencyId, member: req.auth.membership });
     const creators = await prisma.creatorAccount.findMany({
-      where: { agencyId: req.auth.agencyId, deletedAt: null },
+      where: {
+        agencyId: req.auth.agencyId,
+        deletedAt: null,
+        ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
+      },
       orderBy: { createdAt: "desc" },
       take: 10000});
 
@@ -138,6 +161,10 @@ router.get("/", async (req, res) => {
 
 router.post("/", creatorManagementRequired, async (req, res) => {
   try {
+    const scope = await allowedCreatorScope({ agencyId: req.auth.agencyId, member: req.auth.membership });
+    if (!scope.broad) {
+      return res.status(403).json({ ok: false, code: "CREATOR_CREATE_REQUIRES_ALL_SCOPE", error: "Creating a new creator requires all-creators scope" });
+    }
     const input = createSchema.parse(req.body);
     const username = normalizeUsername(input.username);
     const conflict = await findCreatorConflict({ agencyId: req.auth.agencyId, username });
@@ -186,7 +213,7 @@ router.post("/", creatorManagementRequired, async (req, res) => {
   }
 });
 
-router.get("/:id", async (req, res) => {
+router.get("/:id", creatorAccessRequired, async (req, res) => {
   try {
     const creator = await prisma.creatorAccount.findFirst({
       where: {
@@ -207,7 +234,7 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-router.patch("/:id", creatorManagementRequired, async (req, res) => {
+router.patch("/:id", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
   try {
     const input = updateSchema.parse(req.body);
 
@@ -263,7 +290,7 @@ router.patch("/:id", creatorManagementRequired, async (req, res) => {
   }
 });
 
-router.delete("/:id", creatorManagementRequired, async (req, res) => {
+router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
   try {
     const input = agencyRemovalSchema.parse(req.body);
     const existing = await prisma.creatorAccount.findFirst({
@@ -313,6 +340,19 @@ router.delete("/:id", creatorManagementRequired, async (req, res) => {
         removedFromMemberAssignments += 1;
       }
 
+      const pendingInvitations = await tx.agencyInvitation.findMany({
+        where: { agencyId: req.auth.agencyId, claimedAt: null, revokedAt: null },
+        select: { id: true, assignedCreators: true },
+        take: 10000,
+      });
+      let removedFromInvitationAssignments = 0;
+      for (const invitation of pendingInvitations) {
+        const next = removeCreatorFromAssignedCreators(invitation.assignedCreators, existing.id);
+        if (!next.changed) continue;
+        await tx.agencyInvitation.update({ where: { id: invitation.id }, data: { assignedCreators: next.value } });
+        removedFromInvitationAssignments += 1;
+      }
+
       await tx.accessSnapshot.updateMany({ where: { creatorId: existing.id, active: true }, data: { active: false, revokedAt: removedAt } });
       await tx.deviceCreatorBinding.updateMany({ where: { creatorId: existing.id }, data: { status: "REVOKED" } });
       await tx.creatorConnectSession.updateMany({ where: { creatorId: existing.id, status: { in: ["PENDING", "CLAIMED"] } }, data: { status: "CANCELLED", cancelledAt: removedAt } });
@@ -337,13 +377,14 @@ router.delete("/:id", creatorManagementRequired, async (req, res) => {
             remoteId: existing.remoteId,
             partition: existing.partition,
             removedFromMemberAssignments,
+            removedFromInvitationAssignments,
             historyPreserved: true,
             messageHistoryPreserved: true,
             crmDataPreserved: true,
           },
         },
       });
-      return { removedFromMemberAssignments };
+      return { removedFromMemberAssignments, removedFromInvitationAssignments };
     }, { maxWait: 10_000, timeout: 120_000 });
 
     return res.json({
@@ -351,6 +392,7 @@ router.delete("/:id", creatorManagementRequired, async (req, res) => {
       creatorId: existing.id,
       partition: existing.partition,
       removedFromMemberAssignments: result.removedFromMemberAssignments,
+      removedFromInvitationAssignments: result.removedFromInvitationAssignments,
       historyPreserved: true,
     });
   } catch (err) {
@@ -368,7 +410,7 @@ router.delete("/:id", creatorManagementRequired, async (req, res) => {
   }
 });
 
-router.post("/:id/complete-runtime", creatorManagementRequired, async (req, res) => {
+router.post("/:id/complete-runtime", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
   try {
     const input = completeRuntimeSchema.parse(req.body);
     const existing = await prisma.creatorAccount.findFirst({
@@ -460,7 +502,7 @@ router.post("/:id/complete-runtime", creatorManagementRequired, async (req, res)
   }
 });
 
-router.post("/:id/avatar", creatorManagementRequired, upload.single("avatar"), async (req, res) => {
+router.post("/:id/avatar", creatorManagementRequired, creatorAccessRequired, upload.single("avatar"), async (req, res) => {
   try {
     const existing = await prisma.creatorAccount.findFirst({
       where: {

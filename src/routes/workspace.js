@@ -2,27 +2,17 @@ const express = require("express");
 const prisma = require("../prisma");
 const { authRequired } = require("../middleware/auth");
 const { publicUser } = require("../services/auth-service");
+const { isOwner, normalizeAssignedCreators, resolveEffectivePermissions } = require("../services/team-access-control");
 
 const router = express.Router();
 router.use(authRequired);
 
 function getCreatorScopeFilter(member) {
   if (!member) return { id: { in: [] } };
-
-  const roleKey = String(member.roleKey || "").toLowerCase();
-  if (member.role === "OWNER" || roleKey === "owner" || roleKey === "manager") {
-    return {};
-  }
-
-  const assigned = member.assignedCreators;
-  if (!assigned || assigned === "all") return {};
-
-  if (Array.isArray(assigned)) {
-    const ids = assigned.map((id) => String(id || "").trim()).filter(Boolean);
-    return ids.length ? { id: { in: ids } } : { id: { in: [] } };
-  }
-
-  return { id: { in: [] } };
+  if (isOwner(member)) return {};
+  const scope = normalizeAssignedCreators(member.assignedCreators);
+  if (scope.mode === "all") return {};
+  return { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } };
 }
 
 function serializeMembership(member) {
@@ -55,12 +45,17 @@ router.get("/context", async (req, res) => {
         userId: req.auth.userId,
         agency: { deletedAt: null },
         deletedAt: null,
+        deactivatedAt: null,
       },
       include: { agency: true, user: true },
       orderBy: { createdAt: "asc" },
       take: 10000});
 
-    const activeMember = memberships.find((item) => item.agencyId === req.auth.agencyId) || memberships[0] || null;
+    const membershipsWithPermissions = await Promise.all(memberships.map(async (member) => ({
+      ...member,
+      permissions: await resolveEffectivePermissions({ member, db: prisma }),
+    })));
+    const activeMember = membershipsWithPermissions.find((item) => item.agencyId === req.auth.agencyId) || membershipsWithPermissions[0] || null;
 
     const creators = activeMember
       ? await prisma.creatorAccount.findMany({
@@ -95,7 +90,7 @@ router.get("/context", async (req, res) => {
     return res.json({
       ok: true,
       user: publicUser(req.auth.user),
-      memberships: memberships.map(serializeMembership),
+      memberships: membershipsWithPermissions.map(serializeMembership),
       activeAgency: activeMember?.agency || req.auth.agency,
       activeAgencyId: activeMember?.agencyId || req.auth.agencyId,
       activeMember: activeMember ? serializeMembership(activeMember) : null,

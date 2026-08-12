@@ -6,6 +6,7 @@ const prisma = require("../prisma");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { canViewTraffic, canRefreshTraffic, canManageTrafficCosts } = require("./creator-analytics-permissions");
+const { resolveEffectivePermissions } = require("./team-access-control");
 
 const TRAFFIC_SOURCES_SCAN_JOB_KEY = "traffic_sources_scan";
 const TRAFFIC_VALUE_REFRESH_JOB_KEY = "traffic_fan_value_refresh";
@@ -1282,7 +1283,7 @@ async function assertTrafficViewer({ userId, creatorId }) {
   }
 
   const member = await prisma.agencyMember.findFirst({
-    where: { userId, agencyId: creator.agencyId, deletedAt: null, agency: { deletedAt: null } },
+    where: { userId, agencyId: creator.agencyId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
     select: { id: true, role: true, roleKey: true, permissions: true },
   });
   if (!member) {
@@ -1291,13 +1292,15 @@ async function assertTrafficViewer({ userId, creatorId }) {
     throw err;
   }
 
-  if (!canViewTraffic(member)) {
+  const effectivePermissions = await resolveEffectivePermissions({ member, db: prisma });
+  const effectiveMember = { ...member, permissions: effectivePermissions };
+  if (!canViewTraffic(effectiveMember)) {
     const err = new Error("Traffic analytics permission is required");
     err.code = "TRAFFIC_VIEW_FORBIDDEN";
     throw err;
   }
 
-  return { creator, member };
+  return { creator, member: effectiveMember };
 }
 
 async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {

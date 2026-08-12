@@ -22,7 +22,9 @@ function assignedCreatorIds(member) {
 }
 
 function hasBroadCreatorAccess(member) {
-  if (isSeniorAgencyMember(member)) return true;
+  const role = String(member?.role || "").toUpperCase();
+  const roleKey = String(member?.roleKey || "").toLowerCase();
+  if (role === "OWNER" || roleKey === "owner") return true;
   const raw = member?.assignedCreators;
   if (raw === null || raw === undefined || raw === "all") return true;
   const obj = object(raw);

@@ -46,7 +46,7 @@ async function loadAgencyMember(req, agencyIdValue) {
   const id = agencyIdValue || agencyId(req);
   if (!id || !req.auth?.userId) return null;
   return prisma.agencyMember.findFirst({
-    where: { agencyId: id, userId: req.auth.userId, deletedAt: null },
+    where: { agencyId: id, userId: req.auth.userId, deletedAt: null, deactivatedAt: null },
     select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true },
   });
 }
@@ -95,7 +95,7 @@ async function requirePpvClaimsManager(req, res) {
   if (!id) return null;
 
   const member = await prisma.agencyMember.findFirst({
-    where: { agencyId: id, userId: req.auth?.userId, deletedAt: null },
+    where: { agencyId: id, userId: req.auth?.userId, deletedAt: null, deactivatedAt: null },
     select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true },
   });
 

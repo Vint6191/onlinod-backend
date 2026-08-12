@@ -3,7 +3,7 @@
 const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
-const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { canUsePermission } = require("../services/team-access-control");
 const { automationCreatorParamRequired, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { attachAutomationAudit } = require("../middleware/automation-audit");
 const { getAutomationMetrics, listAutomationAudit } = require("../services/automation-history-service");
@@ -77,10 +77,22 @@ function serviceError(res, error, fallback = "AUTOMATION_REQUEST_FAILED") {
 async function seniorRequired(req, res, next) {
   try {
     const member = req.auth?.membership || req.member;
-    if (!member || !isSeniorAgencyMember(member)) {
-      return res.status(403).json({ ok: false, code: "WRITE_AUTOMATION_FORBIDDEN", error: "Only owner, admin or manager may change or run write automation" });
+    if (!member || !(await canUsePermission({ member, key: "automation.manage", db: prisma }))) {
+      return res.status(403).json({ ok: false, code: "WRITE_AUTOMATION_FORBIDDEN", error: "automation.manage permission is required" });
     }
     req.automationMember = member;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function automationLogsRequired(req, res, next) {
+  try {
+    const member = req.auth?.membership || req.member;
+    if (!member || !(await canUsePermission({ member, key: "automation.view_logs", db: prisma }))) {
+      return res.status(403).json({ ok: false, code: "AUTOMATION_LOGS_FORBIDDEN", error: "automation.view_logs permission is required" });
+    }
     return next();
   } catch (error) {
     return next(error);
@@ -99,7 +111,7 @@ router.get("/controls/:creatorId", async (req, res) => {
   } catch (error) { return serviceError(res, error, "AUTOMATION_CONTROLS_FAILED"); }
 });
 
-router.get("/metrics/:creatorId", async (req, res) => {
+router.get("/metrics/:creatorId", automationLogsRequired, async (req, res) => {
   try {
     const query = z.object({
       from: z.string().datetime().optional(),
@@ -116,7 +128,7 @@ router.get("/metrics/:creatorId", async (req, res) => {
   }
 });
 
-router.get("/audit/:creatorId", async (req, res) => {
+router.get("/audit/:creatorId", automationLogsRequired, async (req, res) => {
   try {
     const query = z.object({
       moduleKey: z.string().max(80).optional(),

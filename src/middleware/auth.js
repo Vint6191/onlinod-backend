@@ -21,6 +21,8 @@ async function authRequired(req, res, next) {
       where: {
         userId: decoded.userId,
         agencyId: decoded.agencyId,
+        deletedAt: null,
+        deactivatedAt: null,
         agency: { deletedAt: null },
       },
       include: {
