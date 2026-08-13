@@ -20,6 +20,7 @@ function loadSettingsService() {
     if (request === "./auth-service") return { publicUser: (u) => u, issuePasswordReset: async () => ({ emailResult: { ok: true, skipped: false } }) };
     if (request === "./audit-service") return { audit: async () => null };
     if (request === "./team-access-control") return { canUsePermission: async () => true, isOwner: (member) => member?.role === "OWNER" || member?.roleKey === "owner" };
+    if (request === "./billing-nowpayments-service") return { publicProviderConfig: () => ({ providerKey: "NOWPAYMENTS", environment: "disabled", configured: false, checkoutAvailable: false, testMode: false, feePaidByUser: false, sandboxActivationEnabled: false, liveCheckoutBlockedByInternalTestMode: false, missingConfiguration: ["NOWPAYMENTS_MODE"] }), recentOrders: async () => [] };
     return original.call(this, request, parent, isMain);
   };
   try {
@@ -74,10 +75,11 @@ test("avatar upload is bounded and validates file bytes", () => {
   assert.match(routeSource, /LIMIT_FILE_SIZE/);
 });
 
-test("billing is owner-only/read-only and supports explicit free internal test mode", () => {
+test("billing settings read model is owner-only and supports explicit free internal test mode", () => {
   assert.match(serviceSource, /if \(!isOwner\(member\)\) return \{ available: false, reason: "OWNER_ONLY" \}/);
   assert.match(serviceSource, /billingMode === "FREE_INTERNAL"/);
-  assert.match(serviceSource, /checkoutAvailable: false/);
+  assert.match(serviceSource, /publicProviderConfig\(\)/);
+  assert.match(serviceSource, /recentOrders\(/);
   assert.match(adminSource, /"FREE_INTERNAL"/);
   assert.match(adminSource, /billingMode: input\.billingMode/);
   assert.match(adminSource, /billingPeriod: input\.billingPeriod/);
@@ -124,7 +126,8 @@ test("billing read model is owner-only, filters deleted creators and keeps FREE_
   };
   const result = await service.getBillingSettings({ agencyId: "agency-1", member: { role: "OWNER" }, db });
   assert.equal(result.available, true);
-  assert.equal(result.provider.testMode, true);
+  assert.equal(result.provider.internalTestMode, true);
+  assert.equal(result.provider.testMode, false);
   assert.equal(result.provider.checkoutAvailable, false);
   assert.equal(result.creators.length, 1);
   assert.equal(result.monthlyTotalCents, 2000);

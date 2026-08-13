@@ -5,6 +5,7 @@ const prisma = require("../prisma");
 const { publicUser, issuePasswordReset } = require("./auth-service");
 const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
+const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 
 const WORKSPACE_SETTING_DEFAULTS = Object.freeze({
   timezone: "UTC",
@@ -314,11 +315,12 @@ function billingLine(profile) {
 async function getBillingSettings({ agencyId, member, db = null }) {
   const client = db || prisma;
   if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY" };
-  const [agency, subscription, profiles, creatorsCount] = await Promise.all([
+  const [agency, subscription, profiles, creatorsCount, orders] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),
     client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
     client.creatorBillingProfile.findMany({ where: { agencyId }, include: { creator: { select: { id: true, displayName: true, username: true, deletedAt: true } } }, orderBy: { createdAt: "asc" } }),
     client.creatorAccount.count({ where: { agencyId, deletedAt: null } }),
+    recentOrders({ agencyId, limit: 10, db: client }),
   ]);
   const rows = profiles.filter((row) => !row.creator?.deletedAt).map(billingLine);
   const monthlyTotalCents = rows.reduce((sum, row) => sum + row.lineTotalCents, 0);
@@ -341,12 +343,18 @@ async function getBillingSettings({ agencyId, member, db = null }) {
     creatorsCount,
     monthlyTotalCents,
     creators: rows,
-    provider: {
-      mode: billingMode,
-      testMode: billingMode === "FREE_INTERNAL",
-      checkoutAvailable: false,
-      providerKey: billingMode === "CRYPTO" ? clean(process.env.BILLING_CRYPTO_PROVIDER, 80) || null : null,
-    },
+    provider: (() => {
+      const provider = publicProviderConfig();
+      const liveCheckoutBlockedByInternalTestMode = billingMode === "FREE_INTERNAL" && provider.environment === "live";
+      return {
+        mode: billingMode,
+        internalTestMode: billingMode === "FREE_INTERNAL",
+        ...provider,
+        checkoutAvailable: provider.checkoutAvailable && !liveCheckoutBlockedByInternalTestMode,
+        liveCheckoutBlockedByInternalTestMode,
+      };
+    })(),
+    recentOrders: orders,
   };
 }
 

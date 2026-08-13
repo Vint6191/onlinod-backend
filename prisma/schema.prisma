@@ -208,6 +208,7 @@ model Agency {
   auditLogs AuditLog[]
   subscriptions AgencySubscription[]
   creatorBillingProfiles CreatorBillingProfile[]
+  billingOrders BillingOrder[]
   adminActionLogs AdminActionLog[]
   customRoles            AgencyCustomRole[]
   roleOverrides          AgencyRoleOverride[]
@@ -649,6 +650,22 @@ enum BillingPeriod {
   SIX_MONTHS
 }
 
+enum BillingProvider {
+  NOWPAYMENTS
+}
+
+enum BillingOrderStatus {
+  CREATED
+  CHECKOUT_CREATED
+  PROCESSING
+  PARTIALLY_PAID
+  PAID
+  EXPIRED
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
 
 model AdminUser {
   id           String   @id @default(cuid())
@@ -739,6 +756,91 @@ model CreatorBillingProfile {
   @@index([agencyId])
   @@index([tier])
   @@index([billingExcluded])
+}
+
+model BillingOrder {
+  id              String             @id @default(cuid())
+  agencyId        String
+  createdByUserId String?
+  provider        BillingProvider    @default(NOWPAYMENTS)
+  status          BillingOrderStatus @default(CREATED)
+
+  amountCents      Int
+  currency         String            @default("USD")
+  billingPeriod    BillingPeriod
+  periodMonths     Int
+  billedCreators   Int
+  pricingSnapshot  Json
+
+  providerInvoiceId  String?
+  providerInvoiceUrl String?
+  providerStatus     String?
+  testMode           Boolean @default(false)
+  checkoutKey        String?
+
+  paidAt      DateTime?
+  activatedAt DateTime?
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agency          Agency                 @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  paymentAttempts BillingPaymentAttempt[]
+  providerEvents  BillingProviderEvent[]
+
+  @@unique([provider, testMode, providerInvoiceId])
+  @@unique([agencyId, provider, testMode, checkoutKey])
+  @@index([agencyId, createdAt])
+  @@index([agencyId, status])
+  @@index([status, createdAt])
+}
+
+model BillingPaymentAttempt {
+  id                String          @id @default(cuid())
+  orderId           String
+  provider          BillingProvider @default(NOWPAYMENTS)
+  testMode          Boolean         @default(false)
+  providerPaymentId String
+  providerStatus    String?
+  priceAmount       Decimal?        @db.Decimal(30, 12)
+  priceCurrency     String?
+  payAmount         Decimal?        @db.Decimal(30, 12)
+  payCurrency       String?
+  actuallyPaid      Decimal?        @db.Decimal(30, 12)
+  outcomeAmount     Decimal?        @db.Decimal(30, 12)
+  outcomeCurrency   String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  order          BillingOrder          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  providerEvents BillingProviderEvent[]
+
+  @@unique([provider, testMode, providerPaymentId])
+  @@index([orderId, createdAt])
+  @@index([providerStatus])
+}
+
+model BillingProviderEvent {
+  id               String          @id @default(cuid())
+  provider         BillingProvider @default(NOWPAYMENTS)
+  eventKey         String          @unique
+  orderId          String?
+  paymentAttemptId String?
+  providerStatus   String?
+  signature        String?
+  signatureVerified Boolean        @default(false)
+  payload          Json
+  receivedAt       DateTime        @default(now())
+  processedAt      DateTime?
+  processingError  String?
+
+  order          BillingOrder?          @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  paymentAttempt BillingPaymentAttempt? @relation(fields: [paymentAttemptId], references: [id], onDelete: SetNull)
+
+  @@index([orderId, receivedAt])
+  @@index([paymentAttemptId, receivedAt])
+  @@index([providerStatus])
+  @@index([receivedAt])
 }
 
 model AdminActionLog {
