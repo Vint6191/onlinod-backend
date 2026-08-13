@@ -35,6 +35,20 @@
     }
   }
 
+  function localDateTimeValue(value) {
+    if (!value) return "";
+    const d = new Date(value);
+    if (!Number.isFinite(d.getTime())) return "";
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function localDateTimeToIso(value) {
+    if (!value) return null;
+    const d = new Date(value);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : null;
+  }
+
   function healthBadge(health) {
     const level = health?.level || "unknown";
     const score = health?.score ?? 0;
@@ -316,6 +330,27 @@
     `;
   }
 
+  function renderCreatorEntitlementControls(creator) {
+    const ent = creator.billingEntitlement || {};
+    const currentTier = ent.tier || creator.billingProfile?.tier || "STARTER";
+    return `
+      <div class="admin-creator-billing admin-creator-entitlement">
+        <div class="admin-card-head"><strong>Access entitlement</strong><span class="admin-muted">Dated access. Separate from pricing configuration.</span></div>
+        <label>
+          <span>Paid tier</span>
+          <select class="on-input" data-entitlement-tier="${a()(creator.id)}">
+            ${Object.keys(TIERS).map((key) => `<option value="${key}" ${currentTier === key ? "selected" : ""}>${key}</option>`).join("")}
+          </select>
+        </label>
+        <label><span>Core access until</span><input class="on-input" type="datetime-local" data-entitlement-core="${a()(creator.id)}" value="${a()(localDateTimeValue(ent.coreValidUntil))}"></label>
+        <label><span>AI until</span><input class="on-input" type="datetime-local" data-entitlement-ai="${a()(creator.id)}" value="${a()(localDateTimeValue(ent.aiChatterValidUntil))}"></label>
+        <label><span>SFS until</span><input class="on-input" type="datetime-local" data-entitlement-outreach="${a()(creator.id)}" value="${a()(localDateTimeValue(ent.outreachValidUntil))}"></label>
+        <label><span>Reason *</span><input class="on-input" data-entitlement-reason="${a()(creator.id)}" placeholder="support grant / revoke reason"></label>
+        <button class="on-btn primary" data-save-creator-entitlement="${a()(creator.id)}">Save access</button>
+      </div>
+    `;
+  }
+
   function renderCreators(agency) {
     const creators = agency.creators || [];
 
@@ -341,6 +376,7 @@
             .map((creator) => {
               const kind = creatorKind(creator);
               const billing = creator.billingProfile || {};
+              const entitlement = creator.billingEntitlement || {};
               const expanded = state.expandedCreatorId === creator.id;
               const core = getCreatorCorePrice(creator);
               const addon = getCreatorAddonTotal(creator);
@@ -365,8 +401,8 @@
                     <span>${h()(creator.accessSnapshots?.filter((x) => x.active && !x.revokedAt).length || 0)} active</span>
 
                     <span>
-                      <b>${h()(billing.tier || "STARTER")} · ${h()(money(core))}</b>
-                      <em>${addon ? `addons ${money(addon)} · total ${money(total)}` : `total ${money(total)}`}</em>
+                      <b>${h()(billing.tier || "STARTER")} · ${h()(money(core))} config</b>
+                      <em>${entitlement.coreValidUntil ? `access → ${h()(dateShort(entitlement.coreValidUntil))} · ${h()(entitlement.coreSource || "LEGACY")}` : "no paid core access"}</em>
                     </span>
 
                     <span class="admin-actions">
@@ -377,7 +413,7 @@
                     </span>
                   </div>
 
-                  ${expanded ? `${renderCreatorDebug(creator)}${renderCreatorBillingControls(creator)}` : ""}
+                  ${expanded ? `${renderCreatorDebug(creator)}${renderCreatorBillingControls(creator)}${renderCreatorEntitlementControls(creator)}` : ""}
                 </div>
               `;
             })
@@ -557,6 +593,27 @@
         });
 
         if (!result.ok) return window.OnlinodRouter.toast(result.error || "Creator billing save failed");
+        await reload(root);
+      });
+    });
+
+    root.querySelectorAll("[data-save-creator-entitlement]").forEach((el) => {
+      el.addEventListener("click", async () => {
+        const id = el.dataset.saveCreatorEntitlement;
+        const reason = root.querySelector(`[data-entitlement-reason="${CSS.escape(id)}"]`)?.value?.trim() || "";
+        if (!reason) return window.OnlinodRouter.toast("Reason is required for manual access changes");
+
+        const result = await api().request(`/api/admin/creators/${encodeURIComponent(id)}/entitlement`, {
+          method: "PATCH",
+          body: {
+            tier: root.querySelector(`[data-entitlement-tier="${CSS.escape(id)}"]`)?.value || "STARTER",
+            coreValidUntil: localDateTimeToIso(root.querySelector(`[data-entitlement-core="${CSS.escape(id)}"]`)?.value),
+            aiChatterValidUntil: localDateTimeToIso(root.querySelector(`[data-entitlement-ai="${CSS.escape(id)}"]`)?.value),
+            outreachValidUntil: localDateTimeToIso(root.querySelector(`[data-entitlement-outreach="${CSS.escape(id)}"]`)?.value),
+            reason,
+          },
+        });
+        if (!result.ok) return window.OnlinodRouter.toast(result.error || "Creator access save failed");
         await reload(root);
       });
     });

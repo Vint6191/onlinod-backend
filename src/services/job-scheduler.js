@@ -34,6 +34,7 @@ const { ensureAutomaticBumps } = require("./bump-service");
 const { ensureAutomaticLikes } = require("./likes-service");
 const { ensureAutomaticFollowAutomation } = require("./follow-automation-service");
 const { ensureAutomaticSfs } = require("./sfs-service");
+const { reconcileExpiredBillingStates } = require("./billing-entitlement-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -516,6 +517,16 @@ async function runRecurringSweep() {
   // Retention owns the detailed 180d boundary. Run it before the historical
   // Team backfill so deleted old detail is not immediately recreated.
   const retention = await maybeRunRetentionSweep({ now });
+  let billingExpiry = null;
+  try {
+    billingExpiry = await reconcileExpiredBillingStates({ now });
+    if (billingExpiry?.scanned) {
+      console.log(`[scheduler] billing expiry — scanned=${billingExpiry.scanned}, expired=${billingExpiry.expired}, repaired=${billingExpiry.repaired}`);
+    }
+  } catch (err) {
+    console.warn("[scheduler] billing expiry reconciliation failed:", err?.message || err);
+    billingExpiry = { ok: false, error: err?.message || String(err) };
+  }
   const teamMoneyBackfill = await maybeReconcileHistoricalTeamMoney();
   const teamPendingBackfill = await maybeBackfillTeamPendingProjection();
 
@@ -531,6 +542,7 @@ async function runRecurringSweep() {
     dailyCyclesStarted,
     dailyCyclesSkipped,
     retention,
+    billingExpiry,
     teamMoneyBackfill,
     teamPendingBackfill,
   };

@@ -6,6 +6,8 @@ const { publicUser, issuePasswordReset } = require("./auth-service");
 const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
+const { catalogForClient } = require("./billing-catalog-service");
+const { publicEntitlement } = require("./billing-entitlement-service");
 
 const WORKSPACE_SETTING_DEFAULTS = Object.freeze({
   timezone: "UTC",
@@ -293,7 +295,7 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
   return after;
 }
 
-function billingLine(creator, defaultCorePriceCents = 2000) {
+function billingLine(creator, defaultCorePriceCents = 2000, now = new Date()) {
   const profile = creator?.billingProfile || null;
   const excluded = profile?.billingExcluded === true;
   const core = excluded ? 0 : Math.max(0, Number(profile?.corePriceCents ?? defaultCorePriceCents ?? 2000));
@@ -306,33 +308,50 @@ function billingLine(creator, defaultCorePriceCents = 2000) {
     tier: String(profile?.tier || "STARTER"),
     corePriceCents: core,
     aiChatterEnabled: profile?.aiChatterEnabled === true,
-    aiChatterPriceCents: ai,
+    aiChatterPriceCents: Math.max(0, Number(profile?.aiChatterPriceCents ?? 10000)),
     outreachEnabled: profile?.outreachEnabled === true,
-    outreachPriceCents: outreach,
+    outreachPriceCents: Math.max(0, Number(profile?.outreachPriceCents ?? 2900)),
     billingExcluded: excluded,
     lineTotalCents: core + ai + outreach,
+    entitlement: publicEntitlement(creator?.billingEntitlement || null, now),
   };
 }
 
 async function getBillingSettings({ agencyId, member, db = null }) {
   const client = db || prisma;
   if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY" };
+  const now = new Date();
   const [agency, subscription, creators, orders] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),
     client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
-    client.creatorAccount.findMany({ where: { agencyId, deletedAt: null }, include: { billingProfile: true }, orderBy: { createdAt: "asc" } }),
+    client.creatorAccount.findMany({
+      where: { agencyId, deletedAt: null },
+      include: { billingProfile: true, billingEntitlement: true },
+      orderBy: { createdAt: "asc" },
+    }),
     recentOrders({ agencyId, limit: 10, db: client }),
   ]);
   const defaultCorePriceCents = Math.max(0, Number(subscription?.corePricePerCreatorCents ?? 2000));
-  const rows = creators.map((creator) => billingLine(creator, defaultCorePriceCents));
+  const rows = creators.map((creator) => billingLine(creator, defaultCorePriceCents, now));
   const monthlyTotalCents = rows.reduce((sum, row) => sum + row.lineTotalCents, 0);
+  const activeRows = rows.filter((row) => row.entitlement.coreActive);
+  const maxEntitlementEnd = activeRows
+    .map((row) => row.entitlement.coreValidUntil ? new Date(row.entitlement.coreValidUntil) : null)
+    .filter((value) => value && Number.isFinite(value.getTime()))
+    .sort((a, b) => b.getTime() - a.getTime())[0] || null;
   const billingMode = String(subscription?.billingMode || "MANUAL");
+  const rawStatus = String(subscription?.status || agency?.status || "TRIAL");
+  const effectiveStatus = billingMode !== "FREE_INTERNAL" && rawStatus === "ACTIVE" && activeRows.length === 0
+    ? "PAST_DUE"
+    : activeRows.length > 0 ? "ACTIVE" : rawStatus;
+
   return {
     available: true,
     agency,
     subscription: subscription ? {
       id: subscription.id,
       status: subscription.status,
+      effectiveStatus,
       billingMode,
       billingPeriod: subscription.billingPeriod,
       corePricePerCreatorCents: subscription.corePricePerCreatorCents,
@@ -340,11 +359,14 @@ async function getBillingSettings({ agencyId, member, db = null }) {
       graceUntil: subscription.graceUntil,
       currentPeriodStart: subscription.currentPeriodStart,
       currentPeriodEnd: subscription.currentPeriodEnd,
+      effectiveCurrentPeriodEnd: maxEntitlementEnd ? maxEntitlementEnd.toISOString() : null,
     } : null,
     billedCreators: rows.filter((row) => !row.billingExcluded).length,
+    activeEntitledCreators: activeRows.length,
     creatorsCount: rows.length,
     monthlyTotalCents,
     creators: rows,
+    catalog: catalogForClient(),
     provider: (() => {
       const provider = publicProviderConfig();
       const liveCheckoutBlockedByInternalTestMode = billingMode === "FREE_INTERNAL" && provider.environment === "live";

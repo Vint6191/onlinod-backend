@@ -3,6 +3,8 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { audit } = require("./audit-service");
+const { normalizeSelection, periodMonths, priceCreatorSelection } = require("./billing-catalog-service");
+const { activatePaidOrderEntitlements, refundOrderEntitlements } = require("./billing-entitlement-service");
 
 const PROVIDER = "NOWPAYMENTS";
 const PROCESSING_STATUSES = new Set(["waiting", "confirming", "confirmed", "sending"]);
@@ -107,22 +109,6 @@ function publicProviderConfig() {
     sandboxActivationEnabled: cfg.sandboxActivationEnabled,
     missingConfiguration: missing,
   };
-}
-
-function periodMonths(period) {
-  if (period === "THREE_MONTHS") return 3;
-  if (period === "SIX_MONTHS") return 6;
-  return 1;
-}
-
-function addMonthsUtc(date, months) {
-  const d = new Date(date);
-  const day = d.getUTCDate();
-  d.setUTCDate(1);
-  d.setUTCMonth(d.getUTCMonth() + months);
-  const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
-  d.setUTCDate(Math.min(day, lastDay));
-  return d;
 }
 
 function decimalString(value) {
@@ -296,32 +282,40 @@ function replayExistingCheckout(order) {
   throw err;
 }
 
-function effectiveCreatorBillingLine(creator, defaultCorePriceCents = 2000) {
-  const profile = creator?.billingProfile || null;
-  const excluded = profile?.billingExcluded === true;
-  const core = excluded ? 0 : Math.max(0, Number(profile?.corePriceCents ?? defaultCorePriceCents ?? 2000));
-  const ai = !excluded && profile?.aiChatterEnabled ? Math.max(0, Number(profile.aiChatterPriceCents || 0)) : 0;
-  const outreach = !excluded && profile?.outreachEnabled ? Math.max(0, Number(profile.outreachPriceCents || 0)) : 0;
-  return {
-    creatorId: String(creator.id),
-    creatorName: creator.displayName || creator.username || String(creator.id),
-    tier: String(profile?.tier || "STARTER"),
-    corePriceCents: core,
-    aiChatterEnabled: profile?.aiChatterEnabled === true,
-    aiChatterPriceCents: ai,
-    outreachEnabled: profile?.outreachEnabled === true,
-    outreachPriceCents: outreach,
-    billingExcluded: excluded,
-    monthlyCents: core + ai + outreach,
-  };
+function requestHashForSelection(selection) {
+  return sha256(stableJson(selection));
 }
 
-async function calculateCheckoutSnapshot({ agencyId, db = null }) {
+function assertCheckoutRequestBinding(order, requestHash) {
+  if (!order) return;
+  if (order.requestHash === null) {
+    const err = new Error("This checkout key belongs to a legacy order without a bound creator selection; start a fresh checkout");
+    err.code = "BILLING_LEGACY_CHECKOUT_KEY";
+    err.status = 409;
+    err.permanent = true;
+    throw err;
+  }
+  if (order.requestHash && String(order.requestHash) !== String(requestHash)) {
+    const err = new Error("This checkout idempotency key is already bound to a different billing selection");
+    err.code = "BILLING_CHECKOUT_SELECTION_MISMATCH";
+    err.status = 409;
+    err.permanent = true;
+    throw err;
+  }
+}
+
+async function runTransaction(client, fn) {
+  return typeof client?.$transaction === "function" ? client.$transaction(fn) : fn(client);
+}
+
+async function calculateCheckoutSnapshot({ agencyId, selection, db = null }) {
   const client = db || prisma;
+  const normalized = normalizeSelection(selection);
+  const requestedIds = normalized.creators.map((row) => row.creatorId);
   const [subscription, creators, agency] = await Promise.all([
     client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
     client.creatorAccount.findMany({
-      where: { agencyId, deletedAt: null },
+      where: { agencyId, deletedAt: null, id: { in: requestedIds } },
       include: { billingProfile: true },
       orderBy: { createdAt: "asc" },
     }),
@@ -333,16 +327,26 @@ async function calculateCheckoutSnapshot({ agencyId, db = null }) {
     err.status = 404;
     throw err;
   }
+  const byId = new Map(creators.map((creator) => [String(creator.id), creator]));
+  const missing = requestedIds.filter((id) => !byId.has(String(id)));
+  if (missing.length) {
+    const err = new Error("One or more selected creators are unavailable in this workspace");
+    err.code = "BILLING_CREATOR_NOT_FOUND";
+    err.status = 404;
+    err.permanent = true;
+    throw err;
+  }
+
   const defaultCorePriceCents = Math.max(0, Number(subscription?.corePricePerCreatorCents ?? 2000));
-  const lines = creators
-    .map((creator) => effectiveCreatorBillingLine(creator, defaultCorePriceCents))
-    .filter((row) => !row.billingExcluded && row.monthlyCents > 0);
+  const months = periodMonths(normalized.billingPeriod);
+  const lines = normalized.creators.map((requested) => {
+    const priced = priceCreatorSelection({ creator: byId.get(requested.creatorId), requested, defaultCorePriceCents });
+    return { ...priced, periodMonths: months, lineTotalCents: priced.monthlyCents * months };
+  });
   const monthlyTotalCents = lines.reduce((sum, row) => sum + row.monthlyCents, 0);
-  const billingPeriod = String(subscription?.billingPeriod || "MONTHLY");
-  const months = periodMonths(billingPeriod);
-  const amountCents = monthlyTotalCents * months;
+  const amountCents = lines.reduce((sum, row) => sum + row.lineTotalCents, 0);
   if (!Number.isSafeInteger(amountCents) || amountCents <= 0) {
-    const err = new Error("No billable creator lines are configured for this workspace");
+    const err = new Error("Selected checkout has no billable creator lines");
     err.code = "BILLING_NOTHING_TO_CHARGE";
     err.status = 409;
     throw err;
@@ -350,13 +354,33 @@ async function calculateCheckoutSnapshot({ agencyId, db = null }) {
   return {
     agency,
     subscription,
-    billingPeriod,
+    selection: normalized,
+    requestHash: requestHashForSelection(normalized),
+    billingPeriod: normalized.billingPeriod,
     periodMonths: months,
     billedCreators: lines.length,
     monthlyTotalCents,
     amountCents,
     currency: "USD",
     lines,
+  };
+}
+
+function billingOrderLineCreateData(orderAgencyId, line) {
+  return {
+    agencyId: orderAgencyId,
+    creatorId: line.creatorId,
+    creatorName: line.creatorName,
+    creatorUsername: line.creatorUsername || null,
+    tier: line.tier,
+    corePriceCents: line.corePriceCents,
+    aiChatterEnabled: line.aiChatterEnabled === true,
+    aiChatterPriceCents: line.aiChatterPriceCents,
+    outreachEnabled: line.outreachEnabled === true,
+    outreachPriceCents: line.outreachPriceCents,
+    monthlyCents: line.monthlyCents,
+    periodMonths: line.periodMonths,
+    lineTotalCents: line.lineTotalCents,
   };
 }
 
@@ -369,7 +393,7 @@ function invoiceUrls(orderId, cfg) {
   };
 }
 
-async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutKey, db = null }) {
+async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutKey, selection, db = null }) {
   const client = db || prisma;
   const cfg = providerConfig();
   if (!cfg.configured) {
@@ -379,10 +403,13 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
     throw err;
   }
   const checkoutKey = normalizeCheckoutKey(rawCheckoutKey);
+  const normalizedSelection = normalizeSelection(selection);
+  const requestHash = requestHashForSelection(normalizedSelection);
   const existing = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
+  assertCheckoutRequestBinding(existing, requestHash);
   const retryFailedSandboxOrder = !!(existing && cfg.sandbox && existing.status === "FAILED" && !existing.providerInvoiceId && !existing.providerInvoiceUrl);
   if (existing && !retryFailedSandboxOrder) return replayExistingCheckout(existing);
-  const snapshot = await calculateCheckoutSnapshot({ agencyId, db: client });
+  const snapshot = await calculateCheckoutSnapshot({ agencyId, selection: normalizedSelection, db: client });
   if (snapshot.subscription?.billingMode === "FREE_INTERNAL" && cfg.live) {
     const err = new Error("This workspace is in FREE_INTERNAL mode; live checkout is disabled to prevent accidental charges");
     err.code = "BILLING_FREE_INTERNAL_LIVE_CHECKOUT_DISABLED";
@@ -392,24 +419,35 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
   let order;
   try {
     order = retryFailedSandboxOrder
-      ? await client.billingOrder.update({
-          where: { id: existing.id },
-          data: {
-            status: "CREATED",
-            providerStatus: null,
-            amountCents: snapshot.amountCents,
-            currency: snapshot.currency,
-            billingPeriod: snapshot.billingPeriod,
-            periodMonths: snapshot.periodMonths,
-            billedCreators: snapshot.billedCreators,
-            pricingSnapshot: {
-              agencyName: snapshot.agency.name,
-              plan: snapshot.agency.plan,
-              monthlyTotalCents: snapshot.monthlyTotalCents,
+      ? await runTransaction(client, async (tx) => {
+          const updated = await tx.billingOrder.update({
+            where: { id: existing.id },
+            data: {
+              status: "CREATED",
+              providerStatus: null,
+              amountCents: snapshot.amountCents,
+              currency: snapshot.currency,
+              billingPeriod: snapshot.billingPeriod,
               periodMonths: snapshot.periodMonths,
-              lines: snapshot.lines,
+              billedCreators: snapshot.billedCreators,
+              pricingSnapshot: {
+                agencyName: snapshot.agency.name,
+                plan: snapshot.agency.plan,
+                monthlyTotalCents: snapshot.monthlyTotalCents,
+                periodMonths: snapshot.periodMonths,
+                selection: snapshot.selection,
+                lines: snapshot.lines,
+              },
+              requestHash: snapshot.requestHash,
             },
-          },
+          });
+          if (tx.billingOrderLine?.deleteMany) await tx.billingOrderLine.deleteMany({ where: { orderId: updated.id } });
+          if (tx.billingOrderLine?.createMany) {
+            await tx.billingOrderLine.createMany({ data: snapshot.lines.map((line) => ({ orderId: updated.id, ...billingOrderLineCreateData(agencyId, line) })) });
+          } else if (tx.billingOrderLine?.create) {
+            for (const line of snapshot.lines) await tx.billingOrderLine.create({ data: { orderId: updated.id, ...billingOrderLineCreateData(agencyId, line) } });
+          }
+          return updated;
         })
       : await client.billingOrder.create({
           data: {
@@ -427,8 +465,11 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
               plan: snapshot.agency.plan,
               monthlyTotalCents: snapshot.monthlyTotalCents,
               periodMonths: snapshot.periodMonths,
+              selection: snapshot.selection,
               lines: snapshot.lines,
             },
+            requestHash: snapshot.requestHash,
+            lines: { create: snapshot.lines.map((line) => billingOrderLineCreateData(agencyId, line)) },
             testMode: cfg.sandbox,
             checkoutKey,
           },
@@ -437,6 +478,10 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
     if (err?.code !== "P2002") throw err;
     const raced = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
     if (!raced) throw err;
+    // The unique constraint protects duplicate creation, but a concurrent caller
+    // may have raced with a *different* selection under the same checkoutKey.
+    // Re-check the binding before exposing that caller's invoice.
+    assertCheckoutRequestBinding(raced, requestHash);
     return replayExistingCheckout(raced);
   }
 
@@ -527,55 +572,15 @@ function permanentBindingError(message, code) {
 }
 
 async function activatePaidOrder(orderId, db = null) {
-  const client = db || prisma;
-  const cfg = providerConfig();
-  return client.$transaction(async (tx) => {
-    const order = await tx.billingOrder.findUnique({ where: { id: orderId } });
-    if (!order || order.status !== "PAID") return { activated: false, reason: "ORDER_NOT_PAID" };
-    if (order.activatedAt) return { activated: false, reason: "ALREADY_ACTIVATED" };
-    if (order.testMode && !cfg.sandboxActivationEnabled) return { activated: false, reason: "SANDBOX_ACTIVATION_DISABLED" };
-
-    const claim = await tx.billingOrder.updateMany({
-      where: { id: orderId, activatedAt: null },
-      data: { activatedAt: new Date(), paidAt: order.paidAt || new Date() },
-    });
-    if (claim.count !== 1) return { activated: false, reason: "ALREADY_ACTIVATED" };
-
-    const subscription = await tx.agencySubscription.findFirst({ where: { agencyId: order.agencyId }, orderBy: { createdAt: "desc" } });
-    const now = new Date();
-    const existingEnd = subscription?.currentPeriodEnd ? new Date(subscription.currentPeriodEnd) : null;
-    const extending = !!existingEnd && existingEnd > now && subscription?.status === "ACTIVE";
-    const periodBase = extending ? existingEnd : now;
-    const nextEnd = addMonthsUtc(periodBase, order.periodMonths);
-    const data = {
-      status: "ACTIVE",
-      billingMode: order.testMode ? String(subscription?.billingMode || "FREE_INTERNAL") : "CRYPTO",
-      billingPeriod: order.billingPeriod,
-      currentPeriodStart: extending ? (subscription?.currentPeriodStart || now) : now,
-      currentPeriodEnd: nextEnd,
-      graceUntil: null,
-    };
-    if (subscription) await tx.agencySubscription.update({ where: { id: subscription.id }, data });
-    else await tx.agencySubscription.create({ data: { agencyId: order.agencyId, ...data } });
-    await tx.agency.update({ where: { id: order.agencyId }, data: { status: "ACTIVE", currentPeriodEnd: nextEnd } });
-    return { activated: true, currentPeriodEnd: nextEnd };
+  return activatePaidOrderEntitlements({
+    orderId,
+    sandboxActivationEnabled: providerConfig().sandboxActivationEnabled,
+    db: db || prisma,
   });
 }
 
 async function handleRefundedOrder(order, db = null) {
-  if (!order?.activatedAt) return { downgraded: false };
-  const client = db || prisma;
-  return client.$transaction(async (tx) => {
-    const newerPaid = await tx.billingOrder.findFirst({
-      where: { agencyId: order.agencyId, status: "PAID", activatedAt: { not: null }, createdAt: { gt: order.createdAt }, id: { not: order.id } },
-      orderBy: { createdAt: "desc" },
-    });
-    if (newerPaid) return { downgraded: false, reason: "NEWER_PAID_ORDER_EXISTS" };
-    const subscription = await tx.agencySubscription.findFirst({ where: { agencyId: order.agencyId }, orderBy: { createdAt: "desc" } });
-    if (subscription) await tx.agencySubscription.update({ where: { id: subscription.id }, data: { status: "PAST_DUE" } });
-    await tx.agency.update({ where: { id: order.agencyId }, data: { status: "PAST_DUE" } });
-    return { downgraded: true };
-  });
+  return refundOrderEntitlements({ order, db: db || prisma });
 }
 
 async function applyProviderPayment(payload, { signature = null, signatureVerified = false, source = "IPN", db = null } = {}) {
@@ -761,6 +766,20 @@ function publicOrder(row) {
     billingPeriod: String(row.billingPeriod || "MONTHLY"),
     periodMonths: Number(row.periodMonths || 1),
     billedCreators: Number(row.billedCreators || 0),
+    lines: Array.isArray(row.lines) ? row.lines.map((line) => ({
+      creatorId: String(line.creatorId),
+      creatorName: String(line.creatorName || line.creatorId),
+      creatorUsername: line.creatorUsername || null,
+      tier: String(line.tier || "STARTER"),
+      corePriceCents: Number(line.corePriceCents || 0),
+      aiChatterEnabled: line.aiChatterEnabled === true,
+      aiChatterPriceCents: Number(line.aiChatterPriceCents || 0),
+      outreachEnabled: line.outreachEnabled === true,
+      outreachPriceCents: Number(line.outreachPriceCents || 0),
+      monthlyCents: Number(line.monthlyCents || 0),
+      periodMonths: Number(line.periodMonths || row.periodMonths || 1),
+      lineTotalCents: Number(line.lineTotalCents || 0),
+    })) : [],
     providerInvoiceId: row.providerInvoiceId || null,
     providerInvoiceUrl: row.providerInvoiceUrl || null,
     providerStatus: row.providerStatus || null,
@@ -775,7 +794,7 @@ function publicOrder(row) {
 
 async function recentOrders({ agencyId, limit = 10, db = null }) {
   const client = db || prisma;
-  const rows = await client.billingOrder.findMany({ where: { agencyId }, orderBy: { createdAt: "desc" }, take: Math.max(1, Math.min(25, Number(limit || 10))) });
+  const rows = await client.billingOrder.findMany({ where: { agencyId }, include: { lines: { orderBy: { createdAt: "asc" } } }, orderBy: { createdAt: "desc" }, take: Math.max(1, Math.min(25, Number(limit || 10))) });
   return rows.map(publicOrder);
 }
 

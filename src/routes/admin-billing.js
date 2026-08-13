@@ -20,6 +20,7 @@ const express = require("express");
 const prisma = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
 const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
+const { publicEntitlement } = require("../services/billing-entitlement-service");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -48,12 +49,21 @@ function sendErr(res, err, code = "ADMIN_BILLING_FAILED") {
 }
 
 // Line total for a single model's billing profile.
-function lineCents(bp) {
+function configuredLineCents(bp) {
   if (!bp || bp.billingExcluded) return 0;
   let c = Number(bp.corePriceCents || 0);
   if (bp.aiChatterEnabled) c += Number(bp.aiChatterPriceCents || 0);
   if (bp.outreachEnabled) c += Number(bp.outreachPriceCents || 0);
   return c;
+}
+
+function activePaidLineCents(entitlement, now = new Date()) {
+  if (!entitlement) return 0;
+  let cents = 0;
+  if (entitlement.coreValidUntil && new Date(entitlement.coreValidUntil) > now) cents += Number(entitlement.corePriceCents || 0);
+  if (entitlement.aiChatterValidUntil && new Date(entitlement.aiChatterValidUntil) > now) cents += Number(entitlement.aiChatterPriceCents || 0);
+  if (entitlement.outreachValidUntil && new Date(entitlement.outreachValidUntil) > now) cents += Number(entitlement.outreachPriceCents || 0);
+  return cents;
 }
 
 router.get("/tiers", (_req, res) => res.json({ ok: true, tiers: TIERS, addons: ADDON_DEFAULTS }));
@@ -70,7 +80,7 @@ router.get("/overview", async (req, res) => {
         subscriptions: { orderBy: { createdAt: "desc" }, take: 1 },
         creators: {
           where: { deletedAt: null },
-          include: { billingProfile: true },
+          include: { billingProfile: true, billingEntitlement: true },
         },
       },
       orderBy: { createdAt: "desc" },
@@ -84,7 +94,8 @@ router.get("/overview", async (req, res) => {
     for (const a of agencies) {
       const sub = a.subscriptions[0] || null;
       const status = a.status || sub?.status || "TRIAL";
-      const billable = BILLABLE_STATUSES.has(status);
+      const billable = BILLABLE_STATUSES.has(status) && sub?.billingMode !== "FREE_INTERNAL";
+      const now = new Date();
 
       let agencyCents = 0;
       let modelsCounted = 0;
@@ -92,17 +103,20 @@ router.get("/overview", async (req, res) => {
 
       for (const c of a.creators) {
         const bp = c.billingProfile;
-        const line = lineCents(bp);
+        const ent = c.billingEntitlement;
+        const line = activePaidLineCents(ent, now);
         if (line > 0) {
           agencyCents += line;
           modelsCounted += 1;
-          if (bp.aiChatterEnabled) addons.aiChatter += Number(bp.aiChatterPriceCents || 0);
-          if (bp.outreachEnabled) addons.outreach += Number(bp.outreachPriceCents || 0);
+          if (ent?.aiChatterValidUntil && new Date(ent.aiChatterValidUntil) > now) addons.aiChatter += Number(ent.aiChatterPriceCents || 0);
+          if (ent?.outreachValidUntil && new Date(ent.outreachValidUntil) > now) addons.outreach += Number(ent.outreachPriceCents || 0);
         }
       }
 
       if (billable) { mrrCents += agencyCents; billedModels += modelsCounted; }
-      else if (status === "TRIAL") { trialMrrCents += agencyCents; }
+      else if (status === "TRIAL") {
+        trialMrrCents += a.creators.reduce((sum, creator) => sum + configuredLineCents(creator.billingProfile), 0);
+      }
 
       rows.push({
         agencyId: a.id,
@@ -144,7 +158,7 @@ router.get("/agency/:id", async (req, res) => {
       where: { id: req.params.id },
       include: {
         subscriptions: { orderBy: { createdAt: "desc" }, take: 1 },
-        creators: { where: { deletedAt: null }, include: { billingProfile: true }, orderBy: { createdAt: "asc" } },
+        creators: { where: { deletedAt: null }, include: { billingProfile: true, billingEntitlement: true }, orderBy: { createdAt: "asc" } },
       },
     });
     if (!agency) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND" });
@@ -168,11 +182,13 @@ router.get("/agency/:id", async (req, res) => {
         outreachPriceCents: Number(bp?.outreachPriceCents || ADDON_DEFAULTS.outreachPriceCents),
         billingExcluded: !!bp?.billingExcluded,
         hasProfile: !!bp,
-        lineCents: lineCents(bp),
+        configuredLineCents: configuredLineCents(bp),
+        activeLineCents: activePaidLineCents(c.billingEntitlement),
+        entitlement: publicEntitlement(c.billingEntitlement),
       };
     });
 
-    const monthlyCents = models.reduce((s, m) => s + m.lineCents, 0);
+    const monthlyCents = models.reduce((s, m) => s + m.activeLineCents, 0);
 
     return res.json({
       ok: true,
@@ -223,7 +239,7 @@ router.patch("/creator/:id", async (req, res) => {
       targetType: "creator", targetId: creator.id, before, after: billing, reason: b.reason || "billing update",
     });
 
-    return res.json({ ok: true, billing, lineCents: lineCents(billing) });
+    return res.json({ ok: true, billing, configuredLineCents: configuredLineCents(billing) });
   } catch (err) { return sendErr(res, err); }
 });
 

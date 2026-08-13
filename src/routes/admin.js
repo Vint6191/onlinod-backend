@@ -61,6 +61,7 @@ const prisma    = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
 const { signAccessToken } = require("../utils/tokens");
 const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
+const { publicEntitlement, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -263,16 +264,24 @@ router.get("/dashboard", async (_req, res) => {
         take: 10,
         select: { id: true, email: true, name: true, createdAt: true, emailVerifiedAt: true },
       }),
-      // Sum of all per-creator core prices for non-excluded billing profiles.
-      // Active subscriptions only.
-      prisma.creatorBillingProfile.aggregate({
+      // Exact active entitlement rows. Prices are snapshotted into the entitlement
+      // when access is granted, so later pricing-config edits do not rewrite MRR.
+      prisma.creatorBillingEntitlement.findMany({
         where: {
-          billingExcluded: false,
-          // Join via creator → agency status, but Prisma doesn't allow that
-          // directly here. We approximate: include all non-excluded profiles.
-          // Real MRR will be filtered client-side in the dashboard later.
+          agency: { deletedAt: null },
+          OR: [
+            { coreValidUntil: { gt: new Date() } },
+            { aiChatterValidUntil: { gt: new Date() } },
+            { outreachValidUntil: { gt: new Date() } },
+          ],
         },
-        _sum: { corePriceCents: true, aiChatterPriceCents: true, outreachPriceCents: true },
+        select: {
+          agencyId: true,
+          agency: { select: { subscriptions: { orderBy: { createdAt: "desc" }, take: 1, select: { billingMode: true } } } },
+          corePriceCents: true, coreValidUntil: true,
+          aiChatterPriceCents: true, aiChatterValidUntil: true,
+          outreachPriceCents: true, outreachValidUntil: true,
+        },
       }),
     ]);
 
@@ -308,12 +317,19 @@ router.get("/dashboard", async (_req, res) => {
           active: activeSnapshotsTotal,
         },
       },
-      mrr: {
-        // Rough — full filter happens in agency detail page.
-        coreCents: Number(mrrAggregate._sum.corePriceCents || 0),
-        aiChatterCents: Number(mrrAggregate._sum.aiChatterPriceCents || 0),
-        outreachCents: Number(mrrAggregate._sum.outreachPriceCents || 0),
-      },
+      mrr: (() => {
+        const now = new Date();
+        let coreCents = 0;
+        let aiChatterCents = 0;
+        let outreachCents = 0;
+        for (const row of mrrAggregate) {
+          if (row.agency?.subscriptions?.[0]?.billingMode === "FREE_INTERNAL") continue;
+          if (row.coreValidUntil && new Date(row.coreValidUntil) > now) coreCents += Number(row.corePriceCents || 0);
+          if (row.aiChatterValidUntil && new Date(row.aiChatterValidUntil) > now) aiChatterCents += Number(row.aiChatterPriceCents || 0);
+          if (row.outreachValidUntil && new Date(row.outreachValidUntil) > now) outreachCents += Number(row.outreachPriceCents || 0);
+        }
+        return { coreCents, aiChatterCents, outreachCents };
+      })(),
       recentActions: recentActions.map((x) => ({
         id: x.id,
         action: x.action,
@@ -453,7 +469,7 @@ router.get("/agencies", async (req, res) => {
       orderBy: { createdAt: "desc" },
       include: {
         members:        { include: { user: true }, orderBy: { createdAt: "asc" } },
-        creators:       { include: { billingProfile: true, accessSnapshots: { orderBy: { createdAt: "desc" }, take: 5 } } },
+        creators:       { include: { billingProfile: true, billingEntitlement: true, accessSnapshots: { orderBy: { createdAt: "desc" }, take: 5 } } },
         accessSnapshots: { select: { id: true, active: true, revokedAt: true, creatorId: true, createdAt: true } },
         subscriptions:  { orderBy: { createdAt: "desc" }, take: 1 },
       },
@@ -496,7 +512,7 @@ router.get("/agencies/:id", async (req, res) => {
     include: {
       members: { include: { user: true }, orderBy: { createdAt: "asc" } },
       creators: {
-        include: { billingProfile: true, accessSnapshots: { orderBy: { createdAt: "desc" }, take: 10 } },
+        include: { billingProfile: true, billingEntitlement: true, accessSnapshots: { orderBy: { createdAt: "desc" }, take: 10 } },
         orderBy: [{ status: "asc" }, { createdAt: "desc" }],
       },
       accessSnapshots: { orderBy: { createdAt: "desc" }, take: 150 },
@@ -1282,6 +1298,87 @@ router.patch("/creators/:id/billing", async (req, res) => {
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     return res.status(500).json({ ok: false, code: "ADMIN_CREATOR_BILLING_FAILED", error: err?.message || "Failed to update creator billing" });
+  }
+});
+
+// PATCH /creators/:id/entitlement — explicit manual support grant/revoke.
+// This is intentionally separate from CreatorBillingProfile: the profile is pricing/default
+// configuration, while this row is actual dated access provenance.
+const entitlementSchema = z.object({
+  tier: z.enum(["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"]).optional(),
+  coreValidUntil: z.string().datetime().optional().nullable(),
+  aiChatterValidUntil: z.string().datetime().optional().nullable(),
+  outreachValidUntil: z.string().datetime().optional().nullable(),
+  reason: z.string().min(1).max(500),
+});
+
+router.patch("/creators/:id/entitlement", async (req, res) => {
+  try {
+    const input = entitlementSchema.parse(req.body);
+    const creator = await prisma.creatorAccount.findUnique({
+      where: { id: req.params.id },
+      include: { billingProfile: true, billingEntitlement: true },
+    });
+    if (!creator || creator.deletedAt) {
+      return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
+    }
+
+    const before = creator.billingEntitlement || null;
+    const profile = creator.billingProfile;
+    const tier = input.tier || before?.tier || profile?.tier || "STARTER";
+    const defaults = defaultBilling(tier);
+    const now = new Date();
+    const coreUntil = input.coreValidUntil === undefined ? before?.coreValidUntil ?? null : (input.coreValidUntil ? new Date(input.coreValidUntil) : null);
+    const aiUntil = input.aiChatterValidUntil === undefined ? before?.aiChatterValidUntil ?? null : (input.aiChatterValidUntil ? new Date(input.aiChatterValidUntil) : null);
+    const outreachUntil = input.outreachValidUntil === undefined ? before?.outreachValidUntil ?? null : (input.outreachValidUntil ? new Date(input.outreachValidUntil) : null);
+
+    const data = {
+      agencyId: creator.agencyId,
+      creatorId: creator.id,
+      tier,
+      corePriceCents: Number(profile?.corePriceCents ?? defaults.corePriceCents ?? 0),
+      aiChatterPriceCents: Number(profile?.aiChatterPriceCents ?? defaults.aiChatterPriceCents ?? 10000),
+      outreachPriceCents: Number(profile?.outreachPriceCents ?? defaults.outreachPriceCents ?? 2900),
+      ...(input.coreValidUntil !== undefined ? {
+        coreSource: "ADMIN",
+        coreValidFrom: coreUntil && coreUntil > now && !(before?.coreValidUntil && new Date(before.coreValidUntil) > now) ? now : (before?.coreValidFrom || null),
+        coreValidUntil: coreUntil,
+        coreLastOrderId: null,
+      } : {}),
+      ...(input.aiChatterValidUntil !== undefined ? {
+        aiChatterSource: "ADMIN",
+        aiChatterValidUntil: aiUntil,
+        aiLastOrderId: null,
+      } : {}),
+      ...(input.outreachValidUntil !== undefined ? {
+        outreachSource: "ADMIN",
+        outreachValidUntil: outreachUntil,
+        outreachLastOrderId: null,
+      } : {}),
+    };
+
+    const result = await prisma.$transaction(async (tx) => {
+      const entitlement = before
+        ? await tx.creatorBillingEntitlement.update({ where: { creatorId: creator.id }, data })
+        : await tx.creatorBillingEntitlement.create({ data });
+      const aggregate = await syncAgencyBillingAggregate(tx, creator.agencyId, now);
+      return { entitlement, aggregate };
+    });
+
+    await adminLog(req, {
+      agencyId: creator.agencyId,
+      action: "admin.creator_entitlement_changed",
+      targetType: "creator",
+      targetId: creator.id,
+      before: before ? publicEntitlement(before, now) : null,
+      after: publicEntitlement(result.entitlement, now),
+      reason: input.reason,
+    });
+
+    return res.json({ ok: true, entitlement: publicEntitlement(result.entitlement, now), aggregate: result.aggregate });
+  } catch (err) {
+    if (err?.issues) return validationError(res, err);
+    return res.status(500).json({ ok: false, code: "ADMIN_CREATOR_ENTITLEMENT_FAILED", error: err?.message || "Failed to update creator entitlement" });
   }
 });
 

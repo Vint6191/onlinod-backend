@@ -208,7 +208,9 @@ model Agency {
   auditLogs AuditLog[]
   subscriptions AgencySubscription[]
   creatorBillingProfiles CreatorBillingProfile[]
+  creatorBillingEntitlements CreatorBillingEntitlement[]
   billingOrders BillingOrder[]
+  billingOrderLines BillingOrderLine[]
   adminActionLogs AdminActionLog[]
   customRoles            AgencyCustomRole[]
   roleOverrides          AgencyRoleOverride[]
@@ -442,6 +444,7 @@ model CreatorAccount {
   @@index([status])
   @@index([deletedAt])
   billingProfile CreatorBillingProfile?
+  billingEntitlement CreatorBillingEntitlement?
 }
 
 model AuthToken {
@@ -654,6 +657,12 @@ enum BillingProvider {
   NOWPAYMENTS
 }
 
+enum BillingEntitlementSource {
+  PAYMENT
+  ADMIN
+  LEGACY
+}
+
 enum BillingOrderStatus {
   CREATED
   CHECKOUT_CREATED
@@ -771,6 +780,7 @@ model BillingOrder {
   periodMonths     Int
   billedCreators   Int
   pricingSnapshot  Json
+  requestHash      String?
 
   providerInvoiceId  String?
   providerInvoiceUrl String?
@@ -785,6 +795,7 @@ model BillingOrder {
   updatedAt   DateTime @updatedAt
 
   agency          Agency                 @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  lines           BillingOrderLine[]
   paymentAttempts BillingPaymentAttempt[]
   providerEvents  BillingProviderEvent[]
 
@@ -793,6 +804,85 @@ model BillingOrder {
   @@index([agencyId, createdAt])
   @@index([agencyId, status])
   @@index([status, createdAt])
+  @@index([requestHash])
+}
+
+model BillingOrderLine {
+  id              String             @id @default(cuid())
+  orderId         String
+  agencyId        String
+  creatorId       String
+  creatorName     String
+  creatorUsername String?
+
+  tier CreatorBillingTier
+  corePriceCents Int
+  aiChatterEnabled Boolean @default(false)
+  aiChatterPriceCents Int @default(0)
+  outreachEnabled Boolean @default(false)
+  outreachPriceCents Int @default(0)
+  monthlyCents Int
+  periodMonths Int
+  lineTotalCents Int
+
+  previousTier CreatorBillingTier?
+  corePreviousSource BillingEntitlementSource?
+  corePreviousPriceCents Int?
+  corePreviousValidUntil DateTime?
+  coreGrantedUntil DateTime?
+  aiPreviousSource BillingEntitlementSource?
+  aiPreviousPriceCents Int?
+  aiPreviousValidUntil DateTime?
+  aiGrantedUntil DateTime?
+  outreachPreviousSource BillingEntitlementSource?
+  outreachPreviousPriceCents Int?
+  outreachPreviousValidUntil DateTime?
+  outreachGrantedUntil DateTime?
+  activatedAt DateTime?
+  refundedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  order  BillingOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  agency Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, creatorId])
+  @@index([agencyId, creatorId, createdAt])
+  @@index([creatorId, createdAt])
+}
+
+model CreatorBillingEntitlement {
+  id        String @id @default(cuid())
+  agencyId  String
+  creatorId String @unique
+
+  tier CreatorBillingTier @default(STARTER)
+  coreSource BillingEntitlementSource @default(LEGACY)
+  corePriceCents Int @default(0)
+  coreValidFrom DateTime?
+  coreValidUntil DateTime?
+  aiChatterSource BillingEntitlementSource @default(LEGACY)
+  aiChatterPriceCents Int @default(0)
+  aiChatterValidUntil DateTime?
+  outreachSource BillingEntitlementSource @default(LEGACY)
+  outreachPriceCents Int @default(0)
+  outreachValidUntil DateTime?
+
+  coreLastOrderId String?
+  aiLastOrderId String?
+  outreachLastOrderId String?
+  lastPaidAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, coreValidUntil])
+  @@index([coreValidUntil])
+  @@index([aiChatterValidUntil])
+  @@index([outreachValidUntil])
 }
 
 model BillingPaymentAttempt {

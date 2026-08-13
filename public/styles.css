@@ -196,3 +196,6 @@
   .admin-creator-debug{grid-template-columns:1fr}
   .admin-creator-billing{grid-template-columns:1fr}
 }
+.admin-creator-entitlement{grid-template-columns:1fr 1.2fr 1.2fr 1.2fr 1.5fr 140px}
+.admin-creator-entitlement .admin-card-head{grid-column:1/-1;padding:0 0 4px;background:transparent;border:0}
+@media(max-width:1400px){.admin-creator-entitlement{grid-template-columns:1fr}}

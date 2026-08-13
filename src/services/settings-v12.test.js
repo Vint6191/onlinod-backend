@@ -86,6 +86,17 @@ test("billing settings read model is owner-only and supports explicit free inter
   assert.doesNotMatch(routeSource, /checkout|payment-method|invoice\/create/i);
 });
 
+test("admin creator access entitlement is dated, auditable and separate from pricing configuration", () => {
+  assert.match(adminSource, /router\.patch\("\/creators\/:id\/entitlement"/);
+  assert.match(adminSource, /coreValidUntil: z\.string\(\)\.datetime\(\)\.optional\(\)\.nullable\(\)/);
+  assert.match(adminSource, /aiChatterValidUntil: z\.string\(\)\.datetime\(\)\.optional\(\)\.nullable\(\)/);
+  assert.match(adminSource, /outreachValidUntil: z\.string\(\)\.datetime\(\)\.optional\(\)\.nullable\(\)/);
+  assert.match(adminSource, /reason: z\.string\(\)\.min\(1\)\.max\(500\)/);
+  assert.match(adminSource, /coreSource: "ADMIN"/);
+  assert.match(adminSource, /action: "admin\.creator_entitlement_changed"/);
+  assert.match(adminSource, /syncAgencyBillingAggregate\(tx, creator\.agencyId, now\)/);
+});
+
 test("settings audit never includes plaintext passwords", () => {
   assert.match(serviceSource, /settings\.account\.password_changed/);
   const auditLine = serviceSource.split("\n").find((line) => line.includes('settings.account.password_changed')) || "";

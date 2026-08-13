@@ -5,6 +5,7 @@ const { authRequired } = require("../middleware/auth");
 const { isOwner } = require("../services/team-access-control");
 const {
   createCheckout,
+  calculateCheckoutSnapshot,
   handleNowPaymentsIpn,
   reconcileOrder,
   publicProviderConfig,
@@ -53,9 +54,37 @@ router.use(ownerOnly);
 
 router.get("/provider", (_req, res) => res.json({ ok: true, provider: publicProviderConfig() }));
 
+router.post("/quote", async (req, res) => {
+  try {
+    const quote = await calculateCheckoutSnapshot({
+      agencyId: req.auth.agencyId,
+      selection: { billingPeriod: req.body?.billingPeriod, creators: req.body?.creators },
+    });
+    return res.json({
+      ok: true,
+      quote: {
+        billingPeriod: quote.billingPeriod,
+        periodMonths: quote.periodMonths,
+        billedCreators: quote.billedCreators,
+        monthlyTotalCents: quote.monthlyTotalCents,
+        amountCents: quote.amountCents,
+        currency: quote.currency,
+        lines: quote.lines,
+      },
+    });
+  } catch (err) {
+    return sendError(res, err, "BILLING_QUOTE_FAILED");
+  }
+});
+
 router.post("/checkout", async (req, res) => {
   try {
-    const result = await createCheckout({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, checkoutKey: req.body?.checkoutKey });
+    const result = await createCheckout({
+      agencyId: req.auth.agencyId,
+      actorUserId: req.auth.userId,
+      checkoutKey: req.body?.checkoutKey,
+      selection: { billingPeriod: req.body?.billingPeriod, creators: req.body?.creators },
+    });
     return res.status(201).json({ ok: true, ...result });
   } catch (err) {
     return sendError(res, err, "BILLING_CHECKOUT_FAILED");
