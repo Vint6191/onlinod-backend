@@ -212,6 +212,11 @@ function emptyMetric() {
     totalMessages: 0,
     postsCreated: 0,
     storiesCreated: 0,
+    contentActions: 0,
+    contentMediaItemsPublished: 0,
+    contentCreatorCoverage: 0,
+    contentActiveDays: 0,
+    lastContentActivityAt: null,
     chatOpened: 0,
     incomingMessages: 0,
     unansweredIncomingCount: 0,
@@ -267,6 +272,8 @@ function emptyMetric() {
     // internal accumulators
     _fans: new Set(),
     _creators: new Set(),
+    _contentCreators: new Set(),
+    _contentDays: new Set(),
     _responseSeconds: [],
     _coverageResponseSeconds: [],
     _seenResponseSeconds: [],
@@ -288,7 +295,9 @@ function cleanMetric(metric) {
   metric.totalMessages = metric.messagesSent + metric.massMessages;
   metric.uniqueFans = metric._fans.size;
   metric.creatorCoverage = metric._creators.size;
-  metric.activeEvents = metric.messagesSent + metric.massMessages + metric.incomingMessages + metric.dialogSessionsCount + metric.backlogCleared + metric.ppvSentMessages + metric.ppvSoldMessages;
+  metric.contentCreatorCoverage = metric._contentCreators.size;
+  metric.contentActiveDays = metric._contentDays.size;
+  metric.activeEvents = metric.messagesSent + metric.massMessages + metric.incomingMessages + metric.dialogSessionsCount + metric.backlogCleared + metric.ppvSentMessages + metric.ppvSoldMessages + metric.contentActions;
   metric.dialogDwellMinutes = Math.round(metric.dialogDwellSeconds / 60);
   metric.avgDialogDwellSeconds = metric.dialogSessionsCount > 0 ? metric.dialogDwellSeconds / metric.dialogSessionsCount : null;
   metric.avgResponseSeconds = mean(metric._responseSeconds);
@@ -313,6 +322,8 @@ function cleanMetric(metric) {
 
   delete metric._fans;
   delete metric._creators;
+  delete metric._contentCreators;
+  delete metric._contentDays;
   delete metric._responseSeconds;
   delete metric._coverageResponseSeconds;
   delete metric._seenResponseSeconds;
@@ -644,6 +655,22 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
         // Normally automation has no human memberId by ingest policy. Keep this
         // defensive branch so malformed legacy rows still cannot count manual.
         m.automationDeliveries += 1;
+      }
+      continue;
+    }
+
+    if (canonicalKind === "CONTENT_POST_PUBLISHED_CONFIRMED" || canonicalKind === "CONTENT_STORY_PUBLISHED_CONFIRMED") {
+      if (String(ev.lifecycle || "").toUpperCase() !== "CONFIRMED" || canonicalSource !== "MANUAL" || !m) continue;
+      if (canonicalKind === "CONTENT_POST_PUBLISHED_CONFIRMED") m.postsCreated += 1;
+      else m.storiesCreated += 1;
+      m.contentActions += 1;
+      m.contentMediaItemsPublished += Math.max(0, num(ev.mediaCount ?? extra.mediaCount, 0));
+      if (accountId) m._contentCreators.add(accountId);
+      const ts = new Date(ev.ts || extra.occurredAt || Date.now());
+      if (Number.isFinite(ts.getTime())) {
+        m._contentDays.add(ts.toISOString().slice(0, 10));
+        const previous = m.lastContentActivityAt ? new Date(m.lastContentActivityAt).getTime() : 0;
+        if (ts.getTime() >= previous) m.lastContentActivityAt = ts.toISOString();
       }
       continue;
     }
@@ -1119,6 +1146,11 @@ function combineOverview(metricsList, membersCount) {
     botMessages: 0,
     postsCreated: 0,
     storiesCreated: 0,
+    contentActions: 0,
+    contentMediaItemsPublished: 0,
+    contentCreatorCoverage: 0,
+    contentActiveDays: 0,
+    lastContentActivityAt: null,
     chatOpened: 0,
     incomingMessages: 0,
     unansweredIncomingCount: 0,
@@ -1174,6 +1206,8 @@ function combineOverview(metricsList, membersCount) {
     out.totalMessages += num(m.totalMessages, 0);
     out.postsCreated += num(m.postsCreated, 0);
     out.storiesCreated += num(m.storiesCreated, 0);
+    out.contentActions += num(m.contentActions, 0);
+    out.contentMediaItemsPublished += num(m.contentMediaItemsPublished, 0);
     out.chatOpened += num(m.chatOpened, 0);
     out.incomingMessages += num(m.incomingMessages, 0);
     out.unansweredIncomingCount += num(m.unansweredIncomingCount, 0);

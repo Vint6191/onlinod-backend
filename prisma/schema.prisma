@@ -224,6 +224,7 @@ model Agency {
   teamDialogSessions TeamDialogSession[]
   teamResponseCases TeamResponseCase[]
   teamPendingDialogStates TeamPendingDialogState[]
+  teamShifts TeamShift[]
   analyticsSnapshots AnalyticsSnapshot[]
   workspaceSettings WorkspaceSetting[]
   moduleSettings ModuleSetting[]
@@ -312,6 +313,7 @@ model AgencyMember {
   teamCoverageSessions TeamCoverageSession[]
   teamDialogSessions TeamDialogSession[]
   teamResponseCases TeamResponseCase[]
+  teamShifts TeamShift[]
 
   @@unique([agencyId, userId])
   @@index([agencyId])
@@ -362,6 +364,7 @@ model CreatorAccount {
   teamDialogSessions TeamDialogSession[]
   teamResponseCases TeamResponseCase[]
   teamPendingDialogStates TeamPendingDialogState[]
+  teamShiftLinks TeamShiftCreator[]
   messageTemplateUsageEvents MessageTemplateUsageEvent[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
   presenceSnapshot CreatorPresenceSnapshot?
@@ -1773,6 +1776,7 @@ model TeamActivityEvent {
   lifecycle              String?
   dialogId               String?
   messageId              String?
+  contentId              String?
   correlationId          String?
   coverageId             String?
   startedAt              DateTime?
@@ -1806,12 +1810,50 @@ model TeamActivityEvent {
   @@index([agencyId, eventKind, ts])
   @@index([agencyId, actionSource, ts])
   @@index([agencyId, messageId])
+  @@index([agencyId, contentId])
   @@index([agencyId, correlationId])
   @@index([agencyId, coverageId, ts])
   @@index([agencyId, pendingProjectionVersion, ts])
   @@index([agencyId, automationDeliveryId])
   @@index([agencyId, broadcastDispatchId])
   @@index([type, ts])
+}
+
+model TeamShift {
+  id                String   @id @default(cuid())
+  agencyId          String
+  memberId          String
+  startsAt          DateTime
+  endsAt            DateTime
+  timezone          String   @default("UTC")
+  status            String   @default("PLANNED")
+  note              String?
+  createdByUserId   String?
+  updatedByUserId   String?
+  cancelledAt       DateTime?
+  cancelledByUserId String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agency   Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  member   AgencyMember   @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  creators TeamShiftCreator[]
+
+  @@index([agencyId, startsAt])
+  @@index([agencyId, status, startsAt])
+  @@index([memberId, startsAt])
+}
+
+model TeamShiftCreator {
+  shiftId   String
+  creatorId String
+  createdAt DateTime @default(now())
+
+  shift   TeamShift       @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  creator CreatorAccount  @relation(fields: [creatorId], references: [id], onDelete: Restrict)
+
+  @@id([shiftId, creatorId])
+  @@index([creatorId, shiftId])
 }
 
 model AnalyticsSnapshot {
@@ -3631,6 +3673,7 @@ model TeamSentMessageLedger {
   @@unique([agencyId, accountId, localSeed])
   @@unique([agencyId, accountId, messageId])
   @@index([agencyId, messageId])
+  @@index([agencyId, contentId])
   @@index([agencyId, accountId, messageId])
   @@index([agencyId, creatorId, sentAt])
   @@index([agencyId, memberId, sentAt])
@@ -4021,6 +4064,7 @@ model TeamPpvPurchaseLedger {
   @@index([agencyId, financialTransactionId])
   @@index([agencyId, financialStatus, purchasedAt])
   @@index([agencyId, messageId])
+  @@index([agencyId, contentId])
   @@index([agencyId, status, purchasedAt])
   @@index([agencyId, attributedMemberId, purchasedAt])
 }
@@ -4121,6 +4165,7 @@ model TeamPpvResolveJob {
   @@unique([agencyId, purchaseId, messageId])
   @@index([agencyId, status, createdAt])
   @@index([agencyId, messageId])
+  @@index([agencyId, contentId])
 }
 
 

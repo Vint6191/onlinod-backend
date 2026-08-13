@@ -13,6 +13,8 @@ const TEAM_V13_EVENT_KINDS = new Set([
   "MESSAGE_SEND_ATTEMPTED",
   "MESSAGE_SEND_CONFIRMED",
   "BROADCAST_DISPATCH_CONFIRMED",
+  "CONTENT_POST_PUBLISHED_CONFIRMED",
+  "CONTENT_STORY_PUBLISHED_CONFIRMED",
   "DIALOG_SELECTED",
   "DIALOG_SEEN",
   "DIALOG_SESSION",
@@ -196,6 +198,7 @@ function isCanonicalV13(event) {
 function canonicalNeedsHumanActor(eventKind, actionSource) {
   if (HUMAN_ACTIVITY_KINDS.has(eventKind)) return true;
   if (eventKind === "BROADCAST_DISPATCH_CONFIRMED") return actionSource === "BROADCAST";
+  if (eventKind === "CONTENT_POST_PUBLISHED_CONFIRMED" || eventKind === "CONTENT_STORY_PUBLISHED_CONFIRMED") return actionSource === "MANUAL";
   if (eventKind === "MESSAGE_SEND_ATTEMPTED" || eventKind === "MESSAGE_SEND_CONFIRMED") {
     return actionSource === "MANUAL";
   }
@@ -280,6 +283,7 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
       lifecycle,
       dialogId: cleanString(event.dialogId || event.fanId, 160),
       messageId: cleanString(event.messageId, 220),
+      contentId: cleanString(event.contentId || event.metadata?.contentId, 220),
       correlationId: cleanString(event.correlationId, 220),
       coverageId: cleanString(event.coverageId, 220),
       startedAt: optionalDate(event.startedAt),
