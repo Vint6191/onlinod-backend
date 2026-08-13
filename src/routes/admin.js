@@ -705,6 +705,8 @@ const subSchema = z.object({
   plan: z.string().max(80).optional(),
   status: z.enum(["TRIAL", "ACTIVE", "PAST_DUE", "GRACE", "CANCELLED", "LOCKED"]).optional(),
   corePricePerCreatorCents: z.number().int().min(0).optional(),
+  billingMode: z.enum(["MANUAL", "STRIPE", "CRYPTO", "FREE_INTERNAL"]).optional(),
+  billingPeriod: z.enum(["MONTHLY", "THREE_MONTHS", "SIX_MONTHS"]).optional(),
   currentPeriodEnd: z.string().datetime().optional().nullable(),
   trialEndsAt: z.string().datetime().optional().nullable(),
   reason: z.string().max(500).optional().nullable(),
@@ -731,6 +733,8 @@ router.patch("/agencies/:id/subscription", async (req, res) => {
     const subData = {
       status: input.status || beforeSub?.status || "TRIAL",
       corePricePerCreatorCents: input.corePricePerCreatorCents ?? beforeSub?.corePricePerCreatorCents ?? 2000,
+      billingMode: input.billingMode || beforeSub?.billingMode || "MANUAL",
+      billingPeriod: input.billingPeriod || beforeSub?.billingPeriod || "MONTHLY",
       currentPeriodEnd: input.currentPeriodEnd ? new Date(input.currentPeriodEnd) : beforeSub?.currentPeriodEnd || null,
       trialEndsAt: input.trialEndsAt ? new Date(input.trialEndsAt) : beforeSub?.trialEndsAt || null,
     };
