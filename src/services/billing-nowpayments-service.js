@@ -6,7 +6,6 @@ const { audit } = require("./audit-service");
 
 const PROVIDER = "NOWPAYMENTS";
 const PROCESSING_STATUSES = new Set(["waiting", "confirming", "confirmed", "sending"]);
-const SANDBOX_CASES = new Set(["success", "common", "failed", "partially_paid"]);
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -87,7 +86,6 @@ function providerConfig() {
     feePaidByUser: boolEnv("NOWPAYMENTS_FEE_PAID_BY_USER", false),
     sandboxActivationEnabled: sandbox && boolEnv("NOWPAYMENTS_SANDBOX_ACTIVATE", process.env.NODE_ENV !== "production"),
     timeoutMs,
-    sandboxCase: clean(process.env.NOWPAYMENTS_SANDBOX_CASE, 80).toLowerCase() || null,
   };
 }
 
@@ -298,13 +296,33 @@ function replayExistingCheckout(order) {
   throw err;
 }
 
+function effectiveCreatorBillingLine(creator, defaultCorePriceCents = 2000) {
+  const profile = creator?.billingProfile || null;
+  const excluded = profile?.billingExcluded === true;
+  const core = excluded ? 0 : Math.max(0, Number(profile?.corePriceCents ?? defaultCorePriceCents ?? 2000));
+  const ai = !excluded && profile?.aiChatterEnabled ? Math.max(0, Number(profile.aiChatterPriceCents || 0)) : 0;
+  const outreach = !excluded && profile?.outreachEnabled ? Math.max(0, Number(profile.outreachPriceCents || 0)) : 0;
+  return {
+    creatorId: String(creator.id),
+    creatorName: creator.displayName || creator.username || String(creator.id),
+    tier: String(profile?.tier || "STARTER"),
+    corePriceCents: core,
+    aiChatterEnabled: profile?.aiChatterEnabled === true,
+    aiChatterPriceCents: ai,
+    outreachEnabled: profile?.outreachEnabled === true,
+    outreachPriceCents: outreach,
+    billingExcluded: excluded,
+    monthlyCents: core + ai + outreach,
+  };
+}
+
 async function calculateCheckoutSnapshot({ agencyId, db = null }) {
   const client = db || prisma;
-  const [subscription, profiles, agency] = await Promise.all([
+  const [subscription, creators, agency] = await Promise.all([
     client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
-    client.creatorBillingProfile.findMany({
-      where: { agencyId },
-      include: { creator: { select: { id: true, displayName: true, username: true, deletedAt: true } } },
+    client.creatorAccount.findMany({
+      where: { agencyId, deletedAt: null },
+      include: { billingProfile: true },
       orderBy: { createdAt: "asc" },
     }),
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true } }),
@@ -315,25 +333,10 @@ async function calculateCheckoutSnapshot({ agencyId, db = null }) {
     err.status = 404;
     throw err;
   }
-  const lines = profiles
-    .filter((row) => !row.creator?.deletedAt && row.billingExcluded !== true)
-    .map((row) => {
-      const core = Math.max(0, Number(row.corePriceCents || 0));
-      const ai = row.aiChatterEnabled ? Math.max(0, Number(row.aiChatterPriceCents || 0)) : 0;
-      const outreach = row.outreachEnabled ? Math.max(0, Number(row.outreachPriceCents || 0)) : 0;
-      return {
-        creatorId: String(row.creatorId),
-        creatorName: row.creator?.displayName || row.creator?.username || String(row.creatorId),
-        tier: String(row.tier || "STARTER"),
-        corePriceCents: core,
-        aiChatterEnabled: row.aiChatterEnabled === true,
-        aiChatterPriceCents: ai,
-        outreachEnabled: row.outreachEnabled === true,
-        outreachPriceCents: outreach,
-        monthlyCents: core + ai + outreach,
-      };
-    })
-    .filter((row) => row.monthlyCents > 0);
+  const defaultCorePriceCents = Math.max(0, Number(subscription?.corePricePerCreatorCents ?? 2000));
+  const lines = creators
+    .map((creator) => effectiveCreatorBillingLine(creator, defaultCorePriceCents))
+    .filter((row) => !row.billingExcluded && row.monthlyCents > 0);
   const monthlyTotalCents = lines.reduce((sum, row) => sum + row.monthlyCents, 0);
   const billingPeriod = String(subscription?.billingPeriod || "MONTHLY");
   const months = periodMonths(billingPeriod);
@@ -375,15 +378,10 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
     err.status = 503;
     throw err;
   }
-  if (cfg.sandbox && cfg.sandboxCase && !SANDBOX_CASES.has(cfg.sandboxCase)) {
-    const err = new Error(`Unsupported NOWPayments sandbox case: ${cfg.sandboxCase}`);
-    err.code = "NOWPAYMENTS_SANDBOX_CASE_INVALID";
-    err.status = 503;
-    throw err;
-  }
   const checkoutKey = normalizeCheckoutKey(rawCheckoutKey);
   const existing = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
-  if (existing) return replayExistingCheckout(existing);
+  const retryFailedSandboxOrder = !!(existing && cfg.sandbox && existing.status === "FAILED" && !existing.providerInvoiceId && !existing.providerInvoiceUrl);
+  if (existing && !retryFailedSandboxOrder) return replayExistingCheckout(existing);
   const snapshot = await calculateCheckoutSnapshot({ agencyId, db: client });
   if (snapshot.subscription?.billingMode === "FREE_INTERNAL" && cfg.live) {
     const err = new Error("This workspace is in FREE_INTERNAL mode; live checkout is disabled to prevent accidental charges");
@@ -393,28 +391,48 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
   }
   let order;
   try {
-    order = await client.billingOrder.create({
-      data: {
-        agencyId,
-        createdByUserId: actorUserId || null,
-        provider: PROVIDER,
-        status: "CREATED",
-        amountCents: snapshot.amountCents,
-        currency: snapshot.currency,
-        billingPeriod: snapshot.billingPeriod,
-        periodMonths: snapshot.periodMonths,
-        billedCreators: snapshot.billedCreators,
-        pricingSnapshot: {
-          agencyName: snapshot.agency.name,
-          plan: snapshot.agency.plan,
-          monthlyTotalCents: snapshot.monthlyTotalCents,
-          periodMonths: snapshot.periodMonths,
-          lines: snapshot.lines,
-        },
-        testMode: cfg.sandbox,
-        checkoutKey,
-      },
-    });
+    order = retryFailedSandboxOrder
+      ? await client.billingOrder.update({
+          where: { id: existing.id },
+          data: {
+            status: "CREATED",
+            providerStatus: null,
+            amountCents: snapshot.amountCents,
+            currency: snapshot.currency,
+            billingPeriod: snapshot.billingPeriod,
+            periodMonths: snapshot.periodMonths,
+            billedCreators: snapshot.billedCreators,
+            pricingSnapshot: {
+              agencyName: snapshot.agency.name,
+              plan: snapshot.agency.plan,
+              monthlyTotalCents: snapshot.monthlyTotalCents,
+              periodMonths: snapshot.periodMonths,
+              lines: snapshot.lines,
+            },
+          },
+        })
+      : await client.billingOrder.create({
+          data: {
+            agencyId,
+            createdByUserId: actorUserId || null,
+            provider: PROVIDER,
+            status: "CREATED",
+            amountCents: snapshot.amountCents,
+            currency: snapshot.currency,
+            billingPeriod: snapshot.billingPeriod,
+            periodMonths: snapshot.periodMonths,
+            billedCreators: snapshot.billedCreators,
+            pricingSnapshot: {
+              agencyName: snapshot.agency.name,
+              plan: snapshot.agency.plan,
+              monthlyTotalCents: snapshot.monthlyTotalCents,
+              periodMonths: snapshot.periodMonths,
+              lines: snapshot.lines,
+            },
+            testMode: cfg.sandbox,
+            checkoutKey,
+          },
+        });
   } catch (err) {
     if (err?.code !== "P2002") throw err;
     const raced = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
@@ -430,7 +448,6 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
     order_description: `ONLINOD ${snapshot.billingPeriod} · ${snapshot.billedCreators} creator${snapshot.billedCreators === 1 ? "" : "s"}`,
     ...invoiceUrls(order.id, cfg),
     is_fee_paid_by_user: cfg.feePaidByUser,
-    ...(cfg.sandbox && cfg.sandboxCase ? { case: cfg.sandboxCase } : {}),
   };
 
   try {

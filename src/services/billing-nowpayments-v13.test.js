@@ -260,11 +260,11 @@ test("checkout snapshots real creator prices, creates a hosted invoice, and send
   const service = loadService();
   const created = [];
   const db = {
-    agencySubscription: { findFirst: async () => ({ billingPeriod: "THREE_MONTHS", billingMode: "MANUAL" }) },
-    creatorBillingProfile: { findMany: async () => [
-      { creatorId: "c1", corePriceCents: 2000, aiChatterEnabled: true, aiChatterPriceCents: 1000, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false, creator: { displayName: "One", username: "one", deletedAt: null } },
-      { creatorId: "c2", corePriceCents: 9000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: true, creator: { displayName: "Excluded", username: "x", deletedAt: null } },
-      { creatorId: "c3", corePriceCents: 9000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false, creator: { displayName: "Deleted", username: "d", deletedAt: new Date() } },
+    agencySubscription: { findFirst: async () => ({ billingPeriod: "THREE_MONTHS", billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
+    creatorAccount: { findMany: async () => [
+      { id: "c1", displayName: "One", username: "one", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: true, aiChatterPriceCents: 1000, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } },
+      { id: "c2", displayName: "Excluded", username: "x", billingProfile: { tier: "CUSTOM", corePriceCents: 9000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: true } },
+      { id: "c3", displayName: "No profile", username: "missing", billingProfile: null },
     ] },
     agency: { findUnique: async () => ({ id: "a1", name: "Agency", plan: "PRO" }) },
     billingOrder: {
@@ -281,13 +281,13 @@ test("checkout snapshots real creator prices, creates a hosted invoice, and send
   };
   try {
     const result = await service.createCheckout({ agencyId: "a1", actorUserId: "u1", checkoutKey: "checkout_request_123456", db });
-    assert.equal(result.order.amountCents, 9000); // (2000 + 1000) * 3 months
+    assert.equal(result.order.amountCents, 15000); // ((2000 + 1000) + default 2000) * 3 months
     assert.equal(request.url, "https://api-sandbox.nowpayments.io/v1/invoice");
-    assert.equal(request.body.price_amount, 90);
+    assert.equal(request.body.price_amount, 150);
     assert.equal(request.body.price_currency, "usd");
     assert.equal(request.body.order_id, "order-1");
     assert.equal(created[0].checkoutKey, "checkout_request_123456");
-    assert.equal(request.body.case, "success");
+    assert.equal("case" in request.body, false);
     assert.equal(request.body.ipn_callback_url, "https://api.example.com/api/billing/nowpayments/ipn");
     assert.match(result.checkoutUrl, /^https:\/\/nowpayments\.io\//);
   } finally { global.fetch = previousFetch; }
@@ -298,8 +298,8 @@ test("checkout audit failure after provider invoice creation does not destroy a 
 }, async () => {
   let order = null;
   const db = {
-    agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "MANUAL" }) },
-    creatorBillingProfile: { findMany: async () => [{ creatorId: "c1", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false, creator: { displayName: "One", username: "one", deletedAt: null } }] },
+    agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
+    creatorAccount: { findMany: async () => [{ id: "c1", displayName: "One", username: "one", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } }] },
     agency: { findUnique: async () => ({ id: "a1", name: "Agency", plan: "PRO" }) },
     billingOrder: {
       findUnique: async () => order ? { ...order } : null,
@@ -329,8 +329,8 @@ test("FREE_INTERNAL can use sandbox for testing but cannot accidentally create a
   const service = loadService();
   let orderCreates = 0;
   const db = {
-    agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "FREE_INTERNAL" }) },
-    creatorBillingProfile: { findMany: async () => [{ creatorId: "c1", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false, creator: { displayName: "One", deletedAt: null } }] },
+    agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "FREE_INTERNAL", corePricePerCreatorCents: 2000 }) },
+    creatorAccount: { findMany: async () => [{ id: "c1", displayName: "One", username: "one", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } }] },
     agency: { findUnique: async () => ({ id: "a1", name: "Agency", plan: "PRO" }) },
     billingOrder: { findUnique: async () => null, create: async () => { orderCreates += 1; throw new Error("must not create"); } },
   };
@@ -361,14 +361,40 @@ test("checkout idempotency is persisted in BillingOrder and a retried request re
   } finally { global.fetch = previousFetch; }
 }));
 
-test("invalid sandbox cases fail before order creation instead of sending unknown test values to the provider", async () => withEnv({
-  NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NOWPAYMENTS_SANDBOX_CASE: "typo_case",
+test("a failed sandbox invoice request with no remote invoice can be retried with the same checkout key", async () => withEnv({
+  NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com",
 }, async () => {
-  const service = loadService();
-  let lookedUp = false;
-  const db = { billingOrder: { findUnique: async () => { lookedUp = true; return null; } } };
-  await assert.rejects(service.createCheckout({ agencyId: "a1", actorUserId: "u1", checkoutKey: "checkout_request_case_123", db }), /Unsupported NOWPayments sandbox case/);
-  assert.equal(lookedUp, false);
+  let order = {
+    id: "order-retry", agencyId: "a1", provider: "NOWPAYMENTS", status: "FAILED", amountCents: 2000, currency: "USD",
+    billingPeriod: "MONTHLY", periodMonths: 1, billedCreators: 1, providerInvoiceId: null, providerInvoiceUrl: null,
+    providerStatus: "NOWPAYMENTS_REQUEST_FAILED", testMode: true, checkoutKey: "checkout_request_retry_123",
+    paidAt: null, activatedAt: null, expiresAt: null, createdAt: new Date(), updatedAt: new Date(),
+  };
+  const db = {
+    agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
+    creatorAccount: { findMany: async () => [{ id: "c1", displayName: "One", username: "one", billingProfile: null }] },
+    agency: { findUnique: async () => ({ id: "a1", name: "Agency", plan: "PRO" }) },
+    billingOrder: {
+      findUnique: async () => ({ ...order }),
+      update: async ({ data }) => { order = { ...order, ...data, updatedAt: new Date() }; return { ...order }; },
+    },
+  };
+  const previousFetch = global.fetch;
+  let providerCalls = 0;
+  global.fetch = async (_url, options) => {
+    providerCalls += 1;
+    const body = JSON.parse(options.body);
+    assert.equal("case" in body, false);
+    return { ok: true, status: 201, text: async () => JSON.stringify({ id: "invoice-retry", invoice_url: "https://nowpayments.io/payment/?iid=invoice-retry" }) };
+  };
+  try {
+    const service = loadService(db);
+    const result = await service.createCheckout({ agencyId: "a1", actorUserId: "u1", checkoutKey: order.checkoutKey, db });
+    assert.equal(providerCalls, 1);
+    assert.equal(result.order.status, "CHECKOUT_CREATED");
+    assert.equal(result.checkoutUrl, "https://nowpayments.io/payment/?iid=invoice-retry");
+    assert.equal(order.providerInvoiceId, "invoice-retry");
+  } finally { global.fetch = previousFetch; }
 }));
 
 test("an IPN event that fails transient processing stays retryable; the identical retry resumes instead of being acknowledged as done", async () => withEnv({

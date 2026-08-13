@@ -118,19 +118,21 @@ test("billing read model is owner-only, filters deleted creators and keeps FREE_
   const db = {
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO", status: "ACTIVE" }) },
     agencySubscription: { findFirst: async () => ({ id: "sub-1", status: "ACTIVE", billingMode: "FREE_INTERNAL", billingPeriod: "MONTHLY", corePricePerCreatorCents: 2000, trialEndsAt: null, graceUntil: null, currentPeriodStart: null, currentPeriodEnd: null }) },
-    creatorBillingProfile: { findMany: async () => [
-      { creatorId: "creator-1", tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false, creator: { displayName: "Alive", username: "alive", deletedAt: null } },
-      { creatorId: "creator-2", tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false, creator: { displayName: "Deleted", username: "deleted", deletedAt: new Date() } },
+    creatorAccount: { findMany: async () => [
+      { id: "creator-1", displayName: "Alive", username: "alive", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } },
+      { id: "creator-2", displayName: "No profile", username: "missing", billingProfile: null },
     ] },
-    creatorAccount: { count: async () => 1 },
   };
   const result = await service.getBillingSettings({ agencyId: "agency-1", member: { role: "OWNER" }, db });
   assert.equal(result.available, true);
   assert.equal(result.provider.internalTestMode, true);
   assert.equal(result.provider.testMode, false);
   assert.equal(result.provider.checkoutAvailable, false);
-  assert.equal(result.creators.length, 1);
-  assert.equal(result.monthlyTotalCents, 2000);
+  assert.equal(result.creators.length, 2);
+  assert.equal(result.billedCreators, 2);
+  assert.equal(result.creators[1].tier, "STARTER");
+  assert.equal(result.creators[1].lineTotalCents, 2000);
+  assert.equal(result.monthlyTotalCents, 4000);
   assert.deepEqual(await service.getBillingSettings({ agencyId: "agency-1", member: { role: "CHATTER" }, db }), { available: false, reason: "OWNER_ONLY" });
 });
 

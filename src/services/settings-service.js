@@ -293,21 +293,23 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
   return after;
 }
 
-function billingLine(profile) {
-  const core = profile.billingExcluded ? 0 : Number(profile.corePriceCents || 0);
-  const ai = !profile.billingExcluded && profile.aiChatterEnabled ? Number(profile.aiChatterPriceCents || 0) : 0;
-  const outreach = !profile.billingExcluded && profile.outreachEnabled ? Number(profile.outreachPriceCents || 0) : 0;
+function billingLine(creator, defaultCorePriceCents = 2000) {
+  const profile = creator?.billingProfile || null;
+  const excluded = profile?.billingExcluded === true;
+  const core = excluded ? 0 : Math.max(0, Number(profile?.corePriceCents ?? defaultCorePriceCents ?? 2000));
+  const ai = !excluded && profile?.aiChatterEnabled ? Math.max(0, Number(profile.aiChatterPriceCents || 0)) : 0;
+  const outreach = !excluded && profile?.outreachEnabled ? Math.max(0, Number(profile.outreachPriceCents || 0)) : 0;
   return {
-    creatorId: String(profile.creatorId),
-    creatorName: profile.creator?.displayName || profile.creator?.username || String(profile.creatorId),
-    creatorUsername: profile.creator?.username || null,
-    tier: String(profile.tier || "STARTER"),
+    creatorId: String(creator.id),
+    creatorName: creator.displayName || creator.username || String(creator.id),
+    creatorUsername: creator.username || null,
+    tier: String(profile?.tier || "STARTER"),
     corePriceCents: core,
-    aiChatterEnabled: profile.aiChatterEnabled === true,
+    aiChatterEnabled: profile?.aiChatterEnabled === true,
     aiChatterPriceCents: ai,
-    outreachEnabled: profile.outreachEnabled === true,
+    outreachEnabled: profile?.outreachEnabled === true,
     outreachPriceCents: outreach,
-    billingExcluded: profile.billingExcluded === true,
+    billingExcluded: excluded,
     lineTotalCents: core + ai + outreach,
   };
 }
@@ -315,14 +317,14 @@ function billingLine(profile) {
 async function getBillingSettings({ agencyId, member, db = null }) {
   const client = db || prisma;
   if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY" };
-  const [agency, subscription, profiles, creatorsCount, orders] = await Promise.all([
+  const [agency, subscription, creators, orders] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),
     client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
-    client.creatorBillingProfile.findMany({ where: { agencyId }, include: { creator: { select: { id: true, displayName: true, username: true, deletedAt: true } } }, orderBy: { createdAt: "asc" } }),
-    client.creatorAccount.count({ where: { agencyId, deletedAt: null } }),
+    client.creatorAccount.findMany({ where: { agencyId, deletedAt: null }, include: { billingProfile: true }, orderBy: { createdAt: "asc" } }),
     recentOrders({ agencyId, limit: 10, db: client }),
   ]);
-  const rows = profiles.filter((row) => !row.creator?.deletedAt).map(billingLine);
+  const defaultCorePriceCents = Math.max(0, Number(subscription?.corePricePerCreatorCents ?? 2000));
+  const rows = creators.map((creator) => billingLine(creator, defaultCorePriceCents));
   const monthlyTotalCents = rows.reduce((sum, row) => sum + row.lineTotalCents, 0);
   const billingMode = String(subscription?.billingMode || "MANUAL");
   return {
@@ -340,7 +342,7 @@ async function getBillingSettings({ agencyId, member, db = null }) {
       currentPeriodEnd: subscription.currentPeriodEnd,
     } : null,
     billedCreators: rows.filter((row) => !row.billingExcluded).length,
-    creatorsCount,
+    creatorsCount: rows.length,
     monthlyTotalCents,
     creators: rows,
     provider: (() => {
