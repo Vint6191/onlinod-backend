@@ -118,6 +118,14 @@ test("Schedule is relational, additive and exposes an explicit granular manage p
   assert.match(schema, /model TeamShift \{/);
   assert.match(schema, /model TeamShiftCreator \{/);
   assert.match(schema, /contentId\s+String\?/);
+  const activityBlock = schema.slice(schema.indexOf("model TeamActivityEvent {"), schema.indexOf("model TeamShift {"));
+  assert.match(activityBlock, /@@index\(\[agencyId, contentId\]\)/, "contentId index belongs on TeamActivityEvent");
+  for (const modelName of ["TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamPpvResolveJob"]) {
+    const start = schema.indexOf(`model ${modelName} {`);
+    const end = schema.indexOf("\n}", start);
+    const block = schema.slice(start, end);
+    assert.doesNotMatch(block, /@@index\(\[agencyId, contentId\]\)/, `${modelName} must not index a non-existent contentId field`);
+  }
   assert.match(access, /workspace\.manage_schedule/);
   assert.match(route, /write && !canManageSchedule/);
   assert.match(route, /actorAllowedCreatorIds: actor\.allowedCreatorIds/);

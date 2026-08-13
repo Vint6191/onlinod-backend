@@ -3673,7 +3673,6 @@ model TeamSentMessageLedger {
   @@unique([agencyId, accountId, localSeed])
   @@unique([agencyId, accountId, messageId])
   @@index([agencyId, messageId])
-  @@index([agencyId, contentId])
   @@index([agencyId, accountId, messageId])
   @@index([agencyId, creatorId, sentAt])
   @@index([agencyId, memberId, sentAt])
@@ -4064,7 +4063,6 @@ model TeamPpvPurchaseLedger {
   @@index([agencyId, financialTransactionId])
   @@index([agencyId, financialStatus, purchasedAt])
   @@index([agencyId, messageId])
-  @@index([agencyId, contentId])
   @@index([agencyId, status, purchasedAt])
   @@index([agencyId, attributedMemberId, purchasedAt])
 }
@@ -4165,7 +4163,6 @@ model TeamPpvResolveJob {
   @@unique([agencyId, purchaseId, messageId])
   @@index([agencyId, status, createdAt])
   @@index([agencyId, messageId])
-  @@index([agencyId, contentId])
 }
 
 
