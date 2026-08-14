@@ -270,10 +270,32 @@ test("NOWPayments sandbox/live configuration never leaks secrets and uses offici
   assert.equal(publicConfig.environment, "sandbox");
   assert.equal(publicConfig.configured, true);
   assert.equal(publicConfig.testMode, true);
+  assert.equal(publicConfig.sandboxSimulation, true);
+  assert.equal(publicConfig.sandboxCase, "success");
+  assert.equal(publicConfig.sandboxPayCurrency, "btc");
   assert.equal(publicConfig.liveAutoPricingEnabled, false);
   assert.equal("apiKey" in publicConfig, false);
   assert.equal("ipnSecret" in publicConfig, false);
 }));
+
+test("sandbox simulation configuration fails closed on an unsupported case or malformed pay currency", () => {
+  withEnv({
+    NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com",
+    NOWPAYMENTS_SANDBOX_CASE: "explode", NOWPAYMENTS_SANDBOX_PAY_CURRENCY: "btc",
+  }, () => {
+    const config = loadService().publicProviderConfig();
+    assert.equal(config.configured, false);
+    assert.ok(config.missingConfiguration.some((item) => item.startsWith("NOWPAYMENTS_SANDBOX_CASE")));
+  });
+  withEnv({
+    NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com",
+    NOWPAYMENTS_SANDBOX_CASE: "success", NOWPAYMENTS_SANDBOX_PAY_CURRENCY: "<script>",
+  }, () => {
+    const config = loadService().publicProviderConfig();
+    assert.equal(config.configured, false);
+    assert.ok(config.missingConfiguration.some((item) => item.startsWith("NOWPAYMENTS_SANDBOX_PAY_CURRENCY")));
+  });
+});
 
 test("public provider config exposes the explicit live auto-pricing safety gate without leaking secrets", () => withEnv({
   NOWPAYMENTS_MODE: "live", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", BILLING_LIVE_AUTO_PRICING_ENABLED: "1",
@@ -281,6 +303,9 @@ test("public provider config exposes the explicit live auto-pricing safety gate 
   const service = loadService();
   const publicConfig = service.publicProviderConfig();
   assert.equal(publicConfig.environment, "live");
+  assert.equal(publicConfig.sandboxSimulation, false);
+  assert.equal(publicConfig.sandboxCase, null);
+  assert.equal(publicConfig.sandboxPayCurrency, null);
   assert.equal(publicConfig.liveAutoPricingEnabled, true);
   assert.equal("apiKey" in publicConfig, false);
   assert.equal("ipnSecret" in publicConfig, false);

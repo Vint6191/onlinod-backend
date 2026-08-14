@@ -9,6 +9,7 @@ const { creditPaidTopUp, refundTopUp } = require("./billing-wallet-service");
 
 const PROVIDER = "NOWPAYMENTS";
 const PROCESSING_STATUSES = new Set(["waiting", "confirming", "confirmed", "sending"]);
+const SANDBOX_CASES = new Set(["success", "common", "failed", "partially_paid"]);
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -73,7 +74,11 @@ function providerConfig() {
   const publicUrlValid = isPublicHttpsUrl(publicBaseUrl);
   const timeoutRaw = Number(process.env.NOWPAYMENTS_TIMEOUT_MS || 15_000);
   const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(3_000, Math.min(60_000, timeoutRaw)) : 15_000;
-  const configured = (sandbox || live) && !!apiKey && !!ipnSecret && apiBaseValid && publicUrlValid;
+  const sandboxCase = clean(process.env.NOWPAYMENTS_SANDBOX_CASE || "success", 40).toLowerCase();
+  const sandboxCaseValid = !sandbox || SANDBOX_CASES.has(sandboxCase);
+  const sandboxPayCurrency = clean(process.env.NOWPAYMENTS_SANDBOX_PAY_CURRENCY || "btc", 40).toLowerCase();
+  const sandboxPayCurrencyValid = !sandbox || /^[a-z0-9_-]{2,40}$/.test(sandboxPayCurrency);
+  const configured = (sandbox || live) && !!apiKey && !!ipnSecret && apiBaseValid && publicUrlValid && sandboxCaseValid && sandboxPayCurrencyValid;
   return {
     provider: PROVIDER,
     environment,
@@ -88,6 +93,10 @@ function providerConfig() {
     configured,
     feePaidByUser: boolEnv("NOWPAYMENTS_FEE_PAID_BY_USER", false),
     sandboxActivationEnabled: sandbox && boolEnv("NOWPAYMENTS_SANDBOX_ACTIVATE", process.env.NODE_ENV !== "production"),
+    sandboxCase,
+    sandboxCaseValid,
+    sandboxPayCurrency,
+    sandboxPayCurrencyValid,
     timeoutMs,
   };
 }
@@ -100,6 +109,8 @@ function publicProviderConfig() {
   if ((cfg.sandbox || cfg.live) && !cfg.apiBaseValid) missing.push("NOWPAYMENTS_API_BASE (use the official API base for the selected mode)");
   if (!cfg.publicBaseUrl || !cfg.publicUrlValid) missing.push("PUBLIC_BASE_URL (public HTTPS URL)");
   if (!cfg.sandbox && !cfg.live) missing.push("NOWPAYMENTS_MODE (sandbox or live)");
+  if (cfg.sandbox && !cfg.sandboxCaseValid) missing.push("NOWPAYMENTS_SANDBOX_CASE (success, common, failed or partially_paid)");
+  if (cfg.sandbox && !cfg.sandboxPayCurrencyValid) missing.push("NOWPAYMENTS_SANDBOX_PAY_CURRENCY (valid sandbox currency code)");
   return {
     providerKey: PROVIDER,
     environment: cfg.environment,
@@ -108,6 +119,9 @@ function publicProviderConfig() {
     testMode: cfg.sandbox,
     feePaidByUser: cfg.feePaidByUser,
     sandboxActivationEnabled: cfg.sandboxActivationEnabled,
+    sandboxSimulation: cfg.sandbox,
+    sandboxCase: cfg.sandbox ? cfg.sandboxCase : null,
+    sandboxPayCurrency: cfg.sandbox ? cfg.sandboxPayCurrency : null,
     liveAutoPricingEnabled: boolEnv("BILLING_LIVE_AUTO_PRICING_ENABLED", false),
     missingConfiguration: missing,
   };
@@ -301,13 +315,48 @@ function checkoutKeyWhere(agencyId, testMode, checkoutKey) {
 function replayExistingCheckout(order) {
   if (!order) return null;
   const checkoutUrl = clean(order.providerInvoiceUrl, 2000);
-  if (checkoutUrl) return { order: publicOrder(order), checkoutUrl, replayed: true };
+  if (checkoutUrl) return { order: publicOrder(order), checkoutMode: "hosted", checkoutUrl, sandboxSimulation: null, replayed: true };
   const err = new Error(
     order.status === "CREATED"
       ? "The checkout request with this idempotency key is still in progress"
       : "The previous checkout request with this idempotency key did not produce a reusable invoice",
   );
   err.code = order.status === "CREATED" ? "BILLING_CHECKOUT_REQUEST_IN_PROGRESS" : "BILLING_CHECKOUT_PREVIOUS_ATTEMPT_FAILED";
+  err.status = 409;
+  err.permanent = true;
+  throw err;
+}
+
+async function replayExistingSandboxTopUp(order, client, cfg) {
+  if (!order) return null;
+  const attempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
+  if (attempt?.providerPaymentId) {
+    return {
+      order: publicOrder(order),
+      checkoutMode: "sandbox_simulation",
+      checkoutUrl: null,
+      sandboxSimulation: {
+        providerPaymentId: String(attempt.providerPaymentId),
+        providerStatus: attempt.providerStatus || order.providerStatus || null,
+        case: cfg.sandboxCase,
+        payCurrency: attempt.payCurrency || cfg.sandboxPayCurrency,
+      },
+      replayed: true,
+    };
+  }
+  const legacyHosted = !!clean(order.providerInvoiceUrl, 2000);
+  const err = new Error(
+    legacyHosted
+      ? "This is a legacy hosted sandbox invoice from an older ONLINOD build; start a fresh sandbox top-up"
+      : order.status === "CREATED"
+        ? "The sandbox payment request with this idempotency key is still in progress"
+        : "The previous sandbox payment request did not produce a reusable payment",
+  );
+  err.code = legacyHosted
+    ? "BILLING_SANDBOX_LEGACY_CHECKOUT_NOT_REUSABLE"
+    : order.status === "CREATED"
+      ? "BILLING_CHECKOUT_REQUEST_IN_PROGRESS"
+      : "BILLING_CHECKOUT_PREVIOUS_ATTEMPT_FAILED";
   err.status = 409;
   err.permanent = true;
   throw err;
@@ -588,7 +637,9 @@ async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: r
   const existing = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
   assertCheckoutRequestBinding(existing, requestHash);
   const retryFailedSandboxOrder = !!(existing && cfg.sandbox && existing.status === "FAILED" && !existing.providerInvoiceId && !existing.providerInvoiceUrl);
-  if (existing && !retryFailedSandboxOrder) return replayExistingCheckout(existing);
+  if (existing && !retryFailedSandboxOrder) {
+    return cfg.sandbox ? replayExistingSandboxTopUp(existing, client, cfg) : replayExistingCheckout(existing);
+  }
 
   const [agency, subscription] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true } }),
@@ -631,15 +682,74 @@ async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: r
     const raced = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
     if (!raced) throw err;
     assertCheckoutRequestBinding(raced, requestHash);
-    return replayExistingCheckout(raced);
+    return cfg.sandbox ? replayExistingSandboxTopUp(raced, client, cfg) : replayExistingCheckout(raced);
   }
 
   const priceAmount = Number((amountCents / 100).toFixed(2));
+  const orderDescription = `ONLINOD balance top-up · $${priceAmount.toFixed(2)}`;
+
+  if (cfg.sandbox) {
+    const body = {
+      price_amount: priceAmount,
+      price_currency: "usd",
+      pay_currency: cfg.sandboxPayCurrency,
+      ipn_callback_url: `${cfg.publicBaseUrl}/api/billing/nowpayments/ipn`,
+      order_id: order.id,
+      order_description: orderDescription,
+      case: cfg.sandboxCase,
+    };
+    try {
+      const payment = await nowPaymentsRequest("/payment", { method: "POST", body });
+      const providerPaymentId = clean(payment.payment_id ?? payment.id, 180);
+      if (!providerPaymentId) {
+        const err = new Error("NOWPayments sandbox payment response did not contain payment_id");
+        err.code = "NOWPAYMENTS_SANDBOX_PAYMENT_INVALID";
+        err.status = 502;
+        throw err;
+      }
+      const returnedOrderId = clean(payment.order_id, 180);
+      if (returnedOrderId && returnedOrderId !== String(order.id)) {
+        throw permanentBindingError("NOWPayments sandbox create-payment response returned a different order_id", "BILLING_PROVIDER_ORDER_MISMATCH");
+      }
+      // The create-payment request itself is already bound to this order. Some
+      // provider variants can omit order_id in the immediate response even
+      // though subsequent status/IPN payloads include it. Preserve the raw
+      // response fields but supply the known request binding for centralized
+      // validation/persistence; never accept a conflicting provider order_id.
+      const boundPayment = returnedOrderId ? payment : { ...payment, order_id: order.id };
+      const applied = await applyProviderPayment(boundPayment, { signature: null, signatureVerified: false, source: "SANDBOX_CREATE_PAYMENT", db: client });
+      const updated = applied.order || publicOrder(await client.billingOrder.findUnique({ where: { id: order.id } }));
+      await audit({
+        agencyId,
+        actorUserId,
+        action: "billing.wallet_top_up_sandbox_simulation_started",
+        targetType: "billing_order",
+        targetId: order.id,
+        metadata: { provider: PROVIDER, testMode: true, amountCents, currency: "USD", sandboxCase: cfg.sandboxCase, payCurrency: cfg.sandboxPayCurrency, providerPaymentId },
+        db: client,
+      }).catch(() => undefined);
+      return {
+        order: updated || publicOrder(order),
+        checkoutMode: "sandbox_simulation",
+        checkoutUrl: null,
+        sandboxSimulation: {
+          providerPaymentId,
+          providerStatus: normalizeStatus(payment.payment_status || payment.status) || null,
+          case: cfg.sandboxCase,
+          payCurrency: clean(payment.pay_currency, 80) || cfg.sandboxPayCurrency,
+        },
+      };
+    } catch (err) {
+      await client.billingOrder.update({ where: { id: order.id }, data: { status: "FAILED", providerStatus: clean(err?.code || "CREATE_SANDBOX_PAYMENT_FAILED", 80) } }).catch(() => undefined);
+      throw err;
+    }
+  }
+
   const body = {
     price_amount: priceAmount,
     price_currency: "usd",
     order_id: order.id,
-    order_description: `ONLINOD balance top-up · $${priceAmount.toFixed(2)}`,
+    order_description: orderDescription,
     ...invoiceUrls(order.id, cfg),
     is_fee_paid_by_user: cfg.feePaidByUser,
   };
@@ -657,8 +767,8 @@ async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: r
       where: { id: order.id },
       data: { status: "CHECKOUT_CREATED", providerInvoiceId, providerInvoiceUrl, providerStatus: clean(invoice.payment_status || invoice.status, 80) || "waiting" },
     });
-    await audit({ agencyId, actorUserId, action: "billing.wallet_top_up_checkout_created", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, testMode: cfg.sandbox, amountCents, currency: "USD" }, db: client }).catch(() => undefined);
-    return { order: publicOrder(updated), checkoutUrl: providerInvoiceUrl };
+    await audit({ agencyId, actorUserId, action: "billing.wallet_top_up_checkout_created", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, testMode: false, amountCents, currency: "USD" }, db: client }).catch(() => undefined);
+    return { order: publicOrder(updated), checkoutMode: "hosted", checkoutUrl: providerInvoiceUrl, sandboxSimulation: null };
   } catch (err) {
     await client.billingOrder.update({ where: { id: order.id }, data: { status: "FAILED", providerStatus: clean(err?.code || "CREATE_INVOICE_FAILED", 80) } }).catch(() => undefined);
     throw err;
@@ -678,6 +788,9 @@ function verifyIpnSignature(payload, signature) {
 function paymentAttemptData(payload) {
   return {
     providerStatus: clean(payload.payment_status || payload.status, 80) || null,
+    payAddress: clean(payload.pay_address, 500) || null,
+    payinExtraId: clean(payload.payin_extra_id, 500) || null,
+    purchaseId: clean(payload.purchase_id, 180) || null,
     priceAmount: decimalString(payload.price_amount),
     priceCurrency: clean(payload.price_currency, 40) || null,
     payAmount: decimalString(payload.pay_amount),

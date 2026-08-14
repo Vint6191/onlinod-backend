@@ -578,14 +578,24 @@ test("wallet top-up accepts arbitrary whole cents inside provider-safe bounds", 
   for (const amount of [0, 99, 10_000_001, 12.5, "nope"]) assert.throws(() => svc.normalizeTopUpAmountCents(amount), (e)=>e.code==="BILLING_TOP_UP_AMOUNT_INVALID");
 });
 
-test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines and amount-bound provider invoice", async () => {
+test("wallet top-up sandbox uses NOWPayments payment simulation instead of a hosted invoice", async () => {
   const previous = {};
-  for (const [key,value] of Object.entries({ NOWPAYMENTS_MODE:"sandbox", NOWPAYMENTS_API_KEY:"test-key", NOWPAYMENTS_IPN_SECRET:"test-secret", PUBLIC_BASE_URL:"https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE:"true" })) { previous[key]=process.env[key]; process.env[key]=value; }
+  for (const [key,value] of Object.entries({ NOWPAYMENTS_MODE:"sandbox", NOWPAYMENTS_API_KEY:"test-key", NOWPAYMENTS_IPN_SECRET:"test-secret", PUBLIC_BASE_URL:"https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE:"true", NOWPAYMENTS_SANDBOX_CASE:"success", NOWPAYMENTS_SANDBOX_PAY_CURRENCY:"btc" })) { previous[key]=process.env[key]; process.env[key]=value; }
   const oldFetch=global.fetch;
   let providerBody=null;
-  global.fetch=async (_url, options) => { providerBody=JSON.parse(options.body); return { ok:true, status:200, text:async()=>JSON.stringify({ invoice_id:"inv-top-1", invoice_url:"https://nowpayments.io/payment/top-1" }) }; };
+  let providerUrl=null;
+  global.fetch=async (url, options) => {
+    providerUrl=String(url);
+    providerBody=JSON.parse(options.body);
+    return { ok:true, status:201, text:async()=>JSON.stringify({
+      payment_id:"pay-top-1", payment_status:"waiting", pay_address:"sandbox-address", price_amount:61.37, price_currency:"usd",
+      pay_amount:0.001, pay_currency:"btc", purchase_id:"purchase-top-1"
+    }) };
+  };
   try {
     let order=null;
+    let attempt=null;
+    let event=null;
     const db={
       $transaction: async (fn)=>fn(db),
       agency:{ findUnique:async()=>({id:"agency-1",name:"Agency",plan:"PRO"}) },
@@ -597,6 +607,20 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
         },
         create:async ({data}) => { order={id:"order-top-1",providerInvoiceId:null,providerInvoiceUrl:null,providerStatus:null,paidAt:null,activatedAt:null,expiresAt:null,createdAt:new Date(),updatedAt:new Date(),lines:[],...data}; return {...order}; },
         update:async ({where,data}) => { assert.equal(where.id,"order-top-1"); order={...order,...data,updatedAt:new Date()}; return {...order}; },
+        updateMany:async ({where,data}) => {
+          if (!order || where.id!==order.id || where.status!==order.status) return {count:0};
+          order={...order,...data,updatedAt:new Date()}; return {count:1};
+        },
+      },
+      billingPaymentAttempt:{
+        findUnique:async()=>attempt ? {...attempt} : null,
+        findFirst:async()=>attempt ? {...attempt} : null,
+        upsert:async ({create,update}) => { attempt=attempt ? {...attempt,...update,updatedAt:new Date()} : {id:"attempt-1",createdAt:new Date(),updatedAt:new Date(),...create}; return {...attempt}; },
+      },
+      billingProviderEvent:{
+        create:async ({data}) => { event={id:"event-1",processedAt:null,processingError:null,paymentAttemptId:null,...data}; return {...event}; },
+        findUnique:async()=>event ? {...event} : null,
+        update:async ({where,data}) => { assert.equal(where.id,"event-1"); event={...event,...data}; return {...event}; },
       },
     };
     const svc=loadNowPaymentsService(db);
@@ -606,17 +630,75 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
     assert.equal(result.order.billedCreators,0);
     assert.deepEqual(result.order.lines,[]);
     assert.equal(result.order.periodMonths,1);
-    assert.equal(result.checkoutUrl,"https://nowpayments.io/payment/top-1");
+    assert.equal(result.checkoutMode,"sandbox_simulation");
+    assert.equal(result.checkoutUrl,null);
+    assert.equal(result.sandboxSimulation.providerPaymentId,"pay-top-1");
+    assert.equal(result.sandboxSimulation.case,"success");
+    assert.equal(result.sandboxSimulation.payCurrency,"btc");
+    assert.equal(providerUrl,"https://api-sandbox.nowpayments.io/v1/payment");
     assert.equal(providerBody.price_amount,61.37);
     assert.equal(providerBody.price_currency,"usd");
+    assert.equal(providerBody.pay_currency,"btc");
+    assert.equal(providerBody.case,"success");
     assert.equal(providerBody.order_id,"order-top-1");
-    assert.ok(!("case" in providerBody));
+    assert.equal(providerBody.ipn_callback_url,"https://api.example.com/api/billing/nowpayments/ipn");
+    assert.equal("success_url" in providerBody,false);
+    assert.equal("cancel_url" in providerBody,false);
+    // Immediate sandbox responses are allowed to omit order_id; the backend
+    // binds the response to the order from its own authenticated request.
+    assert.equal(attempt.orderId,"order-top-1");
+    assert.equal(attempt.providerPaymentId,"pay-top-1");
+    assert.equal(attempt.payAddress,"sandbox-address");
+    assert.equal(order.status,"PROCESSING");
+    assert.equal(order.providerInvoiceUrl,null);
   } finally {
     global.fetch=oldFetch;
     for (const [key,value] of Object.entries(previous)) { if (value===undefined) delete process.env[key]; else process.env[key]=value; }
   }
 });
 
+
+
+test("wallet top-up live mode keeps the hosted invoice flow and never sends sandbox case/pay_currency", async () => {
+  const previous = {};
+  for (const [key,value] of Object.entries({ NOWPAYMENTS_MODE:"live", NOWPAYMENTS_API_KEY:"live-key", NOWPAYMENTS_IPN_SECRET:"live-secret", PUBLIC_BASE_URL:"https://api.example.com" })) { previous[key]=process.env[key]; process.env[key]=value; }
+  const oldFetch=global.fetch;
+  let providerBody=null;
+  let providerUrl=null;
+  global.fetch=async (url, options) => { providerUrl=String(url); providerBody=JSON.parse(options.body); return { ok:true, status:201, text:async()=>JSON.stringify({ invoice_id:"inv-live-1", invoice_url:"https://nowpayments.io/payment/?iid=inv-live-1" }) }; };
+  try {
+    let order=null;
+    const db={
+      agency:{ findUnique:async()=>({id:"agency-1",name:"Agency",plan:"PRO"}) },
+      agencySubscription:{ findFirst:async()=>({billingMode:"MANUAL"}) },
+      billingOrder:{
+        findUnique:async ({where}) => {
+          if (where.id) return order?.id===where.id ? {...order} : null;
+          return order && where.agencyId_provider_testMode_checkoutKey && order.checkoutKey===where.agencyId_provider_testMode_checkoutKey.checkoutKey ? {...order} : null;
+        },
+        create:async ({data}) => { order={id:"order-live-1",providerInvoiceId:null,providerInvoiceUrl:null,providerStatus:null,paidAt:null,activatedAt:null,expiresAt:null,createdAt:new Date(),updatedAt:new Date(),lines:[],...data}; return {...order}; },
+        update:async ({where,data}) => { assert.equal(where.id,"order-live-1"); order={...order,...data,updatedAt:new Date()}; return {...order}; },
+      },
+    };
+    const svc=loadNowPaymentsService(db);
+    const result=await svc.createWalletTopUpCheckout({agencyId:"agency-1",actorUserId:"owner-1",checkoutKey:"123e4567-e89b-42d3-a456-426614174001",amountCents:2500,db});
+    assert.equal(result.checkoutMode,"hosted");
+    assert.equal(result.checkoutUrl,"https://nowpayments.io/payment/?iid=inv-live-1");
+    assert.equal(result.sandboxSimulation,null);
+    assert.equal(providerUrl,"https://api.nowpayments.io/v1/invoice");
+    assert.equal(providerBody.price_amount,25);
+    assert.equal(providerBody.price_currency,"usd");
+    assert.equal(providerBody.order_id,"order-live-1");
+    assert.equal(providerBody.ipn_callback_url,"https://api.example.com/api/billing/nowpayments/ipn");
+    assert.equal(providerBody.success_url,"https://api.example.com/api/billing/checkout/success?order_id=order-live-1");
+    assert.equal(providerBody.cancel_url,"https://api.example.com/api/billing/checkout/cancel?order_id=order-live-1");
+    assert.equal("case" in providerBody,false);
+    assert.equal("pay_currency" in providerBody,false);
+  } finally {
+    global.fetch=oldFetch;
+    for (const [key,value] of Object.entries(previous)) { if (value===undefined) delete process.env[key]; else process.env[key]=value; }
+  }
+});
 
 test("a stale failed renewal cannot overwrite error state after another worker already renewed the creator", async () => {
   const now = new Date("2026-08-14T12:00:00Z");
