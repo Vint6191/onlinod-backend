@@ -9,6 +9,8 @@ const { creditPaidTopUp, refundTopUp } = require("./billing-wallet-service");
 
 const PROVIDER = "NOWPAYMENTS";
 const PROCESSING_STATUSES = new Set(["waiting", "confirming", "confirmed", "sending"]);
+const PAYMENT_CURRENCY_CACHE_TTL_MS = 5 * 60 * 1000;
+const paymentCurrencyCache = new Map();
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -105,6 +107,7 @@ function publicProviderConfig() {
     environment: cfg.environment,
     configured: cfg.configured,
     checkoutAvailable: cfg.configured,
+    nativePaymentAvailable: cfg.configured,
     testMode: cfg.sandbox,
     feePaidByUser: cfg.feePaidByUser,
     sandboxActivationEnabled: cfg.sandboxActivationEnabled,
@@ -221,6 +224,28 @@ function validateProviderPaymentForOrder(order, payload, { requirePrice = false 
     if (!Number.isSafeInteger(cents) || cents !== Number(order.amountCents)) {
       const err = new Error("NOWPayments payment amount does not match the ONLINOD billing order");
       err.code = "BILLING_PROVIDER_AMOUNT_MISMATCH";
+      err.status = 409;
+      err.permanent = true;
+      throw err;
+    }
+  }
+
+  const snapshot = order?.pricingSnapshot && typeof order.pricingSnapshot === "object" && !Array.isArray(order.pricingSnapshot) ? order.pricingSnapshot : null;
+  const expectedPayCurrency = String(order?.purpose || "") === "WALLET_TOP_UP" && snapshot?.flow === "NATIVE_PAYMENT"
+    ? clean(snapshot.payCurrency, 80).toLowerCase()
+    : "";
+  if (expectedPayCurrency && requirePrice) {
+    const providerPayCurrency = clean(payload?.pay_currency, 80).toLowerCase();
+    if (!providerPayCurrency) {
+      const err = new Error("NOWPayments final native payment is missing pay_currency");
+      err.code = "BILLING_PROVIDER_PAY_CURRENCY_MISSING";
+      err.status = 409;
+      err.permanent = true;
+      throw err;
+    }
+    if (providerPayCurrency !== expectedPayCurrency) {
+      const err = new Error("NOWPayments final payment asset/network does not match the native top-up order");
+      err.code = "BILLING_PROVIDER_PAY_CURRENCY_MISMATCH";
       err.status = 409;
       err.permanent = true;
       throw err;
@@ -573,22 +598,134 @@ function normalizeTopUpAmountCents(value) {
   return amount;
 }
 
-async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutKey, amountCents: rawAmountCents, db = null }) {
-  const client = db || prisma;
+function normalizePayCurrency(value) {
+  const currency = clean(value, 80).toLowerCase();
+  if (!/^[a-z0-9][a-z0-9_-]{1,79}$/.test(currency)) {
+    const err = new Error("Choose a valid cryptocurrency for this top-up");
+    err.code = "BILLING_PAY_CURRENCY_INVALID";
+    err.status = 400;
+    err.permanent = true;
+    throw err;
+  }
+  return currency;
+}
+
+function normalizeCurrencyList(payload) {
+  const raw = Array.isArray(payload) ? payload : Array.isArray(payload?.currencies) ? payload.currencies : [];
+  return [...new Set(raw.map((value) => clean(value, 80).toLowerCase()).filter((value) => /^[a-z0-9][a-z0-9_-]{1,79}$/.test(value)))].sort();
+}
+
+async function availablePaymentCurrencies({ force = false } = {}) {
   const cfg = providerConfig();
   if (!cfg.configured) {
-    const err = new Error("NOWPayments checkout is not configured on the backend");
+    const err = new Error("NOWPayments is not configured on the backend");
     err.code = "NOWPAYMENTS_NOT_CONFIGURED";
     err.status = 503;
     throw err;
   }
+  const key = cfg.sandbox ? "sandbox" : "live";
+  const cached = paymentCurrencyCache.get(key);
+  if (!force && cached && Date.now() - cached.fetchedAt < PAYMENT_CURRENCY_CACHE_TTL_MS && cached.currencies.length) {
+    return { currencies: [...cached.currencies], fetchedAt: new Date(cached.fetchedAt).toISOString() };
+  }
+  const payload = await nowPaymentsRequest("/currencies");
+  const currencies = normalizeCurrencyList(payload);
+  if (!currencies.length) {
+    const err = new Error("NOWPayments did not return any available payment currencies");
+    err.code = "NOWPAYMENTS_CURRENCIES_EMPTY";
+    err.status = 502;
+    throw err;
+  }
+  const fetchedAt = Date.now();
+  paymentCurrencyCache.set(key, { fetchedAt, currencies });
+  return { currencies: [...currencies], fetchedAt: new Date(fetchedAt).toISOString() };
+}
+
+async function assertAvailablePayCurrency(payCurrency) {
+  const result = await availablePaymentCurrencies();
+  if (!result.currencies.includes(payCurrency)) {
+    const err = new Error(`NOWPayments does not currently expose ${payCurrency.toUpperCase()} as an available payment currency`);
+    err.code = "BILLING_PAY_CURRENCY_UNAVAILABLE";
+    err.status = 409;
+    err.permanent = true;
+    throw err;
+  }
+  return result;
+}
+
+function publicPaymentAttempt(row) {
+  if (!row) return null;
+  const text = (value) => value === null || value === undefined ? null : String(value);
+  return {
+    providerPaymentId: String(row.providerPaymentId || ""),
+    providerStatus: row.providerStatus || null,
+    payAddress: row.payAddress || null,
+    payinExtraId: row.payinExtraId || null,
+    purchaseId: row.purchaseId || null,
+    priceAmount: text(row.priceAmount),
+    priceCurrency: row.priceCurrency || null,
+    payAmount: text(row.payAmount),
+    payCurrency: row.payCurrency || null,
+    actuallyPaid: text(row.actuallyPaid),
+    outcomeAmount: text(row.outcomeAmount),
+    outcomeCurrency: row.outcomeCurrency || null,
+    createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : null,
+    updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : null,
+  };
+}
+
+async function latestPaymentAttempt(client, orderId) {
+  if (!client?.billingPaymentAttempt?.findFirst) return null;
+  return client.billingPaymentAttempt.findFirst({ where: { orderId }, orderBy: { updatedAt: "desc" } });
+}
+
+async function replayExistingWalletTopUpPayment(client, order) {
+  const attempt = await latestPaymentAttempt(client, order.id);
+  if (attempt?.providerPaymentId && attempt?.payAddress && attempt?.payAmount && attempt?.payCurrency) {
+    return { order: publicOrder({ ...order, paymentAttempts: [attempt] }), payment: publicPaymentAttempt(attempt), replayed: true };
+  }
+  const err = new Error(order.status === "CREATED"
+    ? "This top-up payment is still being created. Refresh Payment history before trying again."
+    : "This top-up request has no reusable native payment details. Start a fresh top-up.");
+  err.code = order.status === "CREATED" ? "BILLING_NATIVE_PAYMENT_CREATION_IN_PROGRESS" : "BILLING_NATIVE_PAYMENT_NOT_REUSABLE";
+  err.status = 409;
+  err.permanent = true;
+  throw err;
+}
+
+async function createWalletTopUpCheckout() {
+  const err = new Error("Hosted wallet top-up checkout is retired. Use the V14.1 native payment flow.");
+  err.code = "BILLING_HOSTED_WALLET_TOP_UP_RETIRED";
+  err.status = 410;
+  err.permanent = true;
+  throw err;
+}
+
+async function createWalletTopUpPayment({ agencyId, actorUserId, checkoutKey: rawCheckoutKey, amountCents: rawAmountCents, payCurrency: rawPayCurrency, flow = null, db = null }) {
+  const client = db || prisma;
+  const cfg = providerConfig();
+  if (!cfg.configured) {
+    const err = new Error("NOWPayments is not configured on the backend");
+    err.code = "NOWPAYMENTS_NOT_CONFIGURED";
+    err.status = 503;
+    throw err;
+  }
+  if (String(flow || "").toLowerCase() !== "native") {
+    const err = new Error("This desktop build uses the retired hosted checkout flow. Update ONLINOD before creating another top-up.");
+    err.code = "BILLING_NATIVE_PAYMENT_CLIENT_REQUIRED";
+    err.status = 426;
+    err.permanent = true;
+    throw err;
+  }
   const checkoutKey = normalizeCheckoutKey(rawCheckoutKey);
   const amountCents = normalizeTopUpAmountCents(rawAmountCents);
-  const requestHash = sha256(stableJson({ purpose: "WALLET_TOP_UP", amountCents, currency: "USD" }));
+  const payCurrency = normalizePayCurrency(rawPayCurrency);
+  const requestHash = sha256(stableJson({ purpose: "WALLET_TOP_UP", flow: "NATIVE_PAYMENT", amountCents, currency: "USD", payCurrency }));
   const existing = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
   assertCheckoutRequestBinding(existing, requestHash);
-  const retryFailedSandboxOrder = !!(existing && cfg.sandbox && existing.status === "FAILED" && !existing.providerInvoiceId && !existing.providerInvoiceUrl);
-  if (existing && !retryFailedSandboxOrder) return replayExistingCheckout(existing);
+  const existingAttempt = existing ? await latestPaymentAttempt(client, existing.id) : null;
+  const retryFailedSandboxOrder = !!(existing && cfg.sandbox && existing.status === "FAILED" && !existingAttempt?.providerPaymentId && !existing.providerInvoiceId && !existing.providerInvoiceUrl);
+  if (existing && !retryFailedSandboxOrder) return replayExistingWalletTopUpPayment(client, existing);
 
   const [agency, subscription] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true } }),
@@ -601,13 +738,18 @@ async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: r
     throw err;
   }
   if (subscription?.billingMode === "FREE_INTERNAL" && cfg.live) {
-    const err = new Error("This workspace is in FREE_INTERNAL mode; live checkout is disabled to prevent accidental charges");
+    const err = new Error("This workspace is in FREE_INTERNAL mode; live top-up is disabled to prevent accidental charges");
     err.code = "BILLING_FREE_INTERNAL_LIVE_CHECKOUT_DISABLED";
     err.status = 409;
     throw err;
   }
 
-  const snapshot = { purpose: "WALLET_TOP_UP", agencyName: agency.name, plan: agency.plan, amountCents, currency: "USD" };
+  // Only contact NOWPayments when a brand-new remote payment must be created.
+  // Replaying an existing payment must remain possible during provider currency-list
+  // outages, and FREE_INTERNAL live workspaces must never contact the provider.
+  await assertAvailablePayCurrency(payCurrency);
+
+  const snapshot = { purpose: "WALLET_TOP_UP", flow: "NATIVE_PAYMENT", agencyName: agency.name, plan: agency.plan, amountCents, currency: "USD", payCurrency };
   let order;
   try {
     order = retryFailedSandboxOrder
@@ -631,36 +773,69 @@ async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: r
     const raced = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
     if (!raced) throw err;
     assertCheckoutRequestBinding(raced, requestHash);
-    return replayExistingCheckout(raced);
+    return replayExistingWalletTopUpPayment(client, raced);
   }
 
   const priceAmount = Number((amountCents / 100).toFixed(2));
   const body = {
     price_amount: priceAmount,
     price_currency: "usd",
+    pay_currency: payCurrency,
     order_id: order.id,
     order_description: `ONLINOD balance top-up · $${priceAmount.toFixed(2)}`,
-    ...invoiceUrls(order.id, cfg),
+    ipn_callback_url: `${cfg.publicBaseUrl}/api/billing/nowpayments/ipn`,
     is_fee_paid_by_user: cfg.feePaidByUser,
   };
+
+  let payment;
   try {
-    const invoice = await nowPaymentsRequest("/invoice", { method: "POST", body });
-    const providerInvoiceId = clean(invoice.invoice_id ?? invoice.id, 180);
-    const providerInvoiceUrl = clean(invoice.invoice_url, 2000);
-    if (!providerInvoiceId || !providerInvoiceUrl) {
-      const err = new Error("NOWPayments invoice response did not contain invoice_id/invoice_url");
-      err.code = "NOWPAYMENTS_INVOICE_INVALID";
+    payment = await nowPaymentsRequest("/payment", { method: "POST", body });
+    const providerPaymentId = clean(payment.payment_id ?? payment.id, 180);
+    const payAddress = clean(payment.pay_address, 500);
+    const payAmount = decimalString(payment.pay_amount);
+    const returnedPayCurrency = clean(payment.pay_currency, 80).toLowerCase();
+    if (!providerPaymentId || !payAddress || !payAmount || !returnedPayCurrency) {
+      const err = new Error("NOWPayments payment response did not contain payment_id/pay_address/pay_amount/pay_currency");
+      err.code = "NOWPAYMENTS_PAYMENT_INVALID";
       err.status = 502;
       throw err;
     }
-    const updated = await client.billingOrder.update({
-      where: { id: order.id },
-      data: { status: "CHECKOUT_CREATED", providerInvoiceId, providerInvoiceUrl, providerStatus: clean(invoice.payment_status || invoice.status, 80) || "waiting" },
+    if (returnedPayCurrency !== payCurrency) {
+      const err = new Error("NOWPayments returned a different payment currency than requested");
+      err.code = "NOWPAYMENTS_PAYMENT_CURRENCY_MISMATCH";
+      err.status = 502;
+      throw err;
+    }
+    validateProviderPaymentForOrder(order, payment, { requirePrice: true });
+    const providerStatus = normalizeStatus(payment.payment_status || payment.status) || "waiting";
+    const mapped = orderStatusForProviderStatus(providerStatus);
+    // A synchronous create-payment response is used to render payment details,
+    // but wallet credit remains authoritative through signed IPN/reconciliation.
+    // Even an unexpected `finished` create response stays PROCESSING until that
+    // verified provider-status path runs.
+    const initialStatus = mapped === "FAILED" || mapped === "EXPIRED" ? mapped : mapped === "PARTIALLY_PAID" ? "PARTIALLY_PAID" : "PROCESSING";
+    const persisted = await runTransaction(client, async (tx) => {
+      const attempt = await tx.billingPaymentAttempt.upsert({
+        where: paymentAttemptUniqueWhere(providerPaymentId, cfg.sandbox),
+        create: { orderId: order.id, provider: PROVIDER, testMode: cfg.sandbox, providerPaymentId, ...paymentAttemptData(payment) },
+        update: paymentAttemptUpdateData(payment),
+      });
+      const updated = await tx.billingOrder.update({
+        where: { id: order.id },
+        data: { status: initialStatus, providerStatus, providerInvoiceId: null, providerInvoiceUrl: null },
+      });
+      return { order: updated, attempt };
     });
-    await audit({ agencyId, actorUserId, action: "billing.wallet_top_up_checkout_created", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, testMode: cfg.sandbox, amountCents, currency: "USD" }, db: client }).catch(() => undefined);
-    return { order: publicOrder(updated), checkoutUrl: providerInvoiceUrl };
+    await audit({ agencyId, actorUserId, action: "billing.wallet_top_up_payment_created", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, testMode: cfg.sandbox, amountCents, currency: "USD", payCurrency, providerPaymentId }, db: client }).catch(() => undefined);
+    return { order: publicOrder({ ...persisted.order, paymentAttempts: [persisted.attempt] }), payment: publicPaymentAttempt(persisted.attempt) };
   } catch (err) {
-    await client.billingOrder.update({ where: { id: order.id }, data: { status: "FAILED", providerStatus: clean(err?.code || "CREATE_INVOICE_FAILED", 80) } }).catch(() => undefined);
+    // Only mark the local order failed when the provider request itself did not
+    // yield a usable payment id. If a remote payment may exist but persistence
+    // failed, keep CREATED so retries cannot accidentally create a duplicate.
+    const remoteId = clean(payment?.payment_id ?? payment?.id, 180);
+    if (!remoteId) {
+      await client.billingOrder.update({ where: { id: order.id }, data: { status: "FAILED", providerStatus: clean(err?.code || "CREATE_PAYMENT_FAILED", 80) } }).catch(() => undefined);
+    }
     throw err;
   }
 }
@@ -678,6 +853,9 @@ function verifyIpnSignature(payload, signature) {
 function paymentAttemptData(payload) {
   return {
     providerStatus: clean(payload.payment_status || payload.status, 80) || null,
+    payAddress: clean(payload.pay_address, 500) || null,
+    payinExtraId: clean(payload.payin_extra_id, 500) || null,
+    purchaseId: clean(payload.purchase_id, 180) || null,
     priceAmount: decimalString(payload.price_amount),
     priceCurrency: clean(payload.price_currency, 40) || null,
     payAmount: decimalString(payload.pay_amount),
@@ -686,6 +864,24 @@ function paymentAttemptData(payload) {
     outcomeAmount: decimalString(payload.outcome_amount ?? payload.outcome_price),
     outcomeCurrency: clean(payload.outcome_currency, 80) || null,
   };
+}
+
+function paymentAttemptUpdateData(payload) {
+  const full = paymentAttemptData(payload);
+  const update = {};
+  const has = (value) => value !== undefined && value !== null && value !== "";
+  if (has(payload.payment_status) || has(payload.status)) update.providerStatus = full.providerStatus;
+  if (has(payload.pay_address)) update.payAddress = full.payAddress;
+  if (has(payload.payin_extra_id)) update.payinExtraId = full.payinExtraId;
+  if (has(payload.purchase_id)) update.purchaseId = full.purchaseId;
+  if (has(payload.price_amount)) update.priceAmount = full.priceAmount;
+  if (has(payload.price_currency)) update.priceCurrency = full.priceCurrency;
+  if (has(payload.pay_amount)) update.payAmount = full.payAmount;
+  if (has(payload.pay_currency)) update.payCurrency = full.payCurrency;
+  if (has(payload.actually_paid)) update.actuallyPaid = full.actuallyPaid;
+  if (has(payload.outcome_amount) || has(payload.outcome_price)) update.outcomeAmount = full.outcomeAmount;
+  if (has(payload.outcome_currency)) update.outcomeCurrency = full.outcomeCurrency;
+  return update;
 }
 
 function paymentAttemptUniqueWhere(providerPaymentId, testMode) {
@@ -787,7 +983,7 @@ async function applyProviderPayment(payload, { signature = null, signatureVerifi
       attempt = await client.billingPaymentAttempt.upsert({
         where: paymentAttemptUniqueWhere(providerPaymentId, order.testMode),
         create: { orderId: order.id, provider: PROVIDER, testMode: order.testMode === true, providerPaymentId, ...paymentAttemptData(payload) },
-        update: paymentAttemptData(payload),
+        update: paymentAttemptUpdateData(payload),
       });
       if (event.paymentAttemptId !== attempt.id || event.orderId !== order.id) {
         await client.billingProviderEvent.update({ where: { id: event.id }, data: { paymentAttemptId: attempt.id, orderId: order.id } });
@@ -874,7 +1070,7 @@ async function reconcileOrder({ agencyId, orderId, actorUserId = null, db = null
   }
   const attempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
   if (!attempt?.providerPaymentId) {
-    return { order: publicOrder(order), reconciled: false, reason: "PAYMENT_NOT_DETECTED_YET" };
+    return { order: publicOrder({ ...order, paymentAttempts: attempt ? [attempt] : [] }), reconciled: false, reason: "PAYMENT_NOT_DETECTED_YET" };
   }
   const payload = await nowPaymentsRequest(`/payment/${encodeURIComponent(attempt.providerPaymentId)}`);
   const fetchedPaymentId = clean(payload?.payment_id ?? payload?.id, 180);
@@ -897,6 +1093,11 @@ async function reconcileOrder({ agencyId, orderId, actorUserId = null, db = null
       : await activatePaidOrder(order.id, client);
     reconciledOrder = publicOrder(await client.billingOrder.findUnique({ where: { id: order.id } })) || reconciledOrder;
   }
+  const [freshOrder, freshAttempt] = await Promise.all([
+    client.billingOrder.findUnique({ where: { id: order.id } }),
+    latestPaymentAttempt(client, order.id),
+  ]);
+  if (freshOrder) reconciledOrder = publicOrder({ ...freshOrder, paymentAttempts: freshAttempt ? [freshAttempt] : [] });
   await audit({ agencyId, actorUserId, action: "billing.payment_reconciled", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, providerPaymentId: attempt.providerPaymentId, providerStatus: normalizeStatus(payload.payment_status || payload.status), activated: activation?.activated === true }, db: client });
   return { order: reconciledOrder, reconciled: true, activation };
 }
@@ -930,6 +1131,7 @@ function publicOrder(row) {
     providerInvoiceId: row.providerInvoiceId || null,
     providerInvoiceUrl: row.providerInvoiceUrl || null,
     providerStatus: row.providerStatus || null,
+    payment: publicPaymentAttempt(Array.isArray(row.paymentAttempts) ? row.paymentAttempts[0] : row.payment || null),
     testMode: row.testMode === true,
     paidAt: row.paidAt ? new Date(row.paidAt).toISOString() : null,
     activatedAt: row.activatedAt ? new Date(row.activatedAt).toISOString() : null,
@@ -941,7 +1143,7 @@ function publicOrder(row) {
 
 async function recentOrders({ agencyId, limit = 10, db = null }) {
   const client = db || prisma;
-  const rows = await client.billingOrder.findMany({ where: { agencyId }, include: { lines: { orderBy: { createdAt: "asc" } } }, orderBy: { createdAt: "desc" }, take: Math.max(1, Math.min(25, Number(limit || 10))) });
+  const rows = await client.billingOrder.findMany({ where: { agencyId }, include: { lines: { orderBy: { createdAt: "asc" } }, paymentAttempts: { orderBy: { updatedAt: "desc" }, take: 1 } }, orderBy: { createdAt: "desc" }, take: Math.max(1, Math.min(25, Number(limit || 10))) });
   return rows.map(publicOrder);
 }
 
@@ -956,6 +1158,12 @@ module.exports = {
   calculateCheckoutSnapshot,
   createCheckout,
   createWalletTopUpCheckout,
+  createWalletTopUpPayment,
+  availablePaymentCurrencies,
+  normalizePayCurrency,
+  publicPaymentAttempt,
+  paymentAttemptData,
+  paymentAttemptUpdateData,
   handleNowPaymentsIpn,
   reconcileOrder,
   recentOrders,

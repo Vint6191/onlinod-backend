@@ -1002,6 +1002,9 @@ model BillingPaymentAttempt {
   testMode          Boolean         @default(false)
   providerPaymentId String
   providerStatus    String?
+  payAddress        String?
+  payinExtraId      String?
+  purchaseId        String?
   priceAmount       Decimal?        @db.Decimal(30, 12)
   priceCurrency     String?
   payAmount         Decimal?        @db.Decimal(30, 12)

@@ -578,45 +578,19 @@ test("wallet top-up accepts arbitrary whole cents inside provider-safe bounds", 
   for (const amount of [0, 99, 10_000_001, 12.5, "nope"]) assert.throws(() => svc.normalizeTopUpAmountCents(amount), (e)=>e.code==="BILLING_TOP_UP_AMOUNT_INVALID");
 });
 
-test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines and amount-bound provider invoice", async () => {
-  const previous = {};
-  for (const [key,value] of Object.entries({ NOWPAYMENTS_MODE:"sandbox", NOWPAYMENTS_API_KEY:"test-key", NOWPAYMENTS_IPN_SECRET:"test-secret", PUBLIC_BASE_URL:"https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE:"true" })) { previous[key]=process.env[key]; process.env[key]=value; }
+test("hosted wallet top-up creation is retired and cannot contact NOWPayments", async () => {
+  const svc=loadNowPaymentsService({});
   const oldFetch=global.fetch;
-  let providerBody=null;
-  global.fetch=async (_url, options) => { providerBody=JSON.parse(options.body); return { ok:true, status:200, text:async()=>JSON.stringify({ invoice_id:"inv-top-1", invoice_url:"https://nowpayments.io/payment/top-1" }) }; };
+  let calls=0;
+  global.fetch=async()=>{ calls+=1; throw new Error("provider must not be called"); };
   try {
-    let order=null;
-    const db={
-      $transaction: async (fn)=>fn(db),
-      agency:{ findUnique:async()=>({id:"agency-1",name:"Agency",plan:"PRO"}) },
-      agencySubscription:{ findFirst:async()=>({billingMode:"MANUAL"}) },
-      billingOrder:{
-        findUnique:async ({where}) => {
-          if (where.id) return order?.id===where.id ? {...order} : null;
-          return order && where.agencyId_provider_testMode_checkoutKey && order.checkoutKey===where.agencyId_provider_testMode_checkoutKey.checkoutKey ? {...order} : null;
-        },
-        create:async ({data}) => { order={id:"order-top-1",providerInvoiceId:null,providerInvoiceUrl:null,providerStatus:null,paidAt:null,activatedAt:null,expiresAt:null,createdAt:new Date(),updatedAt:new Date(),lines:[],...data}; return {...order}; },
-        update:async ({where,data}) => { assert.equal(where.id,"order-top-1"); order={...order,...data,updatedAt:new Date()}; return {...order}; },
-      },
-    };
-    const svc=loadNowPaymentsService(db);
-    const result=await svc.createWalletTopUpCheckout({agencyId:"agency-1",actorUserId:"owner-1",checkoutKey:"123e4567-e89b-42d3-a456-426614174000",amountCents:6137,db});
-    assert.equal(result.order.purpose,"WALLET_TOP_UP");
-    assert.equal(result.order.amountCents,6137);
-    assert.equal(result.order.billedCreators,0);
-    assert.deepEqual(result.order.lines,[]);
-    assert.equal(result.order.periodMonths,1);
-    assert.equal(result.checkoutUrl,"https://nowpayments.io/payment/top-1");
-    assert.equal(providerBody.price_amount,61.37);
-    assert.equal(providerBody.price_currency,"usd");
-    assert.equal(providerBody.order_id,"order-top-1");
-    assert.ok(!("case" in providerBody));
-  } finally {
-    global.fetch=oldFetch;
-    for (const [key,value] of Object.entries(previous)) { if (value===undefined) delete process.env[key]; else process.env[key]=value; }
-  }
+    await assert.rejects(
+      svc.createWalletTopUpCheckout({agencyId:"agency-1",actorUserId:"owner-1",checkoutKey:"123e4567-e89b-42d3-a456-426614174000",amountCents:6137}),
+      (e)=>e.code==="BILLING_HOSTED_WALLET_TOP_UP_RETIRED" && e.status===410,
+    );
+    assert.equal(calls,0);
+  } finally { global.fetch=oldFetch; }
 });
-
 
 test("a stale failed renewal cannot overwrite error state after another worker already renewed the creator", async () => {
   const now = new Date("2026-08-14T12:00:00Z");
