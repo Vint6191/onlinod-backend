@@ -4,8 +4,7 @@ const express = require("express");
 const { authRequired } = require("../middleware/auth");
 const { isOwner } = require("../services/team-access-control");
 const {
-  createWalletTopUpPayment,
-  availablePaymentCurrencies,
+  createWalletTopUpCheckout,
   handleNowPaymentsIpn,
   reconcileOrder,
   publicProviderConfig,
@@ -70,28 +69,17 @@ router.post("/checkout", (_req, res) => {
   return res.status(410).json({ ok: false, code: "BILLING_DIRECT_CHECKOUT_DEPRECATED", error: "Creator checkout was replaced by wallet billing. Top up the workspace balance and start a monthly creator subscription." });
 });
 
-router.get("/wallet/top-up/currencies", async (_req, res) => {
-  try {
-    const result = await availablePaymentCurrencies();
-    return res.json({ ok: true, ...result });
-  } catch (err) {
-    return sendError(res, err, "BILLING_TOP_UP_CURRENCIES_FAILED");
-  }
-});
-
 router.post("/wallet/top-up", async (req, res) => {
   try {
-    const result = await createWalletTopUpPayment({
+    const result = await createWalletTopUpCheckout({
       agencyId: req.auth.agencyId,
       actorUserId: req.auth.userId,
       checkoutKey: req.body?.checkoutKey,
       amountCents: req.body?.amountCents,
-      payCurrency: req.body?.payCurrency,
-      flow: req.body?.flow,
     });
-    return res.status(201).json({ ok: true, mode: "native", ...result });
+    return res.status(201).json({ ok: true, ...result });
   } catch (err) {
-    return sendError(res, err, "BILLING_TOP_UP_PAYMENT_FAILED");
+    return sendError(res, err, "BILLING_TOP_UP_CHECKOUT_FAILED");
   }
 });
 
