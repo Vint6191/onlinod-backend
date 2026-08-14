@@ -61,7 +61,7 @@ const prisma    = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
 const { signAccessToken } = require("../utils/tokens");
 const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
-const { publicEntitlement, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
+const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -1315,62 +1315,76 @@ const entitlementSchema = z.object({
 router.patch("/creators/:id/entitlement", async (req, res) => {
   try {
     const input = entitlementSchema.parse(req.body);
-    const creator = await prisma.creatorAccount.findUnique({
+    const identity = await prisma.creatorAccount.findUnique({
       where: { id: req.params.id },
-      include: { billingProfile: true, billingEntitlement: true },
+      select: { id: true, agencyId: true, deletedAt: true },
     });
-    if (!creator || creator.deletedAt) {
+    if (!identity || identity.deletedAt) {
       return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
     }
 
-    const before = creator.billingEntitlement || null;
-    const profile = creator.billingProfile;
-    const tier = input.tier || before?.tier || profile?.tier || "STARTER";
-    const defaults = defaultBilling(tier);
     const now = new Date();
-    const coreUntil = input.coreValidUntil === undefined ? before?.coreValidUntil ?? null : (input.coreValidUntil ? new Date(input.coreValidUntil) : null);
-    const aiUntil = input.aiChatterValidUntil === undefined ? before?.aiChatterValidUntil ?? null : (input.aiChatterValidUntil ? new Date(input.aiChatterValidUntil) : null);
-    const outreachUntil = input.outreachValidUntil === undefined ? before?.outreachValidUntil ?? null : (input.outreachValidUntil ? new Date(input.outreachValidUntil) : null);
-
-    const data = {
-      agencyId: creator.agencyId,
-      creatorId: creator.id,
-      tier,
-      corePriceCents: Number(profile?.corePriceCents ?? defaults.corePriceCents ?? 0),
-      aiChatterPriceCents: Number(profile?.aiChatterPriceCents ?? defaults.aiChatterPriceCents ?? 10000),
-      outreachPriceCents: Number(profile?.outreachPriceCents ?? defaults.outreachPriceCents ?? 2900),
-      ...(input.coreValidUntil !== undefined ? {
-        coreSource: "ADMIN",
-        coreValidFrom: coreUntil && coreUntil > now && !(before?.coreValidUntil && new Date(before.coreValidUntil) > now) ? now : (before?.coreValidFrom || null),
-        coreValidUntil: coreUntil,
-        coreLastOrderId: null,
-      } : {}),
-      ...(input.aiChatterValidUntil !== undefined ? {
-        aiChatterSource: "ADMIN",
-        aiChatterValidUntil: aiUntil,
-        aiLastOrderId: null,
-      } : {}),
-      ...(input.outreachValidUntil !== undefined ? {
-        outreachSource: "ADMIN",
-        outreachValidUntil: outreachUntil,
-        outreachLastOrderId: null,
-      } : {}),
-    };
-
     const result = await prisma.$transaction(async (tx) => {
+      // Serialize manual dated-access changes with payment activation/refund and
+      // aggregate reconciliation for this agency. Then re-read inside the lock
+      // so a concurrent payment cannot make the admin snapshot stale.
+      await lockAgencyBillingMutation(tx, identity.agencyId);
+      const creator = await tx.creatorAccount.findUnique({
+        where: { id: identity.id },
+        include: { billingProfile: true, billingEntitlement: true },
+      });
+      if (!creator || creator.deletedAt) return { missing: true };
+
+      const before = creator.billingEntitlement || null;
+      const profile = creator.billingProfile;
+      const tier = input.tier || before?.tier || profile?.tier || "STARTER";
+      const defaults = defaultBilling(tier);
+      const coreUntil = input.coreValidUntil === undefined ? before?.coreValidUntil ?? null : (input.coreValidUntil ? new Date(input.coreValidUntil) : null);
+      const aiUntil = input.aiChatterValidUntil === undefined ? before?.aiChatterValidUntil ?? null : (input.aiChatterValidUntil ? new Date(input.aiChatterValidUntil) : null);
+      const outreachUntil = input.outreachValidUntil === undefined ? before?.outreachValidUntil ?? null : (input.outreachValidUntil ? new Date(input.outreachValidUntil) : null);
+
+      const data = {
+        agencyId: creator.agencyId,
+        creatorId: creator.id,
+        tier,
+        corePriceCents: Number(profile?.corePriceCents ?? defaults.corePriceCents ?? 0),
+        aiChatterPriceCents: Number(profile?.aiChatterPriceCents ?? defaults.aiChatterPriceCents ?? 10000),
+        outreachPriceCents: Number(profile?.outreachPriceCents ?? defaults.outreachPriceCents ?? 2900),
+        ...(input.coreValidUntil !== undefined ? {
+          coreSource: "ADMIN",
+          coreValidFrom: coreUntil && coreUntil > now && !(before?.coreValidUntil && new Date(before.coreValidUntil) > now) ? now : (before?.coreValidFrom || null),
+          coreValidUntil: coreUntil,
+          coreLastOrderId: null,
+        } : {}),
+        ...(input.aiChatterValidUntil !== undefined ? {
+          aiChatterSource: "ADMIN",
+          aiChatterValidUntil: aiUntil,
+          aiLastOrderId: null,
+        } : {}),
+        ...(input.outreachValidUntil !== undefined ? {
+          outreachSource: "ADMIN",
+          outreachValidUntil: outreachUntil,
+          outreachLastOrderId: null,
+        } : {}),
+      };
+
       const entitlement = before
         ? await tx.creatorBillingEntitlement.update({ where: { creatorId: creator.id }, data })
         : await tx.creatorBillingEntitlement.create({ data });
       const aggregate = await syncAgencyBillingAggregate(tx, creator.agencyId, now);
-      return { entitlement, aggregate };
+      return { missing: false, agencyId: creator.agencyId, creatorId: creator.id, before, entitlement, aggregate };
     });
 
+    if (result.missing) {
+      return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
+    }
+
     await adminLog(req, {
-      agencyId: creator.agencyId,
+      agencyId: result.agencyId,
       action: "admin.creator_entitlement_changed",
       targetType: "creator",
-      targetId: creator.id,
-      before: before ? publicEntitlement(before, now) : null,
+      targetId: result.creatorId,
+      before: result.before ? publicEntitlement(result.before, now) : null,
       after: publicEntitlement(result.entitlement, now),
       reason: input.reason,
     });
@@ -1393,19 +1407,28 @@ router.delete("/creators/:id", async (req, res) => {
   });
   if (!before) return res.status(404).json({ ok: false, error: "Creator not found" });
 
-  if (hard) {
-    await prisma.creatorAccount.delete({ where: { id: before.id } });
-  } else {
-    await prisma.creatorAccount.update({
-      where: { id: before.id },
-      data: { deletedAt: new Date(), status: "DISABLED" },
-    });
-    // Revoke active snapshots so live workers stop using them.
-    await prisma.accessSnapshot.updateMany({
-      where: { creatorId: before.id, active: true, revokedAt: null },
-      data: { active: false, revokedAt: new Date() },
-    });
-  }
+  const deletedAt = new Date();
+  await prisma.$transaction(async (tx) => {
+    await lockAgencyBillingMutation(tx, before.agencyId);
+    if (hard) {
+      await tx.creatorAccount.delete({ where: { id: before.id } });
+    } else {
+      await tx.creatorAccount.update({
+        where: { id: before.id },
+        data: { deletedAt, status: "DISABLED" },
+      });
+      // Revoke active snapshots so live workers stop using them.
+      await tx.accessSnapshot.updateMany({
+        where: { creatorId: before.id, active: true, revokedAt: null },
+        data: { active: false, revokedAt: deletedAt },
+      });
+    }
+
+    // Creator deletion changes the set of billable product access immediately.
+    // Recompute the aggregate in the same transaction rather than waiting for
+    // the hourly scheduler or the old cached currentPeriodEnd.
+    await syncAgencyBillingAggregate(tx, before.agencyId, deletedAt);
+  });
 
   await adminLog(req, {
     agencyId: before.agencyId,

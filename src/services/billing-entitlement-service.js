@@ -121,17 +121,82 @@ async function ensureOrderLines(tx, order) {
   return lines;
 }
 
+async function lockAgencyBillingMutation(tx, agencyId) {
+  const id = String(agencyId || "").trim();
+  if (!id || typeof tx?.$queryRawUnsafe !== "function") return;
+  // Billing entitlement mutations for one agency must serialize. Different
+  // creator payments can otherwise compute against different uncommitted
+  // entitlement sets and race the shared Agency/AgencySubscription aggregate.
+  // Locking the Agency row is transaction-scoped in PostgreSQL and does not
+  // modify the row or its updatedAt timestamp.
+  await tx.$queryRawUnsafe('SELECT "id" FROM "Agency" WHERE "id" = $1 FOR UPDATE', id);
+}
+
 async function activeEntitlementEnd(tx, agencyId, now = new Date()) {
   const row = await tx.creatorBillingEntitlement.findFirst({
-    where: { agencyId, coreValidUntil: { gt: now } },
+    where: {
+      agencyId,
+      coreValidUntil: { gt: now },
+      // Soft-deleted creators are not billable product access. Keep financial
+      // history, but never let a hidden/deleted creator keep the workspace
+      // aggregate ACTIVE.
+      creator: { deletedAt: null },
+    },
     orderBy: { coreValidUntil: "desc" },
   });
   return asDate(row?.coreValidUntil);
 }
 
+async function previousUnrefundedGrant(tx, line, component) {
+  const where = {
+    creatorId: line.creatorId,
+    orderId: { not: line.orderId },
+    activatedAt: { not: null },
+    refundedAt: null,
+    order: { status: "PAID", activatedAt: { not: null } },
+  };
+  if (component === "core") where.coreGrantedUntil = { not: null };
+  if (component === "ai") {
+    where.aiChatterEnabled = true;
+    where.aiGrantedUntil = { not: null };
+  }
+  if (component === "outreach") {
+    where.outreachEnabled = true;
+    where.outreachGrantedUntil = { not: null };
+  }
+  return tx.billingOrderLine.findFirst({
+    where,
+    orderBy: [{ activatedAt: "desc" }, { createdAt: "desc" }],
+    include: { order: { select: { id: true, status: true, paidAt: true, activatedAt: true } } },
+  });
+}
+
+function fallbackComponentState({ previousSource, previousPriceCents, previousValidUntil }) {
+  // A PAYMENT snapshot is only a hint about what used to be underneath this
+  // line. If that payment has since been refunded, restoring the frozen
+  // snapshot would resurrect refunded access. Payment predecessors therefore
+  // come only from live, non-refunded relational order lines.
+  if (previousSource && previousSource !== "PAYMENT") {
+    return {
+      source: previousSource,
+      priceCents: Math.max(0, Number(previousPriceCents || 0)),
+      validUntil: previousValidUntil || null,
+      lastOrderId: null,
+    };
+  }
+  return { source: "LEGACY", priceCents: 0, validUntil: null, lastOrderId: null };
+}
+
 async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled, db = null }) {
   const client = db || prisma;
   return client.$transaction(async (tx) => {
+    // Read only enough to choose the agency lock, then re-read authoritative
+    // order state after acquiring it. Provider callbacks can move PAID ->
+    // REFUNDED concurrently; never activate from a stale pre-lock snapshot.
+    const identity = await tx.billingOrder.findUnique({ where: { id: orderId }, select: { id: true, agencyId: true } });
+    if (!identity) return { activated: false, reason: "ORDER_NOT_PAID" };
+    await lockAgencyBillingMutation(tx, identity.agencyId);
+
     const order = await tx.billingOrder.findUnique({ where: { id: orderId } });
     if (!order || order.status !== "PAID") return { activated: false, reason: "ORDER_NOT_PAID" };
     if (order.activatedAt) return { activated: false, reason: "ALREADY_ACTIVATED" };
@@ -140,7 +205,7 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
     const lines = await ensureOrderLines(tx, order);
     const now = new Date();
     const claim = await tx.billingOrder.updateMany({
-      where: { id: orderId, activatedAt: null },
+      where: { id: orderId, status: "PAID", activatedAt: null },
       data: { activatedAt: now, paidAt: order.paidAt || now },
     });
     if (claim.count !== 1) return { activated: false, reason: "ALREADY_ACTIVATED" };
@@ -269,10 +334,20 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
 }
 
 async function refundOrderEntitlements({ order, db = null }) {
-  if (!order?.activatedAt) return { downgraded: false, reason: "ORDER_NOT_ACTIVATED" };
+  const orderId = String(order?.id || "").trim();
+  const agencyId = String(order?.agencyId || "").trim();
+  if (!orderId || !agencyId) return { downgraded: false, reason: "ORDER_NOT_FOUND" };
   const client = db || prisma;
   return client.$transaction(async (tx) => {
-    const lines = await tx.billingOrderLine.findMany({ where: { orderId: order.id }, orderBy: { createdAt: "asc" } });
+    // The order object passed by provider processing may predate a concurrent
+    // activation. Serialize with activation and re-read after the lock so a
+    // REFUNDED event can never miss an activation that just committed.
+    await lockAgencyBillingMutation(tx, agencyId);
+    const currentOrder = await tx.billingOrder.findUnique({ where: { id: orderId } });
+    if (!currentOrder || currentOrder.status !== "REFUNDED") return { downgraded: false, reason: "ORDER_NOT_REFUNDED" };
+    if (!currentOrder.activatedAt) return { downgraded: false, reason: "ORDER_NOT_ACTIVATED" };
+
+    const lines = await tx.billingOrderLine.findMany({ where: { orderId }, orderBy: { createdAt: "asc" } });
     const now = new Date();
     let changed = 0;
 
@@ -283,26 +358,51 @@ async function refundOrderEntitlements({ order, db = null }) {
         await tx.billingOrderLine.update({ where: { id: line.id }, data: { refundedAt: now } });
         continue;
       }
+
       const data = {};
-      if (String(ent.coreLastOrderId || "") === String(order.id)) {
-        data.coreSource = line.corePreviousSource || "LEGACY";
-        data.corePriceCents = Math.max(0, Number(line.corePreviousPriceCents || 0));
-        data.coreValidUntil = line.corePreviousValidUntil || null;
-        data.coreLastOrderId = null;
-        if (line.previousTier) data.tier = line.previousTier;
+
+      if (String(ent.coreLastOrderId || "") === orderId) {
+        const previous = await previousUnrefundedGrant(tx, line, "core");
+        const state = previous
+          ? { source: "PAYMENT", priceCents: previous.corePriceCents, validUntil: previous.coreGrantedUntil, lastOrderId: previous.orderId }
+          : fallbackComponentState({ previousSource: line.corePreviousSource, previousPriceCents: line.corePreviousPriceCents, previousValidUntil: line.corePreviousValidUntil });
+        data.coreSource = state.source;
+        data.corePriceCents = state.priceCents;
+        data.coreValidUntil = state.validUntil;
+        data.coreLastOrderId = state.lastOrderId;
+        data.lastPaidAt = previous?.order?.paidAt || null;
+
+        // A later admin tier edit is independent of payment validity. Only
+        // restore the payment predecessor tier when nobody changed tier after
+        // this order became the current grant.
+        if (String(ent.tier || "") === String(line.tier || "")) {
+          if (previous?.tier) data.tier = previous.tier;
+          else if (line.corePreviousSource && line.corePreviousSource !== "PAYMENT" && line.previousTier) data.tier = line.previousTier;
+        }
       }
-      if (String(ent.aiLastOrderId || "") === String(order.id)) {
-        data.aiChatterSource = line.aiPreviousSource || "LEGACY";
-        data.aiChatterPriceCents = Math.max(0, Number(line.aiPreviousPriceCents || 0));
-        data.aiChatterValidUntil = line.aiPreviousValidUntil || null;
-        data.aiLastOrderId = null;
+
+      if (String(ent.aiLastOrderId || "") === orderId) {
+        const previous = await previousUnrefundedGrant(tx, line, "ai");
+        const state = previous
+          ? { source: "PAYMENT", priceCents: previous.aiChatterPriceCents, validUntil: previous.aiGrantedUntil, lastOrderId: previous.orderId }
+          : fallbackComponentState({ previousSource: line.aiPreviousSource, previousPriceCents: line.aiPreviousPriceCents, previousValidUntil: line.aiPreviousValidUntil });
+        data.aiChatterSource = state.source;
+        data.aiChatterPriceCents = state.priceCents;
+        data.aiChatterValidUntil = state.validUntil;
+        data.aiLastOrderId = state.lastOrderId;
       }
-      if (String(ent.outreachLastOrderId || "") === String(order.id)) {
-        data.outreachSource = line.outreachPreviousSource || "LEGACY";
-        data.outreachPriceCents = Math.max(0, Number(line.outreachPreviousPriceCents || 0));
-        data.outreachValidUntil = line.outreachPreviousValidUntil || null;
-        data.outreachLastOrderId = null;
+
+      if (String(ent.outreachLastOrderId || "") === orderId) {
+        const previous = await previousUnrefundedGrant(tx, line, "outreach");
+        const state = previous
+          ? { source: "PAYMENT", priceCents: previous.outreachPriceCents, validUntil: previous.outreachGrantedUntil, lastOrderId: previous.orderId }
+          : fallbackComponentState({ previousSource: line.outreachPreviousSource, previousPriceCents: line.outreachPreviousPriceCents, previousValidUntil: line.outreachPreviousValidUntil });
+        data.outreachSource = state.source;
+        data.outreachPriceCents = state.priceCents;
+        data.outreachValidUntil = state.validUntil;
+        data.outreachLastOrderId = state.lastOrderId;
       }
+
       if (Object.keys(data).length) {
         await tx.creatorBillingEntitlement.update({ where: { creatorId: line.creatorId }, data });
         changed += 1;
@@ -310,17 +410,17 @@ async function refundOrderEntitlements({ order, db = null }) {
       await tx.billingOrderLine.update({ where: { id: line.id }, data: { refundedAt: now } });
     }
 
-    const subscription = await tx.agencySubscription.findFirst({ where: { agencyId: order.agencyId }, orderBy: { createdAt: "desc" } });
-    const maxEnd = await activeEntitlementEnd(tx, order.agencyId, now);
+    const subscription = await tx.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } });
+    const maxEnd = await activeEntitlementEnd(tx, agencyId, now);
     if (subscription) {
       if (subscription.billingMode === "FREE_INTERNAL") {
         await tx.agencySubscription.update({ where: { id: subscription.id }, data: { currentPeriodEnd: maxEnd || subscription.currentPeriodEnd } });
       } else if (maxEnd) {
         await tx.agencySubscription.update({ where: { id: subscription.id }, data: { status: "ACTIVE", currentPeriodEnd: maxEnd } });
-        await tx.agency.update({ where: { id: order.agencyId }, data: { status: "ACTIVE", currentPeriodEnd: maxEnd } });
+        await tx.agency.update({ where: { id: agencyId }, data: { status: "ACTIVE", currentPeriodEnd: maxEnd } });
       } else {
         await tx.agencySubscription.update({ where: { id: subscription.id }, data: { status: "PAST_DUE", currentPeriodEnd: null } });
-        await tx.agency.update({ where: { id: order.agencyId }, data: { status: "PAST_DUE", currentPeriodEnd: null } });
+        await tx.agency.update({ where: { id: agencyId }, data: { status: "PAST_DUE", currentPeriodEnd: null } });
       }
     }
     return { downgraded: !maxEnd && subscription?.billingMode !== "FREE_INTERNAL", changed, currentPeriodEnd: maxEnd };
@@ -328,6 +428,7 @@ async function refundOrderEntitlements({ order, db = null }) {
 }
 
 async function syncAgencyBillingAggregate(tx, agencyId, now = new Date()) {
+  await lockAgencyBillingMutation(tx, agencyId);
   const subscription = await tx.agencySubscription.findFirst({
     where: { agencyId },
     orderBy: { createdAt: "desc" },
@@ -374,11 +475,14 @@ async function syncAgencyBillingAggregate(tx, agencyId, now = new Date()) {
 
 async function reconcileExpiredBillingStates({ now = new Date(), db = null } = {}) {
   const client = db || prisma;
+  // Reconcile every paid ACTIVE/GRACE aggregate, not only aggregates whose
+  // cached currentPeriodEnd is already due. A creator can be soft-deleted or
+  // a payment can be refunded before that cached date, so the aggregate must
+  // be derived from live creator entitlements rather than trusted as a timer.
   const subscriptions = await client.agencySubscription.findMany({
     where: {
       status: { in: ["ACTIVE", "GRACE"] },
       billingMode: { not: "FREE_INTERNAL" },
-      currentPeriodEnd: { lte: now },
     },
     orderBy: { createdAt: "asc" },
     take: 10000,
@@ -387,9 +491,15 @@ async function reconcileExpiredBillingStates({ now = new Date(), db = null } = {
   let repaired = 0;
   for (const subscription of subscriptions) {
     await client.$transaction(async (tx) => {
+      const beforeEnd = asDate(subscription.currentPeriodEnd);
       const result = await syncAgencyBillingAggregate(tx, subscription.agencyId, now);
-      if (result.currentPeriodEnd && asDate(result.currentPeriodEnd) > now) repaired += 1;
-      else if (result.status === "PAST_DUE") expired += 1;
+      const afterEnd = asDate(result.currentPeriodEnd);
+      const changed =
+        String(result.status || "") !== String(subscription.status || "") ||
+        Number(beforeEnd?.getTime?.() || 0) !== Number(afterEnd?.getTime?.() || 0);
+      if (!changed) return;
+      if (result.status === "PAST_DUE") expired += 1;
+      else repaired += 1;
     });
   }
   return { scanned: subscriptions.length, expired, repaired };
@@ -399,6 +509,7 @@ module.exports = {
   addMonthsUtc,
   isFuture,
   publicEntitlement,
+  lockAgencyBillingMutation,
   ensureOrderLines,
   activatePaidOrderEntitlements,
   refundOrderEntitlements,

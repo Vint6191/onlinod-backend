@@ -143,6 +143,35 @@ function monotonicOrderStatus(currentStatus, providerStatus) {
   return next;
 }
 
+async function updateOrderStatusMonotonically(client, initialOrder, providerStatus, payload) {
+  let current = initialOrder;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (!current) throw permanentBindingError("Billing order disappeared during provider processing", "BILLING_ORDER_NOT_FOUND");
+    const candidateStatus = monotonicOrderStatus(current.status, providerStatus);
+    validateProviderPaymentForOrder(current, payload, { requirePrice: candidateStatus === "PAID" });
+    const paidAt = candidateStatus === "PAID" ? (current.paidAt || new Date()) : current.paidAt;
+
+    // Compare-and-retry prevents two concurrent provider callbacks from
+    // overwriting a newer terminal state based on the same stale snapshot.
+    // Example: REFUNDED must never regress to PAID because a late `finished`
+    // callback read PAID milliseconds earlier.
+    const claim = await client.billingOrder.updateMany({
+      where: { id: current.id, status: current.status },
+      data: { status: candidateStatus, providerStatus: providerStatus || current.providerStatus, paidAt },
+    });
+    if (claim.count === 1) {
+      const fresh = await client.billingOrder.findUnique({ where: { id: current.id } });
+      if (!fresh) throw permanentBindingError("Billing order disappeared during provider processing", "BILLING_ORDER_NOT_FOUND");
+      return { order: fresh, candidateStatus: String(fresh.status) };
+    }
+    current = await client.billingOrder.findUnique({ where: { id: current.id } });
+  }
+  const err = new Error("Billing order changed too many times during provider processing");
+  err.code = "BILLING_ORDER_CONCURRENT_UPDATE";
+  err.status = 503;
+  throw err;
+}
+
 function validateProviderPaymentForOrder(order, payload, { requirePrice = false } = {}) {
   if (!order) return { ok: false, reason: "ORDER_NOT_FOUND" };
   const providerPaymentId = clean(payload?.payment_id ?? payload?.id, 180);
@@ -644,7 +673,7 @@ async function applyProviderPayment(payload, { signature = null, signatureVerifi
       return { duplicate: false, order: null, code: "ORDER_NOT_FOUND" };
     }
 
-    const candidateStatus = monotonicOrderStatus(order.status, providerStatus);
+    let candidateStatus = monotonicOrderStatus(order.status, providerStatus);
     validateProviderPaymentForOrder(order, payload, { requirePrice: candidateStatus === "PAID" });
 
     let attempt = null;
@@ -659,11 +688,9 @@ async function applyProviderPayment(payload, { signature = null, signatureVerifi
       }
     }
 
-    const paidAt = candidateStatus === "PAID" ? (order.paidAt || new Date()) : order.paidAt;
-    order = await client.billingOrder.update({
-      where: { id: order.id },
-      data: { status: candidateStatus, providerStatus: providerStatus || order.providerStatus, paidAt },
-    });
+    const advanced = await updateOrderStatusMonotonically(client, order, providerStatus, payload);
+    order = advanced.order;
+    candidateStatus = advanced.candidateStatus;
 
     let activation = null;
     if (candidateStatus === "PAID") activation = await activatePaidOrder(order.id, client);
@@ -814,6 +841,7 @@ module.exports = {
   publicOrder,
   orderStatusForProviderStatus,
   monotonicOrderStatus,
+  updateOrderStatusMonotonically,
   validateProviderPaymentForOrder,
   normalizeCheckoutKey,
   applyProviderPayment,

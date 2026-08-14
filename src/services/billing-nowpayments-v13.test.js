@@ -11,12 +11,15 @@ const root = path.join(__dirname, "..", "..");
 const servicePath = path.join(__dirname, "billing-nowpayments-service.js");
 const entitlementServicePath = path.join(__dirname, "billing-entitlement-service.js");
 const serviceSource = fs.readFileSync(servicePath, "utf8");
+const entitlementServiceSource = fs.readFileSync(entitlementServicePath, "utf8");
 const routeSource = fs.readFileSync(path.join(root, "src", "routes", "billing.js"), "utf8");
 const serverSource = fs.readFileSync(path.join(root, "src", "server.js"), "utf8");
+const adminSource = fs.readFileSync(path.join(root, "src", "routes", "admin.js"), "utf8");
 const schemaSource = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
 const migrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20260813143000_nowpayments_billing_v1", "migration.sql"), "utf8");
 const hardeningMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20260813190000_nowpayments_billing_hardening_v13_1", "migration.sql"), "utf8");
 const entitlementMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20260813223000_per_creator_billing_entitlements_v13_3", "migration.sql"), "utf8");
+const entitlementRepairMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20260814002000_billing_v13_3_1_repair", "migration.sql"), "utf8");
 
 function withEnv(values, fn) {
   const previous = {};
@@ -134,7 +137,8 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
         return { ...order };
       },
       updateMany: async ({ where, data }) => {
-        if (where.id !== order.id || (where.activatedAt === null && order.activatedAt)) return { count: 0 };
+        if (orderUpdateFailures > 0) { orderUpdateFailures -= 1; throw new Error("transient db write"); }
+        if (where.id !== order.id || (where.status !== undefined && where.status !== order.status) || (where.activatedAt === null && order.activatedAt)) return { count: 0 };
         order = { ...order, ...data, updatedAt: new Date() };
         return { count: 1 };
       },
@@ -142,6 +146,21 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
     },
     billingOrderLine: {
       findMany: async ({ where }) => [...lines.values()].filter((row) => !where?.orderId || row.orderId === where.orderId).map((row) => ({ ...row })),
+      findFirst: async ({ where } = {}) => {
+        const candidates = [...lines.values()]
+          .filter((row) => !where?.creatorId || row.creatorId === where.creatorId)
+          .filter((row) => !where?.orderId?.not || row.orderId !== where.orderId.not)
+          .filter((row) => where?.activatedAt?.not === null ? row.activatedAt != null : true)
+          .filter((row) => where?.refundedAt === null ? row.refundedAt == null : true)
+          .filter((row) => where?.coreGrantedUntil?.not === null ? row.coreGrantedUntil != null : true)
+          .filter((row) => where?.aiGrantedUntil?.not === null ? row.aiGrantedUntil != null : true)
+          .filter((row) => where?.outreachGrantedUntil?.not === null ? row.outreachGrantedUntil != null : true)
+          .filter((row) => where?.aiChatterEnabled === true ? row.aiChatterEnabled === true : true)
+          .filter((row) => where?.outreachEnabled === true ? row.outreachEnabled === true : true)
+          .sort((a, b) => new Date(b.activatedAt || b.createdAt) - new Date(a.activatedAt || a.createdAt));
+        const row = candidates[0];
+        return row ? { ...row, order: { id: row.orderId, status: "PAID", paidAt: order.paidAt || null, activatedAt: row.activatedAt } } : null;
+      },
       create: async ({ data }) => {
         if ([...lines.values()].some((row) => row.orderId === data.orderId && row.creatorId === data.creatorId)) { const err = new Error("unique"); err.code = "P2002"; throw err; }
         const row = { id: `line-${lines.size + 1}`, createdAt: new Date(), updatedAt: new Date(), activatedAt: null, refundedAt: null, ...data };
@@ -776,6 +795,175 @@ test("V13.3 migration relationalizes legacy V13 order lines, backfills paid crea
   assert.match(entitlementMigrationSource, /'LEGACY'::"BillingEntitlementSource"/);
 });
 
+test("V13.3.1 refund never resurrects a payment predecessor that was already refunded", async () => {
+  const activatedA = new Date("2026-08-01T00:00:00Z");
+  const activatedB = new Date("2026-08-10T00:00:00Z");
+  const aUntil = new Date("2026-09-01T00:00:00Z");
+  const bUntil = new Date("2026-10-01T00:00:00Z");
+  const lines = [
+    { id: "line-a", orderId: "order-a", agencyId: "agency-1", creatorId: "creator-1", tier: "STARTER", corePriceCents: 2000, coreGrantedUntil: aUntil, activatedAt: activatedA, refundedAt: new Date("2026-08-20T00:00:00Z") },
+    { id: "line-b", orderId: "order-b", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", corePriceCents: 3500, previousTier: "STARTER", corePreviousSource: "PAYMENT", corePreviousPriceCents: 2000, corePreviousValidUntil: aUntil, coreGrantedUntil: bUntil, activatedAt: activatedB, refundedAt: null },
+  ];
+  let entitlement = { id: "ent-1", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: bUntil, coreLastOrderId: "order-b" };
+  const orders = new Map([
+    ["order-a", { id: "order-a", status: "REFUNDED", paidAt: activatedA, activatedAt: activatedA }],
+    ["order-b", { id: "order-b", status: "REFUNDED", paidAt: activatedB, activatedAt: activatedB }],
+  ]);
+  const db = {
+    billingOrder: { findUnique: async ({ where }) => { const row = orders.get(where.id); return row ? { ...row, agencyId: "agency-1" } : null; } },
+    billingOrderLine: {
+      findMany: async ({ where }) => lines.filter((row) => row.orderId === where.orderId).map((row) => ({ ...row })),
+      findFirst: async ({ where }) => {
+        const rows = lines.filter((row) => row.creatorId === where.creatorId && row.orderId !== where.orderId.not && row.activatedAt && !row.refundedAt && row.coreGrantedUntil && orders.get(row.orderId)?.status === "PAID");
+        const row = rows.sort((a, b) => b.activatedAt - a.activatedAt)[0];
+        return row ? { ...row, order: orders.get(row.orderId) } : null;
+      },
+      update: async ({ where, data }) => { const row = lines.find((candidate) => candidate.id === where.id); Object.assign(row, data); return { ...row }; },
+    },
+    creatorBillingEntitlement: {
+      findUnique: async () => ({ ...entitlement }),
+      update: async ({ data }) => { entitlement = { ...entitlement, ...data }; return { ...entitlement }; },
+      findFirst: async () => null,
+    },
+    agencySubscription: { findFirst: async () => ({ id: "sub-1", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: bUntil }), update: async ({ data }) => data },
+    agency: { update: async ({ data }) => data },
+  };
+  db.$transaction = async (fn) => fn(db);
+  const service = loadEntitlementService(db);
+  await service.refundOrderEntitlements({ order: { id: "order-b", agencyId: "agency-1", activatedAt: activatedB }, db });
+  assert.equal(entitlement.coreValidUntil, null);
+  assert.equal(entitlement.coreLastOrderId, null);
+  assert.equal(entitlement.coreSource, "LEGACY");
+});
+
+test("V13.3.1 refund restores the latest still-paid predecessor but preserves a later admin tier edit", async () => {
+  const activatedA = new Date("2026-08-01T00:00:00Z");
+  const activatedB = new Date("2026-08-10T00:00:00Z");
+  const aUntil = new Date("2026-09-01T00:00:00Z");
+  const bUntil = new Date("2026-10-01T00:00:00Z");
+  const lines = [
+    { id: "line-a", orderId: "order-a", agencyId: "agency-1", creatorId: "creator-1", tier: "STARTER", corePriceCents: 2000, coreGrantedUntil: aUntil, activatedAt: activatedA, refundedAt: null },
+    { id: "line-b", orderId: "order-b", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", corePriceCents: 3500, previousTier: "STARTER", corePreviousSource: "PAYMENT", corePreviousPriceCents: 2000, corePreviousValidUntil: aUntil, coreGrantedUntil: bUntil, activatedAt: activatedB, refundedAt: null },
+  ];
+  let entitlement = { id: "ent-1", agencyId: "agency-1", creatorId: "creator-1", tier: "ELITE", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: bUntil, coreLastOrderId: "order-b" };
+  const orders = new Map([
+    ["order-a", { id: "order-a", status: "PAID", paidAt: activatedA, activatedAt: activatedA }],
+    ["order-b", { id: "order-b", status: "REFUNDED", paidAt: activatedB, activatedAt: activatedB }],
+  ]);
+  const db = {
+    billingOrder: { findUnique: async ({ where }) => { const row = orders.get(where.id); return row ? { ...row, agencyId: "agency-1" } : null; } },
+    billingOrderLine: {
+      findMany: async ({ where }) => lines.filter((row) => row.orderId === where.orderId).map((row) => ({ ...row })),
+      findFirst: async ({ where }) => {
+        const rows = lines.filter((row) => row.creatorId === where.creatorId && row.orderId !== where.orderId.not && row.activatedAt && !row.refundedAt && row.coreGrantedUntil && orders.get(row.orderId)?.status === "PAID");
+        const row = rows.sort((a, b) => b.activatedAt - a.activatedAt)[0];
+        return row ? { ...row, order: orders.get(row.orderId) } : null;
+      },
+      update: async ({ where, data }) => { const row = lines.find((candidate) => candidate.id === where.id); Object.assign(row, data); return { ...row }; },
+    },
+    creatorBillingEntitlement: {
+      findUnique: async () => ({ ...entitlement }),
+      update: async ({ data }) => { entitlement = { ...entitlement, ...data }; return { ...entitlement }; },
+      findFirst: async ({ where }) => where.creator?.deletedAt === null && entitlement.coreValidUntil > where.coreValidUntil.gt ? ({ ...entitlement }) : null,
+    },
+    agencySubscription: { findFirst: async () => ({ id: "sub-1", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: bUntil }), update: async ({ data }) => data },
+    agency: { update: async ({ data }) => data },
+  };
+  db.$transaction = async (fn) => fn(db);
+  const service = loadEntitlementService(db);
+  await service.refundOrderEntitlements({ order: { id: "order-b", agencyId: "agency-1", activatedAt: activatedB }, db });
+  assert.equal(entitlement.coreLastOrderId, "order-a");
+  assert.equal(entitlement.coreValidUntil.toISOString(), aUntil.toISOString());
+  assert.equal(entitlement.corePriceCents, 2000);
+  assert.equal(entitlement.coreSource, "PAYMENT");
+  assert.equal(entitlement.tier, "ELITE");
+});
+
+test("V13.3.1 aggregate lookup excludes soft-deleted creators", async () => {
+  const now = new Date("2026-09-01T00:00:00Z");
+  let entitlementWhere = null;
+  const subscription = { id: "sub-1", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: new Date("2026-08-31T00:00:00Z"), createdAt: new Date("2026-01-01T00:00:00Z") };
+  const db = {
+    agencySubscription: { findFirst: async () => ({ ...subscription }), update: async ({ data }) => ({ ...subscription, ...data }) },
+    creatorBillingEntitlement: { findFirst: async ({ where }) => { entitlementWhere = where; return null; } },
+    agency: { update: async ({ data }) => ({ id: "agency-1", ...data }) },
+  };
+  const service = loadEntitlementService(db);
+  const result = await service.syncAgencyBillingAggregate(db, "agency-1", now);
+  assert.equal(result.status, "PAST_DUE");
+  assert.deepEqual(entitlementWhere.creator, { deletedAt: null });
+});
+
+test("V13.3.1 repair migration activates migrated lines and makes already-refunded legacy owners fail closed", () => {
+  assert.match(entitlementRepairMigrationSource, /UPDATE "BillingOrderLine" l[\s\S]*"activatedAt" = o\."activatedAt"/);
+  assert.match(entitlementRepairMigrationSource, /"coreGrantedUntil" = e\."coreValidUntil"/);
+  assert.match(entitlementRepairMigrationSource, /e\."coreLastOrderId" = o\."id"[\s\S]*o\."status" = 'REFUNDED'/);
+  assert.match(entitlementRepairMigrationSource, /"coreValidUntil" = NULL/);
+  assert.match(entitlementRepairMigrationSource, /"refundedAt" = COALESCE/);
+  for (const destructive of [/DROP TABLE/i, /DROP COLUMN/i, /TRUNCATE/i, /DELETE FROM/i]) assert.doesNotMatch(entitlementRepairMigrationSource, destructive);
+});
+
+test("V13.3.2 billing entitlement mutations serialize on the agency row before touching creator grants", async () => {
+  const service = loadEntitlementService({});
+  const calls = [];
+  await service.lockAgencyBillingMutation({
+    $queryRawUnsafe: async (sql, agencyId) => { calls.push({ sql, agencyId }); return [{ id: agencyId }]; },
+  }, "agency-1");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].agencyId, "agency-1");
+  assert.match(calls[0].sql, /SELECT "id" FROM "Agency" WHERE "id" = \$1 FOR UPDATE/);
+  assert.match(entitlementServiceSource, /await lockAgencyBillingMutation\(tx, identity\.agencyId\);[\s\S]*?billingOrder\.findUnique[\s\S]*?order\.status !== "PAID"[\s\S]*?ensureOrderLines\(tx, order\)/);
+  assert.match(entitlementServiceSource, /where: \{ id: orderId, status: "PAID", activatedAt: null \}/);
+  assert.match(entitlementServiceSource, /refundOrderEntitlements[\s\S]*?await lockAgencyBillingMutation\(tx, agencyId\);[\s\S]*?billingOrder\.findUnique[\s\S]*?currentOrder\.status !== "REFUNDED"[\s\S]*?billingOrderLine\.findMany/);
+  assert.match(entitlementServiceSource, /syncAgencyBillingAggregate[\s\S]*?await lockAgencyBillingMutation\(tx, agencyId\)/);
+});
+
+test("V13.3.2 admin dated-access edits and creator deletion join the same agency billing lock", () => {
+  const entitlementRoute = adminSource.match(/router\.patch\("\/creators\/:id\/entitlement"[\s\S]*?return res\.json\(\{ ok: true, entitlement:[\s\S]*?\n\}\);/)?.[0] || "";
+  const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{ ok: true, hard, deleted: before \}\);/)?.[0] || "";
+  assert.match(adminSource, /lockAgencyBillingMutation/);
+  assert.match(entitlementRoute, /await lockAgencyBillingMutation\(tx, identity\.agencyId\)/);
+  assert.match(entitlementRoute, /tx\.creatorAccount\.findUnique/);
+  assert.match(deleteRoute, /await lockAgencyBillingMutation\(tx, before\.agencyId\)/);
+});
+
+test("V13.3.2 concurrent provider status update cannot regress REFUNDED back to PAID from a stale finished snapshot", async () => {
+  const service = loadService();
+  let current = {
+    id: "order-race", agencyId: "agency-1", status: "PAID", amountCents: 2000, currency: "USD",
+    providerInvoiceId: "invoice-race", providerStatus: "finished", testMode: true,
+    paidAt: new Date("2026-08-14T00:00:00Z"), activatedAt: new Date("2026-08-14T00:00:01Z"),
+  };
+  let writes = 0;
+  const db = {
+    billingOrder: {
+      updateMany: async ({ where, data }) => {
+        writes += 1;
+        if (writes === 1) {
+          // Simulate a concurrent refund committing after this callback read PAID.
+          current = { ...current, status: "REFUNDED", providerStatus: "refunded" };
+          return { count: 0 };
+        }
+        if (where.id !== current.id || where.status !== current.status) return { count: 0 };
+        current = { ...current, ...data };
+        return { count: 1 };
+      },
+      findUnique: async () => ({ ...current }),
+    },
+  };
+  const payload = { payment_status: "finished", payment_id: "payment-race", invoice_id: "invoice-race", price_amount: 20, price_currency: "usd" };
+  const result = await service.updateOrderStatusMonotonically(db, { ...current }, "finished", payload);
+  assert.equal(writes, 2);
+  assert.equal(result.candidateStatus, "REFUNDED");
+  assert.equal(result.order.status, "REFUNDED");
+});
+
+test("V13.3.2 activation/refund re-read order state after the agency lock", () => {
+  assert.match(entitlementServiceSource, /const identity = await tx\.billingOrder\.findUnique[\s\S]*?await lockAgencyBillingMutation\(tx, identity\.agencyId\);[\s\S]*?const order = await tx\.billingOrder\.findUnique/);
+  assert.match(entitlementServiceSource, /where: \{ id: orderId, status: "PAID", activatedAt: null \}/);
+  assert.match(entitlementServiceSource, /await lockAgencyBillingMutation\(tx, agencyId\);[\s\S]*?const currentOrder = await tx\.billingOrder\.findUnique[\s\S]*?currentOrder\.status !== "REFUNDED"/);
+});
+
 test("billing HTTP boundary keeps signed IPN public, all checkout mutation owner-authenticated, and redirect success non-authoritative", () => {
   const ipnPos = routeSource.indexOf('router.post("/nowpayments/ipn"');
   const authPos = routeSource.indexOf("router.use(authRequired)");
@@ -785,4 +973,36 @@ test("billing HTTP boundary keeps signed IPN public, all checkout mutation owner
   assert.match(routeSource, /Redirects only inform|redirects only inform|never activate entitlements/i);
   assert.doesNotMatch(routeSource.slice(routeSource.indexOf('router.get("/checkout/success"'), authPos), /activatePaidOrder|AgencySubscription|billingMode/);
   assert.match(serverSource, /app\.use\("\/api\/billing", billingRoutes\)/);
+});
+
+test("V13.3.1 expiry scheduler reconciles future ACTIVE aggregates and does not count an unchanged healthy aggregate as repaired", async () => {
+  const now = new Date("2026-09-01T00:00:00Z");
+  const activeUntil = new Date("2026-10-15T00:00:00Z");
+  let findManyArgs = null;
+  let updates = 0;
+  const subscription = { id: "sub-future", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: activeUntil, createdAt: new Date("2026-01-01T00:00:00Z") };
+  const db = {
+    agencySubscription: {
+      findMany: async (args) => { findManyArgs = args; return [{ ...subscription }]; },
+      findFirst: async () => ({ ...subscription }),
+      update: async ({ data }) => { updates += 1; return { ...subscription, ...data }; },
+    },
+    creatorBillingEntitlement: { findFirst: async () => ({ creatorId: "creator-1", agencyId: "agency-1", coreValidUntil: activeUntil }) },
+    agency: { update: async () => ({ id: "agency-1" }) },
+  };
+  db.$transaction = async (fn) => fn(db);
+  const service = loadEntitlementService(db);
+  const result = await service.reconcileExpiredBillingStates({ now, db });
+  assert.deepEqual(result, { scanned: 1, expired: 0, repaired: 0 });
+  assert.equal(Object.prototype.hasOwnProperty.call(findManyArgs.where, "currentPeriodEnd"), false);
+  assert.equal(updates, 1);
+});
+
+
+test("V13.3.1 creator soft/hard delete recomputes billing aggregate in the delete transaction", () => {
+  const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{ ok: true, hard, deleted: before \}\);/)?.[0] || "";
+  assert.match(deleteRoute, /prisma\.\$transaction/);
+  assert.match(deleteRoute, /syncAgencyBillingAggregate\(tx, before\.agencyId, deletedAt\)/);
+  assert.match(deleteRoute, /tx\.creatorAccount\.update/);
+  assert.match(deleteRoute, /tx\.creatorAccount\.delete/);
 });
