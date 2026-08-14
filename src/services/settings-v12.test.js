@@ -20,7 +20,7 @@ function loadSettingsService() {
     if (request === "./auth-service") return { publicUser: (u) => u, issuePasswordReset: async () => ({ emailResult: { ok: true, skipped: false } }) };
     if (request === "./audit-service") return { audit: async () => null };
     if (request === "./team-access-control") return { canUsePermission: async () => true, isOwner: (member) => member?.role === "OWNER" || member?.roleKey === "owner" };
-    if (request === "./billing-nowpayments-service") return { publicProviderConfig: () => ({ providerKey: "NOWPAYMENTS", environment: "disabled", configured: false, checkoutAvailable: false, testMode: false, feePaidByUser: false, sandboxActivationEnabled: false, liveCheckoutBlockedByInternalTestMode: false, missingConfiguration: ["NOWPAYMENTS_MODE"] }), recentOrders: async () => [] };
+    if (request === "./billing-nowpayments-service") return { publicProviderConfig: () => ({ providerKey: "NOWPAYMENTS", environment: "disabled", configured: false, checkoutAvailable: false, testMode: false, feePaidByUser: false, sandboxActivationEnabled: false, liveAutoPricingEnabled: false, liveCheckoutBlockedByInternalTestMode: false, missingConfiguration: ["NOWPAYMENTS_MODE"] }), recentOrders: async () => [] };
     return original.call(this, request, parent, isMain);
   };
   try {
@@ -133,6 +133,9 @@ test("billing read model is owner-only, filters deleted creators and keeps FREE_
       { id: "creator-1", displayName: "Alive", username: "alive", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } },
       { id: "creator-2", displayName: "No profile", username: "missing", billingProfile: null },
     ] },
+    creatorEarningsSnapshot: { findMany: async () => [] },
+    agencyBillingWallet: { findUnique: async () => null },
+    billingWalletTransaction: { findMany: async () => [] },
   };
   const result = await service.getBillingSettings({ agencyId: "agency-1", member: { role: "OWNER" }, db });
   assert.equal(result.available, true);
@@ -142,9 +145,47 @@ test("billing read model is owner-only, filters deleted creators and keeps FREE_
   assert.equal(result.creators.length, 2);
   assert.equal(result.billedCreators, 2);
   assert.equal(result.creators[1].tier, "STARTER");
-  assert.equal(result.creators[1].lineTotalCents, 2000);
-  assert.equal(result.monthlyTotalCents, 4000);
+  assert.equal(result.creators[1].pricingAvailable, false);
+  assert.equal(result.creators[1].estimatedNextChargeCents, null);
+  assert.equal(result.monthlyTotalCents, 0);
   assert.deepEqual(await service.getBillingSettings({ agencyId: "agency-1", member: { role: "CHATTER" }, db }), { available: false, reason: "OWNER_ONLY" });
+});
+
+test("next-30-days billing estimate excludes prepaid renewals outside the horizon", async () => {
+  const service = loadSettingsService();
+  const now = new Date();
+  const upcoming = new Date(now.getTime() + 10 * 24 * 60 * 60 * 1000);
+  const far = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
+  const profile = { tier: "STARTER", tierMode: "AUTO", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false };
+  const entitlement = (creatorId, end) => ({ id: `ent-${creatorId}`, agencyId: "agency-1", creatorId, tier: "STARTER", coreSource: "PAYMENT", coreValidFrom: now, coreValidUntil: end, subscriptionStartedAt: now, currentPeriodStartedAt: now, currentPeriodEndsAt: end, nextRenewalAt: end, autoRenewEnabled: true, walletTestMode: false });
+  const db = {
+    agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO", status: "ACTIVE" }) },
+    agencySubscription: { findFirst: async () => ({ id: "sub-1", status: "ACTIVE", billingMode: "MANUAL", billingPeriod: "MONTHLY", corePricePerCreatorCents: 2000 }) },
+    creatorAccount: { findMany: async () => [
+      { id: "creator-near", displayName: "Near", username: "near", billingProfile: { ...profile }, billingEntitlement: entitlement("creator-near", upcoming) },
+      { id: "creator-far", displayName: "Far", username: "far", billingProfile: { ...profile }, billingEntitlement: entitlement("creator-far", far) },
+    ] },
+    creatorEarningsSnapshot: { findUnique: async () => null },
+    creatorEarningsDaily: {
+      findMany: async ({ where }) => {
+        const start = new Date(where.date.gte);
+        const end = new Date(where.date.lte);
+        const rows = [];
+        for (let day = new Date(start); day <= end; day.setUTCDate(day.getUTCDate() + 1)) rows.push({ creatorId: where.creatorId, date: new Date(day), totalCents: 1000, collectedAt: now, updatedAt: now });
+        return rows;
+      },
+    },
+    analyticsCoverage: {
+      count: async ({ where }) => Math.round((new Date(where.coverageDate.lte).getTime() - new Date(where.coverageDate.gte).getTime()) / (24 * 60 * 60 * 1000)) + 1,
+    },
+    agencyBillingWallet: { findUnique: async () => ({ id: "wallet", testMode: false, balanceCents: 100_000n, currency: "USD", updatedAt: now }) },
+    billingWalletTransaction: { findMany: async () => [] },
+  };
+  const result = await service.getBillingSettings({ agencyId: "agency-1", member: { role: "OWNER" }, db });
+  assert.equal(result.creators[0].estimatedNextChargeCents, 2000);
+  assert.equal(result.creators[1].estimatedNextChargeCents, 2000);
+  assert.equal(result.estimatedNext30DaysCents, 2000);
+  assert.equal(result.pricingDataUnavailableCreators, 0);
 });
 
 test("only the newest live refresh session on the current device is marked THIS DEVICE", async () => {

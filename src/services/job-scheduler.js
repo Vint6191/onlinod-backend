@@ -35,6 +35,7 @@ const { ensureAutomaticLikes } = require("./likes-service");
 const { ensureAutomaticFollowAutomation } = require("./follow-automation-service");
 const { ensureAutomaticSfs } = require("./sfs-service");
 const { reconcileExpiredBillingStates } = require("./billing-entitlement-service");
+const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -517,8 +518,21 @@ async function runRecurringSweep() {
   // Retention owns the detailed 180d boundary. Run it before the historical
   // Team backfill so deleted old detail is not immediately recreated.
   const retention = await maybeRunRetentionSweep({ now });
+  let billingRenewals = null;
+  try {
+    billingRenewals = await renewDueCreatorSubscriptions({ now });
+    if (billingRenewals?.scanned) {
+      console.log(`[scheduler] billing renewals — scanned=${billingRenewals.scanned}, renewed=${billingRenewals.renewed}, balance=${billingRenewals.insufficientBalance}, earnings=${billingRenewals.earningsUnavailable}, skipped=${billingRenewals.skipped}`);
+    }
+  } catch (err) {
+    console.warn("[scheduler] billing wallet renewal failed:", err?.message || err);
+    billingRenewals = { ok: false, error: err?.message || String(err) };
+  }
   let billingExpiry = null;
   try {
+    // Renewal gets the first chance at the due boundary. Only after it either
+    // succeeds or safely declines do we derive the workspace aggregate from
+    // the resulting live entitlements.
     billingExpiry = await reconcileExpiredBillingStates({ now });
     if (billingExpiry?.scanned) {
       console.log(`[scheduler] billing expiry — scanned=${billingExpiry.scanned}, expired=${billingExpiry.expired}, repaired=${billingExpiry.repaired}`);
@@ -542,6 +556,7 @@ async function runRecurringSweep() {
     dailyCyclesStarted,
     dailyCyclesSkipped,
     retention,
+    billingRenewals,
     billingExpiry,
     teamMoneyBackfill,
     teamPendingBackfill,

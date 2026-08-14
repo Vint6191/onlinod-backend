@@ -8,6 +8,13 @@ const TIER_CATALOG = Object.freeze({
   CUSTOM: Object.freeze({ key: "CUSTOM", label: "Custom", priceCents: null, revenueLabel: "manual" }),
 });
 
+const AUTO_TIER_RULES = Object.freeze([
+  Object.freeze({ key: "STARTER", minRevenueCents: 0, maxRevenueCentsExclusive: 100_000 }),
+  Object.freeze({ key: "GROWTH", minRevenueCents: 100_000, maxRevenueCentsExclusive: 500_000 }),
+  Object.freeze({ key: "PRO", minRevenueCents: 500_000, maxRevenueCentsExclusive: 1_500_000 }),
+  Object.freeze({ key: "ELITE", minRevenueCents: 1_500_000, maxRevenueCentsExclusive: null }),
+]);
+
 const ADDON_CATALOG = Object.freeze({
   aiChatter: Object.freeze({ key: "AI_CHATTER", label: "AI Chatter", priceCents: 10000 }),
   outreach: Object.freeze({ key: "OUTREACH", label: "SFS + Comment Bot", priceCents: 2900 }),
@@ -74,14 +81,24 @@ function normalizeSelection(input) {
   return { billingPeriod, creators };
 }
 
+function automaticTierForRevenue(revenue30dCents) {
+  const revenue = Math.max(0, Math.min(2_147_483_647, Math.round(Number(revenue30dCents || 0))));
+  const rule = AUTO_TIER_RULES.find((row) => row.maxRevenueCentsExclusive === null || revenue < row.maxRevenueCentsExclusive) || AUTO_TIER_RULES[AUTO_TIER_RULES.length - 1];
+  return rule.key;
+}
+
 function catalogForClient() {
   return {
-    tiers: Object.values(TIER_CATALOG).map((row) => ({ ...row })),
+    automaticPricing: true,
+    tiers: Object.values(TIER_CATALOG).map((row) => {
+      const rule = AUTO_TIER_RULES.find((candidate) => candidate.key === row.key);
+      return { ...row, minRevenueCents: rule?.minRevenueCents ?? null, maxRevenueCentsExclusive: rule?.maxRevenueCentsExclusive ?? null, customerSelectable: false };
+    }),
     addons: {
       aiChatter: { ...ADDON_CATALOG.aiChatter },
       outreach: { ...ADDON_CATALOG.outreach },
     },
-    periods: Object.values(PERIOD_CATALOG).map((row) => ({ ...row })),
+    periods: [{ ...PERIOD_CATALOG.MONTHLY }],
   };
 }
 
@@ -158,12 +175,14 @@ function priceCreatorSelection({ creator, requested, defaultCorePriceCents = 200
 
 module.exports = {
   TIER_CATALOG,
+  AUTO_TIER_RULES,
   ADDON_CATALOG,
   PERIOD_CATALOG,
   catalogForClient,
   normalizePeriod,
   periodMonths,
   normalizeTier,
+  automaticTierForRevenue,
   normalizeSelection,
   priceCreatorSelection,
 };

@@ -62,6 +62,7 @@ const { adminRequired } = require("../middleware/admin");
 const { signAccessToken } = require("../utils/tokens");
 const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
+const { TIER_CATALOG } = require("../services/billing-catalog-service");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -71,13 +72,13 @@ router.use(adminRequired);
 // Shared helpers / constants
 // ════════════════════════════════════════════════════════════
 
-const TIERS = {
-  STARTER: { label: "Starter", priceCents: 2000, revenueLabel: "$0–$1k" },
-  GROWTH:  { label: "Growth",  priceCents: 3000, revenueLabel: "$1k–$5k" },
-  PRO:     { label: "Pro",     priceCents: 5000, revenueLabel: "$5k–$15k" },
-  ELITE:   { label: "Elite",   priceCents: 15000, revenueLabel: "$15k+" },
-  CUSTOM:  { label: "Custom",  priceCents: 0,    revenueLabel: "manual" },
-};
+const TIERS = Object.freeze(Object.fromEntries(
+  Object.entries(TIER_CATALOG).map(([key, row]) => [key, {
+    label: row.label,
+    priceCents: Number(row.priceCents || 0),
+    revenueLabel: row.revenueLabel,
+  }]),
+));
 
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
@@ -152,7 +153,7 @@ function defaultBilling(tier) {
   const key = TIERS[tier] ? tier : "STARTER";
   return {
     tier: key,
-    tierMode: "MANUAL",
+    tierMode: key === "CUSTOM" ? "MANUAL" : "AUTO",
     corePriceCents: TIERS[key].priceCents,
     revenue30dCents: 0,
     aiChatterEnabled: false,
@@ -1355,6 +1356,22 @@ router.patch("/creators/:id/entitlement", async (req, res) => {
           coreValidFrom: coreUntil && coreUntil > now && !(before?.coreValidUntil && new Date(before.coreValidUntil) > now) ? now : (before?.coreValidFrom || null),
           coreValidUntil: coreUntil,
           coreLastOrderId: null,
+          subscriptionStartedAt: coreUntil && coreUntil > now ? (before?.subscriptionStartedAt || before?.coreValidFrom || now) : (before?.subscriptionStartedAt || null),
+          currentPeriodStartedAt: coreUntil && coreUntil > now
+            ? ((before?.coreValidUntil && new Date(before.coreValidUntil) > now) ? (before?.currentPeriodStartedAt || before?.coreValidFrom || now) : now)
+            : null,
+          currentPeriodEndsAt: coreUntil,
+          nextRenewalAt: null,
+          billingAnchorDay: coreUntil && coreUntil > now
+            ? ((before?.coreValidUntil && new Date(before.coreValidUntil) > now)
+              ? (Number(before?.billingAnchorDay) || new Date(before?.currentPeriodStartedAt || before?.coreValidFrom || now).getUTCDate())
+              : now.getUTCDate())
+            : (before?.billingAnchorDay || null),
+          tierAtPeriodStart: tier,
+          amountChargedForPeriodCents: 0,
+          autoRenewEnabled: false,
+          lastRenewalErrorCode: null,
+          walletTestMode: null,
         } : {}),
         ...(input.aiChatterValidUntil !== undefined ? {
           aiChatterSource: "ADMIN",

@@ -49,6 +49,18 @@ function publicEntitlement(row, now = new Date()) {
       aiChatterActive: false,
       outreachActive: false,
       expired: true,
+      subscriptionStartedAt: null,
+      currentPeriodStartedAt: null,
+      currentPeriodEndsAt: null,
+      nextRenewalAt: null,
+      tierAtPeriodStart: null,
+      amountChargedForPeriodCents: 0,
+      autoRenewEnabled: false,
+      lastRenewalAttemptAt: null,
+      lastRenewalErrorCode: null,
+      lastRevenue30dCents: null,
+      lastRevenueCapturedAt: null,
+      walletTestMode: null,
     };
   }
   return {
@@ -67,6 +79,18 @@ function publicEntitlement(row, now = new Date()) {
     aiChatterActive: isFuture(row.aiChatterValidUntil, now),
     outreachActive: isFuture(row.outreachValidUntil, now),
     expired: !isFuture(row.coreValidUntil, now),
+    subscriptionStartedAt: row.subscriptionStartedAt ? asDate(row.subscriptionStartedAt)?.toISOString() || null : (row.coreValidFrom ? asDate(row.coreValidFrom)?.toISOString() || null : null),
+    currentPeriodStartedAt: row.currentPeriodStartedAt ? asDate(row.currentPeriodStartedAt)?.toISOString() || null : null,
+    currentPeriodEndsAt: row.currentPeriodEndsAt ? asDate(row.currentPeriodEndsAt)?.toISOString() || null : (row.coreValidUntil ? asDate(row.coreValidUntil)?.toISOString() || null : null),
+    nextRenewalAt: row.nextRenewalAt ? asDate(row.nextRenewalAt)?.toISOString() || null : null,
+    tierAtPeriodStart: row.tierAtPeriodStart ? String(row.tierAtPeriodStart) : (row.tier ? String(row.tier) : null),
+    amountChargedForPeriodCents: Math.max(0, Number(row.amountChargedForPeriodCents || 0)),
+    autoRenewEnabled: row.autoRenewEnabled === true,
+    lastRenewalAttemptAt: row.lastRenewalAttemptAt ? asDate(row.lastRenewalAttemptAt)?.toISOString() || null : null,
+    lastRenewalErrorCode: row.lastRenewalErrorCode || null,
+    lastRevenue30dCents: row.lastRevenue30dCents == null ? null : Math.max(0, Number(row.lastRevenue30dCents || 0)),
+    lastRevenueCapturedAt: row.lastRevenueCapturedAt ? asDate(row.lastRevenueCapturedAt)?.toISOString() || null : null,
+    walletTestMode: row.walletTestMode == null ? null : row.walletTestMode === true,
   };
 }
 
@@ -167,7 +191,7 @@ async function previousUnrefundedGrant(tx, line, component) {
   return tx.billingOrderLine.findFirst({
     where,
     orderBy: [{ activatedAt: "desc" }, { createdAt: "desc" }],
-    include: { order: { select: { id: true, status: true, paidAt: true, activatedAt: true } } },
+    include: { order: { select: { id: true, status: true, paidAt: true, activatedAt: true, testMode: true } } },
   });
 }
 
@@ -249,6 +273,17 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
         coreValidUntil: coreGrantedUntil,
         coreLastOrderId: order.id,
         lastPaidAt: order.paidAt || now,
+        subscriptionStartedAt: existing?.subscriptionStartedAt || existing?.coreValidFrom || now,
+        currentPeriodStartedAt: coreBase,
+        currentPeriodEndsAt: coreGrantedUntil,
+        nextRenewalAt: null,
+        tierAtPeriodStart: line.tier,
+        amountChargedForPeriodCents: Math.max(0, Number(line.lineTotalCents || line.monthlyCents || 0)),
+        // A V13 direct payment bought this dated period only. Do not infer
+        // consent to future V14 wallet debits; Start/Resume is the opt-in.
+        autoRenewEnabled: false,
+        lastRenewalErrorCode: null,
+        walletTestMode: order.testMode === true,
         ...(line.aiChatterEnabled ? { aiChatterSource: "PAYMENT", aiChatterPriceCents: line.aiChatterPriceCents, aiChatterValidUntil: aiGrantedUntil, aiLastOrderId: order.id } : {}),
         ...(line.outreachEnabled ? { outreachSource: "PAYMENT", outreachPriceCents: line.outreachPriceCents, outreachValidUntil: outreachGrantedUntil, outreachLastOrderId: order.id } : {}),
       };
@@ -267,7 +302,7 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
           agencyId: order.agencyId,
           creatorId: line.creatorId,
           tier: line.tier,
-          tierMode: "MANUAL",
+          tierMode: line.tier === "CUSTOM" ? "MANUAL" : "AUTO",
           corePriceCents: line.corePriceCents,
           aiChatterEnabled: line.aiChatterEnabled === true,
           aiChatterPriceCents: line.aiChatterPriceCents,
@@ -277,7 +312,7 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
         },
         update: {
           tier: line.tier,
-          tierMode: "MANUAL",
+          tierMode: line.tier === "CUSTOM" ? "MANUAL" : "AUTO",
           corePriceCents: line.corePriceCents,
           aiChatterEnabled: line.aiChatterEnabled === true,
           aiChatterPriceCents: line.aiChatterPriceCents,
@@ -371,6 +406,27 @@ async function refundOrderEntitlements({ order, db = null }) {
         data.coreValidUntil = state.validUntil;
         data.coreLastOrderId = state.lastOrderId;
         data.lastPaidAt = previous?.order?.paidAt || null;
+        data.currentPeriodEndsAt = state.validUntil;
+        if (previous) {
+          const restoredStart = previous.activatedAt || previous.order?.activatedAt || null;
+          data.nextRenewalAt = null;
+          data.currentPeriodStartedAt = restoredStart;
+          // Restoring a dated V13 PAYMENT predecessor is not wallet consent.
+          data.autoRenewEnabled = false;
+          data.walletTestMode = previous.order?.testMode === true;
+          data.billingAnchorDay = restoredStart ? asDate(restoredStart)?.getUTCDate() || null : (state.validUntil ? asDate(state.validUntil)?.getUTCDate() || null : null);
+          if (previous.tier) data.tierAtPeriodStart = previous.tier;
+          data.amountChargedForPeriodCents = Math.max(0, Number(previous.lineTotalCents || previous.monthlyCents || 0));
+        } else {
+          // Restored ADMIN/LEGACY access is not a customer-paid renewal. Never
+          // let metadata from the refunded payment turn it into wallet authority.
+          data.nextRenewalAt = null;
+          data.currentPeriodStartedAt = null;
+          data.autoRenewEnabled = false;
+          data.walletTestMode = null;
+          data.billingAnchorDay = state.validUntil ? asDate(state.validUntil)?.getUTCDate() || null : null;
+          data.amountChargedForPeriodCents = 0;
+        }
 
         // A later admin tier edit is independent of payment validity. Only
         // restore the payment predecessor tier when nobody changed tier after

@@ -4,12 +4,19 @@ const express = require("express");
 const { authRequired } = require("../middleware/auth");
 const { isOwner } = require("../services/team-access-control");
 const {
-  createCheckout,
-  calculateCheckoutSnapshot,
+  createWalletTopUpCheckout,
   handleNowPaymentsIpn,
   reconcileOrder,
   publicProviderConfig,
 } = require("../services/billing-nowpayments-service");
+const {
+  startCreatorSubscription,
+  cancelCreatorRenewal,
+  setCreatorBillingPreferences,
+  publicWallet,
+  publicBillingPeriod,
+} = require("../services/billing-wallet-service");
+const { publicEntitlement } = require("../services/billing-entitlement-service");
 
 const router = express.Router();
 
@@ -54,40 +61,71 @@ router.use(ownerOnly);
 
 router.get("/provider", (_req, res) => res.json({ ok: true, provider: publicProviderConfig() }));
 
-router.post("/quote", async (req, res) => {
-  try {
-    const quote = await calculateCheckoutSnapshot({
-      agencyId: req.auth.agencyId,
-      selection: { billingPeriod: req.body?.billingPeriod, creators: req.body?.creators },
-    });
-    return res.json({
-      ok: true,
-      quote: {
-        billingPeriod: quote.billingPeriod,
-        periodMonths: quote.periodMonths,
-        billedCreators: quote.billedCreators,
-        monthlyTotalCents: quote.monthlyTotalCents,
-        amountCents: quote.amountCents,
-        currency: quote.currency,
-        lines: quote.lines,
-      },
-    });
-  } catch (err) {
-    return sendError(res, err, "BILLING_QUOTE_FAILED");
-  }
+router.post("/quote", (_req, res) => {
+  return res.status(410).json({ ok: false, code: "BILLING_DIRECT_CHECKOUT_DEPRECATED", error: "Creator checkout was replaced by wallet billing. Top up the workspace balance and start a monthly creator subscription." });
 });
 
-router.post("/checkout", async (req, res) => {
+router.post("/checkout", (_req, res) => {
+  return res.status(410).json({ ok: false, code: "BILLING_DIRECT_CHECKOUT_DEPRECATED", error: "Creator checkout was replaced by wallet billing. Top up the workspace balance and start a monthly creator subscription." });
+});
+
+router.post("/wallet/top-up", async (req, res) => {
   try {
-    const result = await createCheckout({
+    const result = await createWalletTopUpCheckout({
       agencyId: req.auth.agencyId,
       actorUserId: req.auth.userId,
       checkoutKey: req.body?.checkoutKey,
-      selection: { billingPeriod: req.body?.billingPeriod, creators: req.body?.creators },
+      amountCents: req.body?.amountCents,
     });
     return res.status(201).json({ ok: true, ...result });
   } catch (err) {
-    return sendError(res, err, "BILLING_CHECKOUT_FAILED");
+    return sendError(res, err, "BILLING_TOP_UP_CHECKOUT_FAILED");
+  }
+});
+
+router.patch("/creators/:creatorId/preferences", async (req, res) => {
+  try {
+    const profile = await setCreatorBillingPreferences({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      aiChatterEnabled: req.body?.aiChatterEnabled === true,
+      outreachEnabled: req.body?.outreachEnabled === true,
+      actorUserId: req.auth.userId,
+    });
+    return res.json({ ok: true, preferences: { aiChatterEnabled: profile.aiChatterEnabled === true, outreachEnabled: profile.outreachEnabled === true } });
+  } catch (err) {
+    return sendError(res, err, "BILLING_PREFERENCES_UPDATE_FAILED");
+  }
+});
+
+router.post("/creators/:creatorId/start", async (req, res) => {
+  try {
+    const provider = publicProviderConfig();
+    const result = await startCreatorSubscription({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      actorUserId: req.auth.userId,
+      testMode: provider.testMode === true,
+    });
+    return res.json({
+      ok: true,
+      alreadyActive: result.alreadyActive === true,
+      wallet: publicWallet(result.wallet),
+      entitlement: publicEntitlement(result.entitlement),
+      period: publicBillingPeriod(result.period),
+      pricing: result.pricing || null,
+    });
+  } catch (err) {
+    return sendError(res, err, "BILLING_SUBSCRIPTION_START_FAILED");
+  }
+});
+
+router.post("/creators/:creatorId/cancel-renewal", async (req, res) => {
+  try {
+    const result = await cancelCreatorRenewal({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId, actorUserId: req.auth.userId });
+    return res.json({ ok: true, changed: result.changed === true, entitlement: publicEntitlement(result.entitlement) });
+  } catch (err) {
+    return sendError(res, err, "BILLING_CANCEL_RENEWAL_FAILED");
   }
 });
 

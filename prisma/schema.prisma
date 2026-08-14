@@ -211,6 +211,9 @@ model Agency {
   creatorBillingEntitlements CreatorBillingEntitlement[]
   billingOrders BillingOrder[]
   billingOrderLines BillingOrderLine[]
+  billingWallets AgencyBillingWallet[]
+  billingWalletTransactions BillingWalletTransaction[]
+  creatorBillingPeriods CreatorBillingPeriod[]
   adminActionLogs AdminActionLog[]
   customRoles            AgencyCustomRole[]
   roleOverrides          AgencyRoleOverride[]
@@ -661,6 +664,25 @@ enum BillingEntitlementSource {
   PAYMENT
   ADMIN
   LEGACY
+  WALLET
+}
+
+enum BillingOrderPurpose {
+  SUBSCRIPTION
+  WALLET_TOP_UP
+}
+
+enum BillingWalletTransactionType {
+  TOP_UP
+  SUBSCRIPTION_DEBIT
+  TOP_UP_REFUND
+  ADMIN_ADJUSTMENT
+}
+
+enum CreatorBillingPeriodStatus {
+  ACTIVE
+  COMPLETED
+  LEGACY
 }
 
 enum BillingOrderStatus {
@@ -742,7 +764,7 @@ model CreatorBillingProfile {
   creatorId String @unique
 
   tier CreatorBillingTier @default(STARTER)
-  tierMode String @default("MANUAL")
+  tierMode String @default("AUTO")
   corePriceCents Int @default(2000)
 
   revenue30dCents Int @default(0)
@@ -772,6 +794,7 @@ model BillingOrder {
   agencyId        String
   createdByUserId String?
   provider        BillingProvider    @default(NOWPAYMENTS)
+  purpose         BillingOrderPurpose @default(SUBSCRIPTION)
   status          BillingOrderStatus @default(CREATED)
 
   amountCents      Int
@@ -873,6 +896,20 @@ model CreatorBillingEntitlement {
   outreachLastOrderId String?
   lastPaidAt DateTime?
 
+  subscriptionStartedAt DateTime?
+  currentPeriodStartedAt DateTime?
+  currentPeriodEndsAt DateTime?
+  nextRenewalAt DateTime?
+  billingAnchorDay Int?
+  tierAtPeriodStart CreatorBillingTier?
+  amountChargedForPeriodCents Int @default(0)
+  autoRenewEnabled Boolean @default(false)
+  lastRenewalAttemptAt DateTime?
+  lastRenewalErrorCode String?
+  lastRevenue30dCents Int?
+  lastRevenueCapturedAt DateTime?
+  walletTestMode Boolean?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -883,6 +920,79 @@ model CreatorBillingEntitlement {
   @@index([coreValidUntil])
   @@index([aiChatterValidUntil])
   @@index([outreachValidUntil])
+}
+
+model AgencyBillingWallet {
+  id           String @id @default(cuid())
+  agencyId     String
+  testMode     Boolean @default(false)
+  balanceCents BigInt @default(0)
+  currency     String @default("USD")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  agency       Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  transactions BillingWalletTransaction[]
+
+  @@unique([agencyId, testMode])
+  @@index([updatedAt])
+}
+
+model BillingWalletTransaction {
+  id                String @id @default(cuid())
+  walletId          String
+  agencyId          String
+  creatorId         String?
+  orderId           String?
+  testMode          Boolean @default(false)
+  periodId          String?
+  type               BillingWalletTransactionType
+  amountCents        BigInt
+  balanceAfterCents  BigInt
+  currency           String @default("USD")
+  idempotencyKey     String @unique
+  description        String?
+  metadata           Json?
+  createdAt          DateTime @default(now())
+
+  wallet AgencyBillingWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, createdAt])
+  @@index([agencyId, creatorId, createdAt])
+  @@index([orderId])
+  @@index([periodId])
+}
+
+model CreatorBillingPeriod {
+  id                    String @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  testMode              Boolean @default(false)
+  tier                  CreatorBillingTier
+  revenue30dCents       Int
+  revenueCapturedAt     DateTime?
+  pricingSource         String @default("AUTO_30D")
+  corePriceCents        Int
+  aiChatterEnabled      Boolean @default(false)
+  aiChatterPriceCents   Int @default(0)
+  outreachEnabled       Boolean @default(false)
+  outreachPriceCents    Int @default(0)
+  totalCents            Int
+  startedAt             DateTime
+  endsAt                DateTime
+  status                CreatorBillingPeriodStatus @default(ACTIVE)
+  renewalKey            String @unique
+  walletTransactionId   String? @unique
+  sourceOrderId         String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, creatorId, startedAt])
+  @@index([creatorId, endsAt])
+  @@index([status, endsAt])
 }
 
 model BillingPaymentAttempt {

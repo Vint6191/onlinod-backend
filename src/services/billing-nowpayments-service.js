@@ -5,6 +5,7 @@ const prisma = require("../prisma");
 const { audit } = require("./audit-service");
 const { normalizeSelection, periodMonths, priceCreatorSelection } = require("./billing-catalog-service");
 const { activatePaidOrderEntitlements, refundOrderEntitlements } = require("./billing-entitlement-service");
+const { creditPaidTopUp, refundTopUp } = require("./billing-wallet-service");
 
 const PROVIDER = "NOWPAYMENTS";
 const PROCESSING_STATUSES = new Set(["waiting", "confirming", "confirmed", "sending"]);
@@ -107,6 +108,7 @@ function publicProviderConfig() {
     testMode: cfg.sandbox,
     feePaidByUser: cfg.feePaidByUser,
     sandboxActivationEnabled: cfg.sandboxActivationEnabled,
+    liveAutoPricingEnabled: boolEnv("BILLING_LIVE_AUTO_PRICING_ENABLED", false),
     missingConfiguration: missing,
   };
 }
@@ -559,6 +561,110 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
   }
 }
 
+function normalizeTopUpAmountCents(value) {
+  const amount = Number(value);
+  if (!Number.isSafeInteger(amount) || amount < 100 || amount > 10_000_000) {
+    const err = new Error("Balance top-up must be between $1.00 and $100,000.00");
+    err.code = "BILLING_TOP_UP_AMOUNT_INVALID";
+    err.status = 400;
+    err.permanent = true;
+    throw err;
+  }
+  return amount;
+}
+
+async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutKey, amountCents: rawAmountCents, db = null }) {
+  const client = db || prisma;
+  const cfg = providerConfig();
+  if (!cfg.configured) {
+    const err = new Error("NOWPayments checkout is not configured on the backend");
+    err.code = "NOWPAYMENTS_NOT_CONFIGURED";
+    err.status = 503;
+    throw err;
+  }
+  const checkoutKey = normalizeCheckoutKey(rawCheckoutKey);
+  const amountCents = normalizeTopUpAmountCents(rawAmountCents);
+  const requestHash = sha256(stableJson({ purpose: "WALLET_TOP_UP", amountCents, currency: "USD" }));
+  const existing = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
+  assertCheckoutRequestBinding(existing, requestHash);
+  const retryFailedSandboxOrder = !!(existing && cfg.sandbox && existing.status === "FAILED" && !existing.providerInvoiceId && !existing.providerInvoiceUrl);
+  if (existing && !retryFailedSandboxOrder) return replayExistingCheckout(existing);
+
+  const [agency, subscription] = await Promise.all([
+    client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true } }),
+    client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
+  ]);
+  if (!agency) {
+    const err = new Error("Agency not found");
+    err.code = "BILLING_AGENCY_NOT_FOUND";
+    err.status = 404;
+    throw err;
+  }
+  if (subscription?.billingMode === "FREE_INTERNAL" && cfg.live) {
+    const err = new Error("This workspace is in FREE_INTERNAL mode; live checkout is disabled to prevent accidental charges");
+    err.code = "BILLING_FREE_INTERNAL_LIVE_CHECKOUT_DISABLED";
+    err.status = 409;
+    throw err;
+  }
+
+  const snapshot = { purpose: "WALLET_TOP_UP", agencyName: agency.name, plan: agency.plan, amountCents, currency: "USD" };
+  let order;
+  try {
+    order = retryFailedSandboxOrder
+      ? await runTransaction(client, async (tx) => tx.billingOrder.update({
+          where: { id: existing.id },
+          data: {
+            purpose: "WALLET_TOP_UP", status: "CREATED", providerStatus: null, amountCents, currency: "USD",
+            billingPeriod: "MONTHLY", periodMonths: 1, billedCreators: 0, pricingSnapshot: snapshot, requestHash,
+            providerInvoiceId: null, providerInvoiceUrl: null, paidAt: null, activatedAt: null,
+          },
+        }))
+      : await client.billingOrder.create({
+          data: {
+            agencyId, createdByUserId: actorUserId || null, provider: PROVIDER, purpose: "WALLET_TOP_UP", status: "CREATED",
+            amountCents, currency: "USD", billingPeriod: "MONTHLY", periodMonths: 1, billedCreators: 0,
+            pricingSnapshot: snapshot, requestHash, testMode: cfg.sandbox, checkoutKey,
+          },
+        });
+  } catch (err) {
+    if (err?.code !== "P2002") throw err;
+    const raced = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
+    if (!raced) throw err;
+    assertCheckoutRequestBinding(raced, requestHash);
+    return replayExistingCheckout(raced);
+  }
+
+  const priceAmount = Number((amountCents / 100).toFixed(2));
+  const body = {
+    price_amount: priceAmount,
+    price_currency: "usd",
+    order_id: order.id,
+    order_description: `ONLINOD balance top-up · $${priceAmount.toFixed(2)}`,
+    ...invoiceUrls(order.id, cfg),
+    is_fee_paid_by_user: cfg.feePaidByUser,
+  };
+  try {
+    const invoice = await nowPaymentsRequest("/invoice", { method: "POST", body });
+    const providerInvoiceId = clean(invoice.invoice_id ?? invoice.id, 180);
+    const providerInvoiceUrl = clean(invoice.invoice_url, 2000);
+    if (!providerInvoiceId || !providerInvoiceUrl) {
+      const err = new Error("NOWPayments invoice response did not contain invoice_id/invoice_url");
+      err.code = "NOWPAYMENTS_INVOICE_INVALID";
+      err.status = 502;
+      throw err;
+    }
+    const updated = await client.billingOrder.update({
+      where: { id: order.id },
+      data: { status: "CHECKOUT_CREATED", providerInvoiceId, providerInvoiceUrl, providerStatus: clean(invoice.payment_status || invoice.status, 80) || "waiting" },
+    });
+    await audit({ agencyId, actorUserId, action: "billing.wallet_top_up_checkout_created", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, testMode: cfg.sandbox, amountCents, currency: "USD" }, db: client }).catch(() => undefined);
+    return { order: publicOrder(updated), checkoutUrl: providerInvoiceUrl };
+  } catch (err) {
+    await client.billingOrder.update({ where: { id: order.id }, data: { status: "FAILED", providerStatus: clean(err?.code || "CREATE_INVOICE_FAILED", 80) } }).catch(() => undefined);
+    throw err;
+  }
+}
+
 function verifyIpnSignature(payload, signature) {
   const cfg = providerConfig();
   const received = clean(signature, 256).toLowerCase();
@@ -693,8 +799,16 @@ async function applyProviderPayment(payload, { signature = null, signatureVerifi
     candidateStatus = advanced.candidateStatus;
 
     let activation = null;
-    if (candidateStatus === "PAID") activation = await activatePaidOrder(order.id, client);
-    if (candidateStatus === "REFUNDED") await handleRefundedOrder(order, client);
+    const purpose = String(order.purpose || "SUBSCRIPTION");
+    if (candidateStatus === "PAID") {
+      activation = purpose === "WALLET_TOP_UP"
+        ? await creditPaidTopUp({ orderId: order.id, sandboxActivationEnabled: config.sandboxActivationEnabled, db: client })
+        : await activatePaidOrder(order.id, client);
+    }
+    if (candidateStatus === "REFUNDED") {
+      if (purpose === "WALLET_TOP_UP") await refundTopUp({ order, db: client });
+      else await handleRefundedOrder(order, client);
+    }
 
     await client.billingProviderEvent.update({ where: { id: event.id }, data: { processedAt: new Date(), processingError: null } });
     if (candidateStatus === "PAID" || candidateStatus === "REFUNDED") {
@@ -775,7 +889,12 @@ async function reconcileOrder({ agencyId, orderId, actorUserId = null, db = null
   let reconciledOrder = result.order || publicOrder(order);
   let activation = result.activation || null;
   if (reconciledOrder?.status === "PAID" && !reconciledOrder.activatedAt) {
-    activation = await activatePaidOrder(order.id, client);
+    // Recovery must preserve the order purpose. A wallet top-up is activated
+    // only by crediting its wallet ledger; sending it through the legacy
+    // subscription activator could claim activatedAt without crediting funds.
+    activation = String(reconciledOrder.purpose || order.purpose || "SUBSCRIPTION") === "WALLET_TOP_UP"
+      ? await creditPaidTopUp({ orderId: order.id, sandboxActivationEnabled: cfg.sandboxActivationEnabled, db: client })
+      : await activatePaidOrder(order.id, client);
     reconciledOrder = publicOrder(await client.billingOrder.findUnique({ where: { id: order.id } })) || reconciledOrder;
   }
   await audit({ agencyId, actorUserId, action: "billing.payment_reconciled", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, providerPaymentId: attempt.providerPaymentId, providerStatus: normalizeStatus(payload.payment_status || payload.status), activated: activation?.activated === true }, db: client });
@@ -787,6 +906,7 @@ function publicOrder(row) {
   return {
     id: String(row.id),
     provider: String(row.provider || PROVIDER),
+    purpose: String(row.purpose || "SUBSCRIPTION"),
     status: String(row.status),
     amountCents: Number(row.amountCents || 0),
     currency: String(row.currency || "USD"),
@@ -835,6 +955,7 @@ module.exports = {
   verifyIpnSignature,
   calculateCheckoutSnapshot,
   createCheckout,
+  createWalletTopUpCheckout,
   handleNowPaymentsIpn,
   reconcileOrder,
   recentOrders,
@@ -844,5 +965,6 @@ module.exports = {
   updateOrderStatusMonotonically,
   validateProviderPaymentForOrder,
   normalizeCheckoutKey,
+  normalizeTopUpAmountCents,
   applyProviderPayment,
 };

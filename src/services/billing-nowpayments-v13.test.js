@@ -44,11 +44,13 @@ function withEnv(values, fn) {
   }
 }
 
-function loadService(prismaMock = {}, auditMock = async () => null) {
+function loadService(prismaMock = {}, auditMock = async () => null, dependencyMocks = {}) {
   const original = Module._load;
   Module._load = function(request, parent, isMain) {
     if (request === "../prisma") return prismaMock;
     if (request === "./audit-service") return { audit: auditMock };
+    if (request === "./billing-wallet-service" && dependencyMocks.wallet) return dependencyMocks.wallet;
+    if (request === "./billing-entitlement-service" && dependencyMocks.entitlement) return dependencyMocks.entitlement;
     return original.call(this, request, parent, isMain);
   };
   try {
@@ -268,6 +270,18 @@ test("NOWPayments sandbox/live configuration never leaks secrets and uses offici
   assert.equal(publicConfig.environment, "sandbox");
   assert.equal(publicConfig.configured, true);
   assert.equal(publicConfig.testMode, true);
+  assert.equal(publicConfig.liveAutoPricingEnabled, false);
+  assert.equal("apiKey" in publicConfig, false);
+  assert.equal("ipnSecret" in publicConfig, false);
+}));
+
+test("public provider config exposes the explicit live auto-pricing safety gate without leaking secrets", () => withEnv({
+  NOWPAYMENTS_MODE: "live", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", BILLING_LIVE_AUTO_PRICING_ENABLED: "1",
+}, () => {
+  const service = loadService();
+  const publicConfig = service.publicProviderConfig();
+  assert.equal(publicConfig.environment, "live");
+  assert.equal(publicConfig.liveAutoPricingEnabled, true);
   assert.equal("apiKey" in publicConfig, false);
   assert.equal("ipnSecret" in publicConfig, false);
 }));
@@ -545,6 +559,49 @@ test("manual reconciliation can activate an already-paid sandbox order after act
   } finally { global.fetch = previousFetch; }
 });
 
+test("manual reconciliation of a paid wallet top-up never claims subscription activation and remains recoverable", async () => {
+  const db = makeProcessingDb();
+  db._setOrder({ purpose: "WALLET_TOP_UP", status: "PAID", billedCreators: 0, pricingSnapshot: { purpose: "WALLET_TOP_UP" }, activatedAt: null });
+  db._seedAttempt({ id: "attempt-topup-recover", providerPaymentId: "payment-topup-recover", providerStatus: "finished" });
+  const payload = { payment_id: "payment-topup-recover", payment_status: "finished", order_id: "order-1", invoice_id: "invoice-1", price_amount: 20, price_currency: "usd" };
+  const previousFetch = global.fetch;
+  global.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(payload) });
+  let creditCalls = 0;
+  let subscriptionActivationCalls = 0;
+  const dependencyMocks = {
+    wallet: {
+      creditPaidTopUp: async ({ sandboxActivationEnabled }) => {
+        creditCalls += 1;
+        if (sandboxActivationEnabled !== true) return { credited: false, reason: "SANDBOX_ACTIVATION_DISABLED" };
+        db._setOrder({ activatedAt: new Date("2026-08-14T13:00:00Z") });
+        return { credited: true };
+      },
+      refundTopUp: async () => ({ reversed: false }),
+    },
+    entitlement: {
+      activatePaidOrderEntitlements: async () => { subscriptionActivationCalls += 1; return { activated: true }; },
+      refundOrderEntitlements: async () => ({ changed: 0 }),
+    },
+  };
+  try {
+    await withEnv({ NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE: "0", NODE_ENV: "production" }, async () => {
+      const service = loadService(db, async () => null, dependencyMocks);
+      const first = await service.reconcileOrder({ agencyId: "agency-1", orderId: "order-1", actorUserId: "owner", db });
+      assert.equal(first.order.status, "PAID");
+      assert.equal(first.order.activatedAt, null);
+      assert.equal(subscriptionActivationCalls, 0);
+    });
+    await withEnv({ NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE: "1", NODE_ENV: "production" }, async () => {
+      const service = loadService(db, async () => null, dependencyMocks);
+      const second = await service.reconcileOrder({ agencyId: "agency-1", orderId: "order-1", actorUserId: "owner", db });
+      assert.equal(second.order.status, "PAID");
+      assert.ok(second.order.activatedAt);
+      assert.equal(subscriptionActivationCalls, 0);
+      assert.ok(creditCalls >= 3, "wallet credit path was retried instead of subscription activation");
+    });
+  } finally { global.fetch = previousFetch; }
+});
+
 test("provider payment identifiers are environment-scoped and a payment_id cannot be rebound to a different local order", async () => withEnv({
   NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com",
 }, async () => {
@@ -804,7 +861,7 @@ test("V13.3.1 refund never resurrects a payment predecessor that was already ref
     { id: "line-a", orderId: "order-a", agencyId: "agency-1", creatorId: "creator-1", tier: "STARTER", corePriceCents: 2000, coreGrantedUntil: aUntil, activatedAt: activatedA, refundedAt: new Date("2026-08-20T00:00:00Z") },
     { id: "line-b", orderId: "order-b", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", corePriceCents: 3500, previousTier: "STARTER", corePreviousSource: "PAYMENT", corePreviousPriceCents: 2000, corePreviousValidUntil: aUntil, coreGrantedUntil: bUntil, activatedAt: activatedB, refundedAt: null },
   ];
-  let entitlement = { id: "ent-1", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: bUntil, coreLastOrderId: "order-b" };
+  let entitlement = { id: "ent-1", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: bUntil, coreLastOrderId: "order-b", autoRenewEnabled: true, walletTestMode: false, amountChargedForPeriodCents: 3500, currentPeriodStartedAt: activatedB, currentPeriodEndsAt: bUntil, nextRenewalAt: bUntil, billingAnchorDay: 10 };
   const orders = new Map([
     ["order-a", { id: "order-a", status: "REFUNDED", paidAt: activatedA, activatedAt: activatedA }],
     ["order-b", { id: "order-b", status: "REFUNDED", paidAt: activatedB, activatedAt: activatedB }],
@@ -834,6 +891,44 @@ test("V13.3.1 refund never resurrects a payment predecessor that was already ref
   assert.equal(entitlement.coreValidUntil, null);
   assert.equal(entitlement.coreLastOrderId, null);
   assert.equal(entitlement.coreSource, "LEGACY");
+  assert.equal(entitlement.autoRenewEnabled, false);
+  assert.equal(entitlement.walletTestMode, null);
+  assert.equal(entitlement.amountChargedForPeriodCents, 0);
+  assert.equal(entitlement.nextRenewalAt, null);
+});
+
+test("V14 refund restores an ADMIN predecessor without inheriting refunded wallet authority", async () => {
+  const activated = new Date("2026-08-10T00:00:00Z");
+  const adminUntil = new Date("2026-09-01T00:00:00Z");
+  const paidUntil = new Date("2026-10-01T00:00:00Z");
+  const line = { id: "line-paid", orderId: "order-paid", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", corePriceCents: 3500, previousTier: "STARTER", corePreviousSource: "ADMIN", corePreviousPriceCents: 0, corePreviousValidUntil: adminUntil, coreGrantedUntil: paidUntil, activatedAt: activated, refundedAt: null };
+  let entitlement = { id: "ent-1", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: paidUntil, coreLastOrderId: "order-paid", autoRenewEnabled: true, walletTestMode: false, amountChargedForPeriodCents: 3500, currentPeriodStartedAt: activated, currentPeriodEndsAt: paidUntil, nextRenewalAt: paidUntil, billingAnchorDay: 10 };
+  const db = {
+    billingOrder: { findUnique: async () => ({ id: "order-paid", agencyId: "agency-1", status: "REFUNDED", paidAt: activated, activatedAt: activated, testMode: false }) },
+    billingOrderLine: {
+      findMany: async () => [{ ...line }],
+      findFirst: async () => null,
+      update: async ({ data }) => { Object.assign(line, data); return { ...line }; },
+    },
+    creatorBillingEntitlement: {
+      findUnique: async () => ({ ...entitlement }),
+      update: async ({ data }) => { entitlement = { ...entitlement, ...data }; return { ...entitlement }; },
+      findFirst: async () => ({ ...entitlement }),
+    },
+    agencySubscription: { findFirst: async () => ({ id: "sub-1", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: paidUntil }), update: async ({ data }) => data },
+    agency: { update: async ({ data }) => data },
+  };
+  db.$transaction = async (fn) => fn(db);
+  const service = loadEntitlementService(db);
+  await service.refundOrderEntitlements({ order: { id: "order-paid", agencyId: "agency-1", activatedAt: activated }, db });
+  assert.equal(entitlement.coreSource, "ADMIN");
+  assert.equal(entitlement.coreValidUntil.toISOString(), adminUntil.toISOString());
+  assert.equal(entitlement.autoRenewEnabled, false);
+  assert.equal(entitlement.walletTestMode, null);
+  assert.equal(entitlement.amountChargedForPeriodCents, 0);
+  assert.equal(entitlement.currentPeriodStartedAt, null);
+  assert.equal(entitlement.nextRenewalAt, null);
+  assert.equal(entitlement.billingAnchorDay, 1);
 });
 
 test("V13.3.1 refund restores the latest still-paid predecessor but preserves a later admin tier edit", async () => {
@@ -842,12 +937,12 @@ test("V13.3.1 refund restores the latest still-paid predecessor but preserves a 
   const aUntil = new Date("2026-09-01T00:00:00Z");
   const bUntil = new Date("2026-10-01T00:00:00Z");
   const lines = [
-    { id: "line-a", orderId: "order-a", agencyId: "agency-1", creatorId: "creator-1", tier: "STARTER", corePriceCents: 2000, coreGrantedUntil: aUntil, activatedAt: activatedA, refundedAt: null },
+    { id: "line-a", orderId: "order-a", agencyId: "agency-1", creatorId: "creator-1", tier: "STARTER", corePriceCents: 2000, lineTotalCents: 2000, coreGrantedUntil: aUntil, activatedAt: activatedA, refundedAt: null },
     { id: "line-b", orderId: "order-b", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", corePriceCents: 3500, previousTier: "STARTER", corePreviousSource: "PAYMENT", corePreviousPriceCents: 2000, corePreviousValidUntil: aUntil, coreGrantedUntil: bUntil, activatedAt: activatedB, refundedAt: null },
   ];
   let entitlement = { id: "ent-1", agencyId: "agency-1", creatorId: "creator-1", tier: "ELITE", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: bUntil, coreLastOrderId: "order-b" };
   const orders = new Map([
-    ["order-a", { id: "order-a", status: "PAID", paidAt: activatedA, activatedAt: activatedA }],
+    ["order-a", { id: "order-a", status: "PAID", paidAt: activatedA, activatedAt: activatedA, testMode: false }],
     ["order-b", { id: "order-b", status: "REFUNDED", paidAt: activatedB, activatedAt: activatedB }],
   ]);
   const db = {
@@ -877,6 +972,46 @@ test("V13.3.1 refund restores the latest still-paid predecessor but preserves a 
   assert.equal(entitlement.corePriceCents, 2000);
   assert.equal(entitlement.coreSource, "PAYMENT");
   assert.equal(entitlement.tier, "ELITE");
+  assert.equal(entitlement.autoRenewEnabled, false);
+  assert.equal(entitlement.walletTestMode, false);
+  assert.equal(entitlement.amountChargedForPeriodCents, 2000);
+  assert.equal(entitlement.currentPeriodStartedAt.toISOString(), activatedA.toISOString());
+  assert.equal(entitlement.nextRenewalAt, null);
+  assert.equal(entitlement.billingAnchorDay, 1);
+});
+
+test("V14 refund never auto-renews an already-expired paid predecessor", async () => {
+  const activatedA = new Date("2020-01-01T00:00:00Z");
+  const activatedB = new Date("2020-02-01T00:00:00Z");
+  const aUntil = new Date("2020-02-01T00:00:00Z");
+  const bUntil = new Date("2020-03-01T00:00:00Z");
+  const lines = [
+    { id: "line-a-old", orderId: "order-a-old", agencyId: "agency-1", creatorId: "creator-1", tier: "STARTER", corePriceCents: 2000, lineTotalCents: 2000, coreGrantedUntil: aUntil, activatedAt: activatedA, refundedAt: null },
+    { id: "line-b-old", orderId: "order-b-old", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", corePriceCents: 3500, coreGrantedUntil: bUntil, activatedAt: activatedB, refundedAt: null },
+  ];
+  const orders = new Map([
+    ["order-a-old", { id: "order-a-old", status: "PAID", paidAt: activatedA, activatedAt: activatedA, testMode: false }],
+    ["order-b-old", { id: "order-b-old", status: "REFUNDED", paidAt: activatedB, activatedAt: activatedB, testMode: false }],
+  ]);
+  let entitlement = { id: "ent-old", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: bUntil, coreLastOrderId: "order-b-old", autoRenewEnabled: true, walletTestMode: false, amountChargedForPeriodCents: 3500 };
+  const db = {
+    billingOrder: { findUnique: async ({ where }) => { const row = orders.get(where.id); return row ? { ...row, agencyId: "agency-1" } : null; } },
+    billingOrderLine: {
+      findMany: async ({ where }) => lines.filter((row) => row.orderId === where.orderId).map((row) => ({ ...row })),
+      findFirst: async ({ where }) => { const row = lines.find((candidate) => candidate.creatorId === where.creatorId && candidate.orderId !== where.orderId.not && candidate.activatedAt && !candidate.refundedAt && candidate.coreGrantedUntil && orders.get(candidate.orderId)?.status === "PAID"); return row ? { ...row, order: orders.get(row.orderId) } : null; },
+      update: async ({ where, data }) => { const row = lines.find((candidate) => candidate.id === where.id); Object.assign(row, data); return { ...row }; },
+    },
+    creatorBillingEntitlement: { findUnique: async () => ({ ...entitlement }), update: async ({ data }) => { entitlement = { ...entitlement, ...data }; return { ...entitlement }; }, findFirst: async () => null },
+    agencySubscription: { findFirst: async () => ({ id: "sub-old", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: bUntil }), update: async ({ data }) => data },
+    agency: { update: async ({ data }) => data },
+  };
+  db.$transaction = async (fn) => fn(db);
+  const service = loadEntitlementService(db);
+  await service.refundOrderEntitlements({ order: { id: "order-b-old", agencyId: "agency-1" }, db });
+  assert.equal(entitlement.coreLastOrderId, "order-a-old");
+  assert.equal(entitlement.coreValidUntil.toISOString(), aUntil.toISOString());
+  assert.equal(entitlement.autoRenewEnabled, false);
+  assert.equal(entitlement.nextRenewalAt, null);
 });
 
 test("V13.3.1 aggregate lookup excludes soft-deleted creators", async () => {

@@ -8,6 +8,7 @@ const { canUsePermission, isOwner } = require("./team-access-control");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
+const { getWalletState, readRolling30dRevenueBatch, pricingPreviewFromRevenue } = require("./billing-wallet-service");
 
 const WORKSPACE_SETTING_DEFAULTS = Object.freeze({
   timezone: "UTC",
@@ -295,24 +296,35 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
   return after;
 }
 
-function billingLine(creator, defaultCorePriceCents = 2000, now = new Date()) {
+function billingLine(creator, pricing, defaultCorePriceCents = 2000, now = new Date()) {
   const profile = creator?.billingProfile || null;
   const excluded = profile?.billingExcluded === true;
-  const core = excluded ? 0 : Math.max(0, Number(profile?.corePriceCents ?? defaultCorePriceCents ?? 2000));
-  const ai = !excluded && profile?.aiChatterEnabled ? Math.max(0, Number(profile.aiChatterPriceCents || 0)) : 0;
-  const outreach = !excluded && profile?.outreachEnabled ? Math.max(0, Number(profile.outreachPriceCents || 0)) : 0;
+  const preview = pricing || null;
+  const core = excluded ? 0 : Math.max(0, Number(preview?.corePriceCents ?? profile?.corePriceCents ?? defaultCorePriceCents ?? 2000));
+  const aiEnabled = !excluded && profile?.aiChatterEnabled === true;
+  const outreachEnabled = !excluded && profile?.outreachEnabled === true;
+  const ai = aiEnabled ? Math.max(0, Number(preview?.aiChatterPriceCents ?? profile?.aiChatterPriceCents ?? 10000)) : 0;
+  const outreach = outreachEnabled ? Math.max(0, Number(preview?.outreachPriceCents ?? profile?.outreachPriceCents ?? 2900)) : 0;
   return {
     creatorId: String(creator.id),
     creatorName: creator.displayName || creator.username || String(creator.id),
     creatorUsername: creator.username || null,
-    tier: String(profile?.tier || "STARTER"),
+    tier: String(preview?.tier || profile?.tier || "STARTER"),
+    tierMode: String(profile?.tierMode || "AUTO"),
+    pricingSource: preview?.pricingSource || "AUTO_30D",
+    pricingAvailable: preview?.available === true,
+    pricingErrorCode: preview?.errorCode || null,
+    revenue30dCents: preview?.revenue30dCents == null ? null : Number(preview.revenue30dCents),
+    revenueCapturedAt: preview?.revenueCapturedAt ? new Date(preview.revenueCapturedAt).toISOString() : null,
+    revenueSource: preview?.revenueSource || null,
     corePriceCents: core,
-    aiChatterEnabled: profile?.aiChatterEnabled === true,
+    aiChatterEnabled: aiEnabled,
     aiChatterPriceCents: Math.max(0, Number(profile?.aiChatterPriceCents ?? 10000)),
-    outreachEnabled: profile?.outreachEnabled === true,
+    outreachEnabled,
     outreachPriceCents: Math.max(0, Number(profile?.outreachPriceCents ?? 2900)),
     billingExcluded: excluded,
     lineTotalCents: core + ai + outreach,
+    estimatedNextChargeCents: excluded || preview?.available !== true ? null : Math.max(0, Number(preview.totalCents || 0)),
     entitlement: publicEntitlement(creator?.billingEntitlement || null, now),
   };
 }
@@ -321,7 +333,8 @@ async function getBillingSettings({ agencyId, member, db = null }) {
   const client = db || prisma;
   if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY" };
   const now = new Date();
-  const [agency, subscription, creators, orders] = await Promise.all([
+  const providerBase = publicProviderConfig();
+  const [agency, subscription, creators, orders, walletState] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),
     client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
     client.creatorAccount.findMany({
@@ -329,12 +342,28 @@ async function getBillingSettings({ agencyId, member, db = null }) {
       include: { billingProfile: true, billingEntitlement: true },
       orderBy: { createdAt: "asc" },
     }),
-    recentOrders({ agencyId, limit: 10, db: client }),
+    recentOrders({ agencyId, limit: 20, db: client }),
+    getWalletState({ agencyId, testMode: providerBase.testMode === true, db: client, limit: 40 }),
   ]);
+  const creatorIds = creators.map((creator) => creator.id);
+  const revenueByCreator = await readRolling30dRevenueBatch({ db: client, creatorIds, now });
   const defaultCorePriceCents = Math.max(0, Number(subscription?.corePricePerCreatorCents ?? 2000));
-  const rows = creators.map((creator) => billingLine(creator, defaultCorePriceCents, now));
+  const rows = creators.map((creator) => {
+    const pricing = pricingPreviewFromRevenue({ profile: creator.billingProfile, revenue: revenueByCreator.get(String(creator.id)) || null });
+    return billingLine(creator, pricing, defaultCorePriceCents, now);
+  });
   const monthlyTotalCents = rows.reduce((sum, row) => sum + row.lineTotalCents, 0);
   const activeRows = rows.filter((row) => row.entitlement.coreActive);
+  const autoRenewRows = rows.filter((row) => row.entitlement.autoRenewEnabled && !row.billingExcluded);
+  const thirtyDayHorizon = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const upcomingAutoRenewRows = autoRenewRows.filter((row) => {
+    const renewalAt = row.entitlement.nextRenewalAt || row.entitlement.coreValidUntil;
+    if (!renewalAt) return false;
+    const date = new Date(renewalAt);
+    return Number.isFinite(date.getTime()) && date <= thirtyDayHorizon;
+  });
+  const estimatedNext30DaysCents = upcomingAutoRenewRows.reduce((sum, row) => sum + Number(row.estimatedNextChargeCents || 0), 0);
+  const pricingDataUnavailableCreators = upcomingAutoRenewRows.filter((row) => row.estimatedNextChargeCents == null).length;
   const maxEntitlementEnd = activeRows
     .map((row) => row.entitlement.coreValidUntil ? new Date(row.entitlement.coreValidUntil) : null)
     .filter((value) => value && Number.isFinite(value.getTime()))
@@ -344,6 +373,7 @@ async function getBillingSettings({ agencyId, member, db = null }) {
   const effectiveStatus = billingMode !== "FREE_INTERNAL" && rawStatus === "ACTIVE" && activeRows.length === 0
     ? "PAST_DUE"
     : activeRows.length > 0 ? "ACTIVE" : rawStatus;
+  const liveCheckoutBlockedByInternalTestMode = billingMode === "FREE_INTERNAL" && providerBase.environment === "live";
 
   return {
     available: true,
@@ -353,7 +383,7 @@ async function getBillingSettings({ agencyId, member, db = null }) {
       status: subscription.status,
       effectiveStatus,
       billingMode,
-      billingPeriod: subscription.billingPeriod,
+      billingPeriod: "MONTHLY",
       corePricePerCreatorCents: subscription.corePricePerCreatorCents,
       trialEndsAt: subscription.trialEndsAt,
       graceUntil: subscription.graceUntil,
@@ -365,19 +395,19 @@ async function getBillingSettings({ agencyId, member, db = null }) {
     activeEntitledCreators: activeRows.length,
     creatorsCount: rows.length,
     monthlyTotalCents,
+    estimatedNext30DaysCents,
+    pricingDataUnavailableCreators,
+    wallet: walletState.wallet,
+    walletTransactions: walletState.transactions,
     creators: rows,
     catalog: catalogForClient(),
-    provider: (() => {
-      const provider = publicProviderConfig();
-      const liveCheckoutBlockedByInternalTestMode = billingMode === "FREE_INTERNAL" && provider.environment === "live";
-      return {
-        mode: billingMode,
-        internalTestMode: billingMode === "FREE_INTERNAL",
-        ...provider,
-        checkoutAvailable: provider.checkoutAvailable && !liveCheckoutBlockedByInternalTestMode,
-        liveCheckoutBlockedByInternalTestMode,
-      };
-    })(),
+    provider: {
+      mode: billingMode,
+      internalTestMode: billingMode === "FREE_INTERNAL",
+      ...providerBase,
+      checkoutAvailable: providerBase.checkoutAvailable && !liveCheckoutBlockedByInternalTestMode,
+      liveCheckoutBlockedByInternalTestMode,
+    },
     recentOrders: orders,
   };
 }
