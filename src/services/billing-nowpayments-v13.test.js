@@ -270,32 +270,10 @@ test("NOWPayments sandbox/live configuration never leaks secrets and uses offici
   assert.equal(publicConfig.environment, "sandbox");
   assert.equal(publicConfig.configured, true);
   assert.equal(publicConfig.testMode, true);
-  assert.equal(publicConfig.sandboxSimulation, true);
-  assert.equal(publicConfig.sandboxCase, "success");
-  assert.equal(publicConfig.sandboxPayCurrency, "btc");
   assert.equal(publicConfig.liveAutoPricingEnabled, false);
   assert.equal("apiKey" in publicConfig, false);
   assert.equal("ipnSecret" in publicConfig, false);
 }));
-
-test("sandbox simulation configuration fails closed on an unsupported case or malformed pay currency", () => {
-  withEnv({
-    NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com",
-    NOWPAYMENTS_SANDBOX_CASE: "explode", NOWPAYMENTS_SANDBOX_PAY_CURRENCY: "btc",
-  }, () => {
-    const config = loadService().publicProviderConfig();
-    assert.equal(config.configured, false);
-    assert.ok(config.missingConfiguration.some((item) => item.startsWith("NOWPAYMENTS_SANDBOX_CASE")));
-  });
-  withEnv({
-    NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com",
-    NOWPAYMENTS_SANDBOX_CASE: "success", NOWPAYMENTS_SANDBOX_PAY_CURRENCY: "<script>",
-  }, () => {
-    const config = loadService().publicProviderConfig();
-    assert.equal(config.configured, false);
-    assert.ok(config.missingConfiguration.some((item) => item.startsWith("NOWPAYMENTS_SANDBOX_PAY_CURRENCY")));
-  });
-});
 
 test("public provider config exposes the explicit live auto-pricing safety gate without leaking secrets", () => withEnv({
   NOWPAYMENTS_MODE: "live", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", BILLING_LIVE_AUTO_PRICING_ENABLED: "1",
@@ -303,9 +281,6 @@ test("public provider config exposes the explicit live auto-pricing safety gate 
   const service = loadService();
   const publicConfig = service.publicProviderConfig();
   assert.equal(publicConfig.environment, "live");
-  assert.equal(publicConfig.sandboxSimulation, false);
-  assert.equal(publicConfig.sandboxCase, null);
-  assert.equal(publicConfig.sandboxPayCurrency, null);
   assert.equal(publicConfig.liveAutoPricingEnabled, true);
   assert.equal("apiKey" in publicConfig, false);
   assert.equal("ipnSecret" in publicConfig, false);
@@ -324,6 +299,26 @@ test("provider configuration rejects local callback URLs, unofficial API bases a
   assert.ok(publicConfig.missingConfiguration.includes("PUBLIC_BASE_URL (public HTTPS URL)"));
   assert.ok(publicConfig.missingConfiguration.some((item) => item.startsWith("NOWPAYMENTS_API_BASE")));
 }));
+
+test("sandbox hosted invoice URL is normalized to the documented NOWPayments checkout origin", () => {
+  const service = loadService();
+  assert.equal(
+    service.normalizeHostedInvoiceUrl("https://sandbox.nowpayments.io/payment/?iid=5040719673", true),
+    "https://nowpayments.io/payment/?iid=5040719673",
+  );
+  assert.equal(
+    service.normalizeHostedInvoiceUrl("https://nowpayments.io/payment/?iid=5040719673", true),
+    "https://nowpayments.io/payment/?iid=5040719673",
+  );
+  assert.equal(service.normalizeHostedInvoiceUrl("http://nowpayments.io/payment/?iid=x", true), "");
+  assert.equal(service.normalizeHostedInvoiceUrl("https://evil.example/payment/?iid=x", true), "");
+  const legacy = service.publicOrder({
+    id: "legacy-sandbox-order", provider: "NOWPAYMENTS", purpose: "WALLET_TOP_UP", status: "CHECKOUT_CREATED", amountCents: 6000, currency: "USD",
+    billingPeriod: "MONTHLY", periodMonths: 1, billedCreators: 0, lines: [], providerInvoiceId: "5040719673",
+    providerInvoiceUrl: "https://sandbox.nowpayments.io/payment/?iid=5040719673", providerStatus: "waiting", testMode: true,
+  });
+  assert.equal(legacy.providerInvoiceUrl, "https://nowpayments.io/payment/?iid=5040719673");
+});
 
 test("NOWPayments IPN signature verification uses deterministic recursive sorting + HMAC SHA-512", () => withEnv({
   NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "very-secret", PUBLIC_BASE_URL: "https://api.example.com",
