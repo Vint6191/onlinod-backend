@@ -425,45 +425,53 @@ function invoiceUrls(orderId, cfg) {
 }
 
 
-const SANDBOX_CHECKOUT_TTL_MS = 2 * 60 * 60 * 1000;
 const TERMINAL_ORDER_STATUSES = new Set(["PAID", "REFUNDED", "EXPIRED", "FAILED", "CANCELLED"]);
 
-function sandboxCheckoutCase() {
-  const value = clean(process.env.NOWPAYMENTS_SANDBOX_CASE || "success", 32).toLowerCase();
-  return new Set(["success", "common", "failed", "partially_paid"]).has(value) ? value : "success";
+function isNowPaymentsHost(host) {
+  const value = String(host || "").toLowerCase();
+  return value === "nowpayments.io" || value.endsWith(".nowpayments.io");
 }
 
-function signSandboxCheckoutToken(order, cfg, expiresAtMs = Date.now() + SANDBOX_CHECKOUT_TTL_MS) {
-  if (!cfg.sandbox || !cfg.ipnSecret || !order?.id || !order?.providerInvoiceId) return "";
-  const expires = Math.floor(expiresAtMs / 1000);
-  const payload = `v1|${String(order.id)}|${String(order.providerInvoiceId)}|${expires}`;
-  const sig = crypto.createHmac("sha256", cfg.ipnSecret).update(payload).digest("hex");
-  return `${expires}.${sig}`;
+function isSandboxHostedCheckoutHost(host) {
+  return String(host || "").toLowerCase() === "sandbox.nowpayments.io";
 }
 
-function verifySandboxCheckoutToken(order, token, cfg) {
-  if (!cfg.sandbox || !cfg.ipnSecret || !order?.id || !order?.providerInvoiceId) return false;
-  const match = /^(\d{10})\.([0-9a-f]{64})$/i.exec(clean(token, 200));
-  if (!match) return false;
-  const expires = Number(match[1]);
-  if (!Number.isSafeInteger(expires) || expires * 1000 < Date.now()) return false;
-  const payload = `v1|${String(order.id)}|${String(order.providerInvoiceId)}|${expires}`;
-  const expected = crypto.createHmac("sha256", cfg.ipnSecret).update(payload).digest();
-  const received = Buffer.from(match[2], "hex");
-  return received.length === expected.length && crypto.timingSafeEqual(received, expected);
-}
-
-function sandboxCheckoutUrlForOrder(order, cfg) {
-  const token = signSandboxCheckoutToken(order, cfg);
-  if (!token) return "";
-  return `${cfg.publicBaseUrl}/api/billing/sandbox-checkout/${encodeURIComponent(order.id)}?token=${encodeURIComponent(token)}`;
+function validateHostedCheckoutUrl(value, cfg = providerConfig()) {
+  const text = clean(value, 2000);
+  if (!text) return "";
+  let url;
+  try {
+    url = new URL(text);
+  } catch {
+    throw permanentBindingError("NOWPayments returned an invalid hosted checkout URL", "BILLING_PROVIDER_CHECKOUT_URL_INVALID");
+  }
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== "https:" || url.username || url.password || !isNowPaymentsHost(host)) {
+    throw permanentBindingError("NOWPayments returned an untrusted hosted checkout URL", "BILLING_PROVIDER_CHECKOUT_URL_UNTRUSTED");
+  }
+  if (cfg.sandbox && !isSandboxHostedCheckoutHost(host)) {
+    const err = permanentBindingError(
+      "NOWPayments sandbox did not return its own hosted checkout. ONLINOD will not open a production NOWPayments invoice for a sandbox order.",
+      "BILLING_SANDBOX_HOSTED_CHECKOUT_UNAVAILABLE",
+    );
+    err.status = 502;
+    throw err;
+  }
+  if (cfg.live && isSandboxHostedCheckoutHost(host)) {
+    const err = permanentBindingError(
+      "NOWPayments live mode returned a sandbox hosted checkout URL",
+      "BILLING_LIVE_CHECKOUT_ENVIRONMENT_MISMATCH",
+    );
+    err.status = 502;
+    throw err;
+  }
+  return url.toString();
 }
 
 function checkoutUrlForOrder(order, cfg = providerConfig()) {
   if (!order) return "";
   if ((order.testMode === true) !== cfg.sandbox) return "";
-  if (cfg.sandbox) return sandboxCheckoutUrlForOrder(order, cfg);
-  return clean(order.providerInvoiceUrl, 2000);
+  return validateHostedCheckoutUrl(order.providerInvoiceUrl, cfg);
 }
 
 function validateInvoiceResponseForOrder(order, invoice) {
@@ -482,144 +490,6 @@ function validateInvoiceResponseForOrder(order, invoice) {
       throw permanentBindingError("NOWPayments invoice amount does not match the ONLINOD billing order", "BILLING_PROVIDER_AMOUNT_MISMATCH");
     }
   }
-}
-
-function normalizeSandboxCurrencies(payload) {
-  const raw = Array.isArray(payload) ? payload : Array.isArray(payload?.currencies) ? payload.currencies : [];
-  const seen = new Set();
-  const out = [];
-  for (const item of raw) {
-    const value = clean(typeof item === "string" ? item : item?.currency ?? item?.code, 80).toLowerCase();
-    if (!/^[a-z0-9_-]{2,80}$/.test(value) || seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
-  }
-  return out.sort((a, b) => a.localeCompare(b));
-}
-
-function publicPaymentAttempt(row) {
-  if (!row) return null;
-  return {
-    providerPaymentId: row.providerPaymentId || null,
-    providerStatus: row.providerStatus || null,
-    payAddress: row.payAddress || null,
-    payinExtraId: row.payinExtraId || null,
-    priceAmount: row.priceAmount || null,
-    priceCurrency: row.priceCurrency || null,
-    payAmount: row.payAmount || null,
-    payCurrency: row.payCurrency || null,
-    actuallyPaid: row.actuallyPaid || null,
-    outcomeAmount: row.outcomeAmount || null,
-    outcomeCurrency: row.outcomeCurrency || null,
-    updatedAt: row.updatedAt ? new Date(row.updatedAt).toISOString() : null,
-  };
-}
-
-async function sandboxOrderFromToken({ orderId, token, db = null }) {
-  const client = db || prisma;
-  const cfg = providerConfig();
-  if (!cfg.sandbox || !cfg.configured) {
-    const err = new Error("Sandbox checkout is unavailable unless NOWPayments sandbox mode is configured");
-    err.code = "NOWPAYMENTS_SANDBOX_CHECKOUT_UNAVAILABLE";
-    err.status = 404;
-    err.permanent = true;
-    throw err;
-  }
-  const order = await client.billingOrder.findUnique({ where: { id: clean(orderId, 180) } });
-  if (!order || order.testMode !== true || order.provider !== PROVIDER || !order.providerInvoiceId) {
-    const err = new Error("Sandbox billing order not found");
-    err.code = "BILLING_ORDER_NOT_FOUND";
-    err.status = 404;
-    err.permanent = true;
-    throw err;
-  }
-  if (!verifySandboxCheckoutToken(order, token, cfg)) {
-    const err = new Error("Sandbox checkout link is invalid or expired");
-    err.code = "BILLING_SANDBOX_CHECKOUT_TOKEN_INVALID";
-    err.status = 403;
-    err.permanent = true;
-    throw err;
-  }
-  return { client, cfg, order };
-}
-
-async function getSandboxCheckoutState({ orderId, token, db = null, includeCurrencies = true }) {
-  const { client, order } = await sandboxOrderFromToken({ orderId, token, db });
-  const attempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
-  let currencies = [];
-  if (includeCurrencies && !attempt && !TERMINAL_ORDER_STATUSES.has(String(order.status))) {
-    currencies = normalizeSandboxCurrencies(await nowPaymentsRequest("/currencies"));
-  }
-  return { order: publicOrder(order), attempt: publicPaymentAttempt(attempt), currencies };
-}
-
-async function startSandboxInvoicePayment({ orderId, token, payCurrency: rawPayCurrency, db = null }) {
-  const { client, cfg, order } = await sandboxOrderFromToken({ orderId, token, db });
-  if (TERMINAL_ORDER_STATUSES.has(String(order.status))) {
-    const err = new Error(`This sandbox checkout is already ${String(order.status).toLowerCase()}`);
-    err.code = "BILLING_CHECKOUT_NOT_RESUMABLE";
-    err.status = 409;
-    err.permanent = true;
-    throw err;
-  }
-  const existingAttempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
-  if (existingAttempt?.providerPaymentId) {
-    return { order: publicOrder(order), attempt: publicPaymentAttempt(existingAttempt), reused: true };
-  }
-
-  const payCurrency = clean(rawPayCurrency, 80).toLowerCase();
-  const currencies = normalizeSandboxCurrencies(await nowPaymentsRequest("/currencies"));
-  if (!payCurrency || !currencies.includes(payCurrency)) {
-    const err = new Error("Choose a currency returned by the NOWPayments sandbox API");
-    err.code = "BILLING_SANDBOX_PAY_CURRENCY_INVALID";
-    err.status = 400;
-    err.permanent = true;
-    throw err;
-  }
-
-  const payload = await nowPaymentsRequest("/invoice-payment", {
-    method: "POST",
-    body: {
-      iid: String(order.providerInvoiceId),
-      pay_currency: payCurrency,
-      order_description: `ONLINOD balance top-up · $${(Number(order.amountCents) / 100).toFixed(2)}`,
-      case: sandboxCheckoutCase(),
-    },
-  });
-
-  const providerPaymentId = clean(payload?.payment_id ?? payload?.id, 180);
-  const returnedPayCurrency = clean(payload?.pay_currency, 80).toLowerCase();
-  const payAmount = Number(payload?.pay_amount);
-  const providerOrderId = clean(payload?.order_id, 180);
-  if (!providerPaymentId) throw permanentBindingError("NOWPayments sandbox payment did not return payment_id", "BILLING_PROVIDER_PAYMENT_ID_MISSING");
-  if (providerOrderId && providerOrderId !== String(order.id)) throw permanentBindingError("NOWPayments sandbox payment returned a different order_id", "BILLING_PROVIDER_ORDER_MISMATCH");
-  if (returnedPayCurrency && returnedPayCurrency !== payCurrency) throw permanentBindingError("NOWPayments sandbox payment returned a different pay_currency", "BILLING_PROVIDER_PAY_CURRENCY_MISMATCH");
-  if (!Number.isFinite(payAmount) || payAmount <= 0) throw permanentBindingError("NOWPayments sandbox payment returned an invalid pay_amount", "BILLING_PROVIDER_PAY_AMOUNT_INVALID");
-  validateProviderPaymentForOrder(order, payload, { requirePrice: true });
-
-  const boundPayload = {
-    ...payload,
-    order_id: providerOrderId || String(order.id),
-    invoice_id: clean(payload?.invoice_id, 180) || String(order.providerInvoiceId),
-  };
-  const applied = await applyProviderPayment(boundPayload, { signature: null, signatureVerified: false, source: "SANDBOX_CHECKOUT", db: client });
-  const attempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
-  return { order: applied.order || publicOrder(order), attempt: publicPaymentAttempt(attempt), reused: false };
-}
-
-async function refreshSandboxInvoicePayment({ orderId, token, db = null }) {
-  const { client, order } = await sandboxOrderFromToken({ orderId, token, db });
-  const attempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
-  if (!attempt?.providerPaymentId) return { order: publicOrder(order), attempt: null, reconciled: false };
-  const payload = await nowPaymentsRequest(`/payment/${encodeURIComponent(attempt.providerPaymentId)}`);
-  const fetchedPaymentId = clean(payload?.payment_id ?? payload?.id, 180);
-  const fetchedOrderId = clean(payload?.order_id, 180);
-  if (fetchedPaymentId && fetchedPaymentId !== String(attempt.providerPaymentId)) throw permanentBindingError("NOWPayments sandbox reconciliation returned a different payment_id", "BILLING_PROVIDER_PAYMENT_ID_MISMATCH");
-  if (fetchedOrderId && fetchedOrderId !== String(order.id)) throw permanentBindingError("NOWPayments sandbox reconciliation returned a different order_id", "BILLING_PROVIDER_ORDER_MISMATCH");
-  validateProviderPaymentForOrder(order, payload, { requirePrice: normalizeStatus(payload?.payment_status || payload?.status) === "finished" });
-  const applied = await applyProviderPayment({ ...payload, order_id: fetchedOrderId || String(order.id) }, { signature: null, signatureVerified: false, source: "SANDBOX_CHECKOUT_REFRESH", db: client });
-  const freshAttempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
-  return { order: applied.order || publicOrder(order), attempt: publicPaymentAttempt(freshAttempt), reconciled: true };
 }
 
 async function resumeCheckout({ agencyId, orderId, db = null }) {
@@ -759,14 +629,15 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
   try {
     const invoice = await nowPaymentsRequest("/invoice", { method: "POST", body });
     const providerInvoiceId = clean(invoice.invoice_id ?? invoice.id, 180);
-    const providerInvoiceUrl = clean(invoice.invoice_url, 2000);
+    const rawProviderInvoiceUrl = clean(invoice.invoice_url, 2000);
     validateInvoiceResponseForOrder(order, invoice);
-    if (!providerInvoiceId || !providerInvoiceUrl) {
+    if (!providerInvoiceId || !rawProviderInvoiceUrl) {
       const err = new Error("NOWPayments invoice response did not contain invoice_id/invoice_url");
       err.code = "NOWPAYMENTS_INVOICE_INVALID";
       err.status = 502;
       throw err;
     }
+    const providerInvoiceUrl = validateHostedCheckoutUrl(rawProviderInvoiceUrl, cfg);
     const updated = await client.billingOrder.update({
       where: { id: order.id },
       data: {
@@ -877,14 +748,15 @@ async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: r
   try {
     const invoice = await nowPaymentsRequest("/invoice", { method: "POST", body });
     const providerInvoiceId = clean(invoice.invoice_id ?? invoice.id, 180);
-    const providerInvoiceUrl = clean(invoice.invoice_url, 2000);
+    const rawProviderInvoiceUrl = clean(invoice.invoice_url, 2000);
     validateInvoiceResponseForOrder(order, invoice);
-    if (!providerInvoiceId || !providerInvoiceUrl) {
+    if (!providerInvoiceId || !rawProviderInvoiceUrl) {
       const err = new Error("NOWPayments invoice response did not contain invoice_id/invoice_url");
       err.code = "NOWPAYMENTS_INVOICE_INVALID";
       err.status = 502;
       throw err;
     }
+    const providerInvoiceUrl = validateHostedCheckoutUrl(rawProviderInvoiceUrl, cfg);
     const updated = await client.billingOrder.update({
       where: { id: order.id },
       data: { status: "CHECKOUT_CREATED", providerInvoiceId, providerInvoiceUrl, providerStatus: clean(invoice.payment_status || invoice.status, 80) || "waiting" },
@@ -1192,9 +1064,6 @@ module.exports = {
   createCheckout,
   createWalletTopUpCheckout,
   resumeCheckout,
-  getSandboxCheckoutState,
-  startSandboxInvoicePayment,
-  refreshSandboxInvoicePayment,
   handleNowPaymentsIpn,
   reconcileOrder,
   recentOrders,

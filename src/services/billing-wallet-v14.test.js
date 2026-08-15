@@ -583,7 +583,7 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
   for (const [key,value] of Object.entries({ NOWPAYMENTS_MODE:"sandbox", NOWPAYMENTS_API_KEY:"test-key", NOWPAYMENTS_IPN_SECRET:"test-secret", PUBLIC_BASE_URL:"https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE:"true" })) { previous[key]=process.env[key]; process.env[key]=value; }
   const oldFetch=global.fetch;
   let providerBody=null;
-  global.fetch=async (_url, options) => { providerBody=JSON.parse(options.body); return { ok:true, status:200, text:async()=>JSON.stringify({ invoice_id:"inv-top-1", invoice_url:"https://nowpayments.io/payment/top-1" }) }; };
+  global.fetch=async (_url, options) => { providerBody=JSON.parse(options.body); return { ok:true, status:200, text:async()=>JSON.stringify({ invoice_id:"inv-top-1", invoice_url:"https://sandbox.nowpayments.io/payment/top-1" }) }; };
   try {
     let order=null;
     const db={
@@ -606,7 +606,7 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
     assert.equal(result.order.billedCreators,0);
     assert.deepEqual(result.order.lines,[]);
     assert.equal(result.order.periodMonths,1);
-    assert.match(result.checkoutUrl,/^https:\/\/api\.example\.com\/api\/billing\/sandbox-checkout\/order-top-1\?token=/);
+    assert.equal(result.checkoutUrl,"https://sandbox.nowpayments.io/payment/top-1");
     assert.equal(providerBody.price_amount,61.37);
     assert.equal(providerBody.price_currency,"usd");
     assert.equal(providerBody.order_id,"order-top-1");
