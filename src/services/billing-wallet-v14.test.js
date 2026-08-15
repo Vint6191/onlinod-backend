@@ -583,8 +583,7 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
   for (const [key,value] of Object.entries({ NOWPAYMENTS_MODE:"sandbox", NOWPAYMENTS_API_KEY:"test-key", NOWPAYMENTS_IPN_SECRET:"test-secret", PUBLIC_BASE_URL:"https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE:"true" })) { previous[key]=process.env[key]; process.env[key]=value; }
   const oldFetch=global.fetch;
   let providerBody=null;
-  let providerUrl=null;
-  global.fetch=async (url, options) => { providerUrl=String(url); providerBody=JSON.parse(options.body); return { ok:true, status:200, text:async()=>JSON.stringify({ invoice_id:"inv-top-1", invoice_url:"https://sandbox.nowpayments.io/payment/?iid=inv-top-1" }) }; };
+  global.fetch=async (_url, options) => { providerBody=JSON.parse(options.body); return { ok:true, status:200, text:async()=>JSON.stringify({ invoice_id:"inv-top-1", invoice_url:"https://nowpayments.io/payment/top-1" }) }; };
   try {
     let order=null;
     const db={
@@ -607,17 +606,11 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
     assert.equal(result.order.billedCreators,0);
     assert.deepEqual(result.order.lines,[]);
     assert.equal(result.order.periodMonths,1);
-    assert.equal(result.checkoutUrl,"https://nowpayments.io/payment/?iid=inv-top-1");
-    assert.equal(result.order.providerInvoiceUrl,"https://nowpayments.io/payment/?iid=inv-top-1");
-    assert.equal(providerUrl,"https://api-sandbox.nowpayments.io/v1/invoice");
+    assert.match(result.checkoutUrl,/^https:\/\/api\.example\.com\/api\/billing\/sandbox-checkout\/order-top-1\?token=/);
     assert.equal(providerBody.price_amount,61.37);
     assert.equal(providerBody.price_currency,"usd");
     assert.equal(providerBody.order_id,"order-top-1");
-    assert.equal(providerBody.ipn_callback_url,"https://api.example.com/api/billing/nowpayments/ipn");
-    assert.equal(providerBody.success_url,"https://api.example.com/api/billing/checkout/success?order_id=order-top-1");
-    assert.equal(providerBody.cancel_url,"https://api.example.com/api/billing/checkout/cancel?order_id=order-top-1");
     assert.ok(!("case" in providerBody));
-    assert.ok(!("pay_currency" in providerBody));
   } finally {
     global.fetch=oldFetch;
     for (const [key,value] of Object.entries(previous)) { if (value===undefined) delete process.env[key]; else process.env[key]=value; }

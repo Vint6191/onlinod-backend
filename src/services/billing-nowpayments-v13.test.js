@@ -300,26 +300,6 @@ test("provider configuration rejects local callback URLs, unofficial API bases a
   assert.ok(publicConfig.missingConfiguration.some((item) => item.startsWith("NOWPAYMENTS_API_BASE")));
 }));
 
-test("sandbox hosted invoice URL is normalized to the documented NOWPayments checkout origin", () => {
-  const service = loadService();
-  assert.equal(
-    service.normalizeHostedInvoiceUrl("https://sandbox.nowpayments.io/payment/?iid=5040719673", true),
-    "https://nowpayments.io/payment/?iid=5040719673",
-  );
-  assert.equal(
-    service.normalizeHostedInvoiceUrl("https://nowpayments.io/payment/?iid=5040719673", true),
-    "https://nowpayments.io/payment/?iid=5040719673",
-  );
-  assert.equal(service.normalizeHostedInvoiceUrl("http://nowpayments.io/payment/?iid=x", true), "");
-  assert.equal(service.normalizeHostedInvoiceUrl("https://evil.example/payment/?iid=x", true), "");
-  const legacy = service.publicOrder({
-    id: "legacy-sandbox-order", provider: "NOWPAYMENTS", purpose: "WALLET_TOP_UP", status: "CHECKOUT_CREATED", amountCents: 6000, currency: "USD",
-    billingPeriod: "MONTHLY", periodMonths: 1, billedCreators: 0, lines: [], providerInvoiceId: "5040719673",
-    providerInvoiceUrl: "https://sandbox.nowpayments.io/payment/?iid=5040719673", providerStatus: "waiting", testMode: true,
-  });
-  assert.equal(legacy.providerInvoiceUrl, "https://nowpayments.io/payment/?iid=5040719673");
-});
-
 test("NOWPayments IPN signature verification uses deterministic recursive sorting + HMAC SHA-512", () => withEnv({
   NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "very-secret", PUBLIC_BASE_URL: "https://api.example.com",
 }, () => {
@@ -387,7 +367,7 @@ test("checkout snapshots real creator prices, creates a hosted invoice, and send
     assert.equal(created[0].checkoutKey, "checkout_request_123456");
     assert.equal("case" in request.body, false);
     assert.equal(request.body.ipn_callback_url, "https://api.example.com/api/billing/nowpayments/ipn");
-    assert.match(result.checkoutUrl, /^https:\/\/nowpayments\.io\//);
+    assert.match(result.checkoutUrl, /^https:\/\/api\.example\.com\/api\/billing\/sandbox-checkout\/order-1\?token=/);
   } finally { global.fetch = previousFetch; }
 }));
 
@@ -412,7 +392,7 @@ test("checkout audit failure after provider invoice creation does not destroy a 
     const service = loadService(db, async () => { throw new Error("audit unavailable"); });
     const first = await service.createCheckout({ agencyId: "a1", actorUserId: "u1", checkoutKey: "checkout_request_audit_123", selection: { billingPeriod: "MONTHLY", creators: [{ creatorId: "c1", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] }, db });
     assert.equal(first.order.status, "CHECKOUT_CREATED");
-    assert.equal(first.checkoutUrl, "https://nowpayments.io/payment/?iid=invoice-audit");
+    assert.match(first.checkoutUrl, /^https:\/\/api\.example\.com\/api\/billing\/sandbox-checkout\/order-audit\?token=/);
     assert.equal(order.status, "CHECKOUT_CREATED");
     const second = await service.createCheckout({ agencyId: "a1", actorUserId: "u1", checkoutKey: "checkout_request_audit_123", selection: { billingPeriod: "MONTHLY", creators: [{ creatorId: "c1", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] }, db });
     assert.equal(second.replayed, true);
@@ -454,7 +434,7 @@ test("checkout idempotency is persisted in BillingOrder and a retried request re
     const result = await service.createCheckout({ agencyId: "a1", actorUserId: "u1", checkoutKey: existing.checkoutKey, selection: { billingPeriod: "MONTHLY", creators: [{ creatorId: "c1", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] }, db });
     assert.equal(result.replayed, true);
     assert.equal(result.order.id, existing.id);
-    assert.equal(result.checkoutUrl, existing.providerInvoiceUrl);
+    assert.match(result.checkoutUrl, /^https:\/\/api\.example\.com\/api\/billing\/sandbox-checkout\/order-existing\?token=/);
     assert.equal(providerCalls, 0);
   } finally { global.fetch = previousFetch; }
 }));
@@ -490,7 +470,7 @@ test("a failed sandbox invoice request with no remote invoice can be retried wit
     const result = await service.createCheckout({ agencyId: "a1", actorUserId: "u1", checkoutKey: order.checkoutKey, selection: { billingPeriod: "MONTHLY", creators: [{ creatorId: "c1", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] }, db });
     assert.equal(providerCalls, 1);
     assert.equal(result.order.status, "CHECKOUT_CREATED");
-    assert.equal(result.checkoutUrl, "https://nowpayments.io/payment/?iid=invoice-retry");
+    assert.match(result.checkoutUrl, /^https:\/\/api\.example\.com\/api\/billing\/sandbox-checkout\/order-retry\?token=/);
     assert.equal(order.providerInvoiceId, "invoice-retry");
   } finally { global.fetch = previousFetch; }
 }));
@@ -1119,11 +1099,14 @@ test("V13.3.2 activation/refund re-read order state after the agency lock", () =
   assert.match(entitlementServiceSource, /await lockAgencyBillingMutation\(tx, agencyId\);[\s\S]*?const currentOrder = await tx\.billingOrder\.findUnique[\s\S]*?currentOrder\.status !== "REFUNDED"/);
 });
 
-test("billing HTTP boundary keeps signed IPN public, all checkout mutation owner-authenticated, and redirect success non-authoritative", () => {
+test("billing HTTP boundary keeps signed IPN and token-bound sandbox checkout public while owner mutations stay authenticated", () => {
   const ipnPos = routeSource.indexOf('router.post("/nowpayments/ipn"');
+  const sandboxPos = routeSource.indexOf('router.get("/sandbox-checkout/:orderId"');
   const authPos = routeSource.indexOf("router.use(authRequired)");
   const checkoutPos = routeSource.indexOf('router.post("/checkout"');
-  assert.ok(ipnPos >= 0 && authPos > ipnPos && checkoutPos > authPos);
+  const resumePos = routeSource.indexOf('router.post("/orders/:orderId/resume"');
+  assert.ok(ipnPos >= 0 && sandboxPos > ipnPos && authPos > sandboxPos && checkoutPos > authPos && resumePos > authPos);
+  assert.match(routeSource, /short-lived HMAC token bound to[\s\S]*?never accepts live orders/i);
   assert.match(routeSource, /router\.use\(ownerOnly\)/);
   assert.match(routeSource, /Redirects only inform|redirects only inform|never activate entitlements/i);
   assert.doesNotMatch(routeSource.slice(routeSource.indexOf('router.get("/checkout/success"'), authPos), /activatePaidOrder|AgencySubscription|billingMode/);
@@ -1161,3 +1144,76 @@ test("V13.3.1 creator soft/hard delete recomputes billing aggregate in the delet
   assert.match(deleteRoute, /tx\.creatorAccount\.update/);
   assert.match(deleteRoute, /tx\.creatorAccount\.delete/);
 });
+
+test("V14.8 sandbox resume returns only the ONLINOD sandbox bridge, never a production NOWPayments invoice URL", async () => withEnv({
+  NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NODE_ENV: "test",
+}, async () => {
+  const db = makeProcessingDb();
+  db._setOrder({ provider: "NOWPAYMENTS", providerInvoiceUrl: "https://nowpayments.io/payment/?iid=collision-danger" });
+  const service = loadService(db);
+  const result = await service.resumeCheckout({ agencyId: "agency-1", orderId: "order-1", db });
+  assert.match(result.checkoutUrl, /^https:\/\/api\.example\.com\/api\/billing\/sandbox-checkout\/order-1\?token=/);
+  assert.doesNotMatch(result.checkoutUrl, /nowpayments\.io\/payment/i);
+}));
+
+test("V14.8 sandbox invoice-payment is amount-bound to the ONLINOD order and stores the provider payment attempt", async () => withEnv({
+  NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NOWPAYMENTS_SANDBOX_CASE: "common", NODE_ENV: "test",
+}, async () => {
+  const db = makeProcessingDb();
+  db._setOrder({ provider: "NOWPAYMENTS", amountCents: 6000, providerInvoiceUrl: "https://nowpayments.io/payment/?iid=do-not-open" });
+  const service = loadService(db);
+  const resume = await service.resumeCheckout({ agencyId: "agency-1", orderId: "order-1", db });
+  const token = new URL(resume.checkoutUrl).searchParams.get("token");
+  const calls = [];
+  const oldFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url: String(url), body: options.body ? JSON.parse(options.body) : null });
+    if (String(url).endsWith("/currencies")) return { ok: true, status: 200, text: async () => JSON.stringify({ currencies: ["btc", "usdttrc20"] }) };
+    if (String(url).endsWith("/invoice-payment")) return { ok: true, status: 201, text: async () => JSON.stringify({
+      payment_id: "sandbox-pay-1", payment_status: "waiting", invoice_id: "invoice-1", order_id: "order-1",
+      price_amount: 60, price_currency: "usd", pay_amount: 60.25, pay_currency: "usdttrc20", pay_address: "TTESTADDRESS",
+    }) };
+    throw new Error(`unexpected provider call ${url}`);
+  };
+  try {
+    const result = await service.startSandboxInvoicePayment({ orderId: "order-1", token, payCurrency: "usdttrc20", db });
+    assert.equal(result.order.amountCents, 6000);
+    assert.equal(result.attempt.providerPaymentId, "sandbox-pay-1");
+    assert.equal(result.attempt.priceAmount, "60");
+    assert.equal(result.attempt.priceCurrency, "usd");
+    assert.equal(result.attempt.payAmount, "60.25");
+    assert.equal(result.attempt.payCurrency, "usdttrc20");
+    assert.equal(result.attempt.payAddress, "TTESTADDRESS");
+    const paymentCall = calls.find((row) => row.url.endsWith("/invoice-payment"));
+    assert.ok(paymentCall);
+    assert.equal(paymentCall.body.iid, "invoice-1");
+    assert.equal(paymentCall.body.pay_currency, "usdttrc20");
+    assert.equal(paymentCall.body.case, "common");
+  } finally { global.fetch = oldFetch; }
+}));
+
+test("V14.8 sandbox invoice-payment fails closed before persistence when provider USD amount differs from the locked top-up", async () => withEnv({
+  NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NODE_ENV: "test",
+}, async () => {
+  const db = makeProcessingDb();
+  db._setOrder({ provider: "NOWPAYMENTS", amountCents: 6000, providerInvoiceUrl: "https://nowpayments.io/payment/?iid=do-not-open" });
+  const service = loadService(db);
+  const resume = await service.resumeCheckout({ agencyId: "agency-1", orderId: "order-1", db });
+  const token = new URL(resume.checkoutUrl).searchParams.get("token");
+  const oldFetch = global.fetch;
+  global.fetch = async (url) => {
+    if (String(url).endsWith("/currencies")) return { ok: true, status: 200, text: async () => JSON.stringify({ currencies: ["usdttrc20"] }) };
+    if (String(url).endsWith("/invoice-payment")) return { ok: true, status: 201, text: async () => JSON.stringify({
+      payment_id: "sandbox-wrong-amount", payment_status: "waiting", invoice_id: "invoice-1", order_id: "order-1",
+      price_amount: 24174, price_currency: "usd", pay_amount: 24174, pay_currency: "usdttrc20", pay_address: "WRONG",
+    }) };
+    throw new Error(`unexpected provider call ${url}`);
+  };
+  try {
+    await assert.rejects(
+      service.startSandboxInvoicePayment({ orderId: "order-1", token, payCurrency: "usdttrc20", db }),
+      (err) => err?.code === "BILLING_PROVIDER_AMOUNT_MISMATCH",
+    );
+    assert.equal(await db.billingPaymentAttempt.findFirst({ where: { orderId: "order-1" } }), null);
+  } finally { global.fetch = oldFetch; }
+}));
