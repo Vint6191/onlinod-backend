@@ -390,9 +390,36 @@ function publicBillingPeriod(row) {
   };
 }
 
+function assertWalletTransactionBinding(row, { agencyId, testMode, amountCents, type, creatorId = null, orderId = null, periodId = null, idempotencyKey }) {
+  if (!row) return;
+  const mismatches = [];
+  if (String(row.agencyId || "") !== String(agencyId || "")) mismatches.push("agencyId");
+  if ((row.testMode === true) !== (testMode === true)) mismatches.push("testMode");
+  if (String(row.idempotencyKey || "") !== String(idempotencyKey || "")) mismatches.push("idempotencyKey");
+  if (String(row.type || "") !== String(type || "")) mismatches.push("type");
+  if (bigintCents(row.amountCents) !== bigintCents(amountCents)) mismatches.push("amountCents");
+  if (String(row.creatorId || "") !== String(creatorId || "")) mismatches.push("creatorId");
+  if (String(row.orderId || "") !== String(orderId || "")) mismatches.push("orderId");
+  if (String(row.periodId || "") !== String(periodId || "")) mismatches.push("periodId");
+  if (mismatches.length) {
+    throw billingError(
+      `Wallet idempotency key is already bound to a different billing mutation (${mismatches.join(", ")})`,
+      "BILLING_WALLET_IDEMPOTENCY_BINDING_MISMATCH",
+      409,
+    );
+  }
+}
+
 async function mutateWallet(tx, { agencyId, testMode, amountCents, type, idempotencyKey, creatorId = null, orderId = null, periodId = null, description = null, metadata = null }) {
   const existing = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey } });
-  if (existing) return { transaction: existing, wallet: await tx.agencyBillingWallet.findUnique({ where: walletUniqueWhere(agencyId, testMode) }), replayed: true };
+  if (existing) {
+    assertWalletTransactionBinding(existing, { agencyId, testMode, amountCents, type, creatorId, orderId, periodId, idempotencyKey });
+    const wallet = await tx.agencyBillingWallet.findUnique({ where: walletUniqueWhere(agencyId, testMode) });
+    if (!wallet || String(wallet.id || "") !== String(existing.walletId || "")) {
+      throw billingError("Wallet transaction does not belong to the expected agency wallet", "BILLING_WALLET_TRANSACTION_SCOPE_MISMATCH", 409);
+    }
+    return { transaction: existing, wallet, replayed: true };
+  }
 
   const wallet = await ensureWallet(tx, agencyId, testMode);
   const delta = bigintCents(amountCents);
@@ -431,12 +458,33 @@ async function creditPaidTopUp({ orderId, sandboxActivationEnabled, db = null })
 
     const idempotencyKey = `topup:${order.id}`;
     const already = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey } });
-    if (already) return { credited: false, reason: "ALREADY_CREDITED", transaction: publicWalletTransaction(already) };
+    if (already) {
+      assertWalletTransactionBinding(already, {
+        agencyId: order.agencyId,
+        testMode: order.testMode === true,
+        amountCents: BigInt(order.amountCents),
+        type: "TOP_UP",
+        orderId: order.id,
+        idempotencyKey,
+      });
+      return { credited: false, reason: "ALREADY_CREDITED", transaction: publicWalletTransaction(already) };
+    }
 
     const claim = await tx.billingOrder.updateMany({ where: { id: order.id, status: "PAID", activatedAt: null }, data: { activatedAt: new Date(), paidAt: order.paidAt || new Date() } });
     if (claim.count !== 1) {
       const replay = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey } });
-      return replay ? { credited: false, reason: "ALREADY_CREDITED", transaction: publicWalletTransaction(replay) } : { credited: false, reason: "ORDER_ALREADY_ACTIVATED" };
+      if (replay) {
+        assertWalletTransactionBinding(replay, {
+          agencyId: order.agencyId,
+          testMode: order.testMode === true,
+          amountCents: BigInt(order.amountCents),
+          type: "TOP_UP",
+          orderId: order.id,
+          idempotencyKey,
+        });
+        return { credited: false, reason: "ALREADY_CREDITED", transaction: publicWalletTransaction(replay) };
+      }
+      return { credited: false, reason: "ORDER_ALREADY_ACTIVATED" };
     }
 
     const result = await mutateWallet(tx, {
@@ -462,8 +510,17 @@ async function refundTopUp({ order, db = null }) {
     await lockAgencyBillingMutation(tx, agencyId);
     const current = await tx.billingOrder.findUnique({ where: { id: orderId } });
     if (!current || String(current.purpose || "SUBSCRIPTION") !== "WALLET_TOP_UP" || current.status !== "REFUNDED") return { reversed: false, reason: "ORDER_NOT_REFUNDED_TOP_UP" };
-    const original = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey: `topup:${orderId}` } });
+    const originalIdempotencyKey = `topup:${orderId}`;
+    const original = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey: originalIdempotencyKey } });
     if (!original) return { reversed: false, reason: "TOP_UP_WAS_NOT_CREDITED" };
+    assertWalletTransactionBinding(original, {
+      agencyId,
+      testMode: current.testMode === true,
+      amountCents: BigInt(current.amountCents),
+      type: "TOP_UP",
+      orderId,
+      idempotencyKey: originalIdempotencyKey,
+    });
     const result = await mutateWallet(tx, {
       agencyId,
       testMode: current.testMode === true,

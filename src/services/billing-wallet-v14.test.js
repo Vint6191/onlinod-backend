@@ -408,6 +408,38 @@ test("top-up credit and refund are idempotent; spent refunded funds can produce 
   assert.equal(again.reversed,false); assert.equal(db._wallet().balanceCents,-5000n);
 });
 
+test("top-up idempotency key cannot be poisoned by a foreign agency transaction", async () => {
+  const db=makeDb({balanceCents:0n});
+  db._orders.set("order-top",{id:"order-top",agencyId:"agency-1",purpose:"WALLET_TOP_UP",status:"PAID",testMode:false,amountCents:6000,provider:"NOWPAYMENTS",providerInvoiceId:"inv",activatedAt:null,paidAt:new Date()});
+  db._transactions.set("foreign-tx",{
+    id:"foreign-tx", walletId:"wallet-agency-2", agencyId:"agency-2", creatorId:null, orderId:"order-top", periodId:null,
+    testMode:false, type:"TOP_UP", amountCents:6000n, balanceAfterCents:6000n, currency:"USD", idempotencyKey:"topup:order-top", createdAt:new Date(),
+  });
+  const svc=loadWalletService(db);
+  await assert.rejects(
+    () => svc.creditPaidTopUp({orderId:"order-top",sandboxActivationEnabled:true,db}),
+    (e)=>e.code==="BILLING_WALLET_IDEMPOTENCY_BINDING_MISMATCH",
+  );
+  assert.equal(db._wallet().balanceCents,0n);
+  assert.equal(db._orders.get("order-top").activatedAt,null);
+});
+
+test("top-up idempotency replay must match the locked order amount and scope", async () => {
+  const db=makeDb({balanceCents:0n});
+  db._orders.set("order-top",{id:"order-top",agencyId:"agency-1",purpose:"WALLET_TOP_UP",status:"PAID",testMode:false,amountCents:6000,provider:"NOWPAYMENTS",providerInvoiceId:"inv",activatedAt:null,paidAt:new Date()});
+  db._transactions.set("wrong-amount-tx",{
+    id:"wrong-amount-tx", walletId:"wallet-live", agencyId:"agency-1", creatorId:null, orderId:"order-top", periodId:null,
+    testMode:false, type:"TOP_UP", amountCents:2417400n, balanceAfterCents:2417400n, currency:"USD", idempotencyKey:"topup:order-top", createdAt:new Date(),
+  });
+  const svc=loadWalletService(db);
+  await assert.rejects(
+    () => svc.creditPaidTopUp({orderId:"order-top",sandboxActivationEnabled:true,db}),
+    (e)=>e.code==="BILLING_WALLET_IDEMPOTENCY_BINDING_MISMATCH",
+  );
+  assert.equal(db._wallet().balanceCents,0n);
+  assert.equal(db._orders.get("order-top").activatedAt,null);
+});
+
 test("sandbox and live balances are isolated", async () => {
   const db=makeDb({balanceCents:7000n,testMode:false});
   db._wallets.set("agency-1:true",{id:"wallet-test",agencyId:"agency-1",testMode:true,balanceCents:1234n,currency:"USD",createdAt:new Date(),updatedAt:new Date()});
