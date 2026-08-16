@@ -45,30 +45,20 @@ function metadataDb(seed = []) {
       async findFirst() { return { id: CREATOR_ID }; },
     },
     creatorMediaAsset: {
-      async findUnique({ where }) {
-        return assets.get(where.creatorId_mediaId.mediaId) || null;
-      },
-      async findFirst({ where }) {
-        return [...assets.values()].find((asset) => (
-          asset.agencyId === where.agencyId
-          && asset.creatorId === where.creatorId
-          && asset.mediaId === where.mediaId
-          && (where.catalogActive === undefined || asset.catalogActive === where.catalogActive)
-        )) || null;
-      },
       async findMany({ where }) {
-        const ids = new Set(where.mediaId?.in || []);
         return [...assets.values()].filter((asset) => (
           asset.agencyId === where.agencyId
           && asset.creatorId === where.creatorId
-          && (!ids.size || ids.has(asset.mediaId))
+          && (!where.mediaId?.in || where.mediaId.in.includes(asset.mediaId))
         ));
       },
-      async update({ where, data }) {
-        const previous = [...assets.values()].find((asset) => asset.id === where.id);
-        if (!previous) throw new Error(`asset ${where.id} missing`);
-        const next = { ...previous, ...data, updatedAt: new Date() };
-        assets.set(next.mediaId, next);
+      async upsert({ where, create, update }) {
+        const key = where.creatorId_mediaId.mediaId;
+        const previous = assets.get(key);
+        const next = previous
+          ? { ...previous, ...update, updatedAt: new Date() }
+          : { ...create, createdAt: new Date(), updatedAt: new Date() };
+        assets.set(key, next);
         return next;
       },
     },
@@ -85,7 +75,7 @@ test("legacy JSON metadata import endpoint is removed from the server runtime", 
   assert.doesNotMatch(service, /importMediaMetadata/);
 });
 
-test("server metadata edits enrich only an existing active catalog row", async () => {
+test("server metadata edits preserve existing active catalog membership", async () => {
   const { db, assets } = metadataDb([{
     id: "asset-active",
     agencyId: AGENCY_ID,
@@ -129,19 +119,72 @@ test("server metadata edits enrich only an existing active catalog row", async (
   assert.deepEqual(queried.items.map((item) => item.onlyfansMediaId), ["active-media"]);
 });
 
-test("metadata editing cannot create catalog rows", async () => {
+test("metadata editing creates only an inactive placeholder when catalog discovery has not seen media yet", async () => {
   const { db, assets } = metadataDb([]);
-  await assert.rejects(
-    () => upsertMediaMetadata({
-      agencyId: AGENCY_ID,
-      creatorId: CREATOR_ID,
-      mediaId: "metadata-only",
-      db,
-      input: { mediaType: "photo", description: "must not create inventory" },
-    }),
-    (error) => error?.code === "MEDIA_NOT_IN_CATALOG" && error?.status === 409,
-  );
-  assert.equal(assets.has("metadata-only"), false);
+  const saved = await upsertMediaMetadata({
+    agencyId: AGENCY_ID,
+    creatorId: CREATOR_ID,
+    mediaId: "metadata-only",
+    db,
+    input: {
+      mediaType: "photo",
+      description: "manager note before catalog discovery",
+      manualTags: ["Teaser"],
+      visibleBodyParts: [],
+      accessType: "paid",
+      minPrice: 10,
+      idealPrice: 20,
+    },
+  });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.item.onlyfansMediaId, "metadata-only");
+  assert.equal(assets.get("metadata-only").catalogActive, false);
+  assert.equal(assets.get("metadata-only").description, "manager note before catalog discovery");
+  assert.deepEqual(assets.get("metadata-only").manualTags, ["teaser"]);
+
+  const queried = await getMediaMetadata({
+    agencyId: AGENCY_ID,
+    creatorId: CREATOR_ID,
+    mediaIds: ["metadata-only"],
+    db,
+  });
+  assert.equal(queried.items.length, 1);
+  assert.equal(queried.items[0].description, "manager note before catalog discovery");
+});
+
+test("metadata editing updates an inactive placeholder without reactivating catalog membership", async () => {
+  const { db, assets } = metadataDb([{
+    id: "asset-inactive",
+    agencyId: AGENCY_ID,
+    creatorId: CREATOR_ID,
+    mediaId: "inactive-media",
+    catalogActive: false,
+    sortingStatus: "UNSORTED",
+    mediaType: "video",
+    manualTags: [],
+    visibleBodyParts: [],
+    metadata: {},
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  }]);
+  const saved = await upsertMediaMetadata({
+    agencyId: AGENCY_ID,
+    creatorId: CREATOR_ID,
+    mediaId: "inactive-media",
+    db,
+    input: {
+      mediaType: "video",
+      description: "kept while inactive",
+      manualTags: [],
+      visibleBodyParts: [],
+      accessType: "paid",
+      minPrice: 0,
+      idealPrice: 0,
+    },
+  });
+  assert.equal(saved.ok, true);
+  assert.equal(assets.get("inactive-media").catalogActive, false);
+  assert.equal(assets.get("inactive-media").description, "kept while inactive");
 });
 
 function usageDb({ rawSql = false } = {}) {

@@ -156,8 +156,8 @@ async function getMediaMetadata({ agencyId, creatorId, mediaIds, db = prisma }) 
   const ids = cleanMediaIds(mediaIds);
   if (!ids.length) return { ok: true, creatorId: id, items: [] };
   const assets = await db.creatorMediaAsset.findMany({
-    // Reads may include inactive usage placeholders so callers can preserve
-    // known metadata, but only an active catalog row can be edited.
+    // Reads include inactive placeholders too: metadata is durable independently
+    // of whether the canonical Messages catalog has activated this media yet.
     where: { agencyId, creatorId: id, mediaId: { in: ids } },
     take: ids.length,
   });
@@ -178,26 +178,28 @@ async function upsertMediaMetadata({ agencyId, creatorId, mediaId, input, userId
     throw error;
   }
 
-  // Metadata enriches an existing canonical catalog row. It must never create
-  // inventory, reactivate a hidden row, or turn an old JSON/local reference
-  // into server catalog membership. Unsorted discovery is the only automatic
-  // catalog writer; explicit media deletion is the only destructive writer.
-  const existing = await db.creatorMediaAsset.findFirst({
-    where: { agencyId, creatorId: id, mediaId: cleanMediaId, catalogActive: true },
-    select: { id: true },
-  });
-  if (!existing) {
-    const error = new Error("Media is not present in the active server catalog");
-    error.code = "MEDIA_NOT_IN_CATALOG";
-    error.status = 409;
-    throw error;
-  }
-
+  // A human metadata edit is not proof of canonical Vault membership. Persist it
+  // even when the Messages catalog has not discovered this media yet, but keep a
+  // newly-created row inactive. The normal catalog scanner later reuses the same
+  // (creatorId, mediaId) row, sets catalogActive=true and preserves metadata.
   const now = new Date();
   const metadata = normalizeMetadata(input);
-  const asset = await db.creatorMediaAsset.update({
-    where: { id: existing.id },
-    data: {
+  const asset = await db.creatorMediaAsset.upsert({
+    where: { creatorId_mediaId: { creatorId: id, mediaId: cleanMediaId } },
+    create: {
+      id: crypto.randomUUID(),
+      agencyId,
+      creatorId: id,
+      mediaId: cleanMediaId,
+      catalogActive: false,
+      sortingStatus: "UNSORTED",
+      firstSeenAt: now,
+      lastSeenAt: now,
+      metadataUpdatedAt: now,
+      metadataUpdatedByUserId: userId || null,
+      ...metadata,
+    },
+    update: {
       metadataUpdatedAt: now,
       metadataUpdatedByUserId: userId || null,
       ...metadata,
