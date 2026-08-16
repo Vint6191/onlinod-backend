@@ -6,6 +6,7 @@ const { automationCreatorParamRequired } = require("../middleware/automation-per
 const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 const {
   getMediaMetadata,
+  searchMediaLibrary,
   upsertMediaMetadata,
   listStorylines,
   replaceUsageSources,
@@ -19,6 +20,15 @@ const router = express.Router();
 
 const mediaIdsSchema = z.object({
   mediaIds: z.array(z.string().min(1).max(240)).max(5000),
+});
+const searchSchema = z.object({
+  query: z.string().max(240).default(""),
+  scope: z.enum(["everything", "description", "tags", "folders"]).default("everything"),
+  folderId: z.string().max(240).nullable().optional(),
+  folderMatchIds: z.array(z.string().min(1).max(240)).max(500).optional(),
+  mediaType: z.enum(["all", "photo", "video", "audio", "gif", "unknown"]).nullable().optional(),
+  offset: z.number().int().min(0).max(10_000_000).optional(),
+  limit: z.number().int().min(1).max(100).optional(),
 });
 const metadataSchema = z.object({
   mediaType: z.enum(["photo", "video", "audio", "gif", "unknown"]),
@@ -105,6 +115,19 @@ router.post("/:creatorId/assets/query", async (req, res) => {
     }));
   } catch (error) {
     return sendError(res, error, "MEDIA_LIBRARY_QUERY_FAILED");
+  }
+});
+
+router.post("/:creatorId/assets/search", async (req, res) => {
+  try {
+    const input = searchSchema.parse(req.body || {});
+    return res.json(await searchMediaLibrary({
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.creatorId,
+      ...input,
+    }));
+  } catch (error) {
+    return sendError(res, error, "MEDIA_LIBRARY_SEARCH_FAILED");
   }
 });
 

@@ -9,6 +9,7 @@ require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded
 delete require.cache[require.resolve("./media-library-service")];
 const {
   getMediaMetadata,
+  searchMediaLibrary,
   upsertMediaMetadata,
   replaceUsageSources,
 } = require("./media-library-service");
@@ -150,6 +151,42 @@ test("metadata editing creates only an inactive placeholder when catalog discove
   });
   assert.equal(queried.items.length, 1);
   assert.equal(queried.items[0].description, "manager note before catalog discovery");
+});
+
+test("Media Library search is catalog-only, paged and supports description/tags/folder filters", async () => {
+  const calls = [];
+  const asset = {
+    id: "asset-search", agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaId: "m-search",
+    catalogActive: true, sortingStatus: "SORTED", mediaType: "video", durationSec: 42,
+    thumbUrl: "thumb.jpg", previewUrl: "preview.jpg", fullUrl: "full.mp4", folderIds: ["folder-2"],
+    description: "Purple couch scene", manualTags: ["purple_light", "cowgirl"], visibleBodyParts: [],
+    accessType: "paid", minPriceCents: 2000, idealPriceCents: 3500, metadata: {},
+    createdAt: new Date(), updatedAt: new Date(), lastSeenAt: new Date(),
+  };
+  const db = {
+    creatorAccount: { async findFirst() { return { id: CREATOR_ID }; } },
+    creatorMediaAsset: {
+      async findMany(input) { calls.push({ kind: "findMany", input }); return [asset]; },
+      async count(input) { calls.push({ kind: "count", input }); return 1; },
+    },
+  };
+  const result = await searchMediaLibrary({
+    agencyId: AGENCY_ID, creatorId: CREATOR_ID, query: "purple couch", scope: "everything",
+    folderId: "folder-2", folderMatchIds: ["folder-3"], mediaType: "video", offset: 0, limit: 40, db,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.count, 1);
+  assert.equal(result.items[0].mediaId, "m-search");
+  assert.equal(result.items[0].previewUrl, "preview.jpg");
+  assert.equal(result.items[0].metadata.idealPrice, 35);
+  const where = calls.find((row) => row.kind === "findMany").input.where;
+  assert.equal(where.AND[0].catalogActive, true);
+  assert.deepEqual(where.AND.find((row) => row.mediaType)?.mediaType, "video");
+  assert.deepEqual(where.AND.find((row) => row.folderIds)?.folderIds, { array_contains: ["folder-2"] });
+  const searchClause = where.AND.find((row) => Array.isArray(row.OR));
+  assert.ok(searchClause.OR.some((row) => row.description?.contains === "purple couch"));
+  assert.ok(searchClause.OR.some((row) => row.manualTags?.array_contains?.includes("purple_couch")));
+  assert.ok(searchClause.OR.some((row) => row.folderIds?.array_contains?.includes("folder-3")));
 });
 
 test("metadata editing updates an inactive placeholder without reactivating catalog membership", async () => {

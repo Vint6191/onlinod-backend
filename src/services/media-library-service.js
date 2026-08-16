@@ -169,6 +169,96 @@ async function getMediaMetadata({ agencyId, creatorId, mediaIds, db = prisma }) 
   };
 }
 
+function searchTagCandidates(value) {
+  const raw = clean(value, 240).toLowerCase();
+  if (!raw) return [];
+  const candidates = [
+    raw.replace(/\s+/g, "_"),
+    ...raw.split(/[\s,;|]+/g).map((part) => part.trim().replace(/\s+/g, "_")),
+  ];
+  return [...new Set(candidates.filter(Boolean))].slice(0, 12);
+}
+
+function jsonArrayContainsAny(field, values) {
+  return uniqueStrings(values, 500, 240).map((value) => ({ [field]: { array_contains: [value] } }));
+}
+
+function assetToSearchItem(asset) {
+  return {
+    mediaId: String(asset.mediaId),
+    mediaType: normalizeMediaType(asset.mediaType),
+    durationSec: Number(asset.durationSec || 0) > 0 ? Number(asset.durationSec) : null,
+    thumbUrl: clean(asset.thumbUrl, 4000),
+    previewUrl: clean(asset.previewUrl, 4000),
+    fullUrl: clean(asset.fullUrl, 4000),
+    folderIds: uniqueStrings(asset.folderIds, 500, 240),
+    metadata: assetToMetadata(asset),
+  };
+}
+
+async function searchMediaLibrary({
+  agencyId, creatorId, query, scope = "everything", folderId = null, folderMatchIds = [],
+  mediaType = null, offset = 0, limit = 40, db = prisma,
+}) {
+  const id = await requireCreator(db, agencyId, creatorId);
+  const q = clean(query, 240);
+  const searchScope = ["everything", "description", "tags", "folders"].includes(clean(scope, 30).toLowerCase())
+    ? clean(scope, 30).toLowerCase()
+    : "everything";
+  const skip = integer(offset, 0, 0, 10_000_000);
+  const take = integer(limit, 40, 1, 100);
+  const activeFolderId = clean(folderId, 240);
+  const matchedFolders = uniqueStrings(folderMatchIds, 500, 240);
+  const type = clean(mediaType, 20).toLowerCase();
+  const normalizedType = type && type !== "all" ? normalizeMediaType(type) : null;
+
+  const and = [
+    { agencyId, creatorId: id, catalogActive: true },
+    ...(normalizedType ? [{ mediaType: normalizedType }] : []),
+    ...(activeFolderId && activeFolderId !== "all" ? [{ folderIds: { array_contains: [activeFolderId] } }] : []),
+  ];
+
+  if (q) {
+    const tagClauses = searchTagCandidates(q).map((tag) => ({ manualTags: { array_contains: [tag] } }));
+    const folderClauses = jsonArrayContainsAny("folderIds", matchedFolders);
+    if (searchScope === "description") {
+      and.push({ description: { contains: q, mode: "insensitive" } });
+    } else if (searchScope === "tags") {
+      and.push(tagClauses.length ? { OR: tagClauses } : { mediaId: "__onlinod_no_tag_match__" });
+    } else if (searchScope === "folders") {
+      and.push(folderClauses.length ? { OR: folderClauses } : { mediaId: "__onlinod_no_folder_match__" });
+    } else {
+      const clauses = [
+        { description: { contains: q, mode: "insensitive" } },
+        ...tagClauses,
+        ...folderClauses,
+      ];
+      and.push({ OR: clauses });
+    }
+  }
+
+  const where = { AND: and };
+  const [assets, count] = await Promise.all([
+    db.creatorMediaAsset.findMany({
+      where,
+      orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }],
+      skip,
+      take,
+    }),
+    db.creatorMediaAsset.count({ where }),
+  ]);
+  const items = assets.map(assetToSearchItem);
+  return {
+    ok: true,
+    creatorId: id,
+    items,
+    count,
+    offset: skip,
+    nextOffset: skip + items.length,
+    hasMore: skip + items.length < count,
+  };
+}
+
 async function upsertMediaMetadata({ agencyId, creatorId, mediaId, input, userId = null, db = prisma }) {
   const id = await requireCreator(db, agencyId, creatorId);
   const cleanMediaId = clean(mediaId, 240);
@@ -694,6 +784,7 @@ module.exports = {
   cleanMediaIds,
   assetToMetadata,
   getMediaMetadata,
+  searchMediaLibrary,
   upsertMediaMetadata,
   listStorylines,
   replaceUsageSources,
