@@ -153,7 +153,7 @@ test("metadata editing creates only an inactive placeholder when catalog discove
   assert.equal(queried.items[0].description, "manager note before catalog discovery");
 });
 
-test("Media Library search is catalog-only, paged and supports description/tags/folder filters", async () => {
+test("Media Library search is paged and keeps folder-scoped queries catalog-active", async () => {
   const calls = [];
   const asset = {
     id: "asset-search", agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaId: "m-search",
@@ -180,13 +180,50 @@ test("Media Library search is catalog-only, paged and supports description/tags/
   assert.equal(result.items[0].previewUrl, "preview.jpg");
   assert.equal(result.items[0].metadata.idealPrice, 35);
   const where = calls.find((row) => row.kind === "findMany").input.where;
-  assert.equal(where.AND[0].catalogActive, true);
+  assert.ok(where.AND.some((row) => row.catalogActive === true));
   assert.deepEqual(where.AND.find((row) => row.mediaType)?.mediaType, "video");
   assert.deepEqual(where.AND.find((row) => row.folderIds)?.folderIds, { array_contains: ["folder-2"] });
   const searchClause = where.AND.find((row) => Array.isArray(row.OR));
   assert.ok(searchClause.OR.some((row) => row.description?.contains === "purple couch"));
   assert.ok(searchClause.OR.some((row) => row.manualTags?.array_contains?.includes("purple_couch")));
-  assert.ok(searchClause.OR.some((row) => row.folderIds?.array_contains?.includes("folder-3")));
+  assert.ok(searchClause.OR.some((row) => row.folderIds?.array_contains?.includes("folder-3") || row.AND?.some((entry) => entry.OR?.some((clause) => clause.folderIds?.array_contains?.includes("folder-3")))));
+});
+
+test("Media Library text search includes metadata-only placeholders before catalog activation", async () => {
+  const calls = [];
+  const asset = {
+    id: "asset-meta-only", agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaId: "m-meta-only",
+    catalogActive: false, sortingStatus: "UNSORTED", mediaType: "photo", durationSec: 0,
+    thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: [],
+    description: "тест", manualTags: ["тест"], visibleBodyParts: [],
+    accessType: "paid", minPriceCents: 0, idealPriceCents: 1500, metadata: {},
+    metadataUpdatedAt: new Date(), createdAt: new Date(), updatedAt: new Date(), lastSeenAt: new Date(),
+  };
+  const db = {
+    creatorAccount: { async findFirst() { return { id: CREATOR_ID }; } },
+    creatorMediaAsset: {
+      async findMany(input) { calls.push({ kind: "findMany", input }); return [asset]; },
+      async count(input) { calls.push({ kind: "count", input }); return 1; },
+    },
+  };
+
+  const result = await searchMediaLibrary({
+    agencyId: AGENCY_ID, creatorId: CREATOR_ID, query: "тест", scope: "everything",
+    mediaType: "all", offset: 0, limit: 40, db,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.items[0].mediaId, "m-meta-only");
+  assert.equal(result.items[0].metadata.description, "тест");
+  assert.deepEqual(result.items[0].metadata.manualTags, ["тест"]);
+
+  const where = calls.find((row) => row.kind === "findMany").input.where;
+  const presence = where.AND.find((row) => Array.isArray(row.OR) && row.OR.some((entry) => entry.metadataUpdatedAt));
+  assert.ok(presence, "text search must admit active catalog rows or human metadata placeholders");
+  assert.deepEqual(presence.OR, [{ catalogActive: true }, { metadataUpdatedAt: { not: null } }]);
+  assert.ok(!where.AND.some((row) => row.catalogActive === true), "text-only search must not globally exclude metadata placeholders");
+  const searchClause = where.AND.find((row) => Array.isArray(row.OR) && row !== presence);
+  assert.ok(searchClause.OR.some((row) => row.description?.contains === "тест"));
+  assert.ok(searchClause.OR.some((row) => row.manualTags?.array_contains?.includes("тест")));
 });
 
 test("metadata editing updates an inactive placeholder without reactivating catalog membership", async () => {

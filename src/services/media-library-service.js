@@ -212,10 +212,20 @@ async function searchMediaLibrary({
   const type = clean(mediaType, 20).toLowerCase();
   const normalizedType = type && type !== "all" ? normalizeMediaType(type) : null;
 
+  // Human-authored metadata is durable even before/without catalog activation.
+  // Search must therefore see rows created by metadata edits (catalogActive=false),
+  // otherwise the Picker can visibly show a description/tag via getManyByMediaIds()
+  // and then return 0 results for the exact same text. Folder membership remains a
+  // catalog concept, so folder-scoped searches still require an active catalog row.
+  const folderScoped = Boolean(activeFolderId && activeFolderId !== "all");
+  const catalogOnly = !q || searchScope === "folders" || folderScoped;
   const and = [
-    { agencyId, creatorId: id, catalogActive: true },
+    { agencyId, creatorId: id },
+    ...(catalogOnly
+      ? [{ catalogActive: true }]
+      : [{ OR: [{ catalogActive: true }, { metadataUpdatedAt: { not: null } }] }]),
     ...(normalizedType ? [{ mediaType: normalizedType }] : []),
-    ...(activeFolderId && activeFolderId !== "all" ? [{ folderIds: { array_contains: [activeFolderId] } }] : []),
+    ...(folderScoped ? [{ folderIds: { array_contains: [activeFolderId] } }] : []),
   ];
 
   if (q) {
@@ -231,7 +241,7 @@ async function searchMediaLibrary({
       const clauses = [
         { description: { contains: q, mode: "insensitive" } },
         ...tagClauses,
-        ...folderClauses,
+        ...(folderClauses.length ? [{ AND: [{ catalogActive: true }, { OR: folderClauses }] }] : []),
       ];
       and.push({ OR: clauses });
     }
