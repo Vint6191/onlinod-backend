@@ -22,6 +22,12 @@ enum CreatorStatus {
   DISABLED
 }
 
+enum CustomOrderStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
 
 enum AnalyticsDataType {
   EARNINGS
@@ -289,6 +295,7 @@ model Agency {
   trafficFanValueSnapshots TrafficFanValueSnapshot[]
   creatorSubscriptionLedgers CreatorSubscriptionLedger[]
   trafficDailyAggregates TrafficDailyAggregate[]
+  customOrders CustomOrder[]
 
   @@index([deletedAt])
 }
@@ -320,6 +327,7 @@ model AgencyMember {
   teamDialogSessions TeamDialogSession[]
   teamResponseCases TeamResponseCase[]
   teamShifts TeamShift[]
+  createdCustomOrders CustomOrder[]
 
   @@unique([agencyId, userId])
   @@index([agencyId])
@@ -441,6 +449,7 @@ model CreatorAccount {
   fanValueCurrent CreatorFanValueCurrent[]
   earningsTotals CreatorEarningsTotal[]
   taskActivities CreatorTaskActivity[]
+  customOrders CustomOrder[]
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
@@ -448,6 +457,36 @@ model CreatorAccount {
   @@index([deletedAt])
   billingProfile CreatorBillingProfile?
   billingEntitlement CreatorBillingEntitlement?
+}
+
+model CustomOrder {
+  id                String            @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  dialogId          String
+  createdByMemberId String
+  scenario          String
+  internalNote      String?
+  status            CustomOrderStatus @default(PENDING)
+  dueAt             DateTime?
+  acceptedAt        DateTime?
+  completedAt       DateTime?
+  deliveredAt       DateTime?
+  cancelledAt       DateTime?
+  cancelReason      String?
+  mediaIds          String            @default("")
+  priceCents        Int               @default(0)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
+  agency          Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  createdByMember AgencyMember  @relation(fields: [createdByMemberId], references: [id], onDelete: Restrict)
+
+  @@index([agencyId, status, dueAt])
+  @@index([agencyId, creatorId, status, dueAt])
+  @@index([agencyId, creatorId, dialogId, createdAt])
+  @@index([creatorId, dialogId, status])
 }
 
 model AuthToken {
@@ -2474,7 +2513,7 @@ model CreatorPresenceSnapshot {
   updatedAt         DateTime @updatedAt
 
   agency          Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator         CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   updatedByDevice WorkerDevice?  @relation("PresenceSnapshotUpdatedByDevice", fields: [updatedByDeviceId], references: [id], onDelete: SetNull)
 
   @@unique([agencyId, creatorId])
@@ -2507,7 +2546,7 @@ model CreatorPresenceUser {
   updatedAt         DateTime @updatedAt
 
   agency          Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator         CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   updatedByDevice WorkerDevice?  @relation("PresenceUserUpdatedByDevice", fields: [updatedByDeviceId], references: [id], onDelete: SetNull)
 
   @@unique([creatorId, fanId])
