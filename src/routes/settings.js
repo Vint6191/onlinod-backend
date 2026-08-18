@@ -21,6 +21,8 @@ const {
   startTelegramMtprotoAuthorization,
   submitTelegramMtprotoCode,
   submitTelegramMtprotoPassword,
+  readTelegramMtprotoAuthorizationStatus,
+  cancelTelegramMtprotoAuthorization,
   runTelegramMtprotoConnectionTest,
   readTelegramMtprotoTestStatus,
 } = require("../services/settings-service");
@@ -248,6 +250,20 @@ router.post("/telegram/accounts/:accountId/auth/password", async (req, res) => {
     const auth = await submitTelegramMtprotoPassword({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.body?.challengeId, password: req.body?.password });
     return res.json({ ok: true, auth });
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_PASSWORD_FAILED"); }
+});
+
+router.get("/telegram/accounts/:accountId/auth/:challengeId", async (req, res) => {
+  try {
+    const auth = await readTelegramMtprotoAuthorizationStatus({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.params.challengeId });
+    return res.json({ ok: true, auth });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_STATUS_FAILED"); }
+});
+
+router.delete("/telegram/accounts/:accountId/auth/:challengeId", async (req, res) => {
+  try {
+    const auth = await cancelTelegramMtprotoAuthorization({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.params.challengeId });
+    return res.json({ ok: true, auth });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_CANCEL_FAILED"); }
 });
 
 router.post("/telegram/accounts/:accountId/test", async (req, res) => {

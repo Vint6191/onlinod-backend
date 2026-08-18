@@ -10,6 +10,8 @@ const {
   beginTelegramAuthorization,
   submitTelegramAuthorizationCode,
   submitTelegramAuthorizationPassword,
+  getTelegramAuthorizationStatus,
+  cancelTelegramAuthorization,
   testTelegramConnection,
   getTelegramTestStatus,
   getTelegramRuntimeStatus,
@@ -453,6 +455,16 @@ async function submitTelegramMtprotoPassword({ agencyId, member, accountId, chal
   return submitTelegramAuthorizationPassword({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180), password });
 }
 
+async function readTelegramMtprotoAuthorizationStatus({ agencyId, member, accountId, challengeId }) {
+  ensureTelegramOwner(member);
+  return getTelegramAuthorizationStatus({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180) });
+}
+
+async function cancelTelegramMtprotoAuthorization({ agencyId, member, accountId, challengeId }) {
+  ensureTelegramOwner(member);
+  return cancelTelegramAuthorization({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180) });
+}
+
 async function runTelegramMtprotoConnectionTest({ agencyId, member, accountId }) {
   ensureTelegramOwner(member);
   return testTelegramConnection({ agencyId, accountId: clean(accountId, 180) });
@@ -569,6 +581,8 @@ module.exports = {
   startTelegramMtprotoAuthorization,
   submitTelegramMtprotoCode,
   submitTelegramMtprotoPassword,
+  readTelegramMtprotoAuthorizationStatus,
+  cancelTelegramMtprotoAuthorization,
   runTelegramMtprotoConnectionTest,
   readTelegramMtprotoTestStatus,
 };

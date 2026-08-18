@@ -94,6 +94,8 @@ test("Settings routes expose owner-scoped MTProto auth and a fixed @runronin con
   assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/start/);
   assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/code/);
   assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/password/);
+  assert.match(routeSource, /router\.get\("\/telegram\/accounts\/:accountId\/auth\/:challengeId"/);
+  assert.match(routeSource, /router\.delete\("\/telegram\/accounts\/:accountId\/auth\/:challengeId"/);
   assert.match(routeSource, /\/telegram\/accounts\/:accountId\/test/);
   assert.match(routeSource, /\/telegram\/accounts\/:accountId\/test-status/);
   const testRoute = routeSource.split('router.post("/telegram/accounts/:accountId/test"')[1].split('router.get("/telegram/accounts/:accountId/test-status"')[0];

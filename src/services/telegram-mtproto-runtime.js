@@ -5,7 +5,8 @@ const prisma = require("../prisma");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
 
 const AUTH_TTL_MS = 10 * 60 * 1000;
-const STAGE_WAIT_MS = 12 * 1000;
+const AUTH_CONNECT_TIMEOUT_MS = 45 * 1000;
+const CLIENT_DISCONNECT_GRACE_MS = 1500;
 const TEST_RECIPIENT = "@runronin";
 const TEST_MESSAGE = "ONLINOD Telegram connection test ✅";
 const TEST_SEND_COOLDOWN_MS = 20 * 1000;
@@ -237,17 +238,31 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
     };
   }
 
-  async function waitForRevision(challenge, revision, timeoutMs = STAGE_WAIT_MS) {
-    const deadline = Date.now() + timeoutMs;
-    while (challenge.revision <= revision && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 40));
+  async function disposeClient(entry, timeoutMs = CLIENT_DISCONNECT_GRACE_MS) {
+    if (!entry?.client) return;
+    let timer = null;
+    try {
+      await Promise.race([
+        Promise.resolve().then(() => entry.client.disconnect?.()).catch(() => undefined),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, Math.max(50, Number(timeoutMs) || CLIENT_DISCONNECT_GRACE_MS));
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    return challengePublic(challenge);
   }
 
-  async function disposeClient(entry) {
-    if (!entry?.client) return;
-    try { await entry.client.disconnect?.(); } catch (_) {}
+  function disposeClientSoon(entry) {
+    void disposeClient(entry).catch(() => undefined);
+  }
+
+  function clearChallengeTimer(challenge) {
+    if (challenge?.connectTimer) {
+      clearTimeout(challenge.connectTimer);
+      challenge.connectTimer = null;
+    }
   }
 
   async function forgetAccount(accountId) {
@@ -257,9 +272,12 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
       const challenge = challenges.get(challengeId);
       if (challenge) {
         challenge.cancelled = true;
+        clearChallengeTimer(challenge);
         challenge.codeDeferred?.reject?.(new Error("Authorization cancelled"));
         challenge.passwordDeferred?.reject?.(new Error("Authorization cancelled"));
-        await disposeClient(challenge.clientEntry);
+        challenge.codeDeferred = null;
+        challenge.passwordDeferred = null;
+        disposeClientSoon(challenge.clientEntry);
         challenges.delete(challengeId);
       }
       activeChallengeByAccount.delete(id);
@@ -268,7 +286,7 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
     runtimes.delete(id);
     testWatches.delete(id);
     lastTestSend.delete(id);
-    await disposeClient(runtime);
+    disposeClientSoon(runtime);
   }
 
   async function attachInboundHandler(accountId, entry) {
@@ -358,63 +376,71 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
       passwordDeferred: null,
       lastError: null,
       cancelled: false,
+      connectTimer: null,
     };
     challenges.set(challenge.id, challenge);
     activeChallengeByAccount.set(account.id, challenge.id);
-    const initialRevision = challenge.revision;
 
-    void (async () => {
-      try {
-        await clientEntry.client.start({
+    challenge.connectTimer = setTimeout(() => {
+      if (challenge.cancelled || challenge.stage !== "CONNECTING") return;
+      challenge.cancelled = true;
+      challenge.lastError = {
+        code: "SETTINGS_TELEGRAM_CONNECT_TIMEOUT",
+        message: "Telegram connection did not reach the login-code stage within 45 seconds",
+        retryAfterSeconds: null,
+      };
+      setStage(challenge, "ERROR");
+      activeChallengeByAccount.delete(account.id);
+      disposeClientSoon(clientEntry);
+    }, AUTH_CONNECT_TIMEOUT_MS);
+    challenge.connectTimer.unref?.();
+
+    setImmediate(() => {
+      void (async () => {
+        try {
+          await clientEntry.client.start({
           phoneNumber: async () => challenge.phone,
           phoneCode: async () => {
             if (challenge.cancelled) throw new Error("Authorization cancelled");
-            const retryingCode = challenge.stage === "CODE";
+            clearChallengeTimer(challenge);
             challenge.codeDeferred = deferred();
-            if (!retryingCode) challenge.lastError = null;
             setStage(challenge, "CODE");
             return challenge.codeDeferred.promise;
           },
           password: async () => {
             if (challenge.cancelled) throw new Error("Authorization cancelled");
-            const retryingPassword = challenge.stage === "PASSWORD";
+            clearChallengeTimer(challenge);
             challenge.passwordDeferred = deferred();
-            if (!retryingPassword) challenge.lastError = null;
             setStage(challenge, "PASSWORD");
             return challenge.passwordDeferred.promise;
           },
           onError: (error) => {
-            // Do not wake the HTTP waiter here. TeleProto normally calls the
-            // corresponding callback again after a recoverable bad code/password.
-            // We wake only when that new callback has installed a fresh deferred,
-            // preventing a race where the UI can submit before Telegram is ready.
             challenge.lastError = publicTelegramError(error);
           },
-        });
-        if (challenge.cancelled) return;
-        const serialized = clientEntry.saveSession();
-        await saveSession({ agencyId, accountId: account.id, session: serialized, db });
-        await attachInboundHandler(account.id, clientEntry);
-        runtimes.set(account.id, clientEntry);
-        challenge.lastError = null;
-        setStage(challenge, "AUTHORIZED");
-        activeChallengeByAccount.delete(account.id);
-        challenges.delete(challenge.id);
-      } catch (error) {
-        if (challenge.cancelled) return;
-        challenge.lastError = publicTelegramError(error);
-        setStage(challenge, "ERROR");
-        activeChallengeByAccount.delete(account.id);
-        challenges.delete(challenge.id);
-        await disposeClient(clientEntry);
-      }
-    })();
+          });
+          if (challenge.cancelled) return;
+          clearChallengeTimer(challenge);
+          const serialized = clientEntry.saveSession();
+          await saveSession({ agencyId, accountId: account.id, session: serialized, db });
+          await attachInboundHandler(account.id, clientEntry);
+          runtimes.set(account.id, clientEntry);
+          challenge.lastError = null;
+          setStage(challenge, "AUTHORIZED");
+          activeChallengeByAccount.delete(account.id);
+        } catch (error) {
+          if (challenge.cancelled) return;
+          clearChallengeTimer(challenge);
+          challenge.lastError = publicTelegramError(error);
+          setStage(challenge, "ERROR");
+          activeChallengeByAccount.delete(account.id);
+          disposeClientSoon(clientEntry);
+        }
+      })();
+    });
 
-    const result = await waitForRevision(challenge, initialRevision);
-    if (result.stage === "CONNECTING") {
-      return { ...result, errorCode: "SETTINGS_TELEGRAM_AUTH_TIMEOUT", errorMessage: "Telegram did not request a login code in time" };
-    }
-    return result;
+    // Never keep the HTTP request open while Telegram negotiates a DC or sends
+    // the login code. The Desktop polls challenge status independently.
+    return challengePublic(challenge);
   }
 
   function getChallenge({ agencyId, accountId, challengeId }) {
@@ -427,13 +453,40 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
       throw err;
     }
     if (now() - challenge.updatedAt > AUTH_TTL_MS) {
-      void forgetAccount(accountId);
+      challenge.cancelled = true;
+      clearChallengeTimer(challenge);
+      activeChallengeByAccount.delete(accountId);
+      challenges.delete(id);
+      challenge.codeDeferred?.reject?.(new Error("Authorization expired"));
+      challenge.passwordDeferred?.reject?.(new Error("Authorization expired"));
+      disposeClientSoon(challenge.clientEntry);
       const err = new Error("Telegram authorization session expired. Start authorization again.");
       err.code = "SETTINGS_TELEGRAM_AUTH_EXPIRED";
       err.status = 410;
       throw err;
     }
     return challenge;
+  }
+
+  function authorizationStatus({ agencyId, accountId, challengeId }) {
+    return challengePublic(getChallenge({ agencyId, accountId, challengeId }));
+  }
+
+  async function cancelAuthorization({ agencyId, accountId, challengeId }) {
+    const challenge = getChallenge({ agencyId, accountId, challengeId });
+    if (!["AUTHORIZED", "ERROR", "CANCELLED"].includes(challenge.stage)) {
+      challenge.cancelled = true;
+      clearChallengeTimer(challenge);
+      challenge.lastError = null;
+      challenge.codeDeferred?.reject?.(new Error("Authorization cancelled"));
+      challenge.passwordDeferred?.reject?.(new Error("Authorization cancelled"));
+      challenge.codeDeferred = null;
+      challenge.passwordDeferred = null;
+      setStage(challenge, "CANCELLED");
+      activeChallengeByAccount.delete(accountId);
+      disposeClientSoon(challenge.clientEntry);
+    }
+    return challengePublic(challenge);
   }
 
   async function submitCode({ agencyId, accountId, challengeId, code }) {
@@ -444,11 +497,12 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
       err.status = 409;
       throw err;
     }
-    const revision = challenge.revision;
     const pending = challenge.codeDeferred;
     challenge.codeDeferred = null;
+    challenge.lastError = null;
+    setStage(challenge, "VERIFYING_CODE");
     pending.resolve(normalizeCode(code));
-    return waitForRevision(challenge, revision);
+    return challengePublic(challenge);
   }
 
   async function submitPassword({ agencyId, accountId, challengeId, password }) {
@@ -459,11 +513,12 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
       err.status = 409;
       throw err;
     }
-    const revision = challenge.revision;
     const pending = challenge.passwordDeferred;
     challenge.passwordDeferred = null;
+    challenge.lastError = null;
+    setStage(challenge, "VERIFYING_PASSWORD");
     pending.resolve(normalizePassword(password));
-    return waitForRevision(challenge, revision);
+    return challengePublic(challenge);
   }
 
   async function testConnection({ agencyId, accountId }) {
@@ -541,7 +596,7 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
     const challenge = challengeId ? challenges.get(challengeId) : null;
     return {
       connected: runtimes.has(accountId),
-      authStage: challenge && !["AUTHORIZED", "ERROR"].includes(challenge.stage) ? challenge.stage : null,
+      authStage: challenge && !["AUTHORIZED", "ERROR", "CANCELLED"].includes(challenge.stage) ? challenge.stage : null,
     };
   }
 
@@ -549,6 +604,8 @@ function createTelegramMtprotoRuntime({ db = prisma, clientFactory = defaultClie
     beginAuthorization,
     submitCode,
     submitPassword,
+    authorizationStatus,
+    cancelAuthorization,
     testConnection,
     testStatus,
     runtimeStatus,
@@ -566,6 +623,8 @@ module.exports = {
   beginTelegramAuthorization: (input) => singleton.beginAuthorization(input),
   submitTelegramAuthorizationCode: (input) => singleton.submitCode(input),
   submitTelegramAuthorizationPassword: (input) => singleton.submitPassword(input),
+  getTelegramAuthorizationStatus: (input) => singleton.authorizationStatus(input),
+  cancelTelegramAuthorization: (input) => singleton.cancelAuthorization(input),
   testTelegramConnection: (input) => singleton.testConnection(input),
   getTelegramTestStatus: (input) => singleton.testStatus(input),
   getTelegramRuntimeStatus: (accountId) => singleton.runtimeStatus(accountId),
