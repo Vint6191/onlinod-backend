@@ -365,8 +365,8 @@ async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, ses
     throw telegramInputError("API hash must contain 32 hexadecimal characters", "SETTINGS_TELEGRAM_API_HASH_INVALID");
   }
   const cleanSession = String(session || "").trim();
-  if (!cleanSession || cleanSession.length > 262144) {
-    throw telegramInputError("MTProto session is required and must be smaller than 256 KB", "SETTINGS_TELEGRAM_SESSION_INVALID");
+  if (cleanSession.length > 262144) {
+    throw telegramInputError("MTProto session must be smaller than 256 KB", "SETTINGS_TELEGRAM_SESSION_INVALID");
   }
   const client = db || prisma;
   let encrypted;

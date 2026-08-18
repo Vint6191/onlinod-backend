@@ -813,7 +813,6 @@ model AgencySubscription {
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 
   @@index([agencyId])
-  @@index([agencyId, telegramUserId])
   @@index([status])
   @@index([currentPeriodEnd])
 }

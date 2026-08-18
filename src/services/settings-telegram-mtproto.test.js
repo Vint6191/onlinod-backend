@@ -73,15 +73,18 @@ test("Telegram MTProto storage is agency-scoped, owner-only and never returns se
   assert.equal(stored, null);
 });
 
-test("Telegram MTProto credentials validate API id/hash/session before DB writes", async () => {
+test("Telegram MTProto API credentials validate id/hash and allow session to be added later", async () => {
   const service = loadSettingsService();
   let writes = 0;
   const db = { agencyTelegramMtprotoAccount: { create: async () => { writes += 1; } } };
   const owner = { role: "OWNER" };
   await assert.rejects(() => service.addTelegramMtprotoAccount({ agencyId: "a", member: owner, apiId: "abc", apiHash: "0123456789abcdef0123456789abcdef", session: "session", db }), /positive integer/);
   await assert.rejects(() => service.addTelegramMtprotoAccount({ agencyId: "a", member: owner, apiId: 1, apiHash: "wrong", session: "session", db }), /32 hexadecimal/);
-  await assert.rejects(() => service.addTelegramMtprotoAccount({ agencyId: "a", member: owner, apiId: 1, apiHash: "0123456789abcdef0123456789abcdef", session: "", db }), /session is required/);
-  assert.equal(writes, 0);
+  const apiOnly = await service.addTelegramMtprotoAccount({ agencyId: "a", member: owner, apiId: 1, apiHash: "0123456789abcdef0123456789abcdef", db });
+  assert.equal(apiOnly.available, true);
+  assert.equal(writes, 1);
+  await assert.rejects(() => service.addTelegramMtprotoAccount({ agencyId: "a", member: owner, apiId: 1, apiHash: "0123456789abcdef0123456789abcdef", session: "x".repeat(262145), db }), /smaller than 256 KB/);
+  assert.equal(writes, 1);
 });
 
 test("Settings routes expose only list/add/remove MTProto credential storage", () => {
