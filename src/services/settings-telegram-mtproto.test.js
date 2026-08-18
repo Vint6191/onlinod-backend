@@ -40,7 +40,7 @@ test("Telegram MTProto storage is agency-scoped, owner-only and never returns se
       },
       findMany: async ({ where }) => {
         assert.equal(where.agencyId, "agency-1");
-        return stored ? [{ id: stored.id, apiId: stored.apiId }] : [];
+        return stored ? [{ ...stored }] : [];
       },
       findFirst: async ({ where }) => where.id === "tg-1" && where.agencyId === "agency-1" ? { id: "tg-1" } : null,
       delete: async ({ where }) => { assert.equal(where.id, "tg-1"); stored = null; return {}; },
@@ -55,14 +55,14 @@ test("Telegram MTProto storage is agency-scoped, owner-only and never returns se
     session: "SESSION_SECRET_VALUE",
     db,
   });
-  assert.deepEqual(added, { available: true, account: { id: "tg-1", apiId: 12345678 } });
+  assert.deepEqual(added, { available: true, account: { id: "tg-1", apiId: 12345678, sessionReady: true, connected: false, authStage: null } });
   assert.equal(stored.agencyId, "agency-1");
   assert.equal(stored.encryptedPayload.includes("SESSION_SECRET_VALUE"), false);
   assert.equal(stored.encryptedPayload.includes("0123456789abcdef"), false);
   assert.equal(stored.algorithm, "aes-256-gcm");
 
   const listed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: owner, db });
-  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678 }] });
+  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678, sessionReady: true, connected: false, authStage: null }] });
   assert.equal(JSON.stringify(listed).includes("SESSION_SECRET_VALUE"), false);
   assert.equal(JSON.stringify(listed).includes("0123456789abcdef"), false);
 
@@ -87,11 +87,18 @@ test("Telegram MTProto API credentials validate id/hash and allow session to be 
   assert.equal(writes, 1);
 });
 
-test("Settings routes expose only list/add/remove MTProto credential storage", () => {
+test("Settings routes expose owner-scoped MTProto auth and a fixed @runronin connection test without recipient input", () => {
   assert.match(routeSource, /router\.get\("\/telegram"/);
   assert.match(routeSource, /router\.post\("\/telegram\/accounts"/);
   assert.match(routeSource, /router\.delete\("\/telegram\/accounts\/:accountId"/);
-  assert.doesNotMatch(routeSource, /sendMessage|messages\.sendMessage|auth\.exportLoginToken|QR/i);
+  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/start/);
+  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/code/);
+  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/password/);
+  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/test/);
+  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/test-status/);
+  const testRoute = routeSource.split('router.post("/telegram/accounts/:accountId/test"')[1].split('router.get("/telegram/accounts/:accountId/test-status"')[0];
+  assert.doesNotMatch(testRoute, /req\.body|recipient|username/);
+  assert.doesNotMatch(routeSource, /auth\.exportLoginToken|QR/i);
   assert.match(schemaSource, /model AgencyTelegramMtprotoAccount/);
   assert.doesNotMatch(schemaSource.split("model AgencyTelegramMtprotoAccount")[1].split("model AgencyMember")[0], /createdAt|updatedAt|deletedAt|username|displayName|phone/);
 });

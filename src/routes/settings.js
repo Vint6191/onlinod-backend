@@ -18,6 +18,11 @@ const {
   getTelegramMtprotoSettings,
   addTelegramMtprotoAccount,
   removeTelegramMtprotoAccount,
+  startTelegramMtprotoAuthorization,
+  submitTelegramMtprotoCode,
+  submitTelegramMtprotoPassword,
+  runTelegramMtprotoConnectionTest,
+  readTelegramMtprotoTestStatus,
 } = require("../services/settings-service");
 
 const router = express.Router();
@@ -84,7 +89,13 @@ function deviceId(req) {
 
 function sendError(res, err, fallbackCode) {
   const status = Number(err?.status || 0) || (String(err?.code || "").includes("FORBIDDEN") ? 403 : 400);
-  return res.status(status).json({ ok: false, code: err?.code || fallbackCode, error: err?.message || "Request failed" });
+  if (Number(err?.retryAfterSeconds || 0) > 0) res.setHeader("Retry-After", String(Math.ceil(Number(err.retryAfterSeconds))));
+  return res.status(status).json({
+    ok: false,
+    code: err?.code || fallbackCode,
+    error: err?.message || "Request failed",
+    ...(Number(err?.retryAfterSeconds || 0) > 0 ? { retryAfterSeconds: Math.ceil(Number(err.retryAfterSeconds)) } : {}),
+  });
 }
 
 router.get("/account", async (req, res) => {
@@ -216,6 +227,41 @@ router.delete("/telegram/accounts/:accountId", async (req, res) => {
     await removeTelegramMtprotoAccount({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
     return res.json({ ok: true });
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_REMOVE_FAILED"); }
+});
+
+router.post("/telegram/accounts/:accountId/auth/start", async (req, res) => {
+  try {
+    const auth = await startTelegramMtprotoAuthorization({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, phone: req.body?.phone });
+    return res.json({ ok: true, auth });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_START_FAILED"); }
+});
+
+router.post("/telegram/accounts/:accountId/auth/code", async (req, res) => {
+  try {
+    const auth = await submitTelegramMtprotoCode({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.body?.challengeId, code: req.body?.code });
+    return res.json({ ok: true, auth });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_CODE_FAILED"); }
+});
+
+router.post("/telegram/accounts/:accountId/auth/password", async (req, res) => {
+  try {
+    const auth = await submitTelegramMtprotoPassword({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.body?.challengeId, password: req.body?.password });
+    return res.json({ ok: true, auth });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_PASSWORD_FAILED"); }
+});
+
+router.post("/telegram/accounts/:accountId/test", async (req, res) => {
+  try {
+    const result = await runTelegramMtprotoConnectionTest({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
+    return res.json(result);
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_TEST_FAILED"); }
+});
+
+router.get("/telegram/accounts/:accountId/test-status", async (req, res) => {
+  try {
+    const result = await readTelegramMtprotoTestStatus({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
+    return res.json(result);
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_TEST_STATUS_FAILED"); }
 });
 
 router.get("/runtime", async (req, res) => {

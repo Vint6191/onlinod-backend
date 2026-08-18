@@ -5,7 +5,16 @@ const prisma = require("../prisma");
 const { publicUser, issuePasswordReset } = require("./auth-service");
 const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
-const { encryptTelegramCredentials } = require("./telegram-mtproto-credentials");
+const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
+const {
+  beginTelegramAuthorization,
+  submitTelegramAuthorizationCode,
+  submitTelegramAuthorizationPassword,
+  testTelegramConnection,
+  getTelegramTestStatus,
+  getTelegramRuntimeStatus,
+  forgetTelegramAccountRuntime,
+} = require("./telegram-mtproto-runtime");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
@@ -334,10 +343,16 @@ function billingLine(creator, pricing, defaultCorePriceCents = 2000, now = new D
 async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
   if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY", accounts: [] };
   const client = db || prisma;
-  const accounts = await client.agencyTelegramMtprotoAccount.findMany({
+  const rows = await client.agencyTelegramMtprotoAccount.findMany({
     where: { agencyId },
-    select: { id: true, apiId: true },
+    select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true },
     orderBy: { id: "asc" },
+  });
+  const accounts = rows.map((row) => {
+    let sessionReady = false;
+    try { sessionReady = Boolean(String(decryptTelegramCredentials(row).session || "").trim()); } catch (_) {}
+    const runtime = getTelegramRuntimeStatus(row.id);
+    return { id: row.id, apiId: row.apiId, sessionReady, connected: runtime.connected === true, authStage: runtime.authStage || null };
   });
   return { available: true, accounts };
 }
@@ -390,7 +405,7 @@ async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, ses
     },
     select: { id: true, apiId: true },
   });
-  return { available: true, account };
+  return { available: true, account: { ...account, sessionReady: Boolean(cleanSession), connected: false, authStage: null } };
 }
 
 async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = null }) {
@@ -410,8 +425,42 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
     err.status = 404;
     throw err;
   }
+  await forgetTelegramAccountRuntime(existing.id).catch(() => undefined);
   await client.agencyTelegramMtprotoAccount.delete({ where: { id: existing.id } });
   return { ok: true };
+}
+
+function ensureTelegramOwner(member) {
+  if (isOwner(member)) return;
+  const err = new Error("Only the agency owner can manage Telegram MTProto credentials");
+  err.code = "SETTINGS_TELEGRAM_OWNER_ONLY";
+  err.status = 403;
+  throw err;
+}
+
+async function startTelegramMtprotoAuthorization({ agencyId, member, accountId, phone }) {
+  ensureTelegramOwner(member);
+  return beginTelegramAuthorization({ agencyId, accountId: clean(accountId, 180), phone });
+}
+
+async function submitTelegramMtprotoCode({ agencyId, member, accountId, challengeId, code }) {
+  ensureTelegramOwner(member);
+  return submitTelegramAuthorizationCode({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180), code });
+}
+
+async function submitTelegramMtprotoPassword({ agencyId, member, accountId, challengeId, password }) {
+  ensureTelegramOwner(member);
+  return submitTelegramAuthorizationPassword({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180), password });
+}
+
+async function runTelegramMtprotoConnectionTest({ agencyId, member, accountId }) {
+  ensureTelegramOwner(member);
+  return testTelegramConnection({ agencyId, accountId: clean(accountId, 180) });
+}
+
+async function readTelegramMtprotoTestStatus({ agencyId, member, accountId }) {
+  ensureTelegramOwner(member);
+  return getTelegramTestStatus({ agencyId, accountId: clean(accountId, 180) });
 }
 
 async function getBillingSettings({ agencyId, member, db = null }) {
@@ -517,4 +566,9 @@ module.exports = {
   getTelegramMtprotoSettings,
   addTelegramMtprotoAccount,
   removeTelegramMtprotoAccount,
+  startTelegramMtprotoAuthorization,
+  submitTelegramMtprotoCode,
+  submitTelegramMtprotoPassword,
+  runTelegramMtprotoConnectionTest,
+  readTelegramMtprotoTestStatus,
 };
