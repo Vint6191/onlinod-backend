@@ -18,13 +18,8 @@ const {
   getTelegramMtprotoSettings,
   addTelegramMtprotoAccount,
   removeTelegramMtprotoAccount,
-  startTelegramMtprotoAuthorization,
-  submitTelegramMtprotoCode,
-  submitTelegramMtprotoPassword,
-  readTelegramMtprotoAuthorizationStatus,
-  cancelTelegramMtprotoAuthorization,
-  runTelegramMtprotoConnectionTest,
-  readTelegramMtprotoTestStatus,
+  issueTelegramMtprotoLocalMaterial,
+  storeTelegramMtprotoSession,
 } = require("../services/settings-service");
 
 const router = express.Router();
@@ -218,7 +213,6 @@ router.post("/telegram/accounts", async (req, res) => {
       member: req.auth.membership,
       apiId: req.body?.apiId,
       apiHash: req.body?.apiHash,
-      session: req.body?.session,
     });
     return res.status(201).json({ ok: true, account: result.account });
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_ADD_FAILED"); }
@@ -231,53 +225,32 @@ router.delete("/telegram/accounts/:accountId", async (req, res) => {
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_REMOVE_FAILED"); }
 });
 
-router.post("/telegram/accounts/:accountId/auth/start", async (req, res) => {
+router.post("/telegram/accounts/:accountId/local-material", async (req, res) => {
   try {
-    const auth = await startTelegramMtprotoAuthorization({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, phone: req.body?.phone });
-    return res.json({ ok: true, auth });
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_START_FAILED"); }
+    const material = await issueTelegramMtprotoLocalMaterial({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership,
+      accountId: req.params.accountId,
+      purpose: req.body?.purpose,
+    });
+    res.setHeader("Cache-Control", "no-store, private");
+    res.setHeader("Pragma", "no-cache");
+    return res.json({ ok: true, material });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_LOCAL_MATERIAL_FAILED"); }
 });
 
-router.post("/telegram/accounts/:accountId/auth/code", async (req, res) => {
+router.put("/telegram/accounts/:accountId/session", async (req, res) => {
   try {
-    const auth = await submitTelegramMtprotoCode({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.body?.challengeId, code: req.body?.code });
-    return res.json({ ok: true, auth });
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_CODE_FAILED"); }
-});
-
-router.post("/telegram/accounts/:accountId/auth/password", async (req, res) => {
-  try {
-    const auth = await submitTelegramMtprotoPassword({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.body?.challengeId, password: req.body?.password });
-    return res.json({ ok: true, auth });
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_PASSWORD_FAILED"); }
-});
-
-router.get("/telegram/accounts/:accountId/auth/:challengeId", async (req, res) => {
-  try {
-    const auth = await readTelegramMtprotoAuthorizationStatus({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.params.challengeId });
-    return res.json({ ok: true, auth });
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_STATUS_FAILED"); }
-});
-
-router.delete("/telegram/accounts/:accountId/auth/:challengeId", async (req, res) => {
-  try {
-    const auth = await cancelTelegramMtprotoAuthorization({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, challengeId: req.params.challengeId });
-    return res.json({ ok: true, auth });
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_AUTH_CANCEL_FAILED"); }
-});
-
-router.post("/telegram/accounts/:accountId/test", async (req, res) => {
-  try {
-    const result = await runTelegramMtprotoConnectionTest({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
-    return res.json(result);
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_TEST_FAILED"); }
-});
-
-router.get("/telegram/accounts/:accountId/test-status", async (req, res) => {
-  try {
-    const result = await readTelegramMtprotoTestStatus({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
-    return res.json(result);
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_TEST_STATUS_FAILED"); }
+    const account = await storeTelegramMtprotoSession({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership,
+      accountId: req.params.accountId,
+      session: req.body?.session,
+    });
+    res.setHeader("Cache-Control", "no-store, private");
+    res.setHeader("Pragma", "no-cache");
+    return res.json({ ok: true, account });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_SESSION_STORE_FAILED"); }
 });
 
 router.get("/runtime", async (req, res) => {

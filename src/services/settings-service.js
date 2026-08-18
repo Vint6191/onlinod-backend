@@ -6,17 +6,6 @@ const { publicUser, issuePasswordReset } = require("./auth-service");
 const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
-const {
-  beginTelegramAuthorization,
-  submitTelegramAuthorizationCode,
-  submitTelegramAuthorizationPassword,
-  getTelegramAuthorizationStatus,
-  cancelTelegramAuthorization,
-  testTelegramConnection,
-  getTelegramTestStatus,
-  getTelegramRuntimeStatus,
-  forgetTelegramAccountRuntime,
-} = require("./telegram-mtproto-runtime");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
@@ -353,8 +342,9 @@ async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
   const accounts = rows.map((row) => {
     let sessionReady = false;
     try { sessionReady = Boolean(String(decryptTelegramCredentials(row).session || "").trim()); } catch (_) {}
-    const runtime = getTelegramRuntimeStatus(row.id);
-    return { id: row.id, apiId: row.apiId, sessionReady, connected: runtime.connected === true, authStage: runtime.authStage || null };
+    // Backend is storage-only for MTProto. Authorization and live clients run
+    // exclusively inside Desktop Electron MAIN.
+    return { id: row.id, apiId: row.apiId, sessionReady, connected: false, authStage: null };
   });
   return { available: true, accounts };
 }
@@ -427,7 +417,6 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
     err.status = 404;
     throw err;
   }
-  await forgetTelegramAccountRuntime(existing.id).catch(() => undefined);
   await client.agencyTelegramMtprotoAccount.delete({ where: { id: existing.id } });
   return { ok: true };
 }
@@ -440,39 +429,85 @@ function ensureTelegramOwner(member) {
   throw err;
 }
 
-async function startTelegramMtprotoAuthorization({ agencyId, member, accountId, phone }) {
-  ensureTelegramOwner(member);
-  return beginTelegramAuthorization({ agencyId, accountId: clean(accountId, 180), phone });
+async function readTelegramMtprotoAccountSecret({ agencyId, accountId, db = null }) {
+  const id = clean(accountId, 180);
+  if (!id) throw telegramInputError("Telegram connection id is required", "SETTINGS_TELEGRAM_ACCOUNT_INVALID");
+  const client = db || prisma;
+  const row = await client.agencyTelegramMtprotoAccount.findFirst({
+    where: { id, agencyId },
+    select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true },
+  });
+  if (!row) {
+    const err = new Error("Telegram connection not found");
+    err.code = "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND";
+    err.status = 404;
+    throw err;
+  }
+  let credentials;
+  try { credentials = decryptTelegramCredentials(row); }
+  catch (_) {
+    const err = new Error("Stored Telegram credentials cannot be decrypted");
+    err.code = "SETTINGS_TELEGRAM_STORAGE_UNAVAILABLE";
+    err.status = 503;
+    throw err;
+  }
+  return { row, apiHash: String(credentials.apiHash || ""), session: String(credentials.session || "") };
 }
 
-async function submitTelegramMtprotoCode({ agencyId, member, accountId, challengeId, code }) {
+async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, purpose, db = null }) {
   ensureTelegramOwner(member);
-  return submitTelegramAuthorizationCode({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180), code });
+  const normalizedPurpose = clean(purpose, 32).toLowerCase();
+  if (!new Set(["authorize", "test"]).has(normalizedPurpose)) {
+    throw telegramInputError("Telegram local-material purpose is invalid", "SETTINGS_TELEGRAM_LOCAL_PURPOSE_INVALID");
+  }
+  const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db });
+  if (!/^[a-fA-F0-9]{32}$/.test(secret.apiHash)) {
+    const err = new Error("Stored Telegram API hash is invalid");
+    err.code = "SETTINGS_TELEGRAM_API_HASH_INVALID";
+    err.status = 409;
+    throw err;
+  }
+  if (normalizedPurpose === "test" && !secret.session.trim()) {
+    const err = new Error("Telegram account has not been authorized yet");
+    err.code = "SETTINGS_TELEGRAM_SESSION_REQUIRED";
+    err.status = 409;
+    throw err;
+  }
+  return {
+    accountId: secret.row.id,
+    apiId: secret.row.apiId,
+    apiHash: secret.apiHash,
+    session: normalizedPurpose === "test" ? secret.session : "",
+  };
 }
 
-async function submitTelegramMtprotoPassword({ agencyId, member, accountId, challengeId, password }) {
+async function storeTelegramMtprotoSession({ agencyId, member, accountId, session, db = null }) {
   ensureTelegramOwner(member);
-  return submitTelegramAuthorizationPassword({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180), password });
-}
-
-async function readTelegramMtprotoAuthorizationStatus({ agencyId, member, accountId, challengeId }) {
-  ensureTelegramOwner(member);
-  return getTelegramAuthorizationStatus({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180) });
-}
-
-async function cancelTelegramMtprotoAuthorization({ agencyId, member, accountId, challengeId }) {
-  ensureTelegramOwner(member);
-  return cancelTelegramAuthorization({ agencyId, accountId: clean(accountId, 180), challengeId: clean(challengeId, 180) });
-}
-
-async function runTelegramMtprotoConnectionTest({ agencyId, member, accountId }) {
-  ensureTelegramOwner(member);
-  return testTelegramConnection({ agencyId, accountId: clean(accountId, 180) });
-}
-
-async function readTelegramMtprotoTestStatus({ agencyId, member, accountId }) {
-  ensureTelegramOwner(member);
-  return getTelegramTestStatus({ agencyId, accountId: clean(accountId, 180) });
+  const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db });
+  const cleanSession = String(session || "").trim();
+  if (!cleanSession || cleanSession.length > 262144) {
+    throw telegramInputError("MTProto session must be non-empty and smaller than 256 KB", "SETTINGS_TELEGRAM_SESSION_INVALID");
+  }
+  let encrypted;
+  try { encrypted = encryptTelegramCredentials({ apiHash: secret.apiHash, session: cleanSession }); }
+  catch (_) {
+    const err = new Error("Secure Telegram credential storage is unavailable");
+    err.code = "SETTINGS_TELEGRAM_STORAGE_UNAVAILABLE";
+    err.status = 503;
+    throw err;
+  }
+  const client = db || prisma;
+  await client.agencyTelegramMtprotoAccount.update({
+    where: { id: secret.row.id },
+    data: {
+      encryptedPayload: encrypted.encryptedPayload,
+      iv: encrypted.iv,
+      tag: encrypted.tag,
+      algorithm: encrypted.algorithm,
+      payloadVersion: encrypted.payloadVersion,
+    },
+  });
+  return { id: secret.row.id, apiId: secret.row.apiId, sessionReady: true, connected: false, authStage: null };
 }
 
 async function getBillingSettings({ agencyId, member, db = null }) {
@@ -578,11 +613,6 @@ module.exports = {
   getTelegramMtprotoSettings,
   addTelegramMtprotoAccount,
   removeTelegramMtprotoAccount,
-  startTelegramMtprotoAuthorization,
-  submitTelegramMtprotoCode,
-  submitTelegramMtprotoPassword,
-  readTelegramMtprotoAuthorizationStatus,
-  cancelTelegramMtprotoAuthorization,
-  runTelegramMtprotoConnectionTest,
-  readTelegramMtprotoTestStatus,
+  issueTelegramMtprotoLocalMaterial,
+  storeTelegramMtprotoSession,
 };

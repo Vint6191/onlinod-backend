@@ -42,7 +42,8 @@ test("Telegram MTProto storage is agency-scoped, owner-only and never returns se
         assert.equal(where.agencyId, "agency-1");
         return stored ? [{ ...stored }] : [];
       },
-      findFirst: async ({ where }) => where.id === "tg-1" && where.agencyId === "agency-1" ? { id: "tg-1" } : null,
+      findFirst: async ({ where }) => where.id === "tg-1" && where.agencyId === "agency-1" ? { ...stored } : null,
+      update: async ({ where, data }) => { assert.equal(where.id, "tg-1"); stored = { ...stored, ...data }; return { id: "tg-1" }; },
       delete: async ({ where }) => { assert.equal(where.id, "tg-1"); stored = null; return {}; },
     },
   };
@@ -69,6 +70,17 @@ test("Telegram MTProto storage is agency-scoped, owner-only and never returns se
   assert.deepEqual(await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: { role: "CHATTER" }, db }), { available: false, reason: "OWNER_ONLY", accounts: [] });
   await assert.rejects(() => service.addTelegramMtprotoAccount({ agencyId: "agency-1", member: { role: "MANAGER" }, apiId: 1, apiHash: "0123456789abcdef0123456789abcdef", session: "x", db }), /Only the agency owner/);
 
+  const authMaterial = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", purpose: "authorize", db });
+  assert.deepEqual(authMaterial, { accountId: "tg-1", apiId: 12345678, apiHash: "0123456789abcdef0123456789abcdef", session: "" });
+  const testMaterial = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", purpose: "test", db });
+  assert.equal(testMaterial.session, "SESSION_SECRET_VALUE");
+
+  const storedSession = await service.storeTelegramMtprotoSession({ agencyId: "agency-1", member: owner, accountId: "tg-1", session: "LOCAL_DESKTOP_SESSION", db });
+  assert.deepEqual(storedSession, { id: "tg-1", apiId: 12345678, sessionReady: true, connected: false, authStage: null });
+  assert.equal(stored.encryptedPayload.includes("LOCAL_DESKTOP_SESSION"), false);
+  const after = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", purpose: "test", db });
+  assert.equal(after.session, "LOCAL_DESKTOP_SESSION");
+
   await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
   assert.equal(stored, null);
 });
@@ -87,20 +99,21 @@ test("Telegram MTProto API credentials validate id/hash and allow session to be 
   assert.equal(writes, 1);
 });
 
-test("Settings routes expose owner-scoped MTProto auth and a fixed @runronin connection test without recipient input", () => {
+test("Backend is MTProto storage-only: Desktop gets local material and hands a session back", () => {
+  const packageSource = fs.readFileSync(path.join(root, "package.json"), "utf8");
+  const serviceSource = fs.readFileSync(path.join(root, "src", "services", "settings-service.js"), "utf8");
   assert.match(routeSource, /router\.get\("\/telegram"/);
   assert.match(routeSource, /router\.post\("\/telegram\/accounts"/);
   assert.match(routeSource, /router\.delete\("\/telegram\/accounts\/:accountId"/);
-  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/start/);
-  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/code/);
-  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/auth\/password/);
-  assert.match(routeSource, /router\.get\("\/telegram\/accounts\/:accountId\/auth\/:challengeId"/);
-  assert.match(routeSource, /router\.delete\("\/telegram\/accounts\/:accountId\/auth\/:challengeId"/);
-  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/test/);
-  assert.match(routeSource, /\/telegram\/accounts\/:accountId\/test-status/);
-  const testRoute = routeSource.split('router.post("/telegram/accounts/:accountId/test"')[1].split('router.get("/telegram/accounts/:accountId/test-status"')[0];
-  assert.doesNotMatch(testRoute, /req\.body|recipient|username/);
-  assert.doesNotMatch(routeSource, /auth\.exportLoginToken|QR/i);
+  assert.match(routeSource, /router\.post\("\/telegram\/accounts\/:accountId\/local-material"/);
+  assert.match(routeSource, /router\.put\("\/telegram\/accounts\/:accountId\/session"/);
+  assert.match(routeSource, /Cache-Control", "no-store, private/);
+
+  assert.doesNotMatch(routeSource, /\/auth\/start|\/auth\/code|\/auth\/password|\/test-status|\/:accountId\/test/);
+  assert.doesNotMatch(serviceSource, /telegram-mtproto-runtime|beginTelegramAuthorization|testTelegramConnection/);
+  assert.doesNotMatch(packageSource, /"teleproto"/);
+  assert.doesNotMatch(routeSource, /auth\.sendCode|auth\.signIn|auth\.checkPassword|TelegramClient|StringSession/);
+
   assert.match(schemaSource, /model AgencyTelegramMtprotoAccount/);
   assert.doesNotMatch(schemaSource.split("model AgencyTelegramMtprotoAccount")[1].split("model AgencyMember")[0], /createdAt|updatedAt|deletedAt|username|displayName|phone/);
 });
