@@ -16,6 +16,7 @@ test("changed creator-management backend files pass node syntax checks", () => {
 test("all creator writes require management permission", () => {
   const source = read("routes/creators.js");
   assert.match(source, /router\.post\("\/", creatorManagementRequired/);
+  assert.match(source, /router\.patch\("\/:id\/telegram-contact", creatorManagementRequired, creatorAccessRequired/);
   assert.match(source, /router\.patch\("\/:id", creatorManagementRequired/);
   assert.match(source, /router\.delete\("\/:id", creatorManagementRequired/);
   assert.match(source, /router\.post\("\/:id\/complete-runtime", creatorManagementRequired/);

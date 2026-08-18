@@ -85,6 +85,10 @@ const agencyRemovalSchema = z.object({
   acknowledgeSessionRevocation: z.literal(true),
 });
 
+const telegramContactSchema = z.object({
+  telegramContact: z.string().trim().min(1).max(160).regex(/^[^\r\n\t]+$/, "Invalid Telegram contact").nullable(),
+});
+
 function normalizeUsername(value) {
   const clean = String(value || "").trim().replace(/^@+/, "");
   return clean ? clean.toLowerCase() : null;
@@ -231,6 +235,55 @@ router.get("/:id", creatorAccessRequired, async (req, res) => {
   } catch (err) {
     console.error("[creators/read] failed:", err);
     return res.status(500).json({ ok: false, code: "CREATOR_READ_FAILED", error: "Failed to read creator" });
+  }
+});
+
+router.patch("/:id/telegram-contact", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
+  try {
+    const input = telegramContactSchema.parse(req.body);
+    const existing = await prisma.creatorAccount.findFirst({
+      where: {
+        id: req.params.id,
+        agencyId: req.auth.agencyId,
+        deletedAt: null,
+      },
+      select: { id: true, telegramContact: true },
+    });
+
+    if (!existing) {
+      return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
+    }
+
+    const creator = await prisma.creatorAccount.update({
+      where: { id: existing.id },
+      data: { telegramContact: input.telegramContact },
+    });
+
+    await audit({
+      agencyId: req.auth.agencyId,
+      actorUserId: req.auth.userId,
+      action: "creator.telegram_contact.updated",
+      targetType: "creator",
+      targetId: creator.id,
+      metadata: {
+        hadContact: Boolean(existing.telegramContact),
+        hasContact: Boolean(creator.telegramContact),
+      },
+    });
+
+    return res.json({ ok: true, creator });
+  } catch (err) {
+    if (err?.issues) {
+      return res.status(400).json({
+        ok: false,
+        code: "VALIDATION_ERROR",
+        error: err.issues[0]?.message || "Validation error",
+        issues: err.issues,
+      });
+    }
+
+    console.error("[creators/telegram-contact] failed:", err);
+    return res.status(500).json({ ok: false, code: "CREATOR_TELEGRAM_CONTACT_UPDATE_FAILED", error: "Failed to update Telegram contact" });
   }
 });
 

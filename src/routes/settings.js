@@ -15,6 +15,9 @@ const {
   getWorkspaceSettings,
   updateWorkspaceSettings,
   getBillingSettings,
+  getTelegramMtprotoSettings,
+  addTelegramMtprotoAccount,
+  removeTelegramMtprotoAccount,
 } = require("../services/settings-service");
 
 const router = express.Router();
@@ -186,6 +189,33 @@ router.get("/billing", async (req, res) => {
     console.error("[settings/billing] failed:", err);
     return res.status(500).json({ ok: false, code: "SETTINGS_BILLING_FAILED", error: "Failed to load billing" });
   }
+});
+
+router.get("/telegram", async (req, res) => {
+  try {
+    const telegram = await getTelegramMtprotoSettings({ agencyId: req.auth.agencyId, member: req.auth.membership });
+    return res.json({ ok: true, telegram });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_LOAD_FAILED"); }
+});
+
+router.post("/telegram/accounts", async (req, res) => {
+  try {
+    const result = await addTelegramMtprotoAccount({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership,
+      apiId: req.body?.apiId,
+      apiHash: req.body?.apiHash,
+      session: req.body?.session,
+    });
+    return res.status(201).json({ ok: true, account: result.account });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_ADD_FAILED"); }
+});
+
+router.delete("/telegram/accounts/:accountId", async (req, res) => {
+  try {
+    await removeTelegramMtprotoAccount({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
+    return res.json({ ok: true });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_REMOVE_FAILED"); }
 });
 
 router.get("/runtime", async (req, res) => {

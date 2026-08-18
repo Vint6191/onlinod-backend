@@ -5,6 +5,7 @@ const prisma = require("../prisma");
 const { publicUser, issuePasswordReset } = require("./auth-service");
 const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
+const { encryptTelegramCredentials } = require("./telegram-mtproto-credentials");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
@@ -329,6 +330,90 @@ function billingLine(creator, pricing, defaultCorePriceCents = 2000, now = new D
   };
 }
 
+
+async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
+  if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY", accounts: [] };
+  const client = db || prisma;
+  const accounts = await client.agencyTelegramMtprotoAccount.findMany({
+    where: { agencyId },
+    select: { id: true, apiId: true },
+    orderBy: { id: "asc" },
+  });
+  return { available: true, accounts };
+}
+
+function telegramInputError(message, code) {
+  const err = new Error(message);
+  err.code = code;
+  err.status = 400;
+  return err;
+}
+
+async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, session, db = null }) {
+  if (!isOwner(member)) {
+    const err = new Error("Only the agency owner can manage Telegram MTProto credentials");
+    err.code = "SETTINGS_TELEGRAM_OWNER_ONLY";
+    err.status = 403;
+    throw err;
+  }
+  const numericApiId = Number(apiId);
+  if (!Number.isSafeInteger(numericApiId) || numericApiId <= 0 || numericApiId > 2147483647) {
+    throw telegramInputError("API ID must be a positive integer", "SETTINGS_TELEGRAM_API_ID_INVALID");
+  }
+  const cleanApiHash = String(apiHash || "").trim();
+  if (!/^[a-fA-F0-9]{32}$/.test(cleanApiHash)) {
+    throw telegramInputError("API hash must contain 32 hexadecimal characters", "SETTINGS_TELEGRAM_API_HASH_INVALID");
+  }
+  const cleanSession = String(session || "").trim();
+  if (!cleanSession || cleanSession.length > 262144) {
+    throw telegramInputError("MTProto session is required and must be smaller than 256 KB", "SETTINGS_TELEGRAM_SESSION_INVALID");
+  }
+  const client = db || prisma;
+  let encrypted;
+  try {
+    encrypted = encryptTelegramCredentials({ apiHash: cleanApiHash, session: cleanSession });
+  } catch (_) {
+    const err = new Error("Secure Telegram credential storage is unavailable");
+    err.code = "SETTINGS_TELEGRAM_STORAGE_UNAVAILABLE";
+    err.status = 503;
+    throw err;
+  }
+  const account = await client.agencyTelegramMtprotoAccount.create({
+    data: {
+      agencyId,
+      apiId: numericApiId,
+      encryptedPayload: encrypted.encryptedPayload,
+      iv: encrypted.iv,
+      tag: encrypted.tag,
+      algorithm: encrypted.algorithm,
+      payloadVersion: encrypted.payloadVersion,
+    },
+    select: { id: true, apiId: true },
+  });
+  return { available: true, account };
+}
+
+async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = null }) {
+  if (!isOwner(member)) {
+    const err = new Error("Only the agency owner can manage Telegram MTProto credentials");
+    err.code = "SETTINGS_TELEGRAM_OWNER_ONLY";
+    err.status = 403;
+    throw err;
+  }
+  const id = String(accountId || "").trim();
+  if (!id || id.length > 180) throw telegramInputError("Telegram connection id is required", "SETTINGS_TELEGRAM_ACCOUNT_INVALID");
+  const client = db || prisma;
+  const existing = await client.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { id: true } });
+  if (!existing) {
+    const err = new Error("Telegram connection not found");
+    err.code = "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND";
+    err.status = 404;
+    throw err;
+  }
+  await client.agencyTelegramMtprotoAccount.delete({ where: { id: existing.id } });
+  return { ok: true };
+}
+
 async function getBillingSettings({ agencyId, member, db = null }) {
   const client = db || prisma;
   if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY" };
@@ -429,4 +514,7 @@ module.exports = {
   getWorkspaceSettings,
   updateWorkspaceSettings,
   getBillingSettings,
+  getTelegramMtprotoSettings,
+  addTelegramMtprotoAccount,
+  removeTelegramMtprotoAccount,
 };
