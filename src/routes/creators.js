@@ -247,16 +247,20 @@ router.patch("/:id/telegram-contact", creatorManagementRequired, creatorAccessRe
         agencyId: req.auth.agencyId,
         deletedAt: null,
       },
-      select: { id: true, telegramContact: true },
+      select: { id: true, telegramContact: true, telegramUserId: true },
     });
 
     if (!existing) {
       return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
     }
 
+    const contactChanged = existing.telegramContact !== input.telegramContact;
     const creator = await prisma.creatorAccount.update({
       where: { id: existing.id },
-      data: { telegramContact: input.telegramContact },
+      data: {
+        telegramContact: input.telegramContact,
+        ...(contactChanged ? { telegramUserId: null } : {}),
+      },
     });
 
     await audit({

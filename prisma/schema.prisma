@@ -380,6 +380,7 @@ model CreatorAccount {
   status      CreatorStatus @default(DRAFT)
   notes       String?
   telegramContact String?
+  telegramUserId  String?
   deletedAt   DateTime?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
@@ -471,6 +472,7 @@ model CreatorAccount {
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
+  @@index([agencyId, telegramUserId])
   @@index([status])
   @@index([deletedAt])
   billingProfile CreatorBillingProfile?
@@ -811,6 +813,7 @@ model AgencySubscription {
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 
   @@index([agencyId])
+  @@index([agencyId, telegramUserId])
   @@index([status])
   @@index([currentPeriodEnd])
 }

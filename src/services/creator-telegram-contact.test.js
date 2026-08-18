@@ -12,6 +12,8 @@ test("creator Telegram contact is a nullable backend field with an additive migr
   const migration = read("prisma/migrations/20260818223000_creator_telegram_contact/migration.sql");
   const creator = schema.slice(schema.indexOf("model CreatorAccount {"), schema.indexOf("model CreatorConnectSession"));
   assert.match(creator, /telegramContact\s+String\?/);
+  assert.match(creator, /telegramUserId\s+String\?/);
+  assert.match(creator, /@@index\(\[agencyId, telegramUserId\]\)/);
   assert.match(migration, /ALTER TABLE "CreatorAccount" ADD COLUMN "telegramContact" TEXT/);
   assert.doesNotMatch(migration, /DROP TABLE|DROP COLUMN|DELETE FROM|TRUNCATE/i);
 });
@@ -26,11 +28,13 @@ test("Telegram contact write is agency-scoped, management-gated and does not exp
   assert.match(route, /agencyId: req\.auth\.agencyId/);
   assert.match(route, /deletedAt: null/);
   assert.match(route, /telegramContactSchema\.parse\(req\.body\)/);
-  assert.match(route, /data: \{ telegramContact: input\.telegramContact \}/);
+  assert.match(route, /contactChanged = existing\.telegramContact !== input\.telegramContact/);
+  assert.match(route, /telegramContact: input\.telegramContact/);
+  assert.match(route, /contactChanged \? \{ telegramUserId: null \} : \{\}/);
   assert.match(route, /creator\.telegram_contact\.updated/);
   assert.match(route, /hadContact/);
   assert.match(route, /hasContact/);
-  assert.doesNotMatch(route, /api_hash|apiId|MTProto|BotFather|sendMessage|telegramUserId/i);
+  assert.doesNotMatch(route, /api_hash|apiId|MTProto|BotFather|sendMessage/i);
 });
 
 test("Telegram contact validation is deliberately contact-only", () => {
