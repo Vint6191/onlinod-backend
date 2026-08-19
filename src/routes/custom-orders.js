@@ -11,6 +11,9 @@ const {
   prepareManualReminder,
   recordManualReminder,
   recordTelegramInboundReply,
+  armTelegramCustomUpload,
+  recordTelegramCustomSubmission,
+  prepareTelegramStatusNotification,
 } = require("../services/custom-orders-service");
 const {
   claimDueReminders,
@@ -45,6 +48,7 @@ router.post("/telegram-inbound", async (req, res) => {
       accountId: req.body?.accountId,
       deviceId: req.body?.deviceId,
       claimToken: req.body?.claimToken,
+      transport: req.body?.transport,
       senderTelegramUserId: req.body?.senderTelegramUserId,
       messageId: req.body?.messageId,
       replyToMessageId: req.body?.replyToMessageId,
@@ -52,6 +56,17 @@ router.post("/telegram-inbound", async (req, res) => {
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_ORDER_TELEGRAM_INBOUND_FAILED"); }
+});
+
+
+router.post("/telegram-upload/arm", async (req, res) => {
+  try { return res.json(await armTelegramCustomUpload({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, accountId: req.body?.accountId, deviceId: req.body?.deviceId, claimToken: req.body?.claimToken, senderTelegramUserId: req.body?.senderTelegramUserId, uploadKey: req.body?.uploadKey, controlMessageId: req.body?.controlMessageId, db: prisma })); }
+  catch (err) { return sendError(res, err, "CUSTOM_ORDER_TELEGRAM_UPLOAD_ARM_FAILED"); }
+});
+
+router.post("/telegram-upload/submission", async (req, res) => {
+  try { return res.json(await recordTelegramCustomSubmission({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, accountId: req.body?.accountId, deviceId: req.body?.deviceId, claimToken: req.body?.claimToken, senderTelegramUserId: req.body?.senderTelegramUserId, messageIds: req.body?.messageIds, sentAt: req.body?.sentAt, db: prisma })); }
+  catch (err) { return sendError(res, err, "CUSTOM_ORDER_TELEGRAM_SUBMISSION_FAILED"); }
 });
 
 router.post("/reminders/claim", async (req, res) => {
@@ -71,8 +86,14 @@ router.post("/:orderId/telegram-task", async (req, res) => {
 });
 
 router.post("/:orderId/telegram-delivery", async (req, res) => {
-  try { return res.json(await recordTelegramDelivery({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, orderId: req.params.orderId, taskMessageId: req.body?.taskMessageId, referenceMessageIds: req.body?.referenceMessageIds, db: prisma })); }
+  try { return res.json(await recordTelegramDelivery({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, orderId: req.params.orderId, taskMessageId: req.body?.taskMessageId, referenceMessageIds: req.body?.referenceMessageIds, transport: req.body?.transport, botControlMessageId: req.body?.botControlMessageId, db: prisma })); }
   catch (err) { return sendError(res, err, "CUSTOM_ORDER_TELEGRAM_RECORD_FAILED"); }
+});
+
+
+router.post("/:orderId/telegram-status", async (req, res) => {
+  try { return res.json(await prepareTelegramStatusNotification({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, orderId: req.params.orderId, db: prisma })); }
+  catch (err) { return sendError(res, err, "CUSTOM_ORDER_TELEGRAM_STATUS_FAILED"); }
 });
 
 router.post("/:orderId/remind-now", async (req, res) => {

@@ -5,7 +5,7 @@ const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/aut
 const { resolveTelegramAccountId } = require("./custom-order-reminders");
 
 const RUNTIME_LEASE_MS = 90 * 1000;
-const MAX_RUNTIME_CLAIMS = 10;
+const MAX_RUNTIME_CLAIMS = 100;
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 180) { const text = String(value == null ? "" : value).trim(); return text ? text.slice(0, max) : ""; }

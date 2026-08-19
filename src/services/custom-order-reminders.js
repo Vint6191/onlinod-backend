@@ -166,9 +166,6 @@ function dateLabel(value) {
   return date ? date.toISOString().replace("T", " ").replace(/\.000Z$/, " UTC") : "—";
 }
 
-function money(order) {
-  return `$${(Math.max(0, Number(order?.priceCents || 0)) / 100).toFixed(2)}`;
-}
 
 function renderTemplate(template, order, creator, now = new Date()) {
   const type = String(order?.type || "CONTENT").toUpperCase();
@@ -183,7 +180,6 @@ function renderTemplate(template, order, creator, now = new Date()) {
     "{scheduledAt}": dateLabel(order?.scheduledAt),
     "{minutes}": minutes,
     "{model}": String(creator?.displayName || creator?.username || "").trim(),
-    "{price}": money(order),
   };
   let text = String(template || "").trim();
   for (const [token, value] of Object.entries(replacements)) text = text.split(token).join(value);
@@ -211,7 +207,6 @@ function taskText(order) {
     lines.push(`Формат: ${label}`);
     if (order?.dueAt) lines.push(`Дедлайн: ${dateLabel(order.dueAt)}`);
   }
-  lines.push(`Цена: ${money(order)}`);
   lines.push("");
   lines.push(String(order?.scenario || "").trim());
   return lines.filter((line, index, all) => !(line === "" && all[index - 1] === "")).join("\n").slice(0, 4096);
@@ -284,6 +279,7 @@ async function claimDueReminders({ agencyId, member, deviceId, limit = 10, now =
       claimToken,
       text: reminderText(row, row.creator, workspacePolicy, now),
       replyToMessageId: row.telegramTaskMessageId == null ? null : String(row.telegramTaskMessageId),
+      transport: String(row.telegramTaskTransport || "USER"),
     });
   }
   return { ok: true, deliveries, serverNow: now.toISOString() };
