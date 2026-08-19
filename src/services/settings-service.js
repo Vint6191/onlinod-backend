@@ -353,20 +353,15 @@ async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
   const [rows, reminderRow] = await Promise.all([
     client.agencyTelegramMtprotoAccount.findMany({
       where: { agencyId },
-      select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true, customBotUsername: true },
+      select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true },
       orderBy: { id: "asc" },
     }),
     client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY } } }).catch(() => null),
   ]);
   const accounts = rows.map((row) => {
     let sessionReady = false;
-    let customBotReady = false;
-    try {
-      const secret = decryptTelegramCredentials(row);
-      sessionReady = Boolean(String(secret.session || "").trim());
-      customBotReady = Boolean(String(secret.customBotToken || "").trim() && String(row.customBotUsername || "").trim());
-    } catch (_) {}
-    return { id: row.id, apiId: row.apiId, sessionReady, customBotReady, customBotUsername: row.customBotUsername || null };
+    try { sessionReady = Boolean(String(decryptTelegramCredentials(row).session || "").trim()); } catch (_) {}
+    return { id: row.id, apiId: row.apiId, sessionReady };
   });
   return { available: true, accounts, reminders: normalizeTelegramCustomReminders(reminderRow?.value) };
 }
@@ -472,7 +467,7 @@ async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, ses
     },
     select: { id: true, apiId: true },
   });
-  return { available: true, account: { ...account, sessionReady: Boolean(cleanSession), customBotReady: false, customBotUsername: null } };
+  return { available: true, account: { ...account, sessionReady: Boolean(cleanSession) } };
 }
 
 async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = null }) {
@@ -503,7 +498,7 @@ async function readTelegramMtprotoAccountSecret({ agencyId, accountId, db = null
   const client = db || prisma;
   const row = await client.agencyTelegramMtprotoAccount.findFirst({
     where: { id, agencyId },
-    select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true, customBotUsername: true },
+    select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true },
   });
   if (!row) {
     const err = new Error("Telegram connection not found");
@@ -519,7 +514,7 @@ async function readTelegramMtprotoAccountSecret({ agencyId, accountId, db = null
     err.status = 503;
     throw err;
   }
-  return { row, apiHash: String(credentials.apiHash || ""), session: String(credentials.session || ""), customBotToken: String(credentials.customBotToken || "") };
+  return { row, apiHash: String(credentials.apiHash || ""), session: String(credentials.session || "") };
 }
 
 async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, purpose, creatorId = null, db = null }) {
@@ -551,7 +546,6 @@ async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, 
     apiId: secret.row.apiId,
     apiHash: secret.apiHash,
     session: normalizedPurpose === "messaging" ? secret.session : "",
-    ...(normalizedPurpose === "messaging" && secret.customBotToken ? { customBotToken: secret.customBotToken, customBotUsername: secret.row.customBotUsername || null } : {}),
   };
 }
 
@@ -563,7 +557,7 @@ async function storeTelegramMtprotoSession({ agencyId, member, accountId, sessio
     throw telegramInputError("MTProto session must be non-empty and smaller than 256 KB", "SETTINGS_TELEGRAM_SESSION_INVALID");
   }
   let encrypted;
-  try { encrypted = encryptTelegramCredentials({ apiHash: secret.apiHash, session: cleanSession, customBotToken: secret.customBotToken }); }
+  try { encrypted = encryptTelegramCredentials({ apiHash: secret.apiHash, session: cleanSession }); }
   catch (_) {
     const err = new Error("Secure Telegram credential storage is unavailable");
     err.code = "SETTINGS_TELEGRAM_STORAGE_UNAVAILABLE";
@@ -581,7 +575,7 @@ async function storeTelegramMtprotoSession({ agencyId, member, accountId, sessio
       payloadVersion: encrypted.payloadVersion,
     },
   });
-  return { id: secret.row.id, apiId: secret.row.apiId, sessionReady: true, customBotReady: Boolean(secret.customBotToken && secret.row.customBotUsername), customBotUsername: secret.row.customBotUsername || null };
+  return { id: secret.row.id, apiId: secret.row.apiId, sessionReady: true };
 }
 
 async function getBillingSettings({ agencyId, member, db = null }) {
@@ -667,64 +661,6 @@ async function getBillingSettings({ agencyId, member, db = null }) {
   };
 }
 
-function normalizeBotToken(value) {
-  const token = String(value || "").trim();
-  if (!/^\d{5,20}:[A-Za-z0-9_-]{20,100}$/.test(token)) throw telegramInputError("BotFather token is invalid", "SETTINGS_TELEGRAM_BOT_TOKEN_INVALID");
-  return token;
-}
-
-async function validateStandardTelegramBotToken(token, fetchImpl = globalThis.fetch) {
-  if (typeof fetchImpl !== "function") throw Object.assign(new Error("Bot token validation is unavailable"), { code: "SETTINGS_TELEGRAM_BOT_VALIDATION_UNAVAILABLE", status: 503 });
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
-  try {
-    const response = await fetchImpl(`https://api.telegram.org/bot${token}/getMe`, { method: "POST", signal: controller.signal });
-    const body = await response.json().catch(() => null);
-    const username = String(body?.result?.username || "").trim().replace(/^@+/, "");
-    const isBot = body?.ok === true && body?.result?.is_bot === true;
-    if (!response.ok || !isBot || !/^[A-Za-z0-9_]{5,32}$/.test(username)) throw telegramInputError("Telegram rejected this BotFather token", "SETTINGS_TELEGRAM_BOT_TOKEN_REJECTED");
-    return { username: `@${username}` };
-  } catch (error) {
-    if (error?.code) throw error;
-    const err = new Error(error?.name === "AbortError" ? "Telegram bot validation timed out" : "Could not validate BotFather token with Telegram");
-    err.code = "SETTINGS_TELEGRAM_BOT_VALIDATION_FAILED"; err.status = 502; throw err;
-  } finally { clearTimeout(timer); }
-}
-
-async function storeTelegramStandardBot({ agencyId, member, accountId, botToken, db = null, fetchImpl = globalThis.fetch }) {
-  ensureTelegramManager(member);
-  const id = String(accountId || "").trim();
-  if (!id) throw telegramInputError("Telegram connection id is required", "SETTINGS_TELEGRAM_ACCOUNT_INVALID");
-  const token = normalizeBotToken(botToken);
-  const client = db || prisma;
-  const account = await client.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true } });
-  if (!account) throw Object.assign(new Error("Telegram connection not found"), { code: "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND", status: 404 });
-  const secret = decryptTelegramCredentials(account);
-  const identity = await validateStandardTelegramBotToken(token, fetchImpl);
-  const conflict = await client.agencyTelegramMtprotoAccount.findFirst({ where: { customBotUsername: identity.username, id: { not: account.id } }, select: { id: true, agencyId: true } });
-  if (conflict) {
-    const err = new Error("This Telegram upload bot is already attached to another Telegram connection");
-    err.code = "SETTINGS_TELEGRAM_BOT_ALREADY_IN_USE"; err.status = 409; throw err;
-  }
-  const encrypted = encryptTelegramCredentials({ apiHash: secret.apiHash, session: secret.session, customBotToken: token });
-  await client.agencyTelegramMtprotoAccount.update({ where: { id: account.id }, data: { encryptedPayload: encrypted.encryptedPayload, iv: encrypted.iv, tag: encrypted.tag, algorithm: encrypted.algorithm, payloadVersion: encrypted.payloadVersion, customBotUsername: identity.username } });
-  await audit({ agencyId, actorUserId: member?.userId || null, action: "settings.telegram.custom_bot_saved", targetType: "AgencyTelegramMtprotoAccount", targetId: account.id, metadata: { username: identity.username }, db: client });
-  return { id: account.id, apiId: account.apiId, sessionReady: Boolean(String(secret.session || "").trim()), customBotReady: true, customBotUsername: identity.username };
-}
-
-async function removeTelegramStandardBot({ agencyId, member, accountId, db = null }) {
-  ensureTelegramManager(member);
-  const id = String(accountId || "").trim();
-  const client = db || prisma;
-  const account = await client.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true } });
-  if (!account) throw Object.assign(new Error("Telegram connection not found"), { code: "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND", status: 404 });
-  const secret = decryptTelegramCredentials(account);
-  const encrypted = encryptTelegramCredentials({ apiHash: secret.apiHash, session: secret.session });
-  await client.agencyTelegramMtprotoAccount.update({ where: { id: account.id }, data: { encryptedPayload: encrypted.encryptedPayload, iv: encrypted.iv, tag: encrypted.tag, algorithm: encrypted.algorithm, payloadVersion: encrypted.payloadVersion, customBotUsername: null } });
-  await audit({ agencyId, actorUserId: member?.userId || null, action: "settings.telegram.custom_bot_removed", targetType: "AgencyTelegramMtprotoAccount", targetId: account.id, metadata: {}, db: client });
-  return { id: account.id, apiId: account.apiId, sessionReady: Boolean(String(secret.session || "").trim()), customBotReady: false, customBotUsername: null };
-}
-
 module.exports = {
   WORKSPACE_SETTING_DEFAULTS,
   TIME_FORMATS,
@@ -748,7 +684,4 @@ module.exports = {
   removeTelegramMtprotoAccount,
   issueTelegramMtprotoLocalMaterial,
   storeTelegramMtprotoSession,
-  validateStandardTelegramBotToken,
-  storeTelegramStandardBot,
-  removeTelegramStandardBot,
 };

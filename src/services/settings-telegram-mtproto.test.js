@@ -68,14 +68,14 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
     session: "SESSION_SECRET_VALUE",
     db,
   });
-  assert.deepEqual(added, { available: true, account: { id: "tg-1", apiId: 12345678, sessionReady: true, customBotReady: false, customBotUsername: null } });
+  assert.deepEqual(added, { available: true, account: { id: "tg-1", apiId: 12345678, sessionReady: true } });
   assert.equal(stored.agencyId, "agency-1");
   assert.equal(stored.encryptedPayload.includes("SESSION_SECRET_VALUE"), false);
   assert.equal(stored.encryptedPayload.includes("0123456789abcdef"), false);
   assert.equal(stored.algorithm, "aes-256-gcm");
 
   const listed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: owner, db });
-  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678, sessionReady: true, customBotReady: false, customBotUsername: null }], reminders: DEFAULT_REMINDERS });
+  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678, sessionReady: true }], reminders: DEFAULT_REMINDERS });
   assert.equal(JSON.stringify(listed).includes("SESSION_SECRET_VALUE"), false);
   assert.equal(JSON.stringify(listed).includes("0123456789abcdef"), false);
 
@@ -106,75 +106,13 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
   );
 
   const storedSession = await service.storeTelegramMtprotoSession({ agencyId: "agency-1", member: owner, accountId: "tg-1", session: "LOCAL_DESKTOP_SESSION", db });
-  assert.deepEqual(storedSession, { id: "tg-1", apiId: 12345678, sessionReady: true, customBotReady: false, customBotUsername: null });
+  assert.deepEqual(storedSession, { id: "tg-1", apiId: 12345678, sessionReady: true });
   assert.equal(stored.encryptedPayload.includes("LOCAL_DESKTOP_SESSION"), false);
   const after = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", creatorId: "creator-1", purpose: "messaging", db });
   assert.equal(after.session, "LOCAL_DESKTOP_SESSION");
 
   await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
   assert.equal(stored, null);
-});
-
-
-test("standard BotFather upload bot is validated once, encrypted, creator-scoped and never exposed in settings", async () => {
-  const service = loadSettingsService();
-  let stored = null;
-  const db = {
-    workspaceSetting: { findUnique: async () => null, upsert: async () => ({}) },
-    creatorAccount: {
-      findFirst: async ({ where }) => where.id === "creator-1" ? { id: "creator-1", agencyId: "agency-1", telegramContact: "@model", telegramAccountId: "tg-1", deletedAt: null } : null,
-      findMany: async () => [{ id: "creator-1", telegramContact: "@model", telegramAccountId: "tg-1" }],
-      updateMany: async () => ({ count: 0 }),
-    },
-    agencyTelegramMtprotoAccount: {
-      create: async ({ data }) => { stored = { id: "tg-1", ...data, customBotUsername: null }; return { id: "tg-1", apiId: data.apiId }; },
-      findMany: async ({ where }) => stored && where.agencyId === "agency-1" ? [{ ...stored }] : [],
-      findFirst: async ({ where }) => {
-        if (where.customBotUsername !== undefined) {
-          if (!stored || stored.customBotUsername !== where.customBotUsername) return null;
-          if (where.id?.not && stored.id === where.id.not) return null;
-          return { id: stored.id, agencyId: stored.agencyId };
-        }
-        return stored && where.id === "tg-1" && where.agencyId === "agency-1" ? { ...stored } : null;
-      },
-      update: async ({ data }) => { stored = { ...stored, ...data }; return { id: "tg-1" }; },
-    },
-  };
-  const owner = { role: "OWNER", userId: "owner-1" };
-  await service.addTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, apiId: 12345678, apiHash: "0123456789abcdef0123456789abcdef", session: "USER_SESSION", db });
-  const token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef_1234567890";
-  const fetchImpl = async (url, options) => {
-    assert.equal(url, `https://api.telegram.org/bot${token}/getMe`);
-    assert.equal(options.method, "POST");
-    return { ok: true, async json() { return { ok: true, result: { id: 42, is_bot: true, username: "onlinod_upload_bot" } }; } };
-  };
-  const saved = await service.storeTelegramStandardBot({ agencyId: "agency-1", member: owner, accountId: "tg-1", botToken: token, db, fetchImpl });
-  assert.deepEqual(saved, { id: "tg-1", apiId: 12345678, sessionReady: true, customBotReady: true, customBotUsername: "@onlinod_upload_bot" });
-  assert.equal(stored.encryptedPayload.includes(token), false, "bot token is encrypted inside the existing credential blob");
-
-  const listed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: owner, db });
-  assert.equal(listed.accounts[0].customBotReady, true);
-  assert.equal(listed.accounts[0].customBotUsername, "@onlinod_upload_bot");
-  assert.equal(JSON.stringify(listed).includes(token), false);
-
-  const authMaterial = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", purpose: "authorize", db });
-  assert.equal("customBotToken" in authMaterial, false, "authorization flow never receives the bot token");
-  const chatterMaterial = await service.issueTelegramMtprotoLocalMaterial({
-    agencyId: "agency-1", member: { role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"] },
-    accountId: "tg-1", creatorId: "creator-1", purpose: "messaging", db,
-  });
-  assert.equal(chatterMaterial.customBotToken, token, "only creator-scoped MAIN execution material contains the bot token");
-  assert.equal(chatterMaterial.customBotUsername, "@onlinod_upload_bot");
-
-  await service.storeTelegramMtprotoSession({ agencyId: "agency-1", member: owner, accountId: "tg-1", session: "REAUTHED_USER_SESSION", db });
-  const afterReauth = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", creatorId: "creator-1", purpose: "messaging", db });
-  assert.equal(afterReauth.customBotToken, token, "reauthorizing the user account preserves the upload bot");
-
-  const removed = await service.removeTelegramStandardBot({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
-  assert.equal(removed.customBotReady, false);
-  const afterRemove = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", creatorId: "creator-1", purpose: "messaging", db });
-  assert.equal(afterRemove.session, "REAUTHED_USER_SESSION");
-  assert.equal("customBotToken" in afterRemove, false);
 });
 
 test("Telegram MTProto API credentials validate id/hash and allow session to be added later", async () => {

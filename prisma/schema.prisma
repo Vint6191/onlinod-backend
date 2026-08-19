@@ -48,11 +48,6 @@ enum CustomOrderPhysicalStatus {
   COMPLETED
 }
 
-enum CustomOrderTelegramTransport {
-  USER
-  BOT
-}
-
 
 enum AnalyticsDataType {
   EARNINGS
@@ -339,7 +334,6 @@ model AgencyTelegramMtprotoAccount {
   runtimeClaimedByDeviceId String?
   runtimeClaimToken        String?
   runtimeClaimUntil        DateTime?
-  customBotUsername        String? @unique
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 
@@ -533,13 +527,7 @@ model CustomOrder {
   mediaIds                    String                    @default("")
   priceCents                  Int                       @default(0)
   telegramTaskMessageId       Int?
-  telegramTaskTransport       CustomOrderTelegramTransport @default(USER)
-  telegramBotControlMessageId Int?
   telegramReferenceMessageIds Int[]                     @default([])
-  telegramUploadKey           String?                    @unique
-  telegramUploadArmedAt       DateTime?
-  telegramSubmissionMessageIds Int[]                    @default([])
-  telegramSubmissionReceivedAt DateTime?
   telegramLastModelMessageId  Int?
   telegramLastModelMessageAt  DateTime?
   reminderConfig              Json?

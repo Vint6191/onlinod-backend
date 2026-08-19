@@ -21,8 +21,6 @@ const {
   removeTelegramMtprotoAccount,
   issueTelegramMtprotoLocalMaterial,
   storeTelegramMtprotoSession,
-  storeTelegramStandardBot,
-  removeTelegramStandardBot,
 } = require("../services/settings-service");
 const {
   claimTelegramExecutionRuntimes,
@@ -248,22 +246,6 @@ router.post("/telegram/accounts", async (req, res) => {
     });
     return res.status(201).json({ ok: true, account: result.account });
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_ADD_FAILED"); }
-});
-
-
-router.put("/telegram/accounts/:accountId/custom-bot", async (req, res) => {
-  try {
-    const account = await storeTelegramStandardBot({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, botToken: req.body?.botToken });
-    res.setHeader("Cache-Control", "no-store, private");
-    return res.json({ ok: true, account });
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_BOT_SAVE_FAILED"); }
-});
-
-router.delete("/telegram/accounts/:accountId/custom-bot", async (req, res) => {
-  try {
-    const account = await removeTelegramStandardBot({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
-    return res.json({ ok: true, account });
-  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_BOT_REMOVE_FAILED"); }
 });
 
 router.delete("/telegram/accounts/:accountId", async (req, res) => {

@@ -166,7 +166,6 @@ function dateLabel(value) {
   return date ? date.toISOString().replace("T", " ").replace(/\.000Z$/, " UTC") : "—";
 }
 
-
 function renderTemplate(template, order, creator, now = new Date()) {
   const type = String(order?.type || "CONTENT").toUpperCase();
   let minutes = "";
@@ -279,7 +278,6 @@ async function claimDueReminders({ agencyId, member, deviceId, limit = 10, now =
       claimToken,
       text: reminderText(row, row.creator, workspacePolicy, now),
       replyToMessageId: row.telegramTaskMessageId == null ? null : String(row.telegramTaskMessageId),
-      transport: String(row.telegramTaskTransport || "USER"),
     });
   }
   return { ok: true, deliveries, serverNow: now.toISOString() };

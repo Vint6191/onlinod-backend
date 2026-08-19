@@ -14,8 +14,6 @@ const {
   prepareTelegramTask,
   prepareManualReminder,
   recordTelegramInboundReply,
-  armTelegramCustomUpload,
-  recordTelegramCustomSubmission,
   prepareTelegramStatusNotification,
 } = require("./custom-orders-service");
 
@@ -43,17 +41,10 @@ function fakeDb(seed = {}) {
 
   function matches(row, where = {}) {
     if (Array.isArray(where.OR) && where.OR.length && !where.OR.some((candidate) => matches(row, candidate))) return false;
-    if (where.id !== undefined) {
-      if (typeof where.id === "string" && row.id !== where.id) return false;
-      if (where.id?.not !== undefined && row.id === where.id.not) return false;
-      if (where.id?.in && !where.id.in.includes(row.id)) return false;
-    }
+    if (where.id !== undefined && row.id !== where.id) return false;
     if (where.agencyId !== undefined && row.agencyId !== where.agencyId) return false;
     if (where.telegramTaskMessageId !== undefined && Number(row.telegramTaskMessageId) !== Number(where.telegramTaskMessageId)) return false;
-    if (where.telegramTaskTransport !== undefined && String(row.telegramTaskTransport || "USER") !== String(where.telegramTaskTransport)) return false;
     if (where.telegramReferenceMessageIds?.has !== undefined && !(Array.isArray(row.telegramReferenceMessageIds) && row.telegramReferenceMessageIds.map(Number).includes(Number(where.telegramReferenceMessageIds.has)))) return false;
-    if (where.telegramUploadKey !== undefined && String(row.telegramUploadKey || "") !== String(where.telegramUploadKey || "")) return false;
-    if (where.telegramUploadArmedAt?.not === null && row.telegramUploadArmedAt == null) return false;
     if (where.type !== undefined && String(row.type || "CONTENT") !== String(where.type)) return false;
     if (where.creatorId) {
       if (typeof where.creatorId === "string" && row.creatorId !== where.creatorId) return false;
@@ -99,9 +90,7 @@ function fakeDb(seed = {}) {
     workspaceSetting: { async findUnique() { return null; } },
     agencyTelegramMtprotoAccount: {
       async findFirst({ where }) {
-        const row = accounts.find((candidate) => candidate.id === where.id && candidate.agencyId === where.agencyId
-          && (where.runtimeClaimedByDeviceId === undefined || candidate.runtimeClaimedByDeviceId === where.runtimeClaimedByDeviceId)
-          && (where.runtimeClaimToken === undefined || candidate.runtimeClaimToken === where.runtimeClaimToken));
+        const row = accounts.find((candidate) => candidate.id === where.id && candidate.agencyId === where.agencyId);
         return clone(row || null);
       },
       async findMany({ where }) { return accounts.filter((row) => row.agencyId === where.agencyId).map((row) => ({ id: row.id })); },
@@ -350,84 +339,6 @@ test("Telegram references persist only task/message ids on the custom and merge 
 });
 
 
-test("model upload is stored only as server-side Telegram ids and blocks chatter completion until Content Team review", async () => {
-  const now = new Date("2026-08-19T20:00:00.000Z");
-  const db = fakeDb({
-    accounts: [{
-      id: "tg-1", agencyId: "agency-1",
-      runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1",
-      runtimeClaimUntil: new Date("2026-08-19T20:10:00.000Z"),
-    }],
-  });
-  const created = await createCustomOrder({
-    agencyId: "agency-1", member, now,
-    input: { creatorId: "creator-1", dialogId: "422", scenario: "Model submission review", type: "CONTENT", contentKind: "VIDEO", price: 123 },
-    db,
-  });
-  assert.equal(created.order.telegramSubmissionCount, 0);
-  assert.equal("telegramSubmissionMessageIds" in created.order, false, "raw model media ids are never exposed through the normal custom serializer");
-  assert.ok(db._rows[0].telegramUploadKey, "content custom gets an opaque upload key");
-
-  const armed = await armTelegramCustomUpload({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
-    senderTelegramUserId: "1001", uploadKey: db._rows[0].telegramUploadKey, controlMessageId: "750", now, db,
-  });
-  assert.equal(armed.matched, true);
-  assert.equal(armed.order.telegramUploadState, "WAITING");
-
-  const first = await recordTelegramCustomSubmission({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
-    senderTelegramUserId: "1001", messageIds: ["801", "802"], sentAt: "2026-08-19T20:01:00.000Z", now, db,
-  });
-  assert.equal(first.matched, true);
-  assert.equal(first.submissionCount, 2);
-  assert.equal(first.order.status, "PENDING", "model upload is a submission, not chatter approval");
-  assert.equal(first.order.telegramSubmissionCount, 2);
-  assert.equal("telegramSubmissionMessageIds" in first.order, false);
-  assert.deepEqual(db._rows[0].telegramSubmissionMessageIds, [801, 802], "only Telegram ids are retained server-side");
-
-  await armTelegramCustomUpload({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
-    senderTelegramUserId: "1001", uploadKey: db._rows[0].telegramUploadKey, controlMessageId: "750", now: new Date("2026-08-19T20:02:00.000Z"), db,
-  });
-  const second = await recordTelegramCustomSubmission({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
-    senderTelegramUserId: "1001", messageIds: ["802", "803", "804"], sentAt: "2026-08-19T20:03:00.000Z", now: new Date("2026-08-19T20:03:00.000Z"), db,
-  });
-  assert.equal(second.submissionCount, 4, "add-more appends and de-duplicates Telegram message ids");
-
-  await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: created.order.id, input: { creatorId: "creator-1", status: "COMPLETED" }, now, db }),
-    (error) => error?.code === "CUSTOM_ORDER_CONTENT_REVIEW_REQUIRED" && error?.status === 409,
-  );
-  await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: created.order.id, input: { creatorId: "creator-1", type: "PHYSICAL" }, now, db }),
-    (error) => error?.code === "CUSTOM_ORDER_CONTENT_REVIEW_REQUIRED" && error?.status === 409,
-    "chatter cannot bypass the review placeholder by changing the custom type",
-  );
-});
-
-test("cancel notification identifies the custom, replies to its task and never exposes model price", async () => {
-  const db = fakeDb({ orders: [{
-    id: "order-cancel", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
-    scenario: "Blue room video", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "CANCELLED",
-    dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null,
-    acceptedAt: null, completedAt: null, deliveredAt: new Date("2026-08-19T19:00:00.000Z"),
-    cancelledAt: new Date("2026-08-19T20:00:00.000Z"), cancelReason: "fan cancelled", mediaIds: "", priceCents: 99900,
-    telegramTaskMessageId: 700, telegramTaskTransport: "BOT", telegramBotControlMessageId: 701,
-    telegramReferenceMessageIds: [], telegramSubmissionMessageIds: [], telegramUploadArmedAt: null,
-    reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
-    createdAt: new Date("2026-08-19T18:00:00.000Z"), updatedAt: new Date("2026-08-19T20:00:00.000Z"),
-  }] });
-  const prepared = await prepareTelegramStatusNotification({ agencyId: "agency-1", member, orderId: "order-cancel", db });
-  assert.equal(prepared.delivery.replyToMessageId, "700");
-  assert.equal(prepared.delivery.botControlMessageId, "701");
-  assert.equal(prepared.delivery.transport, "BOT");
-  assert.match(prepared.delivery.text, /Blue room video/);
-  assert.match(prepared.delivery.text, /fan cancelled/);
-  assert.doesNotMatch(prepared.delivery.text, /999|цена|price/i);
-});
-
 test("leased chatter runtime records only creator-bound Telegram replies and dedupes by message id", async () => {
   const now = new Date("2026-08-19T14:00:00.000Z");
   const db = fakeDb({
@@ -436,7 +347,7 @@ test("leased chatter runtime records only creator-bound Telegram replies and ded
       id: "order-inbound", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
       scenario: "content custom", internalNote: null, status: "PENDING", type: "CONTENT", contentKind: "VIDEO", physicalStatus: null,
       dueAt: new Date("2026-08-20T12:00:00.000Z"), scheduledAt: null, durationMinutes: null, reminderConfig: null,
-      telegramTaskMessageId: 700, telegramTaskTransport: "USER", telegramReferenceMessageIds: [701], telegramLastModelMessageId: null, telegramLastModelMessageAt: null,
+      telegramTaskMessageId: 700, telegramReferenceMessageIds: [701], telegramLastModelMessageId: null, telegramLastModelMessageAt: null,
       nextReminderAt: null, reminderClaimToken: null, reminderClaimUntil: null, lastReminderAt: null, lastReminderKey: null,
       acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 5000,
       createdAt: new Date("2026-08-19T13:00:00.000Z"), updatedAt: new Date("2026-08-19T13:00:00.000Z"),
@@ -444,7 +355,7 @@ test("leased chatter runtime records only creator-bound Telegram replies and ded
   });
 
   const first = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1", transport: "USER",
+    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
     senderTelegramUserId: "1001", messageId: "900", replyToMessageId: "700", sentAt: "2026-08-19T13:59:50.000Z", now, db,
   });
   assert.equal(first.matched, true);
@@ -453,73 +364,23 @@ test("leased chatter runtime records only creator-bound Telegram replies and ded
   assert.equal(first.order.telegramLastModelMessageAt, "2026-08-19T13:59:50.000Z");
 
   const duplicate = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1", transport: "USER",
+    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
     senderTelegramUserId: "1001", messageId: "900", replyToMessageId: "700", sentAt: "2026-08-19T13:59:50.000Z", now, db,
   });
   assert.equal(duplicate.deduped, true);
 
   const referenceReply = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1", transport: "USER",
+    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
     senderTelegramUserId: "1001", messageId: "901", replyToMessageId: "701", sentAt: "2026-08-19T14:00:00.000Z", now, db,
   });
   assert.equal(referenceReply.matched, true, "replying to a reference document remains linked to the same custom");
   assert.equal(referenceReply.order.telegramLastModelMessageId, "901");
 
   const foreignSender = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1", transport: "USER",
+    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
     senderTelegramUserId: "1002", messageId: "902", replyToMessageId: "700", sentAt: now.toISOString(), now, db,
   });
   assert.deepEqual(foreignSender, { ok: true, matched: false, reason: "CREATOR_NOT_FOUND" });
-});
-
-
-test("Telegram inbound reply matching is transport-scoped even when USER and BOT message ids collide", async () => {
-  const now = new Date("2026-08-19T14:00:00.000Z");
-  const common = {
-    agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
-    scenario: "collision", internalNote: null, status: "PENDING", type: "CONTENT", contentKind: "VIDEO", physicalStatus: null,
-    dueAt: null, scheduledAt: null, durationMinutes: null, reminderConfig: null,
-    telegramTaskMessageId: 700, telegramReferenceMessageIds: [701], telegramLastModelMessageId: null, telegramLastModelMessageAt: null,
-    nextReminderAt: null, reminderClaimToken: null, reminderClaimUntil: null, lastReminderAt: null, lastReminderKey: null,
-    acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0,
-    createdAt: new Date("2026-08-19T13:00:00.000Z"), updatedAt: new Date("2026-08-19T13:00:00.000Z"),
-  };
-  const db = fakeDb({
-    accounts: [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1", runtimeClaimUntil: new Date("2026-08-19T14:05:00.000Z") }],
-    orders: [
-      { ...common, id: "order-user", telegramTaskTransport: "USER" },
-      { ...common, id: "order-bot", telegramTaskTransport: "BOT", createdAt: new Date("2026-08-19T13:01:00.000Z") },
-    ],
-  });
-
-  const result = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1", transport: "BOT",
-    senderTelegramUserId: "1001", messageId: "990", replyToMessageId: "700", sentAt: now.toISOString(), now, db,
-  });
-  assert.equal(result.matched, true);
-  assert.equal(result.order.id, "order-bot");
-  assert.equal(db._rows.find((row) => row.id === "order-user").telegramLastModelMessageId, null);
-  assert.equal(db._rows.find((row) => row.id === "order-bot").telegramLastModelMessageId, 990);
-});
-
-test("Telegram task transport becomes immutable after the first recorded delivery", async () => {
-  const now = new Date("2026-08-19T14:00:00.000Z");
-  const db = fakeDb({ orders: [{
-    id: "order-transport", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
-    scenario: "transport", internalNote: null, status: "PENDING", type: "CONTENT", contentKind: "PHOTO",
-    dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, reminderConfig: null,
-    telegramTaskMessageId: 700, telegramTaskTransport: "USER", telegramReferenceMessageIds: [],
-    nextReminderAt: null, reminderClaimToken: null, reminderClaimUntil: null, lastReminderAt: null, lastReminderKey: null,
-    acceptedAt: null, completedAt: null, deliveredAt: now, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0,
-    createdAt: now, updatedAt: now,
-  }] });
-  await assert.rejects(
-    () => recordTelegramDelivery({ agencyId: "agency-1", member, orderId: "order-transport", taskMessageId: "700", referenceMessageIds: [], transport: "BOT", db }),
-    (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TRANSPORT_CONFLICT" && error?.status === 409,
-  );
-  const same = await recordTelegramDelivery({ agencyId: "agency-1", member, orderId: "order-transport", taskMessageId: "700", referenceMessageIds: ["701"], transport: "USER", db });
-  assert.equal(same.order.telegramTaskTransport, "USER");
-  assert.deepEqual(same.order.telegramReferenceMessageIds, ["701"]);
 });
 
 test("Telegram inbound replies require the live account runtime lease", async () => {
@@ -531,4 +392,21 @@ test("Telegram inbound replies require the live account runtime lease", async ()
     () => recordTelegramInboundReply({ agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-b", claimToken: "lease-b", senderTelegramUserId: "1001", messageId: "999", replyToMessageId: "700", now, db }),
     (error) => error?.code === "TELEGRAM_EXECUTION_LEASE_INVALID" && error?.status === 409,
   );
+});
+
+
+test("USER cancellation notification replies to the original task and never exposes price", async () => {
+  const db = fakeDb({ orders: [{
+    id: "order-cancel-user", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "Blue room video", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "CANCELLED",
+    dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null, deliveredAt: new Date("2026-08-19T19:00:00.000Z"),
+    cancelledAt: new Date("2026-08-19T20:00:00.000Z"), cancelReason: "fan cancelled", mediaIds: "", priceCents: 99900,
+    telegramTaskMessageId: 700, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
+    telegramLastModelMessageId: null, telegramLastModelMessageAt: null, createdAt: new Date("2026-08-19T18:00:00.000Z"), updatedAt: new Date("2026-08-19T20:00:00.000Z"),
+  }] });
+  const prepared = await prepareTelegramStatusNotification({ agencyId: "agency-1", member, orderId: "order-cancel-user", db });
+  assert.equal(prepared.delivery.replyToMessageId, "700");
+  assert.match(prepared.delivery.text, /Blue room video/);
+  assert.match(prepared.delivery.text, /fan cancelled/);
+  assert.doesNotMatch(prepared.delivery.text, /999|цена|price/i);
 });
