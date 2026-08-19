@@ -331,6 +331,9 @@ model AgencyTelegramMtprotoAccount {
   tag              String
   algorithm        String @default("aes-256-gcm")
   payloadVersion   Int    @default(1)
+  runtimeClaimedByDeviceId String?
+  runtimeClaimToken        String?
+  runtimeClaimUntil        DateTime?
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 
@@ -525,6 +528,8 @@ model CustomOrder {
   priceCents                  Int                       @default(0)
   telegramTaskMessageId       Int?
   telegramReferenceMessageIds Int[]                     @default([])
+  telegramLastModelMessageId  Int?
+  telegramLastModelMessageAt  DateTime?
   reminderConfig              Json?
   nextReminderAt              DateTime?
   lastReminderAt              DateTime?
@@ -544,6 +549,7 @@ model CustomOrder {
   @@index([agencyId, creatorId, status, dueAt])
   @@index([agencyId, creatorId, status, scheduledAt])
   @@index([agencyId, creatorId, dialogId, createdAt])
+  @@index([agencyId, creatorId, telegramTaskMessageId])
   @@index([creatorId, dialogId, status])
 }
 

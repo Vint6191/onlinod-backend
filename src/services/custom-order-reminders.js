@@ -233,11 +233,8 @@ async function resolveTelegramAccountId({ agencyId, creator, db }) {
 }
 
 async function claimDueReminders({ agencyId, member, deviceId, limit = 10, now = new Date(), db }) {
-  const role = String(member?.role || "").trim().toUpperCase();
-  const roleKey = String(member?.roleKey || "").trim().toLowerCase();
-  if (!(role === "OWNER" || role === "ADMIN" || roleKey === "owner" || roleKey === "admin")) {
-    throw Object.assign(new Error("Only the agency owner or administrator desktop can deliver automatic Telegram reminders"), { code: "CUSTOM_ORDER_REMINDER_DELIVERY_OWNER_ADMIN_ONLY", status: 403 });
-  }
+  const normalizedDeviceId = String(deviceId || "").trim();
+  if (!normalizedDeviceId) throw Object.assign(new Error("deviceId is required"), { code: "CUSTOM_ORDER_REMINDER_DEVICE_REQUIRED", status: 400 });
   const { allowedCreatorScope } = require("../middleware/automation-permissions");
   const scope = await allowedCreatorScope({ agencyId, member, db });
   const creatorWhere = scope.broad ? {} : { creatorId: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } };
@@ -262,6 +259,11 @@ async function claimDueReminders({ agencyId, member, deviceId, limit = 10, now =
     if (!String(row.creator?.telegramContact || "").trim()) continue;
     const accountId = await resolveTelegramAccountId({ agencyId, creator: row.creator, db });
     if (!accountId) continue;
+    const runtimeOwner = await db.agencyTelegramMtprotoAccount.findFirst({
+      where: { id: accountId, agencyId, runtimeClaimedByDeviceId: normalizedDeviceId, runtimeClaimUntil: { gt: now } },
+      select: { id: true },
+    });
+    if (!runtimeOwner) continue;
     const claimToken = crypto.randomUUID();
     const claimUntil = new Date(now.getTime() + CLAIM_MS);
     const changed = await db.customOrder.updateMany({

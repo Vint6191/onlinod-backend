@@ -38,11 +38,74 @@ test("call reminders are relative to scheduledAt while content repeats from deli
   assert.equal(content.at.toISOString(), "2026-08-19T12:47:00.000Z");
 });
 
-test("automatic reminder claim is owner/admin-only so chatter desktops cannot steal a due claim", async () => {
-  await assert.rejects(
-    () => claimDueReminders({ agencyId: "agency-1", member: { role: "CHATTER" }, deviceId: "dev-1", db: {} }),
-    (error) => error?.code === "CUSTOM_ORDER_REMINDER_DELIVERY_OWNER_ADMIN_ONLY" && error?.status === 403,
-  );
+test("assigned chatter desktops can claim due Telegram reminders for their creator scope", async () => {
+  const dueAt = new Date("2026-08-19T11:59:00.000Z");
+  const now = new Date("2026-08-19T12:00:00.000Z");
+  const creator = { id: "creator-1", telegramContact: "@model_a", telegramAccountId: "tg-1", displayName: "Model A" };
+  const db = {
+    creatorAccount: {
+      async findMany() { return [{ id: "creator-1", telegramContact: "@model_a", telegramAccountId: "tg-1" }]; },
+    },
+    agencyTelegramMtprotoAccount: {
+      async findFirst({ where }) {
+        if (where.id !== "tg-1" || where.agencyId !== "agency-1") return null;
+        if (where.runtimeClaimedByDeviceId !== undefined) {
+          return where.runtimeClaimedByDeviceId === "dev-chatter-1" && where.runtimeClaimUntil?.gt === now ? { id: "tg-1" } : null;
+        }
+        return { id: "tg-1" };
+      },
+      async findMany() { return [{ id: "tg-1" }]; },
+    },
+    workspaceSetting: { async findUnique() { return null; } },
+    customOrder: {
+      async findMany({ where }) {
+        assert.deepEqual(where.creatorId, { in: ["creator-1"] });
+        return [{
+          id: "order-1", agencyId: "agency-1", creatorId: "creator-1", creator, status: "PENDING", type: "CONTENT",
+          scenario: "shoot this", priceCents: 1000, createdAt: new Date("2026-08-19T10:00:00.000Z"),
+          telegramTaskMessageId: 501, nextReminderAt: dueAt, reminderClaimUntil: null, reminderConfig: null, lastReminderKey: null,
+        }];
+      },
+      async updateMany({ where, data }) {
+        assert.equal(where.id, "order-1");
+        assert.equal(where.nextReminderAt, dueAt);
+        assert.ok(data.reminderClaimToken);
+        assert.ok(data.reminderClaimUntil > now);
+        return { count: 1 };
+      },
+    },
+  };
+  const result = await claimDueReminders({
+    agencyId: "agency-1",
+    member: { role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"] },
+    deviceId: "dev-chatter-1", now, db,
+  });
+  assert.equal(result.deliveries.length, 1);
+  assert.equal(result.deliveries[0].creatorId, "creator-1");
+  assert.equal(result.deliveries[0].accountId, "tg-1");
+  assert.equal(result.deliveries[0].replyToMessageId, "501");
+});
+
+test("automatic reminders are routed through the current Telegram account runtime owner", async () => {
+  const now = new Date("2026-08-19T12:00:00.000Z");
+  const creator = { id: "creator-1", telegramContact: "@model_a", telegramAccountId: "tg-1", displayName: "Model A" };
+  const db = {
+    creatorAccount: { async findMany() { return [{ id: "creator-1" }]; } },
+    agencyTelegramMtprotoAccount: {
+      async findMany() { return [{ id: "tg-1" }]; },
+      async findFirst({ where }) {
+        if (!where.runtimeClaimedByDeviceId) return { id: "tg-1" };
+        return where.runtimeClaimedByDeviceId === "device-runtime-owner" ? { id: "tg-1" } : null;
+      },
+    },
+    workspaceSetting: { async findUnique() { return null; } },
+    customOrder: {
+      async findMany() { return [{ id: "order-1", agencyId: "agency-1", creatorId: "creator-1", creator, status: "PENDING", type: "CONTENT", scenario: "x", priceCents: 0, createdAt: now, telegramTaskMessageId: 500, nextReminderAt: now, reminderClaimUntil: null }]; },
+      async updateMany() { throw new Error("non-runtime owner must not reach custom reminder claim mutation"); },
+    },
+  };
+  const result = await claimDueReminders({ agencyId: "agency-1", member: { role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"] }, deviceId: "device-not-owner", now, db });
+  assert.deepEqual(result.deliveries, []);
 });
 
 test("schema stores Telegram reference message ids directly on CustomOrder with no reference media model", () => {

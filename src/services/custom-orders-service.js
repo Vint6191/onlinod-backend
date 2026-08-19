@@ -161,6 +161,8 @@ function serializeOrder(row, now = new Date()) {
     priceCents: Math.max(0, Number(row.priceCents || 0)), price: Math.max(0, Number(row.priceCents || 0)) / 100,
     telegramTaskMessageId: row.telegramTaskMessageId == null ? null : String(row.telegramTaskMessageId),
     telegramReferenceMessageIds: Array.isArray(row.telegramReferenceMessageIds) ? row.telegramReferenceMessageIds.map(String) : [],
+    telegramLastModelMessageId: row.telegramLastModelMessageId == null ? null : String(row.telegramLastModelMessageId),
+    telegramLastModelMessageAt: row.telegramLastModelMessageAt ? new Date(row.telegramLastModelMessageAt).toISOString() : null,
     reminderConfig: row.reminderConfig && typeof row.reminderConfig === "object" ? row.reminderConfig : null,
     nextReminderAt: row.nextReminderAt ? new Date(row.nextReminderAt).toISOString() : null,
     lastReminderAt: row.lastReminderAt ? new Date(row.lastReminderAt).toISOString() : null,
@@ -354,9 +356,58 @@ async function recordManualReminder({ agencyId, member, orderId, now = new Date(
   return { ok: true, nextReminderAt: next.at ? next.at.toISOString() : null };
 }
 
+
+async function recordTelegramInboundReply({ agencyId, member, accountId, deviceId, claimToken, senderTelegramUserId, messageId, replyToMessageId, sentAt, now = new Date(), db = null }) {
+  const client = db || require("../prisma");
+  const normalizedAccountId = optionalIdentifier(accountId, "telegramAccountId", 180);
+  const senderId = clean(senderTelegramUserId, 32);
+  const inboundId = telegramMessageId(messageId, "telegramMessageId");
+  const replyToId = telegramMessageId(replyToMessageId, "replyToMessageId");
+  if (!normalizedAccountId || !/^\d{1,20}$/.test(senderId) || inboundId == null || replyToId == null) {
+    throw fail("CUSTOM_ORDER_TELEGRAM_INBOUND_INVALID", "Telegram inbound reply payload is invalid");
+  }
+  const { assertTelegramRuntimeLease } = require("./telegram-execution-runtime");
+  await assertTelegramRuntimeLease({ agencyId, member, accountId: normalizedAccountId, deviceId, claimToken, now, db: client });
+  const scope = await allowedCreatorScope({ agencyId, member, db: client });
+  const creator = await client.creatorAccount.findFirst({
+    where: {
+      agencyId, deletedAt: null, telegramUserId: senderId,
+      ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
+    },
+    select: { id: true, telegramAccountId: true, telegramContact: true },
+  });
+  if (!creator) return { ok: true, matched: false, reason: "CREATOR_NOT_FOUND" };
+  const resolvedAccountId = await resolveTelegramAccountId({ agencyId, creator, db: client });
+  if (!resolvedAccountId || String(resolvedAccountId) !== normalizedAccountId) return { ok: true, matched: false, reason: "ACCOUNT_MISMATCH" };
+  let row = await client.customOrder.findFirst({
+    where: { agencyId, creatorId: creator.id, telegramTaskMessageId: replyToId },
+    include: ORDER_INCLUDE,
+    orderBy: { createdAt: "desc" },
+  });
+  if (!row) {
+    row = await client.customOrder.findFirst({
+      where: { agencyId, creatorId: creator.id, telegramReferenceMessageIds: { has: replyToId } },
+      include: ORDER_INCLUDE,
+      orderBy: { createdAt: "desc" },
+    });
+  }
+  if (!row) return { ok: true, matched: false, reason: "CUSTOM_NOT_FOUND" };
+  if (row.telegramLastModelMessageId != null && Number(row.telegramLastModelMessageId) === inboundId) {
+    return { ok: true, matched: true, deduped: true, order: serializeOrder(row, now) };
+  }
+  const observedAt = parseIso(sentAt, "telegramLastModelMessageAt") || new Date(now);
+  const updated = await client.customOrder.update({
+    where: { id: row.id },
+    data: { telegramLastModelMessageId: inboundId, telegramLastModelMessageAt: observedAt },
+    include: ORDER_INCLUDE,
+  });
+  await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.telegram_model_reply", targetType: "CustomOrder", targetId: updated.id, metadata: { creatorId: updated.creatorId, telegramMessageId: inboundId, replyToMessageId: replyToId, accountId: normalizedAccountId }, db: client });
+  return { ok: true, matched: true, deduped: false, order: serializeOrder(updated, now) };
+}
+
 module.exports = {
   CUSTOM_ORDER_STATUSES, CUSTOM_ORDER_TYPES, CUSTOM_ORDER_CONTENT_KINDS, CUSTOM_ORDER_PHYSICAL_STATUSES,
   buildUpdateData, createCustomOrder, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString,
   normalizeCreateInput, normalizeStatus, normalizeType, serializeOrder, updateCustomOrder,
-  recordTelegramDelivery, prepareTelegramTask, prepareManualReminder, recordManualReminder,
+  recordTelegramDelivery, prepareTelegramTask, prepareManualReminder, recordManualReminder, recordTelegramInboundReply,
 };

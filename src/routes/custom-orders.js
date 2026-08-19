@@ -10,6 +10,7 @@ const {
   prepareTelegramTask,
   prepareManualReminder,
   recordManualReminder,
+  recordTelegramInboundReply,
 } = require("../services/custom-orders-service");
 const {
   claimDueReminders,
@@ -34,6 +35,23 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   try { return res.status(201).json(await createCustomOrder({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, input: req.body || {}, db: prisma })); }
   catch (err) { return sendError(res, err, "CUSTOM_ORDER_CREATE_FAILED"); }
+});
+
+router.post("/telegram-inbound", async (req, res) => {
+  try {
+    return res.json(await recordTelegramInboundReply({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      accountId: req.body?.accountId,
+      deviceId: req.body?.deviceId,
+      claimToken: req.body?.claimToken,
+      senderTelegramUserId: req.body?.senderTelegramUserId,
+      messageId: req.body?.messageId,
+      replyToMessageId: req.body?.replyToMessageId,
+      sentAt: req.body?.sentAt,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_ORDER_TELEGRAM_INBOUND_FAILED"); }
 });
 
 router.post("/reminders/claim", async (req, res) => {

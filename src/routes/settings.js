@@ -22,6 +22,10 @@ const {
   issueTelegramMtprotoLocalMaterial,
   storeTelegramMtprotoSession,
 } = require("../services/settings-service");
+const {
+  claimTelegramExecutionRuntimes,
+  releaseTelegramExecutionRuntime,
+} = require("../services/telegram-execution-runtime");
 
 const router = express.Router();
 const uploadsDir = path.join(__dirname, "..", "..", "uploads");
@@ -219,6 +223,19 @@ router.patch("/telegram/reminders", async (req, res) => {
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_REMINDERS_UPDATE_FAILED"); }
 });
 
+
+router.post("/telegram/runtime/claim", async (req, res) => {
+  try {
+    return res.json(await claimTelegramExecutionRuntimes({ agencyId: req.auth.agencyId, member: req.auth.membership, deviceId: req.body?.deviceId, limit: req.body?.limit, db: require("../prisma") }));
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_RUNTIME_CLAIM_FAILED"); }
+});
+
+router.post("/telegram/runtime/:accountId/release", async (req, res) => {
+  try {
+    return res.json(await releaseTelegramExecutionRuntime({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, deviceId: req.body?.deviceId, claimToken: req.body?.claimToken, db: require("../prisma") }));
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_RUNTIME_RELEASE_FAILED"); }
+});
+
 router.post("/telegram/accounts", async (req, res) => {
   try {
     const result = await addTelegramMtprotoAccount({
@@ -245,6 +262,7 @@ router.post("/telegram/accounts/:accountId/local-material", async (req, res) => 
       member: req.auth.membership,
       accountId: req.params.accountId,
       purpose: req.body?.purpose,
+      creatorId: req.body?.creatorId,
     });
     res.setHeader("Cache-Control", "no-store, private");
     res.setHeader("Pragma", "no-cache");

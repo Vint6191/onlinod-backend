@@ -13,6 +13,7 @@ const {
   recordTelegramDelivery,
   prepareTelegramTask,
   prepareManualReminder,
+  recordTelegramInboundReply,
 } = require("./custom-orders-service");
 
 function clone(value) {
@@ -28,6 +29,7 @@ function fakeDb(seed = {}) {
     "member-1": { id: "member-1", displayName: "Chatter", roleKey: "chatter", user: { name: "Chatter", email: "c@test" } },
   };
   const rows = (seed.orders || []).map(clone);
+  const accounts = (seed.accounts || [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null }]).map(clone);
   let seq = 0;
 
   const include = (row) => row ? {
@@ -40,6 +42,8 @@ function fakeDb(seed = {}) {
     if (Array.isArray(where.OR) && where.OR.length && !where.OR.some((candidate) => matches(row, candidate))) return false;
     if (where.id !== undefined && row.id !== where.id) return false;
     if (where.agencyId !== undefined && row.agencyId !== where.agencyId) return false;
+    if (where.telegramTaskMessageId !== undefined && Number(row.telegramTaskMessageId) !== Number(where.telegramTaskMessageId)) return false;
+    if (where.telegramReferenceMessageIds?.has !== undefined && !(Array.isArray(row.telegramReferenceMessageIds) && row.telegramReferenceMessageIds.map(Number).includes(Number(where.telegramReferenceMessageIds.has)))) return false;
     if (where.type !== undefined && String(row.type || "CONTENT") !== String(where.type)) return false;
     if (where.creatorId) {
       if (typeof where.creatorId === "string" && row.creatorId !== where.creatorId) return false;
@@ -84,15 +88,29 @@ function fakeDb(seed = {}) {
     _rows: rows,
     workspaceSetting: { async findUnique() { return null; } },
     agencyTelegramMtprotoAccount: {
-      async findFirst({ where }) { return where.id === "tg-1" && where.agencyId === "agency-1" ? { id: "tg-1" } : null; },
-      async findMany({ where }) { return where.agencyId === "agency-1" ? [{ id: "tg-1" }] : []; },
+      async findFirst({ where }) {
+        const row = accounts.find((candidate) => candidate.id === where.id && candidate.agencyId === where.agencyId);
+        return clone(row || null);
+      },
+      async findMany({ where }) { return accounts.filter((row) => row.agencyId === where.agencyId).map((row) => ({ id: row.id })); },
+      async updateMany({ where, data }) {
+        const row = accounts.find((candidate) => candidate.id === where.id && candidate.agencyId === where.agencyId
+          && (where.runtimeClaimedByDeviceId === undefined || candidate.runtimeClaimedByDeviceId === where.runtimeClaimedByDeviceId)
+          && (where.runtimeClaimToken === undefined || candidate.runtimeClaimToken === where.runtimeClaimToken));
+        if (!row) return { count: 0 }; Object.assign(row, clone(data)); return { count: 1 };
+      },
     },
     creatorAccount: {
       async findFirst({ where }) {
-        return clone(creators.find((row) => row.id === where.id && row.agencyId === where.agencyId && !row.deletedAt) || null);
+        return clone(creators.find((row) => row.agencyId === where.agencyId && !row.deletedAt
+          && (typeof where.id !== "string" || row.id === where.id)
+          && (!where.id?.in || where.id.in.includes(row.id))
+          && (where.telegramUserId === undefined || String(row.telegramUserId || "") === String(where.telegramUserId))) || null);
       },
       async findMany({ where }) {
-        return creators.filter((row) => row.agencyId === where.agencyId && !row.deletedAt && (!where.id?.in || where.id.in.includes(row.id))).map(clone);
+        return creators.filter((row) => row.agencyId === where.agencyId && !row.deletedAt
+          && (!where.id?.in || where.id.in.includes(row.id))
+          && (where.telegramContact?.not !== null || row.telegramContact !== null)).map(clone);
       },
     },
     customOrder: {
@@ -316,5 +334,61 @@ test("Telegram references persist only task/message ids on the custom and merge 
   await assert.rejects(
     () => recordTelegramDelivery({ agencyId: "agency-1", member, orderId: created.order.id, taskMessageId: 999, referenceMessageIds: [], db }),
     (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_MESSAGE_CONFLICT" && error?.status === 409,
+  );
+});
+
+
+test("leased chatter runtime records only creator-bound Telegram replies and dedupes by message id", async () => {
+  const now = new Date("2026-08-19T14:00:00.000Z");
+  const db = fakeDb({
+    accounts: [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1", runtimeClaimUntil: new Date("2026-08-19T14:05:00.000Z") }],
+    orders: [{
+      id: "order-inbound", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+      scenario: "content custom", internalNote: null, status: "PENDING", type: "CONTENT", contentKind: "VIDEO", physicalStatus: null,
+      dueAt: new Date("2026-08-20T12:00:00.000Z"), scheduledAt: null, durationMinutes: null, reminderConfig: null,
+      telegramTaskMessageId: 700, telegramReferenceMessageIds: [701], telegramLastModelMessageId: null, telegramLastModelMessageAt: null,
+      nextReminderAt: null, reminderClaimToken: null, reminderClaimUntil: null, lastReminderAt: null, lastReminderKey: null,
+      acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 5000,
+      createdAt: new Date("2026-08-19T13:00:00.000Z"), updatedAt: new Date("2026-08-19T13:00:00.000Z"),
+    }],
+  });
+
+  const first = await recordTelegramInboundReply({
+    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
+    senderTelegramUserId: "1001", messageId: "900", replyToMessageId: "700", sentAt: "2026-08-19T13:59:50.000Z", now, db,
+  });
+  assert.equal(first.matched, true);
+  assert.equal(first.deduped, false);
+  assert.equal(first.order.telegramLastModelMessageId, "900");
+  assert.equal(first.order.telegramLastModelMessageAt, "2026-08-19T13:59:50.000Z");
+
+  const duplicate = await recordTelegramInboundReply({
+    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
+    senderTelegramUserId: "1001", messageId: "900", replyToMessageId: "700", sentAt: "2026-08-19T13:59:50.000Z", now, db,
+  });
+  assert.equal(duplicate.deduped, true);
+
+  const referenceReply = await recordTelegramInboundReply({
+    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
+    senderTelegramUserId: "1001", messageId: "901", replyToMessageId: "701", sentAt: "2026-08-19T14:00:00.000Z", now, db,
+  });
+  assert.equal(referenceReply.matched, true, "replying to a reference document remains linked to the same custom");
+  assert.equal(referenceReply.order.telegramLastModelMessageId, "901");
+
+  const foreignSender = await recordTelegramInboundReply({
+    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
+    senderTelegramUserId: "1002", messageId: "902", replyToMessageId: "700", sentAt: now.toISOString(), now, db,
+  });
+  assert.deepEqual(foreignSender, { ok: true, matched: false, reason: "CREATOR_NOT_FOUND" });
+});
+
+test("Telegram inbound replies require the live account runtime lease", async () => {
+  const now = new Date("2026-08-19T14:00:00.000Z");
+  const db = fakeDb({
+    accounts: [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-a", runtimeClaimToken: "lease-a", runtimeClaimUntil: new Date("2026-08-19T14:05:00.000Z") }],
+  });
+  await assert.rejects(
+    () => recordTelegramInboundReply({ agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-b", claimToken: "lease-b", senderTelegramUserId: "1001", messageId: "999", replyToMessageId: "700", now, db }),
+    (error) => error?.code === "TELEGRAM_EXECUTION_LEASE_INVALID" && error?.status === 409,
   );
 });

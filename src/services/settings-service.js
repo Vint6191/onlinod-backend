@@ -517,13 +517,18 @@ async function readTelegramMtprotoAccountSecret({ agencyId, accountId, db = null
   return { row, apiHash: String(credentials.apiHash || ""), session: String(credentials.session || "") };
 }
 
-async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, purpose, db = null }) {
-  ensureTelegramManager(member);
+async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, purpose, creatorId = null, db = null }) {
   const normalizedPurpose = clean(purpose, 32).toLowerCase();
   if (!new Set(["authorize", "messaging"]).has(normalizedPurpose)) {
     throw telegramInputError("Telegram local-material purpose is invalid", "SETTINGS_TELEGRAM_LOCAL_PURPOSE_INVALID");
   }
-  const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db });
+  const client = db || prisma;
+  if (normalizedPurpose === "authorize") ensureTelegramManager(member);
+  else {
+    const { assertTelegramMessagingAccess } = require("./telegram-execution-runtime");
+    await assertTelegramMessagingAccess({ agencyId, member, accountId, creatorId, db: client });
+  }
+  const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db: client });
   if (!/^[a-fA-F0-9]{32}$/.test(secret.apiHash)) {
     const err = new Error("Stored Telegram API hash is invalid");
     err.code = "SETTINGS_TELEGRAM_API_HASH_INVALID";
