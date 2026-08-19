@@ -10,6 +10,9 @@ const {
   normalizeCreateInput,
   serializeOrder,
   updateCustomOrder,
+  recordTelegramDelivery,
+  prepareTelegramTask,
+  prepareManualReminder,
 } = require("./custom-orders-service");
 
 function clone(value) {
@@ -18,8 +21,8 @@ function clone(value) {
 
 function fakeDb(seed = {}) {
   const creators = seed.creators || [
-    { id: "creator-1", agencyId: "agency-1", displayName: "Model A", username: "model_a", avatarUrl: null, deletedAt: null, status: "READY" },
-    { id: "creator-2", agencyId: "agency-1", displayName: "Model B", username: "model_b", avatarUrl: null, deletedAt: null, status: "READY" },
+    { id: "creator-1", agencyId: "agency-1", displayName: "Model A", username: "model_a", avatarUrl: null, telegramContact: "@model_a", telegramUserId: "1001", telegramAccountId: "tg-1", deletedAt: null, status: "READY" },
+    { id: "creator-2", agencyId: "agency-1", displayName: "Model B", username: "model_b", avatarUrl: null, telegramContact: "@model_b", telegramUserId: "1002", telegramAccountId: null, deletedAt: null, status: "READY" },
   ];
   const members = {
     "member-1": { id: "member-1", displayName: "Chatter", roleKey: "chatter", user: { name: "Chatter", email: "c@test" } },
@@ -34,8 +37,10 @@ function fakeDb(seed = {}) {
   } : null;
 
   function matches(row, where = {}) {
+    if (Array.isArray(where.OR) && where.OR.length && !where.OR.some((candidate) => matches(row, candidate))) return false;
     if (where.id !== undefined && row.id !== where.id) return false;
     if (where.agencyId !== undefined && row.agencyId !== where.agencyId) return false;
+    if (where.type !== undefined && String(row.type || "CONTENT") !== String(where.type)) return false;
     if (where.creatorId) {
       if (typeof where.creatorId === "string" && row.creatorId !== where.creatorId) return false;
       if (where.creatorId.in && !where.creatorId.in.includes(row.creatorId)) return false;
@@ -47,11 +52,41 @@ function fakeDb(seed = {}) {
       const before = new Date(where.dueAt.lt).getTime();
       if (!Number.isFinite(due) || !Number.isFinite(before) || due >= before) return false;
     }
+    if (where.dueAt?.gte !== undefined) {
+      const due = row.dueAt ? new Date(row.dueAt).getTime() : NaN;
+      const floor = new Date(where.dueAt.gte).getTime();
+      if (!Number.isFinite(due) || !Number.isFinite(floor) || due < floor) return false;
+    }
+    if (where.dueAt?.lte !== undefined) {
+      const due = row.dueAt ? new Date(row.dueAt).getTime() : NaN;
+      const ceiling = new Date(where.dueAt.lte).getTime();
+      if (!Number.isFinite(due) || !Number.isFinite(ceiling) || due > ceiling) return false;
+    }
+    if (where.scheduledAt?.lt !== undefined) {
+      const scheduled = row.scheduledAt ? new Date(row.scheduledAt).getTime() : NaN;
+      const before = new Date(where.scheduledAt.lt).getTime();
+      if (!Number.isFinite(scheduled) || !Number.isFinite(before) || scheduled >= before) return false;
+    }
+    if (where.scheduledAt?.gte !== undefined) {
+      const scheduled = row.scheduledAt ? new Date(row.scheduledAt).getTime() : NaN;
+      const floor = new Date(where.scheduledAt.gte).getTime();
+      if (!Number.isFinite(scheduled) || !Number.isFinite(floor) || scheduled < floor) return false;
+    }
+    if (where.scheduledAt?.lte !== undefined) {
+      const scheduled = row.scheduledAt ? new Date(row.scheduledAt).getTime() : NaN;
+      const ceiling = new Date(where.scheduledAt.lte).getTime();
+      if (!Number.isFinite(scheduled) || !Number.isFinite(ceiling) || scheduled > ceiling) return false;
+    }
     return true;
   }
 
   return {
     _rows: rows,
+    workspaceSetting: { async findUnique() { return null; } },
+    agencyTelegramMtprotoAccount: {
+      async findFirst({ where }) { return where.id === "tg-1" && where.agencyId === "agency-1" ? { id: "tg-1" } : null; },
+      async findMany({ where }) { return where.agencyId === "agency-1" ? [{ id: "tg-1" }] : []; },
+    },
     creatorAccount: {
       async findFirst({ where }) {
         return clone(creators.find((row) => row.id === where.id && row.agencyId === where.agencyId && !row.deletedAt) || null);
@@ -74,6 +109,12 @@ function fakeDb(seed = {}) {
         if (!row) return { count: 0 };
         Object.assign(row, clone(data), { updatedAt: new Date("2026-08-17T20:01:00.000Z") });
         return { count: 1 };
+      },
+      async update({ where, data }) {
+        const row = rows.find((item) => item.id === where.id);
+        if (!row) throw new Error("not found");
+        Object.assign(row, clone(data), { updatedAt: new Date("2026-08-17T20:01:00.000Z") });
+        return include(row);
       },
       async findMany({ where, select, take = 10000, skip = 0 }) {
         const found = rows.filter((row) => matches(row, where)).slice(skip, skip + take);
@@ -133,7 +174,7 @@ test("list applies member creator scope and reports pending/overdue counters", a
   const result = await listCustomOrders({ agencyId: "agency-1", member, pendingOnly: true, now: new Date("2026-08-17T20:00:00Z"), db });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].creator.name, "Model A");
-  assert.deepEqual(result.counts, { pending: 1, completed: 0, cancelled: 0, overdue: 1 });
+  assert.deepEqual(result.counts, { pending: 1, completed: 0, missed: 0, cancelled: 0, overdue: 1, dueSoon: 0 });
 });
 
 test("update preserves journal row and serializes completed state", async () => {
@@ -181,5 +222,99 @@ test("business-critical text and media limits reject instead of silently truncat
   assert.throws(
     () => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "ok", priceCents: 2_147_483_648 }),
     (error) => error?.code === "CUSTOM_ORDER_PRICE_TOO_LARGE",
+  );
+});
+
+
+test("V2 types keep one CustomOrder row and schedule type-specific reminders", async () => {
+  const db = fakeDb();
+  const call = await createCustomOrder({
+    agencyId: "agency-1",
+    member,
+    now: new Date("2026-08-19T12:00:00.000Z"),
+    input: {
+      creatorId: "creator-1",
+      dialogId: "422411209",
+      scenario: "Private call",
+      type: "CALL",
+      scheduledAt: "2026-08-19T15:00:00.000Z",
+      durationMinutes: 45,
+      reminderConfig: { enabled: true, offsetsMinutes: [135, 47, 5] },
+      price: 200,
+    },
+    db,
+  });
+  assert.equal(call.order.type, "CALL");
+  assert.equal(call.order.contentKind, null);
+  assert.equal(call.order.durationMinutes, 45);
+  assert.equal(call.order.nextReminderAt, "2026-08-19T12:45:00.000Z", "135 minutes before 15:00 is the first future reminder");
+
+  const physical = await createCustomOrder({
+    agencyId: "agency-1",
+    member,
+    now: new Date("2026-08-19T12:00:00.000Z"),
+    input: { creatorId: "creator-1", dialogId: "422411209", scenario: "Panties sale", type: "PHYSICAL", price: 80 },
+    db,
+  });
+  assert.equal(physical.order.type, "PHYSICAL");
+  assert.equal(physical.order.physicalStatus, "WAITING");
+  assert.equal(physical.order.nextReminderAt, null, "physical reminders are off by default");
+});
+
+
+test("ordinary edits preserve an already scheduled reminder while policy edits restart it safely", async () => {
+  const nextAt = new Date("2026-08-19T13:00:00.000Z");
+  const db = fakeDb({ orders: [{
+    id: "order-timer", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "before", internalNote: null, type: "CONTENT", contentKind: "PHOTO", status: "PENDING", dueAt: null,
+    scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null, deliveredAt: new Date("2026-08-19T12:05:00.000Z"),
+    cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0, telegramTaskMessageId: 501, telegramReferenceMessageIds: [],
+    reminderConfig: null, nextReminderAt: nextAt, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
+    createdAt: new Date("2026-08-19T10:00:00.000Z"), updatedAt: new Date("2026-08-19T12:05:00.000Z"),
+  }] });
+  const edited = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { scenario: "after" }, now: new Date("2026-08-19T12:20:00.000Z"), db });
+  assert.equal(edited.order.nextReminderAt, nextAt.toISOString(), "scenario edit must not move the reminder clock");
+
+  const policyEdited = await updateCustomOrder({
+    agencyId: "agency-1", member, orderId: "order-timer",
+    input: { reminderConfig: { enabled: true, firstAfterMinutes: 90, repeatEveryMinutes: 120 } },
+    now: new Date("2026-08-19T12:30:00.000Z"), db,
+  });
+  assert.equal(policyEdited.order.nextReminderAt, "2026-08-19T14:00:00.000Z", "first reminder restarts from the explicit policy edit when no reminder was sent yet");
+});
+
+test("manual remind-now cannot become the first Telegram message for a custom", async () => {
+  const db = fakeDb();
+  const created = await createCustomOrder({ agencyId: "agency-1", member, input: { creatorId: "creator-1", dialogId: "422", scenario: "unsent" }, db });
+  await assert.rejects(
+    () => prepareManualReminder({ agencyId: "agency-1", member, orderId: created.order.id, db }),
+    (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_REQUIRED" && error?.status === 409,
+  );
+});
+
+test("Telegram references persist only task/message ids on the custom and merge idempotently", async () => {
+  const db = fakeDb();
+  const created = await createCustomOrder({
+    agencyId: "agency-1",
+    member,
+    now: new Date("2026-08-19T12:00:00.000Z"),
+    input: { creatorId: "creator-1", dialogId: "422411209", scenario: "Photo custom", type: "CONTENT", contentKind: "PHOTO" },
+    db,
+  });
+  const prepared = await prepareTelegramTask({ agencyId: "agency-1", member, orderId: created.order.id, db });
+  assert.equal(prepared.delivery.accountId, "tg-1");
+  assert.equal(prepared.delivery.creatorId, "creator-1");
+  assert.match(prepared.delivery.text, /Новый кастом/);
+
+  const first = await recordTelegramDelivery({ agencyId: "agency-1", member, orderId: created.order.id, taskMessageId: 501, referenceMessageIds: [502, 503], now: new Date("2026-08-19T12:05:00.000Z"), db });
+  assert.equal(first.order.telegramTaskMessageId, "501");
+  assert.deepEqual(first.order.telegramReferenceMessageIds, ["502", "503"]);
+  assert.equal(first.order.nextReminderAt, "2026-08-19T12:35:00.000Z", "content reminder clock begins at actual Telegram task delivery");
+
+  const second = await recordTelegramDelivery({ agencyId: "agency-1", member, orderId: created.order.id, taskMessageId: 501, referenceMessageIds: [503, 504], db });
+  assert.deepEqual(second.order.telegramReferenceMessageIds, ["502", "503", "504"]);
+  await assert.rejects(
+    () => recordTelegramDelivery({ agencyId: "agency-1", member, orderId: created.order.id, taskMessageId: 999, referenceMessageIds: [], db }),
+    (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_MESSAGE_CONFLICT" && error?.status === 409,
   );
 });

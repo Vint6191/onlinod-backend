@@ -10,6 +10,12 @@ const root = path.join(__dirname, "..", "..");
 const routeSource = fs.readFileSync(path.join(root, "src", "routes", "settings.js"), "utf8");
 const schemaSource = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
 
+const DEFAULT_REMINDERS = {
+  content: { enabled: true, firstAfterMinutes: 30, repeatEveryMinutes: 60, text: "Напоминание: у тебя есть незавершённый кастом «{custom}». Дедлайн: {deadline}." },
+  call: { enabled: true, offsetsMinutes: [30, 5], text: "Созвон через {minutes} мин. Не пропусти: «{custom}»." },
+  physical: { enabled: false, repeatEveryMinutes: 1440, text: "Напоминание по физическому заказу «{custom}»: проверь статус отправки." },
+};
+
 function loadSettingsService() {
   const original = Module._load;
   Module._load = function(request, parent, isMain) {
@@ -33,6 +39,8 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
   const service = loadSettingsService();
   let stored = null;
   const db = {
+    workspaceSetting: { findUnique: async () => null, upsert: async ({ create, update }) => ({ ...(create || update) }) },
+    creatorAccount: { updateMany: async () => ({ count: 0 }) },
     agencyTelegramMtprotoAccount: {
       create: async ({ data }) => {
         stored = { id: "tg-1", ...data };
@@ -63,13 +71,13 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
   assert.equal(stored.algorithm, "aes-256-gcm");
 
   const listed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: owner, db });
-  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678, sessionReady: true }] });
+  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678, sessionReady: true }], reminders: DEFAULT_REMINDERS });
   assert.equal(JSON.stringify(listed).includes("SESSION_SECRET_VALUE"), false);
   assert.equal(JSON.stringify(listed).includes("0123456789abcdef"), false);
 
   const adminListed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: { role: "ADMIN" }, db });
   assert.equal(adminListed.available, true);
-  assert.deepEqual(await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: { role: "CHATTER" }, db }), { available: false, reason: "OWNER_OR_ADMIN_ONLY", accounts: [] });
+  assert.deepEqual(await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: { role: "CHATTER" }, db }), { available: false, reason: "OWNER_OR_ADMIN_ONLY", accounts: [], reminders: DEFAULT_REMINDERS });
   await assert.rejects(() => service.addTelegramMtprotoAccount({ agencyId: "agency-1", member: { role: "MANAGER" }, apiId: 1, apiHash: "0123456789abcdef0123456789abcdef", session: "x", db }), /owner or administrator/);
 
   const authMaterial = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", purpose: "authorize", db });
@@ -131,6 +139,7 @@ test("Backend is MTProto storage-only: Desktop gets local material and hands a s
   const packageSource = fs.readFileSync(path.join(root, "package.json"), "utf8");
   const serviceSource = fs.readFileSync(path.join(root, "src", "services", "settings-service.js"), "utf8");
   assert.match(routeSource, /router\.get\("\/telegram"/);
+  assert.match(routeSource, /router\.patch\("\/telegram\/reminders"/);
   assert.match(routeSource, /router\.post\("\/telegram\/accounts"/);
   assert.match(routeSource, /router\.delete\("\/telegram\/accounts\/:accountId"/);
   assert.match(routeSource, /router\.post\("\/telegram\/accounts\/:accountId\/local-material"/);

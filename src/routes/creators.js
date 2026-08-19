@@ -88,6 +88,7 @@ const agencyRemovalSchema = z.object({
 
 const telegramContactSchema = z.object({
   telegramContact: z.string().trim().min(1).max(160).regex(/^[^\r\n\t]+$/, "Invalid Telegram contact").nullable(),
+  telegramAccountId: z.string().trim().min(1).max(180).nullable().optional(),
 });
 
 const telegramIdentitySchema = z.object({
@@ -253,18 +254,26 @@ router.patch("/:id/telegram-contact", creatorManagementRequired, creatorAccessRe
         agencyId: req.auth.agencyId,
         deletedAt: null,
       },
-      select: { id: true, telegramContact: true, telegramUserId: true },
+      select: { id: true, telegramContact: true, telegramUserId: true, telegramAccountId: true },
     });
 
     if (!existing) {
       return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
     }
 
+    if (input.telegramAccountId) {
+      const account = await prisma.agencyTelegramMtprotoAccount.findFirst({
+        where: { id: input.telegramAccountId, agencyId: req.auth.agencyId },
+        select: { id: true },
+      });
+      if (!account) return res.status(400).json({ ok: false, code: "CREATOR_TELEGRAM_ACCOUNT_INVALID", error: "Telegram connection does not belong to this workspace" });
+    }
     const contactChanged = existing.telegramContact !== input.telegramContact;
     const creator = await prisma.creatorAccount.update({
       where: { id: existing.id },
       data: {
         telegramContact: input.telegramContact,
+        ...(input.telegramAccountId !== undefined ? { telegramAccountId: input.telegramAccountId } : {}),
         ...(contactChanged ? { telegramUserId: null } : {}),
       },
     });
@@ -278,6 +287,7 @@ router.patch("/:id/telegram-contact", creatorManagementRequired, creatorAccessRe
       metadata: {
         hadContact: Boolean(existing.telegramContact),
         hasContact: Boolean(creator.telegramContact),
+        telegramAccountAssigned: Boolean(creator.telegramAccountId),
       },
     });
 

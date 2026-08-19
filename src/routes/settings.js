@@ -16,6 +16,7 @@ const {
   updateWorkspaceSettings,
   getBillingSettings,
   getTelegramMtprotoSettings,
+  updateTelegramCustomReminderSettings,
   addTelegramMtprotoAccount,
   removeTelegramMtprotoAccount,
   issueTelegramMtprotoLocalMaterial,
@@ -204,6 +205,18 @@ router.get("/telegram", async (req, res) => {
     const telegram = await getTelegramMtprotoSettings({ agencyId: req.auth.agencyId, member: req.auth.membership });
     return res.json({ ok: true, telegram });
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_LOAD_FAILED"); }
+});
+
+
+router.patch("/telegram/reminders", async (req, res) => {
+  try {
+    const reminders = await updateTelegramCustomReminderSettings({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership,
+      reminders: req.body?.reminders,
+    });
+    return res.json({ ok: true, reminders });
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_REMINDERS_UPDATE_FAILED"); }
 });
 
 router.post("/telegram/accounts", async (req, res) => {

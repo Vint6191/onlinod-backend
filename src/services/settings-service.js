@@ -6,6 +6,7 @@ const { publicUser, issuePasswordReset } = require("./auth-service");
 const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
+const { SETTINGS_KEY: TELEGRAM_CUSTOM_REMINDERS_KEY, normalizeTelegramCustomReminders, nextReminderForOrder } = require("./custom-order-reminders");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
@@ -347,21 +348,80 @@ function ensureTelegramManager(member) {
 
 
 async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
-  if (!canManageTelegram(member)) return { available: false, reason: "OWNER_OR_ADMIN_ONLY", accounts: [] };
+  if (!canManageTelegram(member)) return { available: false, reason: "OWNER_OR_ADMIN_ONLY", accounts: [], reminders: normalizeTelegramCustomReminders(null) };
   const client = db || prisma;
-  const rows = await client.agencyTelegramMtprotoAccount.findMany({
-    where: { agencyId },
-    select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true },
-    orderBy: { id: "asc" },
-  });
+  const [rows, reminderRow] = await Promise.all([
+    client.agencyTelegramMtprotoAccount.findMany({
+      where: { agencyId },
+      select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true },
+      orderBy: { id: "asc" },
+    }),
+    client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY } } }).catch(() => null),
+  ]);
   const accounts = rows.map((row) => {
     let sessionReady = false;
     try { sessionReady = Boolean(String(decryptTelegramCredentials(row).session || "").trim()); } catch (_) {}
-    // Backend is storage-only for MTProto. Authorization and live clients run
-    // exclusively inside Desktop Electron MAIN.
     return { id: row.id, apiId: row.apiId, sessionReady };
   });
-  return { available: true, accounts };
+  return { available: true, accounts, reminders: normalizeTelegramCustomReminders(reminderRow?.value) };
+}
+
+async function updateTelegramCustomReminderSettings({ agencyId, member, reminders, db = null }) {
+  ensureTelegramManager(member);
+  const client = db || prisma;
+  const normalized = normalizeTelegramCustomReminders(reminders);
+  await client.workspaceSetting.upsert({
+    where: { agencyId_key: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY } },
+    create: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY, value: normalized },
+    update: { value: normalized },
+  });
+  if (client.customOrder?.findMany && client.customOrder?.update) {
+    const pendingOrders = await client.customOrder.findMany({
+      where: { agencyId, status: "PENDING" },
+      select: {
+        id: true,
+        type: true,
+        status: true,
+        createdAt: true,
+        scheduledAt: true,
+        physicalStatus: true,
+        reminderConfig: true,
+        telegramTaskMessageId: true,
+        nextReminderAt: true,
+        lastReminderAt: true,
+        lastReminderKey: true,
+      },
+    });
+    const now = new Date();
+    for (const order of pendingOrders) {
+      if (order.reminderConfig != null) continue; // Per-custom override is authoritative and independent of workspace defaults.
+      let nextAt = null;
+      const type = String(order.type || "CONTENT").toUpperCase();
+      if (order.telegramTaskMessageId != null) {
+        if (type === "CALL") nextAt = nextReminderForOrder(order, normalized, now).at;
+        else if (order.lastReminderAt) nextAt = nextReminderForOrder(order, normalized, now, { afterAck: true }).at;
+        else nextAt = nextReminderForOrder({ ...order, createdAt: now }, normalized, now).at;
+      }
+      await client.customOrder.update({
+        where: { id: order.id },
+        data: {
+          nextReminderAt: nextAt,
+          reminderClaimToken: null,
+          reminderClaimUntil: null,
+        },
+      });
+    }
+  }
+  await audit({
+    agencyId,
+    actorUserId: member?.userId || null,
+    action: "settings.telegram.custom_reminders_updated",
+    targetType: "agency",
+    targetId: agencyId,
+    metadata: { contentEnabled: normalized.content.enabled, callEnabled: normalized.call.enabled, physicalEnabled: normalized.physical.enabled },
+    db: client,
+  });
+  return normalized;
 }
 
 function telegramInputError(message, code) {
@@ -422,7 +482,12 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
     err.status = 404;
     throw err;
   }
-  await client.agencyTelegramMtprotoAccount.delete({ where: { id: existing.id } });
+  const remove = async (tx) => {
+    await tx.creatorAccount.updateMany({ where: { agencyId, telegramAccountId: existing.id }, data: { telegramAccountId: null } });
+    await tx.agencyTelegramMtprotoAccount.delete({ where: { id: existing.id } });
+  };
+  if (typeof client.$transaction === "function") await client.$transaction((tx) => remove(tx));
+  else await remove(client);
   return { ok: true };
 }
 
@@ -609,6 +674,7 @@ module.exports = {
   updateWorkspaceSettings,
   getBillingSettings,
   getTelegramMtprotoSettings,
+  updateTelegramCustomReminderSettings,
   addTelegramMtprotoAccount,
   removeTelegramMtprotoAccount,
   issueTelegramMtprotoLocalMaterial,

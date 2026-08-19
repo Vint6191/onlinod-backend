@@ -25,7 +25,27 @@ enum CreatorStatus {
 enum CustomOrderStatus {
   PENDING
   COMPLETED
+  MISSED
   CANCELLED
+}
+
+enum CustomOrderType {
+  CONTENT
+  CALL
+  PHYSICAL
+}
+
+enum CustomOrderContentKind {
+  PHOTO
+  VIDEO
+  BOTH
+}
+
+enum CustomOrderPhysicalStatus {
+  WAITING
+  READY
+  SHIPPED
+  COMPLETED
 }
 
 
@@ -379,8 +399,9 @@ model CreatorAccount {
   partition   String?
   status      CreatorStatus @default(DRAFT)
   notes       String?
-  telegramContact String?
-  telegramUserId  String?
+  telegramContact   String?
+  telegramUserId    String?
+  telegramAccountId String?
   deletedAt   DateTime?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
@@ -473,6 +494,7 @@ model CreatorAccount {
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
   @@index([agencyId, telegramUserId])
+  @@index([agencyId, telegramAccountId])
   @@index([status])
   @@index([deletedAt])
   billingProfile CreatorBillingProfile?
@@ -480,31 +502,47 @@ model CreatorAccount {
 }
 
 model CustomOrder {
-  id                String            @id @default(cuid())
-  agencyId          String
-  creatorId         String
-  dialogId          String
-  createdByMemberId String
-  scenario          String
-  internalNote      String?
-  status            CustomOrderStatus @default(PENDING)
-  dueAt             DateTime?
-  acceptedAt        DateTime?
-  completedAt       DateTime?
-  deliveredAt       DateTime?
-  cancelledAt       DateTime?
-  cancelReason      String?
-  mediaIds          String            @default("")
-  priceCents        Int               @default(0)
-  createdAt         DateTime          @default(now())
-  updatedAt         DateTime          @updatedAt
+  id                          String                    @id @default(cuid())
+  agencyId                    String
+  creatorId                   String
+  dialogId                    String
+  createdByMemberId           String
+  scenario                    String
+  internalNote                String?
+  type                        CustomOrderType           @default(CONTENT)
+  contentKind                 CustomOrderContentKind?
+  status                      CustomOrderStatus         @default(PENDING)
+  dueAt                       DateTime?
+  scheduledAt                 DateTime?
+  durationMinutes             Int?
+  physicalStatus              CustomOrderPhysicalStatus?
+  acceptedAt                  DateTime?
+  completedAt                 DateTime?
+  deliveredAt                 DateTime?
+  cancelledAt                 DateTime?
+  cancelReason                String?
+  mediaIds                    String                    @default("")
+  priceCents                  Int                       @default(0)
+  telegramTaskMessageId       Int?
+  telegramReferenceMessageIds Int[]                     @default([])
+  reminderConfig              Json?
+  nextReminderAt              DateTime?
+  lastReminderAt              DateTime?
+  lastReminderKey             String?
+  reminderClaimToken          String?
+  reminderClaimUntil          DateTime?
+  createdAt                   DateTime                  @default(now())
+  updatedAt                   DateTime                  @updatedAt
 
   agency          Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   createdByMember AgencyMember  @relation(fields: [createdByMemberId], references: [id], onDelete: Restrict)
 
   @@index([agencyId, status, dueAt])
+  @@index([agencyId, status, scheduledAt])
+  @@index([agencyId, status, nextReminderAt])
   @@index([agencyId, creatorId, status, dueAt])
+  @@index([agencyId, creatorId, status, scheduledAt])
   @@index([agencyId, creatorId, dialogId, createdAt])
   @@index([creatorId, dialogId, status])
 }

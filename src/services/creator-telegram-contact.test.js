@@ -34,10 +34,12 @@ test("Telegram contact write is agency-scoped, management-gated and does not exp
   assert.match(route, /creator\.telegram_contact\.updated/);
   assert.match(route, /hadContact/);
   assert.match(route, /hasContact/);
-  assert.doesNotMatch(route, /api_hash|apiId|MTProto|BotFather|sendMessage/i);
+  assert.match(route, /telegramAccountId/);
+  assert.match(route, /agencyTelegramMtprotoAccount/);
+  assert.doesNotMatch(route, /api_hash|apiHash|BotFather|sendMessage|local-material|encryptedPayload|session/i);
 });
 
-test("Telegram contact validation is deliberately contact-only", () => {
+test("Telegram contact validation stays contact-scoped while allowing an agency Telegram account assignment", () => {
   const source = read("src/routes/creators.js");
   assert.match(source, /telegramContact: z\.string\(\)\.trim\(\)\.min\(1\)\.max\(160\)/);
   assert.match(source, /Invalid Telegram contact/);
