@@ -11,6 +11,7 @@ const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/aut
 const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
 const { agencyRemovalPhrase, removeCreatorFromAssignedCreators } = require("../services/creator-agency-removal");
+const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
 
 const router = express.Router();
 
@@ -87,6 +88,11 @@ const agencyRemovalSchema = z.object({
 
 const telegramContactSchema = z.object({
   telegramContact: z.string().trim().min(1).max(160).regex(/^[^\r\n\t]+$/, "Invalid Telegram contact").nullable(),
+});
+
+const telegramIdentitySchema = z.object({
+  telegramUserId: z.string().trim().regex(/^\d{1,20}$/, "Invalid Telegram user id"),
+  telegramContact: z.string().trim().min(1).max(160).regex(/^[^\r\n\t]+$/, "Invalid Telegram contact"),
 });
 
 function normalizeUsername(value) {
@@ -288,6 +294,55 @@ router.patch("/:id/telegram-contact", creatorManagementRequired, creatorAccessRe
 
     console.error("[creators/telegram-contact] failed:", err);
     return res.status(500).json({ ok: false, code: "CREATOR_TELEGRAM_CONTACT_UPDATE_FAILED", error: "Failed to update Telegram contact" });
+  }
+});
+
+router.patch("/:id/telegram-identity", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
+  try {
+    const input = telegramIdentitySchema.parse(req.body);
+    const before = await prisma.creatorAccount.findFirst({
+      where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null },
+      select: { id: true, telegramContact: true, telegramUserId: true },
+    });
+    if (!before) {
+      return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
+    }
+
+    const creator = await setCreatorTelegramUserId({
+      agencyId: req.auth.agencyId,
+      creatorId: before.id,
+      telegramUserId: input.telegramUserId,
+      expectedTelegramContact: input.telegramContact,
+      db: prisma,
+    });
+
+    await audit({
+      agencyId: req.auth.agencyId,
+      actorUserId: req.auth.userId,
+      action: "creator.telegram_identity.resolved",
+      targetType: "creator",
+      targetId: creator.id,
+      metadata: {
+        hadIdentity: Boolean(before.telegramUserId),
+        hasIdentity: Boolean(creator.telegramUserId),
+      },
+    });
+
+    return res.json({ ok: true, creator });
+  } catch (err) {
+    if (err?.issues) {
+      return res.status(400).json({
+        ok: false,
+        code: "VALIDATION_ERROR",
+        error: err.issues[0]?.message || "Validation error",
+        issues: err.issues,
+      });
+    }
+    if (err?.status && err?.code) {
+      return res.status(Number(err.status)).json({ ok: false, code: err.code, error: err.message || "Failed to save Telegram identity" });
+    }
+    console.error("[creators/telegram-identity] failed:", err);
+    return res.status(500).json({ ok: false, code: "CREATOR_TELEGRAM_IDENTITY_UPDATE_FAILED", error: "Failed to save Telegram identity" });
   }
 });
 

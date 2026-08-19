@@ -4,7 +4,6 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { normalizeTelegramUserId, setCreatorTelegramUserId } = require("./creator-telegram-identity");
 
-
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -29,28 +28,58 @@ test("Telegram user id normalization preserves 64-bit ids as strings", () => {
   assert.throws(() => normalizeTelegramUserId("9223372036854775808"), /64-bit range/);
 });
 
-test("resolved Telegram user id is stored only for creators with a Telegram contact", async () => {
+test("resolved Telegram user id is atomically bound only while the resolved contact still matches", async () => {
   const updates = [];
   const db = {
     creatorAccount: {
-      findFirst: async ({ where }) => where.id === "creator_1" ? { id: "creator_1", telegramContact: "@model" } : null,
-      update: async ({ where, data }) => { updates.push({ where, data }); return { id: where.id, ...data }; },
+      updateMany: async ({ where, data }) => {
+        updates.push({ where, data });
+        return { count: where.id === "creator_1" && where.telegramContact === "@model" ? 1 : 0 };
+      },
+      findFirst: async ({ where }) => where.id === "creator_1"
+        ? { id: "creator_1", telegramContact: "@model", telegramUserId: "999999999999999999" }
+        : null,
     },
   };
-  const result = await setCreatorTelegramUserId({ agencyId: "agency_1", creatorId: "creator_1", telegramUserId: "999999999999999999", db });
+  const result = await setCreatorTelegramUserId({
+    agencyId: "agency_1",
+    creatorId: "creator_1",
+    telegramUserId: "999999999999999999",
+    expectedTelegramContact: "@model",
+    db,
+  });
   assert.equal(result.telegramUserId, "999999999999999999");
-  assert.deepEqual(updates[0], { where: { id: "creator_1" }, data: { telegramUserId: "999999999999999999" } });
+  assert.deepEqual(updates[0], {
+    where: { id: "creator_1", agencyId: "agency_1", deletedAt: null, telegramContact: "@model" },
+    data: { telegramUserId: "999999999999999999" },
+  });
 });
 
-test("resolved Telegram user id is rejected when the model contact is absent", async () => {
+test("resolved Telegram identity is rejected if the model contact changed during resolution", async () => {
   const db = {
     creatorAccount: {
-      findFirst: async () => ({ id: "creator_1", telegramContact: null }),
-      update: async () => assert.fail("must not update"),
+      updateMany: async () => ({ count: 0 }),
+      findFirst: async () => ({ id: "creator_1", telegramContact: "@new_model" }),
     },
   };
   await assert.rejects(
-    () => setCreatorTelegramUserId({ agencyId: "agency_1", creatorId: "creator_1", telegramUserId: "123", db }),
-    (error) => error?.code === "CREATOR_TELEGRAM_CONTACT_REQUIRED",
+    () => setCreatorTelegramUserId({
+      agencyId: "agency_1",
+      creatorId: "creator_1",
+      telegramUserId: "123",
+      expectedTelegramContact: "@old_model",
+      db,
+    }),
+    (error) => error?.code === "CREATOR_TELEGRAM_CONTACT_CHANGED" && error?.status === 409,
   );
+});
+
+test("creator API exposes a scoped contact-bound Telegram identity persistence route for Desktop resolution", () => {
+  const root = path.join(__dirname, "..", "..");
+  const route = fs.readFileSync(path.join(root, "src", "routes", "creators.js"), "utf8");
+  assert.match(route, /router\.patch\("\/:id\/telegram-identity", creatorManagementRequired, creatorAccessRequired/);
+  assert.match(route, /telegramContact: z\.string\(\)\.trim\(\)\.min\(1\)\.max\(160\)/);
+  assert.match(route, /expectedTelegramContact: input\.telegramContact/);
+  assert.match(route, /creator\.telegram_identity\.resolved/);
+  assert.doesNotMatch(route, /telegram-identity[\s\S]{0,1800}(apiHash|session)/);
 });

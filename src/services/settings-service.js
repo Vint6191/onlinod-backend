@@ -331,8 +331,23 @@ function billingLine(creator, pricing, defaultCorePriceCents = 2000, now = new D
 }
 
 
+function canManageTelegram(member) {
+  const role = String(member?.role || "").trim().toUpperCase();
+  const roleKey = String(member?.roleKey || "").trim().toLowerCase();
+  return role === "OWNER" || role === "ADMIN" || roleKey === "owner" || roleKey === "admin";
+}
+
+function ensureTelegramManager(member) {
+  if (canManageTelegram(member)) return;
+  const err = new Error("Only the agency owner or administrator can manage Telegram MTProto credentials");
+  err.code = "SETTINGS_TELEGRAM_OWNER_ADMIN_ONLY";
+  err.status = 403;
+  throw err;
+}
+
+
 async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
-  if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY", accounts: [] };
+  if (!canManageTelegram(member)) return { available: false, reason: "OWNER_OR_ADMIN_ONLY", accounts: [] };
   const client = db || prisma;
   const rows = await client.agencyTelegramMtprotoAccount.findMany({
     where: { agencyId },
@@ -344,7 +359,7 @@ async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
     try { sessionReady = Boolean(String(decryptTelegramCredentials(row).session || "").trim()); } catch (_) {}
     // Backend is storage-only for MTProto. Authorization and live clients run
     // exclusively inside Desktop Electron MAIN.
-    return { id: row.id, apiId: row.apiId, sessionReady, connected: false, authStage: null };
+    return { id: row.id, apiId: row.apiId, sessionReady };
   });
   return { available: true, accounts };
 }
@@ -357,12 +372,7 @@ function telegramInputError(message, code) {
 }
 
 async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, session, db = null }) {
-  if (!isOwner(member)) {
-    const err = new Error("Only the agency owner can manage Telegram MTProto credentials");
-    err.code = "SETTINGS_TELEGRAM_OWNER_ONLY";
-    err.status = 403;
-    throw err;
-  }
+  ensureTelegramManager(member);
   const numericApiId = Number(apiId);
   if (!Number.isSafeInteger(numericApiId) || numericApiId <= 0 || numericApiId > 2147483647) {
     throw telegramInputError("API ID must be a positive integer", "SETTINGS_TELEGRAM_API_ID_INVALID");
@@ -397,16 +407,11 @@ async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, ses
     },
     select: { id: true, apiId: true },
   });
-  return { available: true, account: { ...account, sessionReady: Boolean(cleanSession), connected: false, authStage: null } };
+  return { available: true, account: { ...account, sessionReady: Boolean(cleanSession) } };
 }
 
 async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = null }) {
-  if (!isOwner(member)) {
-    const err = new Error("Only the agency owner can manage Telegram MTProto credentials");
-    err.code = "SETTINGS_TELEGRAM_OWNER_ONLY";
-    err.status = 403;
-    throw err;
-  }
+  ensureTelegramManager(member);
   const id = String(accountId || "").trim();
   if (!id || id.length > 180) throw telegramInputError("Telegram connection id is required", "SETTINGS_TELEGRAM_ACCOUNT_INVALID");
   const client = db || prisma;
@@ -421,13 +426,6 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
   return { ok: true };
 }
 
-function ensureTelegramOwner(member) {
-  if (isOwner(member)) return;
-  const err = new Error("Only the agency owner can manage Telegram MTProto credentials");
-  err.code = "SETTINGS_TELEGRAM_OWNER_ONLY";
-  err.status = 403;
-  throw err;
-}
 
 async function readTelegramMtprotoAccountSecret({ agencyId, accountId, db = null }) {
   const id = clean(accountId, 180);
@@ -455,9 +453,9 @@ async function readTelegramMtprotoAccountSecret({ agencyId, accountId, db = null
 }
 
 async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, purpose, db = null }) {
-  ensureTelegramOwner(member);
+  ensureTelegramManager(member);
   const normalizedPurpose = clean(purpose, 32).toLowerCase();
-  if (!new Set(["authorize", "test"]).has(normalizedPurpose)) {
+  if (!new Set(["authorize", "messaging"]).has(normalizedPurpose)) {
     throw telegramInputError("Telegram local-material purpose is invalid", "SETTINGS_TELEGRAM_LOCAL_PURPOSE_INVALID");
   }
   const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db });
@@ -467,7 +465,7 @@ async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, 
     err.status = 409;
     throw err;
   }
-  if (normalizedPurpose === "test" && !secret.session.trim()) {
+  if (normalizedPurpose === "messaging" && !secret.session.trim()) {
     const err = new Error("Telegram account has not been authorized yet");
     err.code = "SETTINGS_TELEGRAM_SESSION_REQUIRED";
     err.status = 409;
@@ -477,12 +475,12 @@ async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, 
     accountId: secret.row.id,
     apiId: secret.row.apiId,
     apiHash: secret.apiHash,
-    session: normalizedPurpose === "test" ? secret.session : "",
+    session: normalizedPurpose === "messaging" ? secret.session : "",
   };
 }
 
 async function storeTelegramMtprotoSession({ agencyId, member, accountId, session, db = null }) {
-  ensureTelegramOwner(member);
+  ensureTelegramManager(member);
   const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db });
   const cleanSession = String(session || "").trim();
   if (!cleanSession || cleanSession.length > 262144) {
@@ -507,7 +505,7 @@ async function storeTelegramMtprotoSession({ agencyId, member, accountId, sessio
       payloadVersion: encrypted.payloadVersion,
     },
   });
-  return { id: secret.row.id, apiId: secret.row.apiId, sessionReady: true, connected: false, authStage: null };
+  return { id: secret.row.id, apiId: secret.row.apiId, sessionReady: true };
 }
 
 async function getBillingSettings({ agencyId, member, db = null }) {

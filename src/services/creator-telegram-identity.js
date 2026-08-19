@@ -18,32 +18,55 @@ function normalizeTelegramUserId(value) {
   return normalized.toString(10);
 }
 
-async function setCreatorTelegramUserId({ agencyId, creatorId, telegramUserId, db = null }) {
-  const client = db || require("../prisma");
-  const normalized = normalizeTelegramUserId(telegramUserId);
-  const creator = await client.creatorAccount.findFirst({
-    where: { id: String(creatorId || ""), agencyId: String(agencyId || ""), deletedAt: null },
-    select: { id: true, telegramContact: true },
-  });
-  if (!creator) {
-    const err = new Error("Creator not found");
-    err.code = "CREATOR_NOT_FOUND";
-    err.status = 404;
+function normalizeExpectedTelegramContact(value) {
+  const text = String(value ?? "").trim();
+  if (!text || text.length > 160 || /[\r\n\t]/.test(text)) {
+    const err = new Error("Telegram contact used for identity resolution is invalid");
+    err.code = "CREATOR_TELEGRAM_CONTACT_INVALID";
+    err.status = 400;
     throw err;
   }
-  if (!String(creator.telegramContact || "").trim()) {
-    const err = new Error("Telegram contact must be set before resolving Telegram identity");
-    err.code = "CREATOR_TELEGRAM_CONTACT_REQUIRED";
+  return text;
+}
+
+async function setCreatorTelegramUserId({ agencyId, creatorId, telegramUserId, expectedTelegramContact, db = null }) {
+  const client = db || require("../prisma");
+  const normalized = normalizeTelegramUserId(telegramUserId);
+  const expectedContact = normalizeExpectedTelegramContact(expectedTelegramContact);
+  const id = String(creatorId || "");
+  const agency = String(agencyId || "");
+
+  // Bind the resolved Telegram identity only if the creator still has exactly the
+  // contact that Desktop resolved. updateMany makes the contact check and write
+  // atomic, so an edit cannot race an in-flight resolve and attach a stale id.
+  const result = await client.creatorAccount.updateMany({
+    where: { id, agencyId: agency, deletedAt: null, telegramContact: expectedContact },
+    data: { telegramUserId: normalized },
+  });
+  if (Number(result?.count || 0) !== 1) {
+    const current = await client.creatorAccount.findFirst({
+      where: { id, agencyId: agency, deletedAt: null },
+      select: { id: true, telegramContact: true },
+    });
+    if (!current) {
+      const err = new Error("Creator not found");
+      err.code = "CREATOR_NOT_FOUND";
+      err.status = 404;
+      throw err;
+    }
+    const err = new Error("Telegram contact changed while its identity was being resolved");
+    err.code = "CREATOR_TELEGRAM_CONTACT_CHANGED";
     err.status = 409;
     throw err;
   }
-  return client.creatorAccount.update({
-    where: { id: creator.id },
-    data: { telegramUserId: normalized },
+
+  return client.creatorAccount.findFirst({
+    where: { id, agencyId: agency, deletedAt: null },
   });
 }
 
 module.exports = {
   normalizeTelegramUserId,
+  normalizeExpectedTelegramContact,
   setCreatorTelegramUserId,
 };
