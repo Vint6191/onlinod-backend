@@ -36,10 +36,13 @@ test("workspace settings normalize real IANA/time/date preferences", () => {
   assert.equal(service.isValidTimezone("Europe/Kyiv"), true);
   assert.equal(service.isValidTimezone("UTC+3-onlinod"), false);
   assert.deepEqual(service.normalizeWorkspacePreferences({ timezone: "Europe/Kyiv", timeFormat: "12h", dateFormat: "YYYY-MM-DD" }), {
-    timezone: "Europe/Kyiv", timeFormat: "12h", dateFormat: "YYYY-MM-DD",
+    timezone: "Europe/Kyiv", timeFormat: "12h", dateFormat: "YYYY-MM-DD", vaultUploadRecipient: "",
   });
   assert.deepEqual(service.normalizeWorkspacePreferences({ timezone: "fake", timeFormat: "x", dateFormat: "x" }), {
-    timezone: "UTC", timeFormat: "24h", dateFormat: "DD.MM.YYYY",
+    timezone: "UTC", timeFormat: "24h", dateFormat: "DD.MM.YYYY", vaultUploadRecipient: "",
+  });
+  assert.deepEqual(service.normalizeWorkspacePreferences({ vaultUploadRecipient: "@myro_slava" }), {
+    timezone: "UTC", timeFormat: "24h", dateFormat: "DD.MM.YYYY", vaultUploadRecipient: "myro_slava",
   });
 });
 

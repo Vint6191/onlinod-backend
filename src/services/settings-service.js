@@ -16,6 +16,7 @@ const WORKSPACE_SETTING_DEFAULTS = Object.freeze({
   timezone: "UTC",
   timeFormat: "24h",
   dateFormat: "DD.MM.YYYY",
+  vaultUploadRecipient: "",
 });
 const TIME_FORMATS = new Set(["12h", "24h"]);
 const DATE_FORMATS = new Set(["DD.MM.YYYY", "MM.DD.YYYY", "YYYY-MM-DD"]);
@@ -51,7 +52,8 @@ function normalizeWorkspacePreferences(raw) {
   const dateFormat = DATE_FORMATS.has(String(source.dateFormat || ""))
     ? String(source.dateFormat)
     : WORKSPACE_SETTING_DEFAULTS.dateFormat;
-  return { timezone, timeFormat, dateFormat };
+  const vaultUploadRecipient = clean(source.vaultUploadRecipient, 100).replace(/^@+/, "");
+  return { timezone, timeFormat, dateFormat, vaultUploadRecipient };
 }
 
 function sessionPublic(row, currentSessionId) {
@@ -205,7 +207,7 @@ async function getWorkspaceSettings({ agencyId, member, db = null }) {
   const client = db || prisma;
   const [agency, rows] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),
-    client.workspaceSetting.findMany({ where: { agencyId, key: { in: ["timezone", "timeFormat", "dateFormat"] } } }),
+    client.workspaceSetting.findMany({ where: { agencyId, key: { in: ["timezone", "timeFormat", "dateFormat", "vaultUploadRecipient"] } } }),
   ]);
   const raw = settingsObject(rows);
   return {
@@ -264,6 +266,15 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
       throw err;
     }
     values.dateFormat = value;
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "vaultUploadRecipient")) {
+    const value = clean(input.vaultUploadRecipient, 100).replace(/^@+/, "");
+    if (value && !/^(?:[A-Za-z0-9_]{3,64}|[1-9]\d{0,39})$/.test(value)) {
+      const err = new Error("Vault upload recipient must be an OnlyFans username or numeric user ID");
+      err.code = "SETTINGS_VAULT_UPLOAD_RECIPIENT_INVALID";
+      throw err;
+    }
+    values.vaultUploadRecipient = value;
   }
 
   const before = await getWorkspaceSettings({ agencyId, member, db: client });
