@@ -14,6 +14,11 @@ const {
   prepareTelegramStatusNotification,
 } = require("../services/custom-orders-service");
 const {
+  assignCustomContentSubmission,
+  createCustomContentSubmission,
+  listCustomContentSubmissions,
+} = require("../services/custom-content-submissions-service");
+const {
   claimDueReminders,
   acknowledgeReminder,
   releaseReminderClaim,
@@ -36,6 +41,48 @@ router.get("/", async (req, res) => {
 router.post("/", async (req, res) => {
   try { return res.status(201).json(await createCustomOrder({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, input: req.body || {}, db: prisma })); }
   catch (err) { return sendError(res, err, "CUSTOM_ORDER_CREATE_FAILED"); }
+});
+
+router.get("/submissions", async (req, res) => {
+  try {
+    return res.json(await listCustomContentSubmissions({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      creatorId: req.query.creatorId,
+      customOrderId: req.query.customOrderId,
+      unassigned: bool(req.query.unassigned),
+      limit: req.query.limit,
+      offset: req.query.offset,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_LIST_FAILED"); }
+});
+
+router.post("/submissions", async (req, res) => {
+  try {
+    return res.status(201).json(await createCustomContentSubmission({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      input: req.body || {},
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_CREATE_FAILED"); }
+});
+
+router.patch("/submissions/:submissionId", async (req, res) => {
+  try {
+    if (!Object.prototype.hasOwnProperty.call(req.body || {}, "customOrderId")) {
+      const error = Object.assign(new Error("customOrderId is required"), { code: "CUSTOM_SUBMISSION_PATCH_INVALID", status: 400 });
+      throw error;
+    }
+    return res.json(await assignCustomContentSubmission({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      submissionId: req.params.submissionId,
+      customOrderId: req.body.customOrderId,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_UPDATE_FAILED"); }
 });
 
 router.post("/telegram-inbound", async (req, res) => {

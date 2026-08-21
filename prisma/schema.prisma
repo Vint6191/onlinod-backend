@@ -317,6 +317,7 @@ model Agency {
   creatorSubscriptionLedgers CreatorSubscriptionLedger[]
   trafficDailyAggregates TrafficDailyAggregate[]
   customOrders CustomOrder[]
+  customContentSubmissions CustomContentSubmission[]
 
   @@index([deletedAt])
 }
@@ -493,6 +494,7 @@ model CreatorAccount {
   earningsTotals CreatorEarningsTotal[]
   taskActivities CreatorTaskActivity[]
   customOrders CustomOrder[]
+  customContentSubmissions CustomContentSubmission[]
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
@@ -543,6 +545,7 @@ model CustomOrder {
   agency          Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   createdByMember AgencyMember  @relation(fields: [createdByMemberId], references: [id], onDelete: Restrict)
+  contentSubmissions CustomContentSubmission[]
 
   @@index([agencyId, status, dueAt])
   @@index([agencyId, status, scheduledAt])
@@ -552,6 +555,26 @@ model CustomOrder {
   @@index([agencyId, creatorId, dialogId, createdAt])
   @@index([agencyId, creatorId, telegramTaskMessageId])
   @@index([creatorId, dialogId, status])
+}
+
+model CustomContentSubmission {
+  id                 String   @id @default(cuid())
+  agencyId           String
+  creatorId          String
+  customOrderId      String?
+  telegramMessageIds Int[]    @default([])
+  ofMediaIds         String[] @default([])
+  comment            String?
+  receivedAt         DateTime @default(now())
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  agency      Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator     CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  customOrder CustomOrder?   @relation(fields: [customOrderId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId, creatorId, receivedAt])
+  @@index([customOrderId, receivedAt])
 }
 
 model AuthToken {
