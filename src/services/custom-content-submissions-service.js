@@ -2,12 +2,14 @@
 
 const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
-const { requireCreatorAccess } = require("../middleware/automation-permissions");
+const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
 const MAX_OF_MEDIA_IDS = 200;
 const MAX_TELEGRAM_MESSAGE_ID = 2_147_483_647;
+const MAX_UPLOAD_WORK = 3;
+const MAX_RUNTIME_LEASES = 100;
 
 function fail(code, message, status = 400) {
   return Object.assign(new Error(message), { code, status });
@@ -61,6 +63,44 @@ function ofMediaIds(value) {
     result.push(text);
   }
   return result;
+}
+
+function ofMediaId(value) {
+  const text = String(value == null ? "" : value).trim();
+  if (!/^[1-9]\d{0,39}$/.test(text)) {
+    throw fail("CUSTOM_SUBMISSION_OF_MEDIA_ID_INVALID", "ofMediaId must be a positive OnlyFans media id");
+  }
+  return text;
+}
+
+function runtimeLeaseInputs(value) {
+  const raw = Array.isArray(value) ? value : [];
+  const seen = new Set();
+  const result = [];
+  for (const item of raw.slice(0, MAX_RUNTIME_LEASES)) {
+    const accountId = String(item?.accountId || "").trim();
+    const claimToken = String(item?.claimToken || "").trim();
+    if (!accountId || !claimToken || seen.has(accountId)) continue;
+    seen.add(accountId);
+    result.push({ accountId, claimToken });
+  }
+  return result;
+}
+
+function uploadWorkLimit(value) {
+  return Math.max(1, Math.min(MAX_UPLOAD_WORK, Math.floor(Number(value) || 1)));
+}
+
+function vaultUploadRecipient(value) {
+  const text = String(value == null ? "" : value).trim().replace(/^@+/, "");
+  return /^(?:[A-Za-z0-9_]{3,64}|[1-9]\d{0,39})$/.test(text) ? text : "";
+}
+
+function nextUploadIndex(row) {
+  const telegramIds = Array.isArray(row?.telegramMessageIds) ? row.telegramMessageIds : [];
+  const mediaIds = ofMediaIds(row?.ofMediaIds);
+  if (mediaIds.length > telegramIds.length) return null;
+  return mediaIds.length < telegramIds.length ? mediaIds.length : null;
 }
 
 function receivedAt(value, now = new Date()) {
@@ -214,12 +254,194 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   return { ok: true, unchanged: false, submission: serializeSubmission(updated) };
 }
 
+async function pendingUploadRows({ agencyId, creatorIds, limit, db }) {
+  const ids = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map(String).filter(Boolean)));
+  if (!ids.length) return [];
+  const take = Math.max(limit, Math.min(50, limit * 4));
+  if (typeof db.$queryRawUnsafe === "function") {
+    const placeholders = ids.map((_, index) => `$${index + 2}`).join(",");
+    return db.$queryRawUnsafe(
+      `SELECT "id", "agencyId", "creatorId", "customOrderId", "telegramMessageIds", "ofMediaIds", "comment", "receivedAt", "createdAt", "updatedAt"
+       FROM "CustomContentSubmission"
+       WHERE "agencyId" = $1
+         AND "creatorId" IN (${placeholders})
+         AND cardinality("ofMediaIds") < cardinality("telegramMessageIds")
+       ORDER BY "receivedAt" ASC, "createdAt" ASC
+       LIMIT ${take}`,
+      agencyId,
+      ...ids,
+    );
+  }
+  const rows = await db.customContentSubmission.findMany({
+    where: { agencyId, creatorId: { in: ids } },
+    orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }],
+    take: Math.max(200, take * 20),
+    skip: 0,
+  });
+  return rows.filter((row) => nextUploadIndex(row) !== null).slice(0, take);
+}
+
+/**
+ * Return upload work only for Telegram accounts whose existing runtime lease is
+ * currently owned by this Desktop. The submission row itself stays compact:
+ * no extra claim/status/device fields are persisted for upload execution.
+ */
+async function claimCustomContentSubmissionUploadWork({ agencyId, member, deviceId, leases, limit = 1, now = new Date(), db = null } = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
+  const requestedLeases = runtimeLeaseInputs(leases);
+  const take = uploadWorkLimit(limit);
+  if (!requestedLeases.length) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
+
+  const requestedByAccount = new Map(requestedLeases.map((row) => [row.accountId, row.claimToken]));
+  const leasedRows = await client.agencyTelegramMtprotoAccount.findMany({
+    where: {
+      agencyId,
+      id: { in: [...requestedByAccount.keys()] },
+      runtimeClaimedByDeviceId: normalizedDeviceId,
+      runtimeClaimUntil: { gt: now },
+    },
+    select: { id: true, runtimeClaimToken: true },
+    take: MAX_RUNTIME_LEASES,
+  });
+  const validAccountIds = new Set(
+    leasedRows
+      .filter((row) => requestedByAccount.get(String(row.id)) === String(row.runtimeClaimToken || ""))
+      .map((row) => String(row.id)),
+  );
+  if (!validAccountIds.size) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
+
+  const [scope, accountRows, recipientRow] = await Promise.all([
+    allowedCreatorScope({ agencyId, member, db: client }),
+    client.agencyTelegramMtprotoAccount.findMany({ where: { agencyId }, select: { id: true }, orderBy: { id: "asc" }, take: 2 }),
+    client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null),
+  ]);
+  const recipient = vaultUploadRecipient(recipientRow?.value);
+  if (!recipient) {
+    return {
+      ok: true,
+      items: [],
+      blocked: { code: "CUSTOM_SUBMISSION_VAULT_RELAY_REQUIRED", message: "Set Vault upload relay in Settings → Workspace." },
+      serverNow: new Date(now).toISOString(),
+    };
+  }
+
+  const singleAccountId = accountRows.length === 1 ? String(accountRows[0].id) : null;
+  const singleAccountOwned = Boolean(singleAccountId && validAccountIds.has(singleAccountId));
+  const creatorWhere = {
+    agencyId,
+    deletedAt: null,
+    telegramContact: { not: null },
+    customsVaultFolderId: { not: null },
+    ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
+    ...(singleAccountOwned ? {} : { telegramAccountId: { in: [...validAccountIds] } }),
+  };
+  const creators = await client.creatorAccount.findMany({
+    where: creatorWhere,
+    select: { id: true, username: true, telegramAccountId: true, customsVaultFolderId: true },
+    take: 10_000,
+  });
+  if (!creators.length) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
+
+  const creatorById = new Map();
+  for (const creator of creators) {
+    const accountId = singleAccountOwned ? singleAccountId : String(creator.telegramAccountId || "").trim();
+    if (!accountId || !validAccountIds.has(accountId)) continue;
+    creatorById.set(String(creator.id), { ...creator, accountId });
+  }
+  if (!creatorById.size) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
+
+  const rows = await pendingUploadRows({ agencyId, creatorIds: [...creatorById.keys()], limit: take, db: client });
+  const items = [];
+  for (const row of rows) {
+    if (items.length >= take) break;
+    const creator = creatorById.get(String(row.creatorId));
+    const index = nextUploadIndex(row);
+    if (!creator || index === null) continue;
+    const messageId = Number(row.telegramMessageIds?.[index]);
+    if (!Number.isInteger(messageId) || messageId <= 0) continue;
+    items.push({
+      submission: serializeSubmission(row),
+      creatorId: String(row.creatorId),
+      accountId: creator.accountId,
+      creatorUsername: creator.username || null,
+      folderId: String(creator.customsVaultFolderId),
+      recipient,
+      expectedIndex: index,
+      telegramMessageId: String(messageId),
+    });
+  }
+  return { ok: true, items, blocked: null, serverNow: new Date(now).toISOString() };
+}
+
+async function commitCustomContentSubmissionMedia({ agencyId, member, submissionId, expectedIndex, mediaId, db = null } = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  const normalizedSubmissionId = identifier(submissionId, "submissionId", { max: 180 });
+  const index = Number(expectedIndex);
+  if (!Number.isInteger(index) || index < 0 || index >= MAX_TELEGRAM_MESSAGES) {
+    throw fail("CUSTOM_SUBMISSION_MEDIA_INDEX_INVALID", "expectedIndex must be a valid zero-based Telegram media index");
+  }
+  const normalizedMediaId = ofMediaId(mediaId);
+  const row = await client.customContentSubmission.findFirst({ where: { id: normalizedSubmissionId, agencyId } });
+  if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
+  const current = ofMediaIds(row.ofMediaIds);
+  if (current.length > telegramIds.length) throw fail("CUSTOM_SUBMISSION_MEDIA_STATE_INVALID", "Submission has more OnlyFans media ids than Telegram source messages", 409);
+  if (index >= telegramIds.length) throw fail("CUSTOM_SUBMISSION_MEDIA_INDEX_INVALID", "expectedIndex is outside this submission", 409);
+  if (index < current.length) {
+    if (current[index] === normalizedMediaId) {
+      return { ok: true, idempotent: true, completed: current.length === telegramIds.length, submission: serializeSubmission(row) };
+    }
+    throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT", "This submission position is already committed to a different OnlyFans media id", 409);
+  }
+  if (index !== current.length) {
+    throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_OUT_OF_ORDER", "OnlyFans media ids must be committed in Telegram message order", 409);
+  }
+  if (current.includes(normalizedMediaId)) {
+    throw fail("CUSTOM_SUBMISSION_MEDIA_ID_DUPLICATE", "This OnlyFans media id is already committed to another position in the submission", 409);
+  }
+  const next = [...current, normalizedMediaId];
+  const changed = await client.customContentSubmission.updateMany({
+    where: { id: row.id, agencyId, updatedAt: row.updatedAt },
+    data: { ofMediaIds: next },
+  });
+  if (Number(changed?.count || 0) !== 1) {
+    const raced = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
+    const racedIds = ofMediaIds(raced?.ofMediaIds);
+    if (raced && racedIds[index] === normalizedMediaId) {
+      return { ok: true, idempotent: true, completed: racedIds.length === telegramIds.length, submission: serializeSubmission(raced) };
+    }
+    throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT", "Submission changed while the OnlyFans media id was being committed", 409);
+  }
+  const updated = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
+  if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after media commit", 404);
+  const completed = ofMediaIds(updated.ofMediaIds).length === telegramIds.length;
+  if (completed) {
+    await audit({
+      agencyId,
+      actorUserId: member.userId || null,
+      action: "custom_content_submission.of_upload_complete",
+      targetType: "CustomContentSubmission",
+      targetId: updated.id,
+      metadata: { creatorId: updated.creatorId, customOrderId: updated.customOrderId || null, mediaCount: telegramIds.length },
+      db: client,
+    });
+  }
+  return { ok: true, idempotent: false, completed, submission: serializeSubmission(updated) };
+}
+
 module.exports = {
   MAX_TELEGRAM_MESSAGES,
   assignCustomContentSubmission,
+  claimCustomContentSubmissionUploadWork,
+  commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   deterministicSubmissionId,
   listCustomContentSubmissions,
+  nextUploadIndex,
   sameMessageIds,
   serializeSubmission,
   telegramMessageIds,

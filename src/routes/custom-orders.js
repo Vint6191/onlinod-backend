@@ -15,6 +15,8 @@ const {
 } = require("../services/custom-orders-service");
 const {
   assignCustomContentSubmission,
+  claimCustomContentSubmissionUploadWork,
+  commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   listCustomContentSubmissions,
 } = require("../services/custom-content-submissions-service");
@@ -86,6 +88,32 @@ router.post("/submissions", async (req, res) => {
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_CREATE_FAILED"); }
+});
+
+router.post("/submissions/upload-work", async (req, res) => {
+  try {
+    return res.json(await claimCustomContentSubmissionUploadWork({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      deviceId: req.body?.deviceId,
+      leases: req.body?.leases,
+      limit: req.body?.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_UPLOAD_WORK_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/media-commit", async (req, res) => {
+  try {
+    return res.json(await commitCustomContentSubmissionMedia({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      submissionId: req.params.submissionId,
+      expectedIndex: req.body?.expectedIndex,
+      mediaId: req.body?.mediaId,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_MEDIA_COMMIT_FAILED"); }
 });
 
 router.patch("/submissions/:submissionId", async (req, res) => {

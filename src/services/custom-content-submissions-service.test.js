@@ -6,6 +6,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {
   assignCustomContentSubmission,
+  claimCustomContentSubmissionUploadWork,
+  commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   deterministicSubmissionId,
   listCustomContentSubmissions,
@@ -17,8 +19,8 @@ function clone(value) { return value == null ? value : structuredClone(value); }
 
 function fakeDb(seed = {}) {
   const creators = (seed.creators || [
-    { id: "creator-1", agencyId: "agency-1", deletedAt: null, displayName: "Model A", username: "a", status: "READY" },
-    { id: "creator-2", agencyId: "agency-1", deletedAt: null, displayName: "Model B", username: "b", status: "READY" },
+    { id: "creator-1", agencyId: "agency-1", deletedAt: null, displayName: "Model A", username: "a", status: "READY", telegramContact: "@model_a", telegramAccountId: "tg-1", customsVaultFolderId: "vault-1" },
+    { id: "creator-2", agencyId: "agency-1", deletedAt: null, displayName: "Model B", username: "b", status: "READY", telegramContact: "@model_b", telegramAccountId: "tg-1", customsVaultFolderId: "vault-2" },
   ]).map(clone);
   const orders = (seed.orders || [
     { id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT" },
@@ -26,13 +28,25 @@ function fakeDb(seed = {}) {
     { id: "custom-2", agencyId: "agency-1", creatorId: "creator-2", type: "CONTENT" },
   ]).map(clone);
   const submissions = (seed.submissions || []).map(clone);
+  const telegramAccounts = (seed.telegramAccounts || [
+    { id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1", runtimeClaimUntil: new Date("2026-08-21T14:00:00.000Z") },
+  ]).map(clone);
+  const workspaceSettings = new Map(Object.entries(seed.workspaceSettings || { vaultUploadRecipient: "relay_model" }));
   const audits = [];
   let seq = submissions.length;
 
   function matchesSubmission(row, where = {}) {
-    if (where.id !== undefined && row.id !== where.id) return false;
+    if (where.id !== undefined) {
+      if (where.id && typeof where.id === "object" && Array.isArray(where.id.in)) {
+        if (!where.id.in.includes(row.id)) return false;
+      } else if (row.id !== where.id) return false;
+    }
     if (where.agencyId !== undefined && row.agencyId !== where.agencyId) return false;
-    if (where.creatorId !== undefined && row.creatorId !== where.creatorId) return false;
+    if (where.creatorId !== undefined) {
+      if (where.creatorId && typeof where.creatorId === "object" && Array.isArray(where.creatorId.in)) {
+        if (!where.creatorId.in.includes(row.creatorId)) return false;
+      } else if (row.creatorId !== where.creatorId) return false;
+    }
     if (where.customOrderId !== undefined && row.customOrderId !== where.customOrderId) return false;
     if (where.telegramMessageIds?.hasSome) {
       const ids = new Set((row.telegramMessageIds || []).map(Number));
@@ -48,6 +62,34 @@ function fakeDb(seed = {}) {
       async findFirst({ where }) {
         const row = creators.find((candidate) => candidate.agencyId === where.agencyId && candidate.id === where.id && !candidate.deletedAt);
         return clone(row || null);
+      },
+      async findMany({ where, take = 10000 }) {
+        return creators.filter((candidate) => {
+          if (candidate.agencyId !== where.agencyId || candidate.deletedAt) return false;
+          if (where.id?.in && !where.id.in.includes(candidate.id)) return false;
+          if (where.telegramContact?.not === null && !candidate.telegramContact) return false;
+          if (where.customsVaultFolderId?.not === null && !candidate.customsVaultFolderId) return false;
+          if (where.telegramAccountId?.in && !where.telegramAccountId.in.includes(candidate.telegramAccountId)) return false;
+          return true;
+        }).slice(0, take).map(clone);
+      },
+    },
+    agencyTelegramMtprotoAccount: {
+      async findMany({ where, take = 100 }) {
+        return telegramAccounts.filter((row) => {
+          if (row.agencyId !== where.agencyId) return false;
+          if (where.id?.in && !where.id.in.includes(row.id)) return false;
+          if (where.runtimeClaimedByDeviceId !== undefined && row.runtimeClaimedByDeviceId !== where.runtimeClaimedByDeviceId) return false;
+          if (where.runtimeClaimUntil?.gt && !(new Date(row.runtimeClaimUntil).getTime() > new Date(where.runtimeClaimUntil.gt).getTime())) return false;
+          return true;
+        }).slice(0, take).map(clone);
+      },
+    },
+    workspaceSetting: {
+      async findUnique({ where }) {
+        const key = where.agencyId_key?.key;
+        if (!workspaceSettings.has(key)) return null;
+        return { value: workspaceSettings.get(key) };
       },
     },
     customOrder: {
@@ -70,12 +112,19 @@ function fakeDb(seed = {}) {
         Object.assign(row, clone(data), { updatedAt: new Date("2026-08-21T13:00:00.000Z") });
         return clone(row);
       },
-      async findMany({ where, take, skip }) {
+      async findMany({ where, take = 100, skip = 0, orderBy = [] }) {
+        const direction = Array.isArray(orderBy) && orderBy[0]?.receivedAt === "asc" ? 1 : -1;
         return submissions.filter((row) => matchesSubmission(row, where))
-          .sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt))
+          .sort((a, b) => direction * (new Date(a.receivedAt) - new Date(b.receivedAt)))
           .slice(skip, skip + take).map(clone);
       },
       async count({ where }) { return submissions.filter((row) => matchesSubmission(row, where)).length; },
+      async updateMany({ where, data }) {
+        const row = submissions.find((candidate) => candidate.id === where.id && candidate.agencyId === where.agencyId && (!where.updatedAt || new Date(candidate.updatedAt).getTime() === new Date(where.updatedAt).getTime()));
+        if (!row) return { count: 0 };
+        Object.assign(row, clone(data), { updatedAt: new Date(new Date(row.updatedAt).getTime() + 1000) });
+        return { count: 1 };
+      },
     },
     auditLog: { async create({ data }) { audits.push(clone(data)); return { id: `audit-${audits.length}`, ...clone(data) }; } },
   };
@@ -194,4 +243,68 @@ test("list is creator-scoped and supports compact unassigned queue", async () =>
     () => listCustomContentSubmissions({ agencyId: "agency-1", member, creatorId: "creator-2", db }),
     /do not have access/i,
   );
+});
+
+test("V20.3 upload work reuses the existing Telegram runtime lease and stores no upload claim fields", async () => {
+  const db = fakeDb({ submissions: [
+    baseSubmission({ id: "pending-a", telegramMessageIds: [501, 502], ofMediaIds: ["9001"], receivedAt: new Date("2026-08-21T09:00:00.000Z") }),
+    baseSubmission({ id: "done", telegramMessageIds: [601], ofMediaIds: ["9101"], receivedAt: new Date("2026-08-21T08:00:00.000Z") }),
+  ] });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1",
+    member,
+    deviceId: "device-1",
+    leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
+    limit: 2,
+    now: new Date("2026-08-21T13:00:00.000Z"),
+    db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].submission.id, "pending-a");
+  assert.equal(result.items[0].expectedIndex, 1);
+  assert.equal(result.items[0].telegramMessageId, "502");
+  assert.equal(result.items[0].folderId, "vault-1");
+  assert.equal(result.items[0].accountId, "tg-1");
+  assert.equal(result.items[0].recipient, "relay_model");
+
+  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
+  const block = schema.match(/model CustomContentSubmission \{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.doesNotMatch(block, /uploadClaim|claimUntil|claimedByDevice|uploadStatus/i);
+});
+
+test("V20.3 rejects stale runtime leases before exposing Telegram source work", async () => {
+  const db = fakeDb({ submissions: [baseSubmission({ telegramMessageIds: [701], ofMediaIds: [] })] });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1",
+    member,
+    deviceId: "device-1",
+    leases: [{ accountId: "tg-1", claimToken: "wrong-token" }],
+    now: new Date("2026-08-21T13:00:00.000Z"),
+    db,
+  });
+  assert.deepEqual(result.items, []);
+});
+
+test("V20.3 commits OF media ids strictly by Telegram position and exact retries are idempotent", async () => {
+  const db = fakeDb({ submissions: [baseSubmission({ telegramMessageIds: [801, 802], ofMediaIds: [] })] });
+  const first = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, mediaId: "99001", db });
+  assert.equal(first.completed, false);
+  assert.deepEqual(first.submission.ofMediaIds, ["99001"]);
+
+  const retry = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, mediaId: "99001", db });
+  assert.equal(retry.idempotent, true);
+
+  await assert.rejects(
+    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, mediaId: "99002", db }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT",
+  );
+  await assert.rejects(
+    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 2, mediaId: "99003", db }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_MEDIA_INDEX_INVALID" || error?.code === "CUSTOM_SUBMISSION_MEDIA_COMMIT_OUT_OF_ORDER",
+  );
+
+  const second = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 1, mediaId: "99002", db });
+  assert.equal(second.completed, true);
+  assert.deepEqual(second.submission.ofMediaIds, ["99001", "99002"]);
+  assert.equal(db._audits.filter((row) => row.action === "custom_content_submission.of_upload_complete").length, 1);
 });
