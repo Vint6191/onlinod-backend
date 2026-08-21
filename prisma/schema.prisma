@@ -546,7 +546,8 @@ model CustomOrder {
   agency          Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   createdByMember AgencyMember  @relation(fields: [createdByMemberId], references: [id], onDelete: Restrict)
-  contentSubmissions CustomContentSubmission[]
+  contentSubmissions   CustomContentSubmission[]
+  contentLibraryAssets CreatorMediaAsset[]
 
   @@index([agencyId, status, dueAt])
   @@index([agencyId, status, scheduledAt])
@@ -2685,11 +2686,19 @@ model MoneyAttribution {
   @@index([agencyId, locked, occurredAt])
 }
 
+enum CreatorMediaAssetSource {
+  GENERAL
+  CUSTOM
+}
+
 model CreatorMediaAsset {
   id                String   @id @default(cuid())
   agencyId          String
   creatorId         String
   mediaId           String
+  source            CreatorMediaAssetSource @default(GENERAL)
+  customOrderId     String?
+  customFullPriceCents Int?
 
   catalogActive     Boolean  @default(false)
   sortingStatus     String   @default("UNSORTED")
@@ -2731,9 +2740,11 @@ model CreatorMediaAsset {
 
   agency             Agency                          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator            CreatorAccount                  @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  customOrder        CustomOrder?                    @relation(fields: [customOrderId], references: [id], onDelete: SetNull)
   usageContributions CreatorMediaUsageContribution[]
 
   @@unique([creatorId, mediaId])
+  @@index([customOrderId])
   @@index([agencyId, creatorId, catalogActive, sortingStatus, lastSeenAt])
   @@index([creatorId, catalogActive, sentCount, lastSeenAt])
   @@index([creatorId, catalogActive, revenueCents])

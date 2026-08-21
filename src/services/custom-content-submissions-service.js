@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
+const { syncFinalizedSubmissionAssignment } = require("./custom-content-library-service");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
@@ -229,7 +230,7 @@ async function listCustomContentSubmissions({ agencyId, member, creatorId, custo
   return { ok: true, items: rows.map(serializeSubmission), count, nextOffset: skip + rows.length, hasMore: skip + rows.length < count };
 }
 
-async function assignCustomContentSubmission({ agencyId, member, submissionId, customOrderId, db = null } = {}) {
+async function assignCustomContentSubmission({ agencyId, member, submissionId, customOrderId, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const normalizedSubmissionId = identifier(submissionId, "submissionId", { max: 180 });
@@ -251,6 +252,13 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
     metadata: { creatorId: row.creatorId, fromCustomOrderId: row.customOrderId || null, toCustomOrderId: normalizedOrderId },
     db: client,
   });
+  if (Array.isArray(updated.telegramMessageIds) && updated.telegramMessageIds.length > 0
+      && ofMediaIds(updated.ofMediaIds).length === updated.telegramMessageIds.length) {
+    // Best-effort immediate provenance refresh for already-finalized submissions.
+    // If it cannot run now, pendingFinalizeRows notices the mismatch and the
+    // existing Desktop execution loop heals it without losing the assignment.
+    await syncFinalizedSubmissionAssignment({ agencyId, member, submissionId: updated.id, now, db: client }).catch(() => undefined);
+  }
   return { ok: true, unchanged: false, submission: serializeSubmission(updated) };
 }
 
@@ -279,6 +287,83 @@ async function pendingUploadRows({ agencyId, creatorIds, limit, db }) {
     skip: 0,
   });
   return rows.filter((row) => nextUploadIndex(row) !== null).slice(0, take);
+}
+
+
+async function pendingFinalizeRows({ agencyId, creatorIds, limit, db }) {
+  const ids = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map(String).filter(Boolean)));
+  if (!ids.length) return [];
+  const take = Math.max(limit, Math.min(50, limit * 4));
+  if (typeof db.$queryRawUnsafe === "function") {
+    const placeholders = ids.map((_, index) => `$${index + 2}`).join(",");
+    return db.$queryRawUnsafe(
+      `SELECT submission."id", submission."agencyId", submission."creatorId", submission."customOrderId",
+              submission."telegramMessageIds", submission."ofMediaIds", submission."comment",
+              submission."receivedAt", submission."createdAt", submission."updatedAt"
+       FROM "CustomContentSubmission" AS submission
+       LEFT JOIN "CustomOrder" AS custom_order ON custom_order."id" = submission."customOrderId"
+       WHERE submission."agencyId" = $1
+         AND submission."creatorId" IN (${placeholders})
+         AND cardinality(submission."telegramMessageIds") > 0
+         AND cardinality(submission."ofMediaIds") = cardinality(submission."telegramMessageIds")
+         AND EXISTS (
+           SELECT 1
+           FROM unnest(submission."ofMediaIds") AS media_id
+           WHERE NOT EXISTS (
+             SELECT 1
+             FROM "CreatorMediaAsset" AS asset
+             WHERE asset."agencyId" = submission."agencyId"
+               AND asset."creatorId" = submission."creatorId"
+               AND asset."mediaId" = media_id
+               AND asset."source" = 'CUSTOM'
+               AND asset."customOrderId" IS NOT DISTINCT FROM submission."customOrderId"
+               AND (
+                 (submission."customOrderId" IS NULL AND asset."customFullPriceCents" IS NULL)
+                 OR
+                 (submission."customOrderId" IS NOT NULL AND asset."customFullPriceCents" = custom_order."priceCents")
+               )
+           )
+         )
+       ORDER BY submission."receivedAt" ASC, submission."createdAt" ASC
+       LIMIT ${take}`,
+      agencyId,
+      ...ids,
+    );
+  }
+
+  const candidates = await db.customContentSubmission.findMany({
+    where: { agencyId, creatorId: { in: ids } },
+    orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }],
+    take: Math.max(200, take * 20),
+    skip: 0,
+  });
+  const out = [];
+  for (const row of candidates) {
+    const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
+    const mediaIds = ofMediaIds(row.ofMediaIds);
+    if (!telegramIds.length || mediaIds.length !== telegramIds.length) continue;
+    let priceCents = null;
+    if (row.customOrderId) {
+      const order = await db.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, creatorId: row.creatorId }, select: { priceCents: true } });
+      priceCents = order ? Math.max(0, Math.round(Number(order.priceCents) || 0)) : null;
+    }
+    const assets = await db.creatorMediaAsset.findMany({
+      where: { agencyId, creatorId: row.creatorId, mediaId: { in: mediaIds }, source: "CUSTOM" },
+      take: mediaIds.length,
+    });
+    const byMediaId = new Map(assets.map((asset) => [String(asset.mediaId), asset]));
+    const finalized = mediaIds.every((mediaId) => {
+      const asset = byMediaId.get(mediaId);
+      if (!asset) return false;
+      if ((asset.customOrderId || null) !== (row.customOrderId || null)) return false;
+      return row.customOrderId
+        ? Number(asset.customFullPriceCents) === priceCents
+        : asset.customFullPriceCents == null;
+    });
+    if (!finalized) out.push(row);
+    if (out.length >= take) break;
+  }
+  return out;
 }
 
 /**
@@ -352,9 +437,9 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
   }
   if (!creatorById.size) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
 
-  const rows = await pendingUploadRows({ agencyId, creatorIds: [...creatorById.keys()], limit: take, db: client });
+  const uploadRows = await pendingUploadRows({ agencyId, creatorIds: [...creatorById.keys()], limit: take, db: client });
   const items = [];
-  for (const row of rows) {
+  for (const row of uploadRows) {
     if (items.length >= take) break;
     const creator = creatorById.get(String(row.creatorId));
     const index = nextUploadIndex(row);
@@ -362,6 +447,7 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
     const messageId = Number(row.telegramMessageIds?.[index]);
     if (!Number.isInteger(messageId) || messageId <= 0) continue;
     items.push({
+      kind: "UPLOAD_MEDIA",
       submission: serializeSubmission(row),
       creatorId: String(row.creatorId),
       accountId: creator.accountId,
@@ -371,6 +457,26 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
       expectedIndex: index,
       telegramMessageId: String(messageId),
     });
+  }
+
+  if (items.length < take) {
+    const finalizeRows = await pendingFinalizeRows({ agencyId, creatorIds: [...creatorById.keys()], limit: take - items.length, db: client });
+    for (const row of finalizeRows) {
+      if (items.length >= take) break;
+      const creator = creatorById.get(String(row.creatorId));
+      if (!creator) continue;
+      items.push({
+        kind: "FINALIZE_LIBRARY",
+        submission: serializeSubmission(row),
+        creatorId: String(row.creatorId),
+        accountId: creator.accountId,
+        creatorUsername: creator.username || null,
+        folderId: String(creator.customsVaultFolderId),
+        recipient,
+        expectedIndex: null,
+        telegramMessageId: null,
+      });
+    }
   }
   return { ok: true, items, blocked: null, serverNow: new Date(now).toISOString() };
 }
@@ -442,6 +548,7 @@ module.exports = {
   deterministicSubmissionId,
   listCustomContentSubmissions,
   nextUploadIndex,
+  pendingFinalizeRows,
   sameMessageIds,
   serializeSubmission,
   telegramMessageIds,

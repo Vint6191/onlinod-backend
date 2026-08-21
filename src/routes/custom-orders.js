@@ -20,6 +20,7 @@ const {
   createCustomContentSubmission,
   listCustomContentSubmissions,
 } = require("../services/custom-content-submissions-service");
+const { finalizeCustomContentSubmissionLibrary } = require("../services/custom-content-library-service");
 const {
   claimDueReminders,
   acknowledgeReminder,
@@ -114,6 +115,17 @@ router.post("/submissions/:submissionId/media-commit", async (req, res) => {
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_MEDIA_COMMIT_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/content-library-finalize", async (req, res) => {
+  try {
+    return res.json(await finalizeCustomContentSubmissionLibrary({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      submissionId: req.params.submissionId,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_LIBRARY_FINALIZE_FAILED"); }
 });
 
 router.patch("/submissions/:submissionId", async (req, res) => {

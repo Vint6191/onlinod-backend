@@ -23,11 +23,12 @@ function fakeDb(seed = {}) {
     { id: "creator-2", agencyId: "agency-1", deletedAt: null, displayName: "Model B", username: "b", status: "READY", telegramContact: "@model_b", telegramAccountId: "tg-1", customsVaultFolderId: "vault-2" },
   ]).map(clone);
   const orders = (seed.orders || [
-    { id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT" },
-    { id: "call-1", agencyId: "agency-1", creatorId: "creator-1", type: "CALL" },
-    { id: "custom-2", agencyId: "agency-1", creatorId: "creator-2", type: "CONTENT" },
+    { id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", scenario: "custom one", priceCents: 6000 },
+    { id: "call-1", agencyId: "agency-1", creatorId: "creator-1", type: "CALL", scenario: "call one", priceCents: 1000 },
+    { id: "custom-2", agencyId: "agency-1", creatorId: "creator-2", type: "CONTENT", scenario: "custom two", priceCents: 7000 },
   ]).map(clone);
   const submissions = (seed.submissions || []).map(clone);
+  const mediaAssets = (seed.mediaAssets || []).map(clone);
   const telegramAccounts = (seed.telegramAccounts || [
     { id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1", runtimeClaimUntil: new Date("2026-08-21T14:00:00.000Z") },
   ]).map(clone);
@@ -57,6 +58,7 @@ function fakeDb(seed = {}) {
 
   return {
     _submissions: submissions,
+    _mediaAssets: mediaAssets,
     _audits: audits,
     creatorAccount: {
       async findFirst({ where }) {
@@ -124,6 +126,32 @@ function fakeDb(seed = {}) {
         if (!row) return { count: 0 };
         Object.assign(row, clone(data), { updatedAt: new Date(new Date(row.updatedAt).getTime() + 1000) });
         return { count: 1 };
+      },
+    },
+    creatorMediaAsset: {
+      async findMany({ where, take = 100 }) {
+        return mediaAssets.filter((row) => {
+          if (where.agencyId !== undefined && row.agencyId !== where.agencyId) return false;
+          if (where.creatorId !== undefined && row.creatorId !== where.creatorId) return false;
+          if (where.mediaId?.in && !where.mediaId.in.includes(row.mediaId)) return false;
+          if (where.source !== undefined && row.source !== where.source) return false;
+          return true;
+        }).slice(0, take).map(clone);
+      },
+      async createMany({ data, skipDuplicates }) {
+        let count = 0;
+        for (const item of data) {
+          if (skipDuplicates && mediaAssets.some((row) => row.creatorId === item.creatorId && row.mediaId === item.mediaId)) continue;
+          mediaAssets.push({ ...clone(item), metadataUpdatedAt: null, folderIds: item.folderIds || [], createdAt: new Date(), updatedAt: new Date() });
+          count += 1;
+        }
+        return { count };
+      },
+      async update({ where, data }) {
+        const row = mediaAssets.find((candidate) => candidate.id === where.id);
+        if (!row) throw new Error("asset not found");
+        Object.assign(row, clone(data));
+        return clone(row);
       },
     },
     auditLog: { async create({ data }) { audits.push(clone(data)); return { id: `audit-${audits.length}`, ...clone(data) }; } },
@@ -249,7 +277,7 @@ test("V20.3 upload work reuses the existing Telegram runtime lease and stores no
   const db = fakeDb({ submissions: [
     baseSubmission({ id: "pending-a", telegramMessageIds: [501, 502], ofMediaIds: ["9001"], receivedAt: new Date("2026-08-21T09:00:00.000Z") }),
     baseSubmission({ id: "done", telegramMessageIds: [601], ofMediaIds: ["9101"], receivedAt: new Date("2026-08-21T08:00:00.000Z") }),
-  ] });
+  ], mediaAssets: [{ id: "asset-done", agencyId: "agency-1", creatorId: "creator-1", mediaId: "9101", source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000, catalogActive: true, folderIds: ["vault-1"], sortingStatus: "SORTED", metadataUpdatedAt: null, description: "custom one", idealPriceCents: 6000, accessType: "paid" }] });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1",
     member,
@@ -261,6 +289,7 @@ test("V20.3 upload work reuses the existing Telegram runtime lease and stores no
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].submission.id, "pending-a");
+  assert.equal(result.items[0].kind, "UPLOAD_MEDIA");
   assert.equal(result.items[0].expectedIndex, 1);
   assert.equal(result.items[0].telegramMessageId, "502");
   assert.equal(result.items[0].folderId, "vault-1");
@@ -307,4 +336,43 @@ test("V20.3 commits OF media ids strictly by Telegram position and exact retries
   assert.equal(second.completed, true);
   assert.deepEqual(second.submission.ofMediaIds, ["99001", "99002"]);
   assert.equal(db._audits.filter((row) => row.action === "custom_content_submission.of_upload_complete").length, 1);
+});
+
+
+test("V20.4 returns complete-but-not-finalized submissions as move-only library recovery work", async () => {
+  const db = fakeDb({ submissions: [
+    baseSubmission({ id: "crash-window", telegramMessageIds: [901, 902], ofMediaIds: ["99001", "99002"] }),
+  ] });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1",
+    member,
+    deviceId: "device-1",
+    leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
+    limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"),
+    db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
+  assert.equal(result.items[0].submission.id, "crash-window");
+  assert.equal(result.items[0].expectedIndex, null);
+  assert.equal(result.items[0].telegramMessageId, null);
+});
+
+test("V20.4 does not requeue a submission whose typed Content Library provenance is finalized", async () => {
+  const db = fakeDb({
+    submissions: [baseSubmission({ id: "finalized", telegramMessageIds: [911], ofMediaIds: ["99111"] })],
+    mediaAssets: [{
+      id: "asset-finalized", agencyId: "agency-1", creatorId: "creator-1", mediaId: "99111",
+      source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000,
+      catalogActive: true, folderIds: ["vault-1"], sortingStatus: "SORTED",
+      metadataUpdatedAt: null, description: "custom one", idealPriceCents: 6000, accessType: "paid",
+    }],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1",
+    leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.deepEqual(result.items, []);
 });
