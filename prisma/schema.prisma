@@ -406,6 +406,7 @@ model CreatorAccount {
   telegramContact   String?
   telegramUserId    String?
   telegramAccountId String?
+  customsVaultFolderId String?
   deletedAt   DateTime?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt

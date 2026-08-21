@@ -23,6 +23,10 @@ const {
   acknowledgeReminder,
   releaseReminderClaim,
 } = require("../services/custom-order-reminders");
+const {
+  getCustomVaultDestination,
+  setCustomVaultDestination,
+} = require("../services/custom-vault-destination-service");
 
 const router = express.Router();
 function bool(value) { return value === true || value === "1" || String(value || "").toLowerCase() === "true"; }
@@ -36,6 +40,21 @@ router.get("/", async (req, res) => {
     const result = await listCustomOrders({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, creatorId: req.query.creatorId || null, dialogId: req.query.dialogId || null, status: req.query.status || null, pendingOnly: bool(req.query.pendingOnly), limit: req.query.limit, offset: req.query.offset, db: prisma });
     return res.json(result);
   } catch (err) { return sendError(res, err, "CUSTOM_ORDERS_LIST_FAILED"); }
+});
+
+router.get("/vault-destination", async (req, res) => {
+  try {
+    return res.json(await getCustomVaultDestination({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, creatorId: req.query.creatorId, db: prisma }));
+  } catch (err) { return sendError(res, err, "CUSTOM_VAULT_DESTINATION_GET_FAILED"); }
+});
+
+router.patch("/vault-destination", async (req, res) => {
+  try {
+    if (!Object.prototype.hasOwnProperty.call(req.body || {}, "folderId")) {
+      throw Object.assign(new Error("folderId is required; use null to clear"), { code: "CUSTOM_VAULT_DESTINATION_PATCH_INVALID", status: 400 });
+    }
+    return res.json(await setCustomVaultDestination({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, creatorId: req.body?.creatorId, folderId: req.body?.folderId, db: prisma }));
+  } catch (err) { return sendError(res, err, "CUSTOM_VAULT_DESTINATION_UPDATE_FAILED"); }
 });
 
 router.post("/", async (req, res) => {
