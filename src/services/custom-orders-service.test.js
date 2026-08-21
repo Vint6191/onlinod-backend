@@ -2,12 +2,15 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const {
   buildUpdateData,
   createCustomOrder,
   listCustomOrders,
   mediaIdsArray,
   normalizeCreateInput,
+  paymentSnapshot,
   serializeOrder,
   updateCustomOrder,
   recordTelegramDelivery,
@@ -170,6 +173,78 @@ test("custom order create is creator-scoped and starts pending", async () => {
   assert.equal("creatorId" in result.order, false);
   assert.equal("createdByMemberId" in result.order, false);
   await assert.rejects(() => createCustomOrder({ agencyId: "agency-1", member, input: { creatorId: "creator-2", dialogId: "1", scenario: "x" }, db }), /do not have access/i);
+});
+
+
+test("custom payment amounts use integer cents and derive status/remaining instead of persisting flags", async () => {
+  assert.deepEqual(paymentSnapshot(6000, 0), { paidAmountCents: 0, paidAmount: 0, remainingAmountCents: 6000, remainingAmount: 60, paymentStatus: "NOT_PAID" });
+  assert.deepEqual(paymentSnapshot(6000, 4000), { paidAmountCents: 4000, paidAmount: 40, remainingAmountCents: 2000, remainingAmount: 20, paymentStatus: "PARTIALLY_PAID" });
+  assert.deepEqual(paymentSnapshot(6000, 7000), { paidAmountCents: 7000, paidAmount: 70, remainingAmountCents: 0, remainingAmount: 0, paymentStatus: "PAID_IN_FULL" });
+
+  const db = fakeDb();
+  const result = await createCustomOrder({
+    agencyId: "agency-1", member,
+    input: { creatorId: "creator-1", dialogId: "422411209", scenario: "paid in parts", price: 60, paidAmount: 40 },
+    db,
+  });
+  assert.equal(result.order.priceCents, 6000);
+  assert.equal(result.order.paidAmountCents, 4000);
+  assert.equal(result.order.paidAmount, 40);
+  assert.equal(result.order.remainingAmountCents, 2000);
+  assert.equal(result.order.remainingAmount, 20);
+  assert.equal(result.order.paymentStatus, "PARTIALLY_PAID");
+  assert.equal("remainingAmountCents" in db._rows[0], false, "remaining amount must be derived, not stored");
+  assert.equal("paymentStatus" in db._rows[0], false, "payment status must be derived, not stored");
+});
+
+test("editing total or paid amount deterministically recomputes payment state and preserves overpayment", async () => {
+  const db = fakeDb({ orders: [{
+    id: "order-pay", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "payment", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING", dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null,
+    acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 6000, paidAmountCents: 4000,
+    telegramTaskMessageId: null, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
+    createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:00:00.000Z"),
+  }] });
+  const raised = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-pay", input: { price: 100 }, db });
+  assert.equal(raised.order.paidAmount, 40);
+  assert.equal(raised.order.remainingAmount, 60);
+  assert.equal(raised.order.paymentStatus, "PARTIALLY_PAID");
+
+  const overpaid = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-pay", input: { paidAmount: 120 }, db });
+  assert.equal(overpaid.order.paidAmount, 120);
+  assert.equal(overpaid.order.remainingAmount, 0);
+  assert.equal(overpaid.order.paymentStatus, "PAID_IN_FULL");
+});
+
+test("paid amount can be corrected after finalization without reopening immutable production fields", async () => {
+  const db = fakeDb({ orders: [{
+    id: "order-final-pay", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "done", internalNote: null,
+    type: "CONTENT", contentKind: "PHOTO", status: "COMPLETED", dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null,
+    completedAt: new Date("2026-08-21T10:30:00.000Z"), deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "44", priceCents: 6000, paidAmountCents: 2000,
+    telegramTaskMessageId: null, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
+    createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:30:00.000Z"),
+  }] });
+  const corrected = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-final-pay", input: { paidAmount: 60 }, db });
+  assert.equal(corrected.order.status, "COMPLETED");
+  assert.equal(corrected.order.paymentStatus, "PAID_IN_FULL");
+  assert.equal(corrected.order.remainingAmount, 0);
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-final-pay", input: { price: 80 } , db }),
+    (error) => error?.code === "CUSTOM_ORDER_ALREADY_FINALIZED" && error?.status === 409,
+  );
+});
+
+test("payment validation fails closed and migration backfills old rows to zero", () => {
+  assert.throws(() => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmount: -1 }), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_INVALID");
+  assert.throws(() => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmountCents: 2_147_483_648 }), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_TOO_LARGE");
+  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821113000_custom_order_payment_foundation/migration.sql"), "utf8");
+  assert.match(schema, /model CustomOrder[\s\S]*paidAmountCents\s+Int\s+@default\(0\)/);
+  assert.doesNotMatch(schema, /paymentStatus\s+/);
+  assert.doesNotMatch(schema, /remainingAmountCents\s+/);
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS "paidAmountCents" INTEGER/);
+  assert.match(migration, /WHERE "paidAmountCents" IS NULL OR "paidAmountCents" < 0/);
+  assert.match(migration, /ALTER COLUMN "paidAmountCents" SET NOT NULL/);
 });
 
 test("completed/cancelled transitions own their timestamps and cancellation requires reason", () => {

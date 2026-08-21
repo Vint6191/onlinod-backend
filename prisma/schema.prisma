@@ -526,6 +526,7 @@ model CustomOrder {
   cancelReason                String?
   mediaIds                    String                    @default("")
   priceCents                  Int                       @default(0)
+  paidAmountCents             Int                       @default(0)
   telegramTaskMessageId       Int?
   telegramReferenceMessageIds Int[]                     @default([])
   telegramLastModelMessageId  Int?

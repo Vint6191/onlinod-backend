@@ -15,6 +15,7 @@ const CUSTOM_ORDER_STATUSES = Object.freeze(["PENDING", "COMPLETED", "MISSED", "
 const CUSTOM_ORDER_TYPES = Object.freeze(["CONTENT", "CALL", "PHYSICAL"]);
 const CUSTOM_ORDER_CONTENT_KINDS = Object.freeze(["PHOTO", "VIDEO", "BOTH"]);
 const CUSTOM_ORDER_PHYSICAL_STATUSES = Object.freeze(["WAITING", "READY", "SHIPPED", "COMPLETED"]);
+const CUSTOM_ORDER_PAYMENT_STATUSES = Object.freeze(["NOT_PAID", "PARTIALLY_PAID", "PAID_IN_FULL"]);
 const STATUS_SET = new Set(CUSTOM_ORDER_STATUSES);
 const TYPE_SET = new Set(CUSTOM_ORDER_TYPES);
 const CONTENT_KIND_SET = new Set(CUSTOM_ORDER_CONTENT_KINDS);
@@ -96,6 +97,33 @@ function normalizePriceCents(input, fallback = 0) {
   }
   return fallback;
 }
+function normalizePaidAmountCents(input, fallback = 0) {
+  if (input?.paidAmountCents !== undefined) {
+    const value = Number(input.paidAmountCents);
+    if (!Number.isFinite(value) || value < 0) throw fail("CUSTOM_ORDER_PAID_AMOUNT_INVALID", "paidAmountCents must be a non-negative number");
+    const cents = Math.round(value);
+    if (cents > MAX_PRICE_CENTS) throw fail("CUSTOM_ORDER_PAID_AMOUNT_TOO_LARGE", "paidAmountCents exceeds storage limit");
+    return cents;
+  }
+  if (input?.paidAmount !== undefined) {
+    const value = Number(input.paidAmount);
+    if (!Number.isFinite(value) || value < 0) throw fail("CUSTOM_ORDER_PAID_AMOUNT_INVALID", "paidAmount must be a non-negative number");
+    const cents = Math.round(value * 100);
+    if (cents > MAX_PRICE_CENTS) throw fail("CUSTOM_ORDER_PAID_AMOUNT_TOO_LARGE", "paidAmount exceeds storage limit");
+    return cents;
+  }
+  return Math.max(0, Math.round(Number(fallback) || 0));
+}
+function paymentSnapshot(priceCents, paidAmountCents) {
+  const total = Math.max(0, Math.round(Number(priceCents) || 0));
+  const paid = Math.max(0, Math.round(Number(paidAmountCents) || 0));
+  const remaining = Math.max(total - paid, 0);
+  const paymentStatus = paid <= 0 ? "NOT_PAID" : paid < total ? "PARTIALLY_PAID" : "PAID_IN_FULL";
+  return {
+    paidAmountCents: paid, paidAmount: paid / 100,
+    remainingAmountCents: remaining, remainingAmount: remaining / 100, paymentStatus,
+  };
+}
 function normalizeMediaIds(value, { strict = false } = {}) {
   const raw = Array.isArray(value) ? value : String(value == null ? "" : value).split(/[\s,;]+/g);
   const ids = []; const seen = new Set();
@@ -159,6 +187,7 @@ function serializeOrder(row, now = new Date()) {
     cancelReason: row.cancelReason || null,
     mediaIds: mediaIdsArray(row.mediaIds),
     priceCents: Math.max(0, Number(row.priceCents || 0)), price: Math.max(0, Number(row.priceCents || 0)) / 100,
+    ...paymentSnapshot(row.priceCents, row.paidAmountCents),
     telegramTaskMessageId: row.telegramTaskMessageId == null ? null : String(row.telegramTaskMessageId),
     telegramReferenceMessageIds: Array.isArray(row.telegramReferenceMessageIds) ? row.telegramReferenceMessageIds.map(String) : [],
     telegramLastModelMessageId: row.telegramLastModelMessageId == null ? null : String(row.telegramLastModelMessageId),
@@ -213,7 +242,7 @@ function normalizeCreateInput(input = {}) {
     scheduledAt: type === "CALL" ? parseIso(input.scheduledAt, "scheduledAt", { allowNull: false }) : null,
     durationMinutes: type === "CALL" ? normalizeDuration(input.durationMinutes) : null,
     physicalStatus: type === "PHYSICAL" ? normalizePhysicalStatus(input.physicalStatus || "WAITING") : null,
-    mediaIds: mediaIdsString(input.mediaIds), priceCents: normalizePriceCents(input, 0),
+    mediaIds: mediaIdsString(input.mediaIds), priceCents: normalizePriceCents(input, 0), paidAmountCents: normalizePaidAmountCents(input, 0),
     reminderConfig: input.reminderConfig === undefined ? null : normalizeReminderOverride(type, input.reminderConfig),
   };
   return data;
@@ -226,8 +255,9 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
   const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
   const seed = { ...data, status: "PENDING", createdAt: now, lastReminderAt: null, lastReminderKey: null };
   const nextReminderAt = nextReminderForOrder(seed, workspacePolicy, now).at;
-  const row = await client.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, mediaIds: data.mediaIds, priceCents: data.priceCents, reminderConfig: data.reminderConfig, nextReminderAt }, include: ORDER_INCLUDE });
-  await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.create", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, priceCents: row.priceCents }, db: client });
+  const row = await client.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt }, include: ORDER_INCLUDE });
+  const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
+  await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.create", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, priceCents: row.priceCents, paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
   return { ok: true, order: serializeOrder(row, now) };
 }
 
@@ -257,6 +287,7 @@ function buildUpdateData(current, input = {}, now = new Date()) {
   }
   if (input.mediaIds !== undefined) patch.mediaIds = mediaIdsString(input.mediaIds);
   if (input.price !== undefined || input.priceCents !== undefined) patch.priceCents = normalizePriceCents(input, current.priceCents || 0);
+  if (input.paidAmount !== undefined || input.paidAmountCents !== undefined) patch.paidAmountCents = normalizePaidAmountCents(input, current.paidAmountCents || 0);
   if (input.acceptedAt !== undefined) patch.acceptedAt = parseIso(input.acceptedAt, "acceptedAt");
   if (input.reminderConfig !== undefined) patch.reminderConfig = input.reminderConfig === null ? null : normalizeReminderOverride(nextType, input.reminderConfig);
 
@@ -284,7 +315,27 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
   const client = db || require("../prisma"); const current = await loadOwnedOrder({ agencyId, member, orderId, db: client });
   const expectedCreatorId = optionalIdentifier(input?.creatorId, "creatorId", 100); if (expectedCreatorId && expectedCreatorId !== String(current.creatorId)) throw fail("CUSTOM_ORDER_CREATOR_MISMATCH", "Custom order does not belong to the requested creator", 404);
   const currentStatus = normalizeStatus(current.status); const requestedStatus = input?.status === undefined ? null : normalizeStatus(input.status);
-  if (currentStatus !== "PENDING") { if (requestedStatus === currentStatus) return { ok: true, order: serializeOrder(current, now) }; throw fail("CUSTOM_ORDER_ALREADY_FINALIZED", "Completed, missed or cancelled custom orders cannot be changed", 409); }
+  const paymentMutation = input?.paidAmount !== undefined || input?.paidAmountCents !== undefined;
+
+  if (currentStatus !== "PENDING") {
+    const nonFinancialFields = ["scenario", "internalNote", "type", "contentKind", "dueAt", "scheduledAt", "durationMinutes", "physicalStatus", "acceptedAt", "cancelReason", "mediaIds", "price", "priceCents", "reminderConfig"]
+      .filter((key) => input?.[key] !== undefined);
+    if (requestedStatus && requestedStatus !== currentStatus) throw fail("CUSTOM_ORDER_ALREADY_FINALIZED", "Completed, missed or cancelled custom orders cannot change production status", 409);
+    // Preserve the old idempotent finalization contract: retrying the same terminal
+    // status is a no-op even if the stale client repeats its final payload.
+    if (requestedStatus === currentStatus && !paymentMutation) return { ok: true, order: serializeOrder(current, now) };
+    if (nonFinancialFields.length) throw fail("CUSTOM_ORDER_ALREADY_FINALIZED", "Completed, missed or cancelled custom orders cannot change production details", 409);
+    if (!paymentMutation) return { ok: true, order: serializeOrder(current, now) };
+
+    const paidAmountCents = normalizePaidAmountCents(input, current.paidAmountCents || 0);
+    const changed = await client.customOrder.updateMany({ where: { id: current.id, agencyId, status: currentStatus, updatedAt: current.updatedAt }, data: { paidAmountCents } });
+    if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_ORDER_CONFLICT", "Custom order changed while this payment update was being applied; refresh and try again", 409);
+    const row = await client.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE }); if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found after payment update", 404);
+    const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
+    await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.payment_update", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, status: row.status, priceCents: row.priceCents, previousPaidAmountCents: Math.max(0, Number(current.paidAmountCents || 0)), paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
+    return { ok: true, order: serializeOrder(row, now) };
+  }
+
   const patch = buildUpdateData(current, input || {}, now);
   const prospective = { ...current, ...patch };
   if (normalizeStatus(prospective.status) === "PENDING") {
@@ -302,7 +353,8 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
   const changed = await client.customOrder.updateMany({ where: { id: current.id, agencyId, status: "PENDING", updatedAt: current.updatedAt }, data: patch });
   if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_ORDER_CONFLICT", "Custom order changed while this update was being applied; refresh and try again", 409);
   const row = await client.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE }); if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found after update", 404);
-  await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.update", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, previousStatus: current.status, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, physicalStatus: row.physicalStatus, priceCents: row.priceCents }, db: client });
+  const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
+  await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.update", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, previousStatus: current.status, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, physicalStatus: row.physicalStatus, priceCents: row.priceCents, previousPaidAmountCents: Math.max(0, Number(current.paidAmountCents || 0)), paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
   return { ok: true, order: serializeOrder(row, now) };
 }
 
@@ -419,8 +471,8 @@ async function prepareTelegramStatusNotification({ agencyId, member, orderId, db
 }
 
 module.exports = {
-  CUSTOM_ORDER_STATUSES, CUSTOM_ORDER_TYPES, CUSTOM_ORDER_CONTENT_KINDS, CUSTOM_ORDER_PHYSICAL_STATUSES,
-  buildUpdateData, createCustomOrder, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString,
-  normalizeCreateInput, normalizeStatus, normalizeType, serializeOrder, updateCustomOrder,
+  CUSTOM_ORDER_STATUSES, CUSTOM_ORDER_TYPES, CUSTOM_ORDER_CONTENT_KINDS, CUSTOM_ORDER_PHYSICAL_STATUSES, CUSTOM_ORDER_PAYMENT_STATUSES,
+  buildUpdateData, createCustomOrder, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString, paymentSnapshot,
+  normalizeCreateInput, normalizePaidAmountCents, normalizeStatus, normalizeType, serializeOrder, updateCustomOrder,
   recordTelegramDelivery, prepareTelegramTask, prepareManualReminder, recordManualReminder, recordTelegramInboundReply, prepareTelegramStatusNotification,
 };
