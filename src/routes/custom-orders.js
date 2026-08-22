@@ -37,6 +37,7 @@ const {
   getCustomVaultDestination,
   setCustomVaultDestination,
 } = require("../services/custom-vault-destination-service");
+const { listCustomNonContentOperations } = require("../services/custom-noncontent-operations-service");
 const { listCustomReadyDeliveries, getCustomReadyDelivery } = require("../services/custom-content-delivery-service");
 const { recordCustomDeliverySend } = require("../services/custom-content-delivery-tracking-service");
 
@@ -52,6 +53,18 @@ router.get("/", async (req, res) => {
     const result = await listCustomOrders({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, creatorId: req.query.creatorId || null, dialogId: req.query.dialogId || null, status: req.query.status || null, pendingOnly: bool(req.query.pendingOnly), limit: req.query.limit, offset: req.query.offset, db: prisma });
     return res.json(result);
   } catch (err) { return sendError(res, err, "CUSTOM_ORDERS_LIST_FAILED"); }
+});
+
+router.get("/operations/non-content", async (req, res) => {
+  try {
+    return res.json(await listCustomNonContentOperations({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      horizonHours: req.query.horizonHours,
+      limit: req.query.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_NONCONTENT_OPERATIONS_FAILED"); }
 });
 
 router.get("/vault-destination", async (req, res) => {

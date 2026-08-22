@@ -124,6 +124,19 @@ function paymentSnapshot(priceCents, paidAmountCents) {
     remainingAmountCents: remaining, remainingAmount: remaining / 100, paymentStatus,
   };
 }
+function callPhaseSnapshot(row, now = new Date()) {
+  const scheduledAt = row?.scheduledAt ? new Date(row.scheduledAt) : null;
+  if (!scheduledAt || !Number.isFinite(scheduledAt.getTime())) return { callEndAt: null, callPhase: null, callSecondsToStart: null, callSecondsSinceEnd: null };
+  const durationMinutes = Math.max(1, Math.min(1440, Math.round(Number(row?.durationMinutes) || 1)));
+  const endAt = new Date(scheduledAt.getTime() + durationMinutes * 60_000);
+  if (String(row?.status || "PENDING").toUpperCase() !== "PENDING") {
+    return { callEndAt: endAt, callPhase: null, callSecondsToStart: null, callSecondsSinceEnd: null };
+  }
+  const nowMs = now.getTime();
+  if (nowMs < scheduledAt.getTime()) return { callEndAt: endAt, callPhase: "UPCOMING", callSecondsToStart: Math.ceil((scheduledAt.getTime() - nowMs) / 1000), callSecondsSinceEnd: null };
+  if (nowMs < endAt.getTime()) return { callEndAt: endAt, callPhase: "DUE", callSecondsToStart: 0, callSecondsSinceEnd: null };
+  return { callEndAt: endAt, callPhase: "OVERDUE", callSecondsToStart: null, callSecondsSinceEnd: Math.max(0, Math.floor((nowMs - endAt.getTime()) / 1000)) };
+}
 function normalizeMediaIds(value, { strict = false } = {}) {
   const raw = Array.isArray(value) ? value : String(value == null ? "" : value).split(/[\s,;]+/g);
   const ids = []; const seen = new Set();
@@ -169,8 +182,18 @@ function serializeOrder(row, now = new Date()) {
   const scheduledAt = row.scheduledAt ? new Date(row.scheduledAt) : null;
   const status = normalizeStatus(row.status);
   const type = normalizeType(row.type || "CONTENT");
-  const relevantAt = type === "CALL" ? scheduledAt : type === "CONTENT" ? dueAt : null;
-  const dueMs = relevantAt && Number.isFinite(relevantAt.getTime()) ? relevantAt.getTime() - now.getTime() : null;
+  const call = type === "CALL" ? callPhaseSnapshot(row, now) : { callEndAt: null, callPhase: null, callSecondsToStart: null, callSecondsSinceEnd: null };
+  const contentDueMs = type === "CONTENT" && dueAt && Number.isFinite(dueAt.getTime()) ? dueAt.getTime() - now.getTime() : null;
+  const callDueMs = type === "CALL" && scheduledAt && Number.isFinite(scheduledAt.getTime()) ? scheduledAt.getTime() - now.getTime() : null;
+  const dueMs = type === "CALL" ? callDueMs : contentDueMs;
+  const physicalStatusChangedAt = type === "PHYSICAL" && row.physicalStatusChangedAt ? new Date(row.physicalStatusChangedAt) : null;
+  const physicalStatusAgeSeconds = physicalStatusChangedAt && Number.isFinite(physicalStatusChangedAt.getTime())
+    ? Math.max(0, Math.floor((now.getTime() - physicalStatusChangedAt.getTime()) / 1000))
+    : null;
+  const isOverdue = status === "PENDING" && (type === "CONTENT" ? contentDueMs !== null && contentDueMs < 0 : type === "CALL" ? call.callPhase === "OVERDUE" : false);
+  const isDueSoon = status === "PENDING" && (type === "CONTENT"
+    ? contentDueMs !== null && contentDueMs >= 0 && contentDueMs <= DUE_SOON_MS
+    : type === "CALL" ? call.callPhase === "DUE" || (call.callPhase === "UPCOMING" && callDueMs !== null && callDueMs <= DUE_SOON_MS) : false);
   return {
     id: String(row.id), dialogId: String(row.dialogId), scenario: String(row.scenario || ""), internalNote: row.internalNote || null,
     type,
@@ -179,7 +202,13 @@ function serializeOrder(row, now = new Date()) {
     dueAt: dueAt ? dueAt.toISOString() : null,
     scheduledAt: scheduledAt ? scheduledAt.toISOString() : null,
     durationMinutes: row.durationMinutes == null ? null : Number(row.durationMinutes),
+    callEndAt: call.callEndAt ? call.callEndAt.toISOString() : null,
+    callPhase: call.callPhase,
+    callSecondsToStart: call.callSecondsToStart,
+    callSecondsSinceEnd: call.callSecondsSinceEnd,
     physicalStatus: type === "PHYSICAL" ? normalizePhysicalStatus(row.physicalStatus || "WAITING") : null,
+    physicalStatusChangedAt: physicalStatusChangedAt && Number.isFinite(physicalStatusChangedAt.getTime()) ? physicalStatusChangedAt.toISOString() : null,
+    physicalStatusAgeSeconds,
     acceptedAt: row.acceptedAt ? new Date(row.acceptedAt).toISOString() : null,
     completedAt: row.completedAt ? new Date(row.completedAt).toISOString() : null,
     // deliveredAt is the historical Telegram task-delivery timestamp. Fan delivery
@@ -202,8 +231,8 @@ function serializeOrder(row, now = new Date()) {
     nextReminderAt: row.nextReminderAt ? new Date(row.nextReminderAt).toISOString() : null,
     lastReminderAt: row.lastReminderAt ? new Date(row.lastReminderAt).toISOString() : null,
     createdAt: new Date(row.createdAt).toISOString(), updatedAt: new Date(row.updatedAt).toISOString(),
-    isOverdue: status === "PENDING" && dueMs !== null && dueMs < 0,
-    isDueSoon: status === "PENDING" && dueMs !== null && dueMs >= 0 && dueMs <= DUE_SOON_MS,
+    isOverdue,
+    isDueSoon,
     dueInMs: status === "PENDING" ? dueMs : null,
     creator: row.creator ? { name: creatorLabel(row.creator), displayName: row.creator.displayName || null, username: row.creator.username || null, avatarUrl: row.creator.avatarUrl || null } : null,
     createdBy: row.createdByMember ? { name: memberLabel(row.createdByMember), displayName: row.createdByMember.displayName || null, roleKey: row.createdByMember.roleKey || null } : null,
@@ -225,16 +254,28 @@ async function listCustomOrders({ agencyId, member, creatorId = null, dialogId =
   const where = { agencyId, ...scopeWhere(scope), ...(requestedCreatorId ? { creatorId: requestedCreatorId } : {}), ...(requestedDialogId ? { dialogId: requestedDialogId } : {}), ...(normalizedStatus ? { status: normalizedStatus } : {}) };
   const countScope = { agencyId, ...scopeWhere(scope), ...(requestedCreatorId ? { creatorId: requestedCreatorId } : {}), ...(requestedDialogId ? { dialogId: requestedDialogId } : {}) };
   const dueSoonCeiling = new Date(now.getTime() + DUE_SOON_MS);
-  const [items, count, pendingCount, completedCount, missedCount, cancelledCount, overdueCount, dueSoonCount] = await Promise.all([
+  const definitelyOverdueBefore = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const [items, count, pendingCount, completedCount, missedCount, cancelledCount, contentOverdueCount, contentDueSoonCount, oldCallOverdueCount, recentStartedCalls, upcomingCallCount] = await Promise.all([
     client.customOrder.findMany({ where, include: ORDER_INCLUDE, orderBy: [{ status: "asc" }, { dueAt: { sort: "asc", nulls: "last" } }, { scheduledAt: { sort: "asc", nulls: "last" } }, { createdAt: "desc" }, { id: "asc" }], take, skip }),
     client.customOrder.count({ where }),
     client.customOrder.count({ where: { ...countScope, status: "PENDING" } }),
     client.customOrder.count({ where: { ...countScope, status: "COMPLETED" } }),
     client.customOrder.count({ where: { ...countScope, status: "MISSED" } }),
     client.customOrder.count({ where: { ...countScope, status: "CANCELLED" } }),
-    client.customOrder.count({ where: { ...countScope, status: "PENDING", OR: [{ type: "CONTENT", dueAt: { lt: now } }, { type: "CALL", scheduledAt: { lt: now } }] } }),
-    client.customOrder.count({ where: { ...countScope, status: "PENDING", OR: [{ type: "CONTENT", dueAt: { gte: now, lte: dueSoonCeiling } }, { type: "CALL", scheduledAt: { gte: now, lte: dueSoonCeiling } }] } }),
+    client.customOrder.count({ where: { ...countScope, status: "PENDING", type: "CONTENT", dueAt: { lt: now } } }),
+    client.customOrder.count({ where: { ...countScope, status: "PENDING", type: "CONTENT", dueAt: { gte: now, lte: dueSoonCeiling } } }),
+    client.customOrder.count({ where: { ...countScope, status: "PENDING", type: "CALL", scheduledAt: { lte: definitelyOverdueBefore } } }),
+    client.customOrder.findMany({ where: { ...countScope, status: "PENDING", type: "CALL", scheduledAt: { gt: definitelyOverdueBefore, lte: now } }, select: { scheduledAt: true, durationMinutes: true, status: true } }),
+    client.customOrder.count({ where: { ...countScope, status: "PENDING", type: "CALL", scheduledAt: { gt: now, lte: dueSoonCeiling } } }),
   ]);
+  let recentCallOverdueCount = 0; let callDueNowCount = 0;
+  for (const row of recentStartedCalls || []) {
+    const phase = callPhaseSnapshot(row, now).callPhase;
+    if (phase === "OVERDUE") recentCallOverdueCount += 1;
+    else if (phase === "DUE") callDueNowCount += 1;
+  }
+  const overdueCount = Number(contentOverdueCount || 0) + Number(oldCallOverdueCount || 0) + recentCallOverdueCount;
+  const dueSoonCount = Number(contentDueSoonCount || 0) + Number(upcomingCallCount || 0) + callDueNowCount;
   return { ok: true, items: items.map((row) => serializeOrder(row, now)), count, nextOffset: skip + items.length, hasMore: skip + items.length < count, counts: { pending: pendingCount, completed: completedCount, missed: missedCount, cancelled: cancelledCount, overdue: overdueCount, dueSoon: dueSoonCount }, serverNow: now.toISOString() };
 }
 
@@ -261,7 +302,7 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
   const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
   const seed = { ...data, status: "PENDING", createdAt: now, lastReminderAt: null, lastReminderKey: null };
   const nextReminderAt = nextReminderForOrder(seed, workspacePolicy, now).at;
-  const row = await client.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt }, include: ORDER_INCLUDE });
+  const row = await client.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt }, include: ORDER_INCLUDE });
   const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
   await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.create", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, priceCents: row.priceCents, paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
   return { ok: true, order: serializeOrder(row, now) };
@@ -282,13 +323,17 @@ function buildUpdateData(current, input = {}, now = new Date()) {
   if (nextType === "CONTENT") {
     if (input.contentKind !== undefined || input.type !== undefined) patch.contentKind = normalizeContentKind(input.contentKind ?? current.contentKind ?? "BOTH");
     if (input.dueAt !== undefined || input.type !== undefined) patch.dueAt = parseIso(input.dueAt ?? (input.type === undefined ? current.dueAt : null), "dueAt");
-    if (input.type !== undefined) { patch.scheduledAt = null; patch.durationMinutes = null; patch.physicalStatus = null; }
+    if (input.type !== undefined) { patch.scheduledAt = null; patch.durationMinutes = null; patch.physicalStatus = null; patch.physicalStatusChangedAt = null; }
   } else if (nextType === "CALL") {
     if (input.scheduledAt !== undefined || input.type !== undefined) patch.scheduledAt = parseIso(input.scheduledAt ?? current.scheduledAt, "scheduledAt", { allowNull: false });
     if (input.durationMinutes !== undefined || input.type !== undefined) patch.durationMinutes = normalizeDuration(input.durationMinutes ?? current.durationMinutes);
-    if (input.type !== undefined) { patch.contentKind = null; patch.dueAt = null; patch.physicalStatus = null; }
+    if (input.type !== undefined) { patch.contentKind = null; patch.dueAt = null; patch.physicalStatus = null; patch.physicalStatusChangedAt = null; }
   } else {
-    if (input.physicalStatus !== undefined || input.type !== undefined) patch.physicalStatus = normalizePhysicalStatus(input.physicalStatus ?? current.physicalStatus ?? "WAITING");
+    if (input.physicalStatus !== undefined || input.type !== undefined) {
+      const nextPhysicalStatus = normalizePhysicalStatus(input.physicalStatus ?? current.physicalStatus ?? "WAITING");
+      patch.physicalStatus = nextPhysicalStatus;
+      if (input.type !== undefined || nextPhysicalStatus !== normalizePhysicalStatus(current.physicalStatus || "WAITING")) patch.physicalStatusChangedAt = new Date(now);
+    }
     if (input.type !== undefined) { patch.contentKind = null; patch.dueAt = null; patch.scheduledAt = null; patch.durationMinutes = null; }
   }
   if (input.mediaIds !== undefined) patch.mediaIds = mediaIdsString(input.mediaIds);
@@ -303,7 +348,7 @@ function buildUpdateData(current, input = {}, now = new Date()) {
   if (input.status !== undefined || nextStatus !== normalizeStatus(current.status)) patch.status = nextStatus;
   if (nextStatus === "COMPLETED") {
     if (normalizeStatus(current.status) !== "COMPLETED" || !current.completedAt) patch.completedAt = new Date(now);
-    if (nextType === "PHYSICAL") patch.physicalStatus = "COMPLETED";
+    if (nextType === "PHYSICAL") { if (String(current.physicalStatus || "WAITING") !== "COMPLETED") patch.physicalStatusChangedAt = new Date(now); patch.physicalStatus = "COMPLETED"; }
     patch.cancelledAt = null; patch.cancelReason = null;
   } else if (nextStatus === "MISSED") {
     if (nextType !== "CALL") throw fail("CUSTOM_ORDER_MISSED_CALL_ONLY", "Only call customs can be marked missed");
@@ -478,7 +523,7 @@ async function prepareTelegramStatusNotification({ agencyId, member, orderId, db
 
 module.exports = {
   CUSTOM_ORDER_STATUSES, CUSTOM_ORDER_TYPES, CUSTOM_ORDER_CONTENT_KINDS, CUSTOM_ORDER_PHYSICAL_STATUSES, CUSTOM_ORDER_PAYMENT_STATUSES,
-  buildUpdateData, createCustomOrder, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString, paymentSnapshot,
+  buildUpdateData, callPhaseSnapshot, createCustomOrder, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString, paymentSnapshot,
   normalizeCreateInput, normalizePaidAmountCents, normalizeStatus, normalizeType, serializeOrder, updateCustomOrder,
   recordTelegramDelivery, prepareTelegramTask, prepareManualReminder, recordManualReminder, recordTelegramInboundReply, prepareTelegramStatusNotification,
 };
