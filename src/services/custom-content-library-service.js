@@ -44,6 +44,35 @@ function normalizePriceCents(value) {
   return Number.isFinite(number) ? Math.max(0, Math.min(2_147_483_647, Math.round(number))) : 0;
 }
 
+function normalizeMediaHints(value, allowedMediaIds) {
+  const allowed = new Set((allowedMediaIds || []).map(String));
+  const out = new Map();
+  for (const raw of Array.isArray(value) ? value : []) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+    const mediaId = clean(raw.mediaId, 240);
+    if (!mediaId || !allowed.has(mediaId)) continue;
+    const mediaType = clean(raw.mediaType, 40).toLowerCase() || null;
+    const url = (candidate) => clean(candidate, 8_000) || null;
+    out.set(mediaId, {
+      mediaType,
+      thumbUrl: url(raw.thumbUrl),
+      previewUrl: url(raw.previewUrl),
+      fullUrl: url(raw.fullUrl),
+    });
+  }
+  return out;
+}
+
+function previewSeed(asset, hint) {
+  if (!hint) return {};
+  return {
+    ...((!asset || !clean(asset.mediaType, 40) || String(asset.mediaType).toLowerCase() === "unknown") && hint.mediaType ? { mediaType: hint.mediaType } : {}),
+    ...(!asset?.thumbUrl && hint.thumbUrl ? { thumbUrl: hint.thumbUrl } : {}),
+    ...(!asset?.previewUrl && hint.previewUrl ? { previewUrl: hint.previewUrl } : {}),
+    ...(!asset?.fullUrl && hint.fullUrl ? { fullUrl: hint.fullUrl } : {}),
+  };
+}
+
 function isCompleteSubmission(row) {
   const telegramIds = Array.isArray(row?.telegramMessageIds) ? row.telegramMessageIds : [];
   const mediaIds = uniqueMediaIds(row?.ofMediaIds);
@@ -108,13 +137,14 @@ function desiredAutoMetadata(asset, order) {
   };
 }
 
-function needsUpdate(asset, { order, folderId }) {
+function needsUpdate(asset, { order, folderId, previewHint }) {
   const expectedOrderId = order?.id || null;
   const expectedPrice = order ? normalizePriceCents(order.priceCents) : null;
   if (String(asset.source || "GENERAL") !== SOURCE_CUSTOM) return true;
   if ((asset.customOrderId || null) !== expectedOrderId) return true;
   if ((asset.customFullPriceCents == null ? null : normalizePriceCents(asset.customFullPriceCents)) !== expectedPrice) return true;
   if (asset.catalogActive !== true) return true;
+  if (Object.keys(previewSeed(asset, previewHint)).length) return true;
   const folders = new Set(normalizeFolderIds(asset.folderIds));
   if (folderId && !folders.has(folderId)) return true;
   if (folderId && String(asset.sortingStatus || "").toUpperCase() !== "SORTED") return true;
@@ -127,7 +157,7 @@ function needsUpdate(asset, { order, folderId }) {
   return false;
 }
 
-async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, allowCreate, now }) {
+async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, allowCreate, now, mediaHints = new Map() }) {
   let rows = await db.creatorMediaAsset.findMany({
     where: { agencyId, creatorId, mediaId: { in: mediaIds } },
     take: mediaIds.length,
@@ -154,6 +184,7 @@ async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, al
         description: autoDescription,
         accessType: order && priceCents === 0 ? "free" : "paid",
         idealPriceCents: priceCents || 0,
+        ...previewSeed(null, mediaHints.get(mediaId)),
         firstSeenAt: now,
         lastSeenAt: now,
       })),
@@ -172,7 +203,8 @@ async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, al
 
   let changed = 0;
   for (const asset of rows) {
-    if (!needsUpdate(asset, { order, folderId })) continue;
+    const previewHint = mediaHints.get(String(asset.mediaId)) || null;
+    if (!needsUpdate(asset, { order, folderId, previewHint })) continue;
     const folders = new Set(normalizeFolderIds(asset.folderIds));
     if (folderId) folders.add(folderId);
     const update = {
@@ -184,6 +216,7 @@ async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, al
       folderIds: [...folders],
       ...(folderId ? { sortingStatus: "SORTED" } : {}),
       ...desiredAutoMetadata(asset, order),
+      ...previewSeed(asset, previewHint),
     };
     await db.creatorMediaAsset.update({ where: { id: asset.id }, data: update });
     changed += 1;
@@ -196,11 +229,12 @@ async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, al
  * committed OF media id. The resulting CUSTOM CreatorMediaAsset rows are the
  * durable finalization marker; CustomContentSubmission itself stays compact.
  */
-async function finalizeCustomContentSubmissionLibrary({ agencyId, member, submissionId, now = new Date(), db = null } = {}) {
+async function finalizeCustomContentSubmissionLibrary({ agencyId, member, submissionId, mediaHints = null, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const context = await loadContext(client, { agencyId, member, submissionId, requireFolder: true });
   const { submission, folderId, order, mediaIds } = context;
+  const normalizedHints = normalizeMediaHints(mediaHints, mediaIds);
   const result = await syncRows(client, {
     agencyId,
     creatorId: submission.creatorId,
@@ -209,6 +243,7 @@ async function finalizeCustomContentSubmissionLibrary({ agencyId, member, submis
     order,
     allowCreate: true,
     now: new Date(now),
+    mediaHints: normalizedHints,
   });
   if (!result.complete) throw fail("CUSTOM_CONTENT_LIBRARY_FINALIZE_INCOMPLETE", "Could not materialize all submission media in Content Library", 409);
 
@@ -272,6 +307,7 @@ module.exports = {
   SOURCE_CUSTOM,
   finalizeCustomContentSubmissionLibrary,
   isCompleteSubmission,
+  normalizeMediaHints,
   syncFinalizedSubmissionAssignment,
   uniqueMediaIds,
 };

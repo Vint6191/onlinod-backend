@@ -39,6 +39,7 @@ const ZONES = Object.freeze([
     kind: "access",
     permissions: Object.freeze([
       Object.freeze({ key: "content.manage", label: "Manage creator content", requiredLevel: "full" }),
+      Object.freeze({ key: "content.review_customs", label: "Review custom submissions", requiredLevel: "full" }),
       Object.freeze({ key: "content.manage_vault", label: "Manage Vault", requiredLevel: "full" }),
       Object.freeze({ key: "message_library.manage", label: "Manage Message Library", requiredLevel: "full" }),
       Object.freeze({ key: "content.delete_posts", label: "Delete published content", requiredLevel: "destructive" }),
@@ -91,6 +92,7 @@ const PUBLIC_PERMISSION_KEYS = Object.freeze([
   "money.override_attribution",
   "money.view_audit",
   "message_library.manage",
+  "content.review_customs",
   "automation.view_logs",
   "automation.manage",
   "creators.manage",
@@ -395,12 +397,12 @@ function publicPermissionZones() {
   return exposedZones.map((zone) => {
     const exactOnly = zone.key === "content" || zone.key === "automation" || zone.key === "creators";
     const label = zone.key === "content"
-      ? "Message Library"
+      ? "Content"
       : zone.key === "creators"
         ? "Creator management"
         : zone.label;
     const hint = zone.key === "content"
-      ? "Explicit permission to manage the shared Message Library."
+      ? "Explicit permissions for Custom review and the shared Message Library."
       : zone.key === "creators"
         ? "Manage creator accounts. Actual creator visibility is assigned explicitly per member."
         : zone.key === "automation"

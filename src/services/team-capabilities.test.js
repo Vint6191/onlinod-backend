@@ -94,3 +94,11 @@ test("team analytics view is role-authoritative and custom roles can receive it 
     prismaClient: custom,
   }), true);
 });
+
+
+test("custom review write follows Content full/view access without a parallel ACL", async () => {
+  const manager = { agencyId: "a", role: "MANAGER", roleKey: "manager", permissions: {} };
+  const supervisor = { agencyId: "a", role: "OPERATOR", roleKey: "supervisor", permissions: {} };
+  assert.equal(await canUseTeamCapability({ member: manager, key: "content.review_customs", prismaClient: noOverrides }), true);
+  assert.equal(await canUseTeamCapability({ member: supervisor, key: "content.review_customs", prismaClient: noOverrides }), false);
+});

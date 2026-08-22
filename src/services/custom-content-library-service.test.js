@@ -159,3 +159,38 @@ test("Content Library finalize refuses incomplete OF upload state", async () => 
   );
   assert.equal(db._assets.length, 0);
 });
+
+test("V20.5 finalize seeds existing Content Library preview columns from fresh OF commit without JSON or extra tables", async () => {
+  const db = fakeDb();
+  await finalizeCustomContentSubmissionLibrary({
+    agencyId: "agency-1",
+    member,
+    submissionId: "submission-1",
+    db,
+    mediaHints: [
+      { mediaId: "9001", mediaType: "video", thumbUrl: "https://cdn.test/9001-thumb.jpg", previewUrl: "https://cdn.test/9001-preview.jpg", fullUrl: "https://cdn.test/9001.mp4" },
+      { mediaId: "9002", mediaType: "photo", thumbUrl: "https://cdn.test/9002-thumb.jpg", previewUrl: "https://cdn.test/9002-preview.jpg", fullUrl: "https://cdn.test/9002.jpg" },
+      { mediaId: "not-in-submission", mediaType: "video", fullUrl: "https://cdn.test/evil.mp4" },
+    ],
+  });
+  const first = db._assets.find((row) => row.mediaId === "9001");
+  const second = db._assets.find((row) => row.mediaId === "9002");
+  assert.equal(first.mediaType, "video");
+  assert.equal(first.thumbUrl, "https://cdn.test/9001-thumb.jpg");
+  assert.equal(first.previewUrl, "https://cdn.test/9001-preview.jpg");
+  assert.equal(first.fullUrl, "https://cdn.test/9001.mp4");
+  assert.equal(second.mediaType, "photo");
+  assert.equal(second.fullUrl, "https://cdn.test/9002.jpg");
+  assert.equal(db._assets.some((row) => row.mediaId === "not-in-submission"), false);
+
+  // A later retry must not overwrite richer/fresher URLs already written by the normal Media Library scanner.
+  first.thumbUrl = "https://cdn.test/scanner-fresh-thumb.jpg";
+  await finalizeCustomContentSubmissionLibrary({
+    agencyId: "agency-1",
+    member,
+    submissionId: "submission-1",
+    db,
+    mediaHints: [{ mediaId: "9001", mediaType: "video", thumbUrl: "https://cdn.test/stale-upload-thumb.jpg" }],
+  });
+  assert.equal(first.thumbUrl, "https://cdn.test/scanner-fresh-thumb.jpg");
+});

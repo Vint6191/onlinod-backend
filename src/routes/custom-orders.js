@@ -21,6 +21,7 @@ const {
   listCustomContentSubmissions,
 } = require("../services/custom-content-submissions-service");
 const { finalizeCustomContentSubmissionLibrary } = require("../services/custom-content-library-service");
+const { listCustomContentReviewQueue, reviewCustomContentSubmission } = require("../services/custom-content-review-service");
 const {
   claimDueReminders,
   acknowledgeReminder,
@@ -123,6 +124,7 @@ router.post("/submissions/:submissionId/content-library-finalize", async (req, r
       agencyId: req.auth.agencyId,
       member: req.auth.membership || req.member,
       submissionId: req.params.submissionId,
+      mediaHints: req.body?.mediaHints,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_LIBRARY_FINALIZE_FAILED"); }
@@ -142,6 +144,32 @@ router.patch("/submissions/:submissionId", async (req, res) => {
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_UPDATE_FAILED"); }
+});
+
+
+router.get("/review-queue", async (req, res) => {
+  try {
+    return res.json(await listCustomContentReviewQueue({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      status: req.query.status || "WAITING_REVIEW",
+      limit: req.query.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_REVIEW_QUEUE_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/review", async (req, res) => {
+  try {
+    return res.json(await reviewCustomContentSubmission({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      submissionId: req.params.submissionId,
+      action: req.body?.action,
+      comment: req.body?.comment,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_REVIEW_ACTION_FAILED"); }
 });
 
 router.post("/telegram-inbound", async (req, res) => {

@@ -165,10 +165,10 @@ test("Prisma submission ledger stays deliberately compact", () => {
   const match = schema.match(/model CustomContentSubmission \{([\s\S]*?)\n\}/);
   assert.ok(match, "CustomContentSubmission model must exist");
   const block = match[1];
-  for (const required of ["agencyId", "creatorId", "customOrderId", "telegramMessageIds", "ofMediaIds", "comment", "receivedAt", "createdAt", "updatedAt"]) {
+  for (const required of ["agencyId", "creatorId", "customOrderId", "telegramMessageIds", "ofMediaIds", "comment", "reviewStatus", "reviewComment", "reviewedByMemberId", "reviewedAt", "receivedAt", "createdAt", "updatedAt"]) {
     assert.match(block, new RegExp(`\\b${required}\\b`));
   }
-  for (const forbidden of ["status", "deviceId", "endpoint", "peerId", "fileName", "mimeType", "sizeBytes", "attemptCount", "lastError"]) {
+  for (const forbidden of ["uploadStatus", "assignmentStatus", "deviceId", "endpoint", "peerId", "fileName", "mimeType", "sizeBytes", "attemptCount", "lastError"]) {
     assert.doesNotMatch(block, new RegExp(`\\b${forbidden}\\b`, "i"), `do not persist ${forbidden} on the compact ledger`);
   }
   const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821115000_custom_content_submission_ledger/migration.sql"), "utf8");
@@ -256,6 +256,15 @@ test("submission may stay unassigned and can later be assigned only to CONTENT o
 
   const unassigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: null, db });
   assert.equal(unassigned.submission.customOrderId, null);
+});
+
+
+test("reviewed submissions cannot be reassigned after a manager decision", async () => {
+  const db = fakeDb({ submissions: [baseSubmission({ reviewStatus: "APPROVED", reviewedByMemberId: "manager-1", reviewedAt: new Date("2026-08-21T12:00:00.000Z") })] });
+  await assert.rejects(
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: null, db }),
+    (error) => error.code === "CUSTOM_SUBMISSION_REVIEW_LOCKED",
+  );
 });
 
 test("list is creator-scoped and supports compact unassigned queue", async () => {

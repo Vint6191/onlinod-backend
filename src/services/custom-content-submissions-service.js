@@ -132,6 +132,10 @@ function serializeSubmission(row) {
     telegramMessageIds: Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.map(String) : [],
     ofMediaIds: ofMediaIds(row.ofMediaIds),
     comment: row.comment || null,
+    reviewStatus: String(row.reviewStatus || "WAITING_REVIEW"),
+    reviewComment: row.reviewComment || null,
+    reviewedByMemberId: row.reviewedByMemberId == null ? null : String(row.reviewedByMemberId),
+    reviewedAt: row.reviewedAt ? new Date(row.reviewedAt).toISOString() : null,
     receivedAt: new Date(row.receivedAt).toISOString(),
     createdAt: new Date(row.createdAt).toISOString(),
     updatedAt: new Date(row.updatedAt).toISOString(),
@@ -241,6 +245,9 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   await validateContentOrder({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, db: client });
   if ((row.customOrderId || null) === normalizedOrderId) {
     return { ok: true, unchanged: true, submission: serializeSubmission(row) };
+  }
+  if (String(row.reviewStatus || "WAITING_REVIEW") !== "WAITING_REVIEW") {
+    throw fail("CUSTOM_SUBMISSION_REVIEW_LOCKED", "Reviewed submissions cannot be reassigned", 409);
   }
   const updated = await client.customContentSubmission.update({ where: { id: row.id }, data: { customOrderId: normalizedOrderId } });
   await audit({

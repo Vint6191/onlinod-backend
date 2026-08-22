@@ -48,6 +48,12 @@ enum CustomOrderPhysicalStatus {
   COMPLETED
 }
 
+enum CustomContentReviewStatus {
+  WAITING_REVIEW
+  REVISION_REQUESTED
+  APPROVED
+}
+
 
 enum AnalyticsDataType {
   EARNINGS
@@ -369,6 +375,7 @@ model AgencyMember {
   teamResponseCases TeamResponseCase[]
   teamShifts TeamShift[]
   createdCustomOrders CustomOrder[]
+  reviewedCustomContentSubmissions CustomContentSubmission[] @relation("CustomContentSubmissionReviewedBy")
 
   @@unique([agencyId, userId])
   @@index([agencyId])
@@ -567,16 +574,23 @@ model CustomContentSubmission {
   telegramMessageIds Int[]    @default([])
   ofMediaIds         String[] @default([])
   comment            String?
+  reviewStatus       CustomContentReviewStatus @default(WAITING_REVIEW)
+  reviewComment      String?
+  reviewedByMemberId String?
+  reviewedAt         DateTime?
   receivedAt         DateTime @default(now())
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
-  agency      Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator     CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  customOrder CustomOrder?   @relation(fields: [customOrderId], references: [id], onDelete: SetNull)
+  agency           Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator          CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  customOrder      CustomOrder?   @relation(fields: [customOrderId], references: [id], onDelete: SetNull)
+  reviewedByMember AgencyMember?  @relation("CustomContentSubmissionReviewedBy", fields: [reviewedByMemberId], references: [id], onDelete: SetNull)
 
   @@index([agencyId, creatorId, receivedAt])
+  @@index([agencyId, reviewStatus, receivedAt])
   @@index([customOrderId, receivedAt])
+  @@index([reviewedByMemberId])
 }
 
 model AuthToken {

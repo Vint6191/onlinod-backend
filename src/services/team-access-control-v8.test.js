@@ -68,9 +68,9 @@ test("V8 only exposes enforceable Content/Automation/Creator controls", () => {
   const automation = zones.find((zone) => zone.key === "automation");
   const creators = zones.find((zone) => zone.key === "creators");
 
-  assert.equal(content?.label, "Message Library");
+  assert.equal(content?.label, "Content");
   assert.deepEqual(content?.levels, []);
-  assert.deepEqual(content?.permissions.map((permission) => permission.key), ["message_library.manage"]);
+  assert.deepEqual(content?.permissions.map((permission) => permission.key), ["content.review_customs", "message_library.manage"]);
   assert.equal(content?.permissions.some((permission) => permission.key === "content.manage"), false);
   assert.equal(content?.permissions.some((permission) => permission.key === "content.manage_vault"), false);
   assert.equal(content?.permissions.some((permission) => permission.key === "content.delete_posts"), false);
