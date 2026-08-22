@@ -1439,6 +1439,25 @@ router.delete("/creators/:id", async (req, res) => {
         where: { creatorId: before.id, active: true, revokedAt: null },
         data: { active: false, revokedAt: deletedAt },
       });
+      await tx.creatorSessionState.updateMany({
+        where: { creatorId: before.id, status: "ACTIVE" },
+        data: {
+          revision: { increment: 1 },
+          status: "REVOKED",
+          encryptedPayload: null,
+          iv: null,
+          tag: null,
+          algorithm: null,
+          credentialHash: null,
+          coherenceHash: null,
+          capturedAt: deletedAt,
+          capturedByUserId: null,
+          capturedByDeviceId: null,
+          sourceRequestId: `admin-creator-removal:${before.id}:${deletedAt.getTime()}`,
+          revokedAt: deletedAt,
+          revokeReason: "ADMIN_CREATOR_REMOVED",
+        },
+      });
     }
 
     // Creator deletion changes the set of billable product access immediately.

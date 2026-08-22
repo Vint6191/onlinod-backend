@@ -476,6 +476,25 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
       }
 
       await tx.accessSnapshot.updateMany({ where: { creatorId: existing.id, active: true }, data: { active: false, revokedAt: removedAt } });
+      await tx.creatorSessionState.updateMany({
+        where: { creatorId: existing.id, status: "ACTIVE" },
+        data: {
+          revision: { increment: 1 },
+          status: "REVOKED",
+          encryptedPayload: null,
+          iv: null,
+          tag: null,
+          algorithm: null,
+          credentialHash: null,
+          coherenceHash: null,
+          capturedAt: removedAt,
+          capturedByUserId: req.auth.userId,
+          capturedByDeviceId: null,
+          sourceRequestId: `creator-removal:${existing.id}:${removedAt.getTime()}`,
+          revokedAt: removedAt,
+          revokeReason: "CREATOR_REMOVED_FROM_AGENCY",
+        },
+      });
       await tx.deviceCreatorBinding.updateMany({ where: { creatorId: existing.id }, data: { status: "REVOKED" } });
       await tx.creatorConnectSession.updateMany({ where: { creatorId: existing.id, status: { in: ["PENDING", "CLAIMED"] } }, data: { status: "CANCELLED", cancelledAt: removedAt } });
       await tx.jobInstance.updateMany({

@@ -22,6 +22,16 @@ enum CreatorStatus {
   DISABLED
 }
 
+enum CreatorSessionMode {
+  LOCAL_PERSISTENT
+  MANAGED_BROKER
+}
+
+enum CreatorSessionStateStatus {
+  ACTIVE
+  REVOKED
+}
+
 enum CustomOrderStatus {
   PENDING
   COMPLETED
@@ -209,6 +219,7 @@ model User {
   createdConnectSessions CreatorConnectSession[] @relation("ConnectSessionCreator")
   claimedConnectSessions CreatorConnectSession[] @relation("ConnectSessionClaimer")
   accessSnapshots AccessSnapshot[] @relation("SnapshotCreator")
+  creatorSessionStatesCaptured CreatorSessionState[] @relation("CreatorSessionCapturedByUser")
   workerDevices WorkerDevice[]
   auditLogs AuditLog[]
   teamActivityEvents TeamActivityEvent[]
@@ -237,6 +248,7 @@ model Agency {
   telegramMtprotoAccounts AgencyTelegramMtprotoAccount[]
   connectSessions CreatorConnectSession[]
   accessSnapshots AccessSnapshot[]
+  creatorSessionStates CreatorSessionState[]
   workerDevices WorkerDevice[]
   auditLogs AuditLog[]
   subscriptions AgencySubscription[]
@@ -408,6 +420,7 @@ model CreatorAccount {
   avatarUrl   String?
   remoteId    String?
   partition   String?
+  sessionMode CreatorSessionMode @default(LOCAL_PERSISTENT)
   status      CreatorStatus @default(DRAFT)
   notes       String?
   telegramContact   String?
@@ -421,6 +434,7 @@ model CreatorAccount {
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   connectSessions CreatorConnectSession[]
   accessSnapshots AccessSnapshot[]
+  sessionState CreatorSessionState?
   earningsSnapshots  CreatorEarningsSnapshot[]
   campaignsSnapshot  CreatorCampaignsSnapshot?
   jobs               JobInstance[]
@@ -715,6 +729,41 @@ model AccessSnapshot {
   @@index([createdAt])
 }
 
+model CreatorSessionState {
+  id                 String                    @id @default(cuid())
+  agencyId           String
+  creatorId          String                    @unique
+  revision           Int                       @default(1)
+  status             CreatorSessionStateStatus @default(ACTIVE)
+  payloadVersion     Int                       @default(1)
+  encryptedPayload   String?
+  iv                 String?
+  tag                String?
+  algorithm          String?
+  platformUserId     String?
+  credentialHash     String?
+  coherenceHash      String?
+  capturedAt         DateTime?
+  capturedByUserId   String?
+  capturedByDeviceId String?
+  sourceRequestId    String?
+  revokedAt          DateTime?
+  revokeReason       String?
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @updatedAt
+
+  agency           Agency        @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator          CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  capturedByUser   User?         @relation("CreatorSessionCapturedByUser", fields: [capturedByUserId], references: [id], onDelete: SetNull)
+  capturedByDevice WorkerDevice? @relation("CreatorSessionCapturedByDevice", fields: [capturedByDeviceId], references: [id], onDelete: SetNull)
+
+  @@index([agencyId])
+  @@index([status])
+  @@index([capturedByUserId])
+  @@index([capturedByDeviceId])
+  @@index([updatedAt])
+}
+
 model WorkerDevice {
   id         String   @id @default(cuid())
   agencyId   String
@@ -729,6 +778,7 @@ model WorkerDevice {
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   creatorBindings DeviceCreatorBinding[]
+  creatorSessionStatesCaptured CreatorSessionState[] @relation("CreatorSessionCapturedByDevice")
   teamActivityEvents TeamActivityEvent[]
   presenceSnapshotsUpdated CreatorPresenceSnapshot[] @relation("PresenceSnapshotUpdatedByDevice")
   presenceUsersUpdated     CreatorPresenceUser[]     @relation("PresenceUserUpdatedByDevice")

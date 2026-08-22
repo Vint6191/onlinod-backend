@@ -10,6 +10,7 @@ const authRoutes = require("./routes/auth");
 const creatorRoutes = require("./routes/creators");
 const creatorConnectRoutes = require("./routes/creator-connect");
 const accessSnapshotRoutes = require("./routes/access-snapshots");
+const creatorSessionRoutes = require("./routes/creator-sessions");
 const adminRoutes = require("./routes/admin");
 const adminDataRoutes = require("./routes/admin-data");
 const adminBillingRoutes = require("./routes/admin-billing");
@@ -229,6 +230,7 @@ app.use("/api/settings", authRequired, settingsRoutes);
 app.use("/api/message-library", authRequired, messageLibraryRoutes);
 app.use("/api/creators", creatorRoutes);
 app.use("/api/creator-connect", creatorConnectRoutes);
+app.use("/api/creator-sessions", creatorSessionRoutes);
 app.use("/api", accessSnapshotRoutes);
 
 app.get("*", (req, res, next) => {
