@@ -20,19 +20,47 @@ function normalizeSameSite(value) {
   return ["no_restriction", "lax", "strict", "unspecified"].includes(result) ? result : null;
 }
 
+const SESSION_COOKIE_NOISE_EXACT = new Set([
+  "lang",
+  "cookiesaccepted",
+  "ref_src",
+  "__cf_bm",
+  "_cfuvid",
+  "streams",
+  "_fbp",
+  "_gid",
+  "_gcl_au",
+]);
+
+function isPortableSessionCookieName(name) {
+  const lower = String(name || "").trim().toLowerCase();
+  if (!lower || SESSION_COOKIE_NOISE_EXACT.has(lower)) return false;
+  if (lower.startsWith("cloudfront-")) return false;
+  if (lower === "_ga" || lower.startsWith("_ga_") || lower.startsWith("_gat_")) return false;
+  return true;
+}
+
+function isOnlyFansCookieDomain(domainInput) {
+  const host = String(domainInput || "").trim().replace(/^\.+/, "").toLowerCase();
+  return host === "onlyfans.com" || host.endsWith(".onlyfans.com");
+}
+
 function normalizeCookie(cookie) {
   const source = cookie && typeof cookie === "object" && !Array.isArray(cookie) ? cookie : {};
   const name = nullableText(source.name, 256);
   const domain = nullableText(source.domain, 512);
-  if (!name || !domain || !domain.toLowerCase().includes("onlyfans.com")) return null;
+  if (!name || !domain || !isOnlyFansCookieDomain(domain) || !isPortableSessionCookieName(name)) return null;
 
   const expiration = Number(source.expirationDate);
   const expirationDate = Number.isFinite(expiration) && expiration > 0 ? expiration : null;
+
+  const hostOnly = source.hostOnly === true ? true : source.hostOnly === false ? false : !domain.startsWith(".");
 
   return {
     name,
     value: text(source.value, 32_768),
     domain,
+    hostOnly,
     path: nullableText(source.path, 2048) || "/",
     secure: source.secure !== false,
     httpOnly: source.httpOnly === true,
@@ -81,7 +109,7 @@ function hash(value) {
 function hashesForPayload(payload) {
   const normalized = normalizePayload(payload);
   const credentialShape = {
-    cookies: normalized.cookies.map((cookie) => ({ name: cookie.name, value: cookie.value, domain: cookie.domain, path: cookie.path })),
+    cookies: normalized.cookies.map((cookie) => ({ name: cookie.name, value: cookie.value, domain: cookie.domain, hostOnly: cookie.hostOnly, path: cookie.path })),
     storage: normalized.storage,
     userAgent: normalized.userAgent,
   };
@@ -227,6 +255,13 @@ async function writeCreatorSession({
   if (!normalizedPayload.cookies.length) {
     const error = new Error("At least one OnlyFans cookie is required");
     error.code = "CREATOR_SESSION_COOKIES_REQUIRED";
+    error.status = 400;
+    throw error;
+  }
+  const strongCookieNames = new Set(normalizedPayload.cookies.map((cookie) => String(cookie.name || "").toLowerCase()));
+  if (!strongCookieNames.has("sess") && !strongCookieNames.has("auth_id")) {
+    const error = new Error("A strong OnlyFans auth cookie is required");
+    error.code = "CREATOR_SESSION_STRONG_AUTH_COOKIE_REQUIRED";
     error.status = 400;
     throw error;
   }

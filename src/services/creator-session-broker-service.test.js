@@ -73,6 +73,7 @@ function payload({ sess = "sess-A", bcTokenSha = "bc-A", expiry = 1_900_000_000 
         name: "sess",
         value: sess,
         domain: ".onlyfans.com",
+        hostOnly: false,
         path: "/",
         secure: true,
         httpOnly: true,
@@ -84,6 +85,7 @@ function payload({ sess = "sess-A", bcTokenSha = "bc-A", expiry = 1_900_000_000 
         name: "auth_id",
         value: "42",
         domain: "onlyfans.com",
+        hostOnly: true,
         path: "/",
         secure: true,
         httpOnly: false,
@@ -105,10 +107,43 @@ test("session payload normalization is an OnlyFans whitelist, not a browser-prof
     ],
   });
   assert.equal(normalized.cookies.length, 2);
+  assert.equal(normalized.cookies.find((cookie) => cookie.name === "sess").hostOnly, false);
+  assert.equal(normalized.cookies.find((cookie) => cookie.name === "auth_id").hostOnly, true);
   assert.deepEqual(normalized.storage, { bcTokenSha: "bc-A" });
   assert.equal(normalized.userAgent, "UA/1");
   assert.equal(Object.hasOwn(normalized, "ignoredTopLevel"), false);
   assert.equal(Object.hasOwn(normalized.storage, "ignored"), false);
+});
+
+test("session payload normalization rejects lookalike domains instead of substring matching", () => {
+  const normalized = normalizePayload({
+    ...payload(),
+    cookies: [
+      ...payload().cookies,
+      { name: "sess", value: "evil", domain: ".evilonlyfans.com", path: "/" },
+      { name: "sess", value: "evil", domain: ".onlyfans.com.evil.test", path: "/" },
+      { name: "sess", value: "ok", domain: ".api.onlyfans.com", path: "/" },
+    ],
+  });
+  assert.equal(normalized.cookies.some((cookie) => cookie.domain === ".evilonlyfans.com"), false);
+  assert.equal(normalized.cookies.some((cookie) => cookie.domain === ".onlyfans.com.evil.test"), false);
+  assert.equal(normalized.cookies.some((cookie) => cookie.domain === ".api.onlyfans.com"), true);
+});
+
+test("server refuses to canonicalize a cookie jar without a strong OnlyFans auth cookie", async () => {
+  const { db } = makeDb();
+  await assert.rejects(
+    writeCreatorSession({
+      db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+      baseRevision: 0, requestId: "request-weak-cookie", platformUserId: "of-42",
+      payload: {
+        cookies: [{ name: "fp", value: "x", domain: ".onlyfans.com", hostOnly: false, path: "/", secure: true, httpOnly: false, session: true }],
+        storage: { bcTokenSha: "bc-A" },
+        userAgent: "UA/1",
+      },
+    }),
+    (error) => error?.code === "CREATOR_SESSION_STRONG_AUTH_COOKIE_REQUIRED" && error?.status === 400,
+  );
 });
 
 test("credential hash ignores cookie expiry metadata while coherence hash detects it", () => {
@@ -246,4 +281,22 @@ test("revoke increments revision, deletes ciphertext fields, and later verified 
   });
   assert.equal(reactivated.state.revision, 3);
   assert.equal(reactivated.state.status, "ACTIVE");
+});
+
+test("shadow-session normalization drops Cloudflare, analytics and CDN noise before hashing", () => {
+  const normalized = normalizePayload({
+    ...payload(),
+    cookies: [
+      ...payload().cookies,
+      { name: "__cf_bm", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "_cfuvid", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "_ga", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "_ga_XYZ", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "_gat_1", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "_fbp", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "CloudFront-Key-Pair-Id", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "lang", value: "en", domain: ".onlyfans.com", path: "/" },
+    ],
+  });
+  assert.deepEqual(normalized.cookies.map((cookie) => cookie.name).sort(), ["auth_id", "sess"]);
 });

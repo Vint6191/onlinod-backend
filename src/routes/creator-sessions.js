@@ -24,6 +24,7 @@ const cookieSchema = z.object({
   name: z.string().min(1).max(256),
   value: z.string().max(32_768),
   domain: z.string().min(1).max(512),
+  hostOnly: z.boolean().optional().nullable(),
   path: z.string().max(2048).optional().nullable(),
   secure: z.boolean().optional().nullable(),
   httpOnly: z.boolean().optional().nullable(),
@@ -94,11 +95,12 @@ router.get("/:creatorId", async (req, res) => {
   try {
     const deviceId = deviceIdSchema.parse(req.query.deviceId);
     const { creator, device } = await authorize(req, req.params.creatorId, deviceId);
+    const includePayload = String(req.query.includePayload ?? "1").trim() !== "0";
     const state = await getCreatorSession({
       db: prisma,
       agencyId: req.auth.agencyId,
       creatorId: creator.id,
-      includePayload: true,
+      includePayload,
     });
     await audit({
       agencyId: req.auth.agencyId,
