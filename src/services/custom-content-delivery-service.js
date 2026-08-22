@@ -5,6 +5,8 @@ const { canUsePermission } = require("./team-access-control");
 const { isCompleteSubmission, uniqueMediaIds } = require("./custom-content-library-service");
 const { paymentSnapshot } = require("./custom-orders-service");
 
+const CUSTOM_DELIVERY_OVERDUE_MS = 2 * 60 * 60 * 1000;
+
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 500) { return String(value == null ? "" : value).trim().slice(0, max); }
 function scopeWhere(scope) {
@@ -79,10 +81,14 @@ function isReady(row, assets) {
   });
 }
 
-function serializeDelivery(row, assets) {
+function serializeDelivery(row, assets, nowInput = new Date()) {
   const order = row.customOrder;
   const creator = order.creator || row.creator || null;
   const payment = paymentSnapshot(order.priceCents, order.paidAmountCents);
+  const now = nowInput instanceof Date ? nowInput : new Date(nowInput);
+  const readyAtDate = new Date(row.reviewedAt);
+  const overdueAtDate = new Date(readyAtDate.getTime() + CUSTOM_DELIVERY_OVERDUE_MS);
+  const overdueForSeconds = Math.max(0, Math.floor((now.getTime() - overdueAtDate.getTime()) / 1000));
   const approvedMediaIds = uniqueMediaIds(row.ofMediaIds);
   const deliveredMediaIds = uniqueMediaIds(order.deliverySentMediaIds);
   const remainingMediaIds = approvedMediaIds.filter((mediaId) => !deliveredMediaIds.includes(mediaId));
@@ -123,7 +129,10 @@ function serializeDelivery(row, assets) {
     deliveredMediaCount: deliveredMediaIds.filter((id) => approvedMediaIds.includes(id)).length,
     deliveryMessageIds: uniqueMediaIds(order.deliveryMessageIds),
     deliveryOfferedCents,
-    readyAt: new Date(row.reviewedAt).toISOString(),
+    readyAt: readyAtDate.toISOString(),
+    overdueAt: overdueAtDate.toISOString(),
+    overdue: overdueForSeconds > 0,
+    overdueForSeconds,
     vaultFolderId: clean(creator?.customsVaultFolderId, 180) || null,
   };
 }
@@ -134,6 +143,7 @@ async function listCustomReadyDeliveries({ agencyId, member, limit = 100, db = n
   const scope = await allowedCreatorScope({ agencyId, member, db: client });
   const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 100)));
   const items = [];
+  const serverNow = new Date();
   let cursor = null;
   for (let pass = 0; pass < 10 && items.length < take; pass += 1) {
     const rows = await client.customContentSubmission.findMany({
@@ -156,11 +166,11 @@ async function listCustomReadyDeliveries({ agencyId, member, limit = 100, db = n
     const assets = await loadAssets(client, agencyId, candidates);
     for (const row of candidates) {
       if (items.length >= take) break;
-      if (isReady(row, assets)) items.push(serializeDelivery(row, assets));
+      if (isReady(row, assets)) items.push(serializeDelivery(row, assets, serverNow));
     }
     if (rows.length < 200) break;
   }
-  return { ok: true, items, count: items.length, serverNow: new Date().toISOString() };
+  return { ok: true, items, count: items.length, serverNow: serverNow.toISOString() };
 }
 
 async function getCustomReadyDelivery({ agencyId, member, customOrderId, db = null } = {}) {
@@ -183,7 +193,15 @@ async function getCustomReadyDelivery({ agencyId, member, customOrderId, db = nu
   if (!row) throw fail("CUSTOM_DELIVERY_NOT_READY", "Approved custom delivery was not found", 404);
   const assets = await loadAssets(client, agencyId, [row]);
   if (!isReady(row, assets)) throw fail("CUSTOM_DELIVERY_NOT_READY", "Custom content is not ready for chatter delivery", 409);
-  return { ok: true, item: serializeDelivery(row, assets), serverNow: new Date().toISOString() };
+  const serverNow = new Date();
+  return { ok: true, item: serializeDelivery(row, assets, serverNow), serverNow: serverNow.toISOString() };
 }
 
-module.exports = { listCustomReadyDeliveries, getCustomReadyDelivery };
+module.exports = {
+  listCustomReadyDeliveries,
+  getCustomReadyDelivery,
+  CUSTOM_DELIVERY_OVERDUE_MS,
+  loadAssets,
+  isReady,
+  serializeDelivery,
+};

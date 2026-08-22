@@ -22,6 +22,7 @@ const {
   listTeamCoverageSessions,
 } = require("../services/team-response-read-service");
 const { listTeamPendingDialogs } = require("../services/team-pending-read-service");
+const { listCustomDeliveryAnomalies } = require("../services/custom-delivery-anomalies-service");
 
 const router = express.Router();
 
@@ -305,6 +306,21 @@ router.get("/members", async (req, res) => {
     return res.json(await buildTeamMembers({ agencyId: viewer.agencyId, rangeKey: req.query.range || "7d", includeMoney: viewer.includeMoney, allowedCreatorIds: viewer.allowedCreatorIds }));
   } catch (err) {
     return res.status(500).json({ ok: false, code: "TEAM_ANALYTICS_MEMBERS_FAILED", error: err?.message || "Failed" });
+  }
+});
+
+
+router.get("/custom-delivery-anomalies", async (req, res) => {
+  try {
+    const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
+    return res.json(await listCustomDeliveryAnomalies({
+      agencyId: viewer.agencyId,
+      allowedCreatorIds: viewer.allowedCreatorIds,
+      rangeKey: req.query.range || "7d",
+      limit: req.query.limit || 100,
+    }));
+  } catch (err) {
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "CUSTOM_DELIVERY_ANOMALIES_FAILED", error: err?.message || "Failed" });
   }
 });
 
