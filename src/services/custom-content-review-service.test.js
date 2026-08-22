@@ -13,7 +13,7 @@ function fixture() {
   const order = { id: "custom-1", creatorId: "creator-1", dialogId: "777", scenario: "Do the custom", internalNote: null, type: "CONTENT", contentKind: "VIDEO", priceCents: 6000, paidAmountCents: 4000, createdAt: now, creator };
   const row = { id: "sub-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [101, 102], ofMediaIds: ["9001", "9002"], comment: "two versions", reviewStatus: "WAITING_REVIEW", reviewComment: null, reviewedByMemberId: null, reviewedAt: null, receivedAt: now, createdAt: now, updatedAt: now, creator, customOrder: order, reviewedByMember: null };
   const rows = [row];
-  const assets = ["9001", "9002"].map((mediaId) => ({ creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000, mediaType: "video", thumbUrl: `https://cdn/${mediaId}.jpg`, previewUrl: null, fullUrl: null }));
+  const assets = ["9001", "9002"].map((mediaId) => ({ creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "sub-1", customFullPriceCents: 6000, mediaType: "video", thumbUrl: `https://cdn/${mediaId}.jpg`, previewUrl: null, fullUrl: null }));
   const db = {
     customContentSubmission: {
       findMany: async ({ where }) => rows.filter((item) => {
@@ -34,7 +34,7 @@ function fixture() {
     creatorMediaAsset: { findMany: async () => assets },
     auditLog: { create: async () => ({ id: "audit" }) },
   };
-  return { db, member, row, rows };
+  return { db, member, row, rows, assets };
 }
 
 test("manager review queue exposes only finalized custom facts and full payment context", async () => {
@@ -80,4 +80,35 @@ test("V20.5 migration keeps review typed and enforces one approved version per c
   assert.match(migration, /CREATE TYPE "CustomContentReviewStatus"/);
   assert.match(migration, /one_approved_per_order_key/);
   assert.match(migration, /WHERE "reviewStatus" = 'APPROVED'/);
+});
+
+test("review queue derives revision version and previous manager instruction without schema fields", async () => {
+  const { db, member, row, rows } = fixture();
+  row.receivedAt = new Date("2026-08-21T14:00:00.000Z");
+  row.createdAt = new Date("2026-08-21T14:00:00.000Z");
+  rows.unshift({
+    ...row,
+    id: "sub-v1",
+    telegramMessageIds: [90],
+    ofMediaIds: ["8999"],
+    reviewStatus: "REVISION_REQUESTED",
+    reviewComment: "Need another angle",
+    reviewedAt: new Date("2026-08-21T13:00:00.000Z"),
+    receivedAt: new Date("2026-08-21T12:00:00.000Z"),
+    createdAt: new Date("2026-08-21T12:00:00.000Z"),
+    reviewedByMember: { id: "manager-1", displayName: "Manager", roleKey: "manager" },
+  });
+  const result = await listCustomContentReviewQueue({ agencyId: "agency-1", member, db, limit: 50 });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].revisionNumber, 2);
+  assert.equal(result.items[0].previousRevisionRequest.comment, "Need another angle");
+  assert.equal(result.items[0].previousRevisionRequest.reviewedBy.name, "Manager");
+});
+
+
+test("V20.9 review queue refuses Content Library assets belonging to another submission version", async () => {
+  const { db, member, assets } = fixture();
+  assets[1].customSubmissionId = "sub-v1-rejected";
+  const result = await listCustomContentReviewQueue({ agencyId: "agency-1", member, db, limit: 50 });
+  assert.deepEqual(result.items, []);
 });

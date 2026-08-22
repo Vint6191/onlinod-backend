@@ -137,10 +137,11 @@ function desiredAutoMetadata(asset, order) {
   };
 }
 
-function needsUpdate(asset, { order, folderId, previewHint }) {
+function needsUpdate(asset, { order, folderId, previewHint, submissionId }) {
   const expectedOrderId = order?.id || null;
   const expectedPrice = order ? normalizePriceCents(order.priceCents) : null;
   if (String(asset.source || "GENERAL") !== SOURCE_CUSTOM) return true;
+  if ((asset.customSubmissionId || null) !== (submissionId || null)) return true;
   if ((asset.customOrderId || null) !== expectedOrderId) return true;
   if ((asset.customFullPriceCents == null ? null : normalizePriceCents(asset.customFullPriceCents)) !== expectedPrice) return true;
   if (asset.catalogActive !== true) return true;
@@ -157,7 +158,7 @@ function needsUpdate(asset, { order, folderId, previewHint }) {
   return false;
 }
 
-async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, allowCreate, now, mediaHints = new Map() }) {
+async function syncRows(db, { agencyId, creatorId, submissionId, mediaIds, folderId, order, allowCreate, now, mediaHints = new Map() }) {
   let rows = await db.creatorMediaAsset.findMany({
     where: { agencyId, creatorId, mediaId: { in: mediaIds } },
     take: mediaIds.length,
@@ -177,6 +178,7 @@ async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, al
         mediaId,
         source: SOURCE_CUSTOM,
         customOrderId: order?.id || null,
+        customSubmissionId: submissionId || null,
         customFullPriceCents: priceCents,
         catalogActive: true,
         sortingStatus: folderId ? "SORTED" : "UNSORTED",
@@ -204,12 +206,13 @@ async function syncRows(db, { agencyId, creatorId, mediaIds, folderId, order, al
   let changed = 0;
   for (const asset of rows) {
     const previewHint = mediaHints.get(String(asset.mediaId)) || null;
-    if (!needsUpdate(asset, { order, folderId, previewHint })) continue;
+    if (!needsUpdate(asset, { order, folderId, previewHint, submissionId })) continue;
     const folders = new Set(normalizeFolderIds(asset.folderIds));
     if (folderId) folders.add(folderId);
     const update = {
       source: SOURCE_CUSTOM,
       customOrderId: order?.id || null,
+      customSubmissionId: submissionId || null,
       customFullPriceCents: order ? normalizePriceCents(order.priceCents) : null,
       catalogActive: true,
       lastSeenAt: now,
@@ -238,6 +241,7 @@ async function finalizeCustomContentSubmissionLibrary({ agencyId, member, submis
   const result = await syncRows(client, {
     agencyId,
     creatorId: submission.creatorId,
+    submissionId: submission.id,
     mediaIds,
     folderId,
     order,
@@ -294,6 +298,7 @@ async function syncFinalizedSubmissionAssignment({ agencyId, member, submissionI
   const result = await syncRows(client, {
     agencyId,
     creatorId: submission.creatorId,
+    submissionId: submission.id,
     mediaIds,
     folderId,
     order,

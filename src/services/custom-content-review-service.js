@@ -43,6 +43,69 @@ async function requireReviewWrite({ agencyId, member, db }) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_REVIEW_ACTOR_REQUIRED", "Agency membership is required", 403);
   if (!await canUsePermission({ member, key: "content.review_customs", db })) throw fail("CUSTOM_REVIEW_FORBIDDEN", "content.review_customs permission is required", 403);
 }
+
+function compareSubmissionTimeline(a, b) {
+  const ar = new Date(a?.receivedAt || 0).getTime();
+  const br = new Date(b?.receivedAt || 0).getTime();
+  if (ar !== br) return ar - br;
+  const ac = new Date(a?.createdAt || 0).getTime();
+  const bc = new Date(b?.createdAt || 0).getTime();
+  if (ac !== bc) return ac - bc;
+  return String(a?.id || "").localeCompare(String(b?.id || ""));
+}
+
+async function loadRevisionContext(db, agencyId, rows) {
+  const orderIds = Array.from(new Set((rows || []).map((row) => String(row?.customOrderId || "")).filter(Boolean)));
+  const result = new Map();
+  if (!orderIds.length) return result;
+  const history = await db.customContentSubmission.findMany({
+    where: { agencyId, customOrderId: { in: orderIds } },
+    select: {
+      id: true, customOrderId: true, reviewStatus: true, reviewComment: true, reviewedAt: true,
+      receivedAt: true, createdAt: true, reviewedByMemberId: true,
+      reviewedByMember: { select: { id: true, displayName: true, roleKey: true } },
+    },
+    orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+    take: Math.max(200, orderIds.length * 20),
+  });
+  const byOrder = new Map();
+  for (const item of history || []) {
+    const key = String(item.customOrderId || "");
+    if (!key) continue;
+    const list = byOrder.get(key) || [];
+    list.push(item);
+    byOrder.set(key, list);
+  }
+  for (const list of byOrder.values()) list.sort(compareSubmissionTimeline);
+  for (const row of rows || []) {
+    const list = byOrder.get(String(row.customOrderId || "")) || [row];
+    let index = list.findIndex((item) => String(item.id) === String(row.id));
+    if (index < 0) {
+      const augmented = [...list, row].sort(compareSubmissionTimeline);
+      index = augmented.findIndex((item) => String(item.id) === String(row.id));
+      list.splice(0, list.length, ...augmented);
+    }
+    let previous = null;
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+      const candidate = list[cursor];
+      if (String(candidate?.reviewStatus || "") !== REVIEW_REVISION) continue;
+      previous = {
+        submissionId: String(candidate.id),
+        comment: candidate.reviewComment || null,
+        requestedAt: candidate.reviewedAt ? new Date(candidate.reviewedAt).toISOString() : null,
+        reviewedBy: candidate.reviewedByMember ? {
+          id: String(candidate.reviewedByMember.id),
+          name: candidate.reviewedByMember.displayName || null,
+          roleKey: candidate.reviewedByMember.roleKey || null,
+        } : null,
+      };
+      break;
+    }
+    result.set(String(row.id), { revisionNumber: Math.max(1, index + 1), previousRevisionRequest: previous });
+  }
+  return result;
+}
+
 function finalizedAssetMap(assets) {
   const map = new Map();
   for (const asset of assets || []) map.set(`${asset.creatorId}\n${asset.mediaId}`, asset);
@@ -57,11 +120,12 @@ function isFinalizedForReview(row, assetByKey) {
     const asset = assetByKey.get(`${row.creatorId}\n${mediaId}`);
     return asset
       && String(asset.source || "") === "CUSTOM"
+      && String(asset.customSubmissionId || "") === String(row.id || "")
       && String(asset.customOrderId || "") === String(row.customOrderId || "")
       && Number(asset.customFullPriceCents) === expectedPrice;
   });
 }
-function serializeReviewItem(row, assetByKey) {
+function serializeReviewItem(row, assetByKey, revisionContext = null) {
   const order = row.customOrder;
   const creator = order?.creator || row.creator || null;
   const mediaIds = uniqueMediaIds(row.ofMediaIds);
@@ -95,6 +159,8 @@ function serializeReviewItem(row, assetByKey) {
     reviewedAt: row.reviewedAt ? new Date(row.reviewedAt).toISOString() : null,
     reviewedBy: row.reviewedByMember ? { id: String(row.reviewedByMember.id), name: row.reviewedByMember.displayName || null, roleKey: row.reviewedByMember.roleKey || null } : null,
     receivedAt: new Date(row.receivedAt).toISOString(),
+    revisionNumber: Math.max(1, Math.round(Number(revisionContext?.revisionNumber) || 1)),
+    previousRevisionRequest: revisionContext?.previousRevisionRequest || null,
     media,
   };
 }
@@ -132,7 +198,7 @@ async function loadAssets(db, agencyId, rows) {
     const expectedRows = or.reduce((sum, group) => sum + group.mediaId.in.length, 0);
     const found = await db.creatorMediaAsset.findMany({
       where: { agencyId, source: "CUSTOM", OR: or },
-      select: { creatorId: true, mediaId: true, source: true, customOrderId: true, customFullPriceCents: true, mediaType: true, thumbUrl: true, previewUrl: true, fullUrl: true },
+      select: { creatorId: true, mediaId: true, source: true, customOrderId: true, customSubmissionId: true, customFullPriceCents: true, mediaType: true, thumbUrl: true, previewUrl: true, fullUrl: true },
       take: expectedRows,
     });
     assets.push(...found);
@@ -166,11 +232,12 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
       ? await client.customContentSubmission.findMany({ where: { agencyId, customOrderId: { in: orderIds }, reviewStatus: REVIEW_APPROVED }, select: { customOrderId: true }, take: orderIds.length })
       : [];
     const approvedOrders = new Set(approvedRows.map((row) => String(row.customOrderId)));
+    const revisionContext = await loadRevisionContext(client, agencyId, validRows);
     for (const row of validRows) {
       if (items.length >= take) break;
       if (approvedOrders.has(String(row.customOrderId))) continue;
       if (!isFinalizedForReview(row, assetByKey)) continue;
-      items.push(serializeReviewItem(row, assetByKey));
+      items.push(serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))));
     }
     if (rows.length < 200) break;
   }
@@ -198,12 +265,16 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
   const currentStatus = normalizeStatus(row.reviewStatus);
 
   if (currentStatus === REVIEW_APPROVED) {
-    if (normalizedAction === "APPROVE") return { ok: true, idempotent: true, item: serializeReviewItem(row, assetByKey) };
+    if (normalizedAction === "APPROVE") {
+      const revisionContext = await loadRevisionContext(client, agencyId, [row]);
+      return { ok: true, idempotent: true, item: serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))) };
+    }
     throw fail("CUSTOM_REVIEW_APPROVAL_FINAL", "Approved custom content is final; reopen must be an explicit separate workflow", 409);
   }
   if (currentStatus === REVIEW_REVISION) {
     if (normalizedAction === "REQUEST_REVISION" && (row.reviewComment || null) === normalizedComment) {
-      return { ok: true, idempotent: true, item: serializeReviewItem(row, assetByKey) };
+      const revisionContext = await loadRevisionContext(client, agencyId, [row]);
+      return { ok: true, idempotent: true, item: serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))) };
     }
     throw fail("CUSTOM_REVIEW_ALREADY_DECIDED", "This submission already has a review decision", 409);
   }
@@ -239,7 +310,8 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
     metadata: { creatorId: row.creatorId, customOrderId: row.customOrderId, reviewStatus: nextStatus, revisionCommentLength: nextStatus === REVIEW_REVISION ? normalizedComment.length : 0 },
     db: client,
   });
-  return { ok: true, idempotent: false, item: serializeReviewItem(updated, assetByKey) };
+  const revisionContext = await loadRevisionContext(client, agencyId, [updated]);
+  return { ok: true, idempotent: false, item: serializeReviewItem(updated, assetByKey, revisionContext.get(String(updated.id))) };
 }
 
 module.exports = {

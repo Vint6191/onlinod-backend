@@ -80,6 +80,7 @@ test("V20.4 uses typed CreatorMediaAsset columns for Customs provenance, not met
   const block = schema.match(/model CreatorMediaAsset \{([\s\S]*?)\n\}/)?.[1] || "";
   assert.match(block, /source\s+CreatorMediaAssetSource\s+@default\(GENERAL\)/);
   assert.match(block, /customOrderId\s+String\?/);
+  assert.match(block, /customSubmissionId\s+String\?/);
   assert.match(block, /customFullPriceCents\s+Int\?/);
   assert.match(schema, /enum CreatorMediaAssetSource \{\s*GENERAL\s*CUSTOM\s*\}/);
   const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821131500_custom_content_library_columns/migration.sql"), "utf8");
@@ -99,6 +100,7 @@ test("finalize materializes every settled OF media id in Content Library with fu
   for (const asset of db._assets) {
     assert.equal(asset.source, "CUSTOM");
     assert.equal(asset.customOrderId, "custom-1");
+    assert.equal(asset.customSubmissionId, "submission-1");
     assert.equal(asset.customFullPriceCents, 6000);
     assert.equal(asset.catalogActive, true);
     assert.equal(asset.sortingStatus, "SORTED");
@@ -124,6 +126,7 @@ test("automatic Customs finalize never overwrites human Media Library descriptio
   const asset = db._assets.find((row) => row.mediaId === "9001");
   assert.equal(asset.source, "CUSTOM");
   assert.equal(asset.customOrderId, "custom-1");
+  assert.equal(asset.customSubmissionId, "submission-1");
   assert.equal(asset.customFullPriceCents, 6000);
   assert.equal(asset.description, "Manager edited description");
   assert.equal(asset.idealPriceCents, 3500);
@@ -136,6 +139,7 @@ test("an unassigned settled submission is still durable CUSTOM library content a
   for (const asset of db._assets) {
     assert.equal(asset.source, "CUSTOM");
     assert.equal(asset.customOrderId, null);
+    assert.equal(asset.customSubmissionId, "submission-1");
     assert.equal(asset.customFullPriceCents, null);
     assert.equal(asset.idealPriceCents, 0);
   }
@@ -145,6 +149,7 @@ test("an unassigned settled submission is still durable CUSTOM library content a
   assert.equal(synced.synced, true);
   for (const asset of db._assets) {
     assert.equal(asset.customOrderId, "custom-1");
+    assert.equal(asset.customSubmissionId, "submission-1");
     assert.equal(asset.customFullPriceCents, 6000);
     assert.equal(asset.idealPriceCents, 6000);
     assert.equal(asset.description, "Red lingerie video, two angles");
@@ -193,4 +198,16 @@ test("V20.5 finalize seeds existing Content Library preview columns from fresh O
     mediaHints: [{ mediaId: "9001", mediaType: "video", thumbUrl: "https://cdn.test/stale-upload-thumb.jpg" }],
   });
   assert.equal(first.thumbUrl, "https://cdn.test/scanner-fresh-thumb.jpg");
+});
+
+
+test("V20.9 Content Library stores exact submission provenance in a typed FK", () => {
+  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
+  const block = schema.match(/model CreatorMediaAsset \{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.match(block, /customSubmissionId\s+String\?/);
+  assert.match(block, /customSubmission\s+CustomContentSubmission\?/);
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260822123500_custom_content_submission_asset_provenance/migration.sql"), "utf8");
+  assert.match(migration, /ADD COLUMN "customSubmissionId" TEXT/);
+  assert.match(migration, /"mediaId" = ANY\(submission\."ofMediaIds"\)/);
+  assert.match(migration, /ON DELETE SET NULL ON UPDATE CASCADE/);
 });

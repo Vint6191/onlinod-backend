@@ -53,7 +53,7 @@ async function loadAssets(db, agencyId, rows) {
     const assets = await db.creatorMediaAsset.findMany({
       where: { agencyId, source: "CUSTOM", OR: or },
       select: {
-        creatorId: true, mediaId: true, source: true, customOrderId: true, customFullPriceCents: true,
+        creatorId: true, mediaId: true, source: true, customOrderId: true, customSubmissionId: true, customFullPriceCents: true,
         mediaType: true, thumbUrl: true, previewUrl: true, fullUrl: true, folderIds: true,
       },
       take,
@@ -76,6 +76,7 @@ function isReady(row, assets) {
     const asset = assets.get(assetKey(row.creatorId, mediaId));
     return asset
       && String(asset.source || "") === "CUSTOM"
+      && String(asset.customSubmissionId || "") === String(row.id || "")
       && String(asset.customOrderId || "") === String(order.id)
       && Number(asset.customFullPriceCents) === expectedPrice;
   });

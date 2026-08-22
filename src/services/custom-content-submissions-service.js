@@ -11,6 +11,9 @@ const MAX_OF_MEDIA_IDS = 200;
 const MAX_TELEGRAM_MESSAGE_ID = 2_147_483_647;
 const MAX_UPLOAD_WORK = 3;
 const MAX_RUNTIME_LEASES = 100;
+const REVIEW_WAITING = "WAITING_REVIEW";
+const REVIEW_REVISION = "REVISION_REQUESTED";
+const REVIEW_APPROVED = "APPROVED";
 
 function fail(code, message, status = 400) {
   return Object.assign(new Error(message), { code, status });
@@ -146,13 +149,37 @@ async function validateContentOrder({ agencyId, creatorId, customOrderId, db }) 
   if (!customOrderId) return null;
   const row = await db.customOrder.findFirst({
     where: { id: customOrderId, agencyId, creatorId },
-    select: { id: true, type: true },
+    select: { id: true, type: true, status: true, fanDeliveredAt: true },
   });
   if (!row) throw fail("CUSTOM_SUBMISSION_ORDER_NOT_FOUND", "Custom order was not found for this creator", 404);
   if (String(row.type || "CONTENT").toUpperCase() !== "CONTENT") {
     throw fail("CUSTOM_SUBMISSION_ORDER_TYPE_INVALID", "Only CONTENT custom orders can have content submissions", 409);
   }
+  if (String(row.status || "PENDING").toUpperCase() !== "PENDING" || row.fanDeliveredAt) {
+    throw fail("CUSTOM_SUBMISSION_ORDER_CLOSED", "Completed, delivered, missed or cancelled custom orders cannot receive new content submissions", 409);
+  }
   return row;
+}
+
+async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, excludeSubmissionId = null, db }) {
+  if (!customOrderId) return;
+  const exclude = excludeSubmissionId ? { id: { not: excludeSubmissionId } } : {};
+  const approved = await db.customContentSubmission.findFirst({
+    where: { agencyId, creatorId, customOrderId, reviewStatus: REVIEW_APPROVED, ...exclude },
+    select: { id: true },
+  });
+  if (approved) {
+    throw fail("CUSTOM_SUBMISSION_ORDER_ALREADY_APPROVED", "This custom order already has an approved content submission", 409);
+  }
+  const latest = await db.customContentSubmission.findFirst({
+    where: { agencyId, creatorId, customOrderId, ...exclude },
+    select: { id: true, reviewStatus: true },
+    orderBy: [{ receivedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }],
+  });
+  if (!latest) return;
+  if (String(latest.reviewStatus || REVIEW_WAITING) !== REVIEW_REVISION) {
+    throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "This custom order already has an active content submission awaiting manager review", 409);
+  }
 }
 
 async function createCustomContentSubmission({ agencyId, member, input = {}, now = new Date(), db = null } = {}) {
@@ -178,6 +205,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
     }
     throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT", "One or more Telegram messages already belong to another submission", 409);
   }
+  await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: client });
 
   let row;
   try {
@@ -199,7 +227,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
     if (raced && sameMessageIds(raced.telegramMessageIds, messageIds)) {
       return { ok: true, deduped: true, submission: serializeSubmission(raced) };
     }
-    throw error;
+    throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "Another content submission is already awaiting manager review for this custom order", 409);
   }
   await audit({
     agencyId,
@@ -246,10 +274,19 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   if ((row.customOrderId || null) === normalizedOrderId) {
     return { ok: true, unchanged: true, submission: serializeSubmission(row) };
   }
-  if (String(row.reviewStatus || "WAITING_REVIEW") !== "WAITING_REVIEW") {
+  if (String(row.reviewStatus || REVIEW_WAITING) !== REVIEW_WAITING) {
     throw fail("CUSTOM_SUBMISSION_REVIEW_LOCKED", "Reviewed submissions cannot be reassigned", 409);
   }
-  const updated = await client.customContentSubmission.update({ where: { id: row.id }, data: { customOrderId: normalizedOrderId } });
+  await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, db: client });
+  let updated;
+  try {
+    updated = await client.customContentSubmission.update({ where: { id: row.id }, data: { customOrderId: normalizedOrderId } });
+  } catch (error) {
+    if (error?.code === "P2002") {
+      throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "Another content submission is already awaiting manager review for this custom order", 409);
+    }
+    throw error;
+  }
   await audit({
     agencyId,
     actorUserId: member.userId || null,
@@ -323,6 +360,7 @@ async function pendingFinalizeRows({ agencyId, creatorIds, limit, db }) {
                AND asset."creatorId" = submission."creatorId"
                AND asset."mediaId" = media_id
                AND asset."source" = 'CUSTOM'
+               AND asset."customSubmissionId" = submission."id"
                AND asset."customOrderId" IS NOT DISTINCT FROM submission."customOrderId"
                AND (
                  (submission."customOrderId" IS NULL AND asset."customFullPriceCents" IS NULL)
@@ -362,6 +400,7 @@ async function pendingFinalizeRows({ agencyId, creatorIds, limit, db }) {
     const finalized = mediaIds.every((mediaId) => {
       const asset = byMediaId.get(mediaId);
       if (!asset) return false;
+      if ((asset.customSubmissionId || null) !== String(row.id || "")) return false;
       if ((asset.customOrderId || null) !== (row.customOrderId || null)) return false;
       return row.customOrderId
         ? Number(asset.customFullPriceCents) === priceCents

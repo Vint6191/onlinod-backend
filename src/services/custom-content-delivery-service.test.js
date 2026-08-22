@@ -19,7 +19,7 @@ function fixture() {
     receivedAt: new Date("2026-08-21T00:00:00.000Z"), creator, customOrder: order,
   };
   const assets = ["9001", "9002"].map((mediaId) => ({
-    creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000,
+    creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "sub-1", customFullPriceCents: 6000,
     mediaType: "video", thumbUrl: `https://cdn/${mediaId}.jpg`, previewUrl: `https://cdn/${mediaId}.preview`, fullUrl: `https://cdn/${mediaId}.mp4`, folderIds: ["folder-77"],
   }));
   const rows = [row];
@@ -83,7 +83,7 @@ test("delivery queue fails closed for partial Content Library finalization or de
   assets.pop();
   let result = await listCustomReadyDeliveries({ agencyId: "agency-1", member, db });
   assert.equal(result.items.length, 0);
-  assets.push({ creatorId: "creator-1", mediaId: "9002", source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000, mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: [] });
+  assets.push({ creatorId: "creator-1", mediaId: "9002", source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "sub-1", customFullPriceCents: 6000, mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: [] });
   order.fanDeliveredAt = new Date();
   result = await listCustomReadyDeliveries({ agencyId: "agency-1", member, db });
   assert.equal(result.items.length, 0);
@@ -112,4 +112,11 @@ test("ready queue pushes delivered/history filtering into Prisma instead of boun
   assert.equal(result.items.length, 0);
   assert.deepEqual(capturedWhere.customOrder, { is: { type: "CONTENT", status: "PENDING", fanDeliveredAt: null } });
   assert.deepEqual(capturedWhere.reviewedAt, { not: null });
+});
+
+test("V20.9 delivery readiness requires assets from the exact approved submission version", async () => {
+  const { db, member, assets } = fixture();
+  assets[0].customSubmissionId = "sub-old-rejected";
+  const result = await listCustomReadyDeliveries({ agencyId: "agency-1", member, db });
+  assert.deepEqual(result.items, [], "rejected/older version assets must never satisfy a newer approved submission");
 });

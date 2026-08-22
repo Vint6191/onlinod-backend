@@ -120,6 +120,7 @@ function assetToMetadata(asset) {
     onlyfansMediaId: String(asset.mediaId),
     source: String(asset.source || "GENERAL").toUpperCase() === "CUSTOM" ? "CUSTOM" : "GENERAL",
     customOrderId: asset.customOrderId == null ? null : String(asset.customOrderId),
+    customSubmissionId: asset.customSubmissionId == null ? null : String(asset.customSubmissionId),
     customFullPrice: asset.customFullPriceCents == null ? null : centsToDollars(asset.customFullPriceCents),
     customFullPriceCents: asset.customFullPriceCents == null ? null : Math.max(0, integer(asset.customFullPriceCents)),
     mediaType: normalizeMediaType(asset.mediaType),

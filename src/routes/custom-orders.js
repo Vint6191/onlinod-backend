@@ -23,6 +23,12 @@ const {
 const { finalizeCustomContentSubmissionLibrary } = require("../services/custom-content-library-service");
 const { listCustomContentReviewQueue, reviewCustomContentSubmission } = require("../services/custom-content-review-service");
 const {
+  assignUnassignedCustomContentSubmission,
+  listAwaitingCustomRevisions,
+  listCustomSubmissionAssignmentCandidates,
+  listUnassignedCustomContentSubmissions,
+} = require("../services/custom-content-workflow-service");
+const {
   claimDueReminders,
   acknowledgeReminder,
   releaseReminderClaim,
@@ -81,6 +87,53 @@ router.get("/submissions", async (req, res) => {
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_LIST_FAILED"); }
+});
+
+
+router.get("/submissions/unassigned-queue", async (req, res) => {
+  try {
+    return res.json(await listUnassignedCustomContentSubmissions({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      limit: req.query.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_UNASSIGNED_QUEUE_FAILED"); }
+});
+
+router.get("/submissions/:submissionId/assignment-candidates", async (req, res) => {
+  try {
+    return res.json(await listCustomSubmissionAssignmentCandidates({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      submissionId: req.params.submissionId,
+      limit: req.query.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_ASSIGNMENT_CANDIDATES_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/assign-unassigned", async (req, res) => {
+  try {
+    return res.json(await assignUnassignedCustomContentSubmission({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      submissionId: req.params.submissionId,
+      customOrderId: req.body?.customOrderId,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_ASSIGN_UNASSIGNED_FAILED"); }
+});
+
+router.get("/revision-queue", async (req, res) => {
+  try {
+    return res.json(await listAwaitingCustomRevisions({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      limit: req.query.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_REVISION_QUEUE_FAILED"); }
 });
 
 router.post("/submissions", async (req, res) => {

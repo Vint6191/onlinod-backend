@@ -18,7 +18,7 @@ function fixture() {
     reviewedAt: new Date("2026-08-22T08:00:00Z"), creator, customOrder: order,
   };
   const assets = ["9001", "9002"].map((mediaId) => ({
-    creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000,
+    creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "sub-1", customFullPriceCents: 6000,
     mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: ["folder-1"],
   }));
   const audits = [

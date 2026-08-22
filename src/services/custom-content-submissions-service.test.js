@@ -38,8 +38,9 @@ function fakeDb(seed = {}) {
 
   function matchesSubmission(row, where = {}) {
     if (where.id !== undefined) {
-      if (where.id && typeof where.id === "object" && Array.isArray(where.id.in)) {
-        if (!where.id.in.includes(row.id)) return false;
+      if (where.id && typeof where.id === "object") {
+        if (Array.isArray(where.id.in) && !where.id.in.includes(row.id)) return false;
+        if (where.id.not !== undefined && row.id === where.id.not) return false;
       } else if (row.id !== where.id) return false;
     }
     if (where.agencyId !== undefined && row.agencyId !== where.agencyId) return false;
@@ -49,6 +50,7 @@ function fakeDb(seed = {}) {
       } else if (row.creatorId !== where.creatorId) return false;
     }
     if (where.customOrderId !== undefined && row.customOrderId !== where.customOrderId) return false;
+    if (where.reviewStatus !== undefined && String(row.reviewStatus || "WAITING_REVIEW") !== String(where.reviewStatus)) return false;
     if (where.telegramMessageIds?.hasSome) {
       const ids = new Set((row.telegramMessageIds || []).map(Number));
       if (!where.telegramMessageIds.hasSome.some((id) => ids.has(Number(id)))) return false;
@@ -101,7 +103,13 @@ function fakeDb(seed = {}) {
       },
     },
     customContentSubmission: {
-      async findFirst({ where }) { return clone(submissions.find((row) => matchesSubmission(row, where)) || null); },
+      async findFirst({ where, orderBy = [] }) {
+        const matches = submissions.filter((row) => matchesSubmission(row, where));
+        if (Array.isArray(orderBy) && orderBy[0]?.receivedAt === "desc") {
+          matches.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt) || new Date(b.createdAt) - new Date(a.createdAt) || String(b.id).localeCompare(String(a.id)));
+        }
+        return clone(matches[0] || null);
+      },
       async create({ data }) {
         const stamp = new Date(`2026-08-21T12:${String(seq).padStart(2, "0")}:00.000Z`);
         const row = { id: `submission-${++seq}`, ...clone(data), createdAt: stamp, updatedAt: stamp };
@@ -286,7 +294,7 @@ test("V20.3 upload work reuses the existing Telegram runtime lease and stores no
   const db = fakeDb({ submissions: [
     baseSubmission({ id: "pending-a", telegramMessageIds: [501, 502], ofMediaIds: ["9001"], receivedAt: new Date("2026-08-21T09:00:00.000Z") }),
     baseSubmission({ id: "done", telegramMessageIds: [601], ofMediaIds: ["9101"], receivedAt: new Date("2026-08-21T08:00:00.000Z") }),
-  ], mediaAssets: [{ id: "asset-done", agencyId: "agency-1", creatorId: "creator-1", mediaId: "9101", source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000, catalogActive: true, folderIds: ["vault-1"], sortingStatus: "SORTED", metadataUpdatedAt: null, description: "custom one", idealPriceCents: 6000, accessType: "paid" }] });
+  ], mediaAssets: [{ id: "asset-done", agencyId: "agency-1", creatorId: "creator-1", mediaId: "9101", source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "done", customFullPriceCents: 6000, catalogActive: true, folderIds: ["vault-1"], sortingStatus: "SORTED", metadataUpdatedAt: null, description: "custom one", idealPriceCents: 6000, accessType: "paid" }] });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1",
     member,
@@ -373,7 +381,7 @@ test("V20.4 does not requeue a submission whose typed Content Library provenance
     submissions: [baseSubmission({ id: "finalized", telegramMessageIds: [911], ofMediaIds: ["99111"] })],
     mediaAssets: [{
       id: "asset-finalized", agencyId: "agency-1", creatorId: "creator-1", mediaId: "99111",
-      source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000,
+      source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "finalized", customFullPriceCents: 6000,
       catalogActive: true, folderIds: ["vault-1"], sortingStatus: "SORTED",
       metadataUpdatedAt: null, description: "custom one", idealPriceCents: 6000, accessType: "paid",
     }],
@@ -384,4 +392,34 @@ test("V20.4 does not requeue a submission whose typed Content Library provenance
     now: new Date("2026-08-21T13:00:00.000Z"), db,
   });
   assert.deepEqual(result.items, []);
+});
+
+test("V20.9 transport-neutral intake allows a new assigned version only after explicit revision request", async () => {
+  const waiting = baseSubmission({ id: "v1-waiting", telegramMessageIds: [1001], customOrderId: "custom-1", reviewStatus: "WAITING_REVIEW" });
+  const dbBusy = fakeDb({ submissions: [waiting] });
+  await assert.rejects(
+    () => createCustomContentSubmission({ agencyId: "agency-1", member, db: dbBusy, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1002] } }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_ORDER_BUSY" && error?.status === 409,
+  );
+
+  const revision = baseSubmission({ id: "v1-revision", telegramMessageIds: [1101], customOrderId: "custom-1", reviewStatus: "REVISION_REQUESTED", reviewComment: "Redo ending", reviewedAt: new Date("2026-08-21T11:00:00.000Z") });
+  const dbRevision = fakeDb({ submissions: [revision] });
+  const next = await createCustomContentSubmission({ agencyId: "agency-1", member, db: dbRevision, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1102] } });
+  assert.equal(next.deduped, false);
+  assert.equal(next.submission.customOrderId, "custom-1");
+
+  const approved = baseSubmission({ id: "v1-approved", telegramMessageIds: [1201], customOrderId: "custom-1", reviewStatus: "APPROVED", reviewedAt: new Date("2026-08-21T11:00:00.000Z") });
+  const dbApproved = fakeDb({ submissions: [approved] });
+  await assert.rejects(
+    () => createCustomContentSubmission({ agencyId: "agency-1", member, db: dbApproved, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1202] } }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_ORDER_ALREADY_APPROVED" && error?.status === 409,
+  );
+});
+
+test("V20.9 migration repairs ambiguous waiting rows into UNASSIGNED and enforces one active review version per custom", () => {
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260822123500_custom_content_submission_asset_provenance/migration.sql"), "utf8");
+  assert.match(migration, /SET "customOrderId" = NULL/);
+  assert.match(migration, /ROW_NUMBER\(\) OVER/);
+  assert.match(migration, /CustomContentSubmission_one_waiting_per_order_key/);
+  assert.match(migration, /WHERE "customOrderId" IS NOT NULL\s+AND "reviewStatus" = 'WAITING_REVIEW'/);
 });
