@@ -31,6 +31,7 @@ const {
   getCustomVaultDestination,
   setCustomVaultDestination,
 } = require("../services/custom-vault-destination-service");
+const { listCustomReadyDeliveries, getCustomReadyDelivery } = require("../services/custom-content-delivery-service");
 
 const router = express.Router();
 function bool(value) { return value === true || value === "1" || String(value || "").toLowerCase() === "true"; }
@@ -146,6 +147,28 @@ router.patch("/submissions/:submissionId", async (req, res) => {
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_UPDATE_FAILED"); }
 });
 
+
+router.get("/ready-deliveries", async (req, res) => {
+  try {
+    return res.json(await listCustomReadyDeliveries({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      limit: req.query.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_DELIVERY_LIST_FAILED"); }
+});
+
+router.get("/ready-deliveries/:customOrderId", async (req, res) => {
+  try {
+    return res.json(await getCustomReadyDelivery({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      customOrderId: req.params.customOrderId,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_DELIVERY_GET_FAILED"); }
+});
 
 router.get("/review-queue", async (req, res) => {
   try {
