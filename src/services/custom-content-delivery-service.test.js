@@ -9,7 +9,8 @@ function fixture() {
   const creator = { id: "creator-1", displayName: "Model One", username: "modelone", avatarUrl: null, customsVaultFolderId: "folder-77" };
   const order = {
     id: "custom-1", creatorId: "creator-1", dialogId: "777", scenario: "Custom scenario", internalNote: null,
-    type: "CONTENT", contentKind: "VIDEO", status: "PENDING", deliveredAt: null,
+    type: "CONTENT", contentKind: "VIDEO", status: "PENDING", deliveredAt: new Date("2026-08-20T01:00:00.000Z"), fanDeliveredAt: null,
+    deliverySentMediaIds: [], deliveryMessageIds: [], deliveryOfferedCents: 0,
     priceCents: 6000, paidAmountCents: 4000, createdAt: new Date("2026-08-20T00:00:00.000Z"), creator,
   };
   const row = {
@@ -54,6 +55,20 @@ test("approved finalized content becomes a compact READY_TO_DELIVER read model w
   assert.deepEqual(item.media.map((media) => media.mediaId), ["9001", "9002"]);
 });
 
+test("Telegram task deliveredAt does not suppress READY; partial fan delivery returns only remaining media and residual ask", async () => {
+  const { db, member, order } = fixture();
+  order.deliverySentMediaIds = ["9001"];
+  order.deliveryMessageIds = ["msg-1"];
+  order.deliveryOfferedCents = 1500;
+  const result = await getCustomReadyDelivery({ agencyId: "agency-1", member, customOrderId: "custom-1", db });
+  assert.equal(result.item.deliveryPriceCents, 500);
+  assert.equal(result.item.mediaCount, 1);
+  assert.equal(result.item.approvedMediaCount, 2);
+  assert.equal(result.item.deliveredMediaCount, 1);
+  assert.deepEqual(result.item.deliveredMediaIds, ["9001"]);
+  assert.deepEqual(result.item.media.map((media) => media.mediaId), ["9002"]);
+});
+
 test("fully paid approved custom is prepared as FREE without storing another payment state", async () => {
   const { db, member, order } = fixture();
   order.paidAmountCents = 6000;
@@ -69,7 +84,7 @@ test("delivery queue fails closed for partial Content Library finalization or de
   let result = await listCustomReadyDeliveries({ agencyId: "agency-1", member, db });
   assert.equal(result.items.length, 0);
   assets.push({ creatorId: "creator-1", mediaId: "9002", source: "CUSTOM", customOrderId: "custom-1", customFullPriceCents: 6000, mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: [] });
-  order.deliveredAt = new Date();
+  order.fanDeliveredAt = new Date();
   result = await listCustomReadyDeliveries({ agencyId: "agency-1", member, db });
   assert.equal(result.items.length, 0);
 });
@@ -95,6 +110,6 @@ test("ready queue pushes delivered/history filtering into Prisma instead of boun
   const member = { id: "chatter-1", agencyId: "agency-1", roleKey: "chatter", role: "OPERATOR", assignedCreators: "all", permissions: { "chats.reply": true } };
   const result = await listCustomReadyDeliveries({ agencyId: "agency-1", member, db });
   assert.equal(result.items.length, 0);
-  assert.deepEqual(capturedWhere.customOrder, { is: { type: "CONTENT", status: "PENDING", deliveredAt: null } });
+  assert.deepEqual(capturedWhere.customOrder, { is: { type: "CONTENT", status: "PENDING", fanDeliveredAt: null } });
   assert.deepEqual(capturedWhere.reviewedAt, { not: null });
 });

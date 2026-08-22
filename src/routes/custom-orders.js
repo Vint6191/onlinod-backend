@@ -32,6 +32,7 @@ const {
   setCustomVaultDestination,
 } = require("../services/custom-vault-destination-service");
 const { listCustomReadyDeliveries, getCustomReadyDelivery } = require("../services/custom-content-delivery-service");
+const { recordCustomDeliverySend } = require("../services/custom-content-delivery-tracking-service");
 
 const router = express.Router();
 function bool(value) { return value === true || value === "1" || String(value || "").toLowerCase() === "true"; }
@@ -168,6 +169,25 @@ router.get("/ready-deliveries/:customOrderId", async (req, res) => {
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_DELIVERY_GET_FAILED"); }
+});
+
+router.post("/ready-deliveries/:customOrderId/confirm-send", async (req, res) => {
+  try {
+    return res.json(await recordCustomDeliverySend({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      customOrderId: req.params.customOrderId,
+      creatorId: req.body?.creatorId,
+      dialogId: req.body?.dialogId,
+      messageId: req.body?.messageId,
+      mediaIds: req.body?.mediaIds,
+      priceCents: req.body?.priceCents,
+      occurredAt: req.body?.occurredAt,
+      overrideReason: req.body?.overrideReason,
+      duplicateOverride: req.body?.duplicateOverride === true,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_DELIVERY_CONFIRM_FAILED"); }
 });
 
 router.get("/review-queue", async (req, res) => {

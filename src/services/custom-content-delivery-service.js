@@ -25,7 +25,8 @@ const DELIVERY_INCLUDE = {
   customOrder: {
     select: {
       id: true, creatorId: true, dialogId: true, scenario: true, internalNote: true, type: true, contentKind: true,
-      status: true, deliveredAt: true, priceCents: true, paidAmountCents: true, createdAt: true,
+      status: true, deliveredAt: true, fanDeliveredAt: true, deliverySentMediaIds: true, deliveryMessageIds: true, deliveryOfferedCents: true,
+      priceCents: true, paidAmountCents: true, createdAt: true,
       creator: { select: { id: true, displayName: true, username: true, avatarUrl: true, customsVaultFolderId: true } },
     },
   },
@@ -63,7 +64,7 @@ async function loadAssets(db, agencyId, rows) {
 function isReady(row, assets) {
   const order = row?.customOrder;
   if (!order || String(order.type || "") !== "CONTENT") return false;
-  if (String(order.status || "") !== "PENDING" || order.deliveredAt) return false;
+  if (String(order.status || "") !== "PENDING" || order.fanDeliveredAt) return false;
   if (String(row.reviewStatus || "") !== "APPROVED" || !row.reviewedAt) return false;
   if (!isCompleteSubmission(row)) return false;
   const ids = uniqueMediaIds(row.ofMediaIds);
@@ -82,7 +83,12 @@ function serializeDelivery(row, assets) {
   const order = row.customOrder;
   const creator = order.creator || row.creator || null;
   const payment = paymentSnapshot(order.priceCents, order.paidAmountCents);
-  const media = uniqueMediaIds(row.ofMediaIds).map((mediaId) => {
+  const approvedMediaIds = uniqueMediaIds(row.ofMediaIds);
+  const deliveredMediaIds = uniqueMediaIds(order.deliverySentMediaIds);
+  const remainingMediaIds = approvedMediaIds.filter((mediaId) => !deliveredMediaIds.includes(mediaId));
+  const deliveryOfferedCents = Math.max(0, Math.round(Number(order.deliveryOfferedCents) || 0));
+  const deliveryPriceCents = Math.max(payment.remainingAmountCents - deliveryOfferedCents, 0);
+  const media = remainingMediaIds.map((mediaId) => {
     const asset = assets.get(assetKey(row.creatorId, mediaId)) || {};
     return {
       mediaId,
@@ -108,10 +114,15 @@ function serializeDelivery(row, assets) {
     paidAmountCents: payment.paidAmountCents,
     remainingAmountCents: payment.remainingAmountCents,
     paymentStatus: payment.paymentStatus,
-    deliveryPriceCents: payment.remainingAmountCents,
-    freeDelivery: payment.remainingAmountCents === 0,
+    deliveryPriceCents,
+    freeDelivery: deliveryPriceCents === 0,
     media,
     mediaCount: media.length,
+    approvedMediaCount: approvedMediaIds.length,
+    deliveredMediaIds,
+    deliveredMediaCount: deliveredMediaIds.filter((id) => approvedMediaIds.includes(id)).length,
+    deliveryMessageIds: uniqueMediaIds(order.deliveryMessageIds),
+    deliveryOfferedCents,
     readyAt: new Date(row.reviewedAt).toISOString(),
     vaultFolderId: clean(creator?.customsVaultFolderId, 180) || null,
   };
@@ -131,7 +142,7 @@ async function listCustomReadyDeliveries({ agencyId, member, limit = 100, db = n
         reviewStatus: "APPROVED",
         reviewedAt: { not: null },
         customOrderId: { not: null },
-        customOrder: { is: { type: "CONTENT", status: "PENDING", deliveredAt: null } },
+        customOrder: { is: { type: "CONTENT", status: "PENDING", fanDeliveredAt: null } },
         ...scopeWhere(scope),
       },
       include: DELIVERY_INCLUDE,
@@ -141,7 +152,7 @@ async function listCustomReadyDeliveries({ agencyId, member, limit = 100, db = n
     });
     if (!rows.length) break;
     cursor = rows[rows.length - 1].id;
-    const candidates = rows.filter((row) => row.customOrder && String(row.customOrder.type || "") === "CONTENT" && String(row.customOrder.status || "") === "PENDING" && !row.customOrder.deliveredAt && isCompleteSubmission(row));
+    const candidates = rows.filter((row) => row.customOrder && String(row.customOrder.type || "") === "CONTENT" && String(row.customOrder.status || "") === "PENDING" && !row.customOrder.fanDeliveredAt && isCompleteSubmission(row));
     const assets = await loadAssets(client, agencyId, candidates);
     for (const row of candidates) {
       if (items.length >= take) break;
@@ -164,7 +175,7 @@ async function getCustomReadyDelivery({ agencyId, member, customOrderId, db = nu
       customOrderId: orderId,
       reviewStatus: "APPROVED",
       reviewedAt: { not: null },
-      customOrder: { is: { type: "CONTENT", status: "PENDING", deliveredAt: null } },
+      customOrder: { is: { type: "CONTENT", status: "PENDING", fanDeliveredAt: null } },
       ...scopeWhere(scope),
     },
     include: DELIVERY_INCLUDE,

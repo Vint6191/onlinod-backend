@@ -532,6 +532,10 @@ model CustomOrder {
   acceptedAt                  DateTime?
   completedAt                 DateTime?
   deliveredAt                 DateTime?
+  fanDeliveredAt              DateTime?
+  deliverySentMediaIds        String[]                  @default([])
+  deliveryMessageIds          String[]                  @default([])
+  deliveryOfferedCents        Int                       @default(0)
   cancelledAt                 DateTime?
   cancelReason                String?
   mediaIds                    String                    @default("")

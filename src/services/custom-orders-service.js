@@ -182,7 +182,13 @@ function serializeOrder(row, now = new Date()) {
     physicalStatus: type === "PHYSICAL" ? normalizePhysicalStatus(row.physicalStatus || "WAITING") : null,
     acceptedAt: row.acceptedAt ? new Date(row.acceptedAt).toISOString() : null,
     completedAt: row.completedAt ? new Date(row.completedAt).toISOString() : null,
+    // deliveredAt is the historical Telegram task-delivery timestamp. Fan delivery
+    // is tracked independently so reminders/task delivery cannot suppress READY work.
     deliveredAt: row.deliveredAt ? new Date(row.deliveredAt).toISOString() : null,
+    fanDeliveredAt: row.fanDeliveredAt ? new Date(row.fanDeliveredAt).toISOString() : null,
+    deliverySentMediaIds: Array.isArray(row.deliverySentMediaIds) ? row.deliverySentMediaIds.map(String) : [],
+    deliveryMessageIds: Array.isArray(row.deliveryMessageIds) ? row.deliveryMessageIds.map(String) : [],
+    deliveryOfferedCents: Math.max(0, Math.round(Number(row.deliveryOfferedCents) || 0)),
     cancelledAt: row.cancelledAt ? new Date(row.cancelledAt).toISOString() : null,
     cancelReason: row.cancelReason || null,
     mediaIds: mediaIdsArray(row.mediaIds),
