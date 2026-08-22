@@ -12,7 +12,7 @@ test("V20.12 metadata read can omit plaintext payload while preserving managed-r
   const route = read("src/routes/creator-sessions.js");
   assert.match(route, /req\.query\.includePayload/);
   assert.match(route, /includePayload,\s*\n\s*\}\)/);
-  assert.match(route, /String\(req\.query\.includePayload \?\? "1"\).*!== "0"/);
+  assert.match(route, /String\(req\.query\.includePayload \?\? "0"\).*=== "1"/);
 });
 
 test("V20.12 backend independently removes non-portable OF cookie noise", () => {
@@ -21,5 +21,15 @@ test("V20.12 backend independently removes non-portable OF cookie noise", () => 
   assert.match(broker, /cloudfront-/i);
   assert.match(broker, /_ga_/);
   assert.match(broker, /__cf_bm/);
+  assert.match(broker, /startsWith\("__cf"\)/);
+  assert.match(broker, /startsWith\("cf_"\)/);
   assert.match(broker, /isPortableSessionCookieName/);
+});
+
+
+test("V20.13.2 broker read defaults to metadata-only and active access is enforced separately from revoke", () => {
+  const route = read("src/routes/creator-sessions.js");
+  assert.match(route, /includePayload = String\(req\.query\.includePayload \?\? "0"\).*=== "1"/);
+  assert.match(route, /if \(requireActive\) assertCreatorSessionTargetActive\(creator\)/);
+  assert.match(route, /authorize\(req, req\.params\.creatorId, input\.deviceId, \{ requireActive: false \}\)/);
 });

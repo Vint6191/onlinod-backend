@@ -5,6 +5,9 @@ const test = require("node:test");
 
 const {
   normalizePayload,
+  assertNoDuplicateCookies,
+  isCreatorSessionTargetActiveStatus,
+  assertCreatorSessionTargetActive,
   hashesForPayload,
   publicState,
   requireRegisteredDevice,
@@ -98,6 +101,50 @@ function payload({ sess = "sess-A", bcTokenSha = "bc-A", expiry = 1_900_000_000 
   };
 }
 
+
+
+test("creator session target is active only while DRAFT/READY, with DRAFT reserved for broker-first connect", () => {
+  assert.equal(isCreatorSessionTargetActiveStatus("DRAFT"), true);
+  assert.equal(isCreatorSessionTargetActiveStatus("READY"), true);
+  for (const status of ["DISABLED", "AUTH_FAILED", "NOT_CREATOR", "", null]) {
+    assert.equal(isCreatorSessionTargetActiveStatus(status), false, String(status));
+    assert.throws(
+      () => assertCreatorSessionTargetActive({ status }),
+      (error) => error?.code === "CREATOR_SESSION_CREATOR_INACTIVE" && error?.status === 409,
+    );
+  }
+});
+
+test("write path rejects a disabled creator even when direct service callers bypass the route", async () => {
+  const { db, creator } = makeDb();
+  creator.status = "DISABLED";
+  await assert.rejects(
+    writeCreatorSession({
+      db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+      baseRevision: 0, requestId: "request-disabled", platformUserId: "of-42", payload: payload(),
+    }),
+    (error) => error?.code === "CREATOR_SESSION_CREATOR_INACTIVE" && error?.status === 409,
+  );
+});
+
+test("canonical broker payload rejects duplicate cookie identities instead of creating an unhydratable envelope", async () => {
+  const duplicate = [payload().cookies[0], { ...payload().cookies[0] }];
+  assert.throws(
+    () => assertNoDuplicateCookies(duplicate),
+    (error) => error?.code === "CREATOR_SESSION_DUPLICATE_COOKIE" && error?.status === 400,
+  );
+
+  const { db } = makeDb();
+  await assert.rejects(
+    writeCreatorSession({
+      db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+      baseRevision: 0, requestId: "request-duplicate-cookie", platformUserId: "of-42",
+      payload: { ...payload(), cookies: [...payload().cookies, { ...payload().cookies[0] }] },
+    }),
+    (error) => error?.code === "CREATOR_SESSION_DUPLICATE_COOKIE" && error?.status === 400,
+  );
+});
+
 test("session payload normalization is an OnlyFans whitelist, not a browser-profile dump", () => {
   const normalized = normalizePayload({
     ...payload(),
@@ -113,6 +160,28 @@ test("session payload normalization is an OnlyFans whitelist, not a browser-prof
   assert.equal(normalized.userAgent, "UA/1");
   assert.equal(Object.hasOwn(normalized, "ignoredTopLevel"), false);
   assert.equal(Object.hasOwn(normalized.storage, "ignored"), false);
+});
+
+test("session payload normalization canonicalizes cookie path and persistence semantics for Chromium hydration", () => {
+  const normalized = normalizePayload({
+    ...payload(),
+    cookies: [
+      { name: "sess", value: "A", domain: ".onlyfans.com", hostOnly: false, path: "api", secure: true, httpOnly: true, session: false, expirationDate: null },
+      { name: "auth_id", value: "42", domain: "onlyfans.com", hostOnly: true, path: "/", secure: true, httpOnly: false, session: true, expirationDate: 1900000000 },
+      { name: "persist", value: "P", domain: ".onlyfans.com", hostOnly: false, path: "nested/path", secure: true, httpOnly: false, session: false, expirationDate: 1900000000 },
+    ],
+  });
+  const sess = normalized.cookies.find((cookie) => cookie.name === "sess");
+  const auth = normalized.cookies.find((cookie) => cookie.name === "auth_id");
+  const persistent = normalized.cookies.find((cookie) => cookie.name === "persist");
+  assert.equal(sess.path, "/api");
+  assert.equal(sess.session, true, "missing expiry must materialize as a session cookie");
+  assert.equal(sess.expirationDate, null);
+  assert.equal(auth.session, true);
+  assert.equal(auth.expirationDate, null, "session cookie must not carry meaningless expiry metadata");
+  assert.equal(persistent.path, "/nested/path");
+  assert.equal(persistent.session, false);
+  assert.equal(persistent.expirationDate, 1900000000);
 });
 
 test("session payload normalization rejects lookalike domains instead of substring matching", () => {
@@ -260,7 +329,31 @@ test("server rejects a snapshot proven for a different OnlyFans identity", async
   );
 });
 
-test("revoke increments revision, deletes ciphertext fields, and later verified write can reactivate", async () => {
+
+test("revoke retry is idempotent even when the client repeats the original baseRevision", async () => {
+  const { db } = makeDb();
+  await writeCreatorSession({
+    db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+    baseRevision: 0, requestId: "request-before-revoke", platformUserId: "of-42", payload: payload(),
+  });
+  const first = await revokeCreatorSession({
+    db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+    baseRevision: 1, requestId: "request-revoke-idempotent", reason: "verified logout",
+  });
+  assert.equal(first.state.revision, 2);
+  assert.equal(first.idempotent, false);
+
+  const retry = await revokeCreatorSession({
+    db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+    baseRevision: 1, requestId: "request-revoke-idempotent", reason: "verified logout",
+  });
+  assert.equal(retry.state.revision, 2);
+  assert.equal(retry.state.status, "REVOKED");
+  assert.equal(retry.idempotent, true);
+  assert.equal(retry.unchanged, true);
+});
+
+test("revoke increments revision, deletes ciphertext fields, and generic write cannot resurrect it", async () => {
   const { db, getState } = makeDb();
   await writeCreatorSession({
     db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
@@ -275,12 +368,16 @@ test("revoke increments revision, deletes ciphertext fields, and later verified 
   assert.equal(getState().encryptedPayload, null);
   assert.equal(publicState(getState(), { includePayload: true }).payload, null);
 
-  const reactivated = await writeCreatorSession({
-    db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
-    baseRevision: 2, requestId: "request-0003", platformUserId: "of-42", payload: payload({ sess: "sess-new" }),
-  });
-  assert.equal(reactivated.state.revision, 3);
-  assert.equal(reactivated.state.status, "ACTIVE");
+  await assert.rejects(
+    writeCreatorSession({
+      db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+      baseRevision: 2, requestId: "request-0003", platformUserId: "of-42", payload: payload({ sess: "sess-new" }),
+    }),
+    (error) => error?.code === "CREATOR_SESSION_REVOKED" && error?.status === 409 && error?.current?.status === "REVOKED",
+  );
+  assert.equal(getState().revision, 2);
+  assert.equal(getState().status, "REVOKED");
+  assert.equal(getState().encryptedPayload, null);
 });
 
 test("shadow-session normalization drops Cloudflare, analytics and CDN noise before hashing", () => {
@@ -289,6 +386,9 @@ test("shadow-session normalization drops Cloudflare, analytics and CDN noise bef
     cookies: [
       ...payload().cookies,
       { name: "__cf_bm", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "__cflb", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "cf_clearance", value: "noise", domain: ".onlyfans.com", path: "/" },
+      { name: "cf_chl_2", value: "noise", domain: ".onlyfans.com", path: "/" },
       { name: "_cfuvid", value: "noise", domain: ".onlyfans.com", path: "/" },
       { name: "_ga", value: "noise", domain: ".onlyfans.com", path: "/" },
       { name: "_ga_XYZ", value: "noise", domain: ".onlyfans.com", path: "/" },

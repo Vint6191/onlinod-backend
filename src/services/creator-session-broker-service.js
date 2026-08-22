@@ -36,6 +36,7 @@ function isPortableSessionCookieName(name) {
   const lower = String(name || "").trim().toLowerCase();
   if (!lower || SESSION_COOKIE_NOISE_EXACT.has(lower)) return false;
   if (lower.startsWith("cloudfront-")) return false;
+  if (lower.startsWith("__cf") || lower.startsWith("cf_")) return false;
   if (lower === "_ga" || lower.startsWith("_ga_") || lower.startsWith("_gat_")) return false;
   return true;
 }
@@ -52,22 +53,59 @@ function normalizeCookie(cookie) {
   if (!name || !domain || !isOnlyFansCookieDomain(domain) || !isPortableSessionCookieName(name)) return null;
 
   const expiration = Number(source.expirationDate);
-  const expirationDate = Number.isFinite(expiration) && expiration > 0 ? expiration : null;
+  const rawExpirationDate = Number.isFinite(expiration) && expiration > 0 ? expiration : null;
+  const session = source.session === true || rawExpirationDate === null;
+  const expirationDate = session ? null : rawExpirationDate;
 
   const hostOnly = source.hostOnly === true ? true : source.hostOnly === false ? false : !domain.startsWith(".");
+  const rawPath = nullableText(source.path, 2048) || "/";
+  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
 
   return {
     name,
     value: text(source.value, 32_768),
     domain,
     hostOnly,
-    path: nullableText(source.path, 2048) || "/",
+    path,
     secure: source.secure !== false,
     httpOnly: source.httpOnly === true,
     sameSite: normalizeSameSite(source.sameSite),
-    session: source.session === true,
+    session,
     expirationDate,
   };
+}
+
+function cookieIdentity(cookie) {
+  return `${String(cookie.domain || "").trim().replace(/^\.+/, "").toLowerCase()}\u0000${String(cookie.path || "/").trim() || "/"}\u0000${String(cookie.name || "").trim()}`;
+}
+
+function assertNoDuplicateCookies(cookies) {
+  const seen = new Set();
+  for (const cookie of cookies) {
+    const key = cookieIdentity(cookie);
+    if (seen.has(key)) {
+      const error = new Error("Duplicate OnlyFans cookie identity is not allowed");
+      error.code = "CREATOR_SESSION_DUPLICATE_COOKIE";
+      error.status = 400;
+      throw error;
+    }
+    seen.add(key);
+  }
+}
+
+function isCreatorSessionTargetActiveStatus(value) {
+  const status = String(value || "").trim().toUpperCase();
+  // DRAFT is intentionally allowed: the future broker-first creator-connect flow
+  // must be able to establish canonical R1 before complete-runtime marks READY.
+  return status === "DRAFT" || status === "READY";
+}
+
+function assertCreatorSessionTargetActive(creator) {
+  if (isCreatorSessionTargetActiveStatus(creator?.status)) return;
+  const error = new Error("Creator is not active for session-broker access");
+  error.code = "CREATOR_SESSION_CREATOR_INACTIVE";
+  error.status = 409;
+  throw error;
 }
 
 function normalizePayload(payload) {
@@ -205,6 +243,24 @@ function sessionConflict(current) {
   return error;
 }
 
+function sameWriteRequest(current, { requestId, deviceId, coherenceHash, platformUserId }) {
+  if (!current || current.sourceRequestId !== requestId || current.capturedByDeviceId !== deviceId) return false;
+  if (current.coherenceHash !== coherenceHash || current.platformUserId !== platformUserId) {
+    const error = new Error("requestId was already used for different creator session data");
+    error.code = "CREATOR_SESSION_REQUEST_ID_REUSED";
+    error.status = 409;
+    throw error;
+  }
+  return true;
+}
+
+function sameRevokeRequest(current, { requestId, deviceId }) {
+  return Boolean(current
+    && current.status === "REVOKED"
+    && current.sourceRequestId === requestId
+    && current.capturedByDeviceId === deviceId);
+}
+
 async function writeCreatorSession({
   db,
   agencyId,
@@ -244,6 +300,7 @@ async function writeCreatorSession({
     error.status = 404;
     throw error;
   }
+  assertCreatorSessionTargetActive(creator);
   if (creator.remoteId && String(creator.remoteId) !== identity) {
     const error = new Error("The verified OnlyFans identity does not match this creator");
     error.code = "CREATOR_SESSION_IDENTITY_MISMATCH";
@@ -258,6 +315,7 @@ async function writeCreatorSession({
     error.status = 400;
     throw error;
   }
+  assertNoDuplicateCookies(normalizedPayload.cookies);
   const strongCookieNames = new Set(normalizedPayload.cookies.map((cookie) => String(cookie.name || "").toLowerCase()));
   if (!strongCookieNames.has("sess") && !strongCookieNames.has("auth_id")) {
     const error = new Error("A strong OnlyFans auth cookie is required");
@@ -277,13 +335,7 @@ async function writeCreatorSession({
   return db.$transaction(async (tx) => {
     const current = await tx.creatorSessionState.findUnique({ where: { creatorId } });
 
-    if (current?.sourceRequestId === normalizedRequestId && current.capturedByDeviceId === deviceId) {
-      if (current.coherenceHash !== coherenceHash || current.platformUserId !== identity) {
-        const error = new Error("requestId was already used for different creator session data");
-        error.code = "CREATOR_SESSION_REQUEST_ID_REUSED";
-        error.status = 409;
-        throw error;
-      }
+    if (sameWriteRequest(current, { requestId: normalizedRequestId, deviceId, coherenceHash, platformUserId: identity })) {
       return { state: publicState(current, { includePayload: false }), idempotent: true, unchanged: true };
     }
 
@@ -316,11 +368,21 @@ async function writeCreatorSession({
       } catch (error) {
         if (error?.code !== "P2002") throw error;
         const raced = await tx.creatorSessionState.findUnique({ where: { creatorId } });
+        if (sameWriteRequest(raced, { requestId: normalizedRequestId, deviceId, coherenceHash, platformUserId: identity })) {
+          return { state: publicState(raced, { includePayload: false }), idempotent: true, unchanged: true };
+        }
         throw sessionConflict(raced);
       }
     }
 
     if (current.agencyId !== agencyId || Number(current.revision) !== revision) throw sessionConflict(current);
+    if (current.status === "REVOKED") {
+      const error = new Error("Revoked creator session requires an explicit re-initialize flow");
+      error.code = "CREATOR_SESSION_REVOKED";
+      error.status = 409;
+      error.current = publicState(current, { includePayload: false });
+      throw error;
+    }
 
     if (current.status === "ACTIVE" && current.coherenceHash === coherenceHash && current.platformUserId === identity) {
       return { state: publicState(current, { includePayload: false }), idempotent: false, unchanged: true };
@@ -349,6 +411,9 @@ async function writeCreatorSession({
     });
     if (updated.count !== 1) {
       const raced = await tx.creatorSessionState.findUnique({ where: { creatorId } });
+      if (sameWriteRequest(raced, { requestId: normalizedRequestId, deviceId, coherenceHash, platformUserId: identity })) {
+        return { state: publicState(raced, { includePayload: false }), idempotent: true, unchanged: true };
+      }
       throw sessionConflict(raced);
     }
     const next = await tx.creatorSessionState.findUnique({ where: { creatorId } });
@@ -372,10 +437,11 @@ async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, devi
       if (revision !== 0) throw sessionConflict(null);
       return { state: publicState(null, { includePayload: false }), idempotent: false, unchanged: true };
     }
-    if (current.agencyId !== agencyId || Number(current.revision) !== revision) throw sessionConflict(current);
-    if (current.sourceRequestId === normalizedRequestId && current.capturedByDeviceId === deviceId && current.status === "REVOKED") {
+    if (current.agencyId !== agencyId) throw sessionConflict(current);
+    if (sameRevokeRequest(current, { requestId: normalizedRequestId, deviceId })) {
       return { state: publicState(current, { includePayload: false }), idempotent: true, unchanged: true };
     }
+    if (Number(current.revision) !== revision) throw sessionConflict(current);
     if (current.status === "REVOKED") {
       return { state: publicState(current, { includePayload: false }), idempotent: false, unchanged: true };
     }
@@ -402,6 +468,9 @@ async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, devi
     });
     if (updated.count !== 1) {
       const raced = await tx.creatorSessionState.findUnique({ where: { creatorId } });
+      if (sameRevokeRequest(raced, { requestId: normalizedRequestId, deviceId })) {
+        return { state: publicState(raced, { includePayload: false }), idempotent: true, unchanged: true };
+      }
       throw sessionConflict(raced);
     }
     const next = await tx.creatorSessionState.findUnique({ where: { creatorId } });
@@ -411,6 +480,9 @@ async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, devi
 
 module.exports = {
   normalizePayload,
+  assertNoDuplicateCookies,
+  isCreatorSessionTargetActiveStatus,
+  assertCreatorSessionTargetActive,
   hashesForPayload,
   publicState,
   requireRegisteredDevice,

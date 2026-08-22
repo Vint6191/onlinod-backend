@@ -9,6 +9,7 @@ const { requireCreatorAccess } = require("../middleware/automation-permissions")
 const { audit } = require("../services/audit-service");
 const {
   requireRegisteredDevice,
+  assertCreatorSessionTargetActive,
   getCreatorSession,
   writeCreatorSession,
   revokeCreatorSession,
@@ -57,13 +58,14 @@ const revokeSchema = z.object({
   reason: z.string().trim().max(500).optional().nullable(),
 }).strict();
 
-async function authorize(req, creatorId, deviceId) {
+async function authorize(req, creatorId, deviceId, { requireActive = true } = {}) {
   const creator = await requireCreatorAccess({
     agencyId: req.auth.agencyId,
     member: req.auth.membership || req.member,
     creatorId,
     db: prisma,
   });
+  if (requireActive) assertCreatorSessionTargetActive(creator);
   const device = await requireRegisteredDevice({
     db: prisma,
     agencyId: req.auth.agencyId,
@@ -95,7 +97,7 @@ router.get("/:creatorId", async (req, res) => {
   try {
     const deviceId = deviceIdSchema.parse(req.query.deviceId);
     const { creator, device } = await authorize(req, req.params.creatorId, deviceId);
-    const includePayload = String(req.query.includePayload ?? "1").trim() !== "0";
+    const includePayload = String(req.query.includePayload ?? "0").trim() === "1";
     const state = await getCreatorSession({
       db: prisma,
       agencyId: req.auth.agencyId,
@@ -158,7 +160,7 @@ router.post("/:creatorId", async (req, res) => {
 router.post("/:creatorId/revoke", async (req, res) => {
   try {
     const input = revokeSchema.parse(req.body || {});
-    const { creator, device } = await authorize(req, req.params.creatorId, input.deviceId);
+    const { creator, device } = await authorize(req, req.params.creatorId, input.deviceId, { requireActive: false });
     const result = await revokeCreatorSession({
       db: prisma,
       agencyId: req.auth.agencyId,
