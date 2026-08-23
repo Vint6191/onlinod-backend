@@ -32,6 +32,19 @@ enum CreatorSessionStateStatus {
   REVOKED
 }
 
+enum AgencyProxyType {
+  HTTP
+  HTTPS
+  SOCKS4
+  SOCKS4A
+  SOCKS5
+}
+
+enum CreatorNetworkMode {
+  DIRECT
+  PROXY
+}
+
 enum CustomOrderStatus {
   PENDING
   COMPLETED
@@ -249,6 +262,8 @@ model Agency {
   connectSessions CreatorConnectSession[]
   accessSnapshots AccessSnapshot[]
   creatorSessionStates CreatorSessionState[]
+  proxyEndpoints AgencyProxyEndpoint[]
+  creatorNetworkProfiles CreatorNetworkProfile[]
   workerDevices WorkerDevice[]
   auditLogs AuditLog[]
   subscriptions AgencySubscription[]
@@ -435,6 +450,7 @@ model CreatorAccount {
   connectSessions CreatorConnectSession[]
   accessSnapshots AccessSnapshot[]
   sessionState CreatorSessionState?
+  networkProfile CreatorNetworkProfile?
   earningsSnapshots  CreatorEarningsSnapshot[]
   campaignsSnapshot  CreatorCampaignsSnapshot?
   jobs               JobInstance[]
@@ -762,6 +778,52 @@ model CreatorSessionState {
   @@index([capturedByUserId])
   @@index([capturedByDeviceId])
   @@index([updatedAt])
+}
+
+model AgencyProxyEndpoint {
+  id               String          @id @default(cuid())
+  agencyId         String
+  label            String
+  type             AgencyProxyType
+  host             String
+  port             Int
+  enabled          Boolean         @default(true)
+  version          Int             @default(1)
+  encryptedPayload String?         @db.Text
+  iv               String?
+  tag              String?
+  algorithm        String?
+  payloadVersion   Int             @default(1)
+  hasCredentials   Boolean         @default(false)
+  usernameHint     String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  agency          Agency                  @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorProfile  CreatorNetworkProfile?  @relation("CreatorNetworkProfileProxy")
+
+  @@unique([agencyId, id])
+  @@index([agencyId, updatedAt])
+  @@index([agencyId, enabled])
+}
+
+model CreatorNetworkProfile {
+  id              String             @id @default(cuid())
+  agencyId        String
+  creatorId       String             @unique
+  mode            CreatorNetworkMode @default(DIRECT)
+  proxyEndpointId String? @unique
+  version         Int                @default(1)
+  updatedByUserId String?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  agency        Agency               @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator       CreatorAccount       @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  proxyEndpoint AgencyProxyEndpoint? @relation("CreatorNetworkProfileProxy", fields: [agencyId, proxyEndpointId], references: [agencyId, id], onDelete: NoAction)
+
+  @@index([agencyId])
+  @@index([agencyId, mode])
 }
 
 model WorkerDevice {

@@ -171,6 +171,14 @@ router.get("/", async (req, res) => {
             updatedAt: true,
           },
         },
+        networkProfile: {
+          select: {
+            mode: true,
+            proxyEndpointId: true,
+            version: true,
+            updatedAt: true,
+          },
+        },
       },
       orderBy: { createdAt: "desc" },
       take: 10000});
@@ -252,6 +260,14 @@ router.get("/:id", creatorAccessRequired, async (req, res) => {
             payloadVersion: true,
             platformUserId: true,
             capturedByDeviceId: true,
+            updatedAt: true,
+          },
+        },
+        networkProfile: {
+          select: {
+            mode: true,
+            proxyEndpointId: true,
+            version: true,
             updatedAt: true,
           },
         },

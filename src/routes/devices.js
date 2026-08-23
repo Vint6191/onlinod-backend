@@ -322,6 +322,14 @@ router.post("/heartbeat", async (req, res) => {
             updatedAt: true,
           },
         },
+        networkProfile: {
+          select: {
+            mode: true,
+            proxyEndpointId: true,
+            version: true,
+            updatedAt: true,
+          },
+        },
       },
       take: 10000,
     }) : [];
@@ -333,6 +341,13 @@ router.post("/heartbeat", async (req, res) => {
       platformUserId: creator.sessionState?.platformUserId || creator.remoteId || null,
       capturedByDeviceId: creator.sessionState?.capturedByDeviceId || null,
       updatedAt: creator.sessionState?.updatedAt || null,
+    }));
+    const creatorNetworks = manifestRows.map((creator) => ({
+      creatorId: creator.id,
+      mode: creator.networkProfile?.mode || "DIRECT",
+      version: creator.networkProfile?.version || 0,
+      proxyEndpointId: creator.networkProfile?.proxyEndpointId || null,
+      updatedAt: creator.networkProfile?.updatedAt || null,
     }));
 
     return res.json({
@@ -348,6 +363,7 @@ router.post("/heartbeat", async (req, res) => {
       revokedCreatorIds: Array.from(new Set(revokedCreatorIds)),
       revokedPartitions: Array.from(new Set(revokedPartitions)),
       creatorSessions,
+      creatorNetworks,
       commands,
       observation,
       permissionsVersion: Date.now(),
