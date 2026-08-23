@@ -31,8 +31,10 @@ function makeDb() {
     },
     creatorNetworkProfile: {
       async findUnique({ where }) {
-        const row = profiles.get(where.creatorId);
-        return row ? { ...row } : null;
+        const key = where.agencyId_creatorId;
+        if (!key) return null;
+        const row = profiles.get(key.creatorId);
+        return row && row.agencyId === key.agencyId ? { ...row } : null;
       },
       async findFirst({ where }) {
         for (const row of profiles.values()) {
@@ -115,10 +117,12 @@ test("V20.18 dedicated proxy is enforced by Prisma schema and migration", () => 
   const root = path.resolve(__dirname, "../..");
   const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
   const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260823140000_creator_network_profiles/migration.sql"), "utf8");
-  assert.match(schema, /proxyEndpointId\s+String\?\s+@unique/);
+  const relationFixMigration = fs.readFileSync(path.join(root, "prisma/migrations/20260823174500_creator_network_profile_composite_relation_keys/migration.sql"), "utf8");
+  assert.match(schema, /@@unique\(\[agencyId, creatorId\], map: "CreatorNetworkProfile_agencyId_creatorId_key"\)/);
+  assert.match(schema, /@@unique\(\[agencyId, proxyEndpointId\], map: "CreatorNetworkProfile_agencyId_proxyEndpointId_key"\)/);
   assert.match(schema, /creatorProfile\s+CreatorNetworkProfile\?/);
   assert.match(schema, /@@unique\(\[agencyId, id\]\)/);
   assert.match(schema, /fields:\s*\[agencyId, proxyEndpointId\][\s\S]*references:\s*\[agencyId, id\]/);
-  assert.match(migration, /CREATE UNIQUE INDEX "CreatorNetworkProfile_proxyEndpointId_key" ON "CreatorNetworkProfile"\("proxyEndpointId"\);/);
+  assert.match(relationFixMigration, /CREATE UNIQUE INDEX "CreatorNetworkProfile_agencyId_proxyEndpointId_key"\s+ON "CreatorNetworkProfile"\("agencyId", "proxyEndpointId"\);/);
   assert.match(migration, /FOREIGN KEY \(\"agencyId\", \"proxyEndpointId\"\) REFERENCES \"AgencyProxyEndpoint\"\(\"agencyId\", \"id\"\)/);
 });

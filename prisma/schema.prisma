@@ -810,9 +810,9 @@ model AgencyProxyEndpoint {
 model CreatorNetworkProfile {
   id              String             @id @default(cuid())
   agencyId        String
-  creatorId       String             @unique
+  creatorId       String
   mode            CreatorNetworkMode @default(DIRECT)
-  proxyEndpointId String? @unique
+  proxyEndpointId String?
   version         Int                @default(1)
   updatedByUserId String?
   createdAt       DateTime           @default(now())
@@ -822,6 +822,8 @@ model CreatorNetworkProfile {
   creator       CreatorAccount       @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   proxyEndpoint AgencyProxyEndpoint? @relation("CreatorNetworkProfileProxy", fields: [agencyId, proxyEndpointId], references: [agencyId, id], onDelete: NoAction)
 
+  @@unique([agencyId, creatorId], map: "CreatorNetworkProfile_agencyId_creatorId_key")
+  @@unique([agencyId, proxyEndpointId], map: "CreatorNetworkProfile_agencyId_proxyEndpointId_key")
   @@index([agencyId])
   @@index([agencyId, mode])
 }

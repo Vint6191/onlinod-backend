@@ -254,7 +254,7 @@ async function setCreatorNetworkProfile({ db, agencyId, creatorId, actorUserId, 
       }
     }
 
-    const current = await tx.creatorNetworkProfile.findUnique({ where: { creatorId } });
+    const current = await tx.creatorNetworkProfile.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } });
     const currentVersion = current ? Number(current.version || 1) : 0;
     if (currentVersion !== version) throw networkError("CREATOR_NETWORK_VERSION_CONFLICT", "Creator network assignment was changed on another device", 409, { current: profilePublic(current, creator) });
 
@@ -297,10 +297,10 @@ async function setCreatorNetworkProfile({ db, agencyId, creatorId, actorUserId, 
       throw error;
     }
     if (updated.count !== 1) {
-      const raced = await tx.creatorNetworkProfile.findUnique({ where: { creatorId } });
+      const raced = await tx.creatorNetworkProfile.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } });
       throw networkError("CREATOR_NETWORK_VERSION_CONFLICT", "Creator network assignment was changed on another device", 409, { current: profilePublic(raced, creator) });
     }
-    const row = await tx.creatorNetworkProfile.findUnique({ where: { creatorId } });
+    const row = await tx.creatorNetworkProfile.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } });
     return { profile: profilePublic(row, creator), unchanged: same };
   }, "CREATOR_NETWORK_VERSION_CONFLICT", "Creator network assignment was changed concurrently");
 }
