@@ -160,6 +160,18 @@ router.get("/", async (req, res) => {
         deletedAt: null,
         ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
       },
+      include: {
+        sessionState: {
+          select: {
+            status: true,
+            revision: true,
+            payloadVersion: true,
+            platformUserId: true,
+            capturedByDeviceId: true,
+            updatedAt: true,
+          },
+        },
+      },
       orderBy: { createdAt: "desc" },
       take: 10000});
 
@@ -231,6 +243,18 @@ router.get("/:id", creatorAccessRequired, async (req, res) => {
         id: req.params.id,
         agencyId: req.auth.agencyId,
         deletedAt: null,
+      },
+      include: {
+        sessionState: {
+          select: {
+            status: true,
+            revision: true,
+            payloadVersion: true,
+            platformUserId: true,
+            capturedByDeviceId: true,
+            updatedAt: true,
+          },
+        },
       },
     });
 
