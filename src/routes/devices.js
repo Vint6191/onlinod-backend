@@ -2,6 +2,7 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { authRequired } = require("../middleware/auth");
+const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { updateObservationFromHeartbeat, recordRealtimeObservationPing, realtimeFrameSampleAt } = require("../services/team-observation-service");
 const {
   OFFLINE_DIALOG_RECOVERY_GAP_MS,
@@ -156,12 +157,13 @@ router.post("/heartbeat", async (req, res) => {
     const input = heartbeatSchema.parse(req.body || {});
     const agencyId = input.agencyId || input.activeAgencyId || req.auth.agencyId;
 
+    let heartbeatMembership = req.auth.membership;
     if (agencyId !== req.auth.agencyId) {
-      const member = await prisma.agencyMember.findFirst({
+      heartbeatMembership = await prisma.agencyMember.findFirst({
         where: { userId: req.auth.userId, agencyId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
       });
 
-      if (!member) {
+      if (!heartbeatMembership) {
         return res.status(403).json({ ok: false, code: "DEVICE_AGENCY_FORBIDDEN", error: "User has no access to this agency" });
       }
     }
@@ -287,6 +289,52 @@ router.post("/heartbeat", async (req, res) => {
       if (Array.isArray(payload.partitions)) revokedPartitions.push(...payload.partitions.map(String));
     }
 
+    // Revision correctness is state-based. DeviceCommand remains only a wakeup
+    // hint: every successful heartbeat returns the current canonical session
+    // manifest for creators that this authenticated membership may access. No
+    // encrypted payload, cookie value, IV/tag or credential hash is exposed.
+    const requestedCreatorIds = Array.from(new Set((input.accounts || [])
+      .flatMap((account) => [account?.creatorId, account?.accountId])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)))
+      .slice(0, 10000);
+    const creatorScope = await allowedCreatorScope({ agencyId, member: heartbeatMembership });
+    const allowedCreatorIds = creatorScope.broad ? null : new Set(creatorScope.creatorIds);
+    const scopedCreatorIds = allowedCreatorIds
+      ? requestedCreatorIds.filter((id) => allowedCreatorIds.has(id))
+      : requestedCreatorIds;
+    const manifestRows = scopedCreatorIds.length ? await prisma.creatorAccount.findMany({
+      where: {
+        agencyId,
+        deletedAt: null,
+        id: { in: scopedCreatorIds },
+      },
+      select: {
+        id: true,
+        remoteId: true,
+        sessionState: {
+          select: {
+            status: true,
+            revision: true,
+            payloadVersion: true,
+            platformUserId: true,
+            capturedByDeviceId: true,
+            updatedAt: true,
+          },
+        },
+      },
+      take: 10000,
+    }) : [];
+    const creatorSessions = manifestRows.map((creator) => ({
+      creatorId: creator.id,
+      revision: creator.sessionState?.revision || 0,
+      status: creator.sessionState?.status || "MISSING",
+      payloadVersion: creator.sessionState?.payloadVersion || null,
+      platformUserId: creator.sessionState?.platformUserId || creator.remoteId || null,
+      capturedByDeviceId: creator.sessionState?.capturedByDeviceId || null,
+      updatedAt: creator.sessionState?.updatedAt || null,
+    }));
+
     return res.json({
       ok: true,
       device,
@@ -299,6 +347,7 @@ router.post("/heartbeat", async (req, res) => {
       forceLogout,
       revokedCreatorIds: Array.from(new Set(revokedCreatorIds)),
       revokedPartitions: Array.from(new Set(revokedPartitions)),
+      creatorSessions,
       commands,
       observation,
       permissionsVersion: Date.now(),
