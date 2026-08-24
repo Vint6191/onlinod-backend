@@ -12,6 +12,7 @@ const creatorConnectRoutes = require("./routes/creator-connect");
 const accessSnapshotRoutes = require("./routes/access-snapshots");
 const creatorSessionRoutes = require("./routes/creator-sessions");
 const networkProfileRoutes = require("./routes/network-profiles");
+const clientE2eKeyringRoutes = require("./routes/client-e2e-keyring");
 const adminRoutes = require("./routes/admin");
 const adminDataRoutes = require("./routes/admin-data");
 const adminBillingRoutes = require("./routes/admin-billing");
@@ -233,6 +234,7 @@ app.use("/api/creators", creatorRoutes);
 app.use("/api/creator-connect", creatorConnectRoutes);
 app.use("/api/creator-sessions", creatorSessionRoutes);
 app.use("/api/network-profiles", networkProfileRoutes);
+app.use("/api/client-e2e-keyring", clientE2eKeyringRoutes);
 app.use("/api", accessSnapshotRoutes);
 
 app.get("*", (req, res, next) => {

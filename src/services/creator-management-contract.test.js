@@ -64,7 +64,7 @@ test("agency removal revokes live access but preserves creator history transacti
   assert.match(removal, /agencyMember\.findMany/);
   assert.match(removal, /removeCreatorFromAssignedCreators/);
   assert.match(removal, /agencyMember\.update/);
-  assert.match(removal, /accessSnapshot\.updateMany/);
+  assert.match(removal, /retireCreatorCryptoMaterialOnRemoval/);
   assert.match(removal, /deviceCreatorBinding\.updateMany/);
   assert.match(removal, /creatorConnectSession\.updateMany/);
   assert.match(removal, /status: \{ in: \["SCHEDULED", "CLAIMED", "FAILED"\] \}/);

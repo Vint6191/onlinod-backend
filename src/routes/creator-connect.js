@@ -6,6 +6,7 @@ const { authRequired } = require("../middleware/auth");
 const { randomToken, sha256, addMinutes } = require("../utils/crypto");
 const { encryptSnapshot, hashUserAgent } = require("../services/snapshot-crypto");
 const { audit } = require("../services/audit-service");
+const { assertLegacyAccessSnapshotWritable } = require("../services/legacy-access-snapshot-policy");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
 
 const router = express.Router();
@@ -162,7 +163,32 @@ async function upsertPublicDevice({ agencyId, userId, deviceId, deviceName, plat
   });
 }
 
+async function requireLiveCreatorConnectSecretTarget({ db, agencyId, creatorId, sessionId }) {
+  const creator = await db.creatorAccount.findFirst({
+    where: { id: creatorId, agencyId, deletedAt: null },
+    select: { id: true, status: true, username: true, remoteId: true, displayName: true, avatarUrl: true, partition: true },
+  });
+  if (!creator) {
+    const error = new Error("Creator was removed before the connection snapshot could be committed");
+    error.code = "CREATOR_CONNECT_CREATOR_REMOVED";
+    error.status = 409;
+    throw error;
+  }
+  const connectSession = await db.creatorConnectSession.findFirst({
+    where: { id: sessionId, agencyId, creatorId, status: { in: ["PENDING", "CLAIMED"] } },
+    select: { id: true, status: true },
+  });
+  if (!connectSession) {
+    const error = new Error("Creator connection is no longer active");
+    error.code = "CREATOR_CONNECT_SESSION_STALE";
+    error.status = 409;
+    throw error;
+  }
+  return { creator, connectSession };
+}
+
 async function completeSessionWithSnapshot({ session, snapshot, deviceId, actorUserId, action }) {
+  await assertLegacyAccessSnapshotWritable({ db: prisma, agencyId: session.agencyId });
   const snapshotPayload = {
     ...snapshot,
     creatorId: session.creatorId,
@@ -175,6 +201,8 @@ async function completeSessionWithSnapshot({ session, snapshot, deviceId, actorU
   const remoteId = snapshot.remoteId || session.creator.remoteId || null;
 
   const result = await prisma.$transaction(async (tx) => {
+    await assertLegacyAccessSnapshotWritable({ db: tx, agencyId: session.agencyId });
+    await requireLiveCreatorConnectSecretTarget({ db: tx, agencyId: session.agencyId, creatorId: session.creatorId, sessionId: session.id });
     await tx.accessSnapshot.updateMany({
       where: {
         agencyId: session.agencyId,
@@ -233,7 +261,7 @@ async function completeSessionWithSnapshot({ session, snapshot, deviceId, actorU
       creator,
       session: updatedSession,
     };
-  });
+  }, { isolationLevel: "Serializable" });
 
   await scheduleJobsAfterReady(result.creator);
 
@@ -441,12 +469,8 @@ router.post("/complete-public", async (req, res) => {
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
-    console.error("[creator-connect/complete-public] failed:", err);
-    return res.status(500).json({
-      ok: false,
-      code: "CONNECT_COMPLETE_PUBLIC_FAILED",
-      error: err?.message || "Failed to complete creator connection",
-    });
+    if (Number(err?.status || 0) >= 500) console.error("[creator-connect/complete-public] failed:", err);
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "CONNECT_COMPLETE_PUBLIC_FAILED", error: err?.message || "Failed to complete creator connection" });
   }
 });
 
@@ -516,12 +540,8 @@ router.post("/simulate-complete-public", async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("[creator-connect/simulate-complete-public] failed:", err);
-    return res.status(500).json({
-      ok: false,
-      code: "SIMULATE_COMPLETE_PUBLIC_FAILED",
-      error: err?.message || "Failed to simulate complete",
-    });
+    if (Number(err?.status || 0) >= 500) console.error("[creator-connect/simulate-complete-public] failed:", err);
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "SIMULATE_COMPLETE_PUBLIC_FAILED", error: err?.message || "Failed to simulate complete" });
   }
 });
 
@@ -801,6 +821,7 @@ router.post("/:id/complete", async (req, res) => {
       return res.status(403).json({ ok: false, code: "TOKEN_INVALID", error: "Connect token is invalid" });
     }
 
+    await assertLegacyAccessSnapshotWritable({ db: prisma, agencyId: req.auth.agencyId });
     const snapshotPayload = {
       ...input.snapshot,
       creatorId: session.creatorId,
@@ -813,6 +834,8 @@ router.post("/:id/complete", async (req, res) => {
     const remoteId = input.snapshot.remoteId || session.creator.remoteId || null;
 
     const result = await prisma.$transaction(async (tx) => {
+      await assertLegacyAccessSnapshotWritable({ db: tx, agencyId: req.auth.agencyId });
+      await requireLiveCreatorConnectSecretTarget({ db: tx, agencyId: req.auth.agencyId, creatorId: session.creatorId, sessionId: session.id });
       await tx.accessSnapshot.updateMany({
         where: {
           agencyId: req.auth.agencyId,
@@ -870,7 +893,7 @@ router.post("/:id/complete", async (req, res) => {
         creator,
         session: updatedSession,
       };
-    });
+    }, { isolationLevel: "Serializable" });
 
     await scheduleJobsAfterReady(result.creator);
 
@@ -907,13 +930,8 @@ router.post("/:id/complete", async (req, res) => {
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
-    console.error("[creator-connect/complete] failed:", err);
-
-    return res.status(500).json({
-      ok: false,
-      code: "CONNECT_COMPLETE_FAILED",
-      error: err?.message || "Failed to complete creator connection",
-    });
+    if (Number(err?.status || 0) >= 500) console.error("[creator-connect/complete] failed:", err);
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "CONNECT_COMPLETE_FAILED", error: err?.message || "Failed to complete creator connection" });
   }
 });
 
@@ -955,6 +973,7 @@ router.post("/:id/simulate-complete", async (req, res) => {
 
     // Reuse the same logic by calling local helper would be cleaner, but
     // Express cannot re-enter the route stack safely. Keep the operation explicit.
+    await assertLegacyAccessSnapshotWritable({ db: prisma, agencyId: req.auth.agencyId });
     const encrypted = encryptSnapshot({
       ...req.body.snapshot,
       creatorId: session.creatorId,
@@ -965,6 +984,8 @@ router.post("/:id/simulate-complete", async (req, res) => {
     const remoteId = req.body.snapshot.remoteId;
 
     const result = await prisma.$transaction(async (tx) => {
+      await assertLegacyAccessSnapshotWritable({ db: tx, agencyId: req.auth.agencyId });
+      await requireLiveCreatorConnectSecretTarget({ db: tx, agencyId: req.auth.agencyId, creatorId: session.creatorId, sessionId: session.id });
       await tx.accessSnapshot.updateMany({
         where: {
           agencyId: req.auth.agencyId,
@@ -1023,7 +1044,7 @@ router.post("/:id/simulate-complete", async (req, res) => {
         creator,
         session: updatedSession,
       };
-    });
+    }, { isolationLevel: "Serializable" });
 
     await scheduleJobsAfterReady(result.creator);
 
@@ -1054,12 +1075,8 @@ router.post("/:id/simulate-complete", async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("[creator-connect/simulate-complete] failed:", err);
-    return res.status(500).json({
-      ok: false,
-      code: "SIMULATE_COMPLETE_FAILED",
-      error: err?.message || "Failed to simulate complete",
-    });
+    if (Number(err?.status || 0) >= 500) console.error("[creator-connect/simulate-complete] failed:", err);
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "SIMULATE_COMPLETE_FAILED", error: err?.message || "Failed to simulate complete" });
   }
 });
 

@@ -4,6 +4,10 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { audit } = require("./audit-service");
 const {
+  revokeOwnerRootAccessForMember,
+  requireOwnerCryptoCommitActor,
+} = require("./client-e2e-keyring-service");
+const {
   TEAM_FUNCTION_KEYS,
   PRESET_ROLES,
   PERMISSION_BY_KEY,
@@ -96,6 +100,57 @@ const SELF_SCOPED_PERMISSION_KEYS = new Set([
 const DELEGATED_PERMISSION_KEYS = Object.freeze(
   PUBLIC_PERMISSION_KEYS.filter((key) => !SELF_SCOPED_PERMISSION_KEYS.has(key))
 );
+
+async function serializableTeamTransaction(db, fn) {
+  return db.$transaction(fn, { isolationLevel: "Serializable" });
+}
+
+function requireLiveTeamActor(actor) {
+  if (!actor || actor.deletedAt || actor.deactivatedAt) {
+    const error = new Error("Team administration actor is no longer active");
+    error.code = "TEAM_ACTOR_INACTIVE";
+    error.status = 403;
+    throw error;
+  }
+  return actor;
+}
+
+function teamCryptoProofError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = 403;
+  return error;
+}
+
+async function requireOwnerPossessionForCryptoDestructiveTeamMutation({
+  tx,
+  agencyId,
+  actorUserId,
+  liveActor,
+  actorDeviceId,
+  actorProof,
+}) {
+  // Preserve pre-E2E Team Administration semantics until an agency root exists.
+  // Once AMK-backed crypto is initialized, any Team mutation that removes OWNER
+  // authority is itself a destructive crypto operation because the same
+  // Serializable transaction revokes that member's AMK wraps.
+  const root = await tx.agencyCryptoRoot.findUnique({ where: { agencyId }, select: { agencyId: true } });
+  if (!root) return null;
+  if (!String(actorDeviceId || "").trim()) {
+    throw teamCryptoProofError("CRYPTO_ACTOR_DEVICE_REQUIRED", "OWNER crypto-sensitive Team Administration requires a device-bound authentication token");
+  }
+  if (!String(actorProof || "").trim()) {
+    throw teamCryptoProofError("CRYPTO_ACTOR_PROOF_REQUIRED", "OWNER crypto-sensitive Team Administration requires possession of the active Agency Master Key");
+  }
+  return requireOwnerCryptoCommitActor({
+    db: tx,
+    agencyId,
+    userId: actorUserId,
+    member: liveActor,
+    deviceId: actorDeviceId,
+    actorProof,
+  });
+}
 
 function assertRoleConfigurationWithinActor({ actorMember, actorPermissions, role }) {
   if (isOwner(actorMember)) return;
@@ -414,7 +469,7 @@ async function assertOwnerSafety({ agencyId, targetMember, nextRoleKey = null, r
   }
 }
 
-async function updateMemberSettings({ agencyId, memberId, patch, actorMember, actorUserId: actorId, db = prisma }) {
+async function updateMemberSettings({ agencyId, memberId, patch, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
   const target = await db.agencyMember.findFirst({
     where: { id: memberId, agencyId, deletedAt: null },
     include: { user: true, teamFunctions: { select: { functionKey: true } } },
@@ -461,15 +516,33 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
   const nextFunctions = patch.functions === undefined ? null : cleanFunctions(patch.functions);
   const before = memberToClient(target);
 
-  const updated = await db.$transaction(async (tx) => {
+  const ownerDemoted = isOwner(target) && nextRoleKey !== "owner";
+  const updated = await serializableTeamTransaction(db, async (tx) => {
+    const liveActor = requireLiveTeamActor(await tx.agencyMember.findFirst({ where: { id: actorMember?.id, agencyId, deletedAt: null } }));
+    const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
+    if (!liveTarget) { const error = new Error("Member not found in this agency"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
+    assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
+    if ((nextRoleKey === "owner" || isOwner(liveTarget)) && !isOwner(liveActor)) { const error = new Error("Only OWNER can promote or demote an OWNER"); error.code = "OWNER_ROLE_CHANGE_REQUIRED"; error.status = 403; throw error; }
+    await assertActorCanAssignRole({ agencyId, actorMember: liveActor, roleKey: nextRoleKey, db: tx });
+    await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey, db: tx });
+    assertActorCanGrantCreatorScope({ actorMember: liveActor, targetMember: liveTarget, assignedCreators: creatorScope ? creatorScope.value : liveTarget.assignedCreators });
+    const liveOwnerDemoted = isOwner(liveTarget) && nextRoleKey !== "owner";
+    if (liveOwnerDemoted) {
+      await requireOwnerPossessionForCryptoDestructiveTeamMutation({
+        tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
+      });
+    }
     const row = await tx.agencyMember.update({
-      where: { id: target.id },
+      where: { id: liveTarget.id },
       data: {
         ...(patch.displayName !== undefined ? { displayName: patch.displayName || null } : {}),
         ...(patch.roleKey !== undefined ? { roleKey: nextRoleKey, role: roleKeyToLegacy(nextRoleKey) } : {}),
         ...(creatorScope ? { assignedCreators: creatorScope.value } : {}),
       },
     });
+    if (liveOwnerDemoted) {
+      await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: new Date() });
+    }
     if (nextFunctions !== null) {
       await tx.teamMemberFunction.deleteMany({ where: { agencyId, memberId: target.id } });
       if (nextFunctions.length) {
@@ -505,7 +578,7 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
   return after;
 }
 
-async function setMemberStatus({ agencyId, memberId, status, actorMember, actorUserId: actorId, db = prisma }) {
+async function setMemberStatus({ agencyId, memberId, status, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
   const target = await db.agencyMember.findFirst({ where: { id: memberId, agencyId, deletedAt: null } });
   if (!target) {
     const error = new Error("Member not found");
@@ -523,11 +596,23 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
   if (status === "deactivated") await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
 
   const deactivatedAt = status === "deactivated" ? new Date() : null;
-  await db.$transaction(async (tx) => {
-    await tx.agencyMember.update({ where: { id: target.id }, data: { deactivatedAt } });
+  await serializableTeamTransaction(db, async (tx) => {
+    const liveActor = requireLiveTeamActor(await tx.agencyMember.findFirst({ where: { id: actorMember?.id, agencyId, deletedAt: null } }));
+    const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
+    if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
+    assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
+    if (liveTarget.id === liveActor.id && status === "deactivated") { const error = new Error("You cannot deactivate your own active membership"); error.code = "CANNOT_DEACTIVATE_SELF"; error.status = 409; throw error; }
+    if (status === "deactivated") await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey: null, removing: true, db: tx });
+    if (status === "deactivated" && isOwner(liveTarget)) {
+      await requireOwnerPossessionForCryptoDestructiveTeamMutation({
+        tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
+      });
+    }
+    await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deactivatedAt } });
     if (status === "deactivated") {
+      await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deactivatedAt });
       await tx.refreshSession.updateMany({
-        where: { userId: target.userId, agencyId, revokedAt: null },
+        where: { userId: liveTarget.userId, agencyId, revokedAt: null },
         data: { revokedAt: new Date() },
       });
     }
@@ -544,7 +629,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
   return { id: target.id, status, deactivatedAt };
 }
 
-async function removeMember({ agencyId, memberId, actorMember, actorUserId: actorId, db = prisma }) {
+async function removeMember({ agencyId, memberId, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
   const target = await db.agencyMember.findFirst({ where: { id: memberId, agencyId, deletedAt: null } });
   if (!target) {
     const error = new Error("Member not found");
@@ -561,9 +646,21 @@ async function removeMember({ agencyId, memberId, actorMember, actorUserId: acto
   }
   await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
   const deletedAt = new Date();
-  await db.$transaction(async (tx) => {
-    await tx.agencyMember.update({ where: { id: target.id }, data: { deletedAt, deactivatedAt: deletedAt } });
-    await tx.refreshSession.updateMany({ where: { userId: target.userId, agencyId, revokedAt: null }, data: { revokedAt: deletedAt } });
+  await serializableTeamTransaction(db, async (tx) => {
+    const liveActor = requireLiveTeamActor(await tx.agencyMember.findFirst({ where: { id: actorMember?.id, agencyId, deletedAt: null } }));
+    const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
+    if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
+    assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
+    if (liveTarget.id === liveActor.id) { const error = new Error("You cannot remove your own membership"); error.code = "CANNOT_REMOVE_SELF"; error.status = 409; throw error; }
+    await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey: null, removing: true, db: tx });
+    if (isOwner(liveTarget)) {
+      await requireOwnerPossessionForCryptoDestructiveTeamMutation({
+        tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
+      });
+    }
+    await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deletedAt, deactivatedAt: deletedAt } });
+    await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deletedAt });
+    await tx.refreshSession.updateMany({ where: { userId: liveTarget.userId, agencyId, revokedAt: null }, data: { revokedAt: deletedAt } });
   });
   await audit({
     agencyId,

@@ -11,7 +11,7 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 test("V20.12 metadata read can omit plaintext payload while preserving managed-read compatibility", () => {
   const route = read("src/routes/creator-sessions.js");
   assert.match(route, /req\.query\.includePayload/);
-  assert.match(route, /includePayload,\s*\n\s*\}\)/);
+  assert.match(route, /getCreatorSession\(\{[\s\S]*?includePayload,[\s\S]*?\}\)/);
   assert.match(route, /String\(req\.query\.includePayload \?\? "0"\).*=== "1"/);
 });
 

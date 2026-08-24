@@ -31,20 +31,24 @@ test("V20.11 server exposes broker separately from legacy AccessSnapshot routes"
   const route = read("src/routes/creator-sessions.js");
   assert.match(server, /app\.use\("\/api\/creator-sessions", creatorSessionRoutes\)/);
   assert.match(route, /requireCreatorAccess/);
-  assert.match(route, /requireRegisteredDevice/);
+  assert.match(route, /requireAuthDevice/);
+  assert.match(route, /CREATOR_SESSION_DEVICE_BOUND_TOKEN_REQUIRED/);
+  assert.doesNotMatch(route, /requireRegisteredDevice/, "mutable WorkerDevice telemetry must not be session crypto authority");
   assert.match(route, /baseRevision/);
   assert.match(route, /requestId/);
   assert.doesNotMatch(route, /accessSnapshot/);
 });
 
-test("creator removal revokes and zeroes the new canonical credential envelope", () => {
+test("creator removal revokes and zeroes the new canonical credential envelope through the centralized retirement lifecycle", () => {
   const creators = read("src/routes/creators.js");
   const admin = read("src/routes/admin.js");
+  const retirement = read("src/services/creator-agency-removal.js");
   for (const source of [creators, admin]) {
-    assert.match(source, /creatorSessionState\.updateMany/);
-    assert.match(source, /status: "REVOKED"/);
-    assert.match(source, /encryptedPayload: null/);
-    assert.match(source, /credentialHash: null/);
-    assert.match(source, /coherenceHash: null/);
+    assert.match(source, /retireCreatorCryptoMaterialOnRemoval\(\{/);
   }
+  assert.match(retirement, /creatorSessionState\.updateMany/);
+  assert.match(retirement, /status: "REVOKED"/);
+  assert.match(retirement, /encryptedPayload: null/);
+  assert.match(retirement, /credentialHash: null/);
+  assert.match(retirement, /coherenceHash: null/);
 });

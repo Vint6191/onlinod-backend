@@ -10,7 +10,7 @@ const { creatorManagementRequired } = require("../middleware/creator-management-
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
-const { agencyRemovalPhrase, removeCreatorFromAssignedCreators } = require("../services/creator-agency-removal");
+const { agencyRemovalPhrase, removeCreatorFromAssignedCreators, retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
 const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
 
 const router = express.Router();
@@ -515,25 +515,14 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
         removedFromInvitationAssignments += 1;
       }
 
-      await tx.accessSnapshot.updateMany({ where: { creatorId: existing.id, active: true }, data: { active: false, revokedAt: removedAt } });
-      await tx.creatorSessionState.updateMany({
-        where: { creatorId: existing.id, status: "ACTIVE" },
-        data: {
-          revision: { increment: 1 },
-          status: "REVOKED",
-          encryptedPayload: null,
-          iv: null,
-          tag: null,
-          algorithm: null,
-          credentialHash: null,
-          coherenceHash: null,
-          capturedAt: removedAt,
-          capturedByUserId: req.auth.userId,
-          capturedByDeviceId: null,
-          sourceRequestId: `creator-removal:${existing.id}:${removedAt.getTime()}`,
-          revokedAt: removedAt,
-          revokeReason: "CREATOR_REMOVED_FROM_AGENCY",
-        },
+      const cryptoRetirement = await retireCreatorCryptoMaterialOnRemoval({
+        db: tx,
+        agencyId: req.auth.agencyId,
+        creatorId: existing.id,
+        retiredAt: removedAt,
+        actorUserId: req.auth.userId,
+        sourceRequestId: `creator-removal:${existing.id}:${removedAt.getTime()}`,
+        revokeReason: "CREATOR_REMOVED_FROM_AGENCY",
       });
       await tx.deviceCreatorBinding.updateMany({ where: { creatorId: existing.id }, data: { status: "REVOKED" } });
       await tx.creatorConnectSession.updateMany({ where: { creatorId: existing.id, status: { in: ["PENDING", "CLAIMED"] } }, data: { status: "CANCELLED", cancelledAt: removedAt } });
@@ -559,13 +548,14 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
             partition: existing.partition,
             removedFromMemberAssignments,
             removedFromInvitationAssignments,
+            ...cryptoRetirement,
             historyPreserved: true,
             messageHistoryPreserved: true,
             crmDataPreserved: true,
           },
         },
       });
-      return { removedFromMemberAssignments, removedFromInvitationAssignments };
+      return { removedFromMemberAssignments, removedFromInvitationAssignments, ...cryptoRetirement };
     }, { maxWait: 10_000, timeout: 120_000 });
 
     return res.json({
@@ -574,6 +564,12 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
       partition: existing.partition,
       removedFromMemberAssignments: result.removedFromMemberAssignments,
       removedFromInvitationAssignments: result.removedFromInvitationAssignments,
+      revokedAccessSnapshotCount: result.revokedAccessSnapshotCount,
+      retiredAccessSnapshotSecretCount: result.retiredAccessSnapshotSecretCount,
+      revokedCanonicalSessionCount: result.revokedCanonicalSessionCount,
+      retiredCanonicalSessionSecretCount: result.retiredCanonicalSessionSecretCount,
+      revokedCreatorKeyWrapCount: result.revokedCreatorKeyWrapCount,
+      retiredDedicatedProxyCount: result.retiredDedicatedProxyCount,
       historyPreserved: true,
     });
   } catch (err) {

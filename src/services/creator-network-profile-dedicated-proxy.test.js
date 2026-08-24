@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { setCreatorNetworkProfile } = require("./creator-network-profile-service");
+const ownerActor = { userId: "owner-1", agencyId: "agency-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", permissions: {}, deletedAt: null, deactivatedAt: null };
 
 function makeDb() {
   const creators = new Map([
@@ -12,11 +13,12 @@ function makeDb() {
     ["creator-b", { id: "creator-b", agencyId: "agency-1", displayName: "B", username: "b", status: "ACTIVE", deletedAt: null }],
   ]);
   const proxies = new Map([
-    ["proxy-1", { id: "proxy-1", agencyId: "agency-1", label: "Proxy 1", type: "SOCKS5", host: "127.0.0.1", port: 1080, enabled: true, version: 1 }],
+    ["proxy-1", { id: "proxy-1", agencyId: "agency-1", label: "Proxy 1", type: "SOCKS5", host: "127.0.0.1", port: 1080, enabled: true, version: 1, ownerCreatorId: null, encryptionMode: "SERVER_V1" }],
   ]);
   const profiles = new Map();
 
   const tx = {
+    agencyMember: { async findUnique() { return { ...ownerActor, userId: "admin", agencyId: "agency-1" }; } },
     creatorAccount: {
       async findFirst({ where }) {
         const row = creators.get(where.id);
@@ -25,8 +27,25 @@ function makeDb() {
     },
     agencyProxyEndpoint: {
       async findFirst({ where }) {
-        const row = proxies.get(where.id);
-        return row && row.agencyId === where.agencyId ? { ...row } : null;
+        for (const row of proxies.values()) {
+          if (where.id && row.id !== where.id) continue;
+          if (where.agencyId && row.agencyId !== where.agencyId) continue;
+          if (Object.hasOwn(where, "ownerCreatorId") && row.ownerCreatorId !== where.ownerCreatorId) continue;
+          if (where.NOT?.id && row.id === where.NOT.id) continue;
+          return { ...row };
+        }
+        return null;
+      },
+      async updateMany({ where, data }) {
+        let count = 0;
+        for (const row of proxies.values()) {
+          if (where.id && row.id !== where.id) continue;
+          if (where.agencyId && row.agencyId !== where.agencyId) continue;
+          if (Object.hasOwn(where, "ownerCreatorId") && row.ownerCreatorId !== where.ownerCreatorId) continue;
+          Object.assign(row, structuredClone(data));
+          count += 1;
+        }
+        return { count };
       },
     },
     creatorNetworkProfile: {
@@ -87,7 +106,7 @@ function makeDb() {
   };
 }
 
-test("V20.18 dedicated proxy: one endpoint cannot be assigned to two creators", async () => {
+test("V20.19 dedicated ownership: one endpoint cannot belong to two creators", async () => {
   const { db } = makeDb();
   const first = await setCreatorNetworkProfile({
     db, agencyId: "agency-1", creatorId: "creator-a", actorUserId: "admin", expectedVersion: 0,
@@ -100,17 +119,19 @@ test("V20.18 dedicated proxy: one endpoint cannot be assigned to two creators", 
       db, agencyId: "agency-1", creatorId: "creator-b", actorUserId: "admin", expectedVersion: 0,
       mode: "PROXY", proxyEndpointId: "proxy-1",
     }),
-    (error) => error?.code === "PROXY_ALREADY_ASSIGNED" && error?.status === 409,
+    (error) => error?.code === "PROXY_OWNED_BY_ANOTHER_CREATOR" && error?.status === 409,
   );
 });
 
-test("V20.18 dedicated proxy: Direct profiles may coexist and releasing a proxy makes it assignable", async () => {
+test("V20.19 dedicated ownership: Direct mode keeps the creator-owned proxy reserved", async () => {
   const { db } = makeDb();
-  const a1 = await setCreatorNetworkProfile({ db, agencyId: "agency-1", creatorId: "creator-a", expectedVersion: 0, mode: "PROXY", proxyEndpointId: "proxy-1" });
-  const a2 = await setCreatorNetworkProfile({ db, agencyId: "agency-1", creatorId: "creator-a", expectedVersion: a1.profile.version, mode: "DIRECT", proxyEndpointId: null });
+  const a1 = await setCreatorNetworkProfile({ db, agencyId: "agency-1", actorMember: ownerActor, creatorId: "creator-a", expectedVersion: 0, mode: "PROXY", proxyEndpointId: "proxy-1" });
+  const a2 = await setCreatorNetworkProfile({ db, agencyId: "agency-1", actorMember: ownerActor, creatorId: "creator-a", expectedVersion: a1.profile.version, mode: "DIRECT", proxyEndpointId: null });
   assert.equal(a2.profile.mode, "DIRECT");
-  const b = await setCreatorNetworkProfile({ db, agencyId: "agency-1", creatorId: "creator-b", expectedVersion: 0, mode: "PROXY", proxyEndpointId: "proxy-1" });
-  assert.equal(b.profile.proxyEndpointId, "proxy-1");
+  await assert.rejects(
+    setCreatorNetworkProfile({ db, agencyId: "agency-1", actorMember: ownerActor, creatorId: "creator-b", expectedVersion: 0, mode: "PROXY", proxyEndpointId: "proxy-1" }),
+    (error) => error?.code === "PROXY_OWNED_BY_ANOTHER_CREATOR" && error?.status === 409,
+  );
 });
 
 test("V20.18 dedicated proxy is enforced by Prisma schema and migration", () => {

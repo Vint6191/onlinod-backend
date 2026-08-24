@@ -1,5 +1,6 @@
 const prisma = require("../prisma");
 const { verifyAccessToken } = require("../utils/tokens");
+const { requireBoundAccessDevice } = require("../utils/device-binding");
 
 async function authRequired(req, res, next) {
   try {
@@ -80,6 +81,7 @@ async function authRequired(req, res, next) {
       agencyId: membership.agencyId,
       memberId: membership.id,
       role: membership.role,
+      deviceId: decoded.deviceId ? String(decoded.deviceId) : null,
       permissions: membership.permissions || {},
       user: membership.user,
       agency: membership.agency,
@@ -96,6 +98,11 @@ async function authRequired(req, res, next) {
   }
 }
 
+function requireAuthDevice(req, suppliedDeviceId, options = {}) {
+  return requireBoundAccessDevice(req?.auth?.deviceId, suppliedDeviceId, options);
+}
+
 module.exports = {
   authRequired,
+  requireAuthDevice,
 };

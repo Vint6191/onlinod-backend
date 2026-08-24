@@ -5,6 +5,7 @@ const { z } = require("zod");
 const prisma = require("../prisma");
 const { authRequired } = require("../middleware/auth");
 const { encryptSnapshot, hashUserAgent } = require("../services/snapshot-crypto");
+const { assertLegacyAccessSnapshotWritable } = require("../services/legacy-access-snapshot-policy");
 
 const router = express.Router();
 
@@ -91,6 +92,7 @@ async function importCreatorsIntoAgency({ agencyId, userId, creators, includeSna
 
     const result = await prisma.$transaction(async (tx) => {
       const existing = await findExistingCreator({
+        tx,
         agencyId,
         remoteId: item.remoteId,
         username: item.username,
@@ -167,7 +169,7 @@ async function importCreatorsIntoAgency({ agencyId, userId, creators, includeSna
         matchedBy: null,
         localId: item.localId,
       };
-    });
+    }, { isolationLevel: "Serializable" });
 
     results.push(result);
   }
@@ -298,18 +300,19 @@ function normalizeCreator(input) {
   };
 }
 
-async function findExistingCreator({ agencyId, remoteId, username, partition }) {
+async function findExistingCreator({ tx, agencyId, remoteId, username, partition }) {
   if (remoteId) {
-    const byRemoteId = await prisma.creatorAccount.findFirst({
-      where: { agencyId, remoteId },
+    const byRemoteId = await tx.creatorAccount.findFirst({
+      where: { agencyId, remoteId, deletedAt: null },
     });
     if (byRemoteId) return byRemoteId;
   }
 
   if (username) {
-    const byUsername = await prisma.creatorAccount.findFirst({
+    const byUsername = await tx.creatorAccount.findFirst({
       where: {
         agencyId,
+        deletedAt: null,
         username: {
           equals: username,
           mode: "insensitive",
@@ -320,8 +323,8 @@ async function findExistingCreator({ agencyId, remoteId, username, partition }) 
   }
 
   if (partition) {
-    const byPartition = await prisma.creatorAccount.findFirst({
-      where: { agencyId, partition },
+    const byPartition = await tx.creatorAccount.findFirst({
+      where: { agencyId, partition, deletedAt: null },
     });
     if (byPartition) return byPartition;
   }
@@ -350,9 +353,26 @@ function sanitizeSnapshotForEncryption({ snapshot, creator, agencyId }) {
   };
 }
 
+async function requireLiveCreatorSecretTarget({ tx, agencyId, creatorId }) {
+  const liveCreator = await tx.creatorAccount.findFirst({
+    where: { id: creatorId, agencyId, deletedAt: null },
+    select: { id: true },
+  });
+  if (!liveCreator) {
+    const error = new Error("Creator was removed before imported credentials could be committed");
+    error.code = "CREATOR_IMPORT_CREATOR_REMOVED";
+    error.status = 409;
+    throw error;
+  }
+  return liveCreator;
+}
+
 async function saveImportedSnapshot({ tx, agencyId, userId, creator, snapshot }) {
   const cookies = Array.isArray(snapshot?.cookies) ? snapshot.cookies : [];
   if (!cookies.length) return null;
+
+  await requireLiveCreatorSecretTarget({ tx, agencyId, creatorId: creator.id });
+  await assertLegacyAccessSnapshotWritable({ db: tx, agencyId });
 
   const payload = sanitizeSnapshotForEncryption({
     snapshot,
@@ -418,11 +438,12 @@ router.post("/import-local", authRequired, async (req, res) => {
       });
     }
 
-    console.error("[creators/import-local] failed:", err);
+    const status = Number(err?.status) || 500;
+    if (status >= 500) console.error("[creators/import-local] failed:", err);
 
-    return res.status(500).json({
+    return res.status(status).json({
       ok: false,
-      code: "CREATOR_IMPORT_FAILED",
+      code: err?.code || "CREATOR_IMPORT_FAILED",
       error: err?.message || "Failed to import local creators",
     });
   }
@@ -536,11 +557,12 @@ router.post("/import-local/complete-auto", async (req, res) => {
       });
     }
 
-    console.error("[creators/import-local/complete-auto] failed:", err);
+    const status = Number(err?.status) || 500;
+    if (status >= 500) console.error("[creators/import-local/complete-auto] failed:", err);
 
-    return res.status(500).json({
+    return res.status(status).json({
       ok: false,
-      code: "MIGRATION_COMPLETE_FAILED",
+      code: err?.code || "MIGRATION_COMPLETE_FAILED",
       error: err?.message || "Failed to complete local migration",
     });
   }

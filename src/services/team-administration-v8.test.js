@@ -147,3 +147,12 @@ test("V8 never creates or reissues OWNER invitations", () => {
   assert.ok(ownerInviteGuards.length >= 2, "create and reissue must both reject owner invitations");
   assert.match(service, /reissuableByViewer: client\.roleKey !== "owner"/);
 });
+
+test("V20.19 owner demotion, deactivation and removal revoke owner-root distribution in the same team transaction", () => {
+  const service = read("src/services/team-administration-service.js");
+  assert.match(service, /revokeOwnerRootAccessForMember/);
+  assert.match(service, /const liveOwnerDemoted = isOwner\(liveTarget\) && nextRoleKey !== "owner"/);
+  assert.match(service, /if \(liveOwnerDemoted\)[\s\S]*revokeOwnerRootAccessForMember/);
+  assert.match(service, /status === "deactivated"[\s\S]*revokeOwnerRootAccessForMember/);
+  assert.match(service, /deletedAt, deactivatedAt: deletedAt[\s\S]*revokeOwnerRootAccessForMember/);
+});

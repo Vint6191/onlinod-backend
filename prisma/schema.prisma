@@ -264,6 +264,12 @@ model Agency {
   creatorSessionStates CreatorSessionState[]
   proxyEndpoints AgencyProxyEndpoint[]
   creatorNetworkProfiles CreatorNetworkProfile[]
+  cryptoRoot AgencyCryptoRoot?
+  cryptoOwnerKeyWraps AgencyCryptoOwnerKeyWrap[]
+  creatorCryptoKeyStates CreatorCryptoKeyState[]
+  creatorDeviceKeyWraps CreatorDeviceKeyWrap[]
+  deviceCryptoIdentities DeviceCryptoIdentity[]
+  cryptoRootBridges AgencyCryptoRootBridge[]
   workerDevices WorkerDevice[]
   auditLogs AuditLog[]
   subscriptions AgencySubscription[]
@@ -450,7 +456,10 @@ model CreatorAccount {
   connectSessions CreatorConnectSession[]
   accessSnapshots AccessSnapshot[]
   sessionState CreatorSessionState?
+  cryptoKeyState CreatorCryptoKeyState?
+  cryptoDeviceKeyWraps CreatorDeviceKeyWrap[]
   networkProfile CreatorNetworkProfile?
+  ownedProxyEndpoint AgencyProxyEndpoint? @relation("AgencyProxyOwnerCreator")
   earningsSnapshots  CreatorEarningsSnapshot[]
   campaignsSnapshot  CreatorCampaignsSnapshot?
   jobs               JobInstance[]
@@ -722,10 +731,11 @@ model AccessSnapshot {
   deviceId        String?
   type            AccessSnapshotType @default(OF_ACCESS)
   payloadVersion  Int                @default(1)
-  encryptedPayload String
-  iv              String
-  tag             String
-  algorithm       String             @default("aes-256-gcm")
+  encryptedPayload String?
+  iv              String?
+  tag             String?
+  algorithm       String?            @default("aes-256-gcm")
+  payloadRetiredAt DateTime?
   userAgentHash   String?
   remoteId        String?
   username        String?
@@ -745,6 +755,23 @@ model AccessSnapshot {
   @@index([createdAt])
 }
 
+enum CryptoIdentityStatus {
+  PENDING
+  ACTIVE
+  REVOKED
+}
+
+enum CryptoRootStatus {
+  ACTIVE
+  RECOVERY_ONLY
+  DISABLED
+}
+
+enum SecretEncryptionMode {
+  SERVER_V1
+  CLIENT_E2E_V1
+}
+
 model CreatorSessionState {
   id                 String                    @id @default(cuid())
   agencyId           String
@@ -752,6 +779,8 @@ model CreatorSessionState {
   revision           Int                       @default(1)
   status             CreatorSessionStateStatus @default(ACTIVE)
   payloadVersion     Int                       @default(1)
+  encryptionMode     SecretEncryptionMode      @default(SERVER_V1)
+  keyVersion         Int?
   encryptedPayload   String?
   iv                 String?
   tag                String?
@@ -778,11 +807,13 @@ model CreatorSessionState {
   @@index([capturedByUserId])
   @@index([capturedByDeviceId])
   @@index([updatedAt])
+  @@index([encryptionMode])
 }
 
 model AgencyProxyEndpoint {
   id               String          @id @default(cuid())
   agencyId         String
+  ownerCreatorId   String?
   label            String
   type             AgencyProxyType
   host             String
@@ -794,17 +825,22 @@ model AgencyProxyEndpoint {
   tag              String?
   algorithm        String?
   payloadVersion   Int             @default(1)
+  encryptionMode   SecretEncryptionMode @default(SERVER_V1)
+  keyVersion       Int?
   hasCredentials   Boolean         @default(false)
   usernameHint     String?
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 
   agency          Agency                  @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  ownerCreator    CreatorAccount?         @relation("AgencyProxyOwnerCreator", fields: [agencyId, ownerCreatorId], references: [agencyId, id], onDelete: Cascade)
   creatorProfile  CreatorNetworkProfile?  @relation("CreatorNetworkProfileProxy")
 
   @@unique([agencyId, id])
   @@index([agencyId, updatedAt])
   @@index([agencyId, enabled])
+  @@unique([agencyId, ownerCreatorId])
+  @@index([encryptionMode])
 }
 
 model CreatorNetworkProfile {
@@ -828,6 +864,135 @@ model CreatorNetworkProfile {
   @@index([agencyId, mode])
 }
 
+model DeviceCryptoIdentity {
+  deviceId      String
+  agencyId      String
+  userId        String
+  publicKey     String               @db.Text
+  algorithm     String               @default("x25519-spki-der-v1")
+  fingerprint   String
+  status        CryptoIdentityStatus @default(PENDING)
+  registeredAt  DateTime             @default(now())
+  activatedAt   DateTime?
+  revokedAt     DateTime?
+  updatedAt     DateTime             @updatedAt
+
+  agency Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@id([agencyId, deviceId])
+  @@unique([agencyId, fingerprint])
+  @@index([agencyId, userId])
+  @@index([agencyId, status])
+}
+
+model AgencyCryptoRoot {
+  agencyId              String           @id
+  version               Int              @default(1)
+  status                CryptoRootStatus @default(ACTIVE)
+  recoveryCiphertext    String           @db.Text
+  recoveryIv            String
+  recoveryTag           String
+  recoveryAlgorithm     String           @default("aes-256-gcm-recovery-v1")
+  recoveryFormatVersion Int              @default(1)
+  recoveryProofHash     String?
+  enforceOpaqueSecrets Boolean            @default(false)
+  enforcedAt            DateTime?
+  initializedByDeviceId String?
+  initializedAt         DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  agency              Agency        @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  initializedByDevice WorkerDevice? @relation("AgencyCryptoRootInitializedByDevice", fields: [initializedByDeviceId], references: [id], onDelete: SetNull)
+  ownerKeyWraps       AgencyCryptoOwnerKeyWrap[]
+
+  @@index([status, updatedAt])
+}
+
+model AgencyCryptoOwnerKeyWrap {
+  id                String   @id @default(cuid())
+  agencyId          String
+  rootVersion       Int
+  deviceId          String
+  ephemeralPublicKey String  @db.Text
+  ciphertext        String   @db.Text
+  iv                String
+  tag               String
+  algorithm         String   @default("x25519-hkdf-sha256-aes-256-gcm-v1")
+  createdByDeviceId String?
+  createdAt         DateTime @default(now())
+  revokedAt         DateTime?
+
+  agency          Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  root            AgencyCryptoRoot @relation(fields: [agencyId], references: [agencyId], onDelete: Cascade)
+  createdByDevice WorkerDevice? @relation("AgencyCryptoOwnerWrapCreatedByDevice", fields: [createdByDeviceId], references: [id], onDelete: SetNull)
+
+  @@unique([agencyId, rootVersion, deviceId])
+  @@index([deviceId, revokedAt])
+}
+
+model AgencyCryptoRootBridge {
+  id                String   @id @default(cuid())
+  agencyId          String
+  fromVersion       Int
+  toVersion         Int
+  ciphertext        String   @db.Text
+  iv                String
+  tag               String
+  algorithm         String   @default("aes-256-gcm-root-bridge-v1")
+  createdByDeviceId String?
+  createdAt         DateTime @default(now())
+  retiredAt         DateTime?
+
+  agency          Agency        @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  createdByDevice WorkerDevice? @relation("AgencyCryptoRootBridgeCreatedByDevice", fields: [createdByDeviceId], references: [id], onDelete: SetNull)
+
+  @@unique([agencyId, fromVersion, toVersion])
+  @@index([agencyId, toVersion, retiredAt])
+}
+
+model CreatorCryptoKeyState {
+  id            String   @id @default(cuid())
+  agencyId      String
+  creatorId     String   @unique
+  activeVersion Int      @default(1)
+  rootVersion   Int      @default(1)
+  updatedAt     DateTime @updatedAt
+  createdAt     DateTime @default(now())
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  wraps   CreatorDeviceKeyWrap[]
+
+  @@unique([agencyId, creatorId])
+  @@index([agencyId, updatedAt])
+  @@index([agencyId, rootVersion])
+}
+
+model CreatorDeviceKeyWrap {
+  id                String   @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  keyVersion        Int
+  deviceId          String
+  ephemeralPublicKey String  @db.Text
+  ciphertext        String   @db.Text
+  iv                String
+  tag               String
+  algorithm         String   @default("x25519-hkdf-sha256-aes-256-gcm-v1")
+  createdByDeviceId String?
+  createdAt         DateTime @default(now())
+  revokedAt         DateTime?
+
+  agency          Agency                @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator         CreatorAccount        @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  keyState        CreatorCryptoKeyState @relation(fields: [agencyId, creatorId], references: [agencyId, creatorId], onDelete: Cascade)
+  createdByDevice WorkerDevice?         @relation("CreatorCryptoWrapCreatedByDevice", fields: [createdByDeviceId], references: [id], onDelete: SetNull)
+
+  @@unique([agencyId, creatorId, keyVersion, deviceId])
+  @@index([deviceId, revokedAt])
+  @@index([agencyId, creatorId, keyVersion])
+}
+
 model WorkerDevice {
   id         String   @id @default(cuid())
   agencyId   String
@@ -843,6 +1008,10 @@ model WorkerDevice {
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   creatorBindings DeviceCreatorBinding[]
   creatorSessionStatesCaptured CreatorSessionState[] @relation("CreatorSessionCapturedByDevice")
+  cryptoOwnerKeyWrapsCreated AgencyCryptoOwnerKeyWrap[] @relation("AgencyCryptoOwnerWrapCreatedByDevice")
+  creatorKeyWrapsCreated CreatorDeviceKeyWrap[] @relation("CreatorCryptoWrapCreatedByDevice")
+  cryptoRootsInitialized AgencyCryptoRoot[] @relation("AgencyCryptoRootInitializedByDevice")
+  cryptoRootBridgesCreated AgencyCryptoRootBridge[] @relation("AgencyCryptoRootBridgeCreatedByDevice")
   teamActivityEvents TeamActivityEvent[]
   presenceSnapshotsUpdated CreatorPresenceSnapshot[] @relation("PresenceSnapshotUpdatedByDevice")
   presenceUsersUpdated     CreatorPresenceUser[]     @relation("PresenceUserUpdatedByDevice")

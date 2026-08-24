@@ -1,6 +1,6 @@
 "use strict";
 
-const FORBIDDEN_KEYS = /(cookie|authorization|token|secret|password|csrf|x-bc|sign|lease|raw|payload|message(text)?|caption|body|mediaurl|urlsignature)/i;
+const FORBIDDEN_KEYS = /(cookie|authorization|token|secret|password|csrf|x-bc|sign|lease|raw|payload|message(text)?|caption|body|mediaurl|urlsignature|proof|recovery|wrap|ciphertext|privatekey|private_key|masterkey|master_key|amk|cdk)/i;
 const MAX_DEPTH = 4;
 const MAX_ARRAY = 40;
 const MAX_OBJECT_KEYS = 80;

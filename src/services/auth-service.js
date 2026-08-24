@@ -2,6 +2,7 @@ const jwt = require("jsonwebtoken");
 const prisma = require("../prisma");
 const { randomToken, randomCode, sha256, addMinutes, addDays } = require("../utils/crypto");
 const { signAccessToken, refreshTokenDays } = require("../utils/tokens");
+const { resolveRefreshDeviceBinding } = require("../utils/device-binding");
 const { verificationEmail, passwordResetEmail } = require("./email-service");
 
 function publicUser(user) {
@@ -161,6 +162,7 @@ async function issueLoginTokens({ user, membership, req, rememberDevice = false,
     userId: user.id,
     agencyId: membership.agencyId,
     role: membership.role,
+    deviceId: deviceId || null,
   });
 
   const refresh = await createRefreshSession({
@@ -306,6 +308,10 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
     return { ok: false, code: "SESSION_AGENCY_INVALID", error: "Session agency is invalid" };
   }
 
+  const deviceBinding = resolveRefreshDeviceBinding(session.deviceId, deviceId);
+  if (!deviceBinding.ok) return deviceBinding;
+  const effectiveDeviceId = deviceBinding.deviceId;
+
   const nextRefreshToken = randomToken(48);
   const nextExpiresAt = addDays(refreshDaysForRememberDevice(session.rememberDevice));
 
@@ -317,7 +323,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
         lastUsedAt: now,
         ipAddress: req?.ip || session.ipAddress,
         userAgent: req?.headers?.["user-agent"] || session.userAgent,
-        deviceId: deviceId || session.deviceId,
+        deviceId: effectiveDeviceId,
         client: client || session.client,
       },
     });
@@ -333,7 +339,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
         ipAddress: req?.ip || session.ipAddress,
         expiresAt: nextExpiresAt,
         rememberDevice: session.rememberDevice === true,
-        deviceId: deviceId || session.deviceId,
+        deviceId: effectiveDeviceId,
         client: client || session.client,
         impersonatedByAdminId: session.impersonatedByAdminId || null,
         lastUsedAt: now,
@@ -355,6 +361,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
     userId: session.userId,
     agencyId: session.agencyId,
     role: membership.role,
+    deviceId: effectiveDeviceId,
   });
 
   return {

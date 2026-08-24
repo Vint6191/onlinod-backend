@@ -4,13 +4,13 @@ const express = require("express");
 const { z } = require("zod");
 
 const prisma = require("../prisma");
-const { authRequired } = require("../middleware/auth");
+const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
 const {
-  requireRegisteredDevice,
   assertCreatorSessionTargetActive,
   getCreatorSession,
+  migrateCreatorSessionToOpaque,
   writeCreatorSession,
   revokeCreatorSession,
 } = require("../services/creator-session-broker-service");
@@ -42,13 +42,38 @@ const payloadSchema = z.object({
   userAgent: z.string().max(2048).optional().nullable(),
 }).strict();
 
-const writeSchema = z.object({
+const writeCommon = {
   deviceId: deviceIdSchema,
   baseRevision: z.number().int().min(0),
   requestId: requestIdSchema,
   capturedAt: z.string().datetime().optional(),
   platformUserId: z.string().trim().min(1).max(160),
-  payload: payloadSchema,
+};
+
+const opaquePayloadSchema = z.object({
+  encryptionMode: z.literal("CLIENT_E2E_V1"),
+  keyVersion: z.number().int().positive(),
+  ciphertext: z.string().trim().min(1).max(700_000),
+  iv: z.string().trim().min(1).max(128),
+  tag: z.string().trim().min(1).max(128),
+  algorithm: z.literal("aes-256-gcm-client-e2e-v1"),
+}).strict();
+
+const legacyWriteSchema = z.object({ ...writeCommon, payload: payloadSchema }).strict();
+const opaqueWriteSchema = z.object({
+  ...writeCommon,
+  opaquePayload: opaquePayloadSchema,
+  credentialHash: z.string().regex(/^[0-9a-fA-F]{64}$/),
+  coherenceHash: z.string().regex(/^[0-9a-fA-F]{64}$/),
+}).strict();
+const writeSchema = z.union([opaqueWriteSchema, legacyWriteSchema]);
+const migrateOpaqueSchema = z.object({
+  deviceId: deviceIdSchema,
+  expectedRevision: z.number().int().positive(),
+  platformUserId: z.string().trim().min(1).max(160),
+  credentialHash: z.string().regex(/^[0-9a-fA-F]{64}$/),
+  coherenceHash: z.string().regex(/^[0-9a-fA-F]{64}$/),
+  opaquePayload: opaquePayloadSchema,
 }).strict();
 
 const revokeSchema = z.object({
@@ -59,6 +84,10 @@ const revokeSchema = z.object({
 }).strict();
 
 async function authorize(req, creatorId, deviceId, { requireActive = true } = {}) {
+  const boundDeviceId = requireAuthDevice(req, deviceId, {
+    requiredCode: "CREATOR_SESSION_DEVICE_BOUND_TOKEN_REQUIRED",
+    mismatchCode: "CREATOR_SESSION_AUTH_DEVICE_MISMATCH",
+  });
   const creator = await requireCreatorAccess({
     agencyId: req.auth.agencyId,
     member: req.auth.membership || req.member,
@@ -66,13 +95,13 @@ async function authorize(req, creatorId, deviceId, { requireActive = true } = {}
     db: prisma,
   });
   if (requireActive) assertCreatorSessionTargetActive(creator);
-  const device = await requireRegisteredDevice({
-    db: prisma,
-    agencyId: req.auth.agencyId,
-    userId: req.auth.userId,
-    deviceId,
-  });
-  return { creator, device };
+  // The signed access token is the request-level logical-device authority.
+  // Do not consult WorkerDevice here: it is mutable telemetry and can point at
+  // another workspace on the same physical PC. CLIENT_E2E_V1 operations are
+  // additionally fenced in the broker service by immutable DeviceCryptoIdentity
+  // + user + current AMK/CDK enrollment. Legacy SERVER_V1 remains normal bearer
+  // authorization during the migration window.
+  return { creator, device: { id: boundDeviceId } };
 }
 
 function sendError(res, error, fallbackCode) {
@@ -103,6 +132,9 @@ router.get("/:creatorId", async (req, res) => {
       agencyId: req.auth.agencyId,
       creatorId: creator.id,
       includePayload,
+      deviceId: device.id,
+      member: req.auth.membership || req.member,
+      userId: req.auth.userId,
     });
     await audit({
       agencyId: req.auth.agencyId,
@@ -119,6 +151,19 @@ router.get("/:creatorId", async (req, res) => {
   }
 });
 
+router.post("/:creatorId/migrate-opaque", async (req, res) => {
+  try {
+    const input = migrateOpaqueSchema.parse(req.body || {});
+    const { creator, device } = await authorize(req, req.params.creatorId, input.deviceId);
+    const result = await migrateCreatorSessionToOpaque({
+      db: prisma, agencyId: req.auth.agencyId, creatorId: creator.id, deviceId: device.id, member: req.auth.membership || req.member,
+      expectedRevision: input.expectedRevision, platformUserId: input.platformUserId, credentialHash: input.credentialHash, coherenceHash: input.coherenceHash, opaquePayload: input.opaquePayload,
+    });
+    await audit({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, action: "creator_session.migrated_client_e2e", targetType: "creator_session", targetId: creator.id, metadata: { creatorId: creator.id, deviceId: device.id, revision: result.state.revision, keyVersion: result.state.keyVersion, migrated: result.migrated } });
+    return res.json({ ok: true, creatorId: creator.id, ...result });
+  } catch (error) { return sendError(res, error, "CREATOR_SESSION_MIGRATION_FAILED"); }
+});
+
 router.post("/:creatorId", async (req, res) => {
   try {
     const input = writeSchema.parse(req.body || {});
@@ -128,12 +173,15 @@ router.post("/:creatorId", async (req, res) => {
       agencyId: req.auth.agencyId,
       creatorId: creator.id,
       actorUserId: req.auth.userId,
+      actorMember: req.auth.membership || req.member,
       deviceId: device.id,
       baseRevision: input.baseRevision,
       requestId: input.requestId,
       capturedAt: input.capturedAt,
       platformUserId: input.platformUserId,
-      payload: input.payload,
+      ...("opaquePayload" in input
+        ? { opaquePayload: input.opaquePayload, credentialHash: input.credentialHash, coherenceHash: input.coherenceHash }
+        : { payload: input.payload }),
     });
     await audit({
       agencyId: req.auth.agencyId,

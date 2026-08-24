@@ -3,20 +3,23 @@
 const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
-const { authRequired } = require("../middleware/auth");
+const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { creatorManagementRequired } = require("../middleware/creator-management-permissions");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
-const { requireRegisteredDevice } = require("../services/creator-session-broker-service");
 const { audit } = require("../services/audit-service");
 const {
   createProxyEndpoint,
+  createProxyForCreator,
   updateProxyEndpoint,
   deleteProxyEndpoint,
   setCreatorNetworkProfile,
   listNetworkSettings,
   getCreatorNetworkManifest,
   getCreatorNetworkRuntime,
+  getProxyCredentialContext,
+  getProxyCredentialMigrationMaterial,
   getProxyTestMaterial,
+  migrateProxyCredentialsToOpaque,
 } = require("../services/creator-network-profile-service");
 
 const router = express.Router();
@@ -27,10 +30,27 @@ const credentials = z.object({
   username: z.string().max(512).optional().nullable(),
   password: z.string().max(4096).optional().nullable(),
 }).strict();
+const opaqueCredentials = z.object({
+  encryptionMode: z.literal("CLIENT_E2E_V1"),
+  keyVersion: z.number().int().positive(),
+  algorithm: z.literal("aes-256-gcm-client-e2e-v1"),
+  ciphertext: z.string().min(1).max(1_000_000),
+  iv: z.string().min(1).max(4096),
+  tag: z.string().min(1).max(4096),
+}).strict();
 const credentialMutation = z.object({
   mode: z.enum(["KEEP", "REPLACE", "CLEAR"]),
   credentials: credentials.optional(),
-}).strict();
+  opaqueCredentials: opaqueCredentials.optional(),
+  usernameHint: z.string().max(512).optional().nullable(),
+}).strict().superRefine((value, ctx) => {
+  if (value.mode === "REPLACE" && Boolean(value.credentials) === Boolean(value.opaqueCredentials)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "REPLACE requires exactly one of credentials or opaqueCredentials" });
+  }
+  if (value.mode !== "REPLACE" && (value.credentials || value.opaqueCredentials)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${value.mode} must not include credential material` });
+  }
+});
 const createProxySchema = z.object({
   label: z.string().trim().min(1).max(120),
   type: proxyType,
@@ -38,6 +58,27 @@ const createProxySchema = z.object({
   port: z.number().int().min(1).max(65535),
   enabled: z.boolean().optional(),
   credentials: credentials.optional(),
+}).strict();
+const createCreatorProxySchema = z.object({
+  expectedNetworkVersion: z.number().int().min(0),
+  deviceId: z.string().trim().min(1).max(180),
+  label: z.string().trim().min(1).max(120),
+  type: proxyType,
+  host: z.string().trim().min(1).max(512),
+  port: z.number().int().min(1).max(65535),
+  enabled: z.boolean().optional(),
+  credentials: credentials.optional(),
+  opaqueCredentials: opaqueCredentials.optional(),
+  usernameHint: z.string().max(512).optional().nullable(),
+}).strict().superRefine((value, ctx) => {
+  if (value.credentials && value.opaqueCredentials) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Use plaintext or opaque credentials, not both" });
+});
+const migrateCredentialsSchema = z.object({
+  expectedVersion: z.number().int().positive(),
+  deviceId: z.string().trim().min(1).max(180),
+  legacyCredentialHash: z.string().regex(/^[a-f0-9]{64}$/i),
+  usernameHint: z.string().max(512).optional().nullable(),
+  opaqueCredentials,
 }).strict();
 const updateProxySchema = z.object({
   expectedVersion: z.number().int().positive(),
@@ -47,6 +88,7 @@ const updateProxySchema = z.object({
   port: z.number().int().min(1).max(65535).optional(),
   enabled: z.boolean().optional(),
   credentials: credentialMutation.optional(),
+  deviceId: z.string().trim().min(1).max(180).optional(),
 }).strict();
 const deleteProxySchema = z.object({ expectedVersion: z.number().int().positive() }).strict();
 const profileSchema = z.object({
@@ -85,12 +127,16 @@ async function creatorAccess(req, creatorId) {
 }
 
 async function registeredDevice(req, rawDeviceId) {
-  return requireRegisteredDevice({
-    db: prisma,
-    agencyId: req.auth.agencyId,
-    userId: req.auth.userId,
-    deviceId: deviceIdSchema.parse(rawDeviceId),
+  const parsedDeviceId = deviceIdSchema.parse(rawDeviceId);
+  const boundDeviceId = requireAuthDevice(req, parsedDeviceId, {
+    requiredCode: "NETWORK_AUTH_DEVICE_BOUND_TOKEN_REQUIRED",
+    mismatchCode: "NETWORK_AUTH_DEVICE_MISMATCH",
   });
+  // WorkerDevice is live telemetry, not durable crypto authority.  A device-
+  // bound JWT proves the logical request device; CLIENT_E2E_V1 secret paths
+  // additionally prove immutable DeviceCryptoIdentity + current AMK/CDK
+  // enrollment inside creator-network-profile-service.
+  return { id: boundDeviceId };
 }
 
 router.get("/", creatorManagementRequired, async (req, res) => {
@@ -110,7 +156,7 @@ router.get("/", creatorManagementRequired, async (req, res) => {
 router.post("/proxies", creatorManagementRequired, async (req, res) => {
   try {
     const input = createProxySchema.parse(req.body || {});
-    const result = await createProxyEndpoint({ db: prisma, agencyId: req.auth.agencyId, actorUserId: req.auth.userId, input });
+    const result = await createProxyEndpoint({ db: prisma, agencyId: req.auth.agencyId, actorUserId: req.auth.userId, actorMember: req.auth.membership, input });
     await audit({
       agencyId: req.auth.agencyId,
       actorUserId: req.auth.userId,
@@ -128,10 +174,13 @@ router.post("/proxies", creatorManagementRequired, async (req, res) => {
 router.patch("/proxies/:proxyId", creatorManagementRequired, async (req, res) => {
   try {
     const input = updateProxySchema.parse(req.body || {});
+    const device = input.deviceId ? await registeredDevice(req, input.deviceId) : null;
     const result = await updateProxyEndpoint({
       db: prisma,
       agencyId: req.auth.agencyId,
       actorUserId: req.auth.userId,
+      actorMember: req.auth.membership,
+      deviceId: device?.id || null,
       proxyId: req.params.proxyId,
       expectedVersion: input.expectedVersion,
       patch: input,
@@ -153,7 +202,7 @@ router.patch("/proxies/:proxyId", creatorManagementRequired, async (req, res) =>
 router.delete("/proxies/:proxyId", creatorManagementRequired, async (req, res) => {
   try {
     const input = deleteProxySchema.parse(req.body || {});
-    const result = await deleteProxyEndpoint({ db: prisma, agencyId: req.auth.agencyId, proxyId: req.params.proxyId, expectedVersion: input.expectedVersion });
+    const result = await deleteProxyEndpoint({ db: prisma, agencyId: req.auth.agencyId, actorUserId: req.auth.userId, actorMember: req.auth.membership, proxyId: req.params.proxyId, expectedVersion: input.expectedVersion });
     if (result.deleted) {
       await audit({
         agencyId: req.auth.agencyId,
@@ -170,10 +219,52 @@ router.delete("/proxies/:proxyId", creatorManagementRequired, async (req, res) =
   }
 });
 
+router.get("/proxies/:proxyId/credential-context", creatorManagementRequired, async (req, res) => {
+  try {
+    const device = await registeredDevice(req, req.query?.deviceId);
+    const context = await getProxyCredentialContext({ db: prisma, agencyId: req.auth.agencyId, proxyId: req.params.proxyId });
+    if (context.creatorId) await creatorAccess(req, context.creatorId);
+    res.setHeader("Cache-Control", "no-store, private");
+    return res.json({ ok: true, deviceId: device.id, context });
+  } catch (error) {
+    return sendError(res, error, "PROXY_CREDENTIAL_CONTEXT_FAILED");
+  }
+});
+
+router.get("/creators/:creatorId/proxies/:proxyId/migration-material", creatorManagementRequired, async (req, res) => {
+  try {
+    const creator = await creatorAccess(req, req.params.creatorId);
+    const device = await registeredDevice(req, req.query?.deviceId);
+    const proxy = await getProxyCredentialMigrationMaterial({
+      db: prisma,
+      agencyId: req.auth.agencyId,
+      creatorId: creator.id,
+      proxyId: req.params.proxyId,
+      member: req.auth.membership,
+      userId: req.auth.userId,
+    });
+    res.setHeader("Cache-Control", "no-store, private");
+    res.setHeader("Pragma", "no-cache");
+    await audit({
+      agencyId: req.auth.agencyId,
+      actorUserId: req.auth.userId,
+      action: "network_proxy.credential_migration_material_read",
+      targetType: "proxy_endpoint",
+      targetId: proxy.id,
+      metadata: { creatorId: creator.id, deviceId: device.id, version: proxy.version, encryptionMode: proxy.encryptionMode, activelyAssigned: proxy.activelyAssigned },
+    });
+    return res.json({ ok: true, deviceId: device.id, proxy });
+  } catch (error) {
+    return sendError(res, error, "PROXY_CREDENTIAL_MIGRATION_MATERIAL_FAILED");
+  }
+});
+
 router.post("/proxies/:proxyId/test-material", creatorManagementRequired, async (req, res) => {
   try {
     const device = await registeredDevice(req, req.body?.deviceId);
-    const proxy = await getProxyTestMaterial({ db: prisma, agencyId: req.auth.agencyId, proxyId: req.params.proxyId });
+    const context = await getProxyCredentialContext({ db: prisma, agencyId: req.auth.agencyId, proxyId: req.params.proxyId });
+    if (context.creatorId) await creatorAccess(req, context.creatorId);
+    const proxy = await getProxyTestMaterial({ db: prisma, agencyId: req.auth.agencyId, proxyId: req.params.proxyId, deviceId: device.id, member: req.auth.membership, userId: req.auth.userId });
     res.setHeader("Cache-Control", "no-store, private");
     res.setHeader("Pragma", "no-cache");
     await audit({
@@ -182,7 +273,7 @@ router.post("/proxies/:proxyId/test-material", creatorManagementRequired, async 
       action: "network_proxy.test_material_read",
       targetType: "proxy_endpoint",
       targetId: proxy.id,
-      metadata: { deviceId: device.id, type: proxy.type, version: proxy.version },
+      metadata: { deviceId: device.id, type: proxy.type, version: proxy.version, encryptionMode: proxy.encryptionMode },
     });
     return res.json({ ok: true, proxy });
   } catch (error) {
@@ -204,7 +295,7 @@ router.get("/creators/:creatorId/runtime", async (req, res) => {
   try {
     const creator = await creatorAccess(req, req.params.creatorId);
     const device = await registeredDevice(req, req.query?.deviceId);
-    const profile = await getCreatorNetworkRuntime({ db: prisma, agencyId: req.auth.agencyId, creatorId: creator.id });
+    const profile = await getCreatorNetworkRuntime({ db: prisma, agencyId: req.auth.agencyId, creatorId: creator.id, deviceId: device.id, member: req.auth.membership, userId: req.auth.userId });
     res.setHeader("Cache-Control", "no-store, private");
     res.setHeader("Pragma", "no-cache");
     await audit({
@@ -221,6 +312,61 @@ router.get("/creators/:creatorId/runtime", async (req, res) => {
   }
 });
 
+router.post("/creators/:creatorId/proxy", creatorManagementRequired, async (req, res) => {
+  try {
+    const input = createCreatorProxySchema.parse(req.body || {});
+    const creator = await creatorAccess(req, req.params.creatorId);
+    const device = await registeredDevice(req, input.deviceId);
+    const result = await createProxyForCreator({
+      db: prisma,
+      agencyId: req.auth.agencyId,
+      creatorId: creator.id,
+      actorUserId: req.auth.userId,
+      actorMember: req.auth.membership,
+      deviceId: device.id,
+      expectedNetworkVersion: input.expectedNetworkVersion,
+      input,
+    });
+    await audit({
+      agencyId: req.auth.agencyId,
+      actorUserId: req.auth.userId,
+      action: "creator_network.proxy_created_and_assigned",
+      targetType: "creator_network_profile",
+      targetId: creator.id,
+      metadata: { creatorId: creator.id, proxyEndpointId: result.proxy.id, networkVersion: result.profile.version, encryptionMode: result.proxy.encryptionMode },
+    });
+    return res.status(201).json({ ok: true, proxy: result.proxy, profile: result.profile });
+  } catch (error) {
+    return sendError(res, error, "CREATOR_PROXY_CREATE_FAILED");
+  }
+});
+
+router.post("/creators/:creatorId/proxies/:proxyId/migrate-credentials", async (req, res) => {
+  try {
+    const input = migrateCredentialsSchema.parse(req.body || {});
+    const creator = await creatorAccess(req, req.params.creatorId);
+    const device = await registeredDevice(req, input.deviceId);
+    const result = await migrateProxyCredentialsToOpaque({
+      db: prisma,
+      agencyId: req.auth.agencyId,
+      creatorId: creator.id,
+      proxyId: req.params.proxyId,
+      expectedVersion: input.expectedVersion,
+      deviceId: device.id,
+      member: req.auth.membership,
+      opaqueCredentials: input.opaqueCredentials,
+      legacyCredentialHash: input.legacyCredentialHash,
+      suppliedUsernameHint: input.usernameHint,
+    });
+    if (result.migrated) {
+      await audit({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, action: "network_proxy.credentials_migrated_client_e2e", targetType: "proxy_endpoint", targetId: req.params.proxyId, metadata: { creatorId: creator.id, deviceId: device.id, keyVersion: result.proxy.keyVersion } });
+    }
+    return res.json({ ok: true, ...result });
+  } catch (error) {
+    return sendError(res, error, "PROXY_CREDENTIAL_MIGRATION_FAILED");
+  }
+});
+
 router.put("/creators/:creatorId", creatorManagementRequired, async (req, res) => {
   try {
     const input = profileSchema.parse(req.body || {});
@@ -230,6 +376,7 @@ router.put("/creators/:creatorId", creatorManagementRequired, async (req, res) =
       agencyId: req.auth.agencyId,
       creatorId: creator.id,
       actorUserId: req.auth.userId,
+      actorMember: req.auth.membership,
       expectedVersion: input.expectedVersion,
       mode: input.mode,
       proxyEndpointId: input.proxyEndpointId,

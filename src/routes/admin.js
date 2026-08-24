@@ -63,6 +63,7 @@ const { signAccessToken } = require("../utils/tokens");
 const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 const { TIER_CATALOG } = require("../services/billing-catalog-service");
+const { retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -1430,33 +1431,18 @@ router.delete("/creators/:id", async (req, res) => {
     if (hard) {
       await tx.creatorAccount.delete({ where: { id: before.id } });
     } else {
+      await retireCreatorCryptoMaterialOnRemoval({
+        db: tx,
+        agencyId: before.agencyId,
+        creatorId: before.id,
+        retiredAt: deletedAt,
+        actorUserId: null,
+        sourceRequestId: `admin-creator-removal:${before.id}:${deletedAt.getTime()}`,
+        revokeReason: "ADMIN_CREATOR_REMOVED",
+      });
       await tx.creatorAccount.update({
         where: { id: before.id },
         data: { deletedAt, status: "DISABLED" },
-      });
-      // Revoke active snapshots so live workers stop using them.
-      await tx.accessSnapshot.updateMany({
-        where: { creatorId: before.id, active: true, revokedAt: null },
-        data: { active: false, revokedAt: deletedAt },
-      });
-      await tx.creatorSessionState.updateMany({
-        where: { creatorId: before.id, status: "ACTIVE" },
-        data: {
-          revision: { increment: 1 },
-          status: "REVOKED",
-          encryptedPayload: null,
-          iv: null,
-          tag: null,
-          algorithm: null,
-          credentialHash: null,
-          coherenceHash: null,
-          capturedAt: deletedAt,
-          capturedByUserId: null,
-          capturedByDeviceId: null,
-          sourceRequestId: `admin-creator-removal:${before.id}:${deletedAt.getTime()}`,
-          revokedAt: deletedAt,
-          revokeReason: "ADMIN_CREATOR_REMOVED",
-        },
       });
     }
 

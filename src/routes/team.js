@@ -30,6 +30,7 @@ const router = express.Router();
 const TEAM_FUNCTION_KEYS = Object.freeze(["CHATTER", "CONTENT", "SUPERVISOR"]);
 
 const functionSchema = z.enum(TEAM_FUNCTION_KEYS);
+const actorProofSchema = z.string().trim().min(1).max(256).optional();
 const creatorAccessSchema = z.union([
   z.literal("all"),
   z.array(z.string().min(1)).max(10000),
@@ -40,8 +41,9 @@ const memberSettingsSchema = z.object({
   roleKey: z.string().trim().min(1).max(100).optional(),
   functions: z.array(functionSchema).max(TEAM_FUNCTION_KEYS.length).optional(),
   assignedCreators: creatorAccessSchema.optional(),
+  actorProof: actorProofSchema,
 }).strict();
-const memberStatusSchema = z.object({ status: z.enum(["active", "deactivated"]) }).strict();
+const memberStatusSchema = z.object({ status: z.enum(["active", "deactivated"]), actorProof: actorProofSchema }).strict();
 const invitationSchema = z.object({
   email: z.string().trim().email().max(254).nullable().optional(),
   displayName: z.string().trim().min(1).max(120).nullable().optional(),
@@ -94,7 +96,13 @@ function serviceError(res, error, fallbackCode) {
 }
 
 function actor(req) {
-  return { actorMember: req.agencyMember, actorUserId: actorUserId(req) };
+  return {
+    actorMember: req.agencyMember,
+    actorUserId: actorUserId(req),
+    // Never trust a renderer/body supplied device id for OWNER possession.
+    // auth.deviceId is the signed JWT device claim established by authRequired.
+    actorDeviceId: req.auth?.deviceId || null,
+  };
 }
 
 router.get("/state", teamReadRequired("workspace.view_team"), async (req, res) => {
@@ -113,8 +121,9 @@ router.get("/state", teamReadRequired("workspace.view_team"), async (req, res) =
 
 router.patch("/members/:memberId/settings", teamWriteRequired("workspace.manage_members"), async (req, res) => {
   try {
-    const patch = memberSettingsSchema.parse(req.body || {});
-    const member = await updateMemberSettings({ agencyId: req.agencyId, memberId: req.params.memberId, patch, ...actor(req) });
+    const input = memberSettingsSchema.parse(req.body || {});
+    const { actorProof, ...patch } = input;
+    const member = await updateMemberSettings({ agencyId: req.agencyId, memberId: req.params.memberId, patch, actorProof, ...actor(req) });
     return res.json({ ok: true, member });
   } catch (error) {
     return serviceError(res, error, "TEAM_MEMBER_UPDATE_FAILED");
@@ -124,7 +133,7 @@ router.patch("/members/:memberId/settings", teamWriteRequired("workspace.manage_
 router.patch("/members/:memberId/status", teamWriteRequired("workspace.manage_members"), async (req, res) => {
   try {
     const input = memberStatusSchema.parse(req.body || {});
-    const result = await setMemberStatus({ agencyId: req.agencyId, memberId: req.params.memberId, status: input.status, ...actor(req) });
+    const result = await setMemberStatus({ agencyId: req.agencyId, memberId: req.params.memberId, status: input.status, actorProof: input.actorProof, ...actor(req) });
     return res.json({ ok: true, ...result });
   } catch (error) {
     return serviceError(res, error, "TEAM_MEMBER_STATUS_FAILED");
@@ -134,8 +143,9 @@ router.patch("/members/:memberId/status", teamWriteRequired("workspace.manage_me
 // Compatibility endpoint retained for older desktops; V8 uses /settings atomically.
 router.patch("/members/:memberId", teamWriteRequired("workspace.manage_members"), async (req, res) => {
   try {
-    const patch = memberSettingsSchema.partial().parse(req.body || {});
-    const member = await updateMemberSettings({ agencyId: req.agencyId, memberId: req.params.memberId, patch, ...actor(req) });
+    const input = memberSettingsSchema.partial().parse(req.body || {});
+    const { actorProof, ...patch } = input;
+    const member = await updateMemberSettings({ agencyId: req.agencyId, memberId: req.params.memberId, patch, actorProof, ...actor(req) });
     return res.json({ ok: true, member });
   } catch (error) {
     return serviceError(res, error, "TEAM_MEMBER_UPDATE_FAILED");
@@ -155,8 +165,8 @@ router.patch("/members/:memberId/functions", teamWriteRequired("workspace.manage
 
 router.patch("/members/:memberId/role", teamWriteRequired("workspace.manage_members"), async (req, res) => {
   try {
-    const input = z.object({ roleKey: z.string().trim().min(1).max(100) }).strict().parse(req.body || {});
-    const member = await updateMemberSettings({ agencyId: req.agencyId, memberId: req.params.memberId, patch: { roleKey: input.roleKey }, ...actor(req) });
+    const input = z.object({ roleKey: z.string().trim().min(1).max(100), actorProof: actorProofSchema }).strict().parse(req.body || {});
+    const member = await updateMemberSettings({ agencyId: req.agencyId, memberId: req.params.memberId, patch: { roleKey: input.roleKey }, actorProof: input.actorProof, ...actor(req) });
     return res.json({ ok: true, member });
   } catch (error) {
     return serviceError(res, error, "TEAM_MEMBER_ROLE_FAILED");
@@ -165,7 +175,8 @@ router.patch("/members/:memberId/role", teamWriteRequired("workspace.manage_memb
 
 router.delete("/members/:memberId", teamWriteRequired("workspace.manage_members"), async (req, res) => {
   try {
-    const result = await removeMember({ agencyId: req.agencyId, memberId: req.params.memberId, ...actor(req) });
+    const input = z.object({ actorProof: actorProofSchema }).strict().parse(req.body || {});
+    const result = await removeMember({ agencyId: req.agencyId, memberId: req.params.memberId, actorProof: input.actorProof, ...actor(req) });
     return res.json({ ok: true, ...result, historicalAttributionPreserved: true });
   } catch (error) {
     return serviceError(res, error, "TEAM_MEMBER_REMOVE_FAILED");

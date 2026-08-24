@@ -11,6 +11,8 @@ const {
   hashesForPayload,
   publicState,
   requireRegisteredDevice,
+  getCreatorSession,
+  migrateCreatorSessionToOpaque,
   writeCreatorSession,
   revokeCreatorSession,
 } = require("./creator-session-broker-service");
@@ -22,6 +24,8 @@ function clone(value) {
 function makeDb() {
   let state = null;
   const creator = { id: "creator-1", agencyId: "agency-1", remoteId: "of-42", status: "READY", deletedAt: null };
+  const root = { agencyId: "agency-1", version: 1, status: "ACTIVE", enforceOpaqueSecrets: false };
+  const liveMember = { agencyId: "agency-1", userId: "user-1", role: "WORKER", roleKey: "worker", assignedCreators: ["creator-1"], deletedAt: null, deactivatedAt: null };
   const devices = [
     { id: "device-1", agencyId: "agency-1", userId: "user-1", lastSeenAt: new Date("2026-08-22T20:00:00.000Z") },
   ];
@@ -32,8 +36,26 @@ function makeDb() {
         where.id === creator.id && where.agencyId === creator.agencyId && creator.deletedAt === null ? clone(creator) : null
       ),
     },
+    agencyMember: {
+      findUnique: async ({ where }) => {
+        const key = where.agencyId_userId || {};
+        return key.agencyId === liveMember.agencyId && key.userId === liveMember.userId ? clone(liveMember) : null;
+      },
+    },
     workerDevice: {
       findFirst: async ({ where }) => clone(devices.find((item) => item.id === where.id && item.agencyId === where.agencyId && item.userId === where.userId) || null),
+    },
+    agencyCryptoRoot: {
+      findUnique: async ({ where }) => where.agencyId === "agency-1" ? clone(root) : null,
+    },
+    deviceCryptoIdentity: {
+      findUnique: async ({ where }) => { const key = where.agencyId_deviceId || where; return key.deviceId === "device-1" && (!key.agencyId || key.agencyId === "agency-1") ? { deviceId: "device-1", agencyId: "agency-1", status: "ACTIVE", revokedAt: null } : null; },
+    },
+    creatorCryptoKeyState: {
+      findUnique: async ({ where }) => where.agencyId_creatorId?.agencyId === "agency-1" && where.agencyId_creatorId?.creatorId === "creator-1" ? { agencyId: "agency-1", creatorId: "creator-1", activeVersion: 1, rootVersion: 1 } : null,
+    },
+    agencyCryptoOwnerKeyWrap: {
+      findFirst: async ({ where }) => where.agencyId === "agency-1" && where.rootVersion === 1 && where.deviceId === "device-1" && where.revokedAt === null ? { id: "ow-1" } : null,
     },
     creatorSessionState: {
       findUnique: async ({ where }) => (where.creatorId === creator.id ? clone(state) : null),
@@ -66,8 +88,17 @@ function makeDb() {
   };
 
   tx.$transaction = async (fn) => fn(tx);
-  return { db: tx, creator, devices, getState: () => clone(state) };
+  return { db: tx, creator, root, liveMember, devices, getState: () => clone(state) };
 }
+
+function opaquePayload(keyVersion = 1) {
+  return {
+    encryptionMode: "CLIENT_E2E_V1", keyVersion, algorithm: "aes-256-gcm-client-e2e-v1",
+    ciphertext: Buffer.alloc(48, 0x7a).toString("base64"), iv: Buffer.alloc(12, 0x11).toString("base64"), tag: Buffer.alloc(16, 0x22).toString("base64"),
+  };
+}
+
+const ownerMember = { role: "OWNER", roleKey: "owner", assignedCreators: null };
 
 function payload({ sess = "sess-A", bcTokenSha = "bc-A", expiry = 1_900_000_000 } = {}) {
   return {
@@ -380,6 +411,56 @@ test("revoke increments revision, deletes ciphertext fields, and generic write c
   assert.equal(getState().encryptedPayload, null);
 });
 
+test("V20.19 SERVER_V1 session migrates to opaque representation without canonical revision churn", async () => {
+  const { db, getState } = makeDb();
+  const clear = payload();
+  const hashes = hashesForPayload(clear);
+  await writeCreatorSession({
+    db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", actorMember: ownerMember, deviceId: "device-1",
+    baseRevision: 0, requestId: "migration-source-1", platformUserId: "of-42", payload: clear,
+  });
+  const before = await getCreatorSession({ db, agencyId: "agency-1", creatorId: "creator-1", includePayload: true, deviceId: "device-1", member: ownerMember });
+  assert.equal(before.revision, 1);
+  assert.equal(before.encryptionMode, "SERVER_V1");
+  assert.deepEqual(before.payload, hashes.payload);
+
+  const migrated = await migrateCreatorSessionToOpaque({
+    db, agencyId: "agency-1", creatorId: "creator-1", deviceId: "device-1", member: ownerMember, expectedRevision: 1, platformUserId: "of-42",
+    credentialHash: hashes.credentialHash, coherenceHash: hashes.coherenceHash, opaquePayload: opaquePayload(1),
+  });
+  assert.equal(migrated.migrated, true);
+  assert.equal(migrated.state.revision, 1, "representation migration must not rotate canonical session revision");
+  const stored = getState();
+  assert.equal(stored.revision, 1);
+  assert.equal(stored.encryptionMode, "CLIENT_E2E_V1");
+  assert.equal(stored.keyVersion, 1);
+
+  const after = await getCreatorSession({ db, agencyId: "agency-1", creatorId: "creator-1", includePayload: true, deviceId: "device-1", member: ownerMember });
+  assert.equal(after.payload, null);
+  assert.equal(after.opaquePayload.encryptionMode, "CLIENT_E2E_V1");
+  assert.equal(after.opaquePayload.ciphertext, opaquePayload(1).ciphertext);
+});
+
+test("V20.19 opaque enforcement blocks legacy session decrypt and legacy writes", async () => {
+  const { db, root } = makeDb();
+  await writeCreatorSession({
+    db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", actorMember: ownerMember, deviceId: "device-1",
+    baseRevision: 0, requestId: "legacy-before-enforce", platformUserId: "of-42", payload: payload(),
+  });
+  root.enforceOpaqueSecrets = true;
+  await assert.rejects(
+    getCreatorSession({ db, agencyId: "agency-1", creatorId: "creator-1", includePayload: true, deviceId: "device-1", member: ownerMember }),
+    (error) => error?.code === "CREATOR_SESSION_LEGACY_DECRYPT_DISABLED",
+  );
+  await assert.rejects(
+    writeCreatorSession({
+      db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", actorMember: ownerMember, deviceId: "device-1",
+      baseRevision: 1, requestId: "legacy-after-enforce", platformUserId: "of-42", payload: payload({ sess: "new" }),
+    }),
+    (error) => error?.code === "CREATOR_SESSION_LEGACY_WRITE_DISABLED",
+  );
+});
+
 test("shadow-session normalization drops Cloudflare, analytics and CDN noise before hashing", () => {
   const normalized = normalizePayload({
     ...payload(),
@@ -399,4 +480,60 @@ test("shadow-session normalization drops Cloudflare, analytics and CDN noise bef
     ],
   });
   assert.deepEqual(normalized.cookies.map((cookie) => cookie.name).sort(), ["auth_id", "sess"]);
+});
+
+
+test("V20.19 initial session write cannot resurrect credentials after creator soft-delete races the transaction", async () => {
+  const { db, creator, getState } = makeDb();
+  const originalTransaction = db.$transaction.bind(db);
+  db.$transaction = async (fn, options) => {
+    creator.deletedAt = new Date("2026-08-24T13:30:00.000Z");
+    creator.status = "DISABLED";
+    return originalTransaction(fn, options);
+  };
+
+  await assert.rejects(
+    writeCreatorSession({
+      db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", actorMember: ownerMember,
+      deviceId: "device-1", baseRevision: 0, requestId: "request-delete-race", platformUserId: "of-42", payload: payload(),
+    }),
+    (error) => ["CREATOR_NOT_FOUND", "CREATOR_SESSION_CREATOR_INACTIVE"].includes(error?.code),
+  );
+  assert.equal(getState(), null, "no canonical session row may be created after creator deletion commits");
+});
+
+
+test("legacy session payload read rechecks live creator assignment inside the secret-read transaction", async () => {
+  const { db, liveMember } = makeDb();
+  await writeCreatorSession({
+    db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+    baseRevision: 0, requestId: "request-read-access-race", platformUserId: "of-42", payload: payload(),
+  });
+  const staleRouteMember = clone(liveMember);
+  liveMember.assignedCreators = [];
+  await assert.rejects(
+    getCreatorSession({ db, agencyId: "agency-1", creatorId: "creator-1", includePayload: true, deviceId: "device-1", member: staleRouteMember, userId: "user-1" }),
+    (error) => error?.code === "CREATOR_SESSION_ACCESS_REVOKED" && error?.status === 403,
+  );
+});
+
+test("legacy session payload read rechecks creator deletion inside the secret-read transaction", async () => {
+  const { db, creator, liveMember } = makeDb();
+  await writeCreatorSession({
+    db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1",
+    baseRevision: 0, requestId: "request-read-delete-race", platformUserId: "of-42", payload: payload(),
+  });
+  creator.deletedAt = new Date("2026-08-24T15:10:00Z");
+  await assert.rejects(
+    getCreatorSession({ db, agencyId: "agency-1", creatorId: "creator-1", includePayload: true, deviceId: "device-1", member: clone(liveMember), userId: "user-1" }),
+    (error) => error?.code === "CREATOR_NOT_FOUND" && error?.status === 404,
+  );
+});
+
+test("creator session secret reads use a Serializable transaction rather than an unfenced row read", () => {
+  const source = require("node:fs").readFileSync(require("node:path").join(__dirname, "creator-session-broker-service.js"), "utf8");
+  const start = source.indexOf("async function getCreatorSession");
+  const end = source.indexOf("async function migrateCreatorSessionToOpaque", start);
+  const block = source.slice(start, end);
+  assert.match(block, /runSessionReadSerializable/);
 });
