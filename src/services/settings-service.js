@@ -71,15 +71,92 @@ function sessionPublic(row, currentSessionId) {
   };
 }
 
+function dateMs(value) {
+  const time = value ? new Date(value).getTime() : 0;
+  return Number.isFinite(time) ? time : 0;
+}
+
+function newestDate(...values) {
+  let best = null;
+  let bestMs = 0;
+  for (const value of values) {
+    const ms = dateMs(value);
+    if (ms <= bestMs) continue;
+    bestMs = ms;
+    best = value;
+  }
+  return best ? new Date(best).toISOString() : null;
+}
+
+function oldestDate(values) {
+  let best = null;
+  let bestMs = Number.POSITIVE_INFINITY;
+  for (const value of values) {
+    const ms = dateMs(value);
+    if (!ms || ms >= bestMs) continue;
+    bestMs = ms;
+    best = value;
+  }
+  return best ? new Date(best).toISOString() : null;
+}
+
+function accountDevicesFromSessions({ sessions, workerDevices, currentDeviceId }) {
+  const workerById = new Map((Array.isArray(workerDevices) ? workerDevices : []).map((row) => [clean(row.id, 160), row]));
+  const groups = new Map();
+  for (const session of Array.isArray(sessions) ? sessions : []) {
+    const id = clean(session.deviceId, 160);
+    if (!id) continue; // Pre-device-binding sessions stay visible in the legacy session list only.
+    const rows = groups.get(id) || [];
+    rows.push(session);
+    groups.set(id, rows);
+  }
+
+  const devices = [];
+  for (const [id, rows] of groups.entries()) {
+    rows.sort((left, right) => dateMs(right.lastUsedAt || right.createdAt) - dateMs(left.lastUsedAt || left.createdAt));
+    const latest = rows[0] || {};
+    const worker = workerById.get(id) || null;
+    const expiresAt = newestDate(...rows.map((row) => row.expiresAt));
+    const lastActiveAt = newestDate(worker?.lastSeenAt, ...rows.map((row) => row.lastUsedAt || row.createdAt));
+    devices.push({
+      deviceId: id,
+      deviceName: clean(worker?.deviceName, 160) || null,
+      platform: clean(worker?.platform, 80) || null,
+      appVersion: clean(worker?.appVersion, 80) || null,
+      client: clean(latest.client, 80) || null,
+      userAgent: clean(latest.userAgent, 500) || null,
+      firstLoginAt: oldestDate(rows.map((row) => row.createdAt)),
+      lastActiveAt,
+      expiresAt,
+      rememberDevice: rows.some((row) => row.rememberDevice === true),
+      activeSessionCount: rows.length,
+      isThisDevice: !!currentDeviceId && id === currentDeviceId,
+    });
+  }
+
+  devices.sort((left, right) => {
+    if (left.isThisDevice !== right.isThisDevice) return left.isThisDevice ? -1 : 1;
+    return dateMs(right.lastActiveAt) - dateMs(left.lastActiveAt);
+  });
+  return devices;
+}
+
 async function getAccountSettings({ userId, currentDeviceId = null, db = null }) {
   const client = db || prisma;
   const now = new Date();
-  const [user, sessions] = await Promise.all([
+  const [user, sessions, workerDevices] = await Promise.all([
     client.user.findUnique({ where: { id: userId } }),
     client.refreshSession.findMany({
       where: { userId, revokedAt: null, expiresAt: { gt: now } },
       orderBy: [{ lastUsedAt: "desc" }, { createdAt: "desc" }],
     }),
+    client.workerDevice?.findMany
+      ? client.workerDevice.findMany({
+        where: { userId },
+        select: { id: true, deviceName: true, platform: true, appVersion: true, lastSeenAt: true },
+        take: 1000,
+      })
+      : Promise.resolve([]),
   ]);
   if (!user) return null;
   const normalizedDeviceId = clean(currentDeviceId, 160) || null;
@@ -89,6 +166,8 @@ async function getAccountSettings({ userId, currentDeviceId = null, db = null })
   return {
     user: publicUser(user),
     currentDeviceId: normalizedDeviceId,
+    devices: accountDevicesFromSessions({ sessions, workerDevices, currentDeviceId: normalizedDeviceId }),
+    // Kept for backward-compatible desktop builds. New UI is device-oriented.
     sessions: sessions.map((row) => sessionPublic(row, currentSession?.id || null)),
   };
 }
@@ -160,6 +239,76 @@ async function requestAccountPasswordReset({ userId, db = null }) {
   };
 }
 
+async function logoutAccountDevice({ agencyId, userId, targetDeviceId, currentDeviceId = null, db = null }) {
+  const client = db || prisma;
+  const target = clean(targetDeviceId, 160);
+  if (!target) {
+    const err = new Error("Device id is required");
+    err.code = "SETTINGS_DEVICE_REQUIRED";
+    throw err;
+  }
+  const now = new Date();
+  const result = await client.refreshSession.updateMany({
+    // Account-level device logout is intentionally not scoped to the current
+    // agency. It signs this user's logical device out everywhere without
+    // touching another user, WorkerDevice telemetry, creator bindings or any
+    // E2E crypto identity/wrap state.
+    where: { userId, deviceId: target, revokedAt: null },
+    data: { revokedAt: now },
+  });
+  if (!result.count) {
+    const err = new Error("Device has no active account session");
+    err.code = "SETTINGS_DEVICE_NOT_ACTIVE";
+    err.status = 404;
+    throw err;
+  }
+  const normalizedCurrent = clean(currentDeviceId, 160) || null;
+  const currentDeviceLoggedOut = !!normalizedCurrent && target === normalizedCurrent;
+  await audit({
+    agencyId,
+    actorUserId: userId,
+    action: "settings.account.device_logged_out",
+    targetType: "auth_device",
+    targetId: target,
+    metadata: { revokedSessionCount: result.count, currentDeviceLoggedOut },
+    db: client,
+  });
+  return { ok: true, deviceId: target, revokedSessionCount: result.count, currentDeviceLoggedOut };
+}
+
+async function logoutOtherAccountDevices({ agencyId, userId, currentDeviceId, db = null }) {
+  const client = db || prisma;
+  const current = clean(currentDeviceId, 160);
+  if (!current) {
+    const err = new Error("Current device id is required");
+    err.code = "SETTINGS_CURRENT_DEVICE_REQUIRED";
+    throw err;
+  }
+  const now = new Date();
+  const active = await client.refreshSession.findMany({
+    where: { userId, revokedAt: null, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
+    select: { deviceId: true },
+  });
+  const result = await client.refreshSession.updateMany({
+    where: { userId, revokedAt: null, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
+    data: { revokedAt: now },
+  });
+  const loggedOutDeviceIds = Array.from(new Set(active.map((row) => clean(row.deviceId, 160)).filter(Boolean))).sort();
+  await audit({
+    agencyId,
+    actorUserId: userId,
+    action: "settings.account.other_devices_logged_out",
+    targetType: "user",
+    targetId: userId,
+    metadata: { currentDeviceId: current, revokedSessionCount: result.count, loggedOutDeviceIds },
+    db: client,
+  });
+  return { ok: true, revokedSessionCount: result.count, loggedOutDeviceCount: loggedOutDeviceIds.length };
+}
+
+// Backward-compatible session endpoints from Settings V12. If the selected
+// refresh session is device-bound, revoke the entire logical device so old
+// desktop builds get the same immediate isolation semantics as the new UI.
 async function revokeAccountSession({ agencyId, userId, sessionId, currentDeviceId = null, db = null }) {
   const client = db || prisma;
   const session = await client.refreshSession.findFirst({ where: { id: clean(sessionId, 180), userId, revokedAt: null } });
@@ -168,35 +317,19 @@ async function revokeAccountSession({ agencyId, userId, sessionId, currentDevice
     err.code = "SETTINGS_SESSION_NOT_FOUND";
     throw err;
   }
-  let currentSessionId = null;
-  const normalizedDeviceId = clean(currentDeviceId, 160);
-  if (normalizedDeviceId && clean(session.deviceId, 160) === normalizedDeviceId) {
-    const current = await client.refreshSession.findFirst({
-      where: { userId, deviceId: normalizedDeviceId, revokedAt: null, expiresAt: { gt: new Date() } },
-      orderBy: [{ lastUsedAt: "desc" }, { createdAt: "desc" }],
-    });
-    currentSessionId = current?.id || null;
+  const targetDeviceId = clean(session.deviceId, 160);
+  if (targetDeviceId) {
+    const result = await logoutAccountDevice({ agencyId, userId, targetDeviceId, currentDeviceId, db: client });
+    return { ok: true, currentDeviceRevoked: result.currentDeviceLoggedOut };
   }
   await client.refreshSession.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
-  const currentDeviceRevoked = !!currentSessionId && String(currentSessionId) === String(session.id);
-  await audit({ agencyId, actorUserId: userId, action: "settings.account.session_revoked", targetType: "refresh_session", targetId: session.id, metadata: { deviceId: session.deviceId || null, client: session.client || null, currentDeviceRevoked }, db: client });
-  return { ok: true, currentDeviceRevoked };
+  await audit({ agencyId, actorUserId: userId, action: "settings.account.session_revoked", targetType: "refresh_session", targetId: session.id, metadata: { deviceId: null, client: session.client || null, currentDeviceRevoked: false }, db: client });
+  return { ok: true, currentDeviceRevoked: false };
 }
 
 async function revokeOtherAccountSessions({ agencyId, userId, currentDeviceId, db = null }) {
-  const client = db || prisma;
-  const deviceId = clean(currentDeviceId, 160);
-  if (!deviceId) {
-    const err = new Error("Current device id is required");
-    err.code = "SETTINGS_CURRENT_DEVICE_REQUIRED";
-    throw err;
-  }
-  const result = await client.refreshSession.updateMany({
-    where: { userId, revokedAt: null, OR: [{ deviceId: { not: deviceId } }, { deviceId: null }] },
-    data: { revokedAt: new Date() },
-  });
-  await audit({ agencyId, actorUserId: userId, action: "settings.account.other_sessions_revoked", targetType: "user", targetId: userId, metadata: { currentDeviceId: deviceId, revokedCount: result.count }, db: client });
-  return { ok: true, revokedCount: result.count };
+  const result = await logoutOtherAccountDevices({ agencyId, userId, currentDeviceId, db });
+  return { ok: true, revokedCount: result.revokedSessionCount };
 }
 
 async function canManageWorkspaceSettings(member, db = null) {
@@ -683,6 +816,8 @@ module.exports = {
   updateAccountAvatar,
   changeAccountPassword,
   requestAccountPasswordReset,
+  logoutAccountDevice,
+  logoutOtherAccountDevices,
   revokeAccountSession,
   revokeOtherAccountSessions,
   canManageWorkspaceSettings,

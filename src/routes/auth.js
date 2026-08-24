@@ -540,13 +540,18 @@ router.post("/reset-password", async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(input.password, 12);
+    const revokedAt = new Date();
 
     await prisma.$transaction(async (tx) => {
-      await tx.authToken.update({ where: { id: record.id }, data: { usedAt: new Date() } });
-      await tx.user.update({ where: { id: record.userId }, data: { passwordHash } });
+      await tx.authToken.update({ where: { id: record.id }, data: { usedAt: revokedAt } });
+      // Password reset is account recovery, so unlike an in-app password change
+      // it intentionally invalidates every device, including already-issued
+      // access JWTs. Device-bound clients are also cut off by refresh-session
+      // lineage; sessionsRevokedAt covers legacy/unbound access tokens.
+      await tx.user.update({ where: { id: record.userId }, data: { passwordHash, sessionsRevokedAt: revokedAt } });
       await tx.refreshSession.updateMany({
         where: { userId: record.userId, revokedAt: null },
-        data: { revokedAt: new Date() },
+        data: { revokedAt },
       });
     });
 

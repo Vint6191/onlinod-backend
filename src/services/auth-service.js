@@ -265,6 +265,18 @@ async function verifyEmailByCode({ email, code }) {
   };
 }
 
+async function revokeRefreshReuseScope(session, now = new Date()) {
+  const boundDeviceId = String(session?.deviceId || "").trim();
+  await prisma.refreshSession.updateMany({
+    where: {
+      userId: session.userId,
+      revokedAt: null,
+      ...(boundDeviceId ? { deviceId: boundDeviceId } : {}),
+    },
+    data: { revokedAt: now },
+  });
+}
+
 async function refreshAccessToken({ refreshToken, req, deviceId = null, client = null }) {
   const tokenHash = sha256(refreshToken);
 
@@ -280,12 +292,10 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
   }
 
   if (session.revokedAt) {
-    // Reuse detection: an already-rotated token was presented again. Assume
-    // compromise and revoke all currently active sessions for this user.
-    await prisma.refreshSession.updateMany({
-      where: { userId: session.userId, revokedAt: null },
-      data: { revokedAt: now },
-    });
+    // Contain refresh-token reuse to the compromised logical device. A stolen
+    // token from one PC must never sign unrelated devices of the same user out.
+    // Legacy unbound sessions retain the old account-wide fallback.
+    await revokeRefreshReuseScope(session, now);
     return { ok: false, code: "REFRESH_REUSED", error: "Refresh token reuse detected. Please sign in again." };
   }
 
@@ -350,10 +360,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
   });
 
   if (!rotated) {
-    await prisma.refreshSession.updateMany({
-      where: { userId: session.userId, revokedAt: null },
-      data: { revokedAt: now },
-    });
+    await revokeRefreshReuseScope({ ...session, deviceId: effectiveDeviceId || session.deviceId }, now);
     return { ok: false, code: "REFRESH_REUSED", error: "Refresh token reuse detected. Please sign in again." };
   }
 
@@ -377,17 +384,16 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
 
 async function revokeRefreshToken(refreshToken) {
   if (!refreshToken) return { ok: true };
-
+  const tokenHash = sha256(refreshToken);
+  const session = await prisma.refreshSession.findUnique({ where: { tokenHash } });
+  if (!session || session.revokedAt) return { ok: true };
+  const boundDeviceId = String(session.deviceId || "").trim();
   await prisma.refreshSession.updateMany({
-    where: {
-      tokenHash: sha256(refreshToken),
-      revokedAt: null,
-    },
-    data: {
-      revokedAt: new Date(),
-    },
+    where: boundDeviceId
+      ? { userId: session.userId, deviceId: boundDeviceId, revokedAt: null }
+      : { id: session.id, revokedAt: null },
+    data: { revokedAt: new Date() },
   });
-
   return { ok: true };
 }
 

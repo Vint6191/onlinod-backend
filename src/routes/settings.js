@@ -10,6 +10,8 @@ const {
   updateAccountAvatar,
   changeAccountPassword,
   requestAccountPasswordReset,
+  logoutAccountDevice,
+  logoutOtherAccountDevices,
   revokeAccountSession,
   revokeOtherAccountSessions,
   getWorkspaceSettings,
@@ -89,6 +91,14 @@ function deviceId(req) {
   return String(req.query?.deviceId || req.body?.deviceId || req.headers["x-onlinod-device-id"] || "").trim().slice(0, 160) || null;
 }
 
+function authDeviceId(req) {
+  // Current-device identity is an authorization fact from the signed access
+  // token. Never let query/body/header input choose which session survives a
+  // password change or "logout other devices" operation. Legacy unbound JWTs
+  // safely fall back to null, which means no device is implicitly preserved.
+  return String(req.auth?.deviceId || "").trim().slice(0, 160) || null;
+}
+
 function sendError(res, err, fallbackCode) {
   const status = Number(err?.status || 0) || (String(err?.code || "").includes("FORBIDDEN") ? 403 : 400);
   if (Number(err?.retryAfterSeconds || 0) > 0) res.setHeader("Retry-After", String(Math.ceil(Number(err.retryAfterSeconds))));
@@ -102,7 +112,7 @@ function sendError(res, err, fallbackCode) {
 
 router.get("/account", async (req, res) => {
   try {
-    const result = await getAccountSettings({ userId: req.auth.userId, currentDeviceId: deviceId(req) });
+    const result = await getAccountSettings({ userId: req.auth.userId, currentDeviceId: authDeviceId(req) });
     if (!result) return res.status(404).json({ ok: false, code: "SETTINGS_USER_NOT_FOUND", error: "User not found" });
     return res.json({ ok: true, ...result });
   } catch (err) {
@@ -148,7 +158,7 @@ router.delete("/account/avatar", async (req, res) => {
 
 router.post("/account/password", async (req, res) => {
   try {
-    await changeAccountPassword({ agencyId: req.auth.agencyId, userId: req.auth.userId, currentPassword: req.body?.currentPassword, newPassword: req.body?.newPassword, currentDeviceId: deviceId(req) });
+    await changeAccountPassword({ agencyId: req.auth.agencyId, userId: req.auth.userId, currentPassword: req.body?.currentPassword, newPassword: req.body?.newPassword, currentDeviceId: authDeviceId(req) });
     return res.json({ ok: true });
   } catch (err) { return sendError(res, err, "SETTINGS_PASSWORD_CHANGE_FAILED"); }
 });
@@ -163,16 +173,39 @@ router.post("/account/forgot-password", async (req, res) => {
   }
 });
 
+router.delete("/account/devices/:deviceId", async (req, res) => {
+  try {
+    const result = await logoutAccountDevice({
+      agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      targetDeviceId: req.params.deviceId,
+      currentDeviceId: authDeviceId(req),
+    });
+    return res.json(result);
+  } catch (err) { return sendError(res, err, "SETTINGS_DEVICE_LOGOUT_FAILED"); }
+});
+
+router.post("/account/devices/logout-others", async (req, res) => {
+  try {
+    const result = await logoutOtherAccountDevices({
+      agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      currentDeviceId: authDeviceId(req),
+    });
+    return res.json(result);
+  } catch (err) { return sendError(res, err, "SETTINGS_OTHER_DEVICES_LOGOUT_FAILED"); }
+});
+
 router.delete("/account/sessions/:sessionId", async (req, res) => {
   try {
-    const result = await revokeAccountSession({ agencyId: req.auth.agencyId, userId: req.auth.userId, sessionId: req.params.sessionId, currentDeviceId: deviceId(req) });
+    const result = await revokeAccountSession({ agencyId: req.auth.agencyId, userId: req.auth.userId, sessionId: req.params.sessionId, currentDeviceId: authDeviceId(req) });
     return res.json(result);
   } catch (err) { return sendError(res, err, "SETTINGS_SESSION_REVOKE_FAILED"); }
 });
 
 router.post("/account/sessions/revoke-others", async (req, res) => {
   try {
-    const result = await revokeOtherAccountSessions({ agencyId: req.auth.agencyId, userId: req.auth.userId, currentDeviceId: deviceId(req) });
+    const result = await revokeOtherAccountSessions({ agencyId: req.auth.agencyId, userId: req.auth.userId, currentDeviceId: authDeviceId(req) });
     return res.json(result);
   } catch (err) { return sendError(res, err, "SETTINGS_SESSIONS_REVOKE_FAILED"); }
 });

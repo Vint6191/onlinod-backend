@@ -18,6 +18,7 @@ async function authRequired(req, res, next) {
     const token = match[1];
     const decoded = verifyAccessToken(token);
 
+    const boundDeviceId = decoded.deviceId ? String(decoded.deviceId).trim().slice(0, 160) : null;
     const membership = await prisma.agencyMember.findFirst({
       where: {
         userId: decoded.userId,
@@ -27,7 +28,20 @@ async function authRequired(req, res, next) {
         agency: { deletedAt: null },
       },
       include: {
-        user: true,
+        user: boundDeviceId ? {
+          include: {
+            refreshSessions: {
+              where: {
+                agencyId: decoded.agencyId,
+                deviceId: boundDeviceId,
+                revokedAt: null,
+                expiresAt: { gt: new Date() },
+              },
+              select: { id: true },
+              take: 1,
+            },
+          },
+        } : true,
         agency: true,
       },
     });
@@ -46,6 +60,24 @@ async function authRequired(req, res, next) {
         code: "USER_DISABLED",
         error: "User is disabled",
       });
+    }
+
+    // Device logout is an account-session concern, not a crypto revocation.
+    // A device-bound access token is accepted only while this user still has
+    // an active refresh-session lineage for that same logical device. Remote
+    // logout revokes those rows, so the next API request is rejected without
+    // touching WorkerDevice, AMK/CDK wraps, creator bindings or other users.
+    if (boundDeviceId) {
+      const activeDeviceSessions = Array.isArray(membership.user.refreshSessions) ? membership.user.refreshSessions : [];
+      if (!activeDeviceSessions.length) {
+        return res.status(401).json({
+          ok: false,
+          code: "SESSION_REVOKED",
+          error: "This device was logged out. Please sign in again.",
+        });
+      }
+      const { refreshSessions: _activeDeviceSessions, ...publicAuthUser } = membership.user;
+      membership.user = publicAuthUser;
     }
 
     // Admin force-logout must invalidate already-issued access tokens too.
