@@ -903,7 +903,6 @@ model AgencyCryptoRoot {
 
   agency              Agency        @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   initializedByDevice WorkerDevice? @relation("AgencyCryptoRootInitializedByDevice", fields: [initializedByDeviceId], references: [id], onDelete: SetNull)
-  ownerKeyWraps       AgencyCryptoOwnerKeyWrap[]
 
   @@index([status, updatedAt])
 }
@@ -922,8 +921,10 @@ model AgencyCryptoOwnerKeyWrap {
   createdAt         DateTime @default(now())
   revokedAt         DateTime?
 
+  // rootVersion is historical key-generation metadata. AgencyCryptoRoot is one mutable
+  // row per agency, so wraps must not declare a second FK from agencyId to that row.
+  // The durable DB relation is the Agency FK created by the original migration.
   agency          Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  root            AgencyCryptoRoot @relation(fields: [agencyId], references: [agencyId], onDelete: Cascade)
   createdByDevice WorkerDevice? @relation("AgencyCryptoOwnerWrapCreatedByDevice", fields: [createdByDeviceId], references: [id], onDelete: SetNull)
 
   @@unique([agencyId, rootVersion, deviceId])
