@@ -7,7 +7,9 @@
     "node": "22.x"
   },
   "scripts": {
+    "predev": "prisma generate",
     "dev": "node src/server.js",
+    "prestart": "prisma generate",
     "start": "node src/server.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate deploy",
