@@ -137,7 +137,7 @@ test("V8 creator scope is checked before creator mutation handlers and before av
   assert.match(creators, /res\.status\(Number\(error\?\.status\) \|\| 403\)/);
   assert.match(creators, /router\.patch\("\/:id", creatorManagementRequired, creatorAccessRequired/);
   assert.match(creators, /router\.delete\("\/:id", creatorManagementRequired, creatorAccessRequired/);
-  assert.match(creators, /router\.post\("\/:id\/complete-runtime", creatorManagementRequired, creatorAccessRequired/);
+  assert.match(creators, /router\.post\("\/:id\/complete-connection", creatorManagementRequired, creatorAccessRequired/);
   assert.match(creators, /router\.post\("\/:id\/avatar", creatorManagementRequired, creatorAccessRequired, upload\.single/);
 });
 

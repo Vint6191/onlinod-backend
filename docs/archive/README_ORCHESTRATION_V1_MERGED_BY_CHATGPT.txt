@@ -31,3 +31,6 @@ After deploy:
 - `/api/stats/creators/:creatorId/refresh`
 - `/api/jobs/claim`
 - `/api/jobs/pending`
+
+---
+Historical archive note (V20.22): referenced Electron patch bundles were removed after integration. This document is retained only as development history; do not use it as current deployment instructions.

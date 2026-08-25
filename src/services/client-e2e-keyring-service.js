@@ -3,7 +3,6 @@
 const crypto = require("node:crypto");
 const { isOwner } = require("./team-access-control");
 const { assignedCreatorIds, hasBroadCreatorAccess, canAccessCreator, allowedCreatorScope } = require("../middleware/automation-permissions");
-const { countLegacyAccessSnapshotSecrets, cryptoShredLegacyAccessSnapshotSecrets } = require("./legacy-access-snapshot-policy");
 
 const DEVICE_KEY_ALGORITHM = "x25519-spki-der-v1";
 const WRAP_ALGORITHM = "x25519-hkdf-sha256-aes-256-gcm-v1";
@@ -237,8 +236,6 @@ function publicRoot(root) {
     status: String(root.status || "ACTIVE"),
     initializedAt: root.initializedAt,
     updatedAt: root.updatedAt,
-    enforceOpaqueSecrets: root.enforceOpaqueSecrets === true,
-    enforcedAt: root.enforcedAt || null,
     recoveryProofAvailable: Boolean(root.recoveryProofHash),
   };
 }
@@ -711,107 +708,26 @@ async function listCryptoDevicesSnapshot({ db, agencyId, member }) {
   });
 }
 
-async function getCryptoMigrationStatus({ db, agencyId, userId, member }) {
+async function getCryptoSecurityDebt({ db, agencyId, userId, member }) {
   return withFreshOwnerRead({
-    db, agencyId, userId, member, conflictCode: "CRYPTO_MIGRATION_STATUS_READ_CONFLICT",
-    read: (tx, liveMember) => getCryptoMigrationStatusSnapshot({ db: tx, agencyId, member: liveMember }),
+    db, agencyId, userId, member, conflictCode: "CRYPTO_SECURITY_DEBT_READ_CONFLICT",
+    read: (tx) => getCryptoSecurityDebtSnapshot({ db: tx, agencyId }),
   });
 }
 
-async function getCryptoMigrationStatusSnapshot({ db, agencyId, member }) {
-  const legacySessionWhere = { agencyId, status: "ACTIVE", encryptedPayload: { not: null }, encryptionMode: "SERVER_V1" };
-  const legacyProxyWhere = { agencyId, hasCredentials: true, encryptedPayload: { not: null }, encryptionMode: "SERVER_V1" };
-  const [root, legacySessionCount, legacyProxyCredentialCount, legacyAccessSnapshotSecretCount, sessions, proxies] = await Promise.all([
-    db.agencyCryptoRoot.findUnique({ where: { agencyId } }),
-    db.creatorSessionState.count({ where: legacySessionWhere }),
-    db.agencyProxyEndpoint.count({ where: legacyProxyWhere }),
-    countLegacyAccessSnapshotSecrets({ db, agencyId }),
-    db.creatorSessionState.findMany({
-      where: legacySessionWhere,
-      select: {
-        creatorId: true,
-        revision: true,
-        updatedAt: true,
-        creator: { select: { displayName: true, username: true } },
-      },
-      orderBy: { updatedAt: "desc" },
-      take: 500,
-    }),
-    db.agencyProxyEndpoint.findMany({
-      where: legacyProxyWhere,
-      select: {
-        id: true,
-        label: true,
-        version: true,
-        ownerCreatorId: true,
-        updatedAt: true,
-        ownerCreator: { select: { displayName: true, username: true } },
-        creatorProfile: { select: { creatorId: true, mode: true, creator: { select: { displayName: true, username: true } } } },
-      },
-      orderBy: { updatedAt: "desc" },
-      take: 500,
-    }),
-  ]);
-
+async function getCryptoSecurityDebtSnapshot({ db, agencyId }) {
+  const root = await db.agencyCryptoRoot.findUnique({ where: { agencyId } });
   const [rootExposureDebt, untrustedCreatorExposureDebt] = await Promise.all([
     root ? findRootExposureDebt({ db, agencyId, root }) : Promise.resolve({ deviceIds: [], exposures: [] }),
     findUntrustedCreatorExposureDebt({ db, agencyId }),
   ]);
-
-  const sessionRows = sessions.map((row) => ({
-    creatorId: row.creatorId,
-    displayName: row.creator?.displayName || row.creator?.username || row.creatorId,
-    username: row.creator?.username || null,
-    revision: Number(row.revision || 0),
-    updatedAt: row.updatedAt || null,
-  }));
-  const proxyRows = proxies.map((row) => {
-    const assignedCreatorId = row.creatorProfile?.mode === "PROXY" ? row.creatorProfile.creatorId : null;
-    const ownerCreatorId = row.ownerCreatorId || null;
-    const creatorId = ownerCreatorId || assignedCreatorId || null;
-    const ownershipMismatch = Boolean(ownerCreatorId && assignedCreatorId && ownerCreatorId !== assignedCreatorId);
-    const creator = ownerCreatorId ? row.ownerCreator : row.creatorProfile?.creator || null;
-    const autoMigratable = Boolean(creatorId && !ownershipMismatch && (ownerCreatorId === creatorId || (!ownerCreatorId && assignedCreatorId === creatorId)));
-    return {
-      proxyId: row.id,
-      label: row.label,
-      proxyVersion: Number(row.version || 0),
-      ownerCreatorId,
-      assignedCreatorId,
-      creatorId,
-      displayName: creator?.displayName || creator?.username || creatorId || null,
-      username: creator?.username || null,
-      autoMigratable,
-      blocker: ownershipMismatch ? "PROXY_OWNER_ASSIGNMENT_MISMATCH" : (autoMigratable ? null : "PROXY_OWNER_REQUIRED"),
-      updatedAt: row.updatedAt || null,
-    };
-  });
-
   return {
     root: publicRoot(root),
-    legacySessionCount: Number(legacySessionCount || 0),
-    legacyProxyCredentialCount: Number(legacyProxyCredentialCount || 0),
-    legacyAccessSnapshotSecretCount: Number(legacyAccessSnapshotSecretCount || 0),
-    legacyAccessSnapshotRetirementRequired: Number(legacyAccessSnapshotSecretCount || 0) > 0,
-    totalLegacyCount: Number(legacySessionCount || 0) + Number(legacyProxyCredentialCount || 0),
     rootExposureDeviceCount: rootExposureDebt.deviceIds.length,
     rootRotationRequired: rootExposureDebt.deviceIds.length > 0,
     untrustedCreatorExposureDeviceCount: untrustedCreatorExposureDebt.deviceIds.length,
     untrustedCreatorExposureCreatorIds: untrustedCreatorExposureDebt.creatorIds,
     untrustedCreatorRotationRequired: untrustedCreatorExposureDebt.creatorIds.length > 0,
-    readyToEnforce: Boolean(
-      root
-      && root.recoveryProofHash
-      && !root.enforceOpaqueSecrets
-      && Number(legacySessionCount || 0) === 0
-      && Number(legacyProxyCredentialCount || 0) === 0
-      && rootExposureDebt.deviceIds.length === 0
-      && untrustedCreatorExposureDebt.creatorIds.length === 0
-    ),
-    truncated: Number(legacySessionCount || 0) > sessionRows.length || Number(legacyProxyCredentialCount || 0) > proxyRows.length,
-    enforced: root?.enforceOpaqueSecrets === true,
-    sessions: sessionRows,
-    proxies: proxyRows,
   };
 }
 
@@ -1333,8 +1249,8 @@ async function activeOwnerDeviceIdentities({ db, agencyId }) {
 
 function sessionRotationProjection(row) {
   if (!row || row.status !== "ACTIVE" || !row.encryptedPayload) return null;
-  if (String(row.encryptionMode || "SERVER_V1") !== "CLIENT_E2E_V1" || !row.keyVersion) {
-    throw codedError("CRYPTO_ROTATION_REQUIRES_OPAQUE_SECRETS", "Creator session must be migrated to client-side encryption before strong key rotation", 409);
+  if (String(row.encryptionMode || "") !== "CLIENT_E2E_V1" || !row.keyVersion) {
+    throw codedError("CRYPTO_ROTATION_REQUIRES_OPAQUE_SECRETS", "Creator session is not a valid client-side encrypted envelope", 409);
   }
   return {
     revision: Number(row.revision),
@@ -1353,8 +1269,8 @@ function sessionRotationProjection(row) {
 
 function proxyRotationProjection(proxy, profile) {
   if (!proxy || !proxy.hasCredentials) return null;
-  if (String(proxy.encryptionMode || "SERVER_V1") !== "CLIENT_E2E_V1" || !proxy.keyVersion) {
-    throw codedError("CRYPTO_ROTATION_REQUIRES_OPAQUE_SECRETS", "Proxy credentials must be migrated to client-side encryption before strong key rotation", 409);
+  if (String(proxy.encryptionMode || "") !== "CLIENT_E2E_V1" || !proxy.keyVersion) {
+    throw codedError("CRYPTO_ROTATION_REQUIRES_OPAQUE_SECRETS", "Proxy credentials are not a valid client-side encrypted envelope", 409);
   }
   const active = Boolean(profile && profile.mode === "PROXY" && profile.proxyEndpointId === proxy.id);
   return {
@@ -1766,101 +1682,6 @@ async function commitCreatorKeyRotation({
   }, "CRYPTO_ROTATION_WRITE_CONFLICT");
 }
 
-async function cryptoShredResidualServerV1Secrets({ db, agencyId }) {
-  const [sessions, proxies] = await Promise.all([
-    db.creatorSessionState.updateMany({
-      where: { agencyId, encryptionMode: "SERVER_V1", encryptedPayload: { not: null } },
-      data: {
-        encryptedPayload: null,
-        iv: null,
-        tag: null,
-        algorithm: null,
-        keyVersion: null,
-        credentialHash: null,
-        coherenceHash: null,
-      },
-    }),
-    db.agencyProxyEndpoint.updateMany({
-      where: { agencyId, encryptionMode: "SERVER_V1", encryptedPayload: { not: null } },
-      data: {
-        encryptedPayload: null,
-        iv: null,
-        tag: null,
-        algorithm: null,
-        keyVersion: null,
-        hasCredentials: false,
-      },
-    }),
-  ]);
-  return {
-    retiredLegacySessionResiduals: Number(sessions?.count || 0),
-    retiredLegacyProxyResiduals: Number(proxies?.count || 0),
-  };
-}
-
-async function enforceOpaqueSecrets({ db, agencyId, userId, member, deviceId, actorProof }) {
-  return serializableTransaction(db, async (tx) => {
-    const actor = await requireOwnerCryptoCommitActor({ db: tx, agencyId, userId, member, deviceId, actorProof });
-    const actorIdentity = { id: actor.device.id, identity: actor.identity };
-    const root = actor.root;
-
-    // An already-enforced agency may be upgrading from an earlier V20.19
-    // intermediate that did not crypto-shred legacy AccessSnapshot payloads.
-    // Re-running enforcement is therefore intentionally cleanup-idempotent.
-    if (root.enforceOpaqueSecrets) {
-      const [retiredLegacyAccessSnapshots, residuals] = await Promise.all([
-        cryptoShredLegacyAccessSnapshotSecrets({ db: tx, agencyId }),
-        cryptoShredResidualServerV1Secrets({ db: tx, agencyId }),
-      ]);
-      return { enforced: true, root: publicRoot(root), idempotent: true, retiredLegacyAccessSnapshots, ...residuals };
-    }
-
-    if (!root.recoveryProofHash) throw codedError("CRYPTO_RECOVERY_PROOF_REQUIRED", "Pin the recovery proof from an already trusted owner device before enabling irreversible opaque-secret enforcement", 409);
-    const ownerWrap = await tx.agencyCryptoOwnerKeyWrap.findFirst({ where: { agencyId, rootVersion: root.version, deviceId: actorIdentity.id, revokedAt: null } });
-    if (!ownerWrap) throw codedError("CRYPTO_OWNER_KEY_NOT_ENROLLED", "This owner device does not hold the active Agency Master Key", 403);
-    const [legacySessions, legacyProxyCredentials] = await Promise.all([
-      tx.creatorSessionState.count({ where: { agencyId, status: "ACTIVE", encryptedPayload: { not: null }, encryptionMode: "SERVER_V1" } }),
-      tx.agencyProxyEndpoint.count({ where: { agencyId, hasCredentials: true, encryptedPayload: { not: null }, encryptionMode: "SERVER_V1" } }),
-    ]);
-    if (legacySessions || legacyProxyCredentials) {
-      throw codedError("CRYPTO_MIGRATION_INCOMPLETE", "Client-side encryption migration is not complete", 409, { legacySessions, legacyProxyCredentials });
-    }
-    const rootExposureDebt = await findRootExposureDebt({ db: tx, agencyId, root });
-    if (rootExposureDebt.deviceIds.length > 0) {
-      throw codedError(
-        "CRYPTO_ROOT_ROTATION_REQUIRED",
-        "A former, inactive, or revoked owner still knows an Agency Master Key generation that protects active creator state",
-        409,
-        { rootExposureDeviceIds: rootExposureDebt.deviceIds, rootExposureCount: rootExposureDebt.deviceIds.length },
-      );
-    }
-    const creatorExposureDebt = await findUntrustedCreatorExposureDebt({ db: tx, agencyId });
-    if (creatorExposureDebt.creatorIds.length > 0) {
-      throw codedError(
-        "CRYPTO_CREATOR_ROTATION_REQUIRED",
-        "A removed, inactive, revoked, missing, or creator-access-revoked device still knows a current creator encryption key generation",
-        409,
-        {
-          creatorExposureDeviceIds: creatorExposureDebt.deviceIds,
-          creatorExposureCreatorIds: creatorExposureDebt.creatorIds,
-          creatorExposureCount: creatorExposureDebt.creatorIds.length,
-        },
-      );
-    }
-
-    // AccessSnapshot is a pre-Broker rollback artifact.  It is not migrated to
-    // CLIENT_E2E_V1; once the owner crosses the irreversible enforcement
-    // boundary, every server-decryptable payload is crypto-shredded while
-    // non-secret provenance remains until Phase 9 removes the legacy rows/API.
-    const [retiredLegacyAccessSnapshots, residuals] = await Promise.all([
-      cryptoShredLegacyAccessSnapshotSecrets({ db: tx, agencyId }),
-      cryptoShredResidualServerV1Secrets({ db: tx, agencyId }),
-    ]);
-    const updated = await tx.agencyCryptoRoot.update({ where: { agencyId }, data: { enforceOpaqueSecrets: true, enforcedAt: new Date() } });
-    return { enforced: true, root: publicRoot(updated), idempotent: false, retiredLegacyAccessSnapshots, ...residuals };
-  }, "CRYPTO_OPAQUE_ENFORCEMENT_CONFLICT");
-}
-
 async function retireCurrentDeviceIdentity({ db, agencyId, userId, deviceId }) {
   const id = clean(deviceId, 180);
   if (!id) throw codedError("CRYPTO_DEVICE_REQUIRED", "deviceId is required", 400);
@@ -1970,7 +1791,7 @@ module.exports = {
   initializeAgencyCryptoRoot,
   getCryptoStatus,
   listCryptoDevices,
-  getCryptoMigrationStatus,
+  getCryptoSecurityDebt,
   getRecoveryEnvelope,
   recoverOwnerDevice,
   pendingDevices,
@@ -1988,7 +1809,6 @@ module.exports = {
   finalizeRootRotation,
   getCreatorRotationPlan,
   commitCreatorKeyRotation,
-  enforceOpaqueSecrets,
   retireCurrentDeviceIdentity,
   softRevokeDevice,
 };

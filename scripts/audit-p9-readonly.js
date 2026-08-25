@@ -44,7 +44,7 @@ check('scheduler assigns idempotency key', scheduler.includes('buildJobIdempoten
 check('traffic discovery does not hydrate fan values', scheduler.includes('hydrateFanValues: false') && scheduler.includes('hydrateLimit: 0'));
 check('fan-value refresh uses separate future key', traffic.includes('TRAFFIC_VALUE_REFRESH_JOB_KEY = "traffic_fan_value_refresh"'));
 check('catchup does not spawn hidden hydration', !read('src/services/team-observation-service.js').includes('scheduleTrafficValueRefresh'));
-check('claim only returns creator-scoped jobs', lease.includes('creatorId: { in: creatorIds }'));
+check('claim only returns creator-scoped jobs', lease.includes('scopedCreatorIds({ userId, device })') && lease.includes('creatorId: { in: eligibleCreatorIds }'));
 check('lease writes are conditionally fenced', (lease.match(/leaseTokenHash: hashToken\(leaseToken\)/g) || []).length >= 2);
 
 for (const item of checks) console.log(`${item.ok ? 'PASS' : 'FAIL'} ${item.name}`);

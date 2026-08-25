@@ -11,7 +11,7 @@ const {
   initializeAgencyCryptoRoot,
   getCryptoStatus,
   listCryptoDevices,
-  getCryptoMigrationStatus,
+  getCryptoSecurityDebt,
   getRecoveryEnvelope,
   recoverOwnerDevice,
   pendingDevices,
@@ -27,7 +27,6 @@ const {
   finalizeRootRotation,
   getCreatorRotationPlan,
   commitCreatorKeyRotation,
-  enforceOpaqueSecrets,
   retireCurrentDeviceIdentity,
   softRevokeDevice,
 } = require("../services/client-e2e-keyring-service");
@@ -154,12 +153,12 @@ router.get("/devices", async (req, res) => {
   } catch (error) { return fail(res, error, "CRYPTO_DEVICES_FAILED"); }
 });
 
-router.get("/migration-status", async (req, res) => {
+router.get("/security-debt", async (req, res) => {
   try {
-    const migration = await getCryptoMigrationStatus({ db: prisma, ...actor(req) });
+    const securityDebt = await getCryptoSecurityDebt({ db: prisma, ...actor(req) });
     res.setHeader("Cache-Control", "no-store, private");
-    return res.json({ ok: true, migration });
-  } catch (error) { return fail(res, error, "CRYPTO_MIGRATION_STATUS_FAILED"); }
+    return res.json({ ok: true, securityDebt });
+  } catch (error) { return fail(res, error, "CRYPTO_SECURITY_DEBT_FAILED"); }
 });
 
 router.post("/initialize", async (req, res) => {
@@ -394,20 +393,6 @@ router.post("/creators/:creatorId/rotate", async (req, res) => {
     });
     return res.json({ ok: true, ...result });
   } catch (error) { return fail(res, error, "CRYPTO_CREATOR_ROTATION_FAILED"); }
-});
-
-router.post("/enforce-opaque", async (req, res) => {
-  try {
-    const input = z.object({ deviceId, actorProof }).strict().parse(req.body || {});
-    const result = await enforceOpaqueSecrets({ db: prisma, ...actor(req), deviceId: actorDevice(req, input.deviceId), actorProof: input.actorProof });
-    await audit({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, action: "crypto.opaque_enforced", targetType: "agency_crypto_root", targetId: req.auth.agencyId, metadata: { rootVersion: result.root.version, idempotent: result.idempotent } });
-    return res.json({ ok: true, ...result });
-  } catch (error) {
-    if (Number.isInteger(error?.legacySessions) || Number.isInteger(error?.legacyProxyCredentials)) {
-      return res.status(Number(error.status) || 409).json({ ok: false, code: error.code, error: error.message, legacySessions: error.legacySessions || 0, legacyProxyCredentials: error.legacyProxyCredentials || 0 });
-    }
-    return fail(res, error, "CRYPTO_ENFORCEMENT_FAILED");
-  }
 });
 
 router.post("/devices/:deviceId/revoke", async (req, res) => {

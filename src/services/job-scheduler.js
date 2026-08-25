@@ -4,7 +4,7 @@
 
    Used in two places:
 
-   1. creator-connect.js — after a creator transitions to READY,
+   1. creators.js complete-connection — after a creator transitions to READY,
       we schedule lightweight dashboard earnings plus the strict Creator Analytics
       initial sync pipeline so history begins without anyone clicking refresh.
 
@@ -485,7 +485,7 @@ async function runRecurringSweep() {
         creatorId: creator.id,
         agencyId: creator.agencyId,
         creator,
-        priority: 30, // recurring is lower priority than refresh-now (100) and creator-connect (50)
+        priority: 30, // recurring work stays below explicit refresh-now / interactive connect work
         includeAnalyticsCatchups: true,
       });
       totalCreated += result.created.length;

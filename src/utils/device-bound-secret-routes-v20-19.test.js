@@ -53,7 +53,6 @@ test("destructive owner crypto routes require an AMK-possession actorProof", () 
     '/root-rotation/begin',
     '/root-rotation/finalize',
     '/creators/:creatorId/rotate',
-    '/enforce-opaque',
     '/devices/:deviceId/revoke',
   ]) {
     assert.ok(keyring.includes(`router.post("${route}"`), `missing route ${route}`);
@@ -63,6 +62,6 @@ test("destructive owner crypto routes require an AMK-possession actorProof", () 
   assert.match(keyring, /root-rotation\/begin[\s\S]*actorProof/);
   assert.match(keyring, /root-rotation\/finalize[\s\S]*actorProof/);
   assert.match(keyring, /creators\/:creatorId\/rotate[\s\S]*actorProof/);
-  assert.match(keyring, /enforce-opaque[\s\S]*actorProof/);
+  assert.doesNotMatch(keyring, /enforce-opaque/);
   assert.match(keyring, /devices\/:deviceId\/revoke[\s\S]*actorProof/);
 });

@@ -10,10 +10,7 @@ const {
   updateProxyEndpoint,
   listNetworkSettings,
   getProxyTestMaterial,
-  getProxyCredentialMigrationMaterial,
-  migrateProxyCredentialsToOpaque,
 } = require("./creator-network-profile-service");
-const { serverEncryptedProxyCredentials, proxyCredentialHash, usernameHint } = require("./proxy-credentials");
 
 function clone(value) {
   return value == null ? value : structuredClone(value);
@@ -69,8 +66,8 @@ function makeDb({ hideProxyOwnerDuringPrecheck = false } = {}) {
     ["creator-3", { id: "creator-3", agencyId: "agency-2", displayName: "Other", username: "other", status: "READY", deletedAt: null }],
   ]);
   const proxies = new Map([
-    ["proxy-1", { id: "proxy-1", agencyId: "agency-1", label: "P1", type: "SOCKS5", host: "proxy.test", port: 1080, enabled: true, version: 1, ownerCreatorId: null, encryptionMode: "SERVER_V1", hasCredentials: false, usernameHint: null, createdAt: new Date("2026-08-23T16:00:00.000Z"), updatedAt: new Date("2026-08-23T16:00:00.000Z") }],
-    ["proxy-2", { id: "proxy-2", agencyId: "agency-1", label: "P2", type: "HTTP", host: "proxy2.test", port: 8080, enabled: true, version: 1, ownerCreatorId: null, encryptionMode: "SERVER_V1", hasCredentials: false, usernameHint: null, createdAt: new Date("2026-08-23T16:00:00.000Z"), updatedAt: new Date("2026-08-23T16:00:00.000Z") }],
+    ["proxy-1", { id: "proxy-1", agencyId: "agency-1", label: "P1", type: "SOCKS5", host: "proxy.test", port: 1080, enabled: true, version: 1, ownerCreatorId: null, encryptionMode: "CLIENT_E2E_V1", hasCredentials: false, usernameHint: null, createdAt: new Date("2026-08-23T16:00:00.000Z"), updatedAt: new Date("2026-08-23T16:00:00.000Z") }],
+    ["proxy-2", { id: "proxy-2", agencyId: "agency-1", label: "P2", type: "HTTP", host: "proxy2.test", port: 8080, enabled: true, version: 1, ownerCreatorId: null, encryptionMode: "CLIENT_E2E_V1", hasCredentials: false, usernameHint: null, createdAt: new Date("2026-08-23T16:00:00.000Z"), updatedAt: new Date("2026-08-23T16:00:00.000Z") }],
   ]);
   const profiles = new Map();
   const root = { agencyId: "agency-1", version: 1, status: "ACTIVE", enforceOpaqueSecrets: false };
@@ -296,79 +293,55 @@ test("V20.19 E2E credential replacement uses dedicated crypto owner even while c
   assert.equal(profiles.get("creator-1").mode, "DIRECT");
 });
 
-test("V20.19 legacy proxy credentials migrate to opaque representation without proxy/network revision churn", async () => {
+test("V20.22 legacy proxy credentials fail closed instead of being server-decrypted", async () => {
   const { db, proxies, profiles } = makeDb();
-  const legacy = { username: "alice", password: "secret" };
-  Object.assign(proxies.get("proxy-1"), serverEncryptedProxyCredentials("SOCKS5", legacy), { ownerCreatorId: "creator-1", version: 7 });
+  Object.assign(proxies.get("proxy-1"), {
+    ownerCreatorId: "creator-1", version: 7, encryptionMode: "SERVER_V1", hasCredentials: true, keyVersion: null,
+    encryptedPayload: "legacy-ciphertext", iv: "legacy-iv", tag: "legacy-tag", algorithm: "aes-256-gcm", usernameHint: "alice",
+  });
   profiles.set("creator-1", { id: "profile-1", agencyId: "agency-1", creatorId: "creator-1", mode: "PROXY", proxyEndpointId: "proxy-1", version: 5, updatedAt: new Date(), createdAt: new Date() });
-
-  const before = await getProxyTestMaterial({ db, agencyId: "agency-1", proxyId: "proxy-1", deviceId: "device-1", member: ownerMember });
-  assert.equal(before.encryptionMode, "SERVER_V1");
-  assert.equal(before.username, "alice");
-  assert.equal(before.password, "secret");
-  const migrated = await migrateProxyCredentialsToOpaque({
-    db, agencyId: "agency-1", creatorId: "creator-1", proxyId: "proxy-1", expectedVersion: 7, deviceId: "device-1", member: ownerMember,
-    opaqueCredentials: opaqueCredentials(1), legacyCredentialHash: proxyCredentialHash(legacy), suppliedUsernameHint: usernameHint(legacy.username),
-  });
-  assert.equal(migrated.migrated, true);
-  assert.equal(proxies.get("proxy-1").version, 7, "credential representation migration must not bump proxy route version");
-  assert.equal(profiles.get("creator-1").version, 5, "credential representation migration must not bump creator network version");
-  assert.equal(proxies.get("proxy-1").encryptionMode, "CLIENT_E2E_V1");
-
-  const after = await getProxyTestMaterial({ db, agencyId: "agency-1", proxyId: "proxy-1", deviceId: "device-1", member: ownerMember });
-  assert.equal(after.username, null);
-  assert.equal(after.password, null);
-  assert.equal(after.opaqueCredentials.encryptionMode, "CLIENT_E2E_V1");
-  assert.equal(after.opaqueCredentials.keyVersion, 1);
-});
-
-test("V20.19 DIRECT creator can migrate its owned legacy proxy credentials without runtime or version churn", async () => {
-  const { db, proxies, profiles } = makeDb();
-  const legacy = { username: "direct-owner", password: "secret-direct" };
-  Object.assign(proxies.get("proxy-1"), serverEncryptedProxyCredentials("SOCKS5", legacy), { ownerCreatorId: "creator-1", version: 11 });
-  profiles.set("creator-1", { id: "profile-1", agencyId: "agency-1", creatorId: "creator-1", mode: "DIRECT", proxyEndpointId: null, version: 8, updatedAt: new Date(), createdAt: new Date() });
-
-  const material = await getProxyCredentialMigrationMaterial({ db, agencyId: "agency-1", creatorId: "creator-1", proxyId: "proxy-1", member: ownerMember });
-  assert.equal(material.activelyAssigned, false);
-  assert.equal(material.ownerCreatorId, "creator-1");
-  assert.equal(material.username, "direct-owner");
-  assert.equal(material.password, "secret-direct");
-
-  const migrated = await migrateProxyCredentialsToOpaque({
-    db, agencyId: "agency-1", creatorId: "creator-1", proxyId: "proxy-1", expectedVersion: 11, deviceId: "device-1", member: ownerMember,
-    opaqueCredentials: opaqueCredentials(1), legacyCredentialHash: proxyCredentialHash(legacy), suppliedUsernameHint: usernameHint(legacy.username),
-  });
-  assert.equal(migrated.migrated, true);
-  assert.equal(proxies.get("proxy-1").version, 11, "representation migration must not change dedicated proxy version");
-  assert.equal(profiles.get("creator-1").version, 8, "representation migration must not change DIRECT network profile version");
-  assert.equal(profiles.get("creator-1").mode, "DIRECT", "migration must not activate the proxy");
-  assert.equal(proxies.get("proxy-1").encryptionMode, "CLIENT_E2E_V1");
-});
-
-test("V20.19 unowned inactive legacy proxy cannot be migrated through an arbitrary creator", async () => {
-  const { db, proxies } = makeDb();
-  const legacy = { username: "orphan", password: "secret" };
-  Object.assign(proxies.get("proxy-1"), serverEncryptedProxyCredentials("SOCKS5", legacy), { ownerCreatorId: null, version: 4 });
-  await assert.rejects(
-    getProxyCredentialMigrationMaterial({ db, agencyId: "agency-1", creatorId: "creator-1", proxyId: "proxy-1", member: ownerMember }),
-    (error) => error?.code === "PROXY_CRYPTO_OWNER_REQUIRED" && error?.status === 409,
-  );
-  await assert.rejects(
-    migrateProxyCredentialsToOpaque({
-      db, agencyId: "agency-1", creatorId: "creator-1", proxyId: "proxy-1", expectedVersion: 4, deviceId: "device-1", member: ownerMember,
-      opaqueCredentials: opaqueCredentials(1), legacyCredentialHash: proxyCredentialHash(legacy), suppliedUsernameHint: usernameHint(legacy.username),
-    }),
-    (error) => error?.code === "PROXY_CRYPTO_OWNER_REQUIRED" && error?.status === 409,
-  );
-});
-
-test("V20.19 opaque enforcement blocks server-side decrypt of legacy proxy credentials", async () => {
-  const { db, proxies, root } = makeDb();
-  Object.assign(proxies.get("proxy-1"), serverEncryptedProxyCredentials("SOCKS5", { username: "legacy", password: "secret" }), { ownerCreatorId: "creator-1", version: 1 });
-  root.enforceOpaqueSecrets = true;
   await assert.rejects(
     getProxyTestMaterial({ db, agencyId: "agency-1", proxyId: "proxy-1", deviceId: "device-1", member: ownerMember }),
-    (error) => error?.code === "CRYPTO_LEGACY_PROXY_SECRET_BLOCKED",
+    (error) => error?.code === "PROXY_LEGACY_CREDENTIALS_UNSUPPORTED" && error?.status === 409,
+  );
+});
+
+test("V20.22 credential REPLACE requires a CLIENT_E2E_V1 opaque envelope", async () => {
+  const { db, proxies } = makeDb();
+  Object.assign(proxies.get("proxy-1"), { ownerCreatorId: "creator-1", version: 7 });
+  await assert.rejects(
+    updateProxyEndpoint({
+      db, agencyId: "agency-1", actorUserId: "user-1", actorMember: ownerMember, deviceId: "device-1", proxyId: "proxy-1", expectedVersion: 7,
+      patch: { credentials: { mode: "REPLACE" } },
+    }),
+    (error) => error?.code === "PROXY_E2E_CREDENTIALS_REQUIRED" && error?.status === 400,
+  );
+});
+
+test("V20.22 CLEAR can crypto-shred retained legacy proxy credentials without decrypting them", async () => {
+  const { db, proxies } = makeDb();
+  Object.assign(proxies.get("proxy-1"), {
+    ownerCreatorId: "creator-1", version: 4, encryptionMode: "SERVER_V1", hasCredentials: true, keyVersion: null,
+    encryptedPayload: "legacy-ciphertext", iv: "legacy-iv", tag: "legacy-tag", algorithm: "aes-256-gcm", usernameHint: "orphan",
+  });
+  const result = await updateProxyEndpoint({
+    db, agencyId: "agency-1", actorUserId: "user-1", actorMember: ownerMember, deviceId: "device-1", proxyId: "proxy-1", expectedVersion: 4,
+    patch: { credentials: { mode: "CLEAR" } },
+  });
+  assert.equal(result.proxy.hasCredentials, false);
+  assert.equal(proxies.get("proxy-1").encryptionMode, "CLIENT_E2E_V1");
+  assert.equal(proxies.get("proxy-1").encryptedPayload, null);
+});
+
+test("V20.22 unowned authenticated proxy is rejected because no creator CDK can own it", async () => {
+  const { db, proxies } = makeDb();
+  Object.assign(proxies.get("proxy-1"), {
+    ownerCreatorId: null, version: 4, encryptionMode: "CLIENT_E2E_V1", keyVersion: 1, hasCredentials: true,
+    encryptedPayload: opaqueCredentials(1).ciphertext, iv: opaqueCredentials(1).iv, tag: opaqueCredentials(1).tag, algorithm: opaqueCredentials(1).algorithm,
+  });
+  await assert.rejects(
+    getProxyTestMaterial({ db, agencyId: "agency-1", proxyId: "proxy-1", deviceId: "device-1", member: ownerMember }),
+    (error) => error?.code === "PROXY_E2E_OWNER_MISSING" && error?.status === 409,
   );
 });
 
@@ -424,22 +397,20 @@ test("V20.19 deleted creator cannot have its dedicated proxy edited back into li
   assert.equal(proxies.get("proxy-1").version, 12);
 });
 
-test("V20.19 deleted creator cannot migrate retained dedicated proxy credentials to a fresh opaque secret", async () => {
+test("V20.22 deleted creator cannot replace retained dedicated proxy credentials with a fresh opaque secret", async () => {
   const { db, creators, proxies, profiles } = makeDb();
-  const legacy = { username: "removed", password: "still-secret" };
-  Object.assign(proxies.get("proxy-1"), serverEncryptedProxyCredentials("SOCKS5", legacy), { ownerCreatorId: "creator-1", version: 13 });
+  Object.assign(proxies.get("proxy-1"), { ownerCreatorId: "creator-1", version: 13 });
   profiles.set("creator-1", { id: "profile-1", agencyId: "agency-1", creatorId: "creator-1", mode: "DIRECT", proxyEndpointId: null, version: 3, updatedAt: new Date(), createdAt: new Date() });
   creators.get("creator-1").deletedAt = new Date("2026-08-24T13:32:00.000Z");
   creators.get("creator-1").status = "DISABLED";
-
   await assert.rejects(
-    migrateProxyCredentialsToOpaque({
-      db, agencyId: "agency-1", creatorId: "creator-1", proxyId: "proxy-1", expectedVersion: 13,
-      deviceId: "device-1", member: ownerMember, opaqueCredentials: opaqueCredentials(1),
-      legacyCredentialHash: proxyCredentialHash(legacy), suppliedUsernameHint: usernameHint(legacy.username),
+    updateProxyEndpoint({
+      db, agencyId: "agency-1", actorUserId: "user-1", actorMember: ownerMember, deviceId: "device-1",
+      proxyId: "proxy-1", expectedVersion: 13, patch: { credentials: { mode: "REPLACE", opaqueCredentials: opaqueCredentials(1), usernameHint: "removed" } },
     }),
     (error) => error?.code === "PROXY_CREATOR_REMOVED" && error?.status === 409,
   );
-  assert.equal(proxies.get("proxy-1").encryptionMode, "SERVER_V1");
   assert.equal(proxies.get("proxy-1").version, 13);
+  assert.equal(proxies.get("proxy-1").hasCredentials, false);
 });
+

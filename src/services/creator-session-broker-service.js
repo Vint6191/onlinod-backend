@@ -1,7 +1,5 @@
 "use strict";
 
-const crypto = require("node:crypto");
-const { encryptSnapshot, decryptSnapshot } = require("./snapshot-crypto");
 const { assertDeviceCanUseCreatorKey } = require("./client-e2e-keyring-service");
 const { canAccessCreator } = require("../middleware/automation-permissions");
 
@@ -50,89 +48,10 @@ function nullableText(value, max = 4096) {
   return result || null;
 }
 
-function normalizeSameSite(value) {
-  const result = nullableText(value, 32);
-  if (!result) return null;
-  return ["no_restriction", "lax", "strict", "unspecified"].includes(result) ? result : null;
-}
-
-const SESSION_COOKIE_NOISE_EXACT = new Set([
-  "lang",
-  "cookiesaccepted",
-  "ref_src",
-  "__cf_bm",
-  "_cfuvid",
-  "streams",
-  "_fbp",
-  "_gid",
-  "_gcl_au",
-]);
-
-function isPortableSessionCookieName(name) {
-  const lower = String(name || "").trim().toLowerCase();
-  if (!lower || SESSION_COOKIE_NOISE_EXACT.has(lower)) return false;
-  if (lower.startsWith("cloudfront-")) return false;
-  if (lower.startsWith("__cf") || lower.startsWith("cf_")) return false;
-  if (lower === "_ga" || lower.startsWith("_ga_") || lower.startsWith("_gat_")) return false;
-  return true;
-}
-
-function isOnlyFansCookieDomain(domainInput) {
-  const host = String(domainInput || "").trim().replace(/^\.+/, "").toLowerCase();
-  return host === "onlyfans.com" || host.endsWith(".onlyfans.com");
-}
-
-function normalizeCookie(cookie) {
-  const source = cookie && typeof cookie === "object" && !Array.isArray(cookie) ? cookie : {};
-  const name = nullableText(source.name, 256);
-  const domain = nullableText(source.domain, 512);
-  if (!name || !domain || !isOnlyFansCookieDomain(domain) || !isPortableSessionCookieName(name)) return null;
-
-  const expiration = Number(source.expirationDate);
-  const rawExpirationDate = Number.isFinite(expiration) && expiration > 0 ? expiration : null;
-  const session = source.session === true || rawExpirationDate === null;
-  const expirationDate = session ? null : rawExpirationDate;
-
-  const hostOnly = source.hostOnly === true ? true : source.hostOnly === false ? false : !domain.startsWith(".");
-  const rawPath = nullableText(source.path, 2048) || "/";
-  const path = rawPath.startsWith("/") ? rawPath : `/${rawPath}`;
-
-  return {
-    name,
-    value: text(source.value, 32_768),
-    domain,
-    hostOnly,
-    path,
-    secure: source.secure !== false,
-    httpOnly: source.httpOnly === true,
-    sameSite: normalizeSameSite(source.sameSite),
-    session,
-    expirationDate,
-  };
-}
-
-function cookieIdentity(cookie) {
-  return `${String(cookie.domain || "").trim().replace(/^\.+/, "").toLowerCase()}\u0000${String(cookie.path || "/").trim() || "/"}\u0000${String(cookie.name || "").trim()}`;
-}
-
-function assertNoDuplicateCookies(cookies) {
-  const seen = new Set();
-  for (const cookie of cookies) {
-    const key = cookieIdentity(cookie);
-    if (seen.has(key)) {
-      const error = new Error("Duplicate OnlyFans cookie identity is not allowed");
-      error.code = "CREATOR_SESSION_DUPLICATE_COOKIE";
-      error.status = 400;
-      throw error;
-    }
-    seen.add(key);
-  }
-}
-
 function isCreatorSessionTargetActiveStatus(value) {
   const status = String(value || "").trim().toUpperCase();
-  // DRAFT is intentionally allowed: the future broker-first creator-connect flow
-  // must be able to establish canonical R1 before complete-runtime marks READY.
+  // DRAFT is intentionally allowed so broker-first creator connect can publish
+  // canonical R1 before complete-connection marks the creator READY.
   return status === "DRAFT" || status === "READY";
 }
 
@@ -195,56 +114,6 @@ async function requireLiveCreatorSessionReader({ db, agencyId, creatorId, userId
   return { member: liveMember, creator };
 }
 
-function normalizePayload(payload) {
-  const source = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
-  const cookies = Array.isArray(source.cookies)
-    ? source.cookies.map(normalizeCookie).filter(Boolean).slice(0, 256)
-    : [];
-  cookies.sort((left, right) => {
-    const l = `${left.domain}\u0000${left.path}\u0000${left.name}`;
-    const r = `${right.domain}\u0000${right.path}\u0000${right.name}`;
-    return l.localeCompare(r);
-  });
-
-  const storageSource = source.storage && typeof source.storage === "object" && !Array.isArray(source.storage)
-    ? source.storage
-    : {};
-
-  return {
-    cookies,
-    storage: {
-      bcTokenSha: nullableText(storageSource.bcTokenSha, 16_384),
-    },
-    userAgent: nullableText(source.userAgent, 2048),
-  };
-}
-
-function stableJson(value) {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-function hash(value) {
-  return crypto.createHash("sha256").update(stableJson(value)).digest("hex");
-}
-
-function hashesForPayload(payload) {
-  const normalized = normalizePayload(payload);
-  const credentialShape = {
-    cookies: normalized.cookies.map((cookie) => ({ name: cookie.name, value: cookie.value, domain: cookie.domain, hostOnly: cookie.hostOnly, path: cookie.path })),
-    storage: normalized.storage,
-    userAgent: normalized.userAgent,
-  };
-  return {
-    payload: normalized,
-    credentialHash: hash(credentialShape),
-    coherenceHash: hash(normalized),
-  };
-}
-
 function normalizeOpaquePayload(input) {
   const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
   if (String(source.encryptionMode || "") !== "CLIENT_E2E_V1") {
@@ -276,41 +145,39 @@ function normalizeHash(value, code) {
   return hash;
 }
 
-function publicState(record, { includePayload = false, allowLegacyDecrypt = true } = {}) {
+function publicState(record, { includePayload = false } = {}) {
   if (!record) {
     return {
-      revision: 0, status: "MISSING", payloadVersion: 1, encryptionMode: null, keyVersion: null, platformUserId: null,
+      revision: 0, status: "MISSING", payloadVersion: 1, portableReady: false, encryptionMode: null, keyVersion: null, platformUserId: null,
       credentialHash: null, coherenceHash: null, capturedAt: null, capturedByDeviceId: null, sourceRequestId: null,
       revokedAt: null, updatedAt: null, ...(includePayload ? { payload: null, opaquePayload: null } : {}),
     };
   }
 
-  let payload = null;
   let opaquePayload = null;
-  const encryptionMode = String(record.encryptionMode || "SERVER_V1");
+  const encryptionMode = String(record.encryptionMode || "CLIENT_E2E_V1");
   if (includePayload && record.status === "ACTIVE") {
-    if (!record.encryptedPayload || !record.iv || !record.tag) {
-      const error = new Error("Active creator session is missing encrypted payload fields"); error.code = "CREATOR_SESSION_CORRUPT"; error.status = 500; throw error;
+    if (encryptionMode !== "CLIENT_E2E_V1") {
+      const error = new Error("Legacy creator session envelopes are not supported after the V20.22 cutover");
+      error.code = "CREATOR_SESSION_LEGACY_ENVELOPE_UNSUPPORTED"; error.status = 409; throw error;
     }
-    if (encryptionMode === "CLIENT_E2E_V1") {
-      opaquePayload = {
-        encryptionMode: "CLIENT_E2E_V1",
-        keyVersion: Number(record.keyVersion || 0),
-        payloadVersion: Number(record.payloadVersion || 1),
-        ciphertext: record.encryptedPayload, iv: record.iv, tag: record.tag, algorithm: record.algorithm,
-      };
-    } else {
-      if (!allowLegacyDecrypt) { const error = new Error("Legacy server-decrypted creator session payload is disabled for this agency"); error.code = "CREATOR_SESSION_LEGACY_DECRYPT_DISABLED"; error.status = 409; throw error; }
-      payload = decryptSnapshot(record);
+    if (!record.encryptedPayload || !record.iv || !record.tag || !record.algorithm || !record.keyVersion) {
+      const error = new Error("Active creator session is missing client-side encrypted payload fields"); error.code = "CREATOR_SESSION_CORRUPT"; error.status = 500; throw error;
     }
+    opaquePayload = {
+      encryptionMode: "CLIENT_E2E_V1",
+      keyVersion: Number(record.keyVersion),
+      payloadVersion: Number(record.payloadVersion || 1),
+      ciphertext: record.encryptedPayload, iv: record.iv, tag: record.tag, algorithm: record.algorithm,
+    };
   }
 
   return {
     revision: Number(record.revision || 0), status: String(record.status || "MISSING"), payloadVersion: Number(record.payloadVersion || 1),
-    encryptionMode, keyVersion: record.keyVersion == null ? null : Number(record.keyVersion), platformUserId: record.platformUserId || null,
+    portableReady: record.portableReady === true, encryptionMode, keyVersion: record.keyVersion == null ? null : Number(record.keyVersion), platformUserId: record.platformUserId || null,
     credentialHash: record.credentialHash || null, coherenceHash: record.coherenceHash || null, capturedAt: record.capturedAt || null,
     capturedByDeviceId: record.capturedByDeviceId || null, sourceRequestId: record.sourceRequestId || null, revokedAt: record.revokedAt || null, updatedAt: record.updatedAt || null,
-    ...(includePayload ? { payload, opaquePayload } : {}),
+    ...(includePayload ? { payload: null, opaquePayload } : {}),
   };
 }
 
@@ -342,65 +209,25 @@ async function getCreatorSession({ db, agencyId, creatorId, includePayload = tru
     return publicState(record, { includePayload: false });
   }
 
-  // Secret-bearing reads must observe membership/access, creator lifecycle,
-  // opaque-enforcement state and the session row in one Serializable snapshot.
-  // Otherwise a route-authorized request can race demotion/access removal,
-  // creator deletion, session revocation or crypto-shred and decrypt stale bytes.
+  // Secret-bearing reads observe membership/access, creator lifecycle and the
+  // exact canonical row in one Serializable snapshot. The backend never
+  // decrypts creator credentials after the V20.22 CLIENT_E2E-only cutover.
   return runSessionReadSerializable(db, async (tx) => {
     const record = await tx.creatorSessionState.findUnique({ where: { creatorId } });
     if (record && record.agencyId !== agencyId) { const error = new Error("Creator session state belongs to a different agency"); error.code = "CREATOR_SESSION_AGENCY_MISMATCH"; error.status = 403; throw error; }
     if (!record || record.status !== "ACTIVE") return publicState(record, { includePayload: true });
-
-    const live = await requireLiveCreatorSessionReader({ db: tx, agencyId, creatorId, userId, member });
-    const mode = String(record.encryptionMode || "SERVER_V1");
-    if (mode === "CLIENT_E2E_V1") {
-      if (!deviceId) { const error = new Error("An enrolled device context is required to read opaque creator session material"); error.code = "CREATOR_SESSION_E2E_DEVICE_CONTEXT_REQUIRED"; error.status = 403; throw error; }
-      await assertDeviceCanUseCreatorKey({ db: tx, agencyId, creatorId, keyVersion: Number(record.keyVersion), deviceId, member: live.member });
-      return publicState(record, { includePayload: true, allowLegacyDecrypt: false });
+    if (String(record.encryptionMode || "") !== "CLIENT_E2E_V1") {
+      const error = new Error("Legacy creator session envelopes are not supported after the V20.22 cutover");
+      error.code = "CREATOR_SESSION_LEGACY_ENVELOPE_UNSUPPORTED"; error.status = 409; throw error;
     }
-
-    const root = await tx.agencyCryptoRoot.findUnique({ where: { agencyId } });
-    const allowLegacyDecrypt = root?.enforceOpaqueSecrets !== true;
-    return publicState(record, { includePayload: true, allowLegacyDecrypt });
+    const live = await requireLiveCreatorSessionReader({ db: tx, agencyId, creatorId, userId, member });
+    if (!deviceId) { const error = new Error("An enrolled device context is required to read creator session material"); error.code = "CREATOR_SESSION_E2E_DEVICE_CONTEXT_REQUIRED"; error.status = 403; throw error; }
+    await assertDeviceCanUseCreatorKey({ db: tx, agencyId, creatorId, keyVersion: Number(record.keyVersion), deviceId, member: live.member });
+    return publicState(record, { includePayload: true });
   });
 }
 
-async function migrateCreatorSessionToOpaque({ db, agencyId, creatorId, deviceId, member, expectedRevision, platformUserId, credentialHash, coherenceHash, opaquePayload }) {
-  const revision = Math.floor(Number(expectedRevision));
-  if (!Number.isInteger(revision) || revision < 1) { const error = new Error("expectedRevision must be positive"); error.code = "CREATOR_SESSION_MIGRATION_REVISION_INVALID"; error.status = 400; throw error; }
-  const identity = nullableText(platformUserId, 160);
-  if (!identity) { const error = new Error("platformUserId is required"); error.code = "CREATOR_SESSION_PLATFORM_USER_REQUIRED"; error.status = 400; throw error; }
-  const normalizedCredentialHash = normalizeHash(credentialHash, "CREATOR_SESSION_CREDENTIAL_HASH_INVALID");
-  const normalizedCoherenceHash = normalizeHash(coherenceHash, "CREATOR_SESSION_COHERENCE_HASH_INVALID");
-  const stored = normalizeOpaquePayload(opaquePayload);
-  return db.$transaction(async (tx) => {
-    await requireLiveCreatorSessionWriteTarget({ db: tx, agencyId, creatorId, platformUserId: identity });
-    const current = await tx.creatorSessionState.findUnique({ where: { creatorId } });
-    if (!current || current.agencyId !== agencyId) throw sessionConflict(current);
-    if (current.status !== "ACTIVE") { const error = new Error("Only an active creator session can migrate to opaque encryption"); error.code = "CREATOR_SESSION_MIGRATION_NOT_ACTIVE"; error.status = 409; throw error; }
-    if (Number(current.revision) !== revision || current.platformUserId !== identity || current.credentialHash !== normalizedCredentialHash || current.coherenceHash !== normalizedCoherenceHash) {
-      throw sessionConflict(current);
-    }
-    if (String(current.encryptionMode || "SERVER_V1") === "CLIENT_E2E_V1") {
-      if (Number(current.keyVersion) === stored.keyVersion) return { state: publicState(current, { includePayload: false }), migrated: false, alreadyOpaque: true };
-      const error = new Error("Creator session encryption generation changed before migration"); error.code = "CREATOR_SESSION_MIGRATION_KEY_CONFLICT"; error.status = 409; throw error;
-    }
-    await assertDeviceCanUseCreatorKey({ db: tx, agencyId, creatorId, keyVersion: stored.keyVersion, deviceId, member });
-    const updated = await tx.creatorSessionState.updateMany({
-      where: { creatorId, agencyId, revision, status: "ACTIVE", encryptionMode: "SERVER_V1", platformUserId: identity, credentialHash: normalizedCredentialHash, coherenceHash: normalizedCoherenceHash },
-      data: { payloadVersion: stored.payloadVersion, encryptionMode: stored.encryptionMode, keyVersion: stored.keyVersion, encryptedPayload: stored.ciphertext, iv: stored.iv, tag: stored.tag, algorithm: stored.algorithm },
-    });
-    if (updated.count !== 1) {
-      const raced = await tx.creatorSessionState.findUnique({ where: { creatorId } });
-      if (raced && String(raced.encryptionMode || "SERVER_V1") === "CLIENT_E2E_V1" && Number(raced.revision) === revision && Number(raced.keyVersion) === stored.keyVersion && raced.coherenceHash === normalizedCoherenceHash) {
-        return { state: publicState(raced, { includePayload: false }), migrated: false, alreadyOpaque: true };
-      }
-      throw sessionConflict(raced);
-    }
-    const next = await tx.creatorSessionState.findUnique({ where: { creatorId } });
-    return { state: publicState(next, { includePayload: false }), migrated: true, alreadyOpaque: false };
-  }, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 });
-}
+const CREATOR_SESSION_CAPTURE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 function sessionConflict(current) {
   const error = new Error("Creator session revision is stale");
@@ -408,6 +235,39 @@ function sessionConflict(current) {
   error.status = 409;
   error.current = publicState(current, { includePayload: false });
   return error;
+}
+
+function captureTimeConflict(code, message, current = null) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = 409;
+  if (current) error.current = publicState(current, { includePayload: false });
+  return error;
+}
+
+function assertCapturedAtNotFromFuture(captured, now = new Date()) {
+  if (captured.getTime() > now.getTime() + CREATOR_SESSION_CAPTURE_CLOCK_SKEW_MS) {
+    throw captureTimeConflict(
+      "CREATOR_SESSION_CAPTURED_AT_FUTURE",
+      "Creator session evidence is too far in the future",
+    );
+  }
+}
+
+function canonicalCapturedAtForWrite(current, captured) {
+  if (!current?.capturedAt) return captured;
+  const currentCaptured = new Date(current.capturedAt);
+  if (Number.isNaN(currentCaptured.getTime())) return captured;
+  if (captured.getTime() < currentCaptured.getTime() - CREATOR_SESSION_CAPTURE_CLOCK_SKEW_MS) {
+    throw captureTimeConflict(
+      "CREATOR_SESSION_CAPTURED_AT_STALE",
+      "Creator session evidence is older than the current canonical evidence",
+      current,
+    );
+  }
+  // Tolerate bounded clock skew between devices without ever moving the
+  // canonical freshness watermark backwards.
+  return captured.getTime() >= currentCaptured.getTime() ? captured : currentCaptured;
 }
 
 function sameWriteRequest(current, { requestId, deviceId, coherenceHash, platformUserId }) {
@@ -430,7 +290,7 @@ function sameRevokeRequest(current, { requestId, deviceId }) {
 
 async function writeCreatorSession({
   db, agencyId, creatorId, actorUserId, actorMember, deviceId, baseRevision, requestId, capturedAt, platformUserId,
-  payload = null, opaquePayload = null, credentialHash: suppliedCredentialHash = null, coherenceHash: suppliedCoherenceHash = null,
+  opaquePayload, credentialHash: suppliedCredentialHash, coherenceHash: suppliedCoherenceHash, portableReady: suppliedPortableReady = false,
 }) {
   const revision = Math.max(0, Math.floor(Number(baseRevision) || 0));
   const normalizedRequestId = nullableText(requestId, 180);
@@ -439,50 +299,29 @@ async function writeCreatorSession({
   if (!identity) { const error = new Error("platformUserId is required"); error.code = "CREATOR_SESSION_PLATFORM_USER_REQUIRED"; error.status = 400; throw error; }
   await requireLiveCreatorSessionWriteTarget({ db, agencyId, creatorId, platformUserId: identity });
 
-  const useOpaque = Boolean(opaquePayload);
-  let stored;
-  let credentialHash;
-  let coherenceHash;
-  if (useOpaque) {
-    stored = normalizeOpaquePayload(opaquePayload);
-    credentialHash = normalizeHash(suppliedCredentialHash, "CREATOR_SESSION_CREDENTIAL_HASH_INVALID");
-    coherenceHash = normalizeHash(suppliedCoherenceHash, "CREATOR_SESSION_COHERENCE_HASH_INVALID");
-    await assertDeviceCanUseCreatorKey({ db, agencyId, creatorId, keyVersion: stored.keyVersion, deviceId, member: actorMember });
-  } else {
-    const root = await db.agencyCryptoRoot.findUnique({ where: { agencyId } });
-    if (root?.enforceOpaqueSecrets === true) { const error = new Error("Legacy plaintext creator session writes are disabled for this agency"); error.code = "CREATOR_SESSION_LEGACY_WRITE_DISABLED"; error.status = 409; throw error; }
-    const hashed = hashesForPayload(payload);
-    const normalizedPayload = hashed.payload; credentialHash = hashed.credentialHash; coherenceHash = hashed.coherenceHash;
-    if (!normalizedPayload.cookies.length) { const error = new Error("At least one OnlyFans cookie is required"); error.code = "CREATOR_SESSION_COOKIES_REQUIRED"; error.status = 400; throw error; }
-    assertNoDuplicateCookies(normalizedPayload.cookies);
-    const strongCookieNames = new Set(normalizedPayload.cookies.map((cookie) => String(cookie.name || "").toLowerCase()));
-    if (!strongCookieNames.has("sess") && !strongCookieNames.has("auth_id")) { const error = new Error("A strong OnlyFans auth cookie is required"); error.code = "CREATOR_SESSION_STRONG_AUTH_COOKIE_REQUIRED"; error.status = 400; throw error; }
-    const encrypted = encryptSnapshot(normalizedPayload);
-    stored = { encryptionMode: "SERVER_V1", keyVersion: null, payloadVersion: encrypted.payloadVersion, ciphertext: encrypted.encryptedPayload, iv: encrypted.iv, tag: encrypted.tag, algorithm: encrypted.algorithm };
+  if (!opaquePayload) {
+    const error = new Error("Creator session writes require CLIENT_E2E_V1 opaquePayload");
+    error.code = "CREATOR_SESSION_E2E_REQUIRED"; error.status = 400; throw error;
   }
+  const stored = normalizeOpaquePayload(opaquePayload);
+  const credentialHash = normalizeHash(suppliedCredentialHash, "CREATOR_SESSION_CREDENTIAL_HASH_INVALID");
+  const coherenceHash = normalizeHash(suppliedCoherenceHash, "CREATOR_SESSION_COHERENCE_HASH_INVALID");
+  const portableReady = suppliedPortableReady === true;
+  await assertDeviceCanUseCreatorKey({ db, agencyId, creatorId, keyVersion: stored.keyVersion, deviceId, member: actorMember });
   const captured = capturedAt ? new Date(capturedAt) : new Date();
   if (Number.isNaN(captured.getTime())) { const error = new Error("capturedAt is invalid"); error.code = "CREATOR_SESSION_CAPTURED_AT_INVALID"; error.status = 400; throw error; }
+  assertCapturedAtNotFromFuture(captured);
 
   return runSessionSerializable(db, async (tx) => {
     await requireLiveCreatorSessionWriteTarget({ db: tx, agencyId, creatorId, platformUserId: identity });
-    if (useOpaque) {
-      await assertDeviceCanUseCreatorKey({ db: tx, agencyId, creatorId, keyVersion: stored.keyVersion, deviceId, member: actorMember });
-    } else {
-      const root = await tx.agencyCryptoRoot.findUnique({ where: { agencyId } });
-      if (root?.enforceOpaqueSecrets === true) {
-        const error = new Error("Legacy plaintext creator session writes are disabled for this agency");
-        error.code = "CREATOR_SESSION_LEGACY_WRITE_DISABLED";
-        error.status = 409;
-        throw error;
-      }
-    }
+    await assertDeviceCanUseCreatorKey({ db: tx, agencyId, creatorId, keyVersion: stored.keyVersion, deviceId, member: actorMember });
     const current = await tx.creatorSessionState.findUnique({ where: { creatorId } });
     if (sameWriteRequest(current, { requestId: normalizedRequestId, deviceId, coherenceHash, platformUserId: identity })) return { state: publicState(current, { includePayload: false }), idempotent: true, unchanged: true };
     if (!current) {
       if (revision !== 0) throw sessionConflict(null);
       try {
         const created = await tx.creatorSessionState.create({ data: {
-          agencyId, creatorId, revision: 1, status: "ACTIVE", payloadVersion: stored.payloadVersion, encryptionMode: stored.encryptionMode, keyVersion: stored.keyVersion,
+          agencyId, creatorId, revision: 1, status: "ACTIVE", payloadVersion: stored.payloadVersion, portableReady, encryptionMode: "CLIENT_E2E_V1", keyVersion: stored.keyVersion,
           encryptedPayload: stored.ciphertext, iv: stored.iv, tag: stored.tag, algorithm: stored.algorithm, platformUserId: identity, credentialHash, coherenceHash, capturedAt: captured,
           capturedByUserId: actorUserId, capturedByDeviceId: deviceId, sourceRequestId: normalizedRequestId, revokedAt: null, revokeReason: null,
         } });
@@ -496,11 +335,16 @@ async function writeCreatorSession({
     }
     if (current.agencyId !== agencyId || Number(current.revision) !== revision) throw sessionConflict(current);
     if (current.status === "REVOKED") { const error = new Error("Revoked creator session requires an explicit re-initialize flow"); error.code = "CREATOR_SESSION_REVOKED"; error.status = 409; error.current = publicState(current, { includePayload: false }); throw error; }
-    const sameRepresentation = String(current.encryptionMode || "SERVER_V1") === stored.encryptionMode && (stored.encryptionMode !== "CLIENT_E2E_V1" || Number(current.keyVersion) === Number(stored.keyVersion));
-    if (current.status === "ACTIVE" && current.coherenceHash === coherenceHash && current.platformUserId === identity && sameRepresentation) return { state: publicState(current, { includePayload: false }), idempotent: false, unchanged: true };
-    const updated = await tx.creatorSessionState.updateMany({ where: { creatorId, agencyId, revision }, data: {
-      revision: { increment: 1 }, status: "ACTIVE", payloadVersion: stored.payloadVersion, encryptionMode: stored.encryptionMode, keyVersion: stored.keyVersion,
-      encryptedPayload: stored.ciphertext, iv: stored.iv, tag: stored.tag, algorithm: stored.algorithm, platformUserId: identity, credentialHash, coherenceHash, capturedAt: captured,
+    if (String(current.encryptionMode || "") !== "CLIENT_E2E_V1") {
+      const error = new Error("Legacy creator session envelopes cannot be updated after the V20.22 cutover");
+      error.code = "CREATOR_SESSION_LEGACY_ENVELOPE_UNSUPPORTED"; error.status = 409; throw error;
+    }
+    const canonicalCapturedAt = canonicalCapturedAtForWrite(current, captured);
+    const sameRepresentation = Number(current.keyVersion) === Number(stored.keyVersion);
+    if (current.status === "ACTIVE" && current.coherenceHash === coherenceHash && current.platformUserId === identity && current.portableReady === portableReady && sameRepresentation) return { state: publicState(current, { includePayload: false }), idempotent: false, unchanged: true };
+    const updated = await tx.creatorSessionState.updateMany({ where: { creatorId, agencyId, revision, encryptionMode: "CLIENT_E2E_V1" }, data: {
+      revision: { increment: 1 }, status: "ACTIVE", payloadVersion: stored.payloadVersion, portableReady, encryptionMode: "CLIENT_E2E_V1", keyVersion: stored.keyVersion,
+      encryptedPayload: stored.ciphertext, iv: stored.iv, tag: stored.tag, algorithm: stored.algorithm, platformUserId: identity, credentialHash, coherenceHash, capturedAt: canonicalCapturedAt,
       capturedByUserId: actorUserId, capturedByDeviceId: deviceId, sourceRequestId: normalizedRequestId, revokedAt: null, revokeReason: null,
     } });
     if (updated.count !== 1) {
@@ -551,6 +395,7 @@ async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, devi
         keyVersion: null,
         credentialHash: null,
         coherenceHash: null,
+        portableReady: false,
         capturedAt: now,
         capturedByUserId: actorUserId,
         capturedByDeviceId: deviceId,
@@ -572,16 +417,12 @@ async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, devi
 }
 
 module.exports = {
-  normalizePayload,
-  assertNoDuplicateCookies,
   isCreatorSessionTargetActiveStatus,
   assertCreatorSessionTargetActive,
-  hashesForPayload,
   normalizeOpaquePayload,
   publicState,
   requireRegisteredDevice,
   getCreatorSession,
-  migrateCreatorSessionToOpaque,
   writeCreatorSession,
   revokeCreatorSession,
 };

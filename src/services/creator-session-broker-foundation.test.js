@@ -8,14 +8,13 @@ const test = require("node:test");
 const root = path.resolve(__dirname, "..", "..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 
-test("V20.11 schema expands creator sessions without switching existing runtime mode", () => {
+test("V20.22 current schema keeps canonical CreatorSessionState and removes the old runtime-mode switch", () => {
   const schema = read("prisma/schema.prisma");
-  assert.match(schema, /enum CreatorSessionMode\s*\{\s*LOCAL_PERSISTENT\s*MANAGED_BROKER\s*\}/s);
-  assert.match(schema, /sessionMode\s+CreatorSessionMode\s+@default\(LOCAL_PERSISTENT\)/);
   assert.match(schema, /model CreatorSessionState\s*\{/);
   assert.match(schema, /creatorId\s+String\s+@unique/);
   assert.match(schema, /revision\s+Int\s+@default\(1\)/);
   assert.match(schema, /encryptedPayload\s+String\?/);
+  assert.doesNotMatch(schema, /enum CreatorSessionMode|sessionMode\s+CreatorSessionMode|LOCAL_PERSISTENT/);
 });
 
 test("V20.11 migration is additive and never rewrites existing creator partitions", () => {
@@ -26,7 +25,7 @@ test("V20.11 migration is additive and never rewrites existing creator partition
   assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN|TYPE)/i);
 });
 
-test("V20.11 server exposes broker separately from legacy AccessSnapshot routes", () => {
+test("V20.22 server exposes canonical broker with legacy AccessSnapshot routes physically removed", () => {
   const server = read("src/server.js");
   const route = read("src/routes/creator-sessions.js");
   assert.match(server, /app\.use\("\/api\/creator-sessions", creatorSessionRoutes\)/);
@@ -37,6 +36,7 @@ test("V20.11 server exposes broker separately from legacy AccessSnapshot routes"
   assert.match(route, /baseRevision/);
   assert.match(route, /requestId/);
   assert.doesNotMatch(route, /accessSnapshot/);
+  assert.doesNotMatch(server, /access-snapshots|creator-connect|creator-import/);
 });
 
 test("creator removal revokes and zeroes the new canonical credential envelope through the centralized retirement lifecycle", () => {

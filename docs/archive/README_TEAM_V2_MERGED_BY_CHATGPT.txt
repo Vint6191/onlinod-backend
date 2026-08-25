@@ -57,3 +57,6 @@ Likely bridge work:
 - `desktopAPI.backend.getAccessToken(...)`
 
 The Team API wrapper expects a generic authenticated request bridge. If it is not in Electron yet, we need to add it.
+
+---
+Historical archive note (V20.22): referenced Electron patch bundles were removed after integration. This document is retained only as development history; do not use it as current deployment instructions.

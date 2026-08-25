@@ -37,11 +37,6 @@ function apply(row, data) {
 
 function makeDb() {
   const state = {
-    snapshots: [
-      { id: "snap-live", agencyId: "agency-1", creatorId: "creator-1", active: true, encryptedPayload: "legacy-cipher", iv: "iv", tag: "tag", algorithm: "aes-256-gcm", revokedAt: null, payloadRetiredAt: null },
-      { id: "snap-old", agencyId: "agency-1", creatorId: "creator-1", active: false, encryptedPayload: "old-cipher", iv: "iv2", tag: "tag2", algorithm: "aes-256-gcm", revokedAt: new Date("2026-08-20T00:00:00Z"), payloadRetiredAt: null },
-      { id: "other", agencyId: "agency-1", creatorId: "creator-2", active: true, encryptedPayload: "keep-me", iv: "x", tag: "y", algorithm: "aes-256-gcm", revokedAt: null, payloadRetiredAt: null },
-    ],
     wraps: [
       { id: "wrap-live", agencyId: "agency-1", creatorId: "creator-1", deviceId: "device-1", keyVersion: 3, revokedAt: null },
       { id: "wrap-old", agencyId: "agency-1", creatorId: "creator-1", deviceId: "device-2", keyVersion: 2, revokedAt: new Date("2026-08-20T00:00:00Z") },
@@ -73,7 +68,6 @@ function makeDb() {
   return {
     state,
     db: {
-      accessSnapshot: { updateMany: async (args) => updateMany(state.snapshots, args) },
       creatorDeviceKeyWrap: { updateMany: async (args) => updateMany(state.wraps, args) },
       agencyProxyEndpoint: { updateMany: async (args) => updateMany(state.proxies, args) },
       creatorNetworkProfile: { updateMany: async (args) => updateMany(state.profiles, args) },
@@ -82,34 +76,18 @@ function makeDb() {
   };
 }
 
-test("soft creator removal crypto-shreds legacy snapshot/proxy secrets and revokes current CDK wraps without deleting history", async () => {
+test("soft creator removal crypto-shreds canonical/proxy secrets and revokes current CDK wraps without deleting history", async () => {
   const { db, state } = makeDb();
   const retiredAt = new Date("2026-08-24T13:45:00Z");
   const result = await retireCreatorCryptoMaterialOnRemoval({ db, agencyId: "agency-1", creatorId: "creator-1", retiredAt });
 
   assert.deepEqual(result, {
-    revokedAccessSnapshotCount: 1,
-    retiredAccessSnapshotSecretCount: 2,
     revokedCreatorKeyWrapCount: 1,
     retiredDedicatedProxyCount: 1,
     retiredNetworkProfileCount: 1,
     revokedCanonicalSessionCount: 1,
     retiredCanonicalSessionSecretCount: 2,
   });
-
-  const liveSnapshot = state.snapshots.find((row) => row.id === "snap-live");
-  const oldSnapshot = state.snapshots.find((row) => row.id === "snap-old");
-  for (const snapshot of [liveSnapshot, oldSnapshot]) {
-    assert.equal(snapshot.encryptedPayload, null);
-    assert.equal(snapshot.iv, null);
-    assert.equal(snapshot.tag, null);
-    assert.equal(snapshot.algorithm, null);
-    assert.equal(snapshot.active, false);
-    assert.equal(snapshot.payloadRetiredAt, retiredAt);
-  }
-  assert.equal(liveSnapshot.revokedAt, retiredAt);
-  assert.equal(oldSnapshot.revokedAt.toISOString(), "2026-08-20T00:00:00.000Z", "existing revocation provenance must not be overwritten by later crypto-shred");
-  assert.equal(state.snapshots.find((row) => row.creatorId === "creator-2").encryptedPayload, "keep-me");
 
   assert.equal(state.wraps.find((row) => row.id === "wrap-live").revokedAt, retiredAt);
   assert.ok(state.wraps.find((row) => row.id === "wrap-old").revokedAt instanceof Date, "historical wrap row is preserved");
@@ -162,7 +140,7 @@ test("creator crypto retirement is idempotent and does not keep incrementing an 
   const retiredAt = new Date("2026-08-24T13:45:00Z");
   await retireCreatorCryptoMaterialOnRemoval({ db, agencyId: "agency-1", creatorId: "creator-1", retiredAt });
   const second = await retireCreatorCryptoMaterialOnRemoval({ db, agencyId: "agency-1", creatorId: "creator-1", retiredAt: new Date("2026-08-24T13:46:00Z") });
-  assert.deepEqual(second, { revokedAccessSnapshotCount: 0, retiredAccessSnapshotSecretCount: 0, revokedCreatorKeyWrapCount: 0, retiredDedicatedProxyCount: 0, retiredNetworkProfileCount: 0, revokedCanonicalSessionCount: 0, retiredCanonicalSessionSecretCount: 0 });
+  assert.deepEqual(second, { revokedCanonicalSessionCount: 0, retiredCanonicalSessionSecretCount: 0, revokedCreatorKeyWrapCount: 0, retiredDedicatedProxyCount: 0, retiredNetworkProfileCount: 0 });
   assert.equal(state.proxies.find((row) => row.id === "proxy-dedicated").version, 8);
 });
 
@@ -171,5 +149,5 @@ test("both agency and platform-admin soft-delete paths call crypto retirement in
   const admin = fs.readFileSync(path.join(__dirname, "..", "routes", "admin.js"), "utf8");
   assert.match(creators, /retireCreatorCryptoMaterialOnRemoval\(\{[\s\S]*?db: tx,[\s\S]*?creatorId: existing\.id,[\s\S]*?retiredAt: removedAt/);
   assert.match(admin, /retireCreatorCryptoMaterialOnRemoval\(\{[\s\S]*?db: tx,[\s\S]*?creatorId: before\.id,[\s\S]*?retiredAt: deletedAt/);
-  assert.doesNotMatch(creators, /accessSnapshot\.updateMany\(\{ where: \{ creatorId: existing\.id, active: true \}/);
+  assert.doesNotMatch(creators, /accessSnapshot|AccessSnapshot|creatorConnectSession|CreatorConnectSession/);
 });

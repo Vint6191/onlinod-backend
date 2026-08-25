@@ -72,12 +72,11 @@ const createSchema = z.object({
 
 const updateSchema = createSchema.partial();
 
-const completeRuntimeSchema = z.object({
+const completeConnectionSchema = z.object({
   remoteId: z.string().min(1).max(120),
   username: creatorUsernameSchema,
   displayName: z.string().trim().min(1).max(120).optional().nullable(),
   avatarUrl: z.string().max(2000).optional().nullable(),
-  partition: z.string().min(1).max(220),
 });
 
 const agencyRemovalSchema = z.object({
@@ -100,11 +99,6 @@ function normalizeUsername(value) {
   const clean = String(value || "").trim().replace(/^@+/, "");
   return clean ? clean.toLowerCase() : null;
 }
-
-function makePartition(creatorId) {
-  return `persist:acct_${String(creatorId || "").replace(/[^a-zA-Z0-9_-]/g, "_")}`;
-}
-
 
 function jsonRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -166,6 +160,7 @@ router.get("/", async (req, res) => {
             status: true,
             revision: true,
             payloadVersion: true,
+            portableReady: true,
             platformUserId: true,
             capturedByDeviceId: true,
             updatedAt: true,
@@ -203,20 +198,15 @@ router.post("/", creatorManagementRequired, async (req, res) => {
       return res.status(409).json({ ok: false, code: "CREATOR_ALREADY_EXISTS", error: "This OnlyFans creator is already connected", creatorId: conflict.id });
     }
 
-    const creator = await prisma.$transaction(async (tx) => {
-      const created = await tx.creatorAccount.create({
-        data: {
-          agencyId: req.auth.agencyId,
-          displayName: input.displayName.trim(),
-          username,
-          remoteId: null,
-          partition: null,
-          status: "DRAFT",
-          notes: input.notes || null,
-        },
-      });
-      if (created.partition) return created;
-      return tx.creatorAccount.update({ where: { id: created.id }, data: { partition: makePartition(created.id) } });
+    const creator = await prisma.creatorAccount.create({
+      data: {
+        agencyId: req.auth.agencyId,
+        displayName: input.displayName.trim(),
+        username,
+        remoteId: null,
+        status: "DRAFT",
+        notes: input.notes || null,
+      },
     });
 
     await audit({
@@ -258,6 +248,7 @@ router.get("/:id", creatorAccessRequired, async (req, res) => {
             status: true,
             revision: true,
             payloadVersion: true,
+            portableReady: true,
             platformUserId: true,
             capturedByDeviceId: true,
             updatedAt: true,
@@ -480,7 +471,6 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
       return res.json({
         ok: true,
         creatorId: existing.id,
-        partition: existing.partition,
         removedFromMemberAssignments: 0,
         historyPreserved: true,
         alreadyRemoved: true,
@@ -525,7 +515,6 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
         revokeReason: "CREATOR_REMOVED_FROM_AGENCY",
       });
       await tx.deviceCreatorBinding.updateMany({ where: { creatorId: existing.id }, data: { status: "REVOKED" } });
-      await tx.creatorConnectSession.updateMany({ where: { creatorId: existing.id, status: { in: ["PENDING", "CLAIMED"] } }, data: { status: "CANCELLED", cancelledAt: removedAt } });
       await tx.jobInstance.updateMany({
         where: { creatorId: existing.id, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
         data: { status: "CANCELLED", completedAt: removedAt, leaseUntil: null, leaseTokenHash: null, claimedAt: null, claimedByDeviceId: null },
@@ -545,7 +534,6 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
           metadata: {
             username: existing.username,
             remoteId: existing.remoteId,
-            partition: existing.partition,
             removedFromMemberAssignments,
             removedFromInvitationAssignments,
             ...cryptoRetirement,
@@ -561,11 +549,8 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
     return res.json({
       ok: true,
       creatorId: existing.id,
-      partition: existing.partition,
       removedFromMemberAssignments: result.removedFromMemberAssignments,
       removedFromInvitationAssignments: result.removedFromInvitationAssignments,
-      revokedAccessSnapshotCount: result.revokedAccessSnapshotCount,
-      retiredAccessSnapshotSecretCount: result.retiredAccessSnapshotSecretCount,
       revokedCanonicalSessionCount: result.revokedCanonicalSessionCount,
       retiredCanonicalSessionSecretCount: result.retiredCanonicalSessionSecretCount,
       revokedCreatorKeyWrapCount: result.revokedCreatorKeyWrapCount,
@@ -587,9 +572,9 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
   }
 });
 
-router.post("/:id/complete-runtime", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
+router.post("/:id/complete-connection", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
   try {
-    const input = completeRuntimeSchema.parse(req.body);
+    const input = completeConnectionSchema.parse(req.body);
     const existing = await prisma.creatorAccount.findFirst({
       where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null },
     });
@@ -613,12 +598,34 @@ router.post("/:id/complete-runtime", creatorManagementRequired, creatorAccessReq
         error: "The signed-in OnlyFans account does not match the connected creator identity",
       });
     }
-    const expectedPartition = existing.partition || makePartition(existing.id);
-    if (String(input.partition) !== expectedPartition) {
+    // Connection completion is broker-first: canonical CLIENT_E2E session identity
+    // is the authority. Chromium Session/partition naming exists only on Desktop.
+    const canonical = await prisma.creatorSessionState.findUnique({
+      where: { creatorId: existing.id },
+      select: {
+        status: true,
+        revision: true,
+        payloadVersion: true,
+        portableReady: true,
+        platformUserId: true,
+        credentialHash: true,
+        coherenceHash: true,
+      },
+    });
+    const canonicalReady = canonical
+      && canonical.status === "ACTIVE"
+      && Number.isInteger(Number(canonical.revision))
+      && Number(canonical.revision) > 0
+      && Number(canonical.payloadVersion) === 1
+      && canonical.portableReady === true
+      && String(canonical.platformUserId || "") === String(input.remoteId)
+      && Boolean(String(canonical.credentialHash || "").trim())
+      && Boolean(String(canonical.coherenceHash || "").trim());
+    if (!canonicalReady) {
       return res.status(409).json({
         ok: false,
-        code: "CREATOR_PARTITION_MISMATCH",
-        error: "The Chromium partition does not match this creator",
+        code: "CREATOR_CANONICAL_SESSION_REQUIRED",
+        error: "A verified canonical creator session must be published before the creator can become READY",
       });
     }
     const conflict = await findCreatorConflict({
@@ -631,7 +638,6 @@ router.post("/:id/complete-runtime", creatorManagementRequired, creatorAccessReq
       return res.status(409).json({ ok: false, code: "CREATOR_ALREADY_EXISTS", error: "This OnlyFans creator is already connected", creatorId: conflict.id });
     }
 
-    const nextPartition = expectedPartition;
     const wasAlreadyConnected = existing.status === "READY"
       && String(existing.remoteId || "") === String(input.remoteId)
       && normalizeUsername(existing.username) === username;
@@ -643,7 +649,6 @@ router.post("/:id/complete-runtime", creatorManagementRequired, creatorAccessReq
         username,
         displayName: existing.displayName,
         avatarUrl: input.avatarUrl || existing.avatarUrl,
-        partition: nextPartition,
         status: "READY",
       },
     });
@@ -659,7 +664,7 @@ router.post("/:id/complete-runtime", creatorManagementRequired, creatorAccessReq
 
     if (!wasAlreadyConnected) {
       await scheduleInitialJobsForCreator({ creatorId: creator.id, agencyId: creator.agencyId, priority: 50 }).catch((error) => {
-        console.warn("[creators/complete-runtime] schedule jobs failed:", error?.message || error);
+        console.warn("[creators/complete-connection] schedule jobs failed:", error?.message || error);
       });
       await audit({
         agencyId: req.auth.agencyId,
@@ -674,7 +679,7 @@ router.post("/:id/complete-runtime", creatorManagementRequired, creatorAccessReq
     return res.json({ ok: true, creator, unchanged: wasAlreadyConnected });
   } catch (err) {
     if (err?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
-    console.error("[creators/complete-runtime] failed:", err);
+    console.error("[creators/complete-connection] failed:", err);
     return res.status(500).json({ ok: false, code: "CREATOR_RUNTIME_COMPLETE_FAILED", error: "Failed to complete creator connection" });
   }
 });

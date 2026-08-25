@@ -366,7 +366,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     if (!updated.count) continue;
     const claimed = await prisma.jobInstance.findUnique({
       where: { id: candidate.id },
-      include: { creator: { select: { id: true, remoteId: true, username: true, displayName: true, partition: true } } },
+      include: { creator: { select: { id: true, remoteId: true, username: true, displayName: true } } },
     });
     if (!claimed) continue;
     return {

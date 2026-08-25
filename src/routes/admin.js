@@ -167,18 +167,16 @@ function defaultBilling(tier) {
 }
 
 function health(agency) {
-  // Same heuristic as v1 admin.js, kept for UI compatibility.
   const creators = agency.creators || [];
-  const snaps = agency.accessSnapshots || [];
-  const active = new Set(snaps.filter((s) => s.active && !s.revokedAt).map((s) => s.creatorId));
   const issues = [];
   let score = 100;
 
   for (const c of creators) {
     if (c.deletedAt) continue;
-    if (c.status === "READY" && !active.has(c.id)) {
+    const canonicalReady = c.sessionState?.status === "ACTIVE" && c.sessionState?.portableReady === true;
+    if (c.status === "READY" && !canonicalReady) {
       score -= 18;
-      issues.push({ severity: "ERROR",   targetType: "creator", targetId: c.id, message: `${c.displayName} is READY but has no active snapshot` });
+      issues.push({ severity: "ERROR", targetType: "creator", targetId: c.id, message: `${c.displayName} is READY but has no portable ACTIVE canonical session` });
     }
     if (c.status === "NOT_CREATOR") {
       score -= 6;
@@ -187,10 +185,6 @@ function health(agency) {
     if (c.status === "READY" && c.username && !c.remoteId) {
       score -= 8;
       issues.push({ severity: "WARNING", targetType: "creator", targetId: c.id, message: `${c.displayName} has username but no remoteId — possible duplicate` });
-    }
-    if (c.partition === "persist:acct_demo") {
-      score -= 10;
-      issues.push({ severity: "WARNING", targetType: "creator", targetId: c.id, message: `${c.displayName} uses persist:acct_demo — likely test duplicate` });
     }
   }
 
@@ -243,7 +237,7 @@ router.get("/dashboard", async (_req, res) => {
       creatorsReady,
       creatorsProblem,
       devicesTotal,
-      activeSnapshotsTotal,
+      activeCanonicalSessionsTotal,
       recentActions,
       recentSignups,
       mrrAggregate,
@@ -258,7 +252,7 @@ router.get("/dashboard", async (_req, res) => {
       prisma.creatorAccount.count({ where: { deletedAt: null, status: "READY" } }),
       prisma.creatorAccount.count({ where: { deletedAt: null, status: { in: ["NOT_CREATOR", "AUTH_FAILED", "DISABLED"] } } }),
       prisma.workerDevice.count(),
-      prisma.accessSnapshot.count({ where: { active: true, revokedAt: null } }),
+      prisma.creatorSessionState.count({ where: { status: "ACTIVE", portableReady: true, creator: { deletedAt: null } } }),
       prisma.adminActionLog.findMany({ orderBy: { createdAt: "desc" }, take: 30 }),
       prisma.user.findMany({
         where: { disabledAt: null },
@@ -315,8 +309,8 @@ router.get("/dashboard", async (_req, res) => {
           total: devicesTotal,
           online: devicesOnline,
         },
-        snapshots: {
-          active: activeSnapshotsTotal,
+        canonicalSessions: {
+          activePortable: activeCanonicalSessionsTotal,
         },
       },
       mrr: (() => {
@@ -471,8 +465,7 @@ router.get("/agencies", async (req, res) => {
       orderBy: { createdAt: "desc" },
       include: {
         members:        { include: { user: true }, orderBy: { createdAt: "asc" } },
-        creators:       { include: { billingProfile: true, billingEntitlement: true, accessSnapshots: { orderBy: { createdAt: "desc" }, take: 5 } } },
-        accessSnapshots: { select: { id: true, active: true, revokedAt: true, creatorId: true, createdAt: true } },
+        creators:       { include: { billingProfile: true, billingEntitlement: true, sessionState: { select: { status: true, portableReady: true, revision: true, updatedAt: true } } } },
         subscriptions:  { orderBy: { createdAt: "desc" }, take: 1 },
       },
     });
@@ -494,7 +487,7 @@ router.get("/agencies", async (req, res) => {
             members: a.members.length,
             creators: a.creators.filter((c) => !c.deletedAt).length,
             readyCreators: a.creators.filter((c) => c.status === "READY" && !c.deletedAt).length,
-            activeSnapshots: a.accessSnapshots.filter((s) => s.active && !s.revokedAt).length,
+            activeCanonicalSessions: a.creators.filter((c) => !c.deletedAt && c.sessionState?.status === "ACTIVE" && c.sessionState?.portableReady === true).length,
           },
           subscription: a.subscriptions[0] || null,
           health: health(a),
@@ -514,10 +507,9 @@ router.get("/agencies/:id", async (req, res) => {
     include: {
       members: { include: { user: true }, orderBy: { createdAt: "asc" } },
       creators: {
-        include: { billingProfile: true, billingEntitlement: true, accessSnapshots: { orderBy: { createdAt: "desc" }, take: 10 } },
+        include: { billingProfile: true, billingEntitlement: true, sessionState: { select: { status: true, portableReady: true, revision: true, updatedAt: true } } },
         orderBy: [{ status: "asc" }, { createdAt: "desc" }],
       },
-      accessSnapshots: { orderBy: { createdAt: "desc" }, take: 150 },
       subscriptions:   { orderBy: { createdAt: "desc" }, take: 5 },
       adminActionLogs: { orderBy: { createdAt: "desc" }, take: 30 },
     },
@@ -569,7 +561,7 @@ router.delete("/agencies/:id", async (req, res) => {
 
     const before = await prisma.agency.findUnique({
       where: { id: req.params.id },
-      include: { members: true, creators: true, accessSnapshots: true },
+      include: { members: true, creators: { include: { sessionState: { select: { status: true, portableReady: true, revision: true, updatedAt: true } } } } },
     });
     if (!before) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
 
@@ -1170,7 +1162,7 @@ router.get("/creators", async (req, res) => {
     const status   = String(req.query.status || "").trim().toUpperCase();
     const tier     = String(req.query.tier || "").trim().toUpperCase();
     const agencyId = String(req.query.agencyId || "").trim();
-    const noSnap   = req.query.no_snapshot === "1";
+    const noCanonical = req.query.no_canonical === "1";
 
     const where = { deletedAt: null };
     if (q) {
@@ -1190,16 +1182,14 @@ router.get("/creators", async (req, res) => {
       include: {
         agency: { select: { id: true, name: true, status: true, deletedAt: true } },
         billingProfile: true,
-        accessSnapshots: {
-          where: { active: true, revokedAt: null },
-          orderBy: { createdAt: "desc" },
-          take: 1,
+        sessionState: {
+          select: { status: true, portableReady: true, revision: true, updatedAt: true },
         },
       },
     });
 
     if (tier)   creators = creators.filter((c) => c.billingProfile?.tier === tier);
-    if (noSnap) creators = creators.filter((c) => c.accessSnapshots.length === 0);
+    if (noCanonical) creators = creators.filter((c) => !(c.sessionState?.status === "ACTIVE" && c.sessionState?.portableReady === true));
 
     return res.json({
       ok: true,
@@ -1212,12 +1202,12 @@ router.get("/creators", async (req, res) => {
         remoteId: c.remoteId,
         avatarUrl: c.avatarUrl,
         status: c.status,
-        partition: c.partition,
         createdAt: c.createdAt,
         billingTier: c.billingProfile?.tier || null,
         billingExcluded: !!c.billingProfile?.billingExcluded,
         revenue30dCents: Number(c.billingProfile?.revenue30dCents || 0),
-        hasActiveSnapshot: c.accessSnapshots.length > 0,
+        hasPortableCanonicalSession: c.sessionState?.status === "ACTIVE" && c.sessionState?.portableReady === true,
+        canonicalRevision: c.sessionState?.revision ?? null,
       })),
     });
   } catch (err) {
@@ -1421,7 +1411,7 @@ router.delete("/creators/:id", async (req, res) => {
 
   const before = await prisma.creatorAccount.findUnique({
     where: { id: req.params.id },
-    include: { billingProfile: true, accessSnapshots: true },
+    include: { billingProfile: true, sessionState: { select: { status: true, portableReady: true, revision: true, updatedAt: true } } },
   });
   if (!before) return res.status(404).json({ ok: false, error: "Creator not found" });
 

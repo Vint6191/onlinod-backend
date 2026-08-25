@@ -7,10 +7,10 @@ const prisma = require("../prisma");
 const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
+const { publishCreatorSessionRevision, waitForCreatorSessionRevisionEvents } = require("../services/creator-session-revision-events");
 const {
   assertCreatorSessionTargetActive,
   getCreatorSession,
-  migrateCreatorSessionToOpaque,
   writeCreatorSession,
   revokeCreatorSession,
 } = require("../services/creator-session-broker-service");
@@ -20,27 +20,8 @@ router.use(authRequired);
 
 const deviceIdSchema = z.string().trim().min(1).max(180);
 const requestIdSchema = z.string().trim().min(8).max(180);
-
-const cookieSchema = z.object({
-  name: z.string().min(1).max(256),
-  value: z.string().max(32_768),
-  domain: z.string().min(1).max(512),
-  hostOnly: z.boolean().optional().nullable(),
-  path: z.string().max(2048).optional().nullable(),
-  secure: z.boolean().optional().nullable(),
-  httpOnly: z.boolean().optional().nullable(),
-  sameSite: z.string().max(32).optional().nullable(),
-  expirationDate: z.number().finite().positive().optional().nullable(),
-  session: z.boolean().optional().nullable(),
-}).strict();
-
-const payloadSchema = z.object({
-  cookies: z.array(cookieSchema).min(1).max(256),
-  storage: z.object({
-    bcTokenSha: z.string().max(16_384).optional().nullable(),
-  }).strict().optional().default({}),
-  userAgent: z.string().max(2048).optional().nullable(),
-}).strict();
+const eventCursorSchema = z.coerce.number().int().min(0).max(Number.MAX_SAFE_INTEGER).default(0);
+const eventWaitSchema = z.coerce.number().int().min(250).max(25_000).default(20_000);
 
 const writeCommon = {
   deviceId: deviceIdSchema,
@@ -59,21 +40,12 @@ const opaquePayloadSchema = z.object({
   algorithm: z.literal("aes-256-gcm-client-e2e-v1"),
 }).strict();
 
-const legacyWriteSchema = z.object({ ...writeCommon, payload: payloadSchema }).strict();
-const opaqueWriteSchema = z.object({
+const writeSchema = z.object({
   ...writeCommon,
   opaquePayload: opaquePayloadSchema,
   credentialHash: z.string().regex(/^[0-9a-fA-F]{64}$/),
   coherenceHash: z.string().regex(/^[0-9a-fA-F]{64}$/),
-}).strict();
-const writeSchema = z.union([opaqueWriteSchema, legacyWriteSchema]);
-const migrateOpaqueSchema = z.object({
-  deviceId: deviceIdSchema,
-  expectedRevision: z.number().int().positive(),
-  platformUserId: z.string().trim().min(1).max(160),
-  credentialHash: z.string().regex(/^[0-9a-fA-F]{64}$/),
-  coherenceHash: z.string().regex(/^[0-9a-fA-F]{64}$/),
-  opaquePayload: opaquePayloadSchema,
+  portableReady: z.boolean().optional().default(false),
 }).strict();
 
 const revokeSchema = z.object({
@@ -99,9 +71,41 @@ async function authorize(req, creatorId, deviceId, { requireActive = true } = {}
   // Do not consult WorkerDevice here: it is mutable telemetry and can point at
   // another workspace on the same physical PC. CLIENT_E2E_V1 operations are
   // additionally fenced in the broker service by immutable DeviceCryptoIdentity
-  // + user + current AMK/CDK enrollment. Legacy SERVER_V1 remains normal bearer
-  // authorization during the migration window.
+  // + user + current AMK/CDK enrollment. V20.22 cutover is CLIENT_E2E_V1-only:
+  // there is no bearer-authorized legacy secret path left in normal runtime.
   return { creator, device: { id: boundDeviceId } };
+}
+
+
+async function filterAuthorizedRevisionEvents(req, events) {
+  const allowed = [];
+  for (const event of events) {
+    try {
+      await requireCreatorAccess({
+        agencyId: req.auth.agencyId,
+        member: req.auth.membership || req.member,
+        creatorId: event.creatorId,
+        db: prisma,
+      });
+      allowed.push(event);
+    } catch (error) {
+      const status = Number(error?.status || 0);
+      if (status === 403 || status === 404) continue;
+      throw error;
+    }
+  }
+  return allowed;
+}
+
+function publishRevisionHint(input) {
+  try {
+    publishCreatorSessionRevision(input);
+  } catch (error) {
+    // Hint delivery must never turn an already committed canonical CAS write
+    // into an apparent failure. The 30s creator heartbeat remains the repair
+    // path if this in-memory transport is unavailable.
+    console.error("[creator-sessions/revision-hint] failed:", error);
+  }
 }
 
 function sendError(res, error, fallbackCode) {
@@ -121,6 +125,30 @@ function sendError(res, error, fallbackCode) {
     ...(error?.current ? { current: error.current } : {}),
   });
 }
+
+
+router.get("/events", async (req, res) => {
+  try {
+    requireAuthDevice(req, deviceIdSchema.parse(req.query.deviceId), {
+      requiredCode: "CREATOR_SESSION_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "CREATOR_SESSION_AUTH_DEVICE_MISMATCH",
+    });
+    const afterSeq = eventCursorSchema.parse(req.query.afterSeq ?? 0);
+    const waitMs = eventWaitSchema.parse(req.query.waitMs ?? 20_000);
+    const clientStreamId = typeof req.query.streamId === "string" ? req.query.streamId.trim().slice(0, 180) : "";
+    const result = await waitForCreatorSessionRevisionEvents({
+      agencyId: req.auth.agencyId,
+      streamId: clientStreamId || null,
+      afterSeq,
+      waitMs,
+    });
+    const events = await filterAuthorizedRevisionEvents(req, result.events);
+    return res.json({ ok: true, streamId: result.streamId, cursor: result.cursor, events });
+  } catch (error) {
+    if (!error?.issues && Number(error?.status || 0) >= 500) console.error("[creator-sessions/events] failed:", error);
+    return sendError(res, error, "CREATOR_SESSION_EVENTS_FAILED");
+  }
+});
 
 router.get("/:creatorId", async (req, res) => {
   try {
@@ -151,19 +179,6 @@ router.get("/:creatorId", async (req, res) => {
   }
 });
 
-router.post("/:creatorId/migrate-opaque", async (req, res) => {
-  try {
-    const input = migrateOpaqueSchema.parse(req.body || {});
-    const { creator, device } = await authorize(req, req.params.creatorId, input.deviceId);
-    const result = await migrateCreatorSessionToOpaque({
-      db: prisma, agencyId: req.auth.agencyId, creatorId: creator.id, deviceId: device.id, member: req.auth.membership || req.member,
-      expectedRevision: input.expectedRevision, platformUserId: input.platformUserId, credentialHash: input.credentialHash, coherenceHash: input.coherenceHash, opaquePayload: input.opaquePayload,
-    });
-    await audit({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, action: "creator_session.migrated_client_e2e", targetType: "creator_session", targetId: creator.id, metadata: { creatorId: creator.id, deviceId: device.id, revision: result.state.revision, keyVersion: result.state.keyVersion, migrated: result.migrated } });
-    return res.json({ ok: true, creatorId: creator.id, ...result });
-  } catch (error) { return sendError(res, error, "CREATOR_SESSION_MIGRATION_FAILED"); }
-});
-
 router.post("/:creatorId", async (req, res) => {
   try {
     const input = writeSchema.parse(req.body || {});
@@ -179,9 +194,10 @@ router.post("/:creatorId", async (req, res) => {
       requestId: input.requestId,
       capturedAt: input.capturedAt,
       platformUserId: input.platformUserId,
-      ...("opaquePayload" in input
-        ? { opaquePayload: input.opaquePayload, credentialHash: input.credentialHash, coherenceHash: input.coherenceHash }
-        : { payload: input.payload }),
+      opaquePayload: input.opaquePayload,
+      credentialHash: input.credentialHash,
+      coherenceHash: input.coherenceHash,
+      portableReady: input.portableReady,
     });
     await audit({
       agencyId: req.auth.agencyId,
@@ -198,6 +214,16 @@ router.post("/:creatorId", async (req, res) => {
         unchanged: result.unchanged,
       },
     });
+    if (!result.idempotent && !result.unchanged) {
+      publishRevisionHint({
+        agencyId: req.auth.agencyId,
+        creatorId: creator.id,
+        revision: result.state.revision,
+        status: result.state.status,
+        sourceDeviceId: device.id,
+        requestId: input.requestId,
+      });
+    }
     return res.json({ ok: true, creatorId: creator.id, ...result });
   } catch (error) {
     if (!error?.issues && Number(error?.status || 0) >= 500) console.error("[creator-sessions/write] failed:", error);
@@ -234,6 +260,16 @@ router.post("/:creatorId/revoke", async (req, res) => {
         unchanged: result.unchanged,
       },
     });
+    if (!result.idempotent && !result.unchanged) {
+      publishRevisionHint({
+        agencyId: req.auth.agencyId,
+        creatorId: creator.id,
+        revision: result.state.revision,
+        status: result.state.status,
+        sourceDeviceId: device.id,
+        requestId: input.requestId,
+      });
+    }
     return res.json({ ok: true, creatorId: creator.id, ...result });
   } catch (error) {
     if (!error?.issues && Number(error?.status || 0) >= 500) console.error("[creator-sessions/revoke] failed:", error);

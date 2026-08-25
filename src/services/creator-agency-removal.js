@@ -47,14 +47,6 @@ async function retireCreatorCryptoMaterialOnRemoval({
   const agency = String(agencyId || "").trim();
   if (!id || !agency) throw new Error("agencyId and creatorId are required for creator crypto retirement");
 
-  // Preserve historical revocation provenance: active snapshots receive the
-  // creator-removal timestamp, while already-revoked rows keep their original
-  // revokedAt and only receive payloadRetiredAt when secret bytes are shredded.
-  const revokedAccessSnapshots = await db.accessSnapshot.updateMany({
-    where: { agencyId: agency, creatorId: id, active: true, revokedAt: null },
-    data: { active: false, revokedAt: retiredAt },
-  });
-
   // Canonical broker state is unique per creator. Revoke a live execution once,
   // then separately crypto-shred *any* residual payload regardless of status.
   // The second operation intentionally does not rewrite revision/revokedAt/reason,
@@ -73,18 +65,7 @@ async function retireCreatorCryptoMaterialOnRemoval({
     },
   });
 
-  const [retiredAccessSnapshotSecrets, retiredCanonicalSessionSecrets, creatorWraps, dedicatedProxies, retiredNetworkProfiles] = await Promise.all([
-    db.accessSnapshot.updateMany({
-      where: { agencyId: agency, creatorId: id, encryptedPayload: { not: null } },
-      data: {
-        encryptedPayload: null,
-        iv: null,
-        tag: null,
-        algorithm: null,
-        active: false,
-        payloadRetiredAt: retiredAt,
-      },
-    }),
+  const [retiredCanonicalSessionSecrets, creatorWraps, dedicatedProxies, retiredNetworkProfiles] = await Promise.all([
     db.creatorSessionState.updateMany({
       where: {
         agencyId: agency,
@@ -159,8 +140,6 @@ async function retireCreatorCryptoMaterialOnRemoval({
   ]);
 
   return {
-    revokedAccessSnapshotCount: Number(revokedAccessSnapshots?.count || 0),
-    retiredAccessSnapshotSecretCount: Number(retiredAccessSnapshotSecrets?.count || 0),
     revokedCanonicalSessionCount: Number(revokedCanonicalSessions?.count || 0),
     retiredCanonicalSessionSecretCount: Number(retiredCanonicalSessionSecrets?.count || 0),
     revokedCreatorKeyWrapCount: Number(creatorWraps?.count || 0),

@@ -15,15 +15,12 @@ test("V20.12 metadata read can omit plaintext payload while preserving managed-r
   assert.match(route, /String\(req\.query\.includePayload \?\? "0"\).*=== "1"/);
 });
 
-test("V20.12 backend independently removes non-portable OF cookie noise", () => {
+test("V20.22 backend no longer parses plaintext OF cookie jars after CLIENT_E2E cutover", () => {
   const broker = read("src/services/creator-session-broker-service.js");
-  assert.match(broker, /SESSION_COOKIE_NOISE_EXACT/);
-  assert.match(broker, /cloudfront-/i);
-  assert.match(broker, /_ga_/);
-  assert.match(broker, /__cf_bm/);
-  assert.match(broker, /startsWith\("__cf"\)/);
-  assert.match(broker, /startsWith\("cf_"\)/);
-  assert.match(broker, /isPortableSessionCookieName/);
+  assert.doesNotMatch(broker, /SESSION_COOKIE_NOISE_EXACT|isPortableSessionCookieName|normalizeCookie|normalizePayload/);
+  assert.doesNotMatch(broker, /__cf_bm|cf_clearance|auth_id|cookies/);
+  assert.match(broker, /opaquePayload/);
+  assert.match(broker, /portableReady/);
 });
 
 

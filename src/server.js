@@ -8,8 +8,6 @@ const path = require("node:path");
 
 const authRoutes = require("./routes/auth");
 const creatorRoutes = require("./routes/creators");
-const creatorConnectRoutes = require("./routes/creator-connect");
-const accessSnapshotRoutes = require("./routes/access-snapshots");
 const creatorSessionRoutes = require("./routes/creator-sessions");
 const networkProfileRoutes = require("./routes/network-profiles");
 const clientE2eKeyringRoutes = require("./routes/client-e2e-keyring");
@@ -231,11 +229,9 @@ app.use("/api/billing", billingRoutes);
 app.use("/api/settings", authRequired, settingsRoutes);
 app.use("/api/message-library", authRequired, messageLibraryRoutes);
 app.use("/api/creators", creatorRoutes);
-app.use("/api/creator-connect", creatorConnectRoutes);
 app.use("/api/creator-sessions", creatorSessionRoutes);
 app.use("/api/network-profiles", networkProfileRoutes);
 app.use("/api/client-e2e-keyring", clientE2eKeyringRoutes);
-app.use("/api", accessSnapshotRoutes);
 
 app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/") || req.path.startsWith("/uploads/")) {

@@ -66,20 +66,15 @@ router.get("/context", async (req, res) => {
           },
           include: {
             billingProfile: true,
-            accessSnapshots: {
-              where: { active: true, revokedAt: null },
-              orderBy: { createdAt: "desc" },
-              take: 1,
+            sessionState: {
               select: {
-                id: true,
-                creatorId: true,
-                active: true,
-                expiresAt: true,
-                revokedAt: true,
-                createdAt: true,
-                username: true,
-                remoteId: true,
-                deviceId: true,
+                status: true,
+                revision: true,
+                payloadVersion: true,
+                portableReady: true,
+                platformUserId: true,
+                capturedByDeviceId: true,
+                updatedAt: true,
               },
             },
           },
