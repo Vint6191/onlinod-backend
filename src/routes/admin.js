@@ -64,8 +64,61 @@ const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, r
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 const { TIER_CATALOG } = require("../services/billing-catalog-service");
 const { retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
+const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 
 const router = express.Router();
+
+
+async function adminMemberCreatorIds(member) {
+  const raw = member?.assignedCreators;
+  const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  const broad = member?.role === "OWNER" || member?.roleKey === "owner" || raw === null || raw === undefined || raw === "all" || obj?.all === true || String(obj?.mode || "").toLowerCase() === "all";
+  if (!broad) {
+    const ids = Array.isArray(raw) ? raw : (Array.isArray(obj?.creatorIds) ? obj.creatorIds : Array.isArray(obj?.ids) ? obj.ids : []);
+    return Array.from(new Set(ids.map(String).map((id) => id.trim()).filter(Boolean)));
+  }
+  const rows = await prisma.creatorAccount.findMany({ where: { agencyId: member.agencyId, deletedAt: null }, select: { id: true }, take: 10000 });
+  return rows.map((row) => String(row.id || "").trim()).filter(Boolean);
+}
+
+function publishAdminCreatorRevokes(req, member, creatorIds, reason) {
+  for (const creatorId of creatorIds) {
+    try {
+      publishDesktopControlEvent({
+        type: "CREATOR_REVOKED",
+        agencyId: member.agencyId,
+        creatorId,
+        reason,
+        targetUserId: member.userId || member.user?.id || null,
+        targetMemberId: member.id,
+        sourceDeviceId: req.auth?.deviceId || null,
+        requestId: req.headers?.["x-request-id"] || null,
+      });
+    } catch (error) {
+      console.error("[admin/control-creator-revoke] failed:", error);
+    }
+  }
+}
+
+function publishAdminMemberAccessEpoch(req, member, accessEpochOverride = null) {
+  if (!member?.id || !member?.agencyId) return;
+  const epoch = Number(accessEpochOverride ?? member.accessEpoch);
+  if (!Number.isInteger(epoch) || epoch < 1) return;
+  try {
+    publishDesktopControlEvent({
+      type: "ACCESS_EPOCH_CHANGED",
+      agencyId: member.agencyId,
+      accessEpoch: epoch,
+      targetUserId: member.userId || member.user?.id || null,
+      targetMemberId: member.id,
+      sourceDeviceId: req.auth?.deviceId || null,
+      requestId: req.headers?.["x-request-id"] || null,
+    });
+  } catch (error) {
+    console.error("[admin/control-access-epoch] failed:", error);
+  }
+}
+
 router.use(adminRequired);
 
 
@@ -813,8 +866,9 @@ router.patch("/members/:memberId/role", async (req, res) => {
 
     const updated = await prisma.agencyMember.update({
       where: { id: before.id },
-      data: { role: input.role },
+      data: { role: input.role, accessEpoch: { increment: 1 } },
     });
+    publishAdminMemberAccessEpoch(req, updated);
 
     await adminLog(req, {
       agencyId: before.agencyId,
@@ -843,8 +897,9 @@ router.patch("/members/:memberId/permissions", async (req, res) => {
 
     const updated = await prisma.agencyMember.update({
       where: { id: before.id },
-      data: { permissions: input.permissions },
+      data: { permissions: input.permissions, accessEpoch: { increment: 1 } },
     });
+    publishAdminMemberAccessEpoch(req, updated);
 
     await adminLog(req, {
       agencyId: before.agencyId,
@@ -878,6 +933,7 @@ router.delete("/members/:memberId", async (req, res) => {
       }
     }
 
+    const revokedCreatorIds = await adminMemberCreatorIds(before);
     await prisma.agencyMember.delete({ where: { id: before.id } });
 
     // Kill all refresh sessions for this user/agency pair.
@@ -885,6 +941,8 @@ router.delete("/members/:memberId", async (req, res) => {
       where: { userId: before.userId, agencyId: before.agencyId, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    publishAdminCreatorRevokes(req, before, revokedCreatorIds, "MEMBER_REMOVED");
+    publishAdminMemberAccessEpoch(req, before, Math.max(1, Number(before.accessEpoch || 1) + 1));
 
     await adminLog(req, {
       agencyId: before.agencyId,

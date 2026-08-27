@@ -6,6 +6,7 @@ const prisma = require("../prisma");
 const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
+const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const {
   registerDeviceIdentity,
   initializeAgencyCryptoRoot,
@@ -33,6 +34,20 @@ const {
 
 const router = express.Router();
 router.use(authRequired);
+
+function publishCreatorCryptoHints(req, creatorId, result) {
+  const common = { agencyId: req.auth.agencyId, creatorId, sourceDeviceId: req.auth?.deviceId || null, requestId: req.headers?.["x-request-id"] || null };
+  try {
+    const keyVersion = Number(result?.activeKeyVersion ?? result?.state?.activeVersion);
+    if (Number.isInteger(keyVersion) && keyVersion > 0) publishDesktopControlEvent({ ...common, type: "KEY_VERSION_CHANGED", keyVersion });
+    const sessionRevision = Number(result?.sessionRevision);
+    if (Number.isInteger(sessionRevision) && sessionRevision > 0) publishDesktopControlEvent({ ...common, type: "SESSION_REVISION_CHANGED", revision: sessionRevision, status: "ACTIVE" });
+    const networkVersion = Number(result?.networkProfileVersion);
+    if (Number.isInteger(networkVersion) && networkVersion >= 0) publishDesktopControlEvent({ ...common, type: "NETWORK_REVISION_CHANGED", networkVersion });
+  } catch (error) {
+    console.error("[client-e2e-keyring/control-hint] failed:", error);
+  }
+}
 
 const deviceId = z.string().trim().min(1).max(180);
 const publicKey = z.string().trim().min(16).max(4096);
@@ -251,6 +266,7 @@ router.post("/creators/:creatorId/initialize-key", async (req, res) => {
         rootVersion: result.state.rootVersion,
       },
     });
+    if (result.created) publishCreatorCryptoHints(req, result.state.creatorId, result);
     return res.status(result.created ? 201 : 200).json({ ok: true, ...result });
   } catch (error) { return fail(res, error, "CRYPTO_CREATOR_KEY_INITIALIZATION_FAILED"); }
 });
@@ -391,6 +407,7 @@ router.post("/creators/:creatorId/rotate", async (req, res) => {
         networkProfileVersion: result.networkProfileVersion,
       },
     });
+    publishCreatorCryptoHints(req, creator.id, result);
     return res.json({ ok: true, ...result });
   } catch (error) { return fail(res, error, "CRYPTO_CREATOR_ROTATION_FAILED"); }
 });

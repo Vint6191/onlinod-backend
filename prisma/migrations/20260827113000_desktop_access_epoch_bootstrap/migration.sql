@@ -1,0 +1,2 @@
+ALTER TABLE "AgencyMember"
+ADD COLUMN "accessEpoch" INTEGER NOT NULL DEFAULT 1;

@@ -20,6 +20,7 @@ const {
 const { resolveEffectivePermissions, validateAssignedCreators } = require("../services/team-access-control");
 const { cleanFunctions, ensureRoleExists } = require("../services/team-administration-service");
 const { audit } = require("../services/audit-service");
+const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 
 const router = express.Router();
 
@@ -292,6 +293,20 @@ router.post("/register", async (req, res) => {
       return { user, agency, member, invitationClaimed: false };
     });
 
+    if (result.invitationClaimed === true) {
+      try {
+        publishDesktopControlEvent({
+          type: "ACCESS_EPOCH_CHANGED",
+          agencyId: result.agency.id,
+          accessEpoch: Number(result.member.accessEpoch || 1),
+          targetUserId: result.user.id,
+          targetMemberId: result.member.id,
+          requestId: req.headers?.["x-request-id"] || null,
+        });
+      } catch (eventError) {
+        console.error("[auth/register/control-access-epoch] failed:", eventError);
+      }
+    }
     const verification = await issueEmailVerification(result.user);
 
     return res.status(201).json({

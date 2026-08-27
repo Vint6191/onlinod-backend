@@ -12,6 +12,7 @@ const {
   roleKeyToLegacy,
 } = require("../services/team-administration-service");
 const { validateAssignedCreators } = require("../services/team-access-control");
+const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 
 const router = express.Router();
 
@@ -146,6 +147,7 @@ router.post("/claim", authRequired, async (req, res) => {
             role: roleKeyToLegacy(roleKey),
             displayName: currentInvite.displayName || existing.displayName || me.name || null,
             assignedCreators: creatorScope.value,
+            accessEpoch: { increment: 1 },
             commission: currentInvite.commission ?? existing.commission ?? { kind: "none" },
             lastSeenLabel: "just rejoined",
           },
@@ -200,6 +202,20 @@ router.post("/claim", authRequired, async (req, res) => {
 
       return { member, restored, roleKey, functions, agency: currentInvite.agency };
     });
+
+    try {
+      publishDesktopControlEvent({
+        type: "ACCESS_EPOCH_CHANGED",
+        agencyId: result.agency.id,
+        accessEpoch: Number(result.member.accessEpoch || 1),
+        targetUserId: result.member.userId || userId,
+        targetMemberId: result.member.id,
+        sourceDeviceId: req.auth?.deviceId || null,
+        requestId: req.headers?.["x-request-id"] || null,
+      });
+    } catch (eventError) {
+      console.error("[invitations/control-access-epoch] failed:", eventError);
+    }
 
     return res.json({
       ok: true,

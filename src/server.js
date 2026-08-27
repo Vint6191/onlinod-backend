@@ -9,6 +9,7 @@ const path = require("node:path");
 const authRoutes = require("./routes/auth");
 const creatorRoutes = require("./routes/creators");
 const creatorSessionRoutes = require("./routes/creator-sessions");
+const desktopRoutes = require("./routes/desktop");
 const networkProfileRoutes = require("./routes/network-profiles");
 const clientE2eKeyringRoutes = require("./routes/client-e2e-keyring");
 const adminRoutes = require("./routes/admin");
@@ -53,6 +54,7 @@ const automationControlRoutes = require("./routes/automation-control");
 const serverStoreDiagnosticsRoutes = require("./routes/server-store-diagnostics");
 const { authRequired } = require("./middleware/auth");
 const { createIdempotencyMiddleware } = require("./middleware/idempotency");
+const { createRequestObservabilityMiddleware } = require("./middleware/request-observability");
 const prisma = require("./prisma");
 const logger = require("./utils/logger");
 const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
@@ -132,6 +134,7 @@ app.use("/api/auth/login", authLimiter);
 
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
+app.use(createRequestObservabilityMiddleware());
 app.use("/api", createIdempotencyMiddleware());
 
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads"), {
@@ -230,6 +233,7 @@ app.use("/api/settings", authRequired, settingsRoutes);
 app.use("/api/message-library", authRequired, messageLibraryRoutes);
 app.use("/api/creators", creatorRoutes);
 app.use("/api/creator-sessions", creatorSessionRoutes);
+app.use("/api/desktop", desktopRoutes);
 app.use("/api/network-profiles", networkProfileRoutes);
 app.use("/api/client-e2e-keyring", clientE2eKeyringRoutes);
 

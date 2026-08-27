@@ -377,6 +377,7 @@ model AgencyMember {
   userId      String
   role        UserRole @default(OWNER)
   permissions Json?
+  accessEpoch      Int      @default(1)
   roleKey          String?
   displayName      String?
   initials         String?

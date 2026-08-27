@@ -12,8 +12,49 @@ const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
 const { agencyRemovalPhrase, removeCreatorFromAssignedCreators, retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
 const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
+const { bumpAgencyAccessEpoch } = require("../services/access-epoch-service");
+const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 
 const router = express.Router();
+
+async function publishAgencyAccessEpochEvents(req) {
+  const members = await prisma.agencyMember.findMany({
+    where: { agencyId: req.auth.agencyId, deletedAt: null, deactivatedAt: null },
+    select: { id: true, userId: true, accessEpoch: true },
+    take: 10000,
+  });
+  for (const member of members) {
+    try {
+      publishDesktopControlEvent({
+        type: "ACCESS_EPOCH_CHANGED",
+        agencyId: req.auth.agencyId,
+        accessEpoch: member.accessEpoch,
+        targetUserId: member.userId,
+        targetMemberId: member.id,
+        sourceDeviceId: req.auth?.deviceId || null,
+        requestId: req.headers?.["x-request-id"] || null,
+      });
+    } catch (error) {
+      console.error("[creators/control-access-epoch] failed:", error);
+    }
+  }
+}
+
+function publishCreatorRevoked(req, creatorId, reason) {
+  try {
+    publishDesktopControlEvent({
+      type: "CREATOR_REVOKED",
+      agencyId: req.auth.agencyId,
+      creatorId,
+      reason,
+      sourceDeviceId: req.auth?.deviceId || null,
+      requestId: req.headers?.["x-request-id"] || null,
+    });
+  } catch (error) {
+    console.error("[creators/control-revoke] failed:", error);
+  }
+}
+
 
 const uploadsDir = path.join(__dirname, "..", "..", "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
@@ -198,15 +239,22 @@ router.post("/", creatorManagementRequired, async (req, res) => {
       return res.status(409).json({ ok: false, code: "CREATOR_ALREADY_EXISTS", error: "This OnlyFans creator is already connected", creatorId: conflict.id });
     }
 
-    const creator = await prisma.creatorAccount.create({
-      data: {
-        agencyId: req.auth.agencyId,
-        displayName: input.displayName.trim(),
-        username,
-        remoteId: null,
-        status: "DRAFT",
-        notes: input.notes || null,
-      },
+    const creator = await prisma.$transaction(async (tx) => {
+      const created = await tx.creatorAccount.create({
+        data: {
+          agencyId: req.auth.agencyId,
+          displayName: input.displayName.trim(),
+          username,
+          remoteId: null,
+          status: "DRAFT",
+          notes: input.notes || null,
+        },
+      });
+      // The agency creator set is part of broad-access members' authorization
+      // graph. Bump all live members once so every desktop can detect that its
+      // cached creator manifest is no longer current.
+      await bumpAgencyAccessEpoch({ db: tx, agencyId: req.auth.agencyId });
+      return created;
     });
 
     await audit({
@@ -217,6 +265,7 @@ router.post("/", creatorManagementRequired, async (req, res) => {
       targetId: creator.id,
       metadata: { username: creator.username, status: creator.status },
     });
+    await publishAgencyAccessEpochEvents(req);
 
     return res.status(201).json({ ok: true, creator });
   } catch (err) {
@@ -524,6 +573,9 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
         where: { id: existing.id },
         data: { status: "DISABLED", deletedAt: removedAt },
       });
+      // Removal changes both broad creator scope and explicit assignments. One
+      // monotonic epoch bump covers every live member after the transaction.
+      await bumpAgencyAccessEpoch({ db: tx, agencyId: req.auth.agencyId });
       await tx.auditLog.create({
         data: {
           agencyId: req.auth.agencyId,
@@ -545,6 +597,9 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
       });
       return { removedFromMemberAssignments, removedFromInvitationAssignments, ...cryptoRetirement };
     }, { maxWait: 10_000, timeout: 120_000 });
+
+    publishCreatorRevoked(req, existing.id, "CREATOR_REMOVED_FROM_AGENCY");
+    await publishAgencyAccessEpochEvents(req);
 
     return res.json({
       ok: true,

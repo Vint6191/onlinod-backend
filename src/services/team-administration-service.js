@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { publishDesktopControlEvent } = require("./desktop-control-events");
 const { audit } = require("./audit-service");
 const {
   revokeOwnerRootAccessForMember,
@@ -469,6 +470,62 @@ async function assertOwnerSafety({ agencyId, targetMember, nextRoleKey = null, r
   }
 }
 
+
+function normalizedEpoch(value, fallback = 1) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function publishMemberAccessEpoch({ agencyId, member, sourceDeviceId = null, requestId = null }) {
+  if (!member?.id) return;
+  try {
+    publishDesktopControlEvent({
+      type: "ACCESS_EPOCH_CHANGED",
+      agencyId,
+      accessEpoch: normalizedEpoch(member.accessEpoch),
+      targetUserId: member.userId || member.user?.id || null,
+      targetMemberId: member.id,
+      sourceDeviceId,
+      requestId,
+    });
+  } catch (error) {
+    console.error("[team/control-access-epoch] failed:", error);
+  }
+}
+
+async function accessibleCreatorIdsForMember({ db, agencyId, member }) {
+  if (!member) return [];
+  const normalized = normalizeAssignedCreators(member.assignedCreators);
+  const broad = isOwner(member) || normalized.mode === "all";
+  if (!broad) return normalized.creatorIds;
+  if (typeof db?.creatorAccount?.findMany !== "function") return [];
+  const rows = await db.creatorAccount.findMany({
+    where: { agencyId, deletedAt: null },
+    select: { id: true },
+    take: 10000,
+  });
+  return rows.map((row) => String(row.id || "").trim()).filter(Boolean);
+}
+
+function publishTargetedCreatorRevokes({ agencyId, creatorIds, member, reason, sourceDeviceId = null }) {
+  for (const creatorId of Array.from(new Set(creatorIds || []))) {
+    if (!creatorId) continue;
+    try {
+      publishDesktopControlEvent({
+        type: "CREATOR_REVOKED",
+        agencyId,
+        creatorId,
+        reason,
+        targetUserId: member?.userId || member?.user?.id || null,
+        targetMemberId: member?.id || null,
+        sourceDeviceId,
+      });
+    } catch (error) {
+      console.error("[team/control-creator-revoke] failed:", error);
+    }
+  }
+}
+
 async function updateMemberSettings({ agencyId, memberId, patch, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
   const target = await db.agencyMember.findFirst({
     where: { id: memberId, agencyId, deletedAt: null },
@@ -538,6 +595,7 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
         ...(patch.displayName !== undefined ? { displayName: patch.displayName || null } : {}),
         ...(patch.roleKey !== undefined ? { roleKey: nextRoleKey, role: roleKeyToLegacy(nextRoleKey) } : {}),
         ...(creatorScope ? { assignedCreators: creatorScope.value } : {}),
+        ...((patch.roleKey !== undefined || creatorScope) ? { accessEpoch: { increment: 1 } } : {}),
       },
     });
     if (liveOwnerDemoted) {
@@ -562,6 +620,19 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
   });
 
   const after = memberToClient(updated);
+  if (patch.roleKey !== undefined || creatorScope) {
+    const beforeAccess = await accessibleCreatorIdsForMember({ db, agencyId, member: target });
+    const afterAccess = await accessibleCreatorIdsForMember({ db, agencyId, member: updated });
+    const afterSet = new Set(afterAccess);
+    publishTargetedCreatorRevokes({
+      agencyId,
+      creatorIds: beforeAccess.filter((creatorId) => !afterSet.has(creatorId)),
+      member: updated,
+      reason: "CREATOR_ACCESS_REMOVED",
+      sourceDeviceId: actorDeviceId,
+    });
+    publishMemberAccessEpoch({ agencyId, member: updated, sourceDeviceId: actorDeviceId });
+  }
   await audit({
     agencyId,
     actorUserId: actorId,
@@ -596,7 +667,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
   if (status === "deactivated") await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
 
   const deactivatedAt = status === "deactivated" ? new Date() : null;
-  await serializableTeamTransaction(db, async (tx) => {
+  const statusMutation = await serializableTeamTransaction(db, async (tx) => {
     const liveActor = requireLiveTeamActor(await tx.agencyMember.findFirst({ where: { id: actorMember?.id, agencyId, deletedAt: null } }));
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
@@ -608,7 +679,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
         tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
       });
     }
-    await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deactivatedAt } });
+    const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deactivatedAt, accessEpoch: { increment: 1 } } });
     if (status === "deactivated") {
       await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deactivatedAt });
       await tx.refreshSession.updateMany({
@@ -616,7 +687,13 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
         data: { revokedAt: new Date() },
       });
     }
+    return updatedMember || { ...liveTarget, deactivatedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
   });
+  if (status === "deactivated") {
+    const revokedCreatorIds = await accessibleCreatorIdsForMember({ db, agencyId, member: target });
+    publishTargetedCreatorRevokes({ agencyId, creatorIds: revokedCreatorIds, member: target, reason: "MEMBER_DEACTIVATED", sourceDeviceId: actorDeviceId });
+  }
+  publishMemberAccessEpoch({ agencyId, member: statusMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
   await audit({
     agencyId,
     actorUserId: actorId,
@@ -646,7 +723,7 @@ async function removeMember({ agencyId, memberId, actorMember, actorUserId: acto
   }
   await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
   const deletedAt = new Date();
-  await serializableTeamTransaction(db, async (tx) => {
+  const removalMutation = await serializableTeamTransaction(db, async (tx) => {
     const liveActor = requireLiveTeamActor(await tx.agencyMember.findFirst({ where: { id: actorMember?.id, agencyId, deletedAt: null } }));
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
@@ -658,10 +735,14 @@ async function removeMember({ agencyId, memberId, actorMember, actorUserId: acto
         tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
       });
     }
-    await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deletedAt, deactivatedAt: deletedAt } });
+    const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deletedAt, deactivatedAt: deletedAt, accessEpoch: { increment: 1 } } });
     await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deletedAt });
     await tx.refreshSession.updateMany({ where: { userId: liveTarget.userId, agencyId, revokedAt: null }, data: { revokedAt: deletedAt } });
+    return updatedMember || { ...liveTarget, deletedAt, deactivatedAt: deletedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
   });
+  const revokedCreatorIds = await accessibleCreatorIdsForMember({ db, agencyId, member: target });
+  publishTargetedCreatorRevokes({ agencyId, creatorIds: revokedCreatorIds, member: target, reason: "MEMBER_REMOVED", sourceDeviceId: actorDeviceId });
+  publishMemberAccessEpoch({ agencyId, member: removalMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
   await audit({
     agencyId,
     actorUserId: actorId,

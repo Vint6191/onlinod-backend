@@ -36,6 +36,7 @@ const { ensureAutomaticFollowAutomation } = require("./follow-automation-service
 const { ensureAutomaticSfs } = require("./sfs-service");
 const { reconcileExpiredBillingStates } = require("./billing-entitlement-service");
 const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
+const { publishDesktopControlEvent } = require("./desktop-control-events");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -54,6 +55,22 @@ const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin settin
 const TEAM_MONEY_BACKFILL_BATCH_SIZE = 250; // DB-only historical reconciliation, no OF requests
 const TEAM_PENDING_BACKFILL_BATCH_SIZE = 500; // DB-only Team queue projection repair
 let lastRetentionSweepAt = 0;
+
+function publishJobAvailable({ agencyId, creatorId = null, jobId, jobKind }) {
+  if (!agencyId || !jobId) return;
+  try {
+    publishDesktopControlEvent({
+      type: "JOB_AVAILABLE",
+      agencyId,
+      creatorId,
+      jobId,
+      jobKind,
+    });
+  } catch (error) {
+    console.error("[scheduler/control-job-available] failed:", error);
+  }
+}
+
 
 async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) {
   let retentionWindowMs = RETENTION_SWEEP_WINDOW_MS;
@@ -322,7 +339,10 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
     skipDuplicates: true,
   });
   const stored = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
-  if (inserted.count > 0) return { created: true, jobId: stored?.id || null };
+  if (inserted.count > 0) {
+    if (stored?.id) publishJobAvailable({ agencyId, creatorId, jobId: stored.id, jobKind: jobKey });
+    return { created: true, jobId: stored?.id || null };
+  }
   return { created: false, reason: "idempotency_race", jobId: stored?.id || null };
 }
 
@@ -375,6 +395,7 @@ async function scheduleJobNow({
       });
       if (!reset.count) continue;
       const job = await prisma.jobInstance.findUnique({ where: { id: existing.id } });
+      if (job?.id) publishJobAvailable({ agencyId, creatorId, jobId: job.id, jobKind: jobKey });
       return { job, created: false, reason: "rescheduled" };
     }
 
@@ -396,6 +417,7 @@ async function scheduleJobNow({
     if (inserted.count > 0) {
       const job = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
       if (!job) throw new Error(`Failed to read newly scheduled ${jobKey}`);
+      publishJobAvailable({ agencyId, creatorId, jobId: job.id, jobKind: jobKey });
       return { job, created: true, reason: "created" };
     }
   }

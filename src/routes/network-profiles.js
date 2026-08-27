@@ -7,6 +7,7 @@ const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { creatorManagementRequired } = require("../middleware/creator-management-permissions");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
+const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const {
   createProxyEndpoint,
   createProxyForCreator,
@@ -108,6 +109,21 @@ async function creatorAccess(req, creatorId) {
   });
 }
 
+function publishNetworkHint(req, creatorId, networkVersion) {
+  try {
+    publishDesktopControlEvent({
+      type: "NETWORK_REVISION_CHANGED",
+      agencyId: req.auth.agencyId,
+      creatorId,
+      networkVersion,
+      sourceDeviceId: req.auth?.deviceId || null,
+      requestId: req.headers?.["x-request-id"] || null,
+    });
+  } catch (error) {
+    console.error("[network-profiles/control-hint] failed:", error);
+  }
+}
+
 async function registeredDevice(req, rawDeviceId) {
   const parsedDeviceId = deviceIdSchema.parse(rawDeviceId);
   const boundDeviceId = requireAuthDevice(req, parsedDeviceId, {
@@ -175,6 +191,14 @@ router.patch("/proxies/:proxyId", creatorManagementRequired, async (req, res) =>
       targetId: result.proxy.id,
       metadata: { version: result.proxy.version, runtimeChanged: result.runtimeChanged },
     });
+    if (result.runtimeChanged) {
+      const affected = await prisma.creatorNetworkProfile.findMany({
+        where: { agencyId: req.auth.agencyId, proxyEndpointId: result.proxy.id, mode: "PROXY" },
+        select: { creatorId: true, version: true },
+        take: 10000,
+      });
+      for (const profile of affected) publishNetworkHint(req, profile.creatorId, profile.version);
+    }
     return res.json({ ok: true, proxy: result.proxy, unchanged: result.unchanged, runtimeChanged: result.runtimeChanged });
   } catch (error) {
     return sendError(res, error, "PROXY_UPDATE_FAILED");
@@ -289,6 +313,7 @@ router.post("/creators/:creatorId/proxy", creatorManagementRequired, async (req,
       targetId: creator.id,
       metadata: { creatorId: creator.id, proxyEndpointId: result.proxy.id, networkVersion: result.profile.version, encryptionMode: result.proxy.encryptionMode },
     });
+    publishNetworkHint(req, creator.id, result.profile.version);
     return res.status(201).json({ ok: true, proxy: result.proxy, profile: result.profile });
   } catch (error) {
     return sendError(res, error, "CREATOR_PROXY_CREATE_FAILED");
@@ -317,6 +342,7 @@ router.put("/creators/:creatorId", creatorManagementRequired, async (req, res) =
       targetId: creator.id,
       metadata: { creatorId: creator.id, mode: result.profile.mode, proxyEndpointId: result.profile.proxyEndpointId, version: result.profile.version },
     });
+    if (!result.unchanged) publishNetworkHint(req, creator.id, result.profile.version);
     return res.json({ ok: true, ...result });
   } catch (error) {
     return sendError(res, error, "CREATOR_NETWORK_UPDATE_FAILED");
