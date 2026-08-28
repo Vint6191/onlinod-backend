@@ -39,10 +39,10 @@ function randomBetween(min, max) { const lo = Math.max(0, int(min)); const hi = 
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
 function monthStart(date = new Date()) { return new Date(date.getFullYear(), date.getMonth(), 1); }
 
-async function readyWorkerCount({ agencyId, creatorId, db = prisma }) {
+async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   const freshAfter = new Date(Date.now() - 2 * 60_000);
   return db.deviceCreatorBinding.count({
-    where: { agencyId, creatorId, status: "ACTIVE", lastSeenAt: { gte: freshAfter }, device: { lastSeenAt: { gte: freshAfter } } },
+    where: { agencyId, creatorId, status: "ACTIVE", sessionWriteReady: true, lastSeenAt: { gte: freshAfter }, device: { lastSeenAt: { gte: freshAfter } } },
   });
 }
 async function withCreatorLock(db, agencyId, creatorId, fn) {
@@ -57,7 +57,6 @@ async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force 
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: SFS_MODULE_KEY, db });
   const settings = normalizeSfsSettings(control.modules.sfs.settings);
   if (!settings.huntingEnabled) return { ok: false, created: false, reason: "hunting_disabled" };
-  if (!await readyWorkerCount({ agencyId, creatorId, db })) return { ok: false, created: false, reason: "no_ready_worker" };
   const bucketMs = settings.discoveryFreshnessHours * 60 * 60_000;
   const bucket = force ? Date.now() : Math.floor(Date.now() / bucketMs);
   const idempotencyKey = `sfs_discovery:${creatorId}:${bucket}`;
@@ -467,7 +466,7 @@ async function listSfs({ agencyId, creatorId, search = "", state = null, offset 
   const today = dayStart(); const month = monthStart();
   const [items, count, ready, discovery, metricsRows] = await Promise.all([
     db.sfsTargetCandidate.findMany({ where, orderBy: [{ updatedAt: "desc" }, { discoveredAt: "desc" }], skip, take }),
-    db.sfsTargetCandidate.count({ where }), readyWorkerCount({ agencyId, creatorId, db }),
+    db.sfsTargetCandidate.count({ where }), sessionWriteWorkerCount({ agencyId, creatorId, db }),
     db.jobInstance.findFirst({ where: { agencyId, creatorId, jobKey: { in: [SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY] } }, orderBy: { updatedAt: "desc" }, select: { id: true, jobKey: true, status: true, progress: true, lastError: true, createdAt: true, completedAt: true } }),
     Promise.all([
       db.sfsTargetCandidate.count({ where: { agencyId, creatorId } }),

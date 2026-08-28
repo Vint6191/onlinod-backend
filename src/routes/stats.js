@@ -26,6 +26,7 @@ const express = require("express");
 const crypto = require("node:crypto");
 const { z } = require("zod");
 const prisma = require("../prisma");
+const { requireAuthDevice } = require("../middleware/auth");
 const { scheduleJobNow } = require("../services/job-scheduler");
 const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-analytics-permissions");
 const { resolveEffectivePermissions } = require("../services/team-access-control");
@@ -594,6 +595,7 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         creatorId: creator.id,
         agencyId: creator.agencyId,
         status: "ACTIVE",
+        sessionReadReady: true,
         lastSeenAt: { gte: freshAfter },
         device: { lastSeenAt: { gte: freshAfter } },
       },
@@ -614,8 +616,8 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
       },
       message:
         onlineBindings === 0
-          ? "Refresh accepted, but no READY desktop binding currently sees this creator."
-          : `Refresh accepted. ${onlineBindings} READY worker binding(s) can pick up due work.`,
+          ? "Refresh accepted, but no SESSION_READ-capable desktop currently sees this creator."
+          : `Refresh accepted. ${onlineBindings} SESSION_READ-capable worker(s) can pick up due work.`,
     });
   } catch (err) {
     console.error("[stats/refresh-creator] failed:", err);
@@ -1041,23 +1043,28 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
     // the fresh creator binding. Chatter devices must not need the managerial
     // "refresh analytics" permission merely to preserve realtime facts.
     const userId = actorUserId(req);
+    const boundDeviceId = requireAuthDevice(req, input.deviceId, {
+      requiredCode: "LIVE_NOTIFICATION_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "LIVE_NOTIFICATION_DEVICE_IDENTITY_MISMATCH",
+    });
     const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
     const device = await prisma.workerDevice.findFirst({
-      where: { id: input.deviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: { gte: freshAfter } },
+      where: { id: boundDeviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: { gte: freshAfter } },
       select: { id: true },
     });
-    if (!device) return res.status(403).json({ ok: false, code: "LIVE_NOTIFICATION_DEVICE_FORBIDDEN", error: "The reporting device is not owned by this agency member" });
+    if (!device) return res.status(403).json({ ok: false, code: "LIVE_NOTIFICATION_DEVICE_FORBIDDEN", error: "The authenticated reporting device is not owned by this agency member" });
     const binding = await prisma.deviceCreatorBinding.findFirst({
       where: {
         deviceId: device.id,
         creatorId: ctx.creator.id,
         agencyId: ctx.creator.agencyId,
         status: "ACTIVE",
+        realtimeReady: true,
         lastSeenAt: { gte: freshAfter },
       },
       select: { id: true },
     });
-    if (!binding) return res.status(409).json({ ok: false, code: "LIVE_NOTIFICATION_CREATOR_NOT_READY", error: "The reporting device has no fresh READY binding for this creator" });
+    if (!binding) return res.status(409).json({ ok: false, code: "LIVE_NOTIFICATION_REALTIME_UNAVAILABLE", error: "The authenticated reporting device has no fresh REALTIME capability for this creator" });
 
     const grouped = new Map();
     const dates = [];
@@ -1128,12 +1135,16 @@ router.post("/creators/:creatorId/messages-daily", async (req, res) => {
     if (!ctx) return;
     if (!requireRefreshPermission(res, ctx.member)) return;
     const userId = actorUserId(req);
+    const boundDeviceId = requireAuthDevice(req, input.deviceId, {
+      requiredCode: "MESSAGES_DAILY_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "MESSAGES_DAILY_DEVICE_IDENTITY_MISMATCH",
+    });
     const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
     const device = await prisma.workerDevice.findFirst({
-      where: { id: input.deviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: { gte: freshAfter } },
+      where: { id: boundDeviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: { gte: freshAfter } },
       select: { id: true, lastSeenAt: true },
     });
-    if (!device) return res.status(403).json({ ok: false, code: "MESSAGES_DAILY_DEVICE_FORBIDDEN", error: "The reporting device is not owned by this agency member" });
+    if (!device) return res.status(403).json({ ok: false, code: "MESSAGES_DAILY_DEVICE_FORBIDDEN", error: "The authenticated reporting device is not owned by this agency member" });
     const binding = await prisma.deviceCreatorBinding.findFirst({
       where: {
         deviceId: device.id,
@@ -1144,7 +1155,7 @@ router.post("/creators/:creatorId/messages-daily", async (req, res) => {
       },
       select: { id: true },
     });
-    if (!binding) return res.status(409).json({ ok: false, code: "MESSAGES_DAILY_CREATOR_NOT_READY", error: "The reporting device has no fresh READY binding for this creator" });
+    if (!binding) return res.status(409).json({ ok: false, code: "MESSAGES_DAILY_CREATOR_NOT_PRESENT", error: "The authenticated reporting device has no fresh creator presence for this creator" });
     const rows = input.rows.map((row) => ({ ...row, sourceTimezone: input.sourceTimezone }));
     const result = await upsertMessagesDaily({
       agencyId: ctx.creator.agencyId,

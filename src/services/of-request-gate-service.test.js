@@ -24,7 +24,7 @@ function databaseFixture(accessCalls) {
       },
     },
     creatorAccount: {
-      findFirst: async () => { accessCalls.creator += 1; return { id: "creator-1" }; },
+      findFirst: async () => { accessCalls.creator += 1; return { id: "creator-1", status: "READY" }; },
     },
     deviceCreatorBinding: {
       findFirst: async () => { accessCalls.binding += 1; return { id: "binding-1" }; },
@@ -36,6 +36,8 @@ function databaseFixture(accessCalls) {
 async function started(service, deviceId, permitId) {
   return service.acknowledgeOfRequestStarted({
     userId: "user-1",
+    agencyId: "agency-1",
+    member: { role: "OWNER", assignedCreators: "all" },
     deviceId,
     creatorId: "creator-1",
     permitId,
@@ -48,11 +50,11 @@ test("global OF gate prioritizes writes and spaces actual starts by 700ms withou
   service._test.reset();
 
   const backgroundPromise = service.acquireOfRequestSlot({
-    userId: "user-1", deviceId: "device-background", creatorId: "creator-1",
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-background", creatorId: "creator-1",
     priority: "background", operation: "dialog.scan", timeoutMs: 5_000,
   });
   const writePromise = service.acquireOfRequestSlot({
-    userId: "user-1", deviceId: "device-write", creatorId: "creator-1",
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-write", creatorId: "creator-1",
     priority: "critical_write", operation: "bump.send", timeoutMs: 5_000,
   });
 
@@ -73,24 +75,45 @@ test("global OF gate prioritizes writes and spaces actual starts by 700ms withou
   assert.equal(service.getOfRequestGateSnapshot().coordinator, "single_backend_process_memory_two_phase");
 });
 
-test("gate caches device/creator access validation for acquire and started acknowledgement", async () => {
+test("gate rechecks member creator access while caching only device capability validation", async () => {
   const accessCalls = { device: 0, creator: 0, binding: 0 };
   const service = loadService({ db: databaseFixture(accessCalls) });
   service._test.reset();
 
   const permitOne = await service.acquireOfRequestSlot({
-    userId: "user-1", deviceId: "device-1", creatorId: "creator-1",
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-1", creatorId: "creator-1",
     priority: "normal", operation: "one", timeoutMs: 5_000,
   });
   await started(service, "device-1", permitOne.permitId);
 
   const permitTwo = await service.acquireOfRequestSlot({
-    userId: "user-1", deviceId: "device-1", creatorId: "creator-1",
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-1", creatorId: "creator-1",
     priority: "normal", operation: "two", timeoutMs: 5_000,
   });
   await service.cancelOfRequestPermit({
-    userId: "user-1", deviceId: "device-1", creatorId: "creator-1", permitId: permitTwo.permitId,
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-1", creatorId: "creator-1", permitId: permitTwo.permitId,
   });
 
-  assert.deepEqual(accessCalls, { device: 1, creator: 1, binding: 1 });
+  assert.deepEqual(accessCalls, { device: 1, creator: 4, binding: 1 });
+});
+
+test("gate rejects an in-agency creator that the current member is not assigned", async () => {
+  const accessCalls = { device: 0, creator: 0, binding: 0 };
+  const service = loadService({ db: databaseFixture(accessCalls) });
+  service._test.reset();
+
+  await assert.rejects(
+    () => service.acquireOfRequestSlot({
+      userId: "user-1",
+      agencyId: "agency-1",
+      member: { role: "WORKER", assignedCreators: { ids: ["creator-other"] } },
+      deviceId: "device-1",
+      creatorId: "creator-1",
+      priority: "normal",
+      operation: "forbidden",
+      timeoutMs: 5_000,
+    }),
+    (error) => error?.code === "CREATOR_ACCESS_FORBIDDEN" && error?.status === 403,
+  );
+  assert.deepEqual(accessCalls, { device: 0, creator: 1, binding: 0 });
 });

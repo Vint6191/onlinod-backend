@@ -3,6 +3,7 @@
 const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
+const { requireAuthDevice } = require("../middleware/auth");
 const {
   JobLeaseError,
   claimJob,
@@ -14,6 +15,20 @@ const {
 } = require("../services/job-lease-service");
 
 const router = express.Router();
+
+router.use((req, res, next) => {
+  const suppliedDeviceId = req.body && typeof req.body === "object" ? req.body.deviceId : null;
+  if (suppliedDeviceId === undefined || suppliedDeviceId === null) return next();
+  try {
+    requireAuthDevice(req, suppliedDeviceId, {
+      requiredCode: "JOB_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "JOB_DEVICE_IDENTITY_MISMATCH",
+    });
+    return next();
+  } catch (error) {
+    return res.status(Number(error.status) || 403).json({ ok: false, code: error.code || "JOB_DEVICE_FORBIDDEN", error: error.message || "Job device identity mismatch" });
+  }
+});
 
 function actorUserId(req) {
   return req.auth?.userId || req.user?.id || null;

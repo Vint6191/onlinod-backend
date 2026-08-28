@@ -320,6 +320,7 @@ async function countOnlineBindings(db, creator) {
       creatorId: creator.id,
       agencyId: creator.agencyId,
       status: "ACTIVE",
+      sessionReadReady: true,
       lastSeenAt: { gte: freshAfter },
       device: { lastSeenAt: { gte: freshAfter } },
     },

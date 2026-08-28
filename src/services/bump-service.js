@@ -36,11 +36,11 @@ function sourcePriority(source, manual = false) {
   return 45;
 }
 
-async function readyWorkerCount({ agencyId, creatorId, db = prisma }) {
+async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   const freshAfter = new Date(Date.now() - 2 * 60_000);
   return db.deviceCreatorBinding.count({
     where: {
-      agencyId, creatorId, status: "ACTIVE", lastSeenAt: { gte: freshAfter },
+      agencyId, creatorId, status: "ACTIVE", sessionWriteReady: true, lastSeenAt: { gte: freshAfter },
       device: { agencyId, lastSeenAt: { gte: freshAfter } },
     },
   });
@@ -755,11 +755,11 @@ async function planConfiguredBumpSources({
   }
   const settings = control.modules.bumps.settings;
   if (requireAutomatic && !settings.automatic) {
-    return { ok: true, created: false, reason: "automatic_disabled", planned: 0, sources: [], readyDevices: await readyWorkerCount({ agencyId, creatorId, db }), skipCounts: { automatic_disabled: 1 } };
+    return { ok: true, created: false, reason: "automatic_disabled", planned: 0, sources: [], readyDevices: await sessionWriteWorkerCount({ agencyId, creatorId, db }), skipCounts: { automatic_disabled: 1 } };
   }
   const requested = configuredSnapshotSources(settings);
   if (!requested.length) {
-    return { ok: true, created: false, reason: "no_sources_enabled", planned: 0, sources: [], readyDevices: await readyWorkerCount({ agencyId, creatorId, db }), skipCounts: { no_sources_enabled: 1 } };
+    return { ok: true, created: false, reason: "no_sources_enabled", planned: 0, sources: [], readyDevices: await sessionWriteWorkerCount({ agencyId, creatorId, db }), skipCounts: { no_sources_enabled: 1 } };
   }
 
   const sources = [];
@@ -778,7 +778,7 @@ async function planConfiguredBumpSources({
     }
   }
   const skipCounts = summarizePlanningSkips(sources);
-  const readyDevices = await readyWorkerCount({ agencyId, creatorId, db });
+  const readyDevices = await sessionWriteWorkerCount({ agencyId, creatorId, db });
   const firstFailure = Object.keys(skipCounts)[0] || null;
   return {
     ok: true, created: planned > 0,
@@ -811,7 +811,7 @@ async function getBumpOverview({ agencyId, creatorId, db = prisma }) {
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: "FAILED", updatedAt: { gte: dayStart(now) } } }),
     db.bumpDeliveryStat.aggregate({ where: { agencyId, creatorId }, _sum: { replied: true } }),
     db.bumpDeliveryStat.aggregate({ where: { agencyId, creatorId }, _sum: { canceled: true } }),
-    readyWorkerCount({ agencyId, creatorId, db }),
+    sessionWriteWorkerCount({ agencyId, creatorId, db }),
   ]);
 
   const templateCounts = {};

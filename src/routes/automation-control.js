@@ -3,6 +3,7 @@
 const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
+const { requireAuthDevice } = require("../middleware/auth");
 const { canUsePermission } = require("../services/team-access-control");
 const { automationCreatorParamRequired, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { attachAutomationAudit } = require("../middleware/automation-audit");
@@ -63,6 +64,20 @@ const {
 } = require("../services/follow-automation-service");
 
 const router = express.Router();
+
+router.use((req, res, next) => {
+  const suppliedDeviceId = req.body && typeof req.body === "object" ? req.body.deviceId : null;
+  if (suppliedDeviceId === undefined || suppliedDeviceId === null) return next();
+  try {
+    requireAuthDevice(req, suppliedDeviceId, {
+      requiredCode: "AUTOMATION_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "AUTOMATION_DEVICE_IDENTITY_MISMATCH",
+    });
+    return next();
+  } catch (error) {
+    return res.status(Number(error.status) || 403).json({ ok: false, code: error.code || "AUTOMATION_DEVICE_FORBIDDEN", error: error.message || "Automation device identity mismatch" });
+  }
+});
 attachAutomationAudit(router);
 router.param("creatorId", automationCreatorParamRequired());
 
@@ -429,6 +444,7 @@ router.post("/bumps/:creatorId/events", seniorRequired, async (req, res) => {
         creatorId: req.params.creatorId,
         deviceId: input.deviceId,
         status: "ACTIVE",
+        realtimeReady: true,
         lastSeenAt: { gte: freshAfter },
         device: { agencyId: req.auth.agencyId, userId: req.auth.userId, lastSeenAt: { gte: freshAfter } },
       },

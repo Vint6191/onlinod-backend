@@ -206,14 +206,15 @@ async function scopedCreatorIds({ userId, device }) {
       agencyId: device.agencyId,
       deviceId: device.id,
       status: "ACTIVE",
+      sessionReadReady: true,
       lastSeenAt: { gte: freshAfter },
       creatorId: { in: visibleIds },
     },
     select: { creatorId: true },
     take: 10000,
   });
-  // A device may claim work only for creators it advertised as READY in a
-  // recent heartbeat. Role visibility is necessary, but never sufficient.
+  // A device may claim read jobs only for creators with fresh SESSION_READ
+  // capability telemetry. Current member access is checked independently above.
   return bindings.map((item) => item.creatorId);
 }
 function notificationJobMode(params) {

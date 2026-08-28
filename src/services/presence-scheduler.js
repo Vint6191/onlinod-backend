@@ -26,6 +26,7 @@ async function runPresenceSweep() {
   const bindings = await prisma.deviceCreatorBinding.findMany({
     where: {
       status: "ACTIVE",
+      sessionReadReady: true,
       lastSeenAt: { gte: activeSince },
       creator: { status: "READY", deletedAt: null, agency: { deletedAt: null } },
       device: { lastSeenAt: { gte: activeSince } },

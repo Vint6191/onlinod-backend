@@ -31,11 +31,11 @@ function randomBetween(min, max) {
 }
 function future(ms, now = new Date()) { return new Date(now.getTime() + Math.max(0, Number(ms) || 0)); }
 
-async function readyWorkerCount({ agencyId, creatorId, db = prisma }) {
+async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   const freshAfter = new Date(Date.now() - 2 * 60_000);
   return db.deviceCreatorBinding.count({
     where: {
-      agencyId, creatorId, status: "ACTIVE", lastSeenAt: { gte: freshAfter },
+      agencyId, creatorId, status: "ACTIVE", sessionWriteReady: true, lastSeenAt: { gte: freshAfter },
       device: { lastSeenAt: { gte: freshAfter } },
     },
   });
@@ -176,7 +176,7 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
   let capacity = Math.max(0, settings.dailyLimit - completedToday - activeCycles);
   const summary = {
     scanned: 0, created: 0, existing: 0, skipped: {}, dailyLimit: settings.dailyLimit,
-    completedToday, activeCycles, workerCount: await readyWorkerCount({ agencyId, creatorId, db }),
+    completedToday, activeCycles, workerCount: await sessionWriteWorkerCount({ agencyId, creatorId, db }),
   };
   const skip = (code) => { summary.skipped[code] = (summary.skipped[code] || 0) + 1; };
   let cursorId = null;
@@ -456,7 +456,7 @@ async function listFollowAutomation({ agencyId, creatorId, search = "", state = 
   const [items, count, readyDevices, metrics] = await Promise.all([
     db.followAutomationCandidate.findMany({ where, orderBy: [{ updatedAt: "desc" }, { discoveredAt: "desc" }], skip, take }),
     db.followAutomationCandidate.count({ where }),
-    readyWorkerCount({ agencyId, creatorId, db }),
+    sessionWriteWorkerCount({ agencyId, creatorId, db }),
     Promise.all([
       db.followAutomationCandidate.count({ where: { agencyId, creatorId } }),
       db.followAutomationCandidate.count({ where: { agencyId, creatorId, state: "CANDIDATE" } }),

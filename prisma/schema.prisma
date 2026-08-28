@@ -2392,16 +2392,27 @@ model ImpersonationToken {
 }
 
 model DeviceCreatorBinding {
-  id        String   @id @default(cuid())
-  deviceId  String
-  creatorId String
-  agencyId  String
-  status    String   @default("ACTIVE")
-  remoteId  String?
-  username  String?
-  lastSeenAt DateTime?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                  String   @id @default(cuid())
+  deviceId            String
+  creatorId           String
+  agencyId            String
+  status              String   @default("ACTIVE")
+  remoteId            String?
+  username            String?
+  accessEpoch         Int?
+  sessionReadReady    Boolean  @default(false)
+  sessionWriteReady   Boolean  @default(false)
+  realtimeReady       Boolean  @default(false)
+  pageLocalReady      Boolean  @default(false)
+  browserMaterialized Boolean  @default(false)
+  browserPresentable  Boolean  @default(false)
+  sessionProofEpoch   Int?
+  canonicalRevision   Int?
+  networkRevision     Int?
+  lastCapabilityAt    DateTime?
+  lastSeenAt          DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
 
   device  WorkerDevice   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
@@ -2411,6 +2422,8 @@ model DeviceCreatorBinding {
   @@index([agencyId])
   @@index([creatorId])
   @@index([lastSeenAt])
+  @@index([deviceId, sessionReadReady, lastSeenAt])
+  @@index([deviceId, sessionWriteReady, lastSeenAt])
 }
 
 model TeamActivityEvent {

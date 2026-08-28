@@ -1,7 +1,7 @@
 const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
-const { authRequired } = require("../middleware/auth");
+const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { updateObservationFromHeartbeat, recordRealtimeObservationPing, realtimeFrameSampleAt } = require("../services/team-observation-service");
 const {
@@ -29,6 +29,15 @@ const heartbeatSchema = z.object({
     username: z.string().optional().nullable(),
     displayName: z.string().optional().nullable(),
     status: z.string().optional().nullable(),
+    accessEpoch: z.number().int().min(0).optional().nullable(),
+    sessionReadReady: z.boolean().optional().default(false),
+    sessionWriteReady: z.boolean().optional().default(false),
+    pageLocalReady: z.boolean().optional().default(false),
+    browserMaterialized: z.boolean().optional().default(false),
+    browserPresentable: z.boolean().optional().default(false),
+    sessionProofEpoch: z.number().int().min(0).optional().nullable(),
+    canonicalRevision: z.number().int().min(0).optional().nullable(),
+    networkRevision: z.number().int().min(0).optional().nullable(),
     runtimeReady: z.boolean().optional().default(false),
     wsConnected: z.boolean().optional().default(false),
     realtimeHealthy: z.boolean().optional().default(false),
@@ -39,7 +48,7 @@ const heartbeatSchema = z.object({
 });
 
 
-async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = new Date() }) {
+async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowedCreatorIds = null, now = new Date() }) {
   const list = Array.isArray(accounts) ? accounts : [];
   let accepted = 0;
   let rejected = 0;
@@ -48,12 +57,6 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
   const resolvedAccounts = [];
 
   for (const account of list) {
-    const status = String(account?.status || "").toUpperCase();
-    if (status && status !== "READY") {
-      rejected += 1;
-      continue;
-    }
-
     const remoteId = account?.remoteId === undefined || account?.remoteId === null ? null : String(account.remoteId);
     const username = account?.username ? String(account.username).replace(/^@/, "") : null;
     const candidateIds = [account?.creatorId, account?.backendCreatorId, account?.accountId]
@@ -71,18 +74,30 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
     }
 
     const creator = await prisma.creatorAccount.findFirst({
-      where: { agencyId, deletedAt: null, OR: or },
+      where: { agencyId, deletedAt: null, status: "READY", OR: or },
       select: { id: true },
     });
 
-    if (!creator) {
+    if (!creator || (allowedCreatorIds && !allowedCreatorIds.has(creator.id))) {
       rejected += 1;
       continue;
     }
 
-    // DeviceCreatorBinding.lastSeenAt means the Chromium/API execution context
-    // can claim work. It is not proof that WebSocket observation was healthy.
-    // Dialog recovery is therefore based only on the durable realtime
+    const sessionReadReady = account?.sessionReadReady === true;
+    const sessionWriteReady = sessionReadReady && account?.sessionWriteReady === true;
+    const realtimeReady = account?.realtimeHealthy === true;
+    const pageLocalReady = account?.pageLocalReady === true;
+    const browserMaterialized = account?.browserMaterialized === true;
+    const browserPresentable = browserMaterialized && account?.browserPresentable === true;
+    const accessEpoch = Number.isInteger(Number(account?.accessEpoch)) ? Number(account.accessEpoch) : null;
+    const sessionProofEpoch = Number.isInteger(Number(account?.sessionProofEpoch)) ? Number(account.sessionProofEpoch) : null;
+    const canonicalRevision = Number.isInteger(Number(account?.canonicalRevision)) ? Number(account.canonicalRevision) : null;
+    const networkRevision = Number.isInteger(Number(account?.networkRevision)) ? Number(account.networkRevision) : null;
+
+    // DeviceCreatorBinding is device presence plus capability telemetry. It is
+    // never creator-access authority; allowedCreatorIds was resolved from the
+    // current AgencyMember before this function was called. Realtime coverage
+    // is still based only on the durable inbound-frame observation timestamp,
     // observation timestamp, and only when a healthy listener comes back.
     const realtimeFrameAt = account?.realtimeHealthy === true
       ? realtimeFrameSampleAt(account, now)
@@ -109,12 +124,34 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
         status: "ACTIVE",
         remoteId,
         username,
+        accessEpoch,
+        sessionReadReady,
+        sessionWriteReady,
+        realtimeReady,
+        pageLocalReady,
+        browserMaterialized,
+        browserPresentable,
+        sessionProofEpoch,
+        canonicalRevision,
+        networkRevision,
+        lastCapabilityAt: now,
         lastSeenAt: now,
       },
       update: {
         status: "ACTIVE",
         remoteId,
         username,
+        accessEpoch,
+        sessionReadReady,
+        sessionWriteReady,
+        realtimeReady,
+        pageLocalReady,
+        browserMaterialized,
+        browserPresentable,
+        sessionProofEpoch,
+        canonicalRevision,
+        networkRevision,
+        lastCapabilityAt: now,
         lastSeenAt: now,
       },
     });
@@ -126,7 +163,12 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
         ...account,
         creatorId: creator.id,
         backendCreatorId: creator.id,
+        sessionReadReady,
+        sessionWriteReady,
         realtimeHealthy: Boolean(realtimeFrameAt),
+        pageLocalReady,
+        browserMaterialized,
+        browserPresentable,
         lastWsFrameAt: realtimeFrameAt?.toISOString() || null,
       },
     });
@@ -140,7 +182,15 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
       deviceId,
       ...(seenCreatorIds.length ? { creatorId: { notIn: seenCreatorIds } } : {}),
     },
-    data: { status: "STALE" },
+    data: {
+      status: "STALE",
+      sessionReadReady: false,
+      sessionWriteReady: false,
+      realtimeReady: false,
+      pageLocalReady: false,
+      browserMaterialized: false,
+      browserPresentable: false,
+    },
   });
 
   return {
@@ -155,6 +205,10 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, now = n
 router.post("/heartbeat", async (req, res) => {
   try {
     const input = heartbeatSchema.parse(req.body || {});
+    const boundDeviceId = requireAuthDevice(req, input.deviceId, {
+      requiredCode: "DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "DEVICE_IDENTITY_MISMATCH",
+    });
     const agencyId = input.agencyId || input.activeAgencyId || req.auth.agencyId;
 
     let heartbeatMembership = req.auth.membership;
@@ -168,10 +222,13 @@ router.post("/heartbeat", async (req, res) => {
       }
     }
 
+    const creatorScope = await allowedCreatorScope({ agencyId, member: heartbeatMembership });
+    const allowedCreatorIds = creatorScope.broad ? null : new Set(creatorScope.creatorIds);
+
     const device = await prisma.workerDevice.upsert({
-      where: { id: input.deviceId },
+      where: { id: boundDeviceId },
       create: {
-        id: input.deviceId,
+        id: boundDeviceId,
         agencyId,
         userId: req.auth.userId,
         deviceName: input.deviceName || null,
@@ -192,8 +249,9 @@ router.post("/heartbeat", async (req, res) => {
     const heartbeatAt = new Date();
     const bindings = await syncDeviceCreatorBindings({
       agencyId,
-      deviceId: input.deviceId,
+      deviceId: boundDeviceId,
       accounts: input.accounts,
+      allowedCreatorIds,
       now: heartbeatAt,
     });
 
@@ -236,7 +294,7 @@ router.post("/heartbeat", async (req, res) => {
       // masks a dead WebSocket.
       observation = await updateObservationFromHeartbeat({
         agencyId,
-        deviceId: input.deviceId,
+        deviceId: boundDeviceId,
         accounts: realtimeAccounts,
       });
       const realtimePings = [];
@@ -244,7 +302,7 @@ router.post("/heartbeat", async (req, res) => {
         const decision = recoveryDecisions.get(entry.creatorId) || null;
         realtimePings.push(await recordRealtimeObservationPing({
           agencyId,
-          deviceId: input.deviceId,
+          deviceId: boundDeviceId,
           account: entry.account,
           now: heartbeatAt,
           // lastRealtimeEventAt means contiguous, reconciled coverage. A live
@@ -264,7 +322,7 @@ router.post("/heartbeat", async (req, res) => {
 
     const commands = await prisma.deviceCommand.findMany({
       where: {
-        deviceId: input.deviceId,
+        deviceId: boundDeviceId,
         agencyId,
         deliveredAt: null,
       },
@@ -298,8 +356,6 @@ router.post("/heartbeat", async (req, res) => {
       .map((value) => String(value || "").trim())
       .filter(Boolean)))
       .slice(0, 10000);
-    const creatorScope = await allowedCreatorScope({ agencyId, member: heartbeatMembership });
-    const allowedCreatorIds = creatorScope.broad ? null : new Set(creatorScope.creatorIds);
     const scopedCreatorIds = allowedCreatorIds
       ? requestedCreatorIds.filter((id) => allowedCreatorIds.has(id))
       : requestedCreatorIds;
@@ -371,6 +427,9 @@ router.post("/heartbeat", async (req, res) => {
   } catch (err) {
     if (err?.issues) {
       return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
+    }
+    if (err?.status) {
+      return res.status(Number(err.status) || 403).json({ ok: false, code: err.code || "DEVICE_HEARTBEAT_FORBIDDEN", error: err.message || "Device heartbeat forbidden" });
     }
 
     console.error("[devices/heartbeat] failed:", err);

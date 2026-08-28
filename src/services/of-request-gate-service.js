@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { requireCreatorAccess } = require("../middleware/automation-permissions");
 
 // GLOBAL CREATOR REQUEST GATE
 // ---------------------------
@@ -101,29 +102,28 @@ function pruneAccessCache(now = Date.now()) {
   while (accessCache.size > 2_000) accessCache.delete(accessCache.keys().next().value);
 }
 
-async function requireGateAccess({ userId, deviceId, creatorId }) {
+async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId }) {
+  // Access is server-authoritative and intentionally checked on every request.
+  // DeviceCreatorBinding is capability telemetry only and can never grant creator access.
+  const creator = await requireCreatorAccess({ agencyId, member, creatorId, db: prisma });
+  if (creator.status !== "READY") {
+    const error = new Error("Creator is not enrolled for OnlyFans execution");
+    error.code = "OF_GATE_CREATOR_NOT_ENROLLED";
+    error.status = 409;
+    throw error;
+  }
   const key = accessKey(userId, deviceId, creatorId);
   const nowMs = Date.now();
   const cached = accessCache.get(key);
   if (cached && cached.expiresAt > nowMs) return cached.value;
 
   const device = await prisma.workerDevice.findFirst({
-    where: { id: deviceId, userId },
+    where: { id: deviceId, userId, agencyId },
     select: { id: true, agencyId: true, lastSeenAt: true },
   });
   if (!device) {
     const error = new Error("Worker device not found or does not belong to user");
     error.code = "OF_GATE_DEVICE_FORBIDDEN";
-    error.status = 403;
-    throw error;
-  }
-  const creator = await prisma.creatorAccount.findFirst({
-    where: { id: creatorId, agencyId: device.agencyId, deletedAt: null, status: "READY" },
-    select: { id: true },
-  });
-  if (!creator) {
-    const error = new Error("Creator is not available to this device agency");
-    error.code = "OF_GATE_CREATOR_FORBIDDEN";
     error.status = 403;
     throw error;
   }
@@ -134,12 +134,13 @@ async function requireGateAccess({ userId, deviceId, creatorId }) {
       deviceId: device.id,
       creatorId,
       status: "ACTIVE",
+      sessionReadReady: true,
       lastSeenAt: { gte: freshAfter },
     },
     select: { id: true },
   });
   if (!binding) {
-    const error = new Error("Device has no fresh READY binding for creator");
+    const error = new Error("Device has no fresh SESSION_READ capability for creator");
     error.code = "OF_GATE_CREATOR_CONTEXT_MISSING";
     error.status = 409;
     throw error;
@@ -262,7 +263,13 @@ async function acquireOfRequestSlot(input) {
     error.status = 400;
     throw error;
   }
-  const access = await requireGateAccess({ userId, deviceId, creatorId });
+  const access = await requireGateAccess({
+    userId,
+    agencyId: clean(input.agencyId, 200),
+    member: input.member,
+    deviceId,
+    creatorId,
+  });
   const lane = getLane(access.agencyId, creatorId);
 
   return new Promise((resolve, reject) => {
@@ -326,7 +333,13 @@ async function acknowledgeOfRequestStarted(input) {
     error.status = 400;
     throw error;
   }
-  const access = await requireGateAccess({ userId, deviceId, creatorId });
+  const access = await requireGateAccess({
+    userId,
+    agencyId: clean(input.agencyId, 200),
+    member: input.member,
+    deviceId,
+    creatorId,
+  });
   const lane = getLane(access.agencyId, creatorId);
   const permit = lane.activePermit;
   if (!permit || permit.id !== permitId || permit.deviceId !== access.deviceId) {
@@ -356,7 +369,13 @@ async function cancelOfRequestPermit(input) {
   const userId = clean(input.userId, 200);
   const permitId = clean(input.permitId, 200);
   if (!creatorId || !deviceId || !userId || !permitId) return { cancelled: false };
-  const access = await requireGateAccess({ userId, deviceId, creatorId });
+  const access = await requireGateAccess({
+    userId,
+    agencyId: clean(input.agencyId, 200),
+    member: input.member,
+    deviceId,
+    creatorId,
+  });
   const lane = getLane(access.agencyId, creatorId);
   const permit = lane.activePermit;
   if (!permit || permit.id !== permitId || permit.deviceId !== access.deviceId) return { cancelled: false };

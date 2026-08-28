@@ -68,10 +68,10 @@ function subscriptionWhere(settings) {
   ] });
   return and;
 }
-async function readyWorkerCount({ agencyId, creatorId, db = prisma }) {
+async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   const freshAfter = new Date(Date.now() - 2 * 60_000);
   return db.deviceCreatorBinding.count({
-    where: { agencyId, creatorId, status: "ACTIVE", lastSeenAt: { gte: freshAfter }, device: { lastSeenAt: { gte: freshAfter } } },
+    where: { agencyId, creatorId, status: "ACTIVE", sessionWriteReady: true, lastSeenAt: { gte: freshAfter }, device: { lastSeenAt: { gte: freshAfter } } },
   });
 }
 async function withCreatorLock(db, agencyId, creatorId, fn) {
@@ -132,8 +132,6 @@ async function scheduleLikesDiscovery({ agencyId, creatorId, userId = null, fanI
   const settings = normalizeLikesSettings(control.modules.likes.settings);
   const snapshot = await currentSnapshot({ agencyId, creatorId, db });
   if (!snapshot?.currentRunId) return { ok: false, created: false, reason: "snapshot_not_ready", jobs: [] };
-  const ready = await readyWorkerCount({ agencyId, creatorId, db });
-  if (!ready) return { ok: false, created: false, reason: "no_ready_worker", jobs: [] };
   const fans = await eligibleDiscoveryFans({ agencyId, creatorId, settings, snapshotRunId: snapshot.currentRunId, fanIds, force, maxFans, db });
   if (!fans.length) return { ok: true, created: false, reason: "discovery_fresh_or_no_fans", jobs: [] };
   const batches = chunks(fans, settings.discoveryBatchSize);
@@ -304,8 +302,6 @@ async function planLikesLocked({ db, agencyId, creatorId, userId = null, candida
   const settings = normalizeLikesSettings(control.modules.likes.settings);
   const snapshot = await currentSnapshot({ agencyId, creatorId, db });
   if (!snapshot?.currentRunId) return { ok: false, created: false, reason: "snapshot_not_ready", planned: 0, skipped: {} };
-  const ready = await readyWorkerCount({ agencyId, creatorId, db });
-  if (!ready) return { ok: false, created: false, reason: "no_ready_worker", planned: 0, skipped: { no_ready_worker: 1 } };
   const now = new Date();
   const completedToday = await db.automationDelivery.count({
     where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, actionType: LIKE_POST_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: dayStart(now) } },
@@ -514,7 +510,7 @@ async function listLikes({ agencyId, creatorId, search = "", state = null, offse
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "FAILED" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "SKIPPED" } }),
     ]),
-    readyWorkerCount({ agencyId, creatorId, db }),
+    sessionWriteWorkerCount({ agencyId, creatorId, db }),
     db.jobInstance.findFirst({ where: { agencyId, creatorId, jobKey: LIKES_DISCOVERY_JOB_KEY }, orderBy: { createdAt: "desc" }, select: { id: true, status: true, progress: true, lastError: true, createdAt: true, completedAt: true } }),
   ]);
   return {

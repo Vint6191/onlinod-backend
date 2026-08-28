@@ -2,6 +2,7 @@
 
 const express = require("express");
 const { z } = require("zod");
+const { requireAuthDevice } = require("../middleware/auth");
 const {
   acquireOfRequestSlot,
   acknowledgeOfRequestStarted,
@@ -44,9 +45,16 @@ router.post("/acquire", async (req, res, next) => {
   res.once("close", onClose);
   try {
     const input = acquireSchema.parse(req.body);
+    const deviceId = requireAuthDevice(req, input.deviceId, {
+      requiredCode: "OF_GATE_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "OF_GATE_DEVICE_IDENTITY_MISMATCH",
+    });
     const permit = await acquireOfRequestSlot({
       userId: authUserId(req),
+      agencyId: req.auth?.agencyId,
+      member: req.auth?.membership || req.member,
       ...input,
+      deviceId,
       intervalMs: DEFAULT_INTERVAL_MS,
       signal: controller.signal,
     });
@@ -65,7 +73,17 @@ router.post("/acquire", async (req, res, next) => {
 router.post("/started", async (req, res, next) => {
   try {
     const input = permitSchema.parse(req.body);
-    const started = await acknowledgeOfRequestStarted({ userId: authUserId(req), ...input });
+    const deviceId = requireAuthDevice(req, input.deviceId, {
+      requiredCode: "OF_GATE_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "OF_GATE_DEVICE_IDENTITY_MISMATCH",
+    });
+    const started = await acknowledgeOfRequestStarted({
+      userId: authUserId(req),
+      agencyId: req.auth?.agencyId,
+      member: req.auth?.membership || req.member,
+      ...input,
+      deviceId,
+    });
     return res.json({ ok: true, ...started });
   } catch (error) {
     return serviceError(res, next, error);
@@ -75,7 +93,17 @@ router.post("/started", async (req, res, next) => {
 router.post("/cancel", async (req, res, next) => {
   try {
     const input = permitSchema.parse(req.body);
-    const result = await cancelOfRequestPermit({ userId: authUserId(req), ...input });
+    const deviceId = requireAuthDevice(req, input.deviceId, {
+      requiredCode: "OF_GATE_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "OF_GATE_DEVICE_IDENTITY_MISMATCH",
+    });
+    const result = await cancelOfRequestPermit({
+      userId: authUserId(req),
+      agencyId: req.auth?.agencyId,
+      member: req.auth?.membership || req.member,
+      ...input,
+      deviceId,
+    });
     return res.json({ ok: true, ...result });
   } catch (error) {
     return serviceError(res, next, error);

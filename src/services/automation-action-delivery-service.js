@@ -154,6 +154,7 @@ async function scopedReadyCreatorIds({ userId, device }) {
       agencyId: device.agencyId,
       deviceId: device.id,
       status: "ACTIVE",
+      sessionWriteReady: true,
       lastSeenAt: { gte: freshAfter },
       creatorId: { in: ids },
     },

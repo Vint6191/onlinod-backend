@@ -62,7 +62,7 @@ async function countOnlineBindings(db, creator) {
   const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
   return db.deviceCreatorBinding.count({
     where: {
-      creatorId: creator.id, agencyId: creator.agencyId, status: "ACTIVE", lastSeenAt: { gte: freshAfter },
+      creatorId: creator.id, agencyId: creator.agencyId, status: "ACTIVE", sessionReadReady: true, lastSeenAt: { gte: freshAfter },
       device: { lastSeenAt: { gte: freshAfter } },
     },
   });

@@ -108,13 +108,14 @@ async function refreshFollowBackProjection({ db = prisma, agencyId, creatorId, r
   return { ok: true, count, runId, planned };
 }
 
-async function readyWorkerCount({ agencyId, creatorId, db = prisma }) {
+async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   const freshAfter = new Date(Date.now() - 2 * 60_000);
   return db.deviceCreatorBinding.count({
     where: {
       agencyId,
       creatorId,
       status: "ACTIVE",
+      sessionWriteReady: true,
       lastSeenAt: { gte: freshAfter },
       device: { lastSeenAt: { gte: freshAfter } },
     },
@@ -194,7 +195,7 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
     dailyLimit: settings.dailyLimit,
     completedToday,
     activeCount,
-    workerCount: await readyWorkerCount({ agencyId, creatorId, db }),
+    workerCount: await sessionWriteWorkerCount({ agencyId, creatorId, db }),
   };
   const skip = (code) => { summary.skipped[code] = (summary.skipped[code] || 0) + 1; };
 
@@ -476,7 +477,7 @@ async function listFollowBack({ agencyId, creatorId, search = "", state = null, 
     prisma.automationDelivery.count({
       where: { agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, actionType: FOLLOW_BACK_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: monthStart(now) } },
     }),
-    readyWorkerCount({ agencyId, creatorId }),
+    sessionWriteWorkerCount({ agencyId, creatorId }),
     prisma.automationDelivery.findFirst({
       where: { agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, actionType: FOLLOW_BACK_ACTION_TYPE },
       orderBy: { updatedAt: "desc" },
