@@ -11,8 +11,11 @@ ALTER TABLE "CreatorFan"
 
 UPDATE "CreatorFan"
 SET
-  "identityObservedAt" = COALESCE("identityObservedAt", "lastSeenAt"),
-  "identitySource" = COALESCE("identitySource", 'LEGACY_LAST_SEEN'),
+  -- Legacy CreatorFan never had an identity-specific clock. lastSeenAt is an
+  -- activity/event clock and may have advanced independently of the username
+  -- currently stored on the row. Do not invent identity freshness from it.
+  "identityObservedAt" = NULL,
+  "identitySource" = COALESCE("identitySource", 'LEGACY_UNCLASSIFIED'),
   "identityCompleteness" = COALESCE(
     "identityCompleteness",
     CASE
@@ -50,7 +53,7 @@ CREATE TABLE "CreatorFanRelationshipCurrent" (
   "sourceJobId" TEXT,
   "scanRunId" TEXT,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedAt" TIMESTAMP(3) NOT NULL,
   CONSTRAINT "CreatorFanRelationshipCurrent_pkey" PRIMARY KEY ("id")
 );
 
@@ -58,7 +61,7 @@ CREATE UNIQUE INDEX "CreatorFanRelationshipCurrent_creatorId_onlyFansUserId_key"
 ON "CreatorFanRelationshipCurrent"("creatorId", "onlyFansUserId");
 CREATE INDEX "CreatorFanRelationshipCurrent_agencyId_creatorId_observedAt_idx"
 ON "CreatorFanRelationshipCurrent"("agencyId", "creatorId", "observedAt");
-CREATE INDEX "CreatorFanRelationshipCurrent_creatorId_fanRecordId_idx"
+CREATE UNIQUE INDEX "CreatorFanRelationshipCurrent_creatorId_fanRecordId_key"
 ON "CreatorFanRelationshipCurrent"("creatorId", "fanRecordId");
 CREATE INDEX "CreatorFanRelationshipCurrent_sourceDeviceId_idx"
 ON "CreatorFanRelationshipCurrent"("sourceDeviceId");
@@ -140,6 +143,11 @@ ALTER TABLE "CreatorTip"
   ADD COLUMN "fanDisplayNameAtEvent" TEXT,
   ADD COLUMN "fanAvatarUrlAtEvent" TEXT;
 ALTER TABLE "CreatorSubscriptionEvent"
+  ADD COLUMN "fanOnlyFansUserIdAtEvent" TEXT,
+  ADD COLUMN "fanUsernameAtEvent" TEXT,
+  ADD COLUMN "fanDisplayNameAtEvent" TEXT,
+  ADD COLUMN "fanAvatarUrlAtEvent" TEXT;
+ALTER TABLE "CreatorPaidSubscription"
   ADD COLUMN "fanOnlyFansUserIdAtEvent" TEXT,
   ADD COLUMN "fanUsernameAtEvent" TEXT,
   ADD COLUMN "fanDisplayNameAtEvent" TEXT,

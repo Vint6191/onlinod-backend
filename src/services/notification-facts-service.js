@@ -546,6 +546,7 @@ function mergeSubscriptionFacts(current, incoming) {
     externalFanId: primary.externalFanId || secondary.externalFanId || null,
     fanUsername: primary.fanUsername || secondary.fanUsername || null,
     fanDisplayName: primary.fanDisplayName || secondary.fanDisplayName || null,
+    fanAvatarUrl: primary.fanAvatarUrl || secondary.fanAvatarUrl || null,
   };
 }
 function mergeFactDataWithExisting(model, existing, incoming) {
@@ -561,6 +562,18 @@ function mergeFactDataWithExisting(model, existing, incoming) {
     sourceDeviceId: preserveExistingSource ? existing.sourceDeviceId : incoming.sourceDeviceId,
     sourceJobId: preserveExistingSource ? existing.sourceJobId : incoming.sourceJobId,
     collectedAt: preserveExistingSource ? existing.collectedAt : incoming.collectedAt,
+    fanOnlyFansUserIdAtEvent: preserveExistingSource
+      ? (existing.fanOnlyFansUserIdAtEvent || incoming.fanOnlyFansUserIdAtEvent || null)
+      : (incoming.fanOnlyFansUserIdAtEvent || existing.fanOnlyFansUserIdAtEvent || null),
+    fanUsernameAtEvent: preserveExistingSource
+      ? (existing.fanUsernameAtEvent || incoming.fanUsernameAtEvent || null)
+      : (incoming.fanUsernameAtEvent || existing.fanUsernameAtEvent || null),
+    fanDisplayNameAtEvent: preserveExistingSource
+      ? (existing.fanDisplayNameAtEvent || incoming.fanDisplayNameAtEvent || null)
+      : (incoming.fanDisplayNameAtEvent || existing.fanDisplayNameAtEvent || null),
+    fanAvatarUrlAtEvent: preserveExistingSource
+      ? (existing.fanAvatarUrlAtEvent || incoming.fanAvatarUrlAtEvent || null)
+      : (incoming.fanAvatarUrlAtEvent || existing.fanAvatarUrlAtEvent || null),
   };
 }
 function buildFactData({ fact, job, deviceId, fanIds, now }) {
@@ -605,6 +618,7 @@ async function resolveFans(tx, { agencyId, creatorId, facts, now }) {
       onlyFansUserId: fact.externalFanId,
       username: fact.fanUsername,
       platformDisplayName: fact.fanDisplayName,
+      avatarUrl: fact.fanAvatarUrl,
       observedAt: fact.occurredAt,
       activityObservedAt: fact.occurredAt,
       source: "LIVE_NOTIFICATION",

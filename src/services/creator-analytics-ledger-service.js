@@ -668,6 +668,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         onlyFansUserId: claimer.onlyFansUserId,
         username: claimer.username,
         platformDisplayName: claimer.displayName,
+        avatarUrl: claimer.avatarUrl,
         observedAt: seenAt,
         activityObservedAt: seenAt,
         source: "CAMPAIGN_CLAIMER",
@@ -761,6 +762,8 @@ function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
     available: true, observedAt, onlyFansUserId, values, lastActivityAt,
     username: text(item.username, 200),
     displayName: text(item.displayName, 500),
+    avatarUrl: text(item.avatarUrl, 1200),
+    headerUrl: text(item.headerUrl, 1200),
     identitySource: text(item.identitySource, 80) || "USER_PROFILE",
     valueSource: text(item.valueSource ?? item.source, 80) || "USER_PROFILE",
   };
@@ -774,6 +777,8 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }) 
     onlyFansUserId: item.onlyFansUserId,
     username: item.username,
     platformDisplayName: item.displayName,
+    avatarUrl: item.avatarUrl,
+    headerUrl: item.headerUrl,
     observedAt: item.observedAt,
     source: item.identitySource || "USER_PROFILE",
   });

@@ -1560,8 +1560,8 @@ model CreatorFanRelationshipCurrent {
   sourceJob    JobInstance?   @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
 
   @@unique([creatorId, onlyFansUserId])
+  @@unique([creatorId, fanRecordId], map: "CreatorFanRelationshipCurrent_creatorId_fanRecordId_key")
   @@index([agencyId, creatorId, observedAt])
-  @@index([creatorId, fanRecordId])
   @@index([sourceDeviceId])
   @@index([sourceJobId])
 }
@@ -1592,9 +1592,9 @@ model CreatorFanValueCurrent {
   sourceDevice WorkerDevice?   @relation("CreatorFanValueCurrentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
 
-  @@unique([creatorId, fanRecordId])
-  @@index([agencyId, creatorId, valueObservedAt])
-  @@index([creatorId, platformReportedTotalSpendCents])
+  @@unique([creatorId, fanRecordId], map: "CreatorFanValueCurrent_creatorId_fanId_key")
+  @@index([agencyId, creatorId, valueObservedAt], map: "CreatorFanValueCurrent_agencyId_creatorId_fetchedAt_idx")
+  @@index([creatorId, platformReportedTotalSpendCents], map: "CreatorFanValueCurrent_creatorId_totalNetCents_idx")
   @@index([sourceDeviceId])
   @@index([sourceJobId])
 }

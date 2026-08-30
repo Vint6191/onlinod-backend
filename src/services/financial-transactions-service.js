@@ -155,6 +155,7 @@ async function resolveFan(tx, job, row, now) {
     onlyFansUserId: row.fanOnlyFansUserId,
     username: row.fanUsername,
     platformDisplayName: row.fanDisplayName,
+    avatarUrl: row.fanAvatarUrl,
     observedAt: row.occurredAt,
     activityObservedAt: row.occurredAt,
     source: "FINANCIAL_TRANSACTION",

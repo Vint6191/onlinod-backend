@@ -114,11 +114,23 @@ test("older value observation cannot roll current value backward", async () => {
   assert.equal(tx.value.platformReportedTotalSpendCents, 20000n);
 });
 
+test("legacy CreatorFan migration does not invent identity freshness from lastSeenAt", () => {
+  const migration = read("prisma/migrations/20260830160000_fan_data_authority_cutover/migration.sql");
+  assert.match(migration, /"identityObservedAt"\s*=\s*NULL/);
+  assert.match(migration, /LEGACY_UNCLASSIFIED/);
+  assert.doesNotMatch(migration, /"identityObservedAt"\s*=\s*COALESCE\(\s*"identityObservedAt"\s*,\s*"lastSeenAt"/);
+  assert.match(migration, /"lastActivityObservedAt"\s*=\s*COALESCE\(\s*"lastActivityObservedAt"\s*,\s*"lastSeenAt"/);
+});
+
 test("schema establishes separate identity relationship and value clocks with explicit ids", () => {
   const schema = read("prisma/schema.prisma");
   assert.match(schema, /model CreatorFan[\s\S]*identityObservedAt\s+DateTime\?/);
   assert.match(schema, /@@index\(\[creatorId, identityObservedAt\], map: "CreatorFan_creatorId_identityObservedAt_idx"\)/);
   assert.match(schema, /model CreatorFanRelationshipCurrent[\s\S]*fanRecordId\s+String[\s\S]*onlyFansUserId\s+String[\s\S]*observedAt\s+DateTime/);
+  const relationshipModel = schema.match(/model CreatorFanRelationshipCurrent \{[\s\S]*?\n\}/)?.[0] || "";
+  assert.match(relationshipModel, /@@unique\(\[creatorId, fanRecordId\], map: "CreatorFanRelationshipCurrent_creatorId_fanRecordId_key"\)/);
+  const migration = read("prisma/migrations/20260830160000_fan_data_authority_cutover/migration.sql");
+  assert.match(migration, /CREATE UNIQUE INDEX "CreatorFanRelationshipCurrent_creatorId_fanRecordId_key"[\s\S]*ON "CreatorFanRelationshipCurrent"\("creatorId", "fanRecordId"\)/);
   const valueModel = schema.match(/model CreatorFanValueCurrent \{[\s\S]*?\n\}/)?.[0] || "";
   assert.match(valueModel, /fanRecordId\s+String\s+@map\("fanId"\)/);
   assert.match(valueModel, /availability\s+String/);
@@ -143,6 +155,12 @@ test("event and campaign writers use canonical identity projector rather than di
   ].map(read).join("\n");
   assert.match(files, /projectFanIdentity/);
   assert.doesNotMatch(files, /creatorFan\.(?:update|upsert|create)\s*\(/);
+  const financial = read("src/services/financial-transactions-service.js");
+  const notifications = read("src/services/notification-facts-service.js");
+  const campaign = read("src/services/creator-analytics-ledger-service.js");
+  assert.match(financial, /avatarUrl:\s*row\.fanAvatarUrl/);
+  assert.match(notifications, /avatarUrl:\s*fact\.fanAvatarUrl/);
+  assert.match(campaign, /avatarUrl:\s*claimer\.avatarUrl/);
 });
 
 test("subscriber baseline feeds canonical projectors and generic isActive is not relationship truth", () => {
@@ -180,7 +198,7 @@ test("historical event actor snapshots remain explicit while current identity ad
   const financial = read("src/services/financial-transactions-service.js");
   const notifications = read("src/services/notification-facts-service.js");
   const campaign = read("src/services/creator-analytics-ledger-service.js");
-  for (const model of ["CreatorFinancialTransaction", "CreatorSale", "CreatorTip", "CreatorSubscriptionEvent", "CreatorPostLike", "CreatorPostComment"]) {
+  for (const model of ["CreatorFinancialTransaction", "CreatorSale", "CreatorTip", "CreatorSubscriptionEvent", "CreatorPaidSubscription", "CreatorPostLike", "CreatorPostComment"]) {
     const body = schema.match(new RegExp(`model ${model} \\{[\\s\\S]*?\\n\\}`))?.[0] || "";
     assert.match(body, /fanUsernameAtEvent/);
     assert.match(body, /fanDisplayNameAtEvent/);
@@ -190,6 +208,13 @@ test("historical event actor snapshots remain explicit while current identity ad
   assert.match(financial, /fanUsernameAtEvent:\s*row\.fanUsername/);
   assert.match(notifications, /fanUsernameAtEvent:\s*fact\.fanUsername/);
   assert.match(campaign, /claimerUsernameAtEvent:\s*claimer\.username/);
+  const projection = read("src/services/creator-analytics-projection-service.js");
+  assert.match(projection, /fanOnlyFansUserIdAtEvent:\s*event\.fanOnlyFansUserIdAtEvent/);
+  assert.match(projection, /fanUsernameAtEvent:\s*event\.fanUsernameAtEvent/);
+  assert.match(projection, /fanDisplayNameAtEvent:\s*event\.fanDisplayNameAtEvent/);
+  assert.match(projection, /fanAvatarUrlAtEvent:\s*event\.fanAvatarUrlAtEvent/);
+  const migration = read("prisma/migrations/20260830160000_fan_data_authority_cutover/migration.sql");
+  assert.match(migration, /ALTER TABLE "CreatorPaidSubscription"[\s\S]*ADD COLUMN "fanOnlyFansUserIdAtEvent"[\s\S]*ADD COLUMN "fanAvatarUrlAtEvent"/);
 });
 
 
@@ -198,6 +223,8 @@ test("campaign current value read model preserves unknown instead of coercing it
   assert.match(ledger, /availability:\s*valueCurrent\.availability/);
   assert.match(ledger, /platformReportedTotalSpendCents:\s*valueCurrent\.platformReportedTotalSpendCents == null \? null/);
   assert.doesNotMatch(ledger, /totalNetCents:\s*Number\(valueCurrent\.platformReportedTotalSpendCents \|\| 0\)/);
+  assert.match(ledger, /avatarUrl:\s*text\(item\.avatarUrl, 1200\)/);
+  assert.match(ledger, /headerUrl:\s*text\(item\.headerUrl, 1200\)/);
 });
 
 
