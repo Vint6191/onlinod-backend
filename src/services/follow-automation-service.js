@@ -19,6 +19,7 @@ const {
   refollowUnfollowKey,
   refollowFollowKey,
 } = require("./follow-automation-rules");
+const { readFanCurrent } = require("./fan-data-authority-service");
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
@@ -62,32 +63,30 @@ async function refreshFollowAutomationProjection({ db = prisma, agencyId, creato
     )
     SELECT
       'follow_auto_' || md5(i."creatorId" || ':' || i."fanId"), i."agencyId", i."creatorId", i."fanId",
-      i."dialogId", i."username", i."name", i."avatarUrl", i."subscriptionType", i."isActive", i."subscribedBy", i."subscribedOn",
-      CASE WHEN jsonb_typeof(i."metadata"->'subscribePriceCents') = 'number'
-        THEN GREATEST(0, (i."metadata"->>'subscribePriceCents')::integer) ELSE 0 END,
-      COALESCE((i."metadata"->>'ofBlocked')::boolean, false),
-      COALESCE((i."metadata"->>'restricted')::boolean, false),
-      COALESCE((i."metadata"->>'performer')::boolean, false),
-      $2, i."lastSeenAt",
+      i."dialogId", f."username", f."displayName", f."avatarUrl", r."fanSubscriptionType", r."fanSubscriptionActive", r."creatorFollowsFan", r."fanSubscribesToCreator",
+      COALESCE(r."subscribePriceCents", 0), COALESCE(r."blocked", false), COALESCE(r."restricted", false), COALESCE(r."performer", false),
+      $2, r."lastSeenAt",
       CASE
-        WHEN i."isActive" = false AND i."subscribedBy" = true THEN 'fan_expired_creator_following'
-        WHEN i."isActive" = true THEN 'fan_active'
-        WHEN i."subscribedBy" = false THEN 'creator_not_following'
+        WHEN r."fanSubscriptionActive" = false AND r."creatorFollowsFan" = true THEN 'fan_expired_creator_following'
+        WHEN r."fanSubscriptionActive" = true THEN 'fan_active'
+        WHEN r."creatorFollowsFan" = false THEN 'creator_not_following'
         ELSE 'subscription_state_unknown'
       END,
       false, false,
       CASE
-        WHEN i."isActive" = false AND i."subscribedBy" = true THEN 'CANDIDATE'
-        WHEN i."isActive" = true THEN 'NOT_ELIGIBLE'
-        WHEN i."subscribedBy" = false THEN 'NOT_FOLLOWING'
+        WHEN r."fanSubscriptionActive" = false AND r."creatorFollowsFan" = true THEN 'CANDIDATE'
+        WHEN r."fanSubscriptionActive" = true THEN 'NOT_ELIGIBLE'
+        WHEN r."creatorFollowsFan" = false THEN 'NOT_FOLLOWING'
         ELSE 'NOT_ELIGIBLE'
       END,
       'IDLE', 0, 0, NULL, NULL, i."runId",
       COALESCE(i."metadata", '{}'::jsonb) || jsonb_build_object(
-        'source', 'subscriber_directory', 'snapshotRunId', i."runId", 'subscribedOn', i."subscribedOn",
-        'subscribedBy', i."subscribedBy", 'isActive', i."isActive"
+        'source', 'fan_relationship_current', 'snapshotRunId', i."runId", 'fanSubscribesToCreator', r."fanSubscribesToCreator",
+        'creatorFollowsFan', r."creatorFollowsFan", 'fanSubscriptionActive', r."fanSubscriptionActive", 'relationshipObservedAt', r."observedAt"
       ), $2, $2
     FROM "SubscriberScanItem" i
+    JOIN "CreatorFan" f ON f."creatorId" = i."creatorId" AND f."onlyFansUserId" = i."fanId"
+    JOIN "CreatorFanRelationshipCurrent" r ON r."creatorId" = i."creatorId" AND r."onlyFansUserId" = i."fanId"
     WHERE i."runId" = $1
     ON CONFLICT ("creatorId", "fanId") DO UPDATE SET
       "dialogId" = EXCLUDED."dialogId",
@@ -290,7 +289,7 @@ async function validateFollowAutomationDelivery({ delivery, control, now = new D
   if (Number(candidate.generation) !== Number(delivery.generation)) return { ok: false, terminal: true, status: "SKIPPED", code: "stale_candidate" };
   if (delivery.actionType === FOLLOW_FAN_ACTION_TYPE) {
     if (!object(delivery.payload).recovery) return { ok: false, terminal: true, status: "SKIPPED", code: "invalid_payload" };
-    if (!["FOLLOW", "RECOVERY"].includes(candidate.phase) && candidate.subscribedByCreator !== true) {
+    if (!["FOLLOW", "RECOVERY"].includes(candidate.phase) && candidate.creatorFollowsFan !== true) {
       return { ok: false, terminal: false, code: "recovery_state_mismatch", retryAt: future(60_000, now) };
     }
     return { ok: true, candidate };
@@ -352,7 +351,7 @@ async function finalizeFollowAutomationSuccess({ delivery, outcomeCode, result =
     await db.followAutomationCandidate.update({
       where: { id: candidate.id },
       data: {
-        subscribedByCreator: false, state: "QUEUED_FOLLOW", phase: "FOLLOW", eligibilityReason: "refollow_restore_pending",
+        creatorFollowsFan: false, state: "QUEUED_FOLLOW", phase: "FOLLOW", eligibilityReason: "refollow_restore_pending",
         latestDeliveryId: follow.id, latestActionType: follow.actionType, latestStatus: follow.status, latestError: null,
         metadata: { ...object(candidate.metadata), lastUnfollowDeliveryId: delivery.id, lastUnfollowAt: now.toISOString(), lastUnfollowOutcome: outcomeCode || null },
       },
@@ -366,7 +365,7 @@ async function finalizeFollowAutomationSuccess({ delivery, outcomeCode, result =
     await db.followAutomationCandidate.update({
       where: { id: candidate.id },
       data: {
-        subscribedByCreator: true, state: "WAITING_RETURN", phase: "WAIT_RETURN",
+        creatorFollowsFan: true, state: "WAITING_RETURN", phase: "WAIT_RETURN",
         nudgeCount: { increment: 1 }, cooldownUntil: waitReturnUntil, waitReturnUntil,
         eligibilityReason: "refollow_nudge_sent_waiting_return", latestDeliveryId: delivery.id,
         latestActionType: delivery.actionType, latestStatus: "COMPLETED", latestError: null,
@@ -471,9 +470,26 @@ async function listFollowAutomation({ agencyId, creatorId, search = "", state = 
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: monthStart(now) } } }),
     ]),
   ]);
+  const currentRows = await readFanCurrent(db, {
+    agencyId, creatorId, onlyFansUserIds: items.map((item) => item.fanId),
+  });
+  const currentByFan = new Map(currentRows.map((row) => [String(row.onlyFansUserId), row]));
   const mapped = items.map((item) => {
     const eligibility = evaluateRefollowCandidate(item, settings, now);
-    return { ...item, eligible: eligibility.eligible, currentEligibility: eligibility.code };
+    const current = currentByFan.get(String(item.fanId)) || null;
+    return {
+      ...item,
+      eligible: eligibility.eligible,
+      currentEligibility: eligibility.code,
+      platformIdentity: current?.platformIdentity || null,
+      relationship: current?.relationship || null,
+      value: current?.value || null,
+      // Compatibility aliases only; automation decisions use explicit relationship vocabulary.
+      subscriptionType: item.fanSubscriptionType ?? null,
+      isActive: item.fanSubscriptionActive ?? null,
+      subscribedByCreator: item.creatorFollowsFan ?? null,
+      subscribedOn: item.fanSubscribesToCreator ?? null,
+    };
   });
   return {
     ok: true, creatorId, control, settings, worker: { ready: readyDevices > 0, readyDevices },

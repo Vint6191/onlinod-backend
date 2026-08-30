@@ -8,6 +8,7 @@ const { recordNotificationPageProgress } = require("./notification-sync-state-se
 const { recordNotificationScanItems } = require("./notification-scan-control-service");
 const { JOB_KEY: FINANCIAL_TRANSACTIONS_JOB_KEY, ingestFinancialTransactionsChunk, ingestFinancialChartChunk, completeFinancialTransactionsScan } = require("./financial-transactions-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
+const { FAN_DATA_POINT_REFRESH_JOB_KEY, applyFanDataPointRefreshChunk } = require("./fan-data-authority-service");
 const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, ingestCampaignFanValueChunk, ingestCampaignFanValuesBatchChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
 const {
   LIKES_DISCOVERY_JOB_KEY,
@@ -277,6 +278,9 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
     return applySubscriberScanChunk({ db, job, deviceId, userId, chunkResult });
   }
+  if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) {
+    return applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult });
+  }
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) {
     return applyLikesDiscoveryChunk({ db, job, deviceId, userId, chunkResult });
   }
@@ -303,6 +307,7 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return applyLikesDiscoveryCompletion({ job, deviceId, userId, result: result || {} });
   if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryCompletion({ job, deviceId, userId, result: result || {} });
   if (job.jobKey === SFS_TARGET_SCAN_JOB_KEY) return applySfsTargetScanCompletion({ job, deviceId, userId, result: result || {} });
+  if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) return { ok: true, type: "fan_data_point_refresh", ...(asObject(result)) };
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
     const applied = await applySubscriberScanCompletion({ job, deviceId, userId, result: result || {} });
     cleanupSubscriberScanHistory({ creatorId: job.creatorId }).catch(() => null);

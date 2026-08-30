@@ -7,9 +7,16 @@ const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler"
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { canViewTraffic, canRefreshTraffic, canManageTrafficCosts } = require("./creator-analytics-permissions");
 const { resolveEffectivePermissions } = require("./team-access-control");
+const {
+  FAN_DATA_POINT_REFRESH_JOB_KEY,
+  VALUE_AVAILABILITY,
+  projectFanIdentity,
+  projectFanValue,
+  scheduleFanDataPointRefresh,
+} = require("./fan-data-authority-service");
 
 const TRAFFIC_SOURCES_SCAN_JOB_KEY = "traffic_sources_scan";
-const TRAFFIC_VALUE_REFRESH_JOB_KEY = "traffic_fan_value_refresh";
+const TRAFFIC_VALUE_REFRESH_JOB_KEY = FAN_DATA_POINT_REFRESH_JOB_KEY;
 const VALUE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
 
 
@@ -42,6 +49,29 @@ function cents(value) {
   const n = Number(value || 0);
   return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
 }
+
+function parseMoneyObservation(value, unit = "money") {
+  if (value === null || value === undefined || value === "") return { present: false, valid: false, cents: null };
+  const normalized = typeof value === "string"
+    ? value.replace(/[^0-9.,-]/g, "").replace(",", ".")
+    : value;
+  const number = Number(normalized);
+  if (!Number.isFinite(number) || number < 0) return { present: true, valid: false, cents: null };
+  const centsValue = unit === "cents" ? Math.round(number) : Math.round(number * 100);
+  if (!Number.isSafeInteger(centsValue) || centsValue < 0) return { present: true, valid: false, cents: null };
+  return { present: true, valid: true, cents: centsValue };
+}
+
+function firstMoneyObservation(input, centsKeys, moneyKeys) {
+  for (const key of centsKeys) {
+    if (Object.prototype.hasOwnProperty.call(input, key)) return parseMoneyObservation(input[key], "cents");
+  }
+  for (const key of moneyKeys) {
+    if (Object.prototype.hasOwnProperty.call(input, key)) return parseMoneyObservation(input[key], "money");
+  }
+  return { present: false, valid: false, cents: null };
+}
+
 
 function dbNumber(value) {
   if (typeof value === "bigint") return Number(value);
@@ -345,22 +375,36 @@ function normalizeMember(input = {}) {
 }
 
 function normalizeSnapshot(input = {}) {
-  const fanId = clean(input.fanId || input.id, 180);
+  const fanId = clean(input.fanId || input.onlyFansUserId || input.id, 180);
   if (!fanId) return null;
+  const total = firstMoneyObservation(input, ["totalSpentCents", "totalSummCents"], ["totalSumm", "totalSpent", "total"]);
+  const messages = firstMoneyObservation(input, ["messagesSpentCents", "messagesSummCents"], ["messagesSumm", "messages"]);
+  const tips = firstMoneyObservation(input, ["tipsSpentCents", "tipsSummCents"], ["tipsSumm", "tips"]);
+  const subscriptions = firstMoneyObservation(input, ["subscriptionsSpentCents", "subscribesSummCents"], ["subscribesSumm", "subscribes"]);
+  const posts = firstMoneyObservation(input, ["postsSpentCents", "postsSummCents"], ["postsSumm", "posts"]);
+  const streams = firstMoneyObservation(input, ["streamsSpentCents", "streamsSummCents"], ["streamsSumm", "streams"]);
+  const fields = [total, messages, tips, subscriptions, posts, streams];
+  const malformed = fields.some((item) => item.present && !item.valid);
+  const availability = malformed
+    ? VALUE_AVAILABILITY.MALFORMED
+    : total.valid
+      ? VALUE_AVAILABILITY.AVAILABLE
+      : VALUE_AVAILABILITY.UNAVAILABLE;
   return {
     fanId,
     fanUsername: clean(input.fanUsername || input.username || input.login, 120),
     fanName: clean(input.fanName || input.name || input.displayName, 160),
     fanAvatar: clean(input.fanAvatar || input.avatarUrl || input.avatar, 1000),
-    totalSummCents: moneyCents(input.totalSumm ?? input.total),
-    messagesSummCents: moneyCents(input.messagesSumm ?? input.messages),
-    tipsSummCents: moneyCents(input.tipsSumm ?? input.tips),
-    subscribesSummCents: moneyCents(input.subscribesSumm ?? input.subscribes),
-    postsSummCents: moneyCents(input.postsSumm ?? input.posts),
-    streamsSummCents: moneyCents(input.streamsSumm ?? input.streams),
-    lastActivity: asDate(input.lastActivity),
-    fetchedAt: asDate(input.fetchedAt) || new Date(),
-    source: clean(input.source || "fan_value_core", 80) || "fan_value_core",
+    totalSpentCents: total.cents,
+    messagesSpentCents: messages.cents,
+    tipsSpentCents: tips.cents,
+    subscriptionsSpentCents: subscriptions.cents,
+    postsSpentCents: posts.cents,
+    streamsSpentCents: streams.cents,
+    availability,
+    lastActivity: asDate(input.lastActivityAt || input.lastActivity),
+    fetchedAt: asDate(input.fetchedAt || input.observedAt) || new Date(),
+    source: clean(input.source || "TRAFFIC_COMPAT", 80) || "TRAFFIC_COMPAT",
   };
 }
 
@@ -868,122 +912,40 @@ async function upsertTrafficSourceScan({
 async function upsertTrafficFanValueSnapshots({ deviceId, userId, creatorId, snapshots = [] }) {
   const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
   const agencyId = creator.agencyId;
-  const now = new Date();
   const rows = uniqueBy(
-    (Array.isArray(snapshots) ? snapshots : [])
-      .map(normalizeSnapshot)
-      .filter(Boolean)
-      .sort((a, b) => {
-        return Number(asDate(a.fetchedAt)?.getTime() || 0) - Number(asDate(b.fetchedAt)?.getTime() || 0);
-      }),
-    (row) => row.fanId
+    (Array.isArray(snapshots) ? snapshots : []).map(normalizeSnapshot).filter(Boolean).sort((a, b) => Number(a.fetchedAt?.getTime() || 0) - Number(b.fetchedAt?.getTime() || 0)),
+    (row) => row.fanId,
   );
+  if (!rows.length) return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted: 0, authority: "CreatorFanValueCurrent" };
 
-  if (!rows.length) {
-    return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted: 0 };
-  }
-
-  const fanIds = Array.from(new Set(rows.map((row) => row.fanId)));
   let upserted = 0;
-
-  for (const chunk of chunkArray(rows, 500)) {
-    const createData = chunk.map((row) => ({
-      agencyId,
-      creatorId: creator.id,
-      fanId: row.fanId,
-      totalSummCents: row.totalSummCents,
-      messagesSummCents: row.messagesSummCents,
-      tipsSummCents: row.tipsSummCents,
-      subscribesSummCents: row.subscribesSummCents,
-      postsSummCents: row.postsSummCents,
-      streamsSummCents: row.streamsSummCents,
-      lastActivity: row.lastActivity,
-      fetchedAt: row.fetchedAt,
-      source: row.source,
-      updatedAt: now,
-    }));
-
-    await prisma.trafficFanValueSnapshot.createMany({ data: createData, skipDuplicates: true });
-
-    const updatePayload = chunk.map((row) => ({
-      fanId: row.fanId,
-      totalSummCents: row.totalSummCents,
-      messagesSummCents: row.messagesSummCents,
-      tipsSummCents: row.tipsSummCents,
-      subscribesSummCents: row.subscribesSummCents,
-      postsSummCents: row.postsSummCents,
-      streamsSummCents: row.streamsSummCents,
-      lastActivity: isoOrNull(row.lastActivity),
-      fetchedAt: isoOrNull(row.fetchedAt) || now.toISOString(),
-      source: row.source || "fan_value_core",
-    }));
-
-    await prisma.$executeRaw`
-      UPDATE "TrafficFanValueSnapshot" AS v
-      SET
-        "totalSummCents" = x."totalSummCents",
-        "messagesSummCents" = x."messagesSummCents",
-        "tipsSummCents" = x."tipsSummCents",
-        "subscribesSummCents" = x."subscribesSummCents",
-        "postsSummCents" = x."postsSummCents",
-        "streamsSummCents" = x."streamsSummCents",
-        "lastActivity" = x."lastActivity",
-        "fetchedAt" = x."fetchedAt",
-        "source" = COALESCE(x."source", v."source"),
-        "updatedAt" = NOW()
-      FROM jsonb_to_recordset(${JSON.stringify(updatePayload)}::jsonb)
-        AS x(
-          "fanId" text,
-          "totalSummCents" int,
-          "messagesSummCents" int,
-          "tipsSummCents" int,
-          "subscribesSummCents" int,
-          "postsSummCents" int,
-          "streamsSummCents" int,
-          "lastActivity" timestamptz,
-          "fetchedAt" timestamptz,
-          "source" text
-        )
-      WHERE v."agencyId" = ${agencyId}
-        AND v."creatorId" = ${creator.id}
-        AND v."fanId" = x."fanId"
-    `;
-
-    const identityPayload = chunk
-      .map((row) => {
-        const identity = {
-          ...(row.fanUsername ? { fanUsername: row.fanUsername } : {}),
-          ...(row.fanName ? { fanName: row.fanName } : {}),
-          ...(row.fanAvatar ? { fanAvatar: row.fanAvatar } : {}),
-        };
-        return Object.keys(identity).length ? { fanId: row.fanId, metadata: identity } : null;
-      })
-      .filter(Boolean);
-
-    if (identityPayload.length) {
-      await prisma.$executeRaw`
-        UPDATE "TrafficSourceMember" AS m
-        SET "metadata" = COALESCE(m."metadata", '{}'::jsonb) || x."metadata"
-        FROM jsonb_to_recordset(${JSON.stringify(identityPayload)}::jsonb)
-          AS x("fanId" text, "metadata" jsonb)
-        WHERE m."agencyId" = ${agencyId}
-          AND m."creatorId" = ${creator.id}
-          AND m."fanId" = x."fanId"
-      `;
-    }
-
-    upserted += chunk.length;
+  for (const row of rows) {
+    await prisma.$transaction(async (tx) => {
+      if (row.fanUsername || row.fanName || row.fanAvatar) {
+        await projectFanIdentity(tx, {
+          agencyId, creatorId: creator.id, onlyFansUserId: row.fanId,
+          username: row.fanUsername, platformDisplayName: row.fanName, avatarUrl: row.fanAvatar,
+          observedAt: row.fetchedAt, activityObservedAt: row.lastActivity, source: "TRAFFIC_ATTRIBUTION", sourceDeviceId: device.id,
+        });
+      }
+      await projectFanValue(tx, {
+        agencyId, creatorId: creator.id, onlyFansUserId: row.fanId,
+        totalSpentCents: row.totalSpentCents, messagesSpentCents: row.messagesSpentCents,
+        tipsSpentCents: row.tipsSpentCents, subscriptionsSpentCents: row.subscriptionsSpentCents,
+        postsSpentCents: row.postsSpentCents, streamsSpentCents: row.streamsSpentCents,
+        lastActivityAt: row.lastActivity, availability: row.availability, observedAt: row.fetchedAt,
+        source: row.source || "TRAFFIC_COMPAT", sourceDeviceId: device.id,
+      });
+    });
+    upserted += 1;
   }
-
+  const fanIds = rows.map((row) => row.fanId);
+  const newest = rows.reduce((max, row) => !max || row.fetchedAt > max ? row.fetchedAt : max, null);
   await prisma.trafficSourceMember.updateMany({
     where: { agencyId, creatorId: creator.id, fanId: { in: fanIds } },
-    data: {
-      lastValueFetchedAt: now,
-      needsValueRefresh: false,
-    },
+    data: { lastValueFetchedAt: newest || new Date(), needsValueRefresh: false },
   });
-
-  return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted };
+  return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted, authority: "CreatorFanValueCurrent" };
 }
 
 async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt = null, reason = null } = {}) {
@@ -1100,30 +1062,23 @@ async function scheduleTrafficValueRefresh({
   const cleanAccountId = clean(accountId || creatorId, 180) || creatorId;
   const cleanCreatorRef = clean(creatorRef, 180);
 
-  return ensureSingleJob({
-    jobKey: TRAFFIC_VALUE_REFRESH_JOB_KEY,
-    creatorId,
+  const pending = await prisma.trafficSourceMember.findMany({
+    where: { agencyId, creatorId, needsValueRefresh: true },
+    select: { fanId: true },
+    orderBy: [{ lastRevenueAt: "desc" }, { updatedAt: "desc" }],
+    take: 500,
+  });
+  return scheduleFanDataPointRefresh({
     agencyId,
-    params: {
-      hydrateOnly: true,
-      sourceScan: false,
-      hydrateFanValues: true,
-      hydrateLimit: 1000,
-      valueTtlHours: 6,
-      reason: clean(reason, 120) || "traffic_value_dirty",
-      accountId: cleanAccountId,
-      localAccountId: cleanAccountId,
-      accountManifestId: cleanAccountId,
-      creatorUsername: cleanCreatorRef,
-      username: cleanCreatorRef,
-      scheduledFromObservationAt: now.toISOString(),
-    },
+    creatorId,
+    onlyFansUserIds: pending.map((row) => row.fanId),
+    reason: clean(reason, 120) || "traffic_value_dirty",
     priority,
     now,
-    // Dirty value hydrate jobs are cheap and idempotent. Keep the cooldown short
-    // so live WS/catch-up revenue can refresh LTV without waiting for a full
-    // source/member rescan, while still avoiding one job per event.
-    freshnessWindowMs: 2 * 60 * 1000,
+    params: {
+      accountId: cleanAccountId, localAccountId: cleanAccountId, accountManifestId: cleanAccountId,
+      creatorUsername: cleanCreatorRef, username: cleanCreatorRef, scheduledFromObservationAt: now.toISOString(),
+    },
   });
 }
 
@@ -1317,19 +1272,22 @@ async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
     SELECT
       m."sourceId" AS "sourceId",
       COUNT(v."fanId")::bigint AS "valueSnapshotMembers",
-      COUNT(CASE WHEN v."totalSummCents" > 0 THEN 1 END)::bigint AS "valuePayingFans",
-      COALESCE(SUM(v."totalSummCents"), 0)::bigint AS "fanValueCents",
-      COALESCE(SUM(v."messagesSummCents"), 0)::bigint AS "valueMessagesCents",
-      COALESCE(SUM(v."tipsSummCents"), 0)::bigint AS "valueTipsCents",
-      COALESCE(SUM(v."subscribesSummCents"), 0)::bigint AS "valueSubscribesCents",
-      COALESCE(SUM(v."postsSummCents"), 0)::bigint AS "valuePostsCents",
-      COALESCE(SUM(v."streamsSummCents"), 0)::bigint AS "valueStreamsCents",
+      COUNT(CASE WHEN v."totalNetCents" > 0 THEN 1 END)::bigint AS "valuePayingFans",
+      COALESCE(SUM(v."totalNetCents"), 0)::bigint AS "fanValueCents",
+      COALESCE(SUM(v."messagesNetCents"), 0)::bigint AS "valueMessagesCents",
+      COALESCE(SUM(v."tipsNetCents"), 0)::bigint AS "valueTipsCents",
+      COALESCE(SUM(v."subscriptionsNetCents"), 0)::bigint AS "valueSubscribesCents",
+      COALESCE(SUM(v."postsNetCents"), 0)::bigint AS "valuePostsCents",
+      COALESCE(SUM(v."streamsNetCents"), 0)::bigint AS "valueStreamsCents",
       MAX(v."fetchedAt") AS "lastValueFetchedAt"
     FROM "TrafficSourceMember" m
-    LEFT JOIN "TrafficFanValueSnapshot" v
-      ON v."agencyId" = m."agencyId"
-     AND v."creatorId" = m."creatorId"
-     AND v."fanId" = m."fanId"
+    LEFT JOIN "CreatorFan" f
+      ON f."creatorId" = m."creatorId"
+     AND f."onlyFansUserId" = m."fanId"
+    LEFT JOIN "CreatorFanValueCurrent" v
+      ON v."creatorId" = f."creatorId"
+     AND v."fanId" = f."id"
+     AND v."availability" = 'AVAILABLE'
     WHERE m."agencyId" = ${agencyId}
       AND m."creatorId" = ${creatorId}
       AND m."sourceId" IN (${Prisma.join(uniqueSourceIds)})
@@ -1368,29 +1326,32 @@ async function getTrafficValueStats({ agencyId, creatorId, sourceIds = [] }) {
   const totalRows = await prisma.$queryRaw`
     SELECT
       COUNT(*)::bigint AS "valueSnapshotMembers",
-      COUNT(CASE WHEN x."totalSummCents" > 0 THEN 1 END)::bigint AS "valuePayingFans",
-      COALESCE(SUM(x."totalSummCents"), 0)::bigint AS "fanValueCents",
-      COALESCE(SUM(x."messagesSummCents"), 0)::bigint AS "valueMessagesCents",
-      COALESCE(SUM(x."tipsSummCents"), 0)::bigint AS "valueTipsCents",
-      COALESCE(SUM(x."subscribesSummCents"), 0)::bigint AS "valueSubscribesCents",
-      COALESCE(SUM(x."postsSummCents"), 0)::bigint AS "valuePostsCents",
-      COALESCE(SUM(x."streamsSummCents"), 0)::bigint AS "valueStreamsCents",
+      COUNT(CASE WHEN x."totalNetCents" > 0 THEN 1 END)::bigint AS "valuePayingFans",
+      COALESCE(SUM(x."totalNetCents"), 0)::bigint AS "fanValueCents",
+      COALESCE(SUM(x."messagesNetCents"), 0)::bigint AS "valueMessagesCents",
+      COALESCE(SUM(x."tipsNetCents"), 0)::bigint AS "valueTipsCents",
+      COALESCE(SUM(x."subscriptionsNetCents"), 0)::bigint AS "valueSubscribesCents",
+      COALESCE(SUM(x."postsNetCents"), 0)::bigint AS "valuePostsCents",
+      COALESCE(SUM(x."streamsNetCents"), 0)::bigint AS "valueStreamsCents",
       MAX(x."fetchedAt") AS "lastValueFetchedAt"
     FROM (
       SELECT DISTINCT ON (m."fanId")
         m."fanId",
-        v."totalSummCents",
-        v."messagesSummCents",
-        v."tipsSummCents",
-        v."subscribesSummCents",
-        v."postsSummCents",
-        v."streamsSummCents",
+        v."totalNetCents",
+        v."messagesNetCents",
+        v."tipsNetCents",
+        v."subscriptionsNetCents",
+        v."postsNetCents",
+        v."streamsNetCents",
         v."fetchedAt"
       FROM "TrafficSourceMember" m
-      JOIN "TrafficFanValueSnapshot" v
-        ON v."agencyId" = m."agencyId"
-       AND v."creatorId" = m."creatorId"
-       AND v."fanId" = m."fanId"
+      JOIN "CreatorFan" f
+        ON f."creatorId" = m."creatorId"
+       AND f."onlyFansUserId" = m."fanId"
+      JOIN "CreatorFanValueCurrent" v
+        ON v."creatorId" = f."creatorId"
+       AND v."fanId" = f."id"
+       AND v."availability" = 'AVAILABLE'
       WHERE m."agencyId" = ${agencyId}
         AND m."creatorId" = ${creatorId}
       ORDER BY m."fanId", v."fetchedAt" DESC
@@ -1547,20 +1508,26 @@ async function getTrafficSourceMembers({
       m."lastValueFetchedAt" AS "lastValueFetchedAt",
       m."lastRevenueAt" AS "lastRevenueAt",
       m."needsValueRefresh" AS "needsValueRefresh",
-      COALESCE(v."totalSummCents", 0)::bigint AS "totalSummCents",
-      COALESCE(v."messagesSummCents", 0)::bigint AS "messagesSummCents",
-      COALESCE(v."tipsSummCents", 0)::bigint AS "tipsSummCents",
-      COALESCE(v."subscribesSummCents", 0)::bigint AS "subscribesSummCents",
-      COALESCE(v."postsSummCents", 0)::bigint AS "postsSummCents",
-      COALESCE(v."streamsSummCents", 0)::bigint AS "streamsSummCents",
+      v."totalNetCents"::bigint AS "totalSummCents",
+      v."messagesNetCents"::bigint AS "messagesSummCents",
+      v."tipsNetCents"::bigint AS "tipsSummCents",
+      v."subscriptionsNetCents"::bigint AS "subscribesSummCents",
+      v."postsNetCents"::bigint AS "postsSummCents",
+      v."streamsNetCents"::bigint AS "streamsSummCents",
       v."fetchedAt" AS "fetchedAt",
+      v."availability" AS "valueAvailability",
+      f."username" AS "platformUsername",
+      f."displayName" AS "platformDisplayName",
+      f."avatarUrl" AS "platformAvatarUrl",
       COALESCE(l."paidSubscriptions", 0)::bigint AS "ledgerSubscriptions",
       COALESCE(l."ledgerRevenueCents", 0)::bigint AS "ledgerRevenueCents"
     FROM "TrafficSourceMember" m
-    LEFT JOIN "TrafficFanValueSnapshot" v
-      ON v."agencyId" = m."agencyId"
-     AND v."creatorId" = m."creatorId"
-     AND v."fanId" = m."fanId"
+    LEFT JOIN "CreatorFan" f
+      ON f."creatorId" = m."creatorId"
+     AND f."onlyFansUserId" = m."fanId"
+    LEFT JOIN "CreatorFanValueCurrent" v
+      ON v."creatorId" = f."creatorId"
+     AND v."fanId" = f."id"
     LEFT JOIN (
       SELECT "fanId", COUNT(*)::bigint AS "paidSubscriptions", COALESCE(SUM("amountCents"), 0)::bigint AS "ledgerRevenueCents"
       FROM "CreatorSubscriptionLedger"
@@ -1573,8 +1540,8 @@ async function getTrafficSourceMembers({
     WHERE m."agencyId" = ${creator.agencyId}
       AND m."creatorId" = ${creator.id}
       AND m."sourceId" = ${source.id}
-      AND (${onlyPaying === true} = false OR COALESCE(v."totalSummCents", 0) > 0)
-    ORDER BY COALESCE(v."totalSummCents", 0) DESC, m."lastSeenAt" DESC, m."fanId" ASC
+      AND (${onlyPaying === true} = false OR (v."availability" = 'AVAILABLE' AND v."totalNetCents" > 0))
+    ORDER BY CASE WHEN v."availability" = 'AVAILABLE' THEN v."totalNetCents" END DESC NULLS LAST, m."lastSeenAt" DESC, m."fanId" ASC
     LIMIT ${take}
     OFFSET ${skip}
   `;
@@ -1582,20 +1549,22 @@ async function getTrafficSourceMembers({
   const countRows = await prisma.$queryRaw`
     SELECT
       COUNT(*)::bigint AS "members",
-      COUNT(v."fanId")::bigint AS "fetched",
-      COUNT(CASE WHEN COALESCE(v."totalSummCents", 0) > 0 THEN 1 END)::bigint AS "buyers",
+      COUNT(CASE WHEN v."availability" = 'AVAILABLE' THEN 1 END)::bigint AS "fetched",
+      COUNT(CASE WHEN v."availability" = 'AVAILABLE' AND v."totalNetCents" > 0 THEN 1 END)::bigint AS "buyers",
       COUNT(CASE WHEN m."needsValueRefresh" = true OR (m."lastRevenueAt" IS NOT NULL AND (m."lastValueFetchedAt" IS NULL OR m."lastValueFetchedAt" < ${new Date(Date.now() - VALUE_SNAPSHOT_TTL_MS)}) ) THEN 1 END)::bigint AS "pendingValueMembers",
-      COALESCE(SUM(v."totalSummCents"), 0)::bigint AS "fanValueCents",
-      COALESCE(SUM(v."messagesSummCents"), 0)::bigint AS "messagesSummCents",
-      COALESCE(SUM(v."tipsSummCents"), 0)::bigint AS "tipsSummCents",
-      COALESCE(SUM(v."subscribesSummCents"), 0)::bigint AS "subscribesSummCents",
-      COALESCE(SUM(v."postsSummCents"), 0)::bigint AS "postsSummCents",
-      COALESCE(SUM(v."streamsSummCents"), 0)::bigint AS "streamsSummCents"
+      COALESCE(SUM(CASE WHEN v."availability" = 'AVAILABLE' THEN v."totalNetCents" END), 0)::bigint AS "fanValueCents",
+      COALESCE(SUM(CASE WHEN v."availability" = 'AVAILABLE' THEN v."messagesNetCents" END), 0)::bigint AS "messagesSummCents",
+      COALESCE(SUM(CASE WHEN v."availability" = 'AVAILABLE' THEN v."tipsNetCents" END), 0)::bigint AS "tipsSummCents",
+      COALESCE(SUM(CASE WHEN v."availability" = 'AVAILABLE' THEN v."subscriptionsNetCents" END), 0)::bigint AS "subscribesSummCents",
+      COALESCE(SUM(CASE WHEN v."availability" = 'AVAILABLE' THEN v."postsNetCents" END), 0)::bigint AS "postsSummCents",
+      COALESCE(SUM(CASE WHEN v."availability" = 'AVAILABLE' THEN v."streamsNetCents" END), 0)::bigint AS "streamsSummCents"
     FROM "TrafficSourceMember" m
-    LEFT JOIN "TrafficFanValueSnapshot" v
-      ON v."agencyId" = m."agencyId"
-     AND v."creatorId" = m."creatorId"
-     AND v."fanId" = m."fanId"
+    LEFT JOIN "CreatorFan" f
+      ON f."creatorId" = m."creatorId"
+     AND f."onlyFansUserId" = m."fanId"
+    LEFT JOIN "CreatorFanValueCurrent" v
+      ON v."creatorId" = f."creatorId"
+     AND v."fanId" = f."id"
     WHERE m."agencyId" = ${creator.agencyId}
       AND m."creatorId" = ${creator.id}
       AND m."sourceId" = ${source.id}
@@ -1604,21 +1573,22 @@ async function getTrafficSourceMembers({
   const totalsRow = (countRows || [])[0] || {};
   const members = (rows || []).map((row) => {
     const identity = extractMemberIdentity(row.metadata || {});
-    const username = identity.username || null;
-    const name = identity.name || null;
+    const username = row.platformUsername || identity.username || null;
+    const name = row.platformDisplayName || identity.name || null;
     const displayName = username ? `@${username}` : name || String(row.fanId || "");
     return {
       fanId: String(row.fanId || ""),
       fanUsername: username,
       fanName: name,
-      avatarUrl: identity.avatarUrl || null,
+      avatarUrl: row.platformAvatarUrl || identity.avatarUrl || null,
       displayName,
-      totalSummCents: dbNumber(row.totalSummCents),
-      messagesSummCents: dbNumber(row.messagesSummCents),
-      tipsSummCents: dbNumber(row.tipsSummCents),
-      subscribesSummCents: dbNumber(row.subscribesSummCents),
-      postsSummCents: dbNumber(row.postsSummCents),
-      streamsSummCents: dbNumber(row.streamsSummCents),
+      totalSummCents: row.valueAvailability === "AVAILABLE" ? dbNumber(row.totalSummCents) : null,
+      messagesSummCents: row.valueAvailability === "AVAILABLE" ? dbNumber(row.messagesSummCents) : null,
+      tipsSummCents: row.valueAvailability === "AVAILABLE" ? dbNumber(row.tipsSummCents) : null,
+      subscribesSummCents: row.valueAvailability === "AVAILABLE" ? dbNumber(row.subscribesSummCents) : null,
+      postsSummCents: row.valueAvailability === "AVAILABLE" ? dbNumber(row.postsSummCents) : null,
+      streamsSummCents: row.valueAvailability === "AVAILABLE" ? dbNumber(row.streamsSummCents) : null,
+      valueAvailability: row.valueAvailability || "NOT_FETCHED",
       fetchedAt: row.fetchedAt || null,
       pendingValue:
         row.needsValueRefresh === true ||

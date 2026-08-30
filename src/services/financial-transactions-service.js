@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 const { reconcileCreatorSaleToTeam, reconcileCreatorTipToTeam } = require("./team-money-reconciliation-service");
+const { projectFanIdentity } = require("./fan-data-authority-service");
 
 const JOB_KEY = "financial_transactions_scan";
 const COLLECTOR_VERSION = "payout-transactions-v2-catchup";
@@ -133,6 +134,7 @@ function normalizeTransaction(row, index, page) {
     fanOnlyFansUserId,
     fanUsername: clean(source.fanUsername ?? user.username, 180),
     fanDisplayName: clean(source.fanDisplayName ?? user.name ?? user.displayName, 255),
+    fanAvatarUrl: clean(source.fanAvatarUrl ?? user.avatar ?? user.avatarUrl ?? user.avatarThumbs?.c144 ?? user.avatarThumbs?.c50, 1200),
     amountCents,
     feeCents: Number.isSafeInteger(Number(source.feeCents)) && Math.abs(Number(source.feeCents)) <= 2_147_483_647 ? Number(source.feeCents) : moneyCents(source.fee),
     netCents: Number.isSafeInteger(Number(source.netCents)) && Math.abs(Number(source.netCents)) <= 2_147_483_647 ? Number(source.netCents) : moneyCents(source.net),
@@ -147,24 +149,16 @@ function normalizeTransaction(row, index, page) {
 
 async function resolveFan(tx, job, row, now) {
   if (!row.fanOnlyFansUserId) return null;
-  const where = { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId: row.fanOnlyFansUserId } };
-  const existing = await tx.creatorFan.findUnique({ where });
-  if (!existing) {
-    return tx.creatorFan.create({ data: {
-      id: crypto.randomUUID(), agencyId: job.agencyId, creatorId: job.creatorId,
-      onlyFansUserId: row.fanOnlyFansUserId,
-      username: row.fanUsername || null, displayName: row.fanDisplayName || null,
-      firstSeenAt: row.occurredAt, lastSeenAt: row.occurredAt,
-      createdAt: now, updatedAt: now,
-    }});
-  }
-  const data = { lastSeenAt: existing.lastSeenAt < row.occurredAt ? row.occurredAt : existing.lastSeenAt, updatedAt: now };
-  if (existing.firstSeenAt > row.occurredAt) data.firstSeenAt = row.occurredAt;
-  if (row.occurredAt >= existing.lastSeenAt) {
-    if (row.fanUsername) data.username = row.fanUsername;
-    if (row.fanDisplayName) data.displayName = row.fanDisplayName;
-  }
-  return tx.creatorFan.update({ where: { id: existing.id }, data });
+  return projectFanIdentity(tx, {
+    agencyId: job.agencyId,
+    creatorId: job.creatorId,
+    onlyFansUserId: row.fanOnlyFansUserId,
+    username: row.fanUsername,
+    platformDisplayName: row.fanDisplayName,
+    observedAt: row.occurredAt,
+    activityObservedAt: row.occurredAt,
+    source: "FINANCIAL_TRANSACTION",
+  });
 }
 
 function businessData(job, deviceId, row, fanId, now) {
@@ -172,6 +166,10 @@ function businessData(job, deviceId, row, fanId, now) {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     fanId,
+    fanOnlyFansUserIdAtEvent: row.fanOnlyFansUserId || null,
+    fanUsernameAtEvent: row.fanUsername || null,
+    fanDisplayNameAtEvent: row.fanDisplayName || null,
+    fanAvatarUrlAtEvent: row.fanAvatarUrl || null,
     externalTransactionId: row.externalTransactionId,
     amountCents: row.amountCents,
     feeCents: row.feeCents,
@@ -311,6 +309,9 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
       const commonData = {
         agencyId: job.agencyId, creatorId: job.creatorId, fanId,
         fanOnlyFansUserId: row.fanOnlyFansUserId || null,
+        fanUsernameAtEvent: row.fanUsername || null,
+        fanDisplayNameAtEvent: row.fanDisplayName || null,
+        fanAvatarUrlAtEvent: row.fanAvatarUrl || null,
         externalTransactionId: row.externalTransactionId,
         transactionType: row.transactionType,
         factType: row.factType,

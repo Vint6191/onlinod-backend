@@ -8,7 +8,7 @@ const settings = { refollowEnabled: true, maxNudgesPerFan: 1 };
 const base = {
   fanId: "fan-1", state: "CANDIDATE", phase: "IDLE", blocked: false, ignored: false,
   ofBlocked: false, restricted: false, performer: false, subscribePriceCents: 0,
-  isActive: false, subscribedByCreator: true, nudgeCount: 0, cooldownUntil: null,
+  fanSubscriptionActive: false, creatorFollowsFan: true, nudgeCount: 0, cooldownUntil: null,
 };
 
 test("expired free fan still followed by creator is eligible for refollow nudge", () => {
@@ -16,8 +16,8 @@ test("expired free fan still followed by creator is eligible for refollow nudge"
 });
 
 test("refollow never treats a general unfollow candidate as eligible", () => {
-  assert.equal(evaluateRefollowCandidate({ ...base, subscribedByCreator: false }, settings).code, "creator_not_following");
-  assert.equal(evaluateRefollowCandidate({ ...base, isActive: true }, settings).code, "fan_active");
+  assert.equal(evaluateRefollowCandidate({ ...base, creatorFollowsFan: false }, settings).code, "creator_not_following");
+  assert.equal(evaluateRefollowCandidate({ ...base, fanSubscriptionActive: true }, settings).code, "fan_active");
 });
 
 test("Alpha paid/restricted/performer guards are explicit server-side skip codes", () => {

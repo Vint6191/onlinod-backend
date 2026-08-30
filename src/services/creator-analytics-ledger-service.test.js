@@ -348,10 +348,10 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
     },
   });
   assert.equal(result.available, true);
-  assert.equal(upsertData.totalNetCents, 187920n);
-  assert.equal(upsertData.messagesNetCents, 118480n);
-  assert.equal(upsertData.tipsNetCents, 69440n);
-  assert.equal(upsertData.source, "ONLYFANS_SUBSCRIBER_PROFILE");
+  assert.equal(upsertData.platformReportedTotalSpendCents, 187920n);
+  assert.equal(upsertData.messagesSpentCents, 118480n);
+  assert.equal(upsertData.tipsSpentCents, 69440n);
+  assert.equal(upsertData.source, "USER_PROFILE");
 });
 
 
@@ -386,7 +386,7 @@ test("campaign fan value batch applies multiple current snapshots under one anal
   assert.equal(result.available, 2);
   assert.equal(locks, 1);
   assert.equal(upserts.length, 2);
-  assert.deepEqual(upserts.map((row) => row.totalNetCents), [100n, 250n]);
+  assert.deepEqual(upserts.map((row) => row.platformReportedTotalSpendCents), [100n, 250n]);
 });
 
 test("message-day sync records the reporting device and never closes the current UTC day", async () => {

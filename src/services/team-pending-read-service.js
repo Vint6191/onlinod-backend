@@ -85,18 +85,25 @@ async function pendingIdentityMaps({ agencyId, rows, db = prisma }) {
     pairs.push({ creatorId, fanId });
   }
 
-  const [creators, fans, followBack, followAutomation] = await Promise.all([
+  const [creators, fans] = await Promise.all([
     creatorIds.length && db.creatorAccount?.findMany
       ? db.creatorAccount.findMany({ where: { agencyId, id: { in: creatorIds }, deletedAt: null }, select: { id: true, displayName: true, username: true, avatarUrl: true } })
       : Promise.resolve([]),
     pairs.length && db.creatorFan?.findMany
-      ? db.creatorFan.findMany({ where: { agencyId, OR: pairs.map((pair) => ({ creatorId: pair.creatorId, onlyFansUserId: pair.fanId })) }, select: { creatorId: true, onlyFansUserId: true, username: true, displayName: true } })
-      : Promise.resolve([]),
-    pairs.length && db.followBackCandidate?.findMany
-      ? db.followBackCandidate.findMany({ where: { agencyId, OR: pairs.map((pair) => ({ creatorId: pair.creatorId, fanId: pair.fanId })) }, select: { creatorId: true, fanId: true, username: true, displayName: true, avatarUrl: true, updatedAt: true } })
-      : Promise.resolve([]),
-    pairs.length && db.followAutomationCandidate?.findMany
-      ? db.followAutomationCandidate.findMany({ where: { agencyId, OR: pairs.map((pair) => ({ creatorId: pair.creatorId, fanId: pair.fanId })) }, select: { creatorId: true, fanId: true, username: true, displayName: true, avatarUrl: true, updatedAt: true } })
+      ? db.creatorFan.findMany({
+        where: { agencyId, OR: pairs.map((pair) => ({ creatorId: pair.creatorId, onlyFansUserId: pair.fanId })) },
+        select: {
+          creatorId: true,
+          onlyFansUserId: true,
+          username: true,
+          displayName: true,
+          avatarUrl: true,
+          identityObservedAt: true,
+          identitySource: true,
+          relationshipCurrent: true,
+          valueCurrent: true,
+        },
+      })
       : Promise.resolve([]),
   ]);
 
@@ -104,21 +111,40 @@ async function pendingIdentityMaps({ agencyId, rows, db = prisma }) {
   const fanMap = new Map();
   for (const fan of fans || []) {
     fanMap.set(pairKey(fan.creatorId, fan.onlyFansUserId), {
+      onlyFansUserId: clean(fan.onlyFansUserId, 180),
       displayName: clean(fan.displayName, 240),
-      username: clean(fan.username, 160)?.replace(/^@+/, "") || null,
-      avatarUrl: null,
-      updatedAt: 0,
-    });
-  }
-  for (const candidate of [...(followBack || []), ...(followAutomation || [])]) {
-    const key = pairKey(candidate.creatorId, candidate.fanId);
-    const current = fanMap.get(key) || { displayName: null, username: null, avatarUrl: null, updatedAt: 0 };
-    const updatedAt = new Date(candidate.updatedAt || 0).getTime() || 0;
-    fanMap.set(key, {
-      displayName: current.displayName || clean(candidate.displayName, 240),
-      username: current.username || clean(candidate.username, 160)?.replace(/^@+/, "") || null,
-      avatarUrl: (updatedAt >= Number(current.updatedAt || 0) ? clean(candidate.avatarUrl, 2000) : current.avatarUrl) || current.avatarUrl || clean(candidate.avatarUrl, 2000),
-      updatedAt: Math.max(Number(current.updatedAt || 0), updatedAt),
+      username: clean(fan.username, 160)?.replace(/^@+/, '') || null,
+      avatarUrl: clean(fan.avatarUrl, 2000),
+      observedAt: fan.identityObservedAt || null,
+      source: clean(fan.identitySource, 80),
+      relationship: fan.relationshipCurrent ? {
+        fanSubscribesToCreator: fan.relationshipCurrent.fanSubscribesToCreator ?? null,
+        fanSubscriptionActive: fan.relationshipCurrent.fanSubscriptionActive ?? null,
+        fanSubscriptionType: clean(fan.relationshipCurrent.fanSubscriptionType, 100),
+        fanSubscriptionExpiresAt: fan.relationshipCurrent.fanSubscriptionExpiresAt || null,
+        creatorFollowsFan: fan.relationshipCurrent.creatorFollowsFan ?? null,
+        creatorFollowExpiresAt: fan.relationshipCurrent.creatorFollowExpiresAt || null,
+        canReceiveChatMessage: fan.relationshipCurrent.canReceiveChatMessage ?? null,
+        blocked: fan.relationshipCurrent.blocked ?? null,
+        restricted: fan.relationshipCurrent.restricted ?? null,
+        performer: fan.relationshipCurrent.performer ?? null,
+        lastSeenAt: fan.relationshipCurrent.lastSeenAt || null,
+        subscribePriceCents: fan.relationshipCurrent.subscribePriceCents ?? null,
+        observedAt: fan.relationshipCurrent.observedAt || null,
+        source: clean(fan.relationshipCurrent.source, 80),
+      } : null,
+      value: fan.valueCurrent ? {
+        platformReportedTotalSpendCents: fan.valueCurrent.platformReportedTotalSpendCents == null ? null : Number(fan.valueCurrent.platformReportedTotalSpendCents),
+        messagesSpentCents: fan.valueCurrent.messagesSpentCents == null ? null : Number(fan.valueCurrent.messagesSpentCents),
+        subscriptionsSpentCents: fan.valueCurrent.subscriptionsSpentCents == null ? null : Number(fan.valueCurrent.subscriptionsSpentCents),
+        tipsSpentCents: fan.valueCurrent.tipsSpentCents == null ? null : Number(fan.valueCurrent.tipsSpentCents),
+        postsSpentCents: fan.valueCurrent.postsSpentCents == null ? null : Number(fan.valueCurrent.postsSpentCents),
+        streamsSpentCents: fan.valueCurrent.streamsSpentCents == null ? null : Number(fan.valueCurrent.streamsSpentCents),
+        lastActivityAt: fan.valueCurrent.lastActivityAt || null,
+        availability: clean(fan.valueCurrent.availability, 40),
+        observedAt: fan.valueCurrent.valueObservedAt || null,
+        source: clean(fan.valueCurrent.source, 80),
+      } : null,
     });
   }
   return { creatorMap, fanMap };
@@ -291,6 +317,19 @@ async function listTeamPendingDialogs({
       creatorDisplayName: identities.creatorMap.get(row.creatorId)?.displayName || null,
       creatorUsername: identities.creatorMap.get(row.creatorId)?.username || null,
       creatorAvatarUrl: identities.creatorMap.get(row.creatorId)?.avatarUrl || null,
+      platformIdentity: (() => {
+        const identity = identities.fanMap.get(pairKey(row.creatorId, row.fanId || row.dialogId));
+        return identity ? {
+          onlyFansUserId: identity.onlyFansUserId || row.fanId || row.dialogId,
+          username: identity.username || null,
+          displayName: identity.displayName || null,
+          avatarUrl: identity.avatarUrl || null,
+          observedAt: identity.observedAt || null,
+          source: identity.source || null,
+        } : null;
+      })(),
+      relationship: identities.fanMap.get(pairKey(row.creatorId, row.fanId || row.dialogId))?.relationship || null,
+      value: identities.fanMap.get(pairKey(row.creatorId, row.fanId || row.dialogId))?.value || null,
       fanDisplayName: identities.fanMap.get(pairKey(row.creatorId, row.fanId || row.dialogId))?.displayName || null,
       fanUsername: identities.fanMap.get(pairKey(row.creatorId, row.fanId || row.dialogId))?.username || null,
       fanAvatarUrl: identities.fanMap.get(pairKey(row.creatorId, row.fanId || row.dialogId))?.avatarUrl || null,

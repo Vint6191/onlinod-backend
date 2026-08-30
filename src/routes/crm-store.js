@@ -15,6 +15,17 @@ const {
 
 const router = express.Router();
 
+const SERVER_CRM_PRODUCT_STATUS = "SERVER_CRM_ISOLATED";
+
+// This route is an explicitly isolated server/admin CRM product surface. It may
+// store CRM knowledge, but it is not a writer for canonical OnlyFans platform
+// identity, relationship or fan-value projections. Desktop local CRM has no
+// implicit sync contract with this surface.
+router.use((req, res, next) => {
+  res.setHeader("X-ONLINOD-CRM-SURFACE", SERVER_CRM_PRODUCT_STATUS);
+  next();
+});
+
 function parseDate(value) {
   if (!value) return null;
   const d = new Date(value);
@@ -150,7 +161,7 @@ router.get("/profiles", async (req, res) => {
       }),
       prisma.crmProfile.count({ where }),
     ]);
-    return res.json({ ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
+    return res.json({ ok: true, productStatus: SERVER_CRM_PRODUCT_STATUS, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
   } catch (err) {
     return sendError(res, err, "CRM_PROFILES_FAILED");
   }
@@ -163,7 +174,7 @@ router.get("/profiles/:id", async (req, res) => {
       include: { tags: true, rawTags: true, notes: { where: { deletedAt: null }, orderBy: { createdAt: "desc" } }, runs: { orderBy: { createdAt: "desc" }, take: 20 } },
     });
     if (!profile) return res.status(404).json({ ok: false, code: "CRM_PROFILE_NOT_FOUND", error: "CRM profile not found" });
-    return res.json({ ok: true, profile });
+    return res.json({ ok: true, productStatus: SERVER_CRM_PRODUCT_STATUS, profile });
   } catch (err) {
     return sendError(res, err, "CRM_PROFILE_FAILED");
   }

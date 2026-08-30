@@ -343,7 +343,6 @@ model Agency {
   teamObservationStates TeamObservationState[]
   trafficSources TrafficSource[]
   trafficSourceMembers TrafficSourceMember[]
-  trafficFanValueSnapshots TrafficFanValueSnapshot[]
   creatorSubscriptionLedgers CreatorSubscriptionLedger[]
   trafficDailyAggregates TrafficDailyAggregate[]
   customOrders CustomOrder[]
@@ -502,7 +501,6 @@ model CreatorAccount {
   teamObservationStates TeamObservationState[]
   trafficSources TrafficSource[]
   trafficSourceMembers TrafficSourceMember[]
-  trafficFanValueSnapshots TrafficFanValueSnapshot[]
   creatorSubscriptionLedgers CreatorSubscriptionLedger[]
   trafficDailyAggregates TrafficDailyAggregate[]
   fans CreatorFan[]
@@ -526,6 +524,7 @@ model CreatorAccount {
   notificationScanItems CreatorNotificationScanItem[]
   financialTransactions CreatorFinancialTransaction[]
   fanValueCurrent CreatorFanValueCurrent[]
+  fanRelationshipCurrent CreatorFanRelationshipCurrent[]
   earningsTotals CreatorEarningsTotal[]
   taskActivities CreatorTaskActivity[]
   customOrders CustomOrder[]
@@ -943,6 +942,7 @@ model WorkerDevice {
   creatorPaidSubscriptionsCollected CreatorPaidSubscription[] @relation("CreatorPaidSubscriptionCollectedByDevice")
   creatorFinancialTransactionsCollected CreatorFinancialTransaction[] @relation("CreatorFinancialTransactionCollectedByDevice")
   creatorFanValuesCollected CreatorFanValueCurrent[] @relation("CreatorFanValueCurrentCollectedByDevice")
+  creatorFanRelationshipsCollected CreatorFanRelationshipCurrent[] @relation("CreatorFanRelationshipCurrentCollectedByDevice")
   creatorEarningsTotalsCollected CreatorEarningsTotal[] @relation("CreatorEarningsTotalCollectedByDevice")
   creatorLocalMessageCoverage CreatorLocalMessageCoverage[]
   creatorFanLocalCoverage CreatorFanLocalCoverage[]
@@ -1494,12 +1494,18 @@ model CreatorFan {
   agencyId       String
   creatorId      String
   onlyFansUserId String
-  username       String?
-  displayName    String?
-  firstSeenAt    DateTime @default(now())
-  lastSeenAt     DateTime @default(now())
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  username               String?
+  displayName            String?
+  avatarUrl              String?
+  headerUrl              String?
+  identityObservedAt     DateTime?
+  identitySource         String?
+  identityCompleteness   String?
+  firstSeenAt            DateTime @default(now())
+  lastSeenAt             DateTime @default(now())
+  lastActivityObservedAt DateTime?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
 
   creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   sales CreatorSale[]
@@ -1513,27 +1519,68 @@ model CreatorFan {
   localCoverage CreatorFanLocalCoverage[]
   financialTransactions CreatorFinancialTransaction[]
   valueCurrent CreatorFanValueCurrent?
+  relationshipCurrent CreatorFanRelationshipCurrent?
 
   @@unique([creatorId, onlyFansUserId])
   @@unique([creatorId, id], map: "CreatorFan_creatorId_id_key")
   @@index([agencyId, creatorId])
   @@index([creatorId, lastSeenAt])
+  @@index([creatorId, identityObservedAt], map: "CreatorFan_creatorId_identityObservedAt_idx")
+}
+
+model CreatorFanRelationshipCurrent {
+  id                       String   @id @default(cuid())
+  agencyId                 String
+  creatorId                String
+  fanRecordId              String
+  onlyFansUserId           String
+  fanSubscribesToCreator   Boolean?
+  fanSubscriptionActive    Boolean?
+  fanSubscriptionType      String?
+  fanSubscriptionExpiresAt DateTime?
+  creatorFollowsFan        Boolean?
+  creatorFollowExpiresAt   DateTime?
+  canReceiveChatMessage    Boolean?
+  blocked                  Boolean?
+  restricted               Boolean?
+  performer                Boolean?
+  lastSeenAt               DateTime?
+  subscribePriceCents      Int?
+  observedAt               DateTime
+  source                   String
+  sourceDeviceId           String?
+  sourceJobId              String?
+  scanRunId                String?
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  fan          CreatorFan     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: Cascade)
+  sourceDevice WorkerDevice?  @relation("CreatorFanRelationshipCurrentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob    JobInstance?   @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, onlyFansUserId])
+  @@index([agencyId, creatorId, observedAt])
+  @@index([creatorId, fanRecordId])
+  @@index([sourceDeviceId])
+  @@index([sourceJobId])
 }
 
 model CreatorFanValueCurrent {
-  id                    String   @id @default(cuid())
-  agencyId              String
-  creatorId             String
-  fanId                  String
-  totalNetCents          BigInt   @default(0)
-  messagesNetCents       BigInt   @default(0)
-  subscriptionsNetCents  BigInt   @default(0)
-  tipsNetCents           BigInt   @default(0)
-  postsNetCents          BigInt   @default(0)
-  streamsNetCents        BigInt   @default(0)
-  lastActivityAt         DateTime?
-  fetchedAt              DateTime
-  source                 String   @default("ONLYFANS_SUBSCRIBER_PROFILE")
+  id                              String   @id @default(cuid())
+  agencyId                        String
+  creatorId                       String
+  fanRecordId                     String   @map("fanId")
+  platformReportedTotalSpendCents BigInt?  @map("totalNetCents")
+  messagesSpentCents              BigInt?  @map("messagesNetCents")
+  subscriptionsSpentCents         BigInt?  @map("subscriptionsNetCents")
+  tipsSpentCents                  BigInt?  @map("tipsNetCents")
+  postsSpentCents                 BigInt?  @map("postsNetCents")
+  streamsSpentCents               BigInt?  @map("streamsNetCents")
+  lastActivityAt                  DateTime?
+  valueObservedAt                 DateTime @map("fetchedAt")
+  availability                    String   @default("AVAILABLE")
+  source                          String   @default("UNKNOWN")
   sourceDeviceId         String?
   sourceJobId            String?
   scanRunId              String?
@@ -1541,13 +1588,13 @@ model CreatorFanValueCurrent {
   updatedAt              DateTime @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan          CreatorFan     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: Cascade)
+  fan          CreatorFan     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: Cascade)
   sourceDevice WorkerDevice?   @relation("CreatorFanValueCurrentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
 
-  @@unique([creatorId, fanId])
-  @@index([agencyId, creatorId, fetchedAt])
-  @@index([creatorId, totalNetCents])
+  @@unique([creatorId, fanRecordId])
+  @@index([agencyId, creatorId, valueObservedAt])
+  @@index([creatorId, platformReportedTotalSpendCents])
   @@index([sourceDeviceId])
   @@index([sourceJobId])
 }
@@ -1601,6 +1648,9 @@ model CreatorNotificationScanItem {
   factType              CreatorNotificationScanFactType?
   occurredAt            DateTime?
   fanOnlyFansUserId     String?
+  fanUsernameAtEvent    String?
+  fanDisplayNameAtEvent String?
+  fanAvatarUrlAtEvent   String?
   postId                String?
   commentId             String?
   messageId             String?
@@ -1693,6 +1743,9 @@ model CreatorFinancialTransaction {
   creatorId             String
   fanId                  String?
   fanOnlyFansUserId      String?
+  fanUsernameAtEvent     String?
+  fanDisplayNameAtEvent  String?
+  fanAvatarUrlAtEvent    String?
   externalTransactionId String
   transactionType       String
   factType               CreatorFinancialTransactionFactType        @default(OTHER)
@@ -1765,6 +1818,10 @@ model CreatorSale {
   agencyId               String
   creatorId              String
   fanId                   String?
+  fanOnlyFansUserIdAtEvent String?
+  fanUsernameAtEvent      String?
+  fanDisplayNameAtEvent   String?
+  fanAvatarUrlAtEvent     String?
   eventFingerprint       String
   externalNotificationId String?
   externalTransactionId  String?
@@ -1809,6 +1866,10 @@ model CreatorTip {
   agencyId               String
   creatorId              String
   fanId                   String?
+  fanOnlyFansUserIdAtEvent String?
+  fanUsernameAtEvent      String?
+  fanDisplayNameAtEvent   String?
+  fanAvatarUrlAtEvent     String?
   eventFingerprint       String
   externalNotificationId String?
   externalTransactionId  String?
@@ -1849,6 +1910,10 @@ model CreatorSubscriptionEvent {
   agencyId               String
   creatorId              String
   fanId                   String?
+  fanOnlyFansUserIdAtEvent String?
+  fanUsernameAtEvent      String?
+  fanDisplayNameAtEvent   String?
+  fanAvatarUrlAtEvent     String?
   eventFingerprint       String
   externalNotificationId String?
   externalTransactionId  String?
@@ -1915,6 +1980,10 @@ model CreatorPaidSubscription {
   agencyId               String
   creatorId              String
   fanId                   String?
+  fanOnlyFansUserIdAtEvent String?
+  fanUsernameAtEvent      String?
+  fanDisplayNameAtEvent   String?
+  fanAvatarUrlAtEvent     String?
   eventFingerprint       String
   externalTransactionId  String?
   subscriptionEventId    String?                               @unique
@@ -1956,6 +2025,10 @@ model CreatorPostLike {
   agencyId               String
   creatorId              String
   fanId                   String?
+  fanOnlyFansUserIdAtEvent String?
+  fanUsernameAtEvent      String?
+  fanDisplayNameAtEvent   String?
+  fanAvatarUrlAtEvent     String?
   eventFingerprint       String
   externalNotificationId String?
   onlyFansLikeId         String?
@@ -1986,6 +2059,10 @@ model CreatorPostComment {
   agencyId               String
   creatorId              String
   fanId                   String?
+  fanOnlyFansUserIdAtEvent String?
+  fanUsernameAtEvent      String?
+  fanDisplayNameAtEvent   String?
+  fanAvatarUrlAtEvent     String?
   eventFingerprint       String
   externalNotificationId String?
   onlyFansCommentId      String?
@@ -2087,6 +2164,9 @@ model CreatorCampaignFan {
   campaignId      String
   fanId           String
   externalClaimerId String?
+  claimerUsernameAtEvent String?
+  claimerDisplayNameAtEvent String?
+  claimerAvatarUrlAtEvent String?
   attributedAt    DateTime?
   attributionSource CreatorCampaignAttributionSource @default(ONLYFANS_TRACKING)
   attributionConfidence CreatorCampaignAttributionConfidence @default(CONFIRMED)
@@ -2323,6 +2403,7 @@ model JobInstance {
   creatorNotificationScanItems CreatorNotificationScanItem[]
   creatorFinancialTransactions CreatorFinancialTransaction[]
   creatorFanValues CreatorFanValueCurrent[]
+  creatorFanRelationships CreatorFanRelationshipCurrent[]
   creatorEarningsTotals CreatorEarningsTotal[]
 
   @@index([status, nextRunAt])
@@ -2853,7 +2934,7 @@ model CreatorPresenceUser {
   username          String?
   name              String?
   avatarUrl         String?
-  totalSpentCents   Int      @default(0)
+  totalSpentCents   Int?
   subscribeAt       DateTime?
   duration          String?
   status            String   @default("online")
@@ -3537,10 +3618,10 @@ model FollowBackCandidate {
   username              String?
   displayName           String?
   avatarUrl             String?
-  subscriptionType      String?
-  isActive              Boolean?
+  fanSubscriptionType   String?  @map("subscriptionType")
+  fanSubscriptionActive Boolean? @map("isActive")
   canReceiveChatMessage Boolean?
-  subscribedByCreator   Boolean?
+  creatorFollowsFan     Boolean? @map("subscribedByCreator")
   discoveredAt          DateTime @default(now())
   lastSeenAt            DateTime?
   eligibilityReason     String?
@@ -3577,10 +3658,10 @@ model FollowAutomationCandidate {
   username              String?
   displayName           String?
   avatarUrl             String?
-  subscriptionType      String?
-  isActive              Boolean?
-  subscribedByCreator   Boolean?
-  subscribedOn          Boolean?
+  fanSubscriptionType   String?  @map("subscriptionType")
+  fanSubscriptionActive Boolean? @map("isActive")
+  creatorFollowsFan     Boolean? @map("subscribedByCreator")
+  fanSubscribesToCreator Boolean? @map("subscribedOn")
   subscribePriceCents   Int      @default(0)
   ofBlocked             Boolean  @default(false)
   restricted            Boolean  @default(false)
@@ -3835,14 +3916,29 @@ model SubscriberScanItem {
   username              String?
   name                  String?
   avatarUrl             String?
-  totalSpentCents       Int      @default(0)
-  lastSeenAt            DateTime?
+  totalSpentCents         Int?
+  messagesSpentCents      Int?
+  tipsSpentCents          Int?
+  subscriptionsSpentCents Int?
+  postsSpentCents         Int?
+  streamsSpentCents       Int?
+  valueAvailability       String   @default("NOT_FETCHED")
+  lastSeenAt              DateTime?
   lastSeenIsNull        Boolean  @default(false)
-  canReceiveChatMessage Boolean?
-  isActive              Boolean?
-  subscribedOn          Boolean?
-  subscribedBy          Boolean?
-  subscriptionType      String?
+  canReceiveChatMessage   Boolean?
+  isActive                Boolean?
+  subscribedOn            Boolean?
+  subscribedBy            Boolean?
+  subscriptionType        String?
+  fanSubscribesToCreator  Boolean?
+  fanSubscriptionActive   Boolean?
+  fanSubscriptionExpiresAt DateTime?
+  creatorFollowsFan       Boolean?
+  creatorFollowExpiresAt  DateTime?
+  blocked                 Boolean?
+  restricted              Boolean?
+  performer               Boolean?
+  subscribePriceCents     Int?
   contentHash           String
   metadata              Json     @default("{}")
   observedAt            DateTime @default(now())
@@ -3891,7 +3987,7 @@ model HiddenOnlineUser {
   dialogId        String?
   username        String?
   name            String?
-  totalSpentCents Int      @default(0)
+  totalSpentCents Int?
   status          String   @default("active") // active | ignored | blocked | removed
   signals         Json     @default("[]")
   metadata        Json     @default("{}")
@@ -4604,33 +4700,6 @@ model TrafficSourceMember {
   @@index([lastRevenueAt, lastSeenAt, needsValueRefresh])
 }
 
-model TrafficFanValueSnapshot {
-  id        String   @id @default(cuid())
-  agencyId  String
-  creatorId String
-  fanId     String
-
-  totalSummCents      Int @default(0)
-  messagesSummCents   Int @default(0)
-  tipsSummCents       Int @default(0)
-  subscribesSummCents Int @default(0)
-  postsSummCents      Int @default(0)
-  streamsSummCents    Int @default(0)
-
-  lastActivity DateTime?
-  fetchedAt    DateTime @default(now())
-  source       String   @default("fan_value_core")
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@unique([agencyId, creatorId, fanId])
-  @@index([agencyId, creatorId, fetchedAt])
-  @@index([fetchedAt])
-}
 
 model CreatorSubscriptionLedger {
   id        String   @id @default(cuid())

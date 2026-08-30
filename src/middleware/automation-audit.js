@@ -72,7 +72,7 @@ function shouldAudit(req) {
   // Runtime event ingestion is machine telemetry, not a user business action.
   // Auditing every WS flush produced hundreds of meaningless mutation.post rows.
   if (path.endsWith("/events")) return false;
-  if (path.includes("/result") || path.includes("/intel-bulk") || path.includes("/worker/")) return false;
+  if (path.includes("/result") || path.includes("/worker/")) return false;
   return true;
 }
 

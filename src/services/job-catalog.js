@@ -4,6 +4,7 @@ const JOB_CATALOG = Object.freeze({
   fetch_earnings: Object.freeze({ wave: "read-only", scope: "creator" }),
   fetch_campaigns: Object.freeze({ wave: "read-only", scope: "creator" }),
   traffic_sources_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
+  fan_data_point_refresh: Object.freeze({ wave: "read-only", scope: "creator" }),
   catchup_notifications_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
   financial_transactions_scan: Object.freeze({ wave: "read-only", scope: "creator" }),
   dialog_intelligence_scan: Object.freeze({ wave: "read-only", scope: "creator" }),

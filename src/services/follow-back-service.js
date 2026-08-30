@@ -11,6 +11,7 @@ const {
 } = require("./automation-control-service");
 const { listActionDeliveries, retryActionDelivery } = require("./automation-action-delivery-service");
 const { evaluateCandidate } = require("./follow-back-rules");
+const { readFanCurrent } = require("./fan-data-authority-service");
 
 const FOLLOW_BACK_ACTION_TYPE = "FOLLOW_BACK";
 const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"];
@@ -38,20 +39,22 @@ async function refreshFollowBackProjection({ db = prisma, agencyId, creatorId, r
     )
     SELECT
       'follow_' || md5(i."creatorId" || ':' || i."fanId"), i."agencyId", i."creatorId", i."fanId", i."dialogId",
-      i."username", i."name", i."avatarUrl", i."subscriptionType", i."isActive", i."canReceiveChatMessage",
-      i."subscribedBy", $2, i."lastSeenAt",
+      f."username", f."displayName", f."avatarUrl", r."fanSubscriptionType", r."fanSubscriptionActive", r."canReceiveChatMessage",
+      r."creatorFollowsFan", $2, r."lastSeenAt",
       CASE
-        WHEN i."subscribedBy" = true THEN 'already_followed'
-        WHEN i."isActive" = false THEN 'expired_subscriber'
+        WHEN r."creatorFollowsFan" = true THEN 'already_followed'
+        WHEN r."fanSubscriptionActive" = false THEN 'expired_subscriber'
         ELSE 'active_subscriber'
       END,
       false, false,
-      CASE WHEN i."subscribedBy" = true THEN 'FOLLOWED' ELSE 'CANDIDATE' END,
+      CASE WHEN r."creatorFollowsFan" = true THEN 'FOLLOWED' ELSE 'CANDIDATE' END,
       1, NULL, i."runId",
       COALESCE(i."metadata", '{}'::jsonb) || jsonb_build_object(
-        'source', 'subscriber_directory', 'snapshotRunId', i."runId", 'subscribedOn', i."subscribedOn"
+        'source', 'fan_relationship_current', 'snapshotRunId', i."runId", 'fanSubscribesToCreator', r."fanSubscribesToCreator", 'relationshipObservedAt', r."observedAt"
       ), $2, $2
     FROM "SubscriberScanItem" i
+    JOIN "CreatorFan" f ON f."creatorId" = i."creatorId" AND f."onlyFansUserId" = i."fanId"
+    JOIN "CreatorFanRelationshipCurrent" r ON r."creatorId" = i."creatorId" AND r."onlyFansUserId" = i."fanId"
     WHERE i."runId" = $1
     ON CONFLICT ("creatorId", "fanId") DO UPDATE SET
       "dialogId" = EXCLUDED."dialogId",
@@ -125,28 +128,28 @@ async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
 
 function automaticEligibilityWhere(settings, now = new Date()) {
   const and = [
-    { OR: [{ subscribedByCreator: false }, { subscribedByCreator: null }] },
+    { OR: [{ creatorFollowsFan: false }, { creatorFollowsFan: null }] },
     { OR: [{ cooldownUntil: null }, { cooldownUntil: { lte: now } }] },
   ];
   if (settings.activeSubscribers && !settings.expiredSubscribers) {
-    and.push({ OR: [{ isActive: true }, { isActive: null }] });
+    and.push({ OR: [{ fanSubscriptionActive: true }, { fanSubscriptionActive: null }] });
   } else if (!settings.activeSubscribers && settings.expiredSubscribers) {
-    and.push({ isActive: false });
+    and.push({ fanSubscriptionActive: false });
   } else if (!settings.activeSubscribers && !settings.expiredSubscribers) {
     and.push({ id: "__no_eligible_subscription_state__" });
   }
   if (!settings.expiredSubscribers) {
-    and.push({ OR: [{ subscriptionType: null }, { NOT: { subscriptionType: { contains: "expired", mode: "insensitive" } } }] });
+    and.push({ OR: [{ fanSubscriptionType: null }, { NOT: { fanSubscriptionType: { contains: "expired", mode: "insensitive" } } }] });
   }
   if (!settings.freeSubscribers) {
-    and.push({ OR: [{ subscriptionType: null }, { NOT: { subscriptionType: { contains: "free", mode: "insensitive" } } }] });
+    and.push({ OR: [{ fanSubscriptionType: null }, { NOT: { fanSubscriptionType: { contains: "free", mode: "insensitive" } } }] });
   }
   if (!settings.paidSubscribers) {
     and.push({ OR: [
-      { subscriptionType: null },
+      { fanSubscriptionType: null },
       { AND: [
-        { NOT: { subscriptionType: { contains: "paid", mode: "insensitive" } } },
-        { NOT: { subscriptionType: { contains: "active", mode: "insensitive" } } },
+        { NOT: { fanSubscriptionType: { contains: "paid", mode: "insensitive" } } },
+        { NOT: { fanSubscriptionType: { contains: "active", mode: "insensitive" } } },
       ] },
     ] });
   }
@@ -278,7 +281,7 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
               fanId: candidate.fanId,
               username: candidate.username,
               displayName: candidate.displayName,
-              subscriptionType: candidate.subscriptionType,
+              subscriptionType: candidate.fanSubscriptionType,
               snapshotRunId: candidate.snapshotRunId,
               source,
             },
@@ -380,8 +383,8 @@ async function setCandidateState({ agencyId, creatorId, fanId, action }) {
         ? {
             blocked: false,
             ignored: false,
-            state: candidate.subscribedByCreator ? "FOLLOWED" : "CANDIDATE",
-            eligibilityReason: candidate.subscribedByCreator ? "already_followed" : (candidate.isActive === false ? "expired_subscriber" : "active_subscriber"),
+            state: candidate.creatorFollowsFan ? "FOLLOWED" : "CANDIDATE",
+            eligibilityReason: candidate.creatorFollowsFan ? "already_followed" : (candidate.fanSubscriptionActive === false ? "expired_subscriber" : "active_subscriber"),
           }
         : null;
   if (!data) throw Object.assign(new Error("Invalid candidate action"), { code: "invalid_candidate_action", status: 400 });
@@ -485,12 +488,33 @@ async function listFollowBack({ agencyId, creatorId, search = "", state = null, 
     }),
     prisma.followBackCandidate.count({ where: { agencyId, creatorId } }),
     countEligibleCandidates({ agencyId, creatorId, settings, now }),
-    prisma.followBackCandidate.count({ where: { agencyId, creatorId, subscribedByCreator: true } }),
+    prisma.followBackCandidate.count({ where: { agencyId, creatorId, creatorFollowsFan: true } }),
   ]);
   const statusCounts = Object.fromEntries(deliveriesByStatus.map((row) => [row.status, row._count._all]));
+  const currentRows = await readFanCurrent(prisma, {
+    agencyId, creatorId, onlyFansUserIds: items.map((item) => item.fanId).filter(Boolean),
+  });
+  const currentByFan = new Map(currentRows.map((row) => [String(row.onlyFansUserId), row]));
   const publicItems = items.map((item) => {
     const eligibility = evaluateCandidate(item, settings, now);
-    return { ...item, currentEligibility: eligibility.code, eligible: eligibility.eligible };
+    const current = currentByFan.get(String(item.fanId || '')) || null;
+    return {
+      ...item,
+      currentEligibility: eligibility.code,
+      eligible: eligibility.eligible,
+      platformIdentity: current?.platformIdentity || null,
+      relationship: current?.relationship || null,
+      value: current?.value || null,
+      username: current?.platformIdentity?.username ?? item.username ?? null,
+      displayName: current?.platformIdentity?.platformDisplayName ?? item.displayName ?? null,
+      avatarUrl: current?.platformIdentity?.avatarUrl ?? item.avatarUrl ?? null,
+      platformReportedTotalSpendCents: current?.value?.platformReportedTotalSpendCents ?? null,
+      valueAvailability: current?.value?.availability ?? 'NOT_FETCHED',
+      // Compatibility aliases only; canonical relationship vocabulary lives on relationship/current fields.
+      subscriptionType: item.fanSubscriptionType ?? null,
+      isActive: item.fanSubscriptionActive ?? null,
+      subscribedByCreator: item.creatorFollowsFan ?? null,
+    };
   });
   return {
     ok: true,

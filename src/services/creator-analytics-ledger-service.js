@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
+const { projectFanIdentity, projectFanValue } = require("./fan-data-authority-service");
 
 const RANGE_DAYS = Object.freeze({ "24h": 1, "7d": 7, "30d": 30, "90d": 90, "180d": 180, "365d": 365 });
 const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v7";
@@ -524,6 +525,7 @@ function normalizeClaimer(raw) {
     onlyFansUserId,
     username: text(user.username, 200),
     displayName: text(user.name ?? user.displayName, 500),
+    avatarUrl: text(user.avatar ?? user.avatarUrl ?? object(user.avatarThumbs).c144 ?? object(user.avatarThumbs).c50, 1200),
     externalClaimerId: text(row.id ?? row.claimerId, 220),
     attributedAt,
   };
@@ -660,32 +662,16 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
 
     for (const claimer of uniqueClaimers.values()) {
       const seenAt = claimer.attributedAt || observedAt;
-      const fanWhere = { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId: claimer.onlyFansUserId } };
-      const existingFan = await tx.creatorFan.findUnique({ where: fanWhere, select: { id: true, lastSeenAt: true } });
-      let fan;
-      if (existingFan) {
-        const previousLastSeenAt = existingFan.lastSeenAt instanceof Date ? existingFan.lastSeenAt : new Date(existingFan.lastSeenAt);
-        fan = await tx.creatorFan.update({
-          where: fanWhere,
-          data: {
-            ...(claimer.username ? { username: claimer.username } : {}),
-            ...(claimer.displayName ? { displayName: claimer.displayName } : {}),
-            ...(Number.isFinite(previousLastSeenAt.getTime()) && previousLastSeenAt > seenAt ? {} : { lastSeenAt: seenAt }),
-          },
-        });
-      } else {
-        fan = await tx.creatorFan.create({
-          data: {
-            agencyId: job.agencyId,
-            creatorId: job.creatorId,
-            onlyFansUserId: claimer.onlyFansUserId,
-            username: claimer.username,
-            displayName: claimer.displayName,
-            firstSeenAt: seenAt,
-            lastSeenAt: seenAt,
-          },
-        });
-      }
+      const fan = await projectFanIdentity(tx, {
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        onlyFansUserId: claimer.onlyFansUserId,
+        username: claimer.username,
+        platformDisplayName: claimer.displayName,
+        observedAt: seenAt,
+        activityObservedAt: seenAt,
+        source: "CAMPAIGN_CLAIMER",
+      });
 
       const where = { campaignId_fanId: { campaignId: saved.id, fanId: fan.id } };
       const existing = await tx.creatorCampaignFan.findUnique({
@@ -708,6 +694,9 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
           campaignId: saved.id,
           fanId: fan.id,
           externalClaimerId: claimer.externalClaimerId,
+          claimerUsernameAtEvent: claimer.username || null,
+          claimerDisplayNameAtEvent: claimer.displayName || null,
+          claimerAvatarUrlAtEvent: claimer.avatarUrl || null,
           attributedAt: claimer.attributedAt,
           sourceScanRunId: scanRunId,
           sourceScanStartedAt: scanStartedAt,
@@ -717,6 +706,9 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         },
         update: {
           externalClaimerId: claimer.externalClaimerId || existing?.externalClaimerId || null,
+          claimerUsernameAtEvent: claimer.username || null,
+          claimerDisplayNameAtEvent: claimer.displayName || null,
+          claimerAvatarUrlAtEvent: claimer.avatarUrl || null,
           attributedAt,
           sourceScanRunId: scanRunId,
           sourceScanStartedAt: scanStartedAt,
@@ -755,69 +747,60 @@ function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
     return { available: false, observedAt, onlyFansUserId, reasonCode: text(item.reasonCode, 180) || "FAN_VALUE_UNAVAILABLE" };
   }
   const values = {
-    totalNetCents: safeBigIntCents(item.totalNetCents),
-    messagesNetCents: safeBigIntCents(item.messagesNetCents),
-    subscriptionsNetCents: safeBigIntCents(item.subscriptionsNetCents),
-    tipsNetCents: safeBigIntCents(item.tipsNetCents),
-    postsNetCents: safeBigIntCents(item.postsNetCents),
-    streamsNetCents: safeBigIntCents(item.streamsNetCents),
+    totalSpentCents: safeBigIntCents(item.totalSpentCents ?? item.totalNetCents),
+    messagesSpentCents: safeBigIntCents(item.messagesSpentCents ?? item.messagesNetCents),
+    subscriptionsSpentCents: safeBigIntCents(item.subscriptionsSpentCents ?? item.subscriptionsNetCents),
+    tipsSpentCents: safeBigIntCents(item.tipsSpentCents ?? item.tipsNetCents),
+    postsSpentCents: safeBigIntCents(item.postsSpentCents ?? item.postsNetCents),
+    streamsSpentCents: safeBigIntCents(item.streamsSpentCents ?? item.streamsNetCents),
   };
-  if (Object.values(values).some((value) => value === null)) throw new Error("Campaign fan value cents are invalid");
+  if (values.totalSpentCents === null) throw new Error("Campaign fan value total cents are invalid");
   const lastActivityAt = item.lastActivityAt == null ? null : strictDate(item.lastActivityAt);
   if (item.lastActivityAt != null && !lastActivityAt) throw new Error("Campaign fan value lastActivityAt is invalid");
   return {
     available: true, observedAt, onlyFansUserId, values, lastActivityAt,
     username: text(item.username, 200),
     displayName: text(item.displayName, 500),
+    identitySource: text(item.identitySource, 80) || "USER_PROFILE",
+    valueSource: text(item.valueSource ?? item.source, 80) || "USER_PROFILE",
   };
 }
 
 async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }) {
   if (item.available !== true) return { available: false, reasonCode: item.reasonCode };
-  const fan = await tx.creatorFan.findUnique({
-    where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId: item.onlyFansUserId } },
-    select: { id: true },
-  });
-  if (!fan) return { available: false, reasonCode: "CAMPAIGN_FAN_NOT_FOUND" };
-
-  const existing = await tx.creatorFanValueCurrent.findUnique({
-    where: { creatorId_fanId: { creatorId: job.creatorId, fanId: fan.id } },
-    select: { id: true, fetchedAt: true },
-  });
-  if (existing?.fetchedAt && new Date(existing.fetchedAt).getTime() >= item.observedAt.getTime()) {
-    return { replay: true, available: true, fanId: fan.id, fetchedAt: existing.fetchedAt };
-  }
-
-  if (item.username || item.displayName) {
-    await tx.creatorFan.update({
-      where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId: item.onlyFansUserId } },
-      data: { ...(item.username ? { username: item.username } : {}), ...(item.displayName ? { displayName: item.displayName } : {}) },
-    });
-  }
-
-  const data = {
+  const fan = await projectFanIdentity(tx, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
-    fanId: fan.id,
-    totalNetCents: item.values.totalNetCents,
-    messagesNetCents: item.values.messagesNetCents,
-    subscriptionsNetCents: item.values.subscriptionsNetCents,
-    tipsNetCents: item.values.tipsNetCents,
-    postsNetCents: item.values.postsNetCents,
-    streamsNetCents: item.values.streamsNetCents,
+    onlyFansUserId: item.onlyFansUserId,
+    username: item.username,
+    platformDisplayName: item.displayName,
+    observedAt: item.observedAt,
+    source: item.identitySource || "USER_PROFILE",
+  });
+  const projected = await projectFanValue(tx, {
+    agencyId: job.agencyId,
+    creatorId: job.creatorId,
+    onlyFansUserId: item.onlyFansUserId,
+    totalSpentCents: item.values.totalSpentCents,
+    messagesSpentCents: item.values.messagesSpentCents,
+    subscriptionsSpentCents: item.values.subscriptionsSpentCents,
+    tipsSpentCents: item.values.tipsSpentCents,
+    postsSpentCents: item.values.postsSpentCents,
+    streamsSpentCents: item.values.streamsSpentCents,
     lastActivityAt: item.lastActivityAt,
-    fetchedAt: item.observedAt,
-    source: "ONLYFANS_SUBSCRIBER_PROFILE",
+    availability: "AVAILABLE",
+    observedAt: item.observedAt,
+    source: item.valueSource || "USER_PROFILE",
     sourceDeviceId: deviceId || null,
     sourceJobId: job.id,
     scanRunId,
-  };
-  await tx.creatorFanValueCurrent.upsert({
-    where: { creatorId_fanId: { creatorId: job.creatorId, fanId: fan.id } },
-    create: data,
-    update: data,
   });
-  return { replay: false, available: true, fanId: fan.id, fetchedAt: item.observedAt };
+  return {
+    replay: projected.replay,
+    available: true,
+    fanId: fan.id,
+    fetchedAt: projected.record?.valueObservedAt || item.observedAt,
+  };
 }
 
 async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }) {
@@ -1401,14 +1384,14 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
           lastSeenAt: true,
           valueCurrent: {
             select: {
-              totalNetCents: true,
-              messagesNetCents: true,
-              subscriptionsNetCents: true,
-              tipsNetCents: true,
-              postsNetCents: true,
-              streamsNetCents: true,
+              platformReportedTotalSpendCents: true,
+              messagesSpentCents: true,
+              subscriptionsSpentCents: true,
+              tipsSpentCents: true,
+              postsSpentCents: true,
+              streamsSpentCents: true,
               lastActivityAt: true,
-              fetchedAt: true,
+              valueObservedAt: true,
               source: true,
             },
           },
@@ -1496,15 +1479,16 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
         collectedAt: row.collectedAt,
         fan,
         fanValue: valueCurrent ? {
-          available: true,
-          totalNetCents: Number(valueCurrent.totalNetCents || 0),
-          messagesNetCents: Number(valueCurrent.messagesNetCents || 0),
-          subscriptionsNetCents: Number(valueCurrent.subscriptionsNetCents || 0),
-          tipsNetCents: Number(valueCurrent.tipsNetCents || 0),
-          postsNetCents: Number(valueCurrent.postsNetCents || 0),
-          streamsNetCents: Number(valueCurrent.streamsNetCents || 0),
+          available: valueCurrent.availability === "AVAILABLE",
+          availability: valueCurrent.availability,
+          platformReportedTotalSpendCents: valueCurrent.platformReportedTotalSpendCents == null ? null : Number(valueCurrent.platformReportedTotalSpendCents),
+          messagesSpentCents: valueCurrent.messagesSpentCents == null ? null : Number(valueCurrent.messagesSpentCents),
+          subscriptionsSpentCents: valueCurrent.subscriptionsSpentCents == null ? null : Number(valueCurrent.subscriptionsSpentCents),
+          tipsSpentCents: valueCurrent.tipsSpentCents == null ? null : Number(valueCurrent.tipsSpentCents),
+          postsSpentCents: valueCurrent.postsSpentCents == null ? null : Number(valueCurrent.postsSpentCents),
+          streamsSpentCents: valueCurrent.streamsSpentCents == null ? null : Number(valueCurrent.streamsSpentCents),
           lastActivityAt: valueCurrent.lastActivityAt,
-          fetchedAt: valueCurrent.fetchedAt,
+          observedAt: valueCurrent.valueObservedAt,
           source: valueCurrent.source,
         } : null,
         revenue: moneyByFan.get(String(row.fanId)) || zeroMoney,
@@ -1534,18 +1518,19 @@ async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, o
       membership."campaignId",
       COUNT(value."id")::bigint AS "ofValueKnownFans",
       COUNT(*) FILTER (WHERE value."totalNetCents" > 0)::bigint AS "ofValuePayingFans",
-      COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "ofValueNetCents",
+      COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "platformReportedFanSpendCents",
       MAX(value."fetchedAt") AS "ofValueFetchedAt"
     FROM "CreatorCampaignFan" AS membership
     LEFT JOIN "CreatorFanValueCurrent" AS value
       ON value."creatorId" = membership."creatorId" AND value."fanId" = membership."fanId"
+     AND value."availability" = 'AVAILABLE'
     WHERE membership."creatorId" = $1
     GROUP BY membership."campaignId"
   `, creatorId) : [];
   const currentValueByCampaign = new Map(currentValueRows.map((row) => [String(row.campaignId), {
     ofValueKnownFans: Number(row.ofValueKnownFans || 0),
     ofValuePayingFans: Number(row.ofValuePayingFans || 0),
-    ofValueNetCents: Number(row.ofValueNetCents || 0),
+    platformReportedFanSpendCents: Number(row.platformReportedFanSpendCents || 0),
     ofValueFetchedAt: row.ofValueFetchedAt || null,
   }]));
   const pageRows = rows.slice(0, take).map((row) => {
@@ -1556,7 +1541,7 @@ async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, o
       pendingGrossCents: 0, pendingNetCents: 0, pendingTransactionsCount: 0,
       salesRevenueCents: 0, tipsRevenueCents: 0, subscriptionRevenueCents: 0,
     };
-    const currentValue = currentValueByCampaign.get(row.id) || { ofValueKnownFans: 0, ofValuePayingFans: 0, ofValueNetCents: 0, ofValueFetchedAt: null };
+    const currentValue = currentValueByCampaign.get(row.id) || { ofValueKnownFans: 0, ofValuePayingFans: 0, platformReportedFanSpendCents: 0, ofValueFetchedAt: null };
     return { ...campaign, fansCount: Number(_count?.fans || 0), ...money, ...currentValue };
   });
   const revenueSummary = [...revenue.values()].reduce((acc, item) => {
@@ -1570,10 +1555,11 @@ async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, o
     SELECT
       COUNT(value."id")::bigint AS "ofValueKnownFans",
       COUNT(*) FILTER (WHERE value."totalNetCents" > 0)::bigint AS "ofValuePayingFans",
-      COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "ofValueNetCents",
+      COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "platformReportedFanSpendCents",
       MAX(value."fetchedAt") AS "ofValueFetchedAt"
     FROM "CreatorFanValueCurrent" AS value
     WHERE value."creatorId" = $1
+      AND value."availability" = 'AVAILABLE'
       AND EXISTS (
         SELECT 1 FROM "CreatorCampaignFan" AS membership
         WHERE membership."creatorId" = $1 AND membership."fanId" = value."fanId"
@@ -1588,7 +1574,7 @@ async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, o
       ...revenueSummary,
       ofValueKnownFans: Number(currentValueSummary.ofValueKnownFans || 0),
       ofValuePayingFans: Number(currentValueSummary.ofValuePayingFans || 0),
-      ofValueNetCents: Number(currentValueSummary.ofValueNetCents || 0),
+      platformReportedFanSpendCents: Number(currentValueSummary.platformReportedFanSpendCents || 0),
       ofValueFetchedAt: currentValueSummary.ofValueFetchedAt || null,
     },
     pagination: { limit: take, offset: skip, returned: pageRows.length, total, hasMore: rows.length > take },

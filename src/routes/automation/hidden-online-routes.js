@@ -1,6 +1,7 @@
 "use strict";
 
 const { scheduleSubscriberScan, getSubscriberDirectoryStatus } = require("../../services/subscriber-directory-service");
+const { readFanCurrent } = require("../../services/fan-data-authority-service");
 
 function registerHiddenOnlineRoutes(router, deps) {
   const {
@@ -12,117 +13,24 @@ function registerHiddenOnlineRoutes(router, deps) {
   // Candidate listing and bump actions remain here. Subscriber scanning is
   // owned exclusively by SubscriberDirectory/JobInstance.
 
-  function hiddenCandidateMoneyCents(input = {}) {
-    const metadata = jsonObject(input.metadata || {});
-    const raw = jsonObject(input.raw || input.payload || {});
-    const d = jsonObject(input.subscribedOnData || raw.subscribedOnData || metadata.subscribedOnData || {});
-    const moneyNumber = (value) => {
-      if (value === undefined || value === null || value === "") return 0;
-      if (typeof value === "string") return Number(value.replace(/[^\d.,-]/g, "").replace(",", ".")) || 0;
-      return Number(value) || 0;
-    };
-    const cents = Math.max(
-      moneyNumber(input.totalSpentCents),
-      moneyNumber(input.spendTotalCents),
-      moneyNumber(input.spentCents),
-      moneyNumber(metadata.totalSpentCents),
-      moneyNumber(raw.totalSpentCents),
-      moneyNumber(raw.spendTotalCents),
-      moneyNumber(raw.spentCents)
-    );
-    if (cents > 0) return Math.round(cents);
-    const dollars = Math.max(
-      moneyNumber(d.totalSumm ?? input.totalSumm ?? metadata.totalSumm ?? raw.totalSumm ?? input.totalSpent ?? raw.totalSpent),
-      moneyNumber(d.messagesSumm ?? input.messagesSumm ?? metadata.messagesSumm ?? raw.messagesSumm) +
-        moneyNumber(d.tipsSumm ?? input.tipsSumm ?? metadata.tipsSumm ?? raw.tipsSumm) +
-        moneyNumber(d.postsSumm ?? input.postsSumm ?? metadata.postsSumm ?? raw.postsSumm) +
-        moneyNumber(d.streamsSumm ?? input.streamsSumm ?? metadata.streamsSumm ?? raw.streamsSumm) +
-        moneyNumber(d.subscribesSumm ?? input.subscribesSumm ?? metadata.subscribesSumm ?? raw.subscribesSumm)
-    );
-    return dollars > 0 ? Math.round(dollars * 100) : 0;
-  }
-  
-  function automationIntelNumber(value, fallback = 0) {
-    if (value === null || value === undefined || value === "") return fallback;
-    const n = typeof value === "number" ? value : Number(String(value).replace(/[^0-9.,-]/g, "").replace(",", "."));
-    return Number.isFinite(n) ? n : fallback;
-  }
-  
-  function automationIntelCents(input = {}) {
-    const item = input && typeof input === "object" ? input : {};
-    const direct = automationIntelNumber(item.totalSpentCents ?? item.spendTotalCents ?? item.spentCents, 0);
-    if (direct > 0) return Math.max(0, Math.round(direct));
-    const total = automationIntelNumber(item.totalSumm ?? item.totalSpent, 0);
-    const parts = automationIntelNumber(item.messagesSumm, 0) + automationIntelNumber(item.tipsSumm, 0) + automationIntelNumber(item.postsSumm, 0) + automationIntelNumber(item.streamsSumm, 0) + automationIntelNumber(item.subscribesSumm, 0);
-    return Math.max(0, Math.round(Math.max(total, parts) * 100));
-  }
-  
-  function compactAutomationFanIntel(input = {}) {
-    const src = input && typeof input === "object" ? input : {};
-    const fanId = cleanString(src.fanId || src.userId || src.id || "", 80);
-    if (!fanId) return null;
-    const totalSpentCents = automationIntelCents(src);
-    return jsonObject({
-      fanId,
-      username: optionalString(src.username, 120),
-      name: optionalString(src.name, 180),
-      displayName: optionalString(src.displayName, 180),
-      avatarUrl: optionalString(src.avatarUrl || src.avatar, 1000),
-      avatarThumbUrl: optionalString(src.avatarThumbUrl || src.avatarThumb, 1000),
-      subscribedAt: optionalString(src.subscribedAt || src.subscribeAt, 80),
-      subscribedUntil: optionalString(src.subscribedUntil || src.subscribedOnExpireDate || src.expiredAt, 80),
-      subscribedDurationText: optionalString(src.subscribedDurationText || src.duration, 80),
-      subDays: Number.isFinite(Number(src.subDays)) ? Number(src.subDays) : null,
-      totalSumm: automationIntelNumber(src.totalSumm, totalSpentCents / 100),
-      messagesSumm: automationIntelNumber(src.messagesSumm, 0),
-      tipsSumm: automationIntelNumber(src.tipsSumm, 0),
-      postsSumm: automationIntelNumber(src.postsSumm, 0),
-      streamsSumm: automationIntelNumber(src.streamsSumm, 0),
-      subscribesSumm: automationIntelNumber(src.subscribesSumm, 0),
-      totalSpentCents,
-      messagesSpentCents: Math.max(0, Math.round(Number(src.messagesSpentCents || 0) || automationIntelNumber(src.messagesSumm, 0) * 100)),
-      tipsSpentCents: Math.max(0, Math.round(Number(src.tipsSpentCents || 0) || automationIntelNumber(src.tipsSumm, 0) * 100)),
-      postsSpentCents: Math.max(0, Math.round(Number(src.postsSpentCents || 0) || automationIntelNumber(src.postsSumm, 0) * 100)),
-      streamsSpentCents: Math.max(0, Math.round(Number(src.streamsSpentCents || 0) || automationIntelNumber(src.streamsSumm, 0) * 100)),
-      subscribesSpentCents: Math.max(0, Math.round(Number(src.subscribesSpentCents || 0) || automationIntelNumber(src.subscribesSumm, 0) * 100)),
-      joinDate: optionalString(src.joinDate, 80),
-      lastSeen: optionalString(src.lastSeen, 80),
-      canChat: src.canChat === undefined ? null : src.canChat !== false,
-      canReceiveChatMessage: src.canReceiveChatMessage === undefined ? null : src.canReceiveChatMessage !== false,
-      isBlocked: src.isBlocked === true,
-      isRestricted: src.isRestricted === true,
-      isPerformer: src.isPerformer === true,
-      isVerified: src.isVerified === true,
-      canEarn: src.canEarn === true,
-      fetchedAt: optionalString(src.fetchedAt, 80) || new Date().toISOString(),
-      source: optionalString(src.source, 80) || "fan_intel_provider",
-    });
-  }
-  
-  function mergeIntelIntoPublicRow(row = {}) {
-    const item = row && typeof row === "object" ? row : {};
-    const meta = jsonObject(item.metadata || {});
-    const result = jsonObject(item.result || {});
-    const intel = compactAutomationFanIntel(item.fanIntel || meta.fanIntel || result.fanIntel || meta || result || {});
-    if (!intel) return item;
+  function canonicalAutomationFan(row = {}, current = null) {
+    const identity = current?.platformIdentity || null;
+    const value = current?.value || null;
+    const available = value?.availability === "AVAILABLE";
     return {
-      ...item,
-      username: item.username || intel.username || null,
-      name: item.name || intel.displayName || intel.name || null,
-      displayName: intel.displayName || null,
-      avatarUrl: intel.avatarUrl || null,
-      avatarThumbUrl: intel.avatarThumbUrl || intel.avatarUrl || null,
-      totalSpentCents: Number(item.totalSpentCents || 0) || Number(intel.totalSpentCents || 0) || 0,
-      totalSumm: intel.totalSumm || 0,
-      messagesSumm: intel.messagesSumm || 0,
-      tipsSumm: intel.tipsSumm || 0,
-      subscribedAt: intel.subscribedAt || null,
-      subscribedUntil: intel.subscribedUntil || null,
-      subscribedDurationText: intel.subscribedDurationText || null,
-      subDays: intel.subDays ?? null,
-      lastSeen: intel.lastSeen || null,
-      fanIntelFetchedAt: intel.fetchedAt || null,
-      fanIntel: intel,
+      ...row,
+      platformIdentity: identity,
+      relationship: current?.relationship || null,
+      value,
+      username: identity?.username || row.username || null,
+      name: identity?.platformDisplayName || row.name || null,
+      displayName: identity?.platformDisplayName || row.displayName || null,
+      avatarUrl: identity?.avatarUrl || row.avatarUrl || null,
+      avatarThumbUrl: identity?.avatarUrl || row.avatarThumbUrl || row.avatarUrl || null,
+      platformReportedTotalSpendCents: available ? value.platformReportedTotalSpendCents : null,
+      totalSpentCents: available ? value.platformReportedTotalSpendCents : null,
+      valueAvailability: value?.availability || "NOT_FETCHED",
+      fanValueObservedAt: value?.observedAt || null,
     };
   }
   
@@ -530,14 +438,17 @@ function registerHiddenOnlineRoutes(router, deps) {
         }
       }
   
+      const currentRows = creatorId && fanIds.length
+        ? await readFanCurrent(prisma, { agencyId: req.auth.agencyId, creatorId, onlyFansUserIds: fanIds }).catch(() => [])
+        : [];
+      const currentByFan = new Map(currentRows.map((row) => [String(row.onlyFansUserId), row]));
       const enriched = items.map((item) => {
         const fanId = String(item.fanId || "");
         const meta = jsonObject(item.metadata || {});
         const latest = latestHiddenByFan.get(fanId) || null;
         const active = activeHiddenByFan.get(fanId) || null;
-        return mergeIntelIntoPublicRow({
+        return canonicalAutomationFan({
           ...item,
-          totalSpentCents: Number(item.totalSpentCents || 0) || hiddenCandidateMoneyCents(item),
           lastHiddenBumpAt: dateIso(latest?.sentAt) || dateIso(meta.lastHiddenSentAt) || dateIso(meta.lastHiddenQueuedAt) || automationDeliveryDateIso(latest) || null,
           lastHiddenQueuedAt: dateIso(meta.lastHiddenQueuedAt) || dateIso(latest?.createdAt) || null,
           lastHiddenStatus: latest?.status || meta.lastHiddenStatus || null,
@@ -546,7 +457,7 @@ function registerHiddenOnlineRoutes(router, deps) {
           hiddenActiveStatus: active?.status || null,
           hiddenActiveDeliveryId: active?.id || null,
           nextEligibleAt: dateIso(meta.nextEligibleAt || meta.hiddenNextEligibleAt) || null,
-        });
+        }, currentByFan.get(fanId) || null);
       });
   
       return res.json({ ok: true, items: enriched, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
@@ -583,42 +494,7 @@ function registerHiddenOnlineRoutes(router, deps) {
   });
   
   
-  router.post("/hidden-online/intel-bulk", async (req, res) => {
-    try {
-      const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
-      await requireCreator(prisma, req.auth.agencyId, creatorId);
-      const inputItems = Array.isArray(req.body?.items) ? req.body.items : [];
-      const updated = [];
-      for (const raw of inputItems.slice(0, 1000)) {
-        const intel = compactAutomationFanIntel(raw);
-        if (!intel?.fanId) continue;
-        const existing = await prisma.hiddenOnlineUser.findUnique({
-          where: { creatorId_fanId: { creatorId, fanId: intel.fanId } },
-        });
-        if (!existing || existing.agencyId !== req.auth.agencyId) continue;
-        const prevMeta = jsonObject(existing.metadata || {});
-        const name = intel.displayName || intel.name || existing.name || null;
-        const next = await prisma.hiddenOnlineUser.update({
-          where: { id: existing.id },
-          data: {
-            username: intel.username || existing.username || null,
-            name,
-            totalSpentCents: Math.max(Number(existing.totalSpentCents || 0), Number(intel.totalSpentCents || 0)),
-            metadata: jsonObject({
-              ...prevMeta,
-              ...intel,
-              fanIntel: intel,
-              fanIntelFetchedAt: intel.fetchedAt,
-            }),
-          },
-        });
-        updated.push(mergeIntelIntoPublicRow(next));
-      }
-      return res.json({ ok: true, creatorId, count: updated.length, items: updated });
-    } catch (err) { return sendError(res, err, "HIDDEN_ONLINE_INTEL_BULK_FAILED"); }
-  });
-  
-  
+
   router.post("/hidden-online/clear", requireSeniorAutomationWriter, async (req, res) => {
     try {
       const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);

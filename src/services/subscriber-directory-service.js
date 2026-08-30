@@ -5,6 +5,7 @@ const prisma = require("../prisma");
 const { refreshFollowBackProjection } = require("./follow-back-service");
 const { refreshFollowAutomationProjection } = require("./follow-automation-service");
 const { ensureAutomaticBumps } = require("./bump-service");
+const { projectSubscriberDirectoryRun, readFanCurrent } = require("./fan-data-authority-service");
 
 const SUBSCRIBER_DIRECTORY_JOB_KEY = "subscriber_directory_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING"];
@@ -22,6 +23,17 @@ function integer(value, fallback = 0, min = 0, max = Number.MAX_SAFE_INTEGER) {
   const number = Number(value);
   if (!Number.isFinite(number)) return fallback;
   return Math.max(min, Math.min(max, Math.floor(number)));
+}
+function integerOrNull(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
+  const number = Number(value);
+  return Number.isInteger(number) && number >= min && number <= max ? number : null;
+}
+function valueAvailability(raw) {
+  const explicit = clean(raw.valueAvailability, 40)?.toUpperCase();
+  if (["AVAILABLE", "NOT_FETCHED", "UNAVAILABLE", "MALFORMED"].includes(explicit)) return explicit;
+  if (raw.totalSpentCents === null || raw.totalSpentCents === undefined || raw.totalSpentCents === "") return "NOT_FETCHED";
+  return integerOrNull(raw.totalSpentCents, 0, 2_000_000_000) === null ? "MALFORMED" : "AVAILABLE";
 }
 function boolOrNull(value) {
   return typeof value === "boolean" ? value : null;
@@ -222,7 +234,13 @@ function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt }) {
     username: clean(raw.username, 160),
     name: clean(raw.name ?? raw.displayName, 240),
     avatarUrl: clean(raw.avatarUrl ?? raw.avatar, 1000),
-    totalSpentCents: integer(raw.totalSpentCents, 0, 0, 2_000_000_000),
+    totalSpentCents: integerOrNull(raw.totalSpentCents, 0, 2_000_000_000),
+    messagesSpentCents: integerOrNull(raw.messagesSpentCents, 0, 2_000_000_000),
+    tipsSpentCents: integerOrNull(raw.tipsSpentCents, 0, 2_000_000_000),
+    subscriptionsSpentCents: integerOrNull(raw.subscriptionsSpentCents, 0, 2_000_000_000),
+    postsSpentCents: integerOrNull(raw.postsSpentCents, 0, 2_000_000_000),
+    streamsSpentCents: integerOrNull(raw.streamsSpentCents, 0, 2_000_000_000),
+    valueAvailability: valueAvailability(raw),
     lastSeenAt: dateOrNull(raw.lastSeenAt),
     lastSeenIsNull,
     canReceiveChatMessage: boolOrNull(raw.canReceiveChatMessage),
@@ -230,6 +248,15 @@ function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt }) {
     subscribedOn: boolOrNull(raw.subscribedOn),
     subscribedBy: boolOrNull(raw.subscribedBy),
     subscriptionType: clean(raw.subscriptionType ?? raw.type, 80),
+    fanSubscribesToCreator: boolOrNull(raw.fanSubscribesToCreator),
+    fanSubscriptionActive: boolOrNull(raw.fanSubscriptionActive),
+    fanSubscriptionExpiresAt: dateOrNull(raw.fanSubscriptionExpiresAt),
+    creatorFollowsFan: boolOrNull(raw.creatorFollowsFan),
+    creatorFollowExpiresAt: dateOrNull(raw.creatorFollowExpiresAt),
+    blocked: boolOrNull(raw.blocked),
+    restricted: boolOrNull(raw.restricted),
+    performer: boolOrNull(raw.performer),
+    subscribePriceCents: integerOrNull(raw.subscribePriceCents, 0, 2_000_000_000),
     metadata: object(raw.metadata),
     observedAt,
   };
@@ -242,6 +269,12 @@ function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt }) {
       name: normalized.name,
       avatarUrl: normalized.avatarUrl,
       totalSpentCents: normalized.totalSpentCents,
+      messagesSpentCents: normalized.messagesSpentCents,
+      tipsSpentCents: normalized.tipsSpentCents,
+      subscriptionsSpentCents: normalized.subscriptionsSpentCents,
+      postsSpentCents: normalized.postsSpentCents,
+      streamsSpentCents: normalized.streamsSpentCents,
+      valueAvailability: normalized.valueAvailability,
       lastSeenAt: normalized.lastSeenAt?.toISOString?.() || null,
       lastSeenIsNull: normalized.lastSeenIsNull,
       canReceiveChatMessage: normalized.canReceiveChatMessage,
@@ -249,6 +282,13 @@ function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt }) {
       subscribedOn: normalized.subscribedOn,
       subscribedBy: normalized.subscribedBy,
       subscriptionType: normalized.subscriptionType,
+      fanSubscribesToCreator: normalized.fanSubscribesToCreator,
+      fanSubscriptionActive: normalized.fanSubscriptionActive,
+      fanSubscriptionExpiresAt: normalized.fanSubscriptionExpiresAt?.toISOString?.() || null,
+      creatorFollowsFan: normalized.creatorFollowsFan,
+      creatorFollowExpiresAt: normalized.creatorFollowExpiresAt?.toISOString?.() || null,
+      blocked: normalized.blocked, restricted: normalized.restricted, performer: normalized.performer,
+      subscribePriceCents: normalized.subscribePriceCents,
     });
   return normalized;
 }
@@ -352,6 +392,12 @@ async function publishRun(db, run, { jobId, scanEveryDays }) {
     });
   }
 
+  // The immutable run is the bulk source observation. Publish it into the
+  // canonical fact projections before downstream operational read models.
+  const fanDataProjection = await projectSubscriberDirectoryRun(db, {
+    runId: run.id, agencyId: run.agencyId, creatorId: run.creatorId, sourceJobId: jobId,
+  });
+
   // HiddenOnlineUser is a compact projection/override table. Existing ignored
   // and blocked choices are preserved while current candidates are refreshed.
   await db.$executeRawUnsafe(
@@ -417,7 +463,7 @@ async function publishRun(db, run, { jobId, scanEveryDays }) {
     runId: run.id,
   });
 
-  return { ...summary, followBackProjection, followAutomationProjection };
+  return { ...summary, fanDataProjection, followBackProjection, followAutomationProjection };
 }
 
 async function applySubscriberScanChunk({ db, job, chunkResult }) {
@@ -682,11 +728,29 @@ async function listHiddenOnline({
   ]);
 
   const count = asNumber(countRows?.[0]?.count);
-  const items = (Array.isArray(rows) ? rows : []).map((item) => ({
-    ...item,
-    totalSpentCents: asNumber(item.totalSpentCents),
-    metadata: object(item.metadata),
-  }));
+  const rawItems = Array.isArray(rows) ? rows : [];
+  const currentRows = await readFanCurrent(prisma, {
+    agencyId, creatorId, onlyFansUserIds: rawItems.map((item) => item.fanId).filter(Boolean),
+  });
+  const currentByFan = new Map(currentRows.map((row) => [String(row.onlyFansUserId), row]));
+  const items = rawItems.map((item) => {
+    const current = currentByFan.get(String(item.fanId || '')) || null;
+    return {
+      ...item,
+      platformIdentity: current?.platformIdentity || null,
+      relationship: current?.relationship || null,
+      value: current?.value || null,
+      username: current?.platformIdentity?.username ?? item.username ?? null,
+      name: current?.platformIdentity?.platformDisplayName ?? item.name ?? null,
+      avatarUrl: current?.platformIdentity?.avatarUrl ?? item.avatarUrl ?? null,
+      totalSpentCents: current?.value?.availability === 'AVAILABLE'
+        ? current.value.platformReportedTotalSpendCents
+        : null,
+      platformReportedTotalSpendCents: current?.value?.platformReportedTotalSpendCents ?? null,
+      valueAvailability: current?.value?.availability ?? 'NOT_FETCHED',
+      metadata: object(item.metadata),
+    };
+  });
   return {
     ok: true,
     creatorId,

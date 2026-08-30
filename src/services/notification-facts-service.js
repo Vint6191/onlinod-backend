@@ -5,6 +5,7 @@ const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { projectSubscriptionFacts, rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 const { reconcileCreatorSalesToTeam, reconcileCreatorTipsToTeam } = require("./team-money-reconciliation-service");
+const { projectFanIdentityBatch } = require("./fan-data-authority-service");
 
 const SERVICE_VERSION = "notification-facts-v1-history-v8-known-boundary";
 const SCHEMA_VERSION = 5;
@@ -161,6 +162,7 @@ function normalizeEvent(raw, creatorId) {
     externalFanId,
     fanUsername: clean(event.fanUsername || event.username, 200),
     fanDisplayName: clean(event.fanName || event.name, 500),
+    fanAvatarUrl: clean(event.fanAvatarUrl || event.avatarUrl || event.avatar || object(event.user).avatar || object(event.user).avatarUrl, 1200),
     externalNotificationId: clean(event.notificationId, 220),
     externalTransactionId: clean(event.transactionId, 220),
     amountCents,
@@ -567,6 +569,10 @@ function buildFactData({ fact, job, deviceId, fanIds, now }) {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     fanId: fact.externalFanId ? fanIds.get(fact.externalFanId) || null : null,
+    fanOnlyFansUserIdAtEvent: fact.externalFanId || null,
+    fanUsernameAtEvent: fact.fanUsername || null,
+    fanDisplayNameAtEvent: fact.fanDisplayName || null,
+    fanAvatarUrlAtEvent: fact.fanAvatarUrl || null,
     eventFingerprint: fact.fingerprint,
     externalNotificationId: fact.externalNotificationId,
     collectedAt: now,
@@ -590,102 +596,22 @@ function buildFactData({ fact, job, deviceId, fanIds, now }) {
 }
 
 async function resolveFans(tx, { agencyId, creatorId, facts, now }) {
-  const aggregate = new Map();
+  const observations = [];
   for (const fact of facts) {
     if (!fact.externalFanId) continue;
-    const current = aggregate.get(fact.externalFanId);
-    if (!current) {
-      aggregate.set(fact.externalFanId, {
-        onlyFansUserId: fact.externalFanId,
-        firstSeenAt: fact.occurredAt,
-        lastSeenAt: fact.occurredAt,
-        username: fact.fanUsername,
-        displayName: fact.fanDisplayName,
-        latestAt: fact.occurredAt,
-      });
-      continue;
-    }
-    if (fact.occurredAt < current.firstSeenAt) current.firstSeenAt = fact.occurredAt;
-    if (fact.occurredAt > current.lastSeenAt) current.lastSeenAt = fact.occurredAt;
-    if (fact.occurredAt >= current.latestAt) {
-      if (fact.fanUsername) current.username = fact.fanUsername;
-      if (fact.fanDisplayName) current.displayName = fact.fanDisplayName;
-      current.latestAt = fact.occurredAt;
-    }
-  }
-  const externalIds = [...aggregate.keys()];
-  if (!externalIds.length) return new Map();
-
-  await tx.creatorFan.createMany({
-    data: [...aggregate.values()].map((item) => ({
-      id: crypto.randomUUID(),
+    observations.push({
       agencyId,
       creatorId,
-      onlyFansUserId: item.onlyFansUserId,
-      username: item.username || null,
-      displayName: item.displayName || null,
-      firstSeenAt: item.firstSeenAt,
-      lastSeenAt: item.lastSeenAt,
-      createdAt: now,
-      updatedAt: now,
-    })),
-    skipDuplicates: true,
-  });
-
-  const rows = [...aggregate.values()];
-  if (rows.length && typeof tx.$executeRawUnsafe === "function") {
-    const parameters = [];
-    const tuples = rows.map((item) => {
-      const offset = parameters.length;
-      parameters.push(item.onlyFansUserId, item.username || null, item.displayName || null, item.firstSeenAt, item.lastSeenAt);
-      return `($${offset + 1}::text, $${offset + 2}::text, $${offset + 3}::text, timezone('UTC', $${offset + 4}::timestamptz), timezone('UTC', $${offset + 5}::timestamptz))`;
+      onlyFansUserId: fact.externalFanId,
+      username: fact.fanUsername,
+      platformDisplayName: fact.fanDisplayName,
+      observedAt: fact.occurredAt,
+      activityObservedAt: fact.occurredAt,
+      source: "LIVE_NOTIFICATION",
     });
-    parameters.push(now, creatorId);
-    const nowParameter = `$${parameters.length - 1}`;
-    const creatorParameter = `$${parameters.length}`;
-    const query = `
-      UPDATE "CreatorFan" AS fan
-      SET
-        "firstSeenAt" = LEAST(fan."firstSeenAt", incoming."firstSeenAt"),
-        "lastSeenAt" = GREATEST(fan."lastSeenAt", incoming."lastSeenAt"),
-        "username" = CASE
-          WHEN incoming."lastSeenAt" >= fan."lastSeenAt" THEN COALESCE(incoming."username", fan."username")
-          ELSE fan."username"
-        END,
-        "displayName" = CASE
-          WHEN incoming."lastSeenAt" >= fan."lastSeenAt" THEN COALESCE(incoming."displayName", fan."displayName")
-          ELSE fan."displayName"
-        END,
-        "updatedAt" = timezone('UTC', ${nowParameter}::timestamptz)
-      FROM (VALUES ${tuples.join(",")}) AS incoming(
-        "onlyFansUserId", "username", "displayName", "firstSeenAt", "lastSeenAt"
-      )
-      WHERE fan."creatorId" = ${creatorParameter}::text
-        AND fan."onlyFansUserId" = incoming."onlyFansUserId"
-    `;
-    await tx.$executeRawUnsafe(query, ...parameters);
-  } else {
-    // Test/mocked clients may not expose raw SQL. Keep the fallback correct,
-    // while production uses the single bulk UPDATE above.
-    const existing = await tx.creatorFan.findMany({ where: { creatorId, onlyFansUserId: { in: externalIds } } });
-    const byExternal = new Map(existing.map((fan) => [fan.onlyFansUserId, fan]));
-    for (const item of rows) {
-      const fan = byExternal.get(item.onlyFansUserId);
-      if (!fan) continue;
-      const data = {};
-      if (fan.firstSeenAt > item.firstSeenAt) data.firstSeenAt = item.firstSeenAt;
-      if (fan.lastSeenAt < item.lastSeenAt) data.lastSeenAt = item.lastSeenAt;
-      if (item.lastSeenAt >= fan.lastSeenAt) {
-        if (item.username && item.username !== fan.username) data.username = item.username;
-        if (item.displayName && item.displayName !== fan.displayName) data.displayName = item.displayName;
-      }
-      if (Object.keys(data).length) await tx.creatorFan.update({ where: { id: fan.id }, data });
-    }
   }
-
-  const allFans = await tx.creatorFan.findMany({ where: { creatorId, onlyFansUserId: { in: externalIds } } });
-  if (allFans.length !== externalIds.length) throw new Error("CreatorFan bulk upsert did not resolve every external fan");
-  return new Map(allFans.map((fan) => [fan.onlyFansUserId, fan.id]));
+  const projected = await projectFanIdentityBatch(tx, observations);
+  return new Map([...projected.values()].map((fan) => [fan.onlyFansUserId, fan.id]));
 }
 
 async function existingFacts(tx, model, creatorId, facts) {

@@ -56,10 +56,12 @@ function makeDb() {
       async findMany() { return [{ id: "creator-1", displayName: "Vilgelmina", username: "vilgelmina", avatarUrl: "https://img/creator.jpg" }]; },
     },
     creatorFan: {
-      async findMany() { return [{ creatorId: "creator-1", onlyFansUserId: "fan-1", username: "andrew", displayName: "Andrew" }]; },
-    },
-    followBackCandidate: {
-      async findMany() { return [{ creatorId: "creator-1", fanId: "fan-1", username: "andrew", displayName: "Andrew", avatarUrl: "https://img/fan.jpg", updatedAt: new Date("2026-08-12T09:30:00.000Z") }]; },
+      async findMany() { return [{
+        creatorId: "creator-1", onlyFansUserId: "fan-1", username: "andrew", displayName: "Andrew", avatarUrl: "https://img/fan.jpg",
+        identityObservedAt: new Date("2026-08-12T09:30:00.000Z"), identitySource: "SUBSCRIBER_DIRECTORY",
+        relationshipCurrent: { fanSubscriptionActive: true, creatorFollowsFan: false, observedAt: new Date("2026-08-12T09:30:00.000Z"), source: "SUBSCRIBER_DIRECTORY" },
+        valueCurrent: { platformReportedTotalSpendCents: 12345n, availability: "AVAILABLE", valueObservedAt: new Date("2026-08-12T09:30:00.000Z"), source: "SUBSCRIBER_DIRECTORY" },
+      }]; },
     },
   };
 }
@@ -82,6 +84,9 @@ test("pending read model is current-queue, creator-scoped and exposes evidence w
   assert.equal(first.fanDisplayName, "Andrew");
   assert.equal(first.fanUsername, "andrew");
   assert.equal(first.fanAvatarUrl, "https://img/fan.jpg");
+  assert.equal(first.platformIdentity.source, "SUBSCRIBER_DIRECTORY");
+  assert.equal(first.relationship.fanSubscriptionActive, true);
+  assert.equal(first.value.platformReportedTotalSpendCents, 12345);
   assert.equal(Object.prototype.hasOwnProperty.call(payload.rows[0], "text"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(payload.rows[0], "messageText"), false);
 });

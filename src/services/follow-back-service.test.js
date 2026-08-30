@@ -9,8 +9,8 @@ const settings = {
 };
 
 test("Follow Back eligibility preserves alpha subscribedBy semantics", () => {
-  assert.deepEqual(evaluateCandidate({ state: "CANDIDATE", isActive: true, subscribedByCreator: false }, settings), { eligible: true, code: "active_subscriber" });
-  assert.deepEqual(evaluateCandidate({ state: "FOLLOWED", isActive: true, subscribedByCreator: true }, settings), { eligible: false, code: "already_followed" });
+  assert.deepEqual(evaluateCandidate({ state: "CANDIDATE", fanSubscriptionActive: true, creatorFollowsFan: false }, settings), { eligible: true, code: "active_subscriber" });
+  assert.deepEqual(evaluateCandidate({ state: "FOLLOWED", fanSubscriptionActive: true, creatorFollowsFan: true }, settings), { eligible: false, code: "already_followed" });
 });
 
 test("Follow Back rejects blocked, ignored and stale candidates before planning", () => {
@@ -20,17 +20,17 @@ test("Follow Back rejects blocked, ignored and stale candidates before planning"
 });
 
 test("Follow Back respects segment settings", () => {
-  assert.equal(evaluateCandidate({ state: "CANDIDATE", isActive: true, subscriptionType: "free" }, { ...settings, freeSubscribers: false }).code, "free_subscribers_disabled");
-  assert.equal(evaluateCandidate({ state: "CANDIDATE", isActive: false, subscriptionType: "expired" }, settings).code, "expired_subscribers_disabled");
+  assert.equal(evaluateCandidate({ state: "CANDIDATE", fanSubscriptionActive: true, fanSubscriptionType: "free" }, { ...settings, freeSubscribers: false }).code, "free_subscribers_disabled");
+  assert.equal(evaluateCandidate({ state: "CANDIDATE", fanSubscriptionActive: false, fanSubscriptionType: "expired" }, settings).code, "expired_subscribers_disabled");
 });
 
 test("Follow Back keeps refollow as a separate future action type", () => {
   assert.equal(
-    evaluateCandidate({ state: "CANDIDATE", generation: 2, isActive: true, subscribedByCreator: false }, { ...settings, refollowEnabled: false }).code,
+    evaluateCandidate({ state: "CANDIDATE", generation: 2, fanSubscriptionActive: true, creatorFollowsFan: false }, { ...settings, refollowEnabled: false }).code,
     "refollow_disabled",
   );
   assert.equal(
-    evaluateCandidate({ state: "CANDIDATE", generation: 2, isActive: true, subscribedByCreator: false }, { ...settings, refollowEnabled: true }).code,
+    evaluateCandidate({ state: "CANDIDATE", generation: 2, fanSubscriptionActive: true, creatorFollowsFan: false }, { ...settings, refollowEnabled: true }).code,
     "refollow_action_pending",
   );
 });

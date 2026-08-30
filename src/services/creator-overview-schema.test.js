@@ -83,5 +83,5 @@ test("campaign overview exposes current OF fan value even when claimer arrival t
   assert.match(service, /unknownAttributionFans/);
   assert.match(service, /ofValueKnownFans/);
   assert.match(service, /ofValuePayingFans/);
-  assert.match(service, /ofValueNetCents/);
+  assert.match(service, /platformReportedFanSpendCents/);
 });

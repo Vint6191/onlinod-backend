@@ -2,6 +2,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { projectFanIdentity, projectFanValue, VALUE_AVAILABILITY } = require("./fan-data-authority-service");
 
 const SNAPSHOT_TTL_MS = Number(process.env.ONLINOD_PRESENCE_SNAPSHOT_TTL_MS) || 15 * 60 * 1000;
 
@@ -18,32 +19,39 @@ function cleanString(value, max = 512) {
 }
 
 function fanIdOf(value) {
-  const raw = cleanString(value, 80);
-  return /^\d{3,30}$/.test(raw || "") ? raw : null;
+  // External OF identity is an opaque string, never a JavaScript number.
+  const raw = cleanString(value, 180);
+  return raw && !/\s/.test(raw) ? raw : null;
 }
 
-function centsFrom(value) {
-  if (value === null || value === undefined || value === "") return 0;
+function parseMoney(value, unit) {
+  if (value === null || value === undefined || value === "") return { availability: VALUE_AVAILABILITY.NOT_FETCHED, cents: null };
   const n = Number(value);
-  if (!Number.isFinite(n)) return 0;
-  if (Math.abs(n) < 1000000 && !Number.isInteger(n)) return Math.round(n * 100);
-  return Math.round(n);
+  if (!Number.isFinite(n)) return { availability: VALUE_AVAILABILITY.MALFORMED, cents: null };
+  const cents = unit === "cents" ? Math.round(n) : Math.round(n * 100);
+  if (!Number.isSafeInteger(cents) || cents < 0) return { availability: VALUE_AVAILABILITY.MALFORMED, cents: null };
+  return { availability: VALUE_AVAILABILITY.AVAILABLE, cents };
 }
 
 function normalizePresenceUser(raw = {}) {
   const fanId = fanIdOf(raw.fanId || raw.id || raw.userId || raw.remoteId);
   if (!fanId) return null;
 
-  const totalSpentCents = raw.totalSpentCents !== undefined
-    ? centsFrom(raw.totalSpentCents)
-    : centsFrom(raw.totalSpent ?? raw.total_spent ?? raw.totalSumm ?? 0);
+  const hasCents = Object.prototype.hasOwnProperty.call(raw, "totalSpentCents");
+  const hasMoney = ["totalSpent", "total_spent", "totalSumm"].some((key) => Object.prototype.hasOwnProperty.call(raw, key));
+  const money = hasCents
+    ? parseMoney(raw.totalSpentCents, "cents")
+    : hasMoney
+      ? parseMoney(raw.totalSpent ?? raw.total_spent ?? raw.totalSumm, "money")
+      : { availability: VALUE_AVAILABILITY.NOT_FETCHED, cents: null };
 
   return {
     fanId,
-    username: cleanString(raw.username, 160)?.replace(/^@/, "") || `u${fanId}`,
-    name: cleanString(raw.name || raw.displayName || raw.username, 240) || `u${fanId}`,
+    username: cleanString(raw.username, 160)?.replace(/^@/, "") || null,
+    name: cleanString(raw.name || raw.displayName, 240) || null,
     avatarUrl: cleanString(raw.avatarUrl || raw.avatar, 1200),
-    totalSpentCents,
+    totalSpentCents: money.cents,
+    valueAvailability: money.availability,
     subscribeAt: raw.subscribeAt || raw.subscribe_at ? toDate(raw.subscribeAt || raw.subscribe_at, null) : null,
     duration: cleanString(raw.duration, 80),
     metadata: raw.rawUser && typeof raw.rawUser === "object" ? { rawUser: raw.rawUser } : {},
@@ -58,8 +66,8 @@ function serializeUser(row) {
     name: row.name,
     avatar: row.avatarUrl,
     avatarUrl: row.avatarUrl,
-    totalSpent: Math.round(Number(row.totalSpentCents || 0)) / 100,
-    totalSpentCents: row.totalSpentCents || 0,
+    totalSpent: row.totalSpentCents == null ? null : Math.round(Number(row.totalSpentCents)) / 100,
+    totalSpentCents: row.totalSpentCents == null ? null : Number(row.totalSpentCents),
     subscribeAt: row.subscribeAt,
     duration: row.duration,
     status: row.status,
@@ -199,6 +207,21 @@ async function upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, so
         metadata: { ...(row.metadata || {}), ...metadata },
       },
     });
+    if (row.username || row.name || row.avatarUrl) {
+      await projectFanIdentity(prisma, {
+        agencyId, creatorId, onlyFansUserId: row.fanId,
+        username: row.username, platformDisplayName: row.name, avatarUrl: row.avatarUrl,
+        observedAt: at, activityObservedAt: at, source: "PRESENCE_HINT",
+        completeness: "PARTIAL", rejectSyntheticIdentity: true,
+      });
+    }
+    if (row.valueAvailability !== VALUE_AVAILABILITY.NOT_FETCHED) {
+      await projectFanValue(prisma, {
+        agencyId, creatorId, onlyFansUserId: row.fanId,
+        totalSpentCents: row.totalSpentCents, availability: row.valueAvailability,
+        observedAt: at, source: "PRESENCE_HINT",
+      });
+    }
   }
 
   return { normalized, seenIds };
@@ -338,7 +361,7 @@ async function applyPresenceEvents({ agencyId, creatorId, deviceId = null, event
         if (!fanId) continue;
         await prisma.creatorPresenceUser.upsert({
           where: { creatorId_fanId: { creatorId, fanId } },
-          create: { agencyId, creatorId, fanId, username: `u${fanId}`, name: `u${fanId}`, status: "online", source: "ws_presence", lastOnlineAt: at, lastCheckedAt: at, updatedByDeviceId: deviceId, metadata: {} },
+          create: { agencyId, creatorId, fanId, username: null, name: null, status: "online", source: "ws_presence", lastOnlineAt: at, lastCheckedAt: at, updatedByDeviceId: deviceId, metadata: {} },
           update: { status: "online", source: "ws_presence", lastOnlineAt: at, lastCheckedAt: at, updatedByDeviceId: deviceId },
         });
         online += 1;
@@ -354,7 +377,7 @@ async function applyPresenceEvents({ agencyId, creatorId, deviceId = null, event
         if (!fanId) continue;
         await prisma.creatorPresenceUser.upsert({
           where: { creatorId_fanId: { creatorId, fanId } },
-          create: { agencyId, creatorId, fanId, username: `u${fanId}`, name: `u${fanId}`, status: "online", source: "presence_check", lastOnlineAt: at, lastCheckedAt: at, updatedByDeviceId: deviceId, metadata: {} },
+          create: { agencyId, creatorId, fanId, username: null, name: null, status: "online", source: "presence_check", lastOnlineAt: at, lastCheckedAt: at, updatedByDeviceId: deviceId, metadata: {} },
           update: { status: "online", source: "presence_check", lastOnlineAt: at, lastCheckedAt: at, updatedByDeviceId: deviceId },
         });
         online += 1;

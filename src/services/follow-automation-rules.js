@@ -18,11 +18,11 @@ function evaluateRefollowCandidate(candidate, settings, now = new Date()) {
   if (candidate.phase && !["IDLE", "WAIT_RETURN", "DONE"].includes(candidate.phase)) {
     return { eligible: false, code: "active_delivery" };
   }
-  if (candidate.isActive === true) {
+  if (candidate.fanSubscriptionActive === true) {
     return { eligible: false, code: Number(candidate.nudgeCount || 0) > 0 ? "fan_returned" : "fan_active" };
   }
-  if (candidate.isActive !== false) return { eligible: false, code: "subscription_state_unknown" };
-  if (candidate.subscribedByCreator !== true) return { eligible: false, code: "creator_not_following" };
+  if (candidate.fanSubscriptionActive !== false) return { eligible: false, code: "subscription_state_unknown" };
+  if (candidate.creatorFollowsFan !== true) return { eligible: false, code: "creator_not_following" };
   if (candidate.cooldownUntil && candidate.cooldownUntil > now) return { eligible: false, code: "cooldown" };
   if (Number(candidate.nudgeCount || 0) >= Number(settings.maxNudgesPerFan || 1)) {
     return { eligible: false, code: "max_refollow_nudges_reached" };

@@ -477,47 +477,6 @@ async function deleteDeadTrafficSourceMembers({ batchSize, olderThan }) {
   return { label: "trafficSourceMember.dead_no_revenue", deleted: total };
 }
 
-async function deleteZeroTrafficValueSnapshots({ batchSize, olderThan }) {
-  let total = 0;
-  for (;;) {
-    const affected = await prisma.$executeRaw`
-      WITH doomed AS (
-        SELECT v."id"
-        FROM "TrafficFanValueSnapshot" AS v
-        WHERE v."fetchedAt" < ${olderThan}
-          AND COALESCE(v."totalSummCents", 0) = 0
-          AND COALESCE(v."messagesSummCents", 0) = 0
-          AND COALESCE(v."tipsSummCents", 0) = 0
-          AND COALESCE(v."subscribesSummCents", 0) = 0
-          AND COALESCE(v."postsSummCents", 0) = 0
-          AND COALESCE(v."streamsSummCents", 0) = 0
-          AND NOT EXISTS (
-            SELECT 1
-            FROM "TrafficSourceMember" AS m
-            WHERE m."agencyId" = v."agencyId"
-              AND m."creatorId" = v."creatorId"
-              AND m."fanId" = v."fanId"
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM "CreatorSubscriptionLedger" AS l
-            WHERE l."agencyId" = v."agencyId"
-              AND l."creatorId" = v."creatorId"
-              AND l."fanId" = v."fanId"
-          )
-        ORDER BY v."fetchedAt" ASC
-        LIMIT ${batchSize}
-      )
-      DELETE FROM "TrafficFanValueSnapshot" AS v
-      USING doomed
-      WHERE v."id" = doomed."id"
-    `;
-    total += Number(affected || 0);
-    if (Number(affected || 0) < batchSize) break;
-  }
-  return { label: "trafficFanValueSnapshot.zero_orphan", deleted: total };
-}
-
 async function runTeamLedgerRetentionSweep(_options = {}) {
   const result = await gcTeamLedgers({});
   const items = [
@@ -604,10 +563,6 @@ async function runTrafficRetentionSweep(options = {}) {
     olderThan: daysAgo(cfg.trafficSourceMemberNoRevenueDays),
   }));
 
-  out.push(await deleteZeroTrafficValueSnapshots({
-    batchSize: cfg.batchSize,
-    olderThan: daysAgo(cfg.trafficZeroSnapshotDays),
-  }));
 
   out.push(await deleteByIdsInBatches({
     model: prisma.trafficDailyAggregate,
