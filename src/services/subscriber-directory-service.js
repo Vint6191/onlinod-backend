@@ -31,9 +31,13 @@ function integerOrNull(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
 }
 function valueAvailability(raw) {
   const explicit = clean(raw.valueAvailability, 40)?.toUpperCase();
-  if (["AVAILABLE", "NOT_FETCHED", "UNAVAILABLE", "MALFORMED"].includes(explicit)) return explicit;
-  if (raw.totalSpentCents === null || raw.totalSpentCents === undefined || raw.totalSpentCents === "") return "NOT_FETCHED";
-  return integerOrNull(raw.totalSpentCents, 0, 2_000_000_000) === null ? "MALFORMED" : "AVAILABLE";
+  const totalPresent = Object.prototype.hasOwnProperty.call(raw, "totalSpentCents");
+  const parsedTotal = totalPresent ? integerOrNull(raw.totalSpentCents, 0, 2_000_000_000) : null;
+  // AVAILABLE is a strict canonical claim: it is invalid without an explicit valid total.
+  if (explicit === "AVAILABLE") return totalPresent && parsedTotal !== null ? "AVAILABLE" : "MALFORMED";
+  if (["NOT_FETCHED", "UNAVAILABLE", "MALFORMED"].includes(explicit)) return explicit;
+  if (!totalPresent || raw.totalSpentCents === null || raw.totalSpentCents === "") return "NOT_FETCHED";
+  return parsedTotal === null ? "MALFORMED" : "AVAILABLE";
 }
 function boolOrNull(value) {
   return typeof value === "boolean" ? value : null;
@@ -225,6 +229,33 @@ function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt }) {
   const fanId = clean(raw.fanId ?? raw.userId ?? raw.id, 120);
   if (!fanId) return null;
   const lastSeenIsNull = raw.lastSeenIsNull === true;
+  const relationshipInputToCanonical = {
+    canReceiveChatMessage: "canReceiveChatMessage",
+    subscriptionType: "fanSubscriptionType",
+    fanSubscribesToCreator: "fanSubscribesToCreator",
+    fanSubscriptionActive: "fanSubscriptionActive",
+    fanSubscriptionExpiresAt: "fanSubscriptionExpiresAt",
+    creatorFollowsFan: "creatorFollowsFan",
+    creatorFollowExpiresAt: "creatorFollowExpiresAt",
+    blocked: "blocked",
+    restricted: "restricted",
+    performer: "performer",
+    subscribePriceCents: "subscribePriceCents",
+    lastSeenAt: "lastSeenAt",
+  };
+  const observedRelationshipFields = Object.entries(relationshipInputToCanonical)
+    .filter(([inputField]) => Object.prototype.hasOwnProperty.call(raw, inputField))
+    .map(([, canonicalField]) => canonicalField);
+  const observedIdentityFields = [
+    ["username", "username"], ["name", "platformDisplayName"], ["avatarUrl", "avatarUrl"], ["headerUrl", "headerUrl"],
+  ].filter(([inputField]) => Object.prototype.hasOwnProperty.call(raw, inputField)).map(([, canonicalField]) => canonicalField);
+  const observedValueFields = [
+    "totalSpentCents", "messagesSpentCents", "tipsSpentCents", "subscriptionsSpentCents", "postsSpentCents", "streamsSpentCents",
+  ].filter((field) => Object.prototype.hasOwnProperty.call(raw, field));
+  const metadata = {
+    ...object(raw.metadata),
+    fanDataObservedFields: { identity: observedIdentityFields, relationship: observedRelationshipFields, value: observedValueFields },
+  };
   const normalized = {
     runId,
     agencyId,
@@ -257,7 +288,7 @@ function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt }) {
     restricted: boolOrNull(raw.restricted),
     performer: boolOrNull(raw.performer),
     subscribePriceCents: integerOrNull(raw.subscribePriceCents, 0, 2_000_000_000),
-    metadata: object(raw.metadata),
+    metadata,
     observedAt,
   };
   normalized.contentHash =

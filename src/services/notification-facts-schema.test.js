@@ -34,8 +34,9 @@ test("notification facts are typed relational tables without JSON business stora
     const body = modelBody(name);
     assert.doesNotMatch(body, /\bJson\??\b/);
     assert.match(body, /eventFingerprint\s+String/);
+    assert.match(body, /fanRecordId\s+String\?\s+@map\("fanId"\)/);
     assert.match(body, /CreatorAccount @relation\(fields: \[agencyId, creatorId\], references: \[agencyId, id\], onDelete: Cascade\)/);
-    assert.match(body, /CreatorFan\?\s+@relation\(fields: \[creatorId, fanId\], references: \[creatorId, id\], onDelete: NoAction\)/);
+    assert.match(body, /CreatorFan\?\s+@relation\(fields: \[creatorId, fanRecordId\], references: \[creatorId, id\], onDelete: NoAction\)/);
   }
   assert.match(modelBody("CreatorFan"), /@@unique\(\[creatorId, id\], map: "CreatorFan_creatorId_id_key"\)/);
   assert.match(modelBody("CreatorPostLike"), /onlyFansLikeId\s+String\?/);

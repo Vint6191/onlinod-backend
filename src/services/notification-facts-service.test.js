@@ -906,7 +906,7 @@ test("an empty full-history stream reaches EOF without inventing pre-retention c
   assert.equal(db.store.coverage.length, 0);
 });
 
-test("production transaction acquires the advisory lock before bulk fan/fact SQL", async () => {
+test("production transaction acquires the advisory lock before canonical fan/fact writes", async () => {
   const db = memoryDb();
   const sqlCalls = [];
   db.$executeRawUnsafe = async (sql) => { sqlCalls.push(String(sql)); return 1; };
@@ -923,7 +923,8 @@ test("production transaction acquires the advisory lock before bulk fan/fact SQL
   });
   assert.equal(result.status, "COMMITTED");
   assert.match(sqlCalls[0], /pg_advisory_xact_lock/);
-  assert.ok(sqlCalls.some((sql) => /UPDATE "CreatorFan"/.test(sql)));
+  assert.equal(db.store.fans.length, 1);
+  assert.equal(db.store.fans[0].onlyFansUserId, "lock-fan");
 });
 
 test("a batch committed after ensureBatch is re-read under the transaction lock and never overwrites counters", async () => {

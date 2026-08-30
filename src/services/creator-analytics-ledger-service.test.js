@@ -262,7 +262,7 @@ test("campaign fan attribution keeps the earliest confirmed attribution date", a
   };
   harness.tx.creatorFan = {
     findUnique: async () => ({ id: "fan-db-1", lastSeenAt: new Date("2026-07-01T00:00:00.000Z") }),
-    update: async () => ({ id: "fan-db-1" }),
+    updateMany: async () => ({ count: 1 }),
   };
   await ingestCampaignChunk({
     db: harness.db, job,
@@ -286,7 +286,7 @@ test("campaign fan attribution is historical and is never pruned by a later empt
       upsert: async () => ({}),
       deleteMany: async () => { pruneCalls += 1; return { count: 3 }; },
     };
-    harness.tx.creatorFan = { findUnique: async () => null, create: async () => ({ id: "fan-db-1" }), update: async () => ({ id: "fan-db-1" }) };
+    harness.tx.creatorFan = { findUnique: async () => null, create: async () => ({ id: "fan-db-1" }), updateMany: async () => ({ count: 1 }) };
     const result = await ingestCampaignChunk({
       db: harness.db,
       job,
@@ -317,11 +317,12 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
     $executeRawUnsafe: async () => 1,
     creatorFan: {
       findUnique: async () => ({ id: "fan-db-1" }),
-      update: async () => ({ id: "fan-db-1" }),
+      updateMany: async () => ({ count: 1 }),
     },
     creatorFanValueCurrent: {
       findUnique: async () => null,
-      upsert: async ({ create }) => { upsertData = create; return create; },
+      create: async ({ data }) => { upsertData = data; return data; },
+      updateMany: async () => ({ count: 1 }),
     },
   };
   const result = await ingestCampaignFanValueChunk({
@@ -362,11 +363,12 @@ test("campaign fan value batch applies multiple current snapshots under one anal
     $executeRawUnsafe: async () => { locks += 1; return 1; },
     creatorFan: {
       findUnique: async ({ where }) => ({ id: `fan-${where.creatorId_onlyFansUserId.onlyFansUserId}` }),
-      update: async () => ({}),
+      updateMany: async () => ({ count: 1 }),
     },
     creatorFanValueCurrent: {
       findUnique: async () => null,
-      upsert: async ({ create }) => { upserts.push(create); return create; },
+      create: async ({ data }) => { upserts.push(data); return data; },
+      updateMany: async () => ({ count: 1 }),
     },
   };
   const result = await ingestCampaignFanValuesBatchChunk({

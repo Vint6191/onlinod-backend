@@ -25,7 +25,7 @@ function modelBody(name) {
 test("all-time financial source ledger is relational, typed and user-optional", () => {
   const body = modelBody("CreatorFinancialTransaction");
   assert.doesNotMatch(body, /\bJson\??\b/);
-  assert.match(body, /fanId\s+String\?/);
+  assert.match(body, /fanRecordId\s+String\?\s+@map\("fanId"\)/);
   assert.match(body, /fanOnlyFansUserId\s+String\?/);
   assert.match(body, /externalTransactionId\s+String/);
   assert.match(body, /transactionType\s+String/);
@@ -33,7 +33,7 @@ test("all-time financial source ledger is relational, typed and user-optional", 
   assert.match(body, /feeCents\s+Int\?/);
   assert.match(body, /netCents\s+Int\?/);
   assert.match(body, /@@unique\(\[creatorId, externalTransactionId\]\)/);
-  assert.match(body, /CreatorFan\?\s+@relation\(fields: \[creatorId, fanId\]/);
+  assert.match(body, /CreatorFan\?\s+@relation\(fields: \[creatorId, fanRecordId\]/);
   assert.match(schema, /FINANCIAL_TRANSACTIONS/);
   assert.match(schema, /enum CreatorFinancialTransactionFactType/);
   assert.match(schema, /enum CreatorFinancialTransactionProjectionStatus/);

@@ -50,7 +50,7 @@ test("creator analytics V2 keeps every business fact in typed relational models"
 test("subscription state and money are separate relational projections", () => {
   const state = modelBody("CreatorSubscriptionState");
   const paid = modelBody("CreatorPaidSubscription");
-  assert.match(state, /@@unique\(\[creatorId, fanId\]\)/);
+  assert.match(state, /@@unique\(\[creatorId, fanRecordId\]\)/);
   assert.match(state, /updatedFromEventId\s+String\?\s+@unique/);
   assert.match(paid, /paymentType\s+CreatorPaidSubscriptionPaymentType/);
   assert.match(paid, /amountCents\s+Int/);
@@ -79,7 +79,7 @@ test("local message coverage stores only metadata and never message bodies", () 
   for (const column of ["deviceId", "oldestMessageAt", "newestMessageAt", "dialogsCovered", "messagesIndexed", "coverageStatus", "lastVerifiedAt"]) {
     assert.match(coverage, new RegExp(`\\b${column}\\b`));
   }
-  assert.match(fanCoverage, /@@unique\(\[creatorId, fanId, deviceId\]\)/);
+  assert.match(fanCoverage, /@@unique\(\[creatorId, fanRecordId, deviceId\]\)/);
   assert.doesNotMatch(`${coverage}\n${fanCoverage}`, /messageText|bodyText|content|payload/i);
   assert.match(routes, /messagesIndexed/);
   assert.match(routes, /oldestMessageAt/);

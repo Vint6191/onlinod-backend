@@ -101,23 +101,23 @@ function defaultDb(db) {
   return db || require("../prisma");
 }
 
-async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanIds = null, now = new Date() }) {
+async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanRecordIds = null, now = new Date() }) {
   db = defaultDb(db);
-  const filter = { creatorId, fanId: { not: null } };
-  if (Array.isArray(fanIds) && fanIds.length) filter.fanId = { in: [...new Set(fanIds.filter(Boolean))] };
+  const filter = { creatorId, fanRecordId: { not: null } };
+  if (Array.isArray(fanRecordIds) && fanRecordIds.length) filter.fanRecordId = { in: [...new Set(fanRecordIds.filter(Boolean))] };
   const events = await db.creatorSubscriptionEvent.findMany({
     where: filter,
-    orderBy: [{ fanId: "asc" }, { occurredAt: "asc" }, { id: "asc" }],
+    orderBy: [{ fanRecordId: "asc" }, { occurredAt: "asc" }, { id: "asc" }],
   });
   const byFan = new Map();
   let paidInserted = 0;
   let paidUpdated = 0;
 
   for (const event of events) {
-    if (!event.fanId) continue;
-    const rows = byFan.get(event.fanId) || [];
+    if (!event.fanRecordId) continue;
+    const rows = byFan.get(event.fanRecordId) || [];
     rows.push(event);
-    byFan.set(event.fanId, rows);
+    byFan.set(event.fanRecordId, rows);
 
     if (!PAID_EVENT_TYPES.has(event.eventType) || !Number.isInteger(event.observedPriceCents) || event.observedPriceCents <= 0) continue;
     const fingerprint = sha256(`paid-subscription|${creatorId}|${event.eventFingerprint}`);
@@ -136,7 +136,7 @@ async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanIds
     const data = {
       agencyId,
       creatorId,
-      fanId: event.fanId,
+      fanRecordId: event.fanRecordId,
       fanOnlyFansUserIdAtEvent: event.fanOnlyFansUserIdAtEvent || null,
       fanUsernameAtEvent: event.fanUsernameAtEvent || null,
       fanDisplayNameAtEvent: event.fanDisplayNameAtEvent || null,
@@ -167,12 +167,12 @@ async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanIds
   }
 
   let stateUpserts = 0;
-  for (const [fanId, fanEvents] of byFan) {
+  for (const [fanRecordId, fanEvents] of byFan) {
     const projected = projectSubscriptionState(fanEvents);
     if (!projected) continue;
     await db.creatorSubscriptionState.upsert({
-      where: { creatorId_fanId: { creatorId, fanId } },
-      create: { id: crypto.randomUUID(), agencyId, creatorId, fanId, ...projected, createdAt: now, updatedAt: now },
+      where: { creatorId_fanRecordId: { creatorId, fanRecordId } },
+      create: { id: crypto.randomUUID(), agencyId, creatorId, fanRecordId, ...projected, createdAt: now, updatedAt: now },
       update: { ...projected, updatedAt: now },
     });
     stateUpserts += 1;

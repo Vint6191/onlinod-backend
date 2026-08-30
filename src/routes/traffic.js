@@ -4,7 +4,6 @@ const express = require("express");
 const { z } = require("zod");
 const {
   upsertTrafficSourceScan,
-  upsertTrafficFanValueSnapshots,
   getPendingTrafficValueFanIds,
   markTrafficFanValueDirtyFromDevice,
   ingestSubscriptionEvent,
@@ -66,29 +65,6 @@ router.post("/sources/upsert", async (req, res) => {
     if (err?.issues) return validationError(res, err);
     console.error("[traffic/sources/upsert] failed:", err);
     return serviceError(res, err, "TRAFFIC_SOURCES_UPSERT_FAILED");
-  }
-});
-
-const snapshotsSchema = z.object({
-  deviceId: z.string().min(1),
-  creatorId: z.string().min(1),
-  snapshots: z.array(z.any()).max(5000).optional().default([]),
-});
-
-router.post("/value-snapshots/upsert", async (req, res) => {
-  try {
-    const input = snapshotsSchema.parse(req.body || {});
-    const result = await upsertTrafficFanValueSnapshots({
-      deviceId: input.deviceId,
-      userId: actorUserId(req),
-      creatorId: input.creatorId,
-      snapshots: input.snapshots,
-    });
-    return res.json(result);
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    console.error("[traffic/value-snapshots/upsert] failed:", err);
-    return serviceError(res, err, "TRAFFIC_VALUE_SNAPSHOTS_UPSERT_FAILED");
   }
 });
 

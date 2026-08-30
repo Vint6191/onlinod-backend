@@ -35,8 +35,8 @@ test("subscription state is rebuilt chronologically and refund does not invent e
 
 test("subscription projection materializes one current state and typed paid rows", async () => {
   const events = [
-    { id: "e1", agencyId: "a", creatorId: "c", fanId: "f", eventFingerprint: "a".repeat(64), externalTransactionId: "tx1", eventType: "SUBSCRIBED_PAID", observedPriceCents: 1000, currency: "USD", occurredAt: new Date("2026-01-01T00:00:00Z"), source: "NOTIFICATION", collectedAt: new Date("2026-01-02T00:00:00Z") },
-    { id: "e2", agencyId: "a", creatorId: "c", fanId: "f", eventFingerprint: "b".repeat(64), externalTransactionId: "tx2", eventType: "RENEWED", observedPriceCents: 1000, currency: "USD", occurredAt: new Date("2026-02-01T00:00:00Z"), source: "ONLYFANS_API", collectedAt: new Date("2026-02-02T00:00:00Z") },
+    { id: "e1", agencyId: "a", creatorId: "c", fanRecordId: "f", eventFingerprint: "a".repeat(64), externalTransactionId: "tx1", eventType: "SUBSCRIBED_PAID", observedPriceCents: 1000, currency: "USD", occurredAt: new Date("2026-01-01T00:00:00Z"), source: "NOTIFICATION", collectedAt: new Date("2026-01-02T00:00:00Z") },
+    { id: "e2", agencyId: "a", creatorId: "c", fanRecordId: "f", eventFingerprint: "b".repeat(64), externalTransactionId: "tx2", eventType: "RENEWED", observedPriceCents: 1000, currency: "USD", occurredAt: new Date("2026-02-01T00:00:00Z"), source: "ONLYFANS_API", collectedAt: new Date("2026-02-02T00:00:00Z") },
   ];
   const createdPaid = [];
   const states = [];
@@ -51,7 +51,7 @@ test("subscription projection materializes one current state and typed paid rows
       upsert: async (args) => { states.push(args); return args.create; },
     },
   };
-  const result = await projectSubscriptionFacts({ db, agencyId: "a", creatorId: "c", fanIds: ["f"], now: new Date("2026-03-01T00:00:00Z") });
+  const result = await projectSubscriptionFacts({ db, agencyId: "a", creatorId: "c", fanRecordIds: ["f"], now: new Date("2026-03-01T00:00:00Z") });
   assert.equal(result.stateUpserts, 1);
   assert.equal(result.paidInserted, 2);
   assert.equal(createdPaid[1].paymentType, "RENEWAL");

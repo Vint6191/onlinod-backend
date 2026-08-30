@@ -576,12 +576,12 @@ function mergeFactDataWithExisting(model, existing, incoming) {
       : (incoming.fanAvatarUrlAtEvent || existing.fanAvatarUrlAtEvent || null),
   };
 }
-function buildFactData({ fact, job, deviceId, fanIds, now }) {
+function buildFactData({ fact, job, deviceId, fanRecordIds, now }) {
   const identity = {
     id: crypto.randomUUID(),
     agencyId: job.agencyId,
     creatorId: job.creatorId,
-    fanId: fact.externalFanId ? fanIds.get(fact.externalFanId) || null : null,
+    fanRecordId: fact.externalFanId ? fanRecordIds.get(fact.externalFanId) || null : null,
     fanOnlyFansUserIdAtEvent: fact.externalFanId || null,
     fanUsernameAtEvent: fact.fanUsername || null,
     fanDisplayNameAtEvent: fact.fanDisplayName || null,
@@ -648,7 +648,7 @@ async function existingFacts(tx, model, creatorId, facts) {
   if (transactions.length) OR.push({ externalTransactionId: { in: transactions } });
   return tx[model].findMany({ where: { creatorId, OR } });
 }
-async function persistFactGroup(tx, { model, facts, job, deviceId, fanIds, now, compareKeys }) {
+async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds, now, compareKeys }) {
   if (!facts.length) return { inserted: 0, updated: 0, unchanged: 0, rejected: 0 };
 
   // Collapse duplicate identities inside one page before any database work. The
@@ -722,7 +722,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanIds, now, 
     const data = mergeFactDataWithExisting(
       model,
       row,
-      buildFactData({ fact, job, deviceId, fanIds, now }),
+      buildFactData({ fact, job, deviceId, fanRecordIds, now }),
     );
     if (!row) creates.push({ fact, data });
     else if (valuesEqual(row, data, compareKeys)) unchanged += 1;
@@ -1012,7 +1012,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
       if (lockedBatch?.status === "COMMITTED" || lockedBatch?.status === "PARTIAL") {
         return { replayed: true, response: terminalReplayResponse(lockedBatch, result, job) };
       }
-      const fanIds = await resolveFans(tx, { agencyId: job.agencyId, creatorId: job.creatorId, facts, now });
+      const fanRecordIds = await resolveFans(tx, { agencyId: job.agencyId, creatorId: job.creatorId, facts, now });
       const groups = {
         sale: facts.filter((fact) => fact.kind === "sale"),
         tip: facts.filter((fact) => fact.kind === "tip"),
@@ -1021,12 +1021,12 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
         comment: facts.filter((fact) => fact.kind === "comment"),
       };
       const sale = await persistFactGroup(tx, {
-        model: "creatorSale", facts: groups.sale, job, deviceId, fanIds, now,
-        compareKeys: ["fanId", "externalNotificationId", "externalTransactionId", "saleType", "messageId", "postId", "amountCents", "currency", "purchasedAt"],
+        model: "creatorSale", facts: groups.sale, job, deviceId, fanRecordIds, now,
+        compareKeys: ["fanRecordId", "externalNotificationId", "externalTransactionId", "saleType", "messageId", "postId", "amountCents", "currency", "purchasedAt"],
       });
       const tip = await persistFactGroup(tx, {
-        model: "creatorTip", facts: groups.tip, job, deviceId, fanIds, now,
-        compareKeys: ["fanId", "externalNotificationId", "externalTransactionId", "messageId", "amountCents", "currency", "tippedAt"],
+        model: "creatorTip", facts: groups.tip, job, deviceId, fanRecordIds, now,
+        compareKeys: ["fanRecordId", "externalNotificationId", "externalTransactionId", "messageId", "amountCents", "currency", "tippedAt"],
       });
       // Team Analytics consumes the canonical CreatorSale ledger; it never
       // runs a second OF money scanner. Reconcile inside the same transaction
@@ -1041,29 +1041,29 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
         await reconcileCreatorTipsToTeam({ db: tx, tipIds: persistedTips.map((row) => row.id) });
       }
       const subscription = await persistFactGroup(tx, {
-        model: "creatorSubscriptionEvent", facts: groups.subscription, job, deviceId, fanIds, now,
-        compareKeys: ["fanId", "externalNotificationId", "externalTransactionId", "eventType", "observedPriceCents", "currency", "occurredAt"],
+        model: "creatorSubscriptionEvent", facts: groups.subscription, job, deviceId, fanRecordIds, now,
+        compareKeys: ["fanRecordId", "externalNotificationId", "externalTransactionId", "eventType", "observedPriceCents", "currency", "occurredAt"],
       });
       if (groups.subscription.length
         && tx.creatorSubscriptionState
         && tx.creatorPaidSubscription
         && typeof tx.creatorSubscriptionEvent?.findMany === "function") {
         const affectedFanIds = [...new Set(groups.subscription
-          .map((fact) => fact.externalFanId ? fanIds.get(fact.externalFanId) || null : null)
+          .map((fact) => fact.externalFanId ? fanRecordIds.get(fact.externalFanId) || null : null)
           .filter(Boolean))];
         if (affectedFanIds.length) {
           await projectSubscriptionFacts({
-            db: tx, agencyId: job.agencyId, creatorId: job.creatorId, fanIds: affectedFanIds, now,
+            db: tx, agencyId: job.agencyId, creatorId: job.creatorId, fanRecordIds: affectedFanIds, now,
           });
         }
       }
       const like = await persistFactGroup(tx, {
-        model: "creatorPostLike", facts: groups.like, job, deviceId, fanIds, now,
-        compareKeys: ["fanId", "externalNotificationId", "onlyFansLikeId", "onlyFansPostId", "likedAt"],
+        model: "creatorPostLike", facts: groups.like, job, deviceId, fanRecordIds, now,
+        compareKeys: ["fanRecordId", "externalNotificationId", "onlyFansLikeId", "onlyFansPostId", "likedAt"],
       });
       const comment = await persistFactGroup(tx, {
-        model: "creatorPostComment", facts: groups.comment, job, deviceId, fanIds, now,
-        compareKeys: ["fanId", "externalNotificationId", "onlyFansCommentId", "onlyFansPostId", "commentedAt"],
+        model: "creatorPostComment", facts: groups.comment, job, deviceId, fanRecordIds, now,
+        compareKeys: ["fanRecordId", "externalNotificationId", "onlyFansCommentId", "onlyFansPostId", "commentedAt"],
       });
       const perTypePersistenceRejected = {
         purchases: sale.rejected,

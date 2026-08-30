@@ -10,8 +10,6 @@ const { resolveEffectivePermissions } = require("./team-access-control");
 const {
   FAN_DATA_POINT_REFRESH_JOB_KEY,
   VALUE_AVAILABILITY,
-  projectFanIdentity,
-  projectFanValue,
   scheduleFanDataPointRefresh,
 } = require("./fan-data-authority-service");
 
@@ -49,29 +47,6 @@ function cents(value) {
   const n = Number(value || 0);
   return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
 }
-
-function parseMoneyObservation(value, unit = "money") {
-  if (value === null || value === undefined || value === "") return { present: false, valid: false, cents: null };
-  const normalized = typeof value === "string"
-    ? value.replace(/[^0-9.,-]/g, "").replace(",", ".")
-    : value;
-  const number = Number(normalized);
-  if (!Number.isFinite(number) || number < 0) return { present: true, valid: false, cents: null };
-  const centsValue = unit === "cents" ? Math.round(number) : Math.round(number * 100);
-  if (!Number.isSafeInteger(centsValue) || centsValue < 0) return { present: true, valid: false, cents: null };
-  return { present: true, valid: true, cents: centsValue };
-}
-
-function firstMoneyObservation(input, centsKeys, moneyKeys) {
-  for (const key of centsKeys) {
-    if (Object.prototype.hasOwnProperty.call(input, key)) return parseMoneyObservation(input[key], "cents");
-  }
-  for (const key of moneyKeys) {
-    if (Object.prototype.hasOwnProperty.call(input, key)) return parseMoneyObservation(input[key], "money");
-  }
-  return { present: false, valid: false, cents: null };
-}
-
 
 function dbNumber(value) {
   if (typeof value === "bigint") return Number(value);
@@ -371,40 +346,6 @@ function normalizeMember(input = {}) {
     sourceExternalId,
     claimedAt: asDate(input.claimedAt || input.createdAt || input.addedAt || input.ts),
     metadata: compactJson(input.metadata || null),
-  };
-}
-
-function normalizeSnapshot(input = {}) {
-  const fanId = clean(input.fanId || input.onlyFansUserId || input.id, 180);
-  if (!fanId) return null;
-  const total = firstMoneyObservation(input, ["totalSpentCents", "totalSummCents"], ["totalSumm", "totalSpent", "total"]);
-  const messages = firstMoneyObservation(input, ["messagesSpentCents", "messagesSummCents"], ["messagesSumm", "messages"]);
-  const tips = firstMoneyObservation(input, ["tipsSpentCents", "tipsSummCents"], ["tipsSumm", "tips"]);
-  const subscriptions = firstMoneyObservation(input, ["subscriptionsSpentCents", "subscribesSummCents"], ["subscribesSumm", "subscribes"]);
-  const posts = firstMoneyObservation(input, ["postsSpentCents", "postsSummCents"], ["postsSumm", "posts"]);
-  const streams = firstMoneyObservation(input, ["streamsSpentCents", "streamsSummCents"], ["streamsSumm", "streams"]);
-  const fields = [total, messages, tips, subscriptions, posts, streams];
-  const malformed = fields.some((item) => item.present && !item.valid);
-  const availability = malformed
-    ? VALUE_AVAILABILITY.MALFORMED
-    : total.valid
-      ? VALUE_AVAILABILITY.AVAILABLE
-      : VALUE_AVAILABILITY.UNAVAILABLE;
-  return {
-    fanId,
-    fanUsername: clean(input.fanUsername || input.username || input.login, 120),
-    fanName: clean(input.fanName || input.name || input.displayName, 160),
-    fanAvatar: clean(input.fanAvatar || input.avatarUrl || input.avatar, 1000),
-    totalSpentCents: total.cents,
-    messagesSpentCents: messages.cents,
-    tipsSpentCents: tips.cents,
-    subscriptionsSpentCents: subscriptions.cents,
-    postsSpentCents: posts.cents,
-    streamsSpentCents: streams.cents,
-    availability,
-    lastActivity: asDate(input.lastActivityAt || input.lastActivity),
-    fetchedAt: asDate(input.fetchedAt || input.observedAt) || new Date(),
-    source: clean(input.source || "TRAFFIC_COMPAT", 80) || "TRAFFIC_COMPAT",
   };
 }
 
@@ -907,45 +848,6 @@ async function upsertTrafficSourceScan({
     attributionRepair,
     hydrateFanIds,
   };
-}
-
-async function upsertTrafficFanValueSnapshots({ deviceId, userId, creatorId, snapshots = [] }) {
-  const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
-  const agencyId = creator.agencyId;
-  const rows = uniqueBy(
-    (Array.isArray(snapshots) ? snapshots : []).map(normalizeSnapshot).filter(Boolean).sort((a, b) => Number(a.fetchedAt?.getTime() || 0) - Number(b.fetchedAt?.getTime() || 0)),
-    (row) => row.fanId,
-  );
-  if (!rows.length) return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted: 0, authority: "CreatorFanValueCurrent" };
-
-  let upserted = 0;
-  for (const row of rows) {
-    await prisma.$transaction(async (tx) => {
-      if (row.fanUsername || row.fanName || row.fanAvatar) {
-        await projectFanIdentity(tx, {
-          agencyId, creatorId: creator.id, onlyFansUserId: row.fanId,
-          username: row.fanUsername, platformDisplayName: row.fanName, avatarUrl: row.fanAvatar,
-          observedAt: row.fetchedAt, activityObservedAt: row.lastActivity, source: "TRAFFIC_ATTRIBUTION", sourceDeviceId: device.id,
-        });
-      }
-      await projectFanValue(tx, {
-        agencyId, creatorId: creator.id, onlyFansUserId: row.fanId,
-        totalSpentCents: row.totalSpentCents, messagesSpentCents: row.messagesSpentCents,
-        tipsSpentCents: row.tipsSpentCents, subscriptionsSpentCents: row.subscriptionsSpentCents,
-        postsSpentCents: row.postsSpentCents, streamsSpentCents: row.streamsSpentCents,
-        lastActivityAt: row.lastActivity, availability: row.availability, observedAt: row.fetchedAt,
-        source: row.source || "TRAFFIC_COMPAT", sourceDeviceId: device.id,
-      });
-    });
-    upserted += 1;
-  }
-  const fanIds = rows.map((row) => row.fanId);
-  const newest = rows.reduce((max, row) => !max || row.fetchedAt > max ? row.fetchedAt : max, null);
-  await prisma.trafficSourceMember.updateMany({
-    where: { agencyId, creatorId: creator.id, fanId: { in: fanIds } },
-    data: { lastValueFetchedAt: newest || new Date(), needsValueRefresh: false },
-  });
-  return { ok: true, agencyId, creatorId: creator.id, deviceId: device.id, upserted, authority: "CreatorFanValueCurrent" };
 }
 
 async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt = null, reason = null } = {}) {
@@ -2081,7 +1983,6 @@ module.exports = {
   TRAFFIC_VALUE_REFRESH_JOB_KEY,
   VALUE_SNAPSHOT_TTL_MS,
   upsertTrafficSourceScan,
-  upsertTrafficFanValueSnapshots,
   markTrafficFanValueDirty,
   getPendingTrafficValueFanIds,
   markTrafficFanValueDirtyFromDevice,

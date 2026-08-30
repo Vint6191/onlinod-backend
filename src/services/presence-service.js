@@ -2,7 +2,7 @@
 "use strict";
 
 const prisma = require("../prisma");
-const { projectFanIdentity, projectFanValue, VALUE_AVAILABILITY } = require("./fan-data-authority-service");
+const { VALUE_AVAILABILITY } = require("./fan-data-authority-service");
 
 const SNAPSHOT_TTL_MS = Number(process.env.ONLINOD_PRESENCE_SNAPSHOT_TTL_MS) || 15 * 60 * 1000;
 
@@ -207,21 +207,8 @@ async function upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, so
         metadata: { ...(row.metadata || {}), ...metadata },
       },
     });
-    if (row.username || row.name || row.avatarUrl) {
-      await projectFanIdentity(prisma, {
-        agencyId, creatorId, onlyFansUserId: row.fanId,
-        username: row.username, platformDisplayName: row.name, avatarUrl: row.avatarUrl,
-        observedAt: at, activityObservedAt: at, source: "PRESENCE_HINT",
-        completeness: "PARTIAL", rejectSyntheticIdentity: true,
-      });
-    }
-    if (row.valueAvailability !== VALUE_AVAILABILITY.NOT_FETCHED) {
-      await projectFanValue(prisma, {
-        agencyId, creatorId, onlyFansUserId: row.fanId,
-        totalSpentCents: row.totalSpentCents, availability: row.valueAvailability,
-        observedAt: at, source: "PRESENCE_HINT",
-      });
-    }
+    // Presence is temporal telemetry only. Username/avatar/value hints in this payload
+    // are deliberately not projected into canonical Fan Data current truth.
   }
 
   return { normalized, seenIds };

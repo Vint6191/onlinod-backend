@@ -162,11 +162,11 @@ async function resolveFan(tx, job, row, now) {
   });
 }
 
-function businessData(job, deviceId, row, fanId, now) {
+function businessData(job, deviceId, row, fanRecordId, now) {
   return {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
-    fanId,
+    fanRecordId,
     fanOnlyFansUserIdAtEvent: row.fanOnlyFansUserId || null,
     fanUsernameAtEvent: row.fanUsername || null,
     fanDisplayNameAtEvent: row.fanDisplayName || null,
@@ -189,15 +189,15 @@ function businessData(job, deviceId, row, fanId, now) {
   };
 }
 
-async function uniqueLegacyProjectionCandidate(tx, job, row, fanId) {
-  if (!fanId || row.amountCents <= 0) return null;
+async function uniqueLegacyProjectionCandidate(tx, job, row, fanRecordId) {
+  if (!fanRecordId || row.amountCents <= 0) return null;
   const gte = new Date(row.occurredAt.getTime() - 5_000);
   const lte = new Date(row.occurredAt.getTime() + 5_000);
   if (row.factType === "SALE") {
     const rows = await tx.creatorSale.findMany({
       where: {
         creatorId: job.creatorId,
-        fanId,
+        fanRecordId,
         externalTransactionId: null,
         saleType: row.saleType || "OTHER",
         amountCents: row.amountCents,
@@ -213,7 +213,7 @@ async function uniqueLegacyProjectionCandidate(tx, job, row, fanId) {
     const rows = await tx.creatorTip.findMany({
       where: {
         creatorId: job.creatorId,
-        fanId,
+        fanRecordId,
         externalTransactionId: null,
         amountCents: row.amountCents,
         currency: row.currency,
@@ -227,15 +227,15 @@ async function uniqueLegacyProjectionCandidate(tx, job, row, fanId) {
   return null;
 }
 
-async function projectKnownFact(tx, job, deviceId, row, fanId, now) {
-  const common = businessData(job, deviceId, row, fanId, now);
+async function projectKnownFact(tx, job, deviceId, row, fanRecordId, now) {
+  const common = businessData(job, deviceId, row, fanRecordId, now);
   if (row.factType === "SALE") {
     const update = { ...common, saleType: row.saleType || "OTHER", purchasedAt: row.occurredAt };
     const existing = await tx.creatorSale.findUnique({
       where: { creatorId_externalTransactionId: { creatorId: job.creatorId, externalTransactionId: row.externalTransactionId } },
     });
     if (existing) return tx.creatorSale.update({ where: { id: existing.id }, data: update });
-    const legacy = await uniqueLegacyProjectionCandidate(tx, job, row, fanId);
+    const legacy = await uniqueLegacyProjectionCandidate(tx, job, row, fanRecordId);
     if (legacy) return tx.creatorSale.update({ where: { id: legacy.id }, data: update });
     return tx.creatorSale.create({
       data: { id: crypto.randomUUID(), createdAt: now, eventFingerprint: hash(`payout-transaction|${job.creatorId}|${row.externalTransactionId}`), externalNotificationId: null, messageId: null, postId: null, ...update },
@@ -247,7 +247,7 @@ async function projectKnownFact(tx, job, deviceId, row, fanId, now) {
       where: { creatorId_externalTransactionId: { creatorId: job.creatorId, externalTransactionId: row.externalTransactionId } },
     });
     if (existing) return tx.creatorTip.update({ where: { id: existing.id }, data: update });
-    const legacy = await uniqueLegacyProjectionCandidate(tx, job, row, fanId);
+    const legacy = await uniqueLegacyProjectionCandidate(tx, job, row, fanRecordId);
     if (legacy) return tx.creatorTip.update({ where: { id: legacy.id }, data: update });
     return tx.creatorTip.create({
       data: { id: crypto.randomUUID(), createdAt: now, eventFingerprint: hash(`payout-transaction|${job.creatorId}|${row.externalTransactionId}`), externalNotificationId: null, messageId: null, ...update },
@@ -306,9 +306,9 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
 
     for (const row of accepted) {
       const fan = await resolveFan(tx, job, row, now);
-      const fanId = fan?.id || null;
+      const fanRecordId = fan?.id || null;
       const commonData = {
-        agencyId: job.agencyId, creatorId: job.creatorId, fanId,
+        agencyId: job.agencyId, creatorId: job.creatorId, fanRecordId,
         fanOnlyFansUserId: row.fanOnlyFansUserId || null,
         fanUsernameAtEvent: row.fanUsername || null,
         fanDisplayNameAtEvent: row.fanDisplayName || null,
@@ -341,7 +341,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
         if (previousComparable === nextComparable) unchanged += 1; else updated += 1;
       }
       if (row.projectionStatus === "PROJECTED") {
-        const projectedFact = await projectKnownFact(tx, job, deviceId, row, fanId, now);
+        const projectedFact = await projectKnownFact(tx, job, deviceId, row, fanRecordId, now);
         if (row.factType === "SALE" && projectedFact?.id) {
           // Exact Team PPV ownership is derived from CreatorSale.messageId.
           // The payout row only enriches that canonical sale with financial

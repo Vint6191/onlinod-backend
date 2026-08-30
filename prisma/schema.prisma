@@ -1498,9 +1498,14 @@ model CreatorFan {
   displayName            String?
   avatarUrl              String?
   headerUrl              String?
-  identityObservedAt     DateTime?
-  identitySource         String?
-  identityCompleteness   String?
+  identityObservedAt       DateTime?
+  identitySource           String?
+  identityCompleteness     String?
+  identityAuthorityVersion String?
+  usernameAuthorityVersion String?
+  displayNameAuthorityVersion String?
+  avatarAuthorityVersion   String?
+  headerAuthorityVersion   String?
   firstSeenAt            DateTime @default(now())
   lastSeenAt             DateTime @default(now())
   lastActivityObservedAt DateTime?
@@ -1546,6 +1551,19 @@ model CreatorFanRelationshipCurrent {
   performer                Boolean?
   lastSeenAt               DateTime?
   subscribePriceCents      Int?
+  relationshipAuthorityVersion String?
+  fanSubscribesToCreatorAuthorityVersion String?
+  fanSubscriptionActiveAuthorityVersion String?
+  fanSubscriptionTypeAuthorityVersion String?
+  fanSubscriptionExpiresAtAuthorityVersion String?
+  creatorFollowsFanAuthorityVersion String?
+  creatorFollowExpiresAtAuthorityVersion String?
+  canReceiveChatMessageAuthorityVersion String?
+  blockedAuthorityVersion String?
+  restrictedAuthorityVersion String?
+  performerAuthorityVersion String?
+  lastSeenAtAuthorityVersion String?
+  subscribePriceCentsAuthorityVersion String?
   observedAt               DateTime
   source                   String
   sourceDeviceId           String?
@@ -1581,6 +1599,15 @@ model CreatorFanValueCurrent {
   valueObservedAt                 DateTime @map("fetchedAt")
   availability                    String   @default("AVAILABLE")
   source                          String   @default("UNKNOWN")
+  valueAuthorityVersion           String?
+  availabilityAuthorityVersion    String?
+  platformReportedTotalSpendCentsAuthorityVersion String?
+  messagesSpentCentsAuthorityVersion String?
+  subscriptionsSpentCentsAuthorityVersion String?
+  tipsSpentCentsAuthorityVersion  String?
+  postsSpentCentsAuthorityVersion String?
+  streamsSpentCentsAuthorityVersion String?
+  lastActivityAtAuthorityVersion  String?
   sourceDeviceId         String?
   sourceJobId            String?
   scanRunId              String?
@@ -1741,7 +1768,7 @@ model CreatorFinancialTransaction {
   id                    String                                      @id @default(cuid())
   agencyId              String
   creatorId             String
-  fanId                  String?
+  fanRecordId                  String? @map("fanId")
   fanOnlyFansUserId      String?
   fanUsernameAtEvent     String?
   fanDisplayNameAtEvent  String?
@@ -1771,14 +1798,14 @@ model CreatorFinancialTransaction {
   updatedAt               DateTime                                    @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorFinancialTransactionCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
   teamPpvPurchase TeamPpvPurchaseLedger?
 
   @@unique([creatorId, externalTransactionId])
   @@index([agencyId, creatorId, occurredAt])
-  @@index([creatorId, fanId, occurredAt])
+  @@index([creatorId, fanRecordId, occurredAt])
   @@index([creatorId, transactionType, occurredAt])
   @@index([creatorId, sourceJobId, page])
   @@index([creatorId, scanRunId, page])
@@ -1817,7 +1844,7 @@ model CreatorSale {
   id                     String          @id @default(cuid())
   agencyId               String
   creatorId              String
-  fanId                   String?
+  fanRecordId                   String? @map("fanId")
   fanOnlyFansUserIdAtEvent String?
   fanUsernameAtEvent      String?
   fanDisplayNameAtEvent   String?
@@ -1846,7 +1873,7 @@ model CreatorSale {
   updatedAt              DateTime          @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorSaleCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
   teamPpvPurchase TeamPpvPurchaseLedger?
@@ -1855,7 +1882,7 @@ model CreatorSale {
   @@unique([creatorId, externalNotificationId])
   @@unique([creatorId, externalTransactionId])
   @@index([agencyId, creatorId, purchasedAt])
-  @@index([creatorId, fanId, purchasedAt])
+  @@index([creatorId, fanRecordId, purchasedAt])
   @@index([creatorId, messageId])
   @@index([creatorId, postId])
   @@index([sourceJobId])
@@ -1865,7 +1892,7 @@ model CreatorTip {
   id                     String   @id @default(cuid())
   agencyId               String
   creatorId              String
-  fanId                   String?
+  fanRecordId                   String? @map("fanId")
   fanOnlyFansUserIdAtEvent String?
   fanUsernameAtEvent      String?
   fanDisplayNameAtEvent   String?
@@ -1892,7 +1919,7 @@ model CreatorTip {
   updatedAt              DateTime @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorTipCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
   teamTipAttribution TeamTipLedger?
@@ -1901,7 +1928,7 @@ model CreatorTip {
   @@unique([creatorId, externalNotificationId])
   @@unique([creatorId, externalTransactionId])
   @@index([agencyId, creatorId, tippedAt])
-  @@index([creatorId, fanId, tippedAt])
+  @@index([creatorId, fanRecordId, tippedAt])
   @@index([sourceJobId])
 }
 
@@ -1909,7 +1936,7 @@ model CreatorSubscriptionEvent {
   id                     String                       @id @default(cuid())
   agencyId               String
   creatorId              String
-  fanId                   String?
+  fanRecordId                   String? @map("fanId")
   fanOnlyFansUserIdAtEvent String?
   fanUsernameAtEvent      String?
   fanDisplayNameAtEvent   String?
@@ -1930,7 +1957,7 @@ model CreatorSubscriptionEvent {
   updatedAt              DateTime                     @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorSubscriptionEventCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
   stateUpdated CreatorSubscriptionState? @relation("CreatorSubscriptionStateUpdatedFrom")
@@ -1942,7 +1969,7 @@ model CreatorSubscriptionEvent {
   @@unique([creatorId, externalNotificationId])
   @@index([creatorId, externalTransactionId])
   @@index([agencyId, creatorId, occurredAt])
-  @@index([creatorId, fanId, occurredAt])
+  @@index([creatorId, fanRecordId, occurredAt])
   @@index([creatorId, eventType, occurredAt])
   @@index([sourceJobId])
 }
@@ -1952,7 +1979,7 @@ model CreatorSubscriptionState {
   id                 String                         @id @default(cuid())
   agencyId           String
   creatorId          String
-  fanId              String
+  fanRecordId              String @map("fanId")
   status             CreatorSubscriptionStateStatus @default(UNKNOWN)
   currentPriceCents  Int?
   currency           String                         @default("USD")
@@ -1967,10 +1994,10 @@ model CreatorSubscriptionState {
   updatedAt          DateTime                       @updatedAt
 
   creator          CreatorAccount             @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan              CreatorFan                 @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan              CreatorFan                 @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   updatedFromEvent CreatorSubscriptionEvent?   @relation("CreatorSubscriptionStateUpdatedFrom", fields: [updatedFromEventId], references: [id], onDelete: SetNull)
 
-  @@unique([creatorId, fanId])
+  @@unique([creatorId, fanRecordId])
   @@index([agencyId, creatorId, status])
   @@index([creatorId, lastEventAt])
 }
@@ -1979,7 +2006,7 @@ model CreatorPaidSubscription {
   id                     String                                @id @default(cuid())
   agencyId               String
   creatorId              String
-  fanId                   String?
+  fanRecordId                   String? @map("fanId")
   fanOnlyFansUserIdAtEvent String?
   fanUsernameAtEvent      String?
   fanDisplayNameAtEvent   String?
@@ -2008,7 +2035,7 @@ model CreatorPaidSubscription {
   updatedAt              DateTime                              @updatedAt
 
   creator           CreatorAccount            @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan               CreatorFan?               @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan               CreatorFan?               @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   subscriptionEvent CreatorSubscriptionEvent? @relation("CreatorPaidSubscriptionEvent", fields: [subscriptionEventId], references: [id], onDelete: SetNull)
   sourceDevice      WorkerDevice?             @relation("CreatorPaidSubscriptionCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob         JobInstance?              @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
@@ -2016,7 +2043,7 @@ model CreatorPaidSubscription {
   @@unique([creatorId, eventFingerprint])
   @@unique([creatorId, externalTransactionId])
   @@index([agencyId, creatorId, paidAt])
-  @@index([creatorId, fanId, paidAt])
+  @@index([creatorId, fanRecordId, paidAt])
   @@index([sourceJobId])
 }
 
@@ -2024,7 +2051,7 @@ model CreatorPostLike {
   id                     String   @id @default(cuid())
   agencyId               String
   creatorId              String
-  fanId                   String?
+  fanRecordId                   String? @map("fanId")
   fanOnlyFansUserIdAtEvent String?
   fanUsernameAtEvent      String?
   fanDisplayNameAtEvent   String?
@@ -2041,7 +2068,7 @@ model CreatorPostLike {
   updatedAt              DateTime @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorPostLikeCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
 
@@ -2049,7 +2076,7 @@ model CreatorPostLike {
   @@unique([creatorId, externalNotificationId])
   @@unique([creatorId, onlyFansLikeId])
   @@index([agencyId, creatorId, likedAt])
-  @@index([creatorId, fanId, likedAt])
+  @@index([creatorId, fanRecordId, likedAt])
   @@index([creatorId, onlyFansPostId, likedAt])
   @@index([sourceJobId])
 }
@@ -2058,7 +2085,7 @@ model CreatorPostComment {
   id                     String   @id @default(cuid())
   agencyId               String
   creatorId              String
-  fanId                   String?
+  fanRecordId                   String? @map("fanId")
   fanOnlyFansUserIdAtEvent String?
   fanUsernameAtEvent      String?
   fanDisplayNameAtEvent   String?
@@ -2075,7 +2102,7 @@ model CreatorPostComment {
   updatedAt              DateTime @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan          CreatorFan?     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan          CreatorFan?     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   sourceDevice WorkerDevice?   @relation("CreatorPostCommentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
 
@@ -2083,7 +2110,7 @@ model CreatorPostComment {
   @@unique([creatorId, externalNotificationId])
   @@unique([creatorId, onlyFansCommentId])
   @@index([agencyId, creatorId, commentedAt])
-  @@index([creatorId, fanId, commentedAt])
+  @@index([creatorId, fanRecordId, commentedAt])
   @@index([creatorId, onlyFansPostId, commentedAt])
   @@index([sourceJobId])
 }
@@ -2162,7 +2189,7 @@ model CreatorCampaignFan {
   agencyId        String
   creatorId       String
   campaignId      String
-  fanId           String
+  fanRecordId           String @map("fanId")
   externalClaimerId String?
   claimerUsernameAtEvent String?
   claimerDisplayNameAtEvent String?
@@ -2181,14 +2208,14 @@ model CreatorCampaignFan {
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   campaign     CreatorCampaign @relation(fields: [creatorId, campaignId], references: [creatorId, id], onDelete: Cascade)
-  fan          CreatorFan      @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan          CreatorFan      @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   subscriptionEvent CreatorSubscriptionEvent? @relation("CreatorCampaignFanSubscriptionEvent", fields: [subscriptionEventId], references: [id], onDelete: SetNull)
   sourceDevice WorkerDevice?   @relation("CreatorCampaignFanCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
 
-  @@unique([campaignId, fanId])
+  @@unique([campaignId, fanRecordId])
   @@index([agencyId, creatorId, campaignId])
-  @@index([creatorId, fanId])
+  @@index([creatorId, fanRecordId])
   @@index([subscriptionEventId])
   @@index([creatorId, campaignId, sourceScanStartedAt])
   @@index([creatorId, campaignId, sourceScanRunId])
@@ -2288,7 +2315,7 @@ model CreatorFanLocalCoverage {
   id              String   @id @default(cuid())
   agencyId        String
   creatorId       String
-  fanId           String
+  fanRecordId           String @map("fanId")
   deviceId        String
   oldestMessageAt DateTime?
   newestMessageAt DateTime?
@@ -2298,10 +2325,10 @@ model CreatorFanLocalCoverage {
   updatedAt       DateTime @updatedAt
 
   creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan     CreatorFan     @relation(fields: [creatorId, fanId], references: [creatorId, id], onDelete: NoAction)
+  fan     CreatorFan     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
   device  WorkerDevice   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
 
-  @@unique([creatorId, fanId, deviceId])
+  @@unique([creatorId, fanRecordId, deviceId])
   @@index([agencyId, creatorId, isComplete])
   @@index([deviceId, lastVerifiedAt])
 }

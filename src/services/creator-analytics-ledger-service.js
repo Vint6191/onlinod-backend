@@ -674,7 +674,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         source: "CAMPAIGN_CLAIMER",
       });
 
-      const where = { campaignId_fanId: { campaignId: saved.id, fanId: fan.id } };
+      const where = { campaignId_fanRecordId: { campaignId: saved.id, fanRecordId: fan.id } };
       const existing = await tx.creatorCampaignFan.findUnique({
         where,
         select: { id: true, sourceScanStartedAt: true, externalClaimerId: true, attributedAt: true },
@@ -693,7 +693,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
           agencyId: job.agencyId,
           creatorId: job.creatorId,
           campaignId: saved.id,
-          fanId: fan.id,
+          fanRecordId: fan.id,
           externalClaimerId: claimer.externalClaimerId,
           claimerUsernameAtEvent: claimer.username || null,
           claimerDisplayNameAtEvent: claimer.displayName || null,
@@ -803,7 +803,7 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }) 
   return {
     replay: projected.replay,
     available: true,
-    fanId: fan.id,
+    fanRecordId: fan.id,
     fetchedAt: projected.record?.valueObservedAt || item.observedAt,
   };
 }
@@ -1408,13 +1408,13 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
     take: take + 1,
   });
   const pageRows = rows.slice(0, take);
-  const fanIds = pageRows.map((row) => row.fanId).filter(Boolean);
+  const fanRecordIds = pageRows.map((row) => row.fanRecordId).filter(Boolean);
   const range = rangeKey ? rangeBounds(rangeKey, now) : null;
   let moneyByFan = new Map();
   const queryRaw = typeof db.$queryRawUnsafe === "function"
     ? db.$queryRawUnsafe.bind(db)
     : typeof db.$queryRaw === "function" ? db.$queryRaw.bind(db) : null;
-  if (fanIds.length && queryRaw) {
+  if (fanRecordIds.length && queryRaw) {
     const moneyRows = await queryRaw(`
       WITH attributed AS (
         SELECT
@@ -1453,7 +1453,7 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
       FROM attributed
       WHERE "campaignId" = $2
       GROUP BY "fanId"
-    `, creatorId, campaign.id, fanIds, range?.start || null, range?.end || null);
+    `, creatorId, campaign.id, fanRecordIds, range?.start || null, range?.end || null);
     moneyByFan = new Map(moneyRows.map((row) => [String(row.fanId), {
       grossCents: Number(row.grossCents || 0),
       netCents: Number(row.netCents || 0),
@@ -1496,7 +1496,7 @@ async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50
           observedAt: valueCurrent.valueObservedAt,
           source: valueCurrent.source,
         } : null,
-        revenue: moneyByFan.get(String(row.fanId)) || zeroMoney,
+        revenue: moneyByFan.get(String(row.fanRecordId)) || zeroMoney,
       };
     }),
     pagination: { limit: take, offset: skip, returned: pageRows.length, hasMore },
