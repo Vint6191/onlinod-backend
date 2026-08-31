@@ -2,6 +2,7 @@
 
 const prisma = require("../prisma");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
+const { JOB_CATALOG } = require("./job-catalog");
 
 const DEFAULT_PROTECTED_STATUSES = Object.freeze(["CLAIMED"]);
 
@@ -19,6 +20,18 @@ function clean(value, max = 180) {
 function normalizePriority(value, fallback = 0) {
   const parsed = Math.floor(Number(value));
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function assertPlannableJobKey(value) {
+  const normalizedJobKey = clean(value, 120);
+  if (!normalizedJobKey) throw new Error("JOB_PLANNING_JOB_KEY_REQUIRED");
+  if (!Object.prototype.hasOwnProperty.call(JOB_CATALOG, normalizedJobKey)) {
+    const error = new Error("JOB_PLANNING_UNKNOWN_JOB_KEY");
+    error.code = "JOB_PLANNING_UNKNOWN_JOB_KEY";
+    error.jobKey = normalizedJobKey;
+    throw error;
+  }
+  return normalizedJobKey;
 }
 
 function publishPlannedJobAvailable(job) {
@@ -50,8 +63,7 @@ function scheduledCreateData({
   continuation = null,
   progress = null,
 } = {}) {
-  const normalizedJobKey = clean(jobKey, 120);
-  if (!normalizedJobKey) throw new Error("JOB_PLANNING_JOB_KEY_REQUIRED");
+  const normalizedJobKey = assertPlannableJobKey(jobKey);
   return {
     jobKey: normalizedJobKey,
     scope: clean(scope, 80) || "creator",
@@ -154,6 +166,7 @@ async function reschedulePlannedJob({
   resetAttempts = true,
   publish = true,
 } = {}) {
+  if (job?.jobKey) assertPlannableJobKey(job.jobKey);
   const id = clean(jobId, 180);
   if (!id) throw new Error("JOB_PLANNING_JOB_ID_REQUIRED");
   const protectedSet = new Set((protectedStatuses || []).map((value) => String(value || "").trim()).filter(Boolean));
@@ -187,6 +200,7 @@ async function updatePlannedJobDemand({
   nextRunAt = null,
   publish = true,
 } = {}) {
+  if (job?.jobKey) assertPlannableJobKey(job.jobKey);
   if (!job?.id) throw new Error("JOB_PLANNING_JOB_ID_REQUIRED");
   if (!["SCHEDULED", "CLAIMED"].includes(String(job.status || ""))) {
     return { job, updated: false, reason: `not_demand_mutable_${String(job.status || "unknown").toLowerCase()}` };
@@ -217,6 +231,7 @@ async function ensurePlannedJob({
   protectedStatuses = DEFAULT_PROTECTED_STATUSES,
   ...input
 } = {}) {
+  assertPlannableJobKey(input.jobKey);
   const idempotencyKey = clean(input.idempotencyKey, 320);
   if (!idempotencyKey) {
     const job = await createPlannedJob({ db, publish, ...input });
@@ -255,6 +270,7 @@ async function ensurePlannedJob({
 
 module.exports = {
   DEFAULT_PROTECTED_STATUSES,
+  assertPlannableJobKey,
   scheduledCreateData,
   scheduledResetData,
   publishPlannedJobAvailable,

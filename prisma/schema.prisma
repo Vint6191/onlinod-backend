@@ -3763,6 +3763,8 @@ model SfsTargetCandidate {
   unfollowAt               DateTime?
   discoveredAt             DateTime @default(now())
   lastSeenAt               DateTime @default(now())
+  discoveryObservedAt      DateTime?
+  discoverySourceJobId     String?
   completedAt              DateTime?
   metadata                 Json     @default("{}")
   createdAt                DateTime @default(now())

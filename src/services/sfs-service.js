@@ -86,27 +86,60 @@ async function applySfsDiscoveryChunk({ db = prisma, job, chunkResult }) {
   if (payload.kind !== "sfs_target_profile") return { applied: 0 };
   const target = normalizeSfsTarget(payload.target, payload.sourcePostIds);
   if (!target) return { applied: 0 };
-  const now = dateOrNull(payload.observedAt) || new Date();
-  const existing = await db.sfsTargetCandidate.findUnique({ where: { creatorId_username: { creatorId: job.creatorId, username: target.username } } });
-  const usedForever = existing?.usedForever === true;
-  const row = await db.sfsTargetCandidate.upsert({
-    where: { creatorId_username: { creatorId: job.creatorId, username: target.username } },
-    create: {
-      agencyId: job.agencyId, creatorId: job.creatorId, targetUserId: target.targetUserId, username: target.username,
-      displayName: target.displayName, avatarUrl: target.avatarUrl, subscribePriceCents: target.subscribePriceCents,
-      isWantComments: target.isWantComments, creatorFollowing: target.creatorFollowing, sourcePostIds: target.sourcePostIds,
-      state: "CANDIDATE", phase: "DISCOVERY", eligibilityReason: null, discoveredAt: now, lastSeenAt: now,
-      metadata: { discoveryJobId: job.id, profileHash: payload.profileHash || null },
-    },
-    update: {
-      targetUserId: target.targetUserId, displayName: target.displayName, avatarUrl: target.avatarUrl,
-      subscribePriceCents: target.subscribePriceCents, isWantComments: target.isWantComments,
-      creatorFollowing: target.creatorFollowing, sourcePostIds: target.sourcePostIds, lastSeenAt: now,
-      ...(usedForever ? {} : { state: existing?.state === "STALE" ? "CANDIDATE" : existing?.state || "CANDIDATE" }),
-      metadata: { ...object(existing?.metadata), discoveryJobId: job.id, profileHash: payload.profileHash || null },
+  const observedAt = dateOrNull(payload.observedAt);
+  if (!observedAt) throw new Error("SFS_DISCOVERY_OBSERVED_AT_REQUIRED");
+  const sourceJobId = clean(job.id, 180);
+  if (!sourceJobId) throw new Error("SFS_DISCOVERY_SOURCE_JOB_REQUIRED");
+
+  return withDbAdvisoryXactLock({
+    db,
+    key: `a13:sfs-discovery:${job.agencyId}:${job.creatorId}:${target.username}`,
+    options: { timeout: 30_000 },
+    work: async (tx) => {
+      const existing = await tx.sfsTargetCandidate.findUnique({
+        where: { creatorId_username: { creatorId: job.creatorId, username: target.username } },
+      });
+      const currentObservedAt = dateOrNull(existing?.discoveryObservedAt);
+      const currentSourceJobId = clean(existing?.discoverySourceJobId, 180) || "";
+      if (currentObservedAt) {
+        const delta = observedAt.getTime() - currentObservedAt.getTime();
+        const sameAuthority = delta === 0 && currentSourceJobId === sourceJobId;
+        const tieWins = delta === 0 && sourceJobId.localeCompare(currentSourceJobId) > 0;
+        if (delta < 0 || (delta === 0 && !sameAuthority && !tieWins)) {
+          return {
+            applied: 0,
+            stale: true,
+            sideEffect: "STALE_NOOP",
+            candidateId: existing?.id || null,
+            observedAt: observedAt.toISOString(),
+            currentObservedAt: currentObservedAt.toISOString(),
+          };
+        }
+      }
+
+      const usedForever = existing?.usedForever === true;
+      const row = await tx.sfsTargetCandidate.upsert({
+        where: { creatorId_username: { creatorId: job.creatorId, username: target.username } },
+        create: {
+          agencyId: job.agencyId, creatorId: job.creatorId, targetUserId: target.targetUserId, username: target.username,
+          displayName: target.displayName, avatarUrl: target.avatarUrl, subscribePriceCents: target.subscribePriceCents,
+          isWantComments: target.isWantComments, creatorFollowing: target.creatorFollowing, sourcePostIds: target.sourcePostIds,
+          state: "CANDIDATE", phase: "DISCOVERY", eligibilityReason: null, discoveredAt: observedAt, lastSeenAt: observedAt,
+          discoveryObservedAt: observedAt, discoverySourceJobId: sourceJobId,
+          metadata: { discoveryJobId: sourceJobId, profileHash: payload.profileHash || null },
+        },
+        update: {
+          targetUserId: target.targetUserId, displayName: target.displayName, avatarUrl: target.avatarUrl,
+          subscribePriceCents: target.subscribePriceCents, isWantComments: target.isWantComments,
+          creatorFollowing: target.creatorFollowing, sourcePostIds: target.sourcePostIds, lastSeenAt: observedAt,
+          discoveryObservedAt: observedAt, discoverySourceJobId: sourceJobId,
+          ...(usedForever ? {} : { state: existing?.state === "STALE" ? "CANDIDATE" : existing?.state || "CANDIDATE" }),
+          metadata: { ...object(existing?.metadata), discoveryJobId: sourceJobId, profileHash: payload.profileHash || null },
+        },
+      });
+      return { applied: 1, candidateId: row.id, observedAt: observedAt.toISOString() };
     },
   });
-  return { applied: 1, candidateId: row.id };
 }
 
 async function applySfsDiscoveryCompletion({ job, result, db = prisma }) {

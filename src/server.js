@@ -36,7 +36,6 @@ const teamScheduleRoutes = require("./routes/team-schedule");
 const homeRoutes = require("./routes/home");
 const telemetryRoutes = require("./routes/telemetry");
 const analyticsRoutes = require("./routes/analytics");
-const presenceRoutes = require("./routes/presence");
 const contentStoreRoutes = require("./routes/content-store");
 const crmStoreRoutes = require("./routes/crm-store");
 const fanListsRoutes = require("./routes/fan-lists");
@@ -60,7 +59,6 @@ const prisma = require("./prisma");
 const logger = require("./utils/logger");
 const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
 const { startRecurringScheduler } = require("./services/job-scheduler");
-const { startPresenceScheduler } = require("./services/presence-scheduler");
 
 process.on("unhandledRejection", (reason) => {
   logger.error("unhandled promise rejection", { error: String(reason?.message || reason), stack: reason?.stack || null });
@@ -207,7 +205,6 @@ app.use("/api/jobs", authRequired, jobsRoutes);
 app.use("/api/of-request-gate", authRequired, ofRequestGateRoutes);
 app.use("/api/telemetry", authRequired, telemetryRoutes);
 app.use("/api/analytics", authRequired, analyticsRoutes);
-app.use("/api/presence", authRequired, presenceRoutes);
 app.use("/api/traffic", authRequired, trafficRoutes);
 app.use("/api/subscribers", authRequired, subscribersRoutes);
 app.use("/api/fan-data", authRequired, fanDataRoutes);
@@ -282,7 +279,6 @@ const httpServer = app.listen(port, () => {
 });
 
 startRecurringScheduler();
-startPresenceScheduler();
 
 async function gracefulShutdown(signal) {
   logger.info("shutdown requested", { signal });

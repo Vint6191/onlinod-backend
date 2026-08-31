@@ -72,7 +72,7 @@ test("planning reset clears every lease/access/execution field and bumps leaseRe
 test("idempotent plan creates once and publishes one wakeup", async () => {
   published.length = 0;
   const db = makeDb();
-  const input = { db, jobKey: "x", creatorId: "c1", agencyId: "a1", idempotencyKey: "k1", params: {}, priority: 5 };
+  const input = { db, jobKey: "fetch_earnings", creatorId: "c1", agencyId: "a1", idempotencyKey: "k1", params: {}, priority: 5 };
   const a = await ensurePlannedJob(input);
   const b = await ensurePlannedJob(input);
   assert.equal(a.created, true);
@@ -84,9 +84,9 @@ test("idempotent plan creates once and publishes one wakeup", async () => {
 
 test("reschedule invalidates an old lease generation instead of silently reusing it", async () => {
   published.length = 0;
-  const db = makeDb([{ id: "j1", idempotencyKey: "k1", jobKey: "x", creatorId: "c1", agencyId: "a1", status: "FAILED", leaseRevision: 7, leaseMemberId: "m1", leaseAccessEpoch: 4, attempts: 3, params: {} }]);
+  const db = makeDb([{ id: "j1", idempotencyKey: "k1", jobKey: "fetch_earnings", creatorId: "c1", agencyId: "a1", status: "FAILED", leaseRevision: 7, leaseMemberId: "m1", leaseAccessEpoch: 4, attempts: 3, params: {} }]);
   const result = await ensurePlannedJob({
-    db, jobKey: "x", creatorId: "c1", agencyId: "a1", idempotencyKey: "k1", params: { fresh: true }, priority: 10,
+    db, jobKey: "fetch_earnings", creatorId: "c1", agencyId: "a1", idempotencyKey: "k1", params: { fresh: true }, priority: 10,
     resetExisting: true,
   });
   assert.equal(result.rescheduled, true);
@@ -100,9 +100,9 @@ test("reschedule invalidates an old lease generation instead of silently reusing
 });
 
 test("claimed execution ownership is fail-closed against planner reset", async () => {
-  const db = makeDb([{ id: "j1", idempotencyKey: "k1", jobKey: "x", creatorId: "c1", agencyId: "a1", status: "CLAIMED", leaseRevision: 5, params: {} }]);
+  const db = makeDb([{ id: "j1", idempotencyKey: "k1", jobKey: "fetch_earnings", creatorId: "c1", agencyId: "a1", status: "CLAIMED", leaseRevision: 5, params: {} }]);
   const result = await ensurePlannedJob({
-    db, jobKey: "x", creatorId: "c1", agencyId: "a1", idempotencyKey: "k1", params: { newer: true }, resetExisting: true,
+    db, jobKey: "fetch_earnings", creatorId: "c1", agencyId: "a1", idempotencyKey: "k1", params: { newer: true }, resetExisting: true,
   });
   assert.equal(result.rescheduled, false);
   assert.equal(result.reason, "protected_claimed");
@@ -111,7 +111,7 @@ test("claimed execution ownership is fail-closed against planner reset", async (
 });
 
 test("leaseRevision CAS prevents a stale planner reset from winning", async () => {
-  const db = makeDb([{ id: "j1", jobKey: "x", creatorId: "c1", agencyId: "a1", status: "FAILED", leaseRevision: 2, params: {} }]);
+  const db = makeDb([{ id: "j1", jobKey: "fetch_earnings", creatorId: "c1", agencyId: "a1", status: "FAILED", leaseRevision: 2, params: {} }]);
   const stale = { ...(await db.jobInstance.findUnique({ where: { id: "j1" } })) };
   db.rows.set("j1", { ...db.rows.get("j1"), leaseRevision: 3, status: "CLAIMED" });
   const result = await reschedulePlannedJob({ db, job: stale, params: { stale: true } });
@@ -122,7 +122,7 @@ test("leaseRevision CAS prevents a stale planner reset from winning", async () =
 
 
 test("demand update is CAS-fenced and never resets execution ownership", async () => {
-  const db = makeDb([{ id: "j1", idempotencyKey: "k1", jobKey: "x", creatorId: "c1", agencyId: "a1", status: "CLAIMED", leaseRevision: 9, priority: 10, params: { old: true } }]);
+  const db = makeDb([{ id: "j1", idempotencyKey: "k1", jobKey: "fetch_earnings", creatorId: "c1", agencyId: "a1", status: "CLAIMED", leaseRevision: 9, priority: 10, params: { old: true } }]);
   const job = await db.jobInstance.findUnique({ where: { id: "j1" } });
   const result = await updatePlannedJobDemand({ db, job, priority: 30, params: { demand: true }, nextRunAt: new Date("2026-08-31T01:00:00Z") });
   assert.equal(result.updated, true);

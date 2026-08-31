@@ -1,7 +1,6 @@
 "use strict";
 
 const prisma = require("../prisma");
-const { applyPresenceJobResult } = require("./presence-service");
 const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("./team-observation-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
 const { recordNotificationPageProgress } = require("./notification-sync-state-service");
@@ -45,7 +44,6 @@ const {
 
 const EARNINGS_JOB_KEY = "fetch_earnings";
 const CAMPAIGNS_JOB_KEY = "fetch_campaigns";
-const PRESENCE_JOB_KEY = "refresh_online_presence";
 
 function asObject(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -348,7 +346,6 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ db, job, deviceId, userId, result });
   if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ db, job, deviceId, userId, result });
   if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ db, job, deviceId, userId, result });
-  if (job.jobKey === PRESENCE_JOB_KEY) return applyPresenceJobResult({ db, job, deviceId, result: result || {} });
   if (job.jobKey === CATCHUP_JOB_KEY) return applyCatchupJobResult({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return applyLikesDiscoveryCompletion({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryCompletion({ db, job, deviceId, userId, result: result || {} });

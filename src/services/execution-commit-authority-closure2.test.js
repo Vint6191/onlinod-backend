@@ -367,7 +367,6 @@ test("Closure2 delayed SFS generation 1 scan is a no-op after candidate advances
 function loadJobResultForTraffic(db, upsertTrafficSourceScan) {
   cacheModule("../prisma", db);
   const stubs = {
-    "./presence-service": { applyPresenceJobResult: async () => ({}) },
     "./team-observation-service": { CATCHUP_JOB_KEY: "catchup", applyCatchupJobResult: async () => ({}), recordCatchupJobFailure: async () => ({}) },
     "./notification-facts-service": { ingestNotificationFacts: async () => ({}) },
     "./notification-sync-state-service": { recordNotificationPageProgress: async () => ({}) },
