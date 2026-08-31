@@ -2,7 +2,7 @@
 
 const prisma = require("../prisma");
 
-const ACTIVE_WRITE_STATUSES = ["QUEUED", "RETRY_SCHEDULED", "CLAIMED", "RUNNING", "COMMITTING"];
+const ACTIVE_WRITE_STATUSES = ["QUEUED", "RETRY_SCHEDULED", "CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"];
 
 function number(value, fallback = 0) {
   const parsed = Number(value);
@@ -43,7 +43,7 @@ async function latestWriteState({ agencyId, creatorId, actionType = null, now = 
     }),
   ]);
   const activeBase = planned
-    ? Math.max(dateMs(planned.notBefore), dateMs(planned.claimedAt), ["CLAIMED", "RUNNING", "COMMITTING"].includes(planned.status) ? now.getTime() : 0)
+    ? Math.max(dateMs(planned.notBefore), dateMs(planned.claimedAt), ["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"].includes(planned.status) ? now.getTime() : 0)
     : 0;
   return {
     hasState: Boolean(planned || completed),

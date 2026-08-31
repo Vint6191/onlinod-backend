@@ -1,6 +1,9 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { withDbAdvisoryXactLock } = require("./db-transaction-service");
+const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const {
   stableFingerprint,
@@ -16,7 +19,7 @@ const {
   requireCreator,
 } = require("./automation-control-service");
 
-const ACTIVE_ACTION_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RETRY_SCHEDULED", "PAUSED"];
+const ACTIVE_ACTION_STATUSES = [...ACTIVE_WRITE_WORKFLOW_STATUSES];
 const SEND_ACTION = "SEND_MESSAGE";
 const DELETE_ACTION = "DELETE_MESSAGE";
 const SOURCE_KEYS = new Set(["online", "hidden_online", "paid_subscriber", "free_subscriber", "subscription_event", "manual"]);
@@ -137,8 +140,7 @@ async function loadCandidates({ agencyId, creatorId, source, fanIds = [], limit 
 async function planBumps({ agencyId, creatorId, userId = null, source = "manual", fanIds = [], limit = null, manual = false, db = prisma }) {
   const normalizedSource = sourceKey(source);
   await requireCreator(agencyId, creatorId, db);
-  return db.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`p11:bumps:${agencyId}:${creatorId}`}))`;
+  return withDbAdvisoryXactLock({ db, key: `p11:bumps:${agencyId}:${creatorId}`, work: async (tx) => {
     const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, db: tx });
     const settings = control.modules.bumps.settings;
     const sourceEnabled = normalizedSource === "online" ? settings.onlineEnabled
@@ -247,7 +249,7 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
       }
     }
     return { ok: true, source: normalizedSource, planned: planned.length, items: planned, skipped, dailyRemaining: remaining };
-  }, { timeout: 30_000 });
+  }, options: { timeout: 30_000 } });
 }
 
 async function recordDetailedObservations({ agencyId, creatorId, observations, db = prisma }) {
@@ -456,52 +458,72 @@ async function finalizeBumpDelete({ delivery, result, outcomeCode, db = prisma }
 }
 
 async function markBumpReply({ agencyId, creatorId, fanId, messageId = null, repliedAt = new Date(), source = "ws", db = prisma }) {
-  const apply = async (tx) => {
-    const state = await tx.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId, fanId } } });
-    if (!state?.pendingMessageId) return { ok: true, matched: false, code: "no_pending_bump" };
-    const pendingMessageId = state.pendingMessageId;
-    const cancel = await tx.automationDelivery.findFirst({
-      where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, actionType: DELETE_ACTION, targetId: pendingMessageId, status: { in: ACTIVE_ACTION_STATUSES } },
-      orderBy: { createdAt: "desc" },
-    });
-    const send = state.pendingDeliveryId ? await tx.automationDelivery.findUnique({ where: { id: state.pendingDeliveryId } }) : null;
-    const payload = object(cancel?.payload || send?.payload);
-    const timing = object(send?.payload?.timing);
-    const cooldownMs = int(payload.afterReplyCooldownMs ?? timing.afterReplyCooldownMs, 24 * 60 * 60_000, 0, 90 * 24 * 60 * 60_000);
-    const at = date(repliedAt) || new Date();
-    const stateChanged = await tx.automationBumpFanState.updateMany({
-      where: { id: state.id, pendingMessageId },
-      data: {
-        lastStatus: "REPLIED", lastAnyRepliedAt: at, lastReplyMessageId: clean(messageId, 160), lastFinalizedAt: at,
-        pendingMessageId: null, pendingDeliveryId: null, pendingCancelAt: null,
-        cooldownUntil: new Date(at.getTime() + cooldownMs),
-        counters: { ...object(state.counters), replied: Number(object(state.counters).replied || 0) + 1 },
-      },
-    });
-    if (!stateChanged.count) return { ok: true, matched: false, code: "reply_already_applied" };
-    if (cancel) {
-      await tx.automationDelivery.updateMany({
-        where: { id: cancel.id, status: { in: ACTIVE_ACTION_STATUSES }, leaseRevision: cancel.leaseRevision },
+  return runWithAutomationWriteCommitFence({
+    db,
+    agencyId,
+    options: { timeout: 30_000 },
+    work: async (tx) => {
+      const state = await tx.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId, fanId } } });
+      if (!state?.pendingMessageId) return { ok: true, matched: false, code: "no_pending_bump" };
+      const pendingMessageId = state.pendingMessageId;
+      const cancel = await tx.automationDelivery.findFirst({
+        where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, actionType: DELETE_ACTION, targetId: pendingMessageId, status: { in: ACTIVE_ACTION_STATUSES } },
+        orderBy: { createdAt: "desc" },
+      });
+      const send = state.pendingDeliveryId ? await tx.automationDelivery.findUnique({ where: { id: state.pendingDeliveryId } }) : null;
+      const payload = object(cancel?.payload || send?.payload);
+      const timing = object(send?.payload?.timing);
+      const cooldownMs = int(payload.afterReplyCooldownMs ?? timing.afterReplyCooldownMs, 24 * 60 * 60_000, 0, 90 * 24 * 60 * 60_000);
+      const at = date(repliedAt) || new Date();
+      const stateChanged = await tx.automationBumpFanState.updateMany({
+        where: { id: state.id, pendingMessageId },
         data: {
-          status: "SKIPPED", failureCode: "replied", lastError: null, finishedAt: at,
-          claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
-          result: { ...object(cancel.result), code: "replied", replied: true, repliedAt: at.toISOString(), replyMessageId: clean(messageId, 160), source },
+          lastStatus: "REPLIED", lastAnyRepliedAt: at, lastReplyMessageId: clean(messageId, 160), lastFinalizedAt: at,
+          pendingMessageId: null, pendingDeliveryId: null, pendingCancelAt: null,
+          cooldownUntil: new Date(at.getTime() + cooldownMs),
+          counters: { ...object(state.counters), replied: Number(object(state.counters).replied || 0) + 1 },
         },
       });
-    }
-    if (send) {
-      await tx.automationDelivery.update({
-        where: { id: send.id },
-        data: { result: { ...object(send.result), replied: true, repliedAt: at.toISOString(), replyMessageId: clean(messageId, 160), replySource: source } },
-      });
-    }
-    const templateId = clean(object(send?.payload).template?.id || send?.contentCollectionId, 160) || "";
-    await bumpStat({ agencyId, creatorId, templateId, field: "replied", at, db: tx });
-    return { ok: true, matched: true, pendingMessageId, cancelDeliveryId: cancel?.id || null, sendDeliveryId: send?.id || null };
-  };
-  return typeof db.$transaction === "function"
-    ? db.$transaction((tx) => apply(tx), { timeout: 30_000 })
-    : apply(db);
+      if (!stateChanged.count) return { ok: true, matched: false, code: "reply_already_applied" };
+      let replyObservedDuringCommit = false;
+      if (cancel) {
+        if (["COMMITTING", "RECONCILE_REQUIRED"].includes(cancel.status)) {
+          replyObservedDuringCommit = true;
+          await tx.automationDelivery.updateMany({
+            where: { id: cancel.id, status: cancel.status, leaseRevision: cancel.leaseRevision },
+            data: {
+              result: {
+                ...object(cancel.result),
+                replyObservedDuringCommit: true,
+                replied: true,
+                repliedAt: at.toISOString(),
+                replyMessageId: clean(messageId, 160),
+                source,
+              },
+            },
+          });
+        } else {
+          await tx.automationDelivery.updateMany({
+            where: { id: cancel.id, status: { in: PRECOMMIT_MUTABLE_STATUSES }, leaseRevision: cancel.leaseRevision },
+            data: {
+              status: "SKIPPED", failureCode: "replied", lastError: null, finishedAt: at,
+              claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
+              result: { ...object(cancel.result), code: "replied", replied: true, repliedAt: at.toISOString(), replyMessageId: clean(messageId, 160), source },
+            },
+          });
+        }
+      }
+      if (send) {
+        await tx.automationDelivery.update({
+          where: { id: send.id },
+          data: { result: { ...object(send.result), replied: true, repliedAt: at.toISOString(), replyMessageId: clean(messageId, 160), replySource: source } },
+        });
+      }
+      const templateId = clean(object(send?.payload).template?.id || send?.contentCollectionId, 160) || "";
+      await bumpStat({ agencyId, creatorId, templateId, field: "replied", at, db: tx });
+      return { ok: true, matched: true, pendingMessageId, cancelDeliveryId: cancel?.id || null, sendDeliveryId: send?.id || null, replyObservedDuringCommit };
+    },
+  });
 }
 
 async function finalizeBumpFailure({ delivery, failureCode, retryable = false, db = prisma }) {
@@ -806,7 +828,7 @@ async function getBumpOverview({ agencyId, creatorId, db = prisma }) {
     db.automationBumpFanState.count({ where: { agencyId, creatorId } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: { in: ["QUEUED", "RETRY_SCHEDULED"] } } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: "CLAIMED" } }),
-    db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: { in: ["RUNNING", "COMMITTING"] } } }),
+    db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: { in: ["RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] } } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, actionType: SEND_ACTION, status: "COMPLETED", finishedAt: { gte: dayStart(now) } } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: "FAILED", updatedAt: { gte: dayStart(now) } } }),
     db.bumpDeliveryStat.aggregate({ where: { agencyId, creatorId }, _sum: { replied: true } }),

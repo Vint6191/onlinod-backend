@@ -2,6 +2,8 @@
 
 const prisma = require("../prisma");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
+const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
   FOLLOW_BACK_MODULE_KEY,
   getAutomationControlSnapshot,
@@ -14,7 +16,7 @@ const { evaluateCandidate } = require("./follow-back-rules");
 const { readFanCurrent } = require("./fan-data-authority-service");
 
 const FOLLOW_BACK_ACTION_TYPE = "FOLLOW_BACK";
-const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RETRY_SCHEDULED"];
+const ACTIVE_DELIVERY_STATUSES = [...ACTIVE_WRITE_WORKFLOW_STATUSES];
 
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
@@ -372,43 +374,57 @@ async function retryCandidateDelivery({ agencyId, creatorId, fanId }) {
 }
 
 async function setCandidateState({ agencyId, creatorId, fanId, action }) {
-  const candidate = await prisma.followBackCandidate.findFirst({ where: { agencyId, creatorId, fanId } });
-  if (!candidate) throw Object.assign(new Error("Follow Back candidate not found"), { code: "candidate_not_found", status: 404 });
   const normalized = clean(action, 40);
-  const data = normalized === "ignore"
-    ? { ignored: true, blocked: false, state: "IGNORED", eligibilityReason: "ignored" }
-    : normalized === "block"
-      ? { blocked: true, ignored: false, state: "BLOCKED", eligibilityReason: "blocked" }
-      : normalized === "restore"
-        ? {
-            blocked: false,
-            ignored: false,
-            state: candidate.creatorFollowsFan ? "FOLLOWED" : "CANDIDATE",
-            eligibilityReason: candidate.creatorFollowsFan ? "already_followed" : (candidate.fanSubscriptionActive === false ? "expired_subscriber" : "active_subscriber"),
-          }
-        : null;
-  if (!data) throw Object.assign(new Error("Invalid candidate action"), { code: "invalid_candidate_action", status: 400 });
-  const updated = await prisma.followBackCandidate.update({ where: { id: candidate.id }, data });
-  if (normalized === "ignore" || normalized === "block") {
-    await prisma.automationDelivery.updateMany({
-      where: {
-        agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, targetId: fanId,
-        status: { in: ACTIVE_DELIVERY_STATUSES },
-      },
+  if (!["ignore", "block", "restore"].includes(normalized)) {
+    throw Object.assign(new Error("Invalid candidate action"), { code: "invalid_candidate_action", status: 400 });
+  }
+
+  if (normalized === "restore") {
+    const candidate = await prisma.followBackCandidate.findFirst({ where: { agencyId, creatorId, fanId } });
+    if (!candidate) throw Object.assign(new Error("Follow Back candidate not found"), { code: "candidate_not_found", status: 404 });
+    const updated = await prisma.followBackCandidate.update({
+      where: { id: candidate.id },
       data: {
-        status: "CANCELED",
-        failureCode: normalized === "block" ? "blocked" : "ignored",
-        lastError: `Candidate ${normalized}d`,
-        finishedAt: new Date(),
-        claimedByDeviceId: null,
-        claimedAt: null,
-        claimUntil: null,
-        leaseTokenHash: null,
-        leaseRevision: { increment: 1 },
+        blocked: false,
+        ignored: false,
+        state: candidate.creatorFollowsFan ? "FOLLOWED" : "CANDIDATE",
+        eligibilityReason: candidate.creatorFollowsFan ? "already_followed" : (candidate.fanSubscriptionActive === false ? "expired_subscriber" : "active_subscriber"),
       },
     });
+    return { ok: true, candidate: updated };
   }
-  return { ok: true, candidate: updated };
+
+  return runWithAutomationWriteCommitFence({
+    db: prisma,
+    agencyId,
+    options: { timeout: 30_000 },
+    work: async (tx) => {
+      const candidate = await tx.followBackCandidate.findFirst({ where: { agencyId, creatorId, fanId } });
+      if (!candidate) throw Object.assign(new Error("Follow Back candidate not found"), { code: "candidate_not_found", status: 404 });
+      const data = normalized === "ignore"
+        ? { ignored: true, blocked: false, state: "IGNORED", eligibilityReason: "ignored" }
+        : { blocked: true, ignored: false, state: "BLOCKED", eligibilityReason: "blocked" };
+      const updated = await tx.followBackCandidate.update({ where: { id: candidate.id }, data });
+      await tx.automationDelivery.updateMany({
+        where: {
+          agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, targetId: fanId,
+          status: { in: PRECOMMIT_MUTABLE_STATUSES },
+        },
+        data: {
+          status: "CANCELED",
+          failureCode: normalized === "block" ? "blocked" : "ignored",
+          lastError: `Candidate ${normalized}d`,
+          finishedAt: new Date(),
+          claimedByDeviceId: null,
+          claimedAt: null,
+          claimUntil: null,
+          leaseTokenHash: null,
+          leaseRevision: { increment: 1 },
+        },
+      });
+      return { ok: true, candidate: updated };
+    },
+  });
 }
 
 
@@ -526,7 +542,7 @@ async function listFollowBack({ agencyId, creatorId, search = "", state = null, 
       candidates: allCandidates,
       eligible: totalEligible,
       queued: statusCounts.QUEUED || 0,
-      claimed: (statusCounts.CLAIMED || 0) + (statusCounts.RUNNING || 0) + (statusCounts.COMMITTING || 0),
+      claimed: (statusCounts.CLAIMED || 0) + (statusCounts.RUNNING || 0) + (statusCounts.COMMITTING || 0) + (statusCounts.RECONCILE_REQUIRED || 0),
       followed: statusCounts.COMPLETED || 0,
       alreadyFollowed,
       skipped: statusCounts.SKIPPED || 0,
@@ -563,7 +579,7 @@ async function getAutomationOverview({ agencyId, creatorId }) {
     queue: {
       queued: statusCounts.QUEUED || 0,
       claimed: statusCounts.CLAIMED || 0,
-      running: (statusCounts.RUNNING || 0) + (statusCounts.COMMITTING || 0),
+      running: (statusCounts.RUNNING || 0) + (statusCounts.COMMITTING || 0) + (statusCounts.RECONCILE_REQUIRED || 0),
       failed: statusCounts.FAILED || 0,
     },
     subscriberDirectory: directory,

@@ -461,7 +461,7 @@ async function listFollowAutomation({ agencyId, creatorId, search = "", state = 
       db.followAutomationCandidate.count({ where: { agencyId, creatorId, state: "CANDIDATE" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: UNFOLLOW_FAN_ACTION_TYPE, status: { in: ["QUEUED", "RETRY_SCHEDULED"] } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE, status: { in: ["QUEUED", "RETRY_SCHEDULED"] } } }),
-      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, status: { in: ["CLAIMED", "RUNNING", "COMMITTING"] } } }),
+      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, status: { in: ["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] } } }),
       db.followAutomationCandidate.count({ where: { agencyId, creatorId, state: "WAITING_RETURN" } }),
       db.followAutomationCandidate.count({ where: { agencyId, creatorId, state: "RETURNED" } }),
       db.followAutomationCandidate.count({ where: { agencyId, creatorId, state: "RECOVERY_REQUIRED" } }),

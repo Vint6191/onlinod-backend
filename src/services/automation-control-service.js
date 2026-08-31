@@ -1,7 +1,8 @@
 "use strict";
 
 const prisma = require("../prisma");
-const { lockAutomationWriteCommitFence, runDbTransaction } = require("./automation-write-commit-fence-service");
+const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { runDbTransaction } = require("./db-transaction-service");
 
 const FOLLOW_BACK_MODULE_KEY = "follow_back";
 const BUMPS_MODULE_KEY = "bumps";

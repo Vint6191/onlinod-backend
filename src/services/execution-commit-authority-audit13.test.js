@@ -7,7 +7,8 @@ const {
   classifyAutomationFailure,
   categoryAllowsBlindRetry,
 } = require("./automation-failure-taxonomy");
-const { lockAutomationWriteCommitFence, runDbTransaction } = require("./automation-write-commit-fence-service");
+const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { runDbTransaction } = require("./db-transaction-service");
 
 test("Audit13 unknown failure is never a blind-safe retry", () => {
   const category = classifyAutomationFailure({ failureCode: "unknown", deliveryStatus: "RUNNING" });
@@ -44,15 +45,25 @@ test("Audit13 nested lifecycle work reuses an existing transaction client", asyn
   assert.equal(result, "tx");
 });
 
-test("Audit13 COMMITTING is immutable to pause/cancel/release while outcome settlement remains explicit", () => {
+test("Audit13 committed/reconciliation authority is immutable to pause/cancel/release while outcome settlement remains explicit", () => {
   const fs = require("node:fs");
   const path = require("node:path");
   const actionSource = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
   const controlSource = fs.readFileSync(path.join(__dirname, "automation-control-service.js"), "utf8");
-  assert.match(actionSource, /if \(delivery\.status === "COMMITTING"\)[\s\S]{0,180}DELIVERY_COMMIT_IN_FLIGHT[\s\S]{0,180}cancellation/);
-  assert.match(actionSource, /releaseClaimByAdmin[\s\S]{0,260}delivery\.status === "COMMITTING"[\s\S]{0,180}DELIVERY_COMMIT_IN_FLIGHT/);
+  assert.match(actionSource, /if \(\["COMMITTING", "RECONCILE_REQUIRED"\]\.includes\(delivery\.status\)\)[\s\S]{0,220}DELIVERY_COMMIT_IN_FLIGHT[\s\S]{0,220}cancellation/);
+  assert.match(actionSource, /releaseClaimByAdmin[\s\S]{0,360}\["COMMITTING", "RECONCILE_REQUIRED"\]\.includes\(delivery\.status\)[\s\S]{0,220}DELIVERY_COMMIT_IN_FLIGHT/);
   assert.match(controlSource, /ACTIVE_DELIVERY_STATUSES = \["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"\]/);
-  assert.doesNotMatch(controlSource, /ACTIVE_DELIVERY_STATUSES = \[[^\]]*COMMITTING/);
+  assert.doesNotMatch(controlSource, /ACTIVE_DELIVERY_STATUSES = \[[^\]]*(?:COMMITTING|RECONCILE_REQUIRED)/);
+});
+
+test("Audit13 reconciliation is claimable but never precommit-mutable", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const source = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
+  assert.match(source, /NORMAL_CLAIMABLE_STATUSES = \["QUEUED", "RETRY_SCHEDULED"\]/);
+  assert.match(source, /CLAIMABLE_STATUSES = \[\.\.\.NORMAL_CLAIMABLE_STATUSES, "RECONCILE_REQUIRED"\]/);
+  assert.match(source, /PRECOMMIT_EXECUTABLE_STATUSES = \[\.\.\.NORMAL_CLAIMABLE_STATUSES, "CLAIMED", "RUNNING"\]/);
+  assert.doesNotMatch(source, /PRECOMMIT_EXECUTABLE_STATUSES = [^\n]*RECONCILE_REQUIRED/);
 });
 
 test("Audit13 retry and cancel commit candidate projection on the same transaction client", () => {

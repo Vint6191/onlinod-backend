@@ -3543,7 +3543,7 @@ model AutomationDelivery {
   fanId               String
   dialogId            String?
   trigger             String?
-  status              String   @default("scheduled") // P10: QUEUED | CLAIMED | RUNNING | RETRY_SCHEDULED | COMPLETED | FAILED | SKIPPED | CANCELED | PAUSED. Legacy bump rows keep old values until P11 migration.
+  status              String   @default("scheduled") // P10/A13: QUEUED | CLAIMED | RUNNING | COMMITTING | RECONCILE_REQUIRED | RETRY_SCHEDULED | COMPLETED | FAILED | SKIPPED | CANCELED | PAUSED. Legacy bump rows keep old values until P11 migration.
   scheduledAt         DateTime?
   notBefore           DateTime @default(now())
   sentAt              DateTime?

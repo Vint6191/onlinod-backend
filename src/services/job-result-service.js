@@ -8,6 +8,7 @@ const { recordNotificationPageProgress } = require("./notification-sync-state-se
 const { recordNotificationScanItems } = require("./notification-scan-control-service");
 const { JOB_KEY: FINANCIAL_TRANSACTIONS_JOB_KEY, ingestFinancialTransactionsChunk, ingestFinancialChartChunk, completeFinancialTransactionsScan } = require("./financial-transactions-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
+const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { FAN_DATA_POINT_REFRESH_JOB_KEY, applyFanDataPointRefreshChunk } = require("./fan-data-authority-service");
 const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, ingestCampaignFanValueChunk, ingestCampaignFanValuesBatchChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
 const {
@@ -155,22 +156,66 @@ async function applyCampaignsResult({ db = prisma, job, deviceId, userId, result
   };
 }
 
+function trafficScanAuthority(job, result = {}) {
+  const payload = asObject(result);
+  return dateOrNull(payload.scanStartedAt)
+    || dateOrNull(job?.startedAt)
+    || dateOrNull(job?.claimedAt)
+    || dateOrNull(job?.scheduledAt)
+    || dateOrNull(job?.createdAt)
+    || new Date(0);
+}
+function trafficJobIsNewer(candidate, candidateResult, currentJob, currentResult) {
+  const candidateAt = trafficScanAuthority(candidate, candidateResult).getTime();
+  const currentAt = trafficScanAuthority(currentJob, currentResult).getTime();
+  if (candidateAt !== currentAt) return candidateAt > currentAt;
+  const candidateCreated = dateOrNull(candidate?.createdAt)?.getTime() || 0;
+  const currentCreated = dateOrNull(currentJob?.createdAt)?.getTime() || 0;
+  if (candidateCreated !== currentCreated) return candidateCreated > currentCreated;
+  return String(candidate?.id || "").localeCompare(String(currentJob?.id || "")) > 0;
+}
+
 async function applyTrafficResult({ db = prisma, job, deviceId, userId, result }) {
-  if (!job.creatorId) throw new Error("Traffic job is missing creatorId");
+  if (!job.creatorId || !job.agencyId) throw new Error("Traffic job is missing creator scope");
   const payload = asObject(result);
   const params = asObject(job.params);
-  const applied = await upsertTrafficSourceScan({
-    deviceId,
-    userId,
-    creatorId: job.creatorId,
-    accountId: payload.accountId || params.localAccountId || params.accountId || null,
-    sources: Array.isArray(payload.sources) ? payload.sources : [],
-    members: Array.isArray(payload.members) ? payload.members : [],
-    hydrateLimit: integer(payload.hydrateLimit ?? params.hydrateLimit, 0),
-    forceHydrate: payload.forceHydrate === true || params.forceHydrate === true,
+  return withDbAdvisoryXactLock({
     db,
+    key: `a13:traffic-projection:${job.agencyId}:${job.creatorId}`,
+    work: async (tx) => {
+      const completed = await tx.jobInstance.findMany({
+        where: {
+          agencyId: job.agencyId,
+          creatorId: job.creatorId,
+          jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
+          status: "DONE",
+          id: { not: job.id },
+        },
+        orderBy: [{ completedAt: "desc" }, { createdAt: "desc" }],
+        take: 50,
+        select: { id: true, result: true, startedAt: true, claimedAt: true, scheduledAt: true, createdAt: true },
+      });
+      const newer = completed.find((candidate) => trafficJobIsNewer(candidate, asObject(candidate.result), job, payload));
+      if (newer) {
+        return {
+          type: "traffic", ok: true, applied: false, stale: true, sideEffect: "STALE_NOOP",
+          scanStartedAt: trafficScanAuthority(job, payload).toISOString(), newerJobId: newer.id,
+        };
+      }
+      const applied = await upsertTrafficSourceScan({
+        deviceId,
+        userId,
+        creatorId: job.creatorId,
+        accountId: payload.accountId || params.localAccountId || params.accountId || null,
+        sources: Array.isArray(payload.sources) ? payload.sources : [],
+        members: Array.isArray(payload.members) ? payload.members : [],
+        hydrateLimit: integer(payload.hydrateLimit ?? params.hydrateLimit, 0),
+        forceHydrate: payload.forceHydrate === true || params.forceHydrate === true,
+        db: tx,
+      });
+      return { type: "traffic", applied: true, scanStartedAt: trafficScanAuthority(job, payload).toISOString(), ...asObject(applied) };
+    },
   });
-  return { type: "traffic", ...asObject(applied) };
 }
 
 async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {

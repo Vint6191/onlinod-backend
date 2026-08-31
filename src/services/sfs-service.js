@@ -4,6 +4,9 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
+const { runDbTransaction, withDbAdvisoryXactLock } = require("./db-transaction-service");
+const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
   getAutomationControlSnapshot,
   assertAutomationEnabled,
@@ -30,7 +33,7 @@ const {
   isSfsCleanupDelivery,
 } = require("./sfs-constants");
 
-const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RETRY_SCHEDULED", "PAUSED"];
+const ACTIVE_DELIVERY_STATUSES = [...ACTIVE_WRITE_WORKFLOW_STATUSES];
 const RETRYABLE_FAILURES = new Set(["network_error", "timeout", "rate_limited", "temporary_of_error", "backend_unavailable", "lease_lost", "creator_unavailable", "comment_result_unknown"]);
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
@@ -47,10 +50,7 @@ async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   });
 }
 async function withCreatorLock(db, agencyId, creatorId, fn) {
-  return db.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`p14:sfs:${agencyId}:${creatorId}`}))`;
-    return fn(tx);
-  }, { timeout: 30_000 });
+  return withDbAdvisoryXactLock({ db, key: `p14:sfs:${agencyId}:${creatorId}`, work: fn, options: { timeout: 30_000 } });
 }
 
 async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force = false, source = "manual", priority = 75, db = prisma }) {
@@ -123,11 +123,19 @@ async function applySfsDiscoveryCompletion({ job, result, db = prisma }) {
 async function recordSfsJobFailure({ job, error, terminal = true, db = prisma }) {
   if (!job?.creatorId || !job?.agencyId) return null;
   if (job.jobKey === SFS_TARGET_SCAN_JOB_KEY) {
-    const candidateId = clean(object(job.params).candidateId, 160);
-    if (candidateId) await db.sfsTargetCandidate.updateMany({
-      where: { id: candidateId, agencyId: job.agencyId, creatorId: job.creatorId },
-      data: { state: terminal ? "RECOVERY_REQUIRED" : "SCAN_RETRY", phase: "SCAN", latestError: clean(error, 1000), scanJobId: job.id },
-    });
+    const params = object(job.params);
+    const candidateId = clean(params.candidateId, 160);
+    const candidateGeneration = int(params.candidateGeneration, -1);
+    if (candidateId && candidateGeneration >= 0) {
+      const updated = await db.sfsTargetCandidate.updateMany({
+        where: {
+          id: candidateId, agencyId: job.agencyId, creatorId: job.creatorId,
+          generation: candidateGeneration, scanJobId: job.id,
+        },
+        data: { state: terminal ? "RECOVERY_REQUIRED" : "SCAN_RETRY", phase: "SCAN", latestError: clean(error, 1000) },
+      });
+      if (!updated.count) return { recorded: false, stale: true, sideEffect: "STALE_NOOP" };
+    }
   }
   return { recorded: true };
 }
@@ -227,7 +235,7 @@ async function scheduleTargetScan({ delivery, candidate, settings, now, db }) {
   const nextRunAt = new Date(now.getTime() + delay);
   const idempotencyKey = `sfs_target_scan:${delivery.creatorId}:${candidate.id}:${delivery.generation}`;
   const params = {
-    candidateId: candidate.id, targetUserId: candidate.targetUserId, username: candidate.username,
+    candidateId: candidate.id, candidateGeneration: delivery.generation, targetUserId: candidate.targetUserId, username: candidate.username,
     maxPinnedPosts: settings.maxPinnedPosts, commentsPageLimit: settings.commentsPageLimit,
     commentsMaxPages: settings.commentsMaxPages, commentLikesPerPost: settings.commentLikesPerPost,
     commentLikesEnabled: settings.commentLikesEnabled, commentsEnabled: settings.commentsEnabled,
@@ -268,16 +276,36 @@ async function createSafetyUnfollow({ delivery, candidate, settings, now, db }) 
 
 async function applySfsTargetScanCompletion({ job, result, db = prisma }) {
   if (!job?.creatorId || !job?.agencyId) throw new Error("SFS target scan job is missing creator scope");
-  const params = object(job.params); const payload = object(result);
-  const candidate = await db.sfsTargetCandidate.findFirst({ where: { id: clean(params.candidateId, 160), agencyId: job.agencyId, creatorId: job.creatorId } });
-  if (!candidate) return { type: "sfs_target_scan", applied: false, reason: "candidate_not_found" };
-  const control = await getAutomationControlSnapshot({ agencyId: job.agencyId, creatorId: job.creatorId, db });
-  const settings = normalizeSfsSettings(control.modules.sfs.settings);
-  const templates = await loadTemplates({ agencyId: job.agencyId, creatorId: job.creatorId, db });
-  const posts = Array.isArray(payload.posts) ? payload.posts : [];
-  const now = new Date();
-  return db.$transaction(async (tx) => {
-    let commentCount = 0; let likeCount = 0; let lastTemplateId = clean(object(candidate.metadata).lastTemplateId, 160);
+  const params = object(job.params);
+  const payload = object(result);
+  const candidateId = clean(params.candidateId, 160);
+  const candidateGeneration = int(params.candidateGeneration, -1);
+  if (!candidateId || candidateGeneration < 0) {
+    return { type: "sfs_target_scan", applied: false, stale: true, reason: "scan_authority_missing", sideEffect: "STALE_NOOP" };
+  }
+
+  return runDbTransaction(db, async (tx) => {
+    if (typeof tx.$queryRawUnsafe === "function") {
+      await tx.$queryRawUnsafe('SELECT "id" FROM "SfsTargetCandidate" WHERE "id" = $1 FOR UPDATE', candidateId);
+    }
+    const candidate = await tx.sfsTargetCandidate.findFirst({
+      where: {
+        id: candidateId, agencyId: job.agencyId, creatorId: job.creatorId,
+        generation: candidateGeneration, scanJobId: job.id,
+      },
+    });
+    if (!candidate) {
+      return { type: "sfs_target_scan", applied: false, stale: true, reason: "scan_authority_lost", sideEffect: "STALE_NOOP" };
+    }
+
+    const control = await getAutomationControlSnapshot({ agencyId: job.agencyId, creatorId: job.creatorId, db: tx });
+    const settings = normalizeSfsSettings(control.modules.sfs.settings);
+    const templates = await loadTemplates({ agencyId: job.agencyId, creatorId: job.creatorId, db: tx });
+    const posts = Array.isArray(payload.posts) ? payload.posts : [];
+    const now = new Date();
+    let commentCount = 0;
+    let likeCount = 0;
+    let lastTemplateId = clean(object(candidate.metadata).lastTemplateId, 160);
     const today = dayStart(now);
     const existingLikesToday = await tx.automationDelivery.count({
       where: {
@@ -303,9 +331,12 @@ async function applySfsTargetScanCompletion({ job, result, db = prisma }) {
       templateUses.set(templateId, count);
       return count;
     }
+
     let cursor = now;
     for (const rawPost of posts.slice(0, settings.maxPinnedPosts)) {
-      const post = object(rawPost); const postId = clean(post.postId, 160); if (!postId) continue;
+      const post = object(rawPost);
+      const postId = clean(post.postId, 160);
+      if (!postId) continue;
       if (settings.commentsEnabled && post.ownComment !== true && templates.length) {
         const availableTemplates = [];
         for (const candidateTemplate of templates) {
@@ -313,43 +344,51 @@ async function applySfsTargetScanCompletion({ job, result, db = prisma }) {
         }
         const template = pickTemplate(availableTemplates, lastTemplateId);
         if (template) {
-          const idempotencyKey = sfsCommentKey(job.creatorId, candidate.targetUserId, postId, candidate.generation);
+          const idempotencyKey = sfsCommentKey(job.creatorId, candidate.targetUserId, postId, candidateGeneration);
           const delay = randomBetween(settings.minimumIntervalMs, settings.maximumIntervalMs);
           cursor = new Date(cursor.getTime() + delay);
           try {
             await tx.automationDelivery.create({ data: {
               agencyId: job.agencyId, creatorId: job.creatorId, moduleKey: SFS_MODULE_KEY,
               actionType: SFS_COMMENT_POST_ACTION_TYPE, targetId: postId, fanId: candidate.targetUserId,
-              idempotencyKey, generation: candidate.generation, priority: 75,
+              idempotencyKey, generation: candidateGeneration, priority: 75,
               payload: { candidateId: candidate.id, targetUserId: candidate.targetUserId, postId, templateId: template.id, text: template.text },
               status: "QUEUED", scheduledAt: now, notBefore: cursor, maxAttempts: settings.maxAttempts,
             } });
-            commentCount += 1; lastTemplateId = template.id;
+            commentCount += 1;
+            lastTemplateId = template.id;
             templateUses.set(template.id, (templateUses.get(template.id) || 0) + 1);
-          } catch (error) { if (error?.code !== "P2002") throw error; }
+          } catch (error) {
+            if (error?.code !== "P2002") throw error;
+          }
         }
       }
       if (settings.commentLikesEnabled && remainingLikeCapacity > 0) {
         const perPostLimit = Math.min(settings.commentLikesPerPost, Number.isFinite(remainingLikeCapacity) ? remainingLikeCapacity : settings.commentLikesPerPost);
         for (const rawComment of (Array.isArray(post.eligibleComments) ? post.eligibleComments : []).slice(0, perPostLimit)) {
-          const comment = object(rawComment); const commentId = clean(comment.commentId, 160); if (!commentId) continue;
-          const idempotencyKey = sfsCommentLikeKey(job.creatorId, candidate.targetUserId, commentId, candidate.generation);
+          const comment = object(rawComment);
+          const commentId = clean(comment.commentId, 160);
+          if (!commentId) continue;
+          const idempotencyKey = sfsCommentLikeKey(job.creatorId, candidate.targetUserId, commentId, candidateGeneration);
           const delay = randomBetween(settings.minimumIntervalMs, settings.maximumIntervalMs);
           cursor = new Date(cursor.getTime() + delay);
           try {
             await tx.automationDelivery.create({ data: {
               agencyId: job.agencyId, creatorId: job.creatorId, moduleKey: SFS_MODULE_KEY,
               actionType: SFS_LIKE_COMMENT_ACTION_TYPE, targetId: commentId, fanId: candidate.targetUserId,
-              idempotencyKey, generation: candidate.generation, priority: 65,
+              idempotencyKey, generation: candidateGeneration, priority: 65,
               payload: { candidateId: candidate.id, targetUserId: candidate.targetUserId, postId, commentId, authorId: clean(comment.authorId, 160) },
               status: "QUEUED", scheduledAt: now, notBefore: cursor, maxAttempts: settings.maxAttempts,
             } });
             likeCount += 1;
             if (Number.isFinite(remainingLikeCapacity)) remainingLikeCapacity -= 1;
-          } catch (error) { if (error?.code !== "P2002") throw error; }
+          } catch (error) {
+            if (error?.code !== "P2002") throw error;
+          }
         }
       }
     }
+
     const positive = commentCount > 0 || likeCount > 0 || posts.some((post) => object(post).ownComment === true);
     const cleanupDelay = positive
       ? randomBetween(settings.unfollowMinMinutes * 60_000, settings.unfollowMaxMinutes * 60_000)
@@ -357,13 +396,14 @@ async function applySfsTargetScanCompletion({ job, result, db = prisma }) {
     const unfollowAt = new Date(Math.max(cursor.getTime(), now.getTime()) + cleanupDelay);
     if (candidate.safetyUnfollowDeliveryId) await tx.automationDelivery.updateMany({
       where: { id: candidate.safetyUnfollowDeliveryId, status: { in: ["QUEUED", "RETRY_SCHEDULED", "PAUSED"] } },
-      data: { notBefore: unfollowAt, status: "QUEUED", failureCode: null, lastError: null,
-        payload: { candidateId: candidate.id, safetyCleanup: true, originalFollowing: object(candidate.metadata).originalFollowing === true, plannedAfterScan: true } },
+      data: {
+        notBefore: unfollowAt, status: "QUEUED", failureCode: null, lastError: null,
+        payload: { candidateId: candidate.id, safetyCleanup: true, originalFollowing: object(candidate.metadata).originalFollowing === true, plannedAfterScan: true },
+      },
     });
     await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
       state: positive ? "ACTING" : "UNFOLLOW_DUE", phase: positive ? "ACTIONS" : "UNFOLLOW",
-      commentsPlanned: commentCount, likesPlanned: likeCount, unfollowAt,
-      latestError: null, scanJobId: job.id,
+      commentsPlanned: commentCount, likesPlanned: likeCount, unfollowAt, latestError: null,
       metadata: { ...object(candidate.metadata), lastTemplateId, pinnedCount: posts.length, scanCompletedAt: now.toISOString(), positive },
     } });
     return { type: "sfs_target_scan", applied: true, commentsPlanned: commentCount, likesPlanned: likeCount, unfollowAt };
@@ -472,7 +512,7 @@ async function listSfs({ agencyId, creatorId, search = "", state = null, offset 
       db.sfsTargetCandidate.count({ where: { agencyId, creatorId, usedForever: true } }),
       db.sfsTargetCandidate.count({ where: { agencyId, creatorId, state: "RECOVERY_REQUIRED" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, status: "QUEUED" } }),
-      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, status: { in: ["CLAIMED", "RUNNING", "COMMITTING"] } } }),
+      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, status: { in: ["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_COMMENT_POST_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: today } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_LIKE_COMMENT_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: today } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: today } } }),
@@ -490,25 +530,37 @@ async function listSfs({ agencyId, creatorId, search = "", state = null, offset 
 }
 
 async function setSfsCandidateState({ agencyId, creatorId, candidateId, action, db = prisma }) {
-  const candidate = await db.sfsTargetCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });
-  if (!candidate) throw Object.assign(new Error("SFS candidate not found"), { code: "candidate_not_found", status: 404 });
   if (action === "run") return planSfsTargets({ agencyId, creatorId, candidateId, source: "candidate_run", priority: 100, limit: 1, db });
   if (action === "retry") {
+    const candidate = await db.sfsTargetCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });
+    if (!candidate) throw Object.assign(new Error("SFS candidate not found"), { code: "candidate_not_found", status: 404 });
     const delivery = await db.automationDelivery.findFirst({ where: { id: candidate.latestDeliveryId || "__none__", agencyId } });
     if (!delivery) return planSfsTargets({ agencyId, creatorId, candidateId, source: "candidate_retry", priority: 100, limit: 1, db });
     return { ok: true, deliveryId: delivery.id, requiresQueueRetry: true };
   }
-  const data = action === "ignore" ? { ignored: true, blocked: false, state: "IGNORED" }
-    : action === "block" ? { blocked: true, ignored: false, state: "BLOCKED" }
-      : action === "restore" ? { blocked: false, ignored: false, state: candidate.usedForever ? "COMPLETED" : "CANDIDATE", latestError: null }
-        : null;
-  if (!data) throw Object.assign(new Error("Unsupported SFS candidate action"), { code: "invalid_action", status: 400 });
-  const updated = await db.sfsTargetCandidate.update({ where: { id: candidate.id }, data });
-  if (["ignore", "block"].includes(action)) await db.automationDelivery.updateMany({
-    where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, fanId: candidate.targetUserId || "__none__", status: { in: ["QUEUED", "RETRY_SCHEDULED", "PAUSED"] }, actionType: { not: SFS_UNFOLLOW_TARGET_ACTION_TYPE } },
-    data: { status: "CANCELED", failureCode: action === "block" ? "blocked" : "ignored", lastError: `SFS candidate ${action}d`, finishedAt: new Date(), leaseRevision: { increment: 1 } },
-  });
-  return { ok: true, item: updated };
+
+  return runWithAutomationWriteCommitFence({ db, agencyId, options: { timeout: 30_000 }, work: async (tx) => {
+    const candidate = await tx.sfsTargetCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });
+    if (!candidate) throw Object.assign(new Error("SFS candidate not found"), { code: "candidate_not_found", status: 404 });
+    const data = action === "ignore" ? { ignored: true, blocked: false, state: "IGNORED" }
+      : action === "block" ? { blocked: true, ignored: false, state: "BLOCKED" }
+        : action === "restore" ? { blocked: false, ignored: false, state: candidate.usedForever ? "COMPLETED" : "CANDIDATE", latestError: null }
+          : null;
+    if (!data) throw Object.assign(new Error("Unsupported SFS candidate action"), { code: "invalid_action", status: 400 });
+    const updated = await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data });
+    if (["ignore", "block"].includes(action)) await tx.automationDelivery.updateMany({
+      where: {
+        agencyId, creatorId, moduleKey: SFS_MODULE_KEY, fanId: candidate.targetUserId || "__none__",
+        status: { in: PRECOMMIT_MUTABLE_STATUSES }, actionType: { not: SFS_UNFOLLOW_TARGET_ACTION_TYPE },
+      },
+      data: {
+        status: "CANCELED", failureCode: action === "block" ? "blocked" : "ignored",
+        lastError: `SFS candidate ${action}d`, finishedAt: new Date(),
+        claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
+      },
+    });
+    return { ok: true, item: updated };
+  } });
 }
 
 async function adoptLegacySfsUnfollow({ agencyId, creatorId, targetUserId, targetUsername = null, runAfter = null, sourceJobId = null, db = prisma }) {
@@ -517,7 +569,7 @@ async function adoptLegacySfsUnfollow({ agencyId, creatorId, targetUserId, targe
   await requireCreator(agencyId, creatorId, db);
   const username = String(clean(targetUsername, 80) || `legacy_${targetId}`).replace(/^@+/, "").toLowerCase();
   const dueAt = dateOrNull(runAfter) || new Date();
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     const candidate = await tx.sfsTargetCandidate.upsert({
       where: { creatorId_username: { creatorId, username } },
       create: {

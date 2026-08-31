@@ -30,7 +30,7 @@ const IDEMPOTENT_RETRY_CODES = new Set([
 ]);
 const OUTCOME_UNKNOWN_CODES = new Set([
   "send_result_unknown", "write_outcome_unknown", "write_result_unknown", "network_error",
-  "timeout", "temporary_of_error", "lease_lost", "send_reconcile_pending",
+  "timeout", "temporary_of_error", "lease_lost", "send_reconcile_pending", "reconciliation_lease_lost",
 ]);
 
 function normalizeFailureCategory(value) {

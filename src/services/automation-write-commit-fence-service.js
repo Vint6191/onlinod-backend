@@ -1,5 +1,7 @@
 "use strict";
 
+const { runDbTransaction } = require("./db-transaction-service");
+
 const LOCK_NAMESPACE = "onlinod:automation-write-commit:v1";
 
 async function lockAutomationWriteCommitFence({ db, agencyId }) {
@@ -17,10 +19,11 @@ async function lockAutomationWriteCommitFence({ db, agencyId }) {
   return { agencyId: key };
 }
 
-async function runDbTransaction(db, work, options = undefined) {
-  const client = db || require("../prisma");
-  if (typeof client.$transaction !== "function") return work(client);
-  return options === undefined ? client.$transaction(work) : client.$transaction(work, options);
+async function runWithAutomationWriteCommitFence({ db, agencyId, work, options = undefined }) {
+  return runDbTransaction(db, async (tx) => {
+    await lockAutomationWriteCommitFence({ db: tx, agencyId });
+    return work(tx);
+  }, options);
 }
 
-module.exports = { lockAutomationWriteCommitFence, runDbTransaction };
+module.exports = { lockAutomationWriteCommitFence, runWithAutomationWriteCommitFence };

@@ -4,6 +4,9 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob } = require("./job-planning-repository");
+const { withDbAdvisoryXactLock } = require("./db-transaction-service");
+const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
   getAutomationControlSnapshot,
   assertAutomationEnabled,
@@ -21,7 +24,7 @@ const {
   LIKE_POST_ACTION_TYPE,
 } = require("./likes-constants");
 
-const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RETRY_SCHEDULED"];
+const ACTIVE_DELIVERY_STATUSES = [...ACTIVE_WRITE_WORKFLOW_STATUSES];
 const RETRYABLE_FAILURES = new Set([
   "network_error", "timeout", "rate_limited", "temporary_of_error", "backend_unavailable", "lease_lost", "creator_unavailable",
 ]);
@@ -76,10 +79,31 @@ async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   });
 }
 async function withCreatorLock(db, agencyId, creatorId, fn) {
-  return db.$transaction(async (tx) => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`p12:likes:${agencyId}:${creatorId}`}))`;
-    return fn(tx);
-  });
+  return withDbAdvisoryXactLock({ db, key: `p12:likes:${agencyId}:${creatorId}`, work: fn });
+}
+
+function jobAuthorityAt(job) {
+  return dateOrNull(job?.startedAt || job?.claimedAt || job?.scheduledAt || job?.createdAt) || new Date(0);
+}
+function likesAuthorityMetadata(job) {
+  return { latestJobId: job.id, latestJobAuthorityAt: jobAuthorityAt(job).toISOString() };
+}
+async function likesStateSupersedesJob({ db, state, job }) {
+  const metadata = object(state?.metadata);
+  const latestJobId = clean(metadata.latestJobId, 160);
+  if (!latestJobId || latestJobId === job.id) return false;
+  let latestAt = dateOrNull(metadata.latestJobAuthorityAt);
+  if (!latestAt) {
+    const latestJob = await db.jobInstance.findUnique({
+      where: { id: latestJobId },
+      select: { id: true, startedAt: true, claimedAt: true, scheduledAt: true, createdAt: true },
+    });
+    latestAt = latestJob ? jobAuthorityAt(latestJob) : null;
+  }
+  if (!latestAt) return true;
+  const currentAt = jobAuthorityAt(job);
+  if (latestAt.getTime() !== currentAt.getTime()) return latestAt.getTime() > currentAt.getTime();
+  return latestJobId.localeCompare(String(job.id)) > 0;
 }
 
 async function currentSnapshot({ agencyId, creatorId, db = prisma }) {
@@ -173,117 +197,148 @@ async function scheduleLikesDiscovery({ agencyId, creatorId, userId = null, fanI
 
 async function applyLikesDiscoveryChunk({ db = prisma, job, chunkResult }) {
   if (!job?.creatorId || !job?.agencyId) throw new Error("Likes discovery job is missing creator scope");
-  const payload = object(chunkResult);
-  const fan = object(payload.fan);
-  const now = dateOrNull(payload.observedAt) || new Date();
-  const snapshotRunId = clean(payload.snapshotRunId || object(job.params).snapshotRunId, 160);
-  const posts = (Array.isArray(payload.posts) ? payload.posts : []).map((post) => normalizeDiscoveredLikePost(post, fan, now)).filter(Boolean);
-  let applied = 0;
-  for (const post of posts) {
-    const existing = await db.automationContentCandidate.findUnique({
-      where: { creatorId_contentType_contentId: { creatorId: job.creatorId, contentType: "post", contentId: post.contentId } },
-    });
-    const preserveLiked = existing?.state === "LIKED" || existing?.isFavorite === true;
-    await db.automationContentCandidate.upsert({
-      where: { creatorId_contentType_contentId: { creatorId: job.creatorId, contentType: "post", contentId: post.contentId } },
-      create: {
-        agencyId: job.agencyId, creatorId: job.creatorId, ownerFanId: post.ownerFanId, contentId: post.contentId,
-        contentType: "post", username: post.username, displayName: post.displayName, avatarUrl: post.avatarUrl,
-        source: "subscriber_directory", publishedAt: post.publishedAt, discoveredAt: now, lastSeenAt: now,
-        canToggleFavorite: post.canToggleFavorite, canViewMedia: post.canViewMedia, isFavorite: post.isFavorite,
-        state: post.state, eligibilityReason: post.reason, skipReason: post.state === "SKIPPED" ? post.reason : null,
-        snapshotRunId, metadata: post.metadata,
-      },
-      update: {
-        ownerFanId: post.ownerFanId, username: post.username, displayName: post.displayName, avatarUrl: post.avatarUrl,
-        publishedAt: post.publishedAt, lastSeenAt: now, canToggleFavorite: post.canToggleFavorite,
-        canViewMedia: post.canViewMedia, isFavorite: preserveLiked ? true : post.isFavorite,
-        state: preserveLiked ? existing.state : post.state,
-        eligibilityReason: preserveLiked ? existing.eligibilityReason : post.reason,
-        skipReason: preserveLiked ? existing.skipReason : (post.state === "SKIPPED" ? post.reason : null),
-        snapshotRunId, metadata: { ...object(existing?.metadata), ...post.metadata },
-      },
-    });
-    applied += 1;
-  }
-  const fanId = clean(fan.fanId, 160);
-  const sourceErrors = Array.isArray(payload.sourceErrors) ? payload.sourceErrors.map((item) => object(item)).slice(0, 10) : [];
-  const failed = posts.length === 0 && sourceErrors.length >= 3;
-  if (fanId) {
-    await db.automationContentDiscoveryState.upsert({
+  return withCreatorLock(db, job.agencyId, job.creatorId, async (tx) => {
+    const payload = object(chunkResult);
+    const fan = object(payload.fan);
+    const fanId = clean(fan.fanId, 160);
+    const now = dateOrNull(payload.observedAt) || new Date();
+    const snapshotRunId = clean(payload.snapshotRunId || object(job.params).snapshotRunId, 160);
+    const snapshot = await currentSnapshot({ agencyId: job.agencyId, creatorId: job.creatorId, db: tx });
+    if (snapshotRunId && snapshot?.currentRunId !== snapshotRunId) {
+      return { type: "likes_content", applied: 0, stale: true, sideEffect: "STALE_NOOP", snapshotRunId, currentSnapshotRunId: snapshot?.currentRunId || null };
+    }
+    const discoveryState = fanId ? await tx.automationContentDiscoveryState.findUnique({
       where: { creatorId_ownerFanId_sourceKey: { creatorId: job.creatorId, ownerFanId: fanId, sourceKey: "fan_posts" } },
-      create: {
-        agencyId: job.agencyId, creatorId: job.creatorId, ownerFanId: fanId, sourceKey: "fan_posts",
-        snapshotRunId, status: failed ? "FAILED" : "READY", contentCount: posts.length, sourceErrors,
-        lastScannedAt: now, lastSuccessAt: failed ? null : now,
-        metadata: { latestJobId: job.id, latestChunkKind: clean(payload.kind, 80) },
-      },
-      update: {
-        snapshotRunId, status: failed ? "FAILED" : "READY", contentCount: posts.length, sourceErrors,
-        lastScannedAt: now, ...(failed ? {} : { lastSuccessAt: now }),
-        metadata: { latestJobId: job.id, latestChunkKind: clean(payload.kind, 80) },
-      },
-    });
-  }
-  return { type: "likes_content", fanId, posts: posts.length, applied, sourceErrors: sourceErrors.length, status: failed ? "FAILED" : "READY" };
+    }) : null;
+    if (discoveryState && await likesStateSupersedesJob({ db: tx, state: discoveryState, job })) {
+      return { type: "likes_content", fanId, applied: 0, stale: true, sideEffect: "STALE_NOOP", snapshotRunId };
+    }
+
+    const posts = (Array.isArray(payload.posts) ? payload.posts : []).map((post) => normalizeDiscoveredLikePost(post, fan, now)).filter(Boolean);
+    let applied = 0;
+    for (const post of posts) {
+      const existing = await tx.automationContentCandidate.findUnique({
+        where: { creatorId_contentType_contentId: { creatorId: job.creatorId, contentType: "post", contentId: post.contentId } },
+      });
+      const preserveLiked = existing?.state === "LIKED" || existing?.isFavorite === true;
+      await tx.automationContentCandidate.upsert({
+        where: { creatorId_contentType_contentId: { creatorId: job.creatorId, contentType: "post", contentId: post.contentId } },
+        create: {
+          agencyId: job.agencyId, creatorId: job.creatorId, ownerFanId: fanId, contentType: "post", contentId: post.contentId,
+          username: clean(fan.username, 160), displayName: clean(fan.displayName || fan.name, 200), contentUrl: post.contentUrl,
+          postedAt: post.postedAt, canViewMedia: post.canViewMedia, isFavorite: post.isFavorite, state: post.state,
+          eligibilityReason: post.reason, skipReason: post.state === "SKIPPED" ? post.reason : null,
+          snapshotRunId, metadata: { ...post.metadata, ...likesAuthorityMetadata(job) },
+        },
+        update: {
+          ownerFanId: fanId, username: clean(fan.username, 160), displayName: clean(fan.displayName || fan.name, 200), contentUrl: post.contentUrl,
+          postedAt: post.postedAt, canViewMedia: post.canViewMedia, isFavorite: preserveLiked ? true : post.isFavorite,
+          state: preserveLiked ? existing.state : post.state,
+          eligibilityReason: preserveLiked ? existing.eligibilityReason : post.reason,
+          skipReason: preserveLiked ? existing.skipReason : (post.state === "SKIPPED" ? post.reason : null),
+          snapshotRunId, metadata: { ...object(existing?.metadata), ...post.metadata, ...likesAuthorityMetadata(job) },
+        },
+      });
+      applied += 1;
+    }
+    const sourceErrors = Array.isArray(payload.sourceErrors) ? payload.sourceErrors.map((item) => object(item)).slice(0, 10) : [];
+    const failed = posts.length === 0 && sourceErrors.length >= 3;
+    if (fanId) {
+      const authorityMetadata = likesAuthorityMetadata(job);
+      await tx.automationContentDiscoveryState.upsert({
+        where: { creatorId_ownerFanId_sourceKey: { creatorId: job.creatorId, ownerFanId: fanId, sourceKey: "fan_posts" } },
+        create: {
+          agencyId: job.agencyId, creatorId: job.creatorId, ownerFanId: fanId, sourceKey: "fan_posts",
+          snapshotRunId, status: failed ? "FAILED" : "READY", contentCount: posts.length, sourceErrors,
+          lastScannedAt: now, lastSuccessAt: failed ? null : now,
+          metadata: { ...authorityMetadata, latestChunkKind: clean(payload.kind, 80) },
+        },
+        update: {
+          snapshotRunId, status: failed ? "FAILED" : "READY", contentCount: posts.length, sourceErrors,
+          lastScannedAt: now, ...(failed ? {} : { lastSuccessAt: now }),
+          metadata: { ...object(discoveryState?.metadata), ...authorityMetadata, latestChunkKind: clean(payload.kind, 80) },
+        },
+      });
+    }
+    return { type: "likes_content", fanId, posts: posts.length, applied, sourceErrors: sourceErrors.length, status: failed ? "FAILED" : "READY" };
+  });
 }
 
 async function applyLikesDiscoveryCompletion({ job, result, db = prisma }) {
   if (!job?.creatorId || !job?.agencyId) throw new Error("Likes discovery job is missing creator scope");
-  const snapshotRunId = clean(object(job.params).snapshotRunId || object(result).snapshotRunId, 160);
-  if (snapshotRunId) {
-    await Promise.all([
-      db.automationContentCandidate.updateMany({
-        where: {
-          agencyId: job.agencyId,
-          creatorId: job.creatorId,
-          snapshotRunId: { not: snapshotRunId },
-          state: { notIn: ["LIKED", "ALREADY_LIKED", "IGNORED", "BLOCKED"] },
-        },
-        data: { state: "STALE", eligibilityReason: "stale_candidate", latestStatus: "STALE" },
-      }),
-      db.automationContentDiscoveryState.updateMany({
-        where: { agencyId: job.agencyId, creatorId: job.creatorId, snapshotRunId: { not: snapshotRunId }, status: { not: "STALE" } },
-        data: { status: "STALE" },
-      }),
-    ]);
-  }
-  let planning = null;
-  try {
-    const control = await getAutomationControlSnapshot({ agencyId: job.agencyId, creatorId: job.creatorId, db });
-    if (control.effective.likesEnabled && control.modules.likes.settings.automatic) {
-      planning = await planLikes({ agencyId: job.agencyId, creatorId: job.creatorId, source: "discovery_complete", manual: false, db });
+  return withCreatorLock(db, job.agencyId, job.creatorId, async (tx) => {
+    const snapshotRunId = clean(object(job.params).snapshotRunId || object(result).snapshotRunId, 160);
+    const snapshot = await currentSnapshot({ agencyId: job.agencyId, creatorId: job.creatorId, db: tx });
+    if (snapshotRunId && snapshot?.currentRunId !== snapshotRunId) {
+      return { type: "likes_discovery", applied: false, stale: true, sideEffect: "STALE_NOOP", snapshotRunId, currentSnapshotRunId: snapshot?.currentRunId || null };
     }
-  } catch (error) {
-    planning = { ok: false, reason: error?.code || "planning_failed", error: error?.message || String(error) };
-  }
-  return { type: "likes_discovery", result: object(result), planning };
+    if (snapshotRunId) {
+      await Promise.all([
+        tx.automationContentCandidate.updateMany({
+          where: {
+            agencyId: job.agencyId,
+            creatorId: job.creatorId,
+            snapshotRunId: { not: snapshotRunId },
+            state: { notIn: ["LIKED", "ALREADY_LIKED", "IGNORED", "BLOCKED"] },
+          },
+          data: { state: "STALE", eligibilityReason: "stale_candidate", latestStatus: "STALE" },
+        }),
+        tx.automationContentDiscoveryState.updateMany({
+          where: { agencyId: job.agencyId, creatorId: job.creatorId, snapshotRunId: { not: snapshotRunId }, status: { not: "STALE" } },
+          data: { status: "STALE" },
+        }),
+      ]);
+    }
+    let planning = null;
+    try {
+      const control = await getAutomationControlSnapshot({ agencyId: job.agencyId, creatorId: job.creatorId, db: tx });
+      if (control.effective.likesEnabled && control.modules.likes.settings.automatic) {
+        planning = await planLikes({ agencyId: job.agencyId, creatorId: job.creatorId, source: "discovery_complete", manual: false, db: tx });
+      }
+    } catch (error) {
+      planning = { ok: false, reason: error?.code || "planning_failed", error: error?.message || String(error) };
+    }
+    return { type: "likes_discovery", applied: true, result: object(result), planning };
+  });
 }
 
 async function recordLikesDiscoveryFailure({ job, error, db = prisma }) {
   if (!job?.creatorId || !job?.agencyId) return null;
-  const now = new Date();
-  const message = clean(error?.message || error, 2000) || "likes_discovery_failed";
-  const failureCode = clean(error?.code, 120) || "likes_discovery_failed";
-  const snapshotRunId = clean(object(job.params).snapshotRunId, 160);
-  const fans = Array.isArray(object(job.params).fans) ? object(job.params).fans : [];
-  for (const fan of fans.slice(0, 500)) {
-    const ownerFanId = clean(object(fan).fanId, 160);
-    if (!ownerFanId) continue;
-    await db.automationContentDiscoveryState.upsert({
-      where: { creatorId_ownerFanId_sourceKey: { creatorId: job.creatorId, ownerFanId, sourceKey: "fan_posts" } },
-      create: {
-        agencyId: job.agencyId, creatorId: job.creatorId, ownerFanId, sourceKey: "fan_posts", snapshotRunId,
-        status: "FAILED", contentCount: 0, sourceErrors: [{ source: "job", code: failureCode }],
-        lastScannedAt: now, metadata: { latestJobId: job.id, failureCode },
-      },
-      update: {
-        snapshotRunId, status: "FAILED", sourceErrors: [{ source: "job", code: failureCode }],
-        lastScannedAt: now, metadata: { latestJobId: job.id, failureCode },
-      },
-    });
-  }
-  return { type: "likes_discovery", creatorId: job.creatorId, error: message, failureCode };
+  return withCreatorLock(db, job.agencyId, job.creatorId, async (tx) => {
+    const now = new Date();
+    const message = clean(error?.message || error, 2000) || "likes_discovery_failed";
+    const failureCode = clean(error?.code, 120) || "likes_discovery_failed";
+    const snapshotRunId = clean(object(job.params).snapshotRunId, 160);
+    const snapshot = await currentSnapshot({ agencyId: job.agencyId, creatorId: job.creatorId, db: tx });
+    if (snapshotRunId && snapshot?.currentRunId !== snapshotRunId) {
+      return { type: "likes_discovery", creatorId: job.creatorId, recorded: false, stale: true, sideEffect: "STALE_NOOP", failureCode };
+    }
+    const fans = Array.isArray(object(job.params).fans) ? object(job.params).fans : [];
+    let recorded = 0;
+    for (const fan of fans.slice(0, 500)) {
+      const ownerFanId = clean(object(fan).fanId, 160);
+      if (!ownerFanId) continue;
+      const existing = await tx.automationContentDiscoveryState.findUnique({
+        where: { creatorId_ownerFanId_sourceKey: { creatorId: job.creatorId, ownerFanId, sourceKey: "fan_posts" } },
+      });
+      if (existing && await likesStateSupersedesJob({ db: tx, state: existing, job })) continue;
+      const metadata = { ...object(existing?.metadata), ...likesAuthorityMetadata(job), failureCode };
+      await tx.automationContentDiscoveryState.upsert({
+        where: { creatorId_ownerFanId_sourceKey: { creatorId: job.creatorId, ownerFanId, sourceKey: "fan_posts" } },
+        create: {
+          agencyId: job.agencyId, creatorId: job.creatorId, ownerFanId, sourceKey: "fan_posts", snapshotRunId,
+          status: "FAILED", contentCount: 0, sourceErrors: [{ source: "job", code: failureCode }],
+          lastScannedAt: now, metadata,
+        },
+        update: {
+          snapshotRunId, status: "FAILED", sourceErrors: [{ source: "job", code: failureCode }],
+          lastScannedAt: now, metadata,
+        },
+      });
+      recorded += 1;
+    }
+    return { type: "likes_discovery", creatorId: job.creatorId, error: message, failureCode, recorded };
+  });
 }
 
 async function currentBlockedFans({ agencyId, creatorId, fanIds, db }) {
@@ -502,7 +557,7 @@ async function listLikes({ agencyId, creatorId, search = "", state = null, offse
       db.automationContentCandidate.count({ where: { agencyId, creatorId, contentType: "post", state: "ELIGIBLE" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "QUEUED" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "CLAIMED" } }),
-      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: { in: ["RUNNING", "COMMITTING"] } } }),
+      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: { in: ["RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "COMPLETED", finishedAt: { gte: dayStart(now) } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "COMPLETED", finishedAt: { gte: monthStart(now) } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "FAILED" } }),
@@ -524,19 +579,29 @@ async function listLikes({ agencyId, creatorId, search = "", state = null, offse
 }
 
 async function setLikeCandidateState({ agencyId, creatorId, candidateId, action, db = prisma }) {
-  const candidate = await db.automationContentCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });
-  if (!candidate) throw Object.assign(new Error("Like candidate not found"), { code: "candidate_not_found", status: 404 });
   if (action === "restore") {
+    const candidate = await db.automationContentCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });
+    if (!candidate) throw Object.assign(new Error("Like candidate not found"), { code: "candidate_not_found", status: 404 });
     return db.automationContentCandidate.update({ where: { id: candidate.id }, data: { state: candidate.isFavorite ? "ALREADY_LIKED" : "ELIGIBLE", skipReason: null, latestError: null } });
   }
   if (!["ignore", "block"].includes(action)) throw Object.assign(new Error("Unsupported candidate action"), { code: "invalid_candidate_action", status: 400 });
-  const state = action === "ignore" ? "IGNORED" : "BLOCKED";
-  await db.automationDelivery.updateMany({
-    where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, targetId: candidate.contentId, status: { in: ACTIVE_DELIVERY_STATUSES } },
-    data: { status: "CANCELED", failureCode: action === "ignore" ? "ignored" : "blocked", lastError: action, finishedAt: new Date(), claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 } },
+  return runWithAutomationWriteCommitFence({
+    db,
+    agencyId,
+    options: { timeout: 30_000 },
+    work: async (tx) => {
+      const candidate = await tx.automationContentCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });
+      if (!candidate) throw Object.assign(new Error("Like candidate not found"), { code: "candidate_not_found", status: 404 });
+      const state = action === "ignore" ? "IGNORED" : "BLOCKED";
+      await tx.automationDelivery.updateMany({
+        where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, targetId: candidate.contentId, status: { in: PRECOMMIT_MUTABLE_STATUSES } },
+        data: { status: "CANCELED", failureCode: action === "ignore" ? "ignored" : "blocked", lastError: action, finishedAt: new Date(), claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 } },
+      });
+      return tx.automationContentCandidate.update({ where: { id: candidate.id }, data: { state, skipReason: action, latestError: action } });
+    },
   });
-  return db.automationContentCandidate.update({ where: { id: candidate.id }, data: { state, skipReason: action, latestError: action } });
 }
+
 
 module.exports = {
   LIKES_DISCOVERY_JOB_KEY,
