@@ -3,6 +3,7 @@
 const prisma = require("../prisma");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
   FOLLOW_BACK_MODULE_KEY,
@@ -326,15 +327,12 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
 
 async function planFollowBack(input) {
   const db = input.db || prisma;
-  const execute = async (tx) => {
-    await tx.$queryRawUnsafe(
-      `SELECT pg_advisory_xact_lock(hashtext($1))`,
-      `follow_back_plan:${input.agencyId}:${input.creatorId}`,
-    );
-    return planFollowBackLocked({ ...input, db: tx });
-  };
-  if (db === prisma) return prisma.$transaction(execute, { timeout: 30_000 });
-  return execute(db);
+  return withDbAdvisoryXactLock({
+    db,
+    key: `follow_back_plan:${input.agencyId}:${input.creatorId}`,
+    options: { timeout: 30_000 },
+    work: (tx) => planFollowBackLocked({ ...input, db: tx }),
+  });
 }
 
 async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurring_sweep" }) {

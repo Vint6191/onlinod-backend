@@ -1,5 +1,6 @@
 "use strict";
 
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 
@@ -504,11 +505,7 @@ async function recomputeUsage(db, agencyId, creatorId, mediaIds) {
 }
 
 async function lockMediaLibraryUsageTx(db, agencyId, creatorId) {
-  if (typeof db.$queryRawUnsafe !== "function") return;
-  await db.$queryRawUnsafe(
-    "SELECT pg_advisory_xact_lock(hashtext($1))::text AS \"acquired\"",
-    `media_library_usage:${agencyId}:${creatorId}`,
-  );
+  await lockDbAdvisoryXact({ db, key: `media_library_usage:${agencyId}:${creatorId}` });
 }
 
 async function replaceUsageSourceTx(tx, { agencyId, creatorId, source }) {

@@ -60,9 +60,10 @@ function createDb() {
     _jobs: jobs,
     _commits: commits,
     _locks: locks,
-    $queryRawUnsafe: async (...args) => {
+    $queryRawUnsafe: async () => { throw new Error("void deserialization: advisory lock must not use queryRaw"); },
+    $executeRawUnsafe: async (...args) => {
       locks.push(args);
-      return [{ pg_advisory_xact_lock: null }];
+      return 1;
     },
     creatorAccount: {
       findMany: async ({ where }) => where.id.in.map((id) => ({ id })),
@@ -310,7 +311,8 @@ test("one claim reserves one compact batch and creates no JobInstance", async ()
   assert.equal([...db._states.values()].filter((row) => row.status === "RUNNING").length, 3);
   assert.equal([...db._states.values()].filter((row) => row.status === "PLANNED").length, 2);
   assert.equal(db._locks.length, 1);
-  assert.match(db._locks[0][0], /pg_advisory_xact_lock[\s\S]*::text/);
+  assert.match(db._locks[0][0], /pg_advisory_xact_lock/);
+  assert.doesNotMatch(db._locks[0][0], /::text/);
   assert.equal(db._locks[0][1], "dialog_history_batch_claim:agency-1");
 });
 

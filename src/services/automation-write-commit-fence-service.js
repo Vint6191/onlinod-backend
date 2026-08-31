@@ -8,10 +8,10 @@ async function lockAutomationWriteCommitFence({ db, agencyId }) {
   const client = db || require("../prisma");
   const key = String(agencyId || "").trim();
   if (!key) throw Object.assign(new Error("agencyId is required for automation write commit fence"), { code: "AUTOMATION_COMMIT_FENCE_AGENCY_REQUIRED" });
-  if (typeof client.$queryRawUnsafe !== "function") {
-    throw Object.assign(new Error("Automation write commit fence requires a transaction-capable database client"), { code: "AUTOMATION_COMMIT_FENCE_DB_REQUIRED" });
+  if (typeof client.$executeRawUnsafe !== "function") {
+    throw Object.assign(new Error("Automation write commit fence requires Prisma $executeRawUnsafe support"), { code: "AUTOMATION_COMMIT_FENCE_DB_REQUIRED" });
   }
-  await client.$queryRawUnsafe(
+  await client.$executeRawUnsafe(
     "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
     LOCK_NAMESPACE,
     key,

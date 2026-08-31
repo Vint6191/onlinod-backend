@@ -95,7 +95,8 @@ function loadPlanningServices(rootDb) {
 
 test("Closure2 TransactionClient without $transaction supports SFS completion and Likes/SFS/Bumps planning", async () => {
   const tx = {
-    $queryRawUnsafe: async () => [],
+    $queryRawUnsafe: async (sql) => { if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization"); return []; },
+    $executeRawUnsafe: async () => 1,
     subscriberDirectoryState: { findFirst: async () => null },
     sfsTargetCandidate: { findFirst: async () => null, findMany: async () => [] },
     automationDelivery: { count: async () => 0, findFirst: async () => null },
@@ -331,7 +332,8 @@ function loadGenerationServices(db) {
 test("Closure2 Likes S1 completion/failure cannot overwrite current S2", async () => {
   let writes = 0;
   const tx = {
-    $queryRawUnsafe: async () => [],
+    $queryRawUnsafe: async (sql) => { if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization"); return []; },
+    $executeRawUnsafe: async () => 1,
     subscriberDirectoryState: { findFirst: async () => ({ currentRunId: "S2" }) },
     automationContentCandidate: { updateMany: async () => { writes += 1; return { count: 1 }; } },
     automationContentDiscoveryState: { updateMany: async () => { writes += 1; return { count: 1 }; }, upsert: async () => { writes += 1; }, findUnique: async () => null },
@@ -348,7 +350,8 @@ test("Closure2 Likes S1 completion/failure cannot overwrite current S2", async (
 test("Closure2 delayed SFS generation 1 scan is a no-op after candidate advances to generation 2", async () => {
   let deliveryCreates = 0;
   const tx = {
-    $queryRawUnsafe: async () => [],
+    $queryRawUnsafe: async (sql) => { if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization"); return []; },
+    $executeRawUnsafe: async () => 1,
     sfsTargetCandidate: {
       findFirst: async () => null,
       updateMany: async () => ({ count: 0 }),
@@ -388,7 +391,8 @@ function loadJobResultForTraffic(db, upsertTrafficSourceScan) {
 test("Closure2 delayed Traffic T1 cannot replace a newer T2 projection", async () => {
   let writes = 0;
   const tx = {
-    $queryRawUnsafe: async () => [],
+    $queryRawUnsafe: async (sql) => { if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization"); return []; },
+    $executeRawUnsafe: async () => 1,
     jobInstance: { findMany: async () => [{ id: "T2", result: { scanStartedAt: "2026-08-31T10:02:00.000Z" }, createdAt: new Date("2026-08-31T10:01:00.000Z") }] },
   };
   const service = loadJobResultForTraffic({}, async () => { writes += 1; return { ok: true }; });

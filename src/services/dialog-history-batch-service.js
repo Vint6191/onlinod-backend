@@ -2,6 +2,7 @@
 
 const { createHash, randomBytes } = require("node:crypto");
 const prisma = require("../prisma");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const {
   repairStrandedDialogHistoryStatesTx,
   dialogHistoryControl,
@@ -140,11 +141,7 @@ async function lockDialogHistoryBatchClaimsTx(db, agencyId) {
   // agency. The unique index remains the final safety fence, while this lock
   // prevents normal concurrent polling from surfacing an expected P2002 in
   // Prisma logs. Test doubles without raw-query support remain usable.
-  if (typeof db.$queryRawUnsafe !== "function") return;
-  await db.$queryRawUnsafe(
-    "SELECT pg_advisory_xact_lock(hashtext($1))::text AS \"acquired\"",
-    `dialog_history_batch_claim:${agencyId}`,
-  );
+  await lockDbAdvisoryXact({ db, key: `dialog_history_batch_claim:${agencyId}` });
 }
 
 async function recoverExpiredDialogHistoryBatchesTx(db, input = {}) {

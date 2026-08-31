@@ -32,7 +32,7 @@ test("Audit13 proven no-effect pre-wire failure may be retried", () => {
 
 test("Audit13 commit/control fence is transaction-scoped and agency-keyed", async () => {
   const calls = [];
-  const tx = { async $queryRawUnsafe(sql, ...args) { calls.push({ sql, args }); return [{ ok: true }]; } };
+  const tx = { async $queryRawUnsafe() { throw new Error("void deserialization"); }, async $executeRawUnsafe(sql, ...args) { calls.push({ sql, args }); return 1; } };
   await lockAutomationWriteCommitFence({ db: tx, agencyId: "agency-1" });
   assert.equal(calls.length, 1);
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);

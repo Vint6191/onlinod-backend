@@ -88,7 +88,8 @@ function candidateDb() {
   let row = null;
   return {
     get row() { return row; },
-    $queryRawUnsafe: async () => [],
+    $queryRawUnsafe: async () => { throw new Error("void deserialization"); },
+    $executeRawUnsafe: async () => 1,
     sfsTargetCandidate: {
       async findUnique({ where }) {
         const key = where.creatorId_username;

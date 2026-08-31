@@ -8,6 +8,7 @@ const {
   requireCreator,
 } = require("./automation-control-service");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
+const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const {
   FOLLOW_AUTOMATION_MODULE_KEY,
   UNFOLLOW_FAN_ACTION_TYPE,
@@ -261,12 +262,12 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
 
 async function planFollowAutomation(input) {
   const db = input.db || prisma;
-  const execute = async (tx) => {
-    await tx.$queryRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1))`, `follow_automation_plan:${input.agencyId}:${input.creatorId}`);
-    return planFollowAutomationLocked({ ...input, db: tx });
-  };
-  if (db === prisma) return prisma.$transaction(execute, { timeout: 30_000 });
-  return execute(db);
+  return withDbAdvisoryXactLock({
+    db,
+    key: `follow_automation_plan:${input.agencyId}:${input.creatorId}`,
+    options: { timeout: 30_000 },
+    work: (tx) => planFollowAutomationLocked({ ...input, db: tx }),
+  });
 }
 
 async function ensureAutomaticFollowAutomation({ agencyId, creatorId, source = "recurring_sweep" }) {

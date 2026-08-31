@@ -386,21 +386,21 @@ function usageDb({ rawSql = false } = {}) {
       return callback(db);
     },
   };
-  if (rawSql) {
-    db.$queryRawUnsafe = async (...args) => {
-      usageLocks.push(args);
-      return [{ pg_advisory_xact_lock: null }];
-    };
-    db.$executeRawUnsafe = async (query, agencyId, creatorId, payload) => {
-      const projections = JSON.parse(payload);
-      bulkUsageUpdates.push({ query, agencyId, creatorId, projections });
-      for (const projection of projections) {
-        const asset = assets.get(projection.mediaId);
-        if (asset && asset.agencyId === agencyId && asset.creatorId === creatorId) Object.assign(asset, projection);
-      }
-      return projections.length;
-    };
-  }
+  db.$queryRawUnsafe = async () => { throw new Error("void deserialization: advisory lock must not use queryRaw"); };
+  db.$executeRawUnsafe = async (query, ...args) => {
+    if (/pg_advisory_xact_lock/.test(String(query))) {
+      usageLocks.push([query, ...args]);
+      return 1;
+    }
+    const [agencyId, creatorId, payload] = args;
+    const projections = JSON.parse(payload);
+    bulkUsageUpdates.push({ query, agencyId, creatorId, projections });
+    for (const projection of projections) {
+      const asset = assets.get(projection.mediaId);
+      if (asset && asset.agencyId === agencyId && asset.creatorId === creatorId) Object.assign(asset, projection);
+    }
+    return projections.length;
+  };
   return { db, assets, contributions, transactionCalls, usageLocks, bulkUsageUpdates };
 }
 
@@ -482,7 +482,7 @@ test("usage batches commit one bounded source transaction and bulk projection at
   assert.equal(transactionCalls.length, 2);
   assert.equal(transactionCalls.every((options) => options.maxWait === 10_000 && options.timeout === 30_000), true);
   assert.equal(usageLocks.length, 2);
-  assert.equal(usageLocks.every((call) => /pg_advisory_xact_lock[\s\S]*::text/.test(call[0])), true);
+  assert.equal(usageLocks.every((call) => /pg_advisory_xact_lock/.test(call[0]) && !/::text/.test(call[0])), true);
   assert.equal(bulkUsageUpdates.length, 2);
   assert.match(bulkUsageUpdates[0].query, /jsonb_to_recordset/);
   assert.equal(assets.get("m1").sentCount, 5);
