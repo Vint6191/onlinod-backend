@@ -39,6 +39,11 @@ const prismaMock = {
   teamPpvPurchaseLedger: listModel([]),
   teamResponseCase: listModel(responses),
   teamDialogSession: listModel([]),
+  teamProjectionCoverage: {
+    async findUnique() {
+      return { agencyId: "agency-1", responseCoverageFrom: new Date("2026-08-01T00:00:00Z"), dialogCoverageFrom: new Date("2026-08-01T00:00:00Z") };
+    },
+  },
 };
 const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: prismaMock };

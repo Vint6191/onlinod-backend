@@ -8,13 +8,26 @@ const ledgerPath = require.resolve("./team-ppv-ledger-service");
 const projectionPath = require.resolve("./team-response-projection-service");
 const servicePath = require.resolve("./telemetry-ingest-service");
 
-function loadService({ failSideEffects = 0, failCreatorLookup = false } = {}) {
+function loadService({ failSideEffects = 0, failCreatorLookup = false, assignedCreators = undefined } = {}) {
   const created = [];
   const rows = [];
   const sideEffects = [];
   const projections = [];
   const sideEffectState = { failuresRemaining: failSideEffects };
+  const authority = { accessEpoch: 1, assignedCreators, afterCommit: null, transactions: 0 };
   const prisma = {
+    async $transaction(work) {
+      const snapshot = rows.map((row) => ({ ...row }));
+      try {
+        const result = await work(prisma);
+        authority.transactions += 1;
+        if (typeof authority.afterCommit === "function") authority.afterCommit(authority.transactions);
+        return result;
+      } catch (error) {
+        rows.splice(0, rows.length, ...snapshot);
+        throw error;
+      }
+    },
     workerDevice: {
       async findFirst({ where }) { return where.id === "device-1" ? { id: "device-1" } : null; },
     },
@@ -29,8 +42,14 @@ function loadService({ failSideEffects = 0, failCreatorLookup = false } = {}) {
     agencyMember: {
       async findFirst({ where }) {
         if (where.agencyId !== "agency-1") return null;
-        if (where.id === "member-1" && (!where.userId || where.userId === "user-1")) return { id: "member-1", userId: "user-1" };
-        if (where.userId === "user-1") return { id: "member-1", userId: "user-1" };
+        if (where.id === "member-1" && (!where.userId || where.userId === "user-1")) return {
+          id: "member-1", userId: "user-1", agencyId: "agency-1", accessEpoch: authority.accessEpoch,
+          role: "CHATTER", roleKey: "chatter", assignedCreators: authority.assignedCreators, permissions: {},
+        };
+        if (where.userId === "user-1") return {
+          id: "member-1", userId: "user-1", agencyId: "agency-1", accessEpoch: authority.accessEpoch,
+          role: "CHATTER", roleKey: "chatter", assignedCreators: authority.assignedCreators, permissions: {},
+        };
         return null;
       },
     },
@@ -71,7 +90,7 @@ function loadService({ failSideEffects = 0, failCreatorLookup = false } = {}) {
     exports: { async applyTeamResponseProjection(row) { projections.push(row); } },
   };
   const service = require(servicePath);
-  return { service, rows, created, sideEffects, projections, sideEffectState };
+  return { service, rows, created, sideEffects, projections, sideEffectState, authority };
 }
 
 function canonical(overrides = {}) {
@@ -94,13 +113,15 @@ function canonical(overrides = {}) {
   };
 }
 
-async function ingest(service, events) {
+async function ingest(service, events, overrides = {}) {
   return service.ingestTeamEvents({
     agencyId: "agency-1",
     deviceId: "device-1",
     userId: "user-1",
     memberId: "member-1",
+    admittedAccessEpoch: 1,
     events,
+    ...overrides,
   });
 }
 
@@ -229,20 +250,20 @@ test("v13 localId replay is idempotent", async () => {
   assert.equal(sideEffects.length, 2, "ledger side effect is deliberately replay-safe");
 });
 
-test("v13 side-effect failure is retryable after raw event is durably inserted", async () => {
+test("v13 event and ownership projections roll back atomically when a side effect fails", async () => {
   const { service, rows, sideEffects } = loadService({ failSideEffects: 1 });
 
   await assert.rejects(
     () => ingest(service, [canonical({ localId: "retry-side-effect" })]),
     /synthetic ledger failure/
   );
-  assert.equal(rows.length, 1, "raw activity remains durable for retry");
+  assert.equal(rows.length, 0, "failed projection rolls back the raw activity event too");
 
   const retry = await ingest(service, [canonical({ localId: "retry-side-effect" })]);
-  assert.equal(retry.inserted, 0);
-  assert.equal(retry.duplicated, 1);
+  assert.equal(retry.inserted, 1);
+  assert.equal(retry.duplicated, 0);
   assert.equal(rows.length, 1);
-  assert.equal(sideEffects.length, 2, "duplicate replay retries the idempotent ledger side effect");
+  assert.equal(sideEffects.length, 2, "retry replays the projection only after live authority is revalidated");
 });
 
 test("v13 mixed batch returns exact per-row acknowledgement identities", async () => {
@@ -258,4 +279,47 @@ test("v13 mixed batch returns exact per-row acknowledgement identities", async (
   assert.deepEqual(result.acknowledgedLocalIds.sort(), ["ack-good-1", "ack-good-2"]);
   assert.deepEqual(result.rejectedEvents, [{ localId: "ack-bad-1", reason: "human_actor_mismatch" }]);
   assert.equal(rows.length, 2);
+});
+
+
+test("Audit15 rejects legacy telemetry before durable event or ownership side effects", async () => {
+  const { service, rows, sideEffects } = loadService();
+  const result = await ingest(service, [{
+    type: "ppv_purchase_attributed",
+    creatorId: "creator-1",
+    memberId: "member-1",
+    amountCents: 999_00,
+    localId: "legacy-fake-money",
+  }]);
+  assert.equal(result.inserted, 0);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.rejectedByReason.legacy_telemetry_disabled, 1);
+  assert.equal(rows.length, 0);
+  assert.equal(sideEffects.length, 0);
+});
+
+test("Audit15 rejects v13 provenance for an unassigned creator before durable side effects", async () => {
+  const { service, rows, sideEffects } = loadService({ assignedCreators: [] });
+  const result = await ingest(service, [canonical({ localId: "unassigned-creator" })]);
+  assert.equal(result.inserted, 0);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.rejectedByReason.creator_access_forbidden, 1);
+  assert.equal(rows.length, 0);
+  assert.equal(sideEffects.length, 0);
+});
+
+test("Audit15 accessEpoch change between batch events fences remaining stale telemetry", async () => {
+  const { service, rows, authority } = loadService({ assignedCreators: ["creator-1"] });
+  authority.afterCommit = (count) => {
+    if (count === 1) authority.accessEpoch = 2;
+  };
+  await assert.rejects(
+    () => ingest(service, [
+      canonical({ localId: "epoch-first", messageId: "epoch-message-1" }),
+      canonical({ localId: "epoch-second", messageId: "epoch-message-2" }),
+    ]),
+    (error) => error?.code === "TELEMETRY_ACCESS_EPOCH_STALE"
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].localId, "epoch-first");
 });

@@ -290,6 +290,19 @@ router.post("/register", async (req, res) => {
         },
       });
 
+      // Audit15 projection authority starts with the agency. Zero Response/Dialog
+      // rows after this timestamp are an authoritative zero, not a signal to
+      // fall back to legacy telemetry heuristics.
+      const projectionCoverageFrom = new Date();
+      await tx.teamProjectionCoverage.create({
+        data: {
+          agencyId: agency.id,
+          responseCoverageFrom: projectionCoverageFrom,
+          dialogCoverageFrom: projectionCoverageFrom,
+          source: "agency_created_after_audit15",
+        },
+      });
+
       return { user, agency, member, invitationClaimed: false };
     });
 

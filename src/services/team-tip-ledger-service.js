@@ -1,6 +1,5 @@
 "use strict";
 
-const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { classifySentSource } = require("./team-money-reconciliation-service");
@@ -52,112 +51,11 @@ function int(value, fallback = 0) {
   return Number.isFinite(n) ? Math.round(n) : fallback;
 }
 
-function asAmountCents(payload) {
-  const dollars = Number(payload?.amount ?? payload?.priceDollars ?? payload?.amountDollars ?? 0);
-  if (!Number.isFinite(dollars) || dollars <= 0) return 0;
-  return Math.round(dollars * 100);
-}
-
 function safeDate(value, fallback = Date.now()) {
   const n = Number(value);
   if (Number.isFinite(n) && n > 0) return new Date(n);
   const d = new Date(value || fallback);
   return Number.isFinite(d.getTime()) ? d : new Date(fallback);
-}
-
-function buildTipSemanticId({ tipId, messageId, notificationId, toastId, targetUrl } = {}) {
-  return clean(tipId, 120) ||
-    clean(messageId, 120) ||
-    clean(notificationId, 120) ||
-    clean(toastId, 120) ||
-    clean(targetUrl, 500) ||
-    "";
-}
-
-function hashTipSeed({ agencyId, accountId, fanId, receivedAt, amountCents, semanticId, eventType = "tip_received" } = {}) {
-  const seed = [
-    String(agencyId || ""),
-    String(accountId || ""),
-    String(fanId || ""),
-    String(eventType || ""),
-    String(amountCents || 0),
-    semanticId || "",
-    Math.floor(Number(receivedAt) / 1000),
-  ].join("|");
-  return crypto.createHash("sha256").update(seed).digest("hex").slice(0, 40);
-}
-
-function hashTipEvent({
-  agencyId,
-  accountId,
-  fanId,
-  receivedAt,
-  amountCents,
-  eventHash,
-  tipId,
-  messageId,
-  notificationId,
-  toastId,
-  targetUrl,
-} = {}) {
-  const explicit = clean(eventHash, 120);
-  if (explicit) return explicit;
-
-  return hashTipSeed({
-    agencyId,
-    accountId,
-    fanId,
-    receivedAt,
-    amountCents,
-    eventType: "tip_received",
-    semanticId: buildTipSemanticId({ tipId, messageId, notificationId, toastId, targetUrl }),
-  });
-}
-
-function candidateTipHashes({
-  agencyId,
-  accountId,
-  fanId,
-  receivedAt,
-  amountCents,
-  eventHash,
-  tipId,
-  messageId,
-  notificationId,
-  toastId,
-  targetUrl,
-} = {}) {
-  const semanticId = buildTipSemanticId({ tipId, messageId, notificationId, toastId, targetUrl });
-  const hashes = [
-    clean(eventHash, 120),
-    hashTipSeed({ agencyId, accountId, fanId, receivedAt, amountCents, semanticId, eventType: "tip_received" }),
-    // Compatibility with early v16 builds where the TeamTipLedger seed used
-    // the shorter event type. This prevents one real tip becoming two rows
-    // when old/new workers report the same payload around a deploy.
-    hashTipSeed({ agencyId, accountId, fanId, receivedAt, amountCents, semanticId, eventType: "tip" }),
-  ].filter(Boolean);
-  return Array.from(new Set(hashes));
-}
-
-async function resolveCreator({ agencyId, payload }) {
-  const accountId = clean(payload?.accountId, 160);
-  if (accountId) {
-    const byId = await prisma.creatorAccount.findFirst({
-      where: { agencyId, id: accountId, deletedAt: null },
-      select: { id: true, username: true },
-    }).catch(() => null);
-    if (byId) return byId;
-  }
-
-  const username = clean(payload?.creatorRef, 160)?.replace(/^@/, "");
-  if (username) {
-    const byUsername = await prisma.creatorAccount.findFirst({
-      where: { agencyId, username, deletedAt: null },
-      select: { id: true, username: true },
-    }).catch(() => null);
-    if (byUsername) return byUsername;
-  }
-  return null;
 }
 
 async function resolveMember({ agencyId, memberId, userId }) {
@@ -292,174 +190,8 @@ async function findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId
   return { primary, weak };
 }
 
-async function findExactTipMessageCandidate({ agencyId, creatorId, accountId, messageId }) {
-  const safeMessageId = clean(messageId, 160);
-  if (!safeMessageId) return { sent: null, sourceClass: "UNKNOWN", member: null };
-  let sent = null;
-  if (creatorId) {
-    sent = await prisma.teamSentMessageLedger.findFirst({
-      where: { agencyId, creatorId, messageId: safeMessageId },
-      orderBy: { sentAt: "asc" },
-    }).catch(() => null);
-  }
-  if (!sent && accountId) {
-    sent = await prisma.teamSentMessageLedger.findFirst({
-      where: { agencyId, accountId, messageId: safeMessageId, OR: [{ creatorId: null }, ...(creatorId ? [{ creatorId }] : [])] },
-      orderBy: { sentAt: "asc" },
-    }).catch(() => null);
-  }
-  const sourceClass = classifySentSource(sent);
-  const member = sourceClass === "MANUAL" && sent?.memberId
-    ? await resolveMember({ agencyId, memberId: sent.memberId, userId: sent.userId })
-    : null;
-  return { sent, sourceClass, member };
-}
-
-function fallbackWeakCandidateFromPayload({ payload, receivedAt }) {
-  const memberId = clean(payload?.autoAttributedToMemberId, 160);
-  if (!memberId) return null;
-  return {
-    memberId,
-    userId: clean(payload?.autoAttributedToUserId, 160),
-    deviceId: clean(payload?.deviceId, 160),
-    shiftKey: clean(payload?.shiftKey, 220),
-    sentAtMs: null,
-    ageMinutes: null,
-    source: clean(payload?.autoReason, 80) || "electron_auto_legacy_soft_only",
-    note: "Not auto-counted: backend could not verify a 10-minute sent-message ledger match.",
-    receivedAtMs: safeDate(receivedAt).getTime(),
-  };
-}
-
-async function ingestTipEvent({ agencyId, userId, payload }) {
-  const amountCents = asAmountCents(payload);
-  if (amountCents <= 0) return { ok: false, code: "ZERO_AMOUNT" };
-
-  const receivedAt = safeDate(payload?.ts || payload?.occurredAt);
-  const accountId = clean(payload?.accountId, 160);
-  const fanId = clean(payload?.fanId, 160);
-  const dialogId = clean(payload?.dialogId, 160) || fanId;
-  if (!accountId || !fanId) return { ok: false, code: "MISSING_IDENTIFIERS" };
-
-  const tipHashCandidates = candidateTipHashes({
-    agencyId,
-    accountId,
-    fanId,
-    receivedAt: receivedAt.getTime(),
-    amountCents,
-    eventHash: payload?.eventHash,
-    tipId: payload?.tipId || payload?.tip_id,
-    messageId: payload?.messageId,
-    notificationId: payload?.notificationId,
-    toastId: payload?.toastId,
-    targetUrl: payload?.targetUrl,
-  });
-  const eventHash = tipHashCandidates[0];
-
-  const existing = await prisma.teamTipLedger.findFirst({
-    where: { agencyId, eventHash: { in: tipHashCandidates } },
-  }).catch(() => null);
-  if (existing) return { ok: true, deduped: true, attribution: tipRowForClaims(existing) };
-
-  // Cross-version dedupe: if v15/v16.0 stored the same tip under a different
-  // compatible hash, do not write a second revenue row. Sweep/backfill will
-  // migrate that legacy row into TeamTipLedger in batch.
-  const legacyExisting = await prisma.moneyAttribution.findFirst({
-    where: { agencyId, eventType: "tip_received", eventHash: { in: tipHashCandidates } },
-  }).catch(() => null);
-  if (legacyExisting) {
-    return { ok: true, deduped: true, legacy: true, attribution: legacyExisting };
-  }
-
-  const creator = await resolveCreator({ agencyId, payload });
-  const exact = await findExactTipMessageCandidate({
-    agencyId, creatorId: creator?.id || clean(payload?.creatorId, 160), accountId, messageId: payload?.messageId,
-  });
-  const { primary, weak } = await findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId, receivedAt });
-  const fallbackWeak = fallbackWeakCandidateFromPayload({ payload, receivedAt });
-  const exactCandidate = exact.member && exact.sent ? candidateFromSent(exact.sent, receivedAt) : null;
-  const candidates = mergeCandidates(exactCandidate, primary);
-  const weakCandidates = mergeCandidates(weak, primary.length ? [] : fallbackWeak);
-
-  // Exact message provenance may auto-attribute. Recent-message timing is only
-  // evidence for Claims and is never enough to count chatter revenue by itself.
-  let status = "unresolved";
-  let attributedMemberId = null;
-  let attributedUserId = null;
-  let attributedShiftKey = null;
-  let resolvedSource = "tip_unresolved_no_exact_message";
-  let autoReason = "no_exact_message_provenance";
-
-  if (exact.sourceClass === "MANUAL" && exact.member) {
-    status = "attributed";
-    attributedMemberId = exact.member.id;
-    attributedUserId = exact.member.userId || exact.sent?.userId || null;
-    attributedShiftKey = exact.sent?.shiftKey || null;
-    resolvedSource = "tip_exact_message_manual";
-    autoReason = "exact_message_manual";
-  } else if (exact.sourceClass === "NON_HUMAN") {
-    status = "creator_revenue";
-    resolvedSource = "tip_exact_message_non_human";
-    autoReason = "exact_message_non_human";
-  } else if (primary.length > 1) {
-    status = "conflict";
-    resolvedSource = "tip_recent_candidates_conflict";
-    autoReason = "multiple_recent_candidates_evidence_only";
-  } else if (primary.length === 1) {
-    autoReason = "single_recent_candidate_evidence_only";
-  }
-
-  const result = {
-    claimType: "tip_attribution",
-    attributionMode: "exact_message_first",
-    attributionWindowMinutes: 10,
-    softReviewWindowMinutes: 15,
-    candidates,
-    weakCandidates,
-    autoReason,
-  };
-
-  const history = [{
-    ts: Date.now(),
-    action: status === "attributed" ? "exact_auto_attribution" : (status === "conflict" ? "evidence_conflict" : (status === "creator_revenue" ? "exact_non_human_creator_revenue" : "unresolved_evidence")),
-    reason: autoReason,
-    prevOwner: null,
-    nextOwner: attributedMemberId,
-    source: "team_tip_ledger_ingest",
-    byUserId: userId || null,
-  }];
-
-  const created = await prisma.teamTipLedger.create({
-    data: {
-      agencyId,
-      accountId,
-      creatorId: creator?.id || null,
-      creatorRef: clean(payload?.creatorRef, 160) || creator?.username || null,
-      eventHash,
-      tipId: clean(payload?.tipId || payload?.tip_id || payload?.notificationId || payload?.toastId || eventHash, 220),
-      messageId: clean(payload?.messageId, 160),
-      dialogId,
-      fanId,
-      amountCents,
-      currency: clean(payload?.currency, 8) || "USD",
-      receivedAt,
-      status,
-      attributedMemberId,
-      attributedUserId,
-      attributedShiftKey,
-      resolvedAt: ["attributed", "creator_revenue"].includes(status) ? new Date() : null,
-      resolvedSource,
-      attributionBasis: autoReason,
-      candidates,
-      weakCandidates,
-      result,
-      history,
-      source: clean(payload?.source, 80) || "claims_ingest",
-    },
-  });
-
-  return { ok: true, deduped: false, attribution: tipRowForClaims(created) };
-}
+// Audit15: live client tip ingest was retired; canonical CreatorTip reconciliation
+// is the only production TeamTipLedger money writer.
 
 async function canActorClaimTip({ agencyId, row, actor }) {
   if (!row || !actor || !financiallyActive(row)) return false;
@@ -974,11 +706,12 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
         deletedLegacy = deleted.count || 0;
       }
 
+      const unresolvedCreateCount = rowsToCreate.filter((row) => !presentHashes.has(`${row.agencyId}|${row.eventHash}`)).length;
       return {
         createdCount,
         deletedLegacy,
         skippedExisting: existingLegacyIds.length,
-        failedCreateCount: Math.max(0, rowsToCreate.length - createdCount),
+        failedCreateCount: unresolvedCreateCount,
       };
     }, serializableTxOptions());
 
@@ -1049,7 +782,6 @@ module.exports = {
   TIP_LEDGER_RETENTION_DAYS,
   TIP_LEDGER_RETENTION_MS,
   ATTRIBUTED_TIP_STATUSES,
-  ingestTipEvent,
   applyTipOverride,
   listTipClaims,
   getTipClaimByHash,

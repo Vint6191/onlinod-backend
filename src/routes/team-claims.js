@@ -3,12 +3,10 @@
 const express = require("express");
 const { z } = require("zod");
 const {
-  ingestMoneyEvent,
   applyOverride,
   listDisputable,
   sweepLocks,
   purgeExpiredLegacyAttributions,
-  hashEvent,
   LEGACY_CLAIMABLE_EVENT_TYPES,
 } = require("../services/money-attribution-service");
 const {
@@ -211,87 +209,9 @@ router.get("/context", async (req, res) => {
 });
 
 // --------------------------------------------------------------------
-// POST /api/team/claims/ingest
+// Legacy client-side money ingest was retired by Audit15. Claims may only
+// resolve or audit money facts that already exist in canonical Team ledgers.
 // --------------------------------------------------------------------
-// Electron sends one money event with its locally-computed
-// auto-attribution. Backend stores it and returns the canonical row.
-// Idempotent on (agencyId, eventHash) — duplicates are accepted and
-// return the existing row.
-//
-// Multiple chatters' Electrons may report the same event (each sees
-// the WS frame on their own machine). First write wins, others get
-// `deduped: true`.
-
-const ingestSchema = z.object({
-  type: z.string().min(1).max(80),
-  ts: z.union([z.number(), z.string()]),
-  amount: z.number().nonnegative(),
-  currency: z.string().max(8).optional().nullable(),
-  accountId: z.string().min(1).max(160),
-  fanId: z.string().min(1).max(160),
-  dialogId: z.string().max(160).optional().nullable(),
-  creatorRef: z.string().max(160).optional().nullable(),
-
-  // Optional semantic identity from websocket-listener. These prevent
-  // two same-price PPVs in the same second from being deduped together.
-  eventHash: z.string().max(120).optional().nullable(),
-  messageId: z.string().max(160).optional().nullable(),
-  purchaseMessageId: z.string().max(160).optional().nullable(),
-  notificationId: z.string().max(160).optional().nullable(),
-  toastId: z.string().max(160).optional().nullable(),
-  targetUrl: z.string().max(1000).optional().nullable(),
-
-  // Auto-attribution payload computed on the chatter's Electron.
-  autoAttributedToMemberId: z.string().max(160).optional().nullable(),
-  autoAttributedToUserId: z.string().max(160).optional().nullable(),
-  autoReason: z.string().max(80).optional().nullable(),
-});
-
-router.post("/ingest", async (req, res) => {
-  try {
-    const parsed = ingestSchema.parse(req.body || {});
-    const actor = await loadActorMember(req);
-    if (!actor) {
-      return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
-    }
-
-    // Do not trust chatter-submitted auto attribution. Senior users may
-    // import/repair events for another member, but a regular chatter can
-    // only submit himself as the auto-attributed actor. Tip auto-attribution
-    // is still recomputed from TeamSentMessageLedger on the backend; this
-    // clamp only prevents poisoned weak candidates / legacy fallback rows.
-    const canOverrideAttribution = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION });
-    const payload = canOverrideAttribution
-      ? parsed
-      : {
-          ...parsed,
-          autoAttributedToMemberId: actor.id,
-          autoAttributedToUserId: actor.userId || null,
-        };
-
-    const result = await ingestMoneyEvent({
-      agencyId: req.auth.agencyId,
-      userId: req.auth.userId,
-      payload,
-    });
-    return res.json(result);
-  } catch (err) {
-    if (err?.issues) {
-      return res.status(400).json({
-        ok: false,
-        code: "VALIDATION_ERROR",
-        error: err.issues[0]?.message || "Validation error",
-        issues: err.issues,
-      });
-    }
-    console.error("[claims/ingest] failed:", err);
-    return res.status(500).json({
-      ok: false,
-      code: "CLAIMS_INGEST_FAILED",
-      error: err?.message || "Failed",
-    });
-  }
-});
 
 // --------------------------------------------------------------------
 // POST /api/team/claims/override

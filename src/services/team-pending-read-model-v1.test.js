@@ -63,6 +63,11 @@ require.cache[prismaPath] = {
     teamResponseCase: listModel([]),
     teamDialogSession: listModel(sessions),
     teamPendingDialogState: listModel(pending),
+    teamProjectionCoverage: {
+      async findUnique() {
+        return { agencyId: "agency-1", responseCoverageFrom: new Date(now - 24 * 60 * minute), dialogCoverageFrom: new Date(now - 24 * 60 * minute) };
+      },
+    },
   },
 };
 const analytics = require("./team-analytics-service");

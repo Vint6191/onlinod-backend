@@ -367,18 +367,25 @@ async function scheduleJobNow({
 
 async function maybeReconcileHistoricalTeamMoney() {
   try {
+    const { migrateLegacyTipsToTipLedger } = require("./team-tip-ledger-service");
     const { reconcileHistoricalTeamMoneyBatch } = require("./team-money-reconciliation-service");
+    const legacyTips = await migrateLegacyTipsToTipLedger({
+      limit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
+      dryRun: false,
+      deleteLegacy: true,
+    });
     const result = await reconcileHistoricalTeamMoneyBatch({
       db: prisma,
       saleLimit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
       tipLimit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
     });
+    result.legacyTips = legacyTips;
     if (!result?.skipped) {
       const sales = result?.sales || {};
       const tips = result?.tips || {};
-      if ((sales.selected || 0) > 0 || (tips.selected || 0) > 0 || (sales.failed || 0) > 0 || (tips.failed || 0) > 0) {
+      if ((legacyTips.scanned || 0) > 0 || (sales.selected || 0) > 0 || (tips.selected || 0) > 0 || (sales.failed || 0) > 0 || (tips.failed || 0) > 0) {
         console.log(
-          `[scheduler] Team money backfill — sales linked=${sales.linked || 0}/${sales.selected || 0}, tips linked=${tips.linked || 0}/${tips.selected || 0}, failed=${(sales.failed || 0) + (tips.failed || 0)}`
+          `[scheduler] Team money backfill — legacy tips migrated=${legacyTips.migrated || 0}, deleted=${legacyTips.deletedLegacy || 0}; sales linked=${sales.linked || 0}/${sales.selected || 0}, tips linked=${tips.linked || 0}/${tips.selected || 0}, failed=${(sales.failed || 0) + (tips.failed || 0)}`
         );
       }
     }

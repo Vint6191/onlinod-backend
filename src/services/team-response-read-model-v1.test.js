@@ -70,6 +70,15 @@ function makePrisma() {
     teamPpvPurchaseLedger: listModel([]),
     teamResponseCase: listModel(responses),
     teamDialogSession: listModel(sessions),
+    teamProjectionCoverage: {
+      async findUnique() {
+        return {
+          agencyId: "agency-1",
+          responseCoverageFrom: new Date("2026-08-01T00:00:00.000Z"),
+          dialogCoverageFrom: new Date("2026-08-01T00:00:00.000Z"),
+        };
+      },
+    },
   };
 }
 

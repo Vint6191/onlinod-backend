@@ -5,40 +5,39 @@ const { z } = require("zod");
 const { ingestTeamEvents } = require("../services/telemetry-ingest-service");
 const prisma = require("../prisma");
 const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-capabilities");
+const { requireAuthDevice } = require("../middleware/auth");
 
 const router = express.Router();
 
 const ingestSchema = z.object({
-  deviceId: z.string().min(1).max(160).optional().nullable(),
-  agencyId: z.string().optional().nullable(),
+  deviceId: z.string().min(1).max(160),
   events: z.array(z.any()).max(1000),
 });
 
 router.post("/events/ingest", async (req, res) => {
   try {
     const input = ingestSchema.parse(req.body || {});
-    const agencyId = input.agencyId || req.auth.agencyId;
-
-    if (agencyId !== req.auth.agencyId) {
-      const member = await prisma.agencyMember.findFirst({
-        where: { agencyId, userId: req.auth.userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
-      });
-      if (!member) return res.status(403).json({ ok: false, code: "TELEMETRY_AGENCY_FORBIDDEN", error: "No access to agency" });
-    }
+    const agencyId = req.auth.agencyId;
+    const deviceId = requireAuthDevice(req, input.deviceId, {
+      requiredCode: "TELEMETRY_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "TELEMETRY_DEVICE_MISMATCH",
+    });
 
     const result = await ingestTeamEvents({
       agencyId,
-      deviceId: input.deviceId || req.auth.deviceId || null,
+      deviceId,
       userId: req.auth.userId,
       memberId: req.auth.memberId || null,
+      admittedAccessEpoch: Number(req.auth.membership?.accessEpoch || 1),
       events: input.events,
     });
 
     return res.json({ ok: true, ...result });
   } catch (err) {
     if (err?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
-    console.error("[telemetry/ingest] failed:", err);
-    return res.status(500).json({ ok: false, code: "TELEMETRY_INGEST_FAILED", error: err?.message || "Failed" });
+    const status = Number(err?.status) || 500;
+    if (status >= 500) console.error("[telemetry/ingest] failed:", err);
+    return res.status(status).json({ ok: false, code: err?.code || "TELEMETRY_INGEST_FAILED", error: err?.message || "Failed" });
   }
 });
 

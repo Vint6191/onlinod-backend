@@ -1,9 +1,7 @@
 "use strict";
 
-const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
-const { ingestTipEvent } = require("./team-tip-ledger-service");
 
 // --------------------------------------------------------------------
 // Constants — these MUST match electron/team-claims/claim-rules.js or
@@ -12,12 +10,6 @@ const { ingestTipEvent } = require("./team-tip-ledger-service");
 const ATTRIBUTION_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 const GRACE_PERIOD_MS = 48 * 60 * 60 * 1000;      // 48 hours after the money event
 const LEGACY_ATTRIBUTION_RETENTION_DAYS = 180;
-
-const MONEY_EVENT_TYPES = new Set([
-  "tip_received",
-  "ppv_purchase_received",
-  "subscription_created",
-]);
 
 // PPV attribution moved to TeamPpvPurchaseLedger / TeamPpvResolveJob.
 // Tips moved to TeamTipLedger in v16. MoneyAttribution is kept only as
@@ -68,61 +60,6 @@ async function findMoneyAttributionForUpdate(tx, { agencyId, eventHash }) {
   return rows?.[0] || null;
 }
 
-function hashEvent({
-  agencyId,
-  accountId,
-  fanId,
-  occurredAt,
-  eventType,
-  amountCents,
-  eventHash,
-  messageId,
-  purchaseMessageId,
-  notificationId,
-  toastId,
-  targetUrl,
-} = {}) {
-  // Best identity: websocket-listener eventHash, because PPV purchases can
-  // share account/fan/amount/second. We still include agency in the seed via
-  // the DB unique (agencyId,eventHash), so the same OF event in two agencies
-  // cannot collide in storage.
-  const explicit = cleanString(eventHash, 120);
-  if (explicit) return explicit;
-
-  const semanticId =
-    cleanString(purchaseMessageId, 120) ||
-    cleanString(messageId, 120) ||
-    cleanString(notificationId, 120) ||
-    cleanString(toastId, 120) ||
-    cleanString(targetUrl, 500) ||
-    "";
-
-  const seed = [
-    String(agencyId || ""),
-    String(accountId || ""),
-    String(fanId || ""),
-    String(eventType || ""),
-    String(amountCents || 0),
-    semanticId,
-    Math.floor(Number(occurredAt) / 1000),
-  ].join("|");
-  return crypto.createHash("sha256").update(seed).digest("hex").slice(0, 40);
-}
-
-function asAmountCents(payload) {
-  // Electron sends amount in dollars (Number). Convert to cents.
-  const dollars = Number(payload.amount ?? payload.priceDollars ?? payload.amountDollars ?? 0);
-  if (!Number.isFinite(dollars) || dollars <= 0) return 0;
-  return Math.round(dollars * 100);
-}
-
-function safeDate(value) {
-  const n = Number(value);
-  if (Number.isFinite(n) && n > 0) return new Date(n);
-  const d = new Date(value);
-  return Number.isFinite(d.getTime()) ? d : new Date();
-}
-
 function isLocked(row) {
   if (!row) return false;
   if (row.locked) return true;
@@ -142,23 +79,6 @@ function pushHistory(row, entry) {
 // --------------------------------------------------------------------
 // Resolve creator & member ids (mirrors telemetry-ingest-service)
 // --------------------------------------------------------------------
-
-async function resolveCreator({ agencyId, payload }) {
-  const candidates = [];
-  if (payload.accountId) candidates.push({ id: cleanString(payload.accountId, 160) });
-  if (payload.creatorRef) candidates.push({ username: cleanString(payload.creatorRef, 160).replace(/^@/, "") });
-  for (const where of candidates) {
-    if (!where || (!where.id && !where.username)) continue;
-    try {
-      const creator = await prisma.creatorAccount.findFirst({
-        where: { agencyId, deletedAt: null, ...where },
-        select: { id: true, username: true },
-      });
-      if (creator) return creator;
-    } catch (_) {}
-  }
-  return null;
-}
 
 async function resolveMember({ agencyId, memberId, userId }) {
   if (memberId) {
@@ -230,123 +150,9 @@ async function canActorClaimAttribution({ agencyId, row, actor }) {
 }
 
 // --------------------------------------------------------------------
-// Ingest a money event from Electron and apply auto-attribution
+// Audit15: MoneyAttribution is migration/read history only. Client money
+// ingest authority has been removed; no production writer may create rows.
 // --------------------------------------------------------------------
-//
-// Electron computes auto-attribution locally using its own event log
-// (because that's where "who messaged this fan in the last 2h" lives).
-// The backend just stores what it sends. If two Electrons report the
-// same event with different auto-attribution (race condition between
-// chatters' instances) — first write wins, subsequent reports are
-// idempotent on eventHash.
-
-async function ingestMoneyEvent({ agencyId, userId, payload }) {
-  const eventType = cleanString(payload?.type, 80);
-  if (!eventType || !MONEY_EVENT_TYPES.has(eventType)) {
-    return { ok: false, code: "INVALID_EVENT_TYPE" };
-  }
-
-  if (eventType === "tip_received") {
-    return ingestTipEvent({ agencyId, userId, payload });
-  }
-
-  if (eventType === "subscription_created") {
-    return {
-      ok: true,
-      ignored: true,
-      code: "SUBSCRIPTION_NOT_TEAM_MEMBER_REVENUE",
-      message: "Paid subscriptions belong to traffic / creator revenue, not chatter attribution. Free subscriptions are not revenue.",
-    };
-  }
-
-  if (!isLegacyClaimableEventType(eventType)) {
-    return {
-      ok: true,
-      ignored: true,
-      code: "PPV_MOVED_TO_TEAM_PPV_LEDGER",
-      message: "PPV attribution is handled by TeamPpvPurchaseLedger / TeamPpvResolveJob",
-    };
-  }
-
-  const amountCents = asAmountCents(payload);
-  if (amountCents <= 0) {
-    return { ok: false, code: "ZERO_AMOUNT" };
-  }
-
-  const occurredAt = safeDate(payload.ts || payload.occurredAt);
-  const accountId = cleanString(payload.accountId, 160);
-  const fanId = cleanString(payload.fanId, 160);
-
-  if (!accountId || !fanId) {
-    return { ok: false, code: "MISSING_IDENTIFIERS" };
-  }
-
-  const eventHash = hashEvent({
-    agencyId,
-    accountId,
-    fanId,
-    occurredAt: occurredAt.getTime(),
-    eventType,
-    amountCents,
-    eventHash: payload.eventHash,
-    messageId: payload.messageId,
-    purchaseMessageId: payload.purchaseMessageId,
-    notificationId: payload.notificationId,
-    toastId: payload.toastId,
-    targetUrl: payload.targetUrl,
-  });
-
-  // Already exists? Idempotent — return current row.
-  const existing = await prisma.moneyAttribution.findUnique({
-    where: { agencyId_eventHash: { agencyId, eventHash } },
-  });
-
-  if (existing) {
-    return { ok: true, deduped: true, attribution: existing };
-  }
-
-  // Resolve creator and the auto-attributed member (sent by Electron).
-  const creator = await resolveCreator({ agencyId, payload });
-  const autoMember = await resolveMember({
-    agencyId,
-    memberId: payload.autoAttributedToMemberId,
-    userId: payload.autoAttributedToUserId,
-  });
-
-  const initialState = autoMember ? "auto" : "unattributed";
-  const initialHistory = [{
-    ts: Date.now(),
-    action: "auto_attribution",
-    reason: cleanString(payload.autoReason, 80) || (autoMember ? "last_outgoing_within_2h" : "no_message_in_window"),
-    prevOwner: null,
-    nextOwner: autoMember?.id || null,
-    source: "electron_ingest",
-    byUserId: userId || null,
-  }];
-
-  const created = await prisma.moneyAttribution.create({
-    data: {
-      agencyId,
-      eventHash,
-      eventType,
-      amountCents,
-      currency: cleanString(payload.currency, 8) || "USD",
-      occurredAt,
-      creatorId: creator?.id || null,
-      accountId,
-      fanId,
-      state: initialState,
-      attributedToMemberId: autoMember?.id || null,
-      attributedToUserId: autoMember?.userId || null,
-      autoAttributedToMemberId: autoMember?.id || null,
-      autoAttributedToUserId: autoMember?.userId || null,
-      autoReason: cleanString(payload.autoReason, 80) || null,
-      history: initialHistory,
-    },
-  });
-
-  return { ok: true, deduped: false, attribution: created };
-}
 
 // --------------------------------------------------------------------
 // Apply a manual override (claim / release / manager_override)
@@ -558,15 +364,12 @@ module.exports = {
   ATTRIBUTION_WINDOW_MS,
   GRACE_PERIOD_MS,
   LEGACY_ATTRIBUTION_RETENTION_DAYS,
-  MONEY_EVENT_TYPES,
   LEGACY_CLAIMABLE_EVENT_TYPES,
   LEGACY_PURGEABLE_EVENT_TYPES,
-  ingestMoneyEvent,
   applyOverride,
   listDisputable,
   sweepLocks,
   purgeExpiredLegacyAttributions,
-  hashEvent,
   isLocked,
   isLegacyClaimableEventType,
   canActorClaimAttribution,

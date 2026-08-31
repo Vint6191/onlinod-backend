@@ -6,6 +6,9 @@ const { applyLedgerSideEffects } = require("./team-ppv-ledger-service");
 const { applyTeamResponseProjection } = require("./team-response-projection-service");
 const { applyTeamPendingProjection } = require("./team-pending-projection-service");
 const { projectCustomDeliveryFromTeamEvent } = require("./custom-content-delivery-tracking-service");
+const { canAccessCreator } = require("../middleware/automation-permissions");
+const { serializableTxOptions } = require("../utils/prisma-transaction");
+const { runDbTransaction } = require("./db-transaction-service");
 
 const TEAM_V13_VERSION = "team_v13_provenance";
 const TEAM_V13_SOURCE = "electron_team_v13";
@@ -99,7 +102,7 @@ function compactObject(value) {
   return Object.keys(out).length ? out : null;
 }
 
-async function resolveCreator({ agencyId, event, strict = false }) {
+async function resolveCreator({ agencyId, event, strict = false, db = prisma }) {
   const candidates = [];
   const accountId = cleanString(event.accountId, 160);
   const explicitCreatorId = cleanString(event.creatorId, 160);
@@ -117,7 +120,7 @@ async function resolveCreator({ agencyId, event, strict = false }) {
 
   for (const where of candidates) {
     try {
-      const creator = await prisma.creatorAccount.findFirst({
+      const creator = await db.creatorAccount.findFirst({
         where: { agencyId, deletedAt: null, ...where },
         select: { id: true, username: true, remoteId: true },
       });
@@ -129,71 +132,38 @@ async function resolveCreator({ agencyId, event, strict = false }) {
   return null;
 }
 
-async function resolveMember({ agencyId, event, fallbackUserId }) {
-  const viewerId = cleanString(
-    event.viewerId || event.memberId || event.userId ||
-    event.extra?.viewerId || event.extra?.memberId || event.extra?.userId,
-    160
-  );
-  if (viewerId) {
-    const direct = await prisma.agencyMember.findFirst({
-      where: { agencyId, id: viewerId, deletedAt: null },
-      select: { id: true, userId: true },
-    });
-    if (direct) return direct;
-
-    const byUser = await prisma.agencyMember.findFirst({
-      where: { agencyId, userId: viewerId, deletedAt: null },
-      select: { id: true, userId: true },
-    });
-    if (byUser) return byUser;
-  }
-
-  if (fallbackUserId) {
-    const fallback = await prisma.agencyMember.findFirst({
-      where: { agencyId, userId: fallbackUserId, deletedAt: null },
-      select: { id: true, userId: true },
-    });
-    if (fallback) return fallback;
-  }
-  return null;
-}
-
-async function resolveAuthenticatedMember({ agencyId, memberId, userId }) {
-  const safeMemberId = cleanString(memberId, 160);
-  const safeUserId = cleanString(userId, 160);
-  if (safeMemberId) {
-    const member = await prisma.agencyMember.findFirst({
-      where: { agencyId, id: safeMemberId, deletedAt: null },
-      select: { id: true, userId: true },
-    });
-    if (member && (!safeUserId || member.userId === safeUserId)) return member;
-  }
-  if (!safeUserId) return null;
-  return prisma.agencyMember.findFirst({
-    where: { agencyId, userId: safeUserId, deletedAt: null },
-    select: { id: true, userId: true },
-  });
-}
-
-async function resolveExistingDeviceId({ agencyId, deviceId }) {
-  const id = cleanString(deviceId, 160);
-  if (!id) return null;
-  try {
-    const device = await prisma.workerDevice.findFirst({
-      where: { agencyId, id },
-      select: { id: true },
-    });
-    return device?.id || null;
-  } catch (_) {
-    return null;
-  }
-}
-
 function isCanonicalV13(event) {
   return cleanString(event.telemetryVersion, 80) === TEAM_V13_VERSION
-    || cleanString(event.source, 80) === TEAM_V13_SOURCE
-    || Boolean(cleanString(event.eventKind, 80));
+    && cleanString(event.source, 80) === TEAM_V13_SOURCE;
+}
+
+function telemetryAdmissionError(code, message, status = 403) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = status;
+  return error;
+}
+
+async function loadLiveTelemetryMember({ db, agencyId, memberId, userId, admittedAccessEpoch }) {
+  const live = await db.agencyMember.findFirst({
+    where: {
+      id: memberId,
+      agencyId,
+      userId,
+      deletedAt: null,
+      deactivatedAt: null,
+      agency: { deletedAt: null },
+    },
+    select: {
+      id: true, userId: true, agencyId: true, accessEpoch: true, role: true, roleKey: true,
+      assignedCreators: true, permissions: true, deletedAt: true, deactivatedAt: true,
+    },
+  });
+  if (!live) throw telemetryAdmissionError("TELEMETRY_MEMBER_STALE", "Agency membership is no longer active");
+  if (Number(live.accessEpoch || 1) !== Number(admittedAccessEpoch || 1)) {
+    throw telemetryAdmissionError("TELEMETRY_ACCESS_EPOCH_STALE", "Creator access changed while telemetry batch was in flight");
+  }
+  return live;
 }
 
 function canonicalNeedsHumanActor(eventKind, actionSource) {
@@ -305,153 +275,119 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
   };
 }
 
-async function normalizeLegacyEvent({ agencyId, safeDeviceId, deviceId, userId, event }) {
-  const type = cleanString(event.type, 80);
-  if (!type) return null;
-  const ts = safeDate(event.ts || event.createdAt || Date.now());
-  const creator = await resolveCreator({ agencyId, event });
-  const member = await resolveMember({ agencyId, event, fallbackUserId: userId });
-  const localId = cleanString(event.localId, 160) || hashEvent({
-    deviceId: safeDeviceId || deviceId || null,
-    ts: ts.getTime(),
-    type,
-    userId: member?.userId || userId || null,
-    memberId: member?.id || null,
-    accountId: event.accountId || null,
-    fanId: event.fanId || null,
-    extra: event.extra || null,
-  });
-  return {
-    agencyId,
-    deviceId: safeDeviceId,
-    userId: member?.userId || userId || null,
-    memberId: member?.id || null,
-    accountId: cleanString(event.accountId || event.extra?.accountId, 160),
-    creatorId: creator?.id || null,
-    creatorRef: cleanString(event.creatorRef || creator?.username, 160),
-    fanId: cleanString(event.fanId || event.extra?.fanId, 160),
-    type,
-    ts,
-    localId,
-    extra: event.extra && typeof event.extra === "object" ? event.extra : null,
-    source: cleanString(event.source, 80) || "electron",
-  };
-}
-
-async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, events = [] }) {
+async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, admittedAccessEpoch = 1, events = [] }) {
   const input = Array.isArray(events) ? events : [];
-  const normalized = [];
+  let inserted = 0;
+  let duplicated = 0;
   let skipped = 0;
+  const acknowledgedLocalIds = [];
   const rejectedByReason = {};
   const rejectedEvents = [];
-  const safeDeviceId = await resolveExistingDeviceId({ agencyId, deviceId });
-  const authenticatedMember = await resolveAuthenticatedMember({ agencyId, memberId, userId });
+
+  if (!agencyId || !deviceId || !userId || !memberId) {
+    throw telemetryAdmissionError("TELEMETRY_AUTHORITY_REQUIRED", "Telemetry requires authenticated member and device authority", 401);
+  }
+
+  const reject = (event, reason) => {
+    skipped += 1;
+    rejectedByReason[reason] = (rejectedByReason[reason] || 0) + 1;
+    rejectedEvents.push({ localId: cleanString(event?.localId, 160), reason });
+  };
 
   for (const rawEvent of input) {
     const event = stripInternalEventFields(rawEvent);
     if (!event || typeof event !== "object") {
-      skipped += 1;
-      rejectedEvents.push({ localId: null, reason: "invalid_event" });
+      reject(null, "invalid_event");
+      continue;
+    }
+    if (!isCanonicalV13(event)) {
+      reject(event, "legacy_telemetry_disabled");
       continue;
     }
 
-    if (isCanonicalV13(event)) {
-      const creator = await resolveCreator({ agencyId, event, strict: true });
-      if (!creator) {
-        skipped += 1;
-        rejectedByReason.creator_not_found = (rejectedByReason.creator_not_found || 0) + 1;
-        rejectedEvents.push({ localId: cleanString(event.localId, 160), reason: "creator_not_found" });
-        continue;
-      }
-      const result = normalizeCanonicalCore({
-        agencyId,
-        deviceId: safeDeviceId,
-        event,
-        creator,
-        authenticatedMember,
-      });
-      if (!result.row) {
-        skipped += 1;
-        const key = result.reason || "invalid_contract";
-        rejectedByReason[key] = (rejectedByReason[key] || 0) + 1;
-        rejectedEvents.push({ localId: cleanString(event.localId, 160), reason: key });
-        continue;
-      }
-      normalized.push(result.row);
-      continue;
-    }
-
-    const legacy = await normalizeLegacyEvent({ agencyId, safeDeviceId, deviceId, userId, event });
-    if (!legacy) {
-      skipped += 1;
-      rejectedEvents.push({ localId: cleanString(event.localId, 160), reason: "legacy_event_invalid" });
-      continue;
-    }
-    normalized.push(legacy);
-  }
-
-  let inserted = 0;
-  let duplicated = 0;
-  const acknowledgedLocalIds = [];
-
-  for (const row of normalized) {
+    let durable = null;
     try {
-      // Prisma unique index contains nullable deviceId, so Postgres can allow
-      // duplicates when deviceId is null. Do a manual localId check too.
-      if (row.localId) {
-        const exists = await prisma.teamActivityEvent.findFirst({
-          where: { agencyId: row.agencyId, localId: row.localId },
-          select: { id: true },
+      durable = await runDbTransaction(prisma, async (tx) => {
+        const liveMember = await loadLiveTelemetryMember({
+          db: tx,
+          agencyId,
+          memberId,
+          userId,
+          admittedAccessEpoch,
         });
-        if (exists) {
-          duplicated += 1;
-          // Side effects (sent-message / PPV ledgers) are part of durable
-          // ingestion semantics. If they fail, propagate the error so the
-          // desktop keeps its outbox row and retries. On retry the raw event is
-          // found by localId and the idempotent side effect is attempted again.
-          const replayRow = { ...row, id: exists.id };
-          await applyLedgerSideEffects(replayRow);
-          await applyTeamResponseProjection(replayRow);
-          await applyTeamPendingProjection(replayRow);
-          await projectCustomDeliveryFromTeamEvent(replayRow, { db: prisma });
-          if (row.localId) acknowledgedLocalIds.push(row.localId);
-          continue;
-        }
-      }
-      const created = await prisma.teamActivityEvent.create({ data: row });
-      inserted += 1;
-      const durableRow = { ...row, id: created.id };
-      await applyLedgerSideEffects(durableRow);
-      await applyTeamResponseProjection(durableRow);
-      await applyTeamPendingProjection(durableRow);
-      await projectCustomDeliveryFromTeamEvent(durableRow, { db: prisma });
-      if (row.localId) acknowledgedLocalIds.push(row.localId);
-    } catch (err) {
-      if (err?.code === "P2002") {
-        duplicated += 1;
-        // A concurrent writer may have won the unique race after our explicit
-        // pre-check. Do not acknowledge until the idempotent side effects have
-        // also been replayed for the durable row.
+        const creator = await resolveCreator({ agencyId, event, strict: true, db: tx });
+        if (!creator) return { rejected: "creator_not_found" };
+        if (!canAccessCreator(liveMember, creator.id)) return { rejected: "creator_access_forbidden" };
+
+        const result = normalizeCanonicalCore({
+          agencyId,
+          deviceId,
+          event,
+          creator,
+          authenticatedMember: liveMember,
+        });
+        if (!result.row) return { rejected: result.reason || "invalid_contract" };
+        const row = result.row;
+
         if (row.localId) {
-          const existing = await prisma.teamActivityEvent.findFirst({
+          const exists = await tx.teamActivityEvent.findFirst({
             where: { agencyId: row.agencyId, localId: row.localId },
             select: { id: true },
           });
-          if (!existing) throw err;
-          const replayRow = { ...row, id: existing.id };
-          await applyLedgerSideEffects(replayRow);
-          await applyTeamResponseProjection(replayRow);
-          await applyTeamPendingProjection(replayRow);
-          await projectCustomDeliveryFromTeamEvent(replayRow, { db: prisma });
-          acknowledgedLocalIds.push(row.localId);
+          if (exists) {
+            const durableRow = { ...row, id: exists.id };
+            await applyLedgerSideEffects(durableRow, tx);
+            await applyTeamResponseProjection(durableRow, tx);
+            await applyTeamPendingProjection(durableRow, tx);
+            await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
+            return { row: durableRow, duplicated: true };
+          }
         }
-      } else throw err;
+        try {
+          const created = await tx.teamActivityEvent.create({ data: row });
+          const durableRow = { ...row, id: created.id };
+          await applyLedgerSideEffects(durableRow, tx);
+          await applyTeamResponseProjection(durableRow, tx);
+          await applyTeamPendingProjection(durableRow, tx);
+          await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
+          return { row: durableRow, inserted: true };
+        } catch (err) {
+          if (err?.code !== "P2002" || !row.localId) throw err;
+          const exists = await tx.teamActivityEvent.findFirst({
+            where: { agencyId: row.agencyId, localId: row.localId },
+            select: { id: true },
+          });
+          if (!exists) throw err;
+          const durableRow = { ...row, id: exists.id };
+          await applyLedgerSideEffects(durableRow, tx);
+          await applyTeamResponseProjection(durableRow, tx);
+          await applyTeamPendingProjection(durableRow, tx);
+          await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
+          return { row: durableRow, duplicated: true };
+        }
+      }, serializableTxOptions());
+    } catch (err) {
+      if (["TELEMETRY_MEMBER_STALE", "TELEMETRY_ACCESS_EPOCH_STALE"].includes(err?.code)) throw err;
+      throw err;
     }
+
+    if (durable?.rejected) {
+      reject(event, durable.rejected);
+      continue;
+    }
+    if (!durable?.row) {
+      reject(event, "durable_event_missing");
+      continue;
+    }
+
+    if (durable.inserted) inserted += 1;
+    if (durable.duplicated) duplicated += 1;
+    if (durable.row.localId) acknowledgedLocalIds.push(durable.row.localId);
   }
 
   return {
     received: input.length,
-    accepted: normalized.length,
+    accepted: inserted + duplicated,
     inserted,
     duplicated,
     skipped,

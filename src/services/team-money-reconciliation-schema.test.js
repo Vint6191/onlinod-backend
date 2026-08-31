@@ -61,9 +61,10 @@ test("Team tips bind to CreatorTip and recent chatter timing is evidence-only", 
   assert.match(migration, /TeamTipLedger_creatorTipId_fkey/);
   assert.match(reconciliation, /SINGLE_RECENT_CANDIDATE_EVIDENCE_ONLY/);
   assert.match(reconciliation, /MULTIPLE_RECENT_CANDIDATES_EVIDENCE_ONLY/);
-  assert.match(tipLedger, /attributionMode: "exact_message_first"/);
-  assert.match(tipLedger, /single_recent_candidate_evidence_only/);
-  assert.doesNotMatch(tipLedger, /status = "attributed";[\s\S]{0,250}single_recent_dialog_worker_10m/);
+  assert.match(reconciliation, /EXACT_MESSAGE_MANUAL/);
+  assert.match(reconciliation, /EXACT_MESSAGE_NON_HUMAN/);
+  assert.match(reconciliation, /NO_EXACT_MESSAGE_PROVENANCE/);
+  assert.doesNotMatch(tipLedger, /function\s+ingestTipEvent|ingestTipEvent\s*,/, "legacy client tip writer must not return");
 });
 
 test("payout undo is excluded from Team PPV money without erasing ownership evidence", () => {

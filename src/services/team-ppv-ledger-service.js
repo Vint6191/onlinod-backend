@@ -98,15 +98,6 @@ function eventActionSource(event) {
   return clean(event?.actionSource || extraOf(event).actionSource || extraOf(event).source || null, 80);
 }
 
-function purchaseIdFromEvent(event) {
-  const extra = extraOf(event);
-  return clean(
-    extra.purchaseId || extra.purchase_id || extra.notificationId || extra.transactionId ||
-    extra.localSeed || event.localId || [eventMessageId(event) || "no-message", event.ts || Date.now()].join(":"),
-    220
-  );
-}
-
 function shouldKeepExisting(value) {
   const s = String(value ?? "").trim();
   return Boolean(s && s !== "member" && s !== "unknown");
@@ -182,15 +173,15 @@ function displayNameForMember(member) {
   return member.displayName || member.user?.name || member.user?.email || null;
 }
 
-async function findSentLedger({ agencyId, accountId, localSeed, messageId }) {
+async function findSentLedger({ agencyId, accountId, localSeed, messageId }, db = prisma) {
   if (messageId) {
-    const byMessage = await prisma.teamSentMessageLedger.findFirst({
+    const byMessage = await db.teamSentMessageLedger.findFirst({
       where: { agencyId, accountId, messageId },
     });
     if (byMessage) return byMessage;
   }
   if (localSeed) {
-    const bySeed = await prisma.teamSentMessageLedger.findUnique({
+    const bySeed = await db.teamSentMessageLedger.findUnique({
       where: { agencyId_accountId_localSeed: { agencyId, accountId, localSeed } },
     });
     if (bySeed) return bySeed;
@@ -198,7 +189,7 @@ async function findSentLedger({ agencyId, accountId, localSeed, messageId }) {
   return null;
 }
 
-async function upsertSentMessageFromEvent(row) {
+async function upsertSentMessageFromEvent(row, db = prisma) {
   const event = row || {};
   const extra = extraOf(event);
   const agencyId = eventAgency(event, event.agencyId);
@@ -239,13 +230,13 @@ async function upsertSentMessageFromEvent(row) {
     telemetryEventId: clean(event.id || null, 160),
   };
 
-  const existing = await findSentLedger({ agencyId, accountId, localSeed, messageId });
+  const existing = await findSentLedger({ agencyId, accountId, localSeed, messageId }, db);
   if (!existing) {
     try {
-      return await prisma.teamSentMessageLedger.create({ data: next });
+      return await db.teamSentMessageLedger.create({ data: next });
     } catch (err) {
       if (err?.code !== "P2002") throw err;
-      const afterRace = await findSentLedger({ agencyId, accountId, localSeed, messageId });
+      const afterRace = await findSentLedger({ agencyId, accountId, localSeed, messageId }, db);
       if (!afterRace) throw err;
       return afterRace;
     }
@@ -274,219 +265,22 @@ async function upsertSentMessageFromEvent(row) {
     telemetryEventId: existing.telemetryEventId || next.telemetryEventId,
   };
 
-  return prisma.teamSentMessageLedger.update({ where: { id: existing.id }, data: update });
+  return db.teamSentMessageLedger.update({ where: { id: existing.id }, data: update });
 }
 
-async function createResolveJobIfNeeded(payload) {
-  if (!payload?.messageId || !payload?.purchaseId || payload.status === "attributed") return null;
-  return prisma.teamPpvResolveJob.upsert({
-    where: {
-      agencyId_purchaseId_messageId: {
-        agencyId: payload.agencyId,
-        purchaseId: payload.purchaseId,
-        messageId: payload.messageId,
-      },
-    },
-    create: {
-      agencyId: payload.agencyId,
-      accountId: payload.accountId,
-      creatorId: payload.creatorId,
-      creatorRef: payload.creatorRef,
-      purchaseId: payload.purchaseId,
-      messageId: payload.messageId,
-      amountCents: payload.amountCents,
-      currency: payload.currency,
-      purchasedAt: payload.purchasedAt,
-      status: "pending",
-      expiresAt: new Date(Date.now() + RESOLVE_JOB_EXPIRE_MS),
-    },
-    update: {
-      amountCents: payload.amountCents,
-      currency: payload.currency,
-      purchasedAt: payload.purchasedAt,
-      status: "pending",
-      expiresAt: new Date(Date.now() + RESOLVE_JOB_EXPIRE_MS),
-    },
-  });
-}
+// Audit15: PPV purchase creation from telemetry/compatibility events was retired.
+// Canonical CreatorSale reconciliation is the only Team PPV money projector.
 
-
-async function findExistingPurchaseBySemanticKey({ agencyId, accountId, messageId, fanId, dialogId, amountCents, purchasedAt }) {
-  const safeMessageId = clean(messageId, 160);
-  if (!safeMessageId) return null;
-  const safeAgencyId = clean(agencyId, 160);
-  const safeAccountId = clean(accountId, 160) || "unknown";
-  const safeFanId = clean(fanId, 160);
-  const safeDialogId = clean(dialogId, 160);
-  const t = safeDate(purchasedAt).getTime();
-  const from = new Date(t - 24 * 60 * 60 * 1000);
-  const to = new Date(t + 24 * 60 * 60 * 1000);
-
-  const rows = await prisma.teamPpvPurchaseLedger.findMany({
-    where: {
-      agencyId: safeAgencyId,
-      accountId: safeAccountId,
-      messageId: safeMessageId,
-      purchasedAt: { gte: from, lte: to },
-      ...(Number(amountCents || 0) > 0 ? { amountCents: Number(amountCents) } : {}),
-    },
-    orderBy: { createdAt: "desc" },
-    take: 10,
-  }).catch(() => []);
-
-  return (rows || []).find((row) => {
-    if (!safeFanId && !safeDialogId) return true;
-    return !row.fanId || row.fanId === safeFanId || row.fanId === safeDialogId || row.dialogId === safeFanId || row.dialogId === safeDialogId;
-  }) || null;
-}
-
-async function upsertPurchaseFromEvent(row) {
-  const event = row || {};
-  const extra = extraOf(event);
-  const agencyId = eventAgency(event, event.agencyId);
-  if (!agencyId) return null;
-
-  const accountId = eventAccount(event);
-  let purchaseId = purchaseIdFromEvent(event);
-  const messageId = eventMessageId(event);
-  const amountCents = Math.max(0, int(extra.amountCents || extra.amount_cents || extra.priceCents || 0, 0));
-  const purchasedAt = safeDate(extra.purchasedAt || extra.purchasedAtMs || extra.createdAt || event.ts);
-  const attributedMemberId = clean(extra.attributedMemberId || event.memberId || null, 160);
-  const attributedUserId = clean(extra.attributedUserId || event.userId || null, 160);
-  const status = attributedMemberId ? "attributed" : "unresolved";
-
-  const payload = {
-    agencyId,
-    accountId,
-    creatorId: eventCreatorId(event),
-    creatorRef: eventCreatorRef(event),
-    purchaseId,
-    messageId,
-    dialogId: clean(extra.dialogId || event.fanId || extra.fanId, 160),
-    fanId: clean(extra.fanId || event.fanId, 160),
-    buyerFanId: clean(extra.buyerFanId || extra.buyer_fan_id || extra.fanId || event.fanId, 160),
-    amountCents,
-    currency: clean(extra.currency || "USD", 16) || "USD",
-    purchasedAt,
-    status,
-    attributedMemberId,
-    attributedUserId,
-    attributedShiftKey: clean(extra.attributedShiftKey || extra.shiftKey || null, 220),
-    resolvedAt: attributedMemberId ? new Date() : null,
-    resolvedByDeviceId: clean(event.deviceId || extra.deviceId || null, 160),
-    resolvedSource: attributedMemberId ? clean(extra.source || "telemetry", 80) : null,
-  };
-
-  let existing = await prisma.teamPpvPurchaseLedger.findUnique({
-    where: { agencyId_purchaseId: { agencyId, purchaseId } },
-  });
-
-  if (!existing && messageId) {
-    existing = await findExistingPurchaseBySemanticKey({
-      agencyId,
-      accountId,
-      messageId,
-      fanId: payload.fanId,
-      dialogId: payload.dialogId,
-      amountCents,
-      purchasedAt,
-    });
-
-    if (existing?.purchaseId) {
-      // Catch-up and realtime can expose different upstream ids for the same
-      // real purchase. Preserve the original ledger purchaseId and update that
-      // row instead of creating a second revenue row.
-      purchaseId = existing.purchaseId;
-      payload.purchaseId = existing.purchaseId;
-    }
-  }
-
-  if (existing?.attributedMemberId && !attributedMemberId) {
-    // Unresolved duplicate arrived after attribution. Do not downgrade a sale.
-    return existing;
-  }
-
-  if (existing?.attributedMemberId && attributedMemberId && existing.attributedMemberId !== attributedMemberId) {
-    const existingCandidate = {
-      memberId: existing.attributedMemberId,
-      userId: existing.attributedUserId,
-      shiftKey: existing.attributedShiftKey,
-      deviceId: existing.resolvedByDeviceId,
-      source: existing.resolvedSource || "existing_purchase_ledger",
-    };
-    const incomingCandidate = {
-      memberId: attributedMemberId,
-      userId: attributedUserId,
-      shiftKey: payload.attributedShiftKey,
-      deviceId: payload.resolvedByDeviceId,
-      source: payload.resolvedSource || "incoming_telemetry",
-      sentAtMs: purchasedAt?.getTime?.() || null,
-    };
-    await prisma.teamPpvPurchaseLedger.update({ where: { id: existing.id }, data: { status: "conflict" } });
-    if (messageId) {
-      const prevJob = await prisma.teamPpvResolveJob.findUnique({
-        where: { agencyId_purchaseId_messageId: { agencyId, purchaseId, messageId } },
-      }).catch(() => null);
-      const result = conflictResult(prevJob?.result, existingCandidate, incomingCandidate);
-      await prisma.teamPpvResolveJob.upsert({
-        where: { agencyId_purchaseId_messageId: { agencyId, purchaseId, messageId } },
-        create: {
-          agencyId,
-          accountId,
-          creatorId: payload.creatorId,
-          creatorRef: payload.creatorRef,
-          purchaseId,
-          messageId,
-          amountCents,
-          currency: payload.currency,
-          purchasedAt,
-          status: "conflict",
-          attempts: 1,
-          result,
-          expiresAt: new Date(Date.now() + RESOLVE_JOB_EXPIRE_MS),
-        },
-        update: { status: "conflict", attempts: { increment: 1 }, result },
-      });
-    }
-    return existing;
-  }
-
-  const purchase = await prisma.teamPpvPurchaseLedger.upsert({
-    where: { agencyId_purchaseId: { agencyId, purchaseId } },
-    create: payload,
-    update: {
-      messageId: payload.messageId || undefined,
-      dialogId: payload.dialogId || undefined,
-      fanId: payload.fanId || undefined,
-      buyerFanId: payload.buyerFanId || undefined,
-      amountCents: payload.amountCents,
-      currency: payload.currency,
-      purchasedAt: payload.purchasedAt,
-      status: attributedMemberId ? "attributed" : undefined,
-      attributedMemberId: payload.attributedMemberId || undefined,
-      attributedUserId: payload.attributedUserId || undefined,
-      attributedShiftKey: payload.attributedShiftKey || undefined,
-      resolvedAt: payload.resolvedAt || undefined,
-      resolvedByDeviceId: payload.resolvedByDeviceId || undefined,
-      resolvedSource: payload.resolvedSource || undefined,
-    },
-  });
-
-  if (!attributedMemberId && messageId) await createResolveJobIfNeeded(payload);
-  return purchase;
-}
-
-async function applyLedgerSideEffects(row) {
+async function applyLedgerSideEffects(row, db = prisma) {
   if (!row || (!row.type && !row.eventKind)) return;
   const eventKind = String(row.eventKind || "").toUpperCase();
   if (row.type === "sent_message_recorded"
       || row.type === "ppv_message_sent_recorded"
       || (eventKind === "MESSAGE_SEND_CONFIRMED" && String(row.lifecycle || "").toUpperCase() === "CONFIRMED")) {
-    await upsertSentMessageFromEvent(row);
+    await upsertSentMessageFromEvent(row, db);
   }
-  if (row.type === "ppv_purchase_attributed" || row.type === "ppv_purchase_unresolved") {
-    await upsertPurchaseFromEvent(row);
-  }
+  // Audit15: telemetry is ownership/activity provenance only. PPV money facts
+  // are projected exclusively from canonical CreatorSale rows.
 }
 
 async function expirePendingJobs({ agencyId = null } = {}) {
@@ -1226,7 +1020,6 @@ async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS } = {}) {
 module.exports = {
   applyLedgerSideEffects,
   upsertSentMessageFromEvent,
-  upsertPurchaseFromEvent,
   listResolveJobs,
   submitResolveResults,
   listPpvConflicts,

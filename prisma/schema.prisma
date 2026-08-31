@@ -295,6 +295,7 @@ model Agency {
   teamDialogSessions TeamDialogSession[]
   teamResponseCases TeamResponseCase[]
   teamPendingDialogStates TeamPendingDialogState[]
+  teamProjectionCoverage TeamProjectionCoverage?
   teamShifts TeamShift[]
   analyticsSnapshots AnalyticsSnapshot[]
   workspaceSettings WorkspaceSetting[]
@@ -4609,6 +4610,18 @@ model TeamResponseCase {
   @@index([agencyId, creatorId, dialogId, replyAt])
   @@index([agencyId, classification, replyAt])
   @@index([agencyId, slaEligible, replyAt])
+}
+
+
+model TeamProjectionCoverage {
+  agencyId              String   @id
+  responseCoverageFrom  DateTime
+  dialogCoverageFrom    DateTime
+  source                String   @default("audit15_cutover")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 }
 
 model TeamPendingDialogState {

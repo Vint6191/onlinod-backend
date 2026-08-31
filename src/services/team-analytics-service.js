@@ -421,6 +421,42 @@ async function loadPpvPurchaseLedger({ agencyId, range, allowedCreatorIds = null
   }
 }
 
+async function loadProjectionCoverage({ agencyId }) {
+  try {
+    if (!prisma.teamProjectionCoverage?.findUnique) return { available: false, responseCoverageFrom: null, dialogCoverageFrom: null };
+    const row = await prisma.teamProjectionCoverage.findUnique({ where: { agencyId } });
+    if (!row) return { available: false, responseCoverageFrom: null, dialogCoverageFrom: null };
+    return {
+      available: true,
+      responseCoverageFrom: row.responseCoverageFrom ? new Date(row.responseCoverageFrom) : null,
+      dialogCoverageFrom: row.dialogCoverageFrom ? new Date(row.dialogCoverageFrom) : null,
+    };
+  } catch (_) {
+    return { available: false, responseCoverageFrom: null, dialogCoverageFrom: null };
+  }
+}
+
+function projectionRange(range, coverageFrom) {
+  if (!coverageFrom || !Number.isFinite(new Date(coverageFrom).getTime())) return null;
+  const from = new Date(coverageFrom);
+  const end = range?.endAt ? new Date(range.endAt) : new Date();
+  if (end.getTime() < from.getTime()) return null;
+  const start = range?.startAt ? new Date(Math.max(new Date(range.startAt).getTime(), from.getTime())) : from;
+  return { ...range, startAt: start, endAt: end };
+}
+
+function projectionOwnsTimestamp(timestamp, coverageFrom) {
+  const t = Number(timestamp);
+  const from = coverageFrom ? new Date(coverageFrom).getTime() : NaN;
+  return Number.isFinite(t) && Number.isFinite(from) && t >= from;
+}
+
+function projectionCoversWholeRange(range, coverageFrom) {
+  const from = coverageFrom ? new Date(coverageFrom).getTime() : NaN;
+  if (!Number.isFinite(from) || !range?.startAt) return false;
+  return new Date(range.startAt).getTime() >= from;
+}
+
 async function loadProjectedResponseCases({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await findAllById(prisma.teamResponseCase, {
@@ -460,14 +496,19 @@ async function loadProjectedPendingStates({ agencyId, allowedCreatorIds = null }
 
 async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = null }) {
   const range = resolveRange(rangeKey);
+  const projectionCoverage = await loadProjectionCoverage({ agencyId });
+  const responseRange = projectionRange(range, projectionCoverage.responseCoverageFrom);
+  const dialogRange = projectionRange(range, projectionCoverage.dialogCoverageFrom);
   const [members, events, ppvPurchases, responseCases, projectedDialogSessions, pendingProjection] = await Promise.all([
     getMembersShell(agencyId),
     loadV3Events({ agencyId, range, allowedCreatorIds }),
     loadPpvPurchaseLedger({ agencyId, range, allowedCreatorIds }),
-    loadProjectedResponseCases({ agencyId, range, allowedCreatorIds }),
-    loadProjectedDialogSessions({ agencyId, range, allowedCreatorIds }),
+    responseRange ? loadProjectedResponseCases({ agencyId, range: responseRange, allowedCreatorIds }) : Promise.resolve([]),
+    dialogRange ? loadProjectedDialogSessions({ agencyId, range: dialogRange, allowedCreatorIds }) : Promise.resolve([]),
     loadProjectedPendingStates({ agencyId, allowedCreatorIds }),
   ]);
+  const responseProjectionCoversRange = projectionCoversWholeRange(range, projectionCoverage.responseCoverageFrom);
+  const dialogProjectionCoversRange = projectionCoversWholeRange(range, projectionCoverage.dialogCoverageFrom);
 
   const metricsByMember = new Map();
   for (const m of members) metricsByMember.set(String(m.id), emptyMetric());
@@ -532,7 +573,7 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     if (purchaseId) seenPpvPurchaseIds.add(purchaseId);
   }
 
-  const hasProjectedResponses = responseCases.length > 0;
+  const hasProjectedResponses = responseProjectionCoversRange;
   for (const response of responseCases) {
     const m = metricFor(response.memberId);
     if (!m) continue;
@@ -563,7 +604,7 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     }
   }
 
-  const hasProjectedDialogSessions = projectedDialogSessions.length > 0;
+  const hasProjectedDialogSessions = dialogProjectionCoversRange;
   for (const session of projectedDialogSessions) {
     const m = metricFor(session.memberId);
     if (!m) continue;
@@ -681,7 +722,7 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     }
 
     if (canonicalKind === "DIALOG_SESSION") {
-      if (hasProjectedDialogSessions) continue;
+      if (projectionOwnsTimestamp(eventTs(ev), projectionCoverage.dialogCoverageFrom)) continue;
       if (m) {
         const dwell = Math.max(0, num(ev.durationSeconds ?? extra.dwellSeconds, 0));
         m.dialogDwellSeconds += dwell;
@@ -747,31 +788,10 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     }
 
     if (type === "ppv_purchase_attributed" || type === "ppv_purchase_unresolved") {
-      const messageId = String(extra.messageId || "").trim();
-      const purchaseId = String(extra.purchaseId || extra.purchase_id || "").trim();
-      // If the purchase is known to the ledger, the ledger already decided
-      // whether it is attributed, conflict, unresolved or rejected. Do not let
-      // legacy activity events override that decision.
-      if (purchaseId && ledgerPpvPurchaseIds.has(purchaseId)) continue;
-      // Prefer real purchase_id. Fallback keeps the aggregation safe if an older
-      // event missed purchaseId but still has messageId + amount + purchasedAt.
-      const purchaseKey = purchaseId || [accountId, messageId, String(extra.amountCents || ""), String(extra.purchasedAt || extra.purchasedAtMs || eventTs(ev))].join("|");
-      if (purchaseKey) {
-        if (seenPpvPurchaseIds.has(purchaseKey)) continue;
-        seenPpvPurchaseIds.add(purchaseKey);
-      }
-
-      const owner = messageId ? sentByMessageId.get(messageId) : null;
-      const ownerMemberId = String(ev.memberId || extra.attributedMemberId || owner?.memberId || "").trim();
-      const ownerMetric = metricFor(ownerMemberId);
-      if (ownerMetric) {
-        const amount = Math.max(0, num(extra.amountCents, 0));
-        ownerMetric.ppvSoldMessages += 1;
-        ownerMetric.ppvRevenueCents += amount;
-        ownerMetric.revenueAttributedCents += amount;
-        if (fanId) ownerMetric._fans.add(fanId);
-        if (accountId) ownerMetric._creators.add(accountId);
-      }
+      // Audit15: retained historical telemetry is provenance/history only.
+      // Team money is read exclusively from TeamPpvPurchaseLedger, whose rows
+      // are projected from canonical CreatorSale facts. Never resurrect revenue
+      // from an old client-authored PPV event when the canonical ledger is absent.
       continue;
     }
 
@@ -794,7 +814,7 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
       }
 
       const suppliedReplySeconds = nullableNum(extra.replySeconds);
-      if (!hasProjectedResponses && isFreshReply && suppliedReplySeconds !== null) {
+      if (!projectionOwnsTimestamp(eventTs(ev), projectionCoverage.responseCoverageFrom) && isFreshReply && suppliedReplySeconds !== null) {
         const seconds = Math.max(0, Math.round(suppliedReplySeconds));
         const senderMetric = m || metricFor(memberId);
         if (senderMetric) {
@@ -877,6 +897,10 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
   const byMember = new Map();
   for (const [memberId, metric] of metricsByMember.entries()) byMember.set(memberId, cleanMetric(metric));
   const responseSummary = buildProjectedResponseSummary(responseCases);
+  responseSummary.source = responseProjectionCoversRange
+    ? "team_response_case_v1"
+    : (responseRange ? "hybrid_legacy_before_projection_coverage" : "legacy_event_fallback");
+  responseSummary.coverageFrom = projectionCoverage.responseCoverageFrom?.toISOString?.() || null;
 
   return {
     range,
@@ -888,15 +912,20 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     projection: {
       responseCases: responseCases.length,
       dialogSessions: projectedDialogSessions.length,
-      responseSource: hasProjectedResponses ? "team_response_case_v1" : "legacy_event_fallback",
-      dialogSessionSource: hasProjectedDialogSessions ? "team_dialog_session_v1" : "event_fallback",
-      unansweredSource: hasProjectedPending ? "team_pending_dialog_v1" : (hasProjectedResponses ? "not_projected" : "legacy_event_fallback"),
+      responseSource: responseProjectionCoversRange
+        ? "team_response_case_v1"
+        : (responseRange ? "hybrid_legacy_before_projection_coverage" : "legacy_event_fallback"),
+      dialogSessionSource: dialogProjectionCoversRange
+        ? "team_dialog_session_v1"
+        : (dialogRange ? "hybrid_legacy_before_projection_coverage" : "event_fallback"),
+      responseCoverageFrom: projectionCoverage.responseCoverageFrom?.toISOString?.() || null,
+      dialogCoverageFrom: projectionCoverage.dialogCoverageFrom?.toISOString?.() || null,
+      unansweredSource: hasProjectedPending ? "team_pending_dialog_v1" : (responseProjectionCoversRange ? "not_projected" : "legacy_event_fallback"),
       creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
     },
   };
 }
 
-const LEGACY_TIP_MONEY_TYPES = ["tip_received"];
 const ATTRIBUTED_PPV_STATUSES = ["attributed", "resolved"];
 const ATTRIBUTED_TIP_STATUSES = ["attributed", "claimed", "resolved"];
 
@@ -912,54 +941,6 @@ function mergeRevenueMaps(...maps) {
     for (const [key, value] of map?.entries?.() || []) addToMap(out, key, value);
   }
   return out;
-}
-
-async function getLegacyTipRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
-  try {
-    const rows = await prisma.moneyAttribution.groupBy({
-      by: ["attributedToMemberId"],
-      where: {
-        agencyId,
-        ...creatorScopeWhere(allowedCreatorIds),
-        eventType: { in: LEGACY_TIP_MONEY_TYPES },
-        attributedToMemberId: { not: null },
-        ...whereForRange("occurredAt", range),
-      },
-      _sum: { amountCents: true },
-    });
-    const map = new Map();
-    for (const row of rows || []) {
-      if (row.attributedToMemberId) addToMap(map, row.attributedToMemberId, row?._sum?.amountCents);
-    }
-    return map;
-  } catch (_) {
-    return new Map();
-  }
-}
-
-async function getLegacyTipRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
-  try {
-    const rows = await prisma.moneyAttribution.groupBy({
-      by: ["attributedToMemberId", "fanId"],
-      where: {
-        agencyId,
-        ...creatorScopeWhere(allowedCreatorIds),
-        eventType: { in: LEGACY_TIP_MONEY_TYPES },
-        attributedToMemberId: { not: null },
-        fanId: { not: null },
-        ...whereForRange("occurredAt", range),
-      },
-      _sum: { amountCents: true },
-    });
-    const map = new Map();
-    for (const row of rows || []) {
-      if (!row.attributedToMemberId || !row.fanId) continue;
-      addToMap(map, `${row.attributedToMemberId}|${row.fanId}`, row?._sum?.amountCents);
-    }
-    return map;
-  } catch (_) {
-    return new Map();
-  }
 }
 
 async function getPpvLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
@@ -1078,20 +1059,16 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
   const [
     ppvRevenueByMember,
     tipLedgerRevenueByMember,
-    legacyTipRevenueByMember,
     ppvRevenueByMemberDialog,
     tipLedgerRevenueByMemberDialog,
-    legacyTipRevenueByMemberDialog,
   ] = includeMoney ? await Promise.all([
     getPpvLedgerRevenueByMember({ agencyId, range: computed.range, allowedCreatorIds }),
     getTipLedgerRevenueByMember({ agencyId, range: computed.range, allowedCreatorIds }),
-    getLegacyTipRevenueByMember({ agencyId, range: computed.range, allowedCreatorIds }),
     getPpvLedgerRevenueByMemberDialog({ agencyId, range: computed.range, allowedCreatorIds }),
     getTipLedgerRevenueByMemberDialog({ agencyId, range: computed.range, allowedCreatorIds }),
-    getLegacyTipRevenueByMemberDialog({ agencyId, range: computed.range, allowedCreatorIds }),
-  ]) : [new Map(), new Map(), new Map(), new Map(), new Map(), new Map()];
-  const revenueByMember = mergeRevenueMaps(ppvRevenueByMember, tipLedgerRevenueByMember, legacyTipRevenueByMember);
-  const revenueByMemberDialog = mergeRevenueMaps(ppvRevenueByMemberDialog, tipLedgerRevenueByMemberDialog, legacyTipRevenueByMemberDialog);
+  ]) : [new Map(), new Map(), new Map(), new Map()];
+  const revenueByMember = mergeRevenueMaps(ppvRevenueByMember, tipLedgerRevenueByMember);
+  const revenueByMemberDialog = mergeRevenueMaps(ppvRevenueByMemberDialog, tipLedgerRevenueByMemberDialog);
 
   const rows = computed.members.map((member) => {
     const shell = memberShell(member);
@@ -1100,7 +1077,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
     if (includeMoney && revenue > 0) {
       metrics.revenueAttributedCents = revenue;
       metrics.dollarsPerMessageCents = metrics.messagesSent > 0 ? Math.round(revenue / metrics.messagesSent) : 0;
-      metrics.moneySource = "ppv_ledger_plus_tip_ledger_with_legacy_tip_fallback";
+      metrics.moneySource = "team_ledgers";
     }
     if (!includeMoney) {
       metrics.revenueAttributedCents = null;

@@ -20,22 +20,19 @@ function pagedModel(rows, calls) {
   };
 }
 
-function loadProjection({ tips, subscriptions, ingestAssertion }) {
-  const calls = { tips: [], subscriptions: [], tipQueries: [], subscriptionQueries: [], state: null, bump: [] };
+function loadProjection({ sales = [], tips, subscriptions, ingestAssertion }) {
+  const calls = { subscriptions: [], saleQueries: [], tipQueries: [], subscriptionQueries: [], state: null, bump: [], trafficDirty: [] };
   const db = {
+    creatorSale: pagedModel(sales, calls.saleQueries),
     creatorTip: pagedModel(tips, calls.tipQueries),
     creatorSubscriptionEvent: pagedModel(subscriptions, calls.subscriptionQueries),
     teamObservationState: { upsert: async (args) => { calls.state = args; return args.update; } },
   };
   inject("../prisma", db);
   inject("./job-idempotency", { buildJobIdempotencyKey: () => "key" });
-  inject("./team-ppv-ledger-service", { upsertPurchaseFromEvent: async () => ({}) });
-  inject("./team-tip-ledger-service", {
-    ingestTipEvent: async (args) => { calls.tips.push(args); return { ok: true }; },
-  });
   inject("./traffic-service", {
     ingestSubscriptionEvent: async (args) => { calls.subscriptions.push(args); return { ok: true }; },
-    markTrafficFanValueDirty: async () => ({ ok: true }),
+    markTrafficFanValueDirty: async (args) => { calls.trafficDirty.push(args); return { ok: true, matched: 1 }; },
   });
   inject("./bump-service", {
     processRuntimeEvents: async (args) => { calls.bump.push(args); return { planned: args.events.length, errors: [] }; },
@@ -45,7 +42,7 @@ function loadProjection({ tips, subscriptions, ingestAssertion }) {
       ingestAssertion?.(args);
       return {
         batchId: "batch-1", status: "COMMITTED", inserted: 0, updated: 0,
-        unchanged: tips.length + subscriptions.length, rejected: 0,
+        unchanged: sales.length + tips.length + subscriptions.length, rejected: 0,
         coverageComplete: true,
         coverageByType: { tips: "complete", subscriptions: "complete" }, replayed: false,
       };
@@ -114,14 +111,14 @@ test("completion preserves the collector run key and projects current-job facts"
   assert.equal(applied.summary.compatibilityCandidates, 2);
   assert.equal(applied.summary.compatibilityProcessed, 2);
   assert.equal(applied.summary.compatibilityTruncated, false);
-  assert.equal(calls.tips.length, 1);
+  assert.equal(calls.trafficDirty.length, 1, "canonical tip may dirty Traffic but must not write Team money again");
   assert.equal(calls.subscriptions.length, 1);
   assert.equal(calls.tipQueries[0].where.sourceJobId, "job-1");
   assert.equal(calls.subscriptionQueries[0].where.sourceJobId, "job-1");
   assert.equal(calls.state.update.currentScanStatus, "idle");
 });
 
-test("compatibility projection paginates beyond 2000 facts without truncation", async () => {
+test("typed canonical non-money projection paginates beyond 2000 facts without truncation", async () => {
   const at = new Date("2026-08-05T12:00:00.000Z");
   const tips = Array.from({ length: 2101 }, (_, index) => ({
     id: `tip-${String(index).padStart(5, "0")}`,
@@ -142,11 +139,11 @@ test("compatibility projection paginates beyond 2000 facts without truncation", 
   assert.equal(applied.summary.compatibilityCandidates, 2101);
   assert.equal(applied.summary.compatibilityProcessed, 2101);
   assert.equal(applied.summary.compatibilityTruncated, false);
-  assert.equal(calls.tips.length, 2101);
+  assert.equal(calls.trafficDirty.length, 2101);
   assert.ok(calls.tipQueries.length >= 5);
 });
 
-test("compatibility projection keeps refund only in the relational ledger and never inflates old paid revenue", async () => {
+test("typed subscription projection keeps refund only in the relational ledger and never inflates old paid revenue", async () => {
   const at = new Date("2026-08-05T12:00:00.000Z");
   const subscriptions = [
     {

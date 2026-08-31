@@ -40,6 +40,7 @@ function dbFixture({ sent = null, existing = null, financialStatus = "done", mem
   };
   let purchase = existing ? { ...existing } : null;
   let resolveJob = null;
+  let purchaseCreates = 0;
 
   const db = {
     creatorSale: {
@@ -75,6 +76,7 @@ function dbFixture({ sent = null, existing = null, financialStatus = "done", mem
       },
       async findMany() { return []; },
       async create({ data }) {
+        purchaseCreates += 1;
         purchase = { id: "team-purchase-1", createdAt: new Date(), ...data };
         return { ...purchase };
       },
@@ -100,6 +102,7 @@ function dbFixture({ sent = null, existing = null, financialStatus = "done", mem
     db,
     getPurchase: () => purchase,
     getResolveJob: () => resolveJob,
+    getPurchaseCreates: () => purchaseCreates,
   };
 }
 
@@ -141,6 +144,14 @@ test("exact CreatorSale.messageId + confirmed manual provenance attributes PPV t
   assert.equal(row.financialStatus, "done");
   assert.equal(row.fanId, "of-fan-1");
   assert.equal(fx.getResolveJob().status, "resolved");
+});
+
+test("one canonical CreatorSale reconciled repeatedly still owns exactly one Team PPV row", async () => {
+  const fx = dbFixture({ sent: manualSent() });
+  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  assert.equal(fx.getPurchaseCreates(), 1);
+  assert.equal(fx.getPurchase().creatorSaleId, "sale-1");
 });
 
 test("exact automation provenance is creator revenue and cannot inherit logged-in member", async () => {
@@ -242,6 +253,7 @@ function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done",
     creator: { id: "creator-1", username: "vilgelmina", displayName: "Vilgelmina" },
   };
   let attribution = existing ? { ...existing } : null;
+  let tipCreates = 0;
   const db = {
     creatorTip: { async findUnique() { return { ...tip }; } },
     teamSentMessageLedger: {
@@ -260,11 +272,11 @@ function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done",
     },
     teamTipLedger: {
       async findFirst() { return attribution ? { ...attribution } : null; },
-      async create({ data }) { attribution = { id: "team-tip-1", createdAt: new Date(), ...data }; return { ...attribution }; },
+      async create({ data }) { tipCreates += 1; attribution = { id: "team-tip-1", createdAt: new Date(), ...data }; return { ...attribution }; },
       async update({ data }) { attribution = { ...attribution, ...data }; return { ...attribution }; },
     },
   };
-  return { db, getAttribution: () => attribution };
+  return { db, getAttribution: () => attribution, getTipCreates: () => tipCreates };
 }
 
 function tipSent({ memberId = "member-1", source = "manual", minutesBefore = 2 } = {}) {
@@ -282,6 +294,14 @@ test("tip exact message provenance auto-attributes only the proven manual sender
   assert.equal(result.proposedStatus, "attributed");
   assert.equal(result.attributionBasis, "EXACT_MESSAGE_MANUAL");
   assert.equal(fx.getAttribution().attributedMemberId, "member-1");
+  assert.equal(fx.getAttribution().creatorTipId, "creator-tip-1");
+});
+
+test("one canonical CreatorTip reconciled repeatedly still owns exactly one Team Tip row", async () => {
+  const fx = tipDbFixture({ exactSent: tipSent() });
+  await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  assert.equal(fx.getTipCreates(), 1);
   assert.equal(fx.getAttribution().creatorTipId, "creator-tip-1");
 });
 

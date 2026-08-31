@@ -2,8 +2,6 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
-const { upsertPurchaseFromEvent } = require("./team-ppv-ledger-service");
-const { ingestTipEvent } = require("./team-tip-ledger-service");
 const { ingestSubscriptionEvent, markTrafficFanValueDirty } = require("./traffic-service");
 const { processRuntimeEvents: processBumpRuntimeEvents } = require("./bump-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
@@ -327,8 +325,22 @@ function compatibilityEventKey(event) {
   return clean(`${transactionId}:${eventType}`, 220);
 }
 
-function projectTipCompatibilityEvent(row) {
+function projectSaleProjectionFact(row) {
   return {
+    kind: "sale",
+    fanId: row.fanOnlyFansUserIdAtEvent || row.fan?.onlyFansUserId || null,
+    messageId: row.messageId || null,
+    amountCents: row.amountCents,
+    currency: row.currency,
+    occurredAt: row.purchasedAt,
+    purchaseId: row.externalNotificationId || row.externalTransactionId || row.eventFingerprint,
+    eventHash: row.eventFingerprint,
+  };
+}
+
+function projectTipProjectionFact(row) {
+  return {
+    kind: "tip",
     eventType: "tip_received",
     fanId: row.fan?.onlyFansUserId || null,
     fanUsername: row.fan?.username || null,
@@ -347,8 +359,9 @@ function projectTipCompatibilityEvent(row) {
   };
 }
 
-function projectSubscriptionCompatibilityEvent(row) {
+function projectSubscriptionProjectionFact(row) {
   return {
+    kind: "subscription",
     eventType: LEGACY_SUBSCRIPTION_EVENT_TYPES[row.eventType] || String(row.eventType || "").toLowerCase(),
     fanId: row.fan?.onlyFansUserId || null,
     fanUsername: row.fan?.username || null,
@@ -388,42 +401,46 @@ async function* iterateModelRows({ model, where, select }) {
   }
 }
 
-async function* iterateLedgerCompatibilityEvents({ db, job, legacyEvents }) {
-  const seen = new Set();
-  const yieldUnique = function* (events) {
-    for (const event of events) {
-      const key = compatibilityEventKey(event)
-        || stableHashSeed([event?.eventType, event?.fanId, event?.messageId, event?.amountCents, event?.occurredAt]);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      yield event;
-    }
-  };
+async function* iterateCanonicalProjectionFacts({ db, job }) {
+  if (db?.creatorSale?.findMany) {
+    const saleRows = iterateModelRows({
+      model: db.creatorSale,
+      where: { creatorId: job.creatorId, sourceJobId: job.id },
+      select: {
+        eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
+        messageId: true, amountCents: true, currency: true, purchasedAt: true,
+        fanOnlyFansUserIdAtEvent: true,
+        fan: { select: { onlyFansUserId: true } },
+      },
+    });
+    for await (const row of saleRows) yield projectSaleProjectionFact(row);
+  }
 
-  yield* yieldUnique(legacyEvents);
-  if (!db?.creatorTip?.findMany || !db?.creatorSubscriptionEvent?.findMany) return;
+  if (db?.creatorTip?.findMany) {
+    const tipRows = iterateModelRows({
+      model: db.creatorTip,
+      where: { creatorId: job.creatorId, sourceJobId: job.id },
+      select: {
+        eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
+        messageId: true, amountCents: true, currency: true, tippedAt: true,
+        fan: { select: { onlyFansUserId: true, username: true, displayName: true } },
+      },
+    });
+    for await (const row of tipRows) yield projectTipProjectionFact(row);
+  }
 
-  const tipRows = iterateModelRows({
-    model: db.creatorTip,
-    where: { creatorId: job.creatorId, sourceJobId: job.id },
-    select: {
-      eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
-      messageId: true, amountCents: true, currency: true, tippedAt: true,
-      fan: { select: { onlyFansUserId: true, username: true, displayName: true } },
-    },
-  });
-  for await (const row of tipRows) yield* yieldUnique([projectTipCompatibilityEvent(row)]);
-
-  const subscriptionRows = iterateModelRows({
-    model: db.creatorSubscriptionEvent,
-    where: { creatorId: job.creatorId, sourceJobId: job.id },
-    select: {
-      eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
-      eventType: true, observedPriceCents: true, currency: true, occurredAt: true,
-      fan: { select: { onlyFansUserId: true, username: true, displayName: true } },
-    },
-  });
-  for await (const row of subscriptionRows) yield* yieldUnique([projectSubscriptionCompatibilityEvent(row)]);
+  if (db?.creatorSubscriptionEvent?.findMany) {
+    const subscriptionRows = iterateModelRows({
+      model: db.creatorSubscriptionEvent,
+      where: { creatorId: job.creatorId, sourceJobId: job.id },
+      select: {
+        eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
+        eventType: true, observedPriceCents: true, currency: true, occurredAt: true,
+        fan: { select: { onlyFansUserId: true, username: true, displayName: true } },
+      },
+    });
+    for await (const row of subscriptionRows) yield projectSubscriptionProjectionFact(row);
+  }
 }
 
 async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, result }) {
@@ -516,140 +533,79 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, resul
     return dirty;
   };
 
-  for await (const raw of iterateLedgerCompatibilityEvents({ db, job, legacyEvents: events })) {
+  for await (const fact of iterateCanonicalProjectionFacts({ db, job })) {
     summary.compatibilityCandidates += 1;
     summary.compatibilityProcessed += 1;
-    const ev = normalizeEvent(raw);
-    const type = String(ev.type || ev.eventType || "").toLowerCase();
-    const accountId = clean(ev.accountId || params.accountId || job.creatorId || "unknown", 160) || "unknown";
-    const creatorRef = clean(ev.creatorRef || params.creatorRef || null, 160);
     try {
-      if (type.includes("purchase") || type.includes("ppv")) {
-        await upsertPurchaseFromEvent({
-          type: ev.attributedMemberId ? "ppv_purchase_attributed" : "ppv_purchase_unresolved",
-          agencyId: job.agencyId,
-          accountId,
-          creatorId: job.creatorId,
-          creatorRef,
-          fanId: clean(ev.fanId || ev.dialogId, 160),
-          memberId: clean(ev.attributedMemberId, 160),
-          userId: clean(ev.attributedUserId, 160),
-          deviceId,
-          ts: dateOrNull(ev.occurredAt || ev.purchasedAt || ev.ts)?.getTime?.() || Date.now(),
-          localId: clean(ev.localId || ev.purchaseId || ev.notificationId || ev.messageId || null, 220),
-          extra: {
-            // Scanner already canonicalizes purchaseId to match realtime. Keep
-            // notificationId first as a final backend guard for old scanner builds.
-            purchaseId:
-              clean(ev.notificationId || ev.purchaseId || ev.transactionId || ev.localId || null, 220) ||
-              stableHashSeed([accountId, ev.messageId, ev.fanId, ev.amountCents, ev.occurredAt]),
-            notificationId: clean(ev.notificationId, 220),
-            messageId: clean(ev.messageId, 160),
-            dialogId: clean(ev.dialogId || ev.fanId, 160),
-            fanId: clean(ev.fanId || ev.dialogId, 160),
-            amountCents: amountCents(ev.amountCents) || amountDollarsToCents(ev.amount),
-            currency: clean(ev.currency || "USD", 16) || "USD",
-            purchasedAt: dateOrNull(ev.purchasedAt || ev.occurredAt || ev.ts) || now,
-            source: "catchup_notifications_scan",
-            deviceId,
-          },
-        });
-        summary.ppvCreatedOrUpdated += 1;
-        await markTrafficDirty(ev, "catchup_ppv_purchase");
+      if (fact.kind === "sale") {
+        // CreatorSale -> TeamPpvPurchaseLedger already happened inside the
+        // canonical notification transaction. Audit15 permits only typed
+        // non-money side effects here.
+        await markTrafficDirty(fact, "canonical_sale");
         continue;
       }
 
-      if (type.includes("tip")) {
-        const tipResult = await ingestTipEvent({
-          agencyId: job.agencyId,
-          userId,
-          payload: {
-            accountId,
-            creatorId: job.creatorId,
-            creatorRef,
-            fanId: clean(ev.fanId || ev.dialogId, 160),
-            dialogId: clean(ev.dialogId || ev.fanId, 160),
-            messageId: clean(ev.messageId, 160),
-            amountCents: amountCents(ev.amountCents) || amountDollarsToCents(ev.amount),
-            currency: clean(ev.currency || "USD", 8) || "USD",
-            occurredAt: dateOrNull(ev.receivedAt || ev.occurredAt || ev.ts) || now,
-            ts: dateOrNull(ev.receivedAt || ev.occurredAt || ev.ts) || now,
-            eventHash: clean(ev.eventHash, 220),
-            tipId: clean(ev.tipId || ev.notificationId || ev.localId, 220),
-            notificationId: clean(ev.notificationId, 220),
-            toastId: clean(ev.toastId, 220),
-            targetUrl: clean(ev.targetUrl, 500),
-            source: "catchup_notifications_scan",
-          },
-        });
-        if (tipResult?.deduped) summary.deduped += 1;
-        else summary.tipCreatedOrUpdated += 1;
-        await markTrafficDirty(ev, "catchup_tip");
+      if (fact.kind === "tip") {
+        // CreatorTip -> TeamTipLedger already happened inside the canonical
+        // notification transaction. Never project money a second time.
+        await markTrafficDirty(fact, "canonical_tip");
         continue;
       }
 
-      if (type.includes("subscription") || type.includes("subscrib")) {
-        const subscriptionFanId = clean(ev.fanId || ev.dialogId, 160);
-        const subscriptionLifecycleType = String(ev.eventType || type).toLowerCase();
+      if (fact.kind === "subscription") {
+        const subscriptionFanId = clean(fact.fanId, 160);
+        const subscriptionLifecycleType = String(fact.eventType || "").toLowerCase();
         const shouldPlanBump = /(subscribed|resubscribed|renewed)/.test(subscriptionLifecycleType)
           && !/(expired|refund|chargeback|auto.?renew)/.test(subscriptionLifecycleType);
         if (subscriptionFanId && shouldPlanBump) {
           bumpSubscriptionEvents.push({
             type: "subscription_created",
             fanId: subscriptionFanId,
-            dialogId: clean(ev.dialogId || subscriptionFanId, 160) || subscriptionFanId,
-            createdAt: dateOrNull(ev.subscribedAt || ev.occurredAt || ev.ts) || now,
-            source: "catchup_notifications_scan",
+            dialogId: clean(fact.dialogId || subscriptionFanId, 160) || subscriptionFanId,
+            createdAt: dateOrNull(fact.subscribedAt || fact.occurredAt) || now,
+            source: "canonical_subscription_fact",
             fanSnapshot: {
               id: subscriptionFanId,
-              username: clean(ev.fanUsername || ev.username, 120),
-              name: clean(ev.fanName || ev.name, 160),
-              subscriptionType: String(ev.eventType || type).toLowerCase().includes("paid") ? "paid" : "free",
+              username: clean(fact.fanUsername, 120),
+              name: clean(fact.fanName, 160),
+              subscriptionType: subscriptionLifecycleType.includes("paid") ? "paid" : "free",
               isActive: true,
               canReceiveChatMessage: true,
-              dialogId: clean(ev.dialogId || subscriptionFanId, 160) || subscriptionFanId,
+              dialogId: clean(fact.dialogId || subscriptionFanId, 160) || subscriptionFanId,
             },
           });
           if (bumpSubscriptionEvents.length >= BUMP_COMPATIBILITY_PAGE_SIZE) await flushBumpSubscriptionEvents();
         }
         if (/(refund|chargeback|reversal)/.test(subscriptionLifecycleType)) {
-          // The legacy CreatorSubscriptionLedger is positive-revenue only and
-          // its aggregates do not filter eventType. Projecting a refund there
-          // would increase historical subscription revenue. The relational
-          // CreatorSubscriptionEvent remains the authoritative refund record.
           summary.subscriptionRefundIgnored += 1;
           summary.skipped += 1;
           continue;
         }
-        const subscriptionAmountCents = amountCents(ev.amountCents) || amountDollarsToCents(ev.amount || ev.price);
+        const subscriptionAmountCents = amountCents(fact.amountCents);
         if (subscriptionAmountCents <= 0) {
           summary.subscriptionFreeIgnored += 1;
           summary.skipped += 1;
           continue;
         }
-
         const subscriptionResult = await ingestSubscriptionEvent({
           agencyId: job.agencyId,
           deviceId,
           userId,
           creatorId: job.creatorId,
-          accountId,
+          accountId: clean(params.accountId || job.creatorId || "unknown", 160) || "unknown",
           event: {
-            fanId: clean(ev.fanId || ev.dialogId, 160),
-            eventType: clean(ev.eventType || "paid_subscribed", 80) || "paid_subscribed",
+            fanId: subscriptionFanId,
+            eventType: clean(fact.eventType || "paid_subscribed", 80) || "paid_subscribed",
             amountCents: subscriptionAmountCents,
-            amount: ev.amount,
-            price: ev.price,
-            currency: clean(ev.currency || "USD", 8) || "USD",
-            occurredAt: dateOrNull(ev.subscribedAt || ev.occurredAt || ev.ts) || now,
-            externalEventId: clean(ev.externalEventId || ev.notificationId || ev.localId, 220),
-            eventHash: clean(ev.eventHash, 220),
-            notificationId: clean(ev.notificationId, 220),
-            source: "catchup_notifications_scan",
+            currency: clean(fact.currency || "USD", 8) || "USD",
+            occurredAt: dateOrNull(fact.subscribedAt || fact.occurredAt) || now,
+            externalEventId: clean(fact.externalEventId || fact.notificationId || fact.eventHash, 220),
+            eventHash: clean(fact.eventHash, 220),
+            notificationId: clean(fact.notificationId, 220),
+            source: "canonical_subscription_fact",
             metadata: {
-              fanUsername: clean(ev.fanUsername || ev.username, 120),
-              fanName: clean(ev.fanName || ev.name, 160),
-              targetUrl: clean(ev.targetUrl, 500),
+              fanUsername: clean(fact.fanUsername, 120),
+              fanName: clean(fact.fanName, 160),
             },
           },
         });
