@@ -2402,6 +2402,8 @@ model JobInstance {
   leaseUntil        DateTime?
   leaseTokenHash    String?
   leaseRevision     Int       @default(0)
+  leaseMemberId     String?
+  leaseAccessEpoch  Int?
   workId            String?
   continuation      Json?
   progress          Json?
@@ -3551,10 +3553,16 @@ model AutomationDelivery {
   claimUntil          DateTime?
   leaseTokenHash      String?
   leaseRevision       Int      @default(0)
+  leaseMemberId       String?
+  leaseAccessEpoch    Int?
   lastCheckedAt       DateTime?
   attempts            Int      @default(0)
   maxAttempts         Int      @default(5)
   failureCode         String?
+  failureCategory     String?
+  reportedFailureCategory String?
+  writeCommitRevision Int      @default(0)
+  writeCommitAt       DateTime?
   lastError           String?
   messageId           String?
   priceCents          Int      @default(0)

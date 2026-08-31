@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
+const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const {
   getAutomationControlSnapshot,
   assertAutomationEnabled,
@@ -29,7 +30,7 @@ const {
   isSfsCleanupDelivery,
 } = require("./sfs-constants");
 
-const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED", "PAUSED"];
+const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RETRY_SCHEDULED", "PAUSED"];
 const RETRYABLE_FAILURES = new Set(["network_error", "timeout", "rate_limited", "temporary_of_error", "backend_unavailable", "lease_lost", "creator_unavailable", "comment_result_unknown"]);
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
@@ -61,25 +62,21 @@ async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force 
   const bucket = force ? Date.now() : Math.floor(Date.now() / bucketMs);
   const idempotencyKey = `sfs_discovery:${creatorId}:${bucket}`;
   const params = { source, force, requestedByUserId: userId, wallScanPosts: settings.wallScanPosts };
-  let job = await db.jobInstance.findUnique({ where: { idempotencyKey } });
-  if (!job) {
-    try {
-      job = await db.jobInstance.create({ data: {
-        jobKey: SFS_DISCOVERY_JOB_KEY, scope: "creator", agencyId, creatorId, idempotencyKey, params,
-        status: "SCHEDULED", priority, scheduledAt: new Date(), nextRunAt: new Date(),
-      } });
-    } catch (error) {
-      if (error?.code !== "P2002") throw error;
-      job = await db.jobInstance.findUnique({ where: { idempotencyKey } });
-    }
-  } else if (force && !["SCHEDULED", "CLAIMED", "RUNNING"].includes(job.status)) {
-    job = await db.jobInstance.update({ where: { id: job.id }, data: {
-      status: "SCHEDULED", params, priority, scheduledAt: new Date(), nextRunAt: new Date(), claimedAt: null,
-      claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null, continuation: null,
-      progress: null, lastProgressAt: null, completedAt: null, lastError: null, attempts: 0, result: null,
-      leaseRevision: { increment: 1 },
-    } });
-  }
+  const planned = await ensurePlannedJob({
+    db,
+    jobKey: SFS_DISCOVERY_JOB_KEY,
+    scope: "creator",
+    agencyId,
+    creatorId,
+    idempotencyKey,
+    params,
+    priority,
+    scheduledAt: new Date(),
+    nextRunAt: new Date(),
+    shouldResetExisting: (existing) => force && !["SCHEDULED", "CLAIMED", "RUNNING"].includes(existing.status),
+    protectedStatuses: ["CLAIMED", "RUNNING"],
+  });
+  const job = planned.job;
   return { ok: true, created: job?.status === "SCHEDULED", reason: "scheduled", job };
 }
 
@@ -235,17 +232,19 @@ async function scheduleTargetScan({ delivery, candidate, settings, now, db }) {
     commentsMaxPages: settings.commentsMaxPages, commentLikesPerPost: settings.commentLikesPerPost,
     commentLikesEnabled: settings.commentLikesEnabled, commentsEnabled: settings.commentsEnabled,
   };
-  let job;
-  try {
-    job = await db.jobInstance.create({ data: {
-      jobKey: SFS_TARGET_SCAN_JOB_KEY, scope: "creator", agencyId: delivery.agencyId, creatorId: delivery.creatorId,
-      idempotencyKey, params, status: "SCHEDULED", priority: 85, scheduledAt: now, nextRunAt,
-    } });
-  } catch (error) {
-    if (error?.code !== "P2002") throw error;
-    job = await db.jobInstance.findUnique({ where: { idempotencyKey } });
-  }
-  return job;
+  const planned = await createPlannedJobIfAbsent({
+    db,
+    jobKey: SFS_TARGET_SCAN_JOB_KEY,
+    scope: "creator",
+    agencyId: delivery.agencyId,
+    creatorId: delivery.creatorId,
+    idempotencyKey,
+    params,
+    priority: 85,
+    scheduledAt: now,
+    nextRunAt,
+  });
+  return planned.job;
 }
 
 async function createSafetyUnfollow({ delivery, candidate, settings, now, db }) {
@@ -473,7 +472,7 @@ async function listSfs({ agencyId, creatorId, search = "", state = null, offset 
       db.sfsTargetCandidate.count({ where: { agencyId, creatorId, usedForever: true } }),
       db.sfsTargetCandidate.count({ where: { agencyId, creatorId, state: "RECOVERY_REQUIRED" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, status: "QUEUED" } }),
-      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, status: { in: ["CLAIMED", "RUNNING"] } } }),
+      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, status: { in: ["CLAIMED", "RUNNING", "COMMITTING"] } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_COMMENT_POST_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: today } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_LIKE_COMMENT_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: today } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: today } } }),

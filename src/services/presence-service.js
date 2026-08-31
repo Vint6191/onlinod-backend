@@ -111,15 +111,15 @@ function snapshotFreshness(snapshot) {
   };
 }
 
-async function assertCreatorAccess({ agencyId, creatorId }) {
-  return prisma.creatorAccount.findFirst({
+async function assertCreatorAccess({ agencyId, creatorId, db = prisma }) {
+  return db.creatorAccount.findFirst({
     where: { id: creatorId, agencyId, deletedAt: null },
     select: { id: true, agencyId: true, displayName: true, username: true, remoteId: true },
   });
 }
 
-async function recomputeSnapshotCounts({ agencyId, creatorId, capturedAt = new Date(), source = "backend", deviceId = null, metadata = {} }) {
-  const onlineCount = await prisma.creatorPresenceUser.count({ where: { agencyId, creatorId, status: "online" } });
+async function recomputeSnapshotCounts({ agencyId, creatorId, capturedAt = new Date(), source = "backend", deviceId = null, metadata = {}, db = prisma }) {
+  const onlineCount = await db.creatorPresenceUser.count({ where: { agencyId, creatorId, status: "online" } });
   // v5: no stale/offline rows are kept in the online-users module. Fields remain
   // for DB/API compatibility, but they are always zeroed by recompute.
   const staleCount = 0;
@@ -130,7 +130,7 @@ async function recomputeSnapshotCounts({ agencyId, creatorId, capturedAt = new D
   const status = progressive && !done ? "REFRESHING" : (onlineCount ? "FRESH" : "EMPTY");
   const expiresAt = new Date(capturedAt.getTime() + SNAPSHOT_TTL_MS);
 
-  return prisma.creatorPresenceSnapshot.upsert({
+  return db.creatorPresenceSnapshot.upsert({
     where: { agencyId_creatorId: { agencyId, creatorId } },
     create: {
       agencyId,
@@ -159,7 +159,7 @@ async function recomputeSnapshotCounts({ agencyId, creatorId, capturedAt = new D
   });
 }
 
-async function upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, source, metadata = {} }) {
+async function upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, source, metadata = {}, db = prisma }) {
   const normalized = [];
   const seenIds = new Set();
 
@@ -171,7 +171,7 @@ async function upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, so
   }
 
   for (const row of normalized) {
-    await prisma.creatorPresenceUser.upsert({
+    await db.creatorPresenceUser.upsert({
       where: { creatorId_fanId: { creatorId, fanId: row.fanId } },
       create: {
         agencyId,
@@ -214,16 +214,16 @@ async function upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, so
   return { normalized, seenIds };
 }
 
-async function applyPresenceSnapshot({ agencyId, creatorId, deviceId = null, users = [], capturedAt = new Date(), source = "api_snapshot", metadata = {}, markAbsentOffline = true }) {
-  const creator = await assertCreatorAccess({ agencyId, creatorId });
+async function applyPresenceSnapshot({ agencyId, creatorId, deviceId = null, users = [], capturedAt = new Date(), source = "api_snapshot", metadata = {}, markAbsentOffline = true, db = prisma }) {
+  const creator = await assertCreatorAccess({ agencyId, creatorId, db });
   if (!creator) return { ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" };
 
   const at = toDate(capturedAt, new Date());
-  const { normalized, seenIds } = await upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, source, metadata });
+  const { normalized, seenIds } = await upsertPresenceRows({ agencyId, creatorId, deviceId, users, at, source, metadata, db });
 
   let removedAbsent = 0;
   if (markAbsentOffline) {
-    const deleted = await prisma.creatorPresenceUser.deleteMany({
+    const deleted = await db.creatorPresenceUser.deleteMany({
       where: {
         agencyId,
         creatorId,
@@ -233,7 +233,7 @@ async function applyPresenceSnapshot({ agencyId, creatorId, deviceId = null, use
     removedAbsent = deleted.count;
   }
 
-  const snapshot = await recomputeSnapshotCounts({ agencyId, creatorId, capturedAt: at, source, deviceId, metadata: { ...metadata, loaded: normalized.length, removedAbsent } });
+  const snapshot = await recomputeSnapshotCounts({ agencyId, creatorId, capturedAt: at, source, deviceId, metadata: { ...metadata, loaded: normalized.length, removedAbsent }, db });
   return { ok: true, creator, snapshot, loaded: normalized.length, removedAbsent, markedOffline: 0 };
 }
 
@@ -412,13 +412,13 @@ async function listPresence({ agencyId, creatorId, status = "visible", limit = 5
   return { ok: true, creator, snapshot, freshness, users: users.map(serializeUser) };
 }
 
-async function applyPresenceJobResult({ job, deviceId, result }) {
+async function applyPresenceJobResult({ job, deviceId, result, db = prisma }) {
   if (!job?.creatorId || !job?.agencyId) return { ok: false, code: "JOB_SCOPE_INVALID" };
 
   if (result?.progressive === true || result?.reportOnly === true) {
     // Progressive pages were already written through /presence/:creatorId/snapshot.
     // Job report is only an acknowledgement; do not overwrite rows with users: [].
-    const snapshot = await prisma.creatorPresenceSnapshot.findUnique({
+    const snapshot = await db.creatorPresenceSnapshot.findUnique({
       where: { agencyId_creatorId: { agencyId: job.agencyId, creatorId: job.creatorId } },
     });
 
@@ -441,6 +441,7 @@ async function applyPresenceJobResult({ job, deviceId, result }) {
     source: "scheduled_api_snapshot",
     metadata: { jobId: job.id, pages: result?.pages || null, reason: result?.reason || null },
     markAbsentOffline: true,
+    db,
   });
 }
 

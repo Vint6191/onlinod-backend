@@ -33,7 +33,7 @@ function databaseFixture(accessCalls) {
   };
 }
 
-async function started(service, deviceId, permitId) {
+async function started(service, deviceId, permitId, capability = "read") {
   return service.acknowledgeOfRequestStarted({
     userId: "user-1",
     agencyId: "agency-1",
@@ -41,6 +41,7 @@ async function started(service, deviceId, permitId) {
     deviceId,
     creatorId: "creator-1",
     permitId,
+    capability,
   });
 }
 
@@ -51,11 +52,11 @@ test("global OF gate prioritizes writes and spaces actual starts by 700ms withou
 
   const backgroundPromise = service.acquireOfRequestSlot({
     userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-background", creatorId: "creator-1",
-    priority: "background", operation: "dialog.scan", timeoutMs: 5_000,
+    priority: "background", operation: "dialog.scan", capability: "read", timeoutMs: 5_000,
   });
   const writePromise = service.acquireOfRequestSlot({
     userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-write", creatorId: "creator-1",
-    priority: "critical_write", operation: "bump.send", timeoutMs: 5_000,
+    priority: "critical_write", operation: "bump.send", capability: "write", timeoutMs: 5_000,
   });
 
   const writePermit = await writePromise;
@@ -64,7 +65,7 @@ test("global OF gate prioritizes writes and spaces actual starts by 700ms withou
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(backgroundResolved, false, "next permit must wait until previous transport-start acknowledgement");
 
-  const firstStart = await started(service, "device-write", writePermit.permitId);
+  const firstStart = await started(service, "device-write", writePermit.permitId, "write");
   const backgroundPermit = await backgroundPromise;
   const secondStart = await started(service, "device-background", backgroundPermit.permitId);
 
@@ -82,16 +83,16 @@ test("gate rechecks member creator access while caching only device capability v
 
   const permitOne = await service.acquireOfRequestSlot({
     userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-1", creatorId: "creator-1",
-    priority: "normal", operation: "one", timeoutMs: 5_000,
+    priority: "normal", operation: "one", capability: "read", timeoutMs: 5_000,
   });
   await started(service, "device-1", permitOne.permitId);
 
   const permitTwo = await service.acquireOfRequestSlot({
     userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-1", creatorId: "creator-1",
-    priority: "normal", operation: "two", timeoutMs: 5_000,
+    priority: "normal", operation: "two", capability: "read", timeoutMs: 5_000,
   });
   await service.cancelOfRequestPermit({
-    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-1", creatorId: "creator-1", permitId: permitTwo.permitId,
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-1", creatorId: "creator-1", permitId: permitTwo.permitId, capability: "read",
   });
 
   assert.deepEqual(accessCalls, { device: 1, creator: 4, binding: 1 });
@@ -111,9 +112,45 @@ test("gate rejects an in-agency creator that the current member is not assigned"
       creatorId: "creator-1",
       priority: "normal",
       operation: "forbidden",
+      capability: "read",
       timeoutMs: 5_000,
     }),
     (error) => error?.code === "CREATOR_ACCESS_FORBIDDEN" && error?.status === 403,
   );
   assert.deepEqual(accessCalls, { device: 0, creator: 1, binding: 0 });
+});
+
+
+test("read capability cache cannot authorize a later write capability", async () => {
+  const accessCalls = { device: 0, creator: 0, binding: 0 };
+  const db = databaseFixture(accessCalls);
+  db.deviceCreatorBinding.findFirst = async ({ where }) => {
+    accessCalls.binding += 1;
+    if (where.sessionWriteReady === true) return null;
+    return { id: "binding-read" };
+  };
+  const service = loadService({ db });
+  service._test.reset();
+  const readPermit = await service.acquireOfRequestSlot({
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" },
+    deviceId: "device-1", creatorId: "creator-1", priority: "normal", operation: "read", capability: "read", timeoutMs: 5_000,
+  });
+  await started(service, "device-1", readPermit.permitId, "read");
+  await assert.rejects(() => service.acquireOfRequestSlot({
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" },
+    deviceId: "device-1", creatorId: "creator-1", priority: "critical_write", operation: "write", capability: "write", timeoutMs: 5_000,
+  }), (error) => error?.code === "OF_GATE_CREATOR_CONTEXT_MISSING");
+  assert.equal(accessCalls.binding, 2);
+});
+
+test("security probe is globally paced without requiring pre-existing read readiness", async () => {
+  const accessCalls = { device: 0, creator: 0, binding: 0 };
+  const service = loadService({ db: databaseFixture(accessCalls) });
+  service._test.reset();
+  const permit = await service.acquireOfRequestSlot({
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" },
+    deviceId: "device-1", creatorId: "creator-1", priority: "interactive", operation: "identity.bootstrap.me", capability: "security_probe", timeoutMs: 5_000,
+  });
+  await started(service, "device-1", permit.permitId, "security_probe");
+  assert.equal(accessCalls.binding, 0);
 });

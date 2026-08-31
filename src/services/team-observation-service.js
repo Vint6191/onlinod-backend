@@ -746,11 +746,11 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, resul
   return { ok: sourceTraversalComplete || fullySuccessful, verified: fullySuccessful, sourceTraversalComplete, summary };
 }
 
-async function recordCatchupJobFailure({ job, error }) {
+async function recordCatchupJobFailure({ job, error, db = prisma }) {
   if (!job?.agencyId || !job?.creatorId) return null;
   const params = job.params && typeof job.params === "object" ? job.params : {};
-  await recordNotificationSyncFailure({ db: prisma, job, error }).catch(() => null);
-  return prisma.teamObservationState.upsert({
+  await recordNotificationSyncFailure({ db, job, error }).catch(() => null);
+  return db.teamObservationState.upsert({
     where: { agencyId_creatorId: { agencyId: job.agencyId, creatorId: job.creatorId } },
     create: {
       agencyId: job.agencyId,

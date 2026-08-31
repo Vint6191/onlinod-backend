@@ -36,7 +36,7 @@ const { ensureAutomaticFollowAutomation } = require("./follow-automation-service
 const { ensureAutomaticSfs } = require("./sfs-service");
 const { reconcileExpiredBillingStates } = require("./billing-entitlement-service");
 const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
-const { publishDesktopControlEvent } = require("./desktop-control-events");
+const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 
 // Range keys we proactively keep fresh for owner dashboards.
 // Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
@@ -55,21 +55,6 @@ const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin settin
 const TEAM_MONEY_BACKFILL_BATCH_SIZE = 250; // DB-only historical reconciliation, no OF requests
 const TEAM_PENDING_BACKFILL_BATCH_SIZE = 500; // DB-only Team queue projection repair
 let lastRetentionSweepAt = 0;
-
-function publishJobAvailable({ agencyId, creatorId = null, jobId, jobKind }) {
-  if (!agencyId || !jobId) return;
-  try {
-    publishDesktopControlEvent({
-      type: "JOB_AVAILABLE",
-      agencyId,
-      creatorId,
-      jobId,
-      jobKind,
-    });
-  } catch (error) {
-    console.error("[scheduler/control-job-available] failed:", error);
-  }
-}
 
 
 async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) {
@@ -321,29 +306,21 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
     return { created: false, reason: "recently_done", jobId: recentlyDone.id };
   }
 
-  // Create without relying on an expected unique-constraint exception for the
-  // multi-process race. `skipDuplicates` maps to ON CONFLICT DO NOTHING on
-  // PostgreSQL, so a legitimate race stays silent in Prisma logs.
-  const inserted = await prisma.jobInstance.createMany({
-    data: [{
-      jobKey,
-      scope: "creator",
-      creatorId,
-      agencyId,
-      idempotencyKey,
-      params: params || {},
-      priority,
-      scheduledAt: now,
-      nextRunAt: now,
-    }],
-    skipDuplicates: true,
+  const planned = await createPlannedJobIfAbsent({
+    db: prisma,
+    jobKey,
+    scope: "creator",
+    creatorId,
+    agencyId,
+    idempotencyKey,
+    params: params || {},
+    priority,
+    scheduledAt: now,
+    nextRunAt: now,
   });
-  const stored = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
-  if (inserted.count > 0) {
-    if (stored?.id) publishJobAvailable({ agencyId, creatorId, jobId: stored.id, jobKind: jobKey });
-    return { created: true, jobId: stored?.id || null };
-  }
-  return { created: false, reason: "idempotency_race", jobId: stored?.id || null };
+  return planned.created
+    ? { created: true, jobId: planned.job?.id || null }
+    : { created: false, reason: "idempotency_race", jobId: planned.job?.id || null };
 }
 
 async function scheduleJobNow({
@@ -365,66 +342,26 @@ async function scheduleJobNow({
     bucketMs,
   });
 
-  for (let race = 0; race < 3; race += 1) {
-    const existing = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
-    if (existing) {
-      if (existing.status === "CLAIMED") {
-        return { job: existing, created: false, reason: "already_claimed" };
-      }
-      const reset = await prisma.jobInstance.updateMany({
-        where: { id: existing.id, status: { not: "CLAIMED" } },
-        data: {
-          status: "SCHEDULED",
-          params,
-          priority,
-          scheduledAt: now,
-          nextRunAt: now,
-          claimedAt: null,
-          claimedByDeviceId: null,
-          leaseUntil: null,
-          leaseTokenHash: null,
-          workId: null,
-          continuation: null,
-          progress: null,
-          lastProgressAt: null,
-          completedAt: null,
-          lastError: null,
-          attempts: 0,
-          result: null,
-        },
-      });
-      if (!reset.count) continue;
-      const job = await prisma.jobInstance.findUnique({ where: { id: existing.id } });
-      if (job?.id) publishJobAvailable({ agencyId, creatorId, jobId: job.id, jobKind: jobKey });
-      return { job, created: false, reason: "rescheduled" };
-    }
-
-    const inserted = await prisma.jobInstance.createMany({
-      data: [{
-        jobKey,
-        scope: "creator",
-        creatorId,
-        agencyId,
-        idempotencyKey,
-        params,
-        status: "SCHEDULED",
-        priority,
-        scheduledAt: now,
-        nextRunAt: now,
-      }],
-      skipDuplicates: true,
-    });
-    if (inserted.count > 0) {
-      const job = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
-      if (!job) throw new Error(`Failed to read newly scheduled ${jobKey}`);
-      publishJobAvailable({ agencyId, creatorId, jobId: job.id, jobKind: jobKey });
-      return { job, created: true, reason: "created" };
-    }
-  }
-
-  const job = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
-  if (!job) throw new Error(`Failed to schedule ${jobKey}: idempotency race did not converge`);
-  return { job, created: false, reason: job.status === "CLAIMED" ? "already_claimed" : "race_reused" };
+  const planned = await ensurePlannedJob({
+    db: prisma,
+    jobKey,
+    scope: "creator",
+    creatorId,
+    agencyId,
+    idempotencyKey,
+    params,
+    priority,
+    scheduledAt: now,
+    nextRunAt: now,
+    shouldResetExisting: (existing) => existing.status !== "CLAIMED",
+    protectedStatuses: ["CLAIMED"],
+  });
+  if (!planned.job) throw new Error(`Failed to schedule ${jobKey}: planning race did not converge`);
+  return {
+    job: planned.job,
+    created: planned.created,
+    reason: planned.created ? "created" : planned.rescheduled ? "rescheduled" : planned.reason,
+  };
 }
 
 

@@ -6,6 +6,7 @@ const prisma = require("../prisma");
 const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 const { automationCreatorParamRequired } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
+const { createPlannedJob, publishPlannedJobAvailable } = require("../services/job-planning-repository");
 const {
   DIALOG_INTELLIGENCE_JOB_KEY,
   DIALOG_CONTROL_TRANSACTION_OPTIONS,
@@ -173,7 +174,8 @@ async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
 }
 
 async function resumeCreatorRuns({ agencyId, creatorId }) {
-  return prisma.$transaction(async (tx) => {
+  let plannedJob = null;
+  const result = await prisma.$transaction(async (tx) => {
     const pausedRuns = await tx.dialogScanRun.findMany({
       where: { agencyId, creatorId, status: "PAUSED" },
       orderBy: [{ generation: "desc" }, { updatedAt: "asc" }],
@@ -292,27 +294,27 @@ async function resumeCreatorRuns({ agencyId, creatorId }) {
     const oldJob = selectedDiscovery.jobId
       ? await tx.jobInstance.findUnique({ where: { id: selectedDiscovery.jobId } })
       : null;
-    const job = await tx.jobInstance.create({
-      data: {
-        jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
-        scope: "creator",
-        creatorId: selectedDiscovery.creatorId,
-        agencyId: selectedDiscovery.agencyId,
-        idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${selectedDiscovery.id}:${Date.now()}`,
-        params: {
-          ...((oldJob?.params && typeof oldJob.params === "object") ? oldJob.params : {}),
-          scanRunId: selectedDiscovery.id,
-          dialogId: "__dialog_discovery__",
-          mode: "discovery",
-        },
-        continuation: oldJob?.continuation || selectedDiscovery.continuation || null,
-        progress: oldJob?.progress || selectedDiscovery.progress || null,
-        status: "SCHEDULED",
-        priority: oldJob?.priority || 70,
-        scheduledAt: now,
-        nextRunAt: now,
+    const job = await createPlannedJob({
+      db: tx,
+      publish: false,
+      jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
+      scope: "creator",
+      creatorId: selectedDiscovery.creatorId,
+      agencyId: selectedDiscovery.agencyId,
+      idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${selectedDiscovery.id}:${Date.now()}`,
+      params: {
+        ...((oldJob?.params && typeof oldJob.params === "object") ? oldJob.params : {}),
+        scanRunId: selectedDiscovery.id,
+        dialogId: "__dialog_discovery__",
+        mode: "discovery",
       },
+      continuation: oldJob?.continuation || selectedDiscovery.continuation || null,
+      progress: oldJob?.progress || selectedDiscovery.progress || null,
+      priority: oldJob?.priority || 70,
+      scheduledAt: now,
+      nextRunAt: now,
     });
+    plannedJob = job;
     await tx.dialogScanRun.update({
       where: { id: selectedDiscovery.id },
       data: { status: "QUEUED", jobId: job.id, pausedAt: null, completedAt: null, lastError: null },
@@ -333,6 +335,8 @@ async function resumeCreatorRuns({ agencyId, creatorId }) {
       }],
     };
   }, DIALOG_CONTROL_TRANSACTION_OPTIONS);
+  if (plannedJob) publishPlannedJobAvailable(plannedJob);
+  return result;
 }
 
 router.post("/creators/:creatorId/scans", async (req, res) => {

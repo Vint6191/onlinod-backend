@@ -63,6 +63,10 @@ function fakeDb(options = {}) {
     },
     jobInstance: {
       findUnique: async ({ where } = {}) => {
+        const updated = calls.jobsUpdated.slice().reverse().find((item) => item.row?.id === where?.id)?.row;
+        if (updated) return updated;
+        const created = calls.jobsCreated.find((item) => item.id === where?.id);
+        if (created) return created;
         if (failedJob && where?.id === failedJob.id) return failedJob;
         return activeJob;
       },
@@ -75,6 +79,17 @@ function fakeDb(options = {}) {
         const row = { ...(activeJob || calls.jobsCreated.find((item) => item.id === where.id) || { id: where.id }), ...data };
         calls.jobsUpdated.push({ where, data, row });
         return row;
+      },
+      updateMany: async ({ where, data }) => {
+        const current = calls.jobsUpdated.slice().reverse().find((item) => item.row?.id === where.id)?.row
+          || activeJob
+          || calls.jobsCreated.find((item) => item.id === where.id)
+          || { id: where.id };
+        if (where.status && current.status !== where.status) return { count: 0 };
+        if (where.leaseRevision !== undefined && Number(current.leaseRevision || 0) !== Number(where.leaseRevision)) return { count: 0 };
+        const row = { ...current, ...data };
+        calls.jobsUpdated.push({ where, data, row });
+        return { count: 1 };
       },
     },
   };

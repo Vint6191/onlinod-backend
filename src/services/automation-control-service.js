@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { lockAutomationWriteCommitFence, runDbTransaction } = require("./automation-write-commit-fence-service");
 
 const FOLLOW_BACK_MODULE_KEY = "follow_back";
 const BUMPS_MODULE_KEY = "bumps";
@@ -323,43 +324,70 @@ async function getAutomationControlSnapshot({ agencyId, creatorId, db = prisma }
   };
 }
 
+
+async function projectControlDeliveryState(db, delivery, status, failureCode = null) {
+  if (!delivery) return;
+  const staleFence = { OR: [{ latestDeliveryId: null }, { latestDeliveryId: delivery.id }] };
+  if (delivery.moduleKey === FOLLOW_BACK_MODULE_KEY) {
+    await db.followBackCandidate.updateMany({
+      where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId || delivery.fanId, ...staleFence },
+      data: { state: status, latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode },
+    });
+  }
+  if (delivery.moduleKey === LIKES_MODULE_KEY) {
+    const contentId = delivery.targetId || (delivery.payload && typeof delivery.payload === "object" ? delivery.payload.postId : null);
+    if (contentId) await db.automationContentCandidate.updateMany({
+      where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, contentType: "post", contentId: String(contentId), ...staleFence },
+      data: { state: status, latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode },
+    });
+  }
+  if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
+    const fanId = delivery.targetId || delivery.fanId;
+    if (fanId) await db.followAutomationCandidate.updateMany({
+      where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId, ...staleFence },
+      data: { latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode },
+    });
+  }
+  if (delivery.moduleKey === SFS_MODULE_KEY) {
+    const candidateId = delivery.payload && typeof delivery.payload === "object" ? delivery.payload.candidateId : null;
+    if (candidateId) await db.sfsTargetCandidate.updateMany({
+      where: { id: String(candidateId), agencyId: delivery.agencyId, creatorId: delivery.creatorId, ...staleFence },
+      data: { latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode },
+    });
+  }
+}
+
 async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey = null, reason, failureCode, db = prisma }) {
   const now = new Date();
-  const updated = await db.automationDelivery.updateMany({
+  const rows = await db.automationDelivery.findMany({
     where: {
-      agencyId,
-      status: { in: ACTIVE_DELIVERY_STATUSES },
-      ...(creatorId ? { creatorId } : {}),
-      ...(moduleKey ? { moduleKey } : {}),
+      agencyId, status: { in: ACTIVE_DELIVERY_STATUSES }, ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}),
       AND: [
-        // A RUNNING unfollow may already have changed OF state. Let it report completion
-        // so the compensating FOLLOW_FAN step can be created atomically.
         { NOT: { moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: UNFOLLOW_FAN_ACTION_TYPE, status: "RUNNING" } },
-        // Disabling only the follow module must not strand an already-started saga.
-        // Workspace/creator disable still pauses every write, including recovery.
-        ...(moduleKey === FOLLOW_AUTOMATION_MODULE_KEY
-          ? [{ NOT: { moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE } }]
-          : []),
-        // SFS_UNFOLLOW_TARGET is a safety cleanup after a temporary follow.
-        // Module-only disable must not strand the creator following the target.
-        ...(moduleKey === SFS_MODULE_KEY
-          ? [{ NOT: { moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE } }]
-          : []),
+        ...(moduleKey === FOLLOW_AUTOMATION_MODULE_KEY ? [{ NOT: { moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE } }] : []),
+        ...(moduleKey === SFS_MODULE_KEY ? [{ NOT: { moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE } }] : []),
       ],
     },
-    data: {
-      status: "PAUSED",
-      failureCode,
-      lastError: reason,
-      claimedByDeviceId: null,
-      claimedAt: null,
-      claimUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-      lastCheckedAt: now,
-    },
+    take: 10000,
   });
-  return updated.count;
+  let changed = 0;
+  for (const row of rows) {
+    const applied = await runDbTransaction(db, async (tx) => {
+      const updated = await tx.automationDelivery.updateMany({
+        where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision },
+        data: {
+          status: "PAUSED", failureCode, lastError: reason, claimedByDeviceId: null, claimedAt: null,
+          claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, lastCheckedAt: now,
+        },
+      });
+      if (!updated.count) return false;
+      const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
+      await projectControlDeliveryState(tx, current, "PAUSED", failureCode);
+      return true;
+    });
+    if (applied) changed += 1;
+  }
+  return changed;
 }
 
 function effectiveModuleEnabled(snapshot, moduleKey) {
@@ -373,91 +401,71 @@ function effectiveModuleEnabled(snapshot, moduleKey) {
 
 async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKey = null, db = prisma }) {
   const enabled = new Map();
-  let cursorId = null;
+  const rows = await db.automationDelivery.findMany({
+    where: { agencyId, status: "PAUSED", ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}) },
+    orderBy: { id: "asc" }, take: 10000,
+  });
   let resumed = 0;
-  for (;;) {
-    const rows = await db.automationDelivery.findMany({
-      where: {
-        agencyId,
-        status: "PAUSED",
-        ...(creatorId ? { creatorId } : {}),
-        ...(moduleKey ? { moduleKey } : {}),
-      },
-      select: { id: true, creatorId: true, moduleKey: true },
-      orderBy: { id: "asc" },
-      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
-      take: 1000,
+  for (const row of rows) {
+    const key = `${row.creatorId}:${row.moduleKey}`;
+    if (!enabled.has(key)) {
+      try { const snapshot = await getAutomationControlSnapshot({ agencyId, creatorId: row.creatorId, db }); enabled.set(key, effectiveModuleEnabled(snapshot, row.moduleKey)); }
+      catch { enabled.set(key, false); }
+    }
+    if (!enabled.get(key)) continue;
+    const applied = await runDbTransaction(db, async (tx) => {
+      const updated = await tx.automationDelivery.updateMany({ where: { id: row.id, status: "PAUSED", leaseRevision: row.leaseRevision }, data: { status: "QUEUED", failureCode: null, lastError: null, lastCheckedAt: new Date() } });
+      if (!updated.count) return false;
+      const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
+      await projectControlDeliveryState(tx, current, "QUEUED", null);
+      return true;
     });
-    if (!rows.length) break;
-
-    const resumableIds = [];
-    for (const row of rows) {
-      const key = `${row.creatorId}:${row.moduleKey}`;
-      if (!enabled.has(key)) {
-        try {
-          const snapshot = await getAutomationControlSnapshot({ agencyId, creatorId: row.creatorId, db });
-          enabled.set(key, effectiveModuleEnabled(snapshot, row.moduleKey));
-        } catch {
-          enabled.set(key, false);
-        }
-      }
-      if (enabled.get(key)) resumableIds.push(row.id);
-    }
-    if (resumableIds.length) {
-      const now = new Date();
-      const updated = await db.automationDelivery.updateMany({
-        where: { id: { in: resumableIds }, status: "PAUSED" },
-        data: {
-          status: "QUEUED",
-          failureCode: null,
-          lastError: null,
-          // Preserve the original server schedule. Future DELETE_MESSAGE actions
-          // must not become immediately due merely because Automation resumed.
-          lastCheckedAt: now,
-        },
-      });
-      resumed += updated.count;
-    }
-    cursorId = rows[rows.length - 1].id;
-    if (rows.length < 1000) break;
+    if (applied) resumed += 1;
   }
   return resumed;
 }
 
 async function cancelAutomationJobsForControl({ agencyId, creatorId = null, moduleKey = null, reason, failureCode, db = prisma }) {
-  const jobKeys = moduleKey === LIKES_MODULE_KEY
-    ? [LIKES_DISCOVERY_JOB_KEY]
-    : moduleKey === SFS_MODULE_KEY
-      ? [SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY]
-      : moduleKey
-        ? []
-        : [LIKES_DISCOVERY_JOB_KEY, SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY];
+  // Keep the domain failure projector off the module-load path. Automation control
+  // settings are imported by lightweight planning/tests that do not bootstrap Prisma.
+  const { recordJobFailure } = require("./job-result-service");
+  const jobKeys = moduleKey === LIKES_MODULE_KEY ? [LIKES_DISCOVERY_JOB_KEY]
+    : moduleKey === SFS_MODULE_KEY ? [SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY]
+      : moduleKey ? [] : [LIKES_DISCOVERY_JOB_KEY, SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY];
   if (!jobKeys.length) return 0;
-  const now = new Date();
-  const changed = await db.jobInstance.updateMany({
-    where: {
-      agencyId,
-      ...(creatorId ? { creatorId } : {}),
-      jobKey: { in: jobKeys },
-      status: { in: ["SCHEDULED", "CLAIMED", "RUNNING"] },
-    },
-    data: {
-      status: "CANCELED",
-      claimedAt: null,
-      claimedByDeviceId: null,
-      leaseUntil: null,
-      leaseTokenHash: null,
-      workId: null,
-      leaseRevision: { increment: 1 },
-      completedAt: now,
-      lastError: reason,
-      result: { controlFailureCode: failureCode, canceledAt: now.toISOString() },
-    },
+  const rows = await db.jobInstance.findMany({
+    where: { agencyId, ...(creatorId ? { creatorId } : {}), jobKey: { in: jobKeys }, status: { in: ["SCHEDULED", "CLAIMED"] } },
+    take: 10000,
   });
-  return changed.count;
+  const now = new Date();
+  let changed = 0;
+  for (const job of rows) {
+    const applied = await runDbTransaction(db, async (tx) => {
+      const updated = await tx.jobInstance.updateMany({
+        where: { id: job.id, status: job.status, leaseRevision: job.leaseRevision },
+        data: {
+          status: "CANCELLED", claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null,
+          leaseRevision: { increment: 1 }, completedAt: now, lastError: reason,
+          result: { controlFailureCode: failureCode, canceledAt: now.toISOString() },
+        },
+      });
+      if (!updated.count) return false;
+      await recordJobFailure({ db: tx, job, error: reason || failureCode || "control_cancelled", terminal: true });
+      return true;
+    });
+    if (applied) changed += 1;
+  }
+  return changed;
 }
 
-async function setAutomationControl({ agencyId, userId, scope, creatorId = null, moduleKey = null, enabled, settings, db = prisma }) {
+async function setAutomationControl({ agencyId, userId, scope, creatorId = null, moduleKey = null, enabled, settings, db = prisma, _commitFenceHeld = false }) {
+  if (!_commitFenceHeld && typeof db.$transaction === "function") {
+    return db.$transaction((tx) => setAutomationControl({
+      agencyId, userId, scope, creatorId, moduleKey, enabled, settings, db: tx, _commitFenceHeld: true,
+    }), { timeout: 30_000 });
+  }
+  await lockAutomationWriteCommitFence({ db, agencyId });
+
   const normalizedScope = clean(scope, 40);
   if (!normalizedScope || !["workspace", "creator", "module"].includes(normalizedScope)) {
     throw Object.assign(new Error("Invalid automation control scope"), { code: "INVALID_CONTROL_SCOPE", status: 400 });

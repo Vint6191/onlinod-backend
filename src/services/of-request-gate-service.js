@@ -95,14 +95,14 @@ function takeNext(lane) {
   }
   return null;
 }
-function accessKey(userId, deviceId, creatorId) { return `${userId}:${deviceId}:${creatorId}`; }
+function accessKey(userId, deviceId, creatorId, capability) { return `${userId}:${deviceId}:${creatorId}:${capability}`; }
 function pruneAccessCache(now = Date.now()) {
   if (accessCache.size < 2_000) return;
   for (const [key, value] of accessCache) if (value.expiresAt <= now) accessCache.delete(key);
   while (accessCache.size > 2_000) accessCache.delete(accessCache.keys().next().value);
 }
 
-async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId }) {
+async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId, capability = "read" }) {
   // Access is server-authoritative and intentionally checked on every request.
   // DeviceCreatorBinding is capability telemetry only and can never grant creator access.
   const creator = await requireCreatorAccess({ agencyId, member, creatorId, db: prisma });
@@ -112,7 +112,8 @@ async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId
     error.status = 409;
     throw error;
   }
-  const key = accessKey(userId, deviceId, creatorId);
+  const normalizedCapability = ["security_probe", "read", "write"].includes(capability) ? capability : "read";
+  const key = accessKey(userId, deviceId, creatorId, normalizedCapability);
   const nowMs = Date.now();
   const cached = accessCache.get(key);
   if (cached && cached.expiresAt > nowMs) return cached.value;
@@ -127,23 +128,25 @@ async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId
     error.status = 403;
     throw error;
   }
-  const freshAfter = new Date(nowMs - 5 * 60_000);
-  const binding = await prisma.deviceCreatorBinding.findFirst({
-    where: {
-      agencyId: device.agencyId,
-      deviceId: device.id,
-      creatorId,
-      status: "ACTIVE",
-      sessionReadReady: true,
-      lastSeenAt: { gte: freshAfter },
-    },
-    select: { id: true },
-  });
-  if (!binding) {
-    const error = new Error("Device has no fresh SESSION_READ capability for creator");
-    error.code = "OF_GATE_CREATOR_CONTEXT_MISSING";
-    error.status = 409;
-    throw error;
+  if (normalizedCapability !== "security_probe") {
+    const freshAfter = new Date(nowMs - 5 * 60_000);
+    const binding = await prisma.deviceCreatorBinding.findFirst({
+      where: {
+        agencyId: device.agencyId,
+        deviceId: device.id,
+        creatorId,
+        status: "ACTIVE",
+        ...(normalizedCapability === "write" ? { sessionWriteReady: true } : { sessionReadReady: true }),
+        lastSeenAt: { gte: freshAfter },
+      },
+      select: { id: true },
+    });
+    if (!binding) {
+      const error = new Error(`Device has no fresh ${normalizedCapability === "write" ? "SESSION_WRITE" : "SESSION_READ"} capability for creator`);
+      error.code = "OF_GATE_CREATOR_CONTEXT_MISSING";
+      error.status = 409;
+      throw error;
+    }
   }
   const value = { agencyId: device.agencyId, deviceId: device.id };
   pruneAccessCache(nowMs);
@@ -223,6 +226,7 @@ function pump(lane) {
         priority: entry.priority,
         operation: entry.operation,
         source: entry.source,
+        capability: entry.capability,
         intervalMs: entry.intervalMs,
         grantedAt: Date.now(),
         expiryTimer: null,
@@ -239,6 +243,7 @@ function pump(lane) {
         expiresAt: new Date(permit.grantedAt + PERMIT_TTL_MS).toISOString(),
         revision: lane.revision,
         intervalMs: entry.intervalMs,
+        capability: entry.capability,
         queueWaitMs: Math.max(0, Date.now() - entry.enqueuedAt),
       });
     } catch (error) {
@@ -269,6 +274,7 @@ async function acquireOfRequestSlot(input) {
     member: input.member,
     deviceId,
     creatorId,
+    capability: input.capability,
   });
   const lane = getLane(access.agencyId, creatorId);
 
@@ -279,6 +285,7 @@ async function acquireOfRequestSlot(input) {
       priority,
       operation: clean(input.operation, 160) || "unknown",
       source: clean(input.source, 240) || null,
+      capability: ["security_probe", "read", "write"].includes(input.capability) ? input.capability : "read",
       intervalMs,
       enqueuedAt: Date.now(),
       signal: input.signal || null,
@@ -339,11 +346,12 @@ async function acknowledgeOfRequestStarted(input) {
     member: input.member,
     deviceId,
     creatorId,
+    capability: input.capability,
   });
   const lane = getLane(access.agencyId, creatorId);
   const permit = lane.activePermit;
-  if (!permit || permit.id !== permitId || permit.deviceId !== access.deviceId) {
-    const error = new Error("Global OF request permit is missing, expired or belongs to another device");
+  if (!permit || permit.id !== permitId || permit.deviceId !== access.deviceId || permit.capability !== input.capability) {
+    const error = new Error("Global OF request permit is missing, expired or belongs to another device/capability");
     error.code = "OF_GATE_PERMIT_INVALID";
     error.status = 409;
     throw error;
@@ -375,10 +383,11 @@ async function cancelOfRequestPermit(input) {
     member: input.member,
     deviceId,
     creatorId,
+    capability: input.capability,
   });
   const lane = getLane(access.agencyId, creatorId);
   const permit = lane.activePermit;
-  if (!permit || permit.id !== permitId || permit.deviceId !== access.deviceId) return { cancelled: false };
+  if (!permit || permit.id !== permitId || permit.deviceId !== access.deviceId || permit.capability !== input.capability) return { cancelled: false };
   clearActivePermit(lane, permit);
   lane.revision += 1;
   setImmediate(() => pump(lane));
@@ -396,6 +405,7 @@ function getOfRequestGateSnapshot() {
         deviceId: lane.activePermit.deviceId,
         priority: lane.activePermit.priority,
         operation: lane.activePermit.operation,
+        capability: lane.activePermit.capability,
         grantedAt: new Date(lane.activePermit.grantedAt).toISOString(),
       } : null,
       nextAllowedAt: lane.nextAllowedAt ? new Date(lane.nextAllowedAt).toISOString() : null,

@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
+const { reschedulePlannedJob } = require("./job-planning-repository");
 const { buildNotificationScanParams, loadNotificationSyncState } = require("./notification-sync-state-service");
 
 const JOB_KEY = "catchup_notifications_scan";
@@ -123,23 +124,13 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
     }
     if (active.status === "PAUSED" && sameMode && !pausedManualJobNeedsFreshRun(active, desiredMode)) {
-      const resumed = await db.jobInstance.update({
-        where: { id: active.id },
-        data: {
-          status: "SCHEDULED",
-          nextRunAt: now,
-          scheduledAt: now,
-          claimedAt: null,
-          claimedByDeviceId: null,
-          leaseUntil: null,
-          leaseTokenHash: null,
-          leaseRevision: { increment: 1 },
-          workId: null,
-          completedAt: null,
-          lastError: null,
-        },
+      const planned = await reschedulePlannedJob({
+        db, job: active, params: active.params || {}, priority: active.priority || 0,
+        scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
+        lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
+        protectedStatuses: [],
       });
-      return { job: resumed, action: "resumed" };
+      return { job: planned.job, action: "resumed" };
     }
     if (active.status !== "PAUSED" && sameMode) {
       return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };

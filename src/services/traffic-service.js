@@ -5,6 +5,7 @@ const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
+const { createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { canViewTraffic, canRefreshTraffic, canManageTrafficCosts } = require("./creator-analytics-permissions");
 const { resolveEffectivePermissions } = require("./team-access-control");
 const {
@@ -350,10 +351,10 @@ function normalizeMember(input = {}) {
 }
 
 // Write/ingest path: device-bound, because Electron workers mutate traffic data from a local OF session.
-async function validateDeviceForCreator({ deviceId, userId, creatorId }) {
+async function validateDeviceForCreator({ deviceId, userId, creatorId, db = prisma }) {
   const [device, creator] = await Promise.all([
-    prisma.workerDevice.findUnique({ where: { id: deviceId } }),
-    prisma.creatorAccount.findUnique({ where: { id: creatorId } }),
+    db.workerDevice.findUnique({ where: { id: deviceId } }),
+    db.creatorAccount.findUnique({ where: { id: creatorId } }),
   ]);
 
   if (!device || device.userId !== userId) {
@@ -618,8 +619,9 @@ async function upsertTrafficSourceScan({
   members = [],
   hydrateLimit = 1000,
   forceHydrate = false,
+  db = prisma,
 }) {
-  const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
+  const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId, db });
   const agencyId = creator.agencyId;
   const now = new Date();
 
@@ -656,7 +658,7 @@ async function upsertTrafficSourceScan({
       metadata: row.metadata,
     }));
 
-    await prisma.trafficSource.createMany({ data: createData, skipDuplicates: true });
+    await db.trafficSource.createMany({ data: createData, skipDuplicates: true });
 
     const updatePayload = chunk.map((row) => ({
       sourceType: row.sourceType,
@@ -673,7 +675,7 @@ async function upsertTrafficSourceScan({
       metadata: row.metadata || null,
     }));
 
-    await prisma.$executeRaw`
+    await db.$executeRaw`
       UPDATE "TrafficSource" AS s
       SET
         "accountId" = COALESCE(x."accountId", s."accountId"),
@@ -709,7 +711,7 @@ async function upsertTrafficSourceScan({
         AND s."externalId" = x."externalId"
     `;
 
-    const rows = await prisma.trafficSource.findMany({
+    const rows = await db.trafficSource.findMany({
       where: {
         agencyId,
         creatorId: creator.id,
@@ -739,7 +741,7 @@ async function upsertTrafficSourceScan({
   const missingKeys = Array.from(missingSourceKeys.values());
   for (const chunk of chunkArray(missingKeys, 200)) {
     if (!chunk.length) continue;
-    const existingSources = await prisma.trafficSource.findMany({
+    const existingSources = await db.trafficSource.findMany({
       where: {
         agencyId,
         creatorId: creator.id,
@@ -787,7 +789,7 @@ async function upsertTrafficSourceScan({
         updatedAt: now,
       }));
 
-      await prisma.trafficSourceMember.createMany({ data: createData, skipDuplicates: true });
+      await db.trafficSourceMember.createMany({ data: createData, skipDuplicates: true });
 
       const updatePayload = chunk.map((row) => ({
         sourceId: row.sourceId,
@@ -796,7 +798,7 @@ async function upsertTrafficSourceScan({
         metadata: row.metadata || null,
       }));
 
-      await prisma.$executeRaw`
+      await db.$executeRaw`
         UPDATE "TrafficSourceMember" AS m
         SET
           "lastSeenAt" = ${now},
@@ -1946,24 +1948,21 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
       bucketAt: now,
       bucketMs: 0,
     });
-    const job = await prisma.jobInstance.upsert({
-      where: { idempotencyKey },
-      create: {
-        jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
-        scope: "creator",
-        creatorId: creator.id,
-        agencyId: creator.agencyId,
-        idempotencyKey,
-        params,
-        priority: 120,
-        scheduledAt: now,
-        nextRunAt: now,
-      },
-      update: { status: "SCHEDULED", priority: 120, nextRunAt: now, params, lastError: null },
-      select: { id: true, status: true, jobKey: true, createdAt: true, nextRunAt: true, params: true },
+    const planned = await createPlannedJobIfAbsent({
+      db: prisma,
+      jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
+      scope: "creator",
+      creatorId: creator.id,
+      agencyId: creator.agencyId,
+      idempotencyKey,
+      params,
+      priority: 120,
+      scheduledAt: now,
+      nextRunAt: now,
     });
+    const job = planned.job;
 
-    return { ok: true, created: true, forced: true, jobId: job.id, job };
+    return { ok: true, created: planned.created, forced: true, reason: planned.reason, jobId: job.id, job };
   }
 
   const decision = await ensureSingleJob({

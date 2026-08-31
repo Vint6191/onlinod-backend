@@ -6,6 +6,7 @@ const { refreshFollowBackProjection } = require("./follow-back-service");
 const { refreshFollowAutomationProjection } = require("./follow-automation-service");
 const { ensureAutomaticBumps } = require("./bump-service");
 const { projectSubscriberDirectoryRun, readFanCurrent } = require("./fan-data-authority-service");
+const { createPlannedJob, publishPlannedJobAvailable } = require("./job-planning-repository");
 
 const SUBSCRIBER_DIRECTORY_JOB_KEY = "subscriber_directory_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING"];
@@ -145,26 +146,25 @@ async function scheduleSubscriberScan({
           },
         },
       });
-      const job = await tx.jobInstance.create({
-        data: {
-          jobKey: SUBSCRIBER_DIRECTORY_JOB_KEY,
-          scope: "creator",
-          creatorId,
-          agencyId,
-          idempotencyKey: `${SUBSCRIBER_DIRECTORY_JOB_KEY}:${creatorId}:${run.id}`,
-          params: {
-            scanRunId: run.id,
-            mode: run.mode,
-            sourceType: run.sourceType,
-            pageLimit: normalizedLimit,
-            scanEveryDays: normalizedEveryDays,
-            reason: clean(reason, 160) || "subscriber_directory_refresh",
-          },
-          status: "SCHEDULED",
-          priority: integer(priority, 20, 0, 200),
-          scheduledAt: now,
-          nextRunAt: now,
+      const job = await createPlannedJob({
+        db: tx,
+        publish: false,
+        jobKey: SUBSCRIBER_DIRECTORY_JOB_KEY,
+        scope: "creator",
+        creatorId,
+        agencyId,
+        idempotencyKey: `${SUBSCRIBER_DIRECTORY_JOB_KEY}:${creatorId}:${run.id}`,
+        params: {
+          scanRunId: run.id,
+          mode: run.mode,
+          sourceType: run.sourceType,
+          pageLimit: normalizedLimit,
+          scanEveryDays: normalizedEveryDays,
+          reason: clean(reason, 160) || "subscriber_directory_refresh",
         },
+        priority: integer(priority, 20, 0, 200),
+        scheduledAt: now,
+        nextRunAt: now,
       });
       const linkedRun = await tx.subscriberScanRun.update({ where: { id: run.id }, data: { jobId: job.id } });
       await tx.subscriberDirectoryState.upsert({
@@ -208,6 +208,7 @@ async function scheduleSubscriberScan({
     };
   }
 
+  publishPlannedJobAvailable(result.job);
   return { ok: true, created: true, reason: "created", run: runSummary(result.run), job: result.job };
 }
 
@@ -558,9 +559,9 @@ async function applySubscriberScanChunk({ db, job, chunkResult }) {
   return { duplicate: false, published: true, nextOffset, hasMore: false, summary };
 }
 
-async function applySubscriberScanCompletion({ job, userId = null, result }) {
+async function applySubscriberScanCompletion({ job, userId = null, result, db = prisma }) {
   const runId = clean(job.params?.scanRunId, 120);
-  const run = runId ? await prisma.subscriberScanRun.findUnique({ where: { id: runId } }) : null;
+  const run = runId ? await db.subscriberScanRun.findUnique({ where: { id: runId } }) : null;
   if (!run || run.status !== "PUBLISHED")
     throw new Error("Subscriber directory snapshot was not published before job completion");
 
@@ -576,6 +577,7 @@ async function applySubscriberScanCompletion({ job, userId = null, result }) {
       creatorId: run.creatorId,
       userId,
       source: "subscriber_snapshot_published",
+      db,
     });
   } catch (error) {
     bumpPlanning = {
@@ -596,16 +598,16 @@ async function applySubscriberScanCompletion({ job, userId = null, result }) {
   };
 }
 
-async function recordSubscriberScanFailure({ job, error, terminal = true }) {
+async function recordSubscriberScanFailure({ job, error, terminal = true, db = prisma }) {
   const runId = clean(job.params?.scanRunId, 120);
   if (!runId) return null;
   const errorText = clean(error, 2000) || "subscriber scan failed";
   const now = new Date();
-  const existing = await prisma.subscriberScanRun.findUnique({ where: { id: runId } }).catch(() => null);
+  const existing = await db.subscriberScanRun.findUnique({ where: { id: runId } }).catch(() => null);
   // A final progress request may have committed and published before its HTTP
   // response was lost. Never downgrade an immutable published snapshot.
   if (!existing || ["PUBLISHED", "SUPERSEDED"].includes(existing.status)) return existing;
-  const run = await prisma.subscriberScanRun
+  const run = await db.subscriberScanRun
     .update({
       where: { id: runId },
       data: terminal
@@ -614,16 +616,9 @@ async function recordSubscriberScanFailure({ job, error, terminal = true }) {
     })
     .catch(() => null);
   if (run) {
-    await prisma.subscriberDirectoryState.upsert({
-      where: { creatorId: run.creatorId },
-      create: {
-        agencyId: run.agencyId,
-        creatorId: run.creatorId,
-        status: terminal ? "FAILED" : "SCANNING",
-        lastJobId: job.id,
-        lastError: errorText,
-      },
-      update: { status: terminal ? "FAILED" : "SCANNING", lastJobId: job.id, lastError: errorText },
+    await db.subscriberDirectoryState.updateMany({
+      where: { creatorId: run.creatorId, OR: [{ lastJobId: null }, { lastJobId: job.id }] },
+      data: { status: terminal ? "FAILED" : "SCANNING", lastJobId: job.id, lastError: errorText },
     });
   }
   return run;

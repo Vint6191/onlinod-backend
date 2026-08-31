@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
+const { ensurePlannedJob } = require("./job-planning-repository");
 const {
   getAutomationControlSnapshot,
   assertAutomationEnabled,
@@ -20,7 +21,7 @@ const {
   LIKE_POST_ACTION_TYPE,
 } = require("./likes-constants");
 
-const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"];
+const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RETRY_SCHEDULED"];
 const RETRYABLE_FAILURES = new Set([
   "network_error", "timeout", "rate_limited", "temporary_of_error", "backend_unavailable", "lease_lost", "creator_unavailable",
 ]);
@@ -150,24 +151,21 @@ async function scheduleLikesDiscovery({ agencyId, creatorId, userId = null, fanI
       batchCount: batches.length,
     };
     const idempotencyKey = `likes_discovery:${creatorId}:${snapshot.currentRunId}:${stableHash(batch.map((fan) => fan.fanId))}:${force ? Date.now() : bucket}`;
-    let job = await db.jobInstance.findUnique({ where: { idempotencyKey } });
-    if (!job) {
-      try {
-        job = await db.jobInstance.create({ data: {
-          jobKey: LIKES_DISCOVERY_JOB_KEY, scope: "creator", creatorId, agencyId, idempotencyKey, params,
-          status: "SCHEDULED", priority, scheduledAt: new Date(), nextRunAt: new Date(),
-        } });
-      } catch (error) {
-        if (error?.code !== "P2002") throw error;
-        job = await db.jobInstance.findUnique({ where: { idempotencyKey } });
-      }
-    } else if (!["CLAIMED", "SCHEDULED"].includes(job.status)) {
-      job = await db.jobInstance.update({ where: { id: job.id }, data: {
-        status: "SCHEDULED", params, priority, scheduledAt: new Date(), nextRunAt: new Date(), claimedAt: null,
-        claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null, continuation: null,
-        progress: null, lastProgressAt: null, completedAt: null, lastError: null, attempts: 0, result: null,
-      } });
-    }
+    const planned = await ensurePlannedJob({
+      db,
+      jobKey: LIKES_DISCOVERY_JOB_KEY,
+      scope: "creator",
+      creatorId,
+      agencyId,
+      idempotencyKey,
+      params,
+      priority,
+      scheduledAt: new Date(),
+      nextRunAt: new Date(),
+      shouldResetExisting: (existing) => !["CLAIMED", "SCHEDULED"].includes(existing.status),
+      protectedStatuses: ["CLAIMED"],
+    });
+    const job = planned.job;
     jobs.push({ id: job.id, status: job.status, batchSize: batch.length });
   }
   return { ok: true, created: jobs.some((job) => job.status === "SCHEDULED"), reason: "scheduled", jobs, fans: fans.length };
@@ -504,7 +502,7 @@ async function listLikes({ agencyId, creatorId, search = "", state = null, offse
       db.automationContentCandidate.count({ where: { agencyId, creatorId, contentType: "post", state: "ELIGIBLE" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "QUEUED" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "CLAIMED" } }),
-      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "RUNNING" } }),
+      db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: { in: ["RUNNING", "COMMITTING"] } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "COMPLETED", finishedAt: { gte: dayStart(now) } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "COMPLETED", finishedAt: { gte: monthStart(now) } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "FAILED" } }),

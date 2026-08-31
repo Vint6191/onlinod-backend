@@ -155,7 +155,7 @@ async function applyCampaignsResult({ db = prisma, job, deviceId, userId, result
   };
 }
 
-async function applyTrafficResult({ job, deviceId, userId, result }) {
+async function applyTrafficResult({ db = prisma, job, deviceId, userId, result }) {
   if (!job.creatorId) throw new Error("Traffic job is missing creatorId");
   const payload = asObject(result);
   const params = asObject(job.params);
@@ -168,6 +168,7 @@ async function applyTrafficResult({ job, deviceId, userId, result }) {
     members: Array.isArray(payload.members) ? payload.members : [],
     hydrateLimit: integer(payload.hydrateLimit ?? params.hydrateLimit, 0),
     forceHydrate: payload.forceHydrate === true || params.forceHydrate === true,
+    db,
   });
   return { type: "traffic", ...asObject(applied) };
 }
@@ -301,30 +302,30 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   if (job.jobKey === FINANCIAL_TRANSACTIONS_JOB_KEY) return completeFinancialTransactionsScan({ db, job, deviceId, result: result || {} });
   if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ db, job, deviceId, userId, result });
   if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ db, job, deviceId, userId, result });
-  if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ job, deviceId, userId, result });
-  if (job.jobKey === PRESENCE_JOB_KEY) return applyPresenceJobResult({ job, deviceId, result: result || {} });
+  if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ db, job, deviceId, userId, result });
+  if (job.jobKey === PRESENCE_JOB_KEY) return applyPresenceJobResult({ db, job, deviceId, result: result || {} });
   if (job.jobKey === CATCHUP_JOB_KEY) return applyCatchupJobResult({ db, job, deviceId, userId, result: result || {} });
-  if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return applyLikesDiscoveryCompletion({ job, deviceId, userId, result: result || {} });
-  if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryCompletion({ job, deviceId, userId, result: result || {} });
-  if (job.jobKey === SFS_TARGET_SCAN_JOB_KEY) return applySfsTargetScanCompletion({ job, deviceId, userId, result: result || {} });
+  if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return applyLikesDiscoveryCompletion({ db, job, deviceId, userId, result: result || {} });
+  if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryCompletion({ db, job, deviceId, userId, result: result || {} });
+  if (job.jobKey === SFS_TARGET_SCAN_JOB_KEY) return applySfsTargetScanCompletion({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) return { ok: true, type: "fan_data_point_refresh", ...(asObject(result)) };
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
-    const applied = await applySubscriberScanCompletion({ job, deviceId, userId, result: result || {} });
+    const applied = await applySubscriberScanCompletion({ db, job, deviceId, userId, result: result || {} });
     cleanupSubscriberScanHistory({ creatorId: job.creatorId }).catch(() => null);
     return applied;
   }
   throw new Error(`No backend result applier registered for ${job.jobKey}`);
 }
 
-async function recordJobFailure({ job, error, terminal = true }) {
+async function recordJobFailure({ db = prisma, job, error, terminal = true }) {
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
-    return recordDialogIntelligenceFailure({ job, error, terminal });
+    return recordDialogIntelligenceFailure({ db, job, error, terminal });
   }
-  if (job.jobKey === VAULT_UNSORTED_JOB_KEY) return recordVaultUnsortedFailure({ job, error, terminal });
-  if (job.jobKey === CATCHUP_JOB_KEY) return recordCatchupJobFailure({ job, error });
-  if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) return recordSubscriberScanFailure({ job, error, terminal });
-  if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return recordLikesDiscoveryFailure({ job, error, terminal });
-  if ([SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY].includes(job.jobKey)) return recordSfsJobFailure({ job, error, terminal });
+  if (job.jobKey === VAULT_UNSORTED_JOB_KEY) return recordVaultUnsortedFailure({ db, job, error, terminal });
+  if (job.jobKey === CATCHUP_JOB_KEY) return recordCatchupJobFailure({ db, job, error });
+  if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) return recordSubscriberScanFailure({ db, job, error, terminal });
+  if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return recordLikesDiscoveryFailure({ db, job, error, terminal });
+  if ([SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY].includes(job.jobKey)) return recordSfsJobFailure({ db, job, error, terminal });
   return null;
 }
 

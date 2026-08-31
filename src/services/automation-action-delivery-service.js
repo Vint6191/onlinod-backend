@@ -3,8 +3,13 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { canUsePermission, isOwner, normalizeAssignedCreators } = require("./team-access-control");
+const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
 const { assertAutomationEnabled, getAutomationControlSnapshot } = require("./automation-control-service");
+const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
+const {
+  FAILURE_CATEGORIES, SAFE_RETRY_CATEGORIES, normalizeFailureCategory, classifyAutomationFailure,
+} = require("./automation-failure-taxonomy");
 const {
   validateBumpDelivery,
   finalizeBumpSend,
@@ -47,6 +52,7 @@ const {
 } = require("./follow-automation-constants");
 
 const CLAIMABLE_STATUSES = ["QUEUED", "RETRY_SCHEDULED"];
+const LEASED_STATUSES = ["CLAIMED", "RUNNING", "COMMITTING"];
 const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"];
 const DEFAULT_LEASE_MS = 3 * 60_000;
 const MIN_LEASE_MS = 30_000;
@@ -90,7 +96,7 @@ function dayStart(date = new Date()) { const out = new Date(date); out.setHours(
 function nextDayStart(date = new Date()) { const out = dayStart(date); out.setDate(out.getDate() + 1); return out; }
 
 
-async function assertDeliveryControl(delivery, { allowRunningUnfollow = false } = {}) {
+async function assertDeliveryControl(delivery, { allowRunningUnfollow = false, db = prisma } = {}) {
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   const recovery = isFollowRecoveryDelivery(delivery);
   const sfsCleanup = isSfsCleanupDelivery(delivery);
@@ -103,11 +109,13 @@ async function assertDeliveryControl(delivery, { allowRunningUnfollow = false } 
       agencyId: delivery.agencyId,
       creatorId: delivery.creatorId,
       moduleKey: delivery.moduleKey,
+      db,
     });
   }
   const snapshot = await getAutomationControlSnapshot({
     agencyId: delivery.agencyId,
     creatorId: delivery.creatorId,
+    db,
   });
   if (!snapshot.effective.workspaceEnabled) {
     throw new ActionDeliveryError("workspace_disabled", "Automation workspace is disabled");
@@ -118,21 +126,18 @@ async function assertDeliveryControl(delivery, { allowRunningUnfollow = false } 
   return snapshot;
 }
 
-async function requireOwnedSeniorDevice({ userId, deviceId }) {
-  const device = await prisma.workerDevice.findUnique({ where: { id: deviceId } });
+async function requireOwnedSeniorDevice({ userId, deviceId, db = prisma }) {
+  const device = await db.workerDevice.findUnique({ where: { id: deviceId } });
   if (!device || device.userId !== userId) throw new ActionDeliveryError("NOT_YOUR_DEVICE", "Invalid device", 403);
-  const member = await prisma.agencyMember.findFirst({
+  const member = await db.agencyMember.findFirst({
     where: { agencyId: device.agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
   });
   if (!member) throw new ActionDeliveryError("DEVICE_AGENCY_ACCESS_REVOKED", "Device agency access was revoked", 403);
-  if (!(await canUsePermission({ member, key: "automation.manage", db: prisma }))) throw new ActionDeliveryError("WRITE_AUTOMATION_FORBIDDEN", "automation.manage permission is required", 403);
+  if (!(await canUsePermission({ member, key: "automation.manage", db }))) throw new ActionDeliveryError("WRITE_AUTOMATION_FORBIDDEN", "automation.manage permission is required", 403);
   return { device, member };
 }
 
-async function scopedReadyCreatorIds({ userId, device }) {
-  const member = await prisma.agencyMember.findFirst({
-    where: { agencyId: device.agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
-  });
+async function scopedReadyCreatorIds({ device, member }) {
   if (!member) return [];
   const scope = normalizeAssignedCreators(member.assignedCreators);
   const broad = isOwner(member) || scope.mode === "all";
@@ -166,75 +171,52 @@ async function scopedReadyCreatorIds({ userId, device }) {
 
 async function sweepExpiredActionLeases(now = new Date()) {
   const rows = await prisma.automationDelivery.findMany({
-    where: { status: { in: ["CLAIMED", "RUNNING"] }, claimUntil: { lt: now } },
+    where: { status: { in: LEASED_STATUSES }, claimUntil: { lt: now } },
     select: {
       id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true,
-      payload: true, contentCollectionId: true, status: true, failureCode: true, attempts: true, maxAttempts: true, result: true, leaseRevision: true,
-    },
-    take: 10000,
+      payload: true, contentCollectionId: true, status: true, failureCode: true, failureCategory: true,
+      attempts: true, maxAttempts: true, result: true, leaseRevision: true, generation: true, notBefore: true,
+    }, take: 10000,
   });
   let changed = 0;
   for (const row of rows) {
-    const safetySaga = mustPreserveRefollowSaga(row, "lease_lost") || isSfsCleanupDelivery(row);
-    const terminal = !safetySaga && row.attempts >= row.maxAttempts;
-    const updated = await prisma.automationDelivery.updateMany({
-      where: {
-        id: row.id,
-        status: { in: ["CLAIMED", "RUNNING"] },
-        leaseRevision: row.leaseRevision,
-        claimUntil: { lt: now },
-      },
-      data: terminal
-        ? {
-            status: "FAILED",
-            failureCode: "lease_lost",
-            lastError: "Action lease expired",
-            finishedAt: now,
-            claimedByDeviceId: null,
-            claimedAt: null,
-            claimUntil: null,
-            leaseTokenHash: null,
-            leaseRevision: { increment: 1 },
-            result: { ...object(row.result), leaseExpiredAt: now.toISOString() },
-          }
-        : {
-            status: "RETRY_SCHEDULED",
-            failureCode: "lease_lost",
-            lastError: "Action lease expired",
-            notBefore: new Date(now.getTime() + retryDelayMs(row.attempts || 1, "lease_lost")),
-            claimedByDeviceId: null,
-            claimedAt: null,
-            claimUntil: null,
-            leaseTokenHash: null,
-            leaseRevision: { increment: 1 },
-            result: { ...object(row.result), leaseExpiredAt: now.toISOString() },
-          },
-    });
-    if (updated.count) {
-      changed += 1;
-      const latest = await prisma.automationDelivery.findUnique({ where: { id: row.id } });
-      if (terminal && row.moduleKey === "bumps") {
-        await finalizeBumpFailure({ delivery: latest, failureCode: "lease_lost", retryable: false });
-      }
-      if (row.moduleKey === "likes") {
-        await finalizeLikeFailure({
-          delivery: latest,
-          failureCode: "lease_lost",
-          retryable: !terminal,
-          result: latest?.result || {},
-        });
-      }
-      if (row.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
-        await finalizeFollowAutomationFailure({
-          delivery: latest,
-          failureCode: "lease_lost",
-          retryable: !terminal,
-        });
-      }
-      if (row.moduleKey === SFS_MODULE_KEY) {
-        await finalizeSfsFailure({ delivery: latest, failureCode: "lease_lost", retryable: !terminal });
-      }
-    }
+    const committing = row.status === "COMMITTING";
+    const failureCode = committing ? "write_outcome_unknown" : "lease_lost";
+    const failureCategory = committing
+      ? FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE
+      : classifyAutomationFailure({ failureCode, deliveryStatus: row.status, provenNoEffect: true });
+    const mustReconcile = failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE;
+    const safetySaga = mustPreserveRefollowSaga(row, failureCode) || isSfsCleanupDelivery(row);
+    const terminal = !mustReconcile && !safetySaga && row.attempts >= row.maxAttempts;
+    const retryAt = new Date(now.getTime() + retryDelayMs(row.attempts || 1, failureCode));
+    const nextStatus = terminal ? "FAILED" : "RETRY_SCHEDULED";
+    const nextResult = {
+      ...object(row.result), failureCode, failureCategory,
+      outcomeState: mustReconcile ? "RECONCILE_REQUIRED" : "PROVEN_NO_EFFECT",
+      leaseExpiredAt: now.toISOString(),
+      ...(row.actionType === "SEND_MESSAGE" && mustReconcile ? { phase: "send" } : {}),
+    };
+    const latest = await prisma.$transaction(async (tx) => {
+      const updated = await tx.automationDelivery.updateMany({
+        where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision, claimUntil: { lt: now } },
+        data: {
+          status: nextStatus, failureCode, failureCategory,
+          lastError: committing ? "Action outcome must be reconciled after lost commit lease" : "Action lease expired",
+          notBefore: terminal ? row.notBefore : retryAt, finishedAt: terminal ? now : null,
+          claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null,
+          leaseRevision: { increment: 1 }, result: nextResult,
+        },
+      });
+      if (!updated.count) return null;
+      const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
+      await updateModuleCandidateProgress(current, nextStatus, failureCode, tx);
+      if (current?.moduleKey === "bumps" && terminal) await finalizeBumpFailure({ delivery: current, failureCode, retryable: false, db: tx });
+      if (current?.moduleKey === "likes") await finalizeLikeFailure({ delivery: current, failureCode, retryable: !terminal, result: nextResult, db: tx });
+      if (current?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await finalizeFollowAutomationFailure({ delivery: current, failureCode, retryable: !terminal, db: tx });
+      if (current?.moduleKey === SFS_MODULE_KEY) await finalizeSfsFailure({ delivery: current, failureCode, retryable: !terminal, db: tx });
+      return current;
+    }, { timeout: 30_000 });
+    if (latest) changed += 1;
   }
   return changed;
 }
@@ -256,7 +238,7 @@ async function fairCandidates({ agencyId, creatorIds, actionTypes, now }) {
   const creatorSet = [...new Set(withinAttempts.map((item) => item.creatorId))];
   const touches = await prisma.automationDelivery.groupBy({
     by: ["creatorId"],
-    where: { agencyId, creatorId: { in: creatorSet }, status: { in: ["CLAIMED", "RUNNING", "COMPLETED"] } },
+    where: { agencyId, creatorId: { in: creatorSet }, status: { in: ["CLAIMED", "RUNNING", "COMMITTING", "COMPLETED"] } },
     _max: { claimedAt: true, finishedAt: true },
   });
   const lastTouch = new Map(touches.map((row) => [row.creatorId, Math.max(
@@ -270,88 +252,70 @@ async function fairCandidates({ agencyId, creatorIds, actionTypes, now }) {
     || a.createdAt.getTime() - b.createdAt.getTime());
 }
 
-async function updateCandidateProgress(delivery, status, failureCode = null) {
+async function updateCandidateProgress(delivery, status, failureCode = null, db = prisma, claimOwnership = false) {
   if (!delivery || delivery.moduleKey !== "follow_back" || !(delivery.targetId || delivery.fanId)) return;
-  await prisma.followBackCandidate.updateMany({
+  await db.followBackCandidate.updateMany({
     where: {
-      agencyId: delivery.agencyId,
-      creatorId: delivery.creatorId,
-      fanId: delivery.targetId || delivery.fanId,
+      agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId || delivery.fanId,
+      ...(claimOwnership ? {} : { OR: [{ latestDeliveryId: null }, { latestDeliveryId: delivery.id }] }),
     },
-    data: {
-      state: status,
-      latestDeliveryId: delivery.id,
-      latestActionType: delivery.actionType,
-      latestStatus: status,
-      latestError: failureCode,
-    },
+    data: { state: status, latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode },
   });
 }
 
-async function updateLikeCandidateProgress(delivery, status, failureCode = null) {
+async function updateLikeCandidateProgress(delivery, status, failureCode = null, db = prisma, claimOwnership = false) {
   if (!delivery || delivery.moduleKey !== "likes") return;
   const contentId = delivery.targetId || clean(object(delivery.payload).postId, 160);
   if (!contentId) return;
-  await prisma.automationContentCandidate.updateMany({
-    where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, contentType: "post", contentId },
-    data: {
-      state: status,
-      latestDeliveryId: delivery.id,
-      latestActionType: delivery.actionType,
-      latestStatus: status,
-      latestError: failureCode,
+  await db.automationContentCandidate.updateMany({
+    where: {
+      agencyId: delivery.agencyId, creatorId: delivery.creatorId, contentType: "post", contentId,
+      ...(claimOwnership ? {} : { OR: [{ latestDeliveryId: null }, { latestDeliveryId: delivery.id }] }),
     },
+    data: { state: status, latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode },
   });
 }
 
-async function updateFollowAutomationCandidateProgress(delivery, status, failureCode = null) {
+async function updateFollowAutomationCandidateProgress(delivery, status, failureCode = null, db = prisma, claimOwnership = false) {
   if (!delivery || delivery.moduleKey !== FOLLOW_AUTOMATION_MODULE_KEY) return;
   const fanId = delivery.targetId || delivery.fanId;
   if (!fanId) return;
-  const phase = delivery.actionType === FOLLOW_FAN_ACTION_TYPE
-    ? (status === "FAILED" ? "RECOVERY" : "FOLLOW")
-    : "UNFOLLOW";
+  const phase = delivery.actionType === FOLLOW_FAN_ACTION_TYPE ? (status === "FAILED" ? "RECOVERY" : "FOLLOW") : "UNFOLLOW";
   const state = delivery.actionType === FOLLOW_FAN_ACTION_TYPE
     ? (status === "RUNNING" ? "FOLLOWING" : "QUEUED_FOLLOW")
     : (status === "RUNNING" ? "UNFOLLOWING" : "QUEUED_UNFOLLOW");
-  await prisma.followAutomationCandidate.updateMany({
-    where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId },
-    data: {
-      state,
-      phase,
-      latestDeliveryId: delivery.id,
-      latestActionType: delivery.actionType,
-      latestStatus: status,
-      latestError: failureCode,
+  await db.followAutomationCandidate.updateMany({
+    where: {
+      agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId,
+      ...(claimOwnership ? {} : { OR: [{ latestDeliveryId: null }, { latestDeliveryId: delivery.id }] }),
     },
+    data: { state, phase, latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode },
   });
 }
 
-async function updateSfsCandidateProgress(delivery, status, failureCode = null) {
+async function updateSfsCandidateProgress(delivery, status, failureCode = null, db = prisma, claimOwnership = false) {
   if (!delivery || delivery.moduleKey !== SFS_MODULE_KEY) return;
   const candidateId = clean(object(delivery.payload).candidateId, 160);
   if (!candidateId) return;
-  await prisma.sfsTargetCandidate.updateMany({
-    where: { id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId },
+  await db.sfsTargetCandidate.updateMany({
+    where: {
+      id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId,
+      ...(claimOwnership ? {} : { OR: [{ latestDeliveryId: null }, { latestDeliveryId: delivery.id }] }),
+    },
     data: {
-      state: isSfsCleanupDelivery(delivery)
-        ? (status === "RUNNING" ? "UNFOLLOWING" : "UNFOLLOW_DUE")
-        : delivery.actionType === "SFS_FOLLOW_TARGET"
-          ? (status === "RUNNING" ? "FOLLOWING" : "QUEUED")
+      state: isSfsCleanupDelivery(delivery) ? (status === "RUNNING" ? "UNFOLLOWING" : "UNFOLLOW_DUE")
+        : delivery.actionType === "SFS_FOLLOW_TARGET" ? (status === "RUNNING" ? "FOLLOWING" : "QUEUED")
           : (status === "RUNNING" ? "ACTING" : status),
-      latestDeliveryId: delivery.id,
-      latestActionType: delivery.actionType,
-      latestStatus: status,
-      latestError: failureCode,
+      latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode,
     },
   });
 }
 
-async function updateModuleCandidateProgress(delivery, status, failureCode = null) {
-  await updateCandidateProgress(delivery, status, failureCode);
-  await updateLikeCandidateProgress(delivery, status, failureCode);
-  await updateFollowAutomationCandidateProgress(delivery, status, failureCode);
-  await updateSfsCandidateProgress(delivery, status, failureCode);
+async function updateModuleCandidateProgress(delivery, status, failureCode = null, db = prisma, claimOwnership = false) {
+  await updateCandidateProgress(delivery, status, failureCode, db, claimOwnership);
+  await updateLikeCandidateProgress(delivery, status, failureCode, db, claimOwnership);
+  await updateFollowAutomationCandidateProgress(delivery, status, failureCode, db, claimOwnership);
+  await updateSfsCandidateProgress(delivery, status, failureCode, db, claimOwnership);
 }
 
 async function deferOrSkipFollowBackClaim(delivery, control, now) {
@@ -372,23 +336,24 @@ async function deferOrSkipFollowBackClaim(delivery, control, now) {
   else if (candidate.subscribedByCreator === true) code = "already_followed";
 
   if (code) {
-    const updated = await prisma.automationDelivery.updateMany({
-      where: { id: delivery.id, status: { in: CLAIMABLE_STATUSES } },
-      data: {
-        status: terminalStatus,
-        failureCode: code,
-        lastError: code,
-        finishedAt: now,
-        claimUntil: null,
-        leaseTokenHash: null,
-        leaseRevision: { increment: 1 },
-      },
+    return prisma.$transaction(async (tx) => {
+      const updated = await tx.automationDelivery.updateMany({
+        where: { id: delivery.id, status: { in: CLAIMABLE_STATUSES } },
+        data: {
+          status: terminalStatus,
+          failureCode: code,
+          lastError: code,
+          finishedAt: now,
+          claimUntil: null,
+          leaseTokenHash: null,
+          leaseRevision: { increment: 1 },
+        },
+      });
+      if (!updated.count) return true;
+      const latest = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+      await updateCandidateFromTerminal(latest, terminalStatus, code, tx);
+      return true;
     });
-    if (updated.count) {
-      const latest = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
-      await updateCandidateFromTerminal(latest, terminalStatus, code);
-    }
-    return true;
   }
 
   const dailyLimit = Number(control.modules?.follow_back?.settings?.dailyLimit || 0);
@@ -403,29 +368,31 @@ async function deferOrSkipFollowBackClaim(delivery, control, now) {
     },
   });
   if (completedToday >= dailyLimit) {
-    const updated = await prisma.automationDelivery.updateMany({
-      where: { id: delivery.id, status: { in: CLAIMABLE_STATUSES } },
-      data: {
-        status: "RETRY_SCHEDULED",
-        failureCode: "daily_limit",
-        lastError: "Follow Back daily limit reached",
-        notBefore: nextDayStart(now),
-      },
+    return prisma.$transaction(async (tx) => {
+      const updated = await tx.automationDelivery.updateMany({
+        where: { id: delivery.id, status: { in: CLAIMABLE_STATUSES } },
+        data: {
+          status: "RETRY_SCHEDULED",
+          failureCode: "daily_limit",
+          lastError: "Follow Back daily limit reached",
+          notBefore: nextDayStart(now),
+        },
+      });
+      if (!updated.count) return true;
+      const latest = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+      await updateCandidateProgress(latest, "RETRY_SCHEDULED", "daily_limit", tx);
+      return true;
     });
-    if (updated.count) {
-      const latest = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
-      await updateCandidateProgress(latest, "RETRY_SCHEDULED", "daily_limit");
-    }
-    return true;
   }
   return false;
 }
 
-async function applyBumpValidationTransition(delivery, validation, now = new Date()) {
+async function applyBumpValidationTransition(delivery, validation, now = new Date(), executionAccess = null) {
   if (!delivery || delivery.moduleKey !== "bumps" || validation?.ok !== false) return false;
   const terminal = validation.terminal === true;
   const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
   return prisma.$transaction(async (tx) => {
+    if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: {
         id: delivery.id,
@@ -460,11 +427,12 @@ async function applyBumpValidationTransition(delivery, validation, now = new Dat
   });
 }
 
-async function applyLikeValidationTransition(delivery, validation, now = new Date()) {
+async function applyLikeValidationTransition(delivery, validation, now = new Date(), executionAccess = null) {
   if (!delivery || delivery.moduleKey !== "likes" || validation?.ok !== false) return false;
   const terminal = validation.terminal === true;
   const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
   return prisma.$transaction(async (tx) => {
+    if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: [...CLAIMABLE_STATUSES, "CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
       data: {
@@ -493,11 +461,12 @@ async function applyLikeValidationTransition(delivery, validation, now = new Dat
   });
 }
 
-async function applyFollowAutomationValidationTransition(delivery, validation, now = new Date()) {
+async function applyFollowAutomationValidationTransition(delivery, validation, now = new Date(), executionAccess = null) {
   if (!delivery || delivery.moduleKey !== FOLLOW_AUTOMATION_MODULE_KEY || validation?.ok !== false) return false;
   const terminal = validation.terminal === true;
   const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
   return prisma.$transaction(async (tx) => {
+    if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: [...CLAIMABLE_STATUSES, "CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
       data: {
@@ -534,10 +503,11 @@ async function applyFollowAutomationValidationTransition(delivery, validation, n
   });
 }
 
-async function applySfsValidationTransition(delivery, validation, now = new Date()) {
+async function applySfsValidationTransition(delivery, validation, now = new Date(), executionAccess = null) {
   const status = validation.terminal === true ? (validation.code === "already_unfollowed" ? "COMPLETED" : "SKIPPED") : "RETRY_SCHEDULED";
   const retryAt = validation.retryAt || new Date(now.getTime() + 30_000);
   return prisma.$transaction(async (tx) => {
+    if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: CLAIMABLE_STATUSES }, leaseRevision: delivery.leaseRevision },
       data: {
@@ -564,10 +534,10 @@ async function applySfsValidationTransition(delivery, validation, now = new Date
 }
 
 async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST", "UNFOLLOW_FAN", "FOLLOW_FAN", "SFS_FOLLOW_TARGET", "SFS_COMMENT_POST", "SFS_LIKE_COMMENT", "SFS_UNFOLLOW_TARGET"] }) {
-  const { device } = await requireOwnedSeniorDevice({ userId, deviceId });
+  const { device, member } = await requireOwnedSeniorDevice({ userId, deviceId });
   await sweepExpiredActionLeases();
   if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60_000)) return { delivery: null, reason: "device_stale" };
-  const creatorIds = await scopedReadyCreatorIds({ userId, device });
+  const creatorIds = await scopedReadyCreatorIds({ device, member });
   if (!creatorIds.length) return { delivery: null, reason: "no_ready_creator" };
   const allowedActionTypes = [...new Set((Array.isArray(actionTypes) ? actionTypes : []).map((item) => clean(item, 80)).filter(Boolean))];
   if (!allowedActionTypes.length) return { delivery: null, reason: "no_capabilities" };
@@ -640,29 +610,22 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
     const leaseToken = crypto.randomBytes(32).toString("base64url");
     const claimUntil = new Date(now.getTime() + leaseDuration(leaseMs));
     try {
-      const updated = await prisma.automationDelivery.updateMany({
-        where: {
-          id: candidate.id,
-          status: { in: CLAIMABLE_STATUSES },
-          notBefore: { lte: now },
-          claimUntil: null,
-        },
-        data: {
-          status: "CLAIMED",
-          claimedByDeviceId: device.id,
-          claimedAt: now,
-          claimUntil,
-          leaseTokenHash: hashToken(leaseToken),
-          leaseRevision: { increment: 1 },
-          attempts: { increment: 1 },
-          failureCode: null,
-          lastError: null,
-        },
-      });
-      if (!updated.count) continue;
-      const claimed = await prisma.automationDelivery.findUnique({ where: { id: candidate.id } });
+      const claimed = await prisma.$transaction(async (tx) => {
+        const updated = await tx.automationDelivery.updateMany({
+          where: { id: candidate.id, status: { in: CLAIMABLE_STATUSES }, notBefore: { lte: now }, claimUntil: null },
+          data: {
+            status: "CLAIMED", claimedByDeviceId: device.id, claimedAt: now, claimUntil,
+            leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 },
+            leaseMemberId: member.id, leaseAccessEpoch: Number(member.accessEpoch || 1),
+            attempts: { increment: 1 }, lastError: null,
+          },
+        });
+        if (!updated.count) return null;
+        const current = await tx.automationDelivery.findUnique({ where: { id: candidate.id } });
+        if (current) await updateModuleCandidateProgress(current, "CLAIMED", null, tx, true);
+        return current;
+      }, { timeout: 30_000 });
       if (!claimed) continue;
-      await updateModuleCandidateProgress(claimed, "CLAIMED");
       return {
         reason: "claimed",
         delivery: {
@@ -692,6 +655,10 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
           leaseUntil: claimed.claimUntil,
           leaseToken,
           leaseRevision: claimed.leaseRevision,
+          leaseAccessEpoch: claimed.leaseAccessEpoch,
+          failureCode: claimed.failureCode || null,
+          failureCategory: claimed.failureCategory || null,
+          writeCommitRevision: Number(claimed.writeCommitRevision || 0),
         },
       };
     } catch (error) {
@@ -704,64 +671,88 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
   return { delivery: null, reason: "no_work" };
 }
 
-async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, allowTerminal = false, allowExpired = false }) {
-  const { device } = await requireOwnedSeniorDevice({ userId, deviceId });
-  const delivery = await prisma.automationDelivery.findUnique({ where: { id: deliveryId } });
+async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, allowTerminal = false, allowExpired = false, allowCommittedSettlement = false, lockAccess = false, db = prisma }) {
+  const { device, member } = await requireOwnedSeniorDevice({ userId, deviceId, db });
+  const delivery = await db.automationDelivery.findUnique({ where: { id: deliveryId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   if (delivery.agencyId !== device.agencyId) throw new ActionDeliveryError("DELIVERY_DEVICE_AGENCY_MISMATCH", "Delivery belongs to another agency", 403);
   const terminal = TERMINAL_STATUSES.includes(delivery.status);
-  if (!(delivery.status === "CLAIMED" || delivery.status === "RUNNING" || (allowTerminal && terminal))) {
+  if (!(LEASED_STATUSES.includes(delivery.status) || (allowTerminal && terminal))) {
     throw new ActionDeliveryError("DELIVERY_NOT_CLAIMED", `Delivery status is ${delivery.status}`);
   }
   if (delivery.claimedByDeviceId !== deviceId) throw new ActionDeliveryError("DELIVERY_CLAIMED_BY_OTHER", "Delivery is claimed by another device");
   if (!tokenMatches(leaseToken, delivery.leaseTokenHash)) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery lease token is stale");
   if (!Number.isInteger(leaseRevision) || delivery.leaseRevision !== leaseRevision) throw new ActionDeliveryError("DELIVERY_LEASE_REVISION_STALE", "Delivery lease revision is stale");
-  if (!allowExpired && !terminal && (!delivery.claimUntil || delivery.claimUntil.getTime() <= Date.now())) {
+  const committedSettlement = allowCommittedSettlement && delivery.status === "COMMITTING" && delivery.writeCommitAt;
+  if (!allowExpired && !terminal && !committedSettlement && (!delivery.claimUntil || delivery.claimUntil.getTime() <= Date.now())) {
     throw new ActionDeliveryError("DELIVERY_LEASE_EXPIRED", "Delivery lease expired");
+  }
+  try {
+    if (!committedSettlement) {
+      await assertExecutionAccessFence({
+        userId, agencyId: device.agencyId, memberId: delivery.leaseMemberId,
+        accessEpoch: delivery.leaseAccessEpoch, creatorId: delivery.creatorId, db, lock: lockAccess === true,
+      });
+    }
+  } catch (error) {
+    if (error instanceof ExecutionAccessFenceError) throw new ActionDeliveryError(error.code, error.message, error.status);
+    throw error;
   }
   return delivery;
 }
 
+async function lockDeliveryExecutionAccess({ db, delivery, userId }) {
+  if (delivery.status === "COMMITTING" && delivery.writeCommitAt) return;
+  try {
+    await assertExecutionAccessFence({
+      db, userId, agencyId: delivery.agencyId, memberId: delivery.leaseMemberId,
+      accessEpoch: delivery.leaseAccessEpoch, creatorId: delivery.creatorId, lock: true,
+    });
+  } catch (error) {
+    if (error instanceof ExecutionAccessFenceError) throw new ActionDeliveryError(error.code, error.message, error.status);
+    throw error;
+  }
+}
+
 async function renewActionLease(input) {
-  const delivery = await requireLease(input);
-  await assertDeliveryControl(delivery, { allowRunningUnfollow: true });
-  const now = new Date();
-  const result = await prisma.automationDelivery.updateMany({
-    where: {
-      id: delivery.id,
-      status: { in: ["CLAIMED", "RUNNING"] },
-      claimedByDeviceId: input.deviceId,
-      leaseTokenHash: hashToken(input.leaseToken),
-      leaseRevision: input.leaseRevision,
-      claimUntil: { gt: now },
-    },
-    data: { claimUntil: new Date(now.getTime() + leaseDuration(input.leaseMs)), lastCheckedAt: now },
-  });
-  if (!result.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery lease changed before renewal");
-  return { ok: true, id: delivery.id, leaseRevision: delivery.leaseRevision, leaseUntil: new Date(now.getTime() + leaseDuration(input.leaseMs)) };
+  return prisma.$transaction(async (tx) => {
+    const delivery = await requireLease({ ...input, db: tx, lockAccess: true });
+    if (delivery.status !== "COMMITTING") await assertDeliveryControl(delivery, { allowRunningUnfollow: true, db: tx });
+    const now = new Date();
+    const nextLeaseUntil = new Date(now.getTime() + leaseDuration(input.leaseMs));
+    const result = await tx.automationDelivery.updateMany({
+      where: {
+        id: delivery.id,
+        status: { in: LEASED_STATUSES },
+        claimedByDeviceId: input.deviceId,
+        leaseTokenHash: hashToken(input.leaseToken),
+        leaseRevision: input.leaseRevision,
+        claimUntil: { gt: now },
+      },
+      data: { claimUntil: nextLeaseUntil, lastCheckedAt: now },
+    });
+    if (!result.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery lease changed before renewal");
+    return { ok: true, id: delivery.id, leaseRevision: delivery.leaseRevision, leaseUntil: nextLeaseUntil };
+  }, { timeout: 30_000 });
 }
 
 async function startActionDelivery(input) {
-  const delivery = await requireLease(input);
-  await assertDeliveryControl(delivery);
-  if (delivery.notBefore.getTime() > Date.now()) throw new ActionDeliveryError("DELIVERY_NOT_DUE", "Delivery is not due yet");
-  if (delivery.status === "RUNNING") return { ok: true, delivery };
   const now = new Date();
-  const updated = await prisma.automationDelivery.updateMany({
-    where: { id: delivery.id, status: "CLAIMED", leaseRevision: input.leaseRevision, claimedByDeviceId: input.deviceId },
-    data: {
-      status: "RUNNING",
-      lastCheckedAt: now,
-      result: {
-        ...object(delivery.result),
-        attemptStartedAt: now.toISOString(),
-        attemptLeaseRevision: delivery.leaseRevision,
-      },
-    },
-  });
-  if (!updated.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before start");
-  const running = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
-  await updateModuleCandidateProgress(running, "RUNNING");
+  const running = await prisma.$transaction(async (tx) => {
+    const delivery = await requireLease({ ...input, db: tx, lockAccess: true });
+    await assertDeliveryControl(delivery, { db: tx });
+    if (delivery.notBefore.getTime() > Date.now()) throw new ActionDeliveryError("DELIVERY_NOT_DUE", "Delivery is not due yet");
+    if (delivery.status === "RUNNING") return delivery;
+    if (delivery.status === "COMMITTING") throw new ActionDeliveryError("DELIVERY_ALREADY_COMMITTING", "Delivery already crossed the write commit boundary");
+    const updated = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: "CLAIMED", leaseRevision: input.leaseRevision, claimedByDeviceId: input.deviceId },
+      data: { status: "RUNNING", lastCheckedAt: now, result: { ...object(delivery.result), attemptStartedAt: now.toISOString(), attemptLeaseRevision: delivery.leaseRevision } },
+    });
+    if (!updated.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before start");
+    const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    await updateModuleCandidateProgress(current, "RUNNING", null, tx);
+    return current;
+  }, { timeout: 30_000 });
   return { ok: true, delivery: running };
 }
 
@@ -771,43 +762,86 @@ async function validateActionDelivery(input) {
   if (delivery.moduleKey === "bumps") {
     const validation = await validateBumpDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
-      await applyBumpValidationTransition(delivery, validation, new Date());
+      await applyBumpValidationTransition(delivery, validation, new Date(), { userId: input.userId });
       throw new ActionDeliveryError(validation.code || "BUMP_VALIDATION_FAILED", validation.code || "Bump delivery validation failed");
     }
   }
   if (delivery.moduleKey === "likes") {
     const validation = await validateLikeDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
-      await applyLikeValidationTransition(delivery, validation, new Date());
+      await applyLikeValidationTransition(delivery, validation, new Date(), { userId: input.userId });
       throw new ActionDeliveryError(validation.code || "LIKE_VALIDATION_FAILED", validation.code || "Like delivery validation failed");
     }
   }
   if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
     const validation = await validateFollowAutomationDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
-      await applyFollowAutomationValidationTransition(delivery, validation, new Date());
+      await applyFollowAutomationValidationTransition(delivery, validation, new Date(), { userId: input.userId });
       throw new ActionDeliveryError(validation.code || "FOLLOW_AUTOMATION_VALIDATION_FAILED", validation.code || "Follow Automation delivery validation failed");
     }
   }
   if (delivery.moduleKey === SFS_MODULE_KEY) {
     const validation = await validateSfsDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
-      await applySfsValidationTransition(delivery, validation, new Date());
+      await applySfsValidationTransition(delivery, validation, new Date(), { userId: input.userId });
       throw new ActionDeliveryError(validation.code || "SFS_VALIDATION_FAILED", validation.code || "SFS delivery validation failed");
     }
   }
   return { ok: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, control: control.effective };
 }
 
-async function updateCandidateFromTerminal(delivery, status, failureCode) {
+async function prepareWriteActionDelivery(input) {
+  return prisma.$transaction(async (tx) => {
+    let delivery = await requireLease({ ...input, db: tx, lockAccess: true });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId });
+    // The control writer holds the same transaction-scoped fence. Re-read the
+    // lease after acquiring it so a queued control/revoke transition cannot
+    // race a stale pre-lock delivery snapshot into COMMITTING.
+    delivery = await requireLease({ ...input, db: tx, lockAccess: true });
+    if (delivery.status === "COMMITTING" && delivery.writeCommitAt) {
+      return { ok: true, duplicate: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, writeCommitRevision: delivery.writeCommitRevision, writeCommitAt: delivery.writeCommitAt };
+    }
+    if (delivery.status !== "RUNNING") throw new ActionDeliveryError("DELIVERY_NOT_RUNNING", `Delivery status is ${delivery.status}`);
+    const control = await assertDeliveryControl(delivery, { db: tx });
+    const now = new Date();
+    if (delivery.moduleKey === "bumps") {
+      const validation = await validateBumpDelivery({ delivery, control, now, db: tx });
+      if (validation.ok === false) throw new ActionDeliveryError(validation.code || "BUMP_VALIDATION_FAILED", validation.code || "Bump delivery validation failed");
+    }
+    if (delivery.moduleKey === "likes") {
+      const validation = await validateLikeDelivery({ delivery, control, now, db: tx });
+      if (validation.ok === false) throw new ActionDeliveryError(validation.code || "LIKE_VALIDATION_FAILED", validation.code || "Like delivery validation failed");
+    }
+    if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
+      const validation = await validateFollowAutomationDelivery({ delivery, control, now, db: tx });
+      if (validation.ok === false) throw new ActionDeliveryError(validation.code || "FOLLOW_AUTOMATION_VALIDATION_FAILED", validation.code || "Follow Automation delivery validation failed");
+    }
+    if (delivery.moduleKey === SFS_MODULE_KEY) {
+      const validation = await validateSfsDelivery({ delivery, control, now, db: tx });
+      if (validation.ok === false) throw new ActionDeliveryError(validation.code || "SFS_VALIDATION_FAILED", validation.code || "SFS delivery validation failed");
+    }
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: "RUNNING", claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision, claimUntil: { gt: now } },
+      data: {
+        status: "COMMITTING", writeCommitRevision: { increment: 1 }, writeCommitAt: now, lastCheckedAt: now,
+        result: { ...object(delivery.result), writeCommitGrantedAt: now.toISOString(), writeCommitLeaseRevision: delivery.leaseRevision },
+      },
+    });
+    if (!changed.count) throw new ActionDeliveryError("DELIVERY_COMMIT_PERMIT_STALE", "Delivery changed before write commit permit");
+    const committing = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    return { ok: true, duplicate: false, id: committing.id, status: committing.status, leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt };
+  }, { timeout: 30_000 });
+}
+
+async function updateCandidateFromTerminal(delivery, status, failureCode, db = prisma) {
   if (delivery.moduleKey !== "follow_back" || !delivery.targetId) return;
   const candidateState = status === "COMPLETED"
     ? "FOLLOWED"
     : status === "SKIPPED"
       ? (failureCode === "already_followed" ? "FOLLOWED" : "SKIPPED")
       : status;
-  await prisma.followBackCandidate.updateMany({
-    where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId },
+  await db.followBackCandidate.updateMany({
+    where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId, OR: [{ latestDeliveryId: null }, { latestDeliveryId: delivery.id }] },
     data: {
       state: candidateState,
       subscribedByCreator: status === "COMPLETED" || failureCode === "already_followed" ? true : undefined,
@@ -821,17 +855,18 @@ async function updateCandidateFromTerminal(delivery, status, failureCode) {
 }
 
 async function completeActionDelivery(input) {
-  const delivery = await requireLease({ ...input, allowTerminal: true });
+  const delivery = await requireLease({ ...input, allowTerminal: true, allowCommittedSettlement: true });
   if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   const now = new Date();
   const result = object(input.result);
   const outcomeCode = clean(input.outcomeCode, 120) || clean(result.code, 120) || null;
   const terminalStatus = input.status === "SKIPPED" ? "SKIPPED" : "COMPLETED";
   const finalDelivery = await prisma.$transaction(async (tx) => {
+    await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: {
         id: delivery.id,
-        status: { in: ["CLAIMED", "RUNNING"] },
+        status: { in: LEASED_STATUSES },
         claimedByDeviceId: input.deviceId,
         leaseTokenHash: hashToken(input.leaseToken),
         leaseRevision: input.leaseRevision,
@@ -879,97 +914,82 @@ async function completeActionDelivery(input) {
       if (terminalStatus === "COMPLETED") await finalizeSfsSuccess({ delivery: current, outcomeCode, result, db: tx, now });
       else await finalizeSfsTerminal({ delivery: current, status: terminalStatus, failureCode: outcomeCode, db: tx });
     }
-    return tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    const latest = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    await updateCandidateFromTerminal(latest, terminalStatus, outcomeCode, tx);
+    return latest;
   }, { timeout: 30_000 });
-  await updateCandidateFromTerminal(finalDelivery, terminalStatus, outcomeCode);
   return { ok: true, duplicate: false, delivery: finalDelivery };
 }
 
 async function failActionDelivery(input) {
-  const delivery = await requireLease(input);
+  const delivery = await requireLease({ ...input, allowCommittedSettlement: true });
   const now = new Date();
   const failureCode = clean(input.failureCode, 120) || "unknown";
   const lastError = clean(input.error, 2000) || failureCode;
+  const reportedFailureCategory = normalizeFailureCategory(input.failureCategory);
+  const inputResult = object(input.result);
+  const provenNoEffect = inputResult.provenNoEffect === true;
+  const failureCategory = classifyAutomationFailure({ failureCode, deliveryStatus: delivery.status, provenNoEffect, idempotent: inputResult.idempotent === true });
   const safetyRecovery = mustPreserveRefollowSaga(delivery, failureCode) || isSfsCleanupDelivery(delivery);
-  const retryable = input.retryable === true && (safetyRecovery || delivery.attempts < delivery.maxAttempts);
+  const reconcile = failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE;
+  const categoryRetryable = SAFE_RETRY_CATEGORIES.includes(failureCategory) || reconcile;
+  const retryable = categoryRetryable && (reconcile || safetyRecovery || delivery.attempts < delivery.maxAttempts);
   const nextStatus = retryable ? "RETRY_SCHEDULED" : "FAILED";
   const nextNotBefore = retryable ? new Date(now.getTime() + retryDelayMs(delivery.attempts, failureCode, input.retryAfterMs)) : delivery.notBefore;
   const result = {
-    ...object(delivery.result),
-    ...object(input.result),
-    failureCode,
-    failedAt: now.toISOString(),
-    retryable,
+    ...object(delivery.result), ...inputResult, failureCode, failureCategory, reportedFailureCategory,
+    outcomeState: reconcile ? "RECONCILE_REQUIRED" : (provenNoEffect ? "PROVEN_NO_EFFECT" : "TERMINAL"), failedAt: now.toISOString(), retryable,
   };
-  const changed = await prisma.automationDelivery.updateMany({
-    where: {
-      id: delivery.id,
-      status: { in: ["CLAIMED", "RUNNING"] },
-      claimedByDeviceId: input.deviceId,
-      leaseTokenHash: hashToken(input.leaseToken),
-      leaseRevision: input.leaseRevision,
-    },
-    data: {
-      status: nextStatus,
-      failureCode,
-      lastError,
-      result,
-      notBefore: nextNotBefore,
-      finishedAt: retryable ? null : now,
-      claimedByDeviceId: null,
-      claimedAt: null,
-      claimUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-      lastCheckedAt: now,
-    },
-  });
-  if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before failure update");
-  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
-  if (retryable) {
-    await updateModuleCandidateProgress(updated, "RETRY_SCHEDULED", failureCode);
-    if (updated?.moduleKey === "likes") await finalizeLikeFailure({ delivery: updated, failureCode, retryable: true, result });
-    if (updated?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await finalizeFollowAutomationFailure({ delivery: updated, failureCode, retryable: true });
-    if (updated?.moduleKey === SFS_MODULE_KEY) await finalizeSfsFailure({ delivery: updated, failureCode, retryable: true });
-  } else {
-    await updateCandidateFromTerminal(updated, "FAILED", failureCode);
-    if (updated?.moduleKey === "bumps") await finalizeBumpFailure({ delivery: updated, failureCode, retryable: false });
-    if (updated?.moduleKey === "likes") await finalizeLikeFailure({ delivery: updated, failureCode, retryable: false, result });
-    if (updated?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await finalizeFollowAutomationFailure({ delivery: updated, failureCode, retryable: false });
-    if (updated?.moduleKey === SFS_MODULE_KEY) await finalizeSfsFailure({ delivery: updated, failureCode, retryable: false });
-  }
-  return { ok: true, retryable, retryAt: retryable ? nextNotBefore : null, delivery: updated };
+  const updated = await prisma.$transaction(async (tx) => {
+    await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: { in: LEASED_STATUSES }, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision },
+      data: {
+        status: nextStatus, failureCode, failureCategory, reportedFailureCategory, lastError, result, notBefore: nextNotBefore,
+        finishedAt: retryable ? null : now, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null,
+        leaseRevision: { increment: 1 }, lastCheckedAt: now,
+      },
+    });
+    if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before failure update");
+    const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    if (retryable) {
+      await updateModuleCandidateProgress(current, "RETRY_SCHEDULED", failureCode, tx);
+      if (current?.moduleKey === "likes") await finalizeLikeFailure({ delivery: current, failureCode, retryable: true, result, db: tx });
+      if (current?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await finalizeFollowAutomationFailure({ delivery: current, failureCode, retryable: true, db: tx });
+      if (current?.moduleKey === SFS_MODULE_KEY) await finalizeSfsFailure({ delivery: current, failureCode, retryable: true, db: tx });
+    } else {
+      await updateCandidateFromTerminal(current, "FAILED", failureCode, tx);
+      if (current?.moduleKey === "bumps") await finalizeBumpFailure({ delivery: current, failureCode, retryable: false, db: tx });
+      if (current?.moduleKey === "likes") await finalizeLikeFailure({ delivery: current, failureCode, retryable: false, result, db: tx });
+      if (current?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await finalizeFollowAutomationFailure({ delivery: current, failureCode, retryable: false, db: tx });
+      if (current?.moduleKey === SFS_MODULE_KEY) await finalizeSfsFailure({ delivery: current, failureCode, retryable: false, db: tx });
+    }
+    return current;
+  }, { timeout: 30_000 });
+  return { ok: true, retryable, retryAt: retryable ? nextNotBefore : null, failureCategory, delivery: updated };
 }
 
 async function releaseActionDelivery(input) {
   const delivery = await requireLease({ ...input, allowExpired: true });
+  if (delivery.status === "COMMITTING") throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "A committed write cannot be released; reconcile its outcome");
   const now = new Date();
   const runAfterMs = Math.max(0, Math.min(24 * 60 * 60_000, Number(input.runAfterMs) || 0));
-  const changed = await prisma.automationDelivery.updateMany({
-    where: {
-      id: delivery.id,
-      status: { in: ["CLAIMED", "RUNNING"] },
-      claimedByDeviceId: input.deviceId,
-      leaseTokenHash: hashToken(input.leaseToken),
-      leaseRevision: input.leaseRevision,
-    },
-    data: {
-      status: "QUEUED",
-      notBefore: new Date(now.getTime() + runAfterMs),
-      claimedByDeviceId: null,
-      claimedAt: null,
-      claimUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-      attempts: { decrement: 1 },
-      failureCode: null,
-      lastError: clean(input.reason, 500),
-      result: { ...object(delivery.result), releasedAt: now.toISOString(), releaseReason: clean(input.reason, 500) },
-    },
-  });
-  if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before release");
-  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
-  await updateModuleCandidateProgress(updated, "QUEUED", clean(input.reason, 500));
+  const updated = await prisma.$transaction(async (tx) => {
+    await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: { in: ["CLAIMED", "RUNNING"] }, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision },
+      data: {
+        status: "QUEUED", notBefore: new Date(now.getTime() + runAfterMs), claimedByDeviceId: null, claimedAt: null, claimUntil: null,
+        leaseTokenHash: null, leaseRevision: { increment: 1 }, attempts: { decrement: 1 }, failureCode: null, failureCategory: null,
+        reportedFailureCategory: null, lastError: clean(input.reason, 500),
+        result: { ...object(delivery.result), releasedAt: now.toISOString(), releaseReason: clean(input.reason, 500) },
+      },
+    });
+    if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before release");
+    const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    await updateModuleCandidateProgress(current, "QUEUED", clean(input.reason, 500), tx);
+    return current;
+  }, { timeout: 30_000 });
   return { ok: true, delivery: updated };
 }
 
@@ -1031,24 +1051,27 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
     }
     if (validation.ok === false && validation.code === "already_liked") {
       const now = new Date();
-      const changed = await prisma.automationDelivery.updateMany({
-        where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
-        data: {
-          status: "COMPLETED",
-          failureCode: null,
-          lastError: null,
-          finishedAt: now,
-          claimedByDeviceId: null,
-          claimedAt: null,
-          claimUntil: null,
-          leaseTokenHash: null,
-          leaseRevision: { increment: 1 },
-          result: { ...object(delivery.result), code: "already_liked", idempotent: true, completedAt: now.toISOString() },
-        },
+      const latest = await prisma.$transaction(async (tx) => {
+        const changed = await tx.automationDelivery.updateMany({
+          where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
+          data: {
+            status: "COMPLETED",
+            failureCode: null,
+            lastError: null,
+            finishedAt: now,
+            claimedByDeviceId: null,
+            claimedAt: null,
+            claimUntil: null,
+            leaseTokenHash: null,
+            leaseRevision: { increment: 1 },
+            result: { ...object(delivery.result), code: "already_liked", idempotent: true, completedAt: now.toISOString() },
+          },
+        });
+        if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before idempotent completion");
+        const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+        await finalizeLikeTerminal({ delivery: current, status: "COMPLETED", failureCode: "already_liked", result: current?.result || {}, db: tx });
+        return current;
       });
-      if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before idempotent completion");
-      const latest = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
-      await finalizeLikeTerminal({ delivery: latest, status: "COMPLETED", failureCode: "already_liked", result: latest?.result || {} });
       return { ok: true, duplicate: true, delivery: latest };
     }
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
@@ -1094,9 +1117,9 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
     if (latest?.moduleKey === "likes") await prepareLikeRetry({ delivery: latest, db: tx });
     if (latest?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await prepareFollowAutomationRetry({ delivery: latest, db: tx });
     if (latest?.moduleKey === SFS_MODULE_KEY) await prepareSfsRetry({ delivery: latest, db: tx });
+    await updateModuleCandidateProgress(latest, "QUEUED", null, tx);
     return latest;
   });
-  await updateModuleCandidateProgress(updated, "QUEUED");
   return { ok: true, delivery: updated };
 }
 
@@ -1104,6 +1127,9 @@ async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_can
   const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
+  if (delivery.status === "COMMITTING") {
+    throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before cancellation");
+  }
   if (isSfsCleanupDelivery(delivery)) {
     throw new ActionDeliveryError("UNSAFE_SFS_CLEANUP_CANCEL", "An SFS safety unfollow cannot be canceled");
   }
@@ -1143,66 +1169,39 @@ async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_can
     if (latest?.moduleKey === SFS_MODULE_KEY) {
       await finalizeSfsTerminal({ delivery: latest, status: "CANCELED", failureCode: "canceled", db: tx });
     }
+    await updateCandidateFromTerminal(latest, "CANCELED", "canceled", tx);
     return latest;
   });
-  await updateCandidateFromTerminal(updated, "CANCELED", "canceled");
   return { ok: true, duplicate: false, delivery: updated };
 }
 
 async function releaseClaimByAdmin({ agencyId, deliveryId }) {
   const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  if (delivery.status === "COMMITTING") throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before administrative release");
   if (!["CLAIMED", "RUNNING"].includes(delivery.status)) return { ok: true, duplicate: true, delivery };
-  const changed = await prisma.automationDelivery.updateMany({
-    where: { id: delivery.id, status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
-    data: {
-      status: "QUEUED",
-      notBefore: new Date(Date.now() + 15_000),
-      claimedByDeviceId: null,
-      claimedAt: null,
-      claimUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-      attempts: { decrement: 1 },
-      lastError: "Claim released by administrator",
-    },
+  const updated = await prisma.$transaction(async (tx) => {
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
+      data: { status: "QUEUED", notBefore: new Date(Date.now() + 15_000), claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, attempts: { decrement: 1 }, lastError: "Claim released by administrator" },
+    });
+    if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before administrative release");
+    const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    await updateModuleCandidateProgress(current, "QUEUED", "claim_released", tx);
+    return current;
   });
-  if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before administrative release");
-  const updated = await prisma.automationDelivery.findUnique({ where: { id: delivery.id } });
-  await updateModuleCandidateProgress(updated, "QUEUED", "claim_released");
   return { ok: true, delivery: updated };
 }
 
 async function retrySafeFailures({ agencyId, creatorId = null, moduleKey = null, limit = 100 }) {
-  const safeCodes = [
-    "network_error",
-    "timeout",
-    "rate_limited",
-    "temporary_of_error",
-    "backend_temporary_error",
-    "creator_unavailable",
-    "lease_lost",
-    "unknown",
-  ];
   const rows = await prisma.automationDelivery.findMany({
-    where: {
-      agencyId,
-      status: "FAILED",
-      failureCode: { in: safeCodes },
-      ...(creatorId ? { creatorId } : {}),
-      ...(moduleKey ? { moduleKey } : {}),
-    },
-    orderBy: { updatedAt: "asc" },
-    take: Math.max(1, Math.min(500, Number(limit) || 100)),
-    select: { id: true },
+    where: { agencyId, status: "FAILED", failureCategory: { in: SAFE_RETRY_CATEGORIES }, ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}) },
+    orderBy: { updatedAt: "asc" }, take: Math.max(1, Math.min(500, Number(limit) || 100)), select: { id: true },
   });
   const results = [];
   for (const row of rows) {
-    try {
-      results.push(await retryActionDelivery({ agencyId, deliveryId: row.id }));
-    } catch (error) {
-      results.push({ ok: false, deliveryId: row.id, code: error?.code || "retry_failed", error: error?.message || String(error) });
-    }
+    try { results.push(await retryActionDelivery({ agencyId, deliveryId: row.id })); }
+    catch (error) { results.push({ ok: false, deliveryId: row.id, code: error?.code || "retry_failed", error: error?.message || String(error) }); }
   }
   return { ok: true, requested: rows.length, retried: results.filter((item) => item.ok).length, results };
 }
@@ -1216,6 +1215,7 @@ module.exports = {
   renewActionLease,
   startActionDelivery,
   validateActionDelivery,
+  prepareWriteActionDelivery,
   completeActionDelivery,
   failActionDelivery,
   releaseActionDelivery,

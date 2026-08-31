@@ -9,12 +9,16 @@ function tokenHash(value) {
 }
 
 function loadService(fixture) {
+  fixture.db.jobInstance = fixture.db.jobInstance || {};
+  if (typeof fixture.db.jobInstance.findMany !== "function") fixture.db.jobInstance.findMany = async () => [];
+  if (typeof fixture.db.$transaction !== "function") fixture.db.$transaction = async (work) => work(fixture.db);
   const prismaModule = require.resolve("../prisma");
   const resultModule = require.resolve("./job-result-service");
   const catalogModule = require.resolve("./job-catalog");
   const fenceModule = require.resolve("./dialog-job-completion-fence");
   const dailyModule = require.resolve("./vault-intelligence-daily-service");
   const notificationSyncModule = require.resolve("./notification-sync-state-service");
+  const accessFenceModule = require.resolve("./execution-access-fence-service");
   require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: fixture.db };
   require.cache[resultModule] = {
     id: resultModule, filename: resultModule, loaded: true,
@@ -44,6 +48,14 @@ function loadService(fixture) {
     exports: {
       completeNotificationSync: fixture.completeNotificationSync
         || (async () => ({ id: "notification-sync-state" })),
+    },
+  };
+  class TestExecutionAccessFenceError extends Error {}
+  require.cache[accessFenceModule] = {
+    id: accessFenceModule, filename: accessFenceModule, loaded: true,
+    exports: {
+      ExecutionAccessFenceError: TestExecutionAccessFenceError,
+      assertExecutionAccessFence: fixture.assertExecutionAccessFence || (async () => ({ ok: true })),
     },
   };
   delete require.cache[require.resolve("./job-lease-service")];
@@ -184,7 +196,11 @@ test("claim allows another device workflow for the same creator and honors only 
     creatorAccount: { findMany: async () => [{ id: "creator-1" }, { id: "creator-2" }] },
     deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }, { creatorId: "creator-2" }] },
     jobInstance: {
-      findMany: async () => { legacyLiveLeaseQueryCalled = true; return [{ creatorId: "creator-1" }]; },
+      findMany: async ({ where } = {}) => {
+        const statuses = where?.status?.in || [];
+        if (!Array.isArray(statuses) || !statuses.every((value) => ["CLAIMED", "RUNNING"].includes(value))) legacyLiveLeaseQueryCalled = true;
+        return [];
+      },
       findFirst: async ({ where }) => { candidateWhere = where; return candidate; },
       updateMany: async ({ where }) => where?.id === candidate.id ? { count: 1 } : { count: 0 },
       findUnique: async () => ({
@@ -876,4 +892,96 @@ test("explicitly forced notification FULL is exempt from the legacy-mode lease f
   assert.equal(result.status, "CLAIMED");
   assert.ok(update.data.leaseUntil instanceof Date);
   assert.equal(update.data.status, undefined);
+});
+
+test("Audit13 generic completion writes nothing when another worker reclaimed before reservation", async () => {
+  const item = fixture();
+  item.job.jobKey = "traffic_sources_scan";
+  let projectorCalls = 0;
+  item.db.jobInstance.updateMany = async () => ({ count: 0 });
+  const { completeJob } = loadService({
+    db: item.db,
+    applyJobResult: async () => { projectorCalls += 1; return { ok: true }; },
+  });
+
+  await assert.rejects(
+    completeJob({
+      jobId: item.job.id,
+      userId: "user-1",
+      deviceId: "device-1",
+      leaseToken: item.token,
+      leaseRevision: 3,
+      workId: "stale-worker-a",
+      result: { sources: [{ id: "stale" }] },
+      progress: { percent: 100 },
+    }),
+    (error) => error?.code === "JOB_LEASE_STALE",
+  );
+  assert.equal(projectorCalls, 0, "stale worker must not enter the durable projector after losing completion reservation");
+});
+
+test("Audit13 generic completion reservation, projector and terminal commit share one transaction client", async () => {
+  const item = fixture();
+  item.job.jobKey = "traffic_sources_scan";
+  const order = [];
+  let updates = 0;
+  item.db.jobInstance.updateMany = async () => {
+    updates += 1;
+    order.push(updates === 1 ? "reserved" : "completed");
+    return { count: 1 };
+  };
+  const { completeJob } = loadService({
+    db: item.db,
+    applyJobResult: async ({ db }) => {
+      assert.equal(db, item.db, "projector must use the completion transaction client");
+      order.push("projection");
+      return { ok: true, type: "traffic" };
+    },
+  });
+
+  const result = await completeJob({
+    jobId: item.job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: item.token,
+    leaseRevision: 3,
+    workId: "worker-a",
+    result: { sources: [] },
+    progress: { percent: 100 },
+  });
+  assert.deepEqual(order, ["reserved", "projection", "completed"]);
+  assert.equal(result.job.status, "DONE");
+});
+
+test("Audit13 renew rechecks execution access with a transaction row lock before lease mutation", async () => {
+  const item = fixture();
+  item.job.creatorId = "creator-1";
+  item.job.leaseMemberId = "member-1";
+  item.job.leaseAccessEpoch = 7;
+  const locks = [];
+  const { renewLease } = loadService({ ...item, assertExecutionAccessFence: async (input) => { locks.push(input.lock === true); return { ok: true }; } });
+  await renewLease({ jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3, leaseMs: 60_000 });
+  assert.deepEqual(locks, [false, true]);
+});
+
+test("Audit13 cooperative release rechecks execution access with a transaction row lock before reschedule", async () => {
+  const item = fixture();
+  item.job.creatorId = "creator-1";
+  item.job.leaseMemberId = "member-1";
+  item.job.leaseAccessEpoch = 7;
+  const locks = [];
+  const { releaseJob } = loadService({ ...item, assertExecutionAccessFence: async (input) => { locks.push(input.lock === true); return { ok: true }; } });
+  await releaseJob({ jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3, reason: "context unavailable" });
+  assert.deepEqual(locks, [false, true]);
+});
+
+test("Audit13 failure report rechecks execution access with a transaction row lock before domain projection", async () => {
+  const item = fixture();
+  item.job.creatorId = "creator-1";
+  item.job.leaseMemberId = "member-1";
+  item.job.leaseAccessEpoch = 7;
+  const locks = [];
+  const { failJob } = loadService({ ...item, assertExecutionAccessFence: async (input) => { locks.push(input.lock === true); return { ok: true }; } });
+  await failJob({ jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3, error: "temporary", retryable: true });
+  assert.deepEqual(locks, [false, true]);
 });

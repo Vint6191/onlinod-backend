@@ -16,7 +16,7 @@ const {
   requireCreator,
 } = require("./automation-control-service");
 
-const ACTIVE_ACTION_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED", "PAUSED"];
+const ACTIVE_ACTION_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RETRY_SCHEDULED", "PAUSED"];
 const SEND_ACTION = "SEND_MESSAGE";
 const DELETE_ACTION = "DELETE_MESSAGE";
 const SOURCE_KEYS = new Set(["online", "hidden_online", "paid_subscriber", "free_subscriber", "subscription_event", "manual"]);
@@ -806,7 +806,7 @@ async function getBumpOverview({ agencyId, creatorId, db = prisma }) {
     db.automationBumpFanState.count({ where: { agencyId, creatorId } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: { in: ["QUEUED", "RETRY_SCHEDULED"] } } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: "CLAIMED" } }),
-    db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: "RUNNING" } }),
+    db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: { in: ["RUNNING", "COMMITTING"] } } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, actionType: SEND_ACTION, status: "COMPLETED", finishedAt: { gte: dayStart(now) } } }),
     db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, status: "FAILED", updatedAt: { gte: dayStart(now) } } }),
     db.bumpDeliveryStat.aggregate({ where: { agencyId, creatorId }, _sum: { replied: true } }),

@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
+const { reschedulePlannedJob } = require("./job-planning-repository");
 const { readCampaignsWithRevenue } = require("./creator-analytics-ledger-service");
 
 const JOB_KEY = "fetch_campaigns";
@@ -75,23 +76,13 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   const active = await activeJob(db, creator.id);
   if (active?.status === "PAUSED") {
-    const resumed = await db.jobInstance.update({
-      where: { id: active.id },
-      data: {
-        status: "SCHEDULED",
-        nextRunAt: now,
-        scheduledAt: now,
-        claimedAt: null,
-        claimedByDeviceId: null,
-        leaseUntil: null,
-        leaseTokenHash: null,
-        leaseRevision: { increment: 1 },
-        workId: null,
-        completedAt: null,
-        lastError: null,
-      },
+    const planned = await reschedulePlannedJob({
+      db, job: active, params: active.params || {}, priority: active.priority || 0,
+      scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
+      lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
+      protectedStatuses: [],
     });
-    return { job: resumed, action: "resumed" };
+    return { job: planned.job, action: "resumed" };
   }
   if (active) return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
 

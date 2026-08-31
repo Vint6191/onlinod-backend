@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { isOwner, normalizeAssignedCreators } = require("./team-access-control");
+const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
 const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-result-service");
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
@@ -176,15 +177,11 @@ async function requireOwnedDevice({ userId, deviceId }) {
   if (!device || device.userId !== userId) throw new JobLeaseError("NOT_YOUR_DEVICE", "Invalid device", 403);
   const member = await prisma.agencyMember.findFirst({
     where: { agencyId: device.agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
-    select: { id: true },
   });
   if (!member) throw new JobLeaseError("DEVICE_AGENCY_ACCESS_REVOKED", "Device agency access was revoked", 403);
-  return device;
+  return { device, member };
 }
-async function scopedCreatorIds({ userId, device }) {
-  const member = await prisma.agencyMember.findFirst({
-    where: { agencyId: device.agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
-  });
+async function scopedCreatorIds({ device, member }) {
   if (!member) return [];
   const scope = normalizeAssignedCreators(member.assignedCreators);
   const broad = isOwner(member) || scope.mode === "all";
@@ -239,20 +236,20 @@ function notificationScannerSuccessful(job, result) {
     return row.status === "complete" && Number(row.rejected || 0) === 0;
   });
 }
-async function notificationFullIsRedundant(job) {
+async function notificationFullIsRedundant(job, db = prisma) {
   if (job?.jobKey !== "catchup_notifications_scan") return false;
   const params = object(job.params);
   if (notificationJobMode(params) !== "full" || params.forceNotificationFullRebuild === true) return false;
-  if (!prisma?.creatorNotificationSyncState?.findUnique) return false;
-  const state = await prisma.creatorNotificationSyncState.findUnique({
+  if (!db?.creatorNotificationSyncState?.findUnique) return false;
+  const state = await db.creatorNotificationSyncState.findUnique({
     where: { creatorId: job.creatorId },
     select: { fullBackfillCompletedAt: true, fullBackfillVerifiedAt: true },
   });
   return Boolean(state?.fullBackfillCompletedAt || state?.fullBackfillVerifiedAt);
 }
-async function cancelRedundantNotificationFull(job, now = new Date()) {
-  if (!(await notificationFullIsRedundant(job))) return false;
-  const cancelled = await prisma.jobInstance.updateMany({
+async function cancelRedundantNotificationFull(job, now = new Date(), db = prisma) {
+  if (!(await notificationFullIsRedundant(job, db))) return false;
+  const cancelled = await db.jobInstance.updateMany({
     where: { id: job.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
     data: {
       status: "CANCELLED",
@@ -270,49 +267,39 @@ async function cancelRedundantNotificationFull(job, now = new Date()) {
 }
 
 async function sweepExpiredLeases(now = new Date()) {
-  const terminal = await prisma.jobInstance.updateMany({
-    where: {
-      status: "CLAIMED",
-      leaseUntil: { lt: now },
-      attempts: { gte: MAX_ATTEMPTS - 1 },
-    },
-    data: {
-      status: "FAILED",
-      attempts: { increment: 1 },
-      completedAt: now,
-      lastError: "lease expired",
-      claimedAt: null,
-      claimedByDeviceId: null,
-      leaseUntil: null,
-      leaseTokenHash: null,
-      workId: null,
-    },
+  const rows = await prisma.jobInstance.findMany({
+    where: { status: "CLAIMED", leaseUntil: { lt: now } },
+    take: 10000,
   });
-  const retry = await prisma.jobInstance.updateMany({
-    where: {
-      status: "CLAIMED",
-      leaseUntil: { lt: now },
-      attempts: { lt: MAX_ATTEMPTS - 1 },
-    },
-    data: {
-      status: "SCHEDULED",
-      attempts: { increment: 1 },
-      nextRunAt: new Date(now.getTime() + RETRY_BACKOFF_MS),
-      lastError: "lease expired",
-      claimedAt: null,
-      claimedByDeviceId: null,
-      leaseUntil: null,
-      leaseTokenHash: null,
-      workId: null,
-    },
-  });
-  return terminal.count + retry.count;
+  let changed = 0;
+  for (const job of rows) {
+    const attempts = Number(job.attempts || 0) + 1;
+    const terminal = attempts >= MAX_ATTEMPTS;
+    const data = terminal ? {
+      status: "FAILED", attempts, completedAt: now, lastError: "lease expired",
+      claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null,
+    } : {
+      status: "SCHEDULED", attempts, nextRunAt: new Date(now.getTime() + RETRY_BACKOFF_MS), lastError: "lease expired",
+      claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null,
+    };
+    const applied = await prisma.$transaction(async (tx) => {
+      const updated = await tx.jobInstance.updateMany({
+        where: { id: job.id, status: "CLAIMED", leaseRevision: job.leaseRevision, leaseUntil: { lt: now } },
+        data,
+      });
+      if (!updated.count) return false;
+      await recordJobFailure({ db: tx, job, error: "lease expired", terminal });
+      return true;
+    }, JOB_COMPLETION_TRANSACTION_OPTIONS);
+    if (applied) changed += 1;
+  }
+  return changed;
 }
 async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds = [], dialogDiscoveryOnly = false }) {
-  const device = await requireOwnedDevice({ userId, deviceId });
+  const { device, member } = await requireOwnedDevice({ userId, deviceId });
   await sweepExpiredLeases();
   if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60 * 1000)) return { job: null, reason: "device-stale" };
-  const creatorIds = await scopedCreatorIds({ userId, device });
+  const creatorIds = await scopedCreatorIds({ device, member });
   if (!creatorIds.length) return { job: null, reason: "no-creators-visible" };
   const allowedJobKeys = filterClaimableDesktopJobKeys(jobKeys);
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
@@ -360,7 +347,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       },
       data: {
         status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,
-        leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 }, startedAt: candidate.startedAt || now, lastError: null,
+        leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 }, leaseMemberId: member.id, leaseAccessEpoch: Number(member.accessEpoch || 1), startedAt: candidate.startedAt || now, lastError: null,
         progress: clearWaitProgress(candidate.progress),
       },
     });
@@ -375,6 +362,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
         id: claimed.id, jobKey: claimed.jobKey, scope: claimed.scope, creatorId: claimed.creatorId, agencyId: claimed.agencyId,
         idempotencyKey: claimed.idempotencyKey, params: claimed.params || {}, priority: claimed.priority, creator: claimed.creator || null,
         attempt: claimed.attempts + 1, leaseUntil: claimed.leaseUntil, leaseToken, leaseRevision: claimed.leaseRevision,
+        leaseAccessEpoch: claimed.leaseAccessEpoch,
         workId: claimed.workId, continuation: normalizeLeaseContinuation(claimed.continuation), progress: claimed.progress,
       },
       reason: "claimed",
@@ -383,7 +371,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   return { job: null, reason: "race-lost" };
 }
 async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired = false }) {
-  const device = await requireOwnedDevice({ userId, deviceId });
+  const { device, member } = await requireOwnedDevice({ userId, deviceId });
   const job = await prisma.jobInstance.findUnique({ where: { id: jobId } });
   if (!job) throw new JobLeaseError("JOB_NOT_FOUND", "Job not found", 404);
   if (job.agencyId && job.agencyId !== device.agencyId) throw new JobLeaseError("JOB_DEVICE_AGENCY_MISMATCH", "Job belongs to a different device agency", 403);
@@ -392,6 +380,18 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   if (!tokenMatches(leaseToken, job.leaseTokenHash)) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease token is stale");
   if (!Number.isInteger(leaseRevision) || job.leaseRevision !== leaseRevision) throw new JobLeaseError("JOB_LEASE_REVISION_STALE", "Job lease revision is stale");
   if (!allowExpired && (!job.leaseUntil || job.leaseUntil.getTime() <= Date.now())) throw new JobLeaseError("JOB_LEASE_EXPIRED", "Job lease expired");
+  try {
+    await assertExecutionAccessFence({
+      userId,
+      agencyId: device.agencyId,
+      memberId: job.leaseMemberId,
+      accessEpoch: job.leaseAccessEpoch,
+      creatorId: job.creatorId,
+    });
+  } catch (error) {
+    if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
+    throw error;
+  }
   // Normalize in memory before any lease/result service consumes this job. This
   // protects side effects from legacy execute->execute nesting even before the
   // next durable checkpoint rewrites the database row in canonical form.
@@ -401,12 +401,6 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
 async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation }) {
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
   const now = new Date();
-  // Also fence a FULL that became redundant *after* it was claimed (for
-  // example another worker completed the accepted baseline concurrently).
-  // Desktop treats 409 as a stale lease and stops the chunk immediately.
-  if (await cancelRedundantNotificationFull(job, now)) {
-    throw new JobLeaseError("JOB_SUPERSEDED", "Notification full scan was superseded by existing history", 409);
-  }
   const tokenHash = hashToken(leaseToken);
   const data = {
     leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
@@ -416,14 +410,34 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   if (normalizedProgress) data.progress = normalizedProgress;
   if (continuation !== undefined) data.continuation = normalizeLeaseContinuation(continuation);
   if (normalizedProgress || continuation !== undefined) data.lastProgressAt = now;
-  // A pure keepalive must update only leaseUntil. Rewriting an unchanged JSON
-  // continuation made one poisoned legacy value break every heartbeat forever.
-  const result = await prisma.jobInstance.updateMany({
-    where: { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: tokenHash, leaseRevision, leaseUntil: { gt: now } },
-    data,
-  });
-  if (!result.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before renewal");
-  const updated = await prisma.jobInstance.findUnique({ where: { id: job.id } });
+
+  const outcome = await prisma.$transaction(async (tx) => {
+    try {
+      await assertExecutionAccessFence({
+        db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
+        accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock: true,
+      });
+    } catch (error) {
+      if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
+      throw error;
+    }
+    // Also fence a FULL that became redundant *after* it was claimed. The
+    // access fence and redundant-cancel mutation must share this transaction;
+    // otherwise a revoke could land between the continuation check and write.
+    if (await cancelRedundantNotificationFull(job, now, tx)) return { superseded: true };
+    // A pure keepalive updates only leaseUntil. Rewriting unchanged poisoned
+    // legacy JSON on every heartbeat was intentionally removed earlier.
+    const result = await tx.jobInstance.updateMany({
+      where: { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: tokenHash, leaseRevision, leaseUntil: { gt: now } },
+      data,
+    });
+    if (!result.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before renewal");
+    const updated = await tx.jobInstance.findUnique({ where: { id: job.id } });
+    return { superseded: false, updated };
+  }, JOB_CHUNK_TRANSACTION_OPTIONS);
+
+  if (outcome.superseded) throw new JobLeaseError("JOB_SUPERSEDED", "Notification full scan was superseded by existing history", 409);
+  const updated = outcome.updated;
   return {
     id: updated.id,
     status: updated.status,
@@ -444,6 +458,15 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     : normalizeLeaseContinuation(continuation);
 
   return prisma.$transaction(async (tx) => {
+    try {
+      await assertExecutionAccessFence({
+        db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
+        accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock: true,
+      });
+    } catch (error) {
+      if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
+      throw error;
+    }
     const updatedFence = await tx.jobInstance.updateMany({
       where: {
         id: job.id,
@@ -792,11 +815,34 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     return completed;
   }
 
-  const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
-  const updated = await prisma.jobInstance.updateMany({ where: fenceWhere, data: completionData });
-  if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion");
-  await maybeAdvanceCreatorAnalyticsInitialSync(job, sideEffect);
-  return { job: { id: job.id, status: "DONE" }, sideEffect };
+  const completed = await prisma.$transaction(async (tx) => {
+    try {
+      await assertExecutionAccessFence({
+        db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
+        accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock: true,
+      });
+    } catch (error) {
+      if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
+      throw error;
+    }
+    const reserved = await tx.jobInstance.updateMany({
+      where: fenceWhere,
+      data: { leaseRevision: { increment: 1 }, leaseUntil: new Date(now.getTime() + MAX_LEASE_MS), lastProgressAt: now },
+    });
+    if (!reserved.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion reservation");
+    const sideEffect = await applyJobResult({ db: tx, job, deviceId, userId, result: result || {} });
+    const updated = await tx.jobInstance.updateMany({
+      where: {
+        id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: hashToken(leaseToken),
+        leaseRevision: leaseRevision + 1,
+      },
+      data: completionData,
+    });
+    if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job completion reservation was lost");
+    return sideEffect;
+  }, JOB_COMPLETION_TRANSACTION_OPTIONS);
+  await maybeAdvanceCreatorAnalyticsInitialSync(job, completed);
+  return { job: { id: job.id, status: "DONE" }, sideEffect: completed };
 }
 async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, error, result, retryable = true }) {
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired: true });
@@ -812,16 +858,23 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
     nextRunAt: new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1))), claimedAt: null,
     claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null,
   };
-  const updated = await prisma.jobInstance.updateMany({
-    where: { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: hashToken(leaseToken), leaseRevision },
-    data,
-  });
-  if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before failure report");
-  try {
-    await recordJobFailure({ job, error: errorText, terminal });
-  } catch {
-    // Failure projection is best-effort after the fenced job transition succeeds.
-  }
+  await prisma.$transaction(async (tx) => {
+    try {
+      await assertExecutionAccessFence({
+        db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
+        accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock: true,
+      });
+    } catch (accessError) {
+      if (accessError instanceof ExecutionAccessFenceError) throw new JobLeaseError(accessError.code, accessError.message, accessError.status);
+      throw accessError;
+    }
+    const updated = await tx.jobInstance.updateMany({
+      where: { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: hashToken(leaseToken), leaseRevision },
+      data,
+    });
+    if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before failure report");
+    await recordJobFailure({ db: tx, job, error: errorText, terminal });
+  }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   return { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", terminal, retryAt: terminal ? null : data.nextRunAt };
 }
 
@@ -829,36 +882,46 @@ async function releaseJob({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired: true });
   const now = new Date();
   const delay = Math.max(1_000, Math.min(15 * 60_000, Math.floor(Number(runAfterMs) || 30_000)));
-  const updated = await prisma.jobInstance.updateMany({
-    where: {
-      id: job.id,
-      status: "CLAIMED",
-      claimedByDeviceId: deviceId,
-      leaseTokenHash: hashToken(leaseToken),
-      leaseRevision,
-    },
-    data: {
-      status: "SCHEDULED",
-      nextRunAt: new Date(now.getTime() + delay),
-      // A cooperative lease release is not a failed attempt. Keep the reason in
-      // bounded progress diagnostics so the UI can say what it is waiting for,
-      // but never poison the whole pipeline with a fake RETRYING state.
-      lastError: null,
-      progress: {
-        ...object(job.progress),
-        waitKind: waitKind(reason),
-        waitReason: clean(reason, 500) || "worker released lease",
-        waitingSince: now.toISOString(),
-        retryAt: new Date(now.getTime() + delay).toISOString(),
+  await prisma.$transaction(async (tx) => {
+    try {
+      await assertExecutionAccessFence({
+        db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
+        accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock: true,
+      });
+    } catch (error) {
+      if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
+      throw error;
+    }
+    const updated = await tx.jobInstance.updateMany({
+      where: {
+        id: job.id,
+        status: "CLAIMED",
+        claimedByDeviceId: deviceId,
+        leaseTokenHash: hashToken(leaseToken),
+        leaseRevision,
       },
-      claimedAt: null,
-      claimedByDeviceId: null,
-      leaseUntil: null,
-      leaseTokenHash: null,
-      workId: clean(workId, 200) || job.workId,
-    },
-  });
-  if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before release");
+      data: {
+        status: "SCHEDULED",
+        nextRunAt: new Date(now.getTime() + delay),
+        // A cooperative lease release is not a failed attempt. Keep the reason
+        // in bounded progress diagnostics, never as a fake retry failure.
+        lastError: null,
+        progress: {
+          ...object(job.progress),
+          waitKind: waitKind(reason),
+          waitReason: clean(reason, 500) || "worker released lease",
+          waitingSince: now.toISOString(),
+          retryAt: new Date(now.getTime() + delay).toISOString(),
+        },
+        claimedAt: null,
+        claimedByDeviceId: null,
+        leaseUntil: null,
+        leaseTokenHash: null,
+        workId: clean(workId, 200) || job.workId,
+      },
+    });
+    if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before release");
+  }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   return { id: job.id, status: "SCHEDULED", retryAt: new Date(now.getTime() + delay), attempts: job.attempts };
 }
 module.exports = {

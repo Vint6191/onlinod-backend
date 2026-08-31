@@ -126,15 +126,17 @@ test("manual start resumes the same current-v8 paused catch-up without clearing 
   const db = {
     jobInstance: {
       async findMany() { return [paused]; },
+      async findUnique() { return { ...paused, ...(updateData || {}) }; },
       async update({ data }) { updateData = data; return { ...paused, ...data, status: "SCHEDULED" }; },
+      async updateMany({ data }) { updateData = data; return { count: 1 }; },
     },
   };
   const result = await startManualNotificationScan({ db, creator, now: new Date("2026-08-07T12:00:00.000Z") });
   assert.equal(result.action, "resumed");
   assert.equal(result.job.id, paused.id);
   assert.equal(updateData.status, "SCHEDULED");
-  assert.equal("continuation" in updateData, false);
-  assert.equal("progress" in updateData, false);
+  assert.deepEqual(updateData.continuation, paused.continuation);
+  assert.deepEqual(updateData.progress, paused.progress);
   assert.deepEqual(paused.continuation.jobContinuation, { schemaVersion: 8, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 });
 });
 

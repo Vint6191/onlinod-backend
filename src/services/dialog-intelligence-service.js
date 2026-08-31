@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { createPlannedJob, updatePlannedJobDemand, publishPlannedJobAvailable } = require("./job-planning-repository");
 
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING", "PAUSED"];
@@ -405,18 +406,19 @@ async function scheduleDialogScanTx(db, input) {
     const activeJob = active.jobId ? await db.jobInstance.findUnique({ where: { id: active.jobId } }) : null;
     if (activeJob && ["SCHEDULED", "CLAIMED"].includes(activeJob.status)) {
       const params = object(activeJob.params);
-      const updatedJob = await db.jobInstance.update({
-        where: { id: activeJob.id },
-        data: {
-          priority: Math.max(integer(activeJob.priority, 0), requestedPriority),
-          nextRunAt: activeJob.status === "SCHEDULED" ? now : undefined,
-          params: {
-            ...params,
-            lastPriorityReason: clean(input.source, 80) || "dialog_open",
-            lastPriorityAt: now.toISOString(),
-          },
+      const demand = await updatePlannedJobDemand({
+        db,
+        publish: false,
+        job: activeJob,
+        priority: requestedPriority,
+        nextRunAt: now,
+        params: {
+          ...params,
+          lastPriorityReason: clean(input.source, 80) || "dialog_open",
+          lastPriorityAt: now.toISOString(),
         },
       });
+      const updatedJob = demand.job || activeJob;
       await db.dialogScanRun.update({
         where: { id: active.id },
         data: { status: active.status === "PAUSED" ? "QUEUED" : undefined, pausedAt: active.status === "PAUSED" ? null : undefined, lastError: null },
@@ -480,36 +482,35 @@ async function scheduleDialogScanTx(db, input) {
     const scheduledResumeContinuation = durableTarget
       ? targetedContinuation(durableTarget, baseResumeContinuation, fallbackResumeContinuation.knownMessageThreshold)
       : baseResumeContinuation;
-    const job = await db.jobInstance.create({
-      data: {
-        jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
-        scope: "creator",
-        creatorId,
-        agencyId,
-        idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${active.id}:${Date.now()}`,
-        params: {
-          ...object(activeJob?.params),
-          scanRunId: active.id,
-          dialogId,
-          fanId: clean(input.fanId, 160) || active.fanId || null,
-          mode: active.mode,
-          source: clean(input.source, 80) || "startup_resume",
-          pageLimit: integer(input.pageLimit, 50, 1, 100),
-          discoveryBatchSize: active.mode === "discovery" ? integer(input.discoveryBatchSize ?? object(activeJob?.params).discoveryBatchSize, 100, 25, 100) : undefined,
-          discoveryBatchMaxApiPages: active.mode === "discovery" ? integer(input.discoveryBatchMaxApiPages ?? object(activeJob?.params).discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
-          discoveryExecutionTimeBudgetMs: active.mode === "discovery" ? integer(input.discoveryExecutionTimeBudgetMs ?? object(activeJob?.params).discoveryExecutionTimeBudgetMs, 2700000, 60000, 3000000) : undefined,
-          overlapPages: integer(input.overlapPages, 2, 0, 10),
-          knownMessageThreshold: integer(input.knownMessageThreshold, 3, 1, 100),
-          maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : active.mode === "discovery" ? 10000 : 1000, 1, 10000),
-          generation: integer(input.generation, state?.generation || active.generation || 0, 0, 2_000_000_000),
-          forceChildFull: input.forceChildFull === true || object(activeJob?.params).forceChildFull === true,
-        },
-        continuation: scheduledResumeContinuation,
-        status: "SCHEDULED",
-        priority: requestedPriority,
-        scheduledAt: now,
-        nextRunAt: now,
+    const job = await createPlannedJob({
+      db,
+      publish: false,
+      jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
+      scope: "creator",
+      creatorId,
+      agencyId,
+      idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:resume:${active.id}:${Date.now()}`,
+      params: {
+        ...object(activeJob?.params),
+        scanRunId: active.id,
+        dialogId,
+        fanId: clean(input.fanId, 160) || active.fanId || null,
+        mode: active.mode,
+        source: clean(input.source, 80) || "startup_resume",
+        pageLimit: integer(input.pageLimit, 50, 1, 100),
+        discoveryBatchSize: active.mode === "discovery" ? integer(input.discoveryBatchSize ?? object(activeJob?.params).discoveryBatchSize, 100, 25, 100) : undefined,
+        discoveryBatchMaxApiPages: active.mode === "discovery" ? integer(input.discoveryBatchMaxApiPages ?? object(activeJob?.params).discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
+        discoveryExecutionTimeBudgetMs: active.mode === "discovery" ? integer(input.discoveryExecutionTimeBudgetMs ?? object(activeJob?.params).discoveryExecutionTimeBudgetMs, 2700000, 60000, 3000000) : undefined,
+        overlapPages: integer(input.overlapPages, 2, 0, 10),
+        knownMessageThreshold: integer(input.knownMessageThreshold, 3, 1, 100),
+        maxPages: integer(input.maxPages, active.mode === "initial" ? 5000 : active.mode === "discovery" ? 10000 : 1000, 1, 10000),
+        generation: integer(input.generation, state?.generation || active.generation || 0, 0, 2_000_000_000),
+        forceChildFull: input.forceChildFull === true || object(activeJob?.params).forceChildFull === true,
       },
+      continuation: scheduledResumeContinuation,
+      priority: requestedPriority,
+      scheduledAt: now,
+      nextRunAt: now,
     });
     const resumedRun = await db.dialogScanRun.update({
       where: { id: active.id },
@@ -556,37 +557,42 @@ async function scheduleDialogScanTx(db, input) {
     || (mode === "initial" && !forceFull ? clean(state?.backwardCursor, 240) : null);
   const knownMessageThreshold = integer(input.knownMessageThreshold, 3, 1, 100);
   const maxPages = integer(input.maxPages, mode === "initial" ? 5000 : mode === "discovery" ? 10000 : 1000, 1, 10000);
-  const job = await db.jobInstance.create({
-    data: {
-      jobKey: DIALOG_INTELLIGENCE_JOB_KEY, scope: "creator", creatorId, agencyId,
-      idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:${creatorId}:${dialogId}:${run.id}`,
-      params: {
-        scanRunId: run.id, dialogId, fanId: clean(input.fanId, 160), mode,
-        source: clean(input.source, 80) || "manual", pageLimit: integer(input.pageLimit, 50, 1, 100),
-        discoveryBatchSize: mode === "discovery" ? integer(input.discoveryBatchSize, 100, 25, 100) : undefined,
-        discoveryBatchMaxApiPages: mode === "discovery" ? integer(input.discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
-        discoveryExecutionTimeBudgetMs: mode === "discovery" ? integer(input.discoveryExecutionTimeBudgetMs, 2700000, 60000, 3000000) : undefined,
-        targetMessageId, childMode: clean(input.childMode, 40) || null,
-        forceChildFull: input.forceChildFull === true,
-        childPriority: integer(input.childPriority, clean(input.childMode, 40) === "initial" ? 60 : 50, 0, 200),
-        overlapPages: integer(input.overlapPages, 2, 0, 10), knownMessageThreshold, maxPages,
-        generation: integer(input.generation, state?.generation || 0, 0, 2_000_000_000),
-      },
-      continuation: {
-        stage: mode === "discovery" ? "DIALOG_DISCOVERY" : mode === "targeted" ? "TARGETED_RECONCILIATION" : "DIALOG_SCAN",
-        mode, dialogId, cursor: initialCursor, offset: 0, page: 0,
-        childMode: clean(input.childMode, 40) || null,
-        watermark: clean(state?.confirmedWatermarkMessageId || state?.forwardCursor || state?.newestMessageId, 240),
-        watermarkAt: dateOrNull(state?.confirmedWatermarkAt || state?.newestMessageAt)?.toISOString() || null,
-        watermarkReached: false,
-        overlapPages: integer(input.overlapPages, 2, 1, 10),
-        targetMessageId: durableTarget?.messageId || targetMessageId,
-        knownUnchangedStreak: 0,
-        knownMessageThreshold,
-        maxPages,
-      },
-      status: "SCHEDULED", priority: requestedPriority, scheduledAt: now, nextRunAt: now,
+  const job = await createPlannedJob({
+    db,
+    publish: false,
+    jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
+    scope: "creator",
+    creatorId,
+    agencyId,
+    idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:${creatorId}:${dialogId}:${run.id}`,
+    params: {
+      scanRunId: run.id, dialogId, fanId: clean(input.fanId, 160), mode,
+      source: clean(input.source, 80) || "manual", pageLimit: integer(input.pageLimit, 50, 1, 100),
+      discoveryBatchSize: mode === "discovery" ? integer(input.discoveryBatchSize, 100, 25, 100) : undefined,
+      discoveryBatchMaxApiPages: mode === "discovery" ? integer(input.discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
+      discoveryExecutionTimeBudgetMs: mode === "discovery" ? integer(input.discoveryExecutionTimeBudgetMs, 2700000, 60000, 3000000) : undefined,
+      targetMessageId, childMode: clean(input.childMode, 40) || null,
+      forceChildFull: input.forceChildFull === true,
+      childPriority: integer(input.childPriority, clean(input.childMode, 40) === "initial" ? 60 : 50, 0, 200),
+      overlapPages: integer(input.overlapPages, 2, 0, 10), knownMessageThreshold, maxPages,
+      generation: integer(input.generation, state?.generation || 0, 0, 2_000_000_000),
     },
+    continuation: {
+      stage: mode === "discovery" ? "DIALOG_DISCOVERY" : mode === "targeted" ? "TARGETED_RECONCILIATION" : "DIALOG_SCAN",
+      mode, dialogId, cursor: initialCursor, offset: 0, page: 0,
+      childMode: clean(input.childMode, 40) || null,
+      watermark: clean(state?.confirmedWatermarkMessageId || state?.forwardCursor || state?.newestMessageId, 240),
+      watermarkAt: dateOrNull(state?.confirmedWatermarkAt || state?.newestMessageAt)?.toISOString() || null,
+      watermarkReached: false,
+      overlapPages: integer(input.overlapPages, 2, 1, 10),
+      targetMessageId: durableTarget?.messageId || targetMessageId,
+      knownUnchangedStreak: 0,
+      knownMessageThreshold,
+      maxPages,
+    },
+    priority: requestedPriority,
+    scheduledAt: now,
+    nextRunAt: now,
   });
   const linkedRun = await db.dialogScanRun.update({ where: { id: run.id }, data: { jobId: job.id } });
   await db.dialogScanState.upsert({
@@ -774,7 +780,9 @@ async function restartCreatorDialogPlanTx(db, input) {
 
 async function restartCreatorDialogPlan(input) {
   try {
-    return await prisma.$transaction((tx) => restartCreatorDialogPlanTx(tx, input), DIALOG_CONTROL_TRANSACTION_OPTIONS);
+    const result = await prisma.$transaction((tx) => restartCreatorDialogPlanTx(tx, input), DIALOG_CONTROL_TRANSACTION_OPTIONS);
+    if (result?.job?.status === "SCHEDULED") publishPlannedJobAvailable(result.job);
+    return result;
   } catch (error) {
     if (error?.code !== "P2002") throw error;
     const active = await prisma.dialogScanRun.findFirst({
@@ -802,7 +810,9 @@ async function restartCreatorDialogPlan(input) {
 
 async function scheduleDialogScan(input) {
   try {
-    return await prisma.$transaction((tx) => scheduleDialogScanTx(tx, input));
+    const result = await prisma.$transaction((tx) => scheduleDialogScanTx(tx, input));
+    if (result?.job?.status === "SCHEDULED") publishPlannedJobAvailable(result.job);
+    return result;
   } catch (error) {
     if (error?.code !== "P2002") throw error;
     const active = await prisma.dialogScanRun.findFirst({
@@ -2172,14 +2182,14 @@ async function completeDialogIntelligenceJob({ db = prisma, job, deviceId, resul
   };
 }
 
-async function recordDialogIntelligenceFailure({ job, error, terminal }) {
+async function recordDialogIntelligenceFailure({ job, error, terminal, db = prisma }) {
   const params = object(job.params);
   const runId = clean(params.scanRunId, 160);
   const dialogId = clean(params.dialogId, 180);
   if (!job.creatorId || !runId || !dialogId) return null;
   const status = terminal ? "FAILED" : "QUEUED";
   let next = null;
-  await prisma.$transaction(async (tx) => {
+  const project = async (tx) => {
     const run = await tx.dialogScanRun.findUnique({ where: { id: runId } });
     await tx.dialogScanRun.updateMany({
       where: { id: runId },
@@ -2191,7 +2201,8 @@ async function recordDialogIntelligenceFailure({ job, error, terminal }) {
     });
     // Failed legacy per-dialog runs are terminal audit rows only. The dialog
     // plan is reclaimed by the batch coordinator; do not spawn another job.
-  });
+  };
+  if (db === prisma) await prisma.$transaction(project); else await project(db);
   return {
     runId,
     status,

@@ -12,6 +12,7 @@ const {
 } = require("../services/of-request-gate-service");
 
 const router = express.Router();
+const capabilitySchema = z.enum(["security_probe", "read", "write"]);
 const scopeSchema = z.object({
   deviceId: z.string().min(1).max(200),
   creatorId: z.string().min(1).max(200),
@@ -20,9 +21,10 @@ const acquireSchema = scopeSchema.extend({
   priority: z.enum(["critical_write", "interactive", "realtime", "normal", "background"]),
   operation: z.string().min(1).max(160),
   source: z.string().max(240).optional().nullable(),
+  capability: capabilitySchema,
   timeoutMs: z.number().int().min(5_000).max(60_000).optional(),
 });
-const permitSchema = scopeSchema.extend({ permitId: z.string().min(1).max(200) });
+const permitSchema = scopeSchema.extend({ permitId: z.string().min(1).max(200), capability: capabilitySchema });
 
 function authUserId(req) { return req.auth?.userId || req.user?.id; }
 function validationError(res, error) {

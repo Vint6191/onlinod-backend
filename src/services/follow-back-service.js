@@ -14,7 +14,7 @@ const { evaluateCandidate } = require("./follow-back-rules");
 const { readFanCurrent } = require("./fan-data-authority-service");
 
 const FOLLOW_BACK_ACTION_TYPE = "FOLLOW_BACK";
-const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"];
+const ACTIVE_DELIVERY_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RETRY_SCHEDULED"];
 
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
@@ -526,7 +526,7 @@ async function listFollowBack({ agencyId, creatorId, search = "", state = null, 
       candidates: allCandidates,
       eligible: totalEligible,
       queued: statusCounts.QUEUED || 0,
-      claimed: (statusCounts.CLAIMED || 0) + (statusCounts.RUNNING || 0),
+      claimed: (statusCounts.CLAIMED || 0) + (statusCounts.RUNNING || 0) + (statusCounts.COMMITTING || 0),
       followed: statusCounts.COMPLETED || 0,
       alreadyFollowed,
       skipped: statusCounts.SKIPPED || 0,
@@ -563,7 +563,7 @@ async function getAutomationOverview({ agencyId, creatorId }) {
     queue: {
       queued: statusCounts.QUEUED || 0,
       claimed: statusCounts.CLAIMED || 0,
-      running: statusCounts.RUNNING || 0,
+      running: (statusCounts.RUNNING || 0) + (statusCounts.COMMITTING || 0),
       failed: statusCounts.FAILED || 0,
     },
     subscriberDirectory: directory,

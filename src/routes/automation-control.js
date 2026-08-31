@@ -20,6 +20,7 @@ const {
   renewActionLease,
   startActionDelivery,
   validateActionDelivery,
+  prepareWriteActionDelivery,
   completeActionDelivery,
   failActionDelivery,
   releaseActionDelivery,
@@ -722,6 +723,10 @@ router.post("/worker/:id/validate", async (req, res) => {
   try { const input = workerLeaseSchema.parse(req.body || {}); return res.json(await validateActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
   catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_VALIDATE_FAILED"); }
 });
+router.post("/worker/:id/prepare-write", async (req, res) => {
+  try { const input = workerLeaseSchema.parse(req.body || {}); return res.json(await prepareWriteActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
+  catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_PREPARE_WRITE_FAILED"); }
+});
 router.post("/worker/:id/complete", async (req, res) => {
   try {
     const input = workerLeaseSchema.extend({ status: z.enum(["COMPLETED", "SKIPPED"]).optional(), outcomeCode: z.string().max(120).optional().nullable(), result: z.record(z.unknown()).optional() }).parse(req.body || {});
@@ -730,7 +735,7 @@ router.post("/worker/:id/complete", async (req, res) => {
 });
 router.post("/worker/:id/fail", async (req, res) => {
   try {
-    const input = workerLeaseSchema.extend({ failureCode: z.string().min(1).max(120), error: z.string().max(2000).optional(), retryable: z.boolean().optional(), retryAfterMs: z.number().int().min(0).max(24 * 60 * 60_000).optional(), result: z.record(z.unknown()).optional() }).parse(req.body || {});
+    const input = workerLeaseSchema.extend({ failureCode: z.string().min(1).max(120), failureCategory: z.enum(["DEFINITE_NO_WRITE_RETRYABLE", "OUTCOME_UNKNOWN_RECONCILE", "TERMINAL", "CONTROL_BLOCKED", "SESSION_UNAVAILABLE", "IDEMPOTENT_RETRYABLE"]).optional(), error: z.string().max(2000).optional(), retryable: z.boolean().optional(), retryAfterMs: z.number().int().min(0).max(24 * 60 * 60_000).optional(), result: z.record(z.unknown()).optional() }).parse(req.body || {});
     return res.json(await failActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input }));
   } catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_FAIL_FAILED"); }
 });
