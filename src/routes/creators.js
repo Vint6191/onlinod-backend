@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const { z } = require("zod");
 
 const prisma = require("../prisma");
-const { authRequired } = require("../middleware/auth");
+const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { creatorManagementRequired } = require("../middleware/creator-management-permissions");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
@@ -128,11 +128,14 @@ const completeConnectionSchema = z.object({
 });
 
 const platformProfileSchema = z.object({
+  deviceId: z.string().trim().min(1).max(180),
+  connectionGeneration: z.number().int().positive(),
+  observedAt: z.string().datetime(),
   remoteId: z.string().min(1).max(120),
   username: creatorUsernameSchema,
   displayName: z.string().trim().min(1).max(120).optional().nullable(),
   avatarUrl: z.string().max(2000).optional().nullable(),
-});
+}).strict();
 
 const agencyRemovalSchema = z.object({
   phrase: z.string().min(1).max(240),
@@ -716,7 +719,10 @@ router.post("/:id/complete-connection", creatorManagementRequired, creatorAccess
         },
       });
     }
-    return res.json({ ok: true, creator: result.creator, unchanged: result.unchanged });
+    return res.json({
+      ok: true, creator: result.creator, unchanged: result.unchanged,
+      staleNoop: result.staleNoop === true, reason: result.reason || null,
+    });
   } catch (err) {
     if (!err?.status && !err?.issues && String(err?.code || "") !== "P2002") console.error("[creators/complete-connection] failed:", err);
     return creatorErrorResponse(res, err, "CREATOR_RUNTIME_COMPLETE_FAILED", "Failed to complete creator connection");
@@ -726,11 +732,18 @@ router.post("/:id/complete-connection", creatorManagementRequired, creatorAccess
 router.post("/:id/platform-profile", creatorAccessRequired, async (req, res) => {
   try {
     const input = platformProfileSchema.parse(req.body);
+    const sourceDeviceId = requireAuthDevice(req, input.deviceId, {
+      requiredCode: "CREATOR_PROFILE_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "CREATOR_PROFILE_AUTH_DEVICE_MISMATCH",
+    });
     const result = await observeCreatorPlatformProfile({
       db: prisma,
       agencyId: req.auth.agencyId,
       creatorId: req.params.id,
       userId: req.auth.userId,
+      sourceDeviceId,
+      connectionGeneration: input.connectionGeneration,
+      observedAt: input.observedAt,
       remoteId: input.remoteId,
       username: input.username,
       platformDisplayName: input.displayName || null,

@@ -3,7 +3,10 @@
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
-const { reinitializeCreatorSessionInTransaction } = require("./creator-session-broker-service");
+const {
+  reinitializeCreatorSessionInTransaction,
+  revokeCreatorSessionInTransaction,
+} = require("./creator-session-broker-service");
 const { CREATOR_CONNECTION_STATES, creatorConnectionLockKey } = require("./creator-connection-authority");
 
 const SERIALIZABLE = Object.freeze({ isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 });
@@ -16,6 +19,36 @@ function clean(value, max = 4096) {
 function normalizeUsername(value) {
   const text = clean(value, 120).replace(/^@+/, "").toLowerCase();
   return text || null;
+}
+
+const CREATOR_PROFILE_CLOCK_SKEW_MS = 5 * 60 * 1000;
+
+function parseObservedAt(value, now = new Date()) {
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(String(value || ""));
+  if (Number.isNaN(date.getTime())) {
+    throw codedError("CREATOR_PROFILE_OBSERVED_AT_INVALID", "A valid platform profile observation timestamp is required", 400);
+  }
+  if (date.getTime() > now.getTime() + CREATOR_PROFILE_CLOCK_SKEW_MS) {
+    throw codedError("CREATOR_PROFILE_OBSERVED_AT_FUTURE", "Platform profile observation is too far in the future", 409);
+  }
+  return date;
+}
+
+function profileAuthorityOrder({ observedAt, sourceDeviceId }) {
+  return { at: observedAt.getTime(), device: clean(sourceDeviceId, 180) };
+}
+
+function compareProfileAuthority(current, incoming) {
+  const currentGeneration = Number(current.platformProfileConnectionGeneration || 0);
+  const incomingGeneration = Number(incoming.connectionGeneration);
+  if (currentGeneration !== incomingGeneration) return incomingGeneration > currentGeneration ? 1 : -1;
+  const currentAt = current.platformProfileObservedAt ? new Date(current.platformProfileObservedAt) : null;
+  if (!currentAt || Number.isNaN(currentAt.getTime())) return 1;
+  const a = profileAuthorityOrder({ observedAt: currentAt, sourceDeviceId: current.platformProfileSourceDeviceId || "" });
+  const b = profileAuthorityOrder({ observedAt: incoming.observedAt, sourceDeviceId: incoming.sourceDeviceId });
+  if (b.at !== a.at) return b.at > a.at ? 1 : -1;
+  if (b.device === a.device) return 0;
+  return b.device > a.device ? 1 : -1;
 }
 
 function codedError(code, message, status = 409, extra = null) {
@@ -281,6 +314,9 @@ async function completeCreatorConnection({
           platformUsername: observedUsername,
           platformDisplayName: clean(platformDisplayName, 120) || null,
           platformAvatarUrl: clean(avatarUrl, 2000) || null,
+          platformProfileObservedAt: canonical.capturedAt || null,
+          platformProfileSourceDeviceId: clean(canonical.capturedByDeviceId, 180) || null,
+          platformProfileConnectionGeneration: generation,
           avatarUrl: clean(avatarUrl, 2000) || creator.avatarUrl,
           status: "READY",
           connectionState: CREATOR_CONNECTION_STATES.CONNECTED,
@@ -298,17 +334,51 @@ async function completeCreatorConnection({
   }
 }
 
-async function observeCreatorPlatformProfile({ db, agencyId, creatorId, userId, remoteId, username, platformDisplayName = null, avatarUrl = null }) {
+async function observeCreatorPlatformProfile({
+  db, agencyId, creatorId, userId, sourceDeviceId, connectionGeneration, observedAt,
+  remoteId, username, platformDisplayName = null, avatarUrl = null, beforeCommit = null,
+}) {
   const identity = clean(remoteId, 160);
   const observedUsername = normalizeUsername(username);
+  const deviceId = clean(sourceDeviceId, 180);
+  const generation = Number(connectionGeneration);
+  const observationTime = parseObservedAt(observedAt);
   if (!identity || !observedUsername) throw codedError("CREATOR_PROFILE_IDENTITY_REQUIRED", "Verified OnlyFans id and username are required", 400);
+  if (!deviceId) throw codedError("CREATOR_PROFILE_DEVICE_REQUIRED", "A device-bound platform profile observation is required", 400);
+  if (!Number.isInteger(generation) || generation <= 0) throw codedError("CREATOR_PROFILE_GENERATION_INVALID", "A valid creator connection generation is required", 400);
   try {
     return await runSerializable(db, async (tx) => {
       await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
       const { creator } = await requireLiveCreatorAccess({ tx, agencyId, creatorId, userId });
-      if (String(creator.connectionState || "") !== CREATOR_CONNECTION_STATES.CONNECTED || String(creator.remoteId || "") !== identity) {
+      if (String(creator.remoteId || "") !== identity) {
         throw codedError("CREATOR_PROFILE_IDENTITY_MISMATCH", "Platform profile observation does not match the connected creator identity", 409);
       }
+      const currentGeneration = Number(creator.connectionGeneration || 0);
+      if (generation < currentGeneration) {
+        return { creator, unchanged: true, staleNoop: true, reason: "STALE_CONNECTION_GENERATION" };
+      }
+      if (generation > currentGeneration) {
+        throw codedError("CREATOR_PROFILE_GENERATION_MISMATCH", "Platform profile observation belongs to an unknown future connection generation", 409, {
+          currentConnectionGeneration: currentGeneration,
+          observedConnectionGeneration: generation,
+        });
+      }
+      if (String(creator.connectionState || "") !== CREATOR_CONNECTION_STATES.CONNECTED) {
+        throw codedError("CREATOR_PROFILE_CONNECTION_NOT_CURRENT", "Platform profile observations require the current connected generation", 409);
+      }
+
+      const authority = compareProfileAuthority(creator, {
+        connectionGeneration: generation,
+        observedAt: observationTime,
+        sourceDeviceId: deviceId,
+      });
+      if (authority < 0) {
+        return { creator, unchanged: true, staleNoop: true, reason: "STALE_PROFILE_OBSERVATION" };
+      }
+      if (authority === 0) {
+        return { creator, unchanged: true, staleNoop: false, reason: "DUPLICATE_PROFILE_OBSERVATION" };
+      }
+
       const conflict = await tx.creatorAccount.findFirst({
         where: {
           agencyId,
@@ -323,18 +393,29 @@ async function observeCreatorPlatformProfile({ db, agencyId, creatorId, userId, 
         select: { id: true },
       });
       if (conflict) throw codedError("CREATOR_ALREADY_EXISTS", "This OnlyFans username is already active in the agency", 409, { creatorId: conflict.id });
+      if (typeof beforeCommit === "function") await beforeCommit(tx, creator);
+      // The access/member state may have changed while an external test hook or
+      // future pre-commit work ran. Re-read inside the same transaction before
+      // mutating the current projection.
+      const { creator: liveCreator } = await requireLiveCreatorAccess({ tx, agencyId, creatorId, userId });
+      if (String(liveCreator.remoteId || "") !== identity || Number(liveCreator.connectionGeneration || 0) !== generation) {
+        throw codedError("CREATOR_PROFILE_AUTHORITY_CHANGED", "Creator profile authority changed before commit", 409);
+      }
       const nextAvatar = clean(avatarUrl, 2000) || null;
       const updated = await tx.creatorAccount.update({
-        where: { id: creator.id },
+        where: { id: liveCreator.id },
         data: {
           username: observedUsername,
           platformUsername: observedUsername,
           platformDisplayName: clean(platformDisplayName, 120) || null,
           platformAvatarUrl: nextAvatar,
+          platformProfileObservedAt: observationTime,
+          platformProfileSourceDeviceId: deviceId,
+          platformProfileConnectionGeneration: generation,
           ...(nextAvatar ? { avatarUrl: nextAvatar } : {}),
         },
       });
-      return { creator: updated, unchanged: false };
+      return { creator: updated, unchanged: false, staleNoop: false, reason: null };
     });
   } catch (error) {
     if (creatorUniqueViolation(error)) throw codedError("CREATOR_ALREADY_EXISTS", "This OnlyFans username is already active in the agency", 409, { cause: error });
@@ -342,11 +423,28 @@ async function observeCreatorPlatformProfile({ db, agencyId, creatorId, userId, 
   }
 }
 
+async function revokeCreatorConnection({
+  db, agencyId, creatorId, userId, deviceId, baseRevision, requestId, reason, beforeRevoke = null,
+}) {
+  return runSerializable(db, async (tx) => {
+    await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
+    await requireLiveConnectionAuthority({ tx, agencyId, creatorId, userId });
+    if (typeof beforeRevoke === "function") await beforeRevoke(tx);
+    // Destructive authority is checked again immediately before the broker
+    // mutation so middleware/request admission is never the correctness fence.
+    await requireLiveConnectionAuthority({ tx, agencyId, creatorId, userId });
+    return revokeCreatorSessionInTransaction({
+      tx, agencyId, creatorId, actorUserId: userId, deviceId, baseRevision, requestId, reason,
+    });
+  });
+}
+
 module.exports = {
   createCreatorDraft,
   beginCreatorConnection,
   completeCreatorConnection,
   observeCreatorPlatformProfile,
+  revokeCreatorConnection,
   normalizeUsername,
   CREATOR_CONNECTION_STATES,
 };

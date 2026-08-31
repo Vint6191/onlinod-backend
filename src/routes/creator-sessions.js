@@ -5,6 +5,7 @@ const { z } = require("zod");
 
 const prisma = require("../prisma");
 const { authRequired, requireAuthDevice } = require("../middleware/auth");
+const { creatorManagementRequired } = require("../middleware/creator-management-permissions");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
 const { publishCreatorSessionRevision, waitForCreatorSessionRevisionEvents } = require("../services/creator-session-revision-events");
@@ -12,8 +13,8 @@ const {
   assertCreatorSessionTargetActive,
   getCreatorSession,
   writeCreatorSession,
-  revokeCreatorSession,
 } = require("../services/creator-session-broker-service");
+const { revokeCreatorConnection } = require("../services/creator-enrollment-authority-service");
 
 const router = express.Router();
 router.use(authRequired);
@@ -231,15 +232,15 @@ router.post("/:creatorId", async (req, res) => {
   }
 });
 
-router.post("/:creatorId/revoke", async (req, res) => {
+router.post("/:creatorId/revoke", creatorManagementRequired, async (req, res) => {
   try {
     const input = revokeSchema.parse(req.body || {});
     const { creator, device } = await authorize(req, req.params.creatorId, input.deviceId, { requireActive: false });
-    const result = await revokeCreatorSession({
+    const result = await revokeCreatorConnection({
       db: prisma,
       agencyId: req.auth.agencyId,
       creatorId: creator.id,
-      actorUserId: req.auth.userId,
+      userId: req.auth.userId,
       deviceId: device.id,
       baseRevision: input.baseRevision,
       requestId: input.requestId,

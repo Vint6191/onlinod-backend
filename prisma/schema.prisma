@@ -441,6 +441,9 @@ model CreatorAccount {
   platformUsername String?
   platformDisplayName String?
   platformAvatarUrl String?
+  platformProfileObservedAt DateTime?
+  platformProfileSourceDeviceId String?
+  platformProfileConnectionGeneration Int?
   avatarUrl   String?
   remoteId    String?
   status      CreatorStatus @default(DRAFT)

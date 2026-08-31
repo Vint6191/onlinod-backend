@@ -463,7 +463,7 @@ async function reinitializeCreatorSessionInTransaction({
   return { state: publicState(next, { includePayload: false }), unchanged: false };
 }
 
-async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, deviceId, baseRevision, requestId, reason }) {
+async function revokeCreatorSessionInTransaction({ tx, agencyId, creatorId, actorUserId, deviceId, baseRevision, requestId, reason }) {
   const revision = Math.max(0, Math.floor(Number(baseRevision) || 0));
   const normalizedRequestId = nullableText(requestId, 180);
   if (!normalizedRequestId) {
@@ -473,81 +473,87 @@ async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, devi
     throw error;
   }
 
-  return runSessionSerializable(db, async (tx) => {
-    await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
-    const creator = await tx.creatorAccount.findFirst({
+  const creator = await tx.creatorAccount.findFirst({
+    where: { id: creatorId, agencyId, deletedAt: null },
+    select: { id: true, remoteId: true, connectionState: true },
+  });
+  if (!creator) {
+    const error = new Error("Creator not found");
+    error.code = "CREATOR_NOT_FOUND";
+    error.status = 404;
+    throw error;
+  }
+  const projectReconnectRequired = async () => {
+    const nextConnectionState = creator.remoteId
+      ? CREATOR_CONNECTION_STATES.RECONNECT_REQUIRED
+      : CREATOR_CONNECTION_STATES.ENROLLMENT_REQUIRED;
+    if (String(creator.connectionState || "") === nextConnectionState) return;
+    await tx.creatorAccount.updateMany({
       where: { id: creatorId, agencyId, deletedAt: null },
-      select: { id: true, remoteId: true, connectionState: true },
-    });
-    if (!creator) {
-      const error = new Error("Creator not found");
-      error.code = "CREATOR_NOT_FOUND";
-      error.status = 404;
-      throw error;
-    }
-    const projectReconnectRequired = async () => {
-      const nextConnectionState = creator.remoteId
-        ? CREATOR_CONNECTION_STATES.RECONNECT_REQUIRED
-        : CREATOR_CONNECTION_STATES.ENROLLMENT_REQUIRED;
-      if (String(creator.connectionState || "") === nextConnectionState) return;
-      await tx.creatorAccount.updateMany({
-        where: { id: creatorId, agencyId, deletedAt: null },
-        data: {
-          connectionState: nextConnectionState,
-          connectionStartedAt: null,
-          connectedSessionRevision: null,
-        },
-      });
-    };
-    const current = await tx.creatorSessionState.findUnique({ where: { creatorId } });
-    if (!current) {
-      if (revision !== 0) throw sessionConflict(null);
-      await projectReconnectRequired();
-      return { state: publicState(null, { includePayload: false }), idempotent: false, unchanged: true };
-    }
-    if (current.agencyId !== agencyId) throw sessionConflict(current);
-    if (sameRevokeRequest(current, { requestId: normalizedRequestId, deviceId })) {
-      await projectReconnectRequired();
-      return { state: publicState(current, { includePayload: false }), idempotent: true, unchanged: true };
-    }
-    if (Number(current.revision) !== revision) throw sessionConflict(current);
-    if (current.status === "REVOKED") {
-      await projectReconnectRequired();
-      return { state: publicState(current, { includePayload: false }), idempotent: false, unchanged: true };
-    }
-
-    const now = new Date();
-    const updated = await tx.creatorSessionState.updateMany({
-      where: { creatorId, agencyId, revision, status: { in: ["ACTIVE", "REINITIALIZING"] } },
       data: {
-        revision: { increment: 1 },
-        status: "REVOKED",
-        encryptedPayload: null,
-        iv: null,
-        tag: null,
-        algorithm: null,
-        keyVersion: null,
-        credentialHash: null,
-        coherenceHash: null,
-        portableReady: false,
-        capturedAt: now,
-        capturedByUserId: actorUserId,
-        capturedByDeviceId: deviceId,
-        sourceRequestId: normalizedRequestId,
-        revokedAt: now,
-        revokeReason: nullableText(reason, 500),
+        connectionState: nextConnectionState,
+        connectionStartedAt: null,
+        connectedSessionRevision: null,
       },
     });
-    if (updated.count !== 1) {
-      const raced = await tx.creatorSessionState.findUnique({ where: { creatorId } });
-      if (sameRevokeRequest(raced, { requestId: normalizedRequestId, deviceId })) {
-        return { state: publicState(raced, { includePayload: false }), idempotent: true, unchanged: true };
-      }
-      throw sessionConflict(raced);
-    }
+  };
+  const current = await tx.creatorSessionState.findUnique({ where: { creatorId } });
+  if (!current) {
+    if (revision !== 0) throw sessionConflict(null);
     await projectReconnectRequired();
-    const next = await tx.creatorSessionState.findUnique({ where: { creatorId } });
-    return { state: publicState(next, { includePayload: false }), idempotent: false, unchanged: false };
+    return { state: publicState(null, { includePayload: false }), idempotent: false, unchanged: true };
+  }
+  if (current.agencyId !== agencyId) throw sessionConflict(current);
+  if (sameRevokeRequest(current, { requestId: normalizedRequestId, deviceId })) {
+    await projectReconnectRequired();
+    return { state: publicState(current, { includePayload: false }), idempotent: true, unchanged: true };
+  }
+  if (Number(current.revision) !== revision) throw sessionConflict(current);
+  if (current.status === "REVOKED") {
+    await projectReconnectRequired();
+    return { state: publicState(current, { includePayload: false }), idempotent: false, unchanged: true };
+  }
+
+  const now = new Date();
+  const updated = await tx.creatorSessionState.updateMany({
+    where: { creatorId, agencyId, revision, status: { in: ["ACTIVE", "REINITIALIZING"] } },
+    data: {
+      revision: { increment: 1 },
+      status: "REVOKED",
+      encryptedPayload: null,
+      iv: null,
+      tag: null,
+      algorithm: null,
+      keyVersion: null,
+      credentialHash: null,
+      coherenceHash: null,
+      portableReady: false,
+      capturedAt: now,
+      capturedByUserId: actorUserId,
+      capturedByDeviceId: deviceId,
+      sourceRequestId: normalizedRequestId,
+      revokedAt: now,
+      revokeReason: nullableText(reason, 500),
+    },
+  });
+  if (updated.count !== 1) {
+    const raced = await tx.creatorSessionState.findUnique({ where: { creatorId } });
+    if (sameRevokeRequest(raced, { requestId: normalizedRequestId, deviceId })) {
+      return { state: publicState(raced, { includePayload: false }), idempotent: true, unchanged: true };
+    }
+    throw sessionConflict(raced);
+  }
+  await projectReconnectRequired();
+  const next = await tx.creatorSessionState.findUnique({ where: { creatorId } });
+  return { state: publicState(next, { includePayload: false }), idempotent: false, unchanged: false };
+}
+
+async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, deviceId, baseRevision, requestId, reason }) {
+  return runSessionSerializable(db, async (tx) => {
+    await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
+    return revokeCreatorSessionInTransaction({
+      tx, agencyId, creatorId, actorUserId, deviceId, baseRevision, requestId, reason,
+    });
   });
 }
 
@@ -560,5 +566,6 @@ module.exports = {
   getCreatorSession,
   writeCreatorSession,
   reinitializeCreatorSessionInTransaction,
+  revokeCreatorSessionInTransaction,
   revokeCreatorSession,
 };
