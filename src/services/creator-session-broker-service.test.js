@@ -35,7 +35,10 @@ const HASH_C = "c".repeat(64);
 
 function makeDb() {
   let state = null;
-  const creator = { id: "creator-1", agencyId: "agency-1", remoteId: "of-42", status: "READY", deletedAt: null };
+  const creator = {
+    id: "creator-1", agencyId: "agency-1", remoteId: "of-42", status: "READY", deletedAt: null,
+    connectionState: "CONNECTED", connectionGeneration: 1, connectionStartedAt: null, connectedSessionRevision: 1,
+  };
   const liveMember = {
     agencyId: "agency-1", userId: "user-1", role: "WORKER", roleKey: "worker",
     assignedCreators: ["creator-1"], deletedAt: null, deactivatedAt: null,
@@ -47,6 +50,11 @@ function makeDb() {
       findFirst: async ({ where }) => (
         where.id === creator.id && where.agencyId === creator.agencyId && creator.deletedAt === null ? clone(creator) : null
       ),
+      updateMany: async ({ where, data }) => {
+        if (where.id !== creator.id || where.agencyId !== creator.agencyId || creator.deletedAt !== null) return { count: 0 };
+        Object.assign(creator, clone(data));
+        return { count: 1 };
+      },
     },
     agencyMember: {
       findUnique: async ({ where }) => {
@@ -88,7 +96,11 @@ function makeDb() {
       updateMany: async ({ where, data }) => {
         if (!state || state.creatorId !== where.creatorId || state.agencyId !== where.agencyId) return { count: 0 };
         if (where.revision !== undefined && state.revision !== where.revision) return { count: 0 };
-        if (where.status !== undefined && state.status !== where.status) return { count: 0 };
+        if (where.status !== undefined) {
+          if (where.status && typeof where.status === "object" && Array.isArray(where.status.in)) {
+            if (!where.status.in.includes(state.status)) return { count: 0 };
+          } else if (state.status !== where.status) return { count: 0 };
+        }
         if (where.encryptionMode !== undefined && state.encryptionMode !== where.encryptionMode) return { count: 0 };
         const next = clone(data);
         if (next.revision && typeof next.revision === "object" && next.revision.increment) next.revision = state.revision + Number(next.revision.increment);
@@ -97,6 +109,7 @@ function makeDb() {
       },
     },
   };
+  tx.$executeRawUnsafe = async () => 1;
   tx.$transaction = async (fn) => fn(tx);
   return { db: tx, creator, liveMember, devices, getState: () => clone(state), setState: (next) => { state = clone(next); } };
 }
@@ -332,7 +345,7 @@ test("generic write cannot resurrect a revoked canonical session", async () => {
   const ctx = makeDb();
   await writeCreatorSession(writeArgs(ctx));
   await revokeCreatorSession({ db: ctx.db, agencyId: "agency-1", creatorId: "creator-1", actorUserId: "user-1", deviceId: "device-1", baseRevision: 1, requestId: "request-revoke", reason: "logout" });
-  await assert.rejects(writeCreatorSession(writeArgs(ctx, { baseRevision: 2, requestId: "request-resurrect", coherenceHash: HASH_C })), (e) => e?.code === "CREATOR_SESSION_REVOKED" && e?.status === 409);
+  await assert.rejects(writeCreatorSession(writeArgs(ctx, { baseRevision: 2, requestId: "request-resurrect", coherenceHash: HASH_C })), (e) => ["CREATOR_SESSION_CONNECTION_NOT_WRITABLE", "CREATOR_SESSION_REVOKED"].includes(e?.code) && e?.status === 409);
   assert.equal(ctx.getState().encryptedPayload, null);
 });
 

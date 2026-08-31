@@ -2,6 +2,8 @@
 
 const { assertDeviceCanUseCreatorKey } = require("./client-e2e-keyring-service");
 const { canAccessCreator } = require("../middleware/automation-permissions");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
+const { CREATOR_CONNECTION_STATES, creatorConnectionLockKey } = require("./creator-connection-authority");
 
 async function runSessionSerializable(db, work) {
   const options = { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 };
@@ -66,7 +68,15 @@ function assertCreatorSessionTargetActive(creator) {
 async function requireLiveCreatorSessionWriteTarget({ db, agencyId, creatorId, platformUserId = null }) {
   const creator = await db.creatorAccount.findFirst({
     where: { id: creatorId, agencyId, deletedAt: null },
-    select: { id: true, agencyId: true, remoteId: true, status: true },
+    select: {
+      id: true,
+      agencyId: true,
+      remoteId: true,
+      status: true,
+      connectionState: true,
+      connectionGeneration: true,
+      connectionStartedAt: true,
+    },
   });
   if (!creator) {
     const error = new Error("Creator not found");
@@ -82,6 +92,32 @@ async function requireLiveCreatorSessionWriteTarget({ db, agencyId, creatorId, p
     throw error;
   }
   return creator;
+}
+
+function assertWriteBelongsToConnectionGeneration({ creator, capturedAt }) {
+  const state = String(creator?.connectionState || "");
+  const reconnecting = state === CREATOR_CONNECTION_STATES.RECONNECTING;
+  const enrolling = state === CREATOR_CONNECTION_STATES.CONNECTING;
+  const connected = state === CREATOR_CONNECTION_STATES.CONNECTED;
+  if (!reconnecting && !enrolling && !connected) {
+    const error = new Error(`Creator connection state ${state || "UNKNOWN"} does not accept canonical session writes`);
+    error.code = "CREATOR_SESSION_CONNECTION_NOT_WRITABLE";
+    error.status = 409;
+    error.connectionState = state || null;
+    throw error;
+  }
+  if (connected) return Number(creator.connectionGeneration || 0);
+
+  const startedAt = creator.connectionStartedAt ? new Date(creator.connectionStartedAt) : null;
+  const captured = capturedAt instanceof Date ? capturedAt : new Date(capturedAt);
+  if (!startedAt || Number.isNaN(startedAt.getTime()) || Number.isNaN(captured.getTime()) || captured.getTime() < startedAt.getTime()) {
+    const error = new Error("Verified creator session evidence predates the current connection generation");
+    error.code = "CREATOR_SESSION_CONNECTION_GENERATION_STALE";
+    error.status = 409;
+    error.connectionGeneration = Number(creator.connectionGeneration || 0);
+    throw error;
+  }
+  return Number(creator.connectionGeneration || 0);
 }
 
 async function requireLiveCreatorSessionReader({ db, agencyId, creatorId, userId = null, member = null }) {
@@ -148,7 +184,7 @@ function normalizeHash(value, code) {
 function publicState(record, { includePayload = false } = {}) {
   if (!record) {
     return {
-      revision: 0, status: "MISSING", payloadVersion: 1, portableReady: false, encryptionMode: null, keyVersion: null, platformUserId: null,
+      revision: 0, status: "MISSING", connectionGeneration: 0, payloadVersion: 1, portableReady: false, encryptionMode: null, keyVersion: null, platformUserId: null,
       credentialHash: null, coherenceHash: null, capturedAt: null, capturedByDeviceId: null, sourceRequestId: null,
       revokedAt: null, updatedAt: null, ...(includePayload ? { payload: null, opaquePayload: null } : {}),
     };
@@ -173,7 +209,7 @@ function publicState(record, { includePayload = false } = {}) {
   }
 
   return {
-    revision: Number(record.revision || 0), status: String(record.status || "MISSING"), payloadVersion: Number(record.payloadVersion || 1),
+    revision: Number(record.revision || 0), status: String(record.status || "MISSING"), connectionGeneration: Number(record.connectionGeneration || 0), payloadVersion: Number(record.payloadVersion || 1),
     portableReady: record.portableReady === true, encryptionMode, keyVersion: record.keyVersion == null ? null : Number(record.keyVersion), platformUserId: record.platformUserId || null,
     credentialHash: record.credentialHash || null, coherenceHash: record.coherenceHash || null, capturedAt: record.capturedAt || null,
     capturedByDeviceId: record.capturedByDeviceId || null, sourceRequestId: record.sourceRequestId || null, revokedAt: record.revokedAt || null, updatedAt: record.updatedAt || null,
@@ -313,7 +349,9 @@ async function writeCreatorSession({
   assertCapturedAtNotFromFuture(captured);
 
   return runSessionSerializable(db, async (tx) => {
-    await requireLiveCreatorSessionWriteTarget({ db: tx, agencyId, creatorId, platformUserId: identity });
+    await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
+    const creator = await requireLiveCreatorSessionWriteTarget({ db: tx, agencyId, creatorId, platformUserId: identity });
+    const connectionGeneration = assertWriteBelongsToConnectionGeneration({ creator, capturedAt: captured });
     await assertDeviceCanUseCreatorKey({ db: tx, agencyId, creatorId, keyVersion: stored.keyVersion, deviceId, member: actorMember });
     const current = await tx.creatorSessionState.findUnique({ where: { creatorId } });
     if (sameWriteRequest(current, { requestId: normalizedRequestId, deviceId, coherenceHash, platformUserId: identity })) return { state: publicState(current, { includePayload: false }), idempotent: true, unchanged: true };
@@ -321,7 +359,7 @@ async function writeCreatorSession({
       if (revision !== 0) throw sessionConflict(null);
       try {
         const created = await tx.creatorSessionState.create({ data: {
-          agencyId, creatorId, revision: 1, status: "ACTIVE", payloadVersion: stored.payloadVersion, portableReady, encryptionMode: "CLIENT_E2E_V1", keyVersion: stored.keyVersion,
+          agencyId, creatorId, revision: 1, status: "ACTIVE", connectionGeneration, payloadVersion: stored.payloadVersion, portableReady, encryptionMode: "CLIENT_E2E_V1", keyVersion: stored.keyVersion,
           encryptedPayload: stored.ciphertext, iv: stored.iv, tag: stored.tag, algorithm: stored.algorithm, platformUserId: identity, credentialHash, coherenceHash, capturedAt: captured,
           capturedByUserId: actorUserId, capturedByDeviceId: deviceId, sourceRequestId: normalizedRequestId, revokedAt: null, revokeReason: null,
         } });
@@ -335,6 +373,13 @@ async function writeCreatorSession({
     }
     if (current.agencyId !== agencyId || Number(current.revision) !== revision) throw sessionConflict(current);
     if (current.status === "REVOKED") { const error = new Error("Revoked creator session requires an explicit re-initialize flow"); error.code = "CREATOR_SESSION_REVOKED"; error.status = 409; error.current = publicState(current, { includePayload: false }); throw error; }
+    if (current.status === "REINITIALIZING" && Number(current.connectionGeneration || 0) !== connectionGeneration) {
+      const error = new Error("Creator session re-initialization belongs to another connection generation");
+      error.code = "CREATOR_SESSION_CONNECTION_GENERATION_STALE";
+      error.status = 409;
+      error.current = publicState(current, { includePayload: false });
+      throw error;
+    }
     if (String(current.encryptionMode || "") !== "CLIENT_E2E_V1") {
       const error = new Error("Legacy creator session envelopes cannot be updated after the V20.22 cutover");
       error.code = "CREATOR_SESSION_LEGACY_ENVELOPE_UNSUPPORTED"; error.status = 409; throw error;
@@ -343,7 +388,7 @@ async function writeCreatorSession({
     const sameRepresentation = Number(current.keyVersion) === Number(stored.keyVersion);
     if (current.status === "ACTIVE" && current.coherenceHash === coherenceHash && current.platformUserId === identity && current.portableReady === portableReady && sameRepresentation) return { state: publicState(current, { includePayload: false }), idempotent: false, unchanged: true };
     const updated = await tx.creatorSessionState.updateMany({ where: { creatorId, agencyId, revision, encryptionMode: "CLIENT_E2E_V1" }, data: {
-      revision: { increment: 1 }, status: "ACTIVE", payloadVersion: stored.payloadVersion, portableReady, encryptionMode: "CLIENT_E2E_V1", keyVersion: stored.keyVersion,
+      revision: { increment: 1 }, status: "ACTIVE", connectionGeneration, payloadVersion: stored.payloadVersion, portableReady, encryptionMode: "CLIENT_E2E_V1", keyVersion: stored.keyVersion,
       encryptedPayload: stored.ciphertext, iv: stored.iv, tag: stored.tag, algorithm: stored.algorithm, platformUserId: identity, credentialHash, coherenceHash, capturedAt: canonicalCapturedAt,
       capturedByUserId: actorUserId, capturedByDeviceId: deviceId, sourceRequestId: normalizedRequestId, revokedAt: null, revokeReason: null,
     } });
@@ -357,6 +402,67 @@ async function writeCreatorSession({
   });
 }
 
+// Caller must already own creatorConnectionLockKey() inside the same DB
+// transaction. This is the only explicit bridge from REVOKED/old canonical
+// authority into a new enrollment generation. It deliberately does not make
+// the session ACTIVE; only a fresh verified CLIENT_E2E snapshot may do that.
+async function reinitializeCreatorSessionInTransaction({
+  db, agencyId, creatorId, actorUserId, deviceId = null, connectionGeneration, connectionStartedAt,
+}) {
+  const generation = Number(connectionGeneration);
+  if (!Number.isInteger(generation) || generation <= 0) {
+    const error = new Error("A positive creator connection generation is required");
+    error.code = "CREATOR_SESSION_CONNECTION_GENERATION_INVALID";
+    error.status = 400;
+    throw error;
+  }
+  const startedAt = connectionStartedAt instanceof Date ? connectionStartedAt : new Date(connectionStartedAt);
+  if (Number.isNaN(startedAt.getTime())) {
+    const error = new Error("connectionStartedAt is invalid");
+    error.code = "CREATOR_SESSION_CONNECTION_STARTED_AT_INVALID";
+    error.status = 400;
+    throw error;
+  }
+
+  const current = await db.creatorSessionState.findUnique({ where: { creatorId } });
+  if (!current) return { state: publicState(null, { includePayload: false }), unchanged: true };
+  if (current.agencyId !== agencyId) throw sessionConflict(current);
+  if (current.status === "REINITIALIZING" && Number(current.connectionGeneration || 0) === generation) {
+    return { state: publicState(current, { includePayload: false }), unchanged: true };
+  }
+
+  const updated = await db.creatorSessionState.updateMany({
+    where: { creatorId, agencyId, revision: Number(current.revision) },
+    data: {
+      revision: { increment: 1 },
+      status: "REINITIALIZING",
+      connectionGeneration: generation,
+      payloadVersion: 1,
+      portableReady: false,
+      encryptedPayload: null,
+      iv: null,
+      tag: null,
+      algorithm: null,
+      keyVersion: null,
+      platformUserId: null,
+      credentialHash: null,
+      coherenceHash: null,
+      capturedAt: startedAt,
+      capturedByUserId: actorUserId,
+      capturedByDeviceId: nullableText(deviceId, 180),
+      sourceRequestId: `connection-generation:${generation}`,
+      revokedAt: null,
+      revokeReason: null,
+    },
+  });
+  if (updated.count !== 1) {
+    const raced = await db.creatorSessionState.findUnique({ where: { creatorId } });
+    throw sessionConflict(raced);
+  }
+  const next = await db.creatorSessionState.findUnique({ where: { creatorId } });
+  return { state: publicState(next, { includePayload: false }), unchanged: false };
+}
+
 async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, deviceId, baseRevision, requestId, reason }) {
   const revision = Math.max(0, Math.floor(Number(baseRevision) || 0));
   const normalizedRequestId = nullableText(requestId, 180);
@@ -367,24 +473,52 @@ async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, devi
     throw error;
   }
 
-  return db.$transaction(async (tx) => {
+  return runSessionSerializable(db, async (tx) => {
+    await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
+    const creator = await tx.creatorAccount.findFirst({
+      where: { id: creatorId, agencyId, deletedAt: null },
+      select: { id: true, remoteId: true, connectionState: true },
+    });
+    if (!creator) {
+      const error = new Error("Creator not found");
+      error.code = "CREATOR_NOT_FOUND";
+      error.status = 404;
+      throw error;
+    }
+    const projectReconnectRequired = async () => {
+      const nextConnectionState = creator.remoteId
+        ? CREATOR_CONNECTION_STATES.RECONNECT_REQUIRED
+        : CREATOR_CONNECTION_STATES.ENROLLMENT_REQUIRED;
+      if (String(creator.connectionState || "") === nextConnectionState) return;
+      await tx.creatorAccount.updateMany({
+        where: { id: creatorId, agencyId, deletedAt: null },
+        data: {
+          connectionState: nextConnectionState,
+          connectionStartedAt: null,
+          connectedSessionRevision: null,
+        },
+      });
+    };
     const current = await tx.creatorSessionState.findUnique({ where: { creatorId } });
     if (!current) {
       if (revision !== 0) throw sessionConflict(null);
+      await projectReconnectRequired();
       return { state: publicState(null, { includePayload: false }), idempotent: false, unchanged: true };
     }
     if (current.agencyId !== agencyId) throw sessionConflict(current);
     if (sameRevokeRequest(current, { requestId: normalizedRequestId, deviceId })) {
+      await projectReconnectRequired();
       return { state: publicState(current, { includePayload: false }), idempotent: true, unchanged: true };
     }
     if (Number(current.revision) !== revision) throw sessionConflict(current);
     if (current.status === "REVOKED") {
+      await projectReconnectRequired();
       return { state: publicState(current, { includePayload: false }), idempotent: false, unchanged: true };
     }
 
     const now = new Date();
     const updated = await tx.creatorSessionState.updateMany({
-      where: { creatorId, agencyId, revision, status: "ACTIVE" },
+      where: { creatorId, agencyId, revision, status: { in: ["ACTIVE", "REINITIALIZING"] } },
       data: {
         revision: { increment: 1 },
         status: "REVOKED",
@@ -411,9 +545,10 @@ async function revokeCreatorSession({ db, agencyId, creatorId, actorUserId, devi
       }
       throw sessionConflict(raced);
     }
+    await projectReconnectRequired();
     const next = await tx.creatorSessionState.findUnique({ where: { creatorId } });
     return { state: publicState(next, { includePayload: false }), idempotent: false, unchanged: false };
-  }, { maxWait: 10_000, timeout: 30_000 });
+  });
 }
 
 module.exports = {
@@ -424,5 +559,6 @@ module.exports = {
   requireRegisteredDevice,
   getCreatorSession,
   writeCreatorSession,
+  reinitializeCreatorSessionInTransaction,
   revokeCreatorSession,
 };

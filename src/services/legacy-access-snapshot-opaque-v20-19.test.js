@@ -93,17 +93,11 @@ test("AccessSnapshot routes are creator-scoped and plaintext payload reads requi
   assert.match(policy, /algorithm:\s*null/);
 });
 
-test("every legacy AccessSnapshot writer has an early opaque preflight and an in-transaction Serializable race fence", () => {
-  const connect = fs.readFileSync(path.join(__dirname, "../routes/creator-connect.js"), "utf8");
-  const imported = fs.readFileSync(path.join(__dirname, "../routes/creator-import.js"), "utf8");
-  assert.equal((connect.match(/accessSnapshot\.create\(/g) || []).length, 3);
-  assert.equal((connect.match(/assertLegacyAccessSnapshotWritable\(/g) || []).length, 6);
-  assert.ok((connect.match(/isolationLevel:\s*["']Serializable["']/g) || []).length >= 3);
-  assert.equal((imported.match(/accessSnapshot\.create\(/g) || []).length, 1);
-  assert.equal((imported.match(/assertLegacyAccessSnapshotWritable\(/g) || []).length, 1);
-  assert.ok((imported.match(/isolationLevel:\s*["']Serializable["']/g) || []).length >= 1);
-  assert.match(imported, /res\.status\(status\)\.json\(\{[\s\S]*code:\s*err\?\.code\s*\|\|\s*"CREATOR_IMPORT_FAILED"/);
-  assert.match(imported, /code:\s*err\?\.code\s*\|\|\s*"MIGRATION_COMPLETE_FAILED"/);
+test("legacy creator-connect/import AccessSnapshot writers are physically retired", () => {
+  assert.equal(fs.existsSync(path.join(__dirname, "../routes/creator-connect.js")), false);
+  assert.equal(fs.existsSync(path.join(__dirname, "../routes/creator-import.js")), false);
+  const server = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8");
+  assert.doesNotMatch(server, /creator-connect|creator-import|dev-migration\/import-local/);
 });
 
 test("Prisma contract can null AccessSnapshot secrets and deploy migration shreds already-enforced intermediate rows", () => {

@@ -14,6 +14,12 @@ const { agencyRemovalPhrase, removeCreatorFromAssignedCreators, retireCreatorCry
 const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
 const { bumpAgencyAccessEpoch } = require("../services/access-epoch-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
+const {
+  createCreatorDraft,
+  beginCreatorConnection,
+  completeCreatorConnection,
+  observeCreatorPlatformProfile,
+} = require("../services/creator-enrollment-authority-service");
 
 const router = express.Router();
 
@@ -116,6 +122,14 @@ const updateSchema = createSchema.partial();
 const completeConnectionSchema = z.object({
   remoteId: z.string().min(1).max(120),
   username: creatorUsernameSchema,
+  connectionGeneration: z.number().int().positive(),
+  displayName: z.string().trim().min(1).max(120).optional().nullable(),
+  avatarUrl: z.string().max(2000).optional().nullable(),
+});
+
+const platformProfileSchema = z.object({
+  remoteId: z.string().min(1).max(120),
+  username: creatorUsernameSchema,
   displayName: z.string().trim().min(1).max(120).optional().nullable(),
   avatarUrl: z.string().max(2000).optional().nullable(),
 });
@@ -149,7 +163,14 @@ function jsonRecord(value) {
 async function findCreatorConflict({ agencyId, remoteId = null, username = null, excludeId = null }) {
   const or = [];
   if (remoteId) or.push({ remoteId: String(remoteId) });
-  if (username) or.push({ username: { equals: normalizeUsername(username), mode: "insensitive" } });
+  if (username) {
+    const normalized = normalizeUsername(username);
+    or.push(
+      { platformUsername: { equals: normalized, mode: "insensitive" } },
+      { enrollmentExpectedUsername: { equals: normalized, mode: "insensitive" } },
+      { username: { equals: normalized, mode: "insensitive" } },
+    );
+  }
   if (!or.length) return null;
   return prisma.creatorAccount.findFirst({
     where: {
@@ -159,6 +180,28 @@ async function findCreatorConflict({ agencyId, remoteId = null, username = null,
       OR: or,
     },
   });
+}
+
+function creatorErrorResponse(res, error, fallbackCode, fallbackMessage) {
+  if (error?.issues) {
+    return res.status(400).json({
+      ok: false,
+      code: "VALIDATION_ERROR",
+      error: error.issues[0]?.message || "Validation error",
+      issues: error.issues,
+    });
+  }
+  if (String(error?.code || "") === "P2002") {
+    return res.status(409).json({ ok: false, code: "CREATOR_ALREADY_EXISTS", error: "This OnlyFans creator identity or username is already active in the agency" });
+  }
+  if (error?.status && error?.code) {
+    const payload = { ok: false, code: error.code, error: error.message || fallbackMessage };
+    if (error.creatorId) payload.creatorId = error.creatorId;
+    if (error.currentConnectionState) payload.currentConnectionState = error.currentConnectionState;
+    if (error.currentConnectionGeneration != null) payload.currentConnectionGeneration = error.currentConnectionGeneration;
+    return res.status(Number(error.status)).json(payload);
+  }
+  return res.status(500).json({ ok: false, code: fallbackCode, error: fallbackMessage });
 }
 
 
@@ -239,22 +282,18 @@ router.post("/", creatorManagementRequired, async (req, res) => {
       return res.status(409).json({ ok: false, code: "CREATOR_ALREADY_EXISTS", error: "This OnlyFans creator is already connected", creatorId: conflict.id });
     }
 
-    const creator = await prisma.$transaction(async (tx) => {
-      const created = await tx.creatorAccount.create({
-        data: {
-          agencyId: req.auth.agencyId,
-          displayName: input.displayName.trim(),
-          username,
-          remoteId: null,
-          status: "DRAFT",
-          notes: input.notes || null,
-        },
-      });
+    const creator = await createCreatorDraft({
+      db: prisma,
+      agencyId: req.auth.agencyId,
+      displayName: input.displayName,
+      username,
+      notes: input.notes || null,
+      beforeCommit: async (tx) => {
       // The agency creator set is part of broad-access members' authorization
       // graph. Bump all live members once so every desktop can detect that its
       // cached creator manifest is no longer current.
-      await bumpAgencyAccessEpoch({ db: tx, agencyId: req.auth.agencyId });
-      return created;
+        await bumpAgencyAccessEpoch({ db: tx, agencyId: req.auth.agencyId });
+      },
     });
 
     await audit({
@@ -269,17 +308,8 @@ router.post("/", creatorManagementRequired, async (req, res) => {
 
     return res.status(201).json({ ok: true, creator });
   } catch (err) {
-    if (err?.issues) {
-      return res.status(400).json({
-        ok: false,
-        code: "VALIDATION_ERROR",
-        error: err.issues[0]?.message || "Validation error",
-        issues: err.issues,
-      });
-    }
-
     console.error("[creators/create] failed:", err);
-    return res.status(500).json({ ok: false, code: "CREATOR_CREATE_FAILED", error: "Failed to create creator" });
+    return creatorErrorResponse(res, err, "CREATOR_CREATE_FAILED", "Failed to create creator");
   }
 });
 
@@ -453,6 +483,13 @@ router.patch("/:id", creatorManagementRequired, creatorAccessRequired, async (re
     }
 
     const nextUsername = input.username === undefined ? existing.username : normalizeUsername(input.username);
+    if (input.username !== undefined && existing.remoteId && normalizeUsername(existing.platformUsername || existing.username) !== nextUsername) {
+      return res.status(409).json({
+        ok: false,
+        code: "CREATOR_PLATFORM_USERNAME_OBSERVATION_REQUIRED",
+        error: "Connected creator username is updated only from verified platform identity observations",
+      });
+    }
     const conflict = await findCreatorConflict({ agencyId: req.auth.agencyId, username: nextUsername, excludeId: existing.id });
     if (conflict) {
       return res.status(409).json({ ok: false, code: "CREATOR_ALREADY_EXISTS", error: "This OnlyFans creator is already connected", creatorId: conflict.id });
@@ -463,6 +500,7 @@ router.patch("/:id", creatorManagementRequired, creatorAccessRequired, async (re
       data: {
         displayName: input.displayName === undefined ? undefined : input.displayName.trim(),
         username: input.username === undefined ? undefined : nextUsername,
+        enrollmentExpectedUsername: input.username === undefined || existing.remoteId ? undefined : nextUsername,
         notes: input.notes === undefined ? undefined : input.notes || null,
       },
     });
@@ -478,17 +516,8 @@ router.patch("/:id", creatorManagementRequired, creatorAccessRequired, async (re
 
     return res.json({ ok: true, creator });
   } catch (err) {
-    if (err?.issues) {
-      return res.status(400).json({
-        ok: false,
-        code: "VALIDATION_ERROR",
-        error: err.issues[0]?.message || "Validation error",
-        issues: err.issues,
-      });
-    }
-
     console.error("[creators/update] failed:", err);
-    return res.status(500).json({ ok: false, code: "CREATOR_UPDATE_FAILED", error: "Failed to update creator" });
+    return creatorErrorResponse(res, err, "CREATOR_UPDATE_FAILED", "Failed to update creator");
   }
 });
 
@@ -627,115 +656,90 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
   }
 });
 
+router.post("/:id/begin-connection", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
+  try {
+    const result = await beginCreatorConnection({
+      db: prisma,
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.id,
+      userId: req.auth.userId,
+      deviceId: req.auth?.deviceId || null,
+    });
+    if (!result.unchanged) {
+      await audit({
+        agencyId: req.auth.agencyId,
+        actorUserId: req.auth.userId,
+        action: result.mode === "RECONNECT" ? "creator.reconnect_started" : "creator.connection_started",
+        targetType: "creator",
+        targetId: result.creator.id,
+        metadata: { connectionGeneration: result.connectionGeneration, mode: result.mode },
+      });
+    }
+    return res.json({ ok: true, ...result });
+  } catch (err) {
+    if (!err?.status && !err?.issues && String(err?.code || "") !== "P2002") console.error("[creators/begin-connection] failed:", err);
+    return creatorErrorResponse(res, err, "CREATOR_CONNECTION_BEGIN_FAILED", "Failed to begin creator connection");
+  }
+});
+
 router.post("/:id/complete-connection", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
   try {
     const input = completeConnectionSchema.parse(req.body);
-    const existing = await prisma.creatorAccount.findFirst({
-      where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null },
-    });
-    if (!existing) return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
-
-    const username = normalizeUsername(input.username);
-    const expectedUsername = normalizeUsername(existing.username);
-    if (expectedUsername && expectedUsername !== username) {
-      return res.status(409).json({
-        ok: false,
-        code: "CREATOR_IDENTITY_MISMATCH",
-        error: "The signed-in OnlyFans account does not match the creator username",
-        expectedUsername,
-        observedUsername: username,
-      });
-    }
-    if (existing.remoteId && String(existing.remoteId) !== String(input.remoteId)) {
-      return res.status(409).json({
-        ok: false,
-        code: "CREATOR_IDENTITY_MISMATCH",
-        error: "The signed-in OnlyFans account does not match the connected creator identity",
-      });
-    }
-    // Connection completion is broker-first: canonical CLIENT_E2E session identity
-    // is the authority. Chromium Session/partition naming exists only on Desktop.
-    const canonical = await prisma.creatorSessionState.findUnique({
-      where: { creatorId: existing.id },
-      select: {
-        status: true,
-        revision: true,
-        payloadVersion: true,
-        portableReady: true,
-        platformUserId: true,
-        credentialHash: true,
-        coherenceHash: true,
-      },
-    });
-    const canonicalReady = canonical
-      && canonical.status === "ACTIVE"
-      && Number.isInteger(Number(canonical.revision))
-      && Number(canonical.revision) > 0
-      && Number(canonical.payloadVersion) === 1
-      && canonical.portableReady === true
-      && String(canonical.platformUserId || "") === String(input.remoteId)
-      && Boolean(String(canonical.credentialHash || "").trim())
-      && Boolean(String(canonical.coherenceHash || "").trim());
-    if (!canonicalReady) {
-      return res.status(409).json({
-        ok: false,
-        code: "CREATOR_CANONICAL_SESSION_REQUIRED",
-        error: "A verified canonical creator session must be published before the creator can become READY",
-      });
-    }
-    const conflict = await findCreatorConflict({
+    const result = await completeCreatorConnection({
+      db: prisma,
       agencyId: req.auth.agencyId,
+      creatorId: req.params.id,
+      userId: req.auth.userId,
+      connectionGeneration: input.connectionGeneration,
       remoteId: input.remoteId,
-      username,
-      excludeId: existing.id,
+      username: input.username,
+      platformDisplayName: input.displayName || null,
+      avatarUrl: input.avatarUrl || null,
     });
-    if (conflict) {
-      return res.status(409).json({ ok: false, code: "CREATOR_ALREADY_EXISTS", error: "This OnlyFans creator is already connected", creatorId: conflict.id });
-    }
 
-    const wasAlreadyConnected = existing.status === "READY"
-      && String(existing.remoteId || "") === String(input.remoteId)
-      && normalizeUsername(existing.username) === username;
-
-    const updated = await prisma.creatorAccount.updateMany({
-      where: { id: existing.id, agencyId: req.auth.agencyId, deletedAt: null },
-      data: {
-        remoteId: input.remoteId,
-        username,
-        displayName: existing.displayName,
-        avatarUrl: input.avatarUrl || existing.avatarUrl,
-        status: "READY",
-      },
-    });
-    if (updated.count !== 1) {
-      return res.status(409).json({ ok: false, code: "CREATOR_CONNECTION_STALE", error: "Creator was removed while the connection was being completed" });
-    }
-    const creator = await prisma.creatorAccount.findFirst({
-      where: { id: existing.id, agencyId: req.auth.agencyId, deletedAt: null },
-    });
-    if (!creator) {
-      return res.status(409).json({ ok: false, code: "CREATOR_CONNECTION_STALE", error: "Creator was removed while the connection was being completed" });
-    }
-
-    if (!wasAlreadyConnected) {
-      await scheduleInitialJobsForCreator({ creatorId: creator.id, agencyId: creator.agencyId, priority: 50 }).catch((error) => {
+    if (result.connectedNow) {
+      await scheduleInitialJobsForCreator({ creatorId: result.creator.id, agencyId: result.creator.agencyId, priority: 50 }).catch((error) => {
         console.warn("[creators/complete-connection] schedule jobs failed:", error?.message || error);
       });
       await audit({
         agencyId: req.auth.agencyId,
         actorUserId: req.auth.userId,
-        action: "creator.connected",
+        action: result.creator.remoteId ? "creator.connected" : "creator.connection_completed",
         targetType: "creator",
-        targetId: creator.id,
-        metadata: { remoteId: creator.remoteId, username: creator.username, source: "desktop_runtime" },
+        targetId: result.creator.id,
+        metadata: {
+          remoteId: result.creator.remoteId,
+          username: result.creator.platformUsername || result.creator.username,
+          connectionGeneration: result.creator.connectionGeneration,
+          canonicalRevision: result.creator.connectedSessionRevision,
+          source: "desktop_runtime",
+        },
       });
     }
-
-    return res.json({ ok: true, creator, unchanged: wasAlreadyConnected });
+    return res.json({ ok: true, creator: result.creator, unchanged: result.unchanged });
   } catch (err) {
-    if (err?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
-    console.error("[creators/complete-connection] failed:", err);
-    return res.status(500).json({ ok: false, code: "CREATOR_RUNTIME_COMPLETE_FAILED", error: "Failed to complete creator connection" });
+    if (!err?.status && !err?.issues && String(err?.code || "") !== "P2002") console.error("[creators/complete-connection] failed:", err);
+    return creatorErrorResponse(res, err, "CREATOR_RUNTIME_COMPLETE_FAILED", "Failed to complete creator connection");
+  }
+});
+
+router.post("/:id/platform-profile", creatorAccessRequired, async (req, res) => {
+  try {
+    const input = platformProfileSchema.parse(req.body);
+    const result = await observeCreatorPlatformProfile({
+      db: prisma,
+      agencyId: req.auth.agencyId,
+      creatorId: req.params.id,
+      userId: req.auth.userId,
+      remoteId: input.remoteId,
+      username: input.username,
+      platformDisplayName: input.displayName || null,
+      avatarUrl: input.avatarUrl || null,
+    });
+    return res.json({ ok: true, creator: result.creator, unchanged: result.unchanged });
+  } catch (err) {
+    if (!err?.status && !err?.issues && String(err?.code || "") !== "P2002") console.error("[creators/platform-profile] failed:", err);
+    return creatorErrorResponse(res, err, "CREATOR_PLATFORM_PROFILE_UPDATE_FAILED", "Failed to update creator platform profile");
   }
 });
 

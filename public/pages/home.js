@@ -149,7 +149,6 @@
             </div>
 
             <div class="on-search">⌕ jump to… <span style="margin-left:auto">⌘K</span></div>
-            <button class="on-btn" id="btnOpenImportCreators" style="height:32px;margin:0;display:none;">dev migrate</button>
             <button class="on-btn" id="btnToggleDebug" style="height:32px;margin:0;">debug</button>
             <div class="on-user-chip">${window.OnlinodRouter.escapeHtml(userInitial)}</div>
           </header>
@@ -179,74 +178,18 @@
           <div class="on-modal">
             <div class="on-modal-head">
               <div>
-                <strong>Add creator account</strong>
-                <span>Create backend draft record. Electron binding comes next.</span>
+                <strong>Add or reconnect creator</strong>
+                <span>Creator enrollment is owned by ONLINOD Desktop.</span>
               </div>
               <button id="btnCloseAddCreator">×</button>
             </div>
-
-            <div class="on-connect-status" id="connectStatusBox">
-              <strong>Connection flow</strong>
-              <span>Start creates a draft creator and opens Onlinod desktop app.</span>
-              <pre id="connectStatusText">idle</pre>
-              <div class="on-btn-row" style="margin-top:10px;">
-                <button class="on-btn" id="btnCopyConnectUrl" type="button">Copy connect URL</button>
-                <button class="on-btn" id="btnSimulateConnect" type="button">Dev: simulate complete</button>
-              </div>
-            </div>
-
-            <div class="on-field">
-              <label>Display name</label>
-              <input class="on-input" id="modalCreatorDisplayName" value="Mira">
-            </div>
-
-            <div class="on-field">
-              <label>Username / OF handle</label>
-              <input class="on-input" id="modalCreatorUsername" value="myro_slava">
-            </div>
-
-            <div class="on-field">
-              <label>Partition</label>
-              <input class="on-input" id="modalCreatorPartition" value="persist:acct_demo">
-            </div>
-
-            <div class="on-field">
-              <label>Status</label>
-              <select class="on-select" id="modalCreatorStatus">
-                <option value="draft">draft</option>
-                <option value="ready">ready</option>
-                <option value="not_creator">not_creator</option>
-                <option value="auth_failed">auth_failed</option>
-                <option value="disabled">disabled</option>
-              </select>
-            </div>
-
-            <div class="on-btn-row">
-              <button class="on-btn primary" id="btnModalAddCreator">Start Connect</button>
-              <button class="on-btn" id="btnCancelAddCreator">Cancel</button>
-            </div>
-          </div>
-        </section>
-
-        <section class="on-modal-backdrop" id="importCreatorsModal" data-dev-only aria-hidden="true">
-          <div class="on-modal">
-            <div class="on-modal-head">
-              <div>
-                <strong>DEV migration: local creators + snapshots</strong>
-                <span>Temporary internal tool. Electron uploads local snapshots directly.</span>
-              </div>
-              <button id="btnCloseImportCreators">×</button>
-            </div>
-
             <div class="on-connect-status active">
-              <strong>Automatic dev migration</strong>
-              <span>No JSON. No DevTools. This opens Electron and Electron uploads local snapshots directly to backend.</span>
-              <pre id="migrationStatusText">idle</pre>
+              <strong>Open ONLINOD Desktop</strong>
+              <span>Use Creator Control in the desktop app to create a draft, verify OnlyFans identity, and publish the encrypted canonical session. The web console never receives session credentials or connection tokens.</span>
             </div>
-
             <div class="on-btn-row">
-              <button class="on-btn primary" id="btnImportCreators">Start auto migration</button>
-              <button class="on-btn" id="btnCancelImportCreators">Cancel</button>
+              <button class="on-btn primary" id="btnModalAddCreator">OK</button>
+              <button class="on-btn" id="btnCancelAddCreator">Cancel</button>
             </div>
           </div>
         </section>
@@ -321,9 +264,6 @@
   function openAddCreatorModal() {
     const modal = document.getElementById("addCreatorModal");
     if (!modal) return;
-    const suffix = Date.now().toString(36);
-    const partition = document.getElementById("modalCreatorPartition");
-    if (partition && !partition.value.trim()) partition.value = `persist:acct_${suffix}`;
     modal.classList.add("active");
     modal.setAttribute("aria-hidden", "false");
   }
@@ -335,270 +275,9 @@
     modal.setAttribute("aria-hidden", "true");
   }
 
-  function openImportCreatorsModal() {
-    if (!isDevToolsEnabled()) {
-      window.OnlinodRouter.toast("Dev import is disabled");
-      return;
-    }
-
-    const modal = document.getElementById("importCreatorsModal");
-    if (!modal) return;
-    modal.classList.add("active");
-    modal.setAttribute("aria-hidden", "false");
-  }
-
-  function closeImportCreatorsModal() {
-    const modal = document.getElementById("importCreatorsModal");
-    if (!modal) return;
-    modal.classList.remove("active");
-    modal.setAttribute("aria-hidden", "true");
-  }
-
-
-
-  async function copyMigrationUrlForElectron(url) {
-    const text = String(url || "").trim();
-    if (!text) return false;
-
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch (_) {
-      try {
-        const area = document.createElement("textarea");
-        area.value = text;
-        area.setAttribute("readonly", "readonly");
-        area.style.position = "fixed";
-        area.style.left = "-9999px";
-        document.body.appendChild(area);
-        area.select();
-        document.execCommand("copy");
-        area.remove();
-        return true;
-      } catch (_) {
-        return false;
-      }
-    }
-  }
-
-  async function pollAutoMigrationStatus(token) {
-    const statusEl = document.getElementById("migrationStatusText");
-    if (!token) return;
-
-    const started = Date.now();
-    const timeoutMs = 120000;
-
-    while (Date.now() - started < timeoutMs) {
-      let status;
-
-      try {
-        status = await window.OnlinodApi.request(
-          `/api/dev-migration/import-local/status-auto?token=${encodeURIComponent(token)}`
-        );
-      } catch (err) {
-        status = {
-          ok: false,
-          error: err?.message || String(err),
-        };
-      }
-
-      if (statusEl) {
-        const current = window.OnlinodState.currentLocalMigration || {};
-        statusEl.textContent = JSON.stringify({
-          migrateUrl: current.migrateUrl || null,
-          clipboardFallback: current.clipboardFallback === true,
-          backendStatus: status,
-        }, null, 2);
-      }
-
-      if (status?.ok && status.status === "COMPLETED") {
-        await loadCreators();
-        closeImportCreatorsModal();
-        render(document.getElementById("app"));
-        renderRoute("creatorAnalytics");
-
-        const r = status.result || {};
-        window.OnlinodRouter.toast(
-          `Migration done: creators ${r.imported || 0}, snapshots ${r.snapshotsImported || 0}`
-        );
-        return;
-      }
-
-      if (status?.ok && (status.status === "FAILED" || status.status === "EXPIRED")) {
-        window.OnlinodRouter.toast(status.error || `Migration ${status.status.toLowerCase()}`);
-        return;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
-
-    if (statusEl) {
-      statusEl.textContent = "Migration timeout. Electron opened, but backend did not receive completed migration.";
-    }
-
-    window.OnlinodRouter.toast("Migration timeout");
-  }
-
-  async function importCreatorsFromJson() {
-    if (!isDevToolsEnabled()) {
-      window.OnlinodRouter.toast("Dev import is disabled");
-      return;
-    }
-
-    const status = document.getElementById("migrationStatusText");
-    if (status) status.textContent = "starting migration session…";
-
-    const start = await window.OnlinodApi.request("/api/dev-migration/import-local/start-auto", {
-      method: "POST",
-      body: {},
-    });
-
-    if (!start?.ok) {
-      if (status) status.textContent = JSON.stringify(start, null, 2);
-      window.OnlinodRouter.toast(start?.error || "Migration start failed");
-      return;
-    }
-
-    window.OnlinodState.currentLocalMigration = start;
-
-    if (status) {
-      status.textContent = JSON.stringify({
-        status: "opening Electron",
-        migrateUrl: start.migrateUrl,
-        expiresAt: start.expiresAt,
-      }, null, 2);
-    }
-
-    const copied = await copyMigrationUrlForElectron(start.migrateUrl);
-    window.OnlinodState.currentLocalMigration.clipboardFallback = copied;
-
-    if (status) {
-      status.textContent = JSON.stringify({
-        status: "opening Electron",
-        migrateUrl: start.migrateUrl,
-        clipboardFallback: copied,
-        expiresAt: start.expiresAt,
-      }, null, 2);
-    }
-
-    try {
-      window.location.href = start.migrateUrl;
-    } catch (_) {}
-
-    window.OnlinodRouter.toast(
-      copied
-        ? "Opening Electron for migration… fallback copied"
-        : "Opening Electron for migration…"
-    );
-
-    pollAutoMigrationStatus(start.token).catch((err) => {
-      if (status) {
-        status.textContent = JSON.stringify({
-          ok: false,
-          error: err?.message || String(err),
-        }, null, 2);
-      }
-    });
-  }
-
-  async function addCreatorFromModal() {
-    const displayName = document.getElementById("modalCreatorDisplayName")?.value?.trim() || "Creator";
-    const username = document.getElementById("modalCreatorUsername")?.value?.trim() || "";
-    let partition = document.getElementById("modalCreatorPartition")?.value?.trim() || "";
-
-    if (!partition) {
-      partition = `persist:creator_pending_${Date.now().toString(36)}`;
-    }
-
-    const data = await window.OnlinodApi.request("/api/creator-connect/start", {
-      method: "POST",
-      body: {
-        displayName,
-        username,
-        partition,
-      },
-    });
-
-    if (!data.ok) {
-      window.OnlinodRouter.toast(data.error || "Failed to start creator connect");
-      setConnectStatus("failed", data);
-      return;
-    }
-
-    window.OnlinodState.currentConnectSession = data;
-    setConnectStatus("pending", data);
-
-    // Try to open desktop app through custom protocol. Browser may show a
-    // confirmation prompt. This is expected.
-    try {
-      window.location.href = data.connectUrl;
-    } catch (_) {
-      /* ignore */
-    }
-
-    await loadCreators();
-    renderRoute("creatorAnalytics");
-    window.OnlinodRouter.toast("Connect session started");
-  }
-
-  function setConnectStatus(label, data = null) {
-    const box = document.getElementById("connectStatusBox");
-    const text = document.getElementById("connectStatusText");
-    if (!box || !text) return;
-
-    box.classList.add("active");
-    text.textContent = JSON.stringify({
-      status: label,
-      sessionId: data?.session?.id || data?.session?.id || data?.id || null,
-      connectUrl: data?.connectUrl || null,
-      token: data?.token || null,
-      response: data,
-    }, null, 2);
-  }
-
-  async function pollConnectStatus() {
-    const current = window.OnlinodState.currentConnectSession;
-    const sessionId = current?.session?.id;
-    if (!sessionId) {
-      window.OnlinodRouter.toast("No connect session yet");
-      return null;
-    }
-
-    const data = await window.OnlinodApi.request(`/api/creator-connect/${encodeURIComponent(sessionId)}/status`);
-    setConnectStatus(data?.session?.status || "status", data);
-
-    if (data?.ok) {
-      await loadCreators();
-      renderRoute("creatorAnalytics");
-    }
-
-    return data;
-  }
-
-  async function simulateConnectComplete() {
-    const current = window.OnlinodState.currentConnectSession;
-    const sessionId = current?.session?.id;
-    if (!sessionId) {
-      window.OnlinodRouter.toast("Start connect session first");
-      return;
-    }
-
-    const data = await window.OnlinodApi.request(`/api/creator-connect/${encodeURIComponent(sessionId)}/simulate-complete`, {
-      method: "POST",
-      body: {},
-    });
-
-    setConnectStatus(data?.ok ? "completed" : "failed", data);
-
-    if (data?.ok) {
-      await loadCreators();
-      closeAddCreatorModal();
-      render(document.getElementById("app"));
-      renderRoute("creatorAnalytics");
-      window.OnlinodRouter.toast("Dev snapshot saved on server");
-    } else {
-      window.OnlinodRouter.toast(data.error || "Simulate failed");
-    }
+  function addCreatorFromModal() {
+    closeAddCreatorModal();
+    window.OnlinodRouter.toast("Open ONLINOD Desktop → Creator Control to add or reconnect creators");
   }
 
   function bindShell(root) {
@@ -642,41 +321,6 @@
 
     const modalAdd = root.querySelector("#btnModalAddCreator");
     if (modalAdd) modalAdd.addEventListener("click", addCreatorFromModal);
-
-    const copyConnectUrl = root.querySelector("#btnCopyConnectUrl");
-    if (copyConnectUrl) {
-      copyConnectUrl.addEventListener("click", async () => {
-        const url = window.OnlinodState.currentConnectSession?.connectUrl || "";
-        if (!url) {
-          window.OnlinodRouter.toast("No connect URL yet");
-          return;
-        }
-        await navigator.clipboard.writeText(url);
-        window.OnlinodRouter.toast("Connect URL copied");
-      });
-    }
-
-    const simulateConnect = root.querySelector("#btnSimulateConnect");
-    if (simulateConnect) simulateConnect.addEventListener("click", simulateConnectComplete);
-
-    const openImport = root.querySelector("#btnOpenImportCreators");
-    if (openImport) openImport.addEventListener("click", openImportCreatorsModal);
-
-    const closeImport = root.querySelector("#btnCloseImportCreators");
-    if (closeImport) closeImport.addEventListener("click", closeImportCreatorsModal);
-
-    const cancelImport = root.querySelector("#btnCancelImportCreators");
-    if (cancelImport) cancelImport.addEventListener("click", closeImportCreatorsModal);
-
-    const importModal = root.querySelector("#importCreatorsModal");
-    if (importModal) {
-      importModal.addEventListener("click", (event) => {
-        if (event.target === importModal) closeImportCreatorsModal();
-      });
-    }
-
-    const importCreators = root.querySelector("#btnImportCreators");
-    if (importCreators) importCreators.addEventListener("click", importCreatorsFromJson);
 
     const debug = root.querySelector("#btnToggleDebug");
     if (debug) {

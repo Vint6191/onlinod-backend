@@ -22,10 +22,18 @@ enum CreatorStatus {
   DISABLED
 }
 
+enum CreatorConnectionState {
+  ENROLLMENT_REQUIRED
+  CONNECTING
+  CONNECTED
+  RECONNECT_REQUIRED
+  RECONNECTING
+}
 
 enum CreatorSessionStateStatus {
   ACTIVE
   REVOKED
+  REINITIALIZING
 }
 
 enum AgencyProxyType {
@@ -429,9 +437,17 @@ model CreatorAccount {
   agencyId    String
   displayName String
   username    String?
+  enrollmentExpectedUsername String?
+  platformUsername String?
+  platformDisplayName String?
+  platformAvatarUrl String?
   avatarUrl   String?
   remoteId    String?
   status      CreatorStatus @default(DRAFT)
+  connectionState CreatorConnectionState @default(ENROLLMENT_REQUIRED)
+  connectionGeneration Int @default(0)
+  connectionStartedAt DateTime?
+  connectedSessionRevision Int?
   notes       String?
   telegramContact   String?
   telegramUserId    String?
@@ -692,6 +708,7 @@ model CreatorSessionState {
   creatorId          String                    @unique
   revision           Int                       @default(1)
   status             CreatorSessionStateStatus @default(ACTIVE)
+  connectionGeneration Int                     @default(0)
   payloadVersion     Int                       @default(1)
   portableReady      Boolean                   @default(false)
   encryptionMode     SecretEncryptionMode      @default(CLIENT_E2E_V1)

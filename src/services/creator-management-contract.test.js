@@ -19,7 +19,9 @@ test("all creator writes require management permission", () => {
   assert.match(source, /router\.patch\("\/:id\/telegram-contact", creatorManagementRequired, creatorAccessRequired/);
   assert.match(source, /router\.patch\("\/:id", creatorManagementRequired/);
   assert.match(source, /router\.delete\("\/:id", creatorManagementRequired/);
-  assert.match(source, /router\.post\("\/:id\/complete-connection", creatorManagementRequired/);
+  assert.match(source, /router\.post\("\/:id\/begin-connection", creatorManagementRequired, creatorAccessRequired/);
+  assert.match(source, /router\.post\("\/:id\/complete-connection", creatorManagementRequired, creatorAccessRequired/);
+  assert.match(source, /router\.post\("\/:id\/platform-profile", creatorAccessRequired/);
   assert.match(source, /router\.post\("\/:id\/avatar", creatorManagementRequired/);
 });
 
@@ -36,21 +38,24 @@ test("creation requires an expected OnlyFans username and keeps Chromium partiti
   assert.doesNotMatch(createSchema, /remoteId|partition|status/);
 });
 
-test("runtime completion is identity-bound, race-safe and idempotent", () => {
-  const source = read("routes/creators.js");
-  assert.match(source, /CREATOR_IDENTITY_MISMATCH/);
-  assert.doesNotMatch(source, /CREATOR_PARTITION_MISMATCH/);
-  assert.match(source, /creatorSessionState\.findUnique/);
-  assert.match(source, /CREATOR_CANONICAL_SESSION_REQUIRED/);
-  assert.match(source, /canonical\.status === "ACTIVE"/);
-  assert.match(source, /canonical\.platformUserId/);
-  assert.match(source, /displayName: existing\.displayName/);
-  assert.match(source, /creatorAccount\.updateMany/);
-  assert.match(source, /deletedAt: null/);
-  assert.match(source, /wasAlreadyConnected/);
-  assert.match(source, /if \(!wasAlreadyConnected\)/);
-  assert.match(source, /CREATOR_CONNECTION_STALE/);
-  assert.match(source, /scheduleInitialJobsForCreator/);
+test("runtime completion is identity-bound, generation-fenced and committed by one enrollment authority", () => {
+  const routes = read("routes/creators.js");
+  const service = read("services/creator-enrollment-authority-service.js");
+  assert.match(routes, /completeCreatorConnection\(\{/);
+  assert.match(routes, /connectionGeneration: input\.connectionGeneration/);
+  assert.doesNotMatch(routes, /CREATOR_PARTITION_MISMATCH/);
+  assert.match(service, /CREATOR_IDENTITY_MISMATCH/);
+  assert.match(service, /creatorSessionState\.findUnique/);
+  assert.match(service, /CREATOR_CANONICAL_SESSION_REQUIRED/);
+  assert.match(service, /canonical\.status !== "ACTIVE"/);
+  assert.match(service, /canonical\.platformUserId/);
+  assert.match(service, /creatorConnectionLockKey\(agencyId, creatorId\)/);
+  assert.match(service, /requireLiveConnectionAuthority/);
+  assert.match(service, /CREATOR_CONNECTION_GENERATION_STALE/);
+  assert.match(service, /connectionState: CREATOR_CONNECTION_STATES\.CONNECTED/);
+  assert.match(service, /connectedSessionRevision: Number\(canonical\.revision\)/);
+  assert.match(routes, /if \(result\.connectedNow\)/);
+  assert.match(routes, /scheduleInitialJobsForCreator/);
 });
 
 test("agency removal requires two consequences and only the username phrase", () => {
