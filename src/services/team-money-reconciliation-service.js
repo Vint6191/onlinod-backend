@@ -1,6 +1,8 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { runDbTransaction } = require("./db-transaction-service");
+const { serializableTxOptions } = require("../utils/prisma-transaction");
 
 const RESOLVE_JOB_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 const REFUND_STATUSES = new Set(["undo"]);
@@ -264,7 +266,29 @@ async function upsertResolveJob(db, { purchase, sale, proposed, sent }) {
   });
 }
 
-async function reconcileCreatorSaleToTeam({ db = prisma, saleId }) {
+async function lockPpvPurchaseRow(db, row) {
+  if (!row?.id) return row || null;
+  if (typeof db?.$queryRawUnsafe !== "function") {
+    return db?.teamPpvPurchaseLedger?.findUnique ? (await db.teamPpvPurchaseLedger.findUnique({ where: { id: row.id } })) || row : row;
+  }
+  const rows = await db.$queryRawUnsafe(`
+    SELECT * FROM "TeamPpvPurchaseLedger" WHERE "id" = $1 FOR UPDATE
+  `, row.id);
+  return rows?.[0] || null;
+}
+
+async function lockTipLedgerRow(db, row) {
+  if (!row?.id) return row || null;
+  if (typeof db?.$queryRawUnsafe !== "function") {
+    return db?.teamTipLedger?.findUnique ? (await db.teamTipLedger.findUnique({ where: { id: row.id } })) || row : row;
+  }
+  const rows = await db.$queryRawUnsafe(`
+    SELECT * FROM "TeamTipLedger" WHERE "id" = $1 FOR UPDATE
+  `, row.id);
+  return rows?.[0] || null;
+}
+
+async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   if (!saleId) return { ok: false, code: "SALE_ID_REQUIRED" };
   // Memory test clients used by Creator Analytics intentionally do not model
   // Team tables. Production after the additive migration does.
@@ -301,6 +325,7 @@ async function reconcileCreatorSaleToTeam({ db = prisma, saleId }) {
   else if (sentClass === "MANUAL" && !member) proposed = { status: "unresolved", memberId: null, userId: null, basis: "EXACT_MESSAGE_MEMBER_INACTIVE" };
 
   let existing = await findExistingPurchase(db, { sale, purchaseId, fanExternalId });
+  if (existing) existing = await lockPpvPurchaseRow(db, existing);
   const accountId = clean(sent?.accountId || sale.creatorId, 160) || sale.creatorId;
   const creatorRef = clean(sale.creator?.username || sale.creator?.displayName, 160);
   const sourceData = {
@@ -404,6 +429,10 @@ async function reconcileCreatorSaleToTeam({ db = prisma, saleId }) {
   };
 }
 
+async function reconcileCreatorSaleToTeam({ db = prisma, saleId }) {
+  return runDbTransaction(db, (tx) => reconcileCreatorSaleToTeamInTransaction({ db: tx, saleId }), serializableTxOptions());
+}
+
 async function reconcileCreatorSalesToTeam({ db = prisma, saleIds = [] }) {
   const ids = [...new Set((saleIds || []).map((id) => clean(id, 160)).filter(Boolean))];
   const results = [];
@@ -464,7 +493,7 @@ function tipManualResolutionPreserved(row) {
   return String(row?.resolvedSource || "").startsWith("manual_");
 }
 
-async function reconcileCreatorTipToTeam({ db = prisma, tipId }) {
+async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
   if (!tipId) return { ok: false, code: "TIP_ID_REQUIRED" };
   if (!db?.creatorTip?.findUnique || !db?.teamTipLedger?.create) {
     return { ok: true, skipped: true, reason: "TEAM_MONEY_MODELS_UNAVAILABLE" };
@@ -495,6 +524,7 @@ async function reconcileCreatorTipToTeam({ db = prisma, tipId }) {
   let existing = await db.teamTipLedger.findFirst({
     where: { agencyId: tip.agencyId, OR: [{ creatorTipId: tip.id }, { eventHash }] },
   }).catch(() => null);
+  if (existing) existing = await lockTipLedgerRow(db, existing);
 
   const sourceData = {
     agencyId: tip.agencyId,
@@ -582,11 +612,50 @@ async function reconcileCreatorTipToTeam({ db = prisma, tipId }) {
   };
 }
 
+async function reconcileCreatorTipToTeam({ db = prisma, tipId }) {
+  return runDbTransaction(db, (tx) => reconcileCreatorTipToTeamInTransaction({ db: tx, tipId }), serializableTxOptions());
+}
+
 async function reconcileCreatorTipsToTeam({ db = prisma, tipIds = [] }) {
   const ids = [...new Set((tipIds || []).map((id) => clean(id, 160)).filter(Boolean))];
   const results = [];
   for (const tipId of ids) results.push(await reconcileCreatorTipToTeam({ db, tipId }));
   return results;
+}
+
+async function reconcileMoneyForSentMessageEvidence({ db = prisma, sent }) {
+  const agencyId = clean(sent?.agencyId, 160);
+  const creatorId = clean(sent?.creatorId || sent?.accountId, 160);
+  const messageId = clean(sent?.messageId, 160);
+  if (!agencyId || !creatorId || !messageId) return { ok: true, skipped: true, reason: "SENT_EVIDENCE_INCOMPLETE" };
+  if (!db?.creatorSale?.findMany || !db?.creatorTip?.findMany) return { ok: true, skipped: true, reason: "CREATOR_MONEY_MODELS_UNAVAILABLE" };
+
+  const sentAt = sent?.sentAt instanceof Date ? sent.sentAt : new Date(sent?.sentAt || Date.now());
+  const sentAtMs = Number.isFinite(sentAt.getTime()) ? sentAt.getTime() : Date.now();
+  const tipWindowEnd = new Date(sentAtMs + 15 * 60 * 1000);
+
+  const [sales, tips] = await Promise.all([
+    db.creatorSale.findMany({
+      where: { agencyId, creatorId, saleType: "MESSAGE", messageId },
+      select: { id: true }, orderBy: { id: "asc" }, take: 100,
+    }),
+    db.creatorTip.findMany({
+      where: {
+        agencyId, creatorId,
+        OR: [
+          { messageId },
+          { tippedAt: { gte: sentAt, lte: tipWindowEnd } },
+        ],
+      },
+      select: { id: true }, orderBy: { id: "asc" }, take: 200,
+    }),
+  ]);
+
+  const saleIds = [...new Set((sales || []).map((row) => clean(row.id, 160)).filter(Boolean))];
+  const tipIds = [...new Set((tips || []).map((row) => clean(row.id, 160)).filter(Boolean))];
+  await reconcileCreatorSalesToTeam({ db, saleIds });
+  await reconcileCreatorTipsToTeam({ db, tipIds });
+  return { ok: true, saleIds, tipIds };
 }
 
 /**
@@ -623,29 +692,28 @@ async function reconcileHistoricalTeamMoneyBatch({
   const nowMs = Number.isFinite(safeNow.getTime()) ? safeNow.getTime() : Date.now();
   const detailedSince = new Date(nowMs - safeRetentionDays * 24 * 60 * 60 * 1000);
 
-  const [saleRows, tipRows] = await Promise.all([
+  const [missingSaleRows, missingTipRows, unresolvedPurchases, unresolvedTips] = await Promise.all([
     db.creatorSale.findMany({
-      where: {
-        ...agencyWhere,
-        saleType: "MESSAGE",
-        purchasedAt: { gte: detailedSince },
-        teamPpvPurchase: { is: null },
-      },
-      orderBy: { id: "asc" },
-      take: safeSaleLimit,
-      select: { id: true },
+      where: { ...agencyWhere, saleType: "MESSAGE", purchasedAt: { gte: detailedSince }, teamPpvPurchase: { is: null } },
+      orderBy: { id: "asc" }, take: safeSaleLimit, select: { id: true },
     }),
     db.creatorTip.findMany({
-      where: {
-        ...agencyWhere,
-        tippedAt: { gte: detailedSince },
-        teamTipAttribution: { is: null },
-      },
-      orderBy: { id: "asc" },
-      take: safeTipLimit,
-      select: { id: true },
+      where: { ...agencyWhere, tippedAt: { gte: detailedSince }, teamTipAttribution: { is: null } },
+      orderBy: { id: "asc" }, take: safeTipLimit, select: { id: true },
     }),
+    db.teamPpvPurchaseLedger.findMany ? db.teamPpvPurchaseLedger.findMany({
+      where: { ...agencyWhere, purchasedAt: { gte: detailedSince }, status: { in: ["unresolved", "conflict"] }, creatorSaleId: { not: null } },
+      orderBy: { id: "asc" }, take: safeSaleLimit, select: { creatorSaleId: true },
+    }) : Promise.resolve([]),
+    db.teamTipLedger.findMany ? db.teamTipLedger.findMany({
+      where: { ...agencyWhere, receivedAt: { gte: detailedSince }, status: { in: ["unresolved", "conflict"] }, creatorTipId: { not: null } },
+      orderBy: { id: "asc" }, take: safeTipLimit, select: { creatorTipId: true },
+    }) : Promise.resolve([]),
   ]);
+  const saleRows = [...new Set([...(missingSaleRows || []).map((r) => r.id), ...(unresolvedPurchases || []).map((r) => r.creatorSaleId)].filter(Boolean))]
+    .slice(0, safeSaleLimit).map((id) => ({ id }));
+  const tipRows = [...new Set([...(missingTipRows || []).map((r) => r.id), ...(unresolvedTips || []).map((r) => r.creatorTipId)].filter(Boolean))]
+    .slice(0, safeTipLimit).map((id) => ({ id }));
 
   const run = async (rows, reconcile, idKey) => {
     let processed = 0;
@@ -699,5 +767,6 @@ module.exports = {
   reconcileCreatorSalesToTeam,
   reconcileCreatorTipToTeam,
   reconcileCreatorTipsToTeam,
+  reconcileMoneyForSentMessageEvidence,
   reconcileHistoricalTeamMoneyBatch,
 };

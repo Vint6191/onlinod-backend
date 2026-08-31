@@ -232,6 +232,8 @@ function emptyMetric() {
     ppvSentMessages: 0,
     ppvSoldMessages: 0,
     ppvRevenueCents: 0,
+    ppvRevenueCurrency: null,
+    ppvRevenueByCurrency: {},
     ppvOpenRatePct: null,
     uniqueFans: 0,
     creatorCoverage: 0,
@@ -267,6 +269,8 @@ function emptyMetric() {
     dialogSessionsCount: 0,
     topDialogSessions: [],
     revenueAttributedCents: 0,
+    revenueByCurrency: {},
+    revenueCurrency: null,
     dollarsPerMessageCents: 0,
 
     // internal accumulators
@@ -280,6 +284,7 @@ function emptyMetric() {
     _sla5: 0,
     _sla15: 0,
     _dialogSessions: new Map(),
+    _ppvRevenueByCurrency: new Map(),
   };
 }
 
@@ -311,6 +316,10 @@ function cleanMetric(metric) {
   metric.slaReply5mPct = responseSamples > 0 ? (metric._sla5 / responseSamples) * 100 : null;
   metric.slaReply15mPct = responseSamples > 0 ? (metric._sla15 / responseSamples) * 100 : null;
   metric.dollarsPerMessageCents = metric.messagesSent > 0 ? Math.round(metric.revenueAttributedCents / metric.messagesSent) : 0;
+  const ppvRevenue = singleCurrencyValue(metric._ppvRevenueByCurrency);
+  metric.ppvRevenueByCurrency = currencyBucketObject(metric._ppvRevenueByCurrency);
+  metric.ppvRevenueCurrency = ppvRevenue.currency;
+  metric.ppvRevenueCents = ppvRevenue.cents;
   metric.ppvOpenRatePct = metric.ppvSentMessages > 0 ? (metric.ppvSoldMessages / metric.ppvSentMessages) * 100 : null;
   metric.topDialogSessions = dialogSessions.map((item) => ({
     fanId: item.fanId || null,
@@ -330,6 +339,7 @@ function cleanMetric(metric) {
   delete metric._sla5;
   delete metric._sla15;
   delete metric._dialogSessions;
+  delete metric._ppvRevenueByCurrency;
   return metric;
 }
 
@@ -388,6 +398,15 @@ function logicalEventKey(ev) {
   return ev.localId || [type, accountId, fanId, new Date(ev.ts).getTime()].join("|");
 }
 
+function analyticsUnavailable(section, err) {
+  const error = new Error(`Team analytics ${section} is temporarily unavailable`);
+  error.code = "TEAM_ANALYTICS_DATA_UNAVAILABLE";
+  error.status = 503;
+  error.section = section;
+  if (err) error.cause = err;
+  return error;
+}
+
 function dedupeLogicalEvents(rows) {
   const out = [];
   const seen = new Set();
@@ -416,23 +435,23 @@ async function loadPpvPurchaseLedger({ agencyId, range, allowedCreatorIds = null
     });
     rows.sort((a, b) => new Date(a.purchasedAt || 0).getTime() - new Date(b.purchasedAt || 0).getTime());
     return rows;
-  } catch (_) {
-    return [];
+  } catch (err) {
+    throw analyticsUnavailable("ppv_projection", err);
   }
 }
 
 async function loadProjectionCoverage({ agencyId }) {
   try {
-    if (!prisma.teamProjectionCoverage?.findUnique) return { available: false, responseCoverageFrom: null, dialogCoverageFrom: null };
+    if (!prisma.teamProjectionCoverage?.findUnique) throw new Error("TeamProjectionCoverage model unavailable");
     const row = await prisma.teamProjectionCoverage.findUnique({ where: { agencyId } });
-    if (!row) return { available: false, responseCoverageFrom: null, dialogCoverageFrom: null };
+    if (!row) throw new Error("TeamProjectionCoverage row unavailable");
     return {
       available: true,
       responseCoverageFrom: row.responseCoverageFrom ? new Date(row.responseCoverageFrom) : null,
       dialogCoverageFrom: row.dialogCoverageFrom ? new Date(row.dialogCoverageFrom) : null,
     };
-  } catch (_) {
-    return { available: false, responseCoverageFrom: null, dialogCoverageFrom: null };
+  } catch (err) {
+    throw analyticsUnavailable("projection_coverage", err);
   }
 }
 
@@ -464,8 +483,8 @@ async function loadProjectedResponseCases({ agencyId, range, allowedCreatorIds =
     });
     rows.sort((a, b) => new Date(a.replyAt || 0).getTime() - new Date(b.replyAt || 0).getTime());
     return rows;
-  } catch (_) {
-    return [];
+  } catch (err) {
+    throw analyticsUnavailable("response_projection", err);
   }
 }
 
@@ -476,8 +495,8 @@ async function loadProjectedDialogSessions({ agencyId, range, allowedCreatorIds 
     });
     rows.sort((a, b) => new Date(a.startedAt || 0).getTime() - new Date(b.startedAt || 0).getTime());
     return rows;
-  } catch (_) {
-    return [];
+  } catch (err) {
+    throw analyticsUnavailable("dialog_projection", err);
   }
 }
 
@@ -565,9 +584,9 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     if (!ownerMetric) continue;
 
     const amount = Math.max(0, num(p.amountCents, 0));
+    const currency = normalizeCurrency(p.currency);
     ownerMetric.ppvSoldMessages += 1;
-    ownerMetric.ppvRevenueCents += amount;
-    ownerMetric.revenueAttributedCents += amount;
+    ownerMetric._ppvRevenueByCurrency.set(currency, (ownerMetric._ppvRevenueByCurrency.get(currency) || 0) + amount);
     if (p.fanId) ownerMetric._fans.add(String(p.fanId));
     if (p.accountId) ownerMetric._creators.add(String(p.accountId));
     if (purchaseId) seenPpvPurchaseIds.add(purchaseId);
@@ -929,116 +948,101 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
 const ATTRIBUTED_PPV_STATUSES = ["attributed", "resolved"];
 const ATTRIBUTED_TIP_STATUSES = ["attributed", "claimed", "resolved"];
 
-function addToMap(map, key, cents) {
-  const safeKey = String(key || "").trim();
-  if (!safeKey) return;
-  map.set(safeKey, (map.get(safeKey) || 0) + Math.max(0, num(cents, 0)));
+function normalizeCurrency(value) {
+  const currency = String(value || "USD").trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(currency) ? currency : "USD";
 }
 
-function mergeRevenueMaps(...maps) {
+function addCurrencyToMap(map, key, currency, cents) {
+  const safeKey = String(key || "").trim();
+  if (!safeKey) return;
+  const code = normalizeCurrency(currency);
+  const bucket = map.get(safeKey) || new Map();
+  bucket.set(code, (bucket.get(code) || 0) + Math.max(0, num(cents, 0)));
+  map.set(safeKey, bucket);
+}
+
+function mergeRevenueCurrencyMaps(...maps) {
   const out = new Map();
   for (const map of maps || []) {
-    for (const [key, value] of map?.entries?.() || []) addToMap(out, key, value);
+    for (const [key, bucket] of map?.entries?.() || []) {
+      for (const [currency, cents] of bucket?.entries?.() || []) addCurrencyToMap(out, key, currency, cents);
+    }
   }
   return out;
+}
+
+function currencyBucketObject(bucket) {
+  return Object.fromEntries([...(bucket?.entries?.() || [])].sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function singleCurrencyValue(bucket) {
+  const entries = [...(bucket?.entries?.() || [])];
+  if (entries.length === 0) return { cents: 0, currency: null, mixed: false };
+  if (entries.length === 1) return { cents: entries[0][1], currency: entries[0][0], mixed: false };
+  return { cents: null, currency: null, mixed: true };
+}
+
+function bucketTotal(bucket) {
+  let total = 0;
+  for (const value of bucket?.values?.() || []) total += Math.max(0, num(value, 0));
+  return total;
 }
 
 async function getPpvLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await prisma.teamPpvPurchaseLedger.groupBy({
-      by: ["attributedMemberId"],
-      where: {
-        agencyId,
-        ...creatorScopeWhere(allowedCreatorIds),
-        ...activePpvFinancialWhere(),
-        status: { in: ATTRIBUTED_PPV_STATUSES },
-        attributedMemberId: { not: null },
-        ...whereForRange("purchasedAt", range),
-      },
+      by: ["attributedMemberId", "currency"],
+      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activePpvFinancialWhere(), status: { in: ATTRIBUTED_PPV_STATUSES }, attributedMemberId: { not: null }, ...whereForRange("purchasedAt", range) },
       _sum: { amountCents: true },
     });
     const map = new Map();
-    for (const row of rows || []) {
-      if (row.attributedMemberId) addToMap(map, row.attributedMemberId, row?._sum?.amountCents);
-    }
+    for (const row of rows || []) if (row.attributedMemberId) addCurrencyToMap(map, row.attributedMemberId, row.currency, row?._sum?.amountCents);
     return map;
-  } catch (_) {
-    return new Map();
-  }
+  } catch (err) { throw analyticsUnavailable("ppv_revenue", err); }
 }
 
 async function getPpvLedgerRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await findAllById(prisma.teamPpvPurchaseLedger, {
-      where: {
-        agencyId,
-        ...creatorScopeWhere(allowedCreatorIds),
-        ...activePpvFinancialWhere(),
-        status: { in: ATTRIBUTED_PPV_STATUSES },
-        attributedMemberId: { not: null },
-        ...whereForRange("purchasedAt", range),
-      },
-      select: { id: true, attributedMemberId: true, fanId: true, buyerFanId: true, dialogId: true, amountCents: true },
+      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activePpvFinancialWhere(), status: { in: ATTRIBUTED_PPV_STATUSES }, attributedMemberId: { not: null }, ...whereForRange("purchasedAt", range) },
+      select: { id: true, attributedMemberId: true, fanId: true, buyerFanId: true, dialogId: true, amountCents: true, currency: true },
     });
     const map = new Map();
     for (const row of rows || []) {
       const fanKey = row.fanId || row.buyerFanId || row.dialogId;
-      if (!row.attributedMemberId || !fanKey) continue;
-      addToMap(map, `${row.attributedMemberId}|${fanKey}`, row.amountCents);
+      if (row.attributedMemberId && fanKey) addCurrencyToMap(map, `${row.attributedMemberId}|${fanKey}`, row.currency, row.amountCents);
     }
     return map;
-  } catch (_) {
-    return new Map();
-  }
+  } catch (err) { throw analyticsUnavailable("ppv_revenue_dialog", err); }
 }
 
 async function getTipLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await prisma.teamTipLedger.groupBy({
-      by: ["attributedMemberId"],
-      where: {
-        agencyId,
-        ...creatorScopeWhere(allowedCreatorIds),
-        ...activeTipFinancialWhere(),
-        status: { in: ATTRIBUTED_TIP_STATUSES },
-        attributedMemberId: { not: null },
-        ...whereForRange("receivedAt", range),
-      },
+      by: ["attributedMemberId", "currency"],
+      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activeTipFinancialWhere(), status: { in: ATTRIBUTED_TIP_STATUSES }, attributedMemberId: { not: null }, ...whereForRange("receivedAt", range) },
       _sum: { amountCents: true },
     });
     const map = new Map();
-    for (const row of rows || []) {
-      if (row.attributedMemberId) addToMap(map, row.attributedMemberId, row?._sum?.amountCents);
-    }
+    for (const row of rows || []) if (row.attributedMemberId) addCurrencyToMap(map, row.attributedMemberId, row.currency, row?._sum?.amountCents);
     return map;
-  } catch (_) {
-    return new Map();
-  }
+  } catch (err) { throw analyticsUnavailable("tip_revenue", err); }
 }
 
 async function getTipLedgerRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await findAllById(prisma.teamTipLedger, {
-      where: {
-        agencyId,
-        ...creatorScopeWhere(allowedCreatorIds),
-        ...activeTipFinancialWhere(),
-        status: { in: ATTRIBUTED_TIP_STATUSES },
-        attributedMemberId: { not: null },
-        ...whereForRange("receivedAt", range),
-      },
-      select: { id: true, attributedMemberId: true, fanId: true, dialogId: true, amountCents: true },
+      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activeTipFinancialWhere(), status: { in: ATTRIBUTED_TIP_STATUSES }, attributedMemberId: { not: null }, ...whereForRange("receivedAt", range) },
+      select: { id: true, attributedMemberId: true, fanId: true, dialogId: true, amountCents: true, currency: true },
     });
     const map = new Map();
     for (const row of rows || []) {
       const fanKey = row.fanId || row.dialogId;
-      if (!row.attributedMemberId || !fanKey) continue;
-      addToMap(map, `${row.attributedMemberId}|${fanKey}`, row.amountCents);
+      if (row.attributedMemberId && fanKey) addCurrencyToMap(map, `${row.attributedMemberId}|${fanKey}`, row.currency, row.amountCents);
     }
     return map;
-  } catch (_) {
-    return new Map();
-  }
+  } catch (err) { throw analyticsUnavailable("tip_revenue_dialog", err); }
 }
 
 
@@ -1067,36 +1071,44 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
     getPpvLedgerRevenueByMemberDialog({ agencyId, range: computed.range, allowedCreatorIds }),
     getTipLedgerRevenueByMemberDialog({ agencyId, range: computed.range, allowedCreatorIds }),
   ]) : [new Map(), new Map(), new Map(), new Map()];
-  const revenueByMember = mergeRevenueMaps(ppvRevenueByMember, tipLedgerRevenueByMember);
-  const revenueByMemberDialog = mergeRevenueMaps(ppvRevenueByMemberDialog, tipLedgerRevenueByMemberDialog);
+  const revenueByMember = mergeRevenueCurrencyMaps(ppvRevenueByMember, tipLedgerRevenueByMember);
+  const revenueByMemberDialog = mergeRevenueCurrencyMaps(ppvRevenueByMemberDialog, tipLedgerRevenueByMemberDialog);
 
   const rows = computed.members.map((member) => {
     const shell = memberShell(member);
     const metrics = computed.byMember.get(String(member.id)) || cleanMetric(emptyMetric());
-    const revenue = revenueByMember.get(String(member.id)) || 0;
-    if (includeMoney && revenue > 0) {
-      metrics.revenueAttributedCents = revenue;
-      metrics.dollarsPerMessageCents = metrics.messagesSent > 0 ? Math.round(revenue / metrics.messagesSent) : 0;
-      metrics.moneySource = "team_ledgers";
+    const revenueBucket = revenueByMember.get(String(member.id)) || new Map();
+    const revenue = singleCurrencyValue(revenueBucket);
+    if (includeMoney) {
+      metrics.revenueByCurrency = currencyBucketObject(revenueBucket);
+      metrics.revenueAttributedCents = revenue.cents;
+      metrics.revenueCurrency = revenue.currency;
+      metrics.dollarsPerMessageCents = revenue.cents !== null && metrics.messagesSent > 0 ? Math.round(revenue.cents / metrics.messagesSent) : (revenue.cents === 0 ? 0 : null);
+      metrics.moneySource = revenue.mixed ? "team_ledgers_multi_currency" : "team_ledgers";
     }
     if (!includeMoney) {
       metrics.revenueAttributedCents = null;
       metrics.dollarsPerMessageCents = null;
       metrics.ppvRevenueCents = null;
+      metrics.ppvRevenueCurrency = null;
+      metrics.ppvRevenueByCurrency = null;
       metrics.ppvSoldMessages = null;
       metrics.ppvOpenRatePct = null;
       metrics.moneySource = null;
+      metrics.revenueByCurrency = null;
+      metrics.revenueCurrency = null;
     }
     if (Array.isArray(metrics.topDialogSessions)) {
       metrics.topDialogSessions = metrics.topDialogSessions.map((item) => {
-        const cents = includeMoney ? (revenueByMemberDialog.get(`${shell.id}|${item.fanId || ""}`) || 0) : null;
+        const dialogBucket = includeMoney ? (revenueByMemberDialog.get(`${shell.id}|${item.fanId || ""}`) || new Map()) : new Map();
+        const dialogRevenue = singleCurrencyValue(dialogBucket);
         const sharePct = metrics.dialogDwellSeconds > 0 ? Math.round((num(item.dwellSeconds, 0) / metrics.dialogDwellSeconds) * 100) : 0;
         return includeMoney
-          ? { ...item, shiftRevenueCents: cents, shiftRevenueUsd: Math.round(cents || 0) / 100, shiftTimeSharePct: sharePct }
+          ? { ...item, shiftRevenueByCurrency: currencyBucketObject(dialogBucket), shiftRevenueCents: dialogRevenue.cents, shiftRevenueCurrency: dialogRevenue.currency, shiftRevenueUsd: dialogRevenue.currency === "USD" ? Math.round(dialogRevenue.cents || 0) / 100 : null, shiftTimeSharePct: sharePct }
           : { ...item, shiftTimeSharePct: sharePct };
       });
     }
-    return { member: shell, metrics, rawSummary: null, _historicalVisible: !member.deletedAt || memberHasHistoricalActivity(metrics, revenue) };
+    return { member: shell, metrics, rawSummary: null, _historicalVisible: !member.deletedAt || memberHasHistoricalActivity(metrics, bucketTotal(revenueBucket)) };
   }).filter((row) => row._historicalVisible).map(({ _historicalVisible, ...row }) => row);
 
   return {
@@ -1144,6 +1156,8 @@ function combineOverview(metricsList, membersCount) {
     ppvSentMessages: 0,
     ppvSoldMessages: 0,
     ppvRevenueCents: 0,
+    ppvRevenueCurrency: null,
+    ppvRevenueByCurrency: {},
     ppvOpenRatePct: null,
     uniqueFans: 0,
     activeCreators: 0,
@@ -1152,6 +1166,8 @@ function combineOverview(metricsList, membersCount) {
     devicesOnline: 0,
     eventsCount: 0,
     revenueAttributedCents: 0,
+    revenueByCurrency: {},
+    revenueCurrency: null,
     dollarsPerMessageCents: 0,
     avgResponseSeconds: null,
     medianResponseSeconds: null,
@@ -1205,8 +1221,12 @@ function combineOverview(metricsList, membersCount) {
     out.unknownReplies += num(m.unknownReplies, 0);
     out.ppvSentMessages += num(m.ppvSentMessages, 0);
     out.ppvSoldMessages += num(m.ppvSoldMessages, 0);
-    out.ppvRevenueCents += num(m.ppvRevenueCents, 0);
-    out.revenueAttributedCents += num(m.revenueAttributedCents, 0);
+    for (const [currency, cents] of Object.entries(m.ppvRevenueByCurrency || {})) {
+      out.ppvRevenueByCurrency[currency] = (out.ppvRevenueByCurrency[currency] || 0) + Math.max(0, num(cents, 0));
+    }
+    for (const [currency, cents] of Object.entries(m.revenueByCurrency || {})) {
+      out.revenueByCurrency[currency] = (out.revenueByCurrency[currency] || 0) + Math.max(0, num(cents, 0));
+    }
     if (num(m.activeEvents, 0) > 0) out.activeMembers += 1;
     if (num(m.creatorCoverage, 0) > 0) out.activeCreators += num(m.creatorCoverage, 0);
     out.eventsCount += num(m.activeEvents, 0);
@@ -1221,7 +1241,23 @@ function combineOverview(metricsList, membersCount) {
   }
   out.avgResponseSeconds = mean(responses);
   out.slaReply15mPct = sla15Samples > 0 ? (sla15Good / sla15Samples) * 100 : null;
-  out.dollarsPerMessageCents = out.messagesSent > 0 ? Math.round(out.revenueAttributedCents / out.messagesSent) : 0;
+  const overviewCurrencies = Object.entries(out.revenueByCurrency || {});
+  if (overviewCurrencies.length === 0) {
+    out.revenueAttributedCents = 0; out.revenueCurrency = null;
+  } else if (overviewCurrencies.length === 1) {
+    out.revenueCurrency = overviewCurrencies[0][0]; out.revenueAttributedCents = overviewCurrencies[0][1];
+  } else {
+    out.revenueCurrency = null; out.revenueAttributedCents = null;
+  }
+  out.dollarsPerMessageCents = out.revenueAttributedCents !== null && out.messagesSent > 0 ? Math.round(out.revenueAttributedCents / out.messagesSent) : (out.revenueAttributedCents === 0 ? 0 : null);
+  const ppvOverviewCurrencies = Object.entries(out.ppvRevenueByCurrency || {});
+  if (ppvOverviewCurrencies.length === 0) {
+    out.ppvRevenueCents = 0; out.ppvRevenueCurrency = null;
+  } else if (ppvOverviewCurrencies.length === 1) {
+    out.ppvRevenueCurrency = ppvOverviewCurrencies[0][0]; out.ppvRevenueCents = ppvOverviewCurrencies[0][1];
+  } else {
+    out.ppvRevenueCurrency = null; out.ppvRevenueCents = null;
+  }
   out.ppvOpenRatePct = out.ppvSentMessages > 0 ? (out.ppvSoldMessages / out.ppvSentMessages) * 100 : null;
   return out;
 }
@@ -1264,8 +1300,12 @@ async function buildTeamOverview({ agencyId, rangeKey = "7d", includeMoney = tru
   }
   if (!includeMoney) {
     overview.revenueAttributedCents = null;
+    overview.revenueByCurrency = null;
+    overview.revenueCurrency = null;
     overview.dollarsPerMessageCents = null;
     overview.ppvRevenueCents = null;
+    overview.ppvRevenueCurrency = null;
+    overview.ppvRevenueByCurrency = null;
     overview.ppvSoldMessages = null;
     overview.ppvOpenRatePct = null;
   }

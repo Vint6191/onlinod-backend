@@ -12,9 +12,11 @@ const {
   classifySentSource,
   reconcileCreatorSaleToTeam,
   reconcileCreatorTipToTeam,
+  reconcileMoneyForSentMessageEvidence,
 } = require(servicePath);
 
 function dbFixture({ sent = null, existing = null, financialStatus = "done", memberActive = true } = {}) {
+  let sentCurrent = sent;
   const sale = {
     id: "sale-1",
     agencyId: "agency-1",
@@ -45,23 +47,25 @@ function dbFixture({ sent = null, existing = null, financialStatus = "done", mem
   const db = {
     creatorSale: {
       async findUnique({ where }) { return where.id === sale.id ? { ...sale } : null; },
+      async findMany({ where }) { return where.messageId === sale.messageId ? [{ id: sale.id }] : []; },
     },
+    creatorTip: { async findMany() { return []; } },
     creatorFinancialTransaction: {
       async findUnique() { return { ...financial }; },
     },
     teamSentMessageLedger: {
       async findFirst({ where }) {
-        if (!sent) return null;
-        if (where.messageId !== sent.messageId) return null;
-        if (where.creatorId && where.creatorId !== sent.creatorId) return null;
-        if (where.accountId && where.accountId !== sent.accountId) return null;
-        return { ...sent };
+        if (!sentCurrent) return null;
+        if (where.messageId !== sentCurrent.messageId) return null;
+        if (where.creatorId && where.creatorId !== sentCurrent.creatorId) return null;
+        if (where.accountId && where.accountId !== sentCurrent.accountId) return null;
+        return { ...sentCurrent };
       },
     },
     agencyMember: {
       async findFirst({ where }) {
-        if (!memberActive || !sent?.memberId || where.id !== sent.memberId) return null;
-        return { id: sent.memberId, userId: sent.userId || "user-1" };
+        if (!memberActive || !sentCurrent?.memberId || where.id !== sentCurrent.memberId) return null;
+        return { id: sentCurrent.memberId, userId: sentCurrent.userId || "user-1" };
       },
     },
     teamPpvPurchaseLedger: {
@@ -103,6 +107,8 @@ function dbFixture({ sent = null, existing = null, financialStatus = "done", mem
     getPurchase: () => purchase,
     getResolveJob: () => resolveJob,
     getPurchaseCreates: () => purchaseCreates,
+    setSent: (value) => { sentCurrent = value; },
+    setPurchase: (value) => { purchase = value ? { ...value } : null; },
   };
 }
 
@@ -235,7 +241,8 @@ test("payout undo keeps attribution evidence but financially disables the purcha
 });
 
 
-function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done", existing = null } = {}) {
+function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done", existing = null, tipMessageId = undefined } = {}) {
+  let exactSentCurrent = exactSent;
   const tip = {
     id: "creator-tip-1",
     agencyId: "agency-1",
@@ -244,7 +251,7 @@ function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done",
     eventFingerprint: "tip-fingerprint-1",
     externalNotificationId: "tip-notification-1",
     externalTransactionId: "tip-transaction-1",
-    messageId: exactSent ? "tip-message-1" : null,
+    messageId: tipMessageId !== undefined ? tipMessageId : (exactSent ? "tip-message-1" : null),
     amountCents: 1000,
     currency: "USD",
     tippedAt: new Date("2026-08-12T11:00:00Z"),
@@ -255,18 +262,19 @@ function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done",
   let attribution = existing ? { ...existing } : null;
   let tipCreates = 0;
   const db = {
-    creatorTip: { async findUnique() { return { ...tip }; } },
+    creatorTip: { async findUnique() { return { ...tip }; }, async findMany() { return [{ id: tip.id }]; } },
+    creatorSale: { async findMany() { return []; } },
     teamSentMessageLedger: {
       async findFirst({ where }) {
-        if (!exactSent || where.messageId !== exactSent.messageId) return null;
-        if (where.creatorId && where.creatorId !== exactSent.creatorId) return null;
-        return { ...exactSent };
+        if (!exactSentCurrent || where.messageId !== exactSentCurrent.messageId) return null;
+        if (where.creatorId && where.creatorId !== exactSentCurrent.creatorId) return null;
+        return { ...exactSentCurrent };
       },
       async findMany() { return recent.map((row) => ({ ...row })); },
     },
     agencyMember: {
       async findFirst({ where }) {
-        const candidate = [exactSent, ...recent].find((row) => row?.memberId === where.id);
+        const candidate = [exactSentCurrent, ...recent].find((row) => row?.memberId === where.id);
         return candidate ? { id: candidate.memberId, userId: candidate.userId || `user-${candidate.memberId}` } : null;
       },
     },
@@ -276,7 +284,7 @@ function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done",
       async update({ data }) { attribution = { ...attribution, ...data }; return { ...attribution }; },
     },
   };
-  return { db, getAttribution: () => attribution, getTipCreates: () => tipCreates };
+  return { db, getAttribution: () => attribution, getTipCreates: () => tipCreates, setExactSent: (value) => { exactSentCurrent = value; }, setAttribution: (value) => { attribution = value ? { ...value } : null; } };
 }
 
 function tipSent({ memberId = "member-1", source = "manual", minutesBefore = 2 } = {}) {
@@ -341,4 +349,70 @@ test("tip payout undo is retained as evidence but marked financially reversed", 
   assert.equal(result.financialRefunded, true);
   assert.equal(fx.getAttribution().financialStatus, "undo");
   assert.equal(fx.getAttribution().attributedMemberId, "member-1");
+});
+
+
+test("late exact sent-message evidence re-reconciles an existing unresolved PPV row in place", async () => {
+  const fx = dbFixture({ sent: null });
+  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  assert.equal(fx.getPurchase().status, "unresolved");
+  const sent = manualSent("member-late");
+  fx.setSent(sent);
+  await reconcileMoneyForSentMessageEvidence({ db: fx.db, sent });
+  assert.equal(fx.getPurchaseCreates(), 1, "late evidence must update the same money row");
+  assert.equal(fx.getPurchase().status, "attributed");
+  assert.equal(fx.getPurchase().attributedMemberId, "member-late");
+});
+
+test("late recent tip evidence re-evaluates an existing unresolved canonical tip row", async () => {
+  const fx = tipDbFixture({ exactSent: null, recent: [], tipMessageId: "tip-message-1" });
+  await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  assert.equal(fx.getAttribution().status, "unresolved");
+  const sent = tipSent({ memberId: "member-late", minutesBefore: 2 });
+  fx.setExactSent(sent);
+  await reconcileMoneyForSentMessageEvidence({ db: fx.db, sent });
+  assert.equal(fx.getTipCreates(), 1);
+  assert.equal(fx.getAttribution().status, "attributed");
+  assert.equal(fx.getAttribution().attributedMemberId, "member-late");
+});
+
+
+test("automatic PPV reconciliation re-reads a manual resolution at the row lock before commit", async () => {
+  const stale = {
+    id: "old-purchase", agencyId: "agency-1", accountId: "creator-1", creatorId: "creator-1",
+    purchaseId: "notification-1", messageId: "message-1", amountCents: 2500,
+    purchasedAt: new Date("2026-08-12T10:00:00Z"), status: "attributed",
+    attributedMemberId: "member-old", resolvedSource: "legacy_auto_resolver", creatorSaleId: null,
+  };
+  const manual = { ...stale, attributedMemberId: "manager-selected-member", resolvedSource: "manual_claim_resolution" };
+  const fx = dbFixture({ sent: manualSent("different-member"), existing: stale });
+  fx.db.$queryRawUnsafe = async (sql) => {
+    assert.match(String(sql), /TeamPpvPurchaseLedger[\s\S]*FOR UPDATE/);
+    fx.setPurchase(manual);
+    return [{ ...manual }];
+  };
+  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  assert.equal(result.preservedManualResolution, true);
+  assert.equal(fx.getPurchase().attributedMemberId, "manager-selected-member");
+  assert.equal(fx.getPurchase().resolvedSource, "manual_claim_resolution");
+});
+
+test("automatic Tip reconciliation re-reads a manual resolution at the row lock before commit", async () => {
+  const stale = {
+    id: "team-tip-1", agencyId: "agency-1", accountId: "creator-1", creatorId: "creator-1",
+    eventHash: "tip-fingerprint-1", tipId: "tip-notification-1", amountCents: 1000, currency: "USD",
+    receivedAt: new Date("2026-08-12T11:00:00Z"), status: "attributed",
+    attributedMemberId: "member-old", resolvedSource: "creator_tip_exact_message", history: [], result: {},
+  };
+  const manual = { ...stale, attributedMemberId: "manager-selected-member", resolvedSource: "manual_manager_resolution" };
+  const fx = tipDbFixture({ exactSent: tipSent({ memberId: "different-member" }), existing: stale });
+  fx.db.$queryRawUnsafe = async (sql) => {
+    assert.match(String(sql), /TeamTipLedger[\s\S]*FOR UPDATE/);
+    fx.setAttribution(manual);
+    return [{ ...manual }];
+  };
+  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  assert.equal(result.preservedManualResolution, true);
+  assert.equal(fx.getAttribution().attributedMemberId, "manager-selected-member");
+  assert.equal(fx.getAttribution().resolvedSource, "manual_manager_resolution");
 });

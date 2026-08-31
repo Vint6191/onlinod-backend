@@ -11,8 +11,6 @@ const {
   buildTeamFlags,
 } = require("../services/team-analytics-service");
 const {
-  listResolveJobs,
-  submitResolveResults,
   listPpvConflicts,
   resolvePpvConflict,
 } = require("../services/team-ppv-ledger-service");
@@ -131,46 +129,6 @@ function ppvClaimForViewer(row, canViewAudit) {
   }
   return { ...row, audit: [], manualResolutions: [], result: result || null };
 }
-
-router.get("/ppv/resolve-jobs", async (req, res) => {
-  try {
-    const id = requireAgency(req, res); if (!id) return;
-    const actor = await loadAgencyMember(req, id);
-    if (!actor) return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
-    const jobs = await listResolveJobs({
-      agencyId: id,
-      limit: req.query.limit || 100,
-      allowedCreatorIds: analyticsCreatorScope(actor),
-    });
-    return res.json({ ok: true, jobs });
-  } catch (err) {
-    return res.status(500).json({ ok: false, code: "PPV_RESOLVE_JOBS_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-router.post("/ppv/resolve-results", async (req, res) => {
-  try {
-    const id = requireAgency(req, res); if (!id) return;
-    const actor = await loadAgencyMember(req, id);
-    if (!actor) {
-      return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
-    }
-
-    const canResolveAgencyWide = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RESOLVE_ATTRIBUTION });
-    const result = await submitResolveResults({
-      agencyId: id,
-      deviceId: req.auth.deviceId || req.body?.deviceId || null,
-      results: req.body?.results || [],
-      actorMemberId: actor.id,
-      actorUserId: actor.userId,
-      senior: canResolveAgencyWide,
-      allowedCreatorIds: analyticsCreatorScope(actor),
-    });
-    return res.json({ ok: true, ...result });
-  } catch (err) {
-    return res.status(500).json({ ok: false, code: "PPV_RESOLVE_RESULTS_FAILED", error: err?.message || "Failed" });
-  }
-});
 
 router.get("/ppv/conflicts", async (req, res) => {
   try {
@@ -296,7 +254,7 @@ router.get("/overview", async (req, res) => {
     const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
     return res.json(await buildTeamOverview({ agencyId: viewer.agencyId, rangeKey: req.query.range || "7d", includeMoney: viewer.includeMoney, allowedCreatorIds: viewer.allowedCreatorIds }));
   } catch (err) {
-    return res.status(500).json({ ok: false, code: "TEAM_ANALYTICS_OVERVIEW_FAILED", error: err?.message || "Failed" });
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "TEAM_ANALYTICS_OVERVIEW_FAILED", section: err?.section || null, error: err?.message || "Failed" });
   }
 });
 
@@ -305,7 +263,7 @@ router.get("/members", async (req, res) => {
     const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
     return res.json(await buildTeamMembers({ agencyId: viewer.agencyId, rangeKey: req.query.range || "7d", includeMoney: viewer.includeMoney, allowedCreatorIds: viewer.allowedCreatorIds }));
   } catch (err) {
-    return res.status(500).json({ ok: false, code: "TEAM_ANALYTICS_MEMBERS_FAILED", error: err?.message || "Failed" });
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "TEAM_ANALYTICS_MEMBERS_FAILED", section: err?.section || null, error: err?.message || "Failed" });
   }
 });
 
@@ -329,7 +287,7 @@ router.get("/alerts", async (req, res) => {
     const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
     return res.json(await buildTeamAlerts({ agencyId: viewer.agencyId, rangeKey: req.query.range || "7d", includeMoney: viewer.includeMoney, allowedCreatorIds: viewer.allowedCreatorIds }));
   } catch (err) {
-    return res.status(500).json({ ok: false, code: "TEAM_ANALYTICS_ALERTS_FAILED", error: err?.message || "Failed" });
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "TEAM_ANALYTICS_ALERTS_FAILED", section: err?.section || null, error: err?.message || "Failed" });
   }
 });
 
@@ -338,7 +296,7 @@ router.get("/flags", async (req, res) => {
     const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
     return res.json(await buildTeamFlags({ agencyId: viewer.agencyId, rangeKey: req.query.range || "7d", includeMoney: viewer.includeMoney, allowedCreatorIds: viewer.allowedCreatorIds }));
   } catch (err) {
-    return res.status(500).json({ ok: false, code: "TEAM_ANALYTICS_FLAGS_FAILED", error: err?.message || "Failed" });
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "TEAM_ANALYTICS_FLAGS_FAILED", section: err?.section || null, error: err?.message || "Failed" });
   }
 });
 

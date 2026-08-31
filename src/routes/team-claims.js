@@ -3,7 +3,6 @@
 const express = require("express");
 const { z } = require("zod");
 const {
-  applyOverride,
   listDisputable,
   sweepLocks,
   purgeExpiredLegacyAttributions,
@@ -272,20 +271,9 @@ router.post("/override", async (req, res) => {
       allowedCreatorIds,
     });
 
-    // Cross-version fallback: old v15 tip rows may still live in
-    // MoneyAttribution until a one-time migration/backfill is run.
-    if (!result.ok && result.code === "TIP_NOT_FOUND") {
-      result = await applyOverride({
-        agencyId: req.auth.agencyId,
-        byUserId: req.auth.userId,
-        byMemberId: null, // actor is resolved from req.auth.userId; targetMemberId is only the new owner
-        eventHash: input.eventHash,
-        action: input.action,
-        targetMemberId: input.targetMemberId,
-        reason: input.reason,
-        allowedCreatorIds,
-      });
-    }
+    // Audit15 Closure2: current Claims never writes legacy MoneyAttribution.
+    // Any still-retained tip row is migration input only and will become a
+    // TeamTipLedger row through the automatic locked migration sweep.
 
     if (!result.ok) {
       const status = result.code === "ATTRIBUTION_LOCKED" ? 409

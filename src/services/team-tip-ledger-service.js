@@ -607,97 +607,97 @@ async function findExistingTipHashesForLegacyRows(tx, legacyRows) {
   return existing;
 }
 
+async function selectLegacyTipsForMigration(tx, { agencyId, cutoff, limit }) {
+  const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
+  if (typeof tx?.$queryRawUnsafe !== "function") {
+    return tx.moneyAttribution.findMany({
+      where: { eventType: "tip_received", occurredAt: { gte: cutoff }, ...(agencyId ? { agencyId } : {}) },
+      orderBy: [{ occurredAt: "asc" }, { id: "asc" }], take: safeLimit,
+    });
+  }
+  if (agencyId) {
+    return tx.$queryRawUnsafe(`
+      SELECT *
+      FROM "MoneyAttribution"
+      WHERE "eventType" = $1
+        AND "occurredAt" >= $2
+        AND "agencyId" = $3
+      ORDER BY "occurredAt" ASC, "id" ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT $4
+    `, "tip_received", cutoff, agencyId, safeLimit);
+  }
+  return tx.$queryRawUnsafe(`
+    SELECT *
+    FROM "MoneyAttribution"
+    WHERE "eventType" = $1
+      AND "occurredAt" >= $2
+    ORDER BY "occurredAt" ASC, "id" ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT $3
+  `, "tip_received", cutoff, safeLimit);
+}
+
 async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, retentionDays = TIP_LEDGER_RETENTION_DAYS, dryRun = false, deleteLegacy = true } = {}) {
   const cleanAgency = clean(agencyId, 160);
   const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
   const safeRetentionDays = Math.max(1, int(retentionDays, TIP_LEDGER_RETENTION_DAYS));
   const cutoff = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
-  const where = {
-    eventType: "tip_received",
-    occurredAt: { gte: cutoff },
-    ...(cleanAgency ? { agencyId: cleanAgency } : {}),
-  };
-
-  const legacyRows = await prisma.moneyAttribution.findMany({
-    where,
-    orderBy: { occurredAt: "asc" },
-    take: safeLimit,
-  }).catch(() => []);
-
-  const scanned = legacyRows.length;
-  if (scanned === 0) {
-    return {
-      ok: true,
-      scanned: 0,
-      migrated: 0,
-      skippedExisting: 0,
-      deletedLegacy: 0,
-      failed: 0,
-      errors: [],
-      retentionDays: safeRetentionDays,
-      cutoff,
-      dryRun: Boolean(dryRun),
-      deleteLegacy: Boolean(deleteLegacy),
-      batched: true,
-    };
-  }
-
   try {
-    const existingHashes = await findExistingTipHashesForLegacyRows(prisma, legacyRows);
-    const seenInBatch = new Set();
-    const existingLegacyIds = [];
-    const rowsToCreate = [];
-    const createData = [];
-
-    for (const row of legacyRows) {
-      const key = `${row.agencyId}|${row.eventHash}`;
-      if (existingHashes.has(key)) {
-        existingLegacyIds.push(row.id);
-        continue;
-      }
-      if (seenInBatch.has(key)) {
-        existingLegacyIds.push(row.id);
-        continue;
-      }
-      seenInBatch.add(key);
-      rowsToCreate.push(row);
-      createData.push(legacyTipCreateData(row));
-    }
-
-    if (dryRun) {
-      return {
-        ok: true,
-        scanned,
-        migrated: createData.length,
-        skippedExisting: existingLegacyIds.length,
-        deletedLegacy: 0,
-        failed: 0,
-        errors: [],
-        retentionDays: safeRetentionDays,
+    return await prisma.$transaction(async (tx) => {
+      // Audit15 Closure2: selection and snapshot ownership are one authority.
+      // Claims uses row-level locks too, so migration can never delete a newer
+      // manual decision based on a stale pre-transaction MoneyAttribution read.
+      const legacyRows = await selectLegacyTipsForMigration(tx, {
+        agencyId: cleanAgency,
         cutoff,
-        dryRun: true,
-        deleteLegacy: Boolean(deleteLegacy),
-        batched: true,
-      };
-    }
+        limit: safeLimit,
+      });
+      const scanned = legacyRows.length;
+      if (scanned === 0) {
+        return {
+          ok: true, scanned: 0, migrated: 0, skippedExisting: 0,
+          deletedLegacy: 0, failed: 0, errors: [], retentionDays: safeRetentionDays,
+          cutoff, dryRun: Boolean(dryRun), deleteLegacy: Boolean(deleteLegacy), batched: true,
+        };
+      }
 
-    const result = await prisma.$transaction(async (tx) => {
+      const existingHashes = await findExistingTipHashesForLegacyRows(tx, legacyRows);
+      const seenInBatch = new Set();
+      const existingLegacyIds = [];
+      const rowsToCreate = [];
+      const createData = [];
+
+      for (const row of legacyRows) {
+        const key = `${row.agencyId}|${row.eventHash}`;
+        if (existingHashes.has(key) || seenInBatch.has(key)) {
+          existingLegacyIds.push(row.id);
+          continue;
+        }
+        seenInBatch.add(key);
+        rowsToCreate.push(row);
+        createData.push(legacyTipCreateData(row));
+      }
+
+      if (dryRun) {
+        return {
+          ok: true, scanned, migrated: createData.length,
+          skippedExisting: existingLegacyIds.length, deletedLegacy: 0, failed: 0, errors: [],
+          retentionDays: safeRetentionDays, cutoff, dryRun: true,
+          deleteLegacy: Boolean(deleteLegacy), batched: true,
+        };
+      }
+
       let createdCount = 0;
       if (createData.length) {
         const created = await tx.teamTipLedger.createMany({ data: createData, skipDuplicates: true });
         createdCount = created.count || 0;
       }
 
-      // Verify by the same unique key Prisma enforces: (agencyId, eventHash).
-      // This avoids cross-agency false positives when sweep runs without an
-      // agencyId filter, even though hash collisions are practically impossible.
       const presentHashes = await findExistingTipHashesForLegacyRows(tx, legacyRows);
-
       const legacyIdsToDelete = deleteLegacy
-        ? legacyRows
-            .filter((row) => presentHashes.has(`${row.agencyId}|${row.eventHash}`))
-            .map((row) => row.id)
+        ? legacyRows.filter((row) => presentHashes.has(`${row.agencyId}|${row.eventHash}`)).map((row) => row.id)
         : [];
 
       let deletedLegacy = 0;
@@ -708,41 +708,25 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
 
       const unresolvedCreateCount = rowsToCreate.filter((row) => !presentHashes.has(`${row.agencyId}|${row.eventHash}`)).length;
       return {
-        createdCount,
-        deletedLegacy,
+        ok: unresolvedCreateCount === 0,
+        scanned,
+        migrated: createdCount,
         skippedExisting: existingLegacyIds.length,
-        failedCreateCount: unresolvedCreateCount,
+        deletedLegacy,
+        failed: unresolvedCreateCount,
+        errors: unresolvedCreateCount ? [{ error: "Legacy tip rows not represented in TeamTipLedger were preserved" }] : [],
+        retentionDays: safeRetentionDays,
+        cutoff,
+        dryRun: false,
+        deleteLegacy: Boolean(deleteLegacy),
+        batched: true,
       };
     }, serializableTxOptions());
-
-    return {
-      ok: result.failedCreateCount === 0,
-      scanned,
-      migrated: result.createdCount,
-      skippedExisting: result.skippedExisting,
-      deletedLegacy: result.deletedLegacy,
-      failed: result.failedCreateCount,
-      errors: result.failedCreateCount ? [{ error: "createMany inserted fewer rows than expected; legacy rows not present in TeamTipLedger were preserved" }] : [],
-      retentionDays: safeRetentionDays,
-      cutoff,
-      dryRun: false,
-      deleteLegacy: Boolean(deleteLegacy),
-      batched: true,
-    };
   } catch (err) {
     return {
-      ok: false,
-      scanned,
-      migrated: 0,
-      skippedExisting: 0,
-      deletedLegacy: 0,
-      failed: scanned,
-      errors: [{ error: err?.message || String(err) }],
-      retentionDays: safeRetentionDays,
-      cutoff,
-      dryRun: Boolean(dryRun),
-      deleteLegacy: Boolean(deleteLegacy),
-      batched: true,
+      ok: false, scanned: 0, migrated: 0, skippedExisting: 0, deletedLegacy: 0, failed: 0,
+      errors: [{ error: err?.message || String(err) }], retentionDays: safeRetentionDays,
+      cutoff, dryRun: Boolean(dryRun), deleteLegacy: Boolean(deleteLegacy), batched: true,
     };
   }
 }

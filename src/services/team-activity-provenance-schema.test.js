@@ -49,8 +49,8 @@ test("canonical telemetry keeps human actor separate from automation/system fact
 
 test("Team efficiency denominator is confirmed manual messages, not mass volume", () => {
   const analytics = read("src/services/team-analytics-service.js");
-  assert.match(analytics, /metric\.dollarsPerMessageCents = metric\.messagesSent > 0\s*\? Math\.round\(metric\.revenueAttributedCents \/ metric\.messagesSent\)/);
-  assert.match(analytics, /out\.dollarsPerMessageCents = out\.messagesSent > 0\s*\? Math\.round\(out\.revenueAttributedCents \/ out\.messagesSent\)/);
+  assert.match(analytics, /metrics\.dollarsPerMessageCents = revenue\.cents !== null && metrics\.messagesSent > 0 \? Math\.round\(revenue\.cents \/ metrics\.messagesSent\)/);
+  assert.match(analytics, /out\.dollarsPerMessageCents = out\.revenueAttributedCents !== null && out\.messagesSent > 0 \? Math\.round\(out\.revenueAttributedCents \/ out\.messagesSent\)/);
   assert.doesNotMatch(analytics, /dollarsPerMessageCents\s*=\s*[^;]*\/\s*(?:metric\.|out\.)?totalMessages/);
 });
 

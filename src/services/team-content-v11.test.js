@@ -21,6 +21,7 @@ const events = [
 const prismaMock = {
   agencyMember: listModel([member]),
   teamActivityEvent: listModel(events),
+  teamProjectionCoverage: { async findUnique() { return { agencyId: "agency-1", responseCoverageFrom: new Date("2026-08-01T00:00:00Z"), dialogCoverageFrom: new Date("2026-08-01T00:00:00Z") }; } },
   teamPpvPurchaseLedger: listModel([]),
   teamResponseCase: listModel([]),
   teamDialogSession: listModel([]),

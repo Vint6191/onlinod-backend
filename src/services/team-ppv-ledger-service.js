@@ -2,6 +2,7 @@
 
 const prisma = require("../prisma");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
+const { reconcileMoneyForSentMessageEvidence } = require("./team-money-reconciliation-service");
 
 const RAW_LEDGER_RETENTION_DAYS = 180;
 const RAW_LEDGER_RETENTION_MS = RAW_LEDGER_RETENTION_DAYS * 86400000;
@@ -277,7 +278,8 @@ async function applyLedgerSideEffects(row, db = prisma) {
   if (row.type === "sent_message_recorded"
       || row.type === "ppv_message_sent_recorded"
       || (eventKind === "MESSAGE_SEND_CONFIRMED" && String(row.lifecycle || "").toUpperCase() === "CONFIRMED")) {
-    await upsertSentMessageFromEvent(row, db);
+    const sent = await upsertSentMessageFromEvent(row, db);
+    await reconcileMoneyForSentMessageEvidence({ db, sent: sent || row });
   }
   // Audit15: telemetry is ownership/activity provenance only. PPV money facts
   // are projected exclusively from canonical CreatorSale rows.
@@ -294,34 +296,6 @@ async function expirePendingJobs({ agencyId = null } = {}) {
   } catch (_) {
     return { count: 0 };
   }
-}
-
-async function listResolveJobs({ agencyId, limit = 100, allowedCreatorIds = null }) {
-  await expirePendingJobs({ agencyId });
-  const now = new Date();
-  const rows = await prisma.teamPpvResolveJob.findMany({
-    where: {
-      agencyId,
-      ...creatorScopeWhere(allowedCreatorIds),
-      status: "pending",
-      OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
-    },
-    orderBy: { createdAt: "asc" },
-    take: Math.max(1, Math.min(250, Number(limit) || 100)),
-  });
-  return rows.map((r) => ({
-    id: r.id,
-    jobId: r.id,
-    agencyId: r.agencyId,
-    accountId: r.accountId,
-    creatorId: r.creatorId,
-    creatorRef: r.creatorRef,
-    purchaseId: r.purchaseId,
-    messageId: r.messageId,
-    amountCents: r.amountCents,
-    currency: r.currency,
-    purchasedAt: r.purchasedAt?.getTime?.() || null,
-  }));
 }
 
 async function createResolverActivityEvent(tx, { agencyId, deviceId, job, memberId, item }) {
@@ -477,155 +451,6 @@ async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, actorMemberI
     created += 1;
   }
   return created;
-}
-
-async function submitResolveResults({ agencyId, deviceId, results = [], actorMemberId = null, actorUserId = null, senior = false, allowedCreatorIds = null }) {
-  const input = Array.isArray(results) ? results : [];
-  const safeActorMemberId = clean(actorMemberId, 160);
-  const safeActorUserId = clean(actorUserId, 160);
-  const isSenior = Boolean(senior);
-  let resolved = 0;
-  let conflicts = 0;
-  let skipped = 0;
-  let forbidden = 0;
-
-  for (const item of input) {
-    const jobId = clean(item.jobId || item.id, 160);
-    const messageId = clean(item.messageId, 160);
-    const purchaseId = clean(item.purchaseId, 220);
-    const submittedMemberId = clean(item.memberId || item.attributedMemberId, 160);
-    if (!messageId || !submittedMemberId || (!jobId && !purchaseId)) { skipped += 1; continue; }
-
-    const outcome = await prisma.$transaction(async (tx) => {
-      const job = await findPpvResolveJobForUpdate(tx, { agencyId, jobId, purchaseId, messageId });
-      if (!job) return "skipped";
-      if (!creatorAllowed(job.creatorId, allowedCreatorIds)) return "forbidden";
-      if (job.expiresAt && job.expiresAt < new Date()) {
-        await tx.teamPpvResolveJob.update({ where: { id: job.id }, data: { status: "expired", attempts: { increment: 1 } } });
-        return "skipped";
-      }
-
-      // Non-senior workers may only submit PPV resolution for themselves,
-      // and only when the backend has proof that this member originally sent
-      // the purchased PPV message. This closes the forged worker-result window
-      // before a later conflict detector has to clean it up manually.
-      let proof = null;
-      let memberId = submittedMemberId;
-      if (!isSenior) {
-        if (!safeActorMemberId || submittedMemberId !== safeActorMemberId || messageId !== job.messageId) {
-          return "forbidden";
-        }
-        proof = await tx.teamSentMessageLedger.findFirst({
-          where: {
-            agencyId,
-            memberId: safeActorMemberId,
-            messageId: job.messageId,
-            ...(job.accountId ? { accountId: job.accountId } : {}),
-          },
-          select: { id: true, userId: true, deviceId: true, shiftKey: true, sentAt: true },
-        }).catch(() => null);
-        if (!proof) return "forbidden";
-        memberId = safeActorMemberId;
-      }
-
-      const resolvedDeviceId = clean(deviceId || item.deviceId || proof?.deviceId, 160);
-      const resolvedShiftKey = clean(item.shiftKey || proof?.shiftKey, 220);
-      const resolvedUserId = clean(proof?.userId || safeActorUserId, 160);
-      const resolvedSentAtMs = item.sentAtMs || item.sent_at_ms || (proof?.sentAt ? new Date(proof.sentAt).getTime() : null);
-
-      const incomingCandidate = {
-        memberId,
-        userId: resolvedUserId,
-        shiftKey: resolvedShiftKey,
-        deviceId: resolvedDeviceId,
-        sentAtMs: resolvedSentAtMs,
-        source: clean(item.source || "local_worker_ledger", 80),
-      };
-
-      const existingPurchase = await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
-      if (existingPurchase?.attributedMemberId && existingPurchase.attributedMemberId !== memberId) {
-        const existingCandidate = {
-          memberId: existingPurchase.attributedMemberId,
-          userId: existingPurchase.attributedUserId,
-          shiftKey: existingPurchase.attributedShiftKey,
-          deviceId: existingPurchase.resolvedByDeviceId,
-          source: existingPurchase.resolvedSource || "existing_purchase_ledger",
-        };
-        const result = conflictResult(job.result, existingCandidate, incomingCandidate);
-        await tx.teamPpvResolveJob.update({
-          where: { id: job.id },
-          data: { status: "conflict", attempts: { increment: 1 }, result },
-        });
-        await tx.teamPpvPurchaseLedger.update({ where: { id: existingPurchase.id }, data: { status: "conflict" } });
-        return "conflict";
-      }
-
-      if (String(job.status || "") === "conflict") {
-        const result = conflictResult(job.result, incomingCandidate);
-        await tx.teamPpvResolveJob.update({
-          where: { id: job.id },
-          data: { attempts: { increment: 1 }, result },
-        });
-        return "conflict";
-      }
-
-      if (String(job.status || "") === "resolved") return "skipped";
-
-      await tx.teamPpvPurchaseLedger.upsert({
-        where: { agencyId_purchaseId: { agencyId, purchaseId: job.purchaseId } },
-        create: {
-          agencyId,
-          accountId: job.accountId,
-          creatorId: job.creatorId,
-          creatorRef: job.creatorRef,
-          purchaseId: job.purchaseId,
-          messageId: job.messageId,
-          amountCents: job.amountCents,
-          currency: job.currency,
-          purchasedAt: job.purchasedAt || new Date(),
-          status: "attributed",
-          attributedMemberId: memberId,
-          attributedUserId: resolvedUserId,
-          attributedShiftKey: resolvedShiftKey,
-          resolvedAt: new Date(),
-          resolvedByDeviceId: resolvedDeviceId,
-          resolvedSource: clean(item.source || "local_worker_ledger", 80),
-        },
-        update: {
-          status: "attributed",
-          attributedMemberId: memberId,
-          attributedUserId: resolvedUserId,
-          attributedShiftKey: resolvedShiftKey,
-          resolvedAt: new Date(),
-          resolvedByDeviceId: resolvedDeviceId,
-          resolvedSource: clean(item.source || "local_worker_ledger", 80),
-        },
-      });
-
-      await tx.teamPpvResolveJob.update({
-        where: { id: job.id },
-        data: {
-          status: "resolved",
-          attempts: { increment: 1 },
-          resolvedAt: new Date(),
-          resolvedByMemberId: memberId,
-          resolvedByDeviceId: resolvedDeviceId,
-          result: { ...incomingCandidate, autoResolved: true, verifiedBySentMessageLedger: Boolean(proof) },
-        },
-      });
-
-      // Do not create a provisional money event here. Team stats read PPV money
-      // from TeamPpvPurchaseLedger, so a later conflict can safely remove it
-      // from revenue until a manager closes the claim.
-      return "resolved";
-    }, serializableTxOptions());
-
-    if (outcome === "resolved") resolved += 1;
-    else if (outcome === "conflict") conflicts += 1;
-    else if (outcome === "forbidden") forbidden += 1;
-    else skipped += 1;
-  }
-  return { received: input.length, resolved, conflicts, skipped, forbidden };
 }
 
 async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false, allowedCreatorIds = null }) {
@@ -1020,8 +845,6 @@ async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS } = {}) {
 module.exports = {
   applyLedgerSideEffects,
   upsertSentMessageFromEvent,
-  listResolveJobs,
-  submitResolveResults,
   listPpvConflicts,
   resolvePpvConflict,
   expirePendingJobs,
