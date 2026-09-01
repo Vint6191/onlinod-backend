@@ -160,7 +160,7 @@ test("Closure4 rolling migration lock graph has no Team->Money cycle", () => {
   const historical = source("../prisma/migrations/20260831223000_event_team_money_authority_cutover/migration.sql");
   const runtime = source("services/team-tip-ledger-service.js");
   const forward = source("../prisma/migrations/20260901130000_event_team_money_authority_closure4/migration.sql");
-  assert.match(historical, /LOCK TABLE "MoneyAttribution" IN SHARE ROW EXCLUSIVE MODE/);
+  assert.match(historical, /LOCK TABLE "MoneyAttribution" IN ACCESS EXCLUSIVE MODE/);
   assert.doesNotMatch(historical, /LOCK TABLE "TeamTipLedger"/);
   const migrateBody = runtime.slice(runtime.indexOf("async function migrateLegacyTipsToTipLedger"));
   assert.ok(migrateBody.indexOf("selectLegacyTipsForMigration") < migrateBody.indexOf("findTipLedgerForUpdate"));

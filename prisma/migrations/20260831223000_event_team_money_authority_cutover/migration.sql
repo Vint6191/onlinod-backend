@@ -25,7 +25,11 @@ ON CONFLICT ("agencyId") DO NOTHING;
 -- authority as the runtime migrator. Block legacy and canonical tip writers for
 -- the short one-time cutover so an old rolling process cannot commit a newer
 -- manual MoneyAttribution decision between snapshot and deletion.
-LOCK TABLE "MoneyAttribution" IN SHARE ROW EXCLUSIVE MODE;
+-- Closure5 compatibility hardening for databases where this historical cutover
+-- is still pending while a previous backend binary is running. ACCESS
+-- EXCLUSIVE conflicts with the ROW SHARE table lock acquired by legacy
+-- SELECT ... FOR UPDATE, so deployment serializes before touching TeamTipLedger.
+LOCK TABLE "MoneyAttribution" IN ACCESS EXCLUSIVE MODE;
 
 -- Do NOT table-lock TeamTipLedger here. The runtime legacy migrator takes its
 -- MoneyAttribution row lock before touching TeamTipLedger. Holding only the

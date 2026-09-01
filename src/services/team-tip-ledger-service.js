@@ -747,6 +747,17 @@ async function selectLegacyTipsForMigration(tx, { agencyId, cutoff, limit }) {
   `, "tip_received", cutoff, safeLimit);
 }
 
+async function lockLegacyMoneyMigrationTable(tx) {
+  // Audit15 Closure5: serialize every runtime legacy migrator with the historical
+  // deployment cutover before either side acquires Money row / TeamTip row locks.
+  // SHARE ROW EXCLUSIVE conflicts with itself, so runtime/runtime and
+  // runtime/deployment overlap stop at the first authority instead of forming a
+  // Money-row -> Team-row -> Money-delete lock cycle.
+  if (typeof tx?.$executeRawUnsafe === "function") {
+    await tx.$executeRawUnsafe('LOCK TABLE "MoneyAttribution" IN SHARE ROW EXCLUSIVE MODE');
+  }
+}
+
 async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, retentionDays = TIP_LEDGER_RETENTION_DAYS, dryRun = false, deleteLegacy = true } = {}) {
   const cleanAgency = clean(agencyId, 160);
   const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
@@ -755,6 +766,7 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
 
   try {
     return await prisma.$transaction(async (tx) => {
+      await lockLegacyMoneyMigrationTable(tx);
       // Audit15 Closure3: the legacy row and any existing canonical TeamTip row
       // are both locked before precedence is decided. A committed legacy MANUAL
       // resolution can therefore never be deleted merely because an older AUTO
@@ -858,6 +870,46 @@ function isLegacyMigratedTipRow(row) {
     ].includes(String(item?.action || "")));
 }
 
+function legacyStateFromCanonicalRow(row) {
+  const result = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
+  return String(result?.legacyState || result?.legacyMigration?.legacyState || "").trim().toLowerCase();
+}
+
+function legacyStateManualEvidence(row) {
+  const state = legacyStateFromCanonicalRow(row);
+  if (!["claimed", "manager", "released"].includes(state)) return null;
+  const action = state === "claimed" ? "claim" : state === "manager" ? "manager_override" : "release";
+  // Closure2 preserved the current owner tuple for state-only legacy rows.
+  // A claimed row without an owner is internally inconsistent and therefore
+  // cannot be reconstructed automatically; it will be quarantined below.
+  const memberId = clean(row?.attributedMemberId, 160);
+  if (state === "claimed" && !memberId) return null;
+  const rawAt = row?.resolvedAt || row?.result?.migratedAt || row?.updatedAt || row?.receivedAt || row?.createdAt || Date.now();
+  return {
+    action,
+    memberId,
+    resolvedByMemberId: null,
+    resolvedAt: safeDate(rawAt),
+    reason: `Recovered state-only legacy manual authority (${state})`,
+    sourceRank: 0,
+    ordinal: 0,
+    stateOnly: true,
+  };
+}
+
+function closure5RepairClassification(row) {
+  const result = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
+  const marker = result?.audit15Closure5ManualRepairScan;
+  if (marker && marker.classified === true) return String(marker.classification || "classified");
+  const history = Array.isArray(row?.history) ? row.history : [];
+  const durable = history.find((item) => [
+    "audit15_closure5_classify_legacy_auto_no_manual_evidence",
+    "audit15_closure5_quarantine_ambiguous_legacy_authority",
+    "audit15_closure5_repair_migrated_manual_authority",
+  ].includes(String(item?.action || "")));
+  return durable ? String(durable?.classification || durable?.action || "classified") : null;
+}
+
 function canonicalLegacyManualEvidence(row) {
   if (!isLegacyMigratedTipRow(row)) return null;
   const result = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
@@ -907,7 +959,7 @@ function canonicalLegacyManualEvidence(row) {
     });
   }
 
-  if (!events.length) return null;
+  if (!events.length) return legacyStateManualEvidence(row);
   events.sort((a, b) => {
     const at = a.resolvedAt?.getTime?.() || 0;
     const bt = b.resolvedAt?.getTime?.() || 0;
@@ -926,16 +978,20 @@ function repairedManualStatus(evidence) {
 
 async function selectMigratedTipRowsForManualRepair(tx, { agencyId, limit }) {
   const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
+  const eligible = (row) => isLegacyMigratedTipRow(row)
+    && !canonicalManualAuthority(row)
+    && !closure5RepairClassification(row);
   if (typeof tx?.$queryRawUnsafe !== "function") {
-    return tx.teamTipLedger.findMany({
+    const rows = await tx.teamTipLedger.findMany({
       where: agencyId ? { agencyId } : {},
       orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
-      take: safeLimit,
+      take: Math.min(20000, safeLimit * 4),
     });
+    return (rows || []).filter(eligible).slice(0, safeLimit);
   }
   const originSql = `(
       "resolvedSource" IN ('legacy_money_attribution_migration','audit15_legacy_money_attribution_migration')
-      OR "source" IN ('legacy_money_attribution_migration','audit15_legacy_money_attribution_migration','audit15_legacy_money_attribution_migration')
+      OR "source" IN ('legacy_money_attribution_migration','audit15_legacy_money_attribution_migration')
       OR COALESCE("result"->>'migratedFrom','') = 'MoneyAttribution'
       OR ("result" ? 'legacyMigration')
       OR EXISTS (
@@ -944,10 +1000,21 @@ async function selectMigratedTipRowsForManualRepair(tx, { agencyId, limit }) {
         WHERE h.item->>'action' IN ('migrate_legacy_tip_to_team_tip_ledger','audit15_migrate_legacy_tip_to_team_tip_ledger')
       )
     )`;
+  const pendingSql = `
+      LEFT(COALESCE("resolvedSource", ''), 7) <> 'manual_'
+      AND COALESCE("result"->'audit15Closure5ManualRepairScan'->>'classified', 'false') <> 'true'
+      AND NOT EXISTS (
+        SELECT 1 FROM jsonb_array_elements(COALESCE("history", '[]'::jsonb)) c5(item)
+        WHERE c5.item->>'action' IN (
+          'audit15_closure5_classify_legacy_auto_no_manual_evidence',
+          'audit15_closure5_quarantine_ambiguous_legacy_authority',
+          'audit15_closure5_repair_migrated_manual_authority'
+        )
+      )`;
   if (agencyId) {
     return tx.$queryRawUnsafe(`
       SELECT * FROM "TeamTipLedger"
-      WHERE "agencyId" = $1 AND ${originSql}
+      WHERE "agencyId" = $1 AND ${originSql} AND ${pendingSql}
       ORDER BY "updatedAt" ASC, "id" ASC
       FOR UPDATE SKIP LOCKED
       LIMIT $2
@@ -955,7 +1022,7 @@ async function selectMigratedTipRowsForManualRepair(tx, { agencyId, limit }) {
   }
   return tx.$queryRawUnsafe(`
     SELECT * FROM "TeamTipLedger"
-    WHERE ${originSql}
+    WHERE ${originSql} AND ${pendingSql}
     ORDER BY "updatedAt" ASC, "id" ASC
     FOR UPDATE SKIP LOCKED
     LIMIT $1
@@ -967,98 +1034,131 @@ async function repairMigratedLegacyTipManualAuthority({ agencyId = null, limit =
   const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
   try {
     return await prisma.$transaction(async (tx) => {
-      // Audit15 Closure4: this repair intentionally reads ONLY TeamTipLedger.
-      // It can therefore overlap the MoneyAttribution -> TeamTip runtime migrator
-      // without creating a Money/Team lock cycle. Rows are repaired in-place and
-      // remain safe even when the legacy MoneyAttribution source was deleted by
-      // an already-deployed Closure2 migration.
       const rows = await selectMigratedTipRowsForManualRepair(tx, { agencyId: cleanAgency, limit: safeLimit });
       let repaired = 0;
       let alreadyManual = 0;
-      let noManualEvidence = 0;
+      let classifiedAuto = 0;
+      let ambiguous = 0;
       const errors = [];
 
       for (const row of rows) {
-        const evidence = canonicalLegacyManualEvidence(row);
-        if (!evidence) {
-          noManualEvidence += 1;
-          continue;
-        }
-        const currentManual = canonicalManualAuthority(row);
-        const evidenceAt = evidence.resolvedAt?.getTime?.() || 0;
-        if (currentManual && canonicalManualAt(row) >= evidenceAt) {
+        if (canonicalManualAuthority(row)) {
           alreadyManual += 1;
           continue;
         }
-        if (dryRun) {
-          repaired += 1;
+        const evidence = canonicalLegacyManualEvidence(row);
+        if (evidence) {
+          if (dryRun) { repaired += 1; continue; }
+
+          let attributedUserId = null;
+          if (evidence.memberId && tx?.agencyMember?.findFirst) {
+            const member = await tx.agencyMember.findFirst({
+              where: { agencyId: row.agencyId, id: evidence.memberId },
+              select: { userId: true },
+            });
+            attributedUserId = clean(member?.userId, 160);
+          }
+          const resolvedAt = evidence.resolvedAt || safeDate(row.updatedAt || row.receivedAt || Date.now());
+          const suffix = evidence.stateOnly ? `state_${legacyStateFromCanonicalRow(row)}` : evidence.action;
+          const resolvedSource = `manual_legacy_money_attribution_forward_repair_${suffix}`;
+          const currentResult = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? { ...row.result } : {};
+          currentResult.audit15Closure4ManualRepair = {
+            repaired: true, action: evidence.action, memberId: evidence.memberId || null,
+            resolvedByMemberId: evidence.resolvedByMemberId || null, resolvedAt: resolvedAt.toISOString(),
+            source: "audit15_closure5_forward_repair", stateOnly: Boolean(evidence.stateOnly),
+          };
+          currentResult.audit15Closure5ManualRepairScan = {
+            classified: true, classification: evidence.stateOnly ? "state_only_manual_repaired" : "manual_repaired",
+            classifiedAt: new Date().toISOString(),
+          };
+          const history = Array.isArray(row?.history) ? [...row.history] : [];
+          history.push({
+            ts: Date.now(), action: "audit15_closure5_repair_migrated_manual_authority",
+            reason: evidence.stateOnly
+              ? `Recovered durable manual authority from legacyState=${legacyStateFromCanonicalRow(row)}`
+              : "Recovered durable manual authority from canonical migrated history after legacy MoneyAttribution removal",
+            prevOwner: row.attributedMemberId || null, nextOwner: evidence.memberId || null, source: resolvedSource,
+          });
+          try {
+            await tx.teamTipLedger.update({
+              where: { id: row.id },
+              data: {
+                status: repairedManualStatus(evidence),
+                attributedMemberId: evidence.memberId || null,
+                attributedUserId,
+                attributedShiftKey: null,
+                resolvedAt,
+                resolvedByMemberId: evidence.resolvedByMemberId || null,
+                resolvedSource,
+                result: currentResult,
+                history,
+              },
+            });
+            repaired += 1;
+          } catch (err) {
+            errors.push({ id: row.id, eventHash: row.eventHash, error: err?.message || String(err) });
+          }
           continue;
         }
 
-        let attributedUserId = null;
-        if (evidence.memberId && tx?.agencyMember?.findFirst) {
-          const member = await tx.agencyMember.findFirst({
-            where: { agencyId: row.agencyId, id: evidence.memberId },
-            select: { userId: true },
-          });
-          attributedUserId = clean(member?.userId, 160);
+        const legacyState = legacyStateFromCanonicalRow(row);
+        if (legacyState === "auto") {
+          classifiedAuto += 1;
+          if (!dryRun) {
+            const currentResult = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? { ...row.result } : {};
+            currentResult.audit15Closure5ManualRepairScan = {
+              classified: true, classification: "legacy_auto_no_manual_evidence", classifiedAt: new Date().toISOString(),
+            };
+            const history = Array.isArray(row?.history) ? [...row.history] : [];
+            history.push({
+              ts: Date.now(), action: "audit15_closure5_classify_legacy_auto_no_manual_evidence",
+              classification: "legacy_auto_no_manual_evidence",
+              reason: "Legacy state proves AUTO and contains no MANUAL authority evidence",
+              source: "audit15_closure5_runtime_repair",
+            });
+            await tx.teamTipLedger.update({ where: { id: row.id }, data: { result: currentResult, history } });
+          }
+          continue;
         }
-        const resolvedAt = evidence.resolvedAt || safeDate(row.updatedAt || row.receivedAt || Date.now());
-        const resolvedSource = `manual_legacy_money_attribution_forward_repair_${evidence.action}`;
-        const currentResult = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? { ...row.result } : {};
-        currentResult.audit15Closure4ManualRepair = {
-          repaired: true,
-          action: evidence.action,
-          memberId: evidence.memberId || null,
-          resolvedByMemberId: evidence.resolvedByMemberId || null,
-          resolvedAt: resolvedAt.toISOString(),
-          source: "audit15_closure4_forward_repair",
-        };
-        const history = Array.isArray(row?.history) ? [...row.history] : [];
-        history.push({
-          ts: Date.now(),
-          action: "audit15_closure4_repair_migrated_manual_authority",
-          reason: "Recovered durable manual authority from canonical migrated history after legacy MoneyAttribution removal",
-          prevOwner: row.attributedMemberId || null,
-          nextOwner: evidence.memberId || null,
-          source: resolvedSource,
-        });
 
-        try {
+        // Historical evidence was destroyed before Closure5. We cannot prove
+        // whether the prior owner was AUTO or MANUAL, so fail closed: remove any
+        // chatter attribution, freeze automatic reconciliation with a manual_*
+        // source, and surface the row as conflict for explicit manager review.
+        ambiguous += 1;
+        if (!dryRun) {
+          const currentResult = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? { ...row.result } : {};
+          currentResult.audit15Closure5ManualRepairScan = {
+            classified: true, classification: "ambiguous_legacy_authority_requires_review",
+            classifiedAt: new Date().toISOString(), requiresManualReview: true,
+          };
+          const history = Array.isArray(row?.history) ? [...row.history] : [];
+          history.push({
+            ts: Date.now(), action: "audit15_closure5_quarantine_ambiguous_legacy_authority",
+            reason: "Legacy migration provenance is insufficient to distinguish historical AUTO from MANUAL authority",
+            prevOwner: row.attributedMemberId || null, nextOwner: null,
+            source: "manual_legacy_money_attribution_ambiguous_requires_review",
+          });
           await tx.teamTipLedger.update({
             where: { id: row.id },
             data: {
-              status: repairedManualStatus(evidence),
-              attributedMemberId: evidence.memberId || null,
-              attributedUserId,
-              attributedShiftKey: null,
-              resolvedAt,
-              resolvedByMemberId: evidence.resolvedByMemberId || null,
-              resolvedSource,
-              result: currentResult,
-              history,
+              status: "conflict", attributedMemberId: null, attributedUserId: null, attributedShiftKey: null,
+              resolvedAt: null, resolvedByMemberId: null,
+              resolvedSource: "manual_legacy_money_attribution_ambiguous_requires_review",
+              result: currentResult, history,
             },
           });
-          repaired += 1;
-        } catch (err) {
-          errors.push({ id: row.id, eventHash: row.eventHash, error: err?.message || String(err) });
         }
       }
 
       return {
-        ok: errors.length === 0,
-        scanned: rows.length,
-        repaired,
-        alreadyManual,
-        noManualEvidence,
-        failed: errors.length,
-        errors,
-        dryRun: Boolean(dryRun),
+        ok: errors.length === 0, scanned: rows.length, repaired, alreadyManual, classifiedAuto, ambiguous,
+        noManualEvidence: classifiedAuto + ambiguous, failed: errors.length, errors, dryRun: Boolean(dryRun),
       };
     }, serializableTxOptions());
   } catch (err) {
     return {
-      ok: false, scanned: 0, repaired: 0, alreadyManual: 0, noManualEvidence: 0, failed: 1,
+      ok: false, scanned: 0, repaired: 0, alreadyManual: 0, classifiedAuto: 0, ambiguous: 0, noManualEvidence: 0, failed: 1,
       errors: [{ error: err?.message || String(err) }], dryRun: Boolean(dryRun),
     };
   }
