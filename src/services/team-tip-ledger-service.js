@@ -14,6 +14,23 @@ const LEGACY_MIGRATION_REVIEW_SOURCE = "manual_legacy_money_attribution_ambiguou
 const CLOSURE6_AUTO_CLASSIFICATION_ACTION = "audit15_closure6_classify_legacy_auto_authority";
 const CLOSURE6_AMBIGUOUS_CLASSIFICATION_ACTION = "audit15_closure6_quarantine_ambiguous_legacy_authority";
 
+function teamClaimsDataUnavailable(section, cause) {
+  const error = new Error(`Team claims canonical data is unavailable (${section})`);
+  error.code = "TEAM_CLAIMS_DATA_UNAVAILABLE";
+  error.status = 503;
+  error.section = section;
+  if (cause) error.cause = cause;
+  return error;
+}
+
+async function readCanonicalTipClaims(section, work) {
+  try {
+    return await work();
+  } catch (error) {
+    throw teamClaimsDataUnavailable(section, error);
+  }
+}
+
 function clean(value, max = 255) {
   const s = String(value ?? "").trim();
   return s ? s.slice(0, max) : null;
@@ -148,6 +165,33 @@ function appendManualResolution(result, manualResolution) {
   const base = result && typeof result === "object" && !Array.isArray(result) ? { ...result } : {};
   base.manualResolution = manualResolution;
   base.manualResolutions = manualResolutionsOf(base).concat([manualResolution]);
+  return base;
+}
+
+function finalizeMigrationReviewResult(result, { resolvedAt, resolvedByMemberId, resolvedSource }) {
+  const base = result && typeof result === "object" && !Array.isArray(result) ? { ...result } : {};
+  const finalize = (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    return {
+      ...value,
+      requiresManualReview: false,
+      finalized: true,
+      finalizedAt: resolvedAt,
+      finalizedByMemberId: resolvedByMemberId || null,
+      finalResolvedSource: resolvedSource || null,
+    };
+  };
+  if (base.audit15Closure5ManualRepairScan) {
+    base.audit15Closure5ManualRepairScan = finalize(base.audit15Closure5ManualRepairScan);
+  }
+  if (base.audit15Closure6MigrationAuthority) {
+    base.audit15Closure6MigrationAuthority = finalize(base.audit15Closure6MigrationAuthority);
+  }
+  if (base.attribution && typeof base.attribution === "object" && !Array.isArray(base.attribution)) {
+    base.attribution = { ...base.attribution, requiresManualReview: false, reviewLane: null };
+  }
+  if (Object.prototype.hasOwnProperty.call(base, "requiresManualReview")) base.requiresManualReview = false;
+  if (Object.prototype.hasOwnProperty.call(base, "reviewLane")) base.reviewLane = null;
   return base;
 }
 
@@ -309,20 +353,20 @@ async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, seni
   const cutoff = new Date(Date.now() - TIP_CLAIM_GRACE_PERIOD_MS);
   const safeLimit = Math.min(1000, Math.max(1, int(limit, 200)));
   const baseWhere = { agencyId, ...creatorScopeWhere(allowedCreatorIds) };
-  const normalRows = await prisma.teamTipLedger.findMany({
+  const normalRows = await readCanonicalTipClaims("tip_claims_disputable", () => prisma.teamTipLedger.findMany({
     where: { ...baseWhere, AND: [activeFinancialWhere(), { receivedAt: { gte: cutoff } }] },
     orderBy: { receivedAt: "desc" },
     take: safeLimit,
-  }).catch(() => []);
+  }));
   const reviewRows = includeMigrationReview
-    ? await prisma.teamTipLedger.findMany({
+    ? await readCanonicalTipClaims("tip_claims_migration_review", () => prisma.teamTipLedger.findMany({
         where: {
           ...baseWhere,
           AND: [activeFinancialWhere(), { resolvedSource: LEGACY_MIGRATION_REVIEW_SOURCE }],
         },
         orderBy: [{ receivedAt: "asc" }, { id: "asc" }],
         take: safeLimit,
-      }).catch(() => [])
+      }))
     : [];
 
   const byId = new Map();
@@ -351,9 +395,9 @@ async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, seni
 }
 
 async function getTipClaimByHash({ agencyId, eventHash, allowedCreatorIds = null }) {
-  const row = await prisma.teamTipLedger.findUnique({
+  const row = await readCanonicalTipClaims("tip_claim_audit_event", () => prisma.teamTipLedger.findUnique({
     where: { agencyId_eventHash: { agencyId, eventHash: clean(eventHash, 120) } },
-  }).catch(() => null);
+  }));
   if (!row || !creatorAllowed(row.creatorId, allowedCreatorIds)) return null;
   const [enriched] = await enrichTipRows([row], agencyId);
   return enriched || null;
@@ -365,11 +409,11 @@ async function listTipAudit({ agencyId, memberId = null, from, limit = 500, seni
     ...creatorScopeWhere(allowedCreatorIds),
     ...(from ? { receivedAt: { gte: from } } : {}),
   };
-  const rows = await prisma.teamTipLedger.findMany({
+  const rows = await readCanonicalTipClaims("tip_claim_audit_list", () => prisma.teamTipLedger.findMany({
     where,
     orderBy: { receivedAt: "desc" },
     take: Math.min(1000, Math.max(1, int(limit, 500))),
-  }).catch(() => []);
+  }));
 
   let filtered = rows;
   if (memberId) {
@@ -478,16 +522,25 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
       }
     }
 
+    const manualResolvedAt = new Date().toISOString();
     const manualResolution = {
       manualResolution: true,
       action: cleanAction,
       memberId: nextOwnerMemberId || null,
+      shiftKey: null,
       reason: clean(reason, 1000),
       resolvedByMemberId: actor.id,
-      resolvedAt: new Date().toISOString(),
+      resolvedAt: manualResolvedAt,
       migrationReview: historicalManagerReview,
     };
-    const result = appendManualResolution(row.result, manualResolution);
+    const resultBase = historicalManagerReview
+      ? finalizeMigrationReviewResult(row.result, {
+          resolvedAt: manualResolvedAt,
+          resolvedByMemberId: actor.id,
+          resolvedSource: nextResolvedSource,
+        })
+      : row.result;
+    const result = appendManualResolution(resultBase, manualResolution);
     const history = appendHistory(row, {
       action: cleanAction,
       byMemberId: actor.id,
@@ -498,6 +551,19 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
       source: nextResolvedSource,
       migrationReview: historicalManagerReview,
     });
+    if (historicalManagerReview) {
+      history.push({
+        ts: Date.now(),
+        action: "audit15_closure7_finalize_migration_review",
+        byMemberId: actor.id,
+        byUserId: actor.userId,
+        reason: clean(reason, 200),
+        prevOwner: row.attributedMemberId,
+        nextOwner: nextOwnerMemberId,
+        source: nextResolvedSource,
+        requiresManualReview: false,
+      });
+    }
 
     const updated = await tx.teamTipLedger.update({
       where: { id: row.id },
@@ -505,6 +571,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
         status: nextStatus,
         attributedMemberId: nextOwnerMemberId,
         attributedUserId: nextOwnerUserId,
+        attributedShiftKey: null,
         resolvedAt: ["claimed", "resolved", "released", "creator_revenue"].includes(nextStatus) ? new Date() : row.resolvedAt,
         resolvedByMemberId: actor.id,
         resolvedSource: nextResolvedSource,

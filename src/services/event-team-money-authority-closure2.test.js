@@ -101,7 +101,7 @@ test("Closure2 legacy migration reads fresh MoneyAttribution rows under FOR UPDA
 test("Closure2 auto-first then manual Tip resolution ends MANUAL", async () => {
   let row = {
     id: "tip-row", agencyId: "agency-1", creatorId: "creator-1", accountId: "creator-1", eventHash: "H",
-    status: "attributed", attributedMemberId: "member-auto", attributedUserId: "user-auto", resolvedSource: "creator_tip_exact_message",
+    status: "attributed", attributedMemberId: "member-auto", attributedUserId: "user-auto", attributedShiftKey: "shift-auto", resolvedSource: "creator_tip_exact_message",
     amountCents: 1000, currency: "USD", receivedAt: new Date(), financialStatus: "active", history: [], result: {}, candidates: [], weakCandidates: [],
   };
   const fake = {
@@ -118,6 +118,8 @@ test("Closure2 auto-first then manual Tip resolution ends MANUAL", async () => {
   const result = await service.applyTipOverride({ agencyId: "agency-1", byMemberId: "manager", byUserId: "user-manager", eventHash: "H", action: "manager_override", targetMemberId: "member-B", reason: "manual wins", senior: true });
   assert.equal(result.ok, true);
   assert.equal(row.attributedMemberId, "member-B");
+  assert.equal(row.attributedUserId, "user-B");
+  assert.equal(row.attributedShiftKey, null);
   assert.equal(row.resolvedSource, "manual_manager_resolution");
 });
 

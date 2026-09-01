@@ -176,7 +176,7 @@ test("Closure6 senior manager can resolve historical quarantine beyond 48h with 
         return {
           id: "creator-tip-1", agencyId: "agency-1", creatorId: "creator-1", eventFingerprint: "H-review",
           externalNotificationId: "notif-1", externalTransactionId: null, messageId: null, amountCents: 10000, currency: "USD",
-          tippedAt: new Date(), transactionStatus: "done", fan: { onlyFansUserId: "fan-1" },
+          tippedAt: new Date(Date.now() - 72 * 60 * 60 * 1000), transactionStatus: "done", fan: { onlyFansUserId: "fan-1" },
           creator: { id: "creator-1", username: "creator", displayName: "Creator" },
         };
       },
@@ -206,7 +206,11 @@ test("Closure6 senior manager can resolve historical quarantine beyond 48h with 
   assert.equal(row.attributedShiftKey, null);
   assert.equal(row.resolvedSource, "manual_manager_migration_review");
   assert.equal(row.result.manualResolution.migrationReview, true);
-  assert.equal(row.history.at(-1).migrationReview, true);
+  assert.equal(row.result.audit15Closure6MigrationAuthority.requiresManualReview, false);
+  assert.equal(result.attribution.requiresManualReview, false);
+  assert.equal(result.attribution.reviewLane, null);
+  assert.ok(row.history.some((item) => item.action === "manager_override" && item.migrationReview === true));
+  assert.ok(row.history.some((item) => item.action === "audit15_closure7_finalize_migration_review" && item.requiresManualReview === false));
 
   const reconciliation = require("./team-money-reconciliation-service");
   const auto = await reconciliation.reconcileCreatorTipToTeam({ db: fake, tipId: "creator-tip-1" });
@@ -216,6 +220,14 @@ test("Closure6 senior manager can resolve historical quarantine beyond 48h with 
   assert.equal(row.attributedMemberId, "member-B");
   assert.equal(row.attributedUserId, "user-B");
   assert.equal(row.resolvedSource, "manual_manager_migration_review");
+
+  const second = await tips.applyTipOverride({
+    agencyId: "agency-1", byUserId: "user-manager", byMemberId: "manager-1", eventHash: "H-review",
+    action: "manager_override", targetMemberId: "member-B", reason: "review lane must now be terminal",
+    senior: true, allowedCreatorIds: ["creator-1"],
+  });
+  assert.equal(second.ok, false);
+  assert.equal(second.code, "ATTRIBUTION_LOCKED");
 });
 
 test("Closure6 ordinary 48h lock remains for non-senior or non-review manager_override", async () => {

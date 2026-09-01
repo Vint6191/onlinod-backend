@@ -95,6 +95,16 @@ function hideMigratedLegacyRows(tipRows, legacyRows) {
   return (legacyRows || []).filter((row) => !tipHashes.has(String(row?.eventHash || "")));
 }
 
+function sendClaimsReadError(res, err, fallbackCode) {
+  const status = Number(err?.status) || 500;
+  return res.status(status).json({
+    ok: false,
+    code: err?.code || fallbackCode,
+    ...(err?.section ? { section: err.section } : {}),
+    error: err?.message || "Failed",
+  });
+}
+
 function stripManualResolutionPayload(result) {
   if (!result || typeof result !== "object" || Array.isArray(result)) return result || null;
   const safe = { ...result };
@@ -329,23 +339,24 @@ router.get("/disputable", async (req, res) => {
     if (!senior && !canClaimOwn && !canReleaseOwn) {
       return res.status(403).json({ ok: false, code: "CLAIMS_VIEW_FORBIDDEN", error: "Claims permission is required" });
     }
-    const [tipRows, legacyRows] = await Promise.all([
-      listTipClaims({
-        agencyId: req.auth.agencyId,
-        limit,
-        actorMemberId: actor.id,
-        senior,
-        includeMigrationReview: canOverrideAttribution,
-        allowedCreatorIds,
-      }),
-      listDisputable({
-        agencyId: req.auth.agencyId,
-        limit,
-        actorMemberId: actor.id,
-        senior,
-        allowedCreatorIds,
-      }),
-    ]);
+    const tipRows = await listTipClaims({
+      agencyId: req.auth.agencyId,
+      limit,
+      actorMemberId: actor.id,
+      senior,
+      includeMigrationReview: canOverrideAttribution,
+      allowedCreatorIds,
+    });
+    // Audit15 Closure7: legacy history may be consulted only after the
+    // canonical TeamTipLedger read succeeded. UNKNOWN must never become an
+    // old-generation fallback authority.
+    const legacyRows = await listDisputable({
+      agencyId: req.auth.agencyId,
+      limit,
+      actorMemberId: actor.id,
+      senior,
+      allowedCreatorIds,
+    });
     const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)]
       .sort((a, b) => {
         const reviewOrder = Number(Boolean(b?.requiresManualReview)) - Number(Boolean(a?.requiresManualReview));
@@ -361,11 +372,7 @@ router.get("/disputable", async (req, res) => {
     });
   } catch (err) {
     console.error("[claims/disputable] failed:", err);
-    return res.status(500).json({
-      ok: false,
-      code: "CLAIMS_DISPUTABLE_FAILED",
-      error: err?.message || "Failed",
-    });
+    return sendClaimsReadError(res, err, "CLAIMS_DISPUTABLE_FAILED");
   }
 });
 
@@ -411,31 +418,29 @@ router.get("/audit", async (req, res) => {
       if (!senior && requestedMemberId !== actor.id) {
         return res.status(403).json({ ok: false, code: "CLAIMS_AUDIT_FORBIDDEN" });
       }
-      const [tipRows, legacyRows] = await Promise.all([
-        listTipAudit({
+      const tipRows = await listTipAudit({
+        agencyId: req.auth.agencyId,
+        memberId: requestedMemberId,
+        from,
+        limit: 500,
+        senior,
+        actorMemberId: actor.id,
+        allowedCreatorIds,
+      });
+      const legacyRows = await prisma.moneyAttribution.findMany({
+        where: {
           agencyId: req.auth.agencyId,
-          memberId: requestedMemberId,
-          from,
-          limit: 500,
-          senior,
-          actorMemberId: actor.id,
-          allowedCreatorIds,
-        }),
-        prisma.moneyAttribution.findMany({
-          where: {
-            agencyId: req.auth.agencyId,
-            ...creatorScopeWhere(allowedCreatorIds),
-            eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
-            occurredAt: { gte: from },
-            OR: [
-              { attributedToMemberId: requestedMemberId },
-              { autoAttributedToMemberId: requestedMemberId },
-            ],
-          },
-          orderBy: { occurredAt: "desc" },
-          take: 500,
-        }),
-      ]);
+          ...creatorScopeWhere(allowedCreatorIds),
+          eventType: { in: Array.from(LEGACY_CLAIMABLE_EVENT_TYPES) },
+          occurredAt: { gte: from },
+          OR: [
+            { attributedToMemberId: requestedMemberId },
+            { autoAttributedToMemberId: requestedMemberId },
+          ],
+        },
+        orderBy: { occurredAt: "desc" },
+        take: 500,
+      });
       const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)].sort((a, b) => new Date(b.occurredAt || b.receivedAt || 0).getTime() - new Date(a.occurredAt || a.receivedAt || 0).getTime());
       return res.json({ ok: true, count: rows.length, attributions: rows });
     }
@@ -452,30 +457,24 @@ router.get("/audit", async (req, res) => {
         { autoAttributedToMemberId: actor.id },
       ];
     }
-    const [tipRows, legacyRows] = await Promise.all([
-      listTipAudit({
-        agencyId: req.auth.agencyId,
-        from,
-        limit: 500,
-        senior,
-        actorMemberId: actor.id,
-        allowedCreatorIds,
-      }),
-      prisma.moneyAttribution.findMany({
-        where,
-        orderBy: { occurredAt: "desc" },
-        take: 500,
-      }),
-    ]);
+    const tipRows = await listTipAudit({
+      agencyId: req.auth.agencyId,
+      from,
+      limit: 500,
+      senior,
+      actorMemberId: actor.id,
+      allowedCreatorIds,
+    });
+    const legacyRows = await prisma.moneyAttribution.findMany({
+      where,
+      orderBy: { occurredAt: "desc" },
+      take: 500,
+    });
     const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)].sort((a, b) => new Date(b.occurredAt || b.receivedAt || 0).getTime() - new Date(a.occurredAt || a.receivedAt || 0).getTime()).slice(0, 500);
     return res.json({ ok: true, count: rows.length, attributions: rows });
   } catch (err) {
     console.error("[claims/audit] failed:", err);
-    return res.status(500).json({
-      ok: false,
-      code: "CLAIMS_AUDIT_FAILED",
-      error: err?.message || "Failed",
-    });
+    return sendClaimsReadError(res, err, "CLAIMS_AUDIT_FAILED");
   }
 });
 
