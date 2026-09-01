@@ -989,6 +989,19 @@ function bucketTotal(bucket) {
   return total;
 }
 
+function formatCurrencyBucketForAlert(bucketObject) {
+  const entries = Object.entries(bucketObject && typeof bucketObject === "object" ? bucketObject : {})
+    .map(([currency, cents]) => [normalizeCurrency(currency), Math.max(0, num(cents, 0))])
+    .filter(([, cents]) => cents > 0)
+    .sort(([a], [b]) => a.localeCompare(b));
+  if (entries.length === 0) return { text: "no attributed revenue", hasRevenue: false, mixed: false };
+  return {
+    text: entries.map(([currency, cents]) => `${currency} ${(cents / 100).toFixed(2)}`).join(" + "),
+    hasRevenue: true,
+    mixed: entries.length > 1,
+  };
+}
+
 async function getPpvLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await prisma.teamPpvPurchaseLedger.groupBy({
@@ -1325,30 +1338,35 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d", includeMoney = true,
   const membersPayload = await buildTeamMembers({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
   const alerts = [];
   if (includeMoney) {
+    let jobConflicts;
+    let purchaseConflicts;
+    let tipConflicts;
     try {
-      const [jobConflicts, purchaseConflicts, tipConflicts] = await Promise.all([
+      [jobConflicts, purchaseConflicts, tipConflicts] = await Promise.all([
         prisma.teamPpvResolveJob.count({ where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), status: "conflict" } }),
         prisma.teamPpvPurchaseLedger.count({ where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activePpvFinancialWhere(), status: "conflict" } }),
-        prisma.teamTipLedger.count({ where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activeTipFinancialWhere(), status: "conflict" } }).catch(() => 0),
+        prisma.teamTipLedger.count({ where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activeTipFinancialWhere(), status: "conflict" } }),
       ]);
-      const conflictCount = Math.max(num(jobConflicts, 0), num(purchaseConflicts, 0));
-      if (conflictCount > 0) {
-        alerts.push({
-          id: "ppv_conflicts",
-          tone: "danger",
-          title: `${conflictCount} PPV attribution conflicts`,
-          text: "Some PPV purchases were claimed by multiple workers and need manager review.",
-        });
-      }
-      if (num(tipConflicts, 0) > 0) {
-        alerts.push({
-          id: "tip_conflicts",
-          tone: "warn",
-          title: `${tipConflicts} tip attribution conflicts`,
-          text: "Some tips have multiple recent chatters in the 10-minute window and need manager review.",
-        });
-      }
-    } catch (_) {}
+    } catch (err) {
+      throw analyticsUnavailable("money_conflicts", err);
+    }
+    const conflictCount = Math.max(num(jobConflicts, 0), num(purchaseConflicts, 0));
+    if (conflictCount > 0) {
+      alerts.push({
+        id: "ppv_conflicts",
+        tone: "danger",
+        title: `${conflictCount} PPV attribution conflicts`,
+        text: "Some PPV purchases were claimed by multiple workers and need manager review.",
+      });
+    }
+    if (num(tipConflicts, 0) > 0) {
+      alerts.push({
+        id: "tip_conflicts",
+        tone: "warn",
+        title: `${tipConflicts} tip attribution conflicts`,
+        text: "Some tips have multiple recent chatters in the 10-minute window and need manager review.",
+      });
+    }
   }
 
   for (const row of membersPayload.members) {
@@ -1383,13 +1401,13 @@ async function buildTeamAlerts({ agencyId, rangeKey = "7d", includeMoney = true,
     }
     const topDialog = Array.isArray(m.topDialogSessions) ? m.topDialogSessions[0] : null;
     if (topDialog && num(m.dialogDwellSeconds, 0) >= 15 * 60 && num(topDialog.shiftTimeSharePct, 0) >= 80) {
-      const dollars = includeMoney ? (num(topDialog.shiftRevenueCents, 0) / 100).toFixed(2) : null;
+      const revenue = includeMoney ? formatCurrencyBucketForAlert(topDialog.shiftRevenueByCurrency) : null;
       alerts.push({
         id: `focus_dialog_${row.member.id}_${topDialog.fanId || "unknown"}`,
-        tone: includeMoney && num(topDialog.shiftRevenueCents, 0) > 0 ? "warn" : "danger",
+        tone: includeMoney && revenue?.hasRevenue ? "warn" : "danger",
         title: `${name}: ${topDialog.shiftTimeSharePct}% shift time in one dialog`,
         text: includeMoney
-          ? `Fan ${topDialog.fanId || "unknown"}: ${Math.round(num(topDialog.dwellSeconds, 0) / 60)} min, earned this shift $${dollars}.`
+          ? `Fan ${topDialog.fanId || "unknown"}: ${Math.round(num(topDialog.dwellSeconds, 0) / 60)} min, earned this shift ${revenue.text}.`
           : `Fan ${topDialog.fanId || "unknown"}: ${Math.round(num(topDialog.dwellSeconds, 0) / 60)} min.`,
         memberId: row.member.id,
       });

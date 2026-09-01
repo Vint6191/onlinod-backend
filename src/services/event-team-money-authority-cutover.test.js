@@ -269,7 +269,11 @@ test("Audit15 legacy tip migration preserves provenance, deletes only after ledg
       async findMany({ where }) {
         const hashes = new Set(where.eventHash?.in || []);
         return ledgers.filter((row) => row.agencyId === where.agencyId && hashes.has(row.eventHash))
-          .map((row) => ({ agencyId: row.agencyId, eventHash: row.eventHash }));
+          .map((row) => ({ ...row }));
+      },
+      async findFirst({ where }) {
+        const row = ledgers.find((current) => current.agencyId === where.agencyId && current.eventHash === where.eventHash);
+        return row ? { ...row } : null;
       },
       async createMany({ data }) {
         let count = 0;
@@ -279,6 +283,11 @@ test("Audit15 legacy tip migration preserves provenance, deletes only after ledg
           count += 1;
         }
         return { count };
+      },
+      async update({ where, data }) {
+        const index = ledgers.findIndex((row) => row.id === where.id);
+        ledgers[index] = { ...ledgers[index], ...data };
+        return { ...ledgers[index] };
       },
     },
     async $transaction(work) { return work(prisma); },

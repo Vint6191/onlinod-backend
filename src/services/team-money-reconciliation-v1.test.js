@@ -386,13 +386,18 @@ test("automatic PPV reconciliation re-reads a manual resolution at the row lock 
   };
   const manual = { ...stale, attributedMemberId: "manager-selected-member", resolvedSource: "manual_claim_resolution" };
   const fx = dbFixture({ sent: manualSent("different-member"), existing: stale });
+  const lockOrder = [];
   fx.db.$queryRawUnsafe = async (sql) => {
-    assert.match(String(sql), /TeamPpvPurchaseLedger[\s\S]*FOR UPDATE/);
+    const text = String(sql);
+    if (/TeamPpvResolveJob[\s\S]*FOR UPDATE/.test(text)) { lockOrder.push("job"); return []; }
+    assert.match(text, /TeamPpvPurchaseLedger[\s\S]*FOR UPDATE/);
+    lockOrder.push("purchase");
     fx.setPurchase(manual);
     return [{ ...manual }];
   };
   const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
   assert.equal(result.preservedManualResolution, true);
+  assert.deepEqual(lockOrder, ["job", "purchase"]);
   assert.equal(fx.getPurchase().attributedMemberId, "manager-selected-member");
   assert.equal(fx.getPurchase().resolvedSource, "manual_claim_resolution");
 });

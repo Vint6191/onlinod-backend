@@ -614,10 +614,11 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
 
     const purchaseBefore = await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
 
+    let selectedMember = null;
     if (finalAction === "assign") {
-      const selectedMember = await tx.agencyMember.findFirst({
+      selectedMember = await tx.agencyMember.findFirst({
         where: { agencyId, id: safeMemberId, deletedAt: null },
-        select: { id: true },
+        select: { id: true, userId: true },
       });
       if (!selectedMember) return "invalid_member";
     }
@@ -721,6 +722,8 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
           purchasedAt: job.purchasedAt || new Date(),
           status: "attributed",
           attributedMemberId: safeMemberId,
+          attributedUserId: selectedMember?.userId || null,
+          attributedShiftKey: null,
           resolvedAt: new Date(),
           resolvedByDeviceId: clean(deviceId, 160),
           resolvedSource: "manual_claim_resolution",
@@ -728,6 +731,8 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
         update: {
           status: "attributed",
           attributedMemberId: safeMemberId,
+          attributedUserId: selectedMember?.userId || null,
+          attributedShiftKey: null,
           resolvedAt: new Date(),
           resolvedByDeviceId: clean(deviceId, 160),
           resolvedSource: "manual_claim_resolution",

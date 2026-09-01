@@ -266,6 +266,25 @@ async function upsertResolveJob(db, { purchase, sale, proposed, sent }) {
   });
 }
 
+async function lockPpvResolveJobByIdentity(db, { agencyId, purchaseId, messageId }) {
+  if (!agencyId || !purchaseId || !messageId || !db?.teamPpvResolveJob) return null;
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(`
+      SELECT * FROM "TeamPpvResolveJob"
+      WHERE "agencyId" = $1 AND "purchaseId" = $2 AND "messageId" = $3
+      FOR UPDATE
+      LIMIT 1
+    `, agencyId, purchaseId, messageId);
+    return rows?.[0] || null;
+  }
+  if (typeof db?.teamPpvResolveJob?.findUnique === "function") {
+    return db.teamPpvResolveJob.findUnique({
+      where: { agencyId_purchaseId_messageId: { agencyId, purchaseId, messageId } },
+    });
+  }
+  return null;
+}
+
 async function lockPpvPurchaseRow(db, row) {
   if (!row?.id) return row || null;
   if (typeof db?.$queryRawUnsafe !== "function") {
@@ -324,6 +343,14 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   };
   else if (sentClass === "MANUAL" && !member) proposed = { status: "unresolved", memberId: null, userId: null, basis: "EXACT_MESSAGE_MEMBER_INACTIVE" };
 
+  // Audit15 Closure3: manual Claims locks ResolveJob -> Purchase. Automatic
+  // reconciliation must use the same order whenever the resolve job exists,
+  // otherwise a real MANUAL/AUTO overlap can deadlock in PostgreSQL.
+  await lockPpvResolveJobByIdentity(db, {
+    agencyId: sale.agencyId,
+    purchaseId,
+    messageId: clean(sale.messageId, 160),
+  });
   let existing = await findExistingPurchase(db, { sale, purchaseId, fanExternalId });
   if (existing) existing = await lockPpvPurchaseRow(db, existing);
   const accountId = clean(sent?.accountId || sale.creatorId, 160) || sale.creatorId;

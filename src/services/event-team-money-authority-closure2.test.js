@@ -84,8 +84,9 @@ test("Closure2 legacy migration reads fresh MoneyAttribution rows under FOR UPDA
       async deleteMany({ where }) { deleted = where.id.in.slice(); return { count: deleted.length }; },
     },
     teamTipLedger: {
-      async findMany() { return created.map((row) => ({ agencyId: row.agencyId, eventHash: row.eventHash })); },
-      async createMany({ data }) { created.push(...data.map((row) => ({ ...row }))); return { count: data.length }; },
+      async findMany() { return created.map((row) => ({ ...row })); },
+      async createMany({ data }) { created.push(...data.map((row) => ({ id: `tip-${created.length + 1}`, ...row }))); return { count: data.length }; },
+      async update({ where, data }) { const i = created.findIndex((row) => row.id === where.id); created[i] = { ...created[i], ...data }; return { ...created[i] }; },
     },
   };
   const service = loadTip(fake);
@@ -93,7 +94,7 @@ test("Closure2 legacy migration reads fresh MoneyAttribution rows under FOR UPDA
   assert.equal(result.ok, true);
   assert.equal(created.length, 1);
   assert.equal(created[0].attributedMemberId, "member-B");
-  assert.equal(created[0].resolvedSource, "legacy_money_attribution_migration");
+  assert.match(created[0].resolvedSource, /^manual_legacy_money_attribution_/);
   assert.deepEqual(deleted, ["legacy-1"]);
 });
 

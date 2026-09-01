@@ -37,6 +37,14 @@ function financiallyActive(row) {
 }
 
 async function findTipLedgerForUpdate(tx, { agencyId, eventHash }) {
+  if (typeof tx?.$queryRaw !== "function") {
+    if (tx?.teamTipLedger?.findFirst) return tx.teamTipLedger.findFirst({ where: { agencyId, eventHash } });
+    if (tx?.teamTipLedger?.findMany) {
+      const rows = await tx.teamTipLedger.findMany({ where: { agencyId, eventHash }, take: 1 });
+      return rows?.[0] || null;
+    }
+    return null;
+  }
   const rows = await tx.$queryRaw`
     SELECT * FROM "TeamTipLedger"
     WHERE "agencyId" = ${agencyId} AND "eventHash" = ${eventHash}
@@ -505,8 +513,51 @@ function legacyStateToTipStatus(row) {
   return "creator_revenue";
 }
 
-function legacyTipResult(row) {
+function legacyManualHistory(row) {
   const history = Array.isArray(row?.history) ? row.history : [];
+  return history
+    .filter((item) => ["claim", "release", "manager_override"].includes(String(item?.action || "")))
+    .sort((a, b) => Number(a?.ts || 0) - Number(b?.ts || 0));
+}
+
+function legacyManualAuthority(row) {
+  const state = String(row?.state || "").trim().toLowerCase();
+  const manualHistory = legacyManualHistory(row);
+  const latest = manualHistory[manualHistory.length - 1] || null;
+  const manual = ["claimed", "manager", "released"].includes(state) || manualHistory.length > 0;
+  const rawTs = latest?.ts || row?.lockedAt || row?.updatedAt || row?.occurredAt || row?.createdAt || Date.now();
+  const resolvedAt = safeDate(rawTs);
+  const action = String(latest?.action || state || "manual").trim().toLowerCase();
+  let memberId = clean(row?.attributedToMemberId, 160);
+  let userId = clean(row?.attributedToUserId, 160);
+  let status = legacyStateToTipStatus(row);
+  if (latest) {
+    const nextOwner = clean(latest?.nextOwner, 160);
+    if (action === "claim") { memberId = nextOwner || memberId; status = memberId ? "claimed" : "unresolved"; }
+    else if (action === "manager_override") { memberId = nextOwner; status = memberId ? "resolved" : "creator_revenue"; }
+    else if (action === "release") { memberId = nextOwner; status = memberId ? "claimed" : "released"; }
+    if (memberId !== clean(row?.attributedToMemberId, 160)) userId = null;
+  }
+  const source = manual
+    ? `manual_legacy_money_attribution_${action || "resolution"}`
+    : "legacy_money_attribution_migration";
+  return {
+    manual, action, source, resolvedAt, status, memberId, userId,
+    resolvedByMemberId: clean(latest?.byMemberId, 160),
+    manualHistory,
+  };
+}
+
+function canonicalManualAuthority(row) {
+  return String(row?.resolvedSource || "").startsWith("manual_");
+}
+
+function canonicalManualAt(row) {
+  return safeDate(row?.resolvedAt || row?.updatedAt || row?.createdAt || 0, 0).getTime();
+}
+
+function legacyTipResult(row) {
+  const authority = legacyManualAuthority(row);
   return {
     claimType: "tip_attribution",
     migratedFrom: "MoneyAttribution",
@@ -514,6 +565,7 @@ function legacyTipResult(row) {
     legacyAttributionId: row?.id || null,
     legacyState: row?.state || null,
     legacyAutoReason: row?.autoReason || null,
+    manualAuthority: authority.manual,
     attributionWindowMinutes: 10,
     softReviewWindowMinutes: 15,
     candidates: row?.autoAttributedToMemberId ? [{
@@ -525,7 +577,7 @@ function legacyTipResult(row) {
     }] : [],
     weakCandidates: [],
     autoReason: row?.autoReason || "legacy_money_attribution_migration",
-    manualResolutions: history.filter((item) => ["claim", "release", "manager_override"].includes(String(item?.action || ""))).map((item) => ({
+    manualResolutions: authority.manualHistory.map((item) => ({
       manualResolution: true,
       action: item.action,
       memberId: item.nextOwner || null,
@@ -546,12 +598,16 @@ function legacyTipHistory(row) {
     prevOwner: row?.attributedToMemberId || null,
     nextOwner: row?.attributedToMemberId || null,
     source: "v16_1_legacy_tip_migration",
+    legacyAttributionId: row?.id || null,
   }]);
 }
 
 function legacyTipCreateData(row) {
-  const status = legacyStateToTipStatus(row);
-  const attributedMemberId = ATTRIBUTED_TIP_STATUSES.includes(status) ? row.attributedToMemberId : null;
+  const authority = legacyManualAuthority(row);
+  const status = authority.manual ? authority.status : legacyStateToTipStatus(row);
+  const attributedMemberId = authority.manual
+    ? (ATTRIBUTED_TIP_STATUSES.includes(status) ? authority.memberId : null)
+    : (ATTRIBUTED_TIP_STATUSES.includes(status) ? row.attributedToMemberId : null);
   const result = legacyTipResult(row);
   const candidates = Array.isArray(result.candidates) ? result.candidates : [];
   return {
@@ -569,11 +625,11 @@ function legacyTipCreateData(row) {
     receivedAt: row.occurredAt,
     status,
     attributedMemberId,
-    attributedUserId: attributedMemberId ? row.attributedToUserId : null,
+    attributedUserId: attributedMemberId ? (authority.manual ? authority.userId : row.attributedToUserId) : null,
     attributedShiftKey: null,
-    resolvedAt: attributedMemberId ? (row.lockedAt || row.updatedAt || row.occurredAt) : null,
-    resolvedByMemberId: null,
-    resolvedSource: "legacy_money_attribution_migration",
+    resolvedAt: authority.manual ? authority.resolvedAt : (attributedMemberId ? (row.lockedAt || row.updatedAt || row.occurredAt) : null),
+    resolvedByMemberId: authority.manual ? authority.resolvedByMemberId : null,
+    resolvedSource: authority.source,
     candidates,
     weakCandidates: [],
     result,
@@ -581,6 +637,59 @@ function legacyTipCreateData(row) {
     source: "legacy_money_attribution_migration",
     createdAt: row.createdAt || row.capturedAt || row.occurredAt,
   };
+}
+
+function legacyAlreadyRepresented(row, legacyRow) {
+  return (Array.isArray(row?.history) ? row.history : []).some((item) =>
+    String(item?.legacyAttributionId || "") === String(legacyRow?.id || "")
+      && String(item?.action || "") === "migrate_legacy_tip_to_team_tip_ledger"
+  );
+}
+
+function mergeLegacyResult(existing, legacyRow) {
+  const current = existing?.result && typeof existing.result === "object" ? existing.result : {};
+  const incoming = legacyTipResult(legacyRow);
+  const manualResolutions = [
+    ...(Array.isArray(current.manualResolutions) ? current.manualResolutions : []),
+    ...(Array.isArray(incoming.manualResolutions) ? incoming.manualResolutions : []),
+  ];
+  return {
+    ...current,
+    legacyMigration: incoming,
+    manualResolutions,
+  };
+}
+
+function mergeLegacyHistory(existing, legacyRow) {
+  return [
+    ...(Array.isArray(existing?.history) ? existing.history : []),
+    ...legacyTipHistory(legacyRow),
+  ];
+}
+
+async function mergeLegacyManualAuthority(tx, existing, legacyRow) {
+  const authority = legacyManualAuthority(legacyRow);
+  if (!authority.manual || legacyAlreadyRepresented(existing, legacyRow)) {
+    return { row: existing, manualMerged: false };
+  }
+  const incoming = legacyTipCreateData(legacyRow);
+  const existingManual = canonicalManualAuthority(existing);
+  const incomingWins = !existingManual || authority.resolvedAt.getTime() > canonicalManualAt(existing);
+  const data = {
+    result: mergeLegacyResult(existing, legacyRow),
+    history: mergeLegacyHistory(existing, legacyRow),
+    ...(incomingWins ? {
+      status: incoming.status,
+      attributedMemberId: incoming.attributedMemberId,
+      attributedUserId: incoming.attributedUserId,
+      attributedShiftKey: null,
+      resolvedAt: incoming.resolvedAt,
+      resolvedByMemberId: incoming.resolvedByMemberId,
+      resolvedSource: incoming.resolvedSource,
+    } : {}),
+  };
+  const row = await tx.teamTipLedger.update({ where: { id: existing.id }, data });
+  return { row, manualMerged: incomingWins };
 }
 
 async function findExistingTipHashesForLegacyRows(tx, legacyRows) {
@@ -646,9 +755,10 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
 
   try {
     return await prisma.$transaction(async (tx) => {
-      // Audit15 Closure2: selection and snapshot ownership are one authority.
-      // Claims uses row-level locks too, so migration can never delete a newer
-      // manual decision based on a stale pre-transaction MoneyAttribution read.
+      // Audit15 Closure3: the legacy row and any existing canonical TeamTip row
+      // are both locked before precedence is decided. A committed legacy MANUAL
+      // resolution can therefore never be deleted merely because an older AUTO
+      // TeamTipLedger row already exists.
       const legacyRows = await selectLegacyTipsForMigration(tx, {
         agencyId: cleanAgency,
         cutoff,
@@ -657,33 +767,17 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
       const scanned = legacyRows.length;
       if (scanned === 0) {
         return {
-          ok: true, scanned: 0, migrated: 0, skippedExisting: 0,
+          ok: true, scanned: 0, migrated: 0, manualMerged: 0, skippedExisting: 0,
           deletedLegacy: 0, failed: 0, errors: [], retentionDays: safeRetentionDays,
           cutoff, dryRun: Boolean(dryRun), deleteLegacy: Boolean(deleteLegacy), batched: true,
         };
       }
 
-      const existingHashes = await findExistingTipHashesForLegacyRows(tx, legacyRows);
-      const seenInBatch = new Set();
-      const existingLegacyIds = [];
-      const rowsToCreate = [];
-      const createData = [];
-
-      for (const row of legacyRows) {
-        const key = `${row.agencyId}|${row.eventHash}`;
-        if (existingHashes.has(key) || seenInBatch.has(key)) {
-          existingLegacyIds.push(row.id);
-          continue;
-        }
-        seenInBatch.add(key);
-        rowsToCreate.push(row);
-        createData.push(legacyTipCreateData(row));
-      }
-
+      const createData = legacyRows.map(legacyTipCreateData);
       if (dryRun) {
         return {
-          ok: true, scanned, migrated: createData.length,
-          skippedExisting: existingLegacyIds.length, deletedLegacy: 0, failed: 0, errors: [],
+          ok: true, scanned, migrated: createData.length, manualMerged: 0,
+          skippedExisting: 0, deletedLegacy: 0, failed: 0, errors: [],
           retentionDays: safeRetentionDays, cutoff, dryRun: true,
           deleteLegacy: Boolean(deleteLegacy), batched: true,
         };
@@ -695,26 +789,43 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
         createdCount = created.count || 0;
       }
 
-      const presentHashes = await findExistingTipHashesForLegacyRows(tx, legacyRows);
-      const legacyIdsToDelete = deleteLegacy
-        ? legacyRows.filter((row) => presentHashes.has(`${row.agencyId}|${row.eventHash}`)).map((row) => row.id)
-        : [];
+      const representedIds = [];
+      let manualMerged = 0;
+      let skippedExisting = 0;
+      const errors = [];
+      for (const legacyRow of legacyRows) {
+        let canonical = await findTipLedgerForUpdate(tx, { agencyId: legacyRow.agencyId, eventHash: legacyRow.eventHash });
+        if (!canonical) {
+          errors.push({ id: legacyRow.id, eventHash: legacyRow.eventHash, error: "TeamTipLedger representation missing after createMany" });
+          continue;
+        }
+        const alreadyLegacy = legacyAlreadyRepresented(canonical, legacyRow);
+        if (legacyManualAuthority(legacyRow).manual && !alreadyLegacy) {
+          const merged = await mergeLegacyManualAuthority(tx, canonical, legacyRow);
+          canonical = merged.row;
+          if (merged.manualMerged) manualMerged += 1;
+          else skippedExisting += 1;
+        } else if (!alreadyLegacy && canonical.source !== "legacy_money_attribution_migration") {
+          skippedExisting += 1;
+        }
+        representedIds.push(legacyRow.id);
+      }
 
       let deletedLegacy = 0;
-      if (legacyIdsToDelete.length) {
-        const deleted = await tx.moneyAttribution.deleteMany({ where: { id: { in: legacyIdsToDelete } } });
+      if (deleteLegacy && representedIds.length) {
+        const deleted = await tx.moneyAttribution.deleteMany({ where: { id: { in: representedIds } } });
         deletedLegacy = deleted.count || 0;
       }
 
-      const unresolvedCreateCount = rowsToCreate.filter((row) => !presentHashes.has(`${row.agencyId}|${row.eventHash}`)).length;
       return {
-        ok: unresolvedCreateCount === 0,
+        ok: errors.length === 0,
         scanned,
-        migrated: createdCount,
-        skippedExisting: existingLegacyIds.length,
+        migrated: createdCount + manualMerged,
+        manualMerged,
+        skippedExisting,
         deletedLegacy,
-        failed: unresolvedCreateCount,
-        errors: unresolvedCreateCount ? [{ error: "Legacy tip rows not represented in TeamTipLedger were preserved" }] : [],
+        failed: errors.length,
+        errors,
         retentionDays: safeRetentionDays,
         cutoff,
         dryRun: false,
@@ -724,7 +835,7 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
     }, serializableTxOptions());
   } catch (err) {
     return {
-      ok: false, scanned: 0, migrated: 0, skippedExisting: 0, deletedLegacy: 0, failed: 0,
+      ok: false, scanned: 0, migrated: 0, manualMerged: 0, skippedExisting: 0, deletedLegacy: 0, failed: 0,
       errors: [{ error: err?.message || String(err) }], retentionDays: safeRetentionDays,
       cutoff, dryRun: Boolean(dryRun), deleteLegacy: Boolean(deleteLegacy), batched: true,
     };
