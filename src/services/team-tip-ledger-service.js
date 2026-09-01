@@ -10,6 +10,9 @@ const TIP_CLAIM_GRACE_PERIOD_MS = 48 * 60 * 60 * 1000;
 const TIP_LEDGER_RETENTION_DAYS = 180;
 const TIP_LEDGER_RETENTION_MS = TIP_LEDGER_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const ATTRIBUTED_TIP_STATUSES = ["attributed", "claimed", "resolved"];
+const LEGACY_MIGRATION_REVIEW_SOURCE = "manual_legacy_money_attribution_ambiguous_requires_review";
+const CLOSURE6_AUTO_CLASSIFICATION_ACTION = "audit15_closure6_classify_legacy_auto_authority";
+const CLOSURE6_AMBIGUOUS_CLASSIFICATION_ACTION = "audit15_closure6_quarantine_ambiguous_legacy_authority";
 
 function clean(value, max = 255) {
   const s = String(value ?? "").trim();
@@ -154,6 +157,14 @@ function isLocked(row) {
   return elapsed >= TIP_CLAIM_GRACE_PERIOD_MS;
 }
 
+function isLegacyMigrationReviewRow(row) {
+  if (!row) return false;
+  const result = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
+  return String(row.resolvedSource || "") === LEGACY_MIGRATION_REVIEW_SOURCE
+    || result?.audit15Closure5ManualRepairScan?.requiresManualReview === true
+    || result?.audit15Closure6MigrationAuthority?.requiresManualReview === true;
+}
+
 function expiresAtMs(row) {
   const received = new Date(row?.receivedAt || 0).getTime();
   return Number.isFinite(received) && received > 0 ? received + TIP_CLAIM_GRACE_PERIOD_MS : null;
@@ -261,6 +272,8 @@ function tipRowForClaims(row, membersById = new Map()) {
     state: statusToState(row),
     status: row.status,
     locked,
+    requiresManualReview: isLegacyMigrationReviewRow(row),
+    reviewLane: isLegacyMigrationReviewRow(row) ? "migration_ambiguity" : null,
     expiresAt: expiresAtMs(row),
     attributedToMemberId: row.attributedMemberId,
     attributedToUserId: row.attributedUserId,
@@ -292,34 +305,49 @@ async function enrichTipRows(rows, agencyId) {
   return rows.map((row) => tipRowForClaims(row, membersById));
 }
 
-async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, senior = false, allowedCreatorIds = null }) {
+async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, senior = false, includeMigrationReview = false, allowedCreatorIds = null }) {
   const cutoff = new Date(Date.now() - TIP_CLAIM_GRACE_PERIOD_MS);
-  const rows = await prisma.teamTipLedger.findMany({
-    where: {
-      agencyId,
-      ...creatorScopeWhere(allowedCreatorIds),
-      ...activeFinancialWhere(),
-      receivedAt: { gte: cutoff },
-    },
+  const safeLimit = Math.min(1000, Math.max(1, int(limit, 200)));
+  const baseWhere = { agencyId, ...creatorScopeWhere(allowedCreatorIds) };
+  const normalRows = await prisma.teamTipLedger.findMany({
+    where: { ...baseWhere, AND: [activeFinancialWhere(), { receivedAt: { gte: cutoff } }] },
     orderBy: { receivedAt: "desc" },
-    take: Math.min(1000, Math.max(1, int(limit, 200))),
+    take: safeLimit,
   }).catch(() => []);
+  const reviewRows = includeMigrationReview
+    ? await prisma.teamTipLedger.findMany({
+        where: {
+          ...baseWhere,
+          AND: [activeFinancialWhere(), { resolvedSource: LEGACY_MIGRATION_REVIEW_SOURCE }],
+        },
+        orderBy: [{ receivedAt: "asc" }, { id: "asc" }],
+        take: safeLimit,
+      }).catch(() => [])
+    : [];
 
-  let visible = rows;
+  const byId = new Map();
+  for (const row of [...reviewRows, ...normalRows]) if (row?.id && !byId.has(row.id)) byId.set(row.id, row);
+  let visible = Array.from(byId.values());
   if (!senior) {
-    visible = [];
-    for (const row of rows) {
+    const filtered = [];
+    for (const row of visible) {
       if (!actorMemberId) continue;
       if (String(row.status || "") === "conflict") continue;
       if (row.attributedMemberId === actorMemberId) {
-        visible.push(row);
+        filtered.push(row);
         continue;
       }
       const ok = await canActorClaimTip({ agencyId, row, actor: { id: actorMemberId } });
-      if (ok) visible.push(row);
+      if (ok) filtered.push(row);
     }
+    visible = filtered;
   }
-  return enrichTipRows(visible.slice(0, Math.min(1000, Math.max(1, int(limit, 200)))), agencyId);
+  visible.sort((a, b) => {
+    const reviewOrder = Number(isLegacyMigrationReviewRow(b)) - Number(isLegacyMigrationReviewRow(a));
+    if (reviewOrder) return reviewOrder;
+    return new Date(b.receivedAt || 0).getTime() - new Date(a.receivedAt || 0).getTime();
+  });
+  return enrichTipRows(visible.slice(0, safeLimit), agencyId);
 }
 
 async function getTipClaimByHash({ agencyId, eventHash, allowedCreatorIds = null }) {
@@ -406,7 +434,9 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
     if (!row) return { code: "TIP_NOT_FOUND" };
     if (!creatorAllowed(row.creatorId, allowedCreatorIds)) return { code: "CREATOR_ACCESS_FORBIDDEN" };
     if (!financiallyActive(row)) return { code: "TIP_FINANCIAL_REVERSED", error: "This tip was reversed in the financial ledger" };
-    if (isLocked(row)) return { code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
+    const migrationReview = isLegacyMigrationReviewRow(row);
+    const historicalManagerReview = cleanAction === "manager_override" && senior && migrationReview;
+    if (isLocked(row) && !historicalManagerReview) return { code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
 
     let nextStatus = row.status;
     let nextOwnerMemberId = row.attributedMemberId;
@@ -439,12 +469,12 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
         nextStatus = "resolved";
         nextOwnerMemberId = target.id;
         nextOwnerUserId = target.userId;
-        nextResolvedSource = "manual_manager_resolution";
+        nextResolvedSource = historicalManagerReview ? "manual_manager_migration_review" : "manual_manager_resolution";
       } else {
         nextStatus = "creator_revenue";
         nextOwnerMemberId = null;
         nextOwnerUserId = null;
-        nextResolvedSource = "manual_manager_creator_revenue";
+        nextResolvedSource = historicalManagerReview ? "manual_manager_migration_review_creator_revenue" : "manual_manager_creator_revenue";
       }
     }
 
@@ -455,6 +485,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
       reason: clean(reason, 1000),
       resolvedByMemberId: actor.id,
       resolvedAt: new Date().toISOString(),
+      migrationReview: historicalManagerReview,
     };
     const result = appendManualResolution(row.result, manualResolution);
     const history = appendHistory(row, {
@@ -465,6 +496,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
       prevOwner: row.attributedMemberId,
       nextOwner: nextOwnerMemberId,
       source: nextResolvedSource,
+      migrationReview: historicalManagerReview,
     });
 
     const updated = await tx.teamTipLedger.update({
@@ -548,6 +580,14 @@ function legacyManualAuthority(row) {
   };
 }
 
+function legacyAuthorityClassification(row) {
+  const manualAuthority = legacyManualAuthority(row);
+  if (manualAuthority.manual) return { kind: "manual", manualAuthority };
+  const state = String(row?.state || "").trim().toLowerCase();
+  if (state === "auto") return { kind: "auto", manualAuthority };
+  return { kind: "ambiguous", manualAuthority };
+}
+
 function canonicalManualAuthority(row) {
   return String(row?.resolvedSource || "").startsWith("manual_");
 }
@@ -557,7 +597,28 @@ function canonicalManualAt(row) {
 }
 
 function legacyTipResult(row) {
-  const authority = legacyManualAuthority(row);
+  const classification = legacyAuthorityClassification(row);
+  const authority = classification.manualAuthority;
+  const manualResolutions = authority.manualHistory.map((item) => ({
+    manualResolution: true,
+    action: item.action,
+    memberId: item.nextOwner || null,
+    reason: item.reason || null,
+    resolvedByMemberId: item.byMemberId || null,
+    resolvedAt: item.ts ? new Date(item.ts).toISOString() : null,
+    migratedFromLegacyHistory: true,
+  }));
+  if (classification.kind === "manual" && manualResolutions.length === 0) {
+    manualResolutions.push({
+      manualResolution: true,
+      action: authority.action,
+      memberId: authority.memberId || null,
+      reason: `Recovered state-only legacy manual authority (${String(row?.state || "manual").toLowerCase()})`,
+      resolvedByMemberId: authority.resolvedByMemberId || null,
+      resolvedAt: authority.resolvedAt?.toISOString?.() || null,
+      migratedFromLegacyState: true,
+    });
+  }
   return {
     claimType: "tip_attribution",
     migratedFrom: "MoneyAttribution",
@@ -565,7 +626,18 @@ function legacyTipResult(row) {
     legacyAttributionId: row?.id || null,
     legacyState: row?.state || null,
     legacyAutoReason: row?.autoReason || null,
-    manualAuthority: authority.manual,
+    manualAuthority: classification.kind === "manual",
+    audit15Closure6MigrationAuthority: {
+      classified: true,
+      classification: classification.kind === "manual"
+        ? "legacy_manual_authority"
+        : classification.kind === "auto"
+          ? "proven_legacy_auto"
+          : "ambiguous_legacy_authority_requires_review",
+      requiresManualReview: classification.kind === "ambiguous",
+      classifiedAt: new Date().toISOString(),
+      source: "audit15_closure6_runtime_migration",
+    },
     attributionWindowMinutes: 10,
     softReviewWindowMinutes: 15,
     candidates: row?.autoAttributedToMemberId ? [{
@@ -577,20 +649,41 @@ function legacyTipResult(row) {
     }] : [],
     weakCandidates: [],
     autoReason: row?.autoReason || "legacy_money_attribution_migration",
-    manualResolutions: authority.manualHistory.map((item) => ({
-      manualResolution: true,
-      action: item.action,
-      memberId: item.nextOwner || null,
-      reason: item.reason || null,
-      resolvedByMemberId: item.byMemberId || null,
-      resolvedAt: item.ts ? new Date(item.ts).toISOString() : null,
-      migratedFromLegacyHistory: true,
-    })),
+    manualResolutions,
   };
 }
 
 function legacyTipHistory(row) {
   const original = Array.isArray(row?.history) ? row.history : [];
+  const classification = legacyAuthorityClassification(row);
+  const authority = classification.manualAuthority;
+  const classificationEntry = classification.kind === "manual"
+    ? {
+        ts: Date.now(),
+        action: "audit15_closure6_classify_legacy_manual_authority",
+        classification: "legacy_manual_authority",
+        legacyAction: authority.action || null,
+        prevOwner: row?.attributedToMemberId || null,
+        nextOwner: authority.memberId || null,
+        source: "audit15_closure6_runtime_migration",
+      }
+    : classification.kind === "auto"
+      ? {
+          ts: Date.now(),
+          action: CLOSURE6_AUTO_CLASSIFICATION_ACTION,
+          classification: "proven_legacy_auto",
+          prevOwner: row?.attributedToMemberId || null,
+          nextOwner: row?.attributedToMemberId || null,
+          source: "audit15_closure6_runtime_migration",
+        }
+      : {
+          ts: Date.now(),
+          action: CLOSURE6_AMBIGUOUS_CLASSIFICATION_ACTION,
+          classification: "ambiguous_legacy_authority_requires_review",
+          prevOwner: row?.attributedToMemberId || null,
+          nextOwner: null,
+          source: LEGACY_MIGRATION_REVIEW_SOURCE,
+        };
   return original.concat([{
     ts: Date.now(),
     action: "migrate_legacy_tip_to_team_tip_ledger",
@@ -599,15 +692,20 @@ function legacyTipHistory(row) {
     nextOwner: row?.attributedToMemberId || null,
     source: "v16_1_legacy_tip_migration",
     legacyAttributionId: row?.id || null,
-  }]);
+  }, classificationEntry]);
 }
 
 function legacyTipCreateData(row) {
-  const authority = legacyManualAuthority(row);
-  const status = authority.manual ? authority.status : legacyStateToTipStatus(row);
-  const attributedMemberId = authority.manual
-    ? (ATTRIBUTED_TIP_STATUSES.includes(status) ? authority.memberId : null)
-    : (ATTRIBUTED_TIP_STATUSES.includes(status) ? row.attributedToMemberId : null);
+  const classification = legacyAuthorityClassification(row);
+  const authority = classification.manualAuthority;
+  const status = classification.kind === "ambiguous"
+    ? "conflict"
+    : classification.kind === "manual" ? authority.status : legacyStateToTipStatus(row);
+  const attributedMemberId = classification.kind === "ambiguous"
+    ? null
+    : classification.kind === "manual"
+      ? (ATTRIBUTED_TIP_STATUSES.includes(status) ? authority.memberId : null)
+      : (ATTRIBUTED_TIP_STATUSES.includes(status) ? row.attributedToMemberId : null);
   const result = legacyTipResult(row);
   const candidates = Array.isArray(result.candidates) ? result.candidates : [];
   return {
@@ -625,11 +723,11 @@ function legacyTipCreateData(row) {
     receivedAt: row.occurredAt,
     status,
     attributedMemberId,
-    attributedUserId: attributedMemberId ? (authority.manual ? authority.userId : row.attributedToUserId) : null,
+    attributedUserId: attributedMemberId ? (classification.kind === "manual" ? authority.userId : row.attributedToUserId) : null,
     attributedShiftKey: null,
-    resolvedAt: authority.manual ? authority.resolvedAt : (attributedMemberId ? (row.lockedAt || row.updatedAt || row.occurredAt) : null),
-    resolvedByMemberId: authority.manual ? authority.resolvedByMemberId : null,
-    resolvedSource: authority.source,
+    resolvedAt: classification.kind === "manual" ? authority.resolvedAt : (attributedMemberId ? (row.lockedAt || row.updatedAt || row.occurredAt) : null),
+    resolvedByMemberId: classification.kind === "manual" ? authority.resolvedByMemberId : null,
+    resolvedSource: classification.kind === "ambiguous" ? LEGACY_MIGRATION_REVIEW_SOURCE : authority.source,
     candidates,
     weakCandidates: [],
     result,
@@ -690,6 +788,58 @@ async function mergeLegacyManualAuthority(tx, existing, legacyRow) {
   };
   const row = await tx.teamTipLedger.update({ where: { id: existing.id }, data });
   return { row, manualMerged: incomingWins };
+}
+
+function hasClosure6LegacyClassification(row, legacyRow, action) {
+  return (Array.isArray(row?.history) ? row.history : []).some((item) =>
+    String(item?.action || "") === action
+      && (!legacyRow?.id || String(item?.legacyAttributionId || "") === String(legacyRow.id))
+  );
+}
+
+async function mergeLegacyNonManualClassification(tx, existing, legacyRow) {
+  const classification = legacyAuthorityClassification(legacyRow);
+  if (classification.kind === "manual") return { row: existing, classificationMerged: false };
+  const action = classification.kind === "auto" ? CLOSURE6_AUTO_CLASSIFICATION_ACTION : CLOSURE6_AMBIGUOUS_CLASSIFICATION_ACTION;
+  if (hasClosure6LegacyClassification(existing, legacyRow, action)) return { row: existing, classificationMerged: false };
+
+  const currentResult = existing?.result && typeof existing.result === "object" && !Array.isArray(existing.result)
+    ? { ...existing.result }
+    : {};
+  currentResult.audit15Closure6MigrationAuthority = {
+    classified: true,
+    classification: classification.kind === "auto" ? "proven_legacy_auto" : "ambiguous_legacy_authority_requires_review",
+    requiresManualReview: classification.kind === "ambiguous",
+    classifiedAt: new Date().toISOString(),
+    source: "audit15_closure6_runtime_migration",
+    legacyAttributionId: legacyRow?.id || null,
+  };
+  const history = Array.isArray(existing?.history) ? [...existing.history] : [];
+  history.push({
+    ts: Date.now(),
+    action,
+    classification: classification.kind === "auto" ? "proven_legacy_auto" : "ambiguous_legacy_authority_requires_review",
+    legacyAttributionId: legacyRow?.id || null,
+    prevOwner: existing?.attributedMemberId || null,
+    nextOwner: classification.kind === "ambiguous" ? null : (existing?.attributedMemberId || null),
+    source: classification.kind === "ambiguous" ? LEGACY_MIGRATION_REVIEW_SOURCE : "audit15_closure6_runtime_migration",
+  });
+
+  const data = classification.kind === "auto" || canonicalManualAuthority(existing)
+    ? { result: currentResult, history }
+    : {
+        status: "conflict",
+        attributedMemberId: null,
+        attributedUserId: null,
+        attributedShiftKey: null,
+        resolvedAt: null,
+        resolvedByMemberId: null,
+        resolvedSource: LEGACY_MIGRATION_REVIEW_SOURCE,
+        result: currentResult,
+        history,
+      };
+  const row = await tx.teamTipLedger.update({ where: { id: existing.id }, data });
+  return { row, classificationMerged: true };
 }
 
 async function findExistingTipHashesForLegacyRows(tx, legacyRows) {
@@ -812,11 +962,16 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
           continue;
         }
         const alreadyLegacy = legacyAlreadyRepresented(canonical, legacyRow);
-        if (legacyManualAuthority(legacyRow).manual && !alreadyLegacy) {
+        const classification = legacyAuthorityClassification(legacyRow);
+        if (classification.kind === "manual" && !alreadyLegacy) {
           const merged = await mergeLegacyManualAuthority(tx, canonical, legacyRow);
           canonical = merged.row;
           if (merged.manualMerged) manualMerged += 1;
           else skippedExisting += 1;
+        } else if (classification.kind !== "manual") {
+          const merged = await mergeLegacyNonManualClassification(tx, canonical, legacyRow);
+          canonical = merged.row;
+          if (!merged.classificationMerged && !alreadyLegacy && canonical.source !== "legacy_money_attribution_migration") skippedExisting += 1;
         } else if (!alreadyLegacy && canonical.source !== "legacy_money_attribution_migration") {
           skippedExisting += 1;
         }
@@ -899,13 +1054,12 @@ function legacyStateManualEvidence(row) {
 
 function closure5RepairClassification(row) {
   const result = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
-  const marker = result?.audit15Closure5ManualRepairScan;
-  if (marker && marker.classified === true) return String(marker.classification || "classified");
+  const closure6 = result?.audit15Closure6MigrationAuthority;
+  if (closure6 && closure6.classified === true) return String(closure6.classification || "classified");
   const history = Array.isArray(row?.history) ? row.history : [];
   const durable = history.find((item) => [
-    "audit15_closure5_classify_legacy_auto_no_manual_evidence",
-    "audit15_closure5_quarantine_ambiguous_legacy_authority",
-    "audit15_closure5_repair_migrated_manual_authority",
+    CLOSURE6_AUTO_CLASSIFICATION_ACTION,
+    CLOSURE6_AMBIGUOUS_CLASSIFICATION_ACTION,
   ].includes(String(item?.action || "")));
   return durable ? String(durable?.classification || durable?.action || "classified") : null;
 }
@@ -968,6 +1122,19 @@ function canonicalLegacyManualEvidence(row) {
   return events[events.length - 1];
 }
 
+function legacyProvenAutoEvidence(row) {
+  if (!isLegacyMigratedTipRow(row)) return false;
+  const state = legacyStateFromCanonicalRow(row);
+  if (state === "auto") return true;
+  const result = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
+  if (String(result?.audit15Closure6MigrationAuthority?.classification || "") === "proven_legacy_auto") return true;
+  const history = Array.isArray(row?.history) ? row.history : [];
+  return history.some((item) => [
+    "audit15_closure5_classify_legacy_auto_no_manual_evidence",
+    CLOSURE6_AUTO_CLASSIFICATION_ACTION,
+  ].includes(String(item?.action || "")));
+}
+
 function repairedManualStatus(evidence) {
   if (!evidence) return "creator_revenue";
   if (evidence.action === "claim") return evidence.memberId ? "claimed" : "unresolved";
@@ -1006,9 +1173,8 @@ async function selectMigratedTipRowsForManualRepair(tx, { agencyId, limit }) {
       AND NOT EXISTS (
         SELECT 1 FROM jsonb_array_elements(COALESCE("history", '[]'::jsonb)) c5(item)
         WHERE c5.item->>'action' IN (
-          'audit15_closure5_classify_legacy_auto_no_manual_evidence',
-          'audit15_closure5_quarantine_ambiguous_legacy_authority',
-          'audit15_closure5_repair_migrated_manual_authority'
+          'audit15_closure6_classify_legacy_auto_authority',
+          'audit15_closure6_quarantine_ambiguous_legacy_authority'
         )
       )`;
   if (agencyId) {
@@ -1102,12 +1268,16 @@ async function repairMigratedLegacyTipManualAuthority({ agencyId = null, limit =
         }
 
         const legacyState = legacyStateFromCanonicalRow(row);
-        if (legacyState === "auto") {
+        if (legacyProvenAutoEvidence(row)) {
           classifiedAuto += 1;
           if (!dryRun) {
             const currentResult = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? { ...row.result } : {};
             currentResult.audit15Closure5ManualRepairScan = {
               classified: true, classification: "legacy_auto_no_manual_evidence", classifiedAt: new Date().toISOString(),
+            };
+            currentResult.audit15Closure6MigrationAuthority = {
+              classified: true, classification: "proven_legacy_auto", requiresManualReview: false,
+              classifiedAt: new Date().toISOString(), source: "audit15_closure6_runtime_repair",
             };
             const history = Array.isArray(row?.history) ? [...row.history] : [];
             history.push({
@@ -1115,6 +1285,12 @@ async function repairMigratedLegacyTipManualAuthority({ agencyId = null, limit =
               classification: "legacy_auto_no_manual_evidence",
               reason: "Legacy state proves AUTO and contains no MANUAL authority evidence",
               source: "audit15_closure5_runtime_repair",
+            });
+            history.push({
+              ts: Date.now(), action: CLOSURE6_AUTO_CLASSIFICATION_ACTION,
+              classification: "proven_legacy_auto",
+              reason: "Legacy authority was proven AUTO before mutable projection metadata could be replaced",
+              source: "audit15_closure6_runtime_repair",
             });
             await tx.teamTipLedger.update({ where: { id: row.id }, data: { result: currentResult, history } });
           }
@@ -1132,12 +1308,23 @@ async function repairMigratedLegacyTipManualAuthority({ agencyId = null, limit =
             classified: true, classification: "ambiguous_legacy_authority_requires_review",
             classifiedAt: new Date().toISOString(), requiresManualReview: true,
           };
+          currentResult.audit15Closure6MigrationAuthority = {
+            classified: true, classification: "ambiguous_legacy_authority_requires_review",
+            classifiedAt: new Date().toISOString(), requiresManualReview: true, source: "audit15_closure6_runtime_repair",
+          };
           const history = Array.isArray(row?.history) ? [...row.history] : [];
           history.push({
             ts: Date.now(), action: "audit15_closure5_quarantine_ambiguous_legacy_authority",
             reason: "Legacy migration provenance is insufficient to distinguish historical AUTO from MANUAL authority",
             prevOwner: row.attributedMemberId || null, nextOwner: null,
-            source: "manual_legacy_money_attribution_ambiguous_requires_review",
+            source: LEGACY_MIGRATION_REVIEW_SOURCE,
+          });
+          history.push({
+            ts: Date.now(), action: CLOSURE6_AMBIGUOUS_CLASSIFICATION_ACTION,
+            classification: "ambiguous_legacy_authority_requires_review",
+            reason: "Historical legacy authority remains ambiguous and requires explicit senior review",
+            prevOwner: row.attributedMemberId || null, nextOwner: null,
+            source: LEGACY_MIGRATION_REVIEW_SOURCE,
           });
           await tx.teamTipLedger.update({
             where: { id: row.id },

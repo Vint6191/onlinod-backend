@@ -318,11 +318,12 @@ router.get("/disputable", async (req, res) => {
     if (!actor) {
       return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     }
-    const [senior, canClaimOwn, canReleaseOwn, canViewAudit] = await Promise.all([
+    const [senior, canClaimOwn, canReleaseOwn, canViewAudit, canOverrideAttribution] = await Promise.all([
       canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_ATTRIBUTION }),
       canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.CLAIM_OWN }),
       canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.RELEASE_OWN }),
       canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_AUDIT }),
+      canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION }),
     ]);
     const allowedCreatorIds = memberCreatorScope(actor);
     if (!senior && !canClaimOwn && !canReleaseOwn) {
@@ -334,6 +335,7 @@ router.get("/disputable", async (req, res) => {
         limit,
         actorMemberId: actor.id,
         senior,
+        includeMigrationReview: canOverrideAttribution,
         allowedCreatorIds,
       }),
       listDisputable({
@@ -345,7 +347,11 @@ router.get("/disputable", async (req, res) => {
       }),
     ]);
     const rows = [...tipRows, ...hideMigratedLegacyRows(tipRows, legacyRows)]
-      .sort((a, b) => new Date(b.occurredAt || b.receivedAt || 0).getTime() - new Date(a.occurredAt || a.receivedAt || 0).getTime())
+      .sort((a, b) => {
+        const reviewOrder = Number(Boolean(b?.requiresManualReview)) - Number(Boolean(a?.requiresManualReview));
+        if (reviewOrder) return reviewOrder;
+        return new Date(b.occurredAt || b.receivedAt || 0).getTime() - new Date(a.occurredAt || a.receivedAt || 0).getTime();
+      })
       .slice(0, limit)
       .map((row) => claimRowForViewer(row, { actorMemberId: actor.id, canViewAudit }));
     return res.json({
