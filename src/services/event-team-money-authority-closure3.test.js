@@ -302,7 +302,8 @@ test("Closure3 deployment migration locks rolling writers and has manual-precede
   const sql = source("../prisma/migrations/20260831223000_event_team_money_authority_cutover/migration.sql");
   assert.match(sql, /^BEGIN;/m);
   assert.match(sql, /LOCK TABLE "MoneyAttribution" IN SHARE ROW EXCLUSIVE MODE/);
-  assert.match(sql, /LOCK TABLE "TeamTipLedger" IN SHARE ROW EXCLUSIVE MODE/);
+  assert.doesNotMatch(sql, /LOCK TABLE "TeamTipLedger"/);
+  assert.match(sql, /Do NOT table-lock TeamTipLedger/);
   assert.match(sql, /manual_legacy_money_attribution_/);
   assert.match(sql, /LEFT JOIN LATERAL/);
   assert.match(sql, /WITH ORDINALITY/);

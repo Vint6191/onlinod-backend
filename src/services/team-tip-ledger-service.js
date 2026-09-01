@@ -842,6 +842,228 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
   }
 }
 
+
+function isLegacyMigratedTipRow(row) {
+  const source = String(row?.source || "");
+  const resolvedSource = String(row?.resolvedSource || "");
+  const result = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
+  const history = Array.isArray(row?.history) ? row.history : [];
+  return source.includes("legacy_money_attribution_migration")
+    || resolvedSource.includes("legacy_money_attribution_migration")
+    || result.migratedFrom === "MoneyAttribution"
+    || Boolean(result.legacyMigration)
+    || history.some((item) => [
+      "migrate_legacy_tip_to_team_tip_ledger",
+      "audit15_migrate_legacy_tip_to_team_tip_ledger",
+    ].includes(String(item?.action || "")));
+}
+
+function canonicalLegacyManualEvidence(row) {
+  if (!isLegacyMigratedTipRow(row)) return null;
+  const result = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
+  const events = [];
+  let ordinal = 0;
+  const push = ({ action, memberId, resolvedByMemberId, resolvedAt, reason, sourceRank = 0 }) => {
+    const normalizedAction = String(action || "").trim().toLowerCase();
+    if (!["claim", "release", "manager_override"].includes(normalizedAction)) return;
+    ordinal += 1;
+    const parsed = resolvedAt ? safeDate(resolvedAt, 0) : null;
+    const ts = parsed && parsed.getTime() > 0 ? parsed.getTime() : 0;
+    events.push({
+      action: normalizedAction,
+      memberId: clean(memberId, 160),
+      resolvedByMemberId: clean(resolvedByMemberId, 160),
+      resolvedAt: ts > 0 ? new Date(ts) : null,
+      reason: clean(reason, 1000),
+      sourceRank,
+      ordinal,
+    });
+  };
+
+  const resultManual = [
+    ...(Array.isArray(result.manualResolutions) ? result.manualResolutions : []),
+    ...(result.manualResolution ? [result.manualResolution] : []),
+    ...(Array.isArray(result?.legacyMigration?.manualResolutions) ? result.legacyMigration.manualResolutions : []),
+  ];
+  for (const item of resultManual) {
+    push({
+      action: item?.action,
+      memberId: item?.memberId,
+      resolvedByMemberId: item?.resolvedByMemberId,
+      resolvedAt: item?.resolvedAt,
+      reason: item?.reason,
+      sourceRank: 2,
+    });
+  }
+
+  for (const item of Array.isArray(row?.history) ? row.history : []) {
+    push({
+      action: item?.action,
+      memberId: item?.nextOwner,
+      resolvedByMemberId: item?.byMemberId,
+      resolvedAt: item?.ts,
+      reason: item?.reason,
+      sourceRank: 1,
+    });
+  }
+
+  if (!events.length) return null;
+  events.sort((a, b) => {
+    const at = a.resolvedAt?.getTime?.() || 0;
+    const bt = b.resolvedAt?.getTime?.() || 0;
+    return at - bt || a.sourceRank - b.sourceRank || a.ordinal - b.ordinal;
+  });
+  return events[events.length - 1];
+}
+
+function repairedManualStatus(evidence) {
+  if (!evidence) return "creator_revenue";
+  if (evidence.action === "claim") return evidence.memberId ? "claimed" : "unresolved";
+  if (evidence.action === "manager_override") return evidence.memberId ? "resolved" : "creator_revenue";
+  if (evidence.action === "release") return evidence.memberId ? "claimed" : "released";
+  return "creator_revenue";
+}
+
+async function selectMigratedTipRowsForManualRepair(tx, { agencyId, limit }) {
+  const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
+  if (typeof tx?.$queryRawUnsafe !== "function") {
+    return tx.teamTipLedger.findMany({
+      where: agencyId ? { agencyId } : {},
+      orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+      take: safeLimit,
+    });
+  }
+  const originSql = `(
+      "resolvedSource" IN ('legacy_money_attribution_migration','audit15_legacy_money_attribution_migration')
+      OR "source" IN ('legacy_money_attribution_migration','audit15_legacy_money_attribution_migration','audit15_legacy_money_attribution_migration')
+      OR COALESCE("result"->>'migratedFrom','') = 'MoneyAttribution'
+      OR ("result" ? 'legacyMigration')
+      OR EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(COALESCE("history", '[]'::jsonb)) h(item)
+        WHERE h.item->>'action' IN ('migrate_legacy_tip_to_team_tip_ledger','audit15_migrate_legacy_tip_to_team_tip_ledger')
+      )
+    )`;
+  if (agencyId) {
+    return tx.$queryRawUnsafe(`
+      SELECT * FROM "TeamTipLedger"
+      WHERE "agencyId" = $1 AND ${originSql}
+      ORDER BY "updatedAt" ASC, "id" ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT $2
+    `, agencyId, safeLimit);
+  }
+  return tx.$queryRawUnsafe(`
+    SELECT * FROM "TeamTipLedger"
+    WHERE ${originSql}
+    ORDER BY "updatedAt" ASC, "id" ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT $1
+  `, safeLimit);
+}
+
+async function repairMigratedLegacyTipManualAuthority({ agencyId = null, limit = 1000, dryRun = false } = {}) {
+  const cleanAgency = clean(agencyId, 160);
+  const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // Audit15 Closure4: this repair intentionally reads ONLY TeamTipLedger.
+      // It can therefore overlap the MoneyAttribution -> TeamTip runtime migrator
+      // without creating a Money/Team lock cycle. Rows are repaired in-place and
+      // remain safe even when the legacy MoneyAttribution source was deleted by
+      // an already-deployed Closure2 migration.
+      const rows = await selectMigratedTipRowsForManualRepair(tx, { agencyId: cleanAgency, limit: safeLimit });
+      let repaired = 0;
+      let alreadyManual = 0;
+      let noManualEvidence = 0;
+      const errors = [];
+
+      for (const row of rows) {
+        const evidence = canonicalLegacyManualEvidence(row);
+        if (!evidence) {
+          noManualEvidence += 1;
+          continue;
+        }
+        const currentManual = canonicalManualAuthority(row);
+        const evidenceAt = evidence.resolvedAt?.getTime?.() || 0;
+        if (currentManual && canonicalManualAt(row) >= evidenceAt) {
+          alreadyManual += 1;
+          continue;
+        }
+        if (dryRun) {
+          repaired += 1;
+          continue;
+        }
+
+        let attributedUserId = null;
+        if (evidence.memberId && tx?.agencyMember?.findFirst) {
+          const member = await tx.agencyMember.findFirst({
+            where: { agencyId: row.agencyId, id: evidence.memberId },
+            select: { userId: true },
+          });
+          attributedUserId = clean(member?.userId, 160);
+        }
+        const resolvedAt = evidence.resolvedAt || safeDate(row.updatedAt || row.receivedAt || Date.now());
+        const resolvedSource = `manual_legacy_money_attribution_forward_repair_${evidence.action}`;
+        const currentResult = row?.result && typeof row.result === "object" && !Array.isArray(row.result) ? { ...row.result } : {};
+        currentResult.audit15Closure4ManualRepair = {
+          repaired: true,
+          action: evidence.action,
+          memberId: evidence.memberId || null,
+          resolvedByMemberId: evidence.resolvedByMemberId || null,
+          resolvedAt: resolvedAt.toISOString(),
+          source: "audit15_closure4_forward_repair",
+        };
+        const history = Array.isArray(row?.history) ? [...row.history] : [];
+        history.push({
+          ts: Date.now(),
+          action: "audit15_closure4_repair_migrated_manual_authority",
+          reason: "Recovered durable manual authority from canonical migrated history after legacy MoneyAttribution removal",
+          prevOwner: row.attributedMemberId || null,
+          nextOwner: evidence.memberId || null,
+          source: resolvedSource,
+        });
+
+        try {
+          await tx.teamTipLedger.update({
+            where: { id: row.id },
+            data: {
+              status: repairedManualStatus(evidence),
+              attributedMemberId: evidence.memberId || null,
+              attributedUserId,
+              attributedShiftKey: null,
+              resolvedAt,
+              resolvedByMemberId: evidence.resolvedByMemberId || null,
+              resolvedSource,
+              result: currentResult,
+              history,
+            },
+          });
+          repaired += 1;
+        } catch (err) {
+          errors.push({ id: row.id, eventHash: row.eventHash, error: err?.message || String(err) });
+        }
+      }
+
+      return {
+        ok: errors.length === 0,
+        scanned: rows.length,
+        repaired,
+        alreadyManual,
+        noManualEvidence,
+        failed: errors.length,
+        errors,
+        dryRun: Boolean(dryRun),
+      };
+    }, serializableTxOptions());
+  } catch (err) {
+    return {
+      ok: false, scanned: 0, repaired: 0, alreadyManual: 0, noManualEvidence: 0, failed: 1,
+      errors: [{ error: err?.message || String(err) }], dryRun: Boolean(dryRun),
+    };
+  }
+}
+
 async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDGER_RETENTION_DAYS, limit = 5000, dryRun = false } = {}) {
   const cleanAgency = clean(agencyId, 160);
   const safeRetentionDays = Math.max(1, int(retentionDays, TIP_LEDGER_RETENTION_DAYS));
@@ -882,6 +1104,7 @@ module.exports = {
   getTipClaimByHash,
   listTipAudit,
   migrateLegacyTipsToTipLedger,
+  repairMigratedLegacyTipManualAuthority,
   purgeExpiredTipLedger,
   tipRowForClaims,
 };

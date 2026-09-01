@@ -14,6 +14,7 @@ const {
   getTipClaimByHash,
   listTipAudit,
   migrateLegacyTipsToTipLedger,
+  repairMigratedLegacyTipManualAuthority,
   purgeExpiredTipLedger,
 } = require("../services/team-tip-ledger-service");
 const { reconcileHistoricalTeamMoneyBatch } = require("../services/team-money-reconciliation-service");
@@ -491,6 +492,11 @@ router.post("/sweep", async (req, res) => {
     // Run legacy tip migration before legacy lock sweep. The migration reads
     // and deletes MoneyAttribution tip rows; doing it in parallel with locks
     // creates noisy write/delete races on the same rows.
+    const legacyManualRepair = await repairMigratedLegacyTipManualAuthority({
+      agencyId: req.auth.agencyId,
+      limit,
+      dryRun,
+    });
     const legacyTipMigration = await migrateLegacyTipsToTipLedger({
       agencyId: req.auth.agencyId,
       limit,
@@ -524,9 +530,10 @@ router.post("/sweep", async (req, res) => {
     ]);
 
     return res.json({
-      ok: Boolean(legacyTipMigration?.ok && tipLedgerPurge?.ok && legacyAttributionPurge?.ok),
+      ok: Boolean(legacyManualRepair?.ok && legacyTipMigration?.ok && tipLedgerPurge?.ok && legacyAttributionPurge?.ok),
       retentionDays,
       dryRun,
+      legacyManualRepair,
       legacyTipMigration,
       canonicalMoneyBackfill,
       legacyLocks,

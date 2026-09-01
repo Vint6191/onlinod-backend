@@ -26,7 +26,12 @@ ON CONFLICT ("agencyId") DO NOTHING;
 -- the short one-time cutover so an old rolling process cannot commit a newer
 -- manual MoneyAttribution decision between snapshot and deletion.
 LOCK TABLE "MoneyAttribution" IN SHARE ROW EXCLUSIVE MODE;
-LOCK TABLE "TeamTipLedger" IN SHARE ROW EXCLUSIVE MODE;
+
+-- Do NOT table-lock TeamTipLedger here. The runtime legacy migrator takes its
+-- MoneyAttribution row lock before touching TeamTipLedger. Holding only the
+-- MoneyAttribution table lock therefore serializes old rolling writers before
+-- this migration reaches TeamTip rows, while TeamTip ON CONFLICT uses ordinary
+-- row-level locking and cannot form a Money<->Team table-lock cycle.
 
 INSERT INTO "TeamTipLedger" (
     "id", "agencyId", "accountId", "creatorId", "eventHash", "tipId",
