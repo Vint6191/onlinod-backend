@@ -362,7 +362,7 @@ async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey
   const now = new Date();
   const rows = await db.automationDelivery.findMany({
     where: {
-      agencyId, status: { in: ACTIVE_DELIVERY_STATUSES }, ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}),
+      agencyId, originKind: "AUTOMATION", status: { in: ACTIVE_DELIVERY_STATUSES }, ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}),
       AND: [
         { NOT: { moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: UNFOLLOW_FAN_ACTION_TYPE, status: "RUNNING" } },
         ...(moduleKey === FOLLOW_AUTOMATION_MODULE_KEY ? [{ NOT: { moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE } }] : []),
@@ -375,7 +375,7 @@ async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey
   for (const row of rows) {
     const applied = await runDbTransaction(db, async (tx) => {
       const updated = await tx.automationDelivery.updateMany({
-        where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision },
+        where: { id: row.id, originKind: "AUTOMATION", status: row.status, leaseRevision: row.leaseRevision },
         data: {
           status: "PAUSED", failureCode, lastError: reason, claimedByDeviceId: null, claimedAt: null,
           claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, lastCheckedAt: now,
@@ -403,7 +403,7 @@ function effectiveModuleEnabled(snapshot, moduleKey) {
 async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKey = null, db = prisma }) {
   const enabled = new Map();
   const rows = await db.automationDelivery.findMany({
-    where: { agencyId, status: "PAUSED", ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}) },
+    where: { agencyId, originKind: "AUTOMATION", status: "PAUSED", ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}) },
     orderBy: { id: "asc" }, take: 10000,
   });
   let resumed = 0;
@@ -415,7 +415,7 @@ async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKe
     }
     if (!enabled.get(key)) continue;
     const applied = await runDbTransaction(db, async (tx) => {
-      const updated = await tx.automationDelivery.updateMany({ where: { id: row.id, status: "PAUSED", leaseRevision: row.leaseRevision }, data: { status: "QUEUED", failureCode: null, lastError: null, lastCheckedAt: new Date() } });
+      const updated = await tx.automationDelivery.updateMany({ where: { id: row.id, originKind: "AUTOMATION", status: "PAUSED", leaseRevision: row.leaseRevision }, data: { status: "QUEUED", failureCode: null, lastError: null, lastCheckedAt: new Date() } });
       if (!updated.count) return false;
       const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
       await projectControlDeliveryState(tx, current, "QUEUED", null);

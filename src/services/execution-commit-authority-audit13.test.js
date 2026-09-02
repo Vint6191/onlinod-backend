@@ -51,7 +51,7 @@ test("Audit13 committed/reconciliation authority is immutable to pause/cancel/re
   const actionSource = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
   const controlSource = fs.readFileSync(path.join(__dirname, "automation-control-service.js"), "utf8");
   assert.match(actionSource, /if \(\["COMMITTING", "RECONCILE_REQUIRED"\]\.includes\(delivery\.status\)\)[\s\S]{0,220}DELIVERY_COMMIT_IN_FLIGHT[\s\S]{0,220}cancellation/);
-  assert.match(actionSource, /releaseClaimByAdmin[\s\S]{0,360}\["COMMITTING", "RECONCILE_REQUIRED"\]\.includes\(delivery\.status\)[\s\S]{0,220}DELIVERY_COMMIT_IN_FLIGHT/);
+  assert.match(actionSource, /releaseClaimByAdmin[\s\S]{0,520}\["COMMITTING", "RECONCILE_REQUIRED"\]\.includes\(delivery\.status\)[\s\S]{0,220}DELIVERY_COMMIT_IN_FLIGHT/);
   assert.match(controlSource, /ACTIVE_DELIVERY_STATUSES = \["QUEUED", "CLAIMED", "RUNNING", "RETRY_SCHEDULED"\]/);
   assert.doesNotMatch(controlSource, /ACTIVE_DELIVERY_STATUSES = \[[^\]]*(?:COMMITTING|RECONCILE_REQUIRED)/);
 });

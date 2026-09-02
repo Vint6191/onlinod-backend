@@ -34,6 +34,7 @@ try {
 }
 
 const APPLY = process.argv.includes("--apply");
+const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED", "sent", "failed", "skipped", "canceled", "cancelled", "replied"];
 
 async function main() {
   const total = await prisma.automationDelivery.count();
@@ -41,7 +42,7 @@ async function main() {
 
   // Берём все строки с messageId, только нужные поля (легко влезет в память даже на тысячах).
   const rows = await prisma.automationDelivery.findMany({
-    where: { messageId: { not: null } },
+    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, messageId: { not: null } },
     select: { id: true, creatorId: true, messageId: true, updatedAt: true },
     orderBy: { updatedAt: "desc" }, // самые свежие первыми
   });
@@ -62,7 +63,7 @@ async function main() {
   }
 
   const withoutMessageId = await prisma.automationDelivery.count({
-    where: { messageId: null },
+    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, messageId: null },
   });
 
   console.log("------------------------------------------------------------");
@@ -88,7 +89,7 @@ async function main() {
   for (let i = 0; i < toDelete.length; i += CHUNK) {
     const chunk = toDelete.slice(i, i + CHUNK);
     const res = await prisma.automationDelivery.deleteMany({
-      where: { id: { in: chunk } },
+      where: { id: { in: chunk }, originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES } },
     });
     deleted += res.count;
     console.log(`удалено ${deleted}/${toDelete.length}...`);

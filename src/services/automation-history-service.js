@@ -90,6 +90,7 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = n
   for (;;) {
     const rows = await db.automationDelivery.findMany({
       where: {
+        originKind: "AUTOMATION",
         status: { in: TERMINAL_STATUSES },
         finishedAt: { not: null, lt: olderThan },
       },
@@ -144,7 +145,7 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = n
           });
         }
       }
-      await tx.automationDelivery.deleteMany({ where: { id: { in: rows.map((row) => row.id) } } });
+      await tx.automationDelivery.deleteMany({ where: { id: { in: rows.map((row) => row.id) }, originKind: "AUTOMATION" } });
     });
     archived += rows.length;
     aggregateUpdates += groups.length;
@@ -177,6 +178,7 @@ async function getAutomationMetrics({ agencyId, creatorId, from = null, to = nul
       where: {
         agencyId,
         creatorId,
+        originKind: "AUTOMATION",
         status: { in: TERMINAL_STATUSES },
         finishedAt: { gte: start, lte: end },
       },
@@ -185,7 +187,7 @@ async function getAutomationMetrics({ agencyId, creatorId, from = null, to = nul
     }),
     db.automationDelivery.groupBy({
       by: ["moduleKey", "failureCode"],
-      where: { agencyId, creatorId, status: "FAILED", finishedAt: { gte: start, lte: end } },
+      where: { agencyId, creatorId, originKind: "AUTOMATION", status: "FAILED", finishedAt: { gte: start, lte: end } },
       _count: { _all: true },
     }),
   ]);

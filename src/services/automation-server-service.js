@@ -243,6 +243,7 @@ async function loadBumpStatsByTemplate({ agencyId, creatorId, tasks = [] } = {})
     prisma.automationDelivery.findMany({
       where: {
         agencyId,
+        originKind: "AUTOMATION",
         ...(cid ? { creatorId: cid } : {}),
         contentCollectionId: { in: keys },
         status: { in: ["sent", "pending_reply", "checking_reply", "cancel_claimed"] },
@@ -1771,7 +1772,7 @@ async function listActivity({ agencyId, query = {} }) {
   ];
   const [events, deliveries, audits] = await Promise.all([
     prisma.automationEvent.findMany({ where: eventWhere, orderBy: { createdAt: "desc" }, take: Math.min(60, take) }).catch(() => []),
-    prisma.automationDelivery.findMany({ where: { agencyId, ...(creatorId ? { creatorId } : {}), OR: [{ updatedAt: { gte: since } }, { sentAt: { gte: since } }, { createdAt: { gte: since } }] }, orderBy: { updatedAt: "desc" }, take: Math.min(120, Math.ceil(take * 2)) }).catch(() => []),
+    prisma.automationDelivery.findMany({ where: { agencyId, originKind: "AUTOMATION", ...(creatorId ? { creatorId } : {}), OR: [{ updatedAt: { gte: since } }, { sentAt: { gte: since } }, { createdAt: { gte: since } }] }, orderBy: { updatedAt: "desc" }, take: Math.min(120, Math.ceil(take * 2)) }).catch(() => []),
     prisma.auditLog.findMany({ where: auditWhere, orderBy: { createdAt: "desc" }, take: Math.min(120, Math.ceil(take * 1.5)) }).catch(() => []),
   ]);
   const rows = [];

@@ -27,6 +27,7 @@ async function latestWriteState({ agencyId, creatorId, actionType = null, now = 
       where: {
         agencyId,
         creatorId,
+        originKind: "AUTOMATION",
         ...typeFilter,
         status: { in: ACTIVE_WRITE_STATUSES },
         // A bump delete scheduled an hour from now must not reserve the entire
@@ -37,7 +38,7 @@ async function latestWriteState({ agencyId, creatorId, actionType = null, now = 
       select: { status: true, notBefore: true, claimedAt: true },
     }),
     db.automationDelivery.findFirst({
-      where: { agencyId, creatorId, ...typeFilter, status: "COMPLETED", finishedAt: { not: null } },
+      where: { agencyId, creatorId, originKind: "AUTOMATION", ...typeFilter, status: "COMPLETED", finishedAt: { not: null } },
       orderBy: [{ finishedAt: "desc" }, { updatedAt: "desc" }],
       select: { finishedAt: true },
     }),
@@ -79,6 +80,7 @@ async function claimPacingRetryAt({ delivery, workspaceSettings, actionSettings,
       where: {
         agencyId: delivery.agencyId,
         creatorId: delivery.creatorId,
+        originKind: "AUTOMATION",
         status: "COMPLETED",
         finishedAt: { not: null },
         id: { not: delivery.id },
@@ -90,6 +92,7 @@ async function claimPacingRetryAt({ delivery, workspaceSettings, actionSettings,
       where: {
         agencyId: delivery.agencyId,
         creatorId: delivery.creatorId,
+        originKind: "AUTOMATION",
         actionType: delivery.actionType,
         status: "COMPLETED",
         finishedAt: { not: null },

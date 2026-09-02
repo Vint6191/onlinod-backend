@@ -51,7 +51,7 @@ async function main() {
 
   // Берём кандидатов по статусу.
   const candidates = await prisma.automationDelivery.findMany({
-    where: { status: { in: STUCK_STATUSES } },
+    where: { originKind: "AUTOMATION", status: { in: STUCK_STATUSES } },
     select: { id: true, fanId: true, status: true, sentAt: true, createdAt: true, messageId: true },
   });
   console.log(`Записей в целевых статусах: ${candidates.length}`);
@@ -93,7 +93,7 @@ async function main() {
   const CHUNK = 500;
   for (let i = 0; i < ids.length; i += CHUNK) {
     const chunk = ids.slice(i, i + CHUNK);
-    const res = await prisma.automationDelivery.deleteMany({ where: { id: { in: chunk } } });
+    const res = await prisma.automationDelivery.deleteMany({ where: { id: { in: chunk }, originKind: "AUTOMATION", status: { in: STUCK_STATUSES } } });
     deleted += res.count;
     console.log(`удалено ${deleted}/${ids.length}...`);
   }

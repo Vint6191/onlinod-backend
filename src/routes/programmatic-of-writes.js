@@ -13,6 +13,8 @@ const {
   completeProgrammaticWrite,
   failProgrammaticWrite,
   reconcileProgrammaticWrite,
+  closeProgrammaticWriteUnresolved,
+  resolveProgrammaticWriteUnresolvedMatched,
   getProgrammaticWrite,
 } = require("../services/programmatic-of-write-authority-service");
 
@@ -131,6 +133,35 @@ router.post("/:writeId/reconcile", async (req, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
     return sendError(res, error, "PROGRAMMATIC_WRITE_RECONCILE_FAILED");
+  }
+});
+
+
+router.post("/:writeId/close-unresolved", async (req, res) => {
+  try {
+    const input = leaseSchema.extend({
+      creatorId: z.string().min(1).max(180),
+      kind: z.string().min(1).max(80),
+      reason: z.string().max(1000).optional(),
+    }).parse(req.body || {});
+    const { normalized, config } = await publicKindAccess(req, input.kind, input.creatorId, input.deviceId);
+    return res.json(await closeProgrammaticWriteUnresolved({ ...actor(req), writeId: req.params.writeId, ...input, kind: normalized, permissionKey: config.permissionKey }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "PROGRAMMATIC_WRITE_CLOSE_UNRESOLVED_FAILED");
+  }
+});
+
+router.post("/:writeId/resolve-unresolved-matched", async (req, res) => {
+  try {
+    const input = z.object({
+      creatorId: z.string().min(1).max(180), kind: z.string().min(1).max(80), deviceId: z.string().min(1).max(180), result: z.record(z.unknown()),
+    }).parse(req.body || {});
+    const { normalized, config } = await publicKindAccess(req, input.kind, input.creatorId, input.deviceId);
+    return res.json(await resolveProgrammaticWriteUnresolvedMatched({ ...actor(req), writeId: req.params.writeId, ...input, kind: normalized, permissionKey: config.permissionKey }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "PROGRAMMATIC_WRITE_RESOLVE_UNRESOLVED_FAILED");
   }
 });
 

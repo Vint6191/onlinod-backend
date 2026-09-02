@@ -69,7 +69,7 @@ const MODELS = {
   crmProfileRawTag:   { d: () => prisma.crmProfileRawTag,   soft: false },
   crmNote:            { d: () => prisma.crmNote,            soft: true  },
   crmAnalysisRun:     { d: () => prisma.crmAnalysisRun,     soft: false },
-  automationDelivery: { d: () => prisma.automationDelivery, soft: false },
+  automationDelivery: { d: () => prisma.automationDelivery, soft: false, deleteProtected: true },
   bumpDeliveryStat:   { d: () => prisma.bumpDeliveryStat,   soft: false },
   hiddenOnlineUser:   { d: () => prisma.hiddenOnlineUser,   soft: false },
   followBackTask:     { d: () => prisma.followBackTask,     soft: false },
@@ -455,6 +455,7 @@ router.delete("/record/:model/:id", async (req, res) => {
   try {
     const m = MODELS[req.params.model];
     if (!m) return res.status(400).json({ ok: false, code: "MODEL_NOT_ALLOWED" });
+    if (m.deleteProtected) return res.status(403).json({ ok: false, code: "ADMIN_DELETE_PROTECTED", error: "This authority record cannot be deleted through generic admin data APIs" });
     const hard = String(req.query.hard || "") === "1";
     const id = req.params.id;
 
@@ -476,6 +477,7 @@ router.post("/bulk-delete", async (req, res) => {
   try {
     const m = MODELS[req.body?.model];
     if (!m) return res.status(400).json({ ok: false, code: "MODEL_NOT_ALLOWED" });
+    if (m.deleteProtected) return res.status(403).json({ ok: false, code: "ADMIN_DELETE_PROTECTED", error: "This authority record cannot be deleted through generic admin data APIs" });
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).filter(Boolean) : [];
     if (!ids.length) return res.status(400).json({ ok: false, code: "NO_IDS" });
     const hard = req.body?.hard === true;
@@ -507,7 +509,7 @@ router.post("/purge-deliveries", async (req, res) => {
     if (dedupeClones) {
       // Keep newest row per (creatorId, messageId), delete the rest.
       const rows = await prisma.automationDelivery.findMany({
-        where: { messageId: { not: null }, ...(creatorId ? { creatorId } : {}) },
+        where: { originKind: "AUTOMATION", status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] }, messageId: { not: null }, ...(creatorId ? { creatorId } : {}) },
         select: { id: true, creatorId: true, messageId: true, updatedAt: true },
         orderBy: { updatedAt: "desc" },
         take: 10000});
@@ -518,16 +520,17 @@ router.post("/purge-deliveries", async (req, res) => {
         if (seen.has(key)) toDelete.push(r.id); else seen.add(key);
       }
       for (let i = 0; i < toDelete.length; i += 500) {
-        const r = await prisma.automationDelivery.deleteMany({ where: { id: { in: toDelete.slice(i, i + 500) } } });
+        const r = await prisma.automationDelivery.deleteMany({ where: { id: { in: toDelete.slice(i, i + 500) }, originKind: "AUTOMATION", status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] } } });
         deletedClones += r.count;
       }
     }
 
     let deletedByFilter = 0;
     if (statuses.length || olderThanDays > 0) {
-      const where = {};
+      const terminalStatuses = new Set(["COMPLETED", "FAILED", "SKIPPED", "CANCELED"]);
+      const safeStatuses = statuses.filter((status) => terminalStatuses.has(status));
+      const where = { originKind: "AUTOMATION", status: { in: safeStatuses.length ? safeStatuses : [...terminalStatuses] } };
       if (creatorId) where.creatorId = creatorId;
-      if (statuses.length) where.status = { in: statuses };
       if (olderThanDays > 0) {
         const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
         where.OR = [{ sentAt: { lt: cutoff } }, { sentAt: null, createdAt: { lt: cutoff } }];

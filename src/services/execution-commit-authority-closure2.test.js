@@ -172,14 +172,14 @@ function actionFixture() {
   const now = new Date();
   const rows = [
     {
-      id: "A", agencyId: "agency-1", creatorId: "creator-1", moduleKey: "other", actionType: "SEND_MESSAGE", targetId: "fan-a", fanId: "fan-a",
+      id: "A", agencyId: "agency-1", creatorId: "creator-1", originKind: "AUTOMATION", moduleKey: "other", actionType: "SEND_MESSAGE", targetId: "fan-a", fanId: "fan-a",
       status: "COMMITTING", notBefore: new Date(now.getTime() - 60_000), priority: 100, attempts: 1, maxAttempts: 4,
       leaseRevision: 4, claimUntil: new Date(now.getTime() - 5_000), claimedByDeviceId: "device-1", leaseTokenHash: hashToken("old-token"),
       leaseMemberId: "member-1", leaseAccessEpoch: 7, result: {}, writeCommitRevision: 1, writeCommitAt: new Date(now.getTime() - 30_000),
       createdAt: new Date(now.getTime() - 120_000), claimedAt: new Date(now.getTime() - 60_000), generation: 1,
     },
     {
-      id: "B", agencyId: "agency-1", creatorId: "creator-1", moduleKey: "other", actionType: "LIKE_POST", targetId: "post-b", fanId: "fan-b",
+      id: "B", agencyId: "agency-1", creatorId: "creator-1", originKind: "AUTOMATION", moduleKey: "other", actionType: "LIKE_POST", targetId: "post-b", fanId: "fan-b",
       status: "QUEUED", notBefore: new Date(now.getTime() - 60_000), priority: 50, attempts: 0, maxAttempts: 4,
       leaseRevision: 1, claimUntil: null, claimedByDeviceId: null, leaseTokenHash: null, leaseMemberId: null, leaseAccessEpoch: null,
       result: {}, writeCommitRevision: 0, writeCommitAt: null, createdAt: new Date(now.getTime() - 90_000), generation: 1,
@@ -214,6 +214,22 @@ function actionFixture() {
   };
   return { rows, db };
 }
+
+test("Audit17 automation worker lease APIs reject programmatic-origin rows even with a valid device/token/revision", async () => {
+  const { rows, db } = actionFixture();
+  rows.push({
+    id: "P", agencyId: "agency-1", creatorId: "creator-1", originKind: "INTERACTIVE", moduleKey: "mass", actionType: "MASS_QUEUE_CREATE",
+    status: "CLAIMED", notBefore: new Date(Date.now() - 1_000), attempts: 1, maxAttempts: 1,
+    leaseRevision: 2, claimUntil: new Date(Date.now() + 60_000), claimedByDeviceId: "device-1", leaseTokenHash: hashToken("program-token"),
+    leaseMemberId: "member-1", leaseAccessEpoch: 7, result: { programmaticWriteKind: "MASS_QUEUE_CREATE" }, writeCommitRevision: 0, writeCommitAt: null,
+    createdAt: new Date(), claimedAt: new Date(), generation: 1,
+  });
+  const service = loadActionService(db);
+  await assert.rejects(
+    () => service.__test.requireLease({ deliveryId: "P", userId: "user-1", deviceId: "device-1", leaseToken: "program-token", leaseRevision: 2 }, { db }),
+    (error) => error?.code === "DELIVERY_WRONG_AUTHORITY" && error?.status === 403,
+  );
+});
 
 test("Closure2 COMMITTING expiry and reconciliation-worker crash retain creator lane until proven no-effect", async () => {
   const { rows, db } = actionFixture();
@@ -410,7 +426,7 @@ test("Closure2 delayed Traffic T1 cannot replace a newer T2 projection", async (
 function commitRaceDb({ moduleKey, targetId, actionType }) {
   const token = "race-token";
   const delivery = {
-    id: `race-${moduleKey}`, agencyId: "agency-1", creatorId: "creator-1", moduleKey, actionType, targetId, fanId: targetId,
+    id: `race-${moduleKey}`, agencyId: "agency-1", creatorId: "creator-1", originKind: "AUTOMATION", moduleKey, actionType, targetId, fanId: targetId,
     status: "RUNNING", notBefore: new Date(Date.now() - 1_000), priority: 50, attempts: 1, maxAttempts: 3,
     leaseRevision: 2, claimUntil: new Date(Date.now() + 60_000), claimedByDeviceId: "device-1", leaseTokenHash: hashToken(token),
     leaseMemberId: "member-1", leaseAccessEpoch: 7, result: {}, writeCommitRevision: 0, writeCommitAt: null,

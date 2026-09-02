@@ -20,6 +20,8 @@ const {
   createCustomContentSubmission,
   listCustomContentSubmissions,
   reserveCustomContentSubmissionRelayWrite,
+  closeCustomContentSubmissionRelayWriteUnresolved,
+  resolveCustomContentSubmissionRelayWriteMatched,
 } = require("../services/custom-content-submissions-service");
 const { finalizeCustomContentSubmissionLibrary } = require("../services/custom-content-library-service");
 const { listCustomContentReviewQueue, reviewCustomContentSubmission } = require("../services/custom-content-review-service");
@@ -192,6 +194,36 @@ router.post("/submissions/:submissionId/relay-write/reserve", async (req, res) =
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_RELAY_WRITE_RESERVE_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/relay-write/close-unresolved", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await closeCustomContentSubmissionRelayWriteUnresolved({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      deviceId: req.body?.deviceId,
+      submissionId: req.params.submissionId,
+      expectedIndex: req.body?.expectedIndex,
+      writeId: req.body?.writeId,
+      leaseToken: req.body?.leaseToken,
+      leaseRevision: req.body?.leaseRevision,
+      reason: req.body?.reason,
+      accessEpoch: currentAccessEpoch(req),
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_RELAY_WRITE_CLOSE_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/relay-write/resolve-unresolved-matched", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await resolveCustomContentSubmissionRelayWriteMatched({
+      agencyId: req.auth.agencyId, member: req.auth.membership || req.member, deviceId: req.body?.deviceId,
+      submissionId: req.params.submissionId, expectedIndex: req.body?.expectedIndex, writeId: req.body?.writeId,
+      mediaId: req.body?.mediaId, messageId: req.body?.messageId, accessEpoch: currentAccessEpoch(req), db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_RELAY_WRITE_RESOLVE_FAILED"); }
 });
 
 router.post("/submissions/:submissionId/media-commit", async (req, res) => {

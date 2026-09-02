@@ -195,9 +195,9 @@ async function scopedReadyCreatorIds({ device, member }) {
   return bindings.map((item) => item.creatorId);
 }
 
-async function sweepExpiredActionLeases(now = new Date()) {
+async function sweepExpiredAutomationLeases(now = new Date()) {
   const rows = await prisma.automationDelivery.findMany({
-    where: { status: { in: LEASED_STATUSES }, claimUntil: { lt: now } },
+    where: { originKind: "AUTOMATION", status: { in: LEASED_STATUSES }, claimUntil: { lt: now } },
     select: {
       id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true,
       payload: true, contentCollectionId: true, status: true, failureCode: true, failureCategory: true,
@@ -250,10 +250,22 @@ async function sweepExpiredActionLeases(now = new Date()) {
   return changed;
 }
 
+async function sweepExpiredActionLeases(now = new Date()) {
+  // Shared creator lane, origin-specific maintenance policies. Both origins are
+  // swept before Automation attempts to acquire the physical write lane.
+  const { sweepExpiredProgrammaticWriteLeases } = require("./programmatic-of-write-authority-service");
+  const [automationChanged, programmaticChanged] = await Promise.all([
+    sweepExpiredAutomationLeases(now),
+    sweepExpiredProgrammaticWriteLeases({ now }),
+  ]);
+  return automationChanged + programmaticChanged;
+}
+
 async function fairCandidates({ agencyId, creatorIds, actionTypes, now }) {
   const candidates = await prisma.automationDelivery.findMany({
     where: {
       agencyId,
+      originKind: "AUTOMATION",
       creatorId: { in: creatorIds },
       actionType: { in: actionTypes },
       status: { in: CLAIMABLE_STATUSES },
@@ -267,7 +279,7 @@ async function fairCandidates({ agencyId, creatorIds, actionTypes, now }) {
   const creatorSet = [...new Set(withinAttempts.map((item) => item.creatorId))];
   const touches = await prisma.automationDelivery.groupBy({
     by: ["creatorId"],
-    where: { agencyId, creatorId: { in: creatorSet }, status: { in: [...CREATOR_WRITE_LANE_STATUSES, "COMPLETED"] } },
+    where: { agencyId, originKind: "AUTOMATION", creatorId: { in: creatorSet }, status: { in: [...CREATOR_WRITE_LANE_STATUSES, "COMPLETED"] } },
     _max: { claimedAt: true, finishedAt: true },
   });
   const lastTouch = new Map(touches.map((row) => [row.creatorId, Math.max(
@@ -693,6 +705,9 @@ async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRev
   const { device, member } = await requireOwnedSeniorDevice({ userId, deviceId, db });
   const delivery = await db.automationDelivery.findUnique({ where: { id: deliveryId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  if (delivery.originKind !== "AUTOMATION") {
+    throw new ActionDeliveryError("DELIVERY_WRONG_AUTHORITY", "Programmatic write deliveries must use ProgrammaticOfWriteAuthority", 403);
+  }
   if (delivery.agencyId !== device.agencyId) throw new ActionDeliveryError("DELIVERY_DEVICE_AGENCY_MISMATCH", "Delivery belongs to another agency", 403);
   const terminal = TERMINAL_STATUSES.includes(delivery.status);
   if (!(LEASED_STATUSES.includes(delivery.status) || (allowTerminal && terminal))) {
@@ -1033,6 +1048,7 @@ async function listActionDeliveries({ agencyId, creatorId, creatorIds = null, mo
   const search = clean(fan, 160);
   const where = {
     agencyId,
+    originKind: "AUTOMATION",
     ...(creatorId ? { creatorId } : Array.isArray(creatorIds) ? { creatorId: { in: creatorIds } } : {}),
     ...(moduleKey ? { moduleKey } : {}),
     ...(actionType ? { actionType } : {}),
@@ -1061,7 +1077,7 @@ async function listActionDeliveries({ agencyId, creatorId, creatorIds = null, mo
 }
 
 async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
-  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
+  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
   if (!["FAILED", "SKIPPED", "CANCELED", "PAUSED"].includes(delivery.status)) {
@@ -1089,7 +1105,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
       const latest = await prisma.$transaction(async (tx) => {
         await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
         const changed = await tx.automationDelivery.updateMany({
-          where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
+          where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
           data: {
             status: "COMPLETED",
             failureCode: null,
@@ -1129,7 +1145,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
   const updated = await prisma.$transaction(async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
-      where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
+      where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
       data: {
         status: "QUEUED",
         attempts: 0,
@@ -1161,7 +1177,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
 }
 
 async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason = "manual_cancel" }) {
-  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
+  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
   if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
@@ -1181,7 +1197,7 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
   const updated = await prisma.$transaction(async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
-      where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
+      where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
       data: {
         status: "CANCELED",
         failureCode: "canceled",
@@ -1215,7 +1231,7 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
 }
 
 async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId }) {
-  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
+  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
   if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before administrative release");
@@ -1223,7 +1239,7 @@ async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId }) {
   const updated = await prisma.$transaction(async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
-      where: { id: delivery.id, status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
+      where: { id: delivery.id, originKind: "AUTOMATION", status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
       data: { status: "QUEUED", notBefore: new Date(Date.now() + 15_000), claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, attempts: { decrement: 1 }, lastError: "Claim released by administrator" },
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before administrative release");
@@ -1248,7 +1264,7 @@ async function retrySafeFailures({ agencyId, actorUserId, creatorId = null, modu
       ? {}
       : { creatorId: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } };
   const rows = await prisma.automationDelivery.findMany({
-    where: { agencyId, status: "FAILED", failureCategory: { in: SAFE_RETRY_CATEGORIES }, ...creatorFilter, ...(moduleKey ? { moduleKey } : {}) },
+    where: { agencyId, originKind: "AUTOMATION", status: "FAILED", failureCategory: { in: SAFE_RETRY_CATEGORIES }, ...creatorFilter, ...(moduleKey ? { moduleKey } : {}) },
     orderBy: { updatedAt: "asc" }, take: Math.max(1, Math.min(500, Number(limit) || 100)), select: { id: true },
   });
   const results = [];
@@ -1265,6 +1281,7 @@ module.exports = {
   CLAIMABLE_STATUSES,
   PRECOMMIT_EXECUTABLE_STATUSES,
   TERMINAL_STATUSES,
+  sweepExpiredAutomationLeases,
   sweepExpiredActionLeases,
   claimActionDelivery,
   renewActionLease,
@@ -1279,5 +1296,5 @@ module.exports = {
   retrySafeFailures,
   cancelActionDelivery,
   releaseClaimByAdmin,
-  __test: { requireLiveAutomationManagementActor },
+  __test: { requireLiveAutomationManagementActor, requireLease },
 };

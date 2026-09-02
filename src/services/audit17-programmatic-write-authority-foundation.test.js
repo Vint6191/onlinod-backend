@@ -46,6 +46,10 @@ function makeDb() {
         if (candidate[key] === expected.not) return false;
         continue;
       }
+      if (expected && typeof expected === "object" && Array.isArray(expected.in)) {
+        if (!expected.in.includes(candidate[key])) return false;
+        continue;
+      }
       if (candidate[key] !== expected) return false;
     }
     return true;
@@ -66,6 +70,7 @@ function makeDb() {
         ? { id: where.id, agencyId: "agency-a", userId: "user-a" }
         : null,
     },
+    auditLog: { create: async ({ data }) => data },
     automationDelivery: {
       findUnique: async ({ where }) => {
         if (!row) return null;
@@ -74,6 +79,7 @@ function makeDb() {
         return null;
       },
       findFirst: async ({ where }) => matches(where, row) ? row : null,
+      findMany: async ({ where }) => matches(where, row) ? [row] : [],
       create: async ({ data }) => {
         if (row && row.idempotencyKey === data.idempotencyKey) {
           const e = new Error("unique"); e.code = "P2002"; throw e;
@@ -102,6 +108,7 @@ function makeDb() {
 async function withAuthority(run) {
   const fx = makeDb();
   const permissions = [];
+  const access = { enabled: true };
   const restores = [];
   try {
     restores.push(cacheModule("../prisma", fx.db));
@@ -110,10 +117,15 @@ async function withAuthority(run) {
     }));
     restores.push(cacheModule("./execution-access-fence-service", {
       ExecutionAccessFenceError: class ExecutionAccessFenceError extends Error {},
-      assertExecutionAccessFence: async ({ agencyId, userId, memberId, accessEpoch, creatorId }) => ({
-        member: { id: memberId, agencyId, userId, accessEpoch, assignedCreators: [creatorId] },
-        accessEpoch,
-      }),
+      assertExecutionAccessFence: async ({ agencyId, userId, memberId, accessEpoch, creatorId }) => {
+        if (!access.enabled) {
+          const error = new Error("creator access revoked");
+          error.code = "CREATOR_ACCESS_FORBIDDEN";
+          error.status = 403;
+          throw error;
+        }
+        return { member: { id: memberId, agencyId, userId, accessEpoch, assignedCreators: [creatorId] }, accessEpoch };
+      },
     }));
     restores.push(cacheModule("./automation-write-commit-fence-service", { lockAutomationWriteCommitFence: async () => ({ ok: true }) }));
     restores.push(cacheModule("./automation-failure-taxonomy", {
@@ -131,7 +143,7 @@ async function withAuthority(run) {
       },
     }));
     const authority = fresh("./programmatic-of-write-authority-service");
-    await run({ ...fx, permissions, authority });
+    await run({ ...fx, permissions, access, authority });
   } finally {
     delete require.cache[require.resolve("./programmatic-of-write-authority-service")];
     for (const restore of restores.reverse()) restore();
@@ -322,13 +334,13 @@ test("Audit17 prewrite checkpoint is durable before COMMITTING and cannot be rew
       writeId: reserved.delivery.id,
       leaseToken: lease.token,
       leaseRevision: lease.revision,
-      result: { relayPreflight: { anchorMessageId: "100", recipientId: "200" } },
+      result: { massPreflight: { queueIds: ["100"], observedAt: "now" } },
     });
     assert.equal(checkpointed.delivery.status, "RUNNING");
-    assert.equal(getRow().result.relayPreflight.anchorMessageId, "100");
+    assert.deepEqual(getRow().result.massPreflight.queueIds, ["100"]);
     await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
     await assert.rejects(
-      () => authority.checkpointProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision, result: { relayPreflight: { anchorMessageId: "evil" } } }),
+      () => authority.checkpointProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision, result: { massPreflight: { queueIds: ["evil"] } } }),
       (error) => error?.code === "PROGRAMMATIC_WRITE_CHECKPOINT_FORBIDDEN",
     );
   });
@@ -393,8 +405,21 @@ test("Audit17 COMMITTING HTTP failure cannot be downgraded by client provenNoEff
     });
     assert.equal(failed.reconciliationRequired, true);
     assert.equal(failed.delivery.status, "RECONCILE_REQUIRED");
+    assert.ok(failed.lease?.token);
+    assert.equal(failed.lease?.revision, getRow().leaseRevision);
     assert.equal(getRow().result.provenNoEffect, false);
     assert.equal(getRow().result.clientClaimedProvenNoEffect, true);
+    await assert.rejects(
+      () => authority.reserveProgrammaticWrite({ ...base, deviceId: "device-b" }),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_LEASE_BUSY",
+    );
+    const waited = await authority.reconcileProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision,
+      outcome: "WAIT_FOR_READBACK", result: { successfulReadback: true },
+    });
+    assert.equal(waited.reconciliationRequired, true);
+    assert.ok(waited.lease?.until);
+    assert.equal(getRow().status, "RECONCILE_REQUIRED");
   });
 });
 
@@ -437,3 +462,159 @@ test("Audit17 pre-COMMITTING product routes retain creator, device, permission a
   assert.match(service, /claimedByDeviceId/);
 });
 
+
+
+test("Audit17 unresolved reconciliation may close terminally without reopening the logical commit", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    const lease = reserved.lease;
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
+    const failed = await authority.failProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision,
+      failureCode: "WRITE_OUTCOME_AMBIGUOUS", facts: { endpointSemantics: "NON_IDEMPOTENT_WRITE", writeReachedWire: true },
+    });
+    const closed = await authority.closeProgrammaticWriteUnresolved({
+      ...base, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision, reason: "manual support close",
+    });
+    assert.equal(closed.delivery.status, "FAILED");
+    assert.equal(getRow().failureCode, "outcome_unresolved_do_not_retry");
+    assert.equal(getRow().result.outcomeState, "UNRESOLVED_DO_NOT_RETRY");
+    assert.equal(getRow().idempotencyKey, base.idempotencyKey);
+    const replay = await authority.reserveProgrammaticWrite(base);
+    assert.equal(replay.replay, true);
+    assert.equal(replay.lease, null);
+    assert.equal(replay.delivery.status, "FAILED");
+  });
+});
+
+
+test("Audit17 reconciliation lease is exclusive, renewed by WAIT, and an expired token cannot keep reconciling", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    const failed = await authority.failProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision,
+      failureCode: "temporary_of_error", facts: { endpointSemantics: "NON_IDEMPOTENT_WRITE", writeReachedWire: true, httpStatus: 500 },
+    });
+    assert.equal(failed.reconciliationRequired, true);
+    assert.ok(failed.lease?.token);
+    await assert.rejects(() => authority.reserveProgrammaticWrite(base), (error) => error?.code === "PROGRAMMATIC_WRITE_LEASE_BUSY");
+
+    const before = failed.lease.until.getTime();
+    const waited = await authority.reconcileProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision,
+      outcome: "WAIT_FOR_READBACK", result: { successfulReadback: true },
+    });
+    assert.equal(waited.reconciliationRequired, true);
+    assert.ok(waited.lease.until.getTime() >= before);
+
+    getRow().claimUntil = new Date(Date.now() - 1_000);
+    await assert.rejects(
+      () => authority.reconcileProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision, outcome: "WAIT_FOR_READBACK", result: {} }),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_LEASE_EXPIRED",
+    );
+    const takeover = await authority.reserveProgrammaticWrite({ ...base, deviceId: "device-b" });
+    assert.equal(takeover.reconciliationRequired, true);
+    assert.equal(takeover.delivery.status, "RECONCILE_REQUIRED");
+    assert.equal(takeover.delivery.leaseRevision > failed.lease.revision, true);
+  });
+});
+
+test("Audit17 client failure/checkpoint JSON cannot overwrite server-owned authority fields", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    await authority.checkpointProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision,
+      result: { massPreflight: { ids: ["q0"] }, programmaticWriteKind: "VAULT_CREATE_LIST", outcomeState: "PROVEN_SUCCESS", reservedAt: "fake" },
+    });
+    assert.equal(getRow().result.programmaticWriteKind, "MASS_QUEUE_CREATE");
+    assert.notEqual(getRow().result.outcomeState, "PROVEN_SUCCESS");
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    await authority.failProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision,
+      failureCode: "temporary_of_error",
+      facts: { endpointSemantics: "NON_IDEMPOTENT_WRITE", writeReachedWire: true, programmaticWriteKind: "EVIL", outcomeState: "PROVEN_SUCCESS", reservedAt: "evil", httpStatus: 500 },
+    });
+    assert.equal(getRow().result.programmaticWriteKind, "MASS_QUEUE_CREATE");
+    assert.equal(getRow().result.outcomeState, "RECONCILE_REQUIRED");
+    assert.equal(getRow().result.reservedAt === "evil", false);
+    assert.equal(getRow().result.failureEvidence.httpStatus, 500);
+  });
+});
+
+test("Audit17 terminal duplicate complete does not disclose durable result after creator access revoke", async () => {
+  await withAuthority(async ({ authority, access }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    const completed = await authority.completeProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, result: { queueId: "queue-secret" }, messageId: "must-not-be-queue" });
+    assert.equal(completed.delivery.result.queueId, "queue-secret");
+    assert.equal(completed.delivery.messageId, null);
+    access.enabled = false;
+    await assert.rejects(
+      () => authority.completeProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: "stale-terminal", leaseRevision: reserved.lease.revision, result: {} }),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_TERMINAL_RESULT_FORBIDDEN" && error?.status === 403,
+    );
+  });
+});
+
+test("Audit17 custom unresolved close stays behind the Custom product adapter", () => {
+  const genericRoute = read("routes/programmatic-of-writes.js");
+  const customRoute = read("routes/custom-orders.js");
+  const customService = read("services/custom-content-submissions-service.js");
+  assert.match(genericRoute, /close-unresolved[\s\S]{0,700}publicKindAccess/);
+  assert.match(customRoute, /submissions\/:submissionId\/relay-write\/close-unresolved/);
+  assert.match(customService, /expectedIdempotencyKey:\s*`custom-relay:\$\{id\}:\$\{index\}`/);
+});
+
+test("Audit17 shared lease sweeper dispatches programmatic rows to programmatic policy and automation rows to automation policy", () => {
+  const automationService = read("services/automation-action-delivery-service.js");
+  const programmaticService = read("services/programmatic-of-write-authority-service.js");
+  assert.match(automationService, /sweepExpiredProgrammaticWriteLeases\(\{ now \}\)/);
+  assert.match(automationService, /async function sweepExpiredAutomationLeases/);
+  assert.match(automationService, /where:\s*\{\s*originKind:\s*"AUTOMATION",\s*status:/);
+  assert.match(programmaticService, /sweepExpiredAutomationLeases\(now\)/);
+  assert.match(programmaticService, /originKind:\s*\{\s*not:\s*"AUTOMATION"\s*\}/);
+  assert.match(programmaticService, /CLAIMED[\s\S]*RUNNING[\s\S]*COMMITTING[\s\S]*RECONCILE_REQUIRED/);
+});
+
+test("Audit17 bounded WAIT closes permanently unresolved without retry, and manual match can later recover typed remote identity", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    const failed = await authority.failProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision,
+      failureCode: "write_outcome_unknown", facts: { endpointSemantics: "NON_IDEMPOTENT_WRITE", writeReachedWire: true },
+    });
+    getRow().result.reconciliationStartedAt = new Date(Date.now() - 31 * 60_000).toISOString();
+    const closed = await authority.reconcileProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision,
+      outcome: "WAIT_FOR_READBACK", result: { successfulReadback: true },
+    });
+    assert.equal(closed.unresolved, true);
+    assert.equal(closed.delivery.status, "FAILED");
+    assert.equal(closed.delivery.failureCode, "outcome_unresolved_do_not_retry");
+    assert.equal(closed.delivery.result.outcomeState, "UNRESOLVED_DO_NOT_RETRY");
+    assert.equal(getRow().leaseTokenHash, null);
+
+    const replay = await authority.reserveProgrammaticWrite(base);
+    assert.equal(replay.lease, null);
+    assert.equal(replay.delivery.id, reserved.delivery.id);
+    assert.equal(replay.delivery.status, "FAILED");
+
+    const matched = await authority.resolveProgrammaticWriteUnresolvedMatched({
+      ...base, writeId: reserved.delivery.id, result: { queueId: "queue-manual-1", outcomeState: "EVIL", programmaticWriteKind: "EVIL" },
+    });
+    assert.equal(matched.delivery.status, "COMPLETED");
+    assert.equal(matched.delivery.result.queueId, "queue-manual-1");
+    assert.equal(matched.delivery.result.programmaticWriteKind, "MASS_QUEUE_CREATE");
+    assert.equal(matched.delivery.messageId, null);
+    const finalReplay = await authority.reserveProgrammaticWrite(base);
+    assert.equal(finalReplay.delivery.status, "COMPLETED");
+    assert.equal(finalReplay.delivery.id, reserved.delivery.id);
+  });
+});

@@ -183,6 +183,7 @@ test("Closure4 prepareWriteActionDelivery reaches COMMITTING through executeRaw 
     id: "delivery-1",
     agencyId: "agency-1",
     creatorId: "creator-1",
+    originKind: "AUTOMATION",
     moduleKey: "other",
     actionType: "SEND_MESSAGE",
     targetId: "fan-1",

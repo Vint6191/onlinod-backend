@@ -7,11 +7,12 @@ const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./exe
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { classifyAutomationFailure, FAILURE_CATEGORIES } = require("./automation-failure-taxonomy");
 
-const ACTIVE_LEASE_STATUSES = new Set(["CLAIMED", "RUNNING", "COMMITTING"]);
+const ACTIVE_LEASE_STATUSES = new Set(["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"]);
 const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "SKIPPED", "CANCELED"]);
 const DEFAULT_LEASE_MS = 3 * 60_000;
 const MIN_LEASE_MS = 30_000;
 const MAX_LEASE_MS = 10 * 60_000;
+const MAX_RECONCILIATION_WAIT_MS = 30 * 60_000;
 
 const PRODUCT_WRITE_KINDS = Object.freeze({
   MASS_QUEUE_CREATE: Object.freeze({
@@ -74,6 +75,10 @@ function leaseDuration(value) {
   if (!Number.isFinite(parsed)) return DEFAULT_LEASE_MS;
   return Math.max(MIN_LEASE_MS, Math.min(MAX_LEASE_MS, Math.floor(parsed)));
 }
+function mintLease(now = new Date(), leaseMs = DEFAULT_LEASE_MS) {
+  const token = crypto.randomBytes(32).toString("base64url");
+  return { token, hash: hashToken(token), until: new Date(now.getTime() + leaseDuration(leaseMs)) };
+}
 function productKind(value) {
   const key = clean(value, 80)?.toUpperCase();
   const config = key ? PRODUCT_WRITE_KINDS[key] : null;
@@ -135,6 +140,62 @@ async function assertDevice({ db, agencyId, userId, deviceId }) {
   return device;
 }
 
+
+const CLIENT_RESULT_FIELDS = Object.freeze({
+  MASS_QUEUE_CREATE: Object.freeze({ checkpoint: ["massPreflight"], complete: ["queueId", "dispatchId", "audienceCount", "audienceHash", "contentHash"], reconcile: ["queueId", "dispatchId", "audienceCount", "audienceHash", "contentHash", "massQueueProofKind", "candidates", "successfulReadback", "negativeObservationIsNotProof"] }),
+  VAULT_CREATE_LIST: Object.freeze({ checkpoint: ["vaultListPreflight"], complete: ["list", "folderId", "vaultListPreflight", "clientRequestId"], reconcile: ["list", "folderId", "vaultListPreflight", "clientRequestId", "vaultListProofKind", "vaultListReason", "vaultListCandidateIds", "vaultListNewIds", "reconciliationEvidenceInsufficient", "negativeObservationIsNotProof"] }),
+  VAULT_RELAY_SEND: Object.freeze({ checkpoint: ["relayPreflight"], complete: ["mediaId", "mediaType", "mediaIsReady", "messageId", "relayPreflight"], reconcile: ["mediaId", "mediaType", "mediaIsReady", "messageId", "relayPreflight", "relayReconcileReason", "relayReadbackError", "relayReadbackCovered", "relayCandidateCount", "relayUncertainCandidateCount", "relayApproximateMatchIsNotProof", "negativeObservationIsNotProof"] }),
+  CUSTOM_RELAY_SEND: Object.freeze({ checkpoint: ["relayPreflight"], complete: ["mediaId", "mediaType", "mediaIsReady", "messageId", "relayPreflight"], reconcile: ["mediaId", "mediaType", "mediaIsReady", "messageId", "relayPreflight", "relayReconcileReason", "relayReadbackError", "relayReadbackCovered", "relayCandidateCount", "relayUncertainCandidateCount", "relayApproximateMatchIsNotProof", "negativeObservationIsNotProof"] }),
+});
+function storedProgrammaticKind(delivery) { return clean(object(delivery?.result).programmaticWriteKind, 80)?.toUpperCase() || null; }
+function sanitizeClientResult(delivery, value, phase) {
+  const source = object(value);
+  const kind = storedProgrammaticKind(delivery);
+  const allowed = new Set(CLIENT_RESULT_FIELDS[kind]?.[phase] || []);
+  return Object.fromEntries(Object.entries(source).filter(([key]) => allowed.has(key)));
+}
+
+async function sweepExpiredProgrammaticWriteLeases({ db = prisma, agencyId, creatorId = null, now = new Date() } = {}) {
+  const rows = await db.automationDelivery.findMany({
+    where: {
+      ...(agencyId ? { agencyId } : {}),
+      originKind: { not: "AUTOMATION" },
+      ...(creatorId ? { creatorId } : {}),
+      status: { in: ["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] },
+      claimUntil: { lte: now },
+    },
+    select: { id: true, status: true, leaseRevision: true, result: true, writeCommitRevision: true },
+    take: 10000,
+  });
+  let changed = 0;
+  for (const row of rows) {
+    const precommit = row.status === "CLAIMED" || row.status === "RUNNING";
+    const committing = row.status === "COMMITTING";
+    const nextStatus = precommit ? "RETRY_SCHEDULED" : "RECONCILE_REQUIRED";
+    const data = {
+      status: nextStatus,
+      claimedByDeviceId: null,
+      claimedAt: null,
+      claimUntil: null,
+      leaseTokenHash: null,
+      leaseRevision: { increment: 1 },
+      lastCheckedAt: now,
+      ...(precommit ? {
+        failureCode: "programmatic_precommit_lease_expired",
+        failureCategory: FAILURE_CATEGORIES.DEFINITE_NO_WRITE_RETRYABLE,
+        result: { ...object(row.result), outcomeState: "PROVEN_NO_EFFECT", leaseExpiredAt: now.toISOString() },
+      } : {
+        failureCode: row.failureCode || "write_outcome_unknown",
+        failureCategory: FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE,
+        result: { ...object(row.result), outcomeState: "RECONCILE_REQUIRED", reconciliationStartedAt: object(row.result).reconciliationStartedAt || row.writeCommitAt?.toISOString?.() || now.toISOString(), reconciliationLeaseExpiredAt: now.toISOString() },
+      }),
+    };
+    const result = await db.automationDelivery.updateMany({ where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision, claimUntil: { lte: now } }, data });
+    changed += result.count;
+  }
+  return changed;
+}
+
 async function reserveProgrammaticWrite(input) {
   const { key: kind, config } = productKind(input.kind);
   const agencyId = clean(input.agencyId, 180);
@@ -154,6 +215,13 @@ async function reserveProgrammaticWrite(input) {
   return prisma.$transaction(async (tx) => {
     await assertDevice({ db: tx, agencyId, userId, deviceId });
     await assertLiveActor({ db: tx, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: input.permissionKeyOverride === undefined ? config.permissionKey : input.permissionKeyOverride });
+    // The creator write lane is global across origins. Before a programmatic
+    // reserve tries to acquire it, clear expired Automation precommit leases
+    // with Automation semantics, then clear/transition expired programmatic
+    // leases with programmatic semantics. Neither policy may process the other.
+    const { sweepExpiredAutomationLeases } = require("./automation-action-delivery-service");
+    await sweepExpiredAutomationLeases(now);
+    await sweepExpiredProgrammaticWriteLeases({ db: tx, agencyId, creatorId, now });
     let delivery = await tx.automationDelivery.findUnique({ where: { idempotencyKey } });
     const replay = Boolean(delivery);
     if (delivery) {
@@ -179,13 +247,16 @@ async function reserveProgrammaticWrite(input) {
             status: "RECONCILE_REQUIRED",
             failureCode: delivery.failureCode || "write_outcome_unknown",
             failureCategory: FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE,
-            result: { ...object(delivery.result), outcomeState: "RECONCILE_REQUIRED", recoveredAfterCommitLeaseExpiredAt: now.toISOString() },
+            result: { ...object(delivery.result), outcomeState: "RECONCILE_REQUIRED", reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString(), recoveredAfterCommitLeaseExpiredAt: now.toISOString() },
           },
         });
         if (!transitioned.count) {
           throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_COMMIT_IN_FLIGHT", "Programmatic write commit lease changed while recovery was attempted", 409);
         }
         delivery = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+      }
+      if (delivery.status === "RECONCILE_REQUIRED" && delivery.claimUntil && delivery.claimUntil > now) {
+        throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_LEASE_BUSY", "Programmatic write reconciliation is currently owned by another active lease", 409);
       }
       if (ACTIVE_LEASE_STATUSES.has(delivery.status) && delivery.claimUntil && delivery.claimUntil > now && delivery.claimedByDeviceId !== deviceId) {
         throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_LEASE_BUSY", "Programmatic write is currently leased by another device", 409);
@@ -196,8 +267,9 @@ async function reserveProgrammaticWrite(input) {
       }
     }
 
-    const leaseToken = crypto.randomBytes(32).toString("base64url");
-    const claimUntil = new Date(now.getTime() + leaseMs);
+    const minted = mintLease(now, leaseMs);
+    const leaseToken = minted.token;
+    const claimUntil = minted.until;
     if (!delivery) {
       try {
         delivery = await tx.automationDelivery.create({
@@ -307,7 +379,7 @@ async function requireProgrammaticLease(input, { db = prisma, allowTerminal = fa
     throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_LEASE_STALE", "Programmatic write lease is stale", 409);
   }
   const committedSettlement = allowCommittedSettlement && delivery.status === "COMMITTING" && delivery.writeCommitAt;
-  if (!committedSettlement && delivery.status !== "RECONCILE_REQUIRED" && (!delivery.claimUntil || delivery.claimUntil <= new Date())) {
+  if (!committedSettlement && (!delivery.claimUntil || delivery.claimUntil <= new Date())) {
     throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_LEASE_EXPIRED", "Programmatic write lease expired", 409);
   }
   if (!committedSettlement) {
@@ -348,7 +420,7 @@ async function checkpointProgrammaticWrite(input) {
     if (!new Set(["CLAIMED", "RUNNING", "RECONCILE_REQUIRED"]).has(delivery.status)) {
       throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_CHECKPOINT_FORBIDDEN", `Programmatic write status is ${delivery.status}`, 409);
     }
-    const patch = object(input.result);
+    const patch = sanitizeClientResult(delivery, object(input.result), "checkpoint");
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, claimedByDeviceId: input.deviceId },
       data: { result: { ...object(delivery.result), ...patch, checkpointedAt: new Date().toISOString() }, lastCheckedAt: new Date() },
@@ -385,13 +457,44 @@ async function prepareProgrammaticWrite(input) {
   }, { timeout: 30_000 });
 }
 
+async function canRevealTerminalProgrammaticResult(input, delivery, db) {
+  const storedKind = storedProgrammaticKind(delivery);
+  const { config } = productKind(storedKind);
+  // SYSTEM/custom writes have product-specific adapters and intentionally do not
+  // expose durable terminal result through the generic authority endpoint.
+  if (!config.permissionKey) return false;
+  try {
+    await assertLiveActor({
+      db,
+      agencyId: delivery.agencyId,
+      userId: input.userId,
+      memberId: input.memberId,
+      accessEpoch: input.accessEpoch,
+      creatorId: delivery.creatorId,
+      permissionKey: config.permissionKey,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function completeProgrammaticWrite(input) {
   return prisma.$transaction(async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, allowTerminal: true, allowCommittedSettlement: true, lock: true });
-    if (TERMINAL_STATUSES.has(delivery.status)) return { ok: true, duplicate: true, delivery: publicDelivery(delivery) };
+    if (TERMINAL_STATUSES.has(delivery.status)) {
+      if (await canRevealTerminalProgrammaticResult(input, delivery, tx)) {
+        return { ok: true, duplicate: true, terminal: true, delivery: publicDelivery(delivery) };
+      }
+      throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_TERMINAL_RESULT_FORBIDDEN", "Current creator access and product permission are required to replay a terminal programmatic-write result", 403);
+    }
     if (delivery.status !== "COMMITTING") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_COMMITTING", `Programmatic write status is ${delivery.status}`, 409);
     const now = new Date();
-    const result = object(input.result);
+    const result = sanitizeClientResult(delivery, object(input.result), "complete");
+    const kind = storedProgrammaticKind(delivery);
+    const actualMessageId = new Set(["VAULT_RELAY_SEND", "CUSTOM_RELAY_SEND"]).has(kind)
+      ? clean(result.messageId || input.messageId, 180)
+      : null;
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "COMMITTING", claimedByDeviceId: input.deviceId, leaseRevision: delivery.leaseRevision, writeCommitRevision: delivery.writeCommitRevision },
       data: {
@@ -399,7 +502,7 @@ async function completeProgrammaticWrite(input) {
         failureCode: null,
         failureCategory: null,
         lastError: null,
-        messageId: clean(input.messageId || result.messageId || result.queueId || result.folderId, 180),
+        messageId: actualMessageId,
         result: { ...object(delivery.result), ...result, outcomeState: "PROVEN_SUCCESS", completedAt: now.toISOString() },
         finishedAt: now,
         claimUntil: null,
@@ -439,6 +542,7 @@ async function failProgrammaticWrite(input) {
     });
     const reconcile = !provenNoEffect && reachedWire && !idempotent;
     const now = new Date();
+    const reconciliationLease = reconcile ? mintLease(now, DEFAULT_LEASE_MS) : null;
     const nextStatus = reconcile ? "RECONCILE_REQUIRED" : (category === FAILURE_CATEGORIES.TERMINAL ? "FAILED" : "RETRY_SCHEDULED");
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, claimedByDeviceId: input.deviceId },
@@ -449,21 +553,35 @@ async function failProgrammaticWrite(input) {
         lastError: clean(input.error, 2000),
         notBefore: nextStatus === "RETRY_SCHEDULED" ? new Date(now.getTime() + Math.max(5_000, Math.min(60 * 60_000, Number(input.retryAfterMs) || 30_000))) : delivery.notBefore,
         finishedAt: nextStatus === "FAILED" ? now : null,
-        claimUntil: null,
-        leaseTokenHash: null,
+        claimUntil: reconciliationLease ? reconciliationLease.until : null,
+        leaseTokenHash: reconciliationLease ? reconciliationLease.hash : null,
+        leaseRevision: reconcile ? { increment: 1 } : undefined,
         lastCheckedAt: now,
         result: {
           ...object(delivery.result),
-          ...facts,
+          failureEvidence: {
+            endpointSemantics,
+            writeReachedWire: reachedWire,
+            httpStatus: Number.isFinite(Number(facts.httpStatus)) ? Number(facts.httpStatus) : null,
+            transportCode: clean(facts.transportCode || facts.originalCode, 160),
+            reconciliationEvidence: object(facts.reconciliationEvidence),
+          },
           ...(clientClaimedNoEffect && !provenNoEffect ? { clientClaimedProvenNoEffect: true } : {}),
           provenNoEffect,
           outcomeState: reconcile ? "RECONCILE_REQUIRED" : (provenNoEffect ? "PROVEN_NO_EFFECT" : "TERMINAL"),
+          ...(reconcile ? { reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString() } : {}),
           failedAt: now.toISOString(),
         },
       },
     });
     if (!changed.count) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_FAIL_RACE", "Programmatic write changed before failure settlement", 409);
-    return { ok: true, reconciliationRequired: reconcile, delivery: publicDelivery(await tx.automationDelivery.findUnique({ where: { id: delivery.id } })) };
+    const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    return {
+      ok: true,
+      reconciliationRequired: reconcile,
+      lease: reconciliationLease ? { token: reconciliationLease.token, revision: current.leaseRevision, until: reconciliationLease.until } : null,
+      delivery: publicDelivery(current),
+    };
   }, { timeout: 30_000 });
 }
 
@@ -484,10 +602,46 @@ async function reconcileProgrammaticWrite(input) {
       throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NO_EFFECT_PROOF_REQUIRED", "This write kind has no authoritative negative-proof contract; keep reconciling instead of retrying", 409);
     }
     if (outcome === "WAIT_FOR_READBACK") {
-      return { ok: true, reconciliationRequired: true, delivery: publicDelivery(delivery) };
+      const now = new Date();
+      const storedResult = object(delivery.result);
+      const startedAt = new Date(storedResult.reconciliationStartedAt || delivery.writeCommitAt || now);
+      if (Number.isFinite(startedAt.getTime()) && now.getTime() - startedAt.getTime() >= MAX_RECONCILIATION_WAIT_MS) {
+        const closed = await tx.automationDelivery.updateMany({
+          where: { id: delivery.id, status: "RECONCILE_REQUIRED", leaseRevision: delivery.leaseRevision, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken) },
+          data: {
+            status: "FAILED", failureCode: "outcome_unresolved_do_not_retry", failureCategory: FAILURE_CATEGORIES.TERMINAL,
+            lastError: "Reconciliation evidence remained insufficient beyond the bounded verification window; logical commit closed permanently without retry",
+            result: { ...storedResult, ...sanitizeClientResult(delivery, object(input.result), "reconcile"), outcomeState: "UNRESOLVED_DO_NOT_RETRY", unresolvedClosedAt: now.toISOString(), unresolvedCloseReason: "RECONCILIATION_WINDOW_EXPIRED" },
+            finishedAt: now, claimUntil: null, leaseTokenHash: null, lastCheckedAt: now,
+          },
+        });
+        if (!closed.count) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_RECONCILE_RACE", "Programmatic write changed while closing unresolved reconciliation", 409);
+        if (tx.auditLog?.create) await tx.auditLog.create({ data: {
+          agencyId: delivery.agencyId, actorUserId: input.userId || null, action: "programmatic_write.auto_close_unresolved_do_not_retry",
+          targetType: "AutomationDelivery", targetId: delivery.id, metadata: { creatorId: delivery.creatorId, actionType: delivery.actionType, originKind: delivery.originKind, idempotencyKey: delivery.idempotencyKey },
+        } });
+        return { ok: true, reconciliationRequired: false, unresolved: true, lease: null, delivery: publicDelivery(await tx.automationDelivery.findUnique({ where: { id: delivery.id } })) };
+      }
+      const renewedUntil = new Date(now.getTime() + DEFAULT_LEASE_MS);
+      const renewed = await tx.automationDelivery.updateMany({
+        where: { id: delivery.id, status: "RECONCILE_REQUIRED", leaseRevision: delivery.leaseRevision, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken) },
+        data: {
+          claimUntil: renewedUntil,
+          lastCheckedAt: now,
+          result: { ...object(delivery.result), ...sanitizeClientResult(delivery, object(input.result), "reconcile"), outcomeState: "RECONCILE_REQUIRED", lastReadbackAt: now.toISOString() },
+        },
+      });
+      if (!renewed.count) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_RECONCILE_RACE", "Programmatic write changed while renewing reconciliation lease", 409);
+      const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+      return {
+        ok: true,
+        reconciliationRequired: true,
+        lease: { token: input.leaseToken, revision: current.leaseRevision, until: renewedUntil },
+        delivery: publicDelivery(current),
+      };
     }
     const now = new Date();
-    const evidence = object(input.result);
+    const evidence = sanitizeClientResult(delivery, object(input.result), "reconcile");
     const complete = outcome === "MATCHED";
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "RECONCILE_REQUIRED", leaseRevision: delivery.leaseRevision, claimedByDeviceId: input.deviceId },
@@ -496,7 +650,7 @@ async function reconcileProgrammaticWrite(input) {
         failureCode: null,
         failureCategory: null,
         lastError: null,
-        messageId: clean(evidence.messageId || evidence.queueId || evidence.folderId, 180),
+        messageId: clean(evidence.messageId, 180),
         result: { ...object(delivery.result), ...evidence, outcomeState: "PROVEN_SUCCESS", reconciledAt: now.toISOString() },
         finishedAt: now,
         claimUntil: null,
@@ -526,6 +680,81 @@ async function reconcileProgrammaticWrite(input) {
   }, { timeout: 30_000 });
 }
 
+async function closeProgrammaticWriteUnresolved(input) {
+  return prisma.$transaction(async (tx) => {
+    const delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
+    if (delivery.status !== "RECONCILE_REQUIRED") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_RECONCILING", `Programmatic write status is ${delivery.status}`, 409);
+    if (input.expectedIdempotencyKey && delivery.idempotencyKey !== input.expectedIdempotencyKey) {
+      throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_IDEMPOTENCY_MISMATCH", "Programmatic write does not belong to the requested product operation", 409);
+    }
+    const now = new Date();
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: "RECONCILE_REQUIRED", leaseRevision: delivery.leaseRevision, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken) },
+      data: {
+        status: "FAILED",
+        failureCode: "outcome_unresolved_do_not_retry",
+        failureCategory: FAILURE_CATEGORIES.TERMINAL,
+        lastError: clean(input.reason, 1000) || "Remote outcome could not be proven; logical commit closed permanently without retry",
+        result: { ...object(delivery.result), outcomeState: "UNRESOLVED_DO_NOT_RETRY", unresolvedClosedAt: now.toISOString() },
+        finishedAt: now,
+        claimUntil: null,
+        leaseTokenHash: null,
+        lastCheckedAt: now,
+      },
+    });
+    if (!changed.count) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_CLOSE_RACE", "Programmatic write changed before unresolved close", 409);
+    if (tx.auditLog?.create) {
+      await tx.auditLog.create({ data: {
+        agencyId: delivery.agencyId, actorUserId: input.userId || null,
+        action: "programmatic_write.close_unresolved_do_not_retry",
+        targetType: "AutomationDelivery", targetId: delivery.id,
+        metadata: { creatorId: delivery.creatorId, actionType: delivery.actionType, originKind: delivery.originKind, idempotencyKey: delivery.idempotencyKey },
+      } });
+    }
+    return { ok: true, unresolved: true, delivery: publicDelivery(await tx.automationDelivery.findUnique({ where: { id: delivery.id } })) };
+  }, { timeout: 30_000 });
+}
+
+async function resolveProgrammaticWriteUnresolvedMatched(input) {
+  return prisma.$transaction(async (tx) => {
+    const writeId = clean(input.writeId, 180);
+    const delivery = await tx.automationDelivery.findUnique({ where: { id: writeId || "__missing__" } });
+    if (!delivery || delivery.originKind === "AUTOMATION") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_FOUND", "Programmatic write not found", 404);
+    if (delivery.agencyId !== input.agencyId || delivery.creatorId !== String(input.creatorId || "")) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_CREATOR_MISMATCH", "Programmatic write belongs to another creator or agency", 403);
+    const storedKind = storedProgrammaticKind(delivery);
+    const { key: kind, config } = productKind(input.kind || storedKind);
+    if (storedKind !== kind || delivery.actionType !== config.actionType) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_KIND_MISMATCH", "Programmatic write kind does not match the durable operation", 409);
+    if (input.expectedIdempotencyKey && delivery.idempotencyKey !== input.expectedIdempotencyKey) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_IDEMPOTENCY_MISMATCH", "Programmatic write does not belong to the requested product operation", 409);
+    await assertDevice({ db: tx, agencyId: delivery.agencyId, userId: input.userId, deviceId: input.deviceId });
+    await assertLiveActor({ db: tx, agencyId: delivery.agencyId, userId: input.userId, memberId: input.memberId, accessEpoch: input.accessEpoch, creatorId: delivery.creatorId, permissionKey: input.permissionKey === undefined ? config.permissionKey : input.permissionKey });
+    if (delivery.status !== "FAILED" || delivery.failureCode !== "outcome_unresolved_do_not_retry") {
+      throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_UNRESOLVED", "Only a permanently unresolved no-retry operation may be manually matched", 409);
+    }
+    const evidence = sanitizeClientResult(delivery, object(input.result), "reconcile");
+    const valid = kind === "MASS_QUEUE_CREATE" ? Boolean(clean(evidence.queueId, 180))
+      : kind === "VAULT_CREATE_LIST" ? Boolean(clean(evidence.folderId || object(evidence.list).id, 180))
+      : Boolean(clean(evidence.mediaId, 180));
+    if (!valid) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_MANUAL_MATCH_EVIDENCE_REQUIRED", "A typed remote object identity is required to match the unresolved write", 400);
+    const now = new Date();
+    const actualMessageId = new Set(["VAULT_RELAY_SEND", "CUSTOM_RELAY_SEND"]).has(kind) ? clean(evidence.messageId, 180) : null;
+    const changed = await tx.automationDelivery.updateMany({
+      where: { id: delivery.id, status: "FAILED", failureCode: "outcome_unresolved_do_not_retry" },
+      data: {
+        status: "COMPLETED", failureCode: null, failureCategory: null, lastError: null,
+        messageId: actualMessageId,
+        result: { ...object(delivery.result), ...evidence, outcomeState: "PROVEN_SUCCESS", manualResolvedAt: now.toISOString(), manualResolutionKind: "MATCH_EXISTING_REMOTE_RESULT" },
+        finishedAt: now, lastCheckedAt: now,
+      },
+    });
+    if (!changed.count) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_MANUAL_RESOLVE_RACE", "Programmatic write changed before manual resolution", 409);
+    if (tx.auditLog?.create) await tx.auditLog.create({ data: {
+      agencyId: delivery.agencyId, actorUserId: input.userId || null, action: "programmatic_write.match_unresolved_remote_result",
+      targetType: "AutomationDelivery", targetId: delivery.id, metadata: { creatorId: delivery.creatorId, actionType: delivery.actionType, originKind: delivery.originKind, idempotencyKey: delivery.idempotencyKey },
+    } });
+    return { ok: true, matched: true, delivery: publicDelivery(await tx.automationDelivery.findUnique({ where: { id: delivery.id } })) };
+  }, { timeout: 30_000 });
+}
+
 async function getProgrammaticWrite({ agencyId, userId, memberId, accessEpoch, creatorId, writeId, db = prisma }) {
   const delivery = await db.automationDelivery.findFirst({ where: { id: writeId, agencyId, creatorId, originKind: { not: "AUTOMATION" } } });
   if (!delivery) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_FOUND", "Programmatic write not found", 404);
@@ -548,5 +777,8 @@ module.exports = {
   completeProgrammaticWrite,
   failProgrammaticWrite,
   reconcileProgrammaticWrite,
+  closeProgrammaticWriteUnresolved,
+  resolveProgrammaticWriteUnresolvedMatched,
+  sweepExpiredProgrammaticWriteLeases,
   getProgrammaticWrite,
 };

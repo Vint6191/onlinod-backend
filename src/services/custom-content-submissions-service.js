@@ -460,6 +460,59 @@ async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, devi
   return { ...authority, relayRecipient: recipient, submissionId: id, expectedIndex: index };
 }
 
+
+async function closeCustomContentSubmissionRelayWriteUnresolved({ agencyId, member, deviceId, submissionId, expectedIndex, writeId, leaseToken, leaseRevision, accessEpoch = null, reason = null, db = null } = {}) {
+  if (!agencyId || !member?.id || !member?.userId) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
+  const id = identifier(submissionId, "submissionId", { max: 180 });
+  const normalizedWriteId = identifier(writeId, "writeId", { max: 180 });
+  const index = Number(expectedIndex);
+  if (!Number.isInteger(index) || index < 0) throw fail("CUSTOM_SUBMISSION_UPLOAD_INDEX_INVALID", "expectedIndex must be a non-negative integer", 400);
+  const row = await client.customContentSubmission.findFirst({ where: { id, agencyId } });
+  if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  const { closeProgrammaticWriteUnresolved } = require("./programmatic-of-write-authority-service");
+  return closeProgrammaticWriteUnresolved({
+    agencyId,
+    userId: String(member.userId),
+    memberId: String(member.id),
+    accessEpoch: Number.isInteger(Number(accessEpoch)) ? Number(accessEpoch) : Number(member.accessEpoch || 0),
+    creatorId: String(row.creatorId),
+    deviceId: normalizedDeviceId,
+    writeId: normalizedWriteId,
+    leaseToken: identifier(leaseToken, "leaseToken", { max: 500 }),
+    leaseRevision: Number(leaseRevision),
+    kind: "CUSTOM_RELAY_SEND",
+    permissionKey: null,
+    reason,
+    expectedIdempotencyKey: `custom-relay:${id}:${index}`,
+  });
+}
+
+async function resolveCustomContentSubmissionRelayWriteMatched({ agencyId, member, deviceId, submissionId, expectedIndex, writeId, mediaId, messageId = null, accessEpoch = null, db = null } = {}) {
+  if (!agencyId || !member?.id || !member?.userId) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
+  const id = identifier(submissionId, "submissionId", { max: 180 });
+  const normalizedWriteId = identifier(writeId, "writeId", { max: 180 });
+  const normalizedMediaId = identifier(mediaId, "mediaId", { max: 180 });
+  const index = Number(expectedIndex);
+  if (!Number.isInteger(index) || index < 0) throw fail("CUSTOM_SUBMISSION_UPLOAD_INDEX_INVALID", "expectedIndex must be a non-negative integer", 400);
+  const row = await client.customContentSubmission.findFirst({ where: { id, agencyId } });
+  if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  const { resolveProgrammaticWriteUnresolvedMatched } = require("./programmatic-of-write-authority-service");
+  return resolveProgrammaticWriteUnresolvedMatched({
+    agencyId, userId: String(member.userId), memberId: String(member.id),
+    accessEpoch: Number.isInteger(Number(accessEpoch)) ? Number(accessEpoch) : Number(member.accessEpoch || 0),
+    creatorId: String(row.creatorId), deviceId: normalizedDeviceId, writeId: normalizedWriteId,
+    kind: "CUSTOM_RELAY_SEND", permissionKey: null,
+    result: { mediaId: normalizedMediaId, ...(messageId ? { messageId: identifier(messageId, "messageId", { max: 180 }) } : {}) },
+    expectedIdempotencyKey: `custom-relay:${id}:${index}`,
+  });
+}
+
 async function claimCustomContentSubmissionUploadWork({ agencyId, member, deviceId, leases, limit = 1, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
@@ -664,6 +717,8 @@ module.exports = {
   nextUploadIndex,
   pendingFinalizeRows,
   reserveCustomContentSubmissionRelayWrite,
+  closeCustomContentSubmissionRelayWriteUnresolved,
+  resolveCustomContentSubmissionRelayWriteMatched,
   sameMessageIds,
   serializeSubmission,
   telegramMessageIds,
