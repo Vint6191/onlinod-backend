@@ -162,19 +162,37 @@ async function reserveProgrammaticWrite(input) {
         return { ok: true, replay: true, lease: null, delivery: publicDelivery(delivery) };
       }
       if (delivery.status === "COMMITTING") {
+        // COMMITTING means a physical non-idempotent request may still be in-flight.
+        // Never invalidate a live commit lease merely because another caller repeats reserve.
+        // Recovery/takeover is allowed only after the commit lease is demonstrably expired.
+        if (!delivery.claimUntil || delivery.claimUntil > now) {
+          throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_COMMIT_IN_FLIGHT", "Programmatic write is still COMMITTING without a proven expired lease; reconciliation takeover is not allowed yet", 409);
+        }
         const transitioned = await tx.automationDelivery.updateMany({
-          where: { id: delivery.id, status: "COMMITTING", writeCommitRevision: delivery.writeCommitRevision },
+          where: {
+            id: delivery.id,
+            status: "COMMITTING",
+            writeCommitRevision: delivery.writeCommitRevision,
+            claimUntil: { lte: now },
+          },
           data: {
             status: "RECONCILE_REQUIRED",
             failureCode: delivery.failureCode || "write_outcome_unknown",
             failureCategory: FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE,
-            result: { ...object(delivery.result), outcomeState: "RECONCILE_REQUIRED", recoveredAfterCommitLossAt: now.toISOString() },
+            result: { ...object(delivery.result), outcomeState: "RECONCILE_REQUIRED", recoveredAfterCommitLeaseExpiredAt: now.toISOString() },
           },
         });
-        if (transitioned.count) delivery = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+        if (!transitioned.count) {
+          throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_COMMIT_IN_FLIGHT", "Programmatic write commit lease changed while recovery was attempted", 409);
+        }
+        delivery = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
       }
       if (ACTIVE_LEASE_STATUSES.has(delivery.status) && delivery.claimUntil && delivery.claimUntil > now && delivery.claimedByDeviceId !== deviceId) {
         throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_LEASE_BUSY", "Programmatic write is currently leased by another device", 409);
+      }
+      const reconciliation = delivery.status === "RECONCILE_REQUIRED";
+      if (config.executionKind === "SOURCE_DEVICE" && delivery.sourceDeviceId && delivery.sourceDeviceId !== deviceId && !reconciliation) {
+        throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_SOURCE_DEVICE_REQUIRED", "This write payload is bound to its original source device until a commit outcome requires reconciliation", 409);
       }
     }
 
@@ -398,10 +416,15 @@ async function failProgrammaticWrite(input) {
   return prisma.$transaction(async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, allowCommittedSettlement: true, lock: true });
     const facts = object(input.facts);
-    const provenNoEffect = facts.provenNoEffect === true;
     const reachedWire = facts.writeReachedWire === true || delivery.status === "COMMITTING";
     const endpointSemantics = clean(facts.endpointSemantics, 80)?.toUpperCase() || null;
     const idempotent = endpointSemantics === "IDEMPOTENT_WRITE";
+    // Client evidence may describe transport facts, but it cannot declare a
+    // non-idempotent COMMITTING write safe to repeat. Generic post-commit failures
+    // (including HTTP 4xx/5xx) remain unknown until a dedicated reconciler proves
+    // the remote result. Only a pre-wire failure can be authoritative no-effect here.
+    const clientClaimedNoEffect = facts.provenNoEffect === true;
+    const provenNoEffect = clientClaimedNoEffect && !reachedWire && delivery.status !== "COMMITTING";
     const failureCode = clean(input.failureCode, 120) || "unknown";
     const category = classifyAutomationFailure({
       failureCode,
@@ -429,7 +452,14 @@ async function failProgrammaticWrite(input) {
         claimUntil: null,
         leaseTokenHash: null,
         lastCheckedAt: now,
-        result: { ...object(delivery.result), ...facts, outcomeState: reconcile ? "RECONCILE_REQUIRED" : (provenNoEffect ? "PROVEN_NO_EFFECT" : "TERMINAL"), failedAt: now.toISOString() },
+        result: {
+          ...object(delivery.result),
+          ...facts,
+          ...(clientClaimedNoEffect && !provenNoEffect ? { clientClaimedProvenNoEffect: true } : {}),
+          provenNoEffect,
+          outcomeState: reconcile ? "RECONCILE_REQUIRED" : (provenNoEffect ? "PROVEN_NO_EFFECT" : "TERMINAL"),
+          failedAt: now.toISOString(),
+        },
       },
     });
     if (!changed.count) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_FAIL_RACE", "Programmatic write changed before failure settlement", 409);
@@ -446,6 +476,12 @@ async function reconcileProgrammaticWrite(input) {
     const outcome = clean(input.outcome, 80)?.toUpperCase();
     if (!new Set(["MATCHED", "PROVEN_NO_EFFECT", "WAIT_FOR_READBACK"]).has(outcome)) {
       throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_RECONCILE_OUTCOME_INVALID", "Reconciliation outcome is invalid", 400);
+    }
+    // None of the current product write kinds has a documented strong negative
+    // read-after-write contract. Absence from an eventual-consistency readback is
+    // therefore WAIT_FOR_READBACK, never proof that a second POST is safe.
+    if (outcome === "PROVEN_NO_EFFECT") {
+      throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NO_EFFECT_PROOF_REQUIRED", "This write kind has no authoritative negative-proof contract; keep reconciling instead of retrying", 409);
     }
     if (outcome === "WAIT_FOR_READBACK") {
       return { ok: true, reconciliationRequired: true, delivery: publicDelivery(delivery) };
@@ -491,9 +527,14 @@ async function reconcileProgrammaticWrite(input) {
 }
 
 async function getProgrammaticWrite({ agencyId, userId, memberId, accessEpoch, creatorId, writeId, db = prisma }) {
-  await assertLiveActor({ db, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: null });
   const delivery = await db.automationDelivery.findFirst({ where: { id: writeId, agencyId, creatorId, originKind: { not: "AUTOMATION" } } });
   if (!delivery) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_FOUND", "Programmatic write not found", 404);
+  const storedKind = clean(object(delivery.result).programmaticWriteKind, 80)?.toUpperCase();
+  const { config } = productKind(storedKind);
+  if (!config.permissionKey) {
+    throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_GET_FORBIDDEN", "This write kind must be read through its product-specific adapter", 403);
+  }
+  await assertLiveActor({ db, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: config.permissionKey });
   return { ok: true, delivery: publicDelivery(delivery) };
 }
 

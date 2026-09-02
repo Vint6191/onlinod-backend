@@ -32,8 +32,14 @@ function makeDb() {
   const matches = (where, candidate) => {
     if (!candidate) return false;
     for (const [key, expected] of Object.entries(where || {})) {
-      if (key === "claimUntil" && expected && typeof expected === "object" && expected.gt) {
-        if (!(candidate.claimUntil instanceof Date) || !(candidate.claimUntil > expected.gt)) return false;
+      if (key === "OR" && Array.isArray(expected)) {
+        if (!expected.some((branch) => matches(branch, candidate))) return false;
+        continue;
+      }
+      if (key === "claimUntil" && expected && typeof expected === "object") {
+        if (!(candidate.claimUntil instanceof Date)) return false;
+        if (expected.gt && !(candidate.claimUntil > expected.gt)) return false;
+        if (expected.lte && !(candidate.claimUntil <= expected.lte)) return false;
         continue;
       }
       if (expected && typeof expected === "object" && Object.hasOwn(expected, "not")) {
@@ -208,12 +214,21 @@ test("Audit17 prepare creates one durable COMMITTING permit and complete replay 
   });
 });
 
-test("Audit17 a recovered COMMITTING row becomes RECONCILE_REQUIRED and cannot receive a new commit permit", async () => {
-  await withAuthority(async ({ authority }) => {
+test("Audit17 active COMMITTING cannot be taken over; only an expired commit lease becomes RECONCILE_REQUIRED", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
     const reserved = await authority.reserveProgrammaticWrite(base);
     await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
     await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    const revision = getRow().leaseRevision;
 
+    await assert.rejects(
+      () => authority.reserveProgrammaticWrite(base),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_COMMIT_IN_FLIGHT",
+    );
+    assert.equal(getRow().status, "COMMITTING");
+    assert.equal(getRow().leaseRevision, revision);
+
+    getRow().claimUntil = new Date(Date.now() - 1_000);
     const recovered = await authority.reserveProgrammaticWrite(base);
     assert.equal(recovered.reconciliationRequired, true);
     assert.equal(recovered.delivery.status, "RECONCILE_REQUIRED");
@@ -254,6 +269,7 @@ test("Audit17 reconciliation MATCHED recovers remote success without another com
     const reserved = await authority.reserveProgrammaticWrite(base);
     await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
     await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    getRow().claimUntil = new Date(Date.now() - 1_000);
 
     const recovered = await authority.reserveProgrammaticWrite(base);
     assert.equal(recovered.delivery.status, "RECONCILE_REQUIRED");
@@ -272,29 +288,27 @@ test("Audit17 reconciliation MATCHED recovers remote success without another com
   });
 });
 
-test("Audit17 PROVEN_NO_EFFECT is the only reconciliation path that permits a later commit revision", async () => {
-  await withAuthority(async ({ authority }) => {
+test("Audit17 readback absence cannot claim PROVEN_NO_EFFECT for current business-write kinds", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
     const first = await authority.reserveProgrammaticWrite(base);
     await authority.startProgrammaticWrite({ ...base, writeId: first.delivery.id, leaseToken: first.lease.token, leaseRevision: first.lease.revision });
     await authority.prepareProgrammaticWrite({ ...base, writeId: first.delivery.id, leaseToken: first.lease.token, leaseRevision: first.lease.revision });
+    getRow().claimUntil = new Date(Date.now() - 1_000);
 
     const recovered = await authority.reserveProgrammaticWrite(base);
-    const cleared = await authority.reconcileProgrammaticWrite({
-      ...base,
-      writeId: recovered.delivery.id,
-      leaseToken: recovered.lease.token,
-      leaseRevision: recovered.lease.revision,
-      outcome: "PROVEN_NO_EFFECT",
-      result: { evidence: "queue-readback-empty" },
-    });
-    assert.equal(cleared.provenNoEffect, true);
-    assert.equal(cleared.delivery.status, "RETRY_SCHEDULED");
-
-    const retry = await authority.reserveProgrammaticWrite(base);
-    await authority.startProgrammaticWrite({ ...base, writeId: retry.delivery.id, leaseToken: retry.lease.token, leaseRevision: retry.lease.revision });
-    const prepared = await authority.prepareProgrammaticWrite({ ...base, writeId: retry.delivery.id, leaseToken: retry.lease.token, leaseRevision: retry.lease.revision });
-    assert.equal(prepared.delivery.status, "COMMITTING");
-    assert.equal(prepared.writeCommitRevision, 2);
+    await assert.rejects(
+      () => authority.reconcileProgrammaticWrite({
+        ...base,
+        writeId: recovered.delivery.id,
+        leaseToken: recovered.lease.token,
+        leaseRevision: recovered.lease.revision,
+        outcome: "PROVEN_NO_EFFECT",
+        result: { evidence: "readback-empty" },
+      }),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_NO_EFFECT_PROOF_REQUIRED",
+    );
+    assert.equal(getRow().status, "RECONCILE_REQUIRED");
+    assert.equal(getRow().writeCommitRevision, 1);
   });
 });
 
@@ -349,6 +363,66 @@ test("Audit17 commit permit is single-revision and another authenticated device 
     );
     assert.equal(getRow().writeCommitRevision, 1);
   });
+});
+
+test("Audit17 COMMITTING with missing lease expiry cannot be taken over", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    const lease = reserved.lease;
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
+    getRow().claimUntil = null;
+    await assert.rejects(
+      () => authority.reserveProgrammaticWrite(base),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_COMMIT_IN_FLIGHT",
+    );
+    assert.equal(getRow().status, "COMMITTING");
+  });
+});
+
+test("Audit17 COMMITTING HTTP failure cannot be downgraded by client provenNoEffect", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    const lease = reserved.lease;
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
+    const failed = await authority.failProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision,
+      failureCode: "HTTP_500",
+      facts: { endpointSemantics: "NON_IDEMPOTENT_WRITE", writeReachedWire: true, provenNoEffect: true, httpStatus: 500 },
+    });
+    assert.equal(failed.reconciliationRequired, true);
+    assert.equal(failed.delivery.status, "RECONCILE_REQUIRED");
+    assert.equal(getRow().result.provenNoEffect, false);
+    assert.equal(getRow().result.clientClaimedProvenNoEffect, true);
+  });
+});
+
+test("Audit17 SOURCE_DEVICE payload cannot migrate before commit but another device may reconcile after expired COMMITTING", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const first = await authority.reserveProgrammaticWrite(base);
+    getRow().claimUntil = new Date(Date.now() - 1_000);
+    await assert.rejects(
+      () => authority.reserveProgrammaticWrite({ ...base, deviceId: "device-b" }),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_SOURCE_DEVICE_REQUIRED",
+    );
+
+    const sameSource = await authority.reserveProgrammaticWrite(base);
+    await authority.startProgrammaticWrite({ ...base, writeId: sameSource.delivery.id, leaseToken: sameSource.lease.token, leaseRevision: sameSource.lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: sameSource.delivery.id, leaseToken: sameSource.lease.token, leaseRevision: sameSource.lease.revision });
+    getRow().claimUntil = new Date(Date.now() - 1_000);
+    const reconciliation = await authority.reserveProgrammaticWrite({ ...base, deviceId: "device-b" });
+    assert.equal(reconciliation.delivery.status, "RECONCILE_REQUIRED");
+    assert.equal(reconciliation.delivery.sourceDeviceId, "device-a");
+    assert.equal(reconciliation.lease.revision, getRow().leaseRevision);
+  });
+});
+
+test("Audit17 generic GET derives stored product permission and does not expose product-adapter-only writes", () => {
+  const service = read("services/programmatic-of-write-authority-service.js");
+  assert.match(service, /getProgrammaticWrite[\s\S]*productKind\(storedKind\)/);
+  assert.match(service, /PROGRAMMATIC_WRITE_GET_FORBIDDEN/);
+  assert.match(service, /permissionKey: config\.permissionKey/);
 });
 
 test("Audit17 pre-COMMITTING product routes retain creator, device, permission and access-epoch fences", () => {
