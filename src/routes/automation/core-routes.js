@@ -1,16 +1,20 @@
 "use strict";
 
-function registerCoreRoutes(router, deps) {
-  const { automationServer, sendError, requireSeniorAutomationWriter } = deps;
+function registerCoreRoutes(router, _deps) {
+  function tasksGone(_req, res) {
+    return res.status(410).json({
+      ok: false,
+      code: "LEGACY_AUTOMATION_TASK_API_GONE",
+      error: "Use product-specific Automation configuration APIs.",
+    });
+  }
 
-  // This endpoint is agency-wide and exposes every template. Per-creator
-  // templates are read through /bumps and /sfs-comments by normal viewers.
-  router.get("/tasks", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.listTasks({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_TASKS_FAILED"); } });
-  router.post("/tasks", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.upsertTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, input: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_UPSERT_FAILED"); } });
-  router.patch("/tasks/:id", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.patchTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, taskId: req.params.id, patch: req.body || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_PATCH_FAILED"); } });
-  router.post("/tasks/:id/trash", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.trashTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, taskId: req.params.id })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_TRASH_FAILED"); } });
-  router.post("/tasks/:id/restore", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.restoreTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, taskId: req.params.id })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_RESTORE_FAILED"); } });
-  router.delete("/tasks/:id", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.trashTask({ agencyId: req.auth.agencyId, userId: req.auth.userId, taskId: req.params.id, permanent: req.query?.permanent === "1" || req.query?.permanent === "true" })); } catch (err) { return sendError(res, err, "AUTOMATION_TASK_DELETE_FAILED"); } });
+  router.get("/tasks", tasksGone);
+  router.post("/tasks", tasksGone);
+  router.patch("/tasks/:id", tasksGone);
+  router.post("/tasks/:id/trash", tasksGone);
+  router.post("/tasks/:id/restore", tasksGone);
+  router.delete("/tasks/:id", tasksGone);
 }
 
 module.exports = { registerCoreRoutes };

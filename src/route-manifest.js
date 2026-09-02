@@ -54,7 +54,7 @@ const ROUTE_MANIFEST = Object.freeze([
   route("/api/server/fan-lists", ROUTE_CLASS.LEGACY_GONE, "routes/fan-lists.js", "410 tombstone; historical/archive only", { replacement: "current MASS local audience pipeline" }),
   route("/api/server/segments", ROUTE_CLASS.LEGACY_GONE, "routes/segments.js", "410 tombstone; historical/archive only", { replacement: "current MASS local audience pipeline" }),
   route("/api/server/campaigns", ROUTE_CLASS.LEGACY_GONE, "routes/campaigns.js", "410 tombstone; historical/archive only", { replacement: "current MASS CreatorApiRuntime queue" }),
-  route("/api/server/automation", ROUTE_CLASS.CREATOR_DEVICE, "routes/automation-store.js", "current automation configuration/history authority; legacy execution subroutes unmounted"),
+  route("/api/server/automation", ROUTE_CLASS.CREATOR_DEVICE, "routes/automation-store.js", "current product-specific automation configuration/history authority; generic AutomationTask customer API retired", { retiredSubroutes: ["/tasks", "/tasks/:id", "/tasks/:id/trash", "/tasks/:id/restore"], storage: "AutomationTask remains current internal storage for product-specific Bumps/SFS configuration" }),
   route("/api/dialog-intelligence", ROUTE_CLASS.CREATOR_DEVICE, "routes/dialog-intelligence.js", "creator scope + signed device + access-fenced batch lease"),
   route("/api/custom-orders", ROUTE_CLASS.CREATOR_DEVICE, "routes/custom-orders.js", "creator scope + feature permissions + signed device on machine work"),
   route("/api/server/vault-sales", ROUTE_CLASS.LEGACY_GONE, "routes/vault-sales.js", "410 tombstone; historical/admin archive only", { replacement: "Vault/Media Library + local dialog history" }),

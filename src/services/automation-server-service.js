@@ -131,7 +131,7 @@ function normalizeBumpToTask(input = {}, accountId = null) {
   return {
     id: id || undefined,
     clientId: id || undefined,
-    creatorId: input.creatorId || input.accountId || accountId || null,
+    creatorId: accountId || input.creatorId || input.accountId || null,
     type: "bump_online",
     title,
     enabled: input.enabled !== false && !trashedAt,
@@ -317,65 +317,143 @@ async function listTasks({ agencyId, query = {} }) {
   return { ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count };
 }
 
-async function upsertTask({ agencyId, userId, input = {} }) {
-  const creatorId = clean(input.creatorId || input.accountId, 100);
-  if (creatorId) await requireCreator(agencyId, creatorId);
+function automationTaskError(code, message, status = 409) {
+  const err = new Error(message);
+  err.status = status;
+  err.code = code;
+  return err;
+}
+
+function creatorTaskWhere({ agencyId, creatorId, id = null, clientId = null, type = null } = {}) {
+  const where = { agencyId };
+  const cid = clean(creatorId, 100);
+  if (cid) where.creatorId = cid;
+  if (id) where.id = clean(id, 120);
+  if (clientId) where.clientId = clean(clientId, 120);
+  if (type) where.type = type;
+  return where;
+}
+
+async function updateTaskWithFence({ db = prisma, where, data, notFoundCode = "AUTOMATION_TASK_NOT_FOUND" }) {
+  let result;
+  try {
+    result = await db.automationTask.updateMany({ where, data });
+  } catch (err) {
+    if (err?.code === "P2002") {
+      throw automationTaskError("AUTOMATION_TASK_ID_CONFLICT", "Automation task id/clientId conflicts with another creator task", 409);
+    }
+    throw err;
+  }
+  if (Number(result?.count || 0) !== 1) {
+    throw automationTaskError(notFoundCode, "Automation task is outside the current creator boundary or no longer exists", 409);
+  }
+  return db.automationTask.findFirst({ where });
+}
+
+async function upsertTask({ agencyId, userId, input = {}, expectedCreatorId = null }) {
+  const requestedCreatorId = clean(input.creatorId || input.accountId, 100);
+  const canonicalCreatorId = clean(expectedCreatorId || requestedCreatorId, 100);
+  if (expectedCreatorId && requestedCreatorId && requestedCreatorId !== canonicalCreatorId) {
+    throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Automation task creator does not match the validated creator", 409);
+  }
+  if (canonicalCreatorId) await requireCreator(agencyId, canonicalCreatorId);
+
   const rawId = clean(input.id || input.taskId, 120);
   const clientId = clean(input.clientId || input.id, 120);
-  const data = normalizeTaskInput({ ...input, clientId: input.clientId || input.id, creatorId }, { agencyId, userId });
+  const canonicalInput = canonicalCreatorId
+    ? { ...input, creatorId: canonicalCreatorId, accountId: canonicalCreatorId, clientId: input.clientId || input.id }
+    : { ...input, clientId: input.clientId || input.id };
+  const data = normalizeTaskInput(canonicalInput, { agencyId, userId });
+  if (canonicalCreatorId) data.creatorId = canonicalCreatorId;
   const update = { ...data };
   delete update.agencyId;
   delete update.createdByUserId;
 
   let item;
   if (rawId && !rawId.startsWith("bump_") && !rawId.startsWith("local") && !rawId.startsWith("tmp")) {
-    const existing = await prisma.automationTask.findFirst({ where: { id: rawId, agencyId }, select: { id: true } });
-    if (existing) item = await prisma.automationTask.update({ where: { id: existing.id }, data: update });
+    const existingById = await prisma.automationTask.findFirst({ where: { id: rawId, agencyId }, select: { id: true, creatorId: true } });
+    if (existingById) {
+      if (canonicalCreatorId && String(existingById.creatorId || "") !== canonicalCreatorId) {
+        throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Automation task id belongs to another creator", 409);
+      }
+      const where = creatorTaskWhere({ agencyId, creatorId: canonicalCreatorId || existingById.creatorId, id: existingById.id });
+      item = await updateTaskWithFence({ where, data: update, notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH" });
+    }
   }
+
   if (!item && clientId) {
-    item = await prisma.automationTask.upsert({ where: { agencyId_clientId: { agencyId, clientId } }, create: data, update });
+    const scopedWhere = creatorTaskWhere({ agencyId, creatorId: canonicalCreatorId, clientId });
+    const existingScoped = await prisma.automationTask.findFirst({ where: scopedWhere, select: { id: true, creatorId: true } });
+    if (existingScoped) {
+      const where = creatorTaskWhere({ agencyId, creatorId: canonicalCreatorId || existingScoped.creatorId, id: existingScoped.id });
+      item = await updateTaskWithFence({ where, data: update, notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH" });
+    } else {
+      const existingAgencyClient = await prisma.automationTask.findFirst({ where: { agencyId, clientId }, select: { id: true, creatorId: true } });
+      if (existingAgencyClient) {
+        if (canonicalCreatorId && String(existingAgencyClient.creatorId || "") !== canonicalCreatorId) {
+          throw automationTaskError("AUTOMATION_TASK_ID_CONFLICT", "Automation task clientId already belongs to another creator", 409);
+        }
+        const where = creatorTaskWhere({ agencyId, creatorId: canonicalCreatorId || existingAgencyClient.creatorId, id: existingAgencyClient.id });
+        item = await updateTaskWithFence({ where, data: update, notFoundCode: "AUTOMATION_TASK_ID_CONFLICT" });
+      }
+    }
   }
-  if (!item) item = await prisma.automationTask.create({ data: { ...data, clientId: data.clientId || null } });
+
+  if (!item) {
+    try {
+      item = await prisma.automationTask.create({ data: { ...data, clientId: data.clientId || null } });
+    } catch (err) {
+      if (err?.code === "P2002") {
+        throw automationTaskError("AUTOMATION_TASK_ID_CONFLICT", "Automation task id/clientId conflicts with another creator task", 409);
+      }
+      throw err;
+    }
+  }
   return { ok: true, item };
 }
 
-async function patchTask({ agencyId, userId, taskId, patch = {} }) {
+async function patchTask({ agencyId, userId, taskId, patch = {}, creatorId = null }) {
   const id = clean(taskId, 120);
+  const cid = clean(creatorId, 100);
   const existing = await prisma.automationTask.findFirst({ where: { id, agencyId } });
-  if (!existing) {
-    const err = new Error("Automation task not found");
-    err.status = 404;
-    err.code = "AUTOMATION_TASK_NOT_FOUND";
-    throw err;
+  if (!existing) throw automationTaskError("AUTOMATION_TASK_NOT_FOUND", "Automation task not found", 404);
+  if (existing.creatorId && (!cid || String(existing.creatorId) !== cid)) {
+    throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Creator-owned task requires its canonical creator boundary", 409);
   }
   const data = normalizeTaskInput(patch, { agencyId, userId, patch: true });
   delete data.agencyId;
   delete data.createdByUserId;
-  if (patch.creatorId !== undefined || patch.accountId !== undefined) {
-    const creatorId = clean(patch.creatorId || patch.accountId, 100);
-    if (creatorId) await requireCreator(agencyId, creatorId);
+  if (existing.creatorId) {
+    data.creatorId = String(existing.creatorId);
+  } else if (patch.creatorId !== undefined || patch.accountId !== undefined) {
+    const requested = clean(patch.creatorId || patch.accountId, 100);
+    if (requested) await requireCreator(agencyId, requested);
+    data.creatorId = requested || null;
   }
-  const item = await prisma.automationTask.update({ where: { id: existing.id }, data });
+  const where = creatorTaskWhere({ agencyId, creatorId: existing.creatorId || null, id: existing.id });
+  const item = await updateTaskWithFence({ where, data, notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH" });
   return { ok: true, item };
 }
 
-async function trashTask({ agencyId, userId, taskId, permanent = false }) {
+async function trashTask({ agencyId, userId, taskId, creatorId = null, permanent = false }) {
   const id = clean(taskId, 120);
+  const cid = clean(creatorId, 100);
   const existing = await prisma.automationTask.findFirst({ where: { id, agencyId } });
-  if (!existing) {
-    const err = new Error("Automation task not found");
-    err.status = 404;
-    err.code = "AUTOMATION_TASK_NOT_FOUND";
-    throw err;
+  if (!existing) throw automationTaskError("AUTOMATION_TASK_NOT_FOUND", "Automation task not found", 404);
+  if (existing.creatorId && (!cid || String(existing.creatorId) !== cid)) {
+    throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Creator-owned task is outside the requested creator boundary", 409);
   }
+  const where = creatorTaskWhere({ agencyId, creatorId: existing.creatorId || null, id: existing.id });
   if (permanent) {
-    await prisma.automationTask.delete({ where: { id: existing.id } });
+    const deleted = await prisma.automationTask.deleteMany({ where });
+    if (Number(deleted?.count || 0) !== 1) throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Automation task delete lost creator authority", 409);
     return { ok: true, deleted: true };
   }
   const deletedAt = new Date();
   const meta = toPlainObject(existing.metadata);
-  const item = await prisma.automationTask.update({
-    where: { id: existing.id },
+  const item = await updateTaskWithFence({
+    where,
+    notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH",
     data: {
       status: "deleted",
       enabled: false,
@@ -392,20 +470,24 @@ async function trashTask({ agencyId, userId, taskId, permanent = false }) {
   return { ok: true, item };
 }
 
-async function restoreTask({ agencyId, userId, taskId }) {
+async function restoreTask({ agencyId, userId, taskId, creatorId = null }) {
   const id = clean(taskId, 120);
+  const cid = clean(creatorId, 100);
   const existing = await prisma.automationTask.findFirst({ where: { id, agencyId } });
-  if (!existing) {
-    const err = new Error("Automation task not found");
-    err.status = 404;
-    err.code = "AUTOMATION_TASK_NOT_FOUND";
-    throw err;
+  if (!existing) throw automationTaskError("AUTOMATION_TASK_NOT_FOUND", "Automation task not found", 404);
+  if (existing.creatorId && (!cid || String(existing.creatorId) !== cid)) {
+    throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Creator-owned task is outside the requested creator boundary", 409);
   }
   const meta = { ...toPlainObject(existing.metadata) };
   delete meta.trashedAt;
   delete meta.purgeAfter;
   delete meta.trashRetentionDays;
-  const item = await prisma.automationTask.update({ where: { id: existing.id }, data: { status: "active", deletedAt: null, metadata: cleanJsonForPrisma(meta), updatedByUserId: userId || null } });
+  const where = creatorTaskWhere({ agencyId, creatorId: existing.creatorId || null, id: existing.id });
+  const item = await updateTaskWithFence({
+    where,
+    notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH",
+    data: { status: "active", deletedAt: null, metadata: cleanJsonForPrisma(meta), updatedByUserId: userId || null },
+  });
   return { ok: true, item };
 }
 
@@ -437,14 +519,16 @@ async function listBumps({ agencyId, creatorId, query = {} }) {
 }
 
 async function saveBump({ agencyId, userId, accountId, input = {} }) {
-  const taskInput = normalizeBumpToTask(input, accountId);
-  const result = await upsertTask({ agencyId, userId, input: taskInput });
+  const canonicalAccountId = clean(accountId, 100);
+  const taskInput = normalizeBumpToTask({ ...(input || {}), creatorId: canonicalAccountId, accountId: canonicalAccountId }, canonicalAccountId);
+  const result = await upsertTask({ agencyId, userId, input: taskInput, expectedCreatorId: canonicalAccountId });
   return { ok: true, accountId: String(accountId || taskInput.creatorId || ""), item: taskToBump(result.item), task: result.item };
 }
 
 async function trashBump({ agencyId, userId, accountId, bumpId, permanent = false, restore = false }) {
   const id = clean(bumpId, 120);
-  let task = await prisma.automationTask.findFirst({ where: { agencyId, OR: [{ id }, { clientId: id }], type: "bump_online" } });
+  const canonicalAccountId = clean(accountId, 100);
+  let task = await prisma.automationTask.findFirst({ where: { agencyId, creatorId: canonicalAccountId, OR: [{ id }, { clientId: id }], type: "bump_online" } });
   if (!task) {
     const err = new Error("Bump template not found");
     err.status = 404;
@@ -452,8 +536,8 @@ async function trashBump({ agencyId, userId, accountId, bumpId, permanent = fals
     throw err;
   }
   const result = restore
-    ? await restoreTask({ agencyId, userId, taskId: task.id })
-    : await trashTask({ agencyId, userId, taskId: task.id, permanent });
+    ? await restoreTask({ agencyId, userId, taskId: task.id, creatorId: canonicalAccountId })
+    : await trashTask({ agencyId, userId, taskId: task.id, creatorId: canonicalAccountId, permanent });
   const items = accountId ? (await listBumps({ agencyId, creatorId: accountId, query: { includeTrash: true } })).items : [];
   return { ok: true, accountId: String(accountId || task.creatorId || ""), item: result.item ? taskToBump(result.item) : null, items };
 }
@@ -479,7 +563,7 @@ function normalizeSfsCommentToTask(input = {}, accountId = null) {
   return {
     id: id || undefined,
     clientId: id || undefined,
-    creatorId: input.creatorId || input.accountId || accountId || null,
+    creatorId: accountId || input.creatorId || input.accountId || null,
     type: "sfs_comment",
     title,
     enabled: input.enabled !== false && !trashedAt,
@@ -549,6 +633,7 @@ async function listSfsComments({ agencyId, creatorId, query = {} }) {
 }
 
 async function saveSfsComment({ agencyId, userId, accountId, input = {} }) {
+  const canonicalAccountId = clean(accountId, 100);
   const text = clean(input.commentText || input.messageText || input.text || "", 5000);
   if (!text) {
     const err = new Error("Comment text is required");
@@ -556,14 +641,15 @@ async function saveSfsComment({ agencyId, userId, accountId, input = {} }) {
     err.code = "SFS_COMMENT_TEXT_REQUIRED";
     throw err;
   }
-  const taskInput = normalizeSfsCommentToTask({ ...(input || {}), commentText: text }, accountId);
-  const result = await upsertTask({ agencyId, userId, input: taskInput });
+  const taskInput = normalizeSfsCommentToTask({ ...(input || {}), commentText: text, creatorId: canonicalAccountId, accountId: canonicalAccountId }, canonicalAccountId);
+  const result = await upsertTask({ agencyId, userId, input: taskInput, expectedCreatorId: canonicalAccountId });
   return { ok: true, accountId: String(accountId || taskInput.creatorId || ""), item: taskToSfsComment(result.item), task: result.item };
 }
 
 async function trashSfsComment({ agencyId, userId, accountId, templateId, permanent = false, restore = false }) {
   const id = clean(templateId, 120);
-  let task = await prisma.automationTask.findFirst({ where: { agencyId, OR: [{ id }, { clientId: id }], type: "sfs_comment" } });
+  const canonicalAccountId = clean(accountId, 100);
+  let task = await prisma.automationTask.findFirst({ where: { agencyId, creatorId: canonicalAccountId, OR: [{ id }, { clientId: id }], type: "sfs_comment" } });
   if (!task) {
     const err = new Error("SFS comment template not found");
     err.status = 404;
@@ -571,8 +657,8 @@ async function trashSfsComment({ agencyId, userId, accountId, templateId, perman
     throw err;
   }
   const result = restore
-    ? await restoreTask({ agencyId, userId, taskId: task.id })
-    : await trashTask({ agencyId, userId, taskId: task.id, permanent });
+    ? await restoreTask({ agencyId, userId, taskId: task.id, creatorId: canonicalAccountId })
+    : await trashTask({ agencyId, userId, taskId: task.id, creatorId: canonicalAccountId, permanent });
   const items = accountId ? (await listSfsComments({ agencyId, creatorId: accountId, query: { includeTrash: true } })).items : [];
   return { ok: true, accountId: String(accountId || task.creatorId || ""), item: result.item ? taskToSfsComment(result.item) : null, items };
 }
@@ -901,7 +987,11 @@ async function saveSfsHunterSettings({ agencyId, userId, creatorId, input = {} }
   const prev = await getSfsHunterSettings({ agencyId, creatorId: cid });
   const settings = normalizeSfsSettings(input.settings || input, prev.settings || {});
   const clientId = sfsSettingsClientId(cid);
-  const existing = await prisma.automationTask.findFirst({ where: { agencyId, clientId } }).catch(() => null);
+  const existing = await prisma.automationTask.findFirst({ where: { agencyId, creatorId: cid, clientId } }).catch(() => null);
+  const foreignClient = existing ? null : await prisma.automationTask.findFirst({ where: { agencyId, clientId }, select: { id: true, creatorId: true } }).catch(() => null);
+  if (foreignClient && String(foreignClient.creatorId || "") !== cid) {
+    throw automationTaskError("AUTOMATION_TASK_ID_CONFLICT", "SFS Hunter clientId belongs to another creator", 409);
+  }
   const data = {
     agencyId,
     creatorId: cid,
@@ -916,9 +1006,26 @@ async function saveSfsHunterSettings({ agencyId, userId, creatorId, input = {} }
     metadata: compactJson({ sfsHunterSettings: true, updatedAt: new Date().toISOString() }, 2000),
     updatedByUserId: userId || null,
   };
-  const item = existing
-    ? await prisma.automationTask.update({ where: { id: existing.id }, data: { ...data, agencyId: undefined, createdByUserId: undefined } })
-    : await prisma.automationTask.create({ data: { ...data, createdByUserId: userId || null } });
+  let item;
+  if (existing) {
+    const update = { ...data };
+    delete update.agencyId;
+    delete update.createdByUserId;
+    item = await updateTaskWithFence({
+      where: creatorTaskWhere({ agencyId, creatorId: cid, id: existing.id }),
+      data: update,
+      notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH",
+    });
+  } else {
+    try {
+      item = await prisma.automationTask.create({ data: { ...data, createdByUserId: userId || null } });
+    } catch (err) {
+      if (err?.code === "P2002") {
+        throw automationTaskError("AUTOMATION_TASK_ID_CONFLICT", "SFS Hunter clientId conflicts with another creator task", 409);
+      }
+      throw err;
+    }
+  }
   return { ok: true, creatorId: cid, settings, item };
 }
 
