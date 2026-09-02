@@ -19,6 +19,7 @@ const {
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   listCustomContentSubmissions,
+  reserveCustomContentSubmissionRelayWrite,
 } = require("../services/custom-content-submissions-service");
 const { finalizeCustomContentSubmissionLibrary } = require("../services/custom-content-library-service");
 const { listCustomContentReviewQueue, reviewCustomContentSubmission } = require("../services/custom-content-review-service");
@@ -41,7 +42,7 @@ const { listCustomNonContentOperations } = require("../services/custom-nonconten
 const { listCustomReadyDeliveries, getCustomReadyDelivery } = require("../services/custom-content-delivery-service");
 const { recordCustomDeliverySend } = require("../services/custom-content-delivery-tracking-service");
 
-const { requireProductDevice, requireProductPermission } = require("../middleware/product-access");
+const { requireProductDevice, requireProductPermission, currentAccessEpoch } = require("../middleware/product-access");
 
 const router = express.Router();
 function bool(value) { return value === true || value === "1" || String(value || "").toLowerCase() === "true"; }
@@ -175,6 +176,22 @@ router.post("/submissions/upload-work", async (req, res) => {
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_UPLOAD_WORK_FAILED"); }
+});
+
+
+router.post("/submissions/:submissionId/relay-write/reserve", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await reserveCustomContentSubmissionRelayWrite({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      deviceId: req.body?.deviceId,
+      submissionId: req.params.submissionId,
+      expectedIndex: req.body?.expectedIndex,
+      accessEpoch: currentAccessEpoch(req),
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_RELAY_WRITE_RESERVE_FAILED"); }
 });
 
 router.post("/submissions/:submissionId/media-commit", async (req, res) => {

@@ -3569,7 +3569,7 @@ model AutomationDelivery {
   payload             Json     @default("{}")
   ruleId              String?
   contentCollectionId String?
-  fanId               String
+  fanId               String?
   dialogId            String?
   trigger             String?
   status              String   @default("scheduled") // P10/A13: QUEUED | CLAIMED | RUNNING | COMMITTING | RECONCILE_REQUIRED | RETRY_SCHEDULED | COMPLETED | FAILED | SKIPPED | CANCELED | PAUSED. Legacy bump rows keep old values until P11 migration.
@@ -3590,6 +3590,11 @@ model AutomationDelivery {
   failureCode         String?
   failureCategory     String?
   reportedFailureCategory String?
+  originKind          String   @default("AUTOMATION")
+  sourceDeviceId      String?
+  payloadFingerprint  String?
+  executionKind       String?
+  reconciliationKind  String?
   writeCommitRevision Int      @default(0)
   writeCommitAt       DateTime?
   lastError           String?
@@ -3608,6 +3613,8 @@ model AutomationDelivery {
 
   @@index([agencyId, status])
   @@index([agencyId, moduleKey, actionType, status])
+  @@index([agencyId, originKind, status])
+  @@index([sourceDeviceId, status])
   @@index([creatorId, fanId])
   @@index([creatorId, targetId])
   @@index([creatorId, status, notBefore])

@@ -950,7 +950,16 @@ async function failActionDelivery(input) {
   const reportedFailureCategory = normalizeFailureCategory(input.failureCategory);
   const inputResult = object(input.result);
   const provenNoEffect = inputResult.provenNoEffect === true;
-  const failureCategory = classifyAutomationFailure({ failureCode, deliveryStatus: delivery.status, provenNoEffect, idempotent: inputResult.idempotent === true });
+  const failureCategory = classifyAutomationFailure({
+    failureCode,
+    deliveryStatus: delivery.status,
+    provenNoEffect,
+    idempotent: inputResult.idempotent === true,
+    endpointSemantics: inputResult.endpointSemantics || null,
+    writeReachedWire: inputResult.writeReachedWire === true,
+    outcomeState: inputResult.outcomeState || null,
+    transportCode: inputResult.transportCode || inputResult.originalCode || null,
+  });
   const safetyRecovery = mustPreserveRefollowSaga(delivery, failureCode) || isSfsCleanupDelivery(delivery);
   const reconcile = failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE;
   const categoryRetryable = SAFE_RETRY_CATEGORIES.includes(failureCategory) || reconcile;

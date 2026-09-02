@@ -3,7 +3,7 @@
 /**
  * Audit16 production route contract.
  *
- * This manifest classifies the 46 product/admin/public families mounted by
+ * This manifest classifies the mounted product/admin/public families mounted by
  * src/server.js. It intentionally describes authority at the family boundary;
  * narrower sub-routes may add stronger permission/device requirements.
  * LEGACY_GONE families remain mounted only as authenticated 410 compatibility
@@ -49,6 +49,7 @@ const ROUTE_MANIFEST = Object.freeze([
   route("/api/subscribers", ROUTE_CLASS.CREATOR, "routes/subscribers.js", "creator scope + automation.manage for mutations"),
   route("/api/fan-data", ROUTE_CLASS.CREATOR, "routes/fan-data.js", "canonical creator scope"),
   route("/api/automation", ROUTE_CLASS.CREATOR_DEVICE, "routes/automation-control.js", "creator scope + canonical automation permissions + execution device"),
+  route("/api/programmatic-of-writes", ROUTE_CLASS.CREATOR_DEVICE, "routes/programmatic-of-writes.js", "shared non-idempotent external-write commit authority; product-specific creator/permission adapters + signed device"),
   route("/api/server/content", ROUTE_CLASS.CREATOR_DEVICE, "routes/content-store.js", "current Message Library authority; generic collections are 410 tombstones", { retiredSubroutes: ["/collections", "/collections/:id", "/collections/:id/blocks", "/collections/:id/usage"] }),
   route("/api/server/crm", ROUTE_CLASS.LEGACY_GONE, "routes/crm-store.js", "410 tombstone; historical/admin archive only", { replacement: "Desktop local CRM authority" }),
   route("/api/server/fan-lists", ROUTE_CLASS.LEGACY_GONE, "routes/fan-lists.js", "410 tombstone; historical/archive only", { replacement: "current MASS local audience pipeline" }),

@@ -417,6 +417,49 @@ async function pendingFinalizeRows({ agencyId, creatorIds, limit, db }) {
  * currently owned by this Desktop. The submission row itself stays compact:
  * no extra claim/status/device fields are persisted for upload execution.
  */
+
+async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, deviceId, submissionId, expectedIndex, accessEpoch = null, now = new Date(), db = null } = {}) {
+  if (!agencyId || !member?.id || !member?.userId) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
+  const id = identifier(submissionId, "submissionId", { max: 180 });
+  const index = Number(expectedIndex);
+  if (!Number.isInteger(index) || index < 0) throw fail("CUSTOM_SUBMISSION_UPLOAD_INDEX_INVALID", "expectedIndex must be a non-negative integer", 400);
+  const row = await client.customContentSubmission.findFirst({ where: { id, agencyId } });
+  if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  const nextIndex = nextUploadIndex(row);
+  if (nextIndex === null) throw fail("CUSTOM_SUBMISSION_UPLOAD_ALREADY_COMPLETE", "Content submission already has all OnlyFans media ids", 409);
+  if (nextIndex !== index) throw fail("CUSTOM_SUBMISSION_UPLOAD_WORK_STALE", `Expected upload index ${nextIndex}, not ${index}`, 409);
+  const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.map(String) : [];
+  const telegramMessageId = String(telegramIds[index] || "").trim();
+  if (!telegramMessageId) throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_MISSING", "Submission upload index has no Telegram source message", 409);
+  const recipientRow = await client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null);
+  const recipient = String(recipientRow?.value || "").trim().replace(/^@+/, "");
+  if (!recipient) throw fail("CUSTOM_SUBMISSION_VAULT_RECIPIENT_REQUIRED", "Vault upload recipient is not configured", 409);
+  const payloadFingerprint = crypto.createHash("sha256").update(JSON.stringify({
+    version: 1, agencyId, creatorId: String(row.creatorId), submissionId: id, expectedIndex: index, telegramMessageId, recipient,
+  })).digest("hex");
+  const { reserveProgrammaticWrite } = require("./programmatic-of-write-authority-service");
+  const authority = await reserveProgrammaticWrite({
+    agencyId,
+    userId: String(member.userId),
+    memberId: String(member.id),
+    accessEpoch: Number.isInteger(Number(accessEpoch)) ? Number(accessEpoch) : Number(member.accessEpoch || 0),
+    creatorId: String(row.creatorId),
+    deviceId: normalizedDeviceId,
+    kind: "CUSTOM_RELAY_SEND",
+    idempotencyKey: `custom-relay:${id}:${index}`,
+    payloadFingerprint,
+    payload: { submissionId: id, expectedIndex: index, telegramMessageId, recipient, reservedForCustomUploadAt: new Date(now).toISOString() },
+    targetId: `${id}:${index}`,
+    permissionKeyOverride: null,
+    leaseMs: 10 * 60_000,
+    maxAttempts: 20,
+  });
+  return { ...authority, relayRecipient: recipient, submissionId: id, expectedIndex: index };
+}
+
 async function claimCustomContentSubmissionUploadWork({ agencyId, member, deviceId, leases, limit = 1, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
@@ -620,6 +663,7 @@ module.exports = {
   listCustomContentSubmissions,
   nextUploadIndex,
   pendingFinalizeRows,
+  reserveCustomContentSubmissionRelayWrite,
   sameMessageIds,
   serializeSubmission,
   telegramMessageIds,
