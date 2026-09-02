@@ -42,8 +42,11 @@ function makeDb() {
     if (where.runtimeClaimToken !== undefined && row.runtimeClaimToken !== where.runtimeClaimToken) return false;
     return true;
   };
+  const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"], accessEpoch: 1, deletedAt: null, deactivatedAt: null };
   return {
     _accounts: accounts,
+    _member: member,
+    agencyMember: { async findFirst({ where }) { return where.id === member.id && where.userId === member.userId && where.agencyId === member.agencyId ? { ...member } : null; } },
     creatorAccount: {
       async findMany({ where }) { return creators.filter((row) => matchCreator(row, where)).map((row) => ({ ...row })); },
       async findFirst({ where }) { return creators.find((row) => matchCreator(row, where)) || null; },
@@ -61,7 +64,7 @@ function makeDb() {
   };
 }
 
-const chatterA = { role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"] };
+const chatterA = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"], accessEpoch: 1 };
 
 test("Telegram runtime eligibility is creator-scoped instead of role-scoped", async () => {
   const db = makeDb();
@@ -115,9 +118,50 @@ test("runtime release is scoped to the current device/token and cannot release a
   const now = new Date("2026-08-19T14:00:00.000Z");
   const claim = await claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: chatterA, deviceId: "device-a", now, db });
   const lease = claim.leases[0];
-  const wrong = await releaseTelegramExecutionRuntime({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-b", claimToken: lease.claimToken, db });
-  assert.equal(wrong.released, false);
-  const right = await releaseTelegramExecutionRuntime({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-a", claimToken: lease.claimToken, db });
+  await assert.rejects(
+    () => releaseTelegramExecutionRuntime({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-b", claimToken: lease.claimToken, now, db }),
+    (error) => error?.code === "TELEGRAM_EXECUTION_LEASE_INVALID",
+  );
+  const right = await releaseTelegramExecutionRuntime({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-a", claimToken: lease.claimToken, now, db });
   assert.equal(right.released, true);
   assert.equal(db._accounts[0].runtimeClaimUntil, null);
+});
+
+test("Audit16 Telegram runtime lease is rejected after accessEpoch or creator authority changes", async () => {
+  const db = makeDb();
+  const now = new Date("2026-08-19T14:00:00.000Z");
+  const claim = await claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: chatterA, deviceId: "device-a", now, db });
+  const lease = claim.leases[0];
+  assert.ok(lease?.claimToken);
+
+  db._member.accessEpoch = chatterA.accessEpoch + 1;
+  await assert.rejects(
+    () => assertTelegramRuntimeLease({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-a", claimToken: lease.claimToken, now: new Date(now.getTime() + 1_000), db }),
+    (error) => error?.code === "EXECUTION_ACCESS_EPOCH_STALE" && error?.status === 409,
+  );
+
+  db._member.accessEpoch = chatterA.accessEpoch;
+  db._member.assignedCreators = [];
+  await assert.rejects(
+    () => assertTelegramRuntimeLease({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-a", claimToken: lease.claimToken, now: new Date(now.getTime() + 2_000), db }),
+    (error) => error?.code === "EXECUTION_CREATOR_ACCESS_REVOKED" && error?.status === 403,
+  );
+});
+
+test("Audit16 targeted Telegram claim acquires only the requested eligible account", async () => {
+  const db = makeDb();
+  const owner = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 1 };
+  db._member.role = "OWNER";
+  db._member.roleKey = "owner";
+  db._member.assignedCreators = "all";
+  const now = new Date("2026-08-19T14:00:00.000Z");
+  const targeted = await claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: owner, deviceId: "device-a", accountId: "tg-2", limit: 1, now, db });
+  assert.deepEqual(targeted.leases.map((lease) => lease.accountId), ["tg-2"]);
+  assert.equal(db._accounts[0].runtimeClaimedByDeviceId, null, "targeted claim must not opportunistically take another Telegram account");
+  assert.equal(db._accounts[1].runtimeClaimedByDeviceId, "device-a");
+
+  await assert.rejects(
+    () => claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: chatterA, deviceId: "device-a", accountId: "tg-2", limit: 1, now, db: makeDb() }),
+    (error) => error?.code === "TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN" && error?.status === 403,
+  );
 });

@@ -3,8 +3,8 @@
 const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
-const { isSeniorAgencyMember } = require("../middleware/team-permissions");
 const { automationCreatorParamRequired } = require("../middleware/automation-permissions");
+const { requireProductPermission, requireProductDevice, filterProductCreatorScope, currentAccessEpoch } = require("../middleware/product-access");
 const { audit } = require("../services/audit-service");
 const { createPlannedJob, publishPlannedJobAvailable } = require("../services/job-planning-repository");
 const {
@@ -36,13 +36,19 @@ function validationError(res, error) {
 function serviceError(res, error, code = "DIALOG_INTELLIGENCE_FAILED") {
   return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || code, error: error?.message || "Dialog intelligence request failed" });
 }
-function seniorRequired(req, res, next) {
-  const member = req.auth?.membership || req.member;
-  if (!member || !isSeniorAgencyMember(member)) {
-    return res.status(403).json({ ok: false, code: "DIALOG_INTELLIGENCE_WRITE_FORBIDDEN", error: "Owner, admin or manager permission is required" });
-  }
-  return next();
+function permissionRequired(permission, code) {
+  return async (req, res, next) => {
+    try {
+      await requireProductPermission(req, permission, { code });
+      return next();
+    } catch (error) {
+      return serviceError(res, error, code);
+    }
+  };
 }
+
+const vaultManagementRequired = permissionRequired("content.manage_vault", "DIALOG_INTELLIGENCE_WRITE_FORBIDDEN");
+const workspaceSettingsRequired = permissionRequired("workspace.manage_settings", "DIALOG_INTELLIGENCE_CONTROL_FORBIDDEN");
 function clean(value, max = 240) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : null;
@@ -344,8 +350,8 @@ router.post("/creators/:creatorId/scans", async (req, res) => {
     const input = creatorScanSchema.parse(req.body || {});
     const childMode = input.mode === "full" ? "initial" : (input.mode || "incremental");
     const forceChildFull = input.mode === "full";
-    if (childMode === "initial" && !isSeniorAgencyMember(req.auth?.membership || req.member)) {
-      return res.status(403).json({ ok: false, code: "DIALOG_FULL_SCAN_FORBIDDEN", error: "Owner, admin or manager permission is required for a full scan" });
+    if (childMode === "initial") {
+      await requireProductPermission(req, "content.manage_vault", { code: "DIALOG_FULL_SCAN_FORBIDDEN" });
     }
     // Restarting a creator-wide dialog plan is one database transaction.
     // The old build cancelled the current discovery first and created its
@@ -391,10 +397,8 @@ router.post("/creators/:creatorId/dialogs/:dialogId/scans", async (req, res) => 
   try {
     const input = scanSchema.parse(req.body || {});
     const requestedMode = input.mode || "incremental";
-    const member = req.auth?.membership || req.member;
-    const senior = isSeniorAgencyMember(member);
     const lifecycleSources = new Set(["dialog_open", "automatic_startup_resume_scan", "crm_analysis_waiting_for_scan", "browser_dialog_open"]);
-    if (["initial", "full", "reconcile"].includes(requestedMode) && !senior) {
+    if (["initial", "full", "reconcile"].includes(requestedMode)) {
       const currentState = await prisma.dialogScanState.findUnique({
         where: { creatorId_dialogId: { creatorId: req.params.creatorId, dialogId: req.params.dialogId } },
         select: { initialScanComplete: true },
@@ -409,7 +413,7 @@ router.post("/creators/:creatorId/dialogs/:dialogId/scans", async (req, res) => 
       const lifecycleLocalFull = requestedMode === "full"
         && lifecycleSources.has(input.source || "");
       if (!lifecycleInitial && !lifecycleLocalFull) {
-        return res.status(403).json({ ok: false, code: "DIALOG_SCAN_WRITE_FORBIDDEN", error: "Owner, admin or manager permission is required for this scan mode" });
+        await requireProductPermission(req, "content.manage_vault", { code: "DIALOG_SCAN_WRITE_FORBIDDEN" });
       }
     }
     const result = await scheduleDialogScan({
@@ -519,6 +523,7 @@ const purchaseSignalsSchema = z.object({
 });
 router.post("/creators/:creatorId/ingest/purchase-signals", async (req, res) => {
   try {
+    requireProductDevice(req, req.auth?.deviceId);
     const input = purchaseSignalsSchema.parse(req.body || {});
     const result = await prisma.$transaction((tx) => applyPurchaseSignalsChunk({
       db: tx,
@@ -534,6 +539,7 @@ router.post("/creators/:creatorId/ingest/purchase-signals", async (req, res) => 
 });
 router.post("/creators/:creatorId/ingest/ws", async (req, res) => {
   try {
+    requireProductDevice(req, req.auth?.deviceId);
     const input = wsSchema.parse(req.body || {});
     const result = await ingestWsMessages({
       agencyId: req.auth.agencyId,
@@ -625,10 +631,15 @@ const dialogBatchReleaseSchema = dialogBatchLeaseSchema.extend({
 router.post("/batches/claim", async (req, res) => {
   try {
     const input = dialogBatchClaimSchema.parse(req.body || {});
+    requireProductDevice(req, input.deviceId);
+    const scoped = await filterProductCreatorScope(req, input.creatorIds, { rejectForeign: true });
     const result = await claimDialogHistoryBatch({
       agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      memberId: req.auth.memberId,
+      accessEpoch: currentAccessEpoch(req),
       deviceId: input.deviceId,
-      creatorIds: input.creatorIds,
+      creatorIds: scoped.creatorIds,
       batchSize: input.batchSize,
       leaseMs: input.leaseMs,
     });
@@ -642,8 +653,12 @@ router.post("/batches/claim", async (req, res) => {
 router.post("/batches/:batchId/renew", async (req, res) => {
   try {
     const input = dialogBatchLeaseSchema.parse(req.body || {});
+    requireProductDevice(req, input.deviceId);
     const result = await renewDialogHistoryBatch({
       agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      memberId: req.auth.memberId,
+      accessEpoch: currentAccessEpoch(req),
       batchId: req.params.batchId,
       ...input,
     });
@@ -657,8 +672,12 @@ router.post("/batches/:batchId/renew", async (req, res) => {
 router.post("/batches/:batchId/progress", async (req, res) => {
   try {
     const input = dialogBatchProgressSchema.parse(req.body || {});
+    requireProductDevice(req, input.deviceId);
     const result = await progressDialogHistoryBatch({
       agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      memberId: req.auth.memberId,
+      accessEpoch: currentAccessEpoch(req),
       batchId: req.params.batchId,
       ...input,
     });
@@ -672,8 +691,12 @@ router.post("/batches/:batchId/progress", async (req, res) => {
 router.post("/batches/:batchId/complete", async (req, res) => {
   try {
     const input = dialogBatchCompleteSchema.parse(req.body || {});
+    requireProductDevice(req, input.deviceId);
     const result = await completeDialogHistoryBatch({
       agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      memberId: req.auth.memberId,
+      accessEpoch: currentAccessEpoch(req),
       batchId: req.params.batchId,
       ...input,
     });
@@ -687,6 +710,7 @@ router.post("/batches/:batchId/complete", async (req, res) => {
 router.post("/creators/:creatorId/local-counts/reconcile", async (req, res) => {
   try {
     const input = dialogLocalCountReconcileSchema.parse(req.body || {});
+    requireProductDevice(req, input.deviceId);
     const result = await reconcileDialogLocalCounts({
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
@@ -704,8 +728,12 @@ router.post("/creators/:creatorId/local-counts/reconcile", async (req, res) => {
 router.post("/batches/:batchId/release", async (req, res) => {
   try {
     const input = dialogBatchReleaseSchema.parse(req.body || {});
+    requireProductDevice(req, input.deviceId);
     const result = await releaseDialogHistoryBatch({
       agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      memberId: req.auth.memberId,
+      accessEpoch: currentAccessEpoch(req),
       batchId: req.params.batchId,
       ...input,
     });
@@ -716,7 +744,7 @@ router.post("/batches/:batchId/release", async (req, res) => {
   }
 });
 
-router.post("/creators/:creatorId/pause", seniorRequired, async (req, res) => {
+router.post("/creators/:creatorId/pause", vaultManagementRequired, async (req, res) => {
   try {
     const reason = clean(req.body?.reason, 500) || "paused by user";
     const result = await pauseCreatorRuns({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId, reason });
@@ -736,7 +764,7 @@ router.post("/creators/:creatorId/pause", seniorRequired, async (req, res) => {
   } catch (error) { return serviceError(res, error, "DIALOG_CREATOR_SCAN_PAUSE_FAILED"); }
 });
 
-router.post("/creators/:creatorId/resume", seniorRequired, async (req, res) => {
+router.post("/creators/:creatorId/resume", vaultManagementRequired, async (req, res) => {
   try {
     const control = await moduleControl(prisma, req.auth.agencyId);
     if (!control.enabled) return res.status(409).json({ ok: false, code: "DIALOG_MODULE_DISABLED", error: "Enable Dialog Intelligence before resuming scans" });
@@ -750,7 +778,7 @@ router.post("/creators/:creatorId/resume", seniorRequired, async (req, res) => {
   } catch (error) { return serviceError(res, error, "DIALOG_CREATOR_SCAN_RESUME_FAILED"); }
 });
 
-router.post("/creators/:creatorId/cancel", seniorRequired, async (req, res) => {
+router.post("/creators/:creatorId/cancel", vaultManagementRequired, async (req, res) => {
   try {
     const reason = clean(req.body?.reason, 500) || "creator scan canceled by user";
     const now = new Date();
@@ -820,7 +848,7 @@ router.post("/creators/:creatorId/cancel", seniorRequired, async (req, res) => {
   } catch (error) { return serviceError(res, error, "DIALOG_CREATOR_SCAN_CANCEL_FAILED"); }
 });
 
-router.post("/creators/:creatorId/dialogs/:dialogId/cancel", seniorRequired, async (req, res) => {
+router.post("/creators/:creatorId/dialogs/:dialogId/cancel", vaultManagementRequired, async (req, res) => {
   try {
     const reason = clean(req.body?.reason, 500) || "canceled by user";
     const active = await prisma.dialogScanRun.findFirst({
@@ -860,7 +888,7 @@ router.post("/creators/:creatorId/dialogs/:dialogId/cancel", seniorRequired, asy
 });
 
 const controlSchema = z.object({ enabled: z.boolean(), settings: z.record(z.unknown()).optional() });
-router.patch("/control", seniorRequired, async (req, res) => {
+router.patch("/control", workspaceSettingsRequired, async (req, res) => {
   try {
     const input = controlSchema.parse(req.body || {});
     const before = await moduleControl(prisma, req.auth.agencyId);

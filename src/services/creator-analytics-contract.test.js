@@ -27,7 +27,6 @@ test("all changed Creator Analytics backend files pass syntax checks", () => {
   for (const relative of [
     "middleware/agency-member-role.js",
     "middleware/team-permissions.js",
-    "services/creator-analytics-permissions.js",
     "services/creator-analytics-sanitize.js",
     "routes/stats.js",
     "services/traffic-service.js",
@@ -81,15 +80,19 @@ test("creator and agency refresh routes are guarded and agency scheduling is bou
 });
 
 test("traffic reads and writes stay creator-bound and permission guarded", () => {
+  assert.match(trafficService, /requireCreatorAccess\(\{ agencyId: creator\.agencyId, member, creatorId: creator\.id, db: prisma \}\)/);
   assert.match(trafficService, /resolveEffectivePermissions\(\{ member, db: prisma \}\)/);
-  assert.match(trafficService, /if \(!canViewTraffic\(effectiveMember\)\)/);
-  assert.match(trafficService, /if \(!canManageTrafficCosts\(member\)\)/);
-  assert.match(trafficService, /if \(!canRefreshTraffic\(member\)\)/);
-  assert.match(trafficService, /where:\s*\{ id, agencyId: creator\.agencyId, creatorId: creator\.id \}/);
+  assert.match(trafficService, /key: "traffic\.view"/);
+  assert.match(trafficService, /key: "traffic\.manage_costs"/);
+  assert.match(trafficService, /key: "traffic\.refresh"/);
+  assert.match(trafficService, /id:\s*cleanSourceId/);
+  assert.match(trafficService, /agencyId:\s*creator\.agencyId,[\s\S]*creatorId:\s*creator\.id/);
   assert.match(trafficService, /agencyId: creator\.agencyId,[\s\S]*creatorId: creator\.id,[\s\S]*sourceId: source\.id/);
+  assert.match(trafficRoute, /requireProductCreator/);
+  assert.match(trafficRoute, /requireProductDevice/);
   assert.match(trafficRoute, /TRAFFIC_VIEW_FORBIDDEN/);
   assert.match(trafficRoute, /TRAFFIC_REFRESH_FORBIDDEN/);
-  assert.match(trafficRoute, /INSUFFICIENT_TEAM_ROLE/);
+  assert.doesNotMatch(trafficService, /creator-analytics-permissions/);
 });
 
 test("senior role semantics are shared without loading Prisma", () => {

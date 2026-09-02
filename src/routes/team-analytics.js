@@ -174,7 +174,7 @@ router.post("/ppv/conflicts/:jobId/resolve", async (req, res) => {
       actorMemberId: req.agencyMember.id,
       action: input.action,
       reason: input.reason,
-      deviceId: req.auth.deviceId || req.body?.deviceId || null,
+      deviceId: req.auth.deviceId || null,
       allowedCreatorIds: viewer.allowedCreatorIds,
     });
     if (result.code) {

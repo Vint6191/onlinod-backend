@@ -41,6 +41,8 @@ const { listCustomNonContentOperations } = require("../services/custom-nonconten
 const { listCustomReadyDeliveries, getCustomReadyDelivery } = require("../services/custom-content-delivery-service");
 const { recordCustomDeliverySend } = require("../services/custom-content-delivery-tracking-service");
 
+const { requireProductDevice, requireProductPermission } = require("../middleware/product-access");
+
 const router = express.Router();
 function bool(value) { return value === true || value === "1" || String(value || "").toLowerCase() === "true"; }
 function sendError(res, err, fallbackCode) {
@@ -75,6 +77,7 @@ router.get("/vault-destination", async (req, res) => {
 
 router.patch("/vault-destination", async (req, res) => {
   try {
+    await requireProductPermission(req, "content.manage_vault", { code: "CUSTOM_VAULT_DESTINATION_FORBIDDEN" });
     if (!Object.prototype.hasOwnProperty.call(req.body || {}, "folderId")) {
       throw Object.assign(new Error("folderId is required; use null to clear"), { code: "CUSTOM_VAULT_DESTINATION_PATCH_INVALID", status: 400 });
     }
@@ -162,6 +165,7 @@ router.post("/submissions", async (req, res) => {
 
 router.post("/submissions/upload-work", async (req, res) => {
   try {
+    requireProductDevice(req, req.body?.deviceId);
     return res.json(await claimCustomContentSubmissionUploadWork({
       agencyId: req.auth.agencyId,
       member: req.auth.membership || req.member,
@@ -283,6 +287,7 @@ router.post("/submissions/:submissionId/review", async (req, res) => {
 
 router.post("/telegram-inbound", async (req, res) => {
   try {
+    requireProductDevice(req, req.body?.deviceId);
     return res.json(await recordTelegramInboundReply({
       agencyId: req.auth.agencyId,
       member: req.auth.membership || req.member,
@@ -300,6 +305,7 @@ router.post("/telegram-inbound", async (req, res) => {
 
 router.post("/reminders/claim", async (req, res) => {
   try {
+    requireProductDevice(req, req.body?.deviceId);
     return res.json(await claimDueReminders({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, deviceId: req.body?.deviceId, limit: req.body?.limit, db: prisma }));
   } catch (err) { return sendError(res, err, "CUSTOM_ORDER_REMINDER_CLAIM_FAILED"); }
 });
@@ -335,12 +341,16 @@ router.post("/:orderId/remind-now/ack", async (req, res) => {
 });
 
 router.post("/:orderId/reminders/ack", async (req, res) => {
-  try { return res.json(await acknowledgeReminder({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, orderId: req.params.orderId, claimToken: req.body?.claimToken, messageId: req.body?.messageId, db: prisma })); }
+  try {
+    requireProductDevice(req, req.auth?.deviceId);
+    return res.json(await acknowledgeReminder({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, deviceId: req.auth.deviceId, orderId: req.params.orderId, claimToken: req.body?.claimToken, messageId: req.body?.messageId, db: prisma })); }
   catch (err) { return sendError(res, err, "CUSTOM_ORDER_REMINDER_ACK_FAILED"); }
 });
 
 router.post("/:orderId/reminders/fail", async (req, res) => {
-  try { return res.json(await releaseReminderClaim({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, orderId: req.params.orderId, claimToken: req.body?.claimToken, retryable: req.body?.retryable !== false, deliveryUnknown: req.body?.deliveryUnknown === true, db: prisma })); }
+  try {
+    requireProductDevice(req, req.auth?.deviceId);
+    return res.json(await releaseReminderClaim({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, deviceId: req.auth.deviceId, orderId: req.params.orderId, claimToken: req.body?.claimToken, retryable: req.body?.retryable !== false, deliveryUnknown: req.body?.deliveryUnknown === true, db: prisma })); }
   catch (err) { return sendError(res, err, "CUSTOM_ORDER_REMINDER_FAIL_FAILED"); }
 });
 

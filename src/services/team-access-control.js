@@ -33,6 +33,18 @@ const ZONES = Object.freeze([
     ]),
   }),
   Object.freeze({
+    key: "analytics",
+    label: "Creator analytics & traffic",
+    hint: "Creator analytics refresh and traffic attribution controls",
+    kind: "access",
+    permissions: Object.freeze([
+      Object.freeze({ key: "creator_analytics.refresh", label: "Refresh creator analytics", requiredLevel: "full" }),
+      Object.freeze({ key: "traffic.view", label: "View traffic analytics", requiredLevel: "view" }),
+      Object.freeze({ key: "traffic.refresh", label: "Refresh traffic analytics", requiredLevel: "full" }),
+      Object.freeze({ key: "traffic.manage_costs", label: "Manage traffic source costs", requiredLevel: "full" }),
+    ]),
+  }),
+  Object.freeze({
     key: "content",
     label: "Content",
     hint: "Vault and content management",
@@ -91,6 +103,11 @@ const PUBLIC_PERMISSION_KEYS = Object.freeze([
   "money.resolve_attribution",
   "money.override_attribution",
   "money.view_audit",
+  "creator_analytics.refresh",
+  "traffic.view",
+  "traffic.refresh",
+  "traffic.manage_costs",
+  "content.manage_vault",
   "message_library.manage",
   "content.review_customs",
   "automation.view_logs",
@@ -114,7 +131,7 @@ const PRESET_ROLES = Object.freeze({
     tone: "amber",
     description: "Fan conversations and day-to-day chat work.",
     locked: false,
-    access: Object.freeze({ chats: "full", money: "hidden", content: "view", automation: "view", creators: "scoped", workspace: "hidden" }),
+    access: Object.freeze({ chats: "full", money: "hidden", analytics: "hidden", content: "view", automation: "view", creators: "scoped", workspace: "hidden" }),
     permissionDefaults: Object.freeze({
       "money.claim": true,
       "money.release_own_claim": true,
@@ -129,7 +146,7 @@ const PRESET_ROLES = Object.freeze({
     tone: "teal",
     description: "Runs the team day-to-day and manages assigned creators.",
     locked: false,
-    access: Object.freeze({ chats: "full", money: "view", content: "full", automation: "full", creators: "scoped", workspace: "full" }),
+    access: Object.freeze({ chats: "full", money: "view", analytics: "full", content: "full", automation: "full", creators: "scoped", workspace: "full" }),
     permissionDefaults: Object.freeze({
       "workspace.edit_roles": false,
       "money.resolve_attribution": true,
@@ -143,7 +160,7 @@ const PRESET_ROLES = Object.freeze({
     tone: "purple",
     description: "Quality control and Team Analytics with limited write access.",
     locked: false,
-    access: Object.freeze({ chats: "view", money: "view", content: "view", automation: "view", creators: "scoped", workspace: "view" }),
+    access: Object.freeze({ chats: "view", money: "view", analytics: "full", content: "view", automation: "view", creators: "scoped", workspace: "view" }),
     permissionDefaults: Object.freeze({
       "team.analytics.view": true,
       "money.claim": true,
@@ -156,7 +173,7 @@ const PRESET_ROLES = Object.freeze({
     tone: "blue",
     description: "Read-only performance and money analysis.",
     locked: false,
-    access: Object.freeze({ chats: "hidden", money: "view", content: "hidden", automation: "view", creators: "all", workspace: "view" }),
+    access: Object.freeze({ chats: "hidden", money: "view", analytics: "hidden", content: "hidden", automation: "view", creators: "all", workspace: "view" }),
     permissionDefaults: Object.freeze({
       "workspace.manage_members": false,
       "workspace.invite": false,
@@ -169,7 +186,7 @@ const PRESET_ROLES = Object.freeze({
     tone: "amber-strong",
     description: "Workspace owner. Full recovery and administration access.",
     locked: true,
-    access: Object.freeze({ chats: "full", money: "full", content: "full", automation: "full", creators: "all", workspace: "full" }),
+    access: Object.freeze({ chats: "full", money: "full", analytics: "full", content: "full", automation: "full", creators: "all", workspace: "full" }),
     permissionDefaults: Object.freeze({}),
   }),
 });
@@ -383,9 +400,8 @@ async function validateAssignedCreators({ agencyId, assignedCreators, db = null 
 function publicPermissionZones() {
   // V8 only exposes controls that the server can actually enforce today.
   // Browser chat permissions remain reserved until the proven V7.6 Browser
-  // lifecycle can enforce them without renderer-side policy. Legacy generic
-  // Content permissions are also kept internal until their read/write routes
-  // are uniformly permission-gated.
+  // lifecycle can enforce them without renderer-side policy. Audit16 exposes
+  // only permissions that are enforced by current product routes.
   const exposedZones = ZONES
     .filter((zone) => zone.key !== "chats")
     .map((zone) => ({
@@ -402,7 +418,7 @@ function publicPermissionZones() {
         ? "Creator management"
         : zone.label;
     const hint = zone.key === "content"
-      ? "Explicit permissions for Custom review and the shared Message Library."
+      ? "Explicit permissions for Vault management, Custom review and the shared Message Library."
       : zone.key === "creators"
         ? "Manage creator accounts. Actual creator visibility is assigned explicitly per member."
         : zone.key === "automation"

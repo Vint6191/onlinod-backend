@@ -20,6 +20,7 @@ const {
 } = require("../services/vault-never-used-service");
 
 const { automationCreatorParamRequired } = require("../middleware/automation-permissions");
+const { requireProductPermission } = require("../middleware/product-access");
 
 const router = express.Router();
 
@@ -43,8 +44,14 @@ router.param("creatorId", automationCreatorParamRequired());
 
 function sendError(res, error, fallbackCode) {
   const code = error?.code || fallbackCode;
-  const status = code === "CREATOR_NOT_FOUND" ? 404 : code === "MEDIA_IDS_INVALID" ? 400 : 500;
+  const status = Number(error?.status) || (code === "CREATOR_NOT_FOUND" ? 404 : code === "MEDIA_IDS_INVALID" ? 400 : 500);
   return res.status(status).json({ ok: false, code, error: String(error?.message || error || "Vault directory request failed") });
+}
+
+function vaultManagementRequired(req, res, next) {
+  requireProductPermission(req, "content.manage_vault", { code: "VAULT_MANAGE_FORBIDDEN" })
+    .then(() => next())
+    .catch((error) => sendError(res, error, "VAULT_MANAGE_FORBIDDEN"));
 }
 
 
@@ -73,7 +80,7 @@ router.post("/:creatorId/unsorted/items", async (req, res) => {
   }
 });
 
-router.post("/:creatorId/unsorted/scans", async (req, res) => {
+router.post("/:creatorId/unsorted/scans", vaultManagementRequired, async (req, res) => {
   try {
     const input = unsortedStartSchema.parse(req.body || {});
     const result = await scheduleVaultUnsortedScan({
@@ -91,7 +98,7 @@ router.post("/:creatorId/unsorted/scans", async (req, res) => {
   }
 });
 
-router.post("/:creatorId/unsorted/pause", async (req, res) => {
+router.post("/:creatorId/unsorted/pause", vaultManagementRequired, async (req, res) => {
   try {
     return res.json(await pauseVaultUnsortedScan({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId, userId: req.auth.userId }));
   } catch (error) {
@@ -99,7 +106,7 @@ router.post("/:creatorId/unsorted/pause", async (req, res) => {
   }
 });
 
-router.post("/:creatorId/unsorted/resume", async (req, res) => {
+router.post("/:creatorId/unsorted/resume", vaultManagementRequired, async (req, res) => {
   try {
     return res.json(await resumeVaultUnsortedScan({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId, userId: req.auth.userId }));
   } catch (error) {
@@ -107,7 +114,7 @@ router.post("/:creatorId/unsorted/resume", async (req, res) => {
   }
 });
 
-router.post("/:creatorId/unsorted/cancel", async (req, res) => {
+router.post("/:creatorId/unsorted/cancel", vaultManagementRequired, async (req, res) => {
   try {
     return res.json(await cancelVaultUnsortedScan({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId, userId: req.auth.userId }));
   } catch (error) {

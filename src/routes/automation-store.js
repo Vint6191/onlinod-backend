@@ -2,7 +2,7 @@
 
 const express = require("express");
 const prisma = require("../prisma");
-const { cleanString, optionalString, jsonArray, jsonObject, centsFromAny, parseLimit, parseOffset, positiveInt, requireCreator, sendError } = require("../services/server-store-utils");
+const { cleanString, optionalString, jsonArray, jsonObject, centsFromAny, parseLimit, parseOffset, positiveInt, sendError } = require("../services/server-store-utils");
 const { canUsePermission } = require("../services/team-access-control");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { attachAutomationAudit } = require("../middleware/automation-audit");
@@ -64,7 +64,6 @@ const automationRouteDeps = {
   parseLimit,
   parseOffset,
   positiveInt,
-  requireCreator,
   sendError,
   requireSeniorAutomationWriter,
   requireAutomationCreatorAccess,

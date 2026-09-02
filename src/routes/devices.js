@@ -452,6 +452,11 @@ router.post("/commands/:id/ack", async (req, res) => {
     const command = await prisma.deviceCommand.findUnique({ where: { id: req.params.id } });
     if (!command) return res.status(404).json({ ok: false, code: "COMMAND_NOT_FOUND", error: "Command not found" });
 
+    requireAuthDevice(req, command.deviceId, {
+      requiredCode: "DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "DEVICE_IDENTITY_MISMATCH",
+    });
+
     const device = await prisma.workerDevice.findFirst({
       where: { id: command.deviceId, userId: req.auth.userId },
     });
@@ -473,28 +478,10 @@ router.post("/commands/:id/ack", async (req, res) => {
   }
 });
 
-router.get("/mine", async (req, res) => {
-  try {
-    const agencyId = String(req.query.agencyId || req.auth.agencyId || "");
-    if (!agencyId) return res.status(400).json({ ok: false, code: "NO_AGENCY", error: "Agency is missing" });
-    if (agencyId !== req.auth.agencyId) return res.status(403).json({ ok: false, code: "DEVICE_AGENCY_FORBIDDEN", error: "No access to agency" });
-
-    const devices = await prisma.workerDevice.findMany({
-      where: { agencyId },
-      orderBy: { lastSeenAt: "desc" },
-      include: {
-        creatorBindings: {
-          include: { creator: { select: { id: true, displayName: true, username: true, status: true, avatarUrl: true } } },
-          orderBy: { updatedAt: "desc" },
-        },
-      },
-      take: 10000});
-
-    return res.json({ ok: true, devices });
-  } catch (err) {
-    console.error("[devices/mine] failed:", err);
-    return res.status(500).json({ ok: false, code: "DEVICES_MINE_FAILED", error: "Failed to load devices" });
-  }
-});
+router.get("/mine", (_req, res) => res.status(410).json({
+  ok: false,
+  code: "DEVICE_INVENTORY_GONE",
+  error: "Agency-wide customer device inventory is retired; use signed device heartbeat/runtime surfaces",
+}));
 
 module.exports = router;

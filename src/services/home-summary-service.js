@@ -2,8 +2,9 @@
 
 const prisma = require("../prisma");
 const { resolveRange, resolvePreviousRange, rangeForClient } = require("./range-service");
-const { getLatestPayload } = require("./analytics-snapshot-service");
 const { ensureSingleJob } = require("./job-scheduler");
+const { allowedCreatorScope } = require("../middleware/automation-permissions");
+const { canUsePermission, isOwner } = require("./team-access-control");
 
 // ─────────────────────────────────────────────────────────────────────────
 // Home summary service v3 — on-demand snapshot scheduling.
@@ -395,177 +396,232 @@ async function buildPreviousRevenue(agencyId, prevRangeKey, allCreators) {
 
 // ── Main entry ──────────────────────────────────────────────────────────
 
-function snapshotPart(snapshot, key, fallback) {
-  const payload = snapshot?.payload || {};
-  return payload[key] && typeof payload[key] === "object" ? payload[key] : fallback;
+function availability(available, reason = null) {
+  return { available: available === true, reason: available === true ? null : (reason || "UNAVAILABLE") };
 }
 
-async function buildHomeSummary({ agencyId, rangeKey = "7d" }) {
+function emptyRevenueCreator(creator) {
+  return {
+    id: creator.id,
+    name: creator.displayName,
+    displayName: creator.displayName,
+    username: creator.username,
+    avatarUrl: creator.avatarUrl,
+    status: creator.status,
+    remoteId: creator.remoteId,
+    revenueCents: null,
+    salesCount: null,
+    uniqueFans: null,
+    capturedAt: null,
+    hasSnapshot: false,
+    pending: false,
+    stale: false,
+    staleSeconds: null,
+  };
+}
+
+async function buildHomeSummary({ agencyId, member, rangeKey = "7d" }) {
+  if (!member || String(member.agencyId || "") !== String(agencyId || "")) {
+    const error = new Error("Current agency membership is required");
+    error.code = "AGENCY_FORBIDDEN";
+    error.status = 403;
+    throw error;
+  }
+
   const range = resolveRange(rangeKey);
   const previousRange = resolvePreviousRange(rangeKey);
+  const scope = await allowedCreatorScope({ agencyId, member, db: prisma });
+  const creatorWhere = scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } };
 
   const [
-    snapshot,
-    agency,
-    members,
-    creators,
-    jobs,
-    devices,
-    latestAudit,
-    subscription,
+    canViewMoney,
+    canViewTeam,
+    canViewAudit,
+    canManageWorkspace,
+    canRefreshAnalytics,
   ] = await Promise.all([
-    getLatestPayload({ agencyId, scope: "home", rangeKey: range.key }),
-    prisma.agency.findUnique({ where: { id: agencyId } }),
-    prisma.agencyMember.findMany({
-      where: { agencyId, deletedAt: null },
-      select: {
-        id: true, roleKey: true, displayName: true,
-        user: { select: { email: true, name: true } },
-      },
-      take: 10000}),
+    canUsePermission({ member, key: "money.view_earnings", db: prisma }),
+    canUsePermission({ member, key: "workspace.view_team", db: prisma }),
+    canUsePermission({ member, key: "workspace.view_audit", db: prisma }),
+    canUsePermission({ member, key: "workspace.manage_settings", db: prisma }),
+    canUsePermission({ member, key: "creator_analytics.refresh", db: prisma }),
+  ]);
+  const owner = isOwner(member);
+
+  const [agency, creators, members, jobs, devices, latestAudit, subscription] = await Promise.all([
+    prisma.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true } }),
     prisma.creatorAccount.findMany({
-      where: { agencyId, deletedAt: null },
-      select: {
-        id: true, displayName: true, username: true,
-        avatarUrl: true, status: true, remoteId: true,
-      },
-      take: 10000}),
-    prisma.jobInstance
-      .groupBy({
-        by: ["status"],
-        where: { agencyId },
-        _count: { _all: true },
-      })
-      .catch(() => []),
-    prisma.workerDevice.findMany({
-      where: { agencyId },
-      select: {
-        id: true, userId: true, deviceName: true,
-        platform: true, appVersion: true, lastSeenAt: true,
-      },
-      take: 10000}),
-    prisma.auditLog.findMany({
-      where: { agencyId },
-      orderBy: { createdAt: "desc" },
-      take: 5,
-      include: { actor: { select: { id: true, email: true, name: true } } },
+      where: { agencyId, deletedAt: null, ...creatorWhere },
+      select: { id: true, displayName: true, username: true, avatarUrl: true, status: true, remoteId: true },
+      take: 10000,
     }),
-    prisma.agencySubscription.findFirst({
-      where: { agencyId },
-      orderBy: { createdAt: "desc" },
-    }),
+    canViewTeam || owner
+      ? prisma.agencyMember.findMany({
+          where: { agencyId, deletedAt: null, deactivatedAt: null },
+          select: { id: true, roleKey: true, displayName: true, user: { select: { email: true, name: true } } },
+          take: 10000,
+        })
+      : Promise.resolve([]),
+    canManageWorkspace
+      ? prisma.jobInstance.groupBy({ by: ["status"], where: { agencyId, ...(scope.broad ? {} : { creatorId: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }) }, _count: { _all: true } }).catch(() => [])
+      : Promise.resolve([]),
+    canManageWorkspace
+      ? prisma.workerDevice.findMany({
+          where: { agencyId },
+          select: { id: true, userId: true, deviceName: true, platform: true, appVersion: true, lastSeenAt: true },
+          take: 10000,
+        })
+      : Promise.resolve([]),
+    canViewAudit
+      ? prisma.auditLog.findMany({
+          where: { agencyId },
+          orderBy: { createdAt: "desc" },
+          take: 5,
+          include: { actor: { select: { id: true, email: true, name: true } } },
+        })
+      : Promise.resolve([]),
+    owner
+      ? prisma.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } })
+      : Promise.resolve(null),
   ]);
 
-  // Build current revenue (with on-demand scheduling).
-  // Previous revenue is read-only — we don't schedule backfill jobs for it,
-  // that would double the OF traffic on every Home open. If previous data
-  // doesn't exist, deltaPct will be null and UI shows muted state.
-  const [currentRevenue, previousRevenue] = await Promise.all([
-    buildAgencyRevenue(agencyId, range.key, creators),
-    buildPreviousRevenue(agencyId, previousRange.key, creators),
-  ]);
+  let currentRevenue = null;
+  let previousRevenue = null;
+  if (canViewMoney) {
+    [currentRevenue, previousRevenue] = await Promise.all([
+      buildAgencyRevenue(agencyId, range.key, creators),
+      buildPreviousRevenue(agencyId, previousRange.key, creators),
+    ]);
+  }
+
+  const visibleCreators = currentRevenue
+    ? currentRevenue.creators
+    : creators.map(emptyRevenueCreator).sort((a, b) => String(a.displayName || a.username || a.id).localeCompare(String(b.displayName || b.username || b.id)));
+  const pendingCount = currentRevenue?.pendingCreatorIds?.length || 0;
+  const reportingCreators = currentRevenue ? currentRevenue.creators.filter((c) => c.hasSnapshot).length : 0;
 
   const now = Date.now();
-  const onlineDevices = devices.filter(
-    (d) => d.lastSeenAt && now - new Date(d.lastSeenAt).getTime() < 5 * 60 * 1000
-  ).length;
-  const seatsLimit = subscription?.seatsLimit || null;
-
-  const snapshotMessages = snapshotPart(snapshot, "messages", {
-    total: 0, team: 0, bot: 0, incoming: 0, source: "snapshot_missing",
-  });
-  const snapshotWorkers = snapshotPart(snapshot, "workers", {});
-  const snapshotHealth = snapshotPart(snapshot, "health", {});
-
-  const totalCreators = creators.length;
-  const reportingCreators = currentRevenue.creators.filter((c) => c.hasSnapshot).length;
-  const pendingCount = currentRevenue.pendingCreatorIds.length;
+  const onlineDevices = canManageWorkspace
+    ? devices.filter((d) => d.lastSeenAt && now - new Date(d.lastSeenAt).getTime() < 5 * 60 * 1000).length
+    : null;
+  const jobsByStatus = canManageWorkspace
+    ? Object.fromEntries((jobs || []).map((row) => [row.status, row._count?._all || 0]))
+    : {};
+  const seatsLimit = owner ? (subscription?.seatsLimit ?? null) : null;
 
   return {
     ok: true,
     agency: agency
-      ? { id: agency.id, name: agency.name, plan: agency.plan, status: agency.status }
-      : { id: agencyId },
+      ? { id: agency.id, name: agency.name, plan: owner ? agency.plan : null, status: agency.status, billingAvailable: owner }
+      : { id: agencyId, name: null, plan: null, status: null, billingAvailable: owner },
     range: rangeForClient(range),
     refreshedAt: new Date().toISOString(),
-    snapshot: snapshot
+    creatorScope: {
+      broad: scope.broad === true,
+      creatorIds: creators.map((creator) => creator.id),
+    },
+    snapshot: {
+      ...availability(false, "UNAVAILABLE"),
+      id: null,
+      capturedAt: null,
+      staleSeconds: null,
+      source: "analytics_snapshot_retired",
+    },
+    revenue: canViewMoney
       ? {
-          id: snapshot.id,
-          capturedAt: snapshot.capturedAt,
-          staleSeconds: snapshot.staleSeconds,
-          source: "electron_snapshot",
+          ...availability(true),
+          refreshAllowed: canRefreshAnalytics === true,
+          totalCents: currentRevenue.totalCents,
+          grossCents: currentRevenue.grossCents,
+          deltaPct: pctChange(currentRevenue.totalCents, previousRevenue.totalCents),
+          currency: "USD",
+          salesCount: currentRevenue.salesCount,
+          uniqueFans: currentRevenue.uniqueFans,
+          creatorCount: currentRevenue.creatorCount,
+          points: currentRevenue.points,
+          coverage: { totalCreators: creators.length, reportingCreators, pendingCount },
+          pending: {
+            count: pendingCount,
+            creatorIds: currentRevenue.pendingCreatorIds,
+            jobs: currentRevenue.scheduledJobs,
+            etaSeconds: pendingCount * 12,
+          },
+          stalenessMs: stalenessMsFor(range.key),
+          source: "creator_earnings_snapshots",
         }
       : {
-          id: null,
-          capturedAt: null,
-          staleSeconds: null,
-          source: "snapshot_missing",
+          ...availability(false, "FORBIDDEN"),
+          refreshAllowed: false,
+          totalCents: null,
+          grossCents: null,
+          deltaPct: null,
+          currency: "USD",
+          salesCount: null,
+          uniqueFans: null,
+          creatorCount: creators.length,
+          points: [],
+          coverage: { totalCreators: creators.length, reportingCreators: 0, pendingCount: 0 },
+          pending: { count: 0, creatorIds: [], jobs: [], etaSeconds: 0 },
+          stalenessMs: stalenessMsFor(range.key),
+          source: "forbidden",
         },
-    revenue: {
-      totalCents: currentRevenue.totalCents,
-      grossCents: currentRevenue.grossCents,
-      deltaPct: pctChange(currentRevenue.totalCents, previousRevenue.totalCents),
-      currency: "USD",
-      salesCount: currentRevenue.salesCount,
-      uniqueFans: currentRevenue.uniqueFans,
-      creatorCount: currentRevenue.creatorCount,
-      points: currentRevenue.points,
-      // Coverage / pending metadata — UI shows skeleton rows for pending creators.
-      coverage: {
-        totalCreators,
-        reportingCreators,
-        pendingCount,
-      },
-      pending: {
-        count:      pendingCount,
-        creatorIds: currentRevenue.pendingCreatorIds,
-        jobs:       currentRevenue.scheduledJobs,
-        // Heuristic ETA — fetch_earnings typically takes 5-15s per creator
-        // depending on OF response time and runner availability. UI uses
-        // this to set polling cadence (don't poll faster than ETA/3).
-        etaSeconds: pendingCount * 12,
-      },
-      stalenessMs: stalenessMsFor(range.key),
-      source: "creator_earnings_snapshots",
-    },
     messages: {
-      total:    Number(snapshotMessages.total    || 0),
-      team:     Number(snapshotMessages.team     || 0),
-      bot:      Number(snapshotMessages.bot      || 0),
-      incoming: Number(snapshotMessages.incoming || 0),
-      source:   snapshotMessages.source || "analytics_snapshot",
+      ...availability(false, "UNAVAILABLE"),
+      total: null,
+      team: null,
+      bot: null,
+      incoming: null,
+      source: "no_current_home_message_authority",
     },
-    seats: {
-      used: members.length,
-      limit: seatsLimit,
-      available: seatsLimit === null ? null : Math.max(0, Number(seatsLimit) - members.length),
-      source: seatsLimit === null ? "members_only" : "subscription",
+    seats: owner
+      ? {
+          ...availability(true),
+          used: members.length,
+          limit: seatsLimit,
+          remaining: seatsLimit === null ? null : Math.max(0, Number(seatsLimit) - members.length),
+          source: seatsLimit === null ? "members_only" : "subscription",
+        }
+      : { ...availability(false, "FORBIDDEN"), used: null, limit: null, remaining: null, source: "forbidden" },
+    creators: visibleCreators,
+    workers: canViewTeam || owner
+      ? {
+          ...availability(true),
+          totalMembers: members.length,
+          onlineDevices: canManageWorkspace ? onlineDevices : null,
+          devices: canManageWorkspace ? devices.length : null,
+          activeMembers: null,
+          runtimeDetailAvailable: canManageWorkspace === true,
+          source: "current_membership",
+        }
+      : {
+          ...availability(false, "FORBIDDEN"),
+          totalMembers: null,
+          onlineDevices: null,
+          devices: null,
+          activeMembers: null,
+          runtimeDetailAvailable: false,
+          source: "forbidden",
+        },
+    health: canManageWorkspace
+      ? { ...availability(true), onlineDevices, jobs: jobsByStatus, source: "current_runtime" }
+      : { ...availability(false, "FORBIDDEN"), onlineDevices: null, jobs: {}, source: "forbidden" },
+    jobs: canManageWorkspace
+      ? { ...availability(true), counts: jobsByStatus }
+      : { ...availability(false, "FORBIDDEN"), counts: {} },
+    audit: {
+      ...availability(canViewAudit, canViewAudit ? null : "FORBIDDEN"),
+      items: canViewAudit
+        ? latestAudit.map((row) => ({
+            id: row.id,
+            action: row.action,
+            targetType: row.targetType,
+            targetId: row.targetId,
+            metadata: row.metadata || {},
+            createdAt: row.createdAt,
+            actor: row.actor ? { id: row.actor.id, email: row.actor.email, name: row.actor.name } : null,
+          }))
+        : [],
     },
-    creators: currentRevenue.creators,
-    workers: {
-      totalMembers:  members.length,
-      onlineDevices,
-      devices:       devices.length,
-      activeMembers: Number(snapshotWorkers.activeMembers || 0),
-      ...snapshotWorkers,
-    },
-    health: {
-      ...snapshotHealth,
-      onlineDevices,
-      jobs: Object.fromEntries((jobs || []).map((row) => [row.status, row._count?._all || 0])),
-    },
-    jobs: Object.fromEntries((jobs || []).map((row) => [row.status, row._count?._all || 0])),
-    audit: latestAudit.map((row) => ({
-      id:         row.id,
-      action:     row.action,
-      targetType: row.targetType,
-      targetId:   row.targetId,
-      metadata:   row.metadata || {},
-      createdAt:  row.createdAt,
-      actor: row.actor
-        ? { id: row.actor.id, email: row.actor.email, name: row.actor.name }
-        : null,
-    })),
   };
 }
 

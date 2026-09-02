@@ -29,6 +29,8 @@ const {
   releaseTelegramExecutionRuntime,
 } = require("../services/telegram-execution-runtime");
 
+const { requireProductDevice } = require("../middleware/product-access");
+
 const router = express.Router();
 const uploadsDir = path.join(__dirname, "..", "..", "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
@@ -85,10 +87,6 @@ function publicBaseUrl(req) {
   const explicit = String(process.env.PUBLIC_BASE_URL || process.env.API_PUBLIC_URL || "").trim().replace(/\/$/, "");
   if (explicit) return explicit;
   return `${req.protocol}://${req.get("host")}`;
-}
-
-function deviceId(req) {
-  return String(req.query?.deviceId || req.body?.deviceId || req.headers["x-onlinod-device-id"] || "").trim().slice(0, 160) || null;
 }
 
 function authDeviceId(req) {
@@ -259,18 +257,21 @@ router.patch("/telegram/reminders", async (req, res) => {
 
 router.post("/telegram/runtime/claim", async (req, res) => {
   try {
-    return res.json(await claimTelegramExecutionRuntimes({ agencyId: req.auth.agencyId, member: req.auth.membership, deviceId: req.body?.deviceId, limit: req.body?.limit, db: require("../prisma") }));
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await claimTelegramExecutionRuntimes({ agencyId: req.auth.agencyId, member: req.auth.membership, deviceId: req.body?.deviceId, accountId: req.body?.accountId, limit: req.body?.limit, db: require("../prisma") }));
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_RUNTIME_CLAIM_FAILED"); }
 });
 
 router.post("/telegram/runtime/:accountId/release", async (req, res) => {
   try {
+    requireProductDevice(req, req.body?.deviceId);
     return res.json(await releaseTelegramExecutionRuntime({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, deviceId: req.body?.deviceId, claimToken: req.body?.claimToken, db: require("../prisma") }));
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_RUNTIME_RELEASE_FAILED"); }
 });
 
 router.post("/telegram/accounts", async (req, res) => {
   try {
+    requireProductDevice(req, req.body?.deviceId);
     const result = await addTelegramMtprotoAccount({
       agencyId: req.auth.agencyId,
       member: req.auth.membership,
@@ -290,12 +291,15 @@ router.delete("/telegram/accounts/:accountId", async (req, res) => {
 
 router.post("/telegram/accounts/:accountId/local-material", async (req, res) => {
   try {
+    const boundDeviceId = requireProductDevice(req, req.body?.deviceId);
     const material = await issueTelegramMtprotoLocalMaterial({
       agencyId: req.auth.agencyId,
       member: req.auth.membership,
       accountId: req.params.accountId,
       purpose: req.body?.purpose,
       creatorId: req.body?.creatorId,
+      deviceId: boundDeviceId,
+      claimToken: req.body?.claimToken,
     });
     res.setHeader("Cache-Control", "no-store, private");
     res.setHeader("Pragma", "no-cache");
@@ -305,6 +309,7 @@ router.post("/telegram/accounts/:accountId/local-material", async (req, res) => 
 
 router.put("/telegram/accounts/:accountId/session", async (req, res) => {
   try {
+    requireProductDevice(req, req.body?.deviceId);
     const account = await storeTelegramMtprotoSession({
       agencyId: req.auth.agencyId,
       member: req.auth.membership,
@@ -317,17 +322,10 @@ router.put("/telegram/accounts/:accountId/session", async (req, res) => {
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_SESSION_STORE_FAILED"); }
 });
 
-router.get("/runtime", async (req, res) => {
-  try {
-    const prisma = require("../prisma");
-    const [devices, jobs] = await Promise.all([
-      prisma.workerDevice.findMany({ where: { agencyId: req.auth.agencyId }, orderBy: { lastSeenAt: "desc" }, take: 20 }),
-      prisma.jobInstance.groupBy({ by: ["status"], where: { agencyId: req.auth.agencyId }, _count: { _all: true } }).catch(() => []),
-    ]);
-    return res.json({ ok: true, devices, jobs: Object.fromEntries(jobs.map((j) => [j.status, j._count._all])) });
-  } catch (err) {
-    return res.status(500).json({ ok: false, code: "RUNTIME_SETTINGS_FAILED", error: err?.message || "Failed" });
-  }
-});
+router.get("/runtime", (_req, res) => res.status(410).json({
+  ok: false,
+  code: "SETTINGS_RUNTIME_DIAGNOSTICS_GONE",
+  error: "Customer runtime diagnostics are retired from the settings surface",
+}));
 
 module.exports = router;

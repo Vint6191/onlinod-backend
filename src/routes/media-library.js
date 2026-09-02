@@ -3,7 +3,7 @@
 const express = require("express");
 const { z } = require("zod");
 const { automationCreatorParamRequired } = require("../middleware/automation-permissions");
-const { isSeniorAgencyMember } = require("../middleware/team-permissions");
+const { requireProductPermission, requireProductDevice } = require("../middleware/product-access");
 const {
   getMediaMetadata,
   searchMediaLibrary,
@@ -83,9 +83,9 @@ function sendError(res, error, fallbackCode) {
     });
   }
   const code = error?.code || fallbackCode;
-  const status = code === "CREATOR_NOT_FOUND" ? 404
+  const status = Number(error?.status) || (code === "CREATOR_NOT_FOUND" ? 404
     : ["MEDIA_ID_MISSING", "MEDIA_IDS_INVALID"].includes(code) ? 400
-      : 500;
+      : 500);
   return res.status(status).json({
     ok: false,
     code,
@@ -93,16 +93,10 @@ function sendError(res, error, fallbackCode) {
   });
 }
 
-function seniorRequired(req, res, next) {
-  const member = req.auth?.membership || req.member;
-  if (!member || !isSeniorAgencyMember(member)) {
-    return res.status(403).json({
-      ok: false,
-      code: "MEDIA_LIBRARY_DELETE_FORBIDDEN",
-      error: "Owner, admin or manager permission is required",
-    });
-  }
-  return next();
+function vaultManagementRequired(req, res, next) {
+  requireProductPermission(req, "content.manage_vault", { code: "MEDIA_LIBRARY_MANAGE_FORBIDDEN" })
+    .then(() => next())
+    .catch((error) => sendError(res, error, "MEDIA_LIBRARY_MANAGE_FORBIDDEN"));
 }
 
 router.post("/:creatorId/assets/query", async (req, res) => {
@@ -131,7 +125,7 @@ router.post("/:creatorId/assets/search", async (req, res) => {
   }
 });
 
-router.put("/:creatorId/assets/:mediaId/metadata", async (req, res) => {
+router.put("/:creatorId/assets/:mediaId/metadata", vaultManagementRequired, async (req, res) => {
   try {
     const input = metadataSchema.parse(req.body || {});
     return res.json(await upsertMediaMetadata({
@@ -159,6 +153,7 @@ router.get("/:creatorId/storylines", async (req, res) => {
 
 router.put("/:creatorId/usage-sources", async (req, res) => {
   try {
+    requireProductDevice(req, req.auth?.deviceId);
     const input = usageSourcesSchema.parse(req.body || {});
     return res.json(await replaceUsageSources({
       agencyId: req.auth.agencyId,
@@ -170,7 +165,7 @@ router.put("/:creatorId/usage-sources", async (req, res) => {
   }
 });
 
-router.post("/:creatorId/folders/mutate", async (req, res) => {
+router.post("/:creatorId/folders/mutate", vaultManagementRequired, async (req, res) => {
   try {
     const input = folderMutationSchema.parse(req.body || {});
     return res.json(await mutateFolderMembership({
@@ -185,7 +180,7 @@ router.post("/:creatorId/folders/mutate", async (req, res) => {
   }
 });
 
-router.post("/:creatorId/assets/delete", seniorRequired, async (req, res) => {
+router.post("/:creatorId/assets/delete", vaultManagementRequired, async (req, res) => {
   try {
     const input = mediaIdsSchema.parse(req.body || {});
     return res.json(await deleteMediaAssets({

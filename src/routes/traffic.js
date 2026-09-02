@@ -13,6 +13,8 @@ const {
   scheduleTrafficRefresh,
 } = require("../services/traffic-service");
 
+const { requireProductCreator, requireProductDevice } = require("../middleware/product-access");
+
 const router = express.Router();
 
 function actorUserId(req) {
@@ -30,9 +32,10 @@ function validationError(res, err) {
 
 function serviceError(res, err, fallbackCode) {
   const code = err?.code || fallbackCode || "TRAFFIC_FAILED";
-  const status = code === "NOT_YOUR_DEVICE" || code === "NOT_A_MEMBER" || code === "DEVICE_CREATOR_AGENCY_MISMATCH" || code === "INSUFFICIENT_TEAM_ROLE" || code === "TRAFFIC_VIEW_FORBIDDEN" || code === "TRAFFIC_REFRESH_FORBIDDEN" ? 403
+  const status = Number(err?.status) || (code === "NOT_YOUR_DEVICE" || code === "NOT_A_MEMBER" || code === "DEVICE_CREATOR_AGENCY_MISMATCH" || code === "INSUFFICIENT_TEAM_ROLE" || code === "TRAFFIC_VIEW_FORBIDDEN" || code === "TRAFFIC_REFRESH_FORBIDDEN" || code === "TRAFFIC_COSTS_FORBIDDEN" || code === "CREATOR_ACCESS_FORBIDDEN" || code === "DEVICE_IDENTITY_MISMATCH" ? 403
+    : code === "ACCESS_EPOCH_STALE" || code === "DEVICE_CREATOR_BINDING_STALE" ? 409
     : code === "CREATOR_NOT_FOUND" || code === "TRAFFIC_SOURCE_NOT_FOUND" ? 404
-    : 500;
+    : 500);
   return res.status(status).json({ ok: false, code, error: err?.message || "Traffic request failed" });
 }
 
@@ -50,6 +53,8 @@ const sourceScanSchema = z.object({
 router.post("/sources/upsert", async (req, res) => {
   try {
     const input = sourceScanSchema.parse(req.body || {});
+    await requireProductCreator(req, input.creatorId);
+    requireProductDevice(req, input.deviceId);
     const result = await upsertTrafficSourceScan({
       deviceId: input.deviceId,
       userId: actorUserId(req),
@@ -94,6 +99,8 @@ const subscriptionIngestSchema = z.object({
 router.post("/subscriptions/ingest", async (req, res) => {
   try {
     const input = subscriptionIngestSchema.parse(req.body || {});
+    await requireProductCreator(req, input.creatorId);
+    requireProductDevice(req, input.deviceId);
     const result = await ingestSubscriptionEvent({
       deviceId: input.deviceId,
       userId: actorUserId(req),
@@ -126,6 +133,7 @@ const trafficRefreshSchema = z.object({
 router.post("/creators/:creatorId/refresh", async (req, res) => {
   try {
     const input = trafficRefreshSchema.parse(req.body || {});
+    await requireProductCreator(req, req.params.creatorId);
     const result = await scheduleTrafficRefresh({
       userId: actorUserId(req),
       creatorId: req.params.creatorId,
@@ -164,6 +172,8 @@ const markDirtySchema = z.object({
 router.post("/value-refresh/mark-dirty", async (req, res) => {
   try {
     const input = markDirtySchema.parse(req.body || {});
+    await requireProductCreator(req, input.creatorId);
+    requireProductDevice(req, input.deviceId);
     const result = await markTrafficFanValueDirtyFromDevice({
       deviceId: input.deviceId,
       userId: actorUserId(req),
@@ -188,6 +198,8 @@ const pendingValueRefreshSchema = z.object({
 router.post("/creators/:creatorId/value-refresh/pending", async (req, res) => {
   try {
     const input = pendingValueRefreshSchema.parse(req.body || {});
+    await requireProductCreator(req, req.params.creatorId);
+    requireProductDevice(req, input.deviceId);
     const result = await getPendingTrafficValueFanIds({
       deviceId: input.deviceId,
       userId: actorUserId(req),
@@ -204,6 +216,7 @@ router.post("/creators/:creatorId/value-refresh/pending", async (req, res) => {
 
 router.get("/creators/:creatorId/overview", async (req, res) => {
   try {
+    await requireProductCreator(req, req.params.creatorId);
     const result = await getTrafficOverview({ userId: actorUserId(req), creatorId: req.params.creatorId, rangeKey: req.query.range || "all" });
     return res.json(result);
   } catch (err) {
@@ -222,6 +235,7 @@ const sourceCostSchema = z.object({
 router.patch("/creators/:creatorId/sources/:sourceId", async (req, res) => {
   try {
     const input = sourceCostSchema.parse(req.body || {});
+    await requireProductCreator(req, req.params.creatorId);
     const result = await updateTrafficSourceCost({
       userId: actorUserId(req),
       creatorId: req.params.creatorId,
@@ -239,6 +253,7 @@ router.patch("/creators/:creatorId/sources/:sourceId", async (req, res) => {
 
 router.get("/creators/:creatorId/sources/:sourceId/members", async (req, res) => {
   try {
+    await requireProductCreator(req, req.params.creatorId);
     const result = await getTrafficSourceMembers({
       userId: actorUserId(req),
       creatorId: req.params.creatorId,

@@ -32,12 +32,8 @@ function dateOrNull(value) {
   const date = value instanceof Date ? value : new Date(value);
   return Number.isFinite(date.getTime()) ? date : null;
 }
-function messageUnique(creatorId, messageId) { return { creatorId_messageId: { creatorId, messageId } }; }
 const {
-  classifyPurchase,
-  purchaseCountsAsRevenue,
   purchaseIdempotencyKey,
-  allocatePackagePrice,
   evaluateIncrementalStop,
 } = require("./dialog-intelligence-domain");
 
@@ -1197,173 +1193,10 @@ async function autoRecoverDialogHistory(input) {
   return prisma.$transaction((tx) => autoRecoverDialogHistoryTx(tx, input));
 }
 
-function normalizedMessage(input, job) {
-  const raw = object(input);
-  const messageId = clean(raw.messageId ?? raw.id, 240);
-  const dialogId = clean(raw.dialogId ?? job.params?.dialogId, 180);
-  const createdAtOf = dateOrNull(raw.createdAtOf ?? raw.createdAt);
-  if (!messageId || !dialogId || !createdAtOf) return null;
-  const direction = clean(raw.direction, 40) || (raw.isFromCreator === true ? "OUTBOUND" : "INBOUND");
-  const isFromCreator = raw.isFromCreator === true || direction === "OUTBOUND";
-  return {
-    messageId,
-    dialogId,
-    fanId: clean(raw.fanId ?? job.params?.fanId, 160),
-    senderId: clean(raw.senderId, 160),
-    recipientId: clean(raw.recipientId, 160),
-    direction,
-    messageType: clean(raw.messageType, 80) || "message",
-    text: clean(raw.text, 20_000),
-    priceCents: integer(raw.priceCents, 0),
-    currency: (clean(raw.currency, 12) || "USD").toUpperCase(),
-    isFree: raw.isFree === true || integer(raw.priceCents, 0) <= 0,
-    isOpened: raw.isOpened === true,
-    isFromCreator,
-    isFromFan: raw.isFromFan === true || !isFromCreator,
-    createdAtOf,
-    changedAtOf: dateOrNull(raw.changedAtOf ?? raw.changedAt),
-    deletedAt: dateOrNull(raw.deletedAt),
-    source: clean(raw.source, 80) || "dialog_scan",
-    contentHash: clean(raw.contentHash, 128),
-    metadata: object(raw.metadata),
-    media: list(raw.media).map((entry) => {
-      const media = object(entry);
-      const mediaId = clean(media.mediaId ?? media.id, 240);
-      if (!mediaId) return null;
-      const ownership = clean(media.ownership, 40) || (media.isFanMedia === true ? "FAN" : "CREATOR");
-      return {
-        mediaId,
-        assetId: clean(media.assetId, 240) || (ownership === "CREATOR" ? mediaId : null),
-        mediaType: clean(media.mediaType ?? media.type, 80),
-        ownerId: clean(media.ownerId, 160),
-        ownership,
-        isFanMedia: media.isFanMedia === true || ownership === "FAN",
-        preview: object(media.preview),
-        durationMs: media.durationMs == null ? null : integer(media.durationMs, 0, 0, 86_400_000),
-        canView: typeof media.canView === "boolean" ? media.canView : null,
-      };
-    }).filter(Boolean),
-  };
-}
-
-async function upsertMessage(db, { agencyId, creatorId, job, raw, observedAt }) {
-  const message = normalizedMessage(raw, job);
-  if (!message) return null;
-  const existing = await db.dialogMessageLedger.findUnique({
-    where: messageUnique(creatorId, message.messageId),
-    select: { contentHash: true, changedAtOf: true, deletedAt: true },
-  });
-  const businessChanged = !existing
-    || existing.contentHash !== message.contentHash
-    || String(existing.deletedAt || "") !== String(message.deletedAt || "");
-  const effectiveChangedAt = message.changedAtOf || (businessChanged ? observedAt : existing?.changedAtOf || null);
-  const ledger = await db.dialogMessageLedger.upsert({
-    where: messageUnique(creatorId, message.messageId),
-    create: {
-      agencyId, creatorId, dialogId: message.dialogId, messageId: message.messageId, fanId: message.fanId,
-      senderId: message.senderId, recipientId: message.recipientId, direction: message.direction,
-      messageType: message.messageType, text: message.text, priceCents: message.priceCents, currency: message.currency,
-      isFree: message.isFree, isOpened: message.isOpened, isFromCreator: message.isFromCreator, isFromFan: message.isFromFan,
-      createdAtOf: message.createdAtOf, changedAtOf: effectiveChangedAt, deletedAt: message.deletedAt,
-      source: message.source, firstSeenAt: observedAt, lastSeenAt: observedAt, contentHash: message.contentHash, metadata: message.metadata,
-    },
-    update: {
-      dialogId: message.dialogId, fanId: message.fanId || undefined, senderId: message.senderId, recipientId: message.recipientId,
-      direction: message.direction, messageType: message.messageType, text: message.text, priceCents: message.priceCents,
-      currency: message.currency, isFree: message.isFree, isOpened: message.isOpened,
-      isFromCreator: message.isFromCreator, isFromFan: message.isFromFan, changedAtOf: effectiveChangedAt,
-      deletedAt: message.deletedAt, source: message.source, lastSeenAt: observedAt,
-      contentHash: message.contentHash, metadata: message.metadata,
-    },
-  });
-  for (const media of message.media) {
-    await db.dialogMessageMedia.upsert({
-      where: { messageLedgerId_mediaId: { messageLedgerId: ledger.id, mediaId: media.mediaId } },
-      create: {
-        agencyId, creatorId, messageLedgerId: ledger.id, messageId: message.messageId,
-        mediaId: media.mediaId, assetId: media.assetId, mediaType: media.mediaType, ownerId: media.ownerId,
-        ownership: media.ownership, isFanMedia: media.isFanMedia, preview: media.preview,
-        durationMs: media.durationMs, canView: media.canView, firstSeenAt: observedAt, lastSeenAt: observedAt,
-      },
-      update: {
-        assetId: media.assetId, mediaType: media.mediaType, ownerId: media.ownerId, ownership: media.ownership,
-        isFanMedia: media.isFanMedia, preview: media.preview, durationMs: media.durationMs,
-        canView: media.canView, lastSeenAt: observedAt,
-      },
-    });
-  }
-  return { ledger, message, mediaCount: message.media.length, isNew: !existing, businessChanged };
-}
-
-async function projectSignal(db, signal) {
-  const message = signal.sourceMessageId
-    ? await db.dialogMessageLedger.findUnique({ where: messageUnique(signal.creatorId, signal.sourceMessageId), include: { media: true } })
-    : null;
-  const media = message?.media || [];
-  const creatorMedia = media.filter((item) => !item.isFanMedia);
-  const fanMedia = media.filter((item) => item.isFanMedia);
-  const status = classifyPurchase({
-    messageResolved: Boolean(message), deletedMessage: signal.resolveState === "DELETED_MESSAGE" || Boolean(message?.deletedAt), mediaResolved: media.length > 0,
-    hasCreatorMedia: creatorMedia.length > 0, hasFanMedia: fanMedia.length > 0,
-    priceCents: signal.amountCents > 0 ? signal.amountCents : message?.priceCents,
-    isFree: message?.isFree === true, isOpened: message?.isOpened === true, deletedUser: signal.buyerDeleted === true,
-  });
-  const priceCents = integer(signal.amountCents > 0 ? signal.amountCents : message?.priceCents, 0);
-  const resolveState = status.startsWith("UNRESOLVED") ? status : "RESOLVED";
-  const idempotencyKey = purchaseIdempotencyKey(signal);
-  const purchase = await db.vaultPurchaseLedger.upsert({
-    where: { idempotencyKey },
-    create: {
-      agencyId: signal.agencyId, creatorId: signal.creatorId, messageLedgerId: message?.id || null,
-      idempotencyKey, sourceEventId: signal.sourceEventId, sourceMessageId: signal.sourceMessageId,
-      dialogId: signal.dialogId || message?.dialogId || null, buyerId: signal.buyerId,
-      buyerUsername: signal.buyerUsername, buyerDisplayName: signal.buyerDisplayName,
-      purchasedAt: signal.occurredAt, priceCents, currency: signal.currency,
-      isOpened: message?.isOpened === true, isFree: message?.isFree === true || priceCents <= 0,
-      status, resolveState, buyerDeleted: signal.buyerDeleted === true, sourceDeleted: Boolean(message?.deletedAt),
-      resolvedAt: resolveState === "RESOLVED" ? new Date() : null,
-      metadata: { signalId: signal.id },
-    },
-    update: {
-      messageLedgerId: message?.id || undefined, sourceMessageId: signal.sourceMessageId || undefined,
-      dialogId: signal.dialogId || message?.dialogId || undefined, buyerId: signal.buyerId || undefined,
-      buyerUsername: signal.buyerUsername || undefined, buyerDisplayName: signal.buyerDisplayName || undefined,
-      purchasedAt: signal.occurredAt, priceCents, currency: signal.currency,
-      isOpened: message?.isOpened === true, isFree: message?.isFree === true || priceCents <= 0,
-      status, resolveState, buyerDeleted: signal.buyerDeleted === true, sourceDeleted: Boolean(message?.deletedAt),
-      lastSeenAt: new Date(), resolvedAt: resolveState === "RESOLVED" ? new Date() : undefined,
-    },
-  });
-
-  const allocations = allocatePackagePrice(priceCents, media);
-  const affectedAssets = new Set();
-  for (let index = 0; index < media.length; index += 1) {
-    const item = media[index];
-    const allocatedCents = allocations[index] || 0;
-    const assetId = item.assetId || (!item.isFanMedia ? item.mediaId : null);
-    await db.vaultPurchaseMedia.upsert({
-      where: { purchaseId_mediaId: { purchaseId: purchase.id, mediaId: item.mediaId } },
-      create: {
-        agencyId: signal.agencyId, creatorId: signal.creatorId, purchaseId: purchase.id,
-        mediaId: item.mediaId, assetId, mediaType: item.mediaType, isFanMedia: item.isFanMedia,
-        resolutionStatus: item.isFanMedia ? "EXCLUDED_FAN_MEDIA" : (assetId ? "RESOLVED" : "UNRESOLVED_MEDIA"),
-        allocatedCents,
-      },
-      update: {
-        assetId, mediaType: item.mediaType, isFanMedia: item.isFanMedia,
-        resolutionStatus: item.isFanMedia ? "EXCLUDED_FAN_MEDIA" : (assetId ? "RESOLVED" : "UNRESOLVED_MEDIA"),
-        allocatedCents,
-      },
-    });
-    if (assetId && !item.isFanMedia) affectedAssets.add(assetId);
-  }
-  await db.dialogPurchaseSignal.update({
-    where: { id: signal.id },
-    data: { resolveState, resolvedAt: resolveState === "RESOLVED" ? new Date() : null, lastSeenAt: new Date() },
-  });
-  return { purchase, status, affectedAssets: [...affectedAssets] };
-}
-
+// Raw messages, purchase facts and server Vault projections were retired from
+// the current product generation. Current Dialog Intelligence persists only
+// orchestration/checkpoint metadata; message and purchase truth stays in the
+// Desktop dialog-messages.sqlite authority.
 
 async function scheduleNextPlannedDialogTx(db, input) {
   const agencyId = clean(input.agencyId, 160);
@@ -2232,8 +2065,6 @@ module.exports = {
   DIALOG_INTELLIGENCE_JOB_KEY,
   ACTIVE_RUN_STATUSES,
   DIALOG_CONTROL_TRANSACTION_OPTIONS,
-  classifyPurchase,
-  purchaseCountsAsRevenue,
   purchaseIdempotencyKey,
   scheduleDialogScan,
   scheduleDialogScanTx,

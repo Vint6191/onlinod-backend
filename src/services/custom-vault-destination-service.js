@@ -2,6 +2,7 @@
 
 const { audit } = require("./audit-service");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
+const { canUsePermission } = require("./team-access-control");
 
 const MAX_FOLDER_ID = 180;
 
@@ -35,6 +36,9 @@ async function setCustomVaultDestination({ agencyId, member, creatorId: rawCreat
   const cid = creatorId(rawCreatorId);
   const nextFolderId = folderId(rawFolderId);
   await requireCreatorAccess({ agencyId, member, creatorId: cid, db: client });
+  if (!(await canUsePermission({ member, key: "content.manage_vault", db: client }))) {
+    throw fail("CUSTOM_VAULT_DESTINATION_FORBIDDEN", "Vault management permission is required", 403);
+  }
   const current = await client.creatorAccount.findFirst({ where: { id: cid, agencyId, deletedAt: null }, select: { id: true, customsVaultFolderId: true, updatedAt: true } });
   if (!current) throw fail("CUSTOM_VAULT_CREATOR_NOT_FOUND", "Creator not found", 404);
   const previousFolderId = current.customsVaultFolderId == null ? null : String(current.customsVaultFolderId).trim() || null;

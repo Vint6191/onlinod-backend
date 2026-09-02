@@ -373,6 +373,10 @@ model AgencyTelegramMtprotoAccount {
   runtimeClaimedByDeviceId String?
   runtimeClaimToken        String?
   runtimeClaimUntil        DateTime?
+  runtimeLeaseUserId       String?
+  runtimeLeaseMemberId     String?
+  runtimeLeaseAccessEpoch  Int?
+  runtimeLeaseCreatorId    String?
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 
@@ -598,6 +602,10 @@ model CustomOrder {
   lastReminderKey             String?
   reminderClaimToken          String?
   reminderClaimUntil          DateTime?
+  reminderClaimedByDeviceId   String?
+  reminderLeaseUserId         String?
+  reminderLeaseMemberId       String?
+  reminderLeaseAccessEpoch    Int?
   createdAt                   DateTime                  @default(now())
   updatedAt                   DateTime                  @updatedAt
 

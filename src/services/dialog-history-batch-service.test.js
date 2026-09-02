@@ -8,16 +8,26 @@ require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded
 delete require.cache[require.resolve("./dialog-history-batch-service")];
 const {
   DIALOG_HISTORY_BATCH_DIALOG_ID,
-  claimDialogHistoryBatchTx,
-  progressDialogHistoryBatchTx,
-  completeDialogHistoryBatchTx,
+  claimDialogHistoryBatchTx: claimDialogHistoryBatchTxRaw,
+  renewDialogHistoryBatchTx: renewDialogHistoryBatchTxRaw,
+  progressDialogHistoryBatchTx: progressDialogHistoryBatchTxRaw,
+  completeDialogHistoryBatchTx: completeDialogHistoryBatchTxRaw,
   reconcileDialogLocalCountsTx,
   realtimeWatermarkFenceTx,
-  releaseDialogHistoryBatchTx,
+  releaseDialogHistoryBatchTx: releaseDialogHistoryBatchTxRaw,
   recoverExpiredDialogHistoryBatchesTx,
   normalizeOrphanedDialogHistoryBatchesTx,
-  reclaimOwnedDialogHistoryBatchTx,
+  reclaimOwnedDialogHistoryBatchTx: reclaimOwnedDialogHistoryBatchTxRaw,
 } = require("./dialog-history-batch-service");
+
+const CURRENT_ACTOR = Object.freeze({ userId: "user-1", memberId: "member-1", accessEpoch: 1 });
+const withActor = (input = {}) => ({ ...CURRENT_ACTOR, ...input });
+const claimDialogHistoryBatchTx = (db, input) => claimDialogHistoryBatchTxRaw(db, withActor(input));
+const renewDialogHistoryBatchTx = (db, input) => renewDialogHistoryBatchTxRaw(db, withActor(input));
+const progressDialogHistoryBatchTx = (db, input) => progressDialogHistoryBatchTxRaw(db, withActor(input));
+const completeDialogHistoryBatchTx = (db, input) => completeDialogHistoryBatchTxRaw(db, withActor(input));
+const releaseDialogHistoryBatchTx = (db, input) => releaseDialogHistoryBatchTxRaw(db, withActor(input));
+const reclaimOwnedDialogHistoryBatchTx = (db, input) => reclaimOwnedDialogHistoryBatchTxRaw(db, withActor(input));
 
 function applyData(row, data) {
   for (const [key, value] of Object.entries(data || {})) {
@@ -53,20 +63,34 @@ function createDb() {
   const jobs = new Map();
   const commits = new Map();
   const locks = [];
+  const actorMember = { id: CURRENT_ACTOR.memberId, userId: CURRENT_ACTOR.userId, agencyId: "agency-1", role: "OWNER", roleKey: "owner", permissions: null, assignedCreators: "all", accessEpoch: CURRENT_ACTOR.accessEpoch, deletedAt: null, deactivatedAt: null };
   let runSeq = 0;
   const api = {
+    _member: actorMember,
     _states: states,
     _runs: runs,
     _jobs: jobs,
     _commits: commits,
     _locks: locks,
-    $queryRawUnsafe: async () => { throw new Error("void deserialization: advisory lock must not use queryRaw"); },
+    $queryRawUnsafe: async (sql, memberId, userId, agencyId) => {
+      if (String(sql).includes('FROM "AgencyMember"')) {
+        if (memberId !== CURRENT_ACTOR.memberId || userId !== CURRENT_ACTOR.userId || agencyId !== "agency-1") return [];
+        return [{ ...actorMember }];
+      }
+      throw new Error("void deserialization: advisory lock must not use queryRaw");
+    },
     $executeRawUnsafe: async (...args) => {
       locks.push(args);
       return 1;
     },
     creatorAccount: {
       findMany: async ({ where }) => where.id.in.map((id) => ({ id })),
+      findFirst: async ({ where }) => ({ id: where.id, agencyId: where.agencyId, status: "READY", deletedAt: null }),
+    },
+    agencyMember: {
+      findFirst: async ({ where }) => where.id === CURRENT_ACTOR.memberId && where.userId === CURRENT_ACTOR.userId && where.agencyId === "agency-1"
+        ? { ...actorMember }
+        : null,
     },
     moduleSetting: {
       findUnique: async () => ({ enabled: true }),
@@ -1097,3 +1121,49 @@ test("a far-future realtime boundary cannot confirm local watermarks", async () 
   assert.equal(fence.allowed, false);
   assert.equal(fence.reason, "realtime_coverage_clock_skew");
 });
+
+test("Audit16 batch renew and complete reject a lease after accessEpoch changes", async () => {
+  const db = createDb();
+  seedPlanned(db, 2);
+  seedCompletedDiscovery(db);
+  const claim = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 2,
+  });
+  assert.ok(claim.batch?.leaseToken);
+
+  db._member.accessEpoch = CURRENT_ACTOR.accessEpoch + 1;
+
+  await assert.rejects(
+    () => renewDialogHistoryBatchTx(db, {
+      agencyId: "agency-1", deviceId: "device-a", batchId: claim.batch.id, leaseToken: claim.batch.leaseToken,
+    }),
+    (error) => error?.code === "EXECUTION_ACCESS_EPOCH_STALE" && error?.status === 409,
+  );
+  await assert.rejects(
+    () => completeDialogHistoryBatchTx(db, {
+      agencyId: "agency-1", deviceId: "device-a", batchId: claim.batch.id, leaseToken: claim.batch.leaseToken, results: [],
+    }),
+    (error) => error?.code === "EXECUTION_ACCESS_EPOCH_STALE" && error?.status === 409,
+  );
+});
+
+test("Audit16 batch continuation rejects creator access revoked after claim", async () => {
+  const db = createDb();
+  seedPlanned(db, 1);
+  seedCompletedDiscovery(db);
+  const claim = await claimDialogHistoryBatchTx(db, {
+    agencyId: "agency-1", deviceId: "device-a", creatorIds: ["creator-1"], batchSize: 1,
+  });
+  assert.ok(claim.batch?.leaseToken);
+
+  db._member.role = "OPERATOR";
+  db._member.roleKey = "chatter";
+  db._member.assignedCreators = [];
+  await assert.rejects(
+    () => renewDialogHistoryBatchTx(db, {
+      agencyId: "agency-1", deviceId: "device-a", batchId: claim.batch.id, leaseToken: claim.batch.leaseToken,
+    }),
+    (error) => error?.code === "EXECUTION_CREATOR_ACCESS_REVOKED" && error?.status === 403,
+  );
+});
+

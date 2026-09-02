@@ -116,7 +116,10 @@ test("V8 role editor mutates only public enforceable controls and preserves hidd
   assert.match(service, /subPermKey:\s*\{ in:\s*\[\.\.\.PUBLIC_PERMISSION_KEYS\] \}/);
   assert.match(service, /const preservedAccess = \{ \.\.\.\(existingAccessOverride\.access \|\| \{\}\) \}/);
   assert.match(service, /PUBLIC_PERMISSION_KEY_SET\.has\(permissionKey\) && detail\.source !== "zone"/);
-  assert.match(access, /Legacy generic[\s\S]*Content permissions are also kept internal/);
+  assert.match(access, /"content\.manage_vault"/);
+  assert.match(access, /"creator_analytics\.refresh"/);
+  assert.match(access, /"traffic\.manage_costs"/);
+  assert.doesNotMatch(access, /PUBLIC_PERMISSION_KEYS[\s\S]{0,1200}"creatorAnalytics\./);
 });
 
 test("V8 legacy invitations fail closed when creator scope is missing", () => {

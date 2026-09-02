@@ -6,8 +6,8 @@ const prisma = require("../prisma");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { createPlannedJobIfAbsent } = require("./job-planning-repository");
-const { canViewTraffic, canRefreshTraffic, canManageTrafficCosts } = require("./creator-analytics-permissions");
-const { resolveEffectivePermissions } = require("./team-access-control");
+const { canUsePermission, resolveEffectivePermissions } = require("./team-access-control");
+const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const {
   FAN_DATA_POINT_REFRESH_JOB_KEY,
   VALUE_AVAILABILITY,
@@ -360,20 +360,68 @@ async function validateDeviceForCreator({ deviceId, userId, creatorId, db = pris
   if (!device || device.userId !== userId) {
     const err = new Error("Invalid device");
     err.code = "NOT_YOUR_DEVICE";
+    err.status = 403;
     throw err;
   }
   if (!creator || creator.deletedAt) {
     const err = new Error("Creator not found");
     err.code = "CREATOR_NOT_FOUND";
+    err.status = 404;
     throw err;
   }
   if (device.agencyId !== creator.agencyId) {
     const err = new Error("Device and creator agency mismatch");
     err.code = "DEVICE_CREATOR_AGENCY_MISMATCH";
+    err.status = 403;
     throw err;
   }
 
-  return { device, creator };
+  const member = await db.agencyMember.findFirst({
+    where: {
+      userId,
+      agencyId: creator.agencyId,
+      deletedAt: null,
+      deactivatedAt: null,
+      agency: { deletedAt: null },
+    },
+  });
+  if (!member) {
+    const err = new Error("Not a current member of this agency");
+    err.code = "NOT_A_MEMBER";
+    err.status = 403;
+    throw err;
+  }
+  await requireCreatorAccess({ agencyId: creator.agencyId, member, creatorId: creator.id, db });
+
+  const freshnessCutoff = new Date(Date.now() - 10 * 60 * 1000);
+  const binding = await db.deviceCreatorBinding.findFirst({
+    where: {
+      deviceId: device.id,
+      creatorId: creator.id,
+      agencyId: creator.agencyId,
+      status: "ACTIVE",
+      sessionReadReady: true,
+      OR: [
+        { lastSeenAt: { gte: freshnessCutoff } },
+        { lastCapabilityAt: { gte: freshnessCutoff } },
+      ],
+    },
+    select: { id: true, accessEpoch: true, lastSeenAt: true, lastCapabilityAt: true },
+  });
+  if (!binding) {
+    const err = new Error("Fresh creator runtime binding is required for traffic ingest");
+    err.code = "DEVICE_CREATOR_BINDING_STALE";
+    err.status = 409;
+    throw err;
+  }
+  if (binding.accessEpoch != null && Number(binding.accessEpoch) !== Number(member.accessEpoch || 0)) {
+    const err = new Error("Creator runtime binding access epoch is stale");
+    err.code = "ACCESS_EPOCH_STALE";
+    err.status = 409;
+    throw err;
+  }
+
+  return { device, creator, member, binding };
 }
 
 async function resolveTrafficIngestContext({ agencyId: agencyHint, deviceId, userId, creatorId }) {
@@ -1138,24 +1186,27 @@ async function assertTrafficViewer({ userId, creatorId }) {
   if (!creator || creator.deletedAt) {
     const err = new Error("Creator not found");
     err.code = "CREATOR_NOT_FOUND";
+    err.status = 404;
     throw err;
   }
 
   const member = await prisma.agencyMember.findFirst({
     where: { userId, agencyId: creator.agencyId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
-    select: { id: true, role: true, roleKey: true, permissions: true },
   });
   if (!member) {
     const err = new Error("Not a member of this agency");
     err.code = "NOT_A_MEMBER";
+    err.status = 403;
     throw err;
   }
 
+  await requireCreatorAccess({ agencyId: creator.agencyId, member, creatorId: creator.id, db: prisma });
   const effectivePermissions = await resolveEffectivePermissions({ member, db: prisma });
   const effectiveMember = { ...member, permissions: effectivePermissions };
-  if (!canViewTraffic(effectiveMember)) {
+  if (!(await canUsePermission({ member: effectiveMember, key: "traffic.view", db: prisma }))) {
     const err = new Error("Traffic analytics permission is required");
     err.code = "TRAFFIC_VIEW_FORBIDDEN";
+    err.status = 403;
     throw err;
   }
 
@@ -1810,9 +1861,10 @@ async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents,
 
   // Cost/ROI is a financial setting. Keep it owner/manager/admin-only so
   // chatters cannot manipulate promo performance by zeroing source cost.
-  if (!canManageTrafficCosts(member)) {
-    const err = new Error("Only OWNER / manager / admin or traffic cost permission can update traffic source cost");
-    err.code = "INSUFFICIENT_TEAM_ROLE";
+  if (!(await canUsePermission({ member, key: "traffic.manage_costs", db: prisma }))) {
+    const err = new Error("Traffic source cost management permission is required");
+    err.code = "TRAFFIC_COSTS_FORBIDDEN";
+    err.status = 403;
     throw err;
   }
 
@@ -1899,9 +1951,10 @@ function cleanHint(value, max = 255) {
 
 async function scheduleTrafficRefresh({ userId, creatorId, force = false, accountHints = {} } = {}) {
   const { creator, member } = await assertTrafficViewer({ userId, creatorId });
-  if (!canRefreshTraffic(member)) {
+  if (!(await canUsePermission({ member, key: "traffic.refresh", db: prisma }))) {
     const err = new Error("Traffic refresh permission is required");
     err.code = "TRAFFIC_REFRESH_FORBIDDEN";
+    err.status = 403;
     throw err;
   }
 

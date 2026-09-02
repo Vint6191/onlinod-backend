@@ -70,9 +70,9 @@ test("V8 only exposes enforceable Content/Automation/Creator controls", () => {
 
   assert.equal(content?.label, "Content");
   assert.deepEqual(content?.levels, []);
-  assert.deepEqual(content?.permissions.map((permission) => permission.key), ["content.review_customs", "message_library.manage"]);
+  assert.deepEqual(content?.permissions.map((permission) => permission.key), ["content.review_customs", "content.manage_vault", "message_library.manage"]);
   assert.equal(content?.permissions.some((permission) => permission.key === "content.manage"), false);
-  assert.equal(content?.permissions.some((permission) => permission.key === "content.manage_vault"), false);
+  assert.equal(content?.permissions.some((permission) => permission.key === "content.manage_vault"), true);
   assert.equal(content?.permissions.some((permission) => permission.key === "content.delete_posts"), false);
 
   assert.deepEqual(automation?.levels, []);
@@ -80,4 +80,19 @@ test("V8 only exposes enforceable Content/Automation/Creator controls", () => {
 
   assert.deepEqual(creators?.levels, []);
   assert.deepEqual(creators?.permissions.map((permission) => permission.key), ["creators.manage"]);
+});
+
+
+test("Audit16 analytics preset defaults preserve the effective legacy role fallback without privilege expansion", async () => {
+  const supervisor = await resolveRoleDefinition({ agencyId: "a", roleKey: "supervisor", db: db() });
+  assert.equal(supervisor.permissions["creator_analytics.refresh"], true);
+  assert.equal(supervisor.permissions["traffic.view"], true);
+  assert.equal(supervisor.permissions["traffic.refresh"], true);
+  assert.equal(supervisor.permissions["traffic.manage_costs"], true);
+
+  const analyst = await resolveRoleDefinition({ agencyId: "a", roleKey: "analyst", db: db() });
+  assert.equal(analyst.permissions["creator_analytics.refresh"], false);
+  assert.equal(analyst.permissions["traffic.view"], false);
+  assert.equal(analyst.permissions["traffic.refresh"], false);
+  assert.equal(analyst.permissions["traffic.manage_costs"], false);
 });

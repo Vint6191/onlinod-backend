@@ -2,7 +2,8 @@
 
 const express = require("express");
 const prisma = require("../prisma");
-const { canUsePermission, directPermissionValue } = require("../services/team-access-control");
+const { canUsePermission } = require("../services/team-access-control");
+const { requireProductCreator } = require("../middleware/product-access");
 const {
   cleanString,
   optionalString,
@@ -11,205 +12,26 @@ const {
   centsFromAny,
   parseLimit,
   parseOffset,
-  requireCreator,
   sendError,
 } = require("../services/server-store-utils");
 
 const router = express.Router();
 
-function collectionSelect() {
-  return {
-    include: {
-      blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] },
-    },
-  };
+function genericContentGone(req, res) {
+  return res.status(410).json({
+    ok: false,
+    code: "LEGACY_CONTENT_COLLECTION_API_GONE",
+    error: "Generic content collection API is retired; use the product-specific Message Library API",
+  });
 }
 
-async function normalizeCollectionInput(req, { patch = false } = {}) {
-  const body = req.body || {};
-  const data = {};
-
-  if (!patch || body.kind !== undefined) data.kind = cleanString(body.kind || "message_library", 40) || "message_library";
-  if (!patch || body.title !== undefined) data.title = cleanString(body.title || "Untitled", 180) || "Untitled";
-  if (!patch || body.description !== undefined) data.description = optionalString(body.description, 2000);
-  if (!patch || body.tags !== undefined) data.tags = jsonArray(body.tags).map((x) => cleanString(x, 60)).filter(Boolean).slice(0, 100);
-  if (!patch || body.status !== undefined) data.status = cleanString(body.status || "active", 40) || "active";
-  if (!patch || body.clientId !== undefined) data.clientId = optionalString(body.clientId, 120);
-
-  if (body.creatorId !== undefined) {
-    const creatorId = cleanString(body.creatorId, 100);
-    if (creatorId) await requireCreator(prisma, req.auth.agencyId, creatorId);
-    data.creatorId = creatorId || null;
-  } else if (!patch) {
-    data.creatorId = null;
-  }
-
-  if (!patch) {
-    data.agencyId = req.auth.agencyId;
-    data.createdByUserId = req.auth.userId;
-  }
-  data.updatedByUserId = req.auth.userId;
-
-  return data;
-}
-
-function normalizeBlockInput(body = {}, index = 0, { patch = false } = {}) {
-  const data = {};
-  if (!patch || body.order !== undefined) data.order = Number.isFinite(Number(body.order)) ? Number(body.order) : index;
-  if (!patch || body.role !== undefined) data.role = cleanString(body.role || "message", 40) || "message";
-  if (!patch || body.title !== undefined) data.title = optionalString(body.title, 180);
-  if (!patch || body.text !== undefined) data.text = cleanString(body.text || "", 12000);
-  if (!patch || body.priceCents !== undefined || body.price !== undefined) data.priceCents = centsFromAny(body, "priceCents", "price");
-  if (!patch || body.currency !== undefined) data.currency = cleanString(body.currency || "USD", 10).toUpperCase() || "USD";
-  if (!patch || body.lockedText !== undefined) data.lockedText = body.lockedText === true;
-  if (!patch || body.media !== undefined) data.media = jsonArray(body.media);
-  if (!patch || body.note !== undefined) data.note = optionalString(body.note, 2000);
-  if (!patch || body.metadata !== undefined) data.metadata = jsonObject(body.metadata);
-  if (!patch || body.clientId !== undefined) data.clientId = optionalString(body.clientId, 120);
-  return data;
-}
-
-router.get("/collections", async (req, res) => {
-  try {
-    const where = {
-      agencyId: req.auth.agencyId,
-      deletedAt: null,
-    };
-    const kind = cleanString(req.query.kind, 40);
-    const creatorId = cleanString(req.query.creatorId, 100);
-    const status = cleanString(req.query.status, 40);
-    const q = cleanString(req.query.q, 120);
-
-    if (kind) where.kind = kind;
-    where.creatorId = creatorId;
-    if (status) where.status = status;
-    if (q) {
-      where.OR = [
-        { title: { contains: q, mode: "insensitive" } },
-        { description: { contains: q, mode: "insensitive" } },
-      ];
-    }
-
-    const take = parseLimit(req.query.limit, 100, 500);
-    const skip = parseOffset(req.query.offset);
-
-    const [items, count] = await Promise.all([
-      prisma.contentCollection.findMany({
-        where,
-        include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
-        orderBy: [{ updatedAt: "desc" }],
-        take,
-        skip,
-      }),
-      prisma.contentCollection.count({ where }),
-    ]);
-
-    return res.json({ ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count });
-  } catch (err) {
-    return sendError(res, err, "CONTENT_COLLECTIONS_FAILED");
-  }
-});
-
-router.get("/collections/:id", async (req, res) => {
-  try {
-    const item = await prisma.contentCollection.findFirst({
-      where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null },
-      ...collectionSelect(),
-    });
-    if (!item) return res.status(404).json({ ok: false, code: "CONTENT_COLLECTION_NOT_FOUND", error: "Collection not found" });
-    return res.json({ ok: true, item });
-  } catch (err) {
-    return sendError(res, err, "CONTENT_COLLECTION_FAILED");
-  }
-});
-
-router.post("/collections", async (req, res) => {
-  try {
-    const collectionData = await normalizeCollectionInput(req);
-    const blocks = Array.isArray(req.body?.blocks) ? req.body.blocks : [];
-    const item = await prisma.contentCollection.create({
-      data: {
-        ...collectionData,
-        blocks: { create: blocks.map((block, index) => normalizeBlockInput(block, index)) },
-      },
-      ...collectionSelect(),
-    });
-    return res.status(201).json({ ok: true, item });
-  } catch (err) {
-    return sendError(res, err, "CONTENT_COLLECTION_CREATE_FAILED");
-  }
-});
-
-router.patch("/collections/:id", async (req, res) => {
-  try {
-    const existing = await prisma.contentCollection.findFirst({ where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null } });
-    if (!existing) return res.status(404).json({ ok: false, code: "CONTENT_COLLECTION_NOT_FOUND", error: "Collection not found" });
-    const data = await normalizeCollectionInput(req, { patch: true });
-    const item = await prisma.contentCollection.update({ where: { id: existing.id }, data, ...collectionSelect() });
-    return res.json({ ok: true, item });
-  } catch (err) {
-    return sendError(res, err, "CONTENT_COLLECTION_UPDATE_FAILED");
-  }
-});
-
-router.delete("/collections/:id", async (req, res) => {
-  try {
-    const existing = await prisma.contentCollection.findFirst({ where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null } });
-    if (!existing) return res.status(404).json({ ok: false, code: "CONTENT_COLLECTION_NOT_FOUND", error: "Collection not found" });
-    const item = await prisma.contentCollection.update({
-      where: { id: existing.id },
-      data: { deletedAt: new Date(), status: "deleted", updatedByUserId: req.auth.userId },
-    });
-    return res.json({ ok: true, item });
-  } catch (err) {
-    return sendError(res, err, "CONTENT_COLLECTION_DELETE_FAILED");
-  }
-});
-
-router.put("/collections/:id/blocks", async (req, res) => {
-  try {
-    const existing = await prisma.contentCollection.findFirst({ where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null } });
-    if (!existing) return res.status(404).json({ ok: false, code: "CONTENT_COLLECTION_NOT_FOUND", error: "Collection not found" });
-    const blocks = Array.isArray(req.body?.blocks) ? req.body.blocks : [];
-    const item = await prisma.$transaction(async (tx) => {
-      await tx.contentBlock.deleteMany({ where: { collectionId: existing.id } });
-      if (blocks.length) {
-        await tx.contentBlock.createMany({ data: blocks.map((block, index) => ({ collectionId: existing.id, ...normalizeBlockInput(block, index) })) });
-      }
-      return tx.contentCollection.update({
-        where: { id: existing.id },
-        data: { updatedByUserId: req.auth.userId },
-        include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
-      });
-    });
-    return res.json({ ok: true, item });
-  } catch (err) {
-    return sendError(res, err, "CONTENT_BLOCKS_REPLACE_FAILED");
-  }
-});
-
-router.post("/collections/:id/usage", async (req, res) => {
-  try {
-    const existing = await prisma.contentCollection.findFirst({ where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null } });
-    if (!existing) return res.status(404).json({ ok: false, code: "CONTENT_COLLECTION_NOT_FOUND", error: "Collection not found" });
-    const event = await prisma.contentUsageEvent.create({
-      data: {
-        agencyId: req.auth.agencyId,
-        collectionId: existing.id,
-        blockId: optionalString(req.body?.blockId, 100),
-        creatorId: optionalString(req.body?.creatorId || existing.creatorId, 100),
-        fanId: optionalString(req.body?.fanId, 80),
-        dialogId: optionalString(req.body?.dialogId, 80),
-        eventType: cleanString(req.body?.eventType || "used", 40) || "used",
-        metadata: jsonObject(req.body?.metadata),
-        createdByUserId: req.auth.userId,
-      },
-    });
-    return res.status(201).json({ ok: true, event });
-  } catch (err) {
-    return sendError(res, err, "CONTENT_USAGE_FAILED");
-  }
-});
+router.get("/collections", genericContentGone);
+router.get("/collections/:id", genericContentGone);
+router.post("/collections", genericContentGone);
+router.patch("/collections/:id", genericContentGone);
+router.delete("/collections/:id", genericContentGone);
+router.put("/collections/:id/blocks", genericContentGone);
+router.post("/collections/:id/usage", genericContentGone);
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -225,13 +47,6 @@ const MESSAGE_LIBRARY_KIND = "message_library_script";
 const MESSAGE_LIBRARY_TRASH_RETENTION_DAYS = 14;
 const MESSAGE_LIBRARY_PURGE_INTERVAL_MS = 10 * 60 * 1000;
 const messageLibraryPurgeStateByAgency = new Map();
-const MESSAGE_LIBRARY_MANAGER_PERMISSION_KEYS = [
-  "message_library.manage",
-  "messageLibrary.manage",
-  "content.manage",
-  "library.manage",
-];
-
 function addDays(date, days) {
   return new Date(date.getTime() + Number(days || 0) * 24 * 60 * 60 * 1000);
 }
@@ -242,18 +57,8 @@ function trashPurgeAfter(trashedAt = new Date()) {
 }
 
 async function isMessageLibraryManager(req) {
-  const member = req.auth?.membership || req.member || (req.auth ? { agencyId: req.auth.agencyId, role: req.auth.role, roleKey: req.auth.roleKey, permissions: req.auth.permissions || {} } : null);
+  const member = req.auth?.membership || req.member || null;
   if (!member) return false;
-  const perms = member.permissions || {};
-  const canonical = directPermissionValue(perms, "message_library.manage");
-  if (canonical !== null) return canonical;
-  let sawLegacyDeny = false;
-  for (const key of MESSAGE_LIBRARY_MANAGER_PERMISSION_KEYS.filter((key) => key !== "message_library.manage")) {
-    const value = directPermissionValue(perms, key);
-    if (value === true) return true;
-    if (value === false) sawLegacyDeny = true;
-  }
-  if (sawLegacyDeny) return false;
   return canUsePermission({ member, key: "message_library.manage", db: prisma });
 }
 
@@ -267,16 +72,23 @@ async function assertMessageLibraryManager(req) {
 
 async function requireMessageLibraryCreator(req) {
   const creatorId = cleanString(req.body?.creatorId || req.body?.accountId || req.query?.creatorId || req.query?.accountId, 100);
-  await requireCreator(prisma, req.auth.agencyId, creatorId);
+  if (!creatorId) {
+    const err = new Error("creatorId is required");
+    err.status = 400;
+    err.code = "CREATOR_ID_MISSING";
+    throw err;
+  }
+  await requireProductCreator(req, creatorId, { db: prisma });
   return creatorId;
 }
 
-async function purgeExpiredMessageLibraryTrash(agencyId) {
+async function purgeExpiredMessageLibraryTrash(agencyId, creatorId) {
   const now = new Date();
 
   const expiredCollections = await prisma.contentCollection.findMany({
     where: {
       agencyId,
+      creatorId,
       kind: MESSAGE_LIBRARY_KIND,
       OR: [
         { status: "trash", purgeAfter: { lte: now } },
@@ -287,7 +99,7 @@ async function purgeExpiredMessageLibraryTrash(agencyId) {
     take: 10000});
 
   const allCollections = await prisma.contentCollection.findMany({
-    where: { agencyId, kind: MESSAGE_LIBRARY_KIND },
+    where: { agencyId, creatorId, kind: MESSAGE_LIBRARY_KIND },
     select: { id: true },
     take: 10000});
   const collectionIds = allCollections.map((item) => item.id);
@@ -311,9 +123,11 @@ async function purgeExpiredMessageLibraryTrash(agencyId) {
   return { ok: true, scriptsDeleted: collectionDelete.count || 0, blocksDeleted: expiredBlocks.count || 0 };
 }
 
-async function maybePurgeExpiredMessageLibraryTrash(agencyId, { force = false } = {}) {
-  const key = String(agencyId || "").trim();
-  if (!key) return { ok: true, skipped: true, reason: "agency_missing", scriptsDeleted: 0, blocksDeleted: 0 };
+async function maybePurgeExpiredMessageLibraryTrash(agencyId, creatorId, { force = false } = {}) {
+  const agencyKey = String(agencyId || "").trim();
+  const creatorKey = String(creatorId || "").trim();
+  const key = `${agencyKey}:${creatorKey}`;
+  if (!agencyKey || !creatorKey) return { ok: true, skipped: true, reason: "creator_scope_missing", scriptsDeleted: 0, blocksDeleted: 0 };
 
   const now = Date.now();
   const previous = messageLibraryPurgeStateByAgency.get(key) || null;
@@ -322,7 +136,7 @@ async function maybePurgeExpiredMessageLibraryTrash(agencyId, { force = false } 
     return { ok: true, skipped: true, reason: "throttled", scriptsDeleted: 0, blocksDeleted: 0 };
   }
 
-  const promise = purgeExpiredMessageLibraryTrash(key);
+  const promise = purgeExpiredMessageLibraryTrash(agencyKey, creatorKey);
   messageLibraryPurgeStateByAgency.set(key, { completedAt: previous?.completedAt || 0, promise });
   try {
     const result = await promise;
@@ -541,7 +355,7 @@ async function normalizeMlScriptPayload(req, { patch = false } = {}) {
   const body = req.body || {};
   const scriptId = cleanString(body.id || body.clientId || body.scriptId, 120) || `script_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const creatorId = cleanString(body.creatorId || body.accountId || req.query.creatorId, 100);
-  await requireCreator(prisma, req.auth.agencyId, creatorId);
+  await requireProductCreator(req, creatorId, { db: prisma });
   const restoreFromTrash = body.trashedAt === null || body.status === "active";
   const trashedAt = restoreFromTrash ? null : asDateOrNull(body.trashedAt);
   const enabled = body.enabled !== false && !trashedAt;
@@ -661,7 +475,7 @@ router.get("/message-library/scripts", async (req, res) => {
     const creatorId = await requireMessageLibraryCreator(req);
     // Trash retention is maintenance, not a dependency of reads. A temporary
     // cleanup failure must never make the authoritative library unavailable.
-    await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId).catch(() => null);
+    await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId, creatorId).catch(() => null);
     const includeTrash = req.query.includeTrash === "true" || req.query.includeTrash === "1";
     const where = {
       agencyId: req.auth.agencyId,
@@ -839,8 +653,9 @@ router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", as
 router.post("/message-library/purge-expired", async (req, res) => {
   try {
     await assertMessageLibraryManager(req);
-    const result = await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId, { force: true });
-    return res.json(result);
+    const creatorId = await requireMessageLibraryCreator(req);
+    const result = await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId, creatorId, { force: true });
+    return res.json({ ...result, creatorId });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_PURGE_EXPIRED_FAILED");
   }
@@ -848,22 +663,21 @@ router.post("/message-library/purge-expired", async (req, res) => {
 
 router.get("/message-library/usage", async (req, res) => {
   try {
-    const creatorId = cleanString(req.query.creatorId || req.query.accountId, 100);
-    if (creatorId) await requireCreator(prisma, req.auth.agencyId, creatorId);
+    const creatorId = await requireMessageLibraryCreator(req);
     const collections = await prisma.contentCollection.findMany({
-      where: { agencyId: req.auth.agencyId, kind: MESSAGE_LIBRARY_KIND, ...(creatorId ? { creatorId } : {}) },
+      where: { agencyId: req.auth.agencyId, creatorId, kind: MESSAGE_LIBRARY_KIND },
       select: { id: true },
       take: 10000,
     });
     const collectionIds = collections.map((item) => item.id);
     if (!collectionIds.length) return res.json({ ok: true, source: "server", events: [], count: 0 });
     const events = await prisma.contentUsageEvent.findMany({
-      where: { agencyId: req.auth.agencyId, collectionId: { in: collectionIds }, ...(creatorId ? { creatorId } : {}) },
+      where: { agencyId: req.auth.agencyId, creatorId, collectionId: { in: collectionIds } },
       orderBy: [{ createdAt: "desc" }],
       take: parseLimit(req.query.limit, 500, 2000),
       skip: parseOffset(req.query.offset),
     });
-    return res.json({ ok: true, source: "server", events, count: events.length });
+    return res.json({ ok: true, source: "server", creatorId, events, count: events.length });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_USAGE_LIST_FAILED");
   }
@@ -881,7 +695,7 @@ router.post("/message-library/usage", async (req, res) => {
       err.code = "MESSAGE_LIBRARY_USAGE_KEYS_MISSING";
       throw err;
     }
-    await requireCreator(prisma, req.auth.agencyId, creatorId);
+    await requireProductCreator(req, creatorId, { db: prisma });
 
     const collection = await prisma.contentCollection.findFirst({
       where: { agencyId: req.auth.agencyId, kind: MESSAGE_LIBRARY_KIND, clientId: scriptId, creatorId },

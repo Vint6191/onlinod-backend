@@ -28,8 +28,8 @@ const { z } = require("zod");
 const prisma = require("../prisma");
 const { requireAuthDevice } = require("../middleware/auth");
 const { scheduleJobNow } = require("../services/job-scheduler");
-const { canViewEarnings, canRefreshAnalytics } = require("../services/creator-analytics-permissions");
 const { resolveEffectivePermissions } = require("../services/team-access-control");
+const { requireCreatorAccess, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
 const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily } = require("../services/creator-analytics-ledger-service");
 const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity, readCreatorTaskActivityDays } = require("../services/creator-overview-service");
@@ -57,14 +57,14 @@ const router = express.Router();
 
 
 function requireEarningsPermission(res, member) {
-  if (canViewEarnings(member)) return true;
-  res.status(403).json({ ok: false, code: "EARNINGS_VIEW_FORBIDDEN", error: "Earnings permission is required" });
+  if (member?.permissions?.["money.view_earnings"] === true) return true;
+  res.status(403).json({ ok: false, code: "FEATURE_FORBIDDEN", permission: "money.view_earnings", error: "money.view_earnings permission is required" });
   return false;
 }
 
 function requireRefreshPermission(res, member) {
-  if (canRefreshAnalytics(member)) return true;
-  res.status(403).json({ ok: false, code: "ANALYTICS_REFRESH_FORBIDDEN", error: "Owner, admin, manager or analytics refresh permission is required" });
+  if (member?.permissions?.["creator_analytics.refresh"] === true) return true;
+  res.status(403).json({ ok: false, code: "FEATURE_FORBIDDEN", permission: "creator_analytics.refresh", error: "creator_analytics.refresh permission is required" });
   return false;
 }
 
@@ -131,57 +131,96 @@ function snapshotForClient(s) {
   };
 }
 
-async function requireMembership(userId, agencyId) {
-  if (!userId || !agencyId) return null;
-
-  const member = await prisma.agencyMember.findFirst({
-    where: {
-      agencyId,
-      userId,
-      deletedAt: null,
-      deactivatedAt: null,
-      agency: { deletedAt: null },
-    },
-  });
-  if (!member) return null;
+async function effectiveCurrentMember(req) {
+  const member = req.auth?.membership || req.member || null;
+  if (!member || String(member.agencyId || "") !== String(req.auth?.agencyId || "")) return null;
   return { ...member, permissions: await resolveEffectivePermissions({ member, db: prisma }) };
 }
 
-// Look up a creator by id and return both the creator and the
-// caller's membership in its agency. 403 if caller can't access.
+// Creator-level Stats always uses the canonical assigned creator authority.
 async function loadCreatorWithAccess(req, res, creatorId) {
-  const creator = await prisma.creatorAccount.findUnique({
-    where: { id: creatorId },
-  });
-  if (!creator || creator.deletedAt) {
-    res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
+  try {
+    const member = await effectiveCurrentMember(req);
+    if (!member) {
+      res.status(403).json({ ok: false, code: "NOT_A_MEMBER", error: "Not a current member of this agency" });
+      return null;
+    }
+    const creator = await requireCreatorAccess({
+      agencyId: req.auth.agencyId,
+      member,
+      creatorId: String(creatorId || ""),
+      db: prisma,
+    });
+    const fullCreator = await prisma.creatorAccount.findFirst({ where: { id: creator.id, agencyId: req.auth.agencyId, deletedAt: null } });
+    return { creator: fullCreator || creator, member };
+  } catch (error) {
+    res.status(Number(error?.status) || 403).json({
+      ok: false,
+      code: error?.code || "CREATOR_ACCESS_FORBIDDEN",
+      error: error?.message || "Creator access denied",
+    });
     return null;
   }
-
-  const member = await requireMembership(actorUserId(req), creator.agencyId);
-  if (!member) {
-    res.status(403).json({ ok: false, code: "NOT_A_MEMBER", error: "Not a member of this agency" });
-    return null;
-  }
-
-  return { creator, member };
 }
 
-// Same but for agency-level endpoints.
+// Agency convenience endpoints are still member-scoped: membership never
+// implies access to every creator in the agency.
 async function loadAgencyAccess(req, res, agencyId) {
-  const agency = await prisma.agency.findUnique({ where: { id: agencyId } });
-  if (!agency || agency.deletedAt) {
+  if (String(agencyId || "") !== String(req.auth?.agencyId || "")) {
+    res.status(403).json({ ok: false, code: "AGENCY_FORBIDDEN", error: "No access to agency" });
+    return null;
+  }
+  const agency = await prisma.agency.findFirst({ where: { id: req.auth.agencyId, deletedAt: null } });
+  if (!agency) {
     res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
     return null;
   }
-
-  const member = await requireMembership(actorUserId(req), agency.id);
+  const member = await effectiveCurrentMember(req);
   if (!member) {
-    res.status(403).json({ ok: false, code: "NOT_A_MEMBER", error: "Not a member of this agency" });
+    res.status(403).json({ ok: false, code: "NOT_A_MEMBER", error: "Not a current member of this agency" });
     return null;
   }
+  const scope = await allowedCreatorScope({ agencyId: agency.id, member, db: prisma });
+  return { agency, member, scope };
+}
 
-  return { agency, member };
+async function requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId }) {
+  const userId = actorUserId(req);
+  const boundDeviceId = requireAuthDevice(req, suppliedDeviceId, {
+    requiredCode: "ANALYTICS_DEVICE_BOUND_TOKEN_REQUIRED",
+    mismatchCode: "DEVICE_IDENTITY_MISMATCH",
+  });
+  const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
+  const device = await prisma.workerDevice.findFirst({
+    where: { id: boundDeviceId, userId, agencyId: creator.agencyId, lastSeenAt: { gte: freshAfter } },
+    select: { id: true },
+  });
+  if (!device) {
+    const error = new Error("The authenticated reporting device is not active in this agency");
+    error.code = "ANALYTICS_DEVICE_FORBIDDEN";
+    error.status = 403;
+    throw error;
+  }
+  const member = req.auth?.membership || req.member || null;
+  const binding = await prisma.deviceCreatorBinding.findFirst({
+    where: {
+      deviceId: device.id,
+      creatorId: creator.id,
+      agencyId: creator.agencyId,
+      status: "ACTIVE",
+      sessionReadReady: true,
+      lastSeenAt: { gte: freshAfter },
+      ...(Number.isInteger(Number(member?.accessEpoch)) ? { accessEpoch: Number(member.accessEpoch) } : {}),
+    },
+    select: { id: true },
+  });
+  if (!binding) {
+    const error = new Error("The authenticated reporting device has no fresh SESSION_READ capability for this creator");
+    error.code = "ANALYTICS_CREATOR_CAPABILITY_STALE";
+    error.status = 409;
+    throw error;
+  }
+  return device;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -215,19 +254,10 @@ router.post("/earnings/upsert", async (req, res) => {
     const input = earningsUpsertSchema.parse(req.body);
     const userId = actorUserId(req);
 
-    // Validate device → it must belong to this user.
-    const device = await prisma.workerDevice.findUnique({ where: { id: input.deviceId } });
-    if (!device) {
-      return res.status(404).json({ ok: false, code: "DEVICE_NOT_FOUND", error: "Device not found. Heartbeat first." });
-    }
-    if (device.userId !== userId) {
-      return res.status(403).json({ ok: false, code: "NOT_YOUR_DEVICE", error: "This deviceId is not yours" });
-    }
-
-    // Validate creator + access.
     const ctx = await loadCreatorWithAccess(req, res, input.creatorId);
     if (!ctx) return;
     const { creator } = ctx;
+    const device = await requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId: input.deviceId });
 
     const data = {
       creatorId: creator.id,
@@ -261,9 +291,9 @@ router.post("/earnings/upsert", async (req, res) => {
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     console.error("[stats/earnings/upsert] failed:", err);
-    return res.status(500).json({
+    return res.status(Number(err?.status) || 500).json({
       ok: false,
-      code: "EARNINGS_UPSERT_FAILED",
+      code: err?.code || "EARNINGS_UPSERT_FAILED",
       error: err?.message || "Failed",
     });
   }
@@ -285,14 +315,10 @@ router.post("/campaigns/upsert", async (req, res) => {
     const input = campaignsUpsertSchema.parse(req.body);
     const userId = actorUserId(req);
 
-    const device = await prisma.workerDevice.findUnique({ where: { id: input.deviceId } });
-    if (!device || device.userId !== userId) {
-      return res.status(403).json({ ok: false, code: "NOT_YOUR_DEVICE", error: "Invalid device" });
-    }
-
     const ctx = await loadCreatorWithAccess(req, res, input.creatorId);
     if (!ctx) return;
     const { creator } = ctx;
+    const device = await requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId: input.deviceId });
 
     const cleanCampaigns = sanitizeCampaigns(input.campaigns);
     let active = 0,
@@ -338,9 +364,9 @@ router.post("/campaigns/upsert", async (req, res) => {
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     console.error("[stats/campaigns/upsert] failed:", err);
-    return res.status(500).json({
+    return res.status(Number(err?.status) || 500).json({
       ok: false,
-      code: "CAMPAIGNS_UPSERT_FAILED",
+      code: err?.code || "CAMPAIGNS_UPSERT_FAILED",
       error: err?.message || "Failed",
     });
   }
@@ -496,7 +522,11 @@ router.get("/agencies/:agencyId/earnings/summary", async (req, res) => {
     }
 
     const snapshots = await prisma.creatorEarningsSnapshot.findMany({
-      where: { agencyId: ctx.agency.id, rangeKey: range },
+      where: {
+        agencyId: ctx.agency.id,
+        rangeKey: range,
+        ...(ctx.scope.broad ? {} : { creatorId: { in: ctx.scope.creatorIds.length ? ctx.scope.creatorIds : ["__none__"] } }),
+      },
       include: {
         creator: { select: { id: true, displayName: true, username: true, avatarUrl: true, status: true } },
       },
@@ -641,7 +671,12 @@ router.post("/agencies/:agencyId/refresh", async (req, res) => {
     }
 
     const creators = await prisma.creatorAccount.findMany({
-      where: { agencyId: ctx.agency.id, deletedAt: null, status: "READY" },
+      where: {
+        agencyId: ctx.agency.id,
+        deletedAt: null,
+        status: "READY",
+        ...(ctx.scope.broad ? {} : { id: { in: ctx.scope.creatorIds.length ? ctx.scope.creatorIds : ["__none__"] } }),
+      },
       select: { id: true, agencyId: true },
       take: 10000,
     });
@@ -1045,7 +1080,7 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
     const userId = actorUserId(req);
     const boundDeviceId = requireAuthDevice(req, input.deviceId, {
       requiredCode: "LIVE_NOTIFICATION_DEVICE_BOUND_TOKEN_REQUIRED",
-      mismatchCode: "LIVE_NOTIFICATION_DEVICE_IDENTITY_MISMATCH",
+      mismatchCode: "DEVICE_IDENTITY_MISMATCH",
     });
     const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
     const device = await prisma.workerDevice.findFirst({
@@ -1060,6 +1095,7 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
         agencyId: ctx.creator.agencyId,
         status: "ACTIVE",
         realtimeReady: true,
+        ...(Number.isInteger(Number(ctx.member?.accessEpoch)) ? { accessEpoch: Number(ctx.member.accessEpoch) } : {}),
         lastSeenAt: { gte: freshAfter },
       },
       select: { id: true },
@@ -1124,7 +1160,7 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
   } catch (error) {
     if (error?.issues) return validationError(res, error);
     console.error("[stats/notifications-live] failed:", error);
-    return res.status(500).json({ ok: false, code: error?.code || "LIVE_NOTIFICATION_INGEST_FAILED", error: error?.message || "Failed" });
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "LIVE_NOTIFICATION_INGEST_FAILED", error: error?.message || "Failed" });
   }
 });
 
@@ -1133,11 +1169,13 @@ router.post("/creators/:creatorId/messages-daily", async (req, res) => {
     const input = messagesDailySchema.parse(req.body || {});
     const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
     if (!ctx) return;
-    if (!requireRefreshPermission(res, ctx.member)) return;
+    // Daily message facts are machine-plane observations. Authorization is
+    // creator scope + the signed auth device + a fresh creator binding; the
+    // operator-facing analytics refresh permission must not gate ingestion.
     const userId = actorUserId(req);
     const boundDeviceId = requireAuthDevice(req, input.deviceId, {
       requiredCode: "MESSAGES_DAILY_DEVICE_BOUND_TOKEN_REQUIRED",
-      mismatchCode: "MESSAGES_DAILY_DEVICE_IDENTITY_MISMATCH",
+      mismatchCode: "DEVICE_IDENTITY_MISMATCH",
     });
     const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
     const device = await prisma.workerDevice.findFirst({
@@ -1151,6 +1189,7 @@ router.post("/creators/:creatorId/messages-daily", async (req, res) => {
         creatorId: ctx.creator.id,
         agencyId: ctx.creator.agencyId,
         status: "ACTIVE",
+        ...(Number.isInteger(Number(ctx.member?.accessEpoch)) ? { accessEpoch: Number(ctx.member.accessEpoch) } : {}),
         lastSeenAt: { gte: freshAfter },
       },
       select: { id: true },
@@ -1170,7 +1209,7 @@ router.post("/creators/:creatorId/messages-daily", async (req, res) => {
   } catch (error) {
     if (error?.issues) return validationError(res, error);
     console.error("[stats/messages-daily] failed:", error);
-    return res.status(500).json({ ok: false, code: "MESSAGES_DAILY_UPSERT_FAILED", error: error?.message || "Failed" });
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "MESSAGES_DAILY_UPSERT_FAILED", error: error?.message || "Failed" });
   }
 });
 

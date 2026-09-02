@@ -426,28 +426,53 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
   if (!requestedLeases.length) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
 
   const requestedByAccount = new Map(requestedLeases.map((row) => [row.accountId, row.claimToken]));
-  const leasedRows = await client.agencyTelegramMtprotoAccount.findMany({
-    where: {
-      agencyId,
-      id: { in: [...requestedByAccount.keys()] },
-      runtimeClaimedByDeviceId: normalizedDeviceId,
-      runtimeClaimUntil: { gt: now },
-    },
-    select: { id: true, runtimeClaimToken: true },
-    take: MAX_RUNTIME_LEASES,
-  });
+  const [scope, leasedRows, accountRows, recipientRow] = await Promise.all([
+    allowedCreatorScope({ agencyId, member, db: client }),
+    client.agencyTelegramMtprotoAccount.findMany({
+      where: {
+        agencyId,
+        id: { in: [...requestedByAccount.keys()] },
+        runtimeClaimedByDeviceId: normalizedDeviceId,
+        runtimeClaimUntil: { gt: now },
+      },
+      select: {
+        id: true,
+        runtimeClaimToken: true,
+        runtimeLeaseUserId: true,
+        runtimeLeaseMemberId: true,
+        runtimeLeaseAccessEpoch: true,
+        runtimeLeaseCreatorId: true,
+      },
+      take: MAX_RUNTIME_LEASES,
+    }),
+    client.agencyTelegramMtprotoAccount.findMany({ where: { agencyId }, select: { id: true }, orderBy: { id: "asc" }, take: 2 }),
+    client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null),
+  ]);
+  const currentUserId = String(member.userId || "");
+  const currentMemberId = String(member.id || "");
+  const currentAccessEpoch = Number(member.accessEpoch);
+  const scopedCreatorIds = new Set(scope.creatorIds || []);
   const validAccountIds = new Set(
     leasedRows
-      .filter((row) => requestedByAccount.get(String(row.id)) === String(row.runtimeClaimToken || ""))
+      .filter((row) => {
+        const anchorCreatorId = String(row.runtimeLeaseCreatorId || "");
+        return requestedByAccount.get(String(row.id)) === String(row.runtimeClaimToken || "")
+          && String(row.runtimeLeaseUserId || "") === currentUserId
+          && String(row.runtimeLeaseMemberId || "") === currentMemberId
+          && Number.isInteger(currentAccessEpoch)
+          && Number(row.runtimeLeaseAccessEpoch) === currentAccessEpoch
+          && Boolean(anchorCreatorId)
+          && (scope.broad || scopedCreatorIds.has(anchorCreatorId));
+      })
       .map((row) => String(row.id)),
   );
   if (!validAccountIds.size) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
 
-  const [scope, accountRows, recipientRow] = await Promise.all([
-    allowedCreatorScope({ agencyId, member, db: client }),
-    client.agencyTelegramMtprotoAccount.findMany({ where: { agencyId }, select: { id: true }, orderBy: { id: "asc" }, take: 2 }),
-    client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null),
-  ]);
+  /* The upload queue borrows the Telegram runtime lease rather than creating a
+     second claim generation. Treat every actor field on that lease as
+     authority: a stale member/accessEpoch/creator anchor cannot expose new OF
+     upload work even while device/token/TTL still match. */
+
   const recipient = vaultUploadRecipient(recipientRow?.value);
   if (!recipient) {
     return {

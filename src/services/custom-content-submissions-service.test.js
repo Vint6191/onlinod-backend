@@ -30,7 +30,11 @@ function fakeDb(seed = {}) {
   const submissions = (seed.submissions || []).map(clone);
   const mediaAssets = (seed.mediaAssets || []).map(clone);
   const telegramAccounts = (seed.telegramAccounts || [
-    { id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1", runtimeClaimUntil: new Date("2026-08-21T14:00:00.000Z") },
+    {
+      id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1",
+      runtimeClaimUntil: new Date("2026-08-21T14:00:00.000Z"), runtimeLeaseUserId: "user-1",
+      runtimeLeaseMemberId: "member-1", runtimeLeaseAccessEpoch: 1, runtimeLeaseCreatorId: "creator-1",
+    },
   ]).map(clone);
   const workspaceSettings = new Map(Object.entries(seed.workspaceSettings || { vaultUploadRecipient: "relay_model" }));
   const audits = [];
@@ -166,7 +170,7 @@ function fakeDb(seed = {}) {
   };
 }
 
-const member = { id: "member-1", userId: "user-1", roleKey: "chatter", role: "OPERATOR", assignedCreators: ["creator-1"] };
+const member = { id: "member-1", userId: "user-1", roleKey: "chatter", role: "OPERATOR", assignedCreators: ["creator-1"], accessEpoch: 1 };
 
 test("Prisma submission ledger stays deliberately compact", () => {
   const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
@@ -327,6 +331,22 @@ test("V20.3 rejects stale runtime leases before exposing Telegram source work", 
     leases: [{ accountId: "tg-1", claimToken: "wrong-token" }],
     now: new Date("2026-08-21T13:00:00.000Z"),
     db,
+  });
+  assert.deepEqual(result.items, []);
+});
+
+test("Audit16 upload work rejects a Telegram lease from a stale access epoch before exposing OF work", async () => {
+  const db = fakeDb({
+    submissions: [baseSubmission({ telegramMessageIds: [702], ofMediaIds: [] })],
+    telegramAccounts: [{
+      id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1",
+      runtimeClaimUntil: new Date("2026-08-21T14:00:00.000Z"), runtimeLeaseUserId: "user-1",
+      runtimeLeaseMemberId: "member-1", runtimeLeaseAccessEpoch: 0, runtimeLeaseCreatorId: "creator-1",
+    }],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
+    now: new Date("2026-08-21T13:00:00.000Z"), db,
   });
   assert.deepEqual(result.items, []);
 });

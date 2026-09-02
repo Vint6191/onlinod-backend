@@ -30,7 +30,11 @@ function fakeDb(seed = {}) {
     { id: "creator-2", agencyId: "agency-1", displayName: "Model B", username: "model_b", avatarUrl: null, telegramContact: "@model_b", telegramUserId: "1002", telegramAccountId: null, deletedAt: null, status: "READY" },
   ];
   const members = {
-    "member-1": { id: "member-1", displayName: "Chatter", roleKey: "chatter", user: { name: "Chatter", email: "c@test" } },
+    "member-1": {
+      id: "member-1", userId: "user-1", agencyId: "agency-1", displayName: "Chatter",
+      role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"], accessEpoch: 1,
+      deletedAt: null, deactivatedAt: null, user: { name: "Chatter", email: "c@test" },
+    },
   };
   const rows = (seed.orders || []).map(clone);
   const accounts = (seed.accounts || [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null }]).map(clone);
@@ -91,6 +95,13 @@ function fakeDb(seed = {}) {
   return {
     _rows: rows,
     workspaceSetting: { async findUnique() { return null; } },
+    agencyMember: {
+      async findFirst({ where }) {
+        const row = members[where.id];
+        if (!row || row.id !== where.id || row.userId !== where.userId || row.agencyId !== where.agencyId || row.deletedAt || row.deactivatedAt) return null;
+        return clone(row);
+      },
+    },
     agencyTelegramMtprotoAccount: {
       async findFirst({ where }) {
         const row = accounts.find((candidate) => candidate.id === where.id && candidate.agencyId === where.agencyId);
@@ -149,7 +160,7 @@ function fakeDb(seed = {}) {
   };
 }
 
-const member = { id: "member-1", userId: "user-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"] };
+const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"], accessEpoch: 1 };
 
 test("media ids are stored as a stable de-duplicated space-separated list", () => {
   assert.deepEqual(mediaIdsArray("10 20,20;30"), ["10", "20", "30"]);
@@ -417,7 +428,11 @@ test("Telegram references persist only task/message ids on the custom and merge 
 test("leased chatter runtime records only creator-bound Telegram replies and dedupes by message id", async () => {
   const now = new Date("2026-08-19T14:00:00.000Z");
   const db = fakeDb({
-    accounts: [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1", runtimeClaimUntil: new Date("2026-08-19T14:05:00.000Z") }],
+    accounts: [{
+      id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1",
+      runtimeClaimUntil: new Date("2026-08-19T14:05:00.000Z"), runtimeLeaseUserId: "user-1",
+      runtimeLeaseMemberId: "member-1", runtimeLeaseAccessEpoch: 1, runtimeLeaseCreatorId: "creator-1",
+    }],
     orders: [{
       id: "order-inbound", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
       scenario: "content custom", internalNote: null, status: "PENDING", type: "CONTENT", contentKind: "VIDEO", physicalStatus: null,

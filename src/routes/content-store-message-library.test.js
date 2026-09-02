@@ -50,7 +50,13 @@ function response() {
 }
 
 function auth() {
-  return { agencyId: "agency-1", userId: "user-1", role: "OWNER" };
+  return {
+    agencyId: "agency-1",
+    userId: "user-1",
+    deviceId: "device-1",
+    role: "OWNER",
+    membership: { id: "member-1", agencyId: "agency-1", role: "OWNER", roleKey: "owner", accessEpoch: 1, assignedCreators: "all", permissions: {} },
+  };
 }
 
 function baseDb() {
@@ -210,6 +216,21 @@ test("script id collisions cannot move a script to another creator", async () =>
   assert.equal(transactionCalled, false);
 });
 
+test("message-library usage listing and manual purge require an explicit creatorId", async () => {
+  const db = baseDb();
+  const api = loadRoute(db);
+
+  const usageRes = response();
+  await api.route("GET", "/message-library/usage")({ auth: auth(), query: {}, body: {} }, usageRes);
+  assert.equal(usageRes.statusCode, 400);
+  assert.equal(usageRes.body.code, "CREATOR_ID_MISSING");
+
+  const purgeRes = response();
+  await api.route("POST", "/message-library/purge-expired")({ auth: auth(), query: {}, body: {} }, purgeRes);
+  assert.equal(purgeRes.statusCode, 400);
+  assert.equal(purgeRes.body.code, "CREATOR_ID_MISSING");
+});
+
 test("message-library listing and destructive actions require an explicit creatorId", async () => {
   const db = baseDb();
   let collectionLookup = false;
@@ -287,7 +308,7 @@ test("automatic expired-trash cleanup is throttled per agency while manual purge
   assert.equal(purgeCollectionScans, 2, "a frequent list refresh must not rescan all agency trash");
 
   const manual = response();
-  await api.route("POST", "/message-library/purge-expired")({ auth: auth(), query: {}, body: {} }, manual);
+  await api.route("POST", "/message-library/purge-expired")({ auth: auth(), query: {}, body: { creatorId: "creator-1" } }, manual);
   assert.equal(manual.statusCode, 200);
   assert.equal(purgeCollectionScans, 4, "manual manager purge must bypass the read throttle");
 });

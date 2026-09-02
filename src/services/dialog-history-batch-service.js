@@ -9,6 +9,7 @@ const {
   finalizeCommittedDialogDiscoveryTx,
 } = require("./dialog-intelligence-service");
 const { isTerminalDialogOutcome } = require("./dialog-terminal-outcome");
+const { assertExecutionAccessFence } = require("./execution-access-fence-service");
 
 const DIALOG_HISTORY_BATCH_DIALOG_ID = "__dialog_history_batch__";
 const ACTIVE_BATCH_STATUSES = ["QUEUED", "RUNNING"];
@@ -29,6 +30,20 @@ const UNSETTLED_DIALOG_HISTORY_STATUSES = [
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function leaseActor(input = {}) {
+  return {
+    userId: clean(input.userId, 200),
+    memberId: clean(input.memberId, 200),
+    accessEpoch: integer(input.accessEpoch, -1, -1),
+  };
+}
+
+function sameLeaseActor(continuation, actor) {
+  return clean(continuation.leaseUserId, 200) === actor.userId
+    && clean(continuation.leaseMemberId, 200) === actor.memberId
+    && integer(continuation.leaseAccessEpoch, -1, -1) === actor.accessEpoch;
 }
 function list(value) { return Array.isArray(value) ? value : []; }
 function clean(value, max = 500) {
@@ -296,6 +311,7 @@ async function normalizeOrphanedDialogHistoryBatchesTx(db, input = {}) {
 async function reclaimOwnedDialogHistoryBatchTx(db, input = {}) {
   const agencyId = clean(input.agencyId, 160);
   const deviceId = clean(input.deviceId, 200);
+  const actor = leaseActor(input);
   const creatorIds = [...new Set(list(input.creatorIds).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 1_000);
   if (!agencyId || !deviceId || !creatorIds.length) return null;
 
@@ -313,6 +329,8 @@ async function reclaimOwnedDialogHistoryBatchTx(db, input = {}) {
   for (const run of runs) {
     const continuation = object(run.continuation);
     if (clean(continuation.claimedByDeviceId, 200) !== deviceId) continue;
+    if (!sameLeaseActor(continuation, actor)) continue;
+    await assertExecutionAccessFence({ db, agencyId, creatorId: run.creatorId, ...actor, lock: true });
     const leaseUntil = dateOrNull(continuation.leaseUntil);
     if (!leaseUntil || leaseUntil.getTime() <= Date.now()) continue;
 
@@ -353,6 +371,9 @@ async function reclaimOwnedDialogHistoryBatchTx(db, input = {}) {
     const nextContinuation = {
       ...continuation,
       claimedByDeviceId: deviceId,
+      leaseUserId: actor.userId,
+      leaseMemberId: actor.memberId,
+      leaseAccessEpoch: actor.accessEpoch,
       leaseTokenHash: hashToken(token),
       leaseRevision,
       leaseUntil: expiresAt.toISOString(),
@@ -392,7 +413,13 @@ async function reclaimOwnedDialogHistoryBatchTx(db, input = {}) {
 async function claimDialogHistoryBatchTx(db, input) {
   const agencyId = clean(input.agencyId, 160);
   const deviceId = clean(input.deviceId, 200);
-  if (!agencyId || !deviceId) throw new Error("agencyId and deviceId are required");
+  const actor = leaseActor(input);
+  if (!agencyId || !deviceId || !actor.userId || !actor.memberId || actor.accessEpoch < 0) {
+    const error = new Error("agencyId, deviceId and current access actor are required");
+    error.code = "DIALOG_BATCH_ACCESS_FENCE_MISSING";
+    error.status = 400;
+    throw error;
+  }
   const control = await db.moduleSetting.findUnique({
     where: { agencyId_moduleKey: { agencyId, moduleKey: "dialog_intelligence" } },
     select: { enabled: true },
@@ -400,6 +427,15 @@ async function claimDialogHistoryBatchTx(db, input) {
   if (control?.enabled === false) return { ok: true, batch: null, reason: "module_disabled" };
   const allowedCreatorIds = await assertAllowedCreators(db, agencyId, input.creatorIds);
   if (!allowedCreatorIds.length) return { ok: true, batch: null, reason: "no_ready_creators" };
+  if (allowedCreatorIds.length !== [...new Set(list(input.creatorIds).map((value) => clean(value, 160)).filter(Boolean))].length) {
+    const error = new Error("Requested creator set contains an unavailable creator");
+    error.code = "CREATOR_ACCESS_FORBIDDEN";
+    error.status = 403;
+    throw error;
+  }
+  for (const creatorId of allowedCreatorIds) {
+    await assertExecutionAccessFence({ db, agencyId, creatorId, ...actor, lock: true });
+  }
 
   await lockDialogHistoryBatchClaimsTx(db, agencyId);
   // The final discovery page may be committed even when the Desktop loses the
@@ -421,6 +457,9 @@ async function claimDialogHistoryBatchTx(db, input) {
     agencyId,
     deviceId,
     creatorIds: allowedCreatorIds,
+    userId: actor.userId,
+    memberId: actor.memberId,
+    accessEpoch: actor.accessEpoch,
     leaseMs: input.leaseMs,
   });
   if (reclaimed) return { ok: true, reason: "reclaimed", batch: reclaimed, settledCreators: [] };
@@ -560,6 +599,9 @@ async function claimDialogHistoryBatchTx(db, input) {
       continuation: {
         kind: "dialog_history_batch",
         claimedByDeviceId: deviceId,
+        leaseUserId: actor.userId,
+        leaseMemberId: actor.memberId,
+        leaseAccessEpoch: actor.accessEpoch,
         leaseTokenHash: hashToken(token),
         leaseRevision: 1,
         leaseUntil: expiresAt.toISOString(),
@@ -604,6 +646,9 @@ async function claimDialogHistoryBatchTx(db, input) {
   const continuation = {
     kind: "dialog_history_batch",
     claimedByDeviceId: deviceId,
+    leaseUserId: actor.userId,
+    leaseMemberId: actor.memberId,
+    leaseAccessEpoch: actor.accessEpoch,
     leaseTokenHash: hashToken(token),
     leaseRevision: 1,
     leaseUntil: expiresAt.toISOString(),
@@ -676,6 +721,13 @@ async function requireBatchLeaseTx(db, input, options = {}) {
     throw error;
   }
   const continuation = object(run.continuation);
+  const actor = leaseActor(input);
+  if (!actor.userId || !actor.memberId || actor.accessEpoch < 0 || !sameLeaseActor(continuation, actor)) {
+    const error = new Error("Dialog history batch access actor is stale");
+    error.code = "EXECUTION_ACCESS_EPOCH_STALE";
+    error.status = 409;
+    throw error;
+  }
   if (clean(continuation.claimedByDeviceId, 200) !== deviceId) {
     const error = new Error("Dialog history batch is claimed by another device");
     error.code = "DIALOG_BATCH_CLAIMED_BY_OTHER";
@@ -688,6 +740,7 @@ async function requireBatchLeaseTx(db, input, options = {}) {
     error.status = 409;
     throw error;
   }
+  await assertExecutionAccessFence({ db, agencyId, creatorId: run.creatorId, ...actor, lock: true });
   const status = clean(run.status, 40).toUpperCase();
   if (!ACTIVE_BATCH_STATUSES.includes(status)) {
     if (!(options.allowCompleted === true && status === "COMPLETED")) {
