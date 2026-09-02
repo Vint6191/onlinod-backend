@@ -348,7 +348,7 @@ async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurr
   return { ok: true, created: planned.summary.created > 0, reason: planned.summary.created > 0 ? "planned" : "nothing_due", planned };
 }
 
-async function retryCandidateDelivery({ agencyId, creatorId, fanId }) {
+async function retryCandidateDelivery({ agencyId, creatorId, fanId, actorUserId }) {
   const candidate = await prisma.followBackCandidate.findFirst({
     where: { agencyId, creatorId, fanId },
     select: { id: true, latestDeliveryId: true },
@@ -359,7 +359,7 @@ async function retryCandidateDelivery({ agencyId, creatorId, fanId }) {
   if (!candidate.latestDeliveryId) {
     throw Object.assign(new Error("Candidate has no delivery to retry"), { code: "candidate_delivery_not_found", status: 409 });
   }
-  const retried = await retryActionDelivery({ agencyId, deliveryId: candidate.latestDeliveryId });
+  const retried = await retryActionDelivery({ agencyId, actorUserId, deliveryId: candidate.latestDeliveryId });
   await prisma.followBackCandidate.update({
     where: { id: candidate.id },
     data: {

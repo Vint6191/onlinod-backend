@@ -305,13 +305,20 @@ async function updateProxyEndpoint({ db, agencyId, actorUserId, actorMember = nu
   if (!Number.isInteger(version) || version <= 0) throw networkError("PROXY_VERSION_INVALID", "expectedVersion must be a positive integer", 400);
 
   return runSerializable(db, async (tx) => {
-    await requireLiveProxyManagementWriter({ db: tx, agencyId, userId: actorUserId, member: actorMember });
     const current = await tx.agencyProxyEndpoint.findFirst({ where: { id, agencyId } });
     if (!current) throw networkError("PROXY_NOT_FOUND", "Proxy endpoint not found", 404);
-    if (Number(current.version) !== version) throw networkError("PROXY_VERSION_CONFLICT", "Proxy endpoint was changed on another device", 409, { current: proxyPublic(current) });
     const assigned = await tx.creatorNetworkProfile.findFirst({ where: { agencyId, proxyEndpointId: id, mode: "PROXY" }, select: { creatorId: true } });
-    const secretOwnerCreatorId = current.ownerCreatorId || assigned?.creatorId || null;
-    if (secretOwnerCreatorId) await requireLiveProxyCreator({ db: tx, agencyId, creatorId: secretOwnerCreatorId });
+    const managedCreatorId = current.ownerCreatorId || assigned?.creatorId || null;
+    if (managedCreatorId) await requireLiveProxyCreator({ db: tx, agencyId, creatorId: managedCreatorId });
+    const authority = await requireLiveProxyManagementWriter({
+      db: tx,
+      agencyId,
+      userId: actorUserId,
+      member: actorMember,
+      creatorId: managedCreatorId,
+    });
+    if (Number(current.version) !== version) throw networkError("PROXY_VERSION_CONFLICT", "Proxy endpoint was changed on another device", 409, { current: proxyPublic(current) });
+    const secretOwnerCreatorId = managedCreatorId;
 
     const nextType = patch?.type === undefined ? current.type : normalizeType(patch.type);
     const next = {
@@ -328,7 +335,7 @@ async function updateProxyEndpoint({ db, agencyId, actorUserId, actorMember = nu
       assignedCreatorId: secretOwnerCreatorId,
       nextType,
       mutation: patch?.credentials,
-      actorMember,
+      actorMember: actorMember || authority.member,
       deviceId,
     });
 
@@ -373,12 +380,23 @@ async function deleteProxyEndpoint({ db, agencyId, actorUserId = null, actorMemb
   const version = Number(expectedVersion);
   if (!id || !Number.isInteger(version) || version <= 0) throw networkError("PROXY_DELETE_INPUT_INVALID", "Proxy id and expectedVersion are required", 400);
   return runSerializable(db, async (tx) => {
-    await requireLiveProxyManagementWriter({ db: tx, agencyId, userId: actorUserId, member: actorMember });
     const current = await tx.agencyProxyEndpoint.findFirst({ where: { id, agencyId } });
     if (!current) return { deleted: false, alreadyDeleted: true };
+    const assignedProfile = await tx.creatorNetworkProfile.findFirst({
+      where: { agencyId, proxyEndpointId: id, mode: "PROXY" },
+      select: { creatorId: true },
+    });
+    const managedCreatorId = current.ownerCreatorId || assignedProfile?.creatorId || null;
+    if (managedCreatorId) await requireLiveProxyCreator({ db: tx, agencyId, creatorId: managedCreatorId });
+    await requireLiveProxyManagementWriter({
+      db: tx,
+      agencyId,
+      userId: actorUserId,
+      member: actorMember,
+      creatorId: managedCreatorId,
+    });
     if (Number(current.version) !== version) throw networkError("PROXY_VERSION_CONFLICT", "Proxy endpoint was changed on another device", 409, { current: proxyPublic(current) });
-    const assigned = await tx.creatorNetworkProfile.count({ where: { agencyId, proxyEndpointId: id, mode: "PROXY" } });
-    if (assigned > 0) throw networkError("PROXY_STILL_ASSIGNED", "Reassign creators to another proxy or Direct before deleting this proxy", 409, { assignedCreatorCount: assigned });
+    if (assignedProfile) throw networkError("PROXY_STILL_ASSIGNED", "Reassign creators to another proxy or Direct before deleting this proxy", 409, { assignedCreatorCount: 1 });
     const removed = await tx.agencyProxyEndpoint.deleteMany({ where: { id, agencyId, version } });
     if (removed.count !== 1) throw networkError("PROXY_VERSION_CONFLICT", "Proxy endpoint was changed on another device", 409);
     return { deleted: true, alreadyDeleted: false };
@@ -522,8 +540,17 @@ async function listNetworkSettings({ db, agencyId, creatorIds = null }) {
     const id = profile.proxyEndpointId || null;
     if (id) assignmentByProxy.set(id, profile.creatorId || null);
   }
+  const scoped = Array.isArray(creatorIds);
+  const visibleProxies = proxies.filter((row) => {
+    if (!scoped) return true;
+    const assignedCreatorId = assignmentByProxy.get(row.id) || null;
+    const ownerVisible = Boolean(row.ownerCreatorId && visibleCreators.has(row.ownerCreatorId));
+    const assignmentVisible = Boolean(assignedCreatorId && visibleCreators.has(assignedCreatorId));
+    const poolProxy = !row.ownerCreatorId && !assignedCreatorId;
+    return ownerVisible || assignmentVisible || poolProxy;
+  });
   return {
-    proxies: proxies.map((row) => {
+    proxies: visibleProxies.map((row) => {
       const assignedCreatorId = assignmentByProxy.get(row.id) || null;
       return {
         ...proxyPublic(row, assignedCreatorId ? 1 : 0),

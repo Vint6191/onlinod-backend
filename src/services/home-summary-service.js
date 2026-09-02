@@ -191,12 +191,11 @@ function resamplePoints(points, targetLen) {
 //   }
 // On-demand semantics:
 //   - "fresh"   → use it, no scheduling
-//   - "stale"   → schedule new job, but ALSO show the stale data so user
-//                 isn't staring at a skeleton when an OK-ish row exists
-//   - "missing" → schedule new job, mark pending, show skeleton row
+//   - "stale"   → show stale data; schedule only when allowSchedule=true
+//   - "missing" → schedule only when allowSchedule=true; otherwise remain missing
 //   - status not READY → never schedule (job would just fail). If a stale
 //                 snapshot exists, keep showing it as "last known good".
-async function resolveAndScheduleSnapshots(agencyId, requestedRange, creators) {
+async function resolveAndScheduleSnapshots(agencyId, requestedRange, creators, { allowSchedule = false, scheduleJob = ensureSingleJob } = {}) {
   const creatorIds = creators.map((c) => c.id);
   const snaps = creatorIds.length
     ? await prisma.creatorEarningsSnapshot.findMany({
@@ -240,11 +239,14 @@ async function resolveAndScheduleSnapshots(agencyId, requestedRange, creators) {
       continue;
     }
 
-    // Either no snapshot, or stale → schedule a backfill.
-    pendingCreatorIds.push(creator.id);
+    // Either no snapshot, or stale. Keep stale data readable regardless of
+    // refresh permission, but only create/advertise work when scheduling is
+    // explicitly allowed by the caller's canonical analytics permission.
+    if (snap) byCreatorId.set(creator.id, snap);
+    if (!allowSchedule) continue;
 
     scheduleTasks.push(
-      ensureSingleJob({
+      scheduleJob({
         jobKey: "fetch_earnings",
         creatorId: creator.id,
         agencyId,
@@ -254,11 +256,17 @@ async function resolveAndScheduleSnapshots(agencyId, requestedRange, creators) {
         freshnessWindowMs: stalenessMs,
       })
         .then((decision) => {
+          const reason = decision.created ? "scheduled" : decision.reason;
           scheduledJobs.push({
             creatorId: creator.id,
             jobId:     decision.jobId,
-            reason:    decision.created ? "scheduled" : decision.reason,
+            reason,
           });
+          // pending means work really exists in the queue/lease lane. Do not
+          // make Home poll forever for merely useful or recently-completed work.
+          if (decision.created || decision.reason === "already_in_flight" || decision.reason === "idempotency_race") {
+            pendingCreatorIds.push(creator.id);
+          }
         })
         .catch((err) => {
           // Don't fail the whole summary because one creator's job failed
@@ -271,9 +279,6 @@ async function resolveAndScheduleSnapshots(agencyId, requestedRange, creators) {
         })
     );
 
-    // If we have a stale snapshot, still serve it while the fresh one
-    // computes — better than skeleton when an OK-ish row already exists.
-    if (snap) byCreatorId.set(creator.id, snap);
   }
 
   if (scheduleTasks.length) await Promise.all(scheduleTasks);
@@ -284,9 +289,9 @@ async function resolveAndScheduleSnapshots(agencyId, requestedRange, creators) {
 
 // ── Aggregate revenue across the agency ─────────────────────────────────
 
-async function buildAgencyRevenue(agencyId, requestedRange, allCreators) {
+async function buildAgencyRevenue(agencyId, requestedRange, allCreators, { allowSchedule = false } = {}) {
   const { byCreatorId, pendingCreatorIds, scheduledJobs } =
-    await resolveAndScheduleSnapshots(agencyId, requestedRange, allCreators);
+    await resolveAndScheduleSnapshots(agencyId, requestedRange, allCreators, { allowSchedule });
 
   let totalCents = 0;
   let grossCents = 0;
@@ -489,7 +494,7 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d" }) {
   let previousRevenue = null;
   if (canViewMoney) {
     [currentRevenue, previousRevenue] = await Promise.all([
-      buildAgencyRevenue(agencyId, range.key, creators),
+      buildAgencyRevenue(agencyId, range.key, creators, { allowSchedule: canRefreshAnalytics === true }),
       buildPreviousRevenue(agencyId, previousRange.key, creators),
     ]);
   }
@@ -625,4 +630,4 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d" }) {
   };
 }
 
-module.exports = { buildHomeSummary };
+module.exports = { buildHomeSummary, __test: { resolveAndScheduleSnapshots } };

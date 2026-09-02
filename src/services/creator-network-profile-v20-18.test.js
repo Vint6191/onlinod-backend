@@ -266,7 +266,7 @@ test("V20.18 database unique-race maps to PROXY_ALREADY_ASSIGNED without queryin
   );
 });
 
-test("V20.18 settings marks a proxy assigned even when its owner is outside the visible creator scope", async () => {
+test("Audit16 scoped network settings hide endpoint metadata owned/assigned outside visible creator scope", async () => {
   const { db, profiles, proxies } = makeDb();
   proxies.get("proxy-1").ownerCreatorId = "creator-2";
   profiles.set("creator-2", {
@@ -276,7 +276,8 @@ test("V20.18 settings marks a proxy assigned even when its owner is outside the 
   const state = await listNetworkSettings({ db, agencyId: "agency-1", creatorIds: ["creator-1"] });
   assert.equal(state.creators.length, 1);
   assert.equal(state.creators[0].creatorId, "creator-1");
-  assert.equal(state.proxies.find((proxy) => proxy.id === "proxy-1").assignedCreatorCount, 1);
+  assert.equal(state.proxies.some((proxy) => proxy.id === "proxy-1"), false);
+  assert.equal(state.proxies.some((proxy) => proxy.id === "proxy-2"), true, "truly unowned/unassigned pool proxy remains visible");
 });
 
 test("V20.19 E2E credential replacement uses dedicated crypto owner even while creator is DIRECT", async () => {

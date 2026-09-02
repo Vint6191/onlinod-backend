@@ -95,13 +95,40 @@ async function requireProductCreatorDevice(req, { creatorId, deviceId, db = null
 }
 
 async function filterProductCreatorScope(req, creatorIds, { db = null, rejectForeign = true } = {}) {
-  const context = await productAccessContext(req, { db });
+  const client = db || require("../prisma");
+  const context = await productAccessContext(req, { db: client });
   const requested = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : [])
     .map((value) => String(value || "").trim())
     .filter(Boolean)));
-  if (context.scope.broad) return { ...context, creatorIds: requested };
+  if (!requested.length) return { ...context, creatorIds: [], foreignCreatorIds: [] };
+
+  // This helper is a canonical security boundary, so even broad actors must
+  // never turn arbitrary caller-supplied ids into authorised creator ids.
+  const rows = await client.creatorAccount.findMany({
+    where: { agencyId: context.agencyId, deletedAt: null, id: { in: requested } },
+    select: { id: true },
+    take: Math.min(10000, requested.length),
+  });
+  const liveAgencyIds = new Set(rows.map((row) => String(row.id)));
+  const invalid = requested.filter((id) => !liveAgencyIds.has(id));
+
+  if (context.scope.broad) {
+    if (invalid.length && rejectForeign) {
+      throw new ProductAccessError(
+        "CREATOR_ACCESS_FORBIDDEN",
+        "One or more requested creators are outside the current agency scope",
+        403,
+      );
+    }
+    return {
+      ...context,
+      creatorIds: requested.filter((id) => liveAgencyIds.has(id)),
+      foreignCreatorIds: invalid,
+    };
+  }
+
   const allowed = new Set(context.scope.creatorIds || []);
-  const foreign = requested.filter((id) => !allowed.has(id));
+  const foreign = requested.filter((id) => !liveAgencyIds.has(id) || !allowed.has(id));
   if (foreign.length && rejectForeign) {
     throw new ProductAccessError(
       "CREATOR_ACCESS_FORBIDDEN",
@@ -109,7 +136,11 @@ async function filterProductCreatorScope(req, creatorIds, { db = null, rejectFor
       403,
     );
   }
-  return { ...context, creatorIds: requested.filter((id) => allowed.has(id)), foreignCreatorIds: foreign };
+  return {
+    ...context,
+    creatorIds: requested.filter((id) => liveAgencyIds.has(id) && allowed.has(id)),
+    foreignCreatorIds: foreign,
+  };
 }
 
 module.exports = {

@@ -282,6 +282,7 @@ router.post("/follow-back/:creatorId/candidates/:fanId/action", seniorRequired, 
         agencyId: req.auth.agencyId,
         creatorId: req.params.creatorId,
         fanId: req.params.fanId,
+        actorUserId: req.auth.userId,
       }));
     }
     if (input.action === "follow") {
@@ -365,7 +366,7 @@ router.post("/follow/:creatorId/candidates/:fanId/action", seniorRequired, async
       });
       if (!candidate) return res.status(404).json({ ok: false, code: "candidate_not_found", error: "Follow Automation candidate not found" });
       if (!candidate.latestDeliveryId) return res.status(409).json({ ok: false, code: "no_delivery", error: "Candidate has no delivery to retry" });
-      return res.status(202).json(await retryActionDelivery({ agencyId: req.auth.agencyId, deliveryId: candidate.latestDeliveryId }));
+      return res.status(202).json(await retryActionDelivery({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, deliveryId: candidate.latestDeliveryId }));
     }
     return res.json({ ok: true, candidate: await setFollowAutomationCandidateState({
       agencyId: req.auth.agencyId,
@@ -560,7 +561,7 @@ router.post("/likes/:creatorId/candidates/:candidateId/action", seniorRequired, 
     }
     if (input.action === "retry") {
       if (!candidate.latestDeliveryId) return res.status(409).json({ ok: false, code: "no_delivery", error: "Candidate has no delivery to retry" });
-      return res.status(202).json(await retryActionDelivery({ agencyId: req.auth.agencyId, deliveryId: candidate.latestDeliveryId }));
+      return res.status(202).json(await retryActionDelivery({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, deliveryId: candidate.latestDeliveryId }));
     }
     return res.json({ ok: true, candidate: await setLikeCandidateState({
       agencyId: req.auth.agencyId, creatorId: req.params.creatorId, candidateId: candidate.id, action: input.action,
@@ -669,6 +670,7 @@ router.post("/deliveries/retry-safe", seniorRequired, async (req, res) => {
     }).parse(req.body || {});
     return res.json(await retrySafeFailures({
       agencyId: req.auth.agencyId,
+      actorUserId: req.auth.userId,
       creatorId: input.creatorId || null,
       moduleKey: input.moduleKey || null,
       limit: input.limit || 100,
@@ -680,15 +682,15 @@ router.post("/deliveries/retry-safe", seniorRequired, async (req, res) => {
 });
 
 router.post("/deliveries/:id/retry", seniorRequired, async (req, res) => {
-  try { return res.json(await retryActionDelivery({ agencyId: req.auth.agencyId, deliveryId: req.params.id })); }
+  try { return res.json(await retryActionDelivery({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, deliveryId: req.params.id })); }
   catch (error) { return serviceError(res, error, "AUTOMATION_DELIVERY_RETRY_FAILED"); }
 });
 router.post("/deliveries/:id/cancel", seniorRequired, async (req, res) => {
-  try { return res.json(await cancelActionDelivery({ agencyId: req.auth.agencyId, deliveryId: req.params.id, reason: req.body?.reason || "manual_cancel" })); }
+  try { return res.json(await cancelActionDelivery({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, deliveryId: req.params.id, reason: req.body?.reason || "manual_cancel" })); }
   catch (error) { return serviceError(res, error, "AUTOMATION_DELIVERY_CANCEL_FAILED"); }
 });
 router.post("/deliveries/:id/release", seniorRequired, async (req, res) => {
-  try { return res.json(await releaseClaimByAdmin({ agencyId: req.auth.agencyId, deliveryId: req.params.id })); }
+  try { return res.json(await releaseClaimByAdmin({ agencyId: req.auth.agencyId, actorUserId: req.auth.userId, deliveryId: req.params.id })); }
   catch (error) { return serviceError(res, error, "AUTOMATION_DELIVERY_RELEASE_FAILED"); }
 });
 

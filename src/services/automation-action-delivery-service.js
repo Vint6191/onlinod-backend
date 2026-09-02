@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { canUsePermission, isOwner, normalizeAssignedCreators } = require("./team-access-control");
+const { requireCreatorAccess, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
 const { assertAutomationEnabled, getAutomationControlSnapshot } = require("./automation-control-service");
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
@@ -133,6 +134,22 @@ async function assertDeliveryControl(delivery, { allowRunningUnfollow = false, d
     throw new ActionDeliveryError("creator_disabled", "Creator automation is disabled");
   }
   return snapshot;
+}
+
+async function requireLiveAutomationManagementActor({ db = prisma, agencyId, actorUserId, creatorId = null }) {
+  const userId = clean(actorUserId, 180);
+  if (!userId) throw new ActionDeliveryError("AUTOMATION_ACTOR_REQUIRED", "Authenticated automation actor is required", 401);
+  const member = await db.agencyMember.findFirst({
+    where: { agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
+  });
+  if (!member) throw new ActionDeliveryError("AUTOMATION_MEMBER_INACTIVE", "Agency membership is no longer active", 403);
+  if (!(await canUsePermission({ member, key: "automation.manage", db }))) {
+    throw new ActionDeliveryError("WRITE_AUTOMATION_FORBIDDEN", "automation.manage permission is required", 403);
+  }
+  if (creatorId) {
+    await requireCreatorAccess({ agencyId, member, creatorId, db });
+  }
+  return { member };
 }
 
 async function requireOwnedSeniorDevice({ userId, deviceId, db = prisma }) {
@@ -1034,9 +1051,10 @@ async function listActionDeliveries({ agencyId, creatorId, creatorIds = null, mo
   return { ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count };
 }
 
-async function retryActionDelivery({ agencyId, deliveryId }) {
+async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
   const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
   if (!["FAILED", "SKIPPED", "CANCELED", "PAUSED"].includes(delivery.status)) {
     throw new ActionDeliveryError("DELIVERY_NOT_RETRYABLE", `Delivery status ${delivery.status} cannot be retried`);
   }
@@ -1060,6 +1078,7 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
     if (validation.ok === false && validation.code === "already_liked") {
       const now = new Date();
       const latest = await prisma.$transaction(async (tx) => {
+        await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
         const changed = await tx.automationDelivery.updateMany({
           where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
           data: {
@@ -1099,6 +1118,7 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }
   const updated = await prisma.$transaction(async (tx) => {
+    await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
       data: {
@@ -1131,9 +1151,10 @@ async function retryActionDelivery({ agencyId, deliveryId }) {
   return { ok: true, delivery: updated };
 }
 
-async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_cancel" }) {
+async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason = "manual_cancel" }) {
   const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
   if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) {
     throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before cancellation");
@@ -1149,6 +1170,7 @@ async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_can
   }
   const finishedAt = new Date();
   const updated = await prisma.$transaction(async (tx) => {
+    await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision },
       data: {
@@ -1183,12 +1205,14 @@ async function cancelActionDelivery({ agencyId, deliveryId, reason = "manual_can
   return { ok: true, duplicate: false, delivery: updated };
 }
 
-async function releaseClaimByAdmin({ agencyId, deliveryId }) {
+async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId }) {
   const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
+  await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
   if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before administrative release");
   if (!["CLAIMED", "RUNNING"].includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   const updated = await prisma.$transaction(async (tx) => {
+    await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
       data: { status: "QUEUED", notBefore: new Date(Date.now() + 15_000), claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, attempts: { decrement: 1 }, lastError: "Claim released by administrator" },
@@ -1201,14 +1225,26 @@ async function releaseClaimByAdmin({ agencyId, deliveryId }) {
   return { ok: true, delivery: updated };
 }
 
-async function retrySafeFailures({ agencyId, creatorId = null, moduleKey = null, limit = 100 }) {
+async function retrySafeFailures({ agencyId, actorUserId, creatorId = null, moduleKey = null, limit = 100 }) {
+  const authority = await requireLiveAutomationManagementActor({ agencyId, actorUserId });
+  const scope = await allowedCreatorScope({
+    agencyId,
+    member: authority.member,
+    requestedCreatorId: creatorId || null,
+    db: prisma,
+  });
+  const creatorFilter = creatorId
+    ? { creatorId }
+    : scope.broad
+      ? {}
+      : { creatorId: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } };
   const rows = await prisma.automationDelivery.findMany({
-    where: { agencyId, status: "FAILED", failureCategory: { in: SAFE_RETRY_CATEGORIES }, ...(creatorId ? { creatorId } : {}), ...(moduleKey ? { moduleKey } : {}) },
+    where: { agencyId, status: "FAILED", failureCategory: { in: SAFE_RETRY_CATEGORIES }, ...creatorFilter, ...(moduleKey ? { moduleKey } : {}) },
     orderBy: { updatedAt: "asc" }, take: Math.max(1, Math.min(500, Number(limit) || 100)), select: { id: true },
   });
   const results = [];
   for (const row of rows) {
-    try { results.push(await retryActionDelivery({ agencyId, deliveryId: row.id })); }
+    try { results.push(await retryActionDelivery({ agencyId, actorUserId, deliveryId: row.id })); }
     catch (error) { results.push({ ok: false, deliveryId: row.id, code: error?.code || "retry_failed", error: error?.message || String(error) }); }
   }
   return { ok: true, requested: rows.length, retried: results.filter((item) => item.ok).length, results };
@@ -1234,4 +1270,5 @@ module.exports = {
   retrySafeFailures,
   cancelActionDelivery,
   releaseClaimByAdmin,
+  __test: { requireLiveAutomationManagementActor },
 };

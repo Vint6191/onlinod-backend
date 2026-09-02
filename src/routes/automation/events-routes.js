@@ -1,9 +1,13 @@
 "use strict";
 
 function registerEventRoutes(router, deps) {
-  const { automationServer, sendError, requireSeniorAutomationWriter, cleanString, requireAutomationCreatorAccess } = deps;
+  const { automationServer, sendError, cleanString, requireAutomationCreatorAccess } = deps;
 
-  router.get("/events", requireSeniorAutomationWriter, async (req, res) => { try { return res.json(await automationServer.listEvents({ agencyId: req.auth.agencyId, query: req.query || {} })); } catch (err) { return sendError(res, err, "AUTOMATION_EVENTS_FAILED"); } });
+  router.get("/events", (_req, res) => res.status(410).json({
+    ok: false,
+    code: "LEGACY_AUTOMATION_EVENTS_GONE",
+    error: "Use the creator-scoped automation activity surface.",
+  }));
   router.post("/events", (_req, res) => res.status(410).json({
     ok: false,
     code: "LEGACY_AUTOMATION_EVENT_WRITER_DISABLED",
