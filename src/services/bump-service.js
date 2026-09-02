@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
@@ -217,7 +218,7 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
       try {
         const delivery = await tx.automationDelivery.create({
           data: {
-            agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, actionType: SEND_ACTION,
+            agencyId, creatorId, originKind: "AUTOMATION", moduleKey: BUMPS_MODULE_KEY, actionType: SEND_ACTION,
             targetId: candidate.fanId, fanId: candidate.fanId, dialogId: candidate.dialogId,
             idempotencyKey, generation, priority: sourcePriority(normalizedSource, manual), payload,
             contentCollectionId: template.id, trigger: normalizedSource,
@@ -375,11 +376,11 @@ async function finalizeBumpSend({ delivery, result, db = prisma }) {
     afterReplyCooldownMs: int(timing.afterReplyCooldownMs, 24 * 60 * 60_000, 0, 90 * 24 * 60 * 60_000),
   };
   const cancelKey = `bump_cancel:${delivery.creatorId}:${messageId}`;
-  let cancel = await db.automationDelivery.findUnique({ where: { idempotencyKey: cancelKey } });
+  let cancel = assertAutomationDeliveryAdoption(await db.automationDelivery.findUnique({ where: { idempotencyKey: cancelKey } }), { agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: BUMPS_MODULE_KEY, actionType: DELETE_ACTION });
   if (!cancel) {
     cancel = await db.automationDelivery.create({
       data: {
-        agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: BUMPS_MODULE_KEY,
+        agencyId: delivery.agencyId, creatorId: delivery.creatorId, originKind: "AUTOMATION", moduleKey: BUMPS_MODULE_KEY,
         actionType: DELETE_ACTION, targetId: messageId, fanId: delivery.fanId, dialogId: delivery.dialogId,
         idempotencyKey: cancelKey, generation: delivery.generation,
         priority: 120, payload: cancelPayload, contentCollectionId: template.id || delivery.contentCollectionId,

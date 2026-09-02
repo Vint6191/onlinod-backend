@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const { FAILURE_CATEGORIES, classifyAutomationFailure, categoryAllowsBlindRetry } = require("./automation-failure-taxonomy");
+const { FAILURE_CATEGORIES, classifyAutomationFailure, categoryAllowsBlindRetry, automationActionWriteSemantics } = require("./automation-failure-taxonomy");
 
 test("Audit17 backend taxonomy owns unknown-outcome policy from facts, not Desktop category strings", () => {
   assert.equal(classifyAutomationFailure({ failureCode: "comment_result_unknown", deliveryStatus: "COMMITTING" }), FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE);
@@ -41,12 +41,21 @@ test("Audit17 proven-no-effect is the authoritative safe retry proof", () => {
   assert.equal(categoryAllowsBlindRetry(category), true);
 });
 
-test("Audit17 action delivery classifier consumes evidence fields while reported category is observability-only", () => {
+test("Audit17 action delivery policy derives semantics from actionType while client hints stay telemetry-only", () => {
   const source = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
-  assert.match(source, /endpointSemantics:\s*inputResult\.endpointSemantics/);
-  assert.match(source, /writeReachedWire:\s*inputResult\.writeReachedWire === true/);
-  assert.match(source, /outcomeState:\s*inputResult\.outcomeState/);
-  assert.match(source, /transportCode:\s*inputResult\.transportCode/);
+  assert.match(source, /endpointSemantics = automationActionWriteSemantics\(delivery\.actionType\)/);
+  assert.match(source, /reportedEndpointSemantics:\s*inputResult\.endpointSemantics/);
+  assert.match(source, /reportedIdempotent:\s*inputResult\.idempotent === true/);
+  assert.match(source, /reportedProvenNoEffect:\s*inputResult\.provenNoEffect === true/);
   assert.match(source, /reportedFailureCategory = normalizeFailureCategory\(input\.failureCategory\)/);
   assert.doesNotMatch(source, /failureCategory\s*=\s*reportedFailureCategory/);
+});
+
+
+test("Audit17 backend owns Automation action write semantics", () => {
+  assert.equal(automationActionWriteSemantics("SEND_MESSAGE"), "NON_IDEMPOTENT_WRITE");
+  assert.equal(automationActionWriteSemantics("SFS_COMMENT_POST"), "NON_IDEMPOTENT_WRITE");
+  assert.equal(automationActionWriteSemantics("DELETE_MESSAGE"), "IDEMPOTENT_WRITE");
+  assert.equal(automationActionWriteSemantics("FOLLOW_FAN"), "IDEMPOTENT_WRITE");
+  assert.equal(automationActionWriteSemantics("future_unknown_action"), "NON_IDEMPOTENT_WRITE");
 });

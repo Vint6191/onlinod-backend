@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { syncFinalizedSubmissionAssignment } = require("./custom-content-library-service");
+const { canUsePermission } = require("./team-access-control");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
@@ -472,6 +473,7 @@ async function closeCustomContentSubmissionRelayWriteUnresolved({ agencyId, memb
   const row = await client.customContentSubmission.findFirst({ where: { id, agencyId } });
   if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  if (!(await canUsePermission({ member, key: "content.review_customs", db: client }))) throw fail("CUSTOM_SUBMISSION_MANUAL_RESOLUTION_FORBIDDEN", "content.review_customs permission is required to resolve an ambiguous Custom relay write", 403);
   const { closeProgrammaticWriteUnresolved } = require("./programmatic-of-write-authority-service");
   return closeProgrammaticWriteUnresolved({
     agencyId,
@@ -502,6 +504,7 @@ async function resolveCustomContentSubmissionRelayWriteMatched({ agencyId, membe
   const row = await client.customContentSubmission.findFirst({ where: { id, agencyId } });
   if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  if (!(await canUsePermission({ member, key: "content.review_customs", db: client }))) throw fail("CUSTOM_SUBMISSION_MANUAL_RESOLUTION_FORBIDDEN", "content.review_customs permission is required to resolve an ambiguous Custom relay write", 403);
   const { resolveProgrammaticWriteUnresolvedMatched } = require("./programmatic-of-write-authority-service");
   return resolveProgrammaticWriteUnresolvedMatched({
     agencyId, userId: String(member.userId), memberId: String(member.id),

@@ -22,6 +22,8 @@ const PRODUCT_WRITE_KINDS = Object.freeze({
     originKind: "INTERACTIVE",
     executionKind: "SOURCE_DEVICE",
     reconciliationKind: "MASS_QUEUE",
+    writeSemantics: "NON_IDEMPOTENT_WRITE",
+    commitClass: "BUSINESS_COMMIT",
   }),
   VAULT_RELAY_SEND: Object.freeze({
     moduleKey: "vault",
@@ -30,6 +32,8 @@ const PRODUCT_WRITE_KINDS = Object.freeze({
     originKind: "INTERACTIVE",
     executionKind: "SOURCE_DEVICE",
     reconciliationKind: "VAULT_RELAY",
+    writeSemantics: "NON_IDEMPOTENT_WRITE",
+    commitClass: "BUSINESS_COMMIT",
   }),
   VAULT_CREATE_LIST: Object.freeze({
     moduleKey: "vault",
@@ -38,6 +42,8 @@ const PRODUCT_WRITE_KINDS = Object.freeze({
     originKind: "INTERACTIVE",
     executionKind: "SOURCE_DEVICE",
     reconciliationKind: "VAULT_LIST",
+    writeSemantics: "NON_IDEMPOTENT_WRITE",
+    commitClass: "BUSINESS_COMMIT",
   }),
   CUSTOM_RELAY_SEND: Object.freeze({
     moduleKey: "customs",
@@ -46,6 +52,8 @@ const PRODUCT_WRITE_KINDS = Object.freeze({
     originKind: "SYSTEM",
     executionKind: "AUTHORIZED_DEVICE",
     reconciliationKind: "CUSTOM_RELAY",
+    writeSemantics: "NON_IDEMPOTENT_WRITE",
+    commitClass: "BUSINESS_COMMIT",
   }),
 });
 
@@ -155,43 +163,66 @@ function sanitizeClientResult(delivery, value, phase) {
   return Object.fromEntries(Object.entries(source).filter(([key]) => allowed.has(key)));
 }
 
-async function sweepExpiredProgrammaticWriteLeases({ db = prisma, agencyId, creatorId = null, now = new Date() } = {}) {
-  const rows = await db.automationDelivery.findMany({
+async function sweepExpiredProgrammaticWriteLeases({ db = prisma, agencyId, creatorId = null, creatorIds = null, now = new Date() } = {}) {
+  const scopedCreatorIds = Array.isArray(creatorIds) ? [...new Set(creatorIds.map(String).filter(Boolean))] : null;
+  const creatorWhere = creatorId ? { creatorId } : (scopedCreatorIds ? { creatorId: { in: scopedCreatorIds.length ? scopedCreatorIds : ["__none__"] } } : {});
+  const scopeWhere = { ...(agencyId ? { agencyId } : {}), originKind: { not: "AUTOMATION" }, ...creatorWhere };
+  const expired = await db.automationDelivery.findMany({
     where: {
-      ...(agencyId ? { agencyId } : {}),
-      originKind: { not: "AUTOMATION" },
-      ...(creatorId ? { creatorId } : {}),
+      ...scopeWhere,
       status: { in: ["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] },
       claimUntil: { lte: now },
     },
-    select: { id: true, status: true, leaseRevision: true, result: true, writeCommitRevision: true },
+    select: { id: true, status: true, leaseRevision: true, result: true, writeCommitRevision: true, failureCode: true, writeCommitAt: true },
     take: 10000,
   });
   let changed = 0;
-  for (const row of rows) {
+  const closeIfBoundExpired = async (row, where) => {
+    const result = object(row.result);
+    const startedAt = new Date(result.reconciliationStartedAt || row.writeCommitAt || now);
+    if (!Number.isFinite(startedAt.getTime()) || now.getTime() - startedAt.getTime() < MAX_RECONCILIATION_WAIT_MS) return false;
+    const closed = await db.automationDelivery.updateMany({
+      where,
+      data: {
+        status: "FAILED",
+        failureCode: "outcome_unresolved_do_not_retry",
+        failureCategory: FAILURE_CATEGORIES.TERMINAL,
+        lastError: "Reconciliation owner disappeared and the bounded verification window expired; logical commit closed permanently without retry",
+        result: { ...result, outcomeState: "UNRESOLVED_DO_NOT_RETRY", unresolvedClosedAt: now.toISOString(), unresolvedCloseReason: "MAINTENANCE_RECONCILIATION_WINDOW_EXPIRED" },
+        finishedAt: now, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, lastCheckedAt: now,
+      },
+    });
+    changed += closed.count;
+    return Boolean(closed.count);
+  };
+  for (const row of expired) {
     const precommit = row.status === "CLAIMED" || row.status === "RUNNING";
-    const committing = row.status === "COMMITTING";
+    const reconciling = row.status === "RECONCILE_REQUIRED";
+    if (reconciling && await closeIfBoundExpired(row, { id: row.id, status: row.status, leaseRevision: row.leaseRevision, claimUntil: { lte: now } })) continue;
     const nextStatus = precommit ? "RETRY_SCHEDULED" : "RECONCILE_REQUIRED";
     const data = {
-      status: nextStatus,
-      claimedByDeviceId: null,
-      claimedAt: null,
-      claimUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-      lastCheckedAt: now,
+      status: nextStatus, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, lastCheckedAt: now,
       ...(precommit ? {
-        failureCode: "programmatic_precommit_lease_expired",
-        failureCategory: FAILURE_CATEGORIES.DEFINITE_NO_WRITE_RETRYABLE,
+        failureCode: "programmatic_precommit_lease_expired", failureCategory: FAILURE_CATEGORIES.DEFINITE_NO_WRITE_RETRYABLE,
         result: { ...object(row.result), outcomeState: "PROVEN_NO_EFFECT", leaseExpiredAt: now.toISOString() },
       } : {
-        failureCode: row.failureCode || "write_outcome_unknown",
-        failureCategory: FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE,
+        failureCode: row.failureCode || "write_outcome_unknown", failureCategory: FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE,
         result: { ...object(row.result), outcomeState: "RECONCILE_REQUIRED", reconciliationStartedAt: object(row.result).reconciliationStartedAt || row.writeCommitAt?.toISOString?.() || now.toISOString(), reconciliationLeaseExpiredAt: now.toISOString() },
       }),
     };
     const result = await db.automationDelivery.updateMany({ where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision, claimUntil: { lte: now } }, data });
     changed += result.count;
+  }
+  // A reconciler may disappear and leave a deliberately unleased RECONCILE_REQUIRED
+  // row. It still owns the global creator write lane, so maintenance must eventually
+  // close it no-retry once the original bounded verification window expires.
+  const stranded = await db.automationDelivery.findMany({
+    where: { ...scopeWhere, status: "RECONCILE_REQUIRED", claimUntil: null },
+    select: { id: true, status: true, leaseRevision: true, result: true, failureCode: true, writeCommitAt: true },
+    take: 10000,
+  });
+  for (const row of stranded) {
+    await closeIfBoundExpired(row, { id: row.id, status: "RECONCILE_REQUIRED", leaseRevision: row.leaseRevision, claimUntil: null });
   }
   return changed;
 }
@@ -220,7 +251,7 @@ async function reserveProgrammaticWrite(input) {
     // with Automation semantics, then clear/transition expired programmatic
     // leases with programmatic semantics. Neither policy may process the other.
     const { sweepExpiredAutomationLeases } = require("./automation-action-delivery-service");
-    await sweepExpiredAutomationLeases(now);
+    await sweepExpiredAutomationLeases({ now, agencyId, creatorIds: [creatorId] });
     await sweepExpiredProgrammaticWriteLeases({ db: tx, agencyId, creatorId, now });
     let delivery = await tx.automationDelivery.findUnique({ where: { idempotencyKey } });
     const replay = Boolean(delivery);
@@ -519,28 +550,24 @@ async function failProgrammaticWrite(input) {
   return prisma.$transaction(async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, allowCommittedSettlement: true, lock: true });
     const facts = object(input.facts);
-    const reachedWire = facts.writeReachedWire === true || delivery.status === "COMMITTING";
-    const endpointSemantics = clean(facts.endpointSemantics, 80)?.toUpperCase() || null;
+    const storedKind = storedProgrammaticKind(delivery);
+    const { config } = productKind(storedKind);
+    const endpointSemantics = config.writeSemantics;
     const idempotent = endpointSemantics === "IDEMPOTENT_WRITE";
-    // Client evidence may describe transport facts, but it cannot declare a
-    // non-idempotent COMMITTING write safe to repeat. Generic post-commit failures
-    // (including HTTP 4xx/5xx) remain unknown until a dedicated reconciler proves
-    // the remote result. Only a pre-wire failure can be authoritative no-effect here.
+    const reachedWire = delivery.status === "COMMITTING" || Boolean(delivery.writeCommitAt);
+    // Backend owns repeat/no-repeat policy. Client booleans/semantics are retained
+    // only as diagnostics and can never make a committed non-idempotent write retryable.
     const clientClaimedNoEffect = facts.provenNoEffect === true;
-    const provenNoEffect = clientClaimedNoEffect && !reachedWire && delivery.status !== "COMMITTING";
+    const provenNoEffect = !reachedWire;
     const failureCode = clean(input.failureCode, 120) || "unknown";
-    const category = classifyAutomationFailure({
-      failureCode,
-      deliveryStatus: delivery.status,
-      provenNoEffect,
-      idempotent,
-      reachedWire,
-      endpointSemantics,
-      writeReachedWire: reachedWire,
-      outcomeState: facts.outcomeState || null,
-      transportCode: facts.transportCode || facts.originalCode || null,
-    });
-    const reconcile = !provenNoEffect && reachedWire && !idempotent;
+    const category = reachedWire && !idempotent
+      ? FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE
+      : classifyAutomationFailure({
+        failureCode, deliveryStatus: delivery.status, provenNoEffect, idempotent, endpointSemantics,
+        writeReachedWire: reachedWire, outcomeState: reachedWire ? "ON_WIRE_UNKNOWN" : "PRE_WIRE_FAILURE",
+        transportCode: facts.transportCode || facts.originalCode || null,
+      });
+    const reconcile = reachedWire && !idempotent;
     const now = new Date();
     const reconciliationLease = reconcile ? mintLease(now, DEFAULT_LEASE_MS) : null;
     const nextStatus = reconcile ? "RECONCILE_REQUIRED" : (category === FAILURE_CATEGORIES.TERMINAL ? "FAILED" : "RETRY_SCHEDULED");
@@ -561,6 +588,7 @@ async function failProgrammaticWrite(input) {
           ...object(delivery.result),
           failureEvidence: {
             endpointSemantics,
+            reportedEndpointSemantics: clean(facts.endpointSemantics, 80)?.toUpperCase() || null,
             writeReachedWire: reachedWire,
             httpStatus: Number.isFinite(Number(facts.httpStatus)) ? Number(facts.httpStatus) : null,
             transportCode: clean(facts.transportCode || facts.originalCode, 160),

@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
@@ -249,7 +250,7 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
       if (active) { summary.existing += 1; skip("active_delivery"); continue; }
 
       const idempotencyKey = `follow_back:${creatorId}:${candidate.fanId}:${candidate.generation}`;
-      const existing = await db.automationDelivery.findUnique({ where: { idempotencyKey } });
+      const existing = assertAutomationDeliveryAdoption(await db.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, actionType: FOLLOW_BACK_ACTION_TYPE });
       if (existing) {
         summary.existing += 1;
         await db.followBackCandidate.update({
@@ -272,6 +273,7 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
           data: {
             agencyId,
             creatorId,
+            originKind: "AUTOMATION",
             moduleKey: FOLLOW_BACK_MODULE_KEY,
             actionType: FOLLOW_BACK_ACTION_TYPE,
             targetId: candidate.fanId,
@@ -561,7 +563,7 @@ async function getAutomationOverview({ agencyId, creatorId }) {
     listFollowBack({ agencyId, creatorId, limit: 1 }),
     prisma.automationDelivery.groupBy({
       by: ["status"],
-      where: { agencyId, creatorId },
+      where: { agencyId, creatorId, originKind: "AUTOMATION" },
       _count: { _all: true },
     }),
     listActionDeliveries({ agencyId, creatorId, status: "FAILED", offset: 0, limit: 5 }),

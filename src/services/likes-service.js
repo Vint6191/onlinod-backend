@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob } = require("./job-planning-repository");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
@@ -420,7 +421,7 @@ async function planLikesLocked({ db, agencyId, creatorId, userId = null, candida
     });
     if (active) { skipped.active_delivery = (skipped.active_delivery || 0) + 1; continue; }
     if (!idempotencyKey) { skipped.invalid_target = (skipped.invalid_target || 0) + 1; continue; }
-    const existing = await db.automationDelivery.findUnique({ where: { idempotencyKey } });
+    const existing = assertAutomationDeliveryAdoption(await db.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, actionType: LIKE_POST_ACTION_TYPE });
     if (existing?.status === "COMPLETED") {
       await db.automationContentCandidate.update({ where: { id: candidate.id }, data: {
         state: "ALREADY_LIKED", isFavorite: true, latestDeliveryId: existing.id, latestActionType: LIKE_POST_ACTION_TYPE,
@@ -443,7 +444,7 @@ async function planLikesLocked({ db, agencyId, creatorId, userId = null, candida
       } });
     } else if (!existing) {
       delivery = await db.automationDelivery.create({ data: {
-        agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, actionType: LIKE_POST_ACTION_TYPE,
+        agencyId, creatorId, originKind: "AUTOMATION", moduleKey: LIKES_MODULE_KEY, actionType: LIKE_POST_ACTION_TYPE,
         targetId: candidate.contentId, fanId: candidate.ownerFanId, idempotencyKey, generation: candidate.generation,
         priority, payload: { candidateId: candidate.id, postId: candidate.contentId, authorId: candidate.ownerFanId, source, manual },
         status: "QUEUED", scheduledAt: now, notBefore, maxAttempts: settings.maxAttempts, createdByUserId: userId,

@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const {
   getAutomationControlSnapshot,
   assertAutomationEnabled,
@@ -213,7 +214,7 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
       if (active) { summary.existing += 1; skip("active_delivery"); continue; }
       const generation = Number(candidate.generation || 0) + 1;
       const idempotencyKey = refollowUnfollowKey({ creatorId, fanId: candidate.fanId, generation });
-      const existing = await db.automationDelivery.findUnique({ where: { idempotencyKey } });
+      const existing = assertAutomationDeliveryAdoption(await db.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: UNFOLLOW_FAN_ACTION_TYPE });
       if (existing) {
         summary.existing += 1;
         await db.followAutomationCandidate.update({
@@ -229,7 +230,7 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
       try {
         const delivery = await db.automationDelivery.create({
           data: {
-            agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: UNFOLLOW_FAN_ACTION_TYPE,
+            agencyId, creatorId, originKind: "AUTOMATION", moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: UNFOLLOW_FAN_ACTION_TYPE,
             targetId: candidate.fanId, fanId: candidate.fanId, dialogId: candidate.dialogId,
             idempotencyKey, generation, priority: fanId ? Math.max(100, priority) : priority,
             payload: {
@@ -331,11 +332,11 @@ async function finalizeFollowAutomationSuccess({ delivery, outcomeCode, result =
     const pauseMs = randomBetween(settings.refollowPauseMinMs, settings.refollowPauseMaxMs);
     const notBefore = new Date(Math.max(baseSlot.getTime(), now.getTime() + pauseMs));
     const idempotencyKey = refollowFollowKey({ creatorId: delivery.creatorId, fanId, generation: delivery.generation });
-    let follow = await db.automationDelivery.findUnique({ where: { idempotencyKey } });
+    let follow = assertAutomationDeliveryAdoption(await db.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE });
     if (!follow) {
       follow = await db.automationDelivery.create({
         data: {
-          agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY,
+          agencyId: delivery.agencyId, creatorId: delivery.creatorId, originKind: "AUTOMATION", moduleKey: FOLLOW_AUTOMATION_MODULE_KEY,
           actionType: FOLLOW_FAN_ACTION_TYPE, targetId: fanId, fanId, dialogId: delivery.dialogId,
           idempotencyKey, generation: delivery.generation, priority: Math.max(110, delivery.priority),
           payload: {

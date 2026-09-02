@@ -520,3 +520,54 @@ test("Closure2 Likes ignore vs prepareWrite has one fence winner", async () => {
     }
   }
 });
+
+test("Audit17 backend ignores client idempotent/proven-no-effect hints for COMMITTING Automation SEND_MESSAGE", async () => {
+  const { rows, db } = actionFixture();
+  const service = loadActionService(db);
+  const delivery = rows[0];
+  const result = await service.failActionDelivery({
+    deliveryId: delivery.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: "old-token",
+    leaseRevision: delivery.leaseRevision,
+    failureCode: "temporary_of_error",
+    result: {
+      endpointSemantics: "IDEMPOTENT_WRITE",
+      idempotent: true,
+      provenNoEffect: true,
+      writeReachedWire: false,
+    },
+  });
+  assert.equal(result.delivery.status, "RECONCILE_REQUIRED");
+  assert.equal(result.failureCategory, "OUTCOME_UNKNOWN_RECONCILE");
+  assert.equal(result.delivery.result.endpointSemantics, "NON_IDEMPOTENT_WRITE");
+  assert.equal(result.delivery.result.reportedEndpointSemantics, "IDEMPOTENT_WRITE");
+  assert.equal(result.delivery.result.reportedIdempotent, true);
+  assert.equal(result.delivery.result.provenNoEffect, false);
+});
+
+test("Audit17 stranded Automation reconciliation terminalizes no-retry after bounded window", async () => {
+  const { rows, db } = actionFixture();
+  const service = loadActionService(db);
+  const row = rows[0];
+  row.status = "RECONCILE_REQUIRED";
+  row.claimUntil = null;
+  row.claimedByDeviceId = null;
+  row.leaseTokenHash = null;
+  row.failureCategory = "OUTCOME_UNKNOWN_RECONCILE";
+  row.result = {
+    outcomeState: "RECONCILE_REQUIRED",
+    reconciliationStartedAt: new Date(Date.now() - 31 * 60_000).toISOString(),
+  };
+  const changed = await service.sweepExpiredAutomationLeases({
+    now: new Date(),
+    agencyId: "agency-1",
+    creatorIds: ["creator-1"],
+  });
+  assert.equal(changed, 1);
+  assert.equal(row.status, "FAILED");
+  assert.equal(row.failureCode, "outcome_unresolved_do_not_retry");
+  assert.equal(row.result.outcomeState, "UNRESOLVED_DO_NOT_RETRY");
+  assert.equal(row.claimUntil, null);
+});

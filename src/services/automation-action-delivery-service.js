@@ -10,7 +10,7 @@ const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fe
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
 const {
-  FAILURE_CATEGORIES, SAFE_RETRY_CATEGORIES, normalizeFailureCategory, classifyAutomationFailure,
+  FAILURE_CATEGORIES, SAFE_RETRY_CATEGORIES, normalizeFailureCategory, classifyAutomationFailure, automationActionWriteSemantics,
 } = require("./automation-failure-taxonomy");
 const {
   validateBumpDelivery,
@@ -61,6 +61,7 @@ const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"];
 const DEFAULT_LEASE_MS = 3 * 60_000;
 const MIN_LEASE_MS = 30_000;
 const MAX_LEASE_MS = 10 * 60_000;
+const MAX_RECONCILIATION_WAIT_MS = 30 * 60_000;
 
 class ActionDeliveryError extends Error {
   constructor(code, message, status = 409) {
@@ -77,6 +78,15 @@ function deliveryRequiresReconciliation(delivery) {
   return delivery?.status === "RECONCILE_REQUIRED"
     || delivery?.failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE
     || String(result.outcomeState || "").toUpperCase() === "RECONCILE_REQUIRED";
+}
+function reconciliationStartedAt(delivery, now = new Date()) {
+  const result = object(delivery?.result);
+  const value = result.reconciliationStartedAt || delivery?.writeCommitAt || now;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed : now;
+}
+function reconciliationWindowExpired(delivery, now = new Date()) {
+  return now.getTime() - reconciliationStartedAt(delivery, now).getTime() >= MAX_RECONCILIATION_WAIT_MS;
 }
 function clean(value, max = 1000) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
 function hashToken(token) { return crypto.createHash("sha256").update(String(token)).digest("hex"); }
@@ -195,44 +205,69 @@ async function scopedReadyCreatorIds({ device, member }) {
   return bindings.map((item) => item.creatorId);
 }
 
-async function sweepExpiredAutomationLeases(now = new Date()) {
+async function sweepExpiredAutomationLeases(input = new Date()) {
+  const options = input instanceof Date ? { now: input } : (input || {});
+  const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
+  const agencyId = clean(options.agencyId, 180);
+  const creatorIds = Array.isArray(options.creatorIds) ? [...new Set(options.creatorIds.map(String).filter(Boolean))] : null;
+  const scopeWhere = {
+    originKind: "AUTOMATION",
+    ...(agencyId ? { agencyId } : {}),
+    ...(creatorIds ? { creatorId: { in: creatorIds.length ? creatorIds : ["__none__"] } } : {}),
+  };
   const rows = await prisma.automationDelivery.findMany({
-    where: { originKind: "AUTOMATION", status: { in: LEASED_STATUSES }, claimUntil: { lt: now } },
+    where: { ...scopeWhere, status: { in: LEASED_STATUSES }, claimUntil: { lt: now } },
     select: {
       id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true,
-      payload: true, contentCollectionId: true, status: true, failureCode: true, failureCategory: true,
+      payload: true, contentCollectionId: true, status: true, failureCode: true, failureCategory: true, writeCommitAt: true,
       attempts: true, maxAttempts: true, result: true, leaseRevision: true, generation: true, notBefore: true,
     }, take: 10000,
   });
   let changed = 0;
+  const terminalizeUnresolved = async (row, where) => {
+    const failureCode = "outcome_unresolved_do_not_retry";
+    const result = { ...object(row.result), outcomeState: "UNRESOLVED_DO_NOT_RETRY", unresolvedClosedAt: now.toISOString(), unresolvedCloseReason: "MAINTENANCE_RECONCILIATION_WINDOW_EXPIRED" };
+    const updated = await prisma.$transaction(async (tx) => {
+      const changedRow = await tx.automationDelivery.updateMany({ where, data: {
+        status: "FAILED", failureCode, failureCategory: FAILURE_CATEGORIES.TERMINAL,
+        lastError: "Reconciliation evidence remained insufficient beyond the bounded verification window; logical commit closed permanently without retry",
+        finishedAt: now, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, lastCheckedAt: now, result,
+      } });
+      if (!changedRow.count) return null;
+      const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
+      await updateModuleCandidateProgress(current, "FAILED", failureCode, tx);
+      await updateCandidateFromTerminal(current, "FAILED", failureCode, tx);
+      if (current?.moduleKey === "bumps") await finalizeBumpFailure({ delivery: current, failureCode, retryable: false, db: tx });
+      if (current?.moduleKey === "likes") await finalizeLikeFailure({ delivery: current, failureCode, retryable: false, result, db: tx });
+      if (current?.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) await finalizeFollowAutomationFailure({ delivery: current, failureCode, retryable: false, db: tx });
+      if (current?.moduleKey === SFS_MODULE_KEY) await finalizeSfsFailure({ delivery: current, failureCode, retryable: false, db: tx });
+      return current;
+    }, { timeout: 30_000 });
+    if (updated) changed += 1;
+    return Boolean(updated);
+  };
   for (const row of rows) {
     const committing = row.status === "COMMITTING";
     const reconciliationLease = !committing && deliveryRequiresReconciliation(row);
     const mustReconcile = committing || reconciliationLease;
+    if (mustReconcile && reconciliationWindowExpired(row, now)) {
+      if (await terminalizeUnresolved(row, { id: row.id, status: row.status, leaseRevision: row.leaseRevision, claimUntil: { lt: now } })) continue;
+    }
     const failureCode = committing ? "write_outcome_unknown" : (reconciliationLease ? "reconciliation_lease_lost" : "lease_lost");
-    const failureCategory = mustReconcile
-      ? FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE
-      : classifyAutomationFailure({ failureCode, deliveryStatus: row.status, provenNoEffect: true });
+    const failureCategory = mustReconcile ? FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE : classifyAutomationFailure({ failureCode, deliveryStatus: row.status, provenNoEffect: true, endpointSemantics: automationActionWriteSemantics(row.actionType) });
     const safetySaga = mustPreserveRefollowSaga(row, failureCode) || isSfsCleanupDelivery(row);
     const terminal = !mustReconcile && !safetySaga && row.attempts >= row.maxAttempts;
     const retryAt = new Date(now.getTime() + retryDelayMs(row.attempts || 1, failureCode));
     const nextStatus = mustReconcile ? "RECONCILE_REQUIRED" : (terminal ? "FAILED" : "RETRY_SCHEDULED");
     const nextResult = {
-      ...object(row.result), failureCode, failureCategory,
-      outcomeState: mustReconcile ? "RECONCILE_REQUIRED" : "PROVEN_NO_EFFECT",
-      leaseExpiredAt: now.toISOString(),
+      ...object(row.result), failureCode, failureCategory, outcomeState: mustReconcile ? "RECONCILE_REQUIRED" : "PROVEN_NO_EFFECT", leaseExpiredAt: now.toISOString(),
+      ...(mustReconcile ? { reconciliationStartedAt: object(row.result).reconciliationStartedAt || row.writeCommitAt?.toISOString?.() || now.toISOString() } : {}),
       ...(row.actionType === "SEND_MESSAGE" && mustReconcile ? { phase: "send" } : {}),
     };
     const latest = await prisma.$transaction(async (tx) => {
       const updated = await tx.automationDelivery.updateMany({
         where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision, claimUntil: { lt: now } },
-        data: {
-          status: nextStatus, failureCode, failureCategory,
-          lastError: mustReconcile ? "Action outcome must be reconciled after lost commit/reconciliation lease" : "Action lease expired",
-          notBefore: terminal ? row.notBefore : retryAt, finishedAt: terminal ? now : null,
-          claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null,
-          leaseRevision: { increment: 1 }, result: nextResult,
-        },
+        data: { status: nextStatus, failureCode, failureCategory, lastError: mustReconcile ? "Action outcome must be reconciled after lost commit/reconciliation lease" : "Action lease expired", notBefore: terminal ? row.notBefore : retryAt, finishedAt: terminal ? now : null, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, result: nextResult },
       });
       if (!updated.count) return null;
       const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
@@ -247,16 +282,26 @@ async function sweepExpiredAutomationLeases(now = new Date()) {
     }, { timeout: 30_000 });
     if (latest) changed += 1;
   }
+  // Stranded reconciliation rows have no lease timestamp, so they need an
+  // explicit bounded sweep or they would hold the global creator lane forever.
+  const stranded = await prisma.automationDelivery.findMany({
+    where: { ...scopeWhere, status: "RECONCILE_REQUIRED", claimUntil: null },
+    select: { id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true, payload: true, status: true, result: true, failureCode: true, writeCommitAt: true, leaseRevision: true, attempts: true, maxAttempts: true },
+    take: 10000,
+  });
+  for (const row of stranded) {
+    if (reconciliationWindowExpired(row, now)) await terminalizeUnresolved(row, { id: row.id, status: "RECONCILE_REQUIRED", leaseRevision: row.leaseRevision, claimUntil: null });
+  }
   return changed;
 }
 
-async function sweepExpiredActionLeases(now = new Date()) {
-  // Shared creator lane, origin-specific maintenance policies. Both origins are
-  // swept before Automation attempts to acquire the physical write lane.
+async function sweepExpiredActionLeases(input = new Date()) {
+  const options = input instanceof Date ? { now: input } : (input || {});
+  const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
   const { sweepExpiredProgrammaticWriteLeases } = require("./programmatic-of-write-authority-service");
   const [automationChanged, programmaticChanged] = await Promise.all([
-    sweepExpiredAutomationLeases(now),
-    sweepExpiredProgrammaticWriteLeases({ now }),
+    sweepExpiredAutomationLeases({ now, agencyId: options.agencyId, creatorIds: options.creatorIds }),
+    sweepExpiredProgrammaticWriteLeases({ now, agencyId: options.agencyId, creatorIds: options.creatorIds }),
   ]);
   return automationChanged + programmaticChanged;
 }
@@ -577,9 +622,9 @@ async function applySfsValidationTransition(delivery, validation, now = new Date
 
 async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST", "UNFOLLOW_FAN", "FOLLOW_FAN", "SFS_FOLLOW_TARGET", "SFS_COMMENT_POST", "SFS_LIKE_COMMENT", "SFS_UNFOLLOW_TARGET"] }) {
   const { device, member } = await requireOwnedSeniorDevice({ userId, deviceId });
-  await sweepExpiredActionLeases();
   if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60_000)) return { delivery: null, reason: "device_stale" };
   const creatorIds = await scopedReadyCreatorIds({ device, member });
+  if (creatorIds.length) await sweepExpiredActionLeases({ now: new Date(), agencyId: device.agencyId, creatorIds });
   if (!creatorIds.length) return { delivery: null, reason: "no_ready_creator" };
   const allowedActionTypes = [...new Set((Array.isArray(actionTypes) ? actionTypes : []).map((item) => clean(item, 80)).filter(Boolean))];
   if (!allowedActionTypes.length) return { delivery: null, reason: "no_capabilities" };
@@ -670,7 +715,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
             leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 },
             leaseMemberId: member.id, leaseAccessEpoch: Number(member.accessEpoch || 1),
             ...(reconciliationClaim ? {} : { attempts: { increment: 1 } }), lastError: null,
-            ...(reconciliationClaim ? { result: { ...object(candidate.result), reconciliationClaimedAt: now.toISOString(), outcomeState: "RECONCILE_REQUIRED" } } : {}),
+            ...(reconciliationClaim ? { result: { ...object(candidate.result), reconciliationClaimedAt: now.toISOString(), outcomeState: "RECONCILE_REQUIRED", reconciliationStartedAt: object(candidate.result).reconciliationStartedAt || candidate.writeCommitAt?.toISOString?.() || now.toISOString() } } : {}),
           },
         });
         if (!updated.count) return null;
@@ -780,7 +825,7 @@ async function startActionDelivery(input) {
     if (delivery.status === "COMMITTING") throw new ActionDeliveryError("DELIVERY_ALREADY_COMMITTING", "Delivery already crossed the write commit boundary");
     const updated = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "CLAIMED", leaseRevision: input.leaseRevision, claimedByDeviceId: input.deviceId },
-      data: { status: "RUNNING", lastCheckedAt: now, result: { ...object(delivery.result), ...(reconciliationLease ? { outcomeState: "RECONCILE_REQUIRED", reconciliationStartedAt: now.toISOString() } : { attemptStartedAt: now.toISOString() }), attemptLeaseRevision: delivery.leaseRevision } },
+      data: { status: "RUNNING", lastCheckedAt: now, result: { ...object(delivery.result), ...(reconciliationLease ? { outcomeState: "RECONCILE_REQUIRED", reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString() } : { attemptStartedAt: now.toISOString() }), attemptLeaseRevision: delivery.leaseRevision } },
     });
     if (!updated.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before start");
     const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
@@ -964,17 +1009,24 @@ async function failActionDelivery(input) {
   const lastError = clean(input.error, 2000) || failureCode;
   const reportedFailureCategory = normalizeFailureCategory(input.failureCategory);
   const inputResult = object(input.result);
-  const provenNoEffect = inputResult.provenNoEffect === true;
-  const failureCategory = classifyAutomationFailure({
-    failureCode,
-    deliveryStatus: delivery.status,
-    provenNoEffect,
-    idempotent: inputResult.idempotent === true,
-    endpointSemantics: inputResult.endpointSemantics || null,
-    writeReachedWire: inputResult.writeReachedWire === true,
-    outcomeState: inputResult.outcomeState || null,
-    transportCode: inputResult.transportCode || inputResult.originalCode || null,
-  });
+  const endpointSemantics = automationActionWriteSemantics(delivery.actionType);
+  const idempotent = endpointSemantics === "IDEMPOTENT_WRITE";
+  const reachedWire = delivery.status === "COMMITTING" || Boolean(delivery.writeCommitAt);
+  // Strong negative proof is action-specific and server-owned. Generic client
+  // provenNoEffect/idempotent flags never unlock a non-idempotent COMMITTING row.
+  // SEND_MESSAGE has the existing anchored recent-message reconciliation contract.
+  const actionSpecificNoEffectProof = deliveryRequiresReconciliation(delivery)
+    && delivery.actionType === "SEND_MESSAGE"
+    && failureCode === "send_reconcile_no_effect"
+    && inputResult.readbackCovered === true;
+  const provenNoEffect = !reachedWire || actionSpecificNoEffectProof;
+  const failureCategory = reachedWire && !idempotent && !actionSpecificNoEffectProof
+    ? FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE
+    : classifyAutomationFailure({
+      failureCode, deliveryStatus: delivery.status, provenNoEffect, idempotent, endpointSemantics,
+      writeReachedWire: reachedWire, outcomeState: reachedWire ? "ON_WIRE_UNKNOWN" : "PRE_WIRE_FAILURE",
+      transportCode: inputResult.transportCode || inputResult.originalCode || null,
+    });
   const safetyRecovery = mustPreserveRefollowSaga(delivery, failureCode) || isSfsCleanupDelivery(delivery);
   const reconcile = failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE;
   const categoryRetryable = SAFE_RETRY_CATEGORIES.includes(failureCategory) || reconcile;
@@ -982,8 +1034,12 @@ async function failActionDelivery(input) {
   const nextStatus = reconcile ? "RECONCILE_REQUIRED" : (retryable ? "RETRY_SCHEDULED" : "FAILED");
   const nextNotBefore = (retryable || reconcile) ? new Date(now.getTime() + retryDelayMs(delivery.attempts, failureCode, input.retryAfterMs)) : delivery.notBefore;
   const result = {
-    ...object(delivery.result), ...inputResult, failureCode, failureCategory, reportedFailureCategory,
-    outcomeState: reconcile ? "RECONCILE_REQUIRED" : (provenNoEffect ? "PROVEN_NO_EFFECT" : "TERMINAL"), failedAt: now.toISOString(), retryable,
+    ...object(delivery.result), ...inputResult,
+    reportedEndpointSemantics: inputResult.endpointSemantics || null, reportedIdempotent: inputResult.idempotent === true, reportedProvenNoEffect: inputResult.provenNoEffect === true,
+    endpointSemantics, writeReachedWire: reachedWire, provenNoEffect, failureCode, failureCategory, reportedFailureCategory,
+    outcomeState: reconcile ? "RECONCILE_REQUIRED" : (provenNoEffect ? "PROVEN_NO_EFFECT" : "TERMINAL"),
+    ...(reconcile ? { reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString() } : {}),
+    failedAt: now.toISOString(), retryable,
   };
   const updated = await prisma.$transaction(async (tx) => {
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });

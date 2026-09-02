@@ -423,6 +423,46 @@ test("Audit17 COMMITTING HTTP failure cannot be downgraded by client provenNoEff
   });
 });
 
+test("Audit17 backend ignores a malicious idempotent client hint for COMMITTING MASS", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    const failed = await authority.failProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision,
+      failureCode: "write_outcome_ambiguous",
+      facts: { endpointSemantics: "IDEMPOTENT_WRITE", provenNoEffect: true, writeReachedWire: false },
+    });
+    assert.equal(failed.reconciliationRequired, true);
+    assert.equal(getRow().status, "RECONCILE_REQUIRED");
+    assert.equal(getRow().failureCategory, "OUTCOME_UNKNOWN_RECONCILE");
+    assert.equal(getRow().result.failureEvidence.endpointSemantics, "NON_IDEMPOTENT_WRITE");
+    assert.equal(getRow().result.failureEvidence.reportedEndpointSemantics, "IDEMPOTENT_WRITE");
+  });
+});
+
+test("Audit17 stranded programmatic reconciliation auto-closes no-retry after the bounded window", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const reserved = await authority.reserveProgrammaticWrite(base);
+    await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+    const failed = await authority.failProgrammaticWrite({
+      ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision,
+      failureCode: "write_outcome_unknown", facts: {},
+    });
+    getRow().result.reconciliationStartedAt = new Date(Date.now() - 31 * 60_000).toISOString();
+    getRow().claimUntil = null;
+    getRow().leaseTokenHash = null;
+    const changed = await authority.sweepExpiredProgrammaticWriteLeases({ agencyId: base.agencyId, creatorId: base.creatorId, now: new Date() });
+    assert.equal(changed, 1);
+    assert.equal(getRow().status, "FAILED");
+    assert.equal(getRow().failureCode, "outcome_unresolved_do_not_retry");
+    assert.equal(getRow().result.outcomeState, "UNRESOLVED_DO_NOT_RETRY");
+    assert.equal(getRow().idempotencyKey, base.idempotencyKey);
+    assert.ok(failed.lease?.token);
+  });
+});
+
 test("Audit17 SOURCE_DEVICE payload cannot migrate before commit but another device may reconcile after expired COMMITTING", async () => {
   await withAuthority(async ({ authority, getRow }) => {
     const first = await authority.reserveProgrammaticWrite(base);
@@ -573,10 +613,10 @@ test("Audit17 custom unresolved close stays behind the Custom product adapter", 
 test("Audit17 shared lease sweeper dispatches programmatic rows to programmatic policy and automation rows to automation policy", () => {
   const automationService = read("services/automation-action-delivery-service.js");
   const programmaticService = read("services/programmatic-of-write-authority-service.js");
-  assert.match(automationService, /sweepExpiredProgrammaticWriteLeases\(\{ now \}\)/);
+  assert.match(automationService, /sweepExpiredProgrammaticWriteLeases\(\{ now, agencyId: options\.agencyId, creatorIds: options\.creatorIds \}\)/);
   assert.match(automationService, /async function sweepExpiredAutomationLeases/);
-  assert.match(automationService, /where:\s*\{\s*originKind:\s*"AUTOMATION",\s*status:/);
-  assert.match(programmaticService, /sweepExpiredAutomationLeases\(now\)/);
+  assert.match(automationService, /scopeWhere[\s\S]*originKind:\s*"AUTOMATION"[\s\S]*status:\s*\{\s*in:\s*LEASED_STATUSES/);
+  assert.match(programmaticService, /sweepExpiredAutomationLeases\(\{ now, agencyId, creatorIds: \[creatorId\] \}\)/);
   assert.match(programmaticService, /originKind:\s*\{\s*not:\s*"AUTOMATION"\s*\}/);
   assert.match(programmaticService, /CLAIMED[\s\S]*RUNNING[\s\S]*COMMITTING[\s\S]*RECONCILE_REQUIRED/);
 });

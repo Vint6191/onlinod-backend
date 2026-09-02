@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { runDbTransaction, withDbAdvisoryXactLock } = require("./db-transaction-service");
@@ -244,14 +245,14 @@ async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId 
       let delivery;
       try {
         delivery = await tx.automationDelivery.create({ data: {
-          agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_FOLLOW_TARGET_ACTION_TYPE,
+          agencyId, creatorId, originKind: "AUTOMATION", moduleKey: SFS_MODULE_KEY, actionType: SFS_FOLLOW_TARGET_ACTION_TYPE,
           targetId: candidate.targetUserId, fanId: candidate.targetUserId, idempotencyKey, generation, priority,
           payload: { candidateId: candidate.id, username: candidate.username, source, requestedByUserId: userId, originalFollowing: candidate.creatorFollowing === true },
           status: "QUEUED", scheduledAt: new Date(), notBefore, maxAttempts: settings.maxAttempts, createdByUserId: userId,
         } });
       } catch (error) {
         if (error?.code !== "P2002") throw error;
-        delivery = await tx.automationDelivery.findUnique({ where: { idempotencyKey } });
+        delivery = assertAutomationDeliveryAdoption(await tx.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_FOLLOW_TARGET_ACTION_TYPE });
       }
       await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
         generation, state: "QUEUED", phase: "FOLLOW", eligibilityReason: null,
@@ -294,7 +295,7 @@ async function createSafetyUnfollow({ delivery, candidate, settings, now, db }) 
   let cleanup;
   try {
     cleanup = await db.automationDelivery.create({ data: {
-      agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: SFS_MODULE_KEY,
+      agencyId: delivery.agencyId, creatorId: delivery.creatorId, originKind: "AUTOMATION", moduleKey: SFS_MODULE_KEY,
       actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE, targetId: candidate.targetUserId, fanId: candidate.targetUserId,
       idempotencyKey, generation: delivery.generation, priority: 120,
       payload: { candidateId: candidate.id, safetyCleanup: true, originalFollowing: object(delivery.payload).originalFollowing === true },
@@ -302,7 +303,7 @@ async function createSafetyUnfollow({ delivery, candidate, settings, now, db }) 
     } });
   } catch (error) {
     if (error?.code !== "P2002") throw error;
-    cleanup = await db.automationDelivery.findUnique({ where: { idempotencyKey } });
+    cleanup = assertAutomationDeliveryAdoption(await db.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE });
   }
   return cleanup;
 }
@@ -382,7 +383,7 @@ async function applySfsTargetScanCompletion({ job, result, db = prisma }) {
           cursor = new Date(cursor.getTime() + delay);
           try {
             await tx.automationDelivery.create({ data: {
-              agencyId: job.agencyId, creatorId: job.creatorId, moduleKey: SFS_MODULE_KEY,
+              agencyId: job.agencyId, creatorId: job.creatorId, originKind: "AUTOMATION", moduleKey: SFS_MODULE_KEY,
               actionType: SFS_COMMENT_POST_ACTION_TYPE, targetId: postId, fanId: candidate.targetUserId,
               idempotencyKey, generation: candidateGeneration, priority: 75,
               payload: { candidateId: candidate.id, targetUserId: candidate.targetUserId, postId, templateId: template.id, text: template.text },
@@ -407,7 +408,7 @@ async function applySfsTargetScanCompletion({ job, result, db = prisma }) {
           cursor = new Date(cursor.getTime() + delay);
           try {
             await tx.automationDelivery.create({ data: {
-              agencyId: job.agencyId, creatorId: job.creatorId, moduleKey: SFS_MODULE_KEY,
+              agencyId: job.agencyId, creatorId: job.creatorId, originKind: "AUTOMATION", moduleKey: SFS_MODULE_KEY,
               actionType: SFS_LIKE_COMMENT_ACTION_TYPE, targetId: commentId, fanId: candidate.targetUserId,
               idempotencyKey, generation: candidateGeneration, priority: 65,
               payload: { candidateId: candidate.id, targetUserId: candidate.targetUserId, postId, commentId, authorId: clean(comment.authorId, 160) },
@@ -620,14 +621,14 @@ async function adoptLegacySfsUnfollow({ agencyId, creatorId, targetUserId, targe
     let delivery;
     try {
       delivery = await tx.automationDelivery.create({ data: {
-        agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE,
+        agencyId, creatorId, originKind: "AUTOMATION", moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE,
         targetId, fanId: targetId, idempotencyKey, generation, priority: 120,
         payload: { candidateId: candidate.id, safetyCleanup: true, legacyMigration: true, sourceJobId },
         status: "QUEUED", scheduledAt: new Date(), notBefore: dueAt, maxAttempts: 20,
       } });
     } catch (error) {
       if (error?.code !== "P2002") throw error;
-      delivery = await tx.automationDelivery.findUnique({ where: { idempotencyKey } });
+      delivery = assertAutomationDeliveryAdoption(await tx.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE });
     }
     await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
       safetyUnfollowDeliveryId: delivery?.id || candidate.safetyUnfollowDeliveryId,
