@@ -42,7 +42,7 @@ async function main() {
 
   // Берём все строки с messageId, только нужные поля (легко влезет в память даже на тысячах).
   const rows = await prisma.automationDelivery.findMany({
-    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, messageId: { not: null } },
+    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }], messageId: { not: null } },
     select: { id: true, creatorId: true, messageId: true, updatedAt: true },
     orderBy: { updatedAt: "desc" }, // самые свежие первыми
   });
@@ -63,7 +63,7 @@ async function main() {
   }
 
   const withoutMessageId = await prisma.automationDelivery.count({
-    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, messageId: null },
+    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }], messageId: null },
   });
 
   console.log("------------------------------------------------------------");
@@ -89,7 +89,7 @@ async function main() {
   for (let i = 0; i < toDelete.length; i += CHUNK) {
     const chunk = toDelete.slice(i, i + CHUNK);
     const res = await prisma.automationDelivery.deleteMany({
-      where: { id: { in: chunk }, originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES } },
+      where: { id: { in: chunk }, originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }] },
     });
     deleted += res.count;
     console.log(`удалено ${deleted}/${toDelete.length}...`);

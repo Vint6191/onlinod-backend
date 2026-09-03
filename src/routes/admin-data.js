@@ -509,7 +509,7 @@ router.post("/purge-deliveries", async (req, res) => {
     if (dedupeClones) {
       // Keep newest row per (creatorId, messageId), delete the rest.
       const rows = await prisma.automationDelivery.findMany({
-        where: { originKind: "AUTOMATION", status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] }, messageId: { not: null }, ...(creatorId ? { creatorId } : {}) },
+        where: { originKind: "AUTOMATION", status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }], messageId: { not: null }, ...(creatorId ? { creatorId } : {}) },
         select: { id: true, creatorId: true, messageId: true, updatedAt: true },
         orderBy: { updatedAt: "desc" },
         take: 10000});
@@ -520,7 +520,7 @@ router.post("/purge-deliveries", async (req, res) => {
         if (seen.has(key)) toDelete.push(r.id); else seen.add(key);
       }
       for (let i = 0; i < toDelete.length; i += 500) {
-        const r = await prisma.automationDelivery.deleteMany({ where: { id: { in: toDelete.slice(i, i + 500) }, originKind: "AUTOMATION", status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] } } });
+        const r = await prisma.automationDelivery.deleteMany({ where: { id: { in: toDelete.slice(i, i + 500) }, originKind: "AUTOMATION", status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }] } });
         deletedClones += r.count;
       }
     }
@@ -529,7 +529,7 @@ router.post("/purge-deliveries", async (req, res) => {
     if (statuses.length || olderThanDays > 0) {
       const terminalStatuses = new Set(["COMPLETED", "FAILED", "SKIPPED", "CANCELED"]);
       const safeStatuses = statuses.filter((status) => terminalStatuses.has(status));
-      const where = { originKind: "AUTOMATION", status: { in: safeStatuses.length ? safeStatuses : [...terminalStatuses] } };
+      const where = { originKind: "AUTOMATION", status: { in: safeStatuses.length ? safeStatuses : [...terminalStatuses] }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }] };
       if (creatorId) where.creatorId = creatorId;
       if (olderThanDays > 0) {
         const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);

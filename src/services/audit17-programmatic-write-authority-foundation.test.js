@@ -206,6 +206,53 @@ test("Audit17 MASS reserve uses product permission, stable idempotency binding a
   });
 });
 
+test("Audit17 programmatic reserve cannot poison another product idempotency namespace", async () => {
+  await withAuthority(async ({ authority }) => {
+    for (const key of [
+      "bump_send:future-key",
+      "sfs_comment:future-key",
+      "vault-relay:creator-a:item-a",
+      "mass:creator-b:dispatch-a",
+      "mass:creator-a:",
+    ]) {
+      await assert.rejects(
+        () => authority.reserveProgrammaticWrite({ ...base, idempotencyKey: key }),
+        (error) => [
+          "PROGRAMMATIC_WRITE_IDEMPOTENCY_NAMESPACE_MISMATCH",
+          "PROGRAMMATIC_WRITE_IDEMPOTENCY_CREATOR_MISMATCH",
+          "PROGRAMMATIC_WRITE_IDEMPOTENCY_SUFFIX_REQUIRED",
+        ].includes(error?.code),
+      );
+    }
+  });
+});
+
+test("Audit17 durable success requires the remote identity canonical for each programmatic kind", async () => {
+  const cases = [
+    { kind: "MASS_QUEUE_CREATE", idempotencyKey: "mass:creator-a:dispatch-proof", result: {}, field: "queueId" },
+    { kind: "VAULT_CREATE_LIST", idempotencyKey: "vault-create-list:creator-a:list-proof", result: {}, field: "folderId" },
+    { kind: "VAULT_RELAY_SEND", idempotencyKey: "vault-relay:creator-a:relay-proof", result: {}, field: "mediaId" },
+    { kind: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:submission-proof:0", result: {}, field: "mediaId" },
+  ];
+  for (const item of cases) {
+    await withAuthority(async ({ authority, getRow }) => {
+      const input = { ...base, kind: item.kind, idempotencyKey: item.idempotencyKey };
+      const reserved = await authority.reserveProgrammaticWrite(input);
+      await authority.startProgrammaticWrite({ ...input, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+      await authority.prepareProgrammaticWrite({ ...input, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
+      await assert.rejects(
+        () => authority.completeProgrammaticWrite({ ...input, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, result: item.result }),
+        (error) => error?.code === "PROGRAMMATIC_WRITE_COMPLETION_EVIDENCE_REQUIRED",
+      );
+      assert.equal(getRow().status, "COMMITTING", `${item.kind} must remain COMMITTING without ${item.field}`);
+      const evidence = item.field === "queueId" ? { queueId: "queue-proof" } : item.field === "folderId" ? { folderId: "folder-proof" } : { mediaId: "media-proof" };
+      const completed = await authority.completeProgrammaticWrite({ ...input, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, result: evidence });
+      assert.equal(completed.delivery.status, "COMPLETED");
+      assert.equal(completed.delivery.result[item.field], evidence[item.field]);
+    });
+  }
+});
+
 test("Audit17 prepare creates one durable COMMITTING permit and complete replay survives erased lease token", async () => {
   await withAuthority(async ({ authority, getRow }) => {
     const reserved = await authority.reserveProgrammaticWrite(base);

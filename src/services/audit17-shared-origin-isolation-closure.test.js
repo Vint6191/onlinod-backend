@@ -61,3 +61,18 @@ test("Audit17 operational maintenance scripts cannot delete programmatic write r
     }
   }
 });
+
+
+test("Audit17 unresolved-do-not-retry automation receipts survive retention, admin purge and maintenance dedupe", () => {
+  const history = read("automation-history-service.js");
+  const admin = fs.readFileSync(path.join(__dirname, "..", "routes", "admin-data.js"), "utf8");
+  const backendRoot = path.join(__dirname, "..", "..");
+  const maintenance = fs.readFileSync(path.join(backendRoot, "scripts", "maintenance", "dedupe-deliveries.js"), "utf8");
+  const rootMaintenance = fs.readFileSync(path.join(backendRoot, "dedupe-deliveries.js"), "utf8");
+  for (const source of [history, admin, maintenance, rootMaintenance]) {
+    assert.match(source, /failureCode:\s*null/);
+    assert.match(source, /failureCode:\s*\{\s*not:\s*"outcome_unresolved_do_not_retry"\s*\}/);
+  }
+  assert.match(history, /OR:\s*\[\{\s*failureCode:\s*null\s*\},\s*\{\s*failureCode:/);
+  assert.match(admin, /OR:\s*\[\{\s*failureCode:\s*null\s*\},\s*\{\s*failureCode:/);
+});

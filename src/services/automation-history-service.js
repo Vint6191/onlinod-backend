@@ -92,6 +92,7 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = n
       where: {
         originKind: "AUTOMATION",
         status: { in: TERMINAL_STATUSES },
+        AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }],
         finishedAt: { not: null, lt: olderThan },
       },
       orderBy: [{ finishedAt: "asc" }, { id: "asc" }],
@@ -145,7 +146,7 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = n
           });
         }
       }
-      await tx.automationDelivery.deleteMany({ where: { id: { in: rows.map((row) => row.id) }, originKind: "AUTOMATION" } });
+      await tx.automationDelivery.deleteMany({ where: { id: { in: rows.map((row) => row.id) }, originKind: "AUTOMATION", AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }] } });
     });
     archived += rows.length;
     aggregateUpdates += groups.length;

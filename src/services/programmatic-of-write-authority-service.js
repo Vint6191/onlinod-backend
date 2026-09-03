@@ -24,6 +24,9 @@ const PRODUCT_WRITE_KINDS = Object.freeze({
     reconciliationKind: "MASS_QUEUE",
     writeSemantics: "NON_IDEMPOTENT_WRITE",
     commitClass: "BUSINESS_COMMIT",
+    idempotencyNamespace: "mass",
+    idempotencyEmbedsCreator: true,
+    requiredSuccessField: "queueId",
   }),
   VAULT_RELAY_SEND: Object.freeze({
     moduleKey: "vault",
@@ -34,6 +37,9 @@ const PRODUCT_WRITE_KINDS = Object.freeze({
     reconciliationKind: "VAULT_RELAY",
     writeSemantics: "NON_IDEMPOTENT_WRITE",
     commitClass: "BUSINESS_COMMIT",
+    idempotencyNamespace: "vault-relay",
+    idempotencyEmbedsCreator: true,
+    requiredSuccessField: "mediaId",
   }),
   VAULT_CREATE_LIST: Object.freeze({
     moduleKey: "vault",
@@ -44,6 +50,9 @@ const PRODUCT_WRITE_KINDS = Object.freeze({
     reconciliationKind: "VAULT_LIST",
     writeSemantics: "NON_IDEMPOTENT_WRITE",
     commitClass: "BUSINESS_COMMIT",
+    idempotencyNamespace: "vault-create-list",
+    idempotencyEmbedsCreator: true,
+    requiredSuccessField: "folderId",
   }),
   CUSTOM_RELAY_SEND: Object.freeze({
     moduleKey: "customs",
@@ -54,6 +63,9 @@ const PRODUCT_WRITE_KINDS = Object.freeze({
     reconciliationKind: "CUSTOM_RELAY",
     writeSemantics: "NON_IDEMPOTENT_WRITE",
     commitClass: "BUSINESS_COMMIT",
+    idempotencyNamespace: "custom-relay",
+    idempotencyEmbedsCreator: false,
+    requiredSuccessField: "mediaId",
   }),
 });
 
@@ -117,9 +129,43 @@ function publicDelivery(delivery) {
     finishedAt: delivery.finishedAt || null,
   };
 }
+function assertProgrammaticIdempotencyNamespace(kind, config, creatorId, idempotencyKey) {
+  const key = clean(idempotencyKey, 500);
+  const namespace = clean(config.idempotencyNamespace, 80);
+  if (!key || !namespace) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_IDEMPOTENCY_NAMESPACE_INVALID", "Programmatic write idempotency namespace is not configured", 500);
+  const prefix = `${namespace}:`;
+  if (!key.startsWith(prefix)) {
+    throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_IDEMPOTENCY_NAMESPACE_MISMATCH", `Idempotency key must use the ${namespace}: namespace for ${kind}`, 400);
+  }
+  const rest = key.slice(prefix.length);
+  if (!rest) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_IDEMPOTENCY_SUFFIX_REQUIRED", "Programmatic write idempotency key suffix is required", 400);
+  if (config.idempotencyEmbedsCreator) {
+    const creatorPrefix = `${creatorId}:`;
+    if (!rest.startsWith(creatorPrefix) || !rest.slice(creatorPrefix.length)) {
+      throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_IDEMPOTENCY_CREATOR_MISMATCH", "Programmatic write idempotency key is not bound to the requested creator", 400);
+    }
+  } else if (kind === "CUSTOM_RELAY_SEND") {
+    const parts = rest.split(":");
+    if (parts.length !== 2 || !clean(parts[0], 180) || !/^\d+$/.test(parts[1] || "")) {
+      throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_IDEMPOTENCY_NAMESPACE_MISMATCH", "Custom relay idempotency key must be custom-relay:<submissionId>:<index>", 400);
+    }
+  }
+}
+function assertCompletionEvidence(delivery, result) {
+  const kind = storedProgrammaticKind(delivery);
+  const { config } = productKind(kind);
+  const field = clean(config.requiredSuccessField, 80);
+  if (!field) return;
+  const value = field === "folderId" ? clean(result.folderId || object(result.list).id, 180) : clean(result[field], 180);
+  if (!value) {
+    throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_COMPLETION_EVIDENCE_REQUIRED", `${kind} requires ${field} before durable success may be recorded`, 409);
+  }
+}
 function assertPayloadBinding(existing, input, config) {
-  if (existing.agencyId !== input.agencyId || existing.creatorId !== input.creatorId || existing.actionType !== config.actionType) {
-    throw new ProgrammaticOfWriteAuthorityError("IDEMPOTENCY_CONFLICT", "Idempotency key is already bound to another programmatic write", 409);
+  if (existing.agencyId !== input.agencyId || existing.creatorId !== input.creatorId || existing.actionType !== config.actionType
+      || existing.originKind !== config.originKind || existing.moduleKey !== config.moduleKey
+      || existing.executionKind !== config.executionKind || existing.reconciliationKind !== config.reconciliationKind) {
+    throw new ProgrammaticOfWriteAuthorityError("IDEMPOTENCY_CONFLICT", "Idempotency key is already bound to another programmatic write authority identity", 409);
   }
   const existingFingerprint = clean(existing.payloadFingerprint, 200);
   const requestedFingerprint = clean(input.payloadFingerprint, 200);
@@ -240,6 +286,7 @@ async function reserveProgrammaticWrite(input) {
   if (!agencyId || !userId || !memberId || !creatorId || !deviceId || !idempotencyKey || !payloadFingerprint || !Number.isInteger(accessEpoch) || accessEpoch < 0) {
     throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_RESERVE_INVALID", "Programmatic write identity, actor, device and payload fingerprint are required", 400);
   }
+  assertProgrammaticIdempotencyNamespace(kind, config, creatorId, idempotencyKey);
   const leaseMs = leaseDuration(input.leaseMs);
   const now = new Date();
 
@@ -523,6 +570,7 @@ async function completeProgrammaticWrite(input) {
     const now = new Date();
     const result = sanitizeClientResult(delivery, object(input.result), "complete");
     const kind = storedProgrammaticKind(delivery);
+    assertCompletionEvidence(delivery, result);
     const actualMessageId = new Set(["VAULT_RELAY_SEND", "CUSTOM_RELAY_SEND"]).has(kind)
       ? clean(result.messageId || input.messageId, 180)
       : null;
@@ -671,6 +719,7 @@ async function reconcileProgrammaticWrite(input) {
     const now = new Date();
     const evidence = sanitizeClientResult(delivery, object(input.result), "reconcile");
     const complete = outcome === "MATCHED";
+    if (complete) assertCompletionEvidence(delivery, evidence);
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "RECONCILE_REQUIRED", leaseRevision: delivery.leaseRevision, claimedByDeviceId: input.deviceId },
       data: complete ? {
