@@ -1,14 +1,10 @@
 "use strict";
 
-const crypto = require("node:crypto");
-const { assertExecutionAccessFence } = require("./execution-access-fence-service");
-
 const SETTINGS_KEY = "telegramCustomReminders";
 const MIN_MINUTES = 1;
 const MAX_MINUTES = 525_600; // 1 year; UI presets are shortcuts, arbitrary values remain supported
 const MAX_TEXT = 2_000;
 const MAX_CALL_OFFSETS = 12;
-const CLAIM_MS = 2 * 60 * 1000;
 
 const DEFAULT_TELEGRAM_CUSTOM_REMINDERS = Object.freeze({
   content: Object.freeze({
@@ -227,141 +223,6 @@ async function resolveTelegramAccountId({ agencyId, creator, db }) {
   return rows.length === 1 ? rows[0].id : null;
 }
 
-async function claimDueReminders({ agencyId, member, deviceId, limit = 10, now = new Date(), db }) {
-  const normalizedDeviceId = String(deviceId || "").trim();
-  if (!normalizedDeviceId) throw Object.assign(new Error("deviceId is required"), { code: "CUSTOM_ORDER_REMINDER_DEVICE_REQUIRED", status: 400 });
-  const actor = { userId: String(member?.userId || "").trim(), memberId: String(member?.id || "").trim(), accessEpoch: Number(member?.accessEpoch) };
-  if (!actor.userId || !actor.memberId || !Number.isInteger(actor.accessEpoch)) {
-    throw Object.assign(new Error("Current member access fence is required"), { code: "CUSTOM_ORDER_REMINDER_ACCESS_FENCE_REQUIRED", status: 409 });
-  }
-  const { allowedCreatorScope } = require("../middleware/automation-permissions");
-  const scope = await allowedCreatorScope({ agencyId, member, db });
-  const creatorWhere = scope.broad ? {} : { creatorId: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } };
-  const take = Math.max(1, Math.min(25, Math.floor(Number(limit) || 10)));
-  const candidates = await db.customOrder.findMany({
-    where: {
-      agencyId,
-      ...creatorWhere,
-      status: "PENDING",
-      telegramTaskMessageId: { not: null },
-      nextReminderAt: { lte: now },
-      OR: [{ reminderClaimUntil: null }, { reminderClaimUntil: { lt: now } }],
-    },
-    include: { creator: true },
-    orderBy: [{ nextReminderAt: "asc" }, { id: "asc" }],
-    take: take * 3,
-  });
-  const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
-  const deliveries = [];
-  for (const row of candidates) {
-    if (deliveries.length >= take) break;
-    if (!String(row.creator?.telegramContact || "").trim()) continue;
-    const accountId = await resolveTelegramAccountId({ agencyId, creator: row.creator, db });
-    if (!accountId) continue;
-    const runtimeOwner = await db.agencyTelegramMtprotoAccount.findFirst({
-      where: {
-        id: accountId,
-        agencyId,
-        runtimeClaimedByDeviceId: normalizedDeviceId,
-        runtimeLeaseUserId: actor.userId,
-        runtimeLeaseMemberId: actor.memberId,
-        runtimeLeaseAccessEpoch: actor.accessEpoch,
-        runtimeClaimUntil: { gt: now },
-      },
-      select: { id: true },
-    });
-    if (!runtimeOwner) continue;
-    await assertExecutionAccessFence({ db, agencyId, creatorId: row.creatorId, ...actor, lock: true });
-    const claimToken = crypto.randomUUID();
-    const claimUntil = new Date(now.getTime() + CLAIM_MS);
-    const changed = await db.customOrder.updateMany({
-      where: {
-        id: row.id,
-        agencyId,
-        status: "PENDING",
-        nextReminderAt: row.nextReminderAt,
-        OR: [{ reminderClaimUntil: null }, { reminderClaimUntil: { lt: now } }],
-      },
-      data: {
-        reminderClaimToken: claimToken,
-        reminderClaimUntil: claimUntil,
-        reminderClaimedByDeviceId: normalizedDeviceId,
-        reminderLeaseUserId: actor.userId,
-        reminderLeaseMemberId: actor.memberId,
-        reminderLeaseAccessEpoch: actor.accessEpoch,
-      },
-    });
-    if (Number(changed?.count || 0) !== 1) continue;
-    deliveries.push({
-      orderId: row.id,
-      creatorId: row.creatorId,
-      accountId,
-      claimToken,
-      text: reminderText(row, row.creator, workspacePolicy, now),
-      replyToMessageId: row.telegramTaskMessageId == null ? null : String(row.telegramTaskMessageId),
-    });
-  }
-  return { ok: true, deliveries, serverNow: now.toISOString() };
-}
-
-async function acknowledgeReminder({ agencyId, member, deviceId, orderId, claimToken, messageId, now = new Date(), db }) {
-  const { requireCreatorAccess } = require("../middleware/automation-permissions");
-  const row = await db.customOrder.findFirst({ where: { id: String(orderId || ""), agencyId }, include: { creator: true } });
-  if (!row) throw Object.assign(new Error("Custom order not found"), { code: "CUSTOM_ORDER_NOT_FOUND", status: 404 });
-  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db });
-  const actor = { userId: String(member?.userId || "").trim(), memberId: String(member?.id || "").trim(), accessEpoch: Number(member?.accessEpoch) };
-  const actorMatches = String(row.reminderClaimedByDeviceId || "") === String(deviceId || "")
-    && String(row.reminderLeaseUserId || "") === actor.userId
-    && String(row.reminderLeaseMemberId || "") === actor.memberId
-    && Number(row.reminderLeaseAccessEpoch) === actor.accessEpoch;
-  if (!claimToken || String(row.reminderClaimToken || "") !== String(claimToken) || !actorMatches) throw Object.assign(new Error("Reminder claim is no longer valid"), { code: "CUSTOM_ORDER_REMINDER_CLAIM_INVALID", status: 409 });
-  await assertExecutionAccessFence({ db, agencyId, creatorId: row.creatorId, ...actor, lock: true });
-  const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
-  const currentKey = nextReminderForOrder(row, workspacePolicy, now, { afterAck: false }).key || row.lastReminderKey || null;
-  const synthetic = { ...row, lastReminderAt: now, lastReminderKey: currentKey };
-  const next = nextReminderForOrder(synthetic, workspacePolicy, now, { afterAck: true });
-  await db.customOrder.update({
-    where: { id: row.id },
-    data: {
-      lastReminderAt: now,
-      lastReminderKey: currentKey,
-      nextReminderAt: next.at,
-      reminderClaimToken: null,
-      reminderClaimUntil: null,
-      reminderClaimedByDeviceId: null,
-      reminderLeaseUserId: null,
-      reminderLeaseMemberId: null,
-      reminderLeaseAccessEpoch: null,
-    },
-  });
-  return { ok: true, nextReminderAt: next.at ? next.at.toISOString() : null, messageId: String(messageId || "") || null };
-}
-
-async function releaseReminderClaim({ agencyId, member, deviceId, orderId, claimToken, retryable = true, deliveryUnknown = false, now = new Date(), db }) {
-  const { requireCreatorAccess } = require("../middleware/automation-permissions");
-  const row = await db.customOrder.findFirst({ where: { id: String(orderId || ""), agencyId } });
-  if (!row) throw Object.assign(new Error("Custom order not found"), { code: "CUSTOM_ORDER_NOT_FOUND", status: 404 });
-  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db });
-  const actor = { userId: String(member?.userId || "").trim(), memberId: String(member?.id || "").trim(), accessEpoch: Number(member?.accessEpoch) };
-  const actorMatches = String(row.reminderClaimedByDeviceId || "") === String(deviceId || "")
-    && String(row.reminderLeaseUserId || "") === actor.userId
-    && String(row.reminderLeaseMemberId || "") === actor.memberId
-    && Number(row.reminderLeaseAccessEpoch) === actor.accessEpoch;
-  if (!claimToken || String(row.reminderClaimToken || "") !== String(claimToken) || !actorMatches) return { ok: true, ignored: true };
-  await assertExecutionAccessFence({ db, agencyId, creatorId: row.creatorId, ...actor, lock: true });
-  const nextReminderAt = deliveryUnknown ? null : retryable ? new Date(now.getTime() + 10 * 60_000) : null;
-  await db.customOrder.update({ where: { id: row.id }, data: {
-    reminderClaimToken: null,
-    reminderClaimUntil: null,
-    reminderClaimedByDeviceId: null,
-    reminderLeaseUserId: null,
-    reminderLeaseMemberId: null,
-    reminderLeaseAccessEpoch: null,
-    nextReminderAt,
-  } });
-  return { ok: true, nextReminderAt: nextReminderAt ? nextReminderAt.toISOString() : null };
-}
-
 module.exports = {
   SETTINGS_KEY,
   DEFAULT_TELEGRAM_CUSTOM_REMINDERS,
@@ -373,7 +234,4 @@ module.exports = {
   taskText,
   readWorkspaceReminderPolicy,
   resolveTelegramAccountId,
-  claimDueReminders,
-  acknowledgeReminder,
-  releaseReminderClaim,
 };

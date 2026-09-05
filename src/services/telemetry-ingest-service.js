@@ -331,11 +331,14 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
 
         if (row.localId) {
           const exists = await tx.teamActivityEvent.findFirst({
-            where: { agencyId: row.agencyId, localId: row.localId },
-            select: { id: true },
+            where: { agencyId: row.agencyId, deviceId: row.deviceId, localId: row.localId },
           });
           if (exists) {
-            const durableRow = { ...row, id: exists.id };
+            // localId is the durable idempotency identity for this device.  Once committed,
+            // every replay projection must come from the stored canonical event, never from
+            // a newly supplied payload carrying the same localId.  Otherwise a mutated replay
+            // could change money/Custom/response side effects without changing TeamActivityEvent.
+            const durableRow = exists;
             await applyLedgerSideEffects(durableRow, tx);
             await applyTeamResponseProjection(durableRow, tx);
             await applyTeamPendingProjection(durableRow, tx);
@@ -354,11 +357,10 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
         } catch (err) {
           if (err?.code !== "P2002" || !row.localId) throw err;
           const exists = await tx.teamActivityEvent.findFirst({
-            where: { agencyId: row.agencyId, localId: row.localId },
-            select: { id: true },
+            where: { agencyId: row.agencyId, deviceId: row.deviceId, localId: row.localId },
           });
           if (!exists) throw err;
-          const durableRow = { ...row, id: exists.id };
+          const durableRow = exists;
           await applyLedgerSideEffects(durableRow, tx);
           await applyTeamResponseProjection(durableRow, tx);
           await applyTeamPendingProjection(durableRow, tx);

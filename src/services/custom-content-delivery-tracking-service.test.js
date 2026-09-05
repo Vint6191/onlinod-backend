@@ -122,6 +122,21 @@ test("telemetry discovery keeps already fan-delivered customs visible for post-d
   assert.equal(duplicateReplay.fanDeliveredAt, originalDeliveredAt, "duplicate sends must not move the original fan-delivery timestamp");
 });
 
+
+test("unconfirmed or non-manual events cannot establish the Custom fan-delivery fact", async () => {
+  const { order, db } = fixture();
+  const baseline = { status: order.status, sent: [...order.deliverySentMediaIds], messages: [...order.deliveryMessageIds], offered: order.deliveryOfferedCents, deliveredAt: order.fanDeliveredAt };
+  const common = { agencyId: "agency-1", memberId: "member-1", userId: "user-1", creatorId: "creator-1", dialogId: "777", messageId: "fake-1", priceCents: 6000, extra: { mediaIds: ["9001", "9002"] }, ts: new Date("2026-08-22T10:20:00Z") };
+  assert.equal(await projectCustomDeliveryFromTeamEvent({ ...common, eventKind: "MESSAGE_SEND_CONFIRMED", actionSource: "MANUAL", lifecycle: "ATTEMPTED" }, { db }), null);
+  assert.equal(await projectCustomDeliveryFromTeamEvent({ ...common, eventKind: "MESSAGE_SEND_CONFIRMED", actionSource: "AUTOMATION", lifecycle: "CONFIRMED" }, { db }), null);
+  assert.equal(await projectCustomDeliveryFromTeamEvent({ ...common, eventKind: "MESSAGE_SEND_ATTEMPTED", actionSource: "MANUAL", lifecycle: "CONFIRMED" }, { db }), null);
+  assert.equal(order.status, baseline.status);
+  assert.deepEqual(order.deliverySentMediaIds, baseline.sent);
+  assert.deepEqual(order.deliveryMessageIds, baseline.messages);
+  assert.equal(order.deliveryOfferedCents, baseline.offered);
+  assert.equal(order.fanDeliveredAt, baseline.deliveredAt);
+});
+
 test("V20.7 schema/migration separates Telegram task deliveredAt from durable fan delivery progress", () => {
   const fs = require("node:fs");
   const path = require("node:path");

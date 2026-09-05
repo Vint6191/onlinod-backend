@@ -550,8 +550,6 @@ async function updateTelegramCustomReminderSettings({ agencyId, member, reminder
         where: { id: order.id },
         data: {
           nextReminderAt: nextAt,
-          reminderClaimToken: null,
-          reminderClaimUntil: null,
         },
       });
     }
@@ -627,6 +625,44 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
     throw err;
   }
   const remove = async (tx) => {
+    const activeIntent = tx.telegramDeliveryIntent?.findFirst ? await tx.telegramDeliveryIntent.findFirst({
+      where: { agencyId, accountId: existing.id, state: { in: ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED", "FAILED_PRECOMMIT"] } },
+      select: { id: true, kind: true, state: true },
+    }) : null;
+    if (activeIntent) {
+      const err = new Error("Telegram connection is still required by an active or unresolved Custom delivery");
+      err.code = "SETTINGS_TELEGRAM_ACCOUNT_IN_USE"; err.status = 409;
+      throw err;
+    }
+
+    if (tx.telegramDeliveryIntent?.findMany && tx.customOrder?.findFirst) {
+      const taskRows = await tx.telegramDeliveryIntent.findMany({
+        where: { agencyId, accountId: existing.id, kind: "TASK", state: "CONFIRMED" },
+        select: { customOrderId: true }, take: 1000,
+      });
+      const orderIds = Array.from(new Set((taskRows || []).map((row) => String(row.customOrderId || "")).filter(Boolean)));
+      if (orderIds.length) {
+        const pendingOrder = await tx.customOrder.findFirst({ where: { agencyId, id: { in: orderIds }, status: "PENDING" }, select: { id: true } });
+        if (pendingOrder) {
+          const err = new Error("Telegram connection is still the canonical thread for a pending Custom order");
+          err.code = "SETTINGS_TELEGRAM_ACCOUNT_IN_USE"; err.status = 409;
+          throw err;
+        }
+      }
+    }
+
+    if (tx.customContentSubmission?.findFirst) {
+      const pendingSource = await tx.customContentSubmission.findFirst({
+        where: { agencyId, telegramSourceAccountId: existing.id, reviewStatus: { in: ["WAITING_REVIEW", "REVISION_REQUESTED"] } },
+        select: { id: true },
+      });
+      if (pendingSource) {
+        const err = new Error("Telegram connection is still required by pending Custom source media");
+        err.code = "SETTINGS_TELEGRAM_ACCOUNT_IN_USE"; err.status = 409;
+        throw err;
+      }
+    }
+
     await tx.creatorAccount.updateMany({ where: { agencyId, telegramAccountId: existing.id }, data: { telegramAccountId: null } });
     await tx.agencyTelegramMtprotoAccount.delete({ where: { id: existing.id } });
   };
@@ -661,16 +697,35 @@ async function readTelegramMtprotoAccountSecret({ agencyId, accountId, db = null
   return { row, apiHash: String(credentials.apiHash || ""), session: String(credentials.session || "") };
 }
 
-async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, purpose, creatorId = null, deviceId = null, claimToken = null, db = null }) {
-  const normalizedPurpose = clean(purpose, 32).toLowerCase();
-  if (!new Set(["authorize", "messaging"]).has(normalizedPurpose)) {
+async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, purpose, creatorId = null, submissionId = null, messageIds = null, intentId = null, orderId = null, deliveryClaimToken = null, deviceId = null, claimToken = null, db = null }) {
+  const normalizedPurpose = clean(purpose, 40).toLowerCase();
+  if (!new Set(["authorize", "messaging", "customs-source-read", "customs-delivery-write", "customs-delivery-read"]).has(normalizedPurpose)) {
     throw telegramInputError("Telegram local-material purpose is invalid", "SETTINGS_TELEGRAM_LOCAL_PURPOSE_INVALID");
   }
   const client = db || prisma;
+  let customsSource = null;
+  let customsDelivery = null;
   if (normalizedPurpose === "authorize") ensureTelegramManager(member);
   else {
     const { assertTelegramMessagingAccess, assertTelegramRuntimeLease } = require("./telegram-execution-runtime");
-    await assertTelegramMessagingAccess({ agencyId, member, accountId, creatorId, db: client });
+    if (normalizedPurpose === "messaging") {
+      await assertTelegramMessagingAccess({ agencyId, member, accountId, creatorId, db: client });
+    } else if (normalizedPurpose === "customs-source-read") {
+      const { assertCustomSubmissionTelegramSourceAccess } = require("./custom-content-submissions-service");
+      customsSource = await assertCustomSubmissionTelegramSourceAccess({ agencyId, member, submissionId, creatorId, accountId, messageIds, db: client });
+    } else {
+      const { assertTelegramDeliveryMaterialAccess, getTelegramOrderContext } = require("./telegram-delivery-authority-service");
+      if (normalizedPurpose === "customs-delivery-write") {
+        customsDelivery = await assertTelegramDeliveryMaterialAccess({ agencyId, member, intentId, creatorId, accountId, deviceId, deliveryClaimToken, db: client });
+      } else {
+        const context = await getTelegramOrderContext({ agencyId, member, orderId, db: client });
+        const requested = Array.from(new Set((Array.isArray(messageIds) ? messageIds : []).map((value) => clean(value, 40)).filter(Boolean)));
+        const allowed = new Set(context.telegramReferenceMessageIds.map(String));
+        if (!requested.length || requested.some((id) => !allowed.has(id))) throw telegramInputError("Requested Telegram history messages are outside this Custom order", "CUSTOM_ORDER_TELEGRAM_HISTORY_MESSAGE_MISMATCH");
+        if (String(context.creatorId) !== clean(creatorId, 180) || String(context.accountId) !== clean(accountId, 180)) throw telegramInputError("Custom Telegram history scope does not match the order", "CUSTOM_ORDER_TELEGRAM_HISTORY_SCOPE_MISMATCH");
+        customsDelivery = { recipientTelegramUserId: context.telegramUserId };
+      }
+    }
     await assertTelegramRuntimeLease({ agencyId, member, accountId, deviceId, claimToken, db: client });
   }
   const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db: client });
@@ -680,7 +735,7 @@ async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, 
     err.status = 409;
     throw err;
   }
-  if (normalizedPurpose === "messaging" && !secret.session.trim()) {
+  if (normalizedPurpose !== "authorize" && !secret.session.trim()) {
     const err = new Error("Telegram account has not been authorized yet");
     err.code = "SETTINGS_TELEGRAM_SESSION_REQUIRED";
     err.status = 409;
@@ -690,7 +745,9 @@ async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, 
     accountId: secret.row.id,
     apiId: secret.row.apiId,
     apiHash: secret.apiHash,
-    session: normalizedPurpose === "messaging" ? secret.session : "",
+    session: normalizedPurpose === "authorize" ? "" : secret.session,
+    ...(normalizedPurpose === "customs-source-read" ? { sourceTelegramUserId: String(customsSource?.telegramSourceUserId || "") } : {}),
+    ...(normalizedPurpose === "customs-delivery-write" || normalizedPurpose === "customs-delivery-read" ? { deliveryTelegramUserId: String(customsDelivery?.recipientTelegramUserId || "") } : {}),
   };
 }
 

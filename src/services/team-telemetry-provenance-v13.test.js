@@ -29,7 +29,7 @@ function loadService({ failSideEffects = 0, failCreatorLookup = false, assignedC
       }
     },
     workerDevice: {
-      async findFirst({ where }) { return where.id === "device-1" ? { id: "device-1" } : null; },
+      async findFirst({ where }) { return ["device-1", "device-2"].includes(where.id) ? { id: where.id } : null; },
     },
     creatorAccount: {
       async findFirst({ where }) {
@@ -55,7 +55,9 @@ function loadService({ failSideEffects = 0, failCreatorLookup = false, assignedC
     },
     teamActivityEvent: {
       async findFirst({ where }) {
-        return rows.find((row) => row.agencyId === where.agencyId && row.localId === where.localId) || null;
+        return rows.find((row) => row.agencyId === where.agencyId
+          && (where.deviceId === undefined || row.deviceId === where.deviceId)
+          && row.localId === where.localId) || null;
       },
       async create({ data }) {
         const row = { id: `event-${rows.length + 1}`, ...data };
@@ -248,6 +250,30 @@ test("v13 localId replay is idempotent", async () => {
   assert.equal(second.duplicated, 1);
   assert.equal(rows.length, 1);
   assert.equal(sideEffects.length, 2, "ledger side effect is deliberately replay-safe");
+});
+
+
+test("v13 localId replay projects only the stored durable payload, never mutated replay fields", async () => {
+  const { service, rows, sideEffects } = loadService();
+  await ingest(service, [canonical({ localId: "immutable-local", messageId: "message-original", priceCents: 1200 })]);
+  const replay = await ingest(service, [canonical({ localId: "immutable-local", messageId: "message-mutated", priceCents: 9900 })]);
+  assert.equal(replay.duplicated, 1);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].messageId, "message-original");
+  assert.equal(rows[0].priceCents, 1200);
+  assert.equal(sideEffects.length, 2);
+  assert.equal(sideEffects[1].messageId, "message-original");
+  assert.equal(sideEffects[1].priceCents, 1200);
+});
+
+test("v13 localId idempotency is device-scoped and does not alias another workstation", async () => {
+  const { service, rows } = loadService();
+  await ingest(service, [canonical({ localId: "shared-local", messageId: "device-one-message" })]);
+  const second = await ingest(service, [canonical({ localId: "shared-local", messageId: "device-two-message" })], { deviceId: "device-2" });
+  assert.equal(second.inserted, 1);
+  assert.equal(second.duplicated, 0);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map((row) => [row.deviceId, row.messageId]), [["device-1", "device-one-message"], ["device-2", "device-two-message"]]);
 });
 
 test("v13 event and ownership projections roll back atomically when a side effect fails", async () => {

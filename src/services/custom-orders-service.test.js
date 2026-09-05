@@ -13,15 +13,16 @@ const {
   paymentSnapshot,
   serializeOrder,
   updateCustomOrder,
-  recordTelegramDelivery,
-  prepareTelegramTask,
-  prepareManualReminder,
-  recordTelegramInboundReply,
-  prepareTelegramStatusNotification,
 } = require("./custom-orders-service");
 
 function clone(value) {
   return value == null ? value : structuredClone(value);
+}
+
+let mutationSeq = 0;
+function withCreateIntent(input = {}) {
+  mutationSeq += 1;
+  return { clientMutationId: `00000000-0000-4000-8000-${String(mutationSeq).padStart(12, "0")}`, ...input };
 }
 
 function fakeDb(seed = {}) {
@@ -38,6 +39,7 @@ function fakeDb(seed = {}) {
   };
   const rows = (seed.orders || []).map(clone);
   const accounts = (seed.accounts || [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null }]).map(clone);
+  const deliveryIntents = [];
   let seq = 0;
 
   const include = (row) => row ? {
@@ -50,6 +52,7 @@ function fakeDb(seed = {}) {
     if (Array.isArray(where.OR) && where.OR.length && !where.OR.some((candidate) => matches(row, candidate))) return false;
     if (where.id !== undefined && row.id !== where.id) return false;
     if (where.agencyId !== undefined && row.agencyId !== where.agencyId) return false;
+    if (where.clientMutationId !== undefined && row.clientMutationId !== where.clientMutationId) return false;
     if (where.telegramTaskMessageId !== undefined && Number(row.telegramTaskMessageId) !== Number(where.telegramTaskMessageId)) return false;
     if (where.telegramReferenceMessageIds?.has !== undefined && !(Array.isArray(row.telegramReferenceMessageIds) && row.telegramReferenceMessageIds.map(Number).includes(Number(where.telegramReferenceMessageIds.has)))) return false;
     if (where.type !== undefined && String(row.type || "CONTENT") !== String(where.type)) return false;
@@ -156,7 +159,15 @@ function fakeDb(seed = {}) {
       },
       async count({ where }) { return rows.filter((row) => matches(row, where)).length; },
     },
+    telegramDeliveryIntent: {
+      async findUnique({ where }) { return clone(deliveryIntents.find((row) => row.logicalKey === where.logicalKey) || null); },
+      async create({ data }) {
+        const row = { id: `telegram-intent-${deliveryIntents.length + 1}`, claimRevision: 0, remoteMessageId: null, remoteSentAt: null, confirmedAt: null, commitStartedAt: null, outcomeReason: null, ...clone(data), updatedAt: new Date("2026-08-17T20:00:00.000Z") };
+        deliveryIntents.push(row); return clone(row);
+      },
+    },
     auditLog: { async create({ data }) { return { id: `audit-${seq}`, ...clone(data) }; } },
+    async $transaction(fn) { return fn(this); },
   };
 }
 
@@ -164,7 +175,7 @@ const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "
 
 test("media ids are stored as a stable de-duplicated space-separated list", () => {
   assert.deepEqual(mediaIdsArray("10 20,20;30"), ["10", "20", "30"]);
-  assert.equal(normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "hello", mediaIds: ["10", "20", "10"], price: 12.34 }).mediaIds, "10 20");
+  assert.equal(normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "hello", mediaIds: ["10", "20", "10"], price: 12.34 })).mediaIds, "10 20");
 });
 
 test("custom order create is creator-scoped and starts pending", async () => {
@@ -172,7 +183,7 @@ test("custom order create is creator-scoped and starts pending", async () => {
   const result = await createCustomOrder({
     agencyId: "agency-1",
     member,
-    input: { creatorId: "creator-1", dialogId: "422411209", scenario: "5 minute custom", dueAt: "2026-08-18T20:00:00Z", price: 150, mediaIds: ["11", "12"] },
+    input: withCreateIntent({ creatorId: "creator-1", dialogId: "422411209", scenario: "5 minute custom", dueAt: "2026-08-18T20:00:00Z", price: 150, mediaIds: ["11", "12"] }),
     db,
   });
   assert.equal(result.ok, true);
@@ -183,7 +194,7 @@ test("custom order create is creator-scoped and starts pending", async () => {
   assert.equal("agencyId" in result.order, false);
   assert.equal("creatorId" in result.order, false);
   assert.equal("createdByMemberId" in result.order, false);
-  await assert.rejects(() => createCustomOrder({ agencyId: "agency-1", member, input: { creatorId: "creator-2", dialogId: "1", scenario: "x" }, db }), /do not have access/i);
+  await assert.rejects(() => createCustomOrder({ agencyId: "agency-1", member, input: withCreateIntent({ creatorId: "creator-2", dialogId: "1", scenario: "x" }), db }), /do not have access/i);
 });
 
 
@@ -195,7 +206,7 @@ test("custom payment amounts use integer cents and derive status/remaining inste
   const db = fakeDb();
   const result = await createCustomOrder({
     agencyId: "agency-1", member,
-    input: { creatorId: "creator-1", dialogId: "422411209", scenario: "paid in parts", price: 60, paidAmount: 40 },
+    input: withCreateIntent({ creatorId: "creator-1", dialogId: "422411209", scenario: "paid in parts", price: 60, paidAmount: 40 }),
     db,
   });
   assert.equal(result.order.priceCents, 6000);
@@ -246,8 +257,8 @@ test("paid amount can be corrected after finalization without reopening immutabl
 });
 
 test("payment validation fails closed and migration backfills old rows to zero", () => {
-  assert.throws(() => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmount: -1 }), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_INVALID");
-  assert.throws(() => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmountCents: 2_147_483_648 }), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_TOO_LARGE");
+  assert.throws(() => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmount: -1 })), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_INVALID");
+  assert.throws(() => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmountCents: 2_147_483_648 })), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_TOO_LARGE");
   const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
   const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821113000_custom_order_payment_foundation/migration.sql"), "utf8");
   assert.match(schema, /model CustomOrder[\s\S]*paidAmountCents\s+Int\s+@default\(0\)/);
@@ -313,19 +324,19 @@ test("terminal custom orders are immutable and duplicate finalization is idempot
 
 test("business-critical text and media limits reject instead of silently truncating", () => {
   assert.throws(
-    () => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "x".repeat(12_001) }),
+    () => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "x".repeat(12_001) })),
     (error) => error?.code === "CUSTOM_ORDER_SCENARIO_TOO_LONG",
   );
   assert.throws(
-    () => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "ok", internalNote: "n".repeat(4_001) }),
+    () => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "ok", internalNote: "n".repeat(4_001) })),
     (error) => error?.code === "CUSTOM_ORDER_INTERNALNOTE_TOO_LONG",
   );
   assert.throws(
-    () => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "ok", mediaIds: Array.from({ length: 201 }, (_, index) => String(index + 1)) }),
+    () => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "ok", mediaIds: Array.from({ length: 201 }, (_, index) => String(index + 1)) })),
     (error) => error?.code === "CUSTOM_ORDER_MEDIA_IDS_LIMIT",
   );
   assert.throws(
-    () => normalizeCreateInput({ creatorId: "c", dialogId: "42", scenario: "ok", priceCents: 2_147_483_648 }),
+    () => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "ok", priceCents: 2_147_483_648 })),
     (error) => error?.code === "CUSTOM_ORDER_PRICE_TOO_LARGE",
   );
 });
@@ -337,7 +348,7 @@ test("V2 types keep one CustomOrder row and schedule type-specific reminders", a
     agencyId: "agency-1",
     member,
     now: new Date("2026-08-19T12:00:00.000Z"),
-    input: {
+    input: withCreateIntent({
       creatorId: "creator-1",
       dialogId: "422411209",
       scenario: "Private call",
@@ -346,7 +357,7 @@ test("V2 types keep one CustomOrder row and schedule type-specific reminders", a
       durationMinutes: 45,
       reminderConfig: { enabled: true, offsetsMinutes: [135, 47, 5] },
       price: 200,
-    },
+    }),
     db,
   });
   assert.equal(call.order.type, "CALL");
@@ -358,7 +369,7 @@ test("V2 types keep one CustomOrder row and schedule type-specific reminders", a
     agencyId: "agency-1",
     member,
     now: new Date("2026-08-19T12:00:00.000Z"),
-    input: { creatorId: "creator-1", dialogId: "422411209", scenario: "Panties sale", type: "PHYSICAL", price: 80 },
+    input: withCreateIntent({ creatorId: "creator-1", dialogId: "422411209", scenario: "Panties sale", type: "PHYSICAL", price: 80 }),
     db,
   });
   assert.equal(physical.order.type, "PHYSICAL");
@@ -388,115 +399,16 @@ test("ordinary edits preserve an already scheduled reminder while policy edits r
   assert.equal(policyEdited.order.nextReminderAt, "2026-08-19T14:00:00.000Z", "first reminder restarts from the explicit policy edit when no reminder was sent yet");
 });
 
-test("manual remind-now cannot become the first Telegram message for a custom", async () => {
+test("CustomOrder create retries with the same stable clientMutationId return the same order and conflicting payload is rejected", async () => {
   const db = fakeDb();
-  const created = await createCustomOrder({ agencyId: "agency-1", member, input: { creatorId: "creator-1", dialogId: "422", scenario: "unsent" }, db });
+  const input = withCreateIntent({ creatorId: "creator-1", dialogId: "422", scenario: "stable create" });
+  const first = await createCustomOrder({ agencyId: "agency-1", member, input, db });
+  const replay = await createCustomOrder({ agencyId: "agency-1", member, input: { ...input }, db });
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.order.id, first.order.id);
   await assert.rejects(
-    () => prepareManualReminder({ agencyId: "agency-1", member, orderId: created.order.id, db }),
-    (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_REQUIRED" && error?.status === 409,
+    () => createCustomOrder({ agencyId: "agency-1", member, input: { ...input, scenario: "different intent" }, db }),
+    (error) => error?.code === "CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT" && error?.status === 409,
   );
 });
 
-test("Telegram references persist only task/message ids on the custom and merge idempotently", async () => {
-  const db = fakeDb();
-  const created = await createCustomOrder({
-    agencyId: "agency-1",
-    member,
-    now: new Date("2026-08-19T12:00:00.000Z"),
-    input: { creatorId: "creator-1", dialogId: "422411209", scenario: "Photo custom", type: "CONTENT", contentKind: "PHOTO" },
-    db,
-  });
-  const prepared = await prepareTelegramTask({ agencyId: "agency-1", member, orderId: created.order.id, db });
-  assert.equal(prepared.delivery.accountId, "tg-1");
-  assert.equal(prepared.delivery.creatorId, "creator-1");
-  assert.match(prepared.delivery.text, /Новый кастом/);
-
-  const first = await recordTelegramDelivery({ agencyId: "agency-1", member, orderId: created.order.id, taskMessageId: 501, referenceMessageIds: [502, 503], now: new Date("2026-08-19T12:05:00.000Z"), db });
-  assert.equal(first.order.telegramTaskMessageId, "501");
-  assert.deepEqual(first.order.telegramReferenceMessageIds, ["502", "503"]);
-  assert.equal(first.order.nextReminderAt, "2026-08-19T12:35:00.000Z", "content reminder clock begins at actual Telegram task delivery");
-
-  const second = await recordTelegramDelivery({ agencyId: "agency-1", member, orderId: created.order.id, taskMessageId: 501, referenceMessageIds: [503, 504], db });
-  assert.deepEqual(second.order.telegramReferenceMessageIds, ["502", "503", "504"]);
-  await assert.rejects(
-    () => recordTelegramDelivery({ agencyId: "agency-1", member, orderId: created.order.id, taskMessageId: 999, referenceMessageIds: [], db }),
-    (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_MESSAGE_CONFLICT" && error?.status === 409,
-  );
-});
-
-
-test("leased chatter runtime records only creator-bound Telegram replies and dedupes by message id", async () => {
-  const now = new Date("2026-08-19T14:00:00.000Z");
-  const db = fakeDb({
-    accounts: [{
-      id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1",
-      runtimeClaimUntil: new Date("2026-08-19T14:05:00.000Z"), runtimeLeaseUserId: "user-1",
-      runtimeLeaseMemberId: "member-1", runtimeLeaseAccessEpoch: 1, runtimeLeaseCreatorId: "creator-1",
-    }],
-    orders: [{
-      id: "order-inbound", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
-      scenario: "content custom", internalNote: null, status: "PENDING", type: "CONTENT", contentKind: "VIDEO", physicalStatus: null,
-      dueAt: new Date("2026-08-20T12:00:00.000Z"), scheduledAt: null, durationMinutes: null, reminderConfig: null,
-      telegramTaskMessageId: 700, telegramReferenceMessageIds: [701], telegramLastModelMessageId: null, telegramLastModelMessageAt: null,
-      nextReminderAt: null, reminderClaimToken: null, reminderClaimUntil: null, lastReminderAt: null, lastReminderKey: null,
-      acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 5000,
-      createdAt: new Date("2026-08-19T13:00:00.000Z"), updatedAt: new Date("2026-08-19T13:00:00.000Z"),
-    }],
-  });
-
-  const first = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
-    senderTelegramUserId: "1001", messageId: "900", replyToMessageId: "700", sentAt: "2026-08-19T13:59:50.000Z", now, db,
-  });
-  assert.equal(first.matched, true);
-  assert.equal(first.deduped, false);
-  assert.equal(first.order.telegramLastModelMessageId, "900");
-  assert.equal(first.order.telegramLastModelMessageAt, "2026-08-19T13:59:50.000Z");
-
-  const duplicate = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
-    senderTelegramUserId: "1001", messageId: "900", replyToMessageId: "700", sentAt: "2026-08-19T13:59:50.000Z", now, db,
-  });
-  assert.equal(duplicate.deduped, true);
-
-  const referenceReply = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
-    senderTelegramUserId: "1001", messageId: "901", replyToMessageId: "701", sentAt: "2026-08-19T14:00:00.000Z", now, db,
-  });
-  assert.equal(referenceReply.matched, true, "replying to a reference document remains linked to the same custom");
-  assert.equal(referenceReply.order.telegramLastModelMessageId, "901");
-
-  const foreignSender = await recordTelegramInboundReply({
-    agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-1", claimToken: "lease-1",
-    senderTelegramUserId: "1002", messageId: "902", replyToMessageId: "700", sentAt: now.toISOString(), now, db,
-  });
-  assert.deepEqual(foreignSender, { ok: true, matched: false, reason: "CREATOR_NOT_FOUND" });
-});
-
-test("Telegram inbound replies require the live account runtime lease", async () => {
-  const now = new Date("2026-08-19T14:00:00.000Z");
-  const db = fakeDb({
-    accounts: [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-a", runtimeClaimToken: "lease-a", runtimeClaimUntil: new Date("2026-08-19T14:05:00.000Z") }],
-  });
-  await assert.rejects(
-    () => recordTelegramInboundReply({ agencyId: "agency-1", member, accountId: "tg-1", deviceId: "device-b", claimToken: "lease-b", senderTelegramUserId: "1001", messageId: "999", replyToMessageId: "700", now, db }),
-    (error) => error?.code === "TELEGRAM_EXECUTION_LEASE_INVALID" && error?.status === 409,
-  );
-});
-
-
-test("USER cancellation notification replies to the original task and never exposes price", async () => {
-  const db = fakeDb({ orders: [{
-    id: "order-cancel-user", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
-    scenario: "Blue room video", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "CANCELLED",
-    dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null, deliveredAt: new Date("2026-08-19T19:00:00.000Z"),
-    cancelledAt: new Date("2026-08-19T20:00:00.000Z"), cancelReason: "fan cancelled", mediaIds: "", priceCents: 99900,
-    telegramTaskMessageId: 700, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
-    telegramLastModelMessageId: null, telegramLastModelMessageAt: null, createdAt: new Date("2026-08-19T18:00:00.000Z"), updatedAt: new Date("2026-08-19T20:00:00.000Z"),
-  }] });
-  const prepared = await prepareTelegramStatusNotification({ agencyId: "agency-1", member, orderId: "order-cancel-user", db });
-  assert.equal(prepared.delivery.replyToMessageId, "700");
-  assert.match(prepared.delivery.text, /Blue room video/);
-  assert.match(prepared.delivery.text, /fan cancelled/);
-  assert.doesNotMatch(prepared.delivery.text, /999|цена|price/i);
-});

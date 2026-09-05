@@ -33,7 +33,66 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db }) {
     const assigned = clean(creator.telegramAccountId);
     const accountId = assigned && existing.has(assigned) ? assigned : (!assigned && singleAccountId ? singleAccountId : null);
     if (!accountId || byAccount.has(accountId)) continue;
-    byAccount.set(accountId, { accountId, anchorCreatorId: String(creator.id) });
+    byAccount.set(accountId, { accountId, anchorCreatorId: String(creator.id), messagingEligible: true });
+  }
+
+  // Historical Customs source media is account-scoped. A pending proven/manual submission may
+  // still need read access to the account that originally contained its Telegram message IDs
+  // even after the creator's current messaging account was reassigned. This only makes that
+  // account eligible for the existing runtime lease; generic send/resolve still passes through
+  // assertTelegramMessagingAccess and therefore remains bound to the current assignment.
+  if (db.customContentSubmission?.findMany) {
+    const sourceRows = await db.customContentSubmission.findMany({
+      where: { agencyId, creatorId: { in: creators.map((row) => String(row.id)) }, telegramSourceAccountId: { not: null }, telegramSourceUserId: { not: null } },
+      select: { creatorId: true, telegramSourceAccountId: true, telegramSourceUserId: true, telegramMessageIds: true, ofMediaIds: true },
+      take: 1000,
+    });
+    for (const row of sourceRows) {
+      const telegramCount = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.length : 0;
+      const mediaCount = Array.isArray(row.ofMediaIds) ? row.ofMediaIds.length : 0;
+      if (!telegramCount || mediaCount >= telegramCount) continue;
+      const accountId = clean(row.telegramSourceAccountId);
+      if (!accountId || !existing.has(accountId) || byAccount.has(accountId)) continue;
+      byAccount.set(accountId, { accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false });
+    }
+  }
+  // A confirmed TASK can pin follow-up Customs deliveries (reference/reminder/cancellation)
+  // to an older Telegram account after the creator's mutable assignment changes. Such an account
+  // is runtime-eligible only for the delivery-intent authority; generic messaging/inbound remains
+  // forbidden because messagingEligible stays false.
+  if (db.telegramDeliveryIntent?.findMany) {
+    const deliveryRows = await db.telegramDeliveryIntent.findMany({
+      where: {
+        agencyId,
+        creatorId: { in: creators.map((row) => String(row.id)) },
+        kind: { in: ["REFERENCE", "MANUAL_REMINDER", "AUTO_REMINDER", "CANCELLATION"] },
+        state: { in: ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED"] },
+      },
+      select: { creatorId: true, accountId: true },
+      take: 1000,
+    });
+    for (const row of deliveryRows) {
+      const accountId = clean(row.accountId);
+      if (!accountId || !existing.has(accountId) || byAccount.has(accountId)) continue;
+      byAccount.set(accountId, { accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false });
+    }
+    const historyRows = await db.telegramDeliveryIntent.findMany({
+      where: {
+        agencyId,
+        creatorId: { in: creators.map((row) => String(row.id)) },
+        kind: "TASK",
+        state: "CONFIRMED",
+        remoteMessageId: { not: null },
+        remoteRecipientTelegramUserId: { not: null },
+      },
+      select: { creatorId: true, accountId: true },
+      take: 1000,
+    });
+    for (const row of historyRows) {
+      const accountId = clean(row.accountId);
+      if (!accountId || !existing.has(accountId) || byAccount.has(accountId)) continue;
+      byAccount.set(accountId, { accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false });
+    }
   }
   return [...byAccount.values()];
 }
@@ -109,7 +168,7 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
       },
     });
     if (Number(changed?.count || 0) !== 1) continue;
-    leases.push({ accountId: account.id, anchorCreatorId: candidate.anchorCreatorId, claimToken, claimUntil: claimUntil.toISOString() });
+    leases.push({ accountId: account.id, anchorCreatorId: candidate.anchorCreatorId, messagingEligible: candidate.messagingEligible === true, claimToken, claimUntil: claimUntil.toISOString() });
   }
   return { ok: true, leases, serverNow: now.toISOString(), leaseMs: RUNTIME_LEASE_MS };
 }
@@ -145,7 +204,13 @@ async function assertTelegramRuntimeLease({ agencyId, member, accountId, deviceI
     accessEpoch: member?.accessEpoch,
     lock: true,
   });
-  return { account, anchorCreatorId: anchor.anchorCreatorId };
+  return { account, anchorCreatorId: anchor.anchorCreatorId, messagingEligible: anchor.messagingEligible === true };
+}
+
+async function assertTelegramInboundRuntimeLease(args) {
+  const runtime = await assertTelegramRuntimeLease(args);
+  if (!runtime.messagingEligible) throw fail("TELEGRAM_INBOUND_ACCOUNT_FORBIDDEN", "This Telegram runtime exists only for historical Customs source reads and cannot ingest new inbound events", 403);
+  return runtime;
 }
 
 async function releaseTelegramExecutionRuntime({ agencyId, member, accountId, deviceId, claimToken, now = new Date(), db }) {
@@ -174,5 +239,6 @@ module.exports = {
   assertTelegramMessagingAccess,
   claimTelegramExecutionRuntimes,
   assertTelegramRuntimeLease,
+  assertTelegramInboundRuntimeLease,
   releaseTelegramExecutionRuntime,
 };

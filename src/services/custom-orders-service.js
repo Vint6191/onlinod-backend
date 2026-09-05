@@ -1,15 +1,14 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const {
   normalizeReminderOverride,
   nextReminderForOrder,
   readWorkspaceReminderPolicy,
-  reminderText,
-  resolveTelegramAccountId,
-  taskText,
 } = require("./custom-order-reminders");
+const { planTaskIntentForCommittedOrder, planCancellationIntentForCommittedOrder } = require("./telegram-delivery-authority-service");
 
 const CUSTOM_ORDER_STATUSES = Object.freeze(["PENDING", "COMPLETED", "MISSED", "CANCELLED"]);
 const CUSTOM_ORDER_TYPES = Object.freeze(["CONTENT", "CALL", "PHYSICAL"]);
@@ -24,12 +23,23 @@ const MAX_SCENARIO = 12_000;
 const MAX_NOTE = 4_000;
 const MAX_CANCEL_REASON = 1_000;
 const MAX_MEDIA_IDS = 200;
-const MAX_REFERENCE_MESSAGES = 50;
 const MAX_PRICE_CENTS = 2_147_483_647;
 const DUE_SOON_MS = 3 * 60 * 60 * 1000;
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
-function clean(value, max = 500) { const text = String(value == null ? "" : value).trim(); return text ? text.slice(0, max) : ""; }
+function clientMutationId(value) {
+  const text = String(value == null ? "" : value).trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_ID_REQUIRED", "clientMutationId must be a stable UUID");
+  return text;
+}
+function stableCreateFingerprint(data) {
+  const value = {
+    creatorId: data.creatorId, dialogId: data.dialogId, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind,
+    dueAt: data.dueAt ? new Date(data.dueAt).toISOString() : null, scheduledAt: data.scheduledAt ? new Date(data.scheduledAt).toISOString() : null, durationMinutes: data.durationMinutes,
+    physicalStatus: data.physicalStatus, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig,
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
 function optional(value, max = 500, field = "value") {
   const text = String(value == null ? "" : value).trim();
   if (!text) return null;
@@ -151,23 +161,6 @@ function normalizeMediaIds(value, { strict = false } = {}) {
 }
 function mediaIdsArray(value) { return normalizeMediaIds(value); }
 function mediaIdsString(value) { return normalizeMediaIds(value, { strict: true }).join(" "); }
-function telegramMessageId(value, field = "telegramMessageId") {
-  if (value === null || value === undefined || value === "") return null;
-  const numeric = Number(value);
-  if (!Number.isSafeInteger(numeric) || numeric <= 0 || numeric > 2_147_483_647) throw fail("CUSTOM_ORDER_TELEGRAM_MESSAGE_ID_INVALID", `${field} must be a positive Telegram message id`);
-  return numeric;
-}
-function telegramMessageIds(value) {
-  const raw = Array.isArray(value) ? value : [];
-  const seen = new Set(); const result = [];
-  for (const item of raw) {
-    const id = telegramMessageId(item, "telegramReferenceMessageId");
-    if (id == null || seen.has(id)) continue;
-    seen.add(id); result.push(id);
-  }
-  if (result.length > MAX_REFERENCE_MESSAGES) throw fail("CUSTOM_ORDER_REFERENCE_MESSAGES_LIMIT", `Too many Telegram reference messages (max ${MAX_REFERENCE_MESSAGES})`);
-  return result;
-}
 function memberLabel(member) { return member?.displayName || member?.user?.name || member?.user?.email || null; }
 function creatorLabel(creator) { return creator?.displayName || creator?.username || creator?.id || null; }
 
@@ -195,7 +188,7 @@ function serializeOrder(row, now = new Date()) {
     ? contentDueMs !== null && contentDueMs >= 0 && contentDueMs <= DUE_SOON_MS
     : type === "CALL" ? call.callPhase === "DUE" || (call.callPhase === "UPCOMING" && callDueMs !== null && callDueMs <= DUE_SOON_MS) : false);
   return {
-    id: String(row.id), dialogId: String(row.dialogId), scenario: String(row.scenario || ""), internalNote: row.internalNote || null,
+    id: String(row.id), clientMutationId: row.clientMutationId == null ? null : String(row.clientMutationId), dialogId: String(row.dialogId), scenario: String(row.scenario || ""), internalNote: row.internalNote || null,
     type,
     contentKind: type === "CONTENT" ? normalizeContentKind(row.contentKind || "BOTH") : null,
     status,
@@ -282,6 +275,7 @@ async function listCustomOrders({ agencyId, member, creatorId = null, dialogId =
 function normalizeCreateInput(input = {}) {
   const type = normalizeType(input.type || "CONTENT");
   const data = {
+    clientMutationId: clientMutationId(input.clientMutationId),
     creatorId: required(input.creatorId, "creatorId", 100), dialogId: required(input.dialogId, "dialogId", 100), scenario: required(input.scenario, "scenario", MAX_SCENARIO),
     internalNote: optional(input.internalNote, MAX_NOTE, "internalNote"), type,
     contentKind: type === "CONTENT" ? normalizeContentKind(input.contentKind || "BOTH") : null,
@@ -299,12 +293,43 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
   if (!agencyId || !member?.id) throw fail("CUSTOM_ORDER_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma"); const data = normalizeCreateInput(input || {});
   await requireCreatorAccess({ agencyId, member, creatorId: data.creatorId, db: client });
+  const fingerprint = stableCreateFingerprint(data);
+  const existing = await client.customOrder.findFirst({ where: { agencyId, clientMutationId: data.clientMutationId }, include: ORDER_INCLUDE });
+  if (existing) {
+    if (String(existing.clientMutationFingerprint || "") !== fingerprint) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId is already bound to a different CustomOrder payload", 409);
+    if (String(existing.creatorId) !== String(data.creatorId)) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId belongs to another creator", 409);
+    return { ok: true, idempotent: true, order: serializeOrder(existing, now) };
+  }
   const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
   const seed = { ...data, status: "PENDING", createdAt: now, lastReminderAt: null, lastReminderKey: null };
   const nextReminderAt = nextReminderForOrder(seed, workspacePolicy, now).at;
-  const row = await client.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt }, include: ORDER_INCLUDE });
-  const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
-  await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.create", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, priceCents: row.priceCents, paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
+  const execute = async (tx) => {
+    let row;
+    try {
+      row = await tx.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, clientMutationId: data.clientMutationId, clientMutationFingerprint: fingerprint, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt }, include: ORDER_INCLUDE });
+    } catch (error) {
+      if (String(error?.code || "") !== "P2002") throw error;
+      const raced = await tx.customOrder.findFirst({ where: { agencyId, clientMutationId: data.clientMutationId }, include: ORDER_INCLUDE });
+      if (!raced || String(raced.clientMutationFingerprint || "") !== fingerprint) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId conflicted with a different CustomOrder payload", 409);
+      return { row: raced, idempotent: true };
+    }
+    await planTaskIntentForCommittedOrder({ agencyId, member, order: row, now, db: tx });
+    return { row, idempotent: false };
+  };
+  const outcome = typeof client.$transaction === "function" ? await client.$transaction(execute) : await execute(client);
+  const row = outcome.row;
+  if (!outcome.idempotent) {
+    const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
+    await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.create", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, priceCents: row.priceCents, paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus, clientMutationId: data.clientMutationId }, db: client });
+  }
+  return { ok: true, idempotent: outcome.idempotent, order: serializeOrder(row, now) };
+}
+
+async function getCustomOrderByClientMutationId({ agencyId, member, clientMutationId: mutationId, now = new Date(), db = null } = {}) {
+  const client = db || require("../prisma"); const normalized = clientMutationId(mutationId);
+  const row = await client.customOrder.findFirst({ where: { agencyId, clientMutationId: normalized }, include: ORDER_INCLUDE });
+  if (!row) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_NOT_FOUND", "Custom order create intent not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
   return { ok: true, order: serializeOrder(row, now) };
 }
 
@@ -313,6 +338,11 @@ async function loadOwnedOrder({ agencyId, member, orderId, db = null }) {
   const row = await client.customOrder.findFirst({ where: { id, agencyId }, include: ORDER_INCLUDE });
   if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found", 404);
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client }); return row;
+}
+
+async function getCustomOrder({ agencyId, member, orderId, now = new Date(), db = null } = {}) {
+  const row = await loadOwnedOrder({ agencyId, member, orderId, db });
+  return { ok: true, order: serializeOrder(row, now) };
 }
 
 function buildUpdateData(current, input = {}, now = new Date()) {
@@ -398,132 +428,24 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
       else if (prospective.telegramTaskMessageId == null) patch.nextReminderAt = null;
       else if (prospective.lastReminderAt) patch.nextReminderAt = nextReminderForOrder(prospective, workspacePolicy, now, { afterAck: true }).at;
       else patch.nextReminderAt = nextReminderForOrder({ ...prospective, createdAt: now }, workspacePolicy, now).at;
-      patch.reminderClaimToken = null; patch.reminderClaimUntil = null;
     }
-  } else { patch.nextReminderAt = null; patch.reminderClaimToken = null; patch.reminderClaimUntil = null; }
-  const changed = await client.customOrder.updateMany({ where: { id: current.id, agencyId, status: "PENDING", updatedAt: current.updatedAt }, data: patch });
-  if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_ORDER_CONFLICT", "Custom order changed while this update was being applied; refresh and try again", 409);
-  const row = await client.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE }); if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found after update", 404);
+  } else { patch.nextReminderAt = null; }
+  const applyPendingUpdate = async (tx) => {
+    const changed = await tx.customOrder.updateMany({ where: { id: current.id, agencyId, status: "PENDING", updatedAt: current.updatedAt }, data: patch });
+    if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_ORDER_CONFLICT", "Custom order changed while this update was being applied; refresh and try again", 409);
+    const row = await tx.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE });
+    if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found after update", 404);
+    if (String(row.status) === "CANCELLED" && String(current.status) !== "CANCELLED") await planCancellationIntentForCommittedOrder({ agencyId, member, order: row, now, db: tx });
+    return row;
+  };
+  const row = typeof client.$transaction === "function" ? await client.$transaction(applyPendingUpdate) : await applyPendingUpdate(client);
   const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
   await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.update", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, previousStatus: current.status, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, physicalStatus: row.physicalStatus, priceCents: row.priceCents, previousPaidAmountCents: Math.max(0, Number(current.paidAmountCents || 0)), paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
   return { ok: true, order: serializeOrder(row, now) };
 }
 
-async function recordTelegramDelivery({ agencyId, member, orderId, taskMessageId, referenceMessageIds, now = new Date(), db = null }) {
-  const client = db || require("../prisma"); const current = await loadOwnedOrder({ agencyId, member, orderId, db: client });
-  const taskId = telegramMessageId(taskMessageId, "telegramTaskMessageId");
-  if (taskId == null) throw fail("CUSTOM_ORDER_TELEGRAM_TASK_MESSAGE_REQUIRED", "telegramTaskMessageId is required");
-  if (current.telegramTaskMessageId != null && Number(current.telegramTaskMessageId) !== taskId) throw fail("CUSTOM_ORDER_TELEGRAM_TASK_MESSAGE_CONFLICT", "Telegram task message is already linked to this custom order", 409);
-  const refs = telegramMessageIds([...(Array.isArray(current.telegramReferenceMessageIds) ? current.telegramReferenceMessageIds : []), ...telegramMessageIds(referenceMessageIds)]);
-  const firstTaskDelivery = current.telegramTaskMessageId == null;
-  let nextReminderAt = current.nextReminderAt || null;
-  if (firstTaskDelivery && normalizeStatus(current.status) === "PENDING") {
-    const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
-    const schedulingSeed = String(current.type || "CONTENT").toUpperCase() === "CALL" ? current : { ...current, createdAt: now };
-    nextReminderAt = nextReminderForOrder(schedulingSeed, workspacePolicy, now).at;
-  }
-  const row = await client.customOrder.update({
-    where: { id: current.id },
-    data: { telegramTaskMessageId: taskId, telegramReferenceMessageIds: refs, deliveredAt: current.deliveredAt || now, ...(firstTaskDelivery ? { nextReminderAt } : {}) },
-    include: ORDER_INCLUDE,
-  });
-  await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.telegram_delivered", targetType: "CustomOrder", targetId: row.id, metadata: { taskMessageId: taskId, referenceCount: refs.length }, db: client });
-  return { ok: true, order: serializeOrder(row, now) };
-}
-
-async function prepareTelegramTask({ agencyId, member, orderId, db = null }) {
-  const client = db || require("../prisma"); const row = await loadOwnedOrder({ agencyId, member, orderId, db: client });
-  if (!String(row.creator?.telegramContact || "").trim()) throw fail("CUSTOM_ORDER_TELEGRAM_CONTACT_REQUIRED", "Model has no Telegram contact", 409);
-  const accountId = await resolveTelegramAccountId({ agencyId, creator: row.creator, db: client });
-  if (!accountId) throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED", "Assign a Telegram connection to this model, or keep exactly one Telegram connection in the workspace", 409);
-  return { ok: true, delivery: { orderId: row.id, creatorId: row.creatorId, accountId, text: taskText(row) }, order: serializeOrder(row) };
-}
-
-async function prepareManualReminder({ agencyId, member, orderId, now = new Date(), db = null }) {
-  const client = db || require("../prisma"); const row = await loadOwnedOrder({ agencyId, member, orderId, db: client });
-  if (normalizeStatus(row.status) !== "PENDING") throw fail("CUSTOM_ORDER_ALREADY_FINALIZED", "Only pending custom orders can be reminded", 409);
-  if (row.telegramTaskMessageId == null) throw fail("CUSTOM_ORDER_TELEGRAM_TASK_REQUIRED", "Send the custom task to Telegram before sending a reminder", 409);
-  if (!String(row.creator?.telegramContact || "").trim()) throw fail("CUSTOM_ORDER_TELEGRAM_CONTACT_REQUIRED", "Model has no Telegram contact", 409);
-  const accountId = await resolveTelegramAccountId({ agencyId, creator: row.creator, db: client });
-  if (!accountId) throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED", "Assign a Telegram connection to this model, or keep exactly one Telegram connection in the workspace", 409);
-  const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
-  return { ok: true, delivery: { orderId: row.id, creatorId: row.creatorId, accountId, text: reminderText(row, row.creator, workspacePolicy, now), replyToMessageId: row.telegramTaskMessageId == null ? null : String(row.telegramTaskMessageId) } };
-}
-
-async function recordManualReminder({ agencyId, member, orderId, now = new Date(), db = null }) {
-  const client = db || require("../prisma"); const row = await loadOwnedOrder({ agencyId, member, orderId, db: client });
-  const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
-  const synthetic = { ...row, lastReminderAt: now };
-  const next = nextReminderForOrder(synthetic, workspacePolicy, now, { afterAck: true });
-  await client.customOrder.update({ where: { id: row.id }, data: { lastReminderAt: now, nextReminderAt: next.at } });
-  return { ok: true, nextReminderAt: next.at ? next.at.toISOString() : null };
-}
-
-
-async function recordTelegramInboundReply({ agencyId, member, accountId, deviceId, claimToken, senderTelegramUserId, messageId, replyToMessageId, sentAt, now = new Date(), db = null }) {
-  const client = db || require("../prisma");
-  const normalizedAccountId = optionalIdentifier(accountId, "telegramAccountId", 180);
-  const senderId = clean(senderTelegramUserId, 32);
-  const inboundId = telegramMessageId(messageId, "telegramMessageId");
-  const replyToId = telegramMessageId(replyToMessageId, "replyToMessageId");
-  if (!normalizedAccountId || !/^\d{1,20}$/.test(senderId) || inboundId == null || replyToId == null) {
-    throw fail("CUSTOM_ORDER_TELEGRAM_INBOUND_INVALID", "Telegram inbound reply payload is invalid");
-  }
-  const { assertTelegramRuntimeLease } = require("./telegram-execution-runtime");
-  await assertTelegramRuntimeLease({ agencyId, member, accountId: normalizedAccountId, deviceId, claimToken, now, db: client });
-  const scope = await allowedCreatorScope({ agencyId, member, db: client });
-  const creator = await client.creatorAccount.findFirst({
-    where: {
-      agencyId, deletedAt: null, telegramUserId: senderId,
-      ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
-    },
-    select: { id: true, telegramAccountId: true, telegramContact: true },
-  });
-  if (!creator) return { ok: true, matched: false, reason: "CREATOR_NOT_FOUND" };
-  const resolvedAccountId = await resolveTelegramAccountId({ agencyId, creator, db: client });
-  if (!resolvedAccountId || String(resolvedAccountId) !== normalizedAccountId) return { ok: true, matched: false, reason: "ACCOUNT_MISMATCH" };
-  let row = await client.customOrder.findFirst({
-    where: { agencyId, creatorId: creator.id, telegramTaskMessageId: replyToId },
-    include: ORDER_INCLUDE,
-    orderBy: { createdAt: "desc" },
-  });
-  if (!row) {
-    row = await client.customOrder.findFirst({
-      where: { agencyId, creatorId: creator.id, telegramReferenceMessageIds: { has: replyToId } },
-      include: ORDER_INCLUDE,
-      orderBy: { createdAt: "desc" },
-    });
-  }
-  if (!row) return { ok: true, matched: false, reason: "CUSTOM_NOT_FOUND" };
-  if (row.telegramLastModelMessageId != null && Number(row.telegramLastModelMessageId) === inboundId) {
-    return { ok: true, matched: true, deduped: true, order: serializeOrder(row, now) };
-  }
-  const observedAt = parseIso(sentAt, "telegramLastModelMessageAt") || new Date(now);
-  const updated = await client.customOrder.update({
-    where: { id: row.id },
-    data: { telegramLastModelMessageId: inboundId, telegramLastModelMessageAt: observedAt },
-    include: ORDER_INCLUDE,
-  });
-  await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.telegram_model_reply", targetType: "CustomOrder", targetId: updated.id, metadata: { creatorId: updated.creatorId, telegramMessageId: inboundId, replyToMessageId: replyToId, accountId: normalizedAccountId }, db: client });
-  return { ok: true, matched: true, deduped: false, order: serializeOrder(updated, now) };
-}
-
-async function prepareTelegramStatusNotification({ agencyId, member, orderId, db = null }) {
-  const client = db || require("../prisma");
-  const row = await loadOwnedOrder({ agencyId, member, orderId, db: client });
-  if (row.telegramTaskMessageId == null) return { ok: true, delivery: null };
-  const accountId = await resolveTelegramAccountId({ agencyId, creator: row.creator, db: client });
-  if (!accountId) return { ok: true, delivery: null };
-  const status = normalizeStatus(row.status);
-  if (status !== "CANCELLED") return { ok: true, delivery: null };
-  const label = String(row.scenario || "").trim().replace(/\s+/g, " ").slice(0, 240);
-  const text = `❌ Кастом отменён${label ? `: «${label}»` : ""}. Выполнять его больше не нужно.${row.cancelReason ? `\nПричина: ${String(row.cancelReason).trim()}` : ""}`;
-  return { ok: true, delivery: { orderId: row.id, creatorId: row.creatorId, accountId, status, text, replyToMessageId: String(row.telegramTaskMessageId) } };
-}
-
 module.exports = {
   CUSTOM_ORDER_STATUSES, CUSTOM_ORDER_TYPES, CUSTOM_ORDER_CONTENT_KINDS, CUSTOM_ORDER_PHYSICAL_STATUSES, CUSTOM_ORDER_PAYMENT_STATUSES,
-  buildUpdateData, callPhaseSnapshot, createCustomOrder, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString, paymentSnapshot,
+  buildUpdateData, callPhaseSnapshot, createCustomOrder, getCustomOrder, getCustomOrderByClientMutationId, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString, paymentSnapshot,
   normalizeCreateInput, normalizePaidAmountCents, normalizeStatus, normalizeType, serializeOrder, updateCustomOrder,
-  recordTelegramDelivery, prepareTelegramTask, prepareManualReminder, recordManualReminder, recordTelegramInboundReply, prepareTelegramStatusNotification,
 };

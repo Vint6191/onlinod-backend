@@ -298,6 +298,11 @@ router.post("/telegram/accounts/:accountId/local-material", async (req, res) => 
       accountId: req.params.accountId,
       purpose: req.body?.purpose,
       creatorId: req.body?.creatorId,
+      submissionId: req.body?.submissionId,
+      messageIds: req.body?.messageIds,
+      intentId: req.body?.intentId,
+      orderId: req.body?.orderId,
+      deliveryClaimToken: req.body?.deliveryClaimToken,
       deviceId: boundDeviceId,
       claimToken: req.body?.claimToken,
     });

@@ -12,15 +12,19 @@ const {
 const member = { id: "member-1", userId: "user-1", roleKey: "chatter", role: "OPERATOR", assignedCreators: ["creator-1"] };
 function clone(value) { return value == null ? value : structuredClone(value); }
 
-function fakeDb({ submission = {}, assets = [], order = {}, folderId = "vault-customs" } = {}) {
+function fakeDb({ submission = {}, assets = [], order = {}, folderId = "vault-customs", relayProofs = null, beforeMediaAssetUpdateMany = null } = {}) {
   const submissionRow = {
     id: "submission-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1",
-    telegramMessageIds: [101, 102], ofMediaIds: ["9001", "9002"], comment: null,
+    telegramMessageIds: [101, 102], telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", ofMediaIds: ["9001", "9002"], comment: null,
     receivedAt: new Date("2026-08-21T10:00:00.000Z"), createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:00:00.000Z"),
     ...clone(submission),
   };
   const orderRow = { id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", scenario: "Red lingerie video, two angles", priceCents: 6000, ...clone(order) };
   const mediaAssets = assets.map(clone);
+  const proofs = (relayProofs || [
+    { id: "write-0", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:submission-1:0", status: "COMPLETED", payload: { submissionId: "submission-1", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "101" }, result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "9001" }, messageId: null, finishedAt: new Date("2026-08-21T10:10:00.000Z") },
+    { id: "write-1", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:submission-1:1", status: "COMPLETED", payload: { submissionId: "submission-1", expectedIndex: 1, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "102" }, result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "9002" }, messageId: null, finishedAt: new Date("2026-08-21T10:11:00.000Z") },
+  ]).map(clone);
   const audits = [];
   return {
     _submission: submissionRow,
@@ -34,6 +38,12 @@ function fakeDb({ submission = {}, assets = [], order = {}, folderId = "vault-cu
     },
     customContentSubmission: {
       async findFirst({ where }) { return where.id === submissionRow.id && where.agencyId === submissionRow.agencyId ? clone(submissionRow) : null; },
+      async updateMany({ where, data }) {
+        if (where.id !== submissionRow.id || where.agencyId !== submissionRow.agencyId) return { count: 0 };
+        if (where.updatedAt && new Date(where.updatedAt).getTime() !== new Date(submissionRow.updatedAt).getTime()) return { count: 0 };
+        Object.assign(submissionRow, clone(data), { updatedAt: new Date(new Date(submissionRow.updatedAt).getTime() + 1000) });
+        return { count: 1 };
+      },
     },
     customOrder: {
       async findFirst({ where }) {
@@ -41,14 +51,29 @@ function fakeDb({ submission = {}, assets = [], order = {}, folderId = "vault-cu
         return where.id === orderRow.id && where.agencyId === orderRow.agencyId && where.creatorId === orderRow.creatorId ? clone(orderRow) : null;
       },
     },
+    automationDelivery: {
+      async findFirst({ where }) {
+        const row = proofs.find((candidate) => candidate.agencyId === where.agencyId && candidate.creatorId === where.creatorId && candidate.actionType === where.actionType && candidate.idempotencyKey === where.idempotencyKey && candidate.status === where.status);
+        return clone(row || null);
+      },
+    },
     creatorMediaAsset: {
       async findMany({ where, take = 100 }) {
         return mediaAssets.filter((asset) => {
+          if (where.id !== undefined && asset.id !== where.id) return false;
           if (asset.agencyId !== where.agencyId || asset.creatorId !== where.creatorId) return false;
           if (where.mediaId?.in && !where.mediaId.in.includes(asset.mediaId)) return false;
           if (where.source !== undefined && asset.source !== where.source) return false;
           return true;
         }).slice(0, take).map(clone);
+      },
+      async findFirst({ where }) {
+        return clone(mediaAssets.find((asset) => {
+          if (where.id !== undefined && asset.id !== where.id) return false;
+          if (where.agencyId !== undefined && asset.agencyId !== where.agencyId) return false;
+          if (where.creatorId !== undefined && asset.creatorId !== where.creatorId) return false;
+          return true;
+        }) || null);
       },
       async createMany({ data, skipDuplicates }) {
         let count = 0;
@@ -64,11 +89,16 @@ function fakeDb({ submission = {}, assets = [], order = {}, folderId = "vault-cu
         }
         return { count };
       },
-      async update({ where, data }) {
-        const asset = mediaAssets.find((row) => row.id === where.id);
-        if (!asset) throw new Error("asset not found");
-        Object.assign(asset, clone(data), { updatedAt: new Date("2026-08-21T13:00:00.000Z") });
-        return clone(asset);
+      async updateMany({ where, data }) {
+        if (typeof beforeMediaAssetUpdateMany === "function") await beforeMediaAssetUpdateMany({ where: clone(where), data: clone(data), assets: mediaAssets });
+        const asset = mediaAssets.find((row) => {
+          if (row.id !== where.id) return false;
+          if (where.updatedAt && new Date(where.updatedAt).getTime() !== new Date(row.updatedAt).getTime()) return false;
+          return true;
+        });
+        if (!asset) return { count: 0 };
+        Object.assign(asset, clone(data), { updatedAt: new Date(new Date(asset.updatedAt).getTime() + 1000) });
+        return { count: 1 };
       },
     },
     auditLog: { async create({ data }) { audits.push(clone(data)); return { id: `audit-${audits.length}`, ...clone(data) }; } },
@@ -116,6 +146,22 @@ test("finalize materializes every settled OF media id in Content Library with fu
   assert.equal(db._audits.filter((row) => row.action === "custom_content_submission.content_library_finalize").length, 1, "exact finalize retry must not create audit noise");
 });
 
+
+test("CUSTOM Content Library asset ownership cannot be stolen by a different submission sharing the same OF media id", async () => {
+  const stamp = new Date("2026-08-21T11:00:00.000Z");
+  const db = fakeDb({ assets: [
+    { id: "asset-9001", agencyId: "agency-1", creatorId: "creator-1", mediaId: "9001", source: "CUSTOM", customOrderId: "custom-old", customSubmissionId: "submission-old", customFullPriceCents: 5000, catalogActive: true, sortingStatus: "SORTED", folderIds: ["vault-customs"], description: "Old custom", idealPriceCents: 5000, accessType: "paid", metadataUpdatedAt: null, firstSeenAt: stamp, lastSeenAt: stamp, updatedAt: stamp },
+    { id: "asset-9002", agencyId: "agency-1", creatorId: "creator-1", mediaId: "9002", source: "CUSTOM", customOrderId: "custom-old", customSubmissionId: "submission-old", customFullPriceCents: 5000, catalogActive: true, sortingStatus: "SORTED", folderIds: ["vault-customs"], description: "Old custom", idealPriceCents: 5000, accessType: "paid", metadataUpdatedAt: null, firstSeenAt: stamp, lastSeenAt: stamp, updatedAt: stamp },
+  ] });
+  await assert.rejects(
+    () => finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db }),
+    (error) => error?.code === "CUSTOM_CONTENT_LIBRARY_PROVENANCE_CONFLICT" && error?.status === 409,
+  );
+  assert.deepEqual(db._assets.map((asset) => [asset.mediaId, asset.customSubmissionId, asset.customOrderId]), [
+    ["9001", "submission-old", "custom-old"], ["9002", "submission-old", "custom-old"],
+  ]);
+});
+
 test("automatic Customs finalize never overwrites human Media Library description or pricing", async () => {
   const db = fakeDb({ assets: [{
     id: "asset-1", agencyId: "agency-1", creatorId: "creator-1", mediaId: "9001", source: "GENERAL", customOrderId: null, customFullPriceCents: null,
@@ -156,11 +202,21 @@ test("an unassigned settled submission is still durable CUSTOM library content a
   }
 });
 
-test("Content Library finalize refuses incomplete OF upload state", async () => {
+test("Content Library finalize heals stale client projection only from the complete confirmed relay sequence", async () => {
   const db = fakeDb({ submission: { ofMediaIds: ["9001"] } });
+  const result = await finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db });
+  assert.deepEqual(result.mediaIds, ["9001", "9002"]);
+  assert.deepEqual(db._submission.ofMediaIds, ["9001", "9002"]);
+  assert.equal(db._assets.length, 2);
+});
+
+test("Content Library finalize fails closed if any confirmed relay proof is missing", async () => {
+  const db = fakeDb({ submission: { ofMediaIds: ["9001"] }, relayProofs: [
+    { id: "write-0", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:submission-1:0", status: "COMPLETED", payload: { submissionId: "submission-1", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "101" }, result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "9001" } },
+  ] });
   await assert.rejects(
     () => finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db }),
-    (error) => error?.code === "CUSTOM_SUBMISSION_NOT_READY_FOR_LIBRARY" && error?.status === 409,
+    (error) => error?.code === "CUSTOM_SUBMISSION_RELAY_PROOF_REQUIRED" && error?.status === 409,
   );
   assert.equal(db._assets.length, 0);
 });
@@ -198,6 +254,39 @@ test("V20.5 finalize seeds existing Content Library preview columns from fresh O
     mediaHints: [{ mediaId: "9001", mediaType: "video", thumbUrl: "https://cdn.test/stale-upload-thumb.jpg" }],
   });
   assert.equal(first.thumbUrl, "https://cdn.test/scanner-fresh-thumb.jpg");
+});
+
+
+test("concurrent human Media Library edit wins over stale automatic Customs metadata while provenance still converges", async () => {
+  let raced = false;
+  const db = fakeDb({
+    assets: [{
+      id: "asset-1", agencyId: "agency-1", creatorId: "creator-1", mediaId: "9001", source: "GENERAL", customOrderId: null, customSubmissionId: null, customFullPriceCents: null,
+      catalogActive: true, sortingStatus: "UNSORTED", folderIds: [], description: null, idealPriceCents: 0, accessType: "paid",
+      metadataUpdatedAt: null, firstSeenAt: new Date("2026-08-21T10:00:00.000Z"), lastSeenAt: new Date("2026-08-21T10:00:00.000Z"),
+      createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:00:00.000Z"),
+    }],
+    beforeMediaAssetUpdateMany: async ({ assets }) => {
+      if (raced) return;
+      raced = true;
+      const asset = assets.find((row) => row.id === "asset-1");
+      asset.description = "Human edit during finalize";
+      asset.idealPriceCents = 9100;
+      asset.accessType = "paid";
+      asset.metadataUpdatedAt = new Date("2026-08-21T10:00:01.000Z");
+      asset.updatedAt = new Date("2026-08-21T10:00:01.000Z");
+    },
+  });
+
+  await finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db, now: new Date("2026-08-21T12:00:00.000Z") });
+  const asset = db._assets.find((row) => row.mediaId === "9001");
+  assert.equal(asset.source, "CUSTOM");
+  assert.equal(asset.customOrderId, "custom-1");
+  assert.equal(asset.customSubmissionId, "submission-1");
+  assert.deepEqual(asset.folderIds, ["vault-customs"]);
+  assert.equal(asset.description, "Human edit during finalize");
+  assert.equal(asset.idealPriceCents, 9100);
+  assert.ok(asset.metadataUpdatedAt);
 });
 
 

@@ -570,6 +570,8 @@ model CustomOrder {
   creatorId                   String
   dialogId                    String
   createdByMemberId           String
+  clientMutationId            String?
+  clientMutationFingerprint   String?
   scenario                    String
   internalNote                String?
   type                        CustomOrderType           @default(CONTENT)
@@ -615,6 +617,7 @@ model CustomOrder {
   contentSubmissions   CustomContentSubmission[]
   contentLibraryAssets CreatorMediaAsset[]
 
+  @@unique([agencyId, clientMutationId], map: "CustomOrder_agency_clientMutationId_key")
   @@index([agencyId, status, dueAt])
   @@index([agencyId, status, scheduledAt])
   @@index([agencyId, status, nextReminderAt])
@@ -632,6 +635,10 @@ model CustomContentSubmission {
   creatorId          String
   customOrderId      String?
   telegramMessageIds Int[]    @default([])
+  telegramInboundEventIds String[] @default([])
+  telegramSourceKey    String?  @unique
+  telegramSourceAccountId String?
+  telegramSourceUserId String?
   ofMediaIds         String[] @default([])
   comment            String?
   reviewStatus       CustomContentReviewStatus @default(WAITING_REVIEW)
@@ -649,9 +656,74 @@ model CustomContentSubmission {
   contentLibraryAssets CreatorMediaAsset[]
 
   @@index([agencyId, creatorId, receivedAt])
+  @@index([agencyId, telegramSourceAccountId, telegramSourceUserId])
   @@index([agencyId, reviewStatus, receivedAt])
   @@index([customOrderId, receivedAt])
   @@index([reviewedByMemberId])
+}
+
+
+model TelegramDeliveryIntent {
+  id                  String   @id @default(cuid())
+  agencyId            String
+  creatorId           String
+  customOrderId       String
+  accountId           String
+  kind                String
+  logicalKey          String   @unique
+  clientIntentId      String?
+  referenceOrdinal    Int?
+  payloadFingerprint  String
+  payload             Json     @default("{}")
+  state               String   @default("PLANNED")
+  deviceId            String?
+  userId              String?
+  memberId            String?
+  accessEpoch         Int?
+  claimTokenHash      String?
+  claimRevision       Int      @default(0)
+  claimUntil          DateTime?
+  commitStartedAt     DateTime?
+  remoteMessageId     Int?
+  remoteRecipientTelegramUserId String?
+  remoteSentAt        DateTime?
+  outcomeReason       String?
+  confirmedAt         DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([agencyId, state, createdAt])
+  @@index([agencyId, creatorId, state])
+  @@index([agencyId, customOrderId, kind, createdAt])
+  @@unique([customOrderId, kind, referenceOrdinal], map: "TelegramDeliveryIntent_reference_ordinal_key")
+  @@index([agencyId, accountId, state])
+  @@index([agencyId, accountId, remoteRecipientTelegramUserId, state])
+  @@index([customOrderId, remoteMessageId])
+}
+
+model TelegramInboundEvent {
+  id                    String   @id @default(cuid())
+  agencyId              String
+  accountId             String
+  creatorId             String?
+  customOrderId         String?
+  submissionId          String?
+  senderTelegramUserId  String
+  messageId             Int
+  replyToMessageId      Int?
+  groupedId             String?
+  hasMedia              Boolean  @default(false)
+  text                   String?
+  sentAt                 DateTime
+  observedAt             DateTime @default(now())
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  @@unique([agencyId, accountId, senderTelegramUserId, messageId], map: "TelegramInboundEvent_provider_message_key")
+  @@index([agencyId, creatorId, sentAt])
+  @@index([agencyId, customOrderId, sentAt])
+  @@index([agencyId, accountId, replyToMessageId])
+  @@index([submissionId])
 }
 
 model AuthToken {

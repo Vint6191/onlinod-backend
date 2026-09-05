@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
+const { confirmedRelaySequence } = require("./custom-relay-result-proof-service");
 
 const SOURCE_CUSTOM = "CUSTOM";
 const MAX_MEDIA_IDS = 200;
@@ -98,8 +99,20 @@ async function loadContext(db, { agencyId, member, submissionId, requireFolder }
   const submission = await db.customContentSubmission.findFirst({ where: { id, agencyId } });
   if (!submission) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
   await requireCreatorAccess({ agencyId, member, creatorId: submission.creatorId, db });
-  if (!isCompleteSubmission(submission)) {
-    throw fail("CUSTOM_SUBMISSION_NOT_READY_FOR_LIBRARY", "Submission must have one OnlyFans media id for every Telegram source message", 409);
+  const telegramIds = Array.isArray(submission.telegramMessageIds) ? submission.telegramMessageIds : [];
+  if (!telegramIds.length) throw fail("CUSTOM_SUBMISSION_NOT_READY_FOR_LIBRARY", "Submission has no Telegram source messages", 409);
+  const proofs = await confirmedRelaySequence({
+    agencyId, creatorId: submission.creatorId, submissionId: submission.id,
+    expectedTelegramSourceAccountId: submission.telegramSourceAccountId,
+    expectedTelegramSourceUserId: submission.telegramSourceUserId,
+    expectedTelegramMessageIds: telegramIds, db,
+  });
+  const provenMediaIds = proofs.map((proof) => proof.mediaId);
+  const storedMediaIds = uniqueMediaIds(submission.ofMediaIds);
+  if (storedMediaIds.length !== provenMediaIds.length || storedMediaIds.some((value, index) => value !== provenMediaIds[index])) {
+    const changed = await db.customContentSubmission.updateMany({ where: { id: submission.id, agencyId, updatedAt: submission.updatedAt }, data: { ofMediaIds: provenMediaIds } });
+    if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_LIBRARY_PROJECTION_CONFLICT", "Submission changed while proven relay results were being projected", 409);
+    submission.ofMediaIds = provenMediaIds;
   }
   const creator = await db.creatorAccount.findFirst({
     where: { id: submission.creatorId, agencyId, deletedAt: null },
@@ -115,7 +128,7 @@ async function loadContext(db, { agencyId, member, submissionId, requireFolder }
     creatorId: submission.creatorId,
     customOrderId: submission.customOrderId || null,
   });
-  return { submission, creator, folderId, order, mediaIds: uniqueMediaIds(submission.ofMediaIds) };
+  return { submission, creator, folderId, order, mediaIds: provenMediaIds };
 }
 
 function desiredAutoMetadata(asset, order) {
@@ -158,11 +171,23 @@ function needsUpdate(asset, { order, folderId, previewHint, submissionId }) {
   return false;
 }
 
+function assertCustomSubmissionOwnership(rows, submissionId) {
+  const expected = submissionId || null;
+  for (const asset of rows || []) {
+    if (String(asset.source || "GENERAL") !== SOURCE_CUSTOM) continue;
+    const owner = asset.customSubmissionId || null;
+    if (owner && expected && String(owner) !== String(expected)) {
+      throw fail("CUSTOM_CONTENT_LIBRARY_PROVENANCE_CONFLICT", "Content Library media is already owned by a different Custom submission", 409);
+    }
+  }
+}
+
 async function syncRows(db, { agencyId, creatorId, submissionId, mediaIds, folderId, order, allowCreate, now, mediaHints = new Map() }) {
   let rows = await db.creatorMediaAsset.findMany({
     where: { agencyId, creatorId, mediaId: { in: mediaIds } },
     take: mediaIds.length,
   });
+  assertCustomSubmissionOwnership(rows, submissionId);
   const byId = new Map(rows.map((row) => [String(row.mediaId), row]));
   const missing = mediaIds.filter((mediaId) => !byId.has(mediaId));
 
@@ -197,6 +222,9 @@ async function syncRows(db, { agencyId, creatorId, submissionId, mediaIds, folde
       where: { agencyId, creatorId, mediaId: { in: mediaIds } },
       take: mediaIds.length,
     });
+    // createMany(skipDuplicates) can race another submission materializing the same media id.
+    // Re-check after reload before any provenance update so that race cannot steal ownership.
+    assertCustomSubmissionOwnership(rows, submissionId);
   }
 
   if (rows.length !== mediaIds.length) {
@@ -204,27 +232,53 @@ async function syncRows(db, { agencyId, creatorId, submissionId, mediaIds, folde
   }
 
   let changed = 0;
-  for (const asset of rows) {
-    const previewHint = mediaHints.get(String(asset.mediaId)) || null;
-    if (!needsUpdate(asset, { order, folderId, previewHint, submissionId })) continue;
-    const folders = new Set(normalizeFolderIds(asset.folderIds));
-    if (folderId) folders.add(folderId);
-    const update = {
-      source: SOURCE_CUSTOM,
-      customOrderId: order?.id || null,
-      customSubmissionId: submissionId || null,
-      customFullPriceCents: order ? normalizePriceCents(order.priceCents) : null,
-      catalogActive: true,
-      lastSeenAt: now,
-      folderIds: [...folders],
-      ...(folderId ? { sortingStatus: "SORTED" } : {}),
-      ...desiredAutoMetadata(asset, order),
-      ...previewSeed(asset, previewHint),
-    };
-    await db.creatorMediaAsset.update({ where: { id: asset.id }, data: update });
-    changed += 1;
+  const projectedRows = [];
+  for (const originalAsset of rows) {
+    const previewHint = mediaHints.get(String(originalAsset.mediaId)) || null;
+    let asset = originalAsset;
+    let rowChanged = false;
+
+    // Media Library metadata is human-owned once metadataUpdatedAt is set. A manager can
+    // edit description/price while this projection is between read and write, so a plain
+    // update({ id }) can overwrite that newer human fact with stale automatic metadata.
+    // CAS on updatedAt and reload the row on a race; after reload desiredAutoMetadata()
+    // observes metadataUpdatedAt and drops all auto-owned metadata fields while provenance
+    // and folder projection can still converge.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (!needsUpdate(asset, { order, folderId, previewHint, submissionId })) break;
+      const folders = new Set(normalizeFolderIds(asset.folderIds));
+      if (folderId) folders.add(folderId);
+      const update = {
+        source: SOURCE_CUSTOM,
+        customOrderId: order?.id || null,
+        customSubmissionId: submissionId || null,
+        customFullPriceCents: order ? normalizePriceCents(order.priceCents) : null,
+        catalogActive: true,
+        lastSeenAt: now,
+        folderIds: [...folders],
+        ...(folderId ? { sortingStatus: "SORTED" } : {}),
+        ...desiredAutoMetadata(asset, order),
+        ...previewSeed(asset, previewHint),
+      };
+      const applied = await db.creatorMediaAsset.updateMany({
+        where: { id: asset.id, updatedAt: asset.updatedAt },
+        data: update,
+      });
+      if (Number(applied?.count || 0) === 1) {
+        rowChanged = true;
+        asset = await db.creatorMediaAsset.findFirst({ where: { id: asset.id, agencyId, creatorId } }) || { ...asset, ...update };
+        break;
+      }
+      asset = await db.creatorMediaAsset.findFirst({ where: { id: asset.id, agencyId, creatorId } });
+      if (!asset) throw fail("CUSTOM_CONTENT_LIBRARY_ASSET_NOT_FOUND", "Content Library asset disappeared during Customs projection", 409);
+    }
+    if (needsUpdate(asset, { order, folderId, previewHint, submissionId })) {
+      throw fail("CUSTOM_CONTENT_LIBRARY_PROJECTION_RACE", "Content Library asset kept changing during Customs projection", 409);
+    }
+    if (rowChanged) changed += 1;
+    projectedRows.push(asset);
   }
-  return { complete: true, changed: created + changed, items: rows };
+  return { complete: true, changed: created + changed, items: projectedRows };
 }
 
 /**
@@ -263,6 +317,7 @@ async function finalizeCustomContentSubmissionLibrary({ agencyId, member, submis
         customOrderId: order?.id || null,
         mediaCount: mediaIds.length,
         fullContentPriceCents: order ? normalizePriceCents(order.priceCents) : null,
+        authority: "CUSTOM_RELAY_SEND_CONFIRMED",
       },
       db: client,
     });

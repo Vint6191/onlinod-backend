@@ -8,10 +8,11 @@ const {
   assertTelegramMessagingAccess,
   claimTelegramExecutionRuntimes,
   assertTelegramRuntimeLease,
+  assertTelegramInboundRuntimeLease,
   releaseTelegramExecutionRuntime,
 } = require("./telegram-execution-runtime");
 
-function makeDb() {
+function makeDb({ sourceSubmissions = [], deliveryIntents = [] } = {}) {
   const creators = [
     { id: "creator-1", agencyId: "agency-1", telegramContact: "@model_a", telegramAccountId: "tg-1", deletedAt: null, displayName: "A", username: "a", status: "READY" },
     { id: "creator-2", agencyId: "agency-1", telegramContact: "@model_b", telegramAccountId: "tg-2", deletedAt: null, displayName: "B", username: "b", status: "READY" },
@@ -45,11 +46,38 @@ function makeDb() {
   const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"], accessEpoch: 1, deletedAt: null, deactivatedAt: null };
   return {
     _accounts: accounts,
+    _creators: creators,
     _member: member,
     agencyMember: { async findFirst({ where }) { return where.id === member.id && where.userId === member.userId && where.agencyId === member.agencyId ? { ...member } : null; } },
     creatorAccount: {
       async findMany({ where }) { return creators.filter((row) => matchCreator(row, where)).map((row) => ({ ...row })); },
       async findFirst({ where }) { return creators.find((row) => matchCreator(row, where)) || null; },
+    },
+    customContentSubmission: {
+      async findMany({ where, take = 1000 }) {
+        return sourceSubmissions.filter((row) => {
+          if (row.agencyId !== where.agencyId) return false;
+          if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+          if (where.telegramSourceAccountId?.not === null && row.telegramSourceAccountId == null) return false;
+          if (where.telegramSourceUserId?.not === null && row.telegramSourceUserId == null) return false;
+          return true;
+        }).slice(0, take).map((row) => ({ ...row }));
+      },
+    },
+    telegramDeliveryIntent: {
+      async findMany({ where, take = 1000 }) {
+        return deliveryIntents.filter((row) => {
+          if (row.agencyId !== where.agencyId) return false;
+          if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+          if (typeof where.kind === "string" && row.kind !== where.kind) return false;
+          if (where.kind?.in && !where.kind.in.includes(row.kind)) return false;
+          if (typeof where.state === "string" && row.state !== where.state) return false;
+          if (where.state?.in && !where.state.in.includes(row.state)) return false;
+          if (where.remoteMessageId?.not === null && row.remoteMessageId == null) return false;
+          if (where.remoteRecipientTelegramUserId?.not === null && row.remoteRecipientTelegramUserId == null) return false;
+          return true;
+        }).slice(0, take).map((row) => ({ ...row }));
+      },
     },
     agencyTelegramMtprotoAccount: {
       async findMany({ where }) { return accounts.filter((row) => matchAccount(row, where)).map((row) => ({ id: row.id })); },
@@ -69,7 +97,7 @@ const chatterA = { id: "member-1", userId: "user-1", agencyId: "agency-1", role:
 test("Telegram runtime eligibility is creator-scoped instead of role-scoped", async () => {
   const db = makeDb();
   const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: chatterA, db });
-  assert.deepEqual(eligible, [{ accountId: "tg-1", anchorCreatorId: "creator-1" }]);
+  assert.deepEqual(eligible, [{ accountId: "tg-1", anchorCreatorId: "creator-1", messagingEligible: true }]);
 
   const access = await assertTelegramMessagingAccess({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", creatorId: "creator-1", db });
   assert.equal(access.accountId, "tg-1");
@@ -83,6 +111,55 @@ test("Telegram runtime eligibility is creator-scoped instead of role-scoped", as
   );
 });
 
+
+test("pending Customs source account remains runtime-eligible after creator Telegram account reassignment without widening send authority", async () => {
+  const db = makeDb({ sourceSubmissions: [{
+    id: "submission-1", agencyId: "agency-1", creatorId: "creator-1", telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678",
+    telegramMessageIds: [501], ofMediaIds: [],
+  }] });
+  db._creators[0].telegramAccountId = "tg-2";
+  const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: chatterA, db });
+  assert.deepEqual(eligible, [
+    { accountId: "tg-2", anchorCreatorId: "creator-1", messagingEligible: true },
+    { accountId: "tg-1", anchorCreatorId: "creator-1", messagingEligible: false },
+  ]);
+  await assert.rejects(
+    () => assertTelegramMessagingAccess({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", creatorId: "creator-1", db }),
+    (error) => error?.code === "TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN",
+    "historical source-read eligibility must not make the old account valid for normal Telegram messaging writes",
+  );
+  const claimed = await claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: chatterA, deviceId: "device-source", accountId: "tg-1", limit: 1, now: new Date("2026-08-19T14:00:00.000Z"), db });
+  assert.deepEqual(claimed.leases.map((lease) => lease.accountId), ["tg-1"]);
+  assert.equal(claimed.leases[0].messagingEligible, false, "historical source account lease must stay explicitly read-only for inbound authority");
+  await assert.rejects(
+    () => assertTelegramInboundRuntimeLease({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-source", claimToken: claimed.leases[0].claimToken, now: new Date("2026-08-19T14:00:01.000Z"), db }),
+    (error) => error?.code === "TELEGRAM_INBOUND_ACCOUNT_FORBIDDEN" && error?.status === 403,
+  );
+});
+
+test("confirmed TASK thread and active follow-up keep the old account runtime-eligible without restoring generic messaging or inbound", async () => {
+  const db = makeDb({ deliveryIntents: [
+    { id: "task-1", agencyId: "agency-1", creatorId: "creator-1", accountId: "tg-1", kind: "TASK", state: "CONFIRMED", remoteMessageId: 501, remoteRecipientTelegramUserId: "1001" },
+    { id: "ref-1", agencyId: "agency-1", creatorId: "creator-1", accountId: "tg-1", kind: "REFERENCE", state: "PLANNED" },
+  ] });
+  db._creators[0].telegramAccountId = "tg-2";
+  const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: chatterA, db });
+  assert.deepEqual(eligible, [
+    { accountId: "tg-2", anchorCreatorId: "creator-1", messagingEligible: true },
+    { accountId: "tg-1", anchorCreatorId: "creator-1", messagingEligible: false },
+  ]);
+  const claimed = await claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: chatterA, deviceId: "device-followup", accountId: "tg-1", limit: 1, now: new Date("2026-08-19T14:00:00.000Z"), db });
+  assert.equal(claimed.leases[0].messagingEligible, false);
+  await assert.rejects(
+    () => assertTelegramMessagingAccess({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", creatorId: "creator-1", db }),
+    (error) => error?.code === "TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN",
+  );
+  await assert.rejects(
+    () => assertTelegramInboundRuntimeLease({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-followup", claimToken: claimed.leases[0].claimToken, now: new Date("2026-08-19T14:00:01.000Z"), db }),
+    (error) => error?.code === "TELEGRAM_INBOUND_ACCOUNT_FORBIDDEN",
+  );
+});
+
 test("one Desktop owns an account runtime lease, same device renews it, and another takes over only after expiry", async () => {
   const db = makeDb();
   const start = new Date("2026-08-19T14:00:00.000Z");
@@ -90,6 +167,7 @@ test("one Desktop owns an account runtime lease, same device renews it, and anot
   assert.equal(first.leases.length, 1);
   assert.equal(first.leases[0].accountId, "tg-1");
   assert.equal(first.leases[0].anchorCreatorId, "creator-1");
+  assert.equal(first.leases[0].messagingEligible, true);
   assert.equal(new Date(first.leases[0].claimUntil).getTime() - start.getTime(), RUNTIME_LEASE_MS);
   const token = first.leases[0].claimToken;
 

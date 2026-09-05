@@ -118,6 +118,33 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
     accountId: "tg-1", creatorId: "creator-1", purpose: "messaging", ...chatterLease, db,
   });
   assert.equal(chatterMaterial.session, "SESSION_SECRET_VALUE", "creator-scoped chatter execution is allowed without Telegram settings-management rights");
+
+  const originalLoad = Module._load;
+  Module._load = function(request, parent, isMain) {
+    if (request === "./custom-content-submissions-service") {
+      return {
+        assertCustomSubmissionTelegramSourceAccess: async ({ agencyId, member: actor, submissionId, creatorId, accountId, messageIds }) => {
+          assert.equal(agencyId, "agency-1");
+          assert.equal(actor.id, chatter.id);
+          assert.equal(submissionId, "submission-history-1");
+          assert.equal(creatorId, "creator-1");
+          assert.equal(accountId, "tg-1");
+          assert.deepEqual(messageIds, ["801"]);
+          return { ok: true, accountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageIds: ["801"] };
+        },
+      };
+    }
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    const sourceMaterial = await service.issueTelegramMtprotoLocalMaterial({
+      agencyId: "agency-1", member: chatter, accountId: "tg-1", creatorId: "creator-1", submissionId: "submission-history-1", messageIds: ["801"], purpose: "customs-source-read", ...chatterLease, db,
+    });
+    assert.equal(sourceMaterial.session, "SESSION_SECRET_VALUE");
+    assert.equal(sourceMaterial.sourceTelegramUserId, "987654321012345678");
+  } finally {
+    Module._load = originalLoad;
+  }
   await assert.rejects(
     () => service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: chatter, accountId: "tg-1", creatorId: "creator-1", purpose: "messaging", deviceId: "device-other", claimToken: chatterLease.claimToken, db }),
     (error) => error?.code === "TELEGRAM_EXECUTION_LEASE_INVALID",
@@ -143,6 +170,53 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
 
   await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
   assert.equal(stored, null);
+});
+
+test("Telegram account deletion is fail-closed while Customs delivery/thread/source authority still depends on it", async () => {
+  const service = loadSettingsService();
+  const owner = { id: "owner", userId: "user-owner", role: "OWNER", roleKey: "owner" };
+  const account = { id: "tg-1", agencyId: "agency-1" };
+  const baseDb = () => ({
+    agencyTelegramMtprotoAccount: { findFirst: async () => account, delete: async () => ({}) },
+    creatorAccount: { updateMany: async () => ({ count: 1 }) },
+  });
+
+  {
+    const db = baseDb();
+    db.telegramDeliveryIntent = {
+      findFirst: async () => ({ id: "delivery-1", kind: "REFERENCE", state: "RECONCILE_REQUIRED" }),
+      findMany: async () => [],
+    };
+    await assert.rejects(
+      () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db }),
+      (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE" && error?.status === 409,
+    );
+  }
+
+  {
+    const db = baseDb();
+    db.telegramDeliveryIntent = {
+      findFirst: async () => null,
+      findMany: async () => [{ customOrderId: "order-1" }],
+    };
+    db.customOrder = { findFirst: async () => ({ id: "order-1" }) };
+    await assert.rejects(
+      () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db }),
+      (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
+      "a confirmed TASK thread for a pending Custom order must keep its provider account recoverable",
+    );
+  }
+
+  {
+    const db = baseDb();
+    db.telegramDeliveryIntent = { findFirst: async () => null, findMany: async () => [] };
+    db.customContentSubmission = { findFirst: async () => ({ id: "submission-1" }) };
+    await assert.rejects(
+      () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db }),
+      (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
+      "pending/revision Custom source media must keep the pinned Telegram account available",
+    );
+  }
 });
 
 test("Telegram MTProto API credentials validate id/hash and allow session to be added later", async () => {
@@ -211,6 +285,7 @@ test("Backend is MTProto storage-only: Desktop gets local material and hands a s
   assert.match(addBlock, /requireProductDevice\(req, req\.body\?\.deviceId\)/);
   assert.match(materialBlock, /requireProductDevice\(req, req\.body\?\.deviceId\)/);
   assert.match(materialBlock, /claimToken: req\.body\?\.claimToken/);
+  assert.match(materialBlock, /submissionId: req\.body\?\.submissionId/);
   assert.match(sessionBlock, /requireProductDevice\(req, req\.body\?\.deviceId\)/);
 
   assert.doesNotMatch(routeSource, /\/auth\/start|\/auth\/code|\/auth\/password|\/test-status|\/:accountId\/test/);

@@ -5,6 +5,7 @@ const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { syncFinalizedSubmissionAssignment } = require("./custom-content-library-service");
 const { canUsePermission } = require("./team-access-control");
+const { confirmedRelayResult } = require("./custom-relay-result-proof-service");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
@@ -33,6 +34,14 @@ function commentText(value) {
   if (!text) return null;
   if (text.length > MAX_COMMENT) throw fail("CUSTOM_SUBMISSION_COMMENT_TOO_LONG", `comment is too long (max ${MAX_COMMENT} characters)`);
   return text;
+}
+
+function telegramUserId(value, field = "telegramUserId") {
+  const text = identifier(value, field, { max: 40 });
+  if (!/^\d{1,20}$/.test(text)) throw fail("CUSTOM_SUBMISSION_TELEGRAM_SOURCE_USER_INVALID", `${field} must be a positive Telegram user id`);
+  const numeric = BigInt(text);
+  if (numeric <= 0n || numeric > 9223372036854775807n) throw fail("CUSTOM_SUBMISSION_TELEGRAM_SOURCE_USER_INVALID", `${field} must be a positive Telegram user id`);
+  return numeric.toString(10);
 }
 
 function telegramMessageIds(value) {
@@ -121,9 +130,9 @@ function sameMessageIds(a, b) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function deterministicSubmissionId(agencyId, creatorId, messageIds) {
+function deterministicSubmissionId(agencyId, creatorId, sourceAccountId, sourceUserId, messageIds) {
   const canonical = Array.from(new Set(messageIds.map(Number))).sort((a, b) => a - b).join(",");
-  const digest = crypto.createHash("sha256").update(`${agencyId}\n${creatorId}\n${canonical}`).digest("hex");
+  const digest = crypto.createHash("sha256").update(`${agencyId}\n${creatorId}\n${sourceAccountId}\n${sourceUserId}\n${canonical}`).digest("hex");
   return `cs_${digest}`;
 }
 
@@ -134,6 +143,13 @@ function serializeSubmission(row) {
     creatorId: String(row.creatorId),
     customOrderId: row.customOrderId == null ? null : String(row.customOrderId),
     telegramMessageIds: Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.map(String) : [],
+    telegramInboundEventIds: Array.isArray(row.telegramInboundEventIds) ? row.telegramInboundEventIds.map(String) : [],
+    telegramSourceKey: row.telegramSourceKey || null,
+    telegramSourceAccountId: row.telegramSourceAccountId == null ? null : String(row.telegramSourceAccountId),
+    telegramSourceUserId: row.telegramSourceUserId == null ? null : String(row.telegramSourceUserId),
+    intakeAuthority: row.telegramSourceKey && Array.isArray(row.telegramInboundEventIds) && row.telegramInboundEventIds.length > 0
+      ? "PROVEN_TELEGRAM_INBOUND"
+      : "MANUAL_IMPORT",
     ofMediaIds: ofMediaIds(row.ofMediaIds),
     comment: row.comment || null,
     reviewStatus: String(row.reviewStatus || "WAITING_REVIEW"),
@@ -190,14 +206,23 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
   const customOrderId = identifier(input.customOrderId, "customOrderId", { optional: true, max: 180 });
   const messageIds = telegramMessageIds(input.telegramMessageIds);
   const comment = commentText(input.comment);
+  const manualImportReason = commentText(input.manualImportReason);
+  const sourceAccountId = identifier(input.telegramAccountId, "telegramAccountId", { max: 180 });
+  const sourceUserId = telegramUserId(input.telegramUserId, "telegramUserId");
+  if (!manualImportReason) throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_REASON_REQUIRED", "manualImportReason is required for explicit raw Telegram import");
+  if (!(await canUsePermission({ member, key: "content.review_customs", db: client }))) {
+    throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_FORBIDDEN", "content.review_customs permission is required for explicit raw Telegram import", 403);
+  }
   const observedAt = receivedAt(input.receivedAt, now);
 
   await requireCreatorAccess({ agencyId, member, creatorId, db: client });
+  const sourceAccount = await client.agencyTelegramMtprotoAccount.findFirst({ where: { id: sourceAccountId, agencyId }, select: { id: true } });
+  if (!sourceAccount) throw fail("CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_NOT_FOUND", "Telegram source account was not found in this agency", 404);
   await validateContentOrder({ agencyId, creatorId, customOrderId, db: client });
-  const submissionId = deterministicSubmissionId(agencyId, creatorId, messageIds);
+  const submissionId = deterministicSubmissionId(agencyId, creatorId, sourceAccountId, sourceUserId, messageIds);
 
   const overlapping = await client.customContentSubmission.findFirst({
-    where: { agencyId, creatorId, telegramMessageIds: { hasSome: messageIds } },
+    where: { agencyId, creatorId, telegramSourceAccountId: sourceAccountId, telegramSourceUserId: sourceUserId, telegramMessageIds: { hasSome: messageIds } },
     orderBy: [{ receivedAt: "desc" }, { createdAt: "desc" }],
   });
   if (overlapping) {
@@ -217,6 +242,9 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
         creatorId,
         customOrderId,
         telegramMessageIds: messageIds,
+        telegramSourceAccountId: sourceAccountId,
+        telegramSourceUserId: sourceUserId,
+        telegramSourceKey: `manual:${agencyId}:${sourceAccountId}:${sourceUserId}:${submissionId}`,
         ofMediaIds: [],
         comment,
         receivedAt: observedAt,
@@ -236,10 +264,142 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
     action: "custom_content_submission.create",
     targetType: "CustomContentSubmission",
     targetId: row.id,
-    metadata: { creatorId, customOrderId, telegramMessageCount: messageIds.length },
+    metadata: { creatorId, customOrderId, telegramSourceAccountId: sourceAccountId, telegramSourceUserId: sourceUserId, telegramMessageCount: messageIds.length, manualImport: true, manualImportReason },
     db: client,
   });
   return { ok: true, deduped: false, submission: serializeSubmission(row) };
+}
+
+async function withSubmissionSourceLock({ db, agencyId, submissionId, work }) {
+  if (!db || typeof db.$transaction !== "function" || typeof db.$queryRawUnsafe !== "function") return work(db);
+  return db.$transaction(async (tx) => {
+    await tx.$queryRawUnsafe(
+      `SELECT "id" FROM "CustomContentSubmission" WHERE "id" = $1 AND "agencyId" = $2 FOR UPDATE`,
+      String(submissionId),
+      String(agencyId),
+    );
+    return work(tx);
+  }, { timeout: 35_000 });
+}
+
+async function hasRelayExecutionForSubmission({ agencyId, creatorId, submissionId, db }) {
+  if (!db.automationDelivery?.findFirst) return false;
+  const row = await db.automationDelivery.findFirst({
+    where: {
+      agencyId,
+      creatorId,
+      actionType: "CUSTOM_RELAY_SEND",
+      idempotencyKey: { startsWith: `custom-relay:${String(submissionId)}:` },
+    },
+    select: { id: true },
+  });
+  return Boolean(row?.id);
+}
+
+async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUserId = null, now = new Date(), db = null, _sourceLockHeld = false } = {}) {
+  const client = db || require("../prisma");
+  const normalizedEventId = identifier(eventId, "telegramInboundEventId", { max: 180 });
+  const event = await client.telegramInboundEvent.findFirst({ where: { id: normalizedEventId } });
+  if (!event) throw fail("CUSTOM_SUBMISSION_INBOUND_EVENT_NOT_FOUND", "Telegram inbound event was not found", 404);
+  if (event.submissionId) {
+    const existing = await client.customContentSubmission.findFirst({ where: { id: event.submissionId, agencyId: event.agencyId } });
+    return { ok: true, deduped: true, submission: serializeSubmission(existing), sourceEventId: event.id };
+  }
+  if (!event.creatorId || event.hasMedia !== true) return { ok: true, deduped: true, submission: null, sourceEventId: event.id, reason: event.creatorId ? "NO_MEDIA" : "CREATOR_UNRESOLVED" };
+
+  const groupedId = String(event.groupedId || "").trim();
+  let sourceKey = groupedId
+    ? `telegram:${event.agencyId}:${event.accountId}:${event.senderTelegramUserId}:group:${groupedId}`
+    : `telegram:${event.agencyId}:${event.accountId}:${event.senderTelegramUserId}:message:${event.messageId}`;
+  let forceUnassigned = false;
+  let existing = await client.customContentSubmission.findFirst({ where: { telegramSourceKey: sourceKey } });
+  if (existing && !_sourceLockHeld && typeof client.$transaction === "function" && typeof client.$queryRawUnsafe === "function") {
+    return withSubmissionSourceLock({
+      db: client, agencyId: event.agencyId, submissionId: existing.id,
+      work: (tx) => createCustomContentSubmissionFromInboundEvent({ eventId: event.id, actorUserId, now, db: tx, _sourceLockHeld: true }),
+    });
+  }
+  if (existing && existing.telegramSourceAccountId && String(existing.telegramSourceAccountId) !== String(event.accountId)) {
+    throw fail("CUSTOM_SUBMISSION_SOURCE_ACCOUNT_CONFLICT", "Telegram album source account changed", 409);
+  }
+  if (existing && existing.telegramSourceUserId && String(existing.telegramSourceUserId) !== String(event.senderTelegramUserId)) {
+    throw fail("CUSTOM_SUBMISSION_SOURCE_USER_CONFLICT", "Telegram album source sender changed", 409);
+  }
+  if (existing && !sameMessageIds(existing.telegramMessageIds, [event.messageId])) {
+    const projected = ofMediaIds(existing.ofMediaIds);
+    const creatorConflict = String(existing.creatorId || "") !== String(event.creatorId || "");
+    const orderConflict = Boolean(existing.customOrderId && event.customOrderId && String(existing.customOrderId) !== String(event.customOrderId));
+    const relaySourceFrozen = projected.length > 0 || await hasRelayExecutionForSubmission({ agencyId: event.agencyId, creatorId: existing.creatorId, submissionId: existing.id, db: client });
+    if (relaySourceFrozen || creatorConflict || orderConflict) {
+      // A very late album member may never reorder a submission whose OF relay already began.
+      // Likewise, provider grouping cannot override contradictory proven creator/order provenance.
+      // Split the conflicting event into its own deterministic source unit; for an order conflict
+      // keep it UNASSIGNED so a manager resolves the business target explicitly instead of silently
+      // annexing media proven for order B into submission A.
+      sourceKey = `telegram:${event.agencyId}:${event.accountId}:${event.senderTelegramUserId}:message:${event.messageId}`;
+      forceUnassigned = orderConflict || relaySourceFrozen;
+      existing = await client.customContentSubmission.findFirst({ where: { telegramSourceKey: sourceKey } });
+    }
+  }
+
+  if (existing) {
+    const eventIds = Array.from(new Set([...(Array.isArray(existing.telegramInboundEventIds) ? existing.telegramInboundEventIds.map(String) : []), String(event.id)]));
+    const sourceEvents = await client.telegramInboundEvent.findMany({ where: { id: { in: eventIds } }, orderBy: [{ sentAt: "asc" }, { messageId: "asc" }] });
+    const messageIds = sourceEvents.map((item) => Number(item.messageId));
+    const sortedEventIds = sourceEvents.map((item) => String(item.id));
+    if (ofMediaIds(existing.ofMediaIds).length > 0 && !sameMessageIds(existing.telegramMessageIds, messageIds)) {
+      throw fail("CUSTOM_SUBMISSION_SOURCE_FROZEN", "Telegram album changed after OnlyFans relay projection started", 409);
+    }
+    const changed = await client.customContentSubmission.updateMany({ where: { id: existing.id, agencyId: event.agencyId, updatedAt: existing.updatedAt }, data: { telegramMessageIds: messageIds, telegramInboundEventIds: sortedEventIds, telegramSourceAccountId: existing.telegramSourceAccountId || String(event.accountId), telegramSourceUserId: existing.telegramSourceUserId || String(event.senderTelegramUserId), receivedAt: sourceEvents[0]?.sentAt || existing.receivedAt } });
+    if (Number(changed?.count || 0) !== 1) return createCustomContentSubmissionFromInboundEvent({ eventId: event.id, actorUserId, now, db: client, _sourceLockHeld });
+    await client.telegramInboundEvent.updateMany({ where: { id: event.id, submissionId: null }, data: { submissionId: existing.id } });
+    const updated = await client.customContentSubmission.findFirst({ where: { id: existing.id, agencyId: event.agencyId } });
+    return { ok: true, deduped: false, submission: serializeSubmission(updated), sourceEventId: event.id };
+  }
+
+  let customOrderId = forceUnassigned ? null : (event.customOrderId || null);
+  if (customOrderId) {
+    try {
+      await validateContentOrder({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, db: client });
+      await validateSubmissionLifecycleTarget({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, db: client });
+    } catch (error) {
+      if (!["CUSTOM_SUBMISSION_ORDER_BUSY", "CUSTOM_SUBMISSION_ORDER_ALREADY_APPROVED", "CUSTOM_SUBMISSION_ORDER_CLOSED"].includes(String(error?.code || ""))) throw error;
+      customOrderId = null;
+    }
+  }
+  const submissionId = `cs_${crypto.createHash("sha256").update(`${event.agencyId}\n${sourceKey}`).digest("hex")}`;
+  let row;
+  try {
+    row = await client.customContentSubmission.create({ data: {
+      id: submissionId,
+      agencyId: event.agencyId,
+      creatorId: event.creatorId,
+      customOrderId,
+      telegramMessageIds: [Number(event.messageId)],
+      telegramInboundEventIds: [String(event.id)],
+      telegramSourceKey: sourceKey,
+      telegramSourceAccountId: String(event.accountId),
+      telegramSourceUserId: String(event.senderTelegramUserId),
+      ofMediaIds: [],
+      comment: commentText(event.text),
+      receivedAt: event.sentAt || now,
+    } });
+  } catch (error) {
+    if (String(error?.code || "") !== "P2002") throw error;
+    const raced = await client.customContentSubmission.findFirst({ where: { telegramSourceKey: sourceKey } });
+    if (!raced) throw error;
+    // A concurrent member of the same Telegram album may have won the sourceKey create.
+    // Re-enter the canonical merge while this event is still unassigned so its message/event
+    // identity is annexed with freshness ordering instead of being silently marked consumed.
+    return createCustomContentSubmissionFromInboundEvent({ eventId: event.id, actorUserId, now, db: client, _sourceLockHeld });
+  }
+  const assigned = await client.telegramInboundEvent.updateMany({ where: { id: event.id, submissionId: null }, data: { submissionId: row.id } });
+  if (Number(assigned?.count || 0) !== 1) {
+    const freshEvent = await client.telegramInboundEvent.findFirst({ where: { id: event.id } });
+    if (freshEvent?.submissionId && freshEvent.submissionId !== row.id) throw fail("CUSTOM_SUBMISSION_INBOUND_EVENT_REUSED", "Telegram inbound event already belongs to another submission", 409);
+  }
+  await audit({ agencyId: event.agencyId, actorUserId, action: "custom_content_submission.create_from_telegram_inbound", targetType: "CustomContentSubmission", targetId: row.id, metadata: { creatorId: row.creatorId, customOrderId: row.customOrderId || null, telegramInboundEventId: event.id, telegramMessageId: Number(event.messageId), sourceKey }, db: client });
+  return { ok: true, deduped: false, submission: serializeSubmission(row), sourceEventId: event.id };
 }
 
 async function listCustomContentSubmissions({ agencyId, member, creatorId, customOrderId = undefined, unassigned = false, limit = 100, offset = 0, db = null } = {}) {
@@ -281,11 +441,15 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, db: client });
   let updated;
   try {
-    updated = await client.customContentSubmission.update({ where: { id: row.id }, data: { customOrderId: normalizedOrderId } });
+    const changed = await client.customContentSubmission.updateMany({
+      where: { id: row.id, agencyId, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
+      data: { customOrderId: normalizedOrderId },
+    });
+    if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_ASSIGNMENT_STALE", "Submission assignment changed while this manager action was being applied", 409);
+    updated = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
+    if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared during reassignment", 404);
   } catch (error) {
-    if (error?.code === "P2002") {
-      throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "Another content submission is already awaiting manager review for this custom order", 409);
-    }
+    if (error?.code === "P2002") throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "Another content submission is already awaiting manager review for this custom order", 409);
     throw error;
   }
   await audit({
@@ -314,7 +478,7 @@ async function pendingUploadRows({ agencyId, creatorIds, limit, db }) {
   if (typeof db.$queryRawUnsafe === "function") {
     const placeholders = ids.map((_, index) => `$${index + 2}`).join(",");
     return db.$queryRawUnsafe(
-      `SELECT "id", "agencyId", "creatorId", "customOrderId", "telegramMessageIds", "ofMediaIds", "comment", "receivedAt", "createdAt", "updatedAt"
+      `SELECT "id", "agencyId", "creatorId", "customOrderId", "telegramMessageIds", "telegramInboundEventIds", "telegramSourceKey", "telegramSourceAccountId", "telegramSourceUserId", "ofMediaIds", "comment", "receivedAt", "createdAt", "updatedAt"
        FROM "CustomContentSubmission"
        WHERE "agencyId" = $1
          AND "creatorId" IN (${placeholders})
@@ -343,7 +507,7 @@ async function pendingFinalizeRows({ agencyId, creatorIds, limit, db }) {
     const placeholders = ids.map((_, index) => `$${index + 2}`).join(",");
     return db.$queryRawUnsafe(
       `SELECT submission."id", submission."agencyId", submission."creatorId", submission."customOrderId",
-              submission."telegramMessageIds", submission."ofMediaIds", submission."comment",
+              submission."telegramMessageIds", submission."telegramSourceAccountId", submission."telegramSourceUserId", submission."ofMediaIds", submission."comment",
               submission."receivedAt", submission."createdAt", submission."updatedAt"
        FROM "CustomContentSubmission" AS submission
        LEFT JOIN "CustomOrder" AS custom_order ON custom_order."id" = submission."customOrderId"
@@ -419,46 +583,64 @@ async function pendingFinalizeRows({ agencyId, creatorIds, limit, db }) {
  * no extra claim/status/device fields are persisted for upload execution.
  */
 
-async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, deviceId, submissionId, expectedIndex, accessEpoch = null, now = new Date(), db = null } = {}) {
+async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, deviceId, submissionId, expectedIndex, expectedTelegramMessageId, accessEpoch = null, now = new Date(), db = null, reserveWrite = null } = {}) {
   if (!agencyId || !member?.id || !member?.userId) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
   const id = identifier(submissionId, "submissionId", { max: 180 });
   const index = Number(expectedIndex);
   if (!Number.isInteger(index) || index < 0) throw fail("CUSTOM_SUBMISSION_UPLOAD_INDEX_INVALID", "expectedIndex must be a non-negative integer", 400);
-  const row = await client.customContentSubmission.findFirst({ where: { id, agencyId } });
-  if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
-  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
-  const nextIndex = nextUploadIndex(row);
-  if (nextIndex === null) throw fail("CUSTOM_SUBMISSION_UPLOAD_ALREADY_COMPLETE", "Content submission already has all OnlyFans media ids", 409);
-  if (nextIndex !== index) throw fail("CUSTOM_SUBMISSION_UPLOAD_WORK_STALE", `Expected upload index ${nextIndex}, not ${index}`, 409);
-  const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.map(String) : [];
-  const telegramMessageId = String(telegramIds[index] || "").trim();
-  if (!telegramMessageId) throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_MISSING", "Submission upload index has no Telegram source message", 409);
-  const recipientRow = await client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null);
-  const recipient = String(recipientRow?.value || "").trim().replace(/^@+/, "");
-  if (!recipient) throw fail("CUSTOM_SUBMISSION_VAULT_RECIPIENT_REQUIRED", "Vault upload recipient is not configured", 409);
-  const payloadFingerprint = crypto.createHash("sha256").update(JSON.stringify({
-    version: 1, agencyId, creatorId: String(row.creatorId), submissionId: id, expectedIndex: index, telegramMessageId, recipient,
-  })).digest("hex");
-  const { reserveProgrammaticWrite } = require("./programmatic-of-write-authority-service");
-  const authority = await reserveProgrammaticWrite({
-    agencyId,
-    userId: String(member.userId),
-    memberId: String(member.id),
-    accessEpoch: Number.isInteger(Number(accessEpoch)) ? Number(accessEpoch) : Number(member.accessEpoch || 0),
-    creatorId: String(row.creatorId),
-    deviceId: normalizedDeviceId,
-    kind: "CUSTOM_RELAY_SEND",
-    idempotencyKey: `custom-relay:${id}:${index}`,
-    payloadFingerprint,
-    payload: { submissionId: id, expectedIndex: index, telegramMessageId, recipient, reservedForCustomUploadAt: new Date(now).toISOString() },
-    targetId: `${id}:${index}`,
-    permissionKeyOverride: null,
-    leaseMs: 10 * 60_000,
-    maxAttempts: 20,
-  });
-  return { ...authority, relayRecipient: recipient, submissionId: id, expectedIndex: index };
+  const expectedSourceId = String(expectedTelegramMessageId == null ? "" : expectedTelegramMessageId).trim();
+  if (!/^[1-9]\d{0,9}$/.test(expectedSourceId) || Number(expectedSourceId) > MAX_TELEGRAM_MESSAGE_ID) {
+    throw fail("CUSTOM_SUBMISSION_UPLOAD_SOURCE_REQUIRED", "expectedTelegramMessageId must be the Telegram source id from the claimed upload work", 400);
+  }
+
+  return withSubmissionSourceLock({ db: client, agencyId, submissionId: id, work: async (lockedClient) => {
+    const row = await lockedClient.customContentSubmission.findFirst({ where: { id, agencyId } });
+    if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+    await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: lockedClient });
+    const nextIndex = nextUploadIndex(row);
+    if (nextIndex === null) throw fail("CUSTOM_SUBMISSION_UPLOAD_ALREADY_COMPLETE", "Content submission already has all OnlyFans media ids", 409);
+    if (nextIndex !== index) throw fail("CUSTOM_SUBMISSION_UPLOAD_WORK_STALE", `Expected upload index ${nextIndex}, not ${index}`, 409);
+    const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.map(String) : [];
+    const telegramMessageId = String(telegramIds[index] || "").trim();
+    if (!telegramMessageId) throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_MISSING", "Submission upload index has no Telegram source message", 409);
+    if (telegramMessageId !== expectedSourceId) {
+      throw fail("CUSTOM_SUBMISSION_UPLOAD_WORK_STALE", `Telegram source at upload index ${index} changed from ${expectedSourceId} to ${telegramMessageId}`, 409);
+    }
+    const telegramSourceAccountId = String(row.telegramSourceAccountId || "").trim();
+    const telegramSourceUserId = String(row.telegramSourceUserId || "").trim();
+    if (!telegramSourceAccountId || !/^\d{1,20}$/.test(telegramSourceUserId)) {
+      throw fail("CUSTOM_SUBMISSION_SOURCE_IDENTITY_REQUIRED", "Submission has no pinned Telegram source account/user identity", 409);
+    }
+    const recipientRow = await lockedClient.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null);
+    const recipient = String(recipientRow?.value || "").trim().replace(/^@+/, "");
+    if (!recipient) throw fail("CUSTOM_SUBMISSION_VAULT_RECIPIENT_REQUIRED", "Vault upload recipient is not configured", 409);
+    const payloadFingerprint = crypto.createHash("sha256").update(JSON.stringify({
+      version: 2, agencyId, creatorId: String(row.creatorId), submissionId: id, expectedIndex: index,
+      telegramSourceAccountId, telegramSourceUserId, telegramMessageId, recipient,
+    })).digest("hex");
+    const reserveProgrammaticWrite = typeof reserveWrite === "function"
+      ? reserveWrite
+      : require("./programmatic-of-write-authority-service").reserveProgrammaticWrite;
+    const authority = await reserveProgrammaticWrite({
+      agencyId,
+      userId: String(member.userId),
+      memberId: String(member.id),
+      accessEpoch: Number.isInteger(Number(accessEpoch)) ? Number(accessEpoch) : Number(member.accessEpoch || 0),
+      creatorId: String(row.creatorId),
+      deviceId: normalizedDeviceId,
+      kind: "CUSTOM_RELAY_SEND",
+      idempotencyKey: `custom-relay:${id}:${index}`,
+      payloadFingerprint,
+      payload: { submissionId: id, expectedIndex: index, telegramSourceAccountId, telegramSourceUserId, telegramMessageId, recipient, reservedForCustomUploadAt: new Date(now).toISOString() },
+      targetId: `${id}:${index}`,
+      permissionKeyOverride: null,
+      leaseMs: 10 * 60_000,
+      maxAttempts: 20,
+    });
+    return { ...authority, relayRecipient: recipient, submissionId: id, expectedIndex: index, telegramSourceAccountId, telegramSourceUserId, telegramMessageId };
+  } });
 }
 
 
@@ -525,7 +707,7 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
   if (!requestedLeases.length) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
 
   const requestedByAccount = new Map(requestedLeases.map((row) => [row.accountId, row.claimToken]));
-  const [scope, leasedRows, accountRows, recipientRow] = await Promise.all([
+  const [scope, leasedRows, recipientRow] = await Promise.all([
     allowedCreatorScope({ agencyId, member, db: client }),
     client.agencyTelegramMtprotoAccount.findMany({
       where: {
@@ -544,7 +726,6 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
       },
       take: MAX_RUNTIME_LEASES,
     }),
-    client.agencyTelegramMtprotoAccount.findMany({ where: { agencyId }, select: { id: true }, orderBy: { id: "asc" }, take: 2 }),
     client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null),
   ]);
   const currentUserId = String(member.userId || "");
@@ -582,30 +763,21 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
     };
   }
 
-  const singleAccountId = accountRows.length === 1 ? String(accountRows[0].id) : null;
-  const singleAccountOwned = Boolean(singleAccountId && validAccountIds.has(singleAccountId));
   const creatorWhere = {
     agencyId,
     deletedAt: null,
     telegramContact: { not: null },
     customsVaultFolderId: { not: null },
     ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
-    ...(singleAccountOwned ? {} : { telegramAccountId: { in: [...validAccountIds] } }),
   };
   const creators = await client.creatorAccount.findMany({
     where: creatorWhere,
-    select: { id: true, username: true, telegramAccountId: true, customsVaultFolderId: true },
+    select: { id: true, username: true, customsVaultFolderId: true },
     take: 10_000,
   });
   if (!creators.length) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
 
-  const creatorById = new Map();
-  for (const creator of creators) {
-    const accountId = singleAccountOwned ? singleAccountId : String(creator.telegramAccountId || "").trim();
-    if (!accountId || !validAccountIds.has(accountId)) continue;
-    creatorById.set(String(creator.id), { ...creator, accountId });
-  }
-  if (!creatorById.size) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
+  const creatorById = new Map(creators.map((creator) => [String(creator.id), creator]));
 
   const uploadRows = await pendingUploadRows({ agencyId, creatorIds: [...creatorById.keys()], limit: take, db: client });
   const items = [];
@@ -616,11 +788,18 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
     if (!creator || index === null) continue;
     const messageId = Number(row.telegramMessageIds?.[index]);
     if (!Number.isInteger(messageId) || messageId <= 0) continue;
+    const sourceAccountId = String(row.telegramSourceAccountId || "").trim();
+    const sourceUserId = String(row.telegramSourceUserId || "").trim();
+    if (!sourceAccountId || !/^\d{1,20}$/.test(sourceUserId)) {
+      return { ok: true, items: [], blocked: { code: "CUSTOM_SUBMISSION_SOURCE_IDENTITY_REQUIRED", message: "This submission has no pinned Telegram source account/user identity." }, serverNow: new Date(now).toISOString() };
+    }
+    if (!validAccountIds.has(sourceAccountId)) continue;
     items.push({
       kind: "UPLOAD_MEDIA",
       submission: serializeSubmission(row),
       creatorId: String(row.creatorId),
-      accountId: creator.accountId,
+      accountId: sourceAccountId,
+      telegramSourceUserId: sourceUserId,
       creatorUsername: creator.username || null,
       folderId: String(creator.customsVaultFolderId),
       recipient,
@@ -639,7 +818,7 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
         kind: "FINALIZE_LIBRARY",
         submission: serializeSubmission(row),
         creatorId: String(row.creatorId),
-        accountId: creator.accountId,
+        accountId: String(row.telegramSourceAccountId || ""),
         creatorUsername: creator.username || null,
         folderId: String(creator.customsVaultFolderId),
         recipient,
@@ -651,70 +830,76 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
   return { ok: true, items, blocked: null, serverNow: new Date(now).toISOString() };
 }
 
-async function commitCustomContentSubmissionMedia({ agencyId, member, submissionId, expectedIndex, mediaId, db = null } = {}) {
+async function assertCustomSubmissionTelegramSourceAccess({ agencyId, member, submissionId, creatorId, accountId, messageIds, db = null } = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  const normalizedSubmissionId = identifier(submissionId, "submissionId", { max: 180 });
+  const normalizedCreatorId = identifier(creatorId, "creatorId", { max: 100 });
+  const normalizedAccountId = identifier(accountId, "telegramAccountId", { max: 180 });
+  await requireCreatorAccess({ agencyId, member, creatorId: normalizedCreatorId, db: client });
+  const row = await client.customContentSubmission.findFirst({ where: { id: normalizedSubmissionId, agencyId, creatorId: normalizedCreatorId } });
+  if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  if (String(row.telegramSourceAccountId || "") !== normalizedAccountId) {
+    throw fail("CUSTOM_SUBMISSION_SOURCE_ACCOUNT_MISMATCH", "Telegram account does not match this submission source", 403);
+  }
+  const sourceUserId = telegramUserId(row.telegramSourceUserId, "telegramSourceUserId");
+  const pendingIndex = nextUploadIndex(row);
+  if (pendingIndex === null) throw fail("CUSTOM_SUBMISSION_SOURCE_READ_NOT_REQUIRED", "This submission has no pending Telegram source media", 409);
+  const requestedIds = telegramMessageIds(messageIds).map(String);
+  const pendingSourceIds = new Set((Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : []).slice(pendingIndex).map(String));
+  if (requestedIds.some((messageId) => !pendingSourceIds.has(messageId))) {
+    throw fail("CUSTOM_SUBMISSION_SOURCE_MESSAGE_MISMATCH", "Requested Telegram messages are not pending source messages of this submission", 403);
+  }
+  return { ok: true, submission: row, accountId: normalizedAccountId, telegramSourceUserId: sourceUserId, telegramMessageIds: requestedIds };
+}
+
+async function commitCustomContentSubmissionMedia({ agencyId, member, submissionId, expectedIndex, db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const normalizedSubmissionId = identifier(submissionId, "submissionId", { max: 180 });
   const index = Number(expectedIndex);
-  if (!Number.isInteger(index) || index < 0 || index >= MAX_TELEGRAM_MESSAGES) {
-    throw fail("CUSTOM_SUBMISSION_MEDIA_INDEX_INVALID", "expectedIndex must be a valid zero-based Telegram media index");
-  }
-  const normalizedMediaId = ofMediaId(mediaId);
+  if (!Number.isInteger(index) || index < 0 || index >= MAX_TELEGRAM_MESSAGES) throw fail("CUSTOM_SUBMISSION_MEDIA_INDEX_INVALID", "expectedIndex must be a valid zero-based Telegram media index");
   const row = await client.customContentSubmission.findFirst({ where: { id: normalizedSubmissionId, agencyId } });
   if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
   const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
   const current = ofMediaIds(row.ofMediaIds);
-  if (current.length > telegramIds.length) throw fail("CUSTOM_SUBMISSION_MEDIA_STATE_INVALID", "Submission has more OnlyFans media ids than Telegram source messages", 409);
   if (index >= telegramIds.length) throw fail("CUSTOM_SUBMISSION_MEDIA_INDEX_INVALID", "expectedIndex is outside this submission", 409);
-  if (index < current.length) {
-    if (current[index] === normalizedMediaId) {
-      return { ok: true, idempotent: true, completed: current.length === telegramIds.length, submission: serializeSubmission(row) };
-    }
-    throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT", "This submission position is already committed to a different OnlyFans media id", 409);
-  }
-  if (index !== current.length) {
-    throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_OUT_OF_ORDER", "OnlyFans media ids must be committed in Telegram message order", 409);
-  }
-  if (current.includes(normalizedMediaId)) {
-    throw fail("CUSTOM_SUBMISSION_MEDIA_ID_DUPLICATE", "This OnlyFans media id is already committed to another position in the submission", 409);
-  }
-  const next = [...current, normalizedMediaId];
-  const changed = await client.customContentSubmission.updateMany({
-    where: { id: row.id, agencyId, updatedAt: row.updatedAt },
-    data: { ofMediaIds: next },
+  const proof = await confirmedRelayResult({
+    agencyId, creatorId: row.creatorId, submissionId: row.id, expectedIndex: index,
+    expectedTelegramSourceAccountId: row.telegramSourceAccountId,
+    expectedTelegramSourceUserId: row.telegramSourceUserId,
+    expectedTelegramMessageId: telegramIds[index], db: client,
   });
+  const normalizedMediaId = proof.mediaId;
+  if (index < current.length) {
+    if (current[index] === normalizedMediaId) return { ok: true, idempotent: true, completed: current.length === telegramIds.length, proof: { writeId: proof.writeId }, submission: serializeSubmission(row) };
+    throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT", "Stored submission media disagrees with the confirmed CUSTOM_RELAY_SEND result", 409);
+  }
+  if (index !== current.length) throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_OUT_OF_ORDER", "OnlyFans media ids must be projected in Telegram message order", 409);
+  if (current.includes(normalizedMediaId)) throw fail("CUSTOM_SUBMISSION_MEDIA_ID_DUPLICATE", "Confirmed relay result reuses an OnlyFans media id already projected into this submission", 409);
+  const next = [...current, normalizedMediaId];
+  const changed = await client.customContentSubmission.updateMany({ where: { id: row.id, agencyId, updatedAt: row.updatedAt }, data: { ofMediaIds: next } });
   if (Number(changed?.count || 0) !== 1) {
-    const raced = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
-    const racedIds = ofMediaIds(raced?.ofMediaIds);
-    if (raced && racedIds[index] === normalizedMediaId) {
-      return { ok: true, idempotent: true, completed: racedIds.length === telegramIds.length, submission: serializeSubmission(raced) };
-    }
-    throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT", "Submission changed while the OnlyFans media id was being committed", 409);
+    const raced = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId } }); const racedIds = ofMediaIds(raced?.ofMediaIds);
+    if (raced && racedIds[index] === normalizedMediaId) return { ok: true, idempotent: true, completed: racedIds.length === telegramIds.length, proof: { writeId: proof.writeId }, submission: serializeSubmission(raced) };
+    throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT", "Submission changed while the proven relay result was being projected", 409);
   }
   const updated = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
-  if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after media commit", 404);
+  if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after media projection", 404);
   const completed = ofMediaIds(updated.ofMediaIds).length === telegramIds.length;
-  if (completed) {
-    await audit({
-      agencyId,
-      actorUserId: member.userId || null,
-      action: "custom_content_submission.of_upload_complete",
-      targetType: "CustomContentSubmission",
-      targetId: updated.id,
-      metadata: { creatorId: updated.creatorId, customOrderId: updated.customOrderId || null, mediaCount: telegramIds.length },
-      db: client,
-    });
-  }
-  return { ok: true, idempotent: false, completed, submission: serializeSubmission(updated) };
+  if (completed) await audit({ agencyId, actorUserId: member.userId || null, action: "custom_content_submission.of_upload_complete", targetType: "CustomContentSubmission", targetId: updated.id, metadata: { creatorId: updated.creatorId, customOrderId: updated.customOrderId || null, mediaCount: telegramIds.length, authority: "CUSTOM_RELAY_SEND_CONFIRMED" }, db: client });
+  return { ok: true, idempotent: false, completed, proof: { writeId: proof.writeId }, submission: serializeSubmission(updated) };
 }
 
 module.exports = {
   MAX_TELEGRAM_MESSAGES,
   assignCustomContentSubmission,
+  assertCustomSubmissionTelegramSourceAccess,
   claimCustomContentSubmissionUploadWork,
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
+  createCustomContentSubmissionFromInboundEvent,
   deterministicSubmissionId,
   listCustomContentSubmissions,
   nextUploadIndex,

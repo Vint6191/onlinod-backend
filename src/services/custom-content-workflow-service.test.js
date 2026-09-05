@@ -64,6 +64,19 @@ function fakeDb({ submissions = [], orders = [], assets = [] } = {}) {
         Object.assign(row, data, { updatedAt: new Date(now) });
         return row;
       },
+      updateMany: async ({ where, data }) => {
+        const row = submissions.find((item) => {
+          if (where.id && item.id !== where.id) return false;
+          if (where.agencyId && item.agencyId !== where.agencyId) return false;
+          if (where.reviewStatus && item.reviewStatus !== where.reviewStatus) return false;
+          if (Object.prototype.hasOwnProperty.call(where, "customOrderId") && (item.customOrderId || null) !== (where.customOrderId || null)) return false;
+          if (where.updatedAt && new Date(item.updatedAt).getTime() !== new Date(where.updatedAt).getTime()) return false;
+          return true;
+        });
+        if (!row) return { count: 0 };
+        Object.assign(row, data, { updatedAt: new Date(new Date(row.updatedAt).getTime() + 1) });
+        return { count: 1 };
+      },
     },
     customOrder: {
       findMany: async ({ where, take = 9999 }) => orders.filter((row) => {
