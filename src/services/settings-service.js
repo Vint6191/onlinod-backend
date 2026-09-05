@@ -595,65 +595,132 @@ async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, ses
   return { available: true, account: { ...account, sessionReady: Boolean(cleanSession) } };
 }
 
-async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = null }) {
+async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = null, now = new Date() }) {
   ensureTelegramManager(member);
   const id = String(accountId || "").trim();
   if (!id || id.length > 180) throw telegramInputError("Telegram connection id is required", "SETTINGS_TELEGRAM_ACCOUNT_INVALID");
   const client = db || prisma;
-  const existing = await client.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { id: true } });
-  if (!existing) {
-    const err = new Error("Telegram connection not found");
-    err.code = "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND";
-    err.status = 404;
-    throw err;
+  if (typeof client?.$transaction !== "function") {
+    throw Object.assign(new Error("Telegram connection retirement requires transactional storage"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_TRANSACTION_REQUIRED", status: 503 });
   }
-  const remove = async (tx) => {
+  const existing = await client.agencyTelegramMtprotoAccount.findFirst({
+    where: { id, agencyId },
+    select: { id: true, lifecycleState: true, retirementRequestedAt: true, retirementDrainCompletedAt: true, runtimeClaimedByDeviceId: true, runtimeClaimUntil: true, runtimeClaimGeneration: true, runtimeDrainedGeneration: true },
+  });
+  if (!existing) {
+    const err = new Error("Telegram connection not found"); err.code = "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND"; err.status = 404; throw err;
+  }
+
+  const assertNoBusinessBlockers = async (tx) => {
     const activeIntent = tx.telegramDeliveryIntent?.findFirst ? await tx.telegramDeliveryIntent.findFirst({
-      where: { agencyId, accountId: existing.id, state: { in: ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED", "FAILED_PRECOMMIT"] } },
+      where: { agencyId, accountId: id, state: { in: ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED", "FAILED_PRECOMMIT"] } },
       select: { id: true, kind: true, state: true },
     }) : null;
-    if (activeIntent) {
-      const err = new Error("Telegram connection is still required by an active or unresolved Custom delivery");
-      err.code = "SETTINGS_TELEGRAM_ACCOUNT_IN_USE"; err.status = 409;
-      throw err;
-    }
+    if (activeIntent) throw Object.assign(new Error("Telegram connection is still required by an active or unresolved Custom delivery"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
 
     if (tx.telegramDeliveryIntent?.findMany && tx.customOrder?.findFirst) {
-      const taskRows = await tx.telegramDeliveryIntent.findMany({
-        where: { agencyId, accountId: existing.id, kind: "TASK", state: "CONFIRMED" },
-        select: { customOrderId: true }, take: 1000,
-      });
+      const taskRows = await tx.telegramDeliveryIntent.findMany({ where: { agencyId, accountId: id, kind: "TASK", state: "CONFIRMED" }, select: { customOrderId: true }, take: 1000 });
       const orderIds = Array.from(new Set((taskRows || []).map((row) => String(row.customOrderId || "")).filter(Boolean)));
       if (orderIds.length) {
         const pendingOrder = await tx.customOrder.findFirst({ where: { agencyId, id: { in: orderIds }, status: "PENDING" }, select: { id: true } });
-        if (pendingOrder) {
-          const err = new Error("Telegram connection is still the canonical thread for a pending Custom order");
-          err.code = "SETTINGS_TELEGRAM_ACCOUNT_IN_USE"; err.status = 409;
-          throw err;
-        }
+        if (pendingOrder) throw Object.assign(new Error("Telegram connection is still the canonical thread for a pending Custom order"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
       }
     }
 
-    if (tx.customContentSubmission?.findFirst) {
-      const pendingSource = await tx.customContentSubmission.findFirst({
-        where: { agencyId, telegramSourceAccountId: existing.id, reviewStatus: { in: ["WAITING_REVIEW", "REVISION_REQUESTED"] } },
-        select: { id: true },
+    if (tx.customContentSubmission?.findMany) {
+      const sourceRows = await tx.customContentSubmission.findMany({
+        where: { agencyId, telegramSourceAccountId: id },
+        select: { id: true, telegramMessageIds: true, ofMediaIds: true },
       });
-      if (pendingSource) {
-        const err = new Error("Telegram connection is still required by pending Custom source media");
-        err.code = "SETTINGS_TELEGRAM_ACCOUNT_IN_USE"; err.status = 409;
-        throw err;
-      }
+      const pendingSource = (sourceRows || []).find((row) => {
+        const sourceCount = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.length : 0;
+        const mediaCount = Array.isArray(row.ofMediaIds) ? row.ofMediaIds.length : 0;
+        return sourceCount > mediaCount;
+      });
+      if (pendingSource) throw Object.assign(new Error("Telegram connection is still required by pending Custom source media"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
+    } else if (tx.customContentSubmission?.findFirst) {
+      // Compatibility for constrained test/rolling clients. Current Prisma uses the complete
+      // findMany path above so retirement follows actual pending source work, not review labels.
+      const pendingSource = await tx.customContentSubmission.findFirst({
+        where: { agencyId, telegramSourceAccountId: id, reviewStatus: { in: ["WAITING_REVIEW", "REVISION_REQUESTED"] } }, select: { id: true },
+      });
+      if (pendingSource) throw Object.assign(new Error("Telegram connection is still required by pending Custom source media"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
     }
 
-    await tx.creatorAccount.updateMany({ where: { agencyId, telegramAccountId: existing.id }, data: { telegramAccountId: null } });
-    await tx.agencyTelegramMtprotoAccount.delete({ where: { id: existing.id } });
+    if (tx.telegramInboundEvent?.findFirst) {
+      const unresolvedInbound = await tx.telegramInboundEvent.findFirst({
+        where: { agencyId, accountId: id, submissionId: null, projectionState: { in: ["PENDING", "FAILED_RETRYABLE", "REVIEW_REQUIRED"] } }, select: { id: true, projectionState: true },
+      });
+      if (unresolvedInbound) throw Object.assign(new Error("Telegram connection is still required by an unresolved inbound provider source"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
+    }
   };
-  if (typeof client.$transaction === "function") await client.$transaction((tx) => remove(tx));
-  else await remove(client);
-  return { ok: true };
-}
 
+  // ACTIVE -> RETIRING is serialized with new TelegramDeliveryIntent reservation on the
+  // same account row. The first no-op ACTIVE update acquires the row lock *before* the
+  // blocker scan. Therefore a racing planner either commits first and is observed here,
+  // or this transaction commits RETIRING first and the planner's ACTIVE fence fails.
+  if (String(existing.lifecycleState || "ACTIVE") === "ACTIVE") {
+    const beginRetirement = async (tx) => {
+      if (!tx.agencyTelegramMtprotoAccount?.updateMany) {
+        throw Object.assign(new Error("Telegram connection retirement fencing is unavailable"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_FENCE_UNAVAILABLE", status: 503 });
+      }
+      const locked = await tx.agencyTelegramMtprotoAccount.updateMany({
+        where: { id, agencyId, OR: [{ lifecycleState: "ACTIVE" }, { lifecycleState: null }] },
+        data: { lifecycleState: "ACTIVE" },
+      });
+      if (Number(locked?.count || 0) !== 1) {
+        const raced = await tx.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { lifecycleState: true } });
+        if (String(raced?.lifecycleState || "") === "RETIRING") return { alreadyRetiring: true };
+        throw Object.assign(new Error("Telegram connection retirement changed concurrently; retry"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_RACE", status: 409 });
+      }
+
+      // Must run after the account-row lock. A planner that won first has already created
+      // its durable intent by the time this query can proceed.
+      await assertNoBusinessBlockers(tx);
+      const current = await tx.agencyTelegramMtprotoAccount.findFirst({
+        where: { id, agencyId },
+        select: { runtimeClaimedByDeviceId: true, runtimeClaimGeneration: true, runtimeDrainedGeneration: true },
+      });
+      const claimGeneration = Math.max(0, Number(current?.runtimeClaimGeneration) || 0);
+      const drainedGeneration = Math.max(0, Number(current?.runtimeDrainedGeneration) || 0);
+      const latestRuntimeIsDurablyDrained = !current?.runtimeClaimedByDeviceId && claimGeneration === drainedGeneration;
+      const changed = await tx.agencyTelegramMtprotoAccount.updateMany({
+        where: { id, agencyId, lifecycleState: "ACTIVE", runtimeClaimGeneration: claimGeneration, runtimeDrainedGeneration: drainedGeneration },
+        data: {
+          lifecycleState: "RETIRING",
+          retirementRequestedAt: now,
+          // Only a drained release of the latest runtime generation proves the Desktop SQLite
+          // outbox is empty. Merely having no live TTL/current owner is not such a proof.
+          retirementDrainCompletedAt: latestRuntimeIsDurablyDrained ? now : null,
+        },
+      });
+      if (Number(changed?.count || 0) !== 1) throw Object.assign(new Error("Telegram connection retirement changed concurrently; retry"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_RACE", status: 409 });
+      return { alreadyRetiring: false };
+    };
+    await client.$transaction((tx) => beginRetirement(tx), { isolationLevel: "Serializable" });
+  }
+
+  const retire = async (tx) => {
+    const current = await tx.agencyTelegramMtprotoAccount.findFirst({
+      where: { id, agencyId },
+      select: { id: true, lifecycleState: true, retirementDrainCompletedAt: true, runtimeClaimedByDeviceId: true, runtimeClaimUntil: true, runtimeClaimGeneration: true, runtimeDrainedGeneration: true },
+    });
+    if (!current) return { deleted: true };
+    if (String(current.lifecycleState || "") !== "RETIRING") throw Object.assign(new Error("Telegram connection is not in retirement state"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_STATE_INVALID", status: 409 });
+    await assertNoBusinessBlockers(tx);
+    if (!current.retirementDrainCompletedAt) {
+      throw Object.assign(new Error("Telegram connection is retiring and still requires an explicit Desktop inbound-outbox drain"), { code: "SETTINGS_TELEGRAM_ACCOUNT_DRAIN_REQUIRED", status: 409 });
+    }
+    if (current.runtimeClaimedByDeviceId || (current.runtimeClaimUntil && new Date(current.runtimeClaimUntil).getTime() > now.getTime())) {
+      throw Object.assign(new Error("Telegram connection retirement drain has not released its runtime lease"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRING", status: 409 });
+    }
+    await tx.creatorAccount.updateMany({ where: { agencyId, telegramAccountId: id }, data: { telegramAccountId: null } });
+    await tx.agencyTelegramMtprotoAccount.delete({ where: { id } });
+    return { deleted: true };
+  };
+  await client.$transaction((tx) => retire(tx), { isolationLevel: "Serializable" });
+  return { ok: true, retired: true };
+}
 
 async function readTelegramMtprotoAccountSecret({ agencyId, accountId, db = null }) {
   const id = clean(accountId, 180);

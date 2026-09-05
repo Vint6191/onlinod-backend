@@ -38,7 +38,10 @@ test("F29 review-required lifecycle is routed through explicit queue and managem
   assert.match(inbound,/TELEGRAM_INBOUND_REVIEW_TRANSACTION_REQUIRED/,"human resolution must fail closed without transaction support");
   assert.match(inbound,/async function loadReviewCandidateOrders/);
   assert.match(inbound,/async function searchTelegramInboundReviewCandidates/);
-  assert.match(inbound,/proofState:\s*"PROVEN"/);
+  assert.match(inbound,/resolveTelegramCustomThread/);
+  assert.match(inbound,/authorizeTelegramInboundException/);
+  assert.match(inbound,/targetAllowedByThreadContext/);
+  assert.match(inbound,/proofState:\s*context\.type/, "F29 operational proof must expose the current typed thread resolution, not resurrect generic creator PROVEN state");
   assert.match(inbound,/take:\s*20/,"candidate lookup must be bounded per creator rather than globally starving scoped creators");
   assert.match(inbound,/PROJECTION_RETRYABLE_STATES\s*=\s*\["PENDING",\s*"FAILED_RETRYABLE"\]/);
 });

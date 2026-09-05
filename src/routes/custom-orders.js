@@ -45,6 +45,7 @@ const {
   replaceTelegramReferencePrecommit,
   cancelTelegramReferencePrecommit,
   getTelegramOrderContext,
+  listTelegramDeliveryReconciliationQueue,
   reconcileTelegramDeliveryIntent,
 } = require("../services/telegram-delivery-authority-service");
 const {
@@ -376,6 +377,14 @@ router.post("/telegram-inbound", async (req, res) => {
       hasMedia: req.body?.hasMedia === true, text: req.body?.text, sentAt: req.body?.sentAt, db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_ORDER_TELEGRAM_INBOUND_FAILED"); }
+});
+
+router.get("/telegram-deliveries/reconciliation-required", async (req, res) => {
+  try {
+    return res.json(await listTelegramDeliveryReconciliationQueue({
+      agencyId: req.auth.agencyId, member: req.auth.membership || req.member, limit: req.query.limit, db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "TELEGRAM_DELIVERY_RECONCILE_QUEUE_FAILED"); }
 });
 
 router.post("/telegram-deliveries/work", async (req, res) => {

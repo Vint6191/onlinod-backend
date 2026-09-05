@@ -11,6 +11,7 @@ const {
   confirmTelegramDeliveryIntent,
   markTelegramDeliveryUnknown,
   markTelegramDeliveryProvenNotSent,
+  listTelegramDeliveryReconciliationQueue,
   reconcileTelegramDeliveryIntent,
   replaceTelegramReferencePrecommit,
   cancelTelegramReferencePrecommit,
@@ -49,15 +50,16 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
   const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 7, deletedAt: null, deactivatedAt: null };
   const creators = [{ id: "creator-1", agencyId: "agency-1", displayName: "Model", username: "model", status: "READY", deletedAt: null, telegramContact: "@model", telegramUserId: "1001", telegramAccountId: "tg-1" }];
   const accounts = [
-    { id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "runtime-1", runtimeClaimUntil: new Date(now.getTime() + 60_000), runtimeLeaseUserId: member.userId, runtimeLeaseMemberId: member.id, runtimeLeaseAccessEpoch: member.accessEpoch, runtimeLeaseCreatorId: "creator-1" },
-    { id: "tg-2", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-2", runtimeClaimToken: "runtime-2", runtimeClaimUntil: new Date(now.getTime() + 60_000), runtimeLeaseUserId: member.userId, runtimeLeaseMemberId: member.id, runtimeLeaseAccessEpoch: member.accessEpoch, runtimeLeaseCreatorId: "creator-1" },
+    { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "runtime-1", runtimeClaimUntil: new Date(now.getTime() + 60_000), runtimeLeaseUserId: member.userId, runtimeLeaseMemberId: member.id, runtimeLeaseAccessEpoch: member.accessEpoch, runtimeLeaseCreatorId: "creator-1" },
+    { id: "tg-2", agencyId: "agency-1", lifecycleState: "ACTIVE", runtimeClaimedByDeviceId: "device-2", runtimeClaimToken: "runtime-2", runtimeClaimUntil: new Date(now.getTime() + 60_000), runtimeLeaseUserId: member.userId, runtimeLeaseMemberId: member.id, runtimeLeaseAccessEpoch: member.accessEpoch, runtimeLeaseCreatorId: "creator-1" },
   ];
   const orders = [{ id: "order-1", agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-1", scenario: "custom", type: "CONTENT", status: "PENDING", telegramTaskMessageId: null, telegramReferenceMessageIds: [], deliveredAt: null, lastReminderAt: null, lastReminderKey: null, nextReminderAt: null, reminderConfig: null, createdAt: new Date(now.getTime() - 60_000), updatedAt: new Date(now.getTime() - 60_000), creator: creators[0] }];
   const intents = [];
   const inboundEvents = [];
+  const audits = [];
   let seq = 0;
   const db = {
-    _member: member, _creators: creators, _accounts: accounts, _orders: orders, _intents: intents, _inboundEvents: inboundEvents, _workspaceSettingValue: null,
+    _member: member, _creators: creators, _accounts: accounts, _orders: orders, _intents: intents, _inboundEvents: inboundEvents, _audits: audits, _workspaceSettingValue: null,
     agencyMember: { async findFirst({ where }) { return matches(member, where) ? clone(member) : null; } },
     creatorAccount: {
       async findFirst({ where }) { return clone(creators.find((r) => matches(r, where)) || null); },
@@ -103,7 +105,7 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
         return { count };
       },
     },
-    auditLog: { async create({ data }) { return { id: `audit-${Date.now()}`, ...clone(data) }; } },
+    auditLog: { async create({ data }) { const row={ id: `audit-${audits.length+1}`, ...clone(data) }; audits.push(row); return clone(row); } },
     async $transaction(fn) { return fn(this); },
   };
   return { db, member, now, orders, intents, inboundEvents, accounts, creators };
@@ -485,6 +487,75 @@ test("manual reconciliation can confirm an unresolved provider receipt and prese
 
 
 
+
+
+test("RECONCILE_REQUIRED appears in the manager queue and manual resolution requires an explicit reason", async () => {
+  const fx = dbFixture(); const flow = await taskToCommitting(fx);
+  await markTelegramDeliveryUnknown({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, deviceId: "device-1", claimToken: flow.claimed.claimToken, reason: "provider outcome unknown", now: fx.now, db: fx.db });
+  const queue = await listTelegramDeliveryReconciliationQueue({ agencyId: "agency-1", member: fx.member, limit: 20, db: fx.db });
+  assert.equal(queue.items.length, 1);
+  assert.equal(queue.items[0].id, flow.planned.intent.id);
+  assert.equal(queue.items[0].state, "RECONCILE_REQUIRED");
+  assert.equal(queue.items[0].customOrder?.customOrderId, "order-1");
+  assert.equal(queue.items[0].creator?.id, "creator-1");
+  assert.equal(queue.canResolve, true);
+  await assert.rejects(
+    () => reconcileTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, resolution: "CONFIRMED", remoteMessageId: 504, remoteRecipientTelegramUserId: "900001", reason: "", now: fx.now, db: fx.db }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_RECONCILE_REASON_REQUIRED",
+  );
+});
+
+test("broad manager can resolve an outbound RECONCILE_REQUIRED after the historical creator is soft-deleted", async () => {
+  const fx = dbFixture(); const flow = await taskToCommitting(fx);
+  await markTelegramDeliveryUnknown({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, deviceId: "device-1", claimToken: flow.claimed.claimToken, reason: "provider outcome unknown", now: fx.now, db: fx.db });
+  fx.creators[0].deletedAt = new Date(fx.now);
+  const queue = await listTelegramDeliveryReconciliationQueue({ agencyId: "agency-1", member: fx.member, limit: 20, db: fx.db });
+  assert.equal(queue.items.length, 1, "historical exception must remain visible to a broad manager after creator deletion");
+  const resolved = await reconcileTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, resolution: "PROVEN_NOT_SENT", reason: "verified no Telegram message exists", now: fx.now, db: fx.db });
+  assert.equal(resolved.intent.state, "PLANNED");
+  assert.match(String(resolved.intent.outcomeReason || ""), /^PROVEN_NOT_SENT:/);
+  assert.ok(fx.db._audits.some((row) => row.action === "custom_order.telegram_delivery_manual_reconcile_not_sent"));
+});
+
+test("manual reconciliation audit failure rolls back the reconciliation decision and provider projection", async () => {
+  const fx = dbFixture(); const flow = await taskToCommitting(fx);
+  await markTelegramDeliveryUnknown({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, deviceId: "device-1", claimToken: flow.claimed.claimToken, reason: "provider outcome unknown", now: fx.now, db: fx.db });
+  const originalTransaction = fx.db.$transaction.bind(fx.db);
+  fx.db.$transaction = async (fn) => {
+    const intentsSnapshot = clone(fx.intents);
+    const ordersSnapshot = clone(fx.orders);
+    const auditsSnapshot = clone(fx.db._audits);
+    try { return await originalTransaction(fn); }
+    catch (error) {
+      fx.intents.splice(0, fx.intents.length, ...intentsSnapshot);
+      fx.orders.splice(0, fx.orders.length, ...ordersSnapshot);
+      fx.db._audits.splice(0, fx.db._audits.length, ...auditsSnapshot);
+      throw error;
+    }
+  };
+  fx.db.auditLog.create = async () => { throw new Error("audit storage unavailable"); };
+  await assert.rejects(
+    () => reconcileTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, resolution: "CONFIRMED", remoteMessageId: 504, remoteRecipientTelegramUserId: "900001", reason: "verified manually", now: fx.now, db: fx.db }),
+    /audit storage unavailable/,
+  );
+  assert.equal(fx.intents.find((row) => row.id === flow.planned.intent.id)?.state, "RECONCILE_REQUIRED");
+  assert.equal(fx.orders[0].telegramTaskMessageId, null, "required audit failure must roll back the manual provider projection too");
+});
+
+test("manual reconciliation cannot create duplicate canonical outgoing account/message receipt identity", async () => {
+  const fx = dbFixture(); const flow = await taskToCommitting(fx);
+  await markTelegramDeliveryUnknown({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, deviceId: "device-1", claimToken: flow.claimed.claimToken, reason: "provider outcome unknown", now: fx.now, db: fx.db });
+  fx.intents.push({
+    id: "other-confirmed", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-other", accountId: "tg-1", kind: "TASK", logicalKey: "other", payloadFingerprint: "other", payload: {},
+    state: "CONFIRMED", claimRevision: 1, remoteMessageId: 777, remoteRecipientTelegramUserId: "900001", remoteSentAt: fx.now, confirmedAt: fx.now, confirmationAuthority: "PROVIDER_RECEIPT", createdAt: fx.now, updatedAt: fx.now,
+  });
+  await assert.rejects(
+    () => reconcileTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, resolution: "CONFIRMED", remoteMessageId: 777, remoteRecipientTelegramUserId: "900001", reason: "verified manually", now: fx.now, db: fx.db }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_REMOTE_MESSAGE_CONFLICT" && error?.status === 409,
+  );
+  assert.equal(fx.intents.find((row) => row.id === flow.planned.intent.id)?.state, "RECONCILE_REQUIRED");
+});
+
 test("TASK settling after order cancellation durably plans a CANCELLATION instead of losing the model notification", async () => {
   const fx = dbFixture(); const flow = await taskToCommitting(fx);
   // Cancellation happens after the external commit permit. The in-flight TASK must settle,
@@ -567,6 +638,10 @@ test("inbound observed before provider receipt is re-correlated after late CONFI
     text: "received",
     hasMedia: false,
     mediaKind: null,
+    projectionState: "PENDING",
+    projectionReason: "CREATOR_UNRESOLVED",
+    projectionAttempts: 1,
+    projectedAt: null,
     sentAt,
     observedAt: sentAt,
     createdAt: sentAt,

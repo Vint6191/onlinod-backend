@@ -132,6 +132,9 @@ function fakeDb(seed = {}) {
         return { value: workspaceSettings.get(key) };
       },
     },
+    telegramDeliveryIntent: {
+      async findMany() { return []; },
+    },
     customOrder: {
       async findFirst({ where, select = null }) {
         const row = orders.find((candidate) =>
@@ -211,7 +214,25 @@ function fakeDb(seed = {}) {
       },
     },
     telegramInboundEvent: {
-      async findFirst({ where }) { return clone(inboundEvents.find((row) => (!where.id || row.id === where.id)) || null); },
+      async findFirst({ where = {} }) {
+        const row = inboundEvents.find((candidate) => {
+          if (where.id !== undefined && candidate.id !== where.id) return false;
+          if (where.agencyId !== undefined && candidate.agencyId !== where.agencyId) return false;
+          if (where.accountId !== undefined && candidate.accountId !== where.accountId) return false;
+          if (where.senderTelegramUserId !== undefined && String(candidate.senderTelegramUserId) !== String(where.senderTelegramUserId)) return false;
+          if (where.messageId !== undefined && Number(candidate.messageId) !== Number(where.messageId)) return false;
+          return true;
+        });
+        return clone(row || null);
+      },
+      async create({ data }) {
+        if (inboundEvents.some((row) => row.id === data.id || (row.agencyId === data.agencyId && row.accountId === data.accountId && String(row.senderTelegramUserId) === String(data.senderTelegramUserId) && Number(row.messageId) === Number(data.messageId)))) {
+          const error = new Error("duplicate provider source"); error.code = "P2002"; throw error;
+        }
+        const row = { submissionId: null, createdAt: new Date(), updatedAt: new Date(), ...clone(data) };
+        inboundEvents.push(row);
+        return clone(row);
+      },
       async findMany({ where, orderBy = [] }) {
         const ids = where?.id?.in || [];
         const rows = inboundEvents.filter((row) => !ids.length || ids.includes(row.id));
@@ -338,23 +359,24 @@ test("submission message ids are compact, positive, de-duplicated facts", () => 
   assert.throws(() => telegramMessageIds([]), /at least one/i);
   assert.throws(() => telegramMessageIds([0]), /positive/i);
   assert.equal(
-    deterministicSubmissionId("agency-1", "creator-1", "tg-1", "987654321012345678", [102, 101]),
-    deterministicSubmissionId("agency-1", "creator-1", "tg-1", "987654321012345678", [101, 102, 101]),
+    deterministicSubmissionId("agency-1", "tg-1", "987654321012345678", [102, 101]),
+    deterministicSubmissionId("agency-1", "tg-1", "987654321012345678", [101, 102, 101]),
     "the row id itself is the compact exact-retry fence",
   );
-  assert.notEqual(
-    deterministicSubmissionId("agency-1", "creator-1", "tg-1", "987654321012345678", [101]),
-    deterministicSubmissionId("agency-1", "creator-2", "tg-1", "987654321012345678", [101]),
+  assert.equal(
+    deterministicSubmissionId("agency-1", "tg-1", "987654321012345678", [101]),
+    deterministicSubmissionId("agency-1", "tg-1", "987654321012345678", [101]),
+    "provider ownership is independent of the requested creator",
   );
   assert.notEqual(
-    deterministicSubmissionId("agency-1", "creator-1", "tg-1", "987654321012345678", [101]),
-    deterministicSubmissionId("agency-1", "creator-1", "tg-1", "987654321012345679", [101]),
+    deterministicSubmissionId("agency-1", "tg-1", "987654321012345678", [101]),
+    deterministicSubmissionId("agency-1", "tg-1", "987654321012345679", [101]),
     "Telegram message ids are namespaced by both account and provider user",
   );
 });
 
 test("create stores one compact submission row and exact retries are idempotent", async () => {
-  const db = fakeDb();
+  const db = withTransactionalRollback(fakeDb());
   const first = await createCustomContentSubmission({
     agencyId: "agency-1", member, db,
     input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [501, 502, 501], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", comment: "  second angle  ", manualImportReason: "operator recovery", receivedAt: "2026-08-21T11:00:00.000Z" },
@@ -363,7 +385,7 @@ test("create stores one compact submission row and exact retries are idempotent"
   assert.deepEqual(first.submission.telegramMessageIds, ["501", "502"]);
   assert.deepEqual(first.submission.ofMediaIds, []);
   assert.equal(first.submission.comment, "second angle");
-  assert.equal(first.submission.intakeAuthority, "MANUAL_IMPORT");
+  assert.equal(first.submission.intakeAuthority, "MANUAL_HISTORICAL_IMPORT");
   assert.equal(first.submission.telegramSourceAccountId, "tg-1");
   assert.equal(first.submission.telegramSourceUserId, "987654321012345678");
   assert.equal(db._submissions.length, 1);
@@ -380,12 +402,12 @@ test("create stores one compact submission row and exact retries are idempotent"
 
 
 test("exact manual-import retry cannot silently change the CustomOrder assignment", async () => {
-  const db = fakeDb({
+  const db = withTransactionalRollback(fakeDb({
     orders: [
       { id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", scenario: "custom one", priceCents: 6000 },
       { id: "custom-alt", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", scenario: "custom alt", priceCents: 6500 },
     ],
-  });
+  }));
   const input = { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [551], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" };
   const first = await createCustomContentSubmission({ agencyId: "agency-1", member, db, input });
   assert.equal(first.submission.customOrderId, "custom-1");
@@ -434,7 +456,7 @@ test("customs source read is pinned to exact account + provider user and only wh
 });
 
 test("partial Telegram overlap is rejected instead of silently duplicating media", async () => {
-  const db = fakeDb({ submissions: [baseSubmission()] });
+  const db = withTransactionalRollback(fakeDb({ submissions: [baseSubmission()] }));
   await assert.rejects(
     () => createCustomContentSubmission({ agencyId: "agency-1", member, db, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [102, 103], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
     (error) => error?.code === "CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT" && error?.status === 409,
@@ -724,20 +746,20 @@ test("V20.4 does not requeue a submission whose typed Content Library provenance
 
 test("V20.9 transport-neutral intake allows a new assigned version only after explicit revision request", async () => {
   const waiting = baseSubmission({ id: "v1-waiting", telegramMessageIds: [1001], customOrderId: "custom-1", reviewStatus: "WAITING_REVIEW" });
-  const dbBusy = fakeDb({ submissions: [waiting] });
+  const dbBusy = withTransactionalRollback(fakeDb({ submissions: [waiting] }));
   await assert.rejects(
     () => createCustomContentSubmission({ agencyId: "agency-1", member, db: dbBusy, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1002], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ORDER_BUSY" && error?.status === 409,
   );
 
   const revision = baseSubmission({ id: "v1-revision", telegramMessageIds: [1101], customOrderId: "custom-1", reviewStatus: "REVISION_REQUESTED", reviewComment: "Redo ending", reviewedAt: new Date("2026-08-21T11:00:00.000Z") });
-  const dbRevision = fakeDb({ submissions: [revision] });
+  const dbRevision = withTransactionalRollback(fakeDb({ submissions: [revision] }));
   const next = await createCustomContentSubmission({ agencyId: "agency-1", member, db: dbRevision, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1102], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } });
   assert.equal(next.deduped, false);
   assert.equal(next.submission.customOrderId, "custom-1");
 
   const approved = baseSubmission({ id: "v1-approved", telegramMessageIds: [1201], customOrderId: "custom-1", reviewStatus: "APPROVED", reviewedAt: new Date("2026-08-21T11:00:00.000Z") });
-  const dbApproved = fakeDb({ submissions: [approved] });
+  const dbApproved = withTransactionalRollback(fakeDb({ submissions: [approved] }));
   await assert.rejects(
     () => createCustomContentSubmission({ agencyId: "agency-1", member, db: dbApproved, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1202], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ORDER_ALREADY_APPROVED" && error?.status === 409,
@@ -766,7 +788,7 @@ test("concurrent members of one Telegram album merge into the winning submission
   assert.deepEqual(result.submission.telegramMessageIds, ["701", "702"]);
   assert.deepEqual(result.submission.telegramInboundEventIds, ["event-a", "event-b"]);
   assert.equal(db._inboundEvents.find((row) => row.id === "event-b").submissionId, result.submission.id);
-  assert.equal(result.submission.intakeAuthority, "PROVEN_TELEGRAM_INBOUND");
+  assert.equal(result.submission.intakeAuthority, "PROVIDER_ACTIVE_THREAD");
 });
 
 
@@ -936,4 +958,141 @@ test("two manager reassignments from the same submission revision cannot both wi
   const rejected = [a, b].filter((row) => row.status === "rejected");
   assert.equal(fulfilled.length, 1); assert.equal(rejected.length, 1);
   assert.equal(rejected[0].reason?.code, "CUSTOM_SUBMISSION_ASSIGNMENT_STALE");
+});
+
+test("manual historical import cannot cross a current active Telegram thread that belongs to another creator", async () => {
+  const db = withTransactionalRollback(fakeDb());
+  db.telegramDeliveryIntent.findMany = async ({ where }) => {
+    if (where.kind !== "TASK" || where.accountId !== "tg-1" || String(where.remoteRecipientTelegramUserId) !== "987654321012345678") return [];
+    return [{ id: "task-thread-b", agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-2", customOrderId: "custom-2", kind: "TASK", state: "CONFIRMED", remoteMessageId: 901, remoteRecipientTelegramUserId: "987654321012345678", confirmationAuthority: "PROVIDER_RECEIPT", remoteSentAt: new Date("2026-09-05T10:00:00.000Z"), confirmedAt: new Date("2026-09-05T10:00:01.000Z") }];
+  };
+  db.customOrder.findMany = async ({ where }) => db._orders.filter((row) => row.agencyId === where.agencyId && where.id?.in?.includes(row.id) && String(row.status || "PENDING") === String(where.status || row.status || "PENDING")).map(clone);
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1", member, db,
+      input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [901], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery", receivedAt: "2026-09-05T10:00:02.000Z" },
+    }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_MANUAL_IMPORT_THREAD_CONFLICT" && error?.status === 409,
+  );
+  assert.equal(db._submissions.length, 0);
+  assert.equal(db._inboundEvents.length, 0);
+  assert.equal(db._orders.find((row) => row.id === "custom-1").contentBoundAt, null);
+});
+
+test("automatic inbound exception cannot be adjudicated through the separate manual historical import path", async () => {
+  const db = withTransactionalRollback(fakeDb({ inboundEvents: [{
+    id: "tgi-existing-auto", agencyId: "agency-1", accountId: "tg-1", creatorId: null, customOrderId: null, submissionId: null,
+    senderTelegramUserId: "987654321012345678", messageId: 909, replyToMessageId: null, groupedId: null, hasMedia: true, text: "provider media",
+    sentAt: new Date("2026-09-05T09:00:00.000Z"), observedAt: new Date("2026-09-05T09:00:01.000Z"),
+    projectionState: "REVIEW_REQUIRED", projectionReason: "AMBIGUOUS_ACTIVE_THREADS", intakeAuthority: "PROVIDER_OBSERVATION",
+    threadResolutionType: "AMBIGUOUS_ACTIVE_THREADS", resolutionAuthority: null, createdAt: new Date(), updatedAt: new Date(),
+  }] }));
+  // Match the real canonical provider key used by the service.
+  const canonicalId = require("./custom-telegram-thread-authority-service").providerMessageEventId({ agencyId: "agency-1", accountId: "tg-1", senderTelegramUserId: "987654321012345678", messageId: 909 });
+  db._inboundEvents[0].id = canonicalId;
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1", member, db,
+      input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [909], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "try to bypass review queue" },
+    }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_PROVIDER_EVENT_EXISTS" && error?.status === 409,
+  );
+  assert.equal(db._submissions.length, 0);
+  assert.equal(db._inboundEvents[0].submissionId, null);
+  assert.equal(db._inboundEvents[0].projectionState, "REVIEW_REQUIRED");
+  assert.equal(db._orders.find((row) => row.id === "custom-1").contentBoundAt, null);
+});
+
+test("the same provider message manually claimed for creator A cannot acquire a second owner through creator B", async () => {
+  const broad = { ...member, role: "OWNER", roleKey: "owner", assignedCreators: "all" };
+  const db = withTransactionalRollback(fakeDb());
+  const source = { telegramMessageIds: [902], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" };
+  const first = await createCustomContentSubmission({ agencyId: "agency-1", member: broad, db, input: { creatorId: "creator-1", customOrderId: "custom-1", ...source } });
+  await assert.rejects(
+    () => createCustomContentSubmission({ agencyId: "agency-1", member: broad, db, input: { creatorId: "creator-2", customOrderId: "custom-2", ...source } }),
+    (error) => ["CUSTOM_SUBMISSION_MANUAL_IMPORT_TARGET_CONFLICT", "CUSTOM_SUBMISSION_PROVIDER_SOURCE_OWNED", "CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT"].includes(error?.code) && error?.status === 409,
+  );
+  assert.equal(db._submissions.length, 1);
+  assert.equal(db._submissions[0].id, first.submission.id);
+  assert.equal(db._inboundEvents.length, 1);
+  assert.equal(db._inboundEvents[0].submissionId, first.submission.id);
+});
+
+test("manual historical import audit failure rolls back provider ownership, order binding and submission atomically", async () => {
+  const db = withTransactionalRollback(fakeDb());
+  db.auditLog.create = async () => { throw Object.assign(new Error("audit unavailable"), { code: "AUDIT_DOWN" }); };
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1", member, db,
+      input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [903], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery with mandatory audit" },
+    }),
+    (error) => error?.code === "AUDIT_DOWN",
+  );
+  assert.equal(db._submissions.length, 0);
+  assert.equal(db._inboundEvents.length, 0);
+  assert.equal(db._orders.find((row) => row.id === "custom-1").contentBoundAt, null);
+});
+
+test("concurrent automatic provider ownership beats manual recovery through the canonical TelegramInboundEvent key", async () => {
+  const db = withTransactionalRollback(fakeDb());
+  const canonicalId = deterministicSubmissionId("agency-1", "tg-1", "987654321012345678", [904]);
+  const originalCreate = db.telegramInboundEvent.create.bind(db.telegramInboundEvent);
+  const originalFindFirst = db.telegramInboundEvent.findFirst.bind(db.telegramInboundEvent);
+  let externalWinner = null;
+  db.telegramInboundEvent.create = async ({ data }) => {
+    if (!externalWinner) {
+      // Model the P2002 winner as a row committed by a different transaction. It must not
+      // participate in (or be rolled back with) the losing manual-import transaction.
+      externalWinner = { ...clone(data), submissionId: "auto-owner-submission", intakeAuthority: "PROVIDER_OBSERVATION", resolutionAuthority: "PROVIDER_ACTIVE_THREAD", projectionState: "APPLIED", createdAt: new Date(), updatedAt: new Date() };
+      const error = new Error("automatic intake won provider source race"); error.code = "P2002"; throw error;
+    }
+    return originalCreate({ data });
+  };
+  db.telegramInboundEvent.findFirst = async ({ where = {} }) => {
+    if (externalWinner && where.id === externalWinner.id) return clone(externalWinner);
+    return originalFindFirst({ where });
+  };
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1", member, db,
+      input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [904], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "manual recovery raced auto intake" },
+    }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_PROVIDER_SOURCE_OWNED" && error?.status === 409,
+  );
+  assert.ok(externalWinner, "the canonical provider identity must have exactly one external winner");
+  assert.equal(externalWinner.submissionId, "auto-owner-submission");
+  assert.equal(db._submissions.some((row) => row.id === canonicalId), false);
+  assert.equal(db._submissions.length, 0);
+  assert.equal(db._inboundEvents.length, 0, "the losing manual transaction must not create a second local source row");
+  assert.equal(db._orders.find((row) => row.id === "custom-1").contentBoundAt, null);
+});
+
+test("multi-message manual recovery rolls back every earlier source claim when a later provider message is concurrently owned by automatic intake", async () => {
+  const db = withTransactionalRollback(fakeDb());
+  const originalCreate = db.telegramInboundEvent.create.bind(db.telegramInboundEvent);
+  const originalFindFirst = db.telegramInboundEvent.findFirst.bind(db.telegramInboundEvent);
+  let externalWinner = null;
+  db.telegramInboundEvent.create = async ({ data }) => {
+    if (Number(data.messageId) === 906 && !externalWinner) {
+      externalWinner = { ...clone(data), submissionId: "auto-album-owner", intakeAuthority: "PROVIDER_OBSERVATION", resolutionAuthority: "PROVIDER_ACTIVE_THREAD", projectionState: "APPLIED", createdAt: new Date(), updatedAt: new Date() };
+      const error = new Error("automatic album member won provider source race"); error.code = "P2002"; throw error;
+    }
+    return originalCreate({ data });
+  };
+  db.telegramInboundEvent.findFirst = async ({ where = {} }) => {
+    if (externalWinner && where.id === externalWinner.id) return clone(externalWinner);
+    return originalFindFirst({ where });
+  };
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId:"agency-1",member,db,
+      input:{creatorId:"creator-1",customOrderId:"custom-1",telegramMessageIds:[905,906],telegramAccountId:"tg-1",telegramUserId:"987654321012345678",manualImportReason:"recover two-message set"},
+    }),
+    (error)=>error?.code==="CUSTOM_SUBMISSION_PROVIDER_SOURCE_OWNED"&&error?.status===409,
+  );
+  assert.ok(externalWinner);
+  assert.equal(externalWinner.submissionId,"auto-album-owner");
+  assert.equal(db._inboundEvents.length,0,"message 905 claimed earlier in the losing manual transaction must roll back too");
+  assert.equal(db._submissions.length,0);
+  assert.equal(db._orders.find((row)=>row.id==="custom-1").contentBoundAt,null);
 });

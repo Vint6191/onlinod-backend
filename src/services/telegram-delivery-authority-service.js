@@ -6,6 +6,7 @@ const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/aut
 const { assertExecutionAccessFence } = require("./execution-access-fence-service");
 const { assertTelegramRuntimeLease } = require("./telegram-execution-runtime");
 const { reconcilePendingInboundForConfirmedDelivery } = require("./telegram-inbound-authority-service");
+const { canUsePermission } = require("./team-access-control");
 const {
   nextReminderForOrder,
   readWorkspaceReminderPolicy,
@@ -88,7 +89,7 @@ function publicIntent(row) {
     state: String(row.state), claimRevision: Number(row.claimRevision || 0), claimUntil: row.claimUntil ? new Date(row.claimUntil).toISOString() : null,
     commitStartedAt: row.commitStartedAt ? new Date(row.commitStartedAt).toISOString() : null,
     remoteMessageId: row.remoteMessageId == null ? null : String(row.remoteMessageId), remoteRecipientTelegramUserId: row.remoteRecipientTelegramUserId || null, remoteSentAt: row.remoteSentAt ? new Date(row.remoteSentAt).toISOString() : null,
-    outcomeReason: row.outcomeReason || null, confirmedAt: row.confirmedAt ? new Date(row.confirmedAt).toISOString() : null,
+    outcomeReason: row.outcomeReason || null, confirmationAuthority: row.confirmationAuthority || null, confirmedAt: row.confirmedAt ? new Date(row.confirmedAt).toISOString() : null,
     createdAt: new Date(row.createdAt).toISOString(), updatedAt: new Date(row.updatedAt).toISOString(),
   };
 }
@@ -108,6 +109,8 @@ async function resolveAccountForOrder({ agencyId, order, db }) {
   const accountId = await resolveTelegramAccountId({ agencyId, creator: order.creator, db });
   if (!accountId) throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED", "No Telegram connection is assigned to this creator", 409);
   if (!clean(order.creator?.telegramContact, 160)) throw fail("CUSTOM_ORDER_TELEGRAM_CONTACT_REQUIRED", "Creator Telegram contact is required", 409);
+  const account = await db.agencyTelegramMtprotoAccount.findFirst({ where: { id: String(accountId), agencyId }, select: { id: true, lifecycleState: true } });
+  if (!account || String(account.lifecycleState || "ACTIVE") !== "ACTIVE") throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING", "Telegram connection is retiring and cannot accept new Custom delivery work", 409);
   return String(accountId);
 }
 
@@ -134,7 +137,17 @@ async function resolveIntentProviderBinding({ agencyId, order, kind, db }) {
   return loadConfirmedTaskThread({ agencyId, orderId: order.id, db });
 }
 
-async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, payload, now, db }) {
+async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, payload, now, db, _transactional = false }) {
+  // New Telegram work and Telegram-account retirement contend on the same account row.
+  // Running the canonical-intent reservation in one transaction lets the no-op ACTIVE
+  // update below act as a row mutex: either planning wins and retirement sees the new
+  // blocker, or retirement wins and planning cannot create a new intent afterwards.
+  if (!_transactional && typeof db?.$transaction === "function") {
+    return db.$transaction(
+      (tx) => createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, payload, now, db: tx, _transactional: true }),
+      { isolationLevel: "Serializable" },
+    );
+  }
   const key = logicalKey({ agencyId, orderId: order.id, kind, identity });
   const fingerprint = payloadFingerprint(payload);
   const findCanonicalExisting = async () => {
@@ -191,6 +204,21 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
 
   const existing = await findCanonicalExisting();
   if (existing) return useExisting(existing);
+
+  // Acquire the account row while it is still ACTIVE. This is intentionally a no-op
+  // write: PostgreSQL still takes the row lock, so ACTIVE -> RETIRING cannot cross the
+  // TelegramDeliveryIntent create boundary. Do not silently create provider work against
+  // a RETIRING/RETIRED account even if an earlier read saw it as ACTIVE.
+  if (!db.agencyTelegramMtprotoAccount?.updateMany) {
+    throw fail("TELEGRAM_DELIVERY_ACCOUNT_FENCE_UNAVAILABLE", "Telegram account lifecycle fencing is unavailable", 503);
+  }
+  const activeAccount = await db.agencyTelegramMtprotoAccount.updateMany({
+    where: { id: String(accountId), agencyId, lifecycleState: "ACTIVE" },
+    data: { lifecycleState: "ACTIVE" },
+  });
+  if (Number(activeAccount?.count || 0) !== 1) {
+    throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING", "Telegram connection is retiring and cannot accept new Custom delivery work", 409);
+  }
   try {
     const row = await db.telegramDeliveryIntent.create({ data: {
       agencyId, creatorId: order.creatorId, customOrderId: order.id, accountId, kind, logicalKey: key,
@@ -634,11 +662,14 @@ async function projectConfirmedIntent({ row, now, db }) {
 
 async function reconcileInboundAfterConfirmedReceipt({ row, member, now, db }) {
   if (!row?.remoteRecipientTelegramUserId && !row?.remoteMessageId) return { ok: true, skipped: true };
+  const providerReceipt = String(row.confirmationAuthority || "PROVIDER_RECEIPT") === "PROVIDER_RECEIPT";
   try {
     return await reconcilePendingInboundForConfirmedDelivery({
       agencyId: row.agencyId,
       accountId: row.accountId,
-      senderTelegramUserId: row.remoteRecipientTelegramUserId || null,
+      // Manual reconciliation may settle business execution, but only an actual provider receipt
+      // may become generic sender proof. Direct Reply can still be repaired by exact message id.
+      senderTelegramUserId: providerReceipt ? (row.remoteRecipientTelegramUserId || null) : null,
       replyToMessageId: row.remoteMessageId || null,
       actorUserId: member?.userId || row.userId || null,
       now,
@@ -651,6 +682,13 @@ async function reconcileInboundAfterConfirmedReceipt({ row, member, now, db }) {
   }
 }
 
+async function assertProviderReceiptIdentityAvailable({ agencyId, accountId, remoteMessageId, excludeIntentId = null, db }) {
+  const existing = await db.telegramDeliveryIntent.findFirst({
+    where: { agencyId, accountId: String(accountId), remoteMessageId: Number(remoteMessageId), ...(excludeIntentId ? { id: { not: String(excludeIntentId) } } : {}) },
+  });
+  if (existing) throw fail("TELEGRAM_DELIVERY_REMOTE_MESSAGE_CONFLICT", "This Telegram account/message receipt is already owned by another delivery intent", 409);
+}
+
 async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, claimToken, remoteMessageId, remoteRecipientTelegramUserId = null, remoteSentAt, now = new Date(), db = null } = {}) {
   const client = db || require("../prisma"); const id = clean(intentId, 180); const row = await client.telegramDeliveryIntent.findFirst({ where: { id, agencyId } });
   if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
@@ -661,16 +699,31 @@ async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, devic
   if (row.state === "CONFIRMED") {
     if (Number(row.remoteMessageId) !== messageId) throw fail("TELEGRAM_DELIVERY_CONFIRM_CONFLICT", "Telegram delivery was already confirmed with a different remote message id", 409);
     if (recipientTelegramUserId && row.remoteRecipientTelegramUserId && String(row.remoteRecipientTelegramUserId) !== recipientTelegramUserId) throw fail("TELEGRAM_DELIVERY_CONFIRM_CONFLICT", "Telegram delivery was already confirmed for a different recipient identity", 409);
+    // A late actual provider receipt is stronger than an earlier manual reconciliation of the
+    // same exact message. It may upgrade provenance, but never change canonical remote identity.
+    let confirmedRow = row;
+    if (String(row.confirmationAuthority || "") !== "PROVIDER_RECEIPT") {
+      await assertProviderReceiptIdentityAvailable({ agencyId, accountId: row.accountId, remoteMessageId: messageId, excludeIntentId: row.id, db: client });
+      await client.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, state: "CONFIRMED", remoteMessageId: messageId }, data: { confirmationAuthority: "PROVIDER_RECEIPT" } });
+      confirmedRow = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } }) || row;
+    }
     // Repair-safe idempotency: historical/partially-settled rows are projected from the same canonical receipt.
-    await projectConfirmedIntent({ row, now: row.confirmedAt ? new Date(row.confirmedAt) : now, db: client });
-    await reconcileInboundAfterConfirmedReceipt({ row, member, now, db: client });
-    return { ok: true, idempotent: true, intent: publicIntent(row) };
+    await projectConfirmedIntent({ row: confirmedRow, now: confirmedRow.confirmedAt ? new Date(confirmedRow.confirmedAt) : now, db: client });
+    await reconcileInboundAfterConfirmedReceipt({ row: confirmedRow, member, now, db: client });
+    return { ok: true, idempotent: true, intent: publicIntent(confirmedRow) };
   }
   verifyCommitClaim(row, { deviceId, claimToken });
   const settle = async (tx) => {
     // A durable provider receipt captured by the committing Desktop is affirmative proof and may
     // settle a row that became RECONCILE_REQUIRED only because the backend acknowledgement was lost.
-    const changed = await tx.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, state: { in: ["COMMITTING", "RECONCILE_REQUIRED"] }, claimRevision: row.claimRevision, claimTokenHash: row.claimTokenHash }, data: { state: "CONFIRMED", remoteMessageId: messageId, ...(recipientTelegramUserId ? { remoteRecipientTelegramUserId: recipientTelegramUserId } : {}), remoteSentAt: sentAt, confirmedAt: now, outcomeReason: null } });
+    await assertProviderReceiptIdentityAvailable({ agencyId, accountId: row.accountId, remoteMessageId: messageId, excludeIntentId: row.id, db: tx });
+    let changed;
+    try {
+      changed = await tx.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, state: { in: ["COMMITTING", "RECONCILE_REQUIRED"] }, claimRevision: row.claimRevision, claimTokenHash: row.claimTokenHash }, data: { state: "CONFIRMED", remoteMessageId: messageId, ...(recipientTelegramUserId ? { remoteRecipientTelegramUserId: recipientTelegramUserId } : {}), remoteSentAt: sentAt, confirmedAt: now, outcomeReason: null, confirmationAuthority: "PROVIDER_RECEIPT" } });
+    } catch (error) {
+      if (String(error?.code || "") === "P2002") throw fail("TELEGRAM_DELIVERY_REMOTE_MESSAGE_CONFLICT", "This Telegram account/message receipt is already owned by another delivery intent", 409);
+      throw error;
+    }
     if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_CONFIRM_RACE", "Telegram delivery changed before confirmation", 409);
     const confirmed = await tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
     await projectConfirmedIntent({ row: confirmed, now, db: tx });
@@ -819,42 +872,115 @@ async function failTelegramDeliveryPrecommit({ agencyId, member, intentId, devic
   return { ok: true, ignored: false, intent: publicIntent(await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } })) };
 }
 
+async function listTelegramDeliveryReconciliationQueue({ agencyId, member, limit = 50, db = null } = {}) {
+  const client = db || require("../prisma");
+  if (!await canUsePermission({ member, key: "team.analytics.view", db: client })) throw fail("TELEGRAM_DELIVERY_RECONCILE_VIEW_FORBIDDEN", "team.analytics.view permission is required", 403);
+  const scope = await allowedCreatorScope({ agencyId, member, db: client });
+  const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 50)));
+  const rows = await client.telegramDeliveryIntent.findMany({
+    where: { agencyId, ...scopeWhere(scope), state: "RECONCILE_REQUIRED" },
+    orderBy: [{ commitStartedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }], take,
+  });
+  const creatorIds = Array.from(new Set((rows || []).map((row) => String(row.creatorId || "")).filter(Boolean)));
+  const orderIds = Array.from(new Set((rows || []).map((row) => String(row.customOrderId || "")).filter(Boolean)));
+  const creators = creatorIds.length && client.creatorAccount?.findMany
+    ? await client.creatorAccount.findMany({ where: { agencyId, id: { in: creatorIds } }, select: { id: true, displayName: true, username: true, avatarUrl: true, deletedAt: true } })
+    : [];
+  const orders = orderIds.length && client.customOrder?.findMany
+    ? await client.customOrder.findMany({ where: { agencyId, id: { in: orderIds } }, select: { id: true, creatorId: true, scenario: true, type: true, status: true, dueAt: true, scheduledAt: true, createdAt: true } })
+    : [];
+  const creatorById = new Map((creators || []).map((row) => [String(row.id), row]));
+  const orderById = new Map((orders || []).map((row) => [String(row.id), row]));
+  const canResolve = await canUsePermission({ member, key: "content.review_customs", db: client });
+  return {
+    ok: true,
+    items: (rows || []).map((row) => ({
+      ...publicIntent(row),
+      creator: creatorById.has(String(row.creatorId)) ? {
+        id: String(creatorById.get(String(row.creatorId)).id),
+        displayName: creatorById.get(String(row.creatorId)).displayName || null,
+        username: creatorById.get(String(row.creatorId)).username || null,
+        avatarUrl: creatorById.get(String(row.creatorId)).avatarUrl || null,
+        deleted: creatorById.get(String(row.creatorId)).deletedAt != null,
+      } : null,
+      customOrder: orderById.has(String(row.customOrderId)) ? {
+        customOrderId: String(orderById.get(String(row.customOrderId)).id),
+        creatorId: String(orderById.get(String(row.customOrderId)).creatorId),
+        scenario: orderById.get(String(row.customOrderId)).scenario || "",
+        type: String(orderById.get(String(row.customOrderId)).type || ""),
+        status: String(orderById.get(String(row.customOrderId)).status || ""),
+        dueAt: orderById.get(String(row.customOrderId)).dueAt ? new Date(orderById.get(String(row.customOrderId)).dueAt).toISOString() : null,
+        scheduledAt: orderById.get(String(row.customOrderId)).scheduledAt ? new Date(orderById.get(String(row.customOrderId)).scheduledAt).toISOString() : null,
+        createdAt: orderById.get(String(row.customOrderId)).createdAt ? new Date(orderById.get(String(row.customOrderId)).createdAt).toISOString() : null,
+      } : null,
+    })),
+    count: (rows || []).length,
+    canResolve: canResolve === true,
+    serverNow: new Date().toISOString(),
+  };
+}
+
 async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, resolution, remoteMessageId = null, remoteRecipientTelegramUserId = null, remoteSentAt = null, reason = null, now = new Date(), db = null } = {}) {
-  const client = db || require("../prisma"); const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
-  if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
-  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
-  if (row.state !== "RECONCILE_REQUIRED") throw fail("TELEGRAM_DELIVERY_NOT_RECONCILABLE", "Telegram delivery is not awaiting reconciliation", 409);
+  const client = db || require("../prisma"); const id = clean(intentId, 180);
+  if (!await canUsePermission({ member, key: "content.review_customs", db: client })) throw fail("TELEGRAM_DELIVERY_RECONCILE_FORBIDDEN", "content.review_customs permission is required", 403);
+  const justification = clean(reason, 500);
+  if (!justification) throw fail("TELEGRAM_DELIVERY_RECONCILE_REASON_REQUIRED", "A reconciliation reason is required");
+  if (typeof client?.$transaction !== "function") throw fail("TELEGRAM_DELIVERY_RECONCILE_TRANSACTION_REQUIRED", "Manual Telegram reconciliation requires transactional audit authority", 500);
   const mode = clean(resolution, 40).toUpperCase();
-  if (mode === "CONFIRMED") {
-    const messageId = positiveInt(remoteMessageId, "remoteMessageId");
-    const recipientTelegramUserId = clean(remoteRecipientTelegramUserId, 40);
-    if (recipientTelegramUserId && !/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_RECIPIENT_ID_INVALID", "remoteRecipientTelegramUserId must be a numeric Telegram user id");
-    if (String(row.kind) === "TASK" && !/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_TASK_RECIPIENT_REQUIRED", "TASK reconciliation requires the proven Telegram recipient user id", 409);
-    const sentAt = iso(remoteSentAt, "remoteSentAt", now) || now;
-    const settle = async (tx) => {
-      const changed = await tx.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, state: "RECONCILE_REQUIRED", claimRevision: row.claimRevision }, data: { state: "CONFIRMED", remoteMessageId: messageId, ...(recipientTelegramUserId ? { remoteRecipientTelegramUserId: recipientTelegramUserId } : {}), remoteSentAt: sentAt, confirmedAt: now, outcomeReason: `MANUAL_CONFIRMED:${clean(reason, 300) || "operator"}` } });
+  if (!["CONFIRMED", "PROVEN_NOT_SENT"].includes(mode)) throw fail("TELEGRAM_DELIVERY_RECONCILE_RESOLUTION_INVALID", "resolution must be CONFIRMED or PROVEN_NOT_SENT");
+  try {
+    const fresh = await client.$transaction(async (tx) => {
+      const row = await tx.telegramDeliveryIntent.findFirst({ where: { id, agencyId } });
+      if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
+      // Historical provider exceptions can outlive the mutable/active Creator row. A broad
+      // Customs reviewer may adjudicate that durable agency-owned exception; scoped members
+      // still require current creator access and therefore cannot cross their assignment fence.
+      const exceptionScope = await allowedCreatorScope({ agencyId, member, db: tx });
+      if (!exceptionScope?.broad) await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: tx });
+      if (row.state !== "RECONCILE_REQUIRED") throw fail("TELEGRAM_DELIVERY_NOT_RECONCILABLE", "Telegram delivery is not awaiting reconciliation", 409);
+      if (mode === "CONFIRMED") {
+        const messageId = positiveInt(remoteMessageId, "remoteMessageId");
+        const recipientTelegramUserId = clean(remoteRecipientTelegramUserId, 40);
+        if (recipientTelegramUserId && !/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_RECIPIENT_ID_INVALID", "remoteRecipientTelegramUserId must be a numeric Telegram user id");
+        if (String(row.kind) === "TASK" && !/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_TASK_RECIPIENT_REQUIRED", "TASK reconciliation requires the Telegram recipient user id used for the manual decision", 409);
+        const sentAt = iso(remoteSentAt, "remoteSentAt", now) || now;
+        await assertProviderReceiptIdentityAvailable({ agencyId, accountId: row.accountId, remoteMessageId: messageId, excludeIntentId: row.id, db: tx });
+        let changed;
+        try {
+          changed = await tx.telegramDeliveryIntent.updateMany({
+            where: { id: row.id, agencyId, state: "RECONCILE_REQUIRED", claimRevision: row.claimRevision },
+            data: { state: "CONFIRMED", remoteMessageId: messageId, ...(recipientTelegramUserId ? { remoteRecipientTelegramUserId: recipientTelegramUserId } : {}), remoteSentAt: sentAt, confirmedAt: now, outcomeReason: `MANUAL_CONFIRMED:${justification}`, confirmationAuthority: "MANUAL_RECONCILIATION" },
+          });
+        } catch (error) {
+          if (String(error?.code || "") === "P2002") throw fail("TELEGRAM_DELIVERY_REMOTE_MESSAGE_CONFLICT", "This Telegram account/message receipt is already owned by another delivery intent", 409);
+          throw error;
+        }
+        if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram delivery changed during reconciliation", 409);
+        const settled = await tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+        await projectConfirmedIntent({ row: settled, now, db: tx });
+        await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_delivery_manual_reconcile_confirm", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, remoteMessageId: messageId, reason: justification, authority: "MANUAL_RECONCILIATION" }, db: tx, required: true });
+        return settled;
+      }
+      const changed = await tx.telegramDeliveryIntent.updateMany({
+        where: { id: row.id, agencyId, state: "RECONCILE_REQUIRED", claimRevision: row.claimRevision },
+        data: { state: "PLANNED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, commitStartedAt: null, outcomeReason: `PROVEN_NOT_SENT:${justification}`, confirmationAuthority: null },
+      });
       if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram delivery changed during reconciliation", 409);
-      const fresh = await tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
-      await projectConfirmedIntent({ row: fresh, now, db: tx });
-      return fresh;
-    };
-    const fresh = typeof client.$transaction === "function" ? await client.$transaction(settle) : await settle(client);
-    await reconcileInboundAfterConfirmedReceipt({ row: fresh, member, now, db: client });
+      await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_delivery_manual_reconcile_not_sent", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, reason: justification }, db: tx, required: true });
+      return tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+    }, { isolationLevel: "Serializable" });
+    if (mode === "CONFIRMED") await reconcileInboundAfterConfirmedReceipt({ row: fresh, member, now, db: client });
     return { ok: true, intent: publicIntent(fresh) };
+  } catch (error) {
+    if (String(error?.code || "") === "P2034") throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram reconciliation changed concurrently; refresh and retry", 409);
+    throw error;
   }
-  if (mode === "PROVEN_NOT_SENT") {
-    const justification = clean(reason, 500); if (!justification) throw fail("TELEGRAM_DELIVERY_RECONCILE_REASON_REQUIRED", "A reconciliation reason is required");
-    const changed = await client.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, state: "RECONCILE_REQUIRED", claimRevision: row.claimRevision }, data: { state: "PLANNED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, commitStartedAt: null, outcomeReason: `PROVEN_NOT_SENT:${justification}` } });
-    if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram delivery changed during reconciliation", 409);
-    return { ok: true, intent: publicIntent(await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } })) };
-  }
-  throw fail("TELEGRAM_DELIVERY_RECONCILE_RESOLUTION_INVALID", "resolution must be CONFIRMED or PROVEN_NOT_SENT");
 }
 
 async function planTaskIntentForCommittedOrder({ agencyId, member, order, now = new Date(), db }) {
   if (!order || String(order.status) !== "PENDING" || !clean(order.creator?.telegramContact, 160)) return null;
-  const accountId = await resolveTelegramAccountId({ agencyId, creator: order.creator, db });
-  if (!accountId) return null;
+  let accountId;
+  try { accountId = await resolveAccountForOrder({ agencyId, order, db }); } catch { return null; }
   const payload = taskPayload(order);
   const reserved = await createOrReadIntent({ agencyId, order, accountId: String(accountId), kind: "TASK", identity: "one", payload, now, db });
   if (reserved.created) await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_task_plan", targetType: "TelegramDeliveryIntent", targetId: reserved.row.id, metadata: { orderId: order.id, creatorId: order.creatorId }, db });
@@ -890,5 +1016,6 @@ module.exports = {
   cancelTelegramReferencePrecommit,
   getTelegramOrderContext,
   assertTelegramDeliveryMaterialAccess,
+  listTelegramDeliveryReconciliationQueue,
   reconcileTelegramDeliveryIntent,
 };

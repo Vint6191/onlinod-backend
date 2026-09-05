@@ -377,6 +377,12 @@ model AgencyTelegramMtprotoAccount {
   runtimeLeaseMemberId     String?
   runtimeLeaseAccessEpoch  Int?
   runtimeLeaseCreatorId    String?
+  runtimeClaimGeneration   Int      @default(0)
+  runtimeDrainedGeneration Int      @default(0)
+  runtimeClaimInboundEligible Boolean @default(false)
+  lifecycleState           String   @default("ACTIVE")
+  retirementRequestedAt    DateTime?
+  retirementDrainCompletedAt DateTime?
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 
@@ -640,6 +646,9 @@ model CustomContentSubmission {
   telegramSourceKey    String?  @unique
   telegramSourceAccountId String?
   telegramSourceUserId String?
+  sourceAuthority      String   @default("LEGACY_UNCLASSIFIED")
+  sourceThreadIntentId String?
+  sourceResolutionEventId String?
   ofMediaIds         String[] @default([])
   comment            String?
   reviewStatus       CustomContentReviewStatus @default(WAITING_REVIEW)
@@ -689,6 +698,7 @@ model TelegramDeliveryIntent {
   remoteRecipientTelegramUserId String?
   remoteSentAt        DateTime?
   outcomeReason       String?
+  confirmationAuthority String?
   confirmedAt         DateTime?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
@@ -699,6 +709,7 @@ model TelegramDeliveryIntent {
   @@unique([customOrderId, kind, referenceOrdinal], map: "TelegramDeliveryIntent_reference_ordinal_key")
   @@index([agencyId, accountId, state])
   @@index([agencyId, accountId, remoteRecipientTelegramUserId, state])
+  @@unique([agencyId, accountId, remoteMessageId], map: "TelegramDeliveryIntent_provider_message_key")
   @@index([customOrderId, remoteMessageId])
 }
 
@@ -721,6 +732,10 @@ model TelegramInboundEvent {
   projectionReason       String?
   projectionAttempts     Int      @default(0)
   projectedAt            DateTime?
+  intakeAuthority        String   @default("PROVIDER_OBSERVATION")
+  threadResolutionType   String?
+  threadAnchorIntentId   String?
+  resolutionAuthority    String?
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
 

@@ -21,6 +21,7 @@ function matches(row, where={}) {
     if (e && typeof e === "object" && !Array.isArray(e) && !(e instanceof Date)) {
       if ("in" in e && !e.in.map(String).includes(String(a))) return false;
       if ("not" in e && (e.not === null ? a === null : String(a) === String(e.not))) return false;
+      if ("gt" in e && !(String(a) > String(e.gt))) return false;
       continue;
     }
     if (e === null) { if (a !== null) return false; continue; }
@@ -52,7 +53,7 @@ function fixture({ projectedIdentity = false }={}) {
     },
     telegramDeliveryIntent:{
       async findFirst({where}){return clone(intents.find((r)=>matches(r,where))||null);},
-      async findMany({where,take=20}){return intents.filter((r)=>matches(r,where)).slice(0,take).map(clone);},
+      async findMany({where,take}){const rows=intents.filter((r)=>matches(r,where));return (take==null?rows:rows.slice(0,take)).map(clone);},
     },
     customOrder:{
       async findFirst({where}){const r=orders.find((x)=>matches(x,where)); return r?clone(r):null;},
@@ -104,11 +105,11 @@ test("reply to any confirmed Telegram delivery id, including reminder, correlate
   assert.equal(r.event.customOrderId,"order-1");
 });
 
-test("non-Reply inbound has an explicit fallback only when exactly one active CONTENT custom exists",async()=>{
+test("non-Reply inbound routes only through active confirmed TASK threads, never an unsent pending-order fallback",async()=>{
   const fx=fixture();
   const one=await ingest(fx,{messageId:803,replyToMessageId:null}); assert.equal(one.event.customOrderId,"order-1");
-  fx.orders.push({...clone(fx.orders[0]),id:"order-2",createdAt:new Date(fx.now.getTime()-5000),updatedAt:new Date(fx.now.getTime()-5000)});
-  const ambiguous=await ingest(fx,{messageId:804,replyToMessageId:null}); assert.equal(ambiguous.event.customOrderId,null);
+  fx.orders.push({...clone(fx.orders[0]),id:"order-2",telegramTaskMessageId:null,createdAt:new Date(fx.now.getTime()-5000),updatedAt:new Date(fx.now.getTime()-5000)});
+  const stillOne=await ingest(fx,{messageId:804,replyToMessageId:null}); assert.equal(stillOne.event.customOrderId,"order-1");
 });
 
 test("unmatched direct Reply never falls back to legacy message-id projections or the single active order",async()=>{
@@ -118,7 +119,7 @@ test("unmatched direct Reply never falls back to legacy message-id projections o
   // projection still contains 700 and must not become a second correlation authority.
   fx.intents[0].remoteMessageId=999;
   const r=await ingest(fx,{messageId:805,replyToMessageId:700,hasMedia:false});
-  assert.equal(r.event.creatorId,"creator-1");
+  assert.equal(r.event.creatorId,null);
   assert.equal(r.event.customOrderId,null);
   assert.equal(fx.orders[0].telegramLastModelMessageId,null);
 });
@@ -149,9 +150,9 @@ test("best-effort Creator.telegramUserId cannot establish Custom business proven
 test("late confirmed recipient receipt promotes a durable unresolved inbound event and repairs current projection",async()=>{
   const fx=fixture({projectedIdentity:true});
   fx.intents.length=0;
-  const first=await ingest(fx,{messageId:906,replyToMessageId:null,hasMedia:false});
+  const first=await ingest(fx,{messageId:906,replyToMessageId:null,hasMedia:true});
   assert.equal(first.event.creatorId,null);
-  fx.intents.push({id:"intent-task-late",agencyId:"agency-1",creatorId:"creator-1",customOrderId:"order-1",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:700,remoteRecipientTelegramUserId:"900001",confirmedAt:new Date(fx.now.getTime()+1000)});
+  fx.intents.push({id:"intent-task-late",agencyId:"agency-1",creatorId:"creator-1",customOrderId:"order-1",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:700,remoteRecipientTelegramUserId:"900001",remoteSentAt:new Date(fx.now.getTime()-5000),confirmedAt:new Date(fx.now.getTime()+1000)});
   const repaired=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",now:new Date(fx.now.getTime()+2000),db:fx.db});
   assert.equal(repaired.reconciled,1);
   assert.equal(fx.events[0].creatorId,"creator-1");
@@ -162,7 +163,7 @@ test("late confirmed recipient receipt promotes a durable unresolved inbound eve
 test("late manual confirmation without recipient identity still repairs an unresolved direct Reply by remote message id",async()=>{
   const fx=fixture({projectedIdentity:true});
   fx.intents.length=0;
-  const first=await ingest(fx,{messageId:907,replyToMessageId:777,hasMedia:false});
+  const first=await ingest(fx,{messageId:907,replyToMessageId:777,hasMedia:true});
   assert.equal(first.event.creatorId,null);
   fx.intents.push({id:"intent-manual-late",agencyId:"agency-1",creatorId:"creator-1",customOrderId:"order-1",accountId:"tg-1",kind:"MANUAL_REMINDER",state:"CONFIRMED",remoteMessageId:777,remoteRecipientTelegramUserId:null,confirmedAt:new Date(fx.now.getTime()+1000)});
   const repaired=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",replyToMessageId:777,actorUserId:"user-1",now:new Date(fx.now.getTime()+2000),db:fx.db});
@@ -285,32 +286,31 @@ test("REVIEW_REQUIRED inbound events are visible in a management queue with expl
   assert.equal(queue.items[0].candidateOrders.some((row)=>row.customOrderId==="order-1"),true);
 });
 
-test("REVIEW_REQUIRED candidate lookup is per creator and cannot be starved by another creator's large pending queue",async()=>{
+test("ambiguous active threads expose candidates from each current thread without cross-creator starvation",async()=>{
   const fx=fixture();
   for(let i=0;i<60;i++) fx.orders.push({...clone(fx.orders[0]),id:`creator1-bulk-${i}`,scenario:`bulk ${i}`,createdAt:new Date(fx.now.getTime()-i),updatedAt:new Date(fx.now.getTime()-i)});
   const order2={...clone(fx.orders[0]),id:"order-2",creatorId:"creator-2",scenario:"creator two target",contentBoundAt:null,createdAt:new Date(fx.now.getTime()-100000),updatedAt:new Date(fx.now.getTime()-100000)};
   fx.orders.push(order2);
+  fx.intents.push({id:"intent-task-2",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-2",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:701,remoteRecipientTelegramUserId:"900001",confirmedAt:new Date(fx.now.getTime()-4000)});
   const creator2={id:"creator-2",agencyId:"agency-1",status:"READY",deletedAt:null,displayName:"Creator Two",username:"creator2",avatarUrl:null};
-  fx.db.creatorAccount.findMany=async({where})=>{
-    const all=[fx.creator,creator2]; return all.filter((row)=>matches(row,where)).map(clone);
-  };
-  seedReview(fx,{id:"review-c1",creatorId:"creator-1",customOrderId:"order-1",messageId:991});
-  seedReview(fx,{id:"review-c2",creatorId:"creator-2",customOrderId:"order-2",messageId:992});
+  fx.db.creatorAccount.findMany=async({where})=>[fx.creator,creator2].filter((row)=>matches(row,where)).map(clone);
+  seedReview(fx,{id:"review-ambiguous",creatorId:null,customOrderId:null,replyToMessageId:null,messageId:992,projectionReason:"ACTIVE_THREAD_AMBIGUOUS"});
   const queue=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:fx.member,limit:25,now:fx.now,db:fx.db});
-  const c2=queue.items.find((item)=>item.eventId==="review-c2");
-  assert.ok(c2); assert.equal(c2.candidateOrders.some((candidate)=>candidate.customOrderId==="order-2"),true);
-  assert.ok(c2.candidateOrders.length<=20);
+  const item=queue.items.find((row)=>row.eventId==="review-ambiguous");
+  assert.ok(item); assert.equal(item.threadContext.type,"AMBIGUOUS_ACTIVE_THREADS");
+  assert.equal(item.candidateOrders.some((candidate)=>candidate.customOrderId==="order-1"),true);
+  assert.equal(item.candidateOrders.some((candidate)=>candidate.customOrderId==="order-2"),true);
 });
-
 
 test("REVIEW_REQUIRED candidate search can recover an older valid target beyond the initial per-creator suggestions",async()=>{
   const fx=fixture();
   fx.events.push({
     id:"review-search",agencyId:"agency-1",accountId:"tg-1",creatorId:"creator-1",customOrderId:null,submissionId:null,
-    senderTelegramUserId:"900001",messageId:971,replyToMessageId:700,groupedId:null,hasMedia:true,text:"older target",
+    senderTelegramUserId:"900001",messageId:971,replyToMessageId:null,groupedId:null,hasMedia:true,text:"older target",
     sentAt:new Date(fx.now),observedAt:new Date(fx.now),projectionState:"REVIEW_REQUIRED",projectionReason:"CUSTOM_SUBMISSION_ORDER_NOT_FOUND",projectionAttempts:1,projectedAt:new Date(fx.now),
     createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
   });
+  fx.intents.length=0;
   for(let i=0;i<30;i+=1){
     fx.orders.unshift({id:`newer-${i}`,agencyId:"agency-1",creatorId:"creator-1",type:"CONTENT",status:"PENDING",scenario:`newer ${i}`,dueAt:null,createdAt:new Date(fx.now.getTime()+i+1),updatedAt:new Date(fx.now)});
   }
@@ -320,14 +320,14 @@ test("REVIEW_REQUIRED candidate search can recover an older valid target beyond 
     if(args?.where?.OR){
       const exact=args.where.OR.find((part)=>part?.id)?.id;
       if(exact){
-        const row=fx.orders.find((candidate)=>candidate.id===exact && candidate.agencyId===args.where.agencyId && candidate.creatorId===args.where.creatorId && candidate.type==="CONTENT" && candidate.status==="PENDING");
+        const row=fx.orders.find((candidate)=>candidate.id===exact && candidate.agencyId===args.where.agencyId && (!args.where.creatorId || candidate.creatorId===args.where.creatorId || args.where.creatorId?.in?.includes(candidate.creatorId)) && candidate.type==="CONTENT" && candidate.status==="PENDING");
         return row?[clone(row)]:[];
       }
     }
     return original(args);
   };
   const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-search",query:"#older-exact-target",limit:30,db:fx.db});
-  assert.equal(result.proofState,"PROVEN");
+  assert.equal(result.proofState,"NO_ACTIVE_THREAD");
   assert.deepEqual(result.items.map((row)=>row.customOrderId),["older-exact-target"]);
 });
 
@@ -341,14 +341,17 @@ test("stale candidate search result cannot bypass a provider-proof change before
     createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
   });
   const searched=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-search-stale-proof",query:"order-1",db:fx.db});
-  assert.equal(searched.proofState,"PROVEN");
+  assert.equal(searched.proofState,"UNIQUE_ACTIVE_THREAD");
   assert.equal(searched.items[0]?.customOrderId,"order-1");
 
-  // Proof changes after the read-only search but before the manager commits ASSIGN.
-  fx.intents.push({id:"intent-conflicting-recipient",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-other",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:799,remoteRecipientTelegramUserId:"900001",confirmedAt:new Date(fx.now)});
+  // The searched target becomes terminal, while a different thread becomes the only current one.
+  // ASSIGN must re-evaluate inside the transaction instead of trusting the stale search result.
+  fx.orders[0].status="COMPLETED";
+  fx.orders.push({...clone(fx.orders[0]),id:"order-other",creatorId:"creator-2",status:"PENDING",telegramTaskMessageId:799,contentBoundAt:null,updatedAt:new Date(fx.now)});
+  fx.intents.push({id:"intent-current-other",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-other",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:799,remoteRecipientTelegramUserId:"900001",confirmedAt:new Date(fx.now)});
   await assert.rejects(
-    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:"review-search-stale-proof",resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"candidate looked valid before provider proof changed",customOrderId:"order-1",now:fx.now,db:fx.db}),
-    (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_CREATOR_UNPROVEN" && error?.status===409,
+    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:"review-search-stale-proof",resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"candidate looked valid before thread changed",customOrderId:"order-1",now:fx.now,db:fx.db}),
+    (error)=>["TELEGRAM_INBOUND_REVIEW_THREAD_CONFLICT","TELEGRAM_INBOUND_REVIEW_ORDER_INVALID","CUSTOM_SUBMISSION_ORDER_CLOSED"].includes(error?.code) && error?.status===409,
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
   assert.equal(fx.submissions.length,0);
@@ -481,7 +484,7 @@ test("explicit REVIEW_REQUIRED assignment refuses a target whose creator is not 
   seedReview(fx,{customOrderId:null,hasMedia:true});
   await assert.rejects(
     resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"try wrong creator",customOrderId:"order-2",now:fx.now,db:fx.db}),
-    (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_CREATOR_UNPROVEN",
+    (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_THREAD_CONFLICT",
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED"); assert.equal(fx.submissions.length,0); assert.equal(fx.orders[1].contentBoundAt,null);
 });
@@ -508,4 +511,201 @@ test("concurrent submission materialization wins over human SKIP/RETRY and conve
     assert.match(String(fx.events[0].submissionId),/^submission-race-/);
     assert.equal(fx.audits.some((row)=>String(row.action||"").endsWith(resolution === "SKIP" ? "_skip" : "_retry")),false,"losing human action must not audit itself as the winner");
   }
+});
+
+test("legitimate multi-creator active-thread ambiguity can be resolved by an audited MANUAL_REVIEW_OVERRIDE to the selected thread", async()=>{
+  const fx=fixture();
+  const creator2={id:"creator-2",agencyId:"agency-1",status:"READY",deletedAt:null,displayName:"Creator Two",username:"creator2",avatarUrl:null,telegramContact:"@same-model",telegramUserId:"900001",telegramAccountId:"tg-1"};
+  const order2={...clone(fx.orders[0]),id:"order-2",creatorId:"creator-2",scenario:"second creator custom",telegramTaskMessageId:701,contentBoundAt:null,createdAt:new Date(fx.now.getTime()-9000),updatedAt:new Date(fx.now.getTime()-9000)};
+  fx.orders.push(order2);
+  fx.intents.push({id:"intent-task-2",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-2",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:701,remoteRecipientTelegramUserId:"900001",confirmationAuthority:"PROVIDER_RECEIPT",confirmedAt:new Date(fx.now.getTime()-4000)});
+  const originalFindFirst=fx.db.creatorAccount.findFirst.bind(fx.db.creatorAccount);
+  fx.db.creatorAccount.findFirst=async({where})=>String(where?.id||"")==="creator-2"?clone(creator2):originalFindFirst({where});
+  fx.db.creatorAccount.findMany=async({where})=>[fx.creator,creator2].filter((row)=>matches(row,where)).map(clone);
+  seedReview(fx,{id:"review-legit-ambiguous",creatorId:null,customOrderId:null,replyToMessageId:null,messageId:993,hasMedia:true,projectionReason:"ACTIVE_THREAD_AMBIGUOUS",threadResolutionType:"AMBIGUOUS_ACTIVE_THREADS"});
+
+  const result=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:"review-legit-ambiguous",resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"manager selected the matching active Custom thread",customOrderId:"order-2",now:new Date(fx.now.getTime()+1000),db:fx.db});
+  assert.equal(result.state,"APPLIED");
+  const submission=fx.submissions.find((row)=>String(row.id)===String(result.submissionId));
+  assert.ok(submission);
+  assert.equal(submission.creatorId,"creator-2");
+  assert.equal(submission.customOrderId,"order-2");
+  assert.equal(submission.sourceAuthority,"MANUAL_REVIEW_OVERRIDE");
+  assert.equal(fx.events.find((row)=>row.id==="review-legit-ambiguous").resolutionAuthority,"MANUAL_REVIEW_OVERRIDE");
+  const audit=fx.audits.find((row)=>row.action==="custom_order.telegram_inbound_review_assign");
+  assert.ok(audit); assert.equal(audit.metadata.customOrderId,"order-2");
+});
+
+test("deleted historical creator projection cannot make a REVIEW_REQUIRED row immortal for a broad manager", async()=>{
+  const fx=fixture();
+  fx.intents.length=0; // no current active thread remains
+  const row=seedReview(fx,{id:"review-deleted-history",creatorId:"creator-deleted",customOrderId:null,replyToMessageId:null,messageId:994,projectionReason:"HISTORICAL_CREATOR_DELETED"});
+  const result=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:row.id,resolution:"SKIP",reason:"historical creator was retired; archive unrelated observation",now:new Date(fx.now.getTime()+1000),db:fx.db});
+  assert.equal(result.state,"SKIPPED");
+  assert.equal(fx.events.find((event)=>event.id===row.id).projectionState,"SKIPPED");
+  assert.equal(fx.audits.some((audit)=>audit.action==="custom_order.telegram_inbound_review_skip"),true);
+});
+
+test("late provider proof ignores more than 200 terminal rows and reaches the later repairable source", async()=>{
+  const fx=fixture();
+  fx.events.length=0;
+  for(let i=0;i<250;i+=1){
+    fx.events.push({
+      id:`terminal-${String(i).padStart(3,"0")}`,agencyId:"agency-1",accountId:"tg-1",creatorId:null,customOrderId:null,submissionId:null,
+      senderTelegramUserId:"900001",messageId:2000+i,replyToMessageId:null,groupedId:null,hasMedia:true,text:"terminal",
+      sentAt:new Date(fx.now.getTime()-500000+i),observedAt:new Date(fx.now.getTime()-500000+i),projectionState:i%2?"SKIPPED":"REVIEW_REQUIRED",projectionReason:i%2?"MANUAL_SKIP:test":"ACTIVE_THREAD_AMBIGUOUS",projectionAttempts:1,projectedAt:new Date(fx.now),createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
+    });
+  }
+  const pending={
+    id:"zz-repairable",agencyId:"agency-1",accountId:"tg-1",creatorId:null,customOrderId:null,submissionId:null,
+    senderTelegramUserId:"900001",messageId:9999,replyToMessageId:null,groupedId:null,hasMedia:false,text:"late proof target",
+    sentAt:new Date(fx.now),observedAt:new Date(fx.now),projectionState:"PENDING",projectionReason:"CREATOR_UNRESOLVED",projectionAttempts:1,projectedAt:null,createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
+  };
+  fx.events.push(pending);
+  const originalFindMany=fx.db.telegramInboundEvent.findMany.bind(fx.db.telegramInboundEvent);
+  const selectedStates=[];
+  fx.db.telegramInboundEvent.findMany=async(args)=>{
+    if(args?.where?.projectionState?.in) selectedStates.push([...args.where.projectionState.in]);
+    return originalFindMany(args);
+  };
+  const result=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",now:new Date(fx.now.getTime()+1000),limit:200,db:fx.db});
+  assert.equal(result.scanned,1,"terminal history must not consume the late-proof batch");
+  assert.equal(selectedStates.every((states)=>states.length===2&&states.includes("PENDING")&&states.includes("FAILED_RETRYABLE")),true);
+  assert.equal(fx.events.find((row)=>row.id==="zz-repairable").projectionState,"SKIPPED","the newly proven no-media observation should be reconciled instead of starved");
+  assert.equal(fx.events.filter((row)=>row.id.startsWith("terminal-")).every((row)=>["SKIPPED","REVIEW_REQUIRED"].includes(row.projectionState)),true);
+});
+
+test("a non-Reply active-thread snapshot cannot create a submission after that thread becomes terminal before projection", async()=>{
+  const fx=fixture();
+  const accepted=await ingestRaw(fx,{messageId:10001,replyToMessageId:null,hasMedia:true,text:"race media"});
+  assert.equal(accepted.event.customOrderId,"order-1","acceptance may observe the thread while it is still active");
+  fx.orders[0].status="COMPLETED";
+  fx.orders[0].updatedAt=new Date(fx.orders[0].updatedAt.getTime()+1000);
+  await new Promise((resolve)=>setImmediate(resolve));
+  const event=fx.events.find((row)=>Number(row.messageId)===10001);
+  assert.equal(event.submissionId,null);
+  assert.equal(event.customOrderId,null,"backend-owned projection must discard stale active-thread routing before materializing business work");
+  assert.equal(event.projectionState,"PENDING");
+  assert.equal(event.projectionReason,"CREATOR_UNRESOLVED");
+  assert.equal(fx.submissions.length,0);
+});
+
+test("closure 01: completed historical TASK cannot attach non-Reply media to a new pending CONTENT order whose TASK was never sent", async()=>{
+  const fx=fixture();
+  fx.orders[0].status="COMPLETED";
+  fx.orders.push({...clone(fx.orders[0]),id:"order-new-unsent",status:"PENDING",telegramTaskMessageId:null,contentBoundAt:null,createdAt:new Date(fx.now),updatedAt:new Date(fx.now)});
+  const result=await ingest(fx,{messageId:11001,replyToMessageId:null,hasMedia:true,text:"unrelated non reply"});
+  const row=fx.events.find((event)=>Number(event.messageId)===11001);
+  assert.equal(result.accepted,true);
+  assert.equal(row.customOrderId,null);
+  assert.equal(row.submissionId,null);
+  assert.equal(row.projectionState,"PENDING");
+  assert.equal(fx.submissions.length,0);
+});
+
+test("closure 02: current creator Telegram binding may change while Reply to the historical old TASK still resolves the exact old thread", async()=>{
+  const fx=fixture();
+  fx.creator.telegramContact="@new_contact";
+  fx.creator.telegramUserId="900999";
+  fx.creator.telegramAccountId="tg-new";
+  const result=await ingest(fx,{messageId:11002,replyToMessageId:700,hasMedia:false,senderTelegramUserId:"900001"});
+  assert.equal(result.event.creatorId,"creator-1");
+  assert.equal(result.event.customOrderId,"order-1");
+  assert.equal(fx.events.find((row)=>Number(row.messageId)===11002).threadResolutionType,"DIRECT_REPLY");
+});
+
+test("closure 04: two active threads for one non-Reply sender become REVIEW_REQUIRED and never auto-create a submission", async()=>{
+  const fx=fixture();
+  fx.orders.push({...clone(fx.orders[0]),id:"order-b",creatorId:"creator-2",telegramTaskMessageId:702,contentBoundAt:null,updatedAt:new Date(fx.now)});
+  fx.intents.push({id:"task-b",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-b",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:702,remoteRecipientTelegramUserId:"900001",confirmationAuthority:"PROVIDER_RECEIPT",confirmedAt:new Date(fx.now)});
+  await ingest(fx,{messageId:11004,replyToMessageId:null,hasMedia:true});
+  const row=fx.events.find((event)=>Number(event.messageId)===11004);
+  assert.equal(row.projectionState,"REVIEW_REQUIRED");
+  assert.equal(row.projectionReason,"ACTIVE_THREAD_AMBIGUOUS");
+  assert.equal(row.submissionId,null);
+  assert.equal(fx.submissions.length,0);
+});
+
+test("closure 05: same Telegram person may have active A+B threads but exact Reply to TASK B resolves B", async()=>{
+  const fx=fixture();
+  fx.orders.push({...clone(fx.orders[0]),id:"order-b",creatorId:"creator-2",telegramTaskMessageId:703,contentBoundAt:null,updatedAt:new Date(fx.now)});
+  fx.intents.push({id:"task-b",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-b",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:703,remoteRecipientTelegramUserId:"900001",confirmationAuthority:"PROVIDER_RECEIPT",confirmedAt:new Date(fx.now)});
+  const result=await ingest(fx,{messageId:11005,replyToMessageId:703,hasMedia:false});
+  assert.equal(result.event.creatorId,"creator-2");
+  assert.equal(result.event.customOrderId,"order-b");
+  assert.equal(fx.events.find((row)=>Number(row.messageId)===11005).threadResolutionType,"DIRECT_REPLY");
+});
+
+test("closure 06: completed historical A receipt cannot conflict with the only current active B thread for non-Reply", async()=>{
+  const fx=fixture();
+  fx.orders[0].status="COMPLETED";
+  fx.orders.push({...clone(fx.orders[0]),id:"order-b-active",creatorId:"creator-2",status:"PENDING",telegramTaskMessageId:704,contentBoundAt:null,updatedAt:new Date(fx.now)});
+  fx.intents.push({id:"task-b-active",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-b-active",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:704,remoteRecipientTelegramUserId:"900001",confirmationAuthority:"PROVIDER_RECEIPT",confirmedAt:new Date(fx.now)});
+  const result=await ingest(fx,{messageId:11006,replyToMessageId:null,hasMedia:false});
+  assert.equal(result.event.creatorId,"creator-2");
+  assert.equal(result.event.customOrderId,"order-b-active");
+  assert.equal(fx.events.find((row)=>Number(row.messageId)===11006).threadResolutionType,"UNIQUE_ACTIVE_THREAD");
+});
+
+test("closure 07: non-Reply routing is independent of top-N historical receipt volume", async()=>{
+  const fx=fixture();
+  for(let i=0;i<30;i+=1){
+    const orderId=`old-completed-${i}`;
+    fx.orders.push({...clone(fx.orders[0]),id:orderId,status:"COMPLETED",telegramTaskMessageId:12000+i,updatedAt:new Date(fx.now.getTime()-10000-i)});
+    fx.intents.unshift({id:`old-task-${i}`,agencyId:"agency-1",creatorId:"creator-old",customOrderId:orderId,accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:12000+i,remoteRecipientTelegramUserId:"900001",confirmationAuthority:"PROVIDER_RECEIPT",confirmedAt:new Date(fx.now.getTime()+i)});
+  }
+  const result=await ingest(fx,{messageId:11007,replyToMessageId:null,hasMedia:false});
+  assert.equal(result.event.creatorId,"creator-1");
+  assert.equal(result.event.customOrderId,"order-1");
+});
+
+test("closure 08: scoped manager cannot SKIP using stale creator projection after current thread context moves outside scope", async()=>{
+  const fx=fixture();
+  const scoped={...fx.member,role:"OPERATOR",roleKey:"chatter",assignedCreators:["creator-1"],permissions:{"team.analytics.view":true,"content.review_customs":true}};
+  const creator2={id:"creator-2",agencyId:"agency-1",status:"READY",deletedAt:null,displayName:"B",username:"b"};
+  const originalFindMany=fx.db.creatorAccount.findMany.bind(fx.db.creatorAccount);
+  fx.db.creatorAccount.findMany=async({where})=>[fx.creator,creator2].filter((row)=>matches(row,where)).map(clone);
+  seedReview(fx,{id:"review-scope-move",creatorId:"creator-1",customOrderId:"order-1",replyToMessageId:null,messageId:11008,projectionReason:"PROVENANCE_CONFLICT"});
+  const before=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:scoped,db:fx.db});
+  assert.equal(before.items.some((item)=>item.eventId==="review-scope-move"),true);
+
+  fx.orders[0].status="COMPLETED";
+  fx.orders.push({...clone(fx.orders[0]),id:"order-b-current",creatorId:"creator-2",status:"PENDING",telegramTaskMessageId:705,contentBoundAt:null,updatedAt:new Date(fx.now)});
+  fx.intents.push({id:"task-b-current",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-b-current",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:705,remoteRecipientTelegramUserId:"900001",confirmationAuthority:"PROVIDER_RECEIPT",confirmedAt:new Date(fx.now)});
+  await assert.rejects(
+    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:scoped,eventId:"review-scope-move",resolution:"SKIP",reason:"stale queue action",now:fx.now,db:fx.db}),
+    (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_SCOPE_UNRESOLVED"&&error?.status===403,
+  );
+  assert.equal(fx.events.find((row)=>row.id==="review-scope-move").projectionState,"REVIEW_REQUIRED");
+  fx.db.creatorAccount.findMany=originalFindMany;
+});
+
+test("closure 18: manually reconciled TASK recipient alone never becomes generic non-Reply provider proof", async()=>{
+  const fx=fixture();
+  fx.intents[0].confirmationAuthority="MANUAL_RECONCILIATION";
+  fx.intents[0].outcomeReason="MANUAL_CONFIRMED:operator judged send occurred";
+  await ingest(fx,{messageId:11018,replyToMessageId:null,hasMedia:true});
+  const row=fx.events.find((event)=>Number(event.messageId)===11018);
+  assert.equal(row.creatorId,null);
+  assert.equal(row.customOrderId,null);
+  assert.equal(row.submissionId,null);
+  assert.equal(row.projectionState,"PENDING");
+  assert.equal(row.projectionReason,"CREATOR_UNRESOLVED");
+});
+
+test("durable non-Reply replay cannot be retroactively claimed by a TASK thread created after the provider message was sent", async()=>{
+  const fx=fixture();
+  // The only TASK anchor is provider-confirmed *after* this media observation was already sent.
+  // At replay time the order is still PENDING, but temporal provenance must fail closed rather
+  // than attach an old local SQLite observation to a future Custom thread.
+  fx.intents[0].remoteSentAt=new Date(fx.now.getTime()-1_000);
+  fx.intents[0].confirmedAt=new Date(fx.now.getTime()-900);
+  const observationAt=new Date(fx.now.getTime()-10_000);
+  const result=await ingest(fx,{messageId:12001,replyToMessageId:null,hasMedia:true,sentAt:observationAt.toISOString()});
+  assert.equal(result.event.creatorId,null);
+  assert.equal(result.event.customOrderId,null);
+  const row=fx.events.find((event)=>Number(event.messageId)===12001);
+  assert.equal(row.projectionState,"PENDING");
+  assert.equal(row.projectionReason,"CREATOR_UNRESOLVED");
+  assert.equal(fx.submissions.length,0,"future TASK thread must never acquire an older provider observation");
 });

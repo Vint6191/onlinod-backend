@@ -6,6 +6,7 @@ const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/aut
 const { syncFinalizedSubmissionAssignment } = require("./custom-content-library-service");
 const { canUsePermission } = require("./team-access-control");
 const { confirmedRelayResult } = require("./custom-relay-result-proof-service");
+const { providerMessageEventId, resolveTelegramCustomThread, targetAllowedByThreadContext } = require("./custom-telegram-thread-authority-service");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
@@ -141,9 +142,9 @@ function assertManualImportTargetMatches(existing, requestedCustomOrderId) {
   );
 }
 
-function deterministicSubmissionId(agencyId, creatorId, sourceAccountId, sourceUserId, messageIds) {
+function deterministicSubmissionId(agencyId, sourceAccountId, sourceUserId, messageIds) {
   const canonical = Array.from(new Set(messageIds.map(Number))).sort((a, b) => a - b).join(",");
-  const digest = crypto.createHash("sha256").update(`${agencyId}\n${creatorId}\n${sourceAccountId}\n${sourceUserId}\n${canonical}`).digest("hex");
+  const digest = crypto.createHash("sha256").update(`${agencyId}\n${sourceAccountId}\n${sourceUserId}\n${canonical}`).digest("hex");
   return `cs_${digest}`;
 }
 
@@ -158,9 +159,11 @@ function serializeSubmission(row) {
     telegramSourceKey: row.telegramSourceKey || null,
     telegramSourceAccountId: row.telegramSourceAccountId == null ? null : String(row.telegramSourceAccountId),
     telegramSourceUserId: row.telegramSourceUserId == null ? null : String(row.telegramSourceUserId),
-    intakeAuthority: row.telegramSourceKey && Array.isArray(row.telegramInboundEventIds) && row.telegramInboundEventIds.length > 0
+    intakeAuthority: row.sourceAuthority || (row.telegramSourceKey && Array.isArray(row.telegramInboundEventIds) && row.telegramInboundEventIds.length > 0
       ? "PROVEN_TELEGRAM_INBOUND"
-      : "MANUAL_IMPORT",
+      : "MANUAL_IMPORT"),
+    sourceThreadIntentId: row.sourceThreadIntentId || null,
+    sourceResolutionEventId: row.sourceResolutionEventId || null,
     ofMediaIds: ofMediaIds(row.ofMediaIds),
     comment: row.comment || null,
     reviewStatus: String(row.reviewStatus || "WAITING_REVIEW"),
@@ -261,71 +264,144 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
   if (!(await canUsePermission({ member, key: "content.review_customs", db: client }))) {
     throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_FORBIDDEN", "content.review_customs permission is required for explicit raw Telegram import", 403);
   }
-  const observedAt = receivedAt(input.receivedAt, now);
-
   await requireCreatorAccess({ agencyId, member, creatorId, db: client });
   const sourceAccount = await client.agencyTelegramMtprotoAccount.findFirst({ where: { id: sourceAccountId, agencyId }, select: { id: true } });
   if (!sourceAccount) throw fail("CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_NOT_FOUND", "Telegram source account was not found in this agency", 404);
-  await validateContentOrder({ agencyId, creatorId, customOrderId, db: client });
-  const submissionId = deterministicSubmissionId(agencyId, creatorId, sourceAccountId, sourceUserId, messageIds);
+  if (!customOrderId) throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_ORDER_REQUIRED", "customOrderId is required for audited historical Telegram import");
+  const observedAt = receivedAt(input.receivedAt, now);
+  const submissionId = deterministicSubmissionId(agencyId, sourceAccountId, sourceUserId, messageIds);
 
-  const overlapping = await client.customContentSubmission.findFirst({
-    where: { agencyId, creatorId, telegramSourceAccountId: sourceAccountId, telegramSourceUserId: sourceUserId, telegramMessageIds: { hasSome: messageIds } },
-    orderBy: [{ receivedAt: "desc" }, { createdAt: "desc" }],
-  });
-  if (overlapping) {
-    if (sameMessageIds(overlapping.telegramMessageIds, messageIds)) {
-      assertManualImportTargetMatches(overlapping, customOrderId);
-      return { ok: true, deduped: true, submission: serializeSubmission(overlapping) };
-    }
-    throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT", "One or more Telegram messages already belong to another submission", 409);
+  if (typeof client?.$transaction !== "function") {
+    throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_TRANSACTION_REQUIRED", "Manual Telegram import requires transactional provider-source ownership", 500);
   }
-  await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: client });
 
-  let row;
   try {
-    row = await runSubmissionTransaction(client, async (tx) => {
-      if (customOrderId) {
-        await bindContentOrderForSubmission({ agencyId, creatorId, customOrderId, now, db: tx });
-        // Re-check inside the same transaction as bind + create. The pre-check above is only an
-        // early UX rejection; this one owns the actual business commit boundary.
-        await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: tx });
+    const result = await client.$transaction(async (tx) => {
+      // Provider-message ownership is adjudicated before the target lifecycle. Exact retries must
+      // remain idempotent even after their first submission is WAITING_REVIEW, and a partial
+      // provider overlap must report the source conflict rather than an unrelated order-busy state.
+      const existingExact = await tx.customContentSubmission.findFirst({ where: { id: submissionId, agencyId } });
+      if (existingExact) {
+        assertManualImportTargetMatches(existingExact, customOrderId);
+        return { deduped: true, row: existingExact };
       }
-      return tx.customContentSubmission.create({
-        data: {
-          id: submissionId,
-          agencyId,
-          creatorId,
-          customOrderId,
+      // Legacy rows created before the provider-source ledger cutover are checked globally,
+      // deliberately without creatorId. One provider message may have only one business owner.
+      const overlapping = await tx.customContentSubmission.findFirst({
+        where: { agencyId, telegramSourceAccountId: sourceAccountId, telegramSourceUserId: sourceUserId, telegramMessageIds: { hasSome: messageIds } },
+        orderBy: [{ receivedAt: "desc" }, { createdAt: "desc" }],
+      });
+      if (overlapping) {
+        if (sameMessageIds(overlapping.telegramMessageIds, messageIds)) {
+          assertManualImportTargetMatches(overlapping, customOrderId);
+          return { deduped: true, row: overlapping };
+        }
+        throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT", "One or more Telegram provider messages already belong to another submission", 409);
+      }
+
+      const target = await validateContentOrder({ agencyId, creatorId, customOrderId, db: tx });
+      await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: tx });
+
+      // Re-evaluate the CURRENT active-thread context inside the same transaction that claims
+      // provider messages. A unique/ambiguous active thread may constrain a historical import;
+      // NO_ACTIVE_THREAD remains an explicit manager override rather than invented provider proof.
+      const context = await resolveTelegramCustomThread({
+        agencyId, accountId: sourceAccountId, senderTelegramUserId: sourceUserId, replyToMessageId: null, eventSentAt: observedAt, db: tx,
+      });
+      if (context.type === "UNIQUE_ACTIVE_THREAD" && !targetAllowedByThreadContext(context, target)) {
+        throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_THREAD_CONFLICT", "Telegram source currently belongs to another active Custom thread", 409);
+      }
+      if (context.type === "AMBIGUOUS_ACTIVE_THREADS" && !targetAllowedByThreadContext(context, target)) {
+        throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_THREAD_CONFLICT", "Target CustomOrder is not one of the active Telegram threads for this sender", 409);
+      }
+
+      const sourceEvents = [];
+      for (const messageId of messageIds) {
+        const id = providerMessageEventId({ agencyId, accountId: sourceAccountId, senderTelegramUserId: sourceUserId, messageId });
+        let event = await tx.telegramInboundEvent.findFirst({ where: { id } });
+        if (event && !event.submissionId) {
+          // An already-ingested provider observation belongs to the canonical inbound exception
+          // lifecycle. Manual historical import is recovery for observations that were never
+          // ingested, not a second human resolver for REVIEW_REQUIRED/PENDING source rows.
+          throw fail("CUSTOM_SUBMISSION_PROVIDER_EVENT_EXISTS", "This Telegram provider message is already in the inbound exception workflow; resolve that event instead of using manual historical import", 409);
+        }
+        if (!event) {
+          try {
+            event = await tx.telegramInboundEvent.create({ data: {
+              id, agencyId, accountId: sourceAccountId, creatorId, customOrderId, submissionId: null,
+              senderTelegramUserId: sourceUserId, messageId, replyToMessageId: null, groupedId: null,
+              hasMedia: true, text: comment || null, sentAt: observedAt, observedAt: now,
+              projectionState: "PENDING", projectionReason: null, projectedAt: null,
+              intakeAuthority: "MANUAL_HISTORICAL_OBSERVATION",
+              threadResolutionType: String(context.type || "NO_ACTIVE_THREAD"),
+              threadAnchorIntentId: (context.threads || []).find((thread) => String(thread.customOrderId) === customOrderId)?.anchorIntentId || null,
+              resolutionAuthority: "MANUAL_HISTORICAL_IMPORT",
+            } });
+          } catch (error) {
+            if (String(error?.code || "") !== "P2002") throw error;
+            event = await tx.telegramInboundEvent.findFirst({ where: { id } });
+          }
+        }
+        if (!event) throw fail("CUSTOM_SUBMISSION_PROVIDER_SOURCE_PERSIST_FAILED", "Telegram provider source could not be persisted", 500);
+        if (event.submissionId && String(event.submissionId) !== submissionId) {
+          throw fail("CUSTOM_SUBMISSION_PROVIDER_SOURCE_OWNED", "A Telegram provider message already belongs to another submission", 409);
+        }
+        sourceEvents.push(event);
+      }
+
+      let row = await tx.customContentSubmission.findFirst({ where: { id: submissionId, agencyId } });
+      if (row) {
+        assertManualImportTargetMatches(row, customOrderId);
+      } else {
+        await bindContentOrderForSubmission({ agencyId, creatorId, customOrderId, now, db: tx });
+        await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: tx });
+        row = await tx.customContentSubmission.create({ data: {
+          id: submissionId, agencyId, creatorId, customOrderId,
           telegramMessageIds: messageIds,
+          telegramInboundEventIds: sourceEvents.map((event) => String(event.id)),
           telegramSourceAccountId: sourceAccountId,
           telegramSourceUserId: sourceUserId,
-          telegramSourceKey: `manual:${agencyId}:${sourceAccountId}:${sourceUserId}:${submissionId}`,
-          ofMediaIds: [],
-          comment,
-          receivedAt: observedAt,
+          telegramSourceKey: `provider:${agencyId}:${sourceAccountId}:${sourceUserId}:${messageIds.slice().sort((a,b)=>a-b).join(",")}`,
+          sourceAuthority: "MANUAL_HISTORICAL_IMPORT",
+          sourceThreadIntentId: (context.threads || []).find((thread) => String(thread.customOrderId) === customOrderId)?.anchorIntentId || null,
+          sourceResolutionEventId: sourceEvents[0]?.id || null,
+          ofMediaIds: [], comment, receivedAt: observedAt,
+        } });
+      }
+
+      for (const event of sourceEvents) {
+        const changed = await tx.telegramInboundEvent.updateMany({
+          where: { id: event.id, agencyId, OR: [{ submissionId: null }, { submissionId: row.id }] },
+          data: {
+            creatorId, customOrderId, submissionId: row.id, projectionState: "APPLIED",
+            projectionReason: `MANUAL_HISTORICAL_IMPORT:${manualImportReason}`.slice(0, 500), projectedAt: now,
+            resolutionAuthority: "MANUAL_HISTORICAL_IMPORT",
+          },
+        });
+        if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_PROVIDER_SOURCE_RACE", "Telegram provider source ownership changed concurrently", 409);
+      }
+
+      if (!overlapping && !row.createdAt) row.createdAt = now;
+      await audit({
+        agencyId,
+        actorUserId: member.userId || null,
+        action: "custom_content_submission.manual_historical_import",
+        targetType: "CustomContentSubmission",
+        targetId: row.id,
+        metadata: {
+          creatorId, customOrderId, telegramSourceAccountId: sourceAccountId, telegramSourceUserId: sourceUserId,
+          telegramMessageIds: messageIds, manualImportReason, threadResolutionType: context.type,
         },
+        db: tx,
+        required: true,
       });
-    });
+      return { deduped: false, row };
+    }, { isolationLevel: "Serializable" });
+    return { ok: true, deduped: result.deduped === true, submission: serializeSubmission(result.row) };
   } catch (error) {
-    if (error?.code !== "P2002") throw error;
-    const raced = await client.customContentSubmission.findFirst({ where: { id: submissionId, agencyId, creatorId } });
-    if (raced && sameMessageIds(raced.telegramMessageIds, messageIds)) {
-      assertManualImportTargetMatches(raced, customOrderId);
-      return { ok: true, deduped: true, submission: serializeSubmission(raced) };
-    }
-    throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "Another content submission is already awaiting manager review for this custom order", 409);
+    if (String(error?.code || "") === "P2034") throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_RACE", "Telegram provider source changed concurrently; retry from fresh state", 409);
+    throw error;
   }
-  await audit({
-    agencyId,
-    actorUserId: member.userId || null,
-    action: "custom_content_submission.create",
-    targetType: "CustomContentSubmission",
-    targetId: row.id,
-    metadata: { creatorId, customOrderId, telegramSourceAccountId: sourceAccountId, telegramSourceUserId: sourceUserId, telegramMessageCount: messageIds.length, manualImport: true, manualImportReason },
-    db: client,
-  });
-  return { ok: true, deduped: false, submission: serializeSubmission(row) };
 }
 
 async function withSubmissionSourceLock({ db, agencyId, submissionId, work }) {
@@ -408,7 +484,7 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
     if (ofMediaIds(existing.ofMediaIds).length > 0 && !sameMessageIds(existing.telegramMessageIds, messageIds)) {
       throw fail("CUSTOM_SUBMISSION_SOURCE_FROZEN", "Telegram album changed after OnlyFans relay projection started", 409);
     }
-    const changed = await client.customContentSubmission.updateMany({ where: { id: existing.id, agencyId: event.agencyId, updatedAt: existing.updatedAt }, data: { telegramMessageIds: messageIds, telegramInboundEventIds: sortedEventIds, telegramSourceAccountId: existing.telegramSourceAccountId || String(event.accountId), telegramSourceUserId: existing.telegramSourceUserId || String(event.senderTelegramUserId), receivedAt: sourceEvents[0]?.sentAt || existing.receivedAt } });
+    const changed = await client.customContentSubmission.updateMany({ where: { id: existing.id, agencyId: event.agencyId, updatedAt: existing.updatedAt }, data: { telegramMessageIds: messageIds, telegramInboundEventIds: sortedEventIds, telegramSourceAccountId: existing.telegramSourceAccountId || String(event.accountId), telegramSourceUserId: existing.telegramSourceUserId || String(event.senderTelegramUserId), sourceAuthority: existing.sourceAuthority || event.resolutionAuthority || (String(event.threadResolutionType || "") === "DIRECT_REPLY" ? "PROVIDER_DIRECT_REPLY" : "PROVIDER_ACTIVE_THREAD"), sourceThreadIntentId: existing.sourceThreadIntentId || event.threadAnchorIntentId || null, sourceResolutionEventId: existing.sourceResolutionEventId || String(event.id), receivedAt: sourceEvents[0]?.sentAt || existing.receivedAt } });
     if (Number(changed?.count || 0) !== 1) return createCustomContentSubmissionFromInboundEvent({ eventId: event.id, actorUserId, now, db: client, _sourceLockHeld });
     await client.telegramInboundEvent.updateMany({ where: { id: event.id, submissionId: null }, data: { submissionId: existing.id } });
     const updated = await client.customContentSubmission.findFirst({ where: { id: existing.id, agencyId: event.agencyId } });
@@ -429,6 +505,14 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
   let row;
   try {
     row = await runSubmissionTransaction(client, async (tx) => {
+      if (customOrderId && String(event.resolutionAuthority || "") === "PROVIDER_ACTIVE_THREAD") {
+        const currentThread = await resolveTelegramCustomThread({
+          agencyId: event.agencyId, accountId: event.accountId, senderTelegramUserId: event.senderTelegramUserId, replyToMessageId: null, eventSentAt: event.sentAt, db: tx,
+        });
+        if (currentThread.type !== "UNIQUE_ACTIVE_THREAD" || !targetAllowedByThreadContext(currentThread, { id: customOrderId })) {
+          throw fail("CUSTOM_SUBMISSION_THREAD_NOT_ACTIVE", "The non-Reply Telegram thread is no longer uniquely active for this CustomOrder", 409);
+        }
+      }
       if (customOrderId) {
         await bindContentOrderForSubmission({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, now, db: tx });
         await validateSubmissionLifecycleTarget({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, db: tx });
@@ -443,6 +527,9 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
         telegramSourceKey: sourceKey,
         telegramSourceAccountId: String(event.accountId),
         telegramSourceUserId: String(event.senderTelegramUserId),
+        sourceAuthority: event.resolutionAuthority || (String(event.threadResolutionType || "") === "DIRECT_REPLY" ? "PROVIDER_DIRECT_REPLY" : "PROVIDER_ACTIVE_THREAD"),
+        sourceThreadIntentId: event.threadAnchorIntentId || null,
+        sourceResolutionEventId: String(event.id),
         ofMediaIds: [],
         comment: commentText(event.text),
         receivedAt: event.sentAt || now,

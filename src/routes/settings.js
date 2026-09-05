@@ -265,7 +265,7 @@ router.post("/telegram/runtime/claim", async (req, res) => {
 router.post("/telegram/runtime/:accountId/release", async (req, res) => {
   try {
     requireProductDevice(req, req.body?.deviceId);
-    return res.json(await releaseTelegramExecutionRuntime({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, deviceId: req.body?.deviceId, claimToken: req.body?.claimToken, db: require("../prisma") }));
+    return res.json(await releaseTelegramExecutionRuntime({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId, deviceId: req.body?.deviceId, claimToken: req.body?.claimToken, drained: req.body?.drained === true, db: require("../prisma") }));
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_RUNTIME_RELEASE_FAILED"); }
 });
 

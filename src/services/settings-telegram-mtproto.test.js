@@ -56,9 +56,19 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
       },
       findFirst: async ({ where }) => where.id === "tg-1" && where.agencyId === "agency-1" ? { ...stored } : null,
       update: async ({ where, data }) => { assert.equal(where.id, "tg-1"); stored = { ...stored, ...data }; return { id: "tg-1" }; },
+      updateMany: async ({ where, data }) => {
+        if (!stored || where.id !== "tg-1" || where.agencyId !== "agency-1") return { count: 0 };
+        const state = String(stored.lifecycleState || "ACTIVE");
+        const allowedState = !where.lifecycleState || where.lifecycleState === state
+          || (Array.isArray(where.OR) && where.OR.some((entry) => entry?.lifecycleState === state || (entry?.lifecycleState === null && !stored.lifecycleState)));
+        if (!allowedState) return { count: 0 };
+        stored = { ...stored, ...data };
+        return { count: 1 };
+      },
       delete: async ({ where }) => { assert.equal(where.id, "tg-1"); stored = null; return {}; },
     },
   };
+  db.$transaction = async (fn) => fn(db);
   const owner = { id: "member-owner", userId: "user-owner", role: "OWNER", roleKey: "owner", accessEpoch: 1, assignedCreators: "all" };
   const admin = { id: "member-admin", userId: "user-admin", role: "ADMIN", roleKey: "admin", accessEpoch: 1, assignedCreators: "all" };
   const chatter = { id: "member-chatter", userId: "user-chatter", role: "OPERATOR", roleKey: "chatter", accessEpoch: 1, assignedCreators: ["creator-1"] };
@@ -168,6 +178,17 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
   const after = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", creatorId: "creator-1", purpose: "messaging", ...ownerLease, db });
   assert.equal(after.session, "LOCAL_DESKTOP_SESSION");
 
+  await assert.rejects(
+    () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db }),
+    (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_DRAIN_REQUIRED",
+    "an account that owned a Desktop runtime cannot be deleted until that Desktop proves its durable inbound outbox was drained",
+  );
+  stored = {
+    ...stored,
+    retirementDrainCompletedAt: new Date(),
+    runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null,
+    runtimeLeaseUserId: null, runtimeLeaseMemberId: null, runtimeLeaseAccessEpoch: null, runtimeLeaseCreatorId: null,
+  };
   await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
   assert.equal(stored, null);
 });
@@ -175,11 +196,28 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
 test("Telegram account deletion is fail-closed while Customs delivery/thread/source authority still depends on it", async () => {
   const service = loadSettingsService();
   const owner = { id: "owner", userId: "user-owner", role: "OWNER", roleKey: "owner" };
-  const account = { id: "tg-1", agencyId: "agency-1" };
-  const baseDb = () => ({
-    agencyTelegramMtprotoAccount: { findFirst: async () => account, delete: async () => ({}) },
-    creatorAccount: { updateMany: async () => ({ count: 1 }) },
-  });
+  const baseDb = () => {
+    const account = { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimUntil: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0 };
+    const db = {
+      agencyTelegramMtprotoAccount: {
+        findFirst: async () => ({ ...account }),
+        updateMany: async ({ where, data }) => {
+          const state = String(account.lifecycleState || "ACTIVE");
+          const allowed = !where.lifecycleState || where.lifecycleState === state
+            || (Array.isArray(where.OR) && where.OR.some((entry) => entry?.lifecycleState === state || (entry?.lifecycleState === null && !account.lifecycleState)));
+          if (!allowed) return { count: 0 };
+          if (where.runtimeClaimGeneration !== undefined && Number(where.runtimeClaimGeneration) !== Number(account.runtimeClaimGeneration || 0)) return { count: 0 };
+          if (where.runtimeDrainedGeneration !== undefined && Number(where.runtimeDrainedGeneration) !== Number(account.runtimeDrainedGeneration || 0)) return { count: 0 };
+          Object.assign(account, data);
+          return { count: 1 };
+        },
+        delete: async () => ({}),
+      },
+      creatorAccount: { updateMany: async () => ({ count: 1 }) },
+    };
+    db.$transaction = async (fn) => fn(db);
+    return db;
+  };
 
   {
     const db = baseDb();
@@ -210,11 +248,30 @@ test("Telegram account deletion is fail-closed while Customs delivery/thread/sou
   {
     const db = baseDb();
     db.telegramDeliveryIntent = { findFirst: async () => null, findMany: async () => [] };
-    db.customContentSubmission = { findFirst: async () => ({ id: "submission-1" }) };
+    db.customContentSubmission = { findMany: async ({ where }) => {
+      assert.equal(where.telegramSourceAccountId, "tg-1");
+      return [{ id: "submission-1", reviewStatus: "APPROVED", telegramMessageIds: [501, 502], ofMediaIds: ["9001"] }];
+    } };
     await assert.rejects(
       () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db }),
       (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
-      "pending/revision Custom source media must keep the pinned Telegram account available",
+      "any incomplete pinned Telegram source, including APPROVED content, must keep the provider account available",
+    );
+  }
+
+  {
+    const db = baseDb();
+    db.telegramDeliveryIntent = { findFirst: async () => null, findMany: async () => [] };
+    db.customContentSubmission = { findFirst: async () => null };
+    db.telegramInboundEvent = { findFirst: async ({ where }) => {
+      assert.equal(where.accountId, "tg-1");
+      assert.deepEqual(where.projectionState.in, ["PENDING", "FAILED_RETRYABLE", "REVIEW_REQUIRED"]);
+      return { id: "inbound-unresolved-1", projectionState: "REVIEW_REQUIRED" };
+    } };
+    await assert.rejects(
+      () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db }),
+      (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
+      "unresolved canonical provider observations must block account retirement before credentials can be orphaned",
     );
   }
 });
@@ -301,4 +358,90 @@ test("Backend is MTProto storage-only: Desktop gets local material and hands a s
   assert.match(telegramAccountBlock, /runtimeClaimToken\s+String\?/);
   assert.match(telegramAccountBlock, /runtimeClaimUntil\s+DateTime\?/);
   assert.doesNotMatch(telegramAccountBlock, /createdAt|updatedAt|deletedAt|username|displayName|phone/);
+});
+
+test("Telegram planning and account retirement serialize on the account row so new business work wins without leaving RETIRING poison", async () => {
+  const settings = loadSettingsService();
+  const { planTelegramDeliveryIntent } = require("./telegram-delivery-authority-service");
+  const owner = { id: "member-owner-race", userId: "user-owner-race", role: "OWNER", roleKey: "owner", accessEpoch: 3, assignedCreators: "all" };
+  const account = { id: "tg-race", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimUntil: null };
+  const creator = { id: "creator-race", agencyId: "agency-1", displayName: "Model", username: "model", status: "READY", deletedAt: null, telegramContact: "@model", telegramUserId: "991", telegramAccountId: "tg-race" };
+  const order = { id: "order-race", agencyId: "agency-1", creatorId: creator.id, dialogId: "dialog-race", scenario: "race", type: "CONTENT", status: "PENDING", telegramTaskMessageId: null, createdAt: new Date("2026-09-05T12:00:00.000Z"), updatedAt: new Date("2026-09-05T12:00:00.000Z"), creator };
+  const intents = [];
+  let createSeq = 0;
+  let txTail = Promise.resolve();
+  let plannerTouchedResolve;
+  const plannerTouched = new Promise((resolve) => { plannerTouchedResolve = resolve; });
+  let allowPlannerResolve;
+  const allowPlanner = new Promise((resolve) => { allowPlannerResolve = resolve; });
+  let pausePlannerAccountTouch = true;
+
+  const db = {
+    creatorAccount: {
+      findFirst: async ({ where }) => where.id === creator.id && where.agencyId === "agency-1" ? { ...creator } : null,
+      updateMany: async () => ({ count: 0 }),
+    },
+    agencyTelegramMtprotoAccount: {
+      findFirst: async ({ where }) => where.id === account.id && where.agencyId === account.agencyId ? { ...account } : null,
+      updateMany: async ({ where, data }) => {
+        const expected = where.lifecycleState;
+        const activeOrLegacy = Array.isArray(where.OR) && where.OR.some((part) => part?.lifecycleState === "ACTIVE");
+        const matchesState = expected ? String(account.lifecycleState) === String(expected) : (activeOrLegacy ? String(account.lifecycleState) === "ACTIVE" : true);
+        if (where.id !== account.id || where.agencyId !== account.agencyId || !matchesState) return { count: 0 };
+        if (pausePlannerAccountTouch && expected === "ACTIVE" && data.lifecycleState === "ACTIVE") {
+          pausePlannerAccountTouch = false;
+          plannerTouchedResolve();
+          await allowPlanner;
+        }
+        Object.assign(account, data);
+        return { count: 1 };
+      },
+      delete: async () => { account.lifecycleState = "RETIRED"; return {}; },
+    },
+    customOrder: {
+      findFirst: async ({ where }) => {
+        if (where.id === order.id && where.agencyId === order.agencyId) return { ...order, creator: { ...creator } };
+        if (where.agencyId === order.agencyId && where.status === "PENDING" && where.id?.in?.includes(order.id)) return { id: order.id };
+        return null;
+      },
+    },
+    telegramDeliveryIntent: {
+      findUnique: async ({ where }) => intents.find((row) => row.logicalKey === where.logicalKey) || null,
+      findFirst: async ({ where }) => intents.find((row) => {
+        if (where.agencyId && row.agencyId !== where.agencyId) return false;
+        if (where.accountId && row.accountId !== where.accountId) return false;
+        if (where.state?.in && !where.state.in.includes(row.state)) return false;
+        return true;
+      }) || null,
+      findMany: async () => [],
+      create: async ({ data }) => {
+        const row = { id: `intent-race-${++createSeq}`, claimRevision: 0, claimUntil: null, commitStartedAt: null, remoteMessageId: null, remoteRecipientTelegramUserId: null, remoteSentAt: null, outcomeReason: null, confirmationAuthority: null, confirmedAt: null, createdAt: new Date(), updatedAt: new Date(), ...structuredClone(data) };
+        intents.push(row);
+        return { ...row };
+      },
+    },
+    customContentSubmission: { findFirst: async () => null },
+    telegramInboundEvent: { findFirst: async () => null },
+    auditLog: { create: async ({ data }) => ({ id: "audit-race", ...data }) },
+    async $transaction(fn) {
+      const previous = txTail;
+      let release;
+      txTail = new Promise((resolve) => { release = resolve; });
+      await previous;
+      try { return await fn(this); } finally { release(); }
+    },
+  };
+
+  const planning = planTelegramDeliveryIntent({ agencyId: "agency-1", member: owner, orderId: order.id, kind: "TASK", db });
+  await plannerTouched;
+  const retirement = settings.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: account.id, db });
+  await new Promise((resolve) => setImmediate(resolve));
+  allowPlannerResolve();
+
+  const planned = await planning;
+  assert.equal(planned.created, true);
+  await assert.rejects(retirement, (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE");
+  assert.equal(account.lifecycleState, "ACTIVE", "retirement must not poison the account after a racing planner established durable work first");
+  assert.equal(intents.length, 1);
+  assert.equal(intents[0].state, "PLANNED");
 });
