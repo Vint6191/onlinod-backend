@@ -7,6 +7,7 @@ const { assertExecutionAccessFence } = require("./execution-access-fence-service
 const { assertTelegramRuntimeLease } = require("./telegram-execution-runtime");
 const { reconcilePendingInboundForConfirmedDelivery } = require("./telegram-inbound-authority-service");
 const { canUsePermission } = require("./team-access-control");
+const { lockActiveTelegramAccountReference } = require("./telegram-account-reference-authority-service");
 const {
   nextReminderForOrder,
   readWorkspaceReminderPolicy,
@@ -205,20 +206,16 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
   const existing = await findCanonicalExisting();
   if (existing) return useExisting(existing);
 
-  // Acquire the account row while it is still ACTIVE. This is intentionally a no-op
-  // write: PostgreSQL still takes the row lock, so ACTIVE -> RETIRING cannot cross the
-  // TelegramDeliveryIntent create boundary. Do not silently create provider work against
-  // a RETIRING/RETIRED account even if an earlier read saw it as ACTIVE.
-  if (!db.agencyTelegramMtprotoAccount?.updateMany) {
-    throw fail("TELEGRAM_DELIVERY_ACCOUNT_FENCE_UNAVAILABLE", "Telegram account lifecycle fencing is unavailable", 503);
-  }
-  const activeAccount = await db.agencyTelegramMtprotoAccount.updateMany({
-    where: { id: String(accountId), agencyId, lifecycleState: "ACTIVE" },
-    data: { lifecycleState: "ACTIVE" },
+  await lockActiveTelegramAccountReference({
+    agencyId,
+    accountId,
+    db,
+    notFoundCode: "CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED",
+    retiringCode: "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING",
+    unavailableCode: "TELEGRAM_DELIVERY_ACCOUNT_FENCE_UNAVAILABLE",
+    notFoundMessage: "Telegram connection assigned to this Custom order no longer exists",
+    retiringMessage: "Telegram connection is retiring and cannot accept new Custom delivery work",
   });
-  if (Number(activeAccount?.count || 0) !== 1) {
-    throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING", "Telegram connection is retiring and cannot accept new Custom delivery work", 409);
-  }
   try {
     const row = await db.telegramDeliveryIntent.create({ data: {
       agencyId, creatorId: order.creatorId, customOrderId: order.id, accountId, kind, logicalKey: key,

@@ -1,5 +1,7 @@
 "use strict";
 
+const { activeLifecycleWhere } = require("./telegram-account-reference-authority-service");
+
 const SETTINGS_KEY = "telegramCustomReminders";
 const MIN_MINUTES = 1;
 const MAX_MINUTES = 525_600; // 1 year; UI presets are shortcuts, arbitrary values remain supported
@@ -302,10 +304,13 @@ async function readWorkspaceReminderPolicy({ agencyId, db }) {
 async function resolveTelegramAccountId({ agencyId, creator, db }) {
   const assigned = String(creator?.telegramAccountId || "").trim();
   if (assigned) {
-    const exists = await db.agencyTelegramMtprotoAccount.findFirst({ where: { id: assigned, agencyId }, select: { id: true } });
-    if (exists) return exists.id;
+    const exists = await db.agencyTelegramMtprotoAccount.findFirst({ where: { id: assigned, agencyId, ...activeLifecycleWhere() }, select: { id: true } });
+    // An explicit creator assignment is not Auto. If that exact connection is retiring/missing,
+    // fail closed instead of silently rerouting new work through another agency account. Historical
+    // Custom threads use their pinned TASK account independently of this current-work resolver.
+    return exists ? exists.id : null;
   }
-  const rows = await db.agencyTelegramMtprotoAccount.findMany({ where: { agencyId }, select: { id: true }, take: 2, orderBy: { id: "asc" } });
+  const rows = await db.agencyTelegramMtprotoAccount.findMany({ where: { agencyId, ...activeLifecycleWhere() }, select: { id: true }, take: 2, orderBy: { id: "asc" } });
   return rows.length === 1 ? rows[0].id : null;
 }
 

@@ -21,6 +21,7 @@ const {
   updateTelegramCustomReminderSettings,
   addTelegramMtprotoAccount,
   removeTelegramMtprotoAccount,
+  forceRetireLostTelegramMtprotoAccount,
   issueTelegramMtprotoLocalMaterial,
   storeTelegramMtprotoSession,
 } = require("../services/settings-service");
@@ -284,9 +285,22 @@ router.post("/telegram/accounts", async (req, res) => {
 
 router.delete("/telegram/accounts/:accountId", async (req, res) => {
   try {
-    await removeTelegramMtprotoAccount({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
-    return res.json({ ok: true });
+    const result = await removeTelegramMtprotoAccount({ agencyId: req.auth.agencyId, member: req.auth.membership, accountId: req.params.accountId });
+    return res.json(result);
   } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_REMOVE_FAILED"); }
+});
+
+router.post("/telegram/accounts/:accountId/force-retire", async (req, res) => {
+  try {
+    const result = await forceRetireLostTelegramMtprotoAccount({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership,
+      accountId: req.params.accountId,
+      reason: req.body?.reason,
+      acknowledgeLostObservations: req.body?.acknowledgeLostObservations === true,
+    });
+    return res.json(result);
+  } catch (err) { return sendError(res, err, "SETTINGS_TELEGRAM_FORCE_RETIRE_FAILED"); }
 });
 
 router.post("/telegram/accounts/:accountId/local-material", async (req, res) => {

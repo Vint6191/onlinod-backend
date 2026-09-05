@@ -38,6 +38,7 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
     if (where.runtimeLeaseMemberId !== undefined && row.runtimeLeaseMemberId !== where.runtimeLeaseMemberId) return false;
     if (where.runtimeLeaseAccessEpoch !== undefined && row.runtimeLeaseAccessEpoch !== where.runtimeLeaseAccessEpoch) return false;
     if (Array.isArray(where.OR) && !where.OR.some((candidate) => {
+      if (candidate.lifecycleState !== undefined) return candidate.lifecycleState === null ? row.lifecycleState == null : String(row.lifecycleState || "ACTIVE") === String(candidate.lifecycleState);
       if (candidate.runtimeClaimUntil === null) return row.runtimeClaimUntil === null;
       if (candidate.runtimeClaimUntil?.lt) return row.runtimeClaimUntil && new Date(row.runtimeClaimUntil) < new Date(candidate.runtimeClaimUntil.lt);
       if (candidate.runtimeClaimedByDeviceId !== undefined) return row.runtimeClaimedByDeviceId === candidate.runtimeClaimedByDeviceId;

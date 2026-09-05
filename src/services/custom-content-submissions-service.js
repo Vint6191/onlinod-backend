@@ -7,6 +7,7 @@ const { syncFinalizedSubmissionAssignment } = require("./custom-content-library-
 const { canUsePermission } = require("./team-access-control");
 const { confirmedRelayResult } = require("./custom-relay-result-proof-service");
 const { providerMessageEventId, resolveTelegramCustomThread, targetAllowedByThreadContext } = require("./custom-telegram-thread-authority-service");
+const { lockActiveTelegramAccountReference } = require("./telegram-account-reference-authority-service");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
@@ -265,8 +266,6 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
     throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_FORBIDDEN", "content.review_customs permission is required for explicit raw Telegram import", 403);
   }
   await requireCreatorAccess({ agencyId, member, creatorId, db: client });
-  const sourceAccount = await client.agencyTelegramMtprotoAccount.findFirst({ where: { id: sourceAccountId, agencyId }, select: { id: true } });
-  if (!sourceAccount) throw fail("CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_NOT_FOUND", "Telegram source account was not found in this agency", 404);
   if (!customOrderId) throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_ORDER_REQUIRED", "customOrderId is required for audited historical Telegram import");
   const observedAt = receivedAt(input.receivedAt, now);
   const submissionId = deterministicSubmissionId(agencyId, sourceAccountId, sourceUserId, messageIds);
@@ -298,6 +297,20 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
         }
         throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT", "One or more Telegram provider messages already belong to another submission", 409);
       }
+
+      // F40: a NEW historical provider-source reference and account retirement share one row
+      // lock. Existing exact retries above stay idempotent after retirement because they do not
+      // create new account-dependent work.
+      await lockActiveTelegramAccountReference({
+        agencyId,
+        accountId: sourceAccountId,
+        db: tx,
+        notFoundCode: "CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_NOT_FOUND",
+        retiringCode: "CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_RETIRING",
+        unavailableCode: "CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_FENCE_UNAVAILABLE",
+        notFoundMessage: "Telegram source account was not found in this agency",
+        retiringMessage: "Telegram source account is retiring and cannot accept new historical source work",
+      });
 
       const target = await validateContentOrder({ agencyId, creatorId, customOrderId, db: tx });
       await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: tx });

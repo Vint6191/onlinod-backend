@@ -44,7 +44,7 @@ function fakeDb(seed = {}) {
     {
       id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "lease-1",
       runtimeClaimUntil: new Date("2026-08-21T14:00:00.000Z"), runtimeLeaseUserId: "user-1",
-      runtimeLeaseMemberId: "member-1", runtimeLeaseAccessEpoch: 1, runtimeLeaseCreatorId: "creator-1",
+      runtimeLeaseMemberId: "member-1", runtimeLeaseAccessEpoch: 1, runtimeLeaseCreatorId: "creator-1", lifecycleState: "ACTIVE",
     },
   ]).map(clone);
   const workspaceSettings = new Map(Object.entries(seed.workspaceSettings || { vaultUploadRecipient: "relay_model" }));
@@ -93,6 +93,7 @@ function fakeDb(seed = {}) {
     _mediaAssets: mediaAssets,
     _relayProofs: relayProofs,
     _inboundEvents: inboundEvents,
+    _telegramAccounts: telegramAccounts,
     _audits: audits,
     creatorAccount: {
       async findFirst({ where }) {
@@ -112,8 +113,24 @@ function fakeDb(seed = {}) {
     },
     agencyTelegramMtprotoAccount: {
       async findFirst({ where }) {
-        const row = telegramAccounts.find((candidate) => candidate.agencyId === where.agencyId && candidate.id === where.id);
+        const row = telegramAccounts.find((candidate) => {
+          if (candidate.agencyId !== where.agencyId || candidate.id !== where.id) return false;
+          if (where.lifecycleState !== undefined && String(candidate.lifecycleState || "ACTIVE") !== String(where.lifecycleState)) return false;
+          if (Array.isArray(where.OR) && !where.OR.some((entry) => entry.lifecycleState === String(candidate.lifecycleState || "ACTIVE") || (entry.lifecycleState === null && candidate.lifecycleState == null))) return false;
+          return true;
+        });
         return clone(row || null);
+      },
+      async updateMany({ where, data }) {
+        const row = telegramAccounts.find((candidate) => {
+          if (candidate.agencyId !== where.agencyId || candidate.id !== where.id) return false;
+          if (where.lifecycleState !== undefined && String(candidate.lifecycleState || "ACTIVE") !== String(where.lifecycleState)) return false;
+          if (Array.isArray(where.OR) && !where.OR.some((entry) => entry.lifecycleState === String(candidate.lifecycleState || "ACTIVE") || (entry.lifecycleState === null && candidate.lifecycleState == null))) return false;
+          return true;
+        });
+        if (!row) return { count: 0 };
+        Object.assign(row, clone(data));
+        return { count: 1 };
       },
       async findMany({ where, take = 100 }) {
         return telegramAccounts.filter((row) => {
@@ -296,12 +313,14 @@ function withTransactionalRollback(db) {
     const orderSnapshot = clone(db._orders);
     const submissionSnapshot = clone(db._submissions);
     const inboundSnapshot = clone(db._inboundEvents);
+    const telegramAccountSnapshot = clone(db._telegramAccounts);
     try {
       return await work(db);
     } catch (error) {
       db._orders.splice(0, db._orders.length, ...orderSnapshot.map(clone));
       db._submissions.splice(0, db._submissions.length, ...submissionSnapshot.map(clone));
       db._inboundEvents.splice(0, db._inboundEvents.length, ...inboundSnapshot.map(clone));
+      db._telegramAccounts.splice(0, db._telegramAccounts.length, ...telegramAccountSnapshot.map(clone));
       throw error;
     } finally {
       release();
@@ -1095,4 +1114,100 @@ test("multi-message manual recovery rolls back every earlier source claim when a
   assert.equal(db._inboundEvents.length,0,"message 905 claimed earlier in the losing manual transaction must roll back too");
   assert.equal(db._submissions.length,0);
   assert.equal(db._orders.find((row)=>row.id==="custom-1").contentBoundAt,null);
+});
+
+test("F40 manual historical import rejects a RETIRING source account before provider ownership is created", async () => {
+  const db = withTransactionalRollback(fakeDb({ telegramAccounts: [{ id: "tg-1", agencyId: "agency-1", lifecycleState: "RETIRING" }] }));
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1", member, db,
+      input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1201], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery" },
+    }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_RETIRING" && error?.status === 409,
+  );
+  assert.equal(db._inboundEvents.length, 0);
+  assert.equal(db._submissions.length, 0);
+  assert.equal(db._orders.find((row) => row.id === "custom-1")?.contentBoundAt, null);
+});
+
+test("F40 manual historical import cannot create a dangling source after account deletion", async () => {
+  const db = withTransactionalRollback(fakeDb({ telegramAccounts: [] }));
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1", member, db,
+      input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1202], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery" },
+    }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_NOT_FOUND" && error?.status === 404,
+  );
+  assert.equal(db._inboundEvents.length, 0);
+  assert.equal(db._submissions.length, 0);
+});
+
+test("F40 retirement winning the shared account transaction rejects a racing manual import with no provider/source residue", async () => {
+  const db = withTransactionalRollback(fakeDb());
+  let retireLockedResolve;
+  const retireLocked = new Promise((resolve) => { retireLockedResolve = resolve; });
+  let allowRetireResolve;
+  const allowRetire = new Promise((resolve) => { allowRetireResolve = resolve; });
+
+  const retirement = db.$transaction(async (tx) => {
+    const changed = await tx.agencyTelegramMtprotoAccount.updateMany({
+      where: { id: "tg-1", agencyId: "agency-1", OR: [{ lifecycleState: "ACTIVE" }, { lifecycleState: null }] },
+      data: { lifecycleState: "RETIRING" },
+    });
+    assert.equal(changed.count, 1);
+    retireLockedResolve();
+    await allowRetire;
+  });
+  await retireLocked;
+
+  const importing = createCustomContentSubmission({
+    agencyId: "agency-1", member, db,
+    input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1301], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery" },
+  });
+  allowRetireResolve();
+  await retirement;
+  await assert.rejects(importing, (error) => error?.code === "CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_RETIRING");
+  assert.equal(db._inboundEvents.length, 0);
+  assert.equal(db._submissions.length, 0);
+});
+
+test("F40 manual import winning the shared account transaction commits source before retirement can evaluate blockers", async () => {
+  const db = withTransactionalRollback(fakeDb());
+  const originalCreate = db.telegramInboundEvent.create.bind(db.telegramInboundEvent);
+  let sourceCreatedResolve;
+  const sourceCreated = new Promise((resolve) => { sourceCreatedResolve = resolve; });
+  let allowImportResolve;
+  const allowImport = new Promise((resolve) => { allowImportResolve = resolve; });
+  let paused = false;
+  db.telegramInboundEvent.create = async (args) => {
+    const row = await originalCreate(args);
+    if (!paused) {
+      paused = true;
+      sourceCreatedResolve();
+      await allowImport;
+    }
+    return row;
+  };
+
+  const importing = createCustomContentSubmission({
+    agencyId: "agency-1", member, db,
+    input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1302], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery" },
+  });
+  await sourceCreated;
+
+  const retirement = db.$transaction(async (tx) => {
+    const pendingSource = db._submissions.some((row) => row.telegramSourceAccountId === "tg-1" && (row.telegramMessageIds || []).length > (row.ofMediaIds || []).length);
+    if (pendingSource) return { blocked: true };
+    await tx.agencyTelegramMtprotoAccount.updateMany({ where: { id: "tg-1", agencyId: "agency-1" }, data: { lifecycleState: "RETIRING" } });
+    return { blocked: false };
+  });
+
+  allowImportResolve();
+  const created = await importing;
+  assert.equal(created.ok, true);
+  const retireResult = await retirement;
+  assert.equal(retireResult.blocked, true, "retirement must observe the durable source committed by the winning import");
+  assert.equal(db._telegramAccounts[0].lifecycleState, "ACTIVE");
+  assert.equal(db._submissions.length, 1);
 });

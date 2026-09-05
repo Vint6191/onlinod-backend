@@ -12,6 +12,7 @@ const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
 const { agencyRemovalPhrase, removeCreatorFromAssignedCreators, retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
 const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
+const { updateCreatorTelegramContact } = require("../services/creator-telegram-contact-authority-service");
 const { bumpAgencyAccessEpoch } = require("../services/access-epoch-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const {
@@ -361,60 +362,19 @@ router.get("/:id", creatorAccessRequired, async (req, res) => {
 router.patch("/:id/telegram-contact", creatorManagementRequired, creatorAccessRequired, async (req, res) => {
   try {
     const input = telegramContactSchema.parse(req.body);
-    const existing = await prisma.creatorAccount.findFirst({
-      where: {
-        id: req.params.id,
-        agencyId: req.auth.agencyId,
-        deletedAt: null,
-      },
-      select: { id: true, telegramContact: true, telegramUserId: true, telegramAccountId: true },
-    });
-
-    if (!existing) {
-      return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
-    }
-
-    if (input.telegramAccountId) {
-      const account = await prisma.agencyTelegramMtprotoAccount.findFirst({
-        where: { id: input.telegramAccountId, agencyId: req.auth.agencyId },
-        select: { id: true },
-      });
-      if (!account) return res.status(400).json({ ok: false, code: "CREATOR_TELEGRAM_ACCOUNT_INVALID", error: "Telegram connection does not belong to this workspace" });
-    }
-    const contactChanged = existing.telegramContact !== input.telegramContact;
-    const creator = await prisma.creatorAccount.update({
-      where: { id: existing.id },
-      data: {
-        telegramContact: input.telegramContact,
-        ...(input.telegramAccountId !== undefined ? { telegramAccountId: input.telegramAccountId } : {}),
-        ...(contactChanged ? { telegramUserId: null } : {}),
-      },
-    });
-
-    await audit({
+    const creator = await updateCreatorTelegramContact({
       agencyId: req.auth.agencyId,
       actorUserId: req.auth.userId,
-      action: "creator.telegram_contact.updated",
-      targetType: "creator",
-      targetId: creator.id,
-      metadata: {
-        hadContact: Boolean(existing.telegramContact),
-        hasContact: Boolean(creator.telegramContact),
-        telegramAccountAssigned: Boolean(creator.telegramAccountId),
-      },
+      creatorId: req.params.id,
+      telegramContact: input.telegramContact,
+      telegramAccountId: input.telegramAccountId,
+      db: prisma,
     });
-
     return res.json({ ok: true, creator });
   } catch (err) {
-    if (err?.issues) {
-      return res.status(400).json({
-        ok: false,
-        code: "VALIDATION_ERROR",
-        error: err.issues[0]?.message || "Validation error",
-        issues: err.issues,
-      });
-    }
-
+    if (err?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error", issues: err.issues });
+    const status = Number(err?.status || 0);
+    if (status >= 400 && status < 600) return res.status(status).json({ ok: false, code: err?.code || "CREATOR_TELEGRAM_CONTACT_UPDATE_FAILED", error: err?.message || "Failed to update Telegram contact" });
     console.error("[creators/telegram-contact] failed:", err);
     return res.status(500).json({ ok: false, code: "CREATOR_TELEGRAM_CONTACT_UPDATE_FAILED", error: "Failed to update Telegram contact" });
   }

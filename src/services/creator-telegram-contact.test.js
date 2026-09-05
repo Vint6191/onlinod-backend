@@ -28,14 +28,19 @@ test("Telegram contact write is agency-scoped, management-gated and does not exp
   assert.match(route, /agencyId: req\.auth\.agencyId/);
   assert.match(route, /deletedAt: null/);
   assert.match(route, /telegramContactSchema\.parse\(req\.body\)/);
-  assert.match(route, /contactChanged = existing\.telegramContact !== input\.telegramContact/);
+  assert.match(route, /updateCreatorTelegramContact\(\{/);
   assert.match(route, /telegramContact: input\.telegramContact/);
-  assert.match(route, /contactChanged \? \{ telegramUserId: null \} : \{\}/);
-  assert.match(route, /creator\.telegram_contact\.updated/);
-  assert.match(route, /hadContact/);
-  assert.match(route, /hasContact/);
-  assert.match(route, /telegramAccountId/);
-  assert.match(route, /agencyTelegramMtprotoAccount/);
+  assert.match(route, /telegramAccountId: input\.telegramAccountId/);
+  assert.match(route, /db: prisma/);
+  const authority = read("src/services/creator-telegram-contact-authority-service.js");
+  assert.match(authority, /lockActiveTelegramAccountReference/);
+  assert.match(authority, /CREATOR_TELEGRAM_ACCOUNT_RETIRING/);
+  assert.match(authority, /isolationLevel: "Serializable"/);
+  assert.match(authority, /contactChanged = existing\.telegramContact !== telegramContact/);
+  assert.match(authority, /creator\.telegram_contact\.updated/);
+  assert.match(authority, /hadContact/);
+  assert.match(authority, /hasContact/);
+  assert.doesNotMatch(route, /agencyTelegramMtprotoAccount\.(findFirst|updateMany)/, "route must not pre-read or mutate Telegram account lifecycle outside the authority transaction");
   assert.doesNotMatch(route, /api_hash|apiHash|BotFather|sendMessage|local-material|encryptedPayload|session/i);
 });
 

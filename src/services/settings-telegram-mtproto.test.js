@@ -16,13 +16,13 @@ const DEFAULT_REMINDERS = {
   physical: { enabled: false, repeatEveryMinutes: 1440, text: "Напоминание по физическому заказу «{custom}»: проверь статус отправки." },
 };
 
-function loadSettingsService() {
+function loadSettingsService({ auditImpl = async () => null } = {}) {
   const original = Module._load;
   Module._load = function(request, parent, isMain) {
     if (request === "bcryptjs") return { compare: async () => true, hash: async () => "hash" };
     if (request === "../prisma") return {};
     if (request === "./auth-service") return { publicUser: (u) => u, issuePasswordReset: async () => ({ emailResult: { ok: true, skipped: false } }) };
-    if (request === "./audit-service") return { audit: async () => null };
+    if (request === "./audit-service") return { audit: auditImpl };
     if (request === "./team-access-control") return { canUsePermission: async () => true, isOwner: (member) => member?.role === "OWNER" || member?.roleKey === "owner" };
     if (request === "./billing-nowpayments-service") return { publicProviderConfig: () => ({ providerKey: "NOWPAYMENTS", environment: "disabled", configured: false, checkoutAvailable: false, testMode: false, feePaidByUser: false, sandboxActivationEnabled: false, liveAutoPricingEnabled: false, liveCheckoutBlockedByInternalTestMode: false, missingConfiguration: ["NOWPAYMENTS_MODE"] }), recentOrders: async () => [] };
     return original.call(this, request, parent, isMain);
@@ -100,14 +100,14 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
     session: "SESSION_SECRET_VALUE",
     db,
   });
-  assert.deepEqual(added, { available: true, account: { id: "tg-1", apiId: 12345678, sessionReady: true } });
+  assert.deepEqual(added, { available: true, account: { id: "tg-1", apiId: 12345678, sessionReady: true, lifecycleState: "ACTIVE", retirementRequestedAt: null, drainRequired: false, drainCompleted: false, forceRetireAvailable: false } });
   assert.equal(stored.agencyId, "agency-1");
   assert.equal(stored.encryptedPayload.includes("SESSION_SECRET_VALUE"), false);
   assert.equal(stored.encryptedPayload.includes("0123456789abcdef"), false);
   assert.equal(stored.algorithm, "aes-256-gcm");
 
   const listed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: owner, db });
-  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678, sessionReady: true }], reminders: DEFAULT_REMINDERS });
+  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678, sessionReady: true, lifecycleState: "ACTIVE", retirementRequestedAt: null, drainRequired: false, drainCompleted: false, forceRetireAvailable: false }], reminders: DEFAULT_REMINDERS });
   assert.equal(JSON.stringify(listed).includes("SESSION_SECRET_VALUE"), false);
   assert.equal(JSON.stringify(listed).includes("0123456789abcdef"), false);
 
@@ -172,17 +172,17 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
   );
 
   const storedSession = await service.storeTelegramMtprotoSession({ agencyId: "agency-1", member: owner, accountId: "tg-1", session: "LOCAL_DESKTOP_SESSION", db });
-  assert.deepEqual(storedSession, { id: "tg-1", apiId: 12345678, sessionReady: true });
+  assert.deepEqual(storedSession, { id: "tg-1", apiId: 12345678, sessionReady: true, lifecycleState: "ACTIVE", retirementRequestedAt: null, drainRequired: false, drainCompleted: false, forceRetireAvailable: false });
   assert.equal(stored.encryptedPayload.includes("LOCAL_DESKTOP_SESSION"), false);
   const ownerLease = leaseTo(owner, "device-owner");
   const after = await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", creatorId: "creator-1", purpose: "messaging", ...ownerLease, db });
   assert.equal(after.session, "LOCAL_DESKTOP_SESSION");
 
-  await assert.rejects(
-    () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db }),
-    (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_DRAIN_REQUIRED",
-    "an account that owned a Desktop runtime cannot be deleted until that Desktop proves its durable inbound outbox was drained",
-  );
+  const retiring = await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
+  assert.equal(retiring.ok, true);
+  assert.equal(retiring.retired, false);
+  assert.equal(retiring.lifecycleState, "RETIRING");
+  assert.equal(retiring.drainRequired, true, "committed ACTIVE -> RETIRING is returned as lifecycle state, not a generic failed DELETE");
   stored = {
     ...stored,
     retirementDrainCompletedAt: new Date(),
@@ -331,6 +331,7 @@ test("Backend is MTProto storage-only: Desktop gets local material and hands a s
   assert.match(routeSource, /router\.patch\("\/telegram\/reminders"/);
   assert.match(routeSource, /router\.post\("\/telegram\/accounts"/);
   assert.match(routeSource, /router\.delete\("\/telegram\/accounts\/:accountId"/);
+  assert.match(routeSource, /router\.post\("\/telegram\/accounts\/:accountId\/force-retire"/);
   assert.match(routeSource, /router\.post\("\/telegram\/accounts\/:accountId\/local-material"/);
   assert.match(routeSource, /router\.put\("\/telegram\/accounts\/:accountId\/session"/);
   assert.match(routeSource, /router\.post\("\/telegram\/runtime\/claim"/);
@@ -388,7 +389,7 @@ test("Telegram planning and account retirement serialize on the account row so n
         const activeOrLegacy = Array.isArray(where.OR) && where.OR.some((part) => part?.lifecycleState === "ACTIVE");
         const matchesState = expected ? String(account.lifecycleState) === String(expected) : (activeOrLegacy ? String(account.lifecycleState) === "ACTIVE" : true);
         if (where.id !== account.id || where.agencyId !== account.agencyId || !matchesState) return { count: 0 };
-        if (pausePlannerAccountTouch && expected === "ACTIVE" && data.lifecycleState === "ACTIVE") {
+        if (pausePlannerAccountTouch && (expected === "ACTIVE" || activeOrLegacy) && data.lifecycleState === "ACTIVE") {
           pausePlannerAccountTouch = false;
           plannerTouchedResolve();
           await allowPlanner;
@@ -444,4 +445,125 @@ test("Telegram planning and account retirement serialize on the account row so n
   assert.equal(account.lifecycleState, "ACTIVE", "retirement must not poison the account after a racing planner established durable work first");
   assert.equal(intents.length, 1);
   assert.equal(intents[0].state, "PLANNED");
+});
+
+
+test("F42 current Telegram account resolution excludes RETIRING accounts", async () => {
+  const { resolveTelegramAccountId } = require("./custom-order-reminders");
+  const rows = [
+    { id: "tg-active", agencyId: "agency-1", lifecycleState: "ACTIVE" },
+    { id: "tg-retiring", agencyId: "agency-1", lifecycleState: "RETIRING" },
+  ];
+  const matchesLifecycle = (row, where) => {
+    if (where.lifecycleState !== undefined && String(row.lifecycleState || "ACTIVE") !== String(where.lifecycleState)) return false;
+    if (Array.isArray(where.OR) && !where.OR.some((part) => part.lifecycleState === row.lifecycleState || (part.lifecycleState === null && row.lifecycleState == null))) return false;
+    return true;
+  };
+  const db = { agencyTelegramMtprotoAccount: {
+    findFirst: async ({ where }) => rows.find((row) => row.id === where.id && row.agencyId === where.agencyId && matchesLifecycle(row, where)) || null,
+    findMany: async ({ where, take }) => rows.filter((row) => row.agencyId === where.agencyId && matchesLifecycle(row, where)).slice(0, take),
+  } };
+  assert.equal(await resolveTelegramAccountId({ agencyId: "agency-1", creator: { telegramAccountId: null }, db }), "tg-active");
+  assert.equal(await resolveTelegramAccountId({ agencyId: "agency-1", creator: { telegramAccountId: "tg-retiring" }, db }), null, "explicit RETIRING assignment must fail closed instead of silently rerouting through Auto");
+  rows[0].lifecycleState = "RETIRING";
+  assert.equal(await resolveTelegramAccountId({ agencyId: "agency-1", creator: { telegramAccountId: null }, db }), null);
+});
+
+test("F42 QR session handoff cannot commit after ACTIVE -> RETIRING", async () => {
+  const service = loadSettingsService();
+  const owner = { id: "owner", userId: "user-owner", role: "OWNER", roleKey: "owner" };
+  const account = {
+    id: "tg-1", agencyId: "agency-1", apiId: 12345, lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null,
+    encryptedPayload: "", iv: "", tag: "", algorithm: "aes-256-gcm", payloadVersion: 1,
+  };
+  // Create valid encrypted material through service first.
+  let row = null;
+  const db = {
+    agencyTelegramMtprotoAccount: {
+      create: async ({ data }) => { row = { id: "tg-1", lifecycleState: "ACTIVE", ...data }; return { id: "tg-1", apiId: data.apiId }; },
+      findFirst: async ({ where }) => row && where.id === row.id && where.agencyId === row.agencyId ? { ...row } : null,
+      updateMany: async ({ where, data }) => {
+        if (!row || where.id !== row.id || where.agencyId !== row.agencyId) return { count: 0 };
+        if (where.lifecycleState && String(row.lifecycleState || "ACTIVE") !== String(where.lifecycleState)) return { count: 0 };
+        Object.assign(row, data); return { count: 1 };
+      },
+    },
+    async $transaction(fn) { return fn(this); },
+  };
+  await service.addTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, apiId: 12345, apiHash: "0123456789abcdef0123456789abcdef", db });
+  // Authorization material may have been issued while ACTIVE. Retirement wins before handoff.
+  await service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", purpose: "authorize", db });
+  row.lifecycleState = "RETIRING";
+  await assert.rejects(
+    () => service.issueTelegramMtprotoLocalMaterial({ agencyId: "agency-1", member: owner, accountId: "tg-1", purpose: "authorize", db }),
+    (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_RETIRING",
+    "new QR authorization must be rejected after retirement begins",
+  );
+  await assert.rejects(
+    () => service.storeTelegramMtprotoSession({ agencyId: "agency-1", member: owner, accountId: "tg-1", session: "NEW_SESSION", db }),
+    (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_RETIRING",
+  );
+});
+
+test("F43 force retirement is explicit, audited, and impossible while server blockers remain", async () => {
+  let requiredAuditSeen = false;
+  const service = loadSettingsService({ auditImpl: async (args) => { requiredAuditSeen = args.required === true && args.action === "settings.telegram.account_force_retired_lost_runtime"; return { id: "audit-force" }; } });
+  const owner = { id: "owner", userId: "user-owner", role: "OWNER", roleKey: "owner" };
+  const makeDb = ({ blocker = false } = {}) => {
+    let account = { id: "tg-lost", agencyId: "agency-1", apiId: 7, lifecycleState: "RETIRING", retirementRequestedAt: new Date(), retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimUntil: null };
+    const creators = [{ id: "creator-1", agencyId: "agency-1", telegramAccountId: "tg-lost" }];
+    const db = {
+      agencyTelegramMtprotoAccount: {
+        updateMany: async ({ where, data }) => {
+          if (!account || where.id !== account.id || where.agencyId !== account.agencyId || (where.lifecycleState && where.lifecycleState !== account.lifecycleState)) return { count: 0 };
+          Object.assign(account, data); return { count: 1 };
+        },
+        findFirst: async ({ where }) => account && where.id === account.id && where.agencyId === account.agencyId ? { ...account } : null,
+        delete: async () => { account = null; return {}; },
+      },
+      telegramDeliveryIntent: { findFirst: async () => blocker ? ({ id: "intent-1", state: "RECONCILE_REQUIRED" }) : null, findMany: async () => [] },
+      customContentSubmission: { findMany: async () => [] },
+      telegramInboundEvent: { findFirst: async () => null },
+      creatorAccount: { updateMany: async ({ where, data }) => { for (const creator of creators) if (creator.agencyId === where.agencyId && creator.telegramAccountId === where.telegramAccountId) Object.assign(creator, data); return { count: 1 }; } },
+      async $transaction(fn) { return fn(this); },
+      _get: () => ({ account, creators }),
+    };
+    return db;
+  };
+
+  const blocked = makeDb({ blocker: true });
+  await assert.rejects(() => service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "PC destroyed", acknowledgeLostObservations: true, db: blocked }), (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE");
+  assert.ok(blocked._get().account, "server blockers prevent force deletion");
+
+  const live = makeDb();
+  live._get().account.runtimeClaimedByDeviceId = "device-live";
+  live._get().account.runtimeClaimUntil = new Date(Date.now() + 60_000);
+  await assert.rejects(() => service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "PC lost", acknowledgeLostObservations: true, db: live }), (error) => error?.code === "SETTINGS_TELEGRAM_FORCE_RETIRE_RUNTIME_LIVE");
+
+  const clean = makeDb();
+  await assert.rejects(() => service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "", acknowledgeLostObservations: true, db: clean }), (error) => error?.code === "SETTINGS_TELEGRAM_FORCE_RETIRE_REASON_REQUIRED");
+  await assert.rejects(() => service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "PC destroyed", acknowledgeLostObservations: false, db: clean }), (error) => error?.code === "SETTINGS_TELEGRAM_FORCE_RETIRE_ACK_REQUIRED");
+  const result = await service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "PC destroyed", acknowledgeLostObservations: true, db: clean });
+  assert.equal(result.forced, true);
+  assert.equal(clean._get().account, null);
+  assert.equal(clean._get().creators[0].telegramAccountId, null);
+  assert.equal(requiredAuditSeen, true);
+});
+
+test("F43 mandatory force-retire audit failure rolls back the decision", async () => {
+  const service = loadSettingsService({ auditImpl: async (args) => { assert.equal(args.required, true); throw new Error("audit down"); } });
+  const owner = { id: "owner", userId: "user-owner", role: "OWNER", roleKey: "owner" };
+  let account = { id: "tg-lost", agencyId: "agency-1", lifecycleState: "RETIRING" };
+  const db = {
+    agencyTelegramMtprotoAccount: {
+      updateMany: async ({ where, data }) => account && where.id === account.id && where.lifecycleState === account.lifecycleState ? (Object.assign(account, data), { count: 1 }) : { count: 0 },
+      findFirst: async () => account ? { ...account } : null,
+      delete: async () => { account = null; return {}; },
+    },
+    telegramDeliveryIntent: { findFirst: async () => null, findMany: async () => [] },
+    customContentSubmission: { findMany: async () => [] }, telegramInboundEvent: { findFirst: async () => null }, creatorAccount: { updateMany: async () => ({ count: 0 }) },
+    async $transaction(fn) { return fn(this); },
+  };
+  await assert.rejects(() => service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "lost disk", acknowledgeLostObservations: true, db }), /audit down/);
+  assert.ok(account, "force-retire cannot commit when mandatory audit fails");
 });
