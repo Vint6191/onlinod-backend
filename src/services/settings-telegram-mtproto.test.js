@@ -567,3 +567,92 @@ test("F43 mandatory force-retire audit failure rolls back the decision", async (
   await assert.rejects(() => service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "lost disk", acknowledgeLostObservations: true, db }), /audit down/);
   assert.ok(account, "force-retire cannot commit when mandatory audit fails");
 });
+
+test("F44 retirement blocker remains exact beyond 1000 historical TASKs regardless of insertion order", async () => {
+  const service = loadSettingsService();
+  const owner = { id: "owner", userId: "owner-user", role: "OWNER", roleKey: "owner" };
+  const account = { id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimUntil: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0 };
+  const orders = Array.from({ length: 1001 }, (_, i) => ({ id: `order-${String(i + 1).padStart(4, "0")}`, agencyId: "agency-1", creatorId: "creator-1", status: i === 1000 ? "PENDING" : "COMPLETED" }));
+  const tasks = Array.from({ length: 1001 }, (_, i) => ({ id: `task-${String(i + 1).padStart(4, "0")}`, agencyId: "agency-1", creatorId: "creator-1", customOrderId: `order-${String(i + 1).padStart(4, "0")}`, accountId: "tg-old", kind: "TASK", state: "CONFIRMED" }));
+  const page = (rows, { where = {}, take = rows.length, cursor = null, skip = 0 } = {}, match) => {
+    let out = rows.filter((row) => match(row, where)).slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+    if (cursor?.id) { const idx = out.findIndex((row) => row.id === cursor.id); if (idx >= 0) out = out.slice(idx + (skip ? 1 : 0)); }
+    return out.slice(0, take).map((row) => ({ ...row }));
+  };
+  const matchOrder = (row, where) => {
+    if (where.agencyId && row.agencyId !== where.agencyId) return false;
+    if (where.status && row.status !== where.status) return false;
+    if (where.id?.in && !where.id.in.includes(row.id)) return false;
+    if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+    return true;
+  };
+  const matchIntent = (row, where) => {
+    if (where.agencyId && row.agencyId !== where.agencyId) return false;
+    if (where.accountId && row.accountId !== where.accountId) return false;
+    if (where.kind && row.kind !== where.kind) return false;
+    if (where.state && row.state !== where.state) return false;
+    if (where.customOrderId?.in && !where.customOrderId.in.includes(row.customOrderId)) return false;
+    return true;
+  };
+  for (const taskRows of [tasks, [...tasks].reverse()]) {
+    const state = { ...account };
+    const db = {
+      agencyTelegramMtprotoAccount: {
+        findFirst: async ({ where }) => where.id === state.id && where.agencyId === state.agencyId ? { ...state } : null,
+        updateMany: async ({ where, data }) => {
+          if (where.id !== state.id || where.agencyId !== state.agencyId) return { count: 0 };
+          const current = String(state.lifecycleState || "ACTIVE");
+          const lifecycleOk = !where.lifecycleState || where.lifecycleState === current || (Array.isArray(where.OR) && where.OR.some((entry) => entry.lifecycleState === current || (entry.lifecycleState === null && !state.lifecycleState)));
+          if (!lifecycleOk) return { count: 0 };
+          Object.assign(state, data); return { count: 1 };
+        },
+        delete: async () => { throw new Error("retirement must be blocked before delete"); },
+      },
+      creatorAccount: { updateMany: async () => ({ count: 0 }) },
+      telegramDeliveryIntent: {
+        findFirst: async () => null,
+        findMany: async (args) => page(taskRows, args, matchIntent),
+      },
+      customOrder: {
+        findMany: async (args) => page(orders, args, matchOrder),
+        findFirst: async ({ where }) => orders.find((row) => matchOrder(row, where)) || null,
+      },
+      customContentSubmission: { findMany: async () => [] },
+      telegramInboundEvent: { findFirst: async () => null },
+    };
+    db.$transaction = async (fn) => fn(db);
+    await assert.rejects(
+      () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-old", db }),
+      (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
+    );
+  }
+});
+
+test("F44 retirement blocks incomplete account-pinned source even when source user identity still needs repair", async () => {
+  const service = loadSettingsService();
+  const owner = { id: "owner", userId: "owner-user", role: "OWNER", roleKey: "owner" };
+  const account = { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimUntil: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0 };
+  const db = {
+    agencyTelegramMtprotoAccount: {
+      findFirst: async () => ({ ...account }),
+      updateMany: async ({ data }) => { Object.assign(account, data); return { count: 1 }; },
+      delete: async () => { throw new Error("must remain blocked"); },
+    },
+    creatorAccount: { updateMany: async () => ({ count: 0 }) },
+    telegramDeliveryIntent: { findFirst: async () => null, findMany: async () => [] },
+    customOrder: { findMany: async () => [] },
+    customContentSubmission: {
+      findMany: async ({ where }) => {
+        assert.equal(where.telegramSourceAccountId, "tg-1");
+        assert.equal(where.telegramSourceUserId, undefined, "retirement must not require repaired source-user identity to see the account dependency");
+        return [{ id: "submission-repair", agencyId: "agency-1", creatorId: "creator-1", telegramSourceAccountId: "tg-1", telegramSourceUserId: null, telegramMessageIds: [701], ofMediaIds: [] }];
+      },
+    },
+    telegramInboundEvent: { findFirst: async () => null },
+  };
+  db.$transaction = async (fn) => fn(db);
+  await assert.rejects(
+    () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db }),
+    (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
+  );
+});

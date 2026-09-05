@@ -4,6 +4,8 @@ const crypto = require("node:crypto");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { resolveTelegramAccountId } = require("./custom-order-reminders");
 const { assertExecutionAccessFence } = require("./execution-access-fence-service");
+const { activeLifecycleWhere } = require("./telegram-account-reference-authority-service");
+const { scanAllById, findPendingTaskAnchors, scanIncompleteTelegramSources, scanActiveFollowupIntents, fetchAccountRowsByIds } = require("./telegram-exact-authority-scan-service");
 
 const RUNTIME_LEASE_MS = 90 * 1000;
 const MAX_RUNTIME_CLAIMS = 100;
@@ -13,7 +15,9 @@ function clean(value, max = 180) { const text = String(value == null ? "" : valu
 
 async function eligibleTelegramExecutionAccounts({ agencyId, member, db, includeRetiring = false }) {
   const scope = await allowedCreatorScope({ agencyId, member, db });
-  const creators = await db.creatorAccount.findMany({
+  const creators = [];
+  await scanAllById({
+    delegate: db.creatorAccount,
     where: {
       agencyId,
       deletedAt: null,
@@ -21,114 +25,93 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
       telegramContact: { not: null },
     },
     select: { id: true, telegramAccountId: true },
-    take: 10000,
+    onPage: async (rows) => { creators.push(...rows); return false; },
   });
   if (!creators.length) return [];
-  const accountRows = await db.agencyTelegramMtprotoAccount.findMany({
-    where: { agencyId },
-    select: { id: true, lifecycleState: true }, orderBy: { id: "asc" }, take: 100,
-  });
-  // Treat legacy rows that predate lifecycleState as ACTIVE until the additive migration
-  // backfills them. Retirement is enforced in application code as well as by schema state so
-  // source snapshots / rolling deploys cannot make every Telegram account suddenly ineligible.
-  const accounts = accountRows.filter((row) => {
-    const state = String(row?.lifecycleState || "ACTIVE").toUpperCase();
-    return includeRetiring ? state === "ACTIVE" || state === "RETIRING" : state === "ACTIVE";
-  });
-  if (!accounts.length) return [];
-  const existing = new Set(accounts.map((row) => String(row.id)));
-  const singleAccountId = accounts.length === 1 ? String(accounts[0].id) : null;
-  const byAccount = new Map();
-  const mergeCandidate = ({ accountId, anchorCreatorId, messagingEligible = false, inboundEligible = false }) => {
+
+  const creatorIds = creators.map((row) => String(row.id));
+  const rawCandidates = new Map();
+  const mergeRawCandidate = ({ accountId, anchorCreatorId, messagingEligible = false, inboundEligible = false }) => {
     const normalizedAccountId = clean(accountId);
     const normalizedCreatorId = clean(anchorCreatorId);
-    if (!normalizedAccountId || !normalizedCreatorId || !existing.has(normalizedAccountId)) return;
-    const current = byAccount.get(normalizedAccountId);
+    if (!normalizedAccountId || !normalizedCreatorId) return;
+    const current = rawCandidates.get(normalizedAccountId);
     if (current) {
       current.messagingEligible = current.messagingEligible === true || messagingEligible === true;
       current.inboundEligible = current.inboundEligible === true || inboundEligible === true;
       return;
     }
-    byAccount.set(normalizedAccountId, {
+    rawCandidates.set(normalizedAccountId, {
       accountId: normalizedAccountId,
       anchorCreatorId: normalizedCreatorId,
       messagingEligible: messagingEligible === true,
       inboundEligible: inboundEligible === true,
     });
   };
-  for (const creator of creators) {
-    const assigned = clean(creator.telegramAccountId);
-    const accountId = assigned && existing.has(assigned) ? assigned : (!assigned && singleAccountId ? singleAccountId : null);
-    if (!accountId) continue;
-    mergeCandidate({ accountId, anchorCreatorId: String(creator.id), messagingEligible: true, inboundEligible: true });
+
+  const explicitAssignedIds = Array.from(new Set(creators.map((row) => clean(row.telegramAccountId)).filter(Boolean)));
+  const explicitRows = await fetchAccountRowsByIds({ agencyId, accountIds: explicitAssignedIds, db });
+  const explicitActive = new Set(explicitRows
+    .filter((row) => String(row?.lifecycleState || "ACTIVE").toUpperCase() === "ACTIVE")
+    .map((row) => String(row.id)));
+
+  const autoCreators = creators.filter((row) => !clean(row.telegramAccountId));
+  let autoAccountId = null;
+  if (autoCreators.length && db.agencyTelegramMtprotoAccount?.findMany) {
+    const activeRows = await db.agencyTelegramMtprotoAccount.findMany({
+      where: { agencyId, ...activeLifecycleWhere() },
+      select: { id: true, lifecycleState: true },
+      orderBy: { id: "asc" },
+      take: 2,
+    });
+    if ((activeRows || []).length === 1) autoAccountId = String(activeRows[0].id);
   }
 
-  // Historical Customs source media is account-scoped. A pending proven/manual submission may
-  // still need read access to the account that originally contained its Telegram message IDs
-  // even after the creator's current messaging account was reassigned. This only makes that
-  // account eligible for the existing runtime lease; generic send/resolve still passes through
-  // assertTelegramMessagingAccess and therefore remains bound to the current assignment.
-  if (db.customContentSubmission?.findMany) {
-    const sourceRows = await db.customContentSubmission.findMany({
-      where: { agencyId, creatorId: { in: creators.map((row) => String(row.id)) }, telegramSourceAccountId: { not: null }, telegramSourceUserId: { not: null } },
-      select: { creatorId: true, telegramSourceAccountId: true, telegramSourceUserId: true, telegramMessageIds: true, ofMediaIds: true },
-      take: 1000,
-    });
-    for (const row of sourceRows) {
-      const telegramCount = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.length : 0;
-      const mediaCount = Array.isArray(row.ofMediaIds) ? row.ofMediaIds.length : 0;
-      if (!telegramCount || mediaCount >= telegramCount) continue;
-      const accountId = clean(row.telegramSourceAccountId);
-      if (!accountId || !existing.has(accountId)) continue;
-      mergeCandidate({ accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: false });
-    }
+  for (const creator of creators) {
+    const assigned = clean(creator.telegramAccountId);
+    const accountId = assigned ? (explicitActive.has(assigned) ? assigned : null) : autoAccountId;
+    if (!accountId) continue;
+    mergeRawCandidate({ accountId, anchorCreatorId: String(creator.id), messagingEligible: true, inboundEligible: true });
   }
-  // A confirmed TASK can pin follow-up Customs deliveries (reference/reminder/cancellation)
-  // to an older Telegram account after the creator's mutable assignment changes. Such an account
-  // is runtime-eligible only for the delivery-intent authority; generic messaging/inbound remains
-  // forbidden because messagingEligible stays false.
-  if (db.telegramDeliveryIntent?.findMany) {
-    const deliveryRows = await db.telegramDeliveryIntent.findMany({
-      where: {
-        agencyId,
-        creatorId: { in: creators.map((row) => String(row.id)) },
-        kind: { in: ["REFERENCE", "MANUAL_REMINDER", "AUTO_REMINDER", "CANCELLATION"] },
-        state: { in: ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED"] },
-      },
-      select: { creatorId: true, accountId: true },
-      take: 1000,
-    });
-    for (const row of deliveryRows) {
-      const accountId = clean(row.accountId);
-      if (!accountId || !existing.has(accountId)) continue;
-      mergeCandidate({ accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: false });
-    }
-    const historyRows = await db.telegramDeliveryIntent.findMany({
-      where: {
-        agencyId,
-        creatorId: { in: creators.map((row) => String(row.id)) },
-        kind: "TASK",
-        state: "CONFIRMED",
-        remoteMessageId: { not: null },
-        remoteRecipientTelegramUserId: { not: null },
-      },
-      select: { creatorId: true, customOrderId: true, accountId: true },
-      take: 1000,
-    });
-    const historyOrderIds = Array.from(new Set((historyRows || []).map((row) => clean(row.customOrderId)).filter(Boolean)));
-    const pendingOrders = historyOrderIds.length && db.customOrder?.findMany
-      ? await db.customOrder.findMany({ where: { agencyId, id: { in: historyOrderIds }, status: "PENDING" }, select: { id: true, creatorId: true } })
-      : [];
-    const pendingById = new Map((pendingOrders || []).map((row) => [String(row.id), row]));
-    for (const row of historyRows) {
-      const pending = pendingById.get(String(row.customOrderId));
-      if (!pending || String(pending.creatorId) !== String(row.creatorId)) continue;
-      const accountId = clean(row.accountId);
-      if (!accountId || !existing.has(accountId)) continue;
-      mergeCandidate({ accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: true });
-    }
+
+  // Historical Telegram source work is exact: cursor to exhaustion, never first-N sampling.
+  await scanIncompleteTelegramSources({
+    agencyId,
+    creatorIds,
+    db,
+    onRow: async (row) => {
+      mergeRawCandidate({ accountId: row.telegramSourceAccountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: false });
+      return false;
+    },
+  });
+
+  // Follow-up execution only needs current unresolved states. Drain them to exhaustion rather
+  // than letting old row count determine whether a required pinned account is discovered.
+  await scanActiveFollowupIntents({
+    agencyId,
+    creatorIds,
+    db,
+    onRow: async (row) => {
+      mergeRawCandidate({ accountId: row.accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: false });
+      return false;
+    },
+  });
+
+  // Pending TASK thread discovery starts from CURRENT PENDING orders. Historical terminal TASK
+  // volume therefore cannot hide the one active thread that still needs inbound capability.
+  const pendingTaskAnchors = await findPendingTaskAnchors({ agencyId, creatorIds, db });
+  for (const row of pendingTaskAnchors) {
+    mergeRawCandidate({ accountId: row.accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: true });
   }
-  return [...byAccount.values()];
+
+  if (!rawCandidates.size) return [];
+  const accountRows = await fetchAccountRowsByIds({ agencyId, accountIds: [...rawCandidates.keys()], db });
+  const allowed = new Set(accountRows.filter((row) => {
+    const state = String(row?.lifecycleState || "ACTIVE").toUpperCase();
+    return includeRetiring ? state === "ACTIVE" || state === "RETIRING" : state === "ACTIVE";
+  }).map((row) => String(row.id)));
+
+  return [...rawCandidates.values()].filter((candidate) => allowed.has(candidate.accountId));
 }
 
 async function assertTelegramMessagingAccess({ agencyId, member, accountId, creatorId, db }) {

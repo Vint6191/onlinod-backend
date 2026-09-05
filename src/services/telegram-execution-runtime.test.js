@@ -31,7 +31,8 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
     return true;
   };
   const matchAccount = (row, where = {}) => {
-    if (where.id && row.id !== where.id) return false;
+    if (where.id && typeof where.id === "string" && row.id !== where.id) return false;
+    if (where.id?.in && !where.id.in.includes(row.id)) return false;
     if (where.agencyId && row.agencyId !== where.agencyId) return false;
     if (where.lifecycleState && row.lifecycleState !== where.lifecycleState) return false;
     if (where.runtimeLeaseUserId !== undefined && row.runtimeLeaseUserId !== where.runtimeLeaseUserId) return false;

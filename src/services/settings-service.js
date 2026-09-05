@@ -7,6 +7,7 @@ const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
 const { SETTINGS_KEY: TELEGRAM_CUSTOM_REMINDERS_KEY, normalizeTelegramCustomReminders, reprojectCustomReminderSchedule } = require("./custom-order-reminders");
+const { findPendingTaskAnchors, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
@@ -519,26 +520,21 @@ async function assertTelegramAccountNoBusinessBlockers({ agencyId, accountId, db
   }) : null;
   if (activeIntent) throw Object.assign(new Error("Telegram connection is still required by an active or unresolved Custom delivery"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
 
-  if (db.telegramDeliveryIntent?.findMany && db.customOrder?.findFirst) {
-    const taskRows = await db.telegramDeliveryIntent.findMany({ where: { agencyId, accountId: id, kind: "TASK", state: "CONFIRMED" }, select: { customOrderId: true }, take: 1000 });
-    const orderIds = Array.from(new Set((taskRows || []).map((row) => String(row.customOrderId || "")).filter(Boolean)));
-    if (orderIds.length) {
-      const pendingOrder = await db.customOrder.findFirst({ where: { agencyId, id: { in: orderIds }, status: "PENDING" }, select: { id: true } });
-      if (pendingOrder) throw Object.assign(new Error("Telegram connection is still the canonical thread for a pending Custom order"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
-    }
+  const pendingThread = await findPendingTaskAnchors({ agencyId, accountId: id, db, stopAfterFirst: true });
+  if (pendingThread.length) {
+    throw Object.assign(new Error("Telegram connection is still the canonical thread for a pending Custom order"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
   }
 
-  if (db.customContentSubmission?.findMany) {
-    const sourceRows = await db.customContentSubmission.findMany({ where: { agencyId, telegramSourceAccountId: id }, select: { id: true, telegramMessageIds: true, ofMediaIds: true } });
-    const pendingSource = (sourceRows || []).find((row) => {
-      const sourceCount = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.length : 0;
-      const mediaCount = Array.isArray(row.ofMediaIds) ? row.ofMediaIds.length : 0;
-      return sourceCount > mediaCount;
-    });
-    if (pendingSource) throw Object.assign(new Error("Telegram connection is still required by pending Custom source media"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
-  } else if (db.customContentSubmission?.findFirst) {
-    const pendingSource = await db.customContentSubmission.findFirst({ where: { agencyId, telegramSourceAccountId: id, reviewStatus: { in: ["WAITING_REVIEW", "REVISION_REQUESTED"] } }, select: { id: true } });
-    if (pendingSource) throw Object.assign(new Error("Telegram connection is still required by pending Custom source media"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
+  let pendingSource = null;
+  await scanIncompleteTelegramSources({
+    agencyId,
+    accountId: id,
+    requireSourceUser: false,
+    db,
+    onRow: async (row) => { pendingSource = row; return true; },
+  });
+  if (pendingSource) {
+    throw Object.assign(new Error("Telegram connection is still required by pending Custom source media"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
   }
 
   if (db.telegramInboundEvent?.findFirst) {
