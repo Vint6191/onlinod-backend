@@ -25,11 +25,19 @@ function fakeDb(seed = {}) {
     { id: "creator-1", agencyId: "agency-1", deletedAt: null, displayName: "Model A", username: "a", status: "READY", telegramContact: "@model_a", telegramAccountId: "tg-1", customsVaultFolderId: "vault-1" },
     { id: "creator-2", agencyId: "agency-1", deletedAt: null, displayName: "Model B", username: "b", status: "READY", telegramContact: "@model_b", telegramAccountId: "tg-1", customsVaultFolderId: "vault-2" },
   ]).map(clone);
+  const orderStamp = new Date("2026-08-21T10:00:00.000Z");
   const orders = (seed.orders || [
     { id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", scenario: "custom one", priceCents: 6000 },
     { id: "call-1", agencyId: "agency-1", creatorId: "creator-1", type: "CALL", scenario: "call one", priceCents: 1000 },
     { id: "custom-2", agencyId: "agency-1", creatorId: "creator-2", type: "CONTENT", scenario: "custom two", priceCents: 7000 },
-  ]).map(clone);
+  ]).map((row) => ({
+    status: "PENDING",
+    fanDeliveredAt: null,
+    contentBoundAt: null,
+    createdAt: orderStamp,
+    updatedAt: orderStamp,
+    ...clone(row),
+  }));
   const submissions = (seed.submissions || []).map(clone);
   const mediaAssets = (seed.mediaAssets || []).map(clone);
   const telegramAccounts = (seed.telegramAccounts || [
@@ -80,6 +88,7 @@ function fakeDb(seed = {}) {
   }
 
   return {
+    _orders: orders,
     _submissions: submissions,
     _mediaAssets: mediaAssets,
     _relayProofs: relayProofs,
@@ -124,9 +133,36 @@ function fakeDb(seed = {}) {
       },
     },
     customOrder: {
-      async findFirst({ where }) {
-        const row = orders.find((candidate) => candidate.id === where.id && candidate.agencyId === where.agencyId && candidate.creatorId === where.creatorId);
-        return clone(row || null);
+      async findFirst({ where, select = null }) {
+        const row = orders.find((candidate) =>
+          (where.id === undefined || candidate.id === where.id)
+          && (where.agencyId === undefined || candidate.agencyId === where.agencyId)
+          && (where.creatorId === undefined || candidate.creatorId === where.creatorId)
+          && (where.type === undefined || String(candidate.type || "CONTENT") === String(where.type))
+          && (where.status === undefined || String(candidate.status || "PENDING") === String(where.status))
+          && (where.contentBoundAt === undefined || (where.contentBoundAt === null ? candidate.contentBoundAt == null : candidate.contentBoundAt === where.contentBoundAt))
+        );
+        if (!row) return null;
+        if (!select) return clone(row);
+        const picked = {};
+        for (const [key, enabled] of Object.entries(select)) if (enabled) picked[key] = clone(row[key]);
+        return picked;
+      },
+      async updateMany({ where, data }) {
+        const row = orders.find((candidate) =>
+          (where.id === undefined || candidate.id === where.id)
+          && (where.agencyId === undefined || candidate.agencyId === where.agencyId)
+          && (where.creatorId === undefined || candidate.creatorId === where.creatorId)
+          && (where.type === undefined || String(candidate.type || "CONTENT") === String(where.type))
+          && (where.status === undefined || String(candidate.status || "PENDING") === String(where.status))
+          && (where.contentBoundAt === undefined || (where.contentBoundAt === null ? candidate.contentBoundAt == null : candidate.contentBoundAt === where.contentBoundAt))
+          && (where.updatedAt === undefined || new Date(candidate.updatedAt).getTime() === new Date(where.updatedAt).getTime())
+        );
+        if (!row) return { count: 0 };
+        const previousUpdatedAt = new Date(row.updatedAt);
+        Object.assign(row, clone(data));
+        if (data.updatedAt === undefined) row.updatedAt = new Date(previousUpdatedAt.getTime() + 1);
+        return { count: 1 };
       },
     },
     customContentSubmission: {
@@ -229,6 +265,30 @@ function fakeDb(seed = {}) {
   };
 }
 
+function withTransactionalRollback(db) {
+  let tail = Promise.resolve();
+  db.$transaction = async (work) => {
+    const previous = tail;
+    let release;
+    tail = new Promise((resolve) => { release = resolve; });
+    await previous;
+    const orderSnapshot = clone(db._orders);
+    const submissionSnapshot = clone(db._submissions);
+    const inboundSnapshot = clone(db._inboundEvents);
+    try {
+      return await work(db);
+    } catch (error) {
+      db._orders.splice(0, db._orders.length, ...orderSnapshot.map(clone));
+      db._submissions.splice(0, db._submissions.length, ...submissionSnapshot.map(clone));
+      db._inboundEvents.splice(0, db._inboundEvents.length, ...inboundSnapshot.map(clone));
+      throw error;
+    } finally {
+      release();
+    }
+  };
+  return db;
+}
+
 const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", roleKey: "chatter", role: "OPERATOR", assignedCreators: ["creator-1"], accessEpoch: 1, permissions: { "content.review_customs": true } };
 
 test("Prisma submission ledger stays deliberately compact", () => {
@@ -318,6 +378,26 @@ test("create stores one compact submission row and exact retries are idempotent"
   assert.equal(db._audits.length, 1, "idempotent retries do not create audit noise");
 });
 
+
+test("exact manual-import retry cannot silently change the CustomOrder assignment", async () => {
+  const db = fakeDb({
+    orders: [
+      { id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", scenario: "custom one", priceCents: 6000 },
+      { id: "custom-alt", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", scenario: "custom alt", priceCents: 6500 },
+    ],
+  });
+  const input = { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [551], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" };
+  const first = await createCustomContentSubmission({ agencyId: "agency-1", member, db, input });
+  assert.equal(first.submission.customOrderId, "custom-1");
+
+  await assert.rejects(
+    () => createCustomContentSubmission({ agencyId: "agency-1", member, db, input: { ...input, customOrderId: "custom-alt" } }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_MANUAL_IMPORT_TARGET_CONFLICT" && error?.status === 409,
+  );
+  assert.equal(db._submissions.length, 1);
+  assert.equal(db._submissions[0].customOrderId, "custom-1");
+  assert.equal(db._orders.find((row) => row.id === "custom-alt").contentBoundAt, null, "a dedupe conflict must not bind the requested loser target");
+});
 
 test("manual raw Telegram import is forbidden by the domain service without content.review_customs", async () => {
   const db = fakeDb();
@@ -769,6 +849,74 @@ test("Telegram album members with contradictory proven CustomOrder provenance ne
   assert.deepEqual(first.submission.telegramMessageIds, ["711"]);
   assert.deepEqual(second.submission.telegramMessageIds, ["712"]);
   assert.equal(db._inboundEvents.find((row) => row.id === "event-order-b").submissionId, second.submission.id);
+});
+
+test("first submission bind and CONTENT type edit race on the same CustomOrder revision", async () => {
+  const base = baseSubmission({ customOrderId: null, reviewStatus: "WAITING_REVIEW" });
+  const target = {
+    id: "custom-race", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null,
+    scenario: "race", priceCents: 6000, contentBoundAt: null,
+    createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:00:00.000Z"),
+  };
+
+  // Business type edit wins first: the stale submission bind must fail and attach nothing.
+  let db = fakeDb({ submissions: [base], orders: [target] });
+  const originalUpdateMany = db.customOrder.updateMany.bind(db.customOrder);
+  let injected = false;
+  db.customOrder.updateMany = async (args) => {
+    if (!injected && args?.data?.contentBoundAt) {
+      injected = true;
+      const edited = await originalUpdateMany({
+        where: { id: target.id, agencyId: "agency-1", creatorId: "creator-1", status: "PENDING", updatedAt: args.where.updatedAt },
+        data: { type: "CALL" },
+      });
+      assert.equal(edited.count, 1, "forced type edit must win the stale revision exactly once");
+    }
+    return originalUpdateMany(args);
+  };
+  await assert.rejects(
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: target.id, db }),
+    (error) => ["CUSTOM_SUBMISSION_ORDER_TYPE_INVALID", "CUSTOM_SUBMISSION_ORDER_BIND_CONFLICT"].includes(error?.code),
+  );
+  assert.equal(db._submissions[0].customOrderId, null);
+  assert.equal(db._orders[0].type, "CALL");
+  assert.equal(db._orders[0].contentBoundAt, null);
+
+  // Submission bind wins first: the stale type writer cannot cross the updatedAt fence.
+  db = fakeDb({ submissions: [baseSubmission({ customOrderId: null, reviewStatus: "WAITING_REVIEW" })], orders: [clone(target)] });
+  const staleRevision = new Date(db._orders[0].updatedAt);
+  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: target.id, db });
+  assert.equal(assigned.submission.customOrderId, target.id);
+  assert.ok(db._orders[0].contentBoundAt instanceof Date);
+  const staleEdit = await db.customOrder.updateMany({
+    where: { id: target.id, agencyId: "agency-1", creatorId: "creator-1", status: "PENDING", updatedAt: staleRevision },
+    data: { type: "CALL" },
+  });
+  assert.equal(staleEdit.count, 0, "stale type mutation must lose after content binding advances updatedAt");
+  assert.equal(db._orders[0].type, "CONTENT");
+});
+
+test("losing concurrent reassignment rolls back target content binding", async () => {
+  const base = baseSubmission({ customOrderId: null, reviewStatus: "WAITING_REVIEW" });
+  const stamp = new Date("2026-08-21T10:00:00.000Z");
+  const db = withTransactionalRollback(fakeDb({
+    submissions: [base],
+    orders: [
+      { id: "custom-a", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "A", priceCents: 6000, contentBoundAt: null, createdAt: stamp, updatedAt: stamp },
+      { id: "custom-b", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "B", priceCents: 6000, contentBoundAt: null, createdAt: stamp, updatedAt: stamp },
+    ],
+  }));
+
+  const results = await Promise.allSettled([
+    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-a", db }),
+    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-b", db }),
+  ]);
+  assert.equal(results.filter((item) => item.status === "fulfilled").length, 1);
+  assert.equal(results.filter((item) => item.status === "rejected").length, 1);
+  const winnerId = db._submissions[0].customOrderId;
+  const loserId = winnerId === "custom-a" ? "custom-b" : "custom-a";
+  assert.ok(db._orders.find((row) => row.id === winnerId)?.contentBoundAt, "winning target is durably bound");
+  assert.equal(db._orders.find((row) => row.id === loserId)?.contentBoundAt, null, "losing transaction must not leave a false CONTENT binding");
 });
 
 test("two manager reassignments from the same submission revision cannot both win", async () => {

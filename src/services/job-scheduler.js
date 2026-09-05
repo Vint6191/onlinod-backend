@@ -54,6 +54,8 @@ const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
 const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin setting can override
 const TEAM_MONEY_BACKFILL_BATCH_SIZE = 250; // DB-only historical reconciliation, no OF requests
 const TEAM_PENDING_BACKFILL_BATCH_SIZE = 500; // DB-only Team queue projection repair
+const TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS = 30 * 1000; // lightweight DB-only Customs projection retry
+const TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE = 200;
 let lastRetentionSweepAt = 0;
 
 
@@ -403,6 +405,29 @@ async function maybeReconcileHistoricalTeamMoney() {
   }
 }
 
+async function runTelegramInboundProjectionSweep({ now = new Date() } = {}) {
+  try {
+    // Provider observations are ACKed once TelegramInboundEvent is durable. Any derived
+    // Custom submission/current-state repair after that boundary is server-owned work and
+    // must continue even when no Desktop is open or polling delivery work.
+    const { retryPendingInboundProjections } = require("./telegram-inbound-authority-service");
+    const result = await retryPendingInboundProjections({
+      now,
+      limit: TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,
+      db: prisma,
+    });
+    if (Number(result?.scanned || 0) > 0) {
+      console.log(`[scheduler] Telegram inbound projection — scanned=${result.scanned}, applied=${result.applied || 0}, skipped=${result.skipped || 0}, pending=${result.pending || 0}, review=${result.reviewRequired || 0}`);
+    }
+    return result;
+  } catch (err) {
+    // This lane owns only derived state over already-durable provider observations. A
+    // temporary failure must never suppress the main recurring scheduler.
+    console.warn("[scheduler] Telegram inbound projection failed:", err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
 async function maybeBackfillTeamPendingProjection() {
   try {
     const { backfillTeamPendingProjectionBatch } = require("./team-pending-projection-service");
@@ -536,6 +561,7 @@ async function runRecurringSweep() {
 
 
 let recurringTimer = null;
+let telegramInboundProjectionTimer = null;
 
 /**
  * Start the recurring scheduler. Call once at server startup.
@@ -560,7 +586,16 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   }
 
   recurringTimer = setInterval(tick, intervalMs);
-  console.log(`[scheduler] started (interval=${intervalMs}ms, immediate=${runImmediately})`);
+
+  const projectionTick = () => {
+    runTelegramInboundProjectionSweep().catch((err) => {
+      console.error("[scheduler] Telegram inbound projection sweep crashed:", err);
+    });
+  };
+  if (runImmediately) setTimeout(projectionTick, 5 * 1000);
+  telegramInboundProjectionTimer = setInterval(projectionTick, TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS);
+
+  console.log(`[scheduler] started (interval=${intervalMs}ms, inboundProjectionInterval=${TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS}ms, immediate=${runImmediately})`);
 
   return () => stopRecurringScheduler();
 }
@@ -569,8 +604,12 @@ function stopRecurringScheduler() {
   if (recurringTimer) {
     clearInterval(recurringTimer);
     recurringTimer = null;
-    console.log("[scheduler] stopped");
   }
+  if (telegramInboundProjectionTimer) {
+    clearInterval(telegramInboundProjectionTimer);
+    telegramInboundProjectionTimer = null;
+  }
+  console.log("[scheduler] stopped");
 }
 
 
@@ -587,6 +626,9 @@ module.exports = {
   TRAFFIC_REFRESH_WINDOW_MS,
   RETENTION_SWEEP_WINDOW_MS,
   TEAM_MONEY_BACKFILL_BATCH_SIZE,
+  TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS,
+  TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,
+  runTelegramInboundProjectionSweep,
   maybeRunRetentionSweep,
   maybeReconcileHistoricalTeamMoney,
 };

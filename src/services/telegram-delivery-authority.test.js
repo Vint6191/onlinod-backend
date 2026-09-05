@@ -12,9 +12,12 @@ const {
   markTelegramDeliveryUnknown,
   markTelegramDeliveryProvenNotSent,
   reconcileTelegramDeliveryIntent,
+  replaceTelegramReferencePrecommit,
+  cancelTelegramReferencePrecommit,
   getTelegramOrderContext,
   assertTelegramDeliveryMaterialAccess,
 } = require("./telegram-delivery-authority-service");
+const { updateCustomOrder } = require("./custom-orders-service");
 
 function clone(v) { return v == null ? v : structuredClone(v); }
 function scalar(value) { return value instanceof Date ? value.getTime() : value; }
@@ -233,20 +236,88 @@ test("MANUAL_REMINDER response-loss retry keeps one clientIntentId even when tim
   assert.equal(fx.intents.length, 2);
 });
 
-test("REFERENCE precommit refresh never permits a clientIntentId to change its durable file proof", async () => {
+test("REFERENCE slot has one canonical identity across different clientIntentIds and conflicting proof is bounded", async () => {
   const fx = dbFixture();
   seedConfirmedTaskThread(fx);
-  const clientIntentId = "22222222-2222-4222-8222-222222222222";
+  const firstClientIntentId = "22222222-2222-4222-8222-222222222222";
+  const secondClientIntentId = "22222222-2222-4222-8222-333333333333";
   const reference = { ordinal: 0, name: "a.jpg", size: 10, sha256: "a".repeat(64) };
-  const first = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId, reference, now: fx.now, db: fx.db });
+  const first = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: firstClientIntentId, reference, now: fx.now, db: fx.db });
+  const replay = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: secondClientIntentId, reference, now: new Date(fx.now.getTime() + 500), db: fx.db });
+  assert.equal(replay.intent.id, first.intent.id, "same business slot + same proof must resolve to the same canonical intent");
+  assert.equal(fx.intents.filter((row) => row.kind === "REFERENCE").length, 1);
   await assert.rejects(
-    () => planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId, reference: { ...reference, sha256: "b".repeat(64) }, now: new Date(fx.now.getTime() + 1_000), db: fx.db }),
-    (error) => error?.code === "TELEGRAM_DELIVERY_INTENT_CONFLICT",
+    () => planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: secondClientIntentId, reference: { ...reference, sha256: "b".repeat(64) }, now: new Date(fx.now.getTime() + 1_000), db: fx.db }),
+    (error) => error?.code === "TELEGRAM_REFERENCE_SLOT_CONFLICT" && error?.status === 409,
   );
-  assert.equal(fx.intents.length, 2);
-  const referenceIntent = fx.intents.find((row) => row.kind === "REFERENCE");
-  assert.equal(referenceIntent.id, first.intent.id);
-  assert.equal(referenceIntent.payload.reference.sha256, "a".repeat(64));
+  assert.equal(fx.intents.filter((row) => row.kind === "REFERENCE").length, 1, "conflict must terminate without recursive P2002 creation");
+});
+
+test("REFERENCE replay resolves a legacy client-keyed logicalKey through the canonical ordinal slot without data migration", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx);
+  const reference = { ordinal: 0, name: "legacy.jpg", size: 10, sha256: "e".repeat(64) };
+  const firstClientIntentId = "22222222-2222-4222-8222-aaaaaaaaaaaa";
+  const secondClientIntentId = "22222222-2222-4222-8222-bbbbbbbbbbbb";
+  const first = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: firstClientIntentId, reference, now: fx.now, db: fx.db });
+
+  // Simulate a row written by the pre-closure generation where REFERENCE logicalKey was
+  // client-UUID based. The DB slot (order + kind + ordinal) is still the canonical business
+  // identity, so current code must recover it without requiring a risky data rewrite.
+  first.intent.logicalKey = `telegram:order-1:REFERENCE:${firstClientIntentId}`;
+
+  const replay = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: secondClientIntentId, reference, now: new Date(fx.now.getTime() + 1_000), db: fx.db });
+  assert.equal(replay.intent.id, first.intent.id);
+  assert.equal(fx.intents.filter((row) => row.kind === "REFERENCE").length, 1);
+});
+
+test("REFERENCE concurrent same-slot planning resolves a real P2002 race once and never recurses", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx);
+  const reference = { ordinal: 0, name: "race.jpg", size: 10, sha256: "d".repeat(64) };
+  const originalCreate = fx.db.telegramDeliveryIntent.create.bind(fx.db.telegramDeliveryIntent);
+  let arrivals = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let createCalls = 0;
+  fx.db.telegramDeliveryIntent.create = async ({ data }) => {
+    createCalls += 1;
+    arrivals += 1;
+    if (arrivals === 2) release();
+    await gate;
+    const duplicateSlot = fx.intents.some((row) => row.customOrderId === data.customOrderId && row.kind === "REFERENCE" && Number(row.referenceOrdinal) === Number(data.referenceOrdinal));
+    if (duplicateSlot) { const error = new Error("unique slot race"); error.code = "P2002"; throw error; }
+    return originalCreate({ data });
+  };
+
+  const [a, b] = await Promise.all([
+    planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: "22222222-2222-4222-8222-888888888888", reference, now: fx.now, db: fx.db }),
+    planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: "22222222-2222-4222-8222-999999999999", reference, now: fx.now, db: fx.db }),
+  ]);
+  assert.equal(a.intent.id, b.intent.id);
+  assert.equal(fx.intents.filter((row) => row.kind === "REFERENCE").length, 1);
+  assert.equal(createCalls, 2, "both callers must reach create so the test exercises P2002 recovery");
+});
+
+test("REFERENCE missing-artifact recovery can explicitly replace the same precommit slot", async () => {
+  const fx = dbFixture(); seedConfirmedTaskThread(fx);
+  const first = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: "22222222-2222-4222-8222-444444444444", reference: { ordinal: 0, name: "lost.jpg", size: 10, sha256: "a".repeat(64) }, now: fx.now, db: fx.db });
+  const replaced = await replaceTelegramReferencePrecommit({ agencyId: "agency-1", member: fx.member, intentId: first.intent.id, clientIntentId: "22222222-2222-4222-8222-555555555555", reference: { name: "replacement.jpg", size: 11, sha256: "c".repeat(64) }, now: new Date(fx.now.getTime() + 1_000), db: fx.db });
+  assert.equal(replaced.intent.id, first.intent.id);
+  assert.equal(replaced.intent.referenceOrdinal, 0);
+  assert.equal(replaced.intent.clientIntentId, "22222222-2222-4222-8222-555555555555");
+  assert.equal(replaced.intent.payload.reference.sha256, "c".repeat(64));
+  assert.equal(replaced.intent.state, "PLANNED");
+});
+
+test("REFERENCE precommit skip is terminal-resolved and does not permanently block the next ordinal", async () => {
+  const fx = dbFixture(); seedConfirmedTaskThread(fx);
+  const first = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: "22222222-2222-4222-8222-666666666666", reference: { ordinal: 0, name: "lost.jpg", size: 10, sha256: "a".repeat(64) }, now: fx.now, db: fx.db });
+  const second = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: "22222222-2222-4222-8222-777777777777", reference: { ordinal: 1, name: "next.jpg", size: 12, sha256: "b".repeat(64) }, now: fx.now, db: fx.db });
+  const cancelled = await cancelTelegramReferencePrecommit({ agencyId: "agency-1", member: fx.member, intentId: first.intent.id, reason: "artifact missing", now: fx.now, db: fx.db });
+  assert.equal(cancelled.intent.state, "CANCELLED");
+  const claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: second.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  assert.equal(claimed.claimed, true, "CANCELLED predecessor is resolved and must not fence later references");
 });
 
 test("confirmed TASK pins follow-up account and provider recipient after creator account reassignment", async () => {
@@ -275,6 +346,31 @@ test("confirmed TASK pins follow-up account and provider recipient after creator
   assert.equal(context.accountId, "tg-1");
   assert.equal(context.telegramUserId, "1001");
   assert.deepEqual(context.telegramReferenceMessageIds, ["601"]);
+});
+
+test("TASK commit permit atomically fences a business edit that passed pre-check while the task was only CLAIMED", async () => {
+  let planned; let claimed; let beginOnce = false; let fx;
+  fx = dbFixture({
+    beforeCustomOrderUpdateMany: async ({ data }) => {
+      if (beginOnce || data.scenario === undefined) return;
+      beginOnce = true;
+      const begun = await beginTelegramDeliveryIntent({
+        agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken, now: new Date(fx.now.getTime() + 1_000), db: fx.db,
+      });
+      assert.equal(begun.begun, true);
+      assert.equal(fx.intents[0].state, "COMMITTING");
+    },
+  });
+  planned = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "TASK", now: fx.now, db: fx.db });
+  claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  assert.equal(claimed.claimed, true);
+
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member: fx.member, orderId: "order-1", input: { scenario: "must lose the commit race" }, now: new Date(fx.now.getTime() + 2_000), db: fx.db }),
+    (error) => error?.code === "CUSTOM_ORDER_CONFLICT" && error?.status === 409,
+  );
+  assert.equal(fx.orders[0].scenario, "custom", "the stale business write must not cross the external commit boundary");
+  assert.equal(fx.intents[0].state, "COMMITTING");
 });
 
 test("TASK already COMMITTING is immutable even if the CustomOrder changes afterwards", async () => {
@@ -498,27 +594,65 @@ test("inbound observed before provider receipt is re-correlated after late CONFI
 });
 
 
-test("older reminder receipt settling later cannot regress reminder freshness or schedule", async () => {
+test("two distinct claimed reminders racing begin cannot both cross the provider commit boundary", async () => {
+  let fx; let first; let second; let firstClaim; let secondClaim; let injected = false;
+  fx = dbFixture({
+    beforeCustomOrderUpdateMany: async ({ data }) => {
+      if (injected || data.updatedAt === undefined) return;
+      const firstRow = fx.intents.find((row) => row.id === first?.intent?.id);
+      if (!firstRow || firstRow.state !== "CLAIMED") return;
+      injected = true;
+      const secondBegin = await beginTelegramDeliveryIntent({
+        agencyId: "agency-1", member: fx.member, intentId: second.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: secondClaim.claimToken, now: new Date(fx.now.getTime() + 2_000), db: fx.db,
+      });
+      assert.equal(secondBegin.begun, true);
+    },
+  });
+  seedConfirmedTaskThread(fx);
+  fx.orders[0].telegramTaskMessageId = 501;
+  first = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER", clientIntentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", now: fx.now, db: fx.db });
+  second = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER", clientIntentId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", now: new Date(fx.now.getTime() + 1), db: fx.db });
+  firstClaim = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: first.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  secondClaim = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: second.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  assert.equal(firstClaim.claimed, true);
+  assert.equal(secondClaim.claimed, true);
+
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: first.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: firstClaim.claimToken, now: new Date(fx.now.getTime() + 2_000), db: fx.db }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED" && error?.status === 409,
+  );
+  assert.equal(fx.intents.filter((row) => row.kind === "MANUAL_REMINDER" && row.state === "COMMITTING").length, 1);
+  assert.equal(fx.intents.find((row) => row.id === second.intent.id).state, "COMMITTING");
+  assert.equal(fx.intents.find((row) => row.id === first.intent.id).state, "PLANNED", "the losing claim is safely returned to precommit state");
+});
+
+test("unresolved reminder outcome fences every later reminder commit until settlement", async () => {
   const fx = dbFixture();
   const task = await taskToCommitting(fx);
   await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: task.planned.intent.id, deviceId: "device-1", claimToken: task.claimed.claimToken, remoteMessageId: 700, remoteRecipientTelegramUserId: "900001", remoteSentAt: fx.now, now: fx.now, db: fx.db });
 
+  // Both can be durably planned before either provider effect starts. The physical lane still serializes at begin().
   const r1 = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER", clientIntentId: "33333333-3333-4333-8333-333333333333", now: new Date(fx.now.getTime() + 1_000), db: fx.db });
   const r2 = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER", clientIntentId: "44444444-4444-4444-8444-444444444444", now: new Date(fx.now.getTime() + 2_000), db: fx.db });
   const c1 = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r1.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
   const c2 = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r2.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
   await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r1.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: c1.claimToken, now: fx.now, db: fx.db });
-  await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r2.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: c2.claimToken, now: fx.now, db: fx.db });
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r2.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: c2.claimToken, now: fx.now, db: fx.db }),
+    (error) => error?.code === "CUSTOM_ORDER_REMINDER_OUTCOME_UNRESOLVED" && error?.status === 409,
+  );
+  await assert.rejects(
+    () => planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER", clientIntentId: "55555555-5555-4555-8555-555555555555", now: new Date(fx.now.getTime() + 3_000), db: fx.db }),
+    (error) => error?.code === "CUSTOM_ORDER_REMINDER_OUTCOME_UNRESOLVED",
+  );
 
-  const newerAt = new Date(fx.now.getTime() + 120_000);
-  const olderAt = new Date(fx.now.getTime() + 60_000);
-  await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r2.intent.id, deviceId: "device-1", claimToken: c2.claimToken, remoteMessageId: 702, remoteRecipientTelegramUserId: "900001", remoteSentAt: newerAt, now: new Date(fx.now.getTime() + 121_000), db: fx.db });
-  const nextAfterNewer = fx.orders[0].nextReminderAt ? new Date(fx.orders[0].nextReminderAt).getTime() : null;
-  assert.equal(new Date(fx.orders[0].lastReminderAt).getTime(), newerAt.getTime());
-
-  await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r1.intent.id, deviceId: "device-1", claimToken: c1.claimToken, remoteMessageId: 701, remoteRecipientTelegramUserId: "900001", remoteSentAt: olderAt, now: new Date(fx.now.getTime() + 180_000), db: fx.db });
-  assert.equal(new Date(fx.orders[0].lastReminderAt).getTime(), newerAt.getTime());
-  assert.equal(fx.orders[0].nextReminderAt ? new Date(fx.orders[0].nextReminderAt).getTime() : null, nextAfterNewer);
+  await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r1.intent.id, deviceId: "device-1", claimToken: c1.claimToken, remoteMessageId: 701, remoteRecipientTelegramUserId: "900001", remoteSentAt: new Date(fx.now.getTime() + 10_000), now: new Date(fx.now.getTime() + 11_000), db: fx.db });
+  // The fenced begin deliberately invalidates its precommit claim, so the next attempt must
+  // re-claim after the previous provider outcome becomes authoritative.
+  const c2AfterSettlement = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r2.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: new Date(fx.now.getTime() + 12_000), db: fx.db });
+  assert.equal(c2AfterSettlement.claimed, true);
+  const begun2 = await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: r2.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: c2AfterSettlement.claimToken, now: new Date(fx.now.getTime() + 13_000), db: fx.db });
+  assert.equal(begun2.begun, true, "next reminder may commit only after the previous outcome is settled");
 });
 
 test("derived inbound repair failure cannot downgrade a durable Telegram provider receipt", async () => {

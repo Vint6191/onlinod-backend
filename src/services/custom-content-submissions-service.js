@@ -130,6 +130,17 @@ function sameMessageIds(a, b) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function assertManualImportTargetMatches(existing, requestedCustomOrderId) {
+  const existingOrderId = existing?.customOrderId == null ? null : String(existing.customOrderId);
+  const requestedOrderId = requestedCustomOrderId == null ? null : String(requestedCustomOrderId);
+  if (existingOrderId === requestedOrderId) return;
+  throw fail(
+    "CUSTOM_SUBMISSION_MANUAL_IMPORT_TARGET_CONFLICT",
+    "These Telegram messages already belong to a submission with a different CustomOrder assignment; use the dedicated reassignment workflow",
+    409,
+  );
+}
+
 function deterministicSubmissionId(agencyId, creatorId, sourceAccountId, sourceUserId, messageIds) {
   const canonical = Array.from(new Set(messageIds.map(Number))).sort((a, b) => a - b).join(",");
   const digest = crypto.createHash("sha256").update(`${agencyId}\n${creatorId}\n${sourceAccountId}\n${sourceUserId}\n${canonical}`).digest("hex");
@@ -166,7 +177,7 @@ async function validateContentOrder({ agencyId, creatorId, customOrderId, db }) 
   if (!customOrderId) return null;
   const row = await db.customOrder.findFirst({
     where: { id: customOrderId, agencyId, creatorId },
-    select: { id: true, type: true, status: true, fanDeliveredAt: true },
+    select: { id: true, type: true, status: true, fanDeliveredAt: true, contentBoundAt: true, updatedAt: true },
   });
   if (!row) throw fail("CUSTOM_SUBMISSION_ORDER_NOT_FOUND", "Custom order was not found for this creator", 404);
   if (String(row.type || "CONTENT").toUpperCase() !== "CONTENT") {
@@ -176,6 +187,43 @@ async function validateContentOrder({ agencyId, creatorId, customOrderId, db }) 
     throw fail("CUSTOM_SUBMISSION_ORDER_CLOSED", "Completed, delivered, missed or cancelled custom orders cannot receive new content submissions", 409);
   }
   return row;
+}
+
+async function bindContentOrderForSubmission({ agencyId, creatorId, customOrderId, now = new Date(), db }) {
+  if (!customOrderId) return null;
+  const order = await validateContentOrder({ agencyId, creatorId, customOrderId, db });
+  if (order.contentBoundAt) return order;
+  const revision = order.updatedAt ? new Date(order.updatedAt) : null;
+  if (!revision || !Number.isFinite(revision.getTime())) {
+    throw fail("CUSTOM_SUBMISSION_ORDER_BIND_CONFLICT", "Custom order revision is unavailable while binding the CONTENT lifecycle", 409);
+  }
+  const requestedBoundAt = now instanceof Date ? new Date(now.getTime()) : new Date(now);
+  const boundAt = Number.isFinite(requestedBoundAt.getTime()) ? requestedBoundAt : new Date();
+  const fenceAt = new Date(Math.max(boundAt.getTime(), revision.getTime() + 1));
+  const changed = await db.customOrder.updateMany({
+    where: {
+      id: order.id,
+      agencyId,
+      creatorId,
+      type: "CONTENT",
+      status: "PENDING",
+      contentBoundAt: null,
+      updatedAt: order.updatedAt,
+    },
+    // updatedAt is explicit because it is the cross-service CAS fence. Do not depend on
+    // Prisma @updatedAt implementation details for the type-edit vs submission-bind race.
+    data: { contentBoundAt: boundAt, updatedAt: fenceAt },
+  });
+  if (Number(changed?.count || 0) !== 1) {
+    const fresh = await validateContentOrder({ agencyId, creatorId, customOrderId, db });
+    if (fresh.contentBoundAt) return fresh;
+    throw fail("CUSTOM_SUBMISSION_ORDER_BIND_CONFLICT", "Custom order changed while the CONTENT submission lifecycle was being bound; retry from fresh state", 409);
+  }
+  return { ...order, contentBoundAt: boundAt, updatedAt: fenceAt };
+}
+
+async function runSubmissionTransaction(client, work) {
+  return typeof client?.$transaction === "function" ? client.$transaction(work) : work(client);
 }
 
 async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, excludeSubmissionId = null, db }) {
@@ -227,6 +275,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
   });
   if (overlapping) {
     if (sameMessageIds(overlapping.telegramMessageIds, messageIds)) {
+      assertManualImportTargetMatches(overlapping, customOrderId);
       return { ok: true, deduped: true, submission: serializeSubmission(overlapping) };
     }
     throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT", "One or more Telegram messages already belong to another submission", 409);
@@ -235,25 +284,34 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
 
   let row;
   try {
-    row = await client.customContentSubmission.create({
-      data: {
-        id: submissionId,
-        agencyId,
-        creatorId,
-        customOrderId,
-        telegramMessageIds: messageIds,
-        telegramSourceAccountId: sourceAccountId,
-        telegramSourceUserId: sourceUserId,
-        telegramSourceKey: `manual:${agencyId}:${sourceAccountId}:${sourceUserId}:${submissionId}`,
-        ofMediaIds: [],
-        comment,
-        receivedAt: observedAt,
-      },
+    row = await runSubmissionTransaction(client, async (tx) => {
+      if (customOrderId) {
+        await bindContentOrderForSubmission({ agencyId, creatorId, customOrderId, now, db: tx });
+        // Re-check inside the same transaction as bind + create. The pre-check above is only an
+        // early UX rejection; this one owns the actual business commit boundary.
+        await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: tx });
+      }
+      return tx.customContentSubmission.create({
+        data: {
+          id: submissionId,
+          agencyId,
+          creatorId,
+          customOrderId,
+          telegramMessageIds: messageIds,
+          telegramSourceAccountId: sourceAccountId,
+          telegramSourceUserId: sourceUserId,
+          telegramSourceKey: `manual:${agencyId}:${sourceAccountId}:${sourceUserId}:${submissionId}`,
+          ofMediaIds: [],
+          comment,
+          receivedAt: observedAt,
+        },
+      });
     });
   } catch (error) {
     if (error?.code !== "P2002") throw error;
     const raced = await client.customContentSubmission.findFirst({ where: { id: submissionId, agencyId, creatorId } });
     if (raced && sameMessageIds(raced.telegramMessageIds, messageIds)) {
+      assertManualImportTargetMatches(raced, customOrderId);
       return { ok: true, deduped: true, submission: serializeSubmission(raced) };
     }
     throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "Another content submission is already awaiting manager review for this custom order", 409);
@@ -370,20 +428,26 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
   const submissionId = `cs_${crypto.createHash("sha256").update(`${event.agencyId}\n${sourceKey}`).digest("hex")}`;
   let row;
   try {
-    row = await client.customContentSubmission.create({ data: {
-      id: submissionId,
-      agencyId: event.agencyId,
-      creatorId: event.creatorId,
-      customOrderId,
-      telegramMessageIds: [Number(event.messageId)],
-      telegramInboundEventIds: [String(event.id)],
-      telegramSourceKey: sourceKey,
-      telegramSourceAccountId: String(event.accountId),
-      telegramSourceUserId: String(event.senderTelegramUserId),
-      ofMediaIds: [],
-      comment: commentText(event.text),
-      receivedAt: event.sentAt || now,
-    } });
+    row = await runSubmissionTransaction(client, async (tx) => {
+      if (customOrderId) {
+        await bindContentOrderForSubmission({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, now, db: tx });
+        await validateSubmissionLifecycleTarget({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, db: tx });
+      }
+      return tx.customContentSubmission.create({ data: {
+        id: submissionId,
+        agencyId: event.agencyId,
+        creatorId: event.creatorId,
+        customOrderId,
+        telegramMessageIds: [Number(event.messageId)],
+        telegramInboundEventIds: [String(event.id)],
+        telegramSourceKey: sourceKey,
+        telegramSourceAccountId: String(event.accountId),
+        telegramSourceUserId: String(event.senderTelegramUserId),
+        ofMediaIds: [],
+        comment: commentText(event.text),
+        receivedAt: event.sentAt || now,
+      } });
+    });
   } catch (error) {
     if (String(error?.code || "") !== "P2002") throw error;
     const raced = await client.customContentSubmission.findFirst({ where: { telegramSourceKey: sourceKey } });
@@ -441,13 +505,20 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, db: client });
   let updated;
   try {
-    const changed = await client.customContentSubmission.updateMany({
-      where: { id: row.id, agencyId, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
-      data: { customOrderId: normalizedOrderId },
+    updated = await runSubmissionTransaction(client, async (tx) => {
+      if (normalizedOrderId) {
+        await bindContentOrderForSubmission({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, now, db: tx });
+        await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, db: tx });
+      }
+      const changed = await tx.customContentSubmission.updateMany({
+        where: { id: row.id, agencyId, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
+        data: { customOrderId: normalizedOrderId },
+      });
+      if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_ASSIGNMENT_STALE", "Submission assignment changed while this manager action was being applied", 409);
+      const fresh = await tx.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
+      if (!fresh) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared during reassignment", 404);
+      return fresh;
     });
-    if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_ASSIGNMENT_STALE", "Submission assignment changed while this manager action was being applied", 409);
-    updated = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
-    if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared during reassignment", 404);
   } catch (error) {
     if (error?.code === "P2002") throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "Another content submission is already awaiting manager review for this custom order", 409);
     throw error;

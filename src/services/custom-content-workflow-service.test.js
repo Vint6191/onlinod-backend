@@ -29,8 +29,8 @@ function submission(overrides = {}) {
 function order(id, overrides = {}) {
   return {
     id, agencyId: "agency-1", creatorId: "creator-1", dialogId: id.replace(/\D/g, "") || "777", scenario: `Scenario ${id}`,
-    type: "CONTENT", contentKind: "VIDEO", status: "PENDING", fanDeliveredAt: null,
-    priceCents: 6000, paidAmountCents: 2000, dueAt: null, createdAt: new Date("2026-08-22T10:00:00.000Z"),
+    type: "CONTENT", contentKind: "VIDEO", status: "PENDING", fanDeliveredAt: null, contentBoundAt: null,
+    priceCents: 6000, paidAmountCents: 2000, dueAt: null, createdAt: new Date("2026-08-22T10:00:00.000Z"), updatedAt: new Date("2026-08-22T10:00:00.000Z"),
     creator,
     ...overrides,
   };
@@ -88,6 +88,17 @@ function fakeDb({ submissions = [], orders = [], assets = [] } = {}) {
         return true;
       }).slice(0, take),
       findFirst: async ({ where }) => orders.find((row) => row.id === where.id && row.agencyId === where.agencyId && row.creatorId === where.creatorId) || null,
+      updateMany: async ({ where, data }) => {
+        const row = orders.find((item) => item.id === where.id && item.agencyId === where.agencyId
+          && (where.creatorId === undefined || item.creatorId === where.creatorId)
+          && (where.type === undefined || item.type === where.type)
+          && (where.status === undefined || item.status === where.status)
+          && (where.contentBoundAt === undefined || (where.contentBoundAt === null ? item.contentBoundAt == null : item.contentBoundAt === where.contentBoundAt))
+          && (where.updatedAt === undefined || new Date(item.updatedAt).getTime() === new Date(where.updatedAt).getTime()));
+        if (!row) return { count: 0 };
+        Object.assign(row, data, { updatedAt: new Date(new Date(row.updatedAt).getTime() + 1) });
+        return { count: 1 };
+      },
     },
     creatorMediaAsset: {
       findMany: async ({ where }) => assets.filter((asset) => {

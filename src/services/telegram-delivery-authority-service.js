@@ -17,6 +17,9 @@ const {
 const DELIVERY_KINDS = Object.freeze(["TASK", "REFERENCE", "MANUAL_REMINDER", "AUTO_REMINDER", "CANCELLATION"]);
 const DELIVERY_STATES = Object.freeze(["PLANNED", "CLAIMED", "COMMITTING", "CONFIRMED", "RECONCILE_REQUIRED", "CANCELLED", "FAILED_PRECOMMIT"]);
 const KIND_SET = new Set(DELIVERY_KINDS);
+const REMINDER_KINDS = new Set(["MANUAL_REMINDER", "AUTO_REMINDER"]);
+const UNRESOLVED_REMINDER_STATES = ["COMMITTING", "RECONCILE_REQUIRED"];
+const UNRESOLVED_REFERENCE_STATES = ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED", "FAILED_PRECOMMIT"];
 const CLAIM_MS = 2 * 60 * 1000;
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
@@ -133,8 +136,17 @@ async function resolveIntentProviderBinding({ agencyId, order, kind, db }) {
 async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, payload, now, db }) {
   const key = logicalKey({ agencyId, orderId: order.id, kind, identity });
   const fingerprint = payloadFingerprint(payload);
-  const existing = await db.telegramDeliveryIntent.findUnique({ where: { logicalKey: key } });
-  if (existing) {
+  const findCanonicalExisting = async () => {
+    const byKey = await db.telegramDeliveryIntent.findUnique({ where: { logicalKey: key } });
+    if (byKey) return byKey;
+    if (String(kind) !== "REFERENCE" || !Number.isInteger(Number(referenceOrdinal))) return null;
+    // REFERENCE has exactly one business identity: order + ordinal. clientIntentId is correlation only.
+    return db.telegramDeliveryIntent.findFirst({
+      where: { agencyId, customOrderId: order.id, kind: "REFERENCE", referenceOrdinal: Number(referenceOrdinal) },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    });
+  };
+  const useExisting = async (existing) => {
     const exact = String(existing.payloadFingerprint) === fingerprint && String(existing.creatorId) === String(order.creatorId) && String(existing.accountId) === String(accountId);
     if (exact) return { row: existing, created: false, refreshed: false };
 
@@ -163,15 +175,21 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
         },
       });
       if (Number(changed?.count || 0) === 1) {
-        const fresh = await db.telegramDeliveryIntent.findUnique({ where: { logicalKey: key } });
+        const fresh = await db.telegramDeliveryIntent.findFirst({ where: { id: existing.id, agencyId } });
         return { row: fresh, created: false, refreshed: true };
       }
-      const raced = await db.telegramDeliveryIntent.findUnique({ where: { logicalKey: key } });
+      const raced = await findCanonicalExisting();
       if (raced && String(raced.payloadFingerprint) === fingerprint && String(raced.accountId) === String(accountId)) return { row: raced, created: false, refreshed: false };
       throw fail("TELEGRAM_DELIVERY_INTENT_CONFLICT", "Telegram delivery crossed the commit boundary while its precommit provider binding was being refreshed", 409);
     }
+    if (String(kind) === "REFERENCE" && Number(existing.referenceOrdinal) === Number(referenceOrdinal)) {
+      throw fail("TELEGRAM_REFERENCE_SLOT_CONFLICT", "This reference ordinal is already bound to a different immutable artifact proof", 409);
+    }
     throw fail("TELEGRAM_DELIVERY_INTENT_CONFLICT", "Logical Telegram delivery intent already exists with different immutable payload", 409);
-  }
+  };
+
+  const existing = await findCanonicalExisting();
+  if (existing) return useExisting(existing);
   try {
     const row = await db.telegramDeliveryIntent.create({ data: {
       agencyId, creatorId: order.creatorId, customOrderId: order.id, accountId, kind, logicalKey: key,
@@ -180,11 +198,25 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
     return { row, created: true, refreshed: false };
   } catch (error) {
     if (String(error?.code || "") !== "P2002") throw error;
-    // Concurrent retries may have computed a newer provider/context-derived payload for the same
-    // logical intent. Re-enter the existing-row path so precommit refresh semantics, not a second
-    // identity or a false conflict, decide the winner.
-    return createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, payload, now, db });
+    // Bounded collision recovery. Never recursively retry a unique violation: resolve the one
+    // canonical row (logical key or REFERENCE slot) and adjudicate idempotency/conflict once.
+    const raced = await findCanonicalExisting();
+    if (!raced) throw fail("TELEGRAM_DELIVERY_INTENT_RACE", "Telegram delivery identity collided but the canonical row could not be recovered", 409);
+    return useExisting(raced);
   }
+}
+
+async function findUnresolvedReminder({ agencyId, orderId, excludeIntentId = null, db }) {
+  return db.telegramDeliveryIntent.findFirst({
+    where: {
+      agencyId,
+      customOrderId: String(orderId),
+      kind: { in: Array.from(REMINDER_KINDS) },
+      state: { in: UNRESOLVED_REMINDER_STATES },
+      ...(excludeIntentId ? { id: { not: String(excludeIntentId) } } : {}),
+    },
+    orderBy: [{ commitStartedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+  });
 }
 
 async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, clientIntentId = null, reference = null, now = new Date(), db = null } = {}) {
@@ -210,6 +242,8 @@ async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, cli
   } else if (normalizedKind === "MANUAL_REMINDER") {
     if (status !== "PENDING") throw fail("CUSTOM_ORDER_REMINDER_STATE_INVALID", "Only pending custom orders can be reminded", 409);
     if (order.telegramTaskMessageId == null) throw fail("CUSTOM_ORDER_TELEGRAM_REQUIRED", "Send the custom to Telegram before reminding the model", 409);
+    const unresolvedReminder = await findUnresolvedReminder({ agencyId, orderId: order.id, db: client });
+    if (unresolvedReminder) throw fail("CUSTOM_ORDER_REMINDER_OUTCOME_UNRESOLVED", "A previous reminder outcome is unresolved and must be reconciled before another reminder can be sent", 409);
     binding = await resolveIntentProviderBinding({ agencyId, order, kind: normalizedKind, db: client }); accountId = String(binding.accountId);
     normalizedClientIntentId = uuid(clientIntentId);
     identity = normalizedClientIntentId;
@@ -220,9 +254,9 @@ async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, cli
     if (order.telegramTaskMessageId == null) throw fail("CUSTOM_ORDER_TELEGRAM_TASK_REQUIRED", "Confirm the Telegram task before delivering references", 409);
     binding = await resolveIntentProviderBinding({ agencyId, order, kind: normalizedKind, db: client }); accountId = String(binding.accountId);
     normalizedClientIntentId = uuid(clientIntentId);
-    identity = normalizedClientIntentId;
     const ref = reference && typeof reference === "object" ? reference : {};
     referenceOrdinal = Math.max(0, Math.floor(Number(ref.ordinal) || 0));
+    identity = `slot:${referenceOrdinal}`;
     const name = clean(ref.name, 500); const sha256Value = clean(ref.sha256, 64).toLowerCase(); const size = Number(ref.size);
     if (!name || !/^[0-9a-f]{64}$/.test(sha256Value) || !Number.isSafeInteger(size) || size < 0) throw fail("CUSTOM_ORDER_REFERENCE_PROOF_REQUIRED", "Reference name, size and sha256 are required");
     payload = { reference: { name, size, sha256: sha256Value }, replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId };
@@ -242,6 +276,8 @@ async function ensureAutomaticReminderIntents({ agencyId, member, limit = 25, no
   });
   const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
   for (const order of rows) {
+    const unresolvedReminder = await findUnresolvedReminder({ agencyId, orderId: order.id, db });
+    if (unresolvedReminder) continue;
     let binding;
     try { binding = await loadConfirmedTaskThread({ agencyId, orderId: order.id, db }); } catch { continue; }
     const accountId = String(binding.accountId);
@@ -293,8 +329,8 @@ async function refreshPrecommitIntentFromCurrentState({ row, agencyId, now = new
     const reminderKey = clean(row.payload?.reminderKey, 500) || `MANUAL:${clientIntentId}`;
     payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey };
   } else if (kind === "REFERENCE") {
-    if (!clientIntentId || order.telegramTaskMessageId == null || !row.payload?.reference) return null;
-    identity = String(clientIntentId);
+    if (!clientIntentId || order.telegramTaskMessageId == null || !row.payload?.reference || !Number.isInteger(Number(referenceOrdinal))) return null;
+    identity = `slot:${Number(referenceOrdinal)}`;
     payload = { reference: row.payload.reference, replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId };
   } else if (kind === "AUTO_REMINDER") {
     if (order.telegramTaskMessageId == null) return null;
@@ -370,10 +406,14 @@ async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
     // Preserve reference ordering across crashes: a later file may be planned durably, but it cannot
     // receive a physical commit permit while an earlier reference is unresolved/not confirmed.
     const predecessor = await client.telegramDeliveryIntent.findFirst({
-      where: { agencyId, customOrderId: row.customOrderId, kind: "REFERENCE", referenceOrdinal: { lt: Number(row.referenceOrdinal) }, state: { not: "CONFIRMED" } },
+      where: { agencyId, customOrderId: row.customOrderId, kind: "REFERENCE", referenceOrdinal: { lt: Number(row.referenceOrdinal) }, state: { in: UNRESOLVED_REFERENCE_STATES } },
       orderBy: [{ referenceOrdinal: "asc" }, { createdAt: "asc" }],
     });
     if (predecessor) return { ok: true, claimed: false, busy: true, blockedByIntentId: String(predecessor.id), intent: publicIntent(row), claimToken: null };
+  }
+  if (REMINDER_KINDS.has(String(row.kind))) {
+    const unresolvedReminder = await findUnresolvedReminder({ agencyId, orderId: row.customOrderId, excludeIntentId: row.id, db: client });
+    if (unresolvedReminder) return { ok: true, claimed: false, busy: true, blockedByIntentId: String(unresolvedReminder.id), intent: publicIntent(row), claimToken: null };
   }
   const currentClaimAlive = row.state === "CLAIMED" && row.claimUntil && new Date(row.claimUntil).getTime() > now.getTime();
   if (currentClaimAlive && String(row.deviceId || "") !== normalizedDeviceId) return { ok: true, claimed: false, busy: true, intent: publicIntent(row), claimToken: null };
@@ -418,6 +458,10 @@ async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, dev
   await assertTelegramRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId, claimToken: runtimeClaimToken, now, db });
   await assertExecutionAccessFence({ db, agencyId, creatorId: row.creatorId, userId: row.userId, memberId: row.memberId, accessEpoch: row.accessEpoch, lock: true });
   const kind = String(row.kind);
+  if (REMINDER_KINDS.has(kind)) {
+    const unresolvedReminder = await findUnresolvedReminder({ agencyId, orderId: row.customOrderId, excludeIntentId: row.id, db });
+    if (unresolvedReminder) throw fail("CUSTOM_ORDER_REMINDER_OUTCOME_UNRESOLVED", "A previous reminder outcome is unresolved and fences this reminder commit", 409);
+  }
   if (kind === "TASK") {
     const currentTaskPayload = taskPayload(order);
     if (!/^\d{1,20}$/.test(clean(currentTaskPayload.recipientTelegramUserId, 40))) {
@@ -443,30 +487,74 @@ async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, dev
 }
 
 async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, runtimeClaimToken, claimToken, now = new Date(), db = null } = {}) {
-  const client = db || require("../prisma"); const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
-  if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
-  if (row.state === "CONFIRMED" || row.state === "RECONCILE_REQUIRED" || row.state === "COMMITTING") return { ok: true, begun: false, intent: publicIntent(row) };
-  verifyStoredClaim(row, { deviceId, claimToken });
-  try { await currentBeginGuard({ row, member, agencyId, runtimeClaimToken, deviceId, now, db: client }); }
-  catch (error) {
+  const client = db || require("../prisma");
+  const initial = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
+  if (!initial) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
+  if (["CONFIRMED", "RECONCILE_REQUIRED", "COMMITTING"].includes(String(initial.state))) return { ok: true, begun: false, intent: publicIntent(initial) };
+  verifyStoredClaim(initial, { deviceId, claimToken });
+
+  const beginPermit = async (tx) => {
+    // Re-read inside the transaction. The TASK permit and the CustomOrder updatedAt fence must
+    // become visible atomically, otherwise a business edit can pass its pre-check just before
+    // COMMITTING and write a new model-visible revision after the external effect was permitted.
+    const row = await tx.telegramDeliveryIntent.findFirst({ where: { id: initial.id, agencyId } });
+    if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
+    if (["CONFIRMED", "RECONCILE_REQUIRED", "COMMITTING"].includes(String(row.state))) return { ok: true, begun: false, intent: publicIntent(row) };
+    verifyStoredClaim(row, { deviceId, claimToken });
+
+    const order = await currentBeginGuard({ row, member, agencyId, runtimeClaimToken, deviceId, now, db: tx });
+    const kind = String(row.kind);
+    if (kind === "TASK" || REMINDER_KINDS.has(kind)) {
+      const previousUpdatedAt = order?.updatedAt ? new Date(order.updatedAt) : null;
+      if (!previousUpdatedAt || !Number.isFinite(previousUpdatedAt.getTime())) {
+        throw fail("TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED", "Custom order revision is unavailable before Telegram external commit", 409);
+      }
+      const requestedFenceAt = new Date(now);
+      const fenceAt = new Date(Math.max(
+        Number.isFinite(requestedFenceAt.getTime()) ? requestedFenceAt.getTime() : Date.now(),
+        previousUpdatedAt.getTime() + 1,
+      ));
+      const fenced = await tx.customOrder.updateMany({
+        where: { id: order.id, agencyId, status: "PENDING", updatedAt: order.updatedAt },
+        // updatedAt is deliberately used as a cross-entity CAS fence. TASK uses it to keep
+        // model-visible business edits behind the provider commit boundary. Reminder kinds use
+        // the same order revision as a per-CustomOrder commit-lane mutex: two distinct claimed
+        // reminders that pass the unresolved pre-check concurrently cannot both receive permits.
+        data: { updatedAt: fenceAt },
+      });
+      if (Number(fenced?.count || 0) !== 1) {
+        throw fail("TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED", "Custom order changed while Telegram external commit was being fenced; refresh the existing intent", 409);
+      }
+    }
+
+    const changed = await tx.telegramDeliveryIntent.updateMany({
+      where: { id: row.id, agencyId, state: "CLAIMED", claimRevision: row.claimRevision, claimTokenHash: row.claimTokenHash },
+      data: { state: "COMMITTING", commitStartedAt: now, claimUntil: null },
+    });
+    if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_BEGIN_RACE", "Telegram delivery changed before commit permit", 409);
+    const fresh = await tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+    return { ok: true, begun: true, intent: publicIntent(fresh) };
+  };
+
+  try {
+    return typeof client.$transaction === "function" ? await client.$transaction(beginPermit) : await beginPermit(client);
+  } catch (error) {
+    // Any transaction writes were rolled back. Restore only the still-same precommit claim; an
+    // already-COMMITTING concurrent winner is intentionally untouched by this conditional write.
     const reason = clean(error?.code || error?.message, 500) || "PRECOMMIT_GUARD_FAILED";
     const domainCancelled = String(error?.code || "") === "TELEGRAM_DELIVERY_CONTROL_CHANGED";
     await client.telegramDeliveryIntent.updateMany({
-      where: { id: row.id, agencyId, state: "CLAIMED", claimRevision: row.claimRevision },
+      where: { id: initial.id, agencyId, state: "CLAIMED", claimRevision: initial.claimRevision },
       data: domainCancelled
         ? { state: "CANCELLED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, outcomeReason: reason }
         : { state: "PLANNED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, outcomeReason: `FAILED_PRECOMMIT:${reason}` },
     }).catch(() => undefined);
     if (!domainCancelled && String(error?.code || "") === "TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED") {
-      const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } }).catch(() => null);
+      const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: initial.id, agencyId } }).catch(() => null);
       if (fresh) await refreshPrecommitIntentFromCurrentState({ row: fresh, agencyId, now, db: client }).catch(() => undefined);
     }
     throw error;
   }
-  const changed = await client.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, state: "CLAIMED", claimRevision: row.claimRevision, claimTokenHash: row.claimTokenHash }, data: { state: "COMMITTING", commitStartedAt: now, claimUntil: null } });
-  if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_BEGIN_RACE", "Telegram delivery changed before commit permit", 409);
-  const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
-  return { ok: true, begun: true, intent: publicIntent(fresh) };
 }
 
 async function projectConfirmedIntent({ row, now, db }) {
@@ -615,14 +703,17 @@ async function getTelegramOrderContext({ agencyId, member, orderId, db = null } 
   await requireCreatorAccess({ agencyId, member, creatorId: order.creatorId, db: client });
   const thread = await loadConfirmedTaskThread({ agencyId, orderId: order.id, db: client });
   const references = await client.telegramDeliveryIntent.findMany({
-    where: { agencyId, customOrderId: order.id, kind: "REFERENCE", state: "CONFIRMED", accountId: thread.accountId, remoteRecipientTelegramUserId: thread.recipientTelegramUserId },
+    where: { agencyId, customOrderId: order.id, kind: "REFERENCE" },
     orderBy: [{ referenceOrdinal: "asc" }, { createdAt: "asc" }],
     take: 200,
   });
+  const confirmedReferences = references.filter((row) => String(row.state) === "CONFIRMED" && String(row.accountId) === String(thread.accountId) && String(row.remoteRecipientTelegramUserId || "") === String(thread.recipientTelegramUserId));
+  const recoverableReferences = references.filter((row) => ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(String(row.state)) && row.commitStartedAt == null);
   return {
     ok: true, orderId: String(order.id), creatorId: String(order.creatorId), accountId: thread.accountId, telegramUserId: thread.recipientTelegramUserId,
     telegramTaskMessageId: thread.replyToMessageId,
-    telegramReferenceMessageIds: references.filter((row) => row.remoteMessageId != null).map((row) => String(row.remoteMessageId)),
+    telegramReferenceMessageIds: confirmedReferences.filter((row) => row.remoteMessageId != null).map((row) => String(row.remoteMessageId)),
+    recoverableReferenceIntents: recoverableReferences.map(publicIntent),
   };
 }
 
@@ -656,6 +747,62 @@ async function markTelegramDeliveryUnknown({ agencyId, member, intentId, deviceI
   if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_UNKNOWN_RACE", "Telegram delivery changed while recording unknown outcome", 409);
   const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
   await audit({ agencyId, actorUserId: member?.userId || row.userId || null, action: "custom_order.telegram_delivery_unknown", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, reason: fresh.outcomeReason }, db: client });
+  return { ok: true, idempotent: false, intent: publicIntent(fresh) };
+}
+
+async function replaceTelegramReferencePrecommit({ agencyId, member, intentId, clientIntentId, reference, now = new Date(), db = null } = {}) {
+  const client = db || require("../prisma");
+  const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
+  if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  if (String(row.kind) !== "REFERENCE") throw fail("TELEGRAM_REFERENCE_REPLACE_KIND_INVALID", "Only REFERENCE intents support artifact replacement", 409);
+  if (!["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(String(row.state)) || row.commitStartedAt != null) {
+    throw fail("TELEGRAM_REFERENCE_REPLACE_COMMIT_BOUNDARY", "A reference artifact can only be replaced before Telegram commit begins", 409);
+  }
+  const normalizedClientIntentId = uuid(clientIntentId);
+  const ref = reference && typeof reference === "object" ? reference : {};
+  const name = clean(ref.name, 500); const sha256Value = clean(ref.sha256, 64).toLowerCase(); const size = Number(ref.size);
+  if (!name || !/^[0-9a-f]{64}$/.test(sha256Value) || !Number.isSafeInteger(size) || size < 0) {
+    throw fail("CUSTOM_ORDER_REFERENCE_PROOF_REQUIRED", "Reference name, size and sha256 are required");
+  }
+  const order = await loadOrder({ agencyId, orderId: row.customOrderId, db: client });
+  if (String(order.status || "").toUpperCase() !== "PENDING") throw fail("CUSTOM_ORDER_REFERENCE_STATE_INVALID", "References can only be delivered for a pending custom order", 409);
+  const binding = await resolveIntentProviderBinding({ agencyId, order, kind: "REFERENCE", db: client });
+  const payload = { reference: { name, size, sha256: sha256Value }, replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId };
+  const nextRevision = Number(row.claimRevision || 0) + 1;
+  const changed = await client.telegramDeliveryIntent.updateMany({
+    where: { id: row.id, agencyId, kind: "REFERENCE", state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), commitStartedAt: null },
+    data: {
+      accountId: String(binding.accountId), clientIntentId: normalizedClientIntentId, payload, payloadFingerprint: payloadFingerprint(payload),
+      state: "PLANNED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null,
+      claimRevision: nextRevision, outcomeReason: "REFERENCE_ARTIFACT_REPLACED_PRECOMMIT", updatedAt: now,
+    },
+  });
+  if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_REFERENCE_REPLACE_RACE", "Reference changed while replacing its precommit artifact", 409);
+  const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+  await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_reference_replace_precommit", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, referenceOrdinal: row.referenceOrdinal, oldClientIntentId: row.clientIntentId || null, clientIntentId: normalizedClientIntentId }, db: client });
+  return { ok: true, intent: publicIntent(fresh) };
+}
+
+async function cancelTelegramReferencePrecommit({ agencyId, member, intentId, reason, now = new Date(), db = null } = {}) {
+  const client = db || require("../prisma");
+  const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
+  if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  if (String(row.kind) !== "REFERENCE") throw fail("TELEGRAM_REFERENCE_CANCEL_KIND_INVALID", "Only REFERENCE intents support precommit skip", 409);
+  if (String(row.state) === "CANCELLED") return { ok: true, idempotent: true, intent: publicIntent(row) };
+  if (!["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(String(row.state)) || row.commitStartedAt != null) {
+    throw fail("TELEGRAM_REFERENCE_CANCEL_COMMIT_BOUNDARY", "A reference can only be skipped before Telegram commit begins", 409);
+  }
+  const justification = clean(reason, 500);
+  if (!justification) throw fail("TELEGRAM_REFERENCE_CANCEL_REASON_REQUIRED", "A reason is required to skip a reference slot");
+  const changed = await client.telegramDeliveryIntent.updateMany({
+    where: { id: row.id, agencyId, kind: "REFERENCE", state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), commitStartedAt: null },
+    data: { state: "CANCELLED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, claimRevision: Number(row.claimRevision || 0) + 1, outcomeReason: `REFERENCE_SKIPPED:${justification}`, updatedAt: now },
+  });
+  if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_REFERENCE_CANCEL_RACE", "Reference changed while skipping its precommit slot", 409);
+  const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+  await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_reference_cancel_precommit", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, referenceOrdinal: row.referenceOrdinal, reason: justification }, db: client });
   return { ok: true, idempotent: false, intent: publicIntent(fresh) };
 }
 
@@ -736,6 +883,8 @@ module.exports = {
   markTelegramDeliveryUnknown,
   markTelegramDeliveryProvenNotSent,
   failTelegramDeliveryPrecommit,
+  replaceTelegramReferencePrecommit,
+  cancelTelegramReferencePrecommit,
   getTelegramOrderContext,
   assertTelegramDeliveryMaterialAccess,
   reconcileTelegramDeliveryIntent,

@@ -42,6 +42,8 @@ const {
   markTelegramDeliveryUnknown,
   markTelegramDeliveryProvenNotSent,
   failTelegramDeliveryPrecommit,
+  replaceTelegramReferencePrecommit,
+  cancelTelegramReferencePrecommit,
   getTelegramOrderContext,
   reconcileTelegramDeliveryIntent,
 } = require("../services/telegram-delivery-authority-service");
@@ -362,6 +364,14 @@ router.post("/telegram-deliveries/:intentId/proven-not-sent", async (req, res) =
 router.post("/telegram-deliveries/:intentId/fail-precommit", async (req, res) => {
   try { requireProductDevice(req, req.body?.deviceId); return res.json(await failTelegramDeliveryPrecommit({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, deviceId: req.body?.deviceId, claimToken: req.body?.claimToken, reason: req.body?.reason, db: prisma })); }
   catch (err) { return sendError(res, err, "TELEGRAM_DELIVERY_PRECOMMIT_FAILED"); }
+});
+router.post("/telegram-deliveries/:intentId/reference-replace", async (req, res) => {
+  try { requireProductDevice(req, req.body?.deviceId); return res.json(await replaceTelegramReferencePrecommit({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, clientIntentId: req.body?.clientIntentId, reference: req.body?.reference, db: prisma })); }
+  catch (err) { return sendError(res, err, "TELEGRAM_REFERENCE_REPLACE_FAILED"); }
+});
+router.post("/telegram-deliveries/:intentId/reference-cancel", async (req, res) => {
+  try { requireProductDevice(req, req.body?.deviceId); return res.json(await cancelTelegramReferencePrecommit({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, reason: req.body?.reason, db: prisma })); }
+  catch (err) { return sendError(res, err, "TELEGRAM_REFERENCE_CANCEL_FAILED"); }
 });
 router.post("/telegram-deliveries/:intentId/reconcile", async (req, res) => {
   try {

@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { ingestTelegramInboundEvent, reconcilePendingInboundForConfirmedDelivery } = require("./telegram-inbound-authority-service");
+const { ingestTelegramInboundEvent, reconcilePendingInboundForConfirmedDelivery, projectTelegramInboundEvent, retryPendingInboundProjections } = require("./telegram-inbound-authority-service");
 
 function clone(v){ return v == null ? v : structuredClone(v); }
 function value(v){ return v instanceof Date ? v.getTime() : v; }
@@ -49,6 +49,9 @@ function fixture({ projectedIdentity = false }={}) {
       async findMany({where,take=100}){return orders.filter((x)=>matches(x,where)).slice(0,take).map((r)=>({id:r.id}));},
       async updateMany({where,data}){const r=orders.find((x)=>matches(x,where) && (where.updatedAt===undefined || value(x.updatedAt)===value(where.updatedAt))); if(!r)return{count:0}; Object.assign(r,clone(data),{updatedAt:new Date(r.updatedAt.getTime()+1)}); return{count:1};},
     },
+    customContentSubmission:{
+      async findFirst(){return null;},
+    },
     telegramInboundEvent:{
       async findFirst({where}){return clone(events.find((r)=>matches(r,where))||null);},
       async findMany({where,take=200}){return events.filter((r)=>matches(r,where)).slice(0,take).map(clone);},
@@ -60,7 +63,8 @@ function fixture({ projectedIdentity = false }={}) {
   return {db,member,now,creator,orders,intents,events};
 }
 
-function ingest(fx, extra={}) { return ingestTelegramInboundEvent({ agencyId:"agency-1",member:fx.member,accountId:"tg-1",deviceId:"device-1",claimToken:"runtime-1",senderTelegramUserId:"900001",messageId:801,replyToMessageId:700,hasMedia:false,sentAt:fx.now.toISOString(),now:fx.now,db:fx.db,...extra }); }
+function ingestRaw(fx, extra={}) { return ingestTelegramInboundEvent({ agencyId:"agency-1",member:fx.member,accountId:"tg-1",deviceId:"device-1",claimToken:"runtime-1",senderTelegramUserId:"900001",messageId:801,replyToMessageId:700,hasMedia:false,sentAt:fx.now.toISOString(),now:fx.now,db:fx.db,...extra }); }
+async function ingest(fx, extra={}) { const result=await ingestRaw(fx,extra); await new Promise((resolve)=>setImmediate(resolve)); return result; }
 
 test("confirmed provider recipient identity correlates inbound even when best-effort Creator.telegramUserId projection is missing",async()=>{
   const fx=fixture({projectedIdentity:false});
@@ -141,4 +145,95 @@ test("late manual confirmation without recipient identity still repairs an unres
   assert.equal(fx.events[0].creatorId,"creator-1");
   assert.equal(fx.events[0].customOrderId,"order-1");
   assert.equal(fx.orders[0].telegramLastModelMessageId,907);
+});
+
+
+test("CALL/PHYSICAL media observations ACK before derived submission projection and become SKIPPED_NON_CONTENT without poisoning later inbound",async()=>{
+  for (const type of ["CALL","PHYSICAL"]) {
+    const fx=fixture();
+    fx.orders[0].type=type;
+    fx.orders[0].scheduledAt=type === "CALL" ? new Date(fx.now.getTime()+3600000) : null;
+    fx.orders[0].durationMinutes=type === "CALL" ? 30 : null;
+    fx.orders[0].physicalStatus=type === "PHYSICAL" ? "PLANNED" : null;
+
+    const accepted=await ingestRaw(fx,{messageId:type === "CALL" ? 920 : 930,hasMedia:true});
+    assert.equal(accepted.ok,true);
+    assert.equal(accepted.accepted,true);
+    assert.equal(accepted.event.submissionId,null);
+    assert.equal(accepted.event.projectionState,"PENDING","Desktop ACK must not wait for CONTENT submission projection");
+
+    await new Promise((resolve)=>setImmediate(resolve));
+    assert.equal(fx.events[0].projectionState,"SKIPPED");
+    assert.equal(fx.events[0].projectionReason,"NON_CONTENT_ORDER");
+    assert.equal(fx.events[0].submissionId,null);
+
+    const following=await ingestRaw(fx,{messageId:type === "CALL" ? 921 : 931,hasMedia:false,sentAt:new Date(fx.now.getTime()+1000).toISOString(),now:new Date(fx.now.getTime()+1000)});
+    assert.equal(following.accepted,true,"a non-content media observation must never head-of-line poison later inbound events");
+    assert.equal(fx.events.length,2);
+    await new Promise((resolve)=>setImmediate(resolve));
+  }
+});
+
+
+test("concurrent inbound projectors cannot downgrade a terminal projection with a late retryable result",async()=>{
+  const fx=fixture();
+  const accepted=await ingestRaw(fx,{messageId:940,hasMedia:false});
+  assert.equal(accepted.event.projectionState,"PENDING");
+
+  // Consume the ingest fast-path first so the row is terminal, then deliberately put it back
+  // into PENDING to force two projectors over exactly the same durable observation.
+  await new Promise((resolve)=>setImmediate(resolve));
+  fx.events[0].projectionState="PENDING";
+  fx.events[0].projectionReason=null;
+  fx.events[0].projectedAt=null;
+
+  let firstFind=true;
+  let releaseFail;
+  const failGate=new Promise((resolve)=>{ releaseFail=resolve; });
+  const originalFind=fx.db.customOrder.findFirst.bind(fx.db.customOrder);
+  fx.db.customOrder.findFirst=async(args)=>{
+    if(firstFind){
+      firstFind=false;
+      await failGate;
+      throw Object.assign(new Error("forced stale projector failure"),{code:"FORCED_STALE_PROJECTOR_FAILURE"});
+    }
+    return originalFind(args);
+  };
+
+  const stale=projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"user-1",now:new Date(fx.now.getTime()+1000),db:fx.db});
+  await new Promise((resolve)=>setImmediate(resolve));
+  const winner=await projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"user-1",now:new Date(fx.now.getTime()+1001),db:fx.db});
+  assert.equal(winner.state,"SKIPPED");
+  assert.equal(fx.events[0].projectionState,"SKIPPED");
+  assert.equal(fx.events[0].projectionReason,"NO_MEDIA");
+
+  releaseFail();
+  const staleResult=await stale;
+  assert.equal(staleResult.state,"SKIPPED","the stale worker must report the durable terminal truth, not its discarded retryable attempt");
+  assert.equal(staleResult.reason,"NO_MEDIA");
+  assert.equal(fx.events[0].projectionState,"SKIPPED","a late retryable worker must not downgrade the durable terminal state");
+  assert.equal(fx.events[0].projectionReason,"NO_MEDIA");
+});
+
+
+test("server retry sweep can drain crash-window inbound globally without hot-looping unresolved provenance",async()=>{
+  const fx=fixture();
+  fx.events.push({
+    id:"event-crash-window",agencyId:"agency-1",accountId:"tg-1",creatorId:"creator-1",customOrderId:"order-1",submissionId:null,
+    senderTelegramUserId:"900001",messageId:950,replyToMessageId:700,groupedId:null,hasMedia:false,text:null,
+    sentAt:new Date(fx.now),observedAt:new Date(fx.now),projectionState:"PENDING",projectionReason:null,projectionAttempts:0,projectedAt:null,
+    createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
+  });
+  fx.events.push({
+    id:"event-unresolved",agencyId:"agency-2",accountId:"tg-2",creatorId:null,customOrderId:null,submissionId:null,
+    senderTelegramUserId:"900002",messageId:951,replyToMessageId:null,groupedId:null,hasMedia:true,text:null,
+    sentAt:new Date(fx.now),observedAt:new Date(fx.now),projectionState:"PENDING",projectionReason:"CREATOR_UNRESOLVED",projectionAttempts:1,projectedAt:null,
+    createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
+  });
+
+  const result=await retryPendingInboundProjections({now:new Date(fx.now.getTime()+1000),limit:50,db:fx.db});
+  assert.equal(result.scanned,1,"global server sweep should select the crash-window row without requiring an agency/Desktop caller");
+  assert.equal(fx.events[0].projectionState,"SKIPPED");
+  assert.equal(fx.events[0].projectionReason,"NO_MEDIA");
+  assert.equal(fx.events[1].projectionState,"PENDING","CREATOR_UNRESOLVED waits for receipt-driven reconciliation instead of hot-looping");
 });

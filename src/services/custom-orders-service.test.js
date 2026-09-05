@@ -38,6 +38,7 @@ function fakeDb(seed = {}) {
     },
   };
   const rows = (seed.orders || []).map(clone);
+  const contentSubmissions = (seed.submissions || []).map(clone);
   const accounts = (seed.accounts || [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null }]).map(clone);
   const deliveryIntents = [];
   let seq = 0;
@@ -96,7 +97,7 @@ function fakeDb(seed = {}) {
   }
 
   return {
-    _rows: rows,
+    _rows: rows, _deliveryIntents: deliveryIntents,
     workspaceSetting: { async findUnique() { return null; } },
     agencyMember: {
       async findFirst({ where }) {
@@ -131,6 +132,14 @@ function fakeDb(seed = {}) {
           && (where.telegramContact?.not !== null || row.telegramContact !== null)).map(clone);
       },
     },
+    customContentSubmission: {
+      async findFirst({ where }) {
+        return clone(contentSubmissions.find((row) =>
+          (where.agencyId === undefined || row.agencyId === where.agencyId)
+          && (where.customOrderId === undefined || row.customOrderId === where.customOrderId)
+        ) || null);
+      },
+    },
     customOrder: {
       async create({ data }) {
         const now = new Date("2026-08-17T20:00:00.000Z");
@@ -161,6 +170,16 @@ function fakeDb(seed = {}) {
     },
     telegramDeliveryIntent: {
       async findUnique({ where }) { return clone(deliveryIntents.find((row) => row.logicalKey === where.logicalKey) || null); },
+      async findFirst({ where }) {
+        const row = deliveryIntents.find((candidate) =>
+          (where.id === undefined || candidate.id === where.id)
+          && (where.agencyId === undefined || candidate.agencyId === where.agencyId)
+          && (where.customOrderId === undefined || candidate.customOrderId === where.customOrderId)
+          && (where.kind === undefined || candidate.kind === where.kind)
+          && (where.state === undefined || (where.state?.in ? where.state.in.includes(candidate.state) : candidate.state === where.state))
+        );
+        return clone(row || null);
+      },
       async create({ data }) {
         const row = { id: `telegram-intent-${deliveryIntents.length + 1}`, claimRevision: 0, remoteMessageId: null, remoteSentAt: null, confirmedAt: null, commitStartedAt: null, outcomeReason: null, ...clone(data), updatedAt: new Date("2026-08-17T20:00:00.000Z") };
         deliveryIntents.push(row); return clone(row);
@@ -173,9 +192,12 @@ function fakeDb(seed = {}) {
 
 const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"], accessEpoch: 1 };
 
-test("media ids are stored as a stable de-duplicated space-separated list", () => {
+test("legacy media id parser stays deterministic but CONTENT manual media truth is retired", () => {
   assert.deepEqual(mediaIdsArray("10 20,20;30"), ["10", "20", "30"]);
-  assert.equal(normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "hello", mediaIds: ["10", "20", "10"], price: 12.34 })).mediaIds, "10 20");
+  assert.throws(
+    () => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "hello", mediaIds: ["10", "20", "10"], price: 12.34 })),
+    (error) => error?.code === "CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED" && error?.status === 409,
+  );
 });
 
 test("custom order create is creator-scoped and starts pending", async () => {
@@ -183,13 +205,13 @@ test("custom order create is creator-scoped and starts pending", async () => {
   const result = await createCustomOrder({
     agencyId: "agency-1",
     member,
-    input: withCreateIntent({ creatorId: "creator-1", dialogId: "422411209", scenario: "5 minute custom", dueAt: "2026-08-18T20:00:00Z", price: 150, mediaIds: ["11", "12"] }),
+    input: withCreateIntent({ creatorId: "creator-1", dialogId: "422411209", scenario: "5 minute custom", dueAt: "2026-08-18T20:00:00Z", price: 150 }),
     db,
   });
   assert.equal(result.ok, true);
   assert.equal(result.order.status, "PENDING");
   assert.equal(result.order.priceCents, 15000);
-  assert.deepEqual(result.order.mediaIds, ["11", "12"]);
+  assert.deepEqual(result.order.mediaIds, []);
   assert.equal(result.order.createdBy.name, "Chatter");
   assert.equal("agencyId" in result.order, false);
   assert.equal("creatorId" in result.order, false);
@@ -293,14 +315,14 @@ test("list applies member creator scope and reports pending/overdue counters", a
   assert.deepEqual(result.counts, { pending: 1, completed: 0, missed: 0, cancelled: 0, overdue: 1, dueSoon: 0 });
 });
 
-test("update preserves journal row and serializes completed state", async () => {
+test("CALL manual completion preserves the journal row while CONTENT uses the delivery projector only", async () => {
   const db = fakeDb({ orders: [
-    { id: "order-x", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "old", internalNote: null, status: "PENDING", dueAt: null, acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0, createdAt: new Date("2026-08-17T18:00:00Z"), updatedAt: new Date("2026-08-17T18:00:00Z") },
+    { id: "order-x", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "old", internalNote: null, type: "CALL", contentKind: null, status: "PENDING", dueAt: null, scheduledAt: new Date("2026-08-17T21:00:00Z"), durationMinutes: 30, acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0, telegramTaskMessageId: null, createdAt: new Date("2026-08-17T18:00:00Z"), updatedAt: new Date("2026-08-17T18:00:00Z") },
   ] });
-  const result = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-x", input: { status: "COMPLETED", scenario: "done", mediaIds: "44 45" }, now: new Date("2026-08-17T22:00:00Z"), db });
+  const result = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-x", input: { status: "COMPLETED", scenario: "done" }, now: new Date("2026-08-17T22:00:00Z"), db });
   assert.equal(result.order.status, "COMPLETED");
   assert.equal(result.order.scenario, "done");
-  assert.deepEqual(result.order.mediaIds, ["44", "45"]);
+  assert.deepEqual(result.order.mediaIds, []);
   assert.equal(result.order.completedAt, "2026-08-17T22:00:00.000Z");
   assert.equal(serializeOrder(db._rows[0], new Date("2026-08-17T23:00:00Z")).status, "COMPLETED");
 });
@@ -308,9 +330,9 @@ test("update preserves journal row and serializes completed state", async () => 
 
 test("terminal custom orders are immutable and duplicate finalization is idempotent", async () => {
   const db = fakeDb({ orders: [
-    { id: "order-done", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "done", internalNote: null, status: "COMPLETED", dueAt: null, acceptedAt: null, completedAt: new Date("2026-08-17T21:00:00Z"), deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "44", priceCents: 1000, createdAt: new Date("2026-08-17T18:00:00Z"), updatedAt: new Date("2026-08-17T21:00:00Z") },
+    { id: "order-done", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "done", internalNote: null, type: "CALL", contentKind: null, status: "COMPLETED", dueAt: null, scheduledAt: new Date("2026-08-17T20:00:00Z"), durationMinutes: 30, acceptedAt: null, completedAt: new Date("2026-08-17T21:00:00Z"), deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 1000, createdAt: new Date("2026-08-17T18:00:00Z"), updatedAt: new Date("2026-08-17T21:00:00Z") },
   ] });
-  const retry = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", status: "COMPLETED", mediaIds: ["44"] }, db });
+  const retry = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", status: "COMPLETED" }, db });
   assert.equal(retry.order.status, "COMPLETED");
   await assert.rejects(
     () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", status: "CANCELLED", cancelReason: "late" }, db }),
@@ -388,8 +410,12 @@ test("ordinary edits preserve an already scheduled reminder while policy edits r
     reminderConfig: null, nextReminderAt: nextAt, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
     createdAt: new Date("2026-08-19T10:00:00.000Z"), updatedAt: new Date("2026-08-19T12:05:00.000Z"),
   }] });
-  const edited = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { scenario: "after" }, now: new Date("2026-08-19T12:20:00.000Z"), db });
-  assert.equal(edited.order.nextReminderAt, nextAt.toISOString(), "scenario edit must not move the reminder clock");
+  const edited = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { internalNote: "internal only" }, now: new Date("2026-08-19T12:20:00.000Z"), db });
+  assert.equal(edited.order.nextReminderAt, nextAt.toISOString(), "internal edit must not move the reminder clock");
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { scenario: "after" }, now: new Date("2026-08-19T12:21:00.000Z"), db }),
+    (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE",
+  );
 
   const policyEdited = await updateCustomOrder({
     agencyId: "agency-1", member, orderId: "order-timer",
@@ -397,6 +423,123 @@ test("ordinary edits preserve an already scheduled reminder while policy edits r
     now: new Date("2026-08-19T12:30:00.000Z"), db,
   });
   assert.equal(policyEdited.order.nextReminderAt, "2026-08-19T14:00:00.000Z", "first reminder restarts from the explicit policy edit when no reminder was sent yet");
+});
+
+test("confirmed Telegram TASK freezes every model-visible task field but keeps internal/payment edits writable", async () => {
+  const base = {
+    id: "order-frozen", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "original", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING", dueAt: new Date("2026-08-20T18:00:00Z"),
+    scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null, deliveredAt: new Date("2026-08-19T12:05:00Z"),
+    cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 10000, paidAmountCents: 2000, telegramTaskMessageId: 501, telegramReferenceMessageIds: [],
+    reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null,
+    createdAt: new Date("2026-08-19T10:00:00Z"), updatedAt: new Date("2026-08-19T12:05:00Z"),
+  };
+  for (const input of [
+    { scenario: "changed" },
+    { type: "CALL", scheduledAt: "2026-08-20T19:00:00Z", durationMinutes: 30 },
+    { contentKind: "PHOTO" },
+    { dueAt: "2026-08-20T20:00:00Z" },
+  ]) {
+    const db = fakeDb({ orders: [clone(base)] });
+    await assert.rejects(
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-frozen", input, db }),
+      (error) => ["CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE", "CUSTOM_ORDER_TELEGRAM_TASK_TYPE_IMMUTABLE"].includes(error?.code),
+    );
+  }
+  const db = fakeDb({ orders: [clone(base)] });
+  const allowed = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-frozen", input: { internalNote: "manager note", paidAmount: 100 }, db });
+  assert.equal(allowed.order.internalNote, "manager note");
+  assert.equal(allowed.order.paymentStatus, "PAID_IN_FULL");
+});
+
+test("TASK COMMITTING/RECONCILE_REQUIRED fences model-visible edits before provider receipt projection", async () => {
+  for (const state of ["COMMITTING", "RECONCILE_REQUIRED"]) {
+    const db = fakeDb({ orders: [{
+      id: `order-${state}`, agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+      scenario: "original task", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING", dueAt: new Date("2026-08-22T10:00:00.000Z"), scheduledAt: null, durationMinutes: null, physicalStatus: null,
+      acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 6000, paidAmountCents: 0,
+      telegramTaskMessageId: null, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null,
+      createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:00:00.000Z"),
+    }] });
+    db._deliveryIntents.push({
+      id: `task-${state}`, agencyId: "agency-1", customOrderId: `order-${state}`, kind: "TASK", state,
+      commitStartedAt: new Date("2026-08-21T10:05:00.000Z"), createdAt: new Date("2026-08-21T10:00:00.000Z"),
+    });
+    await assert.rejects(
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: `order-${state}`, input: { scenario: "silently diverged task" }, db }),
+      (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE" && error?.status === 409,
+    );
+    const internal = await updateCustomOrder({ agencyId: "agency-1", member, orderId: `order-${state}`, input: { internalNote: "manager-only note" }, db });
+    assert.equal(internal.order.internalNote, "manager-only note");
+  }
+});
+
+test("CONTENT generic update cannot forge completion or OF media provenance", async () => {
+  const row = {
+    id: "order-content-authority", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "content",
+    internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING", dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null,
+    acceptedAt: null, completedAt: null, deliveredAt: null, fanDeliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0, paidAmountCents: 0,
+    telegramTaskMessageId: null, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null,
+    createdAt: new Date("2026-08-19T10:00:00Z"), updatedAt: new Date("2026-08-19T10:00:00Z"),
+  };
+  let db = fakeDb({ orders: [clone(row)] });
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { status: "COMPLETED" }, db }),
+    (error) => error?.code === "CUSTOM_ORDER_CONTENT_COMPLETION_AUTHORITY" && error?.status === 409,
+  );
+  db = fakeDb({ orders: [clone(row)] });
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { mediaIds: ["999"] }, db }),
+    (error) => error?.code === "CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED" && error?.status === 409,
+  );
+});
+
+test("CONTENT type becomes immutable after submission binding, including legacy relation fallback", async () => {
+  const base = {
+    id: "order-content-bound", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "content",
+    internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING", dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null,
+    acceptedAt: null, completedAt: null, deliveredAt: null, fanDeliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0, paidAmountCents: 0,
+    telegramTaskMessageId: null, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null,
+    contentBoundAt: new Date("2026-08-19T10:05:00Z"), createdAt: new Date("2026-08-19T10:00:00Z"), updatedAt: new Date("2026-08-19T10:05:00Z"),
+  };
+  let db = fakeDb({ orders: [clone(base)] });
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: base.id, input: { type: "CALL", scheduledAt: "2026-08-20T18:00:00Z", durationMinutes: 30 }, db }),
+    (error) => error?.code === "CUSTOM_ORDER_CONTENT_TYPE_BOUND" && error?.status === 409,
+  );
+
+  const legacy = { ...clone(base), id: "order-content-legacy-bound", contentBoundAt: null };
+  db = fakeDb({ orders: [legacy], submissions: [{ id: "submission-legacy", agencyId: "agency-1", creatorId: "creator-1", customOrderId: legacy.id }] });
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: legacy.id, input: { type: "PHYSICAL", physicalStatus: "WAITING" }, db }),
+    (error) => error?.code === "CUSTOM_ORDER_CONTENT_TYPE_BOUND" && error?.status === 409,
+  );
+
+  const pristine = { ...clone(base), id: "order-content-pristine", contentBoundAt: null };
+  db = fakeDb({ orders: [pristine] });
+  const changed = await updateCustomOrder({
+    agencyId: "agency-1", member, orderId: pristine.id,
+    input: { type: "CALL", scheduledAt: "2026-08-20T18:00:00Z", durationMinutes: 30 }, db,
+  });
+  assert.equal(changed.order.type, "CALL", "an unused CONTENT draft may still change type before any submission lifecycle binds it");
+});
+
+test("content binding migration is additive and backfills durable submission history", () => {
+  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
+  const orderBlock = schema.match(/model CustomOrder \{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.match(orderBlock, /contentBoundAt\s+DateTime\?/);
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260905154500_custom_content_order_binding_authority/migration.sql"), "utf8");
+  assert.match(migration, /^BEGIN;/);
+  assert.match(migration, /COMMIT;\s*$/);
+  assert.match(migration, /ADD COLUMN "contentBoundAt" TIMESTAMP\(3\)/);
+  assert.match(migration, /FROM "CustomContentSubmission"/);
+  assert.match(migration, /MIN\("boundAt"\)/);
+  assert.match(migration, /custom_content_submission\.create_from_telegram_inbound/);
+  assert.match(migration, /custom_content_submission\.assign/);
+  assert.match(migration, /metadata"->>'toCustomOrderId'/);
+  assert.match(migration, /contentBoundAt" IS NOT NULL[\s\S]*"type" <> 'CONTENT'/);
+  assert.match(migration, /RAISE EXCEPTION 'Custom CONTENT binding cutover blocked:/);
+  assert.doesNotMatch(migration, /\b(?:DROP|DELETE|TRUNCATE)\b/i, "binding migration must be additive/non-destructive");
 });
 
 test("CustomOrder create retries with the same stable clientMutationId return the same order and conflicting payload is rejected", async () => {
@@ -412,3 +555,27 @@ test("CustomOrder create retries with the same stable clientMutationId return th
   );
 });
 
+
+test("cross-type generic PATCH cannot turn CALL/PHYSICAL into forged completed CONTENT or attach manual media IDs", async () => {
+  for (const type of ["CALL", "PHYSICAL"]) {
+    const row = {
+      id: `order-${type.toLowerCase()}-to-content`, agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "legacy type",
+      internalNote: null, type, contentKind: null, status: "PENDING", dueAt: null,
+      scheduledAt: type === "CALL" ? new Date("2026-08-20T18:00:00Z") : null, durationMinutes: type === "CALL" ? 30 : null,
+      physicalStatus: type === "PHYSICAL" ? "WAITING" : null, acceptedAt: null, completedAt: null, deliveredAt: null, fanDeliveredAt: null,
+      cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0, paidAmountCents: 0, telegramTaskMessageId: null, telegramReferenceMessageIds: [],
+      reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null,
+      createdAt: new Date("2026-08-19T10:00:00Z"), updatedAt: new Date("2026-08-19T10:00:00Z"),
+    };
+    let db = fakeDb({ orders: [clone(row)] });
+    await assert.rejects(
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { type: "CONTENT", contentKind: "VIDEO", status: "COMPLETED" }, db }),
+      (error) => error?.code === "CUSTOM_ORDER_CONTENT_COMPLETION_AUTHORITY" && error?.status === 409,
+    );
+    db = fakeDb({ orders: [clone(row)] });
+    await assert.rejects(
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { type: "CONTENT", contentKind: "VIDEO", mediaIds: ["999"] }, db }),
+      (error) => error?.code === "CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED" && error?.status === 409,
+    );
+  }
+});

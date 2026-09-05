@@ -56,3 +56,25 @@ test("direct client fan-delivery confirmation is retired; only durable MESSAGE_S
   assert.match(direct, /MESSAGE_SEND_CONFIRMED/);
   assert.doesNotMatch(direct, /recordCustomDeliverySend\s*\(/);
 });
+
+test("REFERENCE artifact recovery routes preserve the same server slot behind product-device authority", () => {
+  const replace = block('router.post("/telegram-deliveries/:intentId/reference-replace"', 'router.post("/telegram-deliveries/:intentId/reference-cancel"');
+  assert.match(replace, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
+  assert.match(replace, /replaceTelegramReferencePrecommit\s*\(/);
+  assert.match(replace, /intentId:\s*req\.params\.intentId/);
+  assert.match(replace, /clientIntentId:\s*req\.body\?\.clientIntentId/);
+  assert.match(replace, /reference:\s*req\.body\?\.reference/);
+
+  const cancel = block('router.post("/telegram-deliveries/:intentId/reference-cancel"', 'router.post("/telegram-deliveries/:intentId/reconcile"');
+  assert.match(cancel, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
+  assert.match(cancel, /cancelTelegramReferencePrecommit\s*\(/);
+  assert.match(cancel, /intentId:\s*req\.params\.intentId/);
+  assert.match(cancel, /reason:\s*req\.body\?\.reason/);
+});
+
+test("Telegram inbound route hands the durable provider observation only to inbound authority", () => {
+  const inbound = block('router.post("/telegram-inbound"', 'router.post("/telegram-deliveries/work"');
+  assert.match(inbound, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
+  assert.match(inbound, /ingestTelegramInboundEvent\s*\(/);
+  assert.doesNotMatch(inbound, /createCustomContentSubmission/);
+});

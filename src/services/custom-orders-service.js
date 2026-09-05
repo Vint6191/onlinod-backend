@@ -274,6 +274,8 @@ async function listCustomOrders({ agencyId, member, creatorId = null, dialogId =
 
 function normalizeCreateInput(input = {}) {
   const type = normalizeType(input.type || "CONTENT");
+  const requestedMediaIds = mediaIdsString(input.mediaIds);
+  if (type === "CONTENT" && requestedMediaIds) throw fail("CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED", "CONTENT media IDs are projected only from proven Custom submissions and cannot be entered manually", 409);
   const data = {
     clientMutationId: clientMutationId(input.clientMutationId),
     creatorId: required(input.creatorId, "creatorId", 100), dialogId: required(input.dialogId, "dialogId", 100), scenario: required(input.scenario, "scenario", MAX_SCENARIO),
@@ -283,7 +285,7 @@ function normalizeCreateInput(input = {}) {
     scheduledAt: type === "CALL" ? parseIso(input.scheduledAt, "scheduledAt", { allowNull: false }) : null,
     durationMinutes: type === "CALL" ? normalizeDuration(input.durationMinutes) : null,
     physicalStatus: type === "PHYSICAL" ? normalizePhysicalStatus(input.physicalStatus || "WAITING") : null,
-    mediaIds: mediaIdsString(input.mediaIds), priceCents: normalizePriceCents(input, 0), paidAmountCents: normalizePaidAmountCents(input, 0),
+    mediaIds: type === "CONTENT" ? "" : requestedMediaIds, priceCents: normalizePriceCents(input, 0), paidAmountCents: normalizePaidAmountCents(input, 0),
     reminderConfig: input.reminderConfig === undefined ? null : normalizeReminderOverride(type, input.reminderConfig),
   };
   return data;
@@ -391,12 +393,90 @@ function buildUpdateData(current, input = {}, now = new Date()) {
   return patch;
 }
 
+function sameInstant(left, right) {
+  const a = left == null || left === "" ? null : new Date(left);
+  const b = right == null || right === "" ? null : new Date(right);
+  const ams = a && Number.isFinite(a.getTime()) ? a.getTime() : null;
+  const bms = b && Number.isFinite(b.getTime()) ? b.getTime() : null;
+  return ams === bms;
+}
+
+function telegramTaskVisibleEditRequested(current, input = {}) {
+  const currentType = normalizeType(current?.type || "CONTENT");
+  if (input.type !== undefined || input.scenario !== undefined) return true;
+  if (currentType === "CONTENT") return input.contentKind !== undefined || input.dueAt !== undefined;
+  if (currentType === "CALL") return input.scheduledAt !== undefined || input.durationMinutes !== undefined;
+  return false;
+}
+
+async function assertContentTypeMutationCompatibility({ agencyId, current, requestedType, db }) {
+  const currentType = normalizeType(current?.type || "CONTENT");
+  if (currentType !== "CONTENT" || requestedType === "CONTENT") return;
+  if (current?.contentBoundAt) {
+    throw fail("CUSTOM_ORDER_CONTENT_TYPE_BOUND", "A CONTENT custom with submission history cannot change type", 409);
+  }
+  // Migration backfill makes contentBoundAt authoritative for normal current rows, but the
+  // historical relation check keeps rolling-deploy / partially-migrated data fail-closed.
+  if (db?.customContentSubmission?.findFirst) {
+    const existing = await db.customContentSubmission.findFirst({
+      where: { agencyId, customOrderId: current.id },
+      select: { id: true },
+    });
+    if (existing) throw fail("CUSTOM_ORDER_CONTENT_TYPE_BOUND", "A CONTENT custom with submission history cannot change type", 409);
+  }
+}
+
+function assertTelegramTaskEditCompatibility(current, input = {}, { externalCommitFence = false } = {}) {
+  if (!externalCommitFence) return;
+  const currentType = normalizeType(current.type || "CONTENT");
+  if (input.type !== undefined && normalizeType(input.type) !== currentType) {
+    throw fail("CUSTOM_ORDER_TELEGRAM_TASK_TYPE_IMMUTABLE", "Custom type cannot change after the Telegram task external commit has started", 409);
+  }
+  const changed = [];
+  if (input.scenario !== undefined && required(input.scenario, "scenario", MAX_SCENARIO) !== String(current.scenario || "")) changed.push("scenario");
+  if (currentType === "CONTENT") {
+    if (input.contentKind !== undefined && normalizeContentKind(input.contentKind) !== normalizeContentKind(current.contentKind || "BOTH")) changed.push("contentKind");
+    if (input.dueAt !== undefined) {
+      const next = parseIso(input.dueAt, "dueAt");
+      if (!sameInstant(next, current.dueAt)) changed.push("dueAt");
+    }
+  } else if (currentType === "CALL") {
+    if (input.scheduledAt !== undefined) {
+      const next = parseIso(input.scheduledAt, "scheduledAt", { allowNull: false });
+      if (!sameInstant(next, current.scheduledAt)) changed.push("scheduledAt");
+    }
+    if (input.durationMinutes !== undefined && normalizeDuration(input.durationMinutes) !== Number(current.durationMinutes)) changed.push("durationMinutes");
+  }
+  if (changed.length) {
+    throw fail("CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE", `Model-visible Telegram task fields cannot change after the Telegram external commit has started: ${changed.join(", ")}`, 409);
+  }
+}
+
 async function updateCustomOrder({ agencyId, member, orderId, input, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_ORDER_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma"); const current = await loadOwnedOrder({ agencyId, member, orderId, db: client });
   const expectedCreatorId = optionalIdentifier(input?.creatorId, "creatorId", 100); if (expectedCreatorId && expectedCreatorId !== String(current.creatorId)) throw fail("CUSTOM_ORDER_CREATOR_MISMATCH", "Custom order does not belong to the requested creator", 404);
   const currentStatus = normalizeStatus(current.status); const requestedStatus = input?.status === undefined ? null : normalizeStatus(input.status);
   const paymentMutation = input?.paidAmount !== undefined || input?.paidAmountCents !== undefined;
+  const currentType = normalizeType(current.type || "CONTENT");
+  const requestedType = input?.type === undefined ? currentType : normalizeType(input.type);
+  if ((currentType === "CONTENT" || requestedType === "CONTENT") && input?.mediaIds !== undefined) {
+    throw fail("CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED", "CONTENT media IDs are projected only from proven Custom submissions and cannot be mutated manually", 409);
+  }
+  if (requestedType === "CONTENT" && requestedStatus === "COMPLETED") {
+    throw fail("CUSTOM_ORDER_CONTENT_COMPLETION_AUTHORITY", "CONTENT completion is projected only from confirmed fan delivery", 409);
+  }
+  await assertContentTypeMutationCompatibility({ agencyId, current, requestedType, db: client });
+  let externalTaskCommitFence = current.telegramTaskMessageId != null;
+  if (!externalTaskCommitFence && telegramTaskVisibleEditRequested(current, input || {}) && client.telegramDeliveryIntent?.findFirst) {
+    const committedTask = await client.telegramDeliveryIntent.findFirst({
+      where: { agencyId, customOrderId: current.id, kind: "TASK", state: { in: ["COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"] } },
+      select: { id: true },
+      orderBy: [{ commitStartedAt: "desc" }, { createdAt: "desc" }],
+    });
+    externalTaskCommitFence = Boolean(committedTask);
+  }
+  assertTelegramTaskEditCompatibility(current, input || {}, { externalCommitFence: externalTaskCommitFence });
 
   if (currentStatus !== "PENDING") {
     const nonFinancialFields = ["scenario", "internalNote", "type", "contentKind", "dueAt", "scheduledAt", "durationMinutes", "physicalStatus", "acceptedAt", "cancelReason", "mediaIds", "price", "priceCents", "reminderConfig"]

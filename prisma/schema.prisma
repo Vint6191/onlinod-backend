@@ -595,6 +595,7 @@ model CustomOrder {
   priceCents                  Int                       @default(0)
   paidAmountCents             Int                       @default(0)
   telegramTaskMessageId       Int?
+  contentBoundAt              DateTime?
   telegramReferenceMessageIds Int[]                     @default([])
   telegramLastModelMessageId  Int?
   telegramLastModelMessageAt  DateTime?
@@ -716,6 +717,10 @@ model TelegramInboundEvent {
   text                   String?
   sentAt                 DateTime
   observedAt             DateTime @default(now())
+  projectionState        String   @default("PENDING")
+  projectionReason       String?
+  projectionAttempts     Int      @default(0)
+  projectedAt            DateTime?
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
 
@@ -723,6 +728,7 @@ model TelegramInboundEvent {
   @@index([agencyId, creatorId, sentAt])
   @@index([agencyId, customOrderId, sentAt])
   @@index([agencyId, accountId, replyToMessageId])
+  @@index([agencyId, projectionState, observedAt])
   @@index([submissionId])
 }
 
