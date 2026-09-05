@@ -364,7 +364,7 @@ test("business-critical text and media limits reject instead of silently truncat
 });
 
 
-test("V2 types keep one CustomOrder row and schedule type-specific reminders", async () => {
+test("V2 types keep one CustomOrder row and do not arm reminders before canonical Telegram TASK confirmation", async () => {
   const db = fakeDb();
   const call = await createCustomOrder({
     agencyId: "agency-1",
@@ -385,7 +385,7 @@ test("V2 types keep one CustomOrder row and schedule type-specific reminders", a
   assert.equal(call.order.type, "CALL");
   assert.equal(call.order.contentKind, null);
   assert.equal(call.order.durationMinutes, 45);
-  assert.equal(call.order.nextReminderAt, "2026-08-19T12:45:00.000Z", "135 minutes before 15:00 is the first future reminder");
+  assert.equal(call.order.nextReminderAt, null, "reminder schedule must remain unarmed until canonical Telegram TASK confirmation");
 
   const physical = await createCustomOrder({
     agencyId: "agency-1",

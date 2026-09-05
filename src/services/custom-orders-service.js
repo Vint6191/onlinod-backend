@@ -5,8 +5,7 @@ const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const {
   normalizeReminderOverride,
-  nextReminderForOrder,
-  readWorkspaceReminderPolicy,
+  reprojectCustomReminderSchedule,
 } = require("./custom-order-reminders");
 const { planTaskIntentForCommittedOrder, planCancellationIntentForCommittedOrder } = require("./telegram-delivery-authority-service");
 
@@ -302,19 +301,18 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
     if (String(existing.creatorId) !== String(data.creatorId)) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId belongs to another creator", 409);
     return { ok: true, idempotent: true, order: serializeOrder(existing, now) };
   }
-  const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
-  const seed = { ...data, status: "PENDING", createdAt: now, lastReminderAt: null, lastReminderKey: null };
-  const nextReminderAt = nextReminderForOrder(seed, workspacePolicy, now).at;
   const execute = async (tx) => {
     let row;
     try {
-      row = await tx.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, clientMutationId: data.clientMutationId, clientMutationFingerprint: fingerprint, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt }, include: ORDER_INCLUDE });
+      row = await tx.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, clientMutationId: data.clientMutationId, clientMutationFingerprint: fingerprint, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt: null }, include: ORDER_INCLUDE });
     } catch (error) {
       if (String(error?.code || "") !== "P2002") throw error;
       const raced = await tx.customOrder.findFirst({ where: { agencyId, clientMutationId: data.clientMutationId }, include: ORDER_INCLUDE });
       if (!raced || String(raced.clientMutationFingerprint || "") !== fingerprint) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId conflicted with a different CustomOrder payload", 409);
       return { row: raced, idempotent: true };
     }
+    await reprojectCustomReminderSchedule({ agencyId, orderId: row.id, now, db: tx });
+    row = await tx.customOrder.findFirst({ where: { id: row.id, agencyId }, include: ORDER_INCLUDE }) || row;
     await planTaskIntentForCommittedOrder({ agencyId, member, order: row, now, db: tx });
     return { row, idempotent: false };
   };
@@ -499,22 +497,18 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
 
   const patch = buildUpdateData(current, input || {}, now);
   const prospective = { ...current, ...patch };
-  if (normalizeStatus(prospective.status) === "PENDING") {
-    const reminderTimingChanged = input?.reminderConfig !== undefined || input?.type !== undefined || (normalizeType(prospective.type || "CONTENT") === "CALL" && input?.scheduledAt !== undefined);
-    if (reminderTimingChanged) {
-      const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
-      const type = normalizeType(prospective.type || "CONTENT");
-      if (type === "CALL") patch.nextReminderAt = nextReminderForOrder(prospective, workspacePolicy, now).at;
-      else if (prospective.telegramTaskMessageId == null) patch.nextReminderAt = null;
-      else if (prospective.lastReminderAt) patch.nextReminderAt = nextReminderForOrder(prospective, workspacePolicy, now, { afterAck: true }).at;
-      else patch.nextReminderAt = nextReminderForOrder({ ...prospective, createdAt: now }, workspacePolicy, now).at;
-    }
-  } else { patch.nextReminderAt = null; }
+  const reminderTimingChanged = input?.reminderConfig !== undefined || input?.type !== undefined || input?.status !== undefined
+    || (normalizeType(prospective.type || "CONTENT") === "CALL" && input?.scheduledAt !== undefined)
+    || (normalizeType(prospective.type || "CONTENT") === "PHYSICAL" && input?.physicalStatus !== undefined);
   const applyPendingUpdate = async (tx) => {
     const changed = await tx.customOrder.updateMany({ where: { id: current.id, agencyId, status: "PENDING", updatedAt: current.updatedAt }, data: patch });
     if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_ORDER_CONFLICT", "Custom order changed while this update was being applied; refresh and try again", 409);
-    const row = await tx.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE });
+    let row = await tx.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE });
     if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found after update", 404);
+    if (reminderTimingChanged) {
+      await reprojectCustomReminderSchedule({ agencyId, orderId: row.id, now, firstAnchorAt: now, db: tx });
+      row = await tx.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE }) || row;
+    }
     if (String(row.status) === "CANCELLED" && String(current.status) !== "CANCELLED") await planCancellationIntentForCommittedOrder({ agencyId, member, order: row, now, db: tx });
     return row;
   };

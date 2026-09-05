@@ -777,3 +777,107 @@ test("runtime takeover cannot reclaim an unresolved COMMITTING delivery for blin
   assert.equal(takeover.claimed, false);
   assert.equal(takeover.intent.state, "RECONCILE_REQUIRED");
 });
+
+async function manualReminderToCommittingForScheduleRace(fx, clientIntentId) {
+  seedConfirmedTaskThread(fx, { messageId: 880 });
+  const planned = await planTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER",
+    clientIntentId, now: fx.now, db: fx.db,
+  });
+  const claimed = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1",
+    runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db,
+  });
+  assert.equal(claimed.claimed, true);
+  const begun = await beginTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1",
+    runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken, now: fx.now, db: fx.db,
+  });
+  assert.equal(begun.begun, true);
+  return { planned, claimed, begun };
+}
+
+function installWorkspaceRaceAfterScheduleSnapshot(fx, mutateAfterOldRead) {
+  const original = fx.db.workspaceSetting.findUnique.bind(fx.db.workspaceSetting);
+  let injected = false;
+  fx.db.workspaceSetting.findUnique = async (...args) => {
+    const before = await original(...args);
+    if (!injected) {
+      injected = true;
+      mutateAfterOldRead();
+    }
+    return before;
+  };
+  return () => { fx.db.workspaceSetting.findUnique = original; };
+}
+
+test("late confirmed reminder cannot erase schedule when workspace reminders are enabled concurrently", async () => {
+  const fx = dbFixture();
+  const flow = await manualReminderToCommittingForScheduleRace(fx, "66666666-6666-4666-8666-666666666666");
+  const effectAt = new Date(fx.now.getTime() + 10_000);
+  fx.db._workspaceSettingValue = { content: { enabled: false, firstAfterMinutes: 30, repeatEveryMinutes: 60 } };
+  fx.orders[0].nextReminderAt = new Date(effectAt.getTime() + 60 * 60_000);
+
+  const restore = installWorkspaceRaceAfterScheduleSnapshot(fx, () => {
+    fx.db._workspaceSettingValue = { content: { enabled: true, firstAfterMinutes: 30, repeatEveryMinutes: 30 } };
+    fx.orders[0].nextReminderAt = new Date(effectAt.getTime() + 30 * 60_000);
+    fx.orders[0].updatedAt = new Date(new Date(fx.orders[0].updatedAt).getTime() + 100);
+  });
+  try {
+    await confirmTelegramDeliveryIntent({
+      agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, deviceId: "device-1",
+      claimToken: flow.claimed.claimToken, remoteMessageId: 881, remoteRecipientTelegramUserId: "1001",
+      remoteSentAt: effectAt, now: new Date(effectAt.getTime() + 1_000), db: fx.db,
+    });
+  } finally { restore(); }
+
+  assert.equal(new Date(fx.orders[0].lastReminderAt).toISOString(), effectAt.toISOString());
+  assert.equal(new Date(fx.orders[0].nextReminderAt).toISOString(), new Date(effectAt.getTime() + 30 * 60_000).toISOString());
+});
+
+test("late confirmed reminder recomputes from current shortened workspace repeat interval after CAS loss", async () => {
+  const fx = dbFixture();
+  const flow = await manualReminderToCommittingForScheduleRace(fx, "77777777-7777-4777-8777-777777777777");
+  const effectAt = new Date(fx.now.getTime() + 20_000);
+  fx.db._workspaceSettingValue = { content: { enabled: true, firstAfterMinutes: 30, repeatEveryMinutes: 60 } };
+  fx.orders[0].nextReminderAt = new Date(effectAt.getTime() + 60 * 60_000);
+
+  const restore = installWorkspaceRaceAfterScheduleSnapshot(fx, () => {
+    fx.db._workspaceSettingValue = { content: { enabled: true, firstAfterMinutes: 30, repeatEveryMinutes: 5 } };
+    fx.orders[0].nextReminderAt = new Date(effectAt.getTime() + 5 * 60_000);
+    fx.orders[0].updatedAt = new Date(new Date(fx.orders[0].updatedAt).getTime() + 100);
+  });
+  try {
+    await confirmTelegramDeliveryIntent({
+      agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, deviceId: "device-1",
+      claimToken: flow.claimed.claimToken, remoteMessageId: 882, remoteRecipientTelegramUserId: "1001",
+      remoteSentAt: effectAt, now: new Date(effectAt.getTime() + 1_000), db: fx.db,
+    });
+  } finally { restore(); }
+
+  assert.equal(new Date(fx.orders[0].nextReminderAt).toISOString(), new Date(effectAt.getTime() + 5 * 60_000).toISOString());
+});
+
+test("late confirmed reminder cannot stale-overwrite concurrent per-order reminderConfig", async () => {
+  const fx = dbFixture();
+  const flow = await manualReminderToCommittingForScheduleRace(fx, "88888888-8888-4888-8888-888888888888");
+  const effectAt = new Date(fx.now.getTime() + 30_000);
+  fx.db._workspaceSettingValue = { content: { enabled: true, firstAfterMinutes: 30, repeatEveryMinutes: 60 } };
+  fx.orders[0].nextReminderAt = new Date(effectAt.getTime() + 60 * 60_000);
+
+  const restore = installWorkspaceRaceAfterScheduleSnapshot(fx, () => {
+    fx.orders[0].reminderConfig = { enabled: true, firstAfterMinutes: 30, repeatEveryMinutes: 7 };
+    fx.orders[0].nextReminderAt = new Date(effectAt.getTime() + 7 * 60_000);
+    fx.orders[0].updatedAt = new Date(new Date(fx.orders[0].updatedAt).getTime() + 100);
+  });
+  try {
+    await confirmTelegramDeliveryIntent({
+      agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, deviceId: "device-1",
+      claimToken: flow.claimed.claimToken, remoteMessageId: 883, remoteRecipientTelegramUserId: "1001",
+      remoteSentAt: effectAt, now: new Date(effectAt.getTime() + 1_000), db: fx.db,
+    });
+  } finally { restore(); }
+
+  assert.equal(fx.orders[0].reminderConfig.repeatEveryMinutes, 7);
+  assert.equal(new Date(fx.orders[0].nextReminderAt).toISOString(), new Date(effectAt.getTime() + 7 * 60_000).toISOString());
+});

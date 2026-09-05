@@ -9,6 +9,7 @@ const { reconcilePendingInboundForConfirmedDelivery } = require("./telegram-inbo
 const {
   nextReminderForOrder,
   readWorkspaceReminderPolicy,
+  reprojectCustomReminderSchedule,
   reminderText,
   resolveTelegramAccountId,
   taskText,
@@ -583,17 +584,11 @@ async function projectConfirmedIntent({ row, now, db }) {
     if (!settledOrder) return;
     if (settledOrder.telegramTaskMessageId != null && Number(settledOrder.telegramTaskMessageId) !== remoteMessageId) throw fail("TELEGRAM_DELIVERY_TASK_PROJECTION_CONFLICT", "Custom order is already linked to a different Telegram task", 409);
 
-    // Reminder scheduling is a derived projection, not part of the provider receipt. Only a
-    // freshly-read still-PENDING order may receive it. updatedAt + status form the freshness
-    // CAS: if cancellation/settings changes race this statement, it loses and we re-read.
-    if (Number(linked?.count || 0) === 1 && String(settledOrder.status) === "PENDING") {
-      const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId: row.agencyId, db });
-      const seed = String(settledOrder.type || "CONTENT").toUpperCase() === "CALL" ? settledOrder : { ...settledOrder, createdAt: effectAt };
-      const nextReminderAt = nextReminderForOrder(seed, workspacePolicy, effectAt).at;
-      await db.customOrder.updateMany({
-        where: { id: settledOrder.id, agencyId: row.agencyId, status: "PENDING", telegramTaskMessageId: remoteMessageId, updatedAt: settledOrder.updatedAt },
-        data: { nextReminderAt },
-      });
+    // Reminder schedule is a separate convergent projection. It always re-reads the latest
+    // CustomOrder revision and CURRENT policy, then CAS-writes nextReminderAt. This prevents a
+    // late TASK receipt from stale-overwriting a concurrent settings/per-order reminder change.
+    if (String(settledOrder.status) === "PENDING") {
+      await reprojectCustomReminderSchedule({ agencyId: row.agencyId, orderId: settledOrder.id, now: effectAt, firstAnchorAt: effectAt, db });
       settledOrder = await db.customOrder.findFirst({ where: { id: order.id, agencyId: row.agencyId } }) || settledOrder;
     }
 
@@ -611,21 +606,29 @@ async function projectConfirmedIntent({ row, now, db }) {
     const refs = Array.from(new Set([...(Array.isArray(order.telegramReferenceMessageIds) ? order.telegramReferenceMessageIds.map(Number) : []), remoteMessageId]));
     await db.customOrder.update({ where: { id: order.id }, data: { telegramReferenceMessageIds: refs } });
   } else if (kind === "MANUAL_REMINDER" || kind === "AUTO_REMINDER") {
-    const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId: row.agencyId, db });
     const reminderKey = clean(row.payload?.reminderKey, 500) || null;
-    const synthetic = { ...order, lastReminderAt: effectAt, lastReminderKey: reminderKey };
-    const next = nextReminderForOrder(synthetic, workspacePolicy, effectAt, { afterAck: true });
-    // Provider effect time, not backend arrival order, owns the current reminder projection.
-    // Two distinct reminder intents may both be legitimate and settle out of order; an older
-    // receipt must never move lastReminderAt/nextReminderAt backwards and cause an early resend.
-    await db.customOrder.updateMany({
-      where: {
-        id: order.id,
-        agencyId: row.agencyId,
-        OR: [{ lastReminderAt: null }, { lastReminderAt: { lt: effectAt } }],
-      },
-      data: { lastReminderAt: effectAt, lastReminderKey: reminderKey, nextReminderAt: next.at },
-    });
+
+    // Provider facts are monotonic by provider effect time and are committed independently from
+    // the derived schedule. Use the same CustomOrder revision as a CAS fence so unrelated edits
+    // cannot be overwritten; on conflict, re-read and either retry or observe a newer fact.
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const current = await db.customOrder.findFirst({ where: { id: order.id, agencyId: row.agencyId } });
+      if (!current) break;
+      const currentEffectAt = current.lastReminderAt ? new Date(current.lastReminderAt) : null;
+      if (currentEffectAt && currentEffectAt.getTime() >= effectAt.getTime()) break;
+      const revision = current.updatedAt ? new Date(current.updatedAt) : null;
+      if (!revision || !Number.isFinite(revision.getTime())) throw fail("CUSTOM_REMINDER_PROVIDER_REVISION_REQUIRED", "CustomOrder.updatedAt is required to project reminder provider facts", 500);
+      const fenceAt = new Date(Math.max(effectAt.getTime(), revision.getTime() + 1));
+      const changed = await db.customOrder.updateMany({
+        where: { id: current.id, agencyId: row.agencyId, updatedAt: revision, OR: [{ lastReminderAt: null }, { lastReminderAt: { lt: effectAt } }] },
+        data: { lastReminderAt: effectAt, lastReminderKey: reminderKey, updatedAt: fenceAt },
+      });
+      if (Number(changed?.count || 0) === 1) break;
+      if (attempt === 4) throw fail("CUSTOM_REMINDER_PROVIDER_FACT_CONFLICT", "Reminder provider fact changed concurrently too many times", 409);
+    }
+
+    // nextReminderAt is derived only from the latest durable provider fact + current policy.
+    await reprojectCustomReminderSchedule({ agencyId: row.agencyId, orderId: order.id, now: effectAt, db });
   }
 }
 

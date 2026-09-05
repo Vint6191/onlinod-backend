@@ -6,7 +6,7 @@ const { publicUser, issuePasswordReset } = require("./auth-service");
 const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
-const { SETTINGS_KEY: TELEGRAM_CUSTOM_REMINDERS_KEY, normalizeTelegramCustomReminders, nextReminderForOrder } = require("./custom-order-reminders");
+const { SETTINGS_KEY: TELEGRAM_CUSTOM_REMINDERS_KEY, normalizeTelegramCustomReminders, reprojectCustomReminderSchedule } = require("./custom-order-reminders");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
@@ -514,56 +514,39 @@ async function updateTelegramCustomReminderSettings({ agencyId, member, reminder
   ensureTelegramManager(member);
   const client = db || prisma;
   const normalized = normalizeTelegramCustomReminders(reminders);
-  await client.workspaceSetting.upsert({
-    where: { agencyId_key: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY } },
-    create: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY, value: normalized },
-    update: { value: normalized },
-  });
-  if (client.customOrder?.findMany && client.customOrder?.update) {
-    const pendingOrders = await client.customOrder.findMany({
-      where: { agencyId, status: "PENDING" },
-      select: {
-        id: true,
-        type: true,
-        status: true,
-        createdAt: true,
-        scheduledAt: true,
-        physicalStatus: true,
-        reminderConfig: true,
-        telegramTaskMessageId: true,
-        nextReminderAt: true,
-        lastReminderAt: true,
-        lastReminderKey: true,
-      },
+
+  // Workspace policy publication and the order projections that make it executable are one
+  // transaction. If the process crashes, neither a half-published policy nor half-reprojected
+  // schedule set is committed. Concurrent provider settlement loses/retries on CustomOrder CAS.
+  const apply = async (tx) => {
+    await tx.workspaceSetting.upsert({
+      where: { agencyId_key: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY } },
+      create: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY, value: normalized },
+      update: { value: normalized },
     });
-    const now = new Date();
-    for (const order of pendingOrders) {
-      if (order.reminderConfig != null) continue; // Per-custom override is authoritative and independent of workspace defaults.
-      let nextAt = null;
-      const type = String(order.type || "CONTENT").toUpperCase();
-      if (order.telegramTaskMessageId != null) {
-        if (type === "CALL") nextAt = nextReminderForOrder(order, normalized, now).at;
-        else if (order.lastReminderAt) nextAt = nextReminderForOrder(order, normalized, now, { afterAck: true }).at;
-        else nextAt = nextReminderForOrder({ ...order, createdAt: now }, normalized, now).at;
-      }
-      await client.customOrder.update({
-        where: { id: order.id },
-        data: {
-          nextReminderAt: nextAt,
-        },
+    if (tx.customOrder?.findMany && tx.customOrder?.updateMany) {
+      const pendingOrders = await tx.customOrder.findMany({
+        where: { agencyId, status: "PENDING" },
+        select: { id: true },
+        orderBy: { id: "asc" },
       });
+      const projectionNow = new Date();
+      for (const order of pendingOrders) {
+        await reprojectCustomReminderSchedule({ agencyId, orderId: order.id, now: projectionNow, firstAnchorAt: projectionNow, db: tx });
+      }
     }
-  }
-  await audit({
-    agencyId,
-    actorUserId: member?.userId || null,
-    action: "settings.telegram.custom_reminders_updated",
-    targetType: "agency",
-    targetId: agencyId,
-    metadata: { contentEnabled: normalized.content.enabled, callEnabled: normalized.call.enabled, physicalEnabled: normalized.physical.enabled },
-    db: client,
-  });
-  return normalized;
+    await audit({
+      agencyId,
+      actorUserId: member?.userId || null,
+      action: "settings.telegram.custom_reminders_updated",
+      targetType: "agency",
+      targetId: agencyId,
+      metadata: { contentEnabled: normalized.content.enabled, callEnabled: normalized.call.enabled, physicalEnabled: normalized.physical.enabled },
+      db: tx,
+    });
+    return normalized;
+  };
+  return typeof client.$transaction === "function" ? client.$transaction(apply) : apply(client);
 }
 
 function telegramInputError(message, code) {

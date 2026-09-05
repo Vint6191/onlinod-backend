@@ -8,6 +8,7 @@ const {
   normalizeTelegramCustomReminders,
   normalizeReminderOverride,
   nextReminderForOrder,
+  desiredReminderSchedule,
 } = require("./custom-order-reminders");
 
 const root = path.join(__dirname, "..", "..");
@@ -39,6 +40,26 @@ test("call reminders are relative to scheduledAt while content repeats from deli
 
   const content = nextReminderForOrder({ status: "PENDING", type: "CONTENT", createdAt: now, reminderConfig: { enabled: true, firstAfterMinutes: 47, repeatEveryMinutes: 61 } }, policy, now);
   assert.equal(content.at.toISOString(), "2026-08-19T12:47:00.000Z");
+});
+
+test("derived reminder schedule is null until canonical Telegram TASK confirmation for every Custom type", () => {
+  const now = new Date("2026-08-19T12:00:00.000Z");
+  const policy = normalizeTelegramCustomReminders({
+    content: { enabled: true, firstAfterMinutes: 5, repeatEveryMinutes: 10 },
+    call: { enabled: true, offsetsMinutes: [30, 5] },
+    physical: { enabled: true, repeatEveryMinutes: 15 },
+  });
+  const rows = [
+    { status:"PENDING", type:"CONTENT", createdAt:new Date(now.getTime()-3600000), telegramTaskMessageId:null },
+    { status:"PENDING", type:"CALL", scheduledAt:new Date(now.getTime()+3600000), telegramTaskMessageId:null },
+    { status:"PENDING", type:"PHYSICAL", createdAt:new Date(now.getTime()-3600000), physicalStatus:"WAITING", telegramTaskMessageId:null },
+  ];
+  for(const row of rows){
+    const desired=desiredReminderSchedule(row,policy,now,{firstAnchorAt:now});
+    assert.equal(desired.at,null); assert.equal(desired.key,null);
+  }
+  const confirmed=desiredReminderSchedule({...rows[0],telegramTaskMessageId:700},policy,now,{firstAnchorAt:now});
+  assert.equal(confirmed.at.toISOString(),"2026-08-19T12:05:00.000Z");
 });
 
 test("schema stores Telegram reference message ids directly on CustomOrder with no reference media model", () => {

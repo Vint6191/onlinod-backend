@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { sanitizeAuditMetadata } = require("./audit-service");
+const { audit, sanitizeAuditMetadata } = require("./audit-service");
 
 test("audit metadata strips secrets and message content", () => {
   const value = sanitizeAuditMetadata({
@@ -18,4 +18,14 @@ test("audit metadata strips secrets and message content", () => {
   assert.equal(value.messageText, "[redacted]");
   assert.equal(value.nested.leaseToken, "[redacted]");
   assert.equal(value.nested.status, "COMPLETED");
+});
+
+
+test("required audit propagates durable storage failure while best-effort audit remains non-fatal", async () => {
+  const db={auditLog:{async create(){throw Object.assign(new Error("audit down"),{code:"AUDIT_DOWN"});}}};
+  const originalWarn=console.warn; console.warn=()=>{};
+  try {
+    assert.equal(await audit({agencyId:"a1",action:"best_effort",db}),null);
+    await assert.rejects(audit({agencyId:"a1",action:"required",db,required:true}),(error)=>error?.code==="AUDIT_DOWN");
+  } finally { console.warn=originalWarn; }
 });

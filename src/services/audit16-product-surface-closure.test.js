@@ -154,22 +154,26 @@ test("Audit16 feature mutation routes no longer resurrect manager role shortcuts
   assert.match(read("routes/custom-orders.js"), /content\.manage_vault/);
 });
 
-test("Audit16 machine routes bind supplied device identity and long-lived Customs/Telegram work is access-fenced", () => {
+test("Audit16 machine routes bind supplied device identity and current long-lived Customs/Telegram work is access-fenced", () => {
   for (const file of ["routes/custom-orders.js", "routes/settings.js", "routes/traffic.js"]) assert.match(read(file), /requireProductDevice/);
-  const telegram = read("services/telegram-execution-runtime.js");
-  const reminders = read("services/custom-order-reminders.js");
+  const telegramRuntime = read("services/telegram-execution-runtime.js");
+  const telegramDelivery = read("services/telegram-delivery-authority-service.js");
   const uploadWork = read("services/custom-content-submissions-service.js");
-  for (const source of [telegram, reminders]) {
+
+  // Reminder execution no longer lives in custom-order-reminders.js.  The current external-write
+  // authority is TelegramDeliveryIntent, while account runtime ownership remains a separate lease.
+  for (const source of [telegramRuntime, telegramDelivery]) {
     assert.match(source, /assertExecutionAccessFence/);
     assert.match(source, /accessEpoch/);
   }
-  assert.match(telegram, /runtimeLeaseMemberId/);
-  assert.match(telegram, /runtimeLeaseAccessEpoch/);
-  assert.match(reminders, /reminderLeaseMemberId/);
-  assert.match(reminders, /reminderLeaseAccessEpoch/);
   for (const field of ["runtimeLeaseUserId", "runtimeLeaseMemberId", "runtimeLeaseAccessEpoch", "runtimeLeaseCreatorId"]) {
+    assert.match(telegramRuntime, new RegExp(field), `Telegram runtime must validate ${field}`);
     assert.match(uploadWork, new RegExp(field), `Custom upload work must validate ${field}`);
   }
+  for (const field of ["deviceId", "userId", "memberId", "accessEpoch", "claimTokenHash", "commitStartedAt"]) {
+    assert.match(telegramDelivery, new RegExp(field), `TelegramDeliveryIntent authority must carry ${field}`);
+  }
+  assert.match(telegramDelivery, /assertTelegramRuntimeLease/);
   assert.match(uploadWork, /scope\.broad \|\| scopedCreatorIds\.has\(anchorCreatorId\)/);
 });
 

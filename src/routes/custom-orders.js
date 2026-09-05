@@ -47,7 +47,12 @@ const {
   getTelegramOrderContext,
   reconcileTelegramDeliveryIntent,
 } = require("../services/telegram-delivery-authority-service");
-const { ingestTelegramInboundEvent } = require("../services/telegram-inbound-authority-service");
+const {
+  ingestTelegramInboundEvent,
+  listTelegramInboundReviewQueue,
+  searchTelegramInboundReviewCandidates,
+  resolveTelegramInboundReview,
+} = require("../services/telegram-inbound-authority-service");
 const { requireProductDevice, requireProductPermission, currentAccessEpoch } = require("../middleware/product-access");
 
 const router = express.Router();
@@ -322,6 +327,44 @@ router.post("/submissions/:submissionId/review", async (req, res) => {
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_REVIEW_ACTION_FAILED"); }
+});
+
+router.get("/telegram-inbound/review-required", async (req, res) => {
+  try {
+    return res.json(await listTelegramInboundReviewQueue({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      limit: req.query.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "TELEGRAM_INBOUND_REVIEW_QUEUE_FAILED"); }
+});
+
+router.get("/telegram-inbound/:eventId/candidates", async (req, res) => {
+  try {
+    return res.json(await searchTelegramInboundReviewCandidates({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      eventId: req.params.eventId,
+      query: req.query.q || "",
+      limit: req.query.limit,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "TELEGRAM_INBOUND_REVIEW_CANDIDATES_FAILED"); }
+});
+
+router.post("/telegram-inbound/:eventId/resolve", async (req, res) => {
+  try {
+    return res.json(await resolveTelegramInboundReview({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      eventId: req.params.eventId,
+      resolution: req.body?.resolution,
+      reason: req.body?.reason,
+      customOrderId: req.body?.customOrderId,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "TELEGRAM_INBOUND_REVIEW_RESOLVE_FAILED"); }
 });
 
 router.post("/telegram-inbound", async (req, res) => {

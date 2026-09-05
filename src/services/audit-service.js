@@ -30,7 +30,7 @@ function sanitizeAuditMetadata(metadata) {
   return sanitized && typeof sanitized === "object" && !Array.isArray(sanitized) ? sanitized : {};
 }
 
-async function audit({ agencyId, actorUserId = null, action, targetType = null, targetId = null, metadata = null, db = null }) {
+async function audit({ agencyId, actorUserId = null, action, targetType = null, targetId = null, metadata = null, db = null, required = false }) {
   try {
     if (!agencyId || !action) return null;
 
@@ -46,6 +46,7 @@ async function audit({ agencyId, actorUserId = null, action, targetType = null, 
       },
     });
   } catch (err) {
+    if (required === true) throw err;
     console.warn("[audit] failed:", err?.message || err);
     return null;
   }

@@ -158,6 +158,92 @@ function nextReminderForOrder(order, workspacePolicy, now = new Date(), { afterA
   return { at: at.getTime() <= nowMs ? new Date(nowMs) : at, key: `CONTENT:${at.toISOString()}` };
 }
 
+
+function sameInstant(a, b) {
+  const aa = validDate(a);
+  const bb = validDate(b);
+  if (!aa || !bb) return aa === null && bb === null;
+  return aa.getTime() === bb.getTime();
+}
+
+function desiredReminderSchedule(order, workspacePolicy, now = new Date(), { firstAnchorAt = null } = {}) {
+  if (!order || String(order.status || "PENDING") !== "PENDING") return { at: null, key: null };
+  // Automatic reminders are follow-ups to the canonical Telegram TASK thread. Until that provider
+  // effect is confirmed there is no executable reminder schedule, regardless of Custom type.
+  if (order.telegramTaskMessageId == null) return { at: null, key: null };
+  const type = String(order.type || "CONTENT").toUpperCase();
+
+  // Once a reminder effect exists, every schedule projection is derived from that latest provider
+  // fact plus the CURRENT policy. Before the first reminder, CONTENT/PHYSICAL start from the
+  // confirmed TASK effect when available; CALL remains anchored to scheduledAt.
+  if (order.lastReminderAt) return nextReminderForOrder(order, workspacePolicy, now, { afterAck: true });
+  if (type === "CALL") return nextReminderForOrder(order, workspacePolicy, now);
+
+  const explicitAnchor = validDate(firstAnchorAt);
+  if (explicitAnchor) {
+    if (order.telegramTaskMessageId == null) return { at: null, key: null };
+    return nextReminderForOrder({ ...order, createdAt: explicitAnchor }, workspacePolicy, now);
+  }
+
+  const taskAnchor = validDate(order.deliveredAt);
+  if (order.telegramTaskMessageId != null && taskAnchor) {
+    return nextReminderForOrder({ ...order, createdAt: taskAnchor }, workspacePolicy, now);
+  }
+  return nextReminderForOrder(order, workspacePolicy, now);
+}
+
+async function reprojectCustomReminderSchedule({ agencyId, orderId, now = new Date(), firstAnchorAt = null, db, maxAttempts = 5 } = {}) {
+  if (!db?.customOrder?.findFirst || !db?.customOrder?.updateMany) {
+    const error = new Error("CustomOrder CAS projection storage is required");
+    error.code = "CUSTOM_REMINDER_SCHEDULE_STORAGE_REQUIRED";
+    error.status = 500;
+    throw error;
+  }
+  const id = String(orderId || "").trim();
+  if (!agencyId || !id) {
+    const error = new Error("agencyId and orderId are required");
+    error.code = "CUSTOM_REMINDER_SCHEDULE_SCOPE_REQUIRED";
+    error.status = 400;
+    throw error;
+  }
+
+  const attempts = Math.max(1, Math.min(20, Math.floor(Number(maxAttempts) || 5)));
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const order = await db.customOrder.findFirst({ where: { id, agencyId } });
+    if (!order) return { ok: true, missing: true, changed: false, nextReminderAt: null };
+    const revision = validDate(order.updatedAt);
+    if (!revision) {
+      const error = new Error("CustomOrder.updatedAt revision is required for reminder projection");
+      error.code = "CUSTOM_REMINDER_SCHEDULE_REVISION_REQUIRED";
+      error.status = 500;
+      throw error;
+    }
+
+    const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
+    const desired = desiredReminderSchedule(order, workspacePolicy, now, { firstAnchorAt });
+    const desiredAt = desired.at ? new Date(desired.at) : null;
+    if (sameInstant(order.nextReminderAt, desiredAt)) {
+      return { ok: true, missing: false, changed: false, nextReminderAt: desiredAt, attempts: attempt + 1 };
+    }
+
+    // updatedAt is the cross-service revision fence. Write it explicitly: correctness must not
+    // depend on whether a particular Prisma Client version advances @updatedAt for updateMany().
+    const fenceAt = new Date(Math.max(now.getTime(), revision.getTime() + 1));
+    const changed = await db.customOrder.updateMany({
+      where: { id, agencyId, updatedAt: revision },
+      data: { nextReminderAt: desiredAt, updatedAt: fenceAt },
+    });
+    if (Number(changed?.count || 0) === 1) {
+      return { ok: true, missing: false, changed: true, nextReminderAt: desiredAt, attempts: attempt + 1 };
+    }
+  }
+
+  const error = new Error("Custom reminder schedule changed concurrently too many times; retry from current state");
+  error.code = "CUSTOM_REMINDER_SCHEDULE_CONFLICT";
+  error.status = 409;
+  throw error;
+}
+
 function dateLabel(value) {
   const date = validDate(value);
   return date ? date.toISOString().replace("T", " ").replace(/\.000Z$/, " UTC") : "—";
@@ -230,6 +316,8 @@ module.exports = {
   normalizeReminderOverride,
   effectivePolicy,
   nextReminderForOrder,
+  desiredReminderSchedule,
+  reprojectCustomReminderSchedule,
   reminderText,
   taskText,
   readWorkspaceReminderPolicy,
