@@ -240,6 +240,32 @@ function fakeDb({ submissions = [], orders = [], assets = [], writes = [], teleg
     },
 
     telegramDeliveryIntent: {
+      findFirst: async ({ where = {}, orderBy = [] } = {}) => {
+        let rows = telegramIntents.filter((row) => {
+          if (where.id && String(row.id) !== String(where.id)) return false;
+          if (where.agencyId && row.agencyId !== where.agencyId) return false;
+          if (where.creatorId && row.creatorId !== where.creatorId) return false;
+          if (where.customOrderId && row.customOrderId !== where.customOrderId) return false;
+          if (where.customSubmissionId && String(row.customSubmissionId || "") !== String(where.customSubmissionId)) return false;
+          if (where.kind && typeof where.kind === "string" && row.kind !== where.kind) return false;
+          if (where.kind?.in && !where.kind.in.includes(row.kind)) return false;
+          if (where.state && typeof where.state === "string" && row.state !== where.state) return false;
+          if (where.state?.in && !where.state.in.includes(row.state)) return false;
+          return true;
+        });
+        const specs = Array.isArray(orderBy) ? orderBy : [orderBy];
+        rows = rows.slice().sort((a, b) => {
+          for (const spec of specs) {
+            const [key, dir] = Object.entries(spec || {})[0] || [];
+            if (!key) continue;
+            const av = a[key], bv = b[key];
+            const cmp = av instanceof Date || bv instanceof Date ? new Date(av || 0) - new Date(bv || 0) : String(av ?? "").localeCompare(String(bv ?? ""));
+            if (cmp) return dir === "desc" ? -cmp : cmp;
+          }
+          return 0;
+        });
+        return rows[0] || null;
+      },
       findMany: async ({ where = {} } = {}) => telegramIntents.filter((row) => {
         if (where.agencyId && row.agencyId !== where.agencyId) return false;
         if (where.creatorId && row.creatorId !== where.creatorId) return false;
@@ -530,6 +556,48 @@ test("legacy retired-order resolution refuses to guess an unresolved Telegram TA
   assert.equal(pending.status, "PENDING");
   assert.equal(unknownTask.state, "RECONCILE_REQUIRED");
   assert.equal(pending.telegramCancellationWaivedAt ?? null, null);
+});
+
+test("legacy retired-order resolution refuses to guess an unresolved Telegram REVISION_REQUEST outcome", async () => {
+  const retiredCreator = { ...creator, deletedAt: new Date("2026-09-05T12:00:00.000Z"), status: "DISABLED" };
+  const pending = order("retired-revision-unknown", { creator: retiredCreator, telegramTaskMessageId: null, deliveredAt: null });
+  const unknownRevision = {
+    id: "tg-revision-unknown", agencyId: "agency-1", creatorId: retiredCreator.id, customOrderId: pending.id,
+    accountId: "tg-account", kind: "REVISION_REQUEST", state: "RECONCILE_REQUIRED", commitStartedAt: now, claimRevision: 4,
+  };
+  const db = fakeDb({ orders: [pending], telegramIntents: [unknownRevision], creatorRecord: retiredCreator });
+  await assert.rejects(
+    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: pending.id, reason: "do not guess revision provider outcome", db }),
+    (error) => error.code === "CUSTOM_RETIRED_ORDER_REVISION_OUTCOME_UNRESOLVED",
+  );
+  assert.equal(pending.status, "PENDING");
+  assert.equal(unknownRevision.state, "RECONCILE_REQUIRED");
+  assert.equal(pending.telegramCancellationWaivedAt ?? null, null);
+});
+
+test("legacy retired historical Custom with confirmed revision but no TASK records cancellation waiver instead of forgetting the model-visible instruction", async () => {
+  const retiredCreator = { ...creator, deletedAt: new Date("2026-09-05T12:00:00.000Z"), status: "DISABLED" };
+  const pending = order("retired-revision-confirmed-no-task", { creator: retiredCreator, telegramTaskMessageId: null, deliveredAt: null });
+  const revision = {
+    id: "tg-revision-confirmed", agencyId: "agency-1", creatorId: retiredCreator.id, customOrderId: pending.id,
+    accountId: "tg-account", kind: "REVISION_REQUEST", state: "CONFIRMED", commitStartedAt: now,
+    remoteMessageId: 7331, remoteRecipientTelegramUserId: "900001", remoteSentAt: new Date("2026-08-22T10:06:00.000Z"),
+    confirmedAt: new Date("2026-08-22T10:06:01.000Z"), claimRevision: 3,
+  };
+  const db = fakeDb({ orders: [pending], telegramIntents: [revision], creatorRecord: retiredCreator });
+  let auditData = null;
+  db.auditLog.create = async ({ data }) => { auditData = data; return { id: "audit-retired-revision-waiver", ...data }; };
+
+  const result = await resolveRetiredCreatorPendingCustomOrder({
+    agencyId: "agency-1", member: manager, customOrderId: pending.id,
+    reason: "provider capability already retired; preserve revision receipt and waive physical cancellation", db,
+  });
+  assert.equal(result.status, "CANCELLED");
+  assert.equal(result.telegramCancellationWaived, true);
+  assert.equal(pending.telegramTaskMessageId, null, "no synthetic TASK projection may be invented");
+  assert.ok(pending.telegramCancellationWaivedAt);
+  assert.equal(revision.state, "CONFIRMED", "revision provider proof stays immutable");
+  assert.equal(auditData.metadata.telegramCancellationWaived, true);
 });
 
 test("legacy retired-order resolution refuses to terminalize while CUSTOM_MANUAL_SEND outcome is unresolved", async () => {

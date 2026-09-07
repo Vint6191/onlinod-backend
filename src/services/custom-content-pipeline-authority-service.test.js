@@ -790,3 +790,46 @@ test("F45 ordinary ARCHIVE requires proven media and terminal cross-rewrite is f
     (error) => error?.code === "CUSTOM_SUBMISSION_DISPOSITION_TERMINAL_REWRITE_FORBIDDEN",
   );
 });
+
+test("creator and agency retirement block cancelled historical no-TASK revision until cancellation follow-up converges", async () => {
+  const order = { id: "order-cancelled-revision-debt", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "CANCELLED", telegramTaskMessageId: null, telegramCancellationWaivedAt: null };
+  const submission = { id: "submission-cancelled-revision-debt", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, reviewStatus: "REVISION_REQUESTED", pipelineDisposition: "SALVAGE", receivedAt: new Date("2026-09-07T18:00:00Z"), createdAt: new Date("2026-09-07T18:00:00Z") };
+  const revision = { id: "revision-confirmed-debt", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, customSubmissionId: submission.id, accountId: "tg-old", kind: "REVISION_REQUEST", state: "CONFIRMED", remoteMessageId: 8801, remoteRecipientTelegramUserId: "900001", confirmedAt: new Date("2026-09-07T18:05:00Z"), createdAt: new Date("2026-09-07T18:04:00Z") };
+  const intents = [revision];
+  const match = (row, where = {}) => Object.entries(where).every(([key, expected]) => {
+    const actual = row[key];
+    if (expected && typeof expected === "object" && !Array.isArray(expected) && !(expected instanceof Date)) {
+      if ("in" in expected) return expected.in.map(String).includes(String(actual));
+      if ("not" in expected) return expected.not === null ? actual !== null : String(actual) !== String(expected.not);
+      return true;
+    }
+    return String(actual) === String(expected);
+  });
+  const db = {
+    customOrder: {
+      count: async () => 0,
+      findMany: async ({ where = {} }) => where.status === "CANCELLED" && match(order, where) ? [{ ...order }] : [],
+    },
+    customContentSubmission: {
+      count: async () => 0,
+      findMany: async ({ where = {} }) => match(submission, where) ? [{ ...submission }] : [],
+    },
+    automationDelivery: { count: async () => 0, findMany: async () => [] },
+    telegramDeliveryIntent: {
+      count: async () => 0,
+      findMany: async ({ where = {} }) => intents.filter((row) => match(row, where)),
+    },
+    telegramInboundEvent: { count: async () => 0 },
+  };
+  const creatorBlockers = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  assert.equal(creatorBlockers.cancelledTelegramFollowupDebt, 1);
+  assert.equal(creatorBlockers.total, 1);
+  const agencyBlockers = await agencyCustomPipelineBlockers({ db, agencyId: "agency-1" });
+  assert.equal(agencyBlockers.cancelledTelegramFollowupDebt, 1);
+  assert.equal(agencyBlockers.total, 1);
+
+  intents.push({ id: "cancel-revision-debt", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, accountId: "tg-old", kind: "CANCELLATION", state: "PLANNED" });
+  const converged = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  assert.equal(converged.cancelledTelegramFollowupDebt, 0);
+  assert.equal(converged.total, 0);
+});

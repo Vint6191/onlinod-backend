@@ -5,7 +5,7 @@ const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/aut
 const { resolveTelegramAccountId } = require("./custom-order-reminders");
 const { assertExecutionAccessFence } = require("./execution-access-fence-service");
 const { activeLifecycleWhere } = require("./telegram-account-reference-authority-service");
-const { scanAllById, findPendingTaskAnchors, scanIncompleteTelegramSources, scanActiveFollowupIntents, fetchAccountRowsByIds } = require("./telegram-exact-authority-scan-service");
+const { scanAllById, findPendingModelInstructionAnchors, scanIncompleteTelegramSources, scanActiveFollowupIntents, fetchAccountRowsByIds } = require("./telegram-exact-authority-scan-service");
 
 const RUNTIME_LEASE_MS = 90 * 1000;
 const MAX_RUNTIME_CLAIMS = 100;
@@ -101,10 +101,10 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
     },
   });
 
-  // Pending TASK thread discovery starts from CURRENT PENDING orders. Historical terminal TASK
-  // volume therefore cannot hide the one active thread that still needs inbound capability.
-  const pendingTaskAnchors = await findPendingTaskAnchors({ agencyId, creatorIds, db });
-  for (const row of pendingTaskAnchors) {
+  // Pending model-instruction discovery starts from CURRENT PENDING orders. Historical terminal
+  // TASK/revision volume therefore cannot hide the one current instruction that still needs inbound capability.
+  const pendingInstructionAnchors = await findPendingModelInstructionAnchors({ agencyId, creatorIds, db });
+  for (const row of pendingInstructionAnchors) {
     mergeRawCandidate({ accountId: row.accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: true });
   }
 

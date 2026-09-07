@@ -4,6 +4,7 @@ const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { isCompleteSubmission, uniqueMediaIds } = require("./custom-content-library-service");
 const { paymentSnapshot } = require("./custom-orders-service");
+const { resolveCustomMediaProvenance, classifyProgrammaticCustomMediaProvenance } = require("./custom-media-provenance-authority-service");
 const { hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, derivePipelineStage } = require("./custom-content-pipeline-authority-service");
 
 const CUSTOM_DELIVERY_OVERDUE_MS = 2 * 60 * 60 * 1000;
@@ -214,57 +215,7 @@ async function getCustomReadyDelivery({ agencyId, member, customOrderId, db = nu
 }
 
 async function resolveAttemptedCustomMedia({ client, agencyId, creatorId, attemptedMediaIds }) {
-  const customAssets = await client.creatorMediaAsset.findMany({
-    where: { agencyId, creatorId, source: "CUSTOM", mediaId: { in: attemptedMediaIds } },
-    select: { mediaId: true, customOrderId: true, customSubmissionId: true },
-    take: attemptedMediaIds.length,
-  });
-  const assetCustomIds = new Set((customAssets || []).map((asset) => clean(asset.mediaId, 180)).filter(Boolean));
-  const missingProjectionIds = attemptedMediaIds.filter((mediaId) => !assetCustomIds.has(mediaId));
-  // CreatorMediaAsset is only the fast typed projection. Proven submission media
-  // remain CUSTOM even when that projection is missing/drifted.
-  const provenanceRows = missingProjectionIds.length ? await client.customContentSubmission.findMany({
-    where: { agencyId, creatorId, ofMediaIds: { hasSome: missingProjectionIds } },
-    select: { id: true, customOrderId: true, ofMediaIds: true },
-  }) : [];
-  const provenBySubmission = new Set();
-  const missing = new Set(missingProjectionIds);
-  for (const row of provenanceRows || []) {
-    for (const mediaId of uniqueMediaIds(row.ofMediaIds)) if (missing.has(mediaId)) provenBySubmission.add(mediaId);
-  }
-  return {
-    customAssets,
-    provenanceRows,
-    customIds: new Set([...assetCustomIds, ...provenBySubmission]),
-  };
-}
-
-async function classifyProgrammaticCustomMediaProvenance({ agencyId, creatorId, mediaIds, db = null } = {}) {
-  const client = db || require("../prisma");
-  const creator = clean(creatorId, 180);
-  const rawAttempted = Array.isArray(mediaIds) ? mediaIds : [];
-  const attemptedMediaIds = [];
-  const seenAttempted = new Set();
-  for (const raw of rawAttempted) {
-    const mediaId = clean(raw, 240);
-    if (!mediaId || seenAttempted.has(mediaId)) continue;
-    seenAttempted.add(mediaId);
-    attemptedMediaIds.push(mediaId);
-  }
-  if (attemptedMediaIds.length > 200) throw fail("CUSTOM_DELIVERY_MEDIA_LIMIT", "Too many media IDs for one programmatic provenance check (max 200)", 413);
-  if (!creator) throw fail("CUSTOM_DELIVERY_PREFLIGHT_CONTEXT_REQUIRED", "creatorId is required");
-  if (!attemptedMediaIds.length) return { ok: true, matched: false, allow: true, code: null, customMediaIds: [] };
-  const provenance = await resolveAttemptedCustomMedia({ client, agencyId, creatorId: creator, attemptedMediaIds });
-  const customMediaIds = attemptedMediaIds.filter((mediaId) => provenance.customIds.has(mediaId));
-  if (!customMediaIds.length) return { ok: true, matched: false, allow: true, code: null, customMediaIds: [] };
-  return {
-    ok: true,
-    matched: true,
-    allow: false,
-    code: "CUSTOM_MEDIA_PROGRAMMATIC_FORBIDDEN",
-    error: "CUSTOM media may only be sent through the exact Custom delivery flow, never through automation/campaign programmatic writers",
-    customMediaIds,
-  };
+  return resolveCustomMediaProvenance({ agencyId, creatorId, mediaIds: attemptedMediaIds, db: client, maxMediaIds: 500 });
 }
 
 async function preflightProgrammaticCustomMedia({ agencyId, member, creatorId, mediaIds, db = null } = {}) {
@@ -296,9 +247,10 @@ async function classifyDialogComposerMediaAvailability({ agencyId, member, creat
   }
   await allowedCreatorScope({ agencyId, member, requestedCreatorId: creator, db: client });
 
-  const { customAssets, provenanceRows, customIds } = await resolveAttemptedCustomMedia({
+  const provenance = await resolveAttemptedCustomMedia({
     client, agencyId, creatorId: creator, attemptedMediaIds,
   });
+  const { customAssets, provenanceRows, customIds, referencesByMedia: refsByMedia } = provenance;
   if (!customIds.size) {
     return {
       ok: true, creatorId: creator, dialogId: dialog, matched: false,
@@ -307,20 +259,6 @@ async function classifyDialogComposerMediaAvailability({ agencyId, member, creat
     };
   }
 
-  const refsByMedia = new Map();
-  const addRef = (mediaIdInput, submissionIdInput, orderIdInput) => {
-    const mediaId = clean(mediaIdInput, 240);
-    const submissionId = clean(submissionIdInput, 180);
-    const orderId = clean(orderIdInput, 180);
-    if (!mediaId || !customIds.has(mediaId) || !submissionId) return;
-    let refs = refsByMedia.get(mediaId);
-    if (!refs) { refs = new Map(); refsByMedia.set(mediaId, refs); }
-    refs.set(`${submissionId}\n${orderId}`, { submissionId, orderId: orderId || null });
-  };
-  for (const asset of customAssets || []) addRef(asset.mediaId, asset.customSubmissionId, asset.customOrderId);
-  for (const row of provenanceRows || []) {
-    for (const mediaId of uniqueMediaIds(row.ofMediaIds)) addRef(mediaId, row.id, row.customOrderId);
-  }
 
   const submissionIds = [...new Set([...refsByMedia.values()].flatMap((refs) => [...refs.values()].map((ref) => ref.submissionId)))];
   const rows = submissionIds.length ? await client.customContentSubmission.findMany({
@@ -380,21 +318,17 @@ async function preflightCustomManualSend({ agencyId, member, creatorId, dialogId
   if (!attemptedMediaIds.length) return { ok: true, matched: false, allow: true, code: null };
   await allowedCreatorScope({ agencyId, member, requestedCreatorId: creator, db: client });
 
-  const { customAssets, provenanceRows, customIds } = await resolveAttemptedCustomMedia({
+  const provenance = await resolveAttemptedCustomMedia({
     client, agencyId, creatorId: creator, attemptedMediaIds,
   });
+  const { customIds, referencesByMedia } = provenance;
   if (!customIds.size) return { ok: true, matched: false, allow: true, code: null };
   if (customIds.size !== attemptedMediaIds.length) {
     return { ok: true, matched: true, allow: false, code: "CUSTOM_DELIVERY_MIXED_MEDIA", error: "Custom content cannot be mixed with unrelated media in one manual send" };
   }
-  const orderIds = new Set([
-    ...(customAssets || []).map((asset) => clean(asset.customOrderId, 180)).filter(Boolean),
-    ...(provenanceRows || []).map((row) => clean(row.customOrderId, 180)).filter(Boolean),
-  ]);
-  const submissionIds = new Set([
-    ...(customAssets || []).map((asset) => clean(asset.customSubmissionId, 180)).filter(Boolean),
-    ...(provenanceRows || []).map((row) => clean(row.id, 180)).filter(Boolean),
-  ]);
+  const exactRefs = attemptedMediaIds.flatMap((mediaId) => [...(referencesByMedia.get(mediaId)?.values() || [])]);
+  const orderIds = new Set(exactRefs.map((ref) => clean(ref.orderId, 180)).filter(Boolean));
+  const submissionIds = new Set(exactRefs.map((ref) => clean(ref.submissionId, 180)).filter(Boolean));
   if (orderIds.size !== 1 || submissionIds.size !== 1) {
     return { ok: true, matched: true, allow: false, code: "CUSTOM_DELIVERY_AMBIGUOUS_MEDIA", error: "Selected Custom media do not resolve to one exact approved submission" };
   }

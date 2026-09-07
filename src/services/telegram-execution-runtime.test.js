@@ -65,28 +65,43 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
       async findMany({ where }) {
         return customOrders.filter((row) => {
           if (where.agencyId && row.agencyId !== where.agencyId) return false;
+          if (typeof where.id === "string" && row.id !== where.id) return false;
           if (where.id?.in && !where.id.in.includes(row.id)) return false;
+          if (where.creatorId && typeof where.creatorId === "string" && row.creatorId !== where.creatorId) return false;
+          if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
           if (where.status && row.status !== where.status) return false;
           return true;
         }).map((row) => ({ ...row }));
+      },
+      async findFirst({ where }) {
+        return (await this.findMany({ where }))[0] || null;
       },
     },
     customContentSubmission: {
       async findMany({ where, take = 1000 }) {
         return sourceSubmissions.filter((row) => {
           if (row.agencyId !== where.agencyId) return false;
+          if (typeof where.creatorId === "string" && row.creatorId !== where.creatorId) return false;
           if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+          if (typeof where.customOrderId === "string" && row.customOrderId !== where.customOrderId) return false;
+          if (where.reviewStatus && String(row.reviewStatus || "WAITING_REVIEW") !== String(where.reviewStatus)) return false;
           if (where.telegramSourceAccountId?.not === null && row.telegramSourceAccountId == null) return false;
           if (where.telegramSourceUserId?.not === null && row.telegramSourceUserId == null) return false;
           return true;
         }).slice(0, take).map((row) => ({ ...row }));
       },
+      async findFirst({ where }) { return (await this.findMany({ where, take: 1 }))[0] || null; },
     },
     telegramDeliveryIntent: {
       async findMany({ where, take = 1000 }) {
         return deliveryIntents.filter((row) => {
           if (row.agencyId !== where.agencyId) return false;
+          if (where.accountId && row.accountId !== where.accountId) return false;
+          if (typeof where.creatorId === "string" && row.creatorId !== where.creatorId) return false;
           if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+          if (typeof where.customOrderId === "string" && row.customOrderId !== where.customOrderId) return false;
+          if (where.customOrderId?.in && !where.customOrderId.in.includes(row.customOrderId)) return false;
+          if (where.customSubmissionId && row.customSubmissionId !== where.customSubmissionId) return false;
           if (typeof where.kind === "string" && row.kind !== where.kind) return false;
           if (where.kind?.in && !where.kind.in.includes(row.kind)) return false;
           if (typeof where.state === "string" && row.state !== where.state) return false;
@@ -96,6 +111,7 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
           return true;
         }).slice(0, take).map((row) => ({ ...row }));
       },
+      async findFirst({ where }) { return (await this.findMany({ where, take: 1 }))[0] || null; },
     },
     agencyTelegramMtprotoAccount: {
       async findMany({ where }) { return accounts.filter((row) => matchAccount(row, where)).map((row) => ({ ...row })); },
@@ -366,7 +382,7 @@ test("completed historical TASK without active follow-up or source work does not
 
 test("pending confirmed TASK thread keeps the old Telegram account runtime-eligible until the Custom thread is terminal", async () => {
   const db = makeDb({
-    deliveryIntents: [{ id: "task-live", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-live", accountId: "tg-1", kind: "TASK", state: "CONFIRMED", remoteMessageId: 601, remoteRecipientTelegramUserId: "1001" }],
+    deliveryIntents: [{ id: "task-live", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-live", accountId: "tg-1", kind: "TASK", state: "CONFIRMED", remoteMessageId: 601, remoteRecipientTelegramUserId: "1001", confirmedAt: new Date("2026-09-05T11:59:00.000Z") }],
     customOrders: [{ id: "order-live", agencyId: "agency-1", creatorId: "creator-1", status: "PENDING" }],
   });
   db._creators[0].telegramAccountId = "tg-2";

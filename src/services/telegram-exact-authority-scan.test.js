@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { eligibleTelegramExecutionAccounts } = require("./telegram-execution-runtime");
-const { findCancelledTaskFollowupDebt, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
+const { findPendingModelInstructionAnchors, findCancelledModelInstructionFollowupDebt, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
 
 function clean(value) { return String(value == null ? "" : value); }
 function orderedPage(rows, { where = {}, orderBy = null, take = rows.length, cursor = null, skip = 0 } = {}, match) {
@@ -50,6 +50,7 @@ function intentMatch(row, where = {}) {
   if (where.agencyId && row.agencyId !== where.agencyId) return false;
   if (where.accountId && row.accountId !== where.accountId) return false;
   if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+  if (typeof where.customOrderId === "string" && row.customOrderId !== where.customOrderId) return false;
   if (where.customOrderId?.in && !where.customOrderId.in.includes(row.customOrderId)) return false;
   if (typeof where.kind === "string" && row.kind !== where.kind) return false;
   if (where.kind?.in && !where.kind.in.includes(row.kind)) return false;
@@ -63,6 +64,9 @@ function sourceMatch(row, where = {}) {
   if (!idMatch(row, where)) return false;
   if (where.agencyId && row.agencyId !== where.agencyId) return false;
   if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+  if (where.customOrderId?.in && !where.customOrderId.in.map(String).includes(String(row.customOrderId || ""))) return false;
+  if (where.customOrderId !== undefined && typeof where.customOrderId !== "object" && String(row.customOrderId || "") !== String(where.customOrderId)) return false;
+  if (where.reviewStatus !== undefined && String(row.reviewStatus || "WAITING_REVIEW") !== String(where.reviewStatus)) return false;
   if (typeof where.telegramSourceAccountId === "string" && row.telegramSourceAccountId !== where.telegramSourceAccountId) return false;
   if (where.telegramSourceAccountId?.not === null && row.telegramSourceAccountId == null) return false;
   if (where.telegramSourceUserId?.not === null && row.telegramSourceUserId == null) return false;
@@ -91,6 +95,7 @@ function makeRuntimeDb({ creators, accounts, orders = [], intents = [], sources 
     },
     customContentSubmission: {
       async findMany(args) { return orderedPage(sources, args, sourceMatch); },
+      async findFirst({ where }) { return sources.find((row) => sourceMatch(row, where || {})) || null; },
     },
   };
 }
@@ -98,7 +103,7 @@ function makeRuntimeDb({ creators, accounts, orders = [], intents = [], sources 
 function creator(id, accountId) { return { id, agencyId: "agency-1", telegramContact: `@${id}`, telegramAccountId: accountId, deletedAt: null }; }
 function account(index, lifecycleState = "ACTIVE") { return { id: `tg-${String(index).padStart(3, "0")}`, agencyId: "agency-1", lifecycleState }; }
 function order(index, status = "COMPLETED") { return { id: `order-${String(index).padStart(4, "0")}`, agencyId: "agency-1", creatorId: "creator-1", status }; }
-function task(index, accountId = "tg-old") { return { id: `task-${String(index).padStart(4, "0")}`, agencyId: "agency-1", creatorId: "creator-1", customOrderId: `order-${String(index).padStart(4, "0")}`, accountId, kind: "TASK", state: "CONFIRMED", remoteMessageId: 10000 + index, remoteRecipientTelegramUserId: "900001" }; }
+function task(index, accountId = "tg-old") { return { id: `task-${String(index).padStart(4, "0")}`, agencyId: "agency-1", creatorId: "creator-1", customOrderId: `order-${String(index).padStart(4, "0")}`, accountId, kind: "TASK", state: "CONFIRMED", remoteMessageId: 10000 + index, remoteRecipientTelegramUserId: "900001", confirmedAt: new Date("2026-09-06T00:00:00.000Z") }; }
 
 test("F44 runtime pending TASK discovery is exact beyond 1000 terminal historical TASK rows", async () => {
   const orders = Array.from({ length: 1001 }, (_, i) => order(i + 1, i === 1000 ? "PENDING" : "COMPLETED"));
@@ -106,6 +111,30 @@ test("F44 runtime pending TASK discovery is exact beyond 1000 terminal historica
   const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-new")], accounts: [{ id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE" }, { id: "tg-new", agencyId: "agency-1", lifecycleState: "ACTIVE" }], orders, intents });
   const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: db._member, db });
   assert.ok(eligible.some((row) => row.accountId === "tg-old" && row.inboundEligible === true && row.messagingEligible === false));
+});
+
+
+
+test("historical no-TASK confirmed REVISION_REQUEST remains exact inbound runtime authority", async () => {
+  const orders = [{ ...order(1, "PENDING"), type: "CONTENT" }];
+  const sources = [{
+    id: "submission-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id,
+    reviewStatus: "REVISION_REQUESTED", pipelineDisposition: "ACTIVE", receivedAt: new Date("2026-09-07T18:00:00.000Z"), createdAt: new Date("2026-09-07T18:00:00.000Z"),
+  }];
+  const intents = [{
+    id: "revision-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, customSubmissionId: "submission-v1",
+    accountId: "tg-old", kind: "REVISION_REQUEST", state: "CONFIRMED", remoteMessageId: 12001, remoteRecipientTelegramUserId: "900001",
+    remoteSentAt: new Date("2026-09-07T18:05:00.000Z"), confirmedAt: new Date("2026-09-07T18:05:01.000Z"),
+  }];
+  const db = makeRuntimeDb({
+    creators: [creator("creator-1", "tg-new")],
+    accounts: [{ id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE" }, { id: "tg-new", agencyId: "agency-1", lifecycleState: "ACTIVE" }],
+    orders, intents, sources,
+  });
+  const anchors = await findPendingModelInstructionAnchors({ agencyId: "agency-1", creatorIds: ["creator-1"], db });
+  assert.deepEqual(anchors.map((row) => [row.kind, row.accountId, row.obligationState]), [["REVISION_REQUEST", "tg-old", "REVISION_WAITING_RESPONSE"]]);
+  const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: db._member, db });
+  assert.ok(eligible.some((row) => row.accountId === "tg-old" && row.inboundEligible === true && row.messagingEligible === false), "confirmed revision thread must keep its historical provider account inbound-capable");
 });
 
 test("F44 runtime pending Telegram source discovery drains past the old first-1000 window", async () => {
@@ -143,7 +172,7 @@ test("cancelled TASK follow-up debt scan is exact beyond the first two pages", a
     }
   }
   const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-old")], accounts: [{ id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE" }], orders, intents });
-  const debt = await findCancelledTaskFollowupDebt({ agencyId: "agency-1", creatorIds: ["creator-1"], accountId: "tg-old", db });
+  const debt = await findCancelledModelInstructionFollowupDebt({ agencyId: "agency-1", creatorIds: ["creator-1"], accountId: "tg-old", db });
   assert.equal(debt.length, 1);
   assert.equal(debt[0].order.id, orders[500].id);
   assert.equal(debt[0].task.id, `task-${String(501).padStart(4, "0")}`);
@@ -186,4 +215,61 @@ test("F44 Auto uses exact ACTIVE cardinality: 101 ACTIVE is ambiguous, one ACTIV
   const oneActive = many.map((row, index) => ({ ...row, lifecycleState: index === 100 ? "ACTIVE" : "RETIRING" }));
   db = makeRuntimeDb({ creators: [creator("creator-1", null)], accounts: oneActive });
   assert.deepEqual(await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: db._member, db }), [{ accountId: oneActive[100].id, anchorCreatorId: "creator-1", messagingEligible: true, inboundEligible: true }]);
+});
+
+test("cancelled historical no-TASK revision remains follow-up debt until cancellation is durably planned", async () => {
+  const orders = [{ ...order(1, "CANCELLED"), type: "CONTENT" }];
+  const sources = [{
+    id: "submission-cancelled-revision", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id,
+    reviewStatus: "REVISION_REQUESTED", pipelineDisposition: "SALVAGE", receivedAt: new Date("2026-09-07T18:00:00.000Z"), createdAt: new Date("2026-09-07T18:00:00.000Z"),
+  }];
+  const intents = [{
+    id: "revision-cancelled-no-task", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, customSubmissionId: sources[0].id,
+    accountId: "tg-old", kind: "REVISION_REQUEST", state: "CONFIRMED", remoteMessageId: 18001, remoteRecipientTelegramUserId: "900001",
+    remoteSentAt: new Date("2026-09-07T18:05:00.000Z"), confirmedAt: new Date("2026-09-07T18:05:01.000Z"), createdAt: new Date("2026-09-07T18:04:00.000Z"),
+  }];
+  const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-old")], accounts: [{ id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE" }], orders, intents, sources });
+  const debt = await findCancelledModelInstructionFollowupDebt({ agencyId: "agency-1", creatorIds: ["creator-1"], accountId: "tg-old", db });
+  assert.equal(debt.length, 1, "confirmed revision without TASK must still retain cancellation follow-up debt");
+  assert.equal(debt[0].instruction.kind, "REVISION_REQUEST");
+  assert.equal(debt[0].instruction.id, "revision-cancelled-no-task");
+});
+
+test("cancelled revision follow-up debt is satisfied only by cancellation on the exact provider account", async () => {
+  const orders = [{ ...order(1, "CANCELLED"), type: "CONTENT" }];
+  const sources = [{ id: "submission-r", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, reviewStatus: "REVISION_REQUESTED", pipelineDisposition: "SALVAGE", receivedAt: new Date("2026-09-07T18:00:00Z"), createdAt: new Date("2026-09-07T18:00:00Z") }];
+  const revision = { id: "revision-r", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, customSubmissionId: sources[0].id, accountId: "tg-revision", kind: "REVISION_REQUEST", state: "CONFIRMED", remoteMessageId: 18101, remoteRecipientTelegramUserId: "900001", confirmedAt: new Date("2026-09-07T18:05:00Z"), createdAt: new Date("2026-09-07T18:04:00Z") };
+  const wrongCancellation = { id: "cancel-old-task", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, accountId: "tg-task", kind: "CANCELLATION", state: "PLANNED" };
+  const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-revision")], accounts: [], orders, intents: [revision, wrongCancellation], sources });
+  let debt = await findCancelledModelInstructionFollowupDebt({ agencyId: "agency-1", creatorIds: ["creator-1"], db });
+  assert.equal(debt.length, 1, "cancellation pinned to an older TASK account cannot satisfy revision follow-up debt");
+  const exactCancellation = { ...wrongCancellation, id: "cancel-revision", accountId: "tg-revision" };
+  db.telegramDeliveryIntent.findMany = async (args) => orderedPage([revision, wrongCancellation, exactCancellation], args, intentMatch);
+  debt = await findCancelledModelInstructionFollowupDebt({ agencyId: "agency-1", creatorIds: ["creator-1"], db });
+  assert.equal(debt.length, 0);
+});
+
+test("cancelled unresolved revision remains exact follow-up debt and cannot silently fall back to TASK", async () => {
+  const orders = [{ ...order(1, "CANCELLED"), type: "CONTENT" }];
+  const sources = [{ id: "submission-u", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, reviewStatus: "REVISION_REQUESTED", pipelineDisposition: "SALVAGE", receivedAt: new Date("2026-09-07T18:00:00Z"), createdAt: new Date("2026-09-07T18:00:00Z") }];
+  const intents = [
+    { ...task(1, "tg-task"), customOrderId: orders[0].id },
+    { id: "revision-u", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, customSubmissionId: sources[0].id, accountId: "tg-revision", kind: "REVISION_REQUEST", state: "RECONCILE_REQUIRED", createdAt: new Date("2026-09-07T18:04:00Z") },
+  ];
+  const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-revision")], accounts: [], orders, intents, sources });
+  const debt = await findCancelledModelInstructionFollowupDebt({ agencyId: "agency-1", creatorIds: ["creator-1"], db });
+  assert.equal(debt.length, 1);
+  assert.equal(debt[0].unresolved, true);
+  assert.equal(debt[0].instruction.kind, "REVISION_REQUEST");
+  assert.equal(debt[0].instructionState, "RECONCILE_REQUIRED");
+});
+
+test("legacy retirement waiver explicitly closes model-instruction cancellation debt without inventing provider confirmation", async () => {
+  const orders = [{ ...order(1, "CANCELLED"), type: "CONTENT", telegramCancellationWaivedAt: new Date("2026-09-07T19:00:00Z"), telegramCancellationWaiverReason: "provider retired" }];
+  const sources = [{ id: "submission-w", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, reviewStatus: "REVISION_REQUESTED", pipelineDisposition: "SALVAGE", receivedAt: new Date("2026-09-07T18:00:00Z"), createdAt: new Date("2026-09-07T18:00:00Z") }];
+  const intents = [{ id: "revision-w", agencyId: "agency-1", creatorId: "creator-1", customOrderId: orders[0].id, customSubmissionId: sources[0].id, accountId: "tg-old", kind: "REVISION_REQUEST", state: "CONFIRMED", remoteMessageId: 18201, remoteRecipientTelegramUserId: "900001", confirmedAt: new Date("2026-09-07T18:05:00Z"), createdAt: new Date("2026-09-07T18:04:00Z") }];
+  const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-old")], accounts: [], orders, intents, sources });
+  const debt = await findCancelledModelInstructionFollowupDebt({ agencyId: "agency-1", creatorIds: ["creator-1"], db });
+  assert.equal(debt.length, 0);
+  assert.equal(intents.some((row) => row.kind === "CANCELLATION"), false, "waiver is control truth, not a fabricated Telegram send");
 });

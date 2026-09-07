@@ -7,7 +7,7 @@ const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
 const { SETTINGS_KEY: TELEGRAM_CUSTOM_REMINDERS_KEY, normalizeTelegramCustomReminders, reprojectCustomReminderSchedule } = require("./custom-order-reminders");
-const { findPendingTaskAnchors, findCancelledTaskFollowupDebt, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
+const { findPendingModelInstructionAnchors, findCancelledModelInstructionFollowupDebt, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
@@ -541,14 +541,14 @@ async function assertTelegramAccountNoBusinessBlockers({ agencyId, accountId, db
   }) : null;
   if (activeIntent) throw Object.assign(new Error("Telegram connection is still required by an active or unresolved Custom delivery"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
 
-  const pendingThread = await findPendingTaskAnchors({ agencyId, accountId: id, db, stopAfterFirst: true });
+  const pendingThread = await findPendingModelInstructionAnchors({ agencyId, accountId: id, db, stopAfterFirst: true });
   if (pendingThread.length) {
-    throw Object.assign(new Error("Telegram connection is still the canonical thread for a pending Custom order"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
+    throw Object.assign(new Error("Telegram connection is still the canonical model-instruction thread for a pending Custom order"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
   }
 
-  const cancelledFollowupDebt = await findCancelledTaskFollowupDebt({ agencyId, accountId: id, db, stopAfterFirst: true });
+  const cancelledFollowupDebt = await findCancelledModelInstructionFollowupDebt({ agencyId, accountId: id, db, stopAfterFirst: true });
   if (cancelledFollowupDebt.length) {
-    throw Object.assign(new Error("Telegram connection still owns a confirmed task whose cancellation follow-up has not been durably planned or confirmed"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
+    throw Object.assign(new Error("Telegram connection still owns a confirmed model instruction whose cancellation follow-up has not been durably planned or confirmed"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
   }
 
   let pendingSource = null;

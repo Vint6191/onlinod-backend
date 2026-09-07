@@ -4,6 +4,7 @@ const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { unresolvedPipelineSubmissionWhere } = require("./custom-content-pipeline-authority-service");
+const { resolveCustomMediaProvenance } = require("./custom-media-provenance-authority-service");
 
 const MAX_MEDIA_IDS = 5000;
 const MAX_USAGE_SOURCES = 25;
@@ -649,6 +650,35 @@ async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma }
   return result;
 }
 
+async function liveCustomOwnershipByMedia({ agencyId, creatorId, mediaIds, db }) {
+  const ids = cleanMediaIds(mediaIds, MAX_MEDIA_IDS);
+  const ownership = new Map();
+  if (!ids.length) return ownership;
+  const provenance = await resolveCustomMediaProvenance({
+    agencyId, creatorId, mediaIds: ids, db, maxMediaIds: MAX_MEDIA_IDS,
+  });
+  const submissionIds = Array.from(new Set(ids.flatMap((mediaId) =>
+    [...(provenance.referencesByMedia.get(mediaId)?.values() || [])]
+      .map((ref) => clean(ref.submissionId, 180)).filter(Boolean)
+  )));
+  if (!submissionIds.length) return ownership;
+  const live = await db.customContentSubmission.findMany({
+    where: { id: { in: submissionIds }, agencyId, creatorId, ...unresolvedPipelineSubmissionWhere() },
+    select: { id: true, executionVaultFolderId: true },
+    take: submissionIds.length,
+  });
+  const liveById = new Map((live || []).map((row) => [String(row.id), row]));
+  for (const mediaId of ids) {
+    const rows = [];
+    for (const ref of provenance.referencesByMedia.get(mediaId)?.values() || []) {
+      const submission = liveById.get(String(ref.submissionId || ""));
+      if (submission) rows.push(submission);
+    }
+    if (rows.length) ownership.set(mediaId, rows);
+  }
+  return ownership;
+}
+
 async function mutateFolderMembership({ agencyId, creatorId, mediaIds, folderId, action, db = prisma }) {
   const id = await requireCreator(db, agencyId, creatorId);
   const ids = cleanMediaIds(mediaIds);
@@ -663,20 +693,14 @@ async function mutateFolderMembership({ agencyId, creatorId, mediaIds, folderId,
       take: ids.length,
     });
     if (normalizedAction === "remove") {
-      const customRows = assets.filter((asset) => String(asset.source || "") === "CUSTOM" && asset.customSubmissionId);
-      const submissionIds = Array.from(new Set(customRows.map((asset) => String(asset.customSubmissionId)).filter(Boolean)));
-      const live = submissionIds.length ? await tx.customContentSubmission.findMany({
-        where: { id: { in: submissionIds }, agencyId, creatorId: id, ...unresolvedPipelineSubmissionWhere() },
-        select: { id: true, executionVaultFolderId: true },
-        take: submissionIds.length,
-      }) : [];
-      const liveById = new Map(live.map((row) => [String(row.id), row]));
-      const blockedMediaIds = customRows.filter((asset) => {
-        const submission = liveById.get(String(asset.customSubmissionId));
-        if (!submission) return false;
-        const pinnedFolderId = clean(submission.executionVaultFolderId, 240);
-        return !pinnedFolderId || pinnedFolderId === cleanFolderId;
-      }).map((asset) => String(asset.mediaId));
+      const ownership = await liveCustomOwnershipByMedia({ agencyId, creatorId: id, mediaIds: ids, db: tx });
+      const blockedMediaIds = ids.filter((mediaId) => {
+        const submissions = ownership.get(mediaId) || [];
+        return submissions.some((submission) => {
+          const pinnedFolderId = clean(submission.executionVaultFolderId, 240);
+          return !pinnedFolderId || pinnedFolderId === cleanFolderId;
+        });
+      });
       if (blockedMediaIds.length) {
         throw Object.assign(new Error("Live Custom pipeline media cannot be removed from its pinned Vault folder"), {
           code: "MEDIA_LIBRARY_CUSTOM_PIPELINE_FOLDER_OWNED", status: 409, mediaIds: blockedMediaIds, folderId: cleanFolderId,
@@ -703,26 +727,13 @@ async function deleteMediaAssets({ agencyId, creatorId, mediaIds, db = prisma })
   const ids = cleanMediaIds(mediaIds, 10000);
   if (!ids.length) return { ok: true, creatorId: id, deleted: 0 };
   const mutate = async (tx) => {
-    const protectedRows = await tx.creatorMediaAsset.findMany({
-      where: { agencyId, creatorId: id, mediaId: { in: ids }, source: "CUSTOM", customSubmissionId: { not: null } },
-      select: { mediaId: true, customSubmissionId: true },
-      take: ids.length,
-    });
-    if (protectedRows.length) {
-      const submissionIds = Array.from(new Set(protectedRows.map((row) => String(row.customSubmissionId || "")).filter(Boolean)));
-      const live = submissionIds.length ? await tx.customContentSubmission.findMany({
-        where: { id: { in: submissionIds }, agencyId, creatorId: id, ...unresolvedPipelineSubmissionWhere() },
-        select: { id: true },
-        take: submissionIds.length,
-      }) : [];
-      const liveIds = new Set(live.map((row) => String(row.id)));
-      const blockedMediaIds = protectedRows.filter((row) => liveIds.has(String(row.customSubmissionId))).map((row) => String(row.mediaId));
-      if (blockedMediaIds.length) {
-        const error = Object.assign(new Error("Live Custom pipeline media cannot be deleted from Media Library"), {
-          code: "MEDIA_LIBRARY_CUSTOM_PIPELINE_OWNED", status: 409, mediaIds: blockedMediaIds,
-        });
-        throw error;
-      }
+    const ownership = await liveCustomOwnershipByMedia({ agencyId, creatorId: id, mediaIds: ids, db: tx });
+    const blockedMediaIds = ids.filter((mediaId) => (ownership.get(mediaId) || []).length > 0);
+    if (blockedMediaIds.length) {
+      const error = Object.assign(new Error("Live Custom pipeline media cannot be deleted from Media Library"), {
+        code: "MEDIA_LIBRARY_CUSTOM_PIPELINE_OWNED", status: 409, mediaIds: blockedMediaIds,
+      });
+      throw error;
     }
     const deleted = await tx.creatorMediaAsset.deleteMany({ where: { agencyId, creatorId: id, mediaId: { in: ids } } });
     return { ok: true, creatorId: id, deleted: deleted.count };

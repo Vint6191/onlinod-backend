@@ -13,6 +13,7 @@ const {
   upsertMediaMetadata,
   replaceUsageSources,
   mutateFolderMembership,
+  deleteMediaAssets,
 } = require("./media-library-service");
 
 const AGENCY_ID = "agency-1";
@@ -517,4 +518,51 @@ test("folder membership mutation rejects removing live CUSTOM media from its pin
   const result = await mutateFolderMembership({ agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["9001"], folderId: "other", action: "remove", db });
   assert.equal(result.updated, 1);
   assert.deepEqual(assets[0].folderIds, ["vault-pinned"]);
+});
+
+test("validated COMPLETED relay proof protects live CUSTOM media before asset/submission projection catches up", async () => {
+  const assets = [{ id: "asset-proof-window", agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaId: "990701", source: "GENERAL", customSubmissionId: null, catalogActive: true, folderIds: ["vault-pinned", "other"] }];
+  const submission = {
+    id: "sub-proof-window", agencyId: AGENCY_ID, creatorId: CREATOR_ID, customOrderId: "order-live", pipelineDisposition: "ACTIVE",
+    executionVaultFolderId: "vault-pinned", ofMediaIds: [], telegramMessageIds: ["7001"], telegramSourceAccountId: "tg-source", telegramSourceUserId: "1001",
+  };
+  const proof = {
+    id: "relay-proof-window", idempotencyKey: "custom-relay:sub-proof-window:0", actionType: "CUSTOM_RELAY_SEND", status: "COMPLETED",
+    payload: { submissionId: "sub-proof-window", expectedIndex: 0, telegramSourceAccountId: "tg-source", telegramSourceUserId: "1001", telegramMessageId: "7001" },
+    result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "990701" },
+  };
+  let deleted = 0;
+  const tx = {
+    creatorMediaAsset: {
+      async findMany({ where = {} } = {}) {
+        return assets.filter((row) => !where.source || String(row.source) === String(where.source)).map((row) => ({ ...row }));
+      },
+      async update({ where, data }) { const row = assets.find((item) => item.id === where.id); Object.assign(row, data); return { ...row }; },
+      async deleteMany() { deleted += 1; return { count: 1 }; },
+    },
+    customContentSubmission: {
+      async findMany({ where }) {
+        if (where?.ofMediaIds?.hasSome) return [];
+        if (where?.id?.in?.includes("sub-proof-window")) return [{ ...submission }];
+        return [];
+      },
+    },
+    automationDelivery: { async findMany() { return [{ ...proof }]; } },
+  };
+  const db = {
+    creatorAccount: { async findFirst() { return { id: CREATOR_ID }; } },
+    ...tx,
+    async $transaction(work) { return work(tx); },
+  };
+
+  await assert.rejects(
+    () => mutateFolderMembership({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaIds: ["990701"], folderId: "vault-pinned", action: "remove", db }),
+    (error) => error?.code === "MEDIA_LIBRARY_CUSTOM_PIPELINE_FOLDER_OWNED",
+  );
+  await assert.rejects(
+    () => deleteMediaAssets({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaIds: ["990701"], db }),
+    (error) => error?.code === "MEDIA_LIBRARY_CUSTOM_PIPELINE_OWNED",
+  );
+  assert.equal(deleted, 0, "proof-owned live CUSTOM metadata must not be deleted before projection repair");
+  assert.deepEqual(assets[0].folderIds, ["vault-pinned", "other"]);
 });

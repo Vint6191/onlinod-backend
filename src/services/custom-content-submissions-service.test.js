@@ -62,6 +62,7 @@ function fakeDb(seed = {}) {
   const audits = [];
   const relayProofs = (seed.relayProofs || []).map(clone);
   const inboundEvents = (seed.inboundEvents || []).map(clone);
+  const deliveryIntents = (seed.deliveryIntents || []).map(clone);
   let injectAlbumRace = seed.injectAlbumRace === true;
   let seq = submissions.length;
 
@@ -125,6 +126,7 @@ function fakeDb(seed = {}) {
     _mediaAssets: mediaAssets,
     _relayProofs: relayProofs,
     _inboundEvents: inboundEvents,
+    _deliveryIntents: deliveryIntents,
     _telegramAccounts: telegramAccounts,
     _audits: audits,
     agency: {
@@ -186,7 +188,45 @@ function fakeDb(seed = {}) {
       },
     },
     telegramDeliveryIntent: {
-      async findMany() { return []; },
+      async findFirst({ where = {} }) {
+        const row = deliveryIntents.find((candidate) => {
+          if (where.id !== undefined && String(candidate.id) !== String(where.id)) return false;
+          if (where.agencyId !== undefined && String(candidate.agencyId) !== String(where.agencyId)) return false;
+          if (where.creatorId !== undefined && String(candidate.creatorId) !== String(where.creatorId)) return false;
+          if (where.customOrderId !== undefined && String(candidate.customOrderId) !== String(where.customOrderId)) return false;
+          if (where.customSubmissionId !== undefined && String(candidate.customSubmissionId || "") !== String(where.customSubmissionId || "")) return false;
+          if (where.kind !== undefined && String(candidate.kind) !== String(where.kind)) return false;
+          if (where.state !== undefined) {
+            if (where.state?.in && !where.state.in.includes(candidate.state)) return false;
+            if (typeof where.state === "string" && String(candidate.state) !== String(where.state)) return false;
+          }
+          return true;
+        });
+        return clone(row || null);
+      },
+      async findMany({ where = {} } = {}) {
+        return deliveryIntents.filter((candidate) => {
+          if (where.agencyId !== undefined && String(candidate.agencyId) !== String(where.agencyId)) return false;
+          if (where.customOrderId !== undefined && String(candidate.customOrderId) !== String(where.customOrderId)) return false;
+          if (where.kind !== undefined && String(candidate.kind) !== String(where.kind)) return false;
+          if (where.state?.in && !where.state.in.includes(candidate.state)) return false;
+          return true;
+        }).map(clone);
+      },
+      async updateMany({ where = {}, data = {} }) {
+        let count = 0;
+        for (const row of deliveryIntents) {
+          if (where.id !== undefined && String(row.id) !== String(where.id)) continue;
+          if (where.agencyId !== undefined && String(row.agencyId) !== String(where.agencyId)) continue;
+          if (where.kind !== undefined && String(row.kind) !== String(where.kind)) continue;
+          if (where.state?.in && !where.state.in.includes(row.state)) continue;
+          if (where.claimRevision !== undefined && Number(row.claimRevision || 0) !== Number(where.claimRevision)) continue;
+          if (where.commitStartedAt === null && row.commitStartedAt != null) continue;
+          Object.assign(row, clone(data));
+          count += 1;
+        }
+        return { count };
+      },
     },
     customOrder: {
       async findFirst({ where, select = null }) {
@@ -404,6 +444,8 @@ function withTransactionalRollback(db) {
     const submissionSnapshot = clone(db._submissions);
     const inboundSnapshot = clone(db._inboundEvents);
     const telegramAccountSnapshot = clone(db._telegramAccounts);
+    const deliveryIntentSnapshot = clone(db._deliveryIntents);
+    const auditSnapshot = clone(db._audits);
     try {
       return await work(db);
     } catch (error) {
@@ -411,6 +453,8 @@ function withTransactionalRollback(db) {
       db._submissions.splice(0, db._submissions.length, ...submissionSnapshot.map(clone));
       db._inboundEvents.splice(0, db._inboundEvents.length, ...inboundSnapshot.map(clone));
       db._telegramAccounts.splice(0, db._telegramAccounts.length, ...telegramAccountSnapshot.map(clone));
+      db._deliveryIntents.splice(0, db._deliveryIntents.length, ...deliveryIntentSnapshot.map(clone));
+      db._audits.splice(0, db._audits.length, ...auditSnapshot.map(clone));
       throw error;
     } finally {
       release();
@@ -503,6 +547,8 @@ test("create stores one compact submission row and exact retries are idempotent"
   assert.equal(first.submission.telegramSourceAccountId, "tg-1");
   assert.equal(first.submission.telegramSourceUserId, "987654321012345678");
   assert.equal(db._submissions.length, 1);
+  const auditCountAfterFirstCreate = db._audits.length;
+  assert.equal(auditCountAfterFirstCreate, 2, "first human import audits both instruction adjudication and provider-source ownership");
 
   const retry = await createCustomContentSubmission({
     agencyId: "agency-1", member, db,
@@ -511,7 +557,7 @@ test("create stores one compact submission row and exact retries are idempotent"
   assert.equal(retry.deduped, true);
   assert.equal(retry.submission.id, first.submission.id);
   assert.equal(db._submissions.length, 1);
-  assert.equal(db._audits.length, 1, "idempotent retries do not create audit noise");
+  assert.equal(db._audits.length, auditCountAfterFirstCreate, "idempotent retries do not create audit noise");
 });
 
 
@@ -1437,6 +1483,84 @@ test("first submission bind and CONTENT type edit race on the same CustomOrder r
   assert.equal(db._orders[0].type, "CONTENT");
 });
 
+test("manager assignment supersedes a precommit initial TASK before binding the response", async () => {
+  const incoming = baseSubmission({ id: "manager-incoming-v1", customOrderId: null, reviewStatus: "WAITING_REVIEW" });
+  const stamp = new Date("2026-08-21T10:00:00.000Z");
+  const task = {
+    id: "task-manager-precommit", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-manager-task",
+    kind: "TASK", state: "PLANNED", claimRevision: 0, commitStartedAt: null, createdAt: stamp, updatedAt: stamp,
+  };
+  const db = withTransactionalRollback(fakeDb({
+    submissions: [incoming],
+    orders: [{ id: "custom-manager-task", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "manager task race", priceCents: 6000, contentBoundAt: null, createdAt: stamp, updatedAt: stamp }],
+    deliveryIntents: [task],
+  }));
+  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-task", db });
+  assert.equal(assigned.submission.customOrderId, "custom-manager-task");
+  assert.equal(db._deliveryIntents[0].state, "CANCELLED");
+  assert.match(String(db._deliveryIntents[0].outcomeReason || ""), /^HUMAN_RESPONSE_SUPERSEDED:/);
+});
+
+test("manager assignment cannot outrun an initial TASK that already crossed COMMITTING", async () => {
+  const incoming = baseSubmission({ id: "manager-incoming-blocked", customOrderId: null, reviewStatus: "WAITING_REVIEW" });
+  const stamp = new Date("2026-08-21T10:00:00.000Z");
+  const db = withTransactionalRollback(fakeDb({
+    submissions: [incoming],
+    orders: [{ id: "custom-manager-committing", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "manager committing", priceCents: 6000, contentBoundAt: null, createdAt: stamp, updatedAt: stamp }],
+    deliveryIntents: [{ id: "task-manager-committing", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-manager-committing", kind: "TASK", state: "COMMITTING", claimRevision: 2, commitStartedAt: new Date(stamp.getTime() + 1000), createdAt: stamp, updatedAt: stamp }],
+  }));
+  await assert.rejects(
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-committing", db }),
+    (error) => error?.code === "CUSTOM_MODEL_INSTRUCTION_COMMITTING",
+  );
+  assert.equal(db._submissions[0].customOrderId, null);
+  assert.equal(db._orders[0].contentBoundAt, null, "blocked assignment must roll back the speculative CONTENT binding");
+});
+
+test("manager assignment of V2 supersedes the exact precommit REVISION_REQUEST for V1", async () => {
+  const stamp = new Date("2026-08-21T10:00:00.000Z");
+  const v1 = baseSubmission({ id: "manager-v1", customOrderId: "custom-manager-revision", reviewStatus: "REVISION_REQUESTED", receivedAt: new Date(stamp.getTime() + 1000), createdAt: new Date(stamp.getTime() + 1000), updatedAt: new Date(stamp.getTime() + 1000) });
+  const incoming = baseSubmission({ id: "manager-v2-unassigned", customOrderId: null, reviewStatus: "WAITING_REVIEW", receivedAt: new Date(stamp.getTime() + 2000), createdAt: new Date(stamp.getTime() + 2000), updatedAt: new Date(stamp.getTime() + 2000) });
+  const db = withTransactionalRollback(fakeDb({
+    submissions: [v1, incoming],
+    orders: [{ id: "custom-manager-revision", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "manager revision", priceCents: 6000, contentBoundAt: new Date(stamp), createdAt: stamp, updatedAt: stamp }],
+    deliveryIntents: [{ id: "revision-manager-precommit", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-manager-revision", customSubmissionId: "manager-v1", kind: "REVISION_REQUEST", state: "PLANNED", claimRevision: 0, commitStartedAt: null, createdAt: new Date(stamp.getTime() + 1500), updatedAt: new Date(stamp.getTime() + 1500) }],
+  }));
+  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-revision", db });
+  assert.equal(assigned.submission.customOrderId, "custom-manager-revision");
+  assert.equal(db._deliveryIntents[0].state, "CANCELLED");
+  assert.match(String(db._deliveryIntents[0].outcomeReason || ""), /^HUMAN_RESPONSE_SUPERSEDED:/);
+});
+
+test("forced provider begin between manager read and supersede CAS blocks assignment instead of assuming no send", async () => {
+  const incoming = baseSubmission({ id: "manager-race-incoming", customOrderId: null, reviewStatus: "WAITING_REVIEW" });
+  const stamp = new Date("2026-08-21T10:00:00.000Z");
+  const db = withTransactionalRollback(fakeDb({
+    submissions: [incoming],
+    orders: [{ id: "custom-manager-begin-race", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "forced begin race", priceCents: 6000, contentBoundAt: null, createdAt: stamp, updatedAt: stamp }],
+    deliveryIntents: [{ id: "task-manager-begin-race", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-manager-begin-race", kind: "TASK", state: "PLANNED", claimRevision: 0, commitStartedAt: null, createdAt: stamp, updatedAt: stamp }],
+  }));
+  const original = db.telegramDeliveryIntent.updateMany.bind(db.telegramDeliveryIntent);
+  let injected = false;
+  db.telegramDeliveryIntent.updateMany = async (args) => {
+    if (!injected && args?.where?.id === "task-manager-begin-race" && args?.where?.state?.in) {
+      injected = true;
+      const intent = db._deliveryIntents[0];
+      intent.state = "COMMITTING";
+      intent.commitStartedAt = new Date(stamp.getTime() + 500);
+      intent.claimRevision = 1;
+      return { count: 0 };
+    }
+    return original(args);
+  };
+  await assert.rejects(
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-begin-race", db }),
+    (error) => error?.code === "CUSTOM_MODEL_INSTRUCTION_COMMITTING",
+  );
+  assert.equal(db._submissions[0].customOrderId, null);
+  assert.equal(db._orders[0].contentBoundAt, null);
+});
+
 test("losing concurrent reassignment rolls back target content binding", async () => {
   const base = baseSubmission({ customOrderId: null, reviewStatus: "WAITING_REVIEW" });
   const stamp = new Date("2026-08-21T10:00:00.000Z");
@@ -1482,7 +1606,8 @@ test("two manager reassignments from the same submission revision cannot both wi
 test("manual historical import cannot cross a current active Telegram thread that belongs to another creator", async () => {
   const db = withTransactionalRollback(fakeDb());
   db.telegramDeliveryIntent.findMany = async ({ where }) => {
-    if (where.kind !== "TASK" || where.accountId !== "tg-1" || String(where.remoteRecipientTelegramUserId) !== "987654321012345678") return [];
+    const kinds = Array.isArray(where.kind?.in) ? where.kind.in : [where.kind];
+    if (!kinds.includes("TASK") || where.accountId !== "tg-1" || String(where.remoteRecipientTelegramUserId) !== "987654321012345678") return [];
     return [{ id: "task-thread-b", agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-2", customOrderId: "custom-2", kind: "TASK", state: "CONFIRMED", remoteMessageId: 901, remoteRecipientTelegramUserId: "987654321012345678", confirmationAuthority: "PROVIDER_RECEIPT", remoteSentAt: new Date("2026-09-05T10:00:00.000Z"), confirmedAt: new Date("2026-09-05T10:00:01.000Z") }];
   };
   db.customOrder.findMany = async ({ where }) => db._orders.filter((row) => row.agencyId === where.agencyId && where.id?.in?.includes(row.id) && String(row.status || "PENDING") === String(where.status || row.status || "PENDING")).map(clone);
@@ -1710,4 +1835,169 @@ test("F40 manual import winning the shared account transaction commits source be
   assert.equal(retireResult.blocked, true, "retirement must observe the durable source committed by the winning import");
   assert.equal(db._telegramAccounts[0].lifecycleState, "ACTIVE");
   assert.equal(db._submissions.length, 1);
+});
+
+function modelInstructionRow({ id, kind = "TASK", state = "PLANNED", customSubmissionId = null, orderId = "custom-1", creatorId = "creator-1" } = {}) {
+  const at = new Date("2026-08-21T10:30:00.000Z");
+  return {
+    id: id || `${kind.toLowerCase()}-${state.toLowerCase()}`,
+    agencyId: "agency-1", creatorId, customOrderId: orderId, customSubmissionId,
+    kind, state, claimRevision: 3, commitStartedAt: state === "COMMITTING" ? at : null,
+    remoteMessageId: state === "CONFIRMED" ? 7001 : null,
+    remoteRecipientTelegramUserId: state === "CONFIRMED" ? "987654321012345678" : null,
+    remoteSentAt: state === "CONFIRMED" ? at : null, confirmedAt: state === "CONFIRMED" ? at : null,
+    createdAt: at, updatedAt: at,
+  };
+}
+
+test("human historical V1 supersedes a precommit initial TASK atomically before binding the response", async () => {
+  const db = withTransactionalRollback(fakeDb({ deliveryIntents: [modelInstructionRow({ id: "task-precommit", state: "CLAIMED" })] }));
+  const result = await createCustomContentSubmission({
+    agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+    input: {
+      creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9801], telegramAccountId: "tg-1",
+      telegramUserId: "987654321012345678", manualImportReason: "manager confirms this is the model response",
+    },
+  });
+  assert.equal(result.deduped, false);
+  assert.equal(result.submission.customOrderId, "custom-1");
+  const task = db._deliveryIntents.find((row) => row.id === "task-precommit");
+  assert.equal(task.state, "CANCELLED");
+  assert.equal(task.commitStartedAt, null);
+  assert.match(task.outcomeReason, /^HUMAN_RESPONSE_SUPERSEDED:MANUAL_HISTORICAL_IMPORT/);
+});
+
+test("human historical V1 cannot outrun an initial TASK that already crossed COMMITTING", async () => {
+  const db = withTransactionalRollback(fakeDb({ deliveryIntents: [modelInstructionRow({ id: "task-committing", state: "COMMITTING" })] }));
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+      input: {
+        creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9802], telegramAccountId: "tg-1",
+        telegramUserId: "987654321012345678", manualImportReason: "manual response while task is committing",
+      },
+    }),
+    (error) => error?.code === "CUSTOM_MODEL_INSTRUCTION_COMMITTING",
+  );
+  assert.equal(db._submissions.length, 0, "response binding must roll back when provider commit already won");
+  assert.equal(db._inboundEvents.length, 0, "provider-source materialization is transactional with the blocked response");
+  assert.equal(db._deliveryIntents[0].state, "COMMITTING");
+});
+
+test("human historical V2 supersedes the exact precommit REVISION_REQUEST for V1", async () => {
+  const v1 = {
+    id: "revision-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "REVISION_REQUESTED", reviewComment: "redo", reviewedAt: new Date("2026-08-21T10:20:00Z"),
+    telegramMessageIds: [9701], telegramInboundEventIds: [], telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678",
+    ofMediaIds: [], receivedAt: new Date("2026-08-21T10:00:00Z"), createdAt: new Date("2026-08-21T10:00:00Z"), updatedAt: new Date("2026-08-21T10:20:00Z"),
+  };
+  const db = withTransactionalRollback(fakeDb({
+    submissions: [v1],
+    deliveryIntents: [modelInstructionRow({ id: "revision-precommit", kind: "REVISION_REQUEST", state: "PLANNED", customSubmissionId: "revision-v1" })],
+  }));
+  const result = await createCustomContentSubmission({
+    agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+    input: {
+      creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9803], telegramAccountId: "tg-1",
+      telegramUserId: "987654321012345678", manualImportReason: "manager identifies corrected V2",
+    },
+  });
+  assert.equal(result.deduped, false);
+  assert.notEqual(result.submission.id, "revision-v1");
+  assert.equal(db._deliveryIntents.find((row) => row.id === "revision-precommit").state, "CANCELLED");
+});
+
+test("human historical V2 is blocked while exact REVISION_REQUEST outcome is unknown", async () => {
+  const v1 = {
+    id: "revision-v1-unknown", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "REVISION_REQUESTED", reviewComment: "redo", reviewedAt: new Date("2026-08-21T10:20:00Z"),
+    telegramMessageIds: [9702], telegramInboundEventIds: [], telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678",
+    ofMediaIds: [], receivedAt: new Date("2026-08-21T10:00:00Z"), createdAt: new Date("2026-08-21T10:00:00Z"), updatedAt: new Date("2026-08-21T10:20:00Z"),
+  };
+  const db = withTransactionalRollback(fakeDb({
+    submissions: [v1],
+    deliveryIntents: [modelInstructionRow({ id: "revision-unknown", kind: "REVISION_REQUEST", state: "RECONCILE_REQUIRED", customSubmissionId: "revision-v1-unknown" })],
+  }));
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+      input: {
+        creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9804], telegramAccountId: "tg-1",
+        telegramUserId: "987654321012345678", manualImportReason: "manager identifies corrected V2",
+      },
+    }),
+    (error) => error?.code === "CUSTOM_MODEL_INSTRUCTION_OUTCOME_UNKNOWN",
+  );
+  assert.equal(db._submissions.length, 1, "blocked V2 must leave only the historical V1");
+  assert.equal(db._deliveryIntents[0].state, "RECONCILE_REQUIRED");
+});
+
+test("accepted historical V1 immediately supersedes all precommit initial REFERENCES", async () => {
+  const confirmedTask = modelInstructionRow({ id: "task-ref-parent", state: "CONFIRMED" });
+  confirmedTask.accountId = "tg-1";
+  confirmedTask.remoteMessageId = 7101;
+  confirmedTask.remoteRecipientTelegramUserId = "987654321012345678";
+  const refPlanned = { ...modelInstructionRow({ id: "ref-planned-v1", kind: "REFERENCE", state: "PLANNED" }), accountId: "tg-1", clientIntentId: "11111111-2222-4333-8444-555555555555", referenceOrdinal: 0 };
+  const refClaimed = { ...modelInstructionRow({ id: "ref-claimed-v1", kind: "REFERENCE", state: "CLAIMED" }), accountId: "tg-1", clientIntentId: "66666666-7777-4888-8999-000000000000", referenceOrdinal: 1 };
+  const db = withTransactionalRollback(fakeDb({ deliveryIntents: [confirmedTask, refPlanned, refClaimed] }));
+  const result = await createCustomContentSubmission({
+    agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+    input: {
+      creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9811], telegramAccountId: "tg-1",
+      telegramUserId: "987654321012345678", manualImportReason: "manager accepts model V1 and closes initial reference lane",
+    },
+  });
+  assert.equal(result.submission.customOrderId, "custom-1");
+  for (const id of ["ref-planned-v1", "ref-claimed-v1"]) {
+    const ref = db._deliveryIntents.find((row) => row.id === id);
+    assert.equal(ref.state, "CANCELLED");
+    assert.equal(ref.commitStartedAt, null);
+    assert.match(ref.outcomeReason, /^INITIAL_REFERENCE_SUPERSEDED:MANUAL_HISTORICAL_RESPONSE_ACCEPTED/);
+  }
+  assert.equal(db._deliveryIntents.find((row) => row.id === "task-ref-parent").state, "CONFIRMED");
+});
+
+test("accepted historical V1 does not block on an initial REFERENCE already COMMITTING", async () => {
+  const confirmedTask = modelInstructionRow({ id: "task-ref-parent-committing", state: "CONFIRMED" });
+  confirmedTask.accountId = "tg-1";
+  confirmedTask.remoteMessageId = 7201;
+  confirmedTask.remoteRecipientTelegramUserId = "987654321012345678";
+  const committingRef = { ...modelInstructionRow({ id: "ref-committing-v1", kind: "REFERENCE", state: "COMMITTING" }), accountId: "tg-1", clientIntentId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", referenceOrdinal: 0 };
+  const db = withTransactionalRollback(fakeDb({ deliveryIntents: [confirmedTask, committingRef] }));
+  const result = await createCustomContentSubmission({
+    agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:01:00.000Z"),
+    input: {
+      creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9812], telegramAccountId: "tg-1",
+      telegramUserId: "987654321012345678", manualImportReason: "model response is valid while old reference outcome settles",
+    },
+  });
+  assert.equal(result.submission.customOrderId, "custom-1");
+  const ref = db._deliveryIntents.find((row) => row.id === "ref-committing-v1");
+  assert.equal(ref.state, "COMMITTING");
+  assert.ok(ref.commitStartedAt);
+});
+
+test("submission reassignment A→B reprojects both model obligations from canonical TASK receipts", async () => {
+  const stamp = new Date("2026-08-21T10:00:00.000Z");
+  const taskSentAt = new Date("2026-08-21T09:00:00.000Z");
+  const orders = [
+    { id:"custom-A", agencyId:"agency-1", creatorId:"creator-1", type:"CONTENT", scenario:"A", status:"PENDING", fanDeliveredAt:null, contentBoundAt:stamp, nextReminderAt:null, lastReminderAt:null, lastReminderKey:null, reminderConfig:null, createdAt:stamp, updatedAt:stamp },
+    { id:"custom-B", agencyId:"agency-1", creatorId:"creator-1", type:"CONTENT", scenario:"B", status:"PENDING", fanDeliveredAt:null, contentBoundAt:null, nextReminderAt:new Date("2026-08-21T10:15:00.000Z"), lastReminderAt:null, lastReminderKey:null, reminderConfig:null, createdAt:stamp, updatedAt:stamp },
+  ];
+  const taskA = { ...modelInstructionRow({ id:"task-A", state:"CONFIRMED", orderId:"custom-A" }), accountId:"tg-1", remoteMessageId:7301, remoteRecipientTelegramUserId:"987654321012345678", remoteSentAt:taskSentAt, confirmedAt:taskSentAt, createdAt:taskSentAt };
+  const taskB = { ...modelInstructionRow({ id:"task-B", state:"CONFIRMED", orderId:"custom-B" }), accountId:"tg-1", remoteMessageId:7302, remoteRecipientTelegramUserId:"987654321012345678", remoteSentAt:taskSentAt, confirmedAt:taskSentAt, createdAt:taskSentAt };
+  const db = withTransactionalRollback(fakeDb({
+    orders,
+    submissions:[baseSubmission({ id:"move-response", customOrderId:"custom-A", reviewStatus:"WAITING_REVIEW", telegramMessageIds:[101], ofMediaIds:[] })],
+    deliveryIntents:[taskA, taskB],
+    workspaceSettings:{ vaultUploadRecipient:"relay_model", telegramCustomReminders:{ content:{ enabled:true, firstAfterMinutes:30, repeatEveryMinutes:60 } } },
+  }));
+
+  const result = await assignCustomContentSubmission({ agencyId:"agency-1", member, submissionId:"move-response", customOrderId:"custom-B", now:new Date("2026-08-21T11:00:00.000Z"), db });
+  assert.equal(result.submission.customOrderId,"custom-B");
+  const a=db._orders.find((row)=>row.id==="custom-A");
+  const b=db._orders.find((row)=>row.id==="custom-B");
+  assert.ok(a.nextReminderAt instanceof Date, "A lost the response and must restore its current TASK obligation schedule");
+  assert.equal(a.nextReminderAt.toISOString(),"2026-08-21T11:00:00.000Z", "overdue restored obligation is due now from the original TASK receipt");
+  assert.equal(b.nextReminderAt,null,"B gained the response and must clear its old reminder schedule");
 });

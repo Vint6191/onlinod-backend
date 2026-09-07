@@ -168,29 +168,51 @@ function sameInstant(a, b) {
   return aa.getTime() === bb.getTime();
 }
 
-function desiredReminderSchedule(order, workspacePolicy, now = new Date(), { firstAnchorAt = null } = {}) {
-  if (!order || String(order.status || "PENDING") !== "PENDING") return { at: null, key: null };
-  // Automatic reminders are follow-ups to the canonical Telegram TASK thread. Until that provider
-  // effect is confirmed there is no executable reminder schedule, regardless of Custom type.
-  if (order.telegramTaskMessageId == null) return { at: null, key: null };
-  const type = String(order.type || "CONTENT").toUpperCase();
+function contentObligationReminderSchedule(order, workspacePolicy, now, modelObligation) {
+  if (!modelObligation?.modelOwesResponse || !modelObligation?.currentInstruction) return { at: null, key: null };
+  const instruction = modelObligation.currentInstruction;
+  const anchor = validDate(instruction.remoteSentAt);
+  if (!anchor) return { at: null, key: null };
+  const policy = effectivePolicy(order, workspacePolicy);
+  if (policy.enabled !== true) return { at: null, key: null };
+  const first = positiveMinutes(policy.firstAfterMinutes, DEFAULT_TELEGRAM_CUSTOM_REMINDERS.content.firstAfterMinutes);
+  const repeat = positiveMinutes(policy.repeatEveryMinutes, DEFAULT_TELEGRAM_CUSTOM_REMINDERS.content.repeatEveryMinutes);
+  const cyclePrefix = `CONTENT:${String(instruction.kind)}:${String(instruction.intentId)}:`;
+  const lastKey = String(order.lastReminderKey || "");
+  // Historical pre-cutover CONTENT reminders had no instruction identity. They belong only to
+  // the initial TASK cycle; never carry them into a later REVISION_REQUEST cycle.
+  const legacyInitialCycle = String(instruction.kind) === "TASK"
+    && Boolean(order.lastReminderAt)
+    && !lastKey.startsWith("CONTENT:REVISION_REQUEST:")
+    && !lastKey.startsWith("CONTENT:TASK:");
+  const sameCycle = Boolean(order.lastReminderAt) && (lastKey.startsWith(cyclePrefix) || legacyInitialCycle);
+  const base = sameCycle ? validDate(order.lastReminderAt) : anchor;
+  const minutes = sameCycle ? repeat : first;
+  if (!base) return { at: null, key: null };
+  const at = new Date(base.getTime() + minutes * 60_000);
+  const due = at.getTime() <= now.getTime() ? new Date(now.getTime()) : at;
+  return { at: due, key: `${cyclePrefix}${at.toISOString()}`, cycleId: `${instruction.kind}:${instruction.intentId}` };
+}
 
-  // Once a reminder effect exists, every schedule projection is derived from that latest provider
-  // fact plus the CURRENT policy. Before the first reminder, CONTENT/PHYSICAL start from the
-  // confirmed TASK effect when available; CALL remains anchored to scheduledAt.
+function desiredReminderSchedule(order, workspacePolicy, now = new Date(), { firstAnchorAt = null, modelObligation = null } = {}) {
+  if (!order || String(order.status || "PENDING") !== "PENDING") return { at: null, key: null };
+  const type = String(order.type || "CONTENT").toUpperCase();
+  if (type === "CONTENT" && modelObligation) {
+    return contentObligationReminderSchedule(order, workspacePolicy, now, modelObligation);
+  }
+  // Non-CONTENT reminder semantics remain tied to the canonical TASK thread. CONTENT callers that
+  // have not yet migrated may still use this compatibility projection; authoritative persistence
+  // always supplies modelObligation via reprojectCustomReminderSchedule().
+  if (order.telegramTaskMessageId == null) return { at: null, key: null };
+
   if (order.lastReminderAt) return nextReminderForOrder(order, workspacePolicy, now, { afterAck: true });
   if (type === "CALL") return nextReminderForOrder(order, workspacePolicy, now);
 
   const explicitAnchor = validDate(firstAnchorAt);
-  if (explicitAnchor) {
-    if (order.telegramTaskMessageId == null) return { at: null, key: null };
-    return nextReminderForOrder({ ...order, createdAt: explicitAnchor }, workspacePolicy, now);
-  }
+  if (explicitAnchor) return nextReminderForOrder({ ...order, createdAt: explicitAnchor }, workspacePolicy, now);
 
   const taskAnchor = validDate(order.deliveredAt);
-  if (order.telegramTaskMessageId != null && taskAnchor) {
-    return nextReminderForOrder({ ...order, createdAt: taskAnchor }, workspacePolicy, now);
-  }
+  if (taskAnchor) return nextReminderForOrder({ ...order, createdAt: taskAnchor }, workspacePolicy, now);
   return nextReminderForOrder(order, workspacePolicy, now);
 }
 
@@ -222,7 +244,12 @@ async function reprojectCustomReminderSchedule({ agencyId, orderId, now = new Da
     }
 
     const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
-    const desired = desiredReminderSchedule(order, workspacePolicy, now, { firstAnchorAt });
+    let modelObligation = null;
+    if (String(order.type || "CONTENT").toUpperCase() === "CONTENT") {
+      const { deriveCustomModelObligation } = require("./custom-model-obligation-authority-service");
+      modelObligation = await deriveCustomModelObligation({ agencyId, order, db });
+    }
+    const desired = desiredReminderSchedule(order, workspacePolicy, now, { firstAnchorAt, modelObligation });
     const desiredAt = desired.at ? new Date(desired.at) : null;
     if (sameInstant(order.nextReminderAt, desiredAt)) {
       return { ok: true, missing: false, changed: false, nextReminderAt: desiredAt, attempts: attempt + 1 };

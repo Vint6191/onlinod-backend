@@ -56,6 +56,21 @@ function fixture({ projectedIdentity = false }={}) {
     telegramDeliveryIntent:{
       async findFirst({where}){return clone(intents.find((r)=>matches(r,where))||null);},
       async findMany({where,take}){const rows=intents.filter((r)=>matches(r,where));return (take==null?rows:rows.slice(0,take)).map(clone);},
+      async updateMany({where={},data={}}){
+        let count=0;
+        for(const row of intents){
+          if(where.id!==undefined&&String(row.id)!==String(where.id))continue;
+          if(where.agencyId!==undefined&&String(row.agencyId)!==String(where.agencyId))continue;
+          if(where.kind!==undefined&&String(row.kind)!==String(where.kind))continue;
+          if(where.state?.in&&!where.state.in.includes(row.state))continue;
+          if(typeof where.state==="string"&&String(row.state)!==String(where.state))continue;
+          if(where.claimRevision!==undefined&&Number(row.claimRevision||0)!==Number(where.claimRevision))continue;
+          if(where.commitStartedAt===null&&row.commitStartedAt!=null)continue;
+          Object.assign(row,clone(data));
+          count+=1;
+        }
+        return{count};
+      },
     },
     customOrder:{
       async findFirst({where}){const r=orders.find((x)=>matches(x,where)); return r?clone(r):null;},
@@ -519,6 +534,37 @@ test("explicit REVIEW_REQUIRED assignment materializes the provider event and as
 
 
 
+test("REVIEW_REQUIRED assignment supersedes a precommit initial TASK before the event becomes APPLIED",async()=>{
+  const fx=fixture();
+  Object.assign(fx.intents[0],{state:"PLANNED",claimRevision:0,commitStartedAt:null,remoteMessageId:null,remoteRecipientTelegramUserId:null,confirmedAt:null});
+  seedReview(fx,{customOrderId:null,hasMedia:true,text:"historical response while task is still precommit"});
+  const resolved=await resolveTelegramInboundReview({
+    agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",
+    reason:"explicit human recovery supersedes unsent instruction",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:fx.db,
+  });
+  assert.equal(resolved.state,"APPLIED");
+  assert.equal(fx.events[0].projectionState,"APPLIED");
+  assert.equal(fx.submissions.length,1);
+  assert.equal(fx.submissions[0].customOrderId,"order-1");
+  assert.equal(fx.intents[0].state,"CANCELLED");
+  assert.match(String(fx.intents[0].outcomeReason||""),/^HUMAN_RESPONSE_SUPERSEDED:/);
+});
+
+test("REVIEW_REQUIRED assignment cannot outrun a TASK already in COMMITTING and rolls the prepared event back",async()=>{
+  const fx=fixture();
+  Object.assign(fx.intents[0],{state:"COMMITTING",claimRevision:2,commitStartedAt:new Date(fx.now.getTime()-100),remoteMessageId:null,remoteRecipientTelegramUserId:null,confirmedAt:null});
+  seedReview(fx,{customOrderId:null,hasMedia:true,text:"response racing provider begin"});
+  await assert.rejects(
+    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"try to bind racing response",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:fx.db}),
+    (error)=>error?.code==="CUSTOM_MODEL_INSTRUCTION_COMMITTING",
+  );
+  assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
+  assert.equal(fx.events[0].submissionId,null);
+  assert.equal(fx.events[0].customOrderId,null);
+  assert.equal(fx.submissions.length,0);
+  assert.equal(fx.orders[0].contentBoundAt,null);
+});
+
 test("ASSIGN resolution rolls back materialization/binding when mandatory audit cannot commit",async()=>{
   const fx=fixture(); seedReview(fx,{customOrderId:null,hasMedia:true,text:"provider media"});
   fx.db.auditLog.create=async()=>{throw Object.assign(new Error("audit storage unavailable"),{code:"AUDIT_DOWN"});};
@@ -744,9 +790,27 @@ test("F46 unique non-Reply media after confirmed revision remoteSentAt is determ
   await ingest(fx,{messageId:11008,replyToMessageId:null,hasMedia:true,sentAt:new Date(fx.now.getTime()+1000).toISOString()});
   const row=fx.events.find((event)=>Number(event.messageId)===11008);
   assert.equal(row.threadResolutionType,"UNIQUE_ACTIVE_THREAD");
-  assert.equal(row.threadAnchorIntentId,"intent-task","non-Reply provenance stays anchored to the active TASK thread");
+  assert.equal(row.threadAnchorIntentId,"intent-revision-v1","non-Reply provenance follows the current provider-confirmed revision instruction");
   assert.equal(row.projectionState,"APPLIED");
   assert.ok(row.submissionId);
+});
+
+test("closure historical no-TASK confirmed revision is the current non-Reply thread for V2", async()=>{
+  const fx=fixture();
+  fx.intents.splice(0, fx.intents.length, ...fx.intents.filter((row)=>String(row.kind)!=="TASK"));
+  fx.orders[0].telegramTaskMessageId=null;
+  const remoteSentAt=new Date(fx.now.getTime()-5000);
+  seedRevisionDecision(fx,{state:"CONFIRMED",remoteSentAt,remoteMessageId:1761});
+  fx.submissions[0].sourceThreadIntentId=null;
+  await ingest(fx,{messageId:11108,replyToMessageId:null,hasMedia:true,sentAt:new Date(fx.now.getTime()+1000).toISOString()});
+  const row=fx.events.find((event)=>Number(event.messageId)===11108);
+  assert.equal(row.threadResolutionType,"UNIQUE_ACTIVE_THREAD");
+  assert.equal(row.threadAnchorIntentId,"intent-revision-v1");
+  assert.equal(row.projectionState,"APPLIED");
+  assert.ok(row.submissionId);
+  const next=fx.submissions.find((item)=>String(item.id)===String(row.submissionId));
+  assert.equal(next.customOrderId,"order-1");
+  assert.equal(next.sourceThreadIntentId,"intent-revision-v1");
 });
 
 test("F46 non-Reply media timestamped before confirmed revision instruction is REVIEW_REQUIRED", async()=>{

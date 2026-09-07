@@ -589,6 +589,14 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
         409,
       );
     }
+    const unknownRevision = unknownTelegram.find((row) => String(row.kind) === "REVISION_REQUEST");
+    if (unknownRevision) {
+      throw fail(
+        "CUSTOM_RETIRED_ORDER_REVISION_OUTCOME_UNRESOLVED",
+        "Resolve the historical Telegram revision-instruction outcome before terminalizing this retired-creator Custom",
+        409,
+      );
+    }
 
     // Proven-precommit provider work has no external outcome. It cannot execute after legacy
     // creator retirement and is terminalized here. Unknown/confirmed outcomes are preserved.
@@ -620,8 +628,16 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
       const parsedEffect = new Date(effectCandidate);
       confirmedTaskEffectAt = Number.isFinite(parsedEffect.getTime()) ? parsedEffect : now;
     }
+    const confirmedRevision = (telegramRows || []).find((row) => String(row.kind) === "REVISION_REQUEST" && String(row.state) === "CONFIRMED");
+    if (confirmedRevision) {
+      const revisionMessageId = Number(confirmedRevision.remoteMessageId);
+      if (!Number.isSafeInteger(revisionMessageId) || revisionMessageId <= 0) {
+        throw fail("CUSTOM_RETIRED_ORDER_REVISION_RECEIPT_INVALID", "Confirmed historical Telegram revision instruction is missing a valid provider message id", 409);
+      }
+    }
     const cancellationOutcome = (telegramRows || []).find((row) => String(row.kind) === "CANCELLATION" && ["COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"].includes(String(row.state)));
-    const waiveCancellation = Boolean(confirmedTask && !cancellationOutcome);
+    const confirmedModelInstruction = confirmedRevision || confirmedTask || null;
+    const waiveCancellation = Boolean(confirmedModelInstruction && !cancellationOutcome);
 
     const changed = await tx.customOrder.updateMany({
       where: { id: current.id, agencyId, creatorId: current.creatorId, status: "PENDING", updatedAt: current.updatedAt },

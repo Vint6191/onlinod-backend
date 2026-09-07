@@ -10,8 +10,10 @@ test("F47 reusable Bump state cannot persist or plan CUSTOM media", () => {
   const server = read("automation-server-service.js");
   const planner = read("bump-service.js");
   const delivery = read("custom-content-delivery-service.js");
-  assert.match(delivery, /async function classifyProgrammaticCustomMediaProvenance/);
-  assert.match(delivery, /resolveAttemptedCustomMedia/);
+  const provenance = read("custom-media-provenance-authority-service.js");
+  assert.match(provenance, /async function classifyProgrammaticCustomMediaProvenance/);
+  assert.match(provenance, /confirmedRelayProofMediaIdForSubmission/);
+  assert.match(delivery, /resolveCustomMediaProvenance/);
   assert.match(server, /assertReusableBumpMediaAllowed/);
   assert.match(server, /AUTOMATION_BUMP_CUSTOM_MEDIA_FORBIDDEN/);
   assert.match(server, /async function saveBump[\s\S]*assertReusableBumpMediaAllowed[\s\S]*upsertTask/);

@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { deriveCustomModelObligation } = require("./custom-model-obligation-authority-service");
 
 function clean(value, max = 180) {
   const text = String(value == null ? "" : value).trim();
@@ -88,22 +89,23 @@ async function resolveTelegramCustomThread({ agencyId, accountId, senderTelegram
   }
 
   // Non-Reply routing is CURRENT business routing. Historical receipts are deliberately
-  // excluded. Only provider-confirmed TASK anchors whose CustomOrder is still PENDING can
-  // establish an active thread. Manual reconciliation may close a delivery operation, but it
-  // is not generic provider proof for future non-Reply observations.
+  // excluded. The current provider-confirmed model instruction (TASK or REVISION_REQUEST)
+  // owns the active thread; old satisfied instructions must never keep claiming future media.
+  // Manual reconciliation may close a delivery operation, but it is not generic provider
+  // proof for future non-Reply observations.
   if (!db.telegramDeliveryIntent?.findMany || !db.customOrder?.findMany) {
     return { type: "NO_ACTIVE_THREAD", proven: false, conflict: false, thread: null, threads: [], creatorIds: [], customOrderIds: [] };
   }
-  const taskRows = await db.telegramDeliveryIntent.findMany({
+  const instructionRows = await db.telegramDeliveryIntent.findMany({
     where: {
       agencyId,
       accountId: normalizedAccountId,
-      kind: "TASK",
+      kind: { in: ["TASK", "REVISION_REQUEST"] },
       state: "CONFIRMED",
       remoteRecipientTelegramUserId: sender,
     },
     select: {
-      id: true, agencyId: true, accountId: true, creatorId: true, customOrderId: true,
+      id: true, agencyId: true, accountId: true, creatorId: true, customOrderId: true, kind: true,
       remoteMessageId: true, remoteRecipientTelegramUserId: true, remoteSentAt: true, confirmationAuthority: true,
       outcomeReason: true, confirmedAt: true,
     },
@@ -111,16 +113,16 @@ async function resolveTelegramCustomThread({ agencyId, accountId, senderTelegram
   });
   const cutoff = eventSentAt == null ? null : new Date(eventSentAt);
   const cutoffMs = cutoff && Number.isFinite(cutoff.getTime()) ? cutoff.getTime() : null;
-  const providerTasks = (taskRows || []).filter((row) => {
+  const providerInstructions = (instructionRows || []).filter((row) => {
     if (confirmationAuthority(row) !== "PROVIDER_RECEIPT") return false;
     if (cutoffMs == null) return true;
     const anchorAt = row.remoteSentAt || row.confirmedAt || null;
     const anchorMs = anchorAt ? new Date(anchorAt).getTime() : NaN;
-    // A future TASK may never retroactively claim a provider observation that was already sent.
-    // Missing historical timestamps are insufficient temporal proof and therefore fail closed.
+    // A future instruction may never retroactively claim a provider observation that was already
+    // sent. Missing historical timestamps are insufficient temporal proof and therefore fail closed.
     return Number.isFinite(anchorMs) && anchorMs <= cutoffMs;
   });
-  const orderIds = Array.from(new Set(providerTasks.map((row) => clean(row.customOrderId, 180)).filter(Boolean)));
+  const orderIds = Array.from(new Set(providerInstructions.map((row) => clean(row.customOrderId, 180)).filter(Boolean)));
   if (!orderIds.length) {
     return { type: "NO_ACTIVE_THREAD", proven: false, conflict: false, thread: null, threads: [], creatorIds: [], customOrderIds: [] };
   }
@@ -129,12 +131,39 @@ async function resolveTelegramCustomThread({ agencyId, accountId, senderTelegram
     select: { id: true, creatorId: true, type: true, status: true },
   });
   const orderById = new Map((orders || []).map((row) => [String(row.id), row]));
+  const intentById = new Map(providerInstructions.map((row) => [String(row.id), row]));
+  const taskByOrder = new Map();
+  for (const intent of providerInstructions) {
+    if (String(intent.kind || "") !== "TASK") continue;
+    const orderId = String(intent.customOrderId || "");
+    if (orderId && !taskByOrder.has(orderId)) taskByOrder.set(orderId, intent);
+  }
   const threadByOrder = new Map();
-  for (const intent of providerTasks) {
-    const order = orderById.get(String(intent.customOrderId));
-    if (!order) continue;
-    if (String(order.creatorId) !== String(intent.creatorId)) continue;
+  for (const order of orders || []) {
     const orderId = String(order.id);
+    const obligation = await deriveCustomModelObligation({ agencyId, order, db });
+    let intent = null;
+    if (obligation?.modelOwesResponse && obligation.currentInstruction) {
+      const current = obligation.currentInstruction;
+      if (["TASK", "REVISION_REQUEST"].includes(String(current.kind || ""))
+          && String(current.accountId || "") === normalizedAccountId
+          && String(current.recipientTelegramUserId || "") === sender) {
+        const currentIntent = intentById.get(String(current.intentId || ""));
+        if (currentIntent && confirmationAuthority(currentIntent) === "PROVIDER_RECEIPT") {
+          if (cutoffMs == null) intent = currentIntent;
+          else {
+            const anchorMs = current.remoteSentAt ? new Date(current.remoteSentAt).getTime() : NaN;
+            if (Number.isFinite(anchorMs) && anchorMs <= cutoffMs) intent = currentIntent;
+          }
+        }
+      }
+    }
+    // A confirmed TASK remains exact business-context proof even while a later revision is
+    // pending/unknown or an observed media predates the revision receipt. It may identify the
+    // CustomOrder, but it does NOT grant revision-response causality: the submission authority
+    // still requires the current confirmed revision instruction and will surface REVIEW_REQUIRED.
+    if (!intent) intent = taskByOrder.get(orderId) || null;
+    if (!intent || String(order.creatorId) !== String(intent.creatorId)) continue;
     if (!threadByOrder.has(orderId)) threadByOrder.set(orderId, publicThread(intent, order, "ACTIVE_THREAD"));
   }
   const threads = [...threadByOrder.values()];

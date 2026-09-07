@@ -53,6 +53,7 @@ test("inbound projection retry is backend-scheduled and no longer piggybacks Des
 test("confirmed Telegram receipt projection debt is repaired by the backend recurring scheduler", () => {
   assert.match(scheduler, /runTelegramConfirmedProjectionSweep/);
   assert.match(scheduler, /repairConfirmedTelegramDeliveryProjections/);
+  assert.match(scheduler, /repairCustomModelCommunicationConvergence/);
   assert.match(scheduler, /scanAllById\(\{[\s\S]*delegate:\s*prisma\.agency[\s\S]*deletedAt:\s*null/);
   assert.match(scheduler, /telegramConfirmedProjection\s*=\s*await runTelegramConfirmedProjectionSweep/);
   assert.match(deliveryAuthority, /repairConfirmedTelegramDeliveryProjections/);

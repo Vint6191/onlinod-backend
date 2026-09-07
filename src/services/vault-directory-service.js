@@ -5,11 +5,10 @@ const {
 } = require("./vault-never-used-service");
 const { cleanMediaIds } = require("./media-library-service");
 const { unresolvedPipelineSubmissionWhere } = require("./custom-content-pipeline-authority-service");
-const { confirmedRelayProofMediaIdForSubmission } = require("./custom-relay-result-proof-service");
+const { resolveCustomMediaProvenance } = require("./custom-media-provenance-authority-service");
 
 const MAX_MEDIA_IDS = 5000;
 const TOP_ASSET_LIMIT = 100;
-const RELAY_PROOF_MEDIA_QUERY_CHUNK = 200;
 
 function clean(value, max = 240) {
   return String(value ?? "").trim().slice(0, max);
@@ -219,52 +218,32 @@ async function checkProtectedVaultMedia({ agencyId, creatorId, mediaIds = [], op
 
     let unresolvedIds = ids.filter((mediaId) => !ownership.has(mediaId));
 
-    // Audit 18 / Custom pipeline closure: the external OF fact becomes durable
-    // one step before media-commit projects it into submission.ofMediaIds. A
-    // crash in that small window must not let Vault cleanup hide/remove media
-    // that CUSTOM_RELAY_SEND already proved. Query by the requested media ids
-    // first (chunking only DB query size, never correctness), then accept a row
-    // only if the same relay-proof validator binds its idempotency key, index,
-    // submission and pinned Telegram source to a still-live pipeline submission.
-    if (unresolvedIds.length && client.automationDelivery?.findMany) {
-      const proofCandidates = [];
-      for (let offset = 0; offset < unresolvedIds.length; offset += RELAY_PROOF_MEDIA_QUERY_CHUNK) {
-        const chunk = unresolvedIds.slice(offset, offset + RELAY_PROOF_MEDIA_QUERY_CHUNK);
-        const rows = await client.automationDelivery.findMany({
-          where: {
-            agencyId,
-            creatorId: cleanCreatorId,
-            actionType: "CUSTOM_RELAY_SEND",
-            status: "COMPLETED",
-            OR: chunk.map((requestedMediaId) => ({ result: { path: ["mediaId"], equals: requestedMediaId } })),
-          },
-          select: { id: true, idempotencyKey: true, actionType: true, status: true, payload: true, result: true },
+    // Audit 47 convergence: CUSTOM identity comes from one shared provenance
+    // authority. It includes exact validated COMPLETED relay proof, so this
+    // destructive fence cannot lag behind provider truth while the submission
+    // and CreatorMediaAsset projections are still catching up. Ownership
+    // protection remains limited to live/unresolved pipeline submissions.
+    if (unresolvedIds.length) {
+      const provenance = await resolveCustomMediaProvenance({
+        agencyId, creatorId: cleanCreatorId, mediaIds: unresolvedIds, db: client, maxMediaIds: MAX_MEDIA_IDS,
+      });
+      const referencedSubmissionIds = Array.from(new Set(unresolvedIds.flatMap((mediaId) =>
+        [...(provenance.referencesByMedia.get(mediaId)?.values() || [])].map((ref) => clean(ref.submissionId, 180)).filter(Boolean)
+      )));
+      if (referencedSubmissionIds.length) {
+        const liveReferenced = await client.customContentSubmission.findMany({
+          where: { id: { in: referencedSubmissionIds }, agencyId, creatorId: cleanCreatorId, ...unresolvedPipelineSubmissionWhere() },
+          select: { id: true, executionVaultFolderId: true, ofMediaIds: true },
         });
-        proofCandidates.push(...(rows || []));
-      }
-      const candidateSubmissionIds = Array.from(new Set(proofCandidates
-        .map((row) => clean(row?.payload?.submissionId, 180))
-        .filter(Boolean)));
-      if (candidateSubmissionIds.length) {
-        const proofSubmissions = await client.customContentSubmission.findMany({
-          where: {
-            id: { in: candidateSubmissionIds }, agencyId, creatorId: cleanCreatorId,
-            ...unresolvedPipelineSubmissionWhere(),
-          },
-          select: {
-            id: true, executionVaultFolderId: true, ofMediaIds: true,
-            telegramMessageIds: true, telegramSourceAccountId: true, telegramSourceUserId: true,
-          },
-        });
-        const proofSubmissionById = new Map((proofSubmissions || []).map((row) => [String(row.id), row]));
-        const requested = new Set(unresolvedIds);
-        for (const proof of proofCandidates) {
-          const submission = proofSubmissionById.get(clean(proof?.payload?.submissionId, 180));
-          const provenMediaId = confirmedRelayProofMediaIdForSubmission({ row: proof, submission });
-          if (!provenMediaId || !requested.has(provenMediaId)) continue;
-          const rows = ownership.get(provenMediaId) || [];
-          rows.push(submission);
-          ownership.set(provenMediaId, rows);
+        const liveById = new Map((liveReferenced || []).map((row) => [String(row.id), row]));
+        for (const mediaId of unresolvedIds) {
+          for (const ref of provenance.referencesByMedia.get(mediaId)?.values() || []) {
+            const submission = liveById.get(String(ref.submissionId || ""));
+            if (!submission) continue;
+            const rows = ownership.get(mediaId) || [];
+            rows.push(submission);
+            ownership.set(mediaId, rows);
+          }
         }
       }
       unresolvedIds = ids.filter((mediaId) => !ownership.has(mediaId));

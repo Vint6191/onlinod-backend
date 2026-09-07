@@ -1,7 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { findCancelledTaskFollowupDebt, findConfirmedTelegramProjectionDebt } = require("./telegram-exact-authority-scan-service");
+const { findCancelledModelInstructionFollowupDebt, findConfirmedTelegramProjectionDebt } = require("./telegram-exact-authority-scan-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 
 const ACTIVE = "ACTIVE";
@@ -857,7 +857,7 @@ async function creatorCustomPipelineBlockers({ db, agencyId, creatorId }) {
         },
       })
       : Promise.resolve(0),
-    findCancelledTaskFollowupDebt({ agencyId, creatorIds: [creatorId], db }),
+    findCancelledModelInstructionFollowupDebt({ agencyId, creatorIds: [creatorId], db }),
     findConfirmedTelegramProjectionDebt({ agencyId, creatorIds: [creatorId], db, onlyUnmarked: true }),
     findCompletedCustomExternalProjectionDebt({ db, agencyId, creatorId }),
   ]);
@@ -900,7 +900,7 @@ async function agencyCustomPipelineBlockers({ db, agencyId }) {
         },
       })
       : Promise.resolve(0),
-    findCancelledTaskFollowupDebt({ agencyId, db }),
+    findCancelledModelInstructionFollowupDebt({ agencyId, db }),
     findConfirmedTelegramProjectionDebt({ agencyId, db, onlyUnmarked: true }),
     findCompletedCustomExternalProjectionDebt({ db, agencyId }),
   ]);

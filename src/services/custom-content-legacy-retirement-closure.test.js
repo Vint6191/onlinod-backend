@@ -13,6 +13,7 @@ const migration = read("prisma/migrations/20260906133000_legacy_retired_custom_o
 const workflow = read("src/services/custom-content-workflow-service.js");
 const delivery = read("src/services/telegram-delivery-authority-service.js");
 const scan = read("src/services/telegram-exact-authority-scan-service.js");
+const cancellationInstruction = read("src/services/custom-cancellation-instruction-authority-service.js");
 
 test("legacy retired Custom closure records cancellation waiver as control truth, never provider confirmation", () => {
   const order = schema.match(/model CustomOrder \{[\s\S]*?\n\}/)?.[0] || "";
@@ -53,5 +54,9 @@ test("waived cancellation is excluded from debt repair and can never be reactiva
   assert.match(scan, /if \(order\.telegramCancellationWaivedAt\) continue/);
   assert.match(delivery, /&& !order\.telegramCancellationWaivedAt/);
   assert.match(delivery, /String\(settledOrder\.status\) === "CANCELLED" && !settledOrder\.telegramCancellationWaivedAt/);
-  assert.match(delivery, /order\.telegramTaskMessageId == null \|\| order\.telegramCancellationWaivedAt/);
+  assert.match(delivery, /String\(order\.status\) !== "CANCELLED" \|\| order\.telegramCancellationWaivedAt/);
+  assert.match(delivery, /CUSTOM_CANCELLATION_MODEL_INSTRUCTION_NOT_DELIVERED/);
+  assert.match(delivery, /CUSTOM_CANCELLATION_INSTRUCTION_OUTCOME_UNRESOLVED/);
+  assert.match(cancellationInstruction, /state:\s*"CONFIRMED_REVISION"/);
+  assert.match(cancellationInstruction, /anchorKind:\s*String\(instruction.kind\)/);
 });

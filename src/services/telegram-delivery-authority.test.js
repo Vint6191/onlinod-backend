@@ -6,11 +6,14 @@ const {
   CLAIM_MS,
   planTelegramDeliveryIntent,
   planRevisionRequestIntentForReviewedSubmission,
+  planCancellationIntentForCommittedOrder,
   listTelegramDeliveryWork,
   claimTelegramDeliveryIntent,
   beginTelegramDeliveryIntent,
   confirmTelegramDeliveryIntent,
   repairConfirmedTelegramDeliveryProjections,
+  repairCustomModelCommunicationConvergence,
+  ensureInitialTaskIntents,
   markTelegramDeliveryUnknown,
   markTelegramDeliveryProvenNotSent,
   failTelegramDeliveryPrecommit,
@@ -199,15 +202,69 @@ test("F46 cancellation before revision COMMITTING cancels precommit work instead
   assert.equal(fx.intents.find((row) => row.id === flow.row.id)?.state, "CANCELLED");
 });
 
-test("F46 cancellation after revision COMMITTING cannot erase an exact provider receipt", async () => {
+test("F46 cancellation after revision COMMITTING cannot erase an exact provider receipt and follows the settled revision", async () => {
   const fx = dbFixture();
   const flow = await revisionToClaimed(fx);
   const begun = await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: flow.claimed.claimToken, now: fx.now, db: fx.db });
   assert.equal(begun.begun, true);
   fx.orders[0].status = "CANCELLED";
+  fx.orders[0].cancelReason = "manager cancelled while revision outcome was settling";
+  const beforeSettlement = await planCancellationIntentForCommittedOrder({ agencyId: "agency-1", member: fx.member, order: fx.orders[0], now: fx.now, db: fx.db });
+  assert.equal(beforeSettlement, null, "unresolved revision outcome must fence cancellation provider binding");
+  assert.equal(fx.intents.some((row) => row.kind === "CANCELLATION"), false);
+
   const settled = await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", claimToken: flow.claimed.claimToken, remoteMessageId: 777, remoteRecipientTelegramUserId: "1001", remoteSentAt: new Date(fx.now.getTime() + 1000), now: new Date(fx.now.getTime() + 2000), db: fx.db });
   assert.equal(settled.intent.state, "CONFIRMED");
   assert.equal(settled.intent.remoteMessageId, "777");
+  const cancellation = fx.intents.find((row) => row.kind === "CANCELLATION");
+  assert.ok(cancellation, "late confirmed revision must converge the cancellation follow-up");
+  assert.equal(cancellation.state, "PLANNED");
+  assert.equal(cancellation.payload.replyToMessageId, "777", "cancellation must reply to the strongest confirmed revision instruction, not the older TASK");
+});
+
+test("historical no-TASK Custom cancellation follows a confirmed revision delivered through the pinned source thread", async () => {
+  const fx = dbFixture();
+  const submission = seedRevisionDecision(fx, { comment: "Redo historical clip" });
+  submission.telegramSourceAccountId = "tg-1";
+  submission.telegramSourceUserId = "2002";
+  submission.telegramMessageIds = [7101, 7102];
+
+  const revision = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: fx.now, db: fx.db,
+  });
+  assert.equal(revision.payload.replyToMessageId, "7102");
+  const claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken, now: fx.now, db: fx.db });
+  await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", claimToken: claimed.claimToken, remoteMessageId: 7103, remoteRecipientTelegramUserId: "2002", remoteSentAt: fx.now, now: fx.now, db: fx.db });
+
+  assert.equal(fx.orders[0].telegramTaskMessageId, null, "historical recovery intentionally has no TASK projection");
+  fx.orders[0].status = "CANCELLED";
+  fx.orders[0].cancelReason = "historical Custom cancelled";
+  const cancellation = await planCancellationIntentForCommittedOrder({ agencyId: "agency-1", member: fx.member, order: fx.orders[0], now: new Date(fx.now.getTime() + 1000), db: fx.db });
+  assert.ok(cancellation);
+  assert.equal(cancellation.kind, "CANCELLATION");
+  assert.equal(cancellation.accountId, "tg-1");
+  assert.equal(cancellation.payload.replyToMessageId, "7103");
+  assert.equal(cancellation.payload.recipientTelegramUserId, "2002");
+});
+
+test("PROVEN_NOT_SENT revision after order cancellation converges cancellation back to the confirmed TASK thread", async () => {
+  const fx = dbFixture();
+  const flow = await revisionToClaimed(fx);
+  await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: flow.claimed.claimToken, now: fx.now, db: fx.db });
+  fx.orders[0].status = "CANCELLED";
+  fx.orders[0].cancelReason = "cancel while revision transport is unresolved";
+  const blocked = await planCancellationIntentForCommittedOrder({ agencyId: "agency-1", member: fx.member, order: fx.orders[0], now: fx.now, db: fx.db });
+  assert.equal(blocked, null);
+
+  const noEffect = await markTelegramDeliveryProvenNotSent({
+    agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", claimToken: flow.claimed.claimToken,
+    reason: "transport proved Telegram send was never invoked", db: fx.db,
+  });
+  assert.equal(noEffect.intent.state, "PLANNED");
+  const cancellation = fx.intents.find((row) => row.kind === "CANCELLATION");
+  assert.ok(cancellation);
+  assert.equal(cancellation.payload.replyToMessageId, "501", "proven-no-effect revision must fall back to the older confirmed TASK thread");
 });
 
 async function taskToCommitting(fx) {
@@ -991,6 +1048,9 @@ test("AUTO_REMINDER provider outcome left COMMITTING after ack loss becomes reco
   const fx = dbFixture();
   const task = await taskToCommitting(fx);
   await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: task.planned.intent.id, deviceId: "device-1", claimToken: task.claimed.claimToken, remoteMessageId: 719, remoteRecipientTelegramUserId: "900001", remoteSentAt: fx.now, now: fx.now, db: fx.db });
+  const confirmedTask = fx.intents.find((row) => row.kind === "TASK" && row.state === "CONFIRMED");
+  confirmedTask.remoteSentAt = new Date(fx.now.getTime() - 31 * 60_000);
+  confirmedTask.confirmedAt = confirmedTask.remoteSentAt;
   fx.orders[0].createdAt = new Date(fx.now.getTime() - 31 * 60_000);
   fx.orders[0].nextReminderAt = new Date(fx.now);
   const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
@@ -1016,10 +1076,60 @@ test("AUTO_REMINDER provider outcome left COMMITTING after ack loss becomes reco
   assert.equal(retryClaim.intent.state, "RECONCILE_REQUIRED");
 });
 
+test("stale claimed reminder cannot COMMIT after reassignment gives the order a model response", async () => {
+  const fx = dbFixture();
+  const task = await taskToCommitting(fx);
+  await confirmTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: task.planned.intent.id,
+    deviceId: "device-1", claimToken: task.claimed.claimToken, remoteMessageId: 723,
+    remoteRecipientTelegramUserId: "900001", remoteSentAt: fx.now, now: fx.now, db: fx.db,
+  });
+  const confirmedTask = fx.intents.find((row) => row.kind === "TASK" && row.state === "CONFIRMED");
+  confirmedTask.remoteSentAt = new Date(fx.now.getTime() - 31 * 60_000);
+  confirmedTask.confirmedAt = confirmedTask.remoteSentAt;
+  fx.orders[0].createdAt = new Date(fx.now.getTime() - 31 * 60_000);
+  fx.orders[0].nextReminderAt = new Date(fx.now);
+
+  const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
+  const reminder = listed.items.find((row) => row.kind === "AUTO_REMINDER");
+  assert.ok(reminder, "the old obligation must have produced a due reminder before reassignment");
+  const claimed = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: reminder.id,
+    deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db,
+  });
+  assert.equal(claimed.claimed, true);
+
+  // Equivalent canonical state after A→B reassignment: this order now owns a model response.
+  // A stale already-claimed reminder from the previous no-response obligation must not cross
+  // the provider COMMITTING boundary even if a worker still holds its old claim token.
+  fx.submissions.push({
+    id: "reassigned-response", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW", reviewedAt: null,
+    receivedAt: new Date(fx.now.getTime() - 500), createdAt: new Date(fx.now.getTime() - 500), updatedAt: new Date(fx.now.getTime() - 500),
+  });
+  fx.orders[0].nextReminderAt = null;
+  fx.orders[0].updatedAt = new Date(fx.orders[0].updatedAt.getTime() + 10);
+
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({
+      agencyId: "agency-1", member: fx.member, intentId: reminder.id,
+      deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken,
+      now: new Date(fx.now.getTime() + 20), db: fx.db,
+    }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_CONTROL_CHANGED",
+  );
+  const durable = fx.intents.find((row) => row.id === reminder.id);
+  assert.equal(durable.commitStartedAt, null, "stale reminder must never receive provider commit authority");
+  assert.notEqual(durable.state, "COMMITTING");
+});
+
 test("AUTO_REMINDER settings changed before COMMITTING cancel only the obsolete planned intent", async () => {
   const fx = dbFixture();
   const task = await taskToCommitting(fx);
   await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: task.planned.intent.id, deviceId: "device-1", claimToken: task.claimed.claimToken, remoteMessageId: 720, remoteRecipientTelegramUserId: "900001", remoteSentAt: fx.now, now: fx.now, db: fx.db });
+  const confirmedTask = fx.intents.find((row) => row.kind === "TASK" && row.state === "CONFIRMED");
+  confirmedTask.remoteSentAt = new Date(fx.now.getTime() - 31 * 60_000);
+  confirmedTask.confirmedAt = confirmedTask.remoteSentAt;
   fx.orders[0].createdAt = new Date(fx.now.getTime() - 31 * 60_000);
   fx.orders[0].nextReminderAt = new Date(fx.now);
   const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
@@ -1040,6 +1150,9 @@ test("AUTO_REMINDER settings changed after COMMITTING cannot erase the in-flight
   const fx = dbFixture();
   const task = await taskToCommitting(fx);
   await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: task.planned.intent.id, deviceId: "device-1", claimToken: task.claimed.claimToken, remoteMessageId: 721, remoteRecipientTelegramUserId: "900001", remoteSentAt: fx.now, now: fx.now, db: fx.db });
+  const confirmedTask = fx.intents.find((row) => row.kind === "TASK" && row.state === "CONFIRMED");
+  confirmedTask.remoteSentAt = new Date(fx.now.getTime() - 31 * 60_000);
+  confirmedTask.confirmedAt = confirmedTask.remoteSentAt;
   fx.orders[0].createdAt = new Date(fx.now.getTime() - 31 * 60_000);
   fx.orders[0].nextReminderAt = new Date(fx.now);
   const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
@@ -1712,8 +1825,8 @@ test("historical impossible reminder planning is operator-visible without fabric
     id: "task-reminder-blocked", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", accountId: "tg-missing", kind: "TASK",
     logicalKey: "custom-telegram:agency-1:order-1:TASK:one", clientIntentId: null, referenceOrdinal: null, payloadFingerprint: "task-blocked", payload: { text: "task" },
     state: "CONFIRMED", claimRevision: 1, claimUntil: null, claimTokenHash: null, deviceId: null, userId: null, memberId: null, accessEpoch: null,
-    commitStartedAt: new Date(fx.now.getTime() - 60_000), remoteMessageId: 8101, remoteRecipientTelegramUserId: "1001", remoteSentAt: new Date(fx.now.getTime() - 60_000),
-    confirmedAt: new Date(fx.now.getTime() - 59_000), outcomeReason: null, confirmationAuthority: "PROVIDER_RECEIPT", createdAt: new Date(fx.now.getTime() - 60_000), updatedAt: new Date(fx.now.getTime() - 59_000),
+    commitStartedAt: new Date(fx.now.getTime() - 31 * 60_000), remoteMessageId: 8101, remoteRecipientTelegramUserId: "1001", remoteSentAt: new Date(fx.now.getTime() - 31 * 60_000),
+    confirmedAt: new Date(fx.now.getTime() - 31 * 60_000 + 1_000), outcomeReason: null, confirmationAuthority: "PROVIDER_RECEIPT", createdAt: new Date(fx.now.getTime() - 31 * 60_000), updatedAt: new Date(fx.now.getTime() - 31 * 60_000 + 1_000),
   });
   fx.accounts.splice(0, fx.accounts.length, ...fx.accounts.filter((row) => row.id !== "tg-missing"));
 
@@ -1734,7 +1847,7 @@ test("unexpected confirmed TASK thread lookup failures are surfaced instead of h
   fx.orders[0].nextReminderAt = new Date(fx.now.getTime() - 1_000);
   const originalFindFirst = fx.db.telegramDeliveryIntent.findFirst;
   fx.db.telegramDeliveryIntent.findFirst = async (args) => {
-    if (args?.where?.kind === "TASK" && args?.where?.state === "CONFIRMED") {
+    if (args?.where?.kind === "TASK") {
       const error = new Error("SIMULATED_TASK_THREAD_DB_FAILURE");
       error.code = "SIMULATED_TASK_THREAD_DB_FAILURE";
       throw error;
@@ -1745,4 +1858,590 @@ test("unexpected confirmed TASK thread lookup failures are surfaced instead of h
     () => listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 10, now: fx.now, db: fx.db }),
     /SIMULATED_TASK_THREAD_DB_FAILURE/,
   );
+});
+
+test("model response makes CONTENT reminder schedule non-executable and MANUAL_REMINDER is rejected while manager owns the next decision", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { messageId: 8301, telegramUserId: "1001" });
+  const task = fx.intents.find((row) => row.kind === "TASK" && row.state === "CONFIRMED");
+  task.remoteSentAt = new Date(fx.now.getTime() - 90 * 60_000);
+  task.confirmedAt = task.remoteSentAt;
+  fx.orders[0].deliveredAt = task.remoteSentAt;
+  fx.orders[0].nextReminderAt = new Date(fx.now.getTime() - 1_000);
+  fx.submissions.push({
+    id: "response-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
+    receivedAt: new Date(fx.now.getTime() - 5_000), createdAt: new Date(fx.now.getTime() - 5_000), updatedAt: new Date(fx.now.getTime() - 5_000),
+  });
+
+  await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: fx.now, db: fx.db });
+  assert.equal(fx.orders[0].nextReminderAt, null, "response receipt must clear stale CONTENT reminder schedule");
+  await assert.rejects(
+    () => planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER", clientIntentId: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", now: fx.now, db: fx.db }),
+    (error) => error?.code === "CUSTOM_MODEL_OBLIGATION_NOT_WAITING_RESPONSE",
+  );
+});
+
+test("confirmed REVISION_REQUEST starts a fresh reminder cycle and both manual/auto reminders reply to the revision provider message", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { messageId: 8401, telegramUserId: "1001" });
+  const submission = seedRevisionDecision(fx, { reviewedAt: new Date(fx.now.getTime() - 40 * 60_000) });
+  fx.orders[0].nextReminderAt = null;
+  fx.orders[0].lastReminderAt = new Date(fx.now.getTime() - 2 * 60 * 60_000);
+  fx.orders[0].lastReminderKey = "CONTENT:legacy-task-cycle";
+
+  const revision = await planRevisionRequestIntentForReviewedSubmission({ agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: fx.now, db: fx.db });
+  const claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken, now: fx.now, db: fx.db });
+  const revisionSentAt = new Date(fx.now.getTime() - 31 * 60_000);
+  await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", claimToken: claimed.claimToken, remoteMessageId: 8402, remoteRecipientTelegramUserId: "1001", remoteSentAt: revisionSentAt, now: fx.now, db: fx.db });
+
+  assert.ok(fx.orders[0].nextReminderAt, "revision provider receipt must arm the new obligation cycle");
+  assert.equal(new Date(fx.orders[0].nextReminderAt).getTime() <= fx.now.getTime(), true, "31-minute-old revision is due under default 30-minute policy");
+
+  const manual = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER", clientIntentId: "ffffffff-ffff-4fff-8fff-ffffffffffff", now: fx.now, db: fx.db });
+  assert.equal(manual.intent.payload.replyToMessageId, "8402");
+  assert.equal(manual.intent.payload.replyToDeliveryId, revision.id);
+  assert.match(manual.intent.payload.reminderKey, new RegExp(`^CONTENT:REVISION_REQUEST:${revision.id}:MANUAL:`));
+
+  // Keep the manual reminder precommit but do not begin it; automatic planning still uses the same
+  // obligation identity. Remove the manual row from the in-memory fixture so this assertion isolates
+  // provider binding rather than the unrelated manual/auto unresolved policy.
+  fx.intents.splice(fx.intents.findIndex((row) => row.id === manual.intent.id), 1);
+  const work = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
+  const auto = work.items.find((row) => row.kind === "AUTO_REMINDER");
+  assert.ok(auto);
+  assert.equal(auto.payload.replyToMessageId, "8402");
+  assert.equal(auto.payload.replyToDeliveryId, revision.id);
+  assert.match(auto.payload.reminderKey, new RegExp(`^CONTENT:REVISION_REQUEST:${revision.id}:`));
+});
+
+test("model response commit racing a claimed AUTO_REMINDER wins the shared CustomOrder revision fence before COMMITTING", async () => {
+  let armResponseRace = false;
+  let fx;
+  fx = dbFixture({
+    beforeCustomOrderUpdateMany: async ({ data, orders }) => {
+      if (!armResponseRace || !data?.updatedAt) return;
+      armResponseRace = false;
+      // Forced interleaving: begin() already derived a live obligation from the old order revision,
+      // then the canonical response transaction wins the same CustomOrder.updatedAt lane before
+      // begin() can CAS its provider-commit permit.
+      fx.submissions.push({
+        id: "response-race-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+        pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
+        receivedAt: new Date(fx.now.getTime() + 1), createdAt: new Date(fx.now.getTime() + 1), updatedAt: new Date(fx.now.getTime() + 1),
+      });
+      orders[0].updatedAt = new Date(new Date(orders[0].updatedAt).getTime() + 5000);
+    },
+  });
+
+  seedConfirmedTaskThread(fx, { messageId: 8501, telegramUserId: "1001" });
+  const task = fx.intents.find((row) => row.kind === "TASK" && row.state === "CONFIRMED");
+  task.remoteSentAt = new Date(fx.now.getTime() - 31 * 60_000);
+  task.confirmedAt = task.remoteSentAt;
+  fx.orders[0].deliveredAt = task.remoteSentAt;
+  fx.orders[0].nextReminderAt = new Date(fx.now.getTime() - 1000);
+
+  const work = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
+  const auto = work.items.find((row) => row.kind === "AUTO_REMINDER");
+  assert.ok(auto, "due initial model obligation must materialize one AUTO_REMINDER");
+  const claimed = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: auto.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db,
+  });
+  assert.equal(claimed.claimed, true);
+
+  armResponseRace = true;
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({
+      agencyId: "agency-1", member: fx.member, intentId: auto.id, deviceId: "device-1", runtimeClaimToken: "runtime-1",
+      claimToken: claimed.claimToken, now: new Date(fx.now.getTime() + 2000), db: fx.db,
+    }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED",
+  );
+
+  const stored = fx.intents.find((row) => row.id === auto.id);
+  assert.equal(stored.state, "CANCELLED", "refresh after the lost CAS must observe the response and terminalize stale reminder work");
+  assert.equal(stored.commitStartedAt, null, "provider effect must never start after the response won the causal boundary");
+});
+
+test("initial REFERENCE planning is forbidden after the model response already satisfied the TASK obligation", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { messageId: 901, telegramUserId: "1001" });
+  fx.submissions.push({
+    id: "response-v1-ref-stop", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
+    receivedAt: new Date(fx.now.getTime() - 100), createdAt: new Date(fx.now.getTime() - 100), updatedAt: new Date(fx.now.getTime() - 100),
+  });
+  await assert.rejects(
+    () => planTelegramDeliveryIntent({
+      agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE",
+      clientIntentId: "91919191-9191-4191-8191-919191919191",
+      reference: { ordinal: 0, name: "late.jpg", size: 1, sha256: "9".repeat(64) }, now: fx.now, db: fx.db,
+    }),
+    (error) => error?.code === "CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE",
+  );
+  assert.equal(fx.intents.filter((row) => row.kind === "REFERENCE").length, 0);
+});
+
+test("a claimed initial REFERENCE cannot begin after V1 satisfies the model obligation", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { messageId: 902, telegramUserId: "1001" });
+  const planned = await planTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE",
+    clientIntentId: "92929292-9292-4292-8292-929292929292",
+    reference: { ordinal: 0, name: "before.jpg", size: 1, sha256: "8".repeat(64) }, now: fx.now, db: fx.db,
+  });
+  const claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  assert.equal(claimed.claimed, true);
+  fx.submissions.push({
+    id: "response-v1-after-ref-claim", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
+    receivedAt: new Date(fx.now.getTime() + 10), createdAt: new Date(fx.now.getTime() + 10), updatedAt: new Date(fx.now.getTime() + 10),
+  });
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken, now: new Date(fx.now.getTime() + 20), db: fx.db }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_CONTROL_CHANGED",
+  );
+  const row = fx.intents.find((candidate) => candidate.id === planned.intent.id);
+  assert.equal(row.state, "CANCELLED");
+  assert.equal(row.commitStartedAt, null);
+});
+
+
+test("model communication backfill cancels stale precommit reminders/references and clears a satisfied CONTENT schedule", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { messageId: 901, telegramUserId: "1001" });
+  fx.orders[0].deliveredAt = new Date(fx.now.getTime() - 10_000);
+  fx.orders[0].nextReminderAt = new Date(fx.now.getTime() + 60_000);
+  fx.submissions.push({
+    id: "response-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
+    receivedAt: new Date(fx.now.getTime() - 5_000), createdAt: new Date(fx.now.getTime() - 5_000), updatedAt: new Date(fx.now.getTime() - 5_000),
+  });
+  fx.intents.push({
+    id: "legacy-auto-reminder", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", accountId: "tg-1", kind: "AUTO_REMINDER",
+    logicalKey: "legacy-auto", state: "PLANNED", claimRevision: 0, commitStartedAt: null, payload: { reminderKey: "legacy-cycle" }, createdAt: new Date(fx.now.getTime() - 4_000), updatedAt: new Date(fx.now.getTime() - 4_000),
+  });
+  fx.intents.push({
+    id: "legacy-reference", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", accountId: "tg-1", kind: "REFERENCE",
+    logicalKey: "legacy-reference", clientIntentId: "legacy-ref-client", referenceOrdinal: 2, state: "CLAIMED", claimRevision: 3, commitStartedAt: null,
+    payload: { reference: { ordinal: 2, name: "old.jpg", size: 10, sha256: "a".repeat(64) } }, createdAt: new Date(fx.now.getTime() - 3_000), updatedAt: new Date(fx.now.getTime() - 3_000),
+  });
+
+  const result = await repairCustomModelCommunicationConvergence({ agencyId: "agency-1", now: fx.now, db: fx.db });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.precommitScanned, 2);
+  assert.equal(result.precommitCancelled, 2);
+  assert.equal(fx.intents.find((row) => row.id === "legacy-auto-reminder").state, "CANCELLED");
+  assert.equal(fx.intents.find((row) => row.id === "legacy-reference").state, "CANCELLED");
+  assert.equal(fx.orders[0].nextReminderAt, null, "accepted response must clear historical reminder schedule without Desktop polling");
+});
+
+test("model communication backfill reconstructs revision reminder schedule from CONFIRMED revision receipt even without TASK", async () => {
+  const fx = dbFixture();
+  const submission = seedRevisionDecision(fx, { comment: "Redo ending" });
+  const sentAt = new Date(fx.now.getTime() - 30_000);
+  fx.intents.push({
+    id: "historical-revision-confirmed", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", customSubmissionId: submission.id,
+    accountId: "tg-1", kind: "REVISION_REQUEST", logicalKey: `custom-telegram:agency-1:order-1:REVISION_REQUEST:submission:${submission.id}`,
+    state: "CONFIRMED", claimRevision: 1, commitStartedAt: sentAt, remoteMessageId: 9901, remoteRecipientTelegramUserId: "1001", remoteSentAt: sentAt, confirmedAt: sentAt,
+    payload: { reviewComment: "Redo ending" }, createdAt: sentAt, updatedAt: sentAt,
+  });
+  assert.equal(fx.orders[0].telegramTaskMessageId, null);
+  assert.equal(fx.orders[0].nextReminderAt, null);
+
+  const result = await repairCustomModelCommunicationConvergence({ agencyId: "agency-1", now: fx.now, db: fx.db });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.revisionIntentsPlanned, 0, "existing provider receipt must never be duplicated");
+  assert.ok(result.reminderScheduleScanned >= 1);
+  assert.ok(fx.orders[0].nextReminderAt instanceof Date, "confirmed revision must recreate its model-obligation reminder schedule");
+  assert.ok(fx.orders[0].nextReminderAt.getTime() >= sentAt.getTime());
+});
+
+
+test("initial TASK convergence reactivates the same proven-no-effect logical row after response reassignment debt", async () => {
+  const fx = dbFixture();
+  const cancelledAt = new Date(fx.now.getTime() - 30_000);
+  fx.intents.push({
+    id: "task-superseded-before-response-moved", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", accountId: "tg-1", kind: "TASK",
+    logicalKey: "custom-telegram:agency-1:order-1:TASK:one", clientIntentId: null, referenceOrdinal: null,
+    payloadFingerprint: "old-task-payload", payload: { text: "old task" }, state: "CANCELLED",
+    deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimRevision: 4, claimUntil: null, commitStartedAt: null,
+    remoteMessageId: null, remoteRecipientTelegramUserId: null, remoteSentAt: null, confirmationAuthority: null, confirmedAt: null,
+    outcomeReason: "HUMAN_RESPONSE_SUPERSEDED:MANUAL_SUBMISSION_ASSIGNMENT", createdAt: cancelledAt, updatedAt: cancelledAt,
+  });
+
+  const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
+  assert.equal(report.failed, 0);
+  assert.equal(report.reactivated, 1);
+  assert.equal(report.planned, 0);
+  assert.equal(fx.intents.length, 1, "exact TASK logical identity must be reused, not duplicated");
+  const task = fx.intents[0];
+  assert.equal(task.id, "task-superseded-before-response-moved");
+  assert.equal(task.state, "PLANNED");
+  assert.equal(task.claimRevision, 5);
+  assert.equal(task.commitStartedAt, null);
+  assert.equal(task.remoteMessageId, null);
+  assert.equal(task.outcomeReason, "TASK_REACTIVATED_FOR_CURRENT_MODEL_OBLIGATION");
+  assert.match(String(task.payload?.text || ""), /custom/i);
+});
+
+test("initial TASK convergence materializes missing create-time instruction after Telegram binding becomes available", async () => {
+  const fx = dbFixture();
+  assert.equal(fx.intents.length, 0);
+  const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
+  assert.equal(report.failed, 0);
+  assert.equal(report.planned, 1);
+  assert.equal(report.reactivated, 0);
+  assert.equal(fx.intents.length, 1);
+  assert.equal(fx.intents[0].kind, "TASK");
+  assert.equal(fx.intents[0].state, "PLANNED");
+  assert.equal(fx.intents[0].logicalKey, "custom-telegram:agency-1:order-1:TASK:one");
+});
+
+test("initial TASK convergence never rewrites COMMITTING or UNKNOWN provider outcomes", async () => {
+  for (const state of ["COMMITTING", "RECONCILE_REQUIRED"]) {
+    const fx = dbFixture();
+    const at = new Date(fx.now.getTime() - 20_000);
+    fx.intents.push({
+      id: `task-${state.toLowerCase()}`, agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", accountId: "tg-1", kind: "TASK",
+      logicalKey: "custom-telegram:agency-1:order-1:TASK:one", payloadFingerprint: "task", payload: { text: "task" }, state,
+      claimRevision: 2, commitStartedAt: state === "COMMITTING" ? at : at, remoteMessageId: null, remoteSentAt: null, confirmedAt: null,
+      createdAt: at, updatedAt: at,
+    });
+    const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
+    assert.equal(report.planned, 0, state);
+    assert.equal(report.reactivated, 0, state);
+    assert.equal(fx.intents[0].state, state);
+    assert.equal(fx.intents[0].claimRevision, 2);
+  }
+});
+
+test("initial TASK convergence does not resurrect an instruction while a canonical response is assigned", async () => {
+  const fx = dbFixture();
+  const at = new Date(fx.now.getTime() - 30_000);
+  fx.intents.push({
+    id: "task-cancelled-response-present", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", accountId: "tg-1", kind: "TASK",
+    logicalKey: "custom-telegram:agency-1:order-1:TASK:one", payloadFingerprint: "task", payload: { text: "task" }, state: "CANCELLED",
+    claimRevision: 2, commitStartedAt: null, remoteMessageId: null, remoteSentAt: null, confirmedAt: null, confirmationAuthority: null,
+    outcomeReason: "HUMAN_RESPONSE_SUPERSEDED:MANUAL_RESPONSE", createdAt: at, updatedAt: at,
+  });
+  fx.submissions.push({
+    id: "response-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
+    receivedAt: new Date(fx.now.getTime() - 10_000), createdAt: new Date(fx.now.getTime() - 10_000), updatedAt: new Date(fx.now.getTime() - 10_000),
+  });
+  const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
+  assert.equal(report.planned, 0);
+  assert.equal(report.reactivated, 0);
+  assert.equal(fx.intents[0].state, "CANCELLED");
+});
+
+test("initial TASK convergence loses safely when a concurrent human response advances the shared order fence", async () => {
+  let fx;
+  let injected = false;
+  fx = dbFixture({
+    beforeCustomOrderUpdateMany: async ({ where, orders }) => {
+      if (injected || String(where?.id || "") !== "order-1" || where?.updatedAt === undefined) return;
+      injected = true;
+      fx.submissions.push({
+        id: "response-race-winner", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+        pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
+        receivedAt: fx.now, createdAt: fx.now, updatedAt: fx.now,
+      });
+      const row = orders.find((candidate) => candidate.id === "order-1");
+      row.updatedAt = new Date(new Date(row.updatedAt).getTime() + 1);
+    },
+  });
+  const cancelledAt = new Date(fx.now.getTime() - 30_000);
+  fx.intents.push({
+    id: "task-race-cancelled", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", accountId: "tg-1", kind: "TASK",
+    logicalKey: "custom-telegram:agency-1:order-1:TASK:one", payloadFingerprint: "old", payload: { text: "old" }, state: "CANCELLED",
+    claimRevision: 2, commitStartedAt: null, remoteMessageId: null, remoteSentAt: null, confirmedAt: null, confirmationAuthority: null,
+    outcomeReason: "HUMAN_RESPONSE_SUPERSEDED:MANUAL_RESPONSE", createdAt: cancelledAt, updatedAt: cancelledAt,
+  });
+
+  const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
+  assert.equal(report.failed, 0);
+  assert.equal(report.raced, 1);
+  assert.equal(report.reactivated, 0);
+  assert.equal(fx.intents[0].state, "CANCELLED");
+  assert.equal(fx.submissions.length, 1);
+});
+
+test("explicit TASK planning is rejected after a canonical model response already satisfied the initial obligation", async () => {
+  const fx = dbFixture();
+  fx.submissions.push({
+    id: "historical-v1-no-task", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
+    receivedAt: new Date(fx.now.getTime() - 5_000), createdAt: new Date(fx.now.getTime() - 5_000), updatedAt: new Date(fx.now.getTime() - 5_000),
+  });
+  await assert.rejects(
+    () => planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "TASK", now: fx.now, db: fx.db }),
+    (error) => error?.code === "CUSTOM_MODEL_INITIAL_INSTRUCTION_NOT_REQUIRED",
+  );
+  assert.equal(fx.intents.length, 0, "a stale initial instruction must not be created after V1 exists");
+});
+
+test("legacy precommit TASK created after response is cancelled by current-obligation refresh before claim", async () => {
+  const fx = dbFixture();
+  const at = new Date(fx.now.getTime() - 20_000);
+  fx.submissions.push({
+    id: "response-before-legacy-task", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW", receivedAt: at, createdAt: at, updatedAt: at,
+  });
+  fx.intents.push({
+    id: "legacy-stale-task", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", accountId: "tg-1", kind: "TASK",
+    logicalKey: "custom-telegram:agency-1:order-1:TASK:one", payloadFingerprint: "legacy", payload: { text: "stale" }, state: "PLANNED",
+    claimRevision: 0, commitStartedAt: null, remoteMessageId: null, remoteSentAt: null, confirmedAt: null, createdAt: at, updatedAt: at,
+  });
+  const claim = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: "legacy-stale-task", deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db,
+  });
+  assert.equal(claim.claimed, false);
+  assert.equal(fx.intents[0].state, "CANCELLED");
+  assert.equal(fx.intents[0].commitStartedAt, null);
+  assert.equal(fx.intents[0].outcomeReason, "INITIAL_MODEL_OBLIGATION_SATISFIED");
+});
+
+test("claimed TASK cannot cross begin after a response satisfies the initial obligation", async () => {
+  const fx = dbFixture();
+  const planned = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "TASK", now: fx.now, db: fx.db });
+  const claimed = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db,
+  });
+  assert.equal(claimed.claimed, true);
+  const responseAt = new Date(fx.now.getTime() + 500);
+  fx.submissions.push({
+    id: "response-after-claim", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW", receivedAt: responseAt, createdAt: responseAt, updatedAt: responseAt,
+  });
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({
+      agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1",
+      claimToken: claimed.claimToken, now: new Date(fx.now.getTime() + 1_000), db: fx.db,
+    }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_CONTROL_CHANGED",
+  );
+  assert.notEqual(fx.intents[0].state, "COMMITTING");
+  assert.equal(fx.intents[0].commitStartedAt, null);
+});
+
+test("stale MANUAL_REMINDER from initial TASK cycle is cancelled instead of rebinding onto a later confirmed revision cycle", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { messageId: 8501, telegramUserId: "1001" });
+  const task = fx.intents.find((row) => row.kind === "TASK" && row.state === "CONFIRMED");
+  task.remoteSentAt = new Date(fx.now.getTime() - 60 * 60_000);
+  task.confirmedAt = task.remoteSentAt;
+
+  const staleManual = await planTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER",
+    clientIntentId: "12121212-1212-4212-8212-121212121212", now: new Date(fx.now.getTime() - 30_000), db: fx.db,
+  });
+  assert.match(staleManual.intent.payload.reminderKey, new RegExp(`^CONTENT:TASK:${task.id}:MANUAL:`));
+
+  const submission = seedRevisionDecision(fx, { reviewedAt: new Date(fx.now.getTime() - 20_000) });
+  const revision = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: new Date(fx.now.getTime() - 15_000), db: fx.db,
+  });
+  const revisionClaim = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: new Date(fx.now.getTime() - 14_000), db: fx.db,
+  });
+  await beginTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1",
+    claimToken: revisionClaim.claimToken, now: new Date(fx.now.getTime() - 13_000), db: fx.db,
+  });
+  await confirmTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", claimToken: revisionClaim.claimToken,
+    remoteMessageId: 8502, remoteRecipientTelegramUserId: "1001", remoteSentAt: new Date(fx.now.getTime() - 12_000), now: new Date(fx.now.getTime() - 11_000), db: fx.db,
+  });
+
+  const claimed = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: staleManual.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db,
+  });
+  assert.equal(claimed.claimed, false);
+  const row = fx.intents.find((intent) => intent.id === staleManual.intent.id);
+  assert.equal(row.state, "CANCELLED");
+  assert.equal(row.commitStartedAt, null);
+  assert.match(String(row.outcomeReason || ""), /MODEL_OBLIGATION_CYCLE_CHANGED|MODEL_OBLIGATION_SATISFIED/);
+  assert.match(String(row.payload?.reminderKey || ""), new RegExp(`^CONTENT:TASK:${task.id}:MANUAL:`), "stale manual reminder must never be rebound to revision identity");
+});
+
+test("claimed MANUAL_REMINDER cannot cross begin after the Custom obligation advances to a confirmed revision cycle", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { messageId: 8601, telegramUserId: "1001" });
+  const task = fx.intents.find((row) => row.kind === "TASK" && row.state === "CONFIRMED");
+  task.remoteSentAt = new Date(fx.now.getTime() - 60 * 60_000);
+  task.confirmedAt = task.remoteSentAt;
+
+  const manual = await planTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "MANUAL_REMINDER",
+    clientIntentId: "34343434-3434-4434-8434-343434343434", now: new Date(fx.now.getTime() - 30_000), db: fx.db,
+  });
+  const manualClaim = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: manual.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: new Date(fx.now.getTime() - 29_000), db: fx.db,
+  });
+  assert.equal(manualClaim.claimed, true);
+
+  const submission = seedRevisionDecision(fx, { reviewedAt: new Date(fx.now.getTime() - 20_000) });
+  const revision = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: new Date(fx.now.getTime() - 15_000), db: fx.db,
+  });
+  const revisionClaim = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: new Date(fx.now.getTime() - 14_000), db: fx.db,
+  });
+  await beginTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1",
+    claimToken: revisionClaim.claimToken, now: new Date(fx.now.getTime() - 13_000), db: fx.db,
+  });
+  await confirmTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", claimToken: revisionClaim.claimToken,
+    remoteMessageId: 8602, remoteRecipientTelegramUserId: "1001", remoteSentAt: new Date(fx.now.getTime() - 12_000), now: new Date(fx.now.getTime() - 11_000), db: fx.db,
+  });
+
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({
+      agencyId: "agency-1", member: fx.member, intentId: manual.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1",
+      claimToken: manualClaim.claimToken, now: fx.now, db: fx.db,
+    }),
+    (error) => ["TELEGRAM_DELIVERY_CONTROL_CHANGED", "TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED"].includes(error?.code),
+  );
+  const row = fx.intents.find((intent) => intent.id === manual.intent.id);
+  assert.equal(row.state, "CANCELLED");
+  assert.equal(row.commitStartedAt, null);
+  assert.equal(row.outcomeReason, "MODEL_OBLIGATION_CYCLE_CHANGED");
+  assert.match(String(row.payload?.reminderKey || ""), new RegExp(`^CONTENT:TASK:${task.id}:MANUAL:`));
+});
+
+test("server projection repair converges cancellation from a historical CONFIRMED revision even when TASK never existed", async () => {
+  const fx = dbFixture();
+  const submission = seedRevisionDecision(fx, { comment: "Historical redo" });
+  submission.telegramSourceAccountId = "tg-1";
+  submission.telegramSourceUserId = "2002";
+  submission.telegramMessageIds = [9101];
+  const sentAt = new Date(fx.now.getTime() - 20_000);
+  fx.intents.push({
+    id: "revision-confirmed-before-restart", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", customSubmissionId: submission.id,
+    accountId: "tg-1", kind: "REVISION_REQUEST", logicalKey: `custom-telegram:agency-1:order-1:REVISION_REQUEST:submission:${submission.id}`,
+    state: "CONFIRMED", claimRevision: 2, commitStartedAt: sentAt,
+    remoteMessageId: 9102, remoteRecipientTelegramUserId: "2002", remoteSentAt: sentAt, confirmedAt: sentAt,
+    payload: { reviewComment: "Historical redo" }, createdAt: sentAt, updatedAt: sentAt,
+  });
+  fx.orders[0].status = "CANCELLED";
+  fx.orders[0].cancelReason = "cancelled before process restart";
+  assert.equal(fx.orders[0].telegramTaskMessageId, null);
+  assert.equal(fx.intents.some((row) => row.kind === "CANCELLATION"), false);
+
+  const report = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: fx.now, db: fx.db });
+  assert.equal(report.ok, true);
+  const cancellation = fx.intents.find((row) => row.kind === "CANCELLATION");
+  assert.ok(cancellation, "server repair must heal the crash window after revision confirmation");
+  assert.equal(cancellation.payload.replyToMessageId, "9102");
+  assert.equal(cancellation.payload.recipientTelegramUserId, "2002");
+});
+
+test("manual PROVEN_NOT_SENT reconciliation after cancellation falls back from unknown revision to the confirmed TASK", async () => {
+  const fx = dbFixture();
+  const flow = await revisionToClaimed(fx);
+  await beginTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", runtimeClaimToken: "runtime-1",
+    claimToken: flow.claimed.claimToken, now: fx.now, db: fx.db,
+  });
+  await markTelegramDeliveryUnknown({
+    agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", claimToken: flow.claimed.claimToken,
+    reason: "provider response lost", now: fx.now, db: fx.db,
+  });
+  fx.orders[0].status = "CANCELLED";
+  fx.orders[0].cancelReason = "cancelled while revision outcome unknown";
+  assert.equal(await planCancellationIntentForCommittedOrder({ agencyId: "agency-1", member: fx.member, order: fx.orders[0], now: fx.now, db: fx.db }), null);
+
+  const reconciled = await reconcileTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: flow.row.id, resolution: "PROVEN_NOT_SENT",
+    reason: "Telegram history proves revision message does not exist", now: new Date(fx.now.getTime() + 1000), db: fx.db,
+  });
+  assert.equal(reconciled.intent.state, "PLANNED");
+  const cancellation = fx.intents.find((row) => row.kind === "CANCELLATION");
+  assert.ok(cancellation);
+  assert.equal(cancellation.payload.replyToMessageId, "501");
+});
+
+test("historical no-TASK confirmed revision reminder blockage is operator-visible", async () => {
+  const fx = dbFixture();
+  const order = fx.orders[0];
+  order.telegramTaskMessageId = null;
+  order.createdAt = new Date(fx.now.getTime() - 40 * 60_000);
+  order.nextReminderAt = new Date(fx.now.getTime() - 1_000);
+  const submission = seedRevisionDecision(fx, { reviewedAt: new Date(fx.now.getTime() - 35 * 60_000) });
+  const sentAt = new Date(fx.now.getTime() - 31 * 60_000);
+  fx.intents.push({
+    id: "revision-reminder-blocked", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", customSubmissionId: submission.id,
+    accountId: "tg-missing", kind: "REVISION_REQUEST", logicalKey: "custom-telegram:agency-1:order-1:REVISION_REQUEST:submission:submission-v1",
+    clientIntentId: null, referenceOrdinal: null, payloadFingerprint: "revision-blocked", payload: { text: "redo" },
+    state: "CONFIRMED", claimRevision: 1, claimUntil: null, claimTokenHash: null, deviceId: null, userId: null, memberId: null, accessEpoch: null,
+    commitStartedAt: sentAt, remoteMessageId: 9101, remoteRecipientTelegramUserId: "1001", remoteSentAt: sentAt,
+    confirmedAt: new Date(sentAt.getTime() + 1000), outcomeReason: null, confirmationAuthority: "PROVIDER_RECEIPT", createdAt: sentAt, updatedAt: new Date(sentAt.getTime() + 1000),
+  });
+  fx.accounts.splice(0, fx.accounts.length, ...fx.accounts.filter((row) => row.id !== "tg-missing"));
+
+  const queue = await listTelegramReminderPlanningBlockedQueue({ agencyId: "agency-1", member: fx.member, limit: 20, now: fx.now, db: fx.db });
+  assert.equal(queue.items.length, 1);
+  assert.equal(queue.items[0].customOrderId, "order-1");
+  assert.equal(queue.items[0].accountId, "tg-missing");
+  assert.equal(queue.items[0].blockedCode, "CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED");
+  assert.equal(fx.intents.some((row) => row.kind === "AUTO_REMINDER"), false, "blocked read model must not invent reminder work");
+});
+
+test("AUTO_REMINDER planning horizon counts eligible new work, not stale exact CONFIRMED intents awaiting projection repair", async () => {
+  const fx = dbFixture();
+  const oldSentAt = new Date(fx.now.getTime() - 31 * 60_000);
+
+  async function seedDueOrderWithTask(orderId) {
+    if (orderId !== "order-1") {
+      fx.orders.push({
+        ...clone(fx.orders[0]), id: orderId, dialogId: `dialog-${orderId}`,
+        telegramTaskMessageId: null, deliveredAt: null, lastReminderAt: null, lastReminderKey: null,
+        nextReminderAt: null, createdAt: new Date(fx.now.getTime() - 60_000), updatedAt: new Date(fx.now.getTime() - 60_000),
+      });
+    }
+    const planned = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId, kind: "TASK", now: fx.now, db: fx.db });
+    const claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+    await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken, now: fx.now, db: fx.db });
+    await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", claimToken: claimed.claimToken, remoteMessageId: Number(orderId.replace(/\D/g, "")) + 9100, remoteRecipientTelegramUserId: "1001", remoteSentAt: oldSentAt, now: fx.now, db: fx.db });
+    const task = fx.intents.find((row) => row.id === planned.intent.id);
+    task.remoteSentAt = oldSentAt;
+    task.confirmedAt = oldSentAt;
+    const order = fx.orders.find((row) => row.id === orderId);
+    order.deliveredAt = oldSentAt;
+    order.nextReminderAt = new Date(fx.now);
+    return order;
+  }
+
+  async function createConfirmedReminderThenLoseProjection(order) {
+    const work = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
+    const reminder = work.items.find((row) => row.kind === "AUTO_REMINDER" && row.customOrderId === order.id);
+    assert.ok(reminder, `AUTO_REMINDER must first materialize for ${order.id}`);
+    const claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: reminder.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+    await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: reminder.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken, now: fx.now, db: fx.db });
+    await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: reminder.id, deviceId: "device-1", claimToken: claimed.claimToken, remoteMessageId: Number(order.id.replace(/\D/g, "")) + 9200, remoteRecipientTelegramUserId: "1001", remoteSentAt: fx.now, now: fx.now, db: fx.db });
+    // Crash-window model: provider receipt is durable, but CustomOrder reminder projection was lost.
+    order.lastReminderAt = null;
+    order.lastReminderKey = null;
+    order.nextReminderAt = new Date(fx.now);
+    return reminder.id;
+  }
+
+  const order1 = await seedDueOrderWithTask("order-1");
+  await createConfirmedReminderThenLoseProjection(order1);
+  const order2 = await seedDueOrderWithTask("order-2");
+  await createConfirmedReminderThenLoseProjection(order2);
+  const order3 = await seedDueOrderWithTask("order-3");
+
+  const before = fx.intents.filter((row) => row.kind === "AUTO_REMINDER" && row.customOrderId === "order-3").length;
+  assert.equal(before, 0);
+
+  await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 2, now: fx.now, db: fx.db });
+
+  const after = fx.intents.filter((row) => row.kind === "AUTO_REMINDER" && row.customOrderId === "order-3");
+  assert.equal(after.length, 1, "stale exact CONFIRMED reminders must not consume the planning horizon before a later eligible order");
 });

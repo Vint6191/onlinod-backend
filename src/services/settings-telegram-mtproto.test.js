@@ -560,7 +560,7 @@ test("F43 force retirement is explicit, audited, and impossible while server blo
         delete: async () => { account = null; return {}; },
       },
       telegramDeliveryIntent: { findFirst: async () => blocker ? ({ id: "intent-1", state: "RECONCILE_REQUIRED" }) : null, findMany: async () => [] },
-      customContentSubmission: { findMany: async () => [] },
+      customContentSubmission: { findMany: async () => [], findFirst: async () => null },
       telegramInboundEvent: { findFirst: async () => null },
       creatorAccount: { updateMany: async ({ where, data }) => { for (const creator of creators) if (creator.agencyId === where.agencyId && creator.telegramAccountId === where.telegramAccountId) Object.assign(creator, data); return { count: 1 }; } },
       async $transaction(fn) { return fn(this); },
@@ -611,7 +611,7 @@ test("F44 retirement blocker remains exact beyond 1000 historical TASKs regardle
   const owner = { id: "owner", userId: "owner-user", role: "OWNER", roleKey: "owner" };
   const account = { id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimUntil: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0 };
   const orders = Array.from({ length: 1001 }, (_, i) => ({ id: `order-${String(i + 1).padStart(4, "0")}`, agencyId: "agency-1", creatorId: "creator-1", status: i === 1000 ? "PENDING" : "COMPLETED" }));
-  const tasks = Array.from({ length: 1001 }, (_, i) => ({ id: `task-${String(i + 1).padStart(4, "0")}`, agencyId: "agency-1", creatorId: "creator-1", customOrderId: `order-${String(i + 1).padStart(4, "0")}`, accountId: "tg-old", kind: "TASK", state: "CONFIRMED" }));
+  const tasks = Array.from({ length: 1001 }, (_, i) => ({ id: `task-${String(i + 1).padStart(4, "0")}`, agencyId: "agency-1", creatorId: "creator-1", customOrderId: `order-${String(i + 1).padStart(4, "0")}`, accountId: "tg-old", kind: "TASK", state: "CONFIRMED", remoteMessageId: 10000 + i, remoteRecipientTelegramUserId: "900001", confirmedAt: new Date("2026-09-06T12:00:00.000Z") }));
   const page = (rows, { where = {}, take = rows.length, cursor = null, skip = 0 } = {}, match) => {
     let out = rows.filter((row) => match(row, where)).slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
     if (cursor?.id) { const idx = out.findIndex((row) => row.id === cursor.id); if (idx >= 0) out = out.slice(idx + (skip ? 1 : 0)); }
@@ -627,8 +627,11 @@ test("F44 retirement blocker remains exact beyond 1000 historical TASKs regardle
   const matchIntent = (row, where) => {
     if (where.agencyId && row.agencyId !== where.agencyId) return false;
     if (where.accountId && row.accountId !== where.accountId) return false;
-    if (where.kind && row.kind !== where.kind) return false;
-    if (where.state && row.state !== where.state) return false;
+    if (typeof where.kind === "string" && row.kind !== where.kind) return false;
+    if (where.kind?.in && !where.kind.in.includes(row.kind)) return false;
+    if (typeof where.state === "string" && row.state !== where.state) return false;
+    if (where.state?.in && !where.state.in.includes(row.state)) return false;
+    if (typeof where.customOrderId === "string" && row.customOrderId !== where.customOrderId) return false;
     if (where.customOrderId?.in && !where.customOrderId.in.includes(row.customOrderId)) return false;
     return true;
   };
@@ -648,7 +651,7 @@ test("F44 retirement blocker remains exact beyond 1000 historical TASKs regardle
       },
       creatorAccount: { updateMany: async () => ({ count: 0 }) },
       telegramDeliveryIntent: {
-        findFirst: async () => null,
+        findFirst: async ({ where }) => taskRows.find((row) => matchIntent(row, where || {})) || null,
         findMany: async (args) => page(taskRows, args, matchIntent),
       },
       customOrder: {
@@ -664,6 +667,59 @@ test("F44 retirement blocker remains exact beyond 1000 historical TASKs regardle
       (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
     );
   }
+});
+
+test("historical no-TASK confirmed revision blocks Telegram account retirement", async () => {
+  const service = loadSettingsService();
+  const owner = { id: "owner", userId: "owner-user", role: "OWNER", roleKey: "owner" };
+  const account = { id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimUntil: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0 };
+  const order = { id: "order-revision", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", createdAt: new Date("2026-09-07T18:00:00.000Z"), updatedAt: new Date("2026-09-07T18:00:00.000Z") };
+  const submission = { id: "submission-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, reviewStatus: "REVISION_REQUESTED", pipelineDisposition: "ACTIVE", receivedAt: new Date("2026-09-07T18:01:00.000Z"), createdAt: new Date("2026-09-07T18:01:00.000Z") };
+  const revision = { id: "revision-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, customSubmissionId: submission.id, accountId: "tg-old", kind: "REVISION_REQUEST", state: "CONFIRMED", remoteMessageId: 1701, remoteRecipientTelegramUserId: "900001", remoteSentAt: new Date("2026-09-07T18:05:00.000Z"), confirmedAt: new Date("2026-09-07T18:05:01.000Z") };
+  const matches = (row, where = {}) => Object.entries(where).every(([key, expected]) => {
+    if (key === "OR") return expected.some((part) => matches(row, part));
+    const actual = row[key];
+    if (expected && typeof expected === "object" && !Array.isArray(expected) && !(expected instanceof Date)) {
+      if ("in" in expected) return expected.in.map(String).includes(String(actual));
+      if ("not" in expected) return expected.not === null ? actual !== null : String(actual) !== String(expected.not);
+      return true;
+    }
+    return expected instanceof Date || actual instanceof Date ? new Date(actual).getTime() === new Date(expected).getTime() : String(actual) === String(expected);
+  });
+  const db = {
+    agencyTelegramMtprotoAccount: {
+      findFirst: async ({ where }) => where.id === account.id && where.agencyId === account.agencyId ? { ...account } : null,
+      updateMany: async ({ where, data }) => {
+        if (where.id !== account.id || where.agencyId !== account.agencyId) return { count: 0 };
+        const state = String(account.lifecycleState || "ACTIVE");
+        const stateOk = !where.lifecycleState || String(where.lifecycleState) === state
+          || (Array.isArray(where.OR) && where.OR.some((entry) => entry?.lifecycleState === state || (entry?.lifecycleState === null && !account.lifecycleState)));
+        if (!stateOk) return { count: 0 };
+        Object.assign(account, data); return { count: 1 };
+      },
+      delete: async () => { throw new Error("revision provider account must remain blocked"); },
+    },
+    telegramDeliveryIntent: {
+      findFirst: async ({ where }) => matches(revision, where || {}) ? { ...revision } : null,
+      findMany: async ({ where = {} }) => matches(revision, where) ? [{ ...revision }] : [],
+    },
+    customOrder: {
+      findMany: async ({ where = {} }) => matches(order, where) ? [{ ...order }] : [],
+      findFirst: async ({ where = {} }) => matches(order, where) ? { ...order } : null,
+    },
+    customContentSubmission: {
+      findFirst: async ({ where = {} }) => matches(submission, where) ? { ...submission } : null,
+      findMany: async () => [],
+    },
+    telegramInboundEvent: { findFirst: async () => null },
+    creatorAccount: { updateMany: async () => ({ count: 0 }) },
+    async $transaction(fn) { return fn(this); },
+  };
+  await assert.rejects(
+    () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-old", db, now: new Date("2026-09-07T18:06:00.000Z") }),
+    (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE" && error?.status === 409,
+  );
+  assert.equal(account.lifecycleState, "ACTIVE", "retirement transaction must leave the revision provider account active when blocked");
 });
 
 test("F44 retirement blocks incomplete account-pinned source even when source user identity still needs repair", async () => {
@@ -797,4 +853,60 @@ test("pinned follow-up or unknown external outcome still blocks Telegram account
       `${scenario.kind}/${scenario.state} must remain an exact account blocker`,
     );
   }
+});
+
+test("cancelled historical no-TASK revision blocks Telegram account retirement until cancellation follow-up exists", async () => {
+  const service = loadSettingsService();
+  const owner = { id: "owner", userId: "owner-user", role: "OWNER", roleKey: "owner" };
+  const account = { id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimUntil: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0 };
+  const order = { id: "order-cancelled-revision", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "CANCELLED", telegramCancellationWaivedAt: null, createdAt: new Date("2026-09-07T18:00:00Z"), updatedAt: new Date("2026-09-07T18:10:00Z") };
+  const submission = { id: "submission-cancelled-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, reviewStatus: "REVISION_REQUESTED", pipelineDisposition: "SALVAGE", receivedAt: new Date("2026-09-07T18:01:00Z"), createdAt: new Date("2026-09-07T18:01:00Z") };
+  const revision = { id: "revision-cancelled-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, customSubmissionId: submission.id, accountId: "tg-old", kind: "REVISION_REQUEST", state: "CONFIRMED", remoteMessageId: 1901, remoteRecipientTelegramUserId: "900001", confirmedAt: new Date("2026-09-07T18:05:00Z"), createdAt: new Date("2026-09-07T18:04:00Z") };
+  const cancellation = { id: "cancel-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, accountId: "tg-old", kind: "CANCELLATION", state: "CONFIRMED", remoteMessageId: 1902, remoteRecipientTelegramUserId: "900001", confirmedAt: new Date("2026-09-07T18:12:00Z"), createdAt: new Date("2026-09-07T18:11:00Z") };
+  let intents = [revision];
+  const match = (row, where = {}) => Object.entries(where).every(([key, expected]) => {
+    if (key === "OR") return expected.some((part) => match(row, part));
+    const actual = row[key];
+    if (expected && typeof expected === "object" && !Array.isArray(expected) && !(expected instanceof Date)) {
+      if ("in" in expected) return expected.in.map(String).includes(String(actual));
+      if ("not" in expected) return expected.not === null ? actual !== null : String(actual) !== String(expected.not);
+      return true;
+    }
+    return expected instanceof Date || actual instanceof Date ? new Date(actual).getTime() === new Date(expected).getTime() : String(actual) === String(expected);
+  });
+  const db = {
+    agencyTelegramMtprotoAccount: {
+      findFirst: async ({ where }) => where.id === account.id && where.agencyId === account.agencyId ? { ...account } : null,
+      updateMany: async ({ where, data }) => { if (where.id !== account.id || where.agencyId !== account.agencyId) return { count: 0 }; Object.assign(account, data); return { count: 1 }; },
+      delete: async () => { throw new Error("retirement must remain blocked while cancellation follow-up debt exists"); },
+    },
+    telegramDeliveryIntent: {
+      findFirst: async ({ where = {} }) => intents.find((row) => match(row, where)) || null,
+      findMany: async ({ where = {} }) => intents.filter((row) => match(row, where)),
+    },
+    customOrder: {
+      findMany: async ({ where = {} }) => match(order, where) ? [{ ...order }] : [],
+      findFirst: async ({ where = {} }) => match(order, where) ? { ...order } : null,
+    },
+    customContentSubmission: {
+      findMany: async ({ where = {} }) => match(submission, where) ? [{ ...submission }] : [],
+      findFirst: async ({ where = {} }) => match(submission, where) ? { ...submission } : null,
+    },
+    telegramInboundEvent: { findFirst: async () => null },
+    creatorAccount: { updateMany: async () => ({ count: 0 }) },
+    async $transaction(fn) { return fn(this); },
+  };
+  await assert.rejects(
+    () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-old", db }),
+    (error) => error?.code === "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
+  );
+
+  intents = [revision, cancellation];
+  // With exact cancellation follow-up planned, this specific debt no longer blocks. We only call
+  // the internal lifecycle again far enough to prove the blocker changed; delete is intentionally
+  // still unavailable in this narrow fixture, so the expected failure must no longer be IN_USE.
+  await assert.rejects(
+    () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-old", db }),
+    (error) => error?.code !== "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
+  );
 });

@@ -405,6 +405,23 @@ async function maybeReconcileHistoricalTeamMoney() {
   }
 }
 
+async function runCustomExternalProofConvergenceSweep({ now = new Date() } = {}) {
+  try {
+    // Provider-completed CUSTOM relay results are canonical historical facts. Their
+    // projection is backend-owned repair and deliberately has no Desktop lease,
+    // creator READY/deleted, manager permission, or Custom lifecycle dependency.
+    const { convergeHistoricalCustomExternalProofs } = require("./custom-external-proof-convergence-service");
+    const result = await convergeHistoricalCustomExternalProofs({ limit: 200, db: prisma });
+    if (Number(result?.selected || 0) > 0 || Number(result?.failed || 0) > 0) {
+      console.log(`[scheduler] Custom external proof convergence — selected=${result.selected || 0}, repaired=${result.repaired || 0}, media=${result.projectedMedia || 0}, failed=${result.failed || 0}`);
+    }
+    return result;
+  } catch (err) {
+    console.warn("[scheduler] Custom external proof convergence failed:", err?.message || err);
+    return { ok: false, selected: 0, repaired: 0, projectedMedia: 0, failed: 1, error: err?.message || String(err) };
+  }
+}
+
 async function runTelegramInboundProjectionSweep({ now = new Date() } = {}) {
   try {
     // Provider observations are ACKed once TelegramInboundEvent is durable. Any derived
@@ -435,10 +452,14 @@ async function runTelegramConfirmedProjectionSweep({ now = new Date() } = {}) {
     // repair is backend-owned and must converge even with no Desktop polling. Drain agencies by
     // cursor instead of hiding historical debt behind a fixed first-N workspace sample.
     const { scanAllById } = require("./telegram-exact-authority-scan-service");
-    const { repairConfirmedTelegramDeliveryProjections } = require("./telegram-delivery-authority-service");
+    const { repairConfirmedTelegramDeliveryProjections, repairCustomModelCommunicationConvergence } = require("./telegram-delivery-authority-service");
     const report = {
       ok: true, agencies: 0, scanned: 0, repaired: 0, failed: 0,
       reminderScheduleScanned: 0, reminderScheduleRepaired: 0, reminderScheduleFailed: 0,
+      modelInitialTasksPlanned: 0, modelInitialTasksReactivated: 0, modelInitialTasksBlocked: 0, modelInitialTasksRaced: 0, modelInitialTasksFailed: 0,
+      modelCommunicationPrecommitScanned: 0, modelCommunicationPrecommitCancelled: 0, modelCommunicationPrecommitFailed: 0,
+      modelCommunicationReminderScanned: 0, modelCommunicationReminderRepaired: 0, modelCommunicationReminderFailed: 0,
+      revisionIntentsPlanned: 0,
     };
     await scanAllById({
       delegate: prisma.agency,
@@ -456,12 +477,29 @@ async function runTelegramConfirmedProjectionSweep({ now = new Date() } = {}) {
           report.reminderScheduleRepaired += Number(result?.reminderScheduleRepaired || 0);
           report.reminderScheduleFailed += Number(result?.reminderScheduleFailed || 0);
           if (result?.ok === false) report.ok = false;
+
+          const modelCommunication = await repairCustomModelCommunicationConvergence({ agencyId: String(agency.id), now, db: prisma });
+          report.modelInitialTasksPlanned += Number(modelCommunication?.initialTaskIntentsPlanned || 0);
+          report.modelInitialTasksReactivated += Number(modelCommunication?.initialTaskIntentsReactivated || 0);
+          report.modelInitialTasksBlocked += Number(modelCommunication?.initialTaskIntentsBlocked || 0);
+          report.modelInitialTasksRaced += Number(modelCommunication?.initialTaskIntentsRaced || 0);
+          report.modelInitialTasksFailed += Number(modelCommunication?.initialTaskIntentsFailed || 0);
+          report.modelCommunicationPrecommitScanned += Number(modelCommunication?.precommitScanned || 0);
+          report.modelCommunicationPrecommitCancelled += Number(modelCommunication?.precommitCancelled || 0);
+          report.modelCommunicationPrecommitFailed += Number(modelCommunication?.precommitFailed || 0);
+          report.modelCommunicationReminderScanned += Number(modelCommunication?.reminderScheduleScanned || 0);
+          report.modelCommunicationReminderRepaired += Number(modelCommunication?.reminderScheduleRepaired || 0);
+          report.modelCommunicationReminderFailed += Number(modelCommunication?.reminderScheduleFailed || 0);
+          report.revisionIntentsPlanned += Number(modelCommunication?.revisionIntentsPlanned || 0);
+          if (modelCommunication?.ok === false) report.ok = false;
         }
         return false;
       },
     });
-    if (report.scanned > 0 || report.failed > 0 || report.reminderScheduleScanned > 0 || report.reminderScheduleFailed > 0) {
-      console.log(`[scheduler] Telegram confirmed projection — agencies=${report.agencies}, scanned=${report.scanned}, repaired=${report.repaired}, failed=${report.failed}, reminderScheduleScanned=${report.reminderScheduleScanned}, reminderScheduleRepaired=${report.reminderScheduleRepaired}, reminderScheduleFailed=${report.reminderScheduleFailed}`);
+    if (report.scanned > 0 || report.failed > 0 || report.reminderScheduleScanned > 0 || report.reminderScheduleFailed > 0
+      || report.modelInitialTasksPlanned > 0 || report.modelInitialTasksReactivated > 0 || report.modelInitialTasksFailed > 0
+      || report.modelCommunicationPrecommitScanned > 0 || report.modelCommunicationReminderScanned > 0 || report.revisionIntentsPlanned > 0) {
+      console.log(`[scheduler] Telegram/custom model convergence — agencies=${report.agencies}, confirmedScanned=${report.scanned}, confirmedRepaired=${report.repaired}, confirmedFailed=${report.failed}, reminderScheduleScanned=${report.reminderScheduleScanned}, reminderScheduleRepaired=${report.reminderScheduleRepaired}, reminderScheduleFailed=${report.reminderScheduleFailed}, initialTaskPlanned=${report.modelInitialTasksPlanned}, initialTaskReactivated=${report.modelInitialTasksReactivated}, initialTaskBlocked=${report.modelInitialTasksBlocked}, initialTaskRaced=${report.modelInitialTasksRaced}, initialTaskFailed=${report.modelInitialTasksFailed}, precommitScanned=${report.modelCommunicationPrecommitScanned}, precommitCancelled=${report.modelCommunicationPrecommitCancelled}, precommitFailed=${report.modelCommunicationPrecommitFailed}, modelReminderScanned=${report.modelCommunicationReminderScanned}, modelReminderRepaired=${report.modelCommunicationReminderRepaired}, modelReminderFailed=${report.modelCommunicationReminderFailed}, revisionIntentsPlanned=${report.revisionIntentsPlanned}`);
     }
     return report;
   } catch (err) {
@@ -582,6 +620,7 @@ async function runRecurringSweep() {
     billingExpiry = { ok: false, error: err?.message || String(err) };
   }
   const telegramConfirmedProjection = await runTelegramConfirmedProjectionSweep({ now });
+  const customExternalProofConvergence = await runCustomExternalProofConvergenceSweep({ now });
   const teamMoneyBackfill = await maybeReconcileHistoricalTeamMoney();
   const teamPendingBackfill = await maybeBackfillTeamPendingProjection();
 
@@ -600,6 +639,7 @@ async function runRecurringSweep() {
     billingRenewals,
     billingExpiry,
     telegramConfirmedProjection,
+    customExternalProofConvergence,
     teamMoneyBackfill,
     teamPendingBackfill,
   };
@@ -636,6 +676,9 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   const projectionTick = () => {
     runTelegramInboundProjectionSweep().catch((err) => {
       console.error("[scheduler] Telegram inbound projection sweep crashed:", err);
+    });
+    runCustomExternalProofConvergenceSweep().catch((err) => {
+      console.error("[scheduler] Custom external proof convergence sweep crashed:", err);
     });
   };
   if (runImmediately) setTimeout(projectionTick, 5 * 1000);
@@ -676,6 +719,7 @@ module.exports = {
   TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,
   runTelegramInboundProjectionSweep,
   runTelegramConfirmedProjectionSweep,
+  runCustomExternalProofConvergenceSweep,
   maybeRunRetentionSweep,
   maybeReconcileHistoricalTeamMoney,
 };

@@ -406,7 +406,7 @@ function sameInstant(left, right) {
   return ams === bms;
 }
 
-function telegramTaskVisibleEditRequested(current, input = {}) {
+function modelInstructionVisibleEditRequested(current, input = {}) {
   const currentType = normalizeType(current?.type || "CONTENT");
   if (input.type !== undefined || input.scenario !== undefined) return true;
   if (currentType === "CONTENT") return input.contentKind !== undefined || input.dueAt !== undefined;
@@ -431,7 +431,7 @@ async function assertContentTypeMutationCompatibility({ agencyId, current, reque
   }
 }
 
-function assertTelegramTaskEditCompatibility(current, input = {}, { externalCommitFence = false } = {}) {
+function assertTelegramModelInstructionEditCompatibility(current, input = {}, { externalCommitFence = false } = {}) {
   if (!externalCommitFence) return;
   const currentType = normalizeType(current.type || "CONTENT");
   if (input.type !== undefined && normalizeType(input.type) !== currentType) {
@@ -472,16 +472,26 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
     throw fail("CUSTOM_ORDER_CONTENT_COMPLETION_AUTHORITY", "CONTENT completion is projected only from confirmed fan delivery", 409);
   }
   await assertContentTypeMutationCompatibility({ agencyId, current, requestedType, db: client });
-  let externalTaskCommitFence = current.telegramTaskMessageId != null;
-  if (!externalTaskCommitFence && telegramTaskVisibleEditRequested(current, input || {}) && client.telegramDeliveryIntent?.findFirst) {
-    const committedTask = await client.telegramDeliveryIntent.findFirst({
-      where: { agencyId, customOrderId: current.id, kind: "TASK", state: { in: ["COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"] } },
-      select: { id: true },
+  let externalModelInstructionCommitFence = current.telegramTaskMessageId != null;
+  if (!externalModelInstructionCommitFence && modelInstructionVisibleEditRequested(current, input || {}) && client.telegramDeliveryIntent?.findFirst) {
+    // Model-visible Custom fields become historical once any canonical model instruction can
+    // have reached Telegram. Historical/manual recovery may have no TASK at all, so a committed
+    // REVISION_REQUEST must fence the same business fields instead of allowing the order record
+    // to drift underneath an instruction the model is already executing. Precommit instructions
+    // remain refreshable because no provider effect has started yet.
+    const committedInstruction = await client.telegramDeliveryIntent.findFirst({
+      where: {
+        agencyId,
+        customOrderId: current.id,
+        kind: { in: ["TASK", "REVISION_REQUEST"] },
+        state: { in: ["COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"] },
+      },
+      select: { id: true, kind: true },
       orderBy: [{ commitStartedAt: "desc" }, { createdAt: "desc" }],
     });
-    externalTaskCommitFence = Boolean(committedTask);
+    externalModelInstructionCommitFence = Boolean(committedInstruction);
   }
-  assertTelegramTaskEditCompatibility(current, input || {}, { externalCommitFence: externalTaskCommitFence });
+  assertTelegramModelInstructionEditCompatibility(current, input || {}, { externalCommitFence: externalModelInstructionCommitFence });
 
   if (currentStatus !== "PENDING") {
     const nonFinancialFields = ["scenario", "internalNote", "type", "contentKind", "dueAt", "scheduledAt", "durationMinutes", "physicalStatus", "acceptedAt", "cancelReason", "mediaIds", "price", "priceCents", "reminderConfig"]

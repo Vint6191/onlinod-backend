@@ -7,6 +7,7 @@ const { isCompleteSubmission, uniqueMediaIds } = require("./custom-content-libra
 const { paymentSnapshot } = require("./custom-orders-service");
 const { hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, derivePipelineStage, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
 const { planRevisionRequestIntentForReviewedSubmission, revisionDispatchProjection } = require("./telegram-delivery-authority-service");
+const { resolveRevisionProviderBinding } = require("./custom-revision-provider-binding-authority-service");
 
 const REVIEW_WAITING = "WAITING_REVIEW";
 const REVIEW_REVISION = "REVISION_REQUESTED";
@@ -139,6 +140,26 @@ function isFinalizedForReview(row, assetByKey) {
       && customAssetMatchesPipelineProjection(row, asset, row.customOrder);
   });
 }
+function revisionDispatchBlockedError(error) {
+  return [
+    "CUSTOM_REVISION_DISPATCH_BLOCKED",
+    "CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED",
+    "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING",
+  ].includes(String(error?.code || ""));
+}
+function blockedRevisionDispatch(error) {
+  return revisionDispatchProjection(null, { blockedCode: String(error?.blockedCode || error?.code || "PROVIDER_THREAD_UNAVAILABLE") });
+}
+async function planRevisionDispatchOrBlock({ agencyId, member, submission, order, revisionNumber, now, db }) {
+  try {
+    const intent = await planRevisionRequestIntentForReviewedSubmission({ agencyId, member, submission, order, revisionNumber, now, db });
+    return { intent, projection: revisionDispatchProjection(intent) };
+  } catch (error) {
+    if (!revisionDispatchBlockedError(error)) throw error;
+    return { intent: null, projection: blockedRevisionDispatch(error) };
+  }
+}
+
 async function loadRevisionDispatchMap(db, agencyId, rows) {
   const ids = Array.from(new Set((rows || []).filter((row) => String(row.reviewStatus || "") === REVIEW_REVISION).map((row) => String(row.id)).filter(Boolean)));
   if (!ids.length || !db.telegramDeliveryIntent?.findMany) return new Map();
@@ -152,6 +173,17 @@ async function loadRevisionDispatchMap(db, agencyId, rows) {
   for (const intent of intents || []) {
     const key = String(intent.customSubmissionId || "");
     if (key && !map.has(key)) map.set(key, revisionDispatchProjection(intent));
+  }
+  for (const row of rows || []) {
+    const key = String(row?.id || "");
+    if (!key || String(row?.reviewStatus || "") !== REVIEW_REVISION || map.has(key)) continue;
+    try {
+      await resolveRevisionProviderBinding({ agencyId, orderId: row.customOrderId, submission: row, db });
+      map.set(key, revisionDispatchProjection(null));
+    } catch (error) {
+      if (!revisionDispatchBlockedError(error)) throw error;
+      map.set(key, blockedRevisionDispatch(error));
+    }
   }
   return map;
 }
@@ -363,8 +395,8 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
       if (normalizedAction === "REQUEST_REVISION" && (row.reviewComment || null) === normalizedComment) {
         const revisionContext = await loadRevisionContext(tx, agencyId, [row]);
         const context = revisionContext.get(String(row.id));
-        const intent = await planRevisionRequestIntentForReviewedSubmission({ agencyId, member, submission: row, order: row.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx });
-        return { idempotent: true, row, assetByKey, item: { ...serializeReviewItem(row, assetByKey, context), revisionDispatch: revisionDispatchProjection(intent) } };
+        const dispatch = await planRevisionDispatchOrBlock({ agencyId, member, submission: row, order: row.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx });
+        return { idempotent: true, row, assetByKey, item: { ...serializeReviewItem(row, assetByKey, context), revisionDispatch: dispatch.projection } };
       }
       throw fail("CUSTOM_REVIEW_ALREADY_DECIDED", "This submission already has a review decision", 409);
     }
@@ -399,15 +431,15 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
     if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after review", 404);
     const revisionContext = await loadRevisionContext(tx, agencyId, [updated]);
     const context = revisionContext.get(String(updated.id));
-    const revisionIntent = nextStatus === REVIEW_REVISION
-      ? await planRevisionRequestIntentForReviewedSubmission({ agencyId, member, submission: updated, order: updated.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx })
+    const revisionDispatch = nextStatus === REVIEW_REVISION
+      ? await planRevisionDispatchOrBlock({ agencyId, member, submission: updated, order: updated.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx })
       : null;
     return {
       idempotent: false,
       row: updated,
       previousRow: row,
       assetByKey,
-      item: { ...serializeReviewItem(updated, assetByKey, context), ...(revisionIntent ? { revisionDispatch: revisionDispatchProjection(revisionIntent) } : {}) },
+      item: { ...serializeReviewItem(updated, assetByKey, context), ...(revisionDispatch ? { revisionDispatch: revisionDispatch.projection } : {}) },
       nextStatus,
     };
   };

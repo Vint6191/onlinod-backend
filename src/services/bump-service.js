@@ -90,21 +90,47 @@ async function classifyBumpCustomMediaIds({ agencyId, creatorId, mediaIds, db = 
   return customIds;
 }
 
-async function activeTemplates({ agencyId, creatorId, source, db = prisma }) {
-  const rows = await db.automationTask.findMany({
-    where: { agencyId, creatorId, type: "bump_online", enabled: true, status: "active", deletedAt: null },
-    orderBy: [{ updatedAt: "desc" }, { createdAt: "asc" }],
-    take: 500,
-  });
-  const candidates = rows.map(taskToTemplate).filter((item) => triggerEnabled(item, source) && (item.text || item.mediaFiles.length));
-  const allMediaIds = candidates.flatMap((item) => item.mediaFiles);
-  const customIds = await classifyBumpCustomMediaIds({ agencyId, creatorId, mediaIds: allMediaIds, db });
+const ACTIVE_TEMPLATE_PAGE_SIZE = 200;
+
+async function activeTemplates({ agencyId, creatorId, source, eligibleLimit = null, db = prisma }) {
+  const requestedLimit = eligibleLimit == null ? null : Number(eligibleLimit);
+  const targetEligible = requestedLimit != null && Number.isFinite(requestedLimit)
+    ? Math.max(1, Math.min(500, Math.floor(requestedLimit)))
+    : null;
+  const templates = [];
   const blockedTemplateIds = [];
-  const templates = candidates.filter((item) => {
-    const blocked = item.mediaFiles.some((mediaId) => customIds.has(String(mediaId)));
-    if (blocked) blockedTemplateIds.push(item.id);
-    return !blocked;
-  });
+  let cursorId = null;
+
+  while (targetEligible == null || templates.length < targetEligible) {
+    const rows = await db.automationTask.findMany({
+      where: { agencyId, creatorId, type: "bump_online", enabled: true, status: "active", deletedAt: null },
+      orderBy: [{ updatedAt: "desc" }, { createdAt: "asc" }, { id: "asc" }],
+      take: ACTIVE_TEMPLATE_PAGE_SIZE,
+      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+    });
+    if (!rows.length) break;
+
+    cursorId = rows[rows.length - 1]?.id || null;
+    const candidates = rows
+      .map(taskToTemplate)
+      .filter((item) => triggerEnabled(item, source) && (item.text || item.mediaFiles.length));
+    const customIds = await classifyBumpCustomMediaIds({
+      agencyId, creatorId, mediaIds: candidates.flatMap((item) => item.mediaFiles), db,
+    });
+
+    for (const item of candidates) {
+      const blocked = item.mediaFiles.some((mediaId) => customIds.has(String(mediaId)));
+      if (blocked) {
+        blockedTemplateIds.push(item.id);
+        continue;
+      }
+      templates.push(item);
+      if (targetEligible != null && templates.length >= targetEligible) break;
+    }
+
+    if (rows.length < ACTIVE_TEMPLATE_PAGE_SIZE || !cursorId) break;
+  }
+
   return { templates, blockedTemplateIds };
 }
 
@@ -181,7 +207,10 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
               : true;
     if (!sourceEnabled) return { ok: true, source: normalizedSource, planned: 0, skipped: [{ code: "source_disabled" }] };
 
-    const templateSelection = await activeTemplates({ agencyId, creatorId, source: normalizedSource, db: tx });
+    const take = Math.min(settings.candidateBatchSize, Math.max(1, Number(limit) || settings.candidateBatchSize));
+    const templateSelection = await activeTemplates({
+      agencyId, creatorId, source: normalizedSource, eligibleLimit: take, db: tx,
+    });
     const templates = templateSelection.templates;
     if (!templates.length) return {
       ok: true, source: normalizedSource, planned: 0,
@@ -190,7 +219,6 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
         ...(templateSelection.blockedTemplateIds.length ? { templateIds: templateSelection.blockedTemplateIds } : {}),
       }],
     };
-    const take = Math.min(settings.candidateBatchSize, Math.max(1, Number(limit) || settings.candidateBatchSize));
     const candidates = await loadCandidates({ agencyId, creatorId, source: normalizedSource, fanIds, limit: take, db: tx });
     if (!candidates.length) return { ok: true, source: normalizedSource, planned: 0, skipped: [{ code: "no_candidates" }] };
 
@@ -885,7 +913,7 @@ async function getBumpOverview({ agencyId, creatorId, db = prisma }) {
 
   const templateCounts = {};
   for (const source of ["online", "hidden_online", "paid_subscriber", "free_subscriber", "subscription_event"]) {
-    templateCounts[source] = (await activeTemplates({ agencyId, creatorId, source, db })).templates.length;
+    templateCounts[source] = (await activeTemplates({ agencyId, creatorId, source, eligibleLimit: 500, db })).templates.length;
   }
 
   const candidateCounts = { online: 0, hidden_online: 0, paid_subscriber: 0, free_subscriber: 0 };
@@ -942,6 +970,7 @@ module.exports = {
   DELETE_ACTION,
   ACTIVE_ACTION_STATUSES,
   planBumps,
+  activeTemplates,
   planConfiguredBumpsNow,
   summarizePlanningSkips,
   recordOnlineObservations,

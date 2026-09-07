@@ -247,7 +247,7 @@ function fakeDb(seed = {}) {
           (where.id === undefined || candidate.id === where.id)
           && (where.agencyId === undefined || candidate.agencyId === where.agencyId)
           && (where.customOrderId === undefined || candidate.customOrderId === where.customOrderId)
-          && (where.kind === undefined || candidate.kind === where.kind)
+          && (where.kind === undefined || (where.kind?.in ? where.kind.in.includes(candidate.kind) : candidate.kind === where.kind))
           && (where.state === undefined || (where.state?.in ? where.state.in.includes(candidate.state) : candidate.state === where.state))
         );
         return clone(row || null);
@@ -561,7 +561,7 @@ test("V2 types keep one CustomOrder row and do not arm reminders before canonica
 });
 
 
-test("ordinary edits preserve an already scheduled reminder while policy edits restart it safely", async () => {
+test("ordinary edits preserve the current reminder while policy edits reproject from the provider-confirmed model obligation", async () => {
   const nextAt = new Date("2026-08-19T13:00:00.000Z");
   const db = fakeDb({ orders: [{
     id: "order-timer", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
@@ -571,6 +571,11 @@ test("ordinary edits preserve an already scheduled reminder while policy edits r
     reminderConfig: null, nextReminderAt: nextAt, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
     createdAt: new Date("2026-08-19T10:00:00.000Z"), updatedAt: new Date("2026-08-19T12:05:00.000Z"),
   }] });
+  db._deliveryIntents.push({
+    id: "task-order-timer", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-timer",
+    kind: "TASK", state: "CONFIRMED", accountId: "tg-1", remoteMessageId: 501, remoteRecipientTelegramUserId: "1001",
+    remoteSentAt: new Date("2026-08-19T12:05:00.000Z"), confirmedAt: new Date("2026-08-19T12:05:01.000Z"), createdAt: new Date("2026-08-19T12:05:00.000Z"),
+  });
   const edited = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { internalNote: "internal only" }, now: new Date("2026-08-19T12:20:00.000Z"), db });
   assert.equal(edited.order.nextReminderAt, nextAt.toISOString(), "internal edit must not move the reminder clock");
   await assert.rejects(
@@ -583,7 +588,7 @@ test("ordinary edits preserve an already scheduled reminder while policy edits r
     input: { reminderConfig: { enabled: true, firstAfterMinutes: 90, repeatEveryMinutes: 120 } },
     now: new Date("2026-08-19T12:30:00.000Z"), db,
   });
-  assert.equal(policyEdited.order.nextReminderAt, "2026-08-19T14:00:00.000Z", "first reminder restarts from the explicit policy edit when no reminder was sent yet");
+  assert.equal(policyEdited.order.nextReminderAt, "2026-08-19T13:35:00.000Z", "policy changes recompute timing from the canonical TASK provider receipt instead of inventing a new instruction clock");
 });
 
 test("confirmed Telegram TASK freezes every model-visible task field but keeps internal/payment edits writable", async () => {
@@ -739,4 +744,25 @@ test("cross-type generic PATCH cannot turn CALL/PHYSICAL into forged completed C
       (error) => error?.code === "CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED" && error?.status === 409,
     );
   }
+});
+
+test("historical no-TASK committed REVISION_REQUEST freezes model-visible Custom fields", async () => {
+  const updatedAt = new Date("2026-09-07T18:00:00.000Z");
+  const db = fakeDb({ orders: [{
+    id: "order-revision-frozen", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "original historical custom", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING", dueAt: new Date("2026-09-08T18:00:00Z"),
+    scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null, deliveredAt: null, fanDeliveredAt: null,
+    cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 5000, paidAmountCents: 0, telegramTaskMessageId: null, telegramReferenceMessageIds: [],
+    reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, createdAt: updatedAt, updatedAt,
+  }] });
+  db._deliveryIntents.push({
+    id: "revision-committed-no-task", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-revision-frozen", customSubmissionId: "v1",
+    kind: "REVISION_REQUEST", state: "CONFIRMED", accountId: "tg-old", remoteMessageId: 9901, remoteRecipientTelegramUserId: "900001",
+    confirmedAt: new Date("2026-09-07T18:05:00Z"), createdAt: new Date("2026-09-07T18:04:00Z"),
+  });
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-revision-frozen", input: { scenario: "silently rewritten while model works" }, db }),
+    (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE" && error?.status === 409,
+  );
+  assert.equal(db._rows[0].scenario, "original historical custom");
 });

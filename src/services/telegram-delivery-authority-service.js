@@ -8,8 +8,16 @@ const { assertTelegramRuntimeLease } = require("./telegram-execution-runtime");
 const { reconcilePendingInboundForConfirmedDelivery } = require("./telegram-inbound-authority-service");
 const { canUsePermission } = require("./team-access-control");
 const { lockActiveTelegramAccountReference } = require("./telegram-account-reference-authority-service");
+const {
+  deriveCustomModelObligation,
+  fenceCustomModelObligationTransition,
+  reminderBindingFromObligation,
+  confirmedInstruction,
+} = require("./custom-model-obligation-authority-service");
+const { resolveRevisionProviderBinding } = require("./custom-revision-provider-binding-authority-service");
+const { deriveCustomCancellationInstruction, requireCancellationProviderAnchor } = require("./custom-cancellation-instruction-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
-const { scanAllById, findPendingTaskAnchors, findCancelledTaskFollowupDebt } = require("./telegram-exact-authority-scan-service");
+const { scanAllById, findPendingModelInstructionAnchors, findCancelledModelInstructionFollowupDebt } = require("./telegram-exact-authority-scan-service");
 const {
   nextReminderForOrder,
   desiredReminderSchedule,
@@ -98,8 +106,8 @@ function publicIntent(row) {
   };
 }
 
-function revisionDispatchProjection(intent) {
-  if (!intent) return { status: "DISPATCH_REQUIRED", intentId: null, state: null, providerMessageId: null, remoteSentAt: null };
+function revisionDispatchProjection(intent, { blockedCode = null } = {}) {
+  if (!intent) return { status: blockedCode ? "DISPATCH_BLOCKED" : "DISPATCH_REQUIRED", intentId: null, state: null, providerMessageId: null, remoteSentAt: null, blockedCode: blockedCode || null };
   const state = String(intent.state || "PLANNED");
   const status = state === "CONFIRMED" ? "WAITING_MODEL"
     : state === "RECONCILE_REQUIRED" ? "DELIVERY_UNKNOWN"
@@ -111,6 +119,7 @@ function revisionDispatchProjection(intent) {
     state,
     providerMessageId: intent.remoteMessageId == null ? null : String(intent.remoteMessageId),
     remoteSentAt: intent.remoteSentAt ? new Date(intent.remoteSentAt).toISOString() : null,
+    blockedCode: null,
   };
 }
 
@@ -150,21 +159,64 @@ async function loadConfirmedTaskThread({ agencyId, orderId, db }) {
   };
 }
 
-async function resolveIntentProviderBinding({ agencyId, order, kind, db }) {
-  if (String(kind) === "TASK") {
+async function resolveCancellationProviderBinding({ agencyId, order, db }) {
+  const decision = await deriveCustomCancellationInstruction({ agencyId, order, db });
+  return requireCancellationProviderAnchor(decision);
+}
+
+async function resolveReminderProviderBinding({ agencyId, order, db }) {
+  if (String(order?.type || "CONTENT").toUpperCase() !== "CONTENT") {
+    const task = await loadConfirmedTaskThread({ agencyId, orderId: order.id, db });
+    return { ...task, obligation: null, cycleId: `TASK:${String(task.task.id)}`, replyToDeliveryId: String(task.task.id) };
+  }
+  const obligation = await deriveCustomModelObligation({ agencyId, order, db });
+  const binding = reminderBindingFromObligation(obligation);
+  if (!binding) {
+    throw fail("CUSTOM_MODEL_OBLIGATION_NOT_WAITING_RESPONSE", "The model does not currently owe a Custom content response; reminder delivery is not allowed", 409);
+  }
+  return { ...binding, obligation, replyToDeliveryId: binding.intentId };
+}
+
+async function resolveInitialReferenceProviderBinding({ agencyId, order, db }) {
+  const obligation = await deriveCustomModelObligation({ agencyId, order, db });
+  if (String(obligation?.state || "") !== "INITIAL_WAITING_RESPONSE" || obligation?.modelOwesResponse !== true || String(obligation?.currentInstruction?.kind || "") !== "TASK") {
+    throw fail("CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE", "The initial Custom model obligation is no longer waiting for a response; initial references are obsolete", 409);
+  }
+  const instruction = obligation.currentInstruction;
+  return {
+    accountId: String(instruction.accountId),
+    replyToMessageId: String(instruction.remoteMessageId),
+    recipientTelegramUserId: String(instruction.recipientTelegramUserId),
+    replyToDeliveryId: String(instruction.intentId),
+    cycleId: `TASK:${String(instruction.intentId)}`,
+    obligation,
+  };
+}
+
+async function resolveIntentProviderBinding({ agencyId, order, kind, customSubmissionId = null, db }) {
+  const normalizedKind = String(kind);
+  if (normalizedKind === "TASK") {
     return { accountId: await resolveAccountForOrder({ agencyId, order, db }), replyToMessageId: null, recipientTelegramUserId: null };
   }
+  if (normalizedKind === "REFERENCE") return resolveInitialReferenceProviderBinding({ agencyId, order, db });
+  if (normalizedKind === "REVISION_REQUEST") {
+    if (!customSubmissionId) throw fail("TELEGRAM_REVISION_DECISION_REQUIRED", "Exact reviewed submission is required for revision provider binding", 409);
+    const decision = await loadRevisionRequestDecision({ agencyId, customSubmissionId, customOrderId: order.id, db });
+    return resolveRevisionProviderBinding({ agencyId, orderId: order.id, submission: decision.submission, db });
+  }
+  if (REMINDER_KINDS.has(normalizedKind)) return resolveReminderProviderBinding({ agencyId, order, db });
+  if (normalizedKind === "CANCELLATION") return resolveCancellationProviderBinding({ agencyId, order, db });
   return loadConfirmedTaskThread({ agencyId, orderId: order.id, db });
 }
 
-async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, customSubmissionId = null, payload, now, db, _transactional = false }) {
+async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, customSubmissionId = null, payload, now, db, reactivateCancelledTask = false, _transactional = false }) {
   // New Telegram work and Telegram-account retirement contend on the same account row.
   // Running the canonical-intent reservation in one transaction lets the no-op ACTIVE
   // update below act as a row mutex: either planning wins and retirement sees the new
   // blocker, or retirement wins and planning cannot create a new intent afterwards.
   if (!_transactional && typeof db?.$transaction === "function") {
     return db.$transaction(
-      (tx) => createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, customSubmissionId, payload, now, db: tx, _transactional: true }),
+      (tx) => createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, customSubmissionId, payload, now, db: tx, reactivateCancelledTask, _transactional: true }),
       { isolationLevel: "Serializable" },
     );
   }
@@ -238,9 +290,24 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
       && String(order.status || "").toUpperCase() === "CANCELLED"
       && !order.telegramCancellationWaivedAt
   );
+  const mayReactivateCancelledTask = (existing) => Boolean(
+    reactivateCancelledTask === true
+      && existing
+      && String(kind) === "TASK"
+      && String(existing.kind) === "TASK"
+      && String(existing.state) === "CANCELLED"
+      && existing.commitStartedAt == null
+      && existing.remoteMessageId == null
+      && existing.remoteSentAt == null
+      && existing.confirmedAt == null
+      && !clean(existing.confirmationAuthority, 120)
+      && String(order.type || "CONTENT").toUpperCase() === "CONTENT"
+      && String(order.status || "PENDING").toUpperCase() === "PENDING"
+  );
+  const mayReactivateCancelled = (existing) => mayReactivateCancelledCancellation(existing) || mayReactivateCancelledTask(existing);
 
   const existing = await findCanonicalExisting();
-  if (existing && !mayReactivateCancelledCancellation(existing)) return useExisting(existing);
+  if (existing && !mayReactivateCancelled(existing)) return useExisting(existing);
 
   // NEW outbound Custom work participates in the same parent/creator retirement
   // serialization as CustomOrder/submission/provider intake. The global lock order is
@@ -252,7 +319,7 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
   // Re-read after lifecycle locks. Another transaction may have created the canonical
   // intent while we waited; preserve exactly-once identity before taking the account lock.
   const afterLifecycle = await findCanonicalExisting();
-  if (afterLifecycle && !mayReactivateCancelledCancellation(afterLifecycle)) return useExisting(afterLifecycle);
+  if (afterLifecycle && !mayReactivateCancelled(afterLifecycle)) return useExisting(afterLifecycle);
 
   await lockActiveTelegramAccountReference({
     agencyId,
@@ -271,17 +338,24 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
   // only this one safe class under the full Agency -> Creator -> TelegramAccount lifecycle fence.
   // COMMITTING/CONFIRMED outcomes are never rewritten, and no other delivery kind is resurrected.
   const cancelledCanonical = await findCanonicalExisting();
-  if (mayReactivateCancelledCancellation(cancelledCanonical)) {
+  const reactivateCancellation = mayReactivateCancelledCancellation(cancelledCanonical);
+  const reactivateTask = mayReactivateCancelledTask(cancelledCanonical);
+  if (reactivateCancellation || reactivateTask) {
     const nextRevision = Number(cancelledCanonical.claimRevision || 0) + 1;
+    const reactivationKind = reactivateCancellation ? "CANCELLATION" : "TASK";
     const changed = await db.telegramDeliveryIntent.updateMany({
       where: {
-        id: cancelledCanonical.id, agencyId, kind: "CANCELLATION", state: "CANCELLED",
+        id: cancelledCanonical.id, agencyId, kind: reactivationKind, state: "CANCELLED",
         claimRevision: Number(cancelledCanonical.claimRevision || 0), commitStartedAt: null,
+        ...(reactivateTask ? { remoteMessageId: null, remoteSentAt: null, confirmedAt: null, confirmationAuthority: null } : {}),
       },
       data: {
         accountId: String(accountId), payloadFingerprint: fingerprint, payload, state: "PLANNED",
-        deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null,
-        claimRevision: nextRevision, outcomeReason: "CANCELLATION_REACTIVATED_FOR_TERMINAL_ORDER",
+        deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, commitStartedAt: null,
+        claimRevision: nextRevision,
+        outcomeReason: reactivateCancellation
+          ? "CANCELLATION_REACTIVATED_FOR_TERMINAL_ORDER"
+          : "TASK_REACTIVATED_FOR_CURRENT_MODEL_OBLIGATION",
       },
     });
     if (Number(changed?.count || 0) === 1) {
@@ -289,7 +363,7 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
       return { row: fresh, created: false, refreshed: true, reactivated: true };
     }
     const raced = await findCanonicalExisting();
-    if (raced && !mayReactivateCancelledCancellation(raced)) return useExisting(raced);
+    if (raced && !mayReactivateCancelled(raced)) return useExisting(raced);
     throw fail("TELEGRAM_DELIVERY_INTENT_RACE", "Cancelled Telegram intent could not be reactivated from current lifecycle state", 409);
   }
 
@@ -322,6 +396,30 @@ async function findUnresolvedReminder({ agencyId, orderId, excludeIntentId = nul
   });
 }
 
+
+function initialTaskDispatchIsCurrent(obligation, { intentId = null, allowMissing = false, allowCancelled = false, allowAnyInitialState = false } = {}) {
+  const state = String(obligation?.state || "");
+  if (allowMissing && state === "NO_INSTRUCTION") return true;
+  if (allowAnyInitialState && ["INITIAL_DISPATCH_PENDING", "INITIAL_DELIVERY_UNKNOWN", "INITIAL_WAITING_RESPONSE"].includes(state)) return true;
+  if (state !== "INITIAL_DISPATCH_PENDING") return false;
+  if (intentId && String(obligation?.instructionIntentId || "") !== String(intentId)) return false;
+  const deliveryState = String(obligation?.deliveryState || "");
+  if (["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(deliveryState)) return true;
+  return allowCancelled && deliveryState === "CANCELLED";
+}
+
+async function assertInitialTaskDispatchCurrent({ agencyId, order, intentId = null, allowMissing = false, allowCancelled = false, allowAnyInitialState = false, db }) {
+  const obligation = await deriveCustomModelObligation({ agencyId, order, db });
+  if (!initialTaskDispatchIsCurrent(obligation, { intentId, allowMissing, allowCancelled, allowAnyInitialState })) {
+    throw fail(
+      "CUSTOM_MODEL_INITIAL_INSTRUCTION_NOT_REQUIRED",
+      "The current Custom model obligation no longer requires an initial TASK instruction",
+      409,
+    );
+  }
+  return obligation;
+}
+
 async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, clientIntentId = null, reference = null, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("TELEGRAM_DELIVERY_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
@@ -331,30 +429,39 @@ async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, cli
   await requireCreatorAccess({ agencyId, member, creatorId: order.creatorId, db: client });
   const status = String(order.status || "PENDING").toUpperCase();
   let binding = null; let accountId = null;
-  let identity = "one"; let normalizedClientIntentId = null; let referenceOrdinal = null; let payload;
+  let identity = "one"; let normalizedClientIntentId = null; let referenceOrdinal = null; let payload; let reactivateCancelledTask = false;
   if (normalizedKind === "TASK") {
     if (status !== "PENDING") throw fail("CUSTOM_ORDER_TELEGRAM_TASK_STATE_INVALID", "A new Telegram task can only be delivered for a pending custom order", 409);
+    const obligation = await assertInitialTaskDispatchCurrent({ agencyId, order, allowMissing: true, allowCancelled: true, allowAnyInitialState: true, db: client });
+    reactivateCancelledTask = String(obligation?.deliveryState || "") === "CANCELLED";
     binding = await resolveIntentProviderBinding({ agencyId, order, kind: normalizedKind, db: client });
     accountId = String(binding.accountId);
     payload = taskPayload(order);
   } else if (normalizedKind === "CANCELLATION") {
     if (status !== "CANCELLED") throw fail("CUSTOM_ORDER_TELEGRAM_STATUS_INVALID", "Cancellation delivery requires a cancelled custom order", 409);
-    if (order.telegramTaskMessageId == null) return { ok: true, skipped: true, reason: "TASK_NOT_DELIVERED", intent: null };
-    binding = await resolveIntentProviderBinding({ agencyId, order, kind: normalizedKind, db: client }); accountId = String(binding.accountId);
+    try {
+      binding = await resolveIntentProviderBinding({ agencyId, order, kind: normalizedKind, db: client });
+    } catch (error) {
+      if (String(error?.code || "") === "CUSTOM_CANCELLATION_MODEL_INSTRUCTION_NOT_DELIVERED") {
+        return { ok: true, skipped: true, reason: "MODEL_INSTRUCTION_NOT_DELIVERED", intent: null };
+      }
+      throw error;
+    }
+    accountId = String(binding.accountId);
     payload = { text: cancellationText(order), replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId };
   } else if (normalizedKind === "MANUAL_REMINDER") {
     if (status !== "PENDING") throw fail("CUSTOM_ORDER_REMINDER_STATE_INVALID", "Only pending custom orders can be reminded", 409);
-    if (order.telegramTaskMessageId == null) throw fail("CUSTOM_ORDER_TELEGRAM_REQUIRED", "Send the custom to Telegram before reminding the model", 409);
     const unresolvedReminder = await findUnresolvedReminder({ agencyId, orderId: order.id, db: client });
     if (unresolvedReminder) throw fail("CUSTOM_ORDER_REMINDER_OUTCOME_UNRESOLVED", "A previous reminder outcome is unresolved and must be reconciled before another reminder can be sent", 409);
     binding = await resolveIntentProviderBinding({ agencyId, order, kind: normalizedKind, db: client }); accountId = String(binding.accountId);
     normalizedClientIntentId = uuid(clientIntentId);
     identity = normalizedClientIntentId;
     const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: client });
-    payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey: `MANUAL:${normalizedClientIntentId}` };
+    const cycle = clean(binding.cycleId, 260) || `TASK:${clean(binding.replyToDeliveryId, 180)}`;
+    const reminderKey = String(order.type || "CONTENT").toUpperCase() === "CONTENT" ? `CONTENT:${cycle}:MANUAL:${normalizedClientIntentId}` : `MANUAL:${normalizedClientIntentId}`;
+    payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: binding.replyToDeliveryId || null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey };
   } else {
     if (status !== "PENDING") throw fail("CUSTOM_ORDER_REFERENCE_STATE_INVALID", "References can only be delivered for a pending custom order", 409);
-    if (order.telegramTaskMessageId == null) throw fail("CUSTOM_ORDER_TELEGRAM_TASK_REQUIRED", "Confirm the Telegram task before delivering references", 409);
     binding = await resolveIntentProviderBinding({ agencyId, order, kind: normalizedKind, db: client }); accountId = String(binding.accountId);
     normalizedClientIntentId = uuid(clientIntentId);
     const ref = reference && typeof reference === "object" ? reference : {};
@@ -364,7 +471,10 @@ async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, cli
     if (!name || !/^[0-9a-f]{64}$/.test(sha256Value) || !Number.isSafeInteger(size) || size < 0) throw fail("CUSTOM_ORDER_REFERENCE_PROOF_REQUIRED", "Reference name, size and sha256 are required");
     payload = { reference: { name, size, sha256: sha256Value }, replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId };
   }
-  const reserved = await createOrReadIntent({ agencyId, order, accountId: String(accountId), kind: normalizedKind, identity, clientIntentId: normalizedClientIntentId, referenceOrdinal, payload, now, db: client });
+  const reserved = await createOrReadIntent({
+    agencyId, order, accountId: String(accountId), kind: normalizedKind, identity, clientIntentId: normalizedClientIntentId, referenceOrdinal, payload, now, db: client,
+    reactivateCancelledTask,
+  });
   if (reserved.created) await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.telegram_delivery_plan", targetType: "TelegramDeliveryIntent", targetId: reserved.row.id, metadata: { orderId: order.id, creatorId: order.creatorId, kind: normalizedKind }, db: client });
   return { ok: true, skipped: false, created: reserved.created, intent: publicIntent(reserved.row) };
 }
@@ -377,7 +487,7 @@ async function ensureAutomaticReminderIntents({ agencyId, member, limit = 25, no
   let cursor = null;
   while (planned < take) {
     const rows = await db.customOrder.findMany({
-      where: { agencyId, ...scopeWhere(scope), status: "PENDING", telegramTaskMessageId: { not: null }, nextReminderAt: { lte: now } },
+      where: { agencyId, ...scopeWhere(scope), status: "PENDING", nextReminderAt: { lte: now } },
       include: { creator: { select: { id: true, displayName: true, username: true, telegramContact: true, telegramUserId: true, telegramAccountId: true } } },
       orderBy: [{ nextReminderAt: "asc" }, { id: "asc" }],
       take: 200,
@@ -391,24 +501,32 @@ async function ensureAutomaticReminderIntents({ agencyId, member, limit = 25, no
       if (unresolvedReminder) continue;
       let binding;
       try {
-        binding = await loadConfirmedTaskThread({ agencyId, orderId: order.id, db });
+        binding = await resolveReminderProviderBinding({ agencyId, order, db });
       } catch (error) {
         const code = String(error?.code || "");
-        // A reminder cannot be planned until the confirmed TASK thread/recipient is proven.
-        // Those are expected business-domain blockers and are exposed by the dedicated
-        // reminder-planning exception queue. Unexpected DB/invariant failures must surface;
-        // swallowing them here would turn broken durable work into a false empty scheduler.
-        if (code === "TELEGRAM_DELIVERY_TASK_THREAD_REQUIRED" || code === "TELEGRAM_DELIVERY_TASK_RECIPIENT_UNPROVEN") continue;
+        // No current model obligation is a normal business state, not a scheduler failure.
+        if (["TELEGRAM_DELIVERY_TASK_THREAD_REQUIRED", "TELEGRAM_DELIVERY_TASK_RECIPIENT_UNPROVEN", "CUSTOM_MODEL_OBLIGATION_NOT_WAITING_RESPONSE"].includes(code)) continue;
         throw error;
       }
       const accountId = String(binding.accountId);
-      const due = nextReminderForOrder(order, workspacePolicy, now, { afterAck: false });
-      const reminderKey = clean(due.key || order.lastReminderKey || (order.nextReminderAt ? `AT:${new Date(order.nextReminderAt).toISOString()}` : ""), 500);
+      const modelObligation = binding.obligation || null;
+      const due = desiredReminderSchedule(order, workspacePolicy, now, { modelObligation });
+      const reminderKey = clean(due.key, 500);
       if (!reminderKey || (due.at && due.at.getTime() > now.getTime())) continue;
-      const payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey };
+      const payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: binding.replyToDeliveryId || null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey };
       try {
-        await createOrReadIntent({ agencyId, order, accountId, kind: "AUTO_REMINDER", identity: sha256(reminderKey).slice(0, 32), payload, now, db });
-        planned += 1;
+        const reserved = await createOrReadIntent({ agencyId, order, accountId, kind: "AUTO_REMINDER", identity: sha256(reminderKey).slice(0, 32), payload, now, db });
+        // `limit` is an executable-work horizon, not a raw canonical-row horizon. A durable
+        // CONFIRMED reminder whose CustomOrder projection was lost is historical provider truth,
+        // but it must not consume this tick's planning capacity and starve a later order that
+        // still needs a new reminder intent. Conversely, a concurrent worker may win the same
+        // logical reservation between our unresolved precheck and createOrReadIntent(); if the
+        // recovered row is still proven-precommit executable work, count it because queue
+        // capacity has in fact been materialized for this order.
+        const reservedState = String(reserved?.row?.state || "");
+        if (["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(reservedState) && reserved?.row?.commitStartedAt == null) {
+          planned += 1;
+        }
       } catch (error) {
         const code = String(error?.code || "");
         // Historical versions could retire/delete the pinned TASK account before this exact
@@ -466,7 +584,7 @@ function revisionRequestText({ revisionNumber = null, reviewComment } = {}) {
 async function loadRevisionRequestDecision({ agencyId, customSubmissionId, customOrderId, db }) {
   const submission = await db.customContentSubmission.findFirst({
     where: { id: clean(customSubmissionId, 180), agencyId, customOrderId: clean(customOrderId, 180) },
-    select: { id: true, creatorId: true, customOrderId: true, pipelineDisposition: true, reviewStatus: true, reviewComment: true, reviewedAt: true, receivedAt: true, createdAt: true },
+    select: { id: true, creatorId: true, customOrderId: true, pipelineDisposition: true, reviewStatus: true, reviewComment: true, reviewedAt: true, receivedAt: true, createdAt: true, telegramSourceAccountId: true, telegramSourceUserId: true, telegramMessageIds: true },
   });
   if (!submission) throw fail("TELEGRAM_REVISION_SUBMISSION_NOT_FOUND", "Revision submission no longer exists", 409);
   if (String(submission.pipelineDisposition || "ACTIVE") !== "ACTIVE" || String(submission.reviewStatus || "") !== "REVISION_REQUESTED" || !submission.reviewComment || !submission.reviewedAt) {
@@ -486,10 +604,10 @@ async function planRevisionRequestIntentForReviewedSubmission({ agencyId, member
   if (!submission?.id || !order?.id) throw fail("TELEGRAM_REVISION_DECISION_REQUIRED", "Exact reviewed submission and Custom order are required", 409);
   if (String(order.status || "") !== "PENDING" || String(order.type || "") !== "CONTENT" || order.fanDeliveredAt) throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "Revision request requires a pending CONTENT Custom", 409);
   const decision = await loadRevisionRequestDecision({ agencyId, customSubmissionId: submission.id, customOrderId: order.id, db });
-  const binding = await loadConfirmedTaskThread({ agencyId, orderId: order.id, db });
+  const binding = await resolveRevisionProviderBinding({ agencyId, orderId: order.id, submission: decision.submission, db });
   const payload = {
     text: revisionRequestText({ revisionNumber, reviewComment: decision.submission.reviewComment }),
-    replyToDeliveryId: null,
+    replyToDeliveryId: binding.replyToDeliveryId || null,
     replyToMessageId: binding.replyToMessageId,
     recipientTelegramUserId: binding.recipientTelegramUserId,
     customSubmissionId: String(decision.submission.id),
@@ -532,9 +650,42 @@ async function refreshPrecommitIntentFromCurrentState({ row, agencyId, now = new
     return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
   }
 
+  if (kind === "TASK") {
+    try {
+      await assertInitialTaskDispatchCurrent({ agencyId, order, intentId: row.id, db });
+    } catch (error) {
+      if (String(error?.code || "") === "CUSTOM_MODEL_INITIAL_INSTRUCTION_NOT_REQUIRED") {
+        await db.telegramDeliveryIntent.updateMany({
+          where: { id: row.id, agencyId, kind: "TASK", state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), commitStartedAt: null },
+          data: {
+            state: "CANCELLED", deviceId: null, userId: null, memberId: null, accessEpoch: null,
+            claimTokenHash: null, claimUntil: null, claimRevision: Number(row.claimRevision || 0) + 1,
+            outcomeReason: "INITIAL_MODEL_OBLIGATION_SATISFIED",
+          },
+        });
+        return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+      }
+      throw error;
+    }
+  }
+
   let binding; let accountId;
-  try { binding = await resolveIntentProviderBinding({ agencyId, order, kind, db }); accountId = String(binding.accountId); }
+  try { binding = await resolveIntentProviderBinding({ agencyId, order, kind, customSubmissionId: row.customSubmissionId || null, db }); accountId = String(binding.accountId); }
   catch (error) {
+    if (REMINDER_KINDS.has(kind) && String(error?.code || "") === "CUSTOM_MODEL_OBLIGATION_NOT_WAITING_RESPONSE") {
+      await db.telegramDeliveryIntent.updateMany({
+        where: { id: row.id, agencyId, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), commitStartedAt: null },
+        data: { state: "CANCELLED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, claimRevision: Number(row.claimRevision || 0) + 1, outcomeReason: "MODEL_OBLIGATION_SATISFIED" },
+      });
+      return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+    }
+    if (kind === "REFERENCE" && String(error?.code || "") === "CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE") {
+      await db.telegramDeliveryIntent.updateMany({
+        where: { id: row.id, agencyId, kind: "REFERENCE", state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), commitStartedAt: null },
+        data: { state: "CANCELLED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, claimRevision: Number(row.claimRevision || 0) + 1, outcomeReason: "INITIAL_MODEL_OBLIGATION_SATISFIED" },
+      });
+      return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+    }
     // Missing/reassigned provider binding is not a remote effect and must not destroy D1.
     // Keep it durable but do not expose the stale account to Desktop execution.
     await db.telegramDeliveryIntent.updateMany({
@@ -548,20 +699,39 @@ async function refreshPrecommitIntentFromCurrentState({ row, agencyId, now = new
   if (kind === "TASK") {
     payload = taskPayload(order);
   } else if (kind === "CANCELLATION") {
-    if (order.telegramTaskMessageId == null) return null;
     payload = { text: cancellationText(order), replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId };
   } else if (kind === "MANUAL_REMINDER") {
-    if (!clientIntentId || order.telegramTaskMessageId == null) return null;
+    if (!clientIntentId) return null;
     identity = String(clientIntentId);
     const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
-    const reminderKey = clean(row.payload?.reminderKey, 500) || `MANUAL:${clientIntentId}`;
-    payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey };
+    const cycle = clean(binding.cycleId, 260) || `TASK:${clean(binding.replyToDeliveryId, 180)}`;
+    const contentReminder = String(order.type || "CONTENT").toUpperCase() === "CONTENT";
+    const fallbackKey = contentReminder ? `CONTENT:${cycle}:MANUAL:${clientIntentId}` : `MANUAL:${clientIntentId}`;
+    const plannedKey = clean(row.payload?.reminderKey, 500);
+    const plannedReplyToDeliveryId = clean(row.payload?.replyToDeliveryId, 180);
+    const currentReplyToDeliveryId = clean(binding.replyToDeliveryId, 180);
+    if (contentReminder && (
+      (plannedKey && plannedKey !== fallbackKey)
+      || (!plannedKey && (!plannedReplyToDeliveryId || plannedReplyToDeliveryId !== currentReplyToDeliveryId))
+    )) {
+      await db.telegramDeliveryIntent.updateMany({
+        where: { id: row.id, agencyId, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), commitStartedAt: null },
+        data: {
+          state: "CANCELLED", deviceId: null, userId: null, memberId: null, accessEpoch: null,
+          claimTokenHash: null, claimUntil: null, claimRevision: Number(row.claimRevision || 0) + 1,
+          outcomeReason: "MODEL_OBLIGATION_CYCLE_CHANGED",
+        },
+      });
+      return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+    }
+    const reminderKey = plannedKey || fallbackKey;
+    payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: binding.replyToDeliveryId || null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey };
   } else if (kind === "REFERENCE") {
-    if (!clientIntentId || order.telegramTaskMessageId == null || !row.payload?.reference || !Number.isInteger(Number(referenceOrdinal))) return null;
+    if (!clientIntentId || !row.payload?.reference || !Number.isInteger(Number(referenceOrdinal))) return null;
     identity = `slot:${Number(referenceOrdinal)}`;
     payload = { reference: row.payload.reference, replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId };
   } else if (kind === "REVISION_REQUEST") {
-    if (!row.customSubmissionId || order.telegramTaskMessageId == null) return null;
+    if (!row.customSubmissionId) return null;
     let decision;
     try { decision = await loadRevisionRequestDecision({ agencyId, customSubmissionId: row.customSubmissionId, customOrderId: order.id, db }); }
     catch (error) {
@@ -577,16 +747,15 @@ async function refreshPrecommitIntentFromCurrentState({ row, agencyId, now = new
     identity = `submission:${decision.submission.id}`;
     payload = {
       text: revisionRequestText({ revisionNumber: row.payload?.revisionNumber || null, reviewComment: decision.submission.reviewComment }),
-      replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId,
+      replyToDeliveryId: binding.replyToDeliveryId || null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId,
       customSubmissionId: String(decision.submission.id), reviewDecisionFingerprint: decision.fingerprint,
       reviewComment: String(decision.submission.reviewComment), reviewedAt: new Date(decision.submission.reviewedAt).toISOString(),
       ...(row.payload?.revisionNumber ? { revisionNumber: Number(row.payload.revisionNumber) } : {}),
     };
     customSubmissionId = String(decision.submission.id);
   } else if (kind === "AUTO_REMINDER") {
-    if (order.telegramTaskMessageId == null) return null;
     const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
-    const due = nextReminderForOrder(order, workspacePolicy, now, { afterAck: false });
+    const due = desiredReminderSchedule(order, workspacePolicy, now, { modelObligation: binding.obligation || null });
     const plannedKey = clean(row.payload?.reminderKey, 500);
     if (!plannedKey || due.key !== plannedKey || (due.at && due.at.getTime() > now.getTime())) {
       await db.telegramDeliveryIntent.updateMany({
@@ -596,13 +765,122 @@ async function refreshPrecommitIntentFromCurrentState({ row, agencyId, now = new
       return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
     }
     identity = sha256(plannedKey).slice(0, 32);
-    payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey: plannedKey };
+    payload = { text: reminderText(order, order.creator, workspacePolicy, now), replyToDeliveryId: binding.replyToDeliveryId || null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId, reminderKey: plannedKey };
   } else {
     return row;
   }
 
   const reserved = await createOrReadIntent({ agencyId, order, accountId: String(accountId), kind, identity, clientIntentId, referenceOrdinal, customSubmissionId, payload, now, db });
   return reserved.row;
+}
+
+
+function initialTaskNeedsConvergence(obligation) {
+  const state = String(obligation?.state || "");
+  if (state === "NO_INSTRUCTION") return true;
+  return state === "INITIAL_DISPATCH_PENDING" && String(obligation?.deliveryState || "") === "CANCELLED";
+}
+
+async function ensureInitialTaskIntentForOrder({ agencyId, orderId, member = null, now = new Date(), db }) {
+  const snapshot = await loadOrder({ agencyId, orderId, db });
+  if (String(snapshot.type || "CONTENT").toUpperCase() !== "CONTENT" || String(snapshot.status || "PENDING").toUpperCase() !== "PENDING") {
+    return { changed: false, reason: "ORDER_NOT_PENDING_CONTENT", intent: null };
+  }
+  const before = await deriveCustomModelObligation({ agencyId, order: snapshot, db });
+  if (!initialTaskNeedsConvergence(before)) return { changed: false, reason: before.state || "OBLIGATION_ALREADY_CONVERGED", intent: null };
+  if (!clean(snapshot.creator?.telegramContact, 160)) return { changed: false, blocked: true, reason: "CUSTOM_ORDER_TELEGRAM_CONTACT_REQUIRED", intent: null };
+  try {
+    await resolveAccountForOrder({ agencyId, order: snapshot, db });
+  } catch (error) {
+    return { changed: false, blocked: true, reason: clean(error?.code, 120) || "CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED", intent: null };
+  }
+
+  const run = async (tx) => {
+    // Keep the global lock order identical to every other Custom mutation:
+    // Agency -> Creator -> CustomOrder causal fence -> Telegram account.
+    await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: snapshot.creatorId });
+    const fence = await fenceCustomModelObligationTransition({ agencyId, orderId: snapshot.id, now, db: tx });
+    if (fence.missing) return { changed: false, reason: "ORDER_MISSING", intent: null };
+    const current = await loadOrder({ agencyId, orderId: snapshot.id, db: tx });
+    const obligation = await deriveCustomModelObligation({ agencyId, order: current, db: tx });
+    if (!initialTaskNeedsConvergence(obligation)) {
+      return { changed: false, reason: obligation.state || "OBLIGATION_CHANGED", intent: null };
+    }
+    const previousIntentId = obligation.instructionIntentId ? String(obligation.instructionIntentId) : null;
+    const previousState = String(obligation.deliveryState || "");
+    const intent = await planTaskIntentForCommittedOrder({
+      agencyId, member, order: current, now, db: tx,
+      reactivateCancelled: previousState === "CANCELLED",
+    });
+    const changed = Boolean(intent) && (
+      !previousIntentId
+      || String(intent.id) !== previousIntentId
+      || String(intent.state || "") !== previousState
+    );
+    return {
+      changed,
+      created: Boolean(intent && !previousIntentId),
+      reactivated: Boolean(intent && previousIntentId && String(intent.id) === previousIntentId && previousState === "CANCELLED" && String(intent.state) === "PLANNED"),
+      reason: intent ? "INITIAL_TASK_CONVERGED" : "INITIAL_TASK_PROVIDER_BINDING_UNAVAILABLE",
+      intent,
+    };
+  };
+  return typeof db?.$transaction === "function"
+    ? db.$transaction(run, { isolationLevel: "Serializable" })
+    : run(db);
+}
+
+async function ensureInitialTaskIntents({ agencyId, member = null, limit = 25, now = new Date(), db }) {
+  if (!db?.customOrder?.findMany) return { scanned: 0, planned: 0, reactivated: 0, blocked: 0, raced: 0, failed: 0, failures: [] };
+  const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 25)));
+  const scope = member?.id ? await allowedCreatorScope({ agencyId, member, db }) : { broad: true, creatorIds: [] };
+  const report = { scanned: 0, planned: 0, reactivated: 0, blocked: 0, raced: 0, failed: 0, failures: [] };
+  await scanAllById({
+    delegate: db.customOrder,
+    where: {
+      agencyId,
+      type: "CONTENT",
+      status: "PENDING",
+      contentSubmissions: { none: {} },
+      ...scopeWhere(scope),
+    },
+    select: { id: true, creatorId: true },
+    pageSize: 250,
+    onPage: async (rows) => {
+      for (const row of rows || []) {
+        report.scanned += 1;
+        if (report.planned + report.reactivated >= take) return true;
+        try {
+          const result = await ensureInitialTaskIntentForOrder({ agencyId, orderId: row.id, member, now, db });
+          if (result?.created) report.planned += 1;
+          else if (result?.reactivated) report.reactivated += 1;
+          else if (result?.blocked) report.blocked += 1;
+        } catch (error) {
+          const code = clean(error?.code, 120) || "CUSTOM_INITIAL_TASK_CONVERGENCE_FAILED";
+          if ([
+            "CUSTOM_ORDER_TELEGRAM_CONTACT_REQUIRED",
+            "CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED",
+            "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING",
+            "TELEGRAM_DELIVERY_ACCOUNT_FENCE_UNAVAILABLE",
+            "CREATOR_RETIRED",
+            "AGENCY_RETIRED",
+          ].includes(code)) {
+            report.blocked += 1;
+            continue;
+          }
+          if (["CUSTOM_MODEL_OBLIGATION_FENCE_CONFLICT", "TELEGRAM_DELIVERY_CONTROL_CHANGED"].includes(code)) {
+            report.raced += 1;
+            continue;
+          }
+          report.failed += 1;
+          report.failures.push({ orderId: String(row.id), code });
+        }
+      }
+      return false;
+    },
+  });
+  return report;
 }
 
 async function ensureRevisionRequestIntents({ agencyId, member = null, limit = 25, now = new Date(), db }) {
@@ -655,6 +933,7 @@ async function ensureRevisionRequestIntents({ agencyId, member = null, limit = 2
         if ([
           "TELEGRAM_DELIVERY_TASK_THREAD_REQUIRED",
           "TELEGRAM_DELIVERY_TASK_RECIPIENT_UNPROVEN",
+          "CUSTOM_REVISION_DISPATCH_BLOCKED",
           "CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED",
           "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING",
           "TELEGRAM_DELIVERY_ACCOUNT_FENCE_UNAVAILABLE",
@@ -672,6 +951,7 @@ async function ensureRevisionRequestIntents({ agencyId, member = null, limit = 2
 async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("TELEGRAM_DELIVERY_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
+  await ensureInitialTaskIntents({ agencyId, member, limit, now, db: client });
   await ensureRevisionRequestIntents({ agencyId, member, limit, now, db: client });
   await ensureAutomaticReminderIntents({ agencyId, member, limit, now, db: client });
   const scope = await allowedCreatorScope({ agencyId, member, db: client });
@@ -770,7 +1050,28 @@ function verifyCommitClaim(row, { deviceId, claimToken }) {
 async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, deviceId, now, db }) {
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db });
   const order = await loadOrder({ agencyId, orderId: row.customOrderId, db });
-  const binding = await resolveIntentProviderBinding({ agencyId, order, kind: String(row.kind), db });
+  if (String(row.kind) === "TASK") {
+    try {
+      await assertInitialTaskDispatchCurrent({ agencyId, order, intentId: row.id, db });
+    } catch (error) {
+      if (String(error?.code || "") === "CUSTOM_MODEL_INITIAL_INSTRUCTION_NOT_REQUIRED") {
+        throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "The initial model obligation was satisfied before TASK commit", 409);
+      }
+      throw error;
+    }
+  }
+  let binding;
+  try {
+    binding = await resolveIntentProviderBinding({ agencyId, order, kind: String(row.kind), customSubmissionId: row.customSubmissionId || null, db });
+  } catch (error) {
+    if (REMINDER_KINDS.has(String(row.kind)) && String(error?.code || "") === "CUSTOM_MODEL_OBLIGATION_NOT_WAITING_RESPONSE") {
+      throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "The model obligation was satisfied or changed before reminder commit", 409);
+    }
+    if (String(row.kind) === "REFERENCE" && String(error?.code || "") === "CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE") {
+      throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "The initial model obligation was satisfied before reference commit", 409);
+    }
+    throw error;
+  }
   if (String(binding.accountId) !== String(row.accountId)) {
     throw fail("TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED", "Telegram provider thread changed before commit; refresh the existing delivery intent", 409);
   }
@@ -813,9 +1114,18 @@ async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, dev
   }
   if (kind === "AUTO_REMINDER") {
     const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
-    const due = nextReminderForOrder(order, workspacePolicy, now, { afterAck: false });
+    const due = desiredReminderSchedule(order, workspacePolicy, now, { modelObligation: binding.obligation || null });
     const plannedKey = clean(row.payload?.reminderKey, 500);
-    if (!plannedKey || due.key !== plannedKey || (due.at && due.at.getTime() > now.getTime())) throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "Reminder settings changed before Telegram commit", 409);
+    if (!plannedKey || due.key !== plannedKey || (due.at && due.at.getTime() > now.getTime())) throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "Current model obligation or reminder settings changed before Telegram commit", 409);
+  }
+  if (kind === "MANUAL_REMINDER" && String(order.type || "CONTENT").toUpperCase() === "CONTENT") {
+    const clientIntentId = clean(row.clientIntentId, 180);
+    const cycle = clean(binding.cycleId, 260) || `TASK:${clean(binding.replyToDeliveryId, 180)}`;
+    const expectedKey = clientIntentId ? `CONTENT:${cycle}:MANUAL:${clientIntentId}` : null;
+    const plannedKey = clean(row.payload?.reminderKey, 500);
+    if (!expectedKey || plannedKey !== expectedKey) {
+      throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "The manual reminder belongs to an obsolete Custom model-obligation cycle", 409);
+    }
   }
   return order;
 }
@@ -996,11 +1306,22 @@ async function projectConfirmedIntent({ row, now, db }) {
     // path could have observed telegramTaskMessageId=null and therefore planned nothing. Always
     // decide cancellation from the fresh post-receipt order, never from the stale pre-write row.
     if (String(settledOrder.status) === "CANCELLED" && !settledOrder.telegramCancellationWaivedAt) {
-      const recipientTelegramUserId = clean(row.remoteRecipientTelegramUserId, 40);
-      if (!/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_TASK_RECIPIENT_UNPROVEN", "Confirmed Telegram TASK is missing its provider recipient identity", 409);
-      const payload = { text: cancellationText(settledOrder), replyToDeliveryId: null, replyToMessageId: String(remoteMessageId), recipientTelegramUserId };
-      const reserved = await createOrReadIntent({ agencyId: row.agencyId, order: settledOrder, accountId: String(row.accountId), kind: "CANCELLATION", identity: "one", payload, now: effectAt, db });
-      if (reserved.created) await audit({ agencyId: row.agencyId, actorUserId: row.userId || null, action: "custom_order.telegram_cancellation_plan", targetType: "TelegramDeliveryIntent", targetId: reserved.row.id, metadata: { orderId: settledOrder.id, creatorId: settledOrder.creatorId, reason: "TASK_SETTLED_AFTER_CANCELLATION" }, db });
+      await ensureCancellationIntentForCancelledOrder({
+        agencyId: row.agencyId, order: settledOrder, actorUserId: row.userId || null,
+        reason: "TASK_SETTLED_AFTER_CANCELLATION", now: effectAt, db,
+      });
+    }
+  } else if (kind === "REVISION_REQUEST") {
+    // The model's next obligation starts only at the provider-confirmed revision instruction.
+    // Reprojecting here anchors the new reminder cycle to this exact receipt; REQUEST_REVISION
+    // itself intentionally leaves nextReminderAt null while delivery is pending/unknown.
+    if (String(order.status) === "PENDING") {
+      await reprojectCustomReminderSchedule({ agencyId: row.agencyId, orderId: order.id, now: effectAt, firstAnchorAt: effectAt, db });
+    } else if (String(order.status) === "CANCELLED" && !order.telegramCancellationWaivedAt) {
+      await ensureCancellationIntentForCancelledOrder({
+        agencyId: row.agencyId, order, actorUserId: row.userId || null,
+        reason: "REVISION_SETTLED_AFTER_CANCELLATION", now: effectAt, db,
+      });
     }
   } else if (kind === "REFERENCE") {
     await appendConfirmedReferenceMessageId({ agencyId: row.agencyId, orderId: order.id, remoteMessageId, db });
@@ -1120,26 +1441,10 @@ async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, devic
   return { ok: true, idempotent: false, intent: publicIntent(confirmed) };
 }
 
-function reminderScheduleProjectionConverged(order, workspacePolicy, now = new Date()) {
-  const desired = desiredReminderSchedule(order, workspacePolicy, now);
-  const desiredAt = desired?.at ? new Date(desired.at) : null;
-  const actualAt = order?.nextReminderAt ? new Date(order.nextReminderAt) : null;
-  const validDesired = desiredAt && Number.isFinite(desiredAt.getTime()) ? desiredAt : null;
-  const validActual = actualAt && Number.isFinite(actualAt.getTime()) ? actualAt : null;
-  if (!validDesired) return validActual === null;
-  if (!validActual) return false;
-  const nowMs = now.getTime();
-  // Once work is already due, the exact historical due timestamp is not business truth.
-  // Any persisted due-at-or-before-now value keeps the reminder executable without a hot rewrite.
-  if (validDesired.getTime() <= nowMs && validActual.getTime() <= nowMs) return true;
-  return validDesired.getTime() === validActual.getTime();
-}
-
 async function repairConfirmedTaskReminderScheduleDebt({ agencyId, now = new Date(), db }) {
   if (!db?.telegramDeliveryIntent?.findMany || !db?.customOrder?.findMany) {
     return { scanned: 0, repaired: 0, failed: 0, failures: [] };
   }
-  const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
   let scanned = 0;
   let repaired = 0;
   const failures = [];
@@ -1162,10 +1467,12 @@ async function repairConfirmedTaskReminderScheduleDebt({ agencyId, now = new Dat
         if (String(order.creatorId) !== String(row.creatorId)) continue;
         if (order.telegramTaskMessageId == null || Number(order.telegramTaskMessageId) !== Number(row.remoteMessageId) || !order.deliveredAt) continue;
         scanned += 1;
-        if (reminderScheduleProjectionConverged(order, workspacePolicy, now)) continue;
         try {
-          await reprojectCustomReminderSchedule({ agencyId, orderId: order.id, now, db });
-          repaired += 1;
+          // Do not maintain a second "schedule converged" authority here. The live projector
+          // derives the current CONTENT model obligation (TASK vs REVISION_REQUEST vs no work)
+          // and performs the CAS write. Recovery must ask that same authority every time.
+          const result = await reprojectCustomReminderSchedule({ agencyId, orderId: order.id, now, db });
+          if (result?.changed) repaired += 1;
         } catch (error) {
           failures.push({ orderId: String(order.id), code: clean(error?.code, 120) || "CUSTOM_REMINDER_SCHEDULE_REPAIR_FAILED" });
         }
@@ -1187,8 +1494,8 @@ async function repairConfirmedTelegramDeliveryProjections({ agencyId, now = new 
   // Discovery is exact: current PENDING threads and CANCELLED follow-up debt are both cursor-drained
   // by telegram-exact-authority-scan-service before any repair limit is considered.
   const [pendingAnchors, cancelledDebt] = await Promise.all([
-    findPendingTaskAnchors({ agencyId: scopedAgencyId, db: client }),
-    findCancelledTaskFollowupDebt({ agencyId: scopedAgencyId, db: client }),
+    findPendingModelInstructionAnchors({ agencyId: scopedAgencyId, db: client }),
+    findCancelledModelInstructionFollowupDebt({ agencyId: scopedAgencyId, db: client }),
   ]);
 
   const candidates = new Map();
@@ -1241,6 +1548,7 @@ async function repairConfirmedTelegramDeliveryProjections({ agencyId, now = new 
       },
     });
   }
+
   // REFERENCE receipts are canonical too. Drain all confirmed reference intents by
   // cursor and compare them with the derived CustomOrder scalar-list in bounded pages;
   // never let a fixed first-N sample define whether projection debt exists.
@@ -1302,17 +1610,24 @@ async function repairConfirmedTelegramDeliveryProjections({ agencyId, now = new 
     });
   }
   for (const anchor of pendingAnchors || []) {
+    // Only TASK has the legacy CustomOrder telegramTaskMessageId/deliveredAt scalar projection.
+    // REVISION_REQUEST provider receipts are already canonical in TelegramDeliveryIntent and their
+    // derived reminder/thread state is repaired separately from current model obligation.
+    if (String(anchor?.kind || "") !== "TASK") continue;
     const order = anchor?.order || {};
     const remoteMessageId = Number(anchor?.remoteMessageId);
     const projectedMessageId = order.telegramTaskMessageId == null ? null : Number(order.telegramTaskMessageId);
-    // A fully-linked pending thread does not need continuous re-projection. Missing delivery anchor
-    // or a conflicting historical projection is debt and must be adjudicated from the receipt.
     if (projectedMessageId === remoteMessageId && order.deliveredAt) continue;
     candidates.set(String(anchor.id), { intentId: String(anchor.id), kind: "TASK", reason: "PENDING_TASK_PROJECTION_DEBT" });
   }
   for (const debt of cancelledDebt || []) {
-    if (!debt?.task?.id) continue;
-    candidates.set(String(debt.task.id), { intentId: String(debt.task.id), kind: "TASK", reason: "CANCELLED_TASK_FOLLOWUP_DEBT" });
+    if (debt?.unresolved || !debt?.instruction?.id || !["TASK", "REVISION_REQUEST"].includes(String(debt.instruction.kind || ""))) continue;
+    const kind = String(debt.instruction.kind);
+    candidates.set(String(debt.instruction.id), {
+      intentId: String(debt.instruction.id),
+      kind,
+      reason: kind === "REVISION_REQUEST" ? "CANCELLED_REVISION_FOLLOWUP_DEBT" : "CANCELLED_TASK_FOLLOWUP_DEBT",
+    });
   }
 
   let repaired = 0;
@@ -1346,6 +1661,133 @@ async function repairConfirmedTelegramDeliveryProjections({ agencyId, now = new 
   };
 }
 
+
+const MODEL_COMMUNICATION_PRECOMMIT_KINDS = ["TASK", "REFERENCE", "REVISION_REQUEST", "AUTO_REMINDER", "MANUAL_REMINDER"];
+
+async function repairCustomModelCommunicationConvergence({ agencyId, now = new Date(), db = null } = {}) {
+  const client = db || require("../prisma");
+  const scopedAgencyId = clean(agencyId, 180);
+  if (!scopedAgencyId) throw fail("CUSTOM_MODEL_COMMUNICATION_REPAIR_AGENCY_REQUIRED", "agencyId is required for Custom model communication repair");
+
+  const report = {
+    ok: true,
+    initialTaskIntentsPlanned: 0, initialTaskIntentsReactivated: 0, initialTaskIntentsBlocked: 0, initialTaskIntentsRaced: 0, initialTaskIntentsFailed: 0, initialTaskIntentFailures: [],
+    revisionIntentsPlanned: 0, precommitScanned: 0, precommitCancelled: 0,
+    precommitRefreshed: 0, precommitFailed: 0, precommitFailures: [],
+    reminderScheduleScanned: 0, reminderScheduleRepaired: 0, reminderScheduleFailed: 0, reminderScheduleFailures: [],
+  };
+
+  // Initial TASK is the first model-visible obligation. Historical/manual response overrides may
+  // have proven a precommit TASK obsolete, and reassignment can later make that order need a model
+  // response again. Missing or proven-no-effect TASK rows therefore converge server-side before
+  // reminders/references are considered. Unknown/committing/confirmed outcomes are never rewritten.
+  const initialTaskRepair = await ensureInitialTaskIntents({ agencyId: scopedAgencyId, member: null, limit: 100, now, db: client });
+  report.initialTaskIntentsPlanned = Number(initialTaskRepair?.planned || 0);
+  report.initialTaskIntentsReactivated = Number(initialTaskRepair?.reactivated || 0);
+  report.initialTaskIntentsBlocked = Number(initialTaskRepair?.blocked || 0);
+  report.initialTaskIntentsRaced = Number(initialTaskRepair?.raced || 0);
+  report.initialTaskIntentsFailed = Number(initialTaskRepair?.failed || 0);
+  report.initialTaskIntentFailures = Array.isArray(initialTaskRepair?.failures) ? initialTaskRepair.failures : [];
+
+  // Historical REVISION_REQUESTED decisions are business facts. Materialize only a PLANNED
+  // provider intent when the canonical binding authority can prove a thread; blocked rows remain
+  // blocked and never gain synthetic delivery success. Repeated scheduler passes drain batches.
+  report.revisionIntentsPlanned = await ensureRevisionRequestIntents({
+    agencyId: scopedAgencyId, member: null, limit: 100, now, db: client,
+  });
+
+  // Old versions could leave precommit model communication executable after the causal obligation
+  // changed. Reuse the exact live refresh authority instead of inventing migration-only semantics.
+  if (client.telegramDeliveryIntent?.findMany) {
+    await scanAllById({
+      delegate: client.telegramDeliveryIntent,
+      where: {
+        agencyId: scopedAgencyId,
+        kind: { in: MODEL_COMMUNICATION_PRECOMMIT_KINDS },
+        state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] },
+        commitStartedAt: null,
+      },
+      select: {
+        id: true, agencyId: true, creatorId: true, customOrderId: true, customSubmissionId: true, accountId: true, kind: true, state: true,
+        clientIntentId: true, referenceOrdinal: true, payload: true, outcomeReason: true, claimRevision: true, commitStartedAt: true, createdAt: true, updatedAt: true,
+      },
+      pageSize: 250,
+      onPage: async (rows) => {
+        for (const row of rows || []) {
+          report.precommitScanned += 1;
+          try {
+            const beforeState = String(row.state || "");
+            const beforeReason = String(row.outcomeReason || "");
+            const refreshed = await refreshPrecommitIntentFromCurrentState({ row, agencyId: scopedAgencyId, now, db: client });
+            const current = refreshed || await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId: scopedAgencyId } });
+            if (String(current?.state || "") === "CANCELLED" && beforeState !== "CANCELLED") report.precommitCancelled += 1;
+            else if (current && (String(current.state || "") !== beforeState || String(current.outcomeReason || "") !== beforeReason)) report.precommitRefreshed += 1;
+            if (String(row.kind) === "REVISION_REQUEST" && String(current?.state || "") === "CANCELLED") {
+              const cancelledOrder = await client.customOrder.findFirst({ where: { id: row.customOrderId, agencyId: scopedAgencyId, status: "CANCELLED" } });
+              if (cancelledOrder && !cancelledOrder.telegramCancellationWaivedAt) {
+                await ensureCancellationIntentForCancelledOrder({
+                  agencyId: scopedAgencyId, order: cancelledOrder, actorUserId: null,
+                  reason: "REVISION_PRECOMMIT_CANCELLED_AFTER_ORDER_CANCELLATION", now, db: client,
+                });
+              }
+            }
+          } catch (error) {
+            report.precommitFailed += 1;
+            report.precommitFailures.push({ intentId: String(row.id), code: clean(error?.code, 120) || "CUSTOM_MODEL_PRECOMMIT_REPAIR_FAILED" });
+          }
+        }
+        return false;
+      },
+    });
+  }
+
+  const repairedOrderIds = new Set();
+  const repairOrder = async (orderId) => {
+    const id = clean(orderId, 180);
+    if (!id || repairedOrderIds.has(id)) return;
+    repairedOrderIds.add(id);
+    report.reminderScheduleScanned += 1;
+    try {
+      const result = await reprojectCustomReminderSchedule({ agencyId: scopedAgencyId, orderId: id, now, db: client });
+      if (result?.changed) report.reminderScheduleRepaired += 1;
+    } catch (error) {
+      report.reminderScheduleFailed += 1;
+      report.reminderScheduleFailures.push({ orderId: id, code: clean(error?.code, 120) || "CUSTOM_MODEL_REMINDER_REPAIR_FAILED" });
+    }
+  };
+
+  // Any still-armed CONTENT schedule is migration debt candidate: current obligation decides
+  // whether it stays armed, moves to a revision clock, or clears. Rows converge out of this scan.
+  if (client.customOrder?.findMany) {
+    await scanAllById({
+      delegate: client.customOrder,
+      where: { agencyId: scopedAgencyId, type: "CONTENT", status: "PENDING", nextReminderAt: { not: null } },
+      select: { id: true },
+      pageSize: 250,
+      onPage: async (rows) => { for (const row of rows || []) await repairOrder(row.id); return false; },
+    });
+  }
+
+  // A confirmed instruction can require a schedule even when the old scalar projection is null.
+  // Include REVISION_REQUEST explicitly so historical source-thread revisions without a TASK are
+  // recoverable after a crash between provider confirmation and schedule projection.
+  if (client.telegramDeliveryIntent?.findMany) {
+    await scanAllById({
+      delegate: client.telegramDeliveryIntent,
+      where: {
+        agencyId: scopedAgencyId, kind: { in: ["TASK", "REVISION_REQUEST"] }, state: "CONFIRMED",
+        remoteMessageId: { not: null }, customOrderId: { not: null },
+      },
+      select: { id: true, customOrderId: true },
+      pageSize: 250,
+      onPage: async (rows) => { for (const row of rows || []) await repairOrder(row.customOrderId); return false; },
+    });
+  }
+
+  report.ok = report.initialTaskIntentsFailed === 0 && report.precommitFailed === 0 && report.reminderScheduleFailed === 0;
+  return report;
+}
+
 async function markTelegramDeliveryProvenNotSent({ agencyId, member, intentId, deviceId, claimToken, reason, db = null } = {}) {
   const client = db || require("../prisma"); const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
   if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
@@ -1370,6 +1812,15 @@ async function markTelegramDeliveryProvenNotSent({ agencyId, member, intentId, d
   if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_PROVEN_NOT_SENT_RACE", "Telegram delivery changed while recording proven no-effect", 409);
   const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
   await audit({ agencyId, actorUserId: member?.userId || row.userId || null, action: "custom_order.telegram_delivery_proven_not_sent", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, reason: justification, orphanCustomOrder: orphan }, db: client });
+  if (!orphan) {
+    const cancelledOrder = await client.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, status: "CANCELLED" } });
+    if (cancelledOrder && !cancelledOrder.telegramCancellationWaivedAt) {
+      await ensureCancellationIntentForCancelledOrder({
+        agencyId, order: cancelledOrder, actorUserId: member?.userId || row.userId || null,
+        reason: `${String(row.kind)}_PROVEN_NOT_SENT_AFTER_CANCELLATION`, now: new Date(), db: client,
+      });
+    }
+  }
   return { ok: true, idempotent: false, intent: publicIntent(fresh) };
 }
 
@@ -1746,7 +2197,10 @@ async function listTelegramReminderPlanningBlockedQueue({ agencyId, member, limi
         agencyId,
         ...scopeWhere(scope),
         status: "PENDING",
-        telegramTaskMessageId: { not: null },
+        // CONTENT reminder eligibility belongs to the current model obligation, not to the
+        // legacy TASK scalar projection. Historical no-TASK revisions can own the current
+        // provider-confirmed obligation and must remain visible when reminder planning is
+        // blocked. The authority check below filters orders that no longer owe model work.
         nextReminderAt: { lte: now },
       },
       include: { creator: { select: { id: true, displayName: true, username: true, avatarUrl: true, deletedAt: true, telegramContact: true, telegramAccountId: true } } },
@@ -1758,18 +2212,18 @@ async function listTelegramReminderPlanningBlockedQueue({ agencyId, member, limi
     for (const order of rows) {
       scanCursor = String(order.id);
       if (await findUnresolvedReminder({ agencyId, orderId: order.id, db: client })) continue;
-      const due = nextReminderForOrder(order, workspacePolicy, now, { afterAck: false });
-      if (!clean(due?.key, 500) || (due?.at && new Date(due.at).getTime() > now.getTime())) continue;
-
       let thread = null;
       let blockedCode = null;
       try {
-        thread = await loadConfirmedTaskThread({ agencyId, orderId: order.id, db: client });
+        thread = await resolveReminderProviderBinding({ agencyId, order, db: client });
       } catch (error) {
         const code = String(error?.code || "");
+        if (code === "CUSTOM_MODEL_OBLIGATION_NOT_WAITING_RESPONSE") continue;
         if (code === "TELEGRAM_DELIVERY_TASK_THREAD_REQUIRED" || code === "TELEGRAM_DELIVERY_TASK_RECIPIENT_UNPROVEN") blockedCode = code;
         else throw error;
       }
+      const due = desiredReminderSchedule(order, workspacePolicy, now, { modelObligation: thread?.obligation || null });
+      if (!clean(due?.key, 500) || (due?.at && new Date(due.at).getTime() > now.getTime())) continue;
 
       let accountId = thread?.accountId ? String(thread.accountId) : null;
       if (!blockedCode && thread) {
@@ -1883,6 +2337,15 @@ async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, res
       });
       if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram delivery changed during reconciliation", 409);
       await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_delivery_manual_reconcile_not_sent", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, reason: justification, orphanCustomOrder: orphan }, db: tx, required: true });
+      if (!orphan) {
+        const cancelledOrder = await tx.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, status: "CANCELLED" } });
+        if (cancelledOrder && !cancelledOrder.telegramCancellationWaivedAt) {
+          await ensureCancellationIntentForCancelledOrder({
+            agencyId, order: cancelledOrder, actorUserId: member?.userId || null,
+            reason: `${String(row.kind)}_MANUAL_PROVEN_NOT_SENT_AFTER_CANCELLATION`, now, db: tx,
+          });
+        }
+      }
       return tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
     }, { isolationLevel: "Serializable" });
     if (mode === "CONFIRMED") await reconcileInboundAfterConfirmedReceipt({ row: fresh, member, now, db: client });
@@ -1893,23 +2356,77 @@ async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, res
   }
 }
 
-async function planTaskIntentForCommittedOrder({ agencyId, member, order, now = new Date(), db }) {
+async function planTaskIntentForCommittedOrder({ agencyId, member, order, now = new Date(), db, reactivateCancelled = false }) {
   if (!order || String(order.status) !== "PENDING" || !clean(order.creator?.telegramContact, 160)) return null;
+  let obligation;
+  try {
+    obligation = await assertInitialTaskDispatchCurrent({ agencyId, order, allowMissing: true, allowCancelled: reactivateCancelled === true, allowAnyInitialState: true, db });
+  } catch (error) {
+    if (String(error?.code || "") === "CUSTOM_MODEL_INITIAL_INSTRUCTION_NOT_REQUIRED") return null;
+    throw error;
+  }
+  if (String(obligation?.deliveryState || "") === "CANCELLED" && reactivateCancelled !== true) return null;
   let accountId;
   try { accountId = await resolveAccountForOrder({ agencyId, order, db }); } catch { return null; }
   const payload = taskPayload(order);
-  const reserved = await createOrReadIntent({ agencyId, order, accountId: String(accountId), kind: "TASK", identity: "one", payload, now, db });
-  if (reserved.created) await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_task_plan", targetType: "TelegramDeliveryIntent", targetId: reserved.row.id, metadata: { orderId: order.id, creatorId: order.creatorId }, db });
+  const reserved = await createOrReadIntent({
+    agencyId, order, accountId: String(accountId), kind: "TASK", identity: "one", payload, now, db,
+    reactivateCancelledTask: reactivateCancelled === true,
+  });
+  if (reserved.created || reserved.reactivated) {
+    await audit({
+      agencyId, actorUserId: member?.userId || null,
+      action: reserved.reactivated ? "custom_order.telegram_task_reactivate" : "custom_order.telegram_task_plan",
+      targetType: "TelegramDeliveryIntent", targetId: reserved.row.id,
+      metadata: { orderId: order.id, creatorId: order.creatorId, causalAuthority: reserved.reactivated ? "CURRENT_MODEL_OBLIGATION" : "ORDER_COMMIT" },
+      db,
+    });
+  }
+  return reserved.row;
+}
+
+async function ensureCancellationIntentForCancelledOrder({ agencyId, order, actorUserId = null, reason = "CUSTOM_ORDER_CANCELLED", now = new Date(), db }) {
+  if (!order || String(order.status) !== "CANCELLED" || order.telegramCancellationWaivedAt) return null;
+  let binding;
+  try {
+    binding = await resolveCancellationProviderBinding({ agencyId, order, db });
+  } catch (error) {
+    // Business cancellation is allowed to win while a model instruction outcome is unknown.
+    // Follow-up delivery waits for that provider fact; CONFIRMED / PROVEN_NOT_SENT settlement
+    // re-enters this same authority. No provider outcome is guessed here.
+    if ([
+      "CUSTOM_CANCELLATION_MODEL_INSTRUCTION_NOT_DELIVERED",
+      "CUSTOM_CANCELLATION_INSTRUCTION_OUTCOME_UNRESOLVED",
+    ].includes(String(error?.code || ""))) return null;
+    throw error;
+  }
+  const payload = {
+    text: cancellationText(order),
+    replyToDeliveryId: null,
+    replyToMessageId: binding.replyToMessageId,
+    recipientTelegramUserId: binding.recipientTelegramUserId,
+  };
+  const reserved = await createOrReadIntent({
+    agencyId, order, accountId: binding.accountId, kind: "CANCELLATION", identity: "one", payload, now, db,
+  });
+  if (reserved.created || reserved.reactivated || reserved.refreshed) {
+    await audit({
+      agencyId, actorUserId, action: "custom_order.telegram_cancellation_plan",
+      targetType: "TelegramDeliveryIntent", targetId: reserved.row.id,
+      metadata: {
+        orderId: order.id, creatorId: order.creatorId, reason,
+        instructionKind: binding.anchorKind, instructionIntentId: binding.instructionIntentId || null,
+      },
+      db,
+    });
+  }
   return reserved.row;
 }
 
 async function planCancellationIntentForCommittedOrder({ agencyId, member, order, now = new Date(), db }) {
-  if (!order || String(order.status) !== "CANCELLED" || order.telegramTaskMessageId == null || order.telegramCancellationWaivedAt) return null;
-  const binding = await loadConfirmedTaskThread({ agencyId, orderId: order.id, db });
-  const payload = { text: cancellationText(order), replyToDeliveryId: null, replyToMessageId: binding.replyToMessageId, recipientTelegramUserId: binding.recipientTelegramUserId };
-  const reserved = await createOrReadIntent({ agencyId, order, accountId: binding.accountId, kind: "CANCELLATION", identity: "one", payload, now, db });
-  if (reserved.created) await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_cancellation_plan", targetType: "TelegramDeliveryIntent", targetId: reserved.row.id, metadata: { orderId: order.id, creatorId: order.creatorId }, db });
-  return reserved.row;
+  return ensureCancellationIntentForCancelledOrder({
+    agencyId, order, actorUserId: member?.userId || null, reason: "CUSTOM_ORDER_CANCELLED", now, db,
+  });
 }
 
 module.exports = {
@@ -1924,12 +2441,14 @@ module.exports = {
   planRevisionRequestIntentForReviewedSubmission,
   revisionDecisionFingerprint,
   ensureAutomaticReminderIntents,
+  ensureInitialTaskIntents,
   ensureRevisionRequestIntents,
   listTelegramDeliveryWork,
   claimTelegramDeliveryIntent,
   beginTelegramDeliveryIntent,
   confirmTelegramDeliveryIntent,
   repairConfirmedTelegramDeliveryProjections,
+  repairCustomModelCommunicationConvergence,
   markTelegramDeliveryUnknown,
   markTelegramDeliveryProvenNotSent,
   failTelegramDeliveryPrecommit,

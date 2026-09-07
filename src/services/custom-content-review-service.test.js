@@ -361,3 +361,56 @@ test("review queue exposes lossless cursor continuation beyond the first UI page
   assert.equal(new Set(all).size, 120);
   assert.equal(all[119], "review-page-119");
 });
+
+test("historical reviewed submission without TASK plans revision against its pinned Telegram source thread", async () => {
+  const { db, member, row, intents } = fixture();
+  intents.splice(0, intents.length); // no canonical TASK exists for this historical import
+  row.telegramSourceAccountId = "tg-1";
+  row.telegramSourceUserId = "900001";
+  row.telegramMessageIds = [101, 102];
+  const result = await reviewCustomContentSubmission({
+    agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Redo the historical version", db,
+  });
+  assert.equal(result.item.reviewStatus, "REVISION_REQUESTED");
+  assert.equal(result.item.revisionDispatch.status, "DISPATCH_PENDING");
+  const revision = intents.find((intent) => intent.kind === "REVISION_REQUEST");
+  assert.ok(revision);
+  assert.equal(revision.accountId, "tg-1");
+  assert.equal(revision.payload.replyToMessageId, "102");
+  assert.equal(revision.payload.recipientTelegramUserId, "900001");
+  assert.equal(revision.payload.replyToDeliveryId, null, "pinned provider source is not fabricated into a TASK delivery id");
+});
+
+test("revision decision remains durable as DISPATCH_BLOCKED without TASK/source and materializes after provider binding repair", async () => {
+  const { db, member, row, intents } = fixture();
+  intents.splice(0, intents.length);
+  row.telegramSourceAccountId = null;
+  row.telegramSourceUserId = null;
+  row.telegramMessageIds = [101, 102];
+
+  const blocked = await reviewCustomContentSubmission({
+    agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Revision still required", db,
+  });
+  assert.equal(row.reviewStatus, "REVISION_REQUESTED", "manager quality decision must commit independently of provider dispatch capability");
+  assert.equal(blocked.item.revisionDispatch.status, "DISPATCH_BLOCKED");
+  assert.equal(blocked.item.revisionDispatch.blockedCode, "TASK_AND_PINNED_SOURCE_UNAVAILABLE");
+  assert.equal(intents.filter((intent) => intent.kind === "REVISION_REQUEST").length, 0);
+
+  const queue = await listCustomContentReviewQueue({ agencyId: "agency-1", member, status: "REVISION_REQUESTED", db, limit: 50 });
+  assert.equal(queue.items.length, 1);
+  assert.equal(queue.items[0].revisionDispatch.status, "DISPATCH_BLOCKED");
+  assert.equal(queue.items[0].revisionDispatch.blockedCode, "TASK_AND_PINNED_SOURCE_UNAVAILABLE");
+
+  row.telegramSourceAccountId = "tg-1";
+  row.telegramSourceUserId = "900001";
+  row.telegramMessageIds = [101, 444];
+  const repaired = await reviewCustomContentSubmission({
+    agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Revision still required", db,
+  });
+  assert.equal(repaired.idempotent, true);
+  assert.equal(repaired.item.revisionDispatch.status, "DISPATCH_PENDING");
+  const revision = intents.filter((intent) => intent.kind === "REVISION_REQUEST");
+  assert.equal(revision.length, 1);
+  assert.equal(revision[0].payload.replyToMessageId, "444");
+  assert.equal(revision[0].payload.recipientTelegramUserId, "900001");
+});

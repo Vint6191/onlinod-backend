@@ -9,6 +9,9 @@ const { canUsePermission } = require("./team-access-control");
 const { confirmedRelayResult } = require("./custom-relay-result-proof-service");
 const { providerMessageEventId, resolveTelegramCustomThread, targetAllowedByThreadContext } = require("./custom-telegram-thread-authority-service");
 const { lockActiveTelegramAccountReference } = require("./telegram-account-reference-authority-service");
+const { fenceCustomModelObligationTransition, supersedePrecommitInitialReferences } = require("./custom-model-obligation-authority-service");
+const { adjudicateHumanModelResponseOverride } = require("./custom-model-instruction-override-authority-service");
+const { reprojectCustomReminderSchedule } = require("./custom-order-reminders");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
@@ -242,7 +245,7 @@ async function runSubmissionTransaction(client, work) {
   return typeof client?.$transaction === "function" ? client.$transaction(work) : work(client);
 }
 
-async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, excludeSubmissionId = null, revisionSourceIntentId = null, revisionSentAt = null, allowUnprovenRevision = false, db }) {
+async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, excludeSubmissionId = null, revisionSourceIntentId = null, revisionSentAt = null, humanOverridePrecheck = false, db }) {
   if (!customOrderId) return;
   const exclude = excludeSubmissionId ? { id: { not: excludeSubmissionId } } : {};
   const approved = await db.customContentSubmission.findFirst({
@@ -261,7 +264,10 @@ async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOr
   if (String(latest.reviewStatus || REVIEW_WAITING) !== REVIEW_REVISION) {
     throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "This custom order already has an active content submission awaiting manager review", 409);
   }
-  if (allowUnprovenRevision) return;
+  // Human recovery paths may pass the structural lifecycle precheck without automatic revision
+  // causality, but they MUST call adjudicateHumanModelResponseOverride() inside the final write
+  // transaction before binding the response. This flag is precheck-only and has no commit authority.
+  if (humanOverridePrecheck) return;
   const revisionIntent = db.telegramDeliveryIntent?.findFirst ? await db.telegramDeliveryIntent.findFirst({
     where: { agencyId, customOrderId, customSubmissionId: latest.id, kind: "REVISION_REQUEST", state: "CONFIRMED" },
     select: { id: true, remoteSentAt: true, confirmedAt: true },
@@ -344,7 +350,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
       });
 
       const target = await validateContentOrder({ agencyId, creatorId, customOrderId, db: tx });
-      await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, allowUnprovenRevision: true, db: tx });
+      await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, humanOverridePrecheck: true, db: tx });
 
       // Re-evaluate the CURRENT active-thread context inside the same transaction that claims
       // provider messages. A unique/ambiguous active thread may constrain a historical import;
@@ -398,7 +404,12 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
         assertManualImportTargetMatches(row, customOrderId);
       } else {
         await bindContentOrderForSubmission({ agencyId, creatorId, customOrderId, now, db: tx });
-        await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, allowUnprovenRevision: true, db: tx });
+        await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, humanOverridePrecheck: true, db: tx });
+        await adjudicateHumanModelResponseOverride({
+          agencyId, creatorId, customOrderId, actorUserId: member.userId || null,
+          context: "MANUAL_HISTORICAL_IMPORT", now, db: tx,
+        });
+        await supersedePrecommitInitialReferences({ agencyId, orderId: customOrderId, now, reason: "MANUAL_HISTORICAL_RESPONSE_ACCEPTED", db: tx });
         row = await tx.customContentSubmission.create({ data: {
           id: submissionId, agencyId, creatorId, customOrderId,
           telegramMessageIds: messageIds,
@@ -441,6 +452,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
       });
       return { deduped: false, row };
     }, { isolationLevel: "Serializable" });
+    await reprojectModelObligationScheduleIfAvailable({ agencyId, orderId: result.row?.customOrderId, now, db: client });
     return { ok: true, deduped: result.deduped === true, submission: serializeSubmission(result.row) };
   } catch (error) {
     if (String(error?.code || "") === "P2034") throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_RACE", "Telegram provider source changed concurrently; retry from fresh state", 409);
@@ -540,6 +552,7 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
     if (Number(changed?.count || 0) !== 1) return createCustomContentSubmissionFromInboundEvent({ eventId: event.id, actorUserId, now, db: client, _sourceLockHeld });
     await client.telegramInboundEvent.updateMany({ where: { id: event.id, submissionId: null }, data: { submissionId: existing.id } });
     const updated = await client.customContentSubmission.findFirst({ where: { id: existing.id, agencyId: event.agencyId } });
+    await reprojectModelObligationScheduleIfAvailable({ agencyId: event.agencyId, orderId: updated?.customOrderId, now, db: client });
     return { ok: true, deduped: false, submission: serializeSubmission(updated), sourceEventId: event.id };
   }
 
@@ -570,6 +583,8 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
       if (customOrderId) {
         await bindContentOrderForSubmission({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, now, db: tx });
         await validateSubmissionLifecycleTarget({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, revisionSourceIntentId: event.threadAnchorIntentId || null, revisionSentAt: event.sentAt || now, db: tx });
+        await fenceCustomModelObligationTransition({ agencyId: event.agencyId, orderId: customOrderId, now, db: tx });
+        await supersedePrecommitInitialReferences({ agencyId: event.agencyId, orderId: customOrderId, now, reason: "PROVIDER_RESPONSE_ACCEPTED", db: tx });
       }
       return tx.customContentSubmission.create({ data: {
         id: submissionId,
@@ -604,7 +619,13 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
     if (freshEvent?.submissionId && freshEvent.submissionId !== row.id) throw fail("CUSTOM_SUBMISSION_INBOUND_EVENT_REUSED", "Telegram inbound event already belongs to another submission", 409);
   }
   await audit({ agencyId: event.agencyId, actorUserId, action: "custom_content_submission.create_from_telegram_inbound", targetType: "CustomContentSubmission", targetId: row.id, metadata: { creatorId: row.creatorId, customOrderId: row.customOrderId || null, telegramInboundEventId: event.id, telegramMessageId: Number(event.messageId), sourceKey }, db: client });
+  await reprojectModelObligationScheduleIfAvailable({ agencyId: event.agencyId, orderId: row.customOrderId, now, db: client });
   return { ok: true, deduped: false, submission: serializeSubmission(row), sourceEventId: event.id };
+}
+
+async function reprojectModelObligationScheduleIfAvailable({ agencyId, orderId, now, db }) {
+  if (!orderId || !db?.workspaceSetting?.findUnique || !db?.telegramDeliveryIntent?.findFirst) return;
+  await reprojectCustomReminderSchedule({ agencyId, orderId, now, db });
 }
 
 async function listCustomContentSubmissions({ agencyId, member, creatorId, customOrderId = undefined, unassigned = false, limit = 100, offset = 0, db = null } = {}) {
@@ -646,7 +667,7 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   if (String(row.reviewStatus || REVIEW_WAITING) !== REVIEW_WAITING) {
     throw fail("CUSTOM_SUBMISSION_REVIEW_LOCKED", "Reviewed submissions cannot be reassigned", 409);
   }
-  await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, allowUnprovenRevision: true, db: client });
+  await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, humanOverridePrecheck: true, db: client });
   let updated;
   try {
     updated = await runSubmissionTransaction(client, async (tx) => {
@@ -654,7 +675,16 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
       await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: row.creatorId });
       if (normalizedOrderId) {
         await bindContentOrderForSubmission({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, now, db: tx });
-        await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, allowUnprovenRevision: true, db: tx });
+        await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, humanOverridePrecheck: true, db: tx });
+      }
+      if (row.customOrderId) await fenceCustomModelObligationTransition({ agencyId, orderId: row.customOrderId, now, db: tx });
+      if (normalizedOrderId) {
+        await adjudicateHumanModelResponseOverride({
+          agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id,
+          actorUserId: member.userId || null, context: "MANUAL_SUBMISSION_ASSIGNMENT",
+          now: new Date(new Date(now).getTime() + 1), db: tx,
+        });
+        await supersedePrecommitInitialReferences({ agencyId, orderId: normalizedOrderId, now: new Date(new Date(now).getTime() + 2), reason: "MANUAL_RESPONSE_ASSIGNMENT_ACCEPTED", db: tx });
       }
       const changed = await tx.customContentSubmission.updateMany({
         where: { id: row.id, agencyId, pipelineDisposition: ACTIVE, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
@@ -678,6 +708,8 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
     metadata: { creatorId: row.creatorId, fromCustomOrderId: row.customOrderId || null, toCustomOrderId: normalizedOrderId },
     db: client,
   });
+  await reprojectModelObligationScheduleIfAvailable({ agencyId, orderId: row.customOrderId, now, db: client });
+  await reprojectModelObligationScheduleIfAvailable({ agencyId, orderId: normalizedOrderId, now, db: client });
   if (Array.isArray(updated.telegramMessageIds) && updated.telegramMessageIds.length > 0
       && ofMediaIds(updated.ofMediaIds).length === updated.telegramMessageIds.length) {
     // Best-effort immediate provenance refresh for already-finalized submissions.
@@ -1556,6 +1588,7 @@ module.exports = {
   listCustomContentSubmissions,
   nextUploadIndex,
   pendingFinalizeRows,
+  recoverConfirmedRelayProjectionForSubmission,
   reportCustomContentSubmissionExecutionAttempt,
   reserveCustomContentSubmissionRelayWrite,
   closeCustomContentSubmissionRelayWriteUnresolved,
