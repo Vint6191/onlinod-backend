@@ -72,7 +72,8 @@ test("agency removal revokes live access but preserves creator history transacti
   const source = read("routes/creators.js");
   const removal = source.slice(source.indexOf('router.delete("/:id"'), source.indexOf('router.post("/:id/complete-connection"'));
   assert.match(removal, /prisma\.\$transaction/);
-  assert.match(removal, /agencyMember\.findMany/);
+  assert.match(removal, /scanRowsById/);
+  assert.doesNotMatch(removal, /take:\s*10000/, "creator retirement cleanup must scan member/invitation assignments to exhaustion");
   assert.match(removal, /removeCreatorFromAssignedCreators/);
   assert.match(removal, /agencyMember\.update/);
   assert.match(removal, /retireCreatorCryptoMaterialOnRemoval/);
@@ -86,6 +87,8 @@ test("agency removal revokes live access but preserves creator history transacti
   assert.match(removal, /messageHistoryPreserved: true/);
   assert.match(removal, /crmDataPreserved: true/);
   assert.match(removal, /timeout: 120_000/);
+  assert.match(source, /cursor:\s*\{\s*id:\s*cursorId\s*\}/);
+  assert.match(source, /skip:\s*1/);
 });
 
 test("agency removal is retry-safe using the archived creator row", () => {

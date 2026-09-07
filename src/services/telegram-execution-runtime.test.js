@@ -12,13 +12,13 @@ const {
   releaseTelegramExecutionRuntime,
 } = require("./telegram-execution-runtime");
 
-function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [] } = {}) {
-  const creators = [
+function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [], creators: creatorSeed = null, accounts: accountSeed = null } = {}) {
+  const creators = creatorSeed || [
     { id: "creator-1", agencyId: "agency-1", telegramContact: "@model_a", telegramAccountId: "tg-1", deletedAt: null, displayName: "A", username: "a", status: "READY" },
     { id: "creator-2", agencyId: "agency-1", telegramContact: "@model_b", telegramAccountId: "tg-2", deletedAt: null, displayName: "B", username: "b", status: "READY" },
     { id: "creator-3", agencyId: "agency-1", telegramContact: "@model_c", telegramAccountId: null, deletedAt: null, displayName: "C", username: "c", status: "READY" },
   ];
-  const accounts = [
+  const accounts = accountSeed || [
     { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null, runtimeLeaseUserId: null, runtimeLeaseMemberId: null, runtimeLeaseAccessEpoch: null, runtimeLeaseCreatorId: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0, runtimeClaimInboundEligible: false },
     { id: "tg-2", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null, runtimeLeaseUserId: null, runtimeLeaseMemberId: null, runtimeLeaseAccessEpoch: null, runtimeLeaseCreatorId: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0, runtimeClaimInboundEligible: false },
   ];
@@ -130,6 +130,24 @@ test("Telegram runtime eligibility is creator-scoped instead of role-scoped", as
 });
 
 
+test("pinned historical source remains runtime-eligible after current creator Telegram contact is cleared", async () => {
+  const db = makeDb({ sourceSubmissions: [{
+    id: "submission-contact-cleared", agencyId: "agency-1", creatorId: "creator-1", telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678",
+    telegramMessageIds: [4901], ofMediaIds: [], pipelineDisposition: "ACTIVE",
+  }] });
+  db._creators[0].telegramContact = null;
+
+  const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: chatterA, db });
+  assert.deepEqual(eligible, [
+    { accountId: "tg-1", anchorCreatorId: "creator-1", messagingEligible: false, inboundEligible: false },
+  ]);
+  await assert.rejects(
+    () => assertTelegramMessagingAccess({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", creatorId: "creator-1", db }),
+    (error) => error?.code === "TELEGRAM_EXECUTION_CREATOR_CONTACT_REQUIRED",
+    "historical read eligibility must not restore current generic messaging authority",
+  );
+});
+
 test("pending Customs source account remains runtime-eligible after creator Telegram account reassignment without widening send authority", async () => {
   const db = makeDb({ sourceSubmissions: [{
     id: "submission-1", agencyId: "agency-1", creatorId: "creator-1", telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678",
@@ -178,6 +196,41 @@ test("confirmed TASK thread and active follow-up keep the old account runtime-el
     () => assertTelegramInboundRuntimeLease({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-followup", claimToken: claimed.leases[0].claimToken, now: new Date("2026-08-19T14:00:01.000Z"), db }),
     (error) => error?.code === "TELEGRAM_INBOUND_ACCOUNT_FORBIDDEN",
   );
+});
+
+test("pinned confirmed TASK follow-up remains runtime-eligible after current creator Telegram contact is cleared", async () => {
+  const db = makeDb({ deliveryIntents: [
+    { id: "task-contact-cleared", agencyId: "agency-1", creatorId: "creator-1", accountId: "tg-1", kind: "TASK", state: "CONFIRMED", remoteMessageId: 701, remoteRecipientTelegramUserId: "1001" },
+    { id: "cancel-contact-cleared", agencyId: "agency-1", creatorId: "creator-1", accountId: "tg-1", kind: "CANCELLATION", state: "PLANNED" },
+  ] });
+  db._creators[0].telegramContact = null;
+
+  const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: chatterA, db });
+  assert.deepEqual(eligible, [
+    { accountId: "tg-1", anchorCreatorId: "creator-1", messagingEligible: false, inboundEligible: false },
+  ]);
+  const claimed = await claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: chatterA, deviceId: "device-cleared-followup", accountId: "tg-1", limit: 1, now: new Date("2026-08-19T14:00:00.000Z"), db });
+  assert.deepEqual(claimed.leases.map((lease) => lease.accountId), ["tg-1"]);
+  assert.equal(claimed.leases[0].messagingEligible, false);
+  assert.equal(claimed.leases[0].inboundEligible, false);
+});
+
+test("historical FAILED_PRECOMMIT follow-up keeps the pinned TASK account runtime-eligible after creator rebinding", async () => {
+  const db = makeDb({ deliveryIntents: [
+    { id: "task-old", agencyId: "agency-1", creatorId: "creator-1", accountId: "tg-1", kind: "TASK", state: "CONFIRMED", remoteMessageId: 601, remoteRecipientTelegramUserId: "1001" },
+    { id: "cancel-old", agencyId: "agency-1", creatorId: "creator-1", accountId: "tg-1", kind: "CANCELLATION", state: "FAILED_PRECOMMIT" },
+  ] });
+  db._creators[0].telegramAccountId = "tg-2";
+
+  const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: chatterA, db });
+  assert.deepEqual(eligible, [
+    { accountId: "tg-2", anchorCreatorId: "creator-1", messagingEligible: true, inboundEligible: true },
+    { accountId: "tg-1", anchorCreatorId: "creator-1", messagingEligible: false, inboundEligible: false },
+  ]);
+  const claimed = await claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: chatterA, deviceId: "device-failed-followup", accountId: "tg-1", limit: 1, now: new Date("2026-08-19T14:00:00.000Z"), db });
+  assert.deepEqual(claimed.leases.map((lease) => lease.accountId), ["tg-1"]);
+  assert.equal(claimed.leases[0].messagingEligible, false, "pinned follow-up capability must not become generic current-account messaging authority");
+  assert.equal(claimed.leases[0].inboundEligible, false);
 });
 
 test("undrained runtime generation never transfers to another Desktop after TTL; drained release enables a new generation", async () => {
@@ -259,6 +312,28 @@ test("Audit16 Telegram runtime lease is rejected after accessEpoch or creator au
     () => assertTelegramRuntimeLease({ agencyId: "agency-1", member: chatterA, accountId: "tg-1", deviceId: "device-a", claimToken: lease.claimToken, now: new Date(now.getTime() + 2_000), db }),
     (error) => error?.code === "EXECUTION_CREATOR_ACCESS_REVOKED" && error?.status === 403,
   );
+});
+
+test("runtime claim resource cap does not sample discovery: busy early accounts cannot hide a later free eligible account", async () => {
+  const creators = Array.from({ length: 4 }, (_, index) => ({
+    id: `creator-${index + 1}`, agencyId: "agency-1", telegramContact: `@model_${index + 1}`, telegramAccountId: `tg-${index + 1}`,
+    deletedAt: null, displayName: `Model ${index + 1}`, username: `model_${index + 1}`, status: "READY",
+  }));
+  const now = new Date("2026-09-05T18:00:00.000Z");
+  const accounts = Array.from({ length: 4 }, (_, index) => ({
+    id: `tg-${index + 1}`, agencyId: "agency-1", lifecycleState: "ACTIVE", retirementDrainCompletedAt: null,
+    runtimeClaimedByDeviceId: index < 3 ? `other-${index + 1}` : null, runtimeClaimToken: index < 3 ? `other-token-${index + 1}` : null,
+    runtimeClaimUntil: index < 3 ? new Date(now.getTime() + 60_000) : null, runtimeLeaseUserId: index < 3 ? `other-user-${index + 1}` : null,
+    runtimeLeaseMemberId: index < 3 ? `other-member-${index + 1}` : null, runtimeLeaseAccessEpoch: index < 3 ? 1 : null,
+    runtimeLeaseCreatorId: index < 3 ? `creator-${index + 1}` : null, runtimeClaimGeneration: index < 3 ? 1 : 0,
+    runtimeDrainedGeneration: index < 3 ? 1 : 0, runtimeClaimInboundEligible: false,
+  }));
+  const db = makeDb({ creators, accounts });
+  Object.assign(db._member, { role: "OWNER", roleKey: "owner", assignedCreators: "all" });
+  const owner = { ...db._member };
+  const claimed = await claimTelegramExecutionRuntimes({ agencyId: "agency-1", member: owner, deviceId: "device-free", limit: 1, now, db });
+  assert.deepEqual(claimed.leases.map((lease) => lease.accountId), ["tg-4"]);
+  assert.equal(db._accounts[3].runtimeClaimedByDeviceId, "device-free");
 });
 
 test("Audit16 targeted Telegram claim acquires only the requested eligible account", async () => {

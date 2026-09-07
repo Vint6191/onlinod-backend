@@ -21,10 +21,10 @@ function mountedFamilies() {
   return out;
 }
 
-test("Audit16 route manifest exactly classifies all 47 production route families", () => {
+test("Audit16 route manifest exactly classifies all 48 production route families", () => {
   const mounted = mountedFamilies();
-  assert.equal(mounted.length, 47, `expected 47 route families, got ${mounted.length}`);
-  assert.equal(ROUTE_MANIFEST.length, 47, "manifest must classify exactly 47 route families");
+  assert.equal(mounted.length, 48, `expected 48 route families, got ${mounted.length}`);
+  assert.equal(ROUTE_MANIFEST.length, 48, "manifest must classify exactly 48 route families");
   assert.deepEqual(new Set(ROUTE_MANIFEST.map((x) => x.path)), new Set(mounted));
   const valid = new Set(Object.values(ROUTE_CLASS));
   for (const entry of ROUTE_MANIFEST) {

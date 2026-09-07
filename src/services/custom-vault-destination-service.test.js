@@ -7,6 +7,7 @@ const path = require("node:path");
 function fakeDb(initial = null) {
   let row = { id: "creator-1", agencyId: "agency-1", deletedAt: null, customsVaultFolderId: initial, updatedAt: new Date("2026-08-21T12:00:00.000Z") };
   return {
+    $executeRawUnsafe: async (sql) => { assert.match(String(sql), /pg_advisory_xact_lock/); return 0; },
     agencyMemberCreator: { findFirst: async () => ({ id: "scope-1" }) },
     creatorAccount: {
       findFirst: async ({ where }) => row && where.id === row.id && where.agencyId === row.agencyId ? { ...row } : null,

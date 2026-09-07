@@ -4,9 +4,12 @@ const {
   getNeverUsedPipelineState,
 } = require("./vault-never-used-service");
 const { cleanMediaIds } = require("./media-library-service");
+const { unresolvedPipelineSubmissionWhere } = require("./custom-content-pipeline-authority-service");
+const { confirmedRelayProofMediaIdForSubmission } = require("./custom-relay-result-proof-service");
 
 const MAX_MEDIA_IDS = 5000;
 const TOP_ASSET_LIMIT = 100;
+const RELAY_PROOF_MEDIA_QUERY_CHUNK = 200;
 
 function clean(value, max = 240) {
   return String(value ?? "").trim().slice(0, max);
@@ -178,7 +181,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
   };
 }
 
-async function checkProtectedVaultMedia({ agencyId, creatorId, mediaIds = [], db = null }) {
+async function checkProtectedVaultMedia({ agencyId, creatorId, mediaIds = [], operation = null, folderId = null, db = null }) {
   const client = db || require("../prisma");
   const cleanCreatorId = clean(creatorId, 100);
   await requireCreator(client, agencyId, cleanCreatorId);
@@ -186,22 +189,132 @@ async function checkProtectedVaultMedia({ agencyId, creatorId, mediaIds = [], db
   if (!ids.length) {
     return { ok: true, creatorId: cleanCreatorId, requested: 0, protectedMediaIds: [] };
   }
+  const op = clean(operation, 40).toLowerCase();
+  const targetFolderId = clean(folderId, 240);
+  if (op === "hide_media" || op === "remove_from_list") {
+    // Canonical ownership begins when the proven OF media id is committed to
+    // CustomContentSubmission.ofMediaIds. CreatorMediaAsset is a later derived
+    // projection and may not exist yet after a crash between relay confirmation
+    // and Vault/Content-Library finalization. Destructive Vault writes must
+    // therefore fence on the submission fact first, with the asset relation only
+    // as a legacy/backfill compatibility source.
+    const liveCanonical = await client.customContentSubmission.findMany({
+      where: {
+        agencyId, creatorId: cleanCreatorId, ofMediaIds: { hasSome: ids },
+        ...unresolvedPipelineSubmissionWhere(),
+      },
+      select: { id: true, executionVaultFolderId: true, ofMediaIds: true },
+    });
+
+    const bySubmissionId = new Map((liveCanonical || []).map((row) => [String(row.id), row]));
+    const ownership = new Map();
+    for (const submission of liveCanonical || []) {
+      for (const mediaId of cleanMediaIds(submission.ofMediaIds, MAX_MEDIA_IDS)) {
+        if (!ids.includes(mediaId)) continue;
+        const rows = ownership.get(mediaId) || [];
+        rows.push(submission);
+        ownership.set(mediaId, rows);
+      }
+    }
+
+    let unresolvedIds = ids.filter((mediaId) => !ownership.has(mediaId));
+
+    // Audit 18 / Custom pipeline closure: the external OF fact becomes durable
+    // one step before media-commit projects it into submission.ofMediaIds. A
+    // crash in that small window must not let Vault cleanup hide/remove media
+    // that CUSTOM_RELAY_SEND already proved. Query by the requested media ids
+    // first (chunking only DB query size, never correctness), then accept a row
+    // only if the same relay-proof validator binds its idempotency key, index,
+    // submission and pinned Telegram source to a still-live pipeline submission.
+    if (unresolvedIds.length && client.automationDelivery?.findMany) {
+      const proofCandidates = [];
+      for (let offset = 0; offset < unresolvedIds.length; offset += RELAY_PROOF_MEDIA_QUERY_CHUNK) {
+        const chunk = unresolvedIds.slice(offset, offset + RELAY_PROOF_MEDIA_QUERY_CHUNK);
+        const rows = await client.automationDelivery.findMany({
+          where: {
+            agencyId,
+            creatorId: cleanCreatorId,
+            actionType: "CUSTOM_RELAY_SEND",
+            status: "COMPLETED",
+            OR: chunk.map((requestedMediaId) => ({ result: { path: ["mediaId"], equals: requestedMediaId } })),
+          },
+          select: { id: true, idempotencyKey: true, actionType: true, status: true, payload: true, result: true },
+        });
+        proofCandidates.push(...(rows || []));
+      }
+      const candidateSubmissionIds = Array.from(new Set(proofCandidates
+        .map((row) => clean(row?.payload?.submissionId, 180))
+        .filter(Boolean)));
+      if (candidateSubmissionIds.length) {
+        const proofSubmissions = await client.customContentSubmission.findMany({
+          where: {
+            id: { in: candidateSubmissionIds }, agencyId, creatorId: cleanCreatorId,
+            ...unresolvedPipelineSubmissionWhere(),
+          },
+          select: {
+            id: true, executionVaultFolderId: true, ofMediaIds: true,
+            telegramMessageIds: true, telegramSourceAccountId: true, telegramSourceUserId: true,
+          },
+        });
+        const proofSubmissionById = new Map((proofSubmissions || []).map((row) => [String(row.id), row]));
+        const requested = new Set(unresolvedIds);
+        for (const proof of proofCandidates) {
+          const submission = proofSubmissionById.get(clean(proof?.payload?.submissionId, 180));
+          const provenMediaId = confirmedRelayProofMediaIdForSubmission({ row: proof, submission });
+          if (!provenMediaId || !requested.has(provenMediaId)) continue;
+          const rows = ownership.get(provenMediaId) || [];
+          rows.push(submission);
+          ownership.set(provenMediaId, rows);
+        }
+      }
+      unresolvedIds = ids.filter((mediaId) => !ownership.has(mediaId));
+    }
+
+    if (unresolvedIds.length) {
+      const assets = await client.creatorMediaAsset.findMany({
+        where: { agencyId, creatorId: cleanCreatorId, mediaId: { in: unresolvedIds }, source: "CUSTOM", customSubmissionId: { not: null } },
+        select: { mediaId: true, customSubmissionId: true },
+      });
+      const missingSubmissionIds = Array.from(new Set((assets || [])
+        .map((row) => clean(row.customSubmissionId, 180))
+        .filter((id) => id && !bySubmissionId.has(id))));
+      if (missingSubmissionIds.length) {
+        const legacyLive = await client.customContentSubmission.findMany({
+          where: { id: { in: missingSubmissionIds }, agencyId, creatorId: cleanCreatorId, ...unresolvedPipelineSubmissionWhere() },
+          select: { id: true, executionVaultFolderId: true, ofMediaIds: true },
+        });
+        for (const row of legacyLive || []) bySubmissionId.set(String(row.id), row);
+      }
+      for (const asset of assets || []) {
+        const submission = bySubmissionId.get(String(asset.customSubmissionId || ""));
+        if (!submission) continue;
+        const mediaId = String(asset.mediaId);
+        const rows = ownership.get(mediaId) || [];
+        rows.push(submission);
+        ownership.set(mediaId, rows);
+      }
+    }
+
+    const protectedMediaIds = ids.filter((mediaId) => {
+      const submissions = ownership.get(mediaId) || [];
+      if (!submissions.length) return false;
+      if (op === "hide_media") return true;
+      return submissions.some((submission) => {
+        const pinnedFolderId = clean(submission.executionVaultFolderId, 240);
+        return !pinnedFolderId || !targetFolderId || pinnedFolderId === targetFolderId;
+      });
+    });
+    return { ok: true, creatorId: cleanCreatorId, requested: ids.length, protectedMediaIds };
+  }
+
+  // Cleanup protection intentionally remains broader than manual mutation
+  // protection: any active Media Library asset must survive automatic cleanup.
   const rows = await client.creatorMediaAsset.findMany({
-    where: {
-      agencyId,
-      creatorId: cleanCreatorId,
-      catalogActive: true,
-      mediaId: { in: ids },
-    },
+    where: { agencyId, creatorId: cleanCreatorId, catalogActive: true, mediaId: { in: ids } },
     select: { mediaId: true },
     take: ids.length,
   });
-  return {
-    ok: true,
-    creatorId: cleanCreatorId,
-    requested: ids.length,
-    protectedMediaIds: rows.map((row) => String(row.mediaId)),
-  };
+  return { ok: true, creatorId: cleanCreatorId, requested: ids.length, protectedMediaIds: rows.map((row) => String(row.mediaId)) };
 }
 
 module.exports = {

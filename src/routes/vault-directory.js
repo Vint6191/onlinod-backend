@@ -161,6 +161,8 @@ router.post("/:creatorId/protection-check", async (req, res) => {
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
       mediaIds: req.body?.mediaIds || [],
+      operation: req.body?.operation || null,
+      folderId: req.body?.folderId || null,
       includePipeline: req.body?.includePipeline !== false,
     });
     return res.json(result);

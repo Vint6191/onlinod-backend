@@ -3,6 +3,7 @@
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { unresolvedPipelineSubmissionWhere } = require("./custom-content-pipeline-authority-service");
 
 const MAX_MEDIA_IDS = 5000;
 const MAX_USAGE_SOURCES = 25;
@@ -658,9 +659,30 @@ async function mutateFolderMembership({ agencyId, creatorId, mediaIds, folderId,
   await db.$transaction(async (tx) => {
     const assets = await tx.creatorMediaAsset.findMany({
       where: { agencyId, creatorId: id, catalogActive: true, mediaId: { in: ids } },
-      select: { id: true, folderIds: true },
+      select: { id: true, mediaId: true, source: true, customSubmissionId: true, folderIds: true },
       take: ids.length,
     });
+    if (normalizedAction === "remove") {
+      const customRows = assets.filter((asset) => String(asset.source || "") === "CUSTOM" && asset.customSubmissionId);
+      const submissionIds = Array.from(new Set(customRows.map((asset) => String(asset.customSubmissionId)).filter(Boolean)));
+      const live = submissionIds.length ? await tx.customContentSubmission.findMany({
+        where: { id: { in: submissionIds }, agencyId, creatorId: id, ...unresolvedPipelineSubmissionWhere() },
+        select: { id: true, executionVaultFolderId: true },
+        take: submissionIds.length,
+      }) : [];
+      const liveById = new Map(live.map((row) => [String(row.id), row]));
+      const blockedMediaIds = customRows.filter((asset) => {
+        const submission = liveById.get(String(asset.customSubmissionId));
+        if (!submission) return false;
+        const pinnedFolderId = clean(submission.executionVaultFolderId, 240);
+        return !pinnedFolderId || pinnedFolderId === cleanFolderId;
+      }).map((asset) => String(asset.mediaId));
+      if (blockedMediaIds.length) {
+        throw Object.assign(new Error("Live Custom pipeline media cannot be removed from its pinned Vault folder"), {
+          code: "MEDIA_LIBRARY_CUSTOM_PIPELINE_FOLDER_OWNED", status: 409, mediaIds: blockedMediaIds, folderId: cleanFolderId,
+        });
+      }
+    }
     for (const asset of assets) {
       const folders = new Set(uniqueStrings(asset.folderIds, 500, 240));
       if (normalizedAction === "add") folders.add(cleanFolderId);
@@ -680,10 +702,32 @@ async function deleteMediaAssets({ agencyId, creatorId, mediaIds, db = prisma })
   const id = await requireCreator(db, agencyId, creatorId);
   const ids = cleanMediaIds(mediaIds, 10000);
   if (!ids.length) return { ok: true, creatorId: id, deleted: 0 };
-  const deleted = await db.creatorMediaAsset.deleteMany({
-    where: { agencyId, creatorId: id, mediaId: { in: ids } },
-  });
-  return { ok: true, creatorId: id, deleted: deleted.count };
+  const mutate = async (tx) => {
+    const protectedRows = await tx.creatorMediaAsset.findMany({
+      where: { agencyId, creatorId: id, mediaId: { in: ids }, source: "CUSTOM", customSubmissionId: { not: null } },
+      select: { mediaId: true, customSubmissionId: true },
+      take: ids.length,
+    });
+    if (protectedRows.length) {
+      const submissionIds = Array.from(new Set(protectedRows.map((row) => String(row.customSubmissionId || "")).filter(Boolean)));
+      const live = submissionIds.length ? await tx.customContentSubmission.findMany({
+        where: { id: { in: submissionIds }, agencyId, creatorId: id, ...unresolvedPipelineSubmissionWhere() },
+        select: { id: true },
+        take: submissionIds.length,
+      }) : [];
+      const liveIds = new Set(live.map((row) => String(row.id)));
+      const blockedMediaIds = protectedRows.filter((row) => liveIds.has(String(row.customSubmissionId))).map((row) => String(row.mediaId));
+      if (blockedMediaIds.length) {
+        const error = Object.assign(new Error("Live Custom pipeline media cannot be deleted from Media Library"), {
+          code: "MEDIA_LIBRARY_CUSTOM_PIPELINE_OWNED", status: 409, mediaIds: blockedMediaIds,
+        });
+        throw error;
+      }
+    }
+    const deleted = await tx.creatorMediaAsset.deleteMany({ where: { agencyId, creatorId: id, mediaId: { in: ids } } });
+    return { ok: true, creatorId: id, deleted: deleted.count };
+  };
+  return typeof db.$transaction === "function" ? db.$transaction(mutate) : mutate(db);
 }
 
 async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {

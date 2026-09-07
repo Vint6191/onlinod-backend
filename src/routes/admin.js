@@ -64,6 +64,14 @@ const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, r
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 const { TIER_CATALOG } = require("../services/billing-catalog-service");
 const { retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
+const {
+  agencyCustomPipelineBlockers,
+  assertAgencyCustomPipelineRetirable,
+  assertCreatorCustomPipelineRetirable,
+  lockAgencyPipelineLifecycle,
+  lockCreatorPipelineLifecycle,
+} = require("../services/custom-content-pipeline-authority-service");
+const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 
 const router = express.Router();
@@ -569,7 +577,13 @@ router.get("/agencies/:id", async (req, res) => {
   });
 
   if (!agency) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
-  return res.json({ ok: true, agency, health: health(agency), creatorTiers: TIERS });
+  // This read intentionally works for soft-deleted agencies. Historical
+  // installations could retire an Agency before the parent lifecycle fence
+  // existed, leaving durable Custom / Telegram work behind. Surface that
+  // debt to super-admins so the canonical recovery path is explicit:
+  // restore -> converge/resolve work -> retire again.
+  const customPipelineBlockers = await agencyCustomPipelineBlockers({ db: prisma, agencyId: agency.id });
+  return res.json({ ok: true, agency, health: health(agency), customPipelineBlockers, creatorTiers: TIERS });
 });
 
 // PATCH /agencies/:id   — rename / change status notes
@@ -619,7 +633,28 @@ router.delete("/agencies/:id", async (req, res) => {
     if (!before) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
 
     if (hard) {
-      await prisma.agency.delete({ where: { id: before.id } });
+      await prisma.$transaction(async (tx) => {
+        // Hard deletion may destroy historical rows, but MASS can represent a
+        // future external effect. Serialize with NEW MASS creation and refuse to
+        // destroy the only cancellation/reconciliation authority while such an
+        // effect is pending or unknown.
+        await lockAgencyPipelineLifecycle({ db: tx, agencyId: before.id, allowDeleted: true });
+        // Destructive history removal is allowed only after every live/unknown
+        // Custom external-write authority has converged. Otherwise the Agency
+        // cascade would erase AutomationDelivery evidence for a provider effect
+        // that may already be COMMITTING. Terminal history may still be destroyed.
+        await assertAgencyCustomPipelineRetirable({ db: tx, agencyId: before.id });
+        await assertAgencyMassCampaignRetirable({ db: tx, agencyId: before.id, requireFreshProviderSnapshot: !before.deletedAt });
+        // Telegram provider ledgers intentionally have no Agency/Creator/CustomOrder
+        // foreign keys because normal soft/account retirement must preserve them.
+        // A super-admin hard Agency delete is different: it is explicit destructive
+        // history removal, so purge those non-FK rows in the same transaction as
+        // the cascading Agency delete. Any later restrictive FK failure therefore
+        // rolls the ledger purge back too.
+        await tx.telegramDeliveryIntent.deleteMany({ where: { agencyId: before.id } });
+        await tx.telegramInboundEvent.deleteMany({ where: { agencyId: before.id } });
+        await tx.agency.delete({ where: { id: before.id } });
+      });
       await adminLog(req, {
         agencyId: before.id,
         action: "admin.agency_hard_deleted",
@@ -630,20 +665,34 @@ router.delete("/agencies/:id", async (req, res) => {
       return res.json({ ok: true, hard: true, deleted: before });
     }
 
-    const updated = await prisma.agency.update({
-      where: { id: before.id },
-      data: {
-        deletedAt: new Date(),
-        deletedReason: reason,
-        status: "LOCKED",
-      },
-    });
-
-    // Revoke all refresh sessions for this agency so live sessions die.
-    await prisma.refreshSession.updateMany({
-      where: { agencyId: before.id, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
+    const deletedAt = new Date();
+    const updated = await prisma.$transaction(async (tx) => {
+      // Agency retirement and every NEW durable Custom/source path share this
+      // parent row lock. If new work wins first it is visible to the blocker
+      // scan; if retirement wins first later work must fail closed or enter the
+      // explicit post-retirement provider-observation exception lane.
+      const lifecycle = await lockAgencyPipelineLifecycle({ db: tx, agencyId: before.id, allowDeleted: true });
+      if (lifecycle.deletedAt) {
+        return tx.agency.findUnique({ where: { id: before.id } });
+      }
+      await assertAgencyCustomPipelineRetirable({ db: tx, agencyId: before.id });
+      await assertAgencyMassCampaignRetirable({ db: tx, agencyId: before.id });
+      const row = await tx.agency.update({
+        where: { id: before.id },
+        data: {
+          deletedAt,
+          deletedReason: reason,
+          status: "LOCKED",
+        },
+      });
+      // Revoke all refresh sessions in the same commit that removes business
+      // authority; no half-retired agency can remain live after a crash.
+      await tx.refreshSession.updateMany({
+        where: { agencyId: before.id, revokedAt: null },
+        data: { revokedAt: deletedAt },
+      });
+      return row;
+    }, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 120_000 });
 
     await adminLog(req, {
       agencyId: before.id,
@@ -655,6 +704,9 @@ router.delete("/agencies/:id", async (req, res) => {
 
     return res.json({ ok: true, hard: false, agency: updated });
   } catch (err) {
+    if (err?.status && err?.code) {
+      return res.status(Number(err.status)).json({ ok: false, code: String(err.code), error: err.message || "Agency removal is blocked", blockers: err.details || null });
+    }
     return res.status(500).json({ ok: false, code: "AGENCY_DELETE_FAILED", error: err?.message || "Failed" });
   }
 });
@@ -1273,7 +1325,15 @@ router.get("/creators", async (req, res) => {
   }
 });
 
-// PATCH /creators/:id/status   (v1, kept)
+// PATCH /creators/:id/status   (v1 compatibility surface)
+//
+// CreatorAccount.status is no longer an admin-controlled toggle. READY is
+// committed only by the verified enrollment/connection authority; DISABLED is
+// committed by the full creator-removal workflow. Allowing this legacy route
+// to write either direction would bypass identity proof, connection generation,
+// Custom-pipeline retirement blockers, crypto/session retirement and access
+// revocation. Keep the endpoint for old admin clients, but make it read-only
+// except for an idempotent request for the already-current value.
 router.patch("/creators/:id/status", async (req, res) => {
   const status = String(req.body?.status || "");
   if (!["DRAFT", "READY", "NOT_CREATOR", "AUTH_FAILED", "DISABLED"].includes(status)) {
@@ -1282,16 +1342,24 @@ router.patch("/creators/:id/status", async (req, res) => {
 
   const before = await prisma.creatorAccount.findUnique({ where: { id: req.params.id }, include: { billingProfile: true } });
   if (!before) return res.status(404).json({ ok: false, error: "Creator not found" });
+  if (String(before.status) === status) {
+    return res.json({ ok: true, creator: before, unchanged: true });
+  }
 
-  const creator = await prisma.creatorAccount.update({ where: { id: before.id }, data: { status } });
-  await adminLog(req, {
-    agencyId: before.agencyId,
-    action: "admin.creator_status_changed",
-    targetType: "creator",
-    targetId: before.id,
-    before, after: creator, reason: req.body?.reason || null,
+  const requestedAction = status === "READY"
+    ? "Complete or reconnect the creator through the verified Creator Enrollment / Connection workflow."
+    : status === "DISABLED"
+      ? "Use the creator removal workflow so active Customs, external writes, session/crypto material and access are adjudicated atomically."
+      : "Use the canonical creator lifecycle workflow instead of directly editing CreatorAccount.status.";
+
+  return res.status(409).json({
+    ok: false,
+    code: "CREATOR_STATUS_MANAGED_BY_LIFECYCLE_AUTHORITY",
+    error: "Creator status is managed by lifecycle authority and cannot be changed directly from the legacy admin endpoint.",
+    currentStatus: before.status,
+    requestedStatus: status,
+    requestedAction,
   });
-  return res.json({ ok: true, creator });
 });
 
 // PATCH /creators/:id/billing   (v1, kept)
@@ -1474,11 +1542,51 @@ router.delete("/creators/:id", async (req, res) => {
   if (!before) return res.status(404).json({ ok: false, error: "Creator not found" });
 
   const deletedAt = new Date();
-  await prisma.$transaction(async (tx) => {
-    await lockAgencyBillingMutation(tx, before.agencyId);
+  try {
+    await prisma.$transaction(async (tx) => {
+      await lockAgencyBillingMutation(tx, before.agencyId);
     if (hard) {
+      // History destruction is explicit, but pending/unknown MASS is a future
+      // provider effect. Never erase its cancellation/reconciliation authority.
+      await lockCreatorPipelineLifecycle({ db: tx, agencyId: before.agencyId, creatorId: before.id, allowDeleted: true });
+      // Hard delete may erase terminal Custom history, but it must never erase
+      // the only ledger for an active/COMMITTING/unknown provider write.
+      await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
+      await assertCreatorMassCampaignRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id, requireFreshProviderSnapshot: !before.deletedAt });
+      // Explicit super-admin destructive maintenance. Telegram provider ledgers do
+      // not carry Creator/CustomOrder foreign keys by design (they survive normal
+      // account/runtime lifecycle), so purge this creator's rows explicitly before
+      // the CreatorAccount cascade. Otherwise a hard-deleted Custom can leave a
+      // PLANNED/RECONCILE_REQUIRED intent that poisons broad work discovery with a
+      // permanently missing CustomOrder. Product soft-removal must never take this
+      // destructive path implicitly.
+      const hardOrderIds = (await tx.customOrder.findMany({
+        where: { agencyId: before.agencyId, creatorId: before.id },
+        select: { id: true },
+      })).map((row) => String(row.id));
+      await tx.telegramDeliveryIntent.deleteMany({
+        where: {
+          agencyId: before.agencyId,
+          OR: [
+            { creatorId: before.id },
+            ...(hardOrderIds.length ? [{ customOrderId: { in: hardOrderIds } }] : []),
+          ],
+        },
+      });
+      await tx.telegramInboundEvent.deleteMany({
+        where: {
+          agencyId: before.agencyId,
+          OR: [
+            { creatorId: before.id },
+            ...(hardOrderIds.length ? [{ customOrderId: { in: hardOrderIds } }] : []),
+          ],
+        },
+      });
       await tx.creatorAccount.delete({ where: { id: before.id } });
     } else {
+      await lockCreatorPipelineLifecycle({ db: tx, agencyId: before.agencyId, creatorId: before.id, allowDeleted: true });
+      await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
+      await assertCreatorMassCampaignRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
       await retireCreatorCryptoMaterialOnRemoval({
         db: tx,
         agencyId: before.agencyId,
@@ -1497,8 +1605,19 @@ router.delete("/creators/:id", async (req, res) => {
     // Creator deletion changes the set of billable product access immediately.
     // Recompute the aggregate in the same transaction rather than waiting for
     // the hourly scheduler or the old cached currentPeriodEnd.
-    await syncAgencyBillingAggregate(tx, before.agencyId, deletedAt);
-  });
+      await syncAgencyBillingAggregate(tx, before.agencyId, deletedAt);
+    });
+  } catch (error) {
+    if (error?.status && error?.code) {
+      return res.status(Number(error.status)).json({
+        ok: false,
+        code: String(error.code),
+        error: error.message || "Creator removal is blocked",
+        ...(error.details && typeof error.details === "object" ? { details: error.details } : {}),
+      });
+    }
+    throw error;
+  }
 
   await adminLog(req, {
     agencyId: before.agencyId,
@@ -1508,7 +1627,12 @@ router.delete("/creators/:id", async (req, res) => {
     before, after: null,
     reason: String(req.query.reason || req.body?.reason || "admin cleanup"),
   });
-  return res.json({ ok: true, hard, deleted: before });
+  return res.json({
+    ok: true,
+    hard,
+    deleted: before,
+    ...(hard ? { destructive: true, customsHistoryDeletedByCascade: true } : { historyPreserved: true }),
+  });
 });
 
 

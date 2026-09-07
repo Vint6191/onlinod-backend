@@ -34,6 +34,7 @@ function fixture({ projectedIdentity = false }={}) {
   const now=new Date("2026-09-04T16:00:00.000Z");
   const member={id:"member-1",userId:"user-1",agencyId:"agency-1",role:"OWNER",roleKey:"owner",assignedCreators:"all",accessEpoch:3,deletedAt:null,deactivatedAt:null};
   const creator={id:"creator-1",agencyId:"agency-1",status:"READY",deletedAt:null,telegramContact:"@model",telegramUserId:projectedIdentity?"900001":null,telegramAccountId:"tg-1"};
+  const agency={id:"agency-1",deletedAt:null,status:"ACTIVE"};
   const account={id:"tg-1",agencyId:"agency-1",runtimeClaimedByDeviceId:"device-1",runtimeClaimToken:"runtime-1",runtimeClaimUntil:new Date(now.getTime()+600000),runtimeLeaseUserId:member.userId,runtimeLeaseMemberId:member.id,runtimeLeaseAccessEpoch:member.accessEpoch,runtimeLeaseCreatorId:creator.id};
   const orders=[{id:"order-1",agencyId:"agency-1",creatorId:creator.id,type:"CONTENT",status:"PENDING",fanDeliveredAt:null,contentBoundAt:null,scenario:"custom content",dueAt:new Date(now.getTime()+3600000),createdAt:new Date(now.getTime()-10000),updatedAt:new Date(now.getTime()-10000),telegramTaskMessageId:700,telegramReferenceMessageIds:[],telegramLastModelMessageId:null,telegramLastModelMessageAt:null}];
   const intents=[{id:"intent-task",agencyId:"agency-1",creatorId:creator.id,customOrderId:"order-1",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:700,remoteRecipientTelegramUserId:"900001",confirmedAt:new Date(now.getTime()-5000)}];
@@ -42,6 +43,7 @@ function fixture({ projectedIdentity = false }={}) {
   const audits=[];
   const db={
     _orders:orders,_events:events,_intents:intents,_submissions:submissions,_audits:audits,
+    agency:{async findFirst({where}){return where.id==="agency-1"?clone(agency):null;},async findUnique({where}){return where.id==="agency-1"?clone(agency):null;}},
     agencyMember:{async findFirst({where}){return matches(member,where)?clone(member):null;}},
     creatorAccount:{
       async findFirst({where}){return clone(matches(creator,where)?creator:null);},
@@ -65,13 +67,19 @@ function fixture({ projectedIdentity = false }={}) {
       async findMany({where,take=100}={}){return submissions.filter((x)=>matches(x,where||{})).slice(0,take).map(clone);},
       async create({data}){
         if(submissions.some((r)=>r.id===data.id)){const e=new Error("dup");e.code="P2002";throw e;}
-        const r={reviewStatus:"WAITING_REVIEW",reviewComment:null,reviewedByMemberId:null,reviewedAt:null,telegramInboundEventIds:[],...clone(data),createdAt:new Date(now),updatedAt:new Date(now)};submissions.push(r);return clone(r);
+        const r={pipelineDisposition:"ACTIVE",reviewStatus:"WAITING_REVIEW",reviewComment:null,reviewedByMemberId:null,reviewedAt:null,telegramInboundEventIds:[],...clone(data),createdAt:new Date(now),updatedAt:new Date(now)};submissions.push(r);return clone(r);
       },
       async updateMany({where,data}){const r=submissions.find((x)=>matches(x,where));if(!r)return{count:0};Object.assign(r,clone(data),{updatedAt:new Date(new Date(r.updatedAt).getTime()+1)});return{count:1};},
     },
     telegramInboundEvent:{
       async findFirst({where}){return clone(events.find((r)=>matches(r,where))||null);},
-      async findMany({where,take=200}){return events.filter((r)=>matches(r,where)).slice(0,take).map(clone);},
+      async findMany({where,take=200,orderBy=[],cursor=null,skip=0}){
+        const rows=events.filter((r)=>matches(r,where));
+        const order=Array.isArray(orderBy)?orderBy:[orderBy];
+        rows.sort((a,b)=>{for(const part of order){const [key,dir]=Object.entries(part||{})[0]||[];if(!key)continue;const av=value(a[key]);const bv=value(b[key]);if(av==null&&bv!=null)return dir==="desc"?1:-1;if(av!=null&&bv==null)return dir==="desc"?-1:1;if(av<bv)return dir==="desc"?1:-1;if(av>bv)return dir==="desc"?-1:1;}return 0;});
+        const start=cursor?.id?Math.max(0,rows.findIndex((r)=>String(r.id)===String(cursor.id))+(skip||0)):0;
+        return rows.slice(start,start+take).map(clone);
+      },
       async count({where}){return events.filter((r)=>matches(r,where)).length;},
       async create({data}){if(events.some((r)=>r.id===data.id)){const e=new Error("dup");e.code="P2002";throw e;} const r={...clone(data),submissionId:null,createdAt:new Date(now),updatedAt:new Date(now)};events.push(r);return clone(r);},
       async updateMany({where,data}){const r=events.find((x)=>matches(x,where) && (where.updatedAt===undefined || value(x.updatedAt)===value(where.updatedAt))); if(!r)return{count:0}; Object.assign(r,clone(data),{updatedAt:new Date(r.updatedAt.getTime()+1)}); return{count:1};},
@@ -86,7 +94,7 @@ function fixture({ projectedIdentity = false }={}) {
       }
     },
   };
-  return {db,member,now,creator,orders,intents,events,submissions,audits};
+  return {db,member,now,agency,creator,orders,intents,events,submissions,audits};
 }
 
 function ingestRaw(fx, extra={}) { return ingestTelegramInboundEvent({ agencyId:"agency-1",member:fx.member,accountId:"tg-1",deviceId:"device-1",claimToken:"runtime-1",senderTelegramUserId:"900001",messageId:801,replyToMessageId:700,hasMedia:false,sentAt:fx.now.toISOString(),now:fx.now,db:fx.db,...extra }); }
@@ -265,6 +273,38 @@ test("server retry sweep can drain crash-window inbound globally without hot-loo
 });
 
 
+test("retry sweep rotates persistently failing rows so later durable inbound work cannot starve",async()=>{
+  const fx=fixture();
+  fx.intents.length=0;
+  const base=new Date(fx.now.getTime()-10_000);
+  for(let i=0;i<4;i+=1){
+    fx.events.push({
+      id:`retry-fair-${i+1}`,agencyId:"agency-1",accountId:"tg-1",creatorId:null,customOrderId:null,submissionId:null,
+      senderTelegramUserId:i<3?`80000${i+1}`:"900099",messageId:960+i,replyToMessageId:null,groupedId:null,hasMedia:false,text:null,
+      sentAt:new Date(base.getTime()+i),observedAt:new Date(base.getTime()+i),projectionState:"FAILED_RETRYABLE",projectionReason:"TRANSIENT_PROVIDER_LOOKUP",
+      projectionAttempts:1,projectedAt:null,createdAt:new Date(base.getTime()+i),updatedAt:new Date(base),
+    });
+  }
+  const originalFindMany=fx.db.telegramDeliveryIntent.findMany;
+  fx.db.telegramDeliveryIntent.findMany=async(args)=>{
+    const recipient=String(args?.where?.remoteRecipientTelegramUserId||"");
+    if(recipient.startsWith("80000")) throw Object.assign(new Error("provider lookup still unavailable"),{code:"PROVIDER_LOOKUP_DOWN"});
+    return originalFindMany(args);
+  };
+
+  const first=await retryPendingInboundProjections({agencyId:"agency-1",now:new Date(fx.now.getTime()+1000),limit:2,db:fx.db});
+  assert.equal(first.scanned,2);
+  assert.equal(fx.events[0].projectionState,"FAILED_RETRYABLE");
+  assert.equal(fx.events[1].projectionState,"FAILED_RETRYABLE");
+  assert.equal(fx.events[3].projectionState,"FAILED_RETRYABLE","later work is untouched in the first bounded pass");
+
+  const second=await retryPendingInboundProjections({agencyId:"agency-1",now:new Date(fx.now.getTime()+2000),limit:2,db:fx.db});
+  assert.equal(second.scanned,2);
+  assert.equal(fx.events[3].projectionState,"SKIPPED","a later executable observation must become reachable instead of starving behind the same poisoned head rows");
+  assert.equal(fx.events[3].projectionReason,"NO_MEDIA");
+});
+
+
 function seedReview(fx, overrides={}) {
   const row={
     id:`review-${fx.events.length+1}`,agencyId:"agency-1",accountId:"tg-1",creatorId:"creator-1",customOrderId:"order-1",submissionId:null,
@@ -331,6 +371,25 @@ test("REVIEW_REQUIRED candidate search can recover an older valid target beyond 
   assert.deepEqual(result.items.map((row)=>row.customOrderId),["older-exact-target"]);
 });
 
+
+test("candidate search applies proven thread eligibility before LIMIT so an older exact target cannot be hidden",async()=>{
+  const fx=fixture();
+  seedReview(fx,{id:"review-thread-window",creatorId:"creator-1",customOrderId:"order-1",replyToMessageId:null,messageId:973,projectionReason:"ACTIVE_THREAD_AMBIGUOUS"});
+  for(let i=0;i<40;i+=1){
+    fx.orders.unshift({...clone(fx.orders[0]),id:`newer-nonthread-${i}`,scenario:`newer nonthread ${i}`,telegramTaskMessageId:null,createdAt:new Date(fx.now.getTime()+i+1),updatedAt:new Date(fx.now)});
+  }
+  const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-thread-window",query:"",limit:30,db:fx.db});
+  assert.equal(result.proofState,"UNIQUE_ACTIVE_THREAD");
+  assert.deepEqual(result.items.map((row)=>row.customOrderId),["order-1"],"presentation LIMIT must run after exact thread eligibility");
+});
+
+test("DIRECT_REPLY_UNRESOLVED broad-manager override has a searchable candidate surface",async()=>{
+  const fx=fixture();
+  seedReview(fx,{id:"review-direct-unresolved",creatorId:null,customOrderId:null,replyToMessageId:999999,messageId:974,projectionReason:"DIRECT_REPLY_UNRESOLVED"});
+  const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-direct-unresolved",query:"order-1",limit:30,db:fx.db});
+  assert.equal(result.proofState,"DIRECT_REPLY_UNRESOLVED");
+  assert.equal(result.items.some((row)=>row.customOrderId==="order-1"),true,"the same explicit broad override accepted by mutation authority must be reachable from search");
+});
 
 test("stale candidate search result cannot bypass a provider-proof change before ASSIGN",async()=>{
   const fx=fixture();
@@ -590,6 +649,21 @@ test("a non-Reply active-thread snapshot cannot create a submission after that t
   assert.equal(fx.submissions.length,0);
 });
 
+test("media observed after Agency retirement is durably preserved in REVIEW_REQUIRED and cannot materialize new Custom work", async()=>{
+  const fx=fixture();
+  fx.agency.deletedAt=new Date(fx.now.getTime()-1);
+  fx.agency.status="LOCKED";
+  const result=await ingest(fx,{messageId:10991,replyToMessageId:700,hasMedia:true,text:"late provider media"});
+  assert.equal(result.accepted,true);
+  const row=fx.events.find((event)=>Number(event.messageId)===10991);
+  assert.equal(row.creatorId,"creator-1","provider correlation proof is preserved for manager recovery");
+  assert.equal(row.customOrderId,"order-1","historical thread provenance is preserved without reopening execution");
+  assert.equal(row.projectionState,"REVIEW_REQUIRED");
+  assert.equal(row.projectionReason,"AGENCY_RETIRED_DURING_INTAKE");
+  assert.equal(row.submissionId,null);
+  assert.equal(fx.submissions.length,0,"retired Agency must never accept new submission execution");
+});
+
 test("closure 01: completed historical TASK cannot attach non-Reply media to a new pending CONTENT order whose TASK was never sent", async()=>{
   const fx=fixture();
   fx.orders[0].status="COMPLETED";
@@ -708,4 +782,47 @@ test("durable non-Reply replay cannot be retroactively claimed by a TASK thread 
   assert.equal(row.projectionState,"PENDING");
   assert.equal(row.projectionReason,"CREATOR_UNRESOLVED");
   assert.equal(fx.submissions.length,0,"future TASK thread must never acquire an older provider observation");
+});
+
+test("REVIEW_REQUIRED management queue has lossless cursor continuation beyond the first 100 visible exceptions", async () => {
+  const fx = fixture();
+  for (let i = 1; i <= 125; i += 1) {
+    seedReview(fx, {
+      id: `review-page-${String(i).padStart(3, "0")}`,
+      messageId: 2000 + i,
+      observedAt: new Date(fx.now.getTime() + i),
+      projectedAt: new Date(fx.now.getTime() + i),
+    });
+  }
+  const first = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: fx.member, limit: 100, now: fx.now, db: fx.db });
+  assert.equal(first.items.length, 100);
+  assert.equal(first.hasMore, true);
+  assert.equal(first.nextCursor, "review-page-100");
+
+  const second = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: fx.member, limit: 100, cursor: first.nextCursor, now: fx.now, db: fx.db });
+  assert.equal(second.items.length, 25);
+  assert.equal(second.hasMore, false);
+  assert.equal(second.nextCursor, null);
+  assert.deepEqual(
+    [...first.items, ...second.items].map((row) => row.eventId),
+    Array.from({ length: 125 }, (_, index) => `review-page-${String(index + 1).padStart(3, "0")}`),
+  );
+});
+
+test("historical inbound with deleted business context becomes REVIEW_REQUIRED instead of retry-looping or reattaching", async () => {
+  const fx=fixture();
+  fx.intents.length=0; // historical thread anchor was removed by the old hard-delete too
+  fx.events.push({
+    id:"orphan-inbound-1",agencyId:"agency-1",accountId:"tg-1",creatorId:"deleted-creator",customOrderId:"deleted-order",submissionId:null,
+    senderTelegramUserId:"900001",messageId:1991,replyToMessageId:700,groupedId:null,hasMedia:true,text:"historical media",
+    sentAt:new Date(fx.now.getTime()-5000),observedAt:new Date(fx.now.getTime()-4000),projectionState:"FAILED_RETRYABLE",projectionReason:"CUSTOM_SUBMISSION_ORDER_NOT_FOUND",projectionAttempts:2,projectedAt:null,
+    intakeAuthority:"PROVIDER_OBSERVATION",threadResolutionType:"DIRECT_REPLY",threadAnchorIntentId:"intent-task",resolutionAuthority:"PROVIDER_DIRECT_REPLY",
+    createdAt:new Date(fx.now.getTime()-4000),updatedAt:new Date(fx.now.getTime()-3000),
+  });
+  const result=await projectTelegramInboundEvent({eventId:"orphan-inbound-1",now:fx.now,db:fx.db});
+  assert.equal(result.state,"REVIEW_REQUIRED");
+  assert.equal(result.reason,"LEGACY_ORPHAN_BUSINESS_CONTEXT");
+  assert.equal(fx.events[0].creatorId,"deleted-creator","historical provider pointer must be preserved for review");
+  assert.equal(fx.events[0].customOrderId,"deleted-order");
+  assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
 });

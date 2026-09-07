@@ -87,6 +87,7 @@ function makeDb() {
         row = {
           id: `write-${++seq}`,
           writeCommitRevision: 0,
+          writeCommitAt: null,
           leaseRevision: 0,
           result: {},
           ...clone(data),
@@ -113,7 +114,7 @@ async function withAuthority(run) {
   try {
     restores.push(cacheModule("../prisma", fx.db));
     restores.push(cacheModule("./team-access-control", {
-      canUsePermission: async ({ key }) => { permissions.push(key); return key === "chats.mass_message" || key === "content.manage_vault"; },
+      canUsePermission: async ({ key }) => { permissions.push(key); return key === "chats.mass_message" || key === "content.manage_vault" || key === "chats.reply"; },
     }));
     restores.push(cacheModule("./execution-access-fence-service", {
       ExecutionAccessFenceError: class ExecutionAccessFenceError extends Error {},
@@ -128,6 +129,11 @@ async function withAuthority(run) {
       },
     }));
     restores.push(cacheModule("./automation-write-commit-fence-service", { lockAutomationWriteCommitFence: async () => ({ ok: true }) }));
+    restores.push(cacheModule("./custom-manual-delivery-authority-service", { assertCustomManualDeliveryCommitCurrent: async () => ({ ok: true }) }));
+    restores.push(cacheModule("./custom-content-pipeline-authority-service", {
+      lockAgencyPipelineLifecycle: async () => ({ id: "agency-a", deletedAt: null }),
+      lockCreatorPipelineLifecycle: async () => ({ id: "creator-a", agencyId: "agency-a", deletedAt: null }),
+    }));
     restores.push(cacheModule("./automation-failure-taxonomy", {
       FAILURE_CATEGORIES: {
         OUTCOME_UNKNOWN_RECONCILE: "OUTCOME_UNKNOWN_RECONCILE",
@@ -142,8 +148,23 @@ async function withAuthority(run) {
         return "DEFINITE_NO_WRITE_RETRYABLE";
       },
     }));
-    const authority = fresh("./programmatic-of-write-authority-service");
-    await run({ ...fx, permissions, access, authority });
+    const rawAuthority = fresh("./programmatic-of-write-authority-service");
+    const authority = { ...rawAuthority };
+    authority.reserveProgrammaticWrite = async (input) => {
+      const kind = String(input?.kind || "").toUpperCase();
+      const creatorId = String(input?.creatorId || "");
+      const key = String(input?.idempotencyKey || "");
+      const prefix = `mass:${creatorId}:`;
+      if (kind === "MASS_QUEUE_CREATE" && !fx.getRow() && key.startsWith(prefix) && key.length > prefix.length) {
+        await rawAuthority.reserveMassLogicalIntent({
+          agencyId: input.agencyId, userId: input.userId, memberId: input.memberId, accessEpoch: input.accessEpoch,
+          creatorId: input.creatorId, deviceId: input.deviceId, dispatchId: key.slice(prefix.length),
+          payloadFingerprint: input.payloadFingerprint, payload: input.payload || {}, maxAttempts: input.maxAttempts,
+        });
+      }
+      return rawAuthority.reserveProgrammaticWrite(input);
+    };
+    await run({ ...fx, permissions, access, authority, rawAuthority });
   } finally {
     delete require.cache[require.resolve("./programmatic-of-write-authority-service")];
     for (const restore of restores.reverse()) restore();
@@ -189,10 +210,10 @@ test("Audit17 MASS reserve uses product permission, stable idempotency binding a
     const first = await authority.reserveProgrammaticWrite(base);
     assert.equal(first.delivery.status, "CLAIMED");
     assert.equal(first.delivery.originKind, "INTERACTIVE");
-    assert.equal(first.replay, false);
+    assert.equal(first.replay, true); // external reserve attaches to the already server-canonical MASS logical intent
     assert.ok(first.lease.token);
-    assert.deepEqual(permissions, ["chats.mass_message"]);
-    assert.equal(getRow().fanId, null);
+    assert.ok(permissions.length >= 2 && permissions.every((key) => key === "chats.mass_message"));
+    assert.equal(getRow().fanId ?? null, null);
 
     const replay = await authority.reserveProgrammaticWrite(base);
     assert.equal(replay.replay, true);
@@ -323,7 +344,7 @@ test("Audit17 settlement routes bind the signed device but do not demand a fresh
   assert.match(route, /publicKindDevice[\s\S]*requireProductDevice/);
 });
 
-test("Audit17 reconciliation MATCHED recovers remote success without another commit permit", async () => {
+test("Audit17 MASS reconciliation cannot convert queue-shape readback into success without provider correlation", async () => {
   await withAuthority(async ({ authority, getRow }) => {
     const reserved = await authority.reserveProgrammaticWrite(base);
     await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
@@ -332,18 +353,15 @@ test("Audit17 reconciliation MATCHED recovers remote success without another com
 
     const recovered = await authority.reserveProgrammaticWrite(base);
     assert.equal(recovered.delivery.status, "RECONCILE_REQUIRED");
-    const settled = await authority.reconcileProgrammaticWrite({
-      ...base,
-      writeId: recovered.delivery.id,
-      leaseToken: recovered.lease.token,
-      leaseRevision: recovered.lease.revision,
-      outcome: "MATCHED",
-      result: { queueId: "queue-readback-1" },
-    });
-    assert.equal(settled.delivery.status, "COMPLETED");
-    assert.equal(settled.delivery.result.queueId, "queue-readback-1");
+    await assert.rejects(
+      () => authority.reconcileProgrammaticWrite({
+        ...base, writeId: recovered.delivery.id, leaseToken: recovered.lease.token, leaseRevision: recovered.lease.revision,
+        outcome: "MATCHED", result: { queueId: "queue-readback-1", recipientCount: 10, text: "same shape" },
+      }),
+      (error) => error?.code === "MASS_QUEUE_CORRELATION_PROOF_REQUIRED" && error?.status === 409,
+    );
+    assert.equal(getRow().status, "RECONCILE_REQUIRED");
     assert.equal(getRow().writeCommitRevision, 1);
-    assert.equal(getRow().leaseTokenHash, null);
   });
 });
 
@@ -371,20 +389,18 @@ test("Audit17 readback absence cannot claim PROVEN_NO_EFFECT for current busines
   });
 });
 
-test("Audit17 prewrite checkpoint is durable before COMMITTING and cannot be rewritten after permit", async () => {
+test("Audit17 MASS client checkpoint cannot manufacture queue-shape recovery authority before COMMITTING", async () => {
   await withAuthority(async ({ authority, getRow }) => {
     const reserved = await authority.reserveProgrammaticWrite(base);
     const lease = reserved.lease;
     await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
     const checkpointed = await authority.checkpointProgrammaticWrite({
-      ...base,
-      writeId: reserved.delivery.id,
-      leaseToken: lease.token,
-      leaseRevision: lease.revision,
-      result: { massPreflight: { queueIds: ["100"], observedAt: "now" } },
+      ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision,
+      result: { massPreflight: { queueIds: ["100"], observedAt: "now" }, queueId: "evil" },
     });
     assert.equal(checkpointed.delivery.status, "RUNNING");
-    assert.deepEqual(getRow().result.massPreflight.queueIds, ["100"]);
+    assert.equal(getRow().result.massPreflight, undefined);
+    assert.equal(getRow().result.queueId, undefined);
     await authority.prepareProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision });
     await assert.rejects(
       () => authority.checkpointProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: lease.token, leaseRevision: lease.revision, result: { massPreflight: { queueIds: ["evil"] } } }),
@@ -397,7 +413,7 @@ test("Audit17 Custom relay mint stays behind the Custom product adapter", () => 
   const generic = read("routes/programmatic-of-writes.js");
   const custom = read("routes/custom-orders.js");
   const submissions = read("services/custom-content-submissions-service.js");
-  assert.match(generic, /PUBLIC_RESERVE_KINDS = new Set\(\["MASS_QUEUE_CREATE", "VAULT_RELAY_SEND", "VAULT_CREATE_LIST"\]\)/);
+  assert.match(generic, /PUBLIC_RESERVE_KINDS = new Set\(\["MASS_QUEUE_CREATE", "MASS_QUEUE_CANCEL", "VAULT_RELAY_SEND", "VAULT_CREATE_LIST"\]\)/);
   assert.match(generic, /PUBLIC_LEASE_KINDS = new Set\(\[\.\.\.PUBLIC_RESERVE_KINDS, "CUSTOM_RELAY_SEND"\]\)/);
   assert.match(custom, /submissions\/:submissionId\/relay-write\/reserve/);
   assert.match(custom, /requireProductDevice\(req, req\.body\?\.deviceId\)/);
@@ -668,7 +684,7 @@ test("Audit17 shared lease sweeper dispatches programmatic rows to programmatic 
   assert.match(programmaticService, /CLAIMED[\s\S]*RUNNING[\s\S]*COMMITTING[\s\S]*RECONCILE_REQUIRED/);
 });
 
-test("Audit17 bounded WAIT closes permanently unresolved without retry, and manual match can later recover typed remote identity", async () => {
+test("Audit17 bounded WAIT closes MASS permanently unresolved and generic manual-match cannot fabricate success", async () => {
   await withAuthority(async ({ authority, getRow }) => {
     const reserved = await authority.reserveProgrammaticWrite(base);
     await authority.startProgrammaticWrite({ ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision });
@@ -680,12 +696,13 @@ test("Audit17 bounded WAIT closes permanently unresolved without retry, and manu
     getRow().result.reconciliationStartedAt = new Date(Date.now() - 31 * 60_000).toISOString();
     const closed = await authority.reconcileProgrammaticWrite({
       ...base, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision,
-      outcome: "WAIT_FOR_READBACK", result: { successfulReadback: true },
+      outcome: "WAIT_FOR_READBACK", result: { successfulReadback: true, candidates: [{ queueId: "shape-only" }] },
     });
     assert.equal(closed.unresolved, true);
     assert.equal(closed.delivery.status, "FAILED");
     assert.equal(closed.delivery.failureCode, "outcome_unresolved_do_not_retry");
     assert.equal(closed.delivery.result.outcomeState, "UNRESOLVED_DO_NOT_RETRY");
+    assert.equal(getRow().remoteLifecycleState, "UNKNOWN");
     assert.equal(getRow().leaseTokenHash, null);
 
     const replay = await authority.reserveProgrammaticWrite(base);
@@ -693,15 +710,189 @@ test("Audit17 bounded WAIT closes permanently unresolved without retry, and manu
     assert.equal(replay.delivery.id, reserved.delivery.id);
     assert.equal(replay.delivery.status, "FAILED");
 
-    const matched = await authority.resolveProgrammaticWriteUnresolvedMatched({
-      ...base, writeId: reserved.delivery.id, result: { queueId: "queue-manual-1", outcomeState: "EVIL", programmaticWriteKind: "EVIL" },
-    });
-    assert.equal(matched.delivery.status, "COMPLETED");
-    assert.equal(matched.delivery.result.queueId, "queue-manual-1");
-    assert.equal(matched.delivery.result.programmaticWriteKind, "MASS_QUEUE_CREATE");
-    assert.equal(matched.delivery.messageId, null);
-    const finalReplay = await authority.reserveProgrammaticWrite(base);
-    assert.equal(finalReplay.delivery.status, "COMPLETED");
-    assert.equal(finalReplay.delivery.id, reserved.delivery.id);
+    await assert.rejects(
+      () => authority.resolveProgrammaticWriteUnresolvedMatched({ ...base, writeId: reserved.delivery.id, result: { queueId: "queue-manual-1" } }),
+      (error) => error?.code === "MASS_QUEUE_CORRELATION_PROOF_REQUIRED",
+    );
+    assert.equal(getRow().status, "FAILED");
+    assert.equal(getRow().remoteLifecycleState, "UNKNOWN");
   });
+});
+
+test("Audit17 CUSTOM_MANUAL_SEND grants one server-visible commit permit across two devices and never allows ordinary reconciliation takeover", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const manual = {
+      kind: "CUSTOM_MANUAL_SEND", agencyId: "agency-a", userId: "user-a", memberId: "member-a", accessEpoch: 7,
+      creatorId: "creator-a", deviceId: "device-a", idempotencyKey: "custom-manual:order-a:submission-a:0",
+      payloadFingerprint: "sha256:manual-a", payload: { customOrderId: "order-a", submissionId: "submission-a", creatorId: "creator-a", dialogId: "fan-a", attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 1000, actualPriceCents: 1000 },
+      targetId: "order-a", fanId: "fan-a", dialogId: "fan-a", permissionKeyOverride: "chats.reply", allowReconciliationTakeover: false,
+    };
+    const reserved = await authority.reserveProgrammaticWrite(manual);
+    const started = await authority.startProgrammaticWrite({ ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, permissionKey: "chats.reply" });
+    assert.equal(started.delivery.status, "RUNNING");
+    const prepared = await authority.prepareProgrammaticWrite({ ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, permissionKey: "chats.reply" });
+    assert.equal(prepared.delivery.status, "COMMITTING");
+    assert.equal(prepared.writeCommitRevision, 1);
+
+    await assert.rejects(
+      () => authority.reserveProgrammaticWrite({ ...manual, deviceId: "device-b" }),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_COMMIT_IN_FLIGHT" && error?.status === 409,
+    );
+
+    getRow().claimUntil = new Date(Date.now() - 1_000);
+    await assert.rejects(
+      () => authority.reserveProgrammaticWrite({ ...manual, deviceId: "device-b" }),
+      (error) => error?.code === "PROGRAMMATIC_WRITE_RECONCILIATION_REQUIRED" && error?.status === 409,
+    );
+    assert.equal(getRow().status, "RECONCILE_REQUIRED");
+  });
+});
+
+
+
+test("Audit17 CUSTOM_MANUAL_V2 atomically binds settlement capability to COMMITTING and duplicate grant recovery preserves earlier tokens", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const manual = {
+      kind: "CUSTOM_MANUAL_SEND", agencyId: "agency-a", userId: "user-a", memberId: "member-a", accessEpoch: 7,
+      creatorId: "creator-a", deviceId: "device-a", idempotencyKey: "custom-manual:order-v2:submission-a:0",
+      payloadFingerprint: "sha256:manual-v2", payload: { customOrderId: "order-v2", submissionId: "submission-a", creatorId: "creator-a", dialogId: "fan-a", attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 1000, actualPriceCents: 1000, networkRequestId: "network-v2-exact" },
+      targetId: "order-v2", fanId: "fan-a", dialogId: "fan-a", permissionKeyOverride: "chats.reply", allowReconciliationTakeover: false,
+    };
+    const reserved = await authority.reserveProgrammaticWrite(manual);
+    await authority.startProgrammaticWrite({ ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, permissionKey: "chats.reply" });
+    const prepared = await authority.prepareProgrammaticWrite({ ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, permissionKey: "chats.reply", mintCustomManualSettlementCapability: true });
+    assert.equal(prepared.delivery.status, "COMMITTING");
+    assert.ok(prepared.settlementToken);
+    assert.equal(getRow().result.customManualSettlementTokenHashes.length, 1, "first token hash must commit in the same transition as COMMITTING");
+
+    const recovered = await authority.attachCustomManualSettlementCapability({
+      agencyId: "agency-a", creatorId: "creator-a", deviceId: "device-a", userId: "user-a",
+      idempotencyKey: manual.idempotencyKey, payloadFingerprint: manual.payloadFingerprint, networkRequestId: "network-v2-exact", writeCommitRevision: 0,
+    });
+    assert.ok(recovered.settlementToken);
+    assert.notEqual(recovered.settlementToken, prepared.settlementToken);
+    assert.equal(recovered.writeId, reserved.delivery.id);
+    assert.equal(recovered.writeCommitRevision, prepared.writeCommitRevision);
+    assert.equal(getRow().result.customManualSettlementTokenHashes.length, 2, "recovery must append, never evict an already issued capability");
+
+    await assert.rejects(() => authority.attachCustomManualSettlementCapability({
+      agencyId: "agency-a", creatorId: "creator-a", deviceId: "device-a", userId: "user-a",
+      idempotencyKey: manual.idempotencyKey, payloadFingerprint: "sha256:wrong", networkRequestId: "network-v2-exact", writeCommitRevision: prepared.writeCommitRevision,
+    }), (error) => error?.code === "CUSTOM_MANUAL_WRITE_BINDING_MISMATCH");
+    await assert.rejects(() => authority.attachCustomManualSettlementCapability({
+      agencyId: "agency-a", creatorId: "creator-a", deviceId: "device-a", userId: "user-a",
+      idempotencyKey: manual.idempotencyKey, payloadFingerprint: manual.payloadFingerprint, networkRequestId: "network-v2-other", writeCommitRevision: prepared.writeCommitRevision,
+    }), (error) => error?.code === "CUSTOM_MANUAL_WRITE_BINDING_MISMATCH");
+    await assert.rejects(() => authority.attachCustomManualSettlementCapability({
+      agencyId: "agency-a", creatorId: "creator-a", deviceId: "device-a", userId: "user-a",
+      idempotencyKey: manual.idempotencyKey, payloadFingerprint: manual.payloadFingerprint, networkRequestId: "network-v2-exact", writeCommitRevision: prepared.writeCommitRevision + 1,
+    }), (error) => error?.code === "CUSTOM_MANUAL_WRITE_NOT_COMMITTING");
+
+    const issued = [prepared.settlementToken, recovered.settlementToken];
+    for (let index = 0; index < 6; index += 1) {
+      const grant = await authority.attachCustomManualSettlementCapability({
+        agencyId: "agency-a", creatorId: "creator-a", deviceId: "device-a", userId: "user-a",
+        idempotencyKey: manual.idempotencyKey, payloadFingerprint: manual.payloadFingerprint, networkRequestId: "network-v2-exact", writeCommitRevision: prepared.writeCommitRevision,
+      });
+      issued.push(grant.settlementToken);
+    }
+    assert.equal(getRow().result.customManualSettlementTokenHashes.length, issued.length, "issued settlement capabilities must not be evicted by later exact duplicate recovery");
+    assert.equal(new Set(issued).size, issued.length, "each recovery grant must mint an independent capability");
+  });
+});
+
+test("Audit17 CUSTOM_MANUAL_SEND may rebind changed business payload only while previous attempt is proven precommit", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const manual = {
+      kind: "CUSTOM_MANUAL_SEND", agencyId: "agency-a", userId: "user-a", memberId: "member-a", accessEpoch: 7,
+      creatorId: "creator-a", deviceId: "device-a", idempotencyKey: "custom-manual:order-a:submission-a:0",
+      payloadFingerprint: "sha256:manual-before", payload: { customOrderId: "order-a", submissionId: "submission-a", deliveryPhase: 0, expectedPriceCents: 1000, actualPriceCents: 1000 },
+      targetId: "order-a", fanId: "fan-a", dialogId: "fan-a", permissionKeyOverride: "chats.reply", allowReconciliationTakeover: false,
+    };
+    const reserved = await authority.reserveProgrammaticWrite(manual);
+    await authority.failProgrammaticWrite({ ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, permissionKey: "chats.reply", failureCode: "user_cancelled_precommit", error: "no wire", facts: { provenNoEffect: true, phase: "PRECOMMIT" } });
+    assert.equal(getRow().status, "RETRY_SCHEDULED");
+    assert.equal(getRow().writeCommitAt, null);
+
+    const rebound = await authority.reserveProgrammaticWrite({ ...manual, payloadFingerprint: "sha256:manual-after", payload: { ...manual.payload, expectedPriceCents: 500, actualPriceCents: 500 } });
+    assert.equal(rebound.delivery.status, "CLAIMED");
+    assert.equal(getRow().payloadFingerprint, "sha256:manual-after");
+    assert.equal(getRow().payload.expectedPriceCents, 500);
+  });
+});
+
+test("Audit17 generic settlement endpoints cannot bypass CUSTOM_MANUAL_SEND product-specific Team/Custom projection", async () => {
+  await withAuthority(async ({ authority, getRow }) => {
+    const manual = {
+      kind: "CUSTOM_MANUAL_SEND", agencyId: "agency-a", userId: "user-a", memberId: "member-a", accessEpoch: 7,
+      creatorId: "creator-a", deviceId: "device-a", idempotencyKey: "custom-manual:order-product-settle:submission-a:0",
+      payloadFingerprint: "sha256:manual-product-settle", payload: { customOrderId: "order-product-settle", submissionId: "submission-a", creatorId: "creator-a", dialogId: "fan-a", attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 1000, actualPriceCents: 1000 },
+      targetId: "order-product-settle", fanId: "fan-a", dialogId: "fan-a", permissionKeyOverride: "chats.reply", allowReconciliationTakeover: false,
+    };
+    const reserved = await authority.reserveProgrammaticWrite(manual);
+    await authority.startProgrammaticWrite({ ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, permissionKey: "chats.reply" });
+    const prepared = await authority.prepareProgrammaticWrite({ ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision, permissionKey: "chats.reply" });
+    await assert.rejects(() => authority.completeProgrammaticWrite({
+      ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: prepared.delivery.leaseRevision,
+      result: { messageId: "remote-message-1", mediaIds: ["9001"], customOrderId: "order-product-settle", submissionId: "submission-a" },
+    }), (error) => error?.code === "PROGRAMMATIC_WRITE_PRODUCT_SETTLEMENT_REQUIRED");
+
+    const failed = await authority.failProgrammaticWrite({
+      ...manual, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: prepared.delivery.leaseRevision,
+      failureCode: "write_outcome_unknown", facts: { endpointSemantics: "NON_IDEMPOTENT_WRITE", writeReachedWire: true },
+    });
+    await assert.rejects(() => authority.reconcileProgrammaticWrite({
+      ...manual, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision,
+      outcome: "MATCHED", result: { messageId: "remote-message-1", mediaIds: ["9001"], customOrderId: "order-product-settle", submissionId: "submission-a" },
+    }), (error) => error?.code === "PROGRAMMATIC_WRITE_PRODUCT_SETTLEMENT_REQUIRED");
+
+    getRow().result.reconciliationStartedAt = new Date(Date.now() - 31 * 60_000).toISOString();
+    const closed = await authority.reconcileProgrammaticWrite({
+      ...manual, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision,
+      outcome: "WAIT_FOR_READBACK", result: { successfulReadback: false, negativeObservationIsNotProof: true },
+    });
+    assert.equal(closed.delivery.failureCode, "outcome_unresolved_do_not_retry");
+    await assert.rejects(() => authority.resolveProgrammaticWriteUnresolvedMatched({
+      ...manual, writeId: reserved.delivery.id, result: { messageId: "remote-message-1" },
+    }), (error) => error?.code === "PROGRAMMATIC_WRITE_PRODUCT_SETTLEMENT_REQUIRED");
+  });
+});
+
+
+test("native OF MASS page actions require a server-visible physical commit permit and V3 settlement survives auth retirement", () => {
+  const route = read("routes/programmatic-of-writes.js");
+  const block = route.slice(route.indexOf('router.post("/mass-native/preflight"'), route.indexOf('router.post("/mass-intent/reserve"'));
+  assert.match(block, /authorityVersion:\s*z\.enum\(\["MASS_NATIVE_V2",\s*"MASS_NATIVE_V3"\]\)/);
+  assert.match(block, /operation:\s*z\.enum\(\["CREATE",\s*"CANCEL"\]\)/);
+  assert.match(block, /requestKey:\s*z\.string\(\)\.min\(3\)\.max\(500\)/);
+  assert.match(block, /requireProductCreator\(req,\s*input\.creatorId\)/);
+  assert.match(block, /requireProductPermission\(req,\s*"chats\.mass_message"/);
+  assert.match(block, /authorizeNativeMassWrite\(\{\s*\.\.\.actor\(req\),\s*\.\.\.input\s*\}\)/);
+  assert.match(block, /router\.post\("\/mass-native\/:writeId\/complete"/); // V2 rolling fallback remains authenticated
+  assert.doesNotMatch(block, /MASS_NATIVE_V1|publicKindAccess\(req,\s*"MASS_QUEUE_CREATE"/);
+
+  const settlement = read("routes/programmatic-of-write-settlement.js");
+  assert.match(settlement, /authorityVersion:\s*z\.literal\("MASS_NATIVE_V3"\)/);
+  assert.match(settlement, /settlementToken:\s*z\.string\(\)\.min\(20\)/);
+  assert.match(settlement, /completeNativeMassWriteWithSettlementToken/);
+  assert.match(settlement, /\/custom-manual\/:writeId\/settle/);
+  assert.match(settlement, /CUSTOM_MANUAL_V2/);
+  assert.match(settlement, /settleCustomManualDeliveryWithCapability/);
+  assert.doesNotMatch(settlement, /authorizeNativeMassWrite|reserveProgrammaticWrite/);
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  const publicAt = server.indexOf('app.use("/api/programmatic-of-write-settlement", programmaticOfWriteSettlementRoutes)');
+  const authAt = server.indexOf('app.use("/api/programmatic-of-writes", authRequired, programmaticOfWriteRoutes)');
+  assert.ok(publicAt >= 0 && authAt > publicAt, "settlement-only capability must not be gated by a membership that can disappear after provider 2xx");
+});
+
+test("Audit17 programmatic maintenance scans all expired/stranded rows with keyset pagination instead of a 10k correctness horizon", () => {
+  const service = read("services/programmatic-of-write-authority-service.js");
+  const start = service.indexOf("async function sweepExpiredProgrammaticWriteLeases(");
+  const end = service.indexOf("\n\nfunction massIntentTerminalOutcome", start);
+  const sweep = service.slice(start, end);
+  assert.match(sweep, /const scanAll = async/);
+  assert.match(sweep, /orderBy:\s*\{ id:\s*"asc" \}/);
+  assert.match(sweep, /id:\s*\{ gt:\s*afterId \}/);
+  assert.match(sweep, /take:\s*500/);
+  assert.doesNotMatch(sweep, /take:\s*10000|take:\s*10_000/);
 });

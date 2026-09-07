@@ -49,6 +49,48 @@ test("client-supplied OF mediaId is rejected and media projection calls the serv
   assert.doesNotMatch(media, /mediaId:\s*req\.body/);
 });
 
+
+
+
+
+test("programmatic CUSTOM-media preflight is product-device bound and derives provenance only from actual media IDs", () => {
+  const preflight = block('router.post("/ready-deliveries/programmatic-media-preflight"', 'router.post("/ready-deliveries/commit"');
+  assert.match(preflight, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
+  assert.match(preflight, /preflightProgrammaticCustomMedia\s*\(/);
+  assert.match(preflight, /creatorId:\s*req\.body\?\.creatorId/);
+  assert.match(preflight, /mediaIds:\s*req\.body\?\.mediaIds/);
+  assert.doesNotMatch(preflight, /customOrderId:\s*req\.body|dialogId:\s*req\.body/);
+});
+
+test("manual CUSTOM physical-send commit is device/access-bound and mints server-visible Audit17 authority", () => {
+  const commit = block('router.post("/ready-deliveries/commit"', 'router.post("/ready-deliveries/preflight"');
+  assert.match(commit, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
+  assert.match(commit, /currentAccessEpoch\(req\)/);
+  assert.match(commit, /prepareCustomManualDeliveryCommit\s*\(/);
+  assert.match(commit, /networkRequestId:\s*req\.body\?\.networkRequestId/);
+  assert.doesNotMatch(commit, /customOrderId:\s*req\.body/);
+});
+
+
+
+test("manual CUSTOM has no approximate readback-match settlement routes", () => {
+  assert.doesNotMatch(source, /ready-deliveries\/reconciliation-work/);
+  assert.doesNotMatch(source, /ready-deliveries\/reconciliation\/:writeId\/matched/);
+  assert.doesNotMatch(source, /resolveCustomManualDeliveryReconciliationMatched|listCustomManualDeliveryReconciliationWork/);
+});
+
+test("manual CUSTOM physical-send preflight is device-bound and derives authority from actual media, not a client order id", () => {
+  const preflight = block('router.post("/ready-deliveries/preflight"', 'router.get("/ready-deliveries"');
+  assert.match(preflight, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
+  assert.match(preflight, /preflightCustomManualSend\s*\(/);
+  assert.match(preflight, /creatorId:\s*req\.body\?\.creatorId/);
+  assert.match(preflight, /dialogId:\s*req\.body\?\.dialogId/);
+  assert.match(preflight, /mediaIds:\s*req\.body\?\.mediaIds/);
+  assert.match(preflight, /commitAuthorityVersion/);
+  assert.match(preflight, /CUSTOM_MANUAL_V1/);
+  assert.match(preflight, /CUSTOM_DELIVERY_CLIENT_UPGRADE_REQUIRED/);
+  assert.doesNotMatch(preflight, /customOrderId:\s*req\.body/);
+});
 test("direct client fan-delivery confirmation is retired; only durable MESSAGE_SEND_CONFIRMED projection remains", () => {
   const direct = block('router.post("/ready-deliveries/:customOrderId/confirm-send"', 'router.get("/review-queue"');
   assert.match(direct, /status\(410\)/);
@@ -77,4 +119,17 @@ test("Telegram inbound route hands the durable provider observation only to inbo
   assert.match(inbound, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
   assert.match(inbound, /ingestTelegramInboundEvent\s*\(/);
   assert.doesNotMatch(inbound, /createCustomContentSubmission/);
+});
+
+test("Vault settlement receipt is device-bound and Content Library finalize cannot accept client settlement assertions", () => {
+  const receipt = block('router.post("/submissions/:submissionId/vault-settlement/confirm"', 'router.post("/submissions/:submissionId/content-library-finalize"');
+  assert.match(receipt, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
+  assert.match(receipt, /confirmCustomContentSubmissionVaultSettlement\s*\(/);
+  assert.match(receipt, /folderId:\s*req\.body\?\.folderId/);
+  assert.match(receipt, /profileRevision:\s*req\.body\?\.profileRevision/);
+  assert.match(receipt, /mediaIds:\s*req\.body\?\.mediaIds/);
+
+  const finalize = block('router.post("/submissions/:submissionId/content-library-finalize"', 'router.patch("/submissions/:submissionId"');
+  assert.match(finalize, /finalizeCustomContentSubmissionLibrary\s*\(/);
+  assert.doesNotMatch(finalize, /folderId:\s*req\.body|mediaIds:\s*req\.body|settled:\s*req\.body/);
 });

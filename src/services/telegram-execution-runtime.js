@@ -9,6 +9,7 @@ const { scanAllById, findPendingTaskAnchors, scanIncompleteTelegramSources, scan
 
 const RUNTIME_LEASE_MS = 90 * 1000;
 const MAX_RUNTIME_CLAIMS = 100;
+const RUNTIME_ACCOUNT_STATE_BATCH = 250;
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 180) { const text = String(value == null ? "" : value).trim(); return text ? text.slice(0, max) : ""; }
@@ -22,9 +23,8 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
       agencyId,
       deletedAt: null,
       ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
-      telegramContact: { not: null },
     },
-    select: { id: true, telegramAccountId: true },
+    select: { id: true, telegramContact: true, telegramAccountId: true },
     onPage: async (rows) => { creators.push(...rows); return false; },
   });
   if (!creators.length) return [];
@@ -68,6 +68,10 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
   }
 
   for (const creator of creators) {
+    // Current planning/messaging identity is mutable and requires a current Telegram contact.
+    // Historical source/thread work below is pinned provider identity and must remain executable
+    // even when the manager later clears or changes creator.telegramContact.
+    if (!clean(creator.telegramContact, 160)) continue;
     const assigned = clean(creator.telegramAccountId);
     const accountId = assigned ? (explicitActive.has(assigned) ? assigned : null) : autoAccountId;
     if (!accountId) continue;
@@ -133,6 +137,25 @@ async function assertTelegramMessagingAccess({ agencyId, member, accountId, crea
     throw fail("TELEGRAM_EXECUTION_ACCOUNT_RETIRING", "This Telegram account is retiring and cannot accept new messaging work", 409);
   }
   return { creator: fullCreator, accountId: normalizedAccountId };
+}
+
+async function fetchRuntimeAccountStateByIds({ agencyId, accountIds, db }) {
+  const ids = Array.from(new Set((Array.isArray(accountIds) ? accountIds : []).map((value) => clean(value)).filter(Boolean)));
+  const byId = new Map();
+  for (let offset = 0; offset < ids.length; offset += RUNTIME_ACCOUNT_STATE_BATCH) {
+    const batch = ids.slice(offset, offset + RUNTIME_ACCOUNT_STATE_BATCH);
+    const rows = await db.agencyTelegramMtprotoAccount.findMany({
+      where: { agencyId, id: { in: batch } },
+      select: {
+        id: true, lifecycleState: true, retirementRequestedAt: true, runtimeClaimedByDeviceId: true, runtimeClaimToken: true, runtimeClaimUntil: true,
+        runtimeLeaseUserId: true, runtimeLeaseMemberId: true, runtimeLeaseAccessEpoch: true, runtimeLeaseCreatorId: true,
+        runtimeClaimGeneration: true, runtimeDrainedGeneration: true, runtimeClaimInboundEligible: true,
+      },
+      take: batch.length,
+    });
+    for (const row of rows || []) byId.set(String(row.id), row);
+  }
+  return byId;
 }
 
 async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, accountId = null, limit = MAX_RUNTIME_CLAIMS, now = new Date(), db }) {
@@ -220,17 +243,17 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
     throw fail("TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN", "This member has no creator access through this Telegram account", 403);
   }
   const take = Math.max(1, Math.min(MAX_RUNTIME_CLAIMS, Math.floor(Number(limit) || MAX_RUNTIME_CLAIMS)));
+  const accountStateById = await fetchRuntimeAccountStateByIds({ agencyId, accountIds: candidates.map((candidate) => candidate.accountId), db });
   const leases = [];
-  for (const candidate of candidates.slice(0, take * 3)) {
+  // Resource capacity is bounded by `take`, discovery is not. Walk every exact
+  // eligible candidate until the lease budget is full. Stable early rows that
+  // are owned by another Desktop must never hide a later claimable account.
+  for (const candidate of candidates) {
     if (leases.length >= take) break;
-    const account = await db.agencyTelegramMtprotoAccount.findFirst({
-      where: { id: candidate.accountId, agencyId },
-      select: { id: true, lifecycleState: true, retirementRequestedAt: true, runtimeClaimedByDeviceId: true, runtimeClaimToken: true, runtimeClaimUntil: true, runtimeLeaseUserId: true, runtimeLeaseMemberId: true, runtimeLeaseAccessEpoch: true, runtimeLeaseCreatorId: true, runtimeClaimGeneration: true, runtimeDrainedGeneration: true, runtimeClaimInboundEligible: true },
-    });
+    const account = accountStateById.get(String(candidate.accountId));
     if (!account) continue;
     const lifecycleState = String(account.lifecycleState || "ACTIVE").toUpperCase();
     if (lifecycleState !== "ACTIVE" && lifecycleState !== "RETIRING") continue;
-    await assertExecutionAccessFence({ db, agencyId, creatorId: candidate.anchorCreatorId, ...actor, lock: true });
     const ownedIdentity = String(account.runtimeClaimedByDeviceId || "") === normalizedDeviceId
       && String(account.runtimeLeaseUserId || "") === actor.userId
       && String(account.runtimeLeaseMemberId || "") === actor.memberId
@@ -247,6 +270,11 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
     // Never transfer that generation to a different Desktop merely because its TTL expired.
     if (priorUndrained && !ownedIdentity) continue;
     if (lifecycleState === "RETIRING" && !ownedIdentity) continue;
+    const occupiedByOther = !ownedIdentity
+      && account.runtimeClaimUntil
+      && new Date(account.runtimeClaimUntil).getTime() > now.getTime();
+    if (occupiedByOther) continue;
+    await assertExecutionAccessFence({ db, agencyId, creatorId: candidate.anchorCreatorId, ...actor, lock: true });
     const claimToken = existingOwned || resumeUndrainedOwner || lifecycleState === "RETIRING" ? String(account.runtimeClaimToken) : crypto.randomUUID();
     if (!claimToken) continue;
     const nextGeneration = existingOwned || resumeUndrainedOwner || lifecycleState === "RETIRING" ? claimGeneration : claimGeneration + 1;

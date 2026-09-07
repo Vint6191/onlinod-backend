@@ -428,6 +428,50 @@ async function runTelegramInboundProjectionSweep({ now = new Date() } = {}) {
   }
 }
 
+async function runTelegramConfirmedProjectionSweep({ now = new Date() } = {}) {
+  try {
+    // CONFIRMED Telegram provider receipts are canonical facts. If an older process crashed
+    // after committing the receipt but before projecting CustomOrder / CANCELLATION state, the
+    // repair is backend-owned and must converge even with no Desktop polling. Drain agencies by
+    // cursor instead of hiding historical debt behind a fixed first-N workspace sample.
+    const { scanAllById } = require("./telegram-exact-authority-scan-service");
+    const { repairConfirmedTelegramDeliveryProjections } = require("./telegram-delivery-authority-service");
+    const report = {
+      ok: true, agencies: 0, scanned: 0, repaired: 0, failed: 0,
+      reminderScheduleScanned: 0, reminderScheduleRepaired: 0, reminderScheduleFailed: 0,
+    };
+    await scanAllById({
+      delegate: prisma.agency,
+      where: { deletedAt: null },
+      select: { id: true },
+      pageSize: 100,
+      onPage: async (rows) => {
+        for (const agency of rows || []) {
+          report.agencies += 1;
+          const result = await repairConfirmedTelegramDeliveryProjections({ agencyId: String(agency.id), now, db: prisma });
+          report.scanned += Number(result?.scanned || 0);
+          report.repaired += Number(result?.repaired || 0);
+          report.failed += Number(result?.failed || 0);
+          report.reminderScheduleScanned += Number(result?.reminderScheduleScanned || 0);
+          report.reminderScheduleRepaired += Number(result?.reminderScheduleRepaired || 0);
+          report.reminderScheduleFailed += Number(result?.reminderScheduleFailed || 0);
+          if (result?.ok === false) report.ok = false;
+        }
+        return false;
+      },
+    });
+    if (report.scanned > 0 || report.failed > 0 || report.reminderScheduleScanned > 0 || report.reminderScheduleFailed > 0) {
+      console.log(`[scheduler] Telegram confirmed projection — agencies=${report.agencies}, scanned=${report.scanned}, repaired=${report.repaired}, failed=${report.failed}, reminderScheduleScanned=${report.reminderScheduleScanned}, reminderScheduleRepaired=${report.reminderScheduleRepaired}, reminderScheduleFailed=${report.reminderScheduleFailed}`);
+    }
+    return report;
+  } catch (err) {
+    // Repair touches only derived state over already-confirmed provider outcomes. Never suppress
+    // the recurring scheduler if one historical row requires explicit operator adjudication.
+    console.warn("[scheduler] Telegram confirmed projection failed:", err?.message || err);
+    return { ok: false, agencies: 0, scanned: 0, repaired: 0, failed: 1, error: err?.message || String(err) };
+  }
+}
+
 async function maybeBackfillTeamPendingProjection() {
   try {
     const { backfillTeamPendingProjectionBatch } = require("./team-pending-projection-service");
@@ -537,6 +581,7 @@ async function runRecurringSweep() {
     console.warn("[scheduler] billing expiry reconciliation failed:", err?.message || err);
     billingExpiry = { ok: false, error: err?.message || String(err) };
   }
+  const telegramConfirmedProjection = await runTelegramConfirmedProjectionSweep({ now });
   const teamMoneyBackfill = await maybeReconcileHistoricalTeamMoney();
   const teamPendingBackfill = await maybeBackfillTeamPendingProjection();
 
@@ -554,6 +599,7 @@ async function runRecurringSweep() {
     retention,
     billingRenewals,
     billingExpiry,
+    telegramConfirmedProjection,
     teamMoneyBackfill,
     teamPendingBackfill,
   };
@@ -629,6 +675,7 @@ module.exports = {
   TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS,
   TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,
   runTelegramInboundProjectionSweep,
+  runTelegramConfirmedProjectionSweep,
   maybeRunRetentionSweep,
   maybeReconcileHistoricalTeamMoney,
 };

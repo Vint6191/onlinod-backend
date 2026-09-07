@@ -39,6 +39,7 @@ function fakeDb(seed = {}) {
   };
   const rows = (seed.orders || []).map(clone);
   const contentSubmissions = (seed.submissions || []).map(clone);
+  const relayWrites = (seed.relayWrites || []).map(clone);
   const accounts = (seed.accounts || [{ id: "tg-1", agencyId: "agency-1", runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null }]).map(clone);
   const deliveryIntents = [];
   let seq = 0;
@@ -97,7 +98,11 @@ function fakeDb(seed = {}) {
   }
 
   return {
-    _rows: rows, _deliveryIntents: deliveryIntents,
+    _rows: rows, _contentSubmissions: contentSubmissions, _relayWrites: relayWrites, _deliveryIntents: deliveryIntents,
+    agency: {
+      async findFirst({ where }) { return where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null; },
+      async findUnique({ where }) { return where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null; },
+    },
     workspaceSetting: { async findUnique() { return null; } },
     agencyMember: {
       async findFirst({ where }) {
@@ -138,6 +143,73 @@ function fakeDb(seed = {}) {
           (where.agencyId === undefined || row.agencyId === where.agencyId)
           && (where.customOrderId === undefined || row.customOrderId === where.customOrderId)
         ) || null);
+      },
+      async findMany({ where = {}, select = null }) {
+        const found = contentSubmissions.filter((row) =>
+          (where.agencyId === undefined || row.agencyId === where.agencyId)
+          && (where.customOrderId === undefined || row.customOrderId === where.customOrderId)
+          && (where.pipelineDisposition === undefined || String(row.pipelineDisposition || "ACTIVE") === String(where.pipelineDisposition))
+        );
+        if (!select) return found.map(clone);
+        return found.map((row) => Object.fromEntries(Object.entries(select).filter(([, enabled]) => enabled).map(([key]) => [key, clone(row[key])])));
+      },
+      async updateMany({ where = {}, data = {} }) {
+        let count = 0;
+        for (const row of contentSubmissions) {
+          if (where.agencyId !== undefined && row.agencyId !== where.agencyId) continue;
+          if (where.customOrderId !== undefined && row.customOrderId !== where.customOrderId) continue;
+          if (where.id !== undefined && row.id !== where.id) continue;
+          if (where.pipelineDisposition !== undefined && String(row.pipelineDisposition || "ACTIVE") !== String(where.pipelineDisposition)) continue;
+          Object.assign(row, clone(data));
+          count += 1;
+        }
+        return { count };
+      },
+    },
+    automationDelivery: {
+      async findFirst({ where = {} }) {
+        const found = relayWrites.find((row) => {
+          if (where.agencyId !== undefined && row.agencyId !== where.agencyId) return false;
+          if (where.creatorId !== undefined && row.creatorId !== where.creatorId) return false;
+          if (where.actionType !== undefined && row.actionType !== where.actionType) return false;
+          if (where.targetId !== undefined && row.targetId !== where.targetId) return false;
+          if (Array.isArray(where.OR) && where.OR.length) {
+            const matched = where.OR.some((candidate) => {
+              if (candidate?.status?.in) return candidate.status.in.includes(row.status);
+              if (candidate?.status !== undefined && row.status !== candidate.status) return false;
+              if (candidate?.failureCode !== undefined && row.failureCode !== candidate.failureCode) return false;
+              return candidate?.status !== undefined || candidate?.failureCode !== undefined;
+            });
+            if (!matched) return false;
+          }
+          return true;
+        });
+        return found ? clone(found) : null;
+      },
+      async updateMany({ where = {}, data = {} }) {
+        let count = 0;
+        for (const row of relayWrites) {
+          if (where.agencyId !== undefined && row.agencyId !== where.agencyId) continue;
+          if (where.creatorId !== undefined && row.creatorId !== where.creatorId) continue;
+          if (where.actionType !== undefined && row.actionType !== where.actionType) continue;
+          if (where.status?.in && !where.status.in.includes(row.status)) continue;
+          if (Array.isArray(where.OR) && where.OR.length) {
+            const matched = where.OR.some((candidate) => {
+              const prefix = candidate?.targetId?.startsWith;
+              return typeof prefix === "string" && String(row.targetId || "").startsWith(prefix);
+            });
+            if (!matched) continue;
+          }
+          for (const [key, value] of Object.entries(data)) {
+            if (value && typeof value === "object" && Number.isFinite(Number(value.increment))) {
+              row[key] = Number(row[key] || 0) + Number(value.increment);
+            } else {
+              row[key] = clone(value);
+            }
+          }
+          count += 1;
+        }
+        return { count };
       },
     },
     customOrder: {
@@ -186,6 +258,7 @@ function fakeDb(seed = {}) {
       },
     },
     auditLog: { async create({ data }) { return { id: `audit-${seq}`, ...clone(data) }; } },
+    async $executeRawUnsafe() { return 1; },
     async $transaction(fn) { return fn(this); },
   };
 }
@@ -302,6 +375,94 @@ test("completed/cancelled transitions own their timestamps and cancellation requ
   const cancelled = buildUpdateData(base, { status: "CANCELLED", cancelReason: "fan changed mind", cancelledAt: "2000-01-01T00:00:00Z" }, now);
   assert.equal(cancelled.cancelledAt.toISOString(), now.toISOString(), "client cannot forge cancelledAt");
   assert.equal(cancelled.cancelReason, "fan changed mind");
+});
+
+test("PENDING Custom mutations are fenced after CUSTOM_MANUAL_SEND crosses the physical commit boundary", async () => {
+  const updatedAt = new Date("2026-08-21T10:00:00.000Z");
+  const baseOrder = {
+    id: "order-manual-inflight", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "manual delivery", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING",
+    dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null,
+    deliveredAt: null, fanDeliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 6000, paidAmountCents: 1000,
+    deliveryOfferedCents: 0, deliverySentMediaIds: [], deliveryMessageIds: [], telegramTaskMessageId: null, telegramReferenceMessageIds: [],
+    reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
+    createdAt: updatedAt, updatedAt,
+  };
+  const cases = [
+    { status: "COMMITTING", failureCode: null },
+    { status: "RECONCILE_REQUIRED", failureCode: null },
+    { status: "FAILED", failureCode: "outcome_unresolved_do_not_retry" },
+  ];
+  for (const state of cases) {
+    const db = fakeDb({ orders: [baseOrder], relayWrites: [{
+      id: `manual-${state.status}`, agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_MANUAL_SEND",
+      targetId: "order-manual-inflight", status: state.status, failureCode: state.failureCode,
+      createdAt: updatedAt, updatedAt,
+    }] });
+    await assert.rejects(
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-manual-inflight", input: { price: 70 }, db }),
+      (error) => error?.code === "CUSTOM_DELIVERY_COMMIT_IN_FLIGHT" && error?.status === 409,
+      `${state.status} must block business mutation until the remote outcome is settled`,
+    );
+    assert.equal(db._rows[0].priceCents, 6000);
+  }
+});
+
+test("precommit CUSTOM_MANUAL_SEND does not freeze a PENDING Custom; commit-time current-state recheck owns staleness", async () => {
+  const updatedAt = new Date("2026-08-21T10:00:00.000Z");
+  const db = fakeDb({ orders: [{
+    id: "order-manual-precommit", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "manual delivery", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING",
+    dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null,
+    deliveredAt: null, fanDeliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 6000, paidAmountCents: 1000,
+    deliveryOfferedCents: 0, deliverySentMediaIds: [], deliveryMessageIds: [], telegramTaskMessageId: null, telegramReferenceMessageIds: [],
+    reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
+    createdAt: updatedAt, updatedAt,
+  }], relayWrites: [{
+    id: "manual-running", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_MANUAL_SEND",
+    targetId: "order-manual-precommit", status: "RUNNING", failureCode: null, createdAt: updatedAt, updatedAt,
+  }] });
+  const result = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-manual-precommit", input: { price: 70 }, db });
+  assert.equal(result.order.priceCents, 7000);
+});
+
+test("CONTENT cancellation atomically terminalizes only proven-precommit relay writes and preserves COMMITTING for reconciliation", async () => {
+  const updatedAt = new Date("2026-08-21T10:00:00.000Z");
+  const db = fakeDb({
+    orders: [{
+      id: "order-cancel-content", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+      scenario: "cancel while media relay is in flight", internalNote: null, type: "CONTENT", contentKind: "BOTH", status: "PENDING",
+      dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null,
+      deliveredAt: null, fanDeliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0, paidAmountCents: 0,
+      telegramTaskMessageId: null, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null,
+      lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null, contentBoundAt: updatedAt,
+      createdAt: updatedAt, updatedAt,
+    }],
+    submissions: [{
+      id: "submission-cancel-content", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-cancel-content",
+      pipelineDisposition: "ACTIVE", pipelineDispositionReason: null, pipelineDispositionChangedAt: null,
+    }],
+    relayWrites: [
+      { id: "relay-claimed", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", targetId: "submission-cancel-content:0", status: "CLAIMED", leaseRevision: 2, claimedByDeviceId: "device-a", claimUntil: new Date("2026-08-21T10:05:00Z") },
+      { id: "relay-running", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", targetId: "submission-cancel-content:1", status: "RUNNING", leaseRevision: 3, claimedByDeviceId: "device-a", claimUntil: new Date("2026-08-21T10:05:00Z") },
+      { id: "relay-committing", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", targetId: "submission-cancel-content:2", status: "COMMITTING", leaseRevision: 4, claimedByDeviceId: "device-a", claimUntil: new Date("2026-08-21T10:05:00Z") },
+    ],
+  });
+
+  const result = await updateCustomOrder({
+    agencyId: "agency-1", member, orderId: "order-cancel-content",
+    input: { status: "CANCELLED", cancelReason: "fan changed mind" },
+    now: new Date("2026-08-21T10:01:00.000Z"), db,
+  });
+
+  assert.equal(result.order.status, "CANCELLED");
+  assert.equal(db._contentSubmissions[0].pipelineDisposition, "SALVAGE");
+  const byId = new Map(db._relayWrites.map((row) => [row.id, row]));
+  assert.equal(byId.get("relay-claimed").status, "CANCELED");
+  assert.equal(byId.get("relay-running").status, "CANCELED");
+  assert.equal(byId.get("relay-claimed").claimedByDeviceId, null);
+  assert.equal(byId.get("relay-running").claimedByDeviceId, null);
+  assert.equal(byId.get("relay-committing").status, "COMMITTING", "already-crossed commit boundary must survive cancellation for reconciliation");
 });
 
 test("list applies member creator scope and reports pending/overdue counters", async () => {

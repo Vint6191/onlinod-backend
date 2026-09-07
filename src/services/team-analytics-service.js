@@ -735,6 +735,10 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
       continue;
     }
 
+    if (canonicalKind === "BROADCAST_QUEUE_CANCELED_CONFIRMED") {
+      continue;
+    }
+
     if (canonicalKind === "BROADCAST_DISPATCH_CONFIRMED") {
       if (m) m.broadcastDispatches += 1;
       continue;

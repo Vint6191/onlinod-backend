@@ -14,14 +14,26 @@ function fakeDb({ lifecycleState = "ACTIVE", accountExists = true } = {}) {
     runtimeClaimedByDeviceId: null, runtimeClaimUntil: null,
     runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0,
   } : null;
+  const agency = { id: "agency-1", deletedAt: null, status: "ACTIVE" };
   const creator = {
-    id: "creator-1", agencyId: "agency-1", deletedAt: null,
+    id: "creator-1", agencyId: "agency-1", deletedAt: null, status: "READY",
     telegramContact: "@old", telegramUserId: "900001", telegramAccountId: null,
   };
   const audits = [];
   let tail = Promise.resolve();
 
   const db = {
+    agency: {
+      async findFirst({ where, select = null }) {
+        if (where.id !== agency.id) return null;
+        if (where.deletedAt === null && agency.deletedAt) return null;
+        if (!select) return clone(agency);
+        const out = {};
+        for (const [key, enabled] of Object.entries(select)) if (enabled) out[key] = clone(agency[key]);
+        return out;
+      },
+      async findUnique({ where, select = null }) { return this.findFirst({ where, select }); },
+    },
     agencyTelegramMtprotoAccount: {
       async findFirst({ where, select = null }) {
         if (!account || where.id !== account.id || where.agencyId !== account.agencyId) return null;
@@ -55,7 +67,8 @@ function fakeDb({ lifecycleState = "ACTIVE", accountExists = true } = {}) {
     },
     creatorAccount: {
       async findFirst({ where, select = null }) {
-        if (where.id !== creator.id || where.agencyId !== creator.agencyId || creator.deletedAt) return null;
+        if (where.id !== creator.id || where.agencyId !== creator.agencyId) return null;
+        if (where.deletedAt === null && creator.deletedAt) return null;
         if (!select) return clone(creator);
         const out = {};
         for (const [key, enabled] of Object.entries(select)) if (enabled) out[key] = clone(creator[key]);
@@ -82,17 +95,19 @@ function fakeDb({ lifecycleState = "ACTIVE", accountExists = true } = {}) {
       tail = new Promise((resolve) => { release = resolve; });
       await previous;
       const accountSnapshot = clone(account);
+      const agencySnapshot = clone(agency);
       const creatorSnapshot = clone(creator);
       const auditLength = audits.length;
       try { return await work(db); }
       catch (error) {
         account = clone(accountSnapshot);
+        Object.assign(agency, clone(agencySnapshot));
         Object.assign(creator, clone(creatorSnapshot));
         audits.splice(auditLength);
         throw error;
       } finally { release(); }
     },
-    _state: () => ({ account: clone(account), creator: clone(creator), audits: clone(audits) }),
+    _state: () => ({ account: clone(account), agency: clone(agency), creator: clone(creator), audits: clone(audits) }),
   };
   return db;
 }
@@ -164,4 +179,30 @@ test("F41 retirement transaction winning first blocks a concurrently started cre
   await assert.rejects(assignment, (error) => error?.code === "CREATOR_TELEGRAM_ACCOUNT_RETIRING");
   assert.equal(db._state().creator.telegramAccountId, null);
   assert.equal(db._state().creator.telegramContact, "@old");
+});
+
+
+test("creator retirement winning first blocks a concurrently queued Telegram rebinding", async () => {
+  const db = fakeDb();
+  let retiredResolve;
+  const retired = new Promise((resolve) => { retiredResolve = resolve; });
+  let allowCommitResolve;
+  const allowCommit = new Promise((resolve) => { allowCommitResolve = resolve; });
+
+  const retirement = db.$transaction(async (tx) => {
+    await tx.creatorAccount.update({ where: { id: "creator-1" }, data: { deletedAt: new Date("2026-09-06T12:00:00.000Z"), status: "DISABLED" } });
+    retiredResolve();
+    await allowCommit;
+  });
+  await retired;
+
+  const assignment = updateCreatorTelegramContact({
+    agencyId: "agency-1", actorUserId: owner.userId, creatorId: "creator-1",
+    telegramContact: "@new", telegramAccountId: "tg-1", db,
+  });
+  allowCommitResolve();
+  await retirement;
+  await assert.rejects(assignment, (error) => ["CREATOR_RETIRED", "CREATOR_NOT_FOUND"].includes(error?.code));
+  assert.equal(db._state().creator.telegramContact, "@old");
+  assert.equal(db._state().creator.telegramAccountId, null);
 });

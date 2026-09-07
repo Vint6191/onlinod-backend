@@ -4,6 +4,7 @@ const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { isCompleteSubmission, uniqueMediaIds } = require("./custom-content-library-service");
 const { paymentSnapshot } = require("./custom-orders-service");
+const { hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, derivePipelineStage } = require("./custom-content-pipeline-authority-service");
 
 const CUSTOM_DELIVERY_OVERDUE_MS = 2 * 60 * 60 * 1000;
 
@@ -23,13 +24,13 @@ async function requireDeliveryAccess({ agencyId, member, db }) {
 }
 
 const DELIVERY_INCLUDE = {
-  creator: { select: { id: true, displayName: true, username: true, avatarUrl: true, customsVaultFolderId: true } },
+  creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } },
   customOrder: {
     select: {
       id: true, creatorId: true, dialogId: true, scenario: true, internalNote: true, type: true, contentKind: true,
       status: true, deliveredAt: true, fanDeliveredAt: true, deliverySentMediaIds: true, deliveryMessageIds: true, deliveryOfferedCents: true,
       priceCents: true, paidAmountCents: true, createdAt: true,
-      creator: { select: { id: true, displayName: true, username: true, avatarUrl: true, customsVaultFolderId: true } },
+      creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } },
     },
   },
 };
@@ -54,7 +55,7 @@ async function loadAssets(db, agencyId, rows) {
       where: { agencyId, source: "CUSTOM", OR: or },
       select: {
         creatorId: true, mediaId: true, source: true, customOrderId: true, customSubmissionId: true, customFullPriceCents: true,
-        mediaType: true, thumbUrl: true, previewUrl: true, fullUrl: true, folderIds: true,
+        mediaType: true, thumbUrl: true, previewUrl: true, fullUrl: true, folderIds: true, sortingStatus: true, catalogActive: true,
       },
       take,
     });
@@ -65,21 +66,18 @@ async function loadAssets(db, agencyId, rows) {
 
 function isReady(row, assets) {
   const order = row?.customOrder;
-  if (!order || String(order.type || "") !== "CONTENT") return false;
-  if (String(order.status || "") !== "PENDING" || order.fanDeliveredAt) return false;
-  if (String(row.reviewStatus || "") !== "APPROVED" || !row.reviewedAt) return false;
-  if (!isCompleteSubmission(row)) return false;
+  if (!order || !row?.reviewedAt) return false;
   const ids = uniqueMediaIds(row.ofMediaIds);
   if (!ids.length) return false;
-  const expectedPrice = Math.max(0, Math.round(Number(order.priceCents) || 0));
-  return ids.every((mediaId) => {
-    const asset = assets.get(assetKey(row.creatorId, mediaId));
-    return asset
-      && String(asset.source || "") === "CUSTOM"
-      && String(asset.customSubmissionId || "") === String(row.id || "")
-      && String(asset.customOrderId || "") === String(order.id)
-      && Number(asset.customFullPriceCents) === expectedPrice;
-  });
+  const finalized = hasCurrentVaultSettlement(row)
+    && isCompleteSubmission(row)
+    && ids.every((mediaId) => customAssetMatchesPipelineProjection(row, assets.get(assetKey(row.creatorId, mediaId)), order));
+  return derivePipelineStage({
+    submission: row,
+    order,
+    finalized,
+    blockedCode: row.pipelineBlockedCode,
+  }) === "APPROVED_DELIVERY_READY";
 }
 
 function serializeDelivery(row, assets, nowInput = new Date()) {
@@ -134,22 +132,27 @@ function serializeDelivery(row, assets, nowInput = new Date()) {
     overdueAt: overdueAtDate.toISOString(),
     overdue: overdueForSeconds > 0,
     overdueForSeconds,
-    vaultFolderId: clean(creator?.customsVaultFolderId, 180) || null,
+    vaultFolderId: clean(row.executionVaultFolderId, 180) || null,
   };
 }
 
-async function listCustomReadyDeliveries({ agencyId, member, limit = 100, db = null } = {}) {
+async function listCustomReadyDeliveries({ agencyId, member, limit = 100, cursor = null, db = null } = {}) {
   const client = db || require("../prisma");
   await requireDeliveryAccess({ agencyId, member, db: client });
   const scope = await allowedCreatorScope({ agencyId, member, db: client });
   const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 100)));
   const items = [];
   const serverNow = new Date();
-  let cursor = null;
-  for (let pass = 0; pass < 10 && items.length < take; pass += 1) {
+  let scanCursor = clean(cursor, 180) || null;
+  const seenCursors = new Set();
+
+  while (items.length < take) {
+    if (scanCursor && seenCursors.has(scanCursor)) throw fail("CUSTOM_DELIVERY_CURSOR_LOOP", "Ready-delivery cursor did not advance", 500);
+    if (scanCursor) seenCursors.add(scanCursor);
     const rows = await client.customContentSubmission.findMany({
       where: {
         agencyId,
+        pipelineDisposition: "ACTIVE",
         reviewStatus: "APPROVED",
         reviewedAt: { not: null },
         customOrderId: { not: null },
@@ -159,19 +162,30 @@ async function listCustomReadyDeliveries({ agencyId, member, limit = 100, db = n
       include: DELIVERY_INCLUDE,
       orderBy: [{ reviewedAt: "asc" }, { id: "asc" }],
       take: 200,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
     });
-    if (!rows.length) break;
-    cursor = rows[rows.length - 1].id;
-    const candidates = rows.filter((row) => row.customOrder && String(row.customOrder.type || "") === "CONTENT" && String(row.customOrder.status || "") === "PENDING" && !row.customOrder.fanDeliveredAt && isCompleteSubmission(row));
+    if (!rows.length) return { ok: true, items, count: items.length, nextCursor: null, serverNow: serverNow.toISOString() };
+
+    const candidates = rows.filter((row) => row.customOrder
+      && String(row.customOrder.type || "") === "CONTENT"
+      && String(row.customOrder.status || "") === "PENDING"
+      && !row.customOrder.fanDeliveredAt
+      && isCompleteSubmission(row));
     const assets = await loadAssets(client, agencyId, candidates);
-    for (const row of candidates) {
-      if (items.length >= take) break;
-      if (isReady(row, assets)) items.push(serializeDelivery(row, assets, serverNow));
+    const candidateIds = new Set(candidates.map((row) => String(row.id)));
+
+    for (const row of rows) {
+      scanCursor = String(row.id);
+      if (candidateIds.has(String(row.id)) && isReady(row, assets)) items.push(serializeDelivery(row, assets, serverNow));
+      if (items.length >= take) {
+        // Cursor is the last row actually inspected, never the end of the fetched
+        // batch. This keeps later eligible rows reachable across API pages.
+        return { ok: true, items, count: items.length, nextCursor: scanCursor, serverNow: serverNow.toISOString() };
+      }
     }
-    if (rows.length < 200) break;
+    if (rows.length < 200) return { ok: true, items, count: items.length, nextCursor: null, serverNow: serverNow.toISOString() };
   }
-  return { ok: true, items, count: items.length, serverNow: serverNow.toISOString() };
+  return { ok: true, items, count: items.length, nextCursor: scanCursor, serverNow: serverNow.toISOString() };
 }
 
 async function getCustomReadyDelivery({ agencyId, member, customOrderId, db = null } = {}) {
@@ -183,6 +197,7 @@ async function getCustomReadyDelivery({ agencyId, member, customOrderId, db = nu
   const row = await client.customContentSubmission.findFirst({
     where: {
       agencyId,
+      pipelineDisposition: "ACTIVE",
       customOrderId: orderId,
       reviewStatus: "APPROVED",
       reviewedAt: { not: null },
@@ -198,9 +213,126 @@ async function getCustomReadyDelivery({ agencyId, member, customOrderId, db = nu
   return { ok: true, item: serializeDelivery(row, assets, serverNow), serverNow: serverNow.toISOString() };
 }
 
+async function resolveAttemptedCustomMedia({ client, agencyId, creatorId, attemptedMediaIds }) {
+  const customAssets = await client.creatorMediaAsset.findMany({
+    where: { agencyId, creatorId, source: "CUSTOM", mediaId: { in: attemptedMediaIds } },
+    select: { mediaId: true, customOrderId: true, customSubmissionId: true },
+    take: attemptedMediaIds.length,
+  });
+  const assetCustomIds = new Set((customAssets || []).map((asset) => clean(asset.mediaId, 180)).filter(Boolean));
+  const missingProjectionIds = attemptedMediaIds.filter((mediaId) => !assetCustomIds.has(mediaId));
+  // CreatorMediaAsset is only the fast typed projection. Proven submission media
+  // remain CUSTOM even when that projection is missing/drifted.
+  const provenanceRows = missingProjectionIds.length ? await client.customContentSubmission.findMany({
+    where: { agencyId, creatorId, ofMediaIds: { hasSome: missingProjectionIds } },
+    select: { id: true, customOrderId: true, ofMediaIds: true },
+  }) : [];
+  const provenBySubmission = new Set();
+  const missing = new Set(missingProjectionIds);
+  for (const row of provenanceRows || []) {
+    for (const mediaId of uniqueMediaIds(row.ofMediaIds)) if (missing.has(mediaId)) provenBySubmission.add(mediaId);
+  }
+  return {
+    customAssets,
+    provenanceRows,
+    customIds: new Set([...assetCustomIds, ...provenBySubmission]),
+  };
+}
+
+async function preflightProgrammaticCustomMedia({ agencyId, member, creatorId, mediaIds, db = null } = {}) {
+  const client = db || require("../prisma");
+  const creator = clean(creatorId, 180);
+  const rawAttempted = Array.isArray(mediaIds) ? mediaIds : [];
+  const attemptedMediaIds = [];
+  const seenAttempted = new Set();
+  for (const raw of rawAttempted) {
+    const mediaId = clean(raw, 240);
+    if (!mediaId || seenAttempted.has(mediaId)) continue;
+    seenAttempted.add(mediaId);
+    attemptedMediaIds.push(mediaId);
+  }
+  if (attemptedMediaIds.length > 200) throw fail("CUSTOM_DELIVERY_MEDIA_LIMIT", "Too many media IDs for one programmatic send (max 200)", 413);
+  if (!creator) throw fail("CUSTOM_DELIVERY_PREFLIGHT_CONTEXT_REQUIRED", "creatorId is required");
+  if (!attemptedMediaIds.length) return { ok: true, matched: false, allow: true, code: null, customMediaIds: [] };
+  await allowedCreatorScope({ agencyId, member, requestedCreatorId: creator, db: client });
+  const provenance = await resolveAttemptedCustomMedia({ client, agencyId, creatorId: creator, attemptedMediaIds });
+  const customMediaIds = attemptedMediaIds.filter((mediaId) => provenance.customIds.has(mediaId));
+  if (!customMediaIds.length) return { ok: true, matched: false, allow: true, code: null, customMediaIds: [] };
+  return {
+    ok: true,
+    matched: true,
+    allow: false,
+    code: "CUSTOM_MEDIA_PROGRAMMATIC_FORBIDDEN",
+    error: "CUSTOM media may only be sent through the exact Custom delivery flow, never through automation/campaign programmatic writers",
+    customMediaIds,
+  };
+}
+
+async function preflightCustomManualSend({ agencyId, member, creatorId, dialogId, mediaIds, db = null } = {}) {
+  const client = db || require("../prisma");
+  await requireDeliveryAccess({ agencyId, member, db: client });
+  const creator = clean(creatorId, 180);
+  const dialog = clean(dialogId, 180);
+  const rawAttempted = Array.isArray(mediaIds) ? mediaIds : [];
+  const attemptedMediaIds = [];
+  const seenAttempted = new Set();
+  for (const raw of rawAttempted) {
+    const mediaId = clean(raw, 240);
+    if (!mediaId || seenAttempted.has(mediaId)) continue;
+    seenAttempted.add(mediaId);
+    attemptedMediaIds.push(mediaId);
+  }
+  if (attemptedMediaIds.length > 200) throw fail("CUSTOM_DELIVERY_MEDIA_LIMIT", "Too many media IDs for one manual send (max 200)", 413);
+  if (!creator || !dialog) throw fail("CUSTOM_DELIVERY_PREFLIGHT_CONTEXT_REQUIRED", "creatorId and dialogId are required");
+  if (!attemptedMediaIds.length) return { ok: true, matched: false, allow: true, code: null };
+  await allowedCreatorScope({ agencyId, member, requestedCreatorId: creator, db: client });
+
+  const { customAssets, provenanceRows, customIds } = await resolveAttemptedCustomMedia({
+    client, agencyId, creatorId: creator, attemptedMediaIds,
+  });
+  if (!customIds.size) return { ok: true, matched: false, allow: true, code: null };
+  if (customIds.size !== attemptedMediaIds.length) {
+    return { ok: true, matched: true, allow: false, code: "CUSTOM_DELIVERY_MIXED_MEDIA", error: "Custom content cannot be mixed with unrelated media in one manual send" };
+  }
+  const orderIds = new Set([
+    ...(customAssets || []).map((asset) => clean(asset.customOrderId, 180)).filter(Boolean),
+    ...(provenanceRows || []).map((row) => clean(row.customOrderId, 180)).filter(Boolean),
+  ]);
+  const submissionIds = new Set([
+    ...(customAssets || []).map((asset) => clean(asset.customSubmissionId, 180)).filter(Boolean),
+    ...(provenanceRows || []).map((row) => clean(row.id, 180)).filter(Boolean),
+  ]);
+  if (orderIds.size !== 1 || submissionIds.size !== 1) {
+    return { ok: true, matched: true, allow: false, code: "CUSTOM_DELIVERY_AMBIGUOUS_MEDIA", error: "Selected Custom media do not resolve to one exact approved submission" };
+  }
+
+  const customOrderId = [...orderIds][0];
+  const customSubmissionId = [...submissionIds][0];
+  let current;
+  try {
+    current = await getCustomReadyDelivery({ agencyId, member, customOrderId, db: client });
+  } catch (error) {
+    if (error?.code === "CUSTOM_DELIVERY_NOT_READY") {
+      return { ok: true, matched: true, allow: false, code: "CUSTOM_DELIVERY_NOT_READY", error: "Custom is no longer ready for manual delivery", customOrderId };
+    }
+    throw error;
+  }
+  const item = current.item;
+  if (String(item.creatorId) !== creator || String(item.dialogId) !== dialog || String(item.submissionId) !== customSubmissionId) {
+    return { ok: true, matched: true, allow: false, code: "CUSTOM_DELIVERY_CONTEXT_MISMATCH", error: "Custom media no longer belong to this creator/dialog/current approved submission", customOrderId };
+  }
+  const approved = new Set([...(item.deliveredMediaIds || []), ...(item.media || []).map((media) => String(media.mediaId || "").trim())].filter(Boolean));
+  if (attemptedMediaIds.some((mediaId) => !approved.has(mediaId))) {
+    return { ok: true, matched: true, allow: false, code: "CUSTOM_DELIVERY_STALE_MEDIA", error: "Selected Custom media are not part of the current approved media set", customOrderId };
+  }
+  return { ok: true, matched: true, allow: true, code: null, item, attemptedCustomMediaIds: attemptedMediaIds };
+}
+
 module.exports = {
   listCustomReadyDeliveries,
   getCustomReadyDelivery,
+  preflightCustomManualSend,
+  preflightProgrammaticCustomMedia,
   CUSTOM_DELIVERY_OVERDUE_MS,
   loadAssets,
   isReady,

@@ -7,11 +7,12 @@ const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
 const { SETTINGS_KEY: TELEGRAM_CUSTOM_REMINDERS_KEY, normalizeTelegramCustomReminders, reprojectCustomReminderSchedule } = require("./custom-order-reminders");
-const { findPendingTaskAnchors, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
+const { findPendingTaskAnchors, findCancelledTaskFollowupDebt, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
 const { getWalletState, readRolling30dRevenueBatch, pricingPreviewFromRevenue } = require("./billing-wallet-service");
+const { lockCustomExecutionDefaults } = require("./custom-content-pipeline-authority-service");
 
 const WORKSPACE_SETTING_DEFAULTS = Object.freeze({
   timezone: "UTC",
@@ -413,6 +414,12 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
 
   const before = await getWorkspaceSettings({ agencyId, member, db: client });
   const persist = async (tx) => {
+    if (Object.prototype.hasOwnProperty.call(values, "vaultUploadRecipient")) {
+      // Workspace relay recipient is part of the immutable per-submission execution
+      // profile. Publish it through the same transaction fence used by first pinning
+      // so a later profile commit cannot observe a stale pre-update recipient.
+      await lockCustomExecutionDefaults({ db: tx, agencyId });
+    }
     if (nextName !== undefined) {
       await tx.agency.update({ where: { id: agencyId }, data: { name: nextName } });
     }
@@ -515,7 +522,21 @@ function publicTelegramAccount(row, sessionReady = false, now = new Date()) {
 async function assertTelegramAccountNoBusinessBlockers({ agencyId, accountId, db }) {
   const id = String(accountId);
   const activeIntent = db.telegramDeliveryIntent?.findFirst ? await db.telegramDeliveryIntent.findFirst({
-    where: { agencyId, accountId: id, state: { in: ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED", "FAILED_PRECOMMIT"] } },
+    where: {
+      agencyId,
+      accountId: id,
+      OR: [
+        // Once an external effect may have started, account identity is immutable evidence and
+        // retirement must never erase the capability needed to settle/reconcile that outcome.
+        { state: { in: ["COMMITTING", "RECONCILE_REQUIRED"] } },
+        // Follow-ups execute on the confirmed TASK thread, so their account is historical pinned
+        // authority even before commit. TASK itself is different: before COMMITTING its provider
+        // account is refreshable current configuration. A PLANNED/CLAIMED/FAILED_PRECOMMIT TASK
+        // may safely survive retirement of its stale account and later rebind the SAME canonical
+        // intent to a new ACTIVE account; no external effect has started yet.
+        { kind: { not: "TASK" }, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] } },
+      ],
+    },
     select: { id: true, kind: true, state: true },
   }) : null;
   if (activeIntent) throw Object.assign(new Error("Telegram connection is still required by an active or unresolved Custom delivery"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
@@ -523,6 +544,11 @@ async function assertTelegramAccountNoBusinessBlockers({ agencyId, accountId, db
   const pendingThread = await findPendingTaskAnchors({ agencyId, accountId: id, db, stopAfterFirst: true });
   if (pendingThread.length) {
     throw Object.assign(new Error("Telegram connection is still the canonical thread for a pending Custom order"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
+  }
+
+  const cancelledFollowupDebt = await findCancelledTaskFollowupDebt({ agencyId, accountId: id, db, stopAfterFirst: true });
+  if (cancelledFollowupDebt.length) {
+    throw Object.assign(new Error("Telegram connection still owns a confirmed task whose cancellation follow-up has not been durably planned or confirmed"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
   }
 
   let pendingSource = null;
@@ -539,7 +565,7 @@ async function assertTelegramAccountNoBusinessBlockers({ agencyId, accountId, db
 
   if (db.telegramInboundEvent?.findFirst) {
     const unresolvedInbound = await db.telegramInboundEvent.findFirst({
-      where: { agencyId, accountId: id, submissionId: null, projectionState: { in: ["PENDING", "FAILED_RETRYABLE", "REVIEW_REQUIRED"] } },
+      where: { agencyId, accountId: id, hasMedia: true, submissionId: null, projectionState: { in: ["PENDING", "FAILED_RETRYABLE", "REVIEW_REQUIRED"] } },
       select: { id: true, projectionState: true },
     });
     if (unresolvedInbound) throw Object.assign(new Error("Telegram connection is still required by an unresolved inbound provider source"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });

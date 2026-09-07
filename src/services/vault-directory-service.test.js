@@ -127,3 +127,196 @@ test("protection check returns every requested active Media Library id", async (
   });
   assert.deepEqual(result.protectedMediaIds, ["m1", "m3"]);
 });
+
+
+test("manual Vault mutations protect live CUSTOM pipeline media before the remote destructive write", async () => {
+  const assets = [
+    { mediaId: "m-pinned", source: "CUSTOM", customSubmissionId: "sub-pinned" },
+    { mediaId: "m-other", source: "CUSTOM", customSubmissionId: "sub-other" },
+    { mediaId: "m-unpinned", source: "CUSTOM", customSubmissionId: "sub-unpinned" },
+    { mediaId: "m-terminal", source: "CUSTOM", customSubmissionId: "sub-terminal" },
+  ];
+  const live = [
+    { id: "sub-pinned", executionVaultFolderId: "vault-a" },
+    { id: "sub-other", executionVaultFolderId: "vault-b" },
+    { id: "sub-unpinned", executionVaultFolderId: null },
+  ];
+  const db = {
+    creatorAccount: { async findFirst() { return { id: "creator-1" }; } },
+    creatorMediaAsset: {
+      async findMany({ where }) {
+        return assets.filter((row) => !where.mediaId?.in || where.mediaId.in.includes(row.mediaId));
+      },
+    },
+    customContentSubmission: {
+      async findMany({ where }) {
+        return live.filter((row) => !where.id?.in || where.id.in.includes(row.id));
+      },
+    },
+  };
+
+  const hide = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: assets.map((row) => row.mediaId), operation: "hide_media", db,
+  });
+  assert.deepEqual(new Set(hide.protectedMediaIds), new Set(["m-pinned", "m-other", "m-unpinned"]));
+  assert.ok(!hide.protectedMediaIds.includes("m-terminal"), "terminal Custom history must not block ordinary manual Vault cleanup forever");
+
+  const removePinned = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: assets.map((row) => row.mediaId), operation: "remove_from_list", folderId: "vault-a", db,
+  });
+  assert.deepEqual(new Set(removePinned.protectedMediaIds), new Set(["m-pinned", "m-unpinned"]));
+  assert.ok(!removePinned.protectedMediaIds.includes("m-other"), "removing a live Custom from an unrelated extra folder stays allowed");
+});
+
+test("Vault destructive protection starts at canonical submission.ofMediaIds before CUSTOM asset materialization", async () => {
+  const db = {
+    creatorAccount: { async findFirst() { return { id: "creator-1" }; } },
+    creatorMediaAsset: { async findMany() { return []; } },
+    customContentSubmission: {
+      async findMany({ where }) {
+        if (where?.ofMediaIds?.hasSome) {
+          return [{ id: "sub-canonical", executionVaultFolderId: "vault-a", ofMediaIds: ["m-canonical"] }]
+            .filter((row) => row.ofMediaIds.some((id) => where.ofMediaIds.hasSome.includes(id)));
+        }
+        return [];
+      },
+    },
+  };
+
+  const hide = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["m-canonical"], operation: "hide_media", db,
+  });
+  assert.deepEqual(hide.protectedMediaIds, ["m-canonical"], "confirmed pipeline media is protected before CreatorMediaAsset exists");
+
+  const removePinned = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["m-canonical"], operation: "remove_from_list", folderId: "vault-a", db,
+  });
+  assert.deepEqual(removePinned.protectedMediaIds, ["m-canonical"], "canonical media cannot be removed from its pinned execution folder");
+
+  const removeOther = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["m-canonical"], operation: "remove_from_list", folderId: "vault-b", db,
+  });
+  assert.deepEqual(removeOther.protectedMediaIds, [], "canonical media may still be removed from unrelated extra folders");
+});
+
+test("canonical Vault protection has no correctness LIMIT when one media id is referenced by multiple live submissions", async () => {
+  const submissions = [
+    { id: "sub-a", executionVaultFolderId: "vault-a", ofMediaIds: ["m-shared"] },
+    { id: "sub-b", executionVaultFolderId: "vault-b", ofMediaIds: ["m-shared"] },
+  ];
+  const db = {
+    creatorAccount: { async findFirst() { return { id: "creator-1" }; } },
+    creatorMediaAsset: { async findMany() { return []; } },
+    customContentSubmission: {
+      async findMany(args) {
+        let rows = submissions.filter((row) => row.ofMediaIds.some((id) => args.where?.ofMediaIds?.hasSome?.includes(id)));
+        if (Number.isFinite(args.take)) rows = rows.slice(0, args.take);
+        return rows;
+      },
+    },
+  };
+
+  const result = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["m-shared"], operation: "remove_from_list", folderId: "vault-b", db,
+  });
+  assert.deepEqual(result.protectedMediaIds, ["m-shared"], "all live canonical ownership rows must participate before destructive write authority is decided");
+});
+
+test("Vault destructive protection starts at durable CUSTOM_RELAY_SEND proof before media-commit projects ofMediaIds", async () => {
+  const liveSubmission = {
+    id: "sub-proof-window",
+    executionVaultFolderId: "vault-a",
+    ofMediaIds: [],
+    telegramMessageIds: [701],
+    telegramSourceAccountId: "tg-1",
+    telegramSourceUserId: "987654321012345678",
+  };
+  const proof = {
+    id: "relay-proof-window",
+    idempotencyKey: "custom-relay:sub-proof-window:0",
+    actionType: "CUSTOM_RELAY_SEND",
+    status: "COMPLETED",
+    payload: {
+      submissionId: "sub-proof-window",
+      expectedIndex: 0,
+      telegramSourceAccountId: "tg-1",
+      telegramSourceUserId: "987654321012345678",
+      telegramMessageId: "701",
+    },
+    result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "990701" },
+  };
+  const db = {
+    creatorAccount: { async findFirst() { return { id: "creator-1" }; } },
+    creatorMediaAsset: { async findMany() { return []; } },
+    automationDelivery: {
+      async findMany({ where }) {
+        const requested = new Set((where.OR || []).map((entry) => String(entry?.result?.equals || "")));
+        return requested.has(String(proof.result.mediaId)) ? [proof] : [];
+      },
+    },
+    customContentSubmission: {
+      async findMany({ where }) {
+        if (where?.ofMediaIds?.hasSome) return [];
+        if (where?.id?.in?.includes(liveSubmission.id)) return [liveSubmission];
+        return [];
+      },
+    },
+  };
+
+  const hide = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["990701"], operation: "hide_media", db,
+  });
+  assert.deepEqual(hide.protectedMediaIds, ["990701"], "relay-confirmed media is protected in the proof→media-commit crash window");
+
+  const removePinned = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["990701"], operation: "remove_from_list", folderId: "vault-a", db,
+  });
+  assert.deepEqual(removePinned.protectedMediaIds, ["990701"], "relay-confirmed media cannot leave its pinned execution folder before media-commit");
+});
+
+test("Vault relay-proof protection rejects unbound or terminal historical proof", async () => {
+  const proof = {
+    id: "relay-proof-bad",
+    idempotencyKey: "custom-relay:sub-proof-bad:0",
+    actionType: "CUSTOM_RELAY_SEND",
+    status: "COMPLETED",
+    payload: {
+      submissionId: "sub-proof-bad",
+      expectedIndex: 0,
+      telegramSourceAccountId: "tg-1",
+      telegramSourceUserId: "987654321012345678",
+      telegramMessageId: "999", // does not match canonical source message 701
+    },
+    result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "990702" },
+  };
+  const db = {
+    creatorAccount: { async findFirst() { return { id: "creator-1" }; } },
+    creatorMediaAsset: { async findMany() { return []; } },
+    automationDelivery: { async findMany() { return [proof]; } },
+    customContentSubmission: {
+      async findMany({ where }) {
+        if (where?.ofMediaIds?.hasSome) return [];
+        if (where?.id?.in) {
+          return [{
+            id: "sub-proof-bad", executionVaultFolderId: "vault-a", ofMediaIds: [],
+            telegramMessageIds: [701], telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678",
+          }];
+        }
+        return [];
+      },
+    },
+  };
+  const badBinding = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["990702"], operation: "hide_media", db,
+  });
+  assert.deepEqual(badBinding.protectedMediaIds, [], "a result mediaId without exact source/idempotency binding is not ownership proof");
+
+  db.customContentSubmission.findMany = async ({ where }) => {
+    if (where?.ofMediaIds?.hasSome) return [];
+    return []; // terminal/archived submission is excluded by the live-pipeline query
+  };
+  const terminal = await checkProtectedVaultMedia({
+    agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["990702"], operation: "hide_media", db,
+  });
+  assert.deepEqual(terminal.protectedMediaIds, [], "terminal historical relay proof must not block Vault cleanup forever");
+});

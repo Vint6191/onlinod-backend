@@ -1055,7 +1055,7 @@ test("V13.3.2 billing entitlement mutations serialize on the agency row before t
 
 test("V13.3.2 admin dated-access edits and creator deletion join the same agency billing lock", () => {
   const entitlementRoute = adminSource.match(/router\.patch\("\/creators\/:id\/entitlement"[\s\S]*?return res\.json\(\{ ok: true, entitlement:[\s\S]*?\n\}\);/)?.[0] || "";
-  const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{ ok: true, hard, deleted: before \}\);/)?.[0] || "";
+  const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{[\s\S]*?deleted: before,[\s\S]*?historyPreserved: true[\s\S]*?\n  \}\);\n\}\);/)?.[0] || "";
   assert.match(adminSource, /lockAgencyBillingMutation/);
   assert.match(entitlementRoute, /await lockAgencyBillingMutation\(tx, identity\.agencyId\)/);
   assert.match(entitlementRoute, /tx\.creatorAccount\.findUnique/);
@@ -1137,7 +1137,7 @@ test("V13.3.1 expiry scheduler reconciles future ACTIVE aggregates and does not 
 
 
 test("V13.3.1 creator soft/hard delete recomputes billing aggregate in the delete transaction", () => {
-  const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{ ok: true, hard, deleted: before \}\);/)?.[0] || "";
+  const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{[\s\S]*?deleted: before,[\s\S]*?historyPreserved: true[\s\S]*?\n  \}\);\n\}\);/)?.[0] || "";
   assert.match(deleteRoute, /prisma\.\$transaction/);
   assert.match(deleteRoute, /syncAgencyBillingAggregate\(tx, before\.agencyId, deletedAt\)/);
   assert.match(deleteRoute, /tx\.creatorAccount\.update/);

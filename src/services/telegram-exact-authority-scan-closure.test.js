@@ -17,6 +17,8 @@ test("F44 runtime eligibility separates exact discovery from resource claim limi
   assert.match(eligible, /scanIncompleteTelegramSources/);
   assert.match(eligible, /scanActiveFollowupIntents/);
   assert.match(runtime, /MAX_RUNTIME_CLAIMS\s*=\s*100/, "resource claim cap remains separate from discovery correctness");
+  assert.doesNotMatch(runtime, /candidates\.slice\(0,\s*take\s*\*\s*3\)/, "claim execution must not resample exact discovery before CAS");
+  assert.match(runtime, /fetchRuntimeAccountStateByIds/, "runtime claim prefetches exact candidate state before filling the resource cap");
 });
 
 test("F44 retirement uses exact current-thread/source authority instead of sampled history", () => {

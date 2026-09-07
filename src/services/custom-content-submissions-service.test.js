@@ -17,6 +17,17 @@ const {
   sameMessageIds,
   telegramMessageIds,
 } = require("./custom-content-submissions-service");
+const { vaultSettlementFingerprint } = require("./custom-content-pipeline-authority-service");
+
+function settlementReceipt(folderId, profileRevision, mediaIds, at = new Date("2026-08-21T12:00:00.000Z")) {
+  return {
+    vaultSettlementFolderId: folderId,
+    vaultSettlementProfileRevision: profileRevision,
+    vaultSettlementMediaFingerprint: vaultSettlementFingerprint({ folderId, profileRevision, mediaIds }),
+    vaultSettlementConfirmedAt: at,
+    vaultSettlementConfirmedByDeviceId: "device-1",
+  };
+}
 
 function clone(value) { return value == null ? value : structuredClone(value); }
 
@@ -72,6 +83,7 @@ function fakeDb(seed = {}) {
     if (where.telegramSourceAccountId !== undefined) {
       if (where.telegramSourceAccountId && typeof where.telegramSourceAccountId === "object") {
         if (where.telegramSourceAccountId.not === null && row.telegramSourceAccountId == null) return false;
+        if (Array.isArray(where.telegramSourceAccountId.in) && !where.telegramSourceAccountId.in.includes(row.telegramSourceAccountId)) return false;
       } else if (row.telegramSourceAccountId !== where.telegramSourceAccountId) return false;
     }
     if (where.telegramSourceUserId !== undefined) {
@@ -80,6 +92,25 @@ function fakeDb(seed = {}) {
       } else if (row.telegramSourceUserId !== where.telegramSourceUserId) return false;
     }
     if (where.reviewStatus !== undefined && String(row.reviewStatus || "WAITING_REVIEW") !== String(where.reviewStatus)) return false;
+    if (Array.isArray(where.AND)) {
+      for (const clause of where.AND) {
+        if (Array.isArray(clause?.OR) && clause.OR.some((entry) => entry?.pipelineNextAttemptAt !== undefined)) {
+          const matchesBackoff = clause.OR.some((entry) => {
+            if (entry?.pipelineNextAttemptAt === null) return row.pipelineNextAttemptAt == null;
+            if (entry?.pipelineNextAttemptAt?.lte) return row.pipelineNextAttemptAt == null || new Date(row.pipelineNextAttemptAt).getTime() <= new Date(entry.pipelineNextAttemptAt.lte).getTime();
+            return false;
+          });
+          if (!matchesBackoff) return false;
+        }
+      }
+    }
+    if (Array.isArray(where.OR) && where.OR.length && where.OR.every((entry) => entry && typeof entry === "object" && (entry.creatorId !== undefined || entry.telegramSourceAccountId !== undefined))) {
+      const matchesAny = where.OR.some((entry) =>
+        (entry.creatorId === undefined || String(row.creatorId) === String(entry.creatorId))
+        && (entry.telegramSourceAccountId === undefined || String(row.telegramSourceAccountId || "") === String(entry.telegramSourceAccountId))
+      );
+      if (!matchesAny) return false;
+    }
     if (where.telegramMessageIds?.hasSome) {
       const ids = new Set((row.telegramMessageIds || []).map(Number));
       if (!where.telegramMessageIds.hasSome.some((id) => ids.has(Number(id)))) return false;
@@ -88,6 +119,7 @@ function fakeDb(seed = {}) {
   }
 
   return {
+    $executeRawUnsafe: async (sql) => { assert.match(String(sql), /pg_advisory_xact_lock/); return 0; },
     _orders: orders,
     _submissions: submissions,
     _mediaAssets: mediaAssets,
@@ -95,6 +127,10 @@ function fakeDb(seed = {}) {
     _inboundEvents: inboundEvents,
     _telegramAccounts: telegramAccounts,
     _audits: audits,
+    agency: {
+      async findFirst({ where }) { return where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null; },
+      async findUnique({ where }) { return where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null; },
+    },
     creatorAccount: {
       async findFirst({ where }) {
         const row = creators.find((candidate) => candidate.agencyId === where.agencyId && candidate.id === where.id && !candidate.deletedAt);
@@ -168,6 +204,16 @@ function fakeDb(seed = {}) {
         for (const [key, enabled] of Object.entries(select)) if (enabled) picked[key] = clone(row[key]);
         return picked;
       },
+      async findMany({ where, take = 100 }) {
+        return orders.filter((candidate) => {
+          if (where.agencyId !== undefined && candidate.agencyId !== where.agencyId) return false;
+          if (where.id?.in && !where.id.in.includes(candidate.id)) return false;
+          if (where.type !== undefined && String(candidate.type || "CONTENT") !== String(where.type)) return false;
+          if (where.status !== undefined && String(candidate.status || "PENDING") !== String(where.status)) return false;
+          if (where.fanDeliveredAt === null && candidate.fanDeliveredAt != null) return false;
+          return true;
+        }).slice(0, take).map(clone);
+      },
       async updateMany({ where, data }) {
         const row = orders.find((candidate) =>
           (where.id === undefined || candidate.id === where.id)
@@ -186,12 +232,16 @@ function fakeDb(seed = {}) {
       },
     },
     customContentSubmission: {
-      async findFirst({ where, orderBy = [] }) {
+      async findFirst({ where, orderBy = [], include = null, select = null }) {
         const matches = submissions.filter((row) => matchesSubmission(row, where));
         if (Array.isArray(orderBy) && orderBy[0]?.receivedAt === "desc") {
           matches.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt) || new Date(b.createdAt) - new Date(a.createdAt) || String(b.id).localeCompare(String(a.id)));
         }
-        return clone(matches[0] || null);
+        const found = clone(matches[0] || null);
+        if (!found) return null;
+        if (include?.customOrder) found.customOrder = clone(orders.find((order) => order.id === found.customOrderId) || null);
+        if (select) { const picked = {}; for (const [key, enabled] of Object.entries(select)) if (enabled) picked[key] = clone(found[key]); return picked; }
+        return found;
       },
       async create({ data }) {
         const stamp = new Date(`2026-08-21T12:${String(seq).padStart(2, "0")}:00.000Z`);
@@ -199,11 +249,11 @@ function fakeDb(seed = {}) {
           injectAlbumRace = false;
           const winnerEvent = inboundEvents.find((event) => event.id !== data.telegramInboundEventIds?.[0] && event.groupedId && String(data.telegramSourceKey).endsWith(`group:${event.groupedId}`));
           if (winnerEvent) {
-            submissions.push({ id: data.id, agencyId: data.agencyId, creatorId: data.creatorId, customOrderId: data.customOrderId, telegramMessageIds: [Number(winnerEvent.messageId)], telegramInboundEventIds: [winnerEvent.id], telegramSourceKey: data.telegramSourceKey, telegramSourceAccountId: data.telegramSourceAccountId, telegramSourceUserId: data.telegramSourceUserId, ofMediaIds: [], comment: winnerEvent.text || null, receivedAt: winnerEvent.sentAt, createdAt: stamp, updatedAt: stamp });
+            submissions.push({ id: data.id, agencyId: data.agencyId, creatorId: data.creatorId, customOrderId: data.customOrderId, pipelineDisposition: "ACTIVE", executionProfileRevision: 0, executionPinnedAt: null, executionVaultFolderId: null, executionRelayRecipient: null, telegramMessageIds: [Number(winnerEvent.messageId)], telegramInboundEventIds: [winnerEvent.id], telegramSourceKey: data.telegramSourceKey, telegramSourceAccountId: data.telegramSourceAccountId, telegramSourceUserId: data.telegramSourceUserId, ofMediaIds: [], comment: winnerEvent.text || null, receivedAt: winnerEvent.sentAt, createdAt: stamp, updatedAt: stamp });
             const error = new Error("source key race"); error.code = "P2002"; throw error;
           }
         }
-        const row = { id: `submission-${++seq}`, ...clone(data), createdAt: stamp, updatedAt: stamp };
+        const row = { id: `submission-${++seq}`, pipelineDisposition: "ACTIVE", executionProfileRevision: 0, executionPinnedAt: null, executionVaultFolderId: null, executionRelayRecipient: null, ...clone(data), createdAt: stamp, updatedAt: stamp };
         submissions.push(row);
         return clone(row);
       },
@@ -213,11 +263,31 @@ function fakeDb(seed = {}) {
         Object.assign(row, clone(data), { updatedAt: new Date("2026-08-21T13:00:00.000Z") });
         return clone(row);
       },
-      async findMany({ where, take = 100, skip = 0, orderBy = [] }) {
-        const direction = Array.isArray(orderBy) && orderBy[0]?.receivedAt === "asc" ? 1 : -1;
-        return submissions.filter((row) => matchesSubmission(row, where))
-          .sort((a, b) => direction * (new Date(a.receivedAt) - new Date(b.receivedAt)))
-          .slice(skip, skip + take).map(clone);
+      async findMany({ where, take = 100, skip = 0, cursor = null, orderBy = [] }) {
+        const rows = submissions.filter((row) => matchesSubmission(row, where));
+        const fairnessOrder = Array.isArray(orderBy) && orderBy[0]?.pipelineLastAttemptAt;
+        if (fairnessOrder) {
+          rows.sort((a, b) => {
+            const leftAttempt = a.pipelineLastAttemptAt == null ? null : new Date(a.pipelineLastAttemptAt).getTime();
+            const rightAttempt = b.pipelineLastAttemptAt == null ? null : new Date(b.pipelineLastAttemptAt).getTime();
+            if (leftAttempt === null && rightAttempt !== null) return -1;
+            if (leftAttempt !== null && rightAttempt === null) return 1;
+            if (leftAttempt !== null && rightAttempt !== null && leftAttempt !== rightAttempt) return leftAttempt - rightAttempt;
+            const received = new Date(a.receivedAt || a.createdAt || 0).getTime() - new Date(b.receivedAt || b.createdAt || 0).getTime();
+            if (received !== 0) return received;
+            const created = new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime();
+            return created !== 0 ? created : String(a.id).localeCompare(String(b.id));
+          });
+        } else {
+          const direction = Array.isArray(orderBy) && orderBy[0]?.receivedAt === "asc" ? 1 : -1;
+          rows.sort((a, b) => direction * (new Date(a.receivedAt) - new Date(b.receivedAt)));
+        }
+        let start = Math.max(0, Number(skip) || 0);
+        if (cursor?.id) {
+          const cursorIndex = rows.findIndex((row) => String(row.id) === String(cursor.id));
+          if (cursorIndex >= 0) start = cursorIndex + Math.max(0, Number(skip) || 0);
+        }
+        return rows.slice(start, start + take).map(clone);
       },
       async count({ where }) { return submissions.filter((row) => matchesSubmission(row, where)).length; },
       async updateMany({ where, data }) {
@@ -226,7 +296,11 @@ function fakeDb(seed = {}) {
           && (where.customOrderId === undefined || candidate.customOrderId === where.customOrderId)
           && (!where.updatedAt || new Date(candidate.updatedAt).getTime() === new Date(where.updatedAt).getTime()));
         if (!row) return { count: 0 };
-        Object.assign(row, clone(data), { updatedAt: new Date(new Date(row.updatedAt).getTime() + 1000) });
+        const nextData = clone(data);
+        if (nextData.executionProfileRevision && typeof nextData.executionProfileRevision === "object" && Number.isFinite(Number(nextData.executionProfileRevision.increment))) {
+          nextData.executionProfileRevision = Number(row.executionProfileRevision || 0) + Number(nextData.executionProfileRevision.increment);
+        }
+        Object.assign(row, nextData, { updatedAt: new Date(new Date(row.updatedAt).getTime() + 1000) });
         return { count: 1 };
       },
     },
@@ -288,15 +362,31 @@ function fakeDb(seed = {}) {
       },
     },
     automationDelivery: {
+      async findUnique({ where }) {
+        const row = relayProofs.find((candidate) => candidate.idempotencyKey === where.idempotencyKey);
+        return clone(row || null);
+      },
       async findFirst({ where }) {
         const row = relayProofs.find((candidate) => {
-          if (candidate.agencyId !== where.agencyId || candidate.creatorId !== where.creatorId || candidate.actionType !== where.actionType) return false;
+          if (where.agencyId !== undefined && candidate.agencyId !== where.agencyId) return false;
+          if (where.creatorId !== undefined && candidate.creatorId !== where.creatorId) return false;
+          if (where.actionType !== undefined && candidate.actionType !== where.actionType) return false;
           if (where.status !== undefined && candidate.status !== where.status) return false;
           if (where.idempotencyKey && typeof where.idempotencyKey === "object" && where.idempotencyKey.startsWith) return String(candidate.idempotencyKey || "").startsWith(where.idempotencyKey.startsWith);
           if (where.idempotencyKey !== undefined && candidate.idempotencyKey !== where.idempotencyKey) return false;
           return true;
         });
         return clone(row || null);
+      },
+      async findMany({ where }) {
+        return relayProofs.filter((candidate) => {
+          if (where.agencyId !== undefined && candidate.agencyId !== where.agencyId) return false;
+          if (where.creatorId !== undefined && candidate.creatorId !== where.creatorId) return false;
+          if (where.actionType !== undefined && candidate.actionType !== where.actionType) return false;
+          if (where.status?.in && !where.status.in.includes(candidate.status)) return false;
+          if (where.idempotencyKey?.startsWith && !String(candidate.idempotencyKey || "").startsWith(where.idempotencyKey.startsWith)) return false;
+          return true;
+        }).map(clone);
       },
     },
     auditLog: { async create({ data }) { audits.push(clone(data)); return { id: `audit-${audits.length}`, ...clone(data) }; } },
@@ -360,6 +450,11 @@ function baseSubmission(overrides = {}) {
     agencyId: "agency-1",
     creatorId: "creator-1",
     customOrderId: "custom-1",
+    pipelineDisposition: "ACTIVE",
+    executionProfileRevision: 0,
+    executionPinnedAt: null,
+    executionVaultFolderId: null,
+    executionRelayRecipient: null,
     telegramMessageIds: [101, 102],
     telegramSourceAccountId: "tg-1",
     telegramSourceUserId: "987654321012345678",
@@ -474,6 +569,18 @@ test("customs source read is pinned to exact account + provider user and only wh
   );
 });
 
+test("stale upload work cannot read new Telegram source media after Custom cancellation", async () => {
+  const cancelledOrder = { id: "custom-cancel-source", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "CANCELLED", fanDeliveredAt: null, scenario: "cancelled", priceCents: 6000 };
+  const db = fakeDb({
+    orders: [cancelledOrder],
+    submissions: [baseSubmission({ id: "cancel-source", customOrderId: cancelledOrder.id, pipelineDisposition: "SALVAGE", telegramMessageIds: [111], ofMediaIds: [] })],
+  });
+  await assert.rejects(
+    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "cancel-source", creatorId: "creator-1", accountId: "tg-1", messageIds: [111], db }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_PIPELINE_TERMINAL" && error?.status === 409,
+  );
+});
+
 test("partial Telegram overlap is rejected instead of silently duplicating media", async () => {
   const db = withTransactionalRollback(fakeDb({ submissions: [baseSubmission()] }));
   await assert.rejects(
@@ -528,7 +635,7 @@ test("list is creator-scoped and supports compact unassigned queue", async () =>
 test("V20.3 upload work reuses the existing Telegram runtime lease and stores no upload claim fields", async () => {
   const db = fakeDb({ submissions: [
     baseSubmission({ id: "pending-a", telegramMessageIds: [501, 502], ofMediaIds: ["9001"], receivedAt: new Date("2026-08-21T09:00:00.000Z") }),
-    baseSubmission({ id: "done", telegramMessageIds: [601], ofMediaIds: ["9101"], receivedAt: new Date("2026-08-21T08:00:00.000Z") }),
+    baseSubmission({ id: "done", telegramMessageIds: [601], ofMediaIds: ["9101"], executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1, executionPinnedAt: new Date("2026-08-21T12:00:00.000Z"), ...settlementReceipt("vault-1", 1, ["9101"]), receivedAt: new Date("2026-08-21T08:00:00.000Z") }),
   ], mediaAssets: [{ id: "asset-done", agencyId: "agency-1", creatorId: "creator-1", mediaId: "9101", source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "done", customFullPriceCents: 6000, catalogActive: true, folderIds: ["vault-1"], sortingStatus: "SORTED", metadataUpdatedAt: null, description: "custom one", idealPriceCents: 6000, accessType: "paid" }] });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1",
@@ -583,13 +690,17 @@ test("relay reservation binds canonical CUSTOM_RELAY_SEND payload to the full Te
   const db = fakeDb({ submissions: [baseSubmission({ id: "source-bound", telegramMessageIds: [731], ofMediaIds: [] })] });
   let locked = false;
   db.$transaction = async (work) => work(db);
-  db.$queryRawUnsafe = async (sql, submissionId, agencyId) => {
-    assert.match(String(sql), /CustomContentSubmission[\s\S]*FOR UPDATE/);
-    assert.equal(submissionId, "source-bound");
+  db.$queryRawUnsafe = async (sql, id, agencyId) => {
+    const text = String(sql);
+    if (/FROM "Agency"[\s\S]*FOR UPDATE/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+    if (/CreatorAccount[\s\S]*FOR UPDATE/.test(text)) return [{ id, agencyId, deletedAt: null, status: "READY" }];
+    assert.match(text, /CustomContentSubmission[\s\S]*FOR UPDATE/);
+    assert.equal(id, "source-bound");
     assert.equal(agencyId, "agency-1");
     locked = true;
-    return [{ id: submissionId }];
+    return [{ id }];
   };
+  db.$executeRawUnsafe = async (sql) => { assert.match(String(sql), /pg_advisory_xact_lock/); return 0; };
   let captured = null;
   const result = await reserveCustomContentSubmissionRelayWrite({
     agencyId: "agency-1", member, deviceId: "device-1", submissionId: "source-bound",
@@ -605,6 +716,98 @@ test("relay reservation binds canonical CUSTOM_RELAY_SEND payload to the full Te
   assert.equal(result.telegramMessageId, "731");
 });
 
+test("rolling cutover adopts the exact pre-cutover relay fingerprint without weakening Audit17 idempotency", async () => {
+  const legacyFingerprint = "legacy-v2-fingerprint";
+  const db = fakeDb({
+    workspaceSettings: { vaultUploadRecipient: "relay_new" },
+    submissions: [baseSubmission({ id: "legacy-relay", telegramMessageIds: [741], ofMediaIds: [] })],
+    relayProofs: [{
+      id: "legacy-write", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND",
+      idempotencyKey: "custom-relay:legacy-relay:0", status: "RUNNING", payloadFingerprint: legacyFingerprint,
+      payload: { submissionId: "legacy-relay", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "741", recipient: "relay_old" },
+    }],
+  });
+  db.$transaction = async (work) => work(db);
+  db.$queryRawUnsafe = async (sql, id, agencyId) => {
+    const text = String(sql);
+    if (/FROM "Agency"[\s\S]*FOR UPDATE/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+    if (/CreatorAccount[\s\S]*FOR UPDATE/.test(text)) return [{ id, agencyId, deletedAt: null, status: "READY" }];
+    return [{ id }];
+  };
+  let captured = null;
+  const result = await reserveCustomContentSubmissionRelayWrite({
+    agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-relay", expectedIndex: 0, expectedTelegramMessageId: "741", accessEpoch: 1, db,
+    reserveWrite: async (input) => { captured = input; return { delivery: { id: "legacy-write", status: "RUNNING" }, lease: null }; },
+  });
+  assert.equal(captured.payloadFingerprint, legacyFingerprint, "the exact immutable v2 fingerprint is reused for the already-existing idempotency row");
+  assert.equal(captured.payload.recipient, "relay_old", "historical recipient must be adopted before reserve");
+  assert.equal(result.relayRecipient, "relay_old");
+  assert.equal(captured.payload.vaultFolderId, "vault-1", "new execution profile may add the migration destination without changing the old row fingerprint");
+});
+
+test("rolling cutover rejects a pre-cutover relay row whose durable source binding does not match the submission", async () => {
+  const db = fakeDb({
+    submissions: [baseSubmission({ id: "legacy-conflict", telegramMessageIds: [751], ofMediaIds: [] })],
+    relayProofs: [{
+      id: "legacy-write", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND",
+      idempotencyKey: "custom-relay:legacy-conflict:0", status: "RUNNING", payloadFingerprint: "legacy-v2-fingerprint",
+      payload: { submissionId: "legacy-conflict", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "999", recipient: "relay_model" },
+    }],
+  });
+  let reserveCalls = 0;
+  await assert.rejects(
+    () => reserveCustomContentSubmissionRelayWrite({
+      agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-conflict", expectedIndex: 0, expectedTelegramMessageId: "751", accessEpoch: 1, db,
+      reserveWrite: async () => { reserveCalls += 1; return { delivery: { id: "never" } }; },
+    }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_EXECUTION_PROFILE_LEGACY_BINDING_CONFLICT" && error?.status === 409,
+  );
+  assert.equal(reserveCalls, 0);
+});
+
+test("upload discovery reaches a valid historical relay recipient even after the current Workspace default is cleared", async () => {
+  const db = fakeDb({
+    workspaceSettings: { vaultUploadRecipient: "" },
+    submissions: [baseSubmission({ id: "historical-recipient-work", telegramMessageIds: [761, 762], ofMediaIds: ["99761"] })],
+    relayProofs: [{
+      id: "legacy-write-761", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND",
+      idempotencyKey: "custom-relay:historical-recipient-work:0", status: "COMPLETED", payloadFingerprint: "legacy-v2-761",
+      payload: { submissionId: "historical-recipient-work", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "761", recipient: "relay_historical" },
+      result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "99761" },
+    }],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
+    limit: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].kind, "UPLOAD_MEDIA");
+  assert.equal(result.items[0].submission.id, "historical-recipient-work");
+  assert.equal(result.items[0].recipient, "relay_historical", "historical execution fact is eligibility even when mutable current default is absent");
+  assert.equal(db._submissions[0].executionRelayRecipient, "relay_historical");
+});
+
+test("ambiguous historical recipient does not consume executable LIMIT or hide later healthy upload work", async () => {
+  const db = fakeDb({
+    workspaceSettings: { vaultUploadRecipient: "relay_current" },
+    submissions: [
+      baseSubmission({ id: "legacy-conflict-head", telegramMessageIds: [771, 772, 773], ofMediaIds: ["99771", "99772"], receivedAt: new Date("2026-08-21T09:00:00.000Z"), createdAt: new Date("2026-08-21T09:00:00.000Z") }),
+      baseSubmission({ id: "healthy-tail", telegramMessageIds: [781], ofMediaIds: [], executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_healthy", executionProfileRevision: 1, executionPinnedAt: new Date("2026-08-21T10:00:00.000Z"), receivedAt: new Date("2026-08-21T10:00:00.000Z"), createdAt: new Date("2026-08-21T10:00:00.000Z") }),
+    ],
+    relayProofs: [
+      { id: "legacy-a", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:legacy-conflict-head:0", status: "COMPLETED", payload: { submissionId: "legacy-conflict-head", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "771", recipient: "relay_a" } },
+      { id: "legacy-b", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:legacy-conflict-head:1", status: "COMPLETED", payload: { submissionId: "legacy-conflict-head", expectedIndex: 1, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "772", recipient: "relay_b" } },
+    ],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
+    limit: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].submission.id, "healthy-tail", "blocked migration history is diagnostic, not executable queue capacity");
+  assert.ok(result.blockedItems.some((item) => item.submissionId === "legacy-conflict-head" && item.code === "CUSTOM_SUBMISSION_EXECUTION_PROFILE_LEGACY_RECIPIENT_CONFLICT"));
+});
+
 test("V20.3 rejects stale runtime leases before exposing Telegram source work", async () => {
   const db = fakeDb({ submissions: [baseSubmission({ telegramMessageIds: [701], ofMediaIds: [] })] });
   const result = await claimCustomContentSubmissionUploadWork({
@@ -616,6 +819,85 @@ test("V20.3 rejects stale runtime leases before exposing Telegram source work", 
     db,
   });
   assert.deepEqual(result.items, []);
+});
+
+test("upload discovery validates every runtime lease beyond the historical first-100 window", async () => {
+  const leaseCount = 301;
+  const targetAccountId = `tg-${leaseCount}`;
+  const telegramAccounts = Array.from({ length: leaseCount }, (_, index) => {
+    const number = index + 1;
+    return {
+      id: `tg-${number}`, agencyId: "agency-1", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: `lease-${number}`,
+      runtimeClaimUntil: new Date("2026-08-21T14:00:00.000Z"), runtimeLeaseUserId: "user-1",
+      runtimeLeaseMemberId: "member-owner", runtimeLeaseAccessEpoch: 1, runtimeLeaseCreatorId: "creator-1", lifecycleState: "ACTIVE",
+    };
+  });
+  const db = fakeDb({
+    submissions: [baseSubmission({ id: "lease-301-work", telegramSourceAccountId: targetAccountId, telegramMessageIds: [7301], ofMediaIds: [] })],
+    telegramAccounts,
+  });
+  const broadMember = { ...member, id: "member-owner", roleKey: "owner", role: "OWNER", assignedCreators: "all" };
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1",
+    member: broadMember,
+    deviceId: "device-1",
+    leases: telegramAccounts.map((row) => ({ accountId: row.id, claimToken: row.runtimeClaimToken })),
+    limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"),
+    db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].submission.id, "lease-301-work");
+  assert.equal(result.items[0].accountId, targetAccountId);
+});
+
+
+
+test("shared Telegram account lease is account-level capability while creator scope remains authoritative", async () => {
+  const sharedMember = { ...member, assignedCreators: ["creator-1", "creator-2"] };
+  const db = fakeDb({ submissions: [baseSubmission({
+    id: "shared-account-creator-2", creatorId: "creator-2", customOrderId: "custom-2",
+    telegramSourceAccountId: "tg-1", telegramMessageIds: [7401], ofMediaIds: [],
+  })] });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member: sharedMember, deviceId: "device-1",
+    leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].submission.id, "shared-account-creator-2");
+  assert.equal(result.items[0].creatorId, "creator-2");
+  assert.equal(result.items[0].accountId, "tg-1");
+});
+
+test("shared Telegram account lease never broadens creator scope beyond the member assignment", async () => {
+  const db = fakeDb({ submissions: [baseSubmission({
+    id: "shared-account-forbidden-creator-2", creatorId: "creator-2", customOrderId: "custom-2",
+    telegramSourceAccountId: "tg-1", telegramMessageIds: [7402], ofMediaIds: [],
+  })] });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1",
+    leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.deepEqual(result.items, []);
+});
+
+test("two-device upload discovery exposes source relay work only to the Desktop that owns the Telegram runtime lease", async () => {
+  const db = fakeDb({ submissions: [baseSubmission({ id: "two-device-upload", telegramMessageIds: [703], ofMediaIds: [] })] });
+  const now = new Date("2026-08-21T13:00:00.000Z");
+  const [owner, other] = await Promise.all([
+    claimCustomContentSubmissionUploadWork({
+      agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1, now, db,
+    }),
+    claimCustomContentSubmissionUploadWork({
+      agencyId: "agency-1", member, deviceId: "device-2", leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1, now, db,
+    }),
+  ]);
+  assert.equal(owner.items.length, 1);
+  assert.equal(owner.items[0].kind, "UPLOAD_MEDIA");
+  assert.equal(owner.items[0].submission.id, "two-device-upload");
+  assert.deepEqual(other.items, [], "a second Desktop cannot borrow another device's Telegram runtime lease");
 });
 
 test("Audit16 upload work rejects a Telegram lease from a stale access epoch before exposing OF work", async () => {
@@ -745,9 +1027,25 @@ test("V20.4 returns complete-but-not-finalized submissions as move-only library 
   assert.equal(result.items[0].telegramMessageId, null);
 });
 
+test("two devices may both discover the same Telegram-independent FINALIZE recovery because the stage has no exclusive source capability", async () => {
+  const db = fakeDb({ submissions: [
+    baseSubmission({ id: "two-device-finalize", telegramMessageIds: [903], ofMediaIds: ["99003"] }),
+  ] });
+  const now = new Date("2026-08-21T13:00:00.000Z");
+  const [first, second] = await Promise.all([
+    claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db }),
+    claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-2", leases: [], limit: 1, now, db }),
+  ]);
+  assert.equal(first.items[0]?.kind, "FINALIZE_LIBRARY");
+  assert.equal(second.items[0]?.kind, "FINALIZE_LIBRARY");
+  assert.equal(first.items[0]?.submission.id, "two-device-finalize");
+  assert.equal(second.items[0]?.submission.id, "two-device-finalize");
+  assert.equal(first.items[0]?.folderId, second.items[0]?.folderId, "both recovery executors converge on the same pinned destination");
+});
+
 test("V20.4 does not requeue a submission whose typed Content Library provenance is finalized", async () => {
   const db = fakeDb({
-    submissions: [baseSubmission({ id: "finalized", telegramMessageIds: [911], ofMediaIds: ["99111"] })],
+    submissions: [baseSubmission({ id: "finalized", telegramMessageIds: [911], ofMediaIds: ["99111"], executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1, executionPinnedAt: new Date("2026-08-21T12:00:00.000Z"), ...settlementReceipt("vault-1", 1, ["99111"]) })],
     mediaAssets: [{
       id: "asset-finalized", agencyId: "agency-1", creatorId: "creator-1", mediaId: "99111",
       source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "finalized", customFullPriceCents: 6000,
@@ -761,6 +1059,164 @@ test("V20.4 does not requeue a submission whose typed Content Library provenance
     now: new Date("2026-08-21T13:00:00.000Z"), db,
   });
   assert.deepEqual(result.items, []);
+});
+
+
+
+test("folder projection drift requeues FINALIZE_LIBRARY even while the Vault settlement receipt itself is current", async () => {
+  const db = fakeDb({
+    submissions: [baseSubmission({ id: "folder-drift", telegramMessageIds: [911], ofMediaIds: ["99111"], executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1, executionPinnedAt: new Date("2026-08-21T12:00:00.000Z"), ...settlementReceipt("vault-1", 1, ["99111"]) })],
+    mediaAssets: [{
+      id: "asset-folder-drift", agencyId: "agency-1", creatorId: "creator-1", mediaId: "99111",
+      source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "folder-drift", customFullPriceCents: 6000,
+      catalogActive: true, folderIds: [], sortingStatus: "UNSORTED", metadataUpdatedAt: null,
+    }],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
+  assert.equal(result.items[0].submission.id, "folder-drift");
+});
+
+test("price-only mutation requeues Library projection without invalidating the current Vault settlement receipt", async () => {
+  const receipt = settlementReceipt("vault-1", 1, ["99121"]);
+  const db = fakeDb({
+    orders: [{ id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "custom one", priceCents: 6500 }],
+    submissions: [baseSubmission({
+      id: "price-reprojection", telegramMessageIds: [921], ofMediaIds: ["99121"],
+      executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1,
+      executionPinnedAt: new Date("2026-08-21T12:00:00.000Z"), ...receipt,
+    })],
+    mediaAssets: [{
+      id: "asset-price-old", agencyId: "agency-1", creatorId: "creator-1", mediaId: "99121",
+      source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "price-reprojection", customFullPriceCents: 6000,
+      catalogActive: true, folderIds: ["vault-1"], sortingStatus: "SORTED", metadataUpdatedAt: null,
+      description: "custom one", idealPriceCents: 6000, accessType: "paid",
+    }],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
+  assert.equal(result.items[0].submission.id, "price-reprojection");
+  const stored = db._submissions.find((row) => row.id === "price-reprojection");
+  assert.equal(stored.vaultSettlementMediaFingerprint, receipt.vaultSettlementMediaFingerprint, "price is current business state and must not invalidate media/folder settlement proof");
+});
+
+test("legacy finalized assets without a pinned execution profile are requeued for move-only reconcile instead of inventing historical Vault truth", async () => {
+  const db = fakeDb({
+    submissions: [baseSubmission({ id: "legacy-unpinned-finalized", telegramMessageIds: [912], ofMediaIds: ["99112"] })],
+    mediaAssets: [{
+      id: "asset-legacy", agencyId: "agency-1", creatorId: "creator-1", mediaId: "99112",
+      source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "legacy-unpinned-finalized", customFullPriceCents: 6000,
+      catalogActive: true, folderIds: ["vault-old-unknown"], sortingStatus: "SORTED", metadataUpdatedAt: null,
+      description: "custom one", idealPriceCents: 6000, accessType: "paid",
+    }],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
+  assert.equal(result.items[0].submission.id, "legacy-unpinned-finalized");
+  assert.equal(result.items[0].folderId, "vault-1");
+  assert.ok(result.items[0].submission.executionPinnedAt, "recovery pins one durable destination before finalize");
+});
+
+test("retry-eligible old pipeline rows cannot cycle ahead of never-attempted tail work after backoff expires", async () => {
+  const now = new Date("2026-08-21T13:00:00.000Z");
+  const retried = Array.from({ length: 36 }, (_, index) => baseSubmission({
+    id: `retry-${String(index + 1).padStart(2, "0")}`,
+    customOrderId: null,
+    telegramMessageIds: [8000 + index],
+    ofMediaIds: [],
+    pipelineLastAttemptAt: new Date(`2026-08-21T12:${String(20 + Math.floor(index / 12) * 10).padStart(2, "0")}:00.000Z`),
+    pipelineNextAttemptAt: new Date("2026-08-21T12:59:00.000Z"),
+    receivedAt: new Date(`2026-08-21T10:${String(index).padStart(2, "0")}:00.000Z`),
+  }));
+  const neverAttempted = baseSubmission({
+    id: "never-attempted-tail",
+    customOrderId: null,
+    telegramMessageIds: [8999],
+    ofMediaIds: [],
+    pipelineLastAttemptAt: null,
+    pipelineNextAttemptAt: null,
+    receivedAt: new Date("2026-08-21T12:59:00.000Z"),
+  });
+  const db = fakeDb({ submissions: [...retried, neverAttempted] });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1",
+    leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
+    limit: 1, now, db,
+  });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].kind, "UPLOAD_MEDIA");
+  assert.equal(result.items[0].submission.id, "never-attempted-tail", "never-attempted work must outrank retry-eligible poison even when it is much newer");
+
+  const source = fs.readFileSync(path.join(__dirname, "custom-content-submissions-service.js"), "utf8");
+  for (const name of ["pendingRelayProjectionRows", "discoverBlockedPipelineRows", "pendingUploadRowsChunk", "pendingFinalizeRows"]) {
+    const start = source.indexOf(`async function ${name}`);
+    assert.notEqual(start, -1);
+    const next = source.indexOf("\nasync function ", start + 1);
+    const body = source.slice(start, next === -1 ? source.length : next);
+    assert.match(body, /pipelineLastAttemptAt[\s\S]*NULLS FIRST|pipelineLastAttemptAt:\s*\{\s*sort:\s*"asc",\s*nulls:\s*"first"/, `${name} must schedule by last-attempt fairness before applying its limit`);
+  }
+  assert.match(source, /sort\(comparePipelineWorkRows\)/, "chunk merge must preserve fairness ordering");
+  assert.match(source, /sort\(\(left, right\) => comparePipelineWorkRows\(left\.submission, right\.submission\)\)/, "cross-lane upload/finalize merge must preserve fairness ordering");
+});
+
+test("confirmed relay projection recovery honors execution backoff so an older poisoned row cannot hide later healthy proof", async () => {
+  const now = new Date("2026-08-21T13:00:00.000Z");
+  const db = fakeDb({
+    submissions: [
+      baseSubmission({ id: "projection-backed-off", customOrderId: null, telegramMessageIds: [920], ofMediaIds: [], pipelineNextAttemptAt: new Date("2026-08-21T13:05:00.000Z"), receivedAt: new Date("2026-08-21T11:00:00.000Z") }),
+      baseSubmission({ id: "projection-healthy", customOrderId: null, telegramMessageIds: [921], ofMediaIds: [], pipelineNextAttemptAt: null, receivedAt: new Date("2026-08-21T11:01:00.000Z") }),
+    ],
+    relayProofs: [
+      { id: "relay-backed-off", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:projection-backed-off:0", status: "COMPLETED", payload: { submissionId: "projection-backed-off", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "920", recipient: "relay_model" }, result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "99220" } },
+      { id: "relay-healthy", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:projection-healthy:0", status: "COMPLETED", payload: { submissionId: "projection-healthy", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "921", recipient: "relay_model" }, result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "99221" } },
+    ],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db });
+  assert.deepEqual(db._submissions.find((row) => row.id === "projection-backed-off").ofMediaIds, [], "backed-off oldest proof is not retried before nextAttemptAt");
+  assert.deepEqual(db._submissions.find((row) => row.id === "projection-healthy").ofMediaIds, ["99221"], "later healthy proof remains reachable");
+  assert.equal(result.items[0]?.kind, "FINALIZE_LIBRARY");
+  assert.equal(result.items[0]?.submission.id, "projection-healthy");
+
+  const source = fs.readFileSync(path.join(__dirname, "custom-content-submissions-service.js"), "utf8");
+  const projectionFn = source.slice(source.indexOf("async function pendingRelayProjectionRows"), source.indexOf("async function recoverConfirmedRelayProjectionForSubmission"));
+  assert.match(projectionFn, /pipelineNextAttemptAt[\s\S]*nowParam/, "production raw-SQL projection discovery must honor durable backoff too");
+});
+
+test("cancel/crash after a confirmed CUSTOM_RELAY_SEND recovers the proven mediaId from Audit17 and exposes only move-only SALVAGE work", async () => {
+  const db = fakeDb({
+    orders: [{ id: "custom-cancelled", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "CANCELLED", fanDeliveredAt: null, scenario: "cancelled", priceCents: 6000 }],
+    submissions: [baseSubmission({
+      id: "salvage-proof", customOrderId: "custom-cancelled", pipelineDisposition: "SALVAGE",
+      telegramMessageIds: [913], ofMediaIds: [], telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678",
+    })],
+    relayProofs: [{
+      id: "relay-completed-913", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND",
+      idempotencyKey: "custom-relay:salvage-proof:0", status: "COMPLETED", finishedAt: new Date("2026-08-21T12:59:00.000Z"),
+      payload: { submissionId: "salvage-proof", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "913", recipient: "relay_model" },
+      result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "99113" },
+    }],
+  });
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1,
+    now: new Date("2026-08-21T13:00:00.000Z"), db,
+  });
+  assert.deepEqual(db._submissions[0].ofMediaIds, ["99113"], "confirmed external fact is projected after crash/cancel");
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
+  assert.equal(result.items[0].submission.pipelineDisposition, "SALVAGE");
+  assert.equal(result.items[0].telegramMessageId, null, "salvage never schedules a new Telegram/OF relay write");
 });
 
 test("V20.9 transport-neutral intake allows a new assigned version only after explicit revision request", async () => {
@@ -825,14 +1281,17 @@ test("relay reservation racing an album merge serializes on the submission row a
   ] });
   let injected = false;
   db.$transaction = async (work) => work(db);
-  db.$queryRawUnsafe = async (sql, submissionId) => {
-    assert.match(String(sql), /FOR UPDATE/);
-    assert.equal(submissionId, "submission-lock-race");
+  db.$queryRawUnsafe = async (sql, id, agencyId) => {
+    const text = String(sql);
+    if (/FROM "Agency"[\s\S]*FOR UPDATE/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+    if (/CreatorAccount[\s\S]*FOR UPDATE/.test(text)) return [{ id, agencyId: agencyId || "agency-1", deletedAt: null, status: "READY" }];
+    assert.match(text, /CustomContentSubmission[\s\S]*FOR UPDATE/);
+    assert.equal(id, "submission-lock-race");
     if (!injected) {
       injected = true;
       db._relayProofs.push({ id: "write-raced-in", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:submission-lock-race:0", status: "RUNNING", result: {} });
     }
-    return [{ id: submissionId }];
+    return [{ id }];
   };
   const result = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-lock-late", actorUserId: "user-1", db });
   const frozen = db._submissions.find((row) => row.id === "submission-lock-race");
@@ -840,6 +1299,47 @@ test("relay reservation racing an album merge serializes on the submission row a
   assert.notEqual(result.submission.id, "submission-lock-race");
   assert.equal(result.submission.customOrderId, null);
   assert.deepEqual(result.submission.telegramMessageIds, ["741"]);
+});
+
+test("late Telegram album media never reopens SALVAGE or terminal submission history", async () => {
+  const sent = new Date("2026-09-04T16:00:00.000Z");
+  for (const pipelineDisposition of ["SALVAGE", "ARCHIVED", "ABANDONED"]) {
+    const orderId = pipelineDisposition === "SALVAGE" ? `custom-${pipelineDisposition.toLowerCase()}` : null;
+    const groupedId = `album-${pipelineDisposition.toLowerCase()}`;
+    const existingEventId = `event-${pipelineDisposition.toLowerCase()}-existing`;
+    const lateEventId = `event-${pipelineDisposition.toLowerCase()}-late`;
+    const existing = baseSubmission({
+      id: `submission-${pipelineDisposition.toLowerCase()}`,
+      customOrderId: orderId,
+      pipelineDisposition,
+      telegramMessageIds: [731],
+      telegramInboundEventIds: [existingEventId],
+      telegramSourceKey: `telegram:agency-1:tg-1:900001:group:${groupedId}`,
+      telegramSourceUserId: "900001",
+      ofMediaIds: [],
+    });
+    const orders = orderId ? [{
+      id: orderId, agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "CANCELLED",
+      fanDeliveredAt: null, scenario: "cancelled", priceCents: 1000,
+    }] : undefined;
+    const db = fakeDb({
+      submissions: [existing],
+      ...(orders ? { orders } : {}),
+      inboundEvents: [
+        { id: existingEventId, agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-1", customOrderId: orderId, submissionId: existing.id, senderTelegramUserId: "900001", messageId: 731, groupedId, hasMedia: true, text: "existing", sentAt: sent },
+        { id: lateEventId, agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-1", customOrderId: orderId, submissionId: null, senderTelegramUserId: "900001", messageId: 732, groupedId, hasMedia: true, text: "late", sentAt: new Date(sent.getTime() + 1000) },
+      ],
+    });
+
+    const result = await createCustomContentSubmissionFromInboundEvent({ eventId: lateEventId, actorUserId: "user-1", db });
+    const original = db._submissions.find((row) => row.id === existing.id);
+    assert.deepEqual(original.telegramMessageIds.map(String), ["731"], `${pipelineDisposition} history must remain immutable`);
+    assert.notEqual(result.submission.id, existing.id);
+    assert.equal(result.submission.pipelineDisposition, "ACTIVE");
+    assert.equal(result.submission.customOrderId, null, "late provider fact must require a new manager assignment");
+    assert.deepEqual(result.submission.telegramMessageIds, ["732"]);
+    assert.equal(db._inboundEvents.find((row) => row.id === lateEventId).submissionId, result.submission.id);
+  }
 });
 
 test("Telegram source ordering freezes as soon as CUSTOM_RELAY_SEND execution identity exists, before media projection", async () => {

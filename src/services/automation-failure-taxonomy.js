@@ -52,6 +52,9 @@ const DEFINITE_NO_WRITE_CODES = new Set([
 const IDEMPOTENT_RETRY_CODES = new Set([
   "content_not_found", "fan_not_found", "dialog_not_found",
 ]);
+const TERMINAL_CODES = new Set([
+  "custom_media_programmatic_forbidden",
+]);
 const OUTCOME_UNKNOWN_CODES = new Set([
   "send_result_unknown", "comment_result_unknown", "relay_send_result_unknown", "vault_create_list_result_unknown", "write_outcome_unknown", "write_outcome_ambiguous", "write_result_unknown", "network_error",
   "timeout", "temporary_of_error", "lease_lost", "send_reconcile_pending", "reconciliation_lease_lost",
@@ -82,6 +85,7 @@ function classifyAutomationFailure({
 
   if (CONTROL_CODES.has(code)) return FAILURE_CATEGORIES.CONTROL_BLOCKED;
   if (SESSION_CODES.has(code)) return FAILURE_CATEGORIES.SESSION_UNAVAILABLE;
+  if (TERMINAL_CODES.has(code)) return FAILURE_CATEGORIES.TERMINAL;
 
   // Proof of no external effect is stronger than a string code. Once no effect
   // is proven, a later attempt is safe regardless of how the transport failed.

@@ -8,6 +8,8 @@ const {
   reprojectCustomReminderSchedule,
 } = require("./custom-order-reminders");
 const { planTaskIntentForCommittedOrder, planCancellationIntentForCommittedOrder } = require("./telegram-delivery-authority-service");
+const { adjudicateCustomOrderCancellation, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
+const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 
 const CUSTOM_ORDER_STATUSES = Object.freeze(["PENDING", "COMPLETED", "MISSED", "CANCELLED"]);
 const CUSTOM_ORDER_TYPES = Object.freeze(["CONTENT", "CALL", "PHYSICAL"]);
@@ -302,6 +304,11 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
     return { ok: true, idempotent: true, order: serializeOrder(existing, now) };
   }
   const execute = async (tx) => {
+    await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    // Serialize NEW Custom work with creator retirement. If creation wins the
+    // creator row lock, retirement will observe this PENDING order as a blocker;
+    // if retirement wins, this recheck fails after deletedAt commits.
+    await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: data.creatorId });
     let row;
     try {
       row = await tx.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, clientMutationId: data.clientMutationId, clientMutationFingerprint: fingerprint, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt: null }, include: ORDER_INCLUDE });
@@ -501,6 +508,42 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
     || (normalizeType(prospective.type || "CONTENT") === "CALL" && input?.scheduledAt !== undefined)
     || (normalizeType(prospective.type || "CONTENT") === "PHYSICAL" && input?.physicalStatus !== undefined);
   const applyPendingUpdate = async (tx) => {
+    // A PENDING CustomOrder is live business work. Serialize every mutation that can
+    // terminalize/retarget it with Agency/Creator retirement before taking the order
+    // row CAS. This preserves the global lock order used by outbound Telegram planning
+    // and prevents cancellation from holding CustomOrder while waiting on Creator.
+    await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: current.creatorId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId });
+    // The advisory fence linearizes business mutations with the moment a physical
+    // Custom send crosses Audit17 COMMITTING. Once a permit exists the actual OF
+    // POST is outside the database transaction, so cancellation/price/payment/etc.
+    // must not advance the order until the remote outcome is durably settled.
+    // Precommit CLAIMED/RUNNING attempts do not block mutation: the later commit
+    // current-state recheck will reject their stale payload safely.
+    if (tx.automationDelivery?.findFirst) {
+      const unresolvedManualSend = await tx.automationDelivery.findFirst({
+        where: {
+          agencyId,
+          creatorId: current.creatorId,
+          actionType: "CUSTOM_MANUAL_SEND",
+          targetId: current.id,
+          OR: [
+            { status: { in: ["COMMITTING", "RECONCILE_REQUIRED"] } },
+            { status: "FAILED", failureCode: "outcome_unresolved_do_not_retry" },
+          ],
+        },
+        select: { id: true, status: true, failureCode: true },
+        orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
+      });
+      if (unresolvedManualSend) {
+        throw fail(
+          "CUSTOM_DELIVERY_COMMIT_IN_FLIGHT",
+          "A physical Custom delivery has crossed the external-write commit boundary; resolve its remote outcome before changing this Custom order",
+          409,
+        );
+      }
+    }
     const changed = await tx.customOrder.updateMany({ where: { id: current.id, agencyId, status: "PENDING", updatedAt: current.updatedAt }, data: patch });
     if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_ORDER_CONFLICT", "Custom order changed while this update was being applied; refresh and try again", 409);
     let row = await tx.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE });
@@ -509,7 +552,10 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
       await reprojectCustomReminderSchedule({ agencyId, orderId: row.id, now, firstAnchorAt: now, db: tx });
       row = await tx.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE }) || row;
     }
-    if (String(row.status) === "CANCELLED" && String(current.status) !== "CANCELLED") await planCancellationIntentForCommittedOrder({ agencyId, member, order: row, now, db: tx });
+    if (String(row.status) === "CANCELLED" && String(current.status) !== "CANCELLED") {
+      await adjudicateCustomOrderCancellation({ db: tx, agencyId, customOrderId: row.id, now, reason: "CUSTOM_ORDER_CANCELLED" });
+      await planCancellationIntentForCommittedOrder({ agencyId, member, order: row, now, db: tx });
+    }
     return row;
   };
   const row = typeof client.$transaction === "function" ? await client.$transaction(applyPendingUpdate) : await applyPendingUpdate(client);

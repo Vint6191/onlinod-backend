@@ -1,6 +1,7 @@
 "use strict";
 
 const HIGH_PRIVILEGE_KEYS = new Set(["owner", "manager", "admin"]);
+const CREATOR_SCOPE_QUERY_CHUNK = 500;
 
 function isSeniorAgencyMember(member) {
   const role = String(member?.role || "").toUpperCase();
@@ -84,15 +85,23 @@ async function allowedCreatorScope({ agencyId, member, requestedCreatorId = null
     return { broad: false, creatorIds: [creator.id], creator };
   }
   if (hasBroadCreatorAccess(member)) return { broad: true, creatorIds: null, creator: null };
-  const ids = assignedCreatorIds(member);
+  const ids = Array.from(new Set(assignedCreatorIds(member)));
   if (!ids.length) return { broad: false, creatorIds: [], creator: null };
   const client = db || require("../prisma");
-  const rows = await client.creatorAccount.findMany({
-    where: { agencyId, deletedAt: null, id: { in: ids } },
-    select: { id: true },
-    take: 10000,
-  });
-  return { broad: false, creatorIds: rows.map((row) => row.id), creator: null };
+  const rows = [];
+  for (let offset = 0; offset < ids.length; offset += CREATOR_SCOPE_QUERY_CHUNK) {
+    const batch = ids.slice(offset, offset + CREATOR_SCOPE_QUERY_CHUNK);
+    rows.push(...await client.creatorAccount.findMany({
+      where: { agencyId, deletedAt: null, id: { in: batch } },
+      select: { id: true },
+      // Transport/parameter chunk only: every assigned id is queried before
+      // the authoritative scope is returned. Never turn a resource batch size
+      // into a correctness horizon.
+      take: batch.length,
+    }));
+  }
+  const live = new Set(rows.map((row) => String(row.id)));
+  return { broad: false, creatorIds: ids.filter((id) => live.has(String(id))), creator: null };
 }
 
 module.exports = {

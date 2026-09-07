@@ -6,6 +6,14 @@ const { requireProductCreator, requireProductDevice, requireProductPermission, c
 const {
   PRODUCT_WRITE_KINDS,
   ProgrammaticOfWriteAuthorityError,
+  reserveMassLogicalIntent,
+  getCurrentMassLogicalIntent,
+  acknowledgeMassLogicalIntent,
+  abandonMassLogicalIntentPrecommit,
+  beginMassRemoteQueueSnapshot,
+  reconcileMassRemoteQueueSnapshot,
+  authorizeNativeMassWrite,
+  completeNativeMassWrite,
   reserveProgrammaticWrite,
   startProgrammaticWrite,
   prepareProgrammaticWrite,
@@ -19,7 +27,7 @@ const {
 } = require("../services/programmatic-of-write-authority-service");
 
 const router = express.Router();
-const PUBLIC_RESERVE_KINDS = new Set(["MASS_QUEUE_CREATE", "VAULT_RELAY_SEND", "VAULT_CREATE_LIST"]);
+const PUBLIC_RESERVE_KINDS = new Set(["MASS_QUEUE_CREATE", "MASS_QUEUE_CANCEL", "VAULT_RELAY_SEND", "VAULT_CREATE_LIST"]);
 const PUBLIC_LEASE_KINDS = new Set([...PUBLIC_RESERVE_KINDS, "CUSTOM_RELAY_SEND"]);
 const leaseSchema = z.object({
   deviceId: z.string().min(1).max(180),
@@ -50,6 +58,117 @@ function publicKindDevice(req, kind, deviceId) {
   requireProductDevice(req, deviceId, { requiredCode: "PROGRAMMATIC_WRITE_DEVICE_REQUIRED", mismatchCode: "PROGRAMMATIC_WRITE_DEVICE_IDENTITY_MISMATCH" });
   return { normalized, config };
 }
+
+
+router.post("/mass-native/preflight", async (req, res) => {
+  try {
+    const input = z.object({
+      authorityVersion: z.enum(["MASS_NATIVE_V2", "MASS_NATIVE_V3"]),
+      creatorId: z.string().min(1).max(180),
+      deviceId: z.string().min(1).max(180),
+      operation: z.enum(["CREATE", "CANCEL"]),
+      requestKey: z.string().min(3).max(500),
+      queueId: z.string().min(1).max(180).optional().nullable(),
+    }).parse(req.body || {});
+    requireProductDevice(req, input.deviceId, { requiredCode: "PROGRAMMATIC_WRITE_DEVICE_REQUIRED", mismatchCode: "PROGRAMMATIC_WRITE_DEVICE_IDENTITY_MISMATCH" });
+    await requireProductCreator(req, input.creatorId);
+    await requireProductPermission(req, "chats.mass_message", { code: "PROGRAMMATIC_WRITE_PERMISSION_FORBIDDEN" });
+    return res.json(await authorizeNativeMassWrite({ ...actor(req), ...input }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "MASS_NATIVE_PREFLIGHT_FAILED");
+  }
+});
+
+router.post("/mass-native/:writeId/complete", async (req, res) => {
+  try {
+    const input = z.object({
+      authorityVersion: z.literal("MASS_NATIVE_V2"), creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180),
+      requestKey: z.string().min(3).max(500), queueId: z.string().min(1).max(180), writeCommitRevision: z.number().int().min(1),
+    }).parse(req.body || {});
+    // Settlement records an exact response for an already-authorized physical
+    // request. Do not re-run current creator permission here: a permission or
+    // assignment change racing the 2xx must not erase the external fact.
+    requireProductDevice(req, input.deviceId, { requiredCode: "PROGRAMMATIC_WRITE_DEVICE_REQUIRED", mismatchCode: "PROGRAMMATIC_WRITE_DEVICE_IDENTITY_MISMATCH" });
+    return res.json(await completeNativeMassWrite({ ...actor(req), ...input, writeId: req.params.writeId }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "MASS_NATIVE_COMPLETE_FAILED");
+  }
+});
+
+router.post("/mass-intent/reserve", async (req, res) => {
+  try {
+    const input = z.object({
+      creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180), dispatchId: z.string().min(1).max(180),
+      payloadFingerprint: z.string().min(8).max(200), payload: z.record(z.unknown()).optional(), maxAttempts: z.number().int().min(1).max(20).optional(),
+    }).parse(req.body || {});
+    await publicKindAccess(req, "MASS_QUEUE_CREATE", input.creatorId, input.deviceId);
+    return res.json(await reserveMassLogicalIntent({ ...actor(req), ...input }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "MASS_INTENT_RESERVE_FAILED");
+  }
+});
+
+router.get("/mass-intent/:creatorId", async (req, res) => {
+  try {
+    const input = z.object({ creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180) }).parse({ creatorId: req.params.creatorId, deviceId: req.query.deviceId });
+    await publicKindAccess(req, "MASS_QUEUE_CREATE", input.creatorId, input.deviceId);
+    return res.json(await getCurrentMassLogicalIntent({ ...actor(req), ...input }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "MASS_INTENT_GET_FAILED");
+  }
+});
+
+router.post("/mass-intent/:dispatchId/acknowledge", async (req, res) => {
+  try {
+    const input = z.object({ creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180) }).parse(req.body || {});
+    await publicKindAccess(req, "MASS_QUEUE_CREATE", input.creatorId, input.deviceId);
+    return res.json(await acknowledgeMassLogicalIntent({ ...actor(req), ...input, dispatchId: req.params.dispatchId }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "MASS_INTENT_ACK_FAILED");
+  }
+});
+
+router.post("/mass-intent/:dispatchId/abandon-precommit", async (req, res) => {
+  try {
+    const input = z.object({ creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180) }).parse(req.body || {});
+    await publicKindAccess(req, "MASS_QUEUE_CREATE", input.creatorId, input.deviceId);
+    return res.json(await abandonMassLogicalIntentPrecommit({ ...actor(req), ...input, dispatchId: req.params.dispatchId }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "MASS_INTENT_ABANDON_FAILED");
+  }
+});
+
+
+router.post("/mass-queue/snapshot-fence", async (req, res) => {
+  try {
+    const input = z.object({ creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180), purpose: z.enum(["BROWSE", "RETIREMENT"]).default("BROWSE") }).parse(req.body || {});
+    // Snapshot authority has its own purpose-bound permission check inside the
+    // service: BROWSE -> chats.mass_message; RETIREMENT -> creators.manage.
+    // Do not force retirement through the send permission.
+    return res.json(await beginMassRemoteQueueSnapshot({ ...actor(req), ...input }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "MASS_QUEUE_SNAPSHOT_FENCE_FAILED");
+  }
+});
+
+router.post("/mass-queue/reconcile-snapshot", async (req, res) => {
+  try {
+    const input = z.object({
+      creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180), queueIds: z.array(z.string().min(1).max(180)).max(100000), snapshotItemCount: z.number().int().min(0).max(100000), snapshotFenceToken: z.string().min(1).max(180), purpose: z.enum(["BROWSE", "RETIREMENT"]).default("BROWSE"),
+    }).parse(req.body || {});
+    return res.json(await reconcileMassRemoteQueueSnapshot({ ...actor(req), ...input }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "MASS_QUEUE_SNAPSHOT_RECONCILE_FAILED");
+  }
+});
 
 router.post("/reserve", async (req, res) => {
   try {

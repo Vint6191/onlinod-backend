@@ -73,6 +73,23 @@ test("Audit16 product scope validates broad requested ids against live current-a
   );
 });
 
+test("Audit16 product scope validates creator 10001 instead of treating the old 10k query batch as authority", async () => {
+  const ids = Array.from({ length: 10001 }, (_, index) => `creator-${index + 1}`);
+  const db = {
+    creatorAccount: {
+      async findMany({ where, take }) {
+        assert.ok(take <= 500, "DB batch is transport-bounded, not correctness-bounded");
+        return where.id.in.map((id) => ({ id }));
+      },
+    },
+  };
+  const owner = { id: "m-owner", userId: "owner-1", agencyId: "agency-1", role: "OWNER", roleKey: "owner", assignedCreators: null };
+  const result = await filterProductCreatorScope(reqFor(owner), ids, { db, rejectForeign: true });
+  assert.equal(result.creatorIds.length, 10001);
+  assert.equal(result.creatorIds.at(-1), "creator-10001");
+  assert.deepEqual(result.foreignCreatorIds, []);
+});
+
 test("Audit16 product scope never widens a scoped member request", async () => {
   const db = creatorDb();
   const manager = { id: "m1", userId: "user-1", agencyId: "agency-1", role: "MANAGER", roleKey: "manager", assignedCreators: ["creator-a"] };

@@ -43,6 +43,7 @@ const subscribersRoutes = require("./routes/subscribers");
 const fanDataRoutes = require("./routes/fan-data");
 const automationControlRoutes = require("./routes/automation-control");
 const programmaticOfWriteRoutes = require("./routes/programmatic-of-writes");
+const programmaticOfWriteSettlementRoutes = require("./routes/programmatic-of-write-settlement");
 const { createLegacyGoneRouter } = require("./routes/legacy-gone");
 const { authRequired } = require("./middleware/auth");
 const { createIdempotencyMiddleware } = require("./middleware/idempotency");
@@ -212,6 +213,9 @@ app.use("/api/traffic", authRequired, trafficRoutes);
 app.use("/api/subscribers", authRequired, subscribersRoutes);
 app.use("/api/fan-data", authRequired, fanDataRoutes);
 app.use("/api/automation", authRequired, automationControlRoutes);
+// Narrow post-commit capability settlement must remain usable after logout or
+// member retirement; it cannot mint new external work.
+app.use("/api/programmatic-of-write-settlement", programmaticOfWriteSettlementRoutes);
 app.use("/api/programmatic-of-writes", authRequired, programmaticOfWriteRoutes);
 app.use("/api/server/content", authRequired, contentStoreRoutes);
 app.use("/api/server/crm", authRequired, legacyCrmRoutes);

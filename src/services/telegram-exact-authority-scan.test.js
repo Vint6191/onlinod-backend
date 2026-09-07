@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { eligibleTelegramExecutionAccounts } = require("./telegram-execution-runtime");
+const { findCancelledTaskFollowupDebt, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
 
 function clean(value) { return String(value == null ? "" : value); }
 function orderedPage(rows, { where = {}, orderBy = null, take = rows.length, cursor = null, skip = 0 } = {}, match) {
@@ -122,6 +123,52 @@ test("F44 runtime active follow-up discovery drains past the old first-1000 wind
   const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-new")], accounts: [{ id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE" }, { id: "tg-new", agencyId: "agency-1", lifecycleState: "ACTIVE" }], intents });
   const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: db._member, db });
   assert.ok(eligible.some((row) => row.accountId === "tg-old" && row.messagingEligible === false));
+});
+
+test("cancelled TASK follow-up debt scan is exact beyond the first two pages", async () => {
+  const orders = Array.from({ length: 501 }, (_, i) => order(i + 1, "CANCELLED"));
+  const intents = [];
+  for (let i = 0; i < orders.length; i += 1) {
+    intents.push(task(i + 1, "tg-old"));
+    if (i < orders.length - 1) {
+      intents.push({
+        id: `cancel-${String(i + 1).padStart(4, "0")}`,
+        agencyId: "agency-1",
+        creatorId: "creator-1",
+        customOrderId: orders[i].id,
+        accountId: "tg-old",
+        kind: "CANCELLATION",
+        state: "CONFIRMED",
+      });
+    }
+  }
+  const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-old")], accounts: [{ id: "tg-old", agencyId: "agency-1", lifecycleState: "ACTIVE" }], orders, intents });
+  const debt = await findCancelledTaskFollowupDebt({ agencyId: "agency-1", creatorIds: ["creator-1"], accountId: "tg-old", db });
+  assert.equal(debt.length, 1);
+  assert.equal(debt[0].order.id, orders[500].id);
+  assert.equal(debt[0].task.id, `task-${String(501).padStart(4, "0")}`);
+});
+
+
+test("SALVAGE source no longer requires Telegram source capability after cancellation", async () => {
+  const sources = [
+    {
+      id: "submission-active", agencyId: "agency-1", creatorId: "creator-1", telegramSourceAccountId: "tg-active", telegramSourceUserId: "900001",
+      telegramMessageIds: [1, 2], ofMediaIds: ["media-1"], pipelineDisposition: "ACTIVE",
+    },
+    {
+      id: "submission-salvage", agencyId: "agency-1", creatorId: "creator-1", telegramSourceAccountId: "tg-salvage", telegramSourceUserId: "900001",
+      telegramMessageIds: [3, 4, 5], ofMediaIds: ["media-3"], pipelineDisposition: "SALVAGE",
+    },
+  ];
+  const db = makeRuntimeDb({ creators: [creator("creator-1", "tg-active")], accounts: [{ id: "tg-active", agencyId: "agency-1", lifecycleState: "ACTIVE" }, { id: "tg-salvage", agencyId: "agency-1", lifecycleState: "ACTIVE" }], sources });
+  const seen = [];
+  await scanIncompleteTelegramSources({ agencyId: "agency-1", creatorIds: ["creator-1"], db, onRow: async (row) => { seen.push(row.id); return false; } });
+  assert.deepEqual(seen, ["submission-active"]);
+
+  const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: db._member, db });
+  assert.ok(eligible.some((row) => row.accountId === "tg-active"));
+  assert.ok(!eligible.some((row) => row.accountId === "tg-salvage"), "SALVAGE must not keep a historical source MTProto runtime alive");
 });
 
 test("F44 scoped explicit account #101 is discovered without agency-wide first-100 catalog truncation", async () => {

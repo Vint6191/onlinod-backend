@@ -11,6 +11,8 @@ const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/aut
 const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
 const { agencyRemovalPhrase, removeCreatorFromAssignedCreators, retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
+const { assertCreatorCustomPipelineRetirable, lockCreatorPipelineLifecycle } = require("../services/custom-content-pipeline-authority-service");
+const { assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
 const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
 const { updateCreatorTelegramContact } = require("../services/creator-telegram-contact-authority-service");
 const { bumpAgencyAccessEpoch } = require("../services/access-epoch-service");
@@ -24,11 +26,32 @@ const {
 
 const router = express.Router();
 
+const CREATOR_CONTROL_SCAN_BATCH = 500;
+
+async function scanRowsById({ delegate, where, select }) {
+  const rows = [];
+  let cursorId = null;
+  while (true) {
+    const page = await delegate.findMany({
+      where,
+      select,
+      orderBy: { id: "asc" },
+      take: CREATOR_CONTROL_SCAN_BATCH,
+      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
+    });
+    if (!page.length) break;
+    rows.push(...page);
+    cursorId = String(page[page.length - 1].id);
+    if (page.length < CREATOR_CONTROL_SCAN_BATCH) break;
+  }
+  return rows;
+}
+
 async function publishAgencyAccessEpochEvents(req) {
-  const members = await prisma.agencyMember.findMany({
+  const members = await scanRowsById({
+    delegate: prisma.agencyMember,
     where: { agencyId: req.auth.agencyId, deletedAt: null, deactivatedAt: null },
     select: { id: true, userId: true, accessEpoch: true },
-    take: 10000,
   });
   for (const member of members) {
     try {
@@ -203,6 +226,7 @@ function creatorErrorResponse(res, error, fallbackCode, fallbackMessage) {
     if (error.creatorId) payload.creatorId = error.creatorId;
     if (error.currentConnectionState) payload.currentConnectionState = error.currentConnectionState;
     if (error.currentConnectionGeneration != null) payload.currentConnectionGeneration = error.currentConnectionGeneration;
+    if (error.details && typeof error.details === "object") payload.details = error.details;
     return res.status(Number(error.status)).json(payload);
   }
   return res.status(500).json({ ok: false, code: fallbackCode, error: fallbackMessage });
@@ -520,10 +544,13 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
 
     const removedAt = new Date();
     const result = await prisma.$transaction(async (tx) => {
-      const members = await tx.agencyMember.findMany({
+      await lockCreatorPipelineLifecycle({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id, allowDeleted: true });
+      await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id });
+      await assertCreatorMassCampaignRetirable({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id });
+      const members = await scanRowsById({
+        delegate: tx.agencyMember,
         where: { agencyId: req.auth.agencyId, deletedAt: null },
         select: { id: true, assignedCreators: true },
-        take: 10000,
       });
       let removedFromMemberAssignments = 0;
       for (const member of members) {
@@ -533,10 +560,10 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
         removedFromMemberAssignments += 1;
       }
 
-      const pendingInvitations = await tx.agencyInvitation.findMany({
+      const pendingInvitations = await scanRowsById({
+        delegate: tx.agencyInvitation,
         where: { agencyId: req.auth.agencyId, claimedAt: null, revokedAt: null },
         select: { id: true, assignedCreators: true },
-        take: 10000,
       });
       let removedFromInvitationAssignments = 0;
       for (const invitation of pendingInvitations) {
@@ -614,8 +641,8 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
       });
     }
 
-    console.error("[creators/delete] failed:", err);
-    return res.status(500).json({ ok: false, code: "CREATOR_DELETE_FAILED", error: "Failed to remove creator from agency" });
+    if (!err?.status && !err?.code) console.error("[creators/delete] failed:", err);
+    return creatorErrorResponse(res, err, "CREATOR_DELETE_FAILED", "Failed to remove creator from agency");
   }
 });
 

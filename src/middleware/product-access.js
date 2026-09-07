@@ -104,12 +104,18 @@ async function filterProductCreatorScope(req, creatorIds, { db = null, rejectFor
 
   // This helper is a canonical security boundary, so even broad actors must
   // never turn arbitrary caller-supplied ids into authorised creator ids.
-  const rows = await client.creatorAccount.findMany({
-    where: { agencyId: context.agencyId, deletedAt: null, id: { in: requested } },
-    select: { id: true },
-    take: Math.min(10000, requested.length),
-  });
-  const liveAgencyIds = new Set(rows.map((row) => String(row.id)));
+  // Query in transport-sized chunks, but never turn a query batch size into a
+  // correctness horizon: every requested creator id must be classified.
+  const liveAgencyIds = new Set();
+  for (let offset = 0; offset < requested.length; offset += 500) {
+    const chunk = requested.slice(offset, offset + 500);
+    const rows = await client.creatorAccount.findMany({
+      where: { agencyId: context.agencyId, deletedAt: null, id: { in: chunk } },
+      select: { id: true },
+      take: chunk.length,
+    });
+    for (const row of rows) liveAgencyIds.add(String(row.id));
+  }
   const invalid = requested.filter((id) => !liveAgencyIds.has(id));
 
   if (context.scope.broad) {

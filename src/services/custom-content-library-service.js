@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { confirmedRelaySequence } = require("./custom-relay-result-proof-service");
+const { ensureSubmissionExecutionProfile, hasCurrentVaultSettlement, vaultSettlementFingerprint, invalidateVaultSettlementData } = require("./custom-content-pipeline-authority-service");
 
 const SOURCE_CUSTOM = "CUSTOM";
 const MAX_MEDIA_IDS = 200;
@@ -101,27 +102,32 @@ async function loadContext(db, { agencyId, member, submissionId, requireFolder }
   await requireCreatorAccess({ agencyId, member, creatorId: submission.creatorId, db });
   const telegramIds = Array.isArray(submission.telegramMessageIds) ? submission.telegramMessageIds : [];
   if (!telegramIds.length) throw fail("CUSTOM_SUBMISSION_NOT_READY_FOR_LIBRARY", "Submission has no Telegram source messages", 409);
+  const storedMediaIds = uniqueMediaIds(submission.ofMediaIds);
+  const salvage = String(submission.pipelineDisposition || "ACTIVE") === "SALVAGE";
+  if (salvage && !storedMediaIds.length) throw fail("CUSTOM_SUBMISSION_SALVAGE_EMPTY", "Salvaged submission has no confirmed media to finalize", 409);
+  const proofSourceIds = salvage ? telegramIds.slice(0, storedMediaIds.length) : telegramIds;
   const proofs = await confirmedRelaySequence({
     agencyId, creatorId: submission.creatorId, submissionId: submission.id,
     expectedTelegramSourceAccountId: submission.telegramSourceAccountId,
     expectedTelegramSourceUserId: submission.telegramSourceUserId,
-    expectedTelegramMessageIds: telegramIds, db,
+    expectedTelegramMessageIds: proofSourceIds, db,
   });
   const provenMediaIds = proofs.map((proof) => proof.mediaId);
-  const storedMediaIds = uniqueMediaIds(submission.ofMediaIds);
   if (storedMediaIds.length !== provenMediaIds.length || storedMediaIds.some((value, index) => value !== provenMediaIds[index])) {
-    const changed = await db.customContentSubmission.updateMany({ where: { id: submission.id, agencyId, updatedAt: submission.updatedAt }, data: { ofMediaIds: provenMediaIds } });
+    const changed = await db.customContentSubmission.updateMany({ where: { id: submission.id, agencyId, updatedAt: submission.updatedAt }, data: { ofMediaIds: provenMediaIds, ...invalidateVaultSettlementData() } });
     if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_LIBRARY_PROJECTION_CONFLICT", "Submission changed while proven relay results were being projected", 409);
     submission.ofMediaIds = provenMediaIds;
   }
   const creator = await db.creatorAccount.findFirst({
     where: { id: submission.creatorId, agencyId, deletedAt: null },
-    select: { id: true, customsVaultFolderId: true },
+    select: { id: true },
   });
   if (!creator) throw fail("CREATOR_NOT_FOUND", "Creator not found", 404);
-  const folderId = clean(creator.customsVaultFolderId, 240) || null;
+  const profile = await ensureSubmissionExecutionProfile({ db, agencyId, submission, requireRelayRecipient: false });
+  Object.assign(submission, profile.submission);
+  const folderId = clean(profile.vaultFolderId, 240) || null;
   if (requireFolder && !folderId) {
-    throw fail("CUSTOMS_VAULT_DESTINATION_REQUIRED", "Customs Vault destination is not configured", 409);
+    throw fail("CUSTOMS_VAULT_DESTINATION_REQUIRED", "Pinned Customs Vault destination is not available", 409);
   }
   const order = await loadOrder(db, {
     agencyId,
@@ -281,16 +287,72 @@ async function syncRows(db, { agencyId, creatorId, submissionId, mediaIds, folde
   return { complete: true, changed: created + changed, items: projectedRows };
 }
 
+async function confirmCustomContentSubmissionVaultSettlement({ agencyId, member, deviceId, submissionId, folderId, profileRevision, mediaIds, now = new Date(), db = null } = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const boundDeviceId = clean(deviceId, 180);
+  if (!boundDeviceId) throw fail("CUSTOM_SUBMISSION_SETTLEMENT_DEVICE_REQUIRED", "A bound product device is required to confirm Vault settlement", 403);
+  const client = db || require("../prisma");
+  const context = await loadContext(client, { agencyId, member, submissionId, requireFolder: true });
+  // loadContext may repair the durable media projection from provider-proven
+  // relay results. Reload after that CAS so receipt confirmation is always
+  // tied to the latest exact submission revision.
+  const current = await client.customContentSubmission.findFirst({ where: { id: context.submission.id, agencyId } });
+  if (!current) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  const canonicalFolderId = clean(current.executionVaultFolderId, 240);
+  const canonicalRevision = Number(current.executionProfileRevision);
+  const canonicalMediaIds = uniqueMediaIds(current.ofMediaIds);
+  const claimedFolderId = clean(folderId, 240);
+  const claimedRevision = Number(profileRevision);
+  const claimedMediaIds = uniqueMediaIds(mediaIds);
+  if (!canonicalFolderId || !current.executionPinnedAt || !Number.isInteger(canonicalRevision) || canonicalRevision <= 0) {
+    throw fail("CUSTOM_SUBMISSION_SETTLEMENT_PROFILE_REQUIRED", "Submission execution profile must be pinned before Vault settlement can be confirmed", 409);
+  }
+  if (claimedFolderId !== canonicalFolderId || claimedRevision !== canonicalRevision) {
+    throw fail("CUSTOM_SUBMISSION_SETTLEMENT_PROFILE_STALE", "Vault settlement confirmation does not match the current pinned execution profile", 409);
+  }
+  if (claimedMediaIds.length !== canonicalMediaIds.length || claimedMediaIds.some((value, index) => value !== canonicalMediaIds[index])) {
+    throw fail("CUSTOM_SUBMISSION_SETTLEMENT_MEDIA_STALE", "Vault settlement confirmation must cover the exact current proven media set", 409);
+  }
+  const fingerprint = vaultSettlementFingerprint({ folderId: canonicalFolderId, profileRevision: canonicalRevision, mediaIds: canonicalMediaIds });
+  if (!fingerprint) throw fail("CUSTOM_SUBMISSION_SETTLEMENT_INVALID", "Vault settlement fingerprint could not be derived", 409);
+  if (hasCurrentVaultSettlement(current)) {
+    return { ok: true, idempotent: true, submissionId: String(current.id), folderId: canonicalFolderId, profileRevision: canonicalRevision, mediaIds: canonicalMediaIds, fingerprint: current.vaultSettlementMediaFingerprint };
+  }
+  const changed = await client.customContentSubmission.updateMany({
+    where: { id: current.id, agencyId, updatedAt: current.updatedAt, executionVaultFolderId: canonicalFolderId, executionProfileRevision: canonicalRevision },
+    data: {
+      vaultSettlementFolderId: canonicalFolderId,
+      vaultSettlementProfileRevision: canonicalRevision,
+      vaultSettlementMediaFingerprint: fingerprint,
+      vaultSettlementConfirmedAt: new Date(now),
+      vaultSettlementConfirmedByDeviceId: boundDeviceId,
+    },
+  });
+  if (Number(changed?.count || 0) !== 1) {
+    const raced = await client.customContentSubmission.findFirst({ where: { id: current.id, agencyId } });
+    if (raced && hasCurrentVaultSettlement(raced)) {
+      return { ok: true, idempotent: true, submissionId: String(raced.id), folderId: clean(raced.executionVaultFolderId, 240), profileRevision: Number(raced.executionProfileRevision), mediaIds: uniqueMediaIds(raced.ofMediaIds), fingerprint: raced.vaultSettlementMediaFingerprint };
+    }
+    throw fail("CUSTOM_SUBMISSION_SETTLEMENT_CONFLICT", "Submission changed while Vault settlement was being confirmed; reconcile the current media set again", 409);
+  }
+  return { ok: true, idempotent: false, submissionId: String(current.id), folderId: canonicalFolderId, profileRevision: canonicalRevision, mediaIds: canonicalMediaIds, fingerprint };
+}
+
 /**
  * Called only after Desktop has confirmed move-only/folder settlement for every
- * committed OF media id. The resulting CUSTOM CreatorMediaAsset rows are the
- * durable finalization marker; CustomContentSubmission itself stays compact.
+ * committed OF media id. The current Vault-settlement receipt is the durable
+ * proof of that external execution stage; CUSTOM CreatorMediaAsset rows are the
+ * typed business projection. Finalized readiness requires both, so Library rows
+ * alone can never become historical proof of Vault settlement.
  */
 async function finalizeCustomContentSubmissionLibrary({ agencyId, member, submissionId, mediaHints = null, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const context = await loadContext(client, { agencyId, member, submissionId, requireFolder: true });
   const { submission, folderId, order, mediaIds } = context;
+  if (!hasCurrentVaultSettlement(submission)) {
+    throw fail("CUSTOM_SUBMISSION_VAULT_SETTLEMENT_REQUIRED", "All proven Custom media must have a current durable Vault-settlement receipt before Content Library finalization", 409);
+  }
   const normalizedHints = normalizeMediaHints(mediaHints, mediaIds);
   const result = await syncRows(client, {
     agencyId,
@@ -345,6 +407,7 @@ async function syncFinalizedSubmissionAssignment({ agencyId, member, submissionI
   const client = db || require("../prisma");
   const context = await loadContext(client, { agencyId, member, submissionId, requireFolder: false });
   const { submission, folderId, order, mediaIds } = context;
+  if (!hasCurrentVaultSettlement(submission)) return { ok: true, synced: false, reason: "VAULT_SETTLEMENT_REQUIRED" };
   const existing = await client.creatorMediaAsset.findMany({
     where: { agencyId, creatorId: submission.creatorId, mediaId: { in: mediaIds }, source: SOURCE_CUSTOM },
     take: mediaIds.length,
@@ -365,6 +428,7 @@ async function syncFinalizedSubmissionAssignment({ agencyId, member, submissionI
 
 module.exports = {
   SOURCE_CUSTOM,
+  confirmCustomContentSubmissionVaultSettlement,
   finalizeCustomContentSubmissionLibrary,
   isCompleteSubmission,
   normalizeMediaHints,

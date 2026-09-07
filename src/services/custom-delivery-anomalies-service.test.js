@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { listCustomDeliveryAnomalies } = require("./custom-delivery-anomalies-service");
+const { vaultSettlementFingerprint } = require("./custom-content-pipeline-authority-service");
 
 function fixture() {
   const creator = { id: "creator-1", displayName: "Model One", username: "modelone", avatarUrl: null, customsVaultFolderId: "folder-1" };
@@ -14,12 +15,16 @@ function fixture() {
   };
   const submission = {
     id: "sub-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1",
-    telegramMessageIds: [101, 102], ofMediaIds: ["9001", "9002"], reviewStatus: "APPROVED",
-    reviewedAt: new Date("2026-08-22T08:00:00Z"), creator, customOrder: order,
+    telegramMessageIds: [101, 102], ofMediaIds: ["9001", "9002"], pipelineDisposition: "ACTIVE",
+    executionVaultFolderId: "folder-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1, executionPinnedAt: new Date("2026-08-22T07:59:00Z"),
+    vaultSettlementFolderId: "folder-1", vaultSettlementProfileRevision: 1,
+    vaultSettlementMediaFingerprint: vaultSettlementFingerprint({ folderId: "folder-1", profileRevision: 1, mediaIds: ["9001", "9002"] }),
+    vaultSettlementConfirmedAt: new Date("2026-08-22T07:59:30Z"), vaultSettlementConfirmedByDeviceId: "device-1",
+    reviewStatus: "APPROVED", reviewedAt: new Date("2026-08-22T08:00:00Z"), creator, customOrder: order,
   };
   const assets = ["9001", "9002"].map((mediaId) => ({
     creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "sub-1", customFullPriceCents: 6000,
-    mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: ["folder-1"],
+    mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: ["folder-1"], catalogActive: true, sortingStatus: "SORTED",
   }));
   const audits = [
     { id: "a3", actorUserId: "user-1", action: "CUSTOM_DELIVERY_DUPLICATE_ATTEMPT", targetId: "custom-1", createdAt: new Date("2026-08-22T10:40:00Z"), metadata: { creatorId: "creator-1", dialogId: "777", messageId: "msg-3", duplicateMediaIds: ["9001"], expectedPriceCents: 0, actualPriceCents: 0, totalPriceCents: 6000, paidAmountCents: 6000, remainingAmountCents: 0 } },

@@ -6,6 +6,7 @@ const { applyLedgerSideEffects } = require("./team-ppv-ledger-service");
 const { applyTeamResponseProjection } = require("./team-response-projection-service");
 const { applyTeamPendingProjection } = require("./team-pending-projection-service");
 const { projectCustomDeliveryFromTeamEvent } = require("./custom-content-delivery-tracking-service");
+const { projectNativeMassWriteFromTeamEvent } = require("./programmatic-of-write-authority-service");
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { runDbTransaction } = require("./db-transaction-service");
@@ -17,6 +18,7 @@ const TEAM_V13_EVENT_KINDS = new Set([
   "MESSAGE_SEND_ATTEMPTED",
   "MESSAGE_SEND_CONFIRMED",
   "BROADCAST_DISPATCH_CONFIRMED",
+  "BROADCAST_QUEUE_CANCELED_CONFIRMED",
   "CONTENT_POST_PUBLISHED_CONFIRMED",
   "CONTENT_STORY_PUBLISHED_CONFIRMED",
   "DIALOG_SELECTED",
@@ -168,7 +170,7 @@ async function loadLiveTelemetryMember({ db, agencyId, memberId, userId, admitte
 
 function canonicalNeedsHumanActor(eventKind, actionSource) {
   if (HUMAN_ACTIVITY_KINDS.has(eventKind)) return true;
-  if (eventKind === "BROADCAST_DISPATCH_CONFIRMED") return actionSource === "BROADCAST";
+  if (eventKind === "BROADCAST_DISPATCH_CONFIRMED" || eventKind === "BROADCAST_QUEUE_CANCELED_CONFIRMED") return actionSource === "BROADCAST";
   if (eventKind === "CONTENT_POST_PUBLISHED_CONFIRMED" || eventKind === "CONTENT_STORY_PUBLISHED_CONFIRMED") return actionSource === "MANUAL";
   if (eventKind === "MESSAGE_SEND_ATTEMPTED" || eventKind === "MESSAGE_SEND_CONFIRMED") {
     return actionSource === "MANUAL";
@@ -229,7 +231,7 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
     ? stripInternalValue(event.metadata)
     : null;
   const mediaIds = Array.isArray(event.mediaIds)
-    ? Array.from(new Set(event.mediaIds.map((v) => cleanString(v, 160)).filter(Boolean))).slice(0, 100)
+    ? Array.from(new Set(event.mediaIds.map((v) => cleanString(v, 160)).filter(Boolean))).slice(0, 200)
     : [];
   const extra = compactObject({
     telemetryVersion: TEAM_V13_VERSION,
@@ -273,6 +275,47 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
     },
     reason: null,
   };
+}
+
+async function persistCanonicalTeamEventRow({ db, row }) {
+  if (!db || !row) throw new Error("Canonical Team event persistence requires db and row");
+  if (row.localId) {
+    const exists = await db.teamActivityEvent.findFirst({
+      where: { agencyId: row.agencyId, deviceId: row.deviceId, localId: row.localId },
+    });
+    if (exists) {
+      const durableRow = exists;
+      await applyLedgerSideEffects(durableRow, db);
+      await applyTeamResponseProjection(durableRow, db);
+      await applyTeamPendingProjection(durableRow, db);
+      await projectCustomDeliveryFromTeamEvent(durableRow, { db });
+    await projectNativeMassWriteFromTeamEvent(durableRow, { db });
+      return { row: durableRow, duplicated: true, inserted: false };
+    }
+  }
+  try {
+    const created = await db.teamActivityEvent.create({ data: row });
+    const durableRow = { ...row, id: created.id };
+    await applyLedgerSideEffects(durableRow, db);
+    await applyTeamResponseProjection(durableRow, db);
+    await applyTeamPendingProjection(durableRow, db);
+    await projectCustomDeliveryFromTeamEvent(durableRow, { db });
+    await projectNativeMassWriteFromTeamEvent(durableRow, { db });
+    return { row: durableRow, duplicated: false, inserted: true };
+  } catch (err) {
+    if (err?.code !== "P2002" || !row.localId) throw err;
+    const exists = await db.teamActivityEvent.findFirst({
+      where: { agencyId: row.agencyId, deviceId: row.deviceId, localId: row.localId },
+    });
+    if (!exists) throw err;
+    const durableRow = exists;
+    await applyLedgerSideEffects(durableRow, db);
+    await applyTeamResponseProjection(durableRow, db);
+    await applyTeamPendingProjection(durableRow, db);
+    await projectCustomDeliveryFromTeamEvent(durableRow, { db });
+    await projectNativeMassWriteFromTeamEvent(durableRow, { db });
+    return { row: durableRow, duplicated: true, inserted: false };
+  }
 }
 
 async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, admittedAccessEpoch = 1, events = [] }) {
@@ -343,6 +386,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
             await applyTeamResponseProjection(durableRow, tx);
             await applyTeamPendingProjection(durableRow, tx);
             await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
+            await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
             return { row: durableRow, duplicated: true };
           }
         }
@@ -353,6 +397,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
           await applyTeamResponseProjection(durableRow, tx);
           await applyTeamPendingProjection(durableRow, tx);
           await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
+            await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
           return { row: durableRow, inserted: true };
         } catch (err) {
           if (err?.code !== "P2002" || !row.localId) throw err;
@@ -365,6 +410,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
           await applyTeamResponseProjection(durableRow, tx);
           await applyTeamPendingProjection(durableRow, tx);
           await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
+            await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
           return { row: durableRow, duplicated: true };
         }
       }, serializableTxOptions());
@@ -403,4 +449,6 @@ module.exports = {
   TEAM_V13_VERSION,
   TEAM_V13_SOURCE,
   ingestTeamEvents,
+  normalizeCanonicalCore,
+  persistCanonicalTeamEventRow,
 };

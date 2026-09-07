@@ -597,6 +597,8 @@ model CustomOrder {
   deliveryOfferedCents        Int                       @default(0)
   cancelledAt                 DateTime?
   cancelReason                String?
+  telegramCancellationWaivedAt DateTime?
+  telegramCancellationWaiverReason String?
   mediaIds                    String                    @default("")
   priceCents                  Int                       @default(0)
   paidAmountCents             Int                       @default(0)
@@ -651,6 +653,22 @@ model CustomContentSubmission {
   sourceResolutionEventId String?
   ofMediaIds         String[] @default([])
   comment            String?
+  executionVaultFolderId String?
+  executionRelayRecipient String?
+  executionProfileRevision Int @default(0)
+  executionPinnedAt DateTime?
+  vaultSettlementFolderId String?
+  vaultSettlementProfileRevision Int?
+  vaultSettlementMediaFingerprint String?
+  vaultSettlementConfirmedAt DateTime?
+  vaultSettlementConfirmedByDeviceId String?
+  pipelineDisposition String @default("ACTIVE")
+  pipelineDispositionReason String?
+  pipelineDispositionChangedAt DateTime?
+  pipelineBlockedCode String?
+  pipelineBlockedAt DateTime?
+  pipelineLastAttemptAt DateTime?
+  pipelineNextAttemptAt DateTime?
   reviewStatus       CustomContentReviewStatus @default(WAITING_REVIEW)
   reviewComment      String?
   reviewedByMemberId String?
@@ -668,6 +686,11 @@ model CustomContentSubmission {
   @@index([agencyId, creatorId, receivedAt])
   @@index([agencyId, telegramSourceAccountId, telegramSourceUserId])
   @@index([agencyId, reviewStatus, receivedAt])
+  @@index([agencyId, pipelineDisposition, receivedAt])
+  @@index([agencyId, pipelineDisposition, pipelineNextAttemptAt, receivedAt])
+  @@index([agencyId, pipelineDisposition, pipelineLastAttemptAt, receivedAt, createdAt, id], map: "CCS_pipeline_fairness_idx")
+  @@index([agencyId, telegramSourceAccountId, pipelineDisposition, pipelineLastAttemptAt, receivedAt, createdAt, id], map: "CCS_source_pipeline_fairness_idx")
+  @@index([agencyId, telegramSourceAccountId, pipelineDisposition, receivedAt])
   @@index([customOrderId, receivedAt])
   @@index([reviewedByMemberId])
 }
@@ -700,6 +723,10 @@ model TelegramDeliveryIntent {
   outcomeReason       String?
   confirmationAuthority String?
   confirmedAt         DateTime?
+  projectionBlockedCode String?
+  projectionBlockedAt DateTime?
+  projectionLastAttemptAt DateTime?
+  projectionAttempts  Int      @default(0)
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
@@ -709,6 +736,7 @@ model TelegramDeliveryIntent {
   @@unique([customOrderId, kind, referenceOrdinal], map: "TelegramDeliveryIntent_reference_ordinal_key")
   @@index([agencyId, accountId, state])
   @@index([agencyId, accountId, remoteRecipientTelegramUserId, state])
+  @@index([agencyId, state, projectionBlockedAt])
   @@unique([agencyId, accountId, remoteMessageId], map: "TelegramDeliveryIntent_provider_message_key")
   @@index([customOrderId, remoteMessageId])
 }
@@ -744,6 +772,7 @@ model TelegramInboundEvent {
   @@index([agencyId, customOrderId, sentAt])
   @@index([agencyId, accountId, replyToMessageId])
   @@index([agencyId, projectionState, observedAt])
+  @@index([agencyId, projectionState, updatedAt])
   @@index([submissionId])
 }
 
@@ -3695,6 +3724,16 @@ model AutomationDelivery {
   priceCents          Int      @default(0)
   media               Json     @default("[]")
   result              Json     @default("{}")
+  // MASS/Campaigns: server-visible logical intent acknowledgement is distinct
+  // from external-write completion. A terminal queue-create remains the current
+  // logical send until the operator explicitly acknowledges it on any device.
+  intentAcknowledgedAt DateTime?
+  // Provider-side future-effect lifecycle for writes that create durable remote
+  // objects (currently MASS_QUEUE_CREATE). UNKNOWN is never safe to infer away.
+  remoteLifecycleState String?
+  remoteTargetId       String?
+  remoteLifecycleObservedAt DateTime?
+  remoteSettledAt      DateTime?
   error               String?  // legacy alias; new write control plane uses lastError
   finishedAt          DateTime?
   createdByUserId     String?
@@ -3713,6 +3752,9 @@ model AutomationDelivery {
   @@index([creatorId, status, notBefore])
   @@index([creatorId, messageId])
   @@index([creatorId, status, cancelAt])
+  @@index([creatorId, actionType, remoteLifecycleState])
+  @@index([creatorId, actionType, remoteTargetId])
+  @@index([agencyId, actionType, remoteLifecycleState])
   @@index([claimedByDeviceId, status])
   @@index([claimUntil])
   @@index([ruleId])

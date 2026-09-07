@@ -154,9 +154,27 @@
     const u = U();
     const a = slice.data.agency;
     const h = slice.data.health;
+    const pipeline = slice.data.customPipelineBlockers || {};
 
     const isDeleted = !!a.deletedAt;
+    const pipelineDebt = Math.max(0, Number(pipeline.total || 0));
     const owner = (a.members || []).find((m) => m.role === "OWNER");
+
+    const pipelineBreakdown = pipelineDebt > 0
+      ? [
+          ["pending orders", pipeline.pendingOrders],
+          ["submissions", pipeline.activeSubmissions],
+          ["OF writes", pipeline.activeWrites],
+          ["Telegram deliveries", pipeline.activeTelegramDeliveries],
+          ["cancel follow-up debt", pipeline.cancelledTelegramFollowupDebt],
+          ["confirmed projection debt", pipeline.confirmedTelegramProjectionDebt],
+          ["provider observations", pipeline.unresolvedInboundEvents],
+        ]
+          .map(([label, value]) => [label, Math.max(0, Number(value || 0))])
+          .filter(([, value]) => value > 0)
+          .map(([label, value]) => `${label}: ${value}`)
+          .join(" · ")
+      : "";
 
     return `
       <div class="adm-page-head">
@@ -200,6 +218,20 @@
           ? `<div class="adm-error" style="margin-bottom:14px;">
               This agency was soft-deleted${a.deletedReason ? `: ${r.escapeHtml(a.deletedReason)}` : ""}.
               Restore to reactivate, or hard delete to remove forever.
+            </div>`
+          : ""
+      }
+
+      ${
+        pipelineDebt > 0
+          ? `<div class="adm-error" style="margin-bottom:14px;">
+              <strong>${r.escapeHtml(String(pipelineDebt))} durable Custom / Telegram blocker${pipelineDebt === 1 ? "" : "s"}.</strong>
+              ${
+                isDeleted
+                  ? `This is historical pipeline debt behind a retired Agency. Restore the Agency, let the durable work converge or resolve it explicitly, then retire the Agency again. Hard delete is destructive maintenance and will intentionally remove history.`
+                  : `Normal soft delete is fail-closed until this durable work converges or is explicitly resolved.`
+              }
+              ${pipelineBreakdown ? `<div style="margin-top:6px;font-family:var(--adm-mono);font-size:11px;">${r.escapeHtml(pipelineBreakdown)}</div>` : ""}
             </div>`
           : ""
       }

@@ -12,6 +12,7 @@ const {
   searchMediaLibrary,
   upsertMediaMetadata,
   replaceUsageSources,
+  mutateFolderMembership,
 } = require("./media-library-service");
 
 const AGENCY_ID = "agency-1";
@@ -24,7 +25,6 @@ test("Media Library migration merges legacy data before dropping redundant table
     path.join(root, "prisma/migrations/20260719170000_media_library_v1/migration.sql"),
     "utf8",
   );
-  const cleanup = fs.readFileSync(path.join(root, "DELETE_LEGACY_FILES.bat"), "utf8");
   assert.match(schema, /catalogActive\s+Boolean\s+@default\(false\)/);
   assert.match(migration, /INSERT INTO "CreatorMediaAsset"[\s\S]*FROM "VaultUnsortedItem"/);
   assert.match(migration, /CREATE TABLE "CreatorMediaUsageContribution"/);
@@ -32,11 +32,14 @@ test("Media Library migration merges legacy data before dropping redundant table
   const mergePosition = migration.indexOf('FROM "VaultUnsortedItem"');
   const dropPosition = migration.indexOf('DROP TABLE "VaultUnsortedItem"');
   assert.ok(mergePosition >= 0 && dropPosition > mergePosition);
+  // Legacy deletion BATs are one-shot operator tools, not permanent source
+  // authority. Closure is the current production tree itself: the retired
+  // routes/services must already be absent after the migration/cutover.
   for (const file of [
-    "src\\routes\\vault-intelligence.js",
-    "src\\routes\\vault-unsorted.js",
-    "src\\services\\vault-intelligence-service.js",
-  ]) assert.match(cleanup, new RegExp(file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    "src/routes/vault-intelligence.js",
+    "src/routes/vault-unsorted.js",
+    "src/services/vault-intelligence-service.js",
+  ]) assert.equal(fs.existsSync(path.join(root, file)), false, `${file} must stay retired from current source`);
 });
 
 function metadataDb(seed = []) {
@@ -487,4 +490,31 @@ test("usage batches commit one bounded source transaction and bulk projection at
   assert.match(bulkUsageUpdates[0].query, /jsonb_to_recordset/);
   assert.equal(assets.get("m1").sentCount, 5);
   assert.equal(assets.get("m1").revenueCents, 500);
+});
+
+
+test("folder membership mutation rejects removing live CUSTOM media from its pinned pipeline folder before local projection drifts", async () => {
+  const assets = [{ id: "asset-custom", mediaId: "9001", source: "CUSTOM", customSubmissionId: "sub-live", folderIds: ["vault-pinned", "other"] }];
+  const submission = { id: "sub-live", executionVaultFolderId: "vault-pinned" };
+  const tx = {
+    creatorMediaAsset: {
+      findMany: async () => assets.map((row) => ({ ...row })),
+      update: async ({ where, data }) => { const row = assets.find((item) => item.id === where.id); Object.assign(row, data); return row; },
+    },
+    customContentSubmission: { findMany: async () => [{ ...submission }] },
+  };
+  const db = {
+    creatorAccount: { findFirst: async () => ({ id: "creator-1" }) },
+    $transaction: async (work) => work(tx),
+  };
+
+  await assert.rejects(
+    () => mutateFolderMembership({ agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["9001"], folderId: "vault-pinned", action: "remove", db }),
+    (error) => error?.code === "MEDIA_LIBRARY_CUSTOM_PIPELINE_FOLDER_OWNED" && error?.status === 409,
+  );
+  assert.deepEqual(assets[0].folderIds, ["vault-pinned", "other"]);
+
+  const result = await mutateFolderMembership({ agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["9001"], folderId: "other", action: "remove", db });
+  assert.equal(result.updated, 1);
+  assert.deepEqual(assets[0].folderIds, ["vault-pinned"]);
 });

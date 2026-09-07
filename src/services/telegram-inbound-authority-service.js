@@ -7,6 +7,7 @@ const { canUsePermission } = require("./team-access-control");
 const { resolveTelegramAccountId } = require("./custom-order-reminders");
 const { createCustomContentSubmissionFromInboundEvent, assignCustomContentSubmission } = require("./custom-content-submissions-service");
 const { providerMessageEventId, resolveTelegramCustomThread, targetAllowedByThreadContext } = require("./custom-telegram-thread-authority-service");
+const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 4000) { const text = String(value == null ? "" : value).trim(); return text ? text.slice(0, max) : ""; }
@@ -187,6 +188,7 @@ async function projectTelegramInboundEvent({ eventId: inputEventId, actorUserId 
     return durableProjectionResult(row, { state: "APPLIED", submission: { id: String(row.submissionId) } });
   }
 
+
   try {
     const context = await resolveThreadContext({
       agencyId: row.agencyId,
@@ -206,6 +208,26 @@ async function projectTelegramInboundEvent({ eventId: inputEventId, actorUserId 
     };
 
     if (!resolved.creatorId || !resolved.customOrderId) {
+      // If this durable observation already carried historical business pointers but
+      // current thread resolution can no longer find them, distinguish a hard-delete
+      // orphan from an ordinary late/missing provider proof before clearing the pointers.
+      // Prospective hard deletes purge provider ledgers; this is compatibility defense
+      // for old/manual data and keeps the original evidence visible to manager review.
+      if (row.creatorId || row.customOrderId) {
+        const [creatorExists, orderExists] = await Promise.all([
+          row.creatorId && client.creatorAccount?.findFirst
+            ? client.creatorAccount.findFirst({ where: { id: String(row.creatorId), agencyId: row.agencyId }, select: { id: true } })
+            : Promise.resolve(row.creatorId ? null : { id: null }),
+          row.customOrderId && client.customOrder?.findFirst
+            ? client.customOrder.findFirst({ where: { id: String(row.customOrderId), agencyId: row.agencyId }, select: { id: true } })
+            : Promise.resolve(row.customOrderId ? null : { id: null }),
+        ]);
+        const orphanBusinessContext = (row.creatorId && !creatorExists) || (row.customOrderId && !orderExists);
+        if (orphanBusinessContext) {
+          row = await setProjectionState({ row, state: "REVIEW_REQUIRED", reason: "LEGACY_ORPHAN_BUSINESS_CONTEXT", projectedAt: now, db: client });
+          return durableProjectionResult(row, { state: "REVIEW_REQUIRED", reason: "LEGACY_ORPHAN_BUSINESS_CONTEXT" });
+        }
+      }
       await client.telegramInboundEvent.updateMany({
         where: { id: row.id, agencyId: row.agencyId, submissionId: null },
         data: {
@@ -294,28 +316,42 @@ async function projectTelegramInboundEvent({ eventId: inputEventId, actorUserId 
   }
 }
 
-async function listTelegramInboundReviewQueue({ agencyId, member, limit = 50, now = new Date(), db = null } = {}) {
+async function listTelegramInboundReviewQueue({ agencyId, member, limit = 50, cursor = null, now = new Date(), db = null } = {}) {
   const client = db || require("../prisma");
   await requireInboundReviewView({ agencyId, member, db: client });
   const take = boundedLimit(limit);
-  // Exception visibility is derived from CURRENT thread context, not the stale creatorId projection
-  // stored when the event first failed. Read the exception set and authorize each row against a
-  // fresh resolver result; capacity of this correctness queue is audited separately.
-  const rows = await client.telegramInboundEvent.findMany({
-    where: { agencyId, projectionState: "REVIEW_REQUIRED" },
-    orderBy: [{ projectedAt: "asc" }, { observedAt: "asc" }, { id: "asc" }],
-  });
+  const startCursor = clean(cursor, 180);
+  // Authorization is a CURRENT semantic check and therefore necessarily happens after the durable
+  // provider rows are discovered.  The cursor keeps that post-filter convergent: inaccessible or
+  // stale exceptions may delay a page, but they can never make later visible work unreachable.
+  // Keep the original oldest-exception priority. Prisma can resume a composite order from the
+  // unique event id cursor, so pagination does not trade convergence for arbitrary UUID ordering.
+  let scanCursor = startCursor || null;
   const visible = [];
-  for (const row of rows || []) {
-    try {
-      const auth = await authorizeTelegramInboundException({ agencyId, member, row, write: false, db: client });
-      visible.push({ row, auth });
-    } catch (error) {
-      if (Number(error?.status) === 403) continue;
-      throw error;
+  while (visible.length <= take) {
+    const rows = await client.telegramInboundEvent.findMany({
+      where: { agencyId, projectionState: "REVIEW_REQUIRED" },
+      orderBy: [{ projectedAt: "asc" }, { observedAt: "asc" }, { id: "asc" }],
+      ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
+      take: Math.max(200, take * 2),
+    });
+    if (!rows?.length) break;
+    for (const row of rows) {
+      scanCursor = String(row.id);
+      try {
+        const auth = await authorizeTelegramInboundException({ agencyId, member, row, write: false, db: client });
+        visible.push({ row, auth });
+        if (visible.length > take) break;
+      } catch (error) {
+        if (Number(error?.status) === 403) continue;
+        throw error;
+      }
     }
+    if (visible.length > take || rows.length < Math.max(200, take * 2)) break;
   }
+  const hasMore = visible.length > take;
   const selected = visible.slice(0, take);
+  const nextCursor = hasMore && selected.length ? String(selected[selected.length - 1].row.id) : null;
   const creatorIds = Array.from(new Set(selected.flatMap(({ auth }) => auth.creatorIds || [])));
   const creators = creatorIds.length && client.creatorAccount?.findMany
     ? await client.creatorAccount.findMany({ where: { agencyId, id: { in: creatorIds } }, select: { id: true, displayName: true, username: true, avatarUrl: true, deletedAt: true } })
@@ -359,7 +395,7 @@ async function listTelegramInboundReviewQueue({ agencyId, member, limit = 50, no
       candidateOrders,
     };
   });
-  return { ok: true, items, count: visible.length, canResolve: canResolve === true, serverNow: now.toISOString() };
+  return { ok: true, items, count: selected.length, nextCursor, hasMore, canResolve: canResolve === true, serverNow: now.toISOString() };
 }
 
 async function searchTelegramInboundReviewCandidates({ agencyId, member, eventId: inputEventId, query = "", limit = 30, db = null } = {}) {
@@ -377,8 +413,32 @@ async function searchTelegramInboundReviewCandidates({ agencyId, member, eventId
   const rawQuery = clean(query, 200);
   const normalizedQuery = rawQuery.replace(/^#+/, "").trim();
   const take = Math.max(1, Math.min(50, Math.floor(Number(limit) || 30)));
+  const proofType = String(context.type || "NO_ACTIVE_THREAD");
+  const exactThreadProof = ["DIRECT_REPLY", "UNIQUE_ACTIVE_THREAD", "AMBIGUOUS_ACTIVE_THREADS"].includes(proofType);
+  const explicitUnprovenOverride = ["NO_ACTIVE_THREAD", "DIRECT_REPLY_UNRESOLVED"].includes(proofType) && auth.scope?.broad;
+  // Candidate search is a read-model, but LIMIT must still follow eligibility. For proven
+  // threads, constrain SQL to the exact provider-proven Custom ids before the presentation
+  // window. For broad manual override states, keep the intentionally unproven agency search.
+  // Other conflict states have no safe candidate surface and remain fail-closed.
+  if (!exactThreadProof && !explicitUnprovenOverride) {
+    return {
+      ok: true, eventId, creatorId: context.thread?.creatorId || null, items: [], state: "REVIEW_REQUIRED", proofState: proofType,
+      threadContext: { type: proofType, creatorIds: auth.creatorIds, customOrderIds: context.customOrderIds || [] },
+    };
+  }
   const where = { agencyId, type: "CONTENT", status: "PENDING" };
-  if (context.type !== "NO_ACTIVE_THREAD" && auth.creatorIds.length) where.creatorId = { in: auth.creatorIds };
+  if (exactThreadProof) {
+    const exactOrderIds = Array.from(new Set((context.customOrderIds || []).map(String).filter(Boolean)));
+    if (!exactOrderIds.length) {
+      return {
+        ok: true, eventId, creatorId: context.thread?.creatorId || null, items: [], state: "REVIEW_REQUIRED", proofState: proofType,
+        threadContext: { type: proofType, creatorIds: auth.creatorIds, customOrderIds: [] },
+      };
+    }
+    where.id = { in: exactOrderIds };
+  } else if (auth.creatorIds.length) {
+    where.creatorId = { in: auth.creatorIds };
+  }
   if (normalizedQuery) {
     where.OR = [
       { id: normalizedQuery },
@@ -390,7 +450,7 @@ async function searchTelegramInboundReviewCandidates({ agencyId, member, eventId
     select: { id: true, creatorId: true, scenario: true, type: true, status: true, dueAt: true, createdAt: true },
     orderBy: [{ createdAt: "desc" }, { id: "desc" }], take,
   });
-  const filtered = (rows || []).filter((target) => context.type === "NO_ACTIVE_THREAD" || targetAllowedByThreadContext(context, target));
+  const filtered = rows || [];
   return {
     ok: true,
     eventId,
@@ -542,7 +602,11 @@ async function retryPendingInboundProjections({ agencyId, accountId = null, acto
         { projectionState: "PENDING", projectionReason: null },
       ],
     },
-    orderBy: [{ observedAt: "asc" }, { id: "asc" }], take: remaining,
+    // Fair retry scheduling: FAILED_RETRYABLE updates its row on every attempt, so
+    // updatedAt moves a persistently failing observation behind untouched work. This
+    // prevents the oldest poisoned batch from monopolizing every recurring sweep while
+    // keeping crash-window PENDING rows (never attempted) naturally oldest.
+    orderBy: [{ updatedAt: "asc" }, { observedAt: "asc" }, { id: "asc" }], take: remaining,
   }) : [];
   for (const row of rows) {
     const result = await projectTelegramInboundEvent({ eventId: row.id, actorUserId, now, db: client });
@@ -621,17 +685,45 @@ async function ingestTelegramInboundEvent({ agencyId, member, accountId, deviceI
   const id = eventId({ agencyId, accountId: normalizedAccountId, senderTelegramUserId: sender, messageId: inboundMessageId });
   let row = await client.telegramInboundEvent.findFirst({ where: { id } });
   if (!row) {
-    try {
-      row = await client.telegramInboundEvent.create({ data: {
-        id, agencyId, accountId: normalizedAccountId, creatorId, customOrderId, senderTelegramUserId: sender, messageId: inboundMessageId,
-        replyToMessageId: replyId, groupedId: clean(groupedId, 180) || null, hasMedia: hasMedia === true, text: clean(text, 4000) || null,
-        sentAt: observedAt, observedAt: now, projectionState: "PENDING", projectionReason: null, projectedAt: null,
-        intakeAuthority: "PROVIDER_OBSERVATION", threadResolutionType, threadAnchorIntentId, resolutionAuthority,
-      } });
-    } catch (error) {
-      if (String(error?.code || "") !== "P2002") throw error;
-      row = await client.telegramInboundEvent.findFirst({ where: { id } });
-    }
+    const persistObservation = async (tx) => {
+      let agencyRetired = false;
+      let creatorRetired = false;
+      if (hasMedia === true) {
+        const agencyLifecycle = await lockAgencyPipelineLifecycle({ db: tx, agencyId, allowDeleted: true });
+        agencyRetired = agencyLifecycle?.deletedAt != null;
+      }
+      // A media-bearing provider observation that already resolves to a creator is durable
+      // Custom-pipeline work before CustomContentSubmission exists. Serialize its creation with
+      // creator retirement so the removal blocker cannot pass and then be followed by invisible
+      // work. If retirement won first, preserve the provider fact but route it directly to the
+      // manager exception lane instead of pretending the retired creator can accept new work.
+      if (creatorId && hasMedia === true) {
+        const lifecycle = await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId, allowDeleted: true });
+        creatorRetired = lifecycle?.deletedAt != null;
+      }
+      const terminalIntakeReason = agencyRetired
+        ? "AGENCY_RETIRED_DURING_INTAKE"
+        : creatorRetired
+          ? "CREATOR_RETIRED_DURING_INTAKE"
+          : null;
+      try {
+        return await tx.telegramInboundEvent.create({ data: {
+          id, agencyId, accountId: normalizedAccountId, creatorId, customOrderId, senderTelegramUserId: sender, messageId: inboundMessageId,
+          replyToMessageId: replyId, groupedId: clean(groupedId, 180) || null, hasMedia: hasMedia === true, text: clean(text, 4000) || null,
+          sentAt: observedAt, observedAt: now,
+          projectionState: terminalIntakeReason ? "REVIEW_REQUIRED" : "PENDING",
+          projectionReason: terminalIntakeReason,
+          projectedAt: terminalIntakeReason ? now : null,
+          intakeAuthority: "PROVIDER_OBSERVATION", threadResolutionType, threadAnchorIntentId, resolutionAuthority,
+        } });
+      } catch (error) {
+        if (String(error?.code || "") !== "P2002") throw error;
+        return tx.telegramInboundEvent.findFirst({ where: { id } });
+      }
+    };
+    row = hasMedia === true && typeof client.$transaction === "function"
+      ? await client.$transaction(persistObservation)
+      : await persistObservation(client);
   }
   if (!row) throw fail("TELEGRAM_INBOUND_PERSIST_FAILED", "Telegram inbound event could not be persisted", 500);
   const deduped = Boolean(row.createdAt && new Date(row.createdAt).getTime() < new Date(now).getTime());
@@ -646,7 +738,9 @@ async function ingestTelegramInboundEvent({ agencyId, member, accountId, deviceI
     submissionId: row.submissionId || null, projectionState: row.projectionState || "PENDING", projectionReason: row.projectionReason || null,
   };
   setImmediate(() => {
-    void projectTelegramInboundEvent({ eventId: row.id, actorUserId: member?.userId || null, now, db: client }).catch(() => undefined);
+    if (["PENDING", "FAILED_RETRYABLE"].includes(String(row.projectionState || "PENDING"))) {
+      void projectTelegramInboundEvent({ eventId: row.id, actorUserId: member?.userId || null, now, db: client }).catch(() => undefined);
+    }
     void audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_inbound_ingest", targetType: "TelegramInboundEvent", targetId: row.id, metadata: { accountId: normalizedAccountId, creatorId: row.creatorId || null, customOrderId: row.customOrderId || null, messageId: inboundMessageId, replyToMessageId: replyId, hasMedia: row.hasMedia === true, submissionId: row.submissionId || null, projectionState: row.projectionState || "PENDING", projectionReason: row.projectionReason || null }, db: client }).catch(() => undefined);
   });
   return { ok: true, accepted: true, deduped, event: accepted };

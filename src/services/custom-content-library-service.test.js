@@ -5,9 +5,11 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const {
+  confirmCustomContentSubmissionVaultSettlement,
   finalizeCustomContentSubmissionLibrary,
   syncFinalizedSubmissionAssignment,
 } = require("./custom-content-library-service");
+const { vaultSettlementFingerprint } = require("./custom-content-pipeline-authority-service");
 
 const member = { id: "member-1", userId: "user-1", roleKey: "chatter", role: "OPERATOR", assignedCreators: ["creator-1"] };
 function clone(value) { return value == null ? value : structuredClone(value); }
@@ -19,6 +21,18 @@ function fakeDb({ submission = {}, assets = [], order = {}, folderId = "vault-cu
     receivedAt: new Date("2026-08-21T10:00:00.000Z"), createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:00:00.000Z"),
     ...clone(submission),
   };
+  if (!Object.prototype.hasOwnProperty.call(submission, "executionPinnedAt")) {
+    submissionRow.executionVaultFolderId = folderId;
+    submissionRow.executionProfileRevision = 1;
+    submissionRow.executionPinnedAt = new Date("2026-08-21T10:05:00.000Z");
+  }
+  if (!Object.prototype.hasOwnProperty.call(submission, "vaultSettlementConfirmedAt") && submissionRow.executionPinnedAt && submissionRow.executionVaultFolderId) {
+    submissionRow.vaultSettlementFolderId = submissionRow.executionVaultFolderId;
+    submissionRow.vaultSettlementProfileRevision = Number(submissionRow.executionProfileRevision || 0);
+    submissionRow.vaultSettlementMediaFingerprint = vaultSettlementFingerprint({ folderId: submissionRow.executionVaultFolderId, profileRevision: submissionRow.executionProfileRevision, mediaIds: submissionRow.ofMediaIds });
+    submissionRow.vaultSettlementConfirmedAt = new Date("2026-08-21T10:20:00.000Z");
+    submissionRow.vaultSettlementConfirmedByDeviceId = "device-1";
+  }
   const orderRow = { id: "custom-1", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", scenario: "Red lingerie video, two angles", priceCents: 6000, ...clone(order) };
   const mediaAssets = assets.map(clone);
   const proofs = (relayProofs || [
@@ -120,6 +134,32 @@ test("V20.4 uses typed CreatorMediaAsset columns for Customs provenance, not met
   assert.doesNotMatch(migration, /metadata/i, "Customs provenance must not be packed into JSON metadata");
 });
 
+test("Content Library finalization rejects direct bypass without a current Vault-settlement receipt", async () => {
+  const db = fakeDb({ submission: { vaultSettlementFolderId: null, vaultSettlementProfileRevision: null, vaultSettlementMediaFingerprint: null, vaultSettlementConfirmedAt: null, vaultSettlementConfirmedByDeviceId: null } });
+  await assert.rejects(
+    () => finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_VAULT_SETTLEMENT_REQUIRED",
+  );
+  assert.equal(db._assets.length, 0);
+});
+
+test("Vault settlement confirmation is exact, device-bound, and invalidates stale/partial claims", async () => {
+  const db = fakeDb({ submission: { vaultSettlementFolderId: null, vaultSettlementProfileRevision: null, vaultSettlementMediaFingerprint: null, vaultSettlementConfirmedAt: null, vaultSettlementConfirmedByDeviceId: null } });
+  await assert.rejects(
+    () => confirmCustomContentSubmissionVaultSettlement({ agencyId: "agency-1", member, deviceId: "device-1", submissionId: "submission-1", folderId: "wrong", profileRevision: 1, mediaIds: ["9001", "9002"], db }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_SETTLEMENT_PROFILE_STALE",
+  );
+  await assert.rejects(
+    () => confirmCustomContentSubmissionVaultSettlement({ agencyId: "agency-1", member, deviceId: "device-1", submissionId: "submission-1", folderId: "vault-customs", profileRevision: 1, mediaIds: ["9001"], db }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_SETTLEMENT_MEDIA_STALE",
+  );
+  const first = await confirmCustomContentSubmissionVaultSettlement({ agencyId: "agency-1", member, deviceId: "device-1", submissionId: "submission-1", folderId: "vault-customs", profileRevision: 1, mediaIds: ["9001", "9002"], db });
+  assert.equal(first.idempotent, false);
+  const second = await confirmCustomContentSubmissionVaultSettlement({ agencyId: "agency-1", member, deviceId: "device-2", submissionId: "submission-1", folderId: "vault-customs", profileRevision: 1, mediaIds: ["9001", "9002"], db });
+  assert.equal(second.idempotent, true);
+  assert.equal(db._submission.vaultSettlementMediaFingerprint, first.fingerprint);
+});
+
 test("finalize materializes every settled OF media id in Content Library with full custom price", async () => {
   const db = fakeDb();
   const result = await finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db, now: new Date("2026-08-21T12:00:00.000Z") });
@@ -144,6 +184,26 @@ test("finalize materializes every settled OF media id in Content Library with fu
   const retry = await finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db, now: new Date("2026-08-21T12:01:00.000Z") });
   assert.equal(retry.idempotent, true);
   assert.equal(db._audits.filter((row) => row.action === "custom_content_submission.content_library_finalize").length, 1, "exact finalize retry must not create audit noise");
+});
+
+test("two-device concurrent Content Library finalization converges without duplicate CUSTOM ownership or split provenance", async () => {
+  const db = fakeDb();
+  const [first, second] = await Promise.all([
+    finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db, now: new Date("2026-08-21T12:00:00.000Z") }),
+    finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db, now: new Date("2026-08-21T12:00:00.100Z") }),
+  ]);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(db._assets.length, 2, "duplicate-safe materialization keeps one row per proven OF media id");
+  assert.deepEqual(db._assets.map((asset) => asset.mediaId).sort(), ["9001", "9002"]);
+  for (const asset of db._assets) {
+    assert.equal(asset.source, "CUSTOM");
+    assert.equal(asset.customSubmissionId, "submission-1");
+    assert.equal(asset.customOrderId, "custom-1");
+    assert.deepEqual(asset.folderIds, ["vault-customs"]);
+  }
+  const retry = await finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db, now: new Date("2026-08-21T12:01:00.000Z") });
+  assert.equal(retry.idempotent, true, "after concurrent convergence a further recovery pass is a no-op");
 });
 
 
@@ -202,11 +262,17 @@ test("an unassigned settled submission is still durable CUSTOM library content a
   }
 });
 
-test("Content Library finalize heals stale client projection only from the complete confirmed relay sequence", async () => {
+test("stale media projection is repaired from relay proof but must be re-settled before library finalize", async () => {
   const db = fakeDb({ submission: { ofMediaIds: ["9001"] } });
+  await assert.rejects(
+    () => finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_VAULT_SETTLEMENT_REQUIRED",
+  );
+  assert.deepEqual(db._submission.ofMediaIds, ["9001", "9002"]);
+  assert.equal(db._submission.vaultSettlementConfirmedAt, null, "repairing the proven media set must invalidate the old settlement receipt");
+  await confirmCustomContentSubmissionVaultSettlement({ agencyId: "agency-1", member, deviceId: "device-1", submissionId: "submission-1", folderId: "vault-customs", profileRevision: 1, mediaIds: ["9001", "9002"], db });
   const result = await finalizeCustomContentSubmissionLibrary({ agencyId: "agency-1", member, submissionId: "submission-1", db });
   assert.deepEqual(result.mediaIds, ["9001", "9002"]);
-  assert.deepEqual(db._submission.ofMediaIds, ["9001", "9002"]);
   assert.equal(db._assets.length, 2);
 });
 

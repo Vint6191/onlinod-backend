@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { recordCustomDeliverySend, projectCustomDeliveryFromTeamEvent } = require("./custom-content-delivery-tracking-service");
+const { recordCustomDeliverySend, projectCustomDeliveryFromTeamEvent, settleCustomManualDeliveryWriteFromTeamEvent, settleCustomManualDeliveryWithCapability } = require("./custom-content-delivery-tracking-service");
 
 function fixture() {
   const order = {
@@ -33,8 +33,49 @@ function fixture() {
     },
     agencyMember: { findFirst: async () => ({ userId: "user-1" }) },
     auditLog: { create: async ({ data }) => { audits.push(data); return { id: `audit-${audits.length}`, ...data }; } },
+    $executeRawUnsafe: async () => 1,
   };
   return { order, submission, db, audits };
+}
+
+function installManualWrite(db, overrides = {}) {
+  let write = {
+    id: "write-manual-1", agencyId: "agency-1", creatorId: "creator-1",
+    actionType: "CUSTOM_MANUAL_SEND", originKind: "INTERACTIVE",
+    idempotencyKey: "custom-manual:custom-1:sub-1:0", targetId: "custom-1",
+    status: "COMMITTING", writeCommitRevision: 1, failureCode: null, messageId: null,
+    payload: {
+      customOrderId: "custom-1", submissionId: "sub-1", creatorId: "creator-1", dialogId: "777",
+      attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 2000, actualPriceCents: 2000,
+    },
+    result: { programmaticWriteKind: "CUSTOM_MANUAL_SEND", outcomeState: "COMMITTING" },
+    ...overrides,
+  };
+  db.automationDelivery = {
+    findUnique: async ({ where }) => where.id === write.id ? write : null,
+    updateMany: async ({ where, data }) => {
+      if (where.id !== write.id || String(where.status) !== String(write.status) || Number(where.writeCommitRevision) !== Number(write.writeCommitRevision)) return { count: 0 };
+      write = { ...write, ...structuredClone(data) };
+      return { count: 1 };
+    },
+  };
+  return () => write;
+}
+
+function guardedTeamEvent(overrides = {}) {
+  return {
+    agencyId: "agency-1", memberId: "member-1", userId: "user-1", creatorId: "creator-1", dialogId: "777", messageId: "m-server-bound",
+    eventKind: "MESSAGE_SEND_CONFIRMED", actionSource: "MANUAL", lifecycle: "CONFIRMED", priceCents: 2000,
+    extra: {
+      mediaIds: ["9001"],
+      metadata: { customDeliveryGuard: {
+        authorityVersion: "CUSTOM_MANUAL_V1", writeId: "write-manual-1",
+        idempotencyKey: "custom-manual:custom-1:sub-1:0", writeCommitRevision: 1, customOrderId: "custom-1",
+      } },
+    },
+    ts: new Date("2026-08-22T10:20:00Z"),
+    ...overrides,
+  };
 }
 
 test("actual outgoing media advances partial delivery and completes only after all approved media were sent", async () => {
@@ -123,6 +164,43 @@ test("telemetry discovery keeps already fan-delivered customs visible for post-d
 });
 
 
+
+test("confirmed fan-send survives a concurrent CANCEL without resurrecting the Custom", async () => {
+  const { order, db } = fixture();
+  const originalUpdateMany = db.customOrder.updateMany;
+  let injectCancel = true;
+  db.customOrder.updateMany = async (input) => {
+    if (injectCancel) {
+      injectCancel = false;
+      order.status = "CANCELLED";
+      order.cancelledAt = new Date("2026-08-22T10:19:59.000Z");
+      order.updatedAt = new Date(order.updatedAt.getTime() + 1);
+      return { count: 0 };
+    }
+    return originalUpdateMany(input);
+  };
+
+  const event = {
+    agencyId: "agency-1", memberId: "member-1", userId: "user-1", creatorId: "creator-1", dialogId: "777", messageId: "m-race",
+    eventKind: "MESSAGE_SEND_CONFIRMED", actionSource: "MANUAL", lifecycle: "CONFIRMED", priceCents: 2000,
+    extra: { mediaIds: ["9001", "9002"] }, ts: new Date("2026-08-22T10:20:00Z"),
+  };
+
+  await assert.rejects(
+    () => projectCustomDeliveryFromTeamEvent(event, { db }),
+    (error) => error?.code === "CUSTOM_DELIVERY_CONFLICT" && error?.status === 409,
+  );
+  assert.equal(order.status, "CANCELLED");
+  assert.equal(order.fanDeliveredAt, null, "the stale projector must lose the cancellation CAS");
+
+  const retry = await projectCustomDeliveryFromTeamEvent(event, { db });
+  assert.equal(retry.complete, true);
+  assert.equal(order.status, "CANCELLED", "durable external fact must not resurrect a cancelled Custom");
+  assert.equal(order.fanDeliveredAt.toISOString(), "2026-08-22T10:20:00.000Z");
+  assert.deepEqual(order.deliverySentMediaIds, ["9001", "9002"]);
+  assert.deepEqual(order.deliveryMessageIds, ["m-race"]);
+});
+
 test("unconfirmed or non-manual events cannot establish the Custom fan-delivery fact", async () => {
   const { order, db } = fixture();
   const baseline = { status: order.status, sent: [...order.deliverySentMediaIds], messages: [...order.deliveryMessageIds], offered: order.deliveryOfferedCents, deliveredAt: order.fanDeliveredAt };
@@ -137,6 +215,111 @@ test("unconfirmed or non-manual events cannot establish the Custom fan-delivery 
   assert.equal(order.fanDeliveredAt, baseline.deliveredAt);
 });
 
+
+
+test("CUSTOM_MANUAL_V2 capability settles exact success without current membership/auth", async () => {
+  const crypto = require("node:crypto");
+  const { order, db } = fixture();
+  const token = "custom-v2-success-token";
+  const getWrite = installManualWrite(db, {
+    sourceDeviceId: "device-a", leaseMemberId: "member-old", createdByUserId: "user-old",
+    writeCommitAt: new Date("2026-09-07T10:00:00Z"),
+    result: { programmaticWriteKind: "CUSTOM_MANUAL_SEND", outcomeState: "COMMITTING", customManualSettlementTokenHashes: [crypto.createHash("sha256").update(token).digest("hex")] },
+    payload: { customOrderId: "custom-1", submissionId: "sub-1", creatorId: "creator-1", dialogId: "777", attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 2000, actualPriceCents: 2000, networkRequestId: "net-v2-success", actorMemberId: "member-old", actorUserId: "user-old" },
+  });
+  // No requireCreatorAccess/current membership is consulted by the settlement-only capability.
+  const settled = await settleCustomManualDeliveryWithCapability({
+    writeId: "write-manual-1", settlementToken: token, deviceId: "device-a", networkRequestId: "net-v2-success",
+    writeCommitRevision: 1, outcome: "PROVEN_SUCCESS", providerStatus: 200, messageId: "m-v2-success", occurredAt: "2026-09-07T10:00:01Z",
+  }, { db });
+  assert.equal(settled.provenSuccess, true);
+  assert.equal(getWrite().status, "COMPLETED");
+  assert.equal(getWrite().messageId, "m-v2-success");
+  assert.deepEqual(order.deliverySentMediaIds, ["9001"]);
+});
+
+test("CUSTOM_MANUAL_V2 exact provider rejection returns the same logical phase to retryable precommit", async () => {
+  const crypto = require("node:crypto");
+  const { order, db } = fixture();
+  const token = "custom-v2-reject-token";
+  const getWrite = installManualWrite(db, {
+    sourceDeviceId: "device-a", writeCommitAt: new Date("2026-09-07T10:00:00Z"),
+    result: { programmaticWriteKind: "CUSTOM_MANUAL_SEND", outcomeState: "COMMITTING", customManualSettlementTokenHashes: [crypto.createHash("sha256").update(token).digest("hex")] },
+    payload: { customOrderId: "custom-1", submissionId: "sub-1", creatorId: "creator-1", dialogId: "777", attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 2000, actualPriceCents: 2000, networkRequestId: "net-v2-reject" },
+  });
+  const settled = await settleCustomManualDeliveryWithCapability({
+    writeId: "write-manual-1", settlementToken: token, deviceId: "device-a", networkRequestId: "net-v2-reject",
+    writeCommitRevision: 1, outcome: "PROVEN_NO_EFFECT", providerStatus: 422,
+  }, { db });
+  assert.equal(settled.provenNoEffect, true);
+  assert.equal(getWrite().status, "RETRY_SCHEDULED");
+  assert.equal(getWrite().failureCode, "provider_rejected_no_effect");
+  assert.equal(getWrite().writeCommitAt, null);
+  assert.deepEqual(order.deliverySentMediaIds, [], "provider rejection must not project fan delivery");
+});
+
+
+
+test("CUSTOM_MANUAL_V2 rejection settlement is replay-idempotent after writeCommitAt is cleared", async () => {
+  const crypto = require("node:crypto");
+  const { db } = fixture();
+  const token = "custom-v2-reject-replay-token";
+  const getWrite = installManualWrite(db, {
+    sourceDeviceId: "device-a", writeCommitAt: new Date("2026-09-07T10:00:00Z"),
+    result: { programmaticWriteKind: "CUSTOM_MANUAL_SEND", outcomeState: "COMMITTING", customManualSettlementTokenHashes: [crypto.createHash("sha256").update(token).digest("hex")] },
+    payload: { customOrderId: "custom-1", submissionId: "sub-1", creatorId: "creator-1", dialogId: "777", attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 2000, actualPriceCents: 2000, networkRequestId: "net-v2-replay" },
+  });
+  const input = { writeId: "write-manual-1", settlementToken: token, deviceId: "device-a", networkRequestId: "net-v2-replay", writeCommitRevision: 1, outcome: "PROVEN_NO_EFFECT", providerStatus: 422 };
+  await settleCustomManualDeliveryWithCapability(input, { db });
+  assert.equal(getWrite().writeCommitAt, null);
+  const replay = await settleCustomManualDeliveryWithCapability(input, { db });
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.provenNoEffect, true);
+});
+
+
+test("CUSTOM_MANUAL_V2 settlement capability is bound to exact device/request/revision and cannot cross a retry generation", async () => {
+  const crypto = require("node:crypto");
+  const { db } = fixture();
+  const oldToken = "custom-v2-bound-old-token";
+  const oldHash = crypto.createHash("sha256").update(oldToken).digest("hex");
+  const getWrite = installManualWrite(db, {
+    sourceDeviceId: "device-a", writeCommitAt: new Date("2026-09-07T10:00:00Z"), writeCommitRevision: 1,
+    result: { programmaticWriteKind: "CUSTOM_MANUAL_SEND", outcomeState: "COMMITTING", customManualSettlementTokenHashes: [oldHash] },
+    payload: { customOrderId: "custom-1", submissionId: "sub-1", creatorId: "creator-1", dialogId: "777", attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 2000, actualPriceCents: 2000, networkRequestId: "net-v2-bound" },
+  });
+  const base = { writeId: "write-manual-1", settlementToken: oldToken, deviceId: "device-a", networkRequestId: "net-v2-bound", writeCommitRevision: 1, outcome: "PROVEN_NO_EFFECT", providerStatus: 422 };
+  await assert.rejects(() => settleCustomManualDeliveryWithCapability({ ...base, deviceId: "device-b" }, { db }), (error) => error?.code === "CUSTOM_DELIVERY_WRITE_BINDING_MISMATCH");
+  await assert.rejects(() => settleCustomManualDeliveryWithCapability({ ...base, networkRequestId: "net-v2-other" }, { db }), (error) => error?.code === "CUSTOM_DELIVERY_WRITE_BINDING_MISMATCH");
+  await assert.rejects(() => settleCustomManualDeliveryWithCapability({ ...base, writeCommitRevision: 2 }, { db }), (error) => error?.code === "CUSTOM_DELIVERY_WRITE_BINDING_MISMATCH");
+  await assert.rejects(() => settleCustomManualDeliveryWithCapability({ ...base, settlementToken: "wrong-token" }, { db }), (error) => error?.code === "CUSTOM_DELIVERY_WRITE_BINDING_MISMATCH");
+
+  const row = getWrite();
+  const newToken = "custom-v2-bound-new-token";
+  row.writeCommitRevision = 2;
+  row.writeCommitAt = new Date("2026-09-07T10:01:00Z");
+  row.status = "COMMITTING";
+  row.failureCode = null;
+  row.result = { ...row.result, outcomeState: "COMMITTING", customManualSettlementTokenHashes: [crypto.createHash("sha256").update(newToken).digest("hex")] };
+  row.payload = { ...row.payload, networkRequestId: "net-v2-next" };
+  await assert.rejects(() => settleCustomManualDeliveryWithCapability(base, { db }), (error) => error?.code === "CUSTOM_DELIVERY_WRITE_BINDING_MISMATCH");
+});
+
+test("CUSTOM_MANUAL_V2 capability rejects ambiguous provider outcomes instead of fabricating terminal proof", async () => {
+  const crypto = require("node:crypto");
+  const { db } = fixture();
+  const token = "custom-v2-ambiguous-token";
+  installManualWrite(db, {
+    sourceDeviceId: "device-a", writeCommitAt: new Date("2026-09-07T10:00:00Z"),
+    result: { programmaticWriteKind: "CUSTOM_MANUAL_SEND", outcomeState: "COMMITTING", customManualSettlementTokenHashes: [crypto.createHash("sha256").update(token).digest("hex")] },
+    payload: { customOrderId: "custom-1", submissionId: "sub-1", creatorId: "creator-1", dialogId: "777", attemptedMediaIds: ["9001"], deliveryPhase: 0, expectedPriceCents: 2000, actualPriceCents: 2000, networkRequestId: "net-v2-ambiguous" },
+  });
+  const base = { writeId: "write-manual-1", settlementToken: token, deviceId: "device-a", networkRequestId: "net-v2-ambiguous", writeCommitRevision: 1 };
+  await assert.rejects(() => settleCustomManualDeliveryWithCapability({ ...base, outcome: "PROVEN_NO_EFFECT", providerStatus: 409 }, { db }), (error) => error?.code === "CUSTOM_DELIVERY_SETTLEMENT_STATUS_AMBIGUOUS");
+  await assert.rejects(() => settleCustomManualDeliveryWithCapability({ ...base, outcome: "PROVEN_NO_EFFECT", providerStatus: 408 }, { db }), (error) => error?.code === "CUSTOM_DELIVERY_SETTLEMENT_STATUS_AMBIGUOUS");
+  await assert.rejects(() => settleCustomManualDeliveryWithCapability({ ...base, outcome: "PROVEN_SUCCESS", providerStatus: 500, messageId: "fake" }, { db }), (error) => error?.code === "CUSTOM_DELIVERY_SETTLEMENT_STATUS_INVALID");
+});
+
 test("V20.7 schema/migration separates Telegram task deliveredAt from durable fan delivery progress", () => {
   const fs = require("node:fs");
   const path = require("node:path");
@@ -149,4 +332,92 @@ test("V20.7 schema/migration separates Telegram task deliveredAt from durable fa
   assert.match(schema, /deliveryOfferedCents\s+Int\s+@default\(0\)/);
   assert.match(migration, /ADD COLUMN "fanDeliveredAt"/);
   assert.doesNotMatch(migration, /DROP COLUMN "deliveredAt"|RENAME COLUMN "deliveredAt"/);
+});
+
+
+test("durable MESSAGE_SEND_CONFIRMED carries request-bound Custom override audit metadata without choosing delivery authority", async () => {
+  const { order, db, audits } = fixture();
+  order.paidAmountCents = 6000;
+  const result = await projectCustomDeliveryFromTeamEvent({
+    agencyId: "agency-1", memberId: "member-1", userId: "user-1", creatorId: "creator-1", dialogId: "777", messageId: "m-guarded",
+    eventKind: "MESSAGE_SEND_CONFIRMED", actionSource: "MANUAL", lifecycle: "CONFIRMED", priceCents: 3000,
+    extra: { mediaIds: ["9001"], metadata: { customDeliveryGuard: { customOrderId: "custom-1", overrideReason: "fan requested paid resend", duplicateOverride: false } } },
+    ts: new Date("2026-08-22T10:20:00Z"),
+  }, { db });
+  assert.equal(result.matched, true);
+  assert.equal(audits.find((row) => row.action === "CUSTOM_PAYMENT_OVERRIDE")?.metadata?.reason, "fan requested paid resend");
+
+  const { db: otherDb, audits: otherAudits, order: otherOrder } = fixture();
+  otherOrder.paidAmountCents = 6000;
+  await projectCustomDeliveryFromTeamEvent({
+    agencyId: "agency-1", memberId: "member-1", userId: "user-1", creatorId: "creator-1", dialogId: "777", messageId: "m-mismatch",
+    eventKind: "MESSAGE_SEND_CONFIRMED", actionSource: "MANUAL", lifecycle: "CONFIRMED", priceCents: 3000,
+    extra: { mediaIds: ["9001"], metadata: { customDeliveryGuard: { customOrderId: "other-order", overrideReason: "must not attach", duplicateOverride: true } } },
+    ts: new Date("2026-08-22T10:21:00Z"),
+  }, { db: otherDb });
+  assert.equal(otherAudits.find((row) => row.action === "CUSTOM_PAYMENT_OVERRIDE")?.metadata?.reason, null);
+  assert.equal(otherAudits.find((row) => row.action === "CUSTOM_DELIVERY_DUPLICATE_ATTEMPT")?.metadata?.overrideConfirmed ?? false, false);
+});
+
+
+test("CUSTOM_MANUAL_V1 Team proof atomically settles the server-visible physical write authority", async () => {
+  const { order, db } = fixture();
+  const getWrite = installManualWrite(db);
+  const result = await projectCustomDeliveryFromTeamEvent(guardedTeamEvent(), { db });
+  assert.equal(result.matched, true);
+  assert.deepEqual(order.deliverySentMediaIds, ["9001"]);
+  const write = getWrite();
+  assert.equal(write.status, "COMPLETED");
+  assert.equal(write.messageId, "m-server-bound");
+  assert.equal(write.result.messageId, "m-server-bound");
+  assert.equal(write.result.outcomeState, "PROVEN_SUCCESS");
+  assert.deepEqual(write.result.mediaIds, ["9001"]);
+});
+
+test("late canonical Team proof may settle a no-retry unresolved CUSTOM_MANUAL_SEND without minting another commit", async () => {
+  const { db } = fixture();
+  const getWrite = installManualWrite(db, {
+    status: "FAILED", failureCode: "outcome_unresolved_do_not_retry",
+    result: { programmaticWriteKind: "CUSTOM_MANUAL_SEND", outcomeState: "UNRESOLVED_NO_RETRY" },
+  });
+  const settled = await settleCustomManualDeliveryWriteFromTeamEvent({
+    client: db,
+    row: guardedTeamEvent({ messageId: "m-late-proof" }),
+    projection: { matched: true, customOrderId: "custom-1", submissionId: "sub-1" },
+  });
+  assert.equal(settled.settled, true);
+  assert.equal(getWrite().status, "COMPLETED");
+  assert.equal(getWrite().messageId, "m-late-proof");
+});
+
+test("CUSTOM_MANUAL_V1 settlement rejects a Team proof that is not exactly bound to the reserved media/revision", async () => {
+  const { db } = fixture();
+  installManualWrite(db);
+  await assert.rejects(
+    () => settleCustomManualDeliveryWriteFromTeamEvent({
+      client: db,
+      row: guardedTeamEvent({ extra: { mediaIds: ["9002"], metadata: { customDeliveryGuard: { authorityVersion: "CUSTOM_MANUAL_V1", writeId: "write-manual-1", idempotencyKey: "custom-manual:custom-1:sub-1:0", writeCommitRevision: 1, customOrderId: "custom-1" } } } }),
+      projection: { matched: true, customOrderId: "custom-1", submissionId: "sub-1" },
+    }),
+    (error) => error?.code === "CUSTOM_DELIVERY_WRITE_BINDING_MISMATCH" && error?.status === 409,
+  );
+});
+
+test("replayed CUSTOM_MANUAL_V1 Team proof is idempotent only for the same remote message", async () => {
+  const { db } = fixture();
+  const getWrite = installManualWrite(db);
+  await settleCustomManualDeliveryWriteFromTeamEvent({
+    client: db, row: guardedTeamEvent(), projection: { matched: true, customOrderId: "custom-1", submissionId: "sub-1" },
+  });
+  const replay = await settleCustomManualDeliveryWriteFromTeamEvent({
+    client: db, row: guardedTeamEvent(), projection: { matched: true, customOrderId: "custom-1", submissionId: "sub-1" },
+  });
+  assert.equal(replay.idempotent, true);
+  assert.equal(getWrite().status, "COMPLETED");
+  await assert.rejects(
+    () => settleCustomManualDeliveryWriteFromTeamEvent({
+      client: db, row: guardedTeamEvent({ messageId: "m-other" }), projection: { matched: true, customOrderId: "custom-1", submissionId: "sub-1" },
+    }),
+    (error) => error?.code === "CUSTOM_DELIVERY_WRITE_RESULT_CONFLICT",
+  );
 });

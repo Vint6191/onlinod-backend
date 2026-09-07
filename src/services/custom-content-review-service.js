@@ -5,6 +5,7 @@ const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { isCompleteSubmission, uniqueMediaIds } = require("./custom-content-library-service");
 const { paymentSnapshot } = require("./custom-orders-service");
+const { hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, derivePipelineStage } = require("./custom-content-pipeline-authority-service");
 
 const REVIEW_WAITING = "WAITING_REVIEW";
 const REVIEW_REVISION = "REVISION_REQUESTED";
@@ -58,16 +59,29 @@ async function loadRevisionContext(db, agencyId, rows) {
   const orderIds = Array.from(new Set((rows || []).map((row) => String(row?.customOrderId || "")).filter(Boolean)));
   const result = new Map();
   if (!orderIds.length) return result;
-  const history = await db.customContentSubmission.findMany({
-    where: { agencyId, customOrderId: { in: orderIds } },
-    select: {
-      id: true, customOrderId: true, reviewStatus: true, reviewComment: true, reviewedAt: true,
-      receivedAt: true, createdAt: true, reviewedByMemberId: true,
-      reviewedByMember: { select: { id: true, displayName: true, roleKey: true } },
-    },
-    orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
-    take: Math.max(200, orderIds.length * 20),
-  });
+  // Revision history is correctness context, not a preview list. A fixed
+  // `orderIds * N` horizon can silently drop old versions of one busy Custom and
+  // make revisionNumber / previousRevisionRequest depend on backlog shape.
+  // Exhaust the exact order-id set with a stable unique cursor instead.
+  const history = [];
+  let historyCursor = null;
+  for (;;) {
+    const page = await db.customContentSubmission.findMany({
+      where: { agencyId, customOrderId: { in: orderIds } },
+      select: {
+        id: true, customOrderId: true, reviewStatus: true, reviewComment: true, reviewedAt: true,
+        receivedAt: true, createdAt: true, reviewedByMemberId: true,
+        reviewedByMember: { select: { id: true, displayName: true, roleKey: true } },
+      },
+      orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+      take: 200,
+      ...(historyCursor ? { cursor: { id: historyCursor }, skip: 1 } : {}),
+    });
+    if (!page.length) break;
+    history.push(...page);
+    historyCursor = String(page[page.length - 1].id || "");
+    if (!historyCursor || page.length < 200) break;
+  }
   const byOrder = new Map();
   for (const item of history || []) {
     const key = String(item.customOrderId || "");
@@ -113,16 +127,15 @@ function finalizedAssetMap(assets) {
 }
 function isFinalizedForReview(row, assetByKey) {
   if (!row?.customOrder || !isCompleteSubmission(row)) return false;
+  if (!hasCurrentVaultSettlement(row)) return false;
   const mediaIds = uniqueMediaIds(row.ofMediaIds);
   if (!mediaIds.length) return false;
   const expectedPrice = Math.max(0, Math.round(Number(row.customOrder.priceCents) || 0));
   return mediaIds.every((mediaId) => {
     const asset = assetByKey.get(`${row.creatorId}\n${mediaId}`);
     return asset
-      && String(asset.source || "") === "CUSTOM"
-      && String(asset.customSubmissionId || "") === String(row.id || "")
-      && String(asset.customOrderId || "") === String(row.customOrderId || "")
-      && Number(asset.customFullPriceCents) === expectedPrice;
+      && Number(asset.customFullPriceCents) === expectedPrice
+      && customAssetMatchesPipelineProjection(row, asset, row.customOrder);
   });
 }
 function serializeReviewItem(row, assetByKey, revisionContext = null) {
@@ -171,7 +184,7 @@ const REVIEW_INCLUDE = {
   customOrder: {
     select: {
       id: true, creatorId: true, dialogId: true, scenario: true, internalNote: true, type: true, contentKind: true,
-      priceCents: true, paidAmountCents: true, createdAt: true,
+      status: true, fanDeliveredAt: true, priceCents: true, paidAmountCents: true, createdAt: true,
       creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } },
     },
   },
@@ -198,7 +211,7 @@ async function loadAssets(db, agencyId, rows) {
     const expectedRows = or.reduce((sum, group) => sum + group.mediaId.in.length, 0);
     const found = await db.creatorMediaAsset.findMany({
       where: { agencyId, source: "CUSTOM", OR: or },
-      select: { creatorId: true, mediaId: true, source: true, customOrderId: true, customSubmissionId: true, customFullPriceCents: true, mediaType: true, thumbUrl: true, previewUrl: true, fullUrl: true },
+      select: { creatorId: true, mediaId: true, source: true, customOrderId: true, customSubmissionId: true, customFullPriceCents: true, catalogActive: true, sortingStatus: true, folderIds: true, mediaType: true, thumbUrl: true, previewUrl: true, fullUrl: true },
       take: expectedRows,
     });
     assets.push(...found);
@@ -206,7 +219,7 @@ async function loadAssets(db, agencyId, rows) {
   return finalizedAssetMap(assets);
 }
 
-async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_WAITING, limit = 50, db = null } = {}) {
+async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_WAITING, limit = 50, cursor = null, db = null } = {}) {
   const client = db || require("../prisma");
   await requireReviewView({ agencyId, member, db: client });
   const normalizedStatus = normalizeStatus(status);
@@ -214,18 +227,26 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
   const scope = await allowedCreatorScope({ agencyId, member, db: client });
   const canReview = await canUsePermission({ member, key: "content.review_customs", db: client });
   const items = [];
-  let cursor = null;
-  for (let pass = 0; pass < 10 && items.length < take; pass += 1) {
+  let scanCursor = clean(cursor, 180) || null;
+  let pageExhausted = false;
+  while (items.length < take) {
     const rows = await client.customContentSubmission.findMany({
-      where: { agencyId, reviewStatus: normalizedStatus, customOrderId: { not: null }, ...scopeWhere(scope) },
+      where: {
+        agencyId,
+        pipelineDisposition: "ACTIVE",
+        reviewStatus: normalizedStatus,
+        customOrderId: { not: null },
+        customOrder: { is: { type: "CONTENT", status: "PENDING", fanDeliveredAt: null } },
+        ...scopeWhere(scope),
+      },
       include: REVIEW_INCLUDE,
       orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
       take: 200,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
     });
-    if (!rows.length) break;
-    cursor = rows[rows.length - 1].id;
-    const validRows = rows.filter((row) => String(row.customOrder?.type || "") === "CONTENT" && isCompleteSubmission(row));
+    if (!rows.length) { pageExhausted = true; break; }
+    const validRows = rows.filter((row) => String(row.customOrder?.type || "") === "CONTENT" && String(row.customOrder?.status || "") === "PENDING" && !row.customOrder?.fanDeliveredAt && String(row.pipelineDisposition || "ACTIVE") === "ACTIVE" && isCompleteSubmission(row));
+    const validIds = new Set(validRows.map((row) => String(row.id)));
     const assetByKey = await loadAssets(client, agencyId, validRows);
     const orderIds = Array.from(new Set(validRows.map((row) => String(row.customOrderId || "")).filter(Boolean)));
     const approvedRows = normalizedStatus === REVIEW_WAITING && orderIds.length
@@ -233,15 +254,22 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
       : [];
     const approvedOrders = new Set(approvedRows.map((row) => String(row.customOrderId)));
     const revisionContext = await loadRevisionContext(client, agencyId, validRows);
-    for (const row of validRows) {
-      if (items.length >= take) break;
+    for (const row of rows) {
+      scanCursor = String(row.id);
+      if (!validIds.has(scanCursor)) continue;
       if (approvedOrders.has(String(row.customOrderId))) continue;
-      if (!isFinalizedForReview(row, assetByKey)) continue;
-      items.push(serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))));
+      const finalized = isFinalizedForReview(row, assetByKey);
+      const stage = derivePipelineStage({ submission: row, order: row.customOrder, finalized, blockedCode: row.pipelineBlockedCode });
+      const expectedStage = normalizedStatus === REVIEW_APPROVED ? "APPROVED_DELIVERY_READY" : normalizedStatus === REVIEW_REVISION ? "REVISION_WAITING" : "REVIEW_READY";
+      if (stage !== expectedStage) continue;
+      items.push(serializeReviewItem(row, assetByKey, revisionContext.get(scanCursor)));
+      if (items.length >= take) break;
     }
-    if (rows.length < 200) break;
+    if (items.length >= take) break;
+    if (rows.length < 200) { pageExhausted = true; break; }
   }
-  return { ok: true, items, count: items.length, canReview, serverNow: new Date().toISOString() };
+  const hasMore = items.length >= take && !pageExhausted && Boolean(scanCursor);
+  return { ok: true, items, count: items.length, nextCursor: hasMore ? scanCursor : null, hasMore, canReview, serverNow: new Date().toISOString() };
 }
 
 async function loadReviewableSubmission({ agencyId, submissionId, db }) {
@@ -250,9 +278,15 @@ async function loadReviewableSubmission({ agencyId, submissionId, db }) {
   const row = await db.customContentSubmission.findFirst({ where: { id, agencyId }, include: REVIEW_INCLUDE });
   if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
   if (!row.customOrderId || !row.customOrder || String(row.customOrder.type || "") !== "CONTENT") throw fail("CUSTOM_REVIEW_ORDER_REQUIRED", "Submission must be assigned to a CONTENT custom order", 409);
-  if (!isCompleteSubmission(row)) throw fail("CUSTOM_REVIEW_NOT_READY", "Submission upload is not complete", 409);
   const assetByKey = await loadAssets(db, agencyId, [row]);
-  if (!isFinalizedForReview(row, assetByKey)) throw fail("CUSTOM_REVIEW_NOT_READY", "Submission must be finalized in the Customs Vault and Content Library before review", 409);
+  const finalized = isFinalizedForReview(row, assetByKey);
+  const stage = derivePipelineStage({ submission: row, order: row.customOrder, finalized, blockedCode: row.pipelineBlockedCode });
+  if (stage === "TERMINAL" || stage === "SALVAGE_READY") {
+    throw fail("CUSTOM_REVIEW_ORDER_TERMINAL", "Cancelled, completed, delivered, or salvaged Custom content cannot receive a new review decision", 409);
+  }
+  if (!["REVIEW_READY", "REVISION_WAITING", "APPROVED_DELIVERY_READY"].includes(stage)) {
+    throw fail("CUSTOM_REVIEW_NOT_READY", "Submission must finish source relay and pinned Vault/Content Library finalization before review", 409);
+  }
   return { row, assetByKey };
 }
 
@@ -261,57 +295,112 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
   await requireReviewWrite({ agencyId, member, db: client });
   const normalizedAction = normalizeAction(action);
   const normalizedComment = reviewComment(comment, normalizedAction === "REQUEST_REVISION");
-  const { row, assetByKey } = await loadReviewableSubmission({ agencyId, submissionId, db: client });
-  const currentStatus = normalizeStatus(row.reviewStatus);
+  const normalizedSubmissionId = clean(submissionId, 180);
+  if (!normalizedSubmissionId) throw fail("CUSTOM_REVIEW_SUBMISSION_REQUIRED", "submissionId is required");
 
-  if (currentStatus === REVIEW_APPROVED) {
-    if (normalizedAction === "APPROVE") {
-      const revisionContext = await loadRevisionContext(client, agencyId, [row]);
-      return { ok: true, idempotent: true, item: serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))) };
+  // Resolve the business lock target before opening the commit transaction. This
+  // read is not authority; loadReviewableSubmission() is called again after the
+  // CustomOrder lock and remains the commit-time source of truth.
+  const target = await client.customContentSubmission.findFirst({
+    where: { id: normalizedSubmissionId, agencyId },
+    select: { id: true, customOrderId: true },
+  });
+  if (!target) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  if (!target.customOrderId) throw fail("CUSTOM_REVIEW_ORDER_REQUIRED", "Submission must be assigned to a CONTENT custom order", 409);
+
+  const applyReview = async (tx) => {
+    // Cancellation mutates this same CustomOrder row in its transaction. Taking
+    // FOR UPDATE first creates one linear commit boundary:
+    //   review-lock -> review commit -> cancellation
+    // or
+    //   cancellation commit -> review-lock -> terminal recheck/reject.
+    // Therefore an APPROVE can never commit *after* an already-committed CANCEL.
+    if (typeof tx.$queryRawUnsafe === "function") {
+      await tx.$queryRawUnsafe(
+        `SELECT "id" FROM "CustomOrder" WHERE "id" = $1 AND "agencyId" = $2 FOR UPDATE`,
+        String(target.customOrderId),
+        String(agencyId),
+      );
     }
-    throw fail("CUSTOM_REVIEW_APPROVAL_FINAL", "Approved custom content is final; reopen must be an explicit separate workflow", 409);
-  }
-  if (currentStatus === REVIEW_REVISION) {
-    if (normalizedAction === "REQUEST_REVISION" && (row.reviewComment || null) === normalizedComment) {
-      const revisionContext = await loadRevisionContext(client, agencyId, [row]);
-      return { ok: true, idempotent: true, item: serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))) };
+
+    const { row, assetByKey } = await loadReviewableSubmission({ agencyId, submissionId: normalizedSubmissionId, db: tx });
+    const currentStatus = normalizeStatus(row.reviewStatus);
+
+    if (currentStatus === REVIEW_APPROVED) {
+      if (normalizedAction === "APPROVE") {
+        const revisionContext = await loadRevisionContext(tx, agencyId, [row]);
+        return { idempotent: true, row, assetByKey, item: serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))) };
+      }
+      throw fail("CUSTOM_REVIEW_APPROVAL_FINAL", "Approved custom content is final; reopen must be an explicit separate workflow", 409);
     }
-    throw fail("CUSTOM_REVIEW_ALREADY_DECIDED", "This submission already has a review decision", 409);
-  }
+    if (currentStatus === REVIEW_REVISION) {
+      if (normalizedAction === "REQUEST_REVISION" && (row.reviewComment || null) === normalizedComment) {
+        const revisionContext = await loadRevisionContext(tx, agencyId, [row]);
+        return { idempotent: true, row, assetByKey, item: serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))) };
+      }
+      throw fail("CUSTOM_REVIEW_ALREADY_DECIDED", "This submission already has a review decision", 409);
+    }
 
-  const nextStatus = normalizedAction === "APPROVE" ? REVIEW_APPROVED : REVIEW_REVISION;
-  if (nextStatus === REVIEW_APPROVED) {
-    const existing = await client.customContentSubmission.findFirst({
-      where: { agencyId, customOrderId: row.customOrderId, reviewStatus: REVIEW_APPROVED, id: { not: row.id } }, select: { id: true },
-    });
-    if (existing) throw fail("CUSTOM_REVIEW_ALREADY_APPROVED", "Another submission is already approved for this custom order", 409);
-  }
+    const nextStatus = normalizedAction === "APPROVE" ? REVIEW_APPROVED : REVIEW_REVISION;
+    if (nextStatus === REVIEW_APPROVED) {
+      const existing = await tx.customContentSubmission.findFirst({
+        where: { agencyId, customOrderId: row.customOrderId, reviewStatus: REVIEW_APPROVED, id: { not: row.id } }, select: { id: true },
+      });
+      if (existing) throw fail("CUSTOM_REVIEW_ALREADY_APPROVED", "Another submission is already approved for this custom order", 409);
+    }
 
-  let changed;
-  try {
-    changed = await client.customContentSubmission.updateMany({
-      where: { id: row.id, agencyId, reviewStatus: REVIEW_WAITING, updatedAt: row.updatedAt },
-      data: { reviewStatus: nextStatus, reviewComment: nextStatus === REVIEW_REVISION ? normalizedComment : null, reviewedByMemberId: member.id, reviewedAt: new Date(now) },
-    });
-  } catch (error) {
-    if (nextStatus === REVIEW_APPROVED && error?.code === "P2002") throw fail("CUSTOM_REVIEW_ALREADY_APPROVED", "Another submission is already approved for this custom order", 409);
-    throw error;
-  }
-  if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_REVIEW_CONFLICT", "Submission changed while it was being reviewed; refresh and try again", 409);
-  const updated = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId }, include: REVIEW_INCLUDE });
-  if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after review", 404);
+    let changed;
+    try {
+      changed = await tx.customContentSubmission.updateMany({
+        where: {
+          id: row.id,
+          agencyId,
+          pipelineDisposition: "ACTIVE",
+          reviewStatus: REVIEW_WAITING,
+          customOrderId: row.customOrderId,
+          updatedAt: row.updatedAt,
+        },
+        data: { reviewStatus: nextStatus, reviewComment: nextStatus === REVIEW_REVISION ? normalizedComment : null, reviewedByMemberId: member.id, reviewedAt: new Date(now) },
+      });
+    } catch (error) {
+      if (nextStatus === REVIEW_APPROVED && error?.code === "P2002") throw fail("CUSTOM_REVIEW_ALREADY_APPROVED", "Another submission is already approved for this custom order", 409);
+      throw error;
+    }
+    if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_REVIEW_CONFLICT", "Submission changed while it was being reviewed; refresh and try again", 409);
+    const updated = await tx.customContentSubmission.findFirst({ where: { id: row.id, agencyId }, include: REVIEW_INCLUDE });
+    if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after review", 404);
+    const revisionContext = await loadRevisionContext(tx, agencyId, [updated]);
+    return {
+      idempotent: false,
+      row: updated,
+      previousRow: row,
+      assetByKey,
+      item: serializeReviewItem(updated, assetByKey, revisionContext.get(String(updated.id))),
+      nextStatus,
+    };
+  };
+
+  const outcome = typeof client.$transaction === "function"
+    ? await client.$transaction(applyReview)
+    : await applyReview(client);
+
+  if (outcome.idempotent) return { ok: true, idempotent: true, item: outcome.item };
 
   await audit({
     agencyId,
     actorUserId: member.userId || null,
-    action: nextStatus === REVIEW_APPROVED ? "custom_content_submission.approve" : "custom_content_submission.request_revision",
+    action: outcome.nextStatus === REVIEW_APPROVED ? "custom_content_submission.approve" : "custom_content_submission.request_revision",
     targetType: "CustomContentSubmission",
-    targetId: row.id,
-    metadata: { creatorId: row.creatorId, customOrderId: row.customOrderId, reviewStatus: nextStatus, revisionCommentLength: nextStatus === REVIEW_REVISION ? normalizedComment.length : 0 },
+    targetId: outcome.row.id,
+    metadata: {
+      creatorId: outcome.row.creatorId,
+      customOrderId: outcome.row.customOrderId,
+      reviewStatus: outcome.nextStatus,
+      revisionCommentLength: outcome.nextStatus === REVIEW_REVISION ? normalizedComment.length : 0,
+    },
     db: client,
   });
-  const revisionContext = await loadRevisionContext(client, agencyId, [updated]);
-  return { ok: true, idempotent: false, item: serializeReviewItem(updated, assetByKey, revisionContext.get(String(updated.id))) };
+  return { ok: true, idempotent: false, item: outcome.item };
 }
 
 module.exports = {

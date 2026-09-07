@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { syncFinalizedSubmissionAssignment } = require("./custom-content-library-service");
+const { ACTIVE, SALVAGE, submissionAllowsNewPipelineWork, ensureSubmissionExecutionProfile, hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, invalidateVaultSettlementData, assertNewRelayWorkAllowed, reportSubmissionExecutionAttempt, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle, withSubmissionPipelineLock, historicalRelayRecipientsForSubmissions } = require("./custom-content-pipeline-authority-service");
 const { canUsePermission } = require("./team-access-control");
 const { confirmedRelayResult } = require("./custom-relay-result-proof-service");
 const { providerMessageEventId, resolveTelegramCustomThread, targetAllowedByThreadContext } = require("./custom-telegram-thread-authority-service");
@@ -13,8 +14,8 @@ const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
 const MAX_OF_MEDIA_IDS = 200;
 const MAX_TELEGRAM_MESSAGE_ID = 2_147_483_647;
-const MAX_UPLOAD_WORK = 3;
-const MAX_RUNTIME_LEASES = 100;
+const MAX_UPLOAD_WORK = 12;
+const RUNTIME_LEASE_QUERY_CHUNK = 250;
 const REVIEW_WAITING = "WAITING_REVIEW";
 const REVIEW_REVISION = "REVISION_REQUESTED";
 const REVIEW_APPROVED = "APPROVED";
@@ -93,7 +94,7 @@ function runtimeLeaseInputs(value) {
   const raw = Array.isArray(value) ? value : [];
   const seen = new Set();
   const result = [];
-  for (const item of raw.slice(0, MAX_RUNTIME_LEASES)) {
+  for (const item of raw) {
     const accountId = String(item?.accountId || "").trim();
     const claimToken = String(item?.claimToken || "").trim();
     if (!accountId || !claimToken || seen.has(accountId)) continue;
@@ -167,6 +168,17 @@ function serializeSubmission(row) {
     sourceResolutionEventId: row.sourceResolutionEventId || null,
     ofMediaIds: ofMediaIds(row.ofMediaIds),
     comment: row.comment || null,
+    executionVaultFolderId: row.executionVaultFolderId || null,
+    executionRelayRecipient: row.executionRelayRecipient || null,
+    executionProfileRevision: Math.max(0, Number(row.executionProfileRevision || 0)),
+    executionPinnedAt: row.executionPinnedAt ? new Date(row.executionPinnedAt).toISOString() : null,
+    pipelineDisposition: String(row.pipelineDisposition || ACTIVE),
+    pipelineDispositionReason: row.pipelineDispositionReason || null,
+    pipelineDispositionChangedAt: row.pipelineDispositionChangedAt ? new Date(row.pipelineDispositionChangedAt).toISOString() : null,
+    pipelineBlockedCode: row.pipelineBlockedCode || null,
+    pipelineBlockedAt: row.pipelineBlockedAt ? new Date(row.pipelineBlockedAt).toISOString() : null,
+    pipelineLastAttemptAt: row.pipelineLastAttemptAt ? new Date(row.pipelineLastAttemptAt).toISOString() : null,
+    pipelineNextAttemptAt: row.pipelineNextAttemptAt ? new Date(row.pipelineNextAttemptAt).toISOString() : null,
     reviewStatus: String(row.reviewStatus || "WAITING_REVIEW"),
     reviewComment: row.reviewComment || null,
     reviewedByMemberId: row.reviewedByMemberId == null ? null : String(row.reviewedByMemberId),
@@ -276,6 +288,9 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
 
   try {
     const result = await client.$transaction(async (tx) => {
+      // NEW provider-backed work is fenced by the parent Agency lifecycle first.
+      // Global provider-reference lock order is Agency -> CreatorAccount -> TelegramAccount.
+      await lockAgencyPipelineLifecycle({ db: tx, agencyId });
       // Provider-message ownership is adjudicated before the target lifecycle. Exact retries must
       // remain idempotent even after their first submission is WAITING_REVIEW, and a partial
       // provider overlap must report the source conflict rather than an unrelated order-busy state.
@@ -298,9 +313,11 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
         throw fail("CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT", "One or more Telegram provider messages already belong to another submission", 409);
       }
 
-      // F40: a NEW historical provider-source reference and account retirement share one row
-      // lock. Existing exact retries above stay idempotent after retirement because they do not
-      // create new account-dependent work.
+      // NEW historical provider work shares the same lifecycle order as outbound planning and
+      // creator Telegram rebinding: Agency -> CreatorAccount -> TelegramAccount. The Creator lock
+      // prevents retirement from committing between target validation and provider ownership; the
+      // account lock prevents ACTIVE -> RETIRING from racing the new historical account reference.
+      await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
       await lockActiveTelegramAccountReference({
         agencyId,
         accountId: sourceAccountId,
@@ -418,15 +435,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
 }
 
 async function withSubmissionSourceLock({ db, agencyId, submissionId, work }) {
-  if (!db || typeof db.$transaction !== "function" || typeof db.$queryRawUnsafe !== "function") return work(db);
-  return db.$transaction(async (tx) => {
-    await tx.$queryRawUnsafe(
-      `SELECT "id" FROM "CustomContentSubmission" WHERE "id" = $1 AND "agencyId" = $2 FOR UPDATE`,
-      String(submissionId),
-      String(agencyId),
-    );
-    return work(tx);
-  }, { timeout: 35_000 });
+  return withSubmissionPipelineLock({ db, agencyId, submissionId, work });
 }
 
 async function hasRelayExecutionForSubmission({ agencyId, creatorId, submissionId, db }) {
@@ -471,6 +480,22 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
   }
   if (existing && existing.telegramSourceUserId && String(existing.telegramSourceUserId) !== String(event.senderTelegramUserId)) {
     throw fail("CUSTOM_SUBMISSION_SOURCE_USER_CONFLICT", "Telegram album source sender changed", 409);
+  }
+  if (existing && !sameMessageIds(existing.telegramMessageIds, [event.messageId])) {
+    const existingOrder = existing.customOrderId
+      ? await client.customOrder.findFirst({
+          where: { id: existing.customOrderId, agencyId: event.agencyId, creatorId: existing.creatorId },
+          select: { id: true, type: true, status: true, fanDeliveredAt: true },
+        })
+      : null;
+    if (!submissionAllowsNewPipelineWork(existing, existingOrder)) {
+      // A late provider member must never re-open or mutate an adjudicated/terminal pipeline.
+      // Preserve the provider fact as a new deterministic UNASSIGNED submission so confirmed
+      // SALVAGE can converge independently and ARCHIVED/ABANDONED history stays immutable.
+      sourceKey = `telegram:${event.agencyId}:${event.accountId}:${event.senderTelegramUserId}:message:${event.messageId}`;
+      forceUnassigned = true;
+      existing = await client.customContentSubmission.findFirst({ where: { telegramSourceKey: sourceKey } });
+    }
   }
   if (existing && !sameMessageIds(existing.telegramMessageIds, [event.messageId])) {
     const projected = ofMediaIds(existing.ofMediaIds);
@@ -518,6 +543,8 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
   let row;
   try {
     row = await runSubmissionTransaction(client, async (tx) => {
+      await lockAgencyPipelineLifecycle({ db: tx, agencyId: event.agencyId });
+      await lockCreatorPipelineLifecycle({ db: tx, agencyId: event.agencyId, creatorId: event.creatorId });
       if (customOrderId && String(event.resolutionAuthority || "") === "PROVIDER_ACTIVE_THREAD") {
         const currentThread = await resolveTelegramCustomThread({
           agencyId: event.agencyId, accountId: event.accountId, senderTelegramUserId: event.senderTelegramUserId, replyToMessageId: null, eventSentAt: event.sentAt, db: tx,
@@ -594,6 +621,9 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   const row = await client.customContentSubmission.findFirst({ where: { id: normalizedSubmissionId, agencyId } });
   if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  if (String(row.pipelineDisposition || ACTIVE) !== ACTIVE) {
+    throw fail("CUSTOM_SUBMISSION_PIPELINE_NOT_ACTIVE", "Resolved or salvaged content cannot be assigned to an active Custom order", 409);
+  }
   const normalizedOrderId = identifier(customOrderId, "customOrderId", { optional: true, max: 180 });
   await validateContentOrder({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, db: client });
   if ((row.customOrderId || null) === normalizedOrderId) {
@@ -606,12 +636,14 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   let updated;
   try {
     updated = await runSubmissionTransaction(client, async (tx) => {
+      await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+      await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: row.creatorId });
       if (normalizedOrderId) {
         await bindContentOrderForSubmission({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, now, db: tx });
         await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, db: tx });
       }
       const changed = await tx.customContentSubmission.updateMany({
-        where: { id: row.id, agencyId, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
+        where: { id: row.id, agencyId, pipelineDisposition: ACTIVE, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
         data: { customOrderId: normalizedOrderId },
       });
       if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_ASSIGNMENT_STALE", "Submission assignment changed while this manager action was being applied", 409);
@@ -642,110 +674,429 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   return { ok: true, unchanged: false, submission: serializeSubmission(updated) };
 }
 
-async function pendingUploadRows({ agencyId, creatorIds, limit, db }) {
-  const ids = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map(String).filter(Boolean)));
-  if (!ids.length) return [];
-  const take = Math.max(limit, Math.min(50, limit * 4));
+async function pendingRelayProjectionRows({ agencyId, scope, limit, now = new Date(), db }) {
+  const take = Math.max(1, Math.min(200, Math.floor(Number(limit) || 1)));
+  const scopedIds = scope?.broad ? [] : Array.from(new Set((scope?.creatorIds || []).map(String).filter(Boolean)));
+  if (!scope?.broad && !scopedIds.length) return [];
+
   if (typeof db.$queryRawUnsafe === "function") {
-    const placeholders = ids.map((_, index) => `$${index + 2}`).join(",");
+    const params = [agencyId];
+    let scopeSql = "";
+    if (scopedIds.length) {
+      const placeholders = scopedIds.map((id) => { params.push(id); return `$${params.length}`; }).join(",");
+      scopeSql = ` AND submission."creatorId" IN (${placeholders})`;
+    }
+    params.push(now);
+    const nowParam = `$${params.length}`;
     return db.$queryRawUnsafe(
-      `SELECT "id", "agencyId", "creatorId", "customOrderId", "telegramMessageIds", "telegramInboundEventIds", "telegramSourceKey", "telegramSourceAccountId", "telegramSourceUserId", "ofMediaIds", "comment", "receivedAt", "createdAt", "updatedAt"
-       FROM "CustomContentSubmission"
-       WHERE "agencyId" = $1
-         AND "creatorId" IN (${placeholders})
-         AND cardinality("ofMediaIds") < cardinality("telegramMessageIds")
-       ORDER BY "receivedAt" ASC, "createdAt" ASC
+      `SELECT submission.*
+       FROM "CustomContentSubmission" AS submission
+       JOIN "CreatorAccount" AS creator
+         ON creator."id" = submission."creatorId"
+        AND creator."agencyId" = submission."agencyId"
+        AND creator."deletedAt" IS NULL
+       JOIN "AutomationDelivery" AS relay
+         ON relay."agencyId" = submission."agencyId"
+        AND relay."creatorId" = submission."creatorId"
+        AND relay."actionType" = 'CUSTOM_RELAY_SEND'
+        AND relay."status" = 'COMPLETED'
+        AND relay."idempotencyKey" = ('custom-relay:' || submission."id" || ':' || cardinality(submission."ofMediaIds")::text)
+       WHERE submission."agencyId" = $1
+         AND submission."pipelineDisposition" IN ('ACTIVE', 'SALVAGE')
+         ${scopeSql}
+         AND (submission."pipelineNextAttemptAt" IS NULL OR submission."pipelineNextAttemptAt" <= ${nowParam})
+         AND cardinality(submission."ofMediaIds") < cardinality(submission."telegramMessageIds")
+       ORDER BY submission."pipelineLastAttemptAt" ASC NULLS FIRST, submission."receivedAt" ASC, submission."createdAt" ASC, submission."id" ASC
        LIMIT ${take}`,
-      agencyId,
-      ...ids,
+      ...params,
     );
   }
-  const rows = await db.customContentSubmission.findMany({
-    where: { agencyId, creatorId: { in: ids } },
-    orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }],
-    take: Math.max(200, take * 20),
-    skip: 0,
-  });
-  return rows.filter((row) => nextUploadIndex(row) !== null).slice(0, take);
+
+  // Test/fallback path: cursor to exhaustion. LIMIT is applied only after the
+  // exact next-index COMPLETED relay proof is found, so poisoned historical rows
+  // cannot hide a later recoverable projection.
+  const items = [];
+  let cursor = null;
+  while (items.length < take) {
+    const rows = await db.customContentSubmission.findMany({
+      where: {
+        agencyId,
+        pipelineDisposition: { in: [ACTIVE, SALVAGE] },
+        AND: [{ OR: [{ pipelineNextAttemptAt: null }, { pipelineNextAttemptAt: { lte: now } }] }],
+        ...(scope?.broad ? {} : { creatorId: { in: scopedIds } }),
+      },
+      orderBy: [{ pipelineLastAttemptAt: { sort: "asc", nulls: "first" } }, { receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+      take: 200,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    if (!rows.length) break;
+    cursor = rows[rows.length - 1].id;
+    for (const row of rows) {
+      const current = ofMediaIds(row.ofMediaIds);
+      const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
+      if (current.length >= telegramIds.length) continue;
+      const proof = await db.automationDelivery.findFirst({
+        where: {
+          agencyId,
+          creatorId: row.creatorId,
+          actionType: "CUSTOM_RELAY_SEND",
+          status: "COMPLETED",
+          idempotencyKey: `custom-relay:${row.id}:${current.length}`,
+        },
+        select: { id: true },
+      });
+      if (!proof) continue;
+      items.push(row);
+      if (items.length >= take) break;
+    }
+    if (rows.length < 200) break;
+  }
+  return items;
 }
 
+async function recoverConfirmedRelayProjectionForSubmission({ agencyId, submissionId, db }) {
+  return withSubmissionSourceLock({ db, agencyId, submissionId, work: async (lockedClient) => {
+    let row = await lockedClient.customContentSubmission.findFirst({ where: { id: submissionId, agencyId } });
+    if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+    let current = ofMediaIds(row.ofMediaIds);
+    const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
+    let recovered = 0;
 
-async function pendingFinalizeRows({ agencyId, creatorIds, limit, db }) {
-  const ids = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map(String).filter(Boolean)));
-  if (!ids.length) return [];
-  const take = Math.max(limit, Math.min(50, limit * 4));
+    while (current.length < telegramIds.length) {
+      const index = current.length;
+      let proof;
+      try {
+        proof = await confirmedRelayResult({
+          agencyId,
+          creatorId: row.creatorId,
+          submissionId: row.id,
+          expectedIndex: index,
+          expectedTelegramSourceAccountId: row.telegramSourceAccountId,
+          expectedTelegramSourceUserId: row.telegramSourceUserId,
+          expectedTelegramMessageId: telegramIds[index],
+          db: lockedClient,
+        });
+      } catch (error) {
+        // Absence of the exact next proof means the contiguous provider-confirmed
+        // prefix ends here. Any other proof error is a real provenance conflict
+        // and must remain visible instead of being silently skipped.
+        if (String(error?.code || "") === "CUSTOM_SUBMISSION_RELAY_PROOF_REQUIRED") break;
+        throw error;
+      }
+      if (current.includes(proof.mediaId)) {
+        throw fail("CUSTOM_SUBMISSION_MEDIA_ID_DUPLICATE", "Confirmed relay result reuses an OnlyFans media id already projected into this submission", 409);
+      }
+      const next = [...current, proof.mediaId];
+      const changed = await lockedClient.customContentSubmission.updateMany({
+        where: { id: row.id, agencyId, updatedAt: row.updatedAt },
+        data: { ofMediaIds: next, ...invalidateVaultSettlementData() },
+      });
+      if (Number(changed?.count || 0) !== 1) {
+        const raced = await lockedClient.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
+        const racedIds = ofMediaIds(raced?.ofMediaIds);
+        if (raced && racedIds[index] === proof.mediaId) {
+          row = raced;
+          current = racedIds;
+          continue;
+        }
+        throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT", "Submission changed while a confirmed relay result was being recovered", 409);
+      }
+      row = await lockedClient.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });
+      if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared during relay projection recovery", 404);
+      current = ofMediaIds(row.ofMediaIds);
+      recovered += 1;
+    }
+    return { row, recovered };
+  } });
+}
+
+async function discoverBlockedPipelineRows({ agencyId, scope, limit, currentRecipient = "", now = new Date(), db }) {
+  const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 1)));
+  const scopedIds = scope?.broad ? [] : Array.from(new Set((scope?.creatorIds || []).map(String).filter(Boolean)));
+  if (!scope?.broad && !scopedIds.length) return [];
+
+  // Diagnostic discovery is correctness-paged too. In particular, an unpinned
+  // rolling-cutover submission may have a durable historical relay recipient
+  // even when the current Workspace default is empty. Conversely, contradictory
+  // historical recipients are an explicit BLOCKED state and must not be mistaken
+  // for executable capacity merely because a current default happens to exist.
+  const blocked = [];
+  let cursor = null;
+  while (blocked.length < take) {
+    const rows = await db.customContentSubmission.findMany({
+      where: {
+        agencyId,
+        pipelineDisposition: { in: [ACTIVE, SALVAGE] },
+        AND: [{ OR: [{ pipelineNextAttemptAt: null }, { pipelineNextAttemptAt: { lte: now } }] }],
+        ...(scope?.broad ? {} : { creatorId: { in: scopedIds } }),
+      },
+      orderBy: [{ pipelineLastAttemptAt: { sort: "asc", nulls: "first" } }, { receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+      take: 200,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    if (!rows.length) break;
+    cursor = rows[rows.length - 1].id;
+    const historical = await historicalRelayRecipientsForSubmissions({
+      db,
+      agencyId,
+      submissions: rows.filter((row) => !row.executionPinnedAt),
+    });
+    const { creatorById, liveOrderIds } = await loadPipelinePageContext({ db, agencyId, rows });
+    for (const row of rows) {
+      const dispositionValue = String(row.pipelineDisposition || ACTIVE);
+      let live = dispositionValue === SALVAGE || !row.customOrderId;
+      if (!live && row.customOrderId) {
+        live = liveOrderIds === null
+          ? Boolean(await db.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, creatorId: row.creatorId, type: "CONTENT", status: "PENDING", fanDeliveredAt: null }, select: { id: true } }))
+          : liveOrderIds.has(String(row.customOrderId));
+      }
+      if (!live) continue;
+      const creator = creatorById.get(String(row.creatorId));
+      if (!creator) continue;
+      const current = ofMediaIds(row.ofMediaIds);
+      const telegram = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
+      const activeIncomplete = dispositionValue === ACTIVE && current.length < telegram.length;
+      const historicalEntry = !row.executionPinnedAt ? historical.get(String(row.id)) : null;
+      const availableRecipient = String(row.executionRelayRecipient || historicalEntry?.recipient || currentRecipient || "").trim();
+      let code = null;
+      if (activeIncomplete && (!String(row.telegramSourceAccountId || "").trim() || !/^\d{1,20}$/.test(String(row.telegramSourceUserId || "").trim()))) code = "CUSTOM_SUBMISSION_SOURCE_IDENTITY_REQUIRED";
+      else if ((dispositionValue === ACTIVE || current.length > 0) && !String(row.executionVaultFolderId || creator.customsVaultFolderId || "").trim()) code = "CUSTOM_SUBMISSION_VAULT_RELAY_REQUIRED";
+      else if (activeIncomplete && historicalEntry?.error) code = String(historicalEntry.error.code || "CUSTOM_SUBMISSION_EXECUTION_PROFILE_LEGACY_BINDING_CONFLICT");
+      else if (activeIncomplete && !availableRecipient) code = "CUSTOM_SUBMISSION_VAULT_RECIPIENT_REQUIRED";
+      if (code) blocked.push({ row, code });
+      if (blocked.length >= take) break;
+    }
+    if (rows.length < 200) break;
+  }
+  return blocked;
+}
+
+async function loadPipelinePageContext({ db, agencyId, rows }) {
+  const creatorIds = Array.from(new Set((rows || []).map((row) => String(row.creatorId || "")).filter(Boolean)));
+  const orderIds = Array.from(new Set((rows || []).map((row) => String(row.customOrderId || "")).filter(Boolean)));
+  const [creators, liveOrders] = await Promise.all([
+    creatorIds.length ? db.creatorAccount.findMany({
+      where: { agencyId, id: { in: creatorIds }, deletedAt: null },
+      select: { id: true, customsVaultFolderId: true },
+      take: creatorIds.length,
+    }) : Promise.resolve([]),
+    orderIds.length && db.customOrder?.findMany ? db.customOrder.findMany({
+      where: { agencyId, id: { in: orderIds }, type: "CONTENT", status: "PENDING", fanDeliveredAt: null },
+      select: { id: true },
+      take: orderIds.length,
+    }) : Promise.resolve(null),
+  ]);
+  const creatorById = new Map((creators || []).map((creator) => [String(creator.id), creator]));
+  const liveOrderIds = liveOrders === null ? null : new Set((liveOrders || []).map((order) => String(order.id)));
+  return { creatorById, liveOrderIds };
+}
+
+function comparePipelineWorkRows(left, right) {
+  const leftAttempt = left?.pipelineLastAttemptAt == null ? null : new Date(left.pipelineLastAttemptAt).getTime();
+  const rightAttempt = right?.pipelineLastAttemptAt == null ? null : new Date(right.pipelineLastAttemptAt).getTime();
+  if (leftAttempt === null && rightAttempt !== null) return -1;
+  if (leftAttempt !== null && rightAttempt === null) return 1;
+  if (leftAttempt !== null && rightAttempt !== null && leftAttempt !== rightAttempt) return leftAttempt - rightAttempt;
+  const received = new Date(left.receivedAt || left.createdAt || 0).getTime() - new Date(right.receivedAt || right.createdAt || 0).getTime();
+  if (received !== 0) return received;
+  const created = new Date(left.createdAt || 0).getTime() - new Date(right.createdAt || 0).getTime();
+  return created !== 0 ? created : String(left.id).localeCompare(String(right.id));
+}
+
+async function pendingUploadRowsChunk({ agencyId, sourceAccountIds, creatorIds = null, limit, currentRecipient = "", now = new Date(), db }) {
+  const take = Math.max(1, Math.min(200, Math.floor(Number(limit) || 1)));
+  if (!sourceAccountIds.length || (Array.isArray(creatorIds) && !creatorIds.length)) return [];
+
+  // Cursor to exhaustion and apply every correctness predicate before LIMIT.
+  // This intentionally includes rolling-cutover historical recipient authority:
+  // current Workspace configuration is only a default for truly unpinned work.
+  const items = [];
+  let cursor = null;
+  while (items.length < take) {
+    const rows = await db.customContentSubmission.findMany({
+      where: {
+        agencyId,
+        pipelineDisposition: ACTIVE,
+        AND: [{ OR: [{ pipelineNextAttemptAt: null }, { pipelineNextAttemptAt: { lte: now } }] }],
+        telegramSourceAccountId: { in: sourceAccountIds },
+        ...(Array.isArray(creatorIds) ? { creatorId: { in: creatorIds } } : {}),
+      },
+      orderBy: [{ pipelineLastAttemptAt: { sort: "asc", nulls: "first" } }, { receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+      take: 200,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    if (!rows.length) break;
+    cursor = rows[rows.length - 1].id;
+    const historical = await historicalRelayRecipientsForSubmissions({
+      db,
+      agencyId,
+      submissions: rows.filter((row) => !row.executionPinnedAt),
+    });
+    const { creatorById, liveOrderIds } = await loadPipelinePageContext({ db, agencyId, rows });
+    for (const row of rows) {
+      if (nextUploadIndex(row) === null) continue;
+      if (!/^\d{1,20}$/.test(String(row.telegramSourceUserId || "").trim())) continue;
+      const creator = creatorById.get(String(row.creatorId));
+      if (!creator || (!row.executionVaultFolderId && !creator.customsVaultFolderId)) continue;
+      const historicalEntry = !row.executionPinnedAt ? historical.get(String(row.id)) : null;
+      if (historicalEntry?.error) continue;
+      const availableRecipient = String(row.executionRelayRecipient || historicalEntry?.recipient || currentRecipient || "").trim();
+      if (!availableRecipient) continue;
+      if (row.customOrderId) {
+        const orderLive = liveOrderIds === null
+          ? Boolean(await db.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, creatorId: row.creatorId, type: "CONTENT", status: "PENDING", fanDeliveredAt: null }, select: { id: true } }))
+          : liveOrderIds.has(String(row.customOrderId));
+        if (!orderLive) continue;
+      }
+      items.push(row);
+      if (items.length >= take) break;
+    }
+    if (rows.length < 200) break;
+  }
+  return items;
+}
+
+async function pendingUploadRows({ agencyId, sourceAccountIds, scope, limit, currentRecipient = "", now = new Date(), db }) {
+  const accountIds = Array.from(new Set((Array.isArray(sourceAccountIds) ? sourceAccountIds : []).map((value) => String(value || "").trim()).filter(Boolean)));
+  if (!accountIds.length) return [];
+  const scopedIds = scope?.broad ? null : Array.from(new Set((scope?.creatorIds || []).map(String).filter(Boolean)));
+  if (!scope?.broad && !scopedIds.length) return [];
+  const take = Math.max(1, Math.min(200, Math.floor(Number(limit) || 1)));
+  const accountChunks = [];
+  for (let offset = 0; offset < accountIds.length; offset += RUNTIME_LEASE_QUERY_CHUNK) accountChunks.push(accountIds.slice(offset, offset + RUNTIME_LEASE_QUERY_CHUNK));
+  const creatorChunks = scopedIds === null ? [null] : [];
+  if (scopedIds !== null) {
+    for (let offset = 0; offset < scopedIds.length; offset += RUNTIME_LEASE_QUERY_CHUNK) creatorChunks.push(scopedIds.slice(offset, offset + RUNTIME_LEASE_QUERY_CHUNK));
+  }
+  const merged = [];
+  for (const accountChunk of accountChunks) {
+    for (const creatorChunk of creatorChunks) {
+      merged.push(...await pendingUploadRowsChunk({
+        agencyId,
+        sourceAccountIds: accountChunk,
+        creatorIds: creatorChunk,
+        limit: take,
+        currentRecipient,
+        now,
+        db,
+      }));
+    }
+  }
+  const seenIds = new Set();
+  return merged
+    .sort(comparePipelineWorkRows)
+    .filter((row) => { const id = String(row.id); if (seenIds.has(id)) return false; seenIds.add(id); return true; })
+    .slice(0, take);
+}
+
+async function pendingFinalizeRows({ agencyId, scope, limit, now = new Date(), db }) {
+  const take = Math.max(1, Math.min(200, Math.floor(Number(limit) || 1)));
+  const scopedIds = scope?.broad ? [] : Array.from(new Set((scope?.creatorIds || []).map(String).filter(Boolean)));
+  if (!scope?.broad && !scopedIds.length) return [];
   if (typeof db.$queryRawUnsafe === "function") {
-    const placeholders = ids.map((_, index) => `$${index + 2}`).join(",");
+    const params = [agencyId];
+    let scopeSql = "";
+    if (scopedIds.length) {
+      const placeholders = scopedIds.map((id) => { params.push(id); return `$${params.length}`; }).join(",");
+      scopeSql = ` AND submission."creatorId" IN (${placeholders})`;
+    }
+    params.push(now);
+    const nowParam = `$${params.length}`;
     return db.$queryRawUnsafe(
-      `SELECT submission."id", submission."agencyId", submission."creatorId", submission."customOrderId",
-              submission."telegramMessageIds", submission."telegramSourceAccountId", submission."telegramSourceUserId", submission."ofMediaIds", submission."comment",
-              submission."receivedAt", submission."createdAt", submission."updatedAt"
+      `SELECT submission.*
        FROM "CustomContentSubmission" AS submission
+       JOIN "CreatorAccount" AS creator ON creator."id" = submission."creatorId" AND creator."agencyId" = submission."agencyId"
        LEFT JOIN "CustomOrder" AS custom_order ON custom_order."id" = submission."customOrderId"
        WHERE submission."agencyId" = $1
-         AND submission."creatorId" IN (${placeholders})
-         AND cardinality(submission."telegramMessageIds") > 0
-         AND cardinality(submission."ofMediaIds") = cardinality(submission."telegramMessageIds")
-         AND EXISTS (
-           SELECT 1
-           FROM unnest(submission."ofMediaIds") AS media_id
-           WHERE NOT EXISTS (
-             SELECT 1
-             FROM "CreatorMediaAsset" AS asset
-             WHERE asset."agencyId" = submission."agencyId"
-               AND asset."creatorId" = submission."creatorId"
-               AND asset."mediaId" = media_id
-               AND asset."source" = 'CUSTOM'
-               AND asset."customSubmissionId" = submission."id"
-               AND asset."customOrderId" IS NOT DISTINCT FROM submission."customOrderId"
-               AND (
-                 (submission."customOrderId" IS NULL AND asset."customFullPriceCents" IS NULL)
-                 OR
-                 (submission."customOrderId" IS NOT NULL AND asset."customFullPriceCents" = custom_order."priceCents")
-               )
+         AND submission."pipelineDisposition" IN ('ACTIVE', 'SALVAGE')
+         AND (submission."pipelineNextAttemptAt" IS NULL OR submission."pipelineNextAttemptAt" <= ${nowParam})
+         AND creator."deletedAt" IS NULL
+         ${scopeSql}
+         AND cardinality(submission."ofMediaIds") > 0
+         AND (
+           (submission."pipelineDisposition" = 'ACTIVE' AND cardinality(submission."ofMediaIds") = cardinality(submission."telegramMessageIds"))
+           OR submission."pipelineDisposition" = 'SALVAGE'
+         )
+         AND (submission."executionVaultFolderId" IS NOT NULL OR creator."customsVaultFolderId" IS NOT NULL)
+         AND (submission."pipelineDisposition" = 'SALVAGE' OR submission."customOrderId" IS NULL OR (
+           custom_order."type" = 'CONTENT' AND custom_order."status" = 'PENDING' AND custom_order."fanDeliveredAt" IS NULL
+         ))
+         AND (
+           -- Migration/backfill + external-stage proof invariant: Library rows
+           -- alone are not proof of pinned Vault settlement. Missing/stale
+           -- receipt always returns the submission to move-only finalization.
+           submission."executionPinnedAt" IS NULL
+           OR submission."executionVaultFolderId" IS NULL
+           OR submission."vaultSettlementConfirmedAt" IS NULL
+           OR submission."vaultSettlementConfirmedByDeviceId" IS NULL
+           OR submission."vaultSettlementFolderId" IS DISTINCT FROM submission."executionVaultFolderId"
+           OR submission."vaultSettlementProfileRevision" IS DISTINCT FROM submission."executionProfileRevision"
+           OR submission."vaultSettlementMediaFingerprint" IS NULL
+           OR EXISTS (
+             SELECT 1 FROM unnest(submission."ofMediaIds") AS media_id
+             WHERE NOT EXISTS (
+               SELECT 1 FROM "CreatorMediaAsset" AS asset
+               WHERE asset."agencyId" = submission."agencyId"
+                 AND asset."creatorId" = submission."creatorId"
+                 AND asset."mediaId" = media_id
+                 AND asset."source" = 'CUSTOM'
+                 AND asset."customSubmissionId" = submission."id"
+                 AND asset."customOrderId" IS NOT DISTINCT FROM submission."customOrderId"
+                 AND asset."catalogActive" = TRUE
+                 AND asset."sortingStatus" = 'SORTED'
+                 AND submission."executionVaultFolderId" = ANY(asset."folderIds")
+                 AND ((submission."customOrderId" IS NULL AND asset."customFullPriceCents" IS NULL)
+                   OR (submission."customOrderId" IS NOT NULL AND asset."customFullPriceCents" = custom_order."priceCents"))
+             )
            )
          )
-       ORDER BY submission."receivedAt" ASC, submission."createdAt" ASC
+       ORDER BY submission."pipelineLastAttemptAt" ASC NULLS FIRST, submission."receivedAt" ASC, submission."createdAt" ASC, submission."id" ASC
        LIMIT ${take}`,
-      agencyId,
-      ...ids,
+      ...params,
     );
   }
-
-  const candidates = await db.customContentSubmission.findMany({
-    where: { agencyId, creatorId: { in: ids } },
-    orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }],
-    take: Math.max(200, take * 20),
-    skip: 0,
-  });
-  const out = [];
-  for (const row of candidates) {
-    const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
-    const mediaIds = ofMediaIds(row.ofMediaIds);
-    if (!telegramIds.length || mediaIds.length !== telegramIds.length) continue;
-    let priceCents = null;
-    if (row.customOrderId) {
-      const order = await db.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, creatorId: row.creatorId }, select: { priceCents: true } });
-      priceCents = order ? Math.max(0, Math.round(Number(order.priceCents) || 0)) : null;
+  const items = [];
+  let cursor = null;
+  while (items.length < take) {
+    const rows = await db.customContentSubmission.findMany({
+      where: {
+        agencyId,
+        pipelineDisposition: { in: [ACTIVE, SALVAGE] },
+        AND: [{ OR: [{ pipelineNextAttemptAt: null }, { pipelineNextAttemptAt: { lte: now } }] }],
+        ...(scope?.broad ? {} : { creatorId: { in: scopedIds } }),
+      },
+      orderBy: [{ pipelineLastAttemptAt: { sort: "asc", nulls: "first" } }, { receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+      take: 200,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    if (!rows.length) break;
+    cursor = rows[rows.length - 1].id;
+    for (const row of rows) {
+      const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
+      const mediaIds = ofMediaIds(row.ofMediaIds);
+      const salvage = String(row.pipelineDisposition || ACTIVE) === SALVAGE;
+      if (!mediaIds.length || (!salvage && (!telegramIds.length || mediaIds.length !== telegramIds.length))) continue;
+      const creator = await db.creatorAccount.findFirst({ where: { id: row.creatorId, agencyId, deletedAt: null }, select: { customsVaultFolderId: true } });
+      if (!creator || (!row.executionVaultFolderId && !creator.customsVaultFolderId)) continue;
+      let order = null;
+      if (row.customOrderId) {
+        order = await db.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, creatorId: row.creatorId, ...(salvage ? {} : { type: "CONTENT", status: "PENDING", fanDeliveredAt: null }) }, select: { id: true, priceCents: true } });
+        if (!order && !salvage) continue;
+      }
+      const assets = await db.creatorMediaAsset.findMany({ where: { agencyId, creatorId: row.creatorId, mediaId: { in: mediaIds }, source: "CUSTOM" }, take: mediaIds.length });
+      const byMediaId = new Map(assets.map((asset) => [String(asset.mediaId), asset]));
+      const priceCents = order ? Math.max(0, Math.round(Number(order.priceCents) || 0)) : null;
+      const finalized = mediaIds.every((mediaId) => {
+        const asset = byMediaId.get(mediaId);
+        return customAssetMatchesPipelineProjection(row, asset, order);
+      });
+      const profileSettled = hasCurrentVaultSettlement(row);
+      if (!profileSettled || !finalized) items.push(row);
+      if (items.length >= take) break;
     }
-    const assets = await db.creatorMediaAsset.findMany({
-      where: { agencyId, creatorId: row.creatorId, mediaId: { in: mediaIds }, source: "CUSTOM" },
-      take: mediaIds.length,
-    });
-    const byMediaId = new Map(assets.map((asset) => [String(asset.mediaId), asset]));
-    const finalized = mediaIds.every((mediaId) => {
-      const asset = byMediaId.get(mediaId);
-      if (!asset) return false;
-      if ((asset.customSubmissionId || null) !== String(row.id || "")) return false;
-      if ((asset.customOrderId || null) !== (row.customOrderId || null)) return false;
-      return row.customOrderId
-        ? Number(asset.customFullPriceCents) === priceCents
-        : asset.customFullPriceCents == null;
-    });
-    if (!finalized) out.push(row);
-    if (out.length >= take) break;
+    if (rows.length < 200) break;
   }
-  return out;
+  return items;
 }
 
 /**
@@ -767,8 +1118,7 @@ async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, devi
   }
 
   return withSubmissionSourceLock({ db: client, agencyId, submissionId: id, work: async (lockedClient) => {
-    const row = await lockedClient.customContentSubmission.findFirst({ where: { id, agencyId } });
-    if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+    let row = await assertNewRelayWorkAllowed({ db: lockedClient, agencyId, submissionId: id });
     await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: lockedClient });
     const nextIndex = nextUploadIndex(row);
     if (nextIndex === null) throw fail("CUSTOM_SUBMISSION_UPLOAD_ALREADY_COMPLETE", "Content submission already has all OnlyFans media ids", 409);
@@ -784,13 +1134,51 @@ async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, devi
     if (!telegramSourceAccountId || !/^\d{1,20}$/.test(telegramSourceUserId)) {
       throw fail("CUSTOM_SUBMISSION_SOURCE_IDENTITY_REQUIRED", "Submission has no pinned Telegram source account/user identity", 409);
     }
-    const recipientRow = await lockedClient.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null);
-    const recipient = String(recipientRow?.value || "").trim().replace(/^@+/, "");
-    if (!recipient) throw fail("CUSTOM_SUBMISSION_VAULT_RECIPIENT_REQUIRED", "Vault upload recipient is not configured", 409);
-    const payloadFingerprint = crypto.createHash("sha256").update(JSON.stringify({
-      version: 2, agencyId, creatorId: String(row.creatorId), submissionId: id, expectedIndex: index,
-      telegramSourceAccountId, telegramSourceUserId, telegramMessageId, recipient,
+    const profile = await ensureSubmissionExecutionProfile({ db: lockedClient, agencyId, submission: row, now, requireRelayRecipient: true });
+    row = profile.submission;
+    const recipient = String(profile.relayRecipient || "");
+    const vaultFolderId = String(profile.vaultFolderId || "");
+    const idempotencyKey = `custom-relay:${id}:${index}`;
+    const requestedFingerprint = crypto.createHash("sha256").update(JSON.stringify({
+      version: 3, agencyId, creatorId: String(row.creatorId), submissionId: id, expectedIndex: index,
+      telegramSourceAccountId, telegramSourceUserId, telegramMessageId, recipient, vaultFolderId,
+      executionProfileRevision: Number(row.executionProfileRevision || 0),
     })).digest("hex");
+
+    // Rolling-cutover compatibility is scoped to this one product authority.
+    // A pre-cutover custom-relay row used fingerprint v2 (no folder/profile
+    // fields) but already durably bound the same submission/index/source and
+    // recipient. Reuse that row's immutable fingerprint after validating every
+    // semantic binding; never weaken generic Audit17 idempotency matching.
+    let payloadFingerprint = requestedFingerprint;
+    const existingWrite = lockedClient.automationDelivery?.findUnique
+      ? await lockedClient.automationDelivery.findUnique({ where: { idempotencyKey } })
+      : lockedClient.automationDelivery?.findFirst
+        ? await lockedClient.automationDelivery.findFirst({ where: { agencyId, creatorId: row.creatorId, actionType: "CUSTOM_RELAY_SEND", idempotencyKey } })
+        : null;
+    if (existingWrite) {
+      const payload = existingWrite.payload && typeof existingWrite.payload === "object" && !Array.isArray(existingWrite.payload) ? existingWrite.payload : {};
+      const existingRecipient = String(payload.recipient || "").trim().replace(/^@+/, "");
+      const existingFolderId = String(payload.vaultFolderId || "").trim();
+      const existingProfileRevision = payload.executionProfileRevision == null ? null : Number(payload.executionProfileRevision);
+      const existingFingerprint = String(existingWrite.payloadFingerprint || "").trim();
+      const exactBinding = String(existingWrite.agencyId || "") === String(agencyId)
+        && String(existingWrite.creatorId || "") === String(row.creatorId)
+        && String(existingWrite.actionType || "") === "CUSTOM_RELAY_SEND"
+        && String(existingWrite.idempotencyKey || "") === idempotencyKey
+        && String(payload.submissionId || "") === id
+        && Number(payload.expectedIndex) === index
+        && String(payload.telegramSourceAccountId || "") === telegramSourceAccountId
+        && String(payload.telegramSourceUserId || "") === telegramSourceUserId
+        && String(payload.telegramMessageId || "") === telegramMessageId
+        && existingRecipient === recipient
+        && (!existingFolderId || existingFolderId === vaultFolderId)
+        && (existingProfileRevision == null || existingProfileRevision === Number(row.executionProfileRevision || 0));
+      if (!exactBinding || !existingFingerprint) {
+        throw fail("CUSTOM_SUBMISSION_RELAY_LEGACY_BINDING_CONFLICT", "Existing Custom relay write cannot be adopted safely by the pinned execution profile", 409);
+      }
+      payloadFingerprint = existingFingerprint;
+    }
     const reserveProgrammaticWrite = typeof reserveWrite === "function"
       ? reserveWrite
       : require("./programmatic-of-write-authority-service").reserveProgrammaticWrite;
@@ -802,15 +1190,15 @@ async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, devi
       creatorId: String(row.creatorId),
       deviceId: normalizedDeviceId,
       kind: "CUSTOM_RELAY_SEND",
-      idempotencyKey: `custom-relay:${id}:${index}`,
+      idempotencyKey,
       payloadFingerprint,
-      payload: { submissionId: id, expectedIndex: index, telegramSourceAccountId, telegramSourceUserId, telegramMessageId, recipient, reservedForCustomUploadAt: new Date(now).toISOString() },
+      payload: { submissionId: id, expectedIndex: index, telegramSourceAccountId, telegramSourceUserId, telegramMessageId, recipient, vaultFolderId, executionProfileRevision: Number(row.executionProfileRevision || 0), reservedForCustomUploadAt: new Date(now).toISOString() },
       targetId: `${id}:${index}`,
       permissionKeyOverride: null,
       leaseMs: 10 * 60_000,
       maxAttempts: 20,
     });
-    return { ...authority, relayRecipient: recipient, submissionId: id, expectedIndex: index, telegramSourceAccountId, telegramSourceUserId, telegramMessageId };
+    return { ...authority, relayRecipient: recipient, executionVaultFolderId: vaultFolderId, executionProfileRevision: Number(row.executionProfileRevision || 0), submissionId: id, expectedIndex: index, telegramSourceAccountId, telegramSourceUserId, telegramMessageId };
   } });
 }
 
@@ -875,130 +1263,205 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
   const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
   const requestedLeases = runtimeLeaseInputs(leases);
   const take = uploadWorkLimit(limit);
-  if (!requestedLeases.length) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
-
   const requestedByAccount = new Map(requestedLeases.map((row) => [row.accountId, row.claimToken]));
+
+  const leaseIds = [...requestedByAccount.keys()];
+  const leaseRowsPromise = (async () => {
+    if (!leaseIds.length) return [];
+    const rows = [];
+    for (let offset = 0; offset < leaseIds.length; offset += RUNTIME_LEASE_QUERY_CHUNK) {
+      const ids = leaseIds.slice(offset, offset + RUNTIME_LEASE_QUERY_CHUNK);
+      rows.push(...await client.agencyTelegramMtprotoAccount.findMany({
+        where: {
+          agencyId,
+          id: { in: ids },
+          runtimeClaimedByDeviceId: normalizedDeviceId,
+          runtimeClaimUntil: { gt: now },
+        },
+        select: {
+          id: true,
+          runtimeClaimToken: true,
+          runtimeLeaseUserId: true,
+          runtimeLeaseMemberId: true,
+          runtimeLeaseAccessEpoch: true,
+          runtimeLeaseCreatorId: true,
+        },
+        // Explicit chunk-size take is a transport/SQL parameter bound only.
+        // Every requested lease is queried across all chunks before eligibility.
+        take: ids.length,
+      }));
+    }
+    return rows;
+  })();
+
   const [scope, leasedRows, recipientRow] = await Promise.all([
     allowedCreatorScope({ agencyId, member, db: client }),
-    client.agencyTelegramMtprotoAccount.findMany({
-      where: {
-        agencyId,
-        id: { in: [...requestedByAccount.keys()] },
-        runtimeClaimedByDeviceId: normalizedDeviceId,
-        runtimeClaimUntil: { gt: now },
-      },
-      select: {
-        id: true,
-        runtimeClaimToken: true,
-        runtimeLeaseUserId: true,
-        runtimeLeaseMemberId: true,
-        runtimeLeaseAccessEpoch: true,
-        runtimeLeaseCreatorId: true,
-      },
-      take: MAX_RUNTIME_LEASES,
-    }),
+    leaseRowsPromise,
     client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: "vaultUploadRecipient" } }, select: { value: true } }).catch(() => null),
   ]);
+
   const currentUserId = String(member.userId || "");
   const currentMemberId = String(member.id || "");
   const currentAccessEpoch = Number(member.accessEpoch);
   const scopedCreatorIds = new Set(scope.creatorIds || []);
-  const validAccountIds = new Set(
-    leasedRows
-      .filter((row) => {
-        const anchorCreatorId = String(row.runtimeLeaseCreatorId || "");
-        return requestedByAccount.get(String(row.id)) === String(row.runtimeClaimToken || "")
-          && String(row.runtimeLeaseUserId || "") === currentUserId
-          && String(row.runtimeLeaseMemberId || "") === currentMemberId
-          && Number.isInteger(currentAccessEpoch)
-          && Number(row.runtimeLeaseAccessEpoch) === currentAccessEpoch
-          && Boolean(anchorCreatorId)
-          && (scope.broad || scopedCreatorIds.has(anchorCreatorId));
-      })
-      .map((row) => String(row.id)),
-  );
-  if (!validAccountIds.size) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
+  const validAccountIds = leasedRows
+    .filter((row) => {
+      const anchorCreatorId = String(row.runtimeLeaseCreatorId || "");
+      return requestedByAccount.get(String(row.id)) === String(row.runtimeClaimToken || "")
+        && String(row.runtimeLeaseUserId || "") === currentUserId
+        && String(row.runtimeLeaseMemberId || "") === currentMemberId
+        && Number.isInteger(currentAccessEpoch)
+        && Number(row.runtimeLeaseAccessEpoch) === currentAccessEpoch
+        && Boolean(anchorCreatorId)
+        && (scope.broad || scopedCreatorIds.has(anchorCreatorId));
+    })
+    .map((row) => String(row.id));
+  const currentRecipient = vaultUploadRecipient(recipientRow?.value);
+  const recoveryBlockedItems = [];
 
-  /* The upload queue borrows the Telegram runtime lease rather than creating a
-     second claim generation. Treat every actor field on that lease as
-     authority: a stale member/accessEpoch/creator anchor cannot expose new OF
-     upload work even while device/token/TTL still match. */
-
-  const recipient = vaultUploadRecipient(recipientRow?.value);
-  if (!recipient) {
-    return {
-      ok: true,
-      items: [],
-      blocked: { code: "CUSTOM_SUBMISSION_VAULT_RELAY_REQUIRED", message: "Set Vault upload relay in Settings → Workspace." },
-      serverNow: new Date(now).toISOString(),
-    };
+  // Recover provider-confirmed external facts before asking what work remains.
+  // This is deliberately independent of Telegram runtime leases and of the
+  // current CustomOrder status: COMPLETED Audit17 relay rows are historical
+  // proof, not permission to create a new external write. Cancellation may stop
+  // the next relay, but it must never erase a relay that already succeeded.
+  const projectionRows = await pendingRelayProjectionRows({ agencyId, scope, limit: take, now, db: client });
+  for (const projectionRow of projectionRows) {
+    try {
+      await recoverConfirmedRelayProjectionForSubmission({ agencyId, submissionId: String(projectionRow.id), db: client });
+    } catch (error) {
+      if (String(error?.code || "").startsWith("CUSTOM_")) {
+        const code = String(error.code || "CUSTOM_SUBMISSION_RELAY_PROJECTION_BLOCKED");
+        recoveryBlockedItems.push({ submissionId: String(projectionRow.id), code, message: String(error.message || "Confirmed Custom relay projection is blocked") });
+        await reportSubmissionExecutionAttempt({ db: client, agencyId, submissionId: String(projectionRow.id), success: false, code, now }).catch(() => undefined);
+        continue;
+      }
+      throw error;
+    }
   }
 
-  const creatorWhere = {
-    agencyId,
-    deletedAt: null,
-    telegramContact: { not: null },
-    customsVaultFolderId: { not: null },
-    ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
-  };
-  const creators = await client.creatorAccount.findMany({
-    where: creatorWhere,
-    select: { id: true, username: true, customsVaultFolderId: true },
-    take: 10_000,
-  });
-  if (!creators.length) return { ok: true, items: [], blocked: null, serverNow: new Date(now).toISOString() };
+  // Diagnostic discovery is a separate lane from executable work. Structural
+  // blockers that fail eligibility (missing pinned source identity/destination/
+  // recipient) must still become durable operator-visible state, but they must
+  // never consume the executable work LIMIT.
+  const diagnosticRows = await discoverBlockedPipelineRows({ agencyId, scope, limit: take, currentRecipient, now, db: client });
+  for (const blocked of diagnosticRows) {
+    const entry = { submissionId: String(blocked.row.id), code: blocked.code, message: blocked.code };
+    recoveryBlockedItems.push(entry);
+    await reportSubmissionExecutionAttempt({ db: client, agencyId, submissionId: entry.submissionId, success: false, code: entry.code, now }).catch(() => undefined);
+  }
 
+  // Correctness eligibility is applied before LIMIT. Telegram-dependent upload
+  // candidates are restricted to exact account-level leases owned by this Desktop,
+  // while submission creators are independently fenced by current member scope.
+  // runtimeLeaseCreatorId is the lease lifecycle/access anchor, not an exclusive
+  // business binding between one MTProto account and one creator.
+  const [uploadRows, finalizeRows] = await Promise.all([
+    pendingUploadRows({ agencyId, sourceAccountIds: validAccountIds, scope, limit: take, currentRecipient, now, db: client }),
+    pendingFinalizeRows({ agencyId, scope, limit: take, now, db: client }),
+  ]);
+
+  const candidates = [
+    ...uploadRows.map((submission) => ({ kind: "UPLOAD_MEDIA", submission })),
+    ...finalizeRows.map((submission) => ({ kind: "FINALIZE_LIBRARY", submission })),
+  ].sort((left, right) => comparePipelineWorkRows(left.submission, right.submission));
+
+  const creatorIds = Array.from(new Set(candidates.map((entry) => String(entry.submission.creatorId)).filter(Boolean)));
+  const creators = creatorIds.length ? await client.creatorAccount.findMany({
+    where: { agencyId, id: { in: creatorIds }, deletedAt: null },
+    select: { id: true, username: true },
+    take: creatorIds.length,
+  }) : [];
   const creatorById = new Map(creators.map((creator) => [String(creator.id), creator]));
-
-  const uploadRows = await pendingUploadRows({ agencyId, creatorIds: [...creatorById.keys()], limit: take, db: client });
+  const blockedItems = [...recoveryBlockedItems];
   const items = [];
-  for (const row of uploadRows) {
+
+  for (const candidate of candidates) {
     if (items.length >= take) break;
+    let row = candidate.submission;
     const creator = creatorById.get(String(row.creatorId));
-    const index = nextUploadIndex(row);
-    if (!creator || index === null) continue;
-    const messageId = Number(row.telegramMessageIds?.[index]);
-    if (!Number.isInteger(messageId) || messageId <= 0) continue;
-    const sourceAccountId = String(row.telegramSourceAccountId || "").trim();
-    const sourceUserId = String(row.telegramSourceUserId || "").trim();
-    if (!sourceAccountId || !/^\d{1,20}$/.test(sourceUserId)) {
-      return { ok: true, items: [], blocked: { code: "CUSTOM_SUBMISSION_SOURCE_IDENTITY_REQUIRED", message: "This submission has no pinned Telegram source account/user identity." }, serverNow: new Date(now).toISOString() };
+    if (!creator) continue;
+    try {
+      const profile = await ensureSubmissionExecutionProfile({
+        db: client,
+        agencyId,
+        submission: row,
+        now,
+        requireRelayRecipient: candidate.kind === "UPLOAD_MEDIA",
+      });
+      row = profile.submission;
+      if (candidate.kind === "UPLOAD_MEDIA") {
+        const index = nextUploadIndex(row);
+        if (index === null) continue;
+        const messageId = Number(row.telegramMessageIds?.[index]);
+        const sourceAccountId = String(row.telegramSourceAccountId || "").trim();
+        const sourceUserId = String(row.telegramSourceUserId || "").trim();
+        if (!sourceAccountId || !/^\d{1,20}$/.test(sourceUserId)) {
+          blockedItems.push({ submissionId: String(row.id), code: "CUSTOM_SUBMISSION_SOURCE_IDENTITY_REQUIRED", message: "This submission has no pinned Telegram source account/user identity." });
+          continue;
+        }
+        if (!validAccountIds.includes(sourceAccountId)) continue;
+        items.push({
+          kind: "UPLOAD_MEDIA",
+          submission: serializeSubmission(row),
+          creatorId: String(row.creatorId),
+          accountId: sourceAccountId,
+          telegramSourceUserId: sourceUserId,
+          creatorUsername: creator.username || null,
+          folderId: String(profile.vaultFolderId),
+          recipient: String(profile.relayRecipient),
+          executionProfileRevision: Number(row.executionProfileRevision || 0),
+          expectedIndex: index,
+          telegramMessageId: String(messageId),
+        });
+      } else {
+        items.push({
+          kind: "FINALIZE_LIBRARY",
+          submission: serializeSubmission(row),
+          creatorId: String(row.creatorId),
+          accountId: String(row.telegramSourceAccountId || ""),
+          creatorUsername: creator.username || null,
+          folderId: String(profile.vaultFolderId),
+          recipient: String(profile.relayRecipient || ""),
+          executionProfileRevision: Number(row.executionProfileRevision || 0),
+          expectedIndex: null,
+          telegramMessageId: null,
+        });
+      }
+    } catch (error) {
+      if (String(error?.code || "").startsWith("CUSTOM_SUBMISSION_") || String(error?.code || "") === "CREATOR_NOT_FOUND") {
+        const code = String(error.code || "CUSTOM_SUBMISSION_BLOCKED");
+        blockedItems.push({ submissionId: String(row.id), code, message: String(error.message || "Custom submission is blocked") });
+        await reportSubmissionExecutionAttempt({ db: client, agencyId, submissionId: String(row.id), success: false, code, now }).catch(() => undefined);
+        continue;
+      }
+      throw error;
     }
-    if (!validAccountIds.has(sourceAccountId)) continue;
-    items.push({
-      kind: "UPLOAD_MEDIA",
-      submission: serializeSubmission(row),
-      creatorId: String(row.creatorId),
-      accountId: sourceAccountId,
-      telegramSourceUserId: sourceUserId,
-      creatorUsername: creator.username || null,
-      folderId: String(creator.customsVaultFolderId),
-      recipient,
-      expectedIndex: index,
-      telegramMessageId: String(messageId),
-    });
   }
 
-  if (items.length < take) {
-    const finalizeRows = await pendingFinalizeRows({ agencyId, creatorIds: [...creatorById.keys()], limit: take - items.length, db: client });
-    for (const row of finalizeRows) {
-      if (items.length >= take) break;
-      const creator = creatorById.get(String(row.creatorId));
-      if (!creator) continue;
-      items.push({
-        kind: "FINALIZE_LIBRARY",
-        submission: serializeSubmission(row),
-        creatorId: String(row.creatorId),
-        accountId: String(row.telegramSourceAccountId || ""),
-        creatorUsername: creator.username || null,
-        folderId: String(creator.customsVaultFolderId),
-        recipient,
-        expectedIndex: null,
-        telegramMessageId: null,
-      });
-    }
-  }
-  return { ok: true, items, blocked: null, serverNow: new Date(now).toISOString() };
+  return {
+    ok: true,
+    items,
+    blocked: blockedItems[0] || null,
+    blockedItems,
+    serverNow: new Date(now).toISOString(),
+  };
+}
+
+async function reportCustomContentSubmissionExecutionAttempt({
+  agencyId, member, submissionId, success, code = null,
+  workKind = null, expectedIndex = null, executionProfileRevision = null,
+  now = new Date(), db = null,
+} = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  const id = identifier(submissionId, "submissionId", { max: 180 });
+  const row = await client.customContentSubmission.findFirst({ where: { id, agencyId }, select: { id: true, creatorId: true } });
+  if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  return reportSubmissionExecutionAttempt({
+    db: client, agencyId, submissionId: id, success: success === true, code, now,
+    expectedWorkKind: workKind, expectedIndex, expectedExecutionProfileRevision: executionProfileRevision,
+  });
 }
 
 async function assertCustomSubmissionTelegramSourceAccess({ agencyId, member, submissionId, creatorId, accountId, messageIds, db = null } = {}) {
@@ -1008,8 +1471,14 @@ async function assertCustomSubmissionTelegramSourceAccess({ agencyId, member, su
   const normalizedCreatorId = identifier(creatorId, "creatorId", { max: 100 });
   const normalizedAccountId = identifier(accountId, "telegramAccountId", { max: 180 });
   await requireCreatorAccess({ agencyId, member, creatorId: normalizedCreatorId, db: client });
-  const row = await client.customContentSubmission.findFirst({ where: { id: normalizedSubmissionId, agencyId, creatorId: normalizedCreatorId } });
+  const row = await client.customContentSubmission.findFirst({
+    where: { id: normalizedSubmissionId, agencyId, creatorId: normalizedCreatorId },
+    include: { customOrder: { select: { id: true, type: true, status: true, fanDeliveredAt: true, creatorId: true } } },
+  });
   if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  if (!submissionAllowsNewPipelineWork(row, row.customOrder)) {
+    throw fail("CUSTOM_SUBMISSION_PIPELINE_TERMINAL", "Cancelled, completed, delivered, or salvaged Custom content cannot read new Telegram source media", 409);
+  }
   if (String(row.telegramSourceAccountId || "") !== normalizedAccountId) {
     throw fail("CUSTOM_SUBMISSION_SOURCE_ACCOUNT_MISMATCH", "Telegram account does not match this submission source", 403);
   }
@@ -1050,7 +1519,7 @@ async function commitCustomContentSubmissionMedia({ agencyId, member, submission
   if (index !== current.length) throw fail("CUSTOM_SUBMISSION_MEDIA_COMMIT_OUT_OF_ORDER", "OnlyFans media ids must be projected in Telegram message order", 409);
   if (current.includes(normalizedMediaId)) throw fail("CUSTOM_SUBMISSION_MEDIA_ID_DUPLICATE", "Confirmed relay result reuses an OnlyFans media id already projected into this submission", 409);
   const next = [...current, normalizedMediaId];
-  const changed = await client.customContentSubmission.updateMany({ where: { id: row.id, agencyId, updatedAt: row.updatedAt }, data: { ofMediaIds: next } });
+  const changed = await client.customContentSubmission.updateMany({ where: { id: row.id, agencyId, updatedAt: row.updatedAt }, data: { ofMediaIds: next, ...invalidateVaultSettlementData() } });
   if (Number(changed?.count || 0) !== 1) {
     const raced = await client.customContentSubmission.findFirst({ where: { id: row.id, agencyId } }); const racedIds = ofMediaIds(raced?.ofMediaIds);
     if (raced && racedIds[index] === normalizedMediaId) return { ok: true, idempotent: true, completed: racedIds.length === telegramIds.length, proof: { writeId: proof.writeId }, submission: serializeSubmission(raced) };
@@ -1075,6 +1544,7 @@ module.exports = {
   listCustomContentSubmissions,
   nextUploadIndex,
   pendingFinalizeRows,
+  reportCustomContentSubmissionExecutionAttempt,
   reserveCustomContentSubmissionRelayWrite,
   closeCustomContentSubmissionRelayWriteUnresolved,
   resolveCustomContentSubmissionRelayWriteMatched,

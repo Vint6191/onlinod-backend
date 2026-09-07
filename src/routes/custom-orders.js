@@ -14,24 +14,29 @@ const {
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   listCustomContentSubmissions,
+  reportCustomContentSubmissionExecutionAttempt,
   reserveCustomContentSubmissionRelayWrite,
   closeCustomContentSubmissionRelayWriteUnresolved,
   resolveCustomContentSubmissionRelayWriteMatched,
 } = require("../services/custom-content-submissions-service");
-const { finalizeCustomContentSubmissionLibrary } = require("../services/custom-content-library-service");
+const { confirmCustomContentSubmissionVaultSettlement, finalizeCustomContentSubmissionLibrary } = require("../services/custom-content-library-service");
 const { listCustomContentReviewQueue, reviewCustomContentSubmission } = require("../services/custom-content-review-service");
 const {
   assignUnassignedCustomContentSubmission,
   listAwaitingCustomRevisions,
   listCustomSubmissionAssignmentCandidates,
+  listCustomPipelineResolutionQueue,
   listUnassignedCustomContentSubmissions,
+  resolveUnassignedCustomContentSubmission,
+  resolveRetiredCreatorPendingCustomOrder,
 } = require("../services/custom-content-workflow-service");
 const {
   getCustomVaultDestination,
   setCustomVaultDestination,
 } = require("../services/custom-vault-destination-service");
 const { listCustomNonContentOperations } = require("../services/custom-noncontent-operations-service");
-const { listCustomReadyDeliveries, getCustomReadyDelivery } = require("../services/custom-content-delivery-service");
+const { listCustomReadyDeliveries, getCustomReadyDelivery, preflightCustomManualSend, preflightProgrammaticCustomMedia } = require("../services/custom-content-delivery-service");
+const { prepareCustomManualDeliveryCommit } = require("../services/custom-manual-delivery-authority-service");
 
 const {
   planTelegramDeliveryIntent,
@@ -46,6 +51,10 @@ const {
   cancelTelegramReferencePrecommit,
   getTelegramOrderContext,
   listTelegramDeliveryReconciliationQueue,
+  listTelegramConfirmedProjectionBlockedQueue,
+  retryTelegramConfirmedProjection,
+  listTelegramDeliveryPrecommitBlockedQueue,
+  listTelegramReminderPlanningBlockedQueue,
   reconcileTelegramDeliveryIntent,
 } = require("../services/telegram-delivery-authority-service");
 const {
@@ -121,12 +130,40 @@ router.get("/submissions", async (req, res) => {
 });
 
 
+router.get("/submissions/pipeline-resolution-queue", async (req, res) => {
+  try {
+    return res.json(await listCustomPipelineResolutionQueue({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      creatorId: req.query.creatorId || null,
+      limit: req.query.limit,
+      offset: req.query.offset,
+      pendingCustomOffset: req.query.pendingCustomOffset,
+      activeWriteOffset: req.query.activeWriteOffset,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_PIPELINE_RESOLUTION_QUEUE_FAILED"); }
+});
+
+router.post("/pipeline-resolution-orders/:customOrderId/cancel-retired", async (req, res) => {
+  try {
+    return res.json(await resolveRetiredCreatorPendingCustomOrder({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      customOrderId: req.params.customOrderId,
+      reason: req.body?.reason,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_RETIRED_ORDER_RESOLUTION_FAILED"); }
+});
+
 router.get("/submissions/unassigned-queue", async (req, res) => {
   try {
     return res.json(await listUnassignedCustomContentSubmissions({
       agencyId: req.auth.agencyId,
       member: req.auth.membership || req.member,
       limit: req.query.limit,
+      offset: req.query.offset,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_UNASSIGNED_QUEUE_FAILED"); }
@@ -156,12 +193,44 @@ router.post("/submissions/:submissionId/assign-unassigned", async (req, res) => 
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_ASSIGN_UNASSIGNED_FAILED"); }
 });
 
+
+router.post("/submissions/:submissionId/execution-attempt", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await reportCustomContentSubmissionExecutionAttempt({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      submissionId: req.params.submissionId,
+      success: req.body?.success === true,
+      code: req.body?.code,
+      workKind: req.body?.workKind,
+      expectedIndex: req.body?.expectedIndex,
+      executionProfileRevision: req.body?.executionProfileRevision,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_EXECUTION_ATTEMPT_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/disposition", async (req, res) => {
+  try {
+    return res.json(await resolveUnassignedCustomContentSubmission({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      submissionId: req.params.submissionId,
+      disposition: req.body?.disposition,
+      reason: req.body?.reason,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_DISPOSITION_FAILED"); }
+});
+
 router.get("/revision-queue", async (req, res) => {
   try {
     return res.json(await listAwaitingCustomRevisions({
       agencyId: req.auth.agencyId,
       member: req.auth.membership || req.member,
       limit: req.query.limit,
+      cursor: req.query.cursor,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_REVISION_QUEUE_FAILED"); }
@@ -261,6 +330,22 @@ router.post("/submissions/:submissionId/media-commit", async (req, res) => {
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_MEDIA_COMMIT_FAILED"); }
 });
 
+router.post("/submissions/:submissionId/vault-settlement/confirm", async (req, res) => {
+  try {
+    const deviceId = requireProductDevice(req, req.body?.deviceId);
+    return res.json(await confirmCustomContentSubmissionVaultSettlement({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      deviceId,
+      submissionId: req.params.submissionId,
+      folderId: req.body?.folderId,
+      profileRevision: req.body?.profileRevision,
+      mediaIds: req.body?.mediaIds,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_VAULT_SETTLEMENT_CONFIRM_FAILED"); }
+});
+
 router.post("/submissions/:submissionId/content-library-finalize", async (req, res) => {
   try {
     return res.json(await finalizeCustomContentSubmissionLibrary({
@@ -278,12 +363,71 @@ router.patch("/submissions/:submissionId", (_req, res) => {
 });
 
 
+router.post("/ready-deliveries/programmatic-media-preflight", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await preflightProgrammaticCustomMedia({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      creatorId: req.body?.creatorId,
+      mediaIds: req.body?.mediaIds,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_PROGRAMMATIC_MEDIA_PREFLIGHT_FAILED"); }
+});
+
+router.post("/ready-deliveries/commit", async (req, res) => {
+  try {
+    const deviceId = requireProductDevice(req, req.body?.deviceId);
+    return res.json(await prepareCustomManualDeliveryCommit({
+      agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      member: req.auth.membership || req.member,
+      accessEpoch: currentAccessEpoch(req),
+      deviceId,
+      creatorId: req.body?.creatorId,
+      dialogId: req.body?.dialogId,
+      mediaIds: req.body?.mediaIds,
+      priceCents: req.body?.priceCents,
+      networkRequestId: req.body?.networkRequestId,
+      overrideReason: req.body?.overrideReason,
+      duplicateOverride: bool(req.body?.duplicateOverride),
+      priceMismatchOverride: bool(req.body?.priceMismatchOverride),
+      authorityVersion: req.body?.commitAuthorityVersion || "CUSTOM_MANUAL_V1",
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_DELIVERY_COMMIT_FAILED"); }
+});
+
+router.post("/ready-deliveries/preflight", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    const result = await preflightCustomManualSend({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      creatorId: req.body?.creatorId,
+      dialogId: req.body?.dialogId,
+      mediaIds: req.body?.mediaIds,
+      db: prisma,
+    });
+    // Rolling cutover is fail-closed. A pre-authority Desktop must not receive
+    // an allow=true Custom preflight from a backend that now requires a durable
+    // server-visible physical-send commit permit.
+    const authorityVersion = String(req.body?.commitAuthorityVersion || "");
+    if (result?.matched && !["CUSTOM_MANUAL_V1", "CUSTOM_MANUAL_V2"].includes(authorityVersion)) {
+      return res.status(409).json({ ok: false, matched: true, allow: false, code: "CUSTOM_DELIVERY_CLIENT_UPGRADE_REQUIRED", error: "This backend requires a supported CUSTOM_MANUAL physical-send commit authority" });
+    }
+    return res.json(result);
+  } catch (err) { return sendError(res, err, "CUSTOM_DELIVERY_PREFLIGHT_FAILED"); }
+});
+
 router.get("/ready-deliveries", async (req, res) => {
   try {
     return res.json(await listCustomReadyDeliveries({
       agencyId: req.auth.agencyId,
       member: req.auth.membership || req.member,
       limit: req.query.limit,
+      cursor: req.query.cursor,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_DELIVERY_LIST_FAILED"); }
@@ -312,6 +456,7 @@ router.get("/review-queue", async (req, res) => {
       member: req.auth.membership || req.member,
       status: req.query.status || "WAITING_REVIEW",
       limit: req.query.limit,
+      cursor: req.query.cursor,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_REVIEW_QUEUE_FAILED"); }
@@ -336,6 +481,7 @@ router.get("/telegram-inbound/review-required", async (req, res) => {
       agencyId: req.auth.agencyId,
       member: req.auth.membership || req.member,
       limit: req.query.limit,
+      cursor: req.query.cursor,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "TELEGRAM_INBOUND_REVIEW_QUEUE_FAILED"); }
@@ -379,12 +525,40 @@ router.post("/telegram-inbound", async (req, res) => {
   } catch (err) { return sendError(res, err, "CUSTOM_ORDER_TELEGRAM_INBOUND_FAILED"); }
 });
 
+router.get("/telegram-deliveries/confirmed-projection-blocked", async (req, res) => {
+  try {
+    return res.json(await listTelegramConfirmedProjectionBlockedQueue({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, limit: req.query.limit, cursor: req.query.cursor, db: prisma }));
+  } catch (err) { return sendError(res, err, "TELEGRAM_CONFIRMED_PROJECTION_QUEUE_FAILED"); }
+});
+
+router.post("/telegram-deliveries/:intentId/retry-confirmed-projection", async (req, res) => {
+  try {
+    return res.json(await retryTelegramConfirmedProjection({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, db: prisma }));
+  } catch (err) { return sendError(res, err, "TELEGRAM_CONFIRMED_PROJECTION_RETRY_FAILED"); }
+});
+
 router.get("/telegram-deliveries/reconciliation-required", async (req, res) => {
   try {
     return res.json(await listTelegramDeliveryReconciliationQueue({
-      agencyId: req.auth.agencyId, member: req.auth.membership || req.member, limit: req.query.limit, db: prisma,
+      agencyId: req.auth.agencyId, member: req.auth.membership || req.member, limit: req.query.limit, cursor: req.query.cursor, db: prisma,
     }));
   } catch (err) { return sendError(res, err, "TELEGRAM_DELIVERY_RECONCILE_QUEUE_FAILED"); }
+});
+
+router.get("/telegram-deliveries/precommit-blocked", async (req, res) => {
+  try {
+    return res.json(await listTelegramDeliveryPrecommitBlockedQueue({
+      agencyId: req.auth.agencyId, member: req.auth.membership || req.member, limit: req.query.limit, cursor: req.query.cursor, db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "TELEGRAM_DELIVERY_PRECOMMIT_BLOCKED_QUEUE_FAILED"); }
+});
+
+router.get("/telegram-deliveries/reminder-planning-blocked", async (req, res) => {
+  try {
+    return res.json(await listTelegramReminderPlanningBlockedQueue({
+      agencyId: req.auth.agencyId, member: req.auth.membership || req.member, limit: req.query.limit, cursor: req.query.cursor, db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "TELEGRAM_REMINDER_PLANNING_BLOCKED_QUEUE_FAILED"); }
 });
 
 router.post("/telegram-deliveries/work", async (req, res) => {

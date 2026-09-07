@@ -5,6 +5,41 @@ function clean(value, max = 500) { const text = String(value == null ? "" : valu
 function mediaId(value) { const text = clean(value, 80); return /^[1-9]\d{0,39}$/.test(text) ? text : null; }
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 
+function confirmedRelayProofMediaIdForSubmission({ row, submission }) {
+  if (!row || !submission) return null;
+  const result = object(row.result);
+  const payload = object(row.payload);
+  const provenKind = clean(result.programmaticWriteKind, 80).toUpperCase();
+  const provenMediaId = mediaId(result.mediaId);
+  const normalizedSubmissionId = clean(submission.id, 180);
+  const boundSubmissionId = clean(payload.submissionId, 180);
+  const boundIndex = Number(payload.expectedIndex);
+  const sourceIds = Array.isArray(submission.telegramMessageIds)
+    ? submission.telegramMessageIds.map((value) => clean(value, 40))
+    : [];
+  const expectedSourceAccountId = clean(submission.telegramSourceAccountId, 180);
+  const expectedSourceUserId = clean(submission.telegramSourceUserId, 40);
+  const expectedSourceId = Number.isInteger(boundIndex) && boundIndex >= 0
+    ? clean(sourceIds[boundIndex], 40)
+    : "";
+  const boundTelegramSourceAccountId = clean(payload.telegramSourceAccountId, 180);
+  const boundTelegramSourceUserId = clean(payload.telegramSourceUserId, 40);
+  const boundTelegramMessageId = clean(payload.telegramMessageId, 40);
+  const expectedKey = Number.isInteger(boundIndex) && boundIndex >= 0
+    ? `custom-relay:${normalizedSubmissionId}:${boundIndex}`
+    : "";
+
+  if (clean(row.actionType, 80).toUpperCase() !== "CUSTOM_RELAY_SEND" || clean(row.status, 40).toUpperCase() !== "COMPLETED") return null;
+  if (provenKind !== "CUSTOM_RELAY_SEND" || !provenMediaId || !normalizedSubmissionId) return null;
+  if (!Number.isInteger(boundIndex) || boundIndex < 0 || boundIndex >= sourceIds.length) return null;
+  if (clean(row.idempotencyKey, 500) !== expectedKey || boundSubmissionId !== normalizedSubmissionId) return null;
+  if (!expectedSourceAccountId || !/^\d{1,20}$/.test(expectedSourceUserId) || !/^[1-9]\d{0,9}$/.test(expectedSourceId)) return null;
+  if (boundTelegramSourceAccountId !== expectedSourceAccountId
+      || boundTelegramSourceUserId !== expectedSourceUserId
+      || boundTelegramMessageId !== expectedSourceId) return null;
+  return provenMediaId;
+}
+
 async function confirmedRelayResult({ agencyId, creatorId, submissionId, expectedIndex, expectedTelegramSourceAccountId, expectedTelegramSourceUserId, expectedTelegramMessageId, db }) {
   const index = Number(expectedIndex);
   if (!Number.isInteger(index) || index < 0) throw fail("CUSTOM_RELAY_PROOF_INDEX_INVALID", "expectedIndex must be a non-negative integer", 400);
@@ -58,4 +93,4 @@ async function confirmedRelaySequence({ agencyId, creatorId, submissionId, expec
   return results;
 }
 
-module.exports = { confirmedRelayResult, confirmedRelaySequence };
+module.exports = { confirmedRelayResult, confirmedRelaySequence, confirmedRelayProofMediaIdForSubmission };

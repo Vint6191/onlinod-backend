@@ -59,3 +59,14 @@ test("Audit17 backend owns Automation action write semantics", () => {
   assert.equal(automationActionWriteSemantics("FOLLOW_FAN"), "IDEMPOTENT_WRITE");
   assert.equal(automationActionWriteSemantics("future_unknown_action"), "NON_IDEMPOTENT_WRITE");
 });
+
+
+test("custom media programmatic policy is terminal pre-wire rather than a blind retry", () => {
+  assert.equal(classifyAutomationFailure({
+    failureCode: "custom_media_programmatic_forbidden",
+    deliveryStatus: "RUNNING",
+    provenNoEffect: true,
+    endpointSemantics: "NON_IDEMPOTENT_WRITE",
+    writeReachedWire: false,
+  }), FAILURE_CATEGORIES.TERMINAL);
+});

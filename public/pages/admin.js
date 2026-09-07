@@ -407,8 +407,6 @@
 
                     <span class="admin-actions">
                       <button class="on-btn" data-toggle-creator="${a()(creator.id)}">${expanded ? "hide" : "inspect"}</button>
-                      <button class="on-btn" data-admin-creator-status="${a()(creator.id)}" data-status="READY">ready</button>
-                      <button class="on-btn" data-admin-creator-status="${a()(creator.id)}" data-status="DISABLED">disable</button>
                       <button class="on-btn danger" data-admin-delete-creator="${a()(creator.id)}">delete</button>
                     </span>
                   </div>
@@ -614,18 +612,6 @@
           },
         });
         if (!result.ok) return window.OnlinodRouter.toast(result.error || "Creator access save failed");
-        await reload(root);
-      });
-    });
-
-    root.querySelectorAll("[data-admin-creator-status]").forEach((el) => {
-      el.addEventListener("click", async () => {
-        const result = await api().request(`/api/admin/creators/${encodeURIComponent(el.dataset.adminCreatorStatus)}/status`, {
-          method: "PATCH",
-          body: { status: el.dataset.status, reason: "manual admin status change" },
-        });
-
-        if (!result.ok) return window.OnlinodRouter.toast(result.error || "Status failed");
         await reload(root);
       });
     });
