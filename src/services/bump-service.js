@@ -6,6 +6,7 @@ const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
+const { classifyProgrammaticCustomMediaProvenance } = require("./custom-content-delivery-service");
 const {
   stableFingerprint,
   taskToTemplate,
@@ -70,13 +71,41 @@ function summarizePlanningSkips(sources = []) {
   return counts;
 }
 
+async function classifyBumpCustomMediaIds({ agencyId, creatorId, mediaIds, db = prisma }) {
+  const normalized = [...new Set((Array.isArray(mediaIds) ? mediaIds : [])
+    .map((mediaId) => clean(mediaId, 240))
+    .filter(Boolean))];
+  const customIds = new Set();
+  for (let offset = 0; offset < normalized.length; offset += 200) {
+    const result = await classifyProgrammaticCustomMediaProvenance({
+      agencyId, creatorId, mediaIds: normalized.slice(offset, offset + 200), db,
+    });
+    if (!result?.ok || !Array.isArray(result.customMediaIds)) {
+      const err = new Error("Bump media provenance check returned an incomplete result");
+      err.code = "AUTOMATION_BUMP_MEDIA_PROVENANCE_INCOMPLETE";
+      throw err;
+    }
+    for (const mediaId of result.customMediaIds) customIds.add(String(mediaId));
+  }
+  return customIds;
+}
+
 async function activeTemplates({ agencyId, creatorId, source, db = prisma }) {
   const rows = await db.automationTask.findMany({
     where: { agencyId, creatorId, type: "bump_online", enabled: true, status: "active", deletedAt: null },
     orderBy: [{ updatedAt: "desc" }, { createdAt: "asc" }],
     take: 500,
   });
-  return rows.map(taskToTemplate).filter((item) => triggerEnabled(item, source) && (item.text || item.mediaFiles.length));
+  const candidates = rows.map(taskToTemplate).filter((item) => triggerEnabled(item, source) && (item.text || item.mediaFiles.length));
+  const allMediaIds = candidates.flatMap((item) => item.mediaFiles);
+  const customIds = await classifyBumpCustomMediaIds({ agencyId, creatorId, mediaIds: allMediaIds, db });
+  const blockedTemplateIds = [];
+  const templates = candidates.filter((item) => {
+    const blocked = item.mediaFiles.some((mediaId) => customIds.has(String(mediaId)));
+    if (blocked) blockedTemplateIds.push(item.id);
+    return !blocked;
+  });
+  return { templates, blockedTemplateIds };
 }
 
 async function currentSubscriberRun({ agencyId, creatorId, db = prisma }) {
@@ -152,8 +181,15 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
               : true;
     if (!sourceEnabled) return { ok: true, source: normalizedSource, planned: 0, skipped: [{ code: "source_disabled" }] };
 
-    const templates = await activeTemplates({ agencyId, creatorId, source: normalizedSource, db: tx });
-    if (!templates.length) return { ok: true, source: normalizedSource, planned: 0, skipped: [{ code: "no_template" }] };
+    const templateSelection = await activeTemplates({ agencyId, creatorId, source: normalizedSource, db: tx });
+    const templates = templateSelection.templates;
+    if (!templates.length) return {
+      ok: true, source: normalizedSource, planned: 0,
+      skipped: [{
+        code: templateSelection.blockedTemplateIds.length ? "custom_media_programmatic_forbidden" : "no_template",
+        ...(templateSelection.blockedTemplateIds.length ? { templateIds: templateSelection.blockedTemplateIds } : {}),
+      }],
+    };
     const take = Math.min(settings.candidateBatchSize, Math.max(1, Number(limit) || settings.candidateBatchSize));
     const candidates = await loadCandidates({ agencyId, creatorId, source: normalizedSource, fanIds, limit: take, db: tx });
     if (!candidates.length) return { ok: true, source: normalizedSource, planned: 0, skipped: [{ code: "no_candidates" }] };
@@ -325,7 +361,17 @@ async function validateBumpDelivery({ delivery, control = null, now = new Date()
   const state = await db.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId: delivery.creatorId, fanId: delivery.fanId } } });
   if (delivery.actionType === SEND_ACTION) {
     if (!delivery.dialogId) return { ok: false, terminal: true, status: "SKIPPED", code: "missing_dialog" };
-    if (!object(payload.template).id) return { ok: false, terminal: true, status: "SKIPPED", code: "no_template" };
+    const template = object(payload.template);
+    if (!template.id) return { ok: false, terminal: true, status: "SKIPPED", code: "no_template" };
+    const customMediaIds = await classifyBumpCustomMediaIds({
+      agencyId: delivery.agencyId, creatorId: delivery.creatorId, mediaIds: template.mediaFiles, db,
+    });
+    if (customMediaIds.size) {
+      return {
+        ok: false, terminal: true, status: "SKIPPED", code: "custom_media_programmatic_forbidden",
+        customMediaIds: [...customMediaIds],
+      };
+    }
     if (state?.blocked) return { ok: false, terminal: true, status: "CANCELED", code: "blocked" };
     if (state?.ignored) return { ok: false, terminal: true, status: "CANCELED", code: "ignored" };
     if (state?.pendingMessageId && state.pendingDeliveryId !== delivery.id) return { ok: false, terminal: true, status: "SKIPPED", code: "pending_reply" };
@@ -839,7 +885,7 @@ async function getBumpOverview({ agencyId, creatorId, db = prisma }) {
 
   const templateCounts = {};
   for (const source of ["online", "hidden_online", "paid_subscriber", "free_subscriber", "subscription_event"]) {
-    templateCounts[source] = (await activeTemplates({ agencyId, creatorId, source, db })).length;
+    templateCounts[source] = (await activeTemplates({ agencyId, creatorId, source, db })).templates.length;
   }
 
   const candidateCounts = { online: 0, hidden_online: 0, paid_subscriber: 0, free_subscriber: 0 };

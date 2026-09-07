@@ -244,6 +244,7 @@ function fakeDb({ submissions = [], orders = [], assets = [], writes = [], teleg
         if (where.agencyId && row.agencyId !== where.agencyId) return false;
         if (where.creatorId && row.creatorId !== where.creatorId) return false;
         if (where.customOrderId && row.customOrderId !== where.customOrderId) return false;
+        if (where.customSubmissionId?.in && !where.customSubmissionId.in.map(String).includes(String(row.customSubmissionId || ""))) return false;
         if (where.kind && typeof where.kind === "string" && row.kind !== where.kind) return false;
         if (where.kind?.in && !where.kind.in.includes(row.kind)) return false;
         if (where.state && typeof where.state === "string" && row.state !== where.state) return false;
@@ -656,6 +657,28 @@ test("awaiting revision queue only keeps the latest rejected version per custom"
   assert.equal(result.items[0].revisionNumber, 1);
   assert.equal(result.items[0].nextRevisionNumber, 2);
   assert.equal(result.items[0].revisionComment, "Redo ending");
+  assert.equal(result.items[0].revisionDispatch.status, "DISPATCH_REQUIRED");
+});
+
+test("awaiting revision queue derives operational dispatch state from the one durable revision intent", async () => {
+  const a = order("custom-a");
+  const revA = submission({ id: "a-v1", customOrderId: a.id, reviewStatus: "REVISION_REQUESTED", reviewComment: "Redo ending", reviewedAt: new Date("2026-08-22T11:00:00Z"), receivedAt: new Date("2026-08-22T10:00:00Z"), customOrder: a, reviewedByMember: { id: "manager-1", displayName: "Manager", roleKey: "manager" } });
+  const telegramIntents = [{
+    id: "revision-a-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: a.id, customSubmissionId: revA.id, kind: "REVISION_REQUEST",
+    state: "COMMITTING", remoteMessageId: null, remoteSentAt: null, createdAt: new Date("2026-08-22T11:00:01Z"),
+  }];
+  const db = fakeDb({ submissions: [revA], orders: [a], telegramIntents });
+  const sending = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db });
+  assert.equal(sending.items[0].revisionDispatch.status, "SENDING");
+  telegramIntents[0].state = "RECONCILE_REQUIRED";
+  const unknown = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db });
+  assert.equal(unknown.items[0].revisionDispatch.status, "DELIVERY_UNKNOWN");
+  telegramIntents[0].state = "CONFIRMED";
+  telegramIntents[0].remoteMessageId = 991;
+  telegramIntents[0].remoteSentAt = new Date("2026-08-22T11:01:00Z");
+  const waiting = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db });
+  assert.equal(waiting.items[0].revisionDispatch.status, "WAITING_MODEL");
+  assert.equal(waiting.items[0].revisionDispatch.providerMessageId, "991");
 });
 
 test("V20.9 keeps revision workflow derived and adds only exact typed asset→submission provenance", () => {

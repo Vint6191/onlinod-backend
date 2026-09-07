@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { listCustomContentReviewQueue, reviewCustomContentSubmission } = require("./custom-content-review-service");
 const { vaultSettlementFingerprint } = require("./custom-content-pipeline-authority-service");
+const { ensureRevisionRequestIntents } = require("./telegram-delivery-authority-service");
 
 
 function receipt(folderId, profileRevision, mediaIds, at = new Date("2026-08-21T14:30:00.000Z")) {
@@ -26,6 +27,22 @@ function fixture() {
   const row = { id: "sub-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", pipelineDisposition: "ACTIVE", executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1, executionPinnedAt: now, ...receipt("vault-1", 1, ["9001", "9002"], now), telegramMessageIds: [101, 102], ofMediaIds: ["9001", "9002"], comment: "two versions", reviewStatus: "WAITING_REVIEW", reviewComment: null, reviewedByMemberId: null, reviewedAt: null, receivedAt: now, createdAt: now, updatedAt: now, creator, customOrder: order, reviewedByMember: null };
   const rows = [row];
   const assets = ["9001", "9002"].map((mediaId) => ({ agencyId: "agency-1", creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "sub-1", customFullPriceCents: 6000, mediaType: "video", thumbUrl: `https://cdn/${mediaId}.jpg`, previewUrl: null, fullUrl: null, folderIds: ["vault-1"], catalogActive: true, sortingStatus: "SORTED" }));
+  const intents = [{
+    id: "task-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", customSubmissionId: null, accountId: "tg-1", kind: "TASK", logicalKey: "task-key", clientIntentId: null, referenceOrdinal: null,
+    payloadFingerprint: "task-fingerprint", payload: {}, state: "CONFIRMED", claimRevision: 0, claimUntil: null, commitStartedAt: now,
+    remoteMessageId: 555, remoteRecipientTelegramUserId: "900001", remoteSentAt: now, outcomeReason: null, confirmationAuthority: "PROVIDER_RECEIPT", confirmedAt: now, createdAt: now, updatedAt: now,
+  }];
+  const pick = (item, select) => { if (!select) return item; const out = {}; for (const [key, enabled] of Object.entries(select)) if (enabled) out[key] = item[key]; return out; };
+  const matchesIntent = (item, where = {}) => {
+    for (const [key, expected] of Object.entries(where || {})) {
+      const actual = item[key];
+      if (expected && typeof expected === "object" && !Array.isArray(expected)) {
+        if (Array.isArray(expected.in) && !expected.in.map(String).includes(String(actual))) return false;
+        if (expected.not != null && String(actual) === String(expected.not)) return false;
+      } else if (expected !== undefined && String(actual) !== String(expected)) return false;
+    }
+    return true;
+  };
   const db = {
     customContentSubmission: {
       findMany: async ({ where, take = 999999, cursor = null, skip = 0, orderBy = [], select = null }) => {
@@ -46,13 +63,57 @@ function fixture() {
           const picked = {}; for (const [key, enabled] of Object.entries(select)) if (enabled) picked[key] = item[key]; return picked;
         });
       },
-      findFirst: async ({ where }) => rows.find((item) => item.id === where.id || (where.customOrderId === item.customOrderId && where.reviewStatus === item.reviewStatus && where.id?.not !== item.id)) || null,
+      findFirst: async ({ where = {}, select = null, orderBy = [] }) => {
+        let found = rows.filter((item) => {
+          if (where.id && typeof where.id !== "object" && String(item.id) !== String(where.id)) return false;
+          if (where.id?.not && String(item.id) === String(where.id.not)) return false;
+          if (where.agencyId && String(item.agencyId) !== String(where.agencyId)) return false;
+          if (where.creatorId && String(item.creatorId) !== String(where.creatorId)) return false;
+          if (where.customOrderId && typeof where.customOrderId !== "object" && String(item.customOrderId) !== String(where.customOrderId)) return false;
+          if (where.reviewStatus && String(item.reviewStatus) !== String(where.reviewStatus)) return false;
+          return true;
+        });
+        const specs = Array.isArray(orderBy) ? orderBy : [orderBy];
+        found.sort((a,b) => { for (const spec of specs) { const [key,dir] = Object.entries(spec || {})[0] || []; if (!key) continue; const av=a[key], bv=b[key]; const cmp=(av instanceof Date || bv instanceof Date) ? new Date(av||0)-new Date(bv||0) : String(av??"").localeCompare(String(bv??"")); if (cmp) return dir === "desc" ? -cmp : cmp; } return 0; });
+        return found.length ? pick(found[0], select) : null;
+      },
       updateMany: async ({ where, data }) => {
         const item = rows.find((candidate) => candidate.id === where.id && candidate.reviewStatus === where.reviewStatus && candidate.updatedAt === where.updatedAt);
         if (!item) return { count: 0 };
         Object.assign(item, data, { updatedAt: new Date(item.updatedAt.getTime() + 1) });
         item.reviewedByMember = data.reviewedByMemberId ? { id: member.id, displayName: "Manager", roleKey: "manager" } : null;
         return { count: 1 };
+      },
+    },
+    agencyTelegramMtprotoAccount: {
+      updateMany: async ({ where }) => ({ count: String(where?.id || "") === "tg-1" ? 1 : 0 }),
+      findFirst: async ({ where, select = null }) => String(where?.id || "") === "tg-1" ? pick({ id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE" }, select) : null,
+    },
+    telegramDeliveryIntent: {
+      findUnique: async ({ where }) => {
+        if (where?.logicalKey) return intents.find((item) => String(item.logicalKey) === String(where.logicalKey)) || null;
+        return null;
+      },
+      findFirst: async ({ where = {}, select = null, orderBy = [] }) => {
+        let found = intents.filter((item) => matchesIntent(item, where));
+        const specs = Array.isArray(orderBy) ? orderBy : [orderBy];
+        found.sort((a,b) => { for (const spec of specs) { const [key,dir] = Object.entries(spec || {})[0] || []; if (!key) continue; const av=a[key], bv=b[key]; const cmp=(av instanceof Date || bv instanceof Date) ? new Date(av||0)-new Date(bv||0) : String(av??"").localeCompare(String(bv??"")); if (cmp) return dir === "desc" ? -cmp : cmp; } return 0; });
+        return found.length ? pick(found[0], select) : null;
+      },
+      findMany: async ({ where = {}, select = null, orderBy = [], take = 999999 }) => {
+        let found = intents.filter((item) => matchesIntent(item, where));
+        const specs = Array.isArray(orderBy) ? orderBy : [orderBy];
+        found.sort((a,b) => { for (const spec of specs) { const [key,dir] = Object.entries(spec || {})[0] || []; if (!key) continue; const av=a[key], bv=b[key]; const cmp=(av instanceof Date || bv instanceof Date) ? new Date(av||0)-new Date(bv||0) : String(av??"").localeCompare(String(bv??"")); if (cmp) return dir === "desc" ? -cmp : cmp; } return 0; });
+        return found.slice(0, take).map((item) => pick(item, select));
+      },
+      create: async ({ data }) => {
+        const created = { id: `intent-${intents.length + 1}`, claimRevision: 0, claimUntil: null, commitStartedAt: null, remoteMessageId: null, remoteRecipientTelegramUserId: null, remoteSentAt: null, outcomeReason: null, confirmationAuthority: null, confirmedAt: null, updatedAt: data.createdAt || now, ...data };
+        intents.push(created); return created;
+      },
+      updateMany: async ({ where = {}, data }) => {
+        let count = 0;
+        for (const item of intents) { if (!matchesIntent(item, where)) continue; Object.assign(item, data, { updatedAt: data.updatedAt || new Date(now.getTime() + 1) }); count += 1; }
+        return { count };
       },
     },
     creatorMediaAsset: { findMany: async ({ where }) => assets.filter((asset) => {
@@ -64,7 +125,7 @@ function fixture() {
     $queryRawUnsafe: async () => [{ id: order.id }],
     $transaction: async (work) => work(db),
   };
-  return { db, member, row, rows, assets };
+  return { db, member, row, rows, assets, intents };
 }
 
 test("manager review queue exposes only finalized custom facts and full payment context", async () => {
@@ -106,15 +167,53 @@ test("approve is final and persists reviewer without mutating the custom order",
   await assert.rejects(() => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "change it", db }), (error) => error.code === "CUSTOM_REVIEW_APPROVAL_FINAL");
 });
 
-test("revision decision is immutable and stores the exact manager instruction", async () => {
-  const { db, member, row } = fixture();
+test("revision decision atomically creates one durable revision dispatch and preserves exact manager instruction", async () => {
+  const { db, member, row, intents } = fixture();
   const result = await reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Need another angle", db });
   assert.equal(result.item.reviewStatus, "REVISION_REQUESTED");
   assert.equal(row.reviewComment, "Need another angle");
+  assert.equal(result.item.revisionDispatch.status, "DISPATCH_PENDING");
+  const revision = intents.filter((intent) => intent.kind === "REVISION_REQUEST");
+  assert.equal(revision.length, 1);
+  assert.equal(revision[0].customSubmissionId, "sub-1");
+  assert.equal(revision[0].state, "PLANNED");
+  assert.equal(revision[0].payload.replyToMessageId, "555");
+  assert.equal(revision[0].payload.recipientTelegramUserId, "900001");
+  assert.equal(revision[0].payload.reviewComment, "Need another angle");
+  assert.match(revision[0].payload.text, /Need another angle/);
+
+  const retry = await reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Need another angle", db });
+  assert.equal(retry.idempotent, true);
+  assert.equal(retry.item.revisionDispatch.intentId, revision[0].id);
+  assert.equal(intents.filter((intent) => intent.kind === "REVISION_REQUEST").length, 1, "manager retry/restart recovery must not create a second revision instruction");
+
   await assert.rejects(() => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }), (error) => error.code === "CUSTOM_REVIEW_ALREADY_DECIDED");
 });
 
 
+
+test("legacy REVISION_REQUESTED decision materializes one PLANNED provider intent without inventing success", async () => {
+  const { db, row, intents } = fixture();
+  row.reviewStatus = "REVISION_REQUESTED";
+  row.reviewComment = "Legacy manager instruction";
+  row.reviewedAt = new Date("2026-08-21T14:10:00.000Z");
+  row.reviewedByMemberId = "manager-1";
+  row.customOrder.telegramTaskMessageId = 555;
+
+  const planned = await ensureRevisionRequestIntents({ agencyId: "agency-1", member: null, limit: 25, now: new Date("2026-08-21T14:30:00.000Z"), db });
+  assert.equal(planned, 1);
+  const revision = intents.find((intent) => intent.kind === "REVISION_REQUEST");
+  assert.ok(revision);
+  assert.equal(revision.customSubmissionId, "sub-1");
+  assert.equal(revision.state, "PLANNED");
+  assert.equal(revision.remoteMessageId, null);
+  assert.equal(revision.confirmedAt, null);
+  assert.equal(revision.payload.reviewComment, "Legacy manager instruction");
+
+  const retry = await ensureRevisionRequestIntents({ agencyId: "agency-1", member: null, limit: 25, now: new Date("2026-08-21T14:31:00.000Z"), db });
+  assert.equal(retry, 0);
+  assert.equal(intents.filter((intent) => intent.kind === "REVISION_REQUEST").length, 1);
+});
 
 test("commit-time review fence rejects APPROVE when cancellation wins the CustomOrder lock", async () => {
   const { db, member, row } = fixture();
@@ -128,6 +227,18 @@ test("commit-time review fence rejects APPROVE when cancellation wins the Custom
     (error) => error?.code === "CUSTOM_REVIEW_ORDER_TERMINAL",
   );
   assert.equal(row.reviewStatus, "WAITING_REVIEW");
+});
+
+test("decision-convergence migration adds exact revision intent identity without inventing provider success", () => {
+  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
+  assert.match(schema, /model TelegramDeliveryIntent[\s\S]*customSubmissionId\s+String\?/);
+  assert.match(schema, /@@index\(\[agencyId, customSubmissionId, kind, createdAt\]\)/);
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260907163000_custom_content_decision_convergence_authority/migration.sql"), "utf8");
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS "customSubmissionId" TEXT/);
+  assert.match(migration, /one_revision_request_per_submission_key/);
+  assert.match(migration, /kind" = 'REVISION_REQUEST'/);
+  assert.match(migration, /CHECK \("kind" IN \('TASK', 'REFERENCE', 'MANUAL_REMINDER', 'AUTO_REMINDER', 'CANCELLATION', 'REVISION_REQUEST'\)\)/);
+  assert.match(migration, /no synthetic receipt/i);
 });
 
 test("V20.5 migration keeps review typed and enforces one approved version per custom", () => {

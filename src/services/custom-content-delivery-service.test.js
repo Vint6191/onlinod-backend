@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { listCustomReadyDeliveries, getCustomReadyDelivery, preflightCustomManualSend, preflightProgrammaticCustomMedia } = require("./custom-content-delivery-service");
+const { listCustomReadyDeliveries, getCustomReadyDelivery, preflightCustomManualSend, preflightProgrammaticCustomMedia, classifyDialogComposerMediaAvailability } = require("./custom-content-delivery-service");
 const { vaultSettlementFingerprint } = require("./custom-content-pipeline-authority-service");
 
 
@@ -197,6 +197,65 @@ test("V20.9 delivery readiness requires assets from the exact approved submissio
   assert.deepEqual(result.items, [], "rejected/older version assets must never satisfy a newer approved submission");
 });
 
+
+test("dialog-composer availability keeps generic media visible and only exposes exact ready CUSTOM media in its canonical dialog", async () => {
+  const { db, member } = fixture();
+  const result = await classifyDialogComposerMediaAvailability({
+    agencyId: "agency-1", member, creatorId: "creator-1", dialogId: "777", mediaIds: ["general-1", "9001", "9002"], db,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.matched, true);
+  assert.deepEqual(result.blockedMediaIds, []);
+  assert.deepEqual(result.items.map((item) => [item.mediaId, item.custom, item.allow]), [
+    ["general-1", false, true],
+    ["9001", true, true],
+    ["9002", true, true],
+  ]);
+
+  const wrongDialog = await classifyDialogComposerMediaAvailability({
+    agencyId: "agency-1", member, creatorId: "creator-1", dialogId: "other-dialog", mediaIds: ["9001"], db,
+  });
+  assert.deepEqual(wrongDialog.blockedMediaIds, ["9001"]);
+  assert.equal(wrongDialog.items[0].code, "CUSTOM_DELIVERY_CONTEXT_MISMATCH");
+});
+
+test("dialog-composer availability hides WAITING_REVIEW / REVISION_REQUESTED / terminal CUSTOM media instead of turning review state into catalog state", async () => {
+  const { db, member, row, order } = fixture();
+  for (const reviewStatus of ["WAITING_REVIEW", "REVISION_REQUESTED"]) {
+    row.reviewStatus = reviewStatus;
+    const result = await classifyDialogComposerMediaAvailability({
+      agencyId: "agency-1", member, creatorId: "creator-1", dialogId: "777", mediaIds: ["9001"], db,
+    });
+    assert.deepEqual(result.blockedMediaIds, ["9001"]);
+    assert.equal(result.items[0].code, "CUSTOM_DELIVERY_NOT_READY");
+  }
+  row.reviewStatus = "APPROVED";
+  order.fanDeliveredAt = new Date();
+  const terminal = await classifyDialogComposerMediaAvailability({
+    agencyId: "agency-1", member, creatorId: "creator-1", dialogId: "777", mediaIds: ["9001"], db,
+  });
+  assert.deepEqual(terminal.blockedMediaIds, ["9001"]);
+  assert.equal(terminal.items[0].code, "CUSTOM_DELIVERY_NOT_READY");
+});
+
+test("dialog-composer availability fails closed for missing/drifted CUSTOM projection while preserving submission provenance", async () => {
+  const { db, member, assets } = fixture();
+  assets.splice(0, assets.length);
+  const missing = await classifyDialogComposerMediaAvailability({
+    agencyId: "agency-1", member, creatorId: "creator-1", dialogId: "777", mediaIds: ["9001"], db,
+  });
+  assert.equal(missing.items[0].custom, true);
+  assert.equal(missing.items[0].allow, false);
+  assert.equal(missing.items[0].code, "CUSTOM_DELIVERY_NOT_READY");
+
+  const next = fixture();
+  next.assets[0].customSubmissionId = "stale-submission";
+  const drifted = await classifyDialogComposerMediaAvailability({
+    agencyId: "agency-1", member: next.member, creatorId: "creator-1", dialogId: "777", mediaIds: ["9001"], db: next.db,
+  });
+  assert.equal(drifted.items[0].custom, true);
+  assert.equal(drifted.items[0].allow, false);
+});
 
 test("manual-send preflight allows generic media but exact-preflights any CUSTOM media", async () => {
   const { db, member, assets } = fixture();

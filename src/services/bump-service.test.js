@@ -107,3 +107,49 @@ test("Bump planning diagnostics aggregate explicit skip codes", () => {
     { cooldown: 2, no_template: 1, snapshot_not_ready: 1 },
   );
 });
+
+test("legacy Bump SEND_MESSAGE with CUSTOM media is terminal before claim or manual retry", async () => {
+  const previousLoad = Module._load;
+  Module._load = function load(request, parent, isMain) {
+    if (request === "../prisma" && parent?.filename?.endsWith("bump-service.js")) return {};
+    if (request === "./automation-pacing-service" && parent?.filename?.endsWith("bump-service.js")) {
+      return { nextAutomationWriteSlot: async () => new Date() };
+    }
+    if (request === "./custom-content-delivery-service" && parent?.filename?.endsWith("bump-service.js")) {
+      return {
+        classifyProgrammaticCustomMediaProvenance: async ({ mediaIds }) => ({
+          ok: true,
+          matched: true,
+          allow: false,
+          code: "CUSTOM_MEDIA_PROGRAMMATIC_FORBIDDEN",
+          customMediaIds: mediaIds.map(String),
+        }),
+      };
+    }
+    return previousLoad.call(this, request, parent, isMain);
+  };
+  delete require.cache[require.resolve("./bump-service")];
+  const { validateBumpDelivery } = require("./bump-service");
+  Module._load = previousLoad;
+
+  const result = await validateBumpDelivery({
+    delivery: {
+      id: "legacy-custom-delivery",
+      agencyId: "agency-1",
+      creatorId: "creator-1",
+      moduleKey: "bumps",
+      actionType: "SEND_MESSAGE",
+      dialogId: "dialog-1",
+      fanId: "fan-1",
+      payload: { source: "manual", template: { id: "template-1", mediaFiles: [101, 202] } },
+    },
+    control: { modules: { bumps: { settings: {} } } },
+    db: { automationBumpFanState: { findUnique: async () => null } },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.terminal, true);
+  assert.equal(result.status, "SKIPPED");
+  assert.equal(result.code, "custom_media_programmatic_forbidden");
+  assert.deepEqual(result.customMediaIds, ["101", "202"]);
+});

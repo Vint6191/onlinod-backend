@@ -242,7 +242,7 @@ async function runSubmissionTransaction(client, work) {
   return typeof client?.$transaction === "function" ? client.$transaction(work) : work(client);
 }
 
-async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, excludeSubmissionId = null, db }) {
+async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, excludeSubmissionId = null, revisionSourceIntentId = null, revisionSentAt = null, allowUnprovenRevision = false, db }) {
   if (!customOrderId) return;
   const exclude = excludeSubmissionId ? { id: { not: excludeSubmissionId } } : {};
   const approved = await db.customContentSubmission.findFirst({
@@ -261,6 +261,20 @@ async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOr
   if (String(latest.reviewStatus || REVIEW_WAITING) !== REVIEW_REVISION) {
     throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "This custom order already has an active content submission awaiting manager review", 409);
   }
+  if (allowUnprovenRevision) return;
+  const revisionIntent = db.telegramDeliveryIntent?.findFirst ? await db.telegramDeliveryIntent.findFirst({
+    where: { agencyId, customOrderId, customSubmissionId: latest.id, kind: "REVISION_REQUEST", state: "CONFIRMED" },
+    select: { id: true, remoteSentAt: true, confirmedAt: true },
+    orderBy: [{ confirmedAt: "desc" }, { createdAt: "desc" }],
+  }) : null;
+  if (!revisionIntent) {
+    throw fail("CUSTOM_SUBMISSION_REVISION_DISPATCH_UNCONFIRMED", "The manager revision instruction is not provider-confirmed yet; incoming media requires review/correlation instead of automatic next-version assignment", 409);
+  }
+  if (revisionSourceIntentId && String(revisionSourceIntentId) === String(revisionIntent.id)) return;
+  const sent = revisionSentAt ? new Date(revisionSentAt) : null;
+  const remoteSent = revisionIntent.remoteSentAt ? new Date(revisionIntent.remoteSentAt) : null;
+  if (sent && remoteSent && Number.isFinite(sent.getTime()) && Number.isFinite(remoteSent.getTime()) && sent.getTime() >= remoteSent.getTime()) return;
+  throw fail("CUSTOM_SUBMISSION_REVISION_CAUSALITY_UNPROVEN", "Incoming media is not causally after the confirmed revision instruction; manager review is required", 409);
 }
 
 async function createCustomContentSubmission({ agencyId, member, input = {}, now = new Date(), db = null } = {}) {
@@ -330,7 +344,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
       });
 
       const target = await validateContentOrder({ agencyId, creatorId, customOrderId, db: tx });
-      await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: tx });
+      await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, allowUnprovenRevision: true, db: tx });
 
       // Re-evaluate the CURRENT active-thread context inside the same transaction that claims
       // provider messages. A unique/ambiguous active thread may constrain a historical import;
@@ -384,7 +398,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
         assertManualImportTargetMatches(row, customOrderId);
       } else {
         await bindContentOrderForSubmission({ agencyId, creatorId, customOrderId, now, db: tx });
-        await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, db: tx });
+        await validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, allowUnprovenRevision: true, db: tx });
         row = await tx.customContentSubmission.create({ data: {
           id: submissionId, agencyId, creatorId, customOrderId,
           telegramMessageIds: messageIds,
@@ -533,7 +547,7 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
   if (customOrderId) {
     try {
       await validateContentOrder({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, db: client });
-      await validateSubmissionLifecycleTarget({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, db: client });
+      await validateSubmissionLifecycleTarget({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, revisionSourceIntentId: event.threadAnchorIntentId || null, revisionSentAt: event.sentAt || now, db: client });
     } catch (error) {
       if (!["CUSTOM_SUBMISSION_ORDER_BUSY", "CUSTOM_SUBMISSION_ORDER_ALREADY_APPROVED", "CUSTOM_SUBMISSION_ORDER_CLOSED"].includes(String(error?.code || ""))) throw error;
       customOrderId = null;
@@ -555,7 +569,7 @@ async function createCustomContentSubmissionFromInboundEvent({ eventId, actorUse
       }
       if (customOrderId) {
         await bindContentOrderForSubmission({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, now, db: tx });
-        await validateSubmissionLifecycleTarget({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, db: tx });
+        await validateSubmissionLifecycleTarget({ agencyId: event.agencyId, creatorId: event.creatorId, customOrderId, revisionSourceIntentId: event.threadAnchorIntentId || null, revisionSentAt: event.sentAt || now, db: tx });
       }
       return tx.customContentSubmission.create({ data: {
         id: submissionId,
@@ -632,7 +646,7 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   if (String(row.reviewStatus || REVIEW_WAITING) !== REVIEW_WAITING) {
     throw fail("CUSTOM_SUBMISSION_REVIEW_LOCKED", "Reviewed submissions cannot be reassigned", 409);
   }
-  await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, db: client });
+  await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, allowUnprovenRevision: true, db: client });
   let updated;
   try {
     updated = await runSubmissionTransaction(client, async (tx) => {
@@ -640,7 +654,7 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
       await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: row.creatorId });
       if (normalizedOrderId) {
         await bindContentOrderForSubmission({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, now, db: tx });
-        await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, db: tx });
+        await validateSubmissionLifecycleTarget({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, excludeSubmissionId: row.id, allowUnprovenRevision: true, db: tx });
       }
       const changed = await tx.customContentSubmission.updateMany({
         where: { id: row.id, agencyId, pipelineDisposition: ACTIVE, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
@@ -702,7 +716,6 @@ async function pendingRelayProjectionRows({ agencyId, scope, limit, now = new Da
         AND relay."status" = 'COMPLETED'
         AND relay."idempotencyKey" = ('custom-relay:' || submission."id" || ':' || cardinality(submission."ofMediaIds")::text)
        WHERE submission."agencyId" = $1
-         AND submission."pipelineDisposition" IN ('ACTIVE', 'SALVAGE')
          ${scopeSql}
          AND (submission."pipelineNextAttemptAt" IS NULL OR submission."pipelineNextAttemptAt" <= ${nowParam})
          AND cardinality(submission."ofMediaIds") < cardinality(submission."telegramMessageIds")
@@ -721,7 +734,6 @@ async function pendingRelayProjectionRows({ agencyId, scope, limit, now = new Da
     const rows = await db.customContentSubmission.findMany({
       where: {
         agencyId,
-        pipelineDisposition: { in: [ACTIVE, SALVAGE] },
         AND: [{ OR: [{ pipelineNextAttemptAt: null }, { pipelineNextAttemptAt: { lte: now } }] }],
         ...(scope?.broad ? {} : { creatorId: { in: scopedIds } }),
       },

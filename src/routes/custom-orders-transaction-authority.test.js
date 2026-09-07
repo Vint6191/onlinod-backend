@@ -53,6 +53,16 @@ test("client-supplied OF mediaId is rejected and media projection calls the serv
 
 
 
+test("F47 dialog-composer availability is device-bound and derives publish usability from exact creator/dialog/media context", () => {
+  const availability = block('router.post("/ready-deliveries/media-availability"', 'router.post("/ready-deliveries/programmatic-media-preflight"');
+  assert.match(availability, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);
+  assert.match(availability, /classifyDialogComposerMediaAvailability\s*\(/);
+  assert.match(availability, /creatorId:\s*req\.body\?\.creatorId/);
+  assert.match(availability, /dialogId:\s*req\.body\?\.dialogId/);
+  assert.match(availability, /mediaIds:\s*req\.body\?\.mediaIds/);
+  assert.doesNotMatch(availability, /reviewStatus:\s*req\.body|customOrderId:\s*req\.body|submissionId:\s*req\.body/);
+});
+
 test("programmatic CUSTOM-media preflight is product-device bound and derives provenance only from actual media IDs", () => {
   const preflight = block('router.post("/ready-deliveries/programmatic-media-preflight"', 'router.post("/ready-deliveries/commit"');
   assert.match(preflight, /requireProductDevice\(req,\s*req\.body\?\.deviceId\)/);

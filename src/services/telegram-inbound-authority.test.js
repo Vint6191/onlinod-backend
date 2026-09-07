@@ -688,6 +688,79 @@ test("closure 02: current creator Telegram binding may change while Reply to the
   assert.equal(fx.events.find((row)=>Number(row.messageId)===11002).threadResolutionType,"DIRECT_REPLY");
 });
 
+
+function seedRevisionDecision(fx, { state = null, remoteSentAt = null, remoteMessageId = 760 } = {}) {
+  fx.orders[0].contentBoundAt = new Date(fx.now.getTime() - 20_000);
+  fx.submissions.push({
+    id: "submission-revision-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "REVISION_REQUESTED", reviewComment: "Redo ending",
+    reviewedByMemberId: "member-1", reviewedAt: new Date(fx.now.getTime() - 10_000),
+    telegramMessageIds: [650], telegramInboundEventIds: ["source-v1"], telegramSourceKey: "source-v1",
+    telegramSourceAccountId: "tg-1", telegramSourceUserId: "900001", sourceAuthority: "PROVIDER_ACTIVE_THREAD",
+    sourceThreadIntentId: "intent-task", sourceResolutionEventId: "source-v1", ofMediaIds: ["of-v1"], comment: null,
+    receivedAt: new Date(fx.now.getTime() - 30_000), createdAt: new Date(fx.now.getTime() - 30_000), updatedAt: new Date(fx.now.getTime() - 10_000),
+  });
+  if (state) {
+    fx.intents.push({
+      id: "intent-revision-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+      customSubmissionId: "submission-revision-v1", accountId: "tg-1", kind: "REVISION_REQUEST", state,
+      remoteMessageId: state === "CONFIRMED" ? remoteMessageId : null, remoteRecipientTelegramUserId: "900001",
+      remoteSentAt: remoteSentAt || (state === "CONFIRMED" ? new Date(fx.now.getTime() - 5_000) : null),
+      confirmedAt: state === "CONFIRMED" ? new Date(fx.now.getTime() - 4_000) : null,
+      createdAt: new Date(fx.now.getTime() - 9_000),
+    });
+  }
+}
+
+test("F46 revision media before provider-confirmed instruction stays REVIEW_REQUIRED instead of becoming V2", async()=>{
+  const fx=fixture();
+  seedRevisionDecision(fx,{state:"COMMITTING"});
+  await ingest(fx,{messageId:11003,replyToMessageId:null,hasMedia:true,sentAt:new Date(fx.now.getTime()+1000).toISOString()});
+  const row=fx.events.find((event)=>Number(event.messageId)===11003);
+  assert.equal(row.projectionState,"REVIEW_REQUIRED");
+  assert.equal(row.projectionReason,"CUSTOM_SUBMISSION_REVISION_DISPATCH_UNCONFIRMED");
+  assert.equal(row.submissionId,null);
+  assert.equal(fx.submissions.length,1,"provider media must be preserved without fabricating a second submission version");
+});
+
+test("F46 direct Reply to the exact confirmed revision instruction is strongest proof for V2", async()=>{
+  const fx=fixture();
+  seedRevisionDecision(fx,{state:"CONFIRMED",remoteMessageId:760});
+  await ingest(fx,{messageId:11007,replyToMessageId:760,hasMedia:true,sentAt:new Date(fx.now.getTime()+1000).toISOString()});
+  const row=fx.events.find((event)=>Number(event.messageId)===11007);
+  assert.equal(row.threadResolutionType,"DIRECT_REPLY");
+  assert.equal(row.threadAnchorIntentId,"intent-revision-v1");
+  assert.equal(row.projectionState,"APPLIED");
+  assert.ok(row.submissionId);
+  const next=fx.submissions.find((item)=>String(item.id)===String(row.submissionId));
+  assert.equal(next.customOrderId,"order-1");
+  assert.equal(next.sourceThreadIntentId,"intent-revision-v1");
+});
+
+test("F46 unique non-Reply media after confirmed revision remoteSentAt is deterministic temporal revision proof", async()=>{
+  const fx=fixture();
+  const remoteSentAt=new Date(fx.now.getTime()-5000);
+  seedRevisionDecision(fx,{state:"CONFIRMED",remoteSentAt,remoteMessageId:761});
+  await ingest(fx,{messageId:11008,replyToMessageId:null,hasMedia:true,sentAt:new Date(fx.now.getTime()+1000).toISOString()});
+  const row=fx.events.find((event)=>Number(event.messageId)===11008);
+  assert.equal(row.threadResolutionType,"UNIQUE_ACTIVE_THREAD");
+  assert.equal(row.threadAnchorIntentId,"intent-task","non-Reply provenance stays anchored to the active TASK thread");
+  assert.equal(row.projectionState,"APPLIED");
+  assert.ok(row.submissionId);
+});
+
+test("F46 non-Reply media timestamped before confirmed revision instruction is REVIEW_REQUIRED", async()=>{
+  const fx=fixture();
+  const remoteSentAt=new Date(fx.now.getTime()+5000);
+  seedRevisionDecision(fx,{state:"CONFIRMED",remoteSentAt,remoteMessageId:762});
+  await ingest(fx,{messageId:11009,replyToMessageId:null,hasMedia:true,sentAt:new Date(fx.now.getTime()+1000).toISOString()});
+  const row=fx.events.find((event)=>Number(event.messageId)===11009);
+  assert.equal(row.projectionState,"REVIEW_REQUIRED");
+  assert.equal(row.projectionReason,"CUSTOM_SUBMISSION_REVISION_CAUSALITY_UNPROVEN");
+  assert.equal(row.submissionId,null);
+  assert.equal(fx.submissions.length,1);
+});
+
 test("closure 04: two active threads for one non-Reply sender become REVIEW_REQUIRED and never auto-create a submission", async()=>{
   const fx=fixture();
   fx.orders.push({...clone(fx.orders[0]),id:"order-b",creatorId:"creator-2",telegramTaskMessageId:702,contentBoundAt:null,updatedAt:new Date(fx.now)});

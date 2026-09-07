@@ -1139,7 +1139,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
   if (!["FAILED", "SKIPPED", "CANCELED", "PAUSED"].includes(delivery.status)) {
     throw new ActionDeliveryError("DELIVERY_NOT_RETRYABLE", `Delivery status ${delivery.status} cannot be retried`);
   }
-  if (delivery.failureCode && ["permission_denied", "invalid_payload", "fan_not_found", "blocked", "creator_revoked"].includes(delivery.failureCode)) {
+  if (delivery.failureCode && ["permission_denied", "invalid_payload", "fan_not_found", "blocked", "creator_revoked", "custom_media_programmatic_forbidden"].includes(delivery.failureCode)) {
     throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Failure ${delivery.failureCode} requires a new action generation`);
   }
   const control = await assertDeliveryControl(delivery);

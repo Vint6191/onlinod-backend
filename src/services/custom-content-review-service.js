@@ -5,7 +5,8 @@ const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { isCompleteSubmission, uniqueMediaIds } = require("./custom-content-library-service");
 const { paymentSnapshot } = require("./custom-orders-service");
-const { hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, derivePipelineStage } = require("./custom-content-pipeline-authority-service");
+const { hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, derivePipelineStage, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
+const { planRevisionRequestIntentForReviewedSubmission, revisionDispatchProjection } = require("./telegram-delivery-authority-service");
 
 const REVIEW_WAITING = "WAITING_REVIEW";
 const REVIEW_REVISION = "REVISION_REQUESTED";
@@ -138,6 +139,23 @@ function isFinalizedForReview(row, assetByKey) {
       && customAssetMatchesPipelineProjection(row, asset, row.customOrder);
   });
 }
+async function loadRevisionDispatchMap(db, agencyId, rows) {
+  const ids = Array.from(new Set((rows || []).filter((row) => String(row.reviewStatus || "") === REVIEW_REVISION).map((row) => String(row.id)).filter(Boolean)));
+  if (!ids.length || !db.telegramDeliveryIntent?.findMany) return new Map();
+  const intents = await db.telegramDeliveryIntent.findMany({
+    where: { agencyId, kind: "REVISION_REQUEST", customSubmissionId: { in: ids } },
+    select: { id: true, customSubmissionId: true, state: true, remoteMessageId: true, remoteSentAt: true, createdAt: true },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: ids.length,
+  });
+  const map = new Map();
+  for (const intent of intents || []) {
+    const key = String(intent.customSubmissionId || "");
+    if (key && !map.has(key)) map.set(key, revisionDispatchProjection(intent));
+  }
+  return map;
+}
+
 function serializeReviewItem(row, assetByKey, revisionContext = null) {
   const order = row.customOrder;
   const creator = order?.creator || row.creator || null;
@@ -254,6 +272,7 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
       : [];
     const approvedOrders = new Set(approvedRows.map((row) => String(row.customOrderId)));
     const revisionContext = await loadRevisionContext(client, agencyId, validRows);
+    const revisionDispatchMap = await loadRevisionDispatchMap(client, agencyId, validRows);
     for (const row of rows) {
       scanCursor = String(row.id);
       if (!validIds.has(scanCursor)) continue;
@@ -262,7 +281,9 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
       const stage = derivePipelineStage({ submission: row, order: row.customOrder, finalized, blockedCode: row.pipelineBlockedCode });
       const expectedStage = normalizedStatus === REVIEW_APPROVED ? "APPROVED_DELIVERY_READY" : normalizedStatus === REVIEW_REVISION ? "REVISION_WAITING" : "REVIEW_READY";
       if (stage !== expectedStage) continue;
-      items.push(serializeReviewItem(row, assetByKey, revisionContext.get(scanCursor)));
+      const item = serializeReviewItem(row, assetByKey, revisionContext.get(scanCursor));
+      if (normalizedStatus === REVIEW_REVISION) item.revisionDispatch = revisionDispatchMap.get(scanCursor) || revisionDispatchProjection(null);
+      items.push(item);
       if (items.length >= take) break;
     }
     if (items.length >= take) break;
@@ -303,12 +324,17 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
   // CustomOrder lock and remains the commit-time source of truth.
   const target = await client.customContentSubmission.findFirst({
     where: { id: normalizedSubmissionId, agencyId },
-    select: { id: true, customOrderId: true },
+    select: { id: true, customOrderId: true, creatorId: true },
   });
   if (!target) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
   if (!target.customOrderId) throw fail("CUSTOM_REVIEW_ORDER_REQUIRED", "Submission must be assigned to a CONTENT custom order", 409);
 
   const applyReview = async (tx) => {
+    // Shared lifecycle order: Agency -> Creator -> CustomOrder. Revision planning
+    // later takes the Telegram-account row under the same transaction, so review
+    // cannot deadlock creator/account retirement by taking CustomOrder first.
+    await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: target.creatorId });
     // Cancellation mutates this same CustomOrder row in its transaction. Taking
     // FOR UPDATE first creates one linear commit boundary:
     //   review-lock -> review commit -> cancellation
@@ -336,7 +362,9 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
     if (currentStatus === REVIEW_REVISION) {
       if (normalizedAction === "REQUEST_REVISION" && (row.reviewComment || null) === normalizedComment) {
         const revisionContext = await loadRevisionContext(tx, agencyId, [row]);
-        return { idempotent: true, row, assetByKey, item: serializeReviewItem(row, assetByKey, revisionContext.get(String(row.id))) };
+        const context = revisionContext.get(String(row.id));
+        const intent = await planRevisionRequestIntentForReviewedSubmission({ agencyId, member, submission: row, order: row.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx });
+        return { idempotent: true, row, assetByKey, item: { ...serializeReviewItem(row, assetByKey, context), revisionDispatch: revisionDispatchProjection(intent) } };
       }
       throw fail("CUSTOM_REVIEW_ALREADY_DECIDED", "This submission already has a review decision", 409);
     }
@@ -370,12 +398,16 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
     const updated = await tx.customContentSubmission.findFirst({ where: { id: row.id, agencyId }, include: REVIEW_INCLUDE });
     if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after review", 404);
     const revisionContext = await loadRevisionContext(tx, agencyId, [updated]);
+    const context = revisionContext.get(String(updated.id));
+    const revisionIntent = nextStatus === REVIEW_REVISION
+      ? await planRevisionRequestIntentForReviewedSubmission({ agencyId, member, submission: updated, order: updated.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx })
+      : null;
     return {
       idempotent: false,
       row: updated,
       previousRow: row,
       assetByKey,
-      item: serializeReviewItem(updated, assetByKey, revisionContext.get(String(updated.id))),
+      item: { ...serializeReviewItem(updated, assetByKey, context), ...(revisionIntent ? { revisionDispatch: revisionDispatchProjection(revisionIntent) } : {}) },
       nextStatus,
     };
   };

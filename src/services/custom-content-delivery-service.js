@@ -239,7 +239,7 @@ async function resolveAttemptedCustomMedia({ client, agencyId, creatorId, attemp
   };
 }
 
-async function preflightProgrammaticCustomMedia({ agencyId, member, creatorId, mediaIds, db = null } = {}) {
+async function classifyProgrammaticCustomMediaProvenance({ agencyId, creatorId, mediaIds, db = null } = {}) {
   const client = db || require("../prisma");
   const creator = clean(creatorId, 180);
   const rawAttempted = Array.isArray(mediaIds) ? mediaIds : [];
@@ -251,10 +251,9 @@ async function preflightProgrammaticCustomMedia({ agencyId, member, creatorId, m
     seenAttempted.add(mediaId);
     attemptedMediaIds.push(mediaId);
   }
-  if (attemptedMediaIds.length > 200) throw fail("CUSTOM_DELIVERY_MEDIA_LIMIT", "Too many media IDs for one programmatic send (max 200)", 413);
+  if (attemptedMediaIds.length > 200) throw fail("CUSTOM_DELIVERY_MEDIA_LIMIT", "Too many media IDs for one programmatic provenance check (max 200)", 413);
   if (!creator) throw fail("CUSTOM_DELIVERY_PREFLIGHT_CONTEXT_REQUIRED", "creatorId is required");
   if (!attemptedMediaIds.length) return { ok: true, matched: false, allow: true, code: null, customMediaIds: [] };
-  await allowedCreatorScope({ agencyId, member, requestedCreatorId: creator, db: client });
   const provenance = await resolveAttemptedCustomMedia({ client, agencyId, creatorId: creator, attemptedMediaIds });
   const customMediaIds = attemptedMediaIds.filter((mediaId) => provenance.customIds.has(mediaId));
   if (!customMediaIds.length) return { ok: true, matched: false, allow: true, code: null, customMediaIds: [] };
@@ -265,6 +264,100 @@ async function preflightProgrammaticCustomMedia({ agencyId, member, creatorId, m
     code: "CUSTOM_MEDIA_PROGRAMMATIC_FORBIDDEN",
     error: "CUSTOM media may only be sent through the exact Custom delivery flow, never through automation/campaign programmatic writers",
     customMediaIds,
+  };
+}
+
+async function preflightProgrammaticCustomMedia({ agencyId, member, creatorId, mediaIds, db = null } = {}) {
+  const client = db || require("../prisma");
+  const creator = clean(creatorId, 180);
+  if (!creator) throw fail("CUSTOM_DELIVERY_PREFLIGHT_CONTEXT_REQUIRED", "creatorId is required");
+  await allowedCreatorScope({ agencyId, member, requestedCreatorId: creator, db: client });
+  return classifyProgrammaticCustomMediaProvenance({ agencyId, creatorId: creator, mediaIds, db: client });
+}
+
+async function classifyDialogComposerMediaAvailability({ agencyId, member, creatorId, dialogId, mediaIds, db = null } = {}) {
+  const client = db || require("../prisma");
+  await requireDeliveryAccess({ agencyId, member, db: client });
+  const creator = clean(creatorId, 180);
+  const dialog = clean(dialogId, 180);
+  const rawAttempted = Array.isArray(mediaIds) ? mediaIds : [];
+  const attemptedMediaIds = [];
+  const seenAttempted = new Set();
+  for (const raw of rawAttempted) {
+    const mediaId = clean(raw, 240);
+    if (!mediaId || seenAttempted.has(mediaId)) continue;
+    seenAttempted.add(mediaId);
+    attemptedMediaIds.push(mediaId);
+  }
+  if (attemptedMediaIds.length > 500) throw fail("CUSTOM_DELIVERY_MEDIA_LIMIT", "Too many media IDs for one dialog-composer availability read (max 500)", 413);
+  if (!creator || !dialog) throw fail("CUSTOM_DELIVERY_PREFLIGHT_CONTEXT_REQUIRED", "creatorId and dialogId are required");
+  if (!attemptedMediaIds.length) {
+    return { ok: true, creatorId: creator, dialogId: dialog, matched: false, items: [], customMediaIds: [], blockedMediaIds: [] };
+  }
+  await allowedCreatorScope({ agencyId, member, requestedCreatorId: creator, db: client });
+
+  const { customAssets, provenanceRows, customIds } = await resolveAttemptedCustomMedia({
+    client, agencyId, creatorId: creator, attemptedMediaIds,
+  });
+  if (!customIds.size) {
+    return {
+      ok: true, creatorId: creator, dialogId: dialog, matched: false,
+      items: attemptedMediaIds.map((mediaId) => ({ mediaId, custom: false, allow: true, code: null })),
+      customMediaIds: [], blockedMediaIds: [],
+    };
+  }
+
+  const refsByMedia = new Map();
+  const addRef = (mediaIdInput, submissionIdInput, orderIdInput) => {
+    const mediaId = clean(mediaIdInput, 240);
+    const submissionId = clean(submissionIdInput, 180);
+    const orderId = clean(orderIdInput, 180);
+    if (!mediaId || !customIds.has(mediaId) || !submissionId) return;
+    let refs = refsByMedia.get(mediaId);
+    if (!refs) { refs = new Map(); refsByMedia.set(mediaId, refs); }
+    refs.set(`${submissionId}\n${orderId}`, { submissionId, orderId: orderId || null });
+  };
+  for (const asset of customAssets || []) addRef(asset.mediaId, asset.customSubmissionId, asset.customOrderId);
+  for (const row of provenanceRows || []) {
+    for (const mediaId of uniqueMediaIds(row.ofMediaIds)) addRef(mediaId, row.id, row.customOrderId);
+  }
+
+  const submissionIds = [...new Set([...refsByMedia.values()].flatMap((refs) => [...refs.values()].map((ref) => ref.submissionId)))];
+  const rows = submissionIds.length ? await client.customContentSubmission.findMany({
+    where: { agencyId, creatorId: creator, id: { in: submissionIds } },
+    include: DELIVERY_INCLUDE,
+    take: submissionIds.length,
+  }) : [];
+  const rowById = new Map((rows || []).map((row) => [clean(row.id, 180), row]));
+  const assets = await loadAssets(client, agencyId, rows || []);
+
+  const items = attemptedMediaIds.map((mediaId) => {
+    if (!customIds.has(mediaId)) return { mediaId, custom: false, allow: true, code: null };
+    const refs = refsByMedia.get(mediaId);
+    if (!refs || refs.size !== 1) {
+      return { mediaId, custom: true, allow: false, code: "CUSTOM_DELIVERY_AMBIGUOUS_MEDIA" };
+    }
+    const ref = [...refs.values()][0];
+    const row = rowById.get(ref.submissionId);
+    if (!row || (ref.orderId && clean(row.customOrderId, 180) !== ref.orderId)) {
+      return { mediaId, custom: true, allow: false, code: "CUSTOM_DELIVERY_NOT_READY" };
+    }
+    if (!isReady(row, assets)) {
+      return { mediaId, custom: true, allow: false, code: "CUSTOM_DELIVERY_NOT_READY" };
+    }
+    const order = row.customOrder;
+    if (!order || clean(order.dialogId, 180) !== dialog) {
+      return { mediaId, custom: true, allow: false, code: "CUSTOM_DELIVERY_CONTEXT_MISMATCH" };
+    }
+    if (!uniqueMediaIds(row.ofMediaIds).includes(mediaId)) {
+      return { mediaId, custom: true, allow: false, code: "CUSTOM_DELIVERY_STALE_MEDIA" };
+    }
+    return { mediaId, custom: true, allow: true, code: null, customOrderId: clean(order.id, 180), submissionId: clean(row.id, 180) };
+  });
+  return {
+    ok: true, creatorId: creator, dialogId: dialog, matched: true, items,
+    customMediaIds: items.filter((item) => item.custom).map((item) => item.mediaId),
+    blockedMediaIds: items.filter((item) => item.custom && !item.allow).map((item) => item.mediaId),
   };
 }
 
@@ -333,6 +426,8 @@ module.exports = {
   getCustomReadyDelivery,
   preflightCustomManualSend,
   preflightProgrammaticCustomMedia,
+  classifyProgrammaticCustomMediaProvenance,
+  classifyDialogComposerMediaAvailability,
   CUSTOM_DELIVERY_OVERDUE_MS,
   loadAssets,
   isReady,

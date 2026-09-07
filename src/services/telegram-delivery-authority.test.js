@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const {
   CLAIM_MS,
   planTelegramDeliveryIntent,
+  planRevisionRequestIntentForReviewedSubmission,
   listTelegramDeliveryWork,
   claimTelegramDeliveryIntent,
   beginTelegramDeliveryIntent,
@@ -63,10 +64,11 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
   const orders = [{ id: "order-1", agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-1", scenario: "custom", type: "CONTENT", status: "PENDING", telegramTaskMessageId: null, telegramReferenceMessageIds: [], deliveredAt: null, lastReminderAt: null, lastReminderKey: null, nextReminderAt: null, reminderConfig: null, createdAt: new Date(now.getTime() - 60_000), updatedAt: new Date(now.getTime() - 60_000), creator: creators[0] }];
   const intents = [];
   const inboundEvents = [];
+  const submissions = [];
   const audits = [];
   let seq = 0;
   const db = {
-    _member: member, _creators: creators, _accounts: accounts, _orders: orders, _intents: intents, _inboundEvents: inboundEvents, _audits: audits, _workspaceSettingValue: null,
+    _member: member, _creators: creators, _accounts: accounts, _orders: orders, _intents: intents, _inboundEvents: inboundEvents, _submissions: submissions, _audits: audits, _workspaceSettingValue: null,
     // Production Custom/TASK commit fencing uses a PostgreSQL advisory xact lock.
     // This in-memory fixture executes transactions serially, so model the lock as
     // a successful no-op instead of weakening the production fence for tests.
@@ -86,6 +88,18 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
       async updateMany({ where, data }) { const r = accounts.find((x) => matches(x, where)); if (!r) return { count: 0 }; Object.assign(r, clone(data)); return { count: 1 }; },
     },
     workspaceSetting: { async findUnique() { return db._workspaceSettingValue == null ? null : { value: clone(db._workspaceSettingValue) }; } },
+    customContentSubmission: {
+      async findFirst({ where, orderBy = [] }) {
+        const rows = submissions.filter((r) => matches(r, where));
+        const order = Array.isArray(orderBy) ? orderBy : [orderBy];
+        rows.sort((a,b)=>{ for (const part of order) { const [key,dir]=Object.entries(part||{})[0]||[]; if(!key) continue; const av=scalar(a[key]); const bv=scalar(b[key]); if(av==null&&bv!=null)return dir==="desc"?1:-1; if(av!=null&&bv==null)return dir==="desc"?-1:1; if(av<bv)return dir==="desc"?1:-1; if(av>bv)return dir==="desc"?-1:1; } return 0; });
+        return clone(rows[0] || null);
+      },
+      async findMany({ where, take = 100, orderBy = [] }) {
+        const rows = submissions.filter((r) => matches(r, where));
+        return rows.slice(0, take).map(clone);
+      },
+    },
     customOrder: {
       async findFirst({ where }) { return clone(orders.find((r) => matches(r, where)) || null); },
       async findMany({ where, take = 100 }) { return orders.filter((r) => matches(r, where)).slice(0, take).map(clone); },
@@ -129,7 +143,7 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
     auditLog: { async create({ data }) { const row={ id: `audit-${audits.length+1}`, ...clone(data) }; audits.push(row); return clone(row); } },
     async $transaction(fn) { return fn(this); },
   };
-  return { db, member, now, orders, intents, inboundEvents, accounts, creators };
+  return { db, member, now, orders, intents, inboundEvents, submissions, accounts, creators };
 }
 
 function seedConfirmedTaskThread(fx, { accountId = "tg-1", messageId = 501, telegramUserId = "1001" } = {}) {
@@ -143,6 +157,58 @@ function seedConfirmedTaskThread(fx, { accountId = "tg-1", messageId = 501, tele
     remoteMessageId: Number(messageId), remoteRecipientTelegramUserId: String(telegramUserId), remoteSentAt: at, outcomeReason: null, confirmedAt: at, createdAt: at, updatedAt: at,
   });
 }
+
+function seedRevisionDecision(fx, { comment = "Redo ending", reviewedAt = null } = {}) {
+  const at = reviewedAt || new Date(fx.now.getTime() - 500);
+  const row = {
+    id: "submission-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1",
+    pipelineDisposition: "ACTIVE", reviewStatus: "REVISION_REQUESTED", reviewComment: comment, reviewedAt: at,
+    receivedAt: new Date(fx.now.getTime() - 20_000), createdAt: new Date(fx.now.getTime() - 20_000), updatedAt: at,
+  };
+  fx.submissions.push(row);
+  return row;
+}
+
+async function revisionToClaimed(fx) {
+  seedConfirmedTaskThread(fx, { messageId: 501, telegramUserId: "1001" });
+  const submission = seedRevisionDecision(fx);
+  const row = await planRevisionRequestIntentForReviewedSubmission({ agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: fx.now, db: fx.db });
+  const claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: row.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  return { row, claimed, submission };
+}
+
+
+test("F46 revision commit fence rejects a manager decision changed after claim", async () => {
+  const fx = dbFixture();
+  const flow = await revisionToClaimed(fx);
+  fx.submissions[0].reviewComment = "Different instruction";
+  fx.submissions[0].reviewedAt = new Date(fx.now.getTime() + 1000);
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: flow.claimed.claimToken, now: new Date(fx.now.getTime() + 2000), db: fx.db }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_CONTROL_CHANGED" || error?.code === "TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED",
+  );
+  assert.notEqual(fx.intents.find((row) => row.id === flow.row.id)?.state, "COMMITTING");
+});
+
+test("F46 cancellation before revision COMMITTING cancels precommit work instead of sending stale instruction", async () => {
+  const fx = dbFixture();
+  const flow = await revisionToClaimed(fx);
+  fx.orders[0].status = "CANCELLED";
+  const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, now: new Date(fx.now.getTime() + 1000), db: fx.db });
+  assert.equal(listed.items.some((row) => row.id === flow.row.id), false);
+  assert.equal(fx.intents.find((row) => row.id === flow.row.id)?.state, "CANCELLED");
+});
+
+test("F46 cancellation after revision COMMITTING cannot erase an exact provider receipt", async () => {
+  const fx = dbFixture();
+  const flow = await revisionToClaimed(fx);
+  const begun = await beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: flow.claimed.claimToken, now: fx.now, db: fx.db });
+  assert.equal(begun.begun, true);
+  fx.orders[0].status = "CANCELLED";
+  const settled = await confirmTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", claimToken: flow.claimed.claimToken, remoteMessageId: 777, remoteRecipientTelegramUserId: "1001", remoteSentAt: new Date(fx.now.getTime() + 1000), now: new Date(fx.now.getTime() + 2000), db: fx.db });
+  assert.equal(settled.intent.state, "CONFIRMED");
+  assert.equal(settled.intent.remoteMessageId, "777");
+});
 
 async function taskToCommitting(fx) {
   const planned = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "TASK", now: fx.now, db: fx.db });

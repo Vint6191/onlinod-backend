@@ -6,8 +6,9 @@ const { audit } = require("./audit-service");
 const { assignCustomContentSubmission } = require("./custom-content-submissions-service");
 const { paymentSnapshot } = require("./custom-orders-service");
 const { uniqueMediaIds } = require("./custom-content-library-service");
-const { ACTIVE_WRITE_STATUSES, hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, setUnassignedSubmissionDisposition, derivePipelineStage, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle, adjudicateCustomOrderCancellation } = require("./custom-content-pipeline-authority-service");
+const { ACTIVE_WRITE_STATUSES, hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, setUnassignedSubmissionDisposition, derivePipelineStage, customSubmissionExternalEffectConvergence, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle, adjudicateCustomOrderCancellation } = require("./custom-content-pipeline-authority-service");
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { revisionDispatchProjection } = require("./telegram-delivery-authority-service");
 
 const REVIEW_WAITING = "WAITING_REVIEW";
 const REVIEW_REVISION = "REVISION_REQUESTED";
@@ -289,6 +290,22 @@ async function listAwaitingCustomRevisions({ agencyId, member, limit = 50, curso
       ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
     });
     if (!rows.length) { pageExhausted = true; break; }
+    const revisionDispatchBySubmission = new Map();
+    if (client.telegramDeliveryIntent?.findMany) {
+      const submissionIds = rows.map((row) => String(row.id)).filter(Boolean);
+      if (submissionIds.length) {
+        const intents = await client.telegramDeliveryIntent.findMany({
+          where: { agencyId, kind: "REVISION_REQUEST", customSubmissionId: { in: submissionIds } },
+          select: { id: true, customSubmissionId: true, state: true, remoteMessageId: true, remoteSentAt: true, createdAt: true },
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          take: submissionIds.length,
+        });
+        for (const intent of intents || []) {
+          const key = String(intent.customSubmissionId || "");
+          if (key && !revisionDispatchBySubmission.has(key)) revisionDispatchBySubmission.set(key, revisionDispatchProjection(intent));
+        }
+      }
+    }
     for (const row of rows) {
       scanCursor = String(row.id);
       const order = row.customOrder;
@@ -321,6 +338,7 @@ async function listAwaitingCustomRevisions({ agencyId, member, limit = 50, curso
         reviewedBy: reviewActor(row.reviewedByMember),
         modelComment: row.comment || null,
         previousMediaCount: uniqueMediaIds(row.ofMediaIds).length,
+        revisionDispatch: revisionDispatchBySubmission.get(String(row.id)) || revisionDispatchProjection(null),
       });
       if (items.length >= take) break;
     }
@@ -430,7 +448,7 @@ async function listCustomPipelineResolutionQueue({
     map.set(String(asset.mediaId), asset);
     assetsBySubmission.set(key, map);
   }
-  const items = rows.map((row) => {
+  const items = await Promise.all(rows.map(async (row) => {
     const mediaIds = uniqueMediaIds(row.ofMediaIds);
     const projected = assetsBySubmission.get(String(row.id)) || new Map();
     const finalizedMediaCount = mediaIds.filter((mediaId) => customAssetMatchesPipelineProjection(row, projected.get(String(mediaId)), row.customOrder || null)).length;
@@ -438,6 +456,7 @@ async function listCustomPipelineResolutionQueue({
     const finalized = mediaIds.length > 0 && hasCurrentVaultSettlement(row) && finalizedMediaCount === mediaIds.length;
     const pipelineStage = derivePipelineStage({ submission: row, order: row.customOrder || null, finalized, blockedCode: row.pipelineBlockedCode });
     const resolutionAllowed = !row.customOrderId || disposition === "SALVAGE";
+    const externalConvergence = await customSubmissionExternalEffectConvergence({ db: client, agencyId, submission: row, order: row.customOrder || null });
     return {
       submissionId: String(row.id),
       creatorId: String(row.creatorId),
@@ -455,12 +474,14 @@ async function listCustomPipelineResolutionQueue({
       telegramMessageCount: Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.length : 0,
       ofMediaCount: mediaIds.length,
       finalizedMediaCount,
-      canArchive: Boolean(canResolve && resolutionAllowed && mediaIds.length > 0
+      externalEffectsConverged: externalConvergence.converged,
+      externalEffectDebt: externalConvergence.debt.map((entry) => ({ deliveryId: entry.deliveryId, actionType: entry.actionType, status: entry.status, state: entry.state })),
+      canArchive: Boolean(canResolve && resolutionAllowed && externalConvergence.converged && mediaIds.length > 0
         && hasCurrentVaultSettlement(row)
         && finalizedMediaCount === mediaIds.length),
-      canAbandon: Boolean(canResolve && resolutionAllowed && (mediaIds.length === 0 || Boolean(row.creator?.deletedAt))),
+      canAbandon: Boolean(canResolve && resolutionAllowed && externalConvergence.converged && (mediaIds.length === 0 || Boolean(row.creator?.deletedAt))),
     };
-  });
+  }));
   const total = Number(count || 0);
   const pendingCustoms = (orderBlockers || []).map((order) => ({
     customOrderId: String(order.id),

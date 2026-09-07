@@ -12,6 +12,7 @@ const {
   parseOffset: sharedParseOffset,
   requireCreator: sharedRequireCreator,
 } = require("./server-store-utils");
+const { classifyProgrammaticCustomMediaProvenance } = require("./custom-content-delivery-service");
 
 const TASK_TYPE_ALIASES = Object.freeze({
   winback: "sfs_hunter",
@@ -112,6 +113,36 @@ function normalizeTaskInput(input = {}, { agencyId, userId, patch = false } = {}
   return data;
 }
 
+
+function bumpMediaIds(value) {
+  const out = [];
+  const seen = new Set();
+  for (const item of Array.isArray(value) ? value : []) {
+    const row = item && typeof item === "object" && !Array.isArray(item) ? item : {};
+    const raw = item && typeof item === "object" ? (row.id ?? row.mediaId ?? row.media_id ?? row.fileId) : item;
+    const id = cleanString(raw, 120);
+    if (!id || seen.has(id)) continue;
+    seen.add(id); out.push(id);
+  }
+  return out;
+}
+
+async function assertReusableBumpMediaAllowed({ agencyId, creatorId, media, db = prisma }) {
+  const ids = bumpMediaIds(media);
+  for (let offset = 0; offset < ids.length; offset += 200) {
+    const result = await classifyProgrammaticCustomMediaProvenance({
+      agencyId, creatorId, mediaIds: ids.slice(offset, offset + 200), db,
+    });
+    if (!result?.ok || !Array.isArray(result.customMediaIds)) {
+      throw automationTaskError("AUTOMATION_BUMP_MEDIA_PROVENANCE_INCOMPLETE", "Bump media provenance check returned an incomplete result", 503);
+    }
+    if (result.customMediaIds.length) {
+      const err = automationTaskError("AUTOMATION_BUMP_CUSTOM_MEDIA_FORBIDDEN", "CUSTOM media cannot be saved or restored as reusable automation bump content", 409);
+      err.customMediaIds = [...new Set(result.customMediaIds.map(String))];
+      throw err;
+    }
+  }
+}
 function normalizeBumpToTask(input = {}, accountId = null) {
   const id = clean(input.id || input.clientId, 120);
   const title = clean(input.title || input.messageText || input.text || "Bump", 180) || "Bump";
@@ -522,6 +553,7 @@ async function listBumps({ agencyId, creatorId, query = {} }) {
 async function saveBump({ agencyId, userId, accountId, input = {} }) {
   const canonicalAccountId = clean(accountId, 100);
   const taskInput = normalizeBumpToTask({ ...(input || {}), creatorId: canonicalAccountId, accountId: canonicalAccountId }, canonicalAccountId);
+  await assertReusableBumpMediaAllowed({ agencyId, creatorId: canonicalAccountId, media: taskInput.config?.media, db: prisma });
   const result = await upsertTask({ agencyId, userId, input: taskInput, expectedCreatorId: canonicalAccountId });
   return { ok: true, accountId: String(accountId || taskInput.creatorId || ""), item: taskToBump(result.item), task: result.item };
 }
@@ -535,6 +567,10 @@ async function trashBump({ agencyId, userId, accountId, bumpId, permanent = fals
     err.status = 404;
     err.code = "BUMP_NOT_FOUND";
     throw err;
+  }
+  if (restore) {
+    const cfg = toPlainObject(task.config);
+    await assertReusableBumpMediaAllowed({ agencyId, creatorId: canonicalAccountId, media: cfg.media || cfg.mediaFiles, db: prisma });
   }
   const result = restore
     ? await restoreTask({ agencyId, userId, taskId: task.id, creatorId: canonicalAccountId })
@@ -656,6 +692,10 @@ async function trashSfsComment({ agencyId, userId, accountId, templateId, perman
     err.status = 404;
     err.code = "SFS_COMMENT_NOT_FOUND";
     throw err;
+  }
+  if (restore) {
+    const cfg = toPlainObject(task.config);
+    await assertReusableBumpMediaAllowed({ agencyId, creatorId: canonicalAccountId, media: cfg.media || cfg.mediaFiles, db: prisma });
   }
   const result = restore
     ? await restoreTask({ agencyId, userId, taskId: task.id, creatorId: canonicalAccountId })

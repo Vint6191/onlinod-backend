@@ -701,6 +701,7 @@ model TelegramDeliveryIntent {
   agencyId            String
   creatorId           String
   customOrderId       String
+  customSubmissionId  String?
   accountId           String
   kind                String
   logicalKey          String   @unique
@@ -733,6 +734,7 @@ model TelegramDeliveryIntent {
   @@index([agencyId, state, createdAt])
   @@index([agencyId, creatorId, state])
   @@index([agencyId, customOrderId, kind, createdAt])
+  @@index([agencyId, customSubmissionId, kind, createdAt])
   @@unique([customOrderId, kind, referenceOrdinal], map: "TelegramDeliveryIntent_reference_ordinal_key")
   @@index([agencyId, accountId, state])
   @@index([agencyId, accountId, remoteRecipientTelegramUserId, state])

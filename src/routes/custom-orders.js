@@ -35,7 +35,7 @@ const {
   setCustomVaultDestination,
 } = require("../services/custom-vault-destination-service");
 const { listCustomNonContentOperations } = require("../services/custom-noncontent-operations-service");
-const { listCustomReadyDeliveries, getCustomReadyDelivery, preflightCustomManualSend, preflightProgrammaticCustomMedia } = require("../services/custom-content-delivery-service");
+const { listCustomReadyDeliveries, getCustomReadyDelivery, preflightCustomManualSend, preflightProgrammaticCustomMedia, classifyDialogComposerMediaAvailability } = require("../services/custom-content-delivery-service");
 const { prepareCustomManualDeliveryCommit } = require("../services/custom-manual-delivery-authority-service");
 
 const {
@@ -362,6 +362,20 @@ router.patch("/submissions/:submissionId", (_req, res) => {
   return res.status(410).json({ ok: false, code: "CUSTOM_SUBMISSION_GENERIC_ASSIGN_RETIRED", error: "Use the review-authorized assignment workflow." });
 });
 
+
+router.post("/ready-deliveries/media-availability", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await classifyDialogComposerMediaAvailability({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      creatorId: req.body?.creatorId,
+      dialogId: req.body?.dialogId,
+      mediaIds: req.body?.mediaIds,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_DELIVERY_MEDIA_AVAILABILITY_FAILED"); }
+});
 
 router.post("/ready-deliveries/programmatic-media-preflight", async (req, res) => {
   try {

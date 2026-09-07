@@ -62,6 +62,8 @@ function auth() {
 function baseDb() {
   return {
     creatorAccount: { findFirst: async () => ({ id: "creator-1" }) },
+    creatorMediaAsset: { findMany: async () => [] },
+    customContentSubmission: { findMany: async () => [] },
     contentBlock: { deleteMany: async () => ({ count: 0 }) },
     contentUsageEvent: { findMany: async () => [], create: async ({ data }) => ({ id: "event-1", ...data }) },
     contentCollection: {
@@ -135,6 +137,53 @@ test("script update preserves original author and exact message whitespace", asy
   assert.equal("createdByUserId" in collectionUpdate, false);
   assert.equal(blockCreate.text, "  first line\nsecond line  ");
   assert.equal(res.body.item.messages[0].text, "  first line\nsecond line  ");
+});
+
+test("reusable Message Library scripts reject canonical CUSTOM media before any transaction", async () => {
+  const db = baseDb();
+  db.creatorMediaAsset.findMany = async () => [{ mediaId: "9001", customOrderId: "custom-1", customSubmissionId: "submission-1" }];
+  let transactionCalled = false;
+  db.$transaction = async () => { transactionCalled = true; };
+  const api = loadRoute(db);
+  const res = response();
+  await api.route("PUT", "/message-library/scripts/:id")({
+    auth: auth(), query: {}, params: { id: "script-1" },
+    body: {
+      creatorId: "creator-1", title: "Reusable flow",
+      messages: [{ id: "block-1", text: "hello", media: [{ id: "9001", type: "video" }] }],
+    },
+  }, res);
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.code, "MESSAGE_LIBRARY_CUSTOM_MEDIA_FORBIDDEN");
+  assert.equal(transactionCalled, false);
+});
+
+test("Message Library provenance classification exhaustively crosses the 200-id transport batch boundary", async () => {
+  const db = baseDb();
+  let assetReads = 0;
+  db.creatorMediaAsset.findMany = async ({ where }) => {
+    assetReads += 1;
+    const ids = Array.isArray(where?.mediaId?.in) ? where.mediaId.in.map(String) : [];
+    return ids.includes("205") ? [{ mediaId: "205", customOrderId: "custom-205", customSubmissionId: "submission-205" }] : [];
+  };
+  let transactionCalled = false;
+  db.$transaction = async () => { transactionCalled = true; };
+  const api = loadRoute(db);
+  const res = response();
+  const ids = Array.from({ length: 205 }, (_, index) => String(index + 1));
+  const messages = [0, 1, 2].map((blockIndex) => ({
+    id: `block-${blockIndex + 1}`,
+    text: `block ${blockIndex + 1}`,
+    media: ids.slice(blockIndex * 100, (blockIndex + 1) * 100).map((id) => ({ id, type: "photo" })),
+  }));
+  await api.route("PUT", "/message-library/scripts/:id")({
+    auth: auth(), query: {}, params: { id: "script-large" },
+    body: { creatorId: "creator-1", title: "Large reusable flow", messages },
+  }, res);
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.code, "MESSAGE_LIBRARY_CUSTOM_MEDIA_FORBIDDEN");
+  assert.equal(assetReads, 2);
+  assert.equal(transactionCalled, false);
 });
 
 test("duplicate block ids are rejected before a transaction mutates data", async () => {

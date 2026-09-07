@@ -20,6 +20,8 @@ const {
   derivePipelineStage,
   executionFailureStillApplies,
   reportSubmissionExecutionAttempt,
+  customExternalWriteClassification,
+  customSubmissionExternalEffectConvergence,
 } = require("./custom-content-pipeline-authority-service");
 
 function profileDb({ folder = "vault-a", recipient = "relay_a", relayRows = [] } = {}) {
@@ -337,7 +339,7 @@ test("agency retirement aggregates every live Custom/source blocker across creat
     telegramInboundEvent: { count: async ({ where }) => { captured.inbound = where; return 4; } },
   };
   const result = await agencyCustomPipelineBlockers({ db, agencyId: "agency-1" });
-  assert.deepEqual(result, { pendingOrders: 1, activeSubmissions: 2, activeWrites: 3, activeTelegramDeliveries: 5, unresolvedInboundEvents: 4, cancelledTelegramFollowupDebt: 0, confirmedTelegramProjectionDebt: 0, total: 15 });
+  assert.deepEqual(result, { pendingOrders: 1, activeSubmissions: 2, activeWrites: 3, activeTelegramDeliveries: 5, unresolvedInboundEvents: 4, cancelledTelegramFollowupDebt: 0, confirmedTelegramProjectionDebt: 0, completedExternalProjectionDebt: 0, total: 15 });
   assert.deepEqual(captured.orders, { agencyId: "agency-1", status: "PENDING" });
   assert.equal(captured.submissions.agencyId, "agency-1");
   assert.deepEqual(captured.writes, {
@@ -592,13 +594,13 @@ test("pipeline resolution cannot race past an in-flight CUSTOM_RELAY_SEND", asyn
     customContentSubmission: { findFirst: async () => ({ ...state.submission }) },
     automationDelivery: {
       updateMany: async () => ({ count: 0 }),
-      findFirst: async () => ({ id: "write-1", status: "COMMITTING" }),
+      findMany: async () => [{ id: "write-1", actionType: "CUSTOM_RELAY_SEND", targetId: "submission-writing:0", status: "COMMITTING", result: null }],
     },
     creatorMediaAsset: { findMany: async () => [] },
   };
   await assert.rejects(
     () => setUnassignedSubmissionDisposition({ db, agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ABANDONED", reason: "operator discard" }),
-    (error) => error?.code === "CUSTOM_SUBMISSION_DISPOSITION_WRITE_IN_FLIGHT",
+    (error) => error?.code === "CUSTOM_SUBMISSION_EXTERNAL_EFFECT_NOT_CONVERGED",
   );
 });
 
@@ -724,4 +726,67 @@ test("legacy creator-retirement migration preserves unknown external outcomes an
   assert.match(migration, /CustomContentSubmission[\s\S]*CUSTOM_SUBMISSION_CREATOR_RETIRED_LEGACY/);
   assert.doesNotMatch(migration, /pipelineDisposition"\s*=\s*'ARCHIVED'/);
   assert.doesNotMatch(migration, /pipelineDisposition"\s*=\s*'ABANDONED'/);
+});
+
+
+test("F45 shared external-effect classifier distinguishes no-retry unknown from proven terminal and completed projection debt", () => {
+  const submission = { id: "sub-f45", ofMediaIds: ["9001"] };
+  const order = { deliveryMessageIds: ["message-ok"], deliverySentMediaIds: ["9001"] };
+  assert.equal(customExternalWriteClassification({
+    delivery: { actionType: "CUSTOM_RELAY_SEND", status: "FAILED", failureCode: "outcome_unresolved_do_not_retry" }, submission, order,
+  }).state, "OUTCOME_UNRESOLVED");
+  assert.equal(customExternalWriteClassification({
+    delivery: { actionType: "CUSTOM_RELAY_SEND", status: "FAILED", failureCode: "provider_rejected_no_effect" }, submission, order,
+  }).converged, true);
+  assert.equal(customExternalWriteClassification({
+    delivery: { actionType: "CUSTOM_RELAY_SEND", status: "COMPLETED", result: { mediaId: "9002" } }, submission, order,
+  }).state, "COMPLETED_UNPROJECTED");
+  assert.equal(customExternalWriteClassification({
+    delivery: { actionType: "CUSTOM_RELAY_SEND", status: "COMPLETED", result: { mediaId: "9001" } }, submission, order,
+  }).state, "FULLY_CONVERGED");
+  assert.equal(customExternalWriteClassification({
+    delivery: { actionType: "CUSTOM_MANUAL_SEND", status: "COMPLETED", messageId: "message-ok", result: { mediaIds: ["9001"] } }, submission, order,
+  }).state, "FULLY_CONVERGED");
+  assert.equal(customExternalWriteClassification({
+    delivery: { actionType: "CUSTOM_MANUAL_SEND", status: "COMPLETED", messageId: "message-late", result: { mediaIds: ["9001"] } }, submission, order,
+  }).state, "COMPLETED_UNPROJECTED");
+});
+
+test("F45 terminal disposition rejects no-retry unknown and completed-but-unprojected external effects", async () => {
+  for (const write of [
+    { id: "unknown", actionType: "CUSTOM_RELAY_SEND", targetId: "sub-terminal:0", status: "FAILED", failureCode: "outcome_unresolved_do_not_retry", result: null },
+    { id: "late-proof", actionType: "CUSTOM_RELAY_SEND", targetId: "sub-terminal:0", status: "COMPLETED", failureCode: null, result: { mediaId: "9991" } },
+  ]) {
+    const submission = { id: "sub-terminal", agencyId: "agency-1", creatorId: "creator-1", customOrderId: null, pipelineDisposition: "ACTIVE", ofMediaIds: [], telegramMessageIds: [1] };
+    const db = {
+      customContentSubmission: { findFirst: async () => ({ ...submission }) },
+      automationDelivery: { updateMany: async () => ({ count: 0 }), findMany: async () => [{ ...write }] },
+    };
+    await assert.rejects(
+      () => setUnassignedSubmissionDisposition({ db, agencyId: "agency-1", submissionId: submission.id, nextDisposition: "ABANDONED", reason: "resolve" }),
+      (error) => error?.code === "CUSTOM_SUBMISSION_EXTERNAL_EFFECT_NOT_CONVERGED",
+      write.id,
+    );
+  }
+});
+
+test("F45 ordinary ARCHIVE requires proven media and terminal cross-rewrite is forbidden while same-state retry is idempotent", async () => {
+  const sourceOnly = { id: "source-only", agencyId: "agency-1", creatorId: "creator-1", customOrderId: null, pipelineDisposition: "ACTIVE", ofMediaIds: [], telegramMessageIds: [1] };
+  const dbSource = {
+    customContentSubmission: { findFirst: async () => ({ ...sourceOnly }) },
+    automationDelivery: { updateMany: async () => ({ count: 0 }), findMany: async () => [] },
+  };
+  await assert.rejects(
+    () => setUnassignedSubmissionDisposition({ db: dbSource, agencyId: "agency-1", submissionId: sourceOnly.id, nextDisposition: "ARCHIVED", reason: "bad archive" }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_ARCHIVE_MEDIA_REQUIRED",
+  );
+
+  const terminal = { id: "terminal-sub", agencyId: "agency-1", creatorId: "creator-1", customOrderId: null, pipelineDisposition: "ARCHIVED", ofMediaIds: ["9001"] };
+  const dbTerminal = { customContentSubmission: { findFirst: async () => ({ ...terminal }) } };
+  const same = await setUnassignedSubmissionDisposition({ db: dbTerminal, agencyId: "agency-1", submissionId: terminal.id, nextDisposition: "ARCHIVED" });
+  assert.equal(same.unchanged, true);
+  await assert.rejects(
+    () => setUnassignedSubmissionDisposition({ db: dbTerminal, agencyId: "agency-1", submissionId: terminal.id, nextDisposition: "ABANDONED", reason: "rewrite" }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_DISPOSITION_TERMINAL_REWRITE_FORBIDDEN",
+  );
 });

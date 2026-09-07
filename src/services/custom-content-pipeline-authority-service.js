@@ -14,6 +14,8 @@ const PRECOMMIT_WRITE_STATUSES = ["QUEUED", "RETRY_SCHEDULED", "CLAIMED", "RUNNI
 const ACTIVE_WRITE_STATUSES = [...PRECOMMIT_WRITE_STATUSES, "COMMITTING", "RECONCILE_REQUIRED"];
 const UNRESOLVED_INBOUND_PROJECTION_STATES = ["PENDING", "FAILED_RETRYABLE", "REVIEW_REQUIRED"];
 const ACTIVE_TELEGRAM_DELIVERY_STATES = ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED", "FAILED_PRECOMMIT"];
+const CUSTOM_EXTERNAL_ACTION_TYPES = ["CUSTOM_RELAY_SEND", "CUSTOM_MANUAL_SEND"];
+const CUSTOM_EXTERNAL_UNRESOLVED_STATUSES = ["COMMITTING", "RECONCILE_REQUIRED"];
 
 function fail(code, message, status = 409, details = null) {
   const error = Object.assign(new Error(message), { code, status });
@@ -514,6 +516,120 @@ async function cancelPrecommitManualWritesForOrder({ db, agencyId, customOrderId
   return { changed: Number(changed?.count || 0) };
 }
 
+
+function customExternalWriteClassification({ delivery, submission = null, order = null } = {}) {
+  const actionType = clean(delivery?.actionType, 80);
+  const status = clean(delivery?.status, 80).toUpperCase();
+  const failureCode = clean(delivery?.failureCode, 180);
+  const result = delivery?.result && typeof delivery.result === "object" && !Array.isArray(delivery.result) ? delivery.result : {};
+  if (!CUSTOM_EXTERNAL_ACTION_TYPES.includes(actionType)) return { state: "IRRELEVANT", converged: true };
+  if (PRECOMMIT_WRITE_STATUSES.includes(status)) return { state: "PRECOMMIT", converged: false };
+  if (CUSTOM_EXTERNAL_UNRESOLVED_STATUSES.includes(status)
+      || (status === "FAILED" && failureCode === "outcome_unresolved_do_not_retry")) {
+    return { state: "OUTCOME_UNRESOLVED", converged: false };
+  }
+  if (status !== "COMPLETED") return { state: "PROVEN_NO_EFFECT_OR_TERMINAL", converged: true };
+
+  if (actionType === "CUSTOM_RELAY_SEND") {
+    const mediaId = clean(result.mediaId, 240);
+    const projected = new Set(normalizedSettlementMediaIds(submission?.ofMediaIds));
+    if (!mediaId || !submission || !projected.has(mediaId)) {
+      return { state: "COMPLETED_UNPROJECTED", converged: false, mediaId: mediaId || null };
+    }
+    return { state: "FULLY_CONVERGED", converged: true, mediaId };
+  }
+
+  const messageId = clean(delivery?.messageId || result.messageId, 240);
+  const mediaIds = normalizedSettlementMediaIds(result.mediaIds);
+  const projectedMessages = new Set(normalizedSettlementMediaIds(order?.deliveryMessageIds));
+  const projectedMedia = new Set(normalizedSettlementMediaIds(order?.deliverySentMediaIds));
+  const projected = Boolean(order && messageId && projectedMessages.has(messageId)
+    && mediaIds.length > 0 && mediaIds.every((mediaId) => projectedMedia.has(mediaId)));
+  return projected
+    ? { state: "FULLY_CONVERGED", converged: true, messageId, mediaIds }
+    : { state: "COMPLETED_UNPROJECTED", converged: false, messageId: messageId || null, mediaIds };
+}
+
+async function customSubmissionExternalEffectConvergence({ db, agencyId, submission, order = undefined }) {
+  if (!submission?.id) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  const customOrder = order === undefined && submission.customOrderId && db.customOrder?.findFirst
+    ? await db.customOrder.findFirst({
+      where: { id: submission.customOrderId, agencyId, creatorId: submission.creatorId },
+      select: { id: true, deliveryMessageIds: true, deliverySentMediaIds: true },
+    })
+    : (order || null);
+  const ors = [{ actionType: "CUSTOM_RELAY_SEND", targetId: { startsWith: `${submission.id}:` } }];
+  if (submission.customOrderId) ors.push({ actionType: "CUSTOM_MANUAL_SEND", targetId: String(submission.customOrderId) });
+  const writes = db.automationDelivery?.findMany ? await db.automationDelivery.findMany({
+    where: { agencyId, creatorId: submission.creatorId, OR: ors },
+    select: { id: true, actionType: true, targetId: true, status: true, failureCode: true, result: true, messageId: true, updatedAt: true },
+    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+  }) : [];
+  const items = (writes || []).map((delivery) => ({
+    deliveryId: String(delivery.id), actionType: String(delivery.actionType || ""), status: String(delivery.status || ""),
+    ...customExternalWriteClassification({ delivery, submission, order: customOrder }),
+  }));
+  const debt = items.filter((item) => !item.converged);
+  return {
+    converged: debt.length === 0,
+    debt,
+    items,
+    precommit: debt.filter((item) => item.state === "PRECOMMIT"),
+    unresolved: debt.filter((item) => item.state === "OUTCOME_UNRESOLVED"),
+    completedUnprojected: debt.filter((item) => item.state === "COMPLETED_UNPROJECTED"),
+  };
+}
+
+async function findCompletedCustomExternalProjectionDebt({ db, agencyId, creatorId = null }) {
+  if (!db.automationDelivery?.findMany) return [];
+  const debt = [];
+  let cursor = null;
+  for (;;) {
+    const rows = await db.automationDelivery.findMany({
+      where: {
+        agencyId,
+        ...(creatorId ? { creatorId } : {}),
+        actionType: { in: CUSTOM_EXTERNAL_ACTION_TYPES },
+        status: "COMPLETED",
+      },
+      select: { id: true, creatorId: true, actionType: true, targetId: true, status: true, failureCode: true, payload: true, result: true, messageId: true, updatedAt: true },
+      orderBy: [{ id: "asc" }],
+      take: 200,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    if (!rows.length) break;
+    cursor = rows[rows.length - 1].id;
+    for (const row of rows) {
+      const payload = row.payload && typeof row.payload === "object" && !Array.isArray(row.payload) ? row.payload : {};
+      const result = row.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
+      const submissionId = clean(payload.submissionId || result.submissionId || (String(row.actionType) === "CUSTOM_RELAY_SEND" ? String(row.targetId || "").split(":")[0] : ""), 180);
+      const orderId = clean(payload.customOrderId || result.customOrderId || (String(row.actionType) === "CUSTOM_MANUAL_SEND" ? row.targetId : ""), 180);
+      const [submission, order] = await Promise.all([
+        submissionId && db.customContentSubmission?.findFirst
+          ? db.customContentSubmission.findFirst({ where: { id: submissionId, agencyId, creatorId: row.creatorId }, select: { id: true, ofMediaIds: true } })
+          : Promise.resolve(null),
+        orderId && db.customOrder?.findFirst
+          ? db.customOrder.findFirst({ where: { id: orderId, agencyId, creatorId: row.creatorId }, select: { id: true, deliveryMessageIds: true, deliverySentMediaIds: true } })
+          : Promise.resolve(null),
+      ]);
+      const classification = customExternalWriteClassification({ delivery: row, submission, order });
+      if (!classification.converged) debt.push({ deliveryId: String(row.id), creatorId: String(row.creatorId), actionType: String(row.actionType), ...classification });
+    }
+    if (rows.length < 200) break;
+  }
+  return debt;
+}
+
+async function assertCustomSubmissionExternalEffectsConverged({ db, agencyId, submission, order = undefined }) {
+  const convergence = await customSubmissionExternalEffectConvergence({ db, agencyId, submission, order });
+  if (!convergence.converged) {
+    throw fail("CUSTOM_SUBMISSION_EXTERNAL_EFFECT_NOT_CONVERGED", "All Custom external effects must converge before terminal resolution", 409, {
+      debt: convergence.debt.map((item) => ({ deliveryId: item.deliveryId, actionType: item.actionType, status: item.status, state: item.state })),
+    });
+  }
+  return convergence;
+}
+
 async function adjudicateCustomOrderCancellation({ db, agencyId, customOrderId, now = new Date(), reason = "CUSTOM_ORDER_CANCELLED" }) {
   // Cancellation and relay reservation serialize on the same submission rows.
   // The caller executes this inside the CustomOrder update transaction. If a
@@ -564,21 +680,25 @@ async function setUnassignedSubmissionDisposition({ db, agencyId, submissionId, 
     const row = await lockedDb.customContentSubmission.findFirst({ where: { id: submissionId, agencyId } });
     if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
     const current = disposition(row.pipelineDisposition);
+    if ([ARCHIVED, ABANDONED].includes(current)) {
+      if (next === current) return { ok: true, unchanged: true, submissionId: row.id, pipelineDisposition: current };
+      throw fail("CUSTOM_SUBMISSION_DISPOSITION_TERMINAL_REWRITE_FORBIDDEN", "Terminal Custom content disposition cannot be rewritten by the ordinary resolution endpoint", 409);
+    }
     if (row.customOrderId && current !== SALVAGE) {
       throw fail("CUSTOM_SUBMISSION_DISPOSITION_ASSIGNED", "Live assigned content must be resolved through its Custom order lifecycle", 409);
     }
     if (row.customOrderId && next === SALVAGE) return { ok: true, submissionId: row.id, pipelineDisposition: SALVAGE };
     if (next === ARCHIVED || next === ABANDONED) {
       await cancelPrecommitRelayWritesForSubmissions({ db: lockedDb, agencyId, creatorId: row.creatorId, submissionIds: [row.id], now, reason: reason || `CUSTOM_SUBMISSION_${next}` });
+      if (row.customOrderId) await cancelPrecommitManualWritesForOrder({ db: lockedDb, agencyId, customOrderId: row.customOrderId, now, reason: reason || `CUSTOM_SUBMISSION_${next}` });
+      await assertCustomSubmissionExternalEffectsConverged({ db: lockedDb, agencyId, submission: row });
     }
-    const inFlight = await lockedDb.automationDelivery.findFirst({
-      where: { agencyId, creatorId: row.creatorId, actionType: "CUSTOM_RELAY_SEND", targetId: { startsWith: `${row.id}:` }, status: { in: ACTIVE_WRITE_STATUSES } },
-      select: { id: true, status: true },
-    });
-    if (inFlight) throw fail("CUSTOM_SUBMISSION_DISPOSITION_WRITE_IN_FLIGHT", "A Custom relay write is still in flight and must be reconciled before resolving this content", 409);
 
     if (next === ARCHIVED || next === ABANDONED) {
       const mediaIds = Array.from(new Set((Array.isArray(row.ofMediaIds) ? row.ofMediaIds : []).map(String).filter(Boolean)));
+      if (next === ARCHIVED && mediaIds.length === 0) {
+        throw fail("CUSTOM_SUBMISSION_ARCHIVE_MEDIA_REQUIRED", "Ordinary ARCHIVE requires proven Custom media; source-only content can only be abandoned or explicitly recovered", 409);
+      }
       if (mediaIds.length && next === ABANDONED) {
         const creator = allowRetiredConfirmedAbandon
           ? await lockedDb.creatorAccount.findFirst({ where: { id: row.creatorId, agencyId }, select: { id: true, deletedAt: true } })
@@ -703,7 +823,7 @@ async function reportSubmissionExecutionAttempt({
 }
 
 async function creatorCustomPipelineBlockers({ db, agencyId, creatorId }) {
-  const [pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebtRows, latentConfirmedProjectionDebtRows] = await Promise.all([
+  const [pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebtRows, latentConfirmedProjectionDebtRows, completedExternalProjectionDebtRows] = await Promise.all([
     // Every PENDING CustomOrder is live business work. CALL / PHYSICAL do not
     // use the Content submission pipeline, but retiring their creator would
     // still orphan their task/reminder/status lifecycle.
@@ -739,17 +859,19 @@ async function creatorCustomPipelineBlockers({ db, agencyId, creatorId }) {
       : Promise.resolve(0),
     findCancelledTaskFollowupDebt({ agencyId, creatorIds: [creatorId], db }),
     findConfirmedTelegramProjectionDebt({ agencyId, creatorIds: [creatorId], db, onlyUnmarked: true }),
+    findCompletedCustomExternalProjectionDebt({ db, agencyId, creatorId }),
   ]);
   const cancelledTelegramFollowupDebt = cancelledTelegramFollowupDebtRows.length;
   const confirmedTelegramProjectionDebt = latentConfirmedProjectionDebtRows.length;
+  const completedExternalProjectionDebt = completedExternalProjectionDebtRows.length;
   return {
-    pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt,
-    total: pendingOrders + activeSubmissions + activeWrites + activeTelegramDeliveries + unresolvedInboundEvents + cancelledTelegramFollowupDebt + confirmedTelegramProjectionDebt,
+    pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt, completedExternalProjectionDebt,
+    total: pendingOrders + activeSubmissions + activeWrites + activeTelegramDeliveries + unresolvedInboundEvents + cancelledTelegramFollowupDebt + confirmedTelegramProjectionDebt + completedExternalProjectionDebt,
   };
 }
 
 async function agencyCustomPipelineBlockers({ db, agencyId }) {
-  const [pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebtRows, latentConfirmedProjectionDebtRows] = await Promise.all([
+  const [pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebtRows, latentConfirmedProjectionDebtRows, completedExternalProjectionDebtRows] = await Promise.all([
     db.customOrder.count({ where: { agencyId, status: "PENDING" } }),
     db.customContentSubmission.count({ where: { agencyId, ...unresolvedPipelineSubmissionWhere() } }),
     db.automationDelivery.count({ where: {
@@ -780,12 +902,14 @@ async function agencyCustomPipelineBlockers({ db, agencyId }) {
       : Promise.resolve(0),
     findCancelledTaskFollowupDebt({ agencyId, db }),
     findConfirmedTelegramProjectionDebt({ agencyId, db, onlyUnmarked: true }),
+    findCompletedCustomExternalProjectionDebt({ db, agencyId }),
   ]);
   const cancelledTelegramFollowupDebt = cancelledTelegramFollowupDebtRows.length;
   const confirmedTelegramProjectionDebt = latentConfirmedProjectionDebtRows.length;
+  const completedExternalProjectionDebt = completedExternalProjectionDebtRows.length;
   return {
-    pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt,
-    total: pendingOrders + activeSubmissions + activeWrites + activeTelegramDeliveries + unresolvedInboundEvents + cancelledTelegramFollowupDebt + confirmedTelegramProjectionDebt,
+    pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt, completedExternalProjectionDebt,
+    total: pendingOrders + activeSubmissions + activeWrites + activeTelegramDeliveries + unresolvedInboundEvents + cancelledTelegramFollowupDebt + confirmedTelegramProjectionDebt + completedExternalProjectionDebt,
   };
 }
 
@@ -813,6 +937,11 @@ module.exports = {
   PRECOMMIT_WRITE_STATUSES,
   ACTIVE_WRITE_STATUSES,
   UNRESOLVED_INBOUND_PROJECTION_STATES,
+  CUSTOM_EXTERNAL_ACTION_TYPES,
+  customExternalWriteClassification,
+  customSubmissionExternalEffectConvergence,
+  assertCustomSubmissionExternalEffectsConverged,
+  findCompletedCustomExternalProjectionDebt,
   disposition,
   normalizedSettlementMediaIds,
   vaultSettlementFingerprint,

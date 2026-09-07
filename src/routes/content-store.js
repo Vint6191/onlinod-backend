@@ -4,6 +4,7 @@ const express = require("express");
 const prisma = require("../prisma");
 const { canUsePermission } = require("../services/team-access-control");
 const { requireProductCreator } = require("../middleware/product-access");
+const { preflightProgrammaticCustomMedia } = require("../services/custom-content-delivery-service");
 const {
   cleanString,
   optionalString,
@@ -400,6 +401,37 @@ async function normalizeMlScriptPayload(req, { patch = false } = {}) {
 
 async function upsertMessageLibraryScript(req) {
   const normalized = await normalizeMlScriptPayload(req);
+  const mediaIds = [...new Set(normalized.blocks.flatMap((block) => normalizeMlMedia(block.media).map((item) => String(item.id || "").trim())).filter(Boolean))];
+  if (mediaIds.length) {
+    const customMediaIds = [];
+    // The canonical programmatic provenance classifier intentionally bounds one
+    // request to 200 IDs. A reusable script can contain more across many blocks,
+    // so exhaustively classify every chunk instead of turning a transport batch
+    // size into a correctness horizon or rejecting a large all-GENERAL script.
+    for (let offset = 0; offset < mediaIds.length; offset += 200) {
+      const preflight = await preflightProgrammaticCustomMedia({
+        agencyId: req.auth.agencyId,
+        member: req.auth.membership || req.member,
+        creatorId: normalized.data.creatorId,
+        mediaIds: mediaIds.slice(offset, offset + 200),
+        db: prisma,
+      });
+      if (!preflight?.ok || !Array.isArray(preflight.customMediaIds)) {
+        const err = new Error("Message Library media provenance check returned an incomplete result");
+        err.status = 503;
+        err.code = "MESSAGE_LIBRARY_MEDIA_PROVENANCE_INCOMPLETE";
+        throw err;
+      }
+      customMediaIds.push(...preflight.customMediaIds.map(String));
+    }
+    if (customMediaIds.length) {
+      const err = new Error("CUSTOM media cannot be saved into reusable Message Library scripts");
+      err.status = 409;
+      err.code = "MESSAGE_LIBRARY_CUSTOM_MEDIA_FORBIDDEN";
+      err.customMediaIds = [...new Set(customMediaIds)];
+      throw err;
+    }
+  }
   const existing = await prisma.contentCollection.findFirst({
     where: { agencyId: req.auth.agencyId, clientId: normalized.scriptId, kind: MESSAGE_LIBRARY_KIND },
     include: { blocks: true },
