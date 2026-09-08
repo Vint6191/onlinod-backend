@@ -98,19 +98,38 @@ function earningsMaxAgeMs() {
 }
 
 async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
-  // Monetary pricing uses the last 30 fully closed UTC days. Never authorize a
-  // debit from today's PARTIAL row: its value depends on what time the scanner
-  // happened to run and can materially understate the creator's true 30-day
-  // earnings by renewal time.
+  // Billing is authorized only by durable relational facts + durable scan proof.
+  // Operational JobInstance/ingest history may be retained or compacted independently.
   if (db.creatorEarningsDaily?.findMany && db.analyticsCoverage?.count) {
     const closed = closedRevenueWindow(now);
-    const [rows, completeDays] = await Promise.all([
+    const freshThreshold = new Date(now.getTime() - earningsMaxAgeMs());
+    const [rows, completeDays, freshDays] = await Promise.all([
       db.creatorEarningsDaily.findMany({
-        where: { creatorId, sourceTimezone: "UTC", sourceJobId: { not: null }, sourceScanRunId: { not: null }, sourceJob: { is: { jobKey: "fetch_earnings", status: "DONE", completedAt: { not: null } } }, date: { gte: closed.startDay, lte: closed.endDay } },
+        where: {
+          creatorId,
+          sourceTimezone: "UTC",
+          sourceScanRunId: { not: null },
+          scanProofId: { not: null },
+          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
+          date: { gte: closed.startDay, lte: closed.endDay },
+        },
         orderBy: { date: "asc" },
       }),
       db.analyticsCoverage.count({
-        where: { creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE", ingestBatchId: { not: null }, lastVerifiedAt: { not: null }, ingestBatch: { is: { status: "COMMITTED", sourceJobId: { not: null }, completedAt: { not: null } } }, coverageDate: { gte: closed.startDay, lte: closed.endDay } },
+        where: {
+          creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
+          scanProofId: { not: null }, lastVerifiedAt: { not: null },
+          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
+          coverageDate: { gte: closed.startDay, lte: closed.endDay },
+        },
+      }),
+      db.analyticsCoverage.count({
+        where: {
+          creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
+          scanProofId: { not: null }, lastVerifiedAt: { gte: freshThreshold },
+          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
+          coverageDate: { gte: closed.startDay, lte: closed.endDay },
+        },
       }),
     ]);
     const uniqueDays = new Set(rows.map((row) => asDate(row.date)?.toISOString().slice(0, 10)).filter(Boolean));
@@ -119,17 +138,18 @@ async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
         const candidate = asDate(row.collectedAt || row.updatedAt || row.date);
         return candidate && (!latest || candidate > latest) ? candidate : latest;
       }, null);
+      const fresh = freshDays >= 30;
       return {
         revenue30dCents: cents(rows.reduce((sum, row) => sum + cents(row.totalCents), 0)),
         capturedAt: newest || closed.endDay,
-        source: "EARNINGS_DAILY_COMPLETE_30D",
-        fresh: true,
+        source: fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
+        fresh,
       };
     }
   }
-
-  // Legacy 30d snapshots remain display-only estimates. The billing amount is
-  // unavailable until the relational ledger proves all 30 closed days.
+  // Legacy range snapshots are display-only migration evidence. They can tell an
+  // operator what the old generation last reported, but can never be COMPLETE,
+  // FRESH, or monetary authority.
   const snapshot = db.creatorEarningsSnapshot?.findUnique
     ? await db.creatorEarningsSnapshot.findUnique({ where: { creatorId_rangeKey: { creatorId, rangeKey: "30d" } } })
     : null;
@@ -145,62 +165,77 @@ async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
 
 async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) {
   const ids = [...new Set((creatorIds || []).map((value) => String(value || "").trim()).filter(Boolean))];
-  const results = new Map();
+  const results = new Map(ids.map((creatorId) => [creatorId, { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false }]));
   if (!ids.length) return results;
 
-  // Real Prisma path: aggregate the same 30 fully closed days in two grouped
-  // queries, independent of creator count. No N*30 daily-row materialization.
-  if (db.creatorEarningsDaily?.groupBy && db.analyticsCoverage?.groupBy) {
-    const snapshots = db.creatorEarningsSnapshot?.findMany
-      ? await db.creatorEarningsSnapshot.findMany({ where: { creatorId: { in: ids }, rangeKey: "30d" } })
-      : [];
-    const snapshotByCreator = new Map(snapshots.map((row) => [String(row.creatorId), row]));
-    for (const creatorId of ids) {
-      const snapshot = snapshotByCreator.get(creatorId) || null;
-      const capturedAt = asDate(snapshot?.capturedAt);
-      const recent = !!snapshot && !!capturedAt && now.getTime() - capturedAt.getTime() <= earningsMaxAgeMs();
+  if (db.creatorEarningsSnapshot?.findMany) {
+    const snapshots = await db.creatorEarningsSnapshot.findMany({ where: { creatorId: { in: ids }, rangeKey: "30d" } });
+    for (const snapshot of snapshots) {
+      const creatorId = String(snapshot.creatorId);
+      if (!results.has(creatorId)) continue;
+      const capturedAt = asDate(snapshot.capturedAt);
+      const recent = !!capturedAt && now.getTime() - capturedAt.getTime() <= earningsMaxAgeMs();
       results.set(creatorId, {
-        revenue30dCents: snapshot ? cents(snapshot.totalCents) : null,
+        revenue30dCents: cents(snapshot.totalCents),
         capturedAt,
-        source: snapshot ? (recent ? "EARNINGS_SNAPSHOT_30D_UNVERIFIED" : "EARNINGS_SNAPSHOT_30D_STALE") : "UNAVAILABLE",
+        source: recent ? "EARNINGS_SNAPSHOT_30D_UNVERIFIED" : "EARNINGS_SNAPSHOT_30D_STALE",
         fresh: false,
       });
     }
+  }
 
+  if (db.creatorEarningsDaily?.groupBy && db.analyticsCoverage?.groupBy) {
     const closed = closedRevenueWindow(now);
-    const [dailyGroups, coverageGroups] = await Promise.all([
+    const freshThreshold = new Date(now.getTime() - earningsMaxAgeMs());
+    const [dailyGroups, coverageGroups, freshCoverageGroups] = await Promise.all([
       db.creatorEarningsDaily.groupBy({
         by: ["creatorId"],
-        where: { creatorId: { in: ids }, sourceTimezone: "UTC", sourceJobId: { not: null }, sourceScanRunId: { not: null }, sourceJob: { is: { jobKey: "fetch_earnings", status: "DONE", completedAt: { not: null } } }, date: { gte: closed.startDay, lte: closed.endDay } },
-        _count: { _all: true },
-        _sum: { totalCents: true },
-        _max: { collectedAt: true },
+        where: {
+          creatorId: { in: ids }, sourceTimezone: "UTC", sourceScanRunId: { not: null }, scanProofId: { not: null },
+          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
+          date: { gte: closed.startDay, lte: closed.endDay },
+        },
+        _count: { _all: true }, _sum: { totalCents: true }, _max: { collectedAt: true },
       }),
       db.analyticsCoverage.groupBy({
         by: ["creatorId"],
-        where: { creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE", ingestBatchId: { not: null }, lastVerifiedAt: { not: null }, ingestBatch: { is: { status: "COMMITTED", sourceJobId: { not: null }, completedAt: { not: null } } }, coverageDate: { gte: closed.startDay, lte: closed.endDay } },
+        where: {
+          creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
+          scanProofId: { not: null }, lastVerifiedAt: { not: null },
+          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
+          coverageDate: { gte: closed.startDay, lte: closed.endDay },
+        },
+        _count: { _all: true },
+      }),
+      db.analyticsCoverage.groupBy({
+        by: ["creatorId"],
+        where: {
+          creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
+          scanProofId: { not: null }, lastVerifiedAt: { gte: freshThreshold },
+          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
+          coverageDate: { gte: closed.startDay, lte: closed.endDay },
+        },
         _count: { _all: true },
       }),
     ]);
     const dailyByCreator = new Map(dailyGroups.map((row) => [String(row.creatorId), row]));
     const coverageByCreator = new Map(coverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
+    const freshByCreator = new Map(freshCoverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
     for (const creatorId of ids) {
       const daily = dailyByCreator.get(creatorId);
-      if (Number(daily?._count?._all || 0) >= 30 && (coverageByCreator.get(creatorId) || 0) >= 30) {
-        results.set(creatorId, {
-          revenue30dCents: cents(daily?._sum?.totalCents),
-          capturedAt: asDate(daily?._max?.collectedAt) || closed.endDay,
-          source: "EARNINGS_DAILY_COMPLETE_30D",
-          fresh: true,
-        });
-      }
+      if (Number(daily?._count?._all || 0) < 30 || (coverageByCreator.get(creatorId) || 0) < 30) continue;
+      const fresh = (freshByCreator.get(creatorId) || 0) >= 30;
+      results.set(creatorId, {
+        revenue30dCents: cents(daily?._sum?.totalCents),
+        capturedAt: asDate(daily?._max?.collectedAt) || closed.endDay,
+        source: fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
+        fresh,
+      });
     }
     return results;
   }
 
-  for (const creatorId of ids) {
-    results.set(creatorId, await readRolling30dRevenue({ db, creatorId, now }));
-  }
+  for (const creatorId of ids) results.set(creatorId, await readRolling30dRevenue({ db, creatorId, now }));
   return results;
 }
 

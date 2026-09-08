@@ -79,15 +79,13 @@ test("Prisma migration adds capability columns without destructive binding repla
 });
 
 
-test("stats realtime/daily reporters are bound to the authenticated token device and use capability-specific telemetry", () => {
+test("stats realtime reporter is token-device bound and retired daily reporter cannot re-enter current telemetry", () => {
   const stats = read("routes/stats.js");
   const liveStart = stats.indexOf('router.post("/creators/:creatorId/notifications/live"');
-  const dailyStart = stats.indexOf('router.post("/creators/:creatorId/messages-daily"');
-  const live = stats.slice(liveStart, dailyStart);
-  const daily = stats.slice(dailyStart);
+  assert.ok(liveStart >= 0);
+  const liveEnd = stats.indexOf("\nrouter.", liveStart + 1);
+  const live = stats.slice(liveStart, liveEnd === -1 ? stats.length : liveEnd);
   assert.match(live, /requireAuthDevice\(req, input\.deviceId/);
   assert.match(live, /realtimeReady: true/);
-  assert.match(daily, /requireAuthDevice\(req, input\.deviceId/);
-  assert.match(daily, /status: "ACTIVE"/);
-  assert.doesNotMatch(daily, /sessionReadReady: true/);
+  assert.match(stats, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);
 });

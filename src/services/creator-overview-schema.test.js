@@ -23,6 +23,9 @@ test("creator overview is a composed read model, not another raw analytics store
   assert.match(routes, /\/creators\/:creatorId\/overview-v2/);
   assert.match(routes, /\/creators\/:creatorId\/current-task/);
   assert.match(routes, /\/creators\/:creatorId\/task-activity/);
+  assert.match(service, /includeMessages: false, includeCoveragePage: false/);
+  assert.doesNotMatch(service, /messagesServer:/);
+  assert.doesNotMatch(service, /messagesVerified:/);
 });
 
 test("one-year audience range stays locked until six-month backfill has accumulated another half year", () => {

@@ -1,23 +1,7 @@
 /* src/routes/stats.js
-   ────────────────────────────────────────────────────────────
-   Creator metrics storage + retrieval.
-   
-   Mounted at /api/stats. Auth required (req.user populated).
-   
-   Write side (called by chatter machines doing the actual work):
-     POST /earnings/upsert
-     POST /campaigns/upsert
-   
-   Read side (called by owner / chatter UI):
-     GET /creators/:creatorId/earnings?range=7d
-     GET /creators/:creatorId/campaigns
-     GET /creators/:creatorId/overview
-     GET /agencies/:agencyId/earnings/summary?range=7d
-   
-   Refresh trigger (called when owner clicks "refresh now"):
-     POST /creators/:creatorId/refresh
-     POST /agencies/:agencyId/refresh
-   ────────────────────────────────────────────────────────────
+   Current relational Creator Analytics/Stats routes plus explicit 410 tombstones
+   for the retired snapshot generation. Mounted at /api/stats; auth/access is
+   resolved per creator and current analytics ranges use analytics-range-contract.
 */
 
 "use strict";
@@ -27,16 +11,16 @@ const crypto = require("node:crypto");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { requireAuthDevice } = require("../middleware/auth");
-const { scheduleJobNow } = require("../services/job-scheduler");
 const { resolveEffectivePermissions } = require("../services/team-access-control");
 const { requireCreatorAccess, allowedCreatorScope } = require("../middleware/automation-permissions");
-const { sanitizeAnalyticsRaw } = require("../services/creator-analytics-sanitize");
-const { readCreatorLedgerOverview, readCreatorCoverage, readCampaignFans, upsertMessagesDaily } = require("../services/creator-analytics-ledger-service");
+const { readCampaignFans } = require("../services/creator-analytics-ledger-service");
 const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity, readCreatorTaskActivityDays } = require("../services/creator-overview-service");
 const { recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
 const { ensureRecurringCreatorAnalyticsCatchups } = require("../services/creator-analytics-sync-orchestrator");
 const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = require("../services/notification-facts-service");
 const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
+const { ensureAnalyticsFreshness } = require("../services/analytics-collection-planner");
+const { normalizeCreatorOverviewRangeKey } = require("../services/analytics-range-contract");
 const {
   startManualNotificationScan,
   stopManualNotificationScan,
@@ -77,8 +61,6 @@ function actorUserId(req) {
 // Helpers
 // ════════════════════════════════════════════════════════════
 
-const VALID_RANGES = new Set(["24h", "7d", "30d", "90d", "180d", "365d", "ytd", "prev_year", "all"]);
-
 function validationError(res, err) {
   return res.status(400).json({
     ok: false,
@@ -86,49 +68,6 @@ function validationError(res, err) {
     error: err.issues?.[0]?.message || "Validation error",
     issues: err.issues || [],
   });
-}
-
-// Big numbers come back from Prisma as BigInt — JSON.stringify barfs
-// on them. Coerce to Number for output. Cents fit fine in a 53-bit
-// JS number until $90T. We're not there.
-function bigToNum(v) {
-  if (v === null || v === undefined) return 0;
-  if (typeof v === "bigint") return Number(v);
-  return Number(v);
-}
-
-function sanitizeCampaigns(value) {
-  const clean = sanitizeAnalyticsRaw(value, {
-    maxDepth: 10,
-    maxArrayLength: 2000,
-    maxObjectKeys: 500,
-    maxStringLength: 10_000,
-  });
-  return Array.isArray(clean) ? clean : [];
-}
-
-function snapshotForClient(s) {
-  if (!s) return null;
-  return {
-    id: s.id,
-    creatorId: s.creatorId,
-    rangeKey: s.rangeKey,
-    rangeStartAt: s.rangeStartAt,
-    rangeEndAt: s.rangeEndAt,
-    summary: {
-      total: bigToNum(s.totalCents),
-      gross: bigToNum(s.grossCents),
-      delta: bigToNum(s.deltaCents),
-      avgSale: bigToNum(s.avgSaleCents),
-      fanLtv: bigToNum(s.fanLtvCents),
-      salesCount: s.salesCount,
-      uniqueFans: s.uniqueFans,
-    },
-    capturedAt: s.capturedAt,
-    capturedByDeviceId: s.capturedByDeviceId,
-    raw: sanitizeAnalyticsRaw(s.raw),
-    staleSeconds: Math.max(0, Math.floor((Date.now() - new Date(s.capturedAt).getTime()) / 1000)),
-  };
 }
 
 async function effectiveCurrentMember(req) {
@@ -224,390 +163,59 @@ async function requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId })
 }
 
 // ════════════════════════════════════════════════════════════
-// POST /earnings/upsert — chatter machine writes earnings result
+// Retired snapshot-era Stats generation.
+// These endpoints intentionally remain mounted as explicit 410 tombstones so
+// old clients cannot mutate or accidentally read a second analytics truth.
 // ════════════════════════════════════════════════════════════
 
-const earningsUpsertSchema = z.object({
-  deviceId: z.string().min(1), // who is reporting
-  creatorId: z.string().min(1),
-  rangeKey: z.string().refine((v) => VALID_RANGES.has(v), "Invalid rangeKey"),
-  range: z
-    .object({
-      startDate: z.string(),
-      endDate: z.string(),
-    })
-    .optional(),
-  summary: z.object({
-    total: z.number(),
-    gross: z.number().optional(),
-    delta: z.number().optional(),
-    avgSale: z.number().optional(),
-    fanLtv: z.number().optional(),
-    salesCount: z.number().int().nonnegative(),
-    uniqueFans: z.number().int().nonnegative(),
-  }),
-  raw: z.any().optional(),
-});
+function legacyStatsGone(_req, res) {
+  return res.status(410).json({
+    ok: false,
+    code: "ANALYTICS_LEGACY_STATS_RETIRED",
+    error: "This snapshot-era Analytics endpoint has been retired. Use the current analytics read model.",
+  });
+}
 
-router.post("/earnings/upsert", async (req, res) => {
-  try {
-    const input = earningsUpsertSchema.parse(req.body);
-    const userId = actorUserId(req);
+router.post("/earnings/upsert", legacyStatsGone);
+router.post("/campaigns/upsert", legacyStatsGone);
+router.get("/creators/:creatorId/earnings", legacyStatsGone);
+router.get("/creators/:creatorId/campaigns", legacyStatsGone);
+router.get("/creators/:creatorId/overview", legacyStatsGone);
+router.get("/agencies/:agencyId/earnings/summary", legacyStatsGone);
+router.post("/agencies/:agencyId/refresh", legacyStatsGone);
+router.get("/creators/:creatorId/ledger-overview", legacyStatsGone);
+router.get("/creators/:creatorId/ledger-coverage", legacyStatsGone);
+router.post("/creators/:creatorId/messages-daily", legacyStatsGone);
 
-    const ctx = await loadCreatorWithAccess(req, res, input.creatorId);
-    if (!ctx) return;
-    const { creator } = ctx;
-    const device = await requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId: input.deviceId });
-
-    const data = {
-      creatorId: creator.id,
-      agencyId: creator.agencyId,
-      rangeKey: input.rangeKey,
-      rangeStartAt: input.range?.startDate ? new Date(input.range.startDate) : null,
-      rangeEndAt: input.range?.endDate ? new Date(input.range.endDate) : null,
-      totalCents: Math.round(input.summary.total),
-      grossCents: Math.round(input.summary.gross || 0),
-      deltaCents: Math.round(input.summary.delta || 0),
-      avgSaleCents: Math.round(input.summary.avgSale || 0),
-      fanLtvCents: Math.round(input.summary.fanLtv || 0),
-      salesCount: input.summary.salesCount,
-      uniqueFans: input.summary.uniqueFans,
-      raw: sanitizeAnalyticsRaw(input.raw),
-      capturedAt: new Date(),
-      capturedByDeviceId: device.id,
-      capturedByUserId: userId,
-    };
-
-    const snapshot = await prisma.creatorEarningsSnapshot.upsert({
-      where: { creatorId_rangeKey: { creatorId: creator.id, rangeKey: input.rangeKey } },
-      create: data,
-      update: data,
-    });
-
-    return res.json({
-      ok: true,
-      snapshot: snapshotForClient(snapshot),
-    });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    console.error("[stats/earnings/upsert] failed:", err);
-    return res.status(Number(err?.status) || 500).json({
-      ok: false,
-      code: err?.code || "EARNINGS_UPSERT_FAILED",
-      error: err?.message || "Failed",
-    });
-  }
-});
-
-// ════════════════════════════════════════════════════════════
-// POST /campaigns/upsert
-// ════════════════════════════════════════════════════════════
-
-const campaignsUpsertSchema = z.object({
-  deviceId: z.string().min(1),
-  creatorId: z.string().min(1),
-  rangeKey: z.string().optional(),
-  campaigns: z.array(z.any()).max(2000),
-});
-
-router.post("/campaigns/upsert", async (req, res) => {
-  try {
-    const input = campaignsUpsertSchema.parse(req.body);
-    const userId = actorUserId(req);
-
-    const ctx = await loadCreatorWithAccess(req, res, input.creatorId);
-    if (!ctx) return;
-    const { creator } = ctx;
-    const device = await requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId: input.deviceId });
-
-    const cleanCampaigns = sanitizeCampaigns(input.campaigns);
-    let active = 0,
-      claimers = 0,
-      clicks = 0;
-    for (const c of cleanCampaigns) {
-      if (c?.is_active) active += 1;
-      claimers += Number(c?.claimers_count || 0);
-      clicks += Number(c?.clicks_count || 0);
-    }
-
-    const data = {
-      creatorId: creator.id,
-      agencyId: creator.agencyId,
-      rangeKey: input.rangeKey || "7d",
-      campaigns: cleanCampaigns,
-      totalActive: active,
-      totalClaimers: claimers,
-      totalClicks: clicks,
-      capturedAt: new Date(),
-      capturedByDeviceId: device.id,
-      capturedByUserId: userId,
-    };
-
-    const snapshot = await prisma.creatorCampaignsSnapshot.upsert({
-      where: { creatorId: creator.id },
-      create: data,
-      update: data,
-    });
-
-    return res.json({
-      ok: true,
-      snapshot: {
-        id: snapshot.id,
-        creatorId: snapshot.creatorId,
-        rangeKey: snapshot.rangeKey,
-        campaigns: sanitizeCampaigns(snapshot.campaigns),
-        totals: { active, claimers, clicks },
-        capturedAt: snapshot.capturedAt,
-        staleSeconds: 0,
-      },
-    });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    console.error("[stats/campaigns/upsert] failed:", err);
-    return res.status(Number(err?.status) || 500).json({
-      ok: false,
-      code: err?.code || "CAMPAIGNS_UPSERT_FAILED",
-      error: err?.message || "Failed",
-    });
-  }
-});
-
-// ════════════════════════════════════════════════════════════
-// GET /creators/:creatorId/earnings?range=7d
-// ════════════════════════════════════════════════════════════
-
-router.get("/creators/:creatorId/earnings", async (req, res) => {
-  try {
-    const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
-    if (!ctx) return;
-    if (!requireEarningsPermission(res, ctx.member)) return;
-
-    const range = String(req.query.range || "7d");
-    if (!VALID_RANGES.has(range)) {
-      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${range}` });
-    }
-
-    const snapshot = await prisma.creatorEarningsSnapshot.findUnique({
-      where: { creatorId_rangeKey: { creatorId: ctx.creator.id, rangeKey: range } },
-    });
-
-    if (!snapshot) {
-      return res.json({
-        ok: true,
-        snapshot: null,
-        creatorId: ctx.creator.id,
-        rangeKey: range,
-      });
-    }
-
-    return res.json({ ok: true, snapshot: snapshotForClient(snapshot) });
-  } catch (err) {
-    console.error("[stats/earnings/get] failed:", err);
-    return res.status(500).json({ ok: false, code: "EARNINGS_GET_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-// ════════════════════════════════════════════════════════════
-// GET /creators/:creatorId/campaigns
-// ════════════════════════════════════════════════════════════
-
-router.get("/creators/:creatorId/campaigns", async (req, res) => {
-  try {
-    const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
-    if (!ctx) return;
-    if (!requireEarningsPermission(res, ctx.member)) return;
-
-    const snapshot = await prisma.creatorCampaignsSnapshot.findUnique({
-      where: { creatorId: ctx.creator.id },
-    });
-
-    if (!snapshot) {
-      return res.json({ ok: true, snapshot: null, creatorId: ctx.creator.id });
-    }
-
-    return res.json({
-      ok: true,
-      snapshot: {
-        id: snapshot.id,
-        creatorId: snapshot.creatorId,
-        rangeKey: snapshot.rangeKey,
-        campaigns: sanitizeCampaigns(snapshot.campaigns),
-        totals: {
-          active: snapshot.totalActive,
-          claimers: snapshot.totalClaimers,
-          clicks: snapshot.totalClicks,
-        },
-        capturedAt: snapshot.capturedAt,
-        staleSeconds: Math.max(0, Math.floor((Date.now() - new Date(snapshot.capturedAt).getTime()) / 1000)),
-      },
-    });
-  } catch (err) {
-    console.error("[stats/campaigns/get] failed:", err);
-    return res.status(500).json({ ok: false, code: "CAMPAIGNS_GET_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-// ════════════════════════════════════════════════════════════
-// GET /creators/:creatorId/overview — earnings + campaigns combined
-// ════════════════════════════════════════════════════════════
-
-router.get("/creators/:creatorId/overview", async (req, res) => {
-  try {
-    const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
-    if (!ctx) return;
-    if (!requireEarningsPermission(res, ctx.member)) return;
-
-    const range = String(req.query.range || "7d");
-    if (!VALID_RANGES.has(range)) {
-      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${range}` });
-    }
-
-    const [earnings, campaigns, allRanges] = await Promise.all([
-      prisma.creatorEarningsSnapshot.findUnique({
-        where: { creatorId_rangeKey: { creatorId: ctx.creator.id, rangeKey: range } },
-      }),
-      prisma.creatorCampaignsSnapshot.findUnique({
-        where: { creatorId: ctx.creator.id },
-      }),
-      prisma.creatorEarningsSnapshot.findMany({
-        where: { creatorId: ctx.creator.id },
-        select: { rangeKey: true, capturedAt: true, totalCents: true },
-        take: 10000,
-      }),
-    ]);
-
-    return res.json({
-      ok: true,
-      creator: {
-        id: ctx.creator.id,
-        displayName: ctx.creator.displayName,
-        username: ctx.creator.username,
-        status: ctx.creator.status,
-      },
-      earnings: snapshotForClient(earnings),
-      campaigns: campaigns
-        ? {
-            campaigns: sanitizeCampaigns(campaigns.campaigns),
-            totals: { active: campaigns.totalActive, claimers: campaigns.totalClaimers, clicks: campaigns.totalClicks },
-            capturedAt: campaigns.capturedAt,
-            staleSeconds: Math.max(0, Math.floor((Date.now() - new Date(campaigns.capturedAt).getTime()) / 1000)),
-          }
-        : null,
-      availableRanges: allRanges.map((r) => ({
-        rangeKey: r.rangeKey,
-        capturedAt: r.capturedAt,
-        totalCents: bigToNum(r.totalCents),
-      })),
-    });
-  } catch (err) {
-    console.error("[stats/overview] failed:", err);
-    return res.status(500).json({ ok: false, code: "OVERVIEW_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-// ════════════════════════════════════════════════════════════
-// GET /agencies/:agencyId/earnings/summary?range=7d
-// — Aggregated view for owner dashboard.
-// ════════════════════════════════════════════════════════════
-
-router.get("/agencies/:agencyId/earnings/summary", async (req, res) => {
-  try {
-    const ctx = await loadAgencyAccess(req, res, req.params.agencyId);
-    if (!ctx) return;
-    if (!requireEarningsPermission(res, ctx.member)) return;
-
-    const range = String(req.query.range || "7d");
-    if (!VALID_RANGES.has(range)) {
-      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${range}` });
-    }
-
-    const snapshots = await prisma.creatorEarningsSnapshot.findMany({
-      where: {
-        agencyId: ctx.agency.id,
-        rangeKey: range,
-        ...(ctx.scope.broad ? {} : { creatorId: { in: ctx.scope.creatorIds.length ? ctx.scope.creatorIds : ["__none__"] } }),
-      },
-      include: {
-        creator: { select: { id: true, displayName: true, username: true, avatarUrl: true, status: true } },
-      },
-      orderBy: { totalCents: "desc" },
-      take: 10000,
-    });
-
-    let totalCents = 0n;
-    let salesCount = 0;
-    let uniqueFans = 0;
-
-    for (const s of snapshots) {
-      totalCents += BigInt(s.totalCents || 0);
-      salesCount += s.salesCount;
-      uniqueFans += s.uniqueFans;
-    }
-
-    return res.json({
-      ok: true,
-      agencyId: ctx.agency.id,
-      rangeKey: range,
-      totals: {
-        total: bigToNum(totalCents),
-        salesCount,
-        uniqueFans,
-        creatorCount: snapshots.length,
-      },
-      perCreator: snapshots.map((s) => ({
-        creator: s.creator,
-        total: bigToNum(s.totalCents),
-        salesCount: s.salesCount,
-        uniqueFans: s.uniqueFans,
-        capturedAt: s.capturedAt,
-        staleSeconds: Math.max(0, Math.floor((Date.now() - new Date(s.capturedAt).getTime()) / 1000)),
-      })),
-    });
-  } catch (err) {
-    console.error("[stats/agency-summary] failed:", err);
-    return res.status(500).json({ ok: false, code: "AGENCY_SUMMARY_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-// ════════════════════════════════════════════════════════════
-// POST /creators/:creatorId/refresh — owner clicks "refresh now"
-// Bumps priority + nextRunAt for all jobs of this creator.
-// Creates jobs if missing.
-// ════════════════════════════════════════════════════════════
-
+// Current Creator Analytics refresh: one earnings freshness demand plus the
+// already-canonical non-earnings catch-up/subscriber control planes.
 router.post("/creators/:creatorId/refresh", async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, req.params.creatorId);
     if (!ctx) return;
     if (!requireRefreshPermission(res, ctx.member)) return;
     const { creator } = ctx;
-
-    const range = String(req.body?.rangeKey || req.query?.rangeKey || "7d");
-    if (!VALID_RANGES.has(range)) {
-      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${range}` });
+    let range;
+    try {
+      range = normalizeCreatorOverviewRangeKey(req.body?.rangeKey || req.query?.rangeKey || "30d");
+    } catch {
+      return res.status(400).json({
+        ok: false, code: "INVALID_OVERVIEW_RANGE",
+        error: `Invalid overview range: ${String(req.body?.rangeKey || req.query?.rangeKey || "")}`,
+      });
     }
-
     const now = new Date();
-    // A generic UI refresh is not a second analytics scheduler. It may refresh
-    // the cheap range snapshot/subscriber directory, while notification,
-    // financial-transaction and campaign catch-ups remain exclusively owned by
-    // the Creator Analytics orchestrator and its freshness/initial-sync gates.
     const [earnings, analyticsCatchups, subscribers] = await Promise.all([
-      scheduleJobNow({
-        jobKey: "fetch_earnings",
+      ensureAnalyticsFreshness({
+        db: prisma,
         creatorId: creator.id,
         agencyId: creator.agencyId,
-        params: { rangeKey: range },
+        rangeKey: range,
+        reason: "INTERACTIVE_REFRESH",
         priority: 100,
         now,
-        bucketMs: 60_000,
       }),
-      ensureRecurringCreatorAnalyticsCatchups({
-        creatorId: creator.id,
-        agencyId: creator.agencyId,
-        now,
-        priority: 95,
-      }),
+      ensureRecurringCreatorAnalyticsCatchups({ creatorId: creator.id, agencyId: creator.agencyId, now, priority: 95 }),
       scheduleSubscriberScan({
         agencyId: creator.agencyId,
         creatorId: creator.id,
@@ -618,141 +226,28 @@ router.post("/creators/:creatorId/refresh", async (req, res) => {
         reason: "creator_analytics_refresh",
       }),
     ]);
-
-    const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
-    const onlineBindings = await prisma.deviceCreatorBinding.count({
-      where: {
-        creatorId: creator.id,
-        agencyId: creator.agencyId,
-        status: "ACTIVE",
-        sessionReadReady: true,
-        lastSeenAt: { gte: freshAfter },
-        device: { lastSeenAt: { gte: freshAfter } },
-      },
-    });
-
     return res.json({
       ok: true,
-      onlineWorkers: onlineBindings,
-      jobs: [
-        { id: earnings.job.id, jobKey: "fetch_earnings", rangeKey: range, reason: earnings.reason },
-        { id: subscribers.job?.id || subscribers.run?.jobId || null, jobKey: "subscriber_directory_scan", rangeKey: "all", reason: subscribers.reason },
-      ],
+      rangeKey: earnings.rangeKey,
+      earnings: {
+        dueDays: earnings.dueDays,
+        windows: earnings.windows,
+        created: earnings.created,
+        reused: earnings.reused,
+        jobs: earnings.jobs.map((job) => ({ id: job?.id || null, status: job?.status || null })),
+      },
       analyticsCatchups: {
         ready: analyticsCatchups.ready === true,
         created: analyticsCatchups.created || [],
         skipped: analyticsCatchups.skipped || [],
         initial: analyticsCatchups.initial || null,
       },
-      message:
-        onlineBindings === 0
-          ? "Refresh accepted, but no SESSION_READ-capable desktop currently sees this creator."
-          : `Refresh accepted. ${onlineBindings} SESSION_READ-capable worker(s) can pick up due work.`,
+      subscriberJobId: subscribers.job?.id || subscribers.run?.jobId || null,
     });
   } catch (err) {
+    const status = Number(err?.status) || (err?.code === "ANALYTICS_RANGE_INVALID" ? 400 : 500);
     console.error("[stats/refresh-creator] failed:", err);
-    return res.status(500).json({ ok: false, code: "REFRESH_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-// ════════════════════════════════════════════════════════════
-// POST /agencies/:agencyId/refresh — owner clicks "refresh all creators"
-// ════════════════════════════════════════════════════════════
-
-router.post("/agencies/:agencyId/refresh", async (req, res) => {
-  try {
-    const ctx = await loadAgencyAccess(req, res, req.params.agencyId);
-    if (!ctx) return;
-    if (!requireRefreshPermission(res, ctx.member)) return;
-
-    const range = String(req.body?.rangeKey || req.query?.rangeKey || "7d");
-    if (!VALID_RANGES.has(range)) {
-      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${range}` });
-    }
-
-    const creators = await prisma.creatorAccount.findMany({
-      where: {
-        agencyId: ctx.agency.id,
-        deletedAt: null,
-        status: "READY",
-        ...(ctx.scope.broad ? {} : { id: { in: ctx.scope.creatorIds.length ? ctx.scope.creatorIds : ["__none__"] } }),
-      },
-      select: { id: true, agencyId: true },
-      take: 10000,
-    });
-
-    const now = new Date();
-    let jobsScheduled = 0;
-    let alreadyClaimed = 0;
-    let analyticsCatchupsCreated = 0;
-    const failedCreators = [];
-    const batchSize = range === "all" ? 5 : 20;
-
-    // Bounded batch fan-out is retained, but the three durable Creator
-    // Analytics history/catch-up jobs are no longer created here. Every creator
-    // delegates those decisions to the single lifecycle orchestrator.
-    for (let offset = 0; offset < creators.length; offset += batchSize) {
-      const batch = creators.slice(offset, offset + batchSize);
-      const settled = await Promise.allSettled(
-        batch.map(async (creator) => {
-          const [earnings, analyticsCatchups] = await Promise.all([
-            scheduleJobNow({
-              jobKey: "fetch_earnings",
-              creatorId: creator.id,
-              agencyId: creator.agencyId,
-              params: { rangeKey: range },
-              priority: 50,
-              now,
-              bucketMs: 60_000,
-            }),
-            ensureRecurringCreatorAnalyticsCatchups({
-              creatorId: creator.id,
-              agencyId: creator.agencyId,
-              now,
-              priority: 45,
-            }),
-          ]);
-          return { creatorId: creator.id, earnings, analyticsCatchups };
-        })
-      );
-
-      for (let index = 0; index < settled.length; index += 1) {
-        const result = settled[index];
-        const creatorId = batch[index]?.id || null;
-        if (result.status === "rejected") {
-          failedCreators.push({
-            creatorId,
-            code: String(result.reason?.code || "ANALYTICS_JOB_SCHEDULE_FAILED"),
-          });
-          continue;
-        }
-        if (result.value.earnings.reason === "already_claimed") alreadyClaimed += 1;
-        else jobsScheduled += 1;
-        analyticsCatchupsCreated += Array.isArray(result.value.analyticsCatchups?.created)
-          ? result.value.analyticsCatchups.created.length
-          : 0;
-      }
-    }
-
-    const creatorsScheduled = creators.length - failedCreators.length;
-    return res.json({
-      ok: true,
-      // Preserve the pre-Creator-Overview refresh contract used by Home while
-      // exposing the newer orchestration diagnostics additively. Do not rename
-      // these compatibility fields: HomeService normalizes creatorsScheduled.
-      creators: creators.length,
-      creatorsScheduled,
-      creatorsRequested: creators.length,
-      jobsScheduled,
-      alreadyClaimed,
-      analyticsCatchupsCreated,
-      failedCreators,
-      failedCount: failedCreators.length,
-      failures: failedCreators.slice(0, 50),
-    });
-  } catch (err) {
-    console.error("[stats/refresh-agency] failed:", err);
-    return res.status(500).json({ ok: false, code: "AGENCY_REFRESH_FAILED", error: err?.message || "Failed" });
+    return res.status(status).json({ ok: false, code: err?.code || "REFRESH_FAILED", error: err?.message || "Failed" });
   }
 });
 
@@ -764,45 +259,16 @@ const liveNotificationSchema = z.object({
   events: z.array(z.record(z.unknown())).min(1).max(100),
 });
 
-const messagesDailySchema = z.object({
-  deviceId: z.string().min(3).max(160),
-  syncId: z.string().uuid(),
-  observedAt: z.string().datetime({ offset: true }),
-  sourceTimezone: z.literal("UTC").default("UTC"),
-  localCoverage: z.object({
-    complete: z.boolean(),
-    knownDialogs: z.number().int().nonnegative(),
-    incompleteDialogs: z.number().int().nonnegative(),
-    messagesIndexed: z.number().int().nonnegative(),
-    oldestMessageAt: z.string().datetime({ offset: true }).nullable(),
-    newestMessageAt: z.string().datetime({ offset: true }).nullable(),
-  }).superRefine((value, ctx) => {
-    if (value.incompleteDialogs > value.knownDialogs) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "incompleteDialogs cannot exceed knownDialogs" });
-    const provable = value.knownDialogs > 0 && value.incompleteDialogs === 0;
-    if (value.complete !== provable) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "localCoverage.complete does not match dialog counters" });
-    if (value.oldestMessageAt && value.newestMessageAt && new Date(value.oldestMessageAt) > new Date(value.newestMessageAt)) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "localCoverage oldestMessageAt cannot be after newestMessageAt" });
-    }
-  }),
-  rows: z.array(z.object({
-    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-    incomingMessages: z.number().int().nonnegative(),
-    outgoingMessages: z.number().int().nonnegative(),
-    totalMessages: z.number().int().nonnegative(),
-    uniqueDialogs: z.number().int().nonnegative(),
-    uniqueIncomingFans: z.number().int().nonnegative(),
-    uniqueOutgoingFans: z.number().int().nonnegative(),
-  })).max(50),
-});
-
 router.get("/creators/:creatorId/overview-v2", async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
     if (!ctx) return;
     if (!requireEarningsPermission(res, ctx.member)) return;
-    const rangeKey = String(req.query.range || "30d");
-    if (!["7d", "30d", "90d", "180d", "365d"].includes(rangeKey)) {
-      return res.status(400).json({ ok: false, code: "INVALID_OVERVIEW_RANGE", error: `Invalid overview range: ${rangeKey}` });
+    let rangeKey;
+    try {
+      rangeKey = normalizeCreatorOverviewRangeKey(req.query.range || "30d");
+    } catch {
+      return res.status(400).json({ ok: false, code: "INVALID_OVERVIEW_RANGE", error: `Invalid overview range: ${String(req.query.range || "")}` });
     }
     const overview = await readCreatorOverview({ creatorId: ctx.creator.id, rangeKey });
     return res.json(overview);
@@ -846,44 +312,6 @@ router.get("/creators/:creatorId/task-activity", async (req, res) => {
   }
 });
 
-router.get("/creators/:creatorId/ledger-overview", async (req, res) => {
-  try {
-    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
-    if (!ctx) return;
-    if (!requireEarningsPermission(res, ctx.member)) return;
-    const rangeKey = String(req.query.range || "30d");
-    if (!VALID_RANGES.has(rangeKey)) {
-      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${rangeKey}` });
-    }
-    const overview = await readCreatorLedgerOverview({ creatorId: ctx.creator.id, rangeKey });
-    return res.json(overview);
-  } catch (error) {
-    console.error("[stats/ledger-overview] failed:", error);
-    return res.status(500).json({ ok: false, code: "CREATOR_LEDGER_OVERVIEW_FAILED", error: error?.message || "Failed" });
-  }
-});
-
-
-router.get("/creators/:creatorId/ledger-coverage", async (req, res) => {
-  try {
-    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
-    if (!ctx) return;
-    if (!requireEarningsPermission(res, ctx.member)) return;
-    const rangeKey = String(req.query.range || "30d");
-    if (!VALID_RANGES.has(rangeKey)) {
-      return res.status(400).json({ ok: false, code: "INVALID_RANGE", error: `Invalid range: ${rangeKey}` });
-    }
-    const limit = Math.max(1, Math.min(500, Number.parseInt(String(req.query.limit || "120"), 10) || 120));
-    const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
-    const page = await readCreatorCoverage({ creatorId: ctx.creator.id, rangeKey, limit, offset });
-    return res.json({ ok: true, creatorId: ctx.creator.id, ...page });
-  } catch (error) {
-    console.error("[stats/ledger-coverage] failed:", error);
-    return res.status(500).json({ ok: false, code: "CREATOR_LEDGER_COVERAGE_FAILED", error: error?.message || "Failed" });
-  }
-});
-
-
 router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
@@ -895,9 +323,13 @@ router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) =
     if (!campaignId || campaignId.length > 220) {
       return res.status(400).json({ ok: false, code: "INVALID_CAMPAIGN_ID", error: "Invalid campaign id" });
     }
-    const rangeKey = String(req.query.range || "").trim() || null;
-    if (rangeKey && !["7d", "30d", "90d", "180d", "365d"].includes(rangeKey)) {
-      return res.status(400).json({ ok: false, code: "INVALID_CAMPAIGN_FAN_RANGE", error: `Invalid campaign fan range: ${rangeKey}` });
+    let rangeKey = null;
+    if (String(req.query.range || "").trim()) {
+      try {
+        rangeKey = normalizeCreatorOverviewRangeKey(req.query.range);
+      } catch {
+        return res.status(400).json({ ok: false, code: "INVALID_CAMPAIGN_FAN_RANGE", error: `Invalid campaign fan range: ${String(req.query.range || "")}` });
+      }
     }
     const result = await readCampaignFans({
       creatorId: ctx.creator.id,
@@ -1164,53 +596,5 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
   }
 });
 
-router.post("/creators/:creatorId/messages-daily", async (req, res) => {
-  try {
-    const input = messagesDailySchema.parse(req.body || {});
-    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
-    if (!ctx) return;
-    // Daily message facts are machine-plane observations. Authorization is
-    // creator scope + the signed auth device + a fresh creator binding; the
-    // operator-facing analytics refresh permission must not gate ingestion.
-    const userId = actorUserId(req);
-    const boundDeviceId = requireAuthDevice(req, input.deviceId, {
-      requiredCode: "MESSAGES_DAILY_DEVICE_BOUND_TOKEN_REQUIRED",
-      mismatchCode: "DEVICE_IDENTITY_MISMATCH",
-    });
-    const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
-    const device = await prisma.workerDevice.findFirst({
-      where: { id: boundDeviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: { gte: freshAfter } },
-      select: { id: true, lastSeenAt: true },
-    });
-    if (!device) return res.status(403).json({ ok: false, code: "MESSAGES_DAILY_DEVICE_FORBIDDEN", error: "The authenticated reporting device is not owned by this agency member" });
-    const binding = await prisma.deviceCreatorBinding.findFirst({
-      where: {
-        deviceId: device.id,
-        creatorId: ctx.creator.id,
-        agencyId: ctx.creator.agencyId,
-        status: "ACTIVE",
-        ...(Number.isInteger(Number(ctx.member?.accessEpoch)) ? { accessEpoch: Number(ctx.member.accessEpoch) } : {}),
-        lastSeenAt: { gte: freshAfter },
-      },
-      select: { id: true },
-    });
-    if (!binding) return res.status(409).json({ ok: false, code: "MESSAGES_DAILY_CREATOR_NOT_PRESENT", error: "The authenticated reporting device has no fresh creator presence for this creator" });
-    const rows = input.rows.map((row) => ({ ...row, sourceTimezone: input.sourceTimezone }));
-    const result = await upsertMessagesDaily({
-      agencyId: ctx.creator.agencyId,
-      creatorId: ctx.creator.id,
-      rows,
-      syncId: input.syncId,
-      observedAt: input.observedAt,
-      sourceDeviceId: device.id,
-      localCoverage: input.localCoverage,
-    });
-    return res.json({ ok: true, creatorId: ctx.creator.id, ...result });
-  } catch (error) {
-    if (error?.issues) return validationError(res, error);
-    console.error("[stats/messages-daily] failed:", error);
-    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "MESSAGES_DAILY_UPSERT_FAILED", error: error?.message || "Failed" });
-  }
-});
 
 module.exports = router;

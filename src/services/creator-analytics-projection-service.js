@@ -234,7 +234,7 @@ async function queryDaily(db, sql, creatorId, from, toExclusive) {
   return db.$queryRawUnsafe(sql, creatorId, from, toExclusive);
 }
 
-async function rebuildCreatorDailyMetrics({ db = null, agencyId, creatorId, from, to, now = new Date() }) {
+async function rebuildCreatorDailyMetrics({ db = null, agencyId, creatorId, from, to, now = new Date(), includeMessages = false }) {
   db = defaultDb(db);
   const map = makeDayMap(from, to);
   const start = utcDay(from);
@@ -242,7 +242,7 @@ async function rebuildCreatorDailyMetrics({ db = null, agencyId, creatorId, from
   const endExclusive = new Date(end.getTime() + 86_400_000);
 
   const [messages, likes, comments, subscriptions, sales, tips, paidSubscriptions] = await Promise.all([
-    queryDaily(db, `SELECT "date" AS day, SUM("incomingMessages")::bigint AS incoming, SUM("outgoingMessages")::bigint AS outgoing, MAX("uniqueDialogs")::bigint AS dialogs FROM "CreatorMessagesDaily" WHERE "creatorId"=$1 AND "date">=$2 AND "date"<$3 GROUP BY "date"`, creatorId, start, endExclusive),
+    includeMessages ? queryDaily(db, `SELECT "date" AS day, SUM("incomingMessages")::bigint AS incoming, SUM("outgoingMessages")::bigint AS outgoing, MAX("uniqueDialogs")::bigint AS dialogs FROM "CreatorMessagesDaily" WHERE "creatorId"=$1 AND "date">=$2 AND "date"<$3 GROUP BY "date"`, creatorId, start, endExclusive) : Promise.resolve([]),
     queryDaily(db, `SELECT date_trunc('day', "likedAt") AS day, COUNT(*)::bigint AS count, COUNT(DISTINCT "fanId")::bigint AS fans FROM "CreatorPostLike" WHERE "creatorId"=$1 AND "likedAt">=$2 AND "likedAt"<$3 GROUP BY 1`, creatorId, start, endExclusive),
     queryDaily(db, `SELECT date_trunc('day', "commentedAt") AS day, COUNT(*)::bigint AS count, COUNT(DISTINCT "fanId")::bigint AS fans FROM "CreatorPostComment" WHERE "creatorId"=$1 AND "commentedAt">=$2 AND "commentedAt"<$3 GROUP BY 1`, creatorId, start, endExclusive),
     queryDaily(db, `SELECT date_trunc('day', "occurredAt") AS day, COUNT(*) FILTER (WHERE "eventType" IN ('SUBSCRIBED_FREE','SUBSCRIBED_PAID','SUBSCRIBED_UNKNOWN'))::bigint AS subscribed, COUNT(*) FILTER (WHERE "eventType"='RENEWED')::bigint AS renewed, COUNT(*) FILTER (WHERE "eventType"='EXPIRED')::bigint AS expired, COUNT(*) FILTER (WHERE "eventType"='AUTO_RENEW_DISABLED')::bigint AS auto_renew_disabled FROM "CreatorSubscriptionEvent" WHERE "creatorId"=$1 AND "occurredAt">=$2 AND "occurredAt"<$3 GROUP BY 1`, creatorId, start, endExclusive),

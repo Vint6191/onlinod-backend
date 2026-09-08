@@ -134,6 +134,15 @@ async function campaignInitialCoverageReady(db, creatorId) {
   return Boolean(row);
 }
 
+async function creatorAnalyticsInitialSyncReady({ db = prisma, creatorId } = {}) {
+  if (!creatorId) return false;
+  const notificationState = await loadNotificationSyncState(db, creatorId);
+  if (!notificationHistoricalBaselineReady(notificationState)) return false;
+  if (!(await financialInitialCoverageReady(db, creatorId))) return false;
+  if (!(await campaignInitialCoverageReady(db, creatorId))) return false;
+  return true;
+}
+
 async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agencyId, now = new Date(), priority = 95 } = {}) {
   if (!creatorId || !agencyId) return { ready: false, stage: "invalid", created: false, reason: "missing_scope" };
 
@@ -387,4 +396,5 @@ module.exports = {
   campaignCatchupState,
   financialInitialCoverageReady,
   campaignInitialCoverageReady,
+  creatorAnalyticsInitialSyncReady,
 };

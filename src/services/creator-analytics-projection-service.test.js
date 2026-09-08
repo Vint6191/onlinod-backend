@@ -75,7 +75,7 @@ test("daily metrics are a derived relational cache, including paid subscriptions
     },
     creatorDailyMetrics: { upsert: async (args) => { upserts.push(args); return args.create; } },
   };
-  const result = await rebuildCreatorDailyMetrics({ db, agencyId: "a", creatorId: "c", from: new Date("2026-08-01T00:00:00Z"), to: new Date("2026-08-01T23:59:00Z"), now: new Date("2026-08-02T00:00:00Z") });
+  const result = await rebuildCreatorDailyMetrics({ db, agencyId: "a", creatorId: "c", from: new Date("2026-08-01T00:00:00Z"), to: new Date("2026-08-01T23:59:00Z"), now: new Date("2026-08-02T00:00:00Z"), includeMessages: true });
   assert.equal(result.days, 1);
   const row = upserts[0].create;
   assert.equal(row.likes, 4);

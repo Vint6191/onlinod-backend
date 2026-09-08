@@ -5,8 +5,8 @@ const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
 const { projectFanIdentity, projectFanValue } = require("./fan-data-authority-service");
+const { displayRangeBounds, scanContractFromJob } = require("./analytics-range-contract");
 
-const RANGE_DAYS = Object.freeze({ "24h": 1, "7d": 7, "30d": 30, "90d": 90, "180d": 180, "365d": 365 });
 const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v7";
 const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", CAMPAIGN_COLLECTOR_VERSION]);
 const CAMPAIGN_SCHEMA_VERSION = 4;
@@ -70,30 +70,26 @@ function utcDayEnd(value) {
 function compareDate(a, b) {
   return a.getTime() - b.getTime();
 }
-const EARNINGS_RANGE_KEYS = new Set(["24h", "7d", "30d", "90d", "180d", "365d", "ytd", "prev_year", "all"]);
 function rangeBounds(rangeKey, now = new Date()) {
-  const end = new Date(now);
-  const key = String(rangeKey || "30d").toLowerCase();
-  let start;
-  if (key === "24h") {
-    start = utcDay(end);
-  } else if (RANGE_DAYS[key]) {
-    start = utcDay(end);
-    start.setUTCDate(start.getUTCDate() - (RANGE_DAYS[key] - 1));
-  } else if (key === "ytd") {
-    start = new Date(Date.UTC(end.getUTCFullYear(), 0, 1));
-  } else if (key === "prev_year") {
-    start = new Date(Date.UTC(end.getUTCFullYear() - 1, 0, 1));
-    end.setTime(Date.UTC(end.getUTCFullYear(), 0, 1) - 1);
-  } else {
-    start = new Date(Date.UTC(2016, 0, 1));
-  }
-  return { key, start, end, dayStart: utcDay(start), dayEnd: utcDay(end) };
+  const range = displayRangeBounds(rangeKey, now);
+  return {
+    key: range.rangeKey,
+    start: range.startAt,
+    end: range.endAt,
+    dayStart: range.startDay,
+    dayEnd: range.endDay,
+  };
 }
-function earningsJobBounds(job, observedAt) {
-  const key = String(job?.params?.rangeKey || "7d").trim().toLowerCase();
-  if (!EARNINGS_RANGE_KEYS.has(key)) throw new Error("Earnings job rangeKey is invalid");
-  return rangeBounds(key, observedAt);
+function earningsJobBounds(job) {
+  const contract = scanContractFromJob(job);
+  return {
+    key: contract.displayRangeKey || null,
+    start: contract.scanFrom,
+    end: utcDayEnd(contract.scanTo),
+    dayStart: contract.scanFrom,
+    dayEnd: contract.scanTo,
+    contract,
+  };
 }
 function requireJob(job) {
   if (!job?.id || !job?.creatorId || !job?.agencyId) {
@@ -286,7 +282,7 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
   if (idempotencyKey.length > 240) throw new Error("Earnings idempotency key exceeds 240 characters");
   const observedAt = strictDate(payload.observedAt);
   if (!observedAt) throw new Error("Earnings page observedAt must be an ISO date-time with timezone");
-  const requestedRange = earningsJobBounds(job, observedAt);
+  const requestedRange = earningsJobBounds(job);
   const rawRows = array(payload.rows);
   if (rawRows.length > 50) throw new Error("Earnings page exceeds 50 rows");
   const scannerRejected = integer(payload.scannerRejected, 10_000);
@@ -303,9 +299,10 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
     if (rowKeys.has(key)) throw new Error(`Earnings page contains duplicate row ${key}`);
     rowKeys.add(key);
   }
-  const rangeFrom = rows[0]?.date || observedAt;
-  const rangeTo = rows.length ? utcDayEnd(rows.at(-1).date) : observedAt;
+  const rangeFrom = rows[0]?.date || requestedRange.dayStart;
+  const rangeTo = rows.length ? utcDayEnd(rows.at(-1).date) : utcDayEnd(requestedRange.dayEnd);
   return inTransaction(db, async (tx) => {
+    const serverReceivedAt = new Date();
     await acquireAnalyticsLock(tx, "creator-earnings", job.creatorId);
     const { batch, replay } = await beginBatch(tx, {
       job,
@@ -324,14 +321,17 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
     let inserted = 0;
     let updated = 0;
     let unchanged = 0;
-    const currentDay = utcDay(observedAt);
+    const currentDay = utcDay(serverReceivedAt);
     for (const row of rows) {
       const where = { creatorId_date_sourceTimezone: { creatorId: job.creatorId, date: row.date, sourceTimezone: row.sourceTimezone } };
-      const existing = await tx.creatorEarningsDaily.findUnique({ where, select: { id: true, collectedAt: true } });
-      const existingCollectedAt = existing?.collectedAt instanceof Date
-        ? existing.collectedAt
-        : existing?.collectedAt ? new Date(existing.collectedAt) : null;
-      if (existingCollectedAt && Number.isFinite(existingCollectedAt.getTime()) && existingCollectedAt > observedAt) {
+      const existing = await tx.creatorEarningsDaily.findUnique({
+        where,
+        select: { id: true, sourceScanRequestedAt: true },
+      });
+      const existingRequestedAt = existing?.sourceScanRequestedAt instanceof Date
+        ? existing.sourceScanRequestedAt
+        : existing?.sourceScanRequestedAt ? new Date(existing.sourceScanRequestedAt) : null;
+      if (existingRequestedAt && Number.isFinite(existingRequestedAt.getTime()) && existingRequestedAt > requestedRange.contract.requestedAt) {
         unchanged += 1;
         continue;
       }
@@ -340,7 +340,9 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
         creatorId: job.creatorId,
         ...row,
         sourceScanRunId: scanRunId,
-        collectedAt: observedAt,
+        sourceScanRequestedAt: requestedRange.contract.requestedAt,
+        scanProofId: null,
+        collectedAt: serverReceivedAt,
         sourceDeviceId: deviceId || null,
         sourceJobId: job.id,
       };
@@ -356,9 +358,9 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
         sourceTimezone: row.sourceTimezone,
         status: "PARTIAL",
         coveredFromAt: row.date,
-        coveredToAt: isCurrentDay ? observedAt : utcDayEnd(row.date),
+        coveredToAt: isCurrentDay ? serverReceivedAt : utcDayEnd(row.date),
         errorCode: isCurrentDay ? "EARNINGS_DAY_IN_PROGRESS" : "EARNINGS_SCAN_PENDING",
-        verifiedAt: observedAt,
+        verifiedAt: serverReceivedAt,
       });
     }
     const rejected = scannerRejected + rejectedRows;
@@ -390,7 +392,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
   if (expectedDailyBatches === null || expectedDailyCount === null || scannerRejected === null) throw new Error("Earnings completion counters are invalid");
   const observedAt = strictDate(payload.observedAt);
   if (!observedAt) throw new Error("Earnings completion observedAt must be an ISO date-time with timezone");
-  const requestedRange = earningsJobBounds(job, observedAt);
+  const requestedRange = earningsJobBounds(job);
   const range = object(payload.range);
   const startDate = dateOnly(String(range.startDate || ""));
   const endDate = dateOnly(String(range.endDate || ""));
@@ -401,6 +403,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
   const key = `earnings:${job.id}:run:${scanRunId}:completion:v4`;
   if (key.length > 240) throw new Error("Earnings completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
+    const serverReceivedAt = new Date();
     const { batch, replay } = await beginBatch(tx, {
       job,
       deviceId,
@@ -439,7 +442,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       dailyComplete: payload.dailyComplete === true,
       scannerRejected,
     };
-    const complete =
+    const evaluatedComplete =
       payload.chartComplete === true &&
       payload.dailyComplete === true &&
       scannerRejected === 0 &&
@@ -448,16 +451,102 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       expectedDailyCount === requestedDayCount &&
       acceptedRows === expectedDailyCount &&
       persistedDailyCount === expectedDailyCount;
+
+    // Durable proof is the business/audit authority after operational ingest rows
+    // become eligible for compaction. Replaying the exact immutable completion
+    // payload after page-batch retention must therefore remain idempotently
+    // COMMITTED instead of re-inferring PARTIAL from missing technical history.
+    let scanProof = await tx.analyticsScanProof.findUnique({
+      where: { creatorId_dataType_scanRunId: { creatorId: job.creatorId, dataType: "EARNINGS", scanRunId } },
+    });
+    if (scanProof) {
+      if (scanProof.payloadChecksum !== batch.payloadChecksum
+        || utcDay(scanProof.scanFrom).getTime() !== requestedRange.dayStart.getTime()
+        || utcDay(scanProof.scanTo).getTime() !== requestedRange.dayEnd.getTime()) {
+        throw new Error("Analytics scan proof idempotency conflict");
+      }
+    }
+    // AnalyticsScanProof outlives every operational AnalyticsIngestBatch row.
+    // A late replay may therefore arrive after retention removed both page and
+    // completion batches. Matching COMMITTED durable proof remains sufficient
+    // business evidence; technical history must never be required to re-prove it.
+    const durableCommittedReplay = scanProof?.status === "COMMITTED";
+    const complete = evaluatedComplete || durableCommittedReplay;
     const desiredStatus = complete ? "COMMITTED" : "PARTIAL";
-    if (!replay || batch.status !== desiredStatus) {
-      await finishBatch(
+    const completionBatch = (!replay || batch.status !== desiredStatus)
+      ? await finishBatch(
         tx,
         batch.id,
         { received: expectedDailyCount + scannerRejected, unchanged: expectedDailyCount, rejected: scannerRejected },
         desiredStatus,
         complete ? null : "EARNINGS_SCAN_PROOF_INCOMPLETE",
         complete ? null : proofMessage(proof),
-      );
+      )
+      : batch;
+
+    const proofRejectedRows = pageBatches.reduce((sum, row) => sum + Number(row.rejectedRows || 0), 0) + scannerRejected;
+    if (scanProof) {
+
+      // Completion is intentionally replayable. A first attempt may arrive before
+      // every asynchronously-reported page has committed and therefore create a
+      // PARTIAL receipt. Re-evaluating the same immutable completion payload may
+      // later prove the scan complete. Receipt state is monotonic: PARTIAL may be
+      // promoted to COMMITTED, but an already-COMMITTED durable proof is never
+      // downgraded because operational page history was compacted or a stale retry
+      // observed less transient execution evidence.
+      if (scanProof.status !== "COMMITTED") {
+        scanProof = await tx.analyticsScanProof.update({
+          where: { id: scanProof.id },
+          data: {
+            status: desiredStatus,
+            committedAt: complete ? serverReceivedAt : null,
+            serverReceivedAt,
+            clientObservedAt: observedAt,
+            sourceDeviceId: deviceId || scanProof.sourceDeviceId || null,
+            sourceJobId: scanProof.sourceJobId || job.id,
+            rowCount: acceptedRows,
+            rejectedRows: proofRejectedRows,
+          },
+        });
+      }
+    } else {
+      scanProof = await tx.analyticsScanProof.create({
+        data: {
+          agencyId: job.agencyId,
+          creatorId: job.creatorId,
+          dataType: "EARNINGS",
+          scanRunId,
+          sourceTimezone: requestedRange.contract.sourceTimezone,
+          scanFrom: requestedRange.dayStart,
+          scanTo: requestedRange.dayEnd,
+          requestedAt: requestedRange.contract.requestedAt,
+          clientObservedAt: observedAt,
+          serverReceivedAt,
+          committedAt: complete ? serverReceivedAt : null,
+          status: desiredStatus,
+          collectorVersion: EARNINGS_COLLECTOR_VERSION,
+          schemaVersion: EARNINGS_SCHEMA_VERSION,
+          scanGeneration: requestedRange.contract.scanGeneration,
+          collectionReason: requestedRange.contract.collectionReason,
+          sourceDeviceId: deviceId || null,
+          sourceJobId: job.id,
+          rowCount: acceptedRows,
+          rejectedRows: proofRejectedRows,
+          payloadChecksum: completionBatch.payloadChecksum,
+        },
+      });
+    }
+
+    await tx.creatorEarningsDaily.updateMany({
+      where: { creatorId: job.creatorId, sourceJobId: job.id, sourceScanRunId: scanRunId },
+      data: { scanProofId: scanProof.id, sourceScanRequestedAt: requestedRange.contract.requestedAt },
+    });
+
+    if (pageBatches.length) {
+      await tx.analyticsCoverage.updateMany({
+        where: { creatorId: job.creatorId, dataType: "EARNINGS", ingestBatchId: { in: pageBatches.map((row) => row.id) } },
+        data: { scanProofId: scanProof.id },
+      });
     }
     if (complete && pageBatches.length) {
       await tx.analyticsCoverage.updateMany({
@@ -465,20 +554,21 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
           creatorId: job.creatorId,
           dataType: "EARNINGS",
           ingestBatchId: { in: pageBatches.map((row) => row.id) },
-          coverageDate: { lt: utcDay(observedAt) },
+          coverageDate: { lt: utcDay(serverReceivedAt) },
           status: "PARTIAL",
           lastErrorCode: "EARNINGS_SCAN_PENDING",
         },
         data: {
           status: "COMPLETE",
-          lastVerifiedAt: observedAt,
+          scanProofId: scanProof.id,
+          lastVerifiedAt: serverReceivedAt,
           lastErrorCode: null,
           lastErrorMessage: null,
           retryAfterAt: null,
         },
       });
     }
-    return { batchId: batch.id, complete, replay, proof };
+    return { batchId: batch.id, scanProofId: scanProof.id, complete, replay: replay || durableCommittedReplay, proof };
   });
 }
 
@@ -1108,7 +1198,7 @@ async function upsertMessagesDaily({ db = prisma, agencyId, creatorId, rows, syn
   if (!result.replay && normalized.length && db.creatorDailyMetrics) {
     try {
       await rebuildCreatorDailyMetrics({
-        db, agencyId, creatorId, from: normalized[0].date, to: normalized.at(-1).date, now: observed,
+        db, agencyId, creatorId, from: normalized[0].date, to: normalized.at(-1).date, now: observed, includeMessages: true,
       });
     } catch (projectionError) {
       console.warn("[creator-analytics] daily metrics projection failed after messages ingest:", projectionError?.message || projectionError);
@@ -1213,7 +1303,7 @@ async function readCreatorCoverage({ db = prisma, creatorId, rangeKey, limit = 1
   };
 }
 
-async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now = new Date() }) {
+async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now = new Date(), includeMessages = true, includeCoveragePage = true }) {
   const range = rangeBounds(rangeKey, now);
   const eventBetween = { gte: range.start, lte: range.end };
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
@@ -1221,7 +1311,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   const currentDayInRange = currentDay >= range.dayStart && currentDay <= range.dayEnd;
   const [earnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, completeEarningsDays, inProgressEarningsDays, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
     db.creatorEarningsDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }),
-    db.creatorMessagesDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }),
+    includeMessages ? db.creatorMessagesDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }) : Promise.resolve([]),
     db.creatorPostLike.groupBy({ by: ["onlyFansPostId"], where: { creatorId, likedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
     db.creatorPostComment.groupBy({ by: ["onlyFansPostId"], where: { creatorId, commentedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
     db.creatorPostLike.count({ where: { creatorId, likedAt: eventBetween } }),
@@ -1230,18 +1320,22 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     db.creatorTip.aggregate({ where: { creatorId, tippedAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } }),
     db.creatorSubscriptionEvent.groupBy({ by: ["eventType"], where: { creatorId, occurredAt: eventBetween }, _count: { _all: true }, _sum: { observedPriceCents: true } }),
     db.creatorCampaign.findMany({ where: { creatorId }, include: { _count: { select: { fans: true } } }, orderBy: [{ isActive: "desc" }, { collectedAt: "desc" }], take: 2000 }),
-    readCreatorCoverage({ db, creatorId, rangeKey, limit: 120, offset: 0, now }),
+    includeCoveragePage ? readCreatorCoverage({ db, creatorId, rangeKey, limit: 120, offset: 0, now }) : Promise.resolve({ rows: [], pagination: { limit: 0, offset: 0, returned: 0, total: 0, hasMore: false } }),
     db.analyticsCoverage.count({ where: { creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE", coverageDate: dayBetween } }),
     currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "EARNINGS_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
-    db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "COMPLETE", coverageDate: dayBetween } }),
-    currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "MESSAGES_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
+    includeMessages ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "COMPLETE", coverageDate: dayBetween } }) : Promise.resolve(0),
+    includeMessages && currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "MESSAGES_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
     readCampaignRevenue({ db, creatorId, start: range.start, end: range.end }),
     db.creatorCampaignFan.groupBy({ by: ["campaignId"], where: { creatorId, attributedAt: null }, _count: { _all: true } }),
     db.creatorNotificationSyncState?.findUnique
       ? db.creatorNotificationSyncState.findUnique({ where: { creatorId } })
       : Promise.resolve(null),
     db.creatorDailyMetrics?.findMany
-      ? db.creatorDailyMetrics.findMany({ where: { creatorId, date: dayBetween, sourceTimezone: "UTC" }, orderBy: { date: "asc" } })
+      ? db.creatorDailyMetrics.findMany({
+          where: { creatorId, date: dayBetween, sourceTimezone: "UTC" },
+          orderBy: { date: "asc" },
+          ...(includeMessages ? {} : { select: { date: true, likes: true, comments: true, newSubscribers: true, renewals: true } }),
+        })
       : Promise.resolve([]),
     db.creatorPaidSubscription?.aggregate
       ? db.creatorPaidSubscription.aggregate({ where: { creatorId, paidAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } })
@@ -1249,7 +1343,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     db.creatorSubscriptionState?.groupBy
       ? db.creatorSubscriptionState.groupBy({ by: ["status"], where: { creatorId }, _count: { _all: true } })
       : Promise.resolve([]),
-    db.creatorLocalMessageCoverage?.findMany
+    includeMessages && db.creatorLocalMessageCoverage?.findMany
       ? db.creatorLocalMessageCoverage.findMany({ where: { creatorId }, orderBy: { lastVerifiedAt: "desc" } })
       : Promise.resolve([]),
   ]);

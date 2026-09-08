@@ -37,12 +37,14 @@ const { ensureAutomaticSfs } = require("./sfs-service");
 const { reconcileExpiredBillingStates } = require("./billing-entitlement-service");
 const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
-
-// Range keys we proactively keep fresh for owner dashboards.
-// Don't pre-fetch the long ranges (180d/365d/all) — they're expensive
-// and rarely viewed. They get scheduled on-demand when owner opens
-// that tab in the UI.
-const TRACKED_RANGES = ["7d", "30d"];
+const {
+  ensureOperationalAnalyticsFreshness,
+  runAnalyticsCollectionSweep,
+  runAnalyticsCollectionDemandSweep,
+  claimAnalyticsSweepCycle,
+  renewAnalyticsSweepLease,
+  completeAnalyticsSweepCycle,
+} = require("./analytics-collection-planner");
 
 // Recurring sweeper interval. Owner asked for 1 hour.
 const RECURRING_INTERVAL_MS = 60 * 60 * 1000;
@@ -54,9 +56,17 @@ const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
 const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin setting can override
 const TEAM_MONEY_BACKFILL_BATCH_SIZE = 250; // DB-only historical reconciliation, no OF requests
 const TEAM_PENDING_BACKFILL_BATCH_SIZE = 500; // DB-only Team queue projection repair
+const ANALYTICS_DEMAND_INTERVAL_MS = 15 * 1000; // durable interactive Home freshness demands
 const TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS = 30 * 1000; // lightweight DB-only Customs projection retry
 const TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE = 200;
+const RECURRING_READY_PAGE_SIZE = 250;
+const CREATOR_ANALYTICS_SWEEP_LEASE_KEY = "creator_analytics_recurring_v1";
+const CREATOR_ANALYTICS_SWEEP_COORDINATION_LOCK_KEY = "creator-analytics-recurring-sweep-coordinator";
+const CREATOR_ANALYTICS_SWEEP_LEASE_MS = 15 * 60 * 1000;
+const CREATOR_ANALYTICS_SWEEP_HEARTBEAT_EVERY = 25;
 let lastRetentionSweepAt = 0;
+let recurringSweepPromise = null;
+let creatorAnalyticsSweepPromise = null;
 
 
 async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) {
@@ -101,9 +111,18 @@ async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) 
  * @param {string} args.agencyId
  * @param {number} [args.priority=50]
  * @param {boolean} [args.includeAnalyticsCatchups=false]
+ * @param {boolean} [args.includeCreatorAnalytics=true]
  * @returns {Promise<{ created: string[], skipped: string[] }>}
  */
-async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 50, creator = null, includeAnalyticsCatchups = false }) {
+async function scheduleInitialJobsForCreator({
+  creatorId,
+  agencyId,
+  priority = 50,
+  creator = null,
+  includeAnalyticsCatchups = false,
+  includeEarningsFreshness = true,
+  includeCreatorAnalytics = true,
+}) {
   if (!creatorId || !agencyId) return { created: [], skipped: [] };
   const creatorRemoteId = creator?.remoteId || creator?.userId || null;
   const creatorUsername = creator?.username || null;
@@ -115,23 +134,37 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
 
   // Creator Analytics bootstrap owns the creator background-read lane until its
   // strict Notifications -> Financial -> Campaigns history sequence is proven.
-  // Do not pre-schedule unrelated read jobs here: a lower-priority job can be
-  // claimed while waiting and steal the lane between two bootstrap stages.
+  // The recurring scheduler can delegate the actual Analytics planning to its
+  // distributed sweep, but it still gates unrelated creator-wide scans on the
+  // proven bootstrap state so the old lane-ownership invariant is preserved.
   try {
-    const { ensureInitialCreatorAnalyticsSync, ensureRecurringCreatorAnalyticsCatchups } = require("./creator-analytics-sync-orchestrator");
-    const initial = await ensureInitialCreatorAnalyticsSync({
-      creatorId, agencyId, now, priority: Math.max(80, priority),
-    });
-    if (initial.created) created.push(`creator_analytics_initial:${initial.stage}`);
-    else skipped.push(`creator_analytics_initial:${initial.stage}:${initial.reason || "waiting"}`);
-    if (!initial.ready) return { created, skipped };
+    const {
+      ensureInitialCreatorAnalyticsSync,
+      ensureRecurringCreatorAnalyticsCatchups,
+      creatorAnalyticsInitialSyncReady,
+    } = require("./creator-analytics-sync-orchestrator");
 
-    if (includeAnalyticsCatchups) {
-      const catchups = await ensureRecurringCreatorAnalyticsCatchups({
-        creatorId, agencyId, now, priority: Math.max(15, priority - 10),
+    if (includeCreatorAnalytics) {
+      const initial = await ensureInitialCreatorAnalyticsSync({
+        creatorId, agencyId, now, priority: Math.max(80, priority),
       });
-      created.push(...(catchups.created || []));
-      skipped.push(...(catchups.skipped || []));
+      if (initial.created) created.push(`creator_analytics_initial:${initial.stage}`);
+      else skipped.push(`creator_analytics_initial:${initial.stage}:${initial.reason || "waiting"}`);
+      if (!initial.ready) return { created, skipped };
+
+      if (includeAnalyticsCatchups) {
+        const catchups = await ensureRecurringCreatorAnalyticsCatchups({
+          creatorId, agencyId, now, priority: Math.max(15, priority - 10),
+        });
+        created.push(...(catchups.created || []));
+        skipped.push(...(catchups.skipped || []));
+      }
+    } else {
+      const ready = await creatorAnalyticsInitialSyncReady({ creatorId });
+      if (!ready) {
+        skipped.push("creator_analytics_initial:waiting:distributed_sweep");
+        return { created, skipped };
+      }
     }
   } catch (err) {
     skipped.push(`creator_analytics:${err?.message || "schedule_failed"}`);
@@ -140,19 +173,18 @@ async function scheduleInitialJobsForCreator({ creatorId, agencyId, priority = 5
     return { created, skipped };
   }
 
-  // Lightweight dashboard earnings are refreshed only after the initial
-  // analytics history pipeline is complete.
-  for (const rangeKey of TRACKED_RANGES) {
-    const decision = await ensureSingleJob({
-      jobKey: "fetch_earnings",
+  // Earnings collection is no longer display-range scheduling. A single
+  // coverage/freshness planner owns exact provider windows.
+  if (includeEarningsFreshness) {
+    const earnings = await ensureOperationalAnalyticsFreshness({
       creatorId,
       agencyId,
-      params: { rangeKey },
+      reason: "INITIAL_SYNC",
       priority,
       now,
     });
-    if (decision.created) created.push(`fetch_earnings:${rangeKey}`);
-    else skipped.push(`fetch_earnings:${rangeKey}`);
+    if (earnings.created > 0) created.push(`fetch_earnings:${earnings.created}`);
+    else skipped.push(`fetch_earnings:${earnings.reused ? "reused" : "fresh"}`);
   }
 
   // Traffic/member attribution stays independent once bootstrap no longer owns
@@ -531,6 +563,193 @@ async function maybeBackfillTeamPendingProjection() {
   }
 }
 
+async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), pageSize = RECURRING_READY_PAGE_SIZE } = {}) {
+  if (creatorAnalyticsSweepPromise) {
+    return { ok: true, skipped: true, reason: "local_overlap" };
+  }
+
+  creatorAnalyticsSweepPromise = (async () => {
+    const size = Math.max(1, Math.min(1000, Number(pageSize) || RECURRING_READY_PAGE_SIZE));
+    const claim = await claimAnalyticsSweepCycle({
+      db,
+      now,
+      leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+      coordinationLockKey: CREATOR_ANALYTICS_SWEEP_COORDINATION_LOCK_KEY,
+      leaseMs: CREATOR_ANALYTICS_SWEEP_LEASE_MS,
+    });
+    if (!claim.acquired) {
+      return { ok: true, skipped: true, reason: claim.reason, cycleKey: claim.cycleKey };
+    }
+
+    const cycleNow = claim.cycleNow;
+    let cursor = claim.cursorCreatorId || null;
+    let creators = 0;
+    let pages = 0;
+    let jobsCreated = 0;
+    let jobsSkipped = 0;
+    let failures = 0;
+
+    while (true) {
+      const renewed = await renewAnalyticsSweepLease({
+        db,
+        ownerToken: claim.ownerToken,
+        cycleKey: claim.cycleKey,
+        cursorCreatorId: cursor,
+        leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+        leaseMs: CREATOR_ANALYTICS_SWEEP_LEASE_MS,
+      });
+      if (!renewed) {
+        return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures };
+      }
+
+      const rows = await db.creatorAccount.findMany({
+        where: {
+          status: "READY",
+          deletedAt: null,
+          agency: { deletedAt: null },
+          ...(cursor ? { id: { gt: cursor } } : {}),
+        },
+        select: { id: true, agencyId: true },
+        orderBy: [{ id: "asc" }],
+        take: size,
+      });
+      if (!rows.length) break;
+      pages += 1;
+
+      const { ensureRecurringCreatorAnalyticsCatchups } = require("./creator-analytics-sync-orchestrator");
+      for (let index = 0; index < rows.length; index += 1) {
+        const creator = rows[index];
+        try {
+          const result = await ensureRecurringCreatorAnalyticsCatchups({
+            db,
+            creatorId: creator.id,
+            agencyId: creator.agencyId,
+            now: cycleNow,
+            priority: 20,
+          });
+          jobsCreated += Number(result?.created?.length || 0) + (result?.initial?.created ? 1 : 0);
+          jobsSkipped += Number(result?.skipped?.length || 0) + (result?.initial && !result.initial.created ? 1 : 0);
+        } catch (err) {
+          failures += 1;
+          console.warn("[scheduler] Creator Analytics catchup failed:", creator.id, err?.message || err);
+        }
+        creators += 1;
+        cursor = creator.id;
+
+        if ((index + 1) % CREATOR_ANALYTICS_SWEEP_HEARTBEAT_EVERY === 0) {
+          const heartbeat = await renewAnalyticsSweepLease({
+            db,
+            ownerToken: claim.ownerToken,
+            cycleKey: claim.cycleKey,
+            cursorCreatorId: cursor,
+            leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+            leaseMs: CREATOR_ANALYTICS_SWEEP_LEASE_MS,
+          });
+          if (!heartbeat) {
+            return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures };
+          }
+        }
+      }
+
+      const pageRenewed = await renewAnalyticsSweepLease({
+        db,
+        ownerToken: claim.ownerToken,
+        cycleKey: claim.cycleKey,
+        cursorCreatorId: cursor,
+        leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+        leaseMs: CREATOR_ANALYTICS_SWEEP_LEASE_MS,
+      });
+      if (!pageRenewed) {
+        return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures };
+      }
+      if (rows.length < size) break;
+    }
+
+    const completed = await completeAnalyticsSweepCycle({
+      db,
+      ownerToken: claim.ownerToken,
+      cycleKey: claim.cycleKey,
+      cursorCreatorId: cursor,
+      leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+    });
+    if (!completed) {
+      return { ok: false, skipped: true, reason: "cycle_completion_lost", cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures };
+    }
+    return { ok: true, skipped: false, cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures, pageSize: size };
+  })();
+
+  try {
+    return await creatorAnalyticsSweepPromise;
+  } finally {
+    creatorAnalyticsSweepPromise = null;
+  }
+}
+
+async function runRecurringCreatorWork({ db = prisma, now = new Date(), pageSize = RECURRING_READY_PAGE_SIZE } = {}) {
+  const size = Math.max(1, Math.min(1000, Number(pageSize) || RECURRING_READY_PAGE_SIZE));
+  let cursor = null;
+  let creatorsScanned = 0;
+  let pages = 0;
+  let totalCreated = 0;
+  let totalSkipped = 0;
+  let dailyCyclesStarted = 0;
+  let dailyCyclesSkipped = 0;
+
+  while (true) {
+    const creators = await db.creatorAccount.findMany({
+      where: {
+        status: "READY",
+        deletedAt: null,
+        agency: { deletedAt: null },
+        ...(cursor ? { id: { gt: cursor } } : {}),
+      },
+      select: { id: true, agencyId: true, remoteId: true, username: true, displayName: true },
+      orderBy: [{ id: "asc" }],
+      take: size,
+    });
+    if (!creators.length) break;
+    pages += 1;
+
+    for (const creator of creators) {
+      try {
+        const result = await scheduleInitialJobsForCreator({
+          creatorId: creator.id,
+          agencyId: creator.agencyId,
+          creator,
+          priority: 30,
+          includeAnalyticsCatchups: false,
+          includeEarningsFreshness: false,
+          includeCreatorAnalytics: false,
+        });
+        totalCreated += result.created.length;
+        totalSkipped += result.skipped.length;
+      } catch (err) {
+        console.warn("[scheduler] regular creator jobs failed:", creator.id, err?.message || err);
+      }
+
+      try {
+        const { ensureDailyVaultIntelligenceCycle } = require("./vault-intelligence-daily-service");
+        const daily = await ensureDailyVaultIntelligenceCycle({
+          agencyId: creator.agencyId,
+          creatorId: creator.id,
+          now,
+        });
+        if (Number(daily?.created || 0) > 0) dailyCyclesStarted += 1;
+        else dailyCyclesSkipped += 1;
+      } catch (err) {
+        dailyCyclesSkipped += 1;
+        console.warn("[scheduler] daily Vault Intelligence failed:", creator.id, err?.message || err);
+      }
+
+      creatorsScanned += 1;
+      cursor = creator.id;
+    }
+    if (creators.length < size) break;
+  }
+
+  return { creatorsScanned, pages, totalCreated, totalSkipped, dailyCyclesStarted, dailyCyclesSkipped, pageSize: size };
+}
+
 /**
  * Recurring scheduler — finds all READY creators across all agencies
  * and ensures they have scheduled jobs. Runs once on startup, then
@@ -539,59 +758,38 @@ async function maybeBackfillTeamPendingProjection() {
  * Designed to be cheap: looks at recent JobInstance rows (already indexed
  * by creatorId + jobKey), so even with thousands of creators it stays fast.
  */
-async function runRecurringSweep() {
+async function runRecurringSweepInternal() {
   const startedAt = Date.now();
   const now = new Date();
 
-  const creators = await prisma.creatorAccount.findMany({
-    where: {
-      status: "READY",
-      deletedAt: null,
-      agency: { deletedAt: null },
-    },
-    select: { id: true, agencyId: true, remoteId: true, username: true, displayName: true },
-    take: 10000});
-
-  let totalCreated = 0;
-  let totalSkipped = 0;
-  let dailyCyclesStarted = 0;
-  let dailyCyclesSkipped = 0;
-
-  for (const creator of creators) {
-    try {
-      const result = await scheduleInitialJobsForCreator({
-        creatorId: creator.id,
-        agencyId: creator.agencyId,
-        creator,
-        priority: 30, // recurring work stays below explicit refresh-now / interactive connect work
-        includeAnalyticsCatchups: true,
-      });
-      totalCreated += result.created.length;
-      totalSkipped += result.skipped.length;
-    } catch (err) {
-      console.warn("[scheduler] regular creator jobs failed:", creator.id, err?.message || err);
-    }
-
-    // Daily Vault Intelligence is an independent maintenance lane. A failure in
-    // earnings/campaign/automation scheduling must never suppress the catalog
-    // and dialog freshness cycle for the same creator.
-    try {
-      // Load lazily to avoid a module cycle: vault-unsorted-service uses
-      // scheduleJobNow from this module, while the daily coordinator composes
-      // that catalog job with a dialog discovery generation.
-      const { ensureDailyVaultIntelligenceCycle } = require("./vault-intelligence-daily-service");
-      const daily = await ensureDailyVaultIntelligenceCycle({
-        agencyId: creator.agencyId,
-        creatorId: creator.id,
-        now,
-      });
-      if (Number(daily?.created || 0) > 0) dailyCyclesStarted += 1;
-      else dailyCyclesSkipped += 1;
-    } catch (err) {
-      dailyCyclesSkipped += 1;
-      console.warn("[scheduler] daily Vault Intelligence failed:", creator.id, err?.message || err);
-    }
+  // Analytics has its own paginated current-work sweep. A durable UTC-cycle lease
+  // elects one sweep owner across replicas; creator-local DB reservation remains
+  // the second fence for exact provider work, and the planner prevents in-process overlap.
+  let analyticsSweep = null;
+  try {
+    analyticsSweep = await runAnalyticsCollectionSweep({ db: prisma, now });
+  } catch (err) {
+    console.warn("[scheduler] analytics collection sweep failed:", err?.message || err);
+    analyticsSweep = { ok: false, error: err?.message || String(err) };
   }
+
+  let creatorAnalyticsSweep = null;
+  try {
+    creatorAnalyticsSweep = await runCreatorAnalyticsCatchupSweep({ db: prisma, now });
+  } catch (err) {
+    console.warn("[scheduler] Creator Analytics recurring sweep failed:", err?.message || err);
+    creatorAnalyticsSweep = { ok: false, error: err?.message || String(err) };
+  }
+
+  const recurringCreatorWork = await runRecurringCreatorWork({ db: prisma, now });
+  const {
+    creatorsScanned,
+    pages: creatorPages,
+    totalCreated,
+    totalSkipped,
+    dailyCyclesStarted,
+    dailyCyclesSkipped,
+  } = recurringCreatorWork;
 
   // Retention owns the detailed 180d boundary. Run it before the historical
   // Team backfill so deleted old detail is not immediately recreated.
@@ -626,15 +824,18 @@ async function runRecurringSweep() {
 
   const elapsed = Date.now() - startedAt;
   console.log(
-    `[scheduler] sweep done in ${elapsed}ms — creators=${creators.length}, jobs created=${totalCreated}, skipped=${totalSkipped}, daily started=${dailyCyclesStarted}, daily skipped=${dailyCyclesSkipped}`
+    `[scheduler] sweep done in ${elapsed}ms — creators=${creatorsScanned}, pages=${creatorPages}, jobs created=${totalCreated}, skipped=${totalSkipped}, daily started=${dailyCyclesStarted}, daily skipped=${dailyCyclesSkipped}`
   );
 
   return {
-    creatorsScanned: creators.length,
+    creatorsScanned,
+    creatorPages,
     jobsCreated: totalCreated,
     jobsSkipped: totalSkipped,
     dailyCyclesStarted,
     dailyCyclesSkipped,
+    analyticsSweep,
+    creatorAnalyticsSweep,
     retention,
     billingRenewals,
     billingExpiry,
@@ -645,8 +846,20 @@ async function runRecurringSweep() {
   };
 }
 
+async function runRecurringSweep() {
+  if (recurringSweepPromise) {
+    return { ok: true, skipped: true, reason: "local_overlap" };
+  }
+  recurringSweepPromise = runRecurringSweepInternal();
+  try {
+    return await recurringSweepPromise;
+  } finally {
+    recurringSweepPromise = null;
+  }
+}
 
 let recurringTimer = null;
+let analyticsDemandTimer = null;
 let telegramInboundProjectionTimer = null;
 
 /**
@@ -673,6 +886,14 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
 
   recurringTimer = setInterval(tick, intervalMs);
 
+  const analyticsDemandTick = () => {
+    runAnalyticsCollectionDemandSweep({ db: prisma }).catch((err) => {
+      console.error("[scheduler] analytics demand sweep crashed:", err);
+    });
+  };
+  if (runImmediately) setTimeout(analyticsDemandTick, 2 * 1000);
+  analyticsDemandTimer = setInterval(analyticsDemandTick, ANALYTICS_DEMAND_INTERVAL_MS);
+
   const projectionTick = () => {
     runTelegramInboundProjectionSweep().catch((err) => {
       console.error("[scheduler] Telegram inbound projection sweep crashed:", err);
@@ -694,6 +915,10 @@ function stopRecurringScheduler() {
     clearInterval(recurringTimer);
     recurringTimer = null;
   }
+  if (analyticsDemandTimer) {
+    clearInterval(analyticsDemandTimer);
+    analyticsDemandTimer = null;
+  }
   if (telegramInboundProjectionTimer) {
     clearInterval(telegramInboundProjectionTimer);
     telegramInboundProjectionTimer = null;
@@ -707,9 +932,10 @@ module.exports = {
   ensureSingleJob,
   scheduleJobNow,
   runRecurringSweep,
+  runCreatorAnalyticsCatchupSweep,
+  runRecurringCreatorWork,
   startRecurringScheduler,
   stopRecurringScheduler,
-  TRACKED_RANGES,
   RECURRING_INTERVAL_MS,
   FRESHNESS_WINDOW_MS,
   TRAFFIC_REFRESH_WINDOW_MS,

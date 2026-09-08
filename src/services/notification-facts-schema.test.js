@@ -144,7 +144,11 @@ test("automatic creator scheduling delegates notification history to the strict 
   assert.match(body, /ensureInitialCreatorAnalyticsSync/);
   assert.match(body, /ensureRecurringCreatorAnalyticsCatchups/);
   assert.match(body, /if \(!initial\.ready\) return \{ created, skipped \}/);
-  assert.ok(body.indexOf("ensureInitialCreatorAnalyticsSync") < body.indexOf("for (const rangeKey of TRACKED_RANGES)"), "bootstrap gate must run before dashboard earnings scheduling");
+  assert.ok(body.indexOf("ensureInitialCreatorAnalyticsSync") < body.indexOf("ensureOperationalAnalyticsFreshness"), "bootstrap gate must run before canonical earnings freshness planning");
+  assert.match(body, /ensureOperationalAnalyticsFreshness/);
+  assert.match(body, /includeEarningsFreshness/);
+  assert.doesNotMatch(body, /TRACKED_RANGES/);
+  assert.doesNotMatch(body, /jobKey:\s*"fetch_earnings"/);
   assert.doesNotMatch(body, /jobKey:\s*"fetch_campaigns"/);
   assert.match(analyticsOrchestrator, /NOTIFICATION_JOB_KEY = "catchup_notifications_scan"/);
   assert.match(analyticsOrchestrator, /analyticsSyncStage:\s*"notifications"/);

@@ -1,427 +1,245 @@
 "use strict";
 
 const prisma = require("../prisma");
-const { resolveRange, resolvePreviousRange, rangeForClient } = require("./range-service");
-const { ensureSingleJob } = require("./job-scheduler");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission, isOwner } = require("./team-access-control");
-
-// ─────────────────────────────────────────────────────────────────────────
-// Home summary service v3 — on-demand snapshot scheduling.
-//
-// When the UI asks for a range that's missing or stale for some creators,
-// the bek schedules fetch_earnings jobs for them and returns a `pending[]`
-// list so the renderer knows to show a skeleton + poll until the snapshot
-// arrives. NO range fallback — if data isn't there, we wait for it.
-//
-// Staleness thresholds:
-//   - 24h    → 5 min  (intra-day data should feel fresh)
-//   - 7d     → 15 min
-//   - 30d    → 30 min
-//   - 90d+   → 2 h    (long-range bars don't shift much hour-to-hour)
-//
-// These match what a user intuitively expects: "if I'm looking at today's
-// numbers I want them recent; for last quarter I don't need to refetch
-// every minute".
-// ─────────────────────────────────────────────────────────────────────────
-
-
-// Per-range freshness budget (ms). After this much time, a snapshot is
-// considered stale and we re-schedule. Pick generously — OF requests
-// aren't free.
-const STALENESS_MS_BY_RANGE = {
-  "24h":      5  * 60 * 1000,
-  "7d":       15 * 60 * 1000,
-  "30d":      30 * 60 * 1000,
-  "90d":      2  * 60 * 60 * 1000,
-  "180d":     2  * 60 * 60 * 1000,
-  "365d":     2  * 60 * 60 * 1000,
-  "ytd":      2  * 60 * 60 * 1000,
-  "prev_year":24 * 60 * 60 * 1000,
-  "all":      24 * 60 * 60 * 1000,
-};
-
-const DEFAULT_STALENESS_MS = 30 * 60 * 1000; // 30 min
-
-// Priority for on-demand backfill — higher than the recurring sweeper (30)
-// but lower than the user-clicked refresh button (100). We're "the user is
-// looking at this NOW" so it should jump the queue but yield to explicit
-// refresh actions.
-const ON_DEMAND_PRIORITY = 80;
-
-function stalenessMsFor(rangeKey) {
-  return STALENESS_MS_BY_RANGE[rangeKey] ?? DEFAULT_STALENESS_MS;
-}
-
-
-// ── Helpers ──────────────────────────────────────────────────────────────
-
-function bigToNum(value) {
-  if (value === null || value === undefined) return 0;
-  if (typeof value === "bigint") return Number(value);
-  return Number(value || 0);
-}
-
-function pctChange(current, previous) {
-  const c = Number(current || 0);
-  const p = Number(previous || 0);
-  if (!Number.isFinite(c) || !Number.isFinite(p) || p === 0) return null;
-  return Math.round(((c - p) / p) * 1000) / 10;
-}
-
-function safeArray(value) {
-  return Array.isArray(value) ? value : [];
-}
-
-// Pull a numeric value out of an OF-style point. Mirrors creator-analytics
-// extraction logic so home and creator pages look at the same numbers.
-function pickNumericValue(item) {
-  if (item === null || item === undefined) return null;
-  if (typeof item === "number") return Number.isFinite(item) ? item : null;
-
-  if (Array.isArray(item)) {
-    // OF often returns ["2026-04-30", 1234] — last finite number wins.
-    for (let i = item.length - 1; i >= 0; i -= 1) {
-      const n = Number(item[i]);
-      if (Number.isFinite(n)) return n;
-    }
-    return null;
-  }
-
-  if (typeof item === "object") {
-    const candidates = [
-      item.amount, item.total, item.sum, item.value,
-      item.net, item.gross, item.earnings, item.price,
-      item.count, item.y, item.v, item.valueCents,
-    ];
-    for (const candidate of candidates) {
-      const n = Number(candidate);
-      if (Number.isFinite(n)) return n;
-    }
-  }
-
-  return null;
-}
-
-function pickLabel(item, fallback) {
-  if (Array.isArray(item)) return String(item[0] || fallback);
-  if (item && typeof item === "object") {
-    return String(item.label || item.date || item.x || fallback);
-  }
-  return String(fallback);
-}
-
-// Walk the OF response shape (stored in CreatorEarningsSnapshot.raw) and
-// return the longest array of [{ label, valueCents }] points.
-function extractPointsFromRaw(raw) {
-  if (!raw || typeof raw !== "object") return [];
-
-  const earnings = raw.earnings || {};
-  const total = earnings.total || raw.total || {};
-
-  const namedCandidates = [
-    total.chartAmount, total.chart, total.list,
-    earnings.chartAmount, earnings.chart, earnings.list,
-    raw.chartAmount, raw.chart, raw.chartData,
-    raw.chart?.amount, raw.chart?.data,
-    raw.data?.chart, raw.data?.chartAmount, raw.data?.points,
-    raw.points, raw.series, raw.list,
-  ];
-
-  for (const candidate of namedCandidates) {
-    const list = safeArray(candidate);
-    if (list.length < 2) continue;
-
-    const out = [];
-    list.forEach((item, idx) => {
-      const value = pickNumericValue(item);
-      if (!Number.isFinite(value)) return;
-      // OF chart amounts are in dollars (floats). Snapshot's totalCents
-      // is in cents, but `raw` mirrors the OF response directly. Convert
-      // defensively: values > 1_000_000 we assume already in cents.
-      const valueCents = value > 1_000_000 ? Math.round(value) : Math.round(value * 100);
-      out.push({
-        label: pickLabel(item, idx + 1),
-        valueCents,
-      });
-    });
-
-    if (out.length >= 2) return out;
-  }
-
-  return [];
-}
-
-// Resample N points to a fixed length using linear interpolation, so per-
-// creator series of different lengths can be summed into one agency curve
-// without alignment drift.
-function resamplePoints(points, targetLen) {
-  if (!Array.isArray(points) || points.length < 2 || targetLen < 2) return [];
-
-  const out = [];
-  const lastIdx = points.length - 1;
-
-  for (let i = 0; i < targetLen; i += 1) {
-    const t = (i / (targetLen - 1)) * lastIdx;
-    const lo = Math.floor(t);
-    const hi = Math.min(lo + 1, lastIdx);
-    const frac = t - lo;
-
-    const a = Number(points[lo]?.valueCents || 0);
-    const b = Number(points[hi]?.valueCents || 0);
-    const value = a + (b - a) * frac;
-
-    out.push({
-      label: String(points[lo]?.label ?? i + 1),
-      valueCents: Math.round(value),
-    });
-  }
-
-  return out;
-}
-
-
-// ── Snapshot resolution + on-demand scheduling ──────────────────────────
-
-// For an agency + range, returns:
-//   {
-//     byCreatorId: Map<creatorId, snapshot>,    // fresh OR stale snapshots we'll display
-//     pendingCreatorIds: [creatorId, ...],      // those with no snapshot OR stale
-//     scheduledJobs: [{ creatorId, jobId, reason }, ...],
-//   }
-// On-demand semantics:
-//   - "fresh"   → use it, no scheduling
-//   - "stale"   → show stale data; schedule only when allowSchedule=true
-//   - "missing" → schedule only when allowSchedule=true; otherwise remain missing
-//   - status not READY → never schedule (job would just fail). If a stale
-//                 snapshot exists, keep showing it as "last known good".
-async function resolveAndScheduleSnapshots(agencyId, requestedRange, creators, { allowSchedule = false, scheduleJob = ensureSingleJob } = {}) {
-  const creatorIds = creators.map((c) => c.id);
-  const snaps = creatorIds.length
-    ? await prisma.creatorEarningsSnapshot.findMany({
-        where: { agencyId, rangeKey: requestedRange, creatorId: { in: creatorIds } },
-        orderBy: { capturedAt: "desc" },
-        take: 10000})
-    : [];
-
-  // Latest snapshot per creator (findMany came back sorted desc, so first wins).
-  const latestByCreator = new Map();
-  for (const snap of snaps) {
-    if (!latestByCreator.has(snap.creatorId)) {
-      latestByCreator.set(snap.creatorId, snap);
-    }
-  }
-
-  const stalenessMs = stalenessMsFor(requestedRange);
-  const now = new Date();
-  const staleThreshold = new Date(now.getTime() - stalenessMs);
-
-  const byCreatorId = new Map();
-  const pendingCreatorIds = [];
-  const scheduleTasks = [];
-  const scheduledJobs = [];
-
-  for (const creator of creators) {
-    const canFetch = String(creator.status || "").toUpperCase() === "READY";
-    const snap = latestByCreator.get(creator.id);
-    const isFresh = snap && new Date(snap.capturedAt) > staleThreshold;
-
-    if (snap && isFresh) {
-      // Fresh — use it, no scheduling.
-      byCreatorId.set(creator.id, snap);
-      continue;
-    }
-
-    if (!canFetch) {
-      // Not READY — can't schedule a fetch_earnings job. If we have any
-      // (even stale) snapshot, still display it so the row isn't blank.
-      if (snap) byCreatorId.set(creator.id, snap);
-      continue;
-    }
-
-    // Either no snapshot, or stale. Keep stale data readable regardless of
-    // refresh permission, but only create/advertise work when scheduling is
-    // explicitly allowed by the caller's canonical analytics permission.
-    if (snap) byCreatorId.set(creator.id, snap);
-    if (!allowSchedule) continue;
-
-    scheduleTasks.push(
-      scheduleJob({
-        jobKey: "fetch_earnings",
-        creatorId: creator.id,
-        agencyId,
-        params: { rangeKey: requestedRange },
-        priority: ON_DEMAND_PRIORITY,
-        now,
-        freshnessWindowMs: stalenessMs,
-      })
-        .then((decision) => {
-          const reason = decision.created ? "scheduled" : decision.reason;
-          scheduledJobs.push({
-            creatorId: creator.id,
-            jobId:     decision.jobId,
-            reason,
-          });
-          // pending means work really exists in the queue/lease lane. Do not
-          // make Home poll forever for merely useful or recently-completed work.
-          if (decision.created || decision.reason === "already_in_flight" || decision.reason === "idempotency_race") {
-            pendingCreatorIds.push(creator.id);
-          }
-        })
-        .catch((err) => {
-          // Don't fail the whole summary because one creator's job failed
-          // to schedule. Log and move on — the next request will retry.
-          console.warn(
-            "[home/summary] schedule failed for",
-            creator.id,
-            err?.message || err
-          );
-        })
-    );
-
-  }
-
-  if (scheduleTasks.length) await Promise.all(scheduleTasks);
-
-  return { byCreatorId, pendingCreatorIds, scheduledJobs };
-}
-
-
-// ── Aggregate revenue across the agency ─────────────────────────────────
-
-async function buildAgencyRevenue(agencyId, requestedRange, allCreators, { allowSchedule = false } = {}) {
-  const { byCreatorId, pendingCreatorIds, scheduledJobs } =
-    await resolveAndScheduleSnapshots(agencyId, requestedRange, allCreators, { allowSchedule });
-
-  let totalCents = 0;
-  let grossCents = 0;
-  let salesCount = 0;
-  let uniqueFans = 0;
-
-  const TARGET_POINT_COUNT = 32;
-  const seriesToCombine = [];
-  const stalenessMs = stalenessMsFor(requestedRange);
-
-  // creators[] mirrors the full creator list — UI sees ALL creators,
-  // those without (or with stale) snapshots get hasSnapshot/pending flags
-  // so the renderer can show skeleton-pulse rows.
-  const creatorRows = allCreators.map((creator) => {
-    const snap = byCreatorId.get(creator.id) || null;
-    const isPending = pendingCreatorIds.includes(creator.id);
-
-    const ageMs = snap ? Date.now() - new Date(snap.capturedAt).getTime() : null;
-    const isStale = snap ? ageMs > stalenessMs : false;
-
-    if (snap) {
-      totalCents += bigToNum(snap.totalCents);
-      grossCents += bigToNum(snap.grossCents);
-      salesCount += Number(snap.salesCount || 0);
-      uniqueFans += Number(snap.uniqueFans || 0);
-
-      const points = extractPointsFromRaw(snap.raw);
-      if (points.length >= 2) {
-        seriesToCombine.push(resamplePoints(points, TARGET_POINT_COUNT));
-      }
-    }
-
-    return {
-      id:           creator.id,
-      name:         creator.displayName,
-      displayName:  creator.displayName,
-      username:     creator.username,
-      avatarUrl:    creator.avatarUrl,
-      status:       creator.status,
-      remoteId:     creator.remoteId,
-      revenueCents: snap ? bigToNum(snap.totalCents) : 0,
-      salesCount:   snap ? Number(snap.salesCount || 0) : 0,
-      uniqueFans:   snap ? Number(snap.uniqueFans || 0) : 0,
-      capturedAt:   snap ? snap.capturedAt : null,
-      // hasSnapshot=true means we have a row to display (fresh OR stale).
-      // pending=true means a job is queued/running for this creator+range
-      //   regardless of whether we have a stale row to display in the meantime.
-      // stale=true is "snapshot exists but past the freshness budget".
-      hasSnapshot:  !!snap,
-      pending:      isPending,
-      stale:        isStale,
-      staleSeconds: snap ? Math.max(0, Math.floor(ageMs / 1000)) : null,
-    };
-  }).sort((a, b) => Number(b.revenueCents || 0) - Number(a.revenueCents || 0));
-
-  // Build a single agency-wide curve by summing resampled per-creator series.
-  const points = [];
-  if (seriesToCombine.length) {
-    for (let i = 0; i < TARGET_POINT_COUNT; i += 1) {
-      let sum = 0;
-      let label = String(i + 1);
-      for (const series of seriesToCombine) {
-        const point = series[i];
-        if (!point) continue;
-        sum += Number(point.valueCents || 0);
-        if (label === String(i + 1) && point.label) label = String(point.label);
-      }
-      points.push({ label, valueCents: sum });
-    }
-  }
-
-  return {
-    totalCents,
-    grossCents,
-    salesCount,
-    uniqueFans,
-    creatorCount: byCreatorId.size,
-    points,
-    creators: creatorRows,
-    pendingCreatorIds,
-    scheduledJobs,
-  };
-}
-
-// Previous range — read-only, never schedules backfill. Just sums whatever
-// snapshots exist for the comparison delta. If nothing exists, deltaPct
-// will be null, which the UI handles ("→ 0%" shown muted).
-async function buildPreviousRevenue(agencyId, prevRangeKey, allCreators) {
-  const creatorIds = allCreators.map((c) => c.id);
-  if (!creatorIds.length) return { totalCents: 0 };
-
-  const snaps = await prisma.creatorEarningsSnapshot.findMany({
-    where: { agencyId, rangeKey: prevRangeKey, creatorId: { in: creatorIds } },
-    orderBy: { capturedAt: "desc" },
-    take: 10000});
-
-  const seen = new Set();
-  let totalCents = 0;
-  for (const snap of snaps) {
-    if (seen.has(snap.creatorId)) continue;
-    seen.add(snap.creatorId);
-    totalCents += bigToNum(snap.totalCents);
-  }
-  return { totalCents };
-}
-
-
-// ── Main entry ──────────────────────────────────────────────────────────
+const {
+  DAY_MS,
+  displayRangeBounds,
+  previousDisplayRange,
+  normalizeHomeRangeKey,
+  dateKey,
+  utcDay,
+} = require("./analytics-range-contract");
+const {
+  CURRENT_DAY_FRESHNESS_MS,
+  RECENT_CLOSED_FRESHNESS_MS,
+  HISTORICAL_FRESHNESS_MS,
+} = require("./analytics-collection-planner");
 
 function availability(available, reason = null) {
   return { available: available === true, reason: available === true ? null : (reason || "UNAVAILABLE") };
 }
 
+function pctChange(current, previous) {
+  const c = Number(current);
+  const p = Number(previous);
+  if (!Number.isFinite(c) || !Number.isFinite(p) || p === 0) return null;
+  return Math.round(((c - p) / p) * 1000) / 10;
+}
+
+function dayCount(startDay, endDay) {
+  if (!startDay || !endDay || startDay > endDay) return 0;
+  return Math.floor((endDay.getTime() - startDay.getTime()) / DAY_MS) + 1;
+}
+
+function maxDate(a, b) {
+  return a > b ? a : b;
+}
+
+function minDate(a, b) {
+  return a < b ? a : b;
+}
+
+function freshEnough(value, now, maxAgeMs) {
+  const date = value instanceof Date ? value : value ? new Date(value) : null;
+  return Boolean(date && Number.isFinite(date.getTime()) && date <= new Date(now.getTime() + 5 * 60 * 1000) && now.getTime() - date.getTime() <= maxAgeMs);
+}
+
+async function readCoverageState({ db, creatorIds, range, now }) {
+  const ids = creatorIds || [];
+  const out = new Map(ids.map((id) => [id, { completeDays: 0, fresh: true, currentVerifiedAt: null }]));
+  if (!ids.length) return { byCreator: out, expectedDays: dayCount(range.startDay, range.endDay) };
+
+  const today = utcDay(now);
+  const includesToday = range.startDay <= today && range.endDay >= today;
+  const closedEnd = minDate(range.endDay, new Date(today.getTime() - DAY_MS));
+  const recentClosedStart = maxDate(range.startDay, new Date(today.getTime() - 30 * DAY_MS));
+  const oldClosedEnd = minDate(closedEnd, new Date(recentClosedStart.getTime() - DAY_MS));
+  const tasks = [];
+
+  if (range.startDay <= oldClosedEnd) {
+    tasks.push(db.analyticsCoverage.groupBy({
+      by: ["creatorId"],
+      where: {
+        creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC",
+        status: "COMPLETE", scanProofId: { not: null },
+        scanProof: { is: { status: "COMMITTED" } },
+        coverageDate: { gte: range.startDay, lte: oldClosedEnd },
+      },
+      _count: { _all: true },
+      _min: { lastVerifiedAt: true },
+    }).then((rows) => ({ kind: "old", rows })));
+  }
+
+  if (recentClosedStart <= closedEnd) {
+    tasks.push(db.analyticsCoverage.groupBy({
+      by: ["creatorId"],
+      where: {
+        creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC",
+        status: "COMPLETE", scanProofId: { not: null },
+        scanProof: { is: { status: "COMMITTED" } },
+        coverageDate: { gte: recentClosedStart, lte: closedEnd },
+      },
+      _count: { _all: true },
+      _min: { lastVerifiedAt: true },
+    }).then((rows) => ({ kind: "recent", rows })));
+  }
+
+  if (includesToday) {
+    tasks.push(db.analyticsCoverage.findMany({
+      where: {
+        creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC",
+        coverageDate: today, status: { in: ["PARTIAL", "COMPLETE"] }, scanProofId: { not: null },
+        scanProof: { is: { status: "COMMITTED" } },
+      },
+      select: { creatorId: true, lastVerifiedAt: true },
+    }).then((rows) => ({ kind: "today", rows })));
+  }
+
+  for (const group of await Promise.all(tasks)) {
+    for (const row of group.rows) {
+      const state = out.get(row.creatorId);
+      if (!state) continue;
+      if (group.kind === "today") {
+        state.completeDays += 1;
+        state.currentVerifiedAt = row.lastVerifiedAt || null;
+        if (!freshEnough(row.lastVerifiedAt, now, CURRENT_DAY_FRESHNESS_MS)) state.fresh = false;
+      } else {
+        state.completeDays += Number(row?._count?._all || 0);
+        const limit = group.kind === "recent" ? RECENT_CLOSED_FRESHNESS_MS : HISTORICAL_FRESHNESS_MS;
+        if (!freshEnough(row?._min?.lastVerifiedAt, now, limit)) state.fresh = false;
+      }
+    }
+  }
+
+  const expectedDays = dayCount(range.startDay, range.endDay);
+  for (const state of out.values()) {
+    state.complete = state.completeDays >= expectedDays;
+    if (!state.complete) state.fresh = false;
+  }
+  return { byCreator: out, expectedDays };
+}
+
+async function readCanonicalRevenue({ db, agencyId, creators, range, previous, now }) {
+  const creatorIds = creators.map((row) => row.id);
+  if (!creatorIds.length) {
+    return { totalCents: 0, deltaPct: null, points: [], creators: [], reportingCreators: 0, staleCreators: 0, pendingCreatorIds: [], pendingJobs: [] };
+  }
+
+  const [coverage, previousCoverage, activeJobs] = await Promise.all([
+    readCoverageState({ db, creatorIds, range, now }),
+    previous ? readCoverageState({ db, creatorIds, range: previous, now }) : Promise.resolve(null),
+    db.jobInstance.findMany({
+      where: { creatorId: { in: creatorIds }, jobKey: "fetch_earnings", status: { in: ["SCHEDULED", "CLAIMED"] } },
+      select: { id: true, creatorId: true, status: true },
+    }),
+  ]);
+
+  const reportingIds = creatorIds.filter((id) => coverage.byCreator.get(id)?.complete === true);
+  const previousReportingIds = previousCoverage
+    ? creatorIds.filter((id) => previousCoverage.byCreator.get(id)?.complete === true)
+    : [];
+  const [currentGroups, dateGroups, previousTotal] = await Promise.all([
+    reportingIds.length ? db.creatorEarningsDaily.groupBy({
+      by: ["creatorId"],
+      where: {
+        agencyId, creatorId: { in: reportingIds }, sourceTimezone: "UTC", scanProofId: { not: null },
+        scanProof: { is: { status: "COMMITTED" } }, date: { gte: range.startDay, lte: range.endDay },
+      },
+      _count: { _all: true }, _sum: { totalCents: true }, _max: { collectedAt: true },
+    }) : Promise.resolve([]),
+    reportingIds.length ? db.creatorEarningsDaily.groupBy({
+      by: ["date"],
+      where: {
+        agencyId, creatorId: { in: reportingIds }, sourceTimezone: "UTC", scanProofId: { not: null },
+        scanProof: { is: { status: "COMMITTED" } }, date: { gte: range.startDay, lte: range.endDay },
+      },
+      _sum: { totalCents: true },
+    }) : Promise.resolve([]),
+    previous && previousReportingIds.length === creatorIds.length ? db.creatorEarningsDaily.aggregate({
+      where: {
+        agencyId, creatorId: { in: previousReportingIds }, sourceTimezone: "UTC", scanProofId: { not: null },
+        scanProof: { is: { status: "COMMITTED" } }, date: { gte: previous.startDay, lte: previous.endDay },
+      },
+      _sum: { totalCents: true },
+    }) : Promise.resolve(null),
+  ]);
+
+  const currentByCreator = new Map(currentGroups.map((row) => [String(row.creatorId), row]));
+  const activeByCreator = new Map();
+  for (const job of activeJobs) {
+    const list = activeByCreator.get(job.creatorId) || [];
+    list.push(job);
+    activeByCreator.set(job.creatorId, list);
+  }
+  const pendingCreatorIds = [...activeByCreator.keys()];
+  const pendingJobs = activeJobs.map((job) => ({ creatorId: job.creatorId, jobId: job.id, reason: String(job.status || "pending").toLowerCase() }));
+  let totalCents = 0;
+  let staleCreators = 0;
+  const creatorRows = creators.map((creator) => {
+    const state = coverage.byCreator.get(creator.id) || { complete: false, fresh: false };
+    const group = currentByCreator.get(creator.id) || null;
+    const hasRevenue = state.complete === true && Number(group?._count?._all || 0) >= coverage.expectedDays;
+    const stale = hasRevenue && state.fresh !== true;
+    if (stale) staleCreators += 1;
+    const revenueCents = hasRevenue ? Number(group?._sum?.totalCents || 0) : null;
+    if (revenueCents !== null) totalCents += revenueCents;
+    const capturedAt = hasRevenue && group?._max?.collectedAt ? group._max.collectedAt : null;
+    const freshnessAnchor = state.currentVerifiedAt || capturedAt;
+    const staleSeconds = stale && freshnessAnchor ? Math.max(0, Math.floor((now.getTime() - new Date(freshnessAnchor).getTime()) / 1000)) : null;
+    return {
+      id: creator.id,
+      name: creator.displayName,
+      displayName: creator.displayName,
+      username: creator.username,
+      avatarUrl: creator.avatarUrl,
+      status: creator.status,
+      remoteId: creator.remoteId,
+      revenueCents,
+      salesCount: null,
+      uniqueFans: null,
+      capturedAt,
+      hasRevenue,
+      pending: activeByCreator.has(creator.id),
+      stale,
+      staleSeconds,
+    };
+  }).sort((a, b) => Number(b.revenueCents ?? -1) - Number(a.revenueCents ?? -1));
+
+  const currentComplete = reportingIds.length === creatorIds.length;
+  const previousComplete = previous && previousReportingIds.length === creatorIds.length;
+  const currentFresh = currentComplete && creatorIds.every((id) => coverage.byCreator.get(id)?.fresh === true);
+  const previousFresh = previousCoverage && previousComplete
+    ? creatorIds.every((id) => previousCoverage.byCreator.get(id)?.fresh === true)
+    : false;
+  const previousCents = previousTotal ? Number(previousTotal?._sum?.totalCents || 0) : null;
+
+  return {
+    // A partial agency aggregate is not the agency total. Keep individually
+    // verified creator rows available, but publish the headline KPI/chart only
+    // once every scoped creator has canonical coverage for the requested range.
+    // This preserves UNKNOWN != ZERO and prevents partial coverage from looking
+    // like complete agency revenue.
+    totalCents: currentComplete ? totalCents : null,
+    deltaPct: currentComplete && previousComplete && currentFresh && previousFresh ? pctChange(totalCents, previousCents) : null,
+    points: currentComplete
+      ? dateGroups.sort((a, b) => new Date(a.date) - new Date(b.date)).map((row) => ({ label: dateKey(row.date), valueCents: Number(row?._sum?.totalCents || 0) }))
+      : [],
+    creators: creatorRows,
+    reportingCreators: reportingIds.length,
+    staleCreators,
+    pendingCreatorIds,
+    pendingJobs,
+  };
+}
+
 function emptyRevenueCreator(creator) {
   return {
-    id: creator.id,
-    name: creator.displayName,
-    displayName: creator.displayName,
-    username: creator.username,
-    avatarUrl: creator.avatarUrl,
-    status: creator.status,
-    remoteId: creator.remoteId,
-    revenueCents: null,
-    salesCount: null,
-    uniqueFans: null,
-    capturedAt: null,
-    hasSnapshot: false,
-    pending: false,
-    stale: false,
-    staleSeconds: null,
+    id: creator.id, name: creator.displayName, displayName: creator.displayName, username: creator.username,
+    avatarUrl: creator.avatarUrl, status: creator.status, remoteId: creator.remoteId,
+    revenueCents: null, salesCount: null, uniqueFans: null, capturedAt: null,
+    hasRevenue: false, pending: false, stale: false, staleSeconds: null,
   };
 }
 
@@ -432,19 +250,19 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d" }) {
     error.status = 403;
     throw error;
   }
-
-  const range = resolveRange(rangeKey);
-  const previousRange = resolvePreviousRange(rangeKey);
+  const now = new Date();
+  let homeRangeKey;
+  try {
+    homeRangeKey = normalizeHomeRangeKey(rangeKey);
+  } catch (error) {
+    error.status = 400;
+    throw error;
+  }
+  const range = displayRangeBounds(homeRangeKey, now);
+  const previous = previousDisplayRange(range.rangeKey, now);
   const scope = await allowedCreatorScope({ agencyId, member, db: prisma });
   const creatorWhere = scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } };
-
-  const [
-    canViewMoney,
-    canViewTeam,
-    canViewAudit,
-    canManageWorkspace,
-    canRefreshAnalytics,
-  ] = await Promise.all([
+  const [canViewMoney, canViewTeam, canViewAudit, canManageWorkspace, canRefreshAnalytics] = await Promise.all([
     canUsePermission({ member, key: "money.view_earnings", db: prisma }),
     canUsePermission({ member, key: "workspace.view_team", db: prisma }),
     canUsePermission({ member, key: "workspace.view_audit", db: prisma }),
@@ -458,176 +276,74 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d" }) {
     prisma.creatorAccount.findMany({
       where: { agencyId, deletedAt: null, ...creatorWhere },
       select: { id: true, displayName: true, username: true, avatarUrl: true, status: true, remoteId: true },
-      take: 10000,
+      orderBy: { id: "asc" },
     }),
-    canViewTeam || owner
-      ? prisma.agencyMember.findMany({
-          where: { agencyId, deletedAt: null, deactivatedAt: null },
-          select: { id: true, roleKey: true, displayName: true, user: { select: { email: true, name: true } } },
-          take: 10000,
-        })
-      : Promise.resolve([]),
-    canManageWorkspace
-      ? prisma.jobInstance.groupBy({ by: ["status"], where: { agencyId, ...(scope.broad ? {} : { creatorId: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }) }, _count: { _all: true } }).catch(() => [])
-      : Promise.resolve([]),
-    canManageWorkspace
-      ? prisma.workerDevice.findMany({
-          where: { agencyId },
-          select: { id: true, userId: true, deviceName: true, platform: true, appVersion: true, lastSeenAt: true },
-          take: 10000,
-        })
-      : Promise.resolve([]),
-    canViewAudit
-      ? prisma.auditLog.findMany({
-          where: { agencyId },
-          orderBy: { createdAt: "desc" },
-          take: 5,
-          include: { actor: { select: { id: true, email: true, name: true } } },
-        })
-      : Promise.resolve([]),
-    owner
-      ? prisma.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } })
-      : Promise.resolve(null),
+    canViewTeam || owner ? prisma.agencyMember.findMany({
+      where: { agencyId, deletedAt: null, deactivatedAt: null },
+      select: { id: true, roleKey: true, displayName: true, user: { select: { email: true, name: true } } },
+    }) : Promise.resolve([]),
+    canManageWorkspace ? prisma.jobInstance.groupBy({
+      by: ["status"],
+      where: { agencyId, status: { in: ["SCHEDULED", "CLAIMED"] }, ...(scope.broad ? {} : { creatorId: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }) },
+      _count: { _all: true },
+    }).catch(() => []) : Promise.resolve([]),
+    canManageWorkspace ? prisma.workerDevice.findMany({
+      where: { agencyId }, select: { id: true, userId: true, deviceName: true, platform: true, appVersion: true, lastSeenAt: true },
+    }) : Promise.resolve([]),
+    canViewAudit ? prisma.auditLog.findMany({
+      where: { agencyId }, orderBy: { createdAt: "desc" }, take: 5,
+      include: { actor: { select: { id: true, email: true, name: true } } },
+    }) : Promise.resolve([]),
+    owner ? prisma.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }) : Promise.resolve(null),
   ]);
 
-  let currentRevenue = null;
-  let previousRevenue = null;
-  if (canViewMoney) {
-    [currentRevenue, previousRevenue] = await Promise.all([
-      buildAgencyRevenue(agencyId, range.key, creators, { allowSchedule: canRefreshAnalytics === true }),
-      buildPreviousRevenue(agencyId, previousRange.key, creators),
-    ]);
-  }
-
-  const visibleCreators = currentRevenue
-    ? currentRevenue.creators
-    : creators.map(emptyRevenueCreator).sort((a, b) => String(a.displayName || a.username || a.id).localeCompare(String(b.displayName || b.username || b.id)));
-  const pendingCount = currentRevenue?.pendingCreatorIds?.length || 0;
-  const reportingCreators = currentRevenue ? currentRevenue.creators.filter((c) => c.hasSnapshot).length : 0;
-
-  const now = Date.now();
-  const onlineDevices = canManageWorkspace
-    ? devices.filter((d) => d.lastSeenAt && now - new Date(d.lastSeenAt).getTime() < 5 * 60 * 1000).length
-    : null;
-  const jobsByStatus = canManageWorkspace
-    ? Object.fromEntries((jobs || []).map((row) => [row.status, row._count?._all || 0]))
-    : {};
+  const revenue = canViewMoney ? await readCanonicalRevenue({ db: prisma, agencyId, creators, range, previous, now }) : null;
+  const visibleCreators = revenue ? revenue.creators : creators.map(emptyRevenueCreator);
+  const onlineDevices = canManageWorkspace ? devices.filter((d) => d.lastSeenAt && now.getTime() - new Date(d.lastSeenAt).getTime() < 5 * 60 * 1000).length : null;
+  const jobsByStatus = canManageWorkspace ? Object.fromEntries((jobs || []).map((row) => [row.status, row._count?._all || 0])) : {};
   const seatsLimit = owner ? (subscription?.seatsLimit ?? null) : null;
 
   return {
     ok: true,
-    agency: agency
-      ? { id: agency.id, name: agency.name, plan: owner ? agency.plan : null, status: agency.status, billingAvailable: owner }
+    agency: agency ? { id: agency.id, name: agency.name, plan: owner ? agency.plan : null, status: agency.status, billingAvailable: owner }
       : { id: agencyId, name: null, plan: null, status: null, billingAvailable: owner },
-    range: rangeForClient(range),
-    refreshedAt: new Date().toISOString(),
-    creatorScope: {
-      broad: scope.broad === true,
-      creatorIds: creators.map((creator) => creator.id),
+    range: {
+      key: range.rangeKey,
+      label: range.rangeKey === "today" ? "Today" : range.rangeKey,
+      from: range.startDay.toISOString(),
+      to: range.endAt.toISOString(),
+      previousKey: range.rangeKey,
     },
-    snapshot: {
-      ...availability(false, "UNAVAILABLE"),
-      id: null,
-      capturedAt: null,
-      staleSeconds: null,
-      source: "analytics_snapshot_retired",
+    refreshedAt: now.toISOString(),
+    creatorScope: { broad: scope.broad === true, creatorIds: creators.map((creator) => creator.id) },
+    revenue: canViewMoney ? {
+      ...availability(true), refreshAllowed: canRefreshAnalytics === true,
+      totalCents: revenue.totalCents, grossCents: null, deltaPct: revenue.deltaPct, currency: "USD",
+      salesCount: null, uniqueFans: null, creatorCount: revenue.reportingCreators,
+      points: revenue.points,
+      coverage: { totalCreators: creators.length, reportingCreators: revenue.reportingCreators, pendingCount: revenue.pendingCreatorIds.length, staleCreators: revenue.staleCreators },
+      pending: { count: revenue.pendingCreatorIds.length, creatorIds: revenue.pendingCreatorIds, jobs: revenue.pendingJobs, etaSeconds: null },
+      stalenessMs: CURRENT_DAY_FRESHNESS_MS,
+      source: "creator_earnings_daily",
+    } : {
+      ...availability(false, "FORBIDDEN"), refreshAllowed: false, totalCents: null, grossCents: null, deltaPct: null, currency: "USD",
+      salesCount: null, uniqueFans: null, creatorCount: 0, points: [],
+      coverage: { totalCreators: creators.length, reportingCreators: 0, pendingCount: 0, staleCreators: 0 },
+      pending: { count: 0, creatorIds: [], jobs: [], etaSeconds: null }, stalenessMs: CURRENT_DAY_FRESHNESS_MS, source: "forbidden",
     },
-    revenue: canViewMoney
-      ? {
-          ...availability(true),
-          refreshAllowed: canRefreshAnalytics === true,
-          totalCents: currentRevenue.totalCents,
-          grossCents: currentRevenue.grossCents,
-          deltaPct: pctChange(currentRevenue.totalCents, previousRevenue.totalCents),
-          currency: "USD",
-          salesCount: currentRevenue.salesCount,
-          uniqueFans: currentRevenue.uniqueFans,
-          creatorCount: currentRevenue.creatorCount,
-          points: currentRevenue.points,
-          coverage: { totalCreators: creators.length, reportingCreators, pendingCount },
-          pending: {
-            count: pendingCount,
-            creatorIds: currentRevenue.pendingCreatorIds,
-            jobs: currentRevenue.scheduledJobs,
-            etaSeconds: pendingCount * 12,
-          },
-          stalenessMs: stalenessMsFor(range.key),
-          source: "creator_earnings_snapshots",
-        }
-      : {
-          ...availability(false, "FORBIDDEN"),
-          refreshAllowed: false,
-          totalCents: null,
-          grossCents: null,
-          deltaPct: null,
-          currency: "USD",
-          salesCount: null,
-          uniqueFans: null,
-          creatorCount: creators.length,
-          points: [],
-          coverage: { totalCreators: creators.length, reportingCreators: 0, pendingCount: 0 },
-          pending: { count: 0, creatorIds: [], jobs: [], etaSeconds: 0 },
-          stalenessMs: stalenessMsFor(range.key),
-          source: "forbidden",
-        },
-    messages: {
-      ...availability(false, "UNAVAILABLE"),
-      total: null,
-      team: null,
-      bot: null,
-      incoming: null,
-      source: "no_current_home_message_authority",
-    },
-    seats: owner
-      ? {
-          ...availability(true),
-          used: members.length,
-          limit: seatsLimit,
-          remaining: seatsLimit === null ? null : Math.max(0, Number(seatsLimit) - members.length),
-          source: seatsLimit === null ? "members_only" : "subscription",
-        }
+    seats: owner ? { ...availability(true), used: members.length, limit: seatsLimit, remaining: seatsLimit === null ? null : Math.max(0, Number(seatsLimit) - members.length), source: seatsLimit === null ? "members_only" : "subscription" }
       : { ...availability(false, "FORBIDDEN"), used: null, limit: null, remaining: null, source: "forbidden" },
     creators: visibleCreators,
-    workers: canViewTeam || owner
-      ? {
-          ...availability(true),
-          totalMembers: members.length,
-          onlineDevices: canManageWorkspace ? onlineDevices : null,
-          devices: canManageWorkspace ? devices.length : null,
-          activeMembers: null,
-          runtimeDetailAvailable: canManageWorkspace === true,
-          source: "current_membership",
-        }
-      : {
-          ...availability(false, "FORBIDDEN"),
-          totalMembers: null,
-          onlineDevices: null,
-          devices: null,
-          activeMembers: null,
-          runtimeDetailAvailable: false,
-          source: "forbidden",
-        },
-    health: canManageWorkspace
-      ? { ...availability(true), onlineDevices, jobs: jobsByStatus, source: "current_runtime" }
+    workers: canViewTeam || owner ? { ...availability(true), totalMembers: members.length, onlineDevices: canManageWorkspace ? onlineDevices : null, devices: canManageWorkspace ? devices.length : null, activeMembers: null, runtimeDetailAvailable: canManageWorkspace === true, source: "current_membership" }
+      : { ...availability(false, "FORBIDDEN"), totalMembers: null, onlineDevices: null, devices: null, activeMembers: null, runtimeDetailAvailable: false, source: "forbidden" },
+    health: canManageWorkspace ? { ...availability(true), onlineDevices, jobs: jobsByStatus, source: "current_runtime" }
       : { ...availability(false, "FORBIDDEN"), onlineDevices: null, jobs: {}, source: "forbidden" },
-    jobs: canManageWorkspace
-      ? { ...availability(true), counts: jobsByStatus }
-      : { ...availability(false, "FORBIDDEN"), counts: {} },
+    jobs: canManageWorkspace ? { ...availability(true), counts: jobsByStatus } : { ...availability(false, "FORBIDDEN"), counts: {} },
     audit: {
       ...availability(canViewAudit, canViewAudit ? null : "FORBIDDEN"),
-      items: canViewAudit
-        ? latestAudit.map((row) => ({
-            id: row.id,
-            action: row.action,
-            targetType: row.targetType,
-            targetId: row.targetId,
-            metadata: row.metadata || {},
-            createdAt: row.createdAt,
-            actor: row.actor ? { id: row.actor.id, email: row.actor.email, name: row.actor.name } : null,
-          }))
-        : [],
+      items: canViewAudit ? latestAudit.map((row) => ({ id: row.id, action: row.action, targetType: row.targetType, targetId: row.targetId, metadata: row.metadata || {}, createdAt: row.createdAt, actor: row.actor ? { id: row.actor.id, email: row.actor.email, name: row.actor.name } : null })) : [],
     },
   };
 }
 
-module.exports = { buildHomeSummary, __test: { resolveAndScheduleSnapshots } };
+module.exports = { buildHomeSummary, __test: { readCoverageState, readCanonicalRevenue } };

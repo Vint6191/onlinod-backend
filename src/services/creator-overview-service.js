@@ -2,10 +2,10 @@
 
 const prisma = require("../prisma");
 const { readCreatorLedgerOverview } = require("./creator-analytics-ledger-service");
+const { normalizeCreatorOverviewRangeKey } = require("./analytics-range-contract");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVITY_RETENTION_DAYS = 30;
-const OVERVIEW_RANGES = new Set(["7d", "30d", "90d", "180d", "365d"]);
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -42,7 +42,7 @@ const JOB_LABELS = Object.freeze({
   catchup_notifications_scan: "Activity history",
   financial_transactions_scan: "Financial history",
   fetch_campaigns: "Campaigns",
-  fetch_earnings: "Earnings snapshot",
+  fetch_earnings: "Earnings analytics",
   subscriber_directory_scan: "Subscribers directory",
   dialog_intelligence_scan: "Dialog history",
   vault_unsorted_scan: "Media catalog",
@@ -375,8 +375,8 @@ async function readCampaignCurrentValues({ db, creatorId }) {
 }
 
 async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", now = new Date() }) {
-  const range = OVERVIEW_RANGES.has(String(rangeKey)) ? String(rangeKey) : "30d";
-  const ledger = await readCreatorLedgerOverview({ db, creatorId, rangeKey: range, now });
+  const range = normalizeCreatorOverviewRangeKey(rangeKey);
+  const ledger = await readCreatorLedgerOverview({ db, creatorId, rangeKey: range, now, includeMessages: false, includeCoveragePage: false });
   const start = new Date(ledger.range.startAt);
   const end = new Date(ledger.range.endAt);
   const eventBetween = { gte: start, lte: end };
@@ -471,7 +471,6 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     coverage: {
       notificationVerified: notificationBaselineComplete,
       earningsVerified: ledger.verification.officialEarnings,
-      messagesVerified: ledger.verification.officialMessages,
       activityFromAt: iso(ledger.availability?.activityFromAt),
       activityToAt: iso(ledger.availability?.activityToAt),
       oneYearAvailable,
@@ -479,12 +478,6 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     },
     activity,
     finance,
-    messagesServer: {
-      incoming: int(ledger.totals.incomingMessages),
-      outgoing: int(ledger.totals.outgoingMessages),
-      dailyUniqueDialogsSum: int(ledger.totals.uniqueDialogs),
-      days: int(ledger.totals.dialogDays),
-    },
     campaigns: { totals: campaignTotals, rows: campaigns },
     daily: {
       metrics: (ledger.daily?.metrics || []).map((row) => ({
@@ -493,8 +486,6 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
         comments: int(row.comments),
         newSubscribers: int(row.newSubscribers),
         renewals: int(row.renewals),
-        incomingMessages: int(row.incomingMessages),
-        outgoingMessages: int(row.outgoingMessages),
       })),
       earnings: (ledger.daily?.earnings || []).map((row) => ({ date: row.date, totalCents: cents(row.totalCents) })),
     },

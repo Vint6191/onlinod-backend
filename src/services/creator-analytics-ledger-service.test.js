@@ -24,7 +24,21 @@ const {
 } = require("./creator-analytics-ledger-service");
 Module._load = originalLoad;
 
-const job = { id: "job-1", agencyId: "agency-1", creatorId: "creator-1", params: {} };
+const job = {
+  id: "job-1",
+  agencyId: "agency-1",
+  creatorId: "creator-1",
+  params: {
+    analyticsContractVersion: 1,
+    scanFrom: "2026-07-31",
+    scanTo: "2026-08-06",
+    sourceTimezone: "UTC",
+    displayRangeKey: "7d",
+    requestedAt: "2026-08-06T11:30:00.000Z",
+    scanGeneration: "2026-08-06T11:30:00.000Z",
+    collectionReason: "TEST",
+  },
+};
 
 function transactional(tx) {
   return { ...tx, $transaction: async (callback) => callback(tx) };
@@ -35,6 +49,8 @@ function batchHarness(options = {}) {
   const updated = [];
   const coverage = [];
   const coverageUpdates = [];
+  const scanProofs = [];
+  const scanProofUpdates = [];
   const existing = options.existingBatch || null;
   const tx = {
     analyticsIngestBatch: {
@@ -46,11 +62,27 @@ function batchHarness(options = {}) {
         return row;
       },
       update: async ({ where, data }) => {
-        const row = { id: where.id, ...data };
+        const base = (existing && existing.id === where.id)
+          ? existing
+          : (created.find((row) => row.id === where.id) || {});
+        const row = { ...base, id: where.id, ...data };
         updated.push(row);
         return row;
       },
       findMany: async () => options.pageBatches || [],
+    },
+    analyticsScanProof: {
+      findUnique: async () => options.existingScanProof || null,
+      create: async ({ data }) => {
+        const row = { id: `proof-${scanProofs.length + 1}`, ...data };
+        scanProofs.push(row);
+        return row;
+      },
+      update: async ({ where, data }) => {
+        const row = { ...(options.existingScanProof || {}), id: where.id, ...data };
+        scanProofUpdates.push(row);
+        return row;
+      },
     },
     analyticsCoverage: {
       findFirst: async () => options.latestCoverage || null,
@@ -62,7 +94,7 @@ function batchHarness(options = {}) {
       updateMany: async (args) => { coverageUpdates.push(args); return { count: 1 }; },
     },
   };
-  return { tx, db: transactional(tx), created, updated, coverage, coverageUpdates };
+  return { tx, db: transactional(tx), created, updated, coverage, coverageUpdates, scanProofs, scanProofUpdates };
 }
 
 test("rangeBounds uses inclusive calendar-day windows", () => {
@@ -105,7 +137,7 @@ test("earnings pages use protocol v4 and remain pending until completion proof",
   assert.equal(dailyUpserts[0].create.sourceScanRunId, "run-earnings-1");
   assert.deepEqual(harness.coverage.map((entry) => entry.create.status), ["PARTIAL", "PARTIAL"]);
   assert.equal(harness.coverage[0].create.lastErrorCode, "EARNINGS_SCAN_PENDING");
-  assert.equal(harness.coverage[1].create.lastErrorCode, "EARNINGS_DAY_IN_PROGRESS");
+  assert.equal(harness.coverage[1].create.lastErrorCode, "EARNINGS_SCAN_PENDING");
   assert.equal(harness.updated.at(-1).status, "COMMITTED");
   assert.equal(harness.updated.at(-1).receivedRows, 2);
   assert.equal(harness.updated.at(-1).insertedRows, 2);
@@ -122,7 +154,7 @@ test("earnings completion proves every page and promotes only historical coverag
       { id: "page-a", status: "COMMITTED", receivedRows: 7, rejectedRows: 0 },
     ],
   });
-  harness.tx.creatorEarningsDaily = { count: async () => 7 };
+  harness.tx.creatorEarningsDaily = { count: async () => 7, updateMany: async () => ({ count: 7 }) };
   const payload = {
     schemaVersion: 4,
     collectorVersion: "earnings-v4",
@@ -140,14 +172,134 @@ test("earnings completion proves every page and promotes only historical coverag
   assert.equal(harness.updated.at(-1).status, "COMMITTED");
   assert.equal(harness.updated.at(-1).receivedRows, 7);
   assert.equal(harness.updated.at(-1).unchangedRows, 7);
-  assert.equal(harness.coverageUpdates.length, 1);
+  assert.equal(harness.coverageUpdates.length, 2);
   assert.deepEqual(harness.coverageUpdates[0].where.ingestBatchId.in, ["page-a"]);
-  assert.equal(harness.coverageUpdates[0].data.status, "COMPLETE");
+  assert.equal(harness.coverageUpdates[0].data.scanProofId, result.scanProofId);
+  assert.deepEqual(harness.coverageUpdates[1].where.ingestBatchId.in, ["page-a"]);
+  assert.equal(harness.coverageUpdates[1].data.status, "COMPLETE");
+});
+
+test("earnings completion replay monotonically promotes a durable PARTIAL scan proof", async () => {
+  const crypto = require("node:crypto");
+  const payload = {
+    schemaVersion: 4,
+    collectorVersion: "earnings-v4",
+    scanRunId: "run-earnings-replay",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    range: { startDate: "2026-07-31", endDate: "2026-08-06" },
+    dailyBatchCount: 1,
+    dailyCount: 7,
+    scannerRejected: 0,
+    chartComplete: true,
+    dailyComplete: true,
+  };
+  const payloadChecksum = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+  const harness = batchHarness({
+    existingBatch: { id: "completion-batch", status: "PARTIAL", payloadChecksum },
+    existingScanProof: {
+      id: "proof-existing",
+      status: "PARTIAL",
+      payloadChecksum,
+      scanFrom: new Date("2026-07-31T00:00:00.000Z"),
+      scanTo: new Date("2026-08-06T00:00:00.000Z"),
+      sourceDeviceId: null,
+      sourceJobId: "job-1",
+    },
+    pageBatches: [{ id: "page-a", status: "COMMITTED", receivedRows: 7, rejectedRows: 0 }],
+  });
+  harness.tx.creatorEarningsDaily = { count: async () => 7, updateMany: async () => ({ count: 7 }) };
+
+  const result = await completeEarningsScan({ db: harness.db, job, deviceId: "device-1", result: payload });
+  assert.equal(result.complete, true);
+  assert.equal(result.replay, true);
+  assert.equal(result.scanProofId, "proof-existing");
+  assert.equal(harness.scanProofUpdates.length, 1);
+  assert.equal(harness.scanProofUpdates[0].status, "COMMITTED");
+  assert.ok(harness.scanProofUpdates[0].committedAt instanceof Date);
+  assert.equal(harness.scanProofUpdates[0].rowCount, 7);
+  assert.equal(harness.scanProofUpdates[0].rejectedRows, 0);
+});
+
+test("committed earnings proof remains authoritative after operational page-batch compaction", async () => {
+  const crypto = require("node:crypto");
+  const payload = {
+    schemaVersion: 4,
+    collectorVersion: "earnings-v4",
+    scanRunId: "run-earnings-compacted",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    range: { startDate: "2026-07-31", endDate: "2026-08-06" },
+    dailyBatchCount: 1,
+    dailyCount: 7,
+    scannerRejected: 0,
+    chartComplete: true,
+    dailyComplete: true,
+  };
+  const payloadChecksum = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+  const harness = batchHarness({
+    existingBatch: { id: "completion-batch", status: "COMMITTED", payloadChecksum },
+    existingScanProof: {
+      id: "proof-existing",
+      status: "COMMITTED",
+      payloadChecksum,
+      scanFrom: new Date("2026-07-31T00:00:00.000Z"),
+      scanTo: new Date("2026-08-06T00:00:00.000Z"),
+      sourceDeviceId: "device-1",
+      sourceJobId: "job-1",
+    },
+    pageBatches: [],
+  });
+  harness.tx.creatorEarningsDaily = { count: async () => 7, updateMany: async () => ({ count: 7 }) };
+
+  const result = await completeEarningsScan({ db: harness.db, job, deviceId: "device-1", result: payload });
+  assert.equal(result.complete, true);
+  assert.equal(result.replay, true);
+  assert.equal(result.scanProofId, "proof-existing");
+  assert.equal(harness.updated.length, 0, "committed completion batch must not be downgraded after compaction");
+  assert.equal(harness.scanProofUpdates.length, 0, "committed durable proof must remain immutable");
+});
+
+test("committed earnings proof remains authoritative after full ingest-batch compaction", async () => {
+  const crypto = require("node:crypto");
+  const payload = {
+    schemaVersion: 4,
+    collectorVersion: "earnings-v4",
+    scanRunId: "run-earnings-fully-compacted",
+    observedAt: "2026-08-06T12:00:00.000Z",
+    range: { startDate: "2026-07-31", endDate: "2026-08-06" },
+    dailyBatchCount: 1,
+    dailyCount: 7,
+    scannerRejected: 0,
+    chartComplete: true,
+    dailyComplete: true,
+  };
+  const payloadChecksum = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+  const harness = batchHarness({
+    existingBatch: null,
+    existingScanProof: {
+      id: "proof-existing",
+      status: "COMMITTED",
+      payloadChecksum,
+      scanFrom: new Date("2026-07-31T00:00:00.000Z"),
+      scanTo: new Date("2026-08-06T00:00:00.000Z"),
+      sourceDeviceId: "device-1",
+      sourceJobId: "job-1",
+    },
+    pageBatches: [],
+  });
+  harness.tx.creatorEarningsDaily = { count: async () => 7, updateMany: async () => ({ count: 7 }) };
+
+  const result = await completeEarningsScan({ db: harness.db, job, deviceId: "device-1", result: payload });
+  assert.equal(result.complete, true);
+  assert.equal(result.replay, true, "durable receipt defines business replay after technical batch retention");
+  assert.equal(result.scanProofId, "proof-existing");
+  assert.equal(harness.created.length, 1, "a fresh technical completion row may be recorded for the replay");
+  assert.equal(harness.updated.at(-1).status, "COMMITTED", "technical replay row follows durable proof instead of becoming PARTIAL");
+  assert.equal(harness.scanProofUpdates.length, 0, "durable COMMITTED proof remains immutable");
 });
 
 test("earnings completion stays partial when page proof or daily proof is incomplete", async () => {
   const harness = batchHarness({ pageBatches: [] });
-  harness.tx.creatorEarningsDaily = { count: async () => 0 };
+  harness.tx.creatorEarningsDaily = { count: async () => 0, updateMany: async () => ({ count: 0 }) };
   const result = await completeEarningsScan({
     db: harness.db,
     job,
@@ -488,6 +640,19 @@ test("ledger overview preserves nullable earnings categories and counts only com
         lastErrorCode: null, lastErrorMessage: null,
       }),
     },
+    analyticsScanProof: {
+      findUnique: async () => options.existingScanProof || null,
+      create: async ({ data }) => {
+        const row = { id: `proof-${scanProofs.length + 1}`, ...data };
+        scanProofs.push(row);
+        return row;
+      },
+      update: async ({ where, data }) => {
+        const row = { ...(options.existingScanProof || {}), id: where.id, ...data };
+        scanProofUpdates.push(row);
+        return row;
+      },
+    },
     analyticsCoverage: {
       findMany: async () => [{ dataType: "EARNINGS", coverageDate: date, status: "COMPLETE" }],
       count: async ({ where }) => !where.dataType ? 1 : where.dataType === "EARNINGS" && where.status === "COMPLETE" ? 1 : 0,
@@ -513,6 +678,49 @@ test("ledger overview preserves nullable earnings categories and counts only com
 });
 
 
+test("current overview ledger mode does not read dormant server message authority", async () => {
+  let dailyMetricSelect = null;
+  const db = {
+    creatorEarningsDaily: { findMany: async () => [] },
+    creatorMessagesDaily: { findMany: async () => { throw new Error("DORMANT_MESSAGES_MUST_NOT_BE_READ"); } },
+    creatorPostLike: { groupBy: async () => [], count: async () => 0 },
+    creatorPostComment: { groupBy: async () => [], count: async () => 0 },
+    creatorSale: { aggregate: async () => ({ _sum: { amountCents: null }, _count: { _all: 0 } }) },
+    creatorTip: { aggregate: async () => ({ _sum: { amountCents: null }, _count: { _all: 0 } }) },
+    creatorSubscriptionEvent: { groupBy: async () => [] },
+    creatorCampaign: { findMany: async () => [] },
+    creatorCampaignFan: { groupBy: async () => [] },
+    creatorNotificationSyncState: { findUnique: async () => null },
+    creatorDailyMetrics: { findMany: async (args) => { dailyMetricSelect = args.select || null; return []; } },
+    creatorPaidSubscription: { aggregate: async () => ({ _sum: { amountCents: null }, _count: { _all: 0 } }) },
+    creatorSubscriptionState: { groupBy: async () => [] },
+    creatorLocalMessageCoverage: { findMany: async () => { throw new Error("DORMANT_MESSAGE_COVERAGE_MUST_NOT_BE_READ"); } },
+    analyticsCoverage: {
+      findMany: async () => { throw new Error("CURRENT_OVERVIEW_MUST_NOT_READ_GENERIC_COVERAGE_PAGE"); },
+      count: async ({ where }) => {
+        if (where.dataType === "MESSAGES_DAILY") throw new Error("DORMANT_MESSAGE_COVERAGE_MUST_NOT_BE_COUNTED");
+        return 0;
+      },
+    },
+    $queryRaw: async () => [],
+  };
+  const result = await readCreatorLedgerOverview({
+    db,
+    creatorId: "creator-1",
+    rangeKey: "7d",
+    now: new Date("2026-08-06T12:00:00.000Z"),
+    includeMessages: false,
+    includeCoveragePage: false,
+  });
+  assert.equal(result.verification.officialMessages, false);
+  assert.deepEqual(result.daily.messages, []);
+  assert.deepEqual(result.localMessageCoverage, []);
+  assert.deepEqual(result.coverage, []);
+  assert.equal(result.coveragePagination.total, 0);
+  assert.deepEqual(dailyMetricSelect, { date: true, likes: true, comments: true, newSubscribers: true, renewals: true });
+});
+
+
 
 test("today earnings are official only when the row and in-progress proof both exist", async () => {
   const date = new Date("2026-08-06T00:00:00.000Z");
@@ -524,6 +732,19 @@ test("today earnings are official only when the row and in-progress proof both e
     creatorTip: { aggregate: async () => ({ _sum: { amountCents: null }, _count: { _all: 0 } }) },
     creatorSubscriptionEvent: { groupBy: async () => [] }, creatorCampaign: { findMany: async () => [] },
     creatorCampaignFan: { groupBy: async () => [] },
+    analyticsScanProof: {
+      findUnique: async () => options.existingScanProof || null,
+      create: async ({ data }) => {
+        const row = { id: `proof-${scanProofs.length + 1}`, ...data };
+        scanProofs.push(row);
+        return row;
+      },
+      update: async ({ where, data }) => {
+        const row = { ...(options.existingScanProof || {}), id: where.id, ...data };
+        scanProofUpdates.push(row);
+        return row;
+      },
+    },
     analyticsCoverage: {
       findMany: async () => [{ dataType: "EARNINGS", coverageDate: date, sourceTimezone: "UTC", status: "PARTIAL", lastErrorCode: "EARNINGS_DAY_IN_PROGRESS" }],
       count: async ({ where }) => !where.dataType ? 1 : where.dataType === "EARNINGS" && where.status === "PARTIAL" ? 1 : 0,
@@ -737,6 +958,19 @@ test("coverage reader pages on the server and reports the real total", async () 
   const date = new Date("2026-08-05T00:00:00.000Z");
   const calls = [];
   const db = {
+    analyticsScanProof: {
+      findUnique: async () => options.existingScanProof || null,
+      create: async ({ data }) => {
+        const row = { id: `proof-${scanProofs.length + 1}`, ...data };
+        scanProofs.push(row);
+        return row;
+      },
+      update: async ({ where, data }) => {
+        const row = { ...(options.existingScanProof || {}), id: where.id, ...data };
+        scanProofUpdates.push(row);
+        return row;
+      },
+    },
     analyticsCoverage: {
       findMany: async (args) => { calls.push(args); return [
         { dataType: "EARNINGS", coverageDate: date, status: "COMPLETE" },
@@ -759,7 +993,7 @@ test("earnings ingest serializes writers and never lets an older observation ove
   let writes = 0;
   harness.tx.$executeRawUnsafe = async (sql, value) => { locks.push({ sql, value }); return 1; };
   harness.tx.creatorEarningsDaily = {
-    findUnique: async () => ({ id: "daily-newer", collectedAt: new Date("2026-08-06T13:00:00.000Z") }),
+    findUnique: async () => ({ id: "daily-newer", sourceScanRequestedAt: new Date("2026-08-06T12:30:00.000Z"), collectedAt: new Date("2026-08-06T13:00:00.000Z") }),
     upsert: async () => { writes += 1; },
   };
   const result = await ingestEarningsChunk({
@@ -790,6 +1024,7 @@ test("earnings completion accepts rows preserved or superseded by another overla
   let countWhere = null;
   harness.tx.creatorEarningsDaily = {
     count: async ({ where }) => { countWhere = where; return 7; },
+    updateMany: async () => ({ count: 7 }),
   };
   const result = await completeEarningsScan({
     db: harness.db,
@@ -860,4 +1095,67 @@ test("a complete local message proof can upgrade a newer partial row without los
   assert.equal(result.updated, 1);
   assert.equal(result.unchanged, 0);
   assert.equal(harness.coverage[0].create.status, "COMPLETE");
+});
+
+test("desktop future clock is provenance only and cannot poison earnings freshness", async () => {
+  const harness = batchHarness();
+  const upserts = [];
+  harness.tx.creatorEarningsDaily = {
+    findUnique: async () => null,
+    upsert: async (args) => { upserts.push(args); return args.create; },
+  };
+  const before = Date.now();
+  await ingestEarningsChunk({
+    db: harness.db,
+    job,
+    deviceId: "device-future-clock",
+    chunk: {
+      kind: "earnings_daily_page",
+      schemaVersion: 4,
+      collectorVersion: "earnings-v4",
+      scanRunId: "run-future-clock",
+      observedAt: "2099-08-06T23:59:59.000Z",
+      batchKey: "run:run-future-clock:daily:page-1",
+      scannerRejected: 0,
+      rows: [{ date: "2026-08-05", sourceTimezone: "UTC", totalCents: 100, currency: "USD" }],
+    },
+  });
+  const after = Date.now();
+  assert.equal(upserts.length, 1);
+  const collectedAt = upserts[0].create.collectedAt.getTime();
+  assert.ok(collectedAt >= before && collectedAt <= after);
+  assert.notEqual(upserts[0].create.collectedAt.toISOString(), "2099-08-06T23:59:59.000Z");
+  assert.equal(upserts[0].create.sourceScanRequestedAt.toISOString(), job.params.requestedAt);
+});
+
+test("a later server scan can overwrite an earlier fact even when the desktop clock moved backwards", async () => {
+  const laterJob = {
+    ...job,
+    id: "job-later-server-request",
+    params: { ...job.params, requestedAt: "2026-08-06T13:30:00.000Z", scanGeneration: "2026-08-06T13:30:00.000Z" },
+  };
+  const harness = batchHarness();
+  let writes = 0;
+  harness.tx.creatorEarningsDaily = {
+    findUnique: async () => ({ id: "daily-old", sourceScanRequestedAt: new Date(job.params.requestedAt) }),
+    upsert: async () => { writes += 1; return {}; },
+  };
+  const result = await ingestEarningsChunk({
+    db: harness.db,
+    job: laterJob,
+    deviceId: "device-backward-clock",
+    chunk: {
+      kind: "earnings_daily_page",
+      schemaVersion: 4,
+      collectorVersion: "earnings-v4",
+      scanRunId: "run-backward-clock",
+      observedAt: "2020-01-01T00:00:00.000Z",
+      batchKey: "run:run-backward-clock:daily:page-1",
+      scannerRejected: 0,
+      rows: [{ date: "2026-08-05", sourceTimezone: "UTC", totalCents: 200, currency: "USD" }],
+    },
+  });
+  assert.equal(writes, 1);
+  assert.equal(result.updated, 1);
+  assert.equal(result.unchanged, 0);
 });

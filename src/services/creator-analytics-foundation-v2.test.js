@@ -81,9 +81,10 @@ test("local message coverage stores only metadata and never message bodies", () 
   }
   assert.match(fanCoverage, /@@unique\(\[creatorId, fanRecordId, deviceId\]\)/);
   assert.doesNotMatch(`${coverage}\n${fanCoverage}`, /messageText|bodyText|content|payload/i);
-  assert.match(routes, /messagesIndexed/);
-  assert.match(routes, /oldestMessageAt/);
-  assert.match(routes, /newestMessageAt/);
+  assert.match(ledger, /messagesIndexed/);
+  assert.match(ledger, /oldestMessageAt/);
+  assert.match(ledger, /newestMessageAt/);
+  assert.match(routes, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);
 });
 
 test("V2 migrations split enum additions from relational table use and contain no JSON business columns", () => {

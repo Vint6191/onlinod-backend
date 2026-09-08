@@ -99,6 +99,34 @@ const RETENTION_FIELDS = Object.freeze({
     hint: "Retention for compact monthly Automation metrics.",
   },
 
+  analyticsIngestBatchDays: {
+    label: "Analytics ingest execution history",
+    unit: "days",
+    env: "ONLINOD_ANALYTICS_INGEST_BATCH_DAYS",
+    fallback: 30,
+    min: 7,
+    max: 3650,
+    hint: "Earnings page/completion batches after durable AnalyticsScanProof exists.",
+  },
+  analyticsJobInstanceDays: {
+    label: "Analytics completed job history",
+    unit: "days",
+    env: "ONLINOD_ANALYTICS_JOB_INSTANCE_DAYS",
+    fallback: 30,
+    min: 7,
+    max: 3650,
+    hint: "Terminal fetch_earnings JobInstance rows after durable proof exists.",
+  },
+  analyticsSupersededScanProofDays: {
+    label: "Analytics superseded durable proofs",
+    unit: "days",
+    env: "ONLINOD_ANALYTICS_SUPERSEDED_SCAN_PROOF_DAYS",
+    fallback: 30,
+    min: 7,
+    max: 3650,
+    hint: "Old AnalyticsScanProof rows are removed only after no canonical earnings or coverage row references them.",
+  },
+
   automationJobDoneDays: {
     label: "Automation completed jobs",
     unit: "days",
@@ -623,6 +651,131 @@ async function runAuditLogRetentionSweep(options = {}) {
 }
 
 
+async function runAnalyticsExecutionRetentionSweep(options = {}) {
+  const cfg = await resolveSweepConfig(options);
+  const batchSize = Math.max(100, Math.min(10000, Number(cfg.batchSize) || DEFAULT_BATCH_SIZE));
+  const ingestCutoff = daysAgo(cfg.analyticsIngestBatchDays);
+  const jobCutoff = daysAgo(cfg.analyticsJobInstanceDays);
+  const proofCutoff = daysAgo(cfg.analyticsSupersededScanProofDays);
+  const items = [];
+
+  let ingestDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "AnalyticsIngestBatch" b
+      WHERE b."id" IN (
+        SELECT ib."id"
+        FROM "AnalyticsIngestBatch" ib
+        JOIN "AnalyticsScanProof" p
+          ON p."creatorId" = ib."creatorId"
+         AND p."dataType" = 'EARNINGS'::"AnalyticsDataType"
+         AND p."scanRunId" = substring(ib."idempotencyKey" from 'run:([^:]+):')
+        WHERE ib."dataType" = 'EARNINGS'::"AnalyticsDataType"
+          AND ib."completedAt" IS NOT NULL
+          AND ib."completedAt" < $1
+        ORDER BY ib."completedAt" ASC
+        LIMIT $2
+      )
+    `, ingestCutoff, batchSize));
+    ingestDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({ label: `analyticsIngestBatch.earnings_${cfg.analyticsIngestBatchDays}d`, deleted: ingestDeleted });
+
+  let jobsDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "JobInstance" j
+      WHERE j."id" IN (
+        SELECT candidate."id"
+        FROM "JobInstance" candidate
+        WHERE candidate."jobKey" = 'fetch_earnings'
+          AND candidate."status" IN ('DONE', 'FAILED', 'CANCELLED', 'CANCELED', 'EXPIRED')
+          AND candidate."completedAt" IS NOT NULL
+          AND candidate."completedAt" < $1
+          AND EXISTS (
+            SELECT 1 FROM "AnalyticsScanProof" p
+            WHERE p."sourceJobId" = candidate."id"
+              AND p."dataType" = 'EARNINGS'::"AnalyticsDataType"
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM "CreatorEarningsDaily" d
+            WHERE d."sourceJobId" = candidate."id" AND d."scanProofId" IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM "AnalyticsIngestBatch" ib
+            JOIN "AnalyticsCoverage" c ON c."ingestBatchId" = ib."id"
+            WHERE ib."sourceJobId" = candidate."id"
+              AND ib."dataType" = 'EARNINGS'::"AnalyticsDataType"
+              AND c."scanProofId" IS NULL
+          )
+        ORDER BY candidate."completedAt" ASC
+        LIMIT $2
+      )
+    `, jobCutoff, batchSize));
+    jobsDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({ label: `jobInstance.fetch_earnings_${cfg.analyticsJobInstanceDays}d`, deleted: jobsDeleted });
+
+  let demandsDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "AnalyticsCollectionDemand" d
+      WHERE d."key" IN (
+        SELECT candidate."key"
+        FROM "AnalyticsCollectionDemand" candidate
+        WHERE candidate."completedAt" IS NOT NULL
+          AND candidate."completedAt" < $1
+          AND candidate."claimToken" IS NULL
+        ORDER BY candidate."completedAt" ASC
+        LIMIT $2
+      )
+    `, jobCutoff, batchSize));
+    demandsDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({ label: `analyticsCollectionDemand.completed_${cfg.analyticsJobInstanceDays}d`, deleted: demandsDeleted });
+
+  // AnalyticsScanProof is durable business evidence while a canonical daily or
+  // coverage row still points at it.  Once a newer scan has superseded every
+  // such reference, the old receipt becomes technical history and may be
+  // compacted.  Never rely on ON DELETE SET NULL here: reachability is the
+  // retention authority and referenced proofs are explicitly excluded.
+  let proofsDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "AnalyticsScanProof" p
+      WHERE p."id" IN (
+        SELECT candidate."id"
+        FROM "AnalyticsScanProof" candidate
+        WHERE candidate."createdAt" < $1
+          AND NOT EXISTS (
+            SELECT 1
+            FROM "CreatorEarningsDaily" d
+            WHERE d."scanProofId" = candidate."id"
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM "AnalyticsCoverage" c
+            WHERE c."scanProofId" = candidate."id"
+          )
+        ORDER BY candidate."createdAt" ASC, candidate."id" ASC
+        LIMIT $2
+      )
+    `, proofCutoff, batchSize));
+    proofsDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({
+    label: `analyticsScanProof.superseded_unreferenced_${cfg.analyticsSupersededScanProofDays}d`,
+    deleted: proofsDeleted,
+  });
+
+  return summarizeSweep("analyticsExecution", items);
+}
+
 async function runCreatorTaskActivityRetentionSweep(options = {}) {
   const cfg = await resolveSweepConfig(options);
   const items = [];
@@ -650,7 +803,7 @@ async function runRetentionSweep(options = {}) {
   }
 
   try {
-    const [teamActivity, teamLedgers, traffic, automation, dialogIntelligence, auditLogs, creatorTaskActivity] = await Promise.all([
+    const [teamActivity, teamLedgers, traffic, automation, dialogIntelligence, auditLogs, creatorTaskActivity, analyticsExecution] = await Promise.all([
       runTeamActivityRetentionSweep(options),
       runTeamLedgerRetentionSweep(options),
       runTrafficRetentionSweep(options),
@@ -658,12 +811,13 @@ async function runRetentionSweep(options = {}) {
       runDialogIntelligenceRetentionSweep(options),
       runAuditLogRetentionSweep(options),
       runCreatorTaskActivityRetentionSweep(options),
+      runAnalyticsExecutionRetentionSweep(options),
     ]);
 
     return {
       ok: true,
       elapsedMs: Date.now() - startedAt,
-      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0) + (dialogIntelligence.totalDeleted || 0) + (auditLogs.totalDeleted || 0) + (creatorTaskActivity.totalDeleted || 0),
+      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0) + (dialogIntelligence.totalDeleted || 0) + (auditLogs.totalDeleted || 0) + (creatorTaskActivity.totalDeleted || 0) + (analyticsExecution.totalDeleted || 0),
       teamActivity,
       teamLedgers,
       traffic,
@@ -671,6 +825,7 @@ async function runRetentionSweep(options = {}) {
       dialogIntelligence,
       auditLogs,
       creatorTaskActivity,
+      analyticsExecution,
       lock: useLock ? "advisory" : "disabled",
     };
   } finally {
@@ -693,6 +848,7 @@ module.exports = {
   runDialogIntelligenceRetentionSweep,
   runAuditLogRetentionSweep,
   runCreatorTaskActivityRetentionSweep,
+  runAnalyticsExecutionRetentionSweep,
   getRetentionSettings,
   updateRetentionSettings,
   resetRetentionSettings,

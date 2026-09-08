@@ -64,58 +64,16 @@ function dateOrNull(value) {
   return Number.isFinite(date.getTime()) ? date : null;
 }
 
-async function applyEarningsResult({ db = prisma, job, deviceId, userId, result }) {
+async function applyEarningsResult({ db = prisma, job, deviceId, result }) {
   if (!job.creatorId || !job.agencyId) throw new Error("Earnings job is missing creator scope");
   const payload = asObject(result);
   const summary = asObject(payload.summary);
-  const range = asObject(payload.range);
-  const rangeKey = String(payload.rangeKey || job.params?.rangeKey || "7d").trim() || "7d";
   const dailyLedger = await completeEarningsScan({ db, job, deviceId, result: payload });
-  let snapshot = null;
-  const totalValue = summary.totalCents ?? summary.total;
-  const grossValue = summary.grossCents ?? summary.gross;
-  const deltaValue = summary.deltaCents ?? summary.delta;
-  const legacySalesCountKnown = Number.isInteger(summary.salesCount) && summary.salesCount >= 0;
-  const legacyUniqueFansKnown = Number.isInteger(summary.uniqueFans) && summary.uniqueFans >= 0;
-  const canWriteLegacySnapshot = dailyLedger.complete === true
-    && totalValue !== null && totalValue !== undefined
-    && grossValue !== null && grossValue !== undefined
-    && deltaValue !== null && deltaValue !== undefined
-    && legacySalesCountKnown
-    && legacyUniqueFansKnown;
-  if (canWriteLegacySnapshot) {
-    const data = {
-      creatorId: job.creatorId,
-      agencyId: job.agencyId,
-      rangeKey,
-      rangeStartAt: dateOrNull(range.startDate),
-      rangeEndAt: dateOrNull(range.endDate),
-      totalCents: BigInt(cents(totalValue)),
-      grossCents: BigInt(cents(grossValue)),
-      deltaCents: BigInt(cents(deltaValue)),
-      avgSaleCents: summary.avgSaleCents == null && summary.avgSale == null ? 0 : cents(summary.avgSaleCents ?? summary.avgSale),
-      fanLtvCents: summary.fanLtvCents == null && summary.fanLtv == null ? 0 : cents(summary.fanLtvCents ?? summary.fanLtv),
-      salesCount: integer(summary.salesCount),
-      uniqueFans: integer(summary.uniqueFans),
-      raw: null,
-      capturedAt: new Date(),
-      capturedByDeviceId: deviceId,
-      capturedByUserId: userId,
-    };
-    snapshot = await db.creatorEarningsSnapshot.upsert({
-      where: { creatorId_rangeKey: { creatorId: job.creatorId, rangeKey } },
-      create: data,
-      update: data,
-    });
-  }
   return {
     ok: dailyLedger.complete === true,
     type: "earnings",
-    snapshotId: snapshot?.id || null,
-    rangeKey,
-    totalCents: totalValue == null ? null : cents(totalValue),
-    salesCount: legacySalesCountKnown ? summary.salesCount : null,
-    uniqueFans: legacyUniqueFansKnown ? summary.uniqueFans : null,
+    scanProofId: dailyLedger.scanProofId || null,
+    totalCents: summary.totalCents == null ? null : cents(summary.totalCents),
     dailyLedger,
   };
 }

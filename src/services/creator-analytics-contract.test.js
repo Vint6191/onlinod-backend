@@ -38,45 +38,65 @@ test("all changed Creator Analytics backend files pass syntax checks", () => {
   }
 });
 
-test("earnings, campaigns, overview and agency summary are permission guarded", () => {
-  for (const route of [
-    "/creators/:creatorId/earnings",
-    "/creators/:creatorId/campaigns",
-    "/creators/:creatorId/overview",
-    "/agencies/:agencyId/earnings/summary",
+test("snapshot-era Stats surfaces are explicit 410 tombstones and current overview stays guarded", () => {
+  for (const [method, route] of [
+    ["post", "/earnings/upsert"],
+    ["post", "/campaigns/upsert"],
+    ["get", "/creators/:creatorId/earnings"],
+    ["get", "/creators/:creatorId/campaigns"],
+    ["get", "/creators/:creatorId/overview"],
+    ["get", "/agencies/:agencyId/earnings/summary"],
+    ["post", "/agencies/:agencyId/refresh"],
+    ["post", "/creators/:creatorId/messages-daily"],
   ]) {
-    assert.match(routeBody(stats, "get", route), /requireEarningsPermission\(res, ctx\.member\)/, route);
+    assert.match(routeBody(stats, method, route), /legacyStatsGone/, `${method.toUpperCase()} ${route}`);
   }
-  assert.match(stats, /raw:\s*sanitizeAnalyticsRaw\(s\.raw\)/);
-  assert.match(stats, /raw:\s*sanitizeAnalyticsRaw\(input\.raw\)/);
-  assert.match(stats, /const cleanCampaigns = sanitizeCampaigns\(input\.campaigns\)/);
-  assert.match(stats, /campaigns:\s*sanitizeCampaigns\(snapshot\.campaigns\)/);
-  assert.match(stats, /campaigns:\s*sanitizeCampaigns\(campaigns\.campaigns\)/);
+  assert.match(stats, /function legacyStatsGone/);
+  assert.match(stats, /status\(410\)/);
+  assert.match(stats, /ANALYTICS_LEGACY_STATS_RETIRED/);
+
+  const overview = routeBody(stats, "get", "/creators/:creatorId/overview-v2");
+  assert.match(overview, /requireEarningsPermission\(res, ctx\.member\)/);
+  assert.match(overview, /readCreatorOverview\(/);
+  assert.doesNotMatch(overview, /CreatorEarningsSnapshot|creatorEarningsSnapshot|sanitizeAnalyticsRaw/);
 });
 
-test("creator and agency refresh routes are guarded and agency scheduling is bounded", () => {
+test("current creator refresh is the sole Stats refresh control plane", () => {
   const creator = routeBody(stats, "post", "/creators/:creatorId/refresh");
   assert.match(creator, /requireRefreshPermission\(res, ctx\.member\)/);
-  assert.match(creator, /scheduleSubscriberScan\(/);
-  assert.match(creator, /jobKey: "subscriber_directory_scan"/);
-  const agency = routeBody(stats, "post", "/agencies/:agencyId/refresh");
-  assert.match(agency, /requireRefreshPermission\(res, ctx\.member\)/);
-  assert.match(agency, /const batchSize = range === "all" \? 5 : 20/);
+  assert.match(creator, /ensureAnalyticsFreshness\(/);
+  assert.match(creator, /reason: "INTERACTIVE_REFRESH"/);
   assert.match(creator, /ensureRecurringCreatorAnalyticsCatchups\(/);
-  assert.doesNotMatch(creator, /jobKey: "catchup_notifications_scan"/);
-  assert.match(agency, /ensureRecurringCreatorAnalyticsCatchups\(/);
-  assert.doesNotMatch(agency, /jobKey: "catchup_notifications_scan"/);
-  assert.doesNotMatch(agency, /notificationWindows\(/);
-  assert.match(agency, /Promise\.allSettled/);
-  assert.doesNotMatch(agency, /for \(const creator of creators\)[\s\S]*await scheduleJobNow/);
-  // Creator Analytics orchestration must stay additive to the Home dashboard
-  // API contract. HomeService still consumes creatorsScheduled/jobsScheduled/
-  // alreadyClaimed from this endpoint.
-  assert.match(agency, /creatorsScheduled/);
-  assert.match(agency, /creatorsRequested/);
-  assert.match(agency, /failedCount/);
-  assert.match(agency, /failures:/);
-  assert.match(agency, /AGENCY_REFRESH_FAILED/);
+  assert.match(creator, /scheduleSubscriberScan\(/);
+  assert.doesNotMatch(creator, /jobKey: "fetch_earnings"/);
+  assert.doesNotMatch(creator, /TRACKED_RANGES/);
+  assert.match(routeBody(stats, "post", "/agencies/:agencyId/refresh"), /legacyStatsGone/);
+});
+
+test("every live creator-scoped Stats route resolves current creator access before business work", () => {
+  const liveRoutes = [
+    ["post", "/creators/:creatorId/refresh"],
+    ["get", "/creators/:creatorId/overview-v2"],
+    ["get", "/creators/:creatorId/current-task"],
+    ["get", "/creators/:creatorId/task-activity"],
+    ["get", "/creators/:creatorId/campaigns/:campaignId/fans"],
+    ["get", "/creators/:creatorId/notification-scan"],
+    ["post", "/creators/:creatorId/notification-scan/start"],
+    ["post", "/creators/:creatorId/notification-scan/stop"],
+    ["get", "/creators/:creatorId/financial-transaction-scan"],
+    ["post", "/creators/:creatorId/financial-transaction-scan/start"],
+    ["post", "/creators/:creatorId/financial-transaction-scan/stop"],
+    ["get", "/creators/:creatorId/campaign-scan"],
+    ["post", "/creators/:creatorId/campaign-scan/start"],
+    ["post", "/creators/:creatorId/campaign-scan/stop"],
+    ["post", "/creators/:creatorId/notifications/live"],
+  ];
+  for (const [method, route] of liveRoutes) {
+    const body = routeBody(stats, method, route);
+    assert.match(body, /loadCreatorWithAccess\(/, `${method.toUpperCase()} ${route}`);
+  }
+  assert.match(routeBody(stats, "post", "/creators/:creatorId/notifications/live"), /requireAuthDevice\(/);
+  assert.match(routeBody(stats, "post", "/creators/:creatorId/messages-daily"), /legacyStatsGone/);
 });
 
 test("traffic reads and writes stay creator-bound and permission guarded", () => {
@@ -100,4 +120,17 @@ test("senior role semantics are shared without loading Prisma", () => {
   assert.match(roleHelper, /roleKey/);
   assert.match(teamPermissions, /require\("\.\/agency-member-role"\)/);
   assert.doesNotMatch(roleHelper, /prisma|@prisma\/client/);
+});
+
+
+test("Analytics product range subsets share the canonical range authority and reject silent fallback", () => {
+  const ranges = require("./analytics-range-contract");
+  assert.equal(ranges.normalizeCreatorOverviewRangeKey("30d"), "30d");
+  assert.equal(ranges.normalizeHomeRangeKey("24h"), "today");
+  assert.throws(() => ranges.normalizeCreatorOverviewRangeKey("today"), /CREATOR_OVERVIEW_RANGE_UNSUPPORTED/);
+  assert.throws(() => ranges.normalizeHomeRangeKey("365d"), /HOME_RANGE_UNSUPPORTED/);
+  assert.throws(() => ranges.normalizeCreatorOverviewRangeKey("garbage"), /ANALYTICS_RANGE_INVALID/);
+  const refreshBody = routeBody(stats, "post", "/creators/:creatorId/refresh");
+  assert.match(refreshBody, /normalizeCreatorOverviewRangeKey/);
+  assert.match(refreshBody, /INVALID_OVERVIEW_RANGE/);
 });

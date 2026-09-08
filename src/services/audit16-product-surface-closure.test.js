@@ -105,17 +105,14 @@ test("Audit16 Stats, Traffic and Fan Data use canonical creator scope and canoni
   assert.doesNotMatch(stats, /creator-analytics-permissions/);
 
   const liveStart = stats.indexOf('router.post("/creators/:creatorId/notifications/live"');
-  const dailyStart = stats.indexOf('router.post("/creators/:creatorId/messages-daily"');
-  assert.ok(liveStart >= 0 && dailyStart > liveStart, "Stats machine-plane routes must remain mounted");
-  const liveRoute = stats.slice(liveStart, dailyStart);
-  const dailyRoute = stats.slice(dailyStart);
-  for (const machineRoute of [liveRoute, dailyRoute]) {
-    assert.match(machineRoute, /mismatchCode:\s*"DEVICE_IDENTITY_MISMATCH"/);
-    assert.match(machineRoute, /accessEpoch:\s*Number\(ctx\.member\.accessEpoch\)/);
-    assert.match(machineRoute, /res\.status\(Number\(error\?\.status\) \|\| 500\)/);
-  }
+  assert.ok(liveStart >= 0, "Stats notifications/live machine-plane route must remain mounted");
+  const liveNext = stats.indexOf("\nrouter.", liveStart + 1);
+  const liveRoute = stats.slice(liveStart, liveNext === -1 ? stats.length : liveNext);
+  assert.match(liveRoute, /mismatchCode:\s*"DEVICE_IDENTITY_MISMATCH"/);
+  assert.match(liveRoute, /accessEpoch:\s*Number\(ctx\.member\.accessEpoch\)/);
+  assert.match(liveRoute, /res\.status\(Number\(error\?\.status\) \|\| 500\)/);
   assert.doesNotMatch(liveRoute, /requireRefreshPermission/);
-  assert.doesNotMatch(dailyRoute, /requireRefreshPermission/);
+  assert.match(stats, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);
 
   assert.match(trafficRoute, /requireProductCreator/);
   assert.match(trafficRoute, /requireProductDevice/);

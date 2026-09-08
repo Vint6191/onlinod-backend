@@ -102,26 +102,11 @@ test("Audit16 product scope never widens a scoped member request", async () => {
   assert.deepEqual(filtered.foreignCreatorIds, ["creator-b"]);
 });
 
-test("Audit16 Home read without refresh permission cannot schedule or advertise pending work", async () => {
-  fakePrisma.creatorEarningsSnapshot.findMany = async () => [];
-
-  const creators = [{ id: "creator-a", status: "READY", displayName: "A", username: "a" }];
-  let scheduleCalls = 0;
-  const denied = await homeTest.resolveAndScheduleSnapshots("agency-1", "7d", creators, {
-    allowSchedule: false,
-    scheduleJob: async () => { scheduleCalls += 1; return { created: true, jobId: "job-1" }; },
-  });
-  assert.equal(scheduleCalls, 0);
-  assert.deepEqual(denied.pendingCreatorIds, []);
-  assert.deepEqual(denied.scheduledJobs, []);
-
-  const allowed = await homeTest.resolveAndScheduleSnapshots("agency-1", "7d", creators, {
-    allowSchedule: true,
-    scheduleJob: async () => { scheduleCalls += 1; return { created: true, jobId: "job-1" }; },
-  });
-  assert.equal(scheduleCalls, 1);
-  assert.deepEqual(allowed.pendingCreatorIds, ["creator-a"]);
-  assert.equal(allowed.scheduledJobs[0].jobId, "job-1");
+test("Audit16 Home summary read is structurally read-only and cannot schedule analytics work", () => {
+  const source = read("services/home-summary-service.js");
+  assert.doesNotMatch(source, /ensureSingleJob|createPlannedJob|ensureAnalyticsFreshness|ensureAgencyAnalyticsFreshness/);
+  assert.doesNotMatch(source, /jobInstance\.(create|createMany|update|updateMany|upsert)/);
+  assert.equal(typeof homeTest.resolveAndScheduleSnapshots, "undefined");
 });
 
 function scopedProxyDb() {

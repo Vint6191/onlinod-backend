@@ -215,10 +215,12 @@ test("automatic tier boundaries are server-defined and customer catalog is month
   assert.ok(catalog.tiers.every((t) => t.customerSelectable === false));
 });
 
-test("billable earnings provenance requires a DONE fetch_earnings job and COMMITTED ingest batch", () => {
+test("billable earnings provenance requires durable COMMITTED AnalyticsScanProof and not scheduler history", () => {
   const source = fs.readFileSync(walletPath, "utf8");
-  assert.match(source, /sourceJob: \{ is: \{ jobKey: "fetch_earnings", status: "DONE", completedAt: \{ not: null \} \} \}/);
-  assert.match(source, /ingestBatch: \{ is: \{ status: "COMMITTED", sourceJobId: \{ not: null \}, completedAt: \{ not: null \} \} \}/);
+  assert.match(source, /scanProofId: \{ not: null \}/);
+  assert.match(source, /scanProof: \{ is: \{ dataType: "EARNINGS", status: "COMMITTED", committedAt: \{ not: null \} \} \}/);
+  assert.doesNotMatch(source, /sourceJob: \{ is: \{ jobKey: "fetch_earnings"/);
+  assert.doesNotMatch(source, /ingestBatch: \{ is: \{ status: "COMMITTED"/);
 });
 
 test("billing requires relational earnings proof; a fresh legacy snapshot alone can only be an estimate", async () => {
@@ -227,7 +229,7 @@ test("billing requires relational earnings proof; a fresh legacy snapshot alone 
   const svc = loadWalletService(db);
   const verified = await svc.readRolling30dRevenue({ db, creatorId:"creator-1", now });
   assert.equal(verified.fresh, true);
-  assert.equal(verified.source, "EARNINGS_DAILY_COMPLETE_30D");
+  assert.equal(verified.source, "EARNINGS_DAILY_PROVEN_FRESH_30D");
   assert.equal(verified.revenue30dCents, 120_000);
 
   db.creatorEarningsDaily.findMany = async () => [];
@@ -267,25 +269,31 @@ test("exported snapshot preview and quote helpers stay fail-closed for monetary 
   assert.equal(quoted.tier, "GROWTH");
 });
 
-test("complete relational fallback uses the last 30 fully closed UTC days and requires complete coverage", async () => {
+test("durable relational proof uses the last 30 fully closed UTC days and requires complete fresh coverage", async () => {
   const now = new Date("2026-08-14T12:00:00Z");
   const db = makeDb(); db._setSnapshot(null);
   const rows=[]; for (let i=0;i<30;i++){ const d=new Date(Date.UTC(2026,7,13-i)); rows.push({date:d,totalCents:1000,collectedAt:now}); }
   let dailyWhere = null;
-  let coverageWhere = null;
+  const coverageWheres = [];
   db.creatorEarningsDaily.findMany=async({where})=>{ dailyWhere=where; return rows; };
-  db.analyticsCoverage.count=async({where})=>{ coverageWhere=where; return 30; };
+  db.analyticsCoverage.count=async({where})=>{ coverageWheres.push(where); return 30; };
   const svc=loadWalletService(db);
   const ok=await svc.readRolling30dRevenue({db,creatorId:"creator-1",now});
-  assert.equal(ok.fresh,true); assert.equal(ok.revenue30dCents,30_000); assert.equal(ok.source,"EARNINGS_DAILY_COMPLETE_30D");
+  assert.equal(ok.fresh,true); assert.equal(ok.revenue30dCents,30_000); assert.equal(ok.source,"EARNINGS_DAILY_PROVEN_FRESH_30D");
   assert.equal(dailyWhere.date.gte.toISOString(), "2026-07-15T00:00:00.000Z");
   assert.equal(dailyWhere.date.lte.toISOString(), "2026-08-13T00:00:00.000Z");
-  assert.deepEqual(dailyWhere.sourceJobId, { not: null });
   assert.deepEqual(dailyWhere.sourceScanRunId, { not: null });
-  assert.equal(coverageWhere.coverageDate.gte.toISOString(), "2026-07-15T00:00:00.000Z");
-  assert.equal(coverageWhere.coverageDate.lte.toISOString(), "2026-08-13T00:00:00.000Z");
-  assert.deepEqual(coverageWhere.ingestBatchId, { not: null });
-  assert.deepEqual(coverageWhere.lastVerifiedAt, { not: null });
+  assert.deepEqual(dailyWhere.scanProofId, { not: null });
+  assert.equal(dailyWhere.scanProof.is.status, "COMMITTED");
+  assert.equal(coverageWheres.length, 2);
+  for (const coverageWhere of coverageWheres) {
+    assert.equal(coverageWhere.coverageDate.gte.toISOString(), "2026-07-15T00:00:00.000Z");
+    assert.equal(coverageWhere.coverageDate.lte.toISOString(), "2026-08-13T00:00:00.000Z");
+    assert.deepEqual(coverageWhere.scanProofId, { not: null });
+    assert.equal(coverageWhere.scanProof.is.status, "COMMITTED");
+  }
+  assert.deepEqual(coverageWheres[0].lastVerifiedAt, { not: null });
+  assert.ok(coverageWheres[1].lastVerifiedAt.gte instanceof Date);
   db.analyticsCoverage.count=async()=>29;
   const no=await svc.readRolling30dRevenue({db,creatorId:"creator-1",now});
   assert.equal(no.fresh,false); assert.equal(no.revenue30dCents,null);
@@ -308,7 +316,7 @@ test("batched Settings evidence uses the same complete 30-day fallback instead o
   const result = await svc.readRolling30dRevenueBatch({ db, creatorIds: ["creator-1"], now });
   const revenue = result.get("creator-1");
   assert.equal(revenue.fresh, true);
-  assert.equal(revenue.source, "EARNINGS_DAILY_COMPLETE_30D");
+  assert.equal(revenue.source, "EARNINGS_DAILY_PROVEN_FRESH_30D");
   assert.equal(revenue.revenue30dCents, 120_000);
   const preview = svc.pricingPreviewFromRevenue({ profile: db._profiles.get("creator-1"), revenue });
   assert.equal(preview.available, true);
@@ -316,7 +324,7 @@ test("batched Settings evidence uses the same complete 30-day fallback instead o
   assert.equal(preview.totalCents, 3000);
 });
 
-test("batched Settings evidence uses only two grouped queries over the same 30 closed days", async () => {
+test("batched Settings evidence uses bounded grouped queries over the same 30 closed days", async () => {
   const now = new Date("2026-08-14T12:00:00Z");
   const db = makeDb({ revenue30dCents: 120_000, capturedAt: new Date("2026-08-10T00:00:00Z") });
   db.creatorEarningsDaily.findMany = async () => { throw new Error("batch aggregation must not materialize daily rows"); };
@@ -335,7 +343,7 @@ test("batched Settings evidence uses only two grouped queries over the same 30 c
   const svc = loadWalletService(db);
   const revenue = (await svc.readRolling30dRevenueBatch({ db, creatorIds: ["creator-1"], now })).get("creator-1");
   assert.equal(revenue.fresh, true);
-  assert.equal(revenue.source, "EARNINGS_DAILY_COMPLETE_30D");
+  assert.equal(revenue.source, "EARNINGS_DAILY_PROVEN_FRESH_30D");
   assert.equal(revenue.revenue30dCents, 120_000);
 });
 
