@@ -21,11 +21,11 @@ test("F44 runtime eligibility separates exact discovery from resource claim limi
   assert.match(runtime, /fetchRuntimeAccountStateByIds/, "runtime claim prefetches exact candidate state before filling the resource cap");
 });
 
-test("F44 retirement uses exact current-thread/source authority instead of sampled history", () => {
+test("retirement uses exact future-capability retention authority instead of model-obligation sampling", () => {
   const settings = read("src/services/settings-service.js");
   const blocker = settings.slice(settings.indexOf("async function assertTelegramAccountNoBusinessBlockers"), settings.indexOf("async function getTelegramMtprotoSettings"));
   assert.doesNotMatch(blocker, /take:\s*1000\b/);
-  assert.match(blocker, /findPendingModelInstructionAnchors\(\{\s*agencyId,\s*accountId:\s*id/);
+  assert.match(blocker, /findCustomProviderThreadRetentionBlockers\(\{\s*agencyId,\s*accountId:\s*id/);
   assert.match(blocker, /scanIncompleteTelegramSources/);
   assert.match(blocker, /telegramInboundEvent\.findFirst/);
 });

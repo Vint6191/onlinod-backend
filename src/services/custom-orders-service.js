@@ -10,6 +10,7 @@ const {
 const { planTaskIntentForCommittedOrder, planCancellationIntentForCommittedOrder } = require("./telegram-delivery-authority-service");
 const { adjudicateCustomOrderCancellation, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { assertCustomManagementCreatorAccess } = require("./custom-management-access-authority-service");
 
 const CUSTOM_ORDER_STATUSES = Object.freeze(["PENDING", "COMPLETED", "MISSED", "CANCELLED"]);
 const CUSTOM_ORDER_TYPES = Object.freeze(["CONTENT", "CALL", "PHYSICAL"]);
@@ -305,6 +306,9 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
   }
   const execute = async (tx) => {
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    const access = await assertCustomManagementCreatorAccess({
+      agencyId, actorMember: member, creatorId: data.creatorId, permissionKey: null, db: tx,
+    });
     // Serialize NEW Custom work with creator retirement. If creation wins the
     // creator row lock, retirement will observe this PENDING order as a blocker;
     // if retirement wins, this recheck fails after deletedAt commits.
@@ -320,7 +324,7 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
     }
     await reprojectCustomReminderSchedule({ agencyId, orderId: row.id, now, db: tx });
     row = await tx.customOrder.findFirst({ where: { id: row.id, agencyId }, include: ORDER_INCLUDE }) || row;
-    await planTaskIntentForCommittedOrder({ agencyId, member, order: row, now, db: tx });
+    await planTaskIntentForCommittedOrder({ agencyId, member: access.member, order: row, now, db: tx });
     return { row, idempotent: false };
   };
   const outcome = typeof client.$transaction === "function" ? await client.$transaction(execute) : await execute(client);
@@ -504,9 +508,18 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
     if (!paymentMutation) return { ok: true, order: serializeOrder(current, now) };
 
     const paidAmountCents = normalizePaidAmountCents(input, current.paidAmountCents || 0);
-    const changed = await client.customOrder.updateMany({ where: { id: current.id, agencyId, status: currentStatus, updatedAt: current.updatedAt }, data: { paidAmountCents } });
-    if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_ORDER_CONFLICT", "Custom order changed while this payment update was being applied; refresh and try again", 409);
-    const row = await client.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE }); if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found after payment update", 404);
+    const applyTerminalPayment = async (tx) => {
+      await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+      await assertCustomManagementCreatorAccess({
+        agencyId, actorMember: member, creatorId: current.creatorId, permissionKey: null, db: tx,
+      });
+      const changed = await tx.customOrder.updateMany({ where: { id: current.id, agencyId, status: currentStatus, updatedAt: current.updatedAt }, data: { paidAmountCents } });
+      if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_ORDER_CONFLICT", "Custom order changed while this payment update was being applied; refresh and try again", 409);
+      const row = await tx.customOrder.findFirst({ where: { id: current.id, agencyId }, include: ORDER_INCLUDE });
+      if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found after payment update", 404);
+      return row;
+    };
+    const row = typeof client.$transaction === "function" ? await client.$transaction(applyTerminalPayment) : await applyTerminalPayment(client);
     const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
     await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.payment_update", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, status: row.status, priceCents: row.priceCents, previousPaidAmountCents: Math.max(0, Number(current.paidAmountCents || 0)), paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
     return { ok: true, order: serializeOrder(row, now) };
@@ -523,6 +536,9 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
     // row CAS. This preserves the global lock order used by outbound Telegram planning
     // and prevents cancellation from holding CustomOrder while waiting on Creator.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    const access = await assertCustomManagementCreatorAccess({
+      agencyId, actorMember: member, creatorId: current.creatorId, permissionKey: null, db: tx,
+    });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: current.creatorId });
     await lockAutomationWriteCommitFence({ db: tx, agencyId });
     // The advisory fence linearizes business mutations with the moment a physical
@@ -564,7 +580,7 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
     }
     if (String(row.status) === "CANCELLED" && String(current.status) !== "CANCELLED") {
       await adjudicateCustomOrderCancellation({ db: tx, agencyId, customOrderId: row.id, now, reason: "CUSTOM_ORDER_CANCELLED" });
-      await planCancellationIntentForCommittedOrder({ agencyId, member, order: row, now, db: tx });
+      await planCancellationIntentForCommittedOrder({ agencyId, member: access.member, order: row, now, db: tx });
     }
     return row;
   };

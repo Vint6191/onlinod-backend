@@ -60,10 +60,16 @@ async function assertActiveProviderAccount({ agencyId, binding, db }) {
   if (String(account.lifecycleState || "ACTIVE") !== "ACTIVE") throw blocked("PROVIDER_ACCOUNT_RETIRING", "The Telegram account for the revision instruction is retiring");
   return binding;
 }
-async function resolveRevisionProviderBinding({ agencyId, orderId, submission, db } = {}) {
+async function inspectRevisionProviderBindings({ agencyId, orderId, submission, db } = {}) {
   if (!agencyId || !orderId || !submission?.id || !db?.telegramDeliveryIntent?.findFirst) {
     const error = new Error("Exact revision submission, order and Telegram intent storage are required");
     error.code = "CUSTOM_REVISION_PROVIDER_BINDING_SCOPE_REQUIRED";
+    error.status = 500;
+    throw error;
+  }
+  if (!db?.agencyTelegramMtprotoAccount?.findFirst) {
+    const error = new Error("Telegram account storage is required to validate revision provider binding");
+    error.code = "CUSTOM_REVISION_PROVIDER_BINDING_STORAGE_REQUIRED";
     error.status = 500;
     throw error;
   }
@@ -71,20 +77,52 @@ async function resolveRevisionProviderBinding({ agencyId, orderId, submission, d
     where: { agencyId: String(agencyId), customOrderId: String(orderId), kind: "TASK", state: "CONFIRMED" },
     orderBy: [{ confirmedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }],
   });
-  const taskBinding = confirmedTaskBinding(task);
-  if (taskBinding) return assertActiveProviderAccount({ agencyId, binding: taskBinding, db });
+  const candidates = [confirmedTaskBinding(task), pinnedSubmissionSourceBinding(submission)].filter(Boolean);
+  const inspected = [];
+  for (const binding of candidates) {
+    const account = await db.agencyTelegramMtprotoAccount.findFirst({
+      where: { id: String(binding.accountId), agencyId: String(agencyId) },
+      select: { id: true, lifecycleState: true },
+    });
+    const blockedCode = !account ? "PROVIDER_ACCOUNT_MISSING"
+      : String(account.lifecycleState || "ACTIVE") !== "ACTIVE" ? "PROVIDER_ACCOUNT_RETIRING" : null;
+    inspected.push({ binding, usable: blockedCode == null, blockedCode, lifecycleState: account?.lifecycleState || null });
+  }
+  return inspected;
+}
 
-  const sourceBinding = pinnedSubmissionSourceBinding(submission);
-  if (sourceBinding) return assertActiveProviderAccount({ agencyId, binding: sourceBinding, db });
-
-  throw blocked(
+async function resolveRevisionProviderBinding({ agencyId, orderId, submission, db } = {}) {
+  const inspected = await inspectRevisionProviderBindings({ agencyId, orderId, submission, db });
+  if (!inspected.length) {
+    throw blocked(
+      "TASK_AND_PINNED_SOURCE_UNAVAILABLE",
+      "Revision is required, but neither a confirmed TASK thread nor the submission's pinned Telegram source thread is available",
+    );
+  }
+  const usable = inspected.find((row) => row.usable);
+  if (usable) return usable.binding;
+  if (inspected.length === 1) {
+    const row = inspected[0];
+    throw blocked(
+      row.blockedCode || "PROVIDER_THREAD_UNAVAILABLE",
+      row.blockedCode === "PROVIDER_ACCOUNT_MISSING"
+        ? "The Telegram account for the revision instruction no longer exists"
+        : "The Telegram account for the revision instruction is retiring",
+    );
+  }
+  const taskFailure = inspected[0]?.blockedCode || "TASK_UNAVAILABLE";
+  const sourceFailure = inspected[1]?.blockedCode || "PINNED_SOURCE_UNAVAILABLE";
+  const error = blocked(
     "TASK_AND_PINNED_SOURCE_UNAVAILABLE",
-    "Revision is required, but neither a confirmed TASK thread nor the submission's pinned Telegram source thread is available",
+    `Revision provider anchors are unavailable (TASK=${taskFailure}, PINNED_SOURCE=${sourceFailure})`,
   );
+  error.anchorFailures = { task: taskFailure, pinnedSource: sourceFailure };
+  throw error;
 }
 
 module.exports = {
   resolveRevisionProviderBinding,
   confirmedTaskBinding,
   pinnedSubmissionSourceBinding,
+  inspectRevisionProviderBindings,
 };

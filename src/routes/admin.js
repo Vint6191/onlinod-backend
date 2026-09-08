@@ -108,6 +108,18 @@ function publishAdminCreatorRevokes(req, member, creatorIds, reason) {
   }
 }
 
+function canonicalMemberRoleKeyFromLegacy(role) {
+  const value = String(role || "").trim().toUpperCase();
+  if (value === "OWNER") return "owner";
+  if (value === "ADMIN" || value === "MANAGER") return "manager";
+  return "chatter";
+}
+
+function memberIsCanonicalOwner(member) {
+  return String(member?.role || "").trim().toUpperCase() === "OWNER"
+    || String(member?.roleKey || "").trim().toLowerCase() === "owner";
+}
+
 function publishAdminMemberAccessEpoch(req, member, accessEpochOverride = null) {
   if (!member?.id || !member?.agencyId) return;
   const epoch = Number(accessEpochOverride ?? member.accessEpoch);
@@ -900,38 +912,71 @@ const memberRoleSchema = z.object({
 router.patch("/members/:memberId/role", async (req, res) => {
   try {
     const input = memberRoleSchema.parse(req.body);
-    const before = await prisma.agencyMember.findUnique({
+    const snapshot = await prisma.agencyMember.findUnique({
       where: { id: req.params.memberId },
       include: { user: true },
     });
-    if (!before) return res.status(404).json({ ok: false, code: "MEMBER_NOT_FOUND", error: "Member not found" });
+    if (!snapshot) return res.status(404).json({ ok: false, code: "MEMBER_NOT_FOUND", error: "Member not found" });
 
-    // Don't allow demoting the last OWNER.
-    if (before.role === "OWNER" && input.role !== "OWNER") {
-      const otherOwners = await prisma.agencyMember.count({
-        where: { agencyId: before.agencyId, role: "OWNER", id: { not: before.id } },
+    const mutation = await prisma.$transaction(async (tx) => {
+      // Platform-admin role changes are canonical access mutations too. The
+      // Agency row is the stable serialization root shared with role config,
+      // Creator retirement and Customs management commits.
+      await lockAgencyPipelineLifecycle({ db: tx, agencyId: snapshot.agencyId, allowDeleted: true });
+      const before = await tx.agencyMember.findUnique({
+        where: { id: snapshot.id },
+        include: { user: true },
       });
-      if (otherOwners === 0) {
-        return res.status(409).json({ ok: false, code: "LAST_OWNER", error: "Cannot demote the last OWNER" });
+      if (!before) {
+        const error = new Error("Member not found");
+        error.code = "MEMBER_NOT_FOUND";
+        error.status = 404;
+        throw error;
       }
-    }
 
-    const updated = await prisma.agencyMember.update({
-      where: { id: before.id },
-      data: { role: input.role, accessEpoch: { increment: 1 } },
-    });
-    publishAdminMemberAccessEpoch(req, updated);
+      if (memberIsCanonicalOwner(before) && input.role !== "OWNER") {
+        const otherOwners = await tx.agencyMember.count({
+          where: {
+            agencyId: before.agencyId,
+            deletedAt: null,
+            deactivatedAt: null,
+            id: { not: before.id },
+            OR: [{ role: "OWNER" }, { roleKey: "owner" }],
+          },
+        });
+        if (otherOwners === 0) {
+          const error = new Error("Cannot demote the last OWNER");
+          error.code = "LAST_OWNER";
+          error.status = 409;
+          throw error;
+        }
+      }
 
+      const updated = await tx.agencyMember.update({
+        where: { id: before.id },
+        data: {
+          role: input.role,
+          roleKey: canonicalMemberRoleKeyFromLegacy(input.role),
+          accessEpoch: { increment: 1 },
+        },
+      });
+      return { before, updated };
+    }, { isolationLevel: "Serializable" });
+
+    publishAdminMemberAccessEpoch(req, mutation.updated);
     await adminLog(req, {
-      agencyId: before.agencyId,
+      agencyId: mutation.before.agencyId,
       action: "admin.member_role_changed",
       targetType: "member",
-      targetId: before.id,
-      before, after: updated, reason: input.reason || null,
+      targetId: mutation.before.id,
+      before: mutation.before, after: mutation.updated, reason: input.reason || null,
     });
-    return res.json({ ok: true, member: updated });
+    return res.json({ ok: true, member: mutation.updated });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
+    if (Number(err?.status) >= 400 && Number(err?.status) < 600) {
+      return res.status(Number(err.status)).json({ ok: false, code: err.code || "MEMBER_ROLE_FAILED", error: err.message });
+    }
     return res.status(500).json({ ok: false, code: "MEMBER_ROLE_FAILED", error: err?.message || "Failed" });
   }
 });
@@ -976,9 +1021,15 @@ router.delete("/members/:memberId", async (req, res) => {
     if (!before) return res.status(404).json({ ok: false, code: "MEMBER_NOT_FOUND", error: "Member not found" });
 
     // Last OWNER guard.
-    if (before.role === "OWNER") {
+    if (memberIsCanonicalOwner(before)) {
       const otherOwners = await prisma.agencyMember.count({
-        where: { agencyId: before.agencyId, role: "OWNER", id: { not: before.id } },
+        where: {
+          agencyId: before.agencyId,
+          deletedAt: null,
+          deactivatedAt: null,
+          id: { not: before.id },
+          OR: [{ role: "OWNER" }, { roleKey: "owner" }],
+        },
       });
       if (otherOwners === 0) {
         return res.status(409).json({ ok: false, code: "LAST_OWNER", error: "Cannot remove the last OWNER" });

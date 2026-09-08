@@ -27,11 +27,13 @@ function fixture() {
       async findFirst({ where }) {
         return clone(byCreatedDesc(intents.filter((row)=>{
           if (String(row.agencyId)!==String(where.agencyId) || String(row.customOrderId)!==String(where.customOrderId) || String(row.kind)!==String(where.kind)) return false;
+          if (where.state !== undefined && String(row.state)!==String(where.state)) return false;
           if (where.customSubmissionId !== undefined && String(row.customSubmissionId||"")!==String(where.customSubmissionId||"")) return false;
           return true;
         }))[0] || null);
       },
     },
+    agencyTelegramMtprotoAccount: { async findFirst({ where }) { return String(where.id)==="tg-1" ? { id:"tg-1", lifecycleState:"ACTIVE" } : null; } },
   };
   return { now, order, submissions, intents, db };
 }

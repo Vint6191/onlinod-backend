@@ -17,6 +17,7 @@ const {
 const { resolveRevisionProviderBinding } = require("./custom-revision-provider-binding-authority-service");
 const { deriveCustomCancellationInstruction, requireCancellationProviderAnchor } = require("./custom-cancellation-instruction-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
+const { assertCustomManagementCreatorAccess, lockCurrentAgencyMember } = require("./custom-management-access-authority-service");
 const { scanAllById, findPendingModelInstructionAnchors, findCancelledModelInstructionFollowupDebt } = require("./telegram-exact-authority-scan-service");
 const {
   nextReminderForOrder,
@@ -35,9 +36,17 @@ const REMINDER_KINDS = new Set(["MANUAL_REMINDER", "AUTO_REMINDER"]);
 const UNRESOLVED_REMINDER_STATES = ["COMMITTING", "RECONCILE_REQUIRED"];
 const UNRESOLVED_REFERENCE_STATES = ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED", "FAILED_PRECOMMIT"];
 const CLAIM_MS = 2 * 60 * 1000;
+const PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX = "PRECOMMIT_PROVIDER_UNAVAILABLE:";
+const PROVIDER_BLOCK_RETRY_BASE_MS = 60 * 1000;
+const PROVIDER_BLOCK_RETRY_MAX_MS = 60 * 60 * 1000;
+function providerBindingRepairDelayMs(attempts) {
+  const n = Math.max(1, Math.min(16, Math.floor(Number(attempts) || 1)));
+  return Math.min(PROVIDER_BLOCK_RETRY_MAX_MS, PROVIDER_BLOCK_RETRY_BASE_MS * (2 ** (n - 1)));
+}
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 500) { const text = String(value == null ? "" : value).trim(); return text ? text.slice(0, max) : ""; }
+function isPrecommitProviderBlocked(row) { return Boolean(row && String(row.state || "") === "PLANNED" && row.commitStartedAt == null && clean(row.outcomeReason, 500).startsWith(PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX)); }
 function uuid(value, field = "clientIntentId") {
   const text = clean(value, 80);
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)) throw fail("TELEGRAM_DELIVERY_INTENT_ID_INVALID", `${field} must be a UUID`);
@@ -101,27 +110,14 @@ function publicIntent(row) {
     state: String(row.state), claimRevision: Number(row.claimRevision || 0), claimUntil: row.claimUntil ? new Date(row.claimUntil).toISOString() : null,
     commitStartedAt: row.commitStartedAt ? new Date(row.commitStartedAt).toISOString() : null,
     remoteMessageId: row.remoteMessageId == null ? null : String(row.remoteMessageId), remoteRecipientTelegramUserId: row.remoteRecipientTelegramUserId || null, remoteSentAt: row.remoteSentAt ? new Date(row.remoteSentAt).toISOString() : null,
-    outcomeReason: row.outcomeReason || null, confirmationAuthority: row.confirmationAuthority || null, confirmedAt: row.confirmedAt ? new Date(row.confirmedAt).toISOString() : null,
+    outcomeReason: row.outcomeReason || null,
+    providerBindingRepairAttempts: Math.max(0, Number(row.providerBindingRepairAttempts || 0)),
+    providerBindingRetryAt: row.providerBindingRetryAt ? new Date(row.providerBindingRetryAt).toISOString() : null,
+    confirmationAuthority: row.confirmationAuthority || null, confirmedAt: row.confirmedAt ? new Date(row.confirmedAt).toISOString() : null,
     createdAt: new Date(row.createdAt).toISOString(), updatedAt: new Date(row.updatedAt).toISOString(),
   };
 }
 
-function revisionDispatchProjection(intent, { blockedCode = null } = {}) {
-  if (!intent) return { status: blockedCode ? "DISPATCH_BLOCKED" : "DISPATCH_REQUIRED", intentId: null, state: null, providerMessageId: null, remoteSentAt: null, blockedCode: blockedCode || null };
-  const state = String(intent.state || "PLANNED");
-  const status = state === "CONFIRMED" ? "WAITING_MODEL"
-    : state === "RECONCILE_REQUIRED" ? "DELIVERY_UNKNOWN"
-      : ["CLAIMED", "COMMITTING"].includes(state) ? "SENDING"
-        : state === "CANCELLED" ? "DISPATCH_CANCELLED" : "DISPATCH_PENDING";
-  return {
-    status,
-    intentId: String(intent.id),
-    state,
-    providerMessageId: intent.remoteMessageId == null ? null : String(intent.remoteMessageId),
-    remoteSentAt: intent.remoteSentAt ? new Date(intent.remoteSentAt).toISOString() : null,
-    blockedCode: null,
-  };
-}
 
 async function loadOrder({ agencyId, orderId, db }) {
   const id = clean(orderId, 180);
@@ -209,16 +205,25 @@ async function resolveIntentProviderBinding({ agencyId, order, kind, customSubmi
   return loadConfirmedTaskThread({ agencyId, orderId: order.id, db });
 }
 
-async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, customSubmissionId = null, payload, now, db, reactivateCancelledTask = false, _transactional = false }) {
+async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, customSubmissionId = null, payload, now, db, reactivateCancelledTask = false, actorMember = null, _transactional = false }) {
   // New Telegram work and Telegram-account retirement contend on the same account row.
   // Running the canonical-intent reservation in one transaction lets the no-op ACTIVE
   // update below act as a row mutex: either planning wins and retirement sees the new
   // blocker, or retirement wins and planning cannot create a new intent afterwards.
   if (!_transactional && typeof db?.$transaction === "function") {
     return db.$transaction(
-      (tx) => createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, customSubmissionId, payload, now, db: tx, reactivateCancelledTask, _transactional: true }),
+      (tx) => createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, customSubmissionId, payload, now, db: tx, reactivateCancelledTask, actorMember, _transactional: true }),
       { isolationLevel: "Serializable" },
     );
+  }
+  // Direct human planning is itself a creator-specific management write. Fence the
+  // current membership before any existing-intent refresh or new reservation so a
+  // scope/accessEpoch revoke cannot race a stale request into durable Telegram work.
+  if (actorMember) {
+    await lockAgencyPipelineLifecycle({ db, agencyId });
+    await assertCustomManagementCreatorAccess({
+      agencyId, actorMember, creatorId: order.creatorId, permissionKey: null, db,
+    });
   }
   const key = logicalKey({ agencyId, orderId: order.id, kind, identity });
   const fingerprint = payloadFingerprint(payload);
@@ -241,7 +246,21 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
   const useExisting = async (existing) => {
     const exact = String(existing.payloadFingerprint) === fingerprint && String(existing.creatorId) === String(order.creatorId) && String(existing.accountId) === String(accountId)
       && (String(kind) !== "REVISION_REQUEST" || String(existing.customSubmissionId || "") === String(customSubmissionId || ""));
-    if (exact) return { row: existing, created: false, refreshed: false };
+    if (exact) {
+      if (isPrecommitProviderBlocked(existing)) {
+        const changed = await db.telegramDeliveryIntent.updateMany({
+          where: { id: existing.id, agencyId, state: "PLANNED", claimRevision: Number(existing.claimRevision || 0), commitStartedAt: null, outcomeReason: existing.outcomeReason },
+          data: { outcomeReason: null, providerBindingRepairAttempts: 0, providerBindingRetryAt: null },
+        });
+        if (Number(changed?.count || 0) === 1) {
+          const fresh = await findCanonicalExisting();
+          return { row: fresh, created: false, refreshed: true };
+        }
+        const raced = await findCanonicalExisting();
+        if (raced && !isPrecommitProviderBlocked(raced)) return { row: raced, created: false, refreshed: false };
+      }
+      return { row: existing, created: false, refreshed: false };
+    }
 
     // Before a physical commit permit, provider/context-derived Telegram payload may be refreshed
     // on the SAME logical intent. This is required when the creator's Telegram account, task reply
@@ -264,7 +283,7 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
           accountId: String(accountId), customSubmissionId: customSubmissionId ? String(customSubmissionId) : existing.customSubmissionId, payloadFingerprint: fingerprint, payload, state: "PLANNED",
           deviceId: null, userId: null, memberId: null, accessEpoch: null,
           claimTokenHash: null, claimUntil: null, claimRevision: nextRevision,
-          outcomeReason: `PRECOMMIT_${String(kind)}_REFRESH`,
+          outcomeReason: `PRECOMMIT_${String(kind)}_REFRESH`, providerBindingRepairAttempts: 0, providerBindingRetryAt: null,
         },
       });
       if (Number(changed?.count || 0) === 1) {
@@ -474,6 +493,7 @@ async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, cli
   const reserved = await createOrReadIntent({
     agencyId, order, accountId: String(accountId), kind: normalizedKind, identity, clientIntentId: normalizedClientIntentId, referenceOrdinal, payload, now, db: client,
     reactivateCancelledTask,
+    actorMember: member,
   });
   if (reserved.created) await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.telegram_delivery_plan", targetType: "TelegramDeliveryIntent", targetId: reserved.row.id, metadata: { orderId: order.id, creatorId: order.creatorId, kind: normalizedKind }, db: client });
   return { ok: true, skipped: false, created: reserved.created, intent: publicIntent(reserved.row) };
@@ -688,9 +708,15 @@ async function refreshPrecommitIntentFromCurrentState({ row, agencyId, now = new
     }
     // Missing/reassigned provider binding is not a remote effect and must not destroy D1.
     // Keep it durable but do not expose the stale account to Desktop execution.
+    const providerBindingRepairAttempts = Math.max(0, Math.floor(Number(row.providerBindingRepairAttempts) || 0)) + 1;
+    const providerBindingRetryAt = new Date(now.getTime() + providerBindingRepairDelayMs(providerBindingRepairAttempts));
     await db.telegramDeliveryIntent.updateMany({
       where: { id: row.id, agencyId, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), commitStartedAt: null },
-      data: { state: "PLANNED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, outcomeReason: `PRECOMMIT_PROVIDER_UNAVAILABLE:${clean(error?.code || error?.message, 300)}` },
+      data: {
+        state: "PLANNED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null,
+        outcomeReason: `${PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX}${clean(error?.code || error?.message, 300)}`,
+        providerBindingRepairAttempts, providerBindingRetryAt,
+      },
     });
     return null;
   }
@@ -883,6 +909,33 @@ async function ensureInitialTaskIntents({ agencyId, member = null, limit = 25, n
   return report;
 }
 
+async function repairPrecommitProviderBlockedIntents({ agencyId, member = null, limit = 25, now = new Date(), db }) {
+  if (!db?.telegramDeliveryIntent?.findMany) return { attempted: 0, recovered: 0, stillBlocked: 0 };
+  const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 25)));
+  const scope = member?.id ? await allowedCreatorScope({ agencyId, member, db }) : { broad: true, creatorIds: [] };
+  const legacyRetryBefore = new Date(now.getTime() - PROVIDER_BLOCK_RETRY_BASE_MS);
+  const rows = await db.telegramDeliveryIntent.findMany({
+    where: {
+      agencyId, ...scopeWhere(scope), state: "PLANNED", commitStartedAt: null,
+      outcomeReason: { startsWith: PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX },
+      OR: [
+        { providerBindingRetryAt: { lte: now } },
+        { providerBindingRetryAt: null, updatedAt: { lte: legacyRetryBefore } },
+      ],
+    },
+    orderBy: [{ updatedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+    take,
+  });
+  const report = { attempted: 0, recovered: 0, stillBlocked: 0 };
+  for (const row of rows || []) {
+    report.attempted += 1;
+    const current = await refreshPrecommitIntentFromCurrentState({ row, agencyId, now, db });
+    if (current && !isPrecommitProviderBlocked(current)) report.recovered += 1;
+    else report.stillBlocked += 1;
+  }
+  return report;
+}
+
 async function ensureRevisionRequestIntents({ agencyId, member = null, limit = 25, now = new Date(), db }) {
   if (!db?.customContentSubmission?.findMany || !db?.telegramDeliveryIntent?.findMany) return 0;
   const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 25)));
@@ -910,7 +963,6 @@ async function ensureRevisionRequestIntents({ agencyId, member = null, limit = 2
     const existingRows = await db.telegramDeliveryIntent.findMany({
       where: { agencyId, kind: "REVISION_REQUEST", customSubmissionId: { in: ids } },
       select: { customSubmissionId: true },
-      take: ids.length,
     });
     const existing = new Set((existingRows || []).map((row) => String(row.customSubmissionId || "")).filter(Boolean));
 
@@ -954,6 +1006,7 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
   await ensureInitialTaskIntents({ agencyId, member, limit, now, db: client });
   await ensureRevisionRequestIntents({ agencyId, member, limit, now, db: client });
   await ensureAutomaticReminderIntents({ agencyId, member, limit, now, db: client });
+  await repairPrecommitProviderBlockedIntents({ agencyId, member, limit, now, db: client });
   const scope = await allowedCreatorScope({ agencyId, member, db: client });
   const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 25)));
   const staleCommitBefore = new Date(now.getTime() - CLAIM_MS);
@@ -969,7 +1022,10 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
       // RECONCILE_REQUIRED is durable manager work with an unknown provider outcome and
       // must never consume this limit; otherwise a backlog of unknown outcomes can
       // permanently hide healthy executable deliveries behind it.
-      where: { agencyId, ...scopeWhere(scope), state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] } },
+      where: {
+        agencyId, ...scopeWhere(scope), state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] },
+        NOT: { state: "PLANNED", commitStartedAt: null, outcomeReason: { startsWith: PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX } },
+      },
       orderBy: [{ createdAt: "asc" }, { id: "asc" }],
       take: 200,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
@@ -1672,8 +1728,9 @@ async function repairCustomModelCommunicationConvergence({ agencyId, now = new D
   const report = {
     ok: true,
     initialTaskIntentsPlanned: 0, initialTaskIntentsReactivated: 0, initialTaskIntentsBlocked: 0, initialTaskIntentsRaced: 0, initialTaskIntentsFailed: 0, initialTaskIntentFailures: [],
-    revisionIntentsPlanned: 0, precommitScanned: 0, precommitCancelled: 0,
-    precommitRefreshed: 0, precommitFailed: 0, precommitFailures: [],
+    revisionIntentsPlanned: 0,
+    providerBindingRepairAttempted: 0, providerBindingRepairRecovered: 0, providerBindingRepairStillBlocked: 0,
+    precommitScanned: 0, precommitCancelled: 0, precommitRefreshed: 0, precommitFailed: 0, precommitFailures: [],
     reminderScheduleScanned: 0, reminderScheduleRepaired: 0, reminderScheduleFailed: 0, reminderScheduleFailures: [],
   };
 
@@ -1696,6 +1753,15 @@ async function repairCustomModelCommunicationConvergence({ agencyId, now = new D
     agencyId: scopedAgencyId, member: null, limit: 100, now, db: client,
   });
 
+  // Provider-unavailable work has its own durable retry clock. Convergence must not bypass
+  // that clock by feeding the same rows into the generic precommit refresh sweep below.
+  const providerRepair = await repairPrecommitProviderBlockedIntents({
+    agencyId: scopedAgencyId, member: null, limit: 100, now, db: client,
+  });
+  report.providerBindingRepairAttempted = Number(providerRepair?.attempted || 0);
+  report.providerBindingRepairRecovered = Number(providerRepair?.recovered || 0);
+  report.providerBindingRepairStillBlocked = Number(providerRepair?.stillBlocked || 0);
+
   // Old versions could leave precommit model communication executable after the causal obligation
   // changed. Reuse the exact live refresh authority instead of inventing migration-only semantics.
   if (client.telegramDeliveryIntent?.findMany) {
@@ -1706,6 +1772,7 @@ async function repairCustomModelCommunicationConvergence({ agencyId, now = new D
         kind: { in: MODEL_COMMUNICATION_PRECOMMIT_KINDS },
         state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] },
         commitStartedAt: null,
+        NOT: { state: "PLANNED", outcomeReason: { startsWith: PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX } },
       },
       select: {
         id: true, agencyId: true, creatorId: true, customOrderId: true, customSubmissionId: true, accountId: true, kind: true, state: true,
@@ -1909,11 +1976,17 @@ async function markTelegramDeliveryUnknown({ agencyId, member, intentId, deviceI
   return { ok: true, idempotent: false, intent: publicIntent(fresh) };
 }
 
-async function replaceTelegramReferencePrecommit({ agencyId, member, intentId, clientIntentId, reference, now = new Date(), db = null } = {}) {
+async function replaceTelegramReferencePrecommit({ agencyId, member, intentId, clientIntentId, reference, now = new Date(), db = null, _transactional = false } = {}) {
   const client = db || require("../prisma");
+  if (!_transactional && typeof client?.$transaction === "function") {
+    return client.$transaction((tx) => replaceTelegramReferencePrecommit({
+      agencyId, member, intentId, clientIntentId, reference, now, db: tx, _transactional: true,
+    }), { isolationLevel: "Serializable" });
+  }
+  await lockAgencyPipelineLifecycle({ db: client, agencyId });
   const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
   if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
-  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  await assertCustomManagementCreatorAccess({ agencyId, actorMember: member, creatorId: row.creatorId, permissionKey: null, db: client });
   if (String(row.kind) !== "REFERENCE") throw fail("TELEGRAM_REFERENCE_REPLACE_KIND_INVALID", "Only REFERENCE intents support artifact replacement", 409);
   if (!["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(String(row.state)) || row.commitStartedAt != null) {
     throw fail("TELEGRAM_REFERENCE_REPLACE_COMMIT_BOUNDARY", "A reference artifact can only be replaced before Telegram commit begins", 409);
@@ -1943,11 +2016,17 @@ async function replaceTelegramReferencePrecommit({ agencyId, member, intentId, c
   return { ok: true, intent: publicIntent(fresh) };
 }
 
-async function cancelTelegramReferencePrecommit({ agencyId, member, intentId, reason, now = new Date(), db = null } = {}) {
+async function cancelTelegramReferencePrecommit({ agencyId, member, intentId, reason, now = new Date(), db = null, _transactional = false } = {}) {
   const client = db || require("../prisma");
+  if (!_transactional && typeof client?.$transaction === "function") {
+    return client.$transaction((tx) => cancelTelegramReferencePrecommit({
+      agencyId, member, intentId, reason, now, db: tx, _transactional: true,
+    }), { isolationLevel: "Serializable" });
+  }
+  await lockAgencyPipelineLifecycle({ db: client, agencyId });
   const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
   if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
-  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  await assertCustomManagementCreatorAccess({ agencyId, actorMember: member, creatorId: row.creatorId, permissionKey: null, db: client });
   if (String(row.kind) !== "REFERENCE") throw fail("TELEGRAM_REFERENCE_CANCEL_KIND_INVALID", "Only REFERENCE intents support precommit skip", 409);
   if (String(row.state) === "CANCELLED") return { ok: true, idempotent: true, intent: publicIntent(row) };
   if (!["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(String(row.state)) || row.commitStartedAt != null) {
@@ -2155,8 +2234,8 @@ async function listTelegramDeliveryPrecommitBlockedQueue({ agencyId, member, lim
       const rawReason = clean(row.outcomeReason, 500);
       return {
         ...publicIntent(row),
-        blockedCode: rawReason.startsWith("PRECOMMIT_PROVIDER_UNAVAILABLE:")
-          ? rawReason.slice("PRECOMMIT_PROVIDER_UNAVAILABLE:".length) || "PROVIDER_UNAVAILABLE"
+        blockedCode: rawReason.startsWith(PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX)
+          ? rawReason.slice(PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX.length) || "PROVIDER_UNAVAILABLE"
           : rawReason.startsWith("FAILED_PRECOMMIT:")
             ? rawReason.slice("FAILED_PRECOMMIT:".length) || "PRECOMMIT_EXECUTION_FAILED"
             : "PRECOMMIT_EXECUTION_FAILED",
@@ -2287,13 +2366,17 @@ async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, res
   if (!["CONFIRMED", "PROVEN_NOT_SENT"].includes(mode)) throw fail("TELEGRAM_DELIVERY_RECONCILE_RESOLUTION_INVALID", "resolution must be CONFIRMED or PROVEN_NOT_SENT");
   try {
     const fresh = await client.$transaction(async (tx) => {
+      const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });
+      if (!await canUsePermission({ member: currentMember, key: "content.review_customs", db: tx })) {
+        throw fail("TELEGRAM_DELIVERY_RECONCILE_FORBIDDEN", "content.review_customs permission is required", 403);
+      }
       const row = await tx.telegramDeliveryIntent.findFirst({ where: { id, agencyId } });
       if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
       // Historical provider exceptions can outlive the mutable/active Creator row. A broad
       // Customs reviewer may adjudicate that durable agency-owned exception; scoped members
       // still require current creator access and therefore cannot cross their assignment fence.
-      const exceptionScope = await allowedCreatorScope({ agencyId, member, db: tx });
-      if (!exceptionScope?.broad) await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: tx });
+      const exceptionScope = await allowedCreatorScope({ agencyId, member: currentMember, db: tx });
+      if (!exceptionScope?.broad) await requireCreatorAccess({ agencyId, member: currentMember, creatorId: row.creatorId, db: tx });
       if (row.state !== "RECONCILE_REQUIRED") throw fail("TELEGRAM_DELIVERY_NOT_RECONCILABLE", "Telegram delivery is not awaiting reconciliation", 409);
       if (mode === "CONFIRMED") {
         const messageId = positiveInt(remoteMessageId, "remoteMessageId");
@@ -2434,7 +2517,6 @@ module.exports = {
   DELIVERY_KINDS,
   DELIVERY_STATES,
   publicIntent,
-  revisionDispatchProjection,
   planTelegramDeliveryIntent,
   planTaskIntentForCommittedOrder,
   planCancellationIntentForCommittedOrder,
@@ -2443,6 +2525,7 @@ module.exports = {
   ensureAutomaticReminderIntents,
   ensureInitialTaskIntents,
   ensureRevisionRequestIntents,
+  repairPrecommitProviderBlockedIntents,
   listTelegramDeliveryWork,
   claimTelegramDeliveryIntent,
   beginTelegramDeliveryIntent,

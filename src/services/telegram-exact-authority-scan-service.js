@@ -1,7 +1,7 @@
 "use strict";
 
 const { deriveCustomModelObligation } = require("./custom-model-obligation-authority-service");
-const { classifyCancellationInstructionFacts, deriveCustomCancellationInstruction } = require("./custom-cancellation-instruction-authority-service");
+const { classifyCancellationInstructionFacts, selectLatestProviderSignificantRevision, deriveCustomCancellationInstruction } = require("./custom-cancellation-instruction-authority-service");
 
 const DEFAULT_PAGE_SIZE = 250;
 const ACCOUNT_BATCH_SIZE = 250;
@@ -205,9 +205,7 @@ async function findCancelledModelInstructionFollowupDebt({ agencyId, creatorIds 
       if (order.telegramCancellationWaivedAt) continue;
       const rows = intentsByOrder.get(String(order.id)) || [];
       const submission = newest(submissionsByOrder.get(String(order.id)) || [], "receivedAt");
-      const revision = submission
-        ? newest(rows.filter((row) => String(row.kind) === "REVISION_REQUEST" && String(row.customSubmissionId || "") === String(submission.id)), "createdAt")
-        : null;
+      const revision = selectLatestProviderSignificantRevision(rows);
       const task = newest(rows.filter((row) => String(row.kind) === "TASK" && String(row.state) === "CONFIRMED"), "confirmedAt");
       const decision = classifyCancellationInstructionFacts({ submission, revision, task });
       const instruction = decision.instruction || null;

@@ -8,7 +8,8 @@ const { paymentSnapshot } = require("./custom-orders-service");
 const { uniqueMediaIds } = require("./custom-content-library-service");
 const { ACTIVE_WRITE_STATUSES, hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, setUnassignedSubmissionDisposition, derivePipelineStage, customSubmissionExternalEffectConvergence, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle, adjudicateCustomOrderCancellation } = require("./custom-content-pipeline-authority-service");
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
-const { revisionDispatchProjection } = require("./telegram-delivery-authority-service");
+const { deriveCustomRevisionDispatch } = require("./custom-revision-dispatch-authority-service");
+const { lockCurrentAgencyMember } = require("./custom-management-access-authority-service");
 
 const REVIEW_WAITING = "WAITING_REVIEW";
 const REVIEW_REVISION = "REVISION_REQUESTED";
@@ -290,19 +291,17 @@ async function listAwaitingCustomRevisions({ agencyId, member, limit = 50, curso
       ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
     });
     if (!rows.length) { pageExhausted = true; break; }
-    const revisionDispatchBySubmission = new Map();
+    const revisionIntentBySubmission = new Map();
     if (client.telegramDeliveryIntent?.findMany) {
       const submissionIds = rows.map((row) => String(row.id)).filter(Boolean);
       if (submissionIds.length) {
         const intents = await client.telegramDeliveryIntent.findMany({
           where: { agencyId, kind: "REVISION_REQUEST", customSubmissionId: { in: submissionIds } },
-          select: { id: true, customSubmissionId: true, state: true, remoteMessageId: true, remoteSentAt: true, createdAt: true },
           orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-          take: submissionIds.length,
         });
         for (const intent of intents || []) {
           const key = String(intent.customSubmissionId || "");
-          if (key && !revisionDispatchBySubmission.has(key)) revisionDispatchBySubmission.set(key, revisionDispatchProjection(intent));
+          if (key && !revisionIntentBySubmission.has(key)) revisionIntentBySubmission.set(key, intent);
         }
       }
     }
@@ -338,7 +337,9 @@ async function listAwaitingCustomRevisions({ agencyId, member, limit = 50, curso
         reviewedBy: reviewActor(row.reviewedByMember),
         modelComment: row.comment || null,
         previousMediaCount: uniqueMediaIds(row.ofMediaIds).length,
-        revisionDispatch: revisionDispatchBySubmission.get(String(row.id)) || revisionDispatchProjection(null),
+        revisionDispatch: await deriveCustomRevisionDispatch({
+          agencyId, orderId: order.id, submission: row, intent: revisionIntentBySubmission.get(String(row.id)) || null, db: client,
+        }),
       });
       if (items.length >= take) break;
     }
@@ -532,8 +533,9 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
   if (typeof client?.$transaction !== "function") throw fail("CUSTOM_RETIRED_ORDER_RESOLUTION_TRANSACTION_REQUIRED", "Legacy Custom resolution requires transactional audit authority", 500);
 
   return client.$transaction(async (tx) => {
-    await requireWorkflowWrite({ agencyId, member, db: tx });
-    const scope = await allowedCreatorScope({ agencyId, member, db: tx });
+    const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });
+    await requireWorkflowWrite({ agencyId, member: currentMember, db: tx });
+    const scope = await allowedCreatorScope({ agencyId, member: currentMember, db: tx });
     if (!scope?.broad) throw fail("CUSTOM_RETIRED_ORDER_RESOLUTION_BROAD_SCOPE_REQUIRED", "Only broad-scope managers can resolve historical Customs for a retired creator", 403);
 
     const initial = await tx.customOrder.findFirst({
@@ -684,16 +686,17 @@ async function resolveUnassignedCustomContentSubmission({ agencyId, member, subm
   if (typeof client?.$transaction !== "function") throw fail("CUSTOM_SUBMISSION_DISPOSITION_TRANSACTION_REQUIRED", "Pipeline resolution requires transactional audit authority", 500);
 
   return client.$transaction(async (tx) => {
-    // Human terminal resolution is destructive control-plane authority: re-check permission/scope
-    // in the commit transaction, then serialize the exact submission mutation and required audit.
-    await requireWorkflowWrite({ agencyId, member, db: tx });
+    // Human terminal resolution is destructive control-plane authority: re-check the canonical
+    // membership row and permission/scope in the commit transaction before mutating the pipeline.
+    const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });
+    await requireWorkflowWrite({ agencyId, member: currentMember, db: tx });
     const row = await tx.customContentSubmission.findFirst({
       where: { id, agencyId },
       select: { id: true, creatorId: true, customOrderId: true, pipelineDisposition: true, ofMediaIds: true },
     });
     if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
-    const scope = await allowedCreatorScope({ agencyId, member, db: tx });
-    const historicalCreator = await requireWorkflowCreatorHistoryAccess({ agencyId, member, creatorId: row.creatorId, db: tx, scope });
+    const scope = await allowedCreatorScope({ agencyId, member: currentMember, db: tx });
+    const historicalCreator = await requireWorkflowCreatorHistoryAccess({ agencyId, member: currentMember, creatorId: row.creatorId, db: tx, scope });
     const retiredCreatorResolution = Boolean(scope?.broad && historicalCreator?.deletedAt);
     const result = await setUnassignedSubmissionDisposition({
       db: tx, agencyId, submissionId: row.id, nextDisposition: disposition, reason: justification, now,

@@ -356,6 +356,7 @@ model Agency {
   trafficDailyAggregates TrafficDailyAggregate[]
   customOrders CustomOrder[]
   customContentSubmissions CustomContentSubmission[]
+  customDeliveryReceipts CustomDeliveryReceipt[]
 
   @@index([deletedAt])
 }
@@ -625,6 +626,7 @@ model CustomOrder {
   createdByMember AgencyMember  @relation(fields: [createdByMemberId], references: [id], onDelete: Restrict)
   contentSubmissions   CustomContentSubmission[]
   contentLibraryAssets CreatorMediaAsset[]
+  deliveryReceipts     CustomDeliveryReceipt[]
 
   @@unique([agencyId, clientMutationId], map: "CustomOrder_agency_clientMutationId_key")
   @@index([agencyId, status, dueAt])
@@ -682,6 +684,7 @@ model CustomContentSubmission {
   customOrder      CustomOrder?   @relation(fields: [customOrderId], references: [id], onDelete: SetNull)
   reviewedByMember AgencyMember?  @relation("CustomContentSubmissionReviewedBy", fields: [reviewedByMemberId], references: [id], onDelete: SetNull)
   contentLibraryAssets CreatorMediaAsset[]
+  deliveryReceipts CustomDeliveryReceipt[]
 
   @@index([agencyId, creatorId, receivedAt])
   @@index([agencyId, telegramSourceAccountId, telegramSourceUserId])
@@ -695,6 +698,55 @@ model CustomContentSubmission {
   @@index([reviewedByMemberId])
 }
 
+
+
+model CustomDeliveryReceipt {
+  id                              String   @id @default(cuid())
+  agencyId                        String
+  creatorId                       String
+  customOrderId                   String
+  submissionId                    String
+  writeId                         String?
+  writeCommitRevision             Int?
+  idempotencyKey                  String?
+  dialogId                        String
+  messageId                       String
+  actorMemberId                   String?
+  actorUserId                     String?
+  sentMediaIds                    String[] @default([])
+  approvedMediaIds                String[] @default([])
+  matchedMediaIds                 String[] @default([])
+  newlyDeliveredMediaIds          String[] @default([])
+  deliveredMediaIdsAfter          String[] @default([])
+  duplicateMediaIds               String[] @default([])
+  expectedPriceCents              Int      @default(0)
+  actualPriceCents                Int      @default(0)
+  totalPriceCents                 Int      @default(0)
+  paidAmountCents                 Int      @default(0)
+  remainingAmountCents            Int      @default(0)
+  previousDeliveryOfferedCents    Int      @default(0)
+  deliveryOfferedCents            Int      @default(0)
+  paymentStatus                   String?
+  paymentMismatch                 String?
+  overrideReason                  String?
+  duplicateOverrideConfirmed      Boolean  @default(false)
+  priceMismatchOverrideConfirmed  Boolean  @default(false)
+  complete                        Boolean  @default(false)
+  receiptFingerprint              String
+  occurredAt                      DateTime
+  createdAt                       DateTime @default(now())
+
+  agency     Agency                  @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  customOrder CustomOrder             @relation(fields: [customOrderId], references: [id], onDelete: Cascade)
+  submission  CustomContentSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId, messageId], map: "CustomDeliveryReceipt_provider_message_key")
+  @@unique([writeId, writeCommitRevision], map: "CustomDeliveryReceipt_write_revision_key")
+  @@index([agencyId, occurredAt])
+  @@index([agencyId, creatorId, occurredAt])
+  @@index([customOrderId, occurredAt])
+  @@index([submissionId, occurredAt])
+}
 
 model TelegramDeliveryIntent {
   id                  String   @id @default(cuid())
@@ -722,6 +774,8 @@ model TelegramDeliveryIntent {
   remoteRecipientTelegramUserId String?
   remoteSentAt        DateTime?
   outcomeReason       String?
+  providerBindingRepairAttempts Int      @default(0)
+  providerBindingRetryAt        DateTime?
   confirmationAuthority String?
   confirmedAt         DateTime?
   projectionBlockedCode String?
@@ -739,6 +793,7 @@ model TelegramDeliveryIntent {
   @@index([agencyId, accountId, state])
   @@index([agencyId, accountId, remoteRecipientTelegramUserId, state])
   @@index([agencyId, state, projectionBlockedAt])
+  @@index([agencyId, state, providerBindingRetryAt])
   @@unique([agencyId, accountId, remoteMessageId], map: "TelegramDeliveryIntent_provider_message_key")
   @@index([customOrderId, remoteMessageId])
 }

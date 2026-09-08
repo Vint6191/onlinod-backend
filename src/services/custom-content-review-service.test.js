@@ -21,7 +21,8 @@ function receipt(folderId, profileRevision, mediaIds, at = new Date("2026-08-21T
 
 function fixture() {
   const now = new Date("2026-08-21T14:30:00.000Z");
-  const member = { id: "manager-1", userId: "user-1", agencyId: "agency-1", roleKey: "manager", role: "MANAGER", assignedCreators: "all", permissions: { "team.analytics.view": true, "content.review_customs": true } };
+  const member = { id: "manager-1", userId: "user-1", agencyId: "agency-1", roleKey: "manager", role: "MANAGER", assignedCreators: "all", accessEpoch: 1, permissions: { "team.analytics.view": true, "content.review_customs": true } };
+  const currentMember = { ...member, permissions: { ...member.permissions } };
   const creator = { id: "creator-1", displayName: "Model One", username: "modelone", avatarUrl: null };
   const order = { id: "custom-1", creatorId: "creator-1", dialogId: "777", scenario: "Do the custom", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING", fanDeliveredAt: null, priceCents: 6000, paidAmountCents: 4000, createdAt: now, creator };
   const row = { id: "sub-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", pipelineDisposition: "ACTIVE", executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1, executionPinnedAt: now, ...receipt("vault-1", 1, ["9001", "9002"], now), telegramMessageIds: [101, 102], ofMediaIds: ["9001", "9002"], comment: "two versions", reviewStatus: "WAITING_REVIEW", reviewComment: null, reviewedByMemberId: null, reviewedAt: null, receivedAt: now, createdAt: now, updatedAt: now, creator, customOrder: order, reviewedByMember: null };
@@ -44,6 +45,15 @@ function fixture() {
     return true;
   };
   const db = {
+    agencyMember: {
+      findFirst: async ({ where = {} } = {}) => {
+        if (where.id && String(where.id) !== String(currentMember.id)) return null;
+        if (where.userId && String(where.userId) !== String(currentMember.userId)) return null;
+        if (where.agencyId && String(where.agencyId) !== String(currentMember.agencyId)) return null;
+        if (currentMember.deletedAt || currentMember.deactivatedAt) return null;
+        return { ...currentMember, permissions: { ...(currentMember.permissions || {}) } };
+      },
+    },
     customContentSubmission: {
       findMany: async ({ where, take = 999999, cursor = null, skip = 0, orderBy = [], select = null }) => {
         let found = rows.filter((item) => {
@@ -125,7 +135,7 @@ function fixture() {
     $queryRawUnsafe: async () => [{ id: order.id }],
     $transaction: async (work) => work(db),
   };
-  return { db, member, row, rows, assets, intents };
+  return { db, member, currentMember, row, rows, assets, intents };
 }
 
 test("manager review queue exposes only finalized custom facts and full payment context", async () => {
@@ -274,6 +284,50 @@ test("review queue derives revision version and previous manager instruction wit
 });
 
 
+test("historical revision is not projected as current after a later model response exists", async () => {
+  const { db, member, row, rows, assets, intents } = fixture();
+  row.receivedAt = new Date("2026-08-21T14:30:00.000Z");
+  row.createdAt = new Date("2026-08-21T14:30:00.000Z");
+  const oldStamp = new Date("2026-08-21T14:00:00.000Z");
+  const historical = {
+    ...row,
+    id: "sub-v1-revision",
+    telegramMessageIds: [90],
+    ofMediaIds: ["8999"],
+    reviewStatus: "REVISION_REQUESTED",
+    reviewComment: "Need another angle",
+    reviewedAt: new Date("2026-08-21T14:10:00.000Z"),
+    reviewedByMemberId: "manager-1",
+    reviewedByMember: { id: "manager-1", displayName: "Manager", roleKey: "manager" },
+    receivedAt: oldStamp,
+    createdAt: oldStamp,
+    updatedAt: oldStamp,
+    ...receipt("vault-1", 1, ["8999"], oldStamp),
+  };
+  rows.unshift(historical);
+  assets.push({
+    agencyId: "agency-1", creatorId: "creator-1", mediaId: "8999", source: "CUSTOM", customOrderId: "custom-1",
+    customSubmissionId: historical.id, customFullPriceCents: 6000, mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null,
+    folderIds: ["vault-1"], catalogActive: true, sortingStatus: "SORTED",
+  });
+  intents.push({
+    id: "revision-v1-confirmed", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", customSubmissionId: historical.id,
+    accountId: "tg-1", kind: "REVISION_REQUEST", logicalKey: "revision-v1-key", clientIntentId: null, referenceOrdinal: null, payloadFingerprint: "revision-v1-fp", payload: {},
+    state: "CONFIRMED", claimRevision: 1, claimUntil: null, commitStartedAt: new Date("2026-08-21T14:10:01.000Z"),
+    remoteMessageId: 556, remoteRecipientTelegramUserId: "900001", remoteSentAt: new Date("2026-08-21T14:10:02.000Z"), outcomeReason: null, confirmationAuthority: "PROVIDER_RECEIPT",
+    confirmedAt: new Date("2026-08-21T14:10:02.000Z"), createdAt: new Date("2026-08-21T14:10:00.000Z"), updatedAt: new Date("2026-08-21T14:10:02.000Z"),
+  });
+
+  const revisions = await listCustomContentReviewQueue({ agencyId: "agency-1", member, status: "REVISION_REQUESTED", db, limit: 50 });
+  assert.deepEqual(revisions.items, [], "V1 is durable history, but V2 already satisfies the current model-response obligation");
+
+  await assert.rejects(
+    () => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: historical.id, action: "REQUEST_REVISION", comment: "Need another angle", db }),
+    (error) => error?.code === "CUSTOM_REVIEW_DECISION_SUPERSEDED",
+    "a stale exact-id retry must not resurrect the historical V1 revision read-model",
+  );
+});
+
 test("revision context remains exact beyond 500 historical versions", async () => {
   const { db, member, row, rows, assets } = fixture();
   const base = new Date("2026-01-01T00:00:00.000Z").getTime();
@@ -294,6 +348,43 @@ test("revision context remains exact beyond 500 historical versions", async () =
   assert.equal(result.items[0].submissionId, "history-0501");
   assert.equal(result.items[0].revisionNumber, 501);
   assert.equal(result.items[0].previousRevisionRequest.comment, "revision-500");
+});
+
+test("revision dispatch bulk read cannot let duplicate legacy intents hide another submission's durable state", async () => {
+  const { db, member, row, rows, assets, intents } = fixture();
+  row.reviewStatus = "REVISION_REQUESTED";
+  row.reviewComment = "Redo A";
+  row.reviewedAt = new Date("2026-08-21T14:05:00.000Z");
+  row.telegramSourceAccountId = "tg-1";
+  row.telegramSourceUserId = "900001";
+
+  const orderB = { ...row.customOrder, id: "custom-2", dialogId: "778" };
+  const stampB = new Date("2026-08-21T14:20:00.000Z");
+  const rowB = {
+    ...row, id: "sub-2", customOrderId: orderB.id, customOrder: orderB, telegramMessageIds: [201], ofMediaIds: ["9101"],
+    reviewComment: "Redo B", reviewedAt: new Date("2026-08-21T14:21:00.000Z"), receivedAt: stampB, createdAt: stampB, updatedAt: stampB,
+    ...receipt("vault-1", 1, ["9101"], stampB),
+  };
+  rows.push(rowB);
+  assets.push({ agencyId: "agency-1", creatorId: "creator-1", mediaId: "9101", source: "CUSTOM", customOrderId: orderB.id, customSubmissionId: rowB.id, customFullPriceCents: 6000, mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: ["vault-1"], catalogActive: true, sortingStatus: "SORTED" });
+
+  const revisionBase = {
+    agencyId: "agency-1", creatorId: "creator-1", accountId: "tg-1", kind: "REVISION_REQUEST", clientIntentId: null, referenceOrdinal: null,
+    state: "CONFIRMED", claimRevision: 1, claimUntil: null, commitStartedAt: new Date("2026-08-21T14:22:00.000Z"), remoteRecipientTelegramUserId: "900001",
+    remoteSentAt: new Date("2026-08-21T14:22:01.000Z"), outcomeReason: null, confirmationAuthority: "PROVIDER_RECEIPT", confirmedAt: new Date("2026-08-21T14:22:01.000Z"), updatedAt: new Date("2026-08-21T14:22:01.000Z"), payload: {},
+  };
+  intents.push(
+    { ...revisionBase, id: "revision-a-new", customOrderId: "custom-1", customSubmissionId: row.id, logicalKey: "revision-a-new", payloadFingerprint: "a-new", remoteMessageId: 601, createdAt: new Date("2026-08-21T14:29:00.000Z") },
+    { ...revisionBase, id: "revision-a-old", customOrderId: "custom-1", customSubmissionId: row.id, logicalKey: "revision-a-old", payloadFingerprint: "a-old", remoteMessageId: 600, createdAt: new Date("2026-08-21T14:28:00.000Z") },
+    { ...revisionBase, id: "revision-b", customOrderId: "custom-2", customSubmissionId: rowB.id, logicalKey: "revision-b", payloadFingerprint: "b", remoteMessageId: 602, createdAt: new Date("2026-08-21T14:10:00.000Z") },
+  );
+
+  const result = await listCustomContentReviewQueue({ agencyId: "agency-1", member, status: "REVISION_REQUESTED", db, limit: 50 });
+  assert.equal(result.items.length, 2);
+  const byId = new Map(result.items.map((item) => [item.submissionId, item]));
+  assert.equal(byId.get("sub-1")?.revisionDispatch.status, "WAITING_MODEL");
+  assert.equal(byId.get("sub-2")?.revisionDispatch.status, "WAITING_MODEL", "sub-2 confirmed intent must not disappear behind duplicate sub-1 history");
+  assert.equal(byId.get("sub-2")?.revisionDispatch.intentId, "revision-b");
 });
 
 test("review queue reaches a valid row after more than 2000 poisoned WAITING rows", async () => {
@@ -413,4 +504,44 @@ test("revision decision remains durable as DISPATCH_BLOCKED without TASK/source 
   assert.equal(revision.length, 1);
   assert.equal(revision[0].payload.replyToMessageId, "444");
   assert.equal(revision[0].payload.recipientTelegramUserId, "900001");
+});
+
+test("review mutation enforces current creator scope, not knowledge of an opaque submission id", async () => {
+  const { db, member, currentMember, row } = fixture();
+  member.assignedCreators = ["creator-other"];
+  currentMember.assignedCreators = ["creator-other"];
+  await assert.rejects(
+    () => reviewCustomContentSubmission({ agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_CREATOR_ACCESS_FORBIDDEN" && error?.status === 403,
+  );
+  assert.equal(row.reviewStatus, "WAITING_REVIEW");
+});
+
+test("review mutation permits the same scoped manager for the assigned creator", async () => {
+  const { db, member, currentMember, row } = fixture();
+  member.assignedCreators = ["creator-1"];
+  currentMember.assignedCreators = ["creator-1"];
+  const result = await reviewCustomContentSubmission({ agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db });
+  assert.equal(result.item.reviewStatus, "APPROVED");
+});
+
+test("review mutation rechecks access inside commit transaction after target pre-read", async () => {
+  const { db, member, currentMember, row } = fixture();
+  member.assignedCreators = ["creator-1"];
+  currentMember.assignedCreators = ["creator-1"];
+  const normalTransaction = db.$transaction;
+  let changedBeforeCommit = false;
+  db.$transaction = async (work) => {
+    if (!changedBeforeCommit) {
+      changedBeforeCommit = true;
+      currentMember.assignedCreators = [];
+      currentMember.accessEpoch = 2;
+    }
+    return normalTransaction(work);
+  };
+  await assert.rejects(
+    () => reviewCustomContentSubmission({ agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(row.reviewStatus, "WAITING_REVIEW", "stale scope request must not leave a review mutation behind");
 });

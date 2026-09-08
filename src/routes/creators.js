@@ -11,7 +11,7 @@ const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/aut
 const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
 const { agencyRemovalPhrase, removeCreatorFromAssignedCreators, retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
-const { assertCreatorCustomPipelineRetirable, lockCreatorPipelineLifecycle } = require("../services/custom-content-pipeline-authority-service");
+const { assertCreatorCustomPipelineRetirable, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("../services/custom-content-pipeline-authority-service");
 const { assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
 const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
 const { updateCreatorTelegramContact } = require("../services/creator-telegram-contact-authority-service");
@@ -544,6 +544,12 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
 
     const removedAt = new Date();
     const result = await prisma.$transaction(async (tx) => {
+      // Global Custom lifecycle order is Agency -> Member/Creator -> provider rows.
+      // Creator removal also rewrites member creator scopes, so taking Creator first
+      // can deadlock a concurrent Custom management commit that already holds the
+      // member access fence and is waiting for this Creator row. Serialize at the
+      // Agency root before either side reaches member/creator rows.
+      await lockAgencyPipelineLifecycle({ db: tx, agencyId: req.auth.agencyId, allowDeleted: true });
       await lockCreatorPipelineLifecycle({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id, allowDeleted: true });
       await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id });
       await assertCreatorMassCampaignRetirable({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id });

@@ -4,6 +4,7 @@ const { audit } = require("./audit-service");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { lockCustomExecutionDefaults } = require("./custom-content-pipeline-authority-service");
+const { assertCustomManagementCreatorAccess } = require("./custom-management-access-authority-service");
 
 const MAX_FOLDER_ID = 180;
 
@@ -42,6 +43,9 @@ async function setCustomVaultDestination({ agencyId, member, creatorId: rawCreat
   }
 
   const apply = async (tx) => {
+    await assertCustomManagementCreatorAccess({
+      agencyId, actorMember: member, creatorId: cid, permissionKey: "content.manage_vault", db: tx,
+    });
     // Lock-order invariant: mutate the Creator row first, then join the execution-default
     // advisory fence before COMMIT. First-profile pinning may already hold a Submission
     // row when it waits on this fence; taking advisory -> Creator here would permit

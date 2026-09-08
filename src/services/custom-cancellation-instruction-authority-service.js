@@ -18,14 +18,29 @@ async function latestSubmissionForCancellation({ agencyId, order, db }) {
   });
 }
 
-async function latestRevisionIntent({ agencyId, orderId, submissionId, db }) {
-  if (!submissionId || !db?.telegramDeliveryIntent?.findFirst) return null;
+const REVISION_PROVIDER_SIGNIFICANT_STATES = new Set(["COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"]);
+
+function dateMs(value) {
+  if (!value) return Number.NEGATIVE_INFINITY;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(date.getTime()) ? date.getTime() : Number.NEGATIVE_INFINITY;
+}
+
+function selectLatestProviderSignificantRevision(rows) {
+  return (rows || [])
+    .filter((row) => String(row?.kind || "") === "REVISION_REQUEST" && REVISION_PROVIDER_SIGNIFICANT_STATES.has(String(row?.state || "")))
+    .slice()
+    .sort((a, b) => dateMs(b?.createdAt) - dateMs(a?.createdAt) || String(b?.id || "").localeCompare(String(a?.id || "")))[0] || null;
+}
+
+async function latestProviderSignificantRevision({ agencyId, orderId, db }) {
+  if (!db?.telegramDeliveryIntent?.findFirst) return null;
   return db.telegramDeliveryIntent.findFirst({
     where: {
       agencyId,
       customOrderId: String(orderId),
-      customSubmissionId: String(submissionId),
       kind: "REVISION_REQUEST",
+      state: { in: [...REVISION_PROVIDER_SIGNIFICANT_STATES] },
     },
     orderBy: [{ createdAt: "desc" }, { id: "desc" }],
   });
@@ -72,7 +87,12 @@ function publicAnchor(instruction) {
 
 
 function classifyCancellationInstructionFacts({ submission = null, revision = null, task = null } = {}) {
-  if (submission && String(submission.reviewStatus || "").toUpperCase() === "REVISION_REQUESTED") {
+  // Cancellation follows the strongest provider-visible model instruction for the whole
+  // Custom lifecycle, not merely the reviewStatus of the latest response version. After
+  // V1 -> confirmed revision -> V2 WAITING_REVIEW, that historical revision is still the
+  // last instruction the model actually received and therefore remains the correct thread.
+  const revisionState = String(revision?.state || "");
+  if (revisionState === "CONFIRMED") {
     const revisionInstruction = confirmedCancellationInstruction(revision);
     if (revisionInstruction) {
       return {
@@ -81,19 +101,29 @@ function classifyCancellationInstructionFacts({ submission = null, revision = nu
         instruction: revision,
         revisionIntentId: String(revision.id),
         revisionState: "CONFIRMED",
-        submissionId: String(submission.id),
+        submissionId: String(revision.customSubmissionId || submission?.id || "") || null,
       };
     }
-    if (["COMMITTING", "RECONCILE_REQUIRED"].includes(String(revision?.state || ""))) {
-      return {
-        state: "REVISION_OUTCOME_UNRESOLVED",
-        anchor: null,
-        instruction: revision || null,
-        revisionIntentId: String(revision.id),
-        revisionState: String(revision.state),
-        submissionId: String(submission.id),
-      };
-    }
+    // A durable CONFIRMED row with incomplete provider identity is not permission to fall
+    // back to an older TASK. The newer provider effect must be repaired/adjudicated first.
+    return {
+      state: "REVISION_OUTCOME_UNRESOLVED",
+      anchor: null,
+      instruction: revision,
+      revisionIntentId: String(revision.id),
+      revisionState: "CONFIRMED",
+      submissionId: String(revision.customSubmissionId || submission?.id || "") || null,
+    };
+  }
+  if (["COMMITTING", "RECONCILE_REQUIRED"].includes(revisionState)) {
+    return {
+      state: "REVISION_OUTCOME_UNRESOLVED",
+      anchor: null,
+      instruction: revision || null,
+      revisionIntentId: String(revision.id),
+      revisionState,
+      submissionId: String(revision.customSubmissionId || submission?.id || "") || null,
+    };
   }
 
   const taskInstruction = confirmedCancellationInstruction(task);
@@ -127,9 +157,7 @@ async function deriveCustomCancellationInstruction({ agencyId, orderId = null, o
   if (!row) return { state: "ORDER_MISSING", anchor: null, revisionIntentId: null, revisionState: null };
 
   const submission = await latestSubmissionForCancellation({ agencyId: scopedAgencyId, order: row, db });
-  const revision = submission && String(submission.reviewStatus || "").toUpperCase() === "REVISION_REQUESTED"
-    ? await latestRevisionIntent({ agencyId: scopedAgencyId, orderId: row.id, submissionId: submission.id, db })
-    : null;
+  const revision = await latestProviderSignificantRevision({ agencyId: scopedAgencyId, orderId: row.id, db });
   const task = await latestConfirmedTask({ agencyId: scopedAgencyId, orderId: row.id, db });
   return classifyCancellationInstructionFacts({ submission, revision, task });
 }
@@ -153,6 +181,7 @@ function requireCancellationProviderAnchor(result) {
 
 module.exports = {
   classifyCancellationInstructionFacts,
+  selectLatestProviderSignificantRevision,
   deriveCustomCancellationInstruction,
   requireCancellationProviderAnchor,
 };

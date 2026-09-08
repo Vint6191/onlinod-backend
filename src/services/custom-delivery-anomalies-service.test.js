@@ -26,6 +26,7 @@ function fixture() {
     creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "sub-1", customFullPriceCents: 6000,
     mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: ["folder-1"], catalogActive: true, sortingStatus: "SORTED",
   }));
+  const receipts = [];
   const audits = [
     { id: "a3", actorUserId: "user-1", action: "CUSTOM_DELIVERY_DUPLICATE_ATTEMPT", targetId: "custom-1", createdAt: new Date("2026-08-22T10:40:00Z"), metadata: { creatorId: "creator-1", dialogId: "777", messageId: "msg-3", duplicateMediaIds: ["9001"], expectedPriceCents: 0, actualPriceCents: 0, totalPriceCents: 6000, paidAmountCents: 6000, remainingAmountCents: 0 } },
     { id: "a2", actorUserId: "user-1", action: "CUSTOM_PAYMENT_UNDERCHARGE", targetId: "custom-1", createdAt: new Date("2026-08-22T10:30:00Z"), metadata: { creatorId: "creator-1", dialogId: "777", messageId: "msg-2", expectedPriceCents: 2000, actualPriceCents: 1500, shortfallCents: 500, totalPriceCents: 6000, paidAmountCents: 4000, remainingAmountCents: 2000 } },
@@ -40,6 +41,15 @@ function fixture() {
       },
     },
     creatorMediaAsset: { findMany: async () => assets },
+    customDeliveryReceipt: {
+      findMany: async ({ where }) => receipts.filter((row) => {
+        if (where?.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+        if (where?.messageId?.in && !where.messageId.in.includes(row.messageId)) return false;
+        if (where?.occurredAt?.gte && row.occurredAt < where.occurredAt.gte) return false;
+        if (where?.occurredAt?.lte && row.occurredAt > where.occurredAt.lte) return false;
+        return true;
+      }).sort((a, b) => String(a.id).localeCompare(String(b.id))),
+    },
     auditLog: {
       findMany: async ({ where }) => audits.filter((row) => {
         if (where?.action?.in && !where.action.in.includes(row.action)) return false;
@@ -51,7 +61,7 @@ function fixture() {
     agencyMember: { findMany: async () => [{ id: "member-1", userId: "user-1", displayName: "Alex", roleKey: "chatter", user: { name: "Alex", email: "a@test" } }] },
     creatorAccount: { findMany: async () => [creator] },
   };
-  return { db, order, submission, audits };
+  return { db, order, submission, audits, receipts };
 }
 
 test("live overdue is derived from approved readyAt after two hours and keeps partial delivery progress", async () => {
@@ -66,7 +76,7 @@ test("live overdue is derived from approved readyAt after two hours and keeps pa
   assert.equal(result.summary.overdueDeliveries, 1);
 });
 
-test("custom management signals reuse AuditLog and summarize fully-paid PPV override without another event table", async () => {
+test("legacy custom management signals remain visible through AuditLog fallback", async () => {
   const { db } = fixture();
   const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
   assert.equal(result.summary.paymentOverrides, 1);
@@ -79,6 +89,56 @@ test("custom management signals reuse AuditLog and summarize fully-paid PPV over
   assert.equal(override.expectedPriceCents, 0);
   assert.equal(override.actualPriceCents, 3000);
   assert.equal(override.reason, "extra paid version");
+});
+
+test("typed delivery receipts are the management anomaly authority and survive missing AuditLog", async () => {
+  const { db, audits, receipts } = fixture();
+  audits.splice(0, audits.length);
+  receipts.push({
+    id: "r1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", submissionId: "sub-1",
+    dialogId: "777", messageId: "msg-receipt", actorMemberId: "member-1", actorUserId: "user-1",
+    duplicateMediaIds: ["9001", "9002"], expectedPriceCents: 2000, actualPriceCents: 1500, totalPriceCents: 6000,
+    paidAmountCents: 4000, remainingAmountCents: 2000, overrideReason: null, occurredAt: new Date("2026-08-22T10:30:00Z"),
+  });
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  assert.equal(result.summary.undercharges, 1);
+  assert.equal(result.summary.duplicateAttempts, 1);
+  assert.equal(result.events.length, 2);
+  assert.equal(result.events.find((row) => row.type === "CUSTOM_DELIVERY_DUPLICATE_ATTEMPT").duplicateMediaCount, 2);
+});
+
+test("AuditLog projection for a receipt-covered provider message is not double-counted", async () => {
+  const { db, audits, receipts } = fixture();
+  receipts.push({
+    id: "r2", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", submissionId: "sub-1",
+    dialogId: "777", messageId: "msg-2", actorMemberId: "member-1", actorUserId: "user-1",
+    duplicateMediaIds: [], expectedPriceCents: 2000, actualPriceCents: 1500, totalPriceCents: 6000, paidAmountCents: 4000, remainingAmountCents: 2000,
+    occurredAt: new Date("2026-08-22T10:30:00Z"),
+  });
+  // a2 is the historical/best-effort projection for this exact message and must be shadowed by the receipt.
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  assert.equal(result.summary.undercharges, 1);
+  assert.equal(result.events.filter((row) => row.type === "CUSTOM_PAYMENT_UNDERCHARGE").length, 1);
+  assert.ok(audits.some((row) => row.id === "a2"));
+});
+
+
+test("out-of-range typed receipt still shadows an in-range best-effort AuditLog projection", async () => {
+  const { db, audits, receipts } = fixture();
+  audits.splice(0, audits.length, {
+    id: "a-late", actorUserId: "user-1", action: "CUSTOM_PAYMENT_UNDERCHARGE", targetId: "custom-1",
+    createdAt: new Date("2026-08-22T10:30:00Z"),
+    metadata: { creatorId: "creator-1", dialogId: "777", messageId: "msg-old-business", expectedPriceCents: 2000, actualPriceCents: 1500, shortfallCents: 500, totalPriceCents: 6000, paidAmountCents: 4000, remainingAmountCents: 2000 },
+  });
+  receipts.push({
+    id: "r-old", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", submissionId: "sub-1",
+    dialogId: "777", messageId: "msg-old-business", actorMemberId: "member-1", actorUserId: "user-1",
+    duplicateMediaIds: [], expectedPriceCents: 2000, actualPriceCents: 1500, totalPriceCents: 6000, paidAmountCents: 4000, remainingAmountCents: 2000,
+    occurredAt: new Date("2026-08-20T10:30:00Z"),
+  });
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  assert.equal(result.summary.undercharges, 0, "telemetry ingestion time must not move an old typed business fact into the current range");
+  assert.equal(result.events.length, 0);
 });
 
 test("creator scope hides both current overdue state and historical anomaly signals", async () => {

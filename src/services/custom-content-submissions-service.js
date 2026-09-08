@@ -12,6 +12,7 @@ const { lockActiveTelegramAccountReference } = require("./telegram-account-refer
 const { fenceCustomModelObligationTransition, supersedePrecommitInitialReferences } = require("./custom-model-obligation-authority-service");
 const { adjudicateHumanModelResponseOverride } = require("./custom-model-instruction-override-authority-service");
 const { reprojectCustomReminderSchedule } = require("./custom-order-reminders");
+const { assertCustomManagementCreatorAccess } = require("./custom-management-access-authority-service");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
@@ -311,6 +312,9 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
       // NEW provider-backed work is fenced by the parent Agency lifecycle first.
       // Global provider-reference lock order is Agency -> CreatorAccount -> TelegramAccount.
       await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+      await assertCustomManagementCreatorAccess({
+        agencyId, actorMember: member, creatorId, permissionKey: "content.review_customs", db: tx,
+      });
       // Provider-message ownership is adjudicated before the target lifecycle. Exact retries must
       // remain idempotent even after their first submission is WAITING_REVIEW, and a partial
       // provider overlap must report the source conflict rather than an unrelated order-busy state.
@@ -672,6 +676,9 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
   try {
     updated = await runSubmissionTransaction(client, async (tx) => {
       await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+      await assertCustomManagementCreatorAccess({
+        agencyId, actorMember: member, creatorId: row.creatorId, permissionKey: "content.review_customs", db: tx,
+      });
       await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: row.creatorId });
       if (normalizedOrderId) {
         await bindContentOrderForSubmission({ agencyId, creatorId: row.creatorId, customOrderId: normalizedOrderId, now, db: tx });

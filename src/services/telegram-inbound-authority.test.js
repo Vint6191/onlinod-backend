@@ -963,3 +963,16 @@ test("historical inbound with deleted business context becomes REVIEW_REQUIRED i
   assert.equal(fx.events[0].customOrderId,"deleted-order");
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
 });
+
+test("commit-time Telegram inbound human resolution rejects a stale management actor and preserves REVIEW_REQUIRED", async()=>{
+  const fx=fixture();
+  seedReview(fx,{id:"review-stale-access",projectionReason:"PROVENANCE_CONFLICT"});
+  const actorSnapshot=clone(fx.member);
+  fx.member.accessEpoch+=1;
+  fx.member.assignedCreators=[];
+  await assert.rejects(
+    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:actorSnapshot,eventId:"review-stale-access",resolution:"SKIP",reason:"stale queue action",now:fx.now,db:fx.db}),
+    (error)=>error?.code==="CUSTOM_MANAGEMENT_ACCESS_STALE"&&error?.status===409,
+  );
+  assert.equal(fx.events.find((row)=>row.id==="review-stale-access").projectionState,"REVIEW_REQUIRED");
+});

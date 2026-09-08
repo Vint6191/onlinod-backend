@@ -14,6 +14,7 @@ const {
   repairConfirmedTelegramDeliveryProjections,
   repairCustomModelCommunicationConvergence,
   ensureInitialTaskIntents,
+  repairPrecommitProviderBlockedIntents,
   markTelegramDeliveryUnknown,
   markTelegramDeliveryProvenNotSent,
   failTelegramDeliveryPrecommit,
@@ -35,6 +36,7 @@ function scalar(value) { return value instanceof Date ? value.getTime() : value;
 function matches(row, where = {}) {
   for (const [key, expected] of Object.entries(where || {})) {
     if (key === "OR") { if (!expected.some((part) => matches(row, part))) return false; continue; }
+    if (key === "NOT") { if (matches(row, expected)) return false; continue; }
     if (key === "agency") continue;
     const actual = row[key];
     if (expected && typeof expected === "object" && !Array.isArray(expected) && !(expected instanceof Date)) {
@@ -125,7 +127,7 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
         const start = cursor?.id ? Math.max(0, rows.findIndex((r)=>String(r.id)===String(cursor.id)) + (skip || 0)) : 0;
         return rows.slice(start, start + take).map(clone);
       },
-      async create({ data }) { const r = { id: `intent-${++seq}`, claimRevision: 0, claimUntil: null, claimTokenHash: null, deviceId: null, userId: null, memberId: null, accessEpoch: null, commitStartedAt: null, remoteMessageId: null, remoteRecipientTelegramUserId: null, remoteSentAt: null, confirmedAt: null, outcomeReason: null, createdAt: new Date(now.getTime() + seq), updatedAt: new Date(now.getTime() + seq), ...clone(data) }; intents.push(r); return clone(r); },
+      async create({ data }) { const r = { id: `intent-${++seq}`, claimRevision: 0, claimUntil: null, claimTokenHash: null, deviceId: null, userId: null, memberId: null, accessEpoch: null, commitStartedAt: null, remoteMessageId: null, remoteRecipientTelegramUserId: null, remoteSentAt: null, confirmedAt: null, outcomeReason: null, providerBindingRepairAttempts: 0, providerBindingRetryAt: null, createdAt: new Date(now.getTime() + seq), updatedAt: new Date(now.getTime() + seq), ...clone(data) }; intents.push(r); return clone(r); },
       async updateMany({ where, data }) { let count = 0; for (const r of intents) if (matches(r, where)) { Object.assign(r, clone(data), { updatedAt: new Date() }); count += 1; } return { count }; },
     },
     telegramInboundEvent: {
@@ -480,6 +482,38 @@ test("REFERENCE precommit skip is terminal-resolved and does not permanently blo
   assert.equal(cancelled.intent.state, "CANCELLED");
   const claimed = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: second.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
   assert.equal(claimed.claimed, true, "CANCELLED predecessor is resolved and must not fence later references");
+});
+
+
+test("REFERENCE precommit replacement rejects a stale management actor and preserves the durable artifact", async () => {
+  const fx = dbFixture(); seedConfirmedTaskThread(fx);
+  const first = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: "22222222-2222-4222-8222-121212121212", reference: { ordinal: 0, name: "original.jpg", size: 10, sha256: "a".repeat(64) }, now: fx.now, db: fx.db });
+  const actorSnapshot = clone(fx.member);
+  fx.db._member.accessEpoch += 1;
+  fx.db._member.assignedCreators = [];
+  await assert.rejects(
+    () => replaceTelegramReferencePrecommit({ agencyId: "agency-1", member: actorSnapshot, intentId: first.intent.id, clientIntentId: "22222222-2222-4222-8222-131313131313", reference: { name: "replacement.jpg", size: 12, sha256: "b".repeat(64) }, now: new Date(fx.now.getTime() + 1000), db: fx.db }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  const durable = fx.intents.find((row) => row.id === first.intent.id);
+  assert.equal(durable.payload.reference.name, "original.jpg");
+  assert.equal(durable.clientIntentId, "22222222-2222-4222-8222-121212121212");
+  assert.equal(durable.state, "PLANNED");
+});
+
+test("REFERENCE precommit cancellation rejects a stale management actor and preserves the planned slot", async () => {
+  const fx = dbFixture(); seedConfirmedTaskThread(fx);
+  const first = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "REFERENCE", clientIntentId: "22222222-2222-4222-8222-141414141414", reference: { ordinal: 0, name: "keep.jpg", size: 10, sha256: "c".repeat(64) }, now: fx.now, db: fx.db });
+  const actorSnapshot = clone(fx.member);
+  fx.db._member.accessEpoch += 1;
+  fx.db._member.assignedCreators = [];
+  await assert.rejects(
+    () => cancelTelegramReferencePrecommit({ agencyId: "agency-1", member: actorSnapshot, intentId: first.intent.id, reason: "stale skip", now: new Date(fx.now.getTime() + 1000), db: fx.db }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  const durable = fx.intents.find((row) => row.id === first.intent.id);
+  assert.equal(durable.state, "PLANNED");
+  assert.notEqual(String(durable.outcomeReason || ""), "REFERENCE_SKIPPED:stale skip");
 });
 
 test("confirmed TASK pins follow-up account and provider recipient after creator account reassignment", async () => {
@@ -1738,6 +1772,126 @@ test("manual CONFIRMED reconciliation preserves orphan provider proof without fa
 });
 
 
+test("provider-blocked precommit work is backoff-repaired instead of rewritten on every worker poll", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { accountId: "tg-1", messageId: 501, telegramUserId: "1001" });
+  const submission = seedRevisionDecision(fx);
+  const revision = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: fx.now, db: fx.db,
+  });
+  fx.accounts.find((row) => row.id === "tg-1").lifecycleState = "RETIRING";
+
+  const first = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
+  assert.equal(first.items.some((row) => row.id === revision.id), false);
+  const blocked = fx.intents.find((row) => row.id === revision.id);
+  assert.match(String(blocked.outcomeReason), /^PRECOMMIT_PROVIDER_UNAVAILABLE:/);
+  // The fixture's generic updateMany uses wall-clock time, while this test deliberately
+  // drives the authority with a deterministic `now`. Normalize only this row so the
+  // backoff assertion tests authority semantics rather than host clock drift.
+  blocked.updatedAt = new Date(fx.now);
+  const firstBlockedAt = new Date(blocked.updatedAt).getTime();
+  assert.equal(blocked.providerBindingRepairAttempts, 1);
+  assert.equal(new Date(blocked.providerBindingRetryAt).getTime(), fx.now.getTime() + 60_000);
+
+  const immediate = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: new Date(fx.now.getTime() + 5_000), db: fx.db });
+  assert.equal(immediate.items.some((row) => row.id === revision.id), false);
+  assert.equal(new Date(blocked.updatedAt).getTime(), firstBlockedAt, "blocked row must not be rewritten on every poll");
+
+  fx.accounts.find((row) => row.id === "tg-1").lifecycleState = "ACTIVE";
+  const later = new Date(fx.now.getTime() + 61_000);
+  const repair = await repairPrecommitProviderBlockedIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: later, db: fx.db });
+  assert.equal(repair.recovered, 1);
+  const recoveredIntent = fx.intents.find((row) => row.id === revision.id);
+  assert.equal(recoveredIntent.providerBindingRepairAttempts, 0);
+  assert.equal(recoveredIntent.providerBindingRetryAt, null);
+  assert.equal(String(recoveredIntent.outcomeReason || "").startsWith("PRECOMMIT_PROVIDER_UNAVAILABLE:"), false, "repaired work must leave the provider-blocked lane; an ordinary precommit refresh reason is still executable");
+  const recovered = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: later, db: fx.db });
+  assert.equal(recovered.items.some((row) => row.id === revision.id), true);
+});
+
+test("permanently provider-blocked work uses durable exponential retry scheduling instead of rotating write amplification", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { accountId: "tg-1", messageId: 501, telegramUserId: "1001" });
+  const submission = seedRevisionDecision(fx);
+  const revision = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: fx.now, db: fx.db,
+  });
+  fx.accounts.find((row) => row.id === "tg-1").lifecycleState = "RETIRING";
+
+  await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
+  const blocked = fx.intents.find((row) => row.id === revision.id);
+  assert.equal(blocked.providerBindingRepairAttempts, 1);
+  assert.equal(new Date(blocked.providerBindingRetryAt).getTime(), fx.now.getTime() + 60_000);
+
+  const secondAt = new Date(fx.now.getTime() + 61_000);
+  const second = await repairPrecommitProviderBlockedIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: secondAt, db: fx.db });
+  assert.equal(second.attempted, 1);
+  assert.equal(second.stillBlocked, 1);
+  assert.equal(blocked.providerBindingRepairAttempts, 2);
+  assert.equal(new Date(blocked.providerBindingRetryAt).getTime(), secondAt.getTime() + 120_000);
+
+  const tooEarly = await repairPrecommitProviderBlockedIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: new Date(fx.now.getTime() + 120_000), db: fx.db });
+  assert.equal(tooEarly.attempted, 0, "durable retryAt must keep a permanent blocker out of every worker poll");
+  assert.equal(blocked.providerBindingRepairAttempts, 2);
+
+  const thirdAt = new Date(secondAt.getTime() + 121_000);
+  const third = await repairPrecommitProviderBlockedIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: thirdAt, db: fx.db });
+  assert.equal(third.attempted, 1);
+  assert.equal(third.stillBlocked, 1);
+  assert.equal(blocked.providerBindingRepairAttempts, 3);
+  assert.equal(new Date(blocked.providerBindingRetryAt).getTime(), thirdAt.getTime() + 240_000);
+});
+
+test("model communication convergence cannot bypass durable provider-binding retryAt", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { accountId: "tg-1", messageId: 501, telegramUserId: "1001" });
+  const submission = seedRevisionDecision(fx);
+  const revision = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: fx.now, db: fx.db,
+  });
+  fx.accounts.find((row) => row.id === "tg-1").lifecycleState = "RETIRING";
+  await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
+  const blocked = fx.intents.find((row) => row.id === revision.id);
+  assert.equal(blocked.providerBindingRepairAttempts, 1);
+  const firstRetryAt = new Date(blocked.providerBindingRetryAt).getTime();
+  const firstUpdatedAt = new Date(blocked.updatedAt).getTime();
+
+  const early = await repairCustomModelCommunicationConvergence({ agencyId: "agency-1", now: new Date(fx.now.getTime() + 5_000), db: fx.db });
+  assert.equal(early.providerBindingRepairAttempted, 0);
+  assert.equal(blocked.providerBindingRepairAttempts, 1);
+  assert.equal(new Date(blocked.providerBindingRetryAt).getTime(), firstRetryAt);
+  assert.equal(new Date(blocked.updatedAt).getTime(), firstUpdatedAt, "generic convergence must not rewrite a not-yet-due blocked intent");
+
+  const dueAt = new Date(fx.now.getTime() + 61_000);
+  const due = await repairCustomModelCommunicationConvergence({ agencyId: "agency-1", now: dueAt, db: fx.db });
+  assert.equal(due.providerBindingRepairAttempted, 1);
+  assert.equal(due.providerBindingRepairStillBlocked, 1);
+  assert.equal(blocked.providerBindingRepairAttempts, 2);
+  assert.equal(new Date(blocked.providerBindingRetryAt).getTime(), dueAt.getTime() + 120_000);
+});
+
+test("explicit claim-by-id immediately re-evaluates a provider-blocked precommit intent after capability repair", async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { accountId: "tg-1", messageId: 501, telegramUserId: "1001" });
+  const submission = seedRevisionDecision(fx);
+  const revision = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: fx.member, submission, order: fx.orders[0], revisionNumber: 1, now: fx.now, db: fx.db,
+  });
+  fx.accounts.find((row) => row.id === "tg-1").lifecycleState = "RETIRING";
+  const hidden = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
+  assert.equal(hidden.items.some((row) => row.id === revision.id), false);
+  assert.match(String(fx.intents.find((row) => row.id === revision.id).outcomeReason), /^PRECOMMIT_PROVIDER_UNAVAILABLE:/);
+
+  fx.accounts.find((row) => row.id === "tg-1").lifecycleState = "ACTIVE";
+  const claimed = await claimTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: revision.id, deviceId: "device-1", runtimeClaimToken: "runtime-1",
+    now: new Date(fx.now.getTime() + 5_000), db: fx.db,
+  });
+  assert.equal(claimed.claimed, true);
+  assert.equal(claimed.intent.state, "CLAIMED");
+  assert.equal(String(claimed.intent.outcomeReason || "").startsWith("PRECOMMIT_PROVIDER_UNAVAILABLE:"), false);
+});
+
 test("PRECOMMIT_PROVIDER_UNAVAILABLE is visible in a dedicated operator queue without pretending the external outcome is unknown", async () => {
   const fx = dbFixture();
   fx.intents.push({
@@ -2444,4 +2598,38 @@ test("AUTO_REMINDER planning horizon counts eligible new work, not stale exact C
 
   const after = fx.intents.filter((row) => row.kind === "AUTO_REMINDER" && row.customOrderId === "order-3");
   assert.equal(after.length, 1, "stale exact CONFIRMED reminders must not consume the planning horizon before a later eligible order");
+});
+
+test("direct human Telegram planning rejects a stale management actor before creating durable work", async () => {
+  const fx = dbFixture();
+  const actorSnapshot = clone(fx.member);
+  fx.db._member.accessEpoch += 1;
+  fx.db._member.assignedCreators = [];
+  await assert.rejects(
+    () => planTelegramDeliveryIntent({ agencyId: "agency-1", member: actorSnapshot, orderId: "order-1", kind: "TASK", now: fx.now, db: fx.db }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(fx.intents.length, 0, "stale human planning must not create a TelegramDeliveryIntent");
+});
+
+test("manual Telegram reconciliation rejects a stale management actor and preserves unresolved provider truth", async () => {
+  const fx = dbFixture();
+  const planned = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "TASK", now: fx.now, db: fx.db });
+  const row = fx.intents.find((intent) => intent.id === planned.intent.id);
+  assert.ok(row);
+  row.state = "RECONCILE_REQUIRED";
+  row.commitStartedAt = new Date(fx.now.getTime() - 30_000);
+  row.claimRevision = 3;
+  const actorSnapshot = clone(fx.member);
+  fx.db._member.accessEpoch += 1;
+  fx.db._member.assignedCreators = [];
+  await assert.rejects(
+    () => reconcileTelegramDeliveryIntent({
+      agencyId: "agency-1", member: actorSnapshot, intentId: row.id,
+      resolution: "PROVEN_NOT_SENT", reason: "stale operator decision", now: fx.now, db: fx.db,
+    }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(row.state, "RECONCILE_REQUIRED");
+  assert.equal(row.outcomeReason ?? null, null);
 });

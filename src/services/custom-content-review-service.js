@@ -6,8 +6,9 @@ const { canUsePermission } = require("./team-access-control");
 const { isCompleteSubmission, uniqueMediaIds } = require("./custom-content-library-service");
 const { paymentSnapshot } = require("./custom-orders-service");
 const { hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, derivePipelineStage, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
-const { planRevisionRequestIntentForReviewedSubmission, revisionDispatchProjection } = require("./telegram-delivery-authority-service");
-const { resolveRevisionProviderBinding } = require("./custom-revision-provider-binding-authority-service");
+const { planRevisionRequestIntentForReviewedSubmission } = require("./telegram-delivery-authority-service");
+const { deriveCustomRevisionDispatch } = require("./custom-revision-dispatch-authority-service");
+const { assertCustomManagementCreatorAccess } = require("./custom-management-access-authority-service");
 
 const REVIEW_WAITING = "WAITING_REVIEW";
 const REVIEW_REVISION = "REVISION_REQUESTED";
@@ -117,7 +118,14 @@ async function loadRevisionContext(db, agencyId, rows) {
       };
       break;
     }
-    result.set(String(row.id), { revisionNumber: Math.max(1, index + 1), previousRevisionRequest: previous });
+    result.set(String(row.id), {
+      revisionNumber: Math.max(1, index + 1),
+      previousRevisionRequest: previous,
+      // The review/revision product read model is about the CURRENT response for
+      // one CustomOrder. Historical REVISION_REQUESTED rows stay durable history,
+      // but once a later response exists they must not reappear as WAITING_MODEL.
+      latestSubmissionId: list.length ? String(list[list.length - 1].id) : String(row.id),
+    });
   }
   return result;
 }
@@ -140,50 +148,38 @@ function isFinalizedForReview(row, assetByKey) {
       && customAssetMatchesPipelineProjection(row, asset, row.customOrder);
   });
 }
-function revisionDispatchBlockedError(error) {
-  return [
-    "CUSTOM_REVISION_DISPATCH_BLOCKED",
-    "CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED",
-    "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING",
-  ].includes(String(error?.code || ""));
-}
-function blockedRevisionDispatch(error) {
-  return revisionDispatchProjection(null, { blockedCode: String(error?.blockedCode || error?.code || "PROVIDER_THREAD_UNAVAILABLE") });
-}
 async function planRevisionDispatchOrBlock({ agencyId, member, submission, order, revisionNumber, now, db }) {
+  let intent = null;
   try {
-    const intent = await planRevisionRequestIntentForReviewedSubmission({ agencyId, member, submission, order, revisionNumber, now, db });
-    return { intent, projection: revisionDispatchProjection(intent) };
+    intent = await planRevisionRequestIntentForReviewedSubmission({ agencyId, member, submission, order, revisionNumber, now, db });
   } catch (error) {
-    if (!revisionDispatchBlockedError(error)) throw error;
-    return { intent: null, projection: blockedRevisionDispatch(error) };
+    if (String(error?.code || "") !== "CUSTOM_REVISION_DISPATCH_BLOCKED") throw error;
   }
+  const projection = await deriveCustomRevisionDispatch({ agencyId, orderId: order.id, submission, intent, db });
+  return { intent, projection };
 }
 
 async function loadRevisionDispatchMap(db, agencyId, rows) {
-  const ids = Array.from(new Set((rows || []).filter((row) => String(row.reviewStatus || "") === REVIEW_REVISION).map((row) => String(row.id)).filter(Boolean)));
-  if (!ids.length || !db.telegramDeliveryIntent?.findMany) return new Map();
-  const intents = await db.telegramDeliveryIntent.findMany({
-    where: { agencyId, kind: "REVISION_REQUEST", customSubmissionId: { in: ids } },
-    select: { id: true, customSubmissionId: true, state: true, remoteMessageId: true, remoteSentAt: true, createdAt: true },
-    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-    take: ids.length,
-  });
-  const map = new Map();
+  const revisionRows = (rows || []).filter((row) => String(row.reviewStatus || "") === REVIEW_REVISION);
+  if (!revisionRows.length) return new Map();
+  const ids = Array.from(new Set(revisionRows.map((row) => String(row.id)).filter(Boolean)));
+  const intents = ids.length && db.telegramDeliveryIntent?.findMany
+    ? await db.telegramDeliveryIntent.findMany({
+        where: { agencyId, kind: "REVISION_REQUEST", customSubmissionId: { in: ids } },
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      })
+    : [];
+  const intentBySubmission = new Map();
   for (const intent of intents || []) {
     const key = String(intent.customSubmissionId || "");
-    if (key && !map.has(key)) map.set(key, revisionDispatchProjection(intent));
+    if (key && !intentBySubmission.has(key)) intentBySubmission.set(key, intent);
   }
-  for (const row of rows || []) {
-    const key = String(row?.id || "");
-    if (!key || String(row?.reviewStatus || "") !== REVIEW_REVISION || map.has(key)) continue;
-    try {
-      await resolveRevisionProviderBinding({ agencyId, orderId: row.customOrderId, submission: row, db });
-      map.set(key, revisionDispatchProjection(null));
-    } catch (error) {
-      if (!revisionDispatchBlockedError(error)) throw error;
-      map.set(key, blockedRevisionDispatch(error));
-    }
+  const map = new Map();
+  for (const row of revisionRows) {
+    const key = String(row.id);
+    map.set(key, await deriveCustomRevisionDispatch({
+      agencyId, orderId: row.customOrderId, submission: row, intent: intentBySubmission.get(key) || null, db,
+    }));
   }
   return map;
 }
@@ -313,8 +309,16 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
       const stage = derivePipelineStage({ submission: row, order: row.customOrder, finalized, blockedCode: row.pipelineBlockedCode });
       const expectedStage = normalizedStatus === REVIEW_APPROVED ? "APPROVED_DELIVERY_READY" : normalizedStatus === REVIEW_REVISION ? "REVISION_WAITING" : "REVIEW_READY";
       if (stage !== expectedStage) continue;
-      const item = serializeReviewItem(row, assetByKey, revisionContext.get(scanCursor));
-      if (normalizedStatus === REVIEW_REVISION) item.revisionDispatch = revisionDispatchMap.get(scanCursor) || revisionDispatchProjection(null);
+      const rowRevisionContext = revisionContext.get(scanCursor);
+      // A revision decision is current only until the next response version is
+      // accepted for this Custom. Keep historical V1/V2 decisions in durable
+      // history, but never project an old confirmed instruction as WAITING_MODEL
+      // after a later submission has already become the current response.
+      if (normalizedStatus === REVIEW_REVISION
+          && rowRevisionContext?.latestSubmissionId
+          && String(rowRevisionContext.latestSubmissionId) !== scanCursor) continue;
+      const item = serializeReviewItem(row, assetByKey, rowRevisionContext);
+      if (normalizedStatus === REVIEW_REVISION) item.revisionDispatch = revisionDispatchMap.get(scanCursor) || await deriveCustomRevisionDispatch({ agencyId, orderId: row.customOrderId, submission: row, intent: null, db: client });
       items.push(item);
       if (items.length >= take) break;
     }
@@ -366,6 +370,12 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
     // later takes the Telegram-account row under the same transaction, so review
     // cannot deadlock creator/account retirement by taking CustomOrder first.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    // The queue is creator-scoped, but opaque submission ids are not access control.
+    // Re-read and lock the current AgencyMember before taking creator/order business
+    // locks so a concurrent scope/permission revoke cannot race the review commit.
+    const access = await assertCustomManagementCreatorAccess({
+      agencyId, actorMember: member, creatorId: target.creatorId, permissionKey: "content.review_customs", db: tx,
+    });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: target.creatorId });
     // Cancellation mutates this same CustomOrder row in its transaction. Taking
     // FOR UPDATE first creates one linear commit boundary:
@@ -383,6 +393,16 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
 
     const { row, assetByKey } = await loadReviewableSubmission({ agencyId, submissionId: normalizedSubmissionId, db: tx });
     const currentStatus = normalizeStatus(row.reviewStatus);
+    if (currentStatus === REVIEW_REVISION) {
+      const latest = await tx.customContentSubmission.findFirst({
+        where: { agencyId, customOrderId: row.customOrderId },
+        select: { id: true },
+        orderBy: [{ receivedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }],
+      });
+      if (latest && String(latest.id) !== String(row.id)) {
+        throw fail("CUSTOM_REVIEW_DECISION_SUPERSEDED", "A later model response has superseded this historical revision decision", 409);
+      }
+    }
 
     if (currentStatus === REVIEW_APPROVED) {
       if (normalizedAction === "APPROVE") {
@@ -395,7 +415,7 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
       if (normalizedAction === "REQUEST_REVISION" && (row.reviewComment || null) === normalizedComment) {
         const revisionContext = await loadRevisionContext(tx, agencyId, [row]);
         const context = revisionContext.get(String(row.id));
-        const dispatch = await planRevisionDispatchOrBlock({ agencyId, member, submission: row, order: row.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx });
+        const dispatch = await planRevisionDispatchOrBlock({ agencyId, member: access.member, submission: row, order: row.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx });
         return { idempotent: true, row, assetByKey, item: { ...serializeReviewItem(row, assetByKey, context), revisionDispatch: dispatch.projection } };
       }
       throw fail("CUSTOM_REVIEW_ALREADY_DECIDED", "This submission already has a review decision", 409);
@@ -420,7 +440,7 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
           customOrderId: row.customOrderId,
           updatedAt: row.updatedAt,
         },
-        data: { reviewStatus: nextStatus, reviewComment: nextStatus === REVIEW_REVISION ? normalizedComment : null, reviewedByMemberId: member.id, reviewedAt: new Date(now) },
+        data: { reviewStatus: nextStatus, reviewComment: nextStatus === REVIEW_REVISION ? normalizedComment : null, reviewedByMemberId: access.member.id, reviewedAt: new Date(now) },
       });
     } catch (error) {
       if (nextStatus === REVIEW_APPROVED && error?.code === "P2002") throw fail("CUSTOM_REVIEW_ALREADY_APPROVED", "Another submission is already approved for this custom order", 409);
@@ -432,7 +452,7 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
     const revisionContext = await loadRevisionContext(tx, agencyId, [updated]);
     const context = revisionContext.get(String(updated.id));
     const revisionDispatch = nextStatus === REVIEW_REVISION
-      ? await planRevisionDispatchOrBlock({ agencyId, member, submission: updated, order: updated.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx })
+      ? await planRevisionDispatchOrBlock({ agencyId, member: access.member, submission: updated, order: updated.customOrder, revisionNumber: context?.revisionNumber || null, now, db: tx })
       : null;
     return {
       idempotent: false,

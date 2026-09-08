@@ -8,6 +8,7 @@ const { resolveTelegramAccountId } = require("./custom-order-reminders");
 const { createCustomContentSubmissionFromInboundEvent, assignCustomContentSubmission } = require("./custom-content-submissions-service");
 const { providerMessageEventId, resolveTelegramCustomThread, targetAllowedByThreadContext } = require("./custom-telegram-thread-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
+const { lockCurrentAgencyMember } = require("./custom-management-access-authority-service");
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 4000) { const text = String(value == null ? "" : value).trim(); return text ? text.slice(0, max) : ""; }
@@ -483,11 +484,12 @@ async function resolveTelegramInboundReview({ agencyId, member, eventId: inputEv
   const commitHumanReviewState = async ({ data, action }) => {
     const previousReason = row.projectionReason || null;
     const commit = async (tx) => {
+      const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });
       const freshStart = await tx.telegramInboundEvent.findFirst({ where: { id: row.id, agencyId } });
       if (!freshStart) throw fail("TELEGRAM_INBOUND_REVIEW_NOT_FOUND", "Telegram inbound review event was not found", 404);
       if (freshStart.submissionId) return { linked: true, row: await convergeLinkedSubmissionState({ row: freshStart, now, db: tx }) };
       if (String(freshStart.projectionState) !== "REVIEW_REQUIRED") throw fail("TELEGRAM_INBOUND_REVIEW_RACE", "Telegram inbound review changed concurrently; refresh the queue", 409);
-      await authorizeTelegramInboundException({ agencyId, member, row: freshStart, write: true, db: tx });
+      await authorizeTelegramInboundException({ agencyId, member: currentMember, row: freshStart, write: true, db: tx });
       const revision = freshStart.updatedAt ? new Date(freshStart.updatedAt) : null;
       const where = { id: freshStart.id, agencyId, projectionState: "REVIEW_REQUIRED", submissionId: null, ...(revision && Number.isFinite(revision.getTime()) ? { updatedAt: revision } : {}) };
       const changed = await tx.telegramInboundEvent.updateMany({ where, data });
@@ -530,13 +532,14 @@ async function resolveTelegramInboundReview({ agencyId, member, eventId: inputEv
   const targetId = clean(customOrderId, 180);
   if (!targetId) throw fail("TELEGRAM_INBOUND_REVIEW_ORDER_REQUIRED", "customOrderId is required for ASSIGN_TO_CONTENT_ORDER");
   const assign = async (tx) => {
+    const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });
     const fresh = await tx.telegramInboundEvent.findFirst({ where: { id: eventId, agencyId } });
     if (!fresh || String(fresh.projectionState) !== "REVIEW_REQUIRED" || fresh.submissionId) throw fail("TELEGRAM_INBOUND_REVIEW_RACE", "Telegram inbound review changed concurrently; refresh the queue", 409);
-    const auth = await authorizeTelegramInboundException({ agencyId, member, row: fresh, write: true, db: tx });
+    const auth = await authorizeTelegramInboundException({ agencyId, member: currentMember, row: fresh, write: true, db: tx });
     const target = await tx.customOrder.findFirst({ where: { id: targetId, agencyId } });
     if (!target) throw fail("TELEGRAM_INBOUND_REVIEW_ORDER_NOT_FOUND", "Target CustomOrder was not found", 404);
     if (String(target.type || "") !== "CONTENT" || String(target.status || "") !== "PENDING") throw fail("TELEGRAM_INBOUND_REVIEW_ORDER_INVALID", "Target must be a pending CONTENT CustomOrder", 409);
-    await requireCreatorAccess({ agencyId, member, creatorId: target.creatorId, db: tx });
+    await requireCreatorAccess({ agencyId, member: currentMember, creatorId: target.creatorId, db: tx });
 
     const context = auth.context;
     const explicitUnprovenOverride = ["NO_ACTIVE_THREAD", "DIRECT_REPLY_UNRESOLVED"].includes(String(context.type || "")) && auth.scope?.broad;
@@ -558,7 +561,7 @@ async function resolveTelegramInboundReview({ agencyId, member, eventId: inputEv
     if (Number(prepared?.count || 0) !== 1) throw fail("TELEGRAM_INBOUND_REVIEW_RACE", "Telegram inbound review changed while preparing assignment", 409);
     const projected = await createCustomContentSubmissionFromInboundEvent({ eventId, actorUserId: member.userId || null, now, db: tx });
     if (!projected?.submission?.id) throw fail("TELEGRAM_INBOUND_REVIEW_SUBMISSION_REQUIRED", "The inbound event could not be materialized into a Custom submission", 409);
-    const assigned = await assignCustomContentSubmission({ agencyId, member, submissionId: projected.submission.id, customOrderId: targetId, now, db: tx });
+    const assigned = await assignCustomContentSubmission({ agencyId, member: currentMember, submissionId: projected.submission.id, customOrderId: targetId, now, db: tx });
     const finalSubmissionId = assigned?.submission?.id || projected.submission.id;
     const completed = await tx.telegramInboundEvent.updateMany({
       where: { id: eventId, agencyId, projectionState: "REVIEW_REQUIRED", submissionId: finalSubmissionId },

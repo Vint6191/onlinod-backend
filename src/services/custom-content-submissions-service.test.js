@@ -133,6 +133,13 @@ function fakeDb(seed = {}) {
       async findFirst({ where }) { return where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null; },
       async findUnique({ where }) { return where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null; },
     },
+    agencyMember: {
+      async findFirst({ where }) {
+        const current = seed.currentMember || member;
+        return current && String(current.id) === String(where.id) && String(current.userId) === String(where.userId) && String(current.agencyId) === String(where.agencyId)
+          ? clone(current) : null;
+      },
+    },
     creatorAccount: {
       async findFirst({ where }) {
         const row = creators.find((candidate) => candidate.agencyId === where.agencyId && candidate.id === where.id && !candidate.deletedAt);
@@ -1649,7 +1656,7 @@ test("automatic inbound exception cannot be adjudicated through the separate man
 
 test("the same provider message manually claimed for creator A cannot acquire a second owner through creator B", async () => {
   const broad = { ...member, role: "OWNER", roleKey: "owner", assignedCreators: "all" };
-  const db = withTransactionalRollback(fakeDb());
+  const db = withTransactionalRollback(fakeDb({ currentMember: broad }));
   const source = { telegramMessageIds: [902], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" };
   const first = await createCustomContentSubmission({ agencyId: "agency-1", member: broad, db, input: { creatorId: "creator-1", customOrderId: "custom-1", ...source } });
   await assert.rejects(
@@ -2000,4 +2007,41 @@ test("submission reassignment A→B reprojects both model obligations from canon
   assert.ok(a.nextReminderAt instanceof Date, "A lost the response and must restore its current TASK obligation schedule");
   assert.equal(a.nextReminderAt.toISOString(),"2026-08-21T11:00:00.000Z", "overdue restored obligation is due now from the original TASK receipt");
   assert.equal(b.nextReminderAt,null,"B gained the response and must clear its old reminder schedule");
+});
+
+test("commit-time Custom assignment rejects a stale management actor after accessEpoch changes", async () => {
+  const currentMember = { ...member, accessEpoch: 2, assignedCreators: [] };
+  const db = withTransactionalRollback(fakeDb({
+    currentMember,
+    submissions: [baseSubmission({ id: "stale-assignment", customOrderId: null })],
+  }));
+  await assert.rejects(
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "stale-assignment", customOrderId: "custom-1", db }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(db._submissions[0].customOrderId, null, "stale assignment must not mutate the canonical submission");
+  assert.equal(db._orders.find((row) => row.id === "custom-1").contentBoundAt, null, "stale assignment must not bind the target Custom");
+});
+
+test("commit-time manual historical import rejects a stale management actor before business state is created", async () => {
+  const currentMember = { ...member, accessEpoch: 2, assignedCreators: [] };
+  const db = withTransactionalRollback(fakeDb({ currentMember }));
+  await assert.rejects(
+    () => createCustomContentSubmission({
+      agencyId: "agency-1",
+      member,
+      db,
+      input: {
+        creatorId: "creator-1",
+        customOrderId: "custom-1",
+        telegramMessageIds: [1601],
+        telegramAccountId: "tg-1",
+        telegramUserId: "987654321012345678",
+        manualImportReason: "operator recovery",
+      },
+    }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(db._submissions.length, 0, "stale historical import must not create a submission");
+  assert.equal(db._orders.find((row) => row.id === "custom-1").contentBoundAt, null, "stale historical import must not bind the Custom");
 });

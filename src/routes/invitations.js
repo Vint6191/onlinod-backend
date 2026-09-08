@@ -9,6 +9,7 @@ const { audit } = require("../services/audit-service");
 const {
   cleanFunctions,
   ensureRoleExists,
+  lockTeamRoleLifecycle,
   roleKeyToLegacy,
 } = require("../services/team-administration-service");
 const { validateAssignedCreators } = require("../services/team-access-control");
@@ -95,6 +96,11 @@ router.post("/claim", authRequired, async (req, res) => {
 
       let roleKey;
       try {
+        // Claim is itself a role assignment. Hold the same shared lifecycle
+        // capability used by Team Administration until member + invite claim
+        // commit, so custom-role deletion cannot race an invitation that was
+        // validated just before expiry. Preset roles intentionally no-op here.
+        await lockTeamRoleLifecycle({ tx, agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, mode: "share" });
         roleKey = await ensureRoleExists({ agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, db: tx });
       } catch (_) {
         const error = new Error("Invitation role is no longer available");

@@ -8,6 +8,7 @@ const { paymentSnapshot } = require("./custom-orders-service");
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { FAILURE_CATEGORIES } = require("./automation-failure-taxonomy");
 const { isProviderStatusProvenNoEffect, isProviderStatusProvenSuccess } = require("./provider-http-outcome-proof");
+const { createCustomDeliveryReceipt } = require("./custom-delivery-receipt-authority-service");
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
@@ -150,7 +151,35 @@ async function writeAudit(client, input) {
   try { await audit({ ...input, db: client }); } catch (_) { /* delivery state must not roll back on audit transport/schema drift */ }
 }
 
-async function recordCustomDeliverySend({
+async function loadExistingDeliveryReceipt(client, { agencyId, creatorId, messageId }) {
+  if (!client?.customDeliveryReceipt?.findFirst) return null;
+  return client.customDeliveryReceipt.findFirst({
+    where: { agencyId: String(agencyId), creatorId: String(creatorId), messageId: String(messageId) },
+  });
+}
+
+function idempotentDeliveryProjection({ receipt, order, submission, messageId, deliveredMediaIds, fallbackExpectedPriceCents, fallbackActualPriceCents, fallbackPaymentStatus }) {
+  const hasReceipt = Boolean(receipt?.id);
+  const complete = hasReceipt ? receipt.complete === true : Boolean(order?.fanDeliveredAt);
+  return {
+    ok: true, matched: true, idempotent: true, customOrderId: String(order.id), submissionId: String(submission.id),
+    messageId: String(messageId),
+    ...(hasReceipt ? { receiptId: String(receipt.id) } : {}),
+    deliveredMediaIds: hasReceipt && uniqueIds(receipt.deliveredMediaIdsAfter).length
+      ? uniqueIds(receipt.deliveredMediaIdsAfter)
+      : uniqueIds(deliveredMediaIds),
+    newlyDeliveredMediaIds: hasReceipt ? uniqueIds(receipt.newlyDeliveredMediaIds) : [],
+    duplicateMediaIds: hasReceipt ? uniqueIds(receipt.duplicateMediaIds) : [],
+    complete,
+    fanDeliveredAt: complete && order?.fanDeliveredAt ? new Date(order.fanDeliveredAt).toISOString() : null,
+    expectedPriceCents: hasReceipt ? nonNegativeInt(receipt.expectedPriceCents, 0) : fallbackExpectedPriceCents,
+    actualPriceCents: hasReceipt ? nonNegativeInt(receipt.actualPriceCents, 0) : fallbackActualPriceCents,
+    paymentStatus: hasReceipt ? (clean(receipt.paymentStatus, 80) || fallbackPaymentStatus) : fallbackPaymentStatus,
+    ...(hasReceipt && receipt.paymentMismatch ? { paymentMismatch: clean(receipt.paymentMismatch, 80) } : {}),
+  };
+}
+
+async function recordCustomDeliverySendInClient({
   agencyId,
   member = null,
   actorMemberId = null,
@@ -212,12 +241,14 @@ async function recordCustomDeliverySend({
   const newMediaIds = matchedMediaIds.filter((id) => !existingDeliveredIds.includes(id));
 
   if (alreadyRecorded) {
-    return {
-      ok: true, matched: true, idempotent: true, customOrderId: String(order.id), submissionId: String(submission.id),
-      messageId: message, deliveredMediaIds: existingDeliveredIds, newlyDeliveredMediaIds: [], duplicateMediaIds: [],
-      complete: allDelivered(approvedMediaIds, existingDeliveredIds), fanDeliveredAt: order.fanDeliveredAt ? new Date(order.fanDeliveredAt).toISOString() : null,
-      expectedPriceCents, actualPriceCents, paymentStatus: payment.paymentStatus,
-    };
+    // New-format deliveries have a typed receipt with the original send-time facts.
+    // Replays must not silently recompute price/duplicate/completion semantics from a
+    // later aggregate state (for example after a second partial send completed the order).
+    const receipt = await loadExistingDeliveryReceipt(client, { agencyId, creatorId: creator, messageId: message });
+    return idempotentDeliveryProjection({
+      receipt, order, submission, messageId: message, deliveredMediaIds: existingDeliveredIds,
+      fallbackExpectedPriceCents: expectedPriceCents, fallbackActualPriceCents: actualPriceCents, fallbackPaymentStatus: payment.paymentStatus,
+    });
   }
 
   const nextDeliveredIds = uniqueIds([...existingDeliveredIds, ...newMediaIds]);
@@ -243,53 +274,81 @@ async function recordCustomDeliverySend({
     // won the race, treat it as an idempotent success rather than duplicating it.
     const fresh = await client.customOrder.findFirst({ where: { id: order.id, agencyId } });
     if (fresh && uniqueIds(fresh.deliveryMessageIds).includes(message)) {
-      return {
-        ok: true, matched: true, idempotent: true, customOrderId: String(order.id), submissionId: String(submission.id), messageId: message,
-        deliveredMediaIds: uniqueIds(fresh.deliverySentMediaIds), newlyDeliveredMediaIds: [], duplicateMediaIds: [],
-        complete: Boolean(fresh.fanDeliveredAt), fanDeliveredAt: fresh.fanDeliveredAt ? new Date(fresh.fanDeliveredAt).toISOString() : null,
-        expectedPriceCents, actualPriceCents, paymentStatus: payment.paymentStatus,
-      };
+      const receipt = await loadExistingDeliveryReceipt(client, { agencyId, creatorId: creator, messageId: message });
+      return idempotentDeliveryProjection({
+        receipt, order: fresh, submission, messageId: message, deliveredMediaIds: fresh.deliverySentMediaIds,
+        fallbackExpectedPriceCents: expectedPriceCents, fallbackActualPriceCents: actualPriceCents, fallbackPaymentStatus: payment.paymentStatus,
+      });
     }
     throw fail("CUSTOM_DELIVERY_CONFLICT", "Custom delivery changed concurrently; retry", 409);
   }
 
   const memberId = member?.id || clean(actorMemberId, 180) || null;
   const userId = await actorUserId(client, memberId, member?.userId || explicitActorUserId || null);
+  const paymentMismatch = actualPriceCents === expectedPriceCents ? null : actualPriceCents > expectedPriceCents ? "OVERCHARGE" : "UNDERCHARGE";
+  const priceMismatchOverrideConfirmed = guardMatchesOrder ? guard?.priceMismatchOverride === true : Boolean(effectiveOverrideReason);
+  const totalPriceCents = Math.max(0, Number(order.priceCents || 0));
+  const receiptResult = await createCustomDeliveryReceipt({ db: client, input: {
+    agencyId, creatorId: creator, customOrderId: String(order.id), submissionId: String(submission.id),
+    writeId: guardMatchesOrder ? clean(guard?.writeId, 180) || null : null,
+    writeCommitRevision: guardMatchesOrder ? Number(guard?.writeCommitRevision || 0) || null : null,
+    idempotencyKey: guardMatchesOrder ? clean(guard?.idempotencyKey, 500) || null : null,
+    dialogId: dialog, messageId: message, actorMemberId: memberId, actorUserId: userId,
+    sentMediaIds, approvedMediaIds, matchedMediaIds, newlyDeliveredMediaIds: newMediaIds, deliveredMediaIdsAfter: nextDeliveredIds, duplicateMediaIds,
+    expectedPriceCents, actualPriceCents, totalPriceCents, paidAmountCents: payment.paidAmountCents,
+    remainingAmountCents: payment.remainingAmountCents, previousDeliveryOfferedCents: previousOffered, deliveryOfferedCents: nextOffered,
+    paymentStatus: payment.paymentStatus, paymentMismatch, overrideReason: effectiveOverrideReason,
+    duplicateOverrideConfirmed: effectiveDuplicateOverride, priceMismatchOverrideConfirmed, complete, occurredAt: sentAt,
+  } });
   const commonMetadata = {
-    creatorId: creator, dialogId: dialog, submissionId: String(submission.id), messageId: message,
+    creatorId: creator, dialogId: dialog, submissionId: String(submission.id), messageId: message, receiptId: String(receiptResult.receipt.id),
     approvedMediaCount: approvedMediaIds.length, matchedMediaIds, newlyDeliveredMediaIds: newMediaIds,
     duplicateMediaIds, expectedPriceCents, actualPriceCents,
-    totalPriceCents: Math.max(0, Number(order.priceCents || 0)), paidAmountCents: payment.paidAmountCents,
-    remainingAmountCents: payment.remainingAmountCents, previousDeliveryOfferedCents: previousOffered,
-    deliveryOfferedCents: nextOffered, complete,
+    totalPriceCents, paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents,
+    previousDeliveryOfferedCents: previousOffered, deliveryOfferedCents: nextOffered, complete,
   };
-  await writeAudit(client, { agencyId, actorUserId: userId, action: "custom_order.fan_delivery_send", targetType: "CustomOrder", targetId: order.id, metadata: commonMetadata });
-
-  if (duplicateMediaIds.length) {
-    await writeAudit(client, {
-      agencyId, actorUserId: userId, action: "CUSTOM_DELIVERY_DUPLICATE_ATTEMPT", targetType: "CustomOrder", targetId: order.id,
-      metadata: { ...commonMetadata, overrideConfirmed: effectiveDuplicateOverride },
-    });
-  }
-  if (actualPriceCents > expectedPriceCents) {
-    await writeAudit(client, {
-      agencyId, actorUserId: userId, action: "CUSTOM_PAYMENT_OVERRIDE", targetType: "CustomOrder", targetId: order.id,
-      metadata: { ...commonMetadata, reason: effectiveOverrideReason },
-    });
-  } else if (actualPriceCents < expectedPriceCents) {
-    await writeAudit(client, {
-      agencyId, actorUserId: userId, action: "CUSTOM_PAYMENT_UNDERCHARGE", targetType: "CustomOrder", targetId: order.id,
-      metadata: { ...commonMetadata, shortfallCents: expectedPriceCents - actualPriceCents },
-    });
-  }
+  const auditEvents = [
+    { agencyId, actorUserId: userId, action: "custom_order.fan_delivery_send", targetType: "CustomOrder", targetId: order.id, metadata: commonMetadata },
+  ];
+  if (duplicateMediaIds.length) auditEvents.push({
+    agencyId, actorUserId: userId, action: "CUSTOM_DELIVERY_DUPLICATE_ATTEMPT", targetType: "CustomOrder", targetId: order.id,
+    metadata: { ...commonMetadata, overrideConfirmed: effectiveDuplicateOverride },
+  });
+  if (actualPriceCents > expectedPriceCents) auditEvents.push({
+    agencyId, actorUserId: userId, action: "CUSTOM_PAYMENT_OVERRIDE", targetType: "CustomOrder", targetId: order.id,
+    metadata: { ...commonMetadata, reason: effectiveOverrideReason },
+  });
+  else if (actualPriceCents < expectedPriceCents) auditEvents.push({
+    agencyId, actorUserId: userId, action: "CUSTOM_PAYMENT_UNDERCHARGE", targetType: "CustomOrder", targetId: order.id,
+    metadata: { ...commonMetadata, shortfallCents: expectedPriceCents - actualPriceCents },
+  });
 
   return {
     ok: true, matched: true, idempotent: false, customOrderId: String(order.id), submissionId: String(submission.id), messageId: message,
-    deliveredMediaIds: nextDeliveredIds, newlyDeliveredMediaIds: newMediaIds, duplicateMediaIds,
+    receiptId: String(receiptResult.receipt.id), deliveredMediaIds: nextDeliveredIds, newlyDeliveredMediaIds: newMediaIds, duplicateMediaIds,
     complete, fanDeliveredAt: effectiveFanDeliveredAt ? effectiveFanDeliveredAt.toISOString() : null,
-    expectedPriceCents, actualPriceCents, paymentStatus: payment.paymentStatus,
-    paymentMismatch: actualPriceCents === expectedPriceCents ? null : actualPriceCents > expectedPriceCents ? "OVERCHARGE" : "UNDERCHARGE",
+    expectedPriceCents, actualPriceCents, paymentStatus: payment.paymentStatus, paymentMismatch, _auditEvents: auditEvents,
   };
+}
+
+function publicProjection(result) {
+  if (!result || typeof result !== "object") return result;
+  const { _auditEvents, ...publicResult } = result;
+  return publicResult;
+}
+
+async function emitDeliveryAudits(client, result) {
+  for (const event of Array.isArray(result?._auditEvents) ? result._auditEvents : []) await writeAudit(client, event);
+}
+
+async function recordCustomDeliverySend(input = {}) {
+  const client = input.db || require("../prisma");
+  const run = (tx) => recordCustomDeliverySendInClient({ ...input, db: tx });
+  let result;
+  if (typeof client.$transaction === "function") result = await client.$transaction(run, { timeout: 30_000 });
+  else result = await run(client);
+  if (input.suppressAudit !== true) await emitDeliveryAudits(client, result);
+  return publicProjection(result);
 }
 
 
@@ -441,7 +500,7 @@ async function settleCustomManualDeliveryWithCapability(input, { db = null } = {
       duplicateOverride: payload.duplicateOverride === true, priceMismatchOverride: payload.priceMismatchOverride === true,
       authorityVersion: "CUSTOM_MANUAL_V2", writeId, idempotencyKey: String(delivery.idempotencyKey || ""), writeCommitRevision: revision,
     };
-    const projection = await recordCustomDeliverySend({
+    const projection = await recordCustomDeliverySendInClient({
       agencyId: delivery.agencyId, actorMemberId: delivery.leaseMemberId || clean(payload.actorMemberId, 180) || null,
       actorUserId: delivery.createdByUserId || clean(payload.actorUserId, 180) || null,
       customOrderId: clean(payload.customOrderId, 180), creatorId: delivery.creatorId, dialogId: clean(payload.dialogId || delivery.dialogId, 180),
@@ -461,8 +520,15 @@ async function settleCustomManualDeliveryWithCapability(input, { db = null } = {
     if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_DELIVERY_WRITE_SETTLE_RACE", "Physical Custom delivery authority changed while exact proof was settling", 409);
     return { ok: true, provenSuccess: true, writeId, messageId, projection };
   };
-  if (client.$transaction && !db) return client.$transaction(settle, { timeout: 30_000 });
-  return settle(client);
+  if (typeof client.$transaction === "function") {
+    const result = await client.$transaction(settle, { timeout: 30_000 });
+    if (result?.projection) await emitDeliveryAudits(client, result.projection);
+    if (result?.projection) result.projection = publicProjection(result.projection);
+    return result;
+  }
+  const result = await settle(client);
+  if (result?.projection) result.projection = publicProjection(result.projection);
+  return result;
 }
 
 async function projectCustomDeliveryFromTeamEvent(row, { db = null } = {}) {

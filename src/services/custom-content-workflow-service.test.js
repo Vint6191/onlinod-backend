@@ -39,7 +39,7 @@ function order(id, overrides = {}) {
     ...overrides,
   };
 }
-function fakeDb({ submissions = [], orders = [], assets = [], writes = [], telegramIntents = [], creatorRecord = creator } = {}) {
+function fakeDb({ submissions = [], orders = [], assets = [], writes = [], telegramIntents = [], creatorRecord = creator, currentMember = manager } = {}) {
   const orderForSubmission = (row) => row.customOrder || orders.find((item) => item.id === row.customOrderId) || null;
   const matchesSubmissionWhere = (row, where = {}) => {
     if (where.agencyId && row.agencyId !== where.agencyId) return false;
@@ -92,9 +92,18 @@ function fakeDb({ submissions = [], orders = [], assets = [], writes = [], teleg
       findFirst: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null,
       findUnique: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null,
     },
+    agencyMember: {
+      findFirst: async ({ where }) => String(where.id) === String(currentMember.id) && String(where.userId) === String(currentMember.userId) && String(where.agencyId) === String(currentMember.agencyId) ? structuredClone(currentMember) : null,
+    },
     creatorAccount: {
       findFirst: async ({ where }) => where.id === creatorRecord.id && where.agencyId === creatorRecord.agencyId ? creatorRecord : null,
       findMany: async () => [creatorRecord],
+    },
+    agencyTelegramMtprotoAccount: {
+      // Production revision-dispatch authority always validates provider-account usability.
+      // Workflow fixtures without Telegram accounts therefore model the real BLOCKED state
+      // instead of omitting provider storage entirely.
+      findFirst: async () => null,
     },
     customContentSubmission: {
       findMany: async ({ where, take = 9999, cursor = null, skip = 0, orderBy = [] }) => {
@@ -725,7 +734,7 @@ test("awaiting revision queue only keeps the latest rejected version per custom"
   assert.equal(result.items[0].revisionNumber, 1);
   assert.equal(result.items[0].nextRevisionNumber, 2);
   assert.equal(result.items[0].revisionComment, "Redo ending");
-  assert.equal(result.items[0].revisionDispatch.status, "DISPATCH_REQUIRED");
+  assert.equal(result.items[0].revisionDispatch.status, "DISPATCH_BLOCKED");
 });
 
 test("awaiting revision queue derives operational dispatch state from the one durable revision intent", async () => {
@@ -792,4 +801,24 @@ test("awaiting revision queue exposes lossless cursor continuation beyond the fi
   const all = [...first.items, ...second.items, ...third.items].map((item) => item.submissionId);
   assert.equal(new Set(all).size, 120);
   assert.equal(all[119], "revision-page-119");
+});
+
+test("commit-time Pipeline Resolution rejects a stale management actor and preserves ACTIVE state", async () => {
+  const actor = { ...manager, accessEpoch: 1 };
+  const currentMember = { ...manager, accessEpoch: 2, assignedCreators: [] };
+  const row = submission({ id: "stale-resolution", customOrderId: null, ofMediaIds: [], pipelineDisposition: "ACTIVE" });
+  const db = fakeDb({ submissions: [row], currentMember });
+  await assert.rejects(
+    () => resolveUnassignedCustomContentSubmission({
+      agencyId: "agency-1",
+      member: actor,
+      submissionId: row.id,
+      disposition: "ABANDONED",
+      reason: "explicit operator resolution",
+      db,
+    }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(row.pipelineDisposition, "ACTIVE", "stale management work must not terminalize the submission");
+  assert.equal(row.pipelineDispositionReason ?? null, null);
 });

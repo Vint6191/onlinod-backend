@@ -1,6 +1,6 @@
 "use strict";
 
-const { resolveRevisionProviderBinding } = require("./custom-revision-provider-binding-authority-service");
+const { deriveCustomRevisionDispatch } = require("./custom-revision-dispatch-authority-service");
 
 function clean(value, max = 500) {
   const text = String(value == null ? "" : value).trim();
@@ -102,24 +102,21 @@ async function deriveCustomModelObligation({ agencyId, orderId = null, order = n
     const reviewStatus = String(submission.reviewStatus || "WAITING_REVIEW").toUpperCase();
     if (reviewStatus === "REVISION_REQUESTED") {
       const revision = await latestIntent({ agencyId, orderId: row.id, kind: "REVISION_REQUEST", customSubmissionId: submission.id, db });
+      const dispatch = await deriveCustomRevisionDispatch({ agencyId, orderId: row.id, submission, intent: revision, db });
       const instruction = confirmedInstruction(revision);
-      if (instruction) {
+      if (dispatch.status === "WAITING_MODEL" && instruction) {
         return stateResult({ state: "REVISION_WAITING_RESPONSE", order: row, submission, intent: revision, instruction, obligation: true, reason: "REVISION_PROVIDER_CONFIRMED" });
       }
-      if (String(revision?.state || "") === "RECONCILE_REQUIRED") {
+      if (dispatch.status === "DELIVERY_UNKNOWN") {
         return stateResult({ state: "REVISION_DELIVERY_UNKNOWN", order: row, submission, intent: revision, reason: "REVISION_OUTCOME_UNKNOWN" });
       }
-      if (!revision) {
-        try {
-          await resolveRevisionProviderBinding({ agencyId, orderId: row.id, submission, db });
-        } catch (error) {
-          if (String(error?.code || "") === "CUSTOM_REVISION_DISPATCH_BLOCKED") {
-            return stateResult({ state: "REVISION_DISPATCH_BLOCKED", order: row, submission, reason: String(error.blockedCode || error.code) });
-          }
-          throw error;
-        }
+      if (dispatch.status === "DISPATCH_BLOCKED") {
+        return stateResult({ state: "REVISION_DISPATCH_BLOCKED", order: row, submission, intent: revision, reason: String(dispatch.blockedCode || "PROVIDER_THREAD_UNAVAILABLE") });
       }
-      return stateResult({ state: "REVISION_DISPATCH_PENDING", order: row, submission, intent: revision, reason: revision ? `REVISION_${String(revision.state || "PLANNED")}` : "REVISION_INTENT_MISSING" });
+      if (dispatch.status === "DISPATCH_CANCELLED") {
+        return stateResult({ state: "REVISION_DISPATCH_CANCELLED", order: row, submission, intent: revision, reason: "REVISION_DISPATCH_CANCELLED" });
+      }
+      return stateResult({ state: "REVISION_DISPATCH_PENDING", order: row, submission, intent: revision, reason: dispatch.status });
     }
     if (reviewStatus === "APPROVED") {
       return stateResult({ state: "NO_MODEL_OBLIGATION", order: row, submission, reason: "APPROVED_RESPONSE" });

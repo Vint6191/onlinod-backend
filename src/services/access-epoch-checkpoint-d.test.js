@@ -27,7 +27,7 @@ test("D creator-set changes bump access epoch transactionally", () => {
 });
 
 test("D member role, permission, assignment and lifecycle changes increment accessEpoch", () => {
-  assert.match(admin, /role: input\.role, accessEpoch: \{ increment: 1 \}/);
+  assert.match(admin, /role: input\.role,[\s\S]*roleKey: canonicalMemberRoleKeyFromLegacy\(input\.role\),[\s\S]*accessEpoch: \{ increment: 1 \}/);
   assert.match(admin, /permissions: input\.permissions, accessEpoch: \{ increment: 1 \}/);
   assert.match(team, /patch\.roleKey !== undefined \|\| creatorScope[\s\S]*accessEpoch: \{ increment: 1 \}/);
   assert.match(team, /deactivatedAt, accessEpoch: \{ increment: 1 \}/);

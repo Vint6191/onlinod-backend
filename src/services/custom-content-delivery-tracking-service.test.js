@@ -16,6 +16,7 @@ function fixture() {
     ofMediaIds: ["9001", "9002"], reviewStatus: "APPROVED", reviewedAt: new Date("2026-08-22T09:00:00.000Z"), customOrder: order,
   };
   const audits = [];
+  const receipts = [];
   const db = {
     creatorMediaAsset: {
       findMany: async ({ where }) => (where.mediaId?.in || []).filter((id) => submission.ofMediaIds.includes(String(id))).map((mediaId) => ({ mediaId: String(mediaId), customOrderId: "custom-1" })),
@@ -32,10 +33,20 @@ function fixture() {
       findFirst: async ({ where }) => where.id === order.id ? order : null,
     },
     agencyMember: { findFirst: async () => ({ userId: "user-1" }) },
+    customDeliveryReceipt: {
+      findFirst: async ({ where }) => {
+        const options = Array.isArray(where?.OR) ? where.OR : [where || {}];
+        return receipts.find((row) => options.some((option) => (
+          (option.messageId && row.agencyId === option.agencyId && row.creatorId === option.creatorId && row.messageId === option.messageId)
+          || (option.writeId && row.writeId === option.writeId && Number(row.writeCommitRevision) === Number(option.writeCommitRevision))
+        ))) || null;
+      },
+      create: async ({ data }) => { const row = { id: `receipt-${receipts.length + 1}`, ...structuredClone(data) }; receipts.push(row); return row; },
+    },
     auditLog: { create: async ({ data }) => { audits.push(data); return { id: `audit-${audits.length}`, ...data }; } },
     $executeRawUnsafe: async () => 1,
   };
-  return { order, submission, db, audits };
+  return { order, submission, db, audits, receipts };
 }
 
 function installManualWrite(db, overrides = {}) {
@@ -105,6 +116,84 @@ test("message replay is idempotent and does not double-count offered price", asy
   assert.equal(replay.idempotent, true);
   assert.equal(order.deliveryOfferedCents, 2000);
   assert.deepEqual(order.deliveryMessageIds, ["m-1"]);
+});
+
+test("idempotent replay projects original typed receipt facts instead of recomputing from a later aggregate", async () => {
+  const { order, db } = fixture();
+  const first = await recordCustomDeliverySend({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "777", messageId: "m-stable-1", mediaIds: ["9001"], priceCents: 1500, occurredAt: "2026-08-22T10:10:00Z", enforceAccess: false, db });
+  assert.equal(first.complete, false);
+  assert.equal(first.expectedPriceCents, 2000);
+  assert.equal(first.actualPriceCents, 1500);
+  await recordCustomDeliverySend({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "777", messageId: "m-stable-2", mediaIds: ["9002"], priceCents: 500, occurredAt: "2026-08-22T10:12:00Z", enforceAccess: false, db });
+  assert.equal(order.status, "COMPLETED");
+
+  const replay = await recordCustomDeliverySend({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "777", messageId: "m-stable-1", mediaIds: ["9001"], priceCents: 9999, occurredAt: "2026-08-22T10:30:00Z", enforceAccess: false, db });
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.receiptId, "receipt-1");
+  assert.equal(replay.expectedPriceCents, 2000);
+  assert.equal(replay.actualPriceCents, 1500);
+  assert.equal(replay.paymentMismatch, "UNDERCHARGE");
+  assert.deepEqual(replay.newlyDeliveredMediaIds, ["9001"]);
+  assert.deepEqual(replay.deliveredMediaIds, ["9001"], "replay must return the exact aggregate media snapshot after the original provider message");
+  assert.deepEqual(replay.duplicateMediaIds, []);
+  assert.equal(replay.complete, false, "later aggregate completion must not rewrite the original send receipt");
+  assert.equal(replay.fanDeliveredAt, null);
+});
+
+test("typed delivery receipt is durable business history even when best-effort AuditLog fails", async () => {
+  const { order, db, receipts } = fixture();
+  db.auditLog.create = async () => { throw new Error("audit table unavailable"); };
+  const result = await recordCustomDeliverySend({
+    agencyId: "agency-1", actorMemberId: "member-1", creatorId: "creator-1", dialogId: "777",
+    messageId: "m-receipt", mediaIds: ["9001"], priceCents: 1500, occurredAt: "2026-08-22T10:10:00Z", enforceAccess: false, db,
+  });
+  assert.equal(result.matched, true);
+  assert.equal(order.deliveryOfferedCents, 1500);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].messageId, "m-receipt");
+  assert.deepEqual(receipts[0].newlyDeliveredMediaIds, ["9001"]);
+  assert.deepEqual(receipts[0].deliveredMediaIdsAfter, ["9001"]);
+  assert.equal(receipts[0].expectedPriceCents, 2000);
+  assert.equal(receipts[0].actualPriceCents, 1500);
+  assert.equal(receipts[0].paymentMismatch, "UNDERCHARGE");
+});
+
+test("receipt failure rolls back the Custom aggregate when a real transaction boundary is available", async () => {
+  const { order, db, receipts } = fixture();
+  const before = structuredClone(order);
+  const originalReceiptCreate = db.customDeliveryReceipt.create;
+  db.customDeliveryReceipt.create = async () => { throw Object.assign(new Error("receipt storage down"), { code: "P5000" }); };
+  db.$transaction = async (fn) => {
+    const orderSnapshot = structuredClone(order);
+    const receiptSnapshot = structuredClone(receipts);
+    const tx = { ...db };
+    delete tx.$transaction;
+    try { return await fn(tx); }
+    catch (error) {
+      for (const key of Object.keys(order)) delete order[key];
+      Object.assign(order, orderSnapshot);
+      receipts.splice(0, receipts.length, ...receiptSnapshot);
+      throw error;
+    }
+  };
+  await assert.rejects(() => recordCustomDeliverySend({
+    agencyId: "agency-1", creatorId: "creator-1", dialogId: "777", messageId: "m-rollback",
+    mediaIds: ["9001"], priceCents: 2000, occurredAt: "2026-08-22T10:10:00Z", enforceAccess: false, db,
+  }), /receipt storage down/);
+  assert.deepEqual(order.deliverySentMediaIds, before.deliverySentMediaIds);
+  assert.deepEqual(order.deliveryMessageIds, before.deliveryMessageIds);
+  assert.equal(order.deliveryOfferedCents, before.deliveryOfferedCents);
+  assert.equal(order.fanDeliveredAt, before.fanDeliveredAt);
+  assert.equal(receipts.length, 0);
+  db.customDeliveryReceipt.create = originalReceiptCreate;
+});
+
+test("provider replay creates exactly one typed receipt", async () => {
+  const { db, receipts } = fixture();
+  const input = { agencyId: "agency-1", creatorId: "creator-1", dialogId: "777", messageId: "m-one-receipt", mediaIds: ["9001"], priceCents: 2000, occurredAt: "2026-08-22T10:10:00Z", enforceAccess: false, db };
+  await recordCustomDeliverySend(input);
+  await recordCustomDeliverySend({ ...input, occurredAt: "2026-08-22T10:11:00Z" });
+  assert.equal(receipts.length, 1);
 });
 
 test("overcharge and duplicate sends emit management audit signals only after a real confirmed outgoing", async () => {
@@ -219,7 +308,16 @@ test("unconfirmed or non-manual events cannot establish the Custom fan-delivery 
 
 test("CUSTOM_MANUAL_V2 capability settles exact success without current membership/auth", async () => {
   const crypto = require("node:crypto");
-  const { order, db } = fixture();
+  const { order, db, receipts } = fixture();
+  let transactionActive = false;
+  let auditInsideTransaction = false;
+  const originalAuditCreate = db.auditLog.create;
+  db.auditLog.create = async (input) => { if (transactionActive) auditInsideTransaction = true; return originalAuditCreate(input); };
+  db.$transaction = async (fn) => {
+    transactionActive = true;
+    const tx = { ...db }; delete tx.$transaction;
+    try { return await fn(tx); } finally { transactionActive = false; }
+  };
   const token = "custom-v2-success-token";
   const getWrite = installManualWrite(db, {
     sourceDeviceId: "device-a", leaseMemberId: "member-old", createdByUserId: "user-old",
@@ -236,6 +334,10 @@ test("CUSTOM_MANUAL_V2 capability settles exact success without current membersh
   assert.equal(getWrite().status, "COMPLETED");
   assert.equal(getWrite().messageId, "m-v2-success");
   assert.deepEqual(order.deliverySentMediaIds, ["9001"]);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].writeId, "write-manual-1");
+  assert.equal(receipts[0].writeCommitRevision, 1);
+  assert.equal(auditInsideTransaction, false, "best-effort AuditLog must run only after the V2 business transaction commits");
 });
 
 test("CUSTOM_MANUAL_V2 exact provider rejection returns the same logical phase to retryable precommit", async () => {
@@ -334,6 +436,22 @@ test("V20.7 schema/migration separates Telegram task deliveredAt from durable fa
   assert.doesNotMatch(migration, /DROP COLUMN "deliveredAt"|RENAME COLUMN "deliveredAt"/);
 });
 
+
+test("Custom delivery receipt schema is a typed durable business-history authority", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const root = path.resolve(__dirname, "..", "..");
+  const schema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
+  const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260908013000_custom_delivery_business_receipts", "migration.sql"), "utf8");
+  const replaySnapshotMigration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260908043000_custom_delivery_receipt_replay_snapshot", "migration.sql"), "utf8");
+  assert.match(schema, /model CustomDeliveryReceipt[\s\S]*deliveredMediaIdsAfter\s+String\[\][\s\S]*duplicateMediaIds\s+String\[\][\s\S]*expectedPriceCents\s+Int[\s\S]*actualPriceCents\s+Int/);
+  assert.match(schema, /@@unique\(\[agencyId, creatorId, messageId\]/);
+  assert.match(schema, /@@unique\(\[writeId, writeCommitRevision\]/);
+  assert.match(migration, /CREATE TABLE "CustomDeliveryReceipt"/);
+  assert.match(migration, /CustomDeliveryReceipt_provider_message_key/);
+  assert.match(replaySnapshotMigration, /ADD COLUMN "deliveredMediaIdsAfter" TEXT\[\]/);
+  assert.doesNotMatch(migration, /INSERT INTO "CustomDeliveryReceipt"[\s\S]*AuditLog/i, "migration must not synthesize incomplete receipts from best-effort audit history");
+});
 
 test("durable MESSAGE_SEND_CONFIRMED carries request-bound Custom override audit metadata without choosing delivery authority", async () => {
   const { order, db, audits } = fixture();

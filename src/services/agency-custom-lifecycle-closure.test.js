@@ -57,6 +57,25 @@ test("every production NEW Custom/provider work origin takes the Agency lifecycl
 });
 
 
+
+
+test("product creator removal joins the Agency lifecycle fence before Creator/member scope mutation", () => {
+  const creators = source("routes/creators.js");
+  const start = creators.indexOf('router.delete("/:id"');
+  const end = creators.indexOf('router.post("/:id/complete-connection"', start);
+  assert.ok(start >= 0 && end > start, "product creator removal route must exist");
+  const route = creators.slice(start, end);
+  const agencyFence = route.indexOf("lockAgencyPipelineLifecycle");
+  const creatorFence = route.indexOf("lockCreatorPipelineLifecycle");
+  const memberScopeWrite = route.indexOf("removeCreatorFromAssignedCreators");
+  const epochBump = route.indexOf("bumpAgencyAccessEpoch");
+  const creatorDelete = route.indexOf("creatorAccount.update");
+  assert.ok(agencyFence >= 0, "creator removal must serialize at the Agency root");
+  assert.ok(creatorFence > agencyFence, "creator removal lock order must be Agency -> Creator");
+  assert.ok(memberScopeWrite > creatorFence, "member creator-scope rewrites must happen only after lifecycle fences");
+  assert.ok(creatorDelete > creatorFence, "creator soft-delete must happen only after lifecycle fences");
+  assert.ok(epochBump > memberScopeWrite, "effective creator-scope changes must bump live member accessEpoch in the same transaction");
+});
 test("creator Telegram rebinding uses the global Agency -> Creator -> TelegramAccount lifecycle order", () => {
   const contact = source("services/creator-telegram-contact-authority-service.js");
   const start = contact.indexOf("async function updateCreatorTelegramContact");

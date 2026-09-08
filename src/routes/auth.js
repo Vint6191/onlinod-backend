@@ -18,7 +18,7 @@ const {
   revokeRefreshToken,
 } = require("../services/auth-service");
 const { resolveEffectivePermissions, validateAssignedCreators } = require("../services/team-access-control");
-const { cleanFunctions, ensureRoleExists } = require("../services/team-administration-service");
+const { cleanFunctions, ensureRoleExists, lockTeamRoleLifecycle } = require("../services/team-administration-service");
 const { audit } = require("../services/audit-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 
@@ -182,6 +182,10 @@ router.post("/register", async (req, res) => {
         const inv = checked.invitation;
         let roleKey;
         try {
+          // Registration-time invitation claim is also a durable role
+          // assignment. Keep custom-role deletion behind the same shared
+          // lifecycle fence until the new member and claimed invite commit.
+          await lockTeamRoleLifecycle({ tx, agencyId: inv.agencyId, roleKey: inv.roleKey, mode: "share" });
           roleKey = await ensureRoleExists({ agencyId: inv.agencyId, roleKey: inv.roleKey, db: tx });
         } catch (_) {
           const err = new Error("Invitation role is no longer available");

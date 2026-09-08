@@ -37,6 +37,7 @@ function fakeDb(seed = {}) {
       deletedAt: null, deactivatedAt: null, user: { name: "Chatter", email: "c@test" },
     },
   };
+  if (seed.currentMember) members["member-1"] = { ...members["member-1"], ...clone(seed.currentMember) };
   const rows = (seed.orders || []).map(clone);
   const contentSubmissions = (seed.submissions || []).map(clone);
   const relayWrites = (seed.relayWrites || []).map(clone);
@@ -356,9 +357,10 @@ test("payment validation fails closed and migration backfills old rows to zero",
   assert.throws(() => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmountCents: 2_147_483_648 })), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_TOO_LARGE");
   const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
   const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821113000_custom_order_payment_foundation/migration.sql"), "utf8");
-  assert.match(schema, /model CustomOrder[\s\S]*paidAmountCents\s+Int\s+@default\(0\)/);
-  assert.doesNotMatch(schema, /paymentStatus\s+/);
-  assert.doesNotMatch(schema, /remainingAmountCents\s+/);
+  const customOrderModel = schema.match(/model CustomOrder\s*\{[\s\S]*?\n\}/)?.[0] || "";
+  assert.match(customOrderModel, /paidAmountCents\s+Int\s+@default\(0\)/);
+  assert.doesNotMatch(customOrderModel, /paymentStatus\s+/);
+  assert.doesNotMatch(customOrderModel, /remainingAmountCents\s+/);
   assert.match(migration, /ADD COLUMN IF NOT EXISTS "paidAmountCents" INTEGER/);
   assert.match(migration, /WHERE "paidAmountCents" IS NULL OR "paidAmountCents" < 0/);
   assert.match(migration, /ALTER COLUMN "paidAmountCents" SET NOT NULL/);
@@ -765,4 +767,58 @@ test("historical no-TASK committed REVISION_REQUEST freezes model-visible Custom
     (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE" && error?.status === 409,
   );
   assert.equal(db._rows[0].scenario, "original historical custom");
+});
+
+test("commit-time CustomOrder create rejects a stale creator-scope snapshot and creates no order or Telegram work", async () => {
+  const db = fakeDb({ currentMember: { ...member, accessEpoch: 2, assignedCreators: [] } });
+  await assert.rejects(
+    () => createCustomOrder({
+      agencyId: "agency-1",
+      member,
+      input: withCreateIntent({ creatorId: "creator-1", dialogId: "scope-race", scenario: "must not commit after revoke" }),
+      db,
+    }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(db._rows.length, 0, "stale create must not create a CustomOrder");
+  assert.equal(db._deliveryIntents.length, 0, "stale create must not plan Telegram work");
+});
+
+test("commit-time pending CustomOrder update rejects stale management access before mutation", async () => {
+  const updatedAt = new Date("2026-08-21T10:00:00.000Z");
+  const original = {
+    id: "order-stale-update", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "before revoke", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING",
+    dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: null,
+    deliveredAt: null, fanDeliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 6000, paidAmountCents: 0,
+    deliveryOfferedCents: 0, deliverySentMediaIds: [], deliveryMessageIds: [], telegramTaskMessageId: null, telegramReferenceMessageIds: [],
+    reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
+    createdAt: updatedAt, updatedAt,
+  };
+  const db = fakeDb({ orders: [original], currentMember: { ...member, accessEpoch: 2, assignedCreators: [] } });
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: original.id, input: { internalNote: "stale write" }, db }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(db._rows[0].internalNote, null);
+  assert.equal(db._rows[0].updatedAt.getTime(), updatedAt.getTime());
+});
+
+test("commit-time terminal payment correction also rejects stale management access", async () => {
+  const updatedAt = new Date("2026-08-21T10:30:00.000Z");
+  const original = {
+    id: "order-stale-terminal-payment", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1",
+    scenario: "completed", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "COMPLETED",
+    dueAt: null, scheduledAt: null, durationMinutes: null, physicalStatus: null, acceptedAt: null, completedAt: updatedAt,
+    deliveredAt: updatedAt, fanDeliveredAt: updatedAt, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 6000, paidAmountCents: 2000,
+    deliveryOfferedCents: 6000, deliverySentMediaIds: ["9001"], deliveryMessageIds: ["message-1"], telegramTaskMessageId: null, telegramReferenceMessageIds: [],
+    reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
+    createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt,
+  };
+  const db = fakeDb({ orders: [original], currentMember: { ...member, accessEpoch: 2, assignedCreators: [] } });
+  await assert.rejects(
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: original.id, input: { paidAmount: 60 }, db }),
+    (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
+  );
+  assert.equal(db._rows[0].paidAmountCents, 2000);
 });
