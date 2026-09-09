@@ -5,6 +5,9 @@ const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
 const { JOB_KEY, SCHEMA_VERSION, COLLECTOR_VERSION, summarizeStatusGroups } = require("./financial-transactions-service");
+const {
+  buildCollectionCommand, buildCollectionPlanningDedupeParams, withCollectorStateLock, COLLECTOR_TYPES,
+} = require("./analytics-collector-control-service");
 
 const MANUAL_REASON = "manual_creator_analytics_financial_transactions_scan";
 const ACTIVE_STATUSES = new Set(["SCHEDULED", "CLAIMED", "PAUSED"]);
@@ -59,6 +62,14 @@ async function activeJob(db, creatorId) {
   const rows = await recentJobs(db, creatorId, ["SCHEDULED", "CLAIMED", "PAUSED"], 40);
   return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
 }
+async function activeCollectorJob(db, creatorId) {
+  const rows = await db.jobInstance.findMany({
+    where: { creatorId, jobKey: JOB_KEY, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+    take: 40,
+  });
+  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
+}
 async function countOnlineBindings(db, creator) {
   const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
   return db.deviceCreatorBinding.count({
@@ -71,36 +82,49 @@ async function countOnlineBindings(db, creator) {
 
 async function startManualFinancialTransactionScan({ db = prisma, creator, requestedByUserId = null, now = new Date() }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
-  const active = await activeJob(db, creator.id);
-  if (active?.status === "PAUSED") {
-    const planned = await reschedulePlannedJob({
-      db, job: active, params: active.params || {}, priority: active.priority || 0,
-      scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
-      lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
-      protectedStatuses: [],
+  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: creator.id, work: async (tx) => {
+    // Manual and automatic starts share one collector planning boundary. The
+    // read is repeated under the same advisory lock used by accept/complete, so
+    // a cross-replica manual click cannot create a second provider traversal.
+    const active = await activeCollectorJob(tx, creator.id);
+    if (active?.status === "PAUSED") {
+      const planned = await reschedulePlannedJob({
+        db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
+        scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
+        lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
+        protectedStatuses: [],
+      });
+      return { job: planned.job, action: "resumed" };
+    }
+    if (active) return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+
+    const state = typeof tx.creatorFinancialCollectionState?.findUnique === "function"
+      ? await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: creator.id } })
+      : null;
+    const manualRunToken = crypto.randomUUID();
+    const snapshotMarker = Math.floor(now.getTime() / 1000);
+    const params = {
+      manualFinancialTransactionScan: true,
+      manualFinancialTransactionScanVersion: 1,
+      manualRunToken,
+      requestedByUserId: clean(requestedByUserId, 220),
+      reason: MANUAL_REASON,
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", reason: MANUAL_REASON, now }),
+      startDate: "2016-01-01 00:00:00",
+      endDate: onlyFansUtcDateTime(new Date(snapshotMarker * 1000)),
+      initialMarker: snapshotMarker,
+      schemaVersion: SCHEMA_VERSION,
+      collectorVersion: COLLECTOR_VERSION,
+    };
+    const scheduled = await scheduleJobNow({
+      db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId,
+      params, priority: 100, now, bucketMs: 1,
+      dedupeParams: buildCollectionPlanningDedupeParams({
+        collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", state,
+      }),
     });
-    return { job: planned.job, action: "resumed" };
-  }
-  if (active) return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
-  const manualRunToken = crypto.randomUUID();
-  const snapshotMarker = Math.floor(now.getTime() / 1000);
-  const params = {
-    manualFinancialTransactionScan: true,
-    manualFinancialTransactionScanVersion: 1,
-    manualRunToken,
-    requestedByUserId: clean(requestedByUserId, 220),
-    reason: MANUAL_REASON,
-    startDate: "2016-01-01 00:00:00",
-    endDate: onlyFansUtcDateTime(new Date(snapshotMarker * 1000)),
-    initialMarker: snapshotMarker,
-    schemaVersion: SCHEMA_VERSION,
-    collectorVersion: COLLECTOR_VERSION,
-  };
-  const scheduled = await scheduleJobNow({
-    jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId,
-    params, priority: 100, now, bucketMs: 1,
-  });
-  return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
+    return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
+  }});
 }
 
 async function stopManualFinancialTransactionScan({ db = prisma, creatorId, now = new Date() }) {

@@ -117,6 +117,15 @@ const RETENTION_FIELDS = Object.freeze({
     max: 3650,
     hint: "Terminal fetch_earnings JobInstance rows after durable proof exists.",
   },
+  analyticsDemandHistoryDays: {
+    label: "Analytics collection demand history",
+    unit: "days",
+    env: "ONLINOD_ANALYTICS_DEMAND_HISTORY_DAYS",
+    fallback: 90,
+    min: 7,
+    max: 3650,
+    hint: "Completed and quarantined AnalyticsCollectionDemand control-plane history after the durable outcome no longer needs active retry.",
+  },
   analyticsSupersededScanProofDays: {
     label: "Analytics superseded durable proofs",
     unit: "days",
@@ -125,6 +134,33 @@ const RETENTION_FIELDS = Object.freeze({
     min: 7,
     max: 3650,
     hint: "Old AnalyticsScanProof rows are removed only after no canonical earnings or coverage row references them.",
+  },
+  analyticsNonEarningsJobDays: {
+    label: "Analytics non-earnings job history",
+    unit: "days",
+    env: "ONLINOD_ANALYTICS_NON_EARNINGS_JOB_DAYS",
+    fallback: 30,
+    min: 7,
+    max: 3650,
+    hint: "Terminal notification/financial/campaign JobInstance rows after durable collector state exists.",
+  },
+  analyticsNonEarningsIngestBatchDays: {
+    label: "Analytics non-earnings ingest history",
+    unit: "days",
+    env: "ONLINOD_ANALYTICS_NON_EARNINGS_INGEST_DAYS",
+    fallback: 30,
+    min: 7,
+    max: 3650,
+    hint: "Operational notification/financial/campaign ingest batches after durable collector state exists.",
+  },
+  analyticsNotificationScanAuditDays: {
+    label: "Notification scan audit history",
+    unit: "days",
+    env: "ONLINOD_ANALYTICS_NOTIFICATION_SCAN_AUDIT_DAYS",
+    fallback: 30,
+    min: 7,
+    max: 3650,
+    hint: "Per-page notification scan audit rows; current catch-up frontier lives in CreatorNotificationSyncState.",
   },
 
   automationJobDoneDays: {
@@ -656,7 +692,11 @@ async function runAnalyticsExecutionRetentionSweep(options = {}) {
   const batchSize = Math.max(100, Math.min(10000, Number(cfg.batchSize) || DEFAULT_BATCH_SIZE));
   const ingestCutoff = daysAgo(cfg.analyticsIngestBatchDays);
   const jobCutoff = daysAgo(cfg.analyticsJobInstanceDays);
+  const demandCutoff = daysAgo(cfg.analyticsDemandHistoryDays);
   const proofCutoff = daysAgo(cfg.analyticsSupersededScanProofDays);
+  const nonEarningsJobCutoff = daysAgo(cfg.analyticsNonEarningsJobDays);
+  const nonEarningsIngestCutoff = daysAgo(cfg.analyticsNonEarningsIngestBatchDays);
+  const notificationAuditCutoff = daysAgo(cfg.analyticsNotificationScanAuditDays);
   const items = [];
 
   let ingestDeleted = 0;
@@ -719,24 +759,165 @@ async function runAnalyticsExecutionRetentionSweep(options = {}) {
   }
   items.push({ label: `jobInstance.fetch_earnings_${cfg.analyticsJobInstanceDays}d`, deleted: jobsDeleted });
 
+  // Failed/cancelled/expired earnings attempts that never produced durable proof
+  // are technical history too. Delete them only when no canonical earnings or
+  // coverage row still depends on their execution identity.
+  let unprovenEarningsJobsDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "JobInstance" j
+      WHERE j."id" IN (
+        SELECT candidate."id"
+        FROM "JobInstance" candidate
+        WHERE candidate."jobKey" = 'fetch_earnings'
+          AND candidate."status" IN ('FAILED', 'CANCELLED', 'CANCELED', 'EXPIRED')
+          AND candidate."updatedAt" < $1
+          AND NOT EXISTS (SELECT 1 FROM "AnalyticsScanProof" p WHERE p."sourceJobId" = candidate."id")
+          AND NOT EXISTS (SELECT 1 FROM "CreatorEarningsDaily" d WHERE d."sourceJobId" = candidate."id")
+          AND NOT EXISTS (
+            SELECT 1 FROM "AnalyticsIngestBatch" ib
+            JOIN "AnalyticsCoverage" c ON c."ingestBatchId" = ib."id"
+            WHERE ib."sourceJobId" = candidate."id" AND ib."dataType" = 'EARNINGS'::"AnalyticsDataType"
+          )
+        ORDER BY candidate."updatedAt" ASC, candidate."id" ASC
+        LIMIT $2
+      )
+    `, jobCutoff, batchSize));
+    unprovenEarningsJobsDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({ label: `jobInstance.fetch_earnings_unproven_${cfg.analyticsJobInstanceDays}d`, deleted: unprovenEarningsJobsDeleted });
+
+  // Notification frontier is now bounded in CreatorNotificationSyncState, so
+  // whole page audit history is no longer needed for current catch-up semantics.
+  let notificationAuditDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "CreatorNotificationScanItem" item
+      WHERE item."id" IN (
+        SELECT candidate."id" FROM "CreatorNotificationScanItem" candidate
+        WHERE candidate."createdAt" < $1
+          AND EXISTS (
+            SELECT 1 FROM "JobInstance" source_job
+            WHERE source_job."id" = candidate."sourceJobId"
+              AND source_job."status" IN ('DONE', 'FAILED', 'CANCELLED', 'CANCELED', 'EXPIRED')
+          )
+        ORDER BY candidate."createdAt" ASC, candidate."id" ASC
+        LIMIT $2
+      )
+    `, notificationAuditCutoff, batchSize));
+    notificationAuditDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({ label: `creatorNotificationScanItem.audit_${cfg.analyticsNotificationScanAuditDays}d`, deleted: notificationAuditDeleted });
+
+  // Non-earnings ingest batches are operational history. Their current
+  // collection semantics live in specialized durable state before these rows
+  // become eligible for compaction.
+  let nonEarningsIngestDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "AnalyticsIngestBatch" ib
+      WHERE ib."id" IN (
+        SELECT candidate."id"
+        FROM "AnalyticsIngestBatch" candidate
+        WHERE candidate."completedAt" IS NOT NULL
+          AND candidate."completedAt" < $1
+          AND candidate."dataType" IN (
+            'CAMPAIGNS'::"AnalyticsDataType",
+            'FINANCIAL_TRANSACTIONS'::"AnalyticsDataType",
+            'NOTIFICATIONS'::"AnalyticsDataType",
+            'NOTIFICATION_PURCHASES'::"AnalyticsDataType", 'NOTIFICATION_TIPS'::"AnalyticsDataType",
+            'NOTIFICATION_SUBSCRIPTIONS'::"AnalyticsDataType", 'NOTIFICATION_LIKES'::"AnalyticsDataType",
+            'NOTIFICATION_COMMENTS'::"AnalyticsDataType"
+          )
+          AND (
+            candidate."sourceJobId" IS NULL
+            OR EXISTS (
+              SELECT 1 FROM "JobInstance" source_job
+              WHERE source_job."id" = candidate."sourceJobId"
+                AND source_job."status" IN ('DONE', 'FAILED', 'CANCELLED', 'CANCELED', 'EXPIRED')
+            )
+          )
+        ORDER BY candidate."completedAt" ASC
+        LIMIT $2
+      )
+    `, nonEarningsIngestCutoff, batchSize));
+    nonEarningsIngestDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({ label: `analyticsIngestBatch.non_earnings_${cfg.analyticsNonEarningsIngestBatchDays}d`, deleted: nonEarningsIngestDeleted });
+
+  let nonEarningsJobsDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "JobInstance" j
+      WHERE j."id" IN (
+        SELECT candidate."id"
+        FROM "JobInstance" candidate
+        WHERE candidate."jobKey" IN ('catchup_notifications_scan', 'financial_transactions_scan', 'fetch_campaigns')
+          AND candidate."status" IN ('DONE', 'FAILED', 'CANCELLED', 'CANCELED', 'EXPIRED')
+          AND candidate."updatedAt" < $1
+          AND NOT EXISTS (
+            SELECT 1 FROM "CreatorNotificationScanItem" scan_item
+            WHERE scan_item."sourceJobId" = candidate."id"
+          )
+        ORDER BY candidate."updatedAt" ASC, candidate."id" ASC
+        LIMIT $2
+      )
+    `, nonEarningsJobCutoff, batchSize));
+    nonEarningsJobsDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({ label: `jobInstance.analytics_non_earnings_${cfg.analyticsNonEarningsJobDays}d`, deleted: nonEarningsJobsDeleted });
+
   let demandsDeleted = 0;
   for (;;) {
     const deleted = Number(await prisma.$executeRawUnsafe(`
       DELETE FROM "AnalyticsCollectionDemand" d
-      WHERE d."key" IN (
-        SELECT candidate."key"
-        FROM "AnalyticsCollectionDemand" candidate
-        WHERE candidate."completedAt" IS NOT NULL
-          AND candidate."completedAt" < $1
-          AND candidate."claimToken" IS NULL
-        ORDER BY candidate."completedAt" ASC
-        LIMIT $2
-      )
-    `, jobCutoff, batchSize));
+      WHERE d."completedAt" IS NOT NULL
+        AND d."completedAt" < $1
+        AND d."claimToken" IS NULL
+        AND d."key" IN (
+          SELECT candidate."key"
+          FROM "AnalyticsCollectionDemand" candidate
+          WHERE candidate."completedAt" IS NOT NULL
+            AND candidate."completedAt" < $1
+            AND candidate."claimToken" IS NULL
+            AND pg_try_advisory_xact_lock(hashtext('analytics-demand:' || candidate."key"))
+          ORDER BY candidate."completedAt" ASC, candidate."key" ASC
+          LIMIT $2
+        )
+    `, demandCutoff, batchSize));
     demandsDeleted += deleted;
     if (deleted < batchSize) break;
   }
-  items.push({ label: `analyticsCollectionDemand.completed_${cfg.analyticsJobInstanceDays}d`, deleted: demandsDeleted });
+  items.push({ label: `analyticsCollectionDemand.completed_${cfg.analyticsDemandHistoryDays}d`, deleted: demandsDeleted });
+
+  let quarantinedDemandsDeleted = 0;
+  for (;;) {
+    const deleted = Number(await prisma.$executeRawUnsafe(`
+      DELETE FROM "AnalyticsCollectionDemand" d
+      WHERE d."completedAt" IS NULL
+        AND d."quarantinedAt" IS NOT NULL
+        AND d."quarantinedAt" < $1
+        AND d."claimToken" IS NULL
+        AND d."key" IN (
+          SELECT candidate."key"
+          FROM "AnalyticsCollectionDemand" candidate
+          WHERE candidate."completedAt" IS NULL
+            AND candidate."quarantinedAt" IS NOT NULL
+            AND candidate."quarantinedAt" < $1
+            AND candidate."claimToken" IS NULL
+            AND pg_try_advisory_xact_lock(hashtext('analytics-demand:' || candidate."key"))
+          ORDER BY candidate."quarantinedAt" ASC, candidate."key" ASC
+          LIMIT $2
+        )
+    `, demandCutoff, batchSize));
+    quarantinedDemandsDeleted += deleted;
+    if (deleted < batchSize) break;
+  }
+  items.push({ label: `analyticsCollectionDemand.quarantined_${cfg.analyticsDemandHistoryDays}d`, deleted: quarantinedDemandsDeleted });
 
   // AnalyticsScanProof is durable business evidence while a canonical daily or
   // coverage row still points at it.  Once a newer scan has superseded every

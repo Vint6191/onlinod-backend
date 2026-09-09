@@ -553,6 +553,8 @@ model CreatorAccount {
   localMessageCoverage CreatorLocalMessageCoverage[]
   fanLocalCoverage CreatorFanLocalCoverage[]
   notificationSyncState CreatorNotificationSyncState?
+  financialCollectionState CreatorFinancialCollectionState?
+  campaignCollectionState CreatorCampaignCollectionState?
   notificationScanItems CreatorNotificationScanItem[]
   financialTransactions CreatorFinancialTransaction[]
   fanValueCurrent CreatorFanValueCurrent[]
@@ -1843,6 +1845,9 @@ model CreatorNotificationSyncState {
   status                  AnalyticsCoverageStatus @default(MISSING)
   mode                    String                  @default("full")
   scanRunId               String?
+  activeGeneration        String?
+  activeRequestedAt       DateTime?
+  retryAfterAt            DateTime?
   nextCursor              String?
   headNotificationId      String?
   tailNotificationId      String?
@@ -1855,7 +1860,9 @@ model CreatorNotificationSyncState {
   fullBackfillCompletedAt DateTime?
   fullBackfillVerifiedAt  DateTime?
   lastCatchupCompletedAt  DateTime?
+  lastCatchupVerifiedAt   DateTime?
   lastSocketEventAt       DateTime?
+  knownNotificationIds    Json                    @default("[]")
   lastErrorCode           String?
   lastErrorMessage        String?
   sourceDeviceId          String?
@@ -1869,6 +1876,66 @@ model CreatorNotificationSyncState {
   @@index([agencyId, status, updatedAt])
   @@index([creatorId, fullBackfillCompletedAt], map: "CreatorNotificationSyncState_creator_full_idx")
   @@index([sourceJobId])
+}
+
+model CreatorFinancialCollectionState {
+  id                     String                  @id @default(cuid())
+  agencyId               String
+  creatorId              String                  @unique
+  status                 AnalyticsCoverageStatus @default(MISSING)
+  mode                   String                  @default("full")
+  activeGeneration       String?
+  activeRequestedAt      DateTime?
+  baselineVerifiedAt     DateTime?
+  baselineGeneration     String?
+  baselineRangeFrom      DateTime?
+  baselineRangeTo        DateTime?
+  lastCatchupCompletedAt DateTime?
+  lastCatchupGeneration  String?
+  lastBoundary           String?
+  retryAfterAt           DateTime?
+  lastErrorCode          String?
+  lastErrorMessage       String?
+  sourceDeviceId         String?
+  sourceJobId            String?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId], map: "CreatorFinancialCollectionState_agency_creator_key")
+  @@index([agencyId, status, updatedAt], map: "CreatorFinancialCollectionState_agency_status_idx")
+  @@index([creatorId, baselineVerifiedAt], map: "CreatorFinancialCollectionState_creator_baseline_idx")
+  @@index([creatorId, lastCatchupCompletedAt], map: "CreatorFinancialCollectionState_creator_catchup_idx")
+}
+
+model CreatorCampaignCollectionState {
+  id                     String                  @id @default(cuid())
+  agencyId               String
+  creatorId              String                  @unique
+  status                 AnalyticsCoverageStatus @default(MISSING)
+  mode                   String                  @default("full")
+  activeGeneration       String?
+  activeRequestedAt      DateTime?
+  baselineVerifiedAt     DateTime?
+  baselineGeneration     String?
+  lastCatchupCompletedAt DateTime?
+  lastCatchupGeneration  String?
+  lastCompleteScanRunId  String?
+  retryAfterAt           DateTime?
+  lastErrorCode          String?
+  lastErrorMessage       String?
+  sourceDeviceId         String?
+  sourceJobId            String?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorId], map: "CreatorCampaignCollectionState_agency_creator_key")
+  @@index([agencyId, status, updatedAt], map: "CreatorCampaignCollectionState_agency_status_idx")
+  @@index([creatorId, baselineVerifiedAt], map: "CreatorCampaignCollectionState_creator_baseline_idx")
+  @@index([creatorId, lastCatchupCompletedAt], map: "CreatorCampaignCollectionState_creator_catchup_idx")
 }
 
 model CreatorNotificationScanItem {
@@ -1905,6 +1972,7 @@ model CreatorNotificationScanItem {
   @@index([creatorId, scanRunId, page], map: "CreatorNotificationScanItem_run_page_idx")
   @@index([sourceJobId], map: "CreatorNotificationScanItem_sourceJobId_idx")
   @@index([creatorId, reasonCode], map: "CreatorNotificationScanItem_reason_idx")
+  @@index([createdAt, id], map: "CreatorNotificationScanItem_retention_idx")
 }
 
 model AnalyticsIngestBatch {
@@ -1943,6 +2011,7 @@ model AnalyticsIngestBatch {
   @@index([creatorId, dataType, status])
   @@index([sourceDeviceId, startedAt])
   @@index([sourceJobId])
+  @@index([dataType, completedAt, id], map: "AnalyticsIngestBatch_retention_idx")
 }
 
 model AnalyticsCoverage {
@@ -2048,11 +2117,16 @@ model AnalyticsCollectionDemand {
   cursorCreatorId   String?
   requestedAt       DateTime
   completedAt       DateTime?
+  attempts          Int       @default(0)
+  nextAttemptAt     DateTime?
+  lastErrorCode     String?
+  lastErrorClass    String?
   lastError         String?
+  quarantinedAt     DateTime?
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
-  @@index([completedAt, claimUntil, requestedAt], map: "AnalyticsCollectionDemand_due_idx")
+  @@index([completedAt, quarantinedAt, nextAttemptAt, claimUntil, requestedAt], map: "AnalyticsCollectionDemand_due_v2_idx")
   @@index([agencyId, requestedAt], map: "AnalyticsCollectionDemand_agency_requested_idx")
 }
 
@@ -2738,6 +2812,8 @@ model JobInstance {
   @@index([agencyId, idempotencyKey])
   @@index([claimedByDeviceId])
   @@index([leaseUntil])
+  @@index([jobKey, status, completedAt, id], map: "JobInstance_analytics_retention_idx")
+  @@index([jobKey, status, updatedAt, id], map: "JobInstance_analytics_terminal_updated_retention_idx")
 }
 
 

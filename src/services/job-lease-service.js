@@ -8,13 +8,13 @@ const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-resul
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
 const { completeNotificationSync } = require("./notification-sync-state-service");
+const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 const MIN_LEASE_MS = 30 * 1000;
 const MAX_LEASE_MS = 15 * 60 * 1000;
 const RETRY_BACKOFF_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
-const MAX_NOTIFICATION_REPAIR_PASSES = 100;
 const JOB_CHUNK_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 30_000 });
 const JOB_COMPLETION_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
@@ -236,19 +236,47 @@ function notificationScannerSuccessful(job, result) {
     return row.status === "complete" && Number(row.rejected || 0) === 0;
   });
 }
-async function notificationFullIsRedundant(job, db = prisma) {
+async function notificationCommittedPageProof(db, job, result) {
+  // The Desktop owns provider traversal/provenance, but it cannot be the proof
+  // authority for canonical acceptance. Every non-empty page is already stored
+  // as a backend AnalyticsIngestBatch by /progress. Verify those receipts before
+  // advancing lastCatchupVerifiedAt on the fast completion path.
+  if (!db?.analyticsIngestBatch?.findMany) return { verified: true, reason: "delegate_unavailable" };
+  const scanRunId = String(result?.scanRunId || "").trim();
+  const expectedRows = Number(result?.totalAcceptedEvents);
+  if (!scanRunId || !Number.isInteger(expectedRows) || expectedRows < 0) {
+    return { verified: false, reason: "completion_fact_count_missing" };
+  }
+  const rows = await db.analyticsIngestBatch.findMany({
+    where: { sourceJobId: job.id, dataType: "NOTIFICATIONS" },
+    select: { idempotencyKey: true, status: true, receivedRows: true, rejectedRows: true },
+  });
+  const marker = `:run:${scanRunId}:page:`;
+  const current = (rows || []).filter((row) => String(row?.idempotencyKey || "").includes(marker));
+  const receivedRows = current.reduce((sum, row) => sum + Math.max(0, Number(row?.receivedRows || 0)), 0);
+  const receiptsClean = current.every((row) => String(row?.status || "").toUpperCase() === "COMMITTED"
+    && Number(row?.rejectedRows || 0) === 0);
+  return {
+    verified: receiptsClean && receivedRows === expectedRows,
+    reason: !receiptsClean ? "backend_page_receipt_partial" : receivedRows !== expectedRows ? "backend_page_receipt_count_mismatch" : "verified",
+    expectedRows,
+    receivedRows,
+    batches: current.length,
+  };
+}
+async function notificationFullIsRedundant(job, db = prisma, now = new Date()) {
   if (job?.jobKey !== "catchup_notifications_scan") return false;
   const params = object(job.params);
   if (notificationJobMode(params) !== "full" || params.forceNotificationFullRebuild === true) return false;
   if (!db?.creatorNotificationSyncState?.findUnique) return false;
   const state = await db.creatorNotificationSyncState.findUnique({
     where: { creatorId: job.creatorId },
-    select: { fullBackfillCompletedAt: true, fullBackfillVerifiedAt: true },
+    select: { fullBackfillVerifiedAt: true },
   });
-  return Boolean(state?.fullBackfillCompletedAt || state?.fullBackfillVerifiedAt);
+  return Boolean(trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
 }
 async function cancelRedundantNotificationFull(job, now = new Date(), db = prisma) {
-  if (!(await notificationFullIsRedundant(job, db))) return false;
+  if (!(await notificationFullIsRedundant(job, db, now))) return false;
   const cancelled = await db.jobInstance.updateMany({
     where: { id: job.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
     data: {
@@ -288,7 +316,7 @@ async function sweepExpiredLeases(now = new Date()) {
         data,
       });
       if (!updated.count) return false;
-      await recordJobFailure({ db: tx, job, error: "lease expired", terminal });
+      await recordJobFailure({ db: tx, job, error: "lease expired", terminal, retryAfterAt: terminal ? null : data.nextRunAt });
       return true;
     }, JOB_COMPLETION_TRANSACTION_OPTIONS);
     if (applied) changed += 1;
@@ -576,7 +604,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   }
 
-  if (["fetch_earnings", "fetch_campaigns"].includes(job.jobKey)) {
+  if (["fetch_earnings", "fetch_campaigns", "financial_transactions_scan"].includes(job.jobKey)) {
     // These jobs write durable relational projections. Reserve completion
     // ownership before any side effect so a reclaimed worker cannot publish a
     // stale earnings/campaign snapshot after another device takes the lease.
@@ -603,37 +631,46 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       const attempts = Number(job.attempts || 0) + 1;
       const terminal = attempts >= MAX_ATTEMPTS;
       const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
-      const partial = await prisma.jobInstance.updateMany({
-        where: completionFence,
-        data: terminal ? {
-          status: "FAILED",
-          attempts,
-          completedAt: new Date(),
-          claimedAt: null,
-          claimedByDeviceId: null,
-          leaseUntil: null,
-          leaseTokenHash: null,
-          continuation: null,
-          workId: null,
-          result: { ...(result || {}), completionSideEffect: sideEffect || null },
-          lastError: `${job.jobKey}_partial`,
-        } : {
-          status: "SCHEDULED",
-          attempts,
-          nextRunAt: retryAt,
-          completedAt: null,
-          claimedAt: null,
-          claimedByDeviceId: null,
-          leaseUntil: null,
-          leaseTokenHash: null,
-          continuation: null,
-          workId: null,
-          result: { ...(result || {}), completionSideEffect: sideEffect || null },
-          lastError: `${job.jobKey}_partial`,
-          progress: { percent: 0, message: `${job.jobKey} scheduled for repair` },
-        },
-      });
-      if (!partial.count) throw new JobLeaseError("JOB_LEASE_STALE", "Analytics partial-completion fence was lost");
+      const partial = await prisma.$transaction(async (tx) => {
+        const updated = await tx.jobInstance.updateMany({
+          where: completionFence,
+          data: terminal ? {
+            status: "FAILED",
+            attempts,
+            completedAt: new Date(),
+            claimedAt: null,
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+            continuation: null,
+            workId: null,
+            result: { ...(result || {}), completionSideEffect: sideEffect || null },
+            lastError: `${job.jobKey}_partial`,
+          } : {
+            status: "SCHEDULED",
+            attempts,
+            nextRunAt: retryAt,
+            completedAt: null,
+            claimedAt: null,
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+            continuation: null,
+            workId: null,
+            result: { ...(result || {}), completionSideEffect: sideEffect || null },
+            lastError: `${job.jobKey}_partial`,
+            progress: { percent: 0, message: `${job.jobKey} scheduled for repair` },
+          },
+        });
+        if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Analytics partial-completion fence was lost");
+        // Durable collector state must carry the exact same retry/quarantine
+        // decision as JobInstance. Otherwise terminal technical history can be
+        // cleaned while the planner immediately emits a fresh generation.
+        await recordJobFailure({
+          db: tx, job, error: `${job.jobKey}_partial`, terminal, retryAfterAt: retryAt,
+        });
+        return updated;
+      }, JOB_COMPLETION_TRANSACTION_OPTIONS);
       return { job: { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", retryAt }, sideEffect };
     }
     const completed = await prisma.jobInstance.updateMany({ where: completionFence, data: completionData });
@@ -651,33 +688,67 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     // best-effort after the job is already DONE. Atomic notification facts remain
     // the source of truth; compatibility/cache work must never hold the scan lease.
     if (boundedNotificationCatchupCompletion(job, result)) {
-      const scannerSuccessful = notificationScannerSuccessful(job, result);
+      const scannerClaimedSuccessful = notificationScannerSuccessful(job, result);
+      const pageProof = scannerClaimedSuccessful
+        ? await notificationCommittedPageProof(prisma, job, result)
+        : { verified: false, reason: "scanner_report_partial" };
+      const scannerSuccessful = scannerClaimedSuccessful && pageProof.verified === true;
+      const attempts = Number(job.attempts || 0) + (scannerSuccessful ? 0 : 1);
+      const terminal = !scannerSuccessful && attempts >= MAX_ATTEMPTS;
+      const retryAt = scannerSuccessful || terminal
+        ? null
+        : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
+      const terminalData = terminal ? {
+        status: "FAILED", attempts, completedAt: now, claimedAt: null, claimedByDeviceId: null,
+        leaseUntil: null, leaseTokenHash: null, continuation: null, workId: null,
+        result: { ...(result || {}), completionSideEffect: { verified: false, sourceTraversalComplete: true } },
+        lastError: "notification_scan_partial",
+      } : {
+        status: "SCHEDULED", attempts, nextRunAt: retryAt, completedAt: null, claimedAt: null, claimedByDeviceId: null,
+        leaseUntil: null, leaseTokenHash: null, continuation: null, workId: null,
+        result: { ...(result || {}), completionSideEffect: { verified: false, sourceTraversalComplete: true } },
+        lastError: "notification_scan_partial",
+        progress: { percent: 0, message: "notification catch-up scheduled for repair" },
+      };
       const fast = await prisma.$transaction(async (tx) => {
-        const completed = await tx.jobInstance.updateMany({ where: fenceWhere, data: completionData });
+        const completed = await tx.jobInstance.updateMany({
+          where: fenceWhere, data: scannerSuccessful ? completionData : terminalData,
+        });
         if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before bounded notification completion");
         const syncState = await completeNotificationSync({
-          db: tx,
-          job,
-          deviceId,
-          result: result || {},
-          successful: scannerSuccessful,
+          db: tx, job, deviceId, result: result || {}, successful: scannerSuccessful,
         });
+        if (!scannerSuccessful) {
+          await recordJobFailure({
+            db: tx, job, error: "notification_scan_partial", terminal, retryAfterAt: retryAt,
+          });
+        }
         return {
           type: "catchup_notifications",
-          ok: true,
+          ok: scannerSuccessful,
           verified: scannerSuccessful,
           sourceTraversalComplete: true,
-          compatibilityDeferred: true,
+          compatibilityDeferred: scannerSuccessful,
+          pageProof,
           syncStateId: syncState?.id || null,
         };
       }, JOB_COMPLETION_TRANSACTION_OPTIONS);
 
-      setImmediate(() => {
-        applyJobResult({ job, deviceId, userId, result: result || {} }).catch((error) => {
-          console.warn("[notification-catchup] deferred compatibility projection failed:", job.id, error?.message || error);
+      // The compatibility completion path calls completeNotificationSync again.
+      // Never run it after PARTIAL because it would overwrite the durable
+      // FAILED+retry/quarantine state written above. Canonical page facts are
+      // already committed; failure projection is the correct partial summary.
+      if (scannerSuccessful) {
+        setImmediate(() => {
+          applyJobResult({ job, deviceId, userId, result: result || {} }).catch((error) => {
+            console.warn("[notification-catchup] deferred compatibility projection failed:", job.id, error?.message || error);
+          });
         });
-      });
-      return { job: { id: job.id, status: "DONE" }, sideEffect: fast };
+      }
+      return {
+        job: { id: job.id, status: scannerSuccessful ? "DONE" : terminal ? "FAILED" : "SCHEDULED", retryAt },
+        sideEffect: fast,
+      };
     }
 
     // Full/legacy notification completion still reserves ownership before its
@@ -714,7 +785,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       // Reaching hasMore=false with rejected/ignored facts must stop and expose
       // the PARTIAL result to the inspector; never silently schedule another
       // full repair pass behind the operator's back.
-      if (existingParams.manualNotificationScan === true) {
+      if (existingParams.manualNotificationScan === true && sideEffect?.sourceTraversalComplete === true) {
         const partial = await prisma.jobInstance.updateMany({
           where: completionFence,
           data: {
@@ -732,67 +803,68 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           },
         });
         if (!partial.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification manual completion fence was lost");
+        // Manual scans intentionally stop at the inspected PARTIAL outcome.
+        // Do not rewrite the durable collector state to FAILED/quarantined: the
+        // operator asked for a one-shot inspection, not an automatic retry lane.
         return { job: { id: job.id, status: "DONE" }, sideEffect };
       }
       const requestedTypes = Array.isArray(sideEffect?.summary?.requestedTypes)
         ? sideEffect.summary.requestedTypes.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
         : Array.isArray(existingParams.types) ? existingParams.types : [];
-      const persistedCoverage = object(sideEffect?.summary?.analyticsCoverageByType);
+      const persistedCoverage = object(sideEffect?.summary?.collectionCoverageByType);
       const partialTypes = requestedTypes.filter((type) => persistedCoverage[type] !== "complete");
-      const scannerCoverage = object(result?.coverage);
-      const resumeCursors = {};
-      for (const type of partialTypes) {
-        const typeCoverage = object(scannerCoverage[type]);
-        const reason = String(typeCoverage.reason || "").toLowerCase();
-        const rejected = Number(typeCoverage.rejected || 0);
-        const cursor = clean(typeCoverage.cursorEnd, 220);
-        if (cursor && rejected === 0 && ["page_limit", "event_limit"].includes(reason)) resumeCursors[type] = cursor;
-      }
-      const resumable = partialTypes.length > 0 && Object.keys(resumeCursors).length === partialTypes.length;
-      const repairPass = resumable ? Number(existingParams.notificationRepairPass || 0) + 1 : 0;
-      const attempts = Number(job.attempts || 0) + (resumable ? 0 : 1);
-      const terminal = resumable ? repairPass >= MAX_NOTIFICATION_REPAIR_PASSES : attempts >= MAX_ATTEMPTS;
-      const backoffExponent = resumable ? Math.min(6, Math.max(0, repairPass - 1)) : Math.max(0, attempts - 1);
-      const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** backoffExponent));
+      // Current notification collection restarts a failed/partial type from the
+      // durable SyncState frontier/known-ID boundary. The old resumeCursors path
+      // depended on per-day AnalyticsCoverage rows and was never consumed by the
+      // v8 Desktop collector. Keep retry semantics explicit and bounded instead.
+      const attempts = Number(job.attempts || 0) + 1;
+      const terminal = attempts >= MAX_ATTEMPTS;
+      const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
       const repairParams = {
         ...existingParams,
         ...(partialTypes.length ? { types: partialTypes } : {}),
-        ...(Object.keys(resumeCursors).length ? { resumeCursors } : { resumeCursors: null }),
-        notificationRepairPass: repairPass,
       };
-      const partial = await prisma.jobInstance.updateMany({
-        where: completionFence,
-        data: terminal ? {
-          status: "FAILED",
-          attempts,
-          completedAt: new Date(),
-          claimedAt: null,
-          claimedByDeviceId: null,
-          leaseUntil: null,
-          leaseTokenHash: null,
-          continuation: null,
-          workId: null,
-          result: { ...(result || {}), completionSideEffect: sideEffect || null },
-          params: repairParams,
-          lastError: "notification_scan_partial",
-        } : {
-          status: "SCHEDULED",
-          attempts,
-          nextRunAt: retryAt,
-          completedAt: null,
-          claimedAt: null,
-          claimedByDeviceId: null,
-          leaseUntil: null,
-          leaseTokenHash: null,
-          continuation: null,
-          workId: null,
-          result: { ...(result || {}), completionSideEffect: sideEffect || null },
-          params: repairParams,
-          lastError: "notification_scan_partial",
-          progress: { percent: 0, message: "notification scan scheduled for repair" },
-        },
-      });
-      if (!partial.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification partial-completion fence was lost");
+      delete repairParams.resumeCursors;
+      delete repairParams.notificationRepairPass;
+      const partial = await prisma.$transaction(async (tx) => {
+        const updated = await tx.jobInstance.updateMany({
+          where: completionFence,
+          data: terminal ? {
+            status: "FAILED",
+            attempts,
+            completedAt: new Date(),
+            claimedAt: null,
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+            continuation: null,
+            workId: null,
+            result: { ...(result || {}), completionSideEffect: sideEffect || null },
+            params: repairParams,
+            lastError: "notification_scan_partial",
+          } : {
+            status: "SCHEDULED",
+            attempts,
+            nextRunAt: retryAt,
+            completedAt: null,
+            claimedAt: null,
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+            continuation: null,
+            workId: null,
+            result: { ...(result || {}), completionSideEffect: sideEffect || null },
+            params: repairParams,
+            lastError: "notification_scan_partial",
+            progress: { percent: 0, message: "notification scan scheduled for repair" },
+          },
+        });
+        if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification partial-completion fence was lost");
+        await recordJobFailure({
+          db: tx, job, error: `${job.jobKey}_partial`, terminal, retryAfterAt: retryAt,
+        });
+        return updated;
+      }, JOB_COMPLETION_TRANSACTION_OPTIONS);
       return { job: { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", retryAt }, sideEffect };
     }
     const completed = await prisma.jobInstance.updateMany({ where: completionFence, data: completionData });
@@ -873,7 +945,7 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
       data,
     });
     if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before failure report");
-    await recordJobFailure({ db: tx, job, error: errorText, terminal });
+    await recordJobFailure({ db: tx, job, error: errorText, terminal, retryAfterAt: terminal ? null : data.nextRunAt });
   }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   return { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", terminal, retryAt: terminal ? null : data.nextRunAt };
 }

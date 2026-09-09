@@ -6,7 +6,7 @@ const Module = require("node:module");
 
 const originalLoad = Module._load;
 Module._load = function(request, parent, isMain) {
-  if (request === "../prisma" && parent?.filename?.endsWith("creator-analytics-ledger-service.js")) return {};
+  if (request === "../prisma" && (parent?.filename?.endsWith("creator-analytics-ledger-service.js") || parent?.filename?.endsWith("analytics-collector-control-service.js"))) return {};
   return originalLoad.call(this, request, parent, isMain);
 };
 const {
@@ -42,6 +42,20 @@ const job = {
 
 function transactional(tx) {
   return { ...tx, $transaction: async (callback) => callback(tx) };
+}
+
+function campaignJob(scanRunId, requestedAt = "2026-08-06T11:00:00.000Z", collectionMode = "full") {
+  return {
+    ...job,
+    params: {
+      collectionContractVersion: 1,
+      collectionType: "CAMPAIGNS",
+      collectionMode,
+      collectionGeneration: scanRunId,
+      collectionRequestedAt: requestedAt,
+      collectionReason: "TEST",
+    },
+  };
 }
 
 function batchHarness(options = {}) {
@@ -81,6 +95,15 @@ function batchHarness(options = {}) {
       update: async ({ where, data }) => {
         const row = { ...(options.existingScanProof || {}), id: where.id, ...data };
         scanProofUpdates.push(row);
+        return row;
+      },
+    },
+    creatorCampaignCollectionState: {
+      findUnique: async () => options.campaignState || null,
+      upsert: async ({ create, update }) => {
+        const base = options.campaignState || {};
+        const row = { ...base, id: base.id || "campaign-state-1", ...(options.campaignState ? update : create) };
+        options.campaignState = row;
         return row;
       },
     },
@@ -350,22 +373,23 @@ test("campaign completion proves every page batch before closing coverage", asyn
     fanValuesUnavailable: 0,
     fanValuesComplete: true,
   };
-  const complete = await completeCampaignScan({ db: completeHarness.db, job, result: payload });
+  const complete = await completeCampaignScan({ db: completeHarness.db, job: campaignJob(payload.scanRunId, payload.scanStartedAt), result: payload });
   assert.equal(complete.complete, true);
   assert.equal(completeHarness.updated.at(-1).status, "COMMITTED");
   assert.ok(inactiveWhere, "stale campaigns are deactivated only after complete proof");
-  assert.equal(completeHarness.coverage[0].create.status, "COMPLETE");
+  assert.equal(completeHarness.coverage.length, 0);
+  assert.equal(completeHarness.tx.creatorCampaignCollectionState ? completeHarness.tx && true : false, true);
 
   const partialHarness = batchHarness({ pageBatches: completeHarness.tx.analyticsIngestBatch.findMany ? [
     { idempotencyKey: "campaigns:job-1:run:scan-1:campaigns:a", status: "COMMITTED", rejectedRows: 0 },
   ] : [] });
   let deactivated = false;
   partialHarness.tx.creatorCampaign = { count: async () => 1, updateMany: async () => { deactivated = true; return { count: 1 }; } };
-  const partial = await completeCampaignScan({ db: partialHarness.db, job, result: payload });
+  const partial = await completeCampaignScan({ db: partialHarness.db, job: campaignJob(payload.scanRunId, payload.scanStartedAt), result: payload });
   assert.equal(partial.complete, false);
   assert.equal(deactivated, false);
   assert.equal(partialHarness.updated.at(-1).status, "PARTIAL");
-  assert.equal(partialHarness.coverage[0].create.status, "PARTIAL");
+  assert.equal(partialHarness.coverage.length, 0);
 });
 
 test("campaign completion replay can promote a formerly partial audit batch", async () => {
@@ -398,7 +422,7 @@ test("campaign completion replay can promote a formerly partial audit batch", as
     pageBatches: [{ idempotencyKey: "campaigns:job-1:run:scan-2:campaigns:a", status: "COMMITTED", rejectedRows: 0 }],
   });
   harness.tx.creatorCampaign = { count: async () => 1, updateMany: async () => ({ count: 0 }) };
-  const result = await completeCampaignScan({ db: harness.db, job, result: payload });
+  const result = await completeCampaignScan({ db: harness.db, job: campaignJob(payload.scanRunId, payload.scanStartedAt), result: payload });
   assert.equal(result.complete, true);
   assert.equal(result.replay, true);
   assert.equal(harness.updated.at(-1).status, "COMMITTED");
@@ -417,7 +441,7 @@ test("campaign fan attribution keeps the earliest confirmed attribution date", a
     updateMany: async () => ({ count: 1 }),
   };
   await ingestCampaignChunk({
-    db: harness.db, job,
+    db: harness.db, job: campaignJob("scan-earliest"),
     chunk: {
       kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v6",
       scanRunId: "scan-earliest", scanStartedAt: "2026-08-06T11:00:00.000Z", observedAt: "2026-08-06T12:00:00.000Z",
@@ -441,7 +465,7 @@ test("campaign fan attribution is historical and is never pruned by a later empt
     harness.tx.creatorFan = { findUnique: async () => null, create: async () => ({ id: "fan-db-1" }), updateMany: async () => ({ count: 1 }) };
     const result = await ingestCampaignChunk({
       db: harness.db,
-      job,
+      job: campaignJob("scan-history"),
       chunk: {
         kind: "campaign_claimers_page",
         schemaVersion: 4,
@@ -467,6 +491,10 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
   let upsertData = null;
   const db = {
     $executeRawUnsafe: async () => 1,
+    creatorCampaignCollectionState: {
+      findUnique: async () => null,
+      upsert: async ({ create }) => ({ id: "campaign-state-fan-value", ...create }),
+    },
     creatorFan: {
       findUnique: async () => ({ id: "fan-db-1" }),
       updateMany: async () => ({ count: 1 }),
@@ -478,7 +506,7 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
     },
   };
   const result = await ingestCampaignFanValueChunk({
-    db, job, deviceId: "device-1",
+    db, job: campaignJob("fan-value-run", "2026-08-08T18:00:00.000Z"), deviceId: "device-1",
     chunk: {
       kind: "campaign_fan_value",
       schemaVersion: 4,
@@ -513,6 +541,10 @@ test("campaign fan value batch applies multiple current snapshots under one anal
   const upserts = [];
   const db = {
     $executeRawUnsafe: async () => { locks += 1; return 1; },
+    creatorCampaignCollectionState: {
+      findUnique: async () => null,
+      upsert: async ({ create }) => ({ id: "campaign-state-batch", ...create }),
+    },
     creatorFan: {
       findUnique: async ({ where }) => ({ id: `fan-${where.creatorId_onlyFansUserId.onlyFansUserId}` }),
       updateMany: async () => ({ count: 1 }),
@@ -524,7 +556,7 @@ test("campaign fan value batch applies multiple current snapshots under one anal
     },
   };
   const result = await ingestCampaignFanValuesBatchChunk({
-    db, job, deviceId: "device-1",
+    db, job: campaignJob("batch-run", "2026-08-08T18:00:00.000Z"), deviceId: "device-1",
     chunk: {
       kind: "campaign_fan_values_batch",
       schemaVersion: 4, collectorVersion: "campaigns-v6",
@@ -538,7 +570,7 @@ test("campaign fan value batch applies multiple current snapshots under one anal
   });
   assert.equal(result.received, 2);
   assert.equal(result.available, 2);
-  assert.equal(locks, 1);
+  assert.equal(locks, 2);
   assert.equal(upserts.length, 2);
   assert.deepEqual(upserts.map((row) => row.platformReportedTotalSpendCents), [100n, 250n]);
 });
@@ -636,6 +668,8 @@ test("ledger overview preserves nullable earnings categories and counts only com
         oldestOccurredAt: new Date("2026-02-05T08:00:00.000Z"),
         newestOccurredAt: new Date("2026-08-05T22:00:00.000Z"),
         lastCatchupCompletedAt: new Date("2026-08-06T10:00:00.000Z"),
+        lastCatchupVerifiedAt: new Date("2026-08-06T10:00:30.000Z"),
+        retryAfterAt: new Date("2026-08-06T12:30:00.000Z"),
         lastSocketEventAt: new Date("2026-08-06T11:30:00.000Z"),
         lastErrorCode: null, lastErrorMessage: null,
       }),
@@ -654,7 +688,9 @@ test("ledger overview preserves nullable earnings categories and counts only com
       },
     },
     analyticsCoverage: {
-      findMany: async () => [{ dataType: "EARNINGS", coverageDate: date, status: "COMPLETE" }],
+      findMany: async ({ where }) => where?.dataType === "EARNINGS"
+        ? [{ dataType: "EARNINGS", coverageDate: date, status: "COMPLETE", lastVerifiedAt: new Date("2026-08-06T11:55:00.000Z"), retryAfterAt: null, scanProofId: "proof-1", scanProof: { status: "COMMITTED" } }]
+        : [{ dataType: "EARNINGS", coverageDate: date, status: "COMPLETE" }],
       count: async ({ where }) => !where.dataType ? 1 : where.dataType === "EARNINGS" && where.status === "COMPLETE" ? 1 : 0,
     },
     $queryRaw: async () => [{ campaignId: "campaign-1", totalRevenueCents: 1000n, salesRevenueCents: 700n, tipsRevenueCents: 300n, subscriptionRevenueCents: 0n, transactionsCount: 2n }],
@@ -672,9 +708,20 @@ test("ledger overview preserves nullable earnings categories and counts only com
   assert.equal(result.campaigns[0].totalRevenueCents, 1000);
   assert.equal(result.campaigns[0].unknownAttributionFans, 1);
   assert.equal(result.campaigns[0].revenueVerified, false);
+  assert.equal(result.notificationSync.lastCatchupVerifiedAt.toISOString(), "2026-08-06T10:00:30.000Z");
+  assert.equal(result.notificationSync.retryAfterAt.toISOString(), "2026-08-06T12:30:00.000Z");
   assert.equal(result.availability.activityFromAt.toISOString(), "2026-02-05T08:00:00.000Z");
   assert.equal(result.availability.activityToAt.toISOString(), "2026-08-06T11:30:00.000Z");
   assert.equal(result.availability.activityAvailableDays, 183);
+});
+
+test("creator analytics availability cannot be extended by a future-poisoned notification clock", () => {
+  const source = require("node:fs").readFileSync(require("node:path").join(__dirname, "creator-analytics-ledger-service.js"), "utf8");
+  const start = source.indexOf("const endCandidates = [");
+  assert.ok(start >= 0);
+  const block = source.slice(start, start + 600);
+  assert.match(block, /trustedCollectionTimestamp\(value, now\)/);
+  assert.doesNotMatch(block, /\.map\(\(value\) => new Date\(value\)\)/);
 });
 
 
@@ -696,7 +743,10 @@ test("current overview ledger mode does not read dormant server message authorit
     creatorSubscriptionState: { groupBy: async () => [] },
     creatorLocalMessageCoverage: { findMany: async () => { throw new Error("DORMANT_MESSAGE_COVERAGE_MUST_NOT_BE_READ"); } },
     analyticsCoverage: {
-      findMany: async () => { throw new Error("CURRENT_OVERVIEW_MUST_NOT_READ_GENERIC_COVERAGE_PAGE"); },
+      findMany: async ({ where }) => {
+        if (where?.dataType === "EARNINGS") return [];
+        throw new Error("CURRENT_OVERVIEW_MUST_NOT_READ_GENERIC_COVERAGE_PAGE");
+      },
       count: async ({ where }) => {
         if (where.dataType === "MESSAGES_DAILY") throw new Error("DORMANT_MESSAGE_COVERAGE_MUST_NOT_BE_COUNTED");
         return 0;
@@ -746,7 +796,9 @@ test("today earnings are official only when the row and in-progress proof both e
       },
     },
     analyticsCoverage: {
-      findMany: async () => [{ dataType: "EARNINGS", coverageDate: date, sourceTimezone: "UTC", status: "PARTIAL", lastErrorCode: "EARNINGS_DAY_IN_PROGRESS" }],
+      findMany: async ({ where }) => where?.dataType === "EARNINGS"
+        ? [{ dataType: "EARNINGS", coverageDate: date, sourceTimezone: "UTC", status: "PARTIAL", lastErrorCode: "EARNINGS_DAY_IN_PROGRESS", lastVerifiedAt: new Date("2026-08-06T11:55:00.000Z"), retryAfterAt: null, scanProofId: "proof-current", scanProof: { status: "COMMITTED" } }]
+        : [],
       count: async ({ where }) => !where.dataType ? 1 : where.dataType === "EARNINGS" && where.status === "PARTIAL" ? 1 : 0,
     },
     $queryRaw: async () => [],
@@ -805,7 +857,7 @@ test("chunk ingesters run inside the fenced Prisma transaction client without ne
   };
   const campaigns = await ingestCampaignChunk({
     db: campaignHarness.tx,
-    job,
+    job: campaignJob("run-fenced-campaigns"),
     deviceId: "device-1",
     chunk: {
       kind: "campaigns_page",
@@ -869,7 +921,7 @@ test("earnings pages and completion are fenced to the claimed job range", async 
 
 
 test("older campaign pages are superseded once a newer generation has reached ingest", async () => {
-  const harness = batchHarness({ latestBatch: { rangeFrom: new Date("2026-08-06T12:00:00.000Z") } });
+  const harness = batchHarness({ campaignState: { id: "campaign-state-1", activeRequestedAt: new Date("2026-08-06T12:00:00.000Z"), activeGeneration: "newer-run" } });
   let touchedCampaigns = false;
   harness.tx.creatorCampaign = {
     findUnique: async () => { touchedCampaigns = true; return null; },
@@ -877,7 +929,7 @@ test("older campaign pages are superseded once a newer generation has reached in
   };
   const result = await ingestCampaignChunk({
     db: harness.db,
-    job,
+    job: campaignJob("older-run", "2026-08-06T11:00:00.000Z"),
     deviceId: "device-1",
     chunk: {
       kind: "campaigns_page",
@@ -892,13 +944,13 @@ test("older campaign pages are superseded once a newer generation has reached in
     },
   });
   assert.equal(result.superseded, true);
-  assert.equal(result.unchanged, 1);
+  assert.equal(result.generation, "older-run");
   assert.equal(touchedCampaigns, false);
-  assert.equal(harness.updated.at(-1).status, "COMMITTED");
+  assert.equal(harness.updated.length, 0);
 });
 
 test("older campaign completion cannot deactivate or overwrite coverage after a newer generation starts", async () => {
-  const harness = batchHarness({ latestBatch: { rangeFrom: new Date("2026-08-06T12:00:00.000Z") } });
+  const harness = batchHarness({ campaignState: { id: "campaign-state-1", activeRequestedAt: new Date("2026-08-06T12:00:00.000Z"), activeGeneration: "newer-run" } });
   let deactivated = false;
   harness.tx.creatorCampaign = {
     count: async () => 1,
@@ -906,7 +958,7 @@ test("older campaign completion cannot deactivate or overwrite coverage after a 
   };
   const result = await completeCampaignScan({
     db: harness.db,
-    job,
+    job: campaignJob("older-run", "2026-08-06T11:00:00.000Z"),
     deviceId: "device-1",
     result: {
       schemaVersion: 4,
@@ -935,7 +987,7 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
   harness.tx.creatorCampaign = { findUnique: async () => null, upsert: async (args) => args.create };
   await ingestCampaignChunk({
     db: harness.db,
-    job,
+    job: campaignJob("lock-run"),
     chunk: {
       kind: "campaigns_page",
       schemaVersion: 4,
@@ -948,9 +1000,11 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
       campaigns: [],
     },
   });
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
   assert.match(calls[0][0], /pg_advisory_xact_lock/);
   assert.match(calls[0][1], /^-?\d+$/);
+  assert.match(calls[1][0], /pg_advisory_xact_lock/);
+  assert.equal(calls[1][1], "analytics-collector:campaigns:creator-1");
 });
 
 

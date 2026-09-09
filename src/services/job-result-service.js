@@ -3,13 +3,14 @@
 const prisma = require("../prisma");
 const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("./team-observation-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
-const { recordNotificationPageProgress } = require("./notification-sync-state-service");
+const { recordNotificationPageProgress, assertNotificationCollectionResult } = require("./notification-sync-state-service");
 const { recordNotificationScanItems } = require("./notification-scan-control-service");
-const { JOB_KEY: FINANCIAL_TRANSACTIONS_JOB_KEY, ingestFinancialTransactionsChunk, ingestFinancialChartChunk, completeFinancialTransactionsScan } = require("./financial-transactions-service");
+const { JOB_KEY: FINANCIAL_TRANSACTIONS_JOB_KEY, ingestFinancialTransactionsChunk, ingestFinancialChartChunk, completeFinancialTransactionsScan, recordFinancialCollectionFailure } = require("./financial-transactions-service");
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { FAN_DATA_POINT_REFRESH_JOB_KEY, applyFanDataPointRefreshChunk } = require("./fan-data-authority-service");
 const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, ingestCampaignFanValueChunk, ingestCampaignFanValuesBatchChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
+const { recordCampaignCollectionFailure } = require("./analytics-collector-control-service");
 const {
   LIKES_DISCOVERY_JOB_KEY,
   applyLikesDiscoveryChunk,
@@ -204,6 +205,7 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
     return applyVaultUnsortedChunk({ db, job, deviceId, userId, chunkResult });
   }
   if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "notification_facts_page_all") {
+    assertNotificationCollectionResult({ job, scanRunId: chunkResult.scanRunId, notificationMode: chunkResult.notificationMode });
     const batches = Array.isArray(chunkResult.batches) ? chunkResult.batches : [];
     if (batches.length > 5) throw new Error("Notification ALL page contains too many typed batches");
     const seenTypes = new Set();
@@ -246,6 +248,7 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
     return { type: "notification_facts_page_all", batches: applied, audit, syncStateId: syncState?.id || null };
   }
   if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "notification_facts_page") {
+    assertNotificationCollectionResult({ job, scanRunId: chunkResult.scanRunId, notificationMode: chunkResult.notificationMode });
     const type = String(chunkResult.notificationType || "").trim().toLowerCase();
     if (!["purchases", "tips", "subscriptions", "likes", "comments"].includes(type)) throw new Error("Unsupported notification facts page type");
     const events = Array.isArray(chunkResult.events) ? chunkResult.events.slice(0, 100) : [];
@@ -317,12 +320,14 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   throw new Error(`No backend result applier registered for ${job.jobKey}`);
 }
 
-async function recordJobFailure({ db = prisma, job, error, terminal = true }) {
+async function recordJobFailure({ db = prisma, job, error, terminal = true, retryAfterAt = null }) {
+  if (job.jobKey === FINANCIAL_TRANSACTIONS_JOB_KEY) return recordFinancialCollectionFailure({ db, job, error, terminal, retryAfterAt });
+  if (job.jobKey === CAMPAIGNS_JOB_KEY) return recordCampaignCollectionFailure({ db, job, error, terminal, retryAfterAt });
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
     return recordDialogIntelligenceFailure({ db, job, error, terminal });
   }
   if (job.jobKey === VAULT_UNSORTED_JOB_KEY) return recordVaultUnsortedFailure({ db, job, error, terminal });
-  if (job.jobKey === CATCHUP_JOB_KEY) return recordCatchupJobFailure({ db, job, error });
+  if (job.jobKey === CATCHUP_JOB_KEY) return recordCatchupJobFailure({ db, job, error, terminal, retryAfterAt });
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) return recordSubscriberScanFailure({ db, job, error, terminal });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return recordLikesDiscoveryFailure({ db, job, error, terminal });
   if ([SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY].includes(job.jobKey)) return recordSfsJobFailure({ db, job, error, terminal });

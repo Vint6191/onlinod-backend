@@ -130,3 +130,109 @@ test("scheduleJobNow creates through createMany(skipDuplicates) and reads the st
   assert.equal(result.job.id, "job-new");
   assert.equal(createManyArgs.skipDuplicates, true);
 });
+
+
+test("scheduleJobNow converges replica races on one stored collection generation when stable dedupe params are supplied", async () => {
+  const rows = new Map();
+  let updateManyCalls = 0;
+  state.findUnique = async ({ where }) => rows.get(where.idempotencyKey) || null;
+  state.createMany = async ({ data }) => {
+    const row = data[0];
+    if (rows.has(row.idempotencyKey)) return { count: 0 };
+    rows.set(row.idempotencyKey, { id: "job-owned", ...row });
+    return { count: 1 };
+  };
+  state.updateMany = async () => { updateManyCalls += 1; return { count: 1 }; };
+
+  const common = {
+    jobKey: "catchup_notifications_scan",
+    creatorId: "creator-1",
+    agencyId: "agency-1",
+    priority: 80,
+    now: new Date("2026-08-07T18:06:20Z"),
+    bucketMs: 60_000,
+    dedupeParams: {
+      planningEpoch: "none:none",
+      analyticsSyncKind: "initial",
+      analyticsSyncStage: "notifications",
+      analyticsSyncVersion: 1,
+      collectionContractVersion: 1,
+      collectionType: "NOTIFICATIONS",
+      collectionMode: "full",
+    },
+  };
+
+  const first = await scheduleJobNow({
+    ...common,
+    params: {
+      collectionGeneration: "generation-a",
+      collectionRequestedAt: "2026-08-07T18:06:20.000Z",
+      collectionType: "NOTIFICATIONS",
+      collectionMode: "full",
+    },
+  });
+  const second = await scheduleJobNow({
+    ...common,
+    now: new Date("2026-08-07T18:07:01Z"),
+    params: {
+      collectionGeneration: "generation-b",
+      collectionRequestedAt: "2026-08-07T18:06:21.000Z",
+      collectionType: "NOTIFICATIONS",
+      collectionMode: "full",
+    },
+  });
+
+  assert.equal(first.created, true);
+  assert.equal(second.created, false);
+  assert.equal(second.reason, "reused");
+  assert.equal(rows.size, 1);
+  assert.equal(second.job.params.collectionGeneration, "generation-a");
+  assert.equal(updateManyCalls, 0, "a replica race must never replace the command generation stored by the winner");
+});
+
+
+test("stable collection dedupe can recover a terminal job when durable planning epoch never advanced", async () => {
+  const dedupeParams = {
+    planningEpoch: "none:none",
+    analyticsSyncKind: "initial",
+    analyticsSyncStage: "notifications",
+    analyticsSyncVersion: 1,
+    collectionContractVersion: 1,
+    collectionType: "NOTIFICATIONS",
+    collectionMode: "full",
+  };
+  let stored = null;
+  state.findUnique = async () => stored;
+  state.createMany = async ({ data }) => {
+    stored = { id: "job-terminal", leaseRevision: 0, ...data[0], status: "FAILED" };
+    return { count: 1 };
+  };
+  const first = await scheduleJobNow({
+    jobKey: "catchup_notifications_scan",
+    creatorId: "creator-1",
+    agencyId: "agency-1",
+    params: { collectionGeneration: "generation-a", collectionType: "NOTIFICATIONS", collectionMode: "full" },
+    dedupeParams,
+    now: new Date("2026-08-07T18:06:20Z"),
+  });
+  assert.equal(first.created, true);
+
+  state.updateMany = async ({ where, data }) => {
+    if (!stored || stored.id !== where.id || Number(where.leaseRevision) !== Number(stored.leaseRevision)) return { count: 0 };
+    stored = { ...stored, ...data, leaseRevision: Number(stored.leaseRevision) + 1 };
+    return { count: 1 };
+  };
+  const recovered = await scheduleJobNow({
+    jobKey: "catchup_notifications_scan",
+    creatorId: "creator-1",
+    agencyId: "agency-1",
+    params: { collectionGeneration: "generation-b", collectionType: "NOTIFICATIONS", collectionMode: "full" },
+    dedupeParams,
+    now: new Date("2026-08-07T18:09:20Z"),
+  });
+
+  assert.equal(recovered.created, false);
+  assert.equal(recovered.reason, "rescheduled");
+  assert.equal(recovered.job.status, "SCHEDULED");
+  assert.equal(recovered.job.params.collectionGeneration, "generation-b");
+});

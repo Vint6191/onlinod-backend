@@ -20,8 +20,8 @@ function pagedModel(rows, calls) {
   };
 }
 
-function loadProjection({ sales = [], tips, subscriptions, ingestAssertion }) {
-  const calls = { subscriptions: [], saleQueries: [], tipQueries: [], subscriptionQueries: [], state: null, bump: [], trafficDirty: [] };
+function loadProjection({ sales = [], tips, subscriptions, ingestAssertion, ingestResult = {}, trafficError = false }) {
+  const calls = { subscriptions: [], saleQueries: [], tipQueries: [], subscriptionQueries: [], state: null, bump: [], trafficDirty: [], sync: [] };
   const db = {
     creatorSale: pagedModel(sales, calls.saleQueries),
     creatorTip: pagedModel(tips, calls.tipQueries),
@@ -32,7 +32,11 @@ function loadProjection({ sales = [], tips, subscriptions, ingestAssertion }) {
   inject("./job-idempotency", { buildJobIdempotencyKey: () => "key" });
   inject("./traffic-service", {
     ingestSubscriptionEvent: async (args) => { calls.subscriptions.push(args); return { ok: true }; },
-    markTrafficFanValueDirty: async (args) => { calls.trafficDirty.push(args); return { ok: true, matched: 1 }; },
+    markTrafficFanValueDirty: async (args) => {
+      calls.trafficDirty.push(args);
+      if (trafficError) throw new Error("traffic compatibility failed");
+      return { ok: true, matched: 1 };
+    },
   });
   inject("./bump-service", {
     processRuntimeEvents: async (args) => { calls.bump.push(args); return { planned: args.events.length, errors: [] }; },
@@ -45,8 +49,17 @@ function loadProjection({ sales = [], tips, subscriptions, ingestAssertion }) {
         unchanged: sales.length + tips.length + subscriptions.length, rejected: 0,
         coverageComplete: true,
         coverageByType: { tips: "complete", subscriptions: "complete" }, replayed: false,
+        ...ingestResult,
       };
     },
+  });
+  inject("./notification-sync-state-service", {
+    assertNotificationCollectionResult() { return true; },
+    async completeNotificationSync(args) {
+      calls.sync.push(args);
+      return { id: "sync-1", status: args.successful ? "COMPLETE" : "PARTIAL" };
+    },
+    async recordNotificationSyncFailure() { return null; },
   });
   delete require.cache[require.resolve("./team-observation-service")];
   const { applyCatchupJobResult } = require("./team-observation-service");
@@ -57,7 +70,10 @@ function completionResult(totalAcceptedEvents) {
   const scanRunId = "scan-run-projection-0001";
   return {
     collectorVersion: "notifications-catchup-v4",
-    schemaVersion: 3,
+    schemaVersion: 4,
+    notificationMode: "full",
+    sourceExhausted: true,
+    allSourceExhausted: true,
     sourceTimezone: "UTC",
     scanRunId,
     batchKey: `run:${scanRunId}:completion`,
@@ -72,6 +88,7 @@ function completionResult(totalAcceptedEvents) {
 }
 
 function scopedJob() {
+  const scanRunId = "scan-run-projection-0001";
   return {
     id: "job-1", agencyId: "agency-1", creatorId: "creator-1",
     params: {
@@ -79,6 +96,13 @@ function scopedJob() {
       from: "2026-08-05T00:00:00.000Z",
       to: "2026-08-05T23:59:59.999Z",
       types: ["tips", "subscriptions"],
+      notificationMode: "full",
+      collectionContractVersion: 1,
+      collectionType: "NOTIFICATIONS",
+      collectionMode: "full",
+      collectionGeneration: scanRunId,
+      collectionRequestedAt: "2026-08-05T00:00:00.000Z",
+      collectionReason: "test_projection",
     },
   };
 }
@@ -102,7 +126,7 @@ test("completion preserves the collector run key and projects current-job facts"
     ingestAssertion: ({ result: supplied }) => {
       assert.equal(supplied.batchKey, result.batchKey);
       assert.equal(supplied.scanRunId, result.scanRunId);
-      assert.equal(supplied.schemaVersion, 3);
+      assert.equal(supplied.schemaVersion, 4);
     },
   });
 
@@ -168,4 +192,47 @@ test("typed subscription projection keeps refund only in the relational ledger a
   assert.deepEqual(calls.subscriptions.map((call) => call.event.eventType), ["paid_subscribed"]);
   assert.equal(applied.summary.subscriptionRefundIgnored, 1);
   assert.equal(applied.summary.skipped, 1);
+});
+
+
+test("compatibility projection failure cannot invalidate a proven notification collection", async () => {
+  const tips = [{
+    id: "tip-compat", eventFingerprint: "c".repeat(64), externalNotificationId: "tip-compat-notification",
+    externalTransactionId: null, messageId: null, amountCents: 500, currency: "USD",
+    tippedAt: new Date("2026-08-05T12:00:00.000Z"),
+    fan: { onlyFansUserId: "fan-compat", username: null, displayName: null },
+  }];
+  const { applyCatchupJobResult, calls, db } = loadProjection({ tips, subscriptions: [], trafficError: true });
+  const applied = await applyCatchupJobResult({
+    db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result: completionResult(1),
+  });
+
+  assert.equal(applied.ok, true);
+  assert.equal(applied.verified, true);
+  assert.equal(applied.compatibilityComplete, false);
+  assert.equal(applied.summary.errors, 1);
+  assert.equal(calls.sync.length, 1);
+  assert.equal(calls.sync[0].successful, true, "canonical proof must ignore compatibility-only failures");
+  assert.equal(calls.state.update.currentScanStatus, "error", "compatibility failure remains visible in Team activity");
+});
+
+test("source-exhausted rejected notification facts remain PARTIAL and enter job retry semantics", async () => {
+  const { applyCatchupJobResult, calls, db } = loadProjection({
+    tips: [], subscriptions: [],
+    ingestResult: {
+      status: "PARTIAL",
+      rejected: 1,
+      coverageComplete: false,
+      coverageByType: { tips: "partial", subscriptions: "complete" },
+    },
+  });
+  const applied = await applyCatchupJobResult({
+    db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result: completionResult(0),
+  });
+
+  assert.equal(applied.sourceTraversalComplete, true);
+  assert.equal(applied.ok, false);
+  assert.equal(applied.verified, false);
+  assert.equal(calls.sync.length, 1);
+  assert.equal(calls.sync[0].successful, false);
 });

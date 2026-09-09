@@ -4,6 +4,8 @@ const prisma = require("../prisma");
 const { audit } = require("./audit-service");
 const { TIER_CATALOG, ADDON_CATALOG, automaticTierForRevenue } = require("./billing-catalog-service");
 const { isFuture, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("./billing-entitlement-service");
+const { evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
+const { COLLECTION_FUTURE_SKEW_TOLERANCE_MS } = require("./analytics-freshness-policy");
 
 const DEFAULT_MAX_EARNINGS_AGE_HOURS = 48;
 const MAX_INT_CENTS = 2_147_483_647;
@@ -103,7 +105,8 @@ async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
   if (db.creatorEarningsDaily?.findMany && db.analyticsCoverage?.count) {
     const closed = closedRevenueWindow(now);
     const freshThreshold = new Date(now.getTime() - earningsMaxAgeMs());
-    const [rows, completeDays, freshDays] = await Promise.all([
+    const trustedClockCeiling = new Date(now.getTime() + COLLECTION_FUTURE_SKEW_TOLERANCE_MS);
+    const [rows, completeDays, provenDays, freshDays] = await Promise.all([
       db.creatorEarningsDaily.findMany({
         where: {
           creatorId,
@@ -118,6 +121,12 @@ async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
       db.analyticsCoverage.count({
         where: {
           creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
+          coverageDate: { gte: closed.startDay, lte: closed.endDay },
+        },
+      }),
+      db.analyticsCoverage.count({
+        where: {
+          creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
           scanProofId: { not: null }, lastVerifiedAt: { not: null },
           scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
           coverageDate: { gte: closed.startDay, lte: closed.endDay },
@@ -126,24 +135,36 @@ async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
       db.analyticsCoverage.count({
         where: {
           creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
-          scanProofId: { not: null }, lastVerifiedAt: { gte: freshThreshold },
+          scanProofId: { not: null }, lastVerifiedAt: { gte: freshThreshold, lte: trustedClockCeiling },
           scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
           coverageDate: { gte: closed.startDay, lte: closed.endDay },
         },
       }),
     ]);
     const uniqueDays = new Set(rows.map((row) => asDate(row.date)?.toISOString().slice(0, 10)).filter(Boolean));
-    if (completeDays >= 30 && uniqueDays.size >= 30) {
+    const collectionState = evaluateAggregateCollectionState({
+      expectedUnits: 30,
+      completeUnits: completeDays,
+      provenUsableUnits: Math.min(provenDays, uniqueDays.size),
+      freshUsableUnits: Math.min(freshDays, uniqueDays.size),
+      now,
+    });
+    if (collectionState.usable) {
       const newest = rows.reduce((latest, row) => {
         const candidate = asDate(row.collectedAt || row.updatedAt || row.date);
         return candidate && (!latest || candidate > latest) ? candidate : latest;
       }, null);
-      const fresh = freshDays >= 30;
       return {
         revenue30dCents: cents(rows.reduce((sum, row) => sum + cents(row.totalCents), 0)),
         capturedAt: newest || closed.endDay,
-        source: fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
-        fresh,
+        source: collectionState.fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
+        fresh: collectionState.fresh,
+        collectionState: stateVocabulary(collectionState),
+        complete: collectionState.complete,
+        proven: collectionState.proven,
+        stale: collectionState.stale,
+        due: collectionState.due,
+        deferred: collectionState.deferred,
       };
     }
   }
@@ -160,12 +181,14 @@ async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
     capturedAt,
     source: snapshot ? (snapshotRecent ? "EARNINGS_SNAPSHOT_30D_UNVERIFIED" : "EARNINGS_SNAPSHOT_30D_STALE") : "UNAVAILABLE",
     fresh: false,
+    collectionState: "UNAVAILABLE",
+    complete: false, proven: false, stale: false, due: true, deferred: false,
   };
 }
 
 async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) {
   const ids = [...new Set((creatorIds || []).map((value) => String(value || "").trim()).filter(Boolean))];
-  const results = new Map(ids.map((creatorId) => [creatorId, { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false }]));
+  const results = new Map(ids.map((creatorId) => [creatorId, { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false, collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false }]));
   if (!ids.length) return results;
 
   if (db.creatorEarningsSnapshot?.findMany) {
@@ -179,7 +202,7 @@ async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) 
         revenue30dCents: cents(snapshot.totalCents),
         capturedAt,
         source: recent ? "EARNINGS_SNAPSHOT_30D_UNVERIFIED" : "EARNINGS_SNAPSHOT_30D_STALE",
-        fresh: false,
+        fresh: false, collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false,
       });
     }
   }
@@ -187,7 +210,8 @@ async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) 
   if (db.creatorEarningsDaily?.groupBy && db.analyticsCoverage?.groupBy) {
     const closed = closedRevenueWindow(now);
     const freshThreshold = new Date(now.getTime() - earningsMaxAgeMs());
-    const [dailyGroups, coverageGroups, freshCoverageGroups] = await Promise.all([
+    const trustedClockCeiling = new Date(now.getTime() + COLLECTION_FUTURE_SKEW_TOLERANCE_MS);
+    const [dailyGroups, completeCoverageGroups, provenCoverageGroups, freshCoverageGroups] = await Promise.all([
       db.creatorEarningsDaily.groupBy({
         by: ["creatorId"],
         where: {
@@ -196,6 +220,14 @@ async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) 
           date: { gte: closed.startDay, lte: closed.endDay },
         },
         _count: { _all: true }, _sum: { totalCents: true }, _max: { collectedAt: true },
+      }),
+      db.analyticsCoverage.groupBy({
+        by: ["creatorId"],
+        where: {
+          creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
+          coverageDate: { gte: closed.startDay, lte: closed.endDay },
+        },
+        _count: { _all: true },
       }),
       db.analyticsCoverage.groupBy({
         by: ["creatorId"],
@@ -211,7 +243,7 @@ async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) 
         by: ["creatorId"],
         where: {
           creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
-          scanProofId: { not: null }, lastVerifiedAt: { gte: freshThreshold },
+          scanProofId: { not: null }, lastVerifiedAt: { gte: freshThreshold, lte: trustedClockCeiling },
           scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
           coverageDate: { gte: closed.startDay, lte: closed.endDay },
         },
@@ -219,17 +251,27 @@ async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) 
       }),
     ]);
     const dailyByCreator = new Map(dailyGroups.map((row) => [String(row.creatorId), row]));
-    const coverageByCreator = new Map(coverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
+    const completeByCreator = new Map(completeCoverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
+    const provenByCreator = new Map(provenCoverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
     const freshByCreator = new Map(freshCoverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
     for (const creatorId of ids) {
       const daily = dailyByCreator.get(creatorId);
-      if (Number(daily?._count?._all || 0) < 30 || (coverageByCreator.get(creatorId) || 0) < 30) continue;
-      const fresh = (freshByCreator.get(creatorId) || 0) >= 30;
+      const dailyCount = Number(daily?._count?._all || 0);
+      const collectionState = evaluateAggregateCollectionState({
+        expectedUnits: 30,
+        completeUnits: completeByCreator.get(creatorId) || 0,
+        provenUsableUnits: Math.min(provenByCreator.get(creatorId) || 0, dailyCount),
+        freshUsableUnits: Math.min(freshByCreator.get(creatorId) || 0, dailyCount),
+        now,
+      });
+      if (!collectionState.usable) continue;
       results.set(creatorId, {
         revenue30dCents: cents(daily?._sum?.totalCents),
         capturedAt: asDate(daily?._max?.collectedAt) || closed.endDay,
-        source: fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
-        fresh,
+        source: collectionState.fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
+        fresh: collectionState.fresh,
+        collectionState: stateVocabulary(collectionState),
+        complete: collectionState.complete, proven: collectionState.proven, stale: collectionState.stale, due: collectionState.due, deferred: collectionState.deferred,
       });
     }
     return results;

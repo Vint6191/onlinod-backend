@@ -7,6 +7,13 @@ const { createPlannedJobIfAbsent, reschedulePlannedJob, updatePlannedJobDemand, 
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
+const { evaluateCollectionState } = require("./analytics-state-evaluator");
+const {
+  CURRENT_DAY_FRESHNESS_MS,
+  RECENT_CLOSED_FRESHNESS_MS,
+  HISTORICAL_FRESHNESS_MS,
+  earningsFreshnessLimitMs,
+} = require("./analytics-freshness-policy");
 const {
   DAY_MS,
   ANALYTICS_CONTRACT_VERSION,
@@ -18,14 +25,18 @@ const {
 } = require("./analytics-range-contract");
 
 const SCAN_GENERATION_MS = 15 * 60 * 1000;
-const CURRENT_DAY_FRESHNESS_MS = 15 * 60 * 1000;
-const RECENT_CLOSED_FRESHNESS_MS = 48 * 60 * 60 * 1000;
-// Provider history is never declared immutable. Old earnings remain mutable
-// evidence and are periodically reverified so refunds/chargebacks/corrections
-// can converge without inventing an unsupported FINAL state.
-const HISTORICAL_FRESHNESS_MS = 30 * DAY_MS;
-const RECENT_HISTORY_DAYS = 30;
 const RECONCILIATION_BLOCK_DAYS = 7;
+// The previous production generation continuously collected 30d OF earnings
+// windows, which is concrete provider evidence for this bound. Do not raise it
+// without new provider/runtime evidence.
+const DENSE_BACKFILL_MAX_DAYS = 30;
+const DENSE_BACKFILL_MIN_DAYS = 14;
+const EARNINGS_RECONCILIATION_POLICY = Object.freeze({
+  recurringClosedDays: 30,
+  oldHistoryMode: "INTERACTIVE_DEMAND",
+  sparseBlockDays: RECONCILIATION_BLOCK_DAYS,
+  denseBackfillMaxDays: DENSE_BACKFILL_MAX_DAYS,
+});
 const SWEEP_PAGE_SIZE = 250;
 const SWEEP_CYCLE_MS = 60 * 60 * 1000;
 const SWEEP_LEASE_MS = 15 * 60 * 1000;
@@ -35,6 +46,9 @@ const DEMAND_LEASE_MS = 5 * 60 * 1000;
 const DEMAND_PAGE_SIZE = 100;
 const DEMAND_CLAIM_LOCK_KEY = "analytics-demand-claim";
 const DEMAND_MAX_PER_SWEEP = 4;
+const DEMAND_MAX_ATTEMPTS = 8;
+const DEMAND_RETRY_BASE_MS = 30 * 1000;
+const DEMAND_RETRY_MAX_MS = 60 * 60 * 1000;
 
 let sweepPromise = null;
 let demandSweepPromise = null;
@@ -156,27 +170,23 @@ function asDate(value) {
   return Number.isFinite(date.getTime()) ? date : null;
 }
 
-function freshnessLimitMs(day, now) {
+function coverageState(row, day, now, force = false) {
   const today = utcDay(now);
-  if (day.getTime() === today.getTime()) return CURRENT_DAY_FRESHNESS_MS;
-  const ageDays = Math.floor((today.getTime() - day.getTime()) / DAY_MS);
-  return ageDays <= RECENT_HISTORY_DAYS ? RECENT_CLOSED_FRESHNESS_MS : HISTORICAL_FRESHNESS_MS;
+  const isCurrentDay = day.getTime() === today.getTime();
+  return evaluateCollectionState({
+    status: row?.status || "MISSING",
+    proofStatus: row?.scanProof?.status || null,
+    lastVerifiedAt: row?.lastVerifiedAt || null,
+    retryAfterAt: row?.retryAfterAt || null,
+    now,
+    freshnessMs: earningsFreshnessLimitMs(day, now),
+    partialUsable: isCurrentDay,
+    forceDue: force === true,
+  });
 }
 
 function coverageFresh(row, day, now, force = false) {
-  if (force || !row) return false;
-  const today = utcDay(now);
-  const isCurrentDay = day.getTime() === today.getTime();
-  if (isCurrentDay) {
-    if (!["PARTIAL", "COMPLETE"].includes(String(row.status || ""))) return false;
-  } else if (String(row.status || "") !== "COMPLETE") {
-    return false;
-  }
-  if (!row.scanProofId || String(row.scanProof?.status || "") !== "COMMITTED") return false;
-  const lastVerifiedAt = asDate(row.lastVerifiedAt);
-  if (!lastVerifiedAt || lastVerifiedAt > new Date(now.getTime() + 5 * 60 * 1000)) return false;
-  if (row.retryAfterAt && asDate(row.retryAfterAt) > now) return true;
-  return now.getTime() - lastVerifiedAt.getTime() <= freshnessLimitMs(day, now);
+  return coverageState(row, day, now, force).fresh;
 }
 
 function alignedWeekStart(day) {
@@ -189,16 +199,49 @@ function alignedWeekStart(day) {
 function windowsForDueDays(dueDays, now) {
   const today = utcDay(now);
   const windows = new Map();
-  for (const day of dueDays) {
+  const closedDays = [];
+  const seen = new Set();
+  for (const rawDay of dueDays) {
+    const day = utcDay(rawDay);
+    const key = dateKey(day);
+    if (seen.has(key)) continue;
+    seen.add(key);
     if (day.getTime() === today.getTime()) {
-      const key = dateKey(day);
       windows.set(`today:${key}`, { scanFrom: day, scanTo: day });
+    } else if (day < today) {
+      closedDays.push(day);
+    }
+  }
+  closedDays.sort((a, b) => a - b);
+
+  const runs = [];
+  let run = [];
+  for (const day of closedDays) {
+    if (!run.length || day.getTime() - run.at(-1).getTime() === DAY_MS) run.push(day);
+    else { runs.push(run); run = [day]; }
+  }
+  if (run.length) runs.push(run);
+
+  for (const contiguous of runs) {
+    if (contiguous.length >= DENSE_BACKFILL_MIN_DAYS) {
+      // Dense missing history is backfilled in the largest provider window that
+      // current production evidence proves safe (30d), rather than dozens of
+      // tiny display-range jobs. Sparse gaps keep the narrower reconciliation
+      // block so fresh neighboring history is not needlessly re-read.
+      for (let offset = 0; offset < contiguous.length; offset += DENSE_BACKFILL_MAX_DAYS) {
+        const chunk = contiguous.slice(offset, offset + DENSE_BACKFILL_MAX_DAYS);
+        const first = chunk[0];
+        const last = chunk.at(-1);
+        windows.set(`dense:${dateKey(first)}:${dateKey(last)}`, { scanFrom: first, scanTo: last });
+      }
       continue;
     }
-    const blockStart = alignedWeekStart(day);
-    const blockEnd = new Date(Math.min(blockStart.getTime() + (RECONCILIATION_BLOCK_DAYS - 1) * DAY_MS, today.getTime() - DAY_MS));
-    const key = `${dateKey(blockStart)}:${dateKey(blockEnd)}`;
-    windows.set(key, { scanFrom: blockStart, scanTo: blockEnd });
+    for (const day of contiguous) {
+      const blockStart = alignedWeekStart(day);
+      const blockEnd = new Date(Math.min(blockStart.getTime() + (RECONCILIATION_BLOCK_DAYS - 1) * DAY_MS, today.getTime() - DAY_MS));
+      const key = `${dateKey(blockStart)}:${dateKey(blockEnd)}`;
+      windows.set(key, { scanFrom: blockStart, scanTo: blockEnd });
+    }
   }
   return [...windows.values()].sort((a, b) => a.scanFrom - b.scanFrom);
 }
@@ -389,9 +432,12 @@ async function ensureAnalyticsWindowFreshness({
       select: { coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true } } },
     });
   const byDay = new Map(rows.map((row) => [dateKey(row.coverageDate), row]));
-  const dueDays = days.filter((day) => !coverageFresh(byDay.get(dateKey(day)), day, currentNow, force));
+  const evaluatedDays = days.map((day) => ({ day, state: coverageState(byDay.get(dateKey(day)), day, currentNow, force) }));
+  const dueDays = evaluatedDays.filter((item) => item.state.due).map((item) => item.day);
+  const deferredDays = evaluatedDays.filter((item) => item.state.deferred).length;
+  const staleDays = evaluatedDays.filter((item) => item.state.stale).length;
   if (!dueDays.length) {
-    return { ok: true, displayRangeKey, startDay: from, endDay: to, dueDays: 0, windows: 0, created: 0, reused: 0, jobs: [] };
+    return { ok: true, displayRangeKey, startDay: from, endDay: to, dueDays: 0, deferredDays, staleDays, windows: 0, created: 0, reused: 0, jobs: [], fresh: staleDays === 0 && deferredDays === 0 };
   }
   const windows = windowsForDueDays(dueDays, currentNow);
   const jobs = [];
@@ -414,7 +460,7 @@ async function ensureAnalyticsWindowFreshness({
     if (result.created) created += 1;
     else reused += 1;
   }
-  return { ok: true, displayRangeKey, startDay: from, endDay: to, dueDays: dueDays.length, windows: windows.length, created, reused, jobs };
+  return { ok: true, displayRangeKey, startDay: from, endDay: to, dueDays: dueDays.length, deferredDays, staleDays, windows: windows.length, created, reused, jobs, fresh: false };
 }
 
 async function ensureAnalyticsFreshness({
@@ -460,7 +506,7 @@ function operationalFreshnessWindow(now = new Date()) {
   // the Home 30d current range and Billing's previous-30-closed-day authority
   // without turning either product display range into a collection identity.
   return {
-    startDay: new Date(today.getTime() - 30 * DAY_MS),
+    startDay: new Date(today.getTime() - EARNINGS_RECONCILIATION_POLICY.recurringClosedDays * DAY_MS),
     endDay: today,
   };
 }
@@ -572,7 +618,12 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
           requestRevision: Number(existing.requestRevision || 0) + 1,
           requestedAt: currentNow,
           completedAt: null,
+          attempts: 0,
+          nextAttemptAt: null,
+          lastErrorCode: null,
+          lastErrorClass: null,
           lastError: null,
+          quarantinedAt: null,
           ...(!claimAlive ? { claimToken: null, claimUntil: null, claimedRevision: null, cursorCreatorId: null } : {}),
         },
       });
@@ -591,7 +642,11 @@ async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerTo
       const row = await tx.analyticsCollectionDemand.findFirst({
         where: {
           completedAt: null,
-          OR: [{ claimUntil: null }, { claimUntil: { lte: currentNow } }],
+          quarantinedAt: null,
+          AND: [
+            { OR: [{ claimUntil: null }, { claimUntil: { lte: currentNow } }] },
+            { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: currentNow } }] },
+          ],
         },
         orderBy: [{ priority: "desc" }, { requestedAt: "asc" }, { key: "asc" }],
       });
@@ -604,7 +659,6 @@ async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerTo
           claimUntil: new Date(currentNow.getTime() + DEMAND_LEASE_MS),
           claimedRevision: row.requestRevision,
           cursorCreatorId: resumeSameRevision ? row.cursorCreatorId : null,
-          lastError: null,
         },
       });
       return claimed;
@@ -622,6 +676,36 @@ async function renewAnalyticsDemandLease({ db = prisma, key, claimToken, claimed
   return Number(result?.count || 0) === 1;
 }
 
+const DEMAND_CONTRACT_ERROR_CODES = new Set([
+  "ANALYTICS_DEMAND_SCOPE_CORRUPT",
+  "ANALYTICS_DEMAND_ACCESS_FENCE_MISSING",
+  "ANALYTICS_DEMAND_RANGE_INVALID",
+]);
+const DEMAND_TRANSIENT_ERROR_CODES = new Set([
+  "P1001", "P1002", "P1008", "P1017", "P2024", "P2034",
+  "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN",
+]);
+
+function analyticsDemandError(error) {
+  const source = error && typeof error === "object" ? error : {};
+  const rawCode = String(source.code || "ANALYTICS_DEMAND_FAILED").trim().toUpperCase().replace(/[^A-Z0-9_]+/g, "_");
+  const code = (rawCode || "ANALYTICS_DEMAND_FAILED").slice(0, 120);
+  const errorClass = DEMAND_CONTRACT_ERROR_CODES.has(code)
+    ? "CONTRACT"
+    : DEMAND_TRANSIENT_ERROR_CODES.has(code) ? "TRANSIENT" : "INTERNAL";
+  return {
+    code,
+    errorClass,
+    terminal: errorClass === "CONTRACT",
+    message: String(source.message || error || "Analytics collection demand failed").slice(0, 1000),
+  };
+}
+
+function demandRetryDelayMs(attempts) {
+  const exponent = Math.max(0, Math.min(10, Number(attempts || 1) - 1));
+  return Math.min(DEMAND_RETRY_MAX_MS, DEMAND_RETRY_BASE_MS * (2 ** exponent));
+}
+
 async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Date(), error = null, cancellationReason = null }) {
   const finishedAt = asDate(completedAt);
   if (!finishedAt) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
@@ -633,19 +717,34 @@ async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Da
       if (!current || current.claimToken !== demand.claimToken || Number(current.claimedRevision) !== Number(demand.claimedRevision)) {
         return { settled: false, reason: "claim_lost" };
       }
-      if (error) {
-        await tx.analyticsCollectionDemand.update({
-          where: { key: demand.key },
-          data: { claimToken: null, claimUntil: finishedAt, lastError: String(error).slice(0, 1000) },
-        });
-        return { settled: true, completed: false, retry: true };
-      }
+      // Revision authority outranks the outcome of an older claimed pass. A
+      // refresh may coalesce into the same durable demand while the prior
+      // revision still owns a live lease. Once that happens, neither success,
+      // cancellation nor even a terminal failure from the old revision may
+      // complete/backoff/quarantine the newer user request. Release the old
+      // claim and make the newest revision immediately eligible with a clean
+      // failure lifecycle.
       if (Number(current.requestRevision) > Number(demand.claimedRevision)) {
         await tx.analyticsCollectionDemand.update({
           where: { key: demand.key },
-          data: { claimToken: null, claimUntil: null, claimedRevision: null, cursorCreatorId: null, completedAt: null, lastError: null },
+          data: { claimToken: null, claimUntil: null, claimedRevision: null, cursorCreatorId: null, completedAt: null, attempts: 0, nextAttemptAt: null, lastErrorCode: null, lastErrorClass: null, lastError: null, quarantinedAt: null },
         });
         return { settled: true, completed: false, retry: true, reason: "newer_revision_pending" };
+      }
+      if (error) {
+        const failure = analyticsDemandError(error);
+        const attempts = Number(current.attempts || 0) + 1;
+        const quarantined = failure.terminal === true || attempts >= DEMAND_MAX_ATTEMPTS;
+        const nextAttemptAt = quarantined ? null : new Date(finishedAt.getTime() + demandRetryDelayMs(attempts));
+        await tx.analyticsCollectionDemand.update({
+          where: { key: demand.key },
+          data: {
+            claimToken: null, claimUntil: finishedAt, claimedRevision: null,
+            attempts, nextAttemptAt, lastErrorCode: failure.code, lastErrorClass: failure.errorClass, lastError: failure.message,
+            quarantinedAt: quarantined ? finishedAt : null,
+          },
+        });
+        return { settled: true, completed: false, retry: !quarantined, quarantined, attempts, nextAttemptAt, errorCode: failure.code, errorClass: failure.errorClass };
       }
       const cancelled = cancellationReason ? String(cancellationReason).slice(0, 1000) : null;
       await tx.analyticsCollectionDemand.update({
@@ -656,7 +755,12 @@ async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Da
           claimToken: null,
           claimUntil: finishedAt,
           cursorCreatorId: demand.cursorCreatorId || null,
+          attempts: 0,
+          nextAttemptAt: null,
+          lastErrorCode: cancelled ? "ANALYTICS_DEMAND_CANCELLED" : null,
+          lastErrorClass: cancelled ? "CANCELLED" : null,
           lastError: cancelled,
+          quarantinedAt: null,
         },
       });
       return { settled: true, completed: true, retry: false, cancelled: Boolean(cancelled), ...(cancelled ? { reason: cancelled } : {}) };
@@ -835,7 +939,7 @@ async function runAnalyticsCollectionDemandSweep({ db = prisma, now = new Date()
         totals.reused += result.reused || 0;
         totals.dueDays += result.dueDays || 0;
       } catch (error) {
-        await settleAnalyticsDemand({ db, demand, completedAt: new Date(), error: error?.message || error });
+        await settleAnalyticsDemand({ db, demand, completedAt: new Date(), error });
       }
     }
     return { ok: true, skipped: false, ...totals };
@@ -955,6 +1059,8 @@ module.exports = {
   CURRENT_DAY_FRESHNESS_MS,
   RECENT_CLOSED_FRESHNESS_MS,
   HISTORICAL_FRESHNESS_MS,
+  EARNINGS_RECONCILIATION_POLICY,
+  DENSE_BACKFILL_MAX_DAYS,
   SWEEP_CYCLE_MS,
   SWEEP_LEASE_MS,
   SWEEP_LEASE_KEY,
@@ -971,6 +1077,7 @@ module.exports = {
   renewAnalyticsSweepLease,
   completeAnalyticsSweepCycle,
   coverageFresh,
+  coverageState,
   sameScanWindow,
   planWindow,
   ensureAnalyticsWindowFreshness,

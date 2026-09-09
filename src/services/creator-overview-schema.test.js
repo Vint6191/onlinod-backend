@@ -30,10 +30,14 @@ test("creator overview is a composed read model, not another raw analytics store
 
 test("one-year audience range stays locked until six-month backfill has accumulated another half year", () => {
   assert.match(service, /185 \* DAY_MS/);
-  assert.match(service, /fullBackfillVerifiedAt/);
-  assert.match(service, /fullBackfillVerifiedAt \|\| ledger\.notificationSync\?\.fullBackfillCompletedAt/);
+  assert.match(service, /notificationBaselineAtRaw = ledger\.notificationSync\?\.fullBackfillVerifiedAt \|\| null/);
+  assert.match(service, /notificationBaselineAt = trustedCollectionTimestamp\(notificationBaselineAtRaw, now\)/);
+  assert.match(service, /baselineCompletedAt: ledger\.notificationSync\?\.fullBackfillCompletedAt/);
+  assert.match(service, /baselineVerifiedAt: ledger\.notificationSync\?\.fullBackfillVerifiedAt/);
+  assert.match(service, /lastCatchupVerifiedAt/);
+  assert.match(service, /notificationVerified: notificationCollection\.proven === true/);
   assert.match(service, /oldestOccurredAt/);
-  assert.match(service, /oneYearAvailable/);
+  assert.match(service, /oneYearAvailable = Boolean\(notificationCollection\.proven === true/);
   assert.match(service, /365d/);
 });
 
@@ -61,10 +65,15 @@ test("activity log records executed work rather than filling history with untouc
   assert.match(migration, /NEW\."status" = 'SCHEDULED'/);
   assert.match(migration, /NEW\."startedAt" IS NULL/);
   assert.match(migration, /NEW\."claimedAt" IS NULL/);
-  assert.match(service, /status: \{ in: \["CLAIMED", "PAUSED", "DONE", "FAILED", "CANCELLED"\] \}/);
+  assert.doesNotMatch(service, /db\.jobInstance\.findMany/);
 });
 
 test("task activity day index is queried separately so the renderer never needs 2500 rows just to build day filters", () => {
+  assert.match(service, /CreatorTaskActivity Prisma delegate is required by the current Creator Overview contract/);
+  const activityStart = service.indexOf("async function readCreatorTaskActivityDays");
+  const activityEnd = service.indexOf("async function readCreatorOverview", activityStart);
+  const activityBlock = service.slice(activityStart, activityEnd > activityStart ? activityEnd : undefined);
+  assert.doesNotMatch(activityBlock, /db\.jobInstance\.findMany|rolling deploy fallback|JobInstance until migration/);
   assert.match(service, /readCreatorTaskActivityDays/);
   assert.match(service, /GROUP BY 1/);
   assert.match(routes, /readCreatorTaskActivityDays/);
@@ -87,4 +96,15 @@ test("campaign overview exposes current OF fan value even when claimer arrival t
   assert.match(service, /ofValueKnownFans/);
   assert.match(service, /ofValuePayingFans/);
   assert.match(service, /platformReportedFanSpendCents/);
+});
+
+
+test("collector read states use one COMPLETE PROVEN FRESH vocabulary without collapsing product facts", () => {
+  assert.match(service, /evaluateDurableCollectorState/);
+  assert.match(service, /NOTIFICATION_COLLECTION_FRESHNESS_MS/);
+  assert.match(service, /FINANCIAL_COLLECTION_FRESHNESS_MS/);
+  assert.match(service, /CAMPAIGN_COLLECTION_FRESHNESS_MS/);
+  assert.match(service, /collectors:\s*\{/);
+  assert.match(service, /financial: collectorStatePayload\(financialCollection\)/);
+  assert.match(service, /campaigns: collectorStatePayload\(campaignCollection\)/);
 });

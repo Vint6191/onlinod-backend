@@ -15,7 +15,8 @@ const {
   CURRENT_DAY_FRESHNESS_MS,
   RECENT_CLOSED_FRESHNESS_MS,
   HISTORICAL_FRESHNESS_MS,
-} = require("./analytics-collection-planner");
+} = require("./analytics-freshness-policy");
+const { evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
 
 function availability(available, reason = null) {
   return { available: available === true, reason: available === true ? null : (reason || "UNAVAILABLE") };
@@ -48,7 +49,9 @@ function freshEnough(value, now, maxAgeMs) {
 
 async function readCoverageState({ db, creatorIds, range, now }) {
   const ids = creatorIds || [];
-  const out = new Map(ids.map((id) => [id, { completeDays: 0, fresh: true, currentVerifiedAt: null }]));
+  const out = new Map(ids.map((id) => [id, {
+    completeDays: 0, provenUsableDays: 0, freshUsableDays: 0, partialDays: 0, currentVerifiedAt: null,
+  }]));
   if (!ids.length) return { byCreator: out, expectedDays: dayCount(range.startDay, range.endDay) };
 
   const today = utcDay(now);
@@ -93,7 +96,7 @@ async function readCoverageState({ db, creatorIds, range, now }) {
         coverageDate: today, status: { in: ["PARTIAL", "COMPLETE"] }, scanProofId: { not: null },
         scanProof: { is: { status: "COMMITTED" } },
       },
-      select: { creatorId: true, lastVerifiedAt: true },
+      select: { creatorId: true, status: true, lastVerifiedAt: true },
     }).then((rows) => ({ kind: "today", rows })));
   }
 
@@ -102,21 +105,38 @@ async function readCoverageState({ db, creatorIds, range, now }) {
       const state = out.get(row.creatorId);
       if (!state) continue;
       if (group.kind === "today") {
-        state.completeDays += 1;
+        state.provenUsableDays += 1;
+        if (String(row.status || "PARTIAL").toUpperCase() === "COMPLETE") state.completeDays += 1;
+        else state.partialDays += 1;
         state.currentVerifiedAt = row.lastVerifiedAt || null;
-        if (!freshEnough(row.lastVerifiedAt, now, CURRENT_DAY_FRESHNESS_MS)) state.fresh = false;
+        if (freshEnough(row.lastVerifiedAt, now, CURRENT_DAY_FRESHNESS_MS)) state.freshUsableDays += 1;
       } else {
-        state.completeDays += Number(row?._count?._all || 0);
+        const count = Number(row?._count?._all || 0);
+        state.completeDays += count;
+        state.provenUsableDays += count;
         const limit = group.kind === "recent" ? RECENT_CLOSED_FRESHNESS_MS : HISTORICAL_FRESHNESS_MS;
-        if (!freshEnough(row?._min?.lastVerifiedAt, now, limit)) state.fresh = false;
+        if (freshEnough(row?._min?.lastVerifiedAt, now, limit)) state.freshUsableDays += count;
       }
     }
   }
 
   const expectedDays = dayCount(range.startDay, range.endDay);
   for (const state of out.values()) {
-    state.complete = state.completeDays >= expectedDays;
-    if (!state.complete) state.fresh = false;
+    const evaluation = evaluateAggregateCollectionState({
+      expectedUnits: expectedDays,
+      completeUnits: state.completeDays,
+      provenUsableUnits: state.provenUsableDays,
+      freshUsableUnits: state.freshUsableDays,
+      partialUnits: state.partialDays,
+      now,
+    });
+    state.evaluation = evaluation;
+    state.complete = evaluation.complete;
+    state.proven = evaluation.proven;
+    state.usable = evaluation.usable;
+    state.fresh = evaluation.fresh;
+    state.stale = evaluation.stale;
+    state.vocabulary = stateVocabulary(evaluation);
   }
   return { byCreator: out, expectedDays };
 }
@@ -127,18 +147,27 @@ async function readCanonicalRevenue({ db, agencyId, creators, range, previous, n
     return { totalCents: 0, deltaPct: null, points: [], creators: [], reportingCreators: 0, staleCreators: 0, pendingCreatorIds: [], pendingJobs: [] };
   }
 
-  const [coverage, previousCoverage, activeJobs] = await Promise.all([
+  const [coverage, previousCoverage, activeJobs, activeDemands] = await Promise.all([
     readCoverageState({ db, creatorIds, range, now }),
     previous ? readCoverageState({ db, creatorIds, range: previous, now }) : Promise.resolve(null),
     db.jobInstance.findMany({
       where: { creatorId: { in: creatorIds }, jobKey: "fetch_earnings", status: { in: ["SCHEDULED", "CLAIMED"] } },
       select: { id: true, creatorId: true, status: true },
     }),
+    db.analyticsCollectionDemand?.findMany ? db.analyticsCollectionDemand.findMany({
+      where: {
+        agencyId, completedAt: null, quarantinedAt: null,
+        coverageFrom: { lte: range.startDay }, coverageTo: { gte: range.endDay },
+      },
+      select: { key: true, creatorIds: true, claimToken: true, nextAttemptAt: true, requestedAt: true },
+      orderBy: { requestedAt: "desc" },
+      take: 50,
+    }) : Promise.resolve([]),
   ]);
 
-  const reportingIds = creatorIds.filter((id) => coverage.byCreator.get(id)?.complete === true);
+  const reportingIds = creatorIds.filter((id) => coverage.byCreator.get(id)?.usable === true);
   const previousReportingIds = previousCoverage
-    ? creatorIds.filter((id) => previousCoverage.byCreator.get(id)?.complete === true)
+    ? creatorIds.filter((id) => previousCoverage.byCreator.get(id)?.usable === true)
     : [];
   const [currentGroups, dateGroups, previousTotal] = await Promise.all([
     reportingIds.length ? db.creatorEarningsDaily.groupBy({
@@ -167,20 +196,15 @@ async function readCanonicalRevenue({ db, agencyId, creators, range, previous, n
   ]);
 
   const currentByCreator = new Map(currentGroups.map((row) => [String(row.creatorId), row]));
-  const activeByCreator = new Map();
-  for (const job of activeJobs) {
-    const list = activeByCreator.get(job.creatorId) || [];
-    list.push(job);
-    activeByCreator.set(job.creatorId, list);
-  }
-  const pendingCreatorIds = [...activeByCreator.keys()];
-  const pendingJobs = activeJobs.map((job) => ({ creatorId: job.creatorId, jobId: job.id, reason: String(job.status || "pending").toLowerCase() }));
+  const pendingByCreator = projectCollectionLifecycle({ creatorIds, activeJobs, activeDemands, now });
+  const pendingCreatorIds = [...pendingByCreator.keys()];
+  const pendingJobs = [...pendingByCreator.entries()].map(([creatorId, row]) => ({ creatorId, jobId: row.jobId, reason: row.reason }));
   let totalCents = 0;
   let staleCreators = 0;
   const creatorRows = creators.map((creator) => {
-    const state = coverage.byCreator.get(creator.id) || { complete: false, fresh: false };
+    const state = coverage.byCreator.get(creator.id) || { complete: false, proven: false, usable: false, fresh: false, vocabulary: "UNAVAILABLE" };
     const group = currentByCreator.get(creator.id) || null;
-    const hasRevenue = state.complete === true && Number(group?._count?._all || 0) >= coverage.expectedDays;
+    const hasRevenue = state.usable === true && Number(group?._count?._all || 0) >= coverage.expectedDays;
     const stale = hasRevenue && state.fresh !== true;
     if (stale) staleCreators += 1;
     const revenueCents = hasRevenue ? Number(group?._sum?.totalCents || 0) : null;
@@ -201,16 +225,17 @@ async function readCanonicalRevenue({ db, agencyId, creators, range, previous, n
       uniqueFans: null,
       capturedAt,
       hasRevenue,
-      pending: activeByCreator.has(creator.id),
+      pending: pendingByCreator.has(creator.id),
       stale,
       staleSeconds,
+      collectionState: state.vocabulary,
     };
   }).sort((a, b) => Number(b.revenueCents ?? -1) - Number(a.revenueCents ?? -1));
 
-  const currentComplete = reportingIds.length === creatorIds.length;
-  const previousComplete = previous && previousReportingIds.length === creatorIds.length;
-  const currentFresh = currentComplete && creatorIds.every((id) => coverage.byCreator.get(id)?.fresh === true);
-  const previousFresh = previousCoverage && previousComplete
+  const currentUsable = reportingIds.length === creatorIds.length;
+  const previousUsable = previous && previousReportingIds.length === creatorIds.length;
+  const currentFresh = currentUsable && creatorIds.every((id) => coverage.byCreator.get(id)?.fresh === true);
+  const previousFresh = previousCoverage && previousUsable
     ? creatorIds.every((id) => previousCoverage.byCreator.get(id)?.fresh === true)
     : false;
   const previousCents = previousTotal ? Number(previousTotal?._sum?.totalCents || 0) : null;
@@ -221,9 +246,9 @@ async function readCanonicalRevenue({ db, agencyId, creators, range, previous, n
     // once every scoped creator has canonical coverage for the requested range.
     // This preserves UNKNOWN != ZERO and prevents partial coverage from looking
     // like complete agency revenue.
-    totalCents: currentComplete ? totalCents : null,
-    deltaPct: currentComplete && previousComplete && currentFresh && previousFresh ? pctChange(totalCents, previousCents) : null,
-    points: currentComplete
+    totalCents: currentUsable ? totalCents : null,
+    deltaPct: currentUsable && previousUsable && currentFresh && previousFresh ? pctChange(totalCents, previousCents) : null,
+    points: currentUsable
       ? dateGroups.sort((a, b) => new Date(a.date) - new Date(b.date)).map((row) => ({ label: dateKey(row.date), valueCents: Number(row?._sum?.totalCents || 0) }))
       : [],
     creators: creatorRows,
@@ -232,6 +257,42 @@ async function readCanonicalRevenue({ db, agencyId, creators, range, previous, n
     pendingCreatorIds,
     pendingJobs,
   };
+}
+
+
+function projectCollectionLifecycle({ creatorIds, activeJobs = [], activeDemands = [], now = new Date() }) {
+  const visibleCreatorIds = (creatorIds || []).map((value) => String(value || "").trim()).filter(Boolean);
+  const visibleIds = new Set(visibleCreatorIds);
+  const pendingByCreator = new Map();
+
+  // Materialized provider work is the strongest lifecycle signal. A queued or
+  // claimed demand must never downgrade a creator that is already collecting.
+  for (const job of activeJobs || []) {
+    const creatorId = String(job?.creatorId || "").trim();
+    if (!creatorId || !visibleIds.has(creatorId) || pendingByCreator.has(creatorId)) continue;
+    pendingByCreator.set(creatorId, {
+      jobId: job?.id || null,
+      reason: "collecting",
+    });
+  }
+
+  for (const demand of activeDemands || []) {
+    const explicit = Array.isArray(demand?.creatorIds)
+      ? demand.creatorIds.map((value) => String(value || "").trim()).filter(Boolean)
+      : null;
+    const targets = explicit == null ? visibleCreatorIds : explicit.filter((id) => visibleIds.has(id));
+    const retryAt = demand?.nextAttemptAt ? new Date(demand.nextAttemptAt) : null;
+    const reason = demand?.claimToken
+      ? "planning"
+      : retryAt && Number.isFinite(retryAt.getTime()) && retryAt > now
+        ? "deferred"
+        : "queued";
+    for (const creatorId of targets) {
+      if (!pendingByCreator.has(creatorId)) pendingByCreator.set(creatorId, { jobId: null, reason });
+    }
+  }
+
+  return pendingByCreator;
 }
 
 function emptyRevenueCreator(creator) {
@@ -346,4 +407,4 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d" }) {
   };
 }
 
-module.exports = { buildHomeSummary, __test: { readCoverageState, readCanonicalRevenue } };
+module.exports = { buildHomeSummary, __test: { readCoverageState, readCanonicalRevenue, projectCollectionLifecycle } };

@@ -25,7 +25,7 @@ function loadService(fixture) {
     exports: {
       applyJobChunk: fixture.applyJobChunk || (async () => ({})),
       applyJobResult: fixture.applyJobResult || (async () => ({})),
-      recordJobFailure: async () => ({}),
+      recordJobFailure: fixture.recordJobFailure || (async () => ({})),
     },
   };
   require.cache[catalogModule] = {
@@ -570,6 +570,14 @@ test("bounded notification catch-up marks DONE before deferred compatibility pro
       findUnique: async () => job,
       updateMany: async (args) => { updates.push(args); order.push("done-fence"); return { count: 1 }; },
     },
+    analyticsIngestBatch: {
+      findMany: async () => [{
+        idempotencyKey: `notification-facts:${job.id}:run:scan-bounded-success-1:page:tips:abc:v6`,
+        status: "COMMITTED",
+        receivedRows: 1,
+        rejectedRows: 0,
+      }],
+    },
     $transaction: async (callback) => callback(db),
   };
   const { completeJob } = loadService({
@@ -596,6 +604,8 @@ test("bounded notification catch-up marks DONE before deferred compatibility pro
     result: {
       notificationMode: "catchup",
       schemaVersion: 5,
+      scanRunId: "scan-bounded-success-1",
+      totalAcceptedEvents: 1,
       sourceExhausted: true,
       coverage: {
         purchases: { status: "complete", rejected: 0 },
@@ -609,6 +619,9 @@ test("bounded notification catch-up marks DONE before deferred compatibility pro
   });
 
   assert.equal(result.job.status, "DONE");
+  assert.equal(result.sideEffect.verified, true);
+  assert.equal(result.sideEffect.pageProof.reason, "verified");
+  assert.equal(result.sideEffect.pageProof.receivedRows, 1);
   assert.equal(result.sideEffect.compatibilityDeferred, true);
   assert.equal(updates.length, 1);
   assert.equal(updates[0].data.status, "DONE");
@@ -616,6 +629,77 @@ test("bounded notification catch-up marks DONE before deferred compatibility pro
   assert.equal(order.includes("compatibility"), false, "compatibility must not block completion response");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(order.includes("compatibility"), true);
+});
+
+
+test("bounded notification catch-up cannot become PROVEN when backend page receipts are partial", async () => {
+  const token = "bounded-notification-backend-proof-token";
+  const now = new Date();
+  const job = {
+    id: "bounded-notification-backend-proof-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 6,
+    leaseUntil: new Date(now.getTime() + 60_000),
+    attempts: 0,
+    params: { notificationMode: "catchup", types: ["tips"] },
+    workId: "bounded-notification-backend-proof-work",
+  };
+  const updates = [];
+  const failures = [];
+  const syncCalls = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
+    },
+    analyticsIngestBatch: {
+      findMany: async () => [{
+        idempotencyKey: `notification-facts:${job.id}:run:scan-backend-proof-1:page:tips:abc:v6`,
+        status: "PARTIAL",
+        receivedRows: 1,
+        rejectedRows: 1,
+      }],
+    },
+    $transaction: async (callback) => callback(db),
+  };
+  const { completeJob } = loadService({
+    db,
+    completeNotificationSync: async ({ successful }) => { syncCalls.push(successful); return { id: "sync-1" }; },
+    recordJobFailure: async (args) => { failures.push(args); return {}; },
+  });
+
+  const result = await completeJob({
+    jobId: job.id,
+    userId: "user-1",
+    deviceId: "device-1",
+    leaseToken: token,
+    leaseRevision: 6,
+    workId: job.workId,
+    result: {
+      notificationMode: "catchup",
+      schemaVersion: 5,
+      scanRunId: "scan-backend-proof-1",
+      totalAcceptedEvents: 1,
+      sourceExhausted: true,
+      coverage: { tips: { status: "complete", rejected: 0 } },
+    },
+    progress: { percent: 100 },
+  });
+
+  assert.equal(result.job.status, "SCHEDULED");
+  assert.equal(result.sideEffect.verified, false);
+  assert.equal(result.sideEffect.pageProof.reason, "backend_page_receipt_partial");
+  assert.deepEqual(syncCalls, [false]);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].terminal, false);
+  assert.equal(updates[0].data.status, "SCHEDULED");
 });
 
 test("partial notification completion is rescheduled instead of being marked DONE", async () => {
@@ -654,7 +738,7 @@ test("partial notification completion is rescheduled instead of being marked DON
       summary: {
         analyticsCoverageComplete: false,
         requestedTypes: ["purchases", "tips"],
-        analyticsCoverageByType: { purchases: "complete", tips: "partial" },
+        collectionCoverageByType: { purchases: "complete", tips: "partial" },
       },
     }),
   });
@@ -680,15 +764,133 @@ test("partial notification completion is rescheduled instead of being marked DON
   assert.equal(updates.length, 2);
   assert.equal(updates[1].where.leaseRevision, 4);
   assert.equal(updates[1].data.status, "SCHEDULED");
-  assert.equal(updates[1].data.attempts, 0);
+  assert.equal(updates[1].data.attempts, 1);
   assert.equal(updates[1].data.continuation, null);
   assert.equal(updates[1].data.claimedByDeviceId, null);
   assert.equal(updates[1].data.lastError, "notification_scan_partial");
   assert.deepEqual(updates[1].data.params.types, ["tips"]);
-  assert.deepEqual(updates[1].data.params.resumeCursors, { tips: "tip-cursor-200" });
-  assert.equal(updates[1].data.params.notificationRepairPass, 1);
+  assert.equal("resumeCursors" in updates[1].data.params, false);
+  assert.equal("notificationRepairPass" in updates[1].data.params, false);
   assert.ok(updates[1].data.nextRunAt instanceof Date);
   assert.equal(result.job.status, "SCHEDULED");
+});
+
+test("manual notification PARTIAL at a proven source boundary stays a visible one-shot DONE", async () => {
+  const token = "manual-notification-boundary-token";
+  const now = new Date();
+  const job = {
+    id: "manual-notification-boundary-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 4,
+    leaseUntil: new Date(now.getTime() + 60_000),
+    attempts: 0,
+    params: {
+      manualNotificationScan: true,
+      manualNotificationScanVersion: 1,
+      notificationMode: "full",
+      types: ["tips"],
+    },
+    continuation: { driverPhase: "complete" },
+    workId: "manual-notification-boundary-work",
+  };
+  const updates = [];
+  const failures = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => ({
+      ok: false,
+      verified: false,
+      sourceTraversalComplete: true,
+      summary: { requestedTypes: ["tips"], collectionCoverageByType: { tips: "partial" } },
+    }),
+    recordJobFailure: async (args) => { failures.push(args); return {}; },
+  });
+
+  const result = await completeJob({
+    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token,
+    leaseRevision: 4, workId: job.workId,
+    result: { notificationMode: "full", sourceExhausted: true, allSourceExhausted: true },
+    progress: { percent: 100 },
+  });
+
+  assert.equal(result.job.status, "DONE");
+  assert.equal(updates.length, 2);
+  assert.equal(updates[1].data.status, "DONE");
+  assert.equal(updates[1].data.lastError, "notification_scan_partial");
+  assert.equal(failures.length, 0, "manual rejected facts at the source boundary must not start hidden repair");
+});
+
+test("manual notification completion retries when the source boundary was not reached", async () => {
+  const token = "manual-notification-incomplete-token";
+  const now = new Date();
+  const job = {
+    id: "manual-notification-incomplete-job",
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    jobKey: "catchup_notifications_scan",
+    status: "CLAIMED",
+    claimedByDeviceId: "device-1",
+    leaseTokenHash: tokenHash(token),
+    leaseRevision: 5,
+    leaseUntil: new Date(now.getTime() + 60_000),
+    attempts: 0,
+    params: {
+      manualNotificationScan: true,
+      manualNotificationScanVersion: 1,
+      notificationMode: "full",
+      types: ["tips"],
+    },
+    continuation: { driverPhase: "complete" },
+    workId: "manual-notification-incomplete-work",
+  };
+  const updates = [];
+  const failures = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => ({
+      ok: false,
+      verified: false,
+      sourceTraversalComplete: false,
+      summary: { requestedTypes: ["tips"], collectionCoverageByType: { tips: "partial" } },
+    }),
+    recordJobFailure: async (args) => { failures.push(args); return {}; },
+  });
+
+  const result = await completeJob({
+    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token,
+    leaseRevision: 5, workId: job.workId,
+    result: { notificationMode: "full", sourceExhausted: false, allSourceExhausted: false },
+    progress: { percent: 80 },
+  });
+
+  assert.equal(result.job.status, "SCHEDULED");
+  assert.equal(updates.length, 2);
+  assert.equal(updates[1].data.status, "SCHEDULED");
+  assert.equal(updates[1].data.attempts, 1);
+  assert.ok(updates[1].data.nextRunAt instanceof Date);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].terminal, false);
 });
 
 test("fifth non-resumable partial notification attempt becomes FAILED instead of looping forever", async () => {
@@ -723,7 +925,7 @@ test("fifth non-resumable partial notification attempt becomes FAILED instead of
     db,
     applyJobResult: async () => ({
       ok: false,
-      summary: { requestedTypes: ["tips"], analyticsCoverageByType: { tips: "partial" } },
+      summary: { requestedTypes: ["tips"], collectionCoverageByType: { tips: "partial" } },
     }),
   });
 
@@ -779,6 +981,47 @@ test("earnings completion reserves lease ownership before relational projection"
   assert.equal(result.job.status, "DONE");
 });
 
+
+
+test("partial financial proof is rescheduled and persists the same durable retry boundary", async () => {
+  const token = "financial-partial-token";
+  const now = new Date();
+  const job = {
+    id: "financial-partial-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "financial_transactions_scan",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 6,
+    leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, params: { financialMode: "catchup" },
+    continuation: { driverPhase: "complete" }, workId: "financial-work",
+  };
+  const updates = [];
+  const failures = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => ({ ok: false, type: "financial_transactions", complete: false }),
+    recordJobFailure: async (args) => { failures.push(args); return {}; },
+  });
+  const result = await completeJob({
+    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 6,
+    workId: job.workId, result: { complete: false }, progress: { percent: 100 },
+  });
+  assert.equal(updates.length, 2);
+  assert.equal(updates[1].where.leaseRevision, 7);
+  assert.equal(updates[1].data.status, "SCHEDULED");
+  assert.equal(updates[1].data.attempts, 1);
+  assert.equal(updates[1].data.lastError, "financial_transactions_scan_partial");
+  assert.equal(result.job.status, "SCHEDULED");
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].terminal, false);
+  assert.equal(failures[0].retryAfterAt.getTime(), result.job.retryAt.getTime());
+});
+
 test("partial campaign proof is rescheduled instead of publishing DONE", async () => {
   const token = "campaign-partial-token";
   const now = new Date();
@@ -789,6 +1032,7 @@ test("partial campaign proof is rescheduled instead of publishing DONE", async (
     continuation: { driverPhase: "complete" }, workId: "campaign-work",
   };
   const updates = [];
+  const failures = [];
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
@@ -797,7 +1041,11 @@ test("partial campaign proof is rescheduled instead of publishing DONE", async (
       updateMany: async (args) => { updates.push(args); return { count: 1 }; },
     },
   };
-  const { completeJob } = loadService({ db, applyJobResult: async () => ({ ok: false, type: "campaigns", completion: { complete: false } }) });
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => ({ ok: false, type: "campaigns", completion: { complete: false } }),
+    recordJobFailure: async (args) => { failures.push(args); return {}; },
+  });
   const result = await completeJob({
     jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 4,
     workId: job.workId, result: { scanRunId: "scan-partial" }, progress: { percent: 100 },
@@ -809,9 +1057,12 @@ test("partial campaign proof is rescheduled instead of publishing DONE", async (
   assert.equal(updates[1].data.continuation, null);
   assert.equal(updates[1].data.lastError, "fetch_campaigns_partial");
   assert.equal(result.job.status, "SCHEDULED");
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].terminal, false);
+  assert.equal(failures[0].retryAfterAt.getTime(), result.job.retryAt.getTime());
 });
 
-test("claim fence cancels a legacy no-mode notification FULL once historical baseline exists", async () => {
+test("claim fence cancels a legacy no-mode notification FULL once historical baseline is verified", async () => {
   const now = new Date();
   const candidate = {
     id: "legacy-no-mode-full", jobKey: "catchup_notifications_scan", scope: "creator", creatorId: "creator-1", agencyId: "agency-1",
@@ -825,7 +1076,7 @@ test("claim fence cancels a legacy no-mode notification FULL once historical bas
     agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all" }) },
     creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
     deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
-    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), fullBackfillVerifiedAt: null }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
     jobInstance: {
       findFirst: async () => (candidateReads++ === 0 ? candidate : null),
       updateMany: async (args) => {
@@ -842,7 +1093,7 @@ test("claim fence cancels a legacy no-mode notification FULL once historical bas
   assert.equal(cancellation.data.lastError, "superseded_by_existing_notification_history");
 });
 
-test("renew fence kills an already claimed legacy no-mode notification FULL after baseline appears", async () => {
+test("renew fence kills an already claimed legacy no-mode notification FULL after verified baseline appears", async () => {
   const token = "legacy-no-mode-renew-token";
   const now = new Date();
   const job = {
@@ -854,7 +1105,7 @@ test("renew fence kills an already claimed legacy no-mode notification FULL afte
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), fullBackfillVerifiedAt: null }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
     jobInstance: {
       findUnique: async () => job,
       updateMany: async (args) => { cancellation = args; return { count: 1 }; },
@@ -867,6 +1118,31 @@ test("renew fence kills an already claimed legacy no-mode notification FULL afte
   );
   assert.equal(cancellation.data.status, "CANCELLED");
   assert.equal(cancellation.data.lastError, "superseded_by_existing_notification_history");
+});
+
+test("future-poisoned notification baseline cannot cancel a repair FULL lease", async () => {
+  const token = "future-poisoned-full-token";
+  const now = new Date();
+  const job = {
+    id: "future-poisoned-full-renew", agencyId: "agency-1", creatorId: "creator-1", jobKey: "catchup_notifications_scan",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 2,
+    leaseUntil: new Date(now.getTime() + 60_000), params: { notificationMode: "full", reason: "repair" }, continuation: null, progress: null,
+  };
+  let update = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillVerifiedAt: new Date("2099-01-01T00:00:00.000Z") }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { update = args; return { count: 1 }; },
+    },
+  };
+  const { renewLease } = loadService({ db });
+  const result = await renewLease({ jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 2, leaseMs: 60_000 });
+  assert.equal(result.status, "CLAIMED");
+  assert.ok(update.data.leaseUntil instanceof Date);
+  assert.equal(update.data.status, undefined);
 });
 
 test("explicitly forced notification FULL is exempt from the legacy-mode lease fence", async () => {

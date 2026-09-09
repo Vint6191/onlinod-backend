@@ -358,6 +358,7 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
 }
 
 async function scheduleJobNow({
+  db = prisma,
   jobKey,
   creatorId,
   agencyId,
@@ -365,19 +366,31 @@ async function scheduleJobNow({
   priority = 100,
   now = new Date(),
   bucketMs = 60_000,
+  dedupeParams = null,
 } = {}) {
+  // Some planners issue a server-authoritative command inside params.  Fields
+  // such as collectionGeneration/collectionRequestedAt are intentionally unique
+  // per command and therefore must not participate in planning idempotency.
+  // When dedupeParams is supplied, all replicas converge on the first stored
+  // command for the bucket instead of replacing its generation after a race.
+  const hasStableDedupe = dedupeParams && typeof dedupeParams === "object" && !Array.isArray(dedupeParams);
+  if (hasStableDedupe && !String(dedupeParams.planningEpoch || "").trim()) {
+    throw new Error("JOB_PLANNING_DEDUPE_EPOCH_REQUIRED");
+  }
   const idempotencyKey = buildJobIdempotencyKey({
     jobKey,
     scope: "creator",
     creatorId,
     agencyId,
-    params,
-    bucketAt: now,
-    bucketMs,
+    params: hasStableDedupe ? dedupeParams : params,
+    // Stable dedupe is tied to a durable collection-state epoch, not a wall
+    // clock bucket. This closes the minute/hour boundary race between replicas.
+    bucketAt: hasStableDedupe ? new Date(0) : now,
+    bucketMs: hasStableDedupe ? 1 : bucketMs,
   });
 
   const planned = await ensurePlannedJob({
-    db: prisma,
+    db,
     jobKey,
     scope: "creator",
     creatorId,
@@ -387,7 +400,14 @@ async function scheduleJobNow({
     priority,
     scheduledAt: now,
     nextRunAt: now,
-    shouldResetExisting: (existing) => existing.status !== "CLAIMED",
+    shouldResetExisting: (existing) => {
+      if (!hasStableDedupe) return existing.status !== "CLAIMED";
+      // Same planning epoch + active row means another replica already owns the
+      // command. A terminal row with no durable epoch advance, however, must be
+      // recoverable; otherwise cancellation/expiry before collector acceptance
+      // would permanently strand automatic collection on this epoch.
+      return !["SCHEDULED", "CLAIMED", "PAUSED"].includes(String(existing.status || "").toUpperCase());
+    },
     protectedStatuses: ["CLAIMED"],
   });
   if (!planned.job) throw new Error(`Failed to schedule ${jobKey}: planning race did not converge`);

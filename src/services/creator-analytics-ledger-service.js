@@ -6,6 +6,11 @@ const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
 const { projectFanIdentity, projectFanValue } = require("./fan-data-authority-service");
 const { displayRangeBounds, scanContractFromJob } = require("./analytics-range-contract");
+const {
+  collectionCommand, COLLECTOR_TYPES, acceptCampaignGeneration, completeCampaignCollection,
+} = require("./analytics-collector-control-service");
+const { evaluateCollectionState, evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
+const { earningsFreshnessLimitMs, trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 
 const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v7";
 const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", CAMPAIGN_COLLECTOR_VERSION]);
@@ -218,18 +223,6 @@ async function acquireAnalyticsLock(tx, namespace, scopeId) {
   if (typeof tx?.$executeRawUnsafe !== "function") return;
   const value = advisoryLockValue(namespace, scopeId);
   await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock($1::bigint)", value.toString());
-}
-
-async function latestCampaignGeneration(tx, creatorId) {
-  if (typeof tx?.analyticsIngestBatch?.findFirst !== "function") return null;
-  const batch = await tx.analyticsIngestBatch.findFirst({
-    where: { creatorId, dataType: "CAMPAIGNS" },
-    orderBy: [{ rangeFrom: "desc" }, { createdAt: "desc" }],
-    select: { rangeFrom: true },
-  });
-  const value = batch?.rangeFrom;
-  const date = value instanceof Date ? value : value ? new Date(value) : null;
-  return date && Number.isFinite(date.getTime()) ? date : null;
 }
 
 function isNewerGeneration(existing, scanStartedAt) {
@@ -627,11 +620,12 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
   const kind = text(payload.kind, 80);
   if (!["campaigns_page", "campaign_claimers_page"].includes(kind)) throw new Error("Unsupported campaign chunk kind");
   const batchKey = text(payload.batchKey, 500);
+  const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
-  const scanStartedAt = strictDate(payload.scanStartedAt);
-  const observedAt = strictDate(payload.observedAt);
+  const scanStartedAt = command.requestedAt;
+  const observedAt = new Date();
   if (
-    !batchKey || !scanRunId || !scanStartedAt || !observedAt || scanStartedAt > observedAt ||
+    !batchKey || !scanRunId || scanRunId !== command.generation ||
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
   ) {
     throw new Error("Invalid campaign chunk contract");
@@ -648,6 +642,8 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
 
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
+    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
+    if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
     const { batch, replay } = await beginBatch(tx, {
       job,
       deviceId,
@@ -664,11 +660,6 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     }
 
     const received = rawRows.length + scannerRejected;
-    const latestGeneration = await latestCampaignGeneration(tx, job.creatorId);
-    if (latestGeneration && latestGeneration > scanStartedAt) {
-      await finishBatch(tx, batch.id, { received, unchanged: received }, "COMMITTED");
-      return { replay: false, batchId: batch.id, inserted: 0, updated: 0, unchanged: received, rejected: 0, superseded: true };
-    }
 
     let inserted = 0;
     let updated = 0;
@@ -903,17 +894,20 @@ async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }
   const payload = object(chunk);
   if (text(payload.kind, 80) !== "campaign_fan_value") throw new Error("Unsupported campaign fan value chunk kind");
   const batchKey = text(payload.batchKey, 500);
+  const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
-  const scanStartedAt = strictDate(payload.scanStartedAt);
-  const observedAt = strictDate(payload.observedAt);
+  const scanStartedAt = command.requestedAt;
+  const observedAt = new Date();
   if (
-    !batchKey || !scanRunId || !scanStartedAt || !observedAt || scanStartedAt > observedAt ||
+    !batchKey || !scanRunId || scanRunId !== command.generation ||
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
   ) throw new Error("Invalid campaign fan value chunk contract");
   if (!batchKey.startsWith(`run:${scanRunId}:`)) throw new Error("Campaign fan value batch key does not match scan run");
   const item = normalizeCampaignFanValueItem(payload, observedAt);
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
+    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
+    if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
     return upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item });
   });
 }
@@ -923,18 +917,21 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
   const payload = object(chunk);
   if (text(payload.kind, 80) !== "campaign_fan_values_batch") throw new Error("Unsupported campaign fan values batch kind");
   const batchKey = text(payload.batchKey, 500);
+  const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
-  const scanStartedAt = strictDate(payload.scanStartedAt);
-  const observedAt = strictDate(payload.observedAt);
+  const scanStartedAt = command.requestedAt;
+  const observedAt = new Date();
   const values = array(payload.values);
   if (
-    !batchKey || !scanRunId || !scanStartedAt || !observedAt || scanStartedAt > observedAt || values.length < 1 || values.length > 20 ||
+    !batchKey || !scanRunId || scanRunId !== command.generation || values.length < 1 || values.length > 20 ||
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
   ) throw new Error("Invalid campaign fan values batch contract");
   if (!batchKey.startsWith(`run:${scanRunId}:`)) throw new Error("Campaign fan values batch key does not match scan run");
   const normalized = values.map((value) => normalizeCampaignFanValueItem(value, observedAt));
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
+    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
+    if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation, received: values.length, available: 0, unavailable: 0, applied: [] };
     const applied = [];
     for (const item of normalized) applied.push(await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }));
     return { replay: applied.every((row) => row.replay === true), received: normalized.length, available: applied.filter((row) => row.available === true).length, unavailable: applied.filter((row) => row.available !== true).length, applied };
@@ -944,12 +941,13 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
 async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   requireJob(job);
   const payload = object(result);
+  const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
-  const scanStartedAt = strictDate(payload.scanStartedAt);
-  const observedAt = strictDate(payload.observedAt);
+  const scanStartedAt = command.requestedAt;
+  const observedAt = new Date();
   if (
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion) ||
-    !scanRunId || !scanStartedAt || !observedAt || scanStartedAt > observedAt
+    !scanRunId || scanRunId !== command.generation
   ) {
     throw new Error("Invalid campaign completion contract");
   }
@@ -963,6 +961,8 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   if (key.length > 240) throw new Error("Campaign completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
+    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
+    if (!generation.accepted) return { complete: true, replay: false, superseded: true, proof: { newerGeneration: generation.state?.activeGeneration || null } };
     const { batch, replay } = await beginBatch(tx, {
       job,
       deviceId,
@@ -974,14 +974,6 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
       schemaVersion: payload.schemaVersion,
       payload,
     });
-
-    const latestGeneration = await latestCampaignGeneration(tx, job.creatorId);
-    if (latestGeneration && latestGeneration > scanStartedAt) {
-      if (!replay || batch.status !== "COMMITTED") {
-        await finishBatch(tx, batch.id, { received: expectedCampaignCount, unchanged: expectedCampaignCount }, "COMMITTED");
-      }
-      return { batchId: batch.id, complete: true, replay, superseded: true, proof: { newerGeneration: latestGeneration.toISOString() } };
-    }
 
     const batchPrefix = `campaigns:${job.id}:run:${scanRunId}:`;
     const pageBatches = await tx.analyticsIngestBatch.findMany({
@@ -1041,19 +1033,10 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
         data: { isActive: false },
       });
     }
-    await setCoverage(tx, {
-      job,
-      batchId: batch.id,
-      dataType: "CAMPAIGNS",
-      date: observedAt,
-      status: complete ? "COMPLETE" : "PARTIAL",
-      coveredFromAt: scanStartedAt,
-      coveredToAt: observedAt,
-      errorCode: complete ? null : "CAMPAIGN_SCAN_PROOF_INCOMPLETE",
-      errorMessage: complete ? null : proofMessage(proof),
-      verifiedAt: observedAt,
+    const collectionState = await completeCampaignCollection({
+      db: tx, job, deviceId, complete, scanRunId,
     });
-    return { batchId: batch.id, complete, replay, superseded: false, proof };
+    return { batchId: batch.id, complete, replay, superseded: false, proof, collectionStateId: collectionState?.state?.id || null };
   });
 }
 function normalizeMessageDay(raw) {
@@ -1309,7 +1292,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
   const currentDay = utcDay(now);
   const currentDayInRange = currentDay >= range.dayStart && currentDay <= range.dayEnd;
-  const [earnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, completeEarningsDays, inProgressEarningsDays, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
+  const [earnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, earningsCoverageRows, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
     db.creatorEarningsDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }),
     includeMessages ? db.creatorMessagesDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }) : Promise.resolve([]),
     db.creatorPostLike.groupBy({ by: ["onlyFansPostId"], where: { creatorId, likedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
@@ -1321,8 +1304,17 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     db.creatorSubscriptionEvent.groupBy({ by: ["eventType"], where: { creatorId, occurredAt: eventBetween }, _count: { _all: true }, _sum: { observedPriceCents: true } }),
     db.creatorCampaign.findMany({ where: { creatorId }, include: { _count: { select: { fans: true } } }, orderBy: [{ isActive: "desc" }, { collectedAt: "desc" }], take: 2000 }),
     includeCoveragePage ? readCreatorCoverage({ db, creatorId, rangeKey, limit: 120, offset: 0, now }) : Promise.resolve({ rows: [], pagination: { limit: 0, offset: 0, returned: 0, total: 0, hasMore: false } }),
-    db.analyticsCoverage.count({ where: { creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE", coverageDate: dayBetween } }),
-    currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "EARNINGS_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
+    db.analyticsCoverage.findMany({
+      where: {
+        creatorId, dataType: "EARNINGS", sourceTimezone: "UTC",
+        coverageDate: dayBetween, status: { in: ["COMPLETE", "PARTIAL"] },
+      },
+      select: {
+        coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, lastErrorCode: true,
+        scanProofId: true, scanProof: { select: { status: true } },
+      },
+      orderBy: { coverageDate: "asc" },
+    }),
     includeMessages ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "COMPLETE", coverageDate: dayBetween } }) : Promise.resolve(0),
     includeMessages && currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "MESSAGES_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
     readCampaignRevenue({ db, creatorId, start: range.start, end: range.end }),
@@ -1373,9 +1365,43 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     return { ...plain, fansCount: _count.fans, unknownAttributionFans, revenueVerified: unknownAttributionFans === 0, ...revenue };
   });
   const expectedEarningsDays = Math.floor((range.dayEnd.getTime() - range.dayStart.getTime()) / 86_400_000) + 1;
-  const verifiedEarningsDays = completeEarningsDays + inProgressEarningsDays;
+  let completeEarningsDays = 0;
+  let provenEarningsDays = 0;
+  let freshEarningsDays = 0;
+  let partialEarningsDays = 0;
+  let earningsRetryAfterAt = null;
+  for (const row of earningsCoverageRows) {
+    const day = utcDay(row.coverageDate);
+    const isCurrentDay = day.getTime() === currentDay.getTime();
+    const state = evaluateCollectionState({
+      status: row.status,
+      proofStatus: row.scanProof?.status || null,
+      lastVerifiedAt: row.lastVerifiedAt || null,
+      retryAfterAt: row.retryAfterAt || null,
+      now,
+      freshnessMs: earningsFreshnessLimitMs(day, now),
+      partialUsable: isCurrentDay,
+    });
+    if (state.complete) completeEarningsDays += 1;
+    if (state.partial) partialEarningsDays += 1;
+    if (state.usable) provenEarningsDays += 1;
+    if (state.fresh) freshEarningsDays += 1;
+    if (state.deferred && state.retryAfterAt && (!earningsRetryAfterAt || state.retryAfterAt > earningsRetryAfterAt)) {
+      earningsRetryAfterAt = state.retryAfterAt;
+    }
+  }
+  const earningsCollectionState = evaluateAggregateCollectionState({
+    expectedUnits: expectedEarningsDays,
+    completeUnits: completeEarningsDays,
+    provenUsableUnits: provenEarningsDays,
+    freshUsableUnits: freshEarningsDays,
+    partialUnits: partialEarningsDays,
+    retryAfterAt: earningsRetryAfterAt,
+    now,
+  });
+  const verifiedEarningsDays = earningsCollectionState.provenUsableUnits;
   const verifiedMessageDays = completeMessageDays + inProgressMessageDays;
-  const officialEarnings = earnings.length === expectedEarningsDays && verifiedEarningsDays === expectedEarningsDays;
+  const officialEarnings = earnings.length === expectedEarningsDays && earningsCollectionState.usable;
   const officialMessages = messages.length === expectedEarningsDays && verifiedMessageDays === expectedEarningsDays;
   return {
     ok: true,
@@ -1384,8 +1410,15 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     verification: {
       officialEarnings,
       officialMessages,
-      notificationFacts: Boolean(notificationSync?.fullBackfillVerifiedAt),
+      notificationFacts: Boolean(trustedCollectionTimestamp(notificationSync?.fullBackfillVerifiedAt, now)),
       earningsDays: verifiedEarningsDays,
+      earningsComplete: earningsCollectionState.complete,
+      earningsProven: earningsCollectionState.proven,
+      earningsFresh: earningsCollectionState.fresh,
+      earningsStale: earningsCollectionState.stale,
+      earningsDue: earningsCollectionState.due,
+      earningsDeferred: earningsCollectionState.deferred,
+      earningsState: stateVocabulary(earningsCollectionState),
       messageDays: verifiedMessageDays,
     },
     notificationSync: notificationSync ? {
@@ -1400,6 +1433,8 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
       oldestOccurredAt: notificationSync.oldestOccurredAt,
       newestOccurredAt: notificationSync.newestOccurredAt,
       lastCatchupCompletedAt: notificationSync.lastCatchupCompletedAt,
+      lastCatchupVerifiedAt: notificationSync.lastCatchupVerifiedAt,
+      retryAfterAt: notificationSync.retryAfterAt,
       lastSocketEventAt: notificationSync.lastSocketEventAt,
       lastErrorCode: notificationSync.lastErrorCode,
       lastErrorMessage: notificationSync.lastErrorMessage,
@@ -1430,9 +1465,8 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
         notificationSync?.lastSocketEventAt,
         notificationSync?.newestOccurredAt,
       ]
-        .filter(Boolean)
-        .map((value) => new Date(value))
-        .filter((value) => Number.isFinite(value.getTime()));
+        .map((value) => trustedCollectionTimestamp(value, now))
+        .filter(Boolean);
       const activityTo = endCandidates.length
         ? new Date(Math.max(...endCandidates.map((value) => value.getTime())))
         : null;

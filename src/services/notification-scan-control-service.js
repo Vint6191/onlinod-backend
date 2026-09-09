@@ -5,6 +5,10 @@ const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
 const { buildNotificationScanParams, loadNotificationSyncState } = require("./notification-sync-state-service");
+const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
+const {
+  buildCollectionCommand, buildCollectionPlanningDedupeParams, collectionCommand, withCollectorStateLock, COLLECTOR_TYPES,
+} = require("./analytics-collector-control-service");
 
 const JOB_KEY = "catchup_notifications_scan";
 const MANUAL_REASON = "manual_creator_analytics_notification_scan";
@@ -63,8 +67,16 @@ function manualContinuationSchema(job) {
   const value = Number(domain.schemaVersion);
   return Number.isInteger(value) && value > 0 ? value : null;
 }
-function historicalBaselineReady(state) {
-  return Boolean(state?.fullBackfillVerifiedAt || state?.fullBackfillCompletedAt);
+function historicalBaselineReady(state, now = new Date()) {
+  return Boolean(trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
+}
+function hasCurrentNotificationCommand(job, expectedMode) {
+  try {
+    const command = collectionCommand(job, COLLECTOR_TYPES.NOTIFICATIONS);
+    return command.mode === expectedMode;
+  } catch {
+    return false;
+  }
 }
 function pausedManualJobNeedsFreshRun(job, desiredMode) {
   const params = object(job?.params);
@@ -108,85 +120,93 @@ async function findActiveNotificationJob(db, creatorId) {
 
 async function startManualNotificationScan({ db = prisma, creator, requestedByUserId = null, now = new Date(), forceFull = false }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
-  const syncState = await loadNotificationSyncState(db, creator.id);
-  const desiredMode = forceFull === true || !historicalBaselineReady(syncState) ? "full" : "catchup";
-  // START must never create a second notification walk beside an automatic
-  // initial/catch-up job. Prefer the user's manual row when present, otherwise
-  // adopt/fence the creator's already in-flight notification job.
-  const activeManual = await findActiveManualJob(db, creator.id);
-  const active = activeManual || await findActiveNotificationJob(db, creator.id);
+  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.NOTIFICATIONS, creatorId: creator.id, work: async (tx) => {
+    const syncState = await loadNotificationSyncState(tx, creator.id);
+    const desiredMode = forceFull === true || !historicalBaselineReady(syncState, now) ? "full" : "catchup";
+    // START must never create a second notification walk beside an automatic
+    // initial/catch-up job. The read and possible creation are serialized by the
+    // same collector advisory lock used by generation accept/complete.
+    const activeManual = await findActiveManualJob(tx, creator.id);
+    const active = activeManual || await findActiveNotificationJob(tx, creator.id);
 
-  if (active) {
-    const activeParams = object(active.params);
-    const activeMode = scanMode(active, null);
-    const sameMode = activeMode === desiredMode;
-    if (activeParams.forceNotificationFullRebuild === true && forceFull !== true) {
-      return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
-    }
-    if (active.status === "PAUSED" && sameMode && !pausedManualJobNeedsFreshRun(active, desiredMode)) {
-      const planned = await reschedulePlannedJob({
-        db, job: active, params: active.params || {}, priority: active.priority || 0,
-        scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
-        lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
-        protectedStatuses: [],
+    if (active) {
+      const activeParams = object(active.params);
+      const activeMode = scanMode(active, null);
+      const activeCommandCurrent = hasCurrentNotificationCommand(active, activeMode);
+      const sameMode = activeMode === desiredMode && activeCommandCurrent;
+      if (activeCommandCurrent && activeParams.forceNotificationFullRebuild === true && forceFull !== true) {
+        return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+      }
+      if (active.status === "PAUSED" && sameMode && !pausedManualJobNeedsFreshRun(active, desiredMode)) {
+        const planned = await reschedulePlannedJob({
+          db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
+          scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
+          lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
+          protectedStatuses: [],
+        });
+        return { job: planned.job, action: "resumed" };
+      }
+      if (active.status !== "PAUSED" && sameMode) {
+        return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+      }
+
+      // A stale/manual command with the wrong mode is fenced before a replacement
+      // is planned. The collector lock makes this cancel+replace sequence atomic
+      // with automatic planner starts and completion-state generation changes.
+      const cancelled = await tx.jobInstance.updateMany({
+        where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+        data: {
+          status: "CANCELLED",
+          completedAt: now,
+          lastError: !activeCommandCurrent ? "retired_analytics_collection_contract_pre_v1"
+            : desiredMode === "catchup" ? "superseded_by_manual_catchup" : "superseded_by_manual_full_rebuild",
+          claimedAt: null,
+          claimedByDeviceId: null,
+          leaseUntil: null,
+          leaseTokenHash: null,
+          leaseRevision: { increment: 1 },
+          workId: null,
+        },
       });
-      return { job: planned.job, action: "resumed" };
-    }
-    if (active.status !== "PAUSED" && sameMode) {
-      return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+      if (!cancelled.count) {
+        const current = await tx.jobInstance.findUnique({ where: { id: active.id } });
+        if (current?.status === "CLAIMED") return { job: current, action: "already_running" };
+        if (current?.status === "SCHEDULED") return { job: current, action: "already_queued" };
+      }
     }
 
-    // A stale manual FULL from the pre-catch-up UI must never wake up again once
-    // historical coverage already exists. Fence the old lease/cursor and create
-    // a clean run in the mode that is correct *now*.
-    const cancelled = await db.jobInstance.updateMany({
-      where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
-      data: {
-        status: "CANCELLED",
-        completedAt: now,
-        lastError: desiredMode === "catchup" ? "superseded_by_manual_catchup" : "superseded_by_manual_full_rebuild",
-        claimedAt: null,
-        claimedByDeviceId: null,
-        leaseUntil: null,
-        leaseTokenHash: null,
-        leaseRevision: { increment: 1 },
-        workId: null,
-      },
-    });
-    if (!cancelled.count) {
-      const current = await db.jobInstance.findUnique({ where: { id: active.id } });
-      if (current?.status === "CLAIMED") return { job: current, action: "already_running" };
-      if (current?.status === "SCHEDULED") return { job: current, action: "already_queued" };
-    }
-  }
-
-  // START SCAN means "refresh notification facts". Once a historical baseline
-  // exists, that is a bounded HEAD catch-up. A deliberate destructive/full
-  // re-proof must opt in with forceFull; the ordinary UI never does so.
-  const manualRunToken = crypto.randomUUID();
-  const params = {
-    ...buildNotificationScanParams({
-      state: desiredMode === "catchup" ? syncState : null,
+    // START SCAN means refresh notification facts. Once the historical baseline
+    // exists this is a bounded HEAD catch-up; forceFull is the explicit re-proof.
+    const manualRunToken = crypto.randomUUID();
+    const params = {
+      ...buildNotificationScanParams({
+        state: desiredMode === "catchup" ? syncState : null,
+        now,
+        reason: MANUAL_REASON,
+        analyticsRangeKey: "all",
+      }),
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: desiredMode, reason: MANUAL_REASON, now }),
+      manualNotificationScan: true,
+      manualNotificationScanVersion: 1,
+      manualRunToken,
+      ...(forceFull === true ? { forceNotificationFullRebuild: true } : {}),
+      requestedByUserId: clean(requestedByUserId, 220),
+    };
+    const scheduled = await scheduleJobNow({
+      db: tx,
+      jobKey: JOB_KEY,
+      creatorId: creator.id,
+      agencyId: creator.agencyId,
+      params,
+      priority: 100,
       now,
-      reason: MANUAL_REASON,
-      analyticsRangeKey: "all",
-    }),
-    manualNotificationScan: true,
-    manualNotificationScanVersion: 1,
-    manualRunToken,
-    ...(forceFull === true ? { forceNotificationFullRebuild: true } : {}),
-    requestedByUserId: clean(requestedByUserId, 220),
-  };
-  const scheduled = await scheduleJobNow({
-    jobKey: JOB_KEY,
-    creatorId: creator.id,
-    agencyId: creator.agencyId,
-    params,
-    priority: 100,
-    now,
-    bucketMs: 1,
-  });
-  return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
+      bucketMs: 1,
+      dedupeParams: buildCollectionPlanningDedupeParams({
+        collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: desiredMode, state: syncState,
+      }),
+    });
+    return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
+  }});
 }
 
 async function stopManualNotificationScan({ db = prisma, creatorId, now = new Date() }) {
@@ -436,8 +456,10 @@ async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL
     lastErrorCode: currentStatus === "FAILED" ? (linkedSync?.lastErrorCode || "NOTIFICATION_SCAN_FAILED") : linkedSync?.lastErrorCode || null,
     lastErrorMessage: currentStatus === "FAILED" ? (linkedSync?.lastErrorMessage || job?.lastError || null) : linkedSync?.lastErrorMessage || null,
     currentMessage: jobMessage(job),
-    sourceBoundaryReached: Boolean(linkedSync && !linkedSync.nextCursor && linkedSync.fullBackfillCompletedAt && params.notificationMode === "full")
-      || Boolean(job?.status === "DONE" && linkedSync),
+    sourceBoundaryReached: Boolean(linkedSync && !linkedSync.nextCursor && (
+      (params.notificationMode === "full" && linkedSync.fullBackfillCompletedAt)
+      || (params.notificationMode === "catchup" && linkedSync.lastCatchupCompletedAt)
+    )),
     onlineWorkers,
     legacySummary,
     items,

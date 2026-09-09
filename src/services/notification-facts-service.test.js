@@ -374,7 +374,7 @@ test("transactional ingest creates relational facts, subtype coverage and idempo
   assert.equal(db.store.sales.length, 1);
   assert.equal(db.store.tips.length, 1);
   assert.equal(db.store.subscriptions.length, 1);
-  assert.deepEqual(new Set(db.store.coverage.map((row) => row.dataType)), new Set(["NOTIFICATION_PURCHASES", "NOTIFICATION_TIPS", "NOTIFICATION_SUBSCRIPTIONS"]));
+  assert.equal(db.store.coverage.length, 0, "notification cursor/frontier collectors must not write temporal AnalyticsCoverage");
   assert.ok(db.store.coverage.every((row) => row.status === "COMPLETE"));
 
   const replay = await ingestNotificationFacts({ job: job(), deviceId: "device-1", result, db });
@@ -457,7 +457,7 @@ test("page batches commit facts incrementally and completion only finalizes cove
   assert.equal(completion.status, "COMMITTED");
   assert.equal(completion.coverageByType.tips, "complete");
   assert.equal(db.store.tips.length, 1);
-  assert.equal(db.store.coverage.length, 1);
+  assert.equal(db.store.coverage.length, 0);
 });
 
 test("a rejected incremental page prevents final coverage from becoming complete", async () => {
@@ -793,10 +793,10 @@ test("subscription payment and refund sharing one transaction remain two lifecyc
   assert.ok(db.store.subscriptions.every((row) => row.externalTransactionId === "tx-shared"));
 });
 
-test("requested interval can complete while boundary UTC-day coverage remains partial", async () => {
+test("notification completion uses scanner evidence without writing temporal AnalyticsCoverage", async () => {
   const db = memoryDb();
   const scopedJob = job({
-    id: "job-partial-day",
+    id: "job-no-temporal-coverage",
     params: { from: "2026-08-05T10:00:00.000Z", to: "2026-08-05T12:00:00.000Z", types: ["tips"] },
   });
   const result = {
@@ -806,38 +806,8 @@ test("requested interval can complete while boundary UTC-day coverage remains pa
   const applied = await ingestNotificationFacts({ job: scopedJob, result, db });
   assert.equal(applied.status, "COMMITTED");
   assert.equal(applied.coverageComplete, true);
-  assert.equal(db.store.coverage.length, 1);
-  assert.equal(db.store.coverage[0].status, "PARTIAL");
-  assert.equal(new Date(db.store.coverage[0].coveredFromAt).toISOString(), "2026-08-05T10:00:00.000Z");
-  assert.equal(new Date(db.store.coverage[0].coveredToAt).toISOString(), "2026-08-05T12:00:00.000Z");
-});
-
-test("adjacent verified intervals merge into complete UTC-day coverage", async () => {
-  const db = memoryDb();
-  const firstRun = "scan-run-day-half-0001";
-  const secondRun = "scan-run-day-half-0002";
-  await ingestNotificationFacts({
-    job: job({ id: "job-day-half-1", params: { from: "2026-08-05T00:00:00.000Z", to: "2026-08-05T11:59:59.999Z", types: ["tips"] } }),
-    db,
-    result: {
-      collectorVersion: "notifications-catchup-v4", schemaVersion: 3, sourceTimezone: "UTC",
-      scanRunId: firstRun, batchKey: `run:${firstRun}:completion`, finalizeCoverage: true,
-      coverage: { tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 } }, events: [],
-    },
-  });
-  await ingestNotificationFacts({
-    job: job({ id: "job-day-half-2", params: { from: "2026-08-05T12:00:00.000Z", to: "2026-08-05T23:59:59.999Z", types: ["tips"] } }),
-    db,
-    result: {
-      collectorVersion: "notifications-catchup-v4", schemaVersion: 3, sourceTimezone: "UTC",
-      scanRunId: secondRun, batchKey: `run:${secondRun}:completion`, finalizeCoverage: true,
-      coverage: { tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 } }, events: [],
-    },
-  });
-  assert.equal(db.store.coverage.length, 1);
-  assert.equal(db.store.coverage[0].status, "COMPLETE");
-  assert.equal(new Date(db.store.coverage[0].coveredFromAt).toISOString(), "2026-08-05T00:00:00.000Z");
-  assert.equal(new Date(db.store.coverage[0].coveredToAt).toISOString(), "2026-08-05T23:59:59.999Z");
+  assert.deepEqual(applied.coverageByType, { tips: "complete" });
+  assert.equal(db.store.coverage.length, 0, "cursor/frontier notification collector must not create temporal AnalyticsCoverage rows");
 });
 
 test("events outside the exact requested interval are rejected", async () => {
@@ -857,9 +827,8 @@ test("events outside the exact requested interval are rejected", async () => {
 });
 
 
-test("full-history source exhaustion records only the OnlyFans-exposed notification window", async () => {
+test("full-history source exhaustion completes without manufacturing notification calendar coverage", async () => {
   const db = memoryDb();
-  db.store.notificationSync = { oldestOccurredAt: new Date("2026-02-05T10:00:00.000Z") };
   const fullJob = job({
     id: "job-full-retention-boundary",
     params: {
@@ -876,13 +845,7 @@ test("full-history source exhaustion records only the OnlyFans-exposed notificat
   const applied = await ingestNotificationFacts({ job: fullJob, result, db });
   assert.equal(applied.status, "COMMITTED");
   assert.equal(applied.coverageComplete, true);
-  assert.ok(db.store.coverage.length > 100);
-  assert.ok(db.store.coverage.every((row) => new Date(row.coverageDate) >= new Date("2026-02-05T00:00:00.000Z")));
-  const boundary = db.store.coverage.find((row) => new Date(row.coverageDate).toISOString().slice(0, 10) === "2026-02-05");
-  assert.equal(boundary.status, "PARTIAL");
-  assert.equal(new Date(boundary.coveredFromAt).toISOString(), "2026-02-05T10:00:00.000Z");
-  const nextDay = db.store.coverage.find((row) => new Date(row.coverageDate).toISOString().slice(0, 10) === "2026-02-06");
-  assert.equal(nextDay.status, "COMPLETE");
+  assert.equal(db.store.coverage.length, 0);
 });
 
 test("an empty full-history stream reaches EOF without inventing pre-retention calendar coverage", async () => {
@@ -972,26 +935,23 @@ test("schema 3 requires explicit events, collector, timezone and finalization fi
   }
 });
 
-test("a repair cursor without matching persisted coverage cannot complete the requested interval", async () => {
+test("legacy resume cursor params are ignored by current notification proof semantics", async () => {
   const db = memoryDb();
   const repairJob = job({
     params: {
       from: "2026-08-05T00:00:00.000Z",
       to: "2026-08-05T23:59:59.999Z",
       types: ["tips"],
-      resumeCursors: { tips: "missing-prior-cursor" },
+      resumeCursors: { tips: "legacy-unused-cursor" },
     },
   });
   const result = completeResult([], { tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 } });
   result.coverage = { tips: result.coverage.tips };
   const applied = await ingestNotificationFacts({ job: repairJob, result, db });
-  assert.equal(applied.status, "PARTIAL");
-  assert.equal(applied.coverageComplete, false);
-  assert.equal(applied.coverageByType.tips, "partial");
-  assert.equal(db.store.coverage[0].status, "FAILED");
-  assert.equal(db.store.coverage[0].lastErrorCode, "NOTIFICATION_RESUME_CURSOR_UNVERIFIED");
+  assert.equal(applied.status, "COMMITTED");
+  assert.equal(applied.coverageComplete, true);
+  assert.equal(db.store.coverage.length, 0);
 });
-
 
 test("completion coverage metadata is typed and cannot claim complete with rejected rows", async () => {
   const invalid = completeResult([]);
@@ -1043,5 +1003,6 @@ test("desktop-rejected scanner rows are counted in the completion audit and cove
   assert.equal(applied.rejected, 3);
   assert.equal(db.store.batches[0].receivedRows, 3);
   assert.equal(db.store.batches[0].rejectedRows, 3);
-  assert.equal(db.store.coverage[0].lastErrorCode, "NOTIFICATION_ROWS_REJECTED");
+  assert.equal(db.store.coverage.length, 0);
+  assert.equal(db.store.batches[0].lastErrorCode, "NOTIFICATION_ROWS_REJECTED");
 });

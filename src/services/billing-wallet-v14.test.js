@@ -285,15 +285,21 @@ test("durable relational proof uses the last 30 fully closed UTC days and requir
   assert.deepEqual(dailyWhere.sourceScanRunId, { not: null });
   assert.deepEqual(dailyWhere.scanProofId, { not: null });
   assert.equal(dailyWhere.scanProof.is.status, "COMMITTED");
-  assert.equal(coverageWheres.length, 2);
+  assert.equal(coverageWheres.length, 3);
   for (const coverageWhere of coverageWheres) {
     assert.equal(coverageWhere.coverageDate.gte.toISOString(), "2026-07-15T00:00:00.000Z");
     assert.equal(coverageWhere.coverageDate.lte.toISOString(), "2026-08-13T00:00:00.000Z");
+  }
+  assert.equal(coverageWheres[0].scanProofId, undefined);
+  assert.equal(coverageWheres[0].scanProof, undefined);
+  assert.equal(coverageWheres[0].lastVerifiedAt, undefined);
+  for (const coverageWhere of coverageWheres.slice(1)) {
     assert.deepEqual(coverageWhere.scanProofId, { not: null });
     assert.equal(coverageWhere.scanProof.is.status, "COMMITTED");
   }
-  assert.deepEqual(coverageWheres[0].lastVerifiedAt, { not: null });
-  assert.ok(coverageWheres[1].lastVerifiedAt.gte instanceof Date);
+  assert.deepEqual(coverageWheres[1].lastVerifiedAt, { not: null });
+  assert.ok(coverageWheres[2].lastVerifiedAt.gte instanceof Date);
+  assert.equal(coverageWheres[2].lastVerifiedAt.lte.toISOString(), "2026-08-14T12:05:00.000Z");
   db.analyticsCoverage.count=async()=>29;
   const no=await svc.readRolling30dRevenue({db,creatorId:"creator-1",now});
   assert.equal(no.fresh,false); assert.equal(no.revenue30dCents,null);
@@ -334,7 +340,9 @@ test("batched Settings evidence uses bounded grouped queries over the same 30 cl
     assert.equal(where.date.lte.toISOString(), "2026-08-13T00:00:00.000Z");
     return [{ creatorId: "creator-1", _count: { _all: 30 }, _sum: { totalCents: 120_000 }, _max: { collectedAt: now } }];
   };
+  const groupedCoverageWheres = [];
   db.analyticsCoverage.groupBy = async ({ where, by }) => {
+    groupedCoverageWheres.push(where);
     assert.deepEqual(by, ["creatorId"]);
     assert.equal(where.coverageDate.gte.toISOString(), "2026-07-15T00:00:00.000Z");
     assert.equal(where.coverageDate.lte.toISOString(), "2026-08-13T00:00:00.000Z");
@@ -345,6 +353,9 @@ test("batched Settings evidence uses bounded grouped queries over the same 30 cl
   assert.equal(revenue.fresh, true);
   assert.equal(revenue.source, "EARNINGS_DAILY_PROVEN_FRESH_30D");
   assert.equal(revenue.revenue30dCents, 120_000);
+  const freshWhere = groupedCoverageWheres.find((where) => where.lastVerifiedAt?.gte);
+  assert.ok(freshWhere);
+  assert.equal(freshWhere.lastVerifiedAt.lte.toISOString(), "2026-08-14T12:05:00.000Z");
 });
 
 test("batched Settings evidence fails closed when even one coverage day is missing", async () => {

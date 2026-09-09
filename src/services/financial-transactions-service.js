@@ -5,6 +5,9 @@ const prisma = require("../prisma");
 const { rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 const { reconcileCreatorSaleToTeam, reconcileCreatorTipToTeam } = require("./team-money-reconciliation-service");
 const { projectFanIdentity } = require("./fan-data-authority-service");
+const {
+  COLLECTOR_TYPES, collectionCommand, acceptFinancialGeneration, completeFinancialCollection, recordFinancialCollectionFailure,
+} = require("./analytics-collector-control-service");
 
 const JOB_KEY = "financial_transactions_scan";
 const COLLECTOR_VERSION = "payout-transactions-v2-catchup";
@@ -276,8 +279,9 @@ async function runInTransaction(db, callback) {
 
 async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, chunk }) {
   if (!job?.creatorId || !job?.agencyId || !job?.id) throw new Error("Financial transaction ingest requires creator job scope");
+  const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   const scanRunId = clean(chunk?.scanRunId, 120);
-  if (!scanRunId) throw new Error("Financial transaction chunk is missing scanRunId");
+  if (!scanRunId || scanRunId !== command.generation) throw new Error("Financial transaction chunk is missing server generation metadata");
   const page = integer(chunk?.pageNumber, 0, 1_000_000);
   if (page < 1) throw new Error("Financial transaction chunk has invalid pageNumber");
   const rawRows = Array.isArray(chunk?.transactions) ? chunk.transactions : [];
@@ -297,7 +301,9 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
   let inserted = 0; let updated = 0; let unchanged = 0; let projected = 0; let storedOnly = 0;
   const affectedDates = [];
 
-  await runInTransaction(db, async (tx) => {
+  const transactionOutcome = await runInTransaction(db, async (tx) => {
+    const generation = await acceptFinancialGeneration({ db: tx, job, deviceId });
+    if (!generation.accepted) return { superseded: true, generation: generation.command.generation };
     const ids = accepted.map((row) => row.externalTransactionId);
     const existingRows = ids.length ? await tx.creatorFinancialTransaction.findMany({
       where: { creatorId: job.creatorId, externalTransactionId: { in: ids } },
@@ -357,7 +363,12 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
         storedOnly += 1;
       }
     }
+    return { superseded: false };
   });
+
+  if (transactionOutcome?.superseded) {
+    return { type: "financial_transactions_page", scanRunId, page, superseded: true, received: rawRows.length, accepted: 0, rejected: 0, inserted: 0, updated: 0, unchanged: rawRows.length, projected: 0, storedOnly: 0, rejectedRows: [] };
+  }
 
   if (affectedDates.length) {
     // A sparse payout page can span more than a year on low-volume historical
@@ -387,6 +398,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
 }
 
 async function ingestFinancialChartChunk({ db = prisma, job, deviceId, chunk }) {
+  const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   const category = CHART_CATEGORY_MAP[String(chunk?.category || "").trim().toLowerCase()];
   if (!category) throw new Error("Unsupported financial chart category");
   const grossCents = signedInteger(chunk?.grossCents, Number.NaN, 2_147_483_647);
@@ -396,8 +408,10 @@ async function ingestFinancialChartChunk({ db = prisma, job, deviceId, chunk }) 
   const rangeFrom = strictDate(chunk?.rangeFrom);
   const rangeTo = strictDate(chunk?.rangeTo);
   const scanRunId = clean(chunk?.scanRunId, 120);
-  if (!rangeFrom || !rangeTo || !scanRunId) throw new Error("Financial chart chunk is missing range metadata");
+  if (!rangeFrom || !rangeTo || !scanRunId || scanRunId !== command.generation) throw new Error("Financial chart chunk is missing server generation metadata");
   const now = new Date();
+  const generation = await acceptFinancialGeneration({ db, job, deviceId });
+  if (!generation.accepted) return { type: "financial_chart_total", category, superseded: true, grossCents, netCents, transactionsCount };
   await db.creatorEarningsTotal.upsert({
     where: { creatorId_category: { creatorId: job.creatorId, category } },
     create: {
@@ -416,9 +430,10 @@ async function ingestFinancialChartChunk({ db = prisma, job, deviceId, chunk }) 
 
 async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, result }) {
   const payload = object(result);
+  const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   const scanRunId = clean(payload.scanRunId, 120);
-  if (!scanRunId) throw new Error("Financial transaction completion is missing scanRunId");
-  const mode = payload.financialMode === "catchup" || financialMode(job) === "catchup" ? "catchup" : "full";
+  if (!scanRunId || scanRunId !== command.generation) throw new Error("Financial transaction completion is missing server generation metadata");
+  const mode = command.mode;
   const baseWhere = { creatorId: job.creatorId, sourceJobId: job.id, scanRunId };
   const [aggregate, count, statusGroups, chartTotal, storedOnly] = await Promise.all([
     db.creatorFinancialTransaction.aggregate({
@@ -455,11 +470,20 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const complete = mode === "catchup"
     ? sourceBoundaryReached && scannerRejected === 0
     : sourceBoundaryReached && scannerRejected === 0 && chartReady && countMatched && grossMatched && netMatched;
+  const stateResult = await completeFinancialCollection({
+    db, job, deviceId, complete, scanRunId,
+    boundary: payload.knownBoundaryReached === true ? "KNOWN_TRANSACTION_IDS" : sourceBoundaryReached ? "SOURCE_EXHAUSTED" : null,
+    rangeFrom: object(job.params).startDate || chartTotal?.rangeFrom || null,
+    rangeTo: object(job.params).endDate || chartTotal?.rangeTo || null,
+  });
+  const authoritativeComplete = complete && stateResult?.applied !== false;
   return {
-    ok: true,
+    // Reaching the source boundary is not enough for a successful execution:
+    // the JobInstance retry/quarantine lifecycle must see incomplete proof.
+    ok: authoritativeComplete,
     type: "financial_transactions",
     mode,
-    complete,
+    complete: authoritativeComplete,
     scanRunId,
     sourceBoundaryReached,
     scannerRejected,
@@ -495,6 +519,8 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
       chartNetCents: chartReady ? Number(chartTotal.netCents || 0) : null,
     },
     deviceId: deviceId || null,
+    collectionStateId: stateResult?.state?.id || null,
+    staleGeneration: stateResult?.stale === true,
   };
 }
 
@@ -505,6 +531,7 @@ module.exports = {
   ingestFinancialTransactionsChunk,
   ingestFinancialChartChunk,
   completeFinancialTransactionsScan,
+  recordFinancialCollectionFailure,
   summarizeStatusGroups,
   REFUND_TRANSACTION_STATUSES,
   PAYOUT_PENDING_TRANSACTION_STATUSES,

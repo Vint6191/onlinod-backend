@@ -16,13 +16,7 @@ const LEGACY_SCHEMA_VERSION = 3;
 const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4";
 const MAX_EVENTS_PER_BATCH = 2_000;
 const NOTIFICATION_TYPES = Object.freeze(["purchases", "tips", "subscriptions", "likes", "comments"]);
-const COVERAGE_DATA_TYPES = Object.freeze({
-  purchases: "NOTIFICATION_PURCHASES",
-  tips: "NOTIFICATION_TIPS",
-  subscriptions: "NOTIFICATION_SUBSCRIPTIONS",
-  likes: "NOTIFICATION_LIKES",
-  comments: "NOTIFICATION_COMMENTS",
-});
+
 
 function clean(value, max = 220) {
   if (value === null || value === undefined) return null;
@@ -319,189 +313,6 @@ function validateFinalScannerCoverage(result, job, rangeFrom, rangeTo) {
 function coverageComplete(result, job) {
   const states = resultCoverage(result, job);
   return Object.values(states).length > 0 && Object.values(states).every((status) => status === "complete");
-}
-function utcDays(from, to) {
-  const days = [];
-  const cursor = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate()));
-  const end = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate()));
-  while (cursor <= end) {
-    if (days.length >= 370) throw Object.assign(new Error("Notification coverage range exceeds 370 days"), { code: "NOTIFICATION_RANGE_TOO_LARGE" });
-    days.push(new Date(cursor));
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-  }
-  return days;
-}
-function dayBounds(day) {
-  const start = new Date(Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate()));
-  const endExclusive = new Date(start.getTime() + 24 * 60 * 60 * 1_000);
-  const endInclusive = new Date(endExclusive.getTime() - 1);
-  return { start, endExclusive, endInclusive };
-}
-function clippedInterval(from, to, day) {
-  if (!from || !to) return null;
-  const { start, endInclusive } = dayBounds(day);
-  const clippedFrom = new Date(Math.max(from.getTime(), start.getTime()));
-  const clippedTo = new Date(Math.min(to.getTime(), endInclusive.getTime()));
-  return clippedTo >= clippedFrom ? { from: clippedFrom, to: clippedTo } : null;
-}
-function coverageIntervalsTouch(leftFrom, leftTo, rightFrom, rightTo) {
-  return leftFrom && leftTo && rightFrom && rightTo
-    && rightFrom.getTime() <= leftTo.getTime() + 1
-    && leftFrom.getTime() <= rightTo.getTime() + 1;
-}
-function scannerEvidenceInterval(scannerCoverage, rangeFrom, rangeTo, complete, sourceBoundaryAt = null, limitToSourceBoundary = false) {
-  const reason = String(scannerCoverage?.reason || "").toLowerCase();
-  if (complete) {
-    // Only a full historical notification backfill is bounded by OnlyFans'
-    // rolling source retention. Ordinary catch-up/repair jobs still prove the
-    // exact interval they explicitly requested.
-    if (limitToSourceBoundary && reason === "source_exhausted") {
-      const boundary = strictDate(sourceBoundaryAt) || strictDate(scannerCoverage?.oldestAt) || strictDate(scannerCoverage?.newestAt);
-      return boundary
-        ? { from: new Date(Math.max(rangeFrom.getTime(), boundary.getTime())), to: rangeTo }
-        : null;
-    }
-    return { from: rangeFrom, to: rangeTo };
-  }
-  const oldest = strictDate(scannerCoverage?.oldestAt);
-  const newest = strictDate(scannerCoverage?.newestAt);
-  if (!oldest && !newest) return null;
-  const from = oldest || newest;
-  const to = ["page_limit", "event_limit", "cursor_stalled"].includes(reason)
-    ? rangeTo
-    : (newest || oldest);
-  return {
-    from: new Date(Math.max(rangeFrom.getTime(), from.getTime())),
-    to: new Date(Math.min(rangeTo.getTime(), to.getTime())),
-  };
-}
-async function persistCoverageRows(tx, {
-  job, batchId, type, rangeFrom, rangeTo, sourceTimezone, scannerCoverage,
-  scannerComplete, rejectedRows, now, sourceBoundaryAt = null, limitToSourceBoundary = false,
-}) {
-  const dataType = COVERAGE_DATA_TYPES[type];
-  const allRequestedDays = utcDays(rangeFrom, rangeTo);
-  const existingRows = typeof tx.analyticsCoverage.findMany === "function"
-    ? await tx.analyticsCoverage.findMany({
-        where: { creatorId: job.creatorId, dataType, coverageDate: { in: allRequestedDays }, sourceTimezone },
-      })
-    : [];
-  const rawResumeCursor = object(object(job?.params).resumeCursors)[type];
-  if (exceedsTextLimit(rawResumeCursor, 220)) {
-    throw Object.assign(new Error(`Notification resume cursor is too long for ${type}`), {
-      code: "NOTIFICATION_RESUME_CURSOR_TOO_LONG",
-    });
-  }
-  const resumeCursor = clean(rawResumeCursor, 220);
-  const resumeCursorVerified = !resumeCursor || existingRows.some((row) => clean(row.sourceCursorEnd, 220) === resumeCursor);
-  const effectiveScannerComplete = scannerComplete && resumeCursorVerified;
-  const effectiveEvidence = scannerEvidenceInterval(
-    scannerCoverage,
-    rangeFrom,
-    rangeTo,
-    effectiveScannerComplete,
-    sourceBoundaryAt,
-    limitToSourceBoundary,
-  );
-  const sourceExhaustedWithoutTimestamp = limitToSourceBoundary
-    && effectiveScannerComplete
-    && String(scannerCoverage?.reason || "").toLowerCase() === "source_exhausted"
-    && !effectiveEvidence;
-  if (sourceExhaustedWithoutTimestamp) {
-    // A genuinely empty full-history stream proves EOF, but it gives us no
-    // calendar timestamp from which to claim historical availability. The job
-    // may complete; AnalyticsCoverage must not invent months of empty history.
-    return { requestedIntervalComplete: true, resumeCursorVerified: true };
-  }
-
-  const requestedDays = limitToSourceBoundary && effectiveEvidence
-    ? utcDays(effectiveEvidence.from, rangeTo)
-    : allRequestedDays;
-  const existingByDay = new Map(existingRows.map((row) => [new Date(row.coverageDate).toISOString().slice(0, 10), row]));
-  const writes = [];
-
-  for (const day of requestedDays) {
-    const key = day.toISOString().slice(0, 10);
-    const previous = existingByDay.get(key) || null;
-    const current = effectiveEvidence ? clippedInterval(effectiveEvidence.from, effectiveEvidence.to, day) : null;
-    let coveredFromAt = current?.from || null;
-    let coveredToAt = current?.to || null;
-    let discontiguous = false;
-
-    const previousFrom = strictDate(previous?.coveredFromAt);
-    const previousTo = strictDate(previous?.coveredToAt);
-    if (previousFrom && previousTo) {
-      if (coveredFromAt && coveredToAt) {
-        if (coverageIntervalsTouch(previousFrom, previousTo, coveredFromAt, coveredToAt)) {
-          coveredFromAt = new Date(Math.min(previousFrom.getTime(), coveredFromAt.getTime()));
-          coveredToAt = new Date(Math.max(previousTo.getTime(), coveredToAt.getTime()));
-        } else {
-          discontiguous = true;
-          coveredFromAt = new Date(Math.min(previousFrom.getTime(), coveredFromAt.getTime()));
-          coveredToAt = new Date(Math.max(previousTo.getTime(), coveredToAt.getTime()));
-        }
-      } else {
-        coveredFromAt = previousFrom;
-        coveredToAt = previousTo;
-      }
-    }
-
-    const { start, endInclusive } = dayBounds(day);
-    const fullDay = effectiveScannerComplete && !discontiguous
-      && coveredFromAt?.getTime() === start.getTime()
-      && coveredToAt?.getTime() >= endInclusive.getTime();
-    const cursorEnd = clean(scannerCoverage?.cursorEnd, 500);
-    const hasCoverageEvidence = Boolean((coveredFromAt && coveredToAt) || cursorEnd);
-    const status = fullDay ? "COMPLETE" : (!effectiveScannerComplete && !hasCoverageEvidence ? "FAILED" : "PARTIAL");
-    const lastErrorCode = fullDay
-      ? null
-      : !resumeCursorVerified
-        ? "NOTIFICATION_RESUME_CURSOR_UNVERIFIED"
-        : rejectedRows > 0
-        ? "NOTIFICATION_ROWS_REJECTED"
-        : !effectiveScannerComplete
-          ? "NOTIFICATION_SCAN_PARTIAL"
-          : discontiguous
-            ? "NOTIFICATION_COVERAGE_DISCONTIGUOUS"
-            : "NOTIFICATION_DAY_PARTIAL_WINDOW";
-    const lastErrorMessage = fullDay
-      ? null
-      : !resumeCursorVerified
-        ? `${type} repair cursor does not match persisted coverage`
-        : rejectedRows > 0
-        ? `${rejectedRows} ${type} rows were rejected`
-        : !effectiveScannerComplete
-          ? `${type} scanner did not prove the full requested interval`
-          : discontiguous
-            ? `${type} has more than one verified interval inside this UTC day`
-            : `${type} verified only part of this UTC day`;
-    const data = {
-      ingestBatchId: batchId,
-      status,
-      coveredFromAt,
-      coveredToAt,
-      sourceCursorEnd: cursorEnd,
-      lastVerifiedAt: now,
-      lastErrorCode,
-      lastErrorMessage,
-      retryAfterAt: null,
-      updatedAt: now,
-    };
-    writes.push({ day, previous, data });
-  }
-
-  const creates = writes.filter((row) => !row.previous).map(({ day, data }) => ({
-    id: crypto.randomUUID(), agencyId: job.agencyId, creatorId: job.creatorId,
-    dataType, coverageDate: day, sourceTimezone, createdAt: now, ...data,
-  }));
-  if (creates.length) await tx.analyticsCoverage.createMany({ data: creates, skipDuplicates: true });
-  for (const row of writes) {
-    await tx.analyticsCoverage.updateMany({
-      where: { creatorId: job.creatorId, dataType, coverageDate: row.day, sourceTimezone },
-      data: row.data,
-    });
-  }
-  return { requestedIntervalComplete: effectiveScannerComplete, resumeCursorVerified };
 }
 async function acquireIngestTransactionLock(db, idempotencyKey) {
   if (typeof db?.$executeRawUnsafe !== "function") return;
@@ -1107,35 +918,11 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
             : "partial";
         }
 
-        const notificationMode = object(job.params).notificationMode === "full" ? "full" : "catchup";
-        const coverageRangeFrom = notificationMode === "full"
-          ? new Date(Math.max(rangeFrom.getTime(), rangeTo.getTime() - 369 * 24 * 60 * 60 * 1000))
-          : rangeFrom;
-        const notificationSync = notificationMode === "full" && typeof tx.creatorNotificationSyncState?.findUnique === "function"
-          ? await tx.creatorNotificationSyncState.findUnique({
-              where: { creatorId: job.creatorId },
-              select: { oldestOccurredAt: true },
-            })
-          : null;
-        const sourceBoundaryAt = strictDate(notificationSync?.oldestOccurredAt);
-        for (const type of requested) {
-          const typeRejected = (perTypeInitialRejected[type] || 0) + (perTypePersistenceRejected[type] || 0);
-          const persistedCoverage = await persistCoverageRows(tx, {
-            job,
-            batchId: initial.batch.id,
-            type,
-            rangeFrom: coverageRangeFrom,
-            rangeTo,
-            sourceTimezone,
-            scannerCoverage: object(object(result?.coverage)[type]),
-            scannerComplete: coverageByType[type] === "complete",
-            rejectedRows: typeRejected,
-            now,
-            sourceBoundaryAt,
-            limitToSourceBoundary: notificationMode === "full",
-          });
-          if (!persistedCoverage.requestedIntervalComplete) coverageByType[type] = "partial";
-        }
+        // Notifications are a cursor/frontier collector, not a temporal-day collector.
+        // Scanner completion + committed page batches prove this collection generation;
+        // CreatorNotificationSyncState owns the durable frontier/current collection state.
+        // Do not write AnalyticsCoverage(NOTIFICATION_*) here: that would create a second
+        // durable collection-state generation for a non-calendar collector.
       }
       const complete = counts.rejected === 0 && (!finalizeCoverage || requested.every((type) => coverageByType[type] === "complete"));
       const partialReason = counts.rejected > 0

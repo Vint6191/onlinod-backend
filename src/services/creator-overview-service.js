@@ -3,6 +3,13 @@
 const prisma = require("../prisma");
 const { readCreatorLedgerOverview } = require("./creator-analytics-ledger-service");
 const { normalizeCreatorOverviewRangeKey } = require("./analytics-range-contract");
+const { evaluateDurableCollectorState, stateVocabulary } = require("./analytics-state-evaluator");
+const {
+  NOTIFICATION_COLLECTION_FRESHNESS_MS,
+  FINANCIAL_COLLECTION_FRESHNESS_MS,
+  CAMPAIGN_COLLECTION_FRESHNESS_MS,
+  trustedCollectionTimestamp,
+} = require("./analytics-freshness-policy");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const ACTIVITY_RETENTION_DAYS = 30;
@@ -129,26 +136,15 @@ async function readCreatorTaskActivityDays({ db = prisma, creatorId, now = new D
       // Rolling deploy fallback below.
     }
   }
-  let rows = [];
-  try {
-    rows = db?.creatorTaskActivity?.findMany
-      ? await db.creatorTaskActivity.findMany({
-          where: { creatorId, updatedAt: { gte: cutoff } },
-          orderBy: [{ updatedAt: "desc" }],
-          take: 5000,
-          select: { updatedAt: true },
-        })
-      : [];
-  } catch {
-    rows = db?.jobInstance?.findMany
-      ? await db.jobInstance.findMany({
-          where: { creatorId, updatedAt: { gte: cutoff } },
-          orderBy: [{ updatedAt: "desc" }],
-          take: 5000,
-          select: { updatedAt: true },
-        })
-      : [];
+  if (!db?.creatorTaskActivity?.findMany) {
+    throw new Error("CreatorTaskActivity Prisma delegate is required by the current Creator Overview contract");
   }
+  const rows = await db.creatorTaskActivity.findMany({
+    where: { creatorId, updatedAt: { gte: cutoff } },
+    orderBy: [{ updatedAt: "desc" }],
+    take: 5000,
+    select: { updatedAt: true },
+  });
   return [...new Set(rows.map((row) => iso(row.updatedAt)?.slice(0, 10)).filter(Boolean))].slice(0, 30);
 }
 
@@ -161,41 +157,10 @@ async function readCreatorTaskActivity({ db = prisma, creatorId, now = new Date(
     const end = new Date(start.getTime() + DAY_MS);
     where.updatedAt = { gte: start, lt: end };
   }
-  let rows = [];
-  try {
-    rows = await db.creatorTaskActivity.findMany({ where, orderBy: [{ updatedAt: "desc" }, { id: "desc" }], take });
-  } catch (error) {
-    // During a rolling deploy the app can briefly run before the new table is
-    // migrated. Keep the Overview readable by deriving the same 30-day window
-    // from JobInstance until migration finishes.
-    if (!db?.jobInstance?.findMany) throw error;
-    const jobs = await db.jobInstance.findMany({
-      where: {
-        creatorId,
-        updatedAt: where.updatedAt,
-        OR: [
-          { status: { in: ["CLAIMED", "PAUSED", "DONE", "FAILED", "CANCELLED"] } },
-          { status: "SCHEDULED", OR: [{ startedAt: { not: null } }, { claimedAt: { not: null } }] },
-        ],
-      },
-      orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
-      take,
-    });
-    rows = jobs.map((job) => ({
-      id: `job:${job.id}`,
-      jobId: job.id,
-      jobKey: job.jobKey,
-      mode: text(object(job.params).analyticsSyncKind || object(job.params).financialMode || object(job.params).campaignMode || object(job.params).notificationMode, 80),
-      stage: text(object(job.params).analyticsSyncStage, 80),
-      status: job.status,
-      detail: text(object(job.progress).message, 500),
-      lastError: text(job.lastError, 2000),
-      startedAt: job.startedAt || job.claimedAt,
-      completedAt: job.completedAt,
-      createdAt: job.createdAt,
-      updatedAt: job.updatedAt,
-    }));
+  if (!db?.creatorTaskActivity?.findMany) {
+    throw new Error("CreatorTaskActivity Prisma delegate is required by the current Creator Overview contract");
   }
+  const rows = await db.creatorTaskActivity.findMany({ where, orderBy: [{ updatedAt: "desc" }, { id: "desc" }], take });
   return rows.map((row) => {
     const params = { analyticsSyncKind: row.mode, analyticsSyncStage: row.stage };
     const at = row.completedAt || row.updatedAt || row.startedAt || row.createdAt;
@@ -374,6 +339,22 @@ async function readCampaignCurrentValues({ db, creatorId }) {
   };
 }
 
+function collectorStatePayload(state) {
+  return {
+    complete: state.complete === true,
+    proven: state.proven === true,
+    fresh: state.fresh === true,
+    stale: state.stale === true,
+    due: state.due === true,
+    deferred: state.deferred === true,
+    failed: state.failed === true,
+    collecting: state.collecting === true,
+    state: stateVocabulary(state),
+    lastVerifiedAt: iso(state.lastVerifiedAt),
+    retryAfterAt: iso(state.retryAfterAt),
+  };
+}
+
 async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", now = new Date() }) {
   const range = normalizeCreatorOverviewRangeKey(rangeKey);
   const ledger = await readCreatorLedgerOverview({ db, creatorId, rangeKey: range, now, includeMessages: false, includeCoveragePage: false });
@@ -381,7 +362,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   const end = new Date(ledger.range.endAt);
   const eventBetween = { gte: start, lte: end };
 
-  const [creator, financialGroups, campaignFanGroups, campaignCurrent] = await Promise.all([
+  const [creator, financialGroups, campaignFanGroups, campaignCurrent, financialCollectionState, campaignCollectionState] = await Promise.all([
     db.creatorAccount.findUnique({ where: { id: creatorId }, select: { id: true, createdAt: true, updatedAt: true } }),
     db.creatorFinancialTransaction.groupBy({
       by: ["transactionType", "transactionStatus"],
@@ -395,6 +376,8 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
       _count: { _all: true },
     }),
     readCampaignCurrentValues({ db, creatorId }),
+    db.creatorFinancialCollectionState?.findUnique ? db.creatorFinancialCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
+    db.creatorCampaignCollectionState?.findUnique ? db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
   ]);
 
   const joinedByCampaign = new Map(campaignFanGroups.map((row) => [String(row.campaignId), int(row?._count?._all)]));
@@ -427,14 +410,40 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   const campaignFallbackPayers = campaigns.reduce((sum, row) => sum + row.payingFans, 0);
   const payingFans = await readCampaignPayingFanCount({ db, creatorId, start, end, fallback: campaignFallbackPayers });
 
-  const notificationBaselineAtRaw = ledger.notificationSync?.fullBackfillVerifiedAt || ledger.notificationSync?.fullBackfillCompletedAt || null;
-  const notificationBaselineAt = notificationBaselineAtRaw ? new Date(notificationBaselineAtRaw) : null;
-  const notificationBaselineComplete = Boolean(notificationBaselineAt);
+  const notificationBaselineAtRaw = ledger.notificationSync?.fullBackfillVerifiedAt || null;
+  const notificationBaselineAt = trustedCollectionTimestamp(notificationBaselineAtRaw, now);
+  const notificationCollection = evaluateDurableCollectorState({
+    status: ledger.notificationSync?.status,
+    baselineCompletedAt: ledger.notificationSync?.fullBackfillCompletedAt,
+    baselineVerifiedAt: ledger.notificationSync?.fullBackfillVerifiedAt,
+    lastVerifiedAt: ledger.notificationSync?.lastCatchupVerifiedAt || ledger.notificationSync?.fullBackfillVerifiedAt,
+    retryAfterAt: ledger.notificationSync?.retryAfterAt,
+    now,
+    freshnessMs: NOTIFICATION_COLLECTION_FRESHNESS_MS,
+  });
+  const financialCollection = evaluateDurableCollectorState({
+    status: financialCollectionState?.status,
+    baselineCompletedAt: financialCollectionState?.baselineVerifiedAt,
+    baselineVerifiedAt: financialCollectionState?.baselineVerifiedAt,
+    lastVerifiedAt: financialCollectionState?.lastCatchupCompletedAt || financialCollectionState?.baselineVerifiedAt,
+    retryAfterAt: financialCollectionState?.retryAfterAt,
+    now,
+    freshnessMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
+  });
+  const campaignCollection = evaluateDurableCollectorState({
+    status: campaignCollectionState?.status,
+    baselineCompletedAt: campaignCollectionState?.baselineVerifiedAt,
+    baselineVerifiedAt: campaignCollectionState?.baselineVerifiedAt,
+    lastVerifiedAt: campaignCollectionState?.lastCatchupCompletedAt || campaignCollectionState?.baselineVerifiedAt,
+    retryAfterAt: campaignCollectionState?.retryAfterAt,
+    now,
+    freshnessMs: CAMPAIGN_COLLECTION_FRESHNESS_MS,
+  });
   const oldestNotificationAt = ledger.notificationSync?.oldestOccurredAt ? new Date(ledger.notificationSync.oldestOccurredAt) : null;
   const oneYearStart = new Date(now.getTime() - 365 * DAY_MS);
   const accumulatedFromInitialHalfYear = notificationBaselineAt && notificationBaselineAt.getTime() <= now.getTime() - 185 * DAY_MS;
   const explicitOneYearSpan = oldestNotificationAt && oldestNotificationAt <= oneYearStart;
-  const oneYearAvailable = Boolean(notificationBaselineComplete && (accumulatedFromInitialHalfYear || explicitOneYearSpan));
+  const oneYearAvailable = Boolean(notificationCollection.proven === true && (accumulatedFromInitialHalfYear || explicitOneYearSpan));
 
   const activity = subscriptionSummary(ledger.subscriptions);
   activity.likes = int(ledger.totals.likesCount);
@@ -469,8 +478,20 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
       { key: "365d", label: "1Y", enabled: oneYearAvailable, reason: oneYearAvailable ? null : "Available after ONLINOD has accumulated a full year of activity coverage" },
     ],
     coverage: {
-      notificationVerified: notificationBaselineComplete,
+      notificationVerified: notificationCollection.proven === true,
       earningsVerified: ledger.verification.officialEarnings,
+      earningsComplete: ledger.verification.earningsComplete === true,
+      earningsProven: ledger.verification.earningsProven === true,
+      earningsFresh: ledger.verification.earningsFresh === true,
+      earningsStale: ledger.verification.earningsStale === true,
+      earningsDue: ledger.verification.earningsDue === true,
+      earningsDeferred: ledger.verification.earningsDeferred === true,
+      earningsState: String(ledger.verification.earningsState || "UNAVAILABLE"),
+      collectors: {
+        notifications: collectorStatePayload(notificationCollection),
+        financial: collectorStatePayload(financialCollection),
+        campaigns: collectorStatePayload(campaignCollection),
+      },
       activityFromAt: iso(ledger.availability?.activityFromAt),
       activityToAt: iso(ledger.availability?.activityToAt),
       oneYearAvailable,

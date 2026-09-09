@@ -42,7 +42,7 @@ cacheModule(syncPath, {
       from: "2016-01-01T00:00:00.000Z",
       to: "2026-08-07T14:00:00.000Z",
       types: ["purchases", "tips", "subscriptions", "likes", "comments"],
-      notificationMode: state?.fullBackfillVerifiedAt || state?.fullBackfillCompletedAt ? "catchup" : "full",
+      notificationMode: state?.fullBackfillVerifiedAt ? "catchup" : "full",
       pageLimit: 10,
       analyticsRangeKey: "all",
     };
@@ -57,6 +57,13 @@ const {
 } = require("./notification-scan-control-service");
 
 const creator = { id: "creator-1", agencyId: "agency-1" };
+
+function notificationCommand(scanRunId, mode, requestedAt = "2026-08-07T11:00:00.000Z") {
+  return {
+    collectionContractVersion: 1, collectionType: "NOTIFICATIONS", collectionMode: mode,
+    collectionGeneration: scanRunId, collectionRequestedAt: requestedAt, collectionReason: "test",
+  };
+}
 
 function manualJob(overrides = {}) {
   return {
@@ -88,8 +95,20 @@ test("manual START uses bounded catch-up when historical notification coverage a
   assert.equal(scheduledInput.params.manualNotificationScanVersion, 1);
   assert.equal(scheduledInput.params.notificationMode, "catchup");
   assert.equal(scheduledInput.params.analyticsRangeKey, "all");
+  assert.equal(scheduledInput.params.collectionContractVersion, 1);
+  assert.equal(scheduledInput.params.collectionType, "NOTIFICATIONS");
+  assert.equal(scheduledInput.params.collectionMode, "catchup");
+  assert.ok(scheduledInput.params.collectionGeneration);
+  assert.equal(scheduledInput.params.collectionRequestedAt, "2026-08-07T12:00:00.000Z");
   assert.equal(buildStateSeen, syncState);
   assert.equal(scheduledInput.params.forceNotificationFullRebuild, undefined);
+  assert.deepEqual(scheduledInput.dedupeParams, {
+    planningEpoch: "none:2026-08-01T00:00:00.000Z",
+    collectionContractVersion: 1,
+    collectionType: "NOTIFICATIONS",
+    collectionMode: "catchup",
+  });
+  assert.equal(scheduledInput.db, db);
 });
 
 test("manual START still uses full history for a creator with no historical baseline", async () => {
@@ -102,10 +121,39 @@ test("manual START still uses full history for a creator with no historical base
   assert.equal(buildStateSeen, null);
 });
 
+test("manual START treats completed-but-unverified history as FULL repair work", async () => {
+  scheduledInput = null;
+  buildStateSeen = undefined;
+  syncState = {
+    fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
+    fullBackfillVerifiedAt: null,
+    headNotificationId: "known-head",
+  };
+  const db = { jobInstance: { async findMany() { return []; } } };
+  await startManualNotificationScan({ db, creator, requestedByUserId: "user-1", now: new Date("2026-08-07T12:00:00.000Z") });
+  assert.equal(scheduledInput.params.notificationMode, "full");
+  assert.equal(scheduledInput.params.forceNotificationFullRebuild, undefined);
+  assert.equal(buildStateSeen, null);
+});
+
+test("manual START treats a future-poisoned baseline as FULL repair work", async () => {
+  scheduledInput = null;
+  buildStateSeen = undefined;
+  syncState = {
+    fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
+    fullBackfillVerifiedAt: new Date("2099-01-01T00:00:00.000Z"),
+    headNotificationId: "poisoned-head",
+  };
+  const db = { jobInstance: { async findMany() { return []; } } };
+  await startManualNotificationScan({ db, creator, requestedByUserId: "user-1", now: new Date("2026-08-07T12:00:00.000Z") });
+  assert.equal(scheduledInput.params.notificationMode, "full");
+  assert.equal(buildStateSeen, null);
+});
+
 test("an explicit forceFull request can deliberately re-prove full history", async () => {
   scheduledInput = null;
   buildStateSeen = undefined;
-  syncState = { fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z") };
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
   const db = { jobInstance: { async findMany() { return []; } } };
   await startManualNotificationScan({ db, creator, requestedByUserId: "user-1", now: new Date("2026-08-07T12:00:00.000Z"), forceFull: true });
   assert.equal(scheduledInput.params.notificationMode, "full");
@@ -114,10 +162,10 @@ test("an explicit forceFull request can deliberately re-prove full history", asy
 });
 
 test("manual start resumes the same current-v8 paused catch-up without clearing its cursor", async () => {
-  syncState = { fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z") };
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
   const paused = manualJob({
     status: "PAUSED",
-    params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup" },
+    params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup", ...notificationCommand("scan-run-1234", "catchup") },
     continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 8, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 } },
     progress: { current: 7, message: "page 7" },
     leaseRevision: 4,
@@ -140,8 +188,8 @@ test("manual start resumes the same current-v8 paused catch-up without clearing 
   assert.deepEqual(paused.continuation.jobContinuation, { schemaVersion: 8, scanRunId: "scan-run-1234", fromId: "n-100", page: 7 });
 });
 
-test("a stale paused full scan is fenced and replaced by catch-up once baseline exists", async () => {
-  syncState = { fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z") };
+test("a stale paused full scan is fenced and replaced by catch-up once the baseline is verified", async () => {
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
   const paused = manualJob({
     status: "PAUSED",
     params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "full" },
@@ -159,7 +207,7 @@ test("a stale paused full scan is fenced and replaced by catch-up once baseline 
   const result = await startManualNotificationScan({ db, creator, now: new Date("2026-08-07T12:00:00.000Z") });
   assert.equal(result.action, "created");
   assert.equal(cancelled.status, "CANCELLED");
-  assert.equal(cancelled.lastError, "superseded_by_manual_catchup");
+  assert.equal(cancelled.lastError, "retired_analytics_collection_contract_pre_v1");
   assert.equal(scheduledInput.params.notificationMode, "catchup");
 });
 
@@ -167,8 +215,8 @@ test("pre-v8 paused catch-up is restarted cleanly as catch-up, not promoted to f
   syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
   const paused = manualJob({
     status: "PAUSED",
-    params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup" },
-    continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 7, fromId: "old-catchup" } },
+    params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup", ...notificationCommand("scan-run-v7", "catchup") },
+    continuation: { driverPhase: "execute", jobContinuation: { schemaVersion: 7, scanRunId: "scan-run-v7", fromId: "old-catchup" } },
     leaseRevision: 2,
   });
   scheduledInput = null;
@@ -329,13 +377,70 @@ test("scanner read never presents stale legacy sync state as the current manual 
   assert.equal(result.legacySummary.lastErrorMessage, "old type=all failure");
 });
 
+test("scanner read never equates Job DONE with a proven notification source boundary", async () => {
+  const job = manualJob({
+    status: "DONE",
+    params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup" },
+  });
+  syncState = {
+    sourceJobId: job.id,
+    status: "PARTIAL",
+    mode: "catchup",
+    nextCursor: null,
+    lastCatchupCompletedAt: null,
+    pagesScanned: 2,
+    eventsAccepted: 0,
+    eventsRejected: 1,
+    ignoredEvents: 0,
+    updatedAt: new Date("2026-08-07T10:05:00.000Z"),
+  };
+  const db = {
+    jobInstance: { async findMany() { return [job]; } },
+    creatorNotificationScanItem: {
+      async findMany() { return []; }, async count() { return 0; }, async groupBy() { return []; },
+    },
+    deviceCreatorBinding: { async count() { return 1; } },
+  };
+  const result = await readManualNotificationScan({ db, creator, outcome: "ALL", limit: 100, offset: 0 });
+  assert.equal(result.status, "PARTIAL");
+  assert.equal(result.sourceBoundaryReached, false);
+});
+
+test("scanner read reports source boundary only from the linked durable completion proof", async () => {
+  const job = manualJob({
+    status: "DONE",
+    params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup" },
+  });
+  syncState = {
+    sourceJobId: job.id,
+    status: "COMPLETE",
+    mode: "catchup",
+    nextCursor: null,
+    lastCatchupCompletedAt: new Date("2026-08-07T10:05:00.000Z"),
+    pagesScanned: 2,
+    eventsAccepted: 1,
+    eventsRejected: 0,
+    ignoredEvents: 0,
+    updatedAt: new Date("2026-08-07T10:05:00.000Z"),
+  };
+  const db = {
+    jobInstance: { async findMany() { return [job]; } },
+    creatorNotificationScanItem: {
+      async findMany() { return []; }, async count() { return 0; }, async groupBy() { return []; },
+    },
+    deviceCreatorBinding: { async count() { return 1; } },
+  };
+  const result = await readManualNotificationScan({ db, creator, outcome: "ALL", limit: 100, offset: 0 });
+  assert.equal(result.sourceBoundaryReached, true);
+});
+
 test("manual START adopts an already running automatic initial FULL instead of creating a duplicate", async () => {
   scheduledInput = null;
   syncState = null;
   const automatic = manualJob({
     id: "automatic-initial-full",
     status: "CLAIMED",
-    params: { notificationMode: "full", analyticsSyncKind: "initial", analyticsSyncVersion: 1 },
+    params: { notificationMode: "full", analyticsSyncKind: "initial", analyticsSyncVersion: 1, ...notificationCommand("scan-run-auto-full", "full") },
   });
   const db = { jobInstance: { async findMany() { return [automatic]; } } };
   const result = await startManualNotificationScan({ db, creator, now: new Date("2026-08-07T12:00:00.000Z") });
@@ -344,9 +449,25 @@ test("manual START adopts an already running automatic initial FULL instead of c
   assert.equal(scheduledInput, null);
 });
 
-test("manual START fences a legacy no-mode automatic FULL after baseline and replaces it with catch-up", async () => {
+test("manual START never adopts a same-mode pre-v1 notification job without a server collection command", async () => {
   scheduledInput = null;
-  syncState = { fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"), headNotificationId: "known-head" };
+  syncState = null;
+  const legacy = manualJob({ id: "legacy-same-mode", status: "SCHEDULED", params: { notificationMode: "full", analyticsSyncKind: "initial" } });
+  let cancelled = null;
+  const db = { jobInstance: {
+    async findMany() { return [legacy]; },
+    async updateMany({ data }) { cancelled = data; return { count: 1 }; },
+  } };
+  const result = await startManualNotificationScan({ db, creator, now: new Date("2026-08-07T12:00:00.000Z") });
+  assert.equal(result.action, "created");
+  assert.equal(cancelled.status, "CANCELLED");
+  assert.equal(cancelled.lastError, "retired_analytics_collection_contract_pre_v1");
+  assert.equal(scheduledInput.params.collectionType, "NOTIFICATIONS");
+});
+
+test("manual START fences a legacy no-mode automatic FULL after verified baseline and replaces it with catch-up", async () => {
+  scheduledInput = null;
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), headNotificationId: "known-head" };
   const automatic = manualJob({
     id: "automatic-legacy-no-mode",
     status: "CLAIMED",

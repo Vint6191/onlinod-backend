@@ -5,6 +5,9 @@ const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
 const { readCampaignsWithRevenue } = require("./creator-analytics-ledger-service");
+const {
+  buildCollectionCommand, buildCollectionPlanningDedupeParams, withCollectorStateLock, COLLECTOR_TYPES,
+} = require("./analytics-collector-control-service");
 
 const JOB_KEY = "fetch_campaigns";
 const MANUAL_REASON = "manual_creator_analytics_campaign_scan";
@@ -58,6 +61,14 @@ async function activeJob(db, creatorId) {
   const rows = await recentJobs(db, creatorId, ["SCHEDULED", "CLAIMED", "PAUSED"], 40);
   return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
 }
+async function activeCollectorJob(db, creatorId) {
+  const rows = await db.jobInstance.findMany({
+    where: { creatorId, jobKey: JOB_KEY, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
+    take: 40,
+  });
+  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
+}
 async function countOnlineBindings(db, creator) {
   const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
   return db.deviceCreatorBinding.count({
@@ -74,40 +85,43 @@ async function countOnlineBindings(db, creator) {
 
 async function startManualCampaignScan({ db = prisma, creator, requestedByUserId = null, now = new Date() }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
-  const active = await activeJob(db, creator.id);
-  if (active?.status === "PAUSED") {
-    const planned = await reschedulePlannedJob({
-      db, job: active, params: active.params || {}, priority: active.priority || 0,
-      scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
-      lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
-      protectedStatuses: [],
-    });
-    return { job: planned.job, action: "resumed" };
-  }
-  if (active) return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: creator.id, work: async (tx) => {
+    const active = await activeCollectorJob(tx, creator.id);
+    if (active?.status === "PAUSED") {
+      const planned = await reschedulePlannedJob({
+        db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
+        scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
+        lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
+        protectedStatuses: [],
+      });
+      return { job: planned.job, action: "resumed" };
+    }
+    if (active) return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
 
-  const params = {
-    manualCampaignScan: true,
-    manualCampaignScanVersion: MANUAL_VERSION,
-    manualRunToken: crypto.randomUUID(),
-    requestedByUserId: clean(requestedByUserId, 220),
-    reason: MANUAL_REASON,
-    pageSize: 50,
-    maxPages: 40,
-    claimerPageSize: 50,
-    maxClaimerPages: 10_000,
-    fanValueBatchSize: 20,
-  };
-  const scheduled = await scheduleJobNow({
-    jobKey: JOB_KEY,
-    creatorId: creator.id,
-    agencyId: creator.agencyId,
-    params,
-    priority: 100,
-    now,
-    bucketMs: 1,
-  });
-  return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
+    const state = typeof tx.creatorCampaignCollectionState?.findUnique === "function"
+      ? await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id } })
+      : null;
+    const params = {
+      manualCampaignScan: true,
+      manualCampaignScanVersion: MANUAL_VERSION,
+      manualRunToken: crypto.randomUUID(),
+      requestedByUserId: clean(requestedByUserId, 220),
+      reason: MANUAL_REASON,
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "full", reason: MANUAL_REASON, now }),
+      pageSize: 50,
+      maxPages: 40,
+      claimerPageSize: 50,
+      maxClaimerPages: 10_000,
+      fanValueBatchSize: 20,
+    };
+    const scheduled = await scheduleJobNow({
+      db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId, params, priority: 100, now, bucketMs: 1,
+      dedupeParams: buildCollectionPlanningDedupeParams({
+        collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "full", state,
+      }),
+    });
+    return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
+  }});
 }
 
 async function stopManualCampaignScan({ db = prisma, creatorId, now = new Date() }) {

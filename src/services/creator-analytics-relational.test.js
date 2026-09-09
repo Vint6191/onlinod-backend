@@ -6,7 +6,7 @@ const path = require("node:path");
 const Module = require("node:module");
 const originalLoad = Module._load;
 Module._load = function(request, parent, isMain) {
-  if (request === "../prisma" && parent?.filename?.endsWith("creator-analytics-ledger-service.js")) return {};
+  if (request === "../prisma" && (parent?.filename?.endsWith("creator-analytics-ledger-service.js") || parent?.filename?.endsWith("analytics-collector-control-service.js"))) return {};
   return originalLoad.call(this, request, parent, isMain);
 };
 const { normalizeEarningsRow, normalizeCampaign, normalizeMessageDay } = require("./creator-analytics-ledger-service");

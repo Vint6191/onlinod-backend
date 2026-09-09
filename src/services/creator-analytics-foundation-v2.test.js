@@ -13,6 +13,7 @@ const foundationMigration = read("prisma/migrations/20260808101500_creator_analy
 const projection = read("src/services/creator-analytics-projection-service.js");
 const ledger = read("src/services/creator-analytics-ledger-service.js");
 const notifications = read("src/services/notification-facts-service.js");
+const notificationSync = read("src/services/notification-sync-state-service.js");
 const routes = read("src/routes/stats.js");
 
 function modelBody(name) {
@@ -98,9 +99,13 @@ test("V2 migrations split enum additions from relational table use and contain n
   assert.match(foundationMigration, /DELETE FROM "AnalyticsCoverage" AS coverage[\s\S]*"oldestOccurredAt"/);
 });
 
-test("full notification coverage is fenced to the observed rolling source boundary", () => {
-  assert.match(notifications, /limitToSourceBoundary: notificationMode === "full"/);
-  assert.match(notifications, /creatorNotificationSyncState\.findUnique/);
-  assert.match(notifications, /oldestOccurredAt/);
-  assert.match(notifications, /calendar timestamp from which to claim historical availability/);
+test("notification history proof is owned by durable cursor/frontier state, not temporal AnalyticsCoverage", () => {
+  assert.match(notifications, /Notifications are a cursor\/frontier collector, not a temporal-day collector/);
+  assert.match(notifications, /CreatorNotificationSyncState owns the durable frontier\/current collection state/);
+  assert.match(notifications, /Do not write AnalyticsCoverage\(NOTIFICATION_\*\)/);
+  assert.match(notificationSync, /Only the durable verification timestamp is authority/);
+  assert.match(notificationSync, /const historicalBaseline = Boolean\(trustedCollectionTimestamp\(state\?\.fullBackfillVerifiedAt, now\)\)/);
+  assert.match(notificationSync, /const stopAtNotificationId = clean\(state\?\.headNotificationId/);
+  assert.match(notificationSync, /headNotificationId is the durable \*verified\* frontier/);
+  assert.match(notificationSync, /knownNotificationIds: verifiedKnownIds/);
 });

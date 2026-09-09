@@ -49,7 +49,7 @@ test("Home canonical revenue uses distinct date ranges for current/previous peri
       },
       async findMany(args) {
         assert.equal(dateKey(args.where.coverageDate), "2026-09-08");
-        return creators.map((creator) => ({ creatorId: creator.id, lastVerifiedAt: new Date("2026-09-08T13:55:00.000Z") }));
+        return creators.map((creator) => ({ creatorId: creator.id, status: "PARTIAL", lastVerifiedAt: new Date("2026-09-08T13:55:00.000Z") }));
       },
     },
     jobInstance: { async findMany() { return []; } },
@@ -115,7 +115,7 @@ test("Home never publishes a partial agency revenue sum as the complete KPI", as
         }];
       },
       async findMany() {
-        return [{ creatorId: "creator-a", lastVerifiedAt: new Date("2026-09-08T13:55:00.000Z") }];
+        return [{ creatorId: "creator-a", status: "PARTIAL", lastVerifiedAt: new Date("2026-09-08T13:55:00.000Z") }];
       },
     },
     jobInstance: { async findMany() { return []; } },
@@ -161,4 +161,55 @@ test("Home refresh HTTP path enqueues one durable demand instead of looping crea
   assert.doesNotMatch(refreshBody, /for\s*\(|Promise\.all\s*\(|creatorAccount\.findMany/);
   assert.match(refreshBody, /demandKey/);
   assert.match(refreshBody, /requestRevision/);
+});
+
+test("Home lifecycle projection exposes queued demand before any JobInstance exists", () => {
+  const now = new Date("2026-09-08T20:00:00.000Z");
+  const result = home.projectCollectionLifecycle({
+    creatorIds: ["creator-a", "creator-b"],
+    activeJobs: [],
+    activeDemands: [{ key: "demand-1", creatorIds: null, claimToken: null, nextAttemptAt: null }],
+    now,
+  });
+  assert.equal(result.size, 2);
+  assert.deepEqual(result.get("creator-a"), { jobId: null, reason: "queued" });
+  assert.deepEqual(result.get("creator-b"), { jobId: null, reason: "queued" });
+});
+
+test("Home lifecycle projection intersects targeted demand with current visible scope", () => {
+  const now = new Date("2026-09-08T20:00:00.000Z");
+  const result = home.projectCollectionLifecycle({
+    creatorIds: ["creator-a", "creator-b"],
+    activeJobs: [],
+    activeDemands: [{ key: "demand-1", creatorIds: ["creator-b", "creator-hidden"], claimToken: null, nextAttemptAt: null }],
+    now,
+  });
+  assert.deepEqual([...result.keys()], ["creator-b"]);
+  assert.equal(result.has("creator-hidden"), false);
+});
+
+test("Home lifecycle projection distinguishes planning and deferred demand", () => {
+  const now = new Date("2026-09-08T20:00:00.000Z");
+  const result = home.projectCollectionLifecycle({
+    creatorIds: ["creator-a", "creator-b"],
+    activeJobs: [],
+    activeDemands: [
+      { key: "planning", creatorIds: ["creator-a"], claimToken: "claim-1", nextAttemptAt: null },
+      { key: "deferred", creatorIds: ["creator-b"], claimToken: null, nextAttemptAt: new Date("2026-09-08T20:05:00.000Z") },
+    ],
+    now,
+  });
+  assert.deepEqual(result.get("creator-a"), { jobId: null, reason: "planning" });
+  assert.deepEqual(result.get("creator-b"), { jobId: null, reason: "deferred" });
+});
+
+test("Home lifecycle projection gives materialized collection priority over demand state", () => {
+  const now = new Date("2026-09-08T20:00:00.000Z");
+  const result = home.projectCollectionLifecycle({
+    creatorIds: ["creator-a"],
+    activeJobs: [{ id: "job-1", creatorId: "creator-a", status: "CLAIMED" }],
+    activeDemands: [{ key: "demand-1", creatorIds: ["creator-a"], claimToken: "claim-1", nextAttemptAt: new Date("2026-09-08T20:05:00.000Z") }],
+    now,
+  });
+  assert.deepEqual(result.get("creator-a"), { jobId: "job-1", reason: "collecting" });
 });

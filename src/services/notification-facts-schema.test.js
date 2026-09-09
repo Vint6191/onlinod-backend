@@ -107,22 +107,15 @@ test("ingest is version-fenced, transactional, page-oriented and interval-aware"
   assert.match(service, /const LEGACY_SCHEMA_VERSION = 3/);
   assert.match(service, /const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4"/);
   assert.match(service, /schemaVersion === ALL_SCHEMA_VERSION \? "v5" : "v6"/);
-  assert.match(service, /rangeTo\.getTime\(\) - 369/);
-  assert.match(service, /Notification coverage range exceeds 370 days/);
   assert.match(service, /notification-facts:\$\{job\.id\}:\$\{batchKey\}:\$\{protocolSuffix\}/);
   assert.match(service, /db\.\$transaction/);
   assert.match(service, /createMany\(\{ data: creates\.map/);
-  assert.match(service, /analyticsCoverage\.updateMany/);
-  assert.match(service, /NOTIFICATION_PURCHASES/);
-  assert.match(service, /NOTIFICATION_TIPS/);
-  assert.match(service, /NOTIFICATION_SUBSCRIPTIONS/);
+  assert.doesNotMatch(service, /analyticsCoverage\.(?:findMany|createMany|updateMany)/);
+  assert.match(service, /Notifications are a cursor\/frontier collector/);
   assert.match(service, /onlyFansLikeId/);
   assert.match(service, /`l:\$\{fact\.likeId\}`/);
   assert.match(service, /NOTIFICATION_TIMEZONE_UNSUPPORTED/);
-  assert.match(service, /persistCoverageRows/);
-  assert.match(service, /dayBounds/);
   assert.match(service, /pg_advisory_xact_lock/);
-  assert.match(service, /NOTIFICATION_RESUME_CURSOR_UNVERIFIED/);
   assert.match(service, /NOTIFICATION_FINALIZE_FLAG_REQUIRED/);
   assert.match(service, /NOTIFICATION_COVERAGE_METADATA_INVALID/);
   assert.match(strictDates, /getUTCDate\(\) !== day/);
@@ -161,13 +154,13 @@ test("automatic creator scheduling delegates notification history to the strict 
 
 test("completion preserves run identity, streams compatibility facts and treats proven source traversal as technically done", () => {
   const ledgerAt = observation.indexOf("await ingestNotificationFacts");
-  const compatibilityAt = observation.indexOf("for await (const raw of iterateLedgerCompatibilityEvents");
+  const compatibilityAt = observation.indexOf("for await (const fact of iterateCanonicalProjectionFacts");
   assert.ok(ledgerAt >= 0 && compatibilityAt > ledgerAt);
   assert.match(observation, /batchKey: result\?\.batchKey/);
   assert.match(observation, /sourceJobId: job\.id/);
   assert.match(observation, /NOTIFICATION_COMPATIBILITY_PAGE_SIZE = 500/);
   assert.doesNotMatch(observation, /NOTIFICATION_COMPATIBILITY_LIMIT/);
-  assert.match(observation, /analyticsCoverageByType/);
+  assert.match(observation, /collectionCoverageByType/);
   assert.match(observation, /subscriptionRefundIgnored/);
   assert.match(observation, /notification_scan_partial/);
   assert.match(observation, /sourceTraversalComplete/);
@@ -178,7 +171,8 @@ test("completion preserves run identity, streams compatibility facts and treats 
   assert.match(leaseService, /leaseRevision: \{ increment: 1 \}/);
   assert.match(leaseService, /notification scan scheduled for repair/);
   assert.match(leaseService, /partialTypes/);
-  assert.match(leaseService, /resumeCursors/);
+  assert.doesNotMatch(leaseService, /const resumeCursors =/);
+  assert.doesNotMatch(leaseService, /notificationRepairPass\s*:/);
   assert.match(leaseService, /status: "SCHEDULED"/);
 });
 

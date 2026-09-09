@@ -3,6 +3,18 @@
 const prisma = require("../prisma");
 const { buildNotificationScanParams, loadNotificationSyncState } = require("./notification-sync-state-service");
 const {
+  buildCollectionCommand,
+  buildCollectionPlanningDedupeParams,
+  withCollectorStateLock,
+  COLLECTOR_TYPES,
+} = require("./analytics-collector-control-service");
+const {
+  NOTIFICATION_COLLECTION_FRESHNESS_MS,
+  FINANCIAL_COLLECTION_FRESHNESS_MS,
+  CAMPAIGN_COLLECTION_FRESHNESS_MS,
+  trustedCollectionTimestamp,
+} = require("./analytics-freshness-policy");
+const {
   JOB_KEY: FINANCIAL_JOB_KEY,
   SCHEMA_VERSION: FINANCIAL_SCHEMA_VERSION,
   COLLECTOR_VERSION: FINANCIAL_COLLECTOR_VERSION,
@@ -14,14 +26,6 @@ const ANALYTICS_SYNC_VERSION = 1;
 const NOTIFICATION_KNOWN_ID_LIMIT = 300;
 const FINANCIAL_KNOWN_ID_LIMIT = 300;
 const CAMPAIGN_FRONTIER_PER_CAMPAIGN = 100;
-
-function positiveMs(value, fallback) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 60_000 ? Math.floor(parsed) : fallback;
-}
-const NOTIFICATION_CATCHUP_INTERVAL_MS = positiveMs(process.env.CREATOR_ANALYTICS_NOTIFICATION_CATCHUP_MS, 3 * 60 * 60 * 1000);
-const FINANCIAL_CATCHUP_INTERVAL_MS = positiveMs(process.env.CREATOR_ANALYTICS_FINANCIAL_CATCHUP_MS, 24 * 60 * 60 * 1000);
-const CAMPAIGN_CATCHUP_INTERVAL_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_CATCHUP_MS, 60 * 60 * 1000);
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -40,13 +44,6 @@ function lifecycleParams(params) {
 function catchupParams(params) {
   return object(params).analyticsSyncKind === "catchup" && Number(object(params).analyticsSyncVersion || 0) === ANALYTICS_SYNC_VERSION;
 }
-async function recentJobs(db, creatorId, jobKey, take = 60) {
-  return db.jobInstance.findMany({
-    where: { creatorId, jobKey },
-    orderBy: [{ createdAt: "desc" }],
-    take,
-  });
-}
 async function inFlightJob(db, creatorId, jobKey) {
   return db.jobInstance.findFirst({
     where: { creatorId, jobKey, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
@@ -58,14 +55,35 @@ async function scheduleNow(input) {
   const { scheduleJobNow } = require("./job-scheduler");
   return scheduleJobNow(input);
 }
-async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priority, now, bucketMs }) {
-  const active = await inFlightJob(db, creatorId, jobKey);
-  if (active) return { created: false, reason: "already_in_flight", job: active };
-  return scheduleNow({ jobKey, creatorId, agencyId, params, priority, now, bucketMs });
+async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priority, now, bucketMs, collectorType, collectorState }) {
+  return withCollectorStateLock({ db, type: collectorType, creatorId, work: async (tx) => {
+    const active = await inFlightJob(tx, creatorId, jobKey);
+    if (active) return { created: false, reason: "already_in_flight", job: active };
+    return scheduleNow({
+      db: tx,
+      jobKey,
+      creatorId,
+      agencyId,
+      params,
+      priority,
+      now,
+      bucketMs,
+      // Trigger provenance and the random server command UUID are excluded.
+      // The shared collector lock prevents a manual/automatic cross-mode race;
+      // stable dedupe closes same-mode replica races even after the lock releases.
+      dedupeParams: buildCollectionPlanningDedupeParams({
+        collectorType, collectionMode: params?.collectionMode, state: collectorState,
+      }),
+    });
+  }});
 }
 
-function notificationHistoricalBaselineReady(state) {
-  return Boolean(state?.fullBackfillVerifiedAt || state?.fullBackfillCompletedAt);
+function verifiedProofTimestampReady(value, now = new Date()) {
+  return Boolean(trustedCollectionTimestamp(value, now));
+}
+
+function notificationHistoricalBaselineReady(state, now = new Date()) {
+  return verifiedProofTimestampReady(state?.fullBackfillVerifiedAt, now);
 }
 function notificationJobMode(params) {
   // Desktop has always treated anything except an explicit catch-up marker as
@@ -111,35 +129,30 @@ async function cancelRedundantInitialNotificationJobs(db, creatorId, now = new D
   return cancelled;
 }
 
-async function financialInitialCoverageReady(db, creatorId) {
-  if (!db?.creatorEarningsTotal?.findUnique || !db?.jobInstance?.findUnique) return false;
-  const total = await db.creatorEarningsTotal.findUnique({
-    where: { creatorId_category: { creatorId, category: "TOTAL" } },
-    select: { sourceJobId: true, rangeFrom: true, scanRunId: true },
+async function financialInitialCoverageReady(db, creatorId, now = new Date()) {
+  if (!db?.creatorFinancialCollectionState?.findUnique) return false;
+  const state = await db.creatorFinancialCollectionState.findUnique({
+    where: { creatorId },
+    select: { status: true, baselineVerifiedAt: true, baselineGeneration: true },
   });
-  if (!total?.sourceJobId || !total.scanRunId || !total.rangeFrom) return false;
-  if (new Date(total.rangeFrom).getTime() > new Date("2016-01-02T00:00:00.000Z").getTime()) return false;
-  const job = await db.jobInstance.findUnique({ where: { id: total.sourceJobId }, select: { status: true, params: true } });
-  if (!job || job.status !== "DONE") return false;
-  return object(job.params).financialMode !== "catchup";
+  return Boolean(state?.baselineGeneration && verifiedProofTimestampReady(state?.baselineVerifiedAt, now));
 }
 
-async function campaignInitialCoverageReady(db, creatorId) {
-  if (!db?.analyticsCoverage?.findFirst) return false;
-  const row = await db.analyticsCoverage.findFirst({
-    where: { creatorId, dataType: "CAMPAIGNS", status: "COMPLETE" },
-    orderBy: [{ lastVerifiedAt: "desc" }, { updatedAt: "desc" }],
-    select: { id: true },
+async function campaignInitialCoverageReady(db, creatorId, now = new Date()) {
+  if (!db?.creatorCampaignCollectionState?.findUnique) return false;
+  const state = await db.creatorCampaignCollectionState.findUnique({
+    where: { creatorId },
+    select: { status: true, baselineVerifiedAt: true, baselineGeneration: true },
   });
-  return Boolean(row);
+  return Boolean(state?.baselineGeneration && verifiedProofTimestampReady(state?.baselineVerifiedAt, now));
 }
 
-async function creatorAnalyticsInitialSyncReady({ db = prisma, creatorId } = {}) {
+async function creatorAnalyticsInitialSyncReady({ db = prisma, creatorId, now = new Date() } = {}) {
   if (!creatorId) return false;
   const notificationState = await loadNotificationSyncState(db, creatorId);
-  if (!notificationHistoricalBaselineReady(notificationState)) return false;
-  if (!(await financialInitialCoverageReady(db, creatorId))) return false;
-  if (!(await campaignInitialCoverageReady(db, creatorId))) return false;
+  if (!notificationHistoricalBaselineReady(notificationState, now)) return false;
+  if (!(await financialInitialCoverageReady(db, creatorId, now))) return false;
+  if (!(await campaignInitialCoverageReady(db, creatorId, now))) return false;
   return true;
 }
 
@@ -147,23 +160,34 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
   if (!creatorId || !agencyId) return { ready: false, stage: "invalid", created: false, reason: "missing_scope" };
 
   const notificationState = await loadNotificationSyncState(db, creatorId);
-  if (notificationHistoricalBaselineReady(notificationState)) {
-    // Older builds may already have a complete full-history traversal while a
-    // newer bootstrap job was queued under the stricter verification contract.
-    // Fence that redundant full walk immediately; future work starts at HEAD.
+  if (notificationHistoricalBaselineReady(notificationState, now)) {
+    // Only a durably verified historical baseline makes an ordinary FULL
+    // redundant. A completed-but-unverified traversal remains repair work and
+    // must not advance the staged initial-sync authority.
     await cancelRedundantInitialNotificationJobs(db, creatorId, now);
   } else {
+    const notificationRetry = retryDisposition(notificationState, now);
+    if (notificationRetry.deferred) return { ready: false, stage: "notifications", created: false, reason: "deferred", retryAfterAt: notificationRetry.retryAfterAt, jobId: null };
+    if (notificationRetry.terminal) return { ready: false, stage: "notifications", created: false, reason: "failed_terminal", retryAfterAt: null, jobId: null };
     const params = {
       ...buildNotificationScanParams({ state: notificationState, now, reason: "creator_initial_analytics_sync", analyticsRangeKey: "all" }),
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: "full", reason: "creator_initial_analytics_sync", now }),
       analyticsSyncKind: "initial",
       analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
       analyticsSyncStage: "notifications",
     };
-    const scheduled = await scheduleIfIdle({ db, creatorId, agencyId, jobKey: NOTIFICATION_JOB_KEY, params, priority, now, bucketMs: 60_000 });
+    const scheduled = await scheduleIfIdle({
+      db, creatorId, agencyId, jobKey: NOTIFICATION_JOB_KEY, params, priority, now, bucketMs: 60_000,
+      collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectorState: notificationState,
+    });
     return { ready: false, stage: "notifications", created: scheduled.created === true, reason: scheduled.reason || null, jobId: scheduled.job?.id || scheduled.jobId || null };
   }
 
-  if (!(await financialInitialCoverageReady(db, creatorId))) {
+  if (!(await financialInitialCoverageReady(db, creatorId, now))) {
+    const financialState = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId } });
+    const retry = retryDisposition(financialState, now);
+    if (retry.deferred) return { ready: false, stage: "financial", created: false, reason: "deferred", retryAfterAt: retry.retryAfterAt, jobId: null };
+    if (retry.terminal) return { ready: false, stage: "financial", created: false, reason: "failed_terminal", retryAfterAt: null, jobId: null };
     const snapshotMarker = Math.floor(now.getTime() / 1000);
     const params = {
       analyticsSyncKind: "initial",
@@ -171,56 +195,60 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
       analyticsSyncStage: "financial",
       financialMode: "full",
       reason: "creator_initial_analytics_sync",
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", reason: "creator_initial_analytics_sync", now }),
       startDate: "2016-01-01 00:00:00",
       endDate: onlyFansUtcDateTime(new Date(snapshotMarker * 1000)),
       initialMarker: snapshotMarker,
       schemaVersion: FINANCIAL_SCHEMA_VERSION,
       collectorVersion: FINANCIAL_COLLECTOR_VERSION,
     };
-    const scheduled = await scheduleIfIdle({ db, creatorId, agencyId, jobKey: FINANCIAL_JOB_KEY, params, priority, now, bucketMs: 60_000 });
+    const scheduled = await scheduleIfIdle({
+      db, creatorId, agencyId, jobKey: FINANCIAL_JOB_KEY, params, priority, now, bucketMs: 60_000,
+      collectorType: COLLECTOR_TYPES.FINANCIAL, collectorState: financialState,
+    });
     return { ready: false, stage: "financial", created: scheduled.created === true, reason: scheduled.reason || null, jobId: scheduled.job?.id || scheduled.jobId || null };
   }
 
-  if (!(await campaignInitialCoverageReady(db, creatorId))) {
+  if (!(await campaignInitialCoverageReady(db, creatorId, now))) {
+    const campaignState = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId } });
+    const retry = retryDisposition(campaignState, now);
+    if (retry.deferred) return { ready: false, stage: "campaigns", created: false, reason: "deferred", retryAfterAt: retry.retryAfterAt, jobId: null };
+    if (retry.terminal) return { ready: false, stage: "campaigns", created: false, reason: "failed_terminal", retryAfterAt: null, jobId: null };
     const params = {
       analyticsSyncKind: "initial",
       analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
       analyticsSyncStage: "campaigns",
       campaignMode: "full",
       reason: "creator_initial_analytics_sync",
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "full", reason: "creator_initial_analytics_sync", now }),
       pageSize: 50,
       maxPages: 40,
       claimerPageSize: 50,
       maxClaimerPages: 10_000,
       fanValueBatchSize: 20,
     };
-    const scheduled = await scheduleIfIdle({ db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: 60_000 });
+    const scheduled = await scheduleIfIdle({
+      db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: 60_000,
+      collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectorState: campaignState,
+    });
     return { ready: false, stage: "campaigns", created: scheduled.created === true, reason: scheduled.reason || null, jobId: scheduled.job?.id || scheduled.jobId || null };
   }
 
   return { ready: true, stage: "ready", created: false, reason: "initial_sync_complete", jobId: null };
 }
 
-async function recentKnownNotificationIds(db, creatorId) {
-  if (!db?.creatorNotificationScanItem?.findMany) return [];
-  const rows = await db.creatorNotificationScanItem.findMany({
-    where: { creatorId, notificationId: { not: null }, occurredAt: { not: null } },
-    // createdAt is ingest time and a fresh historical scan can make ancient
-    // notifications look "recent". The catch-up frontier must follow OF event
-    // time, otherwise the known-ID set can point at the tail of history.
-    orderBy: [{ occurredAt: "desc" }, { createdAt: "desc" }],
-    take: 2_000,
-    select: { notificationId: true },
-  });
-  const ids = [];
+function recentKnownNotificationIdsFromState(state) {
+  if (!Array.isArray(state?.knownNotificationIds)) return [];
+  const out = [];
   const seen = new Set();
-  for (const row of rows) {
-    const id = clean(row.notificationId, 220);
+  for (const value of state.knownNotificationIds) {
+    const id = clean(value, 220);
     if (!id || seen.has(id)) continue;
-    seen.add(id); ids.push(id);
-    if (ids.length >= NOTIFICATION_KNOWN_ID_LIMIT) break;
+    seen.add(id);
+    out.push(id);
+    if (out.length >= NOTIFICATION_KNOWN_ID_LIMIT) break;
   }
-  return ids;
+  return out;
 }
 
 async function recentKnownTransactionIds(db, creatorId) {
@@ -293,12 +321,26 @@ async function campaignCatchupState(db, creatorId) {
   return { knownCampaignFanCounts, knownClaimersByCampaign };
 }
 
-function latestCompletedCatchup(jobs, modeKey, modeValue) {
-  return jobs.find((job) => job.status === "DONE" && catchupParams(job.params) && object(job.params)[modeKey] === modeValue && job.completedAt) || null;
+function retryDisposition(state, now = new Date()) {
+  const retryAt = state?.retryAfterAt ? new Date(state.retryAfterAt) : null;
+  if (retryAt && Number.isFinite(retryAt.getTime()) && retryAt > now) {
+    return { deferred: true, terminal: false, retryAfterAt: retryAt };
+  }
+  if (String(state?.status || "").toUpperCase() === "FAILED" && !retryAt) {
+    return { deferred: false, terminal: true, retryAfterAt: null };
+  }
+  return { deferred: false, terminal: false, retryAfterAt: retryAt };
 }
-function due(lastCompletedAt, intervalMs, now) {
-  if (!lastCompletedAt) return true;
-  return new Date(lastCompletedAt).getTime() <= now.getTime() - intervalMs;
+
+function due(lastVerifiedAt, intervalMs, now) {
+  if (!lastVerifiedAt) return true;
+  const verifiedAt = new Date(lastVerifiedAt);
+  if (!Number.isFinite(verifiedAt.getTime())) return true;
+  // Use the same future-clock poison rule as AnalyticsStateEvaluator. A clock-
+  // poisoned durable timestamp must be DUE for repair, never silently treated
+  // as fresh by the planner while read models report it as untrusted.
+  if (!trustedCollectionTimestamp(verifiedAt, now)) return true;
+  return verifiedAt.getTime() <= now.getTime() - intervalMs;
 }
 
 async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20 } = {}) {
@@ -307,29 +349,39 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
   const created = [];
   const skipped = [];
 
-  const [notificationState, notificationJobs, financialJobs, campaignJobs] = await Promise.all([
+  const [notificationState, financialState, campaignState] = await Promise.all([
     loadNotificationSyncState(db, creatorId),
-    recentJobs(db, creatorId, NOTIFICATION_JOB_KEY),
-    recentJobs(db, creatorId, FINANCIAL_JOB_KEY),
-    recentJobs(db, creatorId, CAMPAIGN_JOB_KEY),
+    db.creatorFinancialCollectionState.findUnique({ where: { creatorId } }),
+    db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }),
   ]);
 
-  const lastNotificationCatchup = notificationJobs.find((job) => job.status === "DONE" && catchupParams(job.params) && object(job.params).notificationMode === "catchup" && job.completedAt);
-  if (notificationHistoricalBaselineReady(notificationState) && due(notificationState.lastCatchupCompletedAt || lastNotificationCatchup?.completedAt, NOTIFICATION_CATCHUP_INTERVAL_MS, now)) {
-    const knownNotificationIds = await recentKnownNotificationIds(db, creatorId);
+  if (notificationHistoricalBaselineReady(notificationState, now) && due(notificationState.lastCatchupVerifiedAt, NOTIFICATION_COLLECTION_FRESHNESS_MS, now)) {
+    const retry = retryDisposition(notificationState, now);
+    if (retry.deferred) skipped.push("notifications_catchup:deferred");
+    else if (retry.terminal) skipped.push("notifications_catchup:failed_terminal");
+    else {
+    const knownNotificationIds = recentKnownNotificationIdsFromState(notificationState);
     const params = {
       ...buildNotificationScanParams({ state: notificationState, now, reason: "creator_analytics_catchup", analyticsRangeKey: "all" }),
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: "catchup", reason: "creator_analytics_catchup", now }),
       analyticsSyncKind: "catchup",
       analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
       analyticsSyncStage: "notifications",
       knownNotificationIds,
     };
-    const scheduled = await scheduleIfIdle({ db, creatorId, agencyId, jobKey: NOTIFICATION_JOB_KEY, params, priority, now, bucketMs: NOTIFICATION_CATCHUP_INTERVAL_MS });
+    const scheduled = await scheduleIfIdle({
+      db, creatorId, agencyId, jobKey: NOTIFICATION_JOB_KEY, params, priority, now, bucketMs: NOTIFICATION_COLLECTION_FRESHNESS_MS,
+      collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectorState: notificationState,
+    });
     if (scheduled.created) created.push("notifications_catchup"); else skipped.push(`notifications_catchup:${scheduled.reason || "skipped"}`);
+    }
   } else skipped.push("notifications_catchup:fresh");
 
-  const lastFinancialCatchup = latestCompletedCatchup(financialJobs, "financialMode", "catchup");
-  if (due(lastFinancialCatchup?.completedAt, FINANCIAL_CATCHUP_INTERVAL_MS, now)) {
+  if (due(financialState?.lastCatchupCompletedAt, FINANCIAL_COLLECTION_FRESHNESS_MS, now)) {
+    const retry = retryDisposition(financialState, now);
+    if (retry.deferred) skipped.push("financial_catchup:deferred");
+    else if (retry.terminal) skipped.push("financial_catchup:failed_terminal");
+    else {
     const knownTransactionIds = await recentKnownTransactionIds(db, creatorId);
     const snapshotMarker = Math.floor(now.getTime() / 1000);
     const params = {
@@ -338,6 +390,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
       analyticsSyncStage: "financial",
       financialMode: "catchup",
       reason: "creator_analytics_catchup",
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "catchup", reason: "creator_analytics_catchup", now }),
       startDate: "2016-01-01 00:00:00",
       endDate: onlyFansUtcDateTime(new Date(snapshotMarker * 1000)),
       initialMarker: snapshotMarker,
@@ -346,12 +399,19 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
       schemaVersion: FINANCIAL_SCHEMA_VERSION,
       collectorVersion: FINANCIAL_COLLECTOR_VERSION,
     };
-    const scheduled = await scheduleIfIdle({ db, creatorId, agencyId, jobKey: FINANCIAL_JOB_KEY, params, priority, now, bucketMs: FINANCIAL_CATCHUP_INTERVAL_MS });
+    const scheduled = await scheduleIfIdle({
+      db, creatorId, agencyId, jobKey: FINANCIAL_JOB_KEY, params, priority, now, bucketMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
+      collectorType: COLLECTOR_TYPES.FINANCIAL, collectorState: financialState,
+    });
     if (scheduled.created) created.push("financial_catchup"); else skipped.push(`financial_catchup:${scheduled.reason || "skipped"}`);
+    }
   } else skipped.push("financial_catchup:fresh");
 
-  const lastCampaignCatchup = latestCompletedCatchup(campaignJobs, "campaignMode", "catchup");
-  if (due(lastCampaignCatchup?.completedAt, CAMPAIGN_CATCHUP_INTERVAL_MS, now)) {
+  if (due(campaignState?.lastCatchupCompletedAt, CAMPAIGN_COLLECTION_FRESHNESS_MS, now)) {
+    const retry = retryDisposition(campaignState, now);
+    if (retry.deferred) skipped.push("campaigns_catchup:deferred");
+    else if (retry.terminal) skipped.push("campaigns_catchup:failed_terminal");
+    else {
     const catchup = await campaignCatchupState(db, creatorId);
     const params = {
       analyticsSyncKind: "catchup",
@@ -359,6 +419,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
       analyticsSyncStage: "campaigns",
       campaignMode: "catchup",
       reason: "creator_analytics_catchup",
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "catchup", reason: "creator_analytics_catchup", now }),
       pageSize: 50,
       maxPages: 40,
       claimerPageSize: 50,
@@ -367,8 +428,12 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
       knownCampaignFanCounts: catchup.knownCampaignFanCounts,
       knownClaimersByCampaign: catchup.knownClaimersByCampaign,
     };
-    const scheduled = await scheduleIfIdle({ db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: CAMPAIGN_CATCHUP_INTERVAL_MS });
+    const scheduled = await scheduleIfIdle({
+      db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: CAMPAIGN_COLLECTION_FRESHNESS_MS,
+      collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectorState: campaignState,
+    });
     if (scheduled.created) created.push("campaigns_catchup"); else skipped.push(`campaigns_catchup:${scheduled.reason || "skipped"}`);
+    }
   } else skipped.push("campaigns_catchup:fresh");
 
   return { ready: true, initial, created, skipped };
@@ -385,13 +450,13 @@ async function advanceCreatorAnalyticsInitialSyncAfterCompletion({ db = prisma, 
 
 module.exports = {
   ANALYTICS_SYNC_VERSION,
-  NOTIFICATION_CATCHUP_INTERVAL_MS,
-  FINANCIAL_CATCHUP_INTERVAL_MS,
-  CAMPAIGN_CATCHUP_INTERVAL_MS,
+  NOTIFICATION_CATCHUP_INTERVAL_MS: NOTIFICATION_COLLECTION_FRESHNESS_MS,
+  FINANCIAL_CATCHUP_INTERVAL_MS: FINANCIAL_COLLECTION_FRESHNESS_MS,
+  CAMPAIGN_CATCHUP_INTERVAL_MS: CAMPAIGN_COLLECTION_FRESHNESS_MS,
   ensureInitialCreatorAnalyticsSync,
   ensureRecurringCreatorAnalyticsCatchups,
   advanceCreatorAnalyticsInitialSyncAfterCompletion,
-  recentKnownNotificationIds,
+  recentKnownNotificationIdsFromState,
   recentKnownTransactionIds,
   campaignCatchupState,
   financialInitialCoverageReady,

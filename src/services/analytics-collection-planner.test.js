@@ -100,8 +100,13 @@ function addDemandStore(db) {
       return { count: 1 };
     },
     findFirst: async ({ where }) => {
-      const now = where.OR?.find((item) => item.claimUntil?.lte)?.claimUntil?.lte || new Date();
-      const candidates = [...rows.values()].filter((row) => row.completedAt == null && (row.claimUntil == null || new Date(row.claimUntil) <= now));
+      const andRows = Array.isArray(where.AND) ? where.AND : [];
+      const claimNow = andRows.flatMap((entry) => entry.OR || []).find((item) => item.claimUntil?.lte)?.claimUntil?.lte || new Date();
+      const retryNow = andRows.flatMap((entry) => entry.OR || []).find((item) => item.nextAttemptAt?.lte)?.nextAttemptAt?.lte || claimNow;
+      const candidates = [...rows.values()].filter((row) => row.completedAt == null
+        && row.quarantinedAt == null
+        && (row.claimUntil == null || new Date(row.claimUntil) <= claimNow)
+        && (row.nextAttemptAt == null || new Date(row.nextAttemptAt) <= retryNow));
       candidates.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0) || new Date(a.requestedAt) - new Date(b.requestedAt) || String(a.key).localeCompare(String(b.key)));
       return candidates.length ? { ...candidates[0] } : null;
     },
@@ -153,6 +158,28 @@ test("missing daily coverage becomes bounded aligned reconciliation windows inst
   assert.ok((windows[0].scanTo - windows[0].scanFrom) / 86_400_000 <= 6);
   assert.ok(windows[0].scanFrom <= due[0]);
   assert.ok(windows[0].scanTo >= due.at(-1));
+});
+
+test("dense missing earnings history uses proven 30-day provider windows while sparse gaps stay narrow", () => {
+  const now = new Date("2026-09-08T14:00:00.000Z");
+  const start = new Date("2026-06-01T00:00:00.000Z");
+  const dense = Array.from({ length: 90 }, (_, index) => new Date(start.getTime() + index * 86_400_000));
+  const windows = planner.windowsForDueDays(dense, now);
+  assert.equal(windows.length, 3);
+  assert.ok(windows.every((window) => ((window.scanTo - window.scanFrom) / 86_400_000) + 1 <= 30));
+  assert.equal(windows[0].scanFrom.toISOString().slice(0, 10), "2026-06-01");
+  assert.equal(windows.at(-1).scanTo.toISOString().slice(0, 10), "2026-08-29");
+  assert.equal(planner.DENSE_BACKFILL_MAX_DAYS, 30);
+});
+
+test("old earnings reconciliation policy is explicit: recurring owns only current plus 30 closed days and older history is interactive-demand driven", () => {
+  const now = new Date("2026-09-08T14:00:00.000Z");
+  const window = planner.operationalFreshnessWindow(now);
+  assert.equal(window.startDay.toISOString().slice(0, 10), "2026-08-09");
+  assert.equal(window.endDay.toISOString().slice(0, 10), "2026-09-08");
+  assert.equal(planner.EARNINGS_RECONCILIATION_POLICY.oldHistoryMode, "INTERACTIVE_DEMAND");
+  assert.equal(planner.EARNINGS_RECONCILIATION_POLICY.recurringClosedDays, 30);
+  assert.equal(planner.EARNINGS_RECONCILIATION_POLICY.denseBackfillMaxDays, 30);
 });
 
 test("planner merges an exact claimed scan across generation buckets under a creator-local database lock", async () => {
@@ -599,4 +626,75 @@ test("newer demand revision wins over stale actor cancellation instead of being 
   assert.equal(row.requestRevision, 2);
   assert.equal(row.completedAt, null);
   assert.equal(row.requestedByMemberId, "member-2");
+});
+
+
+test("a terminal failure from an old claimed revision cannot quarantine a newer refresh revision", async () => {
+  const db = {};
+  const store = addDemandStore(db);
+  const first = await planner.enqueueAgencyAnalyticsFreshnessDemand({
+    db, agencyId: "agency-1", rangeKey: "7d", ...DEMAND_ACTOR, now: new Date("2026-09-08T14:00:00.000Z"),
+  });
+  const claimed = await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:01.000Z"), ownerToken: "replica-old" });
+  const second = await planner.enqueueAgencyAnalyticsFreshnessDemand({
+    db, agencyId: "agency-1", rangeKey: "7d", ...DEMAND_ACTOR, now: new Date("2026-09-08T14:00:02.000Z"),
+  });
+  assert.equal(second.key, first.key);
+  assert.equal(second.requestRevision, 2);
+  const terminal = Object.assign(new Error("old revision contract failure"), { code: "ANALYTICS_DEMAND_SCOPE_CORRUPT" });
+  const settled = await planner.settleAnalyticsDemand({
+    db, demand: claimed, completedAt: new Date("2026-09-08T14:00:03.000Z"), error: terminal,
+  });
+  assert.equal(settled.completed, false);
+  assert.equal(settled.retry, true);
+  assert.equal(settled.reason, "newer_revision_pending");
+  const pending = store.get(first.key);
+  assert.equal(pending.requestRevision, 2);
+  assert.equal(pending.completedAt, null);
+  assert.equal(pending.attempts, 0);
+  assert.equal(pending.nextAttemptAt, null);
+  assert.equal(pending.quarantinedAt, null);
+  assert.equal(pending.lastErrorClass, null);
+  const reclaimed = await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:04.000Z"), ownerToken: "replica-new" });
+  assert.equal(reclaimed.claimedRevision, 2);
+});
+
+test("transient analytics demand failures back off and are not immediately reclaimable", async () => {
+  const db = {};
+  const store = addDemandStore(db);
+  await planner.enqueueAgencyAnalyticsFreshnessDemand({
+    db, agencyId: "agency-1", rangeKey: "7d", ...DEMAND_ACTOR, now: new Date("2026-09-08T14:00:00.000Z"),
+  });
+  const claimed = await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:01.000Z"), ownerToken: "replica-a" });
+  const error = Object.assign(new Error("database temporarily unavailable"), { code: "P1001" });
+  const settled = await planner.settleAnalyticsDemand({ db, demand: claimed, completedAt: new Date("2026-09-08T14:00:02.000Z"), error });
+  assert.equal(settled.retry, true);
+  assert.equal(settled.quarantined, false);
+  assert.equal(settled.errorClass, "TRANSIENT");
+  assert.equal(settled.attempts, 1);
+  assert.equal(settled.nextAttemptAt.toISOString(), "2026-09-08T14:00:32.000Z");
+  const row = store.get(claimed.key);
+  assert.equal(row.lastErrorClass, "TRANSIENT");
+  assert.equal(await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:10.000Z"), ownerToken: "replica-b" }), null);
+  const retry = await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:33.000Z"), ownerToken: "replica-b" });
+  assert.equal(retry.key, claimed.key);
+});
+
+test("persistent analytics demand contract corruption quarantines immediately", async () => {
+  const db = {};
+  const store = addDemandStore(db);
+  await planner.enqueueAgencyAnalyticsFreshnessDemand({
+    db, agencyId: "agency-1", rangeKey: "7d", ...DEMAND_ACTOR, now: new Date("2026-09-08T14:00:00.000Z"),
+  });
+  const claimed = await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:01.000Z"), ownerToken: "replica-a" });
+  const error = Object.assign(new Error("creator scope payload is corrupt"), { code: "ANALYTICS_DEMAND_SCOPE_CORRUPT" });
+  const settled = await planner.settleAnalyticsDemand({ db, demand: claimed, completedAt: new Date("2026-09-08T14:00:02.000Z"), error });
+  assert.equal(settled.retry, false);
+  assert.equal(settled.quarantined, true);
+  assert.equal(settled.errorClass, "CONTRACT");
+  const row = store.get(claimed.key);
+  assert.equal(row.lastErrorClass, "CONTRACT");
+  assert.ok(row.quarantinedAt instanceof Date);
+  assert.equal(row.nextAttemptAt, null);
+  assert.equal(await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-09T14:00:00.000Z"), ownerToken: "replica-b" }), null);
 });

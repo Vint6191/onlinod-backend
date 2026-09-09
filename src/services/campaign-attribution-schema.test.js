@@ -32,6 +32,7 @@ test("campaign fan rows expose arrival time and settled/pending money", () => {
 test("manual campaign scanner is isolated and has independent routes", () => {
   assert.match(control, /JOB_KEY = "fetch_campaigns"/);
   assert.match(control, /manualCampaignScan: true/);
+  assert.match(control, /buildCollectionCommand\(\{ collectorType: COLLECTOR_TYPES\.CAMPAIGNS, collectionMode: "full", reason: MANUAL_REASON, now \}\)/);
   assert.match(routes, /\/creators\/:creatorId\/campaign-scan"/);
   assert.match(routes, /\/creators\/:creatorId\/campaign-scan\/start"/);
   assert.match(routes, /\/creators\/:creatorId\/campaign-scan\/stop"/);
