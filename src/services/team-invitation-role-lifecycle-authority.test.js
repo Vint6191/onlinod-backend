@@ -28,7 +28,8 @@ test("role lifecycle fence is exported as the shared assignment capability with 
   assert.match(team, /team-role-lifecycle:/);
   assert.match(team, /mode: write \? "exclusive" : "shared"/);
   assert.match(team, /const rowLock = write \? "FOR UPDATE" : "FOR SHARE"/);
-  assert.match(agencyLifecycle, /normalizedMode === "exclusive" \? "FOR UPDATE" : "FOR SHARE"/);
+  assert.match(agencyLifecycle, /normalizedMode === "exclusive" \? " FOR UPDATE" : ""/);
+  assert.doesNotMatch(agencyLifecycle, /"FOR SHARE"/);
   assert.match(agencyLifecycle, /FROM "Agency" WHERE "id" = \$1/);
   assert.match(team, /\n\s*lockTeamRoleLifecycle,\n/);
 });

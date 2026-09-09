@@ -12,7 +12,7 @@ const schema = read("prisma/schema.prisma");
 const migration = read("prisma/migrations/20260906133000_legacy_retired_custom_order_telegram_closure/migration.sql");
 const workflow = read("src/services/custom-content-workflow-service.js");
 const delivery = read("src/services/telegram-delivery-authority-service.js");
-const scan = read("src/services/telegram-exact-authority-scan-service.js");
+const providerDebt = read("src/services/provider-operational-debt-authority-service.js");
 const cancellationInstruction = read("src/services/custom-cancellation-instruction-authority-service.js");
 
 test("legacy retired Custom closure records cancellation waiver as control truth, never provider confirmation", () => {
@@ -50,8 +50,8 @@ test("legacy retired pending-order resolver is audited, lifecycle-locked and ref
   assert.match(block, /required:\s*true/);
 });
 
-test("waived cancellation is excluded from debt repair and can never be reactivated", () => {
-  assert.match(scan, /if \(order\.telegramCancellationWaivedAt\) continue/);
+test("waived cancellation is excluded from current debt projection and can never be reactivated", () => {
+  assert.match(providerDebt, /String\(order\?\.status \|\| ""\)\.toUpperCase\(\) === "CANCELLED" && !order\?\.telegramCancellationWaivedAt/);
   assert.match(delivery, /&& !order\.telegramCancellationWaivedAt/);
   assert.match(delivery, /String\(settledOrder\.status\) === "CANCELLED" && !settledOrder\.telegramCancellationWaivedAt/);
   assert.match(delivery, /String\(order\.status\) !== "CANCELLED" \|\| order\.telegramCancellationWaivedAt/);

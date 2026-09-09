@@ -12,8 +12,8 @@ const {
   lockAgencyPipelineLifecycleExclusive,
   lockCreatorPipelineLifecycle,
   withSubmissionPipelineLock,
-  creatorCustomPipelineBlockers,
-  agencyCustomPipelineBlockers,
+  creatorCustomPipelineBlockers: rawCreatorCustomPipelineBlockers,
+  agencyCustomPipelineBlockers: rawAgencyCustomPipelineBlockers,
   adjudicateCustomOrderCancellation,
   setUnassignedSubmissionDisposition,
   submissionAllowsNewPipelineWork,
@@ -24,6 +24,97 @@ const {
   customExternalWriteClassification,
   customSubmissionExternalEffectConvergence,
 } = require("./custom-content-pipeline-authority-service");
+const providerOperationalAuthority = require("./provider-operational-debt-authority-service");
+
+function pipelineProviderMatches(row, where = {}) {
+  for (const [key, expected] of Object.entries(where || {})) {
+    const actual = row?.[key];
+    if (expected && typeof expected === "object" && !Array.isArray(expected) && !(expected instanceof Date)) {
+      if (Array.isArray(expected.in) && !expected.in.map(String).includes(String(actual))) return false;
+      continue;
+    }
+    if (expected === null ? actual !== null : String(actual) !== String(expected)) return false;
+  }
+  return true;
+}
+
+async function seedPipelineProviderAuthority(db, agencyId) {
+  const debts = [];
+  const ordersById = new Map();
+  const addOrders = (rows) => { for (const row of rows || []) if (row?.id) ordersById.set(String(row.id), row); };
+  if (db?.customOrder?.findMany) {
+    for (const where of [{ agencyId }, { agencyId, status: "PENDING" }, { agencyId, status: "CANCELLED" }]) {
+      try { addOrders(await db.customOrder.findMany({ where, take: 10000, orderBy: { id: "asc" } })); } catch {}
+    }
+  }
+  let confirmedIntents = [];
+  if (db?.telegramDeliveryIntent?.findMany) {
+    try {
+      confirmedIntents = await db.telegramDeliveryIntent.findMany({
+        where: { agencyId, state: "CONFIRMED", kind: { in: ["TASK", "REVISION_REQUEST", "REFERENCE", "MANUAL_REMINDER", "AUTO_REMINDER"] } },
+        take: 10000,
+      }) || [];
+    } catch {}
+  }
+  const confirmedOrderIds = Array.from(new Set(confirmedIntents.map((row) => String(row.customOrderId || "")).filter(Boolean)));
+  if (confirmedOrderIds.length && db?.customOrder?.findMany) {
+    try { addOrders(await db.customOrder.findMany({ where: { agencyId, id: { in: confirmedOrderIds } }, take: 10000 })); } catch {}
+  }
+
+  for (const order of ordersById.values()) {
+    let intents = confirmedIntents.filter((row) => String(row.customOrderId || "") === String(order.id));
+    let submissions = [];
+    if (db?.telegramDeliveryIntent?.findMany) {
+      for (const where of [
+        { agencyId, customOrderId: String(order.id) },
+        { agencyId, customOrderId: { in: [String(order.id)] }, kind: { in: ["TASK", "REVISION_REQUEST", "REFERENCE", "CANCELLATION", "MANUAL_REMINDER", "AUTO_REMINDER"] } },
+      ]) {
+        try {
+          const rows = await db.telegramDeliveryIntent.findMany({ where, take: 10000 }) || [];
+          for (const row of rows) if (!intents.some((existing) => String(existing.id) === String(row.id))) intents.push(row);
+        } catch {}
+      }
+    }
+    try { submissions = await db?.customContentSubmission?.findMany?.({ where: { agencyId, customOrderId: String(order.id) }, take: 10000 }) || []; } catch {}
+    const projectionDb = {
+      ...db,
+      telegramDeliveryIntent: {
+        ...(db.telegramDeliveryIntent || {}),
+        findFirst: db.telegramDeliveryIntent?.findFirst || (async ({ where = {} }) => intents.find((row) => pipelineProviderMatches(row, where)) || null),
+      },
+      customContentSubmission: {
+        ...(db.customContentSubmission || {}),
+        findFirst: db.customContentSubmission?.findFirst || (async ({ where = {} }) => submissions.find((row) => pipelineProviderMatches(row, where)) || null),
+      },
+    };
+    const rows = await providerOperationalAuthority.buildOrderDebtCandidates({ agencyId, order, intents, submissions, db: projectionDb });
+    debts.push(...rows);
+  }
+  db.providerOperationalDebt = {
+    async count({ where = {} }) { return debts.filter((row) => pipelineProviderMatches(row, where)).length; },
+    async findMany({ where = {}, take = 1000 }) { return debts.filter((row) => pipelineProviderMatches(row, where)).slice(0, take).map((row) => ({ ...row })); },
+  };
+  db.maintenanceLaneState = {
+    async findUnique({ where }) {
+      if (where.key === providerOperationalAuthority.PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY) {
+        return { key: where.key, generation: providerOperationalAuthority.PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
+      }
+      if (where.key === providerOperationalAuthority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY) {
+        return { key: where.key, generation: providerOperationalAuthority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
+      }
+      return null;
+    },
+  };
+}
+async function creatorCustomPipelineBlockers(args) {
+  await seedPipelineProviderAuthority(args.db, args.agencyId);
+  return rawCreatorCustomPipelineBlockers(args);
+}
+
+async function agencyCustomPipelineBlockers(args) {
+  await seedPipelineProviderAuthority(args.db, args.agencyId);
+  return rawAgencyCustomPipelineBlockers(args);
+}
 
 function profileDb({ folder = "vault-a", recipient = "relay_a", relayRows = [] } = {}) {
   const state = {
@@ -340,7 +431,7 @@ test("agency retirement aggregates every live Custom/source blocker across creat
     telegramInboundEvent: { count: async ({ where }) => { captured.inbound = where; return 4; } },
   };
   const result = await agencyCustomPipelineBlockers({ db, agencyId: "agency-1" });
-  assert.deepEqual(result, { pendingOrders: 1, activeSubmissions: 2, activeWrites: 3, activeTelegramDeliveries: 5, unresolvedInboundEvents: 4, cancelledTelegramFollowupDebt: 0, confirmedTelegramProjectionDebt: 0, completedExternalProjectionDebt: 0, total: 15 });
+  assert.deepEqual(result, { pendingOrders: 1, activeSubmissions: 2, activeWrites: 3, activeTelegramDeliveries: 5, unresolvedInboundEvents: 4, cancelledTelegramFollowupDebt: 0, confirmedTelegramProjectionDebt: 0, completedExternalProjectionDebt: 0, providerOperationalBackfillIncomplete: 0, customExternalProofBackfillIncomplete: 0, total: 15 });
   assert.deepEqual(captured.orders, { agencyId: "agency-1", status: "PENDING" });
   assert.equal(captured.submissions.agencyId, "agency-1");
   assert.deepEqual(captured.writes, {
@@ -417,7 +508,8 @@ test("creator retirement blocks confirmed TASK history whose cancelled-order fol
   };
   const result = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(result.cancelledTelegramFollowupDebt, 1);
-  assert.equal(result.total, 1);
+  assert.equal(result.confirmedTelegramProjectionDebt, 1);
+  assert.equal(result.total, 2);
 });
 
 test("agency lifecycle fence uses shared advisory barrier for normal work and exclusive barrier for lifecycle mutation", async () => {

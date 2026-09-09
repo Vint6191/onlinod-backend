@@ -19,6 +19,7 @@ test("Phase2 PostgreSQL lock topology: same-Agency shared work is parallel and e
   let releaseFirst = null;
   let first = null;
   let secondShared = null;
+  let rowWriter = null;
   let exclusive = null;
   try {
     const agency = await prisma.agency.findFirst({ where: { deletedAt: null }, select: { id: true } });
@@ -58,6 +59,19 @@ test("Phase2 PostgreSQL lock topology: same-Agency shared work is parallel and e
     ]);
     assert.equal(secondSharedAcquired, true, "shared Agency work should not wait for another shared holder");
 
+    let rowWriterAcquired = false;
+    rowWriter = prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '4s'");
+      await tx.$queryRawUnsafe('SELECT "id" FROM "Agency" WHERE "id" = $1 FOR UPDATE', agency.id);
+      rowWriterAcquired = true;
+    }, { timeout: 10_000 });
+    await Promise.race([
+      rowWriter,
+      sleep(2_000).then(() => { throw new Error("ordinary Agency-row writer was unexpectedly blocked by shared lifecycle work"); }),
+    ]);
+    rowWriter = null;
+    assert.equal(rowWriterAcquired, true, "shared lifecycle must not hold an Agency row lock that blocks unrelated billing/business writers");
+
     let exclusiveAcquired = false;
     const exclusiveAttempting = deferred();
     exclusive = prisma.$transaction(async (tx) => {
@@ -89,7 +103,7 @@ test("Phase2 PostgreSQL lock topology: same-Agency shared work is parallel and e
     // Prisma timeout. Release it first, then settle every started transaction
     // before disconnecting so the integration harness cannot hide a real failure.
     releaseFirst?.resolve();
-    await Promise.allSettled([first, secondShared, exclusive].filter(Boolean));
+    await Promise.allSettled([first, secondShared, rowWriter, exclusive].filter(Boolean));
     if (typeof prisma.$disconnect === "function") await prisma.$disconnect();
   }
 });

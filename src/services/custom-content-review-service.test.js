@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { listCustomContentReviewQueue, reviewCustomContentSubmission } = require("./custom-content-review-service");
 const { vaultSettlementFingerprint } = require("./custom-content-pipeline-authority-service");
-const { ensureRevisionRequestIntents } = require("./telegram-delivery-authority-service");
+const { planRevisionRequestIntentForReviewedSubmission } = require("./telegram-delivery-authority-service");
 
 
 function receipt(folderId, profileRevision, mediaIds, at = new Date("2026-08-21T14:30:00.000Z")) {
@@ -244,8 +244,11 @@ test("legacy REVISION_REQUESTED decision materializes one PLANNED provider inten
   row.reviewedByMemberId = "manager-1";
   row.customOrder.telegramTaskMessageId = 555;
 
-  const planned = await ensureRevisionRequestIntents({ agencyId: "agency-1", member: null, limit: 25, now: new Date("2026-08-21T14:30:00.000Z"), db });
-  assert.equal(planned, 1);
+  const planned = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: null, submission: row, order: row.customOrder, revisionNumber: null,
+    now: new Date("2026-08-21T14:30:00.000Z"), db,
+  });
+  assert.ok(planned);
   const revision = intents.find((intent) => intent.kind === "REVISION_REQUEST");
   assert.ok(revision);
   assert.equal(revision.customSubmissionId, "sub-1");
@@ -254,8 +257,11 @@ test("legacy REVISION_REQUESTED decision materializes one PLANNED provider inten
   assert.equal(revision.confirmedAt, null);
   assert.equal(revision.payload.reviewComment, "Legacy manager instruction");
 
-  const retry = await ensureRevisionRequestIntents({ agencyId: "agency-1", member: null, limit: 25, now: new Date("2026-08-21T14:31:00.000Z"), db });
-  assert.equal(retry, 0);
+  const retry = await planRevisionRequestIntentForReviewedSubmission({
+    agencyId: "agency-1", member: null, submission: row, order: row.customOrder, revisionNumber: null,
+    now: new Date("2026-08-21T14:31:00.000Z"), db,
+  });
+  assert.equal(String(retry.id), String(planned.id));
   assert.equal(intents.filter((intent) => intent.kind === "REVISION_REQUEST").length, 1);
 });
 

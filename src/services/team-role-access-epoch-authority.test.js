@@ -69,7 +69,8 @@ test("role lifecycle serializes assignment/invites against configuration writers
   assert.match(helper, /team-role-lifecycle:/);
   assertBefore(helper, "lockAgencyLifecycleBarrier", "lockDbAdvisoryXact", "Agency lifecycle barrier must precede role-local barrier");
   assertBefore(helper, "lockDbAdvisoryXact", 'FROM "AgencyCustomRole"', "role-local barrier must precede custom role row lock");
-  assert.match(agencyLifecycleSource, /normalizedMode === "exclusive" \? "FOR UPDATE" : "FOR SHARE"/);
+  assert.match(agencyLifecycleSource, /normalizedMode === "exclusive" \? " FOR UPDATE" : ""/);
+  assert.doesNotMatch(agencyLifecycleSource, /"FOR SHARE"/);
 
   const memberMutation = bodyBetween("async function updateMemberSettings", "async function setMemberStatus");
   const memberCommit = memberMutation.slice(memberMutation.indexOf("serializableTeamTransaction"));

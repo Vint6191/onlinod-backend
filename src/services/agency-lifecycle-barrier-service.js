@@ -22,20 +22,21 @@ async function lockAgencyLifecycleBarrier({ db, agencyId, mode = "shared" }) {
   const key = agencyLifecycleBarrierKey(id);
   const normalizedMode = String(mode || "shared").toLowerCase() === "exclusive" ? "exclusive" : "shared";
 
-  // New-generation lifecycle coordination is an advisory RW barrier so normal work
-  // in one large Agency can proceed in parallel. Keep the matching Agency row lock
-  // during this cutover as a rolling-generation compatibility fence: the immediately
-  // previous generation used FOR UPDATE on this same row. Shared holders remain
-  // mutually compatible, while old/new destructive and normal work still serialize.
+  // Canonical lifecycle coordination is the advisory RW barrier. The immediately
+  // previous Phase2 generation already acquired this same advisory key before touching
+  // the Agency row, so normal shared work no longer needs a compatibility FOR SHARE.
+  // This is the final scale cutover: unrelated billing/business updates to Agency must
+  // not serialize ordinary Custom/Team/provider work. Destructive lifecycle mutations
+  // may still lock the exact Agency row because they actually mutate that row.
   if (typeof db?.$executeRawUnsafe === "function") {
     await lockDbAdvisoryXact({ db, key, mode: normalizedMode });
   }
 
   let row = null;
   if (typeof db?.$queryRawUnsafe === "function") {
-    const rowLock = normalizedMode === "exclusive" ? "FOR UPDATE" : "FOR SHARE";
+    const rowLock = normalizedMode === "exclusive" ? " FOR UPDATE" : "";
     const rows = await db.$queryRawUnsafe(
-      `SELECT "id", "deletedAt", "status" FROM "Agency" WHERE "id" = $1 ${rowLock}`,
+      `SELECT "id", "deletedAt", "status" FROM "Agency" WHERE "id" = $1${rowLock}`,
       id,
     );
     row = Array.isArray(rows) ? rows[0] || null : null;

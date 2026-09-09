@@ -16,6 +16,76 @@ const DEFAULT_REMINDERS = {
   physical: { enabled: false, repeatEveryMinutes: 1440, text: "Напоминание по физическому заказу «{custom}»: проверь статус отправки." },
 };
 
+function providerTestMatches(row, where = {}) {
+  for (const [key, expected] of Object.entries(where || {})) {
+    const actual = row?.[key];
+    if (expected && typeof expected === "object" && !Array.isArray(expected) && !(expected instanceof Date)) {
+      if (Array.isArray(expected.in) && !expected.in.map(String).includes(String(actual))) return false;
+      if (Object.prototype.hasOwnProperty.call(expected, "not")) {
+        if (expected.not === null ? actual == null : String(actual) === String(expected.not)) return false;
+      }
+      continue;
+    }
+    if (expected === null ? actual !== null : String(actual) !== String(expected)) return false;
+  }
+  return true;
+}
+
+function markProviderBackfillsComplete(db) {
+  const authority = require("./provider-operational-debt-authority-service");
+  db.providerOperationalDebt = db.providerOperationalDebt || { findMany: async () => [], count: async () => 0 };
+  db.maintenanceLaneState = {
+    async findUnique({ where }) {
+      if (where.key === authority.PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY) {
+        return { key: where.key, generation: authority.PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
+      }
+      if (where.key === authority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY) {
+        return { key: where.key, generation: authority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
+      }
+      return null;
+    },
+  };
+}
+
+async function seedSettingsProviderOperationalAuthority(db, agencyId = "agency-1") {
+  const authority = require("./provider-operational-debt-authority-service");
+  const debts = [];
+  let orders = [];
+  if (db?.customOrder?.findMany) {
+    try { orders = await db.customOrder.findMany({ where: { agencyId }, take: 10_000, orderBy: { id: "asc" } }) || []; }
+    catch { orders = []; }
+  }
+  for (const order of orders) {
+    let intents = [];
+    let submissions = [];
+    try { intents = await db?.telegramDeliveryIntent?.findMany?.({ where: { agencyId, customOrderId: String(order.id) }, take: 10_000 }) || []; } catch {}
+    try { submissions = await db?.customContentSubmission?.findMany?.({ where: { agencyId, customOrderId: String(order.id) }, take: 10_000 }) || []; } catch {}
+    const rows = await authority.buildOrderDebtCandidates({ agencyId, order, intents, submissions, db });
+    debts.push(...rows);
+  }
+  db.providerOperationalDebt = {
+    async findMany({ where = {}, take = 100 }) { return debts.filter((row) => providerTestMatches(row, where)).slice(0, take).map((row) => ({ ...row })); },
+    async deleteMany({ where = {} }) {
+      let count = 0;
+      for (let i = debts.length - 1; i >= 0; i -= 1) if (providerTestMatches(debts[i], where)) { debts.splice(i, 1); count += 1; }
+      return { count };
+    },
+    async createMany({ data = [] }) { for (const row of data) if (!debts.some((x) => x.id === row.id)) debts.push({ ...row }); return { count: data.length }; },
+  };
+  db.maintenanceLaneState = {
+    async findUnique({ where }) {
+      if (where.key === authority.PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY) {
+        return { key: where.key, generation: authority.PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
+      }
+      if (where.key === authority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY) {
+        return { key: where.key, generation: authority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
+      }
+      return null;
+    },
+  };
+  return debts;
+}
+
 function loadSettingsService({ auditImpl = async () => null, agencyLifecycleLockImpl = async ({ agencyId }) => ({ id: agencyId }) } = {}) {
   const original = Module._load;
   Module._load = function(request, parent, isMain) {
@@ -37,6 +107,16 @@ function loadSettingsService({ auditImpl = async () => null, agencyLifecycleLock
     if (request === "./custom-content-pipeline-authority-service") {
       const actual = original.call(this, request, parent, isMain);
       return { ...actual, lockAgencyPipelineLifecycle: agencyLifecycleLockImpl };
+    }
+    if (request === "./telegram-provider-capability-control-authority-service") {
+      const actual = original.call(this, request, parent, isMain);
+      return {
+        ...actual,
+        assertTelegramProviderCapabilityCanRetire: async (args) => {
+          await seedSettingsProviderOperationalAuthority(args.db, args.agencyId);
+          return actual.assertTelegramProviderCapabilityCanRetire(args);
+        },
+      };
     }
     if (request === "./billing-nowpayments-service") return { publicProviderConfig: () => ({ providerKey: "NOWPAYMENTS", environment: "disabled", configured: false, checkoutAvailable: false, testMode: false, feePaidByUser: false, sandboxActivationEnabled: false, liveAutoPricingEnabled: false, liveCheckoutBlockedByInternalTestMode: false, missingConfiguration: ["NOWPAYMENTS_MODE"] }), recentOrders: async () => [] };
     return original.call(this, request, parent, isMain);
@@ -83,6 +163,7 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
     },
   };
   db.$transaction = async (fn) => fn(db);
+  markProviderBackfillsComplete(db);
   const owner = { id: "member-owner", userId: "user-owner", role: "OWNER", roleKey: "owner", accessEpoch: 1, assignedCreators: "all" };
   const admin = { id: "member-admin", userId: "user-admin", role: "ADMIN", roleKey: "admin", accessEpoch: 1, assignedCreators: "all" };
   const chatter = { id: "member-chatter", userId: "user-chatter", role: "OPERATOR", roleKey: "chatter", accessEpoch: 1, assignedCreators: ["creator-1"] };
@@ -283,6 +364,7 @@ test("Telegram account deletion is fail-closed while Customs delivery/thread/sou
     db.customOrder = { findMany: async () => [] };
     db.customContentSubmission = { findMany: async ({ where }) => {
       assert.equal(where.telegramSourceAccountId, "tg-1");
+      if (where.pipelineDisposition === "ACTIVE") return [];
       return [{
         id: "submission-salvage-partial", creatorId: "creator-1", telegramSourceAccountId: "tg-1", telegramSourceUserId: "900001",
         telegramMessageIds: [601, 602, 603], ofMediaIds: ["media-601"], pipelineDisposition: "SALVAGE",
@@ -368,6 +450,7 @@ test("messaging material requires an authorized stored session", async () => {
   db.agencyTelegramMtprotoAccount.findFirst = async () => stored;
   const admin = { id: "member-admin", userId: "user-admin", role: "ADMIN", roleKey: "admin", accessEpoch: 1, assignedCreators: "all" };
   db.agencyMember = { findFirst: async () => ({ ...admin, agencyId: "a", deletedAt: null, deactivatedAt: null }) };
+  markProviderBackfillsComplete(db);
   await service.addTelegramMtprotoAccount({ agencyId: "a", member: admin, apiId: 9001, apiHash: "0123456789abcdef0123456789abcdef", db });
   stored = { ...stored, runtimeClaimedByDeviceId: "device-admin", runtimeClaimToken: "token-admin", runtimeClaimUntil: new Date(Date.now() + 60_000), runtimeLeaseUserId: admin.userId, runtimeLeaseMemberId: admin.id, runtimeLeaseAccessEpoch: admin.accessEpoch, runtimeLeaseCreatorId: "creator-api" };
   await assert.rejects(

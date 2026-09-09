@@ -86,7 +86,8 @@ test("historical Team money backfill is relation-driven, DB-only, scheduled, and
   assert.match(scheduler, /TEAM_MONEY_BACKFILL_BATCH_SIZE = 250/);
   assert.match(scheduler, /maybeReconcileHistoricalTeamMoney/);
   assert.match(scheduler, /const retention = await maybeRunRetentionSweep/);
-  assert.match(scheduler, /const teamMoneyBackfill = await maybeReconcileHistoricalTeamMoney/);
+  assert.match(scheduler, /runPhase2MaintenancePump/);
+  assert.match(scheduler, /maybeReconcileHistoricalTeamMoney\(\{ db, now \}\)/);
   assert.match(scheduler, /reconcileHistoricalTeamMoneyBatch/);
   assert.match(claims, /canonicalMoneyBackfill/);
   assert.match(claims, /reconcileHistoricalTeamMoneyBatch/);

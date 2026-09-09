@@ -2,6 +2,8 @@
 
 const { recoverConfirmedRelayProjectionForSubmission } = require("./custom-content-submissions-service");
 const { confirmedRelayProofMediaIdForSubmission } = require("./custom-relay-result-proof-service");
+const { customExternalWriteClassification } = require("./custom-content-pipeline-authority-service");
+const { DEBT } = require("./provider-operational-debt-authority-service");
 
 const DEFAULT_BATCH_SIZE = 200;
 const FALLBACK_PAGE_SIZE = 200;
@@ -108,8 +110,58 @@ async function convergeHistoricalCustomExternalProofs({ limit = DEFAULT_BATCH_SI
   return result;
 }
 
+
+async function repairCurrentCustomExternalProjectionDebt({ limit = DEFAULT_BATCH_SIZE, db } = {}) {
+  const take = bounded(limit);
+  if (!db?.providerOperationalDebt?.findMany) return { ok: false, selected: 0, repaired: 0, cleared: 0, failed: 0, reason: "provider_operational_debt_unavailable" };
+  const rows = await db.providerOperationalDebt.findMany({
+    where: { debtClass: DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT },
+    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+    take,
+  });
+  const result = { ok: true, selected: rows.length, repaired: 0, cleared: 0, failed: 0, failures: [] };
+  for (const debt of rows) {
+    try {
+      const delivery = await db.automationDelivery?.findUnique?.({ where: { id: String(debt.objectId) } });
+      if (!delivery || String(delivery.status || "") !== "COMPLETED" || !["CUSTOM_RELAY_SEND", "CUSTOM_MANUAL_SEND"].includes(String(delivery.actionType || ""))) {
+        await db.providerOperationalDebt.deleteMany({ where: { id: String(debt.id) } });
+        result.cleared += 1;
+        continue;
+      }
+      const payload = delivery.payload && typeof delivery.payload === "object" && !Array.isArray(delivery.payload) ? delivery.payload : {};
+      const submissionId = clean(debt.customSubmissionId || payload.submissionId || (String(delivery.actionType) === "CUSTOM_RELAY_SEND" ? String(delivery.targetId || "").split(":")[0] : ""), 180);
+      const orderId = clean(debt.customOrderId || payload.customOrderId || (String(delivery.actionType) === "CUSTOM_MANUAL_SEND" ? delivery.targetId : ""), 180);
+
+      if (String(delivery.actionType) === "CUSTOM_RELAY_SEND" && submissionId) {
+        const repaired = await recoverConfirmedRelayProjectionForSubmission({ agencyId: String(delivery.agencyId), submissionId, db });
+        result.repaired += Number(repaired?.recovered || 0) > 0 ? 1 : 0;
+      }
+
+      const [submission, order] = await Promise.all([
+        submissionId && db.customContentSubmission?.findFirst
+          ? db.customContentSubmission.findFirst({ where: { id: submissionId, agencyId: delivery.agencyId, creatorId: delivery.creatorId } })
+          : Promise.resolve(null),
+        orderId && db.customOrder?.findFirst
+          ? db.customOrder.findFirst({ where: { id: orderId, agencyId: delivery.agencyId, creatorId: delivery.creatorId } })
+          : Promise.resolve(null),
+      ]);
+      const classification = customExternalWriteClassification({ delivery, submission, order });
+      if (classification.converged) {
+        await db.providerOperationalDebt.deleteMany({ where: { id: String(debt.id) } });
+        result.cleared += 1;
+      }
+    } catch (error) {
+      result.ok = false;
+      result.failed += 1;
+      result.failures.push({ debtId: String(debt.id), deliveryId: String(debt.objectId), code: clean(error?.code || "CUSTOM_EXTERNAL_CURRENT_DEBT_REPAIR_FAILED", 120), message: clean(error?.message || error, 500) });
+    }
+  }
+  return result;
+}
+
 module.exports = {
   DEFAULT_BATCH_SIZE,
   discoverHistoricalRelayProjectionDebt,
   convergeHistoricalCustomExternalProofs,
+  repairCurrentCustomExternalProjectionDebt,
 };

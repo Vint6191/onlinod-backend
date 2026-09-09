@@ -45,7 +45,8 @@ test("inbound projection retry is backend-scheduled and no longer piggybacks Des
   assert.match(scheduler, /TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS\s*=\s*30\s*\*\s*1000/);
   assert.match(scheduler, /runTelegramInboundProjectionSweep/);
   assert.match(scheduler, /retryPendingInboundProjections/);
-  assert.match(scheduler, /telegramInboundProjectionTimer\s*=\s*setInterval/);
+  assert.match(scheduler, /runPhase2MaintenancePump/);
+  assert.match(scheduler, /phase2MaintenanceTimer\s*=\s*setInterval/);
   assert.doesNotMatch(deliveryAuthority, /retryPendingInboundProjections/);
 });
 
@@ -54,8 +55,10 @@ test("confirmed Telegram receipt projection debt is repaired by the backend recu
   assert.match(scheduler, /runTelegramConfirmedProjectionSweep/);
   assert.match(scheduler, /repairConfirmedTelegramDeliveryProjections/);
   assert.match(scheduler, /repairCustomModelCommunicationConvergence/);
-  assert.match(scheduler, /scanAllById\(\{[\s\S]*delegate:\s*prisma\.agency[\s\S]*deletedAt:\s*null/);
-  assert.match(scheduler, /telegramConfirmedProjection\s*=\s*await runTelegramConfirmedProjectionSweep/);
+  assert.match(scheduler, /db\.agency\.findMany\(\{[\s\S]*deletedAt:\s*null[\s\S]*take:\s*size/);
+  assert.match(scheduler, /runTelegramConfirmedProjectionMaintenanceSweep/);
+  assert.match(scheduler, /cursorAgencyId[\s\S]*nextCursorAgencyId/);
+  assert.match(scheduler, /runPhase2MaintenancePump[\s\S]*runTelegramConfirmedProjectionMaintenanceSweep/);
   assert.match(deliveryAuthority, /repairConfirmedTelegramDeliveryProjections/);
   assert.match(scheduler, /report\.reminderScheduleScanned\s*\+=\s*Number\(result\?\.reminderScheduleScanned/);
   assert.match(scheduler, /report\.reminderScheduleFailed\s*\+=\s*Number\(result\?\.reminderScheduleFailed/);
@@ -95,12 +98,12 @@ test("confirmed provider receipt commits before derived projection and REFERENCE
   const appendBlock = deliveryAuthority.slice(appendStart, projectStart);
   assert.match(appendBlock, /CustomOrder[\s\S]*FOR UPDATE/,
     "REFERENCE scalar-list projection must serialize on the exact CustomOrder row");
-  assert.match(deliveryAuthority, /kind:\s*"REFERENCE"[\s\S]*state:\s*"CONFIRMED"[\s\S]*REFERENCE_PROJECTION_DEBT/,
-    "backend repair must cursor-discover missing REFERENCE projections from canonical confirmed receipts");
-  assert.match(deliveryAuthority, /MANUAL_REMINDER[\s\S]*AUTO_REMINDER[\s\S]*state:\s*"CONFIRMED"[\s\S]*REMINDER_PROJECTION_DEBT/,
-    "backend repair must cursor-discover confirmed reminder effects whose business projection is missing");
-  assert.match(deliveryAuthority, /kind:\s*"TASK"[\s\S]*state:\s*"CONFIRMED"[\s\S]*TASK_PROJECTION_DEBT/,
-    "backend repair must discover TASK projection debt independently of the CustomOrder current lifecycle state");
+  assert.match(deliveryAuthority, /debtClass:\s*\{\s*in:\s*\[DEBT\.CONFIRMED_PROJECTION_DEBT,\s*DEBT\.CANCELLATION_FOLLOWUP_DEBT\]/,
+    "backend repair must select current operational projection debt rather than rediscover confirmed history");
+  assert.match(deliveryAuthority, /reconcileProviderOperationalDebtForOrder/,
+    "current debt candidates must be exact-revalidated against canonical Custom state before repair");
+  assert.doesNotMatch(deliveryAuthority, /REFERENCE_PROJECTION_DEBT|REMINDER_PROJECTION_DEBT|TASK_PROJECTION_DEBT/,
+    "historical per-kind discovery markers must not return as the hot repair workset");
 });
 
 

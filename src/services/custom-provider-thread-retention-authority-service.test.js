@@ -46,7 +46,7 @@ test("confirmed current revision retains the exact revision account even when an
   assert.equal(blocker?.intentId,"rev-1");
 });
 
-test("production-shaped scan locks the CustomOrder and blocks WAITING_REVIEW account retirement", async () => {
+test("production-shaped current-debt lookup locks the exact CustomOrder and blocks WAITING_REVIEW account retirement", async () => {
   const orders=[{...order,agencyId:"agency-1"}];
   const submissions=[{...submission({telegramSourceAccountId:"tg-a"}),agencyId:"agency-1",creatorId:"creator-1"}];
   const intents=[{...task,agencyId:"agency-1",creatorId:"creator-1",customOrderId:"order-1"}];
@@ -64,7 +64,14 @@ test("production-shaped scan locks the CustomOrder and blocks WAITING_REVIEW acc
   const db={
     telegramDeliveryIntent:{findMany:async(args)=>page(intents,args)},
     customContentSubmission:{findMany:async(args)=>page(submissions,args)},
-    customOrder:{findMany:async({where})=>orders.filter(r=>matches(r,where)).map(r=>({...r}))},
+    customOrder:{
+      findMany:async({where})=>orders.filter(r=>matches(r,where)).map(r=>({...r})),
+      findFirst:async({where})=>orders.find(r=>matches(r,where)) || null,
+    },
+    providerOperationalDebt:{
+      findMany:async(args)=>page([{id:"debt-1",agencyId:"agency-1",accountId:"tg-a",debtClass:"CURRENT_PROVIDER_THREAD_CAPABILITY",customOrderId:"order-1",objectId:"order-1"}],args),
+    },
+    maintenanceLaneState:{findUnique:async()=>({key:"provider_operational_debt_backfill_v1",generation:"provider_operational_debt_v1",completedAt:new Date("2026-09-09T00:00:00Z")})},
     agencyTelegramMtprotoAccount:{findMany:async({where})=>accounts.filter(r=>matches(r,where)).map(r=>({...r}))},
     async $queryRawUnsafe(){lockCalls+=1;return [];},
   };

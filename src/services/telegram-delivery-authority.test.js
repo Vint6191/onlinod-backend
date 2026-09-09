@@ -12,8 +12,9 @@ const {
   beginTelegramDeliveryIntent,
   confirmTelegramDeliveryIntent,
   repairConfirmedTelegramDeliveryProjections,
+  repairCurrentCustomModelCommunicationForOrder,
   repairCustomModelCommunicationConvergence,
-  ensureInitialTaskIntents,
+  ensureAutomaticReminderIntents,
   repairPrecommitProviderBlockedIntents,
   markTelegramDeliveryUnknown,
   markTelegramDeliveryProvenNotSent,
@@ -30,6 +31,12 @@ const {
   assertTelegramDeliveryMaterialAccess,
 } = require("./telegram-delivery-authority-service");
 const { updateCustomOrder } = require("./custom-orders-service");
+const { reprojectCustomReminderSchedule } = require("./custom-order-reminders");
+const {
+  PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY,
+  PROVIDER_OPERATIONAL_BACKFILL_GENERATION,
+  reconcileProviderOperationalDebtForOrder,
+} = require("./provider-operational-debt-authority-service");
 
 function clone(v) { return v == null ? v : structuredClone(v); }
 function scalar(value) { return value instanceof Date ? value.getTime() : value; }
@@ -66,14 +73,15 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
     { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE", runtimeClaimedByDeviceId: "device-1", runtimeClaimToken: "runtime-1", runtimeClaimUntil: new Date(now.getTime() + 60_000), runtimeLeaseUserId: member.userId, runtimeLeaseMemberId: member.id, runtimeLeaseAccessEpoch: member.accessEpoch, runtimeLeaseCreatorId: "creator-1" },
     { id: "tg-2", agencyId: "agency-1", lifecycleState: "ACTIVE", runtimeClaimedByDeviceId: "device-2", runtimeClaimToken: "runtime-2", runtimeClaimUntil: new Date(now.getTime() + 60_000), runtimeLeaseUserId: member.userId, runtimeLeaseMemberId: member.id, runtimeLeaseAccessEpoch: member.accessEpoch, runtimeLeaseCreatorId: "creator-1" },
   ];
-  const orders = [{ id: "order-1", agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-1", scenario: "custom", type: "CONTENT", status: "PENDING", telegramTaskMessageId: null, telegramReferenceMessageIds: [], deliveredAt: null, lastReminderAt: null, lastReminderKey: null, nextReminderAt: null, reminderConfig: null, createdAt: new Date(now.getTime() - 60_000), updatedAt: new Date(now.getTime() - 60_000), creator: creators[0] }];
+  const orders = [{ id: "order-1", agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-1", scenario: "custom", type: "CONTENT", status: "PENDING", telegramTaskMessageId: null, telegramReferenceMessageIds: [], deliveredAt: null, lastReminderAt: null, lastReminderKey: null, nextReminderAt: null, reminderConfig: null, providerOperationalDirty: true, providerOperationalProjectedAt: null, providerOperationalProjectionVersion: null, createdAt: new Date(now.getTime() - 60_000), updatedAt: new Date(now.getTime() - 60_000), creator: creators[0] }];
   const intents = [];
   const inboundEvents = [];
   const submissions = [];
   const audits = [];
+  const providerOperationalDebts = [];
   let seq = 0;
   const db = {
-    _member: member, _creators: creators, _accounts: accounts, _orders: orders, _intents: intents, _inboundEvents: inboundEvents, _submissions: submissions, _audits: audits, _workspaceSettingValue: null,
+    _member: member, _creators: creators, _accounts: accounts, _orders: orders, _intents: intents, _inboundEvents: inboundEvents, _submissions: submissions, _audits: audits, _providerOperationalDebts: providerOperationalDebts, _workspaceSettingValue: null,
     // Production Custom/TASK commit fencing uses a PostgreSQL advisory xact lock.
     // This in-memory fixture executes transactions serially, so model the lock as
     // a successful no-op instead of weakening the production fence for tests.
@@ -145,10 +153,40 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
         return { count };
       },
     },
+    providerOperationalDebt: {
+      async findMany({ where, take = 100, orderBy = [] }) {
+        const rows = providerOperationalDebts.filter((r) => matches(r, where));
+        const order = Array.isArray(orderBy) ? orderBy : [orderBy];
+        rows.sort((a,b)=>{ for (const part of order) { const [key,dir]=Object.entries(part||{})[0]||[]; if(!key) continue; const av=scalar(a[key]); const bv=scalar(b[key]); if(av==null&&bv!=null)return dir==="desc"?1:-1; if(av!=null&&bv==null)return dir==="desc"?-1:1; if(av<bv)return dir==="desc"?1:-1; if(av>bv)return dir==="desc"?-1:1; } return 0; });
+        return rows.slice(0, take).map(clone);
+      },
+      async deleteMany({ where }) {
+        let count = 0;
+        for (let i = providerOperationalDebts.length - 1; i >= 0; i -= 1) if (matches(providerOperationalDebts[i], where)) { providerOperationalDebts.splice(i, 1); count += 1; }
+        return { count };
+      },
+      async createMany({ data }) {
+        for (const row of data || []) if (!providerOperationalDebts.some((existing) => existing.id === row.id)) providerOperationalDebts.push({ ...clone(row), createdAt: row.createdAt || new Date(), updatedAt: row.updatedAt || new Date() });
+        return { count: (data || []).length };
+      },
+    },
+    maintenanceLaneState: {
+      async findUnique({ where }) {
+        if (where.key !== PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY) return null;
+        return { key: PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY, generation: PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date(now.getTime() - 1_000) };
+      },
+    },
     auditLog: { async create({ data }) { const row={ id: `audit-${audits.length+1}`, ...clone(data) }; audits.push(row); return clone(row); } },
     async $transaction(fn) { return fn(this); },
   };
-  return { db, member, now, orders, intents, inboundEvents, submissions, accounts, creators };
+  return { db, member, now, orders, intents, inboundEvents, submissions, accounts, creators, providerOperationalDebts };
+}
+
+async function syncProviderOperationalBackfill(fx, { reminder = true } = {}) {
+  for (const order of fx.orders) {
+    if (reminder) await repairCurrentCustomModelCommunicationForOrder({ agencyId: order.agencyId, orderId: order.id, now: fx.now, db: fx.db });
+    await reconcileProviderOperationalDebtForOrder({ agencyId: order.agencyId, orderId: order.id, db: fx.db, now: fx.now, markClean: true });
+  }
 }
 
 function seedConfirmedTaskThread(fx, { accountId = "tg-1", messageId = 501, telegramUserId = "1001" } = {}) {
@@ -1087,6 +1125,7 @@ test("AUTO_REMINDER provider outcome left COMMITTING after ack loss becomes reco
   confirmedTask.confirmedAt = confirmedTask.remoteSentAt;
   fx.orders[0].createdAt = new Date(fx.now.getTime() - 31 * 60_000);
   fx.orders[0].nextReminderAt = new Date(fx.now);
+  await ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const reminder = listed.items.find((row) => row.kind === "AUTO_REMINDER");
   assert.ok(reminder);
@@ -1124,6 +1163,7 @@ test("stale claimed reminder cannot COMMIT after reassignment gives the order a 
   fx.orders[0].createdAt = new Date(fx.now.getTime() - 31 * 60_000);
   fx.orders[0].nextReminderAt = new Date(fx.now);
 
+  await ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const reminder = listed.items.find((row) => row.kind === "AUTO_REMINDER");
   assert.ok(reminder, "the old obligation must have produced a due reminder before reassignment");
@@ -1166,6 +1206,7 @@ test("AUTO_REMINDER settings changed before COMMITTING cancel only the obsolete 
   confirmedTask.confirmedAt = confirmedTask.remoteSentAt;
   fx.orders[0].createdAt = new Date(fx.now.getTime() - 31 * 60_000);
   fx.orders[0].nextReminderAt = new Date(fx.now);
+  await ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const reminder = listed.items.find((row) => row.kind === "AUTO_REMINDER");
   assert.ok(reminder);
@@ -1189,6 +1230,7 @@ test("AUTO_REMINDER settings changed after COMMITTING cannot erase the in-flight
   confirmedTask.confirmedAt = confirmedTask.remoteSentAt;
   fx.orders[0].createdAt = new Date(fx.now.getTime() - 31 * 60_000);
   fx.orders[0].nextReminderAt = new Date(fx.now);
+  await ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const listed = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const reminder = listed.items.find((row) => row.kind === "AUTO_REMINDER");
   assert.ok(reminder);
@@ -1499,6 +1541,7 @@ test("confirmed projection repair isolates one broken receipt and continues late
     },
   );
 
+  await syncProviderOperationalBackfill(fx);
   const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: new Date(fx.now.getTime() + 5_000), db: fx.db });
   assert.equal(repaired.ok, false);
   assert.equal(repaired.failed, 1);
@@ -1526,6 +1569,7 @@ test("server repair projects historical CONFIRMED REFERENCE debt without requiri
   });
   fx.orders[0].telegramReferenceMessageIds = [];
 
+  await syncProviderOperationalBackfill(fx);
   const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: new Date(fx.now.getTime() + 5_000), db: fx.db });
   assert.equal(repaired.ok, true);
   assert.equal(repaired.scanned, 1);
@@ -1547,6 +1591,7 @@ test("confirmed projection refuses cross-creator business-target corruption and 
     createdAt: at, updatedAt: at,
   });
 
+  await syncProviderOperationalBackfill(fx);
   const result = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: fx.now, db: fx.db });
   assert.equal(result.failed >= 1, true);
   assert.equal(fx.orders[0].telegramReferenceMessageIds.length, 0, "corrupt receipt must never mutate another creator's CustomOrder");
@@ -1570,6 +1615,7 @@ test("server repair retries marked CONFIRMED projection debt even when partial b
     createdAt: sentAt, updatedAt: sentAt,
   });
 
+  await syncProviderOperationalBackfill(fx);
   const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: fx.now, db: fx.db });
   assert.equal(repaired.scanned >= 1, true);
   assert.equal(repaired.repaired >= 1, true);
@@ -1578,22 +1624,20 @@ test("server repair retries marked CONFIRMED projection debt even when partial b
   assert.equal(row.projectionBlockedCode, null, "marked debt must run the full projection path and clear its pending/block marker");
 });
 
-test("server repair heals legacy unmarked TASK reminder schedule debt from current policy without replaying provider truth", async () => {
+test("one-time provider backfill heals legacy unmarked TASK reminder schedule debt from current policy", async () => {
   const fx = dbFixture();
   seedConfirmedTaskThread(fx, { messageId: 825, telegramUserId: "1001" });
   const task = fx.intents.find((row) => row.id === "confirmed-task-825");
   fx.orders[0].deliveredAt = new Date(task.remoteSentAt);
   fx.orders[0].nextReminderAt = null;
 
-  const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: fx.now, db: fx.db });
-  assert.equal(repaired.ok, true);
-  assert.equal(repaired.reminderScheduleRepaired, 1);
+  await syncProviderOperationalBackfill(fx);
   assert.ok(fx.orders[0].nextReminderAt, "confirmed TASK thread with enabled current policy must recover its derived reminder schedule");
   assert.equal(new Date(fx.orders[0].nextReminderAt).getTime() > fx.now.getTime(), true);
   assert.equal(task.state, "CONFIRMED", "schedule repair must not rewrite canonical provider truth");
 });
 
-test("server reminder schedule repair obeys current disabled policy instead of replaying historical receipt timing", async () => {
+test("one-time provider backfill obeys current disabled reminder policy instead of replaying historical timing", async () => {
   const fx = dbFixture();
   seedConfirmedTaskThread(fx, { messageId: 826, telegramUserId: "1001" });
   const task = fx.intents.find((row) => row.id === "confirmed-task-826");
@@ -1601,9 +1645,7 @@ test("server reminder schedule repair obeys current disabled policy instead of r
   fx.orders[0].nextReminderAt = new Date(fx.now.getTime() + 60_000);
   fx.db._workspaceSettingValue = { content: { enabled: false } };
 
-  const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: fx.now, db: fx.db });
-  assert.equal(repaired.ok, true);
-  assert.equal(repaired.reminderScheduleRepaired, 1);
+  await syncProviderOperationalBackfill(fx);
   assert.equal(fx.orders[0].nextReminderAt, null, "current disabled policy is the schedule authority");
   assert.equal(task.state, "CONFIRMED");
 });
@@ -1622,6 +1664,7 @@ test("server repair projects historical CONFIRMED reminder provider facts withou
     remoteMessageId: 823, remoteRecipientTelegramUserId: "900001", remoteSentAt: sentAt, outcomeReason: null, confirmationAuthority: "PROVIDER_RECEIPT", confirmedAt: sentAt, createdAt: sentAt, updatedAt: sentAt,
   });
 
+  await syncProviderOperationalBackfill(fx);
   const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: new Date(fx.now.getTime() + 5_000), db: fx.db });
   assert.equal(repaired.ok, true);
   assert.equal(repaired.scanned, 1);
@@ -1638,6 +1681,7 @@ test("server repair projects a CONFIRMED TASK even after the CustomOrder became 
   fx.orders[0].telegramTaskMessageId = null;
   fx.orders[0].deliveredAt = null;
 
+  await syncProviderOperationalBackfill(fx);
   const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: new Date(fx.now.getTime() + 5_000), db: fx.db });
   assert.equal(repaired.ok, true);
   assert.equal(repaired.scanned, 1);
@@ -1653,6 +1697,7 @@ test("server repair projects a historical CONFIRMED TASK without requiring Deskt
   fx.orders[0].telegramTaskMessageId = null;
   fx.orders[0].deliveredAt = null;
 
+  await syncProviderOperationalBackfill(fx);
   const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: new Date(fx.now.getTime() + 5_000), db: fx.db });
   assert.equal(repaired.ok, true);
   assert.equal(repaired.scanned, 1);
@@ -1671,6 +1716,7 @@ test("explicit legacy-retirement cancellation waiver is terminal control truth a
   fx.orders[0].telegramCancellationWaivedAt = new Date(fx.now.getTime() - 250);
   fx.orders[0].telegramCancellationWaiverReason = "LEGACY_CREATOR_RETIRED_BEFORE_PIPELINE_AUTHORITY";
 
+  await syncProviderOperationalBackfill(fx);
   const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: new Date(fx.now.getTime() + 5_000), db: fx.db });
   assert.equal(repaired.ok, true);
   assert.equal(repaired.scanned, 0, "waived terminal follow-up is not projection debt");
@@ -1693,6 +1739,7 @@ test("historical CANCELLED cancellation tombstone is reactivated under lifecycle
   canonical.claimRevision = 4;
   canonical.commitStartedAt = null;
 
+  await syncProviderOperationalBackfill(fx);
   const repaired = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: new Date(fx.now.getTime() + 5_000), db: fx.db });
   assert.equal(repaired.ok, true);
   assert.equal(repaired.scanned, 1);
@@ -2009,7 +2056,7 @@ test("unexpected confirmed TASK thread lookup failures are surfaced instead of h
     return originalFindFirst(args);
   };
   await assert.rejects(
-    () => listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 10, now: fx.now, db: fx.db }),
+    () => ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 10, now: fx.now, db: fx.db }),
     /SIMULATED_TASK_THREAD_DB_FAILURE/,
   );
 });
@@ -2028,6 +2075,7 @@ test("model response makes CONTENT reminder schedule non-executable and MANUAL_R
     receivedAt: new Date(fx.now.getTime() - 5_000), createdAt: new Date(fx.now.getTime() - 5_000), updatedAt: new Date(fx.now.getTime() - 5_000),
   });
 
+  await syncProviderOperationalBackfill(fx);
   await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: fx.now, db: fx.db });
   assert.equal(fx.orders[0].nextReminderAt, null, "response receipt must clear stale CONTENT reminder schedule");
   await assert.rejects(
@@ -2062,6 +2110,7 @@ test("confirmed REVISION_REQUEST starts a fresh reminder cycle and both manual/a
   // obligation identity. Remove the manual row from the in-memory fixture so this assertion isolates
   // provider binding rather than the unrelated manual/auto unresolved policy.
   fx.intents.splice(fx.intents.findIndex((row) => row.id === manual.intent.id), 1);
+  await ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const work = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const auto = work.items.find((row) => row.kind === "AUTO_REMINDER");
   assert.ok(auto);
@@ -2096,6 +2145,7 @@ test("model response commit racing a claimed AUTO_REMINDER wins the shared Custo
   fx.orders[0].deliveredAt = task.remoteSentAt;
   fx.orders[0].nextReminderAt = new Date(fx.now.getTime() - 1000);
 
+  await ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const work = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
   const auto = work.items.find((row) => row.kind === "AUTO_REMINDER");
   assert.ok(auto, "due initial model obligation must materialize one AUTO_REMINDER");
@@ -2162,7 +2212,7 @@ test("a claimed initial REFERENCE cannot begin after V1 satisfies the model obli
 });
 
 
-test("model communication backfill cancels stale precommit reminders/references and clears a satisfied CONTENT schedule", async () => {
+test("exact dirty-order model communication repair cancels stale precommit reminders/references and clears a satisfied CONTENT schedule", async () => {
   const fx = dbFixture();
   seedConfirmedTaskThread(fx, { messageId: 901, telegramUserId: "1001" });
   fx.orders[0].deliveredAt = new Date(fx.now.getTime() - 10_000);
@@ -2182,7 +2232,7 @@ test("model communication backfill cancels stale precommit reminders/references 
     payload: { reference: { ordinal: 2, name: "old.jpg", size: 10, sha256: "a".repeat(64) } }, createdAt: new Date(fx.now.getTime() - 3_000), updatedAt: new Date(fx.now.getTime() - 3_000),
   });
 
-  const result = await repairCustomModelCommunicationConvergence({ agencyId: "agency-1", now: fx.now, db: fx.db });
+  const result = await repairCurrentCustomModelCommunicationForOrder({ agencyId: "agency-1", orderId: "order-1", now: fx.now, db: fx.db });
 
   assert.equal(result.ok, true);
   assert.equal(result.precommitScanned, 2);
@@ -2192,7 +2242,7 @@ test("model communication backfill cancels stale precommit reminders/references 
   assert.equal(fx.orders[0].nextReminderAt, null, "accepted response must clear historical reminder schedule without Desktop polling");
 });
 
-test("model communication backfill reconstructs revision reminder schedule from CONFIRMED revision receipt even without TASK", async () => {
+test("one-time provider backfill reconstructs revision reminder schedule from CONFIRMED revision receipt even without TASK", async () => {
   const fx = dbFixture();
   const submission = seedRevisionDecision(fx, { comment: "Redo ending" });
   const sentAt = new Date(fx.now.getTime() - 30_000);
@@ -2205,12 +2255,13 @@ test("model communication backfill reconstructs revision reminder schedule from 
   assert.equal(fx.orders[0].telegramTaskMessageId, null);
   assert.equal(fx.orders[0].nextReminderAt, null);
 
+  await syncProviderOperationalBackfill(fx);
   const result = await repairCustomModelCommunicationConvergence({ agencyId: "agency-1", now: fx.now, db: fx.db });
 
   assert.equal(result.ok, true);
   assert.equal(result.revisionIntentsPlanned, 0, "existing provider receipt must never be duplicated");
-  assert.ok(result.reminderScheduleScanned >= 1);
-  assert.ok(fx.orders[0].nextReminderAt instanceof Date, "confirmed revision must recreate its model-obligation reminder schedule");
+  assert.equal(result.reminderScheduleScanned, 0, "hourly Agency convergence must not scan order reminder work after dirty-order cutover");
+  assert.ok(fx.orders[0].nextReminderAt instanceof Date, "one-time provider backfill must recreate the model-obligation reminder schedule");
   assert.ok(fx.orders[0].nextReminderAt.getTime() >= sentAt.getTime());
 });
 
@@ -2227,10 +2278,10 @@ test("initial TASK convergence reactivates the same proven-no-effect logical row
     outcomeReason: "HUMAN_RESPONSE_SUPERSEDED:MANUAL_SUBMISSION_ASSIGNMENT", createdAt: cancelledAt, updatedAt: cancelledAt,
   });
 
-  const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
-  assert.equal(report.failed, 0);
-  assert.equal(report.reactivated, 1);
-  assert.equal(report.planned, 0);
+  const report = await repairCurrentCustomModelCommunicationForOrder({ agencyId: "agency-1", orderId: "order-1", now: fx.now, db: fx.db });
+  assert.equal(report.initialTaskFailed, 0);
+  assert.equal(report.initialTaskReactivated, 1);
+  assert.equal(report.initialTaskPlanned, 0);
   assert.equal(fx.intents.length, 1, "exact TASK logical identity must be reused, not duplicated");
   const task = fx.intents[0];
   assert.equal(task.id, "task-superseded-before-response-moved");
@@ -2245,10 +2296,10 @@ test("initial TASK convergence reactivates the same proven-no-effect logical row
 test("initial TASK convergence materializes missing create-time instruction after Telegram binding becomes available", async () => {
   const fx = dbFixture();
   assert.equal(fx.intents.length, 0);
-  const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
-  assert.equal(report.failed, 0);
-  assert.equal(report.planned, 1);
-  assert.equal(report.reactivated, 0);
+  const report = await repairCurrentCustomModelCommunicationForOrder({ agencyId: "agency-1", orderId: "order-1", now: fx.now, db: fx.db });
+  assert.equal(report.initialTaskFailed, 0);
+  assert.equal(report.initialTaskPlanned, 1);
+  assert.equal(report.initialTaskReactivated, 0);
   assert.equal(fx.intents.length, 1);
   assert.equal(fx.intents[0].kind, "TASK");
   assert.equal(fx.intents[0].state, "PLANNED");
@@ -2265,9 +2316,9 @@ test("initial TASK convergence never rewrites COMMITTING or UNKNOWN provider out
       claimRevision: 2, commitStartedAt: state === "COMMITTING" ? at : at, remoteMessageId: null, remoteSentAt: null, confirmedAt: null,
       createdAt: at, updatedAt: at,
     });
-    const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
-    assert.equal(report.planned, 0, state);
-    assert.equal(report.reactivated, 0, state);
+    const report = await repairCurrentCustomModelCommunicationForOrder({ agencyId: "agency-1", orderId: "order-1", now: fx.now, db: fx.db });
+    assert.equal(report.initialTaskPlanned, 0, state);
+    assert.equal(report.initialTaskReactivated, 0, state);
     assert.equal(fx.intents[0].state, state);
     assert.equal(fx.intents[0].claimRevision, 2);
   }
@@ -2286,9 +2337,9 @@ test("initial TASK convergence does not resurrect an instruction while a canonic
     id: "response-v1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "order-1", pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW",
     receivedAt: new Date(fx.now.getTime() - 10_000), createdAt: new Date(fx.now.getTime() - 10_000), updatedAt: new Date(fx.now.getTime() - 10_000),
   });
-  const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
-  assert.equal(report.planned, 0);
-  assert.equal(report.reactivated, 0);
+  const report = await repairCurrentCustomModelCommunicationForOrder({ agencyId: "agency-1", orderId: "order-1", now: fx.now, db: fx.db });
+  assert.equal(report.initialTaskPlanned, 0);
+  assert.equal(report.initialTaskReactivated, 0);
   assert.equal(fx.intents[0].state, "CANCELLED");
 });
 
@@ -2316,10 +2367,9 @@ test("initial TASK convergence loses safely when a concurrent human response adv
     outcomeReason: "HUMAN_RESPONSE_SUPERSEDED:MANUAL_RESPONSE", createdAt: cancelledAt, updatedAt: cancelledAt,
   });
 
-  const report = await ensureInitialTaskIntents({ agencyId: "agency-1", member: null, limit: 10, now: fx.now, db: fx.db });
-  assert.equal(report.failed, 0);
-  assert.equal(report.raced, 1);
-  assert.equal(report.reactivated, 0);
+  const report = await repairCurrentCustomModelCommunicationForOrder({ agencyId: "agency-1", orderId: "order-1", now: fx.now, db: fx.db });
+  assert.equal(report.initialTaskFailed, 1);
+  assert.equal(report.initialTaskReactivated, 0);
   assert.equal(fx.intents[0].state, "CANCELLED");
   assert.equal(fx.submissions.length, 1);
 });
@@ -2487,6 +2537,7 @@ test("server projection repair converges cancellation from a historical CONFIRME
   assert.equal(fx.orders[0].telegramTaskMessageId, null);
   assert.equal(fx.intents.some((row) => row.kind === "CANCELLATION"), false);
 
+  await syncProviderOperationalBackfill(fx);
   const report = await repairConfirmedTelegramDeliveryProjections({ agencyId: "agency-1", now: fx.now, db: fx.db });
   assert.equal(report.ok, true);
   const cancellation = fx.intents.find((row) => row.kind === "CANCELLATION");
@@ -2572,6 +2623,7 @@ test("AUTO_REMINDER planning horizon counts eligible new work, not stale exact C
   }
 
   async function createConfirmedReminderThenLoseProjection(order) {
+    await ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
     const work = await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 25, now: fx.now, db: fx.db });
     const reminder = work.items.find((row) => row.kind === "AUTO_REMINDER" && row.customOrderId === order.id);
     assert.ok(reminder, `AUTO_REMINDER must first materialize for ${order.id}`);
@@ -2594,7 +2646,7 @@ test("AUTO_REMINDER planning horizon counts eligible new work, not stale exact C
   const before = fx.intents.filter((row) => row.kind === "AUTO_REMINDER" && row.customOrderId === "order-3").length;
   assert.equal(before, 0);
 
-  await listTelegramDeliveryWork({ agencyId: "agency-1", member: fx.member, limit: 2, now: fx.now, db: fx.db });
+  await ensureAutomaticReminderIntents({ agencyId: "agency-1", member: fx.member, limit: 2, now: fx.now, db: fx.db });
 
   const after = fx.intents.filter((row) => row.kind === "AUTO_REMINDER" && row.customOrderId === "order-3");
   assert.equal(after.length, 1, "stale exact CONFIRMED reminders must not consume the planning horizon before a later eligible order");

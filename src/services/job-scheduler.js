@@ -38,6 +38,7 @@ const { reconcileExpiredBillingStates } = require("./billing-entitlement-service
 const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { runMaintenanceLane } = require("./maintenance-work-authority");
 const { stampCollectionAuthorityParams } = require("./analytics-collector-control-service");
 const {
   ensureOperationalAnalyticsFreshness,
@@ -58,9 +59,26 @@ const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
 const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin setting can override
 const TEAM_MONEY_BACKFILL_BATCH_SIZE = 250; // DB-only historical reconciliation, no OF requests
 const TEAM_PENDING_BACKFILL_BATCH_SIZE = 500; // DB-only Team queue projection repair
+const PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE = 100; // one-time cold-history -> current-work projection
+const PROVIDER_OPERATIONAL_DIRTY_BATCH_SIZE = 100; // bounded current canonical transitions only
+const TEAM_PENDING_PROJECTION_LANE_KEY = "team_pending_projection_v1";
+const TEAM_PENDING_PROJECTION_LANE_GENERATION = "team_pending_projection_v1";
+const TEAM_LEGACY_PENDING_REPAIR_LANE_KEY = "team_legacy_pending_bootstrap_repair_v1";
+const TEAM_LEGACY_PENDING_REPAIR_LANE_GENERATION = "team_legacy_pending_bootstrap_repair_v1";
 const ANALYTICS_DEMAND_INTERVAL_MS = 15 * 1000; // durable interactive Home freshness demands
-const TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS = 30 * 1000; // lightweight DB-only Customs projection retry
+const TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS = 30 * 1000; // lane cadence; pump checks due state more frequently
+const PHASE2_MAINTENANCE_PUMP_INTERVAL_MS = 5 * 1000;
 const TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE = 200;
+const CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY = "custom_external_proof_backfill_v1";
+const CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION = "custom_external_proof_backfill_v1";
+const CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_KEY = "custom_external_projection_debt_v1";
+const CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_GENERATION = "custom_external_projection_debt_v1";
+const TELEGRAM_INBOUND_MAINTENANCE_LANE_KEY = "telegram_inbound_projection_v1";
+const TELEGRAM_INBOUND_MAINTENANCE_LANE_GENERATION = "telegram_inbound_projection_v1";
+const TELEGRAM_CONFIRMED_MAINTENANCE_LANE_KEY = "telegram_custom_convergence_v1";
+const TELEGRAM_CONFIRMED_MAINTENANCE_LANE_GENERATION = "telegram_custom_convergence_v1";
+const TEAM_MONEY_MAINTENANCE_LANE_KEY = "team_money_backfill_v1";
+const TEAM_MONEY_MAINTENANCE_LANE_GENERATION = "team_money_backfill_v1";
 const RECURRING_READY_PAGE_SIZE = 250;
 const CREATOR_ANALYTICS_SWEEP_LEASE_KEY = "creator_analytics_recurring_v1";
 const CREATOR_ANALYTICS_SWEEP_COORDINATION_LOCK_KEY = "creator-analytics-recurring-sweep-coordinator";
@@ -68,6 +86,7 @@ const CREATOR_ANALYTICS_SWEEP_LEASE_MS = 15 * 60 * 1000;
 const CREATOR_ANALYTICS_SWEEP_HEARTBEAT_EVERY = 25;
 let recurringSweepPromise = null;
 let creatorAnalyticsSweepPromise = null;
+let phase2MaintenancePromise = null;
 
 
 function retentionBreakdown(result, laneNames) {
@@ -450,21 +469,23 @@ async function scheduleJobNow({
 }
 
 
-async function maybeReconcileHistoricalTeamMoney() {
+async function reconcileHistoricalTeamMoneyWork({ db = prisma } = {}) {
   try {
     const { migrateLegacyTipsToTipLedger, repairMigratedLegacyTipManualAuthority } = require("./team-tip-ledger-service");
     const { reconcileHistoricalTeamMoneyBatch } = require("./team-money-reconciliation-service");
     const legacyManualRepair = await repairMigratedLegacyTipManualAuthority({
+      db,
       limit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
       dryRun: false,
     });
     const legacyTips = await migrateLegacyTipsToTipLedger({
+      db,
       limit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
       dryRun: false,
       deleteLegacy: true,
     });
     const result = await reconcileHistoricalTeamMoneyBatch({
-      db: prisma,
+      db,
       saleLimit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
       tipLimit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
     });
@@ -488,24 +509,182 @@ async function maybeReconcileHistoricalTeamMoney() {
   }
 }
 
-async function runCustomExternalProofConvergenceSweep({ now = new Date() } = {}) {
+
+async function maybeReconcileHistoricalTeamMoney({ db = prisma, now = new Date() } = {}) {
+  return runMaintenanceLane({
+    db,
+    key: TEAM_MONEY_MAINTENANCE_LANE_KEY,
+    generation: TEAM_MONEY_MAINTENANCE_LANE_GENERATION,
+    oneTime: false,
+    leaseMs: 10 * 60 * 1000,
+    minIntervalMs: RECURRING_INTERVAL_MS,
+    fallbackNow: now,
+    work: async () => {
+      const result = await reconcileHistoricalTeamMoneyWork({ db });
+      const likelyMore = Boolean(result?.sales?.likelyMore || result?.tips?.likelyMore)
+        || Number(result?.legacyManualRepair?.scanned || 0) >= TEAM_MONEY_BACKFILL_BATCH_SIZE
+        || Number(result?.legacyTips?.scanned || 0) >= TEAM_MONEY_BACKFILL_BATCH_SIZE;
+      return {
+        ...result,
+        outcome: result?.ok === false ? "TEAM_MONEY_BATCH_FAILED" : likelyMore ? "TEAM_MONEY_BACKLOG_CONTINUES" : "TEAM_MONEY_BATCH_COMPLETE",
+        nextRunAt: new Date(now.getTime() + (result?.ok === false ? 60_000 : likelyMore ? 1_000 : RECURRING_INTERVAL_MS)),
+        progress: {
+          salesSelected: Number(result?.sales?.selected || 0),
+          tipsSelected: Number(result?.tips?.selected || 0),
+          salesFailed: Number(result?.sales?.failed || 0),
+          tipsFailed: Number(result?.tips?.failed || 0),
+        },
+      };
+    },
+  });
+}
+
+async function maybeBackfillProviderOperationalDebt({ db = prisma, now = new Date() } = {}) {
   try {
-    // Provider-completed CUSTOM relay results are canonical historical facts. Their
-    // projection is backend-owned repair and deliberately has no Desktop lease,
-    // creator READY/deleted, manager permission, or Custom lifecycle dependency.
-    const { convergeHistoricalCustomExternalProofs } = require("./custom-external-proof-convergence-service");
-    const result = await convergeHistoricalCustomExternalProofs({ limit: 200, db: prisma });
-    if (Number(result?.selected || 0) > 0 || Number(result?.failed || 0) > 0) {
-      console.log(`[scheduler] Custom external proof convergence — selected=${result.selected || 0}, repaired=${result.repaired || 0}, media=${result.projectedMedia || 0}, failed=${result.failed || 0}`);
-    }
-    return result;
+    const {
+      PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY,
+      PROVIDER_OPERATIONAL_BACKFILL_GENERATION,
+      selectProviderOperationalBackfillBatch,
+      reconcileProviderOperationalDebtForOrder,
+    } = require("./provider-operational-debt-authority-service");
+    const { repairCurrentCustomModelCommunicationForOrder } = require("./telegram-delivery-authority-service");
+    return await runMaintenanceLane({
+      db,
+      key: PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY,
+      generation: PROVIDER_OPERATIONAL_BACKFILL_GENERATION,
+      oneTime: true,
+      leaseMs: 15 * 60 * 1000,
+      minIntervalMs: 1_000,
+      fallbackNow: now,
+      work: async ({ claim }) => {
+        const cursor = String(claim?.cursor?.lastOrderId || "").trim() || null;
+        const rows = await selectProviderOperationalBackfillBatch({ db, cursor, limit: PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE });
+        let projected = 0;
+        let modelCommunicationRepaired = 0;
+        let modelCommunicationFailed = 0;
+        for (const row of rows || []) {
+          const communication = await repairCurrentCustomModelCommunicationForOrder({ agencyId: String(row.agencyId), orderId: String(row.id), now, db });
+          modelCommunicationRepaired += Number(communication?.initialTaskPlanned || 0) + Number(communication?.initialTaskReactivated || 0)
+            + Number(communication?.revisionIntentPlanned || 0) + Number(communication?.precommitCancelled || 0)
+            + Number(communication?.precommitRefreshed || 0) + Number(communication?.reminderScheduleRepaired || 0);
+          if (communication?.ok === false) modelCommunicationFailed += 1;
+          const result = await reconcileProviderOperationalDebtForOrder({ agencyId: String(row.agencyId), orderId: String(row.id), db, now, markClean: communication?.ok !== false });
+          projected += Number(result?.projected || 0);
+        }
+        const lastOrderId = rows?.length ? String(rows[rows.length - 1].id) : cursor;
+        const complete = (rows?.length || 0) < PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE;
+        return {
+          complete,
+          outcome: complete ? "BACKFILL_COMPLETE" : "BACKFILL_BATCH_COMPLETE",
+          cursor: { lastOrderId },
+          progress: { processed: Number(claim?.progress?.processed || 0) + Number(rows?.length || 0), projected, modelCommunicationRepaired, modelCommunicationFailed },
+        };
+      },
+    });
   } catch (err) {
-    console.warn("[scheduler] Custom external proof convergence failed:", err?.message || err);
-    return { ok: false, selected: 0, repaired: 0, projectedMedia: 0, failed: 1, error: err?.message || String(err) };
+    console.warn("[scheduler] Provider operational debt backfill failed:", err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
   }
 }
 
-async function runTelegramInboundProjectionSweep({ now = new Date() } = {}) {
+async function maybeRepairProviderOperationalDirty({ db = prisma, now = new Date() } = {}) {
+  try {
+    const {
+      PROVIDER_OPERATIONAL_DIRTY_LANE_KEY,
+      PROVIDER_OPERATIONAL_DIRTY_GENERATION,
+      selectProviderOperationalDirtyBatch,
+      reconcileProviderOperationalDebtForOrder,
+    } = require("./provider-operational-debt-authority-service");
+    const { repairCurrentCustomModelCommunicationForOrder } = require("./telegram-delivery-authority-service");
+    return await runMaintenanceLane({
+      db,
+      key: PROVIDER_OPERATIONAL_DIRTY_LANE_KEY,
+      generation: PROVIDER_OPERATIONAL_DIRTY_GENERATION,
+      leaseMs: 5 * 60 * 1000,
+      minIntervalMs: 30_000,
+      fallbackNow: now,
+      work: async () => {
+        const rows = await selectProviderOperationalDirtyBatch({ db, limit: PROVIDER_OPERATIONAL_DIRTY_BATCH_SIZE });
+        let projected = 0;
+        let modelCommunicationRepaired = 0;
+        let modelCommunicationFailed = 0;
+        for (const row of rows || []) {
+          const communication = await repairCurrentCustomModelCommunicationForOrder({ agencyId: String(row.agencyId), orderId: String(row.id), now, db });
+          modelCommunicationRepaired += Number(communication?.initialTaskPlanned || 0) + Number(communication?.initialTaskReactivated || 0)
+            + Number(communication?.revisionIntentPlanned || 0) + Number(communication?.precommitCancelled || 0)
+            + Number(communication?.precommitRefreshed || 0) + Number(communication?.reminderScheduleRepaired || 0);
+          if (communication?.ok === false) modelCommunicationFailed += 1;
+          const result = await reconcileProviderOperationalDebtForOrder({ agencyId: String(row.agencyId), orderId: String(row.id), db, now, markClean: communication?.ok !== false });
+          projected += Number(result?.projected || 0);
+        }
+        return {
+          outcome: "DIRTY_BATCH_COMPLETE",
+          nextRunAt: new Date(now.getTime() + ((rows?.length || 0) >= PROVIDER_OPERATIONAL_DIRTY_BATCH_SIZE ? 1_000 : 60_000)),
+          progress: { processed: Number(rows?.length || 0), projected, modelCommunicationRepaired, modelCommunicationFailed },
+        };
+      },
+    });
+  } catch (err) {
+    console.warn("[scheduler] Provider operational dirty repair failed:", err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function runCustomExternalProofConvergenceSweep({ now = new Date(), db = prisma } = {}) {
+  try {
+    const { convergeHistoricalCustomExternalProofs, repairCurrentCustomExternalProjectionDebt } = require("./custom-external-proof-convergence-service");
+    const backfill = await runMaintenanceLane({
+      db,
+      key: CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY,
+      generation: CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION,
+      oneTime: true,
+      leaseMs: 10 * 60 * 1000,
+      minIntervalMs: 5_000,
+      fallbackNow: now,
+      work: async () => {
+        const batch = await convergeHistoricalCustomExternalProofs({ limit: 200, db });
+        const complete = Number(batch?.selected || 0) === 0 && Number(batch?.failed || 0) === 0;
+        return {
+          ...batch,
+          complete,
+          outcome: complete ? "BACKFILL_COMPLETE" : "BACKFILL_BATCH_COMPLETE",
+          nextRunAt: complete ? null : new Date(now.getTime() + 5_000),
+          progress: { selected: Number(batch?.selected || 0), repaired: Number(batch?.repaired || 0), failed: Number(batch?.failed || 0) },
+        };
+      },
+    });
+    const current = await runMaintenanceLane({
+      db,
+      key: CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_KEY,
+      generation: CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_GENERATION,
+      oneTime: false,
+      leaseMs: 5 * 60 * 1000,
+      minIntervalMs: 30_000,
+      fallbackNow: now,
+      work: async () => {
+        const batch = await repairCurrentCustomExternalProjectionDebt({ limit: 200, db });
+        return {
+          ...batch,
+          outcome: Number(batch?.selected || 0) > 0 ? "CURRENT_DEBT_BATCH_COMPLETE" : "CURRENT_DEBT_IDLE",
+          nextRunAt: new Date(now.getTime() + (Number(batch?.selected || 0) >= 200 ? 1_000 : 60_000)),
+          progress: { selected: Number(batch?.selected || 0), repaired: Number(batch?.repaired || 0), cleared: Number(batch?.cleared || 0), failed: Number(batch?.failed || 0) },
+        };
+      },
+    });
+    if (!backfill?.skipped && (Number(backfill?.selected || 0) > 0 || Number(backfill?.failed || 0) > 0)) {
+      console.log(`[scheduler] Custom external proof backfill — selected=${backfill.selected || 0}, repaired=${backfill.repaired || 0}, media=${backfill.projectedMedia || 0}, failed=${backfill.failed || 0}`);
+    }
+    if (!current?.skipped && (Number(current?.selected || 0) > 0 || Number(current?.failed || 0) > 0)) {
+      console.log(`[scheduler] Custom external current debt — selected=${current.selected || 0}, repaired=${current.repaired || 0}, cleared=${current.cleared || 0}, failed=${current.failed || 0}`);
+    }
+    return { ok: backfill?.ok !== false && current?.ok !== false, backfill, current };
+  } catch (err) {
+    console.warn("[scheduler] Custom external proof convergence failed:", err?.message || err);
+    return { ok: false, backfill: null, current: null, error: err?.message || String(err) };
+  }
+}
+
+async function runTelegramInboundProjectionSweep({ now = new Date(), db = prisma } = {}) {
   try {
     // Provider observations are ACKed once TelegramInboundEvent is durable. Any derived
     // Custom submission/current-state repair after that boundary is server-owned work and
@@ -514,7 +693,7 @@ async function runTelegramInboundProjectionSweep({ now = new Date() } = {}) {
     const result = await retryPendingInboundProjections({
       now,
       limit: TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,
-      db: prisma,
+      db,
     });
     if (Number(result?.scanned || 0) > 0) {
       console.log(`[scheduler] Telegram inbound projection — scanned=${result.scanned}, applied=${result.applied || 0}, skipped=${result.skipped || 0}, pending=${result.pending || 0}, review=${result.reviewRequired || 0}`);
@@ -528,14 +707,39 @@ async function runTelegramInboundProjectionSweep({ now = new Date() } = {}) {
   }
 }
 
-async function runTelegramConfirmedProjectionSweep({ now = new Date() } = {}) {
+
+async function runTelegramInboundProjectionMaintenanceSweep({ now = new Date(), db = prisma } = {}) {
+  return runMaintenanceLane({
+    db,
+    key: TELEGRAM_INBOUND_MAINTENANCE_LANE_KEY,
+    generation: TELEGRAM_INBOUND_MAINTENANCE_LANE_GENERATION,
+    oneTime: false,
+    leaseMs: 5 * 60 * 1000,
+    minIntervalMs: TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS,
+    fallbackNow: now,
+    work: async () => {
+      const result = await runTelegramInboundProjectionSweep({ now, db });
+      return { ...result, outcome: result?.ok === false ? "INBOUND_PROJECTION_FAILED" : "INBOUND_PROJECTION_BATCH_COMPLETE" };
+    },
+  });
+}
+
+async function runTelegramConfirmedProjectionSweep({ now = new Date(), db = prisma, cursorAgencyId = null, pageSize = 100 } = {}) {
   try {
-    // CONFIRMED Telegram provider receipts are canonical facts. If an older process crashed
-    // after committing the receipt but before projecting CustomOrder / CANCELLATION state, the
-    // repair is backend-owned and must converge even with no Desktop polling. Drain agencies by
-    // cursor instead of hiding historical debt behind a fixed first-N workspace sample.
-    const { scanAllById } = require("./telegram-exact-authority-scan-service");
+    // Current operational debt is already indexed/bounded. This sweep therefore owns only a
+    // bounded page of Agencies per claim; historical Telegram receipts are never rediscovered
+    // here. MaintenanceLaneState carries the Agency cursor across replicas/process restarts.
     const { repairConfirmedTelegramDeliveryProjections, repairCustomModelCommunicationConvergence } = require("./telegram-delivery-authority-service");
+    const size = Math.max(1, Math.min(500, Number(pageSize) || 100));
+    const normalizedCursor = String(cursorAgencyId || "").trim() || null;
+    const agencies = db?.agency?.findMany
+      ? await db.agency.findMany({
+          where: { deletedAt: null, ...(normalizedCursor ? { id: { gt: normalizedCursor } } : {}) },
+          select: { id: true },
+          orderBy: { id: "asc" },
+          take: size,
+        })
+      : [];
     const report = {
       ok: true, agencies: 0, scanned: 0, repaired: 0, failed: 0,
       reminderScheduleScanned: 0, reminderScheduleRepaired: 0, reminderScheduleFailed: 0,
@@ -543,87 +747,148 @@ async function runTelegramConfirmedProjectionSweep({ now = new Date() } = {}) {
       modelCommunicationPrecommitScanned: 0, modelCommunicationPrecommitCancelled: 0, modelCommunicationPrecommitFailed: 0,
       modelCommunicationReminderScanned: 0, modelCommunicationReminderRepaired: 0, modelCommunicationReminderFailed: 0,
       revisionIntentsPlanned: 0,
+      modelCommunicationCurrentBacklog: false,
       agencyFailures: [],
+      cursorAgencyId: normalizedCursor,
+      nextCursorAgencyId: null,
+      complete: false,
     };
-    await scanAllById({
-      delegate: prisma.agency,
-      where: { deletedAt: null },
-      select: { id: true },
-      pageSize: 100,
-      onPage: async (rows) => {
-        for (const agency of rows || []) {
-          report.agencies += 1;
-          const agencyId = String(agency.id);
-          try {
-            const result = await repairConfirmedTelegramDeliveryProjections({ agencyId, now, db: prisma });
-            report.scanned += Number(result?.scanned || 0);
-            report.repaired += Number(result?.repaired || 0);
-            report.failed += Number(result?.failed || 0);
-            report.reminderScheduleScanned += Number(result?.reminderScheduleScanned || 0);
-            report.reminderScheduleRepaired += Number(result?.reminderScheduleRepaired || 0);
-            report.reminderScheduleFailed += Number(result?.reminderScheduleFailed || 0);
-            if (result?.ok === false) report.ok = false;
-          } catch (error) {
-            report.ok = false;
-            report.failed += 1;
-            report.agencyFailures.push({ agencyId, lane: "confirmed_projection", error: String(error?.message || error).slice(0, 1000) });
-          }
+    for (const agency of agencies || []) {
+      report.agencies += 1;
+      const agencyId = String(agency.id);
+      report.nextCursorAgencyId = agencyId;
+      try {
+        const result = await repairConfirmedTelegramDeliveryProjections({ agencyId, now, db });
+        report.scanned += Number(result?.scanned || 0);
+        report.repaired += Number(result?.repaired || 0);
+        report.failed += Number(result?.failed || 0);
+        report.reminderScheduleScanned += Number(result?.reminderScheduleScanned || 0);
+        report.reminderScheduleRepaired += Number(result?.reminderScheduleRepaired || 0);
+        report.reminderScheduleFailed += Number(result?.reminderScheduleFailed || 0);
+        if (result?.ok === false) report.ok = false;
+      } catch (error) {
+        report.ok = false;
+        report.failed += 1;
+        report.agencyFailures.push({ agencyId, lane: "confirmed_projection", error: String(error?.message || error).slice(0, 1000) });
+      }
 
-          try {
-            const modelCommunication = await repairCustomModelCommunicationConvergence({ agencyId, now, db: prisma });
-            report.modelInitialTasksPlanned += Number(modelCommunication?.initialTaskIntentsPlanned || 0);
-            report.modelInitialTasksReactivated += Number(modelCommunication?.initialTaskIntentsReactivated || 0);
-            report.modelInitialTasksBlocked += Number(modelCommunication?.initialTaskIntentsBlocked || 0);
-            report.modelInitialTasksRaced += Number(modelCommunication?.initialTaskIntentsRaced || 0);
-            report.modelInitialTasksFailed += Number(modelCommunication?.initialTaskIntentsFailed || 0);
-            report.modelCommunicationPrecommitScanned += Number(modelCommunication?.precommitScanned || 0);
-            report.modelCommunicationPrecommitCancelled += Number(modelCommunication?.precommitCancelled || 0);
-            report.modelCommunicationPrecommitFailed += Number(modelCommunication?.precommitFailed || 0);
-            report.modelCommunicationReminderScanned += Number(modelCommunication?.reminderScheduleScanned || 0);
-            report.modelCommunicationReminderRepaired += Number(modelCommunication?.reminderScheduleRepaired || 0);
-            report.modelCommunicationReminderFailed += Number(modelCommunication?.reminderScheduleFailed || 0);
-            report.revisionIntentsPlanned += Number(modelCommunication?.revisionIntentsPlanned || 0);
-            if (modelCommunication?.ok === false) report.ok = false;
-          } catch (error) {
-            report.ok = false;
-            report.modelInitialTasksFailed += 1;
-            report.agencyFailures.push({ agencyId, lane: "model_communication", error: String(error?.message || error).slice(0, 1000) });
-          }
-        }
-        return false;
-      },
-    });
+      try {
+        const modelCommunication = await repairCustomModelCommunicationConvergence({ agencyId, now, db });
+        report.modelInitialTasksPlanned += Number(modelCommunication?.initialTaskIntentsPlanned || 0);
+        report.modelInitialTasksReactivated += Number(modelCommunication?.initialTaskIntentsReactivated || 0);
+        report.modelInitialTasksBlocked += Number(modelCommunication?.initialTaskIntentsBlocked || 0);
+        report.modelInitialTasksRaced += Number(modelCommunication?.initialTaskIntentsRaced || 0);
+        report.modelInitialTasksFailed += Number(modelCommunication?.initialTaskIntentsFailed || 0);
+        report.modelCommunicationPrecommitScanned += Number(modelCommunication?.precommitScanned || 0);
+        report.modelCommunicationPrecommitCancelled += Number(modelCommunication?.precommitCancelled || 0);
+        report.modelCommunicationPrecommitFailed += Number(modelCommunication?.precommitFailed || 0);
+        report.modelCommunicationReminderScanned += Number(modelCommunication?.reminderScheduleScanned || 0);
+        report.modelCommunicationReminderRepaired += Number(modelCommunication?.reminderScheduleRepaired || 0);
+        report.modelCommunicationReminderFailed += Number(modelCommunication?.reminderScheduleFailed || 0);
+        report.revisionIntentsPlanned += Number(modelCommunication?.revisionIntentsPlanned || 0);
+        if (modelCommunication?.currentBacklog) report.modelCommunicationCurrentBacklog = true;
+        if (modelCommunication?.ok === false) report.ok = false;
+      } catch (error) {
+        report.ok = false;
+        report.modelInitialTasksFailed += 1;
+        report.agencyFailures.push({ agencyId, lane: "model_communication", error: String(error?.message || error).slice(0, 1000) });
+      }
+    }
+    report.complete = (agencies || []).length < size;
+    if (report.complete) report.nextCursorAgencyId = null;
     if (report.scanned > 0 || report.failed > 0 || report.reminderScheduleScanned > 0 || report.reminderScheduleFailed > 0
       || report.modelInitialTasksPlanned > 0 || report.modelInitialTasksReactivated > 0 || report.modelInitialTasksFailed > 0
       || report.modelCommunicationPrecommitScanned > 0 || report.modelCommunicationReminderScanned > 0 || report.revisionIntentsPlanned > 0) {
-      console.log(`[scheduler] Telegram/custom model convergence — agencies=${report.agencies}, confirmedScanned=${report.scanned}, confirmedRepaired=${report.repaired}, confirmedFailed=${report.failed}, reminderScheduleScanned=${report.reminderScheduleScanned}, reminderScheduleRepaired=${report.reminderScheduleRepaired}, reminderScheduleFailed=${report.reminderScheduleFailed}, initialTaskPlanned=${report.modelInitialTasksPlanned}, initialTaskReactivated=${report.modelInitialTasksReactivated}, initialTaskBlocked=${report.modelInitialTasksBlocked}, initialTaskRaced=${report.modelInitialTasksRaced}, initialTaskFailed=${report.modelInitialTasksFailed}, precommitScanned=${report.modelCommunicationPrecommitScanned}, precommitCancelled=${report.modelCommunicationPrecommitCancelled}, precommitFailed=${report.modelCommunicationPrecommitFailed}, modelReminderScanned=${report.modelCommunicationReminderScanned}, modelReminderRepaired=${report.modelCommunicationReminderRepaired}, modelReminderFailed=${report.modelCommunicationReminderFailed}, revisionIntentsPlanned=${report.revisionIntentsPlanned}, agencyFailures=${report.agencyFailures.length}`);
+      console.log(`[scheduler] Telegram/custom model convergence — agencies=${report.agencies}, confirmedScanned=${report.scanned}, confirmedRepaired=${report.repaired}, confirmedFailed=${report.failed}, reminderScheduleScanned=${report.reminderScheduleScanned}, reminderScheduleRepaired=${report.reminderScheduleRepaired}, reminderScheduleFailed=${report.reminderScheduleFailed}, initialTaskPlanned=${report.modelInitialTasksPlanned}, initialTaskReactivated=${report.modelInitialTasksReactivated}, initialTaskBlocked=${report.modelInitialTasksBlocked}, initialTaskRaced=${report.modelInitialTasksRaced}, initialTaskFailed=${report.modelInitialTasksFailed}, precommitScanned=${report.modelCommunicationPrecommitScanned}, precommitCancelled=${report.modelCommunicationPrecommitCancelled}, precommitFailed=${report.modelCommunicationPrecommitFailed}, modelReminderScanned=${report.modelCommunicationReminderScanned}, modelReminderRepaired=${report.modelCommunicationReminderRepaired}, modelReminderFailed=${report.modelCommunicationReminderFailed}, revisionIntentsPlanned=${report.revisionIntentsPlanned}, agencyFailures=${report.agencyFailures.length}, complete=${report.complete}`);
     }
     return report;
   } catch (err) {
-    // Repair touches only derived state over already-confirmed provider outcomes. Never suppress
-    // the recurring scheduler if one historical row requires explicit operator adjudication.
     console.warn("[scheduler] Telegram confirmed projection failed:", err?.message || err);
-    return { ok: false, agencies: 0, scanned: 0, repaired: 0, failed: 1, error: err?.message || String(err) };
+    return { ok: false, agencies: 0, scanned: 0, repaired: 0, failed: 1, complete: false, error: err?.message || String(err) };
   }
 }
 
-async function maybeBackfillTeamPendingProjection() {
+
+async function runTelegramConfirmedProjectionMaintenanceSweep({ now = new Date(), db = prisma } = {}) {
+  return runMaintenanceLane({
+    db,
+    key: TELEGRAM_CONFIRMED_MAINTENANCE_LANE_KEY,
+    generation: TELEGRAM_CONFIRMED_MAINTENANCE_LANE_GENERATION,
+    oneTime: false,
+    leaseMs: 15 * 60 * 1000,
+    minIntervalMs: RECURRING_INTERVAL_MS,
+    fallbackNow: now,
+    work: async ({ claim }) => {
+      const cursorAgencyId = String(claim?.cursor?.lastAgencyId || "").trim() || null;
+      const result = await runTelegramConfirmedProjectionSweep({ now, db, cursorAgencyId, pageSize: 100 });
+      const retryFast = result?.ok === false || result?.complete === false || result?.modelCommunicationCurrentBacklog === true;
+      return {
+        ...result,
+        cursor: { lastAgencyId: result?.complete ? null : result?.nextCursorAgencyId || cursorAgencyId },
+        nextRunAt: new Date(now.getTime() + (result?.ok === false ? 60_000 : retryFast ? 1_000 : RECURRING_INTERVAL_MS)),
+        outcome: result?.ok === false ? "TELEGRAM_CUSTOM_CONVERGENCE_FAILED" : retryFast ? "TELEGRAM_CUSTOM_CONVERGENCE_BACKLOG_CONTINUES" : "TELEGRAM_CUSTOM_CONVERGENCE_CYCLE_COMPLETE",
+        progress: {
+          lastAgencyId: result?.complete ? null : result?.nextCursorAgencyId || cursorAgencyId,
+          agencies: Number(result?.agencies || 0),
+          scanned: Number(result?.scanned || 0),
+          repaired: Number(result?.repaired || 0),
+          failed: Number(result?.failed || 0),
+        },
+      };
+    },
+  });
+}
+
+async function maybeBackfillTeamPendingProjection({ db = prisma, now = new Date() } = {}) {
   try {
     const { backfillTeamPendingProjectionBatch } = require("./team-pending-projection-service");
-    const result = await backfillTeamPendingProjectionBatch({
-      db: prisma,
-      limit: TEAM_PENDING_BACKFILL_BATCH_SIZE,
+    const result = await runMaintenanceLane({
+      db,
+      key: TEAM_PENDING_PROJECTION_LANE_KEY,
+      generation: TEAM_PENDING_PROJECTION_LANE_GENERATION,
+      oneTime: false,
+      minIntervalMs: RECURRING_INTERVAL_MS,
+      fallbackNow: now,
+      work: async () => {
+        const batch = await backfillTeamPendingProjectionBatch({ db, limit: TEAM_PENDING_BACKFILL_BATCH_SIZE });
+        const selected = Number(batch?.selected || 0);
+        const likelyMore = selected >= TEAM_PENDING_BACKFILL_BATCH_SIZE;
+        return {
+          ...batch,
+          complete: false,
+          outcome: likelyMore ? "PENDING_PROJECTION_BACKLOG_CONTINUES" : selected > 0 ? "PENDING_PROJECTION_REPAIRED" : "PENDING_PROJECTION_IDLE",
+          nextRunAt: new Date(now.getTime() + (likelyMore ? 1_000 : RECURRING_INTERVAL_MS)),
+          progress: { selected, dialogs: Number(batch?.dialogs || 0), projected: Number(batch?.projected || 0) },
+        };
+      },
     });
     if (!result?.skipped && Number(result?.selected || 0) > 0) {
-      console.log(
-        `[scheduler] Team pending projection — projected=${result.projected || 0}/${result.selected || 0}, dialogs=${result.dialogs || 0}`
-      );
+      console.log(`[scheduler] Team pending projection — projected=${result.projected || 0}/${result.selected || 0}, dialogs=${result.dialogs || 0}`);
     }
     return result;
   } catch (err) {
-    // Repair runs only over already-durable Team facts. It must never suppress
-    // creator jobs or runtime automation when the derived queue is unavailable.
     console.warn("[scheduler] Team pending projection backfill failed:", err?.message || err);
+    return { ok: false, error: err?.message || String(err) };
+  }
+}
+
+async function maybeRepairLegacyTeamPendingBootstrap({ db = prisma, now = new Date() } = {}) {
+  try {
+    const { repairStaleLegacyBootstrapPendingBatch } = require("./team-pending-read-service");
+    const result = await runMaintenanceLane({
+      db,
+      key: TEAM_LEGACY_PENDING_REPAIR_LANE_KEY,
+      generation: TEAM_LEGACY_PENDING_REPAIR_LANE_GENERATION,
+      oneTime: true,
+      fallbackNow: now,
+      work: async () => repairStaleLegacyBootstrapPendingBatch({ db, limit: TEAM_PENDING_BACKFILL_BATCH_SIZE, fallbackNow: now }),
+    });
+    if (!result?.skipped && (Number(result?.selected || 0) > 0 || result?.complete)) {
+      console.log(`[scheduler] Team legacy pending repair — cleared=${result.cleared || 0}/${result.selected || 0}, remaining=${result.remaining || 0}, complete=${result.complete === true}`);
+    }
+    return result;
+  } catch (err) {
+    console.warn("[scheduler] Team legacy pending repair failed:", err?.message || err);
     return { ok: false, error: err?.message || String(err) };
   }
 }
@@ -823,6 +1088,38 @@ async function runRecurringCreatorWork({ db = prisma, now = new Date(), pageSize
  * Designed to be cheap: looks at recent JobInstance rows (already indexed
  * by creatorId + jobKey), so even with thousands of creators it stays fast.
  */
+async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) {
+  if (phase2MaintenancePromise) return { ok: true, skipped: true, reason: "local_overlap" };
+  phase2MaintenancePromise = (async () => {
+    const result = { ok: true };
+    // Provider backfill/dirty repair establish the exact current-work projection before
+    // Telegram/custom consumers attempt debt execution in this pump cycle.
+    result.providerOperationalBackfill = await maybeBackfillProviderOperationalDebt({ db, now });
+    result.providerOperationalDirty = await maybeRepairProviderOperationalDirty({ db, now });
+    result.telegramConfirmedProjection = await runTelegramConfirmedProjectionMaintenanceSweep({ now, db });
+
+    const parallel = await Promise.allSettled([
+      runTelegramInboundProjectionMaintenanceSweep({ now, db }),
+      runCustomExternalProofConvergenceSweep({ now, db }),
+      maybeReconcileHistoricalTeamMoney({ db, now }),
+      maybeBackfillTeamPendingProjection({ db, now }),
+      maybeRepairLegacyTeamPendingBootstrap({ db, now }),
+    ]);
+    const names = ["telegramInboundProjection", "customExternalProofConvergence", "teamMoneyBackfill", "teamPendingBackfill", "teamLegacyPendingRepair"];
+    parallel.forEach((entry, index) => {
+      if (entry.status === "fulfilled") result[names[index]] = entry.value;
+      else {
+        result.ok = false;
+        result[names[index]] = { ok: false, error: entry.reason?.message || String(entry.reason) };
+      }
+    });
+    if (result.telegramConfirmedProjection?.ok === false || result.providerOperationalBackfill?.ok === false || result.providerOperationalDirty?.ok === false) result.ok = false;
+    return result;
+  })();
+  try { return await phase2MaintenancePromise; }
+  finally { phase2MaintenancePromise = null; }
+}
+
 async function runRecurringSweepInternal() {
   const startedAt = Date.now();
   const now = new Date();
@@ -882,10 +1179,6 @@ async function runRecurringSweepInternal() {
     console.warn("[scheduler] billing expiry reconciliation failed:", err?.message || err);
     billingExpiry = { ok: false, error: err?.message || String(err) };
   }
-  const telegramConfirmedProjection = await runTelegramConfirmedProjectionSweep({ now });
-  const customExternalProofConvergence = await runCustomExternalProofConvergenceSweep({ now });
-  const teamMoneyBackfill = await maybeReconcileHistoricalTeamMoney();
-  const teamPendingBackfill = await maybeBackfillTeamPendingProjection();
 
   const elapsed = Date.now() - startedAt;
   console.log(
@@ -904,10 +1197,6 @@ async function runRecurringSweepInternal() {
     retention,
     billingRenewals,
     billingExpiry,
-    telegramConfirmedProjection,
-    customExternalProofConvergence,
-    teamMoneyBackfill,
-    teamPendingBackfill,
   };
 }
 
@@ -925,7 +1214,7 @@ async function runRecurringSweep() {
 
 let recurringTimer = null;
 let analyticsDemandTimer = null;
-let telegramInboundProjectionTimer = null;
+let phase2MaintenanceTimer = null;
 
 /**
  * Start the recurring scheduler. Call once at server startup.
@@ -959,18 +1248,15 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   if (runImmediately) setTimeout(analyticsDemandTick, 2 * 1000);
   analyticsDemandTimer = setInterval(analyticsDemandTick, ANALYTICS_DEMAND_INTERVAL_MS);
 
-  const projectionTick = () => {
-    runTelegramInboundProjectionSweep().catch((err) => {
-      console.error("[scheduler] Telegram inbound projection sweep crashed:", err);
-    });
-    runCustomExternalProofConvergenceSweep().catch((err) => {
-      console.error("[scheduler] Custom external proof convergence sweep crashed:", err);
+  const phase2MaintenanceTick = () => {
+    runPhase2MaintenancePump({ db: prisma }).catch((err) => {
+      console.error("[scheduler] Phase2 maintenance pump crashed:", err);
     });
   };
-  if (runImmediately) setTimeout(projectionTick, 5 * 1000);
-  telegramInboundProjectionTimer = setInterval(projectionTick, TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS);
+  if (runImmediately) setTimeout(phase2MaintenanceTick, 5 * 1000);
+  phase2MaintenanceTimer = setInterval(phase2MaintenanceTick, PHASE2_MAINTENANCE_PUMP_INTERVAL_MS);
 
-  console.log(`[scheduler] started (interval=${intervalMs}ms, inboundProjectionInterval=${TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS}ms, immediate=${runImmediately})`);
+  console.log(`[scheduler] started (interval=${intervalMs}ms, phase2MaintenanceInterval=${PHASE2_MAINTENANCE_PUMP_INTERVAL_MS}ms, immediate=${runImmediately})`);
 
   return () => stopRecurringScheduler();
 }
@@ -984,9 +1270,9 @@ function stopRecurringScheduler() {
     clearInterval(analyticsDemandTimer);
     analyticsDemandTimer = null;
   }
-  if (telegramInboundProjectionTimer) {
-    clearInterval(telegramInboundProjectionTimer);
-    telegramInboundProjectionTimer = null;
+  if (phase2MaintenanceTimer) {
+    clearInterval(phase2MaintenanceTimer);
+    phase2MaintenanceTimer = null;
   }
   console.log("[scheduler] stopped");
 }
@@ -1008,9 +1294,16 @@ module.exports = {
   TEAM_MONEY_BACKFILL_BATCH_SIZE,
   TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS,
   TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,
+  PHASE2_MAINTENANCE_PUMP_INTERVAL_MS,
+  runPhase2MaintenancePump,
   runTelegramInboundProjectionSweep,
+  runTelegramInboundProjectionMaintenanceSweep,
   runTelegramConfirmedProjectionSweep,
+  runTelegramConfirmedProjectionMaintenanceSweep,
   runCustomExternalProofConvergenceSweep,
   maybeRunRetentionSweep,
   maybeReconcileHistoricalTeamMoney,
+  maybeRepairLegacyTeamPendingBootstrap,
+  maybeBackfillProviderOperationalDebt,
+  maybeRepairProviderOperationalDirty,
 };

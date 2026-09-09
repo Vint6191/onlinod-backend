@@ -61,8 +61,12 @@ test("TelegramDeliveryIntent convergence never filters impossible null customOrd
   assert.doesNotMatch(model, /customOrderId\s+String\?/);
 
   const repair = functionBlock(delivery, "repairCustomModelCommunicationConvergence", "markTelegramDeliveryProvenNotSent");
-  assert.match(repair, /client\.telegramDeliveryIntent/);
+  const retry = functionBlock(delivery, "repairPrecommitProviderBlockedIntents", "listTelegramDeliveryWork");
+  assert.match(repair, /repairPrecommitProviderBlockedIntents/);
+  assert.match(repair, /ensureAutomaticReminderIntents/);
+  assert.match(retry, /telegramDeliveryIntent\.findMany/);
   assert.doesNotMatch(repair, /customOrderId:\s*\{\s*not:\s*null\s*\}/);
+  assert.doesNotMatch(retry, /customOrderId:\s*\{\s*not:\s*null\s*\}/);
 
   // Do not ban this shape globally: other models, such as CustomContentSubmission,
   // legitimately keep nullable customOrderId and may use a non-null filter.
@@ -77,7 +81,7 @@ test("Telegram/custom convergence isolates one agency failure from later agencie
   const end = scheduler.indexOf("\nasync function ", start + marker.length);
   const block = scheduler.slice(start, end > start ? end : undefined);
   assert.match(block, /agencyFailures/);
-  assert.match(block, /for \(const agency of rows \|\| \[\]\)/);
+  assert.match(block, /for \(const agency of agencies \|\| \[\]\)/);
   assert.match(block, /try\s*\{/);
   assert.match(block, /catch \(error\)/);
   assert.match(block, /agencyFailures\.push/);

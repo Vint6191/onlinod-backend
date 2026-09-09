@@ -3,6 +3,7 @@
 const { scanAllById } = require("./telegram-exact-authority-scan-service");
 const { confirmedTaskBinding, pinnedSubmissionSourceBinding } = require("./custom-revision-provider-binding-authority-service");
 const { isActiveTelegramAccount } = require("./telegram-account-reference-authority-service");
+const { DEBT, requireProviderOperationalBackfillReady } = require("./provider-operational-debt-authority-service");
 
 const PAGE = 200;
 function clean(value, max = 180) { const text=String(value==null?"":value).trim(); return text ? text.slice(0,max) : ""; }
@@ -77,59 +78,73 @@ async function lockCustomOrderRows({ agencyId, orderIds, db }) {
 }
 
 async function candidateCurrentOrderIdsForAccount({ agencyId, accountId, db }) {
-  const ids=new Set();
-  if(!db?.customOrder?.findMany) return [];
+  const ids = new Set();
+  if (!db?.providerOperationalDebt?.findMany) {
+    const error = new Error("Provider operational current-work authority is unavailable");
+    error.code = "PROVIDER_OPERATIONAL_DEBT_STORAGE_UNAVAILABLE";
+    error.status = 503;
+    throw error;
+  }
+  await requireProviderOperationalBackfillReady({ db });
 
-  // Retirement is a CURRENT capability decision.  Page the bounded live PENDING workset first,
-  // then ask whether the retiring account participates in that page.  Never derive the lock set
-  // from the account's entire historical TASK/submission archive.
+  // Retirement is indexed by THIS provider account's current capability debt. Historical
+  // intents/submissions and other providers' PENDING Customs are cold evidence now. Each
+  // candidate order is still exact-revalidated below before it can block retirement.
   await scanAllById({
-    delegate:db.customOrder,
-    where:{agencyId,type:"CONTENT",status:"PENDING"},
-    select:{id:true},
-    pageSize:250,
-    onPage:async(orderRows)=>{
-      const orderIds=(orderRows||[]).map((row)=>String(row.id));
-      if(!orderIds.length) return false;
-
-      if(db?.telegramDeliveryIntent?.findMany) {
-        await scanAllById({
-          delegate:db.telegramDeliveryIntent,
-          where:{agencyId,accountId:String(accountId),customOrderId:{in:orderIds},kind:{in:["TASK","REVISION_REQUEST"]}},
-          select:{id:true,customOrderId:true,kind:true,state:true},
-          pageSize:250,
-          onPage:async(rows)=>{
-            for(const row of rows||[]) {
-              const kind=String(row.kind||""); const state=String(row.state||"");
-              const relevant=(kind==="TASK" && state==="CONFIRMED")
-                || (kind==="REVISION_REQUEST" && ["PLANNED","CLAIMED","FAILED_PRECOMMIT","COMMITTING","RECONCILE_REQUIRED","CONFIRMED"].includes(state));
-              if(relevant && row.customOrderId) ids.add(String(row.customOrderId));
-            }
-            return false;
-          },
-        });
-      }
-
-      if(db?.customContentSubmission?.findMany) {
-        await scanAllById({
-          delegate:db.customContentSubmission,
-          where:{agencyId,telegramSourceAccountId:String(accountId),customOrderId:{in:orderIds}},
-          select:{id:true,customOrderId:true,pipelineDisposition:true,reviewStatus:true},
-          pageSize:250,
-          onPage:async(rows)=>{
-            for(const row of rows||[]) {
-              if(String(row.pipelineDisposition||"ACTIVE")!=="ACTIVE") continue;
-              if(!["WAITING_REVIEW","REVISION_REQUESTED"].includes(String(row.reviewStatus||"WAITING_REVIEW"))) continue;
-              if(row.customOrderId) ids.add(String(row.customOrderId));
-            }
-            return false;
-          },
-        });
+    delegate: db.providerOperationalDebt,
+    where: { agencyId, accountId: String(accountId), debtClass: DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY },
+    select: { id: true, customOrderId: true, objectId: true },
+    pageSize: 250,
+    onPage: async (rows) => {
+      for (const row of rows || []) {
+        const orderId = clean(row.customOrderId || row.objectId);
+        if (orderId) ids.add(orderId);
       }
       return false;
     },
   });
   return [...ids];
+}
+
+
+async function findCustomProviderThreadRetentionBlockerForOrder({ agencyId, accountId, orderId, db }={}) {
+  const target=clean(accountId);
+  const scopedOrderId=clean(orderId);
+  if(!agencyId || !target || !scopedOrderId || !db?.customOrder?.findFirst) return null;
+  await lockCustomOrderRows({agencyId,orderIds:[scopedOrderId],db});
+  const order=await db.customOrder.findFirst({
+    where:{agencyId,id:scopedOrderId,type:"CONTENT",status:"PENDING"},
+    select:{id:true,creatorId:true,type:true,status:true,fanDeliveredAt:true},
+  });
+  if(!order) return null;
+  const submissions=db.customContentSubmission?.findMany ? await db.customContentSubmission.findMany({
+    where:{agencyId,customOrderId:scopedOrderId},
+    select:{id:true,creatorId:true,customOrderId:true,pipelineDisposition:true,reviewStatus:true,telegramSourceAccountId:true,telegramSourceUserId:true,telegramMessageIds:true,receivedAt:true,createdAt:true},
+    orderBy:[{receivedAt:"asc"},{createdAt:"asc"},{id:"asc"}],
+  }) : [];
+  const intents=db.telegramDeliveryIntent?.findMany ? await db.telegramDeliveryIntent.findMany({
+    where:{agencyId,customOrderId:scopedOrderId,kind:{in:["TASK","REVISION_REQUEST"]}},
+    select:{id:true,creatorId:true,customOrderId:true,customSubmissionId:true,kind:true,state:true,accountId:true,remoteMessageId:true,remoteRecipientTelegramUserId:true,remoteSentAt:true,confirmedAt:true,createdAt:true},
+    orderBy:[{createdAt:"asc"},{id:"asc"}],
+  }) : [];
+  const accountIds=new Set([target]);
+  for(const row of intents||[]) if(row.accountId) accountIds.add(String(row.accountId));
+  for(const row of submissions||[]) if(row.telegramSourceAccountId) accountIds.add(String(row.telegramSourceAccountId));
+  const accountById=new Map();
+  const ids=[...accountIds];
+  if(db.agencyTelegramMtprotoAccount?.findMany) {
+    const rows=await db.agencyTelegramMtprotoAccount.findMany({where:{agencyId,id:{in:ids}},select:{id:true,lifecycleState:true}});
+    for(const row of rows||[]) accountById.set(String(row.id),row);
+  } else if(db.agencyTelegramMtprotoAccount?.findFirst) {
+    for(const id of ids) { const row=await db.agencyTelegramMtprotoAccount.findFirst({where:{agencyId,id},select:{id:true,lifecycleState:true}}); if(row) accountById.set(String(row.id),row); }
+  }
+  return classifyProviderThreadRetention({
+    order,
+    submission:currentLatestSubmission(submissions||[]),
+    intents:intents||[],
+    accountById,
+    retiringAccountId:target,
+  });
 }
 
 async function findCustomProviderThreadRetentionBlockers({ agencyId, accountId, db, stopAfterFirst=false }={}) {
@@ -185,4 +200,4 @@ async function findCustomProviderThreadRetentionBlockers({ agencyId, accountId, 
   return blockers;
 }
 
-module.exports={ classifyProviderThreadRetention, findCustomProviderThreadRetentionBlockers, lockCustomOrderRows };
+module.exports={ classifyProviderThreadRetention, findCustomProviderThreadRetentionBlockerForOrder, findCustomProviderThreadRetentionBlockers, lockCustomOrderRows };

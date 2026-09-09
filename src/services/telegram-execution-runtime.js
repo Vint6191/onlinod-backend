@@ -5,7 +5,12 @@ const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/aut
 const { resolveTelegramAccountId } = require("./custom-order-reminders");
 const { assertExecutionAccessFence } = require("./execution-access-fence-service");
 const { activeLifecycleWhere, telegramLifecycleState, isActiveTelegramAccount, isRetiringTelegramAccount } = require("./telegram-account-reference-authority-service");
-const { scanAllById, findPendingModelInstructionAnchors, scanIncompleteTelegramSources, scanActiveFollowupIntents, fetchAccountRowsByIds } = require("./telegram-exact-authority-scan-service");
+const { scanAllById, scanActiveFollowupIntents, fetchAccountRowsByIds } = require("./telegram-exact-authority-scan-service");
+const {
+  DEBT, providerOperationalBackfillReady,
+  listCurrentIncompleteSourceAccountsForCreators,
+  listProviderOperationalAccountsForCreators,
+} = require("./provider-operational-debt-authority-service");
 
 const RUNTIME_LEASE_MS = 90 * 1000;
 const MAX_RUNTIME_CLAIMS = 100;
@@ -78,19 +83,33 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
     mergeRawCandidate({ accountId, anchorCreatorId: String(creator.id), messagingEligible: true, inboundEligible: true });
   }
 
-  // Historical Telegram source work is exact: cursor to exhaustion, never first-N sampling.
-  await scanIncompleteTelegramSources({
-    agencyId,
-    creatorIds,
-    db,
-    onRow: async (row) => {
-      mergeRawCandidate({ accountId: row.telegramSourceAccountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: false });
-      return false;
-    },
+  // Provider-pinned source/thread capability is a CURRENT operational projection. Historical
+  // submissions and confirmed model-instruction receipts are cold evidence after the one-time
+  // backfill. During an incomplete cutover we fail closed instead of silently returning to an
+  // O(history) account-discovery scan.
+  if (!(await providerOperationalBackfillReady({ db }))) {
+    throw fail("TELEGRAM_PROVIDER_OPERATIONAL_BACKFILL_INCOMPLETE", "Telegram provider current-work backfill is not complete", 503);
+  }
+  const currentSources = await listCurrentIncompleteSourceAccountsForCreators({ agencyId, creatorIds, db });
+  for (const row of currentSources) {
+    mergeRawCandidate({ accountId: row.telegramSourceAccountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: false });
+  }
+  const providerDebt = await listProviderOperationalAccountsForCreators({
+    agencyId, creatorIds, db,
+    debtClasses: [DEBT.INCOMPLETE_SOURCE_RELAY, DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY],
   });
+  for (const row of providerDebt) {
+    if (!row.accountId || !row.creatorId) continue;
+    mergeRawCandidate({
+      accountId: row.accountId,
+      anchorCreatorId: String(row.creatorId),
+      messagingEligible: false,
+      inboundEligible: String(row.debtClass) === DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY,
+    });
+  }
 
-  // Follow-up execution only needs current unresolved states. Drain them to exhaustion rather
-  // than letting old row count determine whether a required pinned account is discovered.
+  // Follow-up execution already has an indexed CURRENT-state predicate. Keep it as canonical
+  // current work; it never reconstructs candidates from terminal confirmed/cancelled history.
   await scanActiveFollowupIntents({
     agencyId,
     creatorIds,
@@ -100,13 +119,6 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
       return false;
     },
   });
-
-  // Pending model-instruction discovery starts from CURRENT PENDING orders. Historical terminal
-  // TASK/revision volume therefore cannot hide the one current instruction that still needs inbound capability.
-  const pendingInstructionAnchors = await findPendingModelInstructionAnchors({ agencyId, creatorIds, db });
-  for (const row of pendingInstructionAnchors) {
-    mergeRawCandidate({ accountId: row.accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: true });
-  }
 
   if (!rawCandidates.size) return [];
   const accountRows = await fetchAccountRowsByIds({ agencyId, accountIds: [...rawCandidates.keys()], db });

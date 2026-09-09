@@ -5,6 +5,7 @@ const { z } = require("zod");
 const prisma = require("../prisma");
 const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-capabilities");
 const {
+  buildTeamAnalyticsSnapshot,
   buildTeamOverview,
   buildTeamMembers,
   buildTeamAlerts,
@@ -250,6 +251,15 @@ router.get("/coverage-sessions", async (req, res) => {
   }
 });
 
+router.get("/snapshot", async (req, res) => {
+  try {
+    const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
+    return res.json(await buildTeamAnalyticsSnapshot({ agencyId: viewer.agencyId, rangeKey: req.query.range || "7d", includeMoney: viewer.includeMoney, allowedCreatorIds: viewer.allowedCreatorIds }));
+  } catch (err) {
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "TEAM_ANALYTICS_SNAPSHOT_FAILED", section: err?.section || null, error: err?.message || "Failed" });
+  }
+});
+
 router.get("/overview", async (req, res) => {
   try {
     const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
@@ -262,7 +272,8 @@ router.get("/overview", async (req, res) => {
 router.get("/members", async (req, res) => {
   try {
     const viewer = await requireTeamAnalyticsViewer(req, res); if (!viewer) return;
-    return res.json(await buildTeamMembers({ agencyId: viewer.agencyId, rangeKey: req.query.range || "7d", includeMoney: viewer.includeMoney, allowedCreatorIds: viewer.allowedCreatorIds }));
+    const snapshot = await buildTeamAnalyticsSnapshot({ agencyId: viewer.agencyId, rangeKey: req.query.range || "7d", includeMoney: viewer.includeMoney, allowedCreatorIds: viewer.allowedCreatorIds });
+    return res.json({ ok: true, range: snapshot.range, snapshot: snapshot.snapshot, members: snapshot.members, source: snapshot.snapshot?.source || "team_analytics_read_authority_v1", projection: snapshot.projection, responseSummary: snapshot.responseSummary, pendingSummary: snapshot.pendingSummary, moneyVisible: snapshot.moneyVisible });
   } catch (err) {
     return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "TEAM_ANALYTICS_MEMBERS_FAILED", section: err?.section || null, error: err?.message || "Failed" });
   }

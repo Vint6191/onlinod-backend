@@ -995,7 +995,7 @@ async function lockLegacyMoneyMigrationTable(tx) {
   }
 }
 
-async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, retentionDays = TIP_LEDGER_RETENTION_DAYS, dryRun = false, deleteLegacy = true, now = new Date() } = {}) {
+async function migrateLegacyTipsToTipLedger({ db = prisma, agencyId = null, limit = 1000, retentionDays = TIP_LEDGER_RETENTION_DAYS, dryRun = false, deleteLegacy = true, now = new Date() } = {}) {
   const cleanAgency = clean(agencyId, 160);
   const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
   const safeRetentionDays = Math.max(1, int(retentionDays, TIP_LEDGER_RETENTION_DAYS));
@@ -1004,7 +1004,7 @@ async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, ret
   const cutoff = new Date(authorityNow.getTime() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
   try {
-    return await prisma.$transaction(async (tx) => {
+    return await db.$transaction(async (tx) => {
       await lockLegacyMoneyMigrationTable(tx);
       // Audit15 Closure3: the legacy row and any existing canonical TeamTip row
       // are both locked before precedence is decided. A committed legacy MANUAL
@@ -1284,11 +1284,11 @@ async function selectMigratedTipRowsForManualRepair(tx, { agencyId, limit }) {
   `, safeLimit);
 }
 
-async function repairMigratedLegacyTipManualAuthority({ agencyId = null, limit = 1000, dryRun = false } = {}) {
+async function repairMigratedLegacyTipManualAuthority({ db = prisma, agencyId = null, limit = 1000, dryRun = false } = {}) {
   const cleanAgency = clean(agencyId, 160);
   const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
   try {
-    return await prisma.$transaction(async (tx) => {
+    return await db.$transaction(async (tx) => {
       const rows = await selectMigratedTipRowsForManualRepair(tx, { agencyId: cleanAgency, limit: safeLimit });
       let repaired = 0;
       let alreadyManual = 0;

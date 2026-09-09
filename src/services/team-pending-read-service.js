@@ -1,6 +1,8 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { runDbTransaction } = require("./db-transaction-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const LEGACY_BOOTSTRAP_SOURCE = "crm_pending_bootstrap_v1";
 const LEGACY_BOOTSTRAP_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -31,45 +33,70 @@ function pairKey(creatorId, fanId) {
   return `${clean(creatorId, 160) || ""}\u0000${clean(fanId, 160) || ""}`;
 }
 
-async function repairStaleLegacyBootstrapPending({ agencyId, allowedCreatorIds = null, now = new Date(), db = prisma } = {}) {
-  if (!db.teamPendingDialogState?.findMany || !db.teamPendingDialogState?.updateMany || !db.teamActivityEvent?.findMany) {
-    return { scanned: 0, cleared: 0 };
+async function repairStaleLegacyBootstrapPendingBatch({ db = prisma, limit = 500, fallbackNow = new Date() } = {}) {
+  if (typeof db?.$transaction !== "function" || typeof db?.$queryRawUnsafe !== "function") {
+    return { skipped: true, reason: "postgres_maintenance_client_required", selected: 0, cleared: 0, complete: false };
   }
-  const nowDate = now instanceof Date ? now : new Date(now || Date.now());
-  const cutoff = new Date(nowDate.getTime() - LEGACY_BOOTSTRAP_MAX_AGE_MS);
-  const candidates = await db.teamPendingDialogState.findMany({
-    where: {
-      agencyId,
-      status: "PENDING",
-      lastIncomingAt: { lte: cutoff },
-      ...creatorScopeWhere(allowedCreatorIds),
-    },
-    select: { id: true, lastIncomingEventId: true, lastIncomingAt: true },
-    orderBy: [{ lastIncomingAt: "asc" }, { id: "asc" }],
-    take: 1000,
-  });
-  const eventIds = Array.from(new Set((candidates || []).map((row) => clean(row?.lastIncomingEventId, 220)).filter(Boolean)));
-  if (!eventIds.length) return { scanned: (candidates || []).length, cleared: 0 };
-  const events = await db.teamActivityEvent.findMany({
-    where: { agencyId, id: { in: eventIds } },
-    select: { id: true, ts: true, extra: true },
-  });
-  const byId = new Map((events || []).map((event) => [event.id, event]));
-  const staleIds = [];
-  for (const row of candidates || []) {
-    const eventId = clean(row?.lastIncomingEventId, 220);
-    const event = eventId ? byId.get(eventId) : null;
-    if (!event || extraSourceDetail(event) !== LEGACY_BOOTSTRAP_SOURCE) continue;
-    const eventAt = new Date(event.ts || row?.lastIncomingAt || 0);
-    if (!Number.isFinite(eventAt.getTime()) || eventAt > cutoff) continue;
-    staleIds.push(row.id);
-  }
-  if (!staleIds.length) return { scanned: (candidates || []).length, cleared: 0 };
-  const result = await db.teamPendingDialogState.updateMany({
-    where: { agencyId, id: { in: staleIds }, status: "PENDING" },
-    data: { status: "CLEAR", derivationVersion: "team_pending_v1_legacy_bootstrap_repaired" },
-  });
-  return { scanned: (candidates || []).length, cleared: Number(result?.count || staleIds.length) };
+  const safeLimit = Math.max(1, Math.min(5000, Number(limit) || 500));
+  return runDbTransaction(db, async (tx) => {
+    if (typeof tx?.$queryRawUnsafe !== "function") {
+      return { skipped: true, reason: "postgres_maintenance_client_required", selected: 0, cleared: 0, complete: false };
+    }
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const cutoff = new Date(authorityNow.getTime() - LEGACY_BOOTSTRAP_MAX_AGE_MS);
+    const rows = await tx.$queryRawUnsafe(`
+      SELECT p."id"
+      FROM "TeamPendingDialogState" p
+      JOIN "TeamActivityEvent" e
+        ON e."id" = p."lastIncomingEventId"
+       AND e."agencyId" = p."agencyId"
+      WHERE p."status" = 'PENDING'
+        AND p."lastIncomingAt" <= $1
+        AND (e."extra"->>'sourceDetail') = $2
+      ORDER BY p."lastIncomingAt" ASC, p."id" ASC
+      LIMIT $3
+      FOR UPDATE OF p SKIP LOCKED
+    `, cutoff, LEGACY_BOOTSTRAP_SOURCE, safeLimit);
+    const ids = (rows || []).map((row) => clean(row?.id, 220)).filter(Boolean);
+    let cleared = 0;
+    if (ids.length) {
+      const updated = await tx.teamPendingDialogState.updateMany({
+        where: { id: { in: ids }, status: "PENDING" },
+        data: { status: "CLEAR", derivationVersion: "team_pending_v1_legacy_bootstrap_repaired" },
+      });
+      cleared = Number(updated?.count || ids.length);
+    }
+
+    // Completion is durable only when no legacy bootstrap source remains. If a
+    // recent legacy row still exists, park the lane until that exact row reaches
+    // the 30-day repair boundary instead of rescanning history every hour.
+    const remaining = await tx.$queryRawUnsafe(`
+      SELECT MIN(p."lastIncomingAt") AS "oldestPendingAt", COUNT(*)::bigint AS "remainingCount"
+      FROM "TeamPendingDialogState" p
+      JOIN "TeamActivityEvent" e
+        ON e."id" = p."lastIncomingEventId"
+       AND e."agencyId" = p."agencyId"
+      WHERE p."status" = 'PENDING'
+        AND (e."extra"->>'sourceDetail') = $1
+    `, LEGACY_BOOTSTRAP_SOURCE);
+    const summary = Array.isArray(remaining) ? remaining[0] : remaining;
+    const remainingCount = Number(summary?.remainingCount || summary?.remainingcount || 0);
+    const oldestPendingAt = summary?.oldestPendingAt || summary?.oldestpendingat;
+    const oldest = oldestPendingAt ? new Date(oldestPendingAt) : null;
+    const nextRunAt = remainingCount > 0 && oldest && Number.isFinite(oldest.getTime()) && oldest > cutoff
+      ? new Date(oldest.getTime() + LEGACY_BOOTSTRAP_MAX_AGE_MS)
+      : null;
+    return {
+      skipped: false,
+      selected: ids.length,
+      cleared,
+      remaining: remainingCount,
+      complete: remainingCount === 0,
+      nextRunAt,
+      outcome: remainingCount === 0 ? "LEGACY_PENDING_REPAIR_COMPLETE" : "LEGACY_PENDING_REPAIR_BATCH",
+      progress: { selected: ids.length, cleared, remaining: remainingCount },
+    };
+  }, { timeout: 30_000 });
 }
 
 async function pendingIdentityMaps({ agencyId, rows, db = prisma }) {
@@ -275,7 +302,6 @@ async function listTeamPendingDialogs({
     ...(normalizedMemberId ? { ownerMemberId: normalizedMemberId } : {}),
     ...(!normalizedMemberId && normalizedOwnership === "unassigned" ? { ownerMemberId: null } : {}),
   };
-  await repairStaleLegacyBootstrapPending({ agencyId, allowedCreatorIds, now, db });
   const rows = await db.teamPendingDialogState.findMany({
     where,
     orderBy: [{ firstIncomingAt: "asc" }, { id: "asc" }],
@@ -344,6 +370,6 @@ module.exports = {
   summarizePendingRows,
   summarizePendingWhere,
   listTeamPendingDialogs,
-  repairStaleLegacyBootstrapPending,
+  repairStaleLegacyBootstrapPendingBatch,
   pendingIdentityMaps,
 };

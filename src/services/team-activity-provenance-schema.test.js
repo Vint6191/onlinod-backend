@@ -138,9 +138,10 @@ test("Team analytics reads are capability-gated and money visibility is independ
   assert.ok(route.includes('TEAM_CAPABILITIES.VIEW_ANALYTICS'));
   assert.ok(route.includes('TEAM_CAPABILITIES.VIEW_ATTRIBUTION'));
   assert.ok(route.includes('TEAM_ANALYTICS_VIEW_REQUIRED'));
-  for (const builder of ["buildTeamOverview", "buildTeamMembers", "buildTeamAlerts", "buildTeamFlags"]) {
+  for (const builder of ["buildTeamAnalyticsSnapshot", "buildTeamOverview", "buildTeamAlerts", "buildTeamFlags"]) {
     assert.match(route, new RegExp(`${builder}\\(\\{[^}]*includeMoney`, "s"));
   }
+  assert.match(route, /router\.get\("\/members"[\s\S]*buildTeamAnalyticsSnapshot\(\{[^}]*includeMoney/s);
   assert.match(analytics, /if \(!includeMoney\) \{[\s\S]*metrics\.revenueAttributedCents = null/);
   assert.match(analytics, /overview\.revenueAttributedCents = null/);
 });

@@ -11,6 +11,7 @@ const {
   assertTelegramInboundRuntimeLease,
   releaseTelegramExecutionRuntime,
 } = require("./telegram-execution-runtime");
+const { PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY, PROVIDER_OPERATIONAL_BACKFILL_GENERATION, DEBT } = require("./provider-operational-debt-authority-service");
 
 function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [], creators: creatorSeed = null, accounts: accountSeed = null } = {}) {
   const creators = creatorSeed || [
@@ -22,6 +23,18 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
     { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null, runtimeLeaseUserId: null, runtimeLeaseMemberId: null, runtimeLeaseAccessEpoch: null, runtimeLeaseCreatorId: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0, runtimeClaimInboundEligible: false },
     { id: "tg-2", agencyId: "agency-1", lifecycleState: "ACTIVE", retirementDrainCompletedAt: null, runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null, runtimeLeaseUserId: null, runtimeLeaseMemberId: null, runtimeLeaseAccessEpoch: null, runtimeLeaseCreatorId: null, runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0, runtimeClaimInboundEligible: false },
   ];
+  const providerOperationalDebts = [];
+  for (const order of customOrders) {
+    if (String(order.status || "").toUpperCase() !== "PENDING") continue;
+    const anchors = deliveryIntents.filter((row) => row.customOrderId === order.id && row.state === "CONFIRMED" && ["TASK", "REVISION_REQUEST"].includes(row.kind));
+    for (const row of anchors) {
+      providerOperationalDebts.push({
+        id: `pod-${order.id}-${row.accountId}`, agencyId: "agency-1", accountId: row.accountId, creatorId: order.creatorId,
+        debtClass: DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY, objectType: "CustomOrder", objectId: order.id, customOrderId: order.id,
+        sourceVersion: "provider_operational_debt_v1", updatedAt: new Date("2026-09-09T20:00:00.000Z"),
+      });
+    }
+  }
   const matchCreator = (row, where = {}) => {
     if (where.id && typeof where.id === "string" && row.id !== where.id) return false;
     if (where.id?.in && !where.id.in.includes(row.id)) return false;
@@ -85,6 +98,7 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
           if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
           if (typeof where.customOrderId === "string" && row.customOrderId !== where.customOrderId) return false;
           if (where.reviewStatus && String(row.reviewStatus || "WAITING_REVIEW") !== String(where.reviewStatus)) return false;
+          if (where.pipelineDisposition && String(row.pipelineDisposition || "ACTIVE") !== String(where.pipelineDisposition)) return false;
           if (where.telegramSourceAccountId?.not === null && row.telegramSourceAccountId == null) return false;
           if (where.telegramSourceUserId?.not === null && row.telegramSourceUserId == null) return false;
           return true;
@@ -112,6 +126,23 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
         }).slice(0, take).map((row) => ({ ...row }));
       },
       async findFirst({ where }) { return (await this.findMany({ where, take: 1 }))[0] || null; },
+    },
+    providerOperationalDebt: {
+      async findMany({ where = {}, take = 1000 }) {
+        return providerOperationalDebts.filter((row) => {
+          if (where.agencyId && row.agencyId !== where.agencyId) return false;
+          if (where.creatorId?.in && !where.creatorId.in.includes(row.creatorId)) return false;
+          if (where.debtClass?.in && !where.debtClass.in.includes(row.debtClass)) return false;
+          return true;
+        }).slice(0, take).map((row) => ({ ...row }));
+      },
+    },
+    maintenanceLaneState: {
+      async findUnique({ where }) {
+        return where.key === PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY
+          ? { key: where.key, generation: PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") }
+          : null;
+      },
     },
     agencyTelegramMtprotoAccount: {
       async findMany({ where }) { return accounts.filter((row) => matchAccount(row, where)).map((row) => ({ ...row })); },

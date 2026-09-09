@@ -625,6 +625,9 @@ model CustomOrder {
   reminderLeaseUserId         String?
   reminderLeaseMemberId       String?
   reminderLeaseAccessEpoch    Int?
+  providerOperationalDirty    Boolean                   @default(true)
+  providerOperationalProjectedAt DateTime?
+  providerOperationalProjectionVersion String?
   createdAt                   DateTime                  @default(now())
   updatedAt                   DateTime                  @updatedAt
 
@@ -644,7 +647,31 @@ model CustomOrder {
   @@index([agencyId, type, status, physicalStatusChangedAt])
   @@index([agencyId, creatorId, dialogId, createdAt])
   @@index([agencyId, creatorId, telegramTaskMessageId])
+  @@index([agencyId, providerOperationalDirty, status, id], map: "CustomOrder_provider_operational_work_idx")
   @@index([creatorId, dialogId, status])
+}
+
+model ProviderOperationalDebt {
+  id                 String   @id
+  agencyId           String
+  accountId          String
+  creatorId          String?
+  debtClass          String
+  objectType         String
+  objectId           String
+  customOrderId      String?
+  customSubmissionId String?
+  intentId           String?
+  reason             String?
+  sourceVersion      String
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([agencyId, accountId, debtClass, objectType, objectId], map: "ProviderOperationalDebt_identity_key")
+  @@index([agencyId, accountId, debtClass, updatedAt], map: "ProviderOperationalDebt_account_work_idx")
+  @@index([agencyId, creatorId, debtClass, updatedAt], map: "ProviderOperationalDebt_creator_work_idx")
+  @@index([agencyId, customOrderId, updatedAt], map: "ProviderOperationalDebt_order_idx")
+  @@index([agencyId, customSubmissionId, updatedAt], map: "ProviderOperationalDebt_submission_idx")
 }
 
 model CustomContentSubmission {
@@ -864,6 +891,7 @@ model TelegramInboundEvent {
   @@index([agencyId, accountId, replyToMessageId])
   @@index([agencyId, projectionState, observedAt])
   @@index([agencyId, projectionState, updatedAt])
+  @@index([agencyId, accountId, projectionState, updatedAt], map: "TelegramInboundEvent_account_projection_idx")
   @@index([submissionId])
 }
 
@@ -2113,6 +2141,25 @@ model AnalyticsScanProof {
   @@index([createdAt, id], map: "AnalyticsScanProof_createdAt_id_idx")
 }
 
+model MaintenanceLaneState {
+  key         String    @id
+  generation  String
+  ownerToken  String?
+  leaseUntil  DateTime?
+  nextRunAt   DateTime?
+  completedAt DateTime?
+  cursor      Json?
+  progress    Json?
+  lastRunAt   DateTime?
+  lastOutcome String?
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([leaseUntil], map: "MaintenanceLaneState_leaseUntil_idx")
+  @@index([nextRunAt, completedAt], map: "MaintenanceLaneState_due_idx")
+}
+
 model RetentionSweepLease {
   key         String   @id
   ownerToken  String
@@ -3008,6 +3055,7 @@ model TeamActivityEvent {
   @@index([agencyId, correlationId])
   @@index([agencyId, coverageId, ts])
   @@index([agencyId, pendingProjectionVersion, ts])
+  @@index([pendingProjectionVersion, ts, id], map: "TeamActivityEvent_pending_projection_work_idx")
   @@index([agencyId, historicalProjectionVersion, ts])
   @@index([agencyId, automationDeliveryId])
   @@index([agencyId, broadcastDispatchId])
@@ -4988,6 +5036,7 @@ model TeamDialogSession {
 
   @@unique([agencyId, sessionId])
   @@index([agencyId, memberId, startedAt])
+  @@index([agencyId, startedAt], map: "TeamDialogSession_agency_startedAt_idx")
   @@index([agencyId, creatorId, dialogId, startedAt])
   @@index([agencyId, memberId, creatorId, dialogId, startedAt])
 }
@@ -5026,6 +5075,7 @@ model TeamResponseCase {
 
   @@unique([agencyId, replyMessageId])
   @@index([agencyId, memberId, replyAt])
+  @@index([agencyId, replyAt], map: "TeamResponseCase_agency_replyAt_idx")
   @@index([agencyId, creatorId, dialogId, replyAt])
   @@index([agencyId, classification, replyAt])
   @@index([agencyId, slaEligible, replyAt])

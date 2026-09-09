@@ -12,7 +12,7 @@ function dbFor(currentMember) {
         ? { ...currentMember, permissions: { ...(currentMember.permissions || {}) } } : null,
     },
     async $queryRawUnsafe(sql) {
-      if (/FROM "Agency"[\s\S]*FOR SHARE/.test(sql)) { locks.push("AGENCY"); return [{ id: currentMember.agencyId, deletedAt: null, status: "ACTIVE" }]; }
+      if (/FROM "Agency"/.test(sql)) { locks.push("AGENCY"); return [{ id: currentMember.agencyId, deletedAt: null, status: "ACTIVE" }]; }
       assert.match(sql, /AgencyMember[\s\S]*FOR SHARE/);
       locks.push("MEMBER");
       return [{ id: currentMember.id }];

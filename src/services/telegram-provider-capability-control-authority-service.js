@@ -1,7 +1,18 @@
 "use strict";
 
-const { findCancelledModelInstructionFollowupDebt, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
-const { findCustomProviderThreadRetentionBlockers } = require("./custom-provider-thread-retention-authority-service");
+const { findCustomProviderThreadRetentionBlockerForOrder } = require("./custom-provider-thread-retention-authority-service");
+const { deriveCustomCancellationInstruction } = require("./custom-cancellation-instruction-authority-service");
+const {
+  DEBT,
+  requireProviderOperationalBackfillReady,
+  dirtyOrderIdsForAccount,
+  reconcileProviderOperationalDebtForOrder,
+  findStandaloneIncompleteSource,
+  listProviderOperationalDebtForAccount,
+} = require("./provider-operational-debt-authority-service");
+
+const MAX_SYNC_DIRTY_RECONCILE = 100;
+const MAX_DEBT_REVALIDATION = 200;
 
 function clean(value, max = 180) {
   const text = String(value == null ? "" : value).trim();
@@ -17,6 +28,13 @@ function blockerError(blocker) {
   return error;
 }
 
+function maintenancePendingError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = 503;
+  return error;
+}
+
 async function findHardPinnedIntentBlocker({ agencyId, accountId, db }) {
   if (!db?.telegramDeliveryIntent?.findFirst) return null;
   const row = await db.telegramDeliveryIntent.findFirst({
@@ -24,11 +42,7 @@ async function findHardPinnedIntentBlocker({ agencyId, accountId, db }) {
       agencyId,
       accountId: String(accountId),
       OR: [
-        // External effect may already have started. Provider identity is immutable evidence.
         { state: { in: ["COMMITTING", "RECONCILE_REQUIRED"] } },
-        // Cancellation delivery is a follow-up to a model instruction on an exact provider
-        // thread. Unlike TASK/REFERENCE/REVISION/REMINDER precommit work, current cancellation
-        // planning has no alternate-thread rebinding contract after the source account retires.
         { kind: "CANCELLATION", state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, commitStartedAt: null },
       ],
     },
@@ -47,46 +61,127 @@ async function findHardPinnedIntentBlocker({ agencyId, accountId, db }) {
   };
 }
 
+async function reconcileAccountDirtyWork({ agencyId, accountId, db }) {
+  const ids = await dirtyOrderIdsForAccount({ agencyId, accountId, db, limit: MAX_SYNC_DIRTY_RECONCILE + 1 });
+  const bounded = ids.slice(0, MAX_SYNC_DIRTY_RECONCILE);
+  for (const orderId of bounded) {
+    // Retirement needs current provider locators immediately, but must not consume the
+    // recurring dirty marker that also asks maintenance to repair derived reminder state.
+    await reconcileProviderOperationalDebtForOrder({ agencyId, orderId, db, markClean: false });
+  }
+  if (ids.length > MAX_SYNC_DIRTY_RECONCILE) {
+    throw maintenancePendingError(
+      "PROVIDER_OPERATIONAL_DEBT_RECONCILE_PENDING",
+      "Provider current-work reconciliation is still draining; retry account retirement after maintenance catches up",
+    );
+  }
+}
+
+async function exactCancellationFollowupBlocker({ agencyId, accountId, orderId, db }) {
+  const order = await db?.customOrder?.findFirst?.({ where: { agencyId, id: String(orderId), status: "CANCELLED" } });
+  if (!order || order.telegramCancellationWaivedAt) return null;
+  const decision = await deriveCustomCancellationInstruction({ agencyId, order, db });
+  const instruction = decision?.instruction || null;
+  const anchorAccountId = decision?.anchor?.accountId || instruction?.accountId || null;
+  if (!instruction || String(anchorAccountId || "") !== String(accountId)) return null;
+  if (String(decision.state || "") === "REVISION_OUTCOME_UNRESOLVED") {
+    return {
+      class: "CANCELLATION_FOLLOWUP_DEBT",
+      reason: "REVISION_PROVIDER_OUTCOME_UNRESOLVED",
+      orderId: String(order.id), intentId: String(instruction.id), state: String(instruction.state || ""),
+      message: "Telegram connection still owns an unresolved model instruction required by cancellation follow-up",
+    };
+  }
+  const cancellation = await db.telegramDeliveryIntent?.findFirst?.({
+    where: {
+      agencyId, customOrderId: String(order.id), creatorId: String(order.creatorId), accountId: String(accountId), kind: "CANCELLATION",
+      state: { in: ["PLANNED", "CLAIMED", "COMMITTING", "RECONCILE_REQUIRED", "FAILED_PRECOMMIT", "CONFIRMED"] },
+    },
+    select: { id: true },
+  });
+  if (cancellation) return null;
+  return {
+    class: "CANCELLATION_FOLLOWUP_DEBT",
+    reason: "CANCELLATION_FOLLOWUP_REQUIRED",
+    orderId: String(order.id), intentId: String(instruction.id),
+    message: "Telegram connection still owns a confirmed model instruction whose cancellation follow-up has not been durably planned or confirmed",
+  };
+}
+
+async function exactIncompleteSourceBlocker({ agencyId, accountId, submissionId, db }) {
+  const row = await db?.customContentSubmission?.findFirst?.({ where: { agencyId, id: String(submissionId), telegramSourceAccountId: String(accountId) } });
+  if (!row || String(row.pipelineDisposition || "ACTIVE").toUpperCase() !== "ACTIVE") return null;
+  const sourceCount = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds.length : 0;
+  const mediaCount = Array.isArray(row.ofMediaIds) ? row.ofMediaIds.length : 0;
+  if (!sourceCount || mediaCount >= sourceCount) return null;
+  return {
+    class: "INBOUND_SOURCE_DEBT",
+    reason: "INCOMPLETE_CUSTOM_SOURCE_MEDIA",
+    submissionId: String(row.id),
+    message: "Telegram connection is still required by pending Custom source media",
+  };
+}
+
+async function revalidateDebtRow({ agencyId, accountId, row, db }) {
+  switch (String(row?.debtClass || "")) {
+    case DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY: {
+      const blocker = await findCustomProviderThreadRetentionBlockerForOrder({ agencyId, accountId, orderId: row.customOrderId || row.objectId, db });
+      return blocker ? {
+        class: "CURRENT_PROVIDER_CAPABILITY",
+        reason: blocker.reason || "CURRENT_PROVIDER_CAPABILITY",
+        ...blocker,
+        message: "Telegram connection is still required by an active Custom provider-thread capability",
+      } : null;
+    }
+    case DEBT.CANCELLATION_FOLLOWUP_DEBT:
+      return exactCancellationFollowupBlocker({ agencyId, accountId, orderId: row.customOrderId || row.objectId, db });
+    case DEBT.INCOMPLETE_SOURCE_RELAY:
+      return exactIncompleteSourceBlocker({ agencyId, accountId, submissionId: row.customSubmissionId || row.objectId, db });
+    default:
+      // CONFIRMED projection repair and provider-binding retry are executable maintenance,
+      // but they do not require keeping the MTProto account alive once canonical provider
+      // receipt/current binding can be revalidated independently.
+      return null;
+  }
+}
+
 async function findTelegramProviderCapabilityBlocker({ agencyId, accountId, db }) {
   const target = clean(accountId);
   if (!agencyId || !target || !db) return null;
 
+  // Hard commit-boundary states are already an indexed current canonical query. Keep this
+  // direct check before the derived workset so an unresolved external effect never depends on
+  // projection freshness.
   const hardIntent = await findHardPinnedIntentBlocker({ agencyId, accountId: target, db });
   if (hardIntent) return hardIntent;
 
-  const providerRetention = await findCustomProviderThreadRetentionBlockers({ agencyId, accountId: target, db, stopAfterFirst: true });
-  if (providerRetention.length) {
-    return {
-      class: "CURRENT_PROVIDER_CAPABILITY",
-      reason: providerRetention[0]?.reason || "CURRENT_PROVIDER_CAPABILITY",
-      ...providerRetention[0],
-      message: "Telegram connection is still required by an active Custom provider-thread capability",
-    };
+  if (!db.providerOperationalDebt || !db.maintenanceLaneState) {
+    throw maintenancePendingError("PROVIDER_OPERATIONAL_DEBT_STORAGE_UNAVAILABLE", "Provider operational current-work authority is unavailable");
   }
+  await requireProviderOperationalBackfillReady({ db });
+  await reconcileAccountDirtyWork({ agencyId, accountId: target, db });
 
-  const cancelledFollowupDebt = await findCancelledModelInstructionFollowupDebt({ agencyId, accountId: target, db, stopAfterFirst: true });
-  if (cancelledFollowupDebt.length) {
-    return {
-      class: "CANCELLATION_FOLLOWUP_DEBT",
-      reason: cancelledFollowupDebt[0]?.reason || "CANCELLATION_FOLLOWUP_DEBT",
-      debt: cancelledFollowupDebt[0],
-      message: "Telegram connection still owns a confirmed model instruction whose cancellation follow-up has not been durably planned or confirmed",
-    };
-  }
-
-  let pendingSource = null;
-  await scanIncompleteTelegramSources({
-    agencyId,
-    accountId: target,
-    requireSourceUser: false,
-    db,
-    onRow: async (row) => { pendingSource = row; return true; },
+  const debtRows = await listProviderOperationalDebtForAccount({
+    agencyId, accountId: target, db, limit: MAX_DEBT_REVALIDATION + 1,
+    debtClasses: [DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY, DEBT.CANCELLATION_FOLLOWUP_DEBT, DEBT.INCOMPLETE_SOURCE_RELAY],
   });
+  for (const row of debtRows.slice(0, MAX_DEBT_REVALIDATION)) {
+    const blocker = await revalidateDebtRow({ agencyId, accountId: target, row, db });
+    if (blocker) return blocker;
+  }
+  if (debtRows.length > MAX_DEBT_REVALIDATION) {
+    throw maintenancePendingError("PROVIDER_OPERATIONAL_DEBT_REVALIDATION_PENDING", "Provider current-work revalidation is still draining; retry account retirement");
+  }
+
+  // Standalone submissions are legal before assignment and therefore have no CustomOrder dirty
+  // locator. This is still a bounded CURRENT-state query (ACTIVE + exact account + array debt),
+  // not a cursor walk over completed submission history.
+  const pendingSource = await findStandaloneIncompleteSource({ agencyId, accountId: target, db });
   if (pendingSource) {
     return {
       class: "INBOUND_SOURCE_DEBT",
       reason: "INCOMPLETE_CUSTOM_SOURCE_MEDIA",
-      submissionId: pendingSource?.id ? String(pendingSource.id) : null,
+      submissionId: String(pendingSource.id),
       message: "Telegram connection is still required by pending Custom source media",
     };
   }
@@ -106,7 +201,6 @@ async function findTelegramProviderCapabilityBlocker({ agencyId, accountId, db }
       };
     }
   }
-
   return null;
 }
 

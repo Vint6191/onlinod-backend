@@ -292,7 +292,7 @@ function emptyMetric() {
 }
 
 function cleanMetric(metric) {
-  const responseSamples = metric._responseSeconds.length;
+  const accumulatedResponseSamples = metric._responseSeconds.length;
   const dialogSessions = Array.from(metric._dialogSessions.values())
     .sort((a, b) => b.dwellSeconds - a.dwellSeconds)
     .slice(0, 10);
@@ -301,23 +301,32 @@ function cleanMetric(metric) {
   // totalMessages remains a compatibility volume field. Efficiency metrics use
   // only confirmed human/manual messages and never mass/broadcast deliveries.
   metric.totalMessages = metric.messagesSent + metric.massMessages;
-  metric.uniqueFans = metric._fans.size;
-  metric.creatorCoverage = metric._creators.size;
-  metric.contentCreatorCoverage = metric._contentCreators.size;
-  metric.contentActiveDays = metric._contentDays.size;
+  // Legacy materialization populates Set/array accumulators. The production
+  // scale read authority writes already-aggregated SQL values directly. Never
+  // erase a SQL aggregate merely because its legacy accumulator is empty.
+  metric.uniqueFans = Math.max(Math.max(0, num(metric.uniqueFans, 0)), metric._fans.size);
+  metric.creatorCoverage = Math.max(Math.max(0, num(metric.creatorCoverage, 0)), metric._creators.size);
+  metric.contentCreatorCoverage = Math.max(Math.max(0, num(metric.contentCreatorCoverage, 0)), metric._contentCreators.size);
+  metric.contentActiveDays = Math.max(Math.max(0, num(metric.contentActiveDays, 0)), metric._contentDays.size);
   metric.activeEvents = metric.messagesSent + metric.massMessages + metric.incomingMessages + metric.dialogSessionsCount + metric.backlogCleared + metric.ppvSentMessages + metric.ppvSoldMessages + metric.contentActions;
   metric.dialogDwellMinutes = Math.round(metric.dialogDwellSeconds / 60);
   metric.avgDialogDwellSeconds = metric.dialogSessionsCount > 0 ? metric.dialogDwellSeconds / metric.dialogSessionsCount : null;
-  metric.avgResponseSeconds = mean(metric._responseSeconds);
-  metric.medianResponseSeconds = median(metric._responseSeconds);
-  metric.p90ResponseSeconds = percentile(metric._responseSeconds, 90);
-  metric.responseSamples = responseSamples;
-  metric.coverageResponseAvgSeconds = mean(metric._coverageResponseSeconds);
-  metric.coverageResponseMedianSeconds = median(metric._coverageResponseSeconds);
-  metric.seenResponseAvgSeconds = mean(metric._seenResponseSeconds);
-  metric.seenResponseMedianSeconds = median(metric._seenResponseSeconds);
-  metric.slaReply5mPct = responseSamples > 0 ? (metric._sla5 / responseSamples) * 100 : null;
-  metric.slaReply15mPct = responseSamples > 0 ? (metric._sla15 / responseSamples) * 100 : null;
+  if (accumulatedResponseSamples > 0) {
+    metric.avgResponseSeconds = mean(metric._responseSeconds);
+    metric.medianResponseSeconds = median(metric._responseSeconds);
+    metric.p90ResponseSeconds = percentile(metric._responseSeconds, 90);
+    metric.responseSamples = accumulatedResponseSamples;
+    metric.slaReply5mPct = (metric._sla5 / accumulatedResponseSamples) * 100;
+    metric.slaReply15mPct = (metric._sla15 / accumulatedResponseSamples) * 100;
+  }
+  if (metric._coverageResponseSeconds.length > 0) {
+    metric.coverageResponseAvgSeconds = mean(metric._coverageResponseSeconds);
+    metric.coverageResponseMedianSeconds = median(metric._coverageResponseSeconds);
+  }
+  if (metric._seenResponseSeconds.length > 0) {
+    metric.seenResponseAvgSeconds = mean(metric._seenResponseSeconds);
+    metric.seenResponseMedianSeconds = median(metric._seenResponseSeconds);
+  }
   metric.dollarsPerMessageCents = metric.messagesSent > 0 ? Math.round(metric.revenueAttributedCents / metric.messagesSent) : 0;
   const ppvRevenue = singleCurrencyValue(metric._ppvRevenueByCurrency);
   metric.ppvRevenueByCurrency = currencyBucketObject(metric._ppvRevenueByCurrency);
@@ -564,6 +573,636 @@ async function loadProjectedPendingStates({ agencyId, allowedCreatorIds = null }
     return { available: false, rows: [] };
   }
 }
+
+
+function supportsTeamScaleReadAuthority() {
+  return typeof prisma?.$queryRawUnsafe === "function"
+    && typeof prisma?.teamMemberActivityDaily?.aggregate === "function"
+    && typeof prisma?.teamMoneyAttributionFact?.aggregate === "function"
+    && typeof prisma?.teamResponseCase?.aggregate === "function"
+    && typeof prisma?.teamDialogSession?.aggregate === "function";
+}
+
+function isReducedTeamAnalyticsTestDouble() {
+  // Real Prisma / TransactionClient exposes raw SQL. If that surface exists but
+  // any required aggregate delegate is missing, fail closed instead of silently
+  // resurrecting the historical materialization path in production. Tiny unit
+  // test doubles omit raw SQL entirely and may use the compatibility path below.
+  return typeof prisma?.$queryRawUnsafe !== "function";
+}
+
+function sqlLiteralList(values) {
+  return Array.from(values || []).map((value) => `'${String(value).replace(/'/g, "''")}'`).join(",");
+}
+
+function currentTelemetrySql(alias) {
+  const versions = sqlLiteralList(SUPPORTED_TEAM_TELEMETRY_VERSIONS);
+  const sources = sqlLiteralList(SUPPORTED_TEAM_TELEMETRY_SOURCES);
+  return `(COALESCE(${alias}."extra"->>'telemetryVersion','') IN (${versions}) OR COALESCE(NULLIF(${alias}."source",''), ${alias}."extra"->>'source','') IN (${sources}))`;
+}
+
+function normalizedCreatorScope(allowedCreatorIds) {
+  if (!Array.isArray(allowedCreatorIds)) return null;
+  return Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)));
+}
+
+function sqlScopedWhere({ alias, agencyId, allowedCreatorIds = null, range = null, field = null, extra = [] }) {
+  const params = [String(agencyId)];
+  const clauses = [`${alias}."agencyId" = $1`];
+  const scope = normalizedCreatorScope(allowedCreatorIds);
+  if (scope && scope.length === 0) return { empty: true, sql: "FALSE", params };
+  if (scope) {
+    params.push(scope);
+    clauses.push(`${alias}."creatorId" = ANY($${params.length}::text[])`);
+  }
+  if (field && range?.startAt) {
+    params.push(new Date(range.startAt));
+    clauses.push(`${alias}."${field}" >= $${params.length}`);
+  }
+  if (field && range?.endAt) {
+    params.push(new Date(range.endAt));
+    clauses.push(`${alias}."${field}" <= $${params.length}`);
+  }
+  clauses.push(...extra);
+  return { empty: false, sql: clauses.join(" AND "), params };
+}
+
+async function teamScaleQuery(section, sql, params) {
+  try {
+    return await prisma.$queryRawUnsafe(sql, ...(params || []));
+  } catch (err) {
+    throw analyticsUnavailable(section, err);
+  }
+}
+
+function rowNumber(row, key, fallback = 0) {
+  return num(row?.[key], fallback);
+}
+
+function rowNullableNumber(row, key) {
+  return nullableNum(row?.[key]);
+}
+
+function rowIso(row, key) {
+  const value = row?.[key];
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+async function loadActivitySummarySql({ agencyId, range, allowedCreatorIds = null, exactRaw = false }) {
+  if (exactRaw) {
+    const where = sqlScopedWhere({
+      alias: "e", agencyId, allowedCreatorIds, range, field: "ts",
+      extra: [`e."memberId" IS NOT NULL`, currentTelemetrySql("e")],
+    });
+    if (where.empty) return [];
+    const sql = `
+      SELECT
+        e."memberId" AS "memberId",
+        COUNT(*) FILTER (WHERE e."eventKind" = 'MESSAGE_SEND_CONFIRMED' AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "messagesSent",
+        COUNT(*) FILTER (WHERE e."eventKind" = 'MESSAGE_SEND_CONFIRMED' AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED' AND (e."isPpv" = TRUE OR COALESCE(e."priceCents", 0) > 0))::bigint AS "ppvSentMessages",
+        COUNT(*) FILTER (WHERE e."eventKind" = 'BROADCAST_DISPATCH_CONFIRMED')::bigint AS "broadcastDispatches",
+        COUNT(*) FILTER (WHERE e."eventKind" = 'CONTENT_POST_PUBLISHED_CONFIRMED' AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "postsCreated",
+        COUNT(*) FILTER (WHERE e."eventKind" = 'CONTENT_STORY_PUBLISHED_CONFIRMED' AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "storiesCreated",
+        COUNT(*) FILTER (WHERE e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "contentActions",
+        COALESCE(SUM(CASE WHEN e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED' THEN COALESCE(e."mediaCount",0) ELSE 0 END), 0)::bigint AS "contentMediaItemsPublished",
+        COUNT(DISTINCT e."creatorId") FILTER (WHERE e."creatorId" IS NOT NULL AND e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "contentCreatorCoverage",
+        COUNT(DISTINCT DATE_TRUNC('day', e."ts")) FILTER (WHERE e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED')::bigint AS "contentActiveDays",
+        MAX(e."ts") FILTER (WHERE e."eventKind" IN ('CONTENT_POST_PUBLISHED_CONFIRMED','CONTENT_STORY_PUBLISHED_CONFIRMED') AND e."actionSource" = 'MANUAL' AND e."lifecycle" = 'CONFIRMED') AS "lastContentActivityAt"
+      FROM "TeamActivityEvent" e
+      WHERE ${where.sql}
+      GROUP BY e."memberId"
+    `;
+    return teamScaleQuery("activity_summary", sql, where.params);
+  }
+
+  const where = sqlScopedWhere({
+    alias: "d", agencyId, allowedCreatorIds, range, field: "day",
+    extra: [`d."memberId" IS NOT NULL`],
+  });
+  if (where.empty) return [];
+  const sql = `
+    SELECT
+      d."memberId" AS "memberId",
+      COALESCE(SUM(d."messagesSent"),0)::bigint AS "messagesSent",
+      COALESCE(SUM(d."ppvSentMessages"),0)::bigint AS "ppvSentMessages",
+      COALESCE(SUM(d."broadcastDispatches"),0)::bigint AS "broadcastDispatches",
+      COALESCE(SUM(d."postsCreated"),0)::bigint AS "postsCreated",
+      COALESCE(SUM(d."storiesCreated"),0)::bigint AS "storiesCreated",
+      COALESCE(SUM(d."contentActions"),0)::bigint AS "contentActions",
+      COALESCE(SUM(d."contentMediaItemsPublished"),0)::bigint AS "contentMediaItemsPublished",
+      COUNT(DISTINCT d."creatorId") FILTER (WHERE d."creatorId" IS NOT NULL AND d."contentActions" > 0)::bigint AS "contentCreatorCoverage",
+      COUNT(DISTINCT d."day") FILTER (WHERE d."contentActions" > 0)::bigint AS "contentActiveDays",
+      MAX(d."lastContentActivityAt") AS "lastContentActivityAt"
+    FROM "TeamMemberActivityDaily" d
+    WHERE ${where.sql}
+    GROUP BY d."memberId"
+  `;
+  return teamScaleQuery("activity_summary", sql, where.params);
+}
+
+async function loadLegacyBoundedSummarySql({ agencyId, range, allowedCreatorIds = null }) {
+  if (!range) return [];
+  const where = sqlScopedWhere({ alias: "e", agencyId, allowedCreatorIds, range, field: "ts", extra: [`e."memberId" IS NOT NULL`, currentTelemetrySql("e")] });
+  if (where.empty) return [];
+  const numericJson = (name, fallback = "0") => `CASE WHEN COALESCE(e."extra"->>'${name}','') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN (e."extra"->>'${name}')::double precision ELSE ${fallback} END`;
+  const sql = `
+    SELECT
+      e."memberId" AS "memberId",
+      COUNT(*) FILTER (WHERE e."type" IN ('dialog_unread_seen','dialog_unread_opened'))::bigint AS "chatOpened",
+      COALESCE(SUM(CASE WHEN e."type" = 'fan_message_after_last_responder' THEN GREATEST(1, ${numericJson("incomingCount", numericJson("rawUnreadMessagesCount", numericJson("unreadCount", "1")))}) ELSE 0 END),0)::bigint AS "incomingMessagesLegacy",
+      COALESCE(SUM(CASE WHEN e."type" = 'fan_message_after_last_responder' THEN GREATEST(1, ${numericJson("engagementCount", "1")}) ELSE 0 END),0)::bigint AS "engagementReplies",
+      COALESCE(SUM(CASE WHEN e."type" IN ('mass_message_sent_local','message_queue_sent_local') THEN GREATEST(1, ${numericJson("count", "1")}) ELSE 0 END),0)::bigint AS "massMessages",
+      COUNT(*) FILTER (WHERE e."type" = 'chat_message_sent_local' AND COALESCE(e."extra"->>'isBacklogReply','false') = 'true')::bigint AS "backlogClearedLegacy",
+      COALESCE(MAX(CASE WHEN e."type" = 'chat_message_sent_local' AND COALESCE(e."extra"->>'isBacklogReply','false') = 'true' THEN GREATEST(0, ${numericJson("backlogAgeSeconds", "0")}) ELSE 0 END),0)::double precision AS "backlogMaxAgeSecondsLegacy"
+    FROM "TeamActivityEvent" e
+    WHERE ${where.sql}
+    GROUP BY e."memberId"
+  `;
+  return teamScaleQuery("bounded_legacy_summary", sql, where.params);
+}
+
+function responseSelectSql(alias) {
+  return `
+    COUNT(*)::bigint AS "cases",
+    COALESCE(SUM(${alias}."incomingCount"),0)::bigint AS "incomingHandled",
+    COUNT(*) FILTER (WHERE UPPER(COALESCE(${alias}."classification",'UNKNOWN')) = 'FRESH')::bigint AS "freshReplies",
+    COUNT(*) FILTER (WHERE UPPER(COALESCE(${alias}."classification",'UNKNOWN')) = 'BACKLOG')::bigint AS "backlogReplies",
+    COUNT(*) FILTER (WHERE UPPER(COALESCE(${alias}."classification",'UNKNOWN')) = 'HANDOFF')::bigint AS "handoffReplies",
+    COUNT(*) FILTER (WHERE UPPER(COALESCE(${alias}."classification",'UNKNOWN')) NOT IN ('FRESH','BACKLOG','HANDOFF'))::bigint AS "unknownReplies",
+    COUNT(*) FILTER (WHERE ${alias}."slaEligible" = TRUE)::bigint AS "responseSamples",
+    AVG(${alias}."wallClockSeconds"::double precision) FILTER (WHERE ${alias}."slaEligible" = TRUE) AS "avgResponseSeconds",
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY ${alias}."wallClockSeconds") FILTER (WHERE ${alias}."slaEligible" = TRUE) AS "medianResponseSeconds",
+    percentile_cont(0.9) WITHIN GROUP (ORDER BY ${alias}."wallClockSeconds") FILTER (WHERE ${alias}."slaEligible" = TRUE) AS "p90ResponseSeconds",
+    COUNT(*) FILTER (WHERE ${alias}."slaEligible" = TRUE AND ${alias}."sla5Pass" = TRUE)::bigint AS "sla5Passes",
+    COUNT(*) FILTER (WHERE ${alias}."slaEligible" = TRUE AND ${alias}."sla15Pass" = TRUE)::bigint AS "sla15Passes",
+    AVG(${alias}."coverageResponseSeconds"::double precision) FILTER (WHERE ${alias}."coverageResponseSeconds" IS NOT NULL) AS "coverageResponseAvgSeconds",
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY ${alias}."coverageResponseSeconds") FILTER (WHERE ${alias}."coverageResponseSeconds" IS NOT NULL) AS "coverageResponseMedianSeconds",
+    AVG(${alias}."seenResponseSeconds"::double precision) FILTER (WHERE ${alias}."seenResponseSeconds" IS NOT NULL) AS "seenResponseAvgSeconds",
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY ${alias}."seenResponseSeconds") FILTER (WHERE ${alias}."seenResponseSeconds" IS NOT NULL) AS "seenResponseMedianSeconds",
+    COALESCE(MAX(${alias}."wallClockSeconds") FILTER (WHERE UPPER(COALESCE(${alias}."classification",'UNKNOWN')) IN ('BACKLOG','HANDOFF')),0)::bigint AS "backlogMaxAgeSeconds"
+  `;
+}
+
+async function loadResponseSummarySql({ agencyId, range, allowedCreatorIds = null }) {
+  if (!range) return [];
+  const where = sqlScopedWhere({ alias: "r", agencyId, allowedCreatorIds, range, field: "replyAt" });
+  if (where.empty) return [];
+  const sql = `
+    SELECT GROUPING(r."memberId")::int AS "isTotal", r."memberId" AS "memberId", ${responseSelectSql("r")}
+    FROM "TeamResponseCase" r
+    WHERE ${where.sql}
+    GROUP BY GROUPING SETS ((r."memberId"), ())
+  `;
+  return teamScaleQuery("response_summary", sql, where.params);
+}
+
+async function loadDialogSummarySql({ agencyId, range, allowedCreatorIds = null, includeMoney = false }) {
+  if (!range) return [];
+  const where = sqlScopedWhere({ alias: "s", agencyId, allowedCreatorIds, range, field: "startedAt" });
+  if (where.empty) return [];
+  let params = [...where.params];
+  let moneyJoin = "";
+  let moneySelect = `NULL::text AS "currency", 0::bigint AS "revenueCents"`;
+  let moneyGroup = "";
+  if (includeMoney) {
+    const scope = normalizedCreatorScope(allowedCreatorIds);
+    const moneyClauses = [`m."agencyId" = $1`, `m."attributionActive" = TRUE`, `m."memberId" = r."memberId"`, `m."creatorId" = r."creatorId"`, `COALESCE(NULLIF(m."fanId",''), NULLIF(m."dialogId",'')) = r."fanKey"`];
+    if (scope) {
+      const scopeIndex = where.params.findIndex((value) => Array.isArray(value)) + 1;
+      if (scopeIndex > 0) moneyClauses.push(`m."creatorId" = ANY($${scopeIndex}::text[])`);
+    }
+    if (range.startAt) {
+      params.push(new Date(range.startAt));
+      moneyClauses.push(`m."occurredAt" >= $${params.length}`);
+    }
+    if (range.endAt) {
+      params.push(new Date(range.endAt));
+      moneyClauses.push(`m."occurredAt" <= $${params.length}`);
+    }
+    moneyJoin = `LEFT JOIN "TeamMoneyAttributionFact" m ON ${moneyClauses.join(" AND ")}`;
+    moneySelect = `m."currency" AS "currency", COALESCE(SUM(m."amountCents"),0)::bigint AS "revenueCents"`;
+    moneyGroup = `, m."currency"`;
+  }
+  const sql = `
+    WITH grouped AS (
+      SELECT s."memberId", s."creatorId", COALESCE(NULLIF(s."fanId",''), s."dialogId") AS "fanKey",
+             COUNT(*)::bigint AS "sessions", COALESCE(SUM(s."activeSeconds"),0)::bigint AS "dwellSeconds"
+      FROM "TeamDialogSession" s
+      WHERE ${where.sql}
+      GROUP BY s."memberId", s."creatorId", COALESCE(NULLIF(s."fanId",''), s."dialogId")
+    ), ranked AS (
+      SELECT g.*,
+             SUM(g."sessions") OVER (PARTITION BY g."memberId")::bigint AS "memberSessionCount",
+             SUM(g."dwellSeconds") OVER (PARTITION BY g."memberId")::bigint AS "memberDwellSeconds",
+             ROW_NUMBER() OVER (PARTITION BY g."memberId" ORDER BY g."dwellSeconds" DESC, g."fanKey" ASC) AS rn
+      FROM grouped g
+    )
+    SELECT r."memberId", r."creatorId", r."fanKey", r."sessions", r."dwellSeconds", r."memberSessionCount", r."memberDwellSeconds",
+           ${moneySelect}
+    FROM ranked r
+    ${moneyJoin}
+    WHERE r.rn <= 10
+    GROUP BY r."memberId", r."creatorId", r."fanKey", r."sessions", r."dwellSeconds", r."memberSessionCount", r."memberDwellSeconds"${moneyGroup}
+    ORDER BY r."memberId", r."dwellSeconds" DESC, r."fanKey" ASC
+  `;
+  return teamScaleQuery("dialog_summary", sql, params);
+}
+
+async function loadPendingSummarySql({ agencyId, allowedCreatorIds = null, authorityNow }) {
+  const where = sqlScopedWhere({ alias: "p", agencyId, allowedCreatorIds, extra: [`p."status" = 'PENDING'`] });
+  if (where.empty) return [];
+  const params = [...where.params, new Date(authorityNow)];
+  const nowRef = `$${params.length}`;
+  const sql = `
+    SELECT GROUPING(p."ownerMemberId")::int AS "isTotal", p."ownerMemberId" AS "memberId",
+           COUNT(*)::bigint AS "pendingDialogs",
+           COALESCE(SUM(GREATEST(1,p."incomingCount")),0)::bigint AS "pendingIncomingMessages",
+           COUNT(*) FILTER (WHERE p."ownerMemberId" IS NULL)::bigint AS "unassignedDialogs",
+           COUNT(*) FILTER (WHERE p."firstSeenAt" IS NOT NULL)::bigint AS "seenDialogs",
+           COUNT(*) FILTER (WHERE p."firstIncomingAt" <= ${nowRef} - INTERVAL '15 minutes')::bigint AS "olderThan15m",
+           COUNT(*) FILTER (WHERE p."firstIncomingAt" <= ${nowRef} - INTERVAL '60 minutes')::bigint AS "olderThan60m",
+           MIN(p."firstIncomingAt") AS "oldestPendingAt"
+    FROM "TeamPendingDialogState" p
+    WHERE ${where.sql}
+    GROUP BY GROUPING SETS ((p."ownerMemberId"), ())
+  `;
+  return teamScaleQuery("pending_summary", sql, params);
+}
+
+async function loadMoneySummarySql({ agencyId, range, allowedCreatorIds = null }) {
+  const where = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt", extra: [`m."attributionActive" = TRUE`, `m."memberId" IS NOT NULL`] });
+  if (where.empty) return [];
+  const sql = `
+    SELECT m."memberId" AS "memberId", m."sourceType" AS "sourceType", m."currency" AS "currency",
+           GROUPING(m."sourceType")::int AS "sourceGrouped", GROUPING(m."currency")::int AS "currencyGrouped",
+           COUNT(*)::bigint AS "factCount", COALESCE(SUM(m."amountCents"),0)::bigint AS "amountCents"
+    FROM "TeamMoneyAttributionFact" m
+    WHERE ${where.sql}
+    GROUP BY GROUPING SETS ((m."memberId",m."sourceType",m."currency"),(m."memberId"))
+  `;
+  return teamScaleQuery("money_summary", sql, where.params);
+}
+
+async function loadAudienceCoverageSummarySql({ agencyId, range, rawRange, allowedCreatorIds = null, includeMoney = true, exactRawActivity = false }) {
+  const scope = normalizedCreatorScope(allowedCreatorIds);
+  if (scope && scope.length === 0) return [];
+  const params = [String(agencyId)];
+  let scopeRef = null;
+  if (scope) {
+    params.push(scope);
+    scopeRef = `$${params.length}::text[]`;
+  }
+
+  function sourceWhere({ alias, field, sourceRange, extra = [] }) {
+    const clauses = [`${alias}."agencyId" = $1`, `${alias}."memberId" IS NOT NULL`];
+    if (scopeRef) clauses.push(`${alias}."creatorId" = ANY(${scopeRef})`);
+    if (field && sourceRange?.startAt) {
+      params.push(new Date(sourceRange.startAt));
+      clauses.push(`${alias}."${field}" >= $${params.length}`);
+    }
+    if (field && sourceRange?.endAt) {
+      params.push(new Date(sourceRange.endAt));
+      clauses.push(`${alias}."${field}" <= $${params.length}`);
+    }
+    clauses.push(...extra);
+    return clauses.join(" AND ");
+  }
+
+  const fanSources = [];
+  const creatorSources = [];
+
+  if (rawRange) {
+    const rawFanKey = `COALESCE(NULLIF(e."fanId",''), NULLIF(e."dialogId",''), NULLIF(e."extra"->>'fanId',''), NULLIF(e."extra"->>'dialogId',''))`;
+    const rawCreatorKey = `COALESCE(NULLIF(e."accountId",''), NULLIF(e."extra"->>'accountId',''), NULLIF(e."creatorId",''))`;
+    const rawWhere = sourceWhere({ alias: "e", field: "ts", sourceRange: rawRange, extra: [currentTelemetrySql("e")] });
+    fanSources.push(`SELECT e."memberId" AS "memberId", ${rawFanKey} AS "key" FROM "TeamActivityEvent" e WHERE ${rawWhere} AND ${rawFanKey} IS NOT NULL`);
+    creatorSources.push(`SELECT e."memberId" AS "memberId", ${rawCreatorKey} AS "key" FROM "TeamActivityEvent" e WHERE ${rawWhere} AND ${rawCreatorKey} IS NOT NULL`);
+  }
+
+  if (!exactRawActivity) {
+    const dailyWhere = sourceWhere({ alias: "d", field: "day", sourceRange: range });
+    creatorSources.push(`SELECT d."memberId" AS "memberId", d."creatorId" AS "key" FROM "TeamMemberActivityDaily" d WHERE ${dailyWhere} AND d."creatorId" IS NOT NULL`);
+  }
+
+  if (includeMoney) {
+    const moneyWhere = sourceWhere({ alias: "m", field: "occurredAt", sourceRange: range, extra: [`m."attributionActive" = TRUE`] });
+    const moneyFanKey = `COALESCE(NULLIF(m."fanId",''), NULLIF(m."dialogId",''))`;
+    fanSources.push(`SELECT m."memberId" AS "memberId", ${moneyFanKey} AS "key" FROM "TeamMoneyAttributionFact" m WHERE ${moneyWhere} AND ${moneyFanKey} IS NOT NULL`);
+    creatorSources.push(`SELECT m."memberId" AS "memberId", m."creatorId" AS "key" FROM "TeamMoneyAttributionFact" m WHERE ${moneyWhere} AND m."creatorId" IS NOT NULL`);
+  }
+
+  const fanSql = fanSources.length ? fanSources.join("\n      UNION\n      ") : `SELECT NULL::text AS "memberId", NULL::text AS "key" WHERE FALSE`;
+  const creatorSql = creatorSources.length ? creatorSources.join("\n      UNION\n      ") : `SELECT NULL::text AS "memberId", NULL::text AS "key" WHERE FALSE`;
+  const sql = `
+    WITH fan_keys AS (
+      ${fanSql}
+    ), creator_keys AS (
+      ${creatorSql}
+    ), fan_counts AS (
+      SELECT "memberId", COUNT(*)::bigint AS "uniqueFans"
+      FROM fan_keys
+      GROUP BY "memberId"
+    ), creator_counts AS (
+      SELECT "memberId", COUNT(*)::bigint AS "creatorCoverage"
+      FROM creator_keys
+      GROUP BY "memberId"
+    )
+    SELECT COALESCE(f."memberId", c."memberId") AS "memberId",
+           COALESCE(f."uniqueFans", 0)::bigint AS "uniqueFans",
+           COALESCE(c."creatorCoverage", 0)::bigint AS "creatorCoverage"
+    FROM fan_counts f
+    FULL OUTER JOIN creator_counts c ON c."memberId" = f."memberId"
+  `;
+  return teamScaleQuery("audience_coverage_summary", sql, params);
+}
+
+function applyResponseAggregate(metric, row) {
+  metric.incomingMessages += Math.max(0, rowNumber(row, "incomingHandled", 0));
+  metric.freshReplies += Math.max(0, rowNumber(row, "freshReplies", 0));
+  metric.backlogReplies += Math.max(0, rowNumber(row, "backlogReplies", 0));
+  metric.handoffReplies += Math.max(0, rowNumber(row, "handoffReplies", 0));
+  metric.unknownReplies += Math.max(0, rowNumber(row, "unknownReplies", 0));
+  metric.backlogCleared += Math.max(0, rowNumber(row, "backlogReplies", 0) + rowNumber(row, "handoffReplies", 0));
+  metric.backlogMaxAgeSeconds = Math.max(metric.backlogMaxAgeSeconds || 0, rowNumber(row, "backlogMaxAgeSeconds", 0));
+  metric.responseSamples = Math.max(0, rowNumber(row, "responseSamples", 0));
+  metric.avgResponseSeconds = rowNullableNumber(row, "avgResponseSeconds");
+  metric.medianResponseSeconds = rowNullableNumber(row, "medianResponseSeconds");
+  metric.p90ResponseSeconds = rowNullableNumber(row, "p90ResponseSeconds");
+  const samples = metric.responseSamples;
+  metric.slaReply5mPct = samples > 0 ? (rowNumber(row, "sla5Passes", 0) / samples) * 100 : null;
+  metric.slaReply15mPct = samples > 0 ? (rowNumber(row, "sla15Passes", 0) / samples) * 100 : null;
+  metric.coverageResponseAvgSeconds = rowNullableNumber(row, "coverageResponseAvgSeconds");
+  metric.coverageResponseMedianSeconds = rowNullableNumber(row, "coverageResponseMedianSeconds");
+  metric.seenResponseAvgSeconds = rowNullableNumber(row, "seenResponseAvgSeconds");
+  metric.seenResponseMedianSeconds = rowNullableNumber(row, "seenResponseMedianSeconds");
+}
+
+function responseSummaryFromAggregate(row, source, coverageFrom) {
+  const samples = Math.max(0, rowNumber(row, "responseSamples", 0));
+  return {
+    source,
+    cases: Math.max(0, rowNumber(row, "cases", 0)),
+    incomingHandled: Math.max(0, rowNumber(row, "incomingHandled", 0)),
+    freshReplies: Math.max(0, rowNumber(row, "freshReplies", 0)),
+    backlogReplies: Math.max(0, rowNumber(row, "backlogReplies", 0)),
+    handoffReplies: Math.max(0, rowNumber(row, "handoffReplies", 0)),
+    unknownReplies: Math.max(0, rowNumber(row, "unknownReplies", 0)),
+    responseSamples: samples,
+    avgResponseSeconds: rowNullableNumber(row, "avgResponseSeconds"),
+    medianResponseSeconds: rowNullableNumber(row, "medianResponseSeconds"),
+    p90ResponseSeconds: rowNullableNumber(row, "p90ResponseSeconds"),
+    slaReply5mPct: samples > 0 ? (rowNumber(row, "sla5Passes", 0) / samples) * 100 : null,
+    slaReply15mPct: samples > 0 ? (rowNumber(row, "sla15Passes", 0) / samples) * 100 : null,
+    coverageResponseAvgSeconds: rowNullableNumber(row, "coverageResponseAvgSeconds"),
+    coverageResponseMedianSeconds: rowNullableNumber(row, "coverageResponseMedianSeconds"),
+    seenResponseAvgSeconds: rowNullableNumber(row, "seenResponseAvgSeconds"),
+    seenResponseMedianSeconds: rowNullableNumber(row, "seenResponseMedianSeconds"),
+    coverageFrom: coverageFrom || null,
+  };
+}
+
+async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
+  const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const range = resolveRange(rangeKey, authorityNow);
+  const [projectionCoverage, historicalCoverage, retentionPolicy, members] = await Promise.all([
+    loadProjectionCoverage({ agencyId }),
+    loadHistoricalCoverage({ agencyId }),
+    getRetentionSettings(),
+    getMembersShell(agencyId),
+  ]);
+  if (retentionPolicy?.ok !== true) throw analyticsUnavailable("retention_policy", new Error("Team retention policy unavailable"));
+  const detailDays = Number(retentionPolicy.settings?.teamCanonicalDetailDays || 180);
+  const projectionDetail = buildProjectionDetailAuthority({
+    range,
+    authorityNow,
+    detailDays,
+    responseCoverageFrom: projectionCoverage.responseCoverageFrom,
+    dialogCoverageFrom: projectionCoverage.dialogCoverageFrom,
+  });
+  const rawRange = clampRangeToDetail(range, detailDays);
+  const exactRawActivity = String(range.key || "") === "24h";
+  const activityRange = range;
+  const responseRange = projectionDetail.responseRange;
+  const dialogRange = projectionDetail.dialogRange;
+
+  const [activityRows, legacyRows, responseRows, dialogRows, pendingRows, moneyRows, audienceRows] = await Promise.all([
+    loadActivitySummarySql({ agencyId, range: activityRange, allowedCreatorIds, exactRaw: exactRawActivity }),
+    rawRange ? loadLegacyBoundedSummarySql({ agencyId, range: rawRange, allowedCreatorIds }) : Promise.resolve([]),
+    responseRange ? loadResponseSummarySql({ agencyId, range: responseRange, allowedCreatorIds }) : Promise.resolve([]),
+    dialogRange ? loadDialogSummarySql({ agencyId, range: dialogRange, allowedCreatorIds, includeMoney }) : Promise.resolve([]),
+    loadPendingSummarySql({ agencyId, allowedCreatorIds, authorityNow }),
+    includeMoney ? loadMoneySummarySql({ agencyId, range, allowedCreatorIds }) : Promise.resolve([]),
+    loadAudienceCoverageSummarySql({ agencyId, range, rawRange, allowedCreatorIds, includeMoney, exactRawActivity }),
+  ]);
+
+  const metricsByMember = new Map();
+  for (const member of members) metricsByMember.set(String(member.id), emptyMetric());
+  function metricFor(memberId) {
+    const id = String(memberId || "");
+    if (!id) return null;
+    if (!metricsByMember.has(id)) metricsByMember.set(id, emptyMetric());
+    return metricsByMember.get(id);
+  }
+
+  for (const row of activityRows || []) {
+    const metric = metricFor(row.memberId);
+    if (!metric) continue;
+    metric.messagesSent += Math.max(0, rowNumber(row, "messagesSent", 0));
+    metric.ppvSentMessages += Math.max(0, rowNumber(row, "ppvSentMessages", 0));
+    metric.broadcastDispatches += Math.max(0, rowNumber(row, "broadcastDispatches", 0));
+    metric.postsCreated += Math.max(0, rowNumber(row, "postsCreated", 0));
+    metric.storiesCreated += Math.max(0, rowNumber(row, "storiesCreated", 0));
+    metric.contentActions += Math.max(0, rowNumber(row, "contentActions", 0));
+    metric.contentMediaItemsPublished += Math.max(0, rowNumber(row, "contentMediaItemsPublished", 0));
+    metric.contentCreatorCoverage = Math.max(metric.contentCreatorCoverage || 0, rowNumber(row, "contentCreatorCoverage", 0));
+    metric.contentActiveDays = Math.max(metric.contentActiveDays || 0, rowNumber(row, "contentActiveDays", 0));
+    metric.lastContentActivityAt = rowIso(row, "lastContentActivityAt");
+  }
+
+  for (const row of legacyRows || []) {
+    const metric = metricFor(row.memberId);
+    if (!metric) continue;
+    metric.chatOpened += Math.max(0, rowNumber(row, "chatOpened", 0));
+    metric.incomingMessages += Math.max(0, rowNumber(row, "incomingMessagesLegacy", 0));
+    metric.engagementReplies += Math.max(0, rowNumber(row, "engagementReplies", 0));
+    metric.massMessages += Math.max(0, rowNumber(row, "massMessages", 0));
+    metric.backlogCleared += Math.max(0, rowNumber(row, "backlogClearedLegacy", 0));
+    metric.backlogMaxAgeSeconds = Math.max(metric.backlogMaxAgeSeconds || 0, rowNumber(row, "backlogMaxAgeSecondsLegacy", 0));
+  }
+
+  let totalResponseRow = null;
+  for (const row of responseRows || []) {
+    if (Number(row?.isTotal) === 1) { totalResponseRow = row; continue; }
+    const metric = metricFor(row.memberId);
+    if (metric) applyResponseAggregate(metric, row);
+  }
+
+  const dialogBuckets = new Map();
+  for (const row of dialogRows || []) {
+    const metric = metricFor(row.memberId);
+    if (!metric) continue;
+    metric.dialogSessionsCount = Math.max(metric.dialogSessionsCount || 0, rowNumber(row, "memberSessionCount", 0));
+    metric.dialogDwellSeconds = Math.max(metric.dialogDwellSeconds || 0, rowNumber(row, "memberDwellSeconds", 0));
+    const key = `${row.memberId}|${row.creatorId || ""}|${row.fanKey}`;
+    let item = dialogBuckets.get(key);
+    if (!item) {
+      item = {
+        memberId: String(row.memberId || ""),
+        fanId: row.fanKey || null,
+        accountId: row.creatorId || null,
+        sessions: Math.max(0, rowNumber(row, "sessions", 0)),
+        dwellSeconds: Math.max(0, rowNumber(row, "dwellSeconds", 0)),
+        revenue: new Map(),
+      };
+      dialogBuckets.set(key, item);
+    }
+    if (includeMoney && row.currency) item.revenue.set(normalizeCurrency(row.currency), Math.max(0, rowNumber(row, "revenueCents", 0)));
+  }
+  for (const item of dialogBuckets.values()) {
+    const metric = metricFor(item.memberId);
+    if (!metric) continue;
+    metric._dialogSessions.set(`${item.accountId || ""}|${item.fanId || ""}`, {
+      fanId: item.fanId,
+      accountId: item.accountId,
+      sessions: item.sessions,
+      dwellSeconds: item.dwellSeconds,
+      _revenue: item.revenue,
+    });
+  }
+
+  let pendingSummary = null;
+  for (const row of pendingRows || []) {
+    const oldestAt = rowIso(row, "oldestPendingAt");
+    const oldestSeconds = oldestAt ? Math.max(0, Math.floor((authorityNow.getTime() - new Date(oldestAt).getTime()) / 1000)) : null;
+    const summary = {
+      source: "team_pending_dialog_v1",
+      pendingDialogs: Math.max(0, rowNumber(row, "pendingDialogs", 0)),
+      pendingIncomingMessages: Math.max(0, rowNumber(row, "pendingIncomingMessages", 0)),
+      unassignedDialogs: Math.max(0, rowNumber(row, "unassignedDialogs", 0)),
+      seenDialogs: Math.max(0, rowNumber(row, "seenDialogs", 0)),
+      olderThan15m: Math.max(0, rowNumber(row, "olderThan15m", 0)),
+      olderThan60m: Math.max(0, rowNumber(row, "olderThan60m", 0)),
+      oldestPendingAt: oldestAt,
+      oldestPendingSeconds: oldestSeconds,
+    };
+    if (Number(row?.isTotal) === 1) {
+      pendingSummary = summary;
+      continue;
+    }
+    if (!row.memberId) continue;
+    const metric = metricFor(row.memberId);
+    if (!metric) continue;
+    metric.unansweredIncomingCount = summary.pendingDialogs;
+    metric.unansweredIncomingMessages = summary.pendingIncomingMessages;
+    metric.unansweredOlderThan15m = summary.olderThan15m;
+    metric.unansweredOlderThan60m = summary.olderThan60m;
+    metric.oldestUnansweredSeconds = summary.oldestPendingSeconds;
+  }
+  if (!pendingSummary) pendingSummary = { source: "team_pending_dialog_v1", pendingDialogs: 0, pendingIncomingMessages: 0, unassignedDialogs: 0, seenDialogs: 0, olderThan15m: 0, olderThan60m: 0, oldestPendingAt: null, oldestPendingSeconds: null };
+
+  for (const row of audienceRows || []) {
+    const metric = metricFor(row.memberId);
+    if (!metric) continue;
+    metric.uniqueFans = Math.max(0, rowNumber(row, "uniqueFans", 0));
+    metric.creatorCoverage = Math.max(0, rowNumber(row, "creatorCoverage", 0));
+  }
+
+  const revenueByMember = new Map();
+  for (const row of moneyRows || []) {
+    const metric = metricFor(row.memberId);
+    if (!metric) continue;
+    if (Number(row?.sourceGrouped) === 1 && Number(row?.currencyGrouped) === 1) {
+          continue;
+    }
+    const currency = normalizeCurrency(row.currency);
+    const cents = Math.max(0, rowNumber(row, "amountCents", 0));
+    addCurrencyToMap(revenueByMember, row.memberId, currency, cents);
+    if (String(row.sourceType || "").toUpperCase() === "PPV") {
+      metric.ppvSoldMessages += Math.max(0, rowNumber(row, "factCount", 0));
+      metric._ppvRevenueByCurrency.set(currency, (metric._ppvRevenueByCurrency.get(currency) || 0) + cents);
+    }
+  }
+
+  const byMember = new Map();
+  for (const [memberId, metric] of metricsByMember.entries()) {
+    const revenueBucket = revenueByMember.get(memberId) || new Map();
+    if (includeMoney) {
+      const revenue = singleCurrencyValue(revenueBucket);
+      metric.revenueByCurrency = currencyBucketObject(revenueBucket);
+      metric.revenueAttributedCents = revenue.cents;
+      metric.revenueCurrency = revenue.currency;
+      metric.moneySource = revenue.mixed ? "team_money_fact_v1_multi_currency" : "team_money_fact_v1";
+    }
+    const cleaned = cleanMetric(metric);
+    if (includeMoney && Array.isArray(cleaned.topDialogSessions)) {
+      cleaned.topDialogSessions = cleaned.topDialogSessions.map((dialog) => {
+        const item = dialogBuckets.get(`${memberId}|${dialog.accountId || ""}|${dialog.fanId || ""}`);
+        const bucket = item?._revenue || new Map();
+        const revenue = singleCurrencyValue(bucket);
+        const sharePct = cleaned.dialogDwellSeconds > 0 ? Math.round((num(dialog.dwellSeconds, 0) / cleaned.dialogDwellSeconds) * 100) : 0;
+        return { ...dialog, shiftRevenueByCurrency: currencyBucketObject(bucket), shiftRevenueCents: revenue.cents, shiftRevenueCurrency: revenue.currency, shiftRevenueUsd: revenue.currency === "USD" ? Math.round(revenue.cents || 0) / 100 : null, shiftTimeSharePct: sharePct };
+      });
+    } else if (Array.isArray(cleaned.topDialogSessions)) {
+      cleaned.topDialogSessions = cleaned.topDialogSessions.map((dialog) => ({ ...dialog, shiftTimeSharePct: cleaned.dialogDwellSeconds > 0 ? Math.round((num(dialog.dwellSeconds, 0) / cleaned.dialogDwellSeconds) * 100) : 0 }));
+    }
+    if (!includeMoney) {
+      cleaned.revenueAttributedCents = null;
+      cleaned.revenueByCurrency = null;
+      cleaned.revenueCurrency = null;
+      cleaned.dollarsPerMessageCents = null;
+      cleaned.ppvRevenueCents = null;
+      cleaned.ppvRevenueCurrency = null;
+      cleaned.ppvRevenueByCurrency = null;
+      cleaned.ppvSoldMessages = null;
+      cleaned.ppvOpenRatePct = null;
+      cleaned.moneySource = null;
+    }
+    byMember.set(memberId, cleaned);
+  }
+
+  const responseSource = projectionDetail.responseCoverage.status === "FULL" ? "team_response_case_v1" : (responseRange ? "bounded_projection_partial" : "unavailable");
+  const responseSummary = responseSummaryFromAggregate(totalResponseRow || {}, responseSource, projectionDetail.responseAvailableFrom?.toISOString?.() || null);
+  const activityCoverage = coverageState(range, historicalCoverage.activityCoverageFrom);
+  const moneyCoverage = coverageState(range, historicalCoverage.moneyCoverageFrom);
+  const rawDistinctCoverage = coverageState(range, projectionDetail.detailRetainedFrom);
+
+  return {
+    range,
+    members,
+    byMember,
+    responseSummary,
+    pendingSummary,
+    projection: {
+      responseCases: Math.max(0, rowNumber(totalResponseRow, "cases", 0)),
+      dialogSessions: Array.from(byMember.values()).reduce((sum, metric) => sum + Math.max(0, num(metric.dialogSessionsCount, 0)), 0),
+      responseSource,
+      dialogSessionSource: projectionDetail.dialogCoverage.status === "FULL" ? "team_dialog_session_v1" : (dialogRange ? "bounded_projection_partial" : "unavailable"),
+      responseCoverageFrom: projectionDetail.responseAvailableFrom?.toISOString?.() || null,
+      dialogCoverageFrom: projectionDetail.dialogAvailableFrom?.toISOString?.() || null,
+      unansweredSource: "team_pending_dialog_v1",
+      creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
+      readAuthority: "team_analytics_read_authority_v1",
+      queryShape: "sql_aggregate_bounded_v1",
+      historical: {
+        version: "team_historical_analytics_v1",
+        authoritySource: historicalCoverage.source,
+        rawDetailRetainedFrom: projectionDetail.detailRetainedFrom.toISOString(),
+        rawDetailDays: detailDays,
+        families: {
+          manualActivity: { ...activityCoverage, source: exactRawActivity ? "team_activity_event_v13_exact_sql" : historicalCoverage.activityProjectionVersion },
+          content: { ...activityCoverage, source: exactRawActivity ? "team_activity_event_v13_exact_sql" : historicalCoverage.activityProjectionVersion },
+          money: { ...moneyCoverage, source: historicalCoverage.moneyProjectionVersion },
+          responses: { ...projectionDetail.responseCoverage, source: "bounded_team_response_case_v1_sql" },
+          dialogs: { ...projectionDetail.dialogCoverage, source: "bounded_team_dialog_session_v1_sql" },
+          distinctFansAndLegacyActivity: { ...rawDistinctCoverage, source: "bounded_team_activity_detail_sql" },
+        },
+      },
+    },
+  };
+}
+
 
 async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = null }) {
   const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
@@ -1197,7 +1836,44 @@ function memberHasHistoricalActivity(metrics, revenueCents = 0) {
 }
 
 async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
-  const computed = await buildComputed({ agencyId, rangeKey, allowedCreatorIds });
+  const scaleAuthority = supportsTeamScaleReadAuthority();
+  if (!scaleAuthority && !isReducedTeamAnalyticsTestDouble()) {
+    throw analyticsUnavailable("scale_read_authority", new Error("TEAM_ANALYTICS_SCALE_READ_AUTHORITY_REQUIRED"));
+  }
+  const computed = scaleAuthority
+    ? await buildComputedScale({ agencyId, rangeKey, includeMoney, allowedCreatorIds })
+    : await buildComputed({ agencyId, rangeKey, allowedCreatorIds });
+
+  if (scaleAuthority) {
+    const rows = computed.members.map((member) => {
+      const shell = memberShell(member);
+      const metrics = computed.byMember.get(String(member.id)) || cleanMetric(emptyMetric());
+      const historicalValue = includeMoney ? Math.max(0, num(metrics.revenueAttributedCents, 0)) : 0;
+      return {
+        member: shell,
+        metrics,
+        rawSummary: null,
+        _historicalVisible: !member.deletedAt || memberHasHistoricalActivity(metrics, historicalValue),
+      };
+    }).filter((row) => row._historicalVisible).map(({ _historicalVisible, ...row }) => row);
+
+    return {
+      ok: true,
+      range: rangeForClient(computed.range),
+      snapshot: null,
+      members: rows,
+      source: "team_analytics_read_authority_v1",
+      projection: computed.projection,
+      responseSummary: computed.responseSummary,
+      pendingSummary: computed.pendingSummary || null,
+      moneyVisible: includeMoney === true,
+    };
+  }
+
+  // Unit-test / reduced-double compatibility path. Production Prisma exposes
+  // the aggregate + raw-query surface above; this branch preserves isolated
+  // semantic tests without turning historical materialization back into a
+  // production read authority.
   const [
     ppvRevenueByMember,
     tipLedgerRevenueByMember,
@@ -1324,7 +2000,8 @@ function combineOverview(metricsList, membersCount) {
     source: "team_historical_authority_v1",
   };
   const fans = new Set();
-  const responses = [];
+  let responseWeightedSeconds = 0;
+  let responseWeightedSamples = 0;
   let sla15Good = 0;
   let sla15Samples = 0;
 
@@ -1369,15 +2046,17 @@ function combineOverview(metricsList, membersCount) {
     if (num(m.creatorCoverage, 0) > 0) out.activeCreators += num(m.creatorCoverage, 0);
     out.eventsCount += num(m.activeEvents, 0);
     if (num(m.avgResponseSeconds, NaN) === num(m.avgResponseSeconds, NaN) && num(m.responseSamples, 0) > 0) {
-      for (let i = 0; i < num(m.responseSamples, 0); i++) responses.push(num(m.avgResponseSeconds, 0));
+      const samples = num(m.responseSamples, 0);
+      responseWeightedSeconds += num(m.avgResponseSeconds, 0) * samples;
+      responseWeightedSamples += samples;
       const pct15 = nullableNum(m.slaReply15mPct);
       if (pct15 !== null) {
-        sla15Good += (pct15 / 100) * num(m.responseSamples, 0);
-        sla15Samples += num(m.responseSamples, 0);
+        sla15Good += (pct15 / 100) * samples;
+        sla15Samples += samples;
       }
     }
   }
-  out.avgResponseSeconds = mean(responses);
+  out.avgResponseSeconds = responseWeightedSamples > 0 ? responseWeightedSeconds / responseWeightedSamples : null;
   out.slaReply15mPct = sla15Samples > 0 ? (sla15Good / sla15Samples) * 100 : null;
   const overviewCurrencies = Object.entries(out.revenueByCurrency || {});
   if (overviewCurrencies.length === 0) {
@@ -1400,11 +2079,10 @@ function combineOverview(metricsList, membersCount) {
   return out;
 }
 
-async function buildTeamOverview({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
-  const membersPayload = await buildTeamMembers({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
+function buildOverviewFromMembersPayload(membersPayload, includeMoney) {
   const overview = combineOverview(membersPayload.members.map((r) => r.metrics), membersPayload.members.length);
   const responseSummary = membersPayload.responseSummary;
-  if (responseSummary?.source === "team_response_case_v1") {
+  if (responseSummary?.source && responseSummary.source !== "none" && responseSummary.source !== "unavailable") {
     overview.incomingMessages = responseSummary.incomingHandled;
     overview.freshReplies = responseSummary.freshReplies;
     overview.backlogReplies = responseSummary.backlogReplies;
@@ -1447,20 +2125,64 @@ async function buildTeamOverview({ agencyId, rangeKey = "7d", includeMoney = tru
     overview.ppvSoldMessages = null;
     overview.ppvOpenRatePct = null;
   }
+  return overview;
+}
+
+const teamSnapshotFlights = new Map();
+
+function teamSnapshotKey({ agencyId, rangeKey, includeMoney, allowedCreatorIds }) {
+  const scope = Array.isArray(allowedCreatorIds) ? [...new Set(allowedCreatorIds.map(String))].sort().join(",") : "all";
+  return [String(agencyId), String(rangeKey || "7d"), includeMoney === true ? "money" : "no-money", scope].join("|");
+}
+
+async function buildTeamAnalyticsSnapshot({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
+  const key = teamSnapshotKey({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
+  const existing = teamSnapshotFlights.get(key);
+  if (existing) return existing;
+
+  const flight = (async () => {
+    const membersPayload = await buildTeamMembers({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
+    const overview = buildOverviewFromMembersPayload(membersPayload, includeMoney);
+    return {
+      ok: true,
+      range: membersPayload.range,
+      snapshot: {
+        authorityVersion: "team_analytics_read_authority_v1",
+        source: membersPayload.source,
+      },
+      overview,
+      members: membersPayload.members,
+      projection: membersPayload.projection || null,
+      responseSummary: membersPayload.responseSummary || null,
+      pendingSummary: membersPayload.pendingSummary || null,
+      moneyVisible: includeMoney === true,
+    };
+  })();
+  teamSnapshotFlights.set(key, flight);
+  try {
+    return await flight;
+  } finally {
+    if (teamSnapshotFlights.get(key) === flight) teamSnapshotFlights.delete(key);
+  }
+}
+
+async function buildTeamOverview({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
+  const snapshot = await buildTeamAnalyticsSnapshot({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
   return {
     ok: true,
-    range: membersPayload.range,
-    snapshot: null,
-    overview,
-    projection: membersPayload.projection || null,
-    responseSummary: membersPayload.responseSummary || null,
-    pendingSummary: membersPayload.pendingSummary || null,
-    moneyVisible: includeMoney === true,
+    range: snapshot.range,
+    snapshot: snapshot.snapshot,
+    overview: snapshot.overview,
+    projection: snapshot.projection,
+    responseSummary: snapshot.responseSummary,
+    pendingSummary: snapshot.pendingSummary,
+    moneyVisible: snapshot.moneyVisible,
   };
 }
 
 async function buildTeamAlerts({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
-  const membersPayload = await buildTeamMembers({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
+  const snapshot = await buildTeamAnalyticsSnapshot({ agencyId, rangeKey, includeMoney, allowedCreatorIds });
+  const membersPayload = { range: snapshot.range, members: snapshot.members };
   const alerts = [];
   if (includeMoney) {
     let jobConflicts;
@@ -1547,6 +2269,7 @@ async function buildTeamFlags({ agencyId, rangeKey = "7d", includeMoney = true, 
 }
 
 module.exports = {
+  buildTeamAnalyticsSnapshot,
   buildTeamOverview,
   buildTeamMembers,
   buildTeamAlerts,

@@ -33,7 +33,7 @@ function source(rel) {
   return fs.readFileSync(path.join(__dirname, rel), "utf8");
 }
 
-test("Phase2 lock topology: Agency normal holders are shared, destructive holders are exclusive, with rolling row-lock compatibility", async () => {
+test("Phase2 lock topology: Agency normal holders use advisory shared capability without Agency row lock; destructive holders remain exclusive", async () => {
   const shared = authorityFake();
   const sharedResult = await lockAgencyLifecycleBarrier({ db: shared.db, agencyId: "agency-1", mode: "shared" });
   assert.equal(sharedResult.mode, "shared");
@@ -42,8 +42,7 @@ test("Phase2 lock topology: Agency normal holders are shared, destructive holder
   assert.equal(shared.execute[0].args[0], "agency-lifecycle:agency-1");
   assert.equal(shared.query.length, 1);
   assert.match(shared.query[0].sql, /FROM "Agency"/);
-  assert.match(shared.query[0].sql, /FOR SHARE/);
-  assert.doesNotMatch(shared.query[0].sql, /FOR UPDATE/);
+  assert.doesNotMatch(shared.query[0].sql, /FOR SHARE|FOR UPDATE/);
 
   const exclusive = authorityFake();
   const exclusiveResult = await lockAgencyLifecycleBarrier({ db: exclusive.db, agencyId: "agency-1", mode: "exclusive" });
@@ -74,6 +73,14 @@ test("Phase2 lock topology: management commit no longer owns an Agency exclusive
   assert.match(management, /lockAgencyLifecycleBarrier/);
   assert.doesNotMatch(management, /FROM "Agency"[\s\S]{0,180}FOR UPDATE/);
   assert.doesNotMatch(management, /FROM "Agency"[\s\S]{0,180}FOR SHARE/);
+});
+
+test("Phase2 lock topology: shared lifecycle no longer couples normal work to billing Agency row writers", () => {
+  const lifecycle = source("agency-lifecycle-barrier-service.js");
+  const billing = source("billing-entitlement-service.js");
+  assert.match(lifecycle, /normalizedMode === "exclusive" \? " FOR UPDATE" : ""/);
+  assert.doesNotMatch(lifecycle, /"FOR SHARE"/);
+  assert.match(billing, /FROM "Agency"[\s\S]{0,240}FOR UPDATE/);
 });
 
 test("Phase2 lock topology: destructive Agency delete and restore use the exclusive lifecycle capability", () => {

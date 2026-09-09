@@ -1,7 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { findCancelledModelInstructionFollowupDebt, findConfirmedTelegramProjectionDebt } = require("./telegram-exact-authority-scan-service");
+const { DEBT, providerOperationalBackfillReady, customExternalProofBackfillReady, countProviderOperationalDebt } = require("./provider-operational-debt-authority-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { lockAgencyLifecycleBarrier, agencyLifecycleBarrierKey } = require("./agency-lifecycle-barrier-service");
 
@@ -575,46 +575,6 @@ async function customSubmissionExternalEffectConvergence({ db, agencyId, submiss
   };
 }
 
-async function findCompletedCustomExternalProjectionDebt({ db, agencyId, creatorId = null }) {
-  if (!db.automationDelivery?.findMany) return [];
-  const debt = [];
-  let cursor = null;
-  for (;;) {
-    const rows = await db.automationDelivery.findMany({
-      where: {
-        agencyId,
-        ...(creatorId ? { creatorId } : {}),
-        actionType: { in: CUSTOM_EXTERNAL_ACTION_TYPES },
-        status: "COMPLETED",
-      },
-      select: { id: true, creatorId: true, actionType: true, targetId: true, status: true, failureCode: true, payload: true, result: true, messageId: true, updatedAt: true },
-      orderBy: [{ id: "asc" }],
-      take: 200,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-    });
-    if (!rows.length) break;
-    cursor = rows[rows.length - 1].id;
-    for (const row of rows) {
-      const payload = row.payload && typeof row.payload === "object" && !Array.isArray(row.payload) ? row.payload : {};
-      const result = row.result && typeof row.result === "object" && !Array.isArray(row.result) ? row.result : {};
-      const submissionId = clean(payload.submissionId || result.submissionId || (String(row.actionType) === "CUSTOM_RELAY_SEND" ? String(row.targetId || "").split(":")[0] : ""), 180);
-      const orderId = clean(payload.customOrderId || result.customOrderId || (String(row.actionType) === "CUSTOM_MANUAL_SEND" ? row.targetId : ""), 180);
-      const [submission, order] = await Promise.all([
-        submissionId && db.customContentSubmission?.findFirst
-          ? db.customContentSubmission.findFirst({ where: { id: submissionId, agencyId, creatorId: row.creatorId }, select: { id: true, ofMediaIds: true } })
-          : Promise.resolve(null),
-        orderId && db.customOrder?.findFirst
-          ? db.customOrder.findFirst({ where: { id: orderId, agencyId, creatorId: row.creatorId }, select: { id: true, deliveryMessageIds: true, deliverySentMediaIds: true } })
-          : Promise.resolve(null),
-      ]);
-      const classification = customExternalWriteClassification({ delivery: row, submission, order });
-      if (!classification.converged) debt.push({ deliveryId: String(row.id), creatorId: String(row.creatorId), actionType: String(row.actionType), ...classification });
-    }
-    if (rows.length < 200) break;
-  }
-  return debt;
-}
-
 async function assertCustomSubmissionExternalEffectsConverged({ db, agencyId, submission, order = undefined }) {
   const convergence = await customSubmissionExternalEffectConvergence({ db, agencyId, submission, order });
   if (!convergence.converged) {
@@ -818,7 +778,7 @@ async function reportSubmissionExecutionAttempt({
 }
 
 async function creatorCustomPipelineBlockers({ db, agencyId, creatorId }) {
-  const [pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebtRows, latentConfirmedProjectionDebtRows, completedExternalProjectionDebtRows] = await Promise.all([
+  const [pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, providerWorksetReady, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt, completedExternalProjectionDebtRows, externalProofBackfillReady] = await Promise.all([
     // Every PENDING CustomOrder is live business work. CALL / PHYSICAL do not
     // use the Content submission pipeline, but retiring their creator would
     // still orphan their task/reminder/status lifecycle.
@@ -852,21 +812,23 @@ async function creatorCustomPipelineBlockers({ db, agencyId, creatorId }) {
         },
       })
       : Promise.resolve(0),
-    findCancelledModelInstructionFollowupDebt({ agencyId, creatorIds: [creatorId], db }),
-    findConfirmedTelegramProjectionDebt({ agencyId, creatorIds: [creatorId], db, onlyUnmarked: true }),
-    findCompletedCustomExternalProjectionDebt({ db, agencyId, creatorId }),
+    providerOperationalBackfillReady({ db }),
+    countProviderOperationalDebt({ agencyId, creatorId, db, debtClasses: [DEBT.CANCELLATION_FOLLOWUP_DEBT] }),
+    countProviderOperationalDebt({ agencyId, creatorId, db, debtClasses: [DEBT.CONFIRMED_PROJECTION_DEBT] }),
+    countProviderOperationalDebt({ agencyId, creatorId, db, debtClasses: [DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT] }),
+    customExternalProofBackfillReady({ db }),
   ]);
-  const cancelledTelegramFollowupDebt = cancelledTelegramFollowupDebtRows.length;
-  const confirmedTelegramProjectionDebt = latentConfirmedProjectionDebtRows.length;
-  const completedExternalProjectionDebt = completedExternalProjectionDebtRows.length;
+  const completedExternalProjectionDebt = Number(completedExternalProjectionDebtRows || 0);
+  const providerOperationalBackfillIncomplete = providerWorksetReady ? 0 : 1;
+  const customExternalProofBackfillIncomplete = externalProofBackfillReady ? 0 : 1;
   return {
-    pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt, completedExternalProjectionDebt,
-    total: pendingOrders + activeSubmissions + activeWrites + activeTelegramDeliveries + unresolvedInboundEvents + cancelledTelegramFollowupDebt + confirmedTelegramProjectionDebt + completedExternalProjectionDebt,
+    pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt, completedExternalProjectionDebt, providerOperationalBackfillIncomplete, customExternalProofBackfillIncomplete,
+    total: pendingOrders + activeSubmissions + activeWrites + activeTelegramDeliveries + unresolvedInboundEvents + cancelledTelegramFollowupDebt + confirmedTelegramProjectionDebt + completedExternalProjectionDebt + providerOperationalBackfillIncomplete + customExternalProofBackfillIncomplete,
   };
 }
 
 async function agencyCustomPipelineBlockers({ db, agencyId }) {
-  const [pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebtRows, latentConfirmedProjectionDebtRows, completedExternalProjectionDebtRows] = await Promise.all([
+  const [pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, providerWorksetReady, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt, completedExternalProjectionDebtRows, externalProofBackfillReady] = await Promise.all([
     db.customOrder.count({ where: { agencyId, status: "PENDING" } }),
     db.customContentSubmission.count({ where: { agencyId, ...unresolvedPipelineSubmissionWhere() } }),
     db.automationDelivery.count({ where: {
@@ -895,16 +857,18 @@ async function agencyCustomPipelineBlockers({ db, agencyId }) {
         },
       })
       : Promise.resolve(0),
-    findCancelledModelInstructionFollowupDebt({ agencyId, db }),
-    findConfirmedTelegramProjectionDebt({ agencyId, db, onlyUnmarked: true }),
-    findCompletedCustomExternalProjectionDebt({ db, agencyId }),
+    providerOperationalBackfillReady({ db }),
+    countProviderOperationalDebt({ agencyId, db, debtClasses: [DEBT.CANCELLATION_FOLLOWUP_DEBT] }),
+    countProviderOperationalDebt({ agencyId, db, debtClasses: [DEBT.CONFIRMED_PROJECTION_DEBT] }),
+    countProviderOperationalDebt({ agencyId, db, debtClasses: [DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT] }),
+    customExternalProofBackfillReady({ db }),
   ]);
-  const cancelledTelegramFollowupDebt = cancelledTelegramFollowupDebtRows.length;
-  const confirmedTelegramProjectionDebt = latentConfirmedProjectionDebtRows.length;
-  const completedExternalProjectionDebt = completedExternalProjectionDebtRows.length;
+  const completedExternalProjectionDebt = Number(completedExternalProjectionDebtRows || 0);
+  const providerOperationalBackfillIncomplete = providerWorksetReady ? 0 : 1;
+  const customExternalProofBackfillIncomplete = externalProofBackfillReady ? 0 : 1;
   return {
-    pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt, completedExternalProjectionDebt,
-    total: pendingOrders + activeSubmissions + activeWrites + activeTelegramDeliveries + unresolvedInboundEvents + cancelledTelegramFollowupDebt + confirmedTelegramProjectionDebt + completedExternalProjectionDebt,
+    pendingOrders, activeSubmissions, activeWrites, activeTelegramDeliveries, unresolvedInboundEvents, cancelledTelegramFollowupDebt, confirmedTelegramProjectionDebt, completedExternalProjectionDebt, providerOperationalBackfillIncomplete, customExternalProofBackfillIncomplete,
+    total: pendingOrders + activeSubmissions + activeWrites + activeTelegramDeliveries + unresolvedInboundEvents + cancelledTelegramFollowupDebt + confirmedTelegramProjectionDebt + completedExternalProjectionDebt + providerOperationalBackfillIncomplete + customExternalProofBackfillIncomplete,
   };
 }
 
@@ -936,7 +900,6 @@ module.exports = {
   customExternalWriteClassification,
   customSubmissionExternalEffectConvergence,
   assertCustomSubmissionExternalEffectsConverged,
-  findCompletedCustomExternalProjectionDebt,
   disposition,
   normalizedSettlementMediaIds,
   vaultSettlementFingerprint,

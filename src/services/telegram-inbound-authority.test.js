@@ -53,6 +53,31 @@ function fixture({ projectedIdentity = false }={}) {
       async findFirst({where}){return clone(matches(account,where)?account:null);},
       async findMany({where}){return matches(account,where)?[{id:account.id,lifecycleState:account.lifecycleState}]:[];},
     },
+    maintenanceLaneState:{
+      async findUnique({where}){
+        if(where.key==="provider_operational_debt_backfill_v1") return {key:where.key,generation:"provider_operational_debt_v1",completedAt:new Date(now.getTime()-1000)};
+        if(where.key==="custom_external_proof_backfill_v1") return {key:where.key,generation:"custom_external_proof_backfill_v1",completedAt:new Date(now.getTime()-1000)};
+        return null;
+      },
+    },
+    providerOperationalDebt:{
+      async findMany({where={},take=1000}={}){
+        const creatorIds=new Set((where.creatorId?.in||[]).map(String));
+        const classes=new Set((where.debtClass?.in||[]).map(String));
+        const rows=[];
+        for(const intent of intents){
+          if(String(intent.state)!=="CONFIRMED"||!["TASK","REVISION_REQUEST"].includes(String(intent.kind)))continue;
+          const order=orders.find((x)=>String(x.id)===String(intent.customOrderId)&&String(x.status)==="PENDING");
+          if(!order)continue;
+          const row={id:`pod-${intent.id}`,agencyId:intent.agencyId,creatorId:intent.creatorId,accountId:intent.accountId,debtClass:"CURRENT_PROVIDER_THREAD_CAPABILITY",objectType:"CustomOrder",objectId:order.id,customOrderId:order.id,updatedAt:new Date(now)};
+          if(where.agencyId&&String(row.agencyId)!==String(where.agencyId))continue;
+          if(creatorIds.size&&!creatorIds.has(String(row.creatorId)))continue;
+          if(classes.size&&!classes.has(String(row.debtClass)))continue;
+          rows.push(row);
+        }
+        return rows.slice(0,take).map(clone);
+      },
+    },
     telegramDeliveryIntent:{
       async findFirst({where}){return clone(intents.find((r)=>matches(r,where))||null);},
       async findMany({where,take}){const rows=intents.filter((r)=>matches(r,where));return (take==null?rows:rows.slice(0,take)).map(clone);},

@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: {} };
-const { listTeamPendingDialogs, summarizePendingRows, summarizePendingWhere, repairStaleLegacyBootstrapPending } = require("./team-pending-read-service");
+const { listTeamPendingDialogs, summarizePendingRows, summarizePendingWhere } = require("./team-pending-read-service");
 
 function makeDb() {
   const rows = [
@@ -175,31 +175,3 @@ test("indexed member pending summary never widens owner scope", async () => {
 });
 
 
-test("legacy bootstrap repair clears only ancient pending whose latest incoming is still the legacy bootstrap event", async () => {
-  const pending = [
-    { id: "old-bootstrap", agencyId: "agency-1", creatorId: "creator-1", status: "PENDING", lastIncomingAt: new Date("2026-01-01T00:00:00Z"), lastIncomingEventId: "event-old" },
-    { id: "old-live", agencyId: "agency-1", creatorId: "creator-1", status: "PENDING", lastIncomingAt: new Date("2026-01-01T00:00:00Z"), lastIncomingEventId: "event-live" },
-    { id: "recent-bootstrap", agencyId: "agency-1", creatorId: "creator-1", status: "PENDING", lastIncomingAt: new Date("2026-08-10T00:00:00Z"), lastIncomingEventId: "event-recent" },
-  ];
-  let cleared = [];
-  const db = {
-    teamPendingDialogState: {
-      async findMany({ where }) {
-        return pending.filter((row) => row.status === "PENDING" && row.lastIncomingAt <= where.lastIncomingAt.lte);
-      },
-      async updateMany({ where }) { cleared = where.id.in.slice(); return { count: cleared.length }; },
-    },
-    teamActivityEvent: {
-      async findMany() {
-        return [
-          { id: "event-old", ts: new Date("2026-01-01T00:00:00Z"), extra: { sourceDetail: "crm_pending_bootstrap_v1" } },
-          { id: "event-live", ts: new Date("2026-01-01T00:00:00Z"), extra: { sourceDetail: "creator_runtime_ws" } },
-          { id: "event-recent", ts: new Date("2026-08-10T00:00:00Z"), extra: { sourceDetail: "crm_pending_bootstrap_v1" } },
-        ];
-      },
-    },
-  };
-  const result = await repairStaleLegacyBootstrapPending({ agencyId: "agency-1", allowedCreatorIds: ["creator-1"], now: new Date("2026-08-12T10:00:00Z"), db });
-  assert.equal(result.cleared, 1);
-  assert.deepEqual(cleared, ["old-bootstrap"]);
-});
