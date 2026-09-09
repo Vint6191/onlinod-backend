@@ -110,8 +110,9 @@ test("completion reconciles OF earnings after undo refunds while keeping loading
 test("financial scanner has its own manual job and endpoints, independent of notifications", () => {
   assert.match(catalog, /financial_transactions_scan/);
   assert.match(control, /manualFinancialTransactionScan:\s*true/);
-  assert.match(control, /buildCollectionCommand\(\{ collectorType: COLLECTOR_TYPES\.FINANCIAL, collectionMode: "full", reason: MANUAL_REASON, now \}\)/);
-  assert.match(control, /const snapshotMarker = Math\.floor\(now\.getTime\(\) \/ 1000\)/);
+  assert.match(control, /authorityNow = await dbAuthorityNow\(\{ db: tx, fallbackNow: now \}\)/);
+  assert.match(control, /buildCollectionCommand\(\{ collectorType: COLLECTOR_TYPES\.FINANCIAL, collectionMode: "full", reason: MANUAL_REASON, now: authorityNow \}\)/);
+  assert.match(control, /const snapshotMarker = Math\.floor\(authorityNow\.getTime\(\) \/ 1000\)/);
   assert.match(control, /initialMarker:\s*snapshotMarker/);
   assert.match(control, /endDate:\s*onlyFansUtcDateTime\(new Date\(snapshotMarker \* 1000\)\)/);
   assert.match(control, /status:\s*"PAUSED"/);

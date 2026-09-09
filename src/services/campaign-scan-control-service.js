@@ -4,6 +4,8 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
 const { readCampaignsWithRevenue } = require("./creator-analytics-ledger-service");
 const {
   buildCollectionCommand, buildCollectionPlanningDedupeParams, withCollectorStateLock, COLLECTOR_TYPES,
@@ -69,16 +71,17 @@ async function activeCollectorJob(db, creatorId) {
   });
   return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
 }
-async function countOnlineBindings(db, creator) {
-  const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
+async function countOnlineBindings(db, creator, now = null) {
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now || new Date() });
+  const freshnessWindow = capabilityFreshnessWindow(authorityNow, 2 * 60 * 1000);
   return db.deviceCreatorBinding.count({
     where: {
       creatorId: creator.id,
       agencyId: creator.agencyId,
       status: "ACTIVE",
       sessionReadReady: true,
-      lastSeenAt: { gte: freshAfter },
-      device: { lastSeenAt: { gte: freshAfter } },
+      lastSeenAt: freshnessWindow,
+      device: { lastSeenAt: freshnessWindow },
     },
   });
 }
@@ -86,11 +89,12 @@ async function countOnlineBindings(db, creator) {
 async function startManualCampaignScan({ db = prisma, creator, requestedByUserId = null, now = new Date() }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: creator.id, work: async (tx) => {
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow: now });
     const active = await activeCollectorJob(tx, creator.id);
     if (active?.status === "PAUSED") {
       const planned = await reschedulePlannedJob({
         db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
-        scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
+        scheduledAt: authorityNow, nextRunAt: authorityNow, continuation: active.continuation || null, progress: active.progress || null,
         lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
         protectedStatuses: [],
       });
@@ -107,7 +111,7 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
       manualRunToken: crypto.randomUUID(),
       requestedByUserId: clean(requestedByUserId, 220),
       reason: MANUAL_REASON,
-      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "full", reason: MANUAL_REASON, now }),
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "full", reason: MANUAL_REASON, now: authorityNow }),
       pageSize: 50,
       maxPages: 40,
       claimerPageSize: 50,
@@ -115,7 +119,7 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
       fanValueBatchSize: 20,
     };
     const scheduled = await scheduleJobNow({
-      db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId, params, priority: 100, now, bucketMs: 1,
+      db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId, params, priority: 100, now: authorityNow, bucketMs: 1,
       dedupeParams: buildCollectionPlanningDedupeParams({
         collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "full", state,
       }),
@@ -128,6 +132,7 @@ async function stopManualCampaignScan({ db = prisma, creatorId, now = new Date()
   const active = await activeJob(db, creatorId);
   if (!active) return { job: null, action: "idle" };
   if (active.status === "PAUSED") return { job: active, action: "already_paused" };
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
   const result = await db.jobInstance.updateMany({
     where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED"] } },
     data: {
@@ -140,7 +145,7 @@ async function stopManualCampaignScan({ db = prisma, creatorId, now = new Date()
       workId: null,
       completedAt: null,
       lastError: null,
-      lastProgressAt: active.lastProgressAt || now,
+      lastProgressAt: active.lastProgressAt || authorityNow,
     },
   });
   if (!result.count) {

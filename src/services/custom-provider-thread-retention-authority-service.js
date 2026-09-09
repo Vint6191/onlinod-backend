@@ -2,6 +2,7 @@
 
 const { scanAllById } = require("./telegram-exact-authority-scan-service");
 const { confirmedTaskBinding, pinnedSubmissionSourceBinding } = require("./custom-revision-provider-binding-authority-service");
+const { isActiveTelegramAccount } = require("./telegram-account-reference-authority-service");
 
 const PAGE = 200;
 function clean(value, max = 180) { const text=String(value==null?"":value).trim(); return text ? text.slice(0,max) : ""; }
@@ -16,7 +17,7 @@ function latestRevisionForSubmission(rows, submissionId) {
 }
 function accountActive(accountById, accountId) {
   const row=accountById.get(String(accountId||""));
-  return Boolean(row) && String(row.lifecycleState||"ACTIVE")==="ACTIVE";
+  return isActiveTelegramAccount(row);
 }
 function futureRevisionCandidates({ task, submission }) {
   return [confirmedTaskBinding(task), pinnedSubmissionSourceBinding(submission)].filter(Boolean);

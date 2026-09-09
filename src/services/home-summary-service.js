@@ -17,6 +17,7 @@ const {
   HISTORICAL_FRESHNESS_MS,
 } = require("./analytics-freshness-policy");
 const { evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 function availability(available, reason = null) {
   return { available: available === true, reason: available === true ? null : (reason || "UNAVAILABLE") };
@@ -311,7 +312,7 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d" }) {
     error.status = 403;
     throw error;
   }
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   let homeRangeKey;
   try {
     homeRangeKey = normalizeHomeRangeKey(rangeKey);

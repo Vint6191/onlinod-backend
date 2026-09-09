@@ -11,6 +11,7 @@ const {
 } = require("./analytics-collector-control-service");
 const { evaluateCollectionState, evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
 const { earningsFreshnessLimitMs, trustedCollectionTimestamp } = require("./analytics-freshness-policy");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v7";
 const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", CAMPAIGN_COLLECTOR_VERSION]);
@@ -151,6 +152,7 @@ async function beginBatch(tx, { job, agencyId, creatorId, deviceId, idempotencyK
   return { batch, replay: false };
 }
 async function finishBatch(tx, batchId, counts, status = "COMMITTED", errorCode = null, errorMessage = null) {
+  const completedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
   return tx.analyticsIngestBatch.update({
     where: { id: batchId },
     data: {
@@ -160,7 +162,7 @@ async function finishBatch(tx, batchId, counts, status = "COMMITTED", errorCode 
       updatedRows: counts.updated || 0,
       unchangedRows: counts.unchanged || 0,
       rejectedRows: counts.rejected || 0,
-      completedAt: new Date(),
+      completedAt,
       lastErrorCode: errorCode,
       lastErrorMessage: errorMessage,
     },
@@ -295,7 +297,7 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
   const rangeFrom = rows[0]?.date || requestedRange.dayStart;
   const rangeTo = rows.length ? utcDayEnd(rows.at(-1).date) : utcDayEnd(requestedRange.dayEnd);
   return inTransaction(db, async (tx) => {
-    const serverReceivedAt = new Date();
+    const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     await acquireAnalyticsLock(tx, "creator-earnings", job.creatorId);
     const { batch, replay } = await beginBatch(tx, {
       job,
@@ -396,7 +398,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
   const key = `earnings:${job.id}:run:${scanRunId}:completion:v4`;
   if (key.length > 240) throw new Error("Earnings completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
-    const serverReceivedAt = new Date();
+    const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const { batch, replay } = await beginBatch(tx, {
       job,
       deviceId,
@@ -623,7 +625,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
   const scanStartedAt = command.requestedAt;
-  const observedAt = new Date();
+  const processObservedAt = new Date();
   if (
     !batchKey || !scanRunId || scanRunId !== command.generation ||
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
@@ -644,13 +646,14 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
+    const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: processObservedAt });
     const { batch, replay } = await beginBatch(tx, {
       job,
       deviceId,
       idempotencyKey,
       dataType: "CAMPAIGNS",
       rangeFrom: scanStartedAt,
-      rangeTo: observedAt,
+      rangeTo: serverReceivedAt,
       collectorVersion: payload.collectorVersion,
       schemaVersion: payload.schemaVersion,
       payload,
@@ -691,7 +694,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
           ...(campaign.clicksCount !== null ? { clicksCount: campaign.clicksCount } : {}),
           sourceScanRunId: scanRunId,
           sourceScanStartedAt: scanStartedAt,
-          collectedAt: observedAt,
+          collectedAt: serverReceivedAt,
           sourceDeviceId: deviceId || null,
           sourceJobId: job.id,
         };
@@ -703,7 +706,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
             ...campaign,
             sourceScanRunId: scanRunId,
             sourceScanStartedAt: scanStartedAt,
-            collectedAt: observedAt,
+            collectedAt: serverReceivedAt,
             sourceDeviceId: deviceId || null,
             sourceJobId: job.id,
           },
@@ -742,7 +745,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     unchanged += duplicateClaimers;
 
     for (const claimer of uniqueClaimers.values()) {
-      const seenAt = claimer.attributedAt || observedAt;
+      const seenAt = claimer.attributedAt || serverReceivedAt;
       const fan = await projectFanIdentity(tx, {
         agencyId: job.agencyId,
         creatorId: job.creatorId,
@@ -782,7 +785,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
           attributedAt: claimer.attributedAt,
           sourceScanRunId: scanRunId,
           sourceScanStartedAt: scanStartedAt,
-          collectedAt: observedAt,
+          collectedAt: serverReceivedAt,
           sourceDeviceId: deviceId || null,
           sourceJobId: job.id,
         },
@@ -794,7 +797,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
           attributedAt,
           sourceScanRunId: scanRunId,
           sourceScanStartedAt: scanStartedAt,
-          collectedAt: observedAt,
+          collectedAt: serverReceivedAt,
           sourceDeviceId: deviceId || null,
           sourceJobId: job.id,
         },
@@ -822,11 +825,13 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
 
 function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
   const item = object(payload);
-  const observedAt = strictDate(item.observedAt ?? inheritedObservedAt);
+  // Desktop observation time is retained as provenance only. Canonical FanData
+  // ordering is stamped from PostgreSQL receipt time inside the ingest tx.
+  const clientObservedAt = strictDate(item.observedAt ?? inheritedObservedAt);
   const onlyFansUserId = text(item.fanOnlyFansUserId, 180);
-  if (!observedAt || !onlyFansUserId) throw new Error("Invalid campaign fan value item contract");
+  if (!clientObservedAt || !onlyFansUserId) throw new Error("Invalid campaign fan value item contract");
   if (item.available !== true) {
-    return { available: false, observedAt, onlyFansUserId, reasonCode: text(item.reasonCode, 180) || "FAN_VALUE_UNAVAILABLE" };
+    return { available: false, clientObservedAt, onlyFansUserId, reasonCode: text(item.reasonCode, 180) || "FAN_VALUE_UNAVAILABLE" };
   }
   const values = {
     totalSpentCents: safeBigIntCents(item.totalSpentCents ?? item.totalNetCents),
@@ -840,7 +845,7 @@ function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
   const lastActivityAt = item.lastActivityAt == null ? null : strictDate(item.lastActivityAt);
   if (item.lastActivityAt != null && !lastActivityAt) throw new Error("Campaign fan value lastActivityAt is invalid");
   return {
-    available: true, observedAt, onlyFansUserId, values, lastActivityAt,
+    available: true, clientObservedAt, onlyFansUserId, values, lastActivityAt,
     username: text(item.username, 200),
     displayName: text(item.displayName, 500),
     avatarUrl: text(item.avatarUrl, 1200),
@@ -850,8 +855,10 @@ function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
   };
 }
 
-async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }) {
+async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }) {
   if (item.available !== true) return { available: false, reasonCode: item.reasonCode };
+  const observedAt = strictDate(authorityObservedAt);
+  if (!observedAt) throw new Error("Campaign fan value authority receipt time is invalid");
   const fan = await projectFanIdentity(tx, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
@@ -860,7 +867,7 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }) 
     platformDisplayName: item.displayName,
     avatarUrl: item.avatarUrl,
     headerUrl: item.headerUrl,
-    observedAt: item.observedAt,
+    observedAt,
     source: item.identitySource || "USER_PROFILE",
   });
   const projected = await projectFanValue(tx, {
@@ -875,7 +882,7 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }) 
     streamsSpentCents: item.values.streamsSpentCents,
     lastActivityAt: item.lastActivityAt,
     availability: "AVAILABLE",
-    observedAt: item.observedAt,
+    observedAt,
     source: item.valueSource || "USER_PROFILE",
     sourceDeviceId: deviceId || null,
     sourceJobId: job.id,
@@ -885,7 +892,7 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }) 
     replay: projected.replay,
     available: true,
     fanRecordId: fan.id,
-    fetchedAt: projected.record?.valueObservedAt || item.observedAt,
+    fetchedAt: projected.record?.valueObservedAt || observedAt,
   };
 }
 
@@ -908,7 +915,8 @@ async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
-    return upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item });
+    const authorityObservedAt = await dbAuthorityNow({ db: tx, fallbackNow: observedAt });
+    return upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt });
   });
 }
 
@@ -932,8 +940,9 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation, received: values.length, available: 0, unavailable: 0, applied: [] };
+    const authorityObservedAt = await dbAuthorityNow({ db: tx, fallbackNow: observedAt });
     const applied = [];
-    for (const item of normalized) applied.push(await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item }));
+    for (const item of normalized) applied.push(await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }));
     return { replay: applied.every((row) => row.replay === true), received: normalized.length, available: applied.filter((row) => row.available === true).length, unavailable: applied.filter((row) => row.available !== true).length, applied };
   });
 }
@@ -944,7 +953,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
   const scanStartedAt = command.requestedAt;
-  const observedAt = new Date();
+  const processObservedAt = new Date();
   if (
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion) ||
     !scanRunId || scanRunId !== command.generation
@@ -963,13 +972,14 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { complete: true, replay: false, superseded: true, proof: { newerGeneration: generation.state?.activeGeneration || null } };
+    const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: processObservedAt });
     const { batch, replay } = await beginBatch(tx, {
       job,
       deviceId,
       idempotencyKey: key,
       dataType: "CAMPAIGNS",
       rangeFrom: scanStartedAt,
-      rangeTo: observedAt,
+      rangeTo: serverReceivedAt,
       collectorVersion: payload.collectorVersion,
       schemaVersion: payload.schemaVersion,
       payload,
@@ -1260,7 +1270,8 @@ async function readCampaignRevenue({ db, creatorId, start = null, end = null }) 
   }]));
 }
 
-async function readCreatorCoverage({ db = prisma, creatorId, rangeKey, limit = 120, offset = 0, now = new Date() }) {
+async function readCreatorCoverage({ db = prisma, creatorId, rangeKey, limit = 120, offset = 0, now = new Date(), authorityResolved = false }) {
+  if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
   const range = rangeBounds(rangeKey, now);
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
   const take = Math.max(1, Math.min(500, Number(limit) || 120));
@@ -1286,7 +1297,8 @@ async function readCreatorCoverage({ db = prisma, creatorId, rangeKey, limit = 1
   };
 }
 
-async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now = new Date(), includeMessages = true, includeCoveragePage = true }) {
+async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now = new Date(), includeMessages = true, includeCoveragePage = true, authorityResolved = false }) {
+  if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
   const range = rangeBounds(rangeKey, now);
   const eventBetween = { gte: range.start, lte: range.end };
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
@@ -1303,7 +1315,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     db.creatorTip.aggregate({ where: { creatorId, tippedAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } }),
     db.creatorSubscriptionEvent.groupBy({ by: ["eventType"], where: { creatorId, occurredAt: eventBetween }, _count: { _all: true }, _sum: { observedPriceCents: true } }),
     db.creatorCampaign.findMany({ where: { creatorId }, include: { _count: { select: { fans: true } } }, orderBy: [{ isActive: "desc" }, { collectedAt: "desc" }], take: 2000 }),
-    includeCoveragePage ? readCreatorCoverage({ db, creatorId, rangeKey, limit: 120, offset: 0, now }) : Promise.resolve({ rows: [], pagination: { limit: 0, offset: 0, returned: 0, total: 0, hasMore: false } }),
+    includeCoveragePage ? readCreatorCoverage({ db, creatorId, rangeKey, limit: 120, offset: 0, now, authorityResolved: true }) : Promise.resolve({ rows: [], pagination: { limit: 0, offset: 0, returned: 0, total: 0, hasMore: false } }),
     db.analyticsCoverage.findMany({
       where: {
         creatorId, dataType: "EARNINGS", sourceTimezone: "UTC",
@@ -1490,7 +1502,8 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   };
 }
 
-async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50, offset = 0, rangeKey = null, now = new Date() }) {
+async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50, offset = 0, rangeKey = null, now = new Date(), authorityResolved = false }) {
+  if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
   const take = Math.max(1, Math.min(100, Number(limit) || 50));
   const skip = Math.max(0, Math.min(1_000_000, Number(offset) || 0));
   const campaign = await db.creatorCampaign.findFirst({

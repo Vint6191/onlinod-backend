@@ -4,6 +4,8 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
 const { JOB_KEY, SCHEMA_VERSION, COLLECTOR_VERSION, summarizeStatusGroups } = require("./financial-transactions-service");
 const {
   buildCollectionCommand, buildCollectionPlanningDedupeParams, withCollectorStateLock, COLLECTOR_TYPES,
@@ -70,12 +72,13 @@ async function activeCollectorJob(db, creatorId) {
   });
   return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
 }
-async function countOnlineBindings(db, creator) {
-  const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
+async function countOnlineBindings(db, creator, now = null) {
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now || new Date() });
+  const freshnessWindow = capabilityFreshnessWindow(authorityNow, 2 * 60 * 1000);
   return db.deviceCreatorBinding.count({
     where: {
-      creatorId: creator.id, agencyId: creator.agencyId, status: "ACTIVE", sessionReadReady: true, lastSeenAt: { gte: freshAfter },
-      device: { lastSeenAt: { gte: freshAfter } },
+      creatorId: creator.id, agencyId: creator.agencyId, status: "ACTIVE", sessionReadReady: true, lastSeenAt: freshnessWindow,
+      device: { lastSeenAt: freshnessWindow },
     },
   });
 }
@@ -83,6 +86,7 @@ async function countOnlineBindings(db, creator) {
 async function startManualFinancialTransactionScan({ db = prisma, creator, requestedByUserId = null, now = new Date() }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: creator.id, work: async (tx) => {
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow: now });
     // Manual and automatic starts share one collector planning boundary. The
     // read is repeated under the same advisory lock used by accept/complete, so
     // a cross-replica manual click cannot create a second provider traversal.
@@ -90,7 +94,7 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
     if (active?.status === "PAUSED") {
       const planned = await reschedulePlannedJob({
         db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
-        scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
+        scheduledAt: authorityNow, nextRunAt: authorityNow, continuation: active.continuation || null, progress: active.progress || null,
         lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
         protectedStatuses: [],
       });
@@ -102,14 +106,14 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
       ? await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: creator.id } })
       : null;
     const manualRunToken = crypto.randomUUID();
-    const snapshotMarker = Math.floor(now.getTime() / 1000);
+    const snapshotMarker = Math.floor(authorityNow.getTime() / 1000);
     const params = {
       manualFinancialTransactionScan: true,
       manualFinancialTransactionScanVersion: 1,
       manualRunToken,
       requestedByUserId: clean(requestedByUserId, 220),
       reason: MANUAL_REASON,
-      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", reason: MANUAL_REASON, now }),
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", reason: MANUAL_REASON, now: authorityNow }),
       startDate: "2016-01-01 00:00:00",
       endDate: onlyFansUtcDateTime(new Date(snapshotMarker * 1000)),
       initialMarker: snapshotMarker,
@@ -118,7 +122,7 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
     };
     const scheduled = await scheduleJobNow({
       db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId,
-      params, priority: 100, now, bucketMs: 1,
+      params, priority: 100, now: authorityNow, bucketMs: 1,
       dedupeParams: buildCollectionPlanningDedupeParams({
         collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", state,
       }),
@@ -131,12 +135,13 @@ async function stopManualFinancialTransactionScan({ db = prisma, creatorId, now 
   const active = await activeJob(db, creatorId);
   if (!active) return { job: null, action: "idle" };
   if (active.status === "PAUSED") return { job: active, action: "already_paused" };
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
   const result = await db.jobInstance.updateMany({
     where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED"] } },
     data: {
       status: "PAUSED", claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
       leaseRevision: { increment: 1 }, workId: null, completedAt: null, lastError: null,
-      lastProgressAt: active.lastProgressAt || now,
+      lastProgressAt: active.lastProgressAt || authorityNow,
     },
   });
   if (!result.count) {

@@ -73,7 +73,8 @@ test("campaign transport is page-oriented and notification engagement is accepte
   assert.match(ledger, /MESSAGES_DAILY/);
   assert.match(ledger, /LOCAL_MESSAGE_HISTORY_INCOMPLETE/);
   const routes = fs.readFileSync(path.join(root, 'src/routes/stats.js'), 'utf8');
-  assert.match(routes, /lastSeenAt: \{ gte: freshAfter \}/);
+  assert.match(routes, /capabilityFreshnessWindow/);
+  assert.match(routes, /lastSeenAt: freshnessWindow/);
   assert.match(routes, /ANALYTICS_RANGE_INVALID/);
   assert.match(routes, /code: "INVALID_CAMPAIGN_ID"/);
   assert.match(routes, /router\.get\("\/creators\/:creatorId\/ledger-coverage", legacyStatsGone\)/);

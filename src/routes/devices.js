@@ -3,6 +3,7 @@ const { z } = require("zod");
 const prisma = require("../prisma");
 const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { updateObservationFromHeartbeat, recordRealtimeObservationPing, realtimeFrameSampleAt } = require("../services/team-observation-service");
 const {
   OFFLINE_DIALOG_RECOVERY_GAP_MS,
@@ -224,6 +225,9 @@ router.post("/heartbeat", async (req, res) => {
 
     const creatorScope = await allowedCreatorScope({ agencyId, member: heartbeatMembership });
     const allowedCreatorIds = creatorScope.broad ? null : new Set(creatorScope.creatorIds);
+    // PostgreSQL receipt time is the shared freshness authority for device and
+    // creator capability telemetry. Replica wall clocks are provenance only.
+    const heartbeatAt = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
 
     const device = await prisma.workerDevice.upsert({
       where: { id: boundDeviceId },
@@ -234,7 +238,7 @@ router.post("/heartbeat", async (req, res) => {
         deviceName: input.deviceName || null,
         platform: input.platform || null,
         appVersion: input.appVersion || null,
-        lastSeenAt: new Date(),
+        lastSeenAt: heartbeatAt,
       },
       update: {
         agencyId,
@@ -242,11 +246,10 @@ router.post("/heartbeat", async (req, res) => {
         deviceName: input.deviceName || undefined,
         platform: input.platform || undefined,
         appVersion: input.appVersion || undefined,
-        lastSeenAt: new Date(),
+        lastSeenAt: heartbeatAt,
       },
     });
 
-    const heartbeatAt = new Date();
     const bindings = await syncDeviceCreatorBindings({
       agencyId,
       deviceId: boundDeviceId,

@@ -161,7 +161,7 @@ test("F41 retirement transaction winning first blocks a concurrently started cre
 
   const retirement = db.$transaction(async (tx) => {
     const locked = await tx.agencyTelegramMtprotoAccount.updateMany({
-      where: { id: "tg-1", agencyId: "agency-1", OR: [{ lifecycleState: "ACTIVE" }, { lifecycleState: null }] },
+      where: { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE" },
       data: { lifecycleState: "RETIRING" },
     });
     assert.equal(locked.count, 1);

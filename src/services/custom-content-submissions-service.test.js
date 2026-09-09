@@ -1784,7 +1784,7 @@ test("F40 retirement winning the shared account transaction rejects a racing man
 
   const retirement = db.$transaction(async (tx) => {
     const changed = await tx.agencyTelegramMtprotoAccount.updateMany({
-      where: { id: "tg-1", agencyId: "agency-1", OR: [{ lifecycleState: "ACTIVE" }, { lifecycleState: null }] },
+      where: { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE" },
       data: { lifecycleState: "RETIRING" },
     });
     assert.equal(changed.count, 1);

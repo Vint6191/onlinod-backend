@@ -57,7 +57,8 @@ test("task activity is a compact relational 30-day projection with one row per b
 test("activity retention is fixed at 30 days and independent of temperature heuristics", () => {
   assert.match(service, /ACTIVITY_RETENTION_DAYS = 30/);
   assert.match(retention, /creatorTaskActivity\.30d/);
-  assert.match(retention, /daysAgo\(30\)/);
+  assert.match(retention, /daysAgo\(30, authorityNow\)/);
+  assert.match(retention, /const authorityNow = sweepNow\(options\)/);
   assert.doesNotMatch(service + retention, /\b(?:HOT|WARM|COLD)\b/);
 });
 

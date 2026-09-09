@@ -3,6 +3,7 @@
 const { randomUUID } = require("node:crypto");
 const prisma = require("../prisma");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const COLLECTION_CONTRACT_VERSION = 1;
 const COLLECTOR_TYPES = Object.freeze({
@@ -49,12 +50,14 @@ function buildCollectionPlanningDedupeParams({ collectorType, collectionMode = "
   const requestedMode = mode(collectionMode);
   const proofAt = collectorPlanningProofAt(collectorType, requestedMode, state);
   const generation = clean(state?.activeGeneration, 120) || "none";
+  const orderingAfter = date(state?.activeRequestedAt);
   // Planning identity describes the durable collection epoch and requested
   // provider traversal only. Trigger provenance (manual/automatic/reason) and
   // the newly generated command UUID are deliberately excluded so every caller
   // converges on one creator+collector+mode command for the same proven state.
   return {
     planningEpoch: `${generation}:${proofAt ? proofAt.toISOString() : "none"}`,
+    collectionOrderingAfter: orderingAfter ? orderingAfter.toISOString() : "none",
     collectionContractVersion: COLLECTION_CONTRACT_VERSION,
     collectionType: collectorType,
     collectionMode: requestedMode,
@@ -75,12 +78,46 @@ function buildCollectionCommand({ collectorType, collectionMode = "full", reason
   };
 }
 
+function onlyFansUtcDateTime(value) {
+  return new Date(value).toISOString().slice(0, 19).replace("T", " ");
+}
+
+function stampCollectionAuthorityParams(params, authorityNow, orderingAfter = null) {
+  const source = object(params);
+  const at = date(authorityNow);
+  if (!at) throw new Error("ANALYTICS_COLLECTION_AUTHORITY_CLOCK_INVALID");
+  const previous = date(orderingAfter);
+  // PostgreSQL owns physical source time, while command ordering is a logical
+  // monotonic clock. DateTime crosses Prisma/JS at millisecond precision, so a
+  // second command in the same DB millisecond (or after a DB clock correction)
+  // must still sort strictly after the durable command it supersedes.
+  const orderingAt = previous && at.getTime() <= previous.getTime()
+    ? new Date(previous.getTime() + 1)
+    : at;
+  const type = clean(source.collectionType, 40);
+  const stamped = { ...source, collectionAuthorityRequestedAt: orderingAt.toISOString() };
+  if (type === COLLECTOR_TYPES.FINANCIAL) {
+    const marker = Math.floor(at.getTime() / 1000);
+    stamped.initialMarker = marker;
+    stamped.endDate = onlyFansUtcDateTime(new Date(marker * 1000));
+  } else if (type === COLLECTOR_TYPES.NOTIFICATIONS) {
+    // Notification transport accepts a small forward tolerance, but the anchor
+    // is PostgreSQL time rather than whichever backend replica planned first.
+    stamped.to = new Date(at.getTime() + 5 * 60 * 1000).toISOString();
+  }
+  return stamped;
+}
+
 function collectionCommand(job, expectedType) {
   const params = object(job?.params);
   const version = Number(params.collectionContractVersion);
   const type = clean(params.collectionType, 40);
   const generation = clean(params.collectionGeneration, 120);
-  const requestedAt = date(params.collectionRequestedAt);
+  // collectionRequestedAt remains command provenance for Desktop/old queued jobs.
+  // New jobs also carry collectionAuthorityRequestedAt, stamped from PostgreSQL
+  // while the backend collector planning lock is held. Ordering must prefer the
+  // DB-owned clock so replica wall-clock skew cannot poison current generation.
+  const requestedAt = date(params.collectionAuthorityRequestedAt ?? params.collectionRequestedAt);
   const requestedMode = mode(params.collectionMode || params.notificationMode || params.financialMode || params.campaignMode);
   if (version !== COLLECTION_CONTRACT_VERSION || type !== expectedType || !generation || !requestedAt) {
     const error = new Error(`Invalid ${expectedType} collection command`);
@@ -111,24 +148,27 @@ async function withCollectorStateLock({ db, type, creatorId, work }) {
 }
 
 function commandAuthority(current, command) {
+  const currentGeneration = clean(current?.activeGeneration, 120);
+  // Generation UUID is the identity of one server-issued collection command.
+  // Migration/adoption may replace a legacy process-clock timestamp with a
+  // PostgreSQL authority timestamp; that must never make the same generation
+  // stale against itself.
+  if (currentGeneration && currentGeneration === command.generation) return "CURRENT";
   const currentAt = date(current?.activeRequestedAt);
   if (!currentAt) return "INCOMING";
   const delta = currentAt.getTime() - command.requestedAt.getTime();
   if (delta > 0) return "STALE";
   if (delta < 0) return "INCOMING";
-  const currentGeneration = clean(current?.activeGeneration, 120);
-  if (!currentGeneration || currentGeneration === command.generation) return "CURRENT";
+  if (!currentGeneration) return "CURRENT";
   // requestedAt has millisecond precision. If two independently planned server
-  // commands collide on the same millisecond, the generation that acquired the
-  // collector lock first remains authoritative; never fall back to arrival-order
-  // last-writer-wins between different generations.
+  // commands collide on the same DB millisecond, the generation that acquired
+  // the collector lock first remains authoritative; never fall back to
+  // arrival-order last-writer-wins between different generations.
   return "STALE";
 }
 
 function sameGeneration(current, command) {
-  const activeAt = date(current?.activeRequestedAt);
-  return clean(current?.activeGeneration, 120) === command.generation
-    && Boolean(activeAt && activeAt.getTime() === command.requestedAt.getTime());
+  return clean(current?.activeGeneration, 120) === command.generation;
 }
 
 function completedForCommand(current, command) {
@@ -171,7 +211,7 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
     if (complete === true && completedForCommand(current, command)) {
       return { applied: true, stale: false, replay: true, command, state: current, scanRunId: clean(scanRunId, 120) };
     }
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const success = complete === true;
     const common = {
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
@@ -197,7 +237,7 @@ async function recordFinancialCollectionFailure({ db = prisma, job, error, termi
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
     if (commandAuthority(current, command) === "STALE" || completedForCommand(current, command)) return current;
-    const retryAt = terminal ? null : date(retryAfterAt) || new Date(Date.now() + 5 * 60 * 1000);
+    const retryAt = terminal ? null : date(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000);
     const data = {
       status: "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
       lastErrorCode: "FINANCIAL_COLLECTION_FAILED", lastErrorMessage: clean(error?.message || error, 2000), sourceJobId: clean(job.id, 220),
@@ -239,7 +279,7 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
     if (complete === true && completedForCommand(current, command)) {
       return { applied: true, stale: false, replay: true, command, state: current };
     }
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const success = complete === true;
     const common = {
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
@@ -262,7 +302,7 @@ async function recordCampaignCollectionFailure({ db = prisma, job, error, termin
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
     if (commandAuthority(current, command) === "STALE" || completedForCommand(current, command)) return current;
-    const retryAt = terminal ? null : date(retryAfterAt) || new Date(Date.now() + 5 * 60 * 1000);
+    const retryAt = terminal ? null : date(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000);
     const data = {
       status: "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
       lastErrorCode: "CAMPAIGN_COLLECTION_FAILED", lastErrorMessage: clean(error?.message || error, 2000), sourceJobId: clean(job.id, 220),
@@ -278,6 +318,7 @@ module.exports = {
   COLLECTOR_TYPES,
   buildCollectionCommand,
   buildCollectionPlanningDedupeParams,
+  stampCollectionAuthorityParams,
   collectionCommand,
   withCollectorStateLock,
   commandAuthority,

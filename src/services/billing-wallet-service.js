@@ -6,6 +6,7 @@ const { TIER_CATALOG, ADDON_CATALOG, automaticTierForRevenue } = require("./bill
 const { isFuture, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("./billing-entitlement-service");
 const { evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
 const { COLLECTION_FUTURE_SKEW_TOLERANCE_MS } = require("./analytics-freshness-policy");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const DEFAULT_MAX_EARNINGS_AGE_HOURS = 48;
 const MAX_INT_CENTS = 2_147_483_647;
@@ -99,7 +100,8 @@ function earningsMaxAgeMs() {
   return hours * 60 * 60 * 1000;
 }
 
-async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
+async function readRolling30dRevenue({ db, creatorId, now = new Date(), authorityResolved = false }) {
+  if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
   // Billing is authorized only by durable relational facts + durable scan proof.
   // Operational JobInstance/ingest history may be retained or compacted independently.
   if (db.creatorEarningsDaily?.findMany && db.analyticsCoverage?.count) {
@@ -187,6 +189,7 @@ async function readRolling30dRevenue({ db, creatorId, now = new Date() }) {
 }
 
 async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) {
+  now = await dbAuthorityNow({ db, fallbackNow: now });
   const ids = [...new Set((creatorIds || []).map((value) => String(value || "").trim()).filter(Boolean))];
   const results = new Map(ids.map((creatorId) => [creatorId, { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false, collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false }]));
   if (!ids.length) return results;
@@ -277,7 +280,7 @@ async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) 
     return results;
   }
 
-  for (const creatorId of ids) results.set(creatorId, await readRolling30dRevenue({ db, creatorId, now }));
+  for (const creatorId of ids) results.set(creatorId, await readRolling30dRevenue({ db, creatorId, now, authorityResolved: true }));
   return results;
 }
 
@@ -646,6 +649,7 @@ async function setCreatorBillingPreferences({ agencyId, creatorId, aiChatterEnab
 }
 
 async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMode, now, reason, startAt = null }) {
+  now = await dbAuthorityNow({ db: tx, fallbackNow: now });
   await assertWalletDebitAllowed(tx, agencyId, testMode);
   const profile = creator.billingProfile || null;
   const revenue = await readRolling30dRevenue({ db: tx, creatorId: creator.id, now });
@@ -781,6 +785,7 @@ async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMod
 async function startCreatorSubscription({ agencyId, creatorId, testMode = false, actorUserId = null, db = null, now = new Date() }) {
   const client = db || prisma;
   const result = await client.$transaction(async (tx) => {
+    now = await dbAuthorityNow({ db: tx, fallbackNow: now });
     await lockAgencyBillingMutation(tx, agencyId);
     const creator = await tx.creatorAccount.findFirst({ where: { id: creatorId, agencyId, deletedAt: null }, include: { billingProfile: true, billingEntitlement: true } });
     if (!creator) throw billingError("Creator not found", "BILLING_CREATOR_NOT_FOUND", 404);
@@ -843,6 +848,7 @@ function renewalStartAt(entitlement, now = new Date()) {
 
 async function renewCreatorSubscription({ entitlement, db = null, now = new Date() }) {
   const client = db || prisma;
+  now = await dbAuthorityNow({ db: client, fallbackNow: now });
   const agencyId = String(entitlement?.agencyId || "");
   const creatorId = String(entitlement?.creatorId || "");
   if (!agencyId || !creatorId || entitlement?.autoRenewEnabled !== true) return { renewed: false, reason: "AUTO_RENEW_DISABLED" };
@@ -888,6 +894,7 @@ async function renewCreatorSubscription({ entitlement, db = null, now = new Date
 
 async function renewDueCreatorSubscriptions({ now = new Date(), db = null, limit = 1000, agencyId = null } = {}) {
   const client = db || prisma;
+  now = await dbAuthorityNow({ db: client, fallbackNow: now });
   if (client.creatorBillingPeriod?.updateMany) {
     await client.creatorBillingPeriod.updateMany({
       where: { status: "ACTIVE", endsAt: { lte: now }, ...(agencyId ? { agencyId: String(agencyId) } : {}) },

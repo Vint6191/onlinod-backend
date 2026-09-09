@@ -5,13 +5,23 @@ function fail(code, message, status = 400) {
 }
 
 function activeLifecycleWhere() {
-  // lifecycleState became durable in the thread/source lifecycle migration. Keep null as
-  // rolling/test compatibility only; RETIRING is always excluded from NEW references.
-  return { OR: [{ lifecycleState: "ACTIVE" }, { lifecycleState: null }] };
+  // Current Prisma schema is NOT NULL with default ACTIVE. Historical nulls were
+  // normalized by migration; querying impossible null state now violates the
+  // generated Prisma contract and must not survive as rolling compatibility.
+  return { lifecycleState: "ACTIVE" };
+}
+
+function telegramLifecycleState(row) {
+  const state = String(row?.lifecycleState || "").trim().toUpperCase();
+  return state === "ACTIVE" || state === "RETIRING" ? state : null;
 }
 
 function isActiveTelegramAccount(row) {
-  return !!row && String(row.lifecycleState || "ACTIVE") === "ACTIVE";
+  return telegramLifecycleState(row) === "ACTIVE";
+}
+
+function isRetiringTelegramAccount(row) {
+  return telegramLifecycleState(row) === "RETIRING";
 }
 
 async function lockActiveTelegramAccountReference({
@@ -50,6 +60,8 @@ async function lockActiveTelegramAccountReference({
 
 module.exports = {
   activeLifecycleWhere,
+  telegramLifecycleState,
   isActiveTelegramAccount,
+  isRetiringTelegramAccount,
   lockActiveTelegramAccountReference,
 };

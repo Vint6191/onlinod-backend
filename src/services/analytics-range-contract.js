@@ -146,7 +146,11 @@ function scanContractFromJob(job) {
     error.code = "ANALYTICS_SCAN_TIMEZONE_INVALID";
     throw error;
   }
-  const requestedAt = validDate(params.requestedAt);
+  // requestedAt is Desktop/server provenance. authorityRequestedAt is the
+  // PostgreSQL-owned cross-replica ordering clock introduced by the distributed
+  // collection closure. Legacy queued jobs may not have it, so they remain
+  // readable via requestedAt until the migration adopts active jobs.
+  const requestedAt = validDate(params.authorityRequestedAt ?? params.requestedAt);
   if (!requestedAt) {
     const error = new Error("ANALYTICS_SCAN_REQUESTED_AT_INVALID");
     error.code = "ANALYTICS_SCAN_REQUESTED_AT_INVALID";

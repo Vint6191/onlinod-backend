@@ -35,7 +35,7 @@ function fixture({ projectedIdentity = false }={}) {
   const member={id:"member-1",userId:"user-1",agencyId:"agency-1",role:"OWNER",roleKey:"owner",assignedCreators:"all",accessEpoch:3,deletedAt:null,deactivatedAt:null};
   const creator={id:"creator-1",agencyId:"agency-1",status:"READY",deletedAt:null,telegramContact:"@model",telegramUserId:projectedIdentity?"900001":null,telegramAccountId:"tg-1"};
   const agency={id:"agency-1",deletedAt:null,status:"ACTIVE"};
-  const account={id:"tg-1",agencyId:"agency-1",runtimeClaimedByDeviceId:"device-1",runtimeClaimToken:"runtime-1",runtimeClaimUntil:new Date(now.getTime()+600000),runtimeLeaseUserId:member.userId,runtimeLeaseMemberId:member.id,runtimeLeaseAccessEpoch:member.accessEpoch,runtimeLeaseCreatorId:creator.id};
+  const account={id:"tg-1",agencyId:"agency-1",lifecycleState:"ACTIVE",runtimeClaimedByDeviceId:"device-1",runtimeClaimToken:"runtime-1",runtimeClaimUntil:new Date(now.getTime()+600000),runtimeLeaseUserId:member.userId,runtimeLeaseMemberId:member.id,runtimeLeaseAccessEpoch:member.accessEpoch,runtimeLeaseCreatorId:creator.id};
   const orders=[{id:"order-1",agencyId:"agency-1",creatorId:creator.id,type:"CONTENT",status:"PENDING",fanDeliveredAt:null,contentBoundAt:null,scenario:"custom content",dueAt:new Date(now.getTime()+3600000),createdAt:new Date(now.getTime()-10000),updatedAt:new Date(now.getTime()-10000),telegramTaskMessageId:700,telegramReferenceMessageIds:[],telegramLastModelMessageId:null,telegramLastModelMessageAt:null}];
   const intents=[{id:"intent-task",agencyId:"agency-1",creatorId:creator.id,customOrderId:"order-1",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:700,remoteRecipientTelegramUserId:"900001",confirmedAt:new Date(now.getTime()-5000)}];
   const events=[];
@@ -51,7 +51,7 @@ function fixture({ projectedIdentity = false }={}) {
     },
     agencyTelegramMtprotoAccount:{
       async findFirst({where}){return clone(matches(account,where)?account:null);},
-      async findMany({where}){return matches(account,where)?[{id:account.id}]:[];},
+      async findMany({where}){return matches(account,where)?[{id:account.id,lifecycleState:account.lifecycleState}]:[];},
     },
     telegramDeliveryIntent:{
       async findFirst({where}){return clone(intents.find((r)=>matches(r,where))||null);},

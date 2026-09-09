@@ -4,6 +4,7 @@ const prisma = require("../prisma");
 const { readCreatorLedgerOverview } = require("./creator-analytics-ledger-service");
 const { normalizeCreatorOverviewRangeKey } = require("./analytics-range-contract");
 const { evaluateDurableCollectorState, stateVocabulary } = require("./analytics-state-evaluator");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const {
   NOTIFICATION_COLLECTION_FRESHNESS_MS,
   FINANCIAL_COLLECTION_FRESHNESS_MS,
@@ -119,7 +120,8 @@ async function readCreatorCurrentTask({ db = prisma, creatorId }) {
   };
 }
 
-async function readCreatorTaskActivityDays({ db = prisma, creatorId, now = new Date() }) {
+async function readCreatorTaskActivityDays({ db = prisma, creatorId, now = new Date(), authorityResolved = false }) {
+  if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
   const cutoff = new Date(now.getTime() - ACTIVITY_RETENTION_DAYS * DAY_MS);
   if (typeof db?.$queryRawUnsafe === "function") {
     try {
@@ -148,7 +150,8 @@ async function readCreatorTaskActivityDays({ db = prisma, creatorId, now = new D
   return [...new Set(rows.map((row) => iso(row.updatedAt)?.slice(0, 10)).filter(Boolean))].slice(0, 30);
 }
 
-async function readCreatorTaskActivity({ db = prisma, creatorId, now = new Date(), day = null, limit = 240 }) {
+async function readCreatorTaskActivity({ db = prisma, creatorId, now = new Date(), day = null, limit = 240, authorityResolved = false }) {
+  if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
   const cutoff = new Date(now.getTime() - ACTIVITY_RETENTION_DAYS * DAY_MS);
   const take = Math.max(1, Math.min(5000, Number(limit) || 240));
   const where = { creatorId, updatedAt: { gte: cutoff } };
@@ -356,8 +359,9 @@ function collectorStatePayload(state) {
 }
 
 async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", now = new Date() }) {
+  now = await dbAuthorityNow({ db, fallbackNow: now });
   const range = normalizeCreatorOverviewRangeKey(rangeKey);
-  const ledger = await readCreatorLedgerOverview({ db, creatorId, rangeKey: range, now, includeMessages: false, includeCoveragePage: false });
+  const ledger = await readCreatorLedgerOverview({ db, creatorId, rangeKey: range, now, includeMessages: false, includeCoveragePage: false, authorityResolved: true });
   const start = new Date(ledger.range.startAt);
   const end = new Date(ledger.range.endAt);
   const eventBetween = { gte: start, lte: end };

@@ -3,6 +3,8 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
 
 // GLOBAL CREATOR REQUEST GATE
 // ---------------------------
@@ -118,7 +120,7 @@ async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId
   const cached = accessCache.get(key);
   if (cached && cached.expiresAt > nowMs) return cached.value;
 
-  const device = await prisma.workerDevice.findFirst({
+  let device = await prisma.workerDevice.findFirst({
     where: { id: deviceId, userId, agencyId },
     select: { id: true, agencyId: true, lastSeenAt: true },
   });
@@ -129,7 +131,17 @@ async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId
     throw error;
   }
   if (normalizedCapability !== "security_probe") {
-    const freshAfter = new Date(nowMs - 5 * 60_000);
+    // Capability telemetry is stamped by PostgreSQL at heartbeat receipt. Use
+    // the same DB clock when deciding freshness so replica wall-clock skew
+    // cannot disagree with Job claim admission. This runs only on cache miss.
+    const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+    const freshnessWindow = capabilityFreshnessWindow(authorityNow, 5 * 60_000);
+    if (!device.lastSeenAt || device.lastSeenAt < freshnessWindow.gte || device.lastSeenAt > freshnessWindow.lte) {
+      const error = new Error("Worker device heartbeat is stale or future-poisoned");
+      error.code = "OF_GATE_DEVICE_STALE";
+      error.status = 409;
+      throw error;
+    }
     const binding = await prisma.deviceCreatorBinding.findFirst({
       where: {
         agencyId: device.agencyId,
@@ -137,7 +149,7 @@ async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId
         creatorId,
         status: "ACTIVE",
         ...(normalizedCapability === "write" ? { sessionWriteReady: true } : { sessionReadReady: true }),
-        lastSeenAt: { gte: freshAfter },
+        lastSeenAt: freshnessWindow,
       },
       select: { id: true },
     });

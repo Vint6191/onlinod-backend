@@ -4,7 +4,8 @@ const { randomUUID, createHash } = require("node:crypto");
 const prisma = require("../prisma");
 const { buildJobIdempotencyKey, bucketTimestamp } = require("./job-idempotency");
 const { createPlannedJobIfAbsent, reschedulePlannedJob, updatePlannedJobDemand, publishPlannedJobAvailable } = require("./job-planning-repository");
-const { withDbAdvisoryXactLock } = require("./db-transaction-service");
+const { withDbAdvisoryXactLock, runDbTransaction } = require("./db-transaction-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { evaluateCollectionState } = require("./analytics-state-evaluator");
@@ -68,16 +69,22 @@ async function claimAnalyticsSweepCycle({
   coordinationLockKey = SWEEP_COORDINATION_LOCK_KEY,
   leaseMs = SWEEP_LEASE_MS,
 }) {
-  const currentNow = asDate(now);
-  const wallNow = asDate(leaseNow);
-  if (!currentNow || !wallNow) throw new Error("ANALYTICS_SWEEP_CLOCK_INVALID");
-  const cycleKey = sweepCycleKey(currentNow);
+  const fallbackNow = asDate(now) || asDate(leaseNow);
+  if (!fallbackNow) throw new Error("ANALYTICS_SWEEP_CLOCK_INVALID");
   return withDbAdvisoryXactLock({
     db,
     key: coordinationLockKey,
     work: async (tx) => {
+      const hasDbClock = typeof tx?.$queryRawUnsafe === "function";
+      const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+      const currentNow = authorityNow;
+      // Unit-test doubles historically expose a separate leaseNow to model
+      // expiry without a SQL clock. Production never uses it: PostgreSQL owns
+      // both cycle and lease time when the real raw-query API is present.
+      const wallNow = hasDbClock ? authorityNow : (asDate(leaseNow) || authorityNow);
+      const cycleKey = sweepCycleKey(authorityNow);
       const existing = await tx.analyticsCollectionLease.findUnique({ where: { key: leaseKey } });
-      const leaseUntil = new Date(wallNow.getTime() + leaseMs);
+      const leaseUntil = new Date(authorityNow.getTime() + leaseMs);
       if (!existing) {
         const row = await tx.analyticsCollectionLease.create({
           data: {
@@ -139,13 +146,16 @@ async function renewAnalyticsSweepLease({
   leaseKey = SWEEP_LEASE_KEY,
   leaseMs = SWEEP_LEASE_MS,
 }) {
-  const wallNow = asDate(leaseNow);
-  if (!wallNow) throw new Error("ANALYTICS_SWEEP_CLOCK_INVALID");
-  const result = await db.analyticsCollectionLease.updateMany({
-    where: { key: leaseKey, ownerToken, cycleKey, completedAt: null },
-    data: { cursorCreatorId: cursorCreatorId || null, leaseUntil: new Date(wallNow.getTime() + leaseMs) },
+  const fallbackNow = asDate(leaseNow);
+  if (!fallbackNow) throw new Error("ANALYTICS_SWEEP_CLOCK_INVALID");
+  return runDbTransaction(db, async (tx) => {
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const result = await tx.analyticsCollectionLease.updateMany({
+      where: { key: leaseKey, ownerToken, cycleKey, completedAt: null },
+      data: { cursorCreatorId: cursorCreatorId || null, leaseUntil: new Date(authorityNow.getTime() + leaseMs) },
+    });
+    return Number(result?.count || 0) === 1;
   });
-  return Number(result?.count || 0) === 1;
 }
 
 async function completeAnalyticsSweepCycle({
@@ -156,13 +166,16 @@ async function completeAnalyticsSweepCycle({
   completedAt = new Date(),
   leaseKey = SWEEP_LEASE_KEY,
 }) {
-  const finishedAt = asDate(completedAt);
-  if (!finishedAt) throw new Error("ANALYTICS_SWEEP_CLOCK_INVALID");
-  const result = await db.analyticsCollectionLease.updateMany({
-    where: { key: leaseKey, ownerToken, cycleKey, completedAt: null },
-    data: { cursorCreatorId: cursorCreatorId || null, leaseUntil: finishedAt, completedAt: finishedAt },
+  const fallbackNow = asDate(completedAt);
+  if (!fallbackNow) throw new Error("ANALYTICS_SWEEP_CLOCK_INVALID");
+  return runDbTransaction(db, async (tx) => {
+    const finishedAt = await dbAuthorityNow({ db: tx, fallbackNow });
+    const result = await tx.analyticsCollectionLease.updateMany({
+      where: { key: leaseKey, ownerToken, cycleKey, completedAt: null },
+      data: { cursorCreatorId: cursorCreatorId || null, leaseUntil: finishedAt, completedAt: finishedAt },
+    });
+    return Number(result?.count || 0) === 1;
   });
-  return Number(result?.count || 0) === 1;
 }
 
 function asDate(value) {
@@ -267,34 +280,36 @@ function sameScanWindow(job, identityParams) {
 }
 
 async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, scanTo, collectionReason, priority, now }) {
-  const generation = scanGeneration(now);
   const identityParams = {
     analyticsContractVersion: ANALYTICS_CONTRACT_VERSION,
     scanFrom: dateKey(scanFrom),
     scanTo: dateKey(scanTo),
     sourceTimezone: ANALYTICS_SOURCE_TIMEZONE,
   };
-  const idempotencyKey = buildJobIdempotencyKey({
-    jobKey: "fetch_earnings",
-    scope: "creator",
-    creatorId,
-    agencyId,
-    params: identityParams,
-    bucketAt: now,
-    bucketMs: SCAN_GENERATION_MS,
-  });
-  const params = {
-    ...identityParams,
-    displayRangeKey,
-    scanGeneration: generation,
-    collectionReason,
-    requestedAt: now.toISOString(),
-  };
 
   const decision = await withDbAdvisoryXactLock({
     db,
     key: `analytics-plan:${creatorId}`,
     work: async (tx) => {
+      const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow: now });
+      const generation = scanGeneration(authorityNow);
+      const idempotencyKey = buildJobIdempotencyKey({
+        jobKey: "fetch_earnings",
+        scope: "creator",
+        creatorId,
+        agencyId,
+        params: identityParams,
+        bucketAt: authorityNow,
+        bucketMs: SCAN_GENERATION_MS,
+      });
+      const params = {
+        ...identityParams,
+        displayRangeKey,
+        scanGeneration: generation,
+        collectionReason,
+        requestedAt: authorityNow.toISOString(),
+        authorityRequestedAt: authorityNow.toISOString(),
+      };
       const active = await tx.jobInstance.findMany({
         where: {
           creatorId,
@@ -325,7 +340,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           // A claimed job's contract is immutable. For a scheduled job, keep the
           // original server-pinned contract too; only priority/nextRunAt may rise.
           params: existing.params || params,
-          nextRunAt: now,
+          nextRunAt: authorityNow,
           publish: false,
         });
         return {
@@ -346,8 +361,8 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
         idempotencyKey,
         params,
         priority,
-        scheduledAt: now,
-        nextRunAt: now,
+        scheduledAt: authorityNow,
+        nextRunAt: authorityNow,
       });
       if (!planned.created && planned.job && ["SCHEDULED", "CLAIMED"].includes(planned.job.status)) {
         const demand = await updatePlannedJobDemand({
@@ -355,7 +370,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           job: planned.job,
           priority,
           params: planned.job.params || params,
-          nextRunAt: now,
+          nextRunAt: authorityNow,
           publish: false,
         });
         return {
@@ -374,8 +389,8 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           job: planned.job,
           params,
           priority,
-          scheduledAt: now,
-          nextRunAt: now,
+          scheduledAt: authorityNow,
+          nextRunAt: authorityNow,
           continuation: null,
           progress: null,
           lastProgressAt: null,
@@ -476,8 +491,9 @@ async function ensureAnalyticsFreshness({
   includePrevious = false,
 } = {}) {
   if (!creatorId || !agencyId) throw new Error("ANALYTICS_PLANNER_SCOPE_REQUIRED");
-  const currentNow = asDate(now);
-  if (!currentNow) throw new Error("ANALYTICS_PLANNER_NOW_INVALID");
+  const fallbackNow = asDate(now);
+  if (!fallbackNow) throw new Error("ANALYTICS_PLANNER_NOW_INVALID");
+  const currentNow = await dbAuthorityNow({ db, fallbackNow });
   const range = displayRangeBounds(rangeKey, currentNow);
   let startDay = range.startDay;
   if (includePrevious) {
@@ -520,7 +536,10 @@ async function ensureOperationalAnalyticsFreshness({
   now = new Date(),
   coverageRows = null,
 } = {}) {
-  const window = operationalFreshnessWindow(now);
+  const fallbackNow = asDate(now);
+  if (!fallbackNow) throw new Error("ANALYTICS_PLANNER_NOW_INVALID");
+  const currentNow = await dbAuthorityNow({ db, fallbackNow });
+  const window = operationalFreshnessWindow(currentNow);
   return ensureAnalyticsWindowFreshness({
     db,
     creatorId,
@@ -530,7 +549,7 @@ async function ensureOperationalAnalyticsFreshness({
     displayRangeKey: "30d",
     reason,
     priority,
-    now,
+    now: currentNow,
     coverageRows,
   });
 }
@@ -570,8 +589,9 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
   if (!actorMemberId || !Number.isInteger(actorAccessEpoch) || actorAccessEpoch < 1) {
     throw new Error("ANALYTICS_DEMAND_ACCESS_FENCE_REQUIRED");
   }
-  const currentNow = asDate(now);
-  if (!currentNow) throw new Error("ANALYTICS_PLANNER_NOW_INVALID");
+  const fallbackNow = asDate(now);
+  if (!fallbackNow) throw new Error("ANALYTICS_PLANNER_NOW_INVALID");
+  const currentNow = await dbAuthorityNow({ db, fallbackNow });
   const ids = normalizedDemandCreatorIds(creatorIds);
   const range = displayRangeBounds(rangeKey, currentNow);
   const rangeDays = Math.floor((range.endDay.getTime() - range.startDay.getTime()) / DAY_MS) + 1;
@@ -633,12 +653,13 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
 }
 
 async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerToken = randomUUID() } = {}) {
-  const currentNow = asDate(now);
-  if (!currentNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
+  const fallbackNow = asDate(now);
+  if (!fallbackNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
   return withDbAdvisoryXactLock({
     db,
     key: DEMAND_CLAIM_LOCK_KEY,
     work: async (tx) => {
+      const currentNow = await dbAuthorityNow({ db: tx, fallbackNow });
       const row = await tx.analyticsCollectionDemand.findFirst({
         where: {
           completedAt: null,
@@ -667,13 +688,16 @@ async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerTo
 }
 
 async function renewAnalyticsDemandLease({ db = prisma, key, claimToken, claimedRevision, cursorCreatorId, now = new Date() }) {
-  const currentNow = asDate(now);
-  if (!currentNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
-  const result = await db.analyticsCollectionDemand.updateMany({
-    where: { key, claimToken, claimedRevision, completedAt: null },
-    data: { cursorCreatorId: cursorCreatorId || null, claimUntil: new Date(currentNow.getTime() + DEMAND_LEASE_MS) },
+  const fallbackNow = asDate(now);
+  if (!fallbackNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
+  return runDbTransaction(db, async (tx) => {
+    const currentNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const result = await tx.analyticsCollectionDemand.updateMany({
+      where: { key, claimToken, claimedRevision, completedAt: null },
+      data: { cursorCreatorId: cursorCreatorId || null, claimUntil: new Date(currentNow.getTime() + DEMAND_LEASE_MS) },
+    });
+    return Number(result?.count || 0) === 1;
   });
-  return Number(result?.count || 0) === 1;
 }
 
 const DEMAND_CONTRACT_ERROR_CODES = new Set([
@@ -707,12 +731,13 @@ function demandRetryDelayMs(attempts) {
 }
 
 async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Date(), error = null, cancellationReason = null }) {
-  const finishedAt = asDate(completedAt);
-  if (!finishedAt) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
+  const fallbackNow = asDate(completedAt);
+  if (!fallbackNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
   return withDbAdvisoryXactLock({
     db,
     key: demandLockKey(demand.key),
     work: async (tx) => {
+      const finishedAt = await dbAuthorityNow({ db: tx, fallbackNow });
       const current = await tx.analyticsCollectionDemand.findUnique({ where: { key: demand.key } });
       if (!current || current.claimToken !== demand.claimToken || Number(current.claimedRevision) !== Number(demand.claimedRevision)) {
         return { settled: false, reason: "claim_lost" };
@@ -822,8 +847,9 @@ async function processAnalyticsDemand({ db = prisma, demand, pageSize = DEMAND_P
   if (!demand?.key || !demand.claimToken || !Number.isInteger(Number(demand.claimedRevision))) {
     throw new Error("ANALYTICS_DEMAND_CLAIM_REQUIRED");
   }
-  const processNow = asDate(now);
-  if (!processNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
+  const fallbackNow = asDate(now);
+  if (!fallbackNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
+  const processNow = await dbAuthorityNow({ db, fallbackNow });
   const size = Math.max(25, Math.min(500, Number(pageSize) || DEMAND_PAGE_SIZE));
   // Parse persisted scope only as corruption evidence. Execution never trusts it:
   // every page is fenced by the current member/accessEpoch/permission/scope.

@@ -6,6 +6,8 @@ const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
 const { buildNotificationScanParams, loadNotificationSyncState } = require("./notification-sync-state-service");
 const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
 const {
   buildCollectionCommand, buildCollectionPlanningDedupeParams, collectionCommand, withCollectorStateLock, COLLECTOR_TYPES,
 } = require("./analytics-collector-control-service");
@@ -121,8 +123,9 @@ async function findActiveNotificationJob(db, creatorId) {
 async function startManualNotificationScan({ db = prisma, creator, requestedByUserId = null, now = new Date(), forceFull = false }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.NOTIFICATIONS, creatorId: creator.id, work: async (tx) => {
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow: now });
     const syncState = await loadNotificationSyncState(tx, creator.id);
-    const desiredMode = forceFull === true || !historicalBaselineReady(syncState, now) ? "full" : "catchup";
+    const desiredMode = forceFull === true || !historicalBaselineReady(syncState, authorityNow) ? "full" : "catchup";
     // START must never create a second notification walk beside an automatic
     // initial/catch-up job. The read and possible creation are serialized by the
     // same collector advisory lock used by generation accept/complete.
@@ -140,7 +143,7 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       if (active.status === "PAUSED" && sameMode && !pausedManualJobNeedsFreshRun(active, desiredMode)) {
         const planned = await reschedulePlannedJob({
           db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
-          scheduledAt: now, nextRunAt: now, continuation: active.continuation || null, progress: active.progress || null,
+          scheduledAt: authorityNow, nextRunAt: authorityNow, continuation: active.continuation || null, progress: active.progress || null,
           lastProgressAt: active.lastProgressAt || null, startedAt: active.startedAt || null, resetAttempts: false,
           protectedStatuses: [],
         });
@@ -157,7 +160,7 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
         where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
         data: {
           status: "CANCELLED",
-          completedAt: now,
+          completedAt: authorityNow,
           lastError: !activeCommandCurrent ? "retired_analytics_collection_contract_pre_v1"
             : desiredMode === "catchup" ? "superseded_by_manual_catchup" : "superseded_by_manual_full_rebuild",
           claimedAt: null,
@@ -181,11 +184,11 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
     const params = {
       ...buildNotificationScanParams({
         state: desiredMode === "catchup" ? syncState : null,
-        now,
+        now: authorityNow,
         reason: MANUAL_REASON,
         analyticsRangeKey: "all",
       }),
-      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: desiredMode, reason: MANUAL_REASON, now }),
+      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: desiredMode, reason: MANUAL_REASON, now: authorityNow }),
       manualNotificationScan: true,
       manualNotificationScanVersion: 1,
       manualRunToken,
@@ -199,7 +202,7 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       agencyId: creator.agencyId,
       params,
       priority: 100,
-      now,
+      now: authorityNow,
       bucketMs: 1,
       dedupeParams: buildCollectionPlanningDedupeParams({
         collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: desiredMode, state: syncState,
@@ -213,6 +216,7 @@ async function stopManualNotificationScan({ db = prisma, creatorId, now = new Da
   const active = await findActiveManualJob(db, creatorId);
   if (!active) return { job: null, action: "idle" };
   if (active.status === "PAUSED") return { job: active, action: "already_paused" };
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
 
   const result = await db.jobInstance.updateMany({
     where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED"] } },
@@ -226,7 +230,7 @@ async function stopManualNotificationScan({ db = prisma, creatorId, now = new Da
       workId: null,
       completedAt: null,
       lastError: null,
-      lastProgressAt: active.lastProgressAt || now,
+      lastProgressAt: active.lastProgressAt || authorityNow,
     },
   });
   if (!result.count) {
@@ -330,16 +334,17 @@ function itemForClient(row) {
   };
 }
 
-async function countOnlineBindings(db, creator) {
-  const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
+async function countOnlineBindings(db, creator, now = null) {
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now || new Date() });
+  const freshnessWindow = capabilityFreshnessWindow(authorityNow, 2 * 60 * 1000);
   return db.deviceCreatorBinding.count({
     where: {
       creatorId: creator.id,
       agencyId: creator.agencyId,
       status: "ACTIVE",
       sessionReadReady: true,
-      lastSeenAt: { gte: freshAfter },
-      device: { lastSeenAt: { gte: freshAfter } },
+      lastSeenAt: freshnessWindow,
+      device: { lastSeenAt: freshnessWindow },
     },
   });
 }

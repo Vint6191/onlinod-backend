@@ -285,10 +285,10 @@ async function applyLedgerSideEffects(row, db = prisma) {
   // are projected exclusively from canonical CreatorSale rows.
 }
 
-async function expirePendingJobs({ agencyId = null } = {}) {
+async function expirePendingJobs({ agencyId = null, now = new Date() } = {}) {
   const where = {
     status: "pending",
-    expiresAt: { lt: new Date() },
+    expiresAt: { lt: now instanceof Date ? now : new Date(now) },
     ...(agencyId ? { agencyId } : {}),
   };
   try {
@@ -820,9 +820,10 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
   return { resolved: 1, skipped: 0, action: outcome };
 }
 
-async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS } = {}) {
-  await expirePendingJobs({});
-  const before = new Date(Date.now() - olderThanMs);
+async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS, now = new Date() } = {}) {
+  const authorityNow = now instanceof Date ? now : new Date(now);
+  await expirePendingJobs({ now: authorityNow });
+  const before = new Date(authorityNow.getTime() - olderThanMs);
 
   const [sent, purchases, resolveJobs] = await Promise.all([
     prisma.teamSentMessageLedger.deleteMany({ where: { sentAt: { lt: before } } }),
@@ -834,7 +835,7 @@ async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS } = {}) {
     }),
     prisma.teamPpvResolveJob.deleteMany({
       where: {
-        OR: [{ expiresAt: { lt: new Date() } }, { createdAt: { lt: before } }],
+        OR: [{ expiresAt: { lt: authorityNow } }, { createdAt: { lt: before } }],
         status: { in: ["resolved", "expired", "rejected"] },
       },
     }),

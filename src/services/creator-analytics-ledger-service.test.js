@@ -67,6 +67,7 @@ function batchHarness(options = {}) {
   const scanProofUpdates = [];
   const existing = options.existingBatch || null;
   const tx = {
+    ...(options.authorityNow ? { $queryRawUnsafe: async (sql) => { assert.match(String(sql), /clock_timestamp\(\)/); return [{ authorityNow: options.authorityNow }]; } } : {}),
     analyticsIngestBatch: {
       findFirst: async () => options.latestBatch || null,
       findUnique: async () => existing,
@@ -344,6 +345,31 @@ test("earnings completion stays partial when page proof or daily proof is incomp
   assert.equal(harness.coverageUpdates.length, 0);
 });
 
+test("campaign page receipt uses PostgreSQL time for collectedAt and ingest audit range", async () => {
+  const authorityNow = new Date("2026-08-06T12:34:56.789Z");
+  const harness = batchHarness({ authorityNow });
+  let upsertArgs = null;
+  harness.tx.creatorCampaign = {
+    findUnique: async () => null,
+    upsert: async (args) => { upsertArgs = args; return args.create; },
+  };
+  const result = await ingestCampaignChunk({
+    db: harness.db,
+    job: campaignJob("scan-db-receipt", "2026-08-06T11:00:00.000Z"),
+    deviceId: "device-1",
+    chunk: {
+      kind: "campaigns_page", schemaVersion: 4, collectorVersion: "campaigns-v6",
+      scanRunId: "scan-db-receipt", batchKey: "run:scan-db-receipt:campaigns:1", scannerRejected: 0,
+      campaigns: [{ id: "campaign-1", name: "Campaign 1", isActive: true }],
+    },
+  });
+  assert.equal(result.rejected, 0);
+  assert.ok(upsertArgs);
+  assert.equal(upsertArgs.create.collectedAt.toISOString(), authorityNow.toISOString());
+  assert.equal(upsertArgs.update.collectedAt.toISOString(), authorityNow.toISOString());
+  assert.equal(harness.created[0].rangeTo.toISOString(), authorityNow.toISOString());
+});
+
 test("campaign completion proves every page batch before closing coverage", async () => {
   const completeHarness = batchHarness({
     pageBatches: [
@@ -489,8 +515,10 @@ test("campaign fan attribution is historical and is never pruned by a later empt
 
 test("campaign fan value current snapshot stores fresh OF subscriber totals and preserves cents exactly", async () => {
   let upsertData = null;
+  const authorityNow = new Date("2026-08-08T18:02:30.000Z");
   const db = {
     $executeRawUnsafe: async () => 1,
+    $queryRawUnsafe: async () => [{ authorityNow }],
     creatorCampaignCollectionState: {
       findUnique: async () => null,
       upsert: async ({ create }) => ({ id: "campaign-state-fan-value", ...create }),
@@ -533,6 +561,8 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
   assert.equal(upsertData.messagesSpentCents, 118480n);
   assert.equal(upsertData.tipsSpentCents, 69440n);
   assert.equal(upsertData.source, "USER_PROFILE");
+  assert.equal(upsertData.valueObservedAt.toISOString(), authorityNow.toISOString());
+  assert.notEqual(upsertData.valueObservedAt.toISOString(), "2026-08-08T18:01:00.000Z", "Desktop observedAt is provenance only");
 });
 
 
@@ -1212,4 +1242,37 @@ test("a later server scan can overwrite an earlier fact even when the desktop cl
   assert.equal(writes, 1);
   assert.equal(result.updated, 1);
   assert.equal(result.unchanged, 0);
+});
+
+
+test("earnings ordering prefers DB authorityRequestedAt over legacy requestedAt provenance", async () => {
+  const authorityAt = "2026-08-06T11:31:00.000Z";
+  const legacyFuture = "2099-08-06T11:30:00.000Z";
+  const authorityJob = {
+    ...job,
+    id: "job-db-authority",
+    params: { ...job.params, requestedAt: legacyFuture, authorityRequestedAt: authorityAt, scanGeneration: "authority-generation" },
+  };
+  const harness = batchHarness();
+  const upserts = [];
+  harness.tx.$queryRawUnsafe = async () => [{ authorityNow: new Date("2026-08-06T11:32:00.000Z") }];
+  harness.tx.creatorEarningsDaily = {
+    findUnique: async () => null,
+    upsert: async (args) => { upserts.push(args); return args.create; },
+  };
+  await ingestEarningsChunk({
+    db: harness.db,
+    job: authorityJob,
+    deviceId: "device-db-authority",
+    chunk: {
+      kind: "earnings_daily_page", schemaVersion: 4, collectorVersion: "earnings-v4",
+      scanRunId: "run-db-authority", observedAt: "2099-08-06T23:59:59.000Z",
+      batchKey: "run:run-db-authority:daily:page-1", scannerRejected: 0,
+      rows: [{ date: "2026-08-05", sourceTimezone: "UTC", totalCents: 100, currency: "USD" }],
+    },
+  });
+  assert.equal(upserts.length, 1);
+  assert.equal(upserts[0].create.sourceScanRequestedAt.toISOString(), authorityAt);
+  assert.notEqual(upserts[0].create.sourceScanRequestedAt.toISOString(), legacyFuture);
+  assert.equal(upserts[0].create.collectedAt.toISOString(), "2026-08-06T11:32:00.000Z");
 });

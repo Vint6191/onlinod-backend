@@ -3,6 +3,7 @@
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { collectionCommand, COLLECTOR_TYPES, withCollectorStateLock, commandAuthority, sameGeneration } = require("./analytics-collector-control-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const FULL_HISTORY_FROM = new Date("2016-01-01T00:00:00.000Z");
 
@@ -206,7 +207,7 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
   const command = assertNotificationCollectionResult({ job, scanRunId: result?.scanRunId, notificationMode: mode });
   if (!db?.creatorNotificationSyncState?.upsert) return null;
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.NOTIFICATIONS, creatorId: job.creatorId, work: async (tx) => {
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const existing = await loadNotificationSyncState(tx, job.creatorId);
     const authority = commandAuthority(existing, command);
     if (authority === "STALE") {
@@ -286,7 +287,7 @@ async function recordNotificationSyncFailure({ db, job, deviceId = null, error, 
     const authority = commandAuthority(existing, command);
     if (authority === "STALE" || (sameGeneration(existing, command) && String(existing?.status || "").toUpperCase() === "COMPLETE")) return existing;
     const params = object(job.params);
-    const retryAt = terminal ? null : (strictDate(retryAfterAt) || new Date(Date.now() + 5 * 60 * 1000));
+    const retryAt = terminal ? null : (strictDate(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000));
     const data = {
       status: "FAILED",
       mode: params.notificationMode === "catchup" ? "catchup" : "full",

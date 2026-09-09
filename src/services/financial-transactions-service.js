@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const { rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 const { reconcileCreatorSaleToTeam, reconcileCreatorTipToTeam } = require("./team-money-reconciliation-service");
 const { projectFanIdentity } = require("./fan-data-authority-service");
@@ -297,13 +298,14 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
     if (!row.rejected) acceptedByTransactionId.set(row.externalTransactionId, row);
   }
   const accepted = [...acceptedByTransactionId.values()];
-  const now = new Date();
+  const processReceivedAt = new Date();
   let inserted = 0; let updated = 0; let unchanged = 0; let projected = 0; let storedOnly = 0;
   const affectedDates = [];
 
   const transactionOutcome = await runInTransaction(db, async (tx) => {
     const generation = await acceptFinancialGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { superseded: true, generation: generation.command.generation };
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: processReceivedAt });
     const ids = accepted.map((row) => row.externalTransactionId);
     const existingRows = ids.length ? await tx.creatorFinancialTransaction.findMany({
       where: { creatorId: job.creatorId, externalTransactionId: { in: ids } },
@@ -409,9 +411,10 @@ async function ingestFinancialChartChunk({ db = prisma, job, deviceId, chunk }) 
   const rangeTo = strictDate(chunk?.rangeTo);
   const scanRunId = clean(chunk?.scanRunId, 120);
   if (!rangeFrom || !rangeTo || !scanRunId || scanRunId !== command.generation) throw new Error("Financial chart chunk is missing server generation metadata");
-  const now = new Date();
+  const processReceivedAt = new Date();
   const generation = await acceptFinancialGeneration({ db, job, deviceId });
   if (!generation.accepted) return { type: "financial_chart_total", category, superseded: true, grossCents, netCents, transactionsCount };
+  const now = await dbAuthorityNow({ db, fallbackNow: processReceivedAt });
   await db.creatorEarningsTotal.upsert({
     where: { creatorId_category: { creatorId: job.creatorId, category } },
     create: {

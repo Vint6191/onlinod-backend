@@ -16,7 +16,8 @@ try {
   Module._load = originalLoad;
 }
 const {
-  COLLECTOR_TYPES, buildCollectionPlanningDedupeParams, acceptFinancialGeneration, completeFinancialCollection, recordFinancialCollectionFailure,
+  COLLECTOR_TYPES, buildCollectionPlanningDedupeParams, stampCollectionAuthorityParams, collectionCommand, commandAuthority, sameGeneration,
+  acceptFinancialGeneration, completeFinancialCollection, recordFinancialCollectionFailure,
   acceptCampaignGeneration, completeCampaignCollection, recordCampaignCollectionFailure,
 } = service;
 
@@ -65,11 +66,13 @@ test("collection planning identity excludes trigger provenance and random comman
     activeGeneration: "accepted-generation",
     baselineVerifiedAt: new Date("2026-09-08T19:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-09-08T20:00:00.000Z"),
+    activeRequestedAt: new Date("2026-09-08T20:01:00.123Z"),
   };
   assert.deepEqual(buildCollectionPlanningDedupeParams({
     collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "catchup", state,
   }), {
     planningEpoch: "accepted-generation:2026-09-08T20:00:00.000Z",
+    collectionOrderingAfter: "2026-09-08T20:01:00.123Z",
     collectionContractVersion: 1,
     collectionType: "FINANCIAL",
     collectionMode: "catchup",
@@ -78,6 +81,7 @@ test("collection planning identity excludes trigger provenance and random comman
     collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: "full", state: null,
   }), {
     planningEpoch: "none:none",
+    collectionOrderingAfter: "none",
     collectionContractVersion: 1,
     collectionType: "NOTIFICATIONS",
     collectionMode: "full",
@@ -161,4 +165,58 @@ test("collector failure state preserves the Job retry boundary and terminal fail
   await recordCampaignCollectionFailure({ db: campaignDb, job: campaignJob, error: new Error("contract rejected"), terminal: true, retryAfterAt: retryAt });
   assert.equal(campaignDb._state().status, "FAILED");
   assert.equal(campaignDb._state().retryAfterAt, null, "terminal execution failure is quarantined from automatic scheduling");
+});
+
+
+test("DB authority timestamp outranks process-clock provenance and same generation survives adoption timestamp rewrite", () => {
+  const queued = job(COLLECTOR_TYPES.FINANCIAL, "generation-db-clock", "2099-01-01T00:00:00.000Z", "job-db-clock");
+  queued.params.collectionAuthorityRequestedAt = "2026-09-09T03:00:00.000Z";
+  const command = collectionCommand(queued, COLLECTOR_TYPES.FINANCIAL);
+  assert.equal(command.requestedAt.toISOString(), "2026-09-09T03:00:00.000Z");
+
+  const adoptedState = {
+    activeGeneration: "generation-db-clock",
+    activeRequestedAt: new Date("2099-01-01T00:00:00.000Z"),
+  };
+  assert.equal(commandAuthority(adoptedState, command), "CURRENT");
+  assert.equal(sameGeneration(adoptedState, command), true);
+});
+
+
+test("DB collection authority stamps provider time boundaries, not replica wall-clock boundaries", () => {
+  const authorityAt = new Date("2026-09-09T03:10:11.987Z");
+  const financial = stampCollectionAuthorityParams({
+    collectionType: COLLECTOR_TYPES.FINANCIAL,
+    collectionRequestedAt: "2099-01-01T00:00:00.000Z",
+    initialMarker: 9999999999,
+    endDate: "2099-01-01 00:00:00",
+  }, authorityAt);
+  assert.equal(financial.collectionAuthorityRequestedAt, authorityAt.toISOString());
+  assert.equal(financial.initialMarker, Math.floor(authorityAt.getTime() / 1000));
+  assert.equal(financial.endDate, "2026-09-09 03:10:11");
+
+  const notification = stampCollectionAuthorityParams({
+    collectionType: COLLECTOR_TYPES.NOTIFICATIONS,
+    to: "2099-01-01T00:00:00.000Z",
+  }, authorityAt);
+  assert.equal(notification.to, new Date(authorityAt.getTime() + 5 * 60 * 1000).toISOString());
+});
+
+
+test("collection ordering advances monotonically past the durable command while source boundary stays on physical DB time", () => {
+  const physicalDbNow = new Date("2026-09-09T03:10:11.999Z");
+  const previousOrdering = new Date("2026-09-09T03:10:11.999Z");
+  const financial = stampCollectionAuthorityParams({
+    collectionType: COLLECTOR_TYPES.FINANCIAL,
+    collectionRequestedAt: "2099-01-01T00:00:00.000Z",
+  }, physicalDbNow, previousOrdering);
+  assert.equal(financial.collectionAuthorityRequestedAt, "2026-09-09T03:10:12.000Z");
+  assert.equal(financial.initialMarker, Math.floor(physicalDbNow.getTime() / 1000));
+  assert.equal(financial.endDate, "2026-09-09 03:10:11");
+
+  const notification = stampCollectionAuthorityParams({
+    collectionType: COLLECTOR_TYPES.NOTIFICATIONS,
+  }, physicalDbNow, new Date("2026-09-09T03:10:12.500Z"));
+  assert.equal(notification.collectionAuthorityRequestedAt, "2026-09-09T03:10:12.501Z");
+  assert.equal(notification.to, "2026-09-09T03:15:11.999Z", "provider boundary must stay anchored to physical PostgreSQL time");
 });

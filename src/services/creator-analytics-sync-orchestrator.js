@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const { buildNotificationScanParams, loadNotificationSyncState } = require("./notification-sync-state-service");
 const {
   buildCollectionCommand,
@@ -55,10 +56,29 @@ async function scheduleNow(input) {
   const { scheduleJobNow } = require("./job-scheduler");
   return scheduleJobNow(input);
 }
+async function loadCollectorPlanningState(db, collectorType, creatorId, fallbackState = null) {
+  const delegate = collectorType === COLLECTOR_TYPES.NOTIFICATIONS
+    ? db?.creatorNotificationSyncState
+    : collectorType === COLLECTOR_TYPES.FINANCIAL
+      ? db?.creatorFinancialCollectionState
+      : collectorType === COLLECTOR_TYPES.CAMPAIGNS
+        ? db?.creatorCampaignCollectionState
+        : null;
+  if (typeof delegate?.findUnique === "function") {
+    return delegate.findUnique({ where: { creatorId } });
+  }
+  // Tiny unit-test doubles may omit unrelated delegates. Production Prisma has
+  // every current collector-state model, so only tests use the supplied state.
+  return fallbackState || null;
+}
 async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priority, now, bucketMs, collectorType, collectorState }) {
   return withCollectorStateLock({ db, type: collectorType, creatorId, work: async (tx) => {
     const active = await inFlightJob(tx, creatorId, jobKey);
     if (active) return { created: false, reason: "already_in_flight", job: active };
+    // The state used for planning identity/order must be read *after* acquiring
+    // the same collector lock used by accept/complete. A pre-lock snapshot can
+    // race a completion on another replica and issue work for an obsolete epoch.
+    const currentCollectorState = await loadCollectorPlanningState(tx, collectorType, creatorId, collectorState);
     return scheduleNow({
       db: tx,
       jobKey,
@@ -72,7 +92,7 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
       // The shared collector lock prevents a manual/automatic cross-mode race;
       // stable dedupe closes same-mode replica races even after the lock releases.
       dedupeParams: buildCollectionPlanningDedupeParams({
-        collectorType, collectionMode: params?.collectionMode, state: collectorState,
+        collectorType, collectionMode: params?.collectionMode, state: currentCollectorState,
       }),
     });
   }});
@@ -148,6 +168,7 @@ async function campaignInitialCoverageReady(db, creatorId, now = new Date()) {
 }
 
 async function creatorAnalyticsInitialSyncReady({ db = prisma, creatorId, now = new Date() } = {}) {
+  now = await dbAuthorityNow({ db, fallbackNow: now });
   if (!creatorId) return false;
   const notificationState = await loadNotificationSyncState(db, creatorId);
   if (!notificationHistoricalBaselineReady(notificationState, now)) return false;
@@ -157,6 +178,7 @@ async function creatorAnalyticsInitialSyncReady({ db = prisma, creatorId, now = 
 }
 
 async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agencyId, now = new Date(), priority = 95 } = {}) {
+  now = await dbAuthorityNow({ db, fallbackNow: now });
   if (!creatorId || !agencyId) return { ready: false, stage: "invalid", created: false, reason: "missing_scope" };
 
   const notificationState = await loadNotificationSyncState(db, creatorId);
@@ -344,6 +366,7 @@ function due(lastVerifiedAt, intervalMs, now) {
 }
 
 async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20 } = {}) {
+  now = await dbAuthorityNow({ db, fallbackNow: now });
   const initial = await ensureInitialCreatorAnalyticsSync({ db, creatorId, agencyId, now, priority: Math.max(priority, 80) });
   if (!initial.ready) return { ready: false, initial, created: [], skipped: [] };
   const created = [];

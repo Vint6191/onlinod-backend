@@ -10,6 +10,8 @@ const servicePath = path.join(__dirname, "retention-service.js");
 const migrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20260908190000_analytics_observation_authority", "migration.sql");
 const schemaPath = path.join(__dirname, "..", "..", "prisma", "schema.prisma");
 const collectionMigrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20260908224500_analytics_collection_control_convergence", "migration.sql");
+const distributedClosureMigrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20260909113000_distributed_collection_retention_runtime_closure", "migration.sql");
+const schedulerPath = path.join(__dirname, "job-scheduler.js");
 
 function loadRetention(prismaMock) {
   const original = Module._load;
@@ -259,4 +261,147 @@ test("collection-control migration retires only unfinished pre-v1 Financial/Camp
   assert.match(block, /"status" = 'CANCELLED'/);
   assert.match(block, /"leaseRevision" = "leaseRevision" \+ 1/);
   assert.doesNotMatch(block, /"status" IN \('DONE'/);
+});
+
+
+test("distributed closure migration adopts legacy analytics ordering onto DB-owned job creation time", () => {
+  const sql = fs.readFileSync(distributedClosureMigrationPath, "utf8");
+  assert.match(sql, /CREATE TABLE "RetentionSweepLease"/);
+  assert.match(sql, /\{authorityRequestedAt\}/);
+  assert.match(sql, /\{collectionAuthorityRequestedAt\}/);
+  assert.match(sql, /to_jsonb\(to_char\("createdAt"/);
+  assert.match(sql, /UPDATE "CreatorFinancialCollectionState" AS s[\s\S]*s\."sourceJobId" = j\."id"[\s\S]*activeGeneration/);
+  assert.match(sql, /UPDATE "CreatorCampaignCollectionState" AS s/);
+  assert.match(sql, /UPDATE "CreatorNotificationSyncState" AS s/);
+  assert.match(sql, /UPDATE "CreatorEarningsDaily" AS d[\s\S]*d\."sourceJobId" = j\."id"/);
+  assert.match(sql, /clock_timestamp\(\) - INTERVAL '1 millisecond'/);
+  // Source-window adoption must never rewrite an already CLAIMED contract under
+  // the same lease. CLAIMED work is fenced and restarted. PAUSED work must keep
+  // the operator pause while dropping stale traversal state so a later explicit
+  // resume starts from the DB-owned boundary. Earnings calendar windows are
+  // recomputed by the planner instead of SQL guessing.
+  const financialStart = sql.indexOf(`WHERE "jobKey" = 'financial_transactions_scan'\n  AND "status" = 'SCHEDULED';`);
+  const financialEnd = sql.indexOf(`WHERE "jobKey" = 'catchup_notifications_scan'\n  AND "status" = 'SCHEDULED';`);
+  assert.ok(financialStart >= 0 && financialEnd > financialStart, "financial adoption blocks must exist");
+  const financialBlocks = sql.slice(financialStart, financialEnd);
+  assert.match(financialBlocks, /"status" = 'SCHEDULED'[\s\S]*WHERE "jobKey" = 'financial_transactions_scan'[\s\S]*"status" = 'CLAIMED'/);
+  assert.match(financialBlocks, /"leaseRevision" = "leaseRevision" \+ 1/);
+  const financialPaused = financialBlocks.slice(financialBlocks.indexOf("-- A PAUSED job"));
+  assert.match(financialPaused, /WHERE "jobKey" = 'financial_transactions_scan'\n  AND "status" = 'PAUSED';/);
+  assert.match(financialPaused, /"continuation" = NULL[\s\S]*"progress" = NULL/);
+  assert.match(financialPaused, /analytics_db_time_contract_adopted_paused/);
+  assert.doesNotMatch(financialPaused, /SET "status" = 'SCHEDULED'/);
+
+  const notificationStart = sql.indexOf(`WHERE "jobKey" = 'catchup_notifications_scan'\n  AND "status" = 'SCHEDULED';`);
+  const earningsStart = sql.indexOf("-- Earnings ranges are calendar windows computed by the planner");
+  assert.ok(notificationStart >= 0 && earningsStart > notificationStart, "notification adoption blocks must exist");
+  const notificationBlocks = sql.slice(notificationStart, earningsStart);
+  assert.match(notificationBlocks, /"status" = 'SCHEDULED'[\s\S]*WHERE "jobKey" = 'catchup_notifications_scan'[\s\S]*"status" = 'CLAIMED'/);
+  assert.match(notificationBlocks, /"leaseRevision" = "leaseRevision" \+ 1/);
+  const notificationPaused = notificationBlocks.slice(notificationBlocks.indexOf("UPDATE \"JobInstance\"", notificationBlocks.indexOf("AND \"status\" = 'CLAIMED'")));
+  assert.match(notificationPaused, /WHERE "jobKey" = 'catchup_notifications_scan'\n  AND "status" = 'PAUSED';/);
+  assert.match(notificationPaused, /"continuation" = NULL[\s\S]*"progress" = NULL/);
+  assert.match(notificationPaused, /analytics_db_time_contract_adopted_paused/);
+  assert.doesNotMatch(notificationPaused, /SET "status" = 'SCHEDULED'/);
+
+  assert.match(sql, /"jobKey" = 'fetch_earnings'[\s\S]*"status" IN \('SCHEDULED', 'CLAIMED', 'PAUSED'\)[\s\S]*"status" = 'CANCELLED'/);
+  assert.match(sql, /UPDATE "AnalyticsCollectionLease"[\s\S]*"leaseUntil" = clock_timestamp\(\) - INTERVAL '1 millisecond'[\s\S]*"leaseUntil" > clock_timestamp\(\) \+ INTERVAL '20 minutes'/);
+});
+
+test("retention coordinator is durable, fail-closed and uses one DB-authority cutoff clock", () => {
+  const source = fs.readFileSync(servicePath, "utf8");
+  const schema = fs.readFileSync(schemaPath, "utf8");
+  assert.match(schema, /model RetentionSweepLease[\s\S]*ownerToken\s+String[\s\S]*leaseUntil\s+DateTime[\s\S]*completedAt\s+DateTime\?/);
+  assert.match(source, /RETENTION_COORDINATION_SCHEMA_UNAVAILABLE/);
+  assert.match(source, /reason: "coordination_failed"/);
+  assert.match(source, /db_lease_failed_closed/);
+  assert.match(source, /Promise\.allSettled/);
+  assert.match(source, /renewRetentionSweepLease/);
+  assert.match(source, /const authorityNow = lease\?\.startedAt instanceof Date \? lease\.startedAt : sweepNow\(options\)/);
+  assert.match(source, /const laneOptions = \{ \.\.\.options, authorityNow \}/);
+  assert.doesNotMatch(source, /pg_try_advisory_lock\(/);
+  assert.doesNotMatch(source, /pg_advisory_unlock\(/);
+});
+
+
+
+test("scheduler never uses process-local wall clock as retention cadence authority", () => {
+  const scheduler = fs.readFileSync(schedulerPath, "utf8");
+  const start = scheduler.indexOf("async function maybeRunRetentionSweep");
+  const end = scheduler.indexOf("\nasync function ", start + 1);
+  const block = scheduler.slice(start, end > start ? end : undefined);
+  assert.ok(start >= 0);
+  assert.match(block, /runRetentionSweep\(\{ minIntervalMs: force \? 0 : retentionWindowMs \}\)/);
+  assert.doesNotMatch(block, /lastRetentionSweepAt/);
+  assert.doesNotMatch(block, /reason:\s*"fresh"/);
+  assert.match(block, /Date\.now\(\) - startedAt/, "process clock may remain observability-only for duration logging");
+});
+test("durable retention lease serializes replicas, reclaims expiry and fences stale owners", async () => {
+  let authorityNow = new Date("2026-09-09T09:00:00.000Z");
+  let row = null;
+  const db = {
+    async $transaction(work) { return work(this); },
+    async $executeRawUnsafe(sql, key) {
+      assert.match(String(sql), /pg_advisory_xact_lock/);
+      assert.equal(key, "retention-sweep-coordinator");
+      return 1;
+    },
+    async $queryRawUnsafe(sql) {
+      assert.match(String(sql), /clock_timestamp\(\)/);
+      return [{ authorityNow }];
+    },
+    retentionSweepLease: {
+      async findUnique() { return row ? { ...row } : null; },
+      async upsert({ create, update }) {
+        row = row ? { ...row, ...update } : { ...create };
+        return { ...row };
+      },
+      async updateMany({ where, data }) {
+        if (!row || row.key !== where.key || row.ownerToken !== where.ownerToken || row.completedAt !== null) return { count: 0 };
+        row = { ...row, ...data };
+        return { count: 1 };
+      },
+    },
+  };
+  const retention = loadRetention(db);
+
+  const first = await retention.claimRetentionSweepLease({ db, ownerToken: "replica-a", leaseMs: 60_000 });
+  assert.equal(first.acquired, true);
+  assert.equal(first.startedAt.toISOString(), "2026-09-09T09:00:00.000Z");
+
+  authorityNow = new Date("2026-09-09T09:00:30.000Z");
+  const held = await retention.claimRetentionSweepLease({ db, ownerToken: "replica-b", leaseMs: 60_000 });
+  assert.equal(held.acquired, false);
+  assert.equal(held.reason, "lease_held");
+  assert.equal(held.ownerToken, "replica-a");
+
+  authorityNow = new Date("2026-09-09T09:01:01.000Z");
+  const reclaimed = await retention.claimRetentionSweepLease({ db, ownerToken: "replica-b", leaseMs: 60_000 });
+  assert.equal(reclaimed.acquired, true);
+  assert.equal(row.ownerToken, "replica-b");
+
+  await assert.rejects(
+    retention.renewRetentionSweepLease({ db, ownerToken: "replica-a", leaseMs: 60_000 }),
+    (error) => error?.code === "RETENTION_COORDINATION_OWNERSHIP_LOST"
+  );
+  const renewed = await retention.renewRetentionSweepLease({ db, ownerToken: "replica-b", leaseMs: 60_000 });
+  assert.equal(renewed.renewed, true);
+  assert.equal(await retention.finalizeRetentionSweepLease({ db, ownerToken: "replica-a", outcome: "COMPLETE" }), false);
+
+  authorityNow = new Date("2026-09-09T09:01:10.000Z");
+  assert.equal(await retention.finalizeRetentionSweepLease({ db, ownerToken: "replica-b", outcome: "COMPLETE" }), true);
+  assert.equal(row.completedAt.toISOString(), authorityNow.toISOString());
+  assert.equal(row.lastOutcome, "COMPLETE");
+
+  authorityNow = new Date("2026-09-09T09:30:00.000Z");
+  const tooSoon = await retention.claimRetentionSweepLease({ db, ownerToken: "replica-c", leaseMs: 60_000, minIntervalMs: 60 * 60 * 1000 });
+  assert.equal(tooSoon.acquired, false);
+  assert.equal(tooSoon.reason, "recently_completed");
+  assert.equal(tooSoon.completedAt.toISOString(), "2026-09-09T09:01:10.000Z");
+  assert.equal(tooSoon.nextDueAt.toISOString(), "2026-09-09T10:01:10.000Z");
+
+  authorityNow = new Date("2026-09-09T10:01:11.000Z");
+  const nextCycle = await retention.claimRetentionSweepLease({ db, ownerToken: "replica-c", leaseMs: 60_000, minIntervalMs: 60 * 60 * 1000 });
+  assert.equal(nextCycle.acquired, true);
+  assert.equal(row.ownerToken, "replica-c");
 });

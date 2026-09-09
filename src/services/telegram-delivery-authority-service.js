@@ -7,7 +7,7 @@ const { assertExecutionAccessFence } = require("./execution-access-fence-service
 const { assertTelegramRuntimeLease } = require("./telegram-execution-runtime");
 const { reconcilePendingInboundForConfirmedDelivery } = require("./telegram-inbound-authority-service");
 const { canUsePermission } = require("./team-access-control");
-const { lockActiveTelegramAccountReference } = require("./telegram-account-reference-authority-service");
+const { lockActiveTelegramAccountReference, isActiveTelegramAccount } = require("./telegram-account-reference-authority-service");
 const {
   deriveCustomModelObligation,
   fenceCustomModelObligationTransition,
@@ -135,7 +135,7 @@ async function resolveAccountForOrder({ agencyId, order, db }) {
   if (!accountId) throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED", "No Telegram connection is assigned to this creator", 409);
   if (!clean(order.creator?.telegramContact, 160)) throw fail("CUSTOM_ORDER_TELEGRAM_CONTACT_REQUIRED", "Creator Telegram contact is required", 409);
   const account = await db.agencyTelegramMtprotoAccount.findFirst({ where: { id: String(accountId), agencyId }, select: { id: true, lifecycleState: true } });
-  if (!account || String(account.lifecycleState || "ACTIVE") !== "ACTIVE") throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING", "Telegram connection is retiring and cannot accept new Custom delivery work", 409);
+  if (!isActiveTelegramAccount(account)) throw fail("CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING", "Telegram connection is retiring and cannot accept new Custom delivery work", 409);
   return String(accountId);
 }
 
@@ -1843,7 +1843,7 @@ async function repairCustomModelCommunicationConvergence({ agencyId, now = new D
       delegate: client.telegramDeliveryIntent,
       where: {
         agencyId: scopedAgencyId, kind: { in: ["TASK", "REVISION_REQUEST"] }, state: "CONFIRMED",
-        remoteMessageId: { not: null }, customOrderId: { not: null },
+        remoteMessageId: { not: null },
       },
       select: { id: true, customOrderId: true },
       pageSize: 250,
@@ -2312,7 +2312,7 @@ async function listTelegramReminderPlanningBlockedQueue({ agencyId, member, limi
           select: { id: true, lifecycleState: true },
         });
         if (!account) blockedCode = "CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED";
-        else if (String(account.lifecycleState || "ACTIVE") !== "ACTIVE") blockedCode = "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING";
+        else if (!isActiveTelegramAccount(account)) blockedCode = "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING";
       }
       if (!blockedCode) continue;
 

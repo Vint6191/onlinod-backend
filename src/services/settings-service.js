@@ -14,6 +14,8 @@ const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
 const { getWalletState, readRolling30dRevenueBatch, pricingPreviewFromRevenue } = require("./billing-wallet-service");
 const { lockCustomExecutionDefaults, lockAgencyPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { telegramLifecycleState: currentTelegramLifecycleState, isActiveTelegramAccount, isRetiringTelegramAccount } = require("./telegram-account-reference-authority-service");
 
 const WORKSPACE_SETTING_DEFAULTS = Object.freeze({
   timezone: "UTC",
@@ -501,7 +503,7 @@ function ensureTelegramManager(member) {
 
 
 function telegramLifecycleState(row) {
-  return String(row?.lifecycleState || "ACTIVE") === "RETIRING" ? "RETIRING" : "ACTIVE";
+  return currentTelegramLifecycleState(row) || "UNKNOWN";
 }
 
 function publicTelegramAccount(row, sessionReady = false, now = new Date()) {
@@ -699,7 +701,7 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
   // same account row. The first no-op ACTIVE update acquires the row lock *before* the
   // blocker scan. Therefore a racing planner either commits first and is observed here,
   // or this transaction commits RETIRING first and the planner's ACTIVE fence fails.
-  if (String(existing.lifecycleState || "ACTIVE") === "ACTIVE") {
+  if (isActiveTelegramAccount(existing)) {
     const beginRetirement = async (tx) => {
       // Global lifecycle order starts at Agency. This serializes account retirement
       // with manager review/planning before either side can acquire CustomOrder / TelegramAccount
@@ -709,12 +711,12 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
         throw Object.assign(new Error("Telegram connection retirement fencing is unavailable"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_FENCE_UNAVAILABLE", status: 503 });
       }
       const locked = await tx.agencyTelegramMtprotoAccount.updateMany({
-        where: { id, agencyId, OR: [{ lifecycleState: "ACTIVE" }, { lifecycleState: null }] },
+        where: { id, agencyId, lifecycleState: "ACTIVE" },
         data: { lifecycleState: "ACTIVE" },
       });
       if (Number(locked?.count || 0) !== 1) {
         const raced = await tx.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { lifecycleState: true } });
-        if (String(raced?.lifecycleState || "") === "RETIRING") return { alreadyRetiring: true };
+        if (isRetiringTelegramAccount(raced)) return { alreadyRetiring: true };
         throw Object.assign(new Error("Telegram connection retirement changed concurrently; retry"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_RACE", status: 409 });
       }
 
@@ -753,7 +755,7 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
       select: { id: true, apiId: true, lifecycleState: true, retirementRequestedAt: true, retirementDrainCompletedAt: true, runtimeClaimedByDeviceId: true, runtimeClaimUntil: true, runtimeClaimGeneration: true, runtimeDrainedGeneration: true },
     });
     if (!current) return { ok: true, retired: true, lifecycleState: "RETIRED", drainRequired: false, drainCompleted: true, retirementRequestedAt: null };
-    if (String(current.lifecycleState || "") !== "RETIRING") throw Object.assign(new Error("Telegram connection is not in retirement state"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_STATE_INVALID", status: 409 });
+    if (!isRetiringTelegramAccount(current)) throw Object.assign(new Error("Telegram connection is not in retirement state"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_STATE_INVALID", status: 409 });
     await assertTelegramAccountNoBusinessBlockers({ agencyId, accountId: id, db: tx });
     const drainCompleted = !!current.retirementDrainCompletedAt;
     const liveLease = !!current.runtimeClaimedByDeviceId || !!(current.runtimeClaimUntil && new Date(current.runtimeClaimUntil).getTime() > now.getTime());
@@ -930,7 +932,7 @@ async function storeTelegramMtprotoSession({ agencyId, member, accountId, sessio
 async function getBillingSettings({ agencyId, member, db = null }) {
   const client = db || prisma;
   if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY" };
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: client, fallbackNow: new Date() });
   const providerBase = publicProviderConfig();
   const [agency, subscription, creators, orders, walletState] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),

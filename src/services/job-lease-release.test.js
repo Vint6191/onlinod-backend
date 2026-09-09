@@ -1261,3 +1261,104 @@ test("Audit13 failure report rechecks execution access with a transaction row lo
   await failJob({ jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3, error: "temporary", retryable: true });
   assert.deepEqual(locks, [false, true]);
 });
+
+test("job claim lease timestamps use PostgreSQL authority instead of replica wall clock", async () => {
+  const authorityNow = new Date("2035-04-05T06:07:08.900Z");
+  const candidate = {
+    id: "job-db-clock-claim", jobKey: "fetch_campaigns", scope: "creator", creatorId: "creator-1", agencyId: "agency-1",
+    idempotencyKey: "db-clock-claim", params: {}, priority: 90, attempts: 0, leaseRevision: 4,
+    startedAt: null, workId: null, continuation: null, progress: null, status: "SCHEDULED",
+    nextRunAt: new Date("2035-04-05T06:00:00.000Z"),
+  };
+  let updateData = null;
+  const db = {
+    $queryRawUnsafe: async (sql) => {
+      assert.match(String(sql), /clock_timestamp\(\)/);
+      return [{ authorityNow }];
+    },
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: authorityNow }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 1 }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+    deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
+    jobInstance: {
+      findMany: async () => [],
+      findFirst: async () => candidate,
+      updateMany: async ({ data }) => { updateData = data; return { count: 1 }; },
+      findUnique: async () => ({
+        ...candidate, ...updateData, status: "CLAIMED", claimedByDeviceId: "device-1",
+        leaseRevision: 5, creator: { id: "creator-1" },
+      }),
+    },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"] });
+  assert.equal(result.reason, "claimed");
+  assert.equal(updateData.claimedAt.toISOString(), authorityNow.toISOString());
+  assert.equal(updateData.startedAt.toISOString(), authorityNow.toISOString());
+  assert.equal(updateData.leaseUntil.toISOString(), new Date(authorityNow.getTime() + 60_000).toISOString());
+});
+
+test("cooperative job retry timing uses PostgreSQL authority instead of replica wall clock", async () => {
+  const authorityNow = new Date("2037-08-09T10:11:12.345Z");
+  const item = fixture();
+  item.db.$queryRawUnsafe = async (sql) => {
+    assert.match(String(sql), /clock_timestamp\(\)/);
+    return [{ authorityNow }];
+  };
+  const { releaseJob } = loadService(item);
+  const result = await releaseJob({
+    jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token,
+    leaseRevision: 3, reason: "worker stopped", runAfterMs: 7_000,
+  });
+  const update = item.update();
+  const expected = new Date(authorityNow.getTime() + 7_000);
+  assert.equal(new Date(update.data.nextRunAt).toISOString(), expected.toISOString());
+  assert.equal(update.data.progress.waitingSince, authorityNow.toISOString());
+  assert.equal(update.data.progress.retryAt, expected.toISOString());
+  assert.equal(result.retryAt.toISOString(), expected.toISOString());
+});
+
+test("job lease execution path has no process wall-clock comparisons after claim arbitration begins", () => {
+  const fs = require("node:fs");
+  const source = fs.readFileSync(require.resolve("./job-lease-service"), "utf8");
+  const leasePath = source.slice(source.indexOf("async function sweepExpiredLeases"));
+  assert.match(leasePath, /dbAuthorityNow/);
+  assert.doesNotMatch(leasePath, /Date\.now\(\)/);
+  assert.doesNotMatch(leasePath, /const now = new Date\(\)/);
+  assert.doesNotMatch(leasePath, /leaseUntil\.getTime\(\) <= Date\.now\(\)/);
+});
+
+
+test("job claim creator capability freshness uses the same PostgreSQL authority as lease arbitration", async () => {
+  const authorityNow = new Date("2039-03-04T05:06:07.800Z");
+  let bindingWhere = null;
+  const db = {
+    $queryRawUnsafe: async (sql) => {
+      assert.match(String(sql), /clock_timestamp\(\)/);
+      return [{ authorityNow }];
+    },
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: authorityNow }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 1 }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+    deviceCreatorBinding: { findMany: async ({ where }) => { bindingWhere = where; return [{ creatorId: "creator-1" }]; } },
+    jobInstance: { findMany: async () => [], findFirst: async () => null },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"] });
+  assert.equal(result.reason, "no-work");
+  assert.equal(bindingWhere.lastSeenAt.gte.toISOString(), new Date(authorityNow.getTime() - 2 * 60_000).toISOString());
+  assert.equal(bindingWhere.lastSeenAt.lte.toISOString(), new Date(authorityNow.getTime() + 5 * 60_000).toISOString());
+});
+
+test("job claim rejects future-poisoned device heartbeat before creator capability admission", async () => {
+  const authorityNow = new Date("2039-03-04T05:06:07.800Z");
+  const db = {
+    $queryRawUnsafe: async () => [{ authorityNow }],
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: new Date(authorityNow.getTime() + 20 * 60_000) }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 1 }) },
+    jobInstance: { findMany: async () => [] },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"] });
+  assert.equal(result.reason, "device-stale");
+});

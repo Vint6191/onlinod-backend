@@ -21,6 +21,8 @@ const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = r
 const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
 const { ensureAnalyticsFreshness } = require("../services/analytics-collection-planner");
 const { normalizeCreatorOverviewRangeKey } = require("../services/analytics-range-contract");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const { capabilityFreshnessWindow } = require("../services/capability-freshness-authority-service");
 const {
   startManualNotificationScan,
   stopManualNotificationScan,
@@ -129,9 +131,10 @@ async function requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId })
     requiredCode: "ANALYTICS_DEVICE_BOUND_TOKEN_REQUIRED",
     mismatchCode: "DEVICE_IDENTITY_MISMATCH",
   });
-  const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
+  const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const freshnessWindow = capabilityFreshnessWindow(authorityNow, 10 * 60 * 1000);
   const device = await prisma.workerDevice.findFirst({
-    where: { id: boundDeviceId, userId, agencyId: creator.agencyId, lastSeenAt: { gte: freshAfter } },
+    where: { id: boundDeviceId, userId, agencyId: creator.agencyId, lastSeenAt: freshnessWindow },
     select: { id: true },
   });
   if (!device) {
@@ -148,7 +151,7 @@ async function requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId })
       agencyId: creator.agencyId,
       status: "ACTIVE",
       sessionReadReady: true,
-      lastSeenAt: { gte: freshAfter },
+      lastSeenAt: freshnessWindow,
       ...(Number.isInteger(Number(member?.accessEpoch)) ? { accessEpoch: Number(member.accessEpoch) } : {}),
     },
     select: { id: true },
@@ -514,9 +517,10 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
       requiredCode: "LIVE_NOTIFICATION_DEVICE_BOUND_TOKEN_REQUIRED",
       mismatchCode: "DEVICE_IDENTITY_MISMATCH",
     });
-    const freshAfter = new Date(Date.now() - 10 * 60 * 1000);
+    const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+    const freshnessWindow = capabilityFreshnessWindow(authorityNow, 10 * 60 * 1000);
     const device = await prisma.workerDevice.findFirst({
-      where: { id: boundDeviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: { gte: freshAfter } },
+      where: { id: boundDeviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: freshnessWindow },
       select: { id: true },
     });
     if (!device) return res.status(403).json({ ok: false, code: "LIVE_NOTIFICATION_DEVICE_FORBIDDEN", error: "The authenticated reporting device is not owned by this agency member" });
@@ -528,7 +532,7 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
         status: "ACTIVE",
         realtimeReady: true,
         ...(Number.isInteger(Number(ctx.member?.accessEpoch)) ? { accessEpoch: Number(ctx.member.accessEpoch) } : {}),
-        lastSeenAt: { gte: freshAfter },
+        lastSeenAt: freshnessWindow,
       },
       select: { id: true },
     });

@@ -104,6 +104,7 @@ test("manual START uses bounded catch-up when historical notification coverage a
   assert.equal(scheduledInput.params.forceNotificationFullRebuild, undefined);
   assert.deepEqual(scheduledInput.dedupeParams, {
     planningEpoch: "none:2026-08-01T00:00:00.000Z",
+    collectionOrderingAfter: "none",
     collectionContractVersion: 1,
     collectionType: "NOTIFICATIONS",
     collectionMode: "catchup",

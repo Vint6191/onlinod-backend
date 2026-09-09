@@ -9,19 +9,24 @@
 */
 "use strict";
 
+const { randomUUID } = require("node:crypto");
 const prisma = require("../prisma");
 const { gcTeamLedgers } = require("./team-ppv-ledger-service");
 const { compactAutomationDeliveries } = require("./automation-history-service");
+const { withDbAdvisoryXactLock, runDbTransaction } = require("./db-transaction-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const DEFAULT_BATCH_SIZE = 2000;
 const RETENTION_SETTING_KEY = "retention.policy.v1";
-// Cluster-wide unique identifier for the retention sweep advisory lock.
-// MUST NOT be changed across versions in production deployments — changing
-// this id temporarily defeats the lock during rolling upgrades. Keep the
-// original v18.26 id so old/new instances cannot run parallel sweeps.
-const RETENTION_ADVISORY_LOCK_ID = 91825026;
+// Retention is destructive cluster work. A short transaction-level advisory
+// lock serializes lease claim only; the long-running sweep itself is owned by
+// this durable DB lease, so Prisma pool connection identity is irrelevant.
+const RETENTION_LEASE_KEY = "global_retention_v1";
+const RETENTION_COORDINATION_LOCK_KEY = "retention-sweep-coordinator";
+const RETENTION_LEASE_MS = 2 * 60 * 60 * 1000;
+const RETENTION_HEARTBEAT_MS = 10 * 60 * 1000;
 
 const RETENTION_FIELDS = Object.freeze({
   retentionSweepWindowHours: {
@@ -351,27 +356,109 @@ async function resolveSweepConfig(overrides = {}) {
   return normalizeRetentionSettings({ ...(current.settings || {}), ...(overrides || {}) }, current.settings || defaultRetentionSettings());
 }
 
-async function tryAcquireRetentionLock() {
-  try {
-    const rows = await prisma.$queryRaw`SELECT pg_try_advisory_lock(${RETENTION_ADVISORY_LOCK_ID}) AS locked`;
-    const row = Array.isArray(rows) ? rows[0] : null;
-    return row?.locked === true || row?.pg_try_advisory_lock === true;
-  } catch (err) {
-    console.warn("[retention] advisory lock acquire failed; running without lock:", err?.message || err);
-    return true;
-  }
+async function claimRetentionSweepLease({
+  db = prisma,
+  ownerToken = randomUUID(),
+  fallbackNow = new Date(),
+  leaseMs = RETENTION_LEASE_MS,
+  minIntervalMs = 0,
+} = {}) {
+  return withDbAdvisoryXactLock({
+    db,
+    key: RETENTION_COORDINATION_LOCK_KEY,
+    work: async (tx) => {
+      if (!tx?.retentionSweepLease?.findUnique || !tx?.retentionSweepLease?.upsert) {
+        const error = new Error("RETENTION_COORDINATION_SCHEMA_UNAVAILABLE");
+        error.code = "RETENTION_COORDINATION_SCHEMA_UNAVAILABLE";
+        throw error;
+      }
+      const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+      const existing = await tx.retentionSweepLease.findUnique({ where: { key: RETENTION_LEASE_KEY } });
+      const completedAt = existing?.completedAt instanceof Date ? existing.completedAt : existing?.completedAt ? new Date(existing.completedAt) : null;
+      const minimumInterval = Math.max(0, Number(minIntervalMs) || 0);
+      if (
+        existing && completedAt && Number.isFinite(completedAt.getTime())
+        && String(existing.lastOutcome || "").toUpperCase() === "COMPLETE"
+        && minimumInterval > 0
+        && completedAt.getTime() + minimumInterval > authorityNow.getTime()
+      ) {
+        return {
+          acquired: false,
+          reason: "recently_completed",
+          ownerToken: existing.ownerToken,
+          completedAt,
+          nextDueAt: new Date(completedAt.getTime() + minimumInterval),
+        };
+      }
+      if (existing && !existing.completedAt) {
+        const until = existing.leaseUntil instanceof Date ? existing.leaseUntil : new Date(existing.leaseUntil);
+        if (Number.isFinite(until.getTime()) && until > authorityNow) {
+          return { acquired: false, reason: "lease_held", ownerToken: existing.ownerToken, leaseUntil: until };
+        }
+      }
+      const leaseUntil = new Date(authorityNow.getTime() + Math.max(60_000, Number(leaseMs) || RETENTION_LEASE_MS));
+      const row = await tx.retentionSweepLease.upsert({
+        where: { key: RETENTION_LEASE_KEY },
+        create: {
+          key: RETENTION_LEASE_KEY, ownerToken, leaseUntil, startedAt: authorityNow,
+          completedAt: null, lastOutcome: "RUNNING", lastError: null,
+        },
+        update: {
+          ownerToken, leaseUntil, startedAt: authorityNow,
+          completedAt: null, lastOutcome: "RUNNING", lastError: null,
+        },
+      });
+      return { acquired: true, reason: existing ? "lease_recovered_or_reclaimed" : "lease_created", ownerToken, leaseUntil, startedAt: row.startedAt || authorityNow };
+    },
+  });
 }
 
-async function releaseRetentionLock() {
-  try {
-    await prisma.$queryRaw`SELECT pg_advisory_unlock(${RETENTION_ADVISORY_LOCK_ID})`;
-  } catch (err) {
-    console.warn("[retention] advisory lock release failed:", err?.message || err);
-  }
+async function renewRetentionSweepLease({ db = prisma, ownerToken, fallbackNow = new Date(), leaseMs = RETENTION_LEASE_MS } = {}) {
+  if (!ownerToken) return false;
+  return runDbTransaction(db, async (tx) => {
+    if (!tx?.retentionSweepLease?.updateMany) return false;
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const leaseUntil = new Date(authorityNow.getTime() + Math.max(60_000, Number(leaseMs) || RETENTION_LEASE_MS));
+    const result = await tx.retentionSweepLease.updateMany({
+      where: { key: RETENTION_LEASE_KEY, ownerToken, completedAt: null },
+      data: { leaseUntil, lastOutcome: "RUNNING" },
+    });
+    if (Number(result?.count || 0) !== 1) {
+      const error = new Error("RETENTION_COORDINATION_OWNERSHIP_LOST");
+      error.code = "RETENTION_COORDINATION_OWNERSHIP_LOST";
+      throw error;
+    }
+    return { renewed: true, authorityNow, leaseUntil };
+  });
 }
 
-function daysAgo(days) {
-  return new Date(Date.now() - Math.max(0, Number(days) || 0) * DAY_MS);
+async function finalizeRetentionSweepLease({ db = prisma, ownerToken, outcome, error = null, fallbackNow = new Date() } = {}) {
+  if (!ownerToken) return false;
+  return runDbTransaction(db, async (tx) => {
+    if (!tx?.retentionSweepLease?.updateMany) return false;
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const result = await tx.retentionSweepLease.updateMany({
+      where: { key: RETENTION_LEASE_KEY, ownerToken, completedAt: null },
+      data: {
+        leaseUntil: authorityNow,
+        completedAt: authorityNow,
+        lastOutcome: String(outcome || "UNKNOWN").slice(0, 80),
+        lastError: error ? String(error?.message || error).slice(0, 2000) : null,
+      },
+    });
+    return Number(result?.count || 0) === 1;
+  });
+}
+
+function sweepNow(options = {}) {
+  const value = options?.authorityNow ?? options?.now ?? new Date();
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isFinite(parsed.getTime()) ? parsed : new Date();
+}
+
+function daysAgo(days, now = new Date()) {
+  const base = now instanceof Date ? now : new Date(now);
+  return new Date(base.getTime() - Math.max(0, Number(days) || 0) * DAY_MS);
 }
 
 async function deleteByIdsInBatches({ model, where, orderBy, batchSize, label }) {
@@ -394,6 +481,7 @@ async function deleteByIdsInBatches({ model, where, orderBy, batchSize, label })
 }
 
 async function runTeamActivityRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
   const out = [];
 
@@ -404,7 +492,7 @@ async function runTeamActivityRetentionSweep(options = {}) {
     orderBy: { ts: "asc" },
     where: {
       type: { in: ["dialog_unread_seen", "fan_message_seen_active"] },
-      ts: { lt: daysAgo(cfg.teamIntermediateDays) },
+      ts: { lt: daysAgo(cfg.teamIntermediateDays, authorityNow) },
     },
   }));
 
@@ -415,7 +503,7 @@ async function runTeamActivityRetentionSweep(options = {}) {
     orderBy: { ts: "asc" },
     where: {
       type: "dialog_session",
-      ts: { lt: daysAgo(cfg.teamSessionDays) },
+      ts: { lt: daysAgo(cfg.teamSessionDays, authorityNow) },
     },
   }));
 
@@ -426,7 +514,7 @@ async function runTeamActivityRetentionSweep(options = {}) {
     orderBy: { ts: "asc" },
     where: {
       type: "ppv_claim_resolution_notice",
-      ts: { lt: daysAgo(cfg.teamNoticeDays) },
+      ts: { lt: daysAgo(cfg.teamNoticeDays, authorityNow) },
     },
   }));
 
@@ -448,7 +536,7 @@ async function runTeamActivityRetentionSweep(options = {}) {
           "creator_fan_incoming_unassigned",
         ],
       },
-      ts: { lt: daysAgo(cfg.teamAuditDays) },
+      ts: { lt: daysAgo(cfg.teamAuditDays, authorityNow) },
     },
   }));
 
@@ -541,8 +629,9 @@ async function deleteDeadTrafficSourceMembers({ batchSize, olderThan }) {
   return { label: "trafficSourceMember.dead_no_revenue", deleted: total };
 }
 
-async function runTeamLedgerRetentionSweep(_options = {}) {
-  const result = await gcTeamLedgers({});
+async function runTeamLedgerRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
+  const result = await gcTeamLedgers({ now: authorityNow });
   const items = [
     { label: "teamSentMessageLedger", deleted: Number(result?.sentMessageLedger || 0) },
     { label: "teamPpvPurchaseLedger", deleted: Number(result?.ppvPurchaseLedger || 0) },
@@ -552,12 +641,13 @@ async function runTeamLedgerRetentionSweep(_options = {}) {
 }
 
 async function runAutomationRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
   const out = [];
-  const jobOlderThan = daysAgo(cfg.automationJobDoneDays);
+  const jobOlderThan = daysAgo(cfg.automationJobDoneDays, authorityNow);
 
   out.push(await compactAutomationDeliveries({
-    olderThan: daysAgo(cfg.automationDeliveryDetailedDays),
+    olderThan: daysAgo(cfg.automationDeliveryDetailedDays, authorityNow),
     batchSize: cfg.batchSize,
   }));
 
@@ -566,7 +656,7 @@ async function runAutomationRetentionSweep(options = {}) {
     batchSize: cfg.batchSize,
     label: `automationMonthlyAggregate.old_${cfg.automationAggregateDays}d`,
     orderBy: { periodStart: "asc" },
-    where: { periodStart: { lt: daysAgo(cfg.automationAggregateDays) } },
+    where: { periodStart: { lt: daysAgo(cfg.automationAggregateDays, authorityNow) } },
   }));
 
   out.push(await deleteByIdsInBatches({
@@ -588,7 +678,7 @@ async function runAutomationRetentionSweep(options = {}) {
     batchSize: cfg.batchSize,
     label: `automationEvent.audit_${cfg.automationEventDays}d`,
     orderBy: { createdAt: "asc" },
-    where: { createdAt: { lt: daysAgo(cfg.automationEventDays) } },
+    where: { createdAt: { lt: daysAgo(cfg.automationEventDays, authorityNow) } },
   }));
 
   out.push(await deleteByIdsInBatches({
@@ -597,7 +687,7 @@ async function runAutomationRetentionSweep(options = {}) {
     label: `automationTask.trash_${cfg.automationTaskTrashDays}d`,
     orderBy: { deletedAt: "asc" },
     where: {
-      deletedAt: { not: null, lt: daysAgo(cfg.automationTaskTrashDays) },
+      deletedAt: { not: null, lt: daysAgo(cfg.automationTaskTrashDays, authorityNow) },
     },
   }));
 
@@ -605,18 +695,19 @@ async function runAutomationRetentionSweep(options = {}) {
 }
 
 async function runTrafficRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
   const out = [];
 
   out.push(await deleteFreeOrganicLedgerNoise({
     batchSize: cfg.batchSize,
-    olderThan: new Date(Date.now() - Math.max(1, cfg.trafficFreeOrganicCleanupHours) * HOUR_MS),
+    olderThan: new Date(authorityNow.getTime() - Math.max(1, cfg.trafficFreeOrganicCleanupHours) * HOUR_MS),
   }));
 
   if (cfg.trafficPaidOrganicLedgerDays > 0) {
     out.push(await deleteOldPaidOrganicLedger({
       batchSize: cfg.batchSize,
-      olderThan: daysAgo(cfg.trafficPaidOrganicLedgerDays),
+      olderThan: daysAgo(cfg.trafficPaidOrganicLedgerDays, authorityNow),
     }));
   } else {
     out.push({ label: "creatorSubscriptionLedger.paid_organic_retention", deleted: 0, skipped: true, reason: "keep_forever" });
@@ -624,7 +715,7 @@ async function runTrafficRetentionSweep(options = {}) {
 
   out.push(await deleteDeadTrafficSourceMembers({
     batchSize: cfg.batchSize,
-    olderThan: daysAgo(cfg.trafficSourceMemberNoRevenueDays),
+    olderThan: daysAgo(cfg.trafficSourceMemberNoRevenueDays, authorityNow),
   }));
 
 
@@ -633,13 +724,14 @@ async function runTrafficRetentionSweep(options = {}) {
     batchSize: cfg.batchSize,
     label: `trafficDailyAggregate.old_${cfg.trafficDailyAggregateDays}d`,
     orderBy: { day: "asc" },
-    where: { day: { lt: daysAgo(cfg.trafficDailyAggregateDays) } },
+    where: { day: { lt: daysAgo(cfg.trafficDailyAggregateDays, authorityNow) } },
   }));
 
   return summarizeSweep("traffic", out);
 }
 
 async function runDialogIntelligenceRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
   const out = [];
   out.push(await deleteByIdsInBatches({
@@ -647,7 +739,7 @@ async function runDialogIntelligenceRetentionSweep(options = {}) {
     batchSize: cfg.batchSize,
     label: `dialogScanChunkCommit.old_${cfg.dialogScanChunkDays}d`,
     orderBy: { committedAt: "asc" },
-    where: { committedAt: { lt: daysAgo(cfg.dialogScanChunkDays) } },
+    where: { committedAt: { lt: daysAgo(cfg.dialogScanChunkDays, authorityNow) } },
   }));
   out.push(await deleteByIdsInBatches({
     model: prisma.dialogScanRun,
@@ -656,15 +748,16 @@ async function runDialogIntelligenceRetentionSweep(options = {}) {
     orderBy: { updatedAt: "asc" },
     where: {
       status: { in: ["COMPLETED", "FAILED", "CANCELED"] },
-      updatedAt: { lt: daysAgo(cfg.dialogScanRunDays) },
+      updatedAt: { lt: daysAgo(cfg.dialogScanRunDays, authorityNow) },
     },
   }));
   return summarizeSweep("dialogIntelligence", out);
 }
 
 async function runAuditLogRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
-  const olderThan = daysAgo(cfg.auditLogDays);
+  const olderThan = daysAgo(cfg.auditLogDays, authorityNow);
   const out = [];
 
   out.push(await deleteByIdsInBatches({
@@ -688,15 +781,16 @@ async function runAuditLogRetentionSweep(options = {}) {
 
 
 async function runAnalyticsExecutionRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
   const batchSize = Math.max(100, Math.min(10000, Number(cfg.batchSize) || DEFAULT_BATCH_SIZE));
-  const ingestCutoff = daysAgo(cfg.analyticsIngestBatchDays);
-  const jobCutoff = daysAgo(cfg.analyticsJobInstanceDays);
-  const demandCutoff = daysAgo(cfg.analyticsDemandHistoryDays);
-  const proofCutoff = daysAgo(cfg.analyticsSupersededScanProofDays);
-  const nonEarningsJobCutoff = daysAgo(cfg.analyticsNonEarningsJobDays);
-  const nonEarningsIngestCutoff = daysAgo(cfg.analyticsNonEarningsIngestBatchDays);
-  const notificationAuditCutoff = daysAgo(cfg.analyticsNotificationScanAuditDays);
+  const ingestCutoff = daysAgo(cfg.analyticsIngestBatchDays, authorityNow);
+  const jobCutoff = daysAgo(cfg.analyticsJobInstanceDays, authorityNow);
+  const demandCutoff = daysAgo(cfg.analyticsDemandHistoryDays, authorityNow);
+  const proofCutoff = daysAgo(cfg.analyticsSupersededScanProofDays, authorityNow);
+  const nonEarningsJobCutoff = daysAgo(cfg.analyticsNonEarningsJobDays, authorityNow);
+  const nonEarningsIngestCutoff = daysAgo(cfg.analyticsNonEarningsIngestBatchDays, authorityNow);
+  const notificationAuditCutoff = daysAgo(cfg.analyticsNotificationScanAuditDays, authorityNow);
   const items = [];
 
   let ingestDeleted = 0;
@@ -958,6 +1052,7 @@ async function runAnalyticsExecutionRetentionSweep(options = {}) {
 }
 
 async function runCreatorTaskActivityRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
   const items = [];
   if (!prisma.creatorTaskActivity?.findMany) return summarizeSweep("creatorTaskActivity", items);
@@ -966,51 +1061,127 @@ async function runCreatorTaskActivityRetentionSweep(options = {}) {
     batchSize: cfg.batchSize,
     label: "creatorTaskActivity.30d",
     orderBy: { updatedAt: "asc" },
-    where: { updatedAt: { lt: daysAgo(30) } },
+    where: { updatedAt: { lt: daysAgo(30, authorityNow) } },
   }));
   return summarizeSweep("creatorTaskActivity", items);
 }
 
 async function runRetentionSweep(options = {}) {
   const startedAt = Date.now();
-  const useLock = options?.useAdvisoryLock !== false;
-  let lockAcquired = false;
+  const useCoordination = options?.useAdvisoryLock !== false && options?.useCoordination !== false;
+  let lease = null;
 
-  if (useLock) {
-    lockAcquired = await tryAcquireRetentionLock();
-    if (!lockAcquired) {
-      return { ok: true, skipped: true, reason: "lock_held", elapsedMs: Date.now() - startedAt, totalDeleted: 0 };
+  if (useCoordination) {
+    try {
+      lease = await claimRetentionSweepLease({
+        db: prisma,
+        fallbackNow: options?.now || new Date(),
+        minIntervalMs: Math.max(0, Number(options?.minIntervalMs) || 0),
+      });
+    } catch (error) {
+      // Destructive GC fails closed when its cluster coordinator is unavailable.
+      return {
+        ok: false, skipped: true, reason: "coordination_failed", coordinationError: String(error?.message || error),
+        elapsedMs: Date.now() - startedAt, totalDeleted: 0, lock: "db_lease_failed_closed",
+      };
+    }
+    if (!lease?.acquired) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: lease?.reason || "lease_held",
+        completedAt: lease?.completedAt || null,
+        nextDueAt: lease?.nextDueAt || null,
+        elapsedMs: Date.now() - startedAt,
+        totalDeleted: 0,
+        lock: "db_lease",
+      };
     }
   }
 
-  try {
-    const [teamActivity, teamLedgers, traffic, automation, dialogIntelligence, auditLogs, creatorTaskActivity, analyticsExecution] = await Promise.all([
-      runTeamActivityRetentionSweep(options),
-      runTeamLedgerRetentionSweep(options),
-      runTrafficRetentionSweep(options),
-      runAutomationRetentionSweep(options),
-      runDialogIntelligenceRetentionSweep(options),
-      runAuditLogRetentionSweep(options),
-      runCreatorTaskActivityRetentionSweep(options),
-      runAnalyticsExecutionRetentionSweep(options),
-    ]);
+  // The durable lease was claimed with PostgreSQL clock authority. Use that
+  // same instant for every lane cutoff so replica wall-clock skew cannot make
+  // destructive retention older/younger than policy.
+  const authorityNow = lease?.startedAt instanceof Date ? lease.startedAt : sweepNow(options);
+  const laneOptions = { ...options, authorityNow };
 
-    return {
-      ok: true,
+  let heartbeatTimer = null;
+  let heartbeatInFlight = false;
+  let heartbeatError = null;
+  if (useCoordination && lease?.acquired) {
+    heartbeatTimer = setInterval(() => {
+      if (heartbeatInFlight) return;
+      heartbeatInFlight = true;
+      renewRetentionSweepLease({ db: prisma, ownerToken: lease.ownerToken })
+        .catch((error) => { heartbeatError = error; })
+        .finally(() => { heartbeatInFlight = false; });
+    }, RETENTION_HEARTBEAT_MS);
+    heartbeatTimer.unref?.();
+  }
+
+  const lanes = [
+    ["teamActivity", runTeamActivityRetentionSweep],
+    ["teamLedgers", runTeamLedgerRetentionSweep],
+    ["traffic", runTrafficRetentionSweep],
+    ["automation", runAutomationRetentionSweep],
+    ["dialogIntelligence", runDialogIntelligenceRetentionSweep],
+    ["auditLogs", runAuditLogRetentionSweep],
+    ["creatorTaskActivity", runCreatorTaskActivityRetentionSweep],
+    ["analyticsExecution", runAnalyticsExecutionRetentionSweep],
+  ];
+  let report = null;
+  let thrown = null;
+  try {
+    const settled = await Promise.allSettled(lanes.map(([, run]) => run(laneOptions)));
+    const laneErrors = [];
+    const laneResults = {};
+    let totalDeleted = 0;
+    settled.forEach((entry, index) => {
+      const [name] = lanes[index];
+      if (entry.status === "fulfilled") {
+        laneResults[name] = entry.value;
+        totalDeleted += Number(entry.value?.totalDeleted || 0);
+      } else {
+        const message = String(entry.reason?.message || entry.reason || "retention lane failed");
+        laneResults[name] = { label: name, ok: false, totalDeleted: 0, error: message };
+        laneErrors.push({ lane: name, error: message });
+      }
+    });
+    report = {
+      ok: laneErrors.length === 0,
+      partial: laneErrors.length > 0 && laneErrors.length < lanes.length,
       elapsedMs: Date.now() - startedAt,
-      totalDeleted: (teamActivity.totalDeleted || 0) + (teamLedgers.totalDeleted || 0) + (traffic.totalDeleted || 0) + (automation.totalDeleted || 0) + (dialogIntelligence.totalDeleted || 0) + (auditLogs.totalDeleted || 0) + (creatorTaskActivity.totalDeleted || 0) + (analyticsExecution.totalDeleted || 0),
-      teamActivity,
-      teamLedgers,
-      traffic,
-      automation,
-      dialogIntelligence,
-      auditLogs,
-      creatorTaskActivity,
-      analyticsExecution,
-      lock: useLock ? "advisory" : "disabled",
+      totalDeleted,
+      ...laneResults,
+      laneErrors,
+      lock: useCoordination ? "db_lease" : "disabled",
     };
+    if (heartbeatError) {
+      report.ok = false;
+      report.coordinationHeartbeatError = String(heartbeatError?.message || heartbeatError);
+    }
+    return report;
+  } catch (error) {
+    thrown = error;
+    throw error;
   } finally {
-    if (useLock && lockAcquired) await releaseRetentionLock();
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    if (useCoordination && lease?.acquired) {
+      const outcome = thrown ? "FAILED" : report?.ok ? "COMPLETE" : "PARTIAL";
+      try {
+        const finalized = await finalizeRetentionSweepLease({ db: prisma, ownerToken: lease.ownerToken, outcome, error: thrown || (report?.laneErrors?.length ? JSON.stringify(report.laneErrors) : null) });
+        if (finalized !== true && report) {
+          report.ok = false;
+          report.coordinationFinalizeError = "RETENTION_COORDINATION_OWNERSHIP_LOST";
+        }
+      } catch (finalizeError) {
+        console.warn("[retention] durable lease finalize failed:", finalizeError?.message || finalizeError);
+        if (report) {
+          report.ok = false;
+          report.coordinationFinalizeError = String(finalizeError?.message || finalizeError);
+        }
+      }
+    }
   }
 }
 
@@ -1036,6 +1207,7 @@ module.exports = {
   defaultRetentionSettings,
   normalizeRetentionSettings,
   retentionSchema,
-  tryAcquireRetentionLock,
-  releaseRetentionLock,
+  claimRetentionSweepLease,
+  renewRetentionSweepLease,
+  finalizeRetentionSweepLease,
 };

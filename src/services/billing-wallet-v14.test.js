@@ -724,3 +724,18 @@ test("admin dated access keeps V14 display dates coherent instead of leaving sta
   assert.match(admin,/autoRenewEnabled: false/);
   assert.match(admin,/walletTestMode: null/);
 });
+
+test("billing 30-day authority uses PostgreSQL clock instead of a poisoned caller wall clock", async () => {
+  const dbNow = new Date("2026-08-14T12:00:00.000Z");
+  const poisonedProcessNow = new Date("2026-08-16T12:00:00.000Z");
+  const db = makeDb({ revenue30dCents: 300_000, capturedAt: dbNow });
+  db.$queryRawUnsafe = async (sql) => {
+    assert.match(String(sql), /clock_timestamp\(\)/);
+    return [{ authorityNow: dbNow }];
+  };
+  const service = loadWalletService(db);
+  const revenue = await service.readRolling30dRevenue({ db, creatorId: "creator-1", now: poisonedProcessNow });
+  assert.equal(revenue.revenue30dCents, 300_000);
+  assert.equal(revenue.fresh, true);
+  assert.equal(revenue.collectionState, "FRESH");
+});

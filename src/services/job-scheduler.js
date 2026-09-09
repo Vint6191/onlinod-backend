@@ -37,6 +37,8 @@ const { ensureAutomaticSfs } = require("./sfs-service");
 const { reconcileExpiredBillingStates } = require("./billing-entitlement-service");
 const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { stampCollectionAuthorityParams } = require("./analytics-collector-control-service");
 const {
   ensureOperationalAnalyticsFreshness,
   runAnalyticsCollectionSweep,
@@ -64,10 +66,24 @@ const CREATOR_ANALYTICS_SWEEP_LEASE_KEY = "creator_analytics_recurring_v1";
 const CREATOR_ANALYTICS_SWEEP_COORDINATION_LOCK_KEY = "creator-analytics-recurring-sweep-coordinator";
 const CREATOR_ANALYTICS_SWEEP_LEASE_MS = 15 * 60 * 1000;
 const CREATOR_ANALYTICS_SWEEP_HEARTBEAT_EVERY = 25;
-let lastRetentionSweepAt = 0;
 let recurringSweepPromise = null;
 let creatorAnalyticsSweepPromise = null;
 
+
+function retentionBreakdown(result, laneNames) {
+  const out = {};
+  for (const name of laneNames) {
+    const lane = result?.[name];
+    if (!lane) continue;
+    out[name] = {
+      totalDeleted: Number(lane.totalDeleted || 0),
+      items: Object.fromEntries((Array.isArray(lane.items) ? lane.items : [])
+        .map((item) => [String(item?.label || "unknown"), Number(item?.deleted || 0)])),
+    };
+    if (lane.error) out[name].error = String(lane.error);
+  }
+  return out;
+}
 
 async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) {
   let retentionWindowMs = RETENTION_SWEEP_WINDOW_MS;
@@ -81,18 +97,22 @@ async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) 
     console.warn("[scheduler] retention settings read failed:", err?.message || err);
   }
 
-  if (!force && lastRetentionSweepAt && now.getTime() - lastRetentionSweepAt < retentionWindowMs) {
-    return { ok: true, skipped: true, reason: "fresh", windowMs: retentionWindowMs };
-  }
-
-  lastRetentionSweepAt = now.getTime();
   const startedAt = Date.now();
 
   try {
-    const result = await runRetentionSweep({});
-    console.log(
-      `[scheduler] retention sweep done in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}`
-    );
+    const result = await runRetentionSweep({ minIntervalMs: force ? 0 : retentionWindowMs });
+    const laneNames = ["teamActivity", "teamLedgers", "traffic", "automation", "dialogIntelligence", "auditLogs", "creatorTaskActivity", "analyticsExecution"];
+    const laneSummary = laneNames
+      .map((name) => `${name}=${Number(result?.[name]?.totalDeleted || 0)}`)
+      .join(", ");
+    const breakdown = JSON.stringify(retentionBreakdown(result, laneNames));
+    if (result?.ok === false) {
+      console.warn(`[scheduler] retention sweep partial/failed in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; ${laneSummary}; errors=${JSON.stringify(result.laneErrors || result.coordinationError || [])}; breakdown=${breakdown}`);
+    } else if (result?.skipped) {
+      console.log(`[scheduler] retention sweep skipped in ${Date.now() - startedAt}ms — reason=${result.reason || "unknown"}`);
+    } else {
+      console.log(`[scheduler] retention sweep done in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; ${laneSummary}; breakdown=${breakdown}`);
+    }
     return { ...result, windowMs: retentionWindowMs };
   } catch (err) {
     console.warn("[scheduler] retention sweep failed:", err?.message || err);
@@ -389,6 +409,17 @@ async function scheduleJobNow({
     bucketMs: hasStableDedupe ? 1 : bucketMs,
   });
 
+  const analyticsCommand = hasStableDedupe
+    && Number(params?.collectionContractVersion) === 1
+    && typeof params?.collectionGeneration === "string"
+    && typeof params?.collectionRequestedAt === "string";
+  const authorityNow = analyticsCommand
+    ? await dbAuthorityNow({ db, fallbackNow: now })
+    : now;
+  const plannedParams = analyticsCommand
+    ? stampCollectionAuthorityParams(params, authorityNow, dedupeParams?.collectionOrderingAfter)
+    : params;
+
   const planned = await ensurePlannedJob({
     db,
     jobKey,
@@ -396,10 +427,10 @@ async function scheduleJobNow({
     creatorId,
     agencyId,
     idempotencyKey,
-    params,
+    params: plannedParams,
     priority,
-    scheduledAt: now,
-    nextRunAt: now,
+    scheduledAt: authorityNow,
+    nextRunAt: authorityNow,
     shouldResetExisting: (existing) => {
       if (!hasStableDedupe) return existing.status !== "CLAIMED";
       // Same planning epoch + active row means another replica already owns the
@@ -512,6 +543,7 @@ async function runTelegramConfirmedProjectionSweep({ now = new Date() } = {}) {
       modelCommunicationPrecommitScanned: 0, modelCommunicationPrecommitCancelled: 0, modelCommunicationPrecommitFailed: 0,
       modelCommunicationReminderScanned: 0, modelCommunicationReminderRepaired: 0, modelCommunicationReminderFailed: 0,
       revisionIntentsPlanned: 0,
+      agencyFailures: [],
     };
     await scanAllById({
       delegate: prisma.agency,
@@ -521,29 +553,42 @@ async function runTelegramConfirmedProjectionSweep({ now = new Date() } = {}) {
       onPage: async (rows) => {
         for (const agency of rows || []) {
           report.agencies += 1;
-          const result = await repairConfirmedTelegramDeliveryProjections({ agencyId: String(agency.id), now, db: prisma });
-          report.scanned += Number(result?.scanned || 0);
-          report.repaired += Number(result?.repaired || 0);
-          report.failed += Number(result?.failed || 0);
-          report.reminderScheduleScanned += Number(result?.reminderScheduleScanned || 0);
-          report.reminderScheduleRepaired += Number(result?.reminderScheduleRepaired || 0);
-          report.reminderScheduleFailed += Number(result?.reminderScheduleFailed || 0);
-          if (result?.ok === false) report.ok = false;
+          const agencyId = String(agency.id);
+          try {
+            const result = await repairConfirmedTelegramDeliveryProjections({ agencyId, now, db: prisma });
+            report.scanned += Number(result?.scanned || 0);
+            report.repaired += Number(result?.repaired || 0);
+            report.failed += Number(result?.failed || 0);
+            report.reminderScheduleScanned += Number(result?.reminderScheduleScanned || 0);
+            report.reminderScheduleRepaired += Number(result?.reminderScheduleRepaired || 0);
+            report.reminderScheduleFailed += Number(result?.reminderScheduleFailed || 0);
+            if (result?.ok === false) report.ok = false;
+          } catch (error) {
+            report.ok = false;
+            report.failed += 1;
+            report.agencyFailures.push({ agencyId, lane: "confirmed_projection", error: String(error?.message || error).slice(0, 1000) });
+          }
 
-          const modelCommunication = await repairCustomModelCommunicationConvergence({ agencyId: String(agency.id), now, db: prisma });
-          report.modelInitialTasksPlanned += Number(modelCommunication?.initialTaskIntentsPlanned || 0);
-          report.modelInitialTasksReactivated += Number(modelCommunication?.initialTaskIntentsReactivated || 0);
-          report.modelInitialTasksBlocked += Number(modelCommunication?.initialTaskIntentsBlocked || 0);
-          report.modelInitialTasksRaced += Number(modelCommunication?.initialTaskIntentsRaced || 0);
-          report.modelInitialTasksFailed += Number(modelCommunication?.initialTaskIntentsFailed || 0);
-          report.modelCommunicationPrecommitScanned += Number(modelCommunication?.precommitScanned || 0);
-          report.modelCommunicationPrecommitCancelled += Number(modelCommunication?.precommitCancelled || 0);
-          report.modelCommunicationPrecommitFailed += Number(modelCommunication?.precommitFailed || 0);
-          report.modelCommunicationReminderScanned += Number(modelCommunication?.reminderScheduleScanned || 0);
-          report.modelCommunicationReminderRepaired += Number(modelCommunication?.reminderScheduleRepaired || 0);
-          report.modelCommunicationReminderFailed += Number(modelCommunication?.reminderScheduleFailed || 0);
-          report.revisionIntentsPlanned += Number(modelCommunication?.revisionIntentsPlanned || 0);
-          if (modelCommunication?.ok === false) report.ok = false;
+          try {
+            const modelCommunication = await repairCustomModelCommunicationConvergence({ agencyId, now, db: prisma });
+            report.modelInitialTasksPlanned += Number(modelCommunication?.initialTaskIntentsPlanned || 0);
+            report.modelInitialTasksReactivated += Number(modelCommunication?.initialTaskIntentsReactivated || 0);
+            report.modelInitialTasksBlocked += Number(modelCommunication?.initialTaskIntentsBlocked || 0);
+            report.modelInitialTasksRaced += Number(modelCommunication?.initialTaskIntentsRaced || 0);
+            report.modelInitialTasksFailed += Number(modelCommunication?.initialTaskIntentsFailed || 0);
+            report.modelCommunicationPrecommitScanned += Number(modelCommunication?.precommitScanned || 0);
+            report.modelCommunicationPrecommitCancelled += Number(modelCommunication?.precommitCancelled || 0);
+            report.modelCommunicationPrecommitFailed += Number(modelCommunication?.precommitFailed || 0);
+            report.modelCommunicationReminderScanned += Number(modelCommunication?.reminderScheduleScanned || 0);
+            report.modelCommunicationReminderRepaired += Number(modelCommunication?.reminderScheduleRepaired || 0);
+            report.modelCommunicationReminderFailed += Number(modelCommunication?.reminderScheduleFailed || 0);
+            report.revisionIntentsPlanned += Number(modelCommunication?.revisionIntentsPlanned || 0);
+            if (modelCommunication?.ok === false) report.ok = false;
+          } catch (error) {
+            report.ok = false;
+            report.modelInitialTasksFailed += 1;
+            report.agencyFailures.push({ agencyId, lane: "model_communication", error: String(error?.message || error).slice(0, 1000) });
+          }
         }
         return false;
       },
@@ -551,7 +596,7 @@ async function runTelegramConfirmedProjectionSweep({ now = new Date() } = {}) {
     if (report.scanned > 0 || report.failed > 0 || report.reminderScheduleScanned > 0 || report.reminderScheduleFailed > 0
       || report.modelInitialTasksPlanned > 0 || report.modelInitialTasksReactivated > 0 || report.modelInitialTasksFailed > 0
       || report.modelCommunicationPrecommitScanned > 0 || report.modelCommunicationReminderScanned > 0 || report.revisionIntentsPlanned > 0) {
-      console.log(`[scheduler] Telegram/custom model convergence — agencies=${report.agencies}, confirmedScanned=${report.scanned}, confirmedRepaired=${report.repaired}, confirmedFailed=${report.failed}, reminderScheduleScanned=${report.reminderScheduleScanned}, reminderScheduleRepaired=${report.reminderScheduleRepaired}, reminderScheduleFailed=${report.reminderScheduleFailed}, initialTaskPlanned=${report.modelInitialTasksPlanned}, initialTaskReactivated=${report.modelInitialTasksReactivated}, initialTaskBlocked=${report.modelInitialTasksBlocked}, initialTaskRaced=${report.modelInitialTasksRaced}, initialTaskFailed=${report.modelInitialTasksFailed}, precommitScanned=${report.modelCommunicationPrecommitScanned}, precommitCancelled=${report.modelCommunicationPrecommitCancelled}, precommitFailed=${report.modelCommunicationPrecommitFailed}, modelReminderScanned=${report.modelCommunicationReminderScanned}, modelReminderRepaired=${report.modelCommunicationReminderRepaired}, modelReminderFailed=${report.modelCommunicationReminderFailed}, revisionIntentsPlanned=${report.revisionIntentsPlanned}`);
+      console.log(`[scheduler] Telegram/custom model convergence — agencies=${report.agencies}, confirmedScanned=${report.scanned}, confirmedRepaired=${report.repaired}, confirmedFailed=${report.failed}, reminderScheduleScanned=${report.reminderScheduleScanned}, reminderScheduleRepaired=${report.reminderScheduleRepaired}, reminderScheduleFailed=${report.reminderScheduleFailed}, initialTaskPlanned=${report.modelInitialTasksPlanned}, initialTaskReactivated=${report.modelInitialTasksReactivated}, initialTaskBlocked=${report.modelInitialTasksBlocked}, initialTaskRaced=${report.modelInitialTasksRaced}, initialTaskFailed=${report.modelInitialTasksFailed}, precommitScanned=${report.modelCommunicationPrecommitScanned}, precommitCancelled=${report.modelCommunicationPrecommitCancelled}, precommitFailed=${report.modelCommunicationPrecommitFailed}, modelReminderScanned=${report.modelCommunicationReminderScanned}, modelReminderRepaired=${report.modelCommunicationReminderRepaired}, modelReminderFailed=${report.modelCommunicationReminderFailed}, revisionIntentsPlanned=${report.revisionIntentsPlanned}, agencyFailures=${report.agencyFailures.length}`);
     }
     return report;
   } catch (err) {

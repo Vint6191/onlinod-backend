@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { projectSubscriptionFacts, rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 const { reconcileCreatorSalesToTeam, reconcileCreatorTipsToTeam } = require("./team-money-reconciliation-service");
@@ -793,7 +794,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
       code: "NOTIFICATION_COLLECTOR_VERSION_INVALID",
     });
   }
-  const now = new Date();
+  const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
 
   const creator = await db.creatorAccount.findFirst({
     where: { id: job.creatorId, agencyId: job.agencyId, deletedAt: null, status: { not: "DISABLED" } },
@@ -984,7 +985,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
   } catch (error) {
     await db.analyticsIngestBatch.update({
       where: { id: initial.batch.id },
-      data: { status: "FAILED", completedAt: new Date(), lastErrorCode: clean(error?.code || "NOTIFICATION_FACTS_INGEST_FAILED", 120), lastErrorMessage: clean(error?.message || error, 2_000) },
+      data: { status: "FAILED", completedAt: now, lastErrorCode: clean(error?.code || "NOTIFICATION_FACTS_INGEST_FAILED", 120), lastErrorMessage: clean(error?.message || error, 2_000) },
     }).catch(() => null);
     throw error;
   }

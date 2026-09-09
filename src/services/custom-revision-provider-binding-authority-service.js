@@ -1,5 +1,7 @@
 "use strict";
 
+const { isActiveTelegramAccount } = require("./telegram-account-reference-authority-service");
+
 function clean(value, max = 500) {
   const text = String(value == null ? "" : value).trim();
   return text ? text.slice(0, max) : "";
@@ -57,7 +59,7 @@ async function assertActiveProviderAccount({ agencyId, binding, db }) {
     select: { id: true, lifecycleState: true },
   });
   if (!account) throw blocked("PROVIDER_ACCOUNT_MISSING", "The Telegram account for the revision instruction no longer exists");
-  if (String(account.lifecycleState || "ACTIVE") !== "ACTIVE") throw blocked("PROVIDER_ACCOUNT_RETIRING", "The Telegram account for the revision instruction is retiring");
+  if (!isActiveTelegramAccount(account)) throw blocked("PROVIDER_ACCOUNT_RETIRING", "The Telegram account for the revision instruction is retiring");
   return binding;
 }
 async function inspectRevisionProviderBindings({ agencyId, orderId, submission, db } = {}) {
@@ -85,7 +87,7 @@ async function inspectRevisionProviderBindings({ agencyId, orderId, submission, 
       select: { id: true, lifecycleState: true },
     });
     const blockedCode = !account ? "PROVIDER_ACCOUNT_MISSING"
-      : String(account.lifecycleState || "ACTIVE") !== "ACTIVE" ? "PROVIDER_ACCOUNT_RETIRING" : null;
+      : !isActiveTelegramAccount(account) ? "PROVIDER_ACCOUNT_RETIRING" : null;
     inspected.push({ binding, usable: blockedCode == null, blockedCode, lifecycleState: account?.lifecycleState || null });
   }
   return inspected;

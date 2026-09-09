@@ -94,6 +94,7 @@ test("manual Financial planning is serialized by the collector advisory transact
   const state = {
     activeGeneration: "financial-previous",
     baselineVerifiedAt: new Date("2026-09-01T00:00:00.000Z"),
+    activeRequestedAt: new Date("2026-09-08T20:59:59.500Z"),
   };
   const tx = {
     async $executeRawUnsafe(sql, key) { locks.push([sql, key]); return 1; },
@@ -108,6 +109,7 @@ test("manual Financial planning is serialized by the collector advisory transact
   assert.equal(scheduled[0].db, tx, "job creation must stay inside the collector planning transaction");
   assert.deepEqual(scheduled[0].dedupeParams, {
     planningEpoch: "financial-previous:2026-09-01T00:00:00.000Z",
+    collectionOrderingAfter: "2026-09-08T20:59:59.500Z",
     collectionContractVersion: 1,
     collectionType: "FINANCIAL",
     collectionMode: "full",
@@ -127,6 +129,7 @@ test("manual Campaign planning uses the same durable planning identity as automa
   await startManualCampaignScan({ db, creator, now: new Date("2026-09-08T21:00:00.000Z") });
   assert.deepEqual(scheduled[0].dedupeParams, {
     planningEpoch: "none:none",
+    collectionOrderingAfter: "none",
     collectionContractVersion: 1,
     collectionType: "CAMPAIGNS",
     collectionMode: "full",

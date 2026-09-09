@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { resolveTelegramAccountId } = require("./custom-order-reminders");
 const { assertExecutionAccessFence } = require("./execution-access-fence-service");
-const { activeLifecycleWhere } = require("./telegram-account-reference-authority-service");
+const { activeLifecycleWhere, telegramLifecycleState, isActiveTelegramAccount, isRetiringTelegramAccount } = require("./telegram-account-reference-authority-service");
 const { scanAllById, findPendingModelInstructionAnchors, scanIncompleteTelegramSources, scanActiveFollowupIntents, fetchAccountRowsByIds } = require("./telegram-exact-authority-scan-service");
 
 const RUNTIME_LEASE_MS = 90 * 1000;
@@ -52,7 +52,7 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
   const explicitAssignedIds = Array.from(new Set(creators.map((row) => clean(row.telegramAccountId)).filter(Boolean)));
   const explicitRows = await fetchAccountRowsByIds({ agencyId, accountIds: explicitAssignedIds, db });
   const explicitActive = new Set(explicitRows
-    .filter((row) => String(row?.lifecycleState || "ACTIVE").toUpperCase() === "ACTIVE")
+    .filter((row) => isActiveTelegramAccount(row))
     .map((row) => String(row.id)));
 
   const autoCreators = creators.filter((row) => !clean(row.telegramAccountId));
@@ -111,7 +111,7 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
   if (!rawCandidates.size) return [];
   const accountRows = await fetchAccountRowsByIds({ agencyId, accountIds: [...rawCandidates.keys()], db });
   const allowed = new Set(accountRows.filter((row) => {
-    const state = String(row?.lifecycleState || "ACTIVE").toUpperCase();
+    const state = telegramLifecycleState(row);
     return includeRetiring ? state === "ACTIVE" || state === "RETIRING" : state === "ACTIVE";
   }).map((row) => String(row.id)));
 
@@ -133,7 +133,7 @@ async function assertTelegramMessagingAccess({ agencyId, member, accountId, crea
     throw fail("TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN", "This Telegram account is not assigned to this creator", 403);
   }
   const lifecycle = await db.agencyTelegramMtprotoAccount.findFirst({ where: { id: normalizedAccountId, agencyId }, select: { id: true, lifecycleState: true } });
-  if (!lifecycle || String(lifecycle.lifecycleState || "ACTIVE") !== "ACTIVE") {
+  if (!isActiveTelegramAccount(lifecycle)) {
     throw fail("TELEGRAM_EXECUTION_ACCOUNT_RETIRING", "This Telegram account is retiring and cannot accept new messaging work", 409);
   }
   return { creator: fullCreator, accountId: normalizedAccountId };
@@ -252,7 +252,7 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
     if (leases.length >= take) break;
     const account = accountStateById.get(String(candidate.accountId));
     if (!account) continue;
-    const lifecycleState = String(account.lifecycleState || "ACTIVE").toUpperCase();
+    const lifecycleState = telegramLifecycleState(account);
     if (lifecycleState !== "ACTIVE" && lifecycleState !== "RETIRING") continue;
     const ownedIdentity = String(account.runtimeClaimedByDeviceId || "") === normalizedDeviceId
       && String(account.runtimeLeaseUserId || "") === actor.userId
@@ -357,7 +357,7 @@ async function assertTelegramRuntimeLease({ agencyId, member, accountId, deviceI
   if (!account) throw fail("TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN", "This Telegram account is not available", 403);
   const eligible = await eligibleTelegramExecutionAccounts({ agencyId, member, db, includeRetiring: true });
   let anchor = eligible.find((row) => row.accountId === normalizedAccountId) || null;
-  const lifecycleState = String(account.lifecycleState || "ACTIVE").toUpperCase();
+  const lifecycleState = telegramLifecycleState(account);
   // Retirement drain may outlive the account's mutable creator assignment. In that case the
   // signed runtime identity itself is the temporary drain anchor; it cannot grant new work and
   // is still checked against current member/creator access below.
@@ -423,7 +423,7 @@ async function releaseTelegramExecutionRuntime({ agencyId, member, accountId, de
     where: { id: normalizedAccountId, agencyId },
     select: { id: true, lifecycleState: true },
   });
-  const retiring = String(lifecycle?.lifecycleState || "ACTIVE").toUpperCase() === "RETIRING";
+  const retiring = isRetiringTelegramAccount(lifecycle);
   const generation = Math.max(0, Number(runtime.account?.runtimeClaimGeneration) || 0);
   const drainedRelease = drained === true;
   const changed = await db.agencyTelegramMtprotoAccount.updateMany({

@@ -29,7 +29,7 @@ function databaseFixture(accessCalls) {
     deviceCreatorBinding: {
       findFirst: async () => { accessCalls.binding += 1; return { id: "binding-1" }; },
     },
-    $queryRawUnsafe: async () => { throw new Error("gate must not write PostgreSQL on every OF request"); },
+    $queryRawUnsafe: async () => [{ authorityNow: new Date() }],
   };
 }
 
@@ -152,5 +152,53 @@ test("security probe is globally paced without requiring pre-existing read readi
     deviceId: "device-1", creatorId: "creator-1", priority: "interactive", operation: "identity.bootstrap.me", capability: "security_probe", timeoutMs: 5_000,
   });
   await started(service, "device-1", permit.permitId, "security_probe");
+  assert.equal(accessCalls.binding, 0);
+});
+
+
+test("capability freshness cutoff uses PostgreSQL authority instead of replica wall clock", async () => {
+  const accessCalls = { device: 0, creator: 0, binding: 0 };
+  const authorityNow = new Date("2038-02-03T04:05:06.700Z");
+  let bindingWhere = null;
+  const db = databaseFixture(accessCalls);
+  db.workerDevice.findFirst = async ({ where }) => {
+    accessCalls.device += 1;
+    return { id: where.id, userId: where.userId, agencyId: "agency-1", lastSeenAt: authorityNow };
+  };
+  db.$queryRawUnsafe = async (sql) => {
+    assert.match(String(sql), /clock_timestamp\(\)/);
+    return [{ authorityNow }];
+  };
+  db.deviceCreatorBinding.findFirst = async ({ where }) => {
+    accessCalls.binding += 1;
+    bindingWhere = where;
+    return { id: "binding-db-clock" };
+  };
+  const service = loadService({ db });
+  service._test.reset();
+  const permit = await service.acquireOfRequestSlot({
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" },
+    deviceId: "device-db-clock", creatorId: "creator-1", priority: "normal", operation: "db-clock", capability: "read", timeoutMs: 5_000,
+  });
+  await started(service, "device-db-clock", permit.permitId, "read");
+  assert.equal(bindingWhere.lastSeenAt.gte.toISOString(), new Date(authorityNow.getTime() - 5 * 60_000).toISOString());
+  assert.equal(bindingWhere.lastSeenAt.lte.toISOString(), new Date(authorityNow.getTime() + 5 * 60_000).toISOString());
+});
+
+test("future-poisoned device heartbeat cannot authorize OF capability", async () => {
+  const accessCalls = { device: 0, creator: 0, binding: 0 };
+  const authorityNow = new Date("2038-02-03T04:05:06.700Z");
+  const db = databaseFixture(accessCalls);
+  db.workerDevice.findFirst = async ({ where }) => ({
+    id: where.id, userId: where.userId, agencyId: "agency-1",
+    lastSeenAt: new Date(authorityNow.getTime() + 20 * 60_000),
+  });
+  db.$queryRawUnsafe = async () => [{ authorityNow }];
+  const service = loadService({ db });
+  service._test.reset();
+  await assert.rejects(() => service.acquireOfRequestSlot({
+    userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" },
+    deviceId: "device-future", creatorId: "creator-1", priority: "normal", operation: "future-poison", capability: "read", timeoutMs: 5_000,
+  }), (error) => error?.code === "OF_GATE_DEVICE_STALE");
   assert.equal(accessCalls.binding, 0);
 });

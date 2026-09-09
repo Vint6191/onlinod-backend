@@ -51,7 +51,7 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
     },
     agencyTelegramMtprotoAccount: {
       create: async ({ data }) => {
-        stored = { id: "tg-1", ...data };
+        stored = { id: "tg-1", lifecycleState: "ACTIVE", ...data };
         return { id: "tg-1", apiId: data.apiId };
       },
       findMany: async ({ where }) => {
@@ -349,12 +349,12 @@ test("messaging material requires an authorized stored session", async () => {
         apiId: 9001,
         encryptedPayload: "", iv: "", tag: "", algorithm: "aes-256-gcm", payloadVersion: 1,
       }),
-      findMany: async () => [{ id: "tg-api-only" }],
+      findMany: async () => [{ id: "tg-api-only", lifecycleState: "ACTIVE" }],
     },
   };
   // Use the real credential encryptor shape by creating an API-only record first.
   let stored = null;
-  db.agencyTelegramMtprotoAccount.create = async ({ data }) => { stored = { id: "tg-api-only", ...data }; return { id: "tg-api-only", apiId: data.apiId }; };
+  db.agencyTelegramMtprotoAccount.create = async ({ data }) => { stored = { id: "tg-api-only", lifecycleState: "ACTIVE", ...data }; return { id: "tg-api-only", apiId: data.apiId }; };
   db.agencyTelegramMtprotoAccount.findFirst = async () => stored;
   const admin = { id: "member-admin", userId: "user-admin", role: "ADMIN", roleKey: "admin", accessEpoch: 1, assignedCreators: "all" };
   db.agencyMember = { findFirst: async () => ({ ...admin, agencyId: "a", deletedAt: null, deactivatedAt: null }) };

@@ -89,7 +89,7 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
     },
     agencyTelegramMtprotoAccount: {
       async findFirst({ where }) { return clone(accounts.find((r) => matches(r, where)) || null); },
-      async findMany({ where }) { return accounts.filter((r) => matches(r, where)).map((r) => ({ id: r.id })); },
+      async findMany({ where }) { return accounts.filter((r) => matches(r, where)).map((r) => ({ id: r.id, lifecycleState: r.lifecycleState })); },
       async updateMany({ where, data }) { const r = accounts.find((x) => matches(x, where)); if (!r) return { count: 0 }; Object.assign(r, clone(data)); return { count: 1 }; },
     },
     workspaceSetting: { async findUnique() { return db._workspaceSettingValue == null ? null : { value: clone(db._workspaceSettingValue) }; } },

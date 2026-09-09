@@ -2083,6 +2083,20 @@ model AnalyticsScanProof {
   @@index([createdAt, id], map: "AnalyticsScanProof_createdAt_id_idx")
 }
 
+model RetentionSweepLease {
+  key         String   @id
+  ownerToken  String
+  leaseUntil  DateTime
+  startedAt   DateTime
+  completedAt DateTime?
+  lastOutcome String?
+  lastError   String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([leaseUntil], map: "RetentionSweepLease_leaseUntil_idx")
+}
+
 model AnalyticsCollectionLease {
   key             String    @id
   ownerToken      String

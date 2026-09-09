@@ -9,6 +9,8 @@ const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
 const { completeNotificationSync } = require("./notification-sync-state-service");
 const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { capabilityFreshnessWindow, isCapabilityTimestampFresh } = require("./capability-freshness-authority-service");
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 const MIN_LEASE_MS = 30 * 1000;
@@ -181,7 +183,7 @@ async function requireOwnedDevice({ userId, deviceId }) {
   if (!member) throw new JobLeaseError("DEVICE_AGENCY_ACCESS_REVOKED", "Device agency access was revoked", 403);
   return { device, member };
 }
-async function scopedCreatorIds({ device, member }) {
+async function scopedCreatorIds({ device, member, now }) {
   if (!member) return [];
   const scope = normalizeAssignedCreators(member.assignedCreators);
   const broad = isOwner(member) || scope.mode === "all";
@@ -197,14 +199,17 @@ async function scopedCreatorIds({ device, member }) {
   });
   const visibleIds = creators.map((item) => item.id);
   if (!visibleIds.length) return [];
-  const freshAfter = new Date(Date.now() - 2 * 60 * 1000);
+  const authorityNow = now instanceof Date && Number.isFinite(now.getTime())
+    ? now
+    : await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const freshnessWindow = capabilityFreshnessWindow(authorityNow, 2 * 60 * 1000);
   const bindings = await prisma.deviceCreatorBinding.findMany({
     where: {
       agencyId: device.agencyId,
       deviceId: device.id,
       status: "ACTIVE",
       sessionReadReady: true,
-      lastSeenAt: { gte: freshAfter },
+      lastSeenAt: freshnessWindow,
       creatorId: { in: visibleIds },
     },
     select: { creatorId: true },
@@ -294,7 +299,10 @@ async function cancelRedundantNotificationFull(job, now = new Date(), db = prism
   return Number(cancelled?.count || 0) > 0;
 }
 
-async function sweepExpiredLeases(now = new Date()) {
+async function sweepExpiredLeases(now = null) {
+  now = now instanceof Date && Number.isFinite(now.getTime())
+    ? now
+    : await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   const rows = await prisma.jobInstance.findMany({
     where: { status: "CLAIMED", leaseUntil: { lt: now } },
     take: 10000,
@@ -325,13 +333,13 @@ async function sweepExpiredLeases(now = new Date()) {
 }
 async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds = [], dialogDiscoveryOnly = false }) {
   const { device, member } = await requireOwnedDevice({ userId, deviceId });
-  await sweepExpiredLeases();
-  if (!device.lastSeenAt || device.lastSeenAt < new Date(Date.now() - 5 * 60 * 1000)) return { job: null, reason: "device-stale" };
-  const creatorIds = await scopedCreatorIds({ device, member });
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  await sweepExpiredLeases(now);
+  if (!isCapabilityTimestampFresh(device.lastSeenAt, now, 5 * 60 * 1000)) return { job: null, reason: "device-stale" };
+  const creatorIds = await scopedCreatorIds({ device, member, now });
   if (!creatorIds.length) return { job: null, reason: "no-creators-visible" };
   const allowedJobKeys = filterClaimableDesktopJobKeys(jobKeys);
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
-  const now = new Date();
   const explicitlyExcluded = new Set(
     (Array.isArray(excludedCreatorIds) ? excludedCreatorIds : [])
       .map((value) => String(value || "").trim())
@@ -398,8 +406,11 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   }
   return { job: null, reason: "race-lost" };
 }
-async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired = false }) {
+async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired = false, now = null }) {
   const { device, member } = await requireOwnedDevice({ userId, deviceId });
+  now = now instanceof Date && Number.isFinite(now.getTime())
+    ? now
+    : await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   const job = await prisma.jobInstance.findUnique({ where: { id: jobId } });
   if (!job) throw new JobLeaseError("JOB_NOT_FOUND", "Job not found", 404);
   if (job.agencyId && job.agencyId !== device.agencyId) throw new JobLeaseError("JOB_DEVICE_AGENCY_MISMATCH", "Job belongs to a different device agency", 403);
@@ -407,7 +418,7 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   if (job.claimedByDeviceId !== deviceId) throw new JobLeaseError("JOB_CLAIMED_BY_OTHER", "Job is claimed by a different device");
   if (!tokenMatches(leaseToken, job.leaseTokenHash)) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease token is stale");
   if (!Number.isInteger(leaseRevision) || job.leaseRevision !== leaseRevision) throw new JobLeaseError("JOB_LEASE_REVISION_STALE", "Job lease revision is stale");
-  if (!allowExpired && (!job.leaseUntil || job.leaseUntil.getTime() <= Date.now())) throw new JobLeaseError("JOB_LEASE_EXPIRED", "Job lease expired");
+  if (!allowExpired && (!job.leaseUntil || job.leaseUntil.getTime() <= now.getTime())) throw new JobLeaseError("JOB_LEASE_EXPIRED", "Job lease expired");
   try {
     await assertExecutionAccessFence({
       userId,
@@ -427,8 +438,8 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   return job;
 }
 async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation }) {
-  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });
   const tokenHash = hashToken(leaseToken);
   const data = {
     leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
@@ -476,8 +487,8 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   };
 }
 async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation, chunkResult }) {
-  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });
   const tokenHash = hashToken(leaseToken);
   const nextLeaseUntil = new Date(now.getTime() + leaseDuration(leaseMs));
   const normalizedProgress = safeProgress(progress) ?? job.progress;
@@ -565,8 +576,8 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
 }
 
 async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, result, progress }) {
-  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision });
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });
   const fenceWhere = {
     id: job.id,
     status: "CLAIMED",
@@ -630,14 +641,14 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     if (sideEffect?.ok !== true) {
       const attempts = Number(job.attempts || 0) + 1;
       const terminal = attempts >= MAX_ATTEMPTS;
-      const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
+      const retryAt = terminal ? null : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
       const partial = await prisma.$transaction(async (tx) => {
         const updated = await tx.jobInstance.updateMany({
           where: completionFence,
           data: terminal ? {
             status: "FAILED",
             attempts,
-            completedAt: new Date(),
+            completedAt: now,
             claimedAt: null,
             claimedByDeviceId: null,
             leaseUntil: null,
@@ -697,7 +708,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       const terminal = !scannerSuccessful && attempts >= MAX_ATTEMPTS;
       const retryAt = scannerSuccessful || terminal
         ? null
-        : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
+        : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
       const terminalData = terminal ? {
         status: "FAILED", attempts, completedAt: now, claimedAt: null, claimedByDeviceId: null,
         leaseUntil: null, leaseTokenHash: null, continuation: null, workId: null,
@@ -790,7 +801,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           where: completionFence,
           data: {
             status: "DONE",
-            completedAt: new Date(),
+            completedAt: now,
             claimedAt: null,
             claimedByDeviceId: null,
             leaseUntil: null,
@@ -819,7 +830,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       // v8 Desktop collector. Keep retry semantics explicit and bounded instead.
       const attempts = Number(job.attempts || 0) + 1;
       const terminal = attempts >= MAX_ATTEMPTS;
-      const retryAt = terminal ? null : new Date(Date.now() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
+      const retryAt = terminal ? null : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
       const repairParams = {
         ...existingParams,
         ...(partialTypes.length ? { types: partialTypes } : {}),
@@ -832,7 +843,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           data: terminal ? {
             status: "FAILED",
             attempts,
-            completedAt: new Date(),
+            completedAt: now,
             claimedAt: null,
             claimedByDeviceId: null,
             leaseUntil: null,
@@ -917,11 +928,11 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   return { job: { id: job.id, status: "DONE" }, sideEffect: completed };
 }
 async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, error, result, retryable = true }) {
-  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired: true });
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired: true, now });
   const errorText = clean(error, 2000) || "unknown error";
   const attempts = job.attempts + 1;
   const terminal = retryable === false || attempts >= MAX_ATTEMPTS;
-  const now = new Date();
   const data = terminal ? {
     status: "FAILED", attempts, lastError: errorText, result: result || null, completedAt: now, claimedAt: null,
     claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: clean(workId, 200) || job.workId,
@@ -951,8 +962,8 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
 }
 
 async function releaseJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, reason, runAfterMs = 30_000 }) {
-  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired: true });
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired: true, now });
   const delay = Math.max(1_000, Math.min(15 * 60_000, Math.floor(Number(runAfterMs) || 30_000)));
   await prisma.$transaction(async (tx) => {
     try {

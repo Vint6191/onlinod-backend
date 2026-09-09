@@ -104,6 +104,15 @@ test.beforeEach(() => {
   notificationState = null;
 });
 
+function rawQueryWithAuthorityNow(result, now = new Date("2026-08-09T12:00:00.000Z")) {
+  return async (sql, ...args) => {
+    if (String(sql || "").includes("clock_timestamp()")) {
+      return [{ authorityNow: now }];
+    }
+    return typeof result === "function" ? result(sql, ...args) : result;
+  };
+}
+
 test("initial analytics sync is strictly Notifications -> Financial -> Campaigns", async () => {
   const now = new Date("2026-08-09T12:00:00.000Z");
 
@@ -120,6 +129,7 @@ test("initial analytics sync is strictly Notifications -> Financial -> Campaigns
   assert.equal(scheduled.at(-1).params.collectionRequestedAt, now.toISOString());
   assert.deepEqual(scheduled.at(-1).dedupeParams, {
     planningEpoch: "none:none",
+    collectionOrderingAfter: "none",
     collectionContractVersion: 1,
     collectionType: "NOTIFICATIONS",
     collectionMode: "full",
@@ -284,7 +294,7 @@ test("recurring analytics uses fixed head catch-ups only after initial history i
   db.creatorCampaign = {
     async findMany() { return [{ id: "db-a", externalCampaignId: "campaign-a", _count: { fans: 72 } }]; },
   };
-  db.$queryRawUnsafe = async () => [{ externalCampaignId: "campaign-a", onlyFansUserId: "fan-72" }];
+  db.$queryRawUnsafe = rawQueryWithAuthorityNow([{ externalCampaignId: "campaign-a", onlyFansUserId: "fan-72" }]);
 
   const result = await ensureRecurringCreatorAnalyticsCatchups({
     db,
@@ -328,7 +338,7 @@ test("a freshly completed notification catch-up cannot be immediately scheduled 
   db.creatorNotificationScanItem = { async findMany() { return [{ notificationId: "fresh-head" }]; } };
   db.creatorFinancialTransaction = { async findMany() { return []; } };
   db.creatorCampaign = { async findMany() { return []; } };
-  db.$queryRawUnsafe = async () => [];
+  db.$queryRawUnsafe = rawQueryWithAuthorityNow([]);
 
   const result = await ensureRecurringCreatorAnalyticsCatchups({
     db,
@@ -357,7 +367,7 @@ test("completed-but-unverified notification catch-up never satisfies recurring f
   });
   db.creatorFinancialTransaction = { async findMany() { return []; } };
   db.creatorCampaign = { async findMany() { return []; } };
-  db.$queryRawUnsafe = async () => [];
+  db.$queryRawUnsafe = rawQueryWithAuthorityNow([]);
 
   const result = await ensureRecurringCreatorAnalyticsCatchups({
     db, creatorId: "creator-1", agencyId: "agency-1", now: new Date("2026-08-09T12:00:00.000Z"),
@@ -415,7 +425,7 @@ test("future-poisoned verified timestamps are DUE in planner exactly like the re
   });
   db.creatorFinancialTransaction = { async findMany() { return []; } };
   db.creatorCampaign = { async findMany() { return []; } };
-  db.$queryRawUnsafe = async () => [];
+  db.$queryRawUnsafe = rawQueryWithAuthorityNow([]);
 
   const result = await ensureRecurringCreatorAnalyticsCatchups({
     db, creatorId: "creator-1", agencyId: "agency-1", now,
@@ -570,3 +580,29 @@ test("terminal notification failure without retryAt is quarantined from automati
   assert.equal(scheduled.some((row) => row.jobKey === "catchup_notifications_scan"), false);
 });
 
+
+
+test("collector planning reloads durable state under the collector lock before deriving epoch/order", async () => {
+  const now = new Date("2026-08-09T12:00:00.000Z");
+  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z") };
+  const db = dbFixture();
+  let reads = 0;
+  db.creatorFinancialCollectionState.findUnique = async () => {
+    reads += 1;
+    if (reads === 1) return null; // readiness says Financial still needs baseline
+    if (reads === 2) return { activeGeneration: "prelock-generation", activeRequestedAt: new Date("2026-08-09T11:59:59.000Z") };
+    return { activeGeneration: "locked-generation", activeRequestedAt: new Date("2026-08-09T12:00:00.500Z") };
+  };
+  scheduled = [];
+  const step = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert.equal(step.stage, "financial");
+  assert.ok(reads >= 3, "planning must re-read collector state after entering the lock");
+  assert.equal(scheduled.length, 1);
+  assert.deepEqual(scheduled[0].dedupeParams, {
+    planningEpoch: "locked-generation:none",
+    collectionOrderingAfter: "2026-08-09T12:00:00.500Z",
+    collectionContractVersion: 1,
+    collectionType: "FINANCIAL",
+    collectionMode: "full",
+  });
+});
