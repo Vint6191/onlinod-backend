@@ -28,7 +28,7 @@ function loadSettingsService({ auditImpl = async () => null, agencyLifecycleLock
       assertManagementCommitAuthority: async ({ actorMember, ownerOrAdmin = false, creatorIds = [] }) => {
         const role = String(actorMember?.role || "").toUpperCase();
         const roleKey = String(actorMember?.roleKey || "").toLowerCase();
-        if (ownerOrAdmin && !(role === "OWNER" || role === "ADMIN" || role === "MANAGER" || roleKey === "owner" || roleKey === "admin" || roleKey === "manager")) {
+        if (ownerOrAdmin && !(role === "OWNER" || role === "ADMIN" || roleKey === "owner" || roleKey === "admin")) {
           const error = new Error("OWNER or ADMIN authority is required"); error.code = "MANAGEMENT_OWNER_OR_ADMIN_REQUIRED"; error.status = 403; throw error;
         }
         return { member: actorMember, accessEpoch: Number(actorMember?.accessEpoch || 1), creatorIds: Array.isArray(creatorIds) ? creatorIds : [creatorIds] };

@@ -24,7 +24,7 @@ function isOwnerOrAdmin(member) {
   if (isOwner(member)) return true;
   const legacy = String(member?.role || "").trim().toUpperCase();
   const roleKey = String(member?.roleKey || "").trim().toLowerCase();
-  return legacy === "ADMIN" || legacy === "MANAGER" || roleKey === "admin" || roleKey === "manager";
+  return legacy === "ADMIN" || roleKey === "admin";
 }
 
 async function lockAgencyLifecycle({ tx, agencyId }) {

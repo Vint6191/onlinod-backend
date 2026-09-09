@@ -70,3 +70,19 @@ test("ManagementCommitAuthority rejects owner/admin demotion at commit", async (
     (error) => error?.code === "MANAGEMENT_OWNER_OR_ADMIN_REQUIRED" && error?.status === 403,
   );
 });
+
+
+test("ManagementCommitAuthority ownerOrAdmin contract rejects preset Manager", async () => {
+  const { assertManagementCommitAuthority } = loadAuthority();
+  const manager = { ...admitted, role: "MANAGER", roleKey: "manager" };
+  await assert.rejects(
+    () => assertManagementCommitAuthority({ tx: dbWith(manager), agencyId: "agency-1", actorMember: manager, ownerOrAdmin: true }),
+    (error) => error?.code === "MANAGEMENT_OWNER_OR_ADMIN_REQUIRED" && error?.status === 403,
+  );
+});
+
+test("ManagementCommitAuthority ownerOrAdmin contract accepts explicit ADMIN", async () => {
+  const { assertManagementCommitAuthority } = loadAuthority();
+  const out = await assertManagementCommitAuthority({ tx: dbWith(admitted), agencyId: "agency-1", actorMember: admitted, ownerOrAdmin: true });
+  assert.equal(out.member.id, admitted.id);
+});

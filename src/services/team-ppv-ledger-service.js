@@ -2,6 +2,7 @@
 
 const prisma = require("../prisma");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { resolveHistoricalAttributionTarget } = require("./historical-attribution-target-authority-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { reconcileMoneyForSentMessageEvidence } = require("./team-money-reconciliation-service");
 
@@ -628,11 +629,11 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
 
     let selectedMember = null;
     if (finalAction === "assign") {
-      selectedMember = await tx.agencyMember.findFirst({
-        where: { agencyId, id: safeMemberId, deletedAt: null },
-        select: { id: true, userId: true },
+      const targetAuthority = await resolveHistoricalAttributionTarget({
+        tx, agencyId, targetMemberId: safeMemberId,
       });
-      if (!selectedMember) return "invalid_member";
+      if (!targetAuthority.ok) return targetAuthority.code;
+      selectedMember = targetAuthority.member;
     }
 
     const baseResult = job.result && typeof job.result === "object" ? job.result : {};
@@ -829,7 +830,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
   if (outcome === "skipped") return { resolved: 0, skipped: 1 };
   if (outcome === "creator_forbidden") return { resolved: 0, skipped: 1, code: "CREATOR_ACCESS_FORBIDDEN" };
   if (outcome === "actor_forbidden") return { resolved: 0, skipped: 1, code: "ACTOR_AUTHORITY_REVOKED" };
-  if (outcome === "invalid_member") return { resolved: 0, skipped: 1, code: "RESOLUTION_MEMBER_INVALID" };
+  if (outcome === "HISTORICAL_ATTRIBUTION_TARGET_INVALID") return { resolved: 0, skipped: 1, code: outcome };
   return { resolved: 1, skipped: 0, action: outcome };
 }
 

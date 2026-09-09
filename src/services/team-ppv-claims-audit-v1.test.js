@@ -51,8 +51,9 @@ function loadService({ liveCreatorIds = ["creator-1"] } = {}) {
     },
     agencyMember: {
       async findFirst({ where }) {
-        if (where.id === "outside-agency-member") return null;
-        return { id: where.id, userId: `user-${where.id}`, displayName: where.id };
+        if (where.id === "outside-agency-member" || where.id === "removed-member") return null;
+        if (where.id === "deactivated-member") return { id: where.id, userId: `user-${where.id}`, displayName: where.id, deactivatedAt: new Date("2026-09-01T00:00:00.000Z") };
+        return { id: where.id, userId: `user-${where.id}`, displayName: where.id, deactivatedAt: null };
       },
       async findMany() { return []; },
     },
@@ -86,7 +87,7 @@ test("PPV manager decisions require a real actor and reason before any DB write"
   assert.equal(state.transactions, 0);
 });
 
-test("PPV assign rejects a selected member that is not active in the same agency", async () => {
+test("PPV historical adjudication rejects a removed/outside member with the shared target code", async () => {
   const { service, state } = loadService();
   const result = await service.resolvePpvConflict({
     agencyId: "agency-1",
@@ -98,10 +99,29 @@ test("PPV assign rejects a selected member that is not active in the same agency
     reason: "Reviewed evidence",
   });
 
-  assert.equal(result.code, "RESOLUTION_MEMBER_INVALID");
+  assert.equal(result.code, "HISTORICAL_ATTRIBUTION_TARGET_INVALID");
   assert.equal(state.purchaseWrites.length, 0);
   assert.equal(state.jobWrites.length, 0);
   assert.equal(state.auditRows.length, 0);
+});
+
+
+
+test("PPV historical adjudication allows a deactivated but non-removed agency member", async () => {
+  const { service, state } = loadService();
+  const result = await service.resolvePpvConflict({
+    agencyId: "agency-1",
+    jobId: "job-1",
+    memberId: "deactivated-member",
+    actorMemberId: "manager-1",
+    actorMember: phase2ManagerActor({ id: "manager-1", userId: "user-manager-1", creatorIds: ["creator-1"] }),
+    action: "assign",
+    reason: "Historical work belongs to this former worker",
+  });
+
+  assert.equal(result.action, "assign");
+  assert.equal(state.purchaseWrites[0].update.attributedMemberId, "deactivated-member");
+  assert.equal(state.purchaseWrites[0].update.attributedUserId, "user-deactivated-member");
 });
 
 test("PPV assign keeps selected chatter separate from manager actor in immutable audit", async () => {

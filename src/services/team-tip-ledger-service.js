@@ -2,6 +2,7 @@
 
 const prisma = require("../prisma");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { resolveHistoricalAttributionTarget } = require("./historical-attribution-target-authority-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { classifySentSource } = require("./team-money-reconciliation-service");
 
@@ -524,11 +525,11 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
       nextResolvedSource = "manual_chatter_release";
     } else if (cleanAction === "manager_override") {
       if (targetMemberId) {
-        const target = await tx.agencyMember.findFirst({
-          where: { agencyId, id: clean(targetMemberId, 160), deletedAt: null, deactivatedAt: null },
-          select: { id: true, userId: true },
+        const targetAuthority = await resolveHistoricalAttributionTarget({
+          tx, agencyId, targetMemberId: clean(targetMemberId, 160),
         });
-        if (!target) return { code: "TARGET_NOT_AGENCY_MEMBER" };
+        if (!targetAuthority.ok) return { code: targetAuthority.code };
+        const target = targetAuthority.member;
         nextStatus = "resolved";
         nextOwnerMemberId = target.id;
         nextOwnerUserId = target.userId;
