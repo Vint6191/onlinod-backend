@@ -322,6 +322,8 @@ async function listAwaitingCustomRevisions({ agencyId, member, limit = 50, curso
       items.push({
         submissionId: String(row.id),
         customOrderId: String(order.id),
+        bindingRevision: Math.max(1, Math.floor(Number(row.bindingRevision) || 1)),
+        reviewDecisionRevision: Math.max(1, Math.floor(Number(row.reviewDecisionRevision) || 1)),
         creatorId: String(row.creatorId),
         dialogId: String(order.dialogId),
         creator: creatorSummary(row.creator),

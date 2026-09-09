@@ -88,8 +88,9 @@ test("Team read models do not silently truncate activity or attribution ledgers"
   assert.match(analytics, /cursor: \{ id: cursorId \}, skip: 1/);
   assert.doesNotMatch(analytics, /take:\s*(?:10000|20000|50000)\b/);
   assert.match(analytics, /findAllById\(prisma\.teamActivityEvent/);
-  assert.match(analytics, /findAllById\(prisma\.teamPpvPurchaseLedger/);
-  assert.match(analytics, /findAllById\(prisma\.teamTipLedger/);
+  assert.match(analytics, /findAllById\(prisma\.teamMoneyAttributionFact/);
+  assert.match(analytics, /loadActivityDaily/);
+  assert.doesNotMatch(analytics, /findAllById\(prisma\.teamPpvPurchaseLedger/);
 });
 
 

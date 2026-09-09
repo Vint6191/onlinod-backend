@@ -10,6 +10,7 @@ const { projectNativeMassWriteFromTeamEvent } = require("./programmatic-of-write
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { runDbTransaction } = require("./db-transaction-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const TEAM_V13_VERSION = "team_v13_provenance";
 const TEAM_V13_SOURCE = "electron_team_v13";
@@ -37,6 +38,23 @@ const TEAM_V13_ACTION_SOURCES = new Set([
   "UNKNOWN",
 ]);
 const TEAM_V13_LIFECYCLES = new Set(["OBSERVED", "ATTEMPTED", "CONFIRMED", "FAILED"]);
+const PROVIDER_EVENT_TIME_SOURCE_DETAILS = new Set([
+  "creator_runtime_ws",
+  "crm_incremental_recovery",
+  "crm_pending_bootstrap_v2",
+  "creator_runtime_cdp",
+]);
+const PROVIDER_EVENT_TIME_KINDS = new Set([
+  "FAN_MESSAGE_RECEIVED",
+  "MESSAGE_SEND_CONFIRMED",
+  "BROADCAST_DISPATCH_CONFIRMED",
+  "BROADCAST_QUEUE_CANCELED_CONFIRMED",
+  "CONTENT_POST_PUBLISHED_CONFIRMED",
+  "CONTENT_STORY_PUBLISHED_CONFIRMED",
+]);
+const PROVIDER_EVENT_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
+const PROVIDER_EVENT_MAX_HISTORY_MS = 366 * 24 * 60 * 60 * 1000;
+
 const HUMAN_ACTIVITY_KINDS = new Set([
   "DIALOG_SELECTED",
   "DIALOG_SEEN",
@@ -185,7 +203,34 @@ function canonicalMustNotHaveHumanActor(eventKind, actionSource) {
   return false;
 }
 
-function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authenticatedMember }) {
+function canonicalEventTime({ event, eventKind, authorityNow }) {
+  const dbNow = authorityNow instanceof Date && Number.isFinite(authorityNow.getTime()) ? new Date(authorityNow) : null;
+  if (!dbNow) throw telemetryAdmissionError("TEAM_EVENT_TIME_AUTHORITY_REQUIRED", "DB event-time authority is required", 500);
+  const reported = optionalDate(event.occurredAt ?? event.ts ?? event.createdAt);
+  const sourceDetail = cleanString(event.sourceDetail, 120);
+  const providerEligible = PROVIDER_EVENT_TIME_KINDS.has(eventKind) && PROVIDER_EVENT_TIME_SOURCE_DETAILS.has(String(sourceDetail || ""));
+  if (providerEligible && reported) {
+    const delta = reported.getTime() - dbNow.getTime();
+    if (delta <= PROVIDER_EVENT_FUTURE_TOLERANCE_MS && delta >= -PROVIDER_EVENT_MAX_HISTORY_MS) {
+      return { ts: reported, reported, authority: "PROVIDER_REPORTED_BOUNDED", rejectedReason: null };
+    }
+    return { ts: dbNow, reported, authority: "DB_RECEIPT", rejectedReason: delta > PROVIDER_EVENT_FUTURE_TOLERANCE_MS ? "REPORTED_FUTURE" : "REPORTED_TOO_OLD" };
+  }
+  return { ts: dbNow, reported, authority: "DB_RECEIPT", rejectedReason: reported ? "CLIENT_WALL_CLOCK_NOT_AUTHORITY" : null };
+}
+
+function canonicalHumanSessionTimes({ eventKind, authorityNow, durationSeconds, rawStartedAt, rawEndedAt }) {
+  if (!HUMAN_ACTIVITY_KINDS.has(eventKind)) return { startedAt: rawStartedAt, endedAt: rawEndedAt };
+  const at = new Date(authorityNow);
+  if (eventKind === "COVERAGE_STARTED") return { startedAt: at, endedAt: null };
+  if (eventKind === "COVERAGE_ENDED" || eventKind === "DIALOG_SESSION") {
+    const seconds = Math.max(0, Math.min(24 * 60 * 60, Number(durationSeconds) || 0));
+    return { startedAt: new Date(at.getTime() - seconds * 1000), endedAt: at };
+  }
+  return { startedAt: null, endedAt: null };
+}
+
+function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authenticatedMember, authorityNow }) {
   const eventKind = cleanString(event.eventKind, 80)?.toUpperCase() || "";
   const actionSource = cleanString(event.actionSource, 40)?.toUpperCase() || "";
   const lifecycle = cleanString(event.lifecycle, 40)?.toUpperCase() || "";
@@ -215,7 +260,9 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
   // the logged-in human is not the performance actor. Never let auth context
   // silently turn an automated PPV/message into chatter revenue ownership.
   const humanActor = requiresHuman && !forbidsHuman ? authenticatedMember : null;
-  const ts = safeDate(event.occurredAt || event.ts || event.createdAt || Date.now());
+  const eventTime = canonicalEventTime({ event, eventKind, authorityNow });
+  const ts = eventTime.ts;
+  const identityTime = eventTime.reported || ts;
   const localId = cleanString(event.localId, 160) || hashEvent({
     agencyId,
     deviceId,
@@ -224,7 +271,7 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
     creatorId: creator?.id || event.creatorId || event.accountId || null,
     messageId: event.messageId || null,
     correlationId: event.correlationId || null,
-    ts: ts.getTime(),
+    ts: identityTime.getTime(),
   });
 
   const metadata = event.metadata && typeof event.metadata === "object" && !Array.isArray(event.metadata)
@@ -236,8 +283,20 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
   const extra = compactObject({
     telemetryVersion: TEAM_V13_VERSION,
     sourceDetail: cleanString(event.sourceDetail, 120),
+    eventTimeAuthority: eventTime.authority,
+    reportedOccurredAt: eventTime.reported ? eventTime.reported.toISOString() : null,
+    reportedTimeRejectedReason: eventTime.rejectedReason,
     mediaIds,
     metadata,
+  });
+
+  const durationSeconds = nonNegativeInt(event.durationSeconds);
+  const sessionTimes = canonicalHumanSessionTimes({
+    eventKind,
+    authorityNow: ts,
+    durationSeconds,
+    rawStartedAt: optionalDate(event.startedAt),
+    rawEndedAt: optionalDate(event.endedAt),
   });
 
   return {
@@ -259,9 +318,9 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
       contentId: cleanString(event.contentId || event.metadata?.contentId, 220),
       correlationId: cleanString(event.correlationId, 220),
       coverageId: cleanString(event.coverageId, 220),
-      startedAt: optionalDate(event.startedAt),
-      endedAt: optionalDate(event.endedAt),
-      durationSeconds: nonNegativeInt(event.durationSeconds),
+      startedAt: sessionTimes.startedAt,
+      endedAt: sessionTimes.endedAt,
+      durationSeconds,
       automationDeliveryId: cleanString(event.automationDeliveryId, 220),
       broadcastDispatchId: cleanString(event.broadcastDispatchId, 220),
       priceCents: nonNegativeInt(event.priceCents),
@@ -362,12 +421,14 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
         if (!creator) return { rejected: "creator_not_found" };
         if (!canAccessCreator(liveMember, creator.id)) return { rejected: "creator_access_forbidden" };
 
+        const authorityNow = await dbAuthorityNow({ db: tx });
         const result = normalizeCanonicalCore({
           agencyId,
           deviceId,
           event,
           creator,
           authenticatedMember: liveMember,
+          authorityNow,
         });
         if (!result.row) return { rejected: result.reason || "invalid_contract" };
         const row = result.row;

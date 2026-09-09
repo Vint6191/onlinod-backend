@@ -7,14 +7,14 @@ const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
 const { SETTINGS_KEY: TELEGRAM_CUSTOM_REMINDERS_KEY, normalizeTelegramCustomReminders, reprojectCustomReminderSchedule } = require("./custom-order-reminders");
-const { findCancelledModelInstructionFollowupDebt, scanIncompleteTelegramSources } = require("./telegram-exact-authority-scan-service");
-const { findCustomProviderThreadRetentionBlockers } = require("./custom-provider-thread-retention-authority-service");
+const { assertTelegramProviderCapabilityCanRetire } = require("./telegram-provider-capability-control-authority-service");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
 const { catalogForClient } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
 const { getWalletState, readRolling30dRevenueBatch, pricingPreviewFromRevenue } = require("./billing-wallet-service");
 const { lockCustomExecutionDefaults, lockAgencyPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 const { telegramLifecycleState: currentTelegramLifecycleState, isActiveTelegramAccount, isRetiringTelegramAccount } = require("./telegram-account-reference-authority-service");
 
 const WORKSPACE_SETTING_DEFAULTS = Object.freeze({
@@ -417,6 +417,9 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
 
   const before = await getWorkspaceSettings({ agencyId, member, db: client });
   const persist = async (tx) => {
+    await assertManagementCommitAuthority({
+      tx, agencyId, actorMember: member, permissionKey: "workspace.manage_settings",
+    });
     if (Object.prototype.hasOwnProperty.call(values, "vaultUploadRecipient")) {
       // Workspace relay recipient is part of the immutable per-submission execution
       // profile. Publish it through the same transaction fence used by first pinning
@@ -523,58 +526,10 @@ function publicTelegramAccount(row, sessionReady = false, now = new Date()) {
 }
 
 async function assertTelegramAccountNoBusinessBlockers({ agencyId, accountId, db }) {
-  const id = String(accountId);
-  const activeIntent = db.telegramDeliveryIntent?.findFirst ? await db.telegramDeliveryIntent.findFirst({
-    where: {
-      agencyId,
-      accountId: id,
-      OR: [
-        // Once an external effect may have started, account identity is immutable evidence and
-        // retirement must never erase the capability needed to settle/reconcile that outcome.
-        { state: { in: ["COMMITTING", "RECONCILE_REQUIRED"] } },
-        // Follow-ups execute on the confirmed TASK thread, so their account is historical pinned
-        // authority even before commit. TASK itself is different: before COMMITTING its provider
-        // account is refreshable current configuration. A PLANNED/CLAIMED/FAILED_PRECOMMIT TASK
-        // may safely survive retirement of its stale account and later rebind the SAME canonical
-        // intent to a new ACTIVE account; no external effect has started yet.
-        { kind: { not: "TASK" }, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] } },
-      ],
-    },
-    select: { id: true, kind: true, state: true },
-  }) : null;
-  if (activeIntent) throw Object.assign(new Error("Telegram connection is still required by an active or unresolved Custom delivery"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
-
-  const providerRetention = await findCustomProviderThreadRetentionBlockers({ agencyId, accountId: id, db, stopAfterFirst: true });
-  if (providerRetention.length) {
-    throw Object.assign(new Error("Telegram connection is still required by an active Custom provider-thread capability"), {
-      code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409, retentionReason: providerRetention[0]?.reason || null,
-    });
-  }
-
-  const cancelledFollowupDebt = await findCancelledModelInstructionFollowupDebt({ agencyId, accountId: id, db, stopAfterFirst: true });
-  if (cancelledFollowupDebt.length) {
-    throw Object.assign(new Error("Telegram connection still owns a confirmed model instruction whose cancellation follow-up has not been durably planned or confirmed"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
-  }
-
-  let pendingSource = null;
-  await scanIncompleteTelegramSources({
-    agencyId,
-    accountId: id,
-    requireSourceUser: false,
-    db,
-    onRow: async (row) => { pendingSource = row; return true; },
-  });
-  if (pendingSource) {
-    throw Object.assign(new Error("Telegram connection is still required by pending Custom source media"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
-  }
-
-  if (db.telegramInboundEvent?.findFirst) {
-    const unresolvedInbound = await db.telegramInboundEvent.findFirst({
-      where: { agencyId, accountId: id, hasMedia: true, submissionId: null, projectionState: { in: ["PENDING", "FAILED_RETRYABLE", "REVIEW_REQUIRED"] } },
-      select: { id: true, projectionState: true },
-    });
-    if (unresolvedInbound) throw Object.assign(new Error("Telegram connection is still required by an unresolved inbound provider source"), { code: "SETTINGS_TELEGRAM_ACCOUNT_IN_USE", status: 409 });
-  }
+  // Single provider-capability authority owns retirement classification.  Do not reintroduce
+  // kind-specific blockers here: precommit work may be rebindable while unknown external
+  // outcomes, exact cancellation follow-ups and current source/thread capability remain pinned.
+  return assertTelegramProviderCapabilityCanRetire({ agencyId, accountId, db });
 }
 
 async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
@@ -605,6 +560,7 @@ async function updateTelegramCustomReminderSettings({ agencyId, member, reminder
   // transaction. If the process crashes, neither a half-published policy nor half-reprojected
   // schedule set is committed. Concurrent provider settlement loses/retries on CustomOrder CAS.
   const apply = async (tx) => {
+    await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true });
     await tx.workspaceSetting.upsert({
       where: { agencyId_key: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY } },
       create: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY, value: normalized },
@@ -666,18 +622,24 @@ async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, ses
     err.status = 503;
     throw err;
   }
-  const account = await client.agencyTelegramMtprotoAccount.create({
-    data: {
-      agencyId,
-      apiId: numericApiId,
-      encryptedPayload: encrypted.encryptedPayload,
-      iv: encrypted.iv,
-      tag: encrypted.tag,
-      algorithm: encrypted.algorithm,
-      payloadVersion: encrypted.payloadVersion,
-    },
-    select: { id: true, apiId: true },
-  });
+  const createAccount = async (tx) => {
+    await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true });
+    return tx.agencyTelegramMtprotoAccount.create({
+      data: {
+        agencyId,
+        apiId: numericApiId,
+        encryptedPayload: encrypted.encryptedPayload,
+        iv: encrypted.iv,
+        tag: encrypted.tag,
+        algorithm: encrypted.algorithm,
+        payloadVersion: encrypted.payloadVersion,
+      },
+      select: { id: true, apiId: true },
+    });
+  };
+  const account = typeof client.$transaction === "function"
+    ? await client.$transaction(createAccount, { isolationLevel: "Serializable" })
+    : await createAccount(client);
   return { available: true, account: publicTelegramAccount({ ...account, lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null }, Boolean(cleanSession)) };
 }
 
@@ -707,6 +669,7 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
       // with manager review/planning before either side can acquire CustomOrder / TelegramAccount
       // in opposite order, eliminating the normal REQUEST_REVISION <-> retirement deadlock.
       await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+      await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true, agencyAlreadyLocked: true });
       if (!tx.agencyTelegramMtprotoAccount?.updateMany) {
         throw Object.assign(new Error("Telegram connection retirement fencing is unavailable"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_FENCE_UNAVAILABLE", status: 503 });
       }
@@ -750,6 +713,7 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
     // Keep the same Agency-first order for the RETIRING -> RETIRED phase. Although
     // new work cannot bind a RETIRING account, blocker scans still lock CustomOrder rows.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true, agencyAlreadyLocked: true });
     const current = await tx.agencyTelegramMtprotoAccount.findFirst({
       where: { id, agencyId },
       select: { id: true, apiId: true, lifecycleState: true, retirementRequestedAt: true, retirementDrainCompletedAt: true, runtimeClaimedByDeviceId: true, runtimeClaimUntil: true, runtimeClaimGeneration: true, runtimeDrainedGeneration: true },
@@ -789,6 +753,7 @@ async function forceRetireLostTelegramMtprotoAccount({ agencyId, member, account
     // Force retirement participates in the exact same Agency -> TelegramAccount ->
     // CustomOrder serialization order as normal retirement.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true, agencyAlreadyLocked: true });
     if (!tx.agencyTelegramMtprotoAccount?.updateMany) throw Object.assign(new Error("Telegram retirement fencing is unavailable"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_FENCE_UNAVAILABLE", status: 503 });
     const locked = await tx.agencyTelegramMtprotoAccount.updateMany({ where: { id, agencyId, lifecycleState: "RETIRING" }, data: { lifecycleState: "RETIRING" } });
     if (Number(locked?.count || 0) !== 1) {
@@ -915,6 +880,7 @@ async function storeTelegramMtprotoSession({ agencyId, member, accountId, sessio
   const client = db || prisma;
   if (typeof client?.$transaction !== "function") throw Object.assign(new Error("Telegram session handoff requires transactional storage"), { code: "SETTINGS_TELEGRAM_SESSION_TRANSACTION_REQUIRED", status: 503 });
   return client.$transaction(async (tx) => {
+    await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true });
     const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db: tx, requireActive: true });
     let encrypted;
     try { encrypted = encryptTelegramCredentials({ apiHash: secret.apiHash, session: cleanSession }); }

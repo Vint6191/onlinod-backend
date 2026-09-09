@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { findCancelledModelInstructionFollowupDebt, findConfirmedTelegramProjectionDebt } = require("./telegram-exact-authority-scan-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
+const { lockAgencyLifecycleBarrier, agencyLifecycleBarrierKey } = require("./agency-lifecycle-barrier-service");
 
 const ACTIVE = "ACTIVE";
 const SALVAGE = "SALVAGE";
@@ -190,29 +191,23 @@ async function lockCreatorPipelineLifecycle({ db, agencyId, creatorId, allowDele
   return row;
 }
 
-async function lockAgencyPipelineLifecycle({ db, agencyId, allowDeleted = false }) {
+async function lockAgencyPipelineLifecycle({ db, agencyId, allowDeleted = false, mode = "shared" }) {
   const id = clean(agencyId, 180);
   if (!id) throw fail("AGENCY_NOT_FOUND", "Agency not found", 404);
-  let row = null;
-  if (typeof db?.$queryRawUnsafe === "function") {
-    const rows = await db.$queryRawUnsafe(
-      `SELECT "id", "deletedAt", "status"
-       FROM "Agency"
-       WHERE "id" = $1
-       FOR UPDATE`,
-      id,
-    );
-    row = Array.isArray(rows) ? rows[0] || null : null;
-  } else if (db?.agency?.findFirst) {
-    // Unit-test / adapter fallback. Production transactions use the FOR UPDATE
-    // branch above so agency retirement and NEW Custom work share one row lock.
-    row = await db.agency.findFirst({ where: { id }, select: { id: true, deletedAt: true, status: true } });
-  } else if (db?.agency?.findUnique) {
-    row = await db.agency.findUnique({ where: { id }, select: { id: true, deletedAt: true, status: true } });
-  }
+  const lockMode = String(mode || "shared").toLowerCase() === "exclusive" ? "exclusive" : "shared";
+
+  // Phase 2 lock topology: normal creator/order/provider work shares the generic
+  // transaction-scoped Agency lifecycle barrier; destructive Agency lifecycle takes it
+  // exclusively. Domain-local locks remain below this barrier.
+  const barrier = await lockAgencyLifecycleBarrier({ db, agencyId: id, mode: lockMode });
+  const row = barrier.row;
   if (!row) throw fail("AGENCY_NOT_FOUND", "Agency not found", 404);
   if (!allowDeleted && row.deletedAt) throw fail("AGENCY_RETIRED", "Agency has been removed and cannot accept new Custom pipeline work", 409);
   return row;
+}
+
+async function lockAgencyPipelineLifecycleExclusive({ db, agencyId, allowDeleted = false }) {
+  return lockAgencyPipelineLifecycle({ db, agencyId, allowDeleted, mode: "exclusive" });
 }
 
 async function withSubmissionPipelineLock({ db, agencyId, submissionId, work }) {
@@ -954,6 +949,8 @@ module.exports = {
   derivePipelineStage,
   executionFailureStillApplies,
   lockAgencyPipelineLifecycle,
+  lockAgencyPipelineLifecycleExclusive,
+  agencyPipelineLifecycleBarrierKey: agencyLifecycleBarrierKey,
   lockCreatorPipelineLifecycle,
   withSubmissionPipelineLock,
   lockCustomExecutionDefaults,

@@ -43,7 +43,7 @@ async function viewer(req, res, { write = false } = {}) {
   }
   const member = await prisma.agencyMember.findFirst({
     where: { agencyId: id, userId: req.auth?.userId, deletedAt: null, deactivatedAt: null },
-    select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true },
+    select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true, accessEpoch: true },
   });
   if (!member) {
     res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No active agency membership" });
@@ -94,6 +94,7 @@ router.post("/shifts", async (req, res) => {
       agencyId: actor.agencyId,
       actorUserId: actor.member.userId,
       actorMemberId: actor.member.id,
+      actorMember: actor.member,
       actorAllowedCreatorIds: actor.allowedCreatorIds,
       input: req.body || {},
     }));
@@ -110,7 +111,9 @@ router.patch("/shifts/:shiftId", async (req, res) => {
       shiftId: req.params.shiftId,
       actorUserId: actor.member.userId,
       actorMemberId: actor.member.id,
+      actorMember: actor.member,
       actorAllowedCreatorIds: actor.allowedCreatorIds,
+      expectedRevision: req.body?.expectedRevision,
       input: req.body || {},
     }));
   } catch (err) {
@@ -126,7 +129,9 @@ router.post("/shifts/:shiftId/cancel", async (req, res) => {
       shiftId: req.params.shiftId,
       actorUserId: actor.member.userId,
       actorMemberId: actor.member.id,
+      actorMember: actor.member,
       actorAllowedCreatorIds: actor.allowedCreatorIds,
+      expectedRevision: req.body?.expectedRevision,
       reason: req.body?.reason || null,
     }));
   } catch (err) {

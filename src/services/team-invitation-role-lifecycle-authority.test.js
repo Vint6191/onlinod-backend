@@ -18,13 +18,18 @@ function assertBefore(text, left, right, message) {
 }
 
 const team = read("team-administration-service.js");
+const agencyLifecycle = read("agency-lifecycle-barrier-service.js");
 const invitations = read("../routes/invitations.js");
 const auth = read("../routes/auth.js");
 
 test("role lifecycle fence is exported as the shared assignment capability with an exclusive writer mode", () => {
   assert.match(team, /async function lockTeamRoleLifecycle/);
-  assert.match(team, /mode === "update" \? "FOR UPDATE" : "FOR SHARE"/);
-  assert.match(team, /SELECT "id", "deletedAt" FROM "Agency"/);
+  assert.match(team, /lockAgencyLifecycleBarrier\(\{ db: tx, agencyId, mode: "shared" \}\)/);
+  assert.match(team, /team-role-lifecycle:/);
+  assert.match(team, /mode: write \? "exclusive" : "shared"/);
+  assert.match(team, /const rowLock = write \? "FOR UPDATE" : "FOR SHARE"/);
+  assert.match(agencyLifecycle, /normalizedMode === "exclusive" \? "FOR UPDATE" : "FOR SHARE"/);
+  assert.match(agencyLifecycle, /FROM "Agency" WHERE "id" = \$1/);
   assert.match(team, /\n\s*lockTeamRoleLifecycle,\n/);
 });
 

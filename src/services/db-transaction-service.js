@@ -9,20 +9,24 @@ async function runDbTransaction(db, work, options = undefined) {
   return options === undefined ? client.$transaction(work) : client.$transaction(work, options);
 }
 
-async function lockDbAdvisoryXact({ db, key }) {
+async function lockDbAdvisoryXact({ db, key, mode = "exclusive" }) {
   const client = db || rootPrisma();
   const normalized = String(key || "").trim();
   if (!normalized) throw Object.assign(new Error("Advisory transaction lock key is required"), { code: "DB_ADVISORY_LOCK_KEY_REQUIRED" });
   if (typeof client.$executeRawUnsafe !== "function") {
     throw Object.assign(new Error("Advisory transaction lock requires Prisma $executeRawUnsafe support"), { code: "DB_ADVISORY_LOCK_CLIENT_REQUIRED" });
   }
-  await client.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtext($1))", normalized);
+  const lockMode = String(mode || "exclusive").toLowerCase() === "shared" ? "shared" : "exclusive";
+  const sql = lockMode === "shared"
+    ? "SELECT pg_advisory_xact_lock_shared(hashtext($1))"
+    : "SELECT pg_advisory_xact_lock(hashtext($1))";
+  await client.$executeRawUnsafe(sql, normalized);
   return { key: normalized };
 }
 
-async function withDbAdvisoryXactLock({ db, key, work, options = undefined }) {
+async function withDbAdvisoryXactLock({ db, key, mode = "exclusive", work, options = undefined }) {
   return runDbTransaction(db, async (tx) => {
-    await lockDbAdvisoryXact({ db: tx, key });
+    await lockDbAdvisoryXact({ db: tx, key, mode });
     return work(tx);
   }, options);
 }

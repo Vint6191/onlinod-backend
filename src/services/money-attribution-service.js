@@ -112,11 +112,13 @@ async function sweepLocks({ agencyId = null } = {}) {
 }
 
 
-async function purgeExpiredLegacyAttributions({ agencyId = null, retentionDays = LEGACY_ATTRIBUTION_RETENTION_DAYS, limit = 5000, dryRun = false } = {}) {
+async function purgeExpiredLegacyAttributions({ agencyId = null, retentionDays = LEGACY_ATTRIBUTION_RETENTION_DAYS, limit = 5000, dryRun = false, now = new Date() } = {}) {
   const cleanAgency = cleanString(agencyId, 160);
   const safeRetentionDays = Math.max(1, Math.round(Number(retentionDays) || LEGACY_ATTRIBUTION_RETENTION_DAYS));
   const safeLimit = Math.min(20000, Math.max(1, Math.round(Number(limit) || 5000)));
-  const cutoff = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
+  const authorityNow = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(authorityNow.getTime())) throw new Error("TEAM_LEGACY_RETENTION_AUTHORITY_TIME_INVALID");
+  const cutoff = new Date(authorityNow.getTime() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
   const rows = await prisma.moneyAttribution.findMany({
     where: {

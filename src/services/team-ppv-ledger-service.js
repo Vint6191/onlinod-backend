@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { reconcileMoneyForSentMessageEvidence } = require("./team-money-reconciliation-service");
 
@@ -587,7 +588,7 @@ async function createPpvClaimAudit(tx, { agencyId, actorMemberId, job, action, s
   });
 }
 
-async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = null, action = "assign", deviceId, reason = null, allowedCreatorIds = null }) {
+async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = null, actorMember = null, action = "assign", deviceId, reason = null, allowedCreatorIds = null }) {
   const safeJobId = clean(jobId, 160);
   const safeAction = clean(action || (memberId ? "assign" : "unresolved"), 40) || "assign";
   const safeMemberId = clean(memberId, 160);
@@ -598,7 +599,10 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
       : (safeAction === "creator_revenue"
         ? "creator_revenue"
         : (safeAction === "unresolved" ? "unresolved" : "assign")));
-  const safeActorMemberId = clean(actorMemberId, 160);
+  const safeActorMemberId = clean(actorMemberId || actorMember?.id, 160);
+  const admittedActor = actorMember?.id && actorMember?.userId
+    ? actorMember
+    : { id: safeActorMemberId, userId: clean(actorMember?.userId, 160), accessEpoch: actorMember?.accessEpoch ?? null };
   const safeReason = clean(reason, 1000);
   if (!safeJobId) return { resolved: 0, skipped: 1, code: "PPV_CONFLICT_NOT_FOUND" };
   if (!safeActorMemberId) return { resolved: 0, skipped: 1, code: "RESOLUTION_ACTOR_REQUIRED" };
@@ -610,7 +614,15 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
   const outcome = await prisma.$transaction(async (tx) => {
     const job = await findPpvResolveJobForUpdate(tx, { agencyId, jobId: safeJobId });
     if (!job) return "skipped";
-    if (!creatorAllowed(job.creatorId, allowedCreatorIds)) return "creator_forbidden";
+    try {
+      await assertManagementCommitAuthority({
+        tx, agencyId, actorMember: admittedActor, permissionKey: "money.resolve_attribution", creatorIds: job.creatorId ? [job.creatorId] : [],
+      });
+    } catch (authorityError) {
+      if (authorityError?.code === "MANAGEMENT_CREATOR_SCOPE_REVOKED") return "creator_forbidden";
+      if (["MANAGEMENT_ACCESS_REVOKED", "MANAGEMENT_PERMISSION_REVOKED", "MANAGEMENT_ACCESS_STALE"].includes(authorityError?.code)) return "actor_forbidden";
+      throw authorityError;
+    }
 
     const purchaseBefore = await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
 
@@ -816,6 +828,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
 
   if (outcome === "skipped") return { resolved: 0, skipped: 1 };
   if (outcome === "creator_forbidden") return { resolved: 0, skipped: 1, code: "CREATOR_ACCESS_FORBIDDEN" };
+  if (outcome === "actor_forbidden") return { resolved: 0, skipped: 1, code: "ACTOR_AUTHORITY_REVOKED" };
   if (outcome === "invalid_member") return { resolved: 0, skipped: 1, code: "RESOLUTION_MEMBER_INVALID" };
   return { resolved: 1, skipped: 0, action: outcome };
 }
@@ -831,6 +844,8 @@ async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS, now = new 
       where: {
         purchasedAt: { lt: before },
         status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected", "creator_revenue"] },
+        historicalFactVersion: "team_money_fact_v1",
+        historicalFactProjectedAt: { not: null },
       },
     }),
     prisma.teamPpvResolveJob.deleteMany({

@@ -31,6 +31,8 @@ function dbForRead() {
     },
   ];
   return {
+    systemSetting: { async findUnique() { return null; } },
+    teamProjectionCoverage: { async findUnique() { return { agencyId: "agency-1", responseCoverageFrom: new Date("2026-08-01T00:00:00Z"), dialogCoverageFrom: new Date("2026-08-01T00:00:00Z") }; } },
     teamCoverageSession: { async findMany() { return coverage; } },
     teamShift: { async findMany() { return [{
       id: "shift-1", agencyId: "agency-1", memberId: "member-a", startsAt: new Date("2026-08-12T09:00:00Z"), endsAt: new Date("2026-08-12T17:00:00Z"), timezone: "Europe/Kyiv", status: "PLANNED", note: "day shift", createdAt: new Date("2026-08-11T10:00:00Z"), updatedAt: new Date("2026-08-11T10:00:00Z"), cancelledAt: null,
@@ -99,13 +101,21 @@ test("Schedule context never leaks target member creator ids outside the acting 
 
 test("Schedule write target validation is fail-closed for actor and target-member creator scope", async () => {
   const db = {
-    agencyMember: { async findFirst() { return { id: "member-a", assignedCreators: ["creator-1"], displayName: "Marina", user: { name: "Marina" } }; } },
+    agency: { async findUnique() { return { id: "agency-1", deletedAt: null, status: "ACTIVE" }; } },
+    agencyMember: { async findFirst({ where }) {
+      if (where?.id === "manager") return {
+        id: "manager", userId: "user-manager", agencyId: "agency-1", role: "MANAGER", roleKey: "manager",
+        permissions: { "workspace.manage_schedule": true }, assignedCreators: ["creator-1"], accessEpoch: 1, deletedAt: null, deactivatedAt: null,
+      };
+      return { id: "member-a", agencyId: "agency-1", assignedCreators: ["creator-1"], displayName: "Marina", user: { name: "Marina" } };
+    } },
     creatorAccount: { async findMany({ where }) { return (where.id.in || []).filter((id) => id === "creator-1" || id === "creator-2").map((id) => ({ id })); } },
-    teamShift: { async create({ data }) { return { id: "shift-new", ...data, creators: data.creators.create }; } },
+    teamShift: { async create({ data }) { return { id: "shift-new", revision: 1, ...data, creators: data.creators.create }; } },
     auditLog: { async create() { return { id: "audit-1" }; } },
+    async $transaction(fn) { return fn(this); },
   };
   await schedule.createTeamShift({ agencyId: "agency-1", actorUserId: "user-manager", actorMemberId: "manager", actorAllowedCreatorIds: ["creator-1"], input: { memberId: "member-a", creatorIds: ["creator-1"], startsAt: "2026-08-14T09:00:00Z", endsAt: "2026-08-14T17:00:00Z", timezone: "Europe/Kyiv" }, db });
-  await assert.rejects(() => schedule.createTeamShift({ agencyId: "agency-1", actorUserId: "user-manager", actorMemberId: "manager", actorAllowedCreatorIds: ["creator-1"], input: { memberId: "member-a", creatorIds: ["creator-2"], startsAt: "2026-08-14T09:00:00Z", endsAt: "2026-08-14T17:00:00Z", timezone: "Europe/Kyiv" }, db }), (err) => err.code === "TEAM_SCHEDULE_CREATOR_FORBIDDEN");
+  await assert.rejects(() => schedule.createTeamShift({ agencyId: "agency-1", actorUserId: "user-manager", actorMemberId: "manager", actorAllowedCreatorIds: ["creator-1"], input: { memberId: "member-a", creatorIds: ["creator-2"], startsAt: "2026-08-14T09:00:00Z", endsAt: "2026-08-14T17:00:00Z", timezone: "Europe/Kyiv" }, db }), (err) => ["TEAM_SCHEDULE_CREATOR_FORBIDDEN", "MANAGEMENT_CREATOR_SCOPE_REVOKED"].includes(err.code));
 });
 
 test("Schedule is relational, additive and exposes an explicit granular manage permission", () => {

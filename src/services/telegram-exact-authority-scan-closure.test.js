@@ -24,10 +24,12 @@ test("F44 runtime eligibility separates exact discovery from resource claim limi
 test("retirement uses exact future-capability retention authority instead of model-obligation sampling", () => {
   const settings = read("src/services/settings-service.js");
   const blocker = settings.slice(settings.indexOf("async function assertTelegramAccountNoBusinessBlockers"), settings.indexOf("async function getTelegramMtprotoSettings"));
+  const provider = read("src/services/telegram-provider-capability-control-authority-service.js");
   assert.doesNotMatch(blocker, /take:\s*1000\b/);
-  assert.match(blocker, /findCustomProviderThreadRetentionBlockers\(\{\s*agencyId,\s*accountId:\s*id/);
-  assert.match(blocker, /scanIncompleteTelegramSources/);
-  assert.match(blocker, /telegramInboundEvent\.findFirst/);
+  assert.match(blocker, /assertTelegramProviderCapabilityCanRetire/);
+  assert.match(provider, /findCustomProviderThreadRetentionBlockers\(\{ agencyId, accountId: target/);
+  assert.match(provider, /scanIncompleteTelegramSources/);
+  assert.match(provider, /telegramInboundEvent\.findFirst/);
 });
 
 test("F44 exact scan helper paginates to exhaustion and model-instruction discovery starts from current PENDING orders", () => {

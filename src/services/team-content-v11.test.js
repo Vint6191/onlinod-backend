@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { phase2AnalyticsFixture, attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 
 function listModel(rows) {
   return { async findMany(args = {}) {
@@ -27,7 +28,7 @@ const prismaMock = {
   teamDialogSession: listModel([]),
 };
 const prismaPath = require.resolve("../prisma");
-require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: prismaMock };
+require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(prismaMock) };
 const analytics = require("./team-analytics-service");
 
 test("Content Team counts only confirmed MANUAL publish provenance", async () => {

@@ -46,7 +46,7 @@ async function loadAgencyMember(req, agencyIdValue) {
   if (!id || !req.auth?.userId) return null;
   return prisma.agencyMember.findFirst({
     where: { agencyId: id, userId: req.auth.userId, deletedAt: null, deactivatedAt: null },
-    select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true },
+    select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true, accessEpoch: true },
   });
 }
 
@@ -95,7 +95,7 @@ async function requirePpvClaimsManager(req, res) {
 
   const member = await prisma.agencyMember.findFirst({
     where: { agencyId: id, userId: req.auth?.userId, deletedAt: null, deactivatedAt: null },
-    select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true },
+    select: { id: true, agencyId: true, userId: true, role: true, roleKey: true, permissions: true, assignedCreators: true, accessEpoch: true },
   });
 
   if (!member) {
@@ -172,13 +172,14 @@ router.post("/ppv/conflicts/:jobId/resolve", async (req, res) => {
       jobId: req.params.jobId,
       memberId: input.memberId,
       actorMemberId: req.agencyMember.id,
+      actorMember: viewer.member,
       action: input.action,
       reason: input.reason,
       deviceId: req.auth.deviceId || null,
       allowedCreatorIds: viewer.allowedCreatorIds,
     });
     if (result.code) {
-      const status = result.code === "PPV_CONFLICT_NOT_FOUND" ? 404 : (result.code === "CREATOR_ACCESS_FORBIDDEN" ? 403 : 400);
+      const status = result.code === "PPV_CONFLICT_NOT_FOUND" ? 404 : (["CREATOR_ACCESS_FORBIDDEN", "ACTOR_AUTHORITY_REVOKED"].includes(result.code) ? 403 : 400);
       return res.status(status).json({ ok: false, ...result });
     }
     return res.json({ ok: true, ...result });

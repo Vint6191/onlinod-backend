@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { phase2AnalyticsFixture, attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 
 function listModel(rows) {
   return {
@@ -83,7 +84,7 @@ function makePrisma() {
 }
 
 const prismaPath = require.resolve("../prisma");
-require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: makePrisma() };
+require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(makePrisma()) };
 const analytics = require("./team-analytics-service");
 
 test("Team read model uses projected fresh/backlog response semantics and active dialog time", async () => {

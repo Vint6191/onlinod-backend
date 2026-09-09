@@ -16,6 +16,10 @@ function loadService({ failSideEffects = 0, failCreatorLookup = false, assignedC
   const sideEffectState = { failuresRemaining: failSideEffects };
   const authority = { accessEpoch: 1, assignedCreators, afterCommit: null, transactions: 0 };
   const prisma = {
+    async $queryRawUnsafe(sql) {
+      if (/clock_timestamp/i.test(String(sql || ""))) return [{ authorityNow: new Date("2026-08-11T20:00:30.000Z") }];
+      return [];
+    },
     async $transaction(work) {
       const snapshot = rows.map((row) => ({ ...row }));
       try {

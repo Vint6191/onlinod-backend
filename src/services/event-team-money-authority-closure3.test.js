@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { phase2AnalyticsFixture, attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -14,6 +15,8 @@ const analyticsPath = require.resolve("./team-analytics-service");
 
 function source(rel) { return fs.readFileSync(path.join(ROOT, rel), "utf8"); }
 function loadWithPrisma(modulePath, fake) {
+  if (modulePath === analyticsPath) phase2AnalyticsFixture(fake);
+  if (modulePath === ppvPath) attachManagementAuthority(fake, { actor: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }) });
   delete require.cache[modulePath];
   delete require.cache[prismaPath];
   require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: fake };
@@ -172,7 +175,7 @@ test("Closure3 PPV manual reassignment replaces the full owner tuple", async () 
     teamPpvClaimAudit: { async create() { return {}; } },
   };
   const ppv = loadWithPrisma(ppvPath, fake);
-  const result = await ppv.resolvePpvConflict({ agencyId: "agency-1", jobId: "job-1", memberId: "member-B", actorMemberId: "manager", action: "assign", deviceId: "device-1", reason: "manager changed owner", allowedCreatorIds: ["creator-1"] });
+  const result = await ppv.resolvePpvConflict({ agencyId: "agency-1", jobId: "job-1", memberId: "member-B", actorMemberId: "manager", actorMember: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }), action: "assign", deviceId: "device-1", reason: "manager changed owner", allowedCreatorIds: ["creator-1"] });
   assert.equal(result.resolved, 1);
   assert.deepEqual(lockOrder.slice(0, 2), ["job", "purchase"]);
   assert.equal(purchase.attributedMemberId, "member-B");
@@ -235,7 +238,7 @@ function createSharedPpvConcurrencyDb() {
       teamActivityEvent: { async findFirst() { return null; }, async create() { return {}; } },
       teamPpvClaimAudit: { async create() { return {}; } },
     };
-    return tx;
+    return attachManagementAuthority(tx, { actor: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }) });
   }
   return { root, state };
 }
@@ -245,7 +248,7 @@ test("Closure3 true AUTO/MANUAL PPV overlap converges without deadlock and final
   const money = loadWithPrisma(moneyPath, {});
   const ppv = loadWithPrisma(ppvPath, fx.root);
   const auto = money.reconcileCreatorSaleToTeam({ db: fx.root, saleId: "sale-1" });
-  const manual = ppv.resolvePpvConflict({ agencyId: "agency-1", jobId: "job-1", memberId: "member-B", actorMemberId: "manager", action: "assign", deviceId: "device-1", reason: "manual wins overlap", allowedCreatorIds: ["creator-1"] });
+  const manual = ppv.resolvePpvConflict({ agencyId: "agency-1", jobId: "job-1", memberId: "member-B", actorMemberId: "manager", actorMember: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }), action: "assign", deviceId: "device-1", reason: "manual wins overlap", allowedCreatorIds: ["creator-1"] });
   await Promise.race([
     Promise.all([auto, manual]),
     new Promise((_, reject) => setTimeout(() => reject(new Error("deadlock timeout")), 1000)),

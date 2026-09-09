@@ -745,7 +745,7 @@ test("relay reservation binds canonical CUSTOM_RELAY_SEND payload to the full Te
   db.$transaction = async (work) => work(db);
   db.$queryRawUnsafe = async (sql, id, agencyId) => {
     const text = String(sql);
-    if (/FROM "Agency"[\s\S]*FOR UPDATE/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+    if (/FROM "Agency"[\s\S]*FOR (?:SHARE|UPDATE)/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
     if (/CreatorAccount[\s\S]*FOR UPDATE/.test(text)) return [{ id, agencyId, deletedAt: null, status: "READY" }];
     assert.match(text, /CustomContentSubmission[\s\S]*FOR UPDATE/);
     assert.equal(id, "source-bound");
@@ -783,7 +783,7 @@ test("rolling cutover adopts the exact pre-cutover relay fingerprint without wea
   db.$transaction = async (work) => work(db);
   db.$queryRawUnsafe = async (sql, id, agencyId) => {
     const text = String(sql);
-    if (/FROM "Agency"[\s\S]*FOR UPDATE/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+    if (/FROM "Agency"[\s\S]*FOR (?:SHARE|UPDATE)/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
     if (/CreatorAccount[\s\S]*FOR UPDATE/.test(text)) return [{ id, agencyId, deletedAt: null, status: "READY" }];
     return [{ id }];
   };
@@ -1336,7 +1336,7 @@ test("relay reservation racing an album merge serializes on the submission row a
   db.$transaction = async (work) => work(db);
   db.$queryRawUnsafe = async (sql, id, agencyId) => {
     const text = String(sql);
-    if (/FROM "Agency"[\s\S]*FOR UPDATE/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+    if (/FROM "Agency"[\s\S]*FOR (?:SHARE|UPDATE)/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
     if (/CreatorAccount[\s\S]*FOR UPDATE/.test(text)) return [{ id, agencyId: agencyId || "agency-1", deletedAt: null, status: "READY" }];
     assert.match(text, /CustomContentSubmission[\s\S]*FOR UPDATE/);
     assert.equal(id, "submission-lock-race");

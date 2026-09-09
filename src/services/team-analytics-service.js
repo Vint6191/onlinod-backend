@@ -3,6 +3,9 @@
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
 const { summarizePendingRows } = require("./team-pending-read-service");
+const { getRetentionSettings } = require("./retention-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { coverageState, buildProjectionDetailAuthority } = require("./team-historical-range-authority-service");
 
 const TEAM_TELEMETRY_VERSION = "team_v13_provenance";
 const SUPPORTED_TEAM_TELEMETRY_VERSIONS = new Set([
@@ -428,16 +431,65 @@ async function loadV3Events({ agencyId, range, allowedCreatorIds = null }) {
   return dedupeLogicalEvents(rows.filter(isCurrentTelemetry));
 }
 
-async function loadPpvPurchaseLedger({ agencyId, range, allowedCreatorIds = null }) {
+async function loadHistoricalCoverage({ agencyId }) {
   try {
-    const rows = await findAllById(prisma.teamPpvPurchaseLedger, {
-      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...whereForRange("purchasedAt", range) },
+    if (!prisma.teamHistoricalAnalyticsCoverage?.findUnique) throw new Error("TeamHistoricalAnalyticsCoverage model unavailable");
+    const row = await prisma.teamHistoricalAnalyticsCoverage.findUnique({ where: { agencyId } });
+    if (!row) throw new Error("TeamHistoricalAnalyticsCoverage row unavailable");
+    return {
+      activityCoverageFrom: row.activityCoverageFrom ? new Date(row.activityCoverageFrom) : null,
+      moneyCoverageFrom: row.moneyCoverageFrom ? new Date(row.moneyCoverageFrom) : null,
+      activityProjectionVersion: String(row.activityProjectionVersion || "team_activity_daily_v1"),
+      moneyProjectionVersion: String(row.moneyProjectionVersion || "team_money_fact_v1"),
+      source: String(row.source || "phase2_historical_authority"),
+    };
+  } catch (err) {
+    throw analyticsUnavailable("historical_coverage", err);
+  }
+}
+
+async function loadActivityDaily({ agencyId, range, allowedCreatorIds = null }) {
+  try {
+    if (!prisma.teamMemberActivityDaily?.findMany) throw new Error("TeamMemberActivityDaily model unavailable");
+    const rows = await prisma.teamMemberActivityDaily.findMany({
+      where: {
+        agencyId,
+        ...creatorScopeWhere(allowedCreatorIds),
+        ...whereForRange("day", range),
+      },
+      orderBy: [{ day: "asc" }, { id: "asc" }],
     });
-    rows.sort((a, b) => new Date(a.purchasedAt || 0).getTime() - new Date(b.purchasedAt || 0).getTime());
+    return rows || [];
+  } catch (err) {
+    throw analyticsUnavailable("activity_history", err);
+  }
+}
+
+async function loadPpvMoneyFacts({ agencyId, range, allowedCreatorIds = null }) {
+  try {
+    if (!prisma.teamMoneyAttributionFact?.findMany) throw new Error("TeamMoneyAttributionFact model unavailable");
+    const rows = await findAllById(prisma.teamMoneyAttributionFact, {
+      where: {
+        agencyId,
+        sourceType: "PPV",
+        ...creatorScopeWhere(allowedCreatorIds),
+        ...whereForRange("occurredAt", range),
+      },
+    });
+    rows.sort((a, b) => new Date(a.occurredAt || 0).getTime() - new Date(b.occurredAt || 0).getTime());
     return rows;
   } catch (err) {
-    throw analyticsUnavailable("ppv_projection", err);
+    throw analyticsUnavailable("ppv_historical_fact", err);
   }
+}
+
+function clampRangeToDetail(range, detailDays) {
+  const endAt = range?.endAt ? new Date(range.endAt) : new Date();
+  const cutoff = new Date(endAt.getTime() - Math.max(1, Number(detailDays) || 180) * 86400000);
+  const requestedStart = range?.startAt ? new Date(range.startAt) : null;
+  const startAt = requestedStart && requestedStart.getTime() > cutoff.getTime() ? requestedStart : cutoff;
+  if (startAt.getTime() > endAt.getTime()) return null;
+  return { ...range, startAt, endAt };
 }
 
 async function loadProjectionCoverage({ agencyId }) {
@@ -514,20 +566,38 @@ async function loadProjectedPendingStates({ agencyId, allowedCreatorIds = null }
 }
 
 async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = null }) {
-  const range = resolveRange(rangeKey);
-  const projectionCoverage = await loadProjectionCoverage({ agencyId });
-  const responseRange = projectionRange(range, projectionCoverage.responseCoverageFrom);
-  const dialogRange = projectionRange(range, projectionCoverage.dialogCoverageFrom);
-  const [members, events, ppvPurchases, responseCases, projectedDialogSessions, pendingProjection] = await Promise.all([
+  const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const range = resolveRange(rangeKey, authorityNow);
+  const [projectionCoverage, historicalCoverage, retentionPolicy] = await Promise.all([
+    loadProjectionCoverage({ agencyId }),
+    loadHistoricalCoverage({ agencyId }),
+    getRetentionSettings(),
+  ]);
+  if (retentionPolicy?.ok !== true) throw analyticsUnavailable("retention_policy", new Error("Team retention policy unavailable"));
+  const detailDays = Number(retentionPolicy.settings?.teamCanonicalDetailDays || 180);
+  const projectionDetail = buildProjectionDetailAuthority({
+    range,
+    authorityNow,
+    detailDays,
+    responseCoverageFrom: projectionCoverage.responseCoverageFrom,
+    dialogCoverageFrom: projectionCoverage.dialogCoverageFrom,
+  });
+  const canonicalDetailRetainedFrom = projectionDetail.detailRetainedFrom;
+  const rawRange = clampRangeToDetail(range, detailDays);
+  const useDailyActivity = String(range.key || "") !== "24h";
+  const responseRange = projectionDetail.responseRange;
+  const dialogRange = projectionDetail.dialogRange;
+  const [members, events, activityDaily, ppvPurchases, responseCases, projectedDialogSessions, pendingProjection] = await Promise.all([
     getMembersShell(agencyId),
-    loadV3Events({ agencyId, range, allowedCreatorIds }),
-    loadPpvPurchaseLedger({ agencyId, range, allowedCreatorIds }),
+    rawRange ? loadV3Events({ agencyId, range: rawRange, allowedCreatorIds }) : Promise.resolve([]),
+    useDailyActivity ? loadActivityDaily({ agencyId, range, allowedCreatorIds }) : Promise.resolve([]),
+    loadPpvMoneyFacts({ agencyId, range, allowedCreatorIds }),
     responseRange ? loadProjectedResponseCases({ agencyId, range: responseRange, allowedCreatorIds }) : Promise.resolve([]),
     dialogRange ? loadProjectedDialogSessions({ agencyId, range: dialogRange, allowedCreatorIds }) : Promise.resolve([]),
     loadProjectedPendingStates({ agencyId, allowedCreatorIds }),
   ]);
-  const responseProjectionCoversRange = projectionCoversWholeRange(range, projectionCoverage.responseCoverageFrom);
-  const dialogProjectionCoversRange = projectionCoversWholeRange(range, projectionCoverage.dialogCoverageFrom);
+  const responseProjectionCoversRange = projectionDetail.responseCoverage.status === "FULL";
+  const dialogProjectionCoversRange = projectionDetail.dialogCoverage.status === "FULL";
 
   const metricsByMember = new Map();
   for (const m of members) metricsByMember.set(String(m.id), emptyMetric());
@@ -557,6 +627,35 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     return Math.max(1, Number.isFinite(n) ? Math.round(n) : 1);
   }
 
+  function historicalActivityOwns(ev) {
+    return useDailyActivity && projectionOwnsTimestamp(eventTs(ev), historicalCoverage.activityCoverageFrom);
+  }
+
+  if (useDailyActivity) {
+    for (const row of activityDaily || []) {
+      const m = metricFor(row.memberId);
+      if (!m) continue;
+      m.messagesSent += Math.max(0, num(row.messagesSent, 0));
+      m.ppvSentMessages += Math.max(0, num(row.ppvSentMessages, 0));
+      m.broadcastDispatches += Math.max(0, num(row.broadcastDispatches, 0));
+      m.postsCreated += Math.max(0, num(row.postsCreated, 0));
+      m.storiesCreated += Math.max(0, num(row.storiesCreated, 0));
+      m.contentActions += Math.max(0, num(row.contentActions, 0));
+      m.contentMediaItemsPublished += Math.max(0, num(row.contentMediaItemsPublished, 0));
+      if (row.creatorId) m._creators.add(String(row.creatorId));
+      if (row.creatorId && num(row.contentActions, 0) > 0) m._contentCreators.add(String(row.creatorId));
+      if (num(row.contentActions, 0) > 0 && row.day) {
+        const day = new Date(row.day);
+        if (Number.isFinite(day.getTime())) m._contentDays.add(day.toISOString().slice(0, 10));
+      }
+      if (row.lastContentActivityAt) {
+        const at = new Date(row.lastContentActivityAt);
+        const previous = m.lastContentActivityAt ? new Date(m.lastContentActivityAt).getTime() : 0;
+        if (Number.isFinite(at.getTime()) && at.getTime() >= previous) m.lastContentActivityAt = at.toISOString();
+      }
+    }
+  }
+
   // account|fan -> pending seen dialog that may become unanswered only after leave.
   const pendingByDialog = new Map();
   const sentByMessageId = new Map();
@@ -567,19 +666,17 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
   // Count revenue ONCE per purchaseId, otherwise PPV revenue can silently x2/x3.
   const seenPpvPurchaseIds = new Set();
 
-  // PPV ledger is the money source of truth. If a purchase exists in the
-  // ledger as conflict/unresolved/rejected, old activity events must NOT keep
-  // leaking revenue into member metrics. This is what makes Claims safe.
+  // Durable TeamMoneyAttributionFact is the long-range money source of truth.
+  // Raw claims ledgers remain recent detail/conflict evidence only. Historical
+  // telemetry must never resurrect revenue that the durable fact deactivated.
   const ledgerPpvPurchaseIds = new Set();
   for (const p of ppvPurchases || []) {
-    if (!ppvFinanciallyActive(p)) continue;
-    const purchaseId = String(p.purchaseId || "").trim();
+    const purchaseId = String(p.externalId || "").trim();
     if (purchaseId) ledgerPpvPurchaseIds.add(purchaseId);
 
-    const status = String(p.status || "").toLowerCase();
-    if (status !== "attributed" && status !== "resolved") continue;
+    if (p.attributionActive !== true) continue;
 
-    const ownerMemberId = String(p.attributedMemberId || "").trim();
+    const ownerMemberId = String(p.memberId || "").trim();
     const ownerMetric = metricFor(ownerMemberId);
     if (!ownerMetric) continue;
 
@@ -588,7 +685,7 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     ownerMetric.ppvSoldMessages += 1;
     ownerMetric._ppvRevenueByCurrency.set(currency, (ownerMetric._ppvRevenueByCurrency.get(currency) || 0) + amount);
     if (p.fanId) ownerMetric._fans.add(String(p.fanId));
-    if (p.accountId) ownerMetric._creators.add(String(p.accountId));
+    if (p.creatorId) ownerMetric._creators.add(String(p.creatorId));
     if (purchaseId) seenPpvPurchaseIds.add(purchaseId);
   }
 
@@ -707,8 +804,10 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     if (canonicalKind === "MESSAGE_SEND_CONFIRMED") {
       if (String(ev.lifecycle || "").toUpperCase() !== "CONFIRMED") continue;
       if (canonicalSource === "MANUAL" && m) {
-        m.messagesSent += 1;
-        if (ev.isPpv === true || num(ev.priceCents, 0) > 0) m.ppvSentMessages += 1;
+        if (!historicalActivityOwns(ev)) {
+          m.messagesSent += 1;
+          if (ev.isPpv === true || num(ev.priceCents, 0) > 0) m.ppvSentMessages += 1;
+        }
         const pending = pendingByDialog.get(key);
         if (pending && !pending.closed && Number(pending.firstSeenAt || 0) <= eventTs(ev)) pending.closed = true;
       } else if (canonicalSource === "AUTOMATION" && m) {
@@ -721,16 +820,18 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
 
     if (canonicalKind === "CONTENT_POST_PUBLISHED_CONFIRMED" || canonicalKind === "CONTENT_STORY_PUBLISHED_CONFIRMED") {
       if (String(ev.lifecycle || "").toUpperCase() !== "CONFIRMED" || canonicalSource !== "MANUAL" || !m) continue;
-      if (canonicalKind === "CONTENT_POST_PUBLISHED_CONFIRMED") m.postsCreated += 1;
-      else m.storiesCreated += 1;
-      m.contentActions += 1;
-      m.contentMediaItemsPublished += Math.max(0, num(ev.mediaCount ?? extra.mediaCount, 0));
-      if (accountId) m._contentCreators.add(accountId);
-      const ts = new Date(ev.ts || extra.occurredAt || Date.now());
-      if (Number.isFinite(ts.getTime())) {
-        m._contentDays.add(ts.toISOString().slice(0, 10));
-        const previous = m.lastContentActivityAt ? new Date(m.lastContentActivityAt).getTime() : 0;
-        if (ts.getTime() >= previous) m.lastContentActivityAt = ts.toISOString();
+      if (!historicalActivityOwns(ev)) {
+        if (canonicalKind === "CONTENT_POST_PUBLISHED_CONFIRMED") m.postsCreated += 1;
+        else m.storiesCreated += 1;
+        m.contentActions += 1;
+        m.contentMediaItemsPublished += Math.max(0, num(ev.mediaCount ?? extra.mediaCount, 0));
+        if (accountId) m._contentCreators.add(accountId);
+        const ts = new Date(ev.ts || extra.occurredAt || Date.now());
+        if (Number.isFinite(ts.getTime())) {
+          m._contentDays.add(ts.toISOString().slice(0, 10));
+          const previous = m.lastContentActivityAt ? new Date(m.lastContentActivityAt).getTime() : 0;
+          if (ts.getTime() >= previous) m.lastContentActivityAt = ts.toISOString();
+        }
       }
       continue;
     }
@@ -740,7 +841,7 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     }
 
     if (canonicalKind === "BROADCAST_DISPATCH_CONFIRMED") {
-      if (m) m.broadcastDispatches += 1;
+      if (m && !historicalActivityOwns(ev)) m.broadcastDispatches += 1;
       continue;
     }
 
@@ -804,7 +905,7 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     }
 
     if (type === "sent_message_recorded" || type === "ppv_message_sent_recorded") {
-      if (m && (type === "ppv_message_sent_recorded" || extra.isPpv === true)) {
+      if (!historicalActivityOwns(ev) && m && (type === "ppv_message_sent_recorded" || extra.isPpv === true)) {
         m.ppvSentMessages += 1;
       }
       continue;
@@ -819,7 +920,7 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
     }
 
     if (type === "chat_message_sent_local") {
-      if (m) m.messagesSent += 1;
+      if (!historicalActivityOwns(ev) && m) m.messagesSent += 1;
 
       const evTs = eventTs(ev);
       const pending = pendingByDialog.get(key);
@@ -923,7 +1024,13 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
   responseSummary.source = responseProjectionCoversRange
     ? "team_response_case_v1"
     : (responseRange ? "hybrid_legacy_before_projection_coverage" : "legacy_event_fallback");
-  responseSummary.coverageFrom = projectionCoverage.responseCoverageFrom?.toISOString?.() || null;
+  responseSummary.coverageFrom = projectionDetail.responseAvailableFrom?.toISOString?.() || null;
+
+  const activityCoverage = coverageState(range, historicalCoverage.activityCoverageFrom);
+  const moneyCoverage = coverageState(range, historicalCoverage.moneyCoverageFrom);
+  const responseCoverage = projectionDetail.responseCoverage;
+  const dialogCoverage = projectionDetail.dialogCoverage;
+  const rawDistinctCoverage = coverageState(range, canonicalDetailRetainedFrom);
 
   return {
     range,
@@ -941,10 +1048,24 @@ async function buildComputed({ agencyId, rangeKey = "7d", allowedCreatorIds = nu
       dialogSessionSource: dialogProjectionCoversRange
         ? "team_dialog_session_v1"
         : (dialogRange ? "hybrid_legacy_before_projection_coverage" : "event_fallback"),
-      responseCoverageFrom: projectionCoverage.responseCoverageFrom?.toISOString?.() || null,
-      dialogCoverageFrom: projectionCoverage.dialogCoverageFrom?.toISOString?.() || null,
+      responseCoverageFrom: projectionDetail.responseAvailableFrom?.toISOString?.() || null,
+      dialogCoverageFrom: projectionDetail.dialogAvailableFrom?.toISOString?.() || null,
       unansweredSource: hasProjectedPending ? "team_pending_dialog_v1" : (responseProjectionCoversRange ? "not_projected" : "legacy_event_fallback"),
       creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
+      historical: {
+        version: "team_historical_analytics_v1",
+        authoritySource: historicalCoverage.source,
+        rawDetailRetainedFrom: canonicalDetailRetainedFrom.toISOString(),
+        rawDetailDays: detailDays,
+        families: {
+          manualActivity: { ...activityCoverage, source: useDailyActivity ? historicalCoverage.activityProjectionVersion : "team_activity_event_v13_exact" },
+          content: { ...activityCoverage, source: useDailyActivity ? historicalCoverage.activityProjectionVersion : "team_activity_event_v13_exact" },
+          money: { ...moneyCoverage, source: historicalCoverage.moneyProjectionVersion },
+          responses: { ...responseCoverage, source: "bounded_team_response_case_v1" },
+          dialogs: { ...dialogCoverage, source: "bounded_team_dialog_session_v1" },
+          distinctFansAndLegacyActivity: { ...rawDistinctCoverage, source: "bounded_team_activity_detail" },
+        },
+      },
     },
   };
 }
@@ -1008,27 +1129,27 @@ function formatCurrencyBucketForAlert(bucketObject) {
 
 async function getPpvLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
   try {
-    const rows = await prisma.teamPpvPurchaseLedger.groupBy({
-      by: ["attributedMemberId", "currency"],
-      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activePpvFinancialWhere(), status: { in: ATTRIBUTED_PPV_STATUSES }, attributedMemberId: { not: null }, ...whereForRange("purchasedAt", range) },
+    const rows = await prisma.teamMoneyAttributionFact.groupBy({
+      by: ["memberId", "currency"],
+      where: { agencyId, sourceType: "PPV", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
       _sum: { amountCents: true },
     });
     const map = new Map();
-    for (const row of rows || []) if (row.attributedMemberId) addCurrencyToMap(map, row.attributedMemberId, row.currency, row?._sum?.amountCents);
+    for (const row of rows || []) if (row.memberId) addCurrencyToMap(map, row.memberId, row.currency, row?._sum?.amountCents);
     return map;
   } catch (err) { throw analyticsUnavailable("ppv_revenue", err); }
 }
 
 async function getPpvLedgerRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
-    const rows = await findAllById(prisma.teamPpvPurchaseLedger, {
-      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activePpvFinancialWhere(), status: { in: ATTRIBUTED_PPV_STATUSES }, attributedMemberId: { not: null }, ...whereForRange("purchasedAt", range) },
-      select: { id: true, attributedMemberId: true, fanId: true, buyerFanId: true, dialogId: true, amountCents: true, currency: true },
+    const rows = await findAllById(prisma.teamMoneyAttributionFact, {
+      where: { agencyId, sourceType: "PPV", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
+      select: { id: true, memberId: true, fanId: true, dialogId: true, amountCents: true, currency: true },
     });
     const map = new Map();
     for (const row of rows || []) {
-      const fanKey = row.fanId || row.buyerFanId || row.dialogId;
-      if (row.attributedMemberId && fanKey) addCurrencyToMap(map, `${row.attributedMemberId}|${fanKey}`, row.currency, row.amountCents);
+      const fanKey = row.fanId || row.dialogId;
+      if (row.memberId && fanKey) addCurrencyToMap(map, `${row.memberId}|${fanKey}`, row.currency, row.amountCents);
     }
     return map;
   } catch (err) { throw analyticsUnavailable("ppv_revenue_dialog", err); }
@@ -1036,27 +1157,27 @@ async function getPpvLedgerRevenueByMemberDialog({ agencyId, range, allowedCreat
 
 async function getTipLedgerRevenueByMember({ agencyId, range, allowedCreatorIds = null }) {
   try {
-    const rows = await prisma.teamTipLedger.groupBy({
-      by: ["attributedMemberId", "currency"],
-      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activeTipFinancialWhere(), status: { in: ATTRIBUTED_TIP_STATUSES }, attributedMemberId: { not: null }, ...whereForRange("receivedAt", range) },
+    const rows = await prisma.teamMoneyAttributionFact.groupBy({
+      by: ["memberId", "currency"],
+      where: { agencyId, sourceType: "TIP", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
       _sum: { amountCents: true },
     });
     const map = new Map();
-    for (const row of rows || []) if (row.attributedMemberId) addCurrencyToMap(map, row.attributedMemberId, row.currency, row?._sum?.amountCents);
+    for (const row of rows || []) if (row.memberId) addCurrencyToMap(map, row.memberId, row.currency, row?._sum?.amountCents);
     return map;
   } catch (err) { throw analyticsUnavailable("tip_revenue", err); }
 }
 
 async function getTipLedgerRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
-    const rows = await findAllById(prisma.teamTipLedger, {
-      where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), ...activeTipFinancialWhere(), status: { in: ATTRIBUTED_TIP_STATUSES }, attributedMemberId: { not: null }, ...whereForRange("receivedAt", range) },
-      select: { id: true, attributedMemberId: true, fanId: true, dialogId: true, amountCents: true, currency: true },
+    const rows = await findAllById(prisma.teamMoneyAttributionFact, {
+      where: { agencyId, sourceType: "TIP", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
+      select: { id: true, memberId: true, fanId: true, dialogId: true, amountCents: true, currency: true },
     });
     const map = new Map();
     for (const row of rows || []) {
       const fanKey = row.fanId || row.dialogId;
-      if (row.attributedMemberId && fanKey) addCurrencyToMap(map, `${row.attributedMemberId}|${fanKey}`, row.currency, row.amountCents);
+      if (row.memberId && fanKey) addCurrencyToMap(map, `${row.memberId}|${fanKey}`, row.currency, row.amountCents);
     }
     return map;
   } catch (err) { throw analyticsUnavailable("tip_revenue_dialog", err); }
@@ -1101,7 +1222,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
       metrics.revenueAttributedCents = revenue.cents;
       metrics.revenueCurrency = revenue.currency;
       metrics.dollarsPerMessageCents = revenue.cents !== null && metrics.messagesSent > 0 ? Math.round(revenue.cents / metrics.messagesSent) : (revenue.cents === 0 ? 0 : null);
-      metrics.moneySource = revenue.mixed ? "team_ledgers_multi_currency" : "team_ledgers";
+      metrics.moneySource = revenue.mixed ? "team_money_fact_v1_multi_currency" : "team_money_fact_v1";
     }
     if (!includeMoney) {
       metrics.revenueAttributedCents = null;
@@ -1133,7 +1254,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
     range: rangeForClient(computed.range),
     snapshot: null,
     members: rows,
-    source: "team_activity_event_v13",
+    source: "team_historical_authority_v1",
     projection: computed.projection,
     responseSummary: computed.responseSummary,
     pendingSummary: computed.pendingSummary || null,
@@ -1200,7 +1321,7 @@ function combineOverview(metricsList, membersCount) {
     seenResponseMedianSeconds: null,
     slaReply5mPct: null,
     slaReply15mPct: null,
-    source: "team_activity_event_v13",
+    source: "team_historical_authority_v1",
   };
   const fans = new Set();
   const responses = [];

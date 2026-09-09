@@ -482,8 +482,12 @@ router.post("/submissions/:submissionId/review", async (req, res) => {
       agencyId: req.auth.agencyId,
       member: req.auth.membership || req.member,
       submissionId: req.params.submissionId,
+      expectedCustomOrderId: req.body?.expectedCustomOrderId,
+      expectedBindingRevision: req.body?.expectedBindingRevision,
+      expectedReviewDecisionRevision: req.body?.expectedReviewDecisionRevision,
       action: req.body?.action,
       comment: req.body?.comment,
+      supersessionReason: req.body?.supersessionReason,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_REVIEW_ACTION_FAILED"); }

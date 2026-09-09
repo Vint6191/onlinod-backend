@@ -2,6 +2,9 @@
 
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
+const { getRetentionSettings } = require("./retention-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { retainedDetailFrom, latestAvailableFrom, clampRangeToAvailableFrom, coverageState } = require("./team-historical-range-authority-service");
 
 const RESPONSE_CLASSIFICATIONS = new Set(["FRESH", "BACKLOG", "HANDOFF", "UNKNOWN"]);
 
@@ -34,6 +37,29 @@ function memberName(member) {
   return member?.displayName || member?.user?.name || null;
 }
 
+async function resolveDetailReadAuthority({ agencyId, rangeKey, family }) {
+  const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const range = resolveRange(rangeKey, authorityNow);
+  const [retention, projection] = await Promise.all([
+    getRetentionSettings(),
+    prisma.teamProjectionCoverage.findUnique({ where: { agencyId } }),
+  ]);
+  if (retention?.ok !== true) throw new Error("TEAM_RETENTION_POLICY_UNAVAILABLE");
+  if (!projection) throw new Error("TEAM_PROJECTION_COVERAGE_UNAVAILABLE");
+  const detailDays = Number(retention.settings?.teamCanonicalDetailDays || 180);
+  const retainedFrom = retainedDetailFrom({ authorityNow, detailDays });
+  let availableFrom;
+  if (family === "response") availableFrom = latestAvailableFrom(projection.responseCoverageFrom, retainedFrom);
+  else if (family === "dialog") availableFrom = latestAvailableFrom(projection.dialogCoverageFrom, retainedFrom);
+  else availableFrom = latestAvailableFrom(projection.responseCoverageFrom, projection.dialogCoverageFrom, retainedFrom);
+  return {
+    range,
+    retainedRange: clampRangeToAvailableFrom(range, availableFrom),
+    coverage: { ...coverageState(range, availableFrom), source: `bounded_team_${family}_detail_v1` },
+    detailDays,
+  };
+}
+
 async function listTeamResponseCases({
   agencyId,
   rangeKey = "7d",
@@ -42,12 +68,13 @@ async function listTeamResponseCases({
   classification = null,
   limit = 100,
 } = {}) {
-  const range = resolveRange(rangeKey);
+  const authority = await resolveDetailReadAuthority({ agencyId, rangeKey, family: "response" });
+  const { range, retainedRange } = authority;
   const normalizedClassification = clean(classification, 32)?.toUpperCase() || null;
   const where = {
     agencyId,
     ...creatorScopeWhere(allowedCreatorIds),
-    ...whereForRange("replyAt", range),
+    ...(retainedRange ? whereForRange("replyAt", retainedRange) : { id: "__outside_retained_history__" }),
     ...(clean(memberId, 160) ? { memberId: clean(memberId, 160) } : {}),
     ...(normalizedClassification && RESPONSE_CLASSIFICATIONS.has(normalizedClassification)
       ? { classification: normalizedClassification }
@@ -63,6 +90,8 @@ async function listTeamResponseCases({
     ok: true,
     range: rangeForClient(range),
     creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
+    retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
+    coverage: authority.coverage,
     rows: (rows || []).map((row) => ({
       id: row.id,
       creatorId: row.creatorId,
@@ -99,11 +128,12 @@ async function listTeamDialogSessions({
   memberId = null,
   limit = 100,
 } = {}) {
-  const range = resolveRange(rangeKey);
+  const authority = await resolveDetailReadAuthority({ agencyId, rangeKey, family: "dialog" });
+  const { range, retainedRange } = authority;
   const where = {
     agencyId,
     ...creatorScopeWhere(allowedCreatorIds),
-    ...whereForRange("startedAt", range),
+    ...(retainedRange ? whereForRange("startedAt", retainedRange) : { id: "__outside_retained_history__" }),
     ...(clean(memberId, 160) ? { memberId: clean(memberId, 160) } : {}),
   };
   const rows = await prisma.teamDialogSession.findMany({
@@ -116,6 +146,8 @@ async function listTeamDialogSessions({
     ok: true,
     range: rangeForClient(range),
     creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
+    retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
+    coverage: authority.coverage,
     rows: (rows || []).map((row) => ({
       id: row.id,
       creatorId: row.creatorId,
@@ -144,11 +176,12 @@ async function listTeamCoverageSessions({
   memberId = null,
   limit = 100,
 } = {}) {
-  const range = resolveRange(rangeKey);
+  const authority = await resolveDetailReadAuthority({ agencyId, rangeKey, family: "coverage" });
+  const { range, retainedRange } = authority;
   const where = {
     agencyId,
     ...creatorScopeWhere(allowedCreatorIds),
-    ...whereForRange("startedAt", range),
+    ...(retainedRange ? whereForRange("startedAt", retainedRange) : { id: "__outside_retained_history__" }),
     ...(clean(memberId, 160) ? { memberId: clean(memberId, 160) } : {}),
   };
   const rows = await prisma.teamCoverageSession.findMany({
@@ -161,6 +194,8 @@ async function listTeamCoverageSessions({
     ok: true,
     range: rangeForClient(range),
     creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
+    retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
+    coverage: authority.coverage,
     rows: (rows || []).map((row) => ({
       id: row.id,
       creatorId: row.creatorId,

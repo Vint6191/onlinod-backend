@@ -13,7 +13,10 @@ const { assertCustomManagementCreatorAccess } = require("./custom-management-acc
 const REVIEW_WAITING = "WAITING_REVIEW";
 const REVIEW_REVISION = "REVISION_REQUESTED";
 const REVIEW_APPROVED = "APPROVED";
+const REVIEW_RECONSIDER_APPROVE = "RECONSIDER_APPROVE";
 const REVIEW_STATUSES = new Set([REVIEW_WAITING, REVIEW_REVISION, REVIEW_APPROVED]);
+const REVIEW_ACTIONS = new Set(["APPROVE", "REQUEST_REVISION", REVIEW_RECONSIDER_APPROVE]);
+const REVIEW_SUPERSESSION_REASONS = new Set(["PROVIDER_UNRECOVERABLE", "MANAGER_RECONSIDERATION"]);
 const MAX_REVIEW_COMMENT = 4_000;
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
@@ -25,8 +28,19 @@ function normalizeStatus(value, fallback = REVIEW_WAITING) {
 }
 function normalizeAction(value) {
   const action = String(value || "").trim().toUpperCase();
-  if (action !== "APPROVE" && action !== "REQUEST_REVISION") throw fail("CUSTOM_REVIEW_ACTION_INVALID", "Review action must be APPROVE or REQUEST_REVISION");
+  if (!REVIEW_ACTIONS.has(action)) throw fail("CUSTOM_REVIEW_ACTION_INVALID", "Review action must be APPROVE, REQUEST_REVISION, or RECONSIDER_APPROVE");
   return action;
+}
+function normalizeSupersessionReason(value) {
+  const reason = String(value || "").trim().toUpperCase();
+  if (!REVIEW_SUPERSESSION_REASONS.has(reason)) {
+    throw fail("CUSTOM_REVIEW_SUPERSESSION_REASON_REQUIRED", "A supported review supersession reason is required", 409);
+  }
+  return reason;
+}
+function reviewDecisionRevision(value) {
+  const parsed = Math.floor(Number(value));
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : 0;
 }
 function reviewComment(value, required) {
   const text = String(value == null ? "" : value).trim();
@@ -159,6 +173,52 @@ async function planRevisionDispatchOrBlock({ agencyId, member, submission, order
   return { intent, projection };
 }
 
+async function recordReviewDecision({ tx, submission, member, decisionRevision, decision, comment = null, decidedAt, supersedesDecisionRevision = null, supersessionReason = null }) {
+  if (!tx?.customContentReviewDecision?.create) {
+    throw fail("CUSTOM_REVIEW_DECISION_HISTORY_STORAGE_REQUIRED", "Review decision history storage is required", 500);
+  }
+  return tx.customContentReviewDecision.create({
+    data: {
+      agencyId: String(submission.agencyId),
+      creatorId: String(submission.creatorId),
+      customOrderId: String(submission.customOrderId),
+      submissionId: String(submission.id),
+      decisionRevision,
+      decision,
+      comment: comment || null,
+      actorMemberId: member?.id ? String(member.id) : null,
+      decidedAt: new Date(decidedAt),
+      supersedesDecisionRevision,
+      supersessionReason,
+      source: "MANAGER",
+    },
+  });
+}
+
+async function cancelSupersededRevisionPrecommit({ tx, agencyId, submissionId, customOrderId, reason }) {
+  if (!tx?.telegramDeliveryIntent?.updateMany) return;
+  await tx.telegramDeliveryIntent.updateMany({
+    where: {
+      agencyId: String(agencyId),
+      customOrderId: String(customOrderId),
+      customSubmissionId: String(submissionId),
+      kind: "REVISION_REQUEST",
+      state: { in: ["PLANNED", "FAILED_PRECOMMIT"] },
+      commitStartedAt: null,
+    },
+    data: {
+      state: "CANCELLED",
+      outcomeReason: `REVIEW_DECISION_SUPERSEDED:${reason}`,
+      claimUntil: null,
+      claimTokenHash: null,
+      deviceId: null,
+      userId: null,
+      memberId: null,
+      claimRevision: { increment: 1 },
+    },
+  });
+}
+
 async function loadRevisionDispatchMap(db, agencyId, rows) {
   const revisionRows = (rows || []).filter((row) => String(row.reviewStatus || "") === REVIEW_REVISION);
   if (!revisionRows.length) return new Map();
@@ -202,6 +262,8 @@ function serializeReviewItem(row, assetByKey, revisionContext = null) {
   return {
     submissionId: String(row.id),
     customOrderId: String(order.id),
+    bindingRevision: Math.max(1, Math.floor(Number(row.bindingRevision) || 1)),
+    reviewDecisionRevision: reviewDecisionRevision(row.reviewDecisionRevision),
     creatorId: String(row.creatorId),
     dialogId: String(order.dialogId),
     creator: creator ? { displayName: creator.displayName || null, username: creator.username || null, avatarUrl: creator.avatarUrl || null } : null,
@@ -347,23 +409,39 @@ async function loadReviewableSubmission({ agencyId, submissionId, db }) {
   return { row, assetByKey };
 }
 
-async function reviewCustomContentSubmission({ agencyId, member, submissionId, action, comment, now = new Date(), db = null } = {}) {
+async function reviewCustomContentSubmission({ agencyId, member, submissionId, expectedCustomOrderId, expectedBindingRevision, expectedReviewDecisionRevision = null, action, comment, supersessionReason = null, now = new Date(), db = null } = {}) {
   const client = db || require("../prisma");
   await requireReviewWrite({ agencyId, member, db: client });
   const normalizedAction = normalizeAction(action);
   const normalizedComment = reviewComment(comment, normalizedAction === "REQUEST_REVISION");
+  const normalizedSupersessionReason = normalizedAction === REVIEW_RECONSIDER_APPROVE ? normalizeSupersessionReason(supersessionReason) : null;
+  const normalizedExpectedDecisionRevision = expectedReviewDecisionRevision == null ? null : reviewDecisionRevision(expectedReviewDecisionRevision);
+  if (normalizedAction === REVIEW_RECONSIDER_APPROVE && (!Number.isInteger(Number(expectedReviewDecisionRevision)) || normalizedExpectedDecisionRevision < 1)) {
+    throw fail("CUSTOM_REVIEW_CURRENT_DECISION_REQUIRED", "Current review decision revision is required for reconsideration", 409);
+  }
   const normalizedSubmissionId = clean(submissionId, 180);
   if (!normalizedSubmissionId) throw fail("CUSTOM_REVIEW_SUBMISSION_REQUIRED", "submissionId is required");
+  const normalizedExpectedOrderId = clean(expectedCustomOrderId, 180);
+  const normalizedExpectedBindingRevision = Math.floor(Number(expectedBindingRevision));
+  if (!normalizedExpectedOrderId || !Number.isInteger(normalizedExpectedBindingRevision) || normalizedExpectedBindingRevision < 1) {
+    throw fail("CUSTOM_REVIEW_COMMAND_TARGET_REQUIRED", "expectedCustomOrderId and expectedBindingRevision are required", 409);
+  }
 
   // Resolve the business lock target before opening the commit transaction. This
   // read is not authority; loadReviewableSubmission() is called again after the
   // CustomOrder lock and remains the commit-time source of truth.
   const target = await client.customContentSubmission.findFirst({
     where: { id: normalizedSubmissionId, agencyId },
-    select: { id: true, customOrderId: true, creatorId: true },
+    select: { id: true, customOrderId: true, creatorId: true, bindingRevision: true, reviewDecisionRevision: true },
   });
   if (!target) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
   if (!target.customOrderId) throw fail("CUSTOM_REVIEW_ORDER_REQUIRED", "Submission must be assigned to a CONTENT custom order", 409);
+  if (String(target.customOrderId) !== normalizedExpectedOrderId || Math.max(1, Math.floor(Number(target.bindingRevision) || 1)) !== normalizedExpectedBindingRevision) {
+    throw fail("STALE_COMMAND_TARGET", "Submission assignment changed; refresh the review queue", 409);
+  }
+  if (normalizedAction === REVIEW_RECONSIDER_APPROVE && reviewDecisionRevision(target.reviewDecisionRevision) !== normalizedExpectedDecisionRevision) {
+    throw fail("STALE_COMMAND_TARGET", "Review decision changed; refresh the revision queue", 409);
+  }
 
   const applyReview = async (tx) => {
     // Shared lifecycle order: Agency -> Creator -> CustomOrder. Revision planning
@@ -392,6 +470,14 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
     }
 
     const { row, assetByKey } = await loadReviewableSubmission({ agencyId, submissionId: normalizedSubmissionId, db: tx });
+    const currentBindingRevision = Math.max(1, Math.floor(Number(row.bindingRevision) || 1));
+    const currentDecisionRevision = reviewDecisionRevision(row.reviewDecisionRevision);
+    if (String(row.customOrderId || "") !== normalizedExpectedOrderId || currentBindingRevision !== normalizedExpectedBindingRevision) {
+      throw fail("STALE_COMMAND_TARGET", "Submission assignment changed; refresh the review queue", 409);
+    }
+    if (normalizedAction === REVIEW_RECONSIDER_APPROVE && currentDecisionRevision !== normalizedExpectedDecisionRevision) {
+      throw fail("STALE_COMMAND_TARGET", "Review decision changed; refresh the revision queue", 409);
+    }
     const currentStatus = normalizeStatus(row.reviewStatus);
     if (currentStatus === REVIEW_REVISION) {
       const latest = await tx.customContentSubmission.findFirst({
@@ -402,6 +488,46 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
       if (latest && String(latest.id) !== String(row.id)) {
         throw fail("CUSTOM_REVIEW_DECISION_SUPERSEDED", "A later model response has superseded this historical revision decision", 409);
       }
+    }
+
+    if (normalizedAction === REVIEW_RECONSIDER_APPROVE) {
+      if (currentStatus !== REVIEW_REVISION) {
+        throw fail("CUSTOM_REVIEW_RECONSIDERATION_NOT_ALLOWED", "Only a current revision decision can be reconsidered", 409);
+      }
+      const projection = await deriveCustomRevisionDispatch({ agencyId, orderId: row.customOrderId, submission: row, intent: undefined, db: tx });
+      if (projection.status !== "DISPATCH_BLOCKED") {
+        throw fail("CUSTOM_REVIEW_RECONSIDERATION_PROVIDER_NOT_BLOCKED", "Revision can be reconsidered only after provider dispatch is proven blocked", 409);
+      }
+      const existing = await tx.customContentSubmission.findFirst({
+        where: { agencyId, customOrderId: row.customOrderId, reviewStatus: REVIEW_APPROVED, id: { not: row.id } }, select: { id: true },
+      });
+      if (existing) throw fail("CUSTOM_REVIEW_ALREADY_APPROVED", "Another submission is already approved for this custom order", 409);
+
+      const nextDecisionRevision = currentDecisionRevision + 1;
+      const changed = await tx.customContentSubmission.updateMany({
+        where: {
+          id: row.id, agencyId, pipelineDisposition: "ACTIVE", reviewStatus: REVIEW_REVISION,
+          customOrderId: row.customOrderId, bindingRevision: normalizedExpectedBindingRevision,
+          reviewDecisionRevision: currentDecisionRevision, updatedAt: row.updatedAt,
+        },
+        data: {
+          reviewStatus: REVIEW_APPROVED, reviewComment: null, reviewedByMemberId: access.member.id, reviewedAt: new Date(now),
+          reviewDecisionRevision: { increment: 1 },
+        },
+      });
+      if (Number(changed?.count || 0) !== 1) throw fail("STALE_COMMAND_TARGET", "Review decision changed while reconsideration was in flight", 409);
+      await cancelSupersededRevisionPrecommit({ tx, agencyId, submissionId: row.id, customOrderId: row.customOrderId, reason: normalizedSupersessionReason });
+      await recordReviewDecision({
+        tx, submission: row, member: access.member, decisionRevision: nextDecisionRevision, decision: "APPROVE",
+        comment: null, decidedAt: now, supersedesDecisionRevision: currentDecisionRevision, supersessionReason: normalizedSupersessionReason,
+      });
+      const updated = await tx.customContentSubmission.findFirst({ where: { id: row.id, agencyId }, include: REVIEW_INCLUDE });
+      if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after reconsideration", 404);
+      const revisionContext = await loadRevisionContext(tx, agencyId, [updated]);
+      return {
+        idempotent: false, row: updated, previousRow: row, assetByKey, nextStatus: REVIEW_APPROVED, reconsidered: true,
+        item: serializeReviewItem(updated, assetByKey, revisionContext.get(String(updated.id))),
+      };
     }
 
     if (currentStatus === REVIEW_APPROVED) {
@@ -438,15 +564,30 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
           pipelineDisposition: "ACTIVE",
           reviewStatus: REVIEW_WAITING,
           customOrderId: row.customOrderId,
+          bindingRevision: normalizedExpectedBindingRevision,
+          reviewDecisionRevision: currentDecisionRevision,
           updatedAt: row.updatedAt,
         },
-        data: { reviewStatus: nextStatus, reviewComment: nextStatus === REVIEW_REVISION ? normalizedComment : null, reviewedByMemberId: access.member.id, reviewedAt: new Date(now) },
+        data: {
+          reviewStatus: nextStatus, reviewComment: nextStatus === REVIEW_REVISION ? normalizedComment : null,
+          reviewedByMemberId: access.member.id, reviewedAt: new Date(now), reviewDecisionRevision: { increment: 1 },
+        },
       });
     } catch (error) {
       if (nextStatus === REVIEW_APPROVED && error?.code === "P2002") throw fail("CUSTOM_REVIEW_ALREADY_APPROVED", "Another submission is already approved for this custom order", 409);
       throw error;
     }
-    if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_REVIEW_CONFLICT", "Submission changed while it was being reviewed; refresh and try again", 409);
+    if (Number(changed?.count || 0) !== 1) {
+      const currentTarget = await tx.customContentSubmission.findFirst({ where: { id: row.id, agencyId }, select: { customOrderId: true, bindingRevision: true } });
+      if (currentTarget && (String(currentTarget.customOrderId || "") !== normalizedExpectedOrderId || Math.max(1, Math.floor(Number(currentTarget.bindingRevision) || 1)) !== normalizedExpectedBindingRevision)) {
+        throw fail("STALE_COMMAND_TARGET", "Submission assignment changed; refresh the review queue", 409);
+      }
+      throw fail("CUSTOM_REVIEW_CONFLICT", "Submission changed while it was being reviewed; refresh and try again", 409);
+    }
+    await recordReviewDecision({
+      tx, submission: row, member: access.member, decisionRevision: currentDecisionRevision + 1,
+      decision: normalizedAction, comment: nextStatus === REVIEW_REVISION ? normalizedComment : null, decidedAt: now,
+    });
     const updated = await tx.customContentSubmission.findFirst({ where: { id: row.id, agencyId }, include: REVIEW_INCLUDE });
     if (!updated) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission disappeared after review", 404);
     const revisionContext = await loadRevisionContext(tx, agencyId, [updated]);
@@ -473,7 +614,7 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
   await audit({
     agencyId,
     actorUserId: member.userId || null,
-    action: outcome.nextStatus === REVIEW_APPROVED ? "custom_content_submission.approve" : "custom_content_submission.request_revision",
+    action: outcome.reconsidered ? "custom_content_submission.reconsider_approve" : (outcome.nextStatus === REVIEW_APPROVED ? "custom_content_submission.approve" : "custom_content_submission.request_revision"),
     targetType: "CustomContentSubmission",
     targetId: outcome.row.id,
     metadata: {
@@ -481,6 +622,7 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
       customOrderId: outcome.row.customOrderId,
       reviewStatus: outcome.nextStatus,
       revisionCommentLength: outcome.nextStatus === REVIEW_REVISION ? normalizedComment.length : 0,
+      supersessionReason: outcome.reconsidered ? normalizedSupersessionReason : null,
     },
     db: client,
   });
@@ -489,6 +631,7 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, a
 
 module.exports = {
   REVIEW_APPROVED,
+  REVIEW_RECONSIDER_APPROVE,
   REVIEW_REVISION,
   REVIEW_WAITING,
   listCustomContentReviewQueue,

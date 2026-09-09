@@ -296,6 +296,9 @@ model Agency {
   teamResponseCases TeamResponseCase[]
   teamPendingDialogStates TeamPendingDialogState[]
   teamProjectionCoverage TeamProjectionCoverage?
+  teamHistoricalAnalyticsCoverage TeamHistoricalAnalyticsCoverage?
+  teamMemberActivityDaily TeamMemberActivityDaily[]
+  teamMoneyAttributionFacts TeamMoneyAttributionFact[]
   teamShifts TeamShift[]
   analyticsSnapshots AnalyticsSnapshot[]
   workspaceSettings WorkspaceSetting[]
@@ -649,6 +652,8 @@ model CustomContentSubmission {
   agencyId           String
   creatorId          String
   customOrderId      String?
+  bindingRevision    Int      @default(1)
+  reviewDecisionRevision Int   @default(0)
   telegramMessageIds Int[]    @default([])
   telegramInboundEventIds String[] @default([])
   telegramSourceKey    String?  @unique
@@ -689,6 +694,7 @@ model CustomContentSubmission {
   reviewedByMember AgencyMember?  @relation("CustomContentSubmissionReviewedBy", fields: [reviewedByMemberId], references: [id], onDelete: SetNull)
   contentLibraryAssets CreatorMediaAsset[]
   deliveryReceipts CustomDeliveryReceipt[]
+  reviewDecisions CustomContentReviewDecision[]
 
   @@index([agencyId, creatorId, receivedAt])
   @@index([agencyId, telegramSourceAccountId, telegramSourceUserId])
@@ -700,6 +706,30 @@ model CustomContentSubmission {
   @@index([agencyId, telegramSourceAccountId, pipelineDisposition, receivedAt])
   @@index([customOrderId, receivedAt])
   @@index([reviewedByMemberId])
+}
+
+
+model CustomContentReviewDecision {
+  id                         String   @id @default(cuid())
+  agencyId                   String
+  creatorId                  String
+  customOrderId              String
+  submissionId               String
+  decisionRevision           Int
+  decision                   String
+  comment                    String?
+  actorMemberId              String?
+  decidedAt                  DateTime
+  supersedesDecisionRevision Int?
+  supersessionReason         String?
+  source                     String   @default("MANAGER")
+  createdAt                  DateTime @default(now())
+
+  submission CustomContentSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+
+  @@unique([submissionId, decisionRevision])
+  @@index([agencyId, customOrderId, decidedAt])
+  @@index([agencyId, actorMemberId, decidedAt])
 }
 
 
@@ -2955,6 +2985,8 @@ model TeamActivityEvent {
   extra                  Json?
   pendingProjectionVersion String?
   pendingProjectedAt      DateTime?
+  historicalProjectionVersion String?
+  historicalProjectedAt   DateTime?
   source                 String   @default("electron")
   createdAt              DateTime @default(now())
 
@@ -2976,6 +3008,7 @@ model TeamActivityEvent {
   @@index([agencyId, correlationId])
   @@index([agencyId, coverageId, ts])
   @@index([agencyId, pendingProjectionVersion, ts])
+  @@index([agencyId, historicalProjectionVersion, ts])
   @@index([agencyId, automationDeliveryId])
   @@index([agencyId, broadcastDispatchId])
   @@index([type, ts])
@@ -2994,6 +3027,7 @@ model TeamShift {
   updatedByUserId   String?
   cancelledAt       DateTime?
   cancelledByUserId String?
+  revision          Int      @default(1)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
@@ -5009,6 +5043,91 @@ model TeamProjectionCoverage {
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 }
 
+
+model TeamHistoricalAnalyticsCoverage {
+  agencyId                 String   @id
+  activityCoverageFrom     DateTime
+  moneyCoverageFrom        DateTime
+  activityProjectionVersion String  @default("team_activity_daily_v1")
+  moneyProjectionVersion    String  @default("team_money_fact_v1")
+  source                   String   @default("phase2_historical_authority")
+  backfilledAt             DateTime @default(now())
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+}
+
+model TeamMemberActivityDaily {
+  id                         String   @id @default(cuid())
+  agencyId                   String
+  memberId                   String
+  creatorKey                 String   @default("__none__")
+  creatorId                  String?
+  day                        DateTime
+  messagesSent               Int      @default(0)
+  ppvSentMessages            Int      @default(0)
+  broadcastDispatches        Int      @default(0)
+  postsCreated               Int      @default(0)
+  storiesCreated             Int      @default(0)
+  contentActions             Int      @default(0)
+  contentMediaItemsPublished Int      @default(0)
+  sourceEventCount           Int      @default(0)
+  firstEventAt               DateTime?
+  lastEventAt                DateTime?
+  lastContentActivityAt      DateTime?
+  projectionVersion          String   @default("team_activity_daily_v1")
+  createdAt                  DateTime @default(now())
+  updatedAt                  DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, memberId, creatorKey, day])
+  @@index([agencyId, memberId, day])
+  @@index([agencyId, creatorId, day])
+  @@index([agencyId, day])
+}
+
+model TeamMoneyAttributionFact {
+  id                 String   @id
+  agencyId           String
+  sourceType         String
+  sourceRowId        String
+  externalId         String?
+  creatorId          String?
+  memberId           String?
+  userId             String?
+  fanId              String?
+  dialogId           String?
+  amountCents        Int      @default(0)
+  currency           String   @default("USD")
+  occurredAt         DateTime
+  businessStatus     String
+  financialStatus    String?
+  attributionActive  Boolean  @default(false)
+  canonicalMoneyId   String?
+  creatorSaleId      String?
+  financialTransactionId String?
+  creatorTipId       String?
+  attributionBasis   String?
+  sourceUpdatedAt    DateTime
+  projectionVersion  String   @default("team_money_fact_v1")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, sourceType, sourceRowId])
+  @@index([agencyId, sourceType, memberId, occurredAt])
+  @@index([agencyId, creatorId, occurredAt])
+  @@index([agencyId, attributionActive, occurredAt])
+  @@index([agencyId, memberId, dialogId, occurredAt])
+  @@index([canonicalMoneyId])
+  @@index([creatorSaleId])
+  @@index([financialTransactionId])
+  @@index([creatorTipId])
+}
+
 model TeamPendingDialogState {
   id                     String   @id @default(cuid())
   agencyId               String
@@ -5254,6 +5373,8 @@ model TeamPpvPurchaseLedger {
   financialTransactionId String? @unique
   financialStatus        String?
   attributionBasis       String?
+  historicalFactVersion  String?
+  historicalFactProjectedAt DateTime?
 
   creatorSale          CreatorSale?                @relation(fields: [creatorSaleId], references: [id], onDelete: SetNull)
   financialTransaction CreatorFinancialTransaction? @relation(fields: [financialTransactionId], references: [id], onDelete: SetNull)
@@ -5299,6 +5420,8 @@ model TeamTipLedger {
   creatorTipId     String? @unique
   financialStatus  String?
   attributionBasis String?
+  historicalFactVersion String?
+  historicalFactProjectedAt DateTime?
   creatorTip       CreatorTip? @relation(fields: [creatorTipId], references: [id], onDelete: SetNull)
 
   candidates     Json?

@@ -4,6 +4,10 @@ const prisma = require("../prisma");
 const { resolveRange, rangeForClient } = require("./range-service");
 const { audit } = require("./audit-service");
 const { normalizeAssignedCreators } = require("./team-access-control");
+const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { getRetentionSettings } = require("./retention-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { retainedDetailFrom, latestAvailableFrom, clampRangeToAvailableFrom, coverageState } = require("./team-historical-range-authority-service");
 
 const MAX_OPEN_COVERAGE_MS = 12 * 60 * 60 * 1000;
 const MAX_SHIFT_MS = 36 * 60 * 60 * 1000;
@@ -284,22 +288,39 @@ function matchShiftActual(shift, actualSessions, responseCases, nowMs) {
 }
 
 async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds = null, canManageSchedule = false, now = new Date(), db = prisma } = {}) {
-  const range = resolveRange(rangeKey, now);
-  const nowMs = now.getTime();
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
+  const range = resolveRange(rangeKey, authorityNow);
+  const [retentionPolicy, projectionCoverage] = await Promise.all([
+    getRetentionSettings({ db }),
+    db.teamProjectionCoverage.findUnique({ where: { agencyId } }),
+  ]);
+  if (retentionPolicy?.ok !== true) throw error("TEAM_RETENTION_POLICY_UNAVAILABLE", "Team retention policy is unavailable", 503);
+  if (!projectionCoverage) throw error("TEAM_PROJECTION_COVERAGE_UNAVAILABLE", "Team projection coverage is unavailable", 503);
+  const detailDays = Number(retentionPolicy.settings?.teamCanonicalDetailDays || 180);
+  const detailRetainedFrom = retainedDetailFrom({ authorityNow, detailDays });
+  const detailAvailableFrom = latestAvailableFrom(
+    projectionCoverage.responseCoverageFrom,
+    projectionCoverage.dialogCoverageFrom,
+    detailRetainedFrom,
+  );
+  const retainedRange = clampRangeToAvailableFrom(range, detailAvailableFrom);
+  const queryRange = retainedRange || { ...range, startAt: new Date(0), endAt: new Date(0) };
+  const scheduleCoverage = { ...coverageState(range, detailAvailableFrom), source: "bounded_team_schedule_detail_v1" };
+  const nowMs = authorityNow.getTime();
   const includeCreatorWhere = Array.isArray(allowedCreatorIds)
     ? { where: creatorScopeWhere(allowedCreatorIds), select: { creatorId: true, creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } } } }
     : { select: { creatorId: true, creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } } } };
 
   const [coverageRows, shifts, responseCases, context] = await Promise.all([
     findAllById(db.teamCoverageSession, {
-      where: { agencyId, ...rangeOverlapWhere(range), ...creatorScopeWhere(allowedCreatorIds) },
+      where: { agencyId, ...rangeOverlapWhere(queryRange), ...creatorScopeWhere(allowedCreatorIds) },
       include: {
         member: { select: { id: true, displayName: true, roleKey: true, user: { select: { name: true, email: true } } } },
         creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } },
       },
     }),
     findAllById(db.teamShift, {
-      where: { agencyId, ...plannedShiftWhere(range, allowedCreatorIds) },
+      where: { agencyId, ...plannedShiftWhere(queryRange, allowedCreatorIds) },
       include: {
         member: { select: { id: true, displayName: true, roleKey: true, user: { select: { name: true, email: true } } } },
         creators: includeCreatorWhere,
@@ -307,7 +328,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
     }),
     db.teamResponseCase?.findMany
       ? findAllById(db.teamResponseCase, {
-          where: { agencyId, ...responseRangeWhere(range, allowedCreatorIds) },
+          where: { agencyId, ...responseRangeWhere(queryRange, allowedCreatorIds) },
           select: { id: true, creatorId: true, memberId: true, replyAt: true, slaEligible: true, sla15Pass: true, wallClockSeconds: true },
         })
       : Promise.resolve([]),
@@ -321,7 +342,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
   let staleOpenSessions = 0;
 
   for (const row of coverageRows) {
-    const clipped = clipCoverageSession(row, range, nowMs);
+    const clipped = clipCoverageSession(row, queryRange, nowMs);
     if (!clipped) continue;
     const creatorId = String(row.creatorId);
     if (!byCreator.has(creatorId)) byCreator.set(creatorId, { creator: row.creator, sessions: [], intervals: [] });
@@ -420,6 +441,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
     const enriched = matchShiftActual({ ...row, creators: row.creators }, actualSessions, responseCases || [], nowMs);
     return {
       id: String(row.id),
+      revision: Number(row.revision || 1),
       memberId: String(row.memberId),
       memberName: memberName(row.member) || String(row.memberId),
       roleKey: row.member?.roleKey || null,
@@ -459,8 +481,10 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
 
   return {
     ok: true,
-    asOf: now.toISOString(),
+    asOf: authorityNow.toISOString(),
     range: rangeForClient(range),
+    retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
+    historicalCoverage: scheduleCoverage,
     creatorScope: Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, 10000) : "all",
     context,
     summary: {
@@ -522,85 +546,148 @@ async function assertShiftTargets({ agencyId, memberId, creatorIds, actorAllowed
   return { member, creatorIds: ids };
 }
 
-async function createTeamShift({ agencyId, actorUserId, actorMemberId, actorAllowedCreatorIds = null, input, db = prisma }) {
+function actorFence(actorMember, actorMemberId, actorUserId) {
+  if (actorMember?.id && actorMember?.userId) return actorMember;
+  return { id: actorMemberId || null, userId: actorUserId || null, accessEpoch: actorMember?.accessEpoch ?? null };
+}
+
+function liveActorCreatorScope(member) {
+  const scope = normalizeAssignedCreators(member?.assignedCreators);
+  return scope.mode === "all" ? null : scope.creatorIds;
+}
+
+function requiredRevision(value) {
+  const revision = Number(value);
+  if (!Number.isInteger(revision) || revision < 1) {
+    throw error("TEAM_SCHEDULE_EXPECTED_REVISION_REQUIRED", "expectedRevision is required; refresh the schedule and retry", 400);
+  }
+  return revision;
+}
+
+async function lockShiftForUpdate({ tx, agencyId, shiftId }) {
+  if (typeof tx?.$queryRawUnsafe === "function") {
+    const rows = await tx.$queryRawUnsafe(
+      `SELECT "id" FROM "TeamShift" WHERE "id" = $1 AND "agencyId" = $2 FOR UPDATE`,
+      String(shiftId),
+      String(agencyId),
+    );
+    if (!Array.isArray(rows) || !rows.length) throw error("TEAM_SCHEDULE_SHIFT_NOT_FOUND", "Shift was not found", 404);
+  }
+  const row = await tx.teamShift.findFirst({
+    where: { id: shiftId, agencyId },
+    include: { creators: { select: { creatorId: true } } },
+  });
+  if (!row) throw error("TEAM_SCHEDULE_SHIFT_NOT_FOUND", "Shift was not found", 404);
+  return row;
+}
+
+async function createTeamShift({ agencyId, actorUserId, actorMemberId, actorMember = null, actorAllowedCreatorIds = null, input, db = prisma }) {
   const window = validateShiftWindow(input?.startsAt, input?.endsAt);
   const timezone = validTimezone(input?.timezone || "UTC");
   const note = clean(input?.note, 500);
-  const targets = await assertShiftTargets({ agencyId, memberId: input?.memberId, creatorIds: input?.creatorIds, actorAllowedCreatorIds, db });
-  const row = await db.teamShift.create({
-    data: {
-      agencyId,
-      memberId: targets.member.id,
-      startsAt: window.startsAt,
-      endsAt: window.endsAt,
-      timezone,
-      status: "PLANNED",
-      note,
-      createdByUserId: actorUserId || null,
-      updatedByUserId: actorUserId || null,
-      creators: { create: targets.creatorIds.map((creatorId) => ({ creatorId })) },
-    },
-    include: { creators: { select: { creatorId: true } } },
-  });
+  const admittedActor = actorFence(actorMember, actorMemberId, actorUserId);
+  const requestedCreatorIds = uniqueIds(input?.creatorIds, 100);
+  const row = await db.$transaction(async (tx) => {
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember: admittedActor, permissionKey: "workspace.manage_schedule", creatorIds: requestedCreatorIds,
+    });
+    const targets = await assertShiftTargets({
+      agencyId, memberId: input?.memberId, creatorIds: requestedCreatorIds,
+      actorAllowedCreatorIds: liveActorCreatorScope(commit.member), db: tx,
+    });
+    return tx.teamShift.create({
+      data: {
+        agencyId, memberId: targets.member.id, startsAt: window.startsAt, endsAt: window.endsAt, timezone,
+        status: "PLANNED", note, createdByUserId: actorUserId || null, updatedByUserId: actorUserId || null,
+        creators: { create: targets.creatorIds.map((creatorId) => ({ creatorId })) },
+      },
+      include: { creators: { select: { creatorId: true } } },
+    });
+  }, { isolationLevel: "Serializable" });
   await audit({
     agencyId, actorUserId, action: "team.schedule.shift_created", targetType: "team_shift", targetId: row.id,
-    metadata: { actorMemberId, memberId: row.memberId, startsAt: row.startsAt, endsAt: row.endsAt, timezone: row.timezone, creatorIds: targets.creatorIds }, db,
+    metadata: { actorMemberId, memberId: row.memberId, startsAt: row.startsAt, endsAt: row.endsAt, timezone: row.timezone, creatorIds: row.creators.map((item) => item.creatorId), revision: row.revision }, db,
   });
-  return { ok: true, shiftId: row.id };
+  return { ok: true, shiftId: row.id, revision: Number(row.revision || 1) };
 }
 
-async function updateTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, actorAllowedCreatorIds = null, input, db = prisma }) {
+async function updateTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, actorMember = null, actorAllowedCreatorIds = null, expectedRevision, input, db = prisma }) {
   const id = clean(shiftId, 180);
-  const existing = await db.teamShift.findFirst({ where: { id, agencyId }, include: { creators: { select: { creatorId: true } } } });
-  if (!existing) throw error("TEAM_SCHEDULE_SHIFT_NOT_FOUND", "Shift was not found", 404);
-  if (String(existing.status || "").toUpperCase() === "CANCELLED") throw error("TEAM_SCHEDULE_SHIFT_CANCELLED", "Cancelled shifts are immutable", 409);
-
-  const memberId = input?.memberId ?? existing.memberId;
-  const creatorIds = input?.creatorIds ?? existing.creators.map((row) => row.creatorId);
-  const startsAtInput = input?.startsAt ?? existing.startsAt;
-  const endsAtInput = input?.endsAt ?? existing.endsAt;
-  const window = validateShiftWindow(startsAtInput, endsAtInput);
-  const timezone = validTimezone(input?.timezone ?? existing.timezone ?? "UTC");
-  const note = input && Object.prototype.hasOwnProperty.call(input, "note") ? clean(input.note, 500) : existing.note;
-  const targets = await assertShiftTargets({ agencyId, memberId, creatorIds, actorAllowedCreatorIds, db });
-
-  const updated = await db.$transaction(async (tx) => {
-    await tx.teamShiftCreator.deleteMany({ where: { shiftId: id } });
-    if (targets.creatorIds.length) await tx.teamShiftCreator.createMany({ data: targets.creatorIds.map((creatorId) => ({ shiftId: id, creatorId })), skipDuplicates: true });
-    return tx.teamShift.update({
-      where: { id },
-      data: { memberId: targets.member.id, startsAt: window.startsAt, endsAt: window.endsAt, timezone, note, updatedByUserId: actorUserId || null },
+  const expected = requiredRevision(expectedRevision);
+  const admittedActor = actorFence(actorMember, actorMemberId, actorUserId);
+  const mutation = await db.$transaction(async (tx) => {
+    const existing = await lockShiftForUpdate({ tx, agencyId, shiftId: id });
+    const currentRevision = Number(existing.revision || 1);
+    if (currentRevision !== expected) {
+      throw error("STALE_COMMAND_TARGET", "Shift changed since you opened it; refresh and retry", 409, { expectedRevision: expected, currentRevision });
+    }
+    if (String(existing.status || "").toUpperCase() === "CANCELLED") {
+      throw error("TEAM_SCHEDULE_SHIFT_CANCELLED", "Cancelled shifts are immutable", 409);
+    }
+    const memberId = input?.memberId ?? existing.memberId;
+    const creatorIds = input?.creatorIds ?? existing.creators.map((row) => row.creatorId);
+    const window = validateShiftWindow(input?.startsAt ?? existing.startsAt, input?.endsAt ?? existing.endsAt);
+    const timezone = validTimezone(input?.timezone ?? existing.timezone ?? "UTC");
+    const note = input && Object.prototype.hasOwnProperty.call(input, "note") ? clean(input.note, 500) : existing.note;
+    const requestedCreatorIds = uniqueIds(creatorIds, 100);
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember: admittedActor, permissionKey: "workspace.manage_schedule", creatorIds: requestedCreatorIds,
     });
-  });
+    const targets = await assertShiftTargets({
+      agencyId, memberId, creatorIds: requestedCreatorIds,
+      actorAllowedCreatorIds: liveActorCreatorScope(commit.member), db: tx,
+    });
+    await tx.teamShiftCreator.deleteMany({ where: { shiftId: id } });
+    if (targets.creatorIds.length) {
+      await tx.teamShiftCreator.createMany({ data: targets.creatorIds.map((creatorId) => ({ shiftId: id, creatorId })), skipDuplicates: true });
+    }
+    const updated = await tx.teamShift.update({
+      where: { id },
+      data: { memberId: targets.member.id, startsAt: window.startsAt, endsAt: window.endsAt, timezone, note, updatedByUserId: actorUserId || null, revision: { increment: 1 } },
+    });
+    return { existing, updated, creatorIds: targets.creatorIds };
+  }, { isolationLevel: "Serializable" });
   await audit({
     agencyId, actorUserId, action: "team.schedule.shift_updated", targetType: "team_shift", targetId: id,
     metadata: {
-      actorMemberId,
-      before: { memberId: existing.memberId, startsAt: existing.startsAt, endsAt: existing.endsAt, timezone: existing.timezone, creatorIds: existing.creators.map((row) => row.creatorId) },
-      after: { memberId: updated.memberId, startsAt: updated.startsAt, endsAt: updated.endsAt, timezone: updated.timezone, creatorIds: targets.creatorIds },
+      actorMemberId, expectedRevision: expected, committedRevision: mutation.updated.revision,
+      before: { memberId: mutation.existing.memberId, startsAt: mutation.existing.startsAt, endsAt: mutation.existing.endsAt, timezone: mutation.existing.timezone, creatorIds: mutation.existing.creators.map((row) => row.creatorId) },
+      after: { memberId: mutation.updated.memberId, startsAt: mutation.updated.startsAt, endsAt: mutation.updated.endsAt, timezone: mutation.updated.timezone, creatorIds: mutation.creatorIds },
     }, db,
   });
-  return { ok: true, shiftId: id };
+  return { ok: true, shiftId: id, revision: Number(mutation.updated.revision) };
 }
 
-async function cancelTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, actorAllowedCreatorIds = null, reason = null, db = prisma }) {
+async function cancelTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, actorMember = null, actorAllowedCreatorIds = null, expectedRevision, reason = null, db = prisma }) {
   const id = clean(shiftId, 180);
-  const existing = await db.teamShift.findFirst({ where: { id, agencyId }, include: { creators: { select: { creatorId: true } } } });
-  if (!existing) throw error("TEAM_SCHEDULE_SHIFT_NOT_FOUND", "Shift was not found", 404);
-  if (Array.isArray(actorAllowedCreatorIds)) {
-    const allowed = new Set(uniqueIds(actorAllowedCreatorIds, 10000));
-    const forbidden = (existing.creators || []).map((row) => String(row.creatorId)).filter((creatorId) => !allowed.has(creatorId));
-    if (forbidden.length) throw error("TEAM_SCHEDULE_CREATOR_FORBIDDEN", "Shift is outside your assigned creator scope", 403, { creatorIds: forbidden });
-  }
-  if (String(existing.status || "").toUpperCase() === "CANCELLED") return { ok: true, shiftId: id, alreadyCancelled: true };
+  const expected = requiredRevision(expectedRevision);
+  const admittedActor = actorFence(actorMember, actorMemberId, actorUserId);
   const cancellationReason = clean(reason, 500);
   const now = new Date();
-  await db.teamShift.update({ where: { id }, data: { status: "CANCELLED", cancelledAt: now, cancelledByUserId: actorUserId || null, updatedByUserId: actorUserId || null } });
-  await audit({
-    agencyId, actorUserId, action: "team.schedule.shift_cancelled", targetType: "team_shift", targetId: id,
-    metadata: { actorMemberId, memberId: existing.memberId, reason: cancellationReason }, db,
-  });
-  return { ok: true, shiftId: id, alreadyCancelled: false };
+  const mutation = await db.$transaction(async (tx) => {
+    const existing = await lockShiftForUpdate({ tx, agencyId, shiftId: id });
+    const currentRevision = Number(existing.revision || 1);
+    if (currentRevision !== expected) {
+      throw error("STALE_COMMAND_TARGET", "Shift changed since you opened it; refresh and retry", 409, { expectedRevision: expected, currentRevision });
+    }
+    if (String(existing.status || "").toUpperCase() === "CANCELLED") return { existing, updated: existing, alreadyCancelled: true };
+    const creatorIds = (existing.creators || []).map((row) => String(row.creatorId));
+    await assertManagementCommitAuthority({
+      tx, agencyId, actorMember: admittedActor, permissionKey: "workspace.manage_schedule", creatorIds,
+    });
+    const updated = await tx.teamShift.update({
+      where: { id },
+      data: { status: "CANCELLED", cancelledAt: now, cancelledByUserId: actorUserId || null, updatedByUserId: actorUserId || null, revision: { increment: 1 } },
+    });
+    return { existing, updated, alreadyCancelled: false };
+  }, { isolationLevel: "Serializable" });
+  if (!mutation.alreadyCancelled) {
+    await audit({
+      agencyId, actorUserId, action: "team.schedule.shift_cancelled", targetType: "team_shift", targetId: id,
+      metadata: { actorMemberId, memberId: mutation.existing.memberId, reason: cancellationReason, expectedRevision: expected, committedRevision: mutation.updated.revision }, db,
+    });
+  }
+  return { ok: true, shiftId: id, revision: Number(mutation.updated.revision || expected), alreadyCancelled: mutation.alreadyCancelled };
 }
 
 module.exports = {

@@ -76,46 +76,66 @@ async function lockCustomOrderRows({ agencyId, orderIds, db }) {
   }
 }
 
-async function candidateOrderIdsForAccount({ agencyId, accountId, db }) {
+async function candidateCurrentOrderIdsForAccount({ agencyId, accountId, db }) {
   const ids=new Set();
-  if (db?.telegramDeliveryIntent?.findMany) {
-    await scanAllById({
-      delegate:db.telegramDeliveryIntent,
-      where:{ agencyId, accountId:String(accountId), kind:{in:["TASK","REVISION_REQUEST"]} },
-      select:{id:true,customOrderId:true,kind:true,state:true},
-      onPage:async(rows)=>{
-        for(const row of rows||[]) {
-          const kind=String(row.kind||""); const state=String(row.state||"");
-          const relevant=(kind==="TASK" && state==="CONFIRMED")
-            || (kind==="REVISION_REQUEST" && ["PLANNED","CLAIMED","FAILED_PRECOMMIT","COMMITTING","RECONCILE_REQUIRED","CONFIRMED"].includes(state));
-          if(relevant && row.customOrderId) ids.add(String(row.customOrderId));
-        }
-        return false;
-      },
-    });
-  }
-  if (db?.customContentSubmission?.findMany) {
-    await scanAllById({
-      delegate:db.customContentSubmission,
-      where:{ agencyId, telegramSourceAccountId:String(accountId), customOrderId:{not:null} },
-      select:{id:true,customOrderId:true,pipelineDisposition:true,reviewStatus:true},
-      onPage:async(rows)=>{
-        for(const row of rows||[]) {
-          if(String(row.pipelineDisposition||"ACTIVE")!=="ACTIVE") continue;
-          if(!["WAITING_REVIEW","REVISION_REQUESTED"].includes(String(row.reviewStatus||"WAITING_REVIEW"))) continue;
-          if(row.customOrderId) ids.add(String(row.customOrderId));
-        }
-        return false;
-      },
-    });
-  }
+  if(!db?.customOrder?.findMany) return [];
+
+  // Retirement is a CURRENT capability decision.  Page the bounded live PENDING workset first,
+  // then ask whether the retiring account participates in that page.  Never derive the lock set
+  // from the account's entire historical TASK/submission archive.
+  await scanAllById({
+    delegate:db.customOrder,
+    where:{agencyId,type:"CONTENT",status:"PENDING"},
+    select:{id:true},
+    pageSize:250,
+    onPage:async(orderRows)=>{
+      const orderIds=(orderRows||[]).map((row)=>String(row.id));
+      if(!orderIds.length) return false;
+
+      if(db?.telegramDeliveryIntent?.findMany) {
+        await scanAllById({
+          delegate:db.telegramDeliveryIntent,
+          where:{agencyId,accountId:String(accountId),customOrderId:{in:orderIds},kind:{in:["TASK","REVISION_REQUEST"]}},
+          select:{id:true,customOrderId:true,kind:true,state:true},
+          pageSize:250,
+          onPage:async(rows)=>{
+            for(const row of rows||[]) {
+              const kind=String(row.kind||""); const state=String(row.state||"");
+              const relevant=(kind==="TASK" && state==="CONFIRMED")
+                || (kind==="REVISION_REQUEST" && ["PLANNED","CLAIMED","FAILED_PRECOMMIT","COMMITTING","RECONCILE_REQUIRED","CONFIRMED"].includes(state));
+              if(relevant && row.customOrderId) ids.add(String(row.customOrderId));
+            }
+            return false;
+          },
+        });
+      }
+
+      if(db?.customContentSubmission?.findMany) {
+        await scanAllById({
+          delegate:db.customContentSubmission,
+          where:{agencyId,telegramSourceAccountId:String(accountId),customOrderId:{in:orderIds}},
+          select:{id:true,customOrderId:true,pipelineDisposition:true,reviewStatus:true},
+          pageSize:250,
+          onPage:async(rows)=>{
+            for(const row of rows||[]) {
+              if(String(row.pipelineDisposition||"ACTIVE")!=="ACTIVE") continue;
+              if(!["WAITING_REVIEW","REVISION_REQUESTED"].includes(String(row.reviewStatus||"WAITING_REVIEW"))) continue;
+              if(row.customOrderId) ids.add(String(row.customOrderId));
+            }
+            return false;
+          },
+        });
+      }
+      return false;
+    },
+  });
   return [...ids];
 }
 
 async function findCustomProviderThreadRetentionBlockers({ agencyId, accountId, db, stopAfterFirst=false }={}) {
   const target=clean(accountId);
   if(!agencyId || !target || !db) return [];
-  const candidateIds=await candidateOrderIdsForAccount({agencyId,accountId:target,db});
+  const candidateIds=await candidateCurrentOrderIdsForAccount({agencyId,accountId:target,db});
   if(!candidateIds.length) return [];
   await lockCustomOrderRows({agencyId,orderIds:candidateIds,db});
   if(!db.customOrder?.findMany) return [];

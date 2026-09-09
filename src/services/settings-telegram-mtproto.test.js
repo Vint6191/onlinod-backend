@@ -24,6 +24,16 @@ function loadSettingsService({ auditImpl = async () => null, agencyLifecycleLock
     if (request === "./auth-service") return { publicUser: (u) => u, issuePasswordReset: async () => ({ emailResult: { ok: true, skipped: false } }) };
     if (request === "./audit-service") return { audit: auditImpl };
     if (request === "./team-access-control") return { canUsePermission: async () => true, isOwner: (member) => member?.role === "OWNER" || member?.roleKey === "owner" };
+    if (request === "./management-commit-authority-service") return {
+      assertManagementCommitAuthority: async ({ actorMember, ownerOrAdmin = false, creatorIds = [] }) => {
+        const role = String(actorMember?.role || "").toUpperCase();
+        const roleKey = String(actorMember?.roleKey || "").toLowerCase();
+        if (ownerOrAdmin && !(role === "OWNER" || role === "ADMIN" || role === "MANAGER" || roleKey === "owner" || roleKey === "admin" || roleKey === "manager")) {
+          const error = new Error("OWNER or ADMIN authority is required"); error.code = "MANAGEMENT_OWNER_OR_ADMIN_REQUIRED"; error.status = 403; throw error;
+        }
+        return { member: actorMember, accessEpoch: Number(actorMember?.accessEpoch || 1), creatorIds: Array.isArray(creatorIds) ? creatorIds : [creatorIds] };
+      },
+    };
     if (request === "./custom-content-pipeline-authority-service") {
       const actual = original.call(this, request, parent, isMain);
       return { ...actual, lockAgencyPipelineLifecycle: agencyLifecycleLockImpl };

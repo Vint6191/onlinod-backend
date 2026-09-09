@@ -12,6 +12,7 @@
 const { randomUUID } = require("node:crypto");
 const prisma = require("../prisma");
 const { gcTeamLedgers } = require("./team-ppv-ledger-service");
+const { purgeExpiredTipLedger } = require("./team-tip-ledger-service");
 const { compactAutomationDeliveries } = require("./automation-history-service");
 const { withDbAdvisoryXactLock, runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -83,6 +84,24 @@ const RETENTION_FIELDS = Object.freeze({
     min: 30,
     max: 3650,
     hint: "sent, ppv purchase, unanswered/incoming attribution rows.",
+  },
+  teamCanonicalDetailDays: {
+    label: "Team canonical raw detail",
+    unit: "days",
+    env: "ONLINOD_TEAM_CANONICAL_DETAIL_DAYS",
+    fallback: 180,
+    min: 30,
+    max: 730,
+    hint: "Canonical Team-v13 raw events plus exact response/dialog/coverage projections. Older exact detail is removed only when product coverage can state the retained boundary.",
+  },
+  teamMoneyRawDetailDays: {
+    label: "Team money raw attribution detail",
+    unit: "days",
+    env: "ONLINOD_TEAM_MONEY_RAW_DETAIL_DAYS",
+    fallback: 180,
+    min: 30,
+    max: 730,
+    hint: "PPV/Tip mutable attribution ledgers after durable TeamMoneyAttributionFact projection.",
   },
 
   automationDeliveryDetailedDays: {
@@ -308,11 +327,11 @@ function retentionSchema() {
   return Object.fromEntries(Object.entries(RETENTION_FIELDS).map(([key, spec]) => [key, { ...spec }]));
 }
 
-async function getRetentionSettings() {
+async function getRetentionSettings({ db = prisma } = {}) {
   const defaults = defaultRetentionSettings();
   let row = null;
   try {
-    row = await prisma.systemSetting.findUnique({ where: { key: RETENTION_SETTING_KEY } });
+    row = await db.systemSetting.findUnique({ where: { key: RETENTION_SETTING_KEY } });
   } catch (err) {
     // If migrations were not deployed yet, fall back to env defaults so normal
     // app startup does not hard crash. Admin page will surface the DB error.
@@ -540,6 +559,50 @@ async function runTeamActivityRetentionSweep(options = {}) {
     },
   }));
 
+  // Canonical Team-v13 detail may be compacted only after the DB projection
+  // proved that the event was durably folded into TeamMemberActivityDaily.
+  // Missing/failed projection therefore fails closed by leaving the raw row.
+  out.push(await deleteByIdsInBatches({
+    model: prisma.teamActivityEvent,
+    batchSize: cfg.batchSize,
+    label: `teamActivityEvent.canonical_projected_${cfg.teamCanonicalDetailDays}d`,
+    orderBy: { ts: "asc" },
+    where: {
+      source: "electron_team_v13",
+      eventKind: { not: null },
+      historicalProjectionVersion: "team_activity_daily_v1",
+      historicalProjectedAt: { not: null },
+      ts: { lt: daysAgo(cfg.teamCanonicalDetailDays, authorityNow) },
+    },
+  }));
+
+  // Response/dialog/coverage projections are exact detail authorities, not
+  // infinite historical aggregates. Keep them within the same explicit Team
+  // detail horizon as canonical event detail. Long-range product reads expose
+  // PARTIAL/AVAILABLE_FROM coverage instead of loading unbounded rows into RAM.
+  const projectionDetailCutoff = daysAgo(cfg.teamCanonicalDetailDays, authorityNow);
+  out.push(await deleteByIdsInBatches({
+    model: prisma.teamResponseCase,
+    batchSize: cfg.batchSize,
+    label: `teamResponseCase.detail_${cfg.teamCanonicalDetailDays}d`,
+    orderBy: { replyAt: "asc" },
+    where: { replyAt: { lt: projectionDetailCutoff } },
+  }));
+  out.push(await deleteByIdsInBatches({
+    model: prisma.teamDialogSession,
+    batchSize: cfg.batchSize,
+    label: `teamDialogSession.detail_${cfg.teamCanonicalDetailDays}d`,
+    orderBy: { startedAt: "asc" },
+    where: { startedAt: { lt: projectionDetailCutoff }, endedAt: { lt: projectionDetailCutoff } },
+  }));
+  out.push(await deleteByIdsInBatches({
+    model: prisma.teamCoverageSession,
+    batchSize: cfg.batchSize,
+    label: `teamCoverageSession.detail_${cfg.teamCanonicalDetailDays}d`,
+    orderBy: { startedAt: "asc" },
+    where: { startedAt: { lt: projectionDetailCutoff }, endedAt: { lt: projectionDetailCutoff } },
+  }));
+
   return summarizeSweep("teamActivityEvent", out);
 }
 
@@ -631,11 +694,24 @@ async function deleteDeadTrafficSourceMembers({ batchSize, olderThan }) {
 
 async function runTeamLedgerRetentionSweep(options = {}) {
   const authorityNow = sweepNow(options);
-  const result = await gcTeamLedgers({ now: authorityNow });
+  const cfg = await resolveSweepConfig(options);
+  const [result, tipResult] = await Promise.all([
+    gcTeamLedgers({
+      now: authorityNow,
+      olderThanMs: cfg.teamMoneyRawDetailDays * DAY_MS,
+    }),
+    purgeExpiredTipLedger({
+      retentionDays: cfg.teamMoneyRawDetailDays,
+      limit: cfg.batchSize,
+      dryRun: false,
+      now: authorityNow,
+    }),
+  ]);
   const items = [
     { label: "teamSentMessageLedger", deleted: Number(result?.sentMessageLedger || 0) },
     { label: "teamPpvPurchaseLedger", deleted: Number(result?.ppvPurchaseLedger || 0) },
     { label: "teamPpvResolveJob", deleted: Number(result?.ppvResolveJob || 0) },
+    { label: "teamTipLedger", deleted: Number(tipResult?.deleted || 0) },
   ];
   return summarizeSweep("teamLedgers", items);
 }

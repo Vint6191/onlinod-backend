@@ -3,6 +3,9 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
+const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { audit } = require("./audit-service");
 const {
   revokeOwnerRootAccessForMember,
@@ -518,56 +521,41 @@ function roleNotFoundError() {
 }
 
 async function lockTeamRoleLifecycle({ tx, agencyId, roleKey, mode = "share" }) {
-  // One role configuration is an effective authorization fact consumed by
-  // Customs and the wider product. Use the Agency row as a stable lifecycle
-  // root for BOTH preset and custom roles, then (for custom roles) lock the
-  // concrete role row. Shared holders are assignments/invitation claims;
-  // UPDATE holders are role configuration/deletion writers. This prevents:
-  //   * delete vs assignment/claim races,
-  //   * concurrent role JSON lost-updates,
-  //   * role mutation vs newly-assigned-member accessEpoch gaps,
-  // while preserving concurrency between ordinary assignments.
+  // Role lifecycle is role-local, not an Agency-row mutex. All ordinary Team work
+  // first joins the shared Agency lifecycle barrier so destructive Agency retirement
+  // cannot race it. A role-specific advisory RW lock then serializes assignment/claim
+  // readers against role configuration/deletion writers, including preset roles that
+  // have no AgencyCustomRole row of their own.
   const key = String(roleKey || "").trim().toLowerCase();
-  const lockMode = mode === "update" ? "FOR UPDATE" : "FOR SHARE";
+  const write = mode === "update";
+  const agencyBarrier = await lockAgencyLifecycleBarrier({ db: tx, agencyId, mode: "shared" });
+  if (typeof tx?.$executeRawUnsafe === "function") {
+    await lockDbAdvisoryXact({
+      db: tx,
+      key: `team-role-lifecycle:${String(agencyId)}:${key || "__missing__"}`,
+      mode: write ? "exclusive" : "shared",
+    });
+  }
 
-  if (typeof tx?.$queryRawUnsafe === "function") {
-    const agencyRows = await tx.$queryRawUnsafe(
-      `SELECT "id", "deletedAt" FROM "Agency" WHERE "id" = $1 ${lockMode}`,
-      String(agencyId),
-    );
-    if (!Array.isArray(agencyRows) || !agencyRows.length) {
-      const error = new Error("Agency not found");
-      error.code = "AGENCY_NOT_FOUND";
-      error.status = 404;
-      throw error;
-    }
-    if (agencyRows[0]?.deletedAt) {
-      const error = new Error("Agency was deleted");
-      error.code = "AGENCY_DELETED";
-      error.status = 409;
-      throw error;
-    }
-  } else if (typeof tx?.agency?.findUnique === "function") {
-    const agency = await tx.agency.findUnique({ where: { id: agencyId }, select: { id: true, deletedAt: true } });
-    if (!agency) {
-      const error = new Error("Agency not found");
-      error.code = "AGENCY_NOT_FOUND";
-      error.status = 404;
-      throw error;
-    }
-    if (agency.deletedAt) {
-      const error = new Error("Agency was deleted");
-      error.code = "AGENCY_DELETED";
-      error.status = 409;
-      throw error;
-    }
+  if (!agencyBarrier.row) {
+    const error = new Error("Agency not found");
+    error.code = "AGENCY_NOT_FOUND";
+    error.status = 404;
+    throw error;
+  }
+  if (agencyBarrier.row.deletedAt) {
+    const error = new Error("Agency was deleted");
+    error.code = "AGENCY_DELETED";
+    error.status = 409;
+    throw error;
   }
 
   if (!key || PRESET_ROLE_SET.has(key)) return { agencyId: String(agencyId), roleKey: key, preset: true };
 
+  const rowLock = write ? "FOR UPDATE" : "FOR SHARE";
   if (typeof tx?.$queryRawUnsafe === "function") {
     const rows = await tx.$queryRawUnsafe(
-      `SELECT "id" FROM "AgencyCustomRole" WHERE "agencyId" = $1 AND "key" = $2 ${lockMode}`,
+      `SELECT "id" FROM "AgencyCustomRole" WHERE "agencyId" = $1 AND "key" = $2 ${rowLock}`,
       String(agencyId),
       key,
     );
@@ -899,6 +887,21 @@ async function createInvitation({ agencyId, input, actorMember, actorUserId: act
   const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000);
   const createWithRoleFence = async (tx) => {
     await lockTeamRoleLifecycle({ tx, agencyId, roleKey, mode: "share" });
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.invite",
+      creatorIds: creatorScope.normalized?.mode === "scoped" ? creatorScope.normalized.creatorIds : [],
+      agencyAlreadyLocked: true,
+    });
+    await assertActorCanAssignRole({ agencyId, actorMember: commit.member, roleKey, db: tx });
+    assertActorCanGrantCreatorScope({ actorMember: commit.member, assignedCreators: creatorScope.value });
+    const liveCreatorScope = await validateAssignedCreators({ agencyId, assignedCreators: creatorScope.value, db: tx });
+    if (!liveCreatorScope.ok) {
+      const error = new Error(`Unknown creator scope: ${liveCreatorScope.unknownCreatorIds.join(", ")}`);
+      error.code = liveCreatorScope.code;
+      error.status = 409;
+      error.details = { unknownCreatorIds: liveCreatorScope.unknownCreatorIds };
+      throw error;
+    }
     return tx.agencyInvitation.create({
       data: {
         agencyId,
@@ -906,7 +909,7 @@ async function createInvitation({ agencyId, input, actorMember, actorUserId: act
         email: input.email || null,
         roleKey,
         displayName: input.displayName || null,
-        assignedCreators: creatorScope.value,
+        assignedCreators: liveCreatorScope.value,
         functions,
         commission: input.commission || null,
         invitedByUserId: actorId,
@@ -957,9 +960,28 @@ async function reissueInvitation({ agencyId, invitationId, expiresInDays = 14, a
   const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
   const reissueWithRoleFence = async (tx) => {
     await lockTeamRoleLifecycle({ tx, agencyId, roleKey: inv.roleKey, mode: "share" });
-    return tx.agencyInvitation.update({
-      where: { id: inv.id },
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.invite",
+      creatorIds: normalizeAssignedCreators(inv.assignedCreators).mode === "scoped" ? normalizeAssignedCreators(inv.assignedCreators).creatorIds : [],
+      agencyAlreadyLocked: true,
+    });
+    await assertActorCanAssignRole({ agencyId, actorMember: commit.member, roleKey: inv.roleKey, db: tx });
+    assertActorCanGrantCreatorScope({ actorMember: commit.member, assignedCreators: inv.assignedCreators });
+    const changed = await tx.agencyInvitation.updateMany({
+      where: { id: inv.id, agencyId, claimedAt: null },
       data: { tokenHash: sha256(rawToken), revokedAt: null, expiresAt },
+    });
+    if (Number(changed?.count || 0) !== 1) {
+      const current = await tx.agencyInvitation.findFirst({ where: { id: inv.id, agencyId } });
+      if (!current) { const error = new Error("Invitation not found"); error.code = "INVITE_NOT_FOUND"; error.status = 404; throw error; }
+      if (current.claimedAt) { const error = new Error("Claimed invitations cannot be reissued"); error.code = "INVITE_CLAIMED"; error.status = 409; throw error; }
+      const error = new Error("Invitation changed while this request was in flight");
+      error.code = "STALE_COMMAND_TARGET";
+      error.status = 409;
+      throw error;
+    }
+    return tx.agencyInvitation.findUnique({
+      where: { id: inv.id },
       include: { invitedBy: { select: { id: true, email: true, name: true } } },
     });
   };
@@ -994,7 +1016,29 @@ async function revokeInvitation({ agencyId, invitationId, actorMember, actorUser
   }
   assertActorCanGrantCreatorScope({ actorMember, assignedCreators: inv.assignedCreators });
   const revokedAt = new Date();
-  await db.agencyInvitation.update({ where: { id: inv.id }, data: { revokedAt } });
+  await serializableTeamTransaction(db, async (tx) => {
+    await lockTeamRoleLifecycle({ tx, agencyId, roleKey: inv.roleKey, mode: "share" });
+    const scope = normalizeAssignedCreators(inv.assignedCreators);
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.invite",
+      creatorIds: scope.mode === "scoped" ? scope.creatorIds : [],
+      agencyAlreadyLocked: true,
+    });
+    assertActorCanGrantCreatorScope({ actorMember: commit.member, assignedCreators: inv.assignedCreators });
+    const changed = await tx.agencyInvitation.updateMany({
+      where: { id: inv.id, agencyId, claimedAt: null },
+      data: { revokedAt },
+    });
+    if (Number(changed?.count || 0) !== 1) {
+      const current = await tx.agencyInvitation.findFirst({ where: { id: inv.id, agencyId } });
+      if (!current) { const error = new Error("Invitation not found"); error.code = "INVITE_NOT_FOUND"; error.status = 404; throw error; }
+      if (current.claimedAt) { const error = new Error("Claimed invitations cannot be revoked"); error.code = "INVITE_CLAIMED"; error.status = 409; throw error; }
+      const error = new Error("Invitation changed while this request was in flight");
+      error.code = "STALE_COMMAND_TARGET";
+      error.status = 409;
+      throw error;
+    }
+  });
   await audit({
     agencyId,
     actorUserId: actorId,
@@ -1021,20 +1065,27 @@ async function createCustomRole({ agencyId, input, actorMember, actorUserId: act
   const slug = String(input.label || "custom")
     .trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 36) || "custom";
   const key = `custom_${slug}_${crypto.randomBytes(3).toString("hex")}`;
-  const created = await db.$transaction(async (tx) => {
+  const created = await serializableTeamTransaction(db, async (tx) => {
+    await lockTeamRoleLifecycle({ tx, agencyId, roleKey: sourceKey, mode: "share" });
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
+    });
+    const liveSource = await resolveRoleDefinition({ agencyId, roleKey: sourceKey, db: tx });
+    const liveActorPermissions = await resolveEffectivePermissions({ member: commit.member, db: tx });
+    assertRoleConfigurationWithinActor({ actorMember: commit.member, actorPermissions: liveActorPermissions, role: liveSource });
     const role = await tx.agencyCustomRole.create({
       data: {
         agencyId,
         key,
         label: String(input.label).trim(),
-        tone: input.tone || source.tone || "amber",
-        description: input.description || `Based on ${source.label}`,
-        access: source.access,
+        tone: input.tone || liveSource.tone || "amber",
+        description: input.description || `Based on ${liveSource.label}`,
+        access: liveSource.access,
         basedOn: sourceKey,
         createdByUserId: actorId,
       },
     });
-    const explicit = Object.entries(source.permissionDetails || {})
+    const explicit = Object.entries(liveSource.permissionDetails || {})
       .filter(([permissionKey, detail]) => PUBLIC_PERMISSION_KEY_SET.has(permissionKey) && detail.source !== "zone")
       .map(([subPermKey, detail]) => ({ agencyId, roleKey: key, subPermKey, value: detail.value === true }));
     if (explicit.length) await tx.agencySubPermissionOverride.createMany({ data: explicit, skipDuplicates: true });
@@ -1069,6 +1120,9 @@ async function updateRoleMetadata({ agencyId, roleKey, input, actorMember, actor
   }
   await serializableTeamTransaction(db, async (tx) => {
     await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update" });
+    await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
+    });
     await tx.agencyCustomRole.update({
       where: { id: existing.id },
       data: {
@@ -1099,9 +1153,12 @@ async function setRoleAccess({ agencyId, roleKey, zoneKey, levelKey, actorMember
     throw error;
   }
   const level = String(levelKey).toLowerCase();
-  const actorPermissions = await resolveEffectivePermissions({ member: actorMember, db });
-  const roleMutation = await db.$transaction(async (tx) => {
+  const roleMutation = await serializableTeamTransaction(db, async (tx) => {
     await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update" });
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
+    });
+    const actorPermissions = await resolveEffectivePermissions({ member: commit.member, db: tx });
     const custom = await tx.agencyCustomRole.findUnique({ where: { agencyId_key: { agencyId, key } } });
     if (custom) {
       await tx.agencyCustomRole.update({ where: { id: custom.id }, data: { access: { ...custom.access, [zone.key]: level } } });
@@ -1114,7 +1171,7 @@ async function setRoleAccess({ agencyId, roleKey, zoneKey, levelKey, actorMember
       });
     }
     const nextRole = await resolveRoleDefinition({ agencyId, roleKey: key, db: tx });
-    assertRoleConfigurationWithinActor({ actorMember, actorPermissions, role: nextRole });
+    assertRoleConfigurationWithinActor({ actorMember: commit.member, actorPermissions, role: nextRole });
     const affectedMembers = await bumpLiveRoleMemberAccessEpochs({ tx, agencyId, roleKey: key });
     return { role: nextRole, affectedMembers };
   });
@@ -1137,9 +1194,12 @@ async function setRolePermission({ agencyId, roleKey, permissionKey, value, acto
     error.status = 400;
     throw error;
   }
-  const actorPermissions = await resolveEffectivePermissions({ member: actorMember, db });
-  const roleMutation = await db.$transaction(async (tx) => {
+  const roleMutation = await serializableTeamTransaction(db, async (tx) => {
     await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update" });
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
+    });
+    const actorPermissions = await resolveEffectivePermissions({ member: commit.member, db: tx });
     if (value === null) {
       await tx.agencySubPermissionOverride.deleteMany({ where: { agencyId, roleKey: key, subPermKey: permissionKey } });
     } else {
@@ -1150,7 +1210,7 @@ async function setRolePermission({ agencyId, roleKey, permissionKey, value, acto
       });
     }
     const nextRole = await resolveRoleDefinition({ agencyId, roleKey: key, db: tx });
-    assertRoleConfigurationWithinActor({ actorMember, actorPermissions, role: nextRole });
+    assertRoleConfigurationWithinActor({ actorMember: commit.member, actorPermissions, role: nextRole });
     const affectedMembers = await bumpLiveRoleMemberAccessEpochs({ tx, agencyId, roleKey: key });
     return { role: nextRole, affectedMembers };
   });
@@ -1173,9 +1233,12 @@ async function resetRole({ agencyId, roleKey, actorMember, actorUserId: actorId,
     error.status = 409;
     throw error;
   }
-  const actorPermissions = await resolveEffectivePermissions({ member: actorMember, db });
-  const roleMutation = await db.$transaction(async (tx) => {
+  const roleMutation = await serializableTeamTransaction(db, async (tx) => {
     await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update" });
+    const commit = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
+    });
+    const actorPermissions = await resolveEffectivePermissions({ member: commit.member, db: tx });
     const publicAccessZones = publicPermissionZones().filter((zone) => zone.levels.length > 0).map((zone) => zone.key);
     const existingAccessOverride = await tx.agencyRoleOverride.findUnique({
       where: { agencyId_roleKey: { agencyId, roleKey: key } },
@@ -1193,7 +1256,7 @@ async function resetRole({ agencyId, roleKey, actorMember, actorUserId: actorId,
       where: { agencyId, roleKey: key, subPermKey: { in: [...PUBLIC_PERMISSION_KEYS] } },
     });
     const nextRole = await resolveRoleDefinition({ agencyId, roleKey: key, db: tx });
-    assertRoleConfigurationWithinActor({ actorMember, actorPermissions, role: nextRole });
+    assertRoleConfigurationWithinActor({ actorMember: commit.member, actorPermissions, role: nextRole });
     const affectedMembers = await bumpLiveRoleMemberAccessEpochs({ tx, agencyId, roleKey: key });
     return { role: nextRole, affectedMembers };
   });
@@ -1212,6 +1275,9 @@ async function deleteCustomRole({ agencyId, roleKey, actorMember, actorUserId: a
   }
   const deletion = await serializableTeamTransaction(db, async (tx) => {
     const locked = await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update" });
+    await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
+    });
     const custom = await tx.agencyCustomRole.findUnique({ where: { agencyId_key: { agencyId, key } } });
     if (!custom || (locked?.id && String(locked.id) !== String(custom.id))) throw roleNotFoundError();
     const [memberCount, inviteCount] = await Promise.all([

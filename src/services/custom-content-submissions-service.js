@@ -695,7 +695,7 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
       }
       const changed = await tx.customContentSubmission.updateMany({
         where: { id: row.id, agencyId, pipelineDisposition: ACTIVE, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
-        data: { customOrderId: normalizedOrderId },
+        data: { customOrderId: normalizedOrderId, bindingRevision: { increment: 1 } },
       });
       if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_ASSIGNMENT_STALE", "Submission assignment changed while this manager action was being applied", 409);
       const fresh = await tx.customContentSubmission.findFirst({ where: { id: row.id, agencyId } });

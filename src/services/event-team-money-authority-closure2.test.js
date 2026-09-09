@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { phase2AnalyticsFixture, attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -52,17 +53,19 @@ function analyticsPrisma({ responseThrows = false, dialogThrows = false, coverag
 }
 function loadAnalytics(fake) {
   delete require.cache[analyticsPath]; delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: fake };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(fake) };
   return require(analyticsPath);
 }
 function loadTip(fake) {
+  attachManagementAuthority(fake, { actor: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }) });
   delete require.cache[tipPath]; delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: fake };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(fake) };
   return require(tipPath);
 }
 function loadPpv(fake) {
+  attachManagementAuthority(fake, { actor: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }) });
   delete require.cache[ppvPath]; delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: fake };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(fake) };
   return require(ppvPath);
 }
 
@@ -155,7 +158,7 @@ test("Closure2 auto-first then manual PPV resolution ends MANUAL", async () => {
   };
   const service = loadPpv(fake);
   const result = await service.resolvePpvConflict({
-    agencyId: "agency-1", jobId: "job-1", memberId: "member-B", actorMemberId: "manager", action: "assign", deviceId: "device-1", reason: "manual wins", allowedCreatorIds: ["creator-1"],
+    agencyId: "agency-1", jobId: "job-1", memberId: "member-B", actorMemberId: "manager", actorMember: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }), action: "assign", deviceId: "device-1", reason: "manual wins", allowedCreatorIds: ["creator-1"],
   });
   assert.equal(result.resolved, 1);
   assert.equal(purchase.attributedMemberId, "member-B");

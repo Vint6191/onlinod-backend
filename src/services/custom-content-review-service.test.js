@@ -25,8 +25,9 @@ function fixture() {
   const currentMember = { ...member, permissions: { ...member.permissions } };
   const creator = { id: "creator-1", displayName: "Model One", username: "modelone", avatarUrl: null };
   const order = { id: "custom-1", creatorId: "creator-1", dialogId: "777", scenario: "Do the custom", internalNote: null, type: "CONTENT", contentKind: "VIDEO", status: "PENDING", fanDeliveredAt: null, priceCents: 6000, paidAmountCents: 4000, createdAt: now, creator };
-  const row = { id: "sub-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", pipelineDisposition: "ACTIVE", executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1, executionPinnedAt: now, ...receipt("vault-1", 1, ["9001", "9002"], now), telegramMessageIds: [101, 102], ofMediaIds: ["9001", "9002"], comment: "two versions", reviewStatus: "WAITING_REVIEW", reviewComment: null, reviewedByMemberId: null, reviewedAt: null, receivedAt: now, createdAt: now, updatedAt: now, creator, customOrder: order, reviewedByMember: null };
+  const row = { id: "sub-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", pipelineDisposition: "ACTIVE", executionVaultFolderId: "vault-1", executionRelayRecipient: "relay_model", executionProfileRevision: 1, executionPinnedAt: now, ...receipt("vault-1", 1, ["9001", "9002"], now), telegramMessageIds: [101, 102], ofMediaIds: ["9001", "9002"], comment: "two versions", reviewStatus: "WAITING_REVIEW", reviewComment: null, reviewedByMemberId: null, reviewedAt: null, bindingRevision: 1, reviewDecisionRevision: 0, receivedAt: now, createdAt: now, updatedAt: now, creator, customOrder: order, reviewedByMember: null };
   const rows = [row];
+  const reviewDecisions = [];
   const assets = ["9001", "9002"].map((mediaId) => ({ agencyId: "agency-1", creatorId: "creator-1", mediaId, source: "CUSTOM", customOrderId: "custom-1", customSubmissionId: "sub-1", customFullPriceCents: 6000, mediaType: "video", thumbUrl: `https://cdn/${mediaId}.jpg`, previewUrl: null, fullUrl: null, folderIds: ["vault-1"], catalogActive: true, sortingStatus: "SORTED" }));
   const intents = [{
     id: "task-1", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-1", customSubmissionId: null, accountId: "tg-1", kind: "TASK", logicalKey: "task-key", clientIntentId: null, referenceOrdinal: null,
@@ -87,13 +88,38 @@ function fixture() {
         found.sort((a,b) => { for (const spec of specs) { const [key,dir] = Object.entries(spec || {})[0] || []; if (!key) continue; const av=a[key], bv=b[key]; const cmp=(av instanceof Date || bv instanceof Date) ? new Date(av||0)-new Date(bv||0) : String(av??"").localeCompare(String(bv??"")); if (cmp) return dir === "desc" ? -cmp : cmp; } return 0; });
         return found.length ? pick(found[0], select) : null;
       },
-      updateMany: async ({ where, data }) => {
-        const item = rows.find((candidate) => candidate.id === where.id && candidate.reviewStatus === where.reviewStatus && candidate.updatedAt === where.updatedAt);
+      updateMany: async ({ where = {}, data = {} }) => {
+        const item = rows.find((candidate) => {
+          if (where.id && String(candidate.id) !== String(where.id)) return false;
+          if (where.agencyId && String(candidate.agencyId) !== String(where.agencyId)) return false;
+          if (where.pipelineDisposition && String(candidate.pipelineDisposition) !== String(where.pipelineDisposition)) return false;
+          if (where.reviewStatus && String(candidate.reviewStatus) !== String(where.reviewStatus)) return false;
+          if (where.customOrderId && String(candidate.customOrderId) !== String(where.customOrderId)) return false;
+          if (where.bindingRevision != null && Number(candidate.bindingRevision) !== Number(where.bindingRevision)) return false;
+          if (where.reviewDecisionRevision != null && Number(candidate.reviewDecisionRevision) !== Number(where.reviewDecisionRevision)) return false;
+          if (where.updatedAt && candidate.updatedAt !== where.updatedAt) return false;
+          return true;
+        });
         if (!item) return { count: 0 };
-        Object.assign(item, data, { updatedAt: new Date(item.updatedAt.getTime() + 1) });
+        for (const [key, value] of Object.entries(data)) {
+          if (value && typeof value === "object" && Number.isFinite(Number(value.increment))) item[key] = Number(item[key] || 0) + Number(value.increment);
+          else item[key] = value;
+        }
+        item.updatedAt = new Date(item.updatedAt.getTime() + 1);
         item.reviewedByMember = data.reviewedByMemberId ? { id: member.id, displayName: "Manager", roleKey: "manager" } : null;
         return { count: 1 };
       },
+    },
+    customContentReviewDecision: {
+      create: async ({ data }) => {
+        const created = { id: `review-decision-${reviewDecisions.length + 1}`, createdAt: data.decidedAt || now, ...data };
+        reviewDecisions.push(created);
+        return created;
+      },
+      findMany: async ({ where = {} } = {}) => reviewDecisions.filter((item) => {
+        if (where.submissionId && String(item.submissionId) !== String(where.submissionId)) return false;
+        return true;
+      }),
     },
     agencyTelegramMtprotoAccount: {
       updateMany: async ({ where }) => ({ count: String(where?.id || "") === "tg-1" ? 1 : 0 }),
@@ -120,9 +146,17 @@ function fixture() {
         const created = { id: `intent-${intents.length + 1}`, claimRevision: 0, claimUntil: null, commitStartedAt: null, remoteMessageId: null, remoteRecipientTelegramUserId: null, remoteSentAt: null, outcomeReason: null, confirmationAuthority: null, confirmedAt: null, updatedAt: data.createdAt || now, ...data };
         intents.push(created); return created;
       },
-      updateMany: async ({ where = {}, data }) => {
+      updateMany: async ({ where = {}, data = {} }) => {
         let count = 0;
-        for (const item of intents) { if (!matchesIntent(item, where)) continue; Object.assign(item, data, { updatedAt: data.updatedAt || new Date(now.getTime() + 1) }); count += 1; }
+        for (const item of intents) {
+          if (!matchesIntent(item, where)) continue;
+          for (const [key, value] of Object.entries(data)) {
+            if (value && typeof value === "object" && Number.isFinite(Number(value.increment))) item[key] = Number(item[key] || 0) + Number(value.increment);
+            else item[key] = value;
+          }
+          item.updatedAt = data.updatedAt || new Date(now.getTime() + 1);
+          count += 1;
+        }
         return { count };
       },
     },
@@ -135,7 +169,7 @@ function fixture() {
     $queryRawUnsafe: async () => [{ id: order.id }],
     $transaction: async (work) => work(db),
   };
-  return { db, member, currentMember, row, rows, assets, intents };
+  return { db, member, currentMember, row, rows, assets, intents, reviewDecisions };
 }
 
 test("manager review queue exposes only finalized custom facts and full payment context", async () => {
@@ -157,29 +191,29 @@ test("legacy complete assets without a pinned execution profile remain outside m
   const result = await listCustomContentReviewQueue({ agencyId: "agency-1", member, db, limit: 50 });
   assert.deepEqual(result.items, []);
   await assert.rejects(
-    () => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }),
+    () => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }),
     (error) => error?.code === "CUSTOM_REVIEW_NOT_READY",
   );
 });
 
 test("revision request requires a non-empty manager comment", async () => {
   const { db, member } = fixture();
-  await assert.rejects(() => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "   ", db }), (error) => error.code === "CUSTOM_REVIEW_COMMENT_REQUIRED");
+  await assert.rejects(() => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "   ", db }), (error) => error.code === "CUSTOM_REVIEW_COMMENT_REQUIRED");
 });
 
 test("approve is final and persists reviewer without mutating the custom order", async () => {
   const { db, member, row } = fixture();
-  const result = await reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db });
+  const result = await reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db });
   assert.equal(result.ok, true);
   assert.equal(result.item.reviewStatus, "APPROVED");
   assert.equal(row.reviewedByMemberId, "manager-1");
   assert.ok(row.reviewedAt instanceof Date);
-  await assert.rejects(() => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "change it", db }), (error) => error.code === "CUSTOM_REVIEW_APPROVAL_FINAL");
+  await assert.rejects(() => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "change it", db }), (error) => error.code === "CUSTOM_REVIEW_APPROVAL_FINAL");
 });
 
 test("revision decision atomically creates one durable revision dispatch and preserves exact manager instruction", async () => {
   const { db, member, row, intents } = fixture();
-  const result = await reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Need another angle", db });
+  const result = await reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Need another angle", db });
   assert.equal(result.item.reviewStatus, "REVISION_REQUESTED");
   assert.equal(row.reviewComment, "Need another angle");
   assert.equal(result.item.revisionDispatch.status, "DISPATCH_PENDING");
@@ -192,12 +226,12 @@ test("revision decision atomically creates one durable revision dispatch and pre
   assert.equal(revision[0].payload.reviewComment, "Need another angle");
   assert.match(revision[0].payload.text, /Need another angle/);
 
-  const retry = await reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Need another angle", db });
+  const retry = await reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Need another angle", db });
   assert.equal(retry.idempotent, true);
   assert.equal(retry.item.revisionDispatch.intentId, revision[0].id);
   assert.equal(intents.filter((intent) => intent.kind === "REVISION_REQUEST").length, 1, "manager retry/restart recovery must not create a second revision instruction");
 
-  await assert.rejects(() => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }), (error) => error.code === "CUSTOM_REVIEW_ALREADY_DECIDED");
+  await assert.rejects(() => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }), (error) => error.code === "CUSTOM_REVIEW_ALREADY_DECIDED");
 });
 
 
@@ -233,7 +267,7 @@ test("commit-time review fence rejects APPROVE when cancellation wins the Custom
     return originalRaw(...args);
   };
   await assert.rejects(
-    () => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }),
+    () => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }),
     (error) => error?.code === "CUSTOM_REVIEW_ORDER_TERMINAL",
   );
   assert.equal(row.reviewStatus, "WAITING_REVIEW");
@@ -322,7 +356,7 @@ test("historical revision is not projected as current after a later model respon
   assert.deepEqual(revisions.items, [], "V1 is durable history, but V2 already satisfies the current model-response obligation");
 
   await assert.rejects(
-    () => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: historical.id, action: "REQUEST_REVISION", comment: "Need another angle", db }),
+    () => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: historical.id, action: "REQUEST_REVISION", comment: "Need another angle", db }),
     (error) => error?.code === "CUSTOM_REVIEW_DECISION_SUPERSEDED",
     "a stale exact-id retry must not resurrect the historical V1 revision read-model",
   );
@@ -409,7 +443,7 @@ test("Review fails closed when a current-receipt CUSTOM asset loses the pinned f
   const result = await listCustomContentReviewQueue({ agencyId: "agency-1", member, db, limit: 50 });
   assert.deepEqual(result.items, []);
   await assert.rejects(
-    () => reviewCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }),
+    () => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId: "agency-1", member, submissionId: "sub-1", action: "APPROVE", db }),
     (error) => error?.code === "CUSTOM_REVIEW_NOT_READY",
   );
 });
@@ -460,7 +494,7 @@ test("historical reviewed submission without TASK plans revision against its pin
   row.telegramSourceUserId = "900001";
   row.telegramMessageIds = [101, 102];
   const result = await reviewCustomContentSubmission({
-    agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Redo the historical version", db,
+    agencyId: "agency-1", member, submissionId: "sub-1", expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, action: "REQUEST_REVISION", comment: "Redo the historical version", db,
   });
   assert.equal(result.item.reviewStatus, "REVISION_REQUESTED");
   assert.equal(result.item.revisionDispatch.status, "DISPATCH_PENDING");
@@ -480,7 +514,7 @@ test("revision decision remains durable as DISPATCH_BLOCKED without TASK/source 
   row.telegramMessageIds = [101, 102];
 
   const blocked = await reviewCustomContentSubmission({
-    agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Revision still required", db,
+    agencyId: "agency-1", member, submissionId: "sub-1", expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, action: "REQUEST_REVISION", comment: "Revision still required", db,
   });
   assert.equal(row.reviewStatus, "REVISION_REQUESTED", "manager quality decision must commit independently of provider dispatch capability");
   assert.equal(blocked.item.revisionDispatch.status, "DISPATCH_BLOCKED");
@@ -496,7 +530,7 @@ test("revision decision remains durable as DISPATCH_BLOCKED without TASK/source 
   row.telegramSourceUserId = "900001";
   row.telegramMessageIds = [101, 444];
   const repaired = await reviewCustomContentSubmission({
-    agencyId: "agency-1", member, submissionId: "sub-1", action: "REQUEST_REVISION", comment: "Revision still required", db,
+    agencyId: "agency-1", member, submissionId: "sub-1", expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, action: "REQUEST_REVISION", comment: "Revision still required", db,
   });
   assert.equal(repaired.idempotent, true);
   assert.equal(repaired.item.revisionDispatch.status, "DISPATCH_PENDING");
@@ -511,7 +545,7 @@ test("review mutation enforces current creator scope, not knowledge of an opaque
   member.assignedCreators = ["creator-other"];
   currentMember.assignedCreators = ["creator-other"];
   await assert.rejects(
-    () => reviewCustomContentSubmission({ agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db }),
+    () => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db }),
     (error) => error?.code === "CUSTOM_MANAGEMENT_CREATOR_ACCESS_FORBIDDEN" && error?.status === 403,
   );
   assert.equal(row.reviewStatus, "WAITING_REVIEW");
@@ -521,7 +555,7 @@ test("review mutation permits the same scoped manager for the assigned creator",
   const { db, member, currentMember, row } = fixture();
   member.assignedCreators = ["creator-1"];
   currentMember.assignedCreators = ["creator-1"];
-  const result = await reviewCustomContentSubmission({ agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db });
+  const result = await reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db });
   assert.equal(result.item.reviewStatus, "APPROVED");
 });
 
@@ -540,8 +574,141 @@ test("review mutation rechecks access inside commit transaction after target pre
     return normalTransaction(work);
   };
   await assert.rejects(
-    () => reviewCustomContentSubmission({ agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db }),
+    () => reviewCustomContentSubmission({ expectedCustomOrderId: "custom-1", expectedBindingRevision: 1, agencyId:"agency-1", member, submissionId:row.id, action:"APPROVE", db }),
     (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
   );
   assert.equal(row.reviewStatus, "WAITING_REVIEW", "stale scope request must not leave a review mutation behind");
+});
+
+test("review decisions are durable numbered history, not only mutable submission fields", async () => {
+  const { db, member, row, reviewDecisions } = fixture();
+  const result = await reviewCustomContentSubmission({
+    agencyId: "agency-1", member, submissionId: row.id,
+    expectedCustomOrderId: row.customOrderId, expectedBindingRevision: 1,
+    action: "REQUEST_REVISION", comment: "Need a cleaner ending", db,
+  });
+  assert.equal(result.item.reviewStatus, "REVISION_REQUESTED");
+  assert.equal(result.item.reviewDecisionRevision, 1);
+  assert.equal(row.reviewDecisionRevision, 1);
+  assert.equal(reviewDecisions.length, 1);
+  assert.deepEqual({
+    revision: reviewDecisions[0].decisionRevision,
+    decision: reviewDecisions[0].decision,
+    supersedes: reviewDecisions[0].supersedesDecisionRevision,
+    reason: reviewDecisions[0].supersessionReason,
+  }, { revision: 1, decision: "REQUEST_REVISION", supersedes: null, reason: null });
+});
+
+test("blocked revision can be explicitly superseded by APPROVE while preserving history and cancelling only precommit work", async () => {
+  const { db, member, row, intents, reviewDecisions } = fixture();
+  intents.splice(0, intents.length);
+  row.telegramSourceAccountId = null;
+  row.telegramSourceUserId = null;
+
+  const revision = await reviewCustomContentSubmission({
+    agencyId: "agency-1", member, submissionId: row.id,
+    expectedCustomOrderId: row.customOrderId, expectedBindingRevision: 1,
+    action: "REQUEST_REVISION", comment: "Need another take", db,
+  });
+  assert.equal(revision.item.revisionDispatch.status, "DISPATCH_BLOCKED");
+  assert.equal(row.reviewDecisionRevision, 1);
+
+  intents.push({
+    id: "revision-blocked-precommit", agencyId: "agency-1", creatorId: "creator-1", customOrderId: row.customOrderId,
+    customSubmissionId: row.id, accountId: "tg-dead", kind: "REVISION_REQUEST", logicalKey: "blocked-revision-key",
+    payloadFingerprint: "blocked-fp", payload: {}, state: "PLANNED", claimRevision: 4, claimUntil: null,
+    commitStartedAt: null, remoteMessageId: null, remoteRecipientTelegramUserId: null, remoteSentAt: null,
+    outcomeReason: "PRECOMMIT_PROVIDER_UNAVAILABLE:ACCOUNT_RETIRED", confirmationAuthority: null, confirmedAt: null,
+    createdAt: new Date("2026-08-21T14:31:00.000Z"), updatedAt: new Date("2026-08-21T14:31:00.000Z"),
+  });
+
+  const reconsidered = await reviewCustomContentSubmission({
+    agencyId: "agency-1", member, submissionId: row.id,
+    expectedCustomOrderId: row.customOrderId, expectedBindingRevision: 1, expectedReviewDecisionRevision: 1,
+    action: "RECONSIDER_APPROVE", supersessionReason: "PROVIDER_UNRECOVERABLE", db,
+  });
+
+  assert.equal(reconsidered.item.reviewStatus, "APPROVED");
+  assert.equal(reconsidered.item.reviewDecisionRevision, 2);
+  assert.equal(row.reviewDecisionRevision, 2);
+  assert.equal(reviewDecisions.length, 2);
+  assert.deepEqual(reviewDecisions.map((item) => ({ revision: item.decisionRevision, decision: item.decision, supersedes: item.supersedesDecisionRevision, reason: item.supersessionReason })), [
+    { revision: 1, decision: "REQUEST_REVISION", supersedes: null, reason: null },
+    { revision: 2, decision: "APPROVE", supersedes: 1, reason: "PROVIDER_UNRECOVERABLE" },
+  ]);
+  const cancelled = intents.find((item) => item.id === "revision-blocked-precommit");
+  assert.equal(cancelled.state, "CANCELLED");
+  assert.equal(cancelled.outcomeReason, "REVIEW_DECISION_SUPERSEDED:PROVIDER_UNRECOVERABLE");
+  assert.equal(cancelled.claimRevision, 5);
+  assert.equal(cancelled.remoteMessageId, null, "reconsideration must not invent provider success");
+  assert.equal(cancelled.confirmedAt, null, "reconsideration must not invent provider confirmation");
+});
+
+test("reconsideration is rejected while revision provider dispatch is still usable", async () => {
+  const { db, member, row } = fixture();
+  await reviewCustomContentSubmission({
+    agencyId: "agency-1", member, submissionId: row.id,
+    expectedCustomOrderId: row.customOrderId, expectedBindingRevision: 1,
+    action: "REQUEST_REVISION", comment: "Need another take", db,
+  });
+  await assert.rejects(
+    () => reviewCustomContentSubmission({
+      agencyId: "agency-1", member, submissionId: row.id,
+      expectedCustomOrderId: row.customOrderId, expectedBindingRevision: 1, expectedReviewDecisionRevision: 1,
+      action: "RECONSIDER_APPROVE", supersessionReason: "PROVIDER_UNRECOVERABLE", db,
+    }),
+    (error) => error?.code === "CUSTOM_REVIEW_RECONSIDERATION_PROVIDER_NOT_BLOCKED" && error?.status === 409,
+  );
+  assert.equal(row.reviewStatus, "REVISION_REQUESTED");
+  assert.equal(row.reviewDecisionRevision, 1);
+});
+
+test("reconsideration fences the exact current review decision revision", async () => {
+  const { db, member, row } = fixture();
+  row.reviewStatus = "REVISION_REQUESTED";
+  row.reviewComment = "Old decision";
+  row.reviewedAt = new Date("2026-08-21T14:00:00.000Z");
+  row.reviewDecisionRevision = 2;
+  row.telegramSourceAccountId = null;
+  row.telegramSourceUserId = null;
+  await assert.rejects(
+    () => reviewCustomContentSubmission({
+      agencyId: "agency-1", member, submissionId: row.id,
+      expectedCustomOrderId: row.customOrderId, expectedBindingRevision: 1, expectedReviewDecisionRevision: 1,
+      action: "RECONSIDER_APPROVE", supersessionReason: "MANAGER_RECONSIDERATION", db,
+    }),
+    (error) => error?.code === "STALE_COMMAND_TARGET" && error?.status === 409,
+  );
+  assert.equal(row.reviewStatus, "REVISION_REQUESTED");
+  assert.equal(row.reviewDecisionRevision, 2);
+});
+
+test("reconsideration never cancels committing or reconcile-required revision outcomes", async () => {
+  const { db, member, row, intents } = fixture();
+  row.reviewStatus = "REVISION_REQUESTED";
+  row.reviewComment = "Need revision";
+  row.reviewedAt = new Date("2026-08-21T14:00:00.000Z");
+  row.reviewDecisionRevision = 1;
+  row.telegramSourceAccountId = null;
+  row.telegramSourceUserId = null;
+  intents.splice(0, intents.length,
+    {
+      id: "revision-reconcile", agencyId: "agency-1", creatorId: "creator-1", customOrderId: row.customOrderId,
+      customSubmissionId: row.id, accountId: "tg-dead", kind: "REVISION_REQUEST", logicalKey: "reconcile-key", payloadFingerprint: "reconcile-fp", payload: {},
+      state: "RECONCILE_REQUIRED", claimRevision: 3, claimUntil: null, commitStartedAt: new Date("2026-08-21T14:01:00.000Z"),
+      remoteMessageId: null, remoteRecipientTelegramUserId: null, remoteSentAt: null, outcomeReason: "UNKNOWN_EXTERNAL_OUTCOME", confirmationAuthority: null,
+      confirmedAt: null, createdAt: new Date("2026-08-21T14:01:00.000Z"), updatedAt: new Date("2026-08-21T14:01:00.000Z"),
+    },
+  );
+  await assert.rejects(
+    () => reviewCustomContentSubmission({
+      agencyId: "agency-1", member, submissionId: row.id,
+      expectedCustomOrderId: row.customOrderId, expectedBindingRevision: 1, expectedReviewDecisionRevision: 1,
+      action: "RECONSIDER_APPROVE", supersessionReason: "PROVIDER_UNRECOVERABLE", db,
+    }),
+    (error) => error?.code === "CUSTOM_REVIEW_RECONSIDERATION_PROVIDER_NOT_BLOCKED",
+    "unknown external outcome must remain authoritative and cannot be superseded as provider-unrecoverable precommit work",
+  );
+  assert.equal(intents[0].state, "RECONCILE_REQUIRED");
+  assert.equal(intents[0].claimRevision, 3);
 });

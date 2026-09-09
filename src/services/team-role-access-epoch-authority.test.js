@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "team-administration-service.js"), "utf8");
+const agencyLifecycleSource = fs.readFileSync(path.join(__dirname, "agency-lifecycle-barrier-service.js"), "utf8");
 
 function bodyBetween(startMarker, endMarker) {
   const start = source.indexOf(startMarker);
@@ -27,7 +28,7 @@ test("role permission/access writes bump affected member accessEpoch inside the 
     ["async function resetRole", "async function deleteCustomRole"],
   ]) {
     const body = bodyBetween(start, end);
-    assert.match(body, /db\.\$transaction\(async \(tx\) =>/);
+    assert.match(body, /(?:db\.\$transaction\(async \(tx\) =>|serializableTeamTransaction\(db, async \(tx\) =>)/);
     assert.match(body, /bumpLiveRoleMemberAccessEpochs\(\{ tx, agencyId, roleKey: key \}\)/);
     assertBefore(body, "bumpLiveRoleMemberAccessEpochs", "publishRoleMemberAccessEpochs", "epoch invalidation must commit before publication");
   }
@@ -64,8 +65,11 @@ test("role lifecycle serializes assignment/invites against configuration writers
   assert.match(helper, /FOR UPDATE/);
   assert.match(helper, /FOR SHARE/);
   assert.match(helper, /AgencyCustomRole/);
-  assert.match(helper, /SELECT "id", "deletedAt" FROM "Agency"/);
-  assertBefore(helper, 'FROM "Agency"', 'FROM "AgencyCustomRole"', "stable Agency role root must be locked before custom role row");
+  assert.match(helper, /lockAgencyLifecycleBarrier/);
+  assert.match(helper, /team-role-lifecycle:/);
+  assertBefore(helper, "lockAgencyLifecycleBarrier", "lockDbAdvisoryXact", "Agency lifecycle barrier must precede role-local barrier");
+  assertBefore(helper, "lockDbAdvisoryXact", 'FROM "AgencyCustomRole"', "role-local barrier must precede custom role row lock");
+  assert.match(agencyLifecycleSource, /normalizedMode === "exclusive" \? "FOR UPDATE" : "FOR SHARE"/);
 
   const memberMutation = bodyBetween("async function updateMemberSettings", "async function setMemberStatus");
   const memberCommit = memberMutation.slice(memberMutation.indexOf("serializableTeamTransaction"));

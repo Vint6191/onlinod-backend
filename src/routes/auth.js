@@ -306,6 +306,15 @@ router.post("/register", async (req, res) => {
           source: "agency_created_after_audit15",
         },
       });
+      await tx.teamHistoricalAnalyticsCoverage.create({
+        data: {
+          agencyId: agency.id,
+          activityCoverageFrom: projectionCoverageFrom,
+          moneyCoverageFrom: projectionCoverageFrom,
+          source: "agency_created_after_phase2_history",
+          backfilledAt: projectionCoverageFrom,
+        },
+      });
 
       return { user, agency, member, invitationClaimed: false };
     });

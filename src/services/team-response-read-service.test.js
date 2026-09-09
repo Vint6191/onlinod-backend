@@ -15,6 +15,8 @@ function model(name, rows) {
 
 const member = { id: "member-a", displayName: "Marina", roleKey: "chatter", user: { name: "Marina" } };
 const prismaMock = {
+  systemSetting: { async findUnique() { return null; } },
+  teamProjectionCoverage: { async findUnique() { return { agencyId: "agency-1", responseCoverageFrom: new Date("2026-08-01T00:00:00Z"), dialogCoverageFrom: new Date("2026-08-01T00:00:00Z") }; } },
   teamResponseCase: model("response", [{
     id: "r1", creatorId: "creator-1", memberId: "member-a", member, dialogId: "fan-1", fanId: "fan-1",
     replyMessageId: "reply-1", firstIncomingMessageId: "incoming-1", incomingCount: 2,

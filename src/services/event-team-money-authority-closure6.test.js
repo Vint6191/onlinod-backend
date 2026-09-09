@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -11,6 +12,7 @@ const tipPath = require.resolve("./team-tip-ledger-service");
 
 function source(rel) { return fs.readFileSync(path.join(ROOT, rel), "utf8"); }
 function loadWithPrisma(fake) {
+  attachManagementAuthority(fake, { actor: phase2ManagerActor({ id: "manager-1", userId: "user-manager", creatorIds: ["creator-1"] }) });
   delete require.cache[tipPath];
   delete require.cache[prismaPath];
   require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: fake };
@@ -243,7 +245,7 @@ test("Closure6 ordinary 48h lock remains for non-senior or non-review manager_ov
   };
   const tips = loadWithPrisma(fake);
   const result = await tips.applyTipOverride({
-    agencyId: "agency-1", byMemberId: "manager-1", eventHash: "H-normal", action: "manager_override",
+    agencyId: "agency-1", byMemberId: "manager-1", byUserId: "user-manager", eventHash: "H-normal", action: "manager_override",
     targetMemberId: "member-B", reason: "normal old claim", senior: true, allowedCreatorIds: ["creator-1"],
   });
   assert.equal(result.ok, false);

@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { phase2AnalyticsFixture, attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 
 function listModel(rows) {
   return {
@@ -56,7 +57,7 @@ const activity = [{
 const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = {
   id: prismaPath, filename: prismaPath, loaded: true,
-  exports: {
+  exports: phase2AnalyticsFixture({
     agencyMember: listModel([member]),
     teamActivityEvent: listModel(activity),
     teamPpvPurchaseLedger: listModel([]),
@@ -68,7 +69,7 @@ require.cache[prismaPath] = {
         return { agencyId: "agency-1", responseCoverageFrom: new Date(now - 24 * 60 * minute), dialogCoverageFrom: new Date(now - 24 * 60 * minute) };
       },
     },
-  },
+  }),
 };
 const analytics = require("./team-analytics-service");
 

@@ -17,7 +17,7 @@ test("Agency soft-delete is serialized with Custom work and refuses active pipel
   const route = admin.slice(start, end);
 
   assert.match(route, /prisma\.\$transaction\s*\(\s*async\s*\(tx\)/);
-  assert.match(route, /lockAgencyPipelineLifecycle\(\{\s*db:\s*tx,\s*agencyId:\s*before\.id,\s*allowDeleted:\s*true\s*\}\)/);
+  assert.match(route, /lockAgencyPipelineLifecycleExclusive\(\{\s*db:\s*tx,\s*agencyId:\s*before\.id,\s*allowDeleted:\s*true\s*\}\)/);
   assert.match(route, /assertAgencyCustomPipelineRetirable\(\{\s*db:\s*tx,\s*agencyId:\s*before\.id\s*\}\)/);
   assert.match(route, /tx\.agency\.update\([\s\S]*deletedAt[\s\S]*status:\s*"LOCKED"/);
   assert.match(route, /tx\.refreshSession\.updateMany\([\s\S]*revokedAt:\s*deletedAt/);
@@ -32,18 +32,18 @@ test("every production NEW Custom/provider work origin takes the Agency lifecycl
 
   const orderCreate = orders.slice(orders.indexOf("async function createCustomOrder"), orders.indexOf("async function updateCustomOrder"));
   assert.match(orderCreate, /lockAgencyPipelineLifecycle\(\{\s*db:\s*tx,\s*agencyId\s*\}\)/);
-  assert.ok(orderCreate.indexOf("lockAgencyPipelineLifecycle") < orderCreate.indexOf("lockCreatorPipelineLifecycle"), "CustomOrder lock order must be Agency -> Creator");
+  assert.ok(orderCreate.indexOf("lockAgencyPipelineLifecycle") < orderCreate.indexOf("lockCreatorPipelineLifecycle"), "CustomOrder lock order must be Agency shared lifecycle barrier -> Creator");
   assert.ok(orderCreate.indexOf("lockCreatorPipelineLifecycle") < orderCreate.indexOf("tx.customOrder.create"), "CustomOrder create must happen after lifecycle locks");
 
   const manual = submissions.slice(submissions.indexOf("async function createCustomContentSubmission("), submissions.indexOf("async function createCustomContentSubmissionFromInboundEvent"));
   assert.match(manual, /lockAgencyPipelineLifecycle\(\{\s*db:\s*tx,\s*agencyId\s*\}\)/);
-  assert.ok(manual.indexOf("lockAgencyPipelineLifecycle") < manual.indexOf("lockCreatorPipelineLifecycle"), "historical import lock order must start Agency -> Creator");
+  assert.ok(manual.indexOf("lockAgencyPipelineLifecycle") < manual.indexOf("lockCreatorPipelineLifecycle"), "historical import lock order must start Agency shared lifecycle barrier -> Creator");
   assert.ok(manual.indexOf("lockCreatorPipelineLifecycle") < manual.indexOf("lockActiveTelegramAccountReference"), "historical import lock order must be Agency -> Creator -> TelegramAccount");
   assert.ok(manual.indexOf("lockActiveTelegramAccountReference") < manual.indexOf("tx.customContentSubmission.create"), "historical submission create must happen after lifecycle locks");
 
   const projected = submissions.slice(submissions.indexOf("async function createCustomContentSubmissionFromInboundEvent"), submissions.indexOf("async function assignCustomContentSubmission"));
   assert.match(projected, /lockAgencyPipelineLifecycle\(\{\s*db:\s*tx,\s*agencyId:\s*event\.agencyId\s*\}\)/);
-  assert.ok(projected.indexOf("lockAgencyPipelineLifecycle") < projected.indexOf("lockCreatorPipelineLifecycle"), "provider projection lock order must be Agency -> Creator");
+  assert.ok(projected.indexOf("lockAgencyPipelineLifecycle") < projected.indexOf("lockCreatorPipelineLifecycle"), "provider projection lock order must be Agency shared lifecycle barrier -> Creator");
   assert.ok(projected.indexOf("lockCreatorPipelineLifecycle") < projected.indexOf("tx.customContentSubmission.create"), "provider submission create must happen after lifecycle locks");
 
   const ingest = inbound.slice(inbound.indexOf("async function ingestTelegramInboundEvent"), inbound.indexOf("module.exports"));

@@ -2,11 +2,12 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 
 const prismaPath = require.resolve("../prisma");
 const servicePath = require.resolve("./team-ppv-ledger-service");
 
-function loadService() {
+function loadService({ liveCreatorIds = ["creator-1"] } = {}) {
   const state = {
     queryCount: 0,
     purchaseWrites: [],
@@ -60,6 +61,7 @@ function loadService() {
       async create({ data }) { state.activityRows.push(data); return { id: `event-${state.activityRows.length}`, ...data }; },
     },
   };
+  attachManagementAuthority(tx, { actor: phase2ManagerActor({ id: "manager-1", userId: "user-manager-1", creatorIds: liveCreatorIds }) });
   const prisma = {
     async $transaction(fn) { state.transactions += 1; return fn(tx); },
   };
@@ -78,7 +80,7 @@ test("PPV manager decisions require a real actor and reason before any DB write"
   assert.equal(noActor.code, "RESOLUTION_ACTOR_REQUIRED");
 
   const noReason = await service.resolvePpvConflict({
-    agencyId: "agency-1", jobId: "job-1", memberId: "chatter-1", actorMemberId: "manager-1", action: "assign", reason: "x",
+    agencyId: "agency-1", jobId: "job-1", memberId: "chatter-1", actorMemberId: "manager-1", actorMember: phase2ManagerActor({ id: "manager-1", userId: "user-manager-1", creatorIds: ["creator-1"] }), action: "assign", reason: "x",
   });
   assert.equal(noReason.code, "RESOLUTION_REASON_REQUIRED");
   assert.equal(state.transactions, 0);
@@ -91,6 +93,7 @@ test("PPV assign rejects a selected member that is not active in the same agency
     jobId: "job-1",
     memberId: "outside-agency-member",
     actorMemberId: "manager-1",
+    actorMember: phase2ManagerActor({ id: "manager-1", userId: "user-manager-1", creatorIds: ["creator-1"] }),
     action: "assign",
     reason: "Reviewed evidence",
   });
@@ -108,6 +111,7 @@ test("PPV assign keeps selected chatter separate from manager actor in immutable
     jobId: "job-1",
     memberId: "chatter-1",
     actorMemberId: "manager-1",
+    actorMember: phase2ManagerActor({ id: "manager-1", userId: "user-manager-1", creatorIds: ["creator-1"] }),
     action: "assign",
     reason: "Reviewed exact sent-message evidence",
     deviceId: "device-1",
@@ -130,6 +134,7 @@ test("PPV creator_revenue closes chatter attribution without inventing an owner"
     agencyId: "agency-1",
     jobId: "job-1",
     actorMemberId: "manager-1",
+    actorMember: phase2ManagerActor({ id: "manager-1", userId: "user-manager-1", creatorIds: ["creator-1"] }),
     action: "creator_revenue",
     reason: "No defensible chatter attribution",
     deviceId: "device-1",
@@ -144,12 +149,13 @@ test("PPV creator_revenue closes chatter attribution without inventing an owner"
 });
 
 test("PPV manager cannot resolve a conflict outside assigned creator scope", async () => {
-  const { service, state } = loadService();
+  const { service, state } = loadService({ liveCreatorIds: ["creator-2"] });
   const result = await service.resolvePpvConflict({
     agencyId: "agency-1",
     jobId: "job-1",
     memberId: "chatter-1",
     actorMemberId: "manager-1",
+    actorMember: phase2ManagerActor({ id: "manager-1", userId: "user-manager-1", creatorIds: ["creator-1"] }),
     action: "assign",
     reason: "Reviewed exact sent-message evidence",
     allowedCreatorIds: ["creator-2"],

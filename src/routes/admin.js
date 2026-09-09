@@ -69,6 +69,7 @@ const {
   assertAgencyCustomPipelineRetirable,
   assertCreatorCustomPipelineRetirable,
   lockAgencyPipelineLifecycle,
+  lockAgencyPipelineLifecycleExclusive,
   lockCreatorPipelineLifecycle,
 } = require("../services/custom-content-pipeline-authority-service");
 const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
@@ -650,7 +651,7 @@ router.delete("/agencies/:id", async (req, res) => {
         // future external effect. Serialize with NEW MASS creation and refuse to
         // destroy the only cancellation/reconciliation authority while such an
         // effect is pending or unknown.
-        await lockAgencyPipelineLifecycle({ db: tx, agencyId: before.id, allowDeleted: true });
+        await lockAgencyPipelineLifecycleExclusive({ db: tx, agencyId: before.id, allowDeleted: true });
         // Destructive history removal is allowed only after every live/unknown
         // Custom external-write authority has converged. Otherwise the Agency
         // cascade would erase AutomationDelivery evidence for a provider effect
@@ -679,11 +680,12 @@ router.delete("/agencies/:id", async (req, res) => {
 
     const deletedAt = new Date();
     const updated = await prisma.$transaction(async (tx) => {
-      // Agency retirement and every NEW durable Custom/source path share this
-      // parent row lock. If new work wins first it is visible to the blocker
-      // scan; if retirement wins first later work must fail closed or enter the
-      // explicit post-retirement provider-observation exception lane.
-      const lifecycle = await lockAgencyPipelineLifecycle({ db: tx, agencyId: before.id, allowDeleted: true });
+      // Agency retirement takes the lifecycle barrier exclusively while every NEW
+      // durable Custom/source path holds the same barrier in shared mode. If new work
+      // wins first it is visible to the blocker scan; if retirement wins first later
+      // work must fail closed or enter the explicit post-retirement provider-observation
+      // exception lane.
+      const lifecycle = await lockAgencyPipelineLifecycleExclusive({ db: tx, agencyId: before.id, allowDeleted: true });
       if (lifecycle.deletedAt) {
         return tx.agency.findUnique({ where: { id: before.id } });
       }
@@ -730,10 +732,19 @@ router.post("/agencies/:id/restore", async (req, res) => {
     if (!before) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
     if (!before.deletedAt) return res.status(409).json({ ok: false, code: "AGENCY_NOT_DELETED", error: "Agency is not deleted" });
 
-    const updated = await prisma.agency.update({
-      where: { id: before.id },
-      data: { deletedAt: null, deletedReason: null, status: "TRIAL" },
-    });
+    const updated = await prisma.$transaction(async (tx) => {
+      const lifecycle = await lockAgencyPipelineLifecycleExclusive({ db: tx, agencyId: before.id, allowDeleted: true });
+      if (!lifecycle.deletedAt) {
+        const error = new Error("Agency is not deleted");
+        error.code = "AGENCY_NOT_DELETED";
+        error.status = 409;
+        throw error;
+      }
+      return tx.agency.update({
+        where: { id: before.id },
+        data: { deletedAt: null, deletedReason: null, status: "TRIAL" },
+      });
+    }, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 120_000 });
 
     await adminLog(req, {
       agencyId: before.id,
@@ -745,6 +756,7 @@ router.post("/agencies/:id/restore", async (req, res) => {
 
     return res.json({ ok: true, agency: updated });
   } catch (err) {
+    if (err?.status && err?.code) return res.status(Number(err.status)).json({ ok: false, code: String(err.code), error: err.message || "Agency restore failed" });
     return res.status(500).json({ ok: false, code: "AGENCY_RESTORE_FAILED", error: err?.message || "Failed" });
   }
 });

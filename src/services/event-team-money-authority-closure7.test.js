@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -11,6 +12,7 @@ const tipPath = require.resolve("./team-tip-ledger-service");
 
 function source(rel) { return fs.readFileSync(path.join(ROOT, rel), "utf8"); }
 function loadWithPrisma(fake) {
+  attachManagementAuthority(fake, { actor: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }) });
   delete require.cache[tipPath];
   delete require.cache[prismaPath];
   require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: fake };

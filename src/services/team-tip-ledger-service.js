@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { classifySentSource } = require("./team-money-reconciliation-service");
 
@@ -459,7 +460,7 @@ async function createTipClaimNoticeEvents(tx, { agencyId, row, action, selectedM
   }
 }
 
-async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, action, targetMemberId, reason, senior = false, allowedCreatorIds = null }) {
+async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = null, eventHash, action, targetMemberId, reason, senior = false, allowedCreatorIds = null }) {
   const safeHash = clean(eventHash, 120);
   const cleanAction = clean(action, 24);
   if (!safeHash) return { ok: false, code: "TIP_NOT_FOUND" };
@@ -470,16 +471,32 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
     return { ok: false, code: "RESOLUTION_REASON_REQUIRED", error: "A reason of at least 3 characters is required" };
   }
 
-  const actor = await resolveMember({ agencyId, memberId: byMemberId, userId: byUserId });
-  if (!actor) return { ok: false, code: "ACTOR_NOT_AGENCY_MEMBER" };
+  const admittedActor = actorMember?.id && actorMember?.userId
+    ? actorMember
+    : { id: byMemberId || null, userId: byUserId || null, accessEpoch: actorMember?.accessEpoch ?? null };
 
   const outcome = await prisma.$transaction(async (tx) => {
     const row = await findTipLedgerForUpdate(tx, { agencyId, eventHash: safeHash });
     if (!row) return { code: "TIP_NOT_FOUND" };
-    if (!creatorAllowed(row.creatorId, allowedCreatorIds)) return { code: "CREATOR_ACCESS_FORBIDDEN" };
+    const permissionKey = cleanAction === "manager_override"
+      ? "money.override_attribution"
+      : (cleanAction === "release" ? "money.release_own_claim" : "money.claim");
+    let commit;
+    try {
+      commit = await assertManagementCommitAuthority({
+        tx, agencyId, actorMember: admittedActor, permissionKey, creatorIds: row.creatorId ? [row.creatorId] : [],
+      });
+    } catch (authorityError) {
+      if (authorityError?.code === "MANAGEMENT_CREATOR_SCOPE_REVOKED") return { code: "CREATOR_ACCESS_FORBIDDEN" };
+      if (["MANAGEMENT_ACCESS_REVOKED", "MANAGEMENT_PERMISSION_REVOKED", "MANAGEMENT_ACCESS_STALE"].includes(authorityError?.code)) {
+        return { code: "ACTOR_AUTHORITY_REVOKED", error: authorityError.message };
+      }
+      throw authorityError;
+    }
+    const actor = commit.member;
     if (!financiallyActive(row)) return { code: "TIP_FINANCIAL_REVERSED", error: "This tip was reversed in the financial ledger" };
     const migrationReview = isLegacyMigrationReviewRow(row);
-    const historicalManagerReview = cleanAction === "manager_override" && senior && migrationReview;
+    const historicalManagerReview = cleanAction === "manager_override" && migrationReview;
     if (isLocked(row) && !historicalManagerReview) return { code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
 
     let nextStatus = row.status;
@@ -506,9 +523,11 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, eventHash, act
       nextOwnerUserId = null;
       nextResolvedSource = "manual_chatter_release";
     } else if (cleanAction === "manager_override") {
-      if (!senior) return { code: "MANAGER_OVERRIDE_FORBIDDEN", error: "Only owner / manager / admin can apply manager_override" };
       if (targetMemberId) {
-        const target = await resolveMember({ agencyId, memberId: targetMemberId });
+        const target = await tx.agencyMember.findFirst({
+          where: { agencyId, id: clean(targetMemberId, 160), deletedAt: null, deactivatedAt: null },
+          select: { id: true, userId: true },
+        });
         if (!target) return { code: "TARGET_NOT_AGENCY_MEMBER" };
         nextStatus = "resolved";
         nextOwnerMemberId = target.id;
@@ -975,11 +994,13 @@ async function lockLegacyMoneyMigrationTable(tx) {
   }
 }
 
-async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, retentionDays = TIP_LEDGER_RETENTION_DAYS, dryRun = false, deleteLegacy = true } = {}) {
+async function migrateLegacyTipsToTipLedger({ agencyId = null, limit = 1000, retentionDays = TIP_LEDGER_RETENTION_DAYS, dryRun = false, deleteLegacy = true, now = new Date() } = {}) {
   const cleanAgency = clean(agencyId, 160);
   const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
   const safeRetentionDays = Math.max(1, int(retentionDays, TIP_LEDGER_RETENTION_DAYS));
-  const cutoff = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
+  const authorityNow = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(authorityNow.getTime())) throw new Error("TEAM_TIP_MIGRATION_AUTHORITY_TIME_INVALID");
+  const cutoff = new Date(authorityNow.getTime() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
   try {
     return await prisma.$transaction(async (tx) => {
@@ -1418,14 +1439,18 @@ async function repairMigratedLegacyTipManualAuthority({ agencyId = null, limit =
   }
 }
 
-async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDGER_RETENTION_DAYS, limit = 5000, dryRun = false } = {}) {
+async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDGER_RETENTION_DAYS, limit = 5000, dryRun = false, now = new Date() } = {}) {
   const cleanAgency = clean(agencyId, 160);
   const safeRetentionDays = Math.max(1, int(retentionDays, TIP_LEDGER_RETENTION_DAYS));
   const safeLimit = Math.min(20000, Math.max(1, int(limit, 5000)));
-  const cutoff = new Date(Date.now() - safeRetentionDays * 24 * 60 * 60 * 1000);
+  const authorityNow = now instanceof Date ? now : new Date(now);
+  if (!Number.isFinite(authorityNow.getTime())) throw new Error("TEAM_TIP_RETENTION_AUTHORITY_TIME_INVALID");
+  const cutoff = new Date(authorityNow.getTime() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
   const where = {
     receivedAt: { lt: cutoff },
+    historicalFactVersion: "team_money_fact_v1",
+    historicalFactProjectedAt: { not: null },
     ...(cleanAgency ? { agencyId: cleanAgency } : {}),
   };
 

@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { phase2AnalyticsFixture, attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 
 function listModel(rows) {
   return {
@@ -48,7 +49,7 @@ const prismaMock = {
   },
 };
 const prismaPath = require.resolve("../prisma");
-require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: prismaMock };
+require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(prismaMock) };
 const analytics = require("./team-analytics-service");
 
 test("Team overview computes exact median/P90 from response cases instead of aggregating member medians", async () => {

@@ -71,6 +71,10 @@ function makeDb({ withRoot = true } = {}) {
 
   const db = {
     $transaction: async (fn) => fn(db),
+    agency: {
+      findUnique: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null,
+      findFirst: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null,
+    },
     agencyMember: {
       findFirst: async ({ where }) => {
         const row = members.get(where.id) || null;

@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { phase2AnalyticsFixture, attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 const fs = require("node:fs");
 const path = require("node:path");
 const { requireBoundAccessDevice } = require("../utils/device-binding");
@@ -66,7 +67,7 @@ function emptyCorePrisma({ activity = [], coverageFrom = new Date("2026-08-01T00
 function loadAnalytics(prisma) {
   delete require.cache[analyticsPath];
   delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: prisma };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(prisma) };
   return require(analyticsPath);
 }
 
@@ -117,7 +118,7 @@ function moneyPrisma({ canonicalUndo = false } = {}) {
 function loadTipLedger(prisma) {
   delete require.cache[tipLedgerPath];
   delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: prisma };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(prisma) };
   return require(tipLedgerPath);
 }
 

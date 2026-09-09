@@ -9,6 +9,7 @@ const {
   withCustomExecutionDefaultsLock,
   vaultSettlementFingerprint,
   lockAgencyPipelineLifecycle,
+  lockAgencyPipelineLifecycleExclusive,
   lockCreatorPipelineLifecycle,
   withSubmissionPipelineLock,
   creatorCustomPipelineBlockers,
@@ -419,12 +420,26 @@ test("creator retirement blocks confirmed TASK history whose cancelled-order fol
   assert.equal(result.total, 1);
 });
 
-test("agency lifecycle fence serializes parent retirement with NEW Custom work", async () => {
-  let sql = "";
-  const db = { $queryRawUnsafe: async (query, id) => { sql = String(query); return [{ id, deletedAt: null, status: "ACTIVE" }]; } };
+test("agency lifecycle fence uses shared advisory barrier for normal work and exclusive barrier for lifecycle mutation", async () => {
+  const execute = [];
+  let selectSql = "";
+  const db = {
+    $executeRawUnsafe: async (query, key) => { execute.push({ sql: String(query), key }); return 0; },
+    $queryRawUnsafe: async (query, id) => { selectSql = String(query); return [{ id, deletedAt: null, status: "ACTIVE" }]; },
+  };
   const row = await lockAgencyPipelineLifecycle({ db, agencyId: "agency-1" });
   assert.equal(row.id, "agency-1");
-  assert.match(sql, /FROM "Agency"[\s\S]*FOR UPDATE/);
+  assert.equal(execute.length, 1);
+  assert.match(execute[0].sql, /pg_advisory_xact_lock_shared/);
+  assert.equal(execute[0].key, "agency-lifecycle:agency-1");
+  assert.match(selectSql, /FROM "Agency"/);
+  assert.doesNotMatch(selectSql, /FOR UPDATE/);
+
+  execute.length = 0;
+  await lockAgencyPipelineLifecycleExclusive({ db, agencyId: "agency-1", allowDeleted: true });
+  assert.equal(execute.length, 1);
+  assert.match(execute[0].sql, /pg_advisory_xact_lock\(/);
+  assert.doesNotMatch(execute[0].sql, /_shared/);
 
   db.$queryRawUnsafe = async (_query, id) => [{ id, deletedAt: new Date(), status: "LOCKED" }];
   await assert.rejects(() => lockAgencyPipelineLifecycle({ db, agencyId: "agency-1" }), (error) => error?.code === "AGENCY_RETIRED" && error?.status === 409);

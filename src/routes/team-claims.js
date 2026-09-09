@@ -20,6 +20,8 @@ const {
 const { reconcileHistoricalTeamMoneyBatch } = require("../services/team-money-reconciliation-service");
 const prisma = require("../prisma");
 const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-capabilities");
+const { getRetentionSettings } = require("../services/retention-service");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
 
 const router = express.Router();
 
@@ -53,7 +55,7 @@ async function loadActorMember(req) {
   if (!req.auth?.agencyId || !req.auth?.userId) return null;
   return prisma.agencyMember.findFirst({
     where: { agencyId: req.auth.agencyId, userId: req.auth.userId, deletedAt: null, deactivatedAt: null },
-    select: { id: true, agencyId: true, userId: true, roleKey: true, role: true, permissions: true, assignedCreators: true },
+    select: { id: true, agencyId: true, userId: true, roleKey: true, role: true, permissions: true, assignedCreators: true, accessEpoch: true },
   });
 }
 
@@ -274,6 +276,7 @@ router.post("/override", async (req, res) => {
       agencyId: req.auth.agencyId,
       byUserId: req.auth.userId,
       byMemberId: actor.id,
+      actorMember: actor,
       eventHash: input.eventHash,
       action: input.action,
       targetMemberId: input.targetMemberId,
@@ -288,7 +291,7 @@ router.post("/override", async (req, res) => {
 
     if (!result.ok) {
       const status = result.code === "ATTRIBUTION_LOCKED" ? 409
-                   : result.code === "CREATOR_ACCESS_FORBIDDEN" ? 403
+                   : result.code === "CREATOR_ACCESS_FORBIDDEN" || result.code === "ACTOR_AUTHORITY_REVOKED" ? 403
                    : result.code === "NOT_OWNER" || result.code === "CLAIM_NOT_ELIGIBLE" || result.code === "TIP_CONFLICT_MANAGER_REQUIRED" || result.code === "PPV_CLAIMS_MOVED_TO_LEDGER" ? 403
                    : result.code === "ATTRIBUTION_NOT_FOUND" || result.code === "TIP_NOT_FOUND" ? 404
                    : 400;
@@ -490,7 +493,16 @@ router.post("/sweep", async (req, res) => {
   try {
     const member = await requireClaimsCapability(req, res, TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION);
     if (!member) return;
-    const retentionDays = Math.min(730, Math.max(1, Number(req.query.retentionDays || req.body?.retentionDays || 180)));
+    const retentionPolicy = await getRetentionSettings();
+    if (retentionPolicy?.ok !== true) {
+      return res.status(503).json({
+        ok: false,
+        code: "TEAM_RETENTION_POLICY_UNAVAILABLE",
+        error: "Team retention policy is unavailable",
+      });
+    }
+    const retentionDays = Number(retentionPolicy.settings?.teamMoneyRawDetailDays || 180);
+    const retentionAuthorityNow = await dbAuthorityNow({ db: prisma });
     const limit = Math.min(20000, Math.max(1, Number(req.query.limit || req.body?.limit || 5000)));
     const dryRun = String(req.query.dryRun || req.body?.dryRun || "").toLowerCase() === "true";
 
@@ -508,6 +520,7 @@ router.post("/sweep", async (req, res) => {
       retentionDays,
       dryRun,
       deleteLegacy: true,
+      now: retentionAuthorityNow,
     });
     const canonicalMoneyBackfill = dryRun
       ? { ok: true, skipped: true, reason: "DRY_RUN" }
@@ -516,6 +529,7 @@ router.post("/sweep", async (req, res) => {
           saleLimit: Math.min(1000, limit),
           tipLimit: Math.min(1000, limit),
           retentionDays,
+          now: retentionAuthorityNow,
         });
     const legacyLocks = await sweepLocks({ agencyId: req.auth.agencyId });
 
@@ -525,18 +539,21 @@ router.post("/sweep", async (req, res) => {
         retentionDays,
         limit,
         dryRun,
+        now: retentionAuthorityNow,
       }),
       purgeExpiredLegacyAttributions({
         agencyId: req.auth.agencyId,
         retentionDays,
         limit,
         dryRun,
+        now: retentionAuthorityNow,
       }),
     ]);
 
     return res.json({
       ok: Boolean(legacyManualRepair?.ok && legacyTipMigration?.ok && tipLedgerPurge?.ok && legacyAttributionPurge?.ok),
       retentionDays,
+      retentionPolicySource: retentionPolicy.source || "db",
       dryRun,
       legacyManualRepair,
       legacyTipMigration,
