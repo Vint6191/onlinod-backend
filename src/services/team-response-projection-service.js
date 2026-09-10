@@ -183,17 +183,20 @@ async function upsertDialogSession(row, db = prisma) {
   });
 }
 
-async function findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, db }) {
+async function findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, replyLedgerId = null, db }) {
+  const stableId = clean(replyLedgerId, 220);
   const row = await db.teamSentMessageLedger.findFirst({
     where: {
       agencyId,
       creatorId,
       dialogId,
-      sentAt: { lt: replyAt },
       source: { in: ["manual", "manual_chat"] },
+      OR: stableId
+        ? [{ sentAt: { lt: replyAt } }, { sentAt: replyAt, id: { lt: stableId } }]
+        : [{ sentAt: { lt: replyAt } }],
       ...(replyMessageId ? { NOT: { messageId: replyMessageId } } : {}),
     },
-    orderBy: { sentAt: "desc" },
+    orderBy: [{ sentAt: "desc" }, { id: "desc" }],
   });
   return row || null;
 }
@@ -223,7 +226,7 @@ async function findIncomingEpisode({ agencyId, creatorId, dialogId, fromExclusiv
   }
   const rows = await db.teamActivityEvent.findMany({
     where: { agencyId, creatorId, dialogId, eventKind: "FAN_MESSAGE_RECEIVED", ts: { gt: floor, lte: replyAt } },
-    orderBy: { ts: "asc" },
+    orderBy: [{ ts: "asc" }, { id: "asc" }],
   });
   const out = []; const seen = new Set();
   for (const row of Array.isArray(rows) ? rows : []) {
@@ -246,7 +249,7 @@ async function findCoverageAt({ agencyId, creatorId, memberId, at, db }) {
       },
       OR: [{ endedAt: null }, { endedAt: { gte: at } }],
     },
-    orderBy: { startedAt: "desc" },
+    orderBy: [{ startedAt: "desc" }, { id: "desc" }],
   });
 }
 
@@ -258,7 +261,7 @@ async function findCoverageStartedAfter({ agencyId, creatorId, memberId, after, 
       memberId,
       startedAt: { gt: after, lte: before },
     },
-    orderBy: { startedAt: "asc" },
+    orderBy: [{ startedAt: "asc" }, { id: "asc" }],
   });
 }
 
@@ -274,7 +277,7 @@ async function findOtherCoverageAt({ agencyId, creatorId, memberId, at, db }) {
       },
       OR: [{ endedAt: null }, { endedAt: { gte: at } }],
     },
-    orderBy: { startedAt: "desc" },
+    orderBy: [{ startedAt: "desc" }, { id: "desc" }],
   });
 }
 
@@ -288,7 +291,7 @@ async function findSeenAt({ agencyId, creatorId, dialogId, memberId, incomingAt,
       eventKind: "DIALOG_SEEN",
       ts: { gte: incomingAt, lte: replyAt },
     },
-    orderBy: { ts: "asc" },
+    orderBy: [{ ts: "asc" }, { id: "asc" }],
   });
   return dateOrNull(row?.ts);
 }
@@ -304,7 +307,7 @@ async function deriveResponseCaseForReplyUnlocked(reply, db = prisma, options = 
     return null;
   }
 
-  const previousReply = await findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, db });
+  const previousReply = await findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, replyLedgerId: clean(reply?.id, 220), db });
   const incoming = await findIncomingEpisode({
     agencyId,
     creatorId,
@@ -539,7 +542,7 @@ async function recomputeNextReplyForObservation(row, db = prisma) {
       source: { in: ["manual", "manual_chat"] },
       sentAt: { gte: after, lte: new Date(after.getTime() + RESPONSE_LOOKBACK_MS) },
     },
-    orderBy: { sentAt: "asc" },
+    orderBy: [{ sentAt: "asc" }, { id: "asc" }],
   });
   return reply ? deriveResponseCaseForReply(reply, db) : null;
 }
@@ -550,8 +553,15 @@ async function recomputeSuccessorReply(reply, db = prisma) {
   const dialogId = clean(reply?.dialogId || reply?.fanId,160);
   const sentAt = dateOrNull(reply?.sentAt);
   if (!agencyId || !creatorId || !dialogId || !sentAt) return null;
+  const stableId = clean(reply?.id, 220);
+  const upper = new Date(sentAt.getTime() + RESPONSE_LOOKBACK_MS);
   const successor = await db.teamSentMessageLedger.findFirst({
-    where: { agencyId, creatorId, dialogId, source: { in: ["manual","manual_chat"] }, sentAt: { gt: sentAt, lte: new Date(sentAt.getTime() + RESPONSE_LOOKBACK_MS) } },
+    where: {
+      agencyId, creatorId, dialogId, source: { in: ["manual","manual_chat"] },
+      OR: stableId
+        ? [{ sentAt: { gt: sentAt, lte: upper } }, { sentAt, id: { gt: stableId } }]
+        : [{ sentAt: { gt: sentAt, lte: upper } }],
+    },
     orderBy: [{ sentAt: "asc" }, { id: "asc" }],
   });
   return successor ? deriveResponseCaseForReply(successor, db) : null;

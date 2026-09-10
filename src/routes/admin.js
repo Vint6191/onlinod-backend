@@ -75,10 +75,10 @@ const {
 const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const {
-  collectCreatorPhase2DestructiveScope,
   purgeAgencyPhase2ProviderLedgersForHardDelete,
-  purgeCreatorPhase2ResidualsForHardDelete,
+  purgeAgencyPhase2CurrentWorkRootsAfterCascade,
 } = require("../services/phase2-destructive-delete-authority-service");
+const { publishDomainWork, WORK_CLASS: PHASE2_WORK_CLASS } = require("../services/domain-work-authority-service");
 
 const router = express.Router();
 
@@ -670,6 +670,11 @@ router.delete("/agencies/:id", async (req, res) => {
         // the purge back together with the Agency deletion.
         await purgeAgencyPhase2ProviderLedgersForHardDelete({ db: tx, agencyId: before.id });
         await tx.agency.delete({ where: { id: before.id } });
+        // DomainWorkItem cascades fire AFTER DELETE maintenance triggers. Those
+        // triggers may recreate zero-count Phase2WorkFamilyState/Ready* rows while
+        // the Agency delete statement is running, so remove those non-FK current
+        // roots only after the cascade has fully completed, in the same TX.
+        await purgeAgencyPhase2CurrentWorkRootsAfterCascade({ db: tx, agencyId: before.id });
       });
       await adminLog(req, {
         agencyId: before.id,
@@ -1612,24 +1617,39 @@ router.delete("/creators/:id", async (req, res) => {
     await prisma.$transaction(async (tx) => {
       await lockAgencyBillingMutation(tx, before.agencyId);
     if (hard) {
-      // History destruction is explicit, but pending/unknown MASS is a future
-      // provider effect. Never erase its cancellation/reconciliation authority.
+      // Actual53/F53-12: a hard Creator removal is a durable lifecycle, not one
+      // all-history transaction. First establish the DELETING barrier and revoke
+      // live crypto/session authority, then publish one restartable bounded cleanup
+      // work item in the SAME transaction. The worker rechecks UNKNOWN external
+      // effects before every chunk and performs the final identity delete only after
+      // current/proof/cascade roots reach zero.
       await lockCreatorPipelineLifecycle({ db: tx, agencyId: before.agencyId, creatorId: before.id, allowDeleted: true });
-      // Hard delete may erase terminal Custom history, but it must never erase
-      // the only ledger for an active/COMMITTING/unknown provider write.
       await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
       await assertCreatorMassCampaignRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id, requireFreshProviderSnapshot: !before.deletedAt });
-      // Capture exact non-FK Phase 2 identities before the Creator cascade. The
-      // destructive purge itself happens only after CreatorAccount.delete succeeds,
-      // so a restrictive cascade failure cannot pre-delete provider evidence. The
-      // final cleanup also removes DomainWork/dependency rows published by DELETE
-      // triggers during the cascade; those rows are Agency-scoped and would otherwise
-      // survive a hard Creator deletion as permanently orphaned executable work.
-      const hardDeleteScope = await collectCreatorPhase2DestructiveScope({
-        db: tx, agencyId: before.agencyId, creatorId: before.id,
+      if (!before.deletedAt) {
+        await retireCreatorCryptoMaterialOnRemoval({
+          db: tx,
+          agencyId: before.agencyId,
+          creatorId: before.id,
+          retiredAt: deletedAt,
+          actorUserId: null,
+          sourceRequestId: `admin-creator-hard-removal:${before.id}:${deletedAt.getTime()}`,
+          revokeReason: "ADMIN_CREATOR_HARD_DELETE_PENDING",
+        });
+        await tx.creatorAccount.update({ where: { id: before.id }, data: { deletedAt, status: "DISABLED" } });
+      }
+      await publishDomainWork({
+        db: tx,
+        agencyId: before.agencyId,
+        workClass: PHASE2_WORK_CLASS.DESTRUCTIVE_CREATOR_CLEANUP,
+        objectType: "Phase2CreatorDestructiveCleanup",
+        objectId: before.id,
+        partitionKey: before.id,
+        // Deliberately NULL: creator-scoped residual cleanup must not delete the
+        // cleanup authority that is performing that cleanup.
+        creatorId: null,
+        availableAt: deletedAt,
       });
-      await tx.creatorAccount.delete({ where: { id: before.id } });
-      await purgeCreatorPhase2ResidualsForHardDelete({ db: tx, scope: hardDeleteScope });
     } else {
       await lockCreatorPipelineLifecycle({ db: tx, agencyId: before.agencyId, creatorId: before.id, allowDeleted: true });
       await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
@@ -1668,18 +1688,23 @@ router.delete("/creators/:id", async (req, res) => {
 
   await adminLog(req, {
     agencyId: before.agencyId,
-    action: hard ? "admin.creator_hard_deleted" : "admin.creator_soft_deleted",
+    action: hard ? "admin.creator_hard_delete_scheduled" : "admin.creator_soft_deleted",
     targetType: "creator",
     targetId: before.id,
     before, after: null,
     reason: String(req.query.reason || req.body?.reason || "admin cleanup"),
   });
-  return res.json({
-    ok: true,
-    hard,
-    deleted: before,
-    ...(hard ? { destructive: true, customsHistoryDeletedByCascade: true } : { historyPreserved: true }),
-  });
+  if (hard) {
+    return res.status(202).json({
+      ok: true,
+      hard: true,
+      pending: true,
+      deleting: before,
+      destructive: true,
+      cleanupAuthority: "DESTRUCTIVE_CREATOR_CLEANUP",
+    });
+  }
+  return res.json({ ok: true, hard: false, deleted: before, historyPreserved: true });
 });
 
 

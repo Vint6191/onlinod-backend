@@ -34,6 +34,42 @@ const GENERATION = Object.freeze({
 
 const ENUMERATION = Object.freeze({ PENDING: "PENDING", RUNNING: "RUNNING", COMPLETE: "COMPLETE", FAILED: "FAILED" });
 
+const LIVE_WORK_CLASS_BY_FAMILY = Object.freeze({
+  [FAMILY.CUSTOM_SOURCE_PIPELINE]: "CUSTOM_SOURCE_PIPELINE",
+  [FAMILY.TEAM_RESPONSE_RANGE_REPAIR]: "TEAM_RESPONSE_RANGE_REPAIR",
+  [FAMILY.TEAM_DIALOG_PROJECTION]: "TEAM_DIALOG_PROJECTION",
+  [FAMILY.TEAM_MONEY_ROOT_CLASSIFICATION]: "TEAM_MONEY_RECONCILIATION",
+  [FAMILY.TEAM_MONEY_RECONCILIATION]: "TEAM_MONEY_RECONCILIATION",
+  [FAMILY.TEAM_READ_SUMMARY]: "TEAM_READ_SUMMARY",
+  [FAMILY.TELEGRAM_CONFIRMED_PROJECTION]: "TELEGRAM_CONFIRMED_PROJECTION",
+  [FAMILY.TELEGRAM_INBOUND_PROJECTION]: "TELEGRAM_INBOUND_PROJECTION",
+  [FAMILY.CUSTOM_EXTERNAL_PROJECTION]: "CUSTOM_EXTERNAL_PROJECTION",
+});
+
+async function assertCoverageMutationClaim({ tx, workItem = null, ownerToken = null, fallbackNow = new Date() } = {}) {
+  if (!workItem) return { guarded: false, current: true };
+  const { lockDomainWorkClaimForCommit } = require("./domain-work-authority-service");
+  const claim = await lockDomainWorkClaimForCommit({
+    db: tx, item: workItem, ownerToken, fallbackNow,
+  });
+  if (!claim?.current || claim?.lost) {
+    const error = new Error("Historical coverage mutation lost DomainWork ownership");
+    error.code = "PHASE2_COVERAGE_WORK_OWNERSHIP_LOST";
+    error.status = 409;
+    error.lostOwnership = true;
+    throw error;
+  }
+  if (claim?.newerRevision) {
+    const error = new Error("Historical coverage mutation was superseded by a newer work revision");
+    error.code = "PHASE2_COVERAGE_WORK_REVISION_SUPERSEDED";
+    error.status = 409;
+    error.lostOwnership = true;
+    throw error;
+  }
+  return { guarded: true, current: true, claim };
+}
+
+
 function clean(value, max = 240) {
   const out = String(value ?? "").trim();
   return out ? out.slice(0, max) : null;
@@ -112,10 +148,11 @@ async function requestPhase2CoverageEnumeration({ db = null, agencyId, family, g
   return { ok: true, requested: true, inFlight: false, coverage, work };
 }
 
-async function markPhase2CoverageRunning({ db = null, agencyId, family, generation, enumeratedThrough = undefined, sourceWatermark = undefined } = {}) {
+async function markPhase2CoverageRunning({ db = null, agencyId, family, generation, enumeratedThrough = undefined, sourceWatermark = undefined, workItem = null, ownerToken = null, fallbackNow = new Date() } = {}) {
   if (!db) db = require("../prisma");
   const identity = normalizeIdentity({ agencyId, family, generation });
   return runDbTransaction(db, async (tx) => {
+    await assertCoverageMutationClaim({ tx, workItem, ownerToken, fallbackNow });
     await ensurePhase2Coverage({ db: tx, ...identity, sourceWatermark });
     const data = { enumerationState: ENUMERATION.RUNNING, active: false, completedAt: null };
     if (enumeratedThrough !== undefined) data.enumeratedThrough = clean(enumeratedThrough, 500);
@@ -124,10 +161,11 @@ async function markPhase2CoverageRunning({ db = null, agencyId, family, generati
   });
 }
 
-async function markPhase2CoverageComplete({ db = null, agencyId, family, generation, enumeratedThrough = null, projectedThrough = null, unresolvedCount = 0, sourceWatermark = undefined, fallbackNow = new Date() } = {}) {
+async function markPhase2CoverageComplete({ db = null, agencyId, family, generation, enumeratedThrough = null, projectedThrough = null, unresolvedCount = 0, sourceWatermark = undefined, fallbackNow = new Date(), workItem = null, ownerToken = null } = {}) {
   if (!db) db = require("../prisma");
   const identity = normalizeIdentity({ agencyId, family, generation });
   return runDbTransaction(db, async (tx) => {
+    await assertCoverageMutationClaim({ tx, workItem, ownerToken, fallbackNow });
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     await ensurePhase2Coverage({ db: tx, ...identity, sourceWatermark });
     const data = {
@@ -140,22 +178,55 @@ async function markPhase2CoverageComplete({ db = null, agencyId, family, generat
   });
 }
 
-async function markPhase2CoverageFailed({ db = null, agencyId, family, generation, enumeratedThrough = undefined, unresolvedCount = 1 } = {}) {
+async function markPhase2CoverageFailed({ db = null, agencyId, family, generation, enumeratedThrough = undefined, unresolvedCount = 1, workItem = null, ownerToken = null, fallbackNow = new Date() } = {}) {
   if (!db) db = require("../prisma");
   const identity = normalizeIdentity({ agencyId, family, generation });
-  await ensurePhase2Coverage({ db, ...identity });
-  const data = { active: false, enumerationState: ENUMERATION.FAILED, completedAt: null, unresolvedCount: Math.max(1, Math.floor(Number(unresolvedCount) || 1)) };
-  if (enumeratedThrough !== undefined) data.enumeratedThrough = clean(enumeratedThrough, 500);
-  return db.phase2WorkCoverage.update({ where: identityWhere(identity), data });
+  return runDbTransaction(db, async (tx) => {
+    await assertCoverageMutationClaim({ tx, workItem, ownerToken, fallbackNow });
+    await ensurePhase2Coverage({ db: tx, ...identity });
+    const data = { active: false, enumerationState: ENUMERATION.FAILED, completedAt: null, unresolvedCount: Math.max(1, Math.floor(Number(unresolvedCount) || 1)) };
+    if (enumeratedThrough !== undefined) data.enumeratedThrough = clean(enumeratedThrough, 500);
+    return tx.phase2WorkCoverage.update({ where: identityWhere(identity), data });
+  });
 }
 
 async function phase2CoverageStatus({ db = null, agencyId, family, generation } = {}) {
   if (!db) db = require("../prisma");
   const identity = normalizeIdentity({ agencyId, family, generation });
   const row = await db?.phase2WorkCoverage?.findUnique?.({ where: identityWhere(identity) });
-  if (!row) return { ready: false, state: "MISSING", row: null };
-  const ready = row.active === true && String(row.enumerationState || "") === ENUMERATION.COMPLETE && row.completedAt != null;
-  return { ready, state: String(row.enumerationState || "UNKNOWN"), row };
+  if (!row) {
+    return { ready: false, historicalReady: false, currentReady: false, fresh: false, state: "MISSING", semanticState: "UNKNOWN", row: null, live: null };
+  }
+  const historicalReady = row.active === true && String(row.enumerationState || "") === ENUMERATION.COMPLETE && row.completedAt != null;
+  const workClass = LIVE_WORK_CLASS_BY_FAMILY[identity.family] || null;
+  let live = null;
+  let fresh = historicalReady;
+  if (workClass) {
+    try {
+      const { domainWorkFamilyState } = require("./domain-work-authority-service");
+      live = await domainWorkFamilyState({ db, agencyId: identity.agencyId, workClass });
+      fresh = historicalReady && live?.fresh === true;
+    } catch (_) {
+      fresh = false;
+      live = { fresh: false, outstandingCount: null, state: "UNKNOWN" };
+    }
+  }
+  const currentReady = historicalReady && fresh;
+  const semanticState = !historicalReady
+    ? (String(row.enumerationState || "") === ENUMERATION.FAILED ? "PARTIAL" : "TRANSITION")
+    : currentReady ? "CURRENT_FRESH" : "CURRENT_STALE";
+  return {
+    // `ready` is retained as historical-enumeration compatibility. New current readers
+    // must use currentReady/fresh; historical coverage is never live convergence proof.
+    ready: historicalReady,
+    historicalReady,
+    currentReady,
+    fresh,
+    state: String(row.enumerationState || "UNKNOWN"),
+    semanticState,
+    row,
+    live,
+  };
 }
 
 async function requirePhase2CoverageReady({ db = null, agencyId, family, generation, code = "PHASE2_COVERAGE_INCOMPLETE" } = {}) {
@@ -168,7 +239,7 @@ async function requirePhase2CoverageReady({ db = null, agencyId, family, generat
 }
 
 module.exports = {
-  FAMILY, GENERATION, ENUMERATION, coverageId,
+  FAMILY, GENERATION, ENUMERATION, LIVE_WORK_CLASS_BY_FAMILY, coverageId,
   ensurePhase2Coverage, requestPhase2CoverageEnumeration, markPhase2CoverageRunning, markPhase2CoverageComplete, markPhase2CoverageFailed,
   phase2CoverageStatus, requirePhase2CoverageReady,
 };

@@ -37,9 +37,8 @@ test("historical sales/tips are enumerated per agency in bounded pages and publi
 
 test("historical enumeration does not activate until exact money work has converged", () => {
   const body = functionBlock("runTeamMoneyReconciliationCoverageEnumerationUnit", "runTeamReadSummaryCoverageEnumerationUnit");
-  assert.match(body, /workClass"='TEAM_MONEY_RECONCILIATION'/);
-  assert.match(body, /requestedRevision/);
-  assert.match(body, /completedRevision/);
+  assert.match(body, /hasOutstandingDomainWork/);
+  assert.match(body, /PHASE2_WORK_CLASS\.TEAM_MONEY_RECONCILIATION/);
   assert.match(body, /if \(outstanding\)/);
   assert.ok(body.indexOf("if (outstanding)") < body.indexOf("markPhase2CoverageComplete"));
 });

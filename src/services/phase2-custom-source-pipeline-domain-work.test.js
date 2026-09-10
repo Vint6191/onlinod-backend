@@ -52,14 +52,17 @@ test("A43 creator/account/config dependencies fan out to standalone submissions 
 });
 
 test("A43 historical standalone source enumeration is per-agency, bounded, resumable, and activation waits for convergence", () => {
-  assert.match(scheduler, /phase2_coverage_seed_v2/);
+  assert.match(scheduler, /PHASE2_COVERAGE_SEED_GENERATION/);
+  const manifest = fs.readFileSync(path.join(root, "src/services/phase2-coverage-manifest.js"), "utf8");
+  assert.match(manifest, /phase2_coverage_manifest_actual53_v1/);
+  assert.match(manifest, /CUSTOM_SOURCE_PIPELINE/);
   assert.match(scheduler, /PHASE2_COVERAGE_FAMILY\.CUSTOM_SOURCE_PIPELINE/);
   const enumeration = slice(scheduler, "async function runCustomSourcePipelineCoverageEnumerationUnit", "async function runTeamActivityCoverageEnumerationUnit");
   assert.match(enumeration, /agencyId:\s*String\(item\.agencyId\)/);
   assert.match(enumeration, /pipelineDisposition:\s*\{ in: \["ACTIVE", "SALVAGE"\] \}/);
   assert.match(enumeration, /orderBy:\s*\{ id: "asc" \}, take:\s*100/);
   assert.match(enumeration, /progressCursor:\s*\{ lastSubmissionId: nextCursor \}/);
-  assert.match(enumeration, /state" <> 'DONE'[\s\S]*requestedRevision" > w\."completedRevision"/);
+  assert.match(enumeration, /hasOutstandingDomainWork\(\{[\s\S]*CUSTOM_SOURCE_PIPELINE/);
   assert.match(enumeration, /projectedThrough:\s*"domain_work_converged"/);
 });
 

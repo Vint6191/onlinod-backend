@@ -35,7 +35,7 @@ test("reminder policies accept arbitrary user minute values and keep physical of
 
 test("call reminders are relative to scheduledAt while content repeats from delivery/creation seed", () => {
   const now = new Date("2026-08-19T12:00:00.000Z");
-  const policy = normalizeTelegramCustomReminders({ call: { offsetsMinutes: [47, 5] } });
+  const policy = normalizeTelegramCustomReminders({ call: { enabled: true, offsetsMinutes: [47, 5] } });
   const call = nextReminderForOrder({ status: "PENDING", type: "CALL", scheduledAt: new Date("2026-08-19T15:00:00.000Z"), reminderConfig: null }, policy, now);
   assert.equal(call.at.toISOString(), "2026-08-19T14:13:00.000Z");
   assert.match(call.key, /:47$/);

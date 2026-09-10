@@ -63,20 +63,32 @@ async function resolveDetailReadAuthority({ agencyId, rangeKey, family }) {
   };
 }
 
-async function responseProjectionAuthorityWhere({ agencyId, db = prisma, includeIncomplete = true } = {}) {
+async function responseProjectionAuthority({ agencyId, db = prisma, includeIncomplete = true } = {}) {
+  let dialog;
+  let response;
   try {
-    const [dialog, response] = await Promise.all([
+    [dialog, response] = await Promise.all([
       phase2CoverageStatus({ db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION }),
       phase2CoverageStatus({ db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR }),
     ]);
-    if (!dialog?.ready || !response?.ready) return {};
-    return {
+  } catch (_) {
+    dialog = { historicalReady: false, fresh: false, semanticState: "UNKNOWN" };
+    response = { historicalReady: false, fresh: false, semanticState: "UNKNOWN" };
+  }
+  const fresh = dialog?.currentReady === true && response?.currentReady === true;
+  return {
+    fresh,
+    state: !dialog?.historicalReady || !response?.historicalReady
+      ? "TRANSITION"
+      : fresh ? "CURRENT_FRESH" : "CURRENT_STALE",
+    dialog,
+    response,
+    // Current physical authority only. Never fail-open to compatibility rows.
+    where: {
       derivationVersion: CURRENT_RESPONSE_DERIVATION_VERSION,
       projectionState: includeIncomplete ? { in: ["FULL", "INCOMPLETE_HISTORY"] } : "FULL",
-    };
-  } catch (_) {
-    return {};
-  }
+    },
+  };
 }
 
 async function listTeamResponseCases({
@@ -90,7 +102,8 @@ async function listTeamResponseCases({
   const authority = await resolveDetailReadAuthority({ agencyId, rangeKey, family: "response" });
   const { range, retainedRange } = authority;
   const normalizedClassification = clean(classification, 32)?.toUpperCase() || null;
-  const generationWhere = await responseProjectionAuthorityWhere({ agencyId, db: prisma, includeIncomplete: true });
+  const projectionAuthority = await responseProjectionAuthority({ agencyId, db: prisma, includeIncomplete: true });
+  const generationWhere = projectionAuthority.where;
   const where = {
     agencyId,
     ...generationWhere,
@@ -113,6 +126,13 @@ async function listTeamResponseCases({
     creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
     retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
     coverage: authority.coverage,
+    projectionAuthority: {
+      state: projectionAuthority.state,
+      fresh: projectionAuthority.fresh === true,
+      dialogOutstanding: projectionAuthority.dialog?.live?.outstandingCount ?? null,
+      responseOutstanding: projectionAuthority.response?.live?.outstandingCount ?? null,
+      generation: CURRENT_RESPONSE_DERIVATION_VERSION,
+    },
     rows: (rows || []).map((row) => ({
       id: row.id,
       creatorId: row.creatorId,
@@ -138,6 +158,8 @@ async function listTeamResponseCases({
       sla5Pass: row.sla5Pass,
       sla15Pass: row.sla15Pass,
       derivationVersion: row.derivationVersion,
+      projectionState: row.projectionState || "UNKNOWN",
+      repairReason: row.repairReason || null,
     })),
   };
 }
@@ -235,7 +257,7 @@ async function listTeamCoverageSessions({
 }
 
 module.exports = {
-  CURRENT_RESPONSE_DERIVATION_VERSION, responseProjectionAuthorityWhere,
+  CURRENT_RESPONSE_DERIVATION_VERSION, responseProjectionAuthority,
   RESPONSE_CLASSIFICATIONS,
   listTeamResponseCases,
   listTeamDialogSessions,

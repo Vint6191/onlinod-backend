@@ -4,8 +4,8 @@ const { createHash, randomUUID } = require("node:crypto");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 
-const DOMAIN_WORK_GENERATION = "phase2_domain_work_v1";
-const DOMAIN_WORK_PROJECTION_VERSION = "phase2_domain_work_v1";
+const DOMAIN_WORK_GENERATION = "phase2_domain_work_v2_actual53";
+const DOMAIN_WORK_PROJECTION_VERSION = "phase2_domain_work_v2_actual53";
 const DEFAULT_LEASE_MS = 2 * 60 * 1000;
 const MAX_BATCH = 100;
 
@@ -23,6 +23,7 @@ const WORK_CLASS = Object.freeze({
   DEPENDENCY_FANOUT: "DEPENDENCY_FANOUT",
   HISTORICAL_ENUMERATION: "HISTORICAL_ENUMERATION",
   RETENTION: "RETENTION",
+  DESTRUCTIVE_CREATOR_CLEANUP: "DESTRUCTIVE_CREATOR_CLEANUP",
 });
 
 const STATE = Object.freeze({ READY: "READY", CLAIMED: "CLAIMED", BLOCKED: "BLOCKED", RECONCILE_REQUIRED: "RECONCILE_REQUIRED", DONE: "DONE" });
@@ -130,9 +131,9 @@ async function publishDomainWork({ db = null, ...input } = {}) {
     const rows = await db.$queryRawUnsafe(
       `INSERT INTO "DomainWorkItem"(
          "id","agencyId","workClass","objectType","objectId","parentObjectId","partitionKey","creatorId","accountId",
-         "requestedRevision","completedRevision","activeGeneration","projectionVersion","state","availableAt",
+         "requestedRevision","completedRevision","activeGeneration","projectionVersion","state","isOutstanding","availableAt",
          "dependencyKind","dependencyKey","dependencyRevision","createdAt","updatedAt"
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,0,$10,$11,'READY',$12,$13,$14,$15,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,0,$10,$11,'READY',TRUE,$12,$13,$14,$15,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
        ON CONFLICT ("agencyId","workClass","objectType","objectId") DO UPDATE SET
          "requestedRevision"="DomainWorkItem"."requestedRevision"+1,
          "parentObjectId"=COALESCE(EXCLUDED."parentObjectId","DomainWorkItem"."parentObjectId"),
@@ -143,6 +144,7 @@ async function publishDomainWork({ db = null, ...input } = {}) {
          "dependencyKey"=EXCLUDED."dependencyKey",
          "dependencyRevision"=GREATEST("DomainWorkItem"."dependencyRevision",EXCLUDED."dependencyRevision"),
          "state"=CASE WHEN "DomainWorkItem"."state"='CLAIMED' THEN 'CLAIMED' ELSE 'READY' END,
+         "isOutstanding"=TRUE,
          "availableAt"=LEAST("DomainWorkItem"."availableAt",EXCLUDED."availableAt"),
          "nextAttemptAt"=NULL,
          "progressCursor"=CASE WHEN "DomainWorkItem"."state"='CLAIMED' THEN "DomainWorkItem"."progressCursor" ELSE NULL END,
@@ -160,7 +162,7 @@ async function publishDomainWork({ db = null, ...input } = {}) {
   if (!existing) {
     return db.domainWorkItem.upsert({
       where: identityWhere(row),
-      create: { ...row, requestedRevision: 1n, completedRevision: 0n, state: STATE.READY, claimedRevision: 0n, claimFence: 0n },
+      create: { ...row, requestedRevision: 1n, completedRevision: 0n, state: STATE.READY, isOutstanding: true, claimedRevision: 0n, claimFence: 0n },
       update: {},
     });
   }
@@ -171,7 +173,7 @@ async function publishDomainWork({ db = null, ...input } = {}) {
       creatorId: row.creatorId || existing.creatorId || null, accountId: row.accountId || existing.accountId || null,
       dependencyKind: row.dependencyKind, dependencyKey: row.dependencyKey,
       dependencyRevision: row.dependencyRevision > asBigInt(existing.dependencyRevision) ? row.dependencyRevision : asBigInt(existing.dependencyRevision),
-      state: String(existing.state) === STATE.CLAIMED ? STATE.CLAIMED : STATE.READY,
+      state: String(existing.state) === STATE.CLAIMED ? STATE.CLAIMED : STATE.READY, isOutstanding: true,
       availableAt: asDate(existing.availableAt) && asDate(existing.availableAt) < row.availableAt ? existing.availableAt : row.availableAt,
       nextAttemptAt: null, progressCursor: String(existing.state) === STATE.CLAIMED ? existing.progressCursor ?? null : null,
       errorClass: null, lastError: null, terminalCause: null,
@@ -180,16 +182,70 @@ async function publishDomainWork({ db = null, ...input } = {}) {
 }
 
 
-async function legacyExecutorDrainStatus({ db, workClass }) {
+async function activeDomainWorkGeneration({ db, workClass, fallback = DOMAIN_WORK_GENERATION } = {}) {
+  const klass = clean(workClass, 120);
+  if (!klass) return clean(fallback, 120) || DOMAIN_WORK_GENERATION;
+  if (db?.phase2WorkGenerationAuthority?.findUnique) {
+    const row = await db.phase2WorkGenerationAuthority.findUnique({ where: { workClass: klass }, select: { activeGeneration: true } });
+    return clean(row?.activeGeneration, 120) || clean(fallback, 120) || DOMAIN_WORK_GENERATION;
+  }
+  if (typeof db?.$queryRawUnsafe === "function") {
+    try {
+      const rows = await db.$queryRawUnsafe(
+        `SELECT "activeGeneration" FROM "Phase2WorkGenerationAuthority" WHERE "workClass"=$1 LIMIT 1`,
+        klass,
+      );
+      return clean(rows?.[0]?.activeGeneration, 120) || clean(fallback, 120) || DOMAIN_WORK_GENERATION;
+    } catch (_) {}
+  }
+  return clean(fallback, 120) || DOMAIN_WORK_GENERATION;
+}
+
+async function domainWorkFamilyState({ db = null, agencyId, workClass } = {}) {
+  if (!db) db = require("../prisma");
+  const a = clean(agencyId, 180); const klass = clean(workClass, 120);
+  if (!a || !klass) return { fresh: false, outstandingCount: null, state: "UNKNOWN" };
+  let row = null;
+  if (db?.phase2WorkFamilyState?.findUnique) {
+    row = await db.phase2WorkFamilyState.findUnique({
+      where: { agencyId_workClass: { agencyId: a, workClass: klass } },
+    });
+  } else if (typeof db?.$queryRawUnsafe === "function") {
+    try {
+      const rows = await db.$queryRawUnsafe(
+        `SELECT * FROM "Phase2WorkFamilyState" WHERE "agencyId"=$1 AND "workClass"=$2 LIMIT 1`,
+        a, klass,
+      );
+      row = rows?.[0] || null;
+    } catch (_) {}
+  }
+  if (!row) return { fresh: true, outstandingCount: 0, state: "NO_LIVE_WORK", row: null };
+  const outstandingCount = Math.max(0, Number(row.outstandingCount || 0));
+  const requestedSequence = asBigInt(row.requestedSequence, 0n);
+  const convergedSequence = asBigInt(row.convergedSequence, 0n);
+  const fresh = outstandingCount === 0 && convergedSequence >= requestedSequence;
+  return {
+    fresh, outstandingCount, requestedSequence, convergedSequence,
+    state: fresh ? "FRESH" : "STALE", row,
+  };
+}
+
+async function hasOutstandingDomainWork({ db = null, agencyId, workClass } = {}) {
+  const status = await domainWorkFamilyState({ db, agencyId, workClass });
+  return status.outstandingCount == null ? null : status.outstandingCount > 0;
+}
+
+async function legacyExecutorDrainStatus({ db, workClass, fallbackNow = new Date() }) {
   const klass = clean(workClass, 120);
   if (!LEGACY_DRAIN_WORK_CLASSES.has(klass)) return { ready: true, lanes: [] };
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow });
 
   if (db?.phase2LegacyExecutorFence?.findMany && db?.maintenanceLaneState?.findMany) {
     const fences = await db.phase2LegacyExecutorFence.findMany({ select: { laneKey: true } });
     const keys = (fences || []).map((row) => clean(row?.laneKey, 180)).filter(Boolean);
     if (!keys.length) return { ready: false, lanes: [], reason: "legacy_executor_fence_uninitialized" };
     const rows = await db.maintenanceLaneState.findMany({
-      where: { key: { in: keys }, ownerToken: { not: null } },
+      where: { key: { in: keys }, ownerToken: { not: null }, leaseUntil: { gt: authorityNow } },
       select: { key: true, generation: true, ownerToken: true, leaseUntil: true },
     });
     return { ready: !(rows || []).length, lanes: rows || [], reason: (rows || []).length ? "legacy_executor_drain" : null };
@@ -203,7 +259,8 @@ async function legacyExecutorDrainStatus({ db, workClass }) {
           FROM "MaintenanceLaneState" m
           JOIN "Phase2LegacyExecutorFence" f ON f."laneKey"=m."key"
          WHERE m."ownerToken" IS NOT NULL
-         ORDER BY m."key" ASC`);
+           AND m."leaseUntil" > $1
+         ORDER BY m."key" ASC`, authorityNow);
     } catch (error) {
       const wrapped = new Error("Phase2 legacy executor fence is unavailable");
       wrapped.code = "PHASE2_LEGACY_EXECUTOR_FENCE_REQUIRED";
@@ -213,8 +270,6 @@ async function legacyExecutorDrainStatus({ db, workClass }) {
     return { ready: !(rows || []).length, lanes: rows || [], reason: (rows || []).length ? "legacy_executor_drain" : null };
   }
 
-  // Reduced in-memory unit adapters do not model rolling replicas. Production Prisma
-  // always has raw SQL support after the additive fence migration.
   return { ready: true, lanes: [], skipped: true, reason: "legacy_executor_fence_adapter_unavailable" };
 }
 
@@ -228,7 +283,11 @@ async function claimDomainWorkBatch({
   const take = bounded(limit);
   const quantum = bounded(perAgencyQuantum, 10, take);
   const partitionQuantum = bounded(perPartitionQuantum, 2, quantum);
-  const drain = await legacyExecutorDrainStatus({ db, workClass: klass });
+  const activeGeneration = await activeDomainWorkGeneration({ db, workClass: klass, fallback: generation });
+  if (String(activeGeneration) !== String(generation)) {
+    return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true, reason: "unsupported_domain_work_generation", activeGeneration };
+  }
+  const drain = await legacyExecutorDrainStatus({ db, workClass: klass, fallbackNow });
   if (!drain.ready) {
     return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true, reason: drain.reason || "legacy_executor_drain", legacyExecutors: drain.lanes || [] };
   }
@@ -236,49 +295,81 @@ async function claimDomainWorkBatch({
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
     if (typeof tx?.$queryRawUnsafe === "function") {
-      const params = [klass, authorityNow, String(generation), quantum, partitionQuantum, take, ownerToken, leaseUntil];
-      let filterSql = "";
-      if (agencyId) { params.push(String(agencyId)); filterSql += ` AND d."agencyId"=$${params.length}`; }
-      if (objectType) { params.push(String(objectType)); filterSql += ` AND d."objectType"=$${params.length}`; }
       const normalizedObjectIds = Array.from(new Set((Array.isArray(objectIds) ? objectIds : []).map((value) => clean(value, 240)).filter(Boolean)));
-      if (normalizedObjectIds.length) {
-        const placeholders = normalizedObjectIds.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
-        filterSql += ` AND d."objectId" IN (${placeholders})`;
-      }
       const normalizedCreatorIds = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map((value) => clean(value, 180)).filter(Boolean)));
       if (Array.isArray(creatorIds) && !normalizedCreatorIds.length) {
         return { ownerToken, authorityNow, leaseUntil, items: [] };
       }
+
+      const maxAgencies = Math.max(1, Math.min(take, 100));
+      const params = [klass, authorityNow, String(generation), maxAgencies, quantum, partitionQuantum, take, ownerToken, leaseUntil];
+      let agencyHeadFilter = "";
+      let workFilter = "";
+      if (agencyId) {
+        params.push(String(agencyId));
+        agencyHeadFilter = ` AND a."agencyId"=$${params.length}`;
+      }
+      if (objectType) {
+        params.push(String(objectType));
+        workFilter += ` AND d."objectType"=$${params.length}`;
+      }
+      if (normalizedObjectIds.length) {
+        const placeholders = normalizedObjectIds.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
+        workFilter += ` AND d."objectId" IN (${placeholders})`;
+      }
       if (normalizedCreatorIds.length) {
         const placeholders = normalizedCreatorIds.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
-        filterSql += ` AND d."creatorId" IN (${placeholders})`;
+        workFilter += ` AND d."creatorId" IN (${placeholders})`;
       }
+
       const rows = await tx.$queryRawUnsafe(
-        `WITH partition_ranked AS (
-           SELECT d."id", d."agencyId", d."partitionKey", d."availableAt",
-                  row_number() OVER (PARTITION BY d."agencyId",d."partitionKey" ORDER BY d."availableAt",d."id") AS partition_rn
-             FROM "DomainWorkItem" d
-            WHERE d."workClass"=$1
-              AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-              AND d."availableAt" <= $2
-              AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)
-              AND d."activeGeneration"=$3${filterSql}
-         ), agency_ranked AS (
-           SELECT p.*, row_number() OVER (PARTITION BY p."agencyId" ORDER BY p."availableAt",p."id") AS agency_rn
-             FROM partition_ranked p WHERE p.partition_rn <= $5
+        `WITH agencies AS (
+           SELECT a."agencyId",a."nextDueAt"
+             FROM "DomainWorkReadyAgency" a
+            WHERE a."workClass"=$1
+              AND a."activeGeneration"=$3
+              AND a."nextDueAt" <= $2${agencyHeadFilter}
+            ORDER BY a."nextDueAt",a."agencyId"
+            LIMIT $4
+         ), partitions AS (
+           SELECT a."agencyId",p."partitionKey",p."nextDueAt"
+             FROM agencies a
+             CROSS JOIN LATERAL (
+               SELECT p."partitionKey",p."nextDueAt"
+                 FROM "DomainWorkReadyPartition" p
+                WHERE p."agencyId"=a."agencyId"
+                  AND p."workClass"=$1
+                  AND p."activeGeneration"=$3
+                  AND p."nextDueAt" <= $2
+                ORDER BY p."nextDueAt",p."partitionKey"
+                LIMIT $5
+             ) p
          ), candidates AS (
-           SELECT "id","availableAt" FROM agency_ranked WHERE agency_rn <= $4 ORDER BY "availableAt","id" LIMIT $6
-         ), locked AS (
-           SELECT d."id" FROM "DomainWorkItem" d JOIN candidates c ON c."id"=d."id"
-            WHERE (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-              AND d."activeGeneration"=$3
-            ORDER BY d."availableAt",d."id" FOR UPDATE OF d SKIP LOCKED
+           SELECT d."id",d."availableAt"
+             FROM partitions p
+             CROSS JOIN LATERAL (
+               SELECT d."id",d."availableAt"
+                 FROM "DomainWorkItem" d
+                WHERE d."agencyId"=p."agencyId"
+                  AND d."workClass"=$1
+                  AND d."partitionKey"=p."partitionKey"
+                  AND d."isOutstanding"=TRUE
+                  AND d."activeGeneration"=$3
+                  AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                  AND d."availableAt" <= $2
+                  AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
+                ORDER BY d."availableAt",d."id"
+                FOR UPDATE OF d SKIP LOCKED
+                LIMIT $6
+             ) d
+            ORDER BY d."availableAt",d."id"
+            LIMIT $7
          )
          UPDATE "DomainWorkItem" d SET
-           "state"='CLAIMED',"ownerToken"=$7,"claimFence"=d."claimFence"+1,
-           "claimedRevision"=d."requestedRevision","leaseUntil"=$8,"attempts"=d."attempts"+1,
+           "state"='CLAIMED',"ownerToken"=$8,"claimFence"=d."claimFence"+1,
+           "claimedRevision"=d."requestedRevision","leaseUntil"=$9,"attempts"=d."attempts"+1,
            "updatedAt"=CURRENT_TIMESTAMP
-          FROM locked WHERE d."id"=locked."id"
+          FROM candidates c WHERE d."id"=c."id"
          RETURNING d.*`, ...params,
       );
       return { ownerToken, authorityNow, leaseUntil, items: rows || [] };
@@ -289,6 +380,7 @@ async function claimDomainWorkBatch({
     const discovered = await tx.domainWorkItem.findMany({
       where: {
         workClass: klass,
+        isOutstanding: true,
         OR: [{ state: STATE.READY }, { state: STATE.CLAIMED, leaseUntil: { lte: authorityNow } }],
         activeGeneration: generation,
         availableAt: { lte: authorityNow },
@@ -391,6 +483,7 @@ async function ackDomainWorkClaim({ db = null, item, ownerToken = null, fallback
         `UPDATE "DomainWorkItem" SET
            "completedRevision"=GREATEST("completedRevision",$1),
            "state"=CASE WHEN "requestedRevision">$1 THEN 'READY' ELSE 'DONE' END,
+           "isOutstanding"=CASE WHEN "requestedRevision">$1 THEN TRUE ELSE FALSE END,
            "availableAt"=CASE WHEN "requestedRevision">$1 THEN $2 ELSE "availableAt" END,
            "ownerToken"=NULL,"leaseUntil"=$2,"nextAttemptAt"=NULL,"errorClass"=NULL,"lastError"=NULL,
            "progressCursor"=CASE WHEN "requestedRevision">$1 THEN NULL ELSE "progressCursor" END,
@@ -410,7 +503,7 @@ async function ackDomainWorkClaim({ db = null, item, ownerToken = null, fallback
     const hasNewer = asBigInt(current.requestedRevision) > asBigInt(item.claimedRevision);
     const changed = await tx.domainWorkItem.updateMany({
       where: claimWhere(item, ownerToken, authorityNow, generation),
-      data: { completedRevision: asBigInt(item.claimedRevision), state: hasNewer ? STATE.READY : STATE.DONE, availableAt: hasNewer ? authorityNow : current.availableAt, ownerToken: null, leaseUntil: authorityNow, nextAttemptAt: null, errorClass: null, lastError: null, progressCursor: hasNewer ? null : current.progressCursor ?? null },
+      data: { completedRevision: asBigInt(item.claimedRevision), state: hasNewer ? STATE.READY : STATE.DONE, isOutstanding: hasNewer, availableAt: hasNewer ? authorityNow : current.availableAt, ownerToken: null, leaseUntil: authorityNow, nextAttemptAt: null, errorClass: null, lastError: null, progressCursor: hasNewer ? null : current.progressCursor ?? null },
     });
     return Number(changed?.count || 0) === 1 ? { acknowledged: true, lost: false, state: hasNewer ? STATE.READY : STATE.DONE } : { acknowledged: false, lost: true };
   });
@@ -431,7 +524,7 @@ async function blockDomainWorkClaim({ db = null, item, ownerToken = null, depend
     // must wait and will wake the READY/BLOCKED row after this transition.
     if (currentDependency > observedDependencyRevision) {
       const changed = await tx.domainWorkItem?.updateMany?.({ where: baseWhere, data: {
-        state: STATE.READY, availableAt: authorityNow, ownerToken: null, leaseUntil: authorityNow,
+        state: STATE.READY, isOutstanding: true, availableAt: authorityNow, ownerToken: null, leaseUntil: authorityNow,
         dependencyKind: depKind, dependencyKey: depKey, dependencyRevision: currentDependency,
         errorClass: null, lastError: null, nextAttemptAt: null, progressCursor: null,
       } });
@@ -444,7 +537,7 @@ async function blockDomainWorkClaim({ db = null, item, ownerToken = null, depend
     const blocked = await tx.domainWorkItem?.updateMany?.({
       where: { ...baseWhere, requestedRevision: asBigInt(item.claimedRevision) },
       data: {
-        state: STATE.BLOCKED, ownerToken: null, leaseUntil: authorityNow,
+        state: STATE.BLOCKED, isOutstanding: true, ownerToken: null, leaseUntil: authorityNow,
         dependencyKind: depKind, dependencyKey: depKey, dependencyRevision: currentDependency,
         errorClass: "DEPENDENCY", lastError: clean(reason, 2000), nextAttemptAt: null,
       },
@@ -456,7 +549,7 @@ async function blockDomainWorkClaim({ db = null, item, ownerToken = null, depend
     const reopened = await tx.domainWorkItem?.updateMany?.({
       where: { ...baseWhere, requestedRevision: { gt: asBigInt(item.claimedRevision) } },
       data: {
-        state: STATE.READY, availableAt: authorityNow, ownerToken: null, leaseUntil: authorityNow,
+        state: STATE.READY, isOutstanding: true, availableAt: authorityNow, ownerToken: null, leaseUntil: authorityNow,
         dependencyKind: depKind, dependencyKey: depKey, dependencyRevision: currentDependency,
         errorClass: null, lastError: null, nextAttemptAt: null, progressCursor: null,
       },
@@ -477,7 +570,7 @@ async function failDomainWorkClaim({ db = null, item, ownerToken = null, error =
     const failed = await tx.domainWorkItem?.updateMany?.({
       where: { ...baseWhere, requestedRevision: asBigInt(item.claimedRevision) },
       data: {
-        state: STATE.READY, ownerToken: null, leaseUntil: authorityNow, availableAt: due, nextAttemptAt: due,
+        state: STATE.READY, isOutstanding: true, ownerToken: null, leaseUntil: authorityNow, availableAt: due, nextAttemptAt: due,
         errorClass: clean(error?.code || "TRANSIENT", 120), lastError: clean(error?.message || error || "DOMAIN_WORK_FAILED", 2000),
       },
     });
@@ -517,7 +610,7 @@ async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progre
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const due = asDate(availableAt) || authorityNow;
     const baseWhere = claimWhere(item, ownerToken, authorityNow, generation);
-    const exactData = { state: STATE.READY, ownerToken: null, leaseUntil: authorityNow, availableAt: due, nextAttemptAt: null, errorClass: null, lastError: null };
+    const exactData = { state: STATE.READY, isOutstanding: true, ownerToken: null, leaseUntil: authorityNow, availableAt: due, nextAttemptAt: null, errorClass: null, lastError: null };
     if (progressCursor !== undefined) exactData.progressCursor = progressCursor;
     const yielded = await tx.domainWorkItem?.updateMany?.({
       where: { ...baseWhere, requestedRevision: asBigInt(item.claimedRevision) },
@@ -561,7 +654,7 @@ async function bumpDomainDependency({ db = null, agencyId, dependencyKind, depen
     });
     if (tx?.domainWorkItem?.updateMany) await tx.domainWorkItem.updateMany({
       where: { agencyId: a, state: STATE.BLOCKED, dependencyKind: kind, dependencyKey: key, dependencyRevision: { lt: revision } },
-      data: { state: STATE.READY, availableAt: authorityNow, nextAttemptAt: null, errorClass: null, lastError: null },
+      data: { state: STATE.READY, isOutstanding: true, availableAt: authorityNow, nextAttemptAt: null, errorClass: null, lastError: null },
     });
     return revision;
   });
@@ -575,6 +668,6 @@ async function currentDependencyRevision({ db = null, agencyId, dependencyKind, 
 
 module.exports = {
   DOMAIN_WORK_GENERATION, DOMAIN_WORK_PROJECTION_VERSION, DEFAULT_LEASE_MS, MAX_BATCH, WORK_CLASS, STATE, LEGACY_DRAIN_WORK_CLASSES,
-  workId, publishDomainWork, legacyExecutorDrainStatus, claimDomainWorkBatch, lockDomainWorkClaimForCommit, heartbeatDomainWorkClaim, ackDomainWorkClaim,
+  workId, publishDomainWork, activeDomainWorkGeneration, domainWorkFamilyState, hasOutstandingDomainWork, legacyExecutorDrainStatus, claimDomainWorkBatch, lockDomainWorkClaimForCommit, heartbeatDomainWorkClaim, ackDomainWorkClaim,
   blockDomainWorkClaim, failDomainWorkClaim, saveDomainWorkProgress, yieldDomainWorkClaim, bumpDomainDependency, currentDependencyRevision,
 };

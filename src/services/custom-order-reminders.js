@@ -17,7 +17,7 @@ const DEFAULT_TELEGRAM_CUSTOM_REMINDERS = Object.freeze({
     text: "Напоминание: у тебя есть незавершённый кастом «{custom}». Дедлайн: {deadline}.",
   }),
   call: Object.freeze({
-    enabled: true,
+    enabled: false,
     offsetsMinutes: Object.freeze([30, 5]),
     text: "Созвон через {minutes} мин. Не пропусти: «{custom}».",
   }),
@@ -81,7 +81,9 @@ function normalizeReminderOverride(type, value) {
   const normalizedType = String(type || "CONTENT").toUpperCase();
   if (normalizedType === "CALL") {
     return {
-      enabled: input.enabled !== false,
+      // Historical/omitted CALL override state is fail-closed. Automatic CALL reminders
+      // become executable only after an explicit ON decision.
+      enabled: input.enabled === true,
       offsetsMinutes: offsets(input.offsetsMinutes),
       ...(String(input.text || "").trim() ? { text: cleanText(input.text, "") } : {}),
     };
@@ -244,7 +246,7 @@ async function synchronizeReminderDomainWork({ agencyId, order, desired, db, now
   if (typeof db.$queryRawUnsafe === "function") {
     await db.$queryRawUnsafe(
       `UPDATE "DomainWorkItem"
-          SET "state"='DONE',"completedRevision"=GREATEST("completedRevision","requestedRevision"),
+          SET "state"='DONE',"isOutstanding"=FALSE,"completedRevision"=GREATEST("completedRevision","requestedRevision"),
               "ownerToken"=NULL,"leaseUntil"=$1,"nextAttemptAt"=NULL,"errorClass"=NULL,"lastError"=NULL,
               "terminalCause"='REMINDER_SUPERSEDED',"updatedAt"=CURRENT_TIMESTAMP
         WHERE "agencyId"=$2 AND "workClass"='CUSTOM_REMINDER' AND "parentObjectId"=$3
@@ -255,7 +257,7 @@ async function synchronizeReminderDomainWork({ agencyId, order, desired, db, now
   } else if (db.domainWorkItem?.updateMany) {
     const where = { agencyId: String(agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_REMINDER, parentObjectId, state: { not: "DONE" } };
     if (nextObjectId) where.objectId = { not: nextObjectId };
-    await db.domainWorkItem.updateMany({ where, data: { state: "DONE", ownerToken: null, leaseUntil: now, nextAttemptAt: null, errorClass: null, lastError: null, terminalCause: "REMINDER_SUPERSEDED" } });
+    await db.domainWorkItem.updateMany({ where, data: { state: "DONE", isOutstanding: false, ownerToken: null, leaseUntil: now, nextAttemptAt: null, errorClass: null, lastError: null, terminalCause: "REMINDER_SUPERSEDED" } });
   }
 
   if (!nextObjectId || !nextAt) return { published: false, cleared: true };
@@ -304,13 +306,12 @@ async function reprojectCustomReminderSchedule({ agencyId, orderId, now = new Da
       }
       const desired = desiredReminderSchedule(order, workspacePolicy, now, { firstAnchorAt, modelObligation });
       const desiredAt = desired.at ? new Date(desired.at) : null;
-      if (sameInstant(order.nextReminderAt, desiredAt)) {
-        const work = await synchronizeReminderDomainWork({ agencyId, order, desired, db: tx, now });
-        return { ok: true, missing: false, changed: false, nextReminderAt: desiredAt, reminderKey: desired.key || null, work, attempts: attempt + 1 };
-      }
+      const scheduleChanged = !sameInstant(order.nextReminderAt, desiredAt);
 
-      // updatedAt is the cross-service revision fence. Write it explicitly: correctness must not
-      // depend on whether a particular Prisma Client version advances @updatedAt for updateMany().
+      // F53-17: even the sameInstant branch must acquire the exact CustomOrder revision
+      // before it is allowed to cancel/publish reminder DomainWork. Otherwise a stale
+      // R1 scheduler can supersede R2 work after a concurrent policy/obligation change.
+      // Touch updatedAt deliberately to make the schedule-revision permit observable.
       const fenceAt = new Date(Math.max(now.getTime(), revision.getTime() + 1));
       const changed = await tx.customOrder.updateMany({
         where: { id, agencyId, updatedAt: revision },
@@ -319,7 +320,7 @@ async function reprojectCustomReminderSchedule({ agencyId, orderId, now = new Da
       if (Number(changed?.count || 0) !== 1) return null;
       const nextOrder = { ...order, nextReminderAt: desiredAt, updatedAt: fenceAt };
       const work = await synchronizeReminderDomainWork({ agencyId, order: nextOrder, desired, db: tx, now });
-      return { ok: true, missing: false, changed: true, nextReminderAt: desiredAt, reminderKey: desired.key || null, work, attempts: attempt + 1 };
+      return { ok: true, missing: false, changed: scheduleChanged, nextReminderAt: desiredAt, reminderKey: desired.key || null, work, attempts: attempt + 1 };
     };
     const result = typeof db.$transaction === "function" ? await db.$transaction(execute) : await execute(db);
     if (result) return result;

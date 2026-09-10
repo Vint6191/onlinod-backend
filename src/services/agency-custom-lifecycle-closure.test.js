@@ -151,7 +151,7 @@ test("first execution-profile pin and both mutable defaults share one commit-ord
     "relay-recipient publication must join the same fence before its workspace write");
 });
 
-test("super-admin hard creator delete preserves blockers, captures exact Phase2 scope, then removes residual work after the Creator cascade", () => {
+test("super-admin hard creator delete is a durable bounded lifecycle, not one lifetime destructive transaction", () => {
   const admin = source("routes/admin.js");
   const routeStart = admin.indexOf('router.delete("/creators/:id"');
   const routeEnd = admin.indexOf("// ════════════════════════════════════════════════════════════\n// DEVICES", routeStart);
@@ -161,14 +161,15 @@ test("super-admin hard creator delete preserves blockers, captures exact Phase2 
   const block = route.slice(hardAt, softAt);
   const customFence = block.indexOf("assertCreatorCustomPipelineRetirable");
   const massFence = block.indexOf("assertCreatorMassCampaignRetirable");
-  const scopeCapture = block.indexOf("collectCreatorPhase2DestructiveScope");
-  const creatorDelete = block.indexOf("creatorAccount.delete");
-  const residualPurge = block.indexOf("purgeCreatorPhase2ResidualsForHardDelete");
-  assert.ok(customFence >= 0, "hard delete must refuse active/unknown Custom external-write authority before destructive cascade");
-  assert.ok(massFence > customFence, "Custom and MASS future-effect authorities must both converge before destructive cascade");
-  assert.ok(scopeCapture > massFence, "non-FK destructive scope may be captured only after both unknown-effect guards");
-  assert.ok(creatorDelete > scopeCapture, "canonical Creator cascade starts only after guarded exact-scope capture");
-  assert.ok(residualPurge > creatorDelete, "provider/work cleanup must run after Creator cascade so DELETE-trigger work is also removed");
+  const barrier = block.indexOf("creatorAccount.update");
+  const publishCleanup = block.indexOf("DESTRUCTIVE_CREATOR_CLEANUP");
+  assert.ok(customFence >= 0, "hard delete must refuse active/unknown Custom external-write authority before destructive lifecycle starts");
+  assert.ok(massFence > customFence, "Custom and MASS future-effect authorities must both converge before destructive lifecycle starts");
+  assert.ok(barrier > massFence, "DELETING barrier must be committed only after the external-effect guards");
+  assert.ok(publishCleanup > barrier, "bounded cleanup work must be published in the same transaction after the barrier");
+  assert.doesNotMatch(block, /collectCreatorPhase2DestructiveScope/);
+  assert.doesNotMatch(block, /creatorAccount\.delete/);
+  assert.doesNotMatch(block, /purgeCreatorPhase2ResidualsForHardDelete/);
 });
 
 test("super-admin hard Agency delete atomically purges all Phase2 provider ledgers after blockers and before Agency cascade", () => {

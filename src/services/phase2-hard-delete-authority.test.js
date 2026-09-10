@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const {
   collectCreatorPhase2DestructiveScope,
   purgeAgencyPhase2ProviderLedgersForHardDelete,
+  purgeAgencyPhase2CurrentWorkRootsAfterCascade,
   purgeCreatorPhase2ResidualsForHardDelete,
 } = require("./phase2-destructive-delete-authority-service");
 
@@ -67,6 +68,7 @@ test("A47 creator destructive scope captures order/submission/provider identitie
   assert.deepEqual(scope, {
     agencyId: "agency-1", creatorId: "creator-1",
     orderIds: ["order-1", "order-2"], submissionIds: ["sub-1"], intentIds: ["intent-1"], inboundIds: ["inbound-1"], deliveryIds: ["write-1"],
+    bounded: true,
   });
   assert.deepEqual(captured.orders, { agencyId: "agency-1", creatorId: "creator-1" });
   assert.deepEqual(captured.submissions, { agencyId: "agency-1", creatorId: "creator-1" });
@@ -105,16 +107,39 @@ test("A47 creator cleanup removes provider rows and trigger-created DomainWork/d
   assert.ok(calls.provider.where.OR.some((term) => term.intentId?.in?.includes("intent-1")));
   assert.ok(calls.provider.where.OR.some((term) => term.objectType === "AutomationDelivery" && term.objectId?.in?.includes("write-1")));
 
-  assert.ok(calls.work.where.OR.some((term) => term.creatorId === "creator-1"));
-  assert.ok(calls.work.where.OR.some((term) => term.objectType === "CustomOrder" && term.objectId?.in?.includes("order-1")));
-  assert.ok(calls.work.where.OR.some((term) => term.objectType === "CustomContentSubmission" && term.objectId?.in?.includes("sub-1")));
-  assert.ok(calls.work.where.OR.some((term) => term.objectType === "TelegramDeliveryIntent" && term.objectId?.in?.includes("intent-1")));
-  assert.ok(calls.work.where.OR.some((term) => term.objectType === "TelegramInboundEvent" && term.objectId?.in?.includes("inbound-1")));
-  assert.ok(calls.work.where.OR.some((term) => term.objectType === "AutomationDelivery" && term.objectId?.in?.includes("write-1")));
-  assert.ok(calls.work.where.OR.some((term) => term.dependencyKind === "REMINDER_OUTCOME" && term.dependencyKey?.in?.includes("order-1")));
+  assert.deepEqual(calls.work.where, { agencyId: "agency-1", creatorId: "creator-1" });
+  assert.deepEqual(calls.dependency.where, {
+    agencyId: "agency-1",
+    dependencyKind: "CREATOR_BINDING",
+    dependencyKey: "creator-1",
+  });
+});
 
-  assert.deepEqual(calls.dependency.where.OR, [
-    { dependencyKind: "CREATOR_BINDING", dependencyKey: "creator-1" },
-    { dependencyKind: "REMINDER_OUTCOME", dependencyKey: { in: ["order-1"] } },
-  ]);
+
+test("F53-11 post-cascade current-work purge removes rows recreated by DomainWorkItem delete triggers", async () => {
+  const state = {
+    family: [{ id: "family-pre", agencyId: "agency-1" }],
+    partition: [{ id: "partition-pre", agencyId: "agency-1" }],
+    agencyHead: [{ id: "agency-head-pre", agencyId: "agency-1" }],
+  };
+  const del = (key) => async ({ where }) => deleteByAgency(state, key, where.agencyId);
+  const tx = {
+    phase2WorkFamilyState: { deleteMany: del("family") },
+    domainWorkReadyPartition: { deleteMany: del("partition") },
+    domainWorkReadyAgency: { deleteMany: del("agencyHead") },
+  };
+
+  // Simulate rows recreated by the DomainWorkItem AFTER DELETE trigger while the
+  // Agency cascade statement is executing. Pre-cascade deletion cannot prevent it.
+  state.family.push({ id: "family-trigger-recreated", agencyId: "agency-1" });
+  state.partition.push({ id: "partition-trigger-recreated", agencyId: "agency-1" });
+  state.agencyHead.push({ id: "agency-head-trigger-recreated", agencyId: "agency-1" });
+
+  const result = await purgeAgencyPhase2CurrentWorkRootsAfterCascade({ db: tx, agencyId: "agency-1" });
+  assert.deepEqual(result, {
+    Phase2WorkFamilyState: 2,
+    DomainWorkReadyPartition: 2,
+    DomainWorkReadyAgency: 2,
+  });
+  assert.deepEqual(state, { family: [], partition: [], agencyHead: [] });
 });

@@ -1141,7 +1141,8 @@ test("V13.3.1 creator soft/hard delete recomputes billing aggregate in the delet
   assert.match(deleteRoute, /prisma\.\$transaction/);
   assert.match(deleteRoute, /syncAgencyBillingAggregate\(tx, before\.agencyId, deletedAt\)/);
   assert.match(deleteRoute, /tx\.creatorAccount\.update/);
-  assert.match(deleteRoute, /tx\.creatorAccount\.delete/);
+  assert.match(deleteRoute, /DESTRUCTIVE_CREATOR_CLEANUP/);
+  assert.doesNotMatch(deleteRoute, /tx\.creatorAccount\.delete/);
 });
 
 test("V14.9 sandbox resume returns the original NOWPayments sandbox hosted URL and never an ONLINOD checkout page", async () => withEnv({

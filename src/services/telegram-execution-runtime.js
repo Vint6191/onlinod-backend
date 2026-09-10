@@ -21,20 +21,30 @@ function clean(value, max = 180) { const text = String(value == null ? "" : valu
 
 async function eligibleTelegramExecutionAccounts({ agencyId, member, db, includeRetiring = false }) {
   const scope = await allowedCreatorScope({ agencyId, member, db });
+  if (!scope.broad && !scope.creatorIds.length) return [];
+  const scopedCreatorIds = scope.broad ? null : scope.creatorIds.map(String);
+
+  // Actual53/F53-10: discover configured live messaging demand directly instead
+  // of materializing every creator visible to an owner/admin and filtering it in
+  // Node. The accompanying partial DB index makes this proportional to current
+  // Telegram-configured creators; pinned source/thread/follow-up demand is read
+  // independently from its own current-work locators below.
   const creators = [];
   await scanAllById({
     delegate: db.creatorAccount,
     where: {
       agencyId,
       deletedAt: null,
-      ...(scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }),
+      telegramContact: { not: null },
+      ...(scopedCreatorIds ? { id: { in: scopedCreatorIds } } : {}),
     },
     select: { id: true, telegramContact: true, telegramAccountId: true },
-    onPage: async (rows) => { creators.push(...rows); return false; },
+    onPage: async (rows) => {
+      for (const row of rows || []) if (clean(row.telegramContact, 160)) creators.push(row);
+      return false;
+    },
   });
-  if (!creators.length) return [];
 
-  const creatorIds = creators.map((row) => String(row.id));
   const rawCandidates = new Map();
   const mergeRawCandidate = ({ accountId, anchorCreatorId, messagingEligible = false, inboundEligible = false }) => {
     const normalizedAccountId = clean(accountId);
@@ -56,9 +66,7 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
 
   const explicitAssignedIds = Array.from(new Set(creators.map((row) => clean(row.telegramAccountId)).filter(Boolean)));
   const explicitRows = await fetchAccountRowsByIds({ agencyId, accountIds: explicitAssignedIds, db });
-  const explicitActive = new Set(explicitRows
-    .filter((row) => isActiveTelegramAccount(row))
-    .map((row) => String(row.id)));
+  const explicitActive = new Set(explicitRows.filter((row) => isActiveTelegramAccount(row)).map((row) => String(row.id)));
 
   const autoCreators = creators.filter((row) => !clean(row.telegramAccountId));
   let autoAccountId = null;
@@ -73,29 +81,21 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
   }
 
   for (const creator of creators) {
-    // Current planning/messaging identity is mutable and requires a current Telegram contact.
-    // Historical source/thread work below is pinned provider identity and must remain executable
-    // even when the manager later clears or changes creator.telegramContact.
-    if (!clean(creator.telegramContact, 160)) continue;
     const assigned = clean(creator.telegramAccountId);
     const accountId = assigned ? (explicitActive.has(assigned) ? assigned : null) : autoAccountId;
     if (!accountId) continue;
     mergeRawCandidate({ accountId, anchorCreatorId: String(creator.id), messagingEligible: true, inboundEligible: true });
   }
 
-  // Provider-pinned source/thread capability is a CURRENT operational projection. Historical
-  // submissions and confirmed model-instruction receipts are cold evidence after the one-time
-  // backfill. During an incomplete cutover we fail closed instead of silently returning to an
-  // O(history) account-discovery scan.
   if (!(await providerOperationalBackfillReady({ db, agencyId }))) {
     throw fail("TELEGRAM_PROVIDER_OPERATIONAL_BACKFILL_INCOMPLETE", "Telegram provider current-work backfill is not complete", 503);
   }
-  const currentSources = await listCurrentIncompleteSourceAccountsForCreators({ agencyId, creatorIds, db });
+  const currentSources = await listCurrentIncompleteSourceAccountsForCreators({ agencyId, creatorIds: scopedCreatorIds, db });
   for (const row of currentSources) {
     mergeRawCandidate({ accountId: row.telegramSourceAccountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: false });
   }
   const providerDebt = await listProviderOperationalAccountsForCreators({
-    agencyId, creatorIds, db,
+    agencyId, creatorIds: scopedCreatorIds, db,
     debtClasses: [DEBT.INCOMPLETE_SOURCE_RELAY, DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY],
   });
   for (const row of providerDebt) {
@@ -108,11 +108,9 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
     });
   }
 
-  // Follow-up execution already has an indexed CURRENT-state predicate. Keep it as canonical
-  // current work; it never reconstructs candidates from terminal confirmed/cancelled history.
   await scanActiveFollowupIntents({
     agencyId,
-    creatorIds,
+    creatorIds: scopedCreatorIds,
     db,
     onRow: async (row) => {
       mergeRawCandidate({ accountId: row.accountId, anchorCreatorId: String(row.creatorId), messagingEligible: false, inboundEligible: false });

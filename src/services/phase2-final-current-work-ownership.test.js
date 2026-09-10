@@ -66,9 +66,8 @@ test("Team dialog historical verification has a semantic pre-LIMIT partial index
 
 test("TEAM_READ_SUMMARY coverage cannot activate while a newer DomainWork revision is outstanding", () => {
   const body = block("runTeamReadSummaryCoverageEnumerationUnit", "runTelegramConfirmedCoverageEnumerationUnit");
-  assert.match(body, /workClass"='TEAM_READ_SUMMARY'/);
-  assert.match(body, /requestedRevision/);
-  assert.match(body, /completedRevision/);
+  assert.match(body, /hasOutstandingDomainWork/);
+  assert.match(body, /PHASE2_WORK_CLASS\.TEAM_READ_SUMMARY/);
   assert.match(body, /missing\?\.length[\s\S]*outstanding/);
   assert.ok(body.indexOf("if (Number(missing?.length || 0) > 0 || outstanding)") < body.indexOf("markPhase2CoverageComplete"));
 });

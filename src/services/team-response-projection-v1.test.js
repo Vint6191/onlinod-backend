@@ -29,9 +29,17 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
     if (where.dialogId && row.dialogId !== where.dialogId) return false;
     if (where.memberId && row.memberId !== where.memberId) return false;
     if (where.messageId && row.messageId !== where.messageId) return false;
+    if (where.id) {
+      const id = String(row.id || row.messageId || "");
+      if (where.id.gt && !(id > String(where.id.gt))) return false;
+      if (where.id.gte && !(id >= String(where.id.gte))) return false;
+      if (where.id.lt && !(id < String(where.id.lt))) return false;
+      if (where.id.lte && !(id <= String(where.id.lte))) return false;
+    }
     if (where.source?.in && !where.source.in.includes(row.source)) return false;
     if (where.sentAt && !matchesDate(row.sentAt, where.sentAt)) return false;
     if (where.NOT?.messageId && row.messageId === where.NOT.messageId) return false;
+    if (Array.isArray(where.OR) && !where.OR.some((branch) => ledgerMatches(row, branch))) return false;
     return true;
   }
 

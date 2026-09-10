@@ -158,7 +158,7 @@ test("Audit15 historical money uses per-agency coverage enumeration before exact
   assert.ok(repairIndex >= 0 && migrateIndex > repairIndex && publishIndex > migrateIndex, "legacy repair/migration must precede exact reconciliation work publication");
   assert.doesNotMatch(body, /reconcileHistoricalTeamMoneyBatch/);
   assert.match(body, /markPhase2CoverageComplete/);
-  assert.match(body, /DomainWorkItem/);
+  assert.match(body, /hasOutstandingDomainWork/);
 });
 
 test("Audit15 telemetry route binds device and ignores client tenant authority", () => {

@@ -515,3 +515,33 @@ test("undrained ACTIVE runtime survives loss of normal eligibility only as same-
   assert.equal(db._accounts[0].runtimeDrainedGeneration, 1);
   assert.equal(db._accounts[0].runtimeClaimedByDeviceId, null);
 });
+
+
+test("F53-10 broad owner runtime discovery scales with Telegram demand, not all visible creators", async () => {
+  const creators = Array.from({ length: 4000 }, (_, index) => ({
+    id: `creator-${index + 1}`, agencyId: "agency-1",
+    telegramContact: index < 10 ? `@model_${index + 1}` : null,
+    telegramAccountId: index < 10 ? `tg-${index + 1}` : null,
+    deletedAt: null, status: "READY",
+  }));
+  const accounts = Array.from({ length: 10 }, (_, index) => ({
+    id: `tg-${index + 1}`, agencyId: "agency-1", lifecycleState: "ACTIVE",
+    runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null,
+    runtimeLeaseUserId: null, runtimeLeaseMemberId: null, runtimeLeaseAccessEpoch: null, runtimeLeaseCreatorId: null,
+    runtimeClaimGeneration: 0, runtimeDrainedGeneration: 0, runtimeClaimInboundEligible: false,
+  }));
+  const db = makeDb({ creators, accounts });
+  const owner = { ...chatterA, role: "OWNER", roleKey: "owner", assignedCreators: [] };
+  const originalFindMany = db.creatorAccount.findMany.bind(db.creatorAccount);
+  let configuredRowsRead = null;
+  db.creatorAccount.findMany = async (args) => {
+    assert.deepEqual(args.where.telegramContact, { not: null }, "broad runtime discovery must query configured demand, not all creators");
+    const rows = await originalFindMany(args);
+    configuredRowsRead = rows.length;
+    return rows;
+  };
+  const eligible = await eligibleTelegramExecutionAccounts({ agencyId: "agency-1", member: owner, db });
+  assert.equal(configuredRowsRead, 10);
+  assert.equal(eligible.length, 10);
+  assert.deepEqual(new Set(eligible.map((row) => row.anchorCreatorId)).size, 10);
+});

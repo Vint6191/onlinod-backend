@@ -10,6 +10,7 @@ const schema = fs.readFileSync(path.join(ROOT, "prisma", "schema.prisma"), "utf8
 const migrationFiles = [
   "20260909211500_phase2_current_work_coordination",
   "20260910023000_phase2_authority_execution_consolidation",
+  "20260910211500_phase2_actual53_final_closure",
 ].map((name) => fs.readFileSync(path.join(ROOT, "prisma", "migrations", name, "migration.sql"), "utf8"));
 const migration = migrationFiles.join("\n");
 

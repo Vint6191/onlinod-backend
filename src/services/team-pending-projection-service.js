@@ -83,7 +83,7 @@ async function latestManualReply({ agencyId, creatorId, dialogId, db = prisma })
       dialogId,
       source: { in: MANUAL_SOURCES },
     },
-    orderBy: { sentAt: "desc" },
+    orderBy: [{ sentAt: "desc" }, { id: "desc" }],
   });
 }
 
@@ -115,7 +115,7 @@ async function loadIncomingAfter({ agencyId, creatorId, dialogId, after, db = pr
   }
   const rows = await db.teamActivityEvent.findMany({
     where: { agencyId, creatorId, dialogId, eventKind: "FAN_MESSAGE_RECEIVED", ...(after ? { ts: { gt: after } } : {}) },
-    orderBy: { ts: "asc" },
+    orderBy: [{ ts: "asc" }, { id: "asc" }],
   });
   const out = dedupeIncoming(rows);
   out.episodeCount = out.length;
@@ -142,7 +142,7 @@ async function loadSeenAfter({ agencyId, creatorId, dialogId, after, db = prisma
   }
   const rows = await db.teamActivityEvent.findMany({
     where: { agencyId, creatorId, dialogId, eventKind: "DIALOG_SEEN", memberId: { not: null }, ts: { gte: after } },
-    orderBy: { ts: "asc" },
+    orderBy: [{ ts: "asc" }, { id: "asc" }],
   });
   return dedupeSeen(rows);
 }
@@ -252,6 +252,125 @@ async function reconcilePendingDialogUnlocked({ agencyId, creatorId, dialogId, f
   return { status: "PENDING", row };
 }
 
+
+function compareEventOrder(aAt, aId, bAt, bId) {
+  const a = dateOrNull(aAt); const b = dateOrNull(bAt);
+  const ams = a ? a.getTime() : Number.NEGATIVE_INFINITY;
+  const bms = b ? b.getTime() : Number.NEGATIVE_INFINITY;
+  if (ams !== bms) return ams < bms ? -1 : 1;
+  return String(aId || "").localeCompare(String(bId || ""));
+}
+
+async function duplicateIncomingBefore({ row, agencyId, creatorId, dialogId, db }) {
+  const messageId = clean(row?.messageId, 220);
+  if (!messageId || !db?.teamActivityEvent?.findFirst) return false;
+  const ts = dateOrNull(row?.ts);
+  const id = clean(row?.id, 220);
+  if (!ts || !id) return false;
+  const prior = await db.teamActivityEvent.findFirst({
+    where: {
+      agencyId, creatorId, dialogId, eventKind: "FAN_MESSAGE_RECEIVED", messageId,
+      OR: [{ ts: { lt: ts } }, { ts, id: { lt: id } }],
+    },
+    select: { id: true },
+    orderBy: [{ ts: "asc" }, { id: "asc" }],
+  });
+  return Boolean(prior);
+}
+
+async function applyIncrementalPendingEventUnlocked({ row, existing, agencyId, creatorId, dialogId, fanId, db }) {
+  const kind = kindOf(row);
+  const eventAt = dateOrNull(row?.ts);
+  const eventId = clean(row?.id, 220) || clean(row?.localId, 220);
+  if (!eventAt || !eventId) return { needsRepair: true, reason: "event_order_missing" };
+  const marker = { lastAppliedEventAt: eventAt, lastAppliedEventId: eventId, lastProjectionSourceId: eventId, derivationVersion: PENDING_DERIVATION_VERSION };
+
+  if (kind === "FAN_MESSAGE_RECEIVED") {
+    if (await duplicateIncomingBefore({ row, agencyId, creatorId, dialogId, db })) {
+      if (!existing) return { status: "CLEAR", row: null, duplicate: true };
+      const updated = await db.teamPendingDialogState.update({
+        where: { id: existing.id },
+        data: { ...marker, projectionRevision: BigInt(existing.projectionRevision || 0) + 1n },
+      });
+      return { status: String(updated.status || "CLEAR"), row: updated, duplicate: true };
+    }
+
+    const identity = incomingIdentity(row);
+    if (existing && String(existing.status || "").toUpperCase() === "PENDING") {
+      const updated = await db.teamPendingDialogState.update({
+        where: { id: existing.id },
+        data: {
+          fanId: clean(row?.fanId || fanId || existing.fanId || dialogId, 160),
+          lastIncomingEventId: eventId,
+          lastIncomingMessageId: clean(row?.messageId, 220) || existing.lastIncomingMessageId || null,
+          lastIncomingAt: eventAt,
+          incomingCount: Math.max(0, Number(existing.incomingCount || 0)) + 1,
+          projectionRevision: BigInt(existing.projectionRevision || 0) + 1n,
+          projectionState: "FULL",
+          ...marker,
+        },
+      });
+      return { status: "PENDING", row: updated, incremental: true };
+    }
+
+    const data = {
+      agencyId, creatorId, dialogId, fanId: clean(row?.fanId || fanId || dialogId, 160),
+      status: "PENDING", episodeKey: identity,
+      firstIncomingEventId: eventId, lastIncomingEventId: eventId,
+      firstIncomingMessageId: clean(row?.messageId, 220), lastIncomingMessageId: clean(row?.messageId, 220),
+      firstIncomingAt: eventAt, lastIncomingAt: eventAt, incomingCount: 1,
+      firstSeenAt: null, firstSeenMemberId: null, lastSeenAt: null, lastSeenMemberId: null,
+      ownerMemberId: null, ownerAssignedAt: null, ownerReason: null,
+      replyAt: null, replyMessageId: null, repliedByMemberId: null,
+      derivationVersion: PENDING_DERIVATION_VERSION,
+      projectionRevision: BigInt(existing?.projectionRevision || 0) + 1n,
+      projectionState: "FULL", ...marker,
+    };
+    const updated = await db.teamPendingDialogState.upsert({
+      where: { agencyId_creatorId_dialogId: { agencyId, creatorId, dialogId } },
+      create: data, update: data,
+    });
+    return { status: "PENDING", row: updated, incremental: true };
+  }
+
+  if (kind === "DIALOG_SEEN") {
+    if (!existing) return { status: "CLEAR", row: null, ignored: true };
+    const memberId = clean(row?.memberId, 160);
+    const isPending = String(existing.status || "").toUpperCase() === "PENDING";
+    const afterEpisodeStart = !existing.firstIncomingAt || compareEventOrder(eventAt, eventId, existing.firstIncomingAt, existing.firstIncomingEventId) >= 0;
+    const data = { ...marker, projectionRevision: BigInt(existing.projectionRevision || 0) + 1n };
+    if (isPending && memberId && afterEpisodeStart) {
+      data.firstSeenAt = existing.firstSeenAt || eventAt;
+      data.firstSeenMemberId = existing.firstSeenMemberId || memberId;
+      data.lastSeenAt = eventAt;
+      data.lastSeenMemberId = memberId;
+      data.ownerMemberId = memberId;
+      data.ownerAssignedAt = eventAt;
+      data.ownerReason = existing.firstSeenMemberId && existing.firstSeenMemberId !== memberId ? "DIALOG_SEEN_HANDOFF" : "DIALOG_SEEN";
+      data.projectionState = "FULL";
+    }
+    const updated = await db.teamPendingDialogState.update({ where: { id: existing.id }, data });
+    return { status: String(updated.status || "CLEAR"), row: updated, incremental: true };
+  }
+
+  if (kind === "MESSAGE_SEND_CONFIRMED" && isManualConfirmed(row)) {
+    if (!existing) return { status: "CLEAR", row: null, ignored: true };
+    const data = {
+      ...marker,
+      status: "CLEAR",
+      replyAt: eventAt,
+      replyMessageId: clean(row?.messageId, 220) || existing.replyMessageId || null,
+      repliedByMemberId: clean(row?.memberId, 160) || existing.repliedByMemberId || null,
+      projectionRevision: BigInt(existing.projectionRevision || 0) + 1n,
+      projectionState: "FULL",
+    };
+    const updated = await db.teamPendingDialogState.update({ where: { id: existing.id }, data });
+    return { status: "CLEAR", row: updated, incremental: true };
+  }
+
+  return { needsRepair: true, reason: "unsupported_incremental_kind" };
+}
+
 function pendingDialogFenceKey({ agencyId, creatorId, dialogId }) {
   return `team-pending:${clean(agencyId,160) || ""}:${clean(creatorId,160) || ""}:${clean(dialogId,160) || ""}`;
 }
@@ -291,13 +410,53 @@ async function applyTeamPendingProjection(row, db = prisma) {
     return { skipped: true, reason: "pending_projection_models_unavailable" };
   }
 
-  const result = await reconcilePendingDialog({
-    agencyId: row?.agencyId,
-    creatorId: row?.creatorId,
-    dialogId: row?.dialogId || row?.fanId,
-    fanId: row?.fanId,
-    sourceEventId: row?.id || row?.localId || null,
-    db,
+  const identity = {
+    agencyId: clean(row?.agencyId, 160),
+    creatorId: clean(row?.creatorId, 160),
+    dialogId: clean(row?.dialogId || row?.fanId, 160),
+    fanId: clean(row?.fanId || row?.dialogId, 160),
+  };
+  if (!identity.agencyId || !identity.creatorId || !identity.dialogId) {
+    await markProjected(row, db);
+    return { skipped: true, reason: "missing_dialog_identity" };
+  }
+
+  const result = await runDbTransaction(db, async (tx) => {
+    if (typeof tx?.$executeRawUnsafe === "function") {
+      await lockDbAdvisoryXact({ db: tx, key: pendingDialogFenceKey(identity), mode: "exclusive" });
+    }
+    const existing = await existingState({ agencyId: identity.agencyId, creatorId: identity.creatorId, dialogId: identity.dialogId, db: tx });
+    const eventAt = dateOrNull(row?.ts);
+    const eventId = clean(row?.id, 220) || clean(row?.localId, 220);
+    const markerAt = dateOrNull(existing?.lastAppliedEventAt);
+    const markerId = clean(existing?.lastAppliedEventId, 220);
+
+    if (existing && markerAt && markerId && eventAt && eventId) {
+      const order = compareEventOrder(eventAt, eventId, markerAt, markerId);
+      if (order === 0) return { status: String(existing.status || "CLEAR"), row: existing, idempotent: true };
+      if (order > 0) {
+        const incremental = await applyIncrementalPendingEventUnlocked({ row, existing, ...identity, db: tx });
+        if (!incremental?.needsRepair) return incremental;
+      }
+    }
+
+    // Transition/late-event repair remains a separate path. Normal in-order current
+    // events above are O(current state), not O(unanswered history).
+    const repaired = await reconcilePendingDialogUnlocked({
+      agencyId: identity.agencyId, creatorId: identity.creatorId, dialogId: identity.dialogId,
+      fanId: identity.fanId, sourceEventId: eventId, db: tx,
+    });
+    if (repaired?.row && eventAt && eventId) {
+      const currentAt = dateOrNull(repaired.row.lastAppliedEventAt);
+      const currentId = clean(repaired.row.lastAppliedEventId, 220);
+      if (!currentAt || compareEventOrder(eventAt, eventId, currentAt, currentId) > 0) {
+        repaired.row = await tx.teamPendingDialogState.update({
+          where: { id: repaired.row.id },
+          data: { lastAppliedEventAt: eventAt, lastAppliedEventId: eventId },
+        });
+      }
+    }
+    return repaired;
   });
   await markProjected(row, db);
   return result;

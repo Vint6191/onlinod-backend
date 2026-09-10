@@ -49,15 +49,51 @@ function bytesToMiB(bytes) {
   return Math.round((Number(bytes || 0) / 1024 / 1024) * 100) / 100;
 }
 
+function prismaPhysicalTable(schemaText, modelName) {
+  const block = String(schemaText || "").match(new RegExp(`model\\s+${modelName}\\s*\\{([\\s\\S]*?)\\n\\}`));
+  if (!block) throw new Error(`PHASE2_SCALE_PRISMA_MODEL_MISSING:${modelName}`);
+  const mapped = block[1].match(/@@map\("([^"]+)"\)/);
+  return mapped ? mapped[1] : modelName;
+}
+
+function currentProjectionAuthority() {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const schema = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "schema.prisma"), "utf8");
+  const responseTable = prismaPhysicalTable(schema, "TeamResponseCase");
+  const pendingTable = prismaPhysicalTable(schema, "TeamPendingDialogState");
+  const expected = {
+    responseTable: "TeamResponseCaseCurrent",
+    pendingTable: "TeamPendingDialogStateCurrent",
+  };
+  const actual = { responseTable, pendingTable };
+  if (actual.responseTable !== expected.responseTable || actual.pendingTable !== expected.pendingTable) {
+    const error = new Error("PHASE2_SCALE_CURRENT_AUTHORITY_MAPPING_MISMATCH");
+    error.code = "PHASE2_SCALE_CURRENT_AUTHORITY_MAPPING_MISMATCH";
+    error.expected = expected;
+    error.actual = actual;
+    throw error;
+  }
+  return actual;
+}
+
+function quoteIdent(value) {
+  const text = String(value || "");
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(text)) {
+    throw new Error(`PHASE2_SCALE_SQL_IDENTIFIER_INVALID:${text}`);
+  }
+  return `"${text}"`;
+}
+
 function sqlLabel(sql) {
   const text = String(sql || "").replace(/\s+/g, " ").trim();
   const known = [
     "TeamMemberActivityDaily",
     "TeamActivityEvent",
     "TeamMoneyAttributionFact",
-    "TeamResponseCase",
+    "TeamResponseCaseCurrent",
+    "TeamPendingDialogStateCurrent",
     "TeamDialogSession",
-    "TeamPendingDialogState",
     "TeamHistoricalAnalyticsCoverage",
   ];
   const hit = known.find((name) => text.includes(`\"${name}\"`));
@@ -193,7 +229,7 @@ function largeDatasetChecks(dataset) {
   ];
 }
 
-async function explainRepresentativeQueries(prisma, agencyId) {
+async function explainRepresentativeQueries(prisma, agencyId, authority) {
   const detailDays = finiteInt(process.env.ONLINOD_PHASE2_SCALE_DETAIL_DAYS, 180);
   const queries = [
     {
@@ -217,7 +253,7 @@ async function explainRepresentativeQueries(prisma, agencyId) {
       sql: `SELECT r."memberId", COUNT(*)::bigint AS cases,
                    AVG(r."wallClockSeconds"::double precision) FILTER (WHERE r."slaEligible" = TRUE) AS avg_seconds,
                    percentile_cont(0.9) WITHIN GROUP (ORDER BY r."wallClockSeconds") FILTER (WHERE r."slaEligible" = TRUE) AS p90_seconds
-              FROM "TeamResponseCase" r
+              FROM ${quoteIdent(authority.responseTable)} r
              WHERE r."agencyId" = $1
                AND r."memberId" IS NOT NULL
                AND r."replyAt" >= clock_timestamp() - ($2::int * interval '1 day')
@@ -247,7 +283,7 @@ async function explainRepresentativeQueries(prisma, agencyId) {
     {
       id: "pending_current_grouped_by_owner",
       sql: `SELECT p."ownerMemberId", COUNT(*)::bigint AS pending
-              FROM "TeamPendingDialogState" p
+              FROM ${quoteIdent(authority.pendingTable)} p
              WHERE p."agencyId" = $1 AND p."status" = 'PENDING'
              GROUP BY p."ownerMemberId"`,
       params: [agencyId],
@@ -285,13 +321,14 @@ async function main() {
     const agency = await prisma.agency.findUnique({ where: { id: agencyId }, select: { id: true } });
     if (!agency) throw new Error("ONLINOD_PHASE2_SCALE_AGENCY_NOT_FOUND");
 
+    const currentAuthority = currentProjectionAuthority();
     const dataset = await countDataset(prisma, agencyId);
     const withoutMoney = await measureSnapshot({ prisma, buildTeamAnalyticsSnapshot, agencyId, includeMoney: false });
     const withMoney = await measureSnapshot({ prisma, buildTeamAnalyticsSnapshot, agencyId, includeMoney: true });
     const checks = structuralChecks({ dataset, withoutMoney, withMoney });
     const largeChecks = largeDatasetChecks(dataset);
     const explain = envFlag("ONLINOD_PHASE2_SCALE_EXPLAIN")
-      ? await explainRepresentativeQueries(prisma, agencyId)
+      ? await explainRepresentativeQueries(prisma, agencyId, currentAuthority)
       : [];
 
     const report = {
@@ -299,6 +336,7 @@ async function main() {
       mode: "READ_ONLY_EXISTING_DATA",
       agencyId,
       range: "all",
+      currentProjectionAuthority: currentAuthority,
       dataset,
       withoutMoney,
       withMoney,

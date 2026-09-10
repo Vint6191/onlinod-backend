@@ -193,6 +193,7 @@ function summarizePendingRows(rows, { now = new Date() } = {}) {
   let incomingMessages = 0;
   let unassignedDialogs = 0;
   let seenDialogs = 0;
+  let incompleteHistoryDialogs = 0;
   let olderThan15m = 0;
   let olderThan60m = 0;
   let oldestPendingSeconds = null;
@@ -200,6 +201,7 @@ function summarizePendingRows(rows, { now = new Date() } = {}) {
 
   for (const row of list) {
     incomingMessages += Math.max(1, Number(row?.incomingCount || 1));
+    if (String(row?.projectionState || "FULL").toUpperCase() === "INCOMPLETE_HISTORY") incompleteHistoryDialogs += 1;
     if (row?.ownerMemberId) seenDialogs += 1;
     else unassignedDialogs += 1;
     const age = secondsSince(row?.firstIncomingAt, now);
@@ -219,6 +221,8 @@ function summarizePendingRows(rows, { now = new Date() } = {}) {
     pendingIncomingMessages: incomingMessages,
     unassignedDialogs,
     seenDialogs,
+    incompleteHistoryDialogs,
+    historyCompleteness: incompleteHistoryDialogs > 0 ? "PARTIAL" : "FULL",
     olderThan15m,
     olderThan60m,
     oldestPendingAt,
@@ -235,7 +239,7 @@ async function summarizePendingWhere({ where, now = new Date(), db = prisma, fal
   const cutoff60m = new Date(nowDate.getTime() - 60 * 60 * 1000);
   const hasOwnerFilter = Object.prototype.hasOwnProperty.call(where || {}, "ownerMemberId");
   const ownerFilter = hasOwnerFilter ? where.ownerMemberId : undefined;
-  const [pendingDialogs, aggregate, rawUnassignedDialogs, rawSeenDialogs, olderThan15m, olderThan60m] = await Promise.all([
+  const [pendingDialogs, aggregate, rawUnassignedDialogs, rawSeenDialogs, incompleteHistoryDialogs, olderThan15m, olderThan60m] = await Promise.all([
     db.teamPendingDialogState.count({ where }),
     db.teamPendingDialogState.aggregate({ where, _sum: { incomingCount: true }, _min: { firstIncomingAt: true } }),
     hasOwnerFilter
@@ -244,6 +248,7 @@ async function summarizePendingWhere({ where, now = new Date(), db = prisma, fal
     hasOwnerFilter
       ? Promise.resolve(ownerFilter === null ? 0 : null)
       : db.teamPendingDialogState.count({ where: { ...where, ownerMemberId: { not: null } } }),
+    db.teamPendingDialogState.count({ where: { ...where, projectionState: "INCOMPLETE_HISTORY" } }),
     db.teamPendingDialogState.count({ where: { ...where, firstIncomingAt: { lte: cutoff15m } } }),
     db.teamPendingDialogState.count({ where: { ...where, firstIncomingAt: { lte: cutoff60m } } }),
   ]);
@@ -264,6 +269,8 @@ async function summarizePendingWhere({ where, now = new Date(), db = prisma, fal
     pendingIncomingMessages: Number(aggregate?._sum?.incomingCount || 0),
     unassignedDialogs,
     seenDialogs,
+    incompleteHistoryDialogs: Number(incompleteHistoryDialogs || 0),
+    historyCompleteness: Number(incompleteHistoryDialogs || 0) > 0 ? "PARTIAL" : "FULL",
     olderThan15m: Number(olderThan15m || 0),
     olderThan60m: Number(olderThan60m || 0),
     oldestPendingAt,
@@ -287,22 +294,30 @@ async function memberNamesForRows({ agencyId, rows, db = prisma }) {
   return new Map((members || []).map((member) => [member.id, member.displayName || member.user?.name || null]));
 }
 
-async function pendingProjectionAuthorityWhere({ agencyId, db = prisma } = {}) {
+async function pendingProjectionAuthority({ agencyId, db = prisma } = {}) {
+  let status;
   try {
-    const status = await phase2CoverageStatus({
+    status = await phase2CoverageStatus({
       db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION,
       generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION,
     });
-    if (!status?.ready) return {};
-    return {
+  } catch (_) {
+    status = { ready: false, historicalReady: false, currentReady: false, fresh: false, semanticState: "UNKNOWN", state: "UNAVAILABLE", live: null };
+  }
+  return {
+    status,
+    // Production Prisma maps this model to TeamPendingDialogStateCurrent. Never broaden
+    // a current reader to legacy/unknown generations when coverage cannot be proven.
+    where: {
       derivationVersion: CURRENT_PENDING_DERIVATION_VERSION,
       projectionState: { in: ["FULL", "INCOMPLETE_HISTORY"] },
-    };
-  } catch (_) {
-    // Coverage cannot be proven => preserve the pre-activation read contract.
-    // Activation itself is the authority boundary; never infer it from binary version.
-    return {};
-  }
+    },
+  };
+}
+
+async function pendingProjectionAuthorityWhere(options = {}) {
+  const authority = await pendingProjectionAuthority(options);
+  return authority.where;
 }
 
 async function listTeamPendingDialogs({
@@ -316,7 +331,8 @@ async function listTeamPendingDialogs({
 } = {}) {
   const normalizedMemberId = clean(memberId, 160);
   const normalizedOwnership = clean(ownership, 32)?.toLowerCase() || "all";
-  const generationWhere = await pendingProjectionAuthorityWhere({ agencyId, db });
+  const projectionAuthority = await pendingProjectionAuthority({ agencyId, db });
+  const generationWhere = projectionAuthority.where;
   const where = {
     agencyId,
     status: "PENDING",
@@ -339,6 +355,13 @@ async function listTeamPendingDialogs({
     ok: true,
     asOf: now,
     creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
+    projectionAuthority: {
+      state: projectionAuthority.status?.semanticState || "UNKNOWN",
+      historicalReady: projectionAuthority.status?.historicalReady === true,
+      fresh: projectionAuthority.status?.fresh === true,
+      outstandingCount: projectionAuthority.status?.live?.outstandingCount ?? null,
+      generation: CURRENT_PENDING_DERIVATION_VERSION,
+    },
     summary,
     rows: (rows || []).map((row) => ({
       id: row.id,
@@ -383,12 +406,13 @@ async function listTeamPendingDialogs({
       fanUsername: identities.fanMap.get(pairKey(row.creatorId, row.fanId || row.dialogId))?.username || null,
       fanAvatarUrl: identities.fanMap.get(pairKey(row.creatorId, row.fanId || row.dialogId))?.avatarUrl || null,
       derivationVersion: row.derivationVersion,
+      projectionState: clean(row.projectionState, 64) || "UNKNOWN",
     })),
   };
 }
 
 module.exports = {
-  CURRENT_PENDING_DERIVATION_VERSION, pendingProjectionAuthorityWhere,
+  CURRENT_PENDING_DERIVATION_VERSION, pendingProjectionAuthority, pendingProjectionAuthorityWhere,
   creatorScopeWhere,
   secondsSince,
   summarizePendingRows,

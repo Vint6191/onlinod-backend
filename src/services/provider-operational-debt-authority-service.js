@@ -310,28 +310,28 @@ async function findStandaloneIncompleteSource({ agencyId, accountId, db }) {
   return rows.find((row) => (row.telegramMessageIds || []).length > 0 && (row.ofMediaIds || []).length < (row.telegramMessageIds || []).length) || null;
 }
 
-async function listCurrentIncompleteSourceAccountsForCreators({ agencyId, creatorIds, db } = {}) {
-  const ids = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map(String).filter(Boolean)));
-  if (!ids.length) return [];
+async function listCurrentIncompleteSourceAccountsForCreators({ agencyId, creatorIds = null, db } = {}) {
+  const scopedIds = creatorIds == null ? null : Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map(String).filter(Boolean)));
+  if (scopedIds && !scopedIds.length) return [];
   if (typeof db?.$queryRawUnsafe === "function") {
     const rows = await db.$queryRawUnsafe(
       `SELECT DISTINCT "creatorId", "telegramSourceAccountId"
        FROM "CustomContentSubmission"
        WHERE "agencyId"=$1
-         AND "creatorId" = ANY($2::text[])
+         AND ($2::text[] IS NULL OR "creatorId" = ANY($2::text[]))
          AND "telegramSourceAccountId" IS NOT NULL
          AND "telegramSourceUserId" IS NOT NULL
          AND COALESCE("pipelineDisposition", 'ACTIVE')='ACTIVE'
          AND cardinality("telegramMessageIds") > 0
          AND cardinality("ofMediaIds") < cardinality("telegramMessageIds")
        ORDER BY "creatorId" ASC, "telegramSourceAccountId" ASC`,
-      String(agencyId), ids,
+      String(agencyId), scopedIds,
     );
     return (rows || []).map((row) => ({ creatorId: String(row.creatorId), telegramSourceAccountId: String(row.telegramSourceAccountId) }));
   }
   // Reduced test doubles: read a bounded current set and collapse to account identity.
   const rows = await db?.customContentSubmission?.findMany?.({
-    where: { agencyId, creatorId: { in: ids }, telegramSourceAccountId: { not: null }, telegramSourceUserId: { not: null }, pipelineDisposition: "ACTIVE" },
+    where: { agencyId, ...(scopedIds ? { creatorId: { in: scopedIds } } : {}), telegramSourceAccountId: { not: null }, telegramSourceUserId: { not: null }, pipelineDisposition: "ACTIVE" },
     select: { creatorId: true, telegramSourceAccountId: true, telegramMessageIds: true, ofMediaIds: true },
     orderBy: { id: "asc" }, take: 5000,
   }) || [];
@@ -347,19 +347,19 @@ async function listCurrentIncompleteSourceAccountsForCreators({ agencyId, creato
   return out;
 }
 
-async function listProviderOperationalAccountsForCreators({ agencyId, creatorIds, db, debtClasses = null } = {}) {
-  const ids = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map(String).filter(Boolean)));
-  if (!ids.length) return [];
+async function listProviderOperationalAccountsForCreators({ agencyId, creatorIds = null, db, debtClasses = null } = {}) {
+  const scopedIds = creatorIds == null ? null : Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map(String).filter(Boolean)));
+  if (scopedIds && !scopedIds.length) return [];
   const classes = Array.isArray(debtClasses) ? Array.from(new Set(debtClasses.map(String).filter(Boolean))) : [];
   if (typeof db?.$queryRawUnsafe === "function") {
-    const params = [String(agencyId), ids];
+    const params = [String(agencyId), scopedIds];
     let classSql = "";
     if (classes.length) { params.push(classes); classSql = ` AND "debtClass" = ANY($${params.length}::text[])`; }
     const rows = await db.$queryRawUnsafe(
       `SELECT DISTINCT "creatorId", "accountId", "debtClass"
        FROM "ProviderOperationalDebt"
        WHERE "agencyId"=$1
-         AND "creatorId" = ANY($2::text[])
+         AND ($2::text[] IS NULL OR "creatorId" = ANY($2::text[]))
          AND "accountId" IS NOT NULL${classSql}
        ORDER BY "creatorId" ASC, "accountId" ASC, "debtClass" ASC`,
       ...params,
@@ -367,7 +367,7 @@ async function listProviderOperationalAccountsForCreators({ agencyId, creatorIds
     return (rows || []).map((row) => ({ creatorId: String(row.creatorId), accountId: String(row.accountId), debtClass: String(row.debtClass) }));
   }
   const rows = await db?.providerOperationalDebt?.findMany?.({
-    where: { agencyId, creatorId: { in: ids }, accountId: { not: null }, ...(classes.length ? { debtClass: { in: classes } } : {}) },
+    where: { agencyId, ...(scopedIds ? { creatorId: { in: scopedIds } } : {}), accountId: { not: null }, ...(classes.length ? { debtClass: { in: classes } } : {}) },
     select: { creatorId: true, accountId: true, debtClass: true },
     orderBy: [{ id: "asc" }], take: 5000,
   }) || [];

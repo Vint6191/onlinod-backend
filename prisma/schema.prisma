@@ -2181,9 +2181,10 @@ model DomainWorkItem {
   accountId          String?
   requestedRevision  BigInt   @default(1)
   completedRevision  BigInt   @default(0)
-  activeGeneration   String   @default("phase2_domain_work_v1")
-  projectionVersion  String   @default("phase2_domain_work_v1")
+  activeGeneration   String   @default("phase2_domain_work_v2_actual53")
+  projectionVersion  String   @default("phase2_domain_work_v2_actual53")
   state              String   @default("READY")
+  isOutstanding      Boolean  @default(true)
   availableAt        DateTime @default(now())
   nextAttemptAt      DateTime?
   ownerToken         String?
@@ -2209,6 +2210,62 @@ model DomainWorkItem {
   @@index([agencyId, partitionKey, state, availableAt, id], map: "DomainWorkItem_partition_due_idx")
   @@index([agencyId, dependencyKind, dependencyKey, dependencyRevision, id], map: "DomainWorkItem_dependency_idx")
   @@index([state, availableAt, id], map: "DomainWorkItem_global_due_idx")
+}
+
+model Phase2WorkGenerationAuthority {
+  workClass          String   @id
+  activeGeneration   String
+  projectionVersion  String
+  revision            BigInt   @default(1)
+  previousGeneration String?
+  activatedAt         DateTime @default(now())
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model Phase2WorkFamilyState {
+  id                String   @id
+  agencyId          String
+  workClass         String
+  activeGeneration  String
+  outstandingCount  Int      @default(0)
+  requestedSequence BigInt   @default(0)
+  convergedSequence BigInt   @default(0)
+  lastRequestedAt   DateTime?
+  lastConvergedAt   DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([agencyId, workClass], map: "Phase2WorkFamilyState_identity_key")
+  @@index([agencyId, outstandingCount, workClass], map: "Phase2WorkFamilyState_outstanding_idx")
+}
+
+model DomainWorkReadyPartition {
+  id               String   @id
+  agencyId         String
+  workClass        String
+  partitionKey     String
+  activeGeneration String
+  headWorkId       String
+  nextDueAt        DateTime
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([agencyId, workClass, partitionKey], map: "DomainWorkReadyPartition_identity_key")
+  @@index([agencyId, workClass, activeGeneration, nextDueAt, partitionKey], map: "DomainWorkReadyPartition_due_idx")
+}
+
+model DomainWorkReadyAgency {
+  id               String   @id
+  agencyId         String
+  workClass        String
+  activeGeneration String
+  nextDueAt        DateTime
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([agencyId, workClass], map: "DomainWorkReadyAgency_identity_key")
+  @@index([workClass, activeGeneration, nextDueAt, agencyId], map: "DomainWorkReadyAgency_due_idx")
 }
 
 model Phase2WorkCoverage {
@@ -3160,6 +3217,8 @@ model TeamActivityEvent {
   @@index([agencyId, pendingProjectionVersion, ts])
   @@index([pendingProjectionVersion, ts, id], map: "TeamActivityEvent_pending_projection_work_idx")
   @@index([agencyId, creatorId, dialogId, dialogProjectionVersion, ts, id], map: "TeamActivityEvent_dialog_projection_work_idx")
+  @@index([agencyId, creatorId, dialogId, eventKind, ts, id], map: "TeamActivityEvent_dialog_kind_order_idx")
+  @@index([agencyId, creatorId, dialogId, eventKind, messageId, ts, id], map: "TeamActivityEvent_dialog_message_identity_idx")
   @@index([agencyId, historicalProjectionVersion, ts])
   @@index([agencyId, eventKind, semanticEventKey])
   @@index([agencyId, automationDeliveryId])
@@ -5431,6 +5490,8 @@ model TeamPendingDialogState {
   projectionRevision      BigInt   @default(0)
   projectionState         String   @default("FULL")
   lastProjectionSourceId  String?
+  lastAppliedEventAt      DateTime?
+  lastAppliedEventId      String?
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
 

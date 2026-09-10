@@ -13,17 +13,17 @@ function makeDb() {
       firstIncomingAt: new Date("2026-08-12T09:00:00.000Z"), lastIncomingAt: new Date("2026-08-12T09:02:00.000Z"), incomingCount: 3,
       firstIncomingMessageId: "m-1", lastIncomingMessageId: "m-3", firstSeenAt: new Date("2026-08-12T09:03:00.000Z"),
       firstSeenMemberId: "member-a", lastSeenAt: new Date("2026-08-12T09:04:00.000Z"), lastSeenMemberId: "member-a",
-      ownerMemberId: "member-a", ownerAssignedAt: new Date("2026-08-12T09:04:00.000Z"), ownerReason: "DIALOG_SEEN", derivationVersion: "team_pending_v1",
+      ownerMemberId: "member-a", ownerAssignedAt: new Date("2026-08-12T09:04:00.000Z"), ownerReason: "DIALOG_SEEN", derivationVersion: "team_pending_v2", projectionState: "FULL",
     },
     {
       id: "p-2", agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-2", fanId: "fan-2", status: "PENDING",
       firstIncomingAt: new Date("2026-08-12T08:00:00.000Z"), lastIncomingAt: new Date("2026-08-12T08:00:00.000Z"), incomingCount: 1,
-      ownerMemberId: null, derivationVersion: "team_pending_v1",
+      ownerMemberId: null, derivationVersion: "team_pending_v2", projectionState: "INCOMPLETE_HISTORY",
     },
     {
       id: "p-3", agencyId: "agency-1", creatorId: "creator-2", dialogId: "fan-3", fanId: "fan-3", status: "PENDING",
       firstIncomingAt: new Date("2026-08-12T08:30:00.000Z"), lastIncomingAt: new Date("2026-08-12T08:30:00.000Z"), incomingCount: 2,
-      ownerMemberId: "member-b", derivationVersion: "team_pending_v1",
+      ownerMemberId: "member-b", derivationVersion: "team_pending_v2", projectionState: "FULL",
     },
   ];
   return {
@@ -74,6 +74,8 @@ test("pending read model is current-queue, creator-scoped and exposes evidence w
   assert.equal(payload.summary.pendingIncomingMessages, 4);
   assert.equal(payload.summary.unassignedDialogs, 1);
   assert.equal(payload.summary.seenDialogs, 1);
+  assert.equal(payload.summary.incompleteHistoryDialogs, 1);
+  assert.equal(payload.summary.historyCompleteness, "PARTIAL");
   assert.equal(payload.summary.olderThan15m, 2);
   assert.equal(payload.summary.olderThan60m, 2);
   assert.equal(payload.summary.oldestPendingSeconds, 2 * 60 * 60);
@@ -87,6 +89,8 @@ test("pending read model is current-queue, creator-scoped and exposes evidence w
   assert.equal(first.platformIdentity.source, "SUBSCRIBER_DIRECTORY");
   assert.equal(first.relationship.fanSubscriptionActive, true);
   assert.equal(first.value.platformReportedTotalSpendCents, 12345);
+  const incomplete = payload.rows.find((row) => row.id === "p-2");
+  assert.equal(incomplete.projectionState, "INCOMPLETE_HISTORY", "public pending DTO must preserve incomplete-history state");
   assert.equal(Object.prototype.hasOwnProperty.call(payload.rows[0], "text"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(payload.rows[0], "messageText"), false);
 });

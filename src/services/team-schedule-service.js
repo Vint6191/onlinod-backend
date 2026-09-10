@@ -317,7 +317,27 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
     phase2CoverageStatus({ db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION }),
     phase2CoverageStatus({ db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR }),
   ]);
-  const currentResponseGeneration = dialogGenerationStatus?.ready === true && responseRepairStatus?.ready === true;
+  // Actual53/F53-08: the physical TeamResponseCase model already maps to the
+  // current projection generation. Historical coverage is not authority to
+  // fail-open into a legacy/unversioned reader; freshness is reported
+  // separately from generation selection.
+  const currentResponseGeneration = true;
+  const responseProjectionFresh = dialogGenerationStatus?.currentReady === true
+    && responseRepairStatus?.currentReady === true;
+  const responseProjectionAuthority = {
+    state: responseProjectionFresh
+      ? "CURRENT_FRESH"
+      : (dialogGenerationStatus?.semanticState === "UNKNOWN" || responseRepairStatus?.semanticState === "UNKNOWN")
+        ? "UNKNOWN"
+        : (dialogGenerationStatus?.historicalReady === true && responseRepairStatus?.historicalReady === true)
+          ? "CURRENT_STALE"
+          : "TRANSITION",
+    fresh: responseProjectionFresh,
+    historicalReady: dialogGenerationStatus?.historicalReady === true && responseRepairStatus?.historicalReady === true,
+    dialogOutstandingCount: Number(dialogGenerationStatus?.live?.outstandingCount || 0),
+    responseOutstandingCount: Number(responseRepairStatus?.live?.outstandingCount || 0),
+    generation: "team_response_v2",
+  };
   if (retentionPolicy?.ok !== true) throw error("TEAM_RETENTION_POLICY_UNAVAILABLE", "Team retention policy is unavailable", 503);
   if (!projectionCoverage) throw error("TEAM_PROJECTION_COVERAGE_UNAVAILABLE", "Team projection coverage is unavailable", 503);
   const detailDays = Number(retentionPolicy.settings?.teamCanonicalDetailDays || 180);
@@ -353,6 +373,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
       handoffs: scaled.handoffs,
       overlaps: scaled.overlaps,
       detailCoverage: scaled.detailCoverage,
+      projectionAuthority: responseProjectionAuthority,
       source: "team_shift_scale_sql_v2",
     };
   }
@@ -563,6 +584,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
     members,
     handoffs: handoffs.slice(0, 100),
     overlaps: overlaps.slice(0, 100),
+    projectionAuthority: responseProjectionAuthority,
     source: "team_shift_plus_coverage_v1",
   };
 }

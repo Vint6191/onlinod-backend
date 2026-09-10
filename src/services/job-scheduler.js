@@ -50,6 +50,7 @@ const {
   yieldDomainWorkClaim,
   publishDomainWork,
   currentDependencyRevision,
+  hasOutstandingDomainWork,
 } = require("./domain-work-authority-service");
 const {
   FAMILY: PHASE2_COVERAGE_FAMILY,
@@ -60,6 +61,13 @@ const {
   markPhase2CoverageFailed,
   phase2CoverageStatus,
 } = require("./phase2-work-coverage-authority-service");
+const {
+  COVERAGE_SEED_LANE_KEY: PHASE2_COVERAGE_SEED_LANE_KEY,
+  COVERAGE_SEED_GENERATION: PHASE2_COVERAGE_SEED_GENERATION,
+  COVERAGE_MANIFEST: PHASE2_COVERAGE_MANIFEST,
+  COVERAGE_MANIFEST_VERSION: PHASE2_COVERAGE_MANIFEST_VERSION,
+  coverageManifestFingerprint,
+} = require("./phase2-coverage-manifest");
 const { stampCollectionAuthorityParams } = require("./analytics-collector-control-service");
 const {
   ensureOperationalAnalyticsFreshness,
@@ -81,8 +89,6 @@ const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin settin
 const TEAM_PENDING_BACKFILL_BATCH_SIZE = 500; // DB-only Team queue projection repair
 const PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE = 100; // one-time cold-history -> current-work projection
 const PROVIDER_OPERATIONAL_DIRTY_BATCH_SIZE = 100; // bounded current canonical transitions only
-const PHASE2_COVERAGE_SEED_LANE_KEY = "phase2_coverage_seed_v2";
-const PHASE2_COVERAGE_SEED_GENERATION = "phase2_coverage_seed_v2";
 const PHASE2_COVERAGE_AGENCY_BATCH_SIZE = 100;
 const PHASE2_HISTORICAL_ENUMERATION_BATCH_SIZE = 20;
 const PHASE2_CUSTOM_REMINDER_BATCH_SIZE = 50;
@@ -520,19 +526,7 @@ async function maybeSeedPhase2CoverageWork({ db = prisma, now = new Date() } = {
       let published = 0;
       for (const agency of agencies) {
         const agencyId = String(agency.id);
-        for (const [family, generation] of [
-          [PHASE2_COVERAGE_FAMILY.PROVIDER_OPERATIONAL, PHASE2_COVERAGE_GENERATION.PROVIDER_OPERATIONAL],
-          [PHASE2_COVERAGE_FAMILY.CUSTOM_EXTERNAL_PROJECTION, PHASE2_COVERAGE_GENERATION.CUSTOM_EXTERNAL_PROJECTION],
-          [PHASE2_COVERAGE_FAMILY.CUSTOM_SOURCE_PIPELINE, PHASE2_COVERAGE_GENERATION.CUSTOM_SOURCE_PIPELINE],
-          [PHASE2_COVERAGE_FAMILY.TEAM_ACTIVITY_CONTRIBUTION, PHASE2_COVERAGE_GENERATION.TEAM_ACTIVITY_CONTRIBUTION],
-          [PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR],
-          [PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION],
-          [PHASE2_COVERAGE_FAMILY.TEAM_MONEY_ROOT_CLASSIFICATION, PHASE2_COVERAGE_GENERATION.TEAM_MONEY_ROOT_CLASSIFICATION],
-          [PHASE2_COVERAGE_FAMILY.TEAM_MONEY_RECONCILIATION, PHASE2_COVERAGE_GENERATION.TEAM_MONEY_RECONCILIATION],
-          [PHASE2_COVERAGE_FAMILY.TEAM_READ_SUMMARY, PHASE2_COVERAGE_GENERATION.TEAM_READ_SUMMARY],
-          [PHASE2_COVERAGE_FAMILY.TELEGRAM_CONFIRMED_PROJECTION, PHASE2_COVERAGE_GENERATION.TELEGRAM_CONFIRMED_PROJECTION],
-          [PHASE2_COVERAGE_FAMILY.TELEGRAM_INBOUND_PROJECTION, PHASE2_COVERAGE_GENERATION.TELEGRAM_INBOUND_PROJECTION],
-        ]) {
+        for (const [family, generation] of PHASE2_COVERAGE_MANIFEST) {
           const status = await phase2CoverageStatus({ db, agencyId, family, generation });
           if (!status.ready) {
             await publishCoverageEnumerationWork({ db, agencyId, family, generation, now });
@@ -545,7 +539,12 @@ async function maybeSeedPhase2CoverageWork({ db = prisma, now = new Date() } = {
         complete, outcome: complete ? "COVERAGE_SEED_COMPLETE" : "COVERAGE_SEED_BATCH_COMPLETE",
         cursor: { lastAgencyId: complete ? null : String(agencies[agencies.length - 1]?.id || cursor || "") },
         nextRunAt: complete ? null : new Date(now.getTime() + 1_000),
-        progress: { scannedAgencies: Number(claim?.progress?.scannedAgencies || 0) + agencies.length, published },
+        progress: {
+          manifestVersion: PHASE2_COVERAGE_MANIFEST_VERSION,
+          manifestFingerprint: coverageManifestFingerprint(),
+          scannedAgencies: Number(claim?.progress?.scannedAgencies || 0) + agencies.length,
+          published: Number(claim?.progress?.published || 0) + published,
+        },
       };
     },
   });
@@ -556,7 +555,7 @@ async function runProviderCoverageEnumerationUnit({ db, item, ownerToken, now })
   const family = PHASE2_COVERAGE_FAMILY.PROVIDER_OPERATIONAL;
   const generation = PHASE2_COVERAGE_GENERATION.PROVIDER_OPERATIONAL;
   const cursor = String(item?.progressCursor?.lastOrderId || item?.progressCursor?.lastId || "").trim() || null;
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const rows = await selectProviderOperationalBackfillBatch({ db, agencyId: item.agencyId, cursor, limit: PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE });
   let projected = 0;
   for (const row of rows) {
@@ -570,10 +569,10 @@ async function runProviderCoverageEnumerationUnit({ db, item, ownerToken, now })
   }
   const lastOrderId = rows.length ? String(rows[rows.length - 1].id) : cursor;
   if (rows.length >= PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: lastOrderId });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: lastOrderId });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastOrderId }, availableAt: now, fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: lastOrderId, projectedThrough: lastOrderId, unresolvedCount: 0, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: lastOrderId, projectedThrough: lastOrderId, unresolvedCount: 0, fallbackNow: now });
   const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
   return { ...ack, projected, complete: true };
 }
@@ -583,19 +582,19 @@ async function runExternalCoverageEnumerationUnit({ db, item, ownerToken, now })
   const family = PHASE2_COVERAGE_FAMILY.CUSTOM_EXTERNAL_PROJECTION;
   const generation = PHASE2_COVERAGE_GENERATION.CUSTOM_EXTERNAL_PROJECTION;
   const cursor = String(item?.progressCursor?.lastSubmissionId || "").trim() || null;
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const batch = await convergeHistoricalCustomExternalProofs({ agencyId: item.agencyId, cursor, limit: 200, db });
   const nextCursor = String(batch?.nextCursor || cursor || "").trim() || null;
   if (batch?.ok === false || Number(batch?.failed || 0) > 0) {
-    await markPhase2CoverageFailed({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, Number(batch?.failed || 0)) });
+    await markPhase2CoverageFailed({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, Number(batch?.failed || 0)) });
     const error = new Error("CUSTOM_EXTERNAL_COVERAGE_ENUMERATION_FAILED"); error.code = "CUSTOM_EXTERNAL_COVERAGE_ENUMERATION_FAILED";
     return failDomainWorkClaim({ db, item, ownerToken, error, fallbackNow: new Date() });
   }
   if (batch?.complete === false) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastSubmissionId: nextCursor }, availableAt: now, fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
   return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
 }
 
@@ -603,7 +602,7 @@ async function runCustomSourcePipelineCoverageEnumerationUnit({ db, item, ownerT
   const family = PHASE2_COVERAGE_FAMILY.CUSTOM_SOURCE_PIPELINE;
   const generation = PHASE2_COVERAGE_GENERATION.CUSTOM_SOURCE_PIPELINE;
   const cursor = String(item?.progressCursor?.lastSubmissionId || "").trim() || null;
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const rows = await db.customContentSubmission.findMany({
     where: {
       agencyId: String(item.agencyId),
@@ -622,32 +621,21 @@ async function runCustomSourcePipelineCoverageEnumerationUnit({ db, item, ownerT
   });
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastSubmissionId: nextCursor }, availableAt: now, fallbackNow: new Date() });
   }
 
   // Enumeration is not activation. Existing source work can be owned by a Desktop
   // for several minutes while Telegram/OnlyFans execution is in flight. Coverage is
   // COMPLETE only when every enumerated/live source revision has reached DONE.
-  let outstanding = false;
-  if (typeof db?.$queryRawUnsafe === "function") {
-    const pending = await db.$queryRawUnsafe(`SELECT EXISTS (
-      SELECT 1 FROM "DomainWorkItem" w WHERE w."agencyId"=$1 AND w."workClass"='CUSTOM_SOURCE_PIPELINE'
-        AND (w."state" <> 'DONE' OR w."requestedRevision" > w."completedRevision") LIMIT 1
-    ) AS "hasOutstanding"`, String(item.agencyId));
-    outstanding = Boolean(pending?.[0]?.hasOutstanding);
-  } else if (db?.domainWorkItem?.findMany) {
-    const pending = await db.domainWorkItem.findMany({
-      where: { agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE },
-      select: { state: true, requestedRevision: true, completedRevision: true }, take: 100,
-    });
-    outstanding = (pending || []).some((row) => String(row?.state || "") !== "DONE" || BigInt(row?.requestedRevision || 0) > BigInt(row?.completedRevision || 0));
-  }
+  const outstanding = await hasOutstandingDomainWork({
+    db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+  });
   if (outstanding) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastSubmissionId: nextCursor }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: "domain_work_converged", unresolvedCount: 0, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: "domain_work_converged", unresolvedCount: 0, fallbackNow: now });
   return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
 }
 
@@ -657,21 +645,21 @@ async function runTeamActivityCoverageEnumerationUnit({ db, item, ownerToken, no
   const generation = PHASE2_COVERAGE_GENERATION.TEAM_ACTIVITY_CONTRIBUTION;
   const cursor = String(item?.progressCursor?.lastEventId || "").trim() || null;
   const previousUnresolved = Math.max(0, Number(item?.progressCursor?.unresolved || 0));
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const batch = await backfillActivityContributionBatch({ db, agencyId: item.agencyId, cursor, limit: 100 });
   if (batch?.ok === false) {
-    await markPhase2CoverageFailed({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved + Number(batch?.unresolved || 0)) });
+    await markPhase2CoverageFailed({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved + Number(batch?.unresolved || 0)) });
     const error = new Error(batch?.code || "TEAM_ACTIVITY_CONTRIBUTION_BACKFILL_FAILED"); error.code = batch?.code || "TEAM_ACTIVITY_CONTRIBUTION_BACKFILL_FAILED";
     return failDomainWorkClaim({ db, item, ownerToken, error, fallbackNow: new Date() });
   }
   const unresolved = previousUnresolved + Number(batch?.unresolved || 0);
   const nextCursor = String(batch?.nextCursor || cursor || "").trim() || null;
   if (batch?.complete === false) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastEventId: nextCursor, unresolved }, availableAt: now, fallbackNow: new Date() });
   }
   await markPhase2CoverageComplete({
-    db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor,
+    db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor,
     unresolvedCount: unresolved, fallbackNow: now,
   });
   const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
@@ -684,21 +672,21 @@ async function runTeamResponseCoverageEnumerationUnit({ db, item, ownerToken, no
   const generation = PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR;
   const cursor = String(item?.progressCursor?.lastCaseId || "").trim() || null;
   const previousUnresolved = Math.max(0, Number(item?.progressCursor?.unresolved || 0));
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const batch = await backfillTeamResponseRangeBatch({ db, agencyId: item.agencyId, cursor, limit: 100 });
   if (batch?.ok === false) {
-    await markPhase2CoverageFailed({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved + Number(batch?.unresolved || 0)) });
+    await markPhase2CoverageFailed({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved + Number(batch?.unresolved || 0)) });
     const error = new Error(batch?.code || "TEAM_RESPONSE_RANGE_REPAIR_FAILED"); error.code = batch?.code || "TEAM_RESPONSE_RANGE_REPAIR_FAILED";
     return failDomainWorkClaim({ db, item, ownerToken, error, fallbackNow: new Date() });
   }
   const unresolved = previousUnresolved + Number(batch?.unresolved || 0);
   const nextCursor = String(batch?.nextCursor || cursor || "").trim() || null;
   if (batch?.complete === false) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastCaseId: nextCursor, unresolved }, availableAt: now, fallbackNow: new Date() });
   }
   await markPhase2CoverageComplete({
-    db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor,
+    db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor,
     unresolvedCount: unresolved, fallbackNow: now,
   });
   const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
@@ -711,7 +699,7 @@ async function runTeamDialogCoverageEnumerationUnit({ db, item, ownerToken, now 
   const family = PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION;
   const generation = PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION;
   const cursor = String(item?.progressCursor?.lastEventId || "").trim() || null;
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const rows = await listUnprojectedRelevantDialogEvents({
     db, agencyId: String(item.agencyId), cursor, limit: 100,
   });
@@ -726,7 +714,7 @@ async function runTeamDialogCoverageEnumerationUnit({ db, item, ownerToken, now 
   }
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastEventId: nextCursor }, availableAt: now, fallbackNow: new Date() });
   }
   // Enumerated != converged. Before activating coverage, verify no raw event remains
@@ -743,10 +731,10 @@ async function runTeamDialogCoverageEnumerationUnit({ db, item, ownerToken, now 
     unresolved += 1;
   }
   if (unresolved > 0) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastEventId: null }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
   const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
   return { ...ack, complete: true, published };
 }
@@ -757,20 +745,20 @@ async function runTeamMoneyRootClassificationUnit({ db, item, ownerToken, now })
   const generation = PHASE2_COVERAGE_GENERATION.TEAM_MONEY_ROOT_CLASSIFICATION;
   const cursor = String(item?.progressCursor?.lastFactId || "").trim() || null;
   const previousUnresolved = Math.max(0, Number(item?.progressCursor?.unresolved || 0));
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const batch = await classifyTeamMoneyRootsBatch({ db, agencyId: item.agencyId, cursor, limit: 100 });
   if (batch?.ok === false) {
-    await markPhase2CoverageFailed({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved) });
+    await markPhase2CoverageFailed({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved) });
     const error = new Error(batch?.code || "TEAM_MONEY_ROOT_CLASSIFICATION_FAILED"); error.code = batch?.code || "TEAM_MONEY_ROOT_CLASSIFICATION_FAILED";
     return failDomainWorkClaim({ db, item, ownerToken, error, fallbackNow: new Date() });
   }
   const unresolved = previousUnresolved + Math.max(0, Number(batch?.unresolved || 0));
   const nextCursor = String(batch?.nextCursor || cursor || "").trim() || null;
   if (batch?.complete === false) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastFactId: nextCursor, unresolved }, availableAt: now, fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: unresolved, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: unresolved, fallbackNow: now });
   const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
   return { ...ack, complete: true, unresolved, scanned: Number(batch?.scanned || 0) };
 }
@@ -782,7 +770,7 @@ async function runTeamMoneyReconciliationCoverageEnumerationUnit({ db, item, own
   const progress = item?.progressCursor && typeof item.progressCursor === "object" ? item.progressCursor : {};
   const phase = String(progress.phase || "legacy_manual");
   const agencyId = String(item.agencyId);
-  await markPhase2CoverageRunning({ db, agencyId, family, generation, enumeratedThrough: JSON.stringify(progress) });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId, family, generation, enumeratedThrough: JSON.stringify(progress) });
 
   if (phase === "legacy_manual") {
     const repaired = await repairMigratedLegacyTipManualAuthority({ db, agencyId, limit: 100, dryRun: false });
@@ -811,7 +799,7 @@ async function runTeamMoneyReconciliationCoverageEnumerationUnit({ db, item, own
     });
     const nextId = rows?.length ? String(rows[rows.length - 1].id) : cursor;
     if (Number(rows?.length || 0) >= 100) {
-      await markPhase2CoverageRunning({ db, agencyId, family, generation, enumeratedThrough: `${phase}:${nextId}` });
+      await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId, family, generation, enumeratedThrough: `${phase}:${nextId}` });
       return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { phase, lastId: nextId }, availableAt: now, fallbackNow: new Date() });
     }
     if (phase === "sales") {
@@ -821,25 +809,14 @@ async function runTeamMoneyReconciliationCoverageEnumerationUnit({ db, item, own
 
   // Enumeration alone is not activation. Wait until every exact current/historical
   // money item published for this agency has reached the requested revision.
-  let outstanding = false;
-  if (typeof db?.$queryRawUnsafe === "function") {
-    const rows = await db.$queryRawUnsafe(`SELECT EXISTS (
-      SELECT 1 FROM "DomainWorkItem" w WHERE w."agencyId"=$1 AND w."workClass"='TEAM_MONEY_RECONCILIATION'
-        AND (w."state" <> 'DONE' OR w."requestedRevision" > w."completedRevision") LIMIT 1
-    ) AS "hasOutstanding"`, agencyId);
-    outstanding = Boolean(rows?.[0]?.hasOutstanding);
-  } else if (db?.domainWorkItem?.findMany) {
-    const pendingRows = await db.domainWorkItem.findMany({
-      where: { agencyId, workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION },
-      select: { state: true, requestedRevision: true, completedRevision: true }, take: 25,
-    });
-    outstanding = (pendingRows || []).some((row) => String(row?.state || "") !== "DONE" || BigInt(row?.requestedRevision || 0) > BigInt(row?.completedRevision || 0));
-  }
+  const outstanding = await hasOutstandingDomainWork({
+    db, agencyId, workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION,
+  });
   if (outstanding) {
-    await markPhase2CoverageRunning({ db, agencyId, family, generation, enumeratedThrough: "sources_enumerated" });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId, family, generation, enumeratedThrough: "sources_enumerated" });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { phase: "verify" }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId, family, generation, enumeratedThrough: "sources_enumerated", projectedThrough: "domain_work_converged", unresolvedCount: 0, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId, family, generation, enumeratedThrough: "sources_enumerated", projectedThrough: "domain_work_converged", unresolvedCount: 0, fallbackNow: now });
   return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
 }
 
@@ -847,7 +824,7 @@ async function runTeamReadSummaryCoverageEnumerationUnit({ db, item, ownerToken,
   const family = PHASE2_COVERAGE_FAMILY.TEAM_READ_SUMMARY;
   const generation = PHASE2_COVERAGE_GENERATION.TEAM_READ_SUMMARY;
   const cursor = String(item?.progressCursor?.lastFactId || "").trim() || null;
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const rows = await db.teamMoneyAttributionFact.findMany({
     where: { agencyId: String(item.agencyId), ...(cursor ? { id: { gt: cursor } } : {}) },
     select: { id: true, creatorId: true }, orderBy: { id: "asc" }, take: 100,
@@ -859,7 +836,7 @@ async function runTeamReadSummaryCoverageEnumerationUnit({ db, item, ownerToken,
   });
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastFactId: nextCursor }, availableAt: now, fallbackNow: new Date() });
   }
   // Do not activate a reader generation merely because source rows were enumerated.
@@ -881,25 +858,14 @@ async function runTeamReadSummaryCoverageEnumerationUnit({ db, item, ownerToken,
   // historical enumerator has passed it, leaving a newer TEAM_READ_SUMMARY revision queued.
   // Coverage is allowed to activate only after both storage presence and execution revision
   // convergence are proven.
-  let outstanding = false;
-  if (typeof db?.$queryRawUnsafe === "function") {
-    const pending = await db.$queryRawUnsafe(`SELECT EXISTS (
-      SELECT 1 FROM "DomainWorkItem" w WHERE w."agencyId"=$1 AND w."workClass"='TEAM_READ_SUMMARY'
-        AND (w."state" <> 'DONE' OR w."requestedRevision" > w."completedRevision") LIMIT 1
-    ) AS "hasOutstanding"`, String(item.agencyId));
-    outstanding = Boolean(pending?.[0]?.hasOutstanding);
-  } else if (db?.domainWorkItem?.findMany) {
-    const pending = await db.domainWorkItem.findMany({
-      where: { agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY },
-      select: { state: true, requestedRevision: true, completedRevision: true }, take: 25,
-    });
-    outstanding = (pending || []).some((row) => String(row?.state || "") !== "DONE" || BigInt(row?.requestedRevision || 0) > BigInt(row?.completedRevision || 0));
-  }
+  const outstanding = await hasOutstandingDomainWork({
+    db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY,
+  });
   if (Number(missing?.length || 0) > 0 || outstanding) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastFactId: nextCursor }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
   return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
 }
 
@@ -907,7 +873,7 @@ async function runTelegramConfirmedCoverageEnumerationUnit({ db, item, ownerToke
   const family = PHASE2_COVERAGE_FAMILY.TELEGRAM_CONFIRMED_PROJECTION;
   const generation = PHASE2_COVERAGE_GENERATION.TELEGRAM_CONFIRMED_PROJECTION;
   const cursor = String(item?.progressCursor?.lastIntentId || "").trim() || null;
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const rows = await db.telegramDeliveryIntent.findMany({
     where: { agencyId: String(item.agencyId), state: "CONFIRMED", ...(cursor ? { id: { gt: cursor } } : {}) },
     select: { id: true, creatorId: true, accountId: true }, orderBy: { id: "asc" }, take: 100,
@@ -919,10 +885,10 @@ async function runTelegramConfirmedCoverageEnumerationUnit({ db, item, ownerToke
   });
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastIntentId: nextCursor }, availableAt: now, fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
   return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
 }
 
@@ -930,7 +896,7 @@ async function runTelegramInboundCoverageEnumerationUnit({ db, item, ownerToken,
   const family = PHASE2_COVERAGE_FAMILY.TELEGRAM_INBOUND_PROJECTION;
   const generation = PHASE2_COVERAGE_GENERATION.TELEGRAM_INBOUND_PROJECTION;
   const cursor = String(item?.progressCursor?.lastInboundEventId || "").trim() || null;
-  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
   const rows = await db.telegramInboundEvent.findMany({
     where: {
       agencyId: String(item.agencyId),
@@ -949,10 +915,10 @@ async function runTelegramInboundCoverageEnumerationUnit({ db, item, ownerToken,
   });
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
-    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastInboundEventId: nextCursor }, availableAt: now, fallbackNow: new Date() });
   }
-  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  await markPhase2CoverageComplete({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
   return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
 }
 
@@ -997,7 +963,7 @@ async function maybeRunPhase2HistoricalEnumeration({ db = prisma, now = new Date
       else if (result?.failed) report.failed += 1;
       else report.completed += 1;
     } catch (error) {
-      await markPhase2CoverageFailed({ db, agencyId: item.agencyId,
+      await markPhase2CoverageFailed({ db, workItem: item, ownerToken, agencyId: item.agencyId,
         family: String(item.objectId || "").split(":")[0], generation: String(item.objectId || "").split(":").slice(1).join(":"), unresolvedCount: 1 }).catch(() => {});
       const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
       if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
@@ -1431,6 +1397,40 @@ async function runTeamMoneyReconciliationSweep({ now = new Date(), db = prisma }
   return report;
 }
 
+async function runCreatorDestructiveCleanupSweep({ now = new Date(), db = prisma } = {}) {
+  const { processCreatorHardDeleteWorkItem } = require("./phase2-destructive-delete-authority-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.DESTRUCTIVE_CREATOR_CLEANUP,
+    limit: 10, perAgencyQuantum: 2, perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), completed: 0, yielded: 0, deletedRows: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      const result = await processCreatorHardDeleteWorkItem({ db, item, ownerToken: claim.ownerToken, batchSize: 250, fallbackNow: now });
+      report.deletedRows += Number(result?.deleted || 0);
+      if (result?.lost) { report.lostOwnership += 1; continue; }
+      if (result?.ok === false) throw Object.assign(new Error(result?.code || "CREATOR_DESTRUCTIVE_CLEANUP_FAILED"), { code: result?.code || "CREATOR_DESTRUCTIVE_CLEANUP_FAILED" });
+      if (result?.complete) {
+        const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+        if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
+      } else {
+        const yielded = await yieldDomainWorkClaim({
+          db, item, ownerToken: claim.ownerToken,
+          progressCursor: { phase: result?.phase || "CLEANUP", deletedRows: report.deletedRows },
+          availableAt: new Date(now.getTime() + 250), fallbackNow: new Date(),
+        });
+        if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+      }
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
+}
+
 async function runTeamReadSummarySweep({ now = new Date(), db = prisma } = {}) {
   const { applyTeamMoneyFactToRollups } = require("./team-money-rollup-authority-service");
   const claim = await claimDomainWorkBatch({
@@ -1775,6 +1775,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
     // this rotation is only a resource/fairness budget, never business truth. A restart may
     // change which lane runs first, but no lane loses work because claims/cursors stay durable.
     const lanes = [
+      ["creatorDestructiveCleanup", () => runCreatorDestructiveCleanupSweep({ db, now })],
       ["providerOperationalBackfill", () => maybeBackfillProviderOperationalDebt({ db, now })],
       ["dependencyFanout", () => maybeRunPhase2DependencyFanout({ db, now })],
       ["customReminderWork", () => maybePlanDueCustomReminderWork({ db, now })],
@@ -1998,6 +1999,7 @@ module.exports = {
   runTeamResponseRangeRepairSweep,
   runTeamMoneyReconciliationSweep,
   runTeamReadSummarySweep,
+  runCreatorDestructiveCleanupSweep,
   maybeRunRetentionSweep,
   maybeReconcileHistoricalTeamMoney,
   maybeRepairLegacyTeamPendingBootstrap,

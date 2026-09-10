@@ -860,22 +860,12 @@ async function teamMoneyReadSummaryGenerationStatus({ agencyId }) {
     agencyId,
     family: PHASE2_COVERAGE_FAMILY.TEAM_READ_SUMMARY,
     generation: PHASE2_COVERAGE_GENERATION.TEAM_READ_SUMMARY,
-  }).catch(() => ({ ready: false, state: "UNAVAILABLE", row: null }));
-  if (!coverage?.ready) return { ready: false, coverage, outstanding: null };
-  try {
-    const rows = await prisma.$queryRawUnsafe(`SELECT EXISTS (
-      SELECT 1 FROM "DomainWorkItem" w
-      WHERE w."agencyId"=$1 AND w."workClass"='TEAM_READ_SUMMARY'
-        AND (w."state" <> 'DONE' OR w."requestedRevision" > w."completedRevision")
-      LIMIT 1
-    ) AS "hasOutstanding"`, String(agencyId));
-    const outstanding = Boolean(rows?.[0]?.hasOutstanding);
-    return { ready: !outstanding, coverage, outstanding };
-  } catch (_) {
-    // Failure to prove rollup convergence is not permission to trust a stale
-    // aggregate generation. Canonical facts remain the exact fallback.
-    return { ready: false, coverage, outstanding: null };
-  }
+  }).catch(() => ({ ready: false, historicalReady: false, currentReady: false, fresh: false, state: "UNAVAILABLE", semanticState: "UNKNOWN", row: null, live: null }));
+  return {
+    ready: coverage?.currentReady === true,
+    coverage,
+    outstanding: coverage?.live?.outstandingCount ?? null,
+  };
 }
 
 async function loadMoneySummaryRollupSql({ agencyId, range, allowedCreatorIds = null }) {
@@ -1074,8 +1064,12 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
     phase2CoverageStatus({ agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION }),
     phase2CoverageStatus({ agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR }),
   ]);
-  const currentDialogGeneration = dialogGenerationStatus?.ready === true;
-  const currentResponseGeneration = currentDialogGeneration && responseRepairStatus?.ready === true;
+  // Physical readers are already mapped to the Current tables. Freshness is a
+  // separate live-convergence axis; it must never select legacy rows fail-open.
+  const currentDialogGeneration = true;
+  const currentResponseGeneration = true;
+  const dialogProjectionFresh = dialogGenerationStatus?.currentReady === true;
+  const responseProjectionFresh = dialogProjectionFresh && responseRepairStatus?.currentReady === true;
   if (retentionPolicy?.ok !== true) throw analyticsUnavailable("retention_policy", new Error("Team retention policy unavailable"));
   const detailDays = Number(retentionPolicy.settings?.teamCanonicalDetailDays || 180);
   const projectionDetail = buildProjectionDetailAuthority({
@@ -1275,8 +1269,8 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
   const classificationUnresolved = Math.max(0, Number(moneyRootCoverageStatus?.row?.unresolvedCount || 0));
   const moneyCoverage = includeMoney ? {
     ...baseMoneyCoverage,
-    status: moneyRootCoverageStatus?.ready ? (classificationUnresolved > 0 ? "PARTIAL" : baseMoneyCoverage.status) : "PARTIAL",
-    rootClassification: moneyRootCoverageStatus?.state || "MISSING",
+    status: moneyRootCoverageStatus?.currentReady ? (classificationUnresolved > 0 ? "PARTIAL" : baseMoneyCoverage.status) : "PARTIAL",
+    rootClassification: moneyRootCoverageStatus?.semanticState || moneyRootCoverageStatus?.state || "MISSING",
     unresolvedRootGenerations: classificationUnresolved,
     readSummaryGeneration: moneyReadSummaryStatus?.coverage?.state || "MISSING",
     readSummaryCurrent: moneyReadSummaryStatus?.ready === true,
@@ -1302,8 +1296,12 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
       readAuthority: "team_analytics_read_authority_v1",
       queryShape: "sql_aggregate_bounded_v1",
       projectionGeneration: {
-        dialog: currentDialogGeneration ? "team_pending_v2" : "LEGACY_TRANSITION",
-        response: currentResponseGeneration ? "team_response_v2" : "LEGACY_TRANSITION",
+        dialog: "team_pending_v2",
+        response: "team_response_v2",
+        dialogFreshness: dialogProjectionFresh ? "CURRENT_FRESH" : (dialogGenerationStatus?.semanticState || "UNKNOWN"),
+        responseFreshness: responseProjectionFresh ? "CURRENT_FRESH" : (responseRepairStatus?.semanticState || "UNKNOWN"),
+        dialogOutstanding: dialogGenerationStatus?.live?.outstandingCount ?? null,
+        responseOutstanding: responseRepairStatus?.live?.outstandingCount ?? null,
       },
       historical: {
         version: "team_historical_analytics_v1",

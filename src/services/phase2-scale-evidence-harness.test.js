@@ -48,3 +48,19 @@ test("Phase2 large-data qualification is evidence-only and cannot fabricate fixt
   assert.match(harness, /pending>=10000/);
   assert.doesNotMatch(executable, /\b(seed|fixture|generateRows)\s*\(/i);
 });
+
+test("Phase2 scale harness refuses to benchmark legacy Team physical sinks", () => {
+  assert.match(harness, /TeamResponseCaseCurrent/);
+  assert.match(harness, /TeamPendingDialogStateCurrent/);
+  assert.match(harness, /PHASE2_SCALE_CURRENT_AUTHORITY_MAPPING_MISMATCH/);
+  assert.match(harness, /prismaPhysicalTable/);
+  assert.doesNotMatch(
+    harness,
+    /FROM "TeamResponseCase" r[\s\S]*responses_retained_detail_grouped_by_member/
+  );
+  assert.doesNotMatch(
+    harness,
+    /FROM "TeamPendingDialogState" p[\s\S]*pending_current_grouped_by_owner/
+  );
+});
+
