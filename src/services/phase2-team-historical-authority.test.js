@@ -74,11 +74,14 @@ test("retention is fail-closed on projection proof and owns Team raw horizons ce
 
   assert.match(retention, /teamCanonicalDetailDays/);
   assert.match(retention, /teamMoneyRawDetailDays/);
-  assert.match(retention, /historicalProjectionVersion:\s*"team_activity_daily_v1"/);
+  assert.match(retention, /historicalProjectionVersion:\s*"team_activity_contribution_v2"/);
+  assert.doesNotMatch(retention, /historicalProjectionVersion:\s*"team_activity_daily_v1"/);
   assert.match(retention, /purgeExpiredTipLedger/);
   assert.match(retention, /now:\s*authorityNow/);
-  assert.match(ppv, /historicalFactVersion:\s*"team_money_fact_v1"/);
-  assert.match(tip, /historicalFactVersion:\s*"team_money_fact_v1"/);
+  assert.match(ppv, /historicalFactVersion:\s*"team_money_fact_v2"/);
+  assert.match(ppv, /teamPpvPurchaseLedger\.updateMany/);
+  assert.match(tip, /historicalFactVersion:\s*"team_money_fact_v2"/);
+  assert.match(tip, /teamTipLedger\.updateMany/);
   assert.match(claims, /getRetentionSettings\(\)/);
   assert.match(claims, /dbAuthorityNow\(\{ db: prisma \}\)/);
   assert.match(claims, /now:\s*retentionAuthorityNow/);

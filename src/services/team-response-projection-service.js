@@ -1,8 +1,9 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
 
-const RESPONSE_DERIVATION_VERSION = "team_response_v1";
+const RESPONSE_DERIVATION_VERSION = "team_response_v2";
 const RESPONSE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OPEN_COVERAGE_MS = 12 * 60 * 60 * 1000;
 
@@ -51,7 +52,7 @@ function sourceIsManual(value) {
   return source === "manual" || source === "manual_chat";
 }
 
-async function upsertCoverageSession(row, db = prisma) {
+async function upsertCoverageSessionUnlocked(row, db = prisma) {
   if (!isCanonicalKind(row, "COVERAGE_STARTED") && !isCanonicalKind(row, "COVERAGE_ENDED")) return null;
   const agencyId = clean(row.agencyId, 160);
   const creatorId = clean(row.creatorId, 160);
@@ -105,6 +106,28 @@ async function upsertCoverageSession(row, db = prisma) {
       startReason: existing.startReason || startReason,
       endReason: endReason || existing.endReason,
     },
+  });
+}
+
+
+function coverageSessionFenceKey(row) {
+  const agencyId = clean(row?.agencyId, 160);
+  const coverageId = clean(row?.coverageId || row?.correlationId || row?.localId, 220);
+  if (!agencyId || !coverageId) return null;
+  return `team-coverage:${agencyId}:${coverageId}`;
+}
+
+async function upsertCoverageSession(row, db = prisma) {
+  const fenceKey = coverageSessionFenceKey(row);
+  if (!fenceKey) return upsertCoverageSessionUnlocked(row, db);
+  return runDbTransaction(db, async (tx) => {
+    // COVERAGE_STARTED and COVERAGE_ENDED are separate canonical events and can be
+    // claimed by different replicas. Serialize their read/merge/write cycle by the
+    // stable coverage identity so a late START cannot erase a committed END.
+    if (typeof tx?.$executeRawUnsafe === "function") {
+      await lockDbAdvisoryXact({ db: tx, key: fenceKey, mode: "exclusive" });
+    }
+    return upsertCoverageSessionUnlocked(row, tx);
   });
 }
 
@@ -177,30 +200,37 @@ async function findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt,
 
 async function findIncomingEpisode({ agencyId, creatorId, dialogId, fromExclusive, replyAt, db }) {
   const floor = new Date(Math.max(replyAt.getTime() - RESPONSE_LOOKBACK_MS, fromExclusive?.getTime?.() || 0));
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(`
+      WITH dedup AS (
+        SELECT DISTINCT ON (COALESCE(NULLIF(e."messageId",''),NULLIF(e."localId",''),e."id"))
+               e."id",e."messageId",e."localId",e."fanId",e."ts"
+          FROM "TeamActivityEvent" e
+         WHERE e."agencyId"=$1 AND e."creatorId"=$2 AND e."dialogId"=$3
+           AND e."eventKind"='FAN_MESSAGE_RECEIVED' AND e."ts">$4 AND e."ts"<=$5
+         ORDER BY COALESCE(NULLIF(e."messageId",''),NULLIF(e."localId",''),e."id"),e."ts" ASC,e."id" ASC
+      ), ranked AS (
+        SELECT d.*,row_number() OVER (ORDER BY d."ts",d."id") AS rn_first,
+               row_number() OVER (ORDER BY d."ts" DESC,d."id" DESC) AS rn_last,
+               count(*) OVER () AS total FROM dedup d
+      )
+      SELECT "id","messageId","localId","fanId","ts","total"
+        FROM ranked WHERE rn_first=1 OR rn_last=1 ORDER BY "ts","id"`,
+      agencyId,creatorId,dialogId,floor,replyAt);
+    const out = (rows || []).map((row) => ({ id: row.id, messageId: row.messageId, localId: row.localId, fanId: row.fanId, ts: row.ts }));
+    out.episodeCount = Number(rows?.[0]?.total || 0);
+    return out;
+  }
   const rows = await db.teamActivityEvent.findMany({
-    where: {
-      agencyId,
-      creatorId,
-      dialogId,
-      eventKind: "FAN_MESSAGE_RECEIVED",
-      ts: {
-        gt: floor,
-        lte: replyAt,
-      },
-    },
+    where: { agencyId, creatorId, dialogId, eventKind: "FAN_MESSAGE_RECEIVED", ts: { gt: floor, lte: replyAt } },
     orderBy: { ts: "asc" },
   });
-  const out = [];
-  const seen = new Set();
+  const out = []; const seen = new Set();
   for (const row of Array.isArray(rows) ? rows : []) {
-    // Multiple agency devices can observe the same creator WS message. The OF
-    // messageId is the canonical fan-message identity; localId/id are safe
-    // fallbacks when OF did not expose one.
     const key = clean(row?.messageId, 220) || clean(row?.localId, 220) || clean(row?.id, 220);
-    if (key && seen.has(key)) continue;
-    if (key) seen.add(key);
-    out.push(row);
+    if (key && seen.has(key)) continue; if (key) seen.add(key); out.push(row);
   }
+  out.episodeCount = out.length;
   return out;
 }
 
@@ -263,7 +293,7 @@ async function findSeenAt({ agencyId, creatorId, dialogId, memberId, incomingAt,
   return dateOrNull(row?.ts);
 }
 
-async function deriveResponseCaseForReply(reply, db = prisma) {
+async function deriveResponseCaseForReplyUnlocked(reply, db = prisma, options = {}) {
   const agencyId = clean(reply?.agencyId, 160);
   const creatorId = clean(reply?.creatorId, 160);
   const memberId = clean(reply?.memberId, 160);
@@ -284,8 +314,28 @@ async function deriveResponseCaseForReply(reply, db = prisma) {
     db,
   });
   if (!incoming.length) {
-    if (db.teamResponseCase?.deleteMany) {
-      await db.teamResponseCase.deleteMany({ where: { agencyId, replyMessageId } });
+    if (db.teamResponseCase?.findUnique && db.teamResponseCase?.update) {
+      const existing = await db.teamResponseCase.findUnique({
+        where: { agencyId_creatorId_replyMessageId: { agencyId, creatorId, replyMessageId } },
+      });
+      if (existing) {
+        const preserve = options?.preserveOnMissingHistory === true;
+        return db.teamResponseCase.update({
+          where: { id: existing.id },
+          data: {
+            derivationVersion: RESPONSE_DERIVATION_VERSION,
+            projectionRevision: BigInt(existing.projectionRevision || 0) + 1n,
+            projectionState: preserve ? "INCOMPLETE_HISTORY" : "RETIRED",
+            repairReason: preserve ? "RAW_EPISODE_EVIDENCE_MISSING" : "NO_INCOMING_EPISODE",
+          },
+        });
+      }
+    }
+    // Reduced pre-Phase2 test adapters may not expose revisioned update support.
+    // Production never physically deletes a response root from the projection path;
+    // retention owns destructive compaction after the consumer watermark.
+    if (!db.teamResponseCase?.findUnique && db.teamResponseCase?.deleteMany) {
+      await db.teamResponseCase.deleteMany({ where: { agencyId, creatorId, replyMessageId } });
     }
     return null;
   }
@@ -324,7 +374,7 @@ async function deriveResponseCaseForReply(reply, db = prisma) {
     fanId: clean(reply.fanId || firstIncoming.fanId || dialogId, 160),
     replyMessageId,
     firstIncomingMessageId: clean(firstIncoming.messageId, 220),
-    incomingCount: incoming.length,
+    incomingCount: Math.max(1, Number(incoming.episodeCount || incoming.length)),
     incomingAt,
     lastIncomingAt,
     replyAt,
@@ -340,20 +390,139 @@ async function deriveResponseCaseForReply(reply, db = prisma) {
     sla5Pass: slaEligible ? wallClockSeconds <= 5 * 60 : null,
     sla15Pass: slaEligible ? wallClockSeconds <= 15 * 60 : null,
     derivationVersion: RESPONSE_DERIVATION_VERSION,
+    projectionRevision: 1n,
+    projectionState: "FULL",
+    repairReason: null,
   };
 
+  const existingCase = await db.teamResponseCase.findUnique?.({ where: { agencyId_creatorId_replyMessageId: { agencyId, creatorId, replyMessageId } } });
+  if (existingCase?.projectionRevision != null) data.projectionRevision = BigInt(existingCase.projectionRevision || 0) + 1n;
   return db.teamResponseCase.upsert({
-    where: { agencyId_replyMessageId: { agencyId, replyMessageId } },
+    where: { agencyId_creatorId_replyMessageId: { agencyId, creatorId, replyMessageId } },
     create: data,
     update: data,
   });
 }
 
+
+function responseDialogFenceKey(reply) {
+  const agencyId = clean(reply?.agencyId, 160);
+  const creatorId = clean(reply?.creatorId, 160);
+  const dialogId = clean(reply?.dialogId || reply?.fanId, 160);
+  if (!agencyId || !creatorId || !dialogId) return null;
+  return `team-response:${agencyId}:${creatorId}:${dialogId}`;
+}
+
+async function deriveResponseCaseForReply(reply, db = prisma, options = {}) {
+  const fenceKey = responseDialogFenceKey(reply);
+  if (!fenceKey) return deriveResponseCaseForReplyUnlocked(reply, db, options);
+  return runDbTransaction(db, async (tx) => {
+    // Inline/current-dialog projection and background range repair must share one
+    // commit authority. A worker that derived an older episode cannot overwrite a
+    // newer response case after another repair has already committed.
+    if (typeof tx?.$executeRawUnsafe === "function") {
+      await lockDbAdvisoryXact({ db: tx, key: fenceKey, mode: "exclusive" });
+    }
+    return deriveResponseCaseForReplyUnlocked(reply, tx, options);
+  });
+}
+
+async function repairHistoricalResponseCase({ row, db = prisma, agencyId = null } = {}) {
+  const scopedAgencyId = clean(agencyId || row?.agencyId, 160);
+  const creatorId = clean(row?.creatorId, 160);
+  const dialogId = clean(row?.dialogId, 160);
+  const replyMessageId = clean(row?.replyMessageId, 220);
+  const rowId = clean(row?.id, 220);
+  if (!scopedAgencyId || !creatorId || !dialogId || !replyMessageId || !rowId) {
+    return { projectionState: "INCOMPLETE_HISTORY", skippedCurrent: true, reason: "RESPONSE_REPAIR_IDENTITY_INCOMPLETE" };
+  }
+
+  return runDbTransaction(db, async (tx) => {
+    const fenceKey = responseDialogFenceKey({ agencyId: scopedAgencyId, creatorId, dialogId });
+    if (fenceKey && typeof tx?.$executeRawUnsafe === "function") {
+      await lockDbAdvisoryXact({ db: tx, key: fenceKey, mode: "exclusive" });
+    }
+
+    // The enumerator selected NEEDS_REPAIR before this transaction. Re-read after
+    // acquiring the same dialog authority as live derivation; a newer FULL repair
+    // must never be downgraded by a stale historical page.
+    const current = await tx.teamResponseCase.findUnique?.({
+      where: { agencyId_creatorId_replyMessageId: { agencyId: scopedAgencyId, creatorId, replyMessageId } },
+    });
+    if (!current || String(current.projectionState || "") !== "NEEDS_REPAIR") {
+      return { projectionState: current?.projectionState || null, skippedCurrent: true, current };
+    }
+
+    const ledger = await tx.teamSentMessageLedger.findFirst({
+      where: { agencyId: scopedAgencyId, creatorId, messageId: replyMessageId },
+    });
+    if (ledger) return deriveResponseCaseForReplyUnlocked(ledger, tx, { preserveOnMissingHistory: true });
+
+    return tx.teamResponseCase.update({
+      where: { id: current.id },
+      data: {
+        derivationVersion: RESPONSE_DERIVATION_VERSION,
+        projectionRevision: BigInt(current.projectionRevision || 0) + 1n,
+        projectionState: "INCOMPLETE_HISTORY",
+        repairReason: "REPLY_LEDGER_EVIDENCE_MISSING",
+      },
+    });
+  });
+}
+
+async function backfillTeamResponseRangeBatch({ db = prisma, agencyId, cursor = null, limit = 100 } = {}) {
+  const scopedAgencyId = clean(agencyId, 160);
+  if (!scopedAgencyId) {
+    const error = new Error("TEAM_RESPONSE_REPAIR_AGENCY_REQUIRED");
+    error.code = "TEAM_RESPONSE_REPAIR_AGENCY_REQUIRED";
+    throw error;
+  }
+  if (!db?.teamResponseCase?.findMany || !db?.teamResponseCase?.update || !db?.teamSentMessageLedger?.findFirst) {
+    const error = new Error("TEAM_RESPONSE_REPAIR_STORAGE_REQUIRED");
+    error.code = "TEAM_RESPONSE_REPAIR_STORAGE_REQUIRED";
+    throw error;
+  }
+  const boundedLimit = Math.max(1, Math.min(200, Math.floor(Number(limit) || 100)));
+  const afterId = clean(cursor, 220);
+  const rows = await db.teamResponseCase.findMany({
+    where: {
+      agencyId: scopedAgencyId,
+      projectionState: "NEEDS_REPAIR",
+      ...(afterId ? { id: { gt: afterId } } : {}),
+    },
+    orderBy: { id: "asc" },
+    take: boundedLimit,
+  });
+
+  let repaired = 0;
+  let unresolved = 0;
+  for (const row of rows || []) {
+    const result = await repairHistoricalResponseCase({ row, db, agencyId: scopedAgencyId });
+    if (result?.skippedCurrent) continue;
+    if (result?.projectionState === "FULL") repaired += 1;
+    else unresolved += 1;
+  }
+
+  const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : (afterId || null);
+  return {
+    ok: true,
+    selected: Number(rows?.length || 0),
+    repaired,
+    unresolved,
+    nextCursor,
+    complete: Number(rows?.length || 0) < boundedLimit,
+  };
+}
+
 async function findReplyLedgerByEvent(row, db) {
   const agencyId = clean(row?.agencyId, 160);
+  const creatorId = clean(row?.creatorId, 160);
+  const accountId = clean(row?.accountId, 180);
   const messageId = clean(row?.messageId, 220);
-  if (!agencyId || !messageId) return null;
-  return db.teamSentMessageLedger.findFirst({ where: { agencyId, messageId } });
+  if (!agencyId || !messageId || (!creatorId && !accountId)) return null;
+  return db.teamSentMessageLedger.findFirst({
+    where: { agencyId, messageId, ...(creatorId ? { creatorId } : { accountId }) },
+  });
 }
 
 async function recomputeNextReplyForObservation(row, db = prisma) {
@@ -375,18 +544,32 @@ async function recomputeNextReplyForObservation(row, db = prisma) {
   return reply ? deriveResponseCaseForReply(reply, db) : null;
 }
 
+async function recomputeSuccessorReply(reply, db = prisma) {
+  const agencyId = clean(reply?.agencyId,160);
+  const creatorId = clean(reply?.creatorId,160);
+  const dialogId = clean(reply?.dialogId || reply?.fanId,160);
+  const sentAt = dateOrNull(reply?.sentAt);
+  if (!agencyId || !creatorId || !dialogId || !sentAt) return null;
+  const successor = await db.teamSentMessageLedger.findFirst({
+    where: { agencyId, creatorId, dialogId, source: { in: ["manual","manual_chat"] }, sentAt: { gt: sentAt, lte: new Date(sentAt.getTime() + RESPONSE_LOOKBACK_MS) } },
+    orderBy: [{ sentAt: "asc" }, { id: "asc" }],
+  });
+  return successor ? deriveResponseCaseForReply(successor, db) : null;
+}
+
 async function recomputeRepliesForCoverage(session, db = prisma) {
   if (!session?.agencyId || !session?.creatorId || !session?.memberId || !session?.startedAt) return 0;
-  const upper = session.endedAt || new Date(session.startedAt.getTime() + 12 * 60 * 60 * 1000);
+  const coverageEnd = session.endedAt || new Date(session.startedAt.getTime() + 12 * 60 * 60 * 1000);
+  const upper = new Date(coverageEnd.getTime() + RESPONSE_LOOKBACK_MS);
+  const lower = new Date(Math.max(0, session.startedAt.getTime() - RESPONSE_LOOKBACK_MS));
   const replies = await db.teamSentMessageLedger.findMany({
     where: {
       agencyId: session.agencyId,
       creatorId: session.creatorId,
-      memberId: session.memberId,
       source: { in: ["manual", "manual_chat"] },
-      sentAt: { gte: session.startedAt, lte: upper },
+      sentAt: { gte: lower, lte: upper },
     },
-    orderBy: { sentAt: "asc" },
+    orderBy: [{ sentAt: "asc" }, { id: "asc" }],
   });
   let count = 0;
   for (const reply of replies || []) {
@@ -394,6 +577,26 @@ async function recomputeRepliesForCoverage(session, db = prisma) {
     count += 1;
   }
   return count;
+}
+
+
+async function repairResponseCasesForCoverageEvent({ coverage, db = prisma, cursor = null, limit = 100 } = {}) {
+  const agencyId = clean(coverage?.agencyId, 160); const creatorId = clean(coverage?.creatorId, 160);
+  const startedAt = dateOrNull(coverage?.startedAt);
+  if (!agencyId || !creatorId || !startedAt) return { ok: true, complete: true, repaired: 0, nextCursor: null };
+  const endedAt = dateOrNull(coverage?.endedAt) || new Date(startedAt.getTime() + MAX_OPEN_COVERAGE_MS);
+  const lower = new Date(Math.max(0, startedAt.getTime() - RESPONSE_LOOKBACK_MS));
+  const upper = new Date(endedAt.getTime() + RESPONSE_LOOKBACK_MS);
+  const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 100)));
+  const afterId = clean(cursor, 220);
+  const rows = await db.teamSentMessageLedger.findMany({
+    where: { agencyId, creatorId, source: { in: ["manual","manual_chat"] }, sentAt: { gte: lower, lte: upper }, ...(afterId ? { id: { gt: afterId } } : {}) },
+    orderBy: { id: "asc" }, take,
+  });
+  let repaired = 0;
+  for (const reply of rows || []) { await deriveResponseCaseForReply(reply, db, { preserveOnMissingHistory: true }); repaired += 1; }
+  const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : (afterId || null);
+  return { ok: true, complete: Number(rows?.length || 0) < take, hasMore: Number(rows?.length || 0) >= take, repaired, nextCursor };
 }
 
 async function applyTeamResponseProjection(row, db = prisma) {
@@ -412,7 +615,10 @@ async function applyTeamResponseProjection(row, db = prisma) {
 
   if (isManualConfirmed(row)) {
     const ledger = await findReplyLedgerByEvent(row, db);
-    return ledger ? deriveResponseCaseForReply(ledger, db) : null;
+    if (!ledger) return null;
+    const current = await deriveResponseCaseForReply(ledger, db);
+    await recomputeSuccessorReply(ledger, db);
+    return current;
   }
 
   if (kind === "FAN_MESSAGE_RECEIVED" || kind === "DIALOG_SEEN") {
@@ -425,7 +631,10 @@ async function applyTeamResponseProjection(row, db = prisma) {
 module.exports = {
   RESPONSE_DERIVATION_VERSION,
   deriveResponseCaseForReply,
+  repairHistoricalResponseCase,
+  backfillTeamResponseRangeBatch,
   upsertCoverageSession,
   upsertDialogSession,
+  repairResponseCasesForCoverageEvent,
   applyTeamResponseProjection,
 };

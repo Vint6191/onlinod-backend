@@ -671,7 +671,10 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
 
   const ownerDemoted = isOwner(target) && nextRoleKey !== "owner";
   const updated = await serializableTeamTransaction(db, async (tx) => {
-    const liveActor = requireLiveTeamActor(await tx.agencyMember.findFirst({ where: { id: actorMember?.id, agencyId, deletedAt: null } }));
+    const admission = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.manage_members",
+    });
+    const liveActor = requireLiveTeamActor(admission.member);
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found in this agency"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
     assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
@@ -765,7 +768,10 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
 
   const deactivatedAt = status === "deactivated" ? new Date() : null;
   const statusMutation = await serializableTeamTransaction(db, async (tx) => {
-    const liveActor = requireLiveTeamActor(await tx.agencyMember.findFirst({ where: { id: actorMember?.id, agencyId, deletedAt: null } }));
+    const admission = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.manage_members",
+    });
+    const liveActor = requireLiveTeamActor(admission.member);
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
     assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
@@ -828,7 +834,10 @@ async function removeMember({ agencyId, memberId, actorMember, actorUserId: acto
   await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
   const deletedAt = new Date();
   const removalMutation = await serializableTeamTransaction(db, async (tx) => {
-    const liveActor = requireLiveTeamActor(await tx.agencyMember.findFirst({ where: { id: actorMember?.id, agencyId, deletedAt: null } }));
+    const admission = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.manage_members",
+    });
+    const liveActor = requireLiveTeamActor(admission.member);
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
     assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });

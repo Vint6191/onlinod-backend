@@ -3,6 +3,9 @@
 const prisma = require("../prisma");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { phase2CoverageStatus, FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION } = require("./phase2-work-coverage-authority-service");
+
+const CURRENT_PENDING_DERIVATION_VERSION = "team_pending_v2";
 
 const LEGACY_BOOTSTRAP_SOURCE = "crm_pending_bootstrap_v1";
 const LEGACY_BOOTSTRAP_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -46,7 +49,7 @@ async function repairStaleLegacyBootstrapPendingBatch({ db = prisma, limit = 500
     const cutoff = new Date(authorityNow.getTime() - LEGACY_BOOTSTRAP_MAX_AGE_MS);
     const rows = await tx.$queryRawUnsafe(`
       SELECT p."id"
-      FROM "TeamPendingDialogState" p
+      FROM "TeamPendingDialogStateCurrent" p
       JOIN "TeamActivityEvent" e
         ON e."id" = p."lastIncomingEventId"
        AND e."agencyId" = p."agencyId"
@@ -72,7 +75,7 @@ async function repairStaleLegacyBootstrapPendingBatch({ db = prisma, limit = 500
     // the 30-day repair boundary instead of rescanning history every hour.
     const remaining = await tx.$queryRawUnsafe(`
       SELECT MIN(p."lastIncomingAt") AS "oldestPendingAt", COUNT(*)::bigint AS "remainingCount"
-      FROM "TeamPendingDialogState" p
+      FROM "TeamPendingDialogStateCurrent" p
       JOIN "TeamActivityEvent" e
         ON e."id" = p."lastIncomingEventId"
        AND e."agencyId" = p."agencyId"
@@ -284,6 +287,24 @@ async function memberNamesForRows({ agencyId, rows, db = prisma }) {
   return new Map((members || []).map((member) => [member.id, member.displayName || member.user?.name || null]));
 }
 
+async function pendingProjectionAuthorityWhere({ agencyId, db = prisma } = {}) {
+  try {
+    const status = await phase2CoverageStatus({
+      db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION,
+      generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION,
+    });
+    if (!status?.ready) return {};
+    return {
+      derivationVersion: CURRENT_PENDING_DERIVATION_VERSION,
+      projectionState: { in: ["FULL", "INCOMPLETE_HISTORY"] },
+    };
+  } catch (_) {
+    // Coverage cannot be proven => preserve the pre-activation read contract.
+    // Activation itself is the authority boundary; never infer it from binary version.
+    return {};
+  }
+}
+
 async function listTeamPendingDialogs({
   agencyId,
   allowedCreatorIds = null,
@@ -295,9 +316,11 @@ async function listTeamPendingDialogs({
 } = {}) {
   const normalizedMemberId = clean(memberId, 160);
   const normalizedOwnership = clean(ownership, 32)?.toLowerCase() || "all";
+  const generationWhere = await pendingProjectionAuthorityWhere({ agencyId, db });
   const where = {
     agencyId,
     status: "PENDING",
+    ...generationWhere,
     ...creatorScopeWhere(allowedCreatorIds),
     ...(normalizedMemberId ? { ownerMemberId: normalizedMemberId } : {}),
     ...(!normalizedMemberId && normalizedOwnership === "unassigned" ? { ownerMemberId: null } : {}),
@@ -365,6 +388,7 @@ async function listTeamPendingDialogs({
 }
 
 module.exports = {
+  CURRENT_PENDING_DERIVATION_VERSION, pendingProjectionAuthorityWhere,
   creatorScopeWhere,
   secondsSince,
   summarizePendingRows,

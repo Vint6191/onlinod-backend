@@ -7,7 +7,11 @@ const path = require("node:path");
 
 const ROOT = path.join(__dirname, "..", "..");
 const schema = fs.readFileSync(path.join(ROOT, "prisma", "schema.prisma"), "utf8");
-const migration = fs.readFileSync(path.join(ROOT, "prisma", "migrations", "20260909211500_phase2_current_work_coordination", "migration.sql"), "utf8");
+const migrationFiles = [
+  "20260909211500_phase2_current_work_coordination",
+  "20260910023000_phase2_authority_execution_consolidation",
+].map((name) => fs.readFileSync(path.join(ROOT, "prisma", "migrations", name, "migration.sql"), "utf8"));
+const migration = migrationFiles.join("\n");
 
 function schemaModels() {
   const models = new Map();
@@ -18,7 +22,7 @@ function schemaModels() {
     const fields = new Set();
     for (const raw of body.split(/\r?\n/)) {
       const line = raw.trim();
-      if (!line || line.startsWith("//") || line.startsWith("@@")) continue;
+      if (!line || line.startsWith("//") || line.startsWith("@@") || line.includes("@relation(")) continue;
       const fm = line.match(/^(\w+)\s+/);
       if (!fm) continue;
       const mapped = line.match(/@map\("([^"]+)"\)/);
@@ -47,11 +51,22 @@ function updateOfTriggers() {
   return out;
 }
 
-function createTableColumns(table) {
-  const match = migration.match(new RegExp(`CREATE TABLE IF NOT EXISTS "${table}" \\(([\\s\\S]*?)\\n\\);`));
-  assert.ok(match, `missing CREATE TABLE ${table}`);
-  return new Set(Array.from(match[1].matchAll(/^\s*"([^"]+)"\s+/gm), (m) => m[1]));
+function cumulativeTableColumns(table) {
+  const columns = new Set();
+  for (const text of migrationFiles) {
+    const create = text.match(new RegExp(`CREATE TABLE IF NOT EXISTS "${table}" \\(([\\s\\S]*?)\\n\\);`));
+    if (create) {
+      for (const match of create[1].matchAll(/^\s*"([^"]+)"\s+/gm)) columns.add(match[1]);
+    }
+    const alterBlocks = new RegExp(String.raw`ALTER TABLE "${table}"([\s\S]*?);`, "g");
+    for (const block of text.matchAll(alterBlocks)) {
+      for (const match of block[1].matchAll(/ADD COLUMN IF NOT EXISTS "([^"]+)"/g)) columns.add(match[1]);
+    }
+  }
+  assert.ok(columns.size > 0, `missing cumulative DDL for ${table}`);
+  return columns;
 }
+
 
 test("Phase2 trigger UPDATE OF columns exist in current Prisma models", () => {
   const models = schemaModels();
@@ -68,8 +83,8 @@ test("Phase2 trigger UPDATE OF columns exist in current Prisma models", () => {
 
 test("Phase2 current-work table DDL matches Prisma storage fields", () => {
   const models = schemaModels();
-  for (const table of ["MaintenanceLaneState", "ProviderOperationalDebt"]) {
-    const ddl = createTableColumns(table);
+  for (const table of ["MaintenanceLaneState", "ProviderOperationalDebt", "DomainWorkItem", "Phase2WorkCoverage", "Phase2DependencyState"]) {
+    const ddl = cumulativeTableColumns(table);
     const fields = models.get(table);
     assert.ok(fields, `Prisma model ${table} missing`);
     for (const field of fields) {
@@ -101,4 +116,12 @@ test("Phase2 CustomOrder projection fields and mapped indexes stay aligned", () 
     assert.match(schema, new RegExp(index));
     assert.match(migration, new RegExp(index));
   }
+});
+
+test("Phase2 per-agency coverage activates new agencies without reopening global historical readiness", () => {
+  const migration = fs.readFileSync(path.join(ROOT, "prisma", "migrations", "20260910023000_phase2_authority_execution_consolidation", "migration.sql"), "utf8");
+  assert.match(migration, /Agency_phase2_initial_coverage/);
+  assert.match(migration, /NEW_AGENCY_AFTER_PHASE2_CUTOVER/);
+  assert.match(migration, /PROVIDER_OPERATIONAL/);
+  assert.match(migration, /CUSTOM_EXTERNAL_PROJECTION/);
 });

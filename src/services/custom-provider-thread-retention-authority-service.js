@@ -85,7 +85,7 @@ async function candidateCurrentOrderIdsForAccount({ agencyId, accountId, db }) {
     error.status = 503;
     throw error;
   }
-  await requireProviderOperationalBackfillReady({ db });
+  await requireProviderOperationalBackfillReady({ db, agencyId });
 
   // Retirement is indexed by THIS provider account's current capability debt. Historical
   // intents/submissions and other providers' PENDING Customs are cold evidence now. Each

@@ -25,6 +25,7 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
   function ledgerMatches(row, where) {
     if (where.agencyId && row.agencyId !== where.agencyId) return false;
     if (where.creatorId && row.creatorId !== where.creatorId) return false;
+    if (where.accountId && row.accountId !== where.accountId) return false;
     if (where.dialogId && row.dialogId !== where.dialogId) return false;
     if (where.memberId && row.memberId !== where.memberId) return false;
     if (where.messageId && row.messageId !== where.messageId) return false;
@@ -63,14 +64,16 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
     teamSentMessageLedger: {
       async findFirst({ where, orderBy }) {
         const rows = ledgers.filter((row) => ledgerMatches(row, where));
-        rows.sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt));
-        if (orderBy?.sentAt === "desc") rows.reverse();
+        rows.sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt) || String(a.id || a.messageId).localeCompare(String(b.id || b.messageId)));
+        const direction = Array.isArray(orderBy) ? orderBy[0]?.sentAt : orderBy?.sentAt;
+        if (direction === "desc") rows.reverse();
         return rows[0] || null;
       },
       async findMany({ where, orderBy, take }) {
         const rows = ledgers.filter((row) => ledgerMatches(row, where));
-        rows.sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt));
-        if (orderBy?.sentAt === "desc") rows.reverse();
+        rows.sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt) || String(a.id || a.messageId).localeCompare(String(b.id || b.messageId)));
+        const direction = Array.isArray(orderBy) ? orderBy[0]?.sentAt : orderBy?.sentAt;
+        if (direction === "desc") rows.reverse();
         return rows.slice(0, take || rows.length);
       },
     },
@@ -111,9 +114,31 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
       },
     },
     teamResponseCase: {
+      async findMany({ where = {}, orderBy, take }) {
+        let rows = responseCases.filter((item) => {
+          if (where.agencyId && item.agencyId !== where.agencyId) return false;
+          if (where.projectionState && item.projectionState !== where.projectionState) return false;
+          if (where.id?.gt && !(String(item.id) > String(where.id.gt))) return false;
+          return true;
+        });
+        rows = rows.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+        if (orderBy?.id === "desc") rows.reverse();
+        return rows.slice(0, take || rows.length);
+      },
+      async findUnique({ where }) {
+        const key = where.agencyId_creatorId_replyMessageId;
+        if (!key) return null;
+        return responseCases.find((item) => item.agencyId === key.agencyId && item.creatorId === key.creatorId && item.replyMessageId === key.replyMessageId) || null;
+      },
+      async update({ where, data }) {
+        const row = responseCases.find((item) => item.id === where.id);
+        if (!row) throw new Error(`missing response case ${where.id}`);
+        Object.assign(row, data);
+        return row;
+      },
       async upsert({ where, create, update }) {
-        const key = where.agencyId_replyMessageId;
-        let row = responseCases.find((item) => item.agencyId === key.agencyId && item.replyMessageId === key.replyMessageId);
+        const key = where.agencyId_creatorId_replyMessageId;
+        let row = responseCases.find((item) => item.agencyId === key.agencyId && item.creatorId === key.creatorId && item.replyMessageId === key.replyMessageId);
         if (!row) {
           row = { id: `response-${responseCases.length + 1}`, ...create };
           responseCases.push(row);
@@ -123,7 +148,8 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
       async deleteMany({ where }) {
         const before = responseCases.length;
         for (let i = responseCases.length - 1; i >= 0; i -= 1) {
-          if (responseCases[i].agencyId === where.agencyId && responseCases[i].replyMessageId === where.replyMessageId) responseCases.splice(i, 1);
+          const row = responseCases[i];
+          if (row.agencyId === where.agencyId && (!where.creatorId || row.creatorId === where.creatorId) && row.replyMessageId === where.replyMessageId) responseCases.splice(i, 1);
         }
         return { count: before - responseCases.length };
       },
@@ -313,4 +339,121 @@ test("same OF incoming observed by multiple devices counts once in a response ep
   const result = await service.deriveResponseCaseForReply(current, db);
   assert.equal(result.incomingCount, 1);
   assert.equal(result.firstIncomingMessageId, "incoming-shared");
+});
+
+
+test("late manual reply recomputes the already-materialized successor response case", async () => {
+  const r1 = reply({ id: "ledger-r1", messageId: "reply-r1", sentAt: date("2026-08-12T09:10:00.000Z") });
+  const r2 = reply({ id: "ledger-r2", messageId: "reply-r2", sentAt: date("2026-08-12T09:20:00.000Z") });
+  const i1 = incoming("2026-08-12T09:01:00.000Z", { id: "incoming-1", messageId: "incoming-1" });
+  const i2 = incoming("2026-08-12T09:15:00.000Z", { id: "incoming-2", messageId: "incoming-2" });
+  const fx = makeDb({
+    ledgers: [r1, r2],
+    events: [i1, i2],
+    coverages: [{ agencyId: "agency-1", creatorId: "creator-1", memberId: "member-a", coverageId: "cov-a", startedAt: date("2026-08-12T08:00:00.000Z"), endedAt: date("2026-08-12T10:00:00.000Z") }],
+  });
+
+  // Simulate R2 having arrived/materialized before the late R1 event is applied.
+  await service.deriveResponseCaseForReply(r2, fx.db);
+  assert.equal(fx.responseCases.find((row) => row.replyMessageId === "reply-r2").incomingCount, 1, "current facts already include R1 as the previous boundary");
+
+  // Recreate the stale pre-R1 materialization that production used to leave behind.
+  const stale = fx.responseCases.find((row) => row.replyMessageId === "reply-r2");
+  stale.incomingCount = 2;
+  stale.firstIncomingMessageId = "incoming-1";
+  stale.projectionRevision = 1n;
+
+  await service.applyTeamResponseProjection({
+    agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", memberId: "member-a",
+    eventKind: "MESSAGE_SEND_CONFIRMED", actionSource: "MANUAL", lifecycle: "CONFIRMED",
+    messageId: "reply-r1", ts: r1.sentAt,
+  }, fx.db);
+
+  const repaired = fx.responseCases.find((row) => row.replyMessageId === "reply-r2");
+  assert.equal(repaired.incomingCount, 1);
+  assert.equal(repaired.firstIncomingMessageId, "incoming-2");
+  assert.ok(BigInt(repaired.projectionRevision) > 1n);
+});
+
+test("coverage changes invalidate response cases for other members in the affected creator interval", async () => {
+  const r = reply({ id: "ledger-b", memberId: "member-b", messageId: "reply-b", sentAt: date("2026-08-12T09:20:00.000Z") });
+  const fx = makeDb({ ledgers: [r], events: [incoming("2026-08-12T09:05:00.000Z")] });
+  const before = await service.deriveResponseCaseForReply(r, fx.db);
+  assert.equal(before.classification, "UNKNOWN");
+
+  await service.applyTeamResponseProjection({
+    agencyId: "agency-1", creatorId: "creator-1", memberId: "member-a", eventKind: "COVERAGE_ENDED",
+    coverageId: "coverage-a", startedAt: date("2026-08-12T09:00:00.000Z"), endedAt: date("2026-08-12T09:10:00.000Z"),
+    ts: date("2026-08-12T09:10:00.000Z"),
+  }, fx.db);
+
+  const after = fx.responseCases.find((row) => row.creatorId === "creator-1" && row.replyMessageId === "reply-b");
+  assert.equal(after.classification, "HANDOFF");
+  assert.equal(after.handoffFromMemberId, "member-a");
+});
+
+test("response identity isolates equal message ids across creator scopes", async () => {
+  const ra = reply({ id: "ledger-a", creatorId: "creator-a", dialogId: "fan-a", fanId: "fan-a", messageId: "same-reply", sentAt: date("2026-08-12T09:10:00.000Z") });
+  const rb = reply({ id: "ledger-b", creatorId: "creator-b", dialogId: "fan-b", fanId: "fan-b", messageId: "same-reply", sentAt: date("2026-08-12T09:11:00.000Z") });
+  const fx = makeDb({
+    ledgers: [ra, rb],
+    events: [
+      incoming("2026-08-12T09:00:00.000Z", { creatorId: "creator-a", dialogId: "fan-a", fanId: "fan-a", messageId: "incoming-a" }),
+      incoming("2026-08-12T09:01:00.000Z", { creatorId: "creator-b", dialogId: "fan-b", fanId: "fan-b", messageId: "incoming-b" }),
+    ],
+    coverages: [
+      { agencyId: "agency-1", creatorId: "creator-a", memberId: "member-a", coverageId: "cov-a", startedAt: date("2026-08-12T08:00:00.000Z"), endedAt: date("2026-08-12T10:00:00.000Z") },
+      { agencyId: "agency-1", creatorId: "creator-b", memberId: "member-a", coverageId: "cov-b", startedAt: date("2026-08-12T08:00:00.000Z"), endedAt: date("2026-08-12T10:00:00.000Z") },
+    ],
+  });
+  await service.deriveResponseCaseForReply(ra, fx.db);
+  await service.deriveResponseCaseForReply(rb, fx.db);
+  assert.equal(fx.responseCases.length, 2);
+  assert.deepEqual(new Set(fx.responseCases.map((row) => row.creatorId)), new Set(["creator-a", "creator-b"]));
+});
+
+
+test("bounded response v1 to v2 repair preserves old case as INCOMPLETE_HISTORY when reply evidence is gone", async () => {
+  const fx = makeDb();
+  fx.responseCases.push({
+    id: "response-old-1", agencyId: "agency-1", creatorId: "creator-1", memberId: "member-a",
+    dialogId: "fan-1", replyMessageId: "old-reply", incomingAt: date("2026-01-01T00:00:00.000Z"),
+    lastIncomingAt: date("2026-01-01T00:00:00.000Z"), replyAt: date("2026-01-01T00:01:00.000Z"),
+    incomingCount: 1, classification: "FRESH", derivationVersion: "team_response_v1",
+    projectionRevision: 4n, projectionState: "NEEDS_REPAIR", repairReason: "LEGACY_V1_REPAIR_REQUIRED",
+  });
+
+  const result = await service.backfillTeamResponseRangeBatch({ db: fx.db, agencyId: "agency-1", limit: 100 });
+  assert.equal(result.selected, 1);
+  assert.equal(result.repaired, 0);
+  assert.equal(result.unresolved, 1);
+  assert.equal(result.complete, true);
+  assert.equal(fx.responseCases.length, 1, "missing old raw evidence must not delete the historical case");
+  assert.equal(fx.responseCases[0].derivationVersion, "team_response_v2");
+  assert.equal(fx.responseCases[0].projectionState, "INCOMPLETE_HISTORY");
+  assert.equal(fx.responseCases[0].repairReason, "REPLY_LEDGER_EVIDENCE_MISSING");
+  assert.equal(fx.responseCases[0].classification, "FRESH", "known historical result is preserved rather than invented");
+});
+
+test("bounded response range repair derives FULL v2 when exact reply and incoming evidence remain", async () => {
+  const r = reply({ id: "ledger-old", messageId: "old-reply" });
+  const fx = makeDb({
+    ledgers: [r],
+    events: [incoming("2026-08-12T09:00:00.000Z", { messageId: "old-incoming" })],
+    coverages: [{ agencyId: "agency-1", creatorId: "creator-1", memberId: "member-a", coverageId: "cov-a", startedAt: date("2026-08-12T08:00:00.000Z"), endedAt: date("2026-08-12T10:00:00.000Z") }],
+  });
+  fx.responseCases.push({
+    id: "response-old-2", agencyId: "agency-1", creatorId: "creator-1", memberId: "member-a", dialogId: "fan-1",
+    replyMessageId: "old-reply", incomingAt: date("2026-08-12T09:00:00.000Z"), lastIncomingAt: date("2026-08-12T09:00:00.000Z"),
+    replyAt: r.sentAt, incomingCount: 99, classification: "UNKNOWN", derivationVersion: "team_response_v1",
+    projectionRevision: 2n, projectionState: "NEEDS_REPAIR", repairReason: "LEGACY_V1_REPAIR_REQUIRED",
+  });
+
+  const result = await service.backfillTeamResponseRangeBatch({ db: fx.db, agencyId: "agency-1", limit: 100 });
+  assert.equal(result.repaired, 1);
+  assert.equal(result.unresolved, 0);
+  assert.equal(fx.responseCases[0].projectionState, "FULL");
+  assert.equal(fx.responseCases[0].repairReason, null);
+  assert.equal(fx.responseCases[0].incomingCount, 1);
+  assert.equal(fx.responseCases[0].classification, "FRESH");
 });

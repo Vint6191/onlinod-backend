@@ -15,7 +15,8 @@ const { getWalletState, readRolling30dRevenueBatch, pricingPreviewFromRevenue } 
 const { lockCustomExecutionDefaults, lockAgencyPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
-const { telegramLifecycleState: currentTelegramLifecycleState, isActiveTelegramAccount, isRetiringTelegramAccount } = require("./telegram-account-reference-authority-service");
+const { WORK_CLASS: PHASE2_WORK_CLASS, bumpDomainDependency, publishDomainWork } = require("./domain-work-authority-service");
+const { telegramLifecycleState: currentTelegramLifecycleState, isActiveTelegramAccount, isRetiringTelegramAccount, lockTelegramAccountLifecycleRow } = require("./telegram-account-reference-authority-service");
 
 const WORKSPACE_SETTING_DEFAULTS = Object.freeze({
   timezone: "UTC",
@@ -556,9 +557,8 @@ async function updateTelegramCustomReminderSettings({ agencyId, member, reminder
   const client = db || prisma;
   const normalized = normalizeTelegramCustomReminders(reminders);
 
-  // Workspace policy publication and the order projections that make it executable are one
-  // transaction. If the process crashes, neither a half-published policy nor half-reprojected
-  // schedule set is committed. Concurrent provider settlement loses/retries on CustomOrder CAS.
+  // Workspace policy + dependency revision + durable fanout publication are one short
+  // transaction. Per-order schedule reprojection is executed later in bounded units.
   const apply = async (tx) => {
     await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true });
     await tx.workspaceSetting.upsert({
@@ -566,17 +566,19 @@ async function updateTelegramCustomReminderSettings({ agencyId, member, reminder
       create: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY, value: normalized },
       update: { value: normalized },
     });
-    if (tx.customOrder?.findMany && tx.customOrder?.updateMany) {
-      const pendingOrders = await tx.customOrder.findMany({
-        where: { agencyId, status: "PENDING" },
-        select: { id: true },
-        orderBy: { id: "asc" },
-      });
-      const projectionNow = new Date();
-      for (const order of pendingOrders) {
-        await reprojectCustomReminderSchedule({ agencyId, orderId: order.id, now: projectionNow, firstAnchorAt: projectionNow, db: tx });
-      }
-    }
+    // Policy publication is a short authoritative commit. Reprojection of potentially thousands
+    // of current orders is durable bounded fanout, not work performed while this management TX
+    // holds settings/member locks. Physical begin always revalidates current policy, so OFF is
+    // effective immediately even while the fanout is catching up.
+    const policyRevision = await bumpDomainDependency({
+      db: tx, agencyId, dependencyKind: "REMINDER_POLICY", dependencyKey: String(agencyId), fallbackNow: new Date(),
+    });
+    await publishDomainWork({
+      db: tx, agencyId, workClass: PHASE2_WORK_CLASS.DEPENDENCY_FANOUT,
+      objectType: "ReminderPolicy", objectId: String(agencyId), parentObjectId: String(agencyId),
+      partitionKey: String(agencyId), dependencyKind: "REMINDER_POLICY", dependencyKey: String(agencyId),
+      dependencyRevision: policyRevision, availableAt: new Date(),
+    });
     await audit({
       agencyId,
       actorUserId: member?.userId || null,
@@ -660,9 +662,9 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
   }
 
   // ACTIVE -> RETIRING is serialized with new TelegramDeliveryIntent reservation on the
-  // same account row. The first no-op ACTIVE update acquires the row lock *before* the
-  // blocker scan. Therefore a racing planner either commits first and is observed here,
-  // or this transaction commits RETIRING first and the planner's ACTIVE fence fails.
+  // same account row. The lifecycle row is locked with SELECT ... FOR UPDATE without publishing
+  // a fake ACTIVE -> ACTIVE semantic change. A racing planner either commits first and is
+  // observed here, or this transaction commits RETIRING first and the planner's ACTIVE fence fails.
   if (isActiveTelegramAccount(existing)) {
     const beginRetirement = async (tx) => {
       // Global lifecycle order starts at Agency. This serializes account retirement
@@ -670,16 +672,10 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
       // in opposite order, eliminating the normal REQUEST_REVISION <-> retirement deadlock.
       await lockAgencyPipelineLifecycle({ db: tx, agencyId });
       await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true, agencyAlreadyLocked: true });
-      if (!tx.agencyTelegramMtprotoAccount?.updateMany) {
-        throw Object.assign(new Error("Telegram connection retirement fencing is unavailable"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_FENCE_UNAVAILABLE", status: 503 });
-      }
-      const locked = await tx.agencyTelegramMtprotoAccount.updateMany({
-        where: { id, agencyId, lifecycleState: "ACTIVE" },
-        data: { lifecycleState: "ACTIVE" },
-      });
-      if (Number(locked?.count || 0) !== 1) {
-        const raced = await tx.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { lifecycleState: true } });
-        if (isRetiringTelegramAccount(raced)) return { alreadyRetiring: true };
+      const locked = await lockTelegramAccountLifecycleRow({ agencyId, accountId: id, db: tx });
+      if (!locked) throw Object.assign(new Error("Telegram connection not found"), { code: "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND", status: 404 });
+      if (!isActiveTelegramAccount(locked)) {
+        if (isRetiringTelegramAccount(locked)) return { alreadyRetiring: true };
         throw Object.assign(new Error("Telegram connection retirement changed concurrently; retry"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_RACE", status: 409 });
       }
 
@@ -714,10 +710,7 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
     // new work cannot bind a RETIRING account, blocker scans still lock CustomOrder rows.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
     await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true, agencyAlreadyLocked: true });
-    const current = await tx.agencyTelegramMtprotoAccount.findFirst({
-      where: { id, agencyId },
-      select: { id: true, apiId: true, lifecycleState: true, retirementRequestedAt: true, retirementDrainCompletedAt: true, runtimeClaimedByDeviceId: true, runtimeClaimUntil: true, runtimeClaimGeneration: true, runtimeDrainedGeneration: true },
-    });
+    const current = await lockTelegramAccountLifecycleRow({ agencyId, accountId: id, db: tx });
     if (!current) return { ok: true, retired: true, lifecycleState: "RETIRED", drainRequired: false, drainCompleted: true, retirementRequestedAt: null };
     if (!isRetiringTelegramAccount(current)) throw Object.assign(new Error("Telegram connection is not in retirement state"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_STATE_INVALID", status: 409 });
     await assertTelegramAccountNoBusinessBlockers({ agencyId, accountId: id, db: tx });
@@ -754,11 +747,9 @@ async function forceRetireLostTelegramMtprotoAccount({ agencyId, member, account
     // CustomOrder serialization order as normal retirement.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
     await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true, agencyAlreadyLocked: true });
-    if (!tx.agencyTelegramMtprotoAccount?.updateMany) throw Object.assign(new Error("Telegram retirement fencing is unavailable"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_FENCE_UNAVAILABLE", status: 503 });
-    const locked = await tx.agencyTelegramMtprotoAccount.updateMany({ where: { id, agencyId, lifecycleState: "RETIRING" }, data: { lifecycleState: "RETIRING" } });
-    if (Number(locked?.count || 0) !== 1) {
-      const row = await tx.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { id: true, lifecycleState: true } });
-      if (!row) throw Object.assign(new Error("Telegram connection not found"), { code: "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND", status: 404 });
+    const locked = await lockTelegramAccountLifecycleRow({ agencyId, accountId: id, db: tx });
+    if (!locked) throw Object.assign(new Error("Telegram connection not found"), { code: "SETTINGS_TELEGRAM_ACCOUNT_NOT_FOUND", status: 404 });
+    if (!isRetiringTelegramAccount(locked)) {
       throw Object.assign(new Error("Force retirement is only available after normal retirement has entered RETIRING"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_STATE_INVALID", status: 409 });
     }
     const runtime = await tx.agencyTelegramMtprotoAccount.findFirst({

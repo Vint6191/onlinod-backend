@@ -11,7 +11,7 @@ const {
   assertTelegramInboundRuntimeLease,
   releaseTelegramExecutionRuntime,
 } = require("./telegram-execution-runtime");
-const { PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY, PROVIDER_OPERATIONAL_BACKFILL_GENERATION, DEBT } = require("./provider-operational-debt-authority-service");
+const { DEBT } = require("./provider-operational-debt-authority-service");
 
 function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [], creators: creatorSeed = null, accounts: accountSeed = null } = {}) {
   const creators = creatorSeed || [
@@ -137,11 +137,11 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
         }).slice(0, take).map((row) => ({ ...row }));
       },
     },
-    maintenanceLaneState: {
+    phase2WorkCoverage: {
       async findUnique({ where }) {
-        return where.key === PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY
-          ? { key: where.key, generation: PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") }
-          : null;
+        const key = where?.agencyId_family_generation;
+        if (!key || key.agencyId !== "agency-1" || key.family !== "PROVIDER_OPERATIONAL") return null;
+        return { ...key, active: true, enumerationState: "COMPLETE", completedAt: new Date("2026-09-09T20:00:00.000Z") };
       },
     },
     agencyTelegramMtprotoAccount: {

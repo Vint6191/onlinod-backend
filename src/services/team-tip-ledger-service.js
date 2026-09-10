@@ -1450,7 +1450,7 @@ async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDG
 
   const where = {
     receivedAt: { lt: cutoff },
-    historicalFactVersion: "team_money_fact_v1",
+    historicalFactVersion: "team_money_fact_v2",
     historicalFactProjectedAt: { not: null },
     ...(cleanAgency ? { agencyId: cleanAgency } : {}),
   };
@@ -1460,16 +1460,25 @@ async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDG
     select: { id: true },
     orderBy: { receivedAt: "asc" },
     take: safeLimit,
-  }).catch(() => []);
+  });
 
   if (dryRun || rows.length === 0) {
-    return { ok: true, deleted: dryRun ? 0 : rows.length, matched: rows.length, retentionDays: safeRetentionDays, cutoff, dryRun: Boolean(dryRun) };
+    return { ok: true, deleted: dryRun ? 0 : rows.length, matched: rows.length, hasMore: rows.length >= safeLimit, retentionDays: safeRetentionDays, cutoff, dryRun: Boolean(dryRun) };
   }
 
-  const result = await prisma.teamTipLedger.deleteMany({
+  const result = await prisma.teamTipLedger.updateMany({
     where: { id: { in: rows.map((row) => row.id) } },
+    // Keep the stable attribution/manual-decision root. Only discard rebuildable
+    // candidate/result detail after the retention horizon; history remains durable.
+    data: {
+      candidates: null,
+      weakCandidates: null,
+      result: null,
+      compactedAt: authorityNow,
+      rootVersion: "team_money_root_v2",
+    },
   });
-  return { ok: true, deleted: result.count, matched: rows.length, retentionDays: safeRetentionDays, cutoff, dryRun: false };
+  return { ok: true, deleted: 0, compacted: result.count, matched: rows.length, hasMore: rows.length >= safeLimit, retentionDays: safeRetentionDays, cutoff, dryRun: false };
 }
 
 module.exports = {

@@ -286,6 +286,7 @@ router.get("/custom-delivery-anomalies", async (req, res) => {
     return res.json(await listCustomDeliveryAnomalies({
       agencyId: viewer.agencyId,
       allowedCreatorIds: viewer.allowedCreatorIds,
+      includeMoney: viewer.includeMoney,
       rangeKey: req.query.range || "7d",
       limit: req.query.limit || 100,
     }));

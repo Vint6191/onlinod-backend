@@ -238,6 +238,6 @@ test("long-range member money is read from durable TeamMoneyAttributionFact", as
   assert.equal(m.ppvSoldMessages, 1);
   assert.equal(m.ppvRevenueCents, 5000);
   assert.equal(m.revenueAttributedCents, 5000);
-  assert.equal(m.moneySource, "team_money_fact_v1");
+  assert.equal(m.moneySource, "team_money_fact_v2");
   assert.equal(payload.projection.historical.families.money.status, "FULL");
 });

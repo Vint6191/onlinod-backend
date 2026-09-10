@@ -5,9 +5,6 @@ function fail(code, message, status = 400) {
 }
 
 function activeLifecycleWhere() {
-  // Current Prisma schema is NOT NULL with default ACTIVE. Historical nulls were
-  // normalized by migration; querying impossible null state now violates the
-  // generated Prisma contract and must not survive as rolling compatibility.
   return { lifecycleState: "ACTIVE" };
 }
 
@@ -16,12 +13,29 @@ function telegramLifecycleState(row) {
   return state === "ACTIVE" || state === "RETIRING" ? state : null;
 }
 
-function isActiveTelegramAccount(row) {
-  return telegramLifecycleState(row) === "ACTIVE";
-}
+function isActiveTelegramAccount(row) { return telegramLifecycleState(row) === "ACTIVE"; }
+function isRetiringTelegramAccount(row) { return telegramLifecycleState(row) === "RETIRING"; }
 
-function isRetiringTelegramAccount(row) {
-  return telegramLifecycleState(row) === "RETIRING";
+async function lockTelegramAccountLifecycleRow({ agencyId, accountId, db } = {}) {
+  const id = String(accountId || "").trim();
+  if (!id || !agencyId) return null;
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(
+      `SELECT "id","agencyId","lifecycleState","runtimeClaimGeneration","runtimeDrainedGeneration",
+              "runtimeClaimedByDeviceId","runtimeClaimUntil","retirementRequestedAt","retirementDrainCompletedAt"
+         FROM "AgencyTelegramMtprotoAccount"
+        WHERE "id"=$1 AND "agencyId"=$2
+        FOR UPDATE`,
+      id, String(agencyId),
+    );
+    return rows?.[0] || null;
+  }
+  // Reduced in-memory test doubles have no PostgreSQL row-lock primitive. Production Prisma
+  // transactions always take the SELECT ... FOR UPDATE branch above; do not emulate the lock
+  // with UPDATE lifecycleState=lifecycleState because that fires semantic UPDATE OF triggers.
+  return db?.agencyTelegramMtprotoAccount?.findFirst
+    ? db.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId } })
+    : null;
 }
 
 async function lockActiveTelegramAccountReference({
@@ -36,26 +50,13 @@ async function lockActiveTelegramAccountReference({
 } = {}) {
   const id = String(accountId || "").trim();
   if (!id || !agencyId) throw fail(notFoundCode, notFoundMessage, 404);
-  if (!db?.agencyTelegramMtprotoAccount?.updateMany) {
+  if (typeof db?.$queryRawUnsafe !== "function" && !db?.agencyTelegramMtprotoAccount?.findFirst) {
     throw fail(unavailableCode, "Telegram account lifecycle fencing is unavailable", 503);
   }
-
-  // This no-op write is intentional. PostgreSQL takes the same row lock used by retirement,
-  // making ACTIVE -> RETIRING mutually exclusive with creation of any NEW durable/current
-  // reference to this account.
-  const locked = await db.agencyTelegramMtprotoAccount.updateMany({
-    where: { id, agencyId, ...activeLifecycleWhere() },
-    data: { lifecycleState: "ACTIVE" },
-  });
-  if (Number(locked?.count || 0) === 1) {
-    return { id, lifecycleState: "ACTIVE" };
-  }
-
-  const existing = db?.agencyTelegramMtprotoAccount?.findFirst
-    ? await db.agencyTelegramMtprotoAccount.findFirst({ where: { id, agencyId }, select: { id: true, lifecycleState: true } })
-    : null;
-  if (!existing) throw fail(notFoundCode, notFoundMessage, 404);
-  throw fail(retiringCode, retiringMessage, 409);
+  const row = await lockTelegramAccountLifecycleRow({ agencyId, accountId: id, db });
+  if (!row) throw fail(notFoundCode, notFoundMessage, 404);
+  if (!isActiveTelegramAccount(row)) throw fail(retiringCode, retiringMessage, 409);
+  return { ...row, id, lifecycleState: "ACTIVE" };
 }
 
 module.exports = {
@@ -63,5 +64,6 @@ module.exports = {
   telegramLifecycleState,
   isActiveTelegramAccount,
   isRetiringTelegramAccount,
+  lockTelegramAccountLifecycleRow,
   lockActiveTelegramAccountReference,
 };

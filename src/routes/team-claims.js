@@ -13,15 +13,18 @@ const {
   listTipClaims,
   getTipClaimByHash,
   listTipAudit,
-  migrateLegacyTipsToTipLedger,
-  repairMigratedLegacyTipManualAuthority,
   purgeExpiredTipLedger,
 } = require("../services/team-tip-ledger-service");
-const { reconcileHistoricalTeamMoneyBatch } = require("../services/team-money-reconciliation-service");
 const prisma = require("../prisma");
 const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-capabilities");
 const { getRetentionSettings } = require("../services/retention-service");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const {
+  FAMILY: PHASE2_COVERAGE_FAMILY,
+  GENERATION: PHASE2_COVERAGE_GENERATION,
+  phase2CoverageStatus,
+  requestPhase2CoverageEnumeration,
+} = require("../services/phase2-work-coverage-authority-service");
 
 const router = express.Router();
 
@@ -506,31 +509,34 @@ router.post("/sweep", async (req, res) => {
     const limit = Math.min(20000, Math.max(1, Number(req.query.limit || req.body?.limit || 5000)));
     const dryRun = String(req.query.dryRun || req.body?.dryRun || "").toLowerCase() === "true";
 
-    // Run legacy tip migration before legacy lock sweep. The migration reads
-    // and deletes MoneyAttribution tip rows; doing it in parallel with locks
-    // creates noisy write/delete races on the same rows.
-    const legacyManualRepair = await repairMigratedLegacyTipManualAuthority({
-      agencyId: req.auth.agencyId,
-      limit,
-      dryRun,
-    });
-    const legacyTipMigration = await migrateLegacyTipsToTipLedger({
-      agencyId: req.auth.agencyId,
-      limit,
-      retentionDays,
-      dryRun,
-      deleteLegacy: true,
-      now: retentionAuthorityNow,
-    });
-    const canonicalMoneyBackfill = dryRun
-      ? { ok: true, skipped: true, reason: "DRY_RUN" }
-      : await reconcileHistoricalTeamMoneyBatch({
-          agencyId: req.auth.agencyId,
-          saleLimit: Math.min(1000, limit),
-          tipLimit: Math.min(1000, limit),
-          retentionDays,
+    // Historical Team-money repair/migration/reconciliation has one execution
+    // owner: the per-agency Phase2 HISTORICAL_ENUMERATION -> exact DomainWork
+    // pipeline. The HTTP maintenance endpoint may request that authority, but it
+    // must never run legacy/canonical reconciliation inline as a second writer.
+    const historicalMoneyCoverage = dryRun
+      ? await phase2CoverageStatus({
+          db: prisma, agencyId: req.auth.agencyId,
+          family: PHASE2_COVERAGE_FAMILY.TEAM_MONEY_RECONCILIATION,
+          generation: PHASE2_COVERAGE_GENERATION.TEAM_MONEY_RECONCILIATION,
+        })
+      : await requestPhase2CoverageEnumeration({
+          db: prisma, agencyId: req.auth.agencyId,
+          family: PHASE2_COVERAGE_FAMILY.TEAM_MONEY_RECONCILIATION,
+          generation: PHASE2_COVERAGE_GENERATION.TEAM_MONEY_RECONCILIATION,
           now: retentionAuthorityNow,
         });
+    const legacyManualRepair = { ok: true, skipped: true, reason: "PHASE2_HISTORICAL_ENUMERATION_OWNS_REPAIR" };
+    const legacyTipMigration = { ok: true, skipped: true, reason: "PHASE2_HISTORICAL_ENUMERATION_OWNS_MIGRATION" };
+    const canonicalMoneyBackfill = {
+      ok: historicalMoneyCoverage?.ok !== false,
+      skipped: true,
+      reason: dryRun ? "DRY_RUN" : "PHASE2_DOMAIN_WORK_OWNS_RECONCILIATION",
+      authority: "PHASE2_PER_AGENCY_COVERAGE",
+      requested: Boolean(historicalMoneyCoverage?.requested),
+      inFlight: Boolean(historicalMoneyCoverage?.inFlight),
+      alreadyComplete: Boolean(historicalMoneyCoverage?.alreadyComplete || historicalMoneyCoverage?.ready),
+      coverageState: historicalMoneyCoverage?.coverage?.enumerationState || historicalMoneyCoverage?.state || null,
+    };
     const legacyLocks = await sweepLocks({ agencyId: req.auth.agencyId });
 
     const [tipLedgerPurge, legacyAttributionPurge] = await Promise.all([

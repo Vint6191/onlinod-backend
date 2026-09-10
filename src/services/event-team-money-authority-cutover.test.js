@@ -146,13 +146,19 @@ test("Audit15 source closure removes client money ingress and duplicate compatib
   assert.match(migration, /DELETE FROM "MoneyAttribution" m[\s\S]*EXISTS \([\s\S]*"TeamTipLedger"/);
 });
 
-test("Audit15 scheduler automatically drains legacy tip migration before canonical historical reconciliation", () => {
+test("Audit15 historical money uses per-agency coverage enumeration before exact DomainWork reconciliation", () => {
   const scheduler = source("services/job-scheduler.js");
-  assert.match(scheduler, /migrateLegacyTipsToTipLedger/);
-  assert.match(scheduler, /TEAM_MONEY_BACKFILL_BATCH_SIZE/);
-  const migrateIndex = scheduler.indexOf("await migrateLegacyTipsToTipLedger");
-  const reconcileIndex = scheduler.indexOf("await reconcileHistoricalTeamMoneyBatch", migrateIndex);
-  assert.ok(migrateIndex >= 0 && reconcileIndex > migrateIndex, "legacy tip migration must run before canonical historical reconciliation in the same maintenance sweep");
+  const start = scheduler.indexOf("async function runTeamMoneyReconciliationCoverageEnumerationUnit");
+  const end = scheduler.indexOf("async function runTeamReadSummaryCoverageEnumerationUnit", start);
+  assert.ok(start >= 0 && end > start, "missing Team money coverage enumerator");
+  const body = scheduler.slice(start, end);
+  const repairIndex = body.indexOf("await repairMigratedLegacyTipManualAuthority");
+  const migrateIndex = body.indexOf("await migrateLegacyTipsToTipLedger", repairIndex);
+  const publishIndex = body.indexOf("PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION", migrateIndex);
+  assert.ok(repairIndex >= 0 && migrateIndex > repairIndex && publishIndex > migrateIndex, "legacy repair/migration must precede exact reconciliation work publication");
+  assert.doesNotMatch(body, /reconcileHistoricalTeamMoneyBatch/);
+  assert.match(body, /markPhase2CoverageComplete/);
+  assert.match(body, /DomainWorkItem/);
 });
 
 test("Audit15 telemetry route binds device and ignores client tenant authority", () => {

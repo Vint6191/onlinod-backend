@@ -98,10 +98,11 @@ function makeRuntimeDb({ creators, accounts, orders = [], intents = [], sources 
       async findMany(args) { return orderedPage(sources, args, sourceMatch); },
       async findFirst({ where }) { return sources.find((row) => sourceMatch(row, where || {})) || null; },
     },
-    maintenanceLaneState: {
+    phase2WorkCoverage: {
       async findUnique({ where }) {
-        if (where.key === "provider_operational_debt_backfill_v1") return { key: where.key, generation: "provider_operational_debt_v1", completedAt: new Date("2026-09-09T00:00:00Z") };
-        return null;
+        const key = where?.agencyId_family_generation;
+        if (!key || key.agencyId !== "agency-1" || key.family !== "PROVIDER_OPERATIONAL") return null;
+        return { ...key, active: true, enumerationState: "COMPLETE", completedAt: new Date("2026-09-09T00:00:00Z") };
       },
     },
     providerOperationalDebt: {

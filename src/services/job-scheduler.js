@@ -27,6 +27,7 @@
 
 const prisma = require("../prisma");
 const { runRetentionSweep, getRetentionSettings } = require("./retention-service");
+const { selectPhase2MaintenanceLanes } = require("./phase2-maintenance-admission-service");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
 const { ensureAutomaticFollowBack } = require("./follow-back-service");
@@ -39,6 +40,26 @@ const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { runMaintenanceLane } = require("./maintenance-work-authority");
+const {
+  WORK_CLASS: PHASE2_WORK_CLASS,
+  claimDomainWorkBatch,
+  heartbeatDomainWorkClaim,
+  ackDomainWorkClaim,
+  blockDomainWorkClaim,
+  failDomainWorkClaim,
+  yieldDomainWorkClaim,
+  publishDomainWork,
+  currentDependencyRevision,
+} = require("./domain-work-authority-service");
+const {
+  FAMILY: PHASE2_COVERAGE_FAMILY,
+  GENERATION: PHASE2_COVERAGE_GENERATION,
+  ensurePhase2Coverage,
+  markPhase2CoverageRunning,
+  markPhase2CoverageComplete,
+  markPhase2CoverageFailed,
+  phase2CoverageStatus,
+} = require("./phase2-work-coverage-authority-service");
 const { stampCollectionAuthorityParams } = require("./analytics-collector-control-service");
 const {
   ensureOperationalAnalyticsFreshness,
@@ -57,10 +78,14 @@ const RECURRING_INTERVAL_MS = 60 * 60 * 1000;
 const FRESHNESS_WINDOW_MS = RECURRING_INTERVAL_MS;
 const TRAFFIC_REFRESH_WINDOW_MS = 6 * 60 * 60 * 1000;
 const RETENTION_SWEEP_WINDOW_MS = 24 * 60 * 60 * 1000; // fallback; admin setting can override
-const TEAM_MONEY_BACKFILL_BATCH_SIZE = 250; // DB-only historical reconciliation, no OF requests
 const TEAM_PENDING_BACKFILL_BATCH_SIZE = 500; // DB-only Team queue projection repair
 const PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE = 100; // one-time cold-history -> current-work projection
 const PROVIDER_OPERATIONAL_DIRTY_BATCH_SIZE = 100; // bounded current canonical transitions only
+const PHASE2_COVERAGE_SEED_LANE_KEY = "phase2_coverage_seed_v2";
+const PHASE2_COVERAGE_SEED_GENERATION = "phase2_coverage_seed_v2";
+const PHASE2_COVERAGE_AGENCY_BATCH_SIZE = 100;
+const PHASE2_HISTORICAL_ENUMERATION_BATCH_SIZE = 20;
+const PHASE2_CUSTOM_REMINDER_BATCH_SIZE = 50;
 const TEAM_PENDING_PROJECTION_LANE_KEY = "team_pending_projection_v1";
 const TEAM_PENDING_PROJECTION_LANE_GENERATION = "team_pending_projection_v1";
 const TEAM_LEGACY_PENDING_REPAIR_LANE_KEY = "team_legacy_pending_bootstrap_repair_v1";
@@ -68,17 +93,12 @@ const TEAM_LEGACY_PENDING_REPAIR_LANE_GENERATION = "team_legacy_pending_bootstra
 const ANALYTICS_DEMAND_INTERVAL_MS = 15 * 1000; // durable interactive Home freshness demands
 const TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS = 30 * 1000; // lane cadence; pump checks due state more frequently
 const PHASE2_MAINTENANCE_PUMP_INTERVAL_MS = 5 * 1000;
+const PHASE2_MAINTENANCE_LANES_PER_TICK = 5;
 const TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE = 200;
 const CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY = "custom_external_proof_backfill_v1";
 const CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION = "custom_external_proof_backfill_v1";
 const CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_KEY = "custom_external_projection_debt_v1";
 const CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_GENERATION = "custom_external_projection_debt_v1";
-const TELEGRAM_INBOUND_MAINTENANCE_LANE_KEY = "telegram_inbound_projection_v1";
-const TELEGRAM_INBOUND_MAINTENANCE_LANE_GENERATION = "telegram_inbound_projection_v1";
-const TELEGRAM_CONFIRMED_MAINTENANCE_LANE_KEY = "telegram_custom_convergence_v1";
-const TELEGRAM_CONFIRMED_MAINTENANCE_LANE_GENERATION = "telegram_custom_convergence_v1";
-const TEAM_MONEY_MAINTENANCE_LANE_KEY = "team_money_backfill_v1";
-const TEAM_MONEY_MAINTENANCE_LANE_GENERATION = "team_money_backfill_v1";
 const RECURRING_READY_PAGE_SIZE = 250;
 const CREATOR_ANALYTICS_SWEEP_LEASE_KEY = "creator_analytics_recurring_v1";
 const CREATOR_ANALYTICS_SWEEP_COORDINATION_LOCK_KEY = "creator-analytics-recurring-sweep-coordinator";
@@ -469,407 +489,1067 @@ async function scheduleJobNow({
 }
 
 
-async function reconcileHistoricalTeamMoneyWork({ db = prisma } = {}) {
-  try {
-    const { migrateLegacyTipsToTipLedger, repairMigratedLegacyTipManualAuthority } = require("./team-tip-ledger-service");
-    const { reconcileHistoricalTeamMoneyBatch } = require("./team-money-reconciliation-service");
-    const legacyManualRepair = await repairMigratedLegacyTipManualAuthority({
-      db,
-      limit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
-      dryRun: false,
-    });
-    const legacyTips = await migrateLegacyTipsToTipLedger({
-      db,
-      limit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
-      dryRun: false,
-      deleteLegacy: true,
-    });
-    const result = await reconcileHistoricalTeamMoneyBatch({
-      db,
-      saleLimit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
-      tipLimit: TEAM_MONEY_BACKFILL_BATCH_SIZE,
-    });
-    result.legacyManualRepair = legacyManualRepair;
-    result.legacyTips = legacyTips;
-    if (!result?.skipped) {
-      const sales = result?.sales || {};
-      const tips = result?.tips || {};
-      if ((legacyManualRepair.scanned || 0) > 0 || (legacyTips.scanned || 0) > 0 || (sales.selected || 0) > 0 || (tips.selected || 0) > 0 || (sales.failed || 0) > 0 || (tips.failed || 0) > 0) {
-        console.log(
-          `[scheduler] Team money backfill — migrated-manual repaired=${legacyManualRepair.repaired || 0}/${legacyManualRepair.scanned || 0}; legacy tips migrated=${legacyTips.migrated || 0}, deleted=${legacyTips.deletedLegacy || 0}; sales linked=${sales.linked || 0}/${sales.selected || 0}, tips linked=${tips.linked || 0}/${tips.selected || 0}, failed=${(sales.failed || 0) + (tips.failed || 0)}`
-        );
-      }
-    }
-    return result;
-  } catch (err) {
-    // This is maintenance over already-stored canonical facts. Never suppress
-    // creator jobs because historical Team reconciliation temporarily failed.
-    console.warn("[scheduler] Team money backfill failed:", err?.message || err);
-    return { ok: false, error: err?.message || String(err) };
-  }
+async function maybeReconcileHistoricalTeamMoney({ db = prisma, now = new Date() } = {}) {
+  // Compatibility entry only. Historical Team money is no longer a global recurring
+  // business writer. Per-agency Phase2 coverage enumerates legacy/canonical sources and
+  // publishes exact TEAM_MONEY_RECONCILIATION work; execution is owned by DomainWork.
+  const seed = await maybeSeedPhase2CoverageWork({ db, now });
+  const enumeration = await maybeRunPhase2HistoricalEnumeration({ db, now });
+  return { ok: seed?.ok !== false && enumeration?.ok !== false, seed, enumeration, authority: "PHASE2_PER_AGENCY_COVERAGE" };
 }
 
+async function publishCoverageEnumerationWork({ db, agencyId, family, generation, now }) {
+  await ensurePhase2Coverage({ db, agencyId, family, generation });
+  return publishDomainWork({
+    db, agencyId, workClass: PHASE2_WORK_CLASS.HISTORICAL_ENUMERATION,
+    objectType: "Phase2Coverage", objectId: `${family}:${generation}`,
+    parentObjectId: agencyId, partitionKey: agencyId, availableAt: now,
+  });
+}
 
-async function maybeReconcileHistoricalTeamMoney({ db = prisma, now = new Date() } = {}) {
+async function maybeSeedPhase2CoverageWork({ db = prisma, now = new Date() } = {}) {
   return runMaintenanceLane({
-    db,
-    key: TEAM_MONEY_MAINTENANCE_LANE_KEY,
-    generation: TEAM_MONEY_MAINTENANCE_LANE_GENERATION,
-    oneTime: false,
-    leaseMs: 10 * 60 * 1000,
-    minIntervalMs: RECURRING_INTERVAL_MS,
-    fallbackNow: now,
-    work: async () => {
-      const result = await reconcileHistoricalTeamMoneyWork({ db });
-      const likelyMore = Boolean(result?.sales?.likelyMore || result?.tips?.likelyMore)
-        || Number(result?.legacyManualRepair?.scanned || 0) >= TEAM_MONEY_BACKFILL_BATCH_SIZE
-        || Number(result?.legacyTips?.scanned || 0) >= TEAM_MONEY_BACKFILL_BATCH_SIZE;
+    db, key: PHASE2_COVERAGE_SEED_LANE_KEY, generation: PHASE2_COVERAGE_SEED_GENERATION,
+    oneTime: true, leaseMs: 5 * 60 * 1000, minIntervalMs: 1_000, fallbackNow: now,
+    work: async ({ claim }) => {
+      const cursor = String(claim?.cursor?.lastAgencyId || "").trim() || null;
+      const agencies = await db?.agency?.findMany?.({
+        where: { deletedAt: null, ...(cursor ? { id: { gt: cursor } } : {}) },
+        select: { id: true }, orderBy: { id: "asc" }, take: PHASE2_COVERAGE_AGENCY_BATCH_SIZE,
+      }) || [];
+      let published = 0;
+      for (const agency of agencies) {
+        const agencyId = String(agency.id);
+        for (const [family, generation] of [
+          [PHASE2_COVERAGE_FAMILY.PROVIDER_OPERATIONAL, PHASE2_COVERAGE_GENERATION.PROVIDER_OPERATIONAL],
+          [PHASE2_COVERAGE_FAMILY.CUSTOM_EXTERNAL_PROJECTION, PHASE2_COVERAGE_GENERATION.CUSTOM_EXTERNAL_PROJECTION],
+          [PHASE2_COVERAGE_FAMILY.CUSTOM_SOURCE_PIPELINE, PHASE2_COVERAGE_GENERATION.CUSTOM_SOURCE_PIPELINE],
+          [PHASE2_COVERAGE_FAMILY.TEAM_ACTIVITY_CONTRIBUTION, PHASE2_COVERAGE_GENERATION.TEAM_ACTIVITY_CONTRIBUTION],
+          [PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR],
+          [PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION],
+          [PHASE2_COVERAGE_FAMILY.TEAM_MONEY_ROOT_CLASSIFICATION, PHASE2_COVERAGE_GENERATION.TEAM_MONEY_ROOT_CLASSIFICATION],
+          [PHASE2_COVERAGE_FAMILY.TEAM_MONEY_RECONCILIATION, PHASE2_COVERAGE_GENERATION.TEAM_MONEY_RECONCILIATION],
+          [PHASE2_COVERAGE_FAMILY.TEAM_READ_SUMMARY, PHASE2_COVERAGE_GENERATION.TEAM_READ_SUMMARY],
+          [PHASE2_COVERAGE_FAMILY.TELEGRAM_CONFIRMED_PROJECTION, PHASE2_COVERAGE_GENERATION.TELEGRAM_CONFIRMED_PROJECTION],
+          [PHASE2_COVERAGE_FAMILY.TELEGRAM_INBOUND_PROJECTION, PHASE2_COVERAGE_GENERATION.TELEGRAM_INBOUND_PROJECTION],
+        ]) {
+          const status = await phase2CoverageStatus({ db, agencyId, family, generation });
+          if (!status.ready) {
+            await publishCoverageEnumerationWork({ db, agencyId, family, generation, now });
+            published += 1;
+          }
+        }
+      }
+      const complete = agencies.length < PHASE2_COVERAGE_AGENCY_BATCH_SIZE;
       return {
-        ...result,
-        outcome: result?.ok === false ? "TEAM_MONEY_BATCH_FAILED" : likelyMore ? "TEAM_MONEY_BACKLOG_CONTINUES" : "TEAM_MONEY_BATCH_COMPLETE",
-        nextRunAt: new Date(now.getTime() + (result?.ok === false ? 60_000 : likelyMore ? 1_000 : RECURRING_INTERVAL_MS)),
-        progress: {
-          salesSelected: Number(result?.sales?.selected || 0),
-          tipsSelected: Number(result?.tips?.selected || 0),
-          salesFailed: Number(result?.sales?.failed || 0),
-          tipsFailed: Number(result?.tips?.failed || 0),
-        },
+        complete, outcome: complete ? "COVERAGE_SEED_COMPLETE" : "COVERAGE_SEED_BATCH_COMPLETE",
+        cursor: { lastAgencyId: complete ? null : String(agencies[agencies.length - 1]?.id || cursor || "") },
+        nextRunAt: complete ? null : new Date(now.getTime() + 1_000),
+        progress: { scannedAgencies: Number(claim?.progress?.scannedAgencies || 0) + agencies.length, published },
       };
     },
   });
 }
 
-async function maybeBackfillProviderOperationalDebt({ db = prisma, now = new Date() } = {}) {
-  try {
-    const {
-      PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY,
-      PROVIDER_OPERATIONAL_BACKFILL_GENERATION,
-      selectProviderOperationalBackfillBatch,
-      reconcileProviderOperationalDebtForOrder,
-    } = require("./provider-operational-debt-authority-service");
-    const { repairCurrentCustomModelCommunicationForOrder } = require("./telegram-delivery-authority-service");
-    return await runMaintenanceLane({
-      db,
-      key: PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY,
-      generation: PROVIDER_OPERATIONAL_BACKFILL_GENERATION,
-      oneTime: true,
-      leaseMs: 15 * 60 * 1000,
-      minIntervalMs: 1_000,
-      fallbackNow: now,
-      work: async ({ claim }) => {
-        const cursor = String(claim?.cursor?.lastOrderId || "").trim() || null;
-        const rows = await selectProviderOperationalBackfillBatch({ db, cursor, limit: PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE });
-        let projected = 0;
-        let modelCommunicationRepaired = 0;
-        let modelCommunicationFailed = 0;
-        for (const row of rows || []) {
-          const communication = await repairCurrentCustomModelCommunicationForOrder({ agencyId: String(row.agencyId), orderId: String(row.id), now, db });
-          modelCommunicationRepaired += Number(communication?.initialTaskPlanned || 0) + Number(communication?.initialTaskReactivated || 0)
-            + Number(communication?.revisionIntentPlanned || 0) + Number(communication?.precommitCancelled || 0)
-            + Number(communication?.precommitRefreshed || 0) + Number(communication?.reminderScheduleRepaired || 0);
-          if (communication?.ok === false) modelCommunicationFailed += 1;
-          const result = await reconcileProviderOperationalDebtForOrder({ agencyId: String(row.agencyId), orderId: String(row.id), db, now, markClean: communication?.ok !== false });
-          projected += Number(result?.projected || 0);
-        }
-        const lastOrderId = rows?.length ? String(rows[rows.length - 1].id) : cursor;
-        const complete = (rows?.length || 0) < PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE;
-        return {
-          complete,
-          outcome: complete ? "BACKFILL_COMPLETE" : "BACKFILL_BATCH_COMPLETE",
-          cursor: { lastOrderId },
-          progress: { processed: Number(claim?.progress?.processed || 0) + Number(rows?.length || 0), projected, modelCommunicationRepaired, modelCommunicationFailed },
-        };
-      },
+async function runProviderCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const { selectProviderOperationalBackfillBatch, reconcileProviderOperationalDebtForOrder } = require("./provider-operational-debt-authority-service");
+  const family = PHASE2_COVERAGE_FAMILY.PROVIDER_OPERATIONAL;
+  const generation = PHASE2_COVERAGE_GENERATION.PROVIDER_OPERATIONAL;
+  const cursor = String(item?.progressCursor?.lastOrderId || item?.progressCursor?.lastId || "").trim() || null;
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const rows = await selectProviderOperationalBackfillBatch({ db, agencyId: item.agencyId, cursor, limit: PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE });
+  let projected = 0;
+  for (const row of rows) {
+    await reconcileProviderOperationalDebtForOrder({ agencyId: String(item.agencyId), orderId: String(row.id), db, now, markClean: false });
+    await publishDomainWork({
+      db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_COMMUNICATION,
+      objectType: "CustomOrder", objectId: String(row.id), partitionKey: String(row.creatorId || item.agencyId),
+      creatorId: row.creatorId ? String(row.creatorId) : null, availableAt: now,
     });
-  } catch (err) {
-    console.warn("[scheduler] Provider operational debt backfill failed:", err?.message || err);
-    return { ok: false, error: err?.message || String(err) };
+    projected += 1;
   }
+  const lastOrderId = rows.length ? String(rows[rows.length - 1].id) : cursor;
+  if (rows.length >= PROVIDER_OPERATIONAL_BACKFILL_BATCH_SIZE) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: lastOrderId });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastOrderId }, availableAt: now, fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: lastOrderId, projectedThrough: lastOrderId, unresolvedCount: 0, fallbackNow: now });
+  const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+  return { ...ack, projected, complete: true };
 }
 
-async function maybeRepairProviderOperationalDirty({ db = prisma, now = new Date() } = {}) {
-  try {
-    const {
-      PROVIDER_OPERATIONAL_DIRTY_LANE_KEY,
-      PROVIDER_OPERATIONAL_DIRTY_GENERATION,
-      selectProviderOperationalDirtyBatch,
-      reconcileProviderOperationalDebtForOrder,
-    } = require("./provider-operational-debt-authority-service");
-    const { repairCurrentCustomModelCommunicationForOrder } = require("./telegram-delivery-authority-service");
-    return await runMaintenanceLane({
-      db,
-      key: PROVIDER_OPERATIONAL_DIRTY_LANE_KEY,
-      generation: PROVIDER_OPERATIONAL_DIRTY_GENERATION,
-      leaseMs: 5 * 60 * 1000,
-      minIntervalMs: 30_000,
-      fallbackNow: now,
-      work: async () => {
-        const rows = await selectProviderOperationalDirtyBatch({ db, limit: PROVIDER_OPERATIONAL_DIRTY_BATCH_SIZE });
-        let projected = 0;
-        let modelCommunicationRepaired = 0;
-        let modelCommunicationFailed = 0;
-        for (const row of rows || []) {
-          const communication = await repairCurrentCustomModelCommunicationForOrder({ agencyId: String(row.agencyId), orderId: String(row.id), now, db });
-          modelCommunicationRepaired += Number(communication?.initialTaskPlanned || 0) + Number(communication?.initialTaskReactivated || 0)
-            + Number(communication?.revisionIntentPlanned || 0) + Number(communication?.precommitCancelled || 0)
-            + Number(communication?.precommitRefreshed || 0) + Number(communication?.reminderScheduleRepaired || 0);
-          if (communication?.ok === false) modelCommunicationFailed += 1;
-          const result = await reconcileProviderOperationalDebtForOrder({ agencyId: String(row.agencyId), orderId: String(row.id), db, now, markClean: communication?.ok !== false });
-          projected += Number(result?.projected || 0);
-        }
-        return {
-          outcome: "DIRTY_BATCH_COMPLETE",
-          nextRunAt: new Date(now.getTime() + ((rows?.length || 0) >= PROVIDER_OPERATIONAL_DIRTY_BATCH_SIZE ? 1_000 : 60_000)),
-          progress: { processed: Number(rows?.length || 0), projected, modelCommunicationRepaired, modelCommunicationFailed },
-        };
-      },
-    });
-  } catch (err) {
-    console.warn("[scheduler] Provider operational dirty repair failed:", err?.message || err);
-    return { ok: false, error: err?.message || String(err) };
+async function runExternalCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const { convergeHistoricalCustomExternalProofs } = require("./custom-external-proof-convergence-service");
+  const family = PHASE2_COVERAGE_FAMILY.CUSTOM_EXTERNAL_PROJECTION;
+  const generation = PHASE2_COVERAGE_GENERATION.CUSTOM_EXTERNAL_PROJECTION;
+  const cursor = String(item?.progressCursor?.lastSubmissionId || "").trim() || null;
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const batch = await convergeHistoricalCustomExternalProofs({ agencyId: item.agencyId, cursor, limit: 200, db });
+  const nextCursor = String(batch?.nextCursor || cursor || "").trim() || null;
+  if (batch?.ok === false || Number(batch?.failed || 0) > 0) {
+    await markPhase2CoverageFailed({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, Number(batch?.failed || 0)) });
+    const error = new Error("CUSTOM_EXTERNAL_COVERAGE_ENUMERATION_FAILED"); error.code = "CUSTOM_EXTERNAL_COVERAGE_ENUMERATION_FAILED";
+    return failDomainWorkClaim({ db, item, ownerToken, error, fallbackNow: new Date() });
   }
+  if (batch?.complete === false) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastSubmissionId: nextCursor }, availableAt: now, fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+}
+
+async function runCustomSourcePipelineCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const family = PHASE2_COVERAGE_FAMILY.CUSTOM_SOURCE_PIPELINE;
+  const generation = PHASE2_COVERAGE_GENERATION.CUSTOM_SOURCE_PIPELINE;
+  const cursor = String(item?.progressCursor?.lastSubmissionId || "").trim() || null;
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const rows = await db.customContentSubmission.findMany({
+    where: {
+      agencyId: String(item.agencyId),
+      pipelineDisposition: { in: ["ACTIVE", "SALVAGE"] },
+      ...(cursor ? { id: { gt: cursor } } : {}),
+    },
+    select: { id: true, creatorId: true, telegramSourceAccountId: true },
+    orderBy: { id: "asc" }, take: 100,
+  });
+  for (const row of rows || []) await publishDomainWork({
+    db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+    objectType: "CustomContentSubmission", objectId: String(row.id), partitionKey: String(row.creatorId || item.agencyId),
+    creatorId: row.creatorId ? String(row.creatorId) : null,
+    accountId: row.telegramSourceAccountId ? String(row.telegramSourceAccountId) : null,
+    availableAt: now,
+  });
+  const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
+  if (Number(rows?.length || 0) >= 100) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastSubmissionId: nextCursor }, availableAt: now, fallbackNow: new Date() });
+  }
+
+  // Enumeration is not activation. Existing source work can be owned by a Desktop
+  // for several minutes while Telegram/OnlyFans execution is in flight. Coverage is
+  // COMPLETE only when every enumerated/live source revision has reached DONE.
+  let outstanding = false;
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const pending = await db.$queryRawUnsafe(`SELECT EXISTS (
+      SELECT 1 FROM "DomainWorkItem" w WHERE w."agencyId"=$1 AND w."workClass"='CUSTOM_SOURCE_PIPELINE'
+        AND (w."state" <> 'DONE' OR w."requestedRevision" > w."completedRevision") LIMIT 1
+    ) AS "hasOutstanding"`, String(item.agencyId));
+    outstanding = Boolean(pending?.[0]?.hasOutstanding);
+  } else if (db?.domainWorkItem?.findMany) {
+    const pending = await db.domainWorkItem.findMany({
+      where: { agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE },
+      select: { state: true, requestedRevision: true, completedRevision: true }, take: 100,
+    });
+    outstanding = (pending || []).some((row) => String(row?.state || "") !== "DONE" || BigInt(row?.requestedRevision || 0) > BigInt(row?.completedRevision || 0));
+  }
+  if (outstanding) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastSubmissionId: nextCursor }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: "domain_work_converged", unresolvedCount: 0, fallbackNow: now });
+  return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+}
+
+async function runTeamActivityCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const { backfillActivityContributionBatch } = require("./team-activity-contribution-authority-service");
+  const family = PHASE2_COVERAGE_FAMILY.TEAM_ACTIVITY_CONTRIBUTION;
+  const generation = PHASE2_COVERAGE_GENERATION.TEAM_ACTIVITY_CONTRIBUTION;
+  const cursor = String(item?.progressCursor?.lastEventId || "").trim() || null;
+  const previousUnresolved = Math.max(0, Number(item?.progressCursor?.unresolved || 0));
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const batch = await backfillActivityContributionBatch({ db, agencyId: item.agencyId, cursor, limit: 100 });
+  if (batch?.ok === false) {
+    await markPhase2CoverageFailed({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved + Number(batch?.unresolved || 0)) });
+    const error = new Error(batch?.code || "TEAM_ACTIVITY_CONTRIBUTION_BACKFILL_FAILED"); error.code = batch?.code || "TEAM_ACTIVITY_CONTRIBUTION_BACKFILL_FAILED";
+    return failDomainWorkClaim({ db, item, ownerToken, error, fallbackNow: new Date() });
+  }
+  const unresolved = previousUnresolved + Number(batch?.unresolved || 0);
+  const nextCursor = String(batch?.nextCursor || cursor || "").trim() || null;
+  if (batch?.complete === false) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastEventId: nextCursor, unresolved }, availableAt: now, fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({
+    db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor,
+    unresolvedCount: unresolved, fallbackNow: now,
+  });
+  const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+  return { ...ack, unresolved, complete: true, baseline: Number(batch?.baseline || 0), zero: Number(batch?.zero || 0) };
+}
+
+async function runTeamResponseCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const { backfillTeamResponseRangeBatch } = require("./team-response-projection-service");
+  const family = PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR;
+  const generation = PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR;
+  const cursor = String(item?.progressCursor?.lastCaseId || "").trim() || null;
+  const previousUnresolved = Math.max(0, Number(item?.progressCursor?.unresolved || 0));
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const batch = await backfillTeamResponseRangeBatch({ db, agencyId: item.agencyId, cursor, limit: 100 });
+  if (batch?.ok === false) {
+    await markPhase2CoverageFailed({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved + Number(batch?.unresolved || 0)) });
+    const error = new Error(batch?.code || "TEAM_RESPONSE_RANGE_REPAIR_FAILED"); error.code = batch?.code || "TEAM_RESPONSE_RANGE_REPAIR_FAILED";
+    return failDomainWorkClaim({ db, item, ownerToken, error, fallbackNow: new Date() });
+  }
+  const unresolved = previousUnresolved + Number(batch?.unresolved || 0);
+  const nextCursor = String(batch?.nextCursor || cursor || "").trim() || null;
+  if (batch?.complete === false) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastCaseId: nextCursor, unresolved }, availableAt: now, fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({
+    db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor,
+    unresolvedCount: unresolved, fallbackNow: now,
+  });
+  const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+  return { ...ack, unresolved, repaired: Number(batch?.repaired || 0), complete: true };
+}
+
+
+async function runTeamDialogCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const { dialogWorkObjectId, listUnprojectedRelevantDialogEvents } = require("./team-dialog-projection-authority-service");
+  const family = PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION;
+  const generation = PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION;
+  const cursor = String(item?.progressCursor?.lastEventId || "").trim() || null;
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const rows = await listUnprojectedRelevantDialogEvents({
+    db, agencyId: String(item.agencyId), cursor, limit: 100,
+  });
+  let published = 0;
+  for (const row of rows || []) {
+    const creatorId = String(row?.creatorId || "").trim(); const dialogId = String(row?.dialogId || row?.fanId || "").trim();
+    if (!creatorId || !dialogId) continue;
+    await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_DIALOG_PROJECTION,
+      objectType: "CreatorDialog", objectId: dialogWorkObjectId(creatorId, dialogId), parentObjectId: String(row.id),
+      partitionKey: creatorId, creatorId, availableAt: now });
+    published += 1;
+  }
+  const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
+  if (Number(rows?.length || 0) >= 100) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastEventId: nextCursor }, availableAt: now, fallbackNow: new Date() });
+  }
+  // Enumerated != converged. Before activating coverage, verify no raw event remains
+  // unprojected. If workers are still draining, republish a bounded set and retry later.
+  const pending = await listUnprojectedRelevantDialogEvents({
+    db, agencyId: String(item.agencyId), limit: 25,
+  });
+  let unresolved = 0;
+  for (const row of pending || []) {
+    const creatorId = String(row?.creatorId || "").trim(); const dialogId = String(row?.dialogId || row?.fanId || "").trim();
+    if (!creatorId || !dialogId) continue;
+    await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_DIALOG_PROJECTION, objectType: "CreatorDialog",
+      objectId: dialogWorkObjectId(creatorId, dialogId), parentObjectId: String(row.id), partitionKey: creatorId, creatorId, availableAt: now });
+    unresolved += 1;
+  }
+  if (unresolved > 0) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastEventId: null }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+  return { ...ack, complete: true, published };
+}
+
+async function runTeamMoneyRootClassificationUnit({ db, item, ownerToken, now }) {
+  const { classifyTeamMoneyRootsBatch } = require("./team-money-root-classification-service");
+  const family = PHASE2_COVERAGE_FAMILY.TEAM_MONEY_ROOT_CLASSIFICATION;
+  const generation = PHASE2_COVERAGE_GENERATION.TEAM_MONEY_ROOT_CLASSIFICATION;
+  const cursor = String(item?.progressCursor?.lastFactId || "").trim() || null;
+  const previousUnresolved = Math.max(0, Number(item?.progressCursor?.unresolved || 0));
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const batch = await classifyTeamMoneyRootsBatch({ db, agencyId: item.agencyId, cursor, limit: 100 });
+  if (batch?.ok === false) {
+    await markPhase2CoverageFailed({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor, unresolvedCount: Math.max(1, previousUnresolved) });
+    const error = new Error(batch?.code || "TEAM_MONEY_ROOT_CLASSIFICATION_FAILED"); error.code = batch?.code || "TEAM_MONEY_ROOT_CLASSIFICATION_FAILED";
+    return failDomainWorkClaim({ db, item, ownerToken, error, fallbackNow: new Date() });
+  }
+  const unresolved = previousUnresolved + Math.max(0, Number(batch?.unresolved || 0));
+  const nextCursor = String(batch?.nextCursor || cursor || "").trim() || null;
+  if (batch?.complete === false) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastFactId: nextCursor, unresolved }, availableAt: now, fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: unresolved, fallbackNow: now });
+  const ack = await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+  return { ...ack, complete: true, unresolved, scanned: Number(batch?.scanned || 0) };
+}
+
+async function runTeamMoneyReconciliationCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const { repairMigratedLegacyTipManualAuthority, migrateLegacyTipsToTipLedger } = require("./team-tip-ledger-service");
+  const family = PHASE2_COVERAGE_FAMILY.TEAM_MONEY_RECONCILIATION;
+  const generation = PHASE2_COVERAGE_GENERATION.TEAM_MONEY_RECONCILIATION;
+  const progress = item?.progressCursor && typeof item.progressCursor === "object" ? item.progressCursor : {};
+  const phase = String(progress.phase || "legacy_manual");
+  const agencyId = String(item.agencyId);
+  await markPhase2CoverageRunning({ db, agencyId, family, generation, enumeratedThrough: JSON.stringify(progress) });
+
+  if (phase === "legacy_manual") {
+    const repaired = await repairMigratedLegacyTipManualAuthority({ db, agencyId, limit: 100, dryRun: false });
+    if (repaired?.ok === false) throw Object.assign(new Error("TEAM_MONEY_LEGACY_MANUAL_REPAIR_FAILED"), { code: "TEAM_MONEY_LEGACY_MANUAL_REPAIR_FAILED" });
+    const more = Number(repaired?.scanned || 0) >= 100;
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { phase: more ? "legacy_manual" : "legacy_tips" }, availableAt: now, fallbackNow: new Date() });
+  }
+  if (phase === "legacy_tips") {
+    const migrated = await migrateLegacyTipsToTipLedger({ db, agencyId, limit: 100, dryRun: false, deleteLegacy: true, now });
+    if (migrated?.ok === false) throw Object.assign(new Error("TEAM_MONEY_LEGACY_TIP_MIGRATION_FAILED"), { code: "TEAM_MONEY_LEGACY_TIP_MIGRATION_FAILED" });
+    const more = Number(migrated?.scanned || 0) >= 100;
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { phase: more ? "legacy_tips" : "sales", lastId: null }, availableAt: now, fallbackNow: new Date() });
+  }
+
+  if (phase === "sales" || phase === "tips") {
+    const model = phase === "sales" ? db.creatorSale : db.creatorTip;
+    if (!model?.findMany) throw Object.assign(new Error("TEAM_MONEY_CANONICAL_SOURCE_UNAVAILABLE"), { code: "TEAM_MONEY_CANONICAL_SOURCE_UNAVAILABLE" });
+    const cursor = String(progress.lastId || "").trim() || null;
+    const where = { agencyId, ...(cursor ? { id: { gt: cursor } } : {}) };
+    if (phase === "sales") where.saleType = "MESSAGE";
+    const rows = await model.findMany({ where, select: { id: true, creatorId: true }, orderBy: { id: "asc" }, take: 100 });
+    for (const row of rows || []) await publishDomainWork({
+      db, agencyId, workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION,
+      objectType: phase === "sales" ? "CreatorSale" : "CreatorTip", objectId: String(row.id),
+      partitionKey: String(row.creatorId || agencyId), creatorId: row.creatorId ? String(row.creatorId) : null, availableAt: now,
+    });
+    const nextId = rows?.length ? String(rows[rows.length - 1].id) : cursor;
+    if (Number(rows?.length || 0) >= 100) {
+      await markPhase2CoverageRunning({ db, agencyId, family, generation, enumeratedThrough: `${phase}:${nextId}` });
+      return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { phase, lastId: nextId }, availableAt: now, fallbackNow: new Date() });
+    }
+    if (phase === "sales") {
+      return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { phase: "tips", lastId: null }, availableAt: now, fallbackNow: new Date() });
+    }
+  }
+
+  // Enumeration alone is not activation. Wait until every exact current/historical
+  // money item published for this agency has reached the requested revision.
+  let outstanding = false;
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(`SELECT EXISTS (
+      SELECT 1 FROM "DomainWorkItem" w WHERE w."agencyId"=$1 AND w."workClass"='TEAM_MONEY_RECONCILIATION'
+        AND (w."state" <> 'DONE' OR w."requestedRevision" > w."completedRevision") LIMIT 1
+    ) AS "hasOutstanding"`, agencyId);
+    outstanding = Boolean(rows?.[0]?.hasOutstanding);
+  } else if (db?.domainWorkItem?.findMany) {
+    const pendingRows = await db.domainWorkItem.findMany({
+      where: { agencyId, workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION },
+      select: { state: true, requestedRevision: true, completedRevision: true }, take: 25,
+    });
+    outstanding = (pendingRows || []).some((row) => String(row?.state || "") !== "DONE" || BigInt(row?.requestedRevision || 0) > BigInt(row?.completedRevision || 0));
+  }
+  if (outstanding) {
+    await markPhase2CoverageRunning({ db, agencyId, family, generation, enumeratedThrough: "sources_enumerated" });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { phase: "verify" }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId, family, generation, enumeratedThrough: "sources_enumerated", projectedThrough: "domain_work_converged", unresolvedCount: 0, fallbackNow: now });
+  return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+}
+
+async function runTeamReadSummaryCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const family = PHASE2_COVERAGE_FAMILY.TEAM_READ_SUMMARY;
+  const generation = PHASE2_COVERAGE_GENERATION.TEAM_READ_SUMMARY;
+  const cursor = String(item?.progressCursor?.lastFactId || "").trim() || null;
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const rows = await db.teamMoneyAttributionFact.findMany({
+    where: { agencyId: String(item.agencyId), ...(cursor ? { id: { gt: cursor } } : {}) },
+    select: { id: true, creatorId: true }, orderBy: { id: "asc" }, take: 100,
+  });
+  for (const row of rows || []) await publishDomainWork({
+    db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY,
+    objectType: "TeamMoneyAttributionFact", objectId: String(row.id), partitionKey: String(row.creatorId || item.agencyId),
+    creatorId: row.creatorId ? String(row.creatorId) : null, availableAt: now,
+  });
+  const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
+  if (Number(rows?.length || 0) >= 100) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastFactId: nextCursor }, availableAt: now, fallbackNow: new Date() });
+  }
+  // Do not activate a reader generation merely because source rows were enumerated.
+  // Every historical fact must have its durable contribution snapshot first.
+  let missing = [];
+  if (typeof db?.$queryRawUnsafe === "function") {
+    missing = await db.$queryRawUnsafe(`SELECT f."id",f."creatorId" FROM "TeamMoneyAttributionFact" f
+      LEFT JOIN "TeamMoneyRollupContribution" c ON c."sourceFactId"=f."id"
+      WHERE f."agencyId"=$1 AND c."sourceFactId" IS NULL ORDER BY f."id" ASC LIMIT 25`, String(item.agencyId));
+  } else if (db?.teamMoneyAttributionFact?.findMany) {
+    missing = await db.teamMoneyAttributionFact.findMany({
+      where: { agencyId: String(item.agencyId), rollupContribution: { is: null } }, select: { id: true, creatorId: true }, orderBy: { id: "asc" }, take: 25,
+    });
+  }
+  for (const row of missing || []) await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY, objectType: "TeamMoneyAttributionFact", objectId: String(row.id),
+    partitionKey: String(row.creatorId || item.agencyId), creatorId: row.creatorId ? String(row.creatorId) : null, availableAt: now });
+
+  // Existing contribution != converged contribution. A live fact can change after the
+  // historical enumerator has passed it, leaving a newer TEAM_READ_SUMMARY revision queued.
+  // Coverage is allowed to activate only after both storage presence and execution revision
+  // convergence are proven.
+  let outstanding = false;
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const pending = await db.$queryRawUnsafe(`SELECT EXISTS (
+      SELECT 1 FROM "DomainWorkItem" w WHERE w."agencyId"=$1 AND w."workClass"='TEAM_READ_SUMMARY'
+        AND (w."state" <> 'DONE' OR w."requestedRevision" > w."completedRevision") LIMIT 1
+    ) AS "hasOutstanding"`, String(item.agencyId));
+    outstanding = Boolean(pending?.[0]?.hasOutstanding);
+  } else if (db?.domainWorkItem?.findMany) {
+    const pending = await db.domainWorkItem.findMany({
+      where: { agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY },
+      select: { state: true, requestedRevision: true, completedRevision: true }, take: 25,
+    });
+    outstanding = (pending || []).some((row) => String(row?.state || "") !== "DONE" || BigInt(row?.requestedRevision || 0) > BigInt(row?.completedRevision || 0));
+  }
+  if (Number(missing?.length || 0) > 0 || outstanding) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastFactId: nextCursor }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+}
+
+async function runTelegramConfirmedCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const family = PHASE2_COVERAGE_FAMILY.TELEGRAM_CONFIRMED_PROJECTION;
+  const generation = PHASE2_COVERAGE_GENERATION.TELEGRAM_CONFIRMED_PROJECTION;
+  const cursor = String(item?.progressCursor?.lastIntentId || "").trim() || null;
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const rows = await db.telegramDeliveryIntent.findMany({
+    where: { agencyId: String(item.agencyId), state: "CONFIRMED", ...(cursor ? { id: { gt: cursor } } : {}) },
+    select: { id: true, creatorId: true, accountId: true }, orderBy: { id: "asc" }, take: 100,
+  });
+  for (const row of rows || []) await publishDomainWork({
+    db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TELEGRAM_CONFIRMED_PROJECTION,
+    objectType: "TelegramDeliveryIntent", objectId: String(row.id), partitionKey: String(row.accountId || row.creatorId || item.agencyId),
+    creatorId: row.creatorId ? String(row.creatorId) : null, accountId: row.accountId ? String(row.accountId) : null, availableAt: now,
+  });
+  const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
+  if (Number(rows?.length || 0) >= 100) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastIntentId: nextCursor }, availableAt: now, fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+}
+
+async function runTelegramInboundCoverageEnumerationUnit({ db, item, ownerToken, now }) {
+  const family = PHASE2_COVERAGE_FAMILY.TELEGRAM_INBOUND_PROJECTION;
+  const generation = PHASE2_COVERAGE_GENERATION.TELEGRAM_INBOUND_PROJECTION;
+  const cursor = String(item?.progressCursor?.lastInboundEventId || "").trim() || null;
+  await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: cursor });
+  const rows = await db.telegramInboundEvent.findMany({
+    where: {
+      agencyId: String(item.agencyId),
+      ...(cursor ? { id: { gt: cursor } } : {}),
+      OR: [
+        { submissionId: { not: null }, projectionState: { not: "APPLIED" } },
+        { submissionId: null, projectionState: { in: ["PENDING", "FAILED_RETRYABLE"] } },
+      ],
+    },
+    select: { id: true, creatorId: true, accountId: true }, orderBy: { id: "asc" }, take: 100,
+  });
+  for (const row of rows || []) await publishDomainWork({
+    db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TELEGRAM_INBOUND_PROJECTION,
+    objectType: "TelegramInboundEvent", objectId: String(row.id), partitionKey: String(row.accountId || row.creatorId || item.agencyId),
+    creatorId: row.creatorId ? String(row.creatorId) : null, accountId: row.accountId ? String(row.accountId) : null, availableAt: now,
+  });
+  const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
+  if (Number(rows?.length || 0) >= 100) {
+    await markPhase2CoverageRunning({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
+    return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastInboundEventId: nextCursor }, availableAt: now, fallbackNow: new Date() });
+  }
+  await markPhase2CoverageComplete({ db, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor, projectedThrough: nextCursor, unresolvedCount: 0, fallbackNow: now });
+  return ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: new Date() });
+}
+
+async function maybeRunPhase2HistoricalEnumeration({ db = prisma, now = new Date() } = {}) {
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.HISTORICAL_ENUMERATION, limit: PHASE2_HISTORICAL_ENUMERATION_BATCH_SIZE,
+    perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 5 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), completed: 0, yielded: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      const objectId = String(item.objectId || "");
+      let result;
+      if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.PROVIDER_OPERATIONAL}:`)) {
+        result = await runProviderCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.CUSTOM_EXTERNAL_PROJECTION}:`)) {
+        result = await runExternalCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.CUSTOM_SOURCE_PIPELINE}:`)) {
+        result = await runCustomSourcePipelineCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.TEAM_ACTIVITY_CONTRIBUTION}:`)) {
+        result = await runTeamActivityCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR}:`)) {
+        result = await runTeamResponseCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION}:`)) {
+        result = await runTeamDialogCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.TEAM_MONEY_ROOT_CLASSIFICATION}:`)) {
+        result = await runTeamMoneyRootClassificationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.TEAM_MONEY_RECONCILIATION}:`)) {
+        result = await runTeamMoneyReconciliationCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.TEAM_READ_SUMMARY}:`)) {
+        result = await runTeamReadSummaryCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.TELEGRAM_CONFIRMED_PROJECTION}:`)) {
+        result = await runTelegramConfirmedCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else if (objectId.startsWith(`${PHASE2_COVERAGE_FAMILY.TELEGRAM_INBOUND_PROJECTION}:`)) {
+        result = await runTelegramInboundCoverageEnumerationUnit({ db, item, ownerToken: claim.ownerToken, now });
+      } else {
+        const error = new Error(`Unsupported Phase2 coverage family: ${objectId}`); error.code = "PHASE2_COVERAGE_FAMILY_UNSUPPORTED";
+        result = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() });
+      }
+      if (result?.lost) report.lostOwnership += 1;
+      else if (result?.state === "READY" || result?.yielded) report.yielded += 1;
+      else if (result?.failed) report.failed += 1;
+      else report.completed += 1;
+    } catch (error) {
+      await markPhase2CoverageFailed({ db, agencyId: item.agencyId,
+        family: String(item.objectId || "").split(":")[0], generation: String(item.objectId || "").split(":").slice(1).join(":"), unresolvedCount: 1 }).catch(() => {});
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
+}
+
+// Compatibility export: the old global backfill authority is retired. This now seeds and
+// executes per-agency coverage only; readiness of Agency B is independent from poison in A.
+async function maybeBackfillProviderOperationalDebt({ db = prisma, now = new Date() } = {}) {
+  const seed = await maybeSeedPhase2CoverageWork({ db, now });
+  const enumeration = await maybeRunPhase2HistoricalEnumeration({ db, now });
+  return { ok: seed?.ok !== false && enumeration?.ok !== false, seed, enumeration };
+}
+
+async function communicationBlockedDependency({ item, report, db }) {
+  const reason = String(report?.initialTaskBlockedReason || "");
+  if (!reason) return null;
+  const order = await db?.customOrder?.findFirst?.({
+    where: { agencyId: String(item.agencyId), id: String(item.objectId) },
+    select: { id: true, creatorId: true, creator: { select: { telegramAccountId: true, telegramContact: true } } },
+  });
+  const creatorId = String(order?.creatorId || item.creatorId || "");
+  if (reason === "CUSTOM_ORDER_TELEGRAM_CONTACT_REQUIRED") {
+    const revision = await currentDependencyRevision({ db, agencyId: item.agencyId, dependencyKind: "CREATOR_BINDING", dependencyKey: creatorId });
+    return { dependencyKind: "CREATOR_BINDING", dependencyKey: creatorId, dependencyRevision: revision, reason };
+  }
+  if (["CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED", "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING"].includes(reason)) {
+    const explicitAccount = String(order?.creator?.telegramAccountId || "").trim();
+    const dependencyKind = explicitAccount ? "ACCOUNT_LIFECYCLE" : "AUTO_PROVIDER";
+    const dependencyKey = explicitAccount || String(item.agencyId);
+    const revision = await currentDependencyRevision({ db, agencyId: item.agencyId, dependencyKind, dependencyKey });
+    return { dependencyKind, dependencyKey, dependencyRevision: revision, reason };
+  }
+  return null;
+}
+
+// Compatibility export name retained for callers/tests. Execution ownership is no longer the
+// providerOperationalDirty boolean: revisioned DomainWorkItem is the distributed authority.
+async function maybeRepairProviderOperationalDirty({ db = prisma, now = new Date() } = {}) {
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.CUSTOM_COMMUNICATION,
+    limit: PROVIDER_OPERATIONAL_DIRTY_BATCH_SIZE, perAgencyQuantum: 10,
+    leaseMs: 5 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), acknowledged: 0, blocked: 0, failed: 0, lostOwnership: 0, projected: 0, modelCommunicationRepaired: 0 };
+  const { repairClaimedCustomModelCommunicationWork } = require("./telegram-delivery-authority-service");
+  for (const item of claim?.items || []) {
+    try {
+      const claimedRepair = await repairClaimedCustomModelCommunicationWork({
+        agencyId: String(item.agencyId), orderId: String(item.objectId), workItem: item,
+        ownerToken: claim.ownerToken, now: new Date(), db, leaseMs: 5 * 60 * 1000,
+      });
+      if (claimedRepair?.lostOwnership) { report.lostOwnership += 1; continue; }
+      if (claimedRepair?.superseded || claimedRepair?.missing) {
+        const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+        if (ack?.lost) report.lostOwnership += 1; else report.acknowledged += 1;
+        continue;
+      }
+      const communication = claimedRepair?.communication || {};
+      report.modelCommunicationRepaired += Number(communication?.initialTaskPlanned || 0) + Number(communication?.initialTaskReactivated || 0)
+        + Number(communication?.revisionIntentPlanned || 0) + Number(communication?.precommitCancelled || 0)
+        + Number(communication?.precommitRefreshed || 0) + Number(communication?.reminderScheduleRepaired || 0);
+      if (claimedRepair?.ok === false || communication?.ok === false) {
+        const failure = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error: Object.assign(new Error("CUSTOM_MODEL_COMMUNICATION_REPAIR_FAILED"), { code: "CUSTOM_MODEL_COMMUNICATION_REPAIR_FAILED" }), fallbackNow: new Date() });
+        if (failure?.lost) report.lostOwnership += 1; else report.failed += 1;
+        continue;
+      }
+      const projection = claimedRepair?.projection || {};
+      report.projected += Number(projection?.projected || 0);
+      const dependency = await communicationBlockedDependency({ item, report: communication, db });
+      if (dependency) {
+        const blocked = await blockDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, ...dependency, fallbackNow: new Date() });
+        if (blocked?.lost) report.lostOwnership += 1; else report.blocked += 1;
+        continue;
+      }
+      const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+      if (ack?.lost) report.lostOwnership += 1; else report.acknowledged += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
+}
+
+async function listDependencyFanoutOrders({ db, item, limit = 100 }) {
+  const cursor = String(item?.progressCursor?.lastOrderId || "").trim() || null;
+  const baseWhere = { agencyId: String(item.agencyId), status: "PENDING", type: { in: ["CONTENT", "CALL", "PHYSICAL"] }, ...(cursor ? { id: { gt: cursor } } : {}) };
+  if (String(item.objectType) === "CreatorAccount") {
+    return db.customOrder.findMany({ where: { ...baseWhere, creatorId: String(item.objectId) }, select: { id: true, agencyId: true, creatorId: true }, orderBy: { id: "asc" }, take: limit });
+  }
+  if (String(item.objectType) === "ReminderPolicy") {
+    return db.customOrder.findMany({ where: baseWhere, select: { id: true, agencyId: true, creatorId: true }, orderBy: { id: "asc" }, take: limit });
+  }
+  if (String(item.objectType) === "AgencyTelegramMtprotoAccount" && typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(
+      `SELECT co."id",co."agencyId",co."creatorId"
+         FROM "CustomOrder" co JOIN "CreatorAccount" ca ON ca."agencyId"=co."agencyId" AND ca."id"=co."creatorId"
+        WHERE co."agencyId"=$1 AND co."status"='PENDING' AND co."type" IN ('CONTENT','CALL','PHYSICAL')
+          AND ($2::text IS NULL OR co."id">$2)
+          AND (ca."telegramAccountId" IS NULL OR ca."telegramAccountId"=$3)
+        ORDER BY co."id" ASC LIMIT ${Math.max(1, Math.min(100, Number(limit) || 100))}`,
+      String(item.agencyId), cursor, String(item.objectId),
+    );
+    return rows || [];
+  }
+  // Reduced test fallback. Production account fanout uses the indexed join above.
+  return db.customOrder.findMany({ where: baseWhere, select: { id: true, agencyId: true, creatorId: true }, orderBy: { id: "asc" }, take: limit });
+}
+
+async function listDependencyFanoutSubmissions({ db, item, limit = 100 }) {
+  const cursor = String(item?.progressCursor?.lastSubmissionId || item?.progressCursor?.lastId || "").trim() || null;
+  const where = {
+    agencyId: String(item.agencyId),
+    pipelineDisposition: { in: ["ACTIVE", "SALVAGE"] },
+    ...(cursor ? { id: { gt: cursor } } : {}),
+  };
+  if (String(item.objectType) === "CreatorAccount") where.creatorId = String(item.objectId);
+  else if (String(item.objectType) === "AgencyTelegramMtprotoAccount") where.telegramSourceAccountId = String(item.objectId);
+  else if (String(item.objectType) !== "CustomPipelineConfig") return [];
+  return db.customContentSubmission.findMany({
+    where,
+    select: { id: true, agencyId: true, creatorId: true, telegramSourceAccountId: true },
+    orderBy: { id: "asc" }, take: Math.max(1, Math.min(100, Number(limit) || 100)),
+  });
+}
+
+async function processTeamMoneyEvidenceFanout({ db, item, now }) {
+  const sent = await db?.teamSentMessageLedger?.findFirst?.({
+    where: { id: String(item.objectId), agencyId: String(item.agencyId) },
+    select: { id: true, agencyId: true, creatorId: true, accountId: true, messageId: true, sentAt: true },
+  });
+  if (!sent) return { complete: true, obsolete: true, published: 0 };
+  const creatorId = String(sent.creatorId || sent.accountId || "").trim();
+  const messageId = String(sent.messageId || "").trim();
+  if (!creatorId || !messageId) return { complete: true, obsolete: true, published: 0 };
+  const progress = item?.progressCursor && typeof item.progressCursor === "object" ? item.progressCursor : {};
+  const phase = String(progress.phase || "sales");
+  const cursor = String(progress.lastId || "").trim() || null;
+  const sentAt = sent.sentAt instanceof Date ? sent.sentAt : new Date(sent.sentAt || now);
+  const tipWindowEnd = new Date(sentAt.getTime() + 15 * 60 * 1000);
+  let published = 0;
+
+  if (phase === "sales") {
+    const rows = await db.creatorSale.findMany({
+      where: { agencyId: String(item.agencyId), creatorId, saleType: "MESSAGE", messageId, ...(cursor ? { id: { gt: cursor } } : {}) },
+      select: { id: true }, orderBy: { id: "asc" }, take: 100,
+    });
+    for (const row of rows || []) {
+      await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION,
+        objectType: "CreatorSale", objectId: String(row.id), partitionKey: creatorId, creatorId, availableAt: now });
+      published += 1;
+    }
+    if (Number(rows?.length || 0) >= 100) return { complete: false, published, progressCursor: { phase: "sales", lastId: String(rows[rows.length - 1].id) } };
+  }
+
+  const tipCursor = phase === "tips" ? cursor : null;
+  const tips = await db.creatorTip.findMany({
+    where: { agencyId: String(item.agencyId), creatorId, ...(tipCursor ? { id: { gt: tipCursor } } : {}),
+      OR: [{ messageId }, { tippedAt: { gte: sentAt, lte: tipWindowEnd } }] },
+    select: { id: true }, orderBy: { id: "asc" }, take: 100,
+  });
+  for (const row of tips || []) {
+    await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION,
+      objectType: "CreatorTip", objectId: String(row.id), partitionKey: creatorId, creatorId, availableAt: now });
+    published += 1;
+  }
+  if (Number(tips?.length || 0) >= 100) return { complete: false, published, progressCursor: { phase: "tips", lastId: String(tips[tips.length - 1].id) } };
+  return { complete: true, published };
+}
+
+async function maybeRunPhase2DependencyFanout({ db = prisma, now = new Date() } = {}) {
+  const claim = await claimDomainWorkBatch({ db, workClass: PHASE2_WORK_CLASS.DEPENDENCY_FANOUT, limit: 20, perAgencyQuantum: 2, leaseMs: 2 * 60 * 1000, fallbackNow: now });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), published: 0, sourcePublished: 0, reminderReprojected: 0, completed: 0, yielded: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      if (String(item.objectType) === "TeamSentMessageLedger") {
+        const moneyFanout = await processTeamMoneyEvidenceFanout({ db, item, now });
+        report.published += Number(moneyFanout?.published || 0);
+        if (moneyFanout?.complete === false) {
+          const yielded = await yieldDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, progressCursor: moneyFanout.progressCursor, availableAt: now, fallbackNow: new Date() });
+          if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+        } else {
+          const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+          if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
+        }
+        continue;
+      }
+
+      if (String(item.objectType) === "ReminderPolicy") {
+        const rows = await listDependencyFanoutOrders({ db, item, limit: 100 });
+        for (const row of rows) {
+          const { reprojectCustomReminderSchedule } = require("./custom-order-reminders");
+          await reprojectCustomReminderSchedule({ agencyId: String(row.agencyId), orderId: String(row.id), now: new Date(), db });
+          report.reminderReprojected += 1;
+        }
+        if ((rows?.length || 0) >= 100) {
+          const yielded = await yieldDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, progressCursor: { lastOrderId: String(rows[rows.length - 1].id) }, availableAt: now, fallbackNow: new Date() });
+          if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+        } else {
+          const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+          if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
+        }
+        continue;
+      }
+
+      const progress = item?.progressCursor && typeof item.progressCursor === "object" ? item.progressCursor : {};
+      let phase = String(progress.phase || (String(item.objectType) === "CustomPipelineConfig" ? "submissions" : "orders"));
+      if (phase === "orders") {
+        const rows = await listDependencyFanoutOrders({ db, item: { ...item, progressCursor: { lastOrderId: progress.lastId || progress.lastOrderId || null } }, limit: 100 });
+        for (const row of rows) {
+          await publishDomainWork({ db, agencyId: String(row.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_COMMUNICATION, objectType: "CustomOrder", objectId: String(row.id), partitionKey: String(row.creatorId), creatorId: String(row.creatorId), availableAt: now });
+          report.published += 1;
+        }
+        if ((rows?.length || 0) >= 100) {
+          const yielded = await yieldDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, progressCursor: { phase: "orders", lastId: String(rows[rows.length - 1].id) }, availableAt: now, fallbackNow: new Date() });
+          if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+          continue;
+        }
+        phase = "submissions";
+      }
+
+      if (phase === "submissions") {
+        const rows = await listDependencyFanoutSubmissions({ db, item: { ...item, progressCursor: { lastSubmissionId: progress.phase === "submissions" ? (progress.lastId || progress.lastSubmissionId || null) : null } }, limit: 100 });
+        for (const row of rows) {
+          await publishDomainWork({ db, agencyId: String(row.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+            objectType: "CustomContentSubmission", objectId: String(row.id), partitionKey: String(row.creatorId), creatorId: String(row.creatorId),
+            accountId: row.telegramSourceAccountId ? String(row.telegramSourceAccountId) : null, availableAt: now });
+          report.sourcePublished += 1;
+        }
+        if ((rows?.length || 0) >= 100) {
+          const yielded = await yieldDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, progressCursor: { phase: "submissions", lastId: String(rows[rows.length - 1].id) }, availableAt: now, fallbackNow: new Date() });
+          if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+          continue;
+        }
+      }
+
+      const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+      if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
+}
+
+async function reminderBlockedDependency({ item, result, db }) {
+  const code = String(result?.blockedCode || "");
+  if (!code) return null;
+  if (code === "CUSTOM_ORDER_REMINDER_OUTCOME_UNRESOLVED") {
+    const dependencyKind = "REMINDER_OUTCOME", dependencyKey = String(item.parentObjectId || item.objectId);
+    const dependencyRevision = await currentDependencyRevision({ db, agencyId: item.agencyId, dependencyKind, dependencyKey });
+    return { dependencyKind, dependencyKey, dependencyRevision };
+  }
+  if (["CUSTOM_ORDER_TELEGRAM_ACCOUNT_REQUIRED", "CUSTOM_ORDER_TELEGRAM_ACCOUNT_RETIRING"].includes(code)) {
+    const orderId = String(item.parentObjectId || "").trim();
+    const order = orderId ? await db?.customOrder?.findFirst?.({ where: { agencyId: String(item.agencyId), id: orderId }, select: { creatorId: true, creator: { select: { telegramAccountId: true } } } }) : null;
+    const explicit = String(order?.creator?.telegramAccountId || result?.accountId || "").trim();
+    const dependencyKind = explicit ? "ACCOUNT_LIFECYCLE" : "AUTO_PROVIDER";
+    const dependencyKey = explicit || String(item.agencyId);
+    const dependencyRevision = await currentDependencyRevision({ db, agencyId: item.agencyId, dependencyKind, dependencyKey });
+    return { dependencyKind, dependencyKey, dependencyRevision };
+  }
+  return null;
+}
+
+async function maybePlanDueCustomReminderWork({ db = prisma, now = new Date() } = {}) {
+  const { ensureAutomaticReminderIntentForOrder } = require("./telegram-delivery-authority-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.CUSTOM_REMINDER, limit: PHASE2_CUSTOM_REMINDER_BATCH_SIZE,
+    perAgencyQuantum: 10, perPartitionQuantum: 1, leaseMs: 2 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), planned: 0, blocked: 0, stale: 0, completed: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      const orderId = String(item.parentObjectId || "").trim();
+      if (!orderId) throw Object.assign(new Error("CUSTOM_REMINDER_WORK_PARENT_REQUIRED"), { code: "CUSTOM_REMINDER_WORK_PARENT_REQUIRED" });
+      const result = await ensureAutomaticReminderIntentForOrder({ agencyId: String(item.agencyId), orderId, member: null, now, db });
+      report.planned += Number(result?.planned || 0);
+      if (result?.blocked) {
+        const dependency = await reminderBlockedDependency({ item, result, db });
+        if (dependency) {
+          const blocked = await blockDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, ...dependency, reason: result.blockedCode, fallbackNow: new Date() });
+          if (blocked?.lost) report.lostOwnership += 1; else report.blocked += 1;
+          continue;
+        }
+      }
+      if (result?.stale) report.stale += 1;
+      const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+      if (ack?.lost) {
+        // Reprojection may have superseded exactly this old identity in the same domain action.
+        const current = await db?.domainWorkItem?.findFirst?.({ where: { id: String(item.id) } });
+        if (result?.stale && String(current?.state || "") === "DONE" && String(current?.terminalCause || "") === "REMINDER_SUPERSEDED") report.completed += 1;
+        else report.lostOwnership += 1;
+      } else report.completed += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
 }
 
 async function runCustomExternalProofConvergenceSweep({ now = new Date(), db = prisma } = {}) {
-  try {
-    const { convergeHistoricalCustomExternalProofs, repairCurrentCustomExternalProjectionDebt } = require("./custom-external-proof-convergence-service");
-    const backfill = await runMaintenanceLane({
-      db,
-      key: CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY,
-      generation: CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION,
-      oneTime: true,
-      leaseMs: 10 * 60 * 1000,
-      minIntervalMs: 5_000,
-      fallbackNow: now,
-      work: async () => {
-        const batch = await convergeHistoricalCustomExternalProofs({ limit: 200, db });
-        const complete = Number(batch?.selected || 0) === 0 && Number(batch?.failed || 0) === 0;
-        return {
-          ...batch,
-          complete,
-          outcome: complete ? "BACKFILL_COMPLETE" : "BACKFILL_BATCH_COMPLETE",
-          nextRunAt: complete ? null : new Date(now.getTime() + 5_000),
-          progress: { selected: Number(batch?.selected || 0), repaired: Number(batch?.repaired || 0), failed: Number(batch?.failed || 0) },
-        };
-      },
-    });
-    const current = await runMaintenanceLane({
-      db,
-      key: CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_KEY,
-      generation: CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_GENERATION,
-      oneTime: false,
-      leaseMs: 5 * 60 * 1000,
-      minIntervalMs: 30_000,
-      fallbackNow: now,
-      work: async () => {
-        const batch = await repairCurrentCustomExternalProjectionDebt({ limit: 200, db });
-        return {
-          ...batch,
-          outcome: Number(batch?.selected || 0) > 0 ? "CURRENT_DEBT_BATCH_COMPLETE" : "CURRENT_DEBT_IDLE",
-          nextRunAt: new Date(now.getTime() + (Number(batch?.selected || 0) >= 200 ? 1_000 : 60_000)),
-          progress: { selected: Number(batch?.selected || 0), repaired: Number(batch?.repaired || 0), cleared: Number(batch?.cleared || 0), failed: Number(batch?.failed || 0) },
-        };
-      },
-    });
-    if (!backfill?.skipped && (Number(backfill?.selected || 0) > 0 || Number(backfill?.failed || 0) > 0)) {
-      console.log(`[scheduler] Custom external proof backfill — selected=${backfill.selected || 0}, repaired=${backfill.repaired || 0}, media=${backfill.projectedMedia || 0}, failed=${backfill.failed || 0}`);
+  const { repairCustomExternalProjectionWorkItem } = require("./custom-external-proof-convergence-service");
+  const claim = await claimDomainWorkBatch({
+    db,
+    workClass: PHASE2_WORK_CLASS.CUSTOM_EXTERNAL_PROJECTION,
+    limit: 50,
+    perAgencyQuantum: 5,
+    perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000,
+    fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), repaired: 0, cleared: 0, obsolete: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      if (String(item.objectType) !== "AutomationDelivery") {
+        throw Object.assign(new Error("CUSTOM_EXTERNAL_WORK_TYPE_UNSUPPORTED"), { code: "CUSTOM_EXTERNAL_WORK_TYPE_UNSUPPORTED" });
+      }
+      const result = await repairCustomExternalProjectionWorkItem({ agencyId: String(item.agencyId), deliveryId: String(item.objectId), db });
+      report.repaired += Number(result?.repaired || 0);
+      report.cleared += Number(result?.cleared || 0);
+      if (result?.obsolete) report.obsolete += 1;
+      if (!result?.converged && !result?.obsolete) {
+        const error = new Error("CUSTOM_EXTERNAL_PROJECTION_NOT_CONVERGED");
+        error.code = "CUSTOM_EXTERNAL_PROJECTION_NOT_CONVERGED";
+        const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() });
+        if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+        continue;
+      }
+      const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+      if (ack?.lost) report.lostOwnership += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
     }
-    if (!current?.skipped && (Number(current?.selected || 0) > 0 || Number(current?.failed || 0) > 0)) {
-      console.log(`[scheduler] Custom external current debt — selected=${current.selected || 0}, repaired=${current.repaired || 0}, cleared=${current.cleared || 0}, failed=${current.failed || 0}`);
-    }
-    return { ok: backfill?.ok !== false && current?.ok !== false, backfill, current };
-  } catch (err) {
-    console.warn("[scheduler] Custom external proof convergence failed:", err?.message || err);
-    return { ok: false, backfill: null, current: null, error: err?.message || String(err) };
   }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return { ok: report.ok, backfill: { skipped: true, reason: "per_agency_historical_enumeration" }, current: report };
+}
+
+async function runTeamDialogProjectionSweep({ now = new Date(), db = prisma } = {}) {
+  const { parseDialogWorkObjectId, projectCreatorDialogWorkItem } = require("./team-dialog-projection-authority-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.TEAM_DIALOG_PROJECTION, limit: 50, perAgencyQuantum: 5, perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), projected: 0, yielded: 0, completed: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      if (String(item.objectType) !== "CreatorDialog") throw Object.assign(new Error("TEAM_DIALOG_WORK_TYPE_UNSUPPORTED"), { code: "TEAM_DIALOG_WORK_TYPE_UNSUPPORTED" });
+      const identity = parseDialogWorkObjectId(item.objectId);
+      if (!identity) throw Object.assign(new Error("TEAM_DIALOG_WORK_IDENTITY_INVALID"), { code: "TEAM_DIALOG_WORK_IDENTITY_INVALID" });
+      const result = await projectCreatorDialogWorkItem({ agencyId: String(item.agencyId), ...identity, db, limit: 100 });
+      report.projected += Number(result?.projected || 0);
+      if (result?.hasMore) {
+        const yielded = await yieldDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, availableAt: now, fallbackNow: new Date() });
+        if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+      } else {
+        const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+        if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
+      }
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
+}
+
+async function runTeamResponseRangeRepairSweep({ now = new Date(), db = prisma } = {}) {
+  const { projectCoverageResponseWorkItem } = require("./team-dialog-projection-authority-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.TEAM_RESPONSE_RANGE_REPAIR, limit: 25, perAgencyQuantum: 3, perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), repaired: 0, yielded: 0, completed: 0, obsolete: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      if (String(item.objectType) !== "TeamActivityEvent") throw Object.assign(new Error("TEAM_RESPONSE_RANGE_WORK_TYPE_UNSUPPORTED"), { code: "TEAM_RESPONSE_RANGE_WORK_TYPE_UNSUPPORTED" });
+      const result = await projectCoverageResponseWorkItem({
+        agencyId: String(item.agencyId), eventId: String(item.objectId), db,
+        cursor: item?.progressCursor?.lastReplyLedgerId || null, limit: 100,
+      });
+      report.repaired += Number(result?.repaired || 0); if (result?.obsolete) report.obsolete += 1;
+      if (result?.hasMore && result?.nextCursor) {
+        const yielded = await yieldDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, progressCursor: { lastReplyLedgerId: String(result.nextCursor) }, availableAt: now, fallbackNow: new Date() });
+        if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+      } else {
+        const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+        if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
+      }
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
+}
+
+async function runTeamMoneyReconciliationSweep({ now = new Date(), db = prisma } = {}) {
+  const { repairTeamMoneyReconciliationWorkItem } = require("./team-money-reconciliation-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION, limit: 50, perAgencyQuantum: 5, perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), reconciled: 0, obsolete: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      const result = await repairTeamMoneyReconciliationWorkItem({ db, agencyId: String(item.agencyId), objectType: String(item.objectType), objectId: String(item.objectId) });
+      if (result?.obsolete) report.obsolete += 1; else report.reconciled += 1;
+      if (result?.ok === false) throw Object.assign(new Error(result?.code || "TEAM_MONEY_RECONCILIATION_FAILED"), { code: result?.code || "TEAM_MONEY_RECONCILIATION_FAILED" });
+      const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+      if (ack?.lost) report.lostOwnership += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
+}
+
+async function runTeamReadSummarySweep({ now = new Date(), db = prisma } = {}) {
+  const { applyTeamMoneyFactToRollups } = require("./team-money-rollup-authority-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY, limit: 50, perAgencyQuantum: 5, perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), changed: 0, idempotent: 0, obsolete: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      if (String(item.objectType) !== "TeamMoneyAttributionFact") throw Object.assign(new Error("TEAM_READ_SUMMARY_WORK_TYPE_UNSUPPORTED"), { code: "TEAM_READ_SUMMARY_WORK_TYPE_UNSUPPORTED" });
+      const result = await applyTeamMoneyFactToRollups({ db, agencyId: String(item.agencyId), factId: String(item.objectId) });
+      if (result?.obsolete) report.obsolete += 1; else if (result?.changed) report.changed += 1; else report.idempotent += 1;
+      const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+      if (ack?.lost) report.lostOwnership += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
 }
 
 async function runTelegramInboundProjectionSweep({ now = new Date(), db = prisma } = {}) {
-  try {
-    // Provider observations are ACKed once TelegramInboundEvent is durable. Any derived
-    // Custom submission/current-state repair after that boundary is server-owned work and
-    // must continue even when no Desktop is open or polling delivery work.
-    const { retryPendingInboundProjections } = require("./telegram-inbound-authority-service");
-    const result = await retryPendingInboundProjections({
-      now,
-      limit: TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,
-      db,
-    });
-    if (Number(result?.scanned || 0) > 0) {
-      console.log(`[scheduler] Telegram inbound projection — scanned=${result.scanned}, applied=${result.applied || 0}, skipped=${result.skipped || 0}, pending=${result.pending || 0}, review=${result.reviewRequired || 0}`);
+  const { projectTelegramInboundEvent, reconcilePendingInboundForConfirmedDelivery } = require("./telegram-inbound-authority-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.TELEGRAM_INBOUND_PROJECTION,
+    limit: Math.min(100, TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE), perAgencyQuantum: 5, perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), applied: 0, terminal: 0, yielded: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      if (String(item.objectType) === "TelegramInboundEvent") {
+        const result = await projectTelegramInboundEvent({ eventId: String(item.objectId), now, db });
+        if (String(result?.state) === "FAILED_RETRYABLE") {
+          const error = new Error(result?.reason || "TELEGRAM_INBOUND_PROJECTION_FAILED"); error.code = result?.reason || "TELEGRAM_INBOUND_PROJECTION_FAILED";
+          const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() });
+          if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+          continue;
+        }
+        if (String(result?.state) === "APPLIED") report.applied += 1;
+        else report.terminal += 1;
+        const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+        if (ack?.lost) report.lostOwnership += 1;
+        continue;
+      }
+      if (String(item.objectType) === "TelegramDeliveryReceipt") {
+        const receipt = await db.telegramDeliveryIntent.findFirst({ where: { id: String(item.objectId), agencyId: String(item.agencyId), state: "CONFIRMED" } });
+        if (!receipt) {
+          const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+          if (ack?.lost) report.lostOwnership += 1;
+          else report.terminal += 1;
+          continue;
+        }
+        const providerReceipt = String(receipt.confirmationAuthority || "PROVIDER_RECEIPT") === "PROVIDER_RECEIPT";
+        const result = await reconcilePendingInboundForConfirmedDelivery({
+          agencyId: String(item.agencyId), accountId: String(receipt.accountId),
+          senderTelegramUserId: providerReceipt ? (receipt.remoteRecipientTelegramUserId || null) : null,
+          replyToMessageId: receipt.remoteMessageId || null, actorUserId: receipt.userId || null, now,
+          limit: 100, cursor: item?.progressCursor?.lastInboundEventId || null, db,
+        });
+        report.applied += Number(result?.reconciled || 0);
+        if (result?.hasMore && result?.nextCursor) {
+          const yielded = await yieldDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, progressCursor: { lastInboundEventId: String(result.nextCursor) }, availableAt: now, fallbackNow: new Date() });
+          if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+        } else {
+          const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+          if (ack?.lost) report.lostOwnership += 1; else report.terminal += 1;
+        }
+        continue;
+      }
+      const error = new Error(`Unsupported Telegram inbound work type: ${item.objectType}`); error.code = "TELEGRAM_INBOUND_WORK_TYPE_UNSUPPORTED";
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() });
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
     }
-    return result;
-  } catch (err) {
-    // This lane owns only derived state over already-durable provider observations. A
-    // temporary failure must never suppress the main recurring scheduler.
-    console.warn("[scheduler] Telegram inbound projection failed:", err?.message || err);
-    return { ok: false, error: err?.message || String(err) };
   }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
 }
-
 
 async function runTelegramInboundProjectionMaintenanceSweep({ now = new Date(), db = prisma } = {}) {
-  return runMaintenanceLane({
-    db,
-    key: TELEGRAM_INBOUND_MAINTENANCE_LANE_KEY,
-    generation: TELEGRAM_INBOUND_MAINTENANCE_LANE_GENERATION,
-    oneTime: false,
-    leaseMs: 5 * 60 * 1000,
-    minIntervalMs: TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS,
-    fallbackNow: now,
-    work: async () => {
-      const result = await runTelegramInboundProjectionSweep({ now, db });
-      return { ...result, outcome: result?.ok === false ? "INBOUND_PROJECTION_FAILED" : "INBOUND_PROJECTION_BATCH_COMPLETE" };
-    },
+  return runTelegramInboundProjectionSweep({ now, db });
+}
+
+async function runTelegramConfirmedProjectionSweep({ now = new Date(), db = prisma } = {}) {
+  const { repairConfirmedTelegramDeliveryProjectionItem } = require("./telegram-delivery-authority-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.TELEGRAM_CONFIRMED_PROJECTION,
+    limit: 50, perAgencyQuantum: 5, perPartitionQuantum: 1, leaseMs: 2 * 60 * 1000, fallbackNow: now,
   });
-}
-
-async function runTelegramConfirmedProjectionSweep({ now = new Date(), db = prisma, cursorAgencyId = null, pageSize = 100 } = {}) {
-  try {
-    // Current operational debt is already indexed/bounded. This sweep therefore owns only a
-    // bounded page of Agencies per claim; historical Telegram receipts are never rediscovered
-    // here. MaintenanceLaneState carries the Agency cursor across replicas/process restarts.
-    const { repairConfirmedTelegramDeliveryProjections, repairCustomModelCommunicationConvergence } = require("./telegram-delivery-authority-service");
-    const size = Math.max(1, Math.min(500, Number(pageSize) || 100));
-    const normalizedCursor = String(cursorAgencyId || "").trim() || null;
-    const agencies = db?.agency?.findMany
-      ? await db.agency.findMany({
-          where: { deletedAt: null, ...(normalizedCursor ? { id: { gt: normalizedCursor } } : {}) },
-          select: { id: true },
-          orderBy: { id: "asc" },
-          take: size,
-        })
-      : [];
-    const report = {
-      ok: true, agencies: 0, scanned: 0, repaired: 0, failed: 0,
-      reminderScheduleScanned: 0, reminderScheduleRepaired: 0, reminderScheduleFailed: 0,
-      modelInitialTasksPlanned: 0, modelInitialTasksReactivated: 0, modelInitialTasksBlocked: 0, modelInitialTasksRaced: 0, modelInitialTasksFailed: 0,
-      modelCommunicationPrecommitScanned: 0, modelCommunicationPrecommitCancelled: 0, modelCommunicationPrecommitFailed: 0,
-      modelCommunicationReminderScanned: 0, modelCommunicationReminderRepaired: 0, modelCommunicationReminderFailed: 0,
-      revisionIntentsPlanned: 0,
-      modelCommunicationCurrentBacklog: false,
-      agencyFailures: [],
-      cursorAgencyId: normalizedCursor,
-      nextCursorAgencyId: null,
-      complete: false,
-    };
-    for (const agency of agencies || []) {
-      report.agencies += 1;
-      const agencyId = String(agency.id);
-      report.nextCursorAgencyId = agencyId;
-      try {
-        const result = await repairConfirmedTelegramDeliveryProjections({ agencyId, now, db });
-        report.scanned += Number(result?.scanned || 0);
-        report.repaired += Number(result?.repaired || 0);
-        report.failed += Number(result?.failed || 0);
-        report.reminderScheduleScanned += Number(result?.reminderScheduleScanned || 0);
-        report.reminderScheduleRepaired += Number(result?.reminderScheduleRepaired || 0);
-        report.reminderScheduleFailed += Number(result?.reminderScheduleFailed || 0);
-        if (result?.ok === false) report.ok = false;
-      } catch (error) {
-        report.ok = false;
-        report.failed += 1;
-        report.agencyFailures.push({ agencyId, lane: "confirmed_projection", error: String(error?.message || error).slice(0, 1000) });
-      }
-
-      try {
-        const modelCommunication = await repairCustomModelCommunicationConvergence({ agencyId, now, db });
-        report.modelInitialTasksPlanned += Number(modelCommunication?.initialTaskIntentsPlanned || 0);
-        report.modelInitialTasksReactivated += Number(modelCommunication?.initialTaskIntentsReactivated || 0);
-        report.modelInitialTasksBlocked += Number(modelCommunication?.initialTaskIntentsBlocked || 0);
-        report.modelInitialTasksRaced += Number(modelCommunication?.initialTaskIntentsRaced || 0);
-        report.modelInitialTasksFailed += Number(modelCommunication?.initialTaskIntentsFailed || 0);
-        report.modelCommunicationPrecommitScanned += Number(modelCommunication?.precommitScanned || 0);
-        report.modelCommunicationPrecommitCancelled += Number(modelCommunication?.precommitCancelled || 0);
-        report.modelCommunicationPrecommitFailed += Number(modelCommunication?.precommitFailed || 0);
-        report.modelCommunicationReminderScanned += Number(modelCommunication?.reminderScheduleScanned || 0);
-        report.modelCommunicationReminderRepaired += Number(modelCommunication?.reminderScheduleRepaired || 0);
-        report.modelCommunicationReminderFailed += Number(modelCommunication?.reminderScheduleFailed || 0);
-        report.revisionIntentsPlanned += Number(modelCommunication?.revisionIntentsPlanned || 0);
-        if (modelCommunication?.currentBacklog) report.modelCommunicationCurrentBacklog = true;
-        if (modelCommunication?.ok === false) report.ok = false;
-      } catch (error) {
-        report.ok = false;
-        report.modelInitialTasksFailed += 1;
-        report.agencyFailures.push({ agencyId, lane: "model_communication", error: String(error?.message || error).slice(0, 1000) });
-      }
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), repaired: 0, obsolete: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      if (String(item.objectType) !== "TelegramDeliveryIntent") throw Object.assign(new Error("TELEGRAM_CONFIRMED_WORK_TYPE_UNSUPPORTED"), { code: "TELEGRAM_CONFIRMED_WORK_TYPE_UNSUPPORTED" });
+      const result = await repairConfirmedTelegramDeliveryProjectionItem({ agencyId: String(item.agencyId), intentId: String(item.objectId), now, db });
+      report.repaired += Number(result?.repaired || 0); if (result?.obsolete) report.obsolete += 1;
+      const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+      if (ack?.lost) report.lostOwnership += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
     }
-    report.complete = (agencies || []).length < size;
-    if (report.complete) report.nextCursorAgencyId = null;
-    if (report.scanned > 0 || report.failed > 0 || report.reminderScheduleScanned > 0 || report.reminderScheduleFailed > 0
-      || report.modelInitialTasksPlanned > 0 || report.modelInitialTasksReactivated > 0 || report.modelInitialTasksFailed > 0
-      || report.modelCommunicationPrecommitScanned > 0 || report.modelCommunicationReminderScanned > 0 || report.revisionIntentsPlanned > 0) {
-      console.log(`[scheduler] Telegram/custom model convergence — agencies=${report.agencies}, confirmedScanned=${report.scanned}, confirmedRepaired=${report.repaired}, confirmedFailed=${report.failed}, reminderScheduleScanned=${report.reminderScheduleScanned}, reminderScheduleRepaired=${report.reminderScheduleRepaired}, reminderScheduleFailed=${report.reminderScheduleFailed}, initialTaskPlanned=${report.modelInitialTasksPlanned}, initialTaskReactivated=${report.modelInitialTasksReactivated}, initialTaskBlocked=${report.modelInitialTasksBlocked}, initialTaskRaced=${report.modelInitialTasksRaced}, initialTaskFailed=${report.modelInitialTasksFailed}, precommitScanned=${report.modelCommunicationPrecommitScanned}, precommitCancelled=${report.modelCommunicationPrecommitCancelled}, precommitFailed=${report.modelCommunicationPrecommitFailed}, modelReminderScanned=${report.modelCommunicationReminderScanned}, modelReminderRepaired=${report.modelCommunicationReminderRepaired}, modelReminderFailed=${report.modelCommunicationReminderFailed}, revisionIntentsPlanned=${report.revisionIntentsPlanned}, agencyFailures=${report.agencyFailures.length}, complete=${report.complete}`);
-    }
-    return report;
-  } catch (err) {
-    console.warn("[scheduler] Telegram confirmed projection failed:", err?.message || err);
-    return { ok: false, agencies: 0, scanned: 0, repaired: 0, failed: 1, complete: false, error: err?.message || String(err) };
   }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
 }
-
 
 async function runTelegramConfirmedProjectionMaintenanceSweep({ now = new Date(), db = prisma } = {}) {
-  return runMaintenanceLane({
-    db,
-    key: TELEGRAM_CONFIRMED_MAINTENANCE_LANE_KEY,
-    generation: TELEGRAM_CONFIRMED_MAINTENANCE_LANE_GENERATION,
-    oneTime: false,
-    leaseMs: 15 * 60 * 1000,
-    minIntervalMs: RECURRING_INTERVAL_MS,
-    fallbackNow: now,
-    work: async ({ claim }) => {
-      const cursorAgencyId = String(claim?.cursor?.lastAgencyId || "").trim() || null;
-      const result = await runTelegramConfirmedProjectionSweep({ now, db, cursorAgencyId, pageSize: 100 });
-      const retryFast = result?.ok === false || result?.complete === false || result?.modelCommunicationCurrentBacklog === true;
-      return {
-        ...result,
-        cursor: { lastAgencyId: result?.complete ? null : result?.nextCursorAgencyId || cursorAgencyId },
-        nextRunAt: new Date(now.getTime() + (result?.ok === false ? 60_000 : retryFast ? 1_000 : RECURRING_INTERVAL_MS)),
-        outcome: result?.ok === false ? "TELEGRAM_CUSTOM_CONVERGENCE_FAILED" : retryFast ? "TELEGRAM_CUSTOM_CONVERGENCE_BACKLOG_CONTINUES" : "TELEGRAM_CUSTOM_CONVERGENCE_CYCLE_COMPLETE",
-        progress: {
-          lastAgencyId: result?.complete ? null : result?.nextCursorAgencyId || cursorAgencyId,
-          agencies: Number(result?.agencies || 0),
-          scanned: Number(result?.scanned || 0),
-          repaired: Number(result?.repaired || 0),
-          failed: Number(result?.failed || 0),
-        },
-      };
-    },
-  });
+  return runTelegramConfirmedProjectionSweep({ now, db });
 }
 
 async function maybeBackfillTeamPendingProjection({ db = prisma, now = new Date() } = {}) {
-  try {
-    const { backfillTeamPendingProjectionBatch } = require("./team-pending-projection-service");
-    const result = await runMaintenanceLane({
-      db,
-      key: TEAM_PENDING_PROJECTION_LANE_KEY,
-      generation: TEAM_PENDING_PROJECTION_LANE_GENERATION,
-      oneTime: false,
-      minIntervalMs: RECURRING_INTERVAL_MS,
-      fallbackNow: now,
-      work: async () => {
-        const batch = await backfillTeamPendingProjectionBatch({ db, limit: TEAM_PENDING_BACKFILL_BATCH_SIZE });
-        const selected = Number(batch?.selected || 0);
-        const likelyMore = selected >= TEAM_PENDING_BACKFILL_BATCH_SIZE;
-        return {
-          ...batch,
-          complete: false,
-          outcome: likelyMore ? "PENDING_PROJECTION_BACKLOG_CONTINUES" : selected > 0 ? "PENDING_PROJECTION_REPAIRED" : "PENDING_PROJECTION_IDLE",
-          nextRunAt: new Date(now.getTime() + (likelyMore ? 1_000 : RECURRING_INTERVAL_MS)),
-          progress: { selected, dialogs: Number(batch?.dialogs || 0), projected: Number(batch?.projected || 0) },
-        };
-      },
-    });
-    if (!result?.skipped && Number(result?.selected || 0) > 0) {
-      console.log(`[scheduler] Team pending projection — projected=${result.projected || 0}/${result.selected || 0}, dialogs=${result.dialogs || 0}`);
-    }
-    return result;
-  } catch (err) {
-    console.warn("[scheduler] Team pending projection backfill failed:", err?.message || err);
-    return { ok: false, error: err?.message || String(err) };
-  }
+  // Compatibility entry point: current pending/response work is now exact CreatorDialog
+  // DomainWork. Cold history is owned by per-agency HISTORICAL_ENUMERATION coverage.
+  return runTeamDialogProjectionSweep({ db, now });
 }
 
 async function maybeRepairLegacyTeamPendingBootstrap({ db = prisma, now = new Date() } = {}) {
@@ -1091,29 +1771,43 @@ async function runRecurringCreatorWork({ db = prisma, now = new Date(), pageSize
 async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) {
   if (phase2MaintenancePromise) return { ok: true, skipped: true, reason: "local_overlap" };
   phase2MaintenancePromise = (async () => {
-    const result = { ok: true };
-    // Provider backfill/dirty repair establish the exact current-work projection before
-    // Telegram/custom consumers attempt debt execution in this pump cycle.
-    result.providerOperationalBackfill = await maybeBackfillProviderOperationalDebt({ db, now });
-    result.providerOperationalDirty = await maybeRepairProviderOperationalDirty({ db, now });
-    result.telegramConfirmedProjection = await runTelegramConfirmedProjectionMaintenanceSweep({ now, db });
-
-    const parallel = await Promise.allSettled([
-      runTelegramInboundProjectionMaintenanceSweep({ now, db }),
-      runCustomExternalProofConvergenceSweep({ now, db }),
-      maybeReconcileHistoricalTeamMoney({ db, now }),
-      maybeBackfillTeamPendingProjection({ db, now }),
-      maybeRepairLegacyTeamPendingBootstrap({ db, now }),
-    ]);
-    const names = ["telegramInboundProjection", "customExternalProofConvergence", "teamMoneyBackfill", "teamPendingBackfill", "teamLegacyPendingRepair"];
-    parallel.forEach((entry, index) => {
-      if (entry.status === "fulfilled") result[names[index]] = entry.value;
-      else {
-        result.ok = false;
-        result[names[index]] = { ok: false, error: entry.reason?.message || String(entry.reason) };
-      }
+    // R6 final admission layer. Each lane remains its own durable distributed authority;
+    // this rotation is only a resource/fairness budget, never business truth. A restart may
+    // change which lane runs first, but no lane loses work because claims/cursors stay durable.
+    const lanes = [
+      ["providerOperationalBackfill", () => maybeBackfillProviderOperationalDebt({ db, now })],
+      ["dependencyFanout", () => maybeRunPhase2DependencyFanout({ db, now })],
+      ["customReminderWork", () => maybePlanDueCustomReminderWork({ db, now })],
+      ["providerOperationalDirty", () => maybeRepairProviderOperationalDirty({ db, now })],
+      ["telegramConfirmedProjection", () => runTelegramConfirmedProjectionMaintenanceSweep({ now, db })],
+      ["telegramInboundProjection", () => runTelegramInboundProjectionMaintenanceSweep({ now, db })],
+      ["customExternalProofConvergence", () => runCustomExternalProofConvergenceSweep({ now, db })],
+      ["teamMoneyReconciliation", () => runTeamMoneyReconciliationSweep({ now, db })],
+      ["teamReadSummary", () => runTeamReadSummarySweep({ now, db })],
+      ["teamPendingBackfill", () => maybeBackfillTeamPendingProjection({ db, now })],
+      ["teamResponseRangeRepair", () => runTeamResponseRangeRepairSweep({ db, now })],
+      ["teamLegacyPendingRepair", () => maybeRepairLegacyTeamPendingBootstrap({ db, now })],
+    ];
+    const admission = selectPhase2MaintenanceLanes({
+      laneNames: lanes.map(([name]) => name),
+      now,
+      intervalMs: PHASE2_MAINTENANCE_PUMP_INTERVAL_MS,
+      lanesPerTick: PHASE2_MAINTENANCE_LANES_PER_TICK,
     });
-    if (result.telegramConfirmedProjection?.ok === false || result.providerOperationalBackfill?.ok === false || result.providerOperationalDirty?.ok === false) result.ok = false;
+    const selected = admission.selected.map((name) => lanes.find(([laneName]) => laneName === name)).filter(Boolean);
+    const result = { ok: true, admission };
+    // Sequential admission deliberately avoids a fixed Promise.all connection burst. Every
+    // admitted lane executes one already-bounded work unit, then yields to the next lane.
+    for (const [name, run] of selected) {
+      try {
+        const laneResult = await run();
+        result[name] = laneResult;
+        if (laneResult?.ok === false) result.ok = false;
+      } catch (error) {
+        result.ok = false;
+        result[name] = { ok: false, error: error?.message || String(error) };
+      }
+    }
     return result;
   })();
   try { return await phase2MaintenancePromise; }
@@ -1291,7 +1985,6 @@ module.exports = {
   FRESHNESS_WINDOW_MS,
   TRAFFIC_REFRESH_WINDOW_MS,
   RETENTION_SWEEP_WINDOW_MS,
-  TEAM_MONEY_BACKFILL_BATCH_SIZE,
   TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS,
   TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,
   PHASE2_MAINTENANCE_PUMP_INTERVAL_MS,
@@ -1301,9 +1994,17 @@ module.exports = {
   runTelegramConfirmedProjectionSweep,
   runTelegramConfirmedProjectionMaintenanceSweep,
   runCustomExternalProofConvergenceSweep,
+  runTeamDialogProjectionSweep,
+  runTeamResponseRangeRepairSweep,
+  runTeamMoneyReconciliationSweep,
+  runTeamReadSummarySweep,
   maybeRunRetentionSweep,
   maybeReconcileHistoricalTeamMoney,
   maybeRepairLegacyTeamPendingBootstrap,
   maybeBackfillProviderOperationalDebt,
+  maybeSeedPhase2CoverageWork,
+  maybeRunPhase2HistoricalEnumeration,
+  maybePlanDueCustomReminderWork,
   maybeRepairProviderOperationalDirty,
+  maybeRunPhase2DependencyFanout,
 };

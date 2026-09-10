@@ -11,6 +11,7 @@ const {
 } = require("../services/custom-orders-service");
 const {
   claimCustomContentSubmissionUploadWork,
+  heartbeatCustomContentSubmissionSourceWork,
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   listCustomContentSubmissions,
@@ -206,9 +207,24 @@ router.post("/submissions/:submissionId/execution-attempt", async (req, res) => 
       workKind: req.body?.workKind,
       expectedIndex: req.body?.expectedIndex,
       executionProfileRevision: req.body?.executionProfileRevision,
+      sourceWorkClaim: req.body?.sourceWorkClaim,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_EXECUTION_ATTEMPT_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/source-work/heartbeat", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await heartbeatCustomContentSubmissionSourceWork({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      deviceId: req.body?.deviceId,
+      submissionId: req.params.submissionId,
+      sourceWorkClaim: req.body?.sourceWorkClaim,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_SOURCE_WORK_HEARTBEAT_FAILED"); }
 });
 
 router.post("/submissions/:submissionId/disposition", async (req, res) => {
@@ -279,6 +295,7 @@ router.post("/submissions/:submissionId/relay-write/reserve", async (req, res) =
       submissionId: req.params.submissionId,
       expectedIndex: req.body?.expectedIndex,
       expectedTelegramMessageId: req.body?.telegramMessageId,
+      sourceWorkClaim: req.body?.sourceWorkClaim,
       accessEpoch: currentAccessEpoch(req),
       db: prisma,
     }));

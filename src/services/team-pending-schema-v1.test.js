@@ -45,12 +45,18 @@ test("pending projection is part of durable ingest and automation cannot clear h
   assert.match(projector, /messageId[\s\S]{0,120}localId[\s\S]{0,120}id/);
 });
 
-test("historical pending repair is DB-only, cursor-driven and scheduled as non-blocking maintenance", () => {
-  assert.match(projector, /pendingProjectionVersion: null/);
+test("historical pending repair is per-agency bounded DomainWork coverage, not a recurring current writer", () => {
   assert.match(projector, /backfillTeamPendingProjectionBatch/);
-  assert.match(scheduler, /TEAM_PENDING_BACKFILL_BATCH_SIZE = 500/);
-  assert.match(scheduler, /maybeBackfillTeamPendingProjection/);
-  assert.match(scheduler, /Team pending projection backfill failed/);
+  assert.match(scheduler, /runTeamDialogCoverageEnumerationUnit/);
+  assert.match(scheduler, /listUnprojectedRelevantDialogEvents/);
+  assert.match(scheduler, /limit:\s*100/);
+  assert.match(scheduler, /PHASE2_COVERAGE_FAMILY\.TEAM_DIALOG_PROJECTION/);
+  assert.match(scheduler, /yieldDomainWorkClaim/);
+  const compatibilityStart = scheduler.indexOf("async function maybeBackfillTeamPendingProjection");
+  const compatibilityEnd = scheduler.indexOf("async function maybeRepairLegacyTeamPendingBootstrap", compatibilityStart);
+  const compatibility = scheduler.slice(compatibilityStart, compatibilityEnd);
+  assert.match(compatibility, /runTeamDialogProjectionSweep/);
+  assert.doesNotMatch(compatibility, /runMaintenanceLane|TEAM_PENDING_PROJECTION_LANE_KEY/);
 });
 
 test("overview switches unanswered source to projected queue and exposes scoped pending diagnostics", () => {

@@ -110,7 +110,7 @@ test("Team response projection schema is additive, relational, and excludes acci
   assert.match(response, /coverageResponseSeconds\s+Int\?/);
   assert.match(response, /seenResponseSeconds\s+Int\?/);
   assert.match(response, /slaEligible\s+Boolean/);
-  assert.ok(response.includes("@@unique([agencyId, replyMessageId])"));
+  assert.ok(response.includes("@@unique([agencyId, creatorId, replyMessageId])"));
   assert.doesNotMatch(user, /teamCoverageSessions|teamDialogSessions|teamResponseCases/);
 
   const sql = read("prisma/migrations/20260812012000_team_response_projection_v1/migration.sql");

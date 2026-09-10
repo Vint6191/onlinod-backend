@@ -74,6 +74,11 @@ const {
 } = require("../services/custom-content-pipeline-authority-service");
 const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
+const {
+  collectCreatorPhase2DestructiveScope,
+  purgeAgencyPhase2ProviderLedgersForHardDelete,
+  purgeCreatorPhase2ResidualsForHardDelete,
+} = require("../services/phase2-destructive-delete-authority-service");
 
 const router = express.Router();
 
@@ -658,14 +663,12 @@ router.delete("/agencies/:id", async (req, res) => {
         // that may already be COMMITTING. Terminal history may still be destroyed.
         await assertAgencyCustomPipelineRetirable({ db: tx, agencyId: before.id });
         await assertAgencyMassCampaignRetirable({ db: tx, agencyId: before.id, requireFreshProviderSnapshot: !before.deletedAt });
-        // Telegram provider ledgers intentionally have no Agency/Creator/CustomOrder
-        // foreign keys because normal soft/account retirement must preserve them.
-        // A super-admin hard Agency delete is different: it is explicit destructive
-        // history removal, so purge those non-FK rows in the same transaction as
-        // the cascading Agency delete. Any later restrictive FK failure therefore
-        // rolls the ledger purge back too.
-        await tx.telegramDeliveryIntent.deleteMany({ where: { agencyId: before.id } });
-        await tx.telegramInboundEvent.deleteMany({ where: { agencyId: before.id } });
+        // Phase 2 provider ledgers intentionally have no Agency FK because normal
+        // retirement/reconciliation must preserve provider evidence. Hard delete is
+        // the explicit destructive exception. Purge them only after the unknown-effect
+        // guards above and in this same transaction; any later cascade/FK failure rolls
+        // the purge back together with the Agency deletion.
+        await purgeAgencyPhase2ProviderLedgersForHardDelete({ db: tx, agencyId: before.id });
         await tx.agency.delete({ where: { id: before.id } });
       });
       await adminLog(req, {
@@ -1616,36 +1619,17 @@ router.delete("/creators/:id", async (req, res) => {
       // the only ledger for an active/COMMITTING/unknown provider write.
       await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
       await assertCreatorMassCampaignRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id, requireFreshProviderSnapshot: !before.deletedAt });
-      // Explicit super-admin destructive maintenance. Telegram provider ledgers do
-      // not carry Creator/CustomOrder foreign keys by design (they survive normal
-      // account/runtime lifecycle), so purge this creator's rows explicitly before
-      // the CreatorAccount cascade. Otherwise a hard-deleted Custom can leave a
-      // PLANNED/RECONCILE_REQUIRED intent that poisons broad work discovery with a
-      // permanently missing CustomOrder. Product soft-removal must never take this
-      // destructive path implicitly.
-      const hardOrderIds = (await tx.customOrder.findMany({
-        where: { agencyId: before.agencyId, creatorId: before.id },
-        select: { id: true },
-      })).map((row) => String(row.id));
-      await tx.telegramDeliveryIntent.deleteMany({
-        where: {
-          agencyId: before.agencyId,
-          OR: [
-            { creatorId: before.id },
-            ...(hardOrderIds.length ? [{ customOrderId: { in: hardOrderIds } }] : []),
-          ],
-        },
-      });
-      await tx.telegramInboundEvent.deleteMany({
-        where: {
-          agencyId: before.agencyId,
-          OR: [
-            { creatorId: before.id },
-            ...(hardOrderIds.length ? [{ customOrderId: { in: hardOrderIds } }] : []),
-          ],
-        },
+      // Capture exact non-FK Phase 2 identities before the Creator cascade. The
+      // destructive purge itself happens only after CreatorAccount.delete succeeds,
+      // so a restrictive cascade failure cannot pre-delete provider evidence. The
+      // final cleanup also removes DomainWork/dependency rows published by DELETE
+      // triggers during the cascade; those rows are Agency-scoped and would otherwise
+      // survive a hard Creator deletion as permanently orphaned executable work.
+      const hardDeleteScope = await collectCreatorPhase2DestructiveScope({
+        db: tx, agencyId: before.agencyId, creatorId: before.id,
       });
       await tx.creatorAccount.delete({ where: { id: before.id } });
+      await purgeCreatorPhase2ResidualsForHardDelete({ db: tx, scope: hardDeleteScope });
     } else {
       await lockCreatorPipelineLifecycle({ db: tx, agencyId: before.agencyId, creatorId: before.id, allowDeleted: true });
       await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });

@@ -33,14 +33,16 @@ test("Team PPV rows bind relationally to CreatorSale and payout transaction", ()
   assert.match(migration, /TeamPpvPurchaseLedger_financialTransactionId_fkey/);
 });
 
-test("Creator Analytics notification and payout ingests reconcile Team money inside their transaction", () => {
-  assert.match(notifications, /reconcileCreatorSalesToTeam/);
-  assert.match(notifications, /reconcileCreatorTipsToTeam/);
+test("Creator Analytics canonical transactions publish exact Team money work instead of running a second inline writer", () => {
+  assert.match(notifications, /dispatchTeamMoneyReconciliationForCanonicalFact/);
   assert.match(notifications, /existingFacts\(tx, "creatorSale", job\.creatorId, groups\.sale\)/);
-  assert.match(notifications, /reconcileCreatorSalesToTeam\(\{ db: tx/);
+  assert.match(notifications, /dispatchTeamMoneyReconciliationForCanonicalFact\(\{ db: tx,[\s\S]*sourceType: "PPV"/);
+  assert.match(notifications, /dispatchTeamMoneyReconciliationForCanonicalFact\(\{ db: tx,[\s\S]*sourceType: "TIP"/);
+  assert.doesNotMatch(notifications, /reconcileCreatorSalesToTeam|reconcileCreatorTipsToTeam/);
   assert.match(financial, /const projectedFact = await projectKnownFact\(tx/);
-  assert.match(financial, /reconcileCreatorSaleToTeam\(\{ db: tx, saleId: projectedFact\.id \}\)/);
-  assert.match(financial, /reconcileCreatorTipToTeam\(\{ db: tx, tipId: projectedFact\.id \}\)/);
+  assert.match(financial, /dispatchTeamMoneyReconciliationForCanonicalFact\(\{ db: tx,[\s\S]*sourceType: "PPV"/);
+  assert.match(financial, /dispatchTeamMoneyReconciliationForCanonicalFact\(\{ db: tx,[\s\S]*sourceType: "TIP"/);
+  assert.doesNotMatch(financial, /reconcileCreatorSaleToTeam\(\{ db: tx|reconcileCreatorTipToTeam\(\{ db: tx/);
 });
 
 test("PPV reconciliation is exact-message based and has no last-chatter time heuristic", () => {
@@ -74,21 +76,18 @@ test("payout undo is excluded from Team PPV money without erasing ownership evid
   assert.match(analytics, /ppvFinanciallyActive/);
 });
 
-test("historical Team money backfill is relation-driven, DB-only, scheduled, and available from Claims maintenance", () => {
+test("historical Team money is per-agency coverage driven and Claims only requests that authority", () => {
   const scheduler = read("src/services/job-scheduler.js");
   const claims = read("src/routes/team-claims.js");
-  assert.match(reconciliation, /teamPpvPurchase:\s*\{ is: null \}/);
-  assert.match(reconciliation, /teamTipAttribution:\s*\{ is: null \}/);
-  assert.match(reconciliation, /saleType: "MESSAGE"/);
-  assert.match(reconciliation, /purchasedAt: \{ gte: detailedSince \}/);
-  assert.match(reconciliation, /tippedAt: \{ gte: detailedSince \}/);
-  assert.match(reconciliation, /reconcileHistoricalTeamMoneyBatch/);
-  assert.match(scheduler, /TEAM_MONEY_BACKFILL_BATCH_SIZE = 250/);
+  const coverage = read("src/services/phase2-work-coverage-authority-service.js");
+  assert.doesNotMatch(reconciliation, /reconcileHistoricalTeamMoneyBatch/, "retired global historical writer must not remain importable after DomainWork cutover");
+  assert.match(scheduler, /runTeamMoneyReconciliationCoverageEnumerationUnit/);
+  assert.match(scheduler, /PHASE2_WORK_CLASS\.TEAM_MONEY_RECONCILIATION/);
   assert.match(scheduler, /maybeReconcileHistoricalTeamMoney/);
-  assert.match(scheduler, /const retention = await maybeRunRetentionSweep/);
-  assert.match(scheduler, /runPhase2MaintenancePump/);
-  assert.match(scheduler, /maybeReconcileHistoricalTeamMoney\(\{ db, now \}\)/);
-  assert.match(scheduler, /reconcileHistoricalTeamMoneyBatch/);
-  assert.match(claims, /canonicalMoneyBackfill/);
-  assert.match(claims, /reconcileHistoricalTeamMoneyBatch/);
+  assert.doesNotMatch(scheduler, /TEAM_MONEY_BACKFILL_BATCH_SIZE/);
+  assert.doesNotMatch(scheduler, /await reconcileHistoricalTeamMoneyBatch/);
+  assert.match(coverage, /requestPhase2CoverageEnumeration/);
+  assert.match(claims, /requestPhase2CoverageEnumeration/);
+  assert.match(claims, /PHASE2_DOMAIN_WORK_OWNS_RECONCILIATION/);
+  assert.doesNotMatch(claims, /reconcileHistoricalTeamMoneyBatch|migrateLegacyTipsToTipLedger|repairMigratedLegacyTipManualAuthority/);
 });

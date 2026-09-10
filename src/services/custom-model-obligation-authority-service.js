@@ -81,6 +81,55 @@ async function latestIntent({ agencyId, orderId, kind, customSubmissionId = null
   });
 }
 
+async function deriveCustomInitialInstruction({ agencyId, orderId = null, order = null, db } = {}) {
+  if (!agencyId || !db) {
+    const error = new Error("agencyId and db are required to derive Custom initial instruction");
+    error.code = "CUSTOM_INITIAL_INSTRUCTION_SCOPE_REQUIRED";
+    error.status = 400;
+    throw error;
+  }
+  const row = order || (db.customOrder?.findFirst ? await db.customOrder.findFirst({ where: { id: clean(orderId, 180), agencyId } }) : null);
+  if (!row) return { applies: false, missing: true, state: "MISSING", initialInstructionRequired: false, currentInstruction: null };
+  const type = String(row.type || "CONTENT").toUpperCase();
+  const supported = ["CONTENT", "CALL", "PHYSICAL"].includes(type);
+  if (!supported) return { applies: false, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "UNSUPPORTED_TYPE", initialInstructionRequired: false, currentInstruction: null };
+  // CONTENT has additional causal completion states (a submitted model response can make a
+  // late/stale TASK obsolete). Reuse that existing authority rather than creating a second
+  // interpretation of CONTENT completion; NON_CONTENT only differs in not owing media response.
+  if (type === "CONTENT") {
+    const obligation = await deriveCustomModelObligation({ agencyId, order: row, db });
+    const state = String(obligation?.state || "");
+    const deliveryState = String(obligation?.deliveryState || "");
+    return {
+      ...obligation, type,
+      initialInstructionRequired: state === "NO_INSTRUCTION" || (state === "INITIAL_DISPATCH_PENDING" && deliveryState === "CANCELLED"),
+    };
+  }
+  if (String(row.status || "PENDING").toUpperCase() !== "PENDING") {
+    return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "TERMINAL", initialInstructionRequired: false, currentInstruction: null, reason: `ORDER_${String(row.status || "UNKNOWN").toUpperCase()}` };
+  }
+  const task = await latestIntent({ agencyId, orderId: row.id, kind: "TASK", db });
+  const instruction = confirmedInstruction(task);
+  if (instruction) {
+    return {
+      applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type,
+      state: type === "CONTENT" ? "INITIAL_WAITING_RESPONSE" : "INITIAL_CONFIRMED",
+      initialInstructionRequired: false,
+      modelOwesResponse: type === "CONTENT",
+      currentInstruction: instruction,
+      instructionIntentId: String(task.id), instructionKind: "TASK", deliveryState: String(task.state || "CONFIRMED"),
+      reason: "TASK_PROVIDER_CONFIRMED",
+    };
+  }
+  if (String(task?.state || "") === "RECONCILE_REQUIRED" || String(task?.state || "") === "COMMITTING") {
+    return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "INITIAL_DELIVERY_UNKNOWN", initialInstructionRequired: false, currentInstruction: null, instructionIntentId: String(task.id), instructionKind: "TASK", deliveryState: String(task.state), reason: "TASK_OUTCOME_UNKNOWN" };
+  }
+  if (task) {
+    return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "INITIAL_DISPATCH_PENDING", initialInstructionRequired: ["PLANNED","CLAIMED","FAILED_PRECOMMIT","CANCELLED"].includes(String(task.state || "")), currentInstruction: null, instructionIntentId: String(task.id), instructionKind: "TASK", deliveryState: String(task.state || "PLANNED"), reason: `TASK_${String(task.state || "PLANNED")}` };
+  }
+  return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "NO_INSTRUCTION", initialInstructionRequired: true, modelOwesResponse: false, currentInstruction: null, reason: "TASK_INTENT_MISSING" };
+}
+
 async function deriveCustomModelObligation({ agencyId, orderId = null, order = null, db } = {}) {
   if (!agencyId || !db) {
     const error = new Error("agencyId and db are required to derive Custom model obligation");
@@ -243,6 +292,7 @@ function reminderBindingFromObligation(obligation) {
 }
 
 module.exports = {
+  deriveCustomInitialInstruction,
   deriveCustomModelObligation,
   reminderBindingFromObligation,
   confirmedInstruction,

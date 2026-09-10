@@ -812,11 +812,11 @@ async function creatorCustomPipelineBlockers({ db, agencyId, creatorId }) {
         },
       })
       : Promise.resolve(0),
-    providerOperationalBackfillReady({ db }),
+    providerOperationalBackfillReady({ db, agencyId }),
     countProviderOperationalDebt({ agencyId, creatorId, db, debtClasses: [DEBT.CANCELLATION_FOLLOWUP_DEBT] }),
     countProviderOperationalDebt({ agencyId, creatorId, db, debtClasses: [DEBT.CONFIRMED_PROJECTION_DEBT] }),
     countProviderOperationalDebt({ agencyId, creatorId, db, debtClasses: [DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT] }),
-    customExternalProofBackfillReady({ db }),
+    customExternalProofBackfillReady({ db, agencyId }),
   ]);
   const completedExternalProjectionDebt = Number(completedExternalProjectionDebtRows || 0);
   const providerOperationalBackfillIncomplete = providerWorksetReady ? 0 : 1;
@@ -857,11 +857,11 @@ async function agencyCustomPipelineBlockers({ db, agencyId }) {
         },
       })
       : Promise.resolve(0),
-    providerOperationalBackfillReady({ db }),
+    providerOperationalBackfillReady({ db, agencyId }),
     countProviderOperationalDebt({ agencyId, db, debtClasses: [DEBT.CANCELLATION_FOLLOWUP_DEBT] }),
     countProviderOperationalDebt({ agencyId, db, debtClasses: [DEBT.CONFIRMED_PROJECTION_DEBT] }),
     countProviderOperationalDebt({ agencyId, db, debtClasses: [DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT] }),
-    customExternalProofBackfillReady({ db }),
+    customExternalProofBackfillReady({ db, agencyId }),
   ]);
   const completedExternalProjectionDebt = Number(completedExternalProjectionDebtRows || 0);
   const providerOperationalBackfillIncomplete = providerWorksetReady ? 0 : 1;

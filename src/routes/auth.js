@@ -484,6 +484,7 @@ router.post("/login", async (req, res) => {
       activeAgency: membership.agency,
       activeAgencyId: membership.agencyId,
       activeMemberId: membership.id,
+      accessEpoch: Number(membership.accessEpoch || 1),
       role: membership.role,
       permissions: effectivePermissions,
     });
@@ -517,6 +518,7 @@ router.post("/refresh", async (req, res) => {
       activeAgency: result.membership.agency,
       activeAgencyId: result.membership.agencyId,
       activeMemberId: result.membership.id,
+      accessEpoch: Number(result.membership.accessEpoch || 1),
       role: result.membership.role,
       permissions: effectivePermissions,
     });
@@ -614,6 +616,7 @@ router.get("/me", authRequired, async (req, res) => {
       activeAgency: req.auth.agency,
       activeAgencyId: req.auth.agencyId,
       activeMemberId: req.auth.memberId,
+      accessEpoch: Number(req.auth.membership?.accessEpoch || 1),
       role: req.auth.role,
       permissions: effectivePermissions,
     });

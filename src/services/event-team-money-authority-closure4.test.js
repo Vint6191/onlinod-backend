@@ -167,10 +167,15 @@ test("Closure4 rolling migration lock graph has no Team->Money cycle", () => {
   assert.doesNotMatch(forward, /MoneyAttribution"/);
 });
 
-test("Closure4 scheduler repairs already-migrated manual rows before automatic reconciliation", () => {
+test("Closure4 per-agency enumerator repairs manual rows before exact reconciliation work", () => {
   const scheduler = source("services/job-scheduler.js");
-  const repair = scheduler.indexOf("await repairMigratedLegacyTipManualAuthority");
-  const migrate = scheduler.indexOf("await migrateLegacyTipsToTipLedger", repair);
-  const reconcile = scheduler.indexOf("await reconcileHistoricalTeamMoneyBatch", migrate);
-  assert.ok(repair >= 0 && migrate > repair && reconcile > migrate);
+  const start = scheduler.indexOf("async function runTeamMoneyReconciliationCoverageEnumerationUnit");
+  const end = scheduler.indexOf("async function runTeamReadSummaryCoverageEnumerationUnit", start);
+  assert.ok(start >= 0 && end > start);
+  const body = scheduler.slice(start, end);
+  const repair = body.indexOf("await repairMigratedLegacyTipManualAuthority");
+  const migrate = body.indexOf("await migrateLegacyTipsToTipLedger", repair);
+  const publish = body.indexOf("PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION", migrate);
+  assert.ok(repair >= 0 && migrate > repair && publish > migrate);
+  assert.doesNotMatch(body, /reconcileHistoricalTeamMoneyBatch/);
 });

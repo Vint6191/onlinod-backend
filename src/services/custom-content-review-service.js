@@ -327,7 +327,7 @@ async function loadAssets(db, agencyId, rows) {
   return finalizedAssetMap(assets);
 }
 
-async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_WAITING, limit = 50, cursor = null, db = null } = {}) {
+async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_WAITING, limit = 50, cursor = null, scanBudget = 1000, db = null } = {}) {
   const client = db || require("../prisma");
   await requireReviewView({ agencyId, member, db: client });
   const normalizedStatus = normalizeStatus(status);
@@ -337,7 +337,9 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
   const items = [];
   let scanCursor = clean(cursor, 180) || null;
   let pageExhausted = false;
-  while (items.length < take) {
+  let scannedRows = 0;
+  const maxScan = Math.max(200, Math.min(5000, Math.floor(Number(scanBudget) || 1000)));
+  while (items.length < take && scannedRows < maxScan) {
     const rows = await client.customContentSubmission.findMany({
       where: {
         agencyId,
@@ -349,10 +351,11 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
       },
       include: REVIEW_INCLUDE,
       orderBy: [{ receivedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
-      take: 200,
+      take: Math.min(200, maxScan - scannedRows),
       ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
     });
     if (!rows.length) { pageExhausted = true; break; }
+    scannedRows += rows.length;
     const validRows = rows.filter((row) => String(row.customOrder?.type || "") === "CONTENT" && String(row.customOrder?.status || "") === "PENDING" && !row.customOrder?.fanDeliveredAt && String(row.pipelineDisposition || "ACTIVE") === "ACTIVE" && isCompleteSubmission(row));
     const validIds = new Set(validRows.map((row) => String(row.id)));
     const assetByKey = await loadAssets(client, agencyId, validRows);
@@ -385,10 +388,11 @@ async function listCustomContentReviewQueue({ agencyId, member, status = REVIEW_
       if (items.length >= take) break;
     }
     if (items.length >= take) break;
-    if (rows.length < 200) { pageExhausted = true; break; }
+    if (rows.length < Math.min(200, maxScan - (scannedRows - rows.length))) { pageExhausted = true; break; }
   }
-  const hasMore = items.length >= take && !pageExhausted && Boolean(scanCursor);
-  return { ok: true, items, count: items.length, nextCursor: hasMore ? scanCursor : null, hasMore, canReview, serverNow: new Date().toISOString() };
+  const scanComplete = pageExhausted;
+  const hasMore = Boolean(scanCursor) && (!scanComplete || items.length >= take);
+  return { ok: true, items, count: items.length, nextCursor: hasMore ? scanCursor : null, hasMore, scanComplete, scannedRows, canReview, serverNow: new Date().toISOString() };
 }
 
 async function loadReviewableSubmission({ agencyId, submissionId, db }) {

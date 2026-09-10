@@ -166,7 +166,9 @@ function fixture() {
       return true;
     }) },
     auditLog: { create: async () => ({ id: "audit" }) },
-    $queryRawUnsafe: async () => [{ id: order.id }],
+    $queryRawUnsafe: async (sql) => /FROM "AgencyTelegramMtprotoAccount"/.test(String(sql))
+      ? [{ id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE" }]
+      : [{ id: order.id }],
     $transaction: async (work) => work(db),
   };
   return { db, member, currentMember, row, rows, assets, intents, reviewDecisions };
@@ -427,7 +429,7 @@ test("revision dispatch bulk read cannot let duplicate legacy intents hide anoth
   assert.equal(byId.get("sub-2")?.revisionDispatch.intentId, "revision-b");
 });
 
-test("review queue reaches a valid row after more than 2000 poisoned WAITING rows", async () => {
+test("review queue enforces a scan budget and exposes lossless continuation through poisoned WAITING rows", async () => {
   const { db, member, row, rows, assets } = fixture();
   const base = new Date("2026-02-01T00:00:00.000Z").getTime();
   rows.splice(0, rows.length); assets.splice(0, assets.length);
@@ -438,8 +440,22 @@ test("review queue reaches a valid row after more than 2000 poisoned WAITING row
   const readyOrder = { ...row.customOrder, id: "reachable-order", dialogId: "99999" };
   rows.push({ ...row, id: "reachable-review", customOrderId: readyOrder.id, customOrder: readyOrder, telegramMessageIds: [999999], ofMediaIds: ["999999"], executionPinnedAt: new Date(base + 3000), executionVaultFolderId: "vault-1", ...receipt("vault-1", 1, ["999999"], new Date(base + 3000)), receivedAt: new Date(base + 3000), createdAt: new Date(base + 3000) });
   assets.push({ agencyId: "agency-1", creatorId: "creator-1", mediaId: "999999", source: "CUSTOM", customOrderId: "reachable-order", customSubmissionId: "reachable-review", customFullPriceCents: 6000, mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: ["vault-1"], catalogActive: true, sortingStatus: "SORTED" });
-  const result = await listCustomContentReviewQueue({ agencyId: "agency-1", member, db, limit: 1 });
-  assert.deepEqual(result.items.map((item) => item.submissionId), ["reachable-review"]);
+
+  const first = await listCustomContentReviewQueue({ agencyId: "agency-1", member, db, limit: 1, scanBudget: 1000 });
+  assert.deepEqual(first.items, []);
+  assert.equal(first.scanComplete, false);
+  assert.equal(first.scannedRows, 1000);
+  assert.ok(first.nextCursor);
+
+  const second = await listCustomContentReviewQueue({ agencyId: "agency-1", member, db, limit: 1, scanBudget: 1000, cursor: first.nextCursor });
+  assert.deepEqual(second.items, []);
+  assert.equal(second.scanComplete, false);
+  assert.equal(second.scannedRows, 1000);
+  assert.ok(second.nextCursor);
+
+  const third = await listCustomContentReviewQueue({ agencyId: "agency-1", member, db, limit: 1, scanBudget: 1000, cursor: second.nextCursor });
+  assert.deepEqual(third.items.map((item) => item.submissionId), ["reachable-review"]);
+  assert.ok(third.scannedRows <= 1000);
 });
 
 test("Review fails closed when a current-receipt CUSTOM asset loses the pinned folder projection", async () => {

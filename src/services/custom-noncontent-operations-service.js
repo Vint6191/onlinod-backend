@@ -26,8 +26,8 @@ async function exactCallSummarySql({ client, agencyId, scope, now, horizonAt }) 
   const rows = await client.$queryRawUnsafe(`
     SELECT
       COUNT(*) FILTER (WHERE "scheduledAt" > $2 AND "scheduledAt" <= $3)::int AS "upcoming",
-      COUNT(*) FILTER (WHERE "scheduledAt" <= $2 AND "scheduledAt" + ("durationMinutes" * INTERVAL '1 minute') > $2)::int AS "due",
-      COUNT(*) FILTER (WHERE "scheduledAt" + ("durationMinutes" * INTERVAL '1 minute') <= $2)::int AS "overdue"
+      COUNT(*) FILTER (WHERE "scheduledAt" <= $2 AND ("scheduledAt" + (GREATEST(1, LEAST(1440, COALESCE("durationMinutes", 1))) * INTERVAL '1 minute')) > $2)::int AS "due",
+      COUNT(*) FILTER (WHERE ("scheduledAt" + (GREATEST(1, LEAST(1440, COALESCE("durationMinutes", 1))) * INTERVAL '1 minute')) <= $2)::int AS "overdue"
     FROM "CustomOrder"
     WHERE "agencyId" = $1
       AND "type" = 'CALL'
@@ -41,6 +41,73 @@ async function exactCallSummarySql({ client, agencyId, scope, now, horizonAt }) 
     due: Math.max(0, Number(row?.due || 0)),
     overdue: Math.max(0, Number(row?.overdue || 0)),
   };
+
+}
+
+async function exactCallTopIdsSql({ client, agencyId, scope, now, horizonAt, limit }) {
+  if (typeof client?.$queryRawUnsafe !== "function") return null;
+  const take = bounded(limit, 100, 1, 200);
+  const params = [String(agencyId), now, horizonAt];
+  let creatorClause = "";
+  if (!scope?.broad) {
+    const ids = Array.isArray(scope?.creatorIds) ? scope.creatorIds.map(String).filter(Boolean) : [];
+    if (!ids.length) return [];
+    params.push(ids);
+    creatorClause = ` AND "creatorId" = ANY($4::text[])`;
+  }
+  // A48: rank each phase at the database before LIMIT. Every branch is itself
+  // bounded and uses the exact API rank: overdue by callEndAt, due/upcoming by
+  // scheduledAt. This avoids the old scheduledAt candidate cap, which was not
+  // equivalent when recent CALL durations differed.
+  const rows = await client.$queryRawUnsafe(`
+    WITH overdue AS (
+      SELECT "id", 0::int AS "phaseRank",
+             "scheduledAt" + (GREATEST(1, LEAST(1440, COALESCE("durationMinutes", 1))) * INTERVAL '1 minute') AS "rankAt"
+      FROM "CustomOrder"
+      WHERE "agencyId" = $1
+        AND "type" = 'CALL'
+        AND "status" = 'PENDING'
+        AND "scheduledAt" IS NOT NULL
+        AND "scheduledAt" + (GREATEST(1, LEAST(1440, COALESCE("durationMinutes", 1))) * INTERVAL '1 minute') <= $2
+        ${creatorClause}
+      ORDER BY "scheduledAt" + (GREATEST(1, LEAST(1440, COALESCE("durationMinutes", 1))) * INTERVAL '1 minute') ASC, "id" ASC
+      LIMIT ${take}
+    ), due AS (
+      SELECT "id", 1::int AS "phaseRank", "scheduledAt" AS "rankAt"
+      FROM "CustomOrder"
+      WHERE "agencyId" = $1
+        AND "type" = 'CALL'
+        AND "status" = 'PENDING'
+        AND "scheduledAt" IS NOT NULL
+        AND "scheduledAt" <= $2
+        AND "scheduledAt" + (GREATEST(1, LEAST(1440, COALESCE("durationMinutes", 1))) * INTERVAL '1 minute') > $2
+        ${creatorClause}
+      ORDER BY "scheduledAt" ASC, "id" ASC
+      LIMIT ${take}
+    ), upcoming AS (
+      SELECT "id", 2::int AS "phaseRank", "scheduledAt" AS "rankAt"
+      FROM "CustomOrder"
+      WHERE "agencyId" = $1
+        AND "type" = 'CALL'
+        AND "status" = 'PENDING'
+        AND "scheduledAt" > $2
+        AND "scheduledAt" <= $3
+        ${creatorClause}
+      ORDER BY "scheduledAt" ASC, "id" ASC
+      LIMIT ${take}
+    )
+    SELECT "id"
+    FROM (
+      SELECT * FROM overdue
+      UNION ALL
+      SELECT * FROM due
+      UNION ALL
+      SELECT * FROM upcoming
+    ) ranked
+    ORDER BY "phaseRank" ASC, "rankAt" ASC, "id" ASC
+    LIMIT ${take}
+  `, ...params);
+  return Array.isArray(rows) ? rows.map((row) => String(row?.id || "").trim()).filter(Boolean) : [];
 }
 
 async function requireView({ agencyId, member, db }) {
@@ -85,21 +152,21 @@ async function listCustomNonContentOperations({ agencyId, member, horizonHours =
   const definitelyOverdueBefore = new Date(now.getTime() - 24 * 60 * 60 * 1000);
   const supportsExactSql = typeof client?.$queryRawUnsafe === "function";
   const recentDetailTake = Math.min(800, Math.max(take * 4, 200));
-  const [oldOverdueCalls, oldOverdueCount, recentStartedCalls, upcomingCalls, upcomingCount, physicalRows, waitingCount, readyCount, shippedCount, exactCallSummary] = await Promise.all([
-    client.customOrder.findMany({
+  const [oldOverdueCalls, oldOverdueCount, recentStartedCalls, upcomingCalls, upcomingCount, physicalRows, waitingCount, readyCount, shippedCount, exactCallSummary, exactCallTopIds] = await Promise.all([
+    supportsExactSql ? Promise.resolve([]) : client.customOrder.findMany({
       where: { agencyId, ...scopeFilter, type: "CALL", status: "PENDING", scheduledAt: { lte: definitelyOverdueBefore } },
       include,
       orderBy: [{ scheduledAt: "asc" }, { id: "asc" }],
       take,
     }),
     supportsExactSql ? Promise.resolve(null) : client.customOrder.count({ where: { agencyId, ...scopeFilter, type: "CALL", status: "PENDING", scheduledAt: { lte: definitelyOverdueBefore } } }),
-    client.customOrder.findMany({
+    supportsExactSql ? Promise.resolve([]) : client.customOrder.findMany({
       where: { agencyId, ...scopeFilter, type: "CALL", status: "PENDING", scheduledAt: { gt: definitelyOverdueBefore, lte: now } },
       include,
       orderBy: [{ scheduledAt: "asc" }, { id: "asc" }],
       take: recentDetailTake,
     }),
-    client.customOrder.findMany({
+    supportsExactSql ? Promise.resolve([]) : client.customOrder.findMany({
       where: { agencyId, ...scopeFilter, type: "CALL", status: "PENDING", scheduledAt: { gt: now, lte: horizonAt } },
       include,
       orderBy: [{ scheduledAt: "asc" }, { id: "asc" }],
@@ -116,7 +183,14 @@ async function listCustomNonContentOperations({ agencyId, member, horizonHours =
     client.customOrder.count({ where: { agencyId, ...scopeFilter, type: "PHYSICAL", status: "PENDING", physicalStatus: "READY" } }),
     client.customOrder.count({ where: { agencyId, ...scopeFilter, type: "PHYSICAL", status: "PENDING", physicalStatus: "SHIPPED" } }),
     supportsExactSql ? exactCallSummarySql({ client, agencyId, scope, now, horizonAt }) : Promise.resolve(null),
+    supportsExactSql ? exactCallTopIdsSql({ client, agencyId, scope, now, horizonAt, limit: take }) : Promise.resolve(null),
   ]);
+
+  const exactCallRows = supportsExactSql && Array.isArray(exactCallTopIds) && exactCallTopIds.length
+    ? await client.customOrder.findMany({ where: { agencyId, id: { in: exactCallTopIds }, ...scopeFilter }, include })
+    : [];
+  const exactCallOrder = new Map((exactCallTopIds || []).map((id, index) => [String(id), index]));
+  exactCallRows.sort((a, b) => (exactCallOrder.get(String(a.id)) ?? Number.MAX_SAFE_INTEGER) - (exactCallOrder.get(String(b.id)) ?? Number.MAX_SAFE_INTEGER));
 
   let dueCount = 0; let recentOverdueCount = 0;
   const startedSerialized = (recentStartedCalls || []).map((row) => serializeCall(row, now));
@@ -125,11 +199,13 @@ async function listCustomNonContentOperations({ agencyId, member, horizonHours =
   const exactDueCount = exactCallSummary ? exactCallSummary.due : dueCount;
   const exactUpcomingCount = exactCallSummary ? exactCallSummary.upcoming : Number(upcomingCount || 0);
   const callRank = { OVERDUE: 0, DUE: 1, UPCOMING: 2 };
-  const calls = [...(oldOverdueCalls || []).map((row) => serializeCall(row, now)), ...startedSerialized, ...(upcomingCalls || []).map((row) => serializeCall(row, now))]
-    .sort((a, b) => (callRank[a.phase] ?? 9) - (callRank[b.phase] ?? 9)
-      || (a.phase === "OVERDUE" ? Number(b.secondsSinceEnd || 0) - Number(a.secondsSinceEnd || 0) : new Date(a.scheduledAt || 0).getTime() - new Date(b.scheduledAt || 0).getTime())
-      || a.customOrderId.localeCompare(b.customOrderId))
-    .slice(0, take);
+  const calls = supportsExactSql
+    ? exactCallRows.map((row) => serializeCall(row, now))
+    : [...(oldOverdueCalls || []).map((row) => serializeCall(row, now)), ...startedSerialized, ...(upcomingCalls || []).map((row) => serializeCall(row, now))]
+      .sort((a, b) => (callRank[a.phase] ?? 9) - (callRank[b.phase] ?? 9)
+        || (a.phase === "OVERDUE" ? Number(b.secondsSinceEnd || 0) - Number(a.secondsSinceEnd || 0) : new Date(a.scheduledAt || 0).getTime() - new Date(b.scheduledAt || 0).getTime())
+        || a.customOrderId.localeCompare(b.customOrderId))
+      .slice(0, take);
 
   return {
     ok: true,

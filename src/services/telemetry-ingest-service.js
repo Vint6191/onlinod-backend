@@ -5,6 +5,7 @@ const prisma = require("../prisma");
 const { applyLedgerSideEffects } = require("./team-ppv-ledger-service");
 const { applyTeamResponseProjection } = require("./team-response-projection-service");
 const { applyTeamPendingProjection } = require("./team-pending-projection-service");
+const { publishTeamProjectionWorkForEvent } = require("./team-dialog-projection-authority-service");
 const { projectCustomDeliveryFromTeamEvent } = require("./custom-content-delivery-tracking-service");
 const { projectNativeMassWriteFromTeamEvent } = require("./programmatic-of-write-authority-service");
 const { canAccessCreator } = require("../middleware/automation-permissions");
@@ -219,6 +220,24 @@ function canonicalEventTime({ event, eventKind, authorityNow }) {
   return { ts: dbNow, reported, authority: "DB_RECEIPT", rejectedReason: reported ? "CLIENT_WALL_CLOCK_NOT_AUTHORITY" : null };
 }
 
+function activitySemanticEventKey({ eventKind, creatorId, accountId, messageId, broadcastDispatchId, contentId }) {
+  const scope = cleanString(creatorId || accountId, 160);
+  if (!scope) return null;
+  if (eventKind === "MESSAGE_SEND_CONFIRMED") {
+    const id = cleanString(messageId, 220);
+    return id ? `${scope}:message:${id}` : null;
+  }
+  if (eventKind === "BROADCAST_DISPATCH_CONFIRMED") {
+    const id = cleanString(broadcastDispatchId, 220);
+    return id ? `${scope}:broadcast:${id}` : null;
+  }
+  if (eventKind === "CONTENT_POST_PUBLISHED_CONFIRMED" || eventKind === "CONTENT_STORY_PUBLISHED_CONFIRMED") {
+    const id = cleanString(contentId, 220);
+    return id ? `${scope}:content:${id}` : null;
+  }
+  return null;
+}
+
 function canonicalHumanSessionTimes({ eventKind, authorityNow, durationSeconds, rawStartedAt, rawEndedAt }) {
   if (!HUMAN_ACTIVITY_KINDS.has(eventKind)) return { startedAt: rawStartedAt, endedAt: rawEndedAt };
   const at = new Date(authorityNow);
@@ -261,6 +280,14 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
   // silently turn an automated PPV/message into chatter revenue ownership.
   const humanActor = requiresHuman && !forbidsHuman ? authenticatedMember : null;
   const eventTime = canonicalEventTime({ event, eventKind, authorityNow });
+  // R15/A37 admission-horizon fence: a provider event older than the supported
+  // correction horizon is an explicitly rejected historical observation, not a
+  // new event at DB receipt time.  The Desktop outbox treats rejectedEvents as
+  // terminal/quarantined evidence, so this prevents a replay after raw retention
+  // from becoming a second current contribution.
+  if (eventTime.rejectedReason === "REPORTED_TOO_OLD") {
+    return { row: null, reason: "provider_event_outside_admission_horizon" };
+  }
   const ts = eventTime.ts;
   const identityTime = eventTime.reported || ts;
   const localId = cleanString(event.localId, 160) || hashEvent({
@@ -298,6 +325,19 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
     rawStartedAt: optionalDate(event.startedAt),
     rawEndedAt: optionalDate(event.endedAt),
   });
+  const canonicalCreatorId = creator?.id || null;
+  const canonicalAccountId = cleanString(event.accountId || event.creatorId, 160);
+  const canonicalMessageId = cleanString(event.messageId, 220);
+  const canonicalContentId = cleanString(event.contentId || event.metadata?.contentId, 220);
+  const canonicalBroadcastDispatchId = cleanString(event.broadcastDispatchId, 220);
+  const semanticEventKey = activitySemanticEventKey({
+    eventKind,
+    creatorId: canonicalCreatorId,
+    accountId: canonicalAccountId,
+    messageId: canonicalMessageId,
+    broadcastDispatchId: canonicalBroadcastDispatchId,
+    contentId: canonicalContentId,
+  });
 
   return {
     row: {
@@ -305,8 +345,8 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
       deviceId,
       userId: humanActor?.userId || null,
       memberId: humanActor?.id || null,
-      accountId: cleanString(event.accountId || event.creatorId, 160),
-      creatorId: creator?.id || null,
+      accountId: canonicalAccountId,
+      creatorId: canonicalCreatorId,
       creatorRef: cleanString(event.creatorRef || creator?.username, 160),
       fanId: cleanString(event.fanId, 160),
       type: eventKind.toLowerCase(),
@@ -314,15 +354,16 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
       actionSource,
       lifecycle,
       dialogId: cleanString(event.dialogId || event.fanId, 160),
-      messageId: cleanString(event.messageId, 220),
-      contentId: cleanString(event.contentId || event.metadata?.contentId, 220),
+      messageId: canonicalMessageId,
+      contentId: canonicalContentId,
       correlationId: cleanString(event.correlationId, 220),
       coverageId: cleanString(event.coverageId, 220),
       startedAt: sessionTimes.startedAt,
       endedAt: sessionTimes.endedAt,
       durationSeconds,
       automationDeliveryId: cleanString(event.automationDeliveryId, 220),
-      broadcastDispatchId: cleanString(event.broadcastDispatchId, 220),
+      broadcastDispatchId: canonicalBroadcastDispatchId,
+      semanticEventKey,
       priceCents: nonNegativeInt(event.priceCents),
       currency: cleanString(event.currency, 16),
       isPpv: event.isPpv === true,
@@ -336,6 +377,20 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
   };
 }
 
+async function dispatchTeamProjectionForDurableEvent(durableRow, db) {
+  // PostgreSQL production uses the AFTER INSERT producer installed by Phase 2, so the
+  // canonical event commit and DomainWork invalidation are atomic. Reduced test doubles
+  // do not execute DB triggers: publish through the same authority when DomainWork exists,
+  // otherwise retain the old inline reducer only as a schema-compatibility/test fallback.
+  if (typeof db?.$queryRawUnsafe === "function") return { triggerOwned: true };
+  if (db?.domainWorkItem?.upsert || db?.domainWorkItem?.update) {
+    return publishTeamProjectionWorkForEvent({ row: durableRow, db });
+  }
+  await applyTeamResponseProjection(durableRow, db);
+  await applyTeamPendingProjection(durableRow, db);
+  return { compatibilityInline: true };
+}
+
 async function persistCanonicalTeamEventRow({ db, row }) {
   if (!db || !row) throw new Error("Canonical Team event persistence requires db and row");
   if (row.localId) {
@@ -345,8 +400,7 @@ async function persistCanonicalTeamEventRow({ db, row }) {
     if (exists) {
       const durableRow = exists;
       await applyLedgerSideEffects(durableRow, db);
-      await applyTeamResponseProjection(durableRow, db);
-      await applyTeamPendingProjection(durableRow, db);
+      await dispatchTeamProjectionForDurableEvent(durableRow, db);
       await projectCustomDeliveryFromTeamEvent(durableRow, { db });
     await projectNativeMassWriteFromTeamEvent(durableRow, { db });
       return { row: durableRow, duplicated: true, inserted: false };
@@ -356,8 +410,7 @@ async function persistCanonicalTeamEventRow({ db, row }) {
     const created = await db.teamActivityEvent.create({ data: row });
     const durableRow = { ...row, id: created.id };
     await applyLedgerSideEffects(durableRow, db);
-    await applyTeamResponseProjection(durableRow, db);
-    await applyTeamPendingProjection(durableRow, db);
+    await dispatchTeamProjectionForDurableEvent(durableRow, db);
     await projectCustomDeliveryFromTeamEvent(durableRow, { db });
     await projectNativeMassWriteFromTeamEvent(durableRow, { db });
     return { row: durableRow, duplicated: false, inserted: true };
@@ -369,8 +422,7 @@ async function persistCanonicalTeamEventRow({ db, row }) {
     if (!exists) throw err;
     const durableRow = exists;
     await applyLedgerSideEffects(durableRow, db);
-    await applyTeamResponseProjection(durableRow, db);
-    await applyTeamPendingProjection(durableRow, db);
+    await dispatchTeamProjectionForDurableEvent(durableRow, db);
     await projectCustomDeliveryFromTeamEvent(durableRow, { db });
     await projectNativeMassWriteFromTeamEvent(durableRow, { db });
     return { row: durableRow, duplicated: true, inserted: false };
@@ -444,8 +496,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
             // could change money/Custom/response side effects without changing TeamActivityEvent.
             const durableRow = exists;
             await applyLedgerSideEffects(durableRow, tx);
-            await applyTeamResponseProjection(durableRow, tx);
-            await applyTeamPendingProjection(durableRow, tx);
+            await dispatchTeamProjectionForDurableEvent(durableRow, tx);
             await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
             await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
             return { row: durableRow, duplicated: true };
@@ -455,8 +506,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
           const created = await tx.teamActivityEvent.create({ data: row });
           const durableRow = { ...row, id: created.id };
           await applyLedgerSideEffects(durableRow, tx);
-          await applyTeamResponseProjection(durableRow, tx);
-          await applyTeamPendingProjection(durableRow, tx);
+          await dispatchTeamProjectionForDurableEvent(durableRow, tx);
           await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
             await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
           return { row: durableRow, inserted: true };
@@ -468,8 +518,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
           if (!exists) throw err;
           const durableRow = exists;
           await applyLedgerSideEffects(durableRow, tx);
-          await applyTeamResponseProjection(durableRow, tx);
-          await applyTeamPendingProjection(durableRow, tx);
+          await dispatchTeamProjectionForDurableEvent(durableRow, tx);
           await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
             await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
           return { row: durableRow, duplicated: true };

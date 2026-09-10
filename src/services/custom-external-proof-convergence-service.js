@@ -14,7 +14,7 @@ function bounded(value, fallback = DEFAULT_BATCH_SIZE, max = 1000) {
   return Math.max(1, Math.min(max, n));
 }
 
-async function discoverHistoricalRelayProjectionDebt({ limit = DEFAULT_BATCH_SIZE, db } = {}) {
+async function discoverHistoricalRelayProjectionDebt({ agencyId = null, cursor = null, limit = DEFAULT_BATCH_SIZE, db } = {}) {
   const take = bounded(limit);
   if (!db) throw new Error("Custom external proof convergence requires a database");
 
@@ -43,8 +43,11 @@ async function discoverHistoricalRelayProjectionDebt({ limit = DEFAULT_BATCH_SIZ
         AND relay."result"->>'mediaId' ~ '^[1-9][0-9]{0,39}$'
        WHERE cardinality(submission."ofMediaIds") < cardinality(submission."telegramMessageIds")
          AND NOT ((relay."result"->>'mediaId') = ANY(submission."ofMediaIds"))
+         AND ($1::text IS NULL OR submission."agencyId"=$1)
+         AND ($2::text IS NULL OR submission."id">$2)
        ORDER BY submission."id" ASC
        LIMIT ${take}`,
+      agencyId ? String(agencyId) : null, cursor ? String(cursor) : null,
     );
   }
 
@@ -52,20 +55,20 @@ async function discoverHistoricalRelayProjectionDebt({ limit = DEFAULT_BATCH_SIZ
   // found. LIMIT is applied after proof validation, never before it, so malformed
   // historical rows cannot starve a later convergent row.
   const found = [];
-  let cursor = null;
+  let scanCursor = cursor ? String(cursor) : null;
   while (found.length < take) {
     const rows = await db.customContentSubmission.findMany({
-      where: {},
+      where: { ...(agencyId ? { agencyId: String(agencyId) } : {}) },
       select: {
         id: true, agencyId: true, creatorId: true, customOrderId: true, ofMediaIds: true,
         telegramMessageIds: true, telegramSourceAccountId: true, telegramSourceUserId: true,
       },
       orderBy: { id: "asc" },
       take: FALLBACK_PAGE_SIZE,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
     });
     if (!rows.length) break;
-    cursor = rows[rows.length - 1].id;
+    scanCursor = rows[rows.length - 1].id;
     for (const submission of rows) {
       const current = Array.isArray(submission.ofMediaIds) ? submission.ofMediaIds.map(String).filter(Boolean) : [];
       const source = Array.isArray(submission.telegramMessageIds) ? submission.telegramMessageIds : [];
@@ -89,8 +92,8 @@ async function discoverHistoricalRelayProjectionDebt({ limit = DEFAULT_BATCH_SIZ
   return found;
 }
 
-async function convergeHistoricalCustomExternalProofs({ limit = DEFAULT_BATCH_SIZE, db } = {}) {
-  const rows = await discoverHistoricalRelayProjectionDebt({ limit, db });
+async function convergeHistoricalCustomExternalProofs({ agencyId = null, cursor = null, limit = DEFAULT_BATCH_SIZE, db } = {}) {
+  const rows = await discoverHistoricalRelayProjectionDebt({ agencyId, cursor, limit, db });
   const result = { ok: true, selected: rows.length, repaired: 0, projectedMedia: 0, failed: 0, failures: [] };
   for (const candidate of rows) {
     try {
@@ -107,61 +110,86 @@ async function convergeHistoricalCustomExternalProofs({ limit = DEFAULT_BATCH_SI
       result.failures.push({ submissionId: String(candidate.id), agencyId: String(candidate.agencyId), code: clean(error?.code || "CUSTOM_EXTERNAL_PROOF_CONVERGENCE_FAILED", 120), message: clean(error?.message || error, 500) });
     }
   }
+  result.nextCursor = rows.length ? String(rows[rows.length - 1].id) : (cursor ? String(cursor) : null);
+  result.complete = rows.length < bounded(limit);
   return result;
 }
 
 
-async function repairCurrentCustomExternalProjectionDebt({ limit = DEFAULT_BATCH_SIZE, db } = {}) {
-  const take = bounded(limit);
-  if (!db?.providerOperationalDebt?.findMany) return { ok: false, selected: 0, repaired: 0, cleared: 0, failed: 0, reason: "provider_operational_debt_unavailable" };
-  const rows = await db.providerOperationalDebt.findMany({
-    where: { debtClass: DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT },
-    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
-    take,
-  });
-  const result = { ok: true, selected: rows.length, repaired: 0, cleared: 0, failed: 0, failures: [] };
-  for (const debt of rows) {
-    try {
-      const delivery = await db.automationDelivery?.findUnique?.({ where: { id: String(debt.objectId) } });
-      if (!delivery || String(delivery.status || "") !== "COMPLETED" || !["CUSTOM_RELAY_SEND", "CUSTOM_MANUAL_SEND"].includes(String(delivery.actionType || ""))) {
-        await db.providerOperationalDebt.deleteMany({ where: { id: String(debt.id) } });
-        result.cleared += 1;
-        continue;
-      }
-      const payload = delivery.payload && typeof delivery.payload === "object" && !Array.isArray(delivery.payload) ? delivery.payload : {};
-      const submissionId = clean(debt.customSubmissionId || payload.submissionId || (String(delivery.actionType) === "CUSTOM_RELAY_SEND" ? String(delivery.targetId || "").split(":")[0] : ""), 180);
-      const orderId = clean(debt.customOrderId || payload.customOrderId || (String(delivery.actionType) === "CUSTOM_MANUAL_SEND" ? delivery.targetId : ""), 180);
-
-      if (String(delivery.actionType) === "CUSTOM_RELAY_SEND" && submissionId) {
-        const repaired = await recoverConfirmedRelayProjectionForSubmission({ agencyId: String(delivery.agencyId), submissionId, db });
-        result.repaired += Number(repaired?.recovered || 0) > 0 ? 1 : 0;
-      }
-
-      const [submission, order] = await Promise.all([
-        submissionId && db.customContentSubmission?.findFirst
-          ? db.customContentSubmission.findFirst({ where: { id: submissionId, agencyId: delivery.agencyId, creatorId: delivery.creatorId } })
-          : Promise.resolve(null),
-        orderId && db.customOrder?.findFirst
-          ? db.customOrder.findFirst({ where: { id: orderId, agencyId: delivery.agencyId, creatorId: delivery.creatorId } })
-          : Promise.resolve(null),
-      ]);
-      const classification = customExternalWriteClassification({ delivery, submission, order });
-      if (classification.converged) {
-        await db.providerOperationalDebt.deleteMany({ where: { id: String(debt.id) } });
-        result.cleared += 1;
-      }
-    } catch (error) {
-      result.ok = false;
-      result.failed += 1;
-      result.failures.push({ debtId: String(debt.id), deliveryId: String(debt.objectId), code: clean(error?.code || "CUSTOM_EXTERNAL_CURRENT_DEBT_REPAIR_FAILED", 120), message: clean(error?.message || error, 500) });
-    }
+async function repairCustomExternalProjectionWorkItem({ agencyId, deliveryId, db } = {}) {
+  const scopedAgencyId = clean(agencyId, 180);
+  const scopedDeliveryId = clean(deliveryId, 220);
+  if (!scopedAgencyId || !scopedDeliveryId) {
+    const error = new Error("Custom external projection work identity is required");
+    error.code = "CUSTOM_EXTERNAL_WORK_IDENTITY_REQUIRED";
+    throw error;
   }
-  return result;
+  if (!db?.automationDelivery?.findFirst) {
+    const error = new Error("AutomationDelivery storage is required");
+    error.code = "CUSTOM_EXTERNAL_AUTOMATION_DELIVERY_STORAGE_REQUIRED";
+    throw error;
+  }
+
+  // ProviderOperationalDebt is intentionally only the provider-retention/capability
+  // projection. Execution ownership belongs to DomainWorkItem keyed by this exact
+  // AutomationDelivery, so this worker never scans the debt table for "some work".
+  const delivery = await db.automationDelivery.findFirst({
+    where: { id: scopedDeliveryId, agencyId: scopedAgencyId },
+  });
+  if (!delivery || String(delivery.status || "") !== "COMPLETED" || !["CUSTOM_RELAY_SEND", "CUSTOM_MANUAL_SEND"].includes(String(delivery.actionType || ""))) {
+    if (db?.providerOperationalDebt?.deleteMany) {
+      await db.providerOperationalDebt.deleteMany({
+        where: { agencyId: scopedAgencyId, debtClass: DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT, objectType: "AutomationDelivery", objectId: scopedDeliveryId },
+      });
+    }
+    return { ok: true, obsolete: true, repaired: 0, cleared: 1, converged: true };
+  }
+
+  const payload = delivery.payload && typeof delivery.payload === "object" && !Array.isArray(delivery.payload) ? delivery.payload : {};
+  const result = delivery.result && typeof delivery.result === "object" && !Array.isArray(delivery.result) ? delivery.result : {};
+  const submissionId = clean(
+    payload.submissionId || result.submissionId || (String(delivery.actionType) === "CUSTOM_RELAY_SEND" ? String(delivery.targetId || "").split(":")[0] : ""),
+    180,
+  );
+  const orderId = clean(
+    payload.customOrderId || result.customOrderId || (String(delivery.actionType) === "CUSTOM_MANUAL_SEND" ? delivery.targetId : ""),
+    180,
+  );
+
+  let repaired = 0;
+  if (String(delivery.actionType) === "CUSTOM_RELAY_SEND" && submissionId) {
+    const projection = await recoverConfirmedRelayProjectionForSubmission({ agencyId: scopedAgencyId, submissionId, db });
+    repaired += Number(projection?.recovered || 0);
+  }
+
+  const [submission, order] = await Promise.all([
+    submissionId && db.customContentSubmission?.findFirst
+      ? db.customContentSubmission.findFirst({ where: { id: submissionId, agencyId: scopedAgencyId, creatorId: delivery.creatorId } })
+      : Promise.resolve(null),
+    orderId && db.customOrder?.findFirst
+      ? db.customOrder.findFirst({ where: { id: orderId, agencyId: scopedAgencyId, creatorId: delivery.creatorId } })
+      : Promise.resolve(null),
+  ]);
+  const classification = customExternalWriteClassification({ delivery, submission, order });
+  if (classification.converged && db?.providerOperationalDebt?.deleteMany) {
+    await db.providerOperationalDebt.deleteMany({
+      where: { agencyId: scopedAgencyId, debtClass: DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT, objectType: "AutomationDelivery", objectId: scopedDeliveryId },
+    });
+  }
+  return {
+    ok: true,
+    obsolete: false,
+    repaired,
+    cleared: classification.converged ? 1 : 0,
+    converged: Boolean(classification.converged),
+    classification,
+  };
 }
+
 
 module.exports = {
   DEFAULT_BATCH_SIZE,
   discoverHistoricalRelayProjectionDebt,
   convergeHistoricalCustomExternalProofs,
-  repairCurrentCustomExternalProjectionDebt,
+  repairCustomExternalProjectionWorkItem,
 };

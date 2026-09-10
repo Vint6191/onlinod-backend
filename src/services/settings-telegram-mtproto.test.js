@@ -31,18 +31,13 @@ function providerTestMatches(row, where = {}) {
   return true;
 }
 
-function markProviderBackfillsComplete(db) {
-  const authority = require("./provider-operational-debt-authority-service");
+function markProviderBackfillsComplete(db, agencyId = "agency-1") {
   db.providerOperationalDebt = db.providerOperationalDebt || { findMany: async () => [], count: async () => 0 };
-  db.maintenanceLaneState = {
+  db.phase2WorkCoverage = {
     async findUnique({ where }) {
-      if (where.key === authority.PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY) {
-        return { key: where.key, generation: authority.PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
-      }
-      if (where.key === authority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY) {
-        return { key: where.key, generation: authority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
-      }
-      return null;
+      const key = where?.agencyId_family_generation;
+      if (!key || String(key.agencyId) !== String(agencyId)) return null;
+      return { agencyId: String(agencyId), family: String(key.family), generation: String(key.generation), active: true, enumerationState: "COMPLETE", completedAt: new Date("2026-09-09T20:00:00.000Z") };
     },
   };
 }
@@ -72,17 +67,7 @@ async function seedSettingsProviderOperationalAuthority(db, agencyId = "agency-1
     },
     async createMany({ data = [] }) { for (const row of data) if (!debts.some((x) => x.id === row.id)) debts.push({ ...row }); return { count: data.length }; },
   };
-  db.maintenanceLaneState = {
-    async findUnique({ where }) {
-      if (where.key === authority.PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY) {
-        return { key: where.key, generation: authority.PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
-      }
-      if (where.key === authority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY) {
-        return { key: where.key, generation: authority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
-      }
-      return null;
-    },
-  };
+  markProviderBackfillsComplete(db, agencyId);
   return debts;
 }
 
@@ -450,7 +435,7 @@ test("messaging material requires an authorized stored session", async () => {
   db.agencyTelegramMtprotoAccount.findFirst = async () => stored;
   const admin = { id: "member-admin", userId: "user-admin", role: "ADMIN", roleKey: "admin", accessEpoch: 1, assignedCreators: "all" };
   db.agencyMember = { findFirst: async () => ({ ...admin, agencyId: "a", deletedAt: null, deactivatedAt: null }) };
-  markProviderBackfillsComplete(db);
+  markProviderBackfillsComplete(db, "a");
   await service.addTelegramMtprotoAccount({ agencyId: "a", member: admin, apiId: 9001, apiHash: "0123456789abcdef0123456789abcdef", db });
   stored = { ...stored, runtimeClaimedByDeviceId: "device-admin", runtimeClaimToken: "token-admin", runtimeClaimUntil: new Date(Date.now() + 60_000), runtimeLeaseUserId: admin.userId, runtimeLeaseMemberId: admin.id, runtimeLeaseAccessEpoch: admin.accessEpoch, runtimeLeaseCreatorId: "creator-api" };
   await assert.rejects(
@@ -517,6 +502,25 @@ test("Telegram planning and account retirement serialize on the account row so n
   let pausePlannerAccountTouch = true;
 
   const db = {
+    async $queryRawUnsafe(sql, ...params) {
+      const text = String(sql);
+      if (/clock_timestamp/.test(text)) return [{ authorityNow: new Date("2026-09-10T00:00:00.000Z") }];
+      if (/FROM "AgencyTelegramMtprotoAccount"/.test(text) && /FOR UPDATE/.test(text)) {
+        const [id, agencyId] = params;
+        if (String(id) !== account.id || String(agencyId) !== account.agencyId || account.lifecycleState === "RETIRED") return [];
+        if (pausePlannerAccountTouch) {
+          pausePlannerAccountTouch = false;
+          plannerTouchedResolve();
+          await allowPlanner;
+        }
+        return [{ ...account }];
+      }
+      if (/FROM "Agency"/.test(text)) return params[0] === "agency-1" ? [{ id: "agency-1", deletedAt: null, status: "ACTIVE" }] : [];
+      if (/FROM "CreatorAccount"/.test(text) && /FOR UPDATE/.test(text)) return params[0] === creator.id ? [{ id: creator.id, agencyId: creator.agencyId, deletedAt: null, status: creator.status }] : [];
+      if (/FROM "CustomOrder"/.test(text) && /FOR UPDATE/.test(text)) return params[0] === order.id ? [{ id: order.id }] : [];
+      // Provider current-work SQL in this focused race has no dirty/external rows.
+      return [];
+    },
     agency: {
       findFirst: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null,
     },
@@ -534,11 +538,6 @@ test("Telegram planning and account retirement serialize on the account row so n
         const activeOrLegacy = Array.isArray(where.OR) && where.OR.some((part) => part?.lifecycleState === "ACTIVE");
         const matchesState = expected ? String(account.lifecycleState) === String(expected) : (activeOrLegacy ? String(account.lifecycleState) === "ACTIVE" : true);
         if (where.id !== account.id || where.agencyId !== account.agencyId || !matchesState) return { count: 0 };
-        if (pausePlannerAccountTouch && (expected === "ACTIVE" || activeOrLegacy) && data.lifecycleState === "ACTIVE") {
-          pausePlannerAccountTouch = false;
-          plannerTouchedResolve();
-          await allowPlanner;
-        }
         Object.assign(account, data);
         return { count: 1 };
       },
@@ -1096,7 +1095,6 @@ test("production retirement retains last revision-capable provider through V1/V2
       },
       telegramInboundEvent: { findFirst: async () => null },
       creatorAccount: { updateMany: async () => ({ count: 1 }) },
-      async $queryRawUnsafe() { return []; },
       async $transaction(fn) { return fn(this); },
     };
 

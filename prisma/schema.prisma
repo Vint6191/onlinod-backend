@@ -298,7 +298,11 @@ model Agency {
   teamProjectionCoverage TeamProjectionCoverage?
   teamHistoricalAnalyticsCoverage TeamHistoricalAnalyticsCoverage?
   teamMemberActivityDaily TeamMemberActivityDaily[]
+  teamActivityContributions TeamActivityContribution[]
   teamMoneyAttributionFacts TeamMoneyAttributionFact[]
+  teamMoneyDailyRollups TeamMoneyDailyRollup[]
+  teamMoneyLifetimeRollups TeamMoneyLifetimeRollup[]
+  teamMoneyRollupContributions TeamMoneyRollupContribution[]
   teamShifts TeamShift[]
   analyticsSnapshots AnalyticsSnapshot[]
   workspaceSettings WorkspaceSetting[]
@@ -360,6 +364,9 @@ model Agency {
   customOrders CustomOrder[]
   customContentSubmissions CustomContentSubmission[]
   customDeliveryReceipts CustomDeliveryReceipt[]
+  phase2DomainWorkItems DomainWorkItem[]
+  phase2WorkCoverages Phase2WorkCoverage[]
+  phase2DependencyStates Phase2DependencyState[]
 
   @@index([deletedAt])
 }
@@ -2142,10 +2149,12 @@ model AnalyticsScanProof {
 }
 
 model MaintenanceLaneState {
-  key         String    @id
-  generation  String
-  ownerToken  String?
-  leaseUntil  DateTime?
+  key              String    @id
+  generation       String
+  activeGeneration String?
+  ownerToken       String?
+  claimFence       BigInt    @default(0)
+  leaseUntil       DateTime?
   nextRunAt   DateTime?
   completedAt DateTime?
   cursor      Json?
@@ -2158,6 +2167,97 @@ model MaintenanceLaneState {
 
   @@index([leaseUntil], map: "MaintenanceLaneState_leaseUntil_idx")
   @@index([nextRunAt, completedAt], map: "MaintenanceLaneState_due_idx")
+}
+
+model DomainWorkItem {
+  id                 String   @id
+  agencyId           String
+  workClass          String
+  objectType         String
+  objectId           String
+  parentObjectId     String?
+  partitionKey       String
+  creatorId          String?
+  accountId          String?
+  requestedRevision  BigInt   @default(1)
+  completedRevision  BigInt   @default(0)
+  activeGeneration   String   @default("phase2_domain_work_v1")
+  projectionVersion  String   @default("phase2_domain_work_v1")
+  state              String   @default("READY")
+  availableAt        DateTime @default(now())
+  nextAttemptAt      DateTime?
+  ownerToken         String?
+  claimFence         BigInt   @default(0)
+  leaseUntil         DateTime?
+  claimedRevision    BigInt   @default(0)
+  progressCursor     Json?
+  dependencyKind     String?
+  dependencyKey      String?
+  dependencyRevision BigInt   @default(0)
+  attempts           Int      @default(0)
+  errorClass         String?
+  lastError          String?
+  terminalCause      String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, workClass, objectType, objectId], map: "DomainWorkItem_identity_key")
+  @@index([agencyId, workClass, state, availableAt, id], map: "DomainWorkItem_class_due_idx")
+  @@index([agencyId, workClass, parentObjectId, state, availableAt, id], map: "DomainWorkItem_parent_due_idx")
+  @@index([agencyId, partitionKey, state, availableAt, id], map: "DomainWorkItem_partition_due_idx")
+  @@index([agencyId, dependencyKind, dependencyKey, dependencyRevision, id], map: "DomainWorkItem_dependency_idx")
+  @@index([state, availableAt, id], map: "DomainWorkItem_global_due_idx")
+}
+
+model Phase2WorkCoverage {
+  id                  String   @id
+  agencyId            String
+  family              String
+  generation          String
+  active              Boolean  @default(false)
+  enumerationState    String   @default("PENDING")
+  enumeratedThrough   String?
+  projectedThrough    String?
+  unresolvedCount     Int      @default(0)
+  retainedFrom        DateTime?
+  sourceWatermark     String?
+  activatedAt         DateTime?
+  completedAt         DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, family, generation], map: "Phase2WorkCoverage_identity_key")
+  @@index([agencyId, family, active], map: "Phase2WorkCoverage_active_idx")
+}
+
+model Phase2LegacyExecutorFence {
+  laneKey            String   @id
+  retiredGeneration  String?
+  retiredAt          DateTime @default(now())
+  reason             String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+
+model Phase2DependencyState {
+  id             String   @id
+  agencyId       String
+  dependencyKind String
+  dependencyKey  String
+  revision       BigInt   @default(1)
+  changedAt      DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, dependencyKind, dependencyKey], map: "Phase2DependencyState_identity_key")
+  @@index([agencyId, dependencyKind, revision], map: "Phase2DependencyState_revision_idx")
 }
 
 model RetentionSweepLease {
@@ -3032,8 +3132,11 @@ model TeamActivityEvent {
   extra                  Json?
   pendingProjectionVersion String?
   pendingProjectedAt      DateTime?
+  dialogProjectionVersion String?
+  dialogProjectedAt       DateTime?
   historicalProjectionVersion String?
   historicalProjectedAt   DateTime?
+  semanticEventKey        String?
   source                 String   @default("electron")
   createdAt              DateTime @default(now())
 
@@ -3056,7 +3159,9 @@ model TeamActivityEvent {
   @@index([agencyId, coverageId, ts])
   @@index([agencyId, pendingProjectionVersion, ts])
   @@index([pendingProjectionVersion, ts, id], map: "TeamActivityEvent_pending_projection_work_idx")
+  @@index([agencyId, creatorId, dialogId, dialogProjectionVersion, ts, id], map: "TeamActivityEvent_dialog_projection_work_idx")
   @@index([agencyId, historicalProjectionVersion, ts])
+  @@index([agencyId, eventKind, semanticEventKey])
   @@index([agencyId, automationDeliveryId])
   @@index([agencyId, broadcastDispatchId])
   @@index([type, ts])
@@ -4966,6 +5071,8 @@ model TeamSentMessageLedger {
   campaignId   String?
   source       String   @default("manual_chat")
   telemetryEventId String?
+  compactedAt  DateTime?
+  rootVersion  String   @default("team_sent_root_v2")
 
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
@@ -5005,6 +5112,7 @@ model TeamCoverageSession {
   @@index([agencyId, memberId, startedAt])
   @@index([agencyId, creatorId, startedAt])
   @@index([agencyId, creatorId, memberId, startedAt])
+  @@index([agencyId, endedAt], map: "TeamCoverageSession_agency_endedAt_idx")
   @@index([endedAt])
 }
 
@@ -5039,6 +5147,7 @@ model TeamDialogSession {
   @@index([agencyId, startedAt], map: "TeamDialogSession_agency_startedAt_idx")
   @@index([agencyId, creatorId, dialogId, startedAt])
   @@index([agencyId, memberId, creatorId, dialogId, startedAt])
+  @@index([agencyId, endedAt], map: "TeamDialogSession_agency_endedAt_idx")
 }
 
 model TeamResponseCase {
@@ -5065,7 +5174,10 @@ model TeamResponseCase {
   slaEligible             Boolean  @default(false)
   sla5Pass                Boolean?
   sla15Pass               Boolean?
-  derivationVersion       String   @default("team_response_v1")
+  derivationVersion       String   @default("team_response_v2")
+  projectionRevision      BigInt   @default(0)
+  projectionState         String   @default("FULL")
+  repairReason            String?
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
 
@@ -5073,12 +5185,15 @@ model TeamResponseCase {
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
   member  AgencyMember   @relation(fields: [memberId], references: [id], onDelete: Cascade)
 
-  @@unique([agencyId, replyMessageId])
+  @@unique([agencyId, creatorId, replyMessageId])
   @@index([agencyId, memberId, replyAt])
   @@index([agencyId, replyAt], map: "TeamResponseCase_agency_replyAt_idx")
   @@index([agencyId, creatorId, dialogId, replyAt])
+  @@index([agencyId, creatorId, memberId, replyAt], map: "TeamResponseCase_agency_creator_member_replyAt_idx")
   @@index([agencyId, classification, replyAt])
   @@index([agencyId, slaEligible, replyAt])
+  @@index([agencyId, derivationVersion, projectionState, replyAt], map: "TeamResponseCase_current_generation_idx")
+  @@map("TeamResponseCaseCurrent")
 }
 
 
@@ -5099,13 +5214,46 @@ model TeamHistoricalAnalyticsCoverage {
   activityCoverageFrom     DateTime
   moneyCoverageFrom        DateTime
   activityProjectionVersion String  @default("team_activity_daily_v1")
-  moneyProjectionVersion    String  @default("team_money_fact_v1")
+  moneyProjectionVersion    String  @default("team_money_fact_v2")
+  activityContributionVersion String @default("team_activity_contribution_v2")
+  activityContributionCutoverAt DateTime?
+  retentionVectorVersion    String  @default("team_retention_vector_v2")
   source                   String   @default("phase2_historical_authority")
   backfilledAt             DateTime @default(now())
   createdAt                DateTime @default(now())
   updatedAt                DateTime @updatedAt
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+}
+
+model TeamActivityContribution {
+  id                String   @id
+  agencyId          String
+  eventKind         String
+  semanticKey       String
+  state             String   @default("APPLIED")
+  memberId          String?
+  creatorKey        String   @default("__none__")
+  creatorId         String?
+  day               DateTime
+  messagesSent      Int      @default(0)
+  ppvSentMessages   Int      @default(0)
+  broadcastDispatches Int    @default(0)
+  postsCreated      Int      @default(0)
+  storiesCreated    Int      @default(0)
+  contentActions    Int      @default(0)
+  contentMediaItemsPublished Int @default(0)
+  sourceEventAt     DateTime
+  projectionVersion String   @default("team_activity_contribution_v2")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, eventKind, semanticKey])
+  @@index([agencyId, memberId, day])
+  @@index([agencyId, creatorId, day])
+  @@index([agencyId, state, sourceEventAt])
 }
 
 model TeamMemberActivityDaily {
@@ -5161,13 +5309,23 @@ model TeamMoneyAttributionFact {
   creatorTipId       String?
   attributionBasis   String?
   sourceUpdatedAt    DateTime
-  projectionVersion  String   @default("team_money_fact_v1")
+  rootId             String?
+  rootVersion        String   @default("team_money_root_v2")
+  canonicalBusinessKey String?
+  classificationState String   @default("PENDING")
+  classificationReason String?
+  classificationVersion String @default("team_money_root_classification_v1")
+  projectionVersion  String   @default("team_money_fact_v2")
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  rollupContribution TeamMoneyRollupContribution?
 
   @@unique([agencyId, sourceType, sourceRowId])
+  @@index([agencyId, sourceType, rootId])
+  @@index([agencyId, classificationState, sourceType, occurredAt], map: "TeamMoneyAttributionFact_classification_read_idx")
+  @@index([agencyId, sourceType, canonicalBusinessKey], map: "TeamMoneyAttributionFact_business_key_idx")
   @@index([agencyId, sourceType, memberId, occurredAt])
   @@index([agencyId, creatorId, occurredAt])
   @@index([agencyId, attributionActive, occurredAt])
@@ -5176,6 +5334,72 @@ model TeamMoneyAttributionFact {
   @@index([creatorSaleId])
   @@index([financialTransactionId])
   @@index([creatorTipId])
+}
+
+model TeamMoneyDailyRollup {
+  id                String   @id
+  agencyId          String
+  memberId          String
+  creatorKey        String   @default("__none__")
+  creatorId         String?
+  sourceType        String
+  currency          String
+  day               DateTime @db.Date
+  amountCents       BigInt   @default(0)
+  factCount         Int      @default(0)
+  projectionVersion String   @default("team_money_rollup_v1")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, memberId, creatorKey, sourceType, currency, day], map: "TeamMoneyDailyRollup_identity_key")
+  @@index([agencyId, day, memberId], map: "TeamMoneyDailyRollup_agency_day_member_idx")
+  @@index([agencyId, creatorId, day], map: "TeamMoneyDailyRollup_agency_creator_day_idx")
+}
+
+model TeamMoneyLifetimeRollup {
+  id                String   @id
+  agencyId          String
+  memberId          String
+  creatorKey        String   @default("__none__")
+  creatorId         String?
+  sourceType        String
+  currency          String
+  amountCents       BigInt   @default(0)
+  factCount         Int      @default(0)
+  projectionVersion String   @default("team_money_rollup_v1")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, memberId, creatorKey, sourceType, currency], map: "TeamMoneyLifetimeRollup_identity_key")
+  @@index([agencyId, memberId], map: "TeamMoneyLifetimeRollup_agency_member_idx")
+  @@index([agencyId, creatorId], map: "TeamMoneyLifetimeRollup_agency_creator_idx")
+}
+
+model TeamMoneyRollupContribution {
+  id                String   @id
+  agencyId          String
+  sourceFactId      String   @unique
+  factFingerprint   String
+  active            Boolean  @default(false)
+  memberId          String?
+  creatorKey        String   @default("__none__")
+  creatorId         String?
+  sourceType        String?
+  currency          String?
+  day               DateTime? @db.Date
+  amountCents       BigInt   @default(0)
+  projectionVersion String   @default("team_money_rollup_v1")
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  sourceFact TeamMoneyAttributionFact @relation(fields: [sourceFactId], references: [id], onDelete: Cascade)
+
+  @@index([agencyId, active, day], map: "TeamMoneyRollupContribution_active_day_idx")
 }
 
 model TeamPendingDialogState {
@@ -5203,7 +5427,10 @@ model TeamPendingDialogState {
   replyAt                 DateTime?
   replyMessageId          String?
   repliedByMemberId       String?
-  derivationVersion       String   @default("team_pending_v1")
+  derivationVersion       String   @default("team_pending_v2")
+  projectionRevision      BigInt   @default(0)
+  projectionState         String   @default("FULL")
+  lastProjectionSourceId  String?
   createdAt               DateTime @default(now())
   updatedAt               DateTime @updatedAt
 
@@ -5214,6 +5441,8 @@ model TeamPendingDialogState {
   @@index([agencyId, status, firstIncomingAt])
   @@index([agencyId, ownerMemberId, status])
   @@index([agencyId, creatorId, status, firstIncomingAt])
+  @@index([agencyId, derivationVersion, projectionState, status, firstIncomingAt], map: "TeamPendingDialogState_current_generation_idx")
+  @@map("TeamPendingDialogStateCurrent")
 }
 
 model TeamObservationState {
@@ -5425,6 +5654,9 @@ model TeamPpvPurchaseLedger {
   attributionBasis       String?
   historicalFactVersion  String?
   historicalFactProjectedAt DateTime?
+  rootVersion            String   @default("team_money_root_v2")
+  compactedAt            DateTime?
+  migrationBaselineProtected Boolean @default(false)
 
   creatorSale          CreatorSale?                @relation(fields: [creatorSaleId], references: [id], onDelete: SetNull)
   financialTransaction CreatorFinancialTransaction? @relation(fields: [financialTransactionId], references: [id], onDelete: SetNull)
@@ -5472,6 +5704,9 @@ model TeamTipLedger {
   attributionBasis String?
   historicalFactVersion String?
   historicalFactProjectedAt DateTime?
+  rootVersion      String   @default("team_money_root_v2")
+  compactedAt      DateTime?
+  migrationBaselineProtected Boolean @default(false)
   creatorTip       CreatorTip? @relation(fields: [creatorTipId], references: [id], onDelete: SetNull)
 
   candidates     Json?

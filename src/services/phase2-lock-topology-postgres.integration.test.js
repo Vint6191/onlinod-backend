@@ -21,12 +21,9 @@ test("Phase2 PostgreSQL lock topology: same-Agency shared work is parallel and e
   let secondShared = null;
   let rowWriter = null;
   let exclusive = null;
+  let agency = null;
   try {
-    const agency = await prisma.agency.findFirst({ where: { deletedAt: null }, select: { id: true } });
-    if (!agency) {
-      t.skip("No active Agency row exists in the PostgreSQL integration database");
-      return;
-    }
+    agency = await prisma.agency.create({ data: { name: `Phase2 lock PG ${Date.now()} ${Math.random().toString(16).slice(2)}` }, select: { id: true } });
 
     const firstLocked = deferred();
     releaseFirst = deferred();
@@ -104,6 +101,9 @@ test("Phase2 PostgreSQL lock topology: same-Agency shared work is parallel and e
     // before disconnecting so the integration harness cannot hide a real failure.
     releaseFirst?.resolve();
     await Promise.allSettled([first, secondShared, rowWriter, exclusive].filter(Boolean));
+    if (agency?.id) {
+      try { await prisma.agency.delete({ where: { id: agency.id } }); } catch (_) {}
+    }
     if (typeof prisma.$disconnect === "function") await prisma.$disconnect();
   }
 });

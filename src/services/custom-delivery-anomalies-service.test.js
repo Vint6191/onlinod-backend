@@ -66,7 +66,7 @@ function fixture() {
 
 test("live overdue is derived from approved readyAt after two hours and keeps partial delivery progress", async () => {
   const { db } = fixture();
-  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T10:15:00Z"), db });
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", includeMoney: true, rangeKey: "24h", now: new Date("2026-08-22T10:15:00Z"), db });
   assert.equal(result.overdueThresholdSeconds, 7200);
   assert.equal(result.overdue.length, 1);
   assert.equal(result.overdue[0].customOrderId, "custom-1");
@@ -78,7 +78,7 @@ test("live overdue is derived from approved readyAt after two hours and keeps pa
 
 test("legacy custom management signals remain visible through AuditLog fallback", async () => {
   const { db } = fixture();
-  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", includeMoney: true, rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
   assert.equal(result.summary.paymentOverrides, 1);
   assert.equal(result.summary.undercharges, 1);
   assert.equal(result.summary.duplicateAttempts, 1);
@@ -100,7 +100,7 @@ test("typed delivery receipts are the management anomaly authority and survive m
     duplicateMediaIds: ["9001", "9002"], expectedPriceCents: 2000, actualPriceCents: 1500, totalPriceCents: 6000,
     paidAmountCents: 4000, remainingAmountCents: 2000, overrideReason: null, occurredAt: new Date("2026-08-22T10:30:00Z"),
   });
-  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", includeMoney: true, rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
   assert.equal(result.summary.undercharges, 1);
   assert.equal(result.summary.duplicateAttempts, 1);
   assert.equal(result.events.length, 2);
@@ -116,7 +116,7 @@ test("AuditLog projection for a receipt-covered provider message is not double-c
     occurredAt: new Date("2026-08-22T10:30:00Z"),
   });
   // a2 is the historical/best-effort projection for this exact message and must be shadowed by the receipt.
-  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", includeMoney: true, rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
   assert.equal(result.summary.undercharges, 1);
   assert.equal(result.events.filter((row) => row.type === "CUSTOM_PAYMENT_UNDERCHARGE").length, 1);
   assert.ok(audits.some((row) => row.id === "a2"));
@@ -136,15 +136,82 @@ test("out-of-range typed receipt still shadows an in-range best-effort AuditLog 
     duplicateMediaIds: [], expectedPriceCents: 2000, actualPriceCents: 1500, totalPriceCents: 6000, paidAmountCents: 4000, remainingAmountCents: 2000,
     occurredAt: new Date("2026-08-20T10:30:00Z"),
   });
-  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", includeMoney: true, rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
   assert.equal(result.summary.undercharges, 0, "telemetry ingestion time must not move an old typed business fact into the current range");
   assert.equal(result.events.length, 0);
 });
 
 test("creator scope hides both current overdue state and historical anomaly signals", async () => {
   const { db } = fixture();
-  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", allowedCreatorIds: ["creator-other"], rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", includeMoney: true, allowedCreatorIds: ["creator-other"], rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
   assert.equal(result.overdue.length, 0);
   assert.equal(result.events.length, 0);
   assert.deepEqual(result.summary, { overdueDeliveries: 0, paymentOverrides: 0, undercharges: 0, duplicateAttempts: 0, fullyPaidSentAsPpv: 0 });
+});
+
+
+test("money-disabled anomalies redact monetary fields while preserving structural signals", async () => {
+  const { db } = fixture();
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", includeMoney: false, rangeKey: "24h", now: new Date("2026-08-22T11:00:00Z"), db });
+  assert.equal(result.moneyVisible, false);
+  assert.equal(result.summary.paymentOverrides, 1);
+  assert.equal(result.summary.undercharges, 1);
+  assert.equal(result.summary.fullyPaidSentAsPpv, null);
+  assert.equal(result.overdue[0].totalPriceCents, null);
+  const signal = result.events.find((row) => row.type === "CUSTOM_PAYMENT_OVERRIDE");
+  assert.equal(signal.expectedPriceCents, null);
+  assert.equal(signal.actualPriceCents, null);
+  assert.equal(signal.totalPriceCents, null);
+  assert.equal(signal.paidAmountCents, null);
+  assert.equal(signal.remainingAmountCents, null);
+  assert.equal(signal.shortfallCents, null);
+});
+
+test("A14 bounded anomaly scan reports PARTIAL instead of false zero when source rows exceed budget", async () => {
+  const now = new Date("2026-08-22T11:00:00Z");
+  const receipts = Array.from({ length: 1200 }, (_, index) => ({
+    id: `r-${String(1200-index).padStart(4, "0")}`,
+    agencyId: "agency-1",
+    creatorId: "creator-1",
+    customOrderId: `custom-${index}`,
+    submissionId: null,
+    dialogId: `dialog-${index}`,
+    messageId: `message-${index}`,
+    actorMemberId: null,
+    actorUserId: null,
+    duplicateMediaIds: [],
+    expectedPriceCents: 1000,
+    actualPriceCents: 1000,
+    totalPriceCents: 1000,
+    paidAmountCents: 1000,
+    remainingAmountCents: 0,
+    overrideReason: null,
+    occurredAt: new Date(now.getTime() - index * 1000),
+  }));
+  let receiptRowsRead = 0;
+  const db = {
+    customContentSubmission: { findMany: async () => [] },
+    creatorMediaAsset: { findMany: async () => [] },
+    customDeliveryReceipt: {
+      findMany: async ({ where = {}, take = 200, cursor = null, skip = 0 }) => {
+        if (where?.messageId?.in) return [];
+        const ordered = receipts.slice().sort((a,b) => b.occurredAt - a.occurredAt || String(b.id).localeCompare(String(a.id)));
+        const start = cursor?.id ? Math.max(0, ordered.findIndex((row) => row.id === cursor.id) + (skip || 0)) : 0;
+        const page = ordered.slice(start, start + take);
+        receiptRowsRead += page.length;
+        return page;
+      },
+    },
+    auditLog: { findMany: async () => [] },
+    agencyMember: { findMany: async () => [] },
+    creatorAccount: { findMany: async () => [] },
+  };
+  const result = await listCustomDeliveryAnomalies({ agencyId: "agency-1", includeMoney: true, rangeKey: "24h", limit: 100, scanBudget: 1000, now, db });
+  assert.equal(receiptRowsRead, 1000, "one request must not drain the whole receipt range");
+  assert.equal(result.readCoverage.complete, false);
+  assert.equal(result.readCoverage.events.complete, false);
+  assert.equal(result.summary.paymentOverrides, null, "incomplete scan must not claim an exact zero");
+  assert.equal(result.summary.duplicateAttempts, null);
+  assert.equal(result.summaryLowerBounds.paymentOverrides, 0);
+  assert.equal(result.events.length, 0);
 });

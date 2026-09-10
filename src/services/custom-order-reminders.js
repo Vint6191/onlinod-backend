@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("node:crypto");
 const { activeLifecycleWhere } = require("./telegram-account-reference-authority-service");
 
 const SETTINGS_KEY = "telegramCustomReminders";
@@ -131,14 +132,19 @@ function nextReminderForOrder(order, workspacePolicy, now = new Date(), { afterA
       at: new Date(scheduledAt.getTime() - minutes * 60_000),
       key: `CALL:${scheduledAt.toISOString()}:${minutes}`,
     }));
-    const future = candidates.filter((candidate) => candidate.at.getTime() > nowMs && candidate.key !== order.lastReminderKey)
-      .sort((a, b) => a.at.getTime() - b.at.getTime());
+    const ordered = candidates.slice().sort((a, b) => a.at.getTime() - b.at.getTime());
+    if (nowMs >= scheduledAt.getTime()) return { at: null, key: null };
+    // A concrete due offset has priority over the next future wakeup. Its catch-up window
+    // ends at the next offset (or scheduledAt for the final offset), so a missed :30 does
+    // not get silently replaced by the future :5 and old offsets do not burst later.
+    const due = ordered.filter((candidate, index) => {
+      if (candidate.key === order.lastReminderKey || candidate.at.getTime() > nowMs) return false;
+      const windowEnd = ordered[index + 1]?.at || scheduledAt;
+      return nowMs < windowEnd.getTime();
+    }).sort((a, b) => b.at.getTime() - a.at.getTime());
+    if (due.length) return { ...due[0], at: new Date(nowMs) };
+    const future = ordered.filter((candidate) => candidate.at.getTime() > nowMs && candidate.key !== order.lastReminderKey);
     if (future.length) return future[0];
-    if (!afterAck) {
-      const due = candidates.filter((candidate) => candidate.at.getTime() <= nowMs && candidate.key !== order.lastReminderKey)
-        .sort((a, b) => b.at.getTime() - a.at.getTime());
-      if (due.length && nowMs < scheduledAt.getTime()) return { ...due[0], at: new Date(nowMs) };
-    }
     return { at: null, key: null };
   }
 
@@ -216,6 +222,52 @@ function desiredReminderSchedule(order, workspacePolicy, now = new Date(), { fir
   return nextReminderForOrder(order, workspacePolicy, now);
 }
 
+function reminderWorkObjectId(orderId, reminderKey) {
+  const digest = crypto.createHash("sha256").update(String(reminderKey || "")).digest("hex").slice(0, 32);
+  return `${String(orderId)}:${digest}`;
+}
+
+async function synchronizeReminderDomainWork({ agencyId, order, desired, db, now = new Date() } = {}) {
+  if (!order?.id || !db) return { published: false, skipped: true };
+  const { WORK_CLASS: PHASE2_WORK_CLASS, publishDomainWork } = require("./domain-work-authority-service");
+  const storageAvailable = typeof db.$queryRawUnsafe === "function" || Boolean(db.domainWorkItem?.upsert);
+  if (!storageAvailable) return { published: false, skipped: true, reason: "domain_work_storage_unavailable" };
+
+  const parentObjectId = String(order.id);
+  const nextKey = String(desired?.key || "").trim();
+  const nextAt = validDate(desired?.at);
+  const nextObjectId = nextKey ? reminderWorkObjectId(parentObjectId, nextKey) : null;
+
+  // Old precommit reminder obligations are no longer executable once the canonical schedule
+  // changes. A CLAIMED old item is fenced out here as well; the Telegram begin guard still
+  // revalidates current policy/identity before any physical effect.
+  if (typeof db.$queryRawUnsafe === "function") {
+    await db.$queryRawUnsafe(
+      `UPDATE "DomainWorkItem"
+          SET "state"='DONE',"completedRevision"=GREATEST("completedRevision","requestedRevision"),
+              "ownerToken"=NULL,"leaseUntil"=$1,"nextAttemptAt"=NULL,"errorClass"=NULL,"lastError"=NULL,
+              "terminalCause"='REMINDER_SUPERSEDED',"updatedAt"=CURRENT_TIMESTAMP
+        WHERE "agencyId"=$2 AND "workClass"='CUSTOM_REMINDER' AND "parentObjectId"=$3
+          AND ($4::text IS NULL OR "objectId"<>$4)
+          AND "state"<>'DONE'`,
+      now, String(agencyId), parentObjectId, nextObjectId,
+    );
+  } else if (db.domainWorkItem?.updateMany) {
+    const where = { agencyId: String(agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_REMINDER, parentObjectId, state: { not: "DONE" } };
+    if (nextObjectId) where.objectId = { not: nextObjectId };
+    await db.domainWorkItem.updateMany({ where, data: { state: "DONE", ownerToken: null, leaseUntil: now, nextAttemptAt: null, errorClass: null, lastError: null, terminalCause: "REMINDER_SUPERSEDED" } });
+  }
+
+  if (!nextObjectId || !nextAt) return { published: false, cleared: true };
+  const row = await publishDomainWork({
+    db, agencyId: String(agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_REMINDER,
+    objectType: "CustomReminderObligation", objectId: nextObjectId, parentObjectId,
+    partitionKey: String(order.creatorId || agencyId), creatorId: order.creatorId ? String(order.creatorId) : null,
+    availableAt: nextAt,
+  });
+  return { published: true, objectId: nextObjectId, work: row };
+}
+
 async function reprojectCustomReminderSchedule({ agencyId, orderId, now = new Date(), firstAnchorAt = null, db, maxAttempts = 5 } = {}) {
   if (!db?.customOrder?.findFirst || !db?.customOrder?.updateMany) {
     const error = new Error("CustomOrder CAS projection storage is required");
@@ -233,38 +285,44 @@ async function reprojectCustomReminderSchedule({ agencyId, orderId, now = new Da
 
   const attempts = Math.max(1, Math.min(20, Math.floor(Number(maxAttempts) || 5)));
   for (let attempt = 0; attempt < attempts; attempt += 1) {
-    const order = await db.customOrder.findFirst({ where: { id, agencyId } });
-    if (!order) return { ok: true, missing: true, changed: false, nextReminderAt: null };
-    const revision = validDate(order.updatedAt);
-    if (!revision) {
-      const error = new Error("CustomOrder.updatedAt revision is required for reminder projection");
-      error.code = "CUSTOM_REMINDER_SCHEDULE_REVISION_REQUIRED";
-      error.status = 500;
-      throw error;
-    }
+    const execute = async (tx) => {
+      const order = await tx.customOrder.findFirst({ where: { id, agencyId } });
+      if (!order) return { ok: true, missing: true, changed: false, nextReminderAt: null };
+      const revision = validDate(order.updatedAt);
+      if (!revision) {
+        const error = new Error("CustomOrder.updatedAt revision is required for reminder projection");
+        error.code = "CUSTOM_REMINDER_SCHEDULE_REVISION_REQUIRED";
+        error.status = 500;
+        throw error;
+      }
 
-    const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db });
-    let modelObligation = null;
-    if (String(order.type || "CONTENT").toUpperCase() === "CONTENT") {
-      const { deriveCustomModelObligation } = require("./custom-model-obligation-authority-service");
-      modelObligation = await deriveCustomModelObligation({ agencyId, order, db });
-    }
-    const desired = desiredReminderSchedule(order, workspacePolicy, now, { firstAnchorAt, modelObligation });
-    const desiredAt = desired.at ? new Date(desired.at) : null;
-    if (sameInstant(order.nextReminderAt, desiredAt)) {
-      return { ok: true, missing: false, changed: false, nextReminderAt: desiredAt, attempts: attempt + 1 };
-    }
+      const workspacePolicy = await readWorkspaceReminderPolicy({ agencyId, db: tx });
+      let modelObligation = null;
+      if (String(order.type || "CONTENT").toUpperCase() === "CONTENT") {
+        const { deriveCustomModelObligation } = require("./custom-model-obligation-authority-service");
+        modelObligation = await deriveCustomModelObligation({ agencyId, order, db: tx });
+      }
+      const desired = desiredReminderSchedule(order, workspacePolicy, now, { firstAnchorAt, modelObligation });
+      const desiredAt = desired.at ? new Date(desired.at) : null;
+      if (sameInstant(order.nextReminderAt, desiredAt)) {
+        const work = await synchronizeReminderDomainWork({ agencyId, order, desired, db: tx, now });
+        return { ok: true, missing: false, changed: false, nextReminderAt: desiredAt, reminderKey: desired.key || null, work, attempts: attempt + 1 };
+      }
 
-    // updatedAt is the cross-service revision fence. Write it explicitly: correctness must not
-    // depend on whether a particular Prisma Client version advances @updatedAt for updateMany().
-    const fenceAt = new Date(Math.max(now.getTime(), revision.getTime() + 1));
-    const changed = await db.customOrder.updateMany({
-      where: { id, agencyId, updatedAt: revision },
-      data: { nextReminderAt: desiredAt, updatedAt: fenceAt },
-    });
-    if (Number(changed?.count || 0) === 1) {
-      return { ok: true, missing: false, changed: true, nextReminderAt: desiredAt, attempts: attempt + 1 };
-    }
+      // updatedAt is the cross-service revision fence. Write it explicitly: correctness must not
+      // depend on whether a particular Prisma Client version advances @updatedAt for updateMany().
+      const fenceAt = new Date(Math.max(now.getTime(), revision.getTime() + 1));
+      const changed = await tx.customOrder.updateMany({
+        where: { id, agencyId, updatedAt: revision },
+        data: { nextReminderAt: desiredAt, updatedAt: fenceAt },
+      });
+      if (Number(changed?.count || 0) !== 1) return null;
+      const nextOrder = { ...order, nextReminderAt: desiredAt, updatedAt: fenceAt };
+      const work = await synchronizeReminderDomainWork({ agencyId, order: nextOrder, desired, db: tx, now });
+      return { ok: true, missing: false, changed: true, nextReminderAt: desiredAt, reminderKey: desired.key || null, work, attempts: attempt + 1 };
+    };
+    const result = typeof db.$transaction === "function" ? await db.$transaction(execute) : await execute(db);
+    if (result) return result;
   }
 
   const error = new Error("Custom reminder schedule changed concurrently too many times; retry from current state");
@@ -349,6 +407,8 @@ module.exports = {
   effectivePolicy,
   nextReminderForOrder,
   desiredReminderSchedule,
+  reminderWorkObjectId,
+  synchronizeReminderDomainWork,
   reprojectCustomReminderSchedule,
   reminderText,
   taskText,

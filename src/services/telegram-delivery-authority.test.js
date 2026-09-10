@@ -170,10 +170,11 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
         return { count: (data || []).length };
       },
     },
-    maintenanceLaneState: {
+    phase2WorkCoverage: {
       async findUnique({ where }) {
-        if (where.key !== PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY) return null;
-        return { key: PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY, generation: PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date(now.getTime() - 1_000) };
+        const key = where?.agencyId_family_generation;
+        if (!key || String(key.agencyId) !== "agency-1") return null;
+        return { agencyId: "agency-1", family: String(key.family), generation: String(key.generation), active: true, enumerationState: "COMPLETE", completedAt: new Date(now.getTime() - 1_000) };
       },
     },
     auditLog: { async create({ data }) { const row={ id: `audit-${audits.length+1}`, ...clone(data) }; audits.push(row); return clone(row); } },
@@ -2684,4 +2685,87 @@ test("manual Telegram reconciliation rejects a stale management actor and preser
   );
   assert.equal(row.state, "RECONCILE_REQUIRED");
   assert.equal(row.outcomeReason ?? null, null);
+});
+
+test("A30 reminder blocked discovery obeys scan budget and does not claim an empty queue is complete", async () => {
+  const fx = dbFixture();
+  const template = clone(fx.orders[0]);
+  fx.orders.splice(0, fx.orders.length);
+  for (let index = 0; index < 250; index += 1) {
+    fx.orders.push({
+      ...clone(template),
+      id: `scan-order-${String(index).padStart(4, "0")}`,
+      dialogId: `scan-dialog-${index}`,
+      status: "PENDING",
+      nextReminderAt: new Date(fx.now.getTime() - 1000),
+      telegramTaskMessageId: null,
+      createdAt: new Date(fx.now.getTime() - 60_000),
+      updatedAt: new Date(fx.now.getTime() - 60_000),
+    });
+  }
+  const queue = await listTelegramReminderPlanningBlockedQueue({ agencyId: "agency-1", member: fx.member, limit: 50, scanBudget: 200, now: fx.now, db: fx.db });
+  assert.equal(queue.scannedRows, 200);
+  assert.equal(queue.items.length, 0);
+  assert.equal(queue.scanComplete, false, "budget exhaustion is not a complete-empty proof");
+  assert.equal(queue.hasMore, true);
+  assert.ok(queue.nextCursor);
+});
+
+test("A42 precommit old owner cannot begin a send after runtime ownership and delivery claim move to a new owner", async () => {
+  const fx = dbFixture();
+  const planned = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "TASK", now: fx.now, db: fx.db });
+  const oldClaim = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db });
+  assert.equal(oldClaim.claimed, true);
+
+  // The old precommit lease expires before provider dispatch. Runtime capability then
+  // moves to device-2 and the exact same intent is reclaimed under claimRevision 2.
+  const account = fx.accounts[0];
+  account.runtimeClaimedByDeviceId = "device-2";
+  account.runtimeClaimToken = "runtime-2";
+  account.runtimeClaimUntil = new Date(fx.now.getTime() + CLAIM_MS * 3);
+  fx.intents[0].claimUntil = new Date(fx.now.getTime() - 1);
+  const newClaim = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-2", runtimeClaimToken: "runtime-2", now: new Date(fx.now.getTime() + 1_000), db: fx.db });
+  assert.equal(newClaim.claimed, true);
+  assert.equal(newClaim.intent.claimRevision, 2);
+
+  await assert.rejects(
+    () => beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: oldClaim.claimToken, now: new Date(fx.now.getTime() + 1_500), db: fx.db }),
+    (error) => error?.code === "TELEGRAM_DELIVERY_CLAIM_STALE",
+  );
+  assert.equal(fx.intents[0].state, "CLAIMED");
+  assert.equal(fx.intents[0].commitStartedAt, null, "stale owner must never cross the physical-send boundary");
+});
+
+test("A42 committed old attempt keeps its exact late receipt after runtime owner changes, while the new owner cannot send again", async () => {
+  const fx = dbFixture();
+  const flow = await taskToCommitting(fx);
+  assert.equal(fx.intents[0].state, "COMMITTING");
+
+  // Provider/runtime capability may move while an already-authorized physical attempt
+  // is awaiting its backend receipt. That capability handoff is not evidence that the
+  // old external effect did or did not happen.
+  const account = fx.accounts[0];
+  account.runtimeClaimedByDeviceId = "device-2";
+  account.runtimeClaimToken = "runtime-2";
+  account.runtimeClaimUntil = new Date(fx.now.getTime() + CLAIM_MS * 3);
+
+  const secondOwner = await claimTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id, deviceId: "device-2", runtimeClaimToken: "runtime-2", now: new Date(fx.now.getTime() + 1_000), db: fx.db });
+  assert.equal(secondOwner.claimed, false);
+  assert.equal(secondOwner.intent.state, "COMMITTING", "new owner must inherit UNKNOWN/in-flight state, not a new send permit");
+  assert.equal(secondOwner.claimToken, null);
+
+  const receipt = await confirmTelegramDeliveryIntent({
+    agencyId: "agency-1", member: fx.member, intentId: flow.planned.intent.id,
+    deviceId: "device-1", claimToken: flow.claimed.claimToken,
+    remoteMessageId: 9042, remoteRecipientTelegramUserId: "900001",
+    remoteSentAt: fx.now, now: new Date(fx.now.getTime() + 2_000), db: fx.db,
+  });
+  assert.equal(receipt.intent.state, "CONFIRMED");
+  assert.equal(receipt.intent.remoteMessageId, "9042");
+  assert.equal(fx.orders[0].telegramTaskMessageId, 9042);
+
+  const plannedAgain = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "TASK", now: new Date(fx.now.getTime() + 3_000), db: fx.db });
+  assert.equal(plannedAgain.created, false);
+  assert.equal(plannedAgain.intent.id, flow.planned.intent.id);
+  assert.equal(plannedAgain.intent.state, "CONFIRMED", "late exact receipt must fence any second TASK send");
 });

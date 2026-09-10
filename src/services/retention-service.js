@@ -16,6 +16,8 @@ const { purgeExpiredTipLedger } = require("./team-tip-ledger-service");
 const { compactAutomationDeliveries } = require("./automation-history-service");
 const { withDbAdvisoryXactLock, runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { runMaintenanceLane } = require("./maintenance-work-authority");
+const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, phase2CoverageStatus } = require("./phase2-work-coverage-authority-service");
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
@@ -28,6 +30,11 @@ const RETENTION_LEASE_KEY = "global_retention_v1";
 const RETENTION_COORDINATION_LOCK_KEY = "retention-sweep-coordinator";
 const RETENTION_LEASE_MS = 2 * 60 * 60 * 1000;
 const RETENTION_HEARTBEAT_MS = 10 * 60 * 1000;
+const TEAM_PROVIDER_CORRECTION_HORIZON_DAYS = 366;
+const TEAM_PROJECTION_RETENTION_LANE_KEY = "team_projection_retention_v1";
+const TEAM_PROJECTION_RETENTION_GENERATION = "team_projection_retention_v1";
+const TEAM_PROJECTION_RETENTION_AGENCIES_PER_BATCH = 10;
+
 
 const RETENTION_FIELDS = Object.freeze({
   retentionSweepWindowHours: {
@@ -480,8 +487,11 @@ function daysAgo(days, now = new Date()) {
   return new Date(base.getTime() - Math.max(0, Number(days) || 0) * DAY_MS);
 }
 
-async function deleteByIdsInBatches({ model, where, orderBy, batchSize, label }) {
+async function deleteByIdsInBatches({ model, where, orderBy, batchSize, label, maxBatches = null }) {
   let total = 0;
+  let batches = 0;
+  let hasMore = false;
+  const finiteMax = maxBatches == null ? null : Math.max(1, Math.floor(Number(maxBatches) || 1));
   for (;;) {
     const rows = await model.findMany({
       where,
@@ -493,10 +503,143 @@ async function deleteByIdsInBatches({ model, where, orderBy, batchSize, label })
 
     const result = await model.deleteMany({ where: { id: { in: rows.map((row) => row.id) } } });
     total += result?.count || rows.length;
+    batches += 1;
 
     if (rows.length < batchSize) break;
+    if (finiteMax != null && batches >= finiteMax) { hasMore = true; break; }
   }
-  return { label, deleted: total };
+  return { label, deleted: total, batches, hasMore };
+}
+
+function maxDate(a, b) {
+  const left = a instanceof Date ? a : a ? new Date(a) : null;
+  const right = b instanceof Date ? b : b ? new Date(b) : null;
+  if (!left || !Number.isFinite(left.getTime())) return right;
+  if (!right || !Number.isFinite(right.getTime())) return left;
+  return left.getTime() >= right.getTime() ? left : right;
+}
+
+async function compactTeamProjectionAuthorityForAgency({ db = prisma, agencyId, cutoff, batchSize = DEFAULT_BATCH_SIZE } = {}) {
+  if (!agencyId || !(cutoff instanceof Date) || !Number.isFinite(cutoff.getTime())) {
+    throw new Error("TEAM_PROJECTION_RETENTION_IDENTITY_REQUIRED");
+  }
+  const coverage = await phase2CoverageStatus({
+    db,
+    agencyId,
+    family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR,
+    generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR,
+  });
+  if (!coverage.ready) {
+    return { agencyId, skipped: true, reason: "response_repair_coverage_incomplete", deleted: 0, hasMore: false, watermarkAdvanced: false };
+  }
+
+  const limit = Math.max(1, Math.min(10_000, Math.floor(Number(batchSize) || DEFAULT_BATCH_SIZE)));
+  return runDbTransaction(db, async (tx) => {
+    // A45: only FULL compact correction roots are eligible. INCOMPLETE_HISTORY
+    // remains explicit evidence and open coverage has endedAt=NULL, so neither is
+    // destroyed merely because wall-clock retention elapsed.
+    const [responseRows, dialogRows, coverageRows] = await Promise.all([
+      tx.teamResponseCase.findMany({
+        where: { agencyId, projectionState: "FULL", replyAt: { lt: cutoff } },
+        select: { id: true }, orderBy: [{ replyAt: "asc" }, { id: "asc" }], take: limit,
+      }),
+      tx.teamDialogSession.findMany({
+        where: { agencyId, endedAt: { lt: cutoff } },
+        select: { id: true }, orderBy: [{ endedAt: "asc" }, { id: "asc" }], take: limit,
+      }),
+      tx.teamCoverageSession.findMany({
+        where: { agencyId, endedAt: { not: null, lt: cutoff } },
+        select: { id: true }, orderBy: [{ endedAt: "asc" }, { id: "asc" }], take: limit,
+      }),
+    ]);
+
+    const responseDelete = responseRows.length ? await tx.teamResponseCase.deleteMany({ where: { id: { in: responseRows.map((row) => row.id) } } }) : { count: 0 };
+    const dialogDelete = dialogRows.length ? await tx.teamDialogSession.deleteMany({ where: { id: { in: dialogRows.map((row) => row.id) } } }) : { count: 0 };
+    const coverageDelete = coverageRows.length ? await tx.teamCoverageSession.deleteMany({ where: { id: { in: coverageRows.map((row) => row.id) } } }) : { count: 0 };
+    const hasMore = responseRows.length >= limit || dialogRows.length >= limit || coverageRows.length >= limit;
+    let watermarkAdvanced = false;
+
+    // The retained boundary advances only when every eligible family returned a
+    // short page in this transaction. A crash therefore either keeps the old
+    // coverage boundary or commits both final compaction and the new boundary.
+    if (!hasMore) {
+      const current = await tx.teamProjectionCoverage.findUnique({ where: { agencyId } });
+      if (current) {
+        await tx.teamProjectionCoverage.update({
+          where: { agencyId },
+          data: {
+            responseCoverageFrom: maxDate(current.responseCoverageFrom, cutoff),
+            dialogCoverageFrom: maxDate(current.dialogCoverageFrom, cutoff),
+            source: "phase2_retention_vector_v3",
+          },
+        });
+      }
+      await tx.phase2WorkCoverage.updateMany({
+        where: {
+          agencyId,
+          family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR,
+          generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR,
+          active: true,
+          enumerationState: "COMPLETE",
+        },
+        data: { retainedFrom: cutoff },
+      });
+      watermarkAdvanced = true;
+    }
+
+    const deleted = Number(responseDelete?.count || 0) + Number(dialogDelete?.count || 0) + Number(coverageDelete?.count || 0);
+    return {
+      agencyId, deleted, hasMore, watermarkAdvanced,
+      responseDeleted: Number(responseDelete?.count || 0),
+      dialogDeleted: Number(dialogDelete?.count || 0),
+      coverageDeleted: Number(coverageDelete?.count || 0),
+      retainedFrom: watermarkAdvanced ? cutoff : null,
+    };
+  });
+}
+
+async function runTeamProjectionRetentionCompaction({ db = prisma, authorityNow = new Date(), detailDays = 180, batchSize = DEFAULT_BATCH_SIZE, agenciesPerBatch = TEAM_PROJECTION_RETENTION_AGENCIES_PER_BATCH } = {}) {
+  const correctionDays = Math.max(TEAM_PROVIDER_CORRECTION_HORIZON_DAYS, Math.max(1, Number(detailDays) || 180));
+  const cutoff = daysAgo(correctionDays, authorityNow);
+  return runMaintenanceLane({
+    db,
+    key: TEAM_PROJECTION_RETENTION_LANE_KEY,
+    generation: TEAM_PROJECTION_RETENTION_GENERATION,
+    oneTime: false,
+    minIntervalMs: 0,
+    fallbackNow: authorityNow,
+    work: async ({ claim, heartbeat }) => {
+      const cursorAgencyId = String(claim?.cursor?.agencyId || "").trim() || null;
+      const rows = await db.teamProjectionCoverage.findMany({
+        where: cursorAgencyId ? { agencyId: { gt: cursorAgencyId } } : {},
+        select: { agencyId: true },
+        orderBy: { agencyId: "asc" },
+        take: Math.max(1, Math.min(50, Math.floor(Number(agenciesPerBatch) || TEAM_PROJECTION_RETENTION_AGENCIES_PER_BATCH))),
+      });
+      if (!rows.length) {
+        return { complete: false, outcome: "CYCLE_COMPLETE", cursor: null, deleted: 0, agenciesScanned: 0, hasMore: false, retainedFrom: cutoff };
+      }
+
+      let deleted = 0;
+      let hasMore = false;
+      const details = [];
+      for (const row of rows) {
+        const item = await compactTeamProjectionAuthorityForAgency({ db, agencyId: row.agencyId, cutoff, batchSize });
+        deleted += Number(item?.deleted || 0);
+        if (item?.hasMore) hasMore = true;
+        details.push(item);
+        const renewed = await heartbeat({ cursor: { agencyId: row.agencyId }, progress: { deleted, agenciesScanned: details.length, retainedFrom: cutoff.toISOString() } });
+        if (!renewed?.renewed) throw Object.assign(new Error("TEAM_PROJECTION_RETENTION_OWNERSHIP_LOST"), { code: "MAINTENANCE_LANE_OWNERSHIP_LOST" });
+      }
+      return {
+        complete: false,
+        outcome: hasMore ? "PARTIAL" : "BATCH_COMPLETE",
+        cursor: { agencyId: rows[rows.length - 1].agencyId },
+        progress: { deleted, agenciesScanned: rows.length, retainedFrom: cutoff.toISOString() },
+        deleted, agenciesScanned: rows.length, hasMore, retainedFrom: cutoff, details,
+      };
+    },
+  });
 }
 
 async function runTeamActivityRetentionSweep(options = {}) {
@@ -507,6 +650,7 @@ async function runTeamActivityRetentionSweep(options = {}) {
   out.push(await deleteByIdsInBatches({
     model: prisma.teamActivityEvent,
     batchSize: cfg.batchSize,
+    maxBatches: 4,
     label: `teamActivityEvent.intermediate_${cfg.teamIntermediateDays}d`,
     orderBy: { ts: "asc" },
     where: {
@@ -518,6 +662,7 @@ async function runTeamActivityRetentionSweep(options = {}) {
   out.push(await deleteByIdsInBatches({
     model: prisma.teamActivityEvent,
     batchSize: cfg.batchSize,
+    maxBatches: 4,
     label: `teamActivityEvent.dialog_session_${cfg.teamSessionDays}d`,
     orderBy: { ts: "asc" },
     where: {
@@ -529,6 +674,7 @@ async function runTeamActivityRetentionSweep(options = {}) {
   out.push(await deleteByIdsInBatches({
     model: prisma.teamActivityEvent,
     batchSize: cfg.batchSize,
+    maxBatches: 4,
     label: `teamActivityEvent.claim_notices_${cfg.teamNoticeDays}d`,
     orderBy: { ts: "asc" },
     where: {
@@ -540,6 +686,7 @@ async function runTeamActivityRetentionSweep(options = {}) {
   out.push(await deleteByIdsInBatches({
     model: prisma.teamActivityEvent,
     batchSize: cfg.batchSize,
+    maxBatches: 4,
     label: `teamActivityEvent.audit_${cfg.teamAuditDays}d`,
     orderBy: { ts: "asc" },
     where: {
@@ -559,49 +706,41 @@ async function runTeamActivityRetentionSweep(options = {}) {
     },
   }));
 
-  // Canonical Team-v13 detail may be compacted only after the DB projection
-  // proved that the event was durably folded into TeamMemberActivityDaily.
-  // Missing/failed projection therefore fails closed by leaving the raw row.
+  // R15 vector-retention cutover: do not treat the old daily marker as proof
+  // that pending/response consumers no longer need raw evidence. Until the full
+  // consumer vector is projected, only activity-only v2 semantic contributions
+  // (broadcast/content) may lose raw payload. Message/incoming/seen/coverage raw
+  // remains fail-closed and is retired by the later vector-watermark generation.
   out.push(await deleteByIdsInBatches({
     model: prisma.teamActivityEvent,
     batchSize: cfg.batchSize,
-    label: `teamActivityEvent.canonical_projected_${cfg.teamCanonicalDetailDays}d`,
+    maxBatches: 4,
+    label: `teamActivityEvent.activity_only_v2_${cfg.teamCanonicalDetailDays}d`,
     orderBy: { ts: "asc" },
     where: {
       source: "electron_team_v13",
-      eventKind: { not: null },
-      historicalProjectionVersion: "team_activity_daily_v1",
+      eventKind: { in: ["BROADCAST_DISPATCH_CONFIRMED", "CONTENT_POST_PUBLISHED_CONFIRMED", "CONTENT_STORY_PUBLISHED_CONFIRMED"] },
+      historicalProjectionVersion: "team_activity_contribution_v2",
       historicalProjectedAt: { not: null },
       ts: { lt: daysAgo(cfg.teamCanonicalDetailDays, authorityNow) },
     },
   }));
 
-  // Response/dialog/coverage projections are exact detail authorities, not
-  // infinite historical aggregates. Keep them within the same explicit Team
-  // detail horizon as canonical event detail. Long-range product reads expose
-  // PARTIAL/AVAILABLE_FROM coverage instead of loading unbounded rows into RAM.
-  const projectionDetailCutoff = daysAgo(cfg.teamCanonicalDetailDays, authorityNow);
-  out.push(await deleteByIdsInBatches({
-    model: prisma.teamResponseCase,
-    batchSize: cfg.batchSize,
-    label: `teamResponseCase.detail_${cfg.teamCanonicalDetailDays}d`,
-    orderBy: { replyAt: "asc" },
-    where: { replyAt: { lt: projectionDetailCutoff } },
-  }));
-  out.push(await deleteByIdsInBatches({
-    model: prisma.teamDialogSession,
-    batchSize: cfg.batchSize,
-    label: `teamDialogSession.detail_${cfg.teamCanonicalDetailDays}d`,
-    orderBy: { startedAt: "asc" },
-    where: { startedAt: { lt: projectionDetailCutoff }, endedAt: { lt: projectionDetailCutoff } },
-  }));
-  out.push(await deleteByIdsInBatches({
-    model: prisma.teamCoverageSession,
-    batchSize: cfg.batchSize,
-    label: `teamCoverageSession.detail_${cfg.teamCanonicalDetailDays}d`,
-    orderBy: { startedAt: "asc" },
-    where: { startedAt: { lt: projectionDetailCutoff }, endedAt: { lt: projectionDetailCutoff } },
-  }));
+  // R15/A45 retention vector: compact projection roots are retired only behind
+  // completed response-repair coverage and a correction-horizon retained watermark.
+  // The lane is cursor-fair across agencies and every agency performs one bounded
+  // delete unit; open/incomplete evidence is preserved.
+  const projectionCompaction = await runTeamProjectionRetentionCompaction({
+    db: options.db || prisma, authorityNow, detailDays: cfg.teamCanonicalDetailDays, batchSize: cfg.batchSize,
+  });
+  out.push({
+    label: "teamProjection.compact_v3",
+    deleted: Number(projectionCompaction?.deleted || 0),
+    hasMore: projectionCompaction?.hasMore === true,
+    skipped: projectionCompaction?.skipped === true,
+    reason: projectionCompaction?.reason || null,
+    retainedFrom: projectionCompaction?.retainedFrom || null,
+  });
 
   return summarizeSweep("teamActivityEvent", out);
 }
@@ -699,6 +838,7 @@ async function runTeamLedgerRetentionSweep(options = {}) {
     gcTeamLedgers({
       now: authorityNow,
       olderThanMs: cfg.teamMoneyRawDetailDays * DAY_MS,
+      limit: cfg.batchSize,
     }),
     purgeExpiredTipLedger({
       retentionDays: cfg.teamMoneyRawDetailDays,
@@ -709,9 +849,11 @@ async function runTeamLedgerRetentionSweep(options = {}) {
   ]);
   const items = [
     { label: "teamSentMessageLedger", deleted: Number(result?.sentMessageLedger || 0) },
+    { label: "teamSentMessageLedger.compacted", deleted: 0, compacted: Number(result?.sentMessageLedgerCompacted || 0), hasMore: Boolean(result?.hasMore) },
     { label: "teamPpvPurchaseLedger", deleted: Number(result?.ppvPurchaseLedger || 0) },
+    { label: "teamPpvPurchaseLedger.compacted", deleted: 0, compacted: Number(result?.ppvPurchaseLedgerCompacted || 0) },
     { label: "teamPpvResolveJob", deleted: Number(result?.ppvResolveJob || 0) },
-    { label: "teamTipLedger", deleted: Number(tipResult?.deleted || 0) },
+    { label: "teamTipLedger", deleted: Number(tipResult?.deleted || 0), compacted: Number(tipResult?.compacted || 0), hasMore: Boolean(tipResult?.hasMore) },
   ];
   return summarizeSweep("teamLedgers", items);
 }
@@ -1223,9 +1365,11 @@ async function runRetentionSweep(options = {}) {
         laneErrors.push({ lane: name, error: message });
       }
     });
+    const remainingWork = Object.values(laneResults).some((lane) => lane?.hasMore === true);
     report = {
       ok: laneErrors.length === 0,
       partial: laneErrors.length > 0 && laneErrors.length < lanes.length,
+      remainingWork,
       elapsedMs: Date.now() - startedAt,
       totalDeleted,
       ...laneResults,
@@ -1243,7 +1387,7 @@ async function runRetentionSweep(options = {}) {
   } finally {
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     if (useCoordination && lease?.acquired) {
-      const outcome = thrown ? "FAILED" : report?.ok ? "COMPLETE" : "PARTIAL";
+      const outcome = thrown ? "FAILED" : (report?.ok && report?.remainingWork !== true) ? "COMPLETE" : "PARTIAL";
       try {
         const finalized = await finalizeRetentionSweepLease({ db: prisma, ownerToken: lease.ownerToken, outcome, error: thrown || (report?.laneErrors?.length ? JSON.stringify(report.laneErrors) : null) });
         if (finalized !== true && report) {
@@ -1263,7 +1407,8 @@ async function runRetentionSweep(options = {}) {
 
 function summarizeSweep(label, items) {
   const totalDeleted = items.reduce((sum, item) => sum + Number(item?.deleted || 0), 0);
-  return { label, totalDeleted, items };
+  const hasMore = items.some((item) => item?.hasMore === true);
+  return { label, totalDeleted, hasMore, items };
 }
 
 module.exports = {
@@ -1286,4 +1431,6 @@ module.exports = {
   claimRetentionSweepLease,
   renewRetentionSweepLease,
   finalizeRetentionSweepLease,
+  compactTeamProjectionAuthorityForAgency,
+  runTeamProjectionRetentionCompaction,
 };

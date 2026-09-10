@@ -167,7 +167,7 @@ test("fan incoming opens an unassigned pending dialog; trusted seen assigns curr
   assert.equal(fx.states[0].ownerMemberId, "member-a", "reconciliation can see already durable trusted seen evidence");
   assert.equal(fx.states[0].incomingCount, 1);
   assert.equal(fx.states[0].firstIncomingMessageId, "of-in-1");
-  assert.equal(fx.activity[0].pendingProjectionVersion, "team_pending_v1");
+  assert.equal(fx.activity[0].pendingProjectionVersion, "team_pending_v2");
 });
 
 test("same OF incoming observed on two devices counts once by canonical messageId", async () => {
@@ -224,7 +224,7 @@ test("late-arriving incoming telemetry cannot reopen an episode that a durable m
   });
   await service.applyTeamPendingProjection(inc, fx.db);
   assert.equal(fx.states.length, 0, "latest manual reply is the durable episode boundary");
-  assert.equal(fx.activity[0].pendingProjectionVersion, "team_pending_v1");
+  assert.equal(fx.activity[0].pendingProjectionVersion, "team_pending_v2");
 });
 
 test("historical backfill groups raw events by dialog and marks durable progress", async () => {
@@ -241,7 +241,7 @@ test("historical backfill groups raw events by dialog and marks durable progress
   assert.equal(fx.states.length, 1);
   assert.equal(fx.states[0].incomingCount, 2);
   assert.equal(fx.states[0].ownerMemberId, "member-a");
-  assert.ok(fx.activity.every((row) => row.pendingProjectionVersion === "team_pending_v1"));
+  assert.ok(fx.activity.every((row) => row.pendingProjectionVersion === "team_pending_v2"));
 
   const second = await service.backfillTeamPendingProjectionBatch({ db: fx.db, limit: 100 });
   assert.equal(second.selected, 0, "projection cursor is stored on raw facts; no endless rescan");
@@ -265,4 +265,35 @@ test("rolling deploy before pending migration keeps raw event unprojected for la
   assert.equal(result.skipped, true);
   assert.equal(result.reason, "pending_projection_models_unavailable");
   assert.equal(marked, 0, "raw row must remain eligible for later backfill");
+});
+
+
+test("open pending survives raw-detail retention instead of becoming a false CLEAR", async () => {
+  const inc = incoming("in-retained", "2026-01-01T09:00:00.000Z", "of-retained");
+  const fx = makeDb({ events: [inc] });
+  await service.applyTeamPendingProjection(inc, fx.db);
+  assert.equal(fx.states[0].status, "PENDING");
+  assert.equal(fx.states[0].incomingCount, 1);
+
+  // Detail TTL removes the raw incoming while the compact current episode survives.
+  fx.activity.splice(0, fx.activity.length);
+  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: fx.db });
+  assert.equal(result.status, "PENDING");
+  assert.equal(result.incompleteHistory, true);
+  assert.equal(fx.states[0].projectionState, "INCOMPLETE_HISTORY");
+  assert.equal(fx.states[0].replyAt, null);
+  assert.equal(fx.states[0].incomingCount, 1, "compact pending evidence is preserved");
+});
+
+test("pending reconciliation takes the dialog fence before reading projection inputs", async () => {
+  const calls = [];
+  const fx = makeDb({ events: [incoming("in-lock", "2026-08-12T09:00:00.000Z", "of-lock")] });
+  const originalFindFirst = fx.db.teamSentMessageLedger.findFirst;
+  fx.db.teamSentMessageLedger.findFirst = async (args) => { calls.push("read"); return originalFindFirst(args); };
+  fx.db.$executeRawUnsafe = async () => { calls.push("lock"); return 1; };
+  fx.db.$transaction = async (work) => work(fx.db);
+
+  await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: fx.db });
+  assert.equal(calls[0], "lock");
+  assert.ok(calls.includes("read"));
 });

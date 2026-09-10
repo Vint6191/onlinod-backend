@@ -353,3 +353,20 @@ test("Audit15 accessEpoch change between batch events fences remaining stale tel
   assert.equal(rows.length, 1);
   assert.equal(rows[0].localId, "epoch-first");
 });
+
+test("A37 provider replay outside admission horizon is rejected instead of re-timestamped and recounted", async () => {
+  const { service, rows } = loadService();
+  const result = await ingest(service, [canonical({
+    localId: "late-replay-new-local-id",
+    occurredAt: "2025-01-01T00:00:00.000Z",
+    messageId: "old-confirmed-message",
+    sourceDetail: "creator_runtime_cdp",
+  })]);
+
+  assert.equal(result.inserted, 0);
+  assert.equal(result.duplicated, 0);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.rejectedByReason.provider_event_outside_admission_horizon, 1);
+  assert.deepEqual(result.rejectedEvents, [{ localId: "late-replay-new-local-id", reason: "provider_event_outside_admission_horizon" }]);
+  assert.equal(rows.length, 0, "outside-horizon provider evidence must not become a DB-receipt-time current event");
+});

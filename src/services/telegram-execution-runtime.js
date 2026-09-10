@@ -87,7 +87,7 @@ async function eligibleTelegramExecutionAccounts({ agencyId, member, db, include
   // submissions and confirmed model-instruction receipts are cold evidence after the one-time
   // backfill. During an incomplete cutover we fail closed instead of silently returning to an
   // O(history) account-discovery scan.
-  if (!(await providerOperationalBackfillReady({ db }))) {
+  if (!(await providerOperationalBackfillReady({ db, agencyId }))) {
     throw fail("TELEGRAM_PROVIDER_OPERATIONAL_BACKFILL_INCOMPLETE", "Telegram provider current-work backfill is not complete", 503);
   }
   const currentSources = await listCurrentIncompleteSourceAccountsForCreators({ agencyId, creatorIds, db });

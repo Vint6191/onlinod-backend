@@ -7,6 +7,33 @@ const { normalizeTelegramUserId, setCreatorTelegramUserId } = require("./creator
 const fs = require("node:fs");
 const path = require("node:path");
 
+const owner = { id: "owner-1", userId: "user-owner", agencyId: "agency_1", role: "OWNER", roleKey: "owner", permissions: { "creators.manage": true }, assignedCreators: "all", accessEpoch: 1 };
+
+function identityDb({ contact = "@model", updateCount = 1 } = {}) {
+  const creator = { id: "creator_1", agencyId: "agency_1", deletedAt: null, status: "READY", telegramContact: contact, telegramUserId: null };
+  const updates = [];
+  const db = {
+    agency: { async findUnique({ where }) { return where.id === "agency_1" ? { id: "agency_1", deletedAt: null, status: "ACTIVE" } : null; } },
+    agencyMember: { async findFirst({ where }) { return (!where.id || where.id === owner.id) && (!where.userId || where.userId === owner.userId) ? { ...owner, deletedAt: null, deactivatedAt: null } : null; } },
+    creatorAccount: {
+      async updateMany({ where, data }) {
+        updates.push({ where, data });
+        if (updateCount !== 1 || where.id !== creator.id || where.agencyId !== creator.agencyId || where.telegramContact !== creator.telegramContact) return { count: 0 };
+        Object.assign(creator, data);
+        return { count: 1 };
+      },
+      async findFirst({ where, select }) {
+        if (where.id !== creator.id || where.agencyId !== creator.agencyId) return null;
+        if (select) { const out = {}; for (const [k,v] of Object.entries(select)) if (v) out[k] = creator[k]; return out; }
+        return { ...creator };
+      },
+    },
+    async $transaction(work) { return work(db); },
+    _updates: updates,
+  };
+  return db;
+}
+
 test("Creator Telegram identity has an additive backend column and agency lookup index", () => {
   const root = path.join(__dirname, "..", "..");
   const schema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
@@ -29,42 +56,28 @@ test("Telegram user id normalization preserves 64-bit ids as strings", () => {
 });
 
 test("resolved Telegram user id is atomically bound only while the resolved contact still matches", async () => {
-  const updates = [];
-  const db = {
-    creatorAccount: {
-      updateMany: async ({ where, data }) => {
-        updates.push({ where, data });
-        return { count: where.id === "creator_1" && where.telegramContact === "@model" ? 1 : 0 };
-      },
-      findFirst: async ({ where }) => where.id === "creator_1"
-        ? { id: "creator_1", telegramContact: "@model", telegramUserId: "999999999999999999" }
-        : null,
-    },
-  };
+  const db = identityDb();
   const result = await setCreatorTelegramUserId({
     agencyId: "agency_1",
+    actorMember: owner,
     creatorId: "creator_1",
     telegramUserId: "999999999999999999",
     expectedTelegramContact: "@model",
     db,
   });
   assert.equal(result.telegramUserId, "999999999999999999");
-  assert.deepEqual(updates[0], {
+  assert.deepEqual(db._updates[0], {
     where: { id: "creator_1", agencyId: "agency_1", deletedAt: null, telegramContact: "@model" },
     data: { telegramUserId: "999999999999999999" },
   });
 });
 
 test("resolved Telegram identity is rejected if the model contact changed during resolution", async () => {
-  const db = {
-    creatorAccount: {
-      updateMany: async () => ({ count: 0 }),
-      findFirst: async () => ({ id: "creator_1", telegramContact: "@new_model" }),
-    },
-  };
+  const db = identityDb({ contact: "@new_model", updateCount: 0 });
   await assert.rejects(
     () => setCreatorTelegramUserId({
       agencyId: "agency_1",
+      actorMember: owner,
       creatorId: "creator_1",
       telegramUserId: "123",
       expectedTelegramContact: "@old_model",

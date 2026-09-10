@@ -151,7 +151,7 @@ test("first execution-profile pin and both mutable defaults share one commit-ord
     "relay-recipient publication must join the same fence before its workspace write");
 });
 
-test("super-admin hard creator delete purges non-FK Telegram provider ledgers before the Creator cascade", () => {
+test("super-admin hard creator delete preserves blockers, captures exact Phase2 scope, then removes residual work after the Creator cascade", () => {
   const admin = source("routes/admin.js");
   const routeStart = admin.indexOf('router.delete("/creators/:id"');
   const routeEnd = admin.indexOf("// ════════════════════════════════════════════════════════════\n// DEVICES", routeStart);
@@ -161,20 +161,17 @@ test("super-admin hard creator delete purges non-FK Telegram provider ledgers be
   const block = route.slice(hardAt, softAt);
   const customFence = block.indexOf("assertCreatorCustomPipelineRetirable");
   const massFence = block.indexOf("assertCreatorMassCampaignRetirable");
-  const orderScan = block.indexOf("customOrder.findMany");
-  const intentPurge = block.indexOf("telegramDeliveryIntent.deleteMany");
-  const inboundPurge = block.indexOf("telegramInboundEvent.deleteMany");
+  const scopeCapture = block.indexOf("collectCreatorPhase2DestructiveScope");
   const creatorDelete = block.indexOf("creatorAccount.delete");
+  const residualPurge = block.indexOf("purgeCreatorPhase2ResidualsForHardDelete");
   assert.ok(customFence >= 0, "hard delete must refuse active/unknown Custom external-write authority before destructive cascade");
   assert.ok(massFence > customFence, "Custom and MASS future-effect authorities must both converge before destructive cascade");
-  assert.ok(orderScan > massFence, "provider ledgers may be purged only after both external-write authorities are retirable");
-  assert.ok(intentPurge > orderScan, "Telegram delivery ledger must be purged explicitly");
-  assert.ok(inboundPurge > intentPurge, "Telegram inbound ledger must be purged explicitly");
-  assert.ok(creatorDelete > inboundPurge, "provider ledgers must be purged before CreatorAccount cascade");
-  assert.match(block, /customOrderId:\s*\{\s*in:\s*hardOrderIds\s*\}/);
+  assert.ok(scopeCapture > massFence, "non-FK destructive scope may be captured only after both unknown-effect guards");
+  assert.ok(creatorDelete > scopeCapture, "canonical Creator cascade starts only after guarded exact-scope capture");
+  assert.ok(residualPurge > creatorDelete, "provider/work cleanup must run after Creator cascade so DELETE-trigger work is also removed");
 });
 
-test("super-admin hard Agency delete atomically purges non-FK Telegram ledgers with the Agency cascade", () => {
+test("super-admin hard Agency delete atomically purges all Phase2 provider ledgers after blockers and before Agency cascade", () => {
   const admin = source("routes/admin.js");
   const routeStart = admin.indexOf('router.delete("/agencies/:id"');
   const routeEnd = admin.indexOf('router.post("/agencies/:id/restore"', routeStart);
@@ -185,10 +182,9 @@ test("super-admin hard Agency delete atomically purges non-FK Telegram ledgers w
   assert.match(block, /prisma\.\$transaction\s*\(\s*async\s*\(tx\)/);
   const customFence = block.indexOf("assertAgencyCustomPipelineRetirable");
   const massFence = block.indexOf("assertAgencyMassCampaignRetirable");
-  const intentPurge = block.indexOf("telegramDeliveryIntent.deleteMany");
-  const inboundPurge = block.indexOf("telegramInboundEvent.deleteMany");
+  const providerPurge = block.indexOf("purgeAgencyPhase2ProviderLedgersForHardDelete");
   const agencyDelete = block.indexOf("tx.agency.delete");
   assert.ok(customFence >= 0 && massFence > customFence, "hard Agency delete must converge Custom then MASS future-effect authority before history destruction");
-  assert.ok(intentPurge > massFence && inboundPurge > intentPurge && agencyDelete > inboundPurge);
-  assert.match(block, /where:\s*\{\s*agencyId:\s*before\.id\s*\}/);
+  assert.ok(providerPurge > massFence, "provider-ledger purge must remain behind every unknown-effect blocker");
+  assert.ok(agencyDelete > providerPurge, "provider purge and Agency cascade must share one transaction in rollback-safe order");
 });

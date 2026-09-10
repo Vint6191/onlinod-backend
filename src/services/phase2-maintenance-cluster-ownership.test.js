@@ -14,52 +14,72 @@ function functionBlock(name, nextName) {
   return scheduler.slice(start, end > start ? end : undefined);
 }
 
-test("Phase2 maintenance ownership: Telegram inbound is a cluster-owned bounded lane", () => {
+test("Phase2 maintenance ownership: Telegram inbound uses revisioned DomainWork with bounded receipt continuation", () => {
   const direct = functionBlock("runTelegramInboundProjectionSweep", "runTelegramInboundProjectionMaintenanceSweep");
   const lane = functionBlock("runTelegramInboundProjectionMaintenanceSweep", "runTelegramConfirmedProjectionSweep");
-  assert.match(direct, /retryPendingInboundProjections\(\{[\s\S]*limit:\s*TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE[\s\S]*db,/);
-  assert.match(lane, /runMaintenanceLane\(\{/);
-  assert.match(lane, /TELEGRAM_INBOUND_MAINTENANCE_LANE_KEY/);
+  assert.match(direct, /claimDomainWorkBatch\(\{[\s\S]*PHASE2_WORK_CLASS\.TELEGRAM_INBOUND_PROJECTION/);
+  assert.match(direct, /perAgencyQuantum:\s*5/);
+  assert.match(direct, /perPartitionQuantum:\s*1/);
+  assert.match(direct, /reconcilePendingInboundForConfirmedDelivery/);
+  assert.match(direct, /yieldDomainWorkClaim/);
+  assert.match(direct, /progressCursor:\s*\{\s*lastInboundEventId/);
   assert.match(lane, /runTelegramInboundProjectionSweep\(\{ now, db \}\)/);
+  assert.doesNotMatch(lane, /runMaintenanceLane/, "DomainWork claim is the distributed execution authority");
 });
 
-test("Phase2 maintenance ownership: Telegram/custom convergence is paged by durable Agency cursor", () => {
+test("Phase2 maintenance ownership: confirmed Telegram projection uses exact DomainWork; history is separate per-agency enumeration", () => {
   const direct = functionBlock("runTelegramConfirmedProjectionSweep", "runTelegramConfirmedProjectionMaintenanceSweep");
   const lane = functionBlock("runTelegramConfirmedProjectionMaintenanceSweep", "maybeBackfillTeamPendingProjection");
-  assert.match(direct, /db\.agency\.findMany\(\{/);
-  assert.match(direct, /id:\s*\{\s*gt:\s*normalizedCursor\s*\}/);
-  assert.match(direct, /take:\s*size/);
-  assert.doesNotMatch(direct, /scanAllById/);
-  assert.match(direct, /repairConfirmedTelegramDeliveryProjections\(\{ agencyId, now, db \}\)/);
-  assert.match(direct, /repairCustomModelCommunicationConvergence\(\{ agencyId, now, db \}\)/);
-  assert.match(lane, /claim\?\.cursor\?\.lastAgencyId/);
-  assert.match(lane, /cursor:\s*\{\s*lastAgencyId:/);
-  assert.match(lane, /modelCommunicationCurrentBacklog/);
-  assert.match(lane, /retryFast \? 1_000 : RECURRING_INTERVAL_MS/);
+  const history = functionBlock("runTelegramConfirmedCoverageEnumerationUnit", "runTelegramInboundCoverageEnumerationUnit");
+  assert.match(direct, /claimDomainWorkBatch\(\{[\s\S]*PHASE2_WORK_CLASS\.TELEGRAM_CONFIRMED_PROJECTION/);
+  assert.match(direct, /repairConfirmedTelegramDeliveryProjectionItem/);
+  assert.doesNotMatch(direct, /db\.agency\.findMany|repairCustomModelCommunicationConvergence/);
+  assert.match(history, /agencyId:\s*String\(item\.agencyId\)/);
+  assert.match(history, /id:\s*\{\s*gt:\s*cursor\s*\}/);
+  assert.match(history, /take:\s*100/);
+  assert.match(history, /publishDomainWork/);
+  assert.match(history, /yieldDomainWorkClaim/);
+  assert.match(lane, /runTelegramConfirmedProjectionSweep\(\{ now, db \}\)/);
+  assert.doesNotMatch(lane, /runMaintenanceLane/);
 });
 
-test("Phase2 maintenance ownership: Team money is cluster-owned and drains backlog without hourly starvation", () => {
-  const lane = functionBlock("maybeReconcileHistoricalTeamMoney", "maybeBackfillProviderOperationalDebt");
-  assert.match(lane, /runMaintenanceLane\(\{/);
-  assert.match(lane, /TEAM_MONEY_MAINTENANCE_LANE_KEY/);
-  assert.match(lane, /reconcileHistoricalTeamMoneyWork\(\{ db \}\)/);
-  assert.match(lane, /likelyMore/);
-  assert.match(lane, /likelyMore \? 1_000 : RECURRING_INTERVAL_MS/);
+test("Phase2 maintenance ownership: Team money current execution is DomainWork and history is per-agency coverage", () => {
+  const compatibility = functionBlock("maybeReconcileHistoricalTeamMoney", "publishCoverageEnumerationWork");
+  const current = functionBlock("runTeamMoneyReconciliationSweep", "runTeamReadSummarySweep");
+  const history = functionBlock("runTeamMoneyReconciliationCoverageEnumerationUnit", "runTeamReadSummaryCoverageEnumerationUnit");
+  assert.match(compatibility, /maybeSeedPhase2CoverageWork/);
+  assert.match(compatibility, /maybeRunPhase2HistoricalEnumeration/);
+  assert.doesNotMatch(compatibility, /runMaintenanceLane|reconcileHistoricalTeamMoneyBatch/);
+  assert.match(current, /claimDomainWorkBatch\(\{[\s\S]*PHASE2_WORK_CLASS\.TEAM_MONEY_RECONCILIATION/);
+  assert.match(current, /repairTeamMoneyReconciliationWorkItem/);
+  assert.match(current, /ackDomainWorkClaim/);
+  assert.match(history, /agencyId/);
+  assert.match(history, /take:\s*100/);
+  assert.match(history, /publishDomainWork/);
+  assert.match(history, /yieldDomainWorkClaim/);
 });
 
 
-test("Phase2 maintenance ownership: Team pending projection drains a full bounded batch promptly", () => {
-  const lane = functionBlock("maybeBackfillTeamPendingProjection", "maybeRepairLegacyTeamPendingBootstrap");
-  assert.match(lane, /TEAM_PENDING_PROJECTION_LANE_KEY/);
-  assert.match(lane, /selected >= TEAM_PENDING_BACKFILL_BATCH_SIZE/);
-  assert.match(lane, /likelyMore \? 1_000 : RECURRING_INTERVAL_MS/);
-  assert.match(lane, /PENDING_PROJECTION_BACKLOG_CONTINUES/);
+test("Phase2 maintenance ownership: Team dialog projection is exact current work and bounded historical enumeration", () => {
+  const compatibility = functionBlock("maybeBackfillTeamPendingProjection", "maybeRepairLegacyTeamPendingBootstrap");
+  const current = functionBlock("runTeamDialogProjectionSweep", "runTeamResponseRangeRepairSweep");
+  const history = functionBlock("runTeamDialogCoverageEnumerationUnit", "runTeamMoneyRootClassificationUnit");
+  assert.match(compatibility, /runTeamDialogProjectionSweep\(\{ db, now \}\)/);
+  assert.doesNotMatch(compatibility, /runMaintenanceLane|TEAM_PENDING_PROJECTION_LANE_KEY/);
+  assert.match(current, /claimDomainWorkBatch\(\{[\s\S]*TEAM_DIALOG_PROJECTION/);
+  assert.match(current, /projectCreatorDialogWorkItem/);
+  assert.match(history, /listUnprojectedRelevantDialogEvents/);
+  assert.match(history, /limit:\s*100/);
+  assert.match(history, /limit:\s*25/);
+  assert.match(history, /yieldDomainWorkClaim/);
 });
 
 test("Phase2 maintenance pump owns distributed lanes; process-local promises are overlap optimization only", () => {
   const pump = functionBlock("runPhase2MaintenancePump", "runRecurringSweepInternal");
   assert.match(pump, /runTelegramConfirmedProjectionMaintenanceSweep\(\{ now, db \}\)/);
-  assert.match(pump, /maybeReconcileHistoricalTeamMoney\(\{ db, now \}\)/);
+  assert.match(pump, /runTeamMoneyReconciliationSweep\(\{ now, db \}\)/);
+  assert.match(pump, /runTeamReadSummarySweep\(\{ now, db \}\)/);
+  assert.match(pump, /maybeBackfillTeamPendingProjection\(\{ db, now \}\)/);
   assert.match(pump, /runTelegramInboundProjectionMaintenanceSweep\(\{ now, db \}\)/);
   assert.match(pump, /maybeBackfillProviderOperationalDebt\(\{ db, now \}\)/);
   assert.match(pump, /maybeRepairProviderOperationalDirty\(\{ db, now \}\)/);

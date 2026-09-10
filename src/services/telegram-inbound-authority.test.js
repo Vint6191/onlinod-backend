@@ -53,11 +53,12 @@ function fixture({ projectedIdentity = false }={}) {
       async findFirst({where}){return clone(matches(account,where)?account:null);},
       async findMany({where}){return matches(account,where)?[{id:account.id,lifecycleState:account.lifecycleState}]:[];},
     },
-    maintenanceLaneState:{
+    phase2WorkCoverage:{
       async findUnique({where}){
-        if(where.key==="provider_operational_debt_backfill_v1") return {key:where.key,generation:"provider_operational_debt_v1",completedAt:new Date(now.getTime()-1000)};
-        if(where.key==="custom_external_proof_backfill_v1") return {key:where.key,generation:"custom_external_proof_backfill_v1",completedAt:new Date(now.getTime()-1000)};
-        return null;
+        const key=where?.agencyId_family_generation;
+        if(!key||String(key.agencyId)!=="agency-1")return null;
+        if(!["PROVIDER_OPERATIONAL","CUSTOM_EXTERNAL_PROJECTION"].includes(String(key.family)))return null;
+        return {...key,active:true,enumerationState:"COMPLETE",completedAt:new Date(now.getTime()-1000)};
       },
     },
     providerOperationalDebt:{
@@ -206,6 +207,46 @@ test("late confirmed recipient receipt promotes a durable unresolved inbound eve
   assert.equal(fx.events[0].creatorId,"creator-1");
   assert.equal(fx.events[0].customOrderId,"order-1");
   assert.equal(fx.orders[0].telegramLastModelMessageId,906);
+});
+
+test("confirmed receipt reconciliation is a bounded resumable keyset page instead of a synchronous tenant walk",async()=>{
+  const fx=fixture({projectedIdentity:true});
+  fx.events.length=0;
+  for(let i=0;i<205;i+=1){
+    fx.events.push({
+      id:`bulk-${String(i).padStart(4,"0")}`,agencyId:"agency-1",accountId:"tg-1",creatorId:null,customOrderId:null,submissionId:null,
+      senderTelegramUserId:"900001",messageId:20000+i,replyToMessageId:null,groupedId:null,hasMedia:false,text:null,
+      sentAt:new Date(fx.now.getTime()+i),observedAt:new Date(fx.now.getTime()+i),projectionState:"PENDING",projectionReason:"CREATOR_UNRESOLVED",
+      projectionAttempts:0,projectedAt:null,createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
+    });
+  }
+  const first=await reconcilePendingInboundForConfirmedDelivery({
+    agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",
+    now:new Date(fx.now.getTime()+1000),limit:100,db:fx.db,
+  });
+  assert.equal(first.scanned,100);
+  assert.equal(first.hasMore,true);
+  assert.equal(first.scanComplete,false);
+  assert.equal(first.nextCursor,"bulk-0099");
+  assert.equal(fx.events.filter((row)=>row.projectionState==="PENDING").length,105);
+
+  const second=await reconcilePendingInboundForConfirmedDelivery({
+    agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",
+    now:new Date(fx.now.getTime()+2000),limit:100,cursor:first.nextCursor,db:fx.db,
+  });
+  assert.equal(second.scanned,100);
+  assert.equal(second.hasMore,true);
+  assert.equal(second.nextCursor,"bulk-0199");
+
+  const third=await reconcilePendingInboundForConfirmedDelivery({
+    agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",
+    now:new Date(fx.now.getTime()+3000),limit:100,cursor:second.nextCursor,db:fx.db,
+  });
+  assert.equal(third.scanned,5);
+  assert.equal(third.hasMore,false);
+  assert.equal(third.scanComplete,true);
+  assert.equal(third.nextCursor,null);
+  assert.equal(fx.events.every((row)=>row.projectionState==="SKIPPED"),true);
 });
 
 test("late manual confirmation without recipient identity still repairs an unresolved direct Reply by remote message id",async()=>{
@@ -1000,4 +1041,27 @@ test("commit-time Telegram inbound human resolution rejects a stale management a
     (error)=>error?.code==="CUSTOM_MANAGEMENT_ACCESS_STALE"&&error?.status===409,
   );
   assert.equal(fx.events.find((row)=>row.id==="review-stale-access").projectionState,"REVIEW_REQUIRED");
+});
+
+test("R9 inbound review queue has a hard scan budget and honest continuation through inaccessible rows", async () => {
+  const fx = fixture();
+  for (let i = 1; i <= 1200; i += 1) {
+    seedReview(fx, {
+      id: `hidden-review-${String(i).padStart(4, "0")}`,
+      creatorId: "creator-hidden",
+      senderTelegramUserId: `hidden-${i}`,
+      replyToMessageId: null,
+      messageId: 30000 + i,
+      observedAt: new Date(fx.now.getTime() + i),
+      projectedAt: new Date(fx.now.getTime() + i),
+    });
+  }
+  const scoped = { ...fx.member, role: "CHATTER", roleKey: "chatter", assignedCreators: ["creator-1"], permissions: { ...(fx.member.permissions || {}), "team.analytics.view": true, "content.review_customs": true } };
+  const result = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: scoped, limit: 50, now: fx.now, db: fx.db });
+  assert.equal(result.items.length, 0);
+  assert.equal(result.scannedRows, 500);
+  assert.equal(result.scanBudget, 500);
+  assert.equal(result.scanComplete, false);
+  assert.equal(result.hasMore, true);
+  assert.equal(result.nextCursor, "hidden-review-0500");
 });

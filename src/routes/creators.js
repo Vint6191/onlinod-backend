@@ -388,6 +388,7 @@ router.patch("/:id/telegram-contact", creatorManagementRequired, creatorAccessRe
     const input = telegramContactSchema.parse(req.body);
     const creator = await updateCreatorTelegramContact({
       agencyId: req.auth.agencyId,
+      actorMember: req.auth.membership,
       actorUserId: req.auth.userId,
       creatorId: req.params.id,
       telegramContact: input.telegramContact,
@@ -417,6 +418,7 @@ router.patch("/:id/telegram-identity", creatorManagementRequired, creatorAccessR
 
     const creator = await setCreatorTelegramUserId({
       agencyId: req.auth.agencyId,
+      actorMember: req.auth.membership,
       creatorId: before.id,
       telegramUserId: input.telegramUserId,
       expectedTelegramContact: input.telegramContact,

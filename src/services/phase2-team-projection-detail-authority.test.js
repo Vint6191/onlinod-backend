@@ -30,11 +30,13 @@ test("all-range response/dialog detail is bounded by retained horizon and report
   assert.equal(authority.dialogCoverage.status, "AVAILABLE_FROM");
 });
 
-test("retention owns exact Team response/dialog/coverage projection detail horizon", () => {
+test("retention preserves incomplete/open correction authority and advances retained coverage only through vector compaction", () => {
   const source = fs.readFileSync(path.join(__dirname, "retention-service.js"), "utf8");
-  assert.match(source, /model: prisma\.teamResponseCase[\s\S]*?replyAt: \{ lt: projectionDetailCutoff \}/);
-  assert.match(source, /model: prisma\.teamDialogSession[\s\S]*?endedAt: \{ lt: projectionDetailCutoff \}/);
-  assert.match(source, /model: prisma\.teamCoverageSession[\s\S]*?endedAt: \{ lt: projectionDetailCutoff \}/);
+  assert.match(source, /projectionState:\s*"FULL"/);
+  assert.match(source, /endedAt:\s*\{ not:\s*null, lt:\s*cutoff \}/);
+  assert.match(source, /TEAM_PROVIDER_CORRECTION_HORIZON_DAYS = 366/);
+  assert.match(source, /responseCoverageFrom:\s*maxDate/);
+  assert.match(source, /dialogCoverageFrom:\s*maxDate/);
 });
 
 test("all Team detail APIs and schedule use the shared historical range authority", () => {

@@ -42,7 +42,8 @@ function purchaseIdentity(sale) {
 }
 
 function manualResolutionPreserved(row) {
-  return String(row?.resolvedSource || "").startsWith(MANAGER_SOURCE_PREFIX);
+  return row?.migrationBaselineProtected === true
+    || String(row?.resolvedSource || "").startsWith(MANAGER_SOURCE_PREFIX);
 }
 
 function candidateFromPurchase(row) {
@@ -116,7 +117,62 @@ async function findExactSentMessage(db, sale) {
   });
 }
 
-async function findExistingPurchase(db, { sale, purchaseId, fanExternalId }) {
+async function recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTransactionId = null }) {
+  if (!db?.teamMoneyAttributionFact?.findMany || !db?.teamPpvPurchaseLedger?.create) return null;
+  const or = [{ creatorSaleId: sale.id }];
+  if (financialTransactionId) or.push({ financialTransactionId });
+  if (purchaseId) or.push({ externalId: purchaseId });
+  const facts = await db.teamMoneyAttributionFact.findMany({
+    where: { agencyId: sale.agencyId, sourceType: "PPV", OR: or },
+    orderBy: [{ sourceUpdatedAt: "desc" }, { id: "asc" }], take: 3,
+  });
+  const roots = [...new Set((facts || []).map((f) => clean(f.rootId || f.sourceRowId, 220)).filter(Boolean))];
+  if (roots.length === 0) return null;
+  if (roots.length !== 1) {
+    const error = new Error("Multiple durable PPV fact generations require migration adjudication");
+    error.code = "TEAM_MONEY_ROOT_MIGRATION_AMBIGUOUS";
+    throw error;
+  }
+  const fact = facts.find((f) => clean(f.rootId || f.sourceRowId, 220) === roots[0]) || facts[0];
+  const rootId = roots[0];
+  const existingById = db.teamPpvPurchaseLedger.findUnique
+    ? await db.teamPpvPurchaseLedger.findUnique({ where: { id: rootId } })
+    : null;
+  if (existingById) return existingById;
+  try {
+    return await db.teamPpvPurchaseLedger.create({ data: {
+      id: rootId,
+      agencyId: sale.agencyId,
+      accountId: clean(fact.creatorId || sale.creatorId, 160) || sale.creatorId,
+      creatorId: clean(fact.creatorId || sale.creatorId, 160) || sale.creatorId,
+      purchaseId: clean(fact.externalId || purchaseId || `recovered:${fact.id}`, 220),
+      messageId: clean(sale.messageId, 160), dialogId: clean(fact.dialogId, 160),
+      fanId: clean(fact.fanId, 160), buyerFanId: clean(fact.fanId, 160),
+      amountCents: Number(fact.amountCents || sale.amountCents || 0),
+      currency: clean(fact.currency || sale.currency || "USD", 16) || "USD",
+      purchasedAt: fact.occurredAt || sale.purchasedAt,
+      status: clean(fact.businessStatus, 80) || "unresolved",
+      attributedMemberId: clean(fact.memberId, 160), attributedUserId: clean(fact.userId, 160),
+      resolvedAt: fact.attributionActive ? (fact.sourceUpdatedAt || new Date()) : null,
+      resolvedSource: "migration_fact_baseline",
+      creatorSaleId: sale.id,
+      financialTransactionId: financialTransactionId || clean(fact.financialTransactionId, 160),
+      financialStatus: clean(fact.financialStatus, 80),
+      attributionBasis: clean(fact.attributionBasis, 240) || "MIGRATION_FACT_BASELINE",
+      historicalFactVersion: "team_money_fact_v2", historicalFactProjectedAt: new Date(),
+      rootVersion: "team_money_root_v2", compactedAt: new Date(), migrationBaselineProtected: true,
+    }});
+  } catch (error) {
+    if (error?.code !== "P2002") throw error;
+    const recovered = db.teamPpvPurchaseLedger.findUnique
+      ? await db.teamPpvPurchaseLedger.findUnique({ where: { id: rootId } })
+      : null;
+    if (recovered) return recovered;
+    throw error;
+  }
+}
+
+async function findExistingPurchase(db, { sale, purchaseId, fanExternalId, financialTransactionId = null }) {
   if (!db?.teamPpvPurchaseLedger) return null;
   if (sale.id && db.teamPpvPurchaseLedger.findUnique) {
     const bySale = await db.teamPpvPurchaseLedger.findUnique({ where: { creatorSaleId: sale.id } }).catch(() => null);
@@ -129,7 +185,9 @@ async function findExistingPurchase(db, { sale, purchaseId, fanExternalId }) {
     if (byId) return byId;
   }
   const messageId = clean(sale.messageId, 160);
-  if (!messageId || !db.teamPpvPurchaseLedger.findMany) return null;
+  if (!messageId || !db.teamPpvPurchaseLedger.findMany) {
+    return recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTransactionId });
+  }
   const when = sale.purchasedAt instanceof Date ? sale.purchasedAt : new Date(sale.purchasedAt);
   if (!Number.isFinite(when.getTime())) return null;
   const rows = await db.teamPpvPurchaseLedger.findMany({
@@ -150,7 +208,9 @@ async function findExistingPurchase(db, { sale, purchaseId, fanExternalId }) {
     if (!fanExternalId) return true;
     return !row.fanId || row.fanId === fanExternalId || row.buyerFanId === fanExternalId || row.dialogId === fanExternalId;
   });
-  return semanticallySame.length === 1 ? semanticallySame[0] : null;
+  if (semanticallySame.length === 1) return semanticallySame[0];
+  if (semanticallySame.length > 1) return null;
+  return recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTransactionId });
 }
 
 async function loadSale(db, saleId) {
@@ -351,7 +411,9 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     purchaseId,
     messageId: clean(sale.messageId, 160),
   });
-  let existing = await findExistingPurchase(db, { sale, purchaseId, fanExternalId });
+  let existing = await findExistingPurchase(db, {
+    sale, purchaseId, fanExternalId, financialTransactionId: financialTransaction?.id || null,
+  });
   if (existing) existing = await lockPpvPurchaseRow(db, existing);
   const accountId = clean(sent?.accountId || sale.creatorId, 160) || sale.creatorId;
   const creatorRef = clean(sale.creator?.username || sale.creator?.displayName, 160);
@@ -371,6 +433,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     creatorSaleId: sale.id,
     financialTransactionId: financialTransaction?.id || null,
     financialStatus,
+    rootVersion: "team_money_root_v2",
   };
 
   if (existing && manualResolutionPreserved(existing)) {
@@ -430,7 +493,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
             resolvedSource: "creator_sale_unresolved",
           };
 
-  const data = { ...sourceData, ...attributionData, attributionBasis: proposed.basis };
+  const data = { ...sourceData, ...attributionData, attributionBasis: proposed.basis, compactedAt: null };
   let purchase;
   if (existing) {
     purchase = await db.teamPpvPurchaseLedger.update({ where: { id: existing.id }, data });
@@ -517,7 +580,55 @@ async function findRecentTipCandidates(db, tip, fanExternalId) {
 }
 
 function tipManualResolutionPreserved(row) {
-  return String(row?.resolvedSource || "").startsWith("manual_");
+  return row?.migrationBaselineProtected === true
+    || String(row?.resolvedSource || "").startsWith("manual_");
+}
+
+async function recoverTipRootFromDurableFact(db, { tip, eventHash }) {
+  if (!db?.teamMoneyAttributionFact?.findMany || !db?.teamTipLedger?.create) return null;
+  const externalIds = [tip.externalNotificationId, tip.externalTransactionId, tip.eventFingerprint, tip.id].map((v) => clean(v, 220)).filter(Boolean);
+  const facts = await db.teamMoneyAttributionFact.findMany({
+    where: { agencyId: tip.agencyId, sourceType: "TIP", OR: [{ creatorTipId: tip.id }, { externalId: { in: externalIds } }] },
+    orderBy: [{ sourceUpdatedAt: "desc" }, { id: "asc" }], take: 3,
+  });
+  const roots = [...new Set((facts || []).map((f) => clean(f.rootId || f.sourceRowId, 220)).filter(Boolean))];
+  if (roots.length === 0) return null;
+  if (roots.length !== 1) {
+    const error = new Error("Multiple durable Tip fact generations require migration adjudication");
+    error.code = "TEAM_MONEY_ROOT_MIGRATION_AMBIGUOUS";
+    throw error;
+  }
+  const fact = facts.find((f) => clean(f.rootId || f.sourceRowId, 220) === roots[0]) || facts[0];
+  const rootId = roots[0];
+  const existingById = db.teamTipLedger.findUnique
+    ? await db.teamTipLedger.findUnique({ where: { id: rootId } })
+    : null;
+  if (existingById) return existingById;
+  try {
+    return await db.teamTipLedger.create({ data: {
+      id: rootId, agencyId: tip.agencyId, accountId: clean(fact.creatorId || tip.creatorId, 160) || tip.creatorId,
+      creatorId: clean(fact.creatorId || tip.creatorId, 160) || tip.creatorId,
+      eventHash: clean(eventHash, 120) || `recovered:${fact.id}`,
+      tipId: clean(fact.externalId || tip.externalNotificationId || tip.externalTransactionId || tip.eventFingerprint || tip.id, 220),
+      messageId: clean(tip.messageId, 160), dialogId: clean(fact.dialogId, 160), fanId: clean(fact.fanId, 160),
+      amountCents: Number(fact.amountCents || tip.amountCents || 0), currency: clean(fact.currency || tip.currency || "USD", 8) || "USD",
+      receivedAt: fact.occurredAt || tip.tippedAt, status: clean(fact.businessStatus, 80) || "unresolved",
+      attributedMemberId: clean(fact.memberId, 160), attributedUserId: clean(fact.userId, 160),
+      resolvedAt: fact.attributionActive ? (fact.sourceUpdatedAt || new Date()) : null,
+      resolvedSource: "migration_fact_baseline", creatorTipId: tip.id, financialStatus: clean(fact.financialStatus, 80),
+      attributionBasis: clean(fact.attributionBasis, 240) || "MIGRATION_FACT_BASELINE",
+      historicalFactVersion: "team_money_fact_v2", historicalFactProjectedAt: new Date(),
+      rootVersion: "team_money_root_v2", compactedAt: new Date(), migrationBaselineProtected: true,
+      candidates: null, weakCandidates: null, result: null, history: [], source: "migration_fact_baseline",
+    }});
+  } catch (error) {
+    if (error?.code !== "P2002") throw error;
+    const recovered = db.teamTipLedger.findUnique
+      ? await db.teamTipLedger.findUnique({ where: { id: rootId } })
+      : null;
+    if (recovered) return recovered;
+    throw error;
+  }
 }
 
 async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
@@ -551,6 +662,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
   let existing = await db.teamTipLedger.findFirst({
     where: { agencyId: tip.agencyId, OR: [{ creatorTipId: tip.id }, { eventHash }] },
   }).catch(() => null);
+  if (!existing) existing = await recoverTipRootFromDurableFact(db, { tip, eventHash });
   if (existing) existing = await lockTipLedgerRow(db, existing);
 
   const sourceData = {
@@ -569,6 +681,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
     creatorTipId: tip.id,
     financialStatus,
     source: "creator_tip_reconciliation",
+    rootVersion: "team_money_root_v2",
   };
 
   if (existing && tipManualResolutionPreserved(existing)) {
@@ -626,7 +739,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
           };
 
   const data = {
-    ...sourceData, ...attributionData, attributionBasis: proposed.basis,
+    ...sourceData, ...attributionData, attributionBasis: proposed.basis, compactedAt: null,
     candidates: recent.primary, weakCandidates: recent.weak, result, history,
   };
   const attribution = existing
@@ -654,138 +767,75 @@ async function reconcileMoneyForSentMessageEvidence({ db = prisma, sent }) {
   const agencyId = clean(sent?.agencyId, 160);
   const creatorId = clean(sent?.creatorId || sent?.accountId, 160);
   const messageId = clean(sent?.messageId, 160);
+  const sentLedgerId = clean(sent?.id, 160);
   if (!agencyId || !creatorId || !messageId) return { ok: true, skipped: true, reason: "SENT_EVIDENCE_INCOMPLETE" };
-  if (!db?.creatorSale?.findMany || !db?.creatorTip?.findMany) return { ok: true, skipped: true, reason: "CREATOR_MONEY_MODELS_UNAVAILABLE" };
 
+  // Current production path: the sent-message root is durable. Publish one fanout
+  // work identity in the same transaction as the ledger write; its keyset cursor
+  // enumerates every matching canonical sale/tip without a hidden take ceiling.
+  if (sentLedgerId && (db?.domainWorkItem?.upsert || db?.domainWorkItem?.update || typeof db?.$queryRawUnsafe === "function")) {
+    const { publishDomainWork, WORK_CLASS } = require("./domain-work-authority-service");
+    await publishDomainWork({
+      db, agencyId, workClass: WORK_CLASS.DEPENDENCY_FANOUT,
+      objectType: "TeamSentMessageLedger", objectId: sentLedgerId,
+      partitionKey: creatorId, creatorId, parentObjectId: messageId, availableAt: new Date(),
+    });
+    return { ok: true, publishedFanout: true, sentLedgerId };
+  }
+
+  // Reduced compatibility doubles do not have DomainWork. Keep an exact bounded
+  // fallback for old unit tests only; production never relies on this path.
+  if (!db?.creatorSale?.findMany || !db?.creatorTip?.findMany) return { ok: true, skipped: true, reason: "CREATOR_MONEY_MODELS_UNAVAILABLE" };
   const sentAt = sent?.sentAt instanceof Date ? sent.sentAt : new Date(sent?.sentAt || Date.now());
   const sentAtMs = Number.isFinite(sentAt.getTime()) ? sentAt.getTime() : Date.now();
   const tipWindowEnd = new Date(sentAtMs + 15 * 60 * 1000);
-
   const [sales, tips] = await Promise.all([
-    db.creatorSale.findMany({
-      where: { agencyId, creatorId, saleType: "MESSAGE", messageId },
-      select: { id: true }, orderBy: { id: "asc" }, take: 100,
-    }),
-    db.creatorTip.findMany({
-      where: {
-        agencyId, creatorId,
-        OR: [
-          { messageId },
-          { tippedAt: { gte: sentAt, lte: tipWindowEnd } },
-        ],
-      },
-      select: { id: true }, orderBy: { id: "asc" }, take: 200,
-    }),
+    db.creatorSale.findMany({ where: { agencyId, creatorId, saleType: "MESSAGE", messageId }, select: { id: true }, orderBy: { id: "asc" }, take: 100 }),
+    db.creatorTip.findMany({ where: { agencyId, creatorId, OR: [{ messageId }, { tippedAt: { gte: sentAt, lte: tipWindowEnd } }] }, select: { id: true }, orderBy: { id: "asc" }, take: 100 }),
   ]);
-
   const saleIds = [...new Set((sales || []).map((row) => clean(row.id, 160)).filter(Boolean))];
   const tipIds = [...new Set((tips || []).map((row) => clean(row.id, 160)).filter(Boolean))];
   await reconcileCreatorSalesToTeam({ db, saleIds });
   await reconcileCreatorTipsToTeam({ db, tipIds });
-  return { ok: true, saleIds, tipIds };
+  return { ok: true, saleIds, tipIds, compatibilityInline: true };
 }
 
-/**
- * Gradually attaches historical Creator Analytics money facts to the Team
- * ledgers. The relation itself is the durable progress marker: once a
- * CreatorSale/CreatorTip is reconciled, it no longer matches the next batch.
- *
- * This is intentionally DB-only. It never requests OnlyFans and it never
- * invents ownership. Exact message provenance can auto-attribute; otherwise
- * the canonical fact remains unresolved/creator revenue according to the same
- * rules used for live ingest.
- */
-async function reconcileHistoricalTeamMoneyBatch({
-  db = prisma,
-  agencyId = null,
-  saleLimit = 250,
-  tipLimit = 250,
-  retentionDays = 180,
-  now = new Date(),
-} = {}) {
-  if (!db?.creatorSale?.findMany || !db?.creatorTip?.findMany) {
-    return { ok: true, skipped: true, reason: "CREATOR_MONEY_MODELS_UNAVAILABLE", sales: null, tips: null };
-  }
-  if (!db?.teamPpvPurchaseLedger || !db?.teamTipLedger) {
-    return { ok: true, skipped: true, reason: "TEAM_MONEY_MODELS_UNAVAILABLE", sales: null, tips: null };
-  }
-
-  const normalizedAgencyId = clean(agencyId, 160);
-  const safeSaleLimit = Math.min(2000, Math.max(1, Number(saleLimit) || 250));
-  const safeTipLimit = Math.min(2000, Math.max(1, Number(tipLimit) || 250));
-  const agencyWhere = normalizedAgencyId ? { agencyId: normalizedAgencyId } : {};
-  const safeRetentionDays = Math.min(730, Math.max(1, Number(retentionDays) || 180));
-  const safeNow = now instanceof Date ? now : new Date(now);
-  const nowMs = Number.isFinite(safeNow.getTime()) ? safeNow.getTime() : Date.now();
-  const detailedSince = new Date(nowMs - safeRetentionDays * 24 * 60 * 60 * 1000);
-
-  const [missingSaleRows, missingTipRows, unresolvedPurchases, unresolvedTips] = await Promise.all([
-    db.creatorSale.findMany({
-      where: { ...agencyWhere, saleType: "MESSAGE", purchasedAt: { gte: detailedSince }, teamPpvPurchase: { is: null } },
-      orderBy: { id: "asc" }, take: safeSaleLimit, select: { id: true },
-    }),
-    db.creatorTip.findMany({
-      where: { ...agencyWhere, tippedAt: { gte: detailedSince }, teamTipAttribution: { is: null } },
-      orderBy: { id: "asc" }, take: safeTipLimit, select: { id: true },
-    }),
-    db.teamPpvPurchaseLedger.findMany ? db.teamPpvPurchaseLedger.findMany({
-      where: { ...agencyWhere, purchasedAt: { gte: detailedSince }, status: { in: ["unresolved", "conflict"] }, creatorSaleId: { not: null } },
-      orderBy: { id: "asc" }, take: safeSaleLimit, select: { creatorSaleId: true },
-    }) : Promise.resolve([]),
-    db.teamTipLedger.findMany ? db.teamTipLedger.findMany({
-      where: { ...agencyWhere, receivedAt: { gte: detailedSince }, status: { in: ["unresolved", "conflict"] }, creatorTipId: { not: null } },
-      orderBy: { id: "asc" }, take: safeTipLimit, select: { creatorTipId: true },
-    }) : Promise.resolve([]),
-  ]);
-  const saleRows = [...new Set([...(missingSaleRows || []).map((r) => r.id), ...(unresolvedPurchases || []).map((r) => r.creatorSaleId)].filter(Boolean))]
-    .slice(0, safeSaleLimit).map((id) => ({ id }));
-  const tipRows = [...new Set([...(missingTipRows || []).map((r) => r.id), ...(unresolvedTips || []).map((r) => r.creatorTipId)].filter(Boolean))]
-    .slice(0, safeTipLimit).map((id) => ({ id }));
-
-  const run = async (rows, reconcile, idKey) => {
-    let processed = 0;
-    let linked = 0;
-    let skipped = 0;
-    const failures = [];
-    for (const row of rows || []) {
-      const id = clean(row?.id, 160);
-      if (!id) continue;
-      processed += 1;
-      try {
-        const result = await reconcile({ db, [idKey]: id });
-        if (result?.ok === false) {
-          failures.push({ id, code: clean(result.code || "RECONCILE_FAILED", 120) });
-        } else if (result?.skipped) {
-          skipped += 1;
-        } else {
-          linked += 1;
-        }
-      } catch (err) {
-        failures.push({ id, code: "RECONCILE_EXCEPTION", error: clean(err?.message || err, 240) });
-      }
-    }
-    return {
-      selected: (rows || []).length,
-      processed,
-      linked,
-      skipped,
-      failed: failures.length,
-      failures: failures.slice(0, 25),
-    };
-  };
-
-  const sales = await run(saleRows, reconcileCreatorSaleToTeam, "saleId");
-  const tips = await run(tipRows, reconcileCreatorTipToTeam, "tipId");
-
-  return {
-    ok: sales.failed === 0 && tips.failed === 0,
-    agencyId: normalizedAgencyId,
-    retentionDays: safeRetentionDays,
-    detailedSince,
-    sales: { ...sales, likelyMore: sales.selected >= safeSaleLimit },
-    tips: { ...tips, likelyMore: tips.selected >= safeTipLimit },
-  };
+async function publishTeamMoneyReconciliationWork({ db = prisma, agencyId, creatorId = null, sourceType, sourceId, now = new Date() } = {}) {
+  const agency = clean(agencyId,160); const id = clean(sourceId,160); const type = String(sourceType || "").trim().toUpperCase();
+  if (!agency || !id || !["PPV","TIP"].includes(type)) throw Object.assign(new Error("TEAM_MONEY_WORK_IDENTITY_REQUIRED"), { code: "TEAM_MONEY_WORK_IDENTITY_REQUIRED" });
+  const { publishDomainWork, WORK_CLASS } = require("./domain-work-authority-service");
+  return publishDomainWork({ db, agencyId: agency, workClass: WORK_CLASS.TEAM_MONEY_RECONCILIATION,
+    objectType: type === "PPV" ? "CreatorSale" : "CreatorTip", objectId: id,
+    partitionKey: clean(creatorId,160) || agency, creatorId: clean(creatorId,160), availableAt: now });
 }
+
+async function dispatchTeamMoneyReconciliationForCanonicalFact({ db = prisma, agencyId, creatorId = null, sourceType, sourceId, now = new Date() } = {}) {
+  // Production PostgreSQL publishes from the canonical CreatorSale/CreatorTip trigger in
+  // the same transaction. Reduced test doubles do not execute triggers: use DomainWork when
+  // available, otherwise preserve the legacy exact reconcile only as compatibility behavior.
+  if (typeof db?.$queryRawUnsafe === "function") return { ok: true, triggerOwned: true };
+  if (db?.domainWorkItem?.upsert || db?.domainWorkItem?.update) {
+    await publishTeamMoneyReconciliationWork({ db, agencyId, creatorId, sourceType, sourceId, now });
+    return { ok: true, published: true };
+  }
+  return String(sourceType || "").toUpperCase() === "TIP"
+    ? reconcileCreatorTipToTeam({ db, tipId: sourceId })
+    : reconcileCreatorSaleToTeam({ db, saleId: sourceId });
+}
+
+async function repairTeamMoneyReconciliationWorkItem({ db = prisma, agencyId, objectType, objectId } = {}) {
+  const type = String(objectType || ""); const id = clean(objectId,160); const agency = clean(agencyId,160);
+  if (!agency || !id || !["CreatorSale","CreatorTip"].includes(type)) throw Object.assign(new Error("TEAM_MONEY_WORK_IDENTITY_REQUIRED"), { code: "TEAM_MONEY_WORK_IDENTITY_REQUIRED" });
+  const row = type === "CreatorSale"
+    ? await db.creatorSale.findFirst({ where: { id, agencyId: agency }, select: { id: true } })
+    : await db.creatorTip.findFirst({ where: { id, agencyId: agency }, select: { id: true } });
+  if (!row) return { ok: true, obsolete: true };
+  const result = type === "CreatorSale"
+    ? await reconcileCreatorSaleToTeam({ db, saleId: id })
+    : await reconcileCreatorTipToTeam({ db, tipId: id });
+  return { ...result, obsolete: false };
+}
+
 
 module.exports = {
   REFUND_STATUSES,
@@ -795,5 +845,7 @@ module.exports = {
   reconcileCreatorTipToTeam,
   reconcileCreatorTipsToTeam,
   reconcileMoneyForSentMessageEvidence,
-  reconcileHistoricalTeamMoneyBatch,
+  publishTeamMoneyReconciliationWork,
+  dispatchTeamMoneyReconciliationForCanonicalFact,
+  repairTeamMoneyReconciliationWorkItem,
 };

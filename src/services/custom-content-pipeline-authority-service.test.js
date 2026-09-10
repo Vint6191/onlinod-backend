@@ -94,15 +94,12 @@ async function seedPipelineProviderAuthority(db, agencyId) {
     async count({ where = {} }) { return debts.filter((row) => pipelineProviderMatches(row, where)).length; },
     async findMany({ where = {}, take = 1000 }) { return debts.filter((row) => pipelineProviderMatches(row, where)).slice(0, take).map((row) => ({ ...row })); },
   };
-  db.maintenanceLaneState = {
+  db.phase2WorkCoverage = {
     async findUnique({ where }) {
-      if (where.key === providerOperationalAuthority.PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY) {
-        return { key: where.key, generation: providerOperationalAuthority.PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
-      }
-      if (where.key === providerOperationalAuthority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY) {
-        return { key: where.key, generation: providerOperationalAuthority.CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION, completedAt: new Date("2026-09-09T20:00:00.000Z") };
-      }
-      return null;
+      const key = where?.agencyId_family_generation;
+      if (!key || String(key.agencyId) !== String(agencyId)) return null;
+      if (!["PROVIDER_OPERATIONAL", "CUSTOM_EXTERNAL_PROJECTION"].includes(String(key.family))) return null;
+      return { agencyId, family: key.family, generation: key.generation, active: true, enumerationState: "COMPLETE", completedAt: new Date("2026-09-09T20:00:00.000Z") };
     },
   };
 }

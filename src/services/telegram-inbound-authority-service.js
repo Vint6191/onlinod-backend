@@ -324,21 +324,26 @@ async function listTelegramInboundReviewQueue({ agencyId, member, limit = 50, cu
   await requireInboundReviewView({ agencyId, member, db: client });
   const take = boundedLimit(limit);
   const startCursor = clean(cursor, 180);
-  // Authorization is a CURRENT semantic check and therefore necessarily happens after the durable
-  // provider rows are discovered.  The cursor keeps that post-filter convergent: inaccessible or
-  // stale exceptions may delay a page, but they can never make later visible work unreachable.
-  // Keep the original oldest-exception priority. Prisma can resume a composite order from the
-  // unique event id cursor, so pagination does not trade convergence for arbitrary UUID ordering.
+  const maxScan = Math.max(200, Math.min(2_000, take * 10));
   let scanCursor = startCursor || null;
+  let scannedRows = 0;
+  let sourceExhausted = false;
   const visible = [];
-  while (visible.length <= take) {
+
+  // R9/A44 sibling contract: authorization is necessarily a post-filter, but it
+  // cannot turn a visible limit into an unbounded agency scan.  The cursor moves
+  // over every inspected provider row, and incomplete work is returned honestly.
+  while (visible.length <= take && scannedRows < maxScan && !sourceExhausted) {
+    const remaining = maxScan - scannedRows;
+    const pageTake = Math.min(Math.max(200, take * 2), remaining);
     const rows = await client.telegramInboundEvent.findMany({
       where: { agencyId, projectionState: "REVIEW_REQUIRED" },
       orderBy: [{ projectedAt: "asc" }, { observedAt: "asc" }, { id: "asc" }],
       ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
-      take: Math.max(200, take * 2),
+      take: pageTake,
     });
-    if (!rows?.length) break;
+    if (!rows?.length) { sourceExhausted = true; break; }
+    scannedRows += rows.length;
     for (const row of rows) {
       scanCursor = String(row.id);
       try {
@@ -350,11 +355,20 @@ async function listTelegramInboundReviewQueue({ agencyId, member, limit = 50, cu
         throw error;
       }
     }
-    if (visible.length > take || rows.length < Math.max(200, take * 2)) break;
+    if (visible.length > take) break;
+    if (rows.length < pageTake) sourceExhausted = true;
   }
-  const hasMore = visible.length > take;
+
+  const visibleOverflow = visible.length > take;
   const selected = visible.slice(0, take);
-  const nextCursor = hasMore && selected.length ? String(selected[selected.length - 1].row.id) : null;
+  const scanComplete = sourceExhausted && !visibleOverflow;
+  const hasMore = visibleOverflow || !scanComplete;
+  // If one extra visible row was inspected, resume after the last returned row so
+  // the extra remains reachable. Otherwise every inspected row is either returned
+  // or proven inaccessible, so the scan cursor is a lossless continuation.
+  const nextCursor = !hasMore ? null
+    : visibleOverflow && selected.length ? String(selected[selected.length - 1].row.id)
+      : scanCursor;
   const creatorIds = Array.from(new Set(selected.flatMap(({ auth }) => auth.creatorIds || [])));
   const creators = creatorIds.length && client.creatorAccount?.findMany
     ? await client.creatorAccount.findMany({ where: { agencyId, id: { in: creatorIds } }, select: { id: true, displayName: true, username: true, avatarUrl: true, deletedAt: true } })
@@ -398,7 +412,7 @@ async function listTelegramInboundReviewQueue({ agencyId, member, limit = 50, cu
       candidateOrders,
     };
   });
-  return { ok: true, items, count: selected.length, nextCursor, hasMore, canResolve: canResolve === true, serverNow: now.toISOString() };
+  return { ok: true, items, count: selected.length, nextCursor, hasMore, canResolve: canResolve === true, serverNow: now.toISOString(), scannedRows, scanBudget: maxScan, scanComplete };
 }
 
 async function searchTelegramInboundReviewCandidates({ agencyId, member, eventId: inputEventId, query = "", limit = 30, db = null } = {}) {
@@ -623,49 +637,62 @@ async function retryPendingInboundProjections({ agencyId, accountId = null, acto
   return { ok: true, scanned: linkedRows.length + rows.length, convergedLinked: linkedRows.length, applied, skipped, pending, reviewRequired };
 }
 
-async function reconcilePendingInboundForConfirmedDelivery({ agencyId, accountId, senderTelegramUserId = null, replyToMessageId = null, actorUserId = null, now = new Date(), limit = 200, db = null } = {}) {
+async function reconcilePendingInboundForConfirmedDelivery({ agencyId, accountId, senderTelegramUserId = null, replyToMessageId = null, actorUserId = null, now = new Date(), limit = 200, cursor = null, db = null } = {}) {
   const client = db || require("../prisma");
   const normalizedAccountId = clean(accountId, 180);
   const sender = clean(senderTelegramUserId, 40);
   const replyId = positiveInt(replyToMessageId, "replyToMessageId", true);
-  if (!agencyId || !normalizedAccountId || (!/^\d{1,20}$/.test(sender) && !replyId)) return { ok: true, reconciled: 0, submissions: 0 };
+  if (!agencyId || !normalizedAccountId || (!/^\d{1,20}$/.test(sender) && !replyId)) {
+    return { ok: true, reconciled: 0, submissions: 0, scanned: 0, nextCursor: null, hasMore: false, scanComplete: true };
+  }
   const candidateOr = [];
   if (/^\d{1,20}$/.test(sender)) candidateOr.push({ senderTelegramUserId: sender });
   if (replyId) candidateOr.push({ replyToMessageId: replyId });
-  const pageSize = Math.max(1, Math.min(1000, Math.floor(Number(limit) || 200)));
-  let cursorId = null; let reconciled = 0; let submissions = 0; let scanned = 0;
+  const pageSize = Math.max(1, Math.min(500, Math.floor(Number(limit) || 200)));
+  const afterId = clean(cursor, 180);
+  const where = {
+    agencyId,
+    accountId: normalizedAccountId,
+    submissionId: null,
+    projectionState: { in: ["PENDING", "FAILED_RETRYABLE"] },
+    ...(candidateOr.length === 1 ? candidateOr[0] : { OR: candidateOr }),
+    ...(afterId ? { id: { gt: afterId } } : {}),
+  };
+  // One bounded keyset page only. Durable DomainWork owns continuation; a provider receipt
+  // must never synchronously walk an arbitrary tenant history before ACKing the external fact.
+  const discovered = await client.telegramInboundEvent.findMany({ where, orderBy: [{ id: "asc" }], take: pageSize + 1 });
+  const hasMore = Number(discovered?.length || 0) > pageSize;
+  const rows = (discovered || []).slice(0, pageSize);
+  let reconciled = 0; let submissions = 0; let scanned = 0;
   const creatorIds = new Set();
-  for (;;) {
-    const where = {
-      agencyId,
-      accountId: normalizedAccountId,
-      submissionId: null,
-      projectionState: { in: ["PENDING", "FAILED_RETRYABLE"] },
-      ...(candidateOr.length === 1 ? candidateOr[0] : { OR: candidateOr }),
-      ...(cursorId ? { id: { gt: cursorId } } : {}),
-    };
-    const rows = await client.telegramInboundEvent.findMany({ where, orderBy: [{ id: "asc" }], take: pageSize });
-    if (!rows?.length) break;
-    for (const row of rows) {
-      cursorId = String(row.id); scanned += 1;
-      const result = await projectTelegramInboundEvent({ eventId: row.id, actorUserId, now, db: client });
-      const fresh = await client.telegramInboundEvent.findFirst({ where: { id: row.id, agencyId } });
-      if (fresh?.creatorId) creatorIds.add(String(fresh.creatorId));
-      if (result?.submission) submissions += 1;
-      if (!["PENDING", "FAILED_RETRYABLE"].includes(String(result?.state))) reconciled += 1;
-    }
-    if (rows.length < pageSize) break;
+  for (const row of rows) {
+    scanned += 1;
+    const result = await projectTelegramInboundEvent({ eventId: row.id, actorUserId, now, db: client });
+    const fresh = await client.telegramInboundEvent.findFirst({ where: { id: row.id, agencyId } });
+    if (fresh?.creatorId) creatorIds.add(String(fresh.creatorId));
+    if (result?.submission) submissions += 1;
+    if (!["PENDING", "FAILED_RETRYABLE"].includes(String(result?.state))) reconciled += 1;
   }
+  const nextCursor = hasMore && rows.length ? String(rows[rows.length - 1].id) : null;
   if (reconciled > 0) await audit({
     agencyId, actorUserId, action: "custom_order.telegram_inbound_reconcile_after_delivery_receipt", targetType: "TelegramDeliveryReceipt",
     targetId: `${normalizedAccountId}:${sender || replyId || "unknown"}`,
-    metadata: { creatorIds: Array.from(creatorIds), reconciled, submissions, scanned, replyToMessageId: replyId }, db: client,
+    metadata: { creatorIds: Array.from(creatorIds), reconciled, submissions, scanned, replyToMessageId: replyId, scanComplete: !hasMore }, db: client,
   });
-  return { ok: true, creatorId: creatorIds.size === 1 ? Array.from(creatorIds)[0] : null, reconciled, submissions, scanned };
+  return {
+    ok: true,
+    creatorId: creatorIds.size === 1 ? Array.from(creatorIds)[0] : null,
+    reconciled,
+    submissions,
+    scanned,
+    nextCursor,
+    hasMore,
+    scanComplete: !hasMore,
+  };
 }
 
-async function reconcilePendingInboundForRecipient({ agencyId, accountId, senderTelegramUserId, actorUserId = null, now = new Date(), limit = 200, db = null } = {}) {
-  return reconcilePendingInboundForConfirmedDelivery({ agencyId, accountId, senderTelegramUserId, actorUserId, now, limit, db });
+async function reconcilePendingInboundForRecipient({ agencyId, accountId, senderTelegramUserId, actorUserId = null, now = new Date(), limit = 200, cursor = null, db = null } = {}) {
+  return reconcilePendingInboundForConfirmedDelivery({ agencyId, accountId, senderTelegramUserId, actorUserId, now, limit, cursor, db });
 }
 
 async function ingestTelegramInboundEvent({ agencyId, member, accountId, deviceId, claimToken, senderTelegramUserId, messageId, replyToMessageId = null, groupedId = null, hasMedia = false, text = null, sentAt: sentAtInput = null, now = new Date(), db = null } = {}) {

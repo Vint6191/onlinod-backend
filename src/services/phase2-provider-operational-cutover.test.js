@@ -12,7 +12,8 @@ test("provider retirement is current-debt driven and does not import historical 
   assert.match(source, /requireProviderOperationalBackfillReady/);
   assert.match(source, /listProviderOperationalDebtForAccount/);
   assert.match(source, /dirtyOrderIdsForAccount/);
-  assert.match(source, /reconcileProviderOperationalDebtForOrder/);
+  assert.match(source, /assertAccountDirtyWorkDrained/);
+  assert.doesNotMatch(source, /reconcileProviderOperationalDebtForOrder/, "retirement must not repair CustomOrder rows while holding the account fence");
   assert.doesNotMatch(source, /findCancelledModelInstructionFollowupDebt/);
   assert.doesNotMatch(source, /scanIncompleteTelegramSources/);
   assert.doesNotMatch(source, /findCustomProviderThreadRetentionBlocker\s*[,}]/);
@@ -41,16 +42,23 @@ test("provider debt migration installs current-work storage and exact dirty trig
   assert.match(migration, /CUSTOM_EXTERNAL_PROJECTION_DEBT/);
 });
 
-test("historical Custom external-proof discovery is owned by a one-time maintenance generation", () => {
+test("historical Custom external-proof discovery is per-agency finite enumeration, not a recurring history scan", () => {
   const source = read("job-scheduler.js");
-  assert.match(source, /CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY/);
-  const start = source.indexOf("async function runCustomExternalProofConvergenceSweep");
-  const end = source.indexOf("\nasync function ", start + 20);
-  const body = source.slice(start, end > start ? end : source.length);
-  assert.match(body, /runMaintenanceLane/);
-  assert.match(body, /oneTime:\s*true/);
-  assert.match(body, /CUSTOM_EXTERNAL_CURRENT_DEBT_LANE_KEY/);
-  assert.match(body, /repairCurrentCustomExternalProjectionDebt/);
+  const enumerationStart = source.indexOf("async function runExternalCoverageEnumerationUnit");
+  const enumerationEnd = source.indexOf("\nasync function ", enumerationStart + 20);
+  const enumeration = source.slice(enumerationStart, enumerationEnd > enumerationStart ? enumerationEnd : source.length);
+  assert.match(enumeration, /convergeHistoricalCustomExternalProofs/);
+  assert.match(enumeration, /item\.agencyId/);
+  assert.match(enumeration, /markPhase2CoverageComplete/);
+  assert.match(enumeration, /yieldDomainWorkClaim/);
+  const hotStart = source.indexOf("async function runCustomExternalProofConvergenceSweep");
+  const hotEnd = source.indexOf("\nasync function ", hotStart + 20);
+  const hot = source.slice(hotStart, hotEnd > hotStart ? hotEnd : source.length);
+  assert.doesNotMatch(hot, /convergeHistoricalCustomExternalProofs/);
+  assert.match(hot, /PHASE2_WORK_CLASS\.CUSTOM_EXTERNAL_PROJECTION/);
+  assert.match(hot, /repairCustomExternalProjectionWorkItem/);
+  assert.match(hot, /claimDomainWorkBatch/);
+  assert.doesNotMatch(hot, /repairCurrentCustomExternalProjectionDebt|runMaintenanceLane/);
 });
 
 test("Telegram runtime eligibility uses current provider worksets instead of historical source/model scans", () => {

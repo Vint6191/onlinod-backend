@@ -14,8 +14,9 @@ test("F40/F41 all NEW manual-source and creator account references share the ACT
   const creatorsRoute = read("src/routes/creators.js");
   const delivery = read("src/services/telegram-delivery-authority-service.js");
 
-  assert.match(helper, /agencyTelegramMtprotoAccount\.updateMany/);
-  assert.match(helper, /lifecycleState:\s*"ACTIVE"/);
+  assert.match(helper, /SELECT[\s\S]*FROM "AgencyTelegramMtprotoAccount"[\s\S]*FOR UPDATE/);
+  assert.match(helper, /lockTelegramAccountLifecycleRow/);
+  assert.doesNotMatch(helper, /data:\s*\{\s*lifecycleState:\s*"ACTIVE"\s*\}/, "row fencing must not publish a fake lifecycle update");
   assert.match(submissions, /lockActiveTelegramAccountReference\(\{/);
   assert.match(creatorAuthority, /lockActiveTelegramAccountReference\(\{/);
   assert.match(creatorAuthority, /isolationLevel:\s*"Serializable"/);

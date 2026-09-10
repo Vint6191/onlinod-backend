@@ -45,28 +45,31 @@ async function clearOrderDirty(tx, orderId) {
 test("Phase2 PostgreSQL provider current-work triggers preserve exact dirty/debt recovery", { skip: !enabled }, async (t) => {
   const prisma = require("../prisma");
   try {
-    const agency = await prisma.agency.findFirst({
-      where: {
-        deletedAt: null,
-        members: { some: { deletedAt: null } },
-        creators: { some: { deletedAt: null } },
-      },
-      select: { id: true },
-    });
-    if (!agency) {
-      t.skip("No Agency with an active member and creator exists in the PostgreSQL integration database");
-      return;
-    }
-    const [member, creator] = await Promise.all([
-      prisma.agencyMember.findFirst({ where: { agencyId: agency.id, deletedAt: null }, select: { id: true } }),
-      prisma.creatorAccount.findFirst({ where: { agencyId: agency.id, deletedAt: null }, select: { id: true } }),
-    ]);
-    if (!member || !creator) {
-      t.skip("Agency fixture lost its member/creator before the integration transaction started");
-      return;
-    }
-
     await rollbackTx(prisma, async (tx) => {
+      const agency = { id: token("phase2_agency") };
+      const user = { id: token("phase2_user") };
+      const member = { id: token("phase2_member") };
+      const creator = { id: token("phase2_creator") };
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "User" ("id","email","passwordHash","createdAt","updatedAt")
+         VALUES ($1,$2,'phase2_pg',clock_timestamp(),clock_timestamp())`,
+        user.id, `${user.id}@phase2.invalid`,
+      );
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "Agency" ("id","name","plan","status","createdAt","updatedAt")
+         VALUES ($1,$2,'trial','TRIAL',clock_timestamp(),clock_timestamp())`,
+        agency.id, `Phase2 provider PG ${agency.id}`,
+      );
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "AgencyMember" ("id","agencyId","userId","role","accessEpoch","createdAt","updatedAt")
+         VALUES ($1,$2,$3,'OWNER',1,clock_timestamp(),clock_timestamp())`,
+        member.id, agency.id, user.id,
+      );
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "CreatorAccount" ("id","agencyId","displayName","status","connectionState","connectionGeneration","createdAt","updatedAt")
+         VALUES ($1,$2,$3,'DRAFT','ENROLLMENT_REQUIRED',0,clock_timestamp(),clock_timestamp())`,
+        creator.id, agency.id, `Phase2 creator ${creator.id}`,
+      );
       const accountId = token("phase2_mtproto");
       const orderId = token("phase2_custom");
       const intentId = token("phase2_intent");

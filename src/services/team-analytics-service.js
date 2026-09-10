@@ -6,6 +6,7 @@ const { summarizePendingRows } = require("./team-pending-read-service");
 const { getRetentionSettings } = require("./retention-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { coverageState, buildProjectionDetailAuthority } = require("./team-historical-range-authority-service");
+const { phase2CoverageStatus, FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION } = require("./phase2-work-coverage-authority-service");
 
 const TEAM_TELEMETRY_VERSION = "team_v13_provenance";
 const SUPPORTED_TEAM_TELEMETRY_VERSIONS = new Set([
@@ -449,7 +450,7 @@ async function loadHistoricalCoverage({ agencyId }) {
       activityCoverageFrom: row.activityCoverageFrom ? new Date(row.activityCoverageFrom) : null,
       moneyCoverageFrom: row.moneyCoverageFrom ? new Date(row.moneyCoverageFrom) : null,
       activityProjectionVersion: String(row.activityProjectionVersion || "team_activity_daily_v1"),
-      moneyProjectionVersion: String(row.moneyProjectionVersion || "team_money_fact_v1"),
+      moneyProjectionVersion: String(row.moneyProjectionVersion || "team_money_fact_v2"),
       source: String(row.source || "phase2_historical_authority"),
     };
   } catch (err) {
@@ -481,6 +482,7 @@ async function loadPpvMoneyFacts({ agencyId, range, allowedCreatorIds = null }) 
       where: {
         agencyId,
         sourceType: "PPV",
+        classificationState: "CANONICAL",
         ...creatorScopeWhere(allowedCreatorIds),
         ...whereForRange("occurredAt", range),
       },
@@ -745,13 +747,16 @@ function responseSelectSql(alias) {
   `;
 }
 
-async function loadResponseSummarySql({ agencyId, range, allowedCreatorIds = null }) {
+async function loadResponseSummarySql({ agencyId, range, allowedCreatorIds = null, currentGenerationOnly = false }) {
   if (!range) return [];
-  const where = sqlScopedWhere({ alias: "r", agencyId, allowedCreatorIds, range, field: "replyAt" });
+  const where = sqlScopedWhere({
+    alias: "r", agencyId, allowedCreatorIds, range, field: "replyAt",
+    extra: currentGenerationOnly ? [`r."derivationVersion"='team_response_v2'`, `r."projectionState"='FULL'`] : [],
+  });
   if (where.empty) return [];
   const sql = `
     SELECT GROUPING(r."memberId")::int AS "isTotal", r."memberId" AS "memberId", ${responseSelectSql("r")}
-    FROM "TeamResponseCase" r
+    FROM "TeamResponseCaseCurrent" r
     WHERE ${where.sql}
     GROUP BY GROUPING SETS ((r."memberId"), ())
   `;
@@ -768,7 +773,7 @@ async function loadDialogSummarySql({ agencyId, range, allowedCreatorIds = null,
   let moneyGroup = "";
   if (includeMoney) {
     const scope = normalizedCreatorScope(allowedCreatorIds);
-    const moneyClauses = [`m."agencyId" = $1`, `m."attributionActive" = TRUE`, `m."memberId" = r."memberId"`, `m."creatorId" = r."creatorId"`, `COALESCE(NULLIF(m."fanId",''), NULLIF(m."dialogId",'')) = r."fanKey"`];
+    const moneyClauses = [`m."agencyId" = $1`, `m."classificationState" = 'CANONICAL'`, `m."attributionActive" = TRUE`, `m."memberId" = r."memberId"`, `m."creatorId" = r."creatorId"`, `COALESCE(NULLIF(m."fanId",''), NULLIF(m."dialogId",'')) = r."fanKey"`];
     if (scope) {
       const scopeIndex = where.params.findIndex((value) => Array.isArray(value)) + 1;
       if (scopeIndex > 0) moneyClauses.push(`m."creatorId" = ANY($${scopeIndex}::text[])`);
@@ -810,8 +815,14 @@ async function loadDialogSummarySql({ agencyId, range, allowedCreatorIds = null,
   return teamScaleQuery("dialog_summary", sql, params);
 }
 
-async function loadPendingSummarySql({ agencyId, allowedCreatorIds = null, authorityNow }) {
-  const where = sqlScopedWhere({ alias: "p", agencyId, allowedCreatorIds, extra: [`p."status" = 'PENDING'`] });
+async function loadPendingSummarySql({ agencyId, allowedCreatorIds = null, authorityNow, currentGenerationOnly = false }) {
+  const where = sqlScopedWhere({
+    alias: "p", agencyId, allowedCreatorIds,
+    extra: [
+      `p."status" = 'PENDING'`,
+      ...(currentGenerationOnly ? [`p."derivationVersion"='team_pending_v2'`, `p."projectionState" IN ('FULL','INCOMPLETE_HISTORY')`] : []),
+    ],
+  });
   if (where.empty) return [];
   const params = [...where.params, new Date(authorityNow)];
   const nowRef = `$${params.length}`;
@@ -824,15 +835,102 @@ async function loadPendingSummarySql({ agencyId, allowedCreatorIds = null, autho
            COUNT(*) FILTER (WHERE p."firstIncomingAt" <= ${nowRef} - INTERVAL '15 minutes')::bigint AS "olderThan15m",
            COUNT(*) FILTER (WHERE p."firstIncomingAt" <= ${nowRef} - INTERVAL '60 minutes')::bigint AS "olderThan60m",
            MIN(p."firstIncomingAt") AS "oldestPendingAt"
-    FROM "TeamPendingDialogState" p
+    FROM "TeamPendingDialogStateCurrent" p
     WHERE ${where.sql}
     GROUP BY GROUPING SETS ((p."ownerMemberId"), ())
   `;
   return teamScaleQuery("pending_summary", sql, params);
 }
 
-async function loadMoneySummarySql({ agencyId, range, allowedCreatorIds = null }) {
-  const where = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt", extra: [`m."attributionActive" = TRUE`, `m."memberId" IS NOT NULL`] });
+function floorUtcDay(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(d.getTime())) return null;
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+function ceilUtcDay(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(d.getTime())) return null;
+  const floor = floorUtcDay(d);
+  return d.getTime() === floor.getTime() ? floor : new Date(floor.getTime() + 24 * 60 * 60 * 1000);
+}
+
+async function teamMoneyReadSummaryGenerationStatus({ agencyId }) {
+  const coverage = await phase2CoverageStatus({
+    agencyId,
+    family: PHASE2_COVERAGE_FAMILY.TEAM_READ_SUMMARY,
+    generation: PHASE2_COVERAGE_GENERATION.TEAM_READ_SUMMARY,
+  }).catch(() => ({ ready: false, state: "UNAVAILABLE", row: null }));
+  if (!coverage?.ready) return { ready: false, coverage, outstanding: null };
+  try {
+    const rows = await prisma.$queryRawUnsafe(`SELECT EXISTS (
+      SELECT 1 FROM "DomainWorkItem" w
+      WHERE w."agencyId"=$1 AND w."workClass"='TEAM_READ_SUMMARY'
+        AND (w."state" <> 'DONE' OR w."requestedRevision" > w."completedRevision")
+      LIMIT 1
+    ) AS "hasOutstanding"`, String(agencyId));
+    const outstanding = Boolean(rows?.[0]?.hasOutstanding);
+    return { ready: !outstanding, coverage, outstanding };
+  } catch (_) {
+    // Failure to prove rollup convergence is not permission to trust a stale
+    // aggregate generation. Canonical facts remain the exact fallback.
+    return { ready: false, coverage, outstanding: null };
+  }
+}
+
+async function loadMoneySummaryRollupSql({ agencyId, range, allowedCreatorIds = null }) {
+  const startAt = range?.startAt ? new Date(range.startAt) : null;
+  const endAt = range?.endAt ? new Date(range.endAt) : null;
+  if (!startAt || !endAt || !Number.isFinite(startAt.getTime()) || !Number.isFinite(endAt.getTime()) || endAt < startAt) return null;
+
+  const fullStart = ceilUtcDay(startAt);
+  const fullEnd = floorUtcDay(endAt);
+  if (!fullStart || !fullEnd || fullStart.getTime() >= fullEnd.getTime()) return null;
+
+  const scope = normalizedCreatorScope(allowedCreatorIds);
+  if (scope && scope.length === 0) return [];
+  const params = [String(agencyId), fullStart, fullEnd, startAt, endAt];
+  let rollupScope = "";
+  let factScope = "";
+  if (scope) {
+    params.push(scope);
+    const ref = `$${params.length}::text[]`;
+    rollupScope = ` AND r."creatorId" = ANY(${ref})`;
+    factScope = ` AND m."creatorId" = ANY(${ref})`;
+  }
+
+  const sql = `
+    WITH money_slices AS (
+      SELECT r."memberId", r."sourceType", r."currency",
+             SUM(r."factCount")::bigint AS "factCount", SUM(r."amountCents")::bigint AS "amountCents"
+      FROM "TeamMoneyDailyRollup" r
+      WHERE r."agencyId"=$1 AND r."memberId" IS NOT NULL
+        AND r."day" >= $2::date AND r."day" < $3::date${rollupScope}
+      GROUP BY r."memberId", r."sourceType", r."currency"
+      UNION ALL
+      SELECT m."memberId", m."sourceType", m."currency",
+             COUNT(*)::bigint AS "factCount", COALESCE(SUM(m."amountCents"),0)::bigint AS "amountCents"
+      FROM "TeamMoneyAttributionFact" m
+      WHERE m."agencyId"=$1 AND m."classificationState"='CANONICAL' AND m."attributionActive"=TRUE AND m."memberId" IS NOT NULL
+        AND m."occurredAt" >= $4 AND m."occurredAt" <= $5
+        AND (m."occurredAt" < $2 OR m."occurredAt" >= $3)${factScope}
+      GROUP BY m."memberId", m."sourceType", m."currency"
+    )
+    SELECT x."memberId" AS "memberId", x."sourceType" AS "sourceType", x."currency" AS "currency",
+           GROUPING(x."sourceType")::int AS "sourceGrouped", GROUPING(x."currency")::int AS "currencyGrouped",
+           COALESCE(SUM(x."factCount"),0)::bigint AS "factCount", COALESCE(SUM(x."amountCents"),0)::bigint AS "amountCents"
+    FROM money_slices x
+    GROUP BY GROUPING SETS ((x."memberId",x."sourceType",x."currency"),(x."memberId"))
+  `;
+  return teamScaleQuery("money_summary_rollup", sql, params);
+}
+
+async function loadMoneySummarySql({ agencyId, range, allowedCreatorIds = null, rollupReady = false }) {
+  if (rollupReady) {
+    const rolled = await loadMoneySummaryRollupSql({ agencyId, range, allowedCreatorIds });
+    if (rolled !== null) return rolled;
+  }
+  const where = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt", extra: [`m."classificationState" = 'CANONICAL'`, `m."attributionActive" = TRUE`, `m."memberId" IS NOT NULL`] });
   if (where.empty) return [];
   const sql = `
     SELECT m."memberId" AS "memberId", m."sourceType" AS "sourceType", m."currency" AS "currency",
@@ -887,7 +985,7 @@ async function loadAudienceCoverageSummarySql({ agencyId, range, rawRange, allow
   }
 
   if (includeMoney) {
-    const moneyWhere = sourceWhere({ alias: "m", field: "occurredAt", sourceRange: range, extra: [`m."attributionActive" = TRUE`] });
+    const moneyWhere = sourceWhere({ alias: "m", field: "occurredAt", sourceRange: range, extra: [`m."classificationState" = 'CANONICAL'`, `m."attributionActive" = TRUE`] });
     const moneyFanKey = `COALESCE(NULLIF(m."fanId",''), NULLIF(m."dialogId",''))`;
     fanSources.push(`SELECT m."memberId" AS "memberId", ${moneyFanKey} AS "key" FROM "TeamMoneyAttributionFact" m WHERE ${moneyWhere} AND ${moneyFanKey} IS NOT NULL`);
     creatorSources.push(`SELECT m."memberId" AS "memberId", m."creatorId" AS "key" FROM "TeamMoneyAttributionFact" m WHERE ${moneyWhere} AND m."creatorId" IS NOT NULL`);
@@ -966,12 +1064,18 @@ function responseSummaryFromAggregate(row, source, coverageFrom) {
 async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = true, allowedCreatorIds = null }) {
   const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   const range = resolveRange(rangeKey, authorityNow);
-  const [projectionCoverage, historicalCoverage, retentionPolicy, members] = await Promise.all([
+  const [projectionCoverage, historicalCoverage, retentionPolicy, members, moneyRootCoverageStatus, moneyReadSummaryStatus, dialogGenerationStatus, responseRepairStatus] = await Promise.all([
     loadProjectionCoverage({ agencyId }),
     loadHistoricalCoverage({ agencyId }),
     getRetentionSettings(),
     getMembersShell(agencyId),
+    includeMoney ? phase2CoverageStatus({ agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_MONEY_ROOT_CLASSIFICATION, generation: PHASE2_COVERAGE_GENERATION.TEAM_MONEY_ROOT_CLASSIFICATION }) : Promise.resolve({ ready: true, state: "NOT_REQUIRED", row: null }),
+    includeMoney ? teamMoneyReadSummaryGenerationStatus({ agencyId }) : Promise.resolve({ ready: false, coverage: { state: "NOT_REQUIRED" }, outstanding: false }),
+    phase2CoverageStatus({ agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION }),
+    phase2CoverageStatus({ agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR }),
   ]);
+  const currentDialogGeneration = dialogGenerationStatus?.ready === true;
+  const currentResponseGeneration = currentDialogGeneration && responseRepairStatus?.ready === true;
   if (retentionPolicy?.ok !== true) throw analyticsUnavailable("retention_policy", new Error("Team retention policy unavailable"));
   const detailDays = Number(retentionPolicy.settings?.teamCanonicalDetailDays || 180);
   const projectionDetail = buildProjectionDetailAuthority({
@@ -990,10 +1094,10 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
   const [activityRows, legacyRows, responseRows, dialogRows, pendingRows, moneyRows, audienceRows] = await Promise.all([
     loadActivitySummarySql({ agencyId, range: activityRange, allowedCreatorIds, exactRaw: exactRawActivity }),
     rawRange ? loadLegacyBoundedSummarySql({ agencyId, range: rawRange, allowedCreatorIds }) : Promise.resolve([]),
-    responseRange ? loadResponseSummarySql({ agencyId, range: responseRange, allowedCreatorIds }) : Promise.resolve([]),
+    responseRange ? loadResponseSummarySql({ agencyId, range: responseRange, allowedCreatorIds, currentGenerationOnly: currentResponseGeneration }) : Promise.resolve([]),
     dialogRange ? loadDialogSummarySql({ agencyId, range: dialogRange, allowedCreatorIds, includeMoney }) : Promise.resolve([]),
-    loadPendingSummarySql({ agencyId, allowedCreatorIds, authorityNow }),
-    includeMoney ? loadMoneySummarySql({ agencyId, range, allowedCreatorIds }) : Promise.resolve([]),
+    loadPendingSummarySql({ agencyId, allowedCreatorIds, authorityNow, currentGenerationOnly: currentDialogGeneration }),
+    includeMoney ? loadMoneySummarySql({ agencyId, range, allowedCreatorIds, rollupReady: moneyReadSummaryStatus.ready === true }) : Promise.resolve([]),
     loadAudienceCoverageSummarySql({ agencyId, range, rawRange, allowedCreatorIds, includeMoney, exactRawActivity }),
   ]);
 
@@ -1133,7 +1237,7 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
       metric.revenueByCurrency = currencyBucketObject(revenueBucket);
       metric.revenueAttributedCents = revenue.cents;
       metric.revenueCurrency = revenue.currency;
-      metric.moneySource = revenue.mixed ? "team_money_fact_v1_multi_currency" : "team_money_fact_v1";
+      metric.moneySource = revenue.mixed ? "team_money_fact_v2_multi_currency" : "team_money_fact_v2";
     }
     const cleaned = cleanMetric(metric);
     if (includeMoney && Array.isArray(cleaned.topDialogSessions)) {
@@ -1162,10 +1266,22 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
     byMember.set(memberId, cleaned);
   }
 
-  const responseSource = projectionDetail.responseCoverage.status === "FULL" ? "team_response_case_v1" : (responseRange ? "bounded_projection_partial" : "unavailable");
+  const responseSource = currentResponseGeneration
+    ? (projectionDetail.responseCoverage.status === "FULL" ? "team_response_case_v2" : (responseRange ? "bounded_projection_partial_v2" : "unavailable"))
+    : (projectionDetail.responseCoverage.status === "FULL" ? "team_response_case_legacy_transition" : (responseRange ? "bounded_projection_partial" : "unavailable"));
   const responseSummary = responseSummaryFromAggregate(totalResponseRow || {}, responseSource, projectionDetail.responseAvailableFrom?.toISOString?.() || null);
   const activityCoverage = coverageState(range, historicalCoverage.activityCoverageFrom);
-  const moneyCoverage = coverageState(range, historicalCoverage.moneyCoverageFrom);
+  const baseMoneyCoverage = coverageState(range, historicalCoverage.moneyCoverageFrom);
+  const classificationUnresolved = Math.max(0, Number(moneyRootCoverageStatus?.row?.unresolvedCount || 0));
+  const moneyCoverage = includeMoney ? {
+    ...baseMoneyCoverage,
+    status: moneyRootCoverageStatus?.ready ? (classificationUnresolved > 0 ? "PARTIAL" : baseMoneyCoverage.status) : "PARTIAL",
+    rootClassification: moneyRootCoverageStatus?.state || "MISSING",
+    unresolvedRootGenerations: classificationUnresolved,
+    readSummaryGeneration: moneyReadSummaryStatus?.coverage?.state || "MISSING",
+    readSummaryCurrent: moneyReadSummaryStatus?.ready === true,
+    readSummaryOutstanding: moneyReadSummaryStatus?.outstanding,
+  } : baseMoneyCoverage;
   const rawDistinctCoverage = coverageState(range, projectionDetail.detailRetainedFrom);
 
   return {
@@ -1185,6 +1301,10 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
       creatorScope: Array.isArray(allowedCreatorIds) ? allowedCreatorIds.map(String) : "all",
       readAuthority: "team_analytics_read_authority_v1",
       queryShape: "sql_aggregate_bounded_v1",
+      projectionGeneration: {
+        dialog: currentDialogGeneration ? "team_pending_v2" : "LEGACY_TRANSITION",
+        response: currentResponseGeneration ? "team_response_v2" : "LEGACY_TRANSITION",
+      },
       historical: {
         version: "team_historical_analytics_v1",
         authoritySource: historicalCoverage.source,
@@ -1770,7 +1890,7 @@ async function getPpvLedgerRevenueByMember({ agencyId, range, allowedCreatorIds 
   try {
     const rows = await prisma.teamMoneyAttributionFact.groupBy({
       by: ["memberId", "currency"],
-      where: { agencyId, sourceType: "PPV", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
+      where: { agencyId, sourceType: "PPV", classificationState: "CANONICAL", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
       _sum: { amountCents: true },
     });
     const map = new Map();
@@ -1782,7 +1902,7 @@ async function getPpvLedgerRevenueByMember({ agencyId, range, allowedCreatorIds 
 async function getPpvLedgerRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await findAllById(prisma.teamMoneyAttributionFact, {
-      where: { agencyId, sourceType: "PPV", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
+      where: { agencyId, sourceType: "PPV", classificationState: "CANONICAL", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
       select: { id: true, memberId: true, fanId: true, dialogId: true, amountCents: true, currency: true },
     });
     const map = new Map();
@@ -1798,7 +1918,7 @@ async function getTipLedgerRevenueByMember({ agencyId, range, allowedCreatorIds 
   try {
     const rows = await prisma.teamMoneyAttributionFact.groupBy({
       by: ["memberId", "currency"],
-      where: { agencyId, sourceType: "TIP", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
+      where: { agencyId, sourceType: "TIP", classificationState: "CANONICAL", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
       _sum: { amountCents: true },
     });
     const map = new Map();
@@ -1810,7 +1930,7 @@ async function getTipLedgerRevenueByMember({ agencyId, range, allowedCreatorIds 
 async function getTipLedgerRevenueByMemberDialog({ agencyId, range, allowedCreatorIds = null }) {
   try {
     const rows = await findAllById(prisma.teamMoneyAttributionFact, {
-      where: { agencyId, sourceType: "TIP", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
+      where: { agencyId, sourceType: "TIP", classificationState: "CANONICAL", attributionActive: true, ...creatorScopeWhere(allowedCreatorIds), memberId: { not: null }, ...whereForRange("occurredAt", range) },
       select: { id: true, memberId: true, fanId: true, dialogId: true, amountCents: true, currency: true },
     });
     const map = new Map();
@@ -1898,7 +2018,7 @@ async function buildTeamMembers({ agencyId, rangeKey = "7d", includeMoney = true
       metrics.revenueAttributedCents = revenue.cents;
       metrics.revenueCurrency = revenue.currency;
       metrics.dollarsPerMessageCents = revenue.cents !== null && metrics.messagesSent > 0 ? Math.round(revenue.cents / metrics.messagesSent) : (revenue.cents === 0 ? 0 : null);
-      metrics.moneySource = revenue.mixed ? "team_money_fact_v1_multi_currency" : "team_money_fact_v1";
+      metrics.moneySource = revenue.mixed ? "team_money_fact_v2_multi_currency" : "team_money_fact_v2";
     }
     if (!includeMoney) {
       metrics.revenueAttributedCents = null;

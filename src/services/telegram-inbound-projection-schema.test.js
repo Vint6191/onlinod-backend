@@ -13,6 +13,14 @@ const deliveryAuthority = fs.readFileSync(path.join(root, "src/services/telegram
 const retryFairnessMigration = fs.readFileSync(path.join(root, "prisma/migrations/20260906165000_telegram_inbound_retry_fairness/migration.sql"), "utf8");
 const confirmedProjectionMigration = fs.readFileSync(path.join(root, "prisma/migrations/20260906234500_telegram_confirmed_projection_observability/migration.sql"), "utf8");
 
+
+function functionBlockSource(source, name, nextName) {
+  const start = source.indexOf(`async function ${name}`);
+  assert.notEqual(start, -1, `missing ${name}`);
+  const end = nextName ? source.indexOf(`async function ${nextName}`, start + 1) : -1;
+  return source.slice(start, end > start ? end : undefined);
+}
+
 function modelBlock(name) {
   const start = schema.indexOf(`model ${name} {`);
   assert.notEqual(start, -1, `missing Prisma model ${name}`);
@@ -41,28 +49,27 @@ test("projection migration is additive and backfills only already-proven termina
 });
 
 
-test("inbound projection retry is backend-scheduled and no longer piggybacks Desktop delivery polling", () => {
-  assert.match(scheduler, /TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS\s*=\s*30\s*\*\s*1000/);
+test("inbound projection retry is backend-scheduled through exact revisioned DomainWork", () => {
   assert.match(scheduler, /runTelegramInboundProjectionSweep/);
-  assert.match(scheduler, /retryPendingInboundProjections/);
+  assert.match(scheduler, /PHASE2_WORK_CLASS\.TELEGRAM_INBOUND_PROJECTION/);
+  assert.match(scheduler, /claimDomainWorkBatch/);
+  assert.match(scheduler, /yieldDomainWorkClaim/);
   assert.match(scheduler, /runPhase2MaintenancePump/);
   assert.match(scheduler, /phase2MaintenanceTimer\s*=\s*setInterval/);
   assert.doesNotMatch(deliveryAuthority, /retryPendingInboundProjections/);
 });
 
 
-test("confirmed Telegram receipt projection debt is repaired by the backend recurring scheduler", () => {
+test("confirmed Telegram receipt projection debt is current DomainWork and history is bounded per-agency enumeration", () => {
   assert.match(scheduler, /runTelegramConfirmedProjectionSweep/);
-  assert.match(scheduler, /repairConfirmedTelegramDeliveryProjections/);
-  assert.match(scheduler, /repairCustomModelCommunicationConvergence/);
-  assert.match(scheduler, /db\.agency\.findMany\(\{[\s\S]*deletedAt:\s*null[\s\S]*take:\s*size/);
+  assert.match(scheduler, /PHASE2_WORK_CLASS\.TELEGRAM_CONFIRMED_PROJECTION/);
+  assert.match(scheduler, /repairConfirmedTelegramDeliveryProjectionItem/);
+  assert.match(scheduler, /runTelegramConfirmedCoverageEnumerationUnit/);
+  assert.match(scheduler, /publishDomainWork/);
   assert.match(scheduler, /runTelegramConfirmedProjectionMaintenanceSweep/);
-  assert.match(scheduler, /cursorAgencyId[\s\S]*nextCursorAgencyId/);
   assert.match(scheduler, /runPhase2MaintenancePump[\s\S]*runTelegramConfirmedProjectionMaintenanceSweep/);
-  assert.match(deliveryAuthority, /repairConfirmedTelegramDeliveryProjections/);
-  assert.match(scheduler, /report\.reminderScheduleScanned\s*\+=\s*Number\(result\?\.reminderScheduleScanned/);
-  assert.match(scheduler, /report\.reminderScheduleFailed\s*\+=\s*Number\(result\?\.reminderScheduleFailed/);
-  assert.match(scheduler, /report\.reminderScheduleFailed\s*>\s*0/);
+  assert.match(deliveryAuthority, /repairConfirmedTelegramDeliveryProjectionItem/);
+  assert.doesNotMatch(functionBlockSource(scheduler, "runTelegramConfirmedProjectionSweep", "runTelegramConfirmedProjectionMaintenanceSweep"), /db\.agency\.findMany|repairCustomModelCommunicationConvergence/);
 });
 
 

@@ -1,8 +1,9 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
 
-const PENDING_DERIVATION_VERSION = "team_pending_v1";
+const PENDING_DERIVATION_VERSION = "team_pending_v2";
 const RELEVANT_EVENT_KINDS = new Set(["FAN_MESSAGE_RECEIVED", "DIALOG_SEEN", "MESSAGE_SEND_CONFIRMED"]);
 const MANUAL_SOURCES = ["manual", "manual_chat"];
 
@@ -87,29 +88,60 @@ async function latestManualReply({ agencyId, creatorId, dialogId, db = prisma })
 }
 
 async function loadIncomingAfter({ agencyId, creatorId, dialogId, after, db = prisma }) {
+  // Production must not materialize an arbitrarily large unanswered dialog in Node.
+  // Return only first/last canonical incoming plus the exact deduped count.
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(`
+      WITH dedup AS (
+        SELECT DISTINCT ON (COALESCE(NULLIF(e."messageId",''),NULLIF(e."localId",''),e."id"))
+               e."id",e."messageId",e."localId",e."fanId",e."ts"
+          FROM "TeamActivityEvent" e
+         WHERE e."agencyId"=$1 AND e."creatorId"=$2 AND e."dialogId"=$3
+           AND e."eventKind"='FAN_MESSAGE_RECEIVED'
+           AND ($4::timestamptz IS NULL OR e."ts">$4)
+         ORDER BY COALESCE(NULLIF(e."messageId",''),NULLIF(e."localId",''),e."id"),e."ts" ASC,e."id" ASC
+      ), ranked AS (
+        SELECT d.*, row_number() OVER (ORDER BY d."ts",d."id") AS rn_first,
+               row_number() OVER (ORDER BY d."ts" DESC,d."id" DESC) AS rn_last,
+               count(*) OVER () AS total
+          FROM dedup d
+      )
+      SELECT "id","messageId","localId","fanId","ts","rn_first","rn_last","total"
+        FROM ranked WHERE rn_first=1 OR rn_last=1 ORDER BY "ts" ASC,"id" ASC`,
+      agencyId,creatorId,dialogId,after || null);
+    const out = (rows || []).map((row) => ({ id: row.id, messageId: row.messageId, localId: row.localId, fanId: row.fanId, ts: row.ts }));
+    out.episodeCount = Number(rows?.[0]?.total || 0);
+    return out;
+  }
   const rows = await db.teamActivityEvent.findMany({
-    where: {
-      agencyId,
-      creatorId,
-      dialogId,
-      eventKind: "FAN_MESSAGE_RECEIVED",
-      ...(after ? { ts: { gt: after } } : {}),
-    },
+    where: { agencyId, creatorId, dialogId, eventKind: "FAN_MESSAGE_RECEIVED", ...(after ? { ts: { gt: after } } : {}) },
     orderBy: { ts: "asc" },
   });
-  return dedupeIncoming(rows);
+  const out = dedupeIncoming(rows);
+  out.episodeCount = out.length;
+  return out;
 }
 
 async function loadSeenAfter({ agencyId, creatorId, dialogId, after, db = prisma }) {
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(`
+      WITH dedup AS (
+        SELECT DISTINCT ON (COALESCE(NULLIF(e."localId",''),e."id")) e."id",e."localId",e."memberId",e."ts"
+          FROM "TeamActivityEvent" e
+         WHERE e."agencyId"=$1 AND e."creatorId"=$2 AND e."dialogId"=$3
+           AND e."eventKind"='DIALOG_SEEN' AND e."memberId" IS NOT NULL AND e."ts">=$4
+         ORDER BY COALESCE(NULLIF(e."localId",''),e."id"),e."ts" ASC,e."id" ASC
+      ), ranked AS (
+        SELECT d.*,row_number() OVER (ORDER BY d."ts",d."id") AS rn_first,
+               row_number() OVER (ORDER BY d."ts" DESC,d."id" DESC) AS rn_last
+          FROM dedup d
+      )
+      SELECT "id","localId","memberId","ts" FROM ranked WHERE rn_first=1 OR rn_last=1 ORDER BY "ts","id"`,
+      agencyId,creatorId,dialogId,after);
+    return rows || [];
+  }
   const rows = await db.teamActivityEvent.findMany({
-    where: {
-      agencyId,
-      creatorId,
-      dialogId,
-      eventKind: "DIALOG_SEEN",
-      memberId: { not: null },
-      ts: { gte: after },
-    },
+    where: { agencyId, creatorId, dialogId, eventKind: "DIALOG_SEEN", memberId: { not: null }, ts: { gte: after } },
     orderBy: { ts: "asc" },
   });
   return dedupeSeen(rows);
@@ -121,7 +153,7 @@ async function existingState({ agencyId, creatorId, dialogId, db = prisma }) {
   });
 }
 
-async function reconcilePendingDialog({ agencyId, creatorId, dialogId, fanId = null, db = prisma }) {
+async function reconcilePendingDialogUnlocked({ agencyId, creatorId, dialogId, fanId = null, sourceEventId = null, db = prisma }) {
   agencyId = clean(agencyId, 160);
   creatorId = clean(creatorId, 160);
   dialogId = clean(dialogId, 160);
@@ -136,6 +168,21 @@ async function reconcilePendingDialog({ agencyId, creatorId, dialogId, fanId = n
   if (!incoming.length) {
     if (!existing) return { status: "CLEAR", row: null };
     if (String(existing.status || "").toUpperCase() !== "PENDING") return { status: "CLEAR", row: existing };
+    // Raw Team detail retention is not proof that a pending episode received a reply.
+    // Preserve the known current obligation when the compact state says PENDING but
+    // the historical raw incoming rows are no longer available.
+    if (!replyAt) {
+      const preserved = await db.teamPendingDialogState.update({
+        where: { id: existing.id },
+        data: {
+          projectionRevision: BigInt(existing.projectionRevision || 0) + 1n,
+          projectionState: "INCOMPLETE_HISTORY",
+          lastProjectionSourceId: clean(sourceEventId, 220) || existing.lastProjectionSourceId || null,
+          derivationVersion: PENDING_DERIVATION_VERSION,
+        },
+      });
+      return { status: "PENDING", row: preserved, incompleteHistory: true };
+    }
     const clearData = {
       status: "CLEAR",
       replyAt: replyAt || existing.replyAt || null,
@@ -144,6 +191,9 @@ async function reconcilePendingDialog({ agencyId, creatorId, dialogId, fanId = n
       ownerMemberId: existing.ownerMemberId || null,
       ownerAssignedAt: existing.ownerAssignedAt || null,
       derivationVersion: PENDING_DERIVATION_VERSION,
+      projectionRevision: BigInt(existing.projectionRevision || 0) + 1n,
+      projectionState: "FULL",
+      lastProjectionSourceId: clean(sourceEventId, 220) || existing.lastProjectionSourceId || null,
     };
     const row = await db.teamPendingDialogState.update({ where: { id: existing.id }, data: clearData });
     return { status: "CLEAR", row };
@@ -177,7 +227,7 @@ async function reconcilePendingDialog({ agencyId, creatorId, dialogId, fanId = n
     lastIncomingMessageId: clean(last?.messageId, 220),
     firstIncomingAt,
     lastIncomingAt,
-    incomingCount: incoming.length,
+    incomingCount: Math.max(1, Number(incoming.episodeCount || incoming.length)),
     firstSeenAt: dateOrNull(firstSeen?.ts),
     firstSeenMemberId,
     lastSeenAt: dateOrNull(lastSeen?.ts),
@@ -189,6 +239,9 @@ async function reconcilePendingDialog({ agencyId, creatorId, dialogId, fanId = n
     replyMessageId: null,
     repliedByMemberId: null,
     derivationVersion: PENDING_DERIVATION_VERSION,
+    projectionRevision: BigInt(existing?.projectionRevision || 0) + 1n,
+    projectionState: "FULL",
+    lastProjectionSourceId: clean(sourceEventId, 220),
   };
 
   const row = await db.teamPendingDialogState.upsert({
@@ -197,6 +250,21 @@ async function reconcilePendingDialog({ agencyId, creatorId, dialogId, fanId = n
     update: data,
   });
   return { status: "PENDING", row };
+}
+
+function pendingDialogFenceKey({ agencyId, creatorId, dialogId }) {
+  return `team-pending:${clean(agencyId,160) || ""}:${clean(creatorId,160) || ""}:${clean(dialogId,160) || ""}`;
+}
+
+async function reconcilePendingDialog({ agencyId, creatorId, dialogId, fanId = null, sourceEventId = null, db = prisma }) {
+  const identity = { agencyId: clean(agencyId,160), creatorId: clean(creatorId,160), dialogId: clean(dialogId,160) };
+  if (!identity.agencyId || !identity.creatorId || !identity.dialogId) return { skipped: true, reason: "missing_dialog_identity" };
+  return runDbTransaction(db, async (tx) => {
+    if (typeof tx?.$executeRawUnsafe === "function") {
+      await lockDbAdvisoryXact({ db: tx, key: pendingDialogFenceKey(identity), mode: "exclusive" });
+    }
+    return reconcilePendingDialogUnlocked({ agencyId: identity.agencyId, creatorId: identity.creatorId, dialogId: identity.dialogId, fanId, sourceEventId, db: tx });
+  });
 }
 
 async function markProjected(row, db = prisma) {
@@ -228,6 +296,7 @@ async function applyTeamPendingProjection(row, db = prisma) {
     creatorId: row?.creatorId,
     dialogId: row?.dialogId || row?.fanId,
     fanId: row?.fanId,
+    sourceEventId: row?.id || row?.localId || null,
     db,
   });
   await markProjected(row, db);

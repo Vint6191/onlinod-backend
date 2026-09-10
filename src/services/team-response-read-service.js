@@ -5,6 +5,9 @@ const { resolveRange, rangeForClient, whereForRange } = require("./range-service
 const { getRetentionSettings } = require("./retention-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { retainedDetailFrom, latestAvailableFrom, clampRangeToAvailableFrom, coverageState } = require("./team-historical-range-authority-service");
+const { phase2CoverageStatus, FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION } = require("./phase2-work-coverage-authority-service");
+
+const CURRENT_RESPONSE_DERIVATION_VERSION = "team_response_v2";
 
 const RESPONSE_CLASSIFICATIONS = new Set(["FRESH", "BACKLOG", "HANDOFF", "UNKNOWN"]);
 
@@ -60,6 +63,22 @@ async function resolveDetailReadAuthority({ agencyId, rangeKey, family }) {
   };
 }
 
+async function responseProjectionAuthorityWhere({ agencyId, db = prisma, includeIncomplete = true } = {}) {
+  try {
+    const [dialog, response] = await Promise.all([
+      phase2CoverageStatus({ db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION }),
+      phase2CoverageStatus({ db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR }),
+    ]);
+    if (!dialog?.ready || !response?.ready) return {};
+    return {
+      derivationVersion: CURRENT_RESPONSE_DERIVATION_VERSION,
+      projectionState: includeIncomplete ? { in: ["FULL", "INCOMPLETE_HISTORY"] } : "FULL",
+    };
+  } catch (_) {
+    return {};
+  }
+}
+
 async function listTeamResponseCases({
   agencyId,
   rangeKey = "7d",
@@ -71,8 +90,10 @@ async function listTeamResponseCases({
   const authority = await resolveDetailReadAuthority({ agencyId, rangeKey, family: "response" });
   const { range, retainedRange } = authority;
   const normalizedClassification = clean(classification, 32)?.toUpperCase() || null;
+  const generationWhere = await responseProjectionAuthorityWhere({ agencyId, db: prisma, includeIncomplete: true });
   const where = {
     agencyId,
+    ...generationWhere,
     ...creatorScopeWhere(allowedCreatorIds),
     ...(retainedRange ? whereForRange("replyAt", retainedRange) : { id: "__outside_retained_history__" }),
     ...(clean(memberId, 160) ? { memberId: clean(memberId, 160) } : {}),
@@ -214,6 +235,7 @@ async function listTeamCoverageSessions({
 }
 
 module.exports = {
+  CURRENT_RESPONSE_DERIVATION_VERSION, responseProjectionAuthorityWhere,
   RESPONSE_CLASSIFICATIONS,
   listTeamResponseCases,
   listTeamDialogSessions,

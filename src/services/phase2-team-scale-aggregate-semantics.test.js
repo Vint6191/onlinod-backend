@@ -78,7 +78,7 @@ function makePrisma({ queryLog }) {
       if (/FROM "TeamActivityEvent" e/.test(sql) && /incomingMessagesLegacy/.test(sql)) {
         return [{ memberId: "member-a", chatOpened: 2n, incomingMessagesLegacy: 1n, engagementReplies: 1n, massMessages: 4n, backlogClearedLegacy: 0n, backlogMaxAgeSecondsLegacy: 0 }];
       }
-      if (/FROM "TeamResponseCase" r/.test(sql) && /GROUPING SETS/.test(sql)) {
+      if (/FROM "TeamResponseCaseCurrent" r/.test(sql) && /GROUPING SETS/.test(sql)) {
         const row = {
           cases: 8n,
           incomingHandled: 8n,
@@ -101,7 +101,7 @@ function makePrisma({ queryLog }) {
         return [{ ...row, isTotal: 0, memberId: "member-a" }, { ...row, isTotal: 1, memberId: null }];
       }
       if (/WITH grouped AS/.test(sql) && /TeamDialogSession/.test(sql)) return [];
-      if (/FROM "TeamPendingDialogState" p/.test(sql)) {
+      if (/FROM "TeamPendingDialogStateCurrent" p/.test(sql)) {
         return [{ isTotal: 1, memberId: null, pendingDialogs: 0n, pendingIncomingMessages: 0n, unassignedDialogs: 0n, seenDialogs: 0n, olderThan15m: 0n, olderThan60m: 0n, oldestPendingAt: null }];
       }
       if (/FROM "TeamMoneyAttributionFact" m/.test(sql) && /GROUPING SETS/.test(sql)) {

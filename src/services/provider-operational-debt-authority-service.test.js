@@ -34,7 +34,7 @@ function fixture() {
   const intents = [];
   const submissions = [];
   const debts = [];
-  let maintenance = null;
+  let coverage = null;
   const tx = {
     async $queryRawUnsafe() { return []; },
     customOrder: {
@@ -61,12 +61,15 @@ function fixture() {
       async createMany({ data }) { debts.push(...data.map(clone)); return { count: data.length }; },
       async findMany({ where }) { return debts.filter((row) => matches(row, where)).map(clone); },
     },
-    maintenanceLaneState: {
-      async findUnique({ where }) { return where.key === PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY ? clone(maintenance) : null; },
+    phase2WorkCoverage: {
+      async findUnique({ where }) {
+        const k = where.agencyId_family_generation;
+        return k && String(k.agencyId) === "agency-1" ? clone(coverage) : null;
+      },
     },
   };
   const db = { ...tx, async $transaction(work) { return work(tx); } };
-  return { db, now, orders, intents, submissions, debts, completeBackfill() { maintenance = { key: PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY, generation: PROVIDER_OPERATIONAL_BACKFILL_GENERATION, completedAt: now }; } };
+  return { db, now, orders, intents, submissions, debts, completeBackfill() { coverage = { agencyId: "agency-1", family: "PROVIDER_OPERATIONAL", generation: "phase2_provider_operational_coverage_v1", active: true, enumerationState: "COMPLETE", completedAt: now }; } };
 }
 
 function confirmedIntent(overrides = {}) {
@@ -97,6 +100,21 @@ test("exact order projection creates only current provider debt and marks the or
   assert.equal(fx.debts.some((row) => row.debtClass === DEBT.INCOMPLETE_SOURCE_RELAY && row.accountId === "tg-2"), true);
 });
 
+test("A2: order reprojection cannot delete external projection work owned by another projector", async () => {
+  const fx = fixture();
+  fx.debts.push({
+    id: "pod_external_delivery-1", agencyId: "agency-1", accountId: "tg-external",
+    debtClass: DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT, objectType: "AutomationDelivery", objectId: "delivery-1",
+    customOrderId: "order-1", creatorId: "creator-1", reasonCode: "CUSTOM_EXTERNAL_PROJECTION_DEBT", createdAt: fx.now, updatedAt: fx.now,
+  });
+  fx.intents.push(confirmedIntent());
+
+  await reconcileProviderOperationalDebtForOrder({ agencyId: "agency-1", orderId: "order-1", db: fx.db, now: fx.now });
+
+  assert.equal(fx.debts.some((row) => row.id === "pod_external_delivery-1" && row.debtClass === DEBT.CUSTOM_EXTERNAL_PROJECTION_DEBT), true);
+  assert.equal(fx.debts.some((row) => row.debtClass === DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY), true);
+});
+
 test("reprojection clears stale debt when canonical provider debt is gone", async () => {
   const fx = fixture();
   fx.intents.push(confirmedIntent({ projectionBlockedAt: fx.now }));
@@ -113,9 +131,9 @@ test("reprojection clears stale debt when canonical provider debt is gone", asyn
 
 test("provider operational authority fails closed until one-time current-debt backfill is complete", async () => {
   const fx = fixture();
-  assert.equal(await providerOperationalBackfillReady({ db: fx.db }), false);
-  await assert.rejects(() => requireProviderOperationalBackfillReady({ db: fx.db }), (error) => error?.code === "PROVIDER_OPERATIONAL_DEBT_BACKFILL_INCOMPLETE" && error?.status === 503);
+  assert.equal(await providerOperationalBackfillReady({ db: fx.db, agencyId: "agency-1" }), false);
+  await assert.rejects(() => requireProviderOperationalBackfillReady({ db: fx.db, agencyId: "agency-1" }), (error) => error?.code === "PROVIDER_OPERATIONAL_DEBT_BACKFILL_INCOMPLETE" && error?.status === 503);
   fx.completeBackfill();
-  assert.equal(await providerOperationalBackfillReady({ db: fx.db }), true);
-  assert.equal(await requireProviderOperationalBackfillReady({ db: fx.db }), true);
+  assert.equal(await providerOperationalBackfillReady({ db: fx.db, agencyId: "agency-1" }), true);
+  assert.equal(await requireProviderOperationalBackfillReady({ db: fx.db, agencyId: "agency-1" }), true);
 });

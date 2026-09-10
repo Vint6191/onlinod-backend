@@ -106,3 +106,48 @@ test("production CALL summary stays exact without loading an unbounded 24h histo
   assert.deepEqual(result.callSummary, { upcoming: 321, due: 12, overdue: 44, horizonHours: 24 });
   assert.ok(takes.every((value) => Number.isInteger(value) && value <= 400), `CALL detail reads must stay bounded: ${JSON.stringify(takes)}`);
 });
+
+
+test("A48 production CALL top-N uses one exact mixed-duration rank before LIMIT", async () => {
+  const client = db();
+  const now = new Date("2026-08-22T11:00:00.000Z");
+  const exactRows = [
+    { ...base, id: "late-short-overdue", scenario: "Short call", type: "CALL", scheduledAt: new Date("2026-08-22T10:40:00.000Z"), durationMinutes: 5 },
+    { ...base, id: "early-long-due", scenario: "Long call", type: "CALL", scheduledAt: new Date("2026-08-22T10:00:00.000Z"), durationMinutes: 120 },
+  ];
+  const rawSql = [];
+  client.$queryRawUnsafe = async (sql, ...params) => {
+    const text = String(sql);
+    rawSql.push(text);
+    if (/COUNT\(\*\) FILTER/.test(text)) return [{ upcoming: 0, due: 1, overdue: 1 }];
+    assert.match(text, /WITH overdue AS/);
+    assert.match(text, /GREATEST\(1, LEAST\(1440, COALESCE\("durationMinutes", 1\)\)\)/);
+    assert.ok(text.indexOf('ORDER BY "scheduledAt" +') < text.indexOf('LIMIT 2'), "overdue business rank must be applied before branch LIMIT");
+    return [{ id: "late-short-overdue" }, { id: "early-long-due" }];
+  };
+  const originalFindMany = client.customOrder.findMany;
+  client.customOrder.findMany = async (args) => {
+    if (args?.where?.id?.in) {
+      assert.deepEqual(args.where.id.in, ["late-short-overdue", "early-long-due"]);
+      return [exactRows[1], exactRows[0]]; // DB delegate order is intentionally different.
+    }
+    if (args?.where?.type === "CALL") throw new Error("production CALL detail path must not use scheduledAt candidate pools");
+    return originalFindMany(args);
+  };
+
+  const result = await listCustomNonContentOperations({ agencyId: "agency-1", member, limit: 2, now, db: client });
+  assert.deepEqual(result.callSummary, { upcoming: 0, due: 1, overdue: 1, horizonHours: 24 });
+  assert.deepEqual(result.calls.map((item) => [item.customOrderId, item.phase]), [
+    ["late-short-overdue", "OVERDUE"],
+    ["early-long-due", "DUE"],
+  ]);
+  assert.equal(rawSql.length, 2, "summary and exact top-N are separate bounded SQL reads");
+});
+
+test("A48 fresh-source migration indexes exact pending CALL end-rank", () => {
+  const root = path.resolve(__dirname, "..", "..");
+  const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260910144500_phase2_fresh_source_closure", "migration.sql"), "utf8");
+  assert.match(migration, /CustomOrder_call_pending_end_rank_idx/);
+  assert.match(migration, /GREATEST\(1, LEAST\(1440, COALESCE\("durationMinutes", 1\)\)\)/);
+  assert.match(migration, /WHERE "type" = 'CALL'[\s\S]*"status" = 'PENDING'[\s\S]*"scheduledAt" IS NOT NULL/);
+});

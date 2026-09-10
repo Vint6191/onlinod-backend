@@ -1,5 +1,8 @@
 "use strict";
 
+const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
+
 function normalizeTelegramUserId(value) {
   const text = String(value ?? "").trim();
   if (!/^\d{1,20}$/.test(text)) {
@@ -29,40 +32,59 @@ function normalizeExpectedTelegramContact(value) {
   return text;
 }
 
-async function setCreatorTelegramUserId({ agencyId, creatorId, telegramUserId, expectedTelegramContact, db = null }) {
+async function setCreatorTelegramUserId({ agencyId, actorMember, creatorId, telegramUserId, expectedTelegramContact, db = null }) {
   const client = db || require("../prisma");
   const normalized = normalizeTelegramUserId(telegramUserId);
   const expectedContact = normalizeExpectedTelegramContact(expectedTelegramContact);
   const id = String(creatorId || "");
   const agency = String(agencyId || "");
-
-  // Bind the resolved Telegram identity only if the creator still has exactly the
-  // contact that Desktop resolved. updateMany makes the contact check and write
-  // atomic, so an edit cannot race an in-flight resolve and attach a stale id.
-  const result = await client.creatorAccount.updateMany({
-    where: { id, agencyId: agency, deletedAt: null, telegramContact: expectedContact },
-    data: { telegramUserId: normalized },
-  });
-  if (Number(result?.count || 0) !== 1) {
-    const current = await client.creatorAccount.findFirst({
-      where: { id, agencyId: agency, deletedAt: null },
-      select: { id: true, telegramContact: true },
-    });
-    if (!current) {
-      const err = new Error("Creator not found");
-      err.code = "CREATOR_NOT_FOUND";
-      err.status = 404;
-      throw err;
-    }
-    const err = new Error("Telegram contact changed while its identity was being resolved");
-    err.code = "CREATOR_TELEGRAM_CONTACT_CHANGED";
-    err.status = 409;
+  if (typeof client?.$transaction !== "function") {
+    const err = new Error("Creator Telegram identity mutation requires transactional storage");
+    err.code = "CREATOR_TELEGRAM_IDENTITY_TRANSACTION_REQUIRED";
+    err.status = 503;
     throw err;
   }
 
-  return client.creatorAccount.findFirst({
-    where: { id, agencyId: agency, deletedAt: null },
-  });
+  return client.$transaction(async (tx) => {
+    await lockAgencyPipelineLifecycle({ db: tx, agencyId: agency });
+    await assertManagementCommitAuthority({
+      tx,
+      agencyId: agency,
+      actorMember,
+      permissionKey: "creators.manage",
+      creatorIds: [id],
+      agencyAlreadyLocked: true,
+    });
+    await lockCreatorPipelineLifecycle({ db: tx, agencyId: agency, creatorId: id });
+
+    // Bind the resolved Telegram identity only if the creator still has exactly the
+    // contact that Desktop resolved. The commit-time management guard above and
+    // this CAS solve different races and are both required.
+    const result = await tx.creatorAccount.updateMany({
+      where: { id, agencyId: agency, deletedAt: null, telegramContact: expectedContact },
+      data: { telegramUserId: normalized },
+    });
+    if (Number(result?.count || 0) !== 1) {
+      const current = await tx.creatorAccount.findFirst({
+        where: { id, agencyId: agency, deletedAt: null },
+        select: { id: true, telegramContact: true },
+      });
+      if (!current) {
+        const err = new Error("Creator not found");
+        err.code = "CREATOR_NOT_FOUND";
+        err.status = 404;
+        throw err;
+      }
+      const err = new Error("Telegram contact changed while its identity was being resolved");
+      err.code = "CREATOR_TELEGRAM_CONTACT_CHANGED";
+      err.status = 409;
+      throw err;
+    }
+
+    return tx.creatorAccount.findFirst({
+      where: { id, agencyId: agency, deletedAt: null },
+    });
+  }, { isolationLevel: "Serializable" });
 }
 
 module.exports = {

@@ -19,10 +19,19 @@ function fakeDb({ lifecycleState = "ACTIVE", accountExists = true } = {}) {
     id: "creator-1", agencyId: "agency-1", deletedAt: null, status: "READY",
     telegramContact: "@old", telegramUserId: "900001", telegramAccountId: null,
   };
+  const actor = { id: "owner-1", userId: "user-owner", agencyId: "agency-1", role: "OWNER", roleKey: "owner", permissions: { "creators.manage": true }, assignedCreators: "all", accessEpoch: 1, deletedAt: null, deactivatedAt: null };
   const audits = [];
   let tail = Promise.resolve();
 
   const db = {
+    agencyMember: {
+      async findFirst({ where }) {
+        if (where.id && where.id !== actor.id) return null;
+        if (where.userId && where.userId !== actor.userId) return null;
+        if (where.agencyId && where.agencyId !== actor.agencyId) return null;
+        return clone(actor);
+      },
+    },
     agency: {
       async findFirst({ where, select = null }) {
         if (where.id !== agency.id) return null;
@@ -112,12 +121,12 @@ function fakeDb({ lifecycleState = "ACTIVE", accountExists = true } = {}) {
   return db;
 }
 
-const owner = { id: "owner-1", userId: "user-owner", agencyId: "agency-1", role: "OWNER", roleKey: "owner" };
+const owner = { id: "owner-1", userId: "user-owner", agencyId: "agency-1", role: "OWNER", roleKey: "owner", permissions: { "creators.manage": true }, assignedCreators: "all", accessEpoch: 1 };
 
 test("F41 creator Telegram assignment rejects RETIRING account without writing a stale current reference", async () => {
   const db = fakeDb({ lifecycleState: "RETIRING" });
   await assert.rejects(
-    () => updateCreatorTelegramContact({ agencyId: "agency-1", actorUserId: owner.userId, creatorId: "creator-1", telegramContact: "@new", telegramAccountId: "tg-1", db }),
+    () => updateCreatorTelegramContact({ agencyId: "agency-1", actorMember: owner, actorUserId: owner.userId, creatorId: "creator-1", telegramContact: "@new", telegramAccountId: "tg-1", db }),
     (error) => error?.code === "CREATOR_TELEGRAM_ACCOUNT_RETIRING" && error?.status === 409,
   );
   assert.equal(db._state().creator.telegramAccountId, null);
@@ -133,7 +142,7 @@ test("F41 creator Telegram assignment cannot resurrect a deleted account after r
   await db.agencyTelegramMtprotoAccount.delete({ where: { id: "tg-1" } });
   assert.equal(db._state().account, null);
   await assert.rejects(
-    () => updateCreatorTelegramContact({ agencyId: "agency-1", actorUserId: owner.userId, creatorId: "creator-1", telegramContact: "@new", telegramAccountId: "tg-1", db }),
+    () => updateCreatorTelegramContact({ agencyId: "agency-1", actorMember: owner, actorUserId: owner.userId, creatorId: "creator-1", telegramContact: "@new", telegramAccountId: "tg-1", db }),
     (error) => error?.code === "CREATOR_TELEGRAM_ACCOUNT_INVALID" && error?.status === 404,
   );
   assert.equal(db._state().creator.telegramAccountId, null);
@@ -141,7 +150,7 @@ test("F41 creator Telegram assignment cannot resurrect a deleted account after r
 
 test("F41 creator assignment wins ACTIVE account row first and later explicit removal deterministically unassigns it", async () => {
   const db = fakeDb();
-  const assigned = await updateCreatorTelegramContact({ agencyId: "agency-1", actorUserId: owner.userId, creatorId: "creator-1", telegramContact: "@new", telegramAccountId: "tg-1", db });
+  const assigned = await updateCreatorTelegramContact({ agencyId: "agency-1", actorMember: owner, actorUserId: owner.userId, creatorId: "creator-1", telegramContact: "@new", telegramAccountId: "tg-1", db });
   assert.equal(assigned.telegramAccountId, "tg-1");
   assert.equal(db._state().creator.telegramAccountId, "tg-1");
 
@@ -171,7 +180,7 @@ test("F41 retirement transaction winning first blocks a concurrently started cre
   await retiring;
 
   const assignment = updateCreatorTelegramContact({
-    agencyId: "agency-1", actorUserId: owner.userId, creatorId: "creator-1",
+    agencyId: "agency-1", actorMember: owner, actorUserId: owner.userId, creatorId: "creator-1",
     telegramContact: "@new", telegramAccountId: "tg-1", db,
   });
   allowRetireResolve();
@@ -197,7 +206,7 @@ test("creator retirement winning first blocks a concurrently queued Telegram reb
   await retired;
 
   const assignment = updateCreatorTelegramContact({
-    agencyId: "agency-1", actorUserId: owner.userId, creatorId: "creator-1",
+    agencyId: "agency-1", actorMember: owner, actorUserId: owner.userId, creatorId: "creator-1",
     telegramContact: "@new", telegramAccountId: "tg-1", db,
   });
   allowCommitResolve();

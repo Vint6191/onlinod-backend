@@ -25,13 +25,13 @@ function token(prefix) {
 test("Phase2 PostgreSQL historical authority: DB triggers create durable projection before proof", { skip: !enabled }, async (t) => {
   const prisma = require("../prisma");
   try {
-    const agency = await prisma.agency.findFirst({ where: { deletedAt: null }, select: { id: true } });
-    if (!agency) {
-      t.skip("No active Agency row exists in the PostgreSQL integration database");
-      return;
-    }
-
     await rollbackTx(prisma, async (tx) => {
+      const agency = { id: token("phase2_agency") };
+      await tx.$executeRawUnsafe(
+        `INSERT INTO "Agency" ("id","name","plan","status","createdAt","updatedAt")
+         VALUES ($1,$2,'trial','TRIAL',clock_timestamp(),clock_timestamp())`,
+        agency.id, `Phase2 historical PG ${agency.id}`,
+      );
       const eventId = token("phase2_activity");
       const memberId = token("member");
       const accountId = token("creator_ref");

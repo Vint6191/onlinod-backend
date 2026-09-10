@@ -287,17 +287,22 @@ async function applyLedgerSideEffects(row, db = prisma) {
   // are projected exclusively from canonical CreatorSale rows.
 }
 
-async function expirePendingJobs({ agencyId = null, now = new Date() } = {}) {
+async function expirePendingJobs({ agencyId = null, now = new Date(), limit = 500, db = prisma } = {}) {
+  const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 500)));
   const where = {
     status: "pending",
     expiresAt: { lt: now instanceof Date ? now : new Date(now) },
     ...(agencyId ? { agencyId } : {}),
   };
-  try {
-    return await prisma.teamPpvResolveJob.updateMany({ where, data: { status: "expired" } });
-  } catch (_) {
-    return { count: 0 };
-  }
+  const rows = await db.teamPpvResolveJob.findMany({
+    where, select: { id: true }, orderBy: [{ expiresAt: "asc" }, { id: "asc" }], take: safeLimit,
+  });
+  if (!rows.length) return { count: 0, hasMore: false };
+  const result = await db.teamPpvResolveJob.updateMany({
+    where: { id: { in: rows.map((row) => row.id) }, status: "pending" },
+    data: { status: "expired" },
+  });
+  return { count: Number(result?.count || 0), hasMore: rows.length >= safeLimit };
 }
 
 async function createResolverActivityEvent(tx, { agencyId, deviceId, job, memberId, item }) {
@@ -834,33 +839,55 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
   return { resolved: 1, skipped: 0, action: outcome };
 }
 
-async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS, now = new Date() } = {}) {
+async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS, now = new Date(), limit = 500, db = prisma } = {}) {
   const authorityNow = now instanceof Date ? now : new Date(now);
-  await expirePendingJobs({ now: authorityNow });
+  const expired = await expirePendingJobs({ now: authorityNow, limit, db });
   const before = new Date(authorityNow.getTime() - olderThanMs);
+  const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 500)));
 
-  const [sent, purchases, resolveJobs] = await Promise.all([
-    prisma.teamSentMessageLedger.deleteMany({ where: { sentAt: { lt: before } } }),
-    prisma.teamPpvPurchaseLedger.deleteMany({
+  // R15/R6: Team retention is a finite work unit. Preserve compact authority
+  // roots and only mutate ids selected by a bounded keyset/range query.
+  const [sentRows, purchaseRows, resolveRows] = await Promise.all([
+    db.teamSentMessageLedger.findMany({
+      where: { sentAt: { lt: before }, compactedAt: null },
+      select: { id: true }, orderBy: [{ sentAt: "asc" }, { id: "asc" }], take: safeLimit,
+    }),
+    prisma.teamPpvPurchaseLedger.findMany({
       where: {
         purchasedAt: { lt: before },
         status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected", "creator_revenue"] },
-        historicalFactVersion: "team_money_fact_v1",
-        historicalFactProjectedAt: { not: null },
+        historicalFactVersion: "team_money_fact_v2", historicalFactProjectedAt: { not: null }, compactedAt: null,
       },
+      select: { id: true }, orderBy: [{ purchasedAt: "asc" }, { id: "asc" }], take: safeLimit,
     }),
-    prisma.teamPpvResolveJob.deleteMany({
+    prisma.teamPpvResolveJob.findMany({
       where: {
         OR: [{ expiresAt: { lt: authorityNow } }, { createdAt: { lt: before } }],
         status: { in: ["resolved", "expired", "rejected"] },
       },
+      select: { id: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: safeLimit,
     }),
   ]);
 
+  const [sent, purchases, resolveJobs] = await Promise.all([
+    sentRows.length ? db.teamSentMessageLedger.updateMany({
+      where: { id: { in: sentRows.map((row) => row.id) } },
+      data: { mediaIds: null, compactedAt: authorityNow, rootVersion: "team_sent_root_v2" },
+    }) : Promise.resolve({ count: 0 }),
+    purchaseRows.length ? db.teamPpvPurchaseLedger.updateMany({
+      where: { id: { in: purchaseRows.map((row) => row.id) } },
+      data: { compactedAt: authorityNow, rootVersion: "team_money_root_v2" },
+    }) : Promise.resolve({ count: 0 }),
+    resolveRows.length ? db.teamPpvResolveJob.deleteMany({ where: { id: { in: resolveRows.map((row) => row.id) } } }) : Promise.resolve({ count: 0 }),
+  ]);
+
   return {
-    sentMessageLedger: sent?.count || 0,
-    ppvPurchaseLedger: purchases?.count || 0,
+    sentMessageLedger: 0,
+    sentMessageLedgerCompacted: sent?.count || 0,
+    ppvPurchaseLedger: 0,
+    ppvPurchaseLedgerCompacted: purchases?.count || 0,
     ppvResolveJob: resolveJobs?.count || 0,
+    hasMore: Boolean(expired?.hasMore) || sentRows.length >= safeLimit || purchaseRows.length >= safeLimit || resolveRows.length >= safeLimit,
   };
 }
 

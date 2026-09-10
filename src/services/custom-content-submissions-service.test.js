@@ -8,6 +8,8 @@ const {
   assignCustomContentSubmission,
   assertCustomSubmissionTelegramSourceAccess,
   claimCustomContentSubmissionUploadWork,
+  heartbeatCustomContentSubmissionSourceWork,
+  reportCustomContentSubmissionExecutionAttempt,
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   createCustomContentSubmissionFromInboundEvent,
@@ -27,6 +29,21 @@ function settlementReceipt(folderId, profileRevision, mediaIds, at = new Date("2
     vaultSettlementConfirmedAt: at,
     vaultSettlementConfirmedByDeviceId: "device-1",
   };
+}
+
+function claimedSourceDomainWork(submissionId, overrides = {}) {
+  return {
+    id: `dwi-source-${submissionId}`, agencyId: "agency-1", workClass: "CUSTOM_SOURCE_PIPELINE",
+    objectType: "CustomContentSubmission", objectId: submissionId, parentObjectId: null, partitionKey: "creator-1",
+    creatorId: "creator-1", accountId: "tg-1", requestedRevision: 1n, completedRevision: 0n, claimedRevision: 1n,
+    ownerToken: "source-worker", claimFence: 1n, leaseUntil: new Date("2026-08-21T14:00:00.000Z"),
+    activeGeneration: "phase2_domain_work_v1", projectionVersion: "phase2_domain_work_v1", state: "CLAIMED",
+    availableAt: new Date("2026-08-21T12:00:00.000Z"), nextAttemptAt: null, attempts: 1, progressCursor: null,
+    ...overrides,
+  };
+}
+function sourceClaim(row) {
+  return { id: row.id, ownerToken: row.ownerToken, claimFence: String(row.claimFence), claimedRevision: String(row.claimedRevision), leaseUntil: row.leaseUntil?.toISOString?.() || null };
 }
 
 function clone(value) { return value == null ? value : structuredClone(value); }
@@ -63,8 +80,50 @@ function fakeDb(seed = {}) {
   const relayProofs = (seed.relayProofs || []).map(clone);
   const inboundEvents = (seed.inboundEvents || []).map(clone);
   const deliveryIntents = (seed.deliveryIntents || []).map(clone);
+  const domainWorkItems = seed.domainWorkItems === undefined ? null : (seed.domainWorkItems || []).map(clone);
   let injectAlbumRace = seed.injectAlbumRace === true;
   let seq = submissions.length;
+
+  function compareScalar(value, condition) {
+    if (condition && typeof condition === "object" && !(condition instanceof Date) && !Array.isArray(condition)) {
+      if (condition.in && !condition.in.map(String).includes(String(value ?? ""))) return false;
+      if (condition.gt !== undefined) {
+        if (typeof value === "bigint" || typeof condition.gt === "bigint") { if (!(BigInt(value || 0) > BigInt(condition.gt))) return false; }
+        else if (!(new Date(value).getTime() > new Date(condition.gt).getTime())) return false;
+      }
+      if (condition.gte !== undefined) {
+        if (typeof value === "bigint" || typeof condition.gte === "bigint") { if (!(BigInt(value || 0) >= BigInt(condition.gte))) return false; }
+        else if (!(new Date(value).getTime() >= new Date(condition.gte).getTime())) return false;
+      }
+      if (condition.lt !== undefined) {
+        if (typeof value === "bigint" || typeof condition.lt === "bigint") { if (!(BigInt(value || 0) < BigInt(condition.lt))) return false; }
+        else if (!(new Date(value).getTime() < new Date(condition.lt).getTime())) return false;
+      }
+      if (condition.lte !== undefined) {
+        if (typeof value === "bigint" || typeof condition.lte === "bigint") { if (!(BigInt(value || 0) <= BigInt(condition.lte))) return false; }
+        else if (!(new Date(value).getTime() <= new Date(condition.lte).getTime())) return false;
+      }
+      return true;
+    }
+    if (typeof value === "bigint" || typeof condition === "bigint") return BigInt(value || 0) === BigInt(condition || 0);
+    return String(value ?? "") === String(condition ?? "");
+  }
+
+  function matchesDomain(row, where = {}) {
+    if (Array.isArray(where.OR) && !where.OR.some((clause) => matchesDomain(row, clause))) return false;
+    for (const [key, condition] of Object.entries(where)) {
+      if (key === "OR") continue;
+      if (!compareScalar(row[key], condition)) return false;
+    }
+    return true;
+  }
+
+  function applyDomainData(row, data = {}) {
+    for (const [key, value] of Object.entries(data)) {
+      if (value && typeof value === "object" && !(value instanceof Date) && value.increment !== undefined) row[key] = BigInt(row[key] || 0) + BigInt(value.increment);
+      else row[key] = clone(value);
+    }
+  }
 
   function matchesSubmission(row, where = {}) {
     if (where.id !== undefined) {
@@ -128,7 +187,26 @@ function fakeDb(seed = {}) {
     _inboundEvents: inboundEvents,
     _deliveryIntents: deliveryIntents,
     _telegramAccounts: telegramAccounts,
+    _domainWorkItems: domainWorkItems,
     _audits: audits,
+    ...(domainWorkItems ? { domainWorkItem: {
+      async findMany({ where = {}, take = 100 }) { return domainWorkItems.filter((row) => matchesDomain(row, where)).slice(0, take).map(clone); },
+      async findFirst({ where = {} }) { return clone(domainWorkItems.find((row) => matchesDomain(row, where)) || null); },
+      async findUnique({ where = {} }) {
+        if (where.id !== undefined) return clone(domainWorkItems.find((row) => String(row.id) === String(where.id)) || null);
+        const identity = where.agencyId_workClass_objectType_objectId;
+        return clone(domainWorkItems.find((row) => !identity || (row.agencyId === identity.agencyId && row.workClass === identity.workClass && row.objectType === identity.objectType && row.objectId === identity.objectId)) || null);
+      },
+      async updateMany({ where = {}, data = {} }) {
+        let count = 0;
+        for (const row of domainWorkItems) { if (!matchesDomain(row, where)) continue; applyDomainData(row, data); count += 1; }
+        return { count };
+      },
+      async update({ where = {}, data = {} }) {
+        const row = domainWorkItems.find((candidate) => matchesDomain(candidate, where));
+        if (!row) throw new Error("domain work not found"); applyDomainData(row, data); return clone(row);
+      },
+    } } : {}),
     agency: {
       async findFirst({ where }) { return where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null; },
       async findUnique({ where }) { return where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null; },
@@ -714,7 +792,8 @@ test("V20.3 upload work reuses the existing Telegram runtime lease and stores no
 });
 
 test("relay reservation fences the exact Telegram source identity from claimed upload work", async () => {
-  const db = fakeDb({ submissions: [baseSubmission({ id: "source-fence", telegramMessageIds: [721, 722], ofMediaIds: [] })] });
+  const sourceWork = claimedSourceDomainWork("source-fence", { state: "READY", ownerToken: null, claimFence: 0n, claimedRevision: 0n, attempts: 0, leaseUntil: new Date(0) });
+  const db = fakeDb({ submissions: [baseSubmission({ id: "source-fence", telegramMessageIds: [721, 722], ofMediaIds: [] })], domainWorkItems: [sourceWork] });
   const claimed = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
     now: new Date("2026-08-21T13:00:00.000Z"), db,
@@ -731,7 +810,7 @@ test("relay reservation fences the exact Telegram source identity from claimed u
   await assert.rejects(
     () => reserveCustomContentSubmissionRelayWrite({
       agencyId: "agency-1", member, deviceId: "device-1", submissionId: "source-fence",
-      expectedIndex: work.expectedIndex, expectedTelegramMessageId: work.telegramMessageId, accessEpoch: 1, db,
+      expectedIndex: work.expectedIndex, expectedTelegramMessageId: work.telegramMessageId, sourceWorkClaim: work.sourceWorkClaim, accessEpoch: 1, now: new Date("2026-08-21T13:00:30.000Z"), db,
       reserveWrite: async () => { reserveCalls += 1; return { delivery: { id: "should-not-exist" } }; },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_UPLOAD_WORK_STALE" && error?.status === 409,
@@ -740,13 +819,16 @@ test("relay reservation fences the exact Telegram source identity from claimed u
 });
 
 test("relay reservation binds canonical CUSTOM_RELAY_SEND payload to the full Telegram source namespace while holding the submission row lock", async () => {
-  const db = fakeDb({ submissions: [baseSubmission({ id: "source-bound", telegramMessageIds: [731], ofMediaIds: [] })] });
+  const sourceWork = claimedSourceDomainWork("source-bound");
+  const db = fakeDb({ submissions: [baseSubmission({ id: "source-bound", telegramMessageIds: [731], ofMediaIds: [] })], domainWorkItems: [sourceWork] });
   let locked = false;
   db.$transaction = async (work) => work(db);
   db.$queryRawUnsafe = async (sql, id, agencyId) => {
     const text = String(sql);
+    if (/clock_timestamp\(\)/.test(text)) return [{ authorityNow: new Date("2026-08-21T13:00:00.000Z") }];
     if (/FROM "Agency"/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
     if (/CreatorAccount[\s\S]*FOR UPDATE/.test(text)) return [{ id, agencyId, deletedAt: null, status: "READY" }];
+    if (/FROM "DomainWorkItem"[\s\S]*FOR UPDATE/.test(text)) return [clone(db._domainWorkItems.find((row) => row.id === id))];
     assert.match(text, /CustomContentSubmission[\s\S]*FOR UPDATE/);
     assert.equal(id, "source-bound");
     assert.equal(agencyId, "agency-1");
@@ -757,7 +839,7 @@ test("relay reservation binds canonical CUSTOM_RELAY_SEND payload to the full Te
   let captured = null;
   const result = await reserveCustomContentSubmissionRelayWrite({
     agencyId: "agency-1", member, deviceId: "device-1", submissionId: "source-bound",
-    expectedIndex: 0, expectedTelegramMessageId: "731", accessEpoch: 1, db,
+    expectedIndex: 0, expectedTelegramMessageId: "731", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
     reserveWrite: async (input) => { assert.equal(locked, true, "source row must be locked before Audit17 reservation"); captured = input; return { delivery: { id: "write-731", status: "READY" }, lease: null }; },
   });
   assert.equal(captured.idempotencyKey, "custom-relay:source-bound:0");
@@ -771,9 +853,11 @@ test("relay reservation binds canonical CUSTOM_RELAY_SEND payload to the full Te
 
 test("rolling cutover adopts the exact pre-cutover relay fingerprint without weakening Audit17 idempotency", async () => {
   const legacyFingerprint = "legacy-v2-fingerprint";
+  const sourceWork = claimedSourceDomainWork("legacy-relay");
   const db = fakeDb({
     workspaceSettings: { vaultUploadRecipient: "relay_new" },
     submissions: [baseSubmission({ id: "legacy-relay", telegramMessageIds: [741], ofMediaIds: [] })],
+    domainWorkItems: [sourceWork],
     relayProofs: [{
       id: "legacy-write", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND",
       idempotencyKey: "custom-relay:legacy-relay:0", status: "RUNNING", payloadFingerprint: legacyFingerprint,
@@ -783,13 +867,15 @@ test("rolling cutover adopts the exact pre-cutover relay fingerprint without wea
   db.$transaction = async (work) => work(db);
   db.$queryRawUnsafe = async (sql, id, agencyId) => {
     const text = String(sql);
+    if (/clock_timestamp\(\)/.test(text)) return [{ authorityNow: new Date("2026-08-21T13:00:00.000Z") }];
     if (/FROM "Agency"/.test(text)) return [{ id, deletedAt: null, status: "ACTIVE" }];
     if (/CreatorAccount[\s\S]*FOR UPDATE/.test(text)) return [{ id, agencyId, deletedAt: null, status: "READY" }];
+    if (/FROM "DomainWorkItem"[\s\S]*FOR UPDATE/.test(text)) return [clone(db._domainWorkItems.find((row) => row.id === id))];
     return [{ id }];
   };
   let captured = null;
   const result = await reserveCustomContentSubmissionRelayWrite({
-    agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-relay", expectedIndex: 0, expectedTelegramMessageId: "741", accessEpoch: 1, db,
+    agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-relay", expectedIndex: 0, expectedTelegramMessageId: "741", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
     reserveWrite: async (input) => { captured = input; return { delivery: { id: "legacy-write", status: "RUNNING" }, lease: null }; },
   });
   assert.equal(captured.payloadFingerprint, legacyFingerprint, "the exact immutable v2 fingerprint is reused for the already-existing idempotency row");
@@ -799,8 +885,10 @@ test("rolling cutover adopts the exact pre-cutover relay fingerprint without wea
 });
 
 test("rolling cutover rejects a pre-cutover relay row whose durable source binding does not match the submission", async () => {
+  const sourceWork = claimedSourceDomainWork("legacy-conflict");
   const db = fakeDb({
     submissions: [baseSubmission({ id: "legacy-conflict", telegramMessageIds: [751], ofMediaIds: [] })],
+    domainWorkItems: [sourceWork],
     relayProofs: [{
       id: "legacy-write", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND",
       idempotencyKey: "custom-relay:legacy-conflict:0", status: "RUNNING", payloadFingerprint: "legacy-v2-fingerprint",
@@ -810,7 +898,7 @@ test("rolling cutover rejects a pre-cutover relay row whose durable source bindi
   let reserveCalls = 0;
   await assert.rejects(
     () => reserveCustomContentSubmissionRelayWrite({
-      agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-conflict", expectedIndex: 0, expectedTelegramMessageId: "751", accessEpoch: 1, db,
+      agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-conflict", expectedIndex: 0, expectedTelegramMessageId: "751", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
       reserveWrite: async () => { reserveCalls += 1; return { delivery: { id: "never" } }; },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_EXECUTION_PROFILE_LEGACY_BINDING_CONFLICT" && error?.status === 409,
@@ -2044,4 +2132,157 @@ test("commit-time manual historical import rejects a stale management actor befo
   );
   assert.equal(db._submissions.length, 0, "stale historical import must not create a submission");
   assert.equal(db._orders.find((row) => row.id === "custom-1").contentBoundAt, null, "stale historical import must not bind the Custom");
+});
+
+test("A4/A43 source relay reserve fails closed without a DomainWork claim", async () => {
+  const db = fakeDb({ submissions: [baseSubmission({ id: "source-claim-required", telegramMessageIds: [801], ofMediaIds: [] })] });
+  let reserveCalls = 0;
+  await assert.rejects(
+    () => reserveCustomContentSubmissionRelayWrite({
+      agencyId: "agency-1", member, deviceId: "device-1", submissionId: "source-claim-required",
+      expectedIndex: 0, expectedTelegramMessageId: "801", accessEpoch: 1, db,
+      reserveWrite: async () => { reserveCalls += 1; return { delivery: { id: "never" } }; },
+    }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_REQUIRED" && error?.status === 409,
+  );
+  assert.equal(reserveCalls, 0);
+});
+
+test("A4 source execution report rejects an expired claim before retry metadata changes", async () => {
+  const submission = baseSubmission({ id: "source-expired-report", telegramMessageIds: [811], ofMediaIds: [] });
+  const sourceWork = claimedSourceDomainWork(submission.id, { leaseUntil: new Date("2026-08-21T12:00:10.000Z") });
+  const db = fakeDb({ submissions: [submission], domainWorkItems: [sourceWork] });
+  await assert.rejects(
+    () => reportCustomContentSubmissionExecutionAttempt({
+      agencyId: "agency-1", member, submissionId: submission.id, success: false, code: "NETWORK",
+      sourceWorkClaim: sourceClaim(sourceWork), workKind: "UPLOAD_MEDIA", expectedIndex: 0, executionProfileRevision: 1,
+      now: new Date("2026-08-21T12:00:30.000Z"), db,
+    }),
+    (error) => error?.code === "CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE" && error?.status === 409,
+  );
+  assert.equal(db._submissions[0].pipelineBlockedCode == null, true);
+  assert.equal(db._submissions[0].pipelineNextAttemptAt == null, true);
+});
+
+test("A1/A4 stale V1 source failure cannot write retry metadata over a newer V2 invalidation", async () => {
+  const submission = baseSubmission({ id: "source-newer-revision-report", telegramMessageIds: [812], ofMediaIds: [] });
+  const sourceWork = claimedSourceDomainWork(submission.id, { requestedRevision: 2n, claimedRevision: 1n });
+  const db = fakeDb({ submissions: [submission], domainWorkItems: [sourceWork] });
+  const settled = await reportCustomContentSubmissionExecutionAttempt({
+    agencyId: "agency-1", member, submissionId: submission.id, success: false, code: "NETWORK",
+    sourceWorkClaim: sourceClaim(sourceWork), workKind: "UPLOAD_MEDIA", expectedIndex: 0, executionProfileRevision: 1,
+    now: new Date("2026-08-21T12:00:30.000Z"), db,
+  });
+  assert.equal(settled.sourceWorkSettled, true);
+  assert.equal(settled.sourceWorkSuperseded, true);
+  assert.equal(settled.nextAttemptAt, null);
+  assert.equal(db._submissions[0].pipelineBlockedCode == null, true, "V1 failure must not publish stale retry metadata after V2 exists");
+  assert.equal(db._submissions[0].pipelineNextAttemptAt == null, true, "V2 must not inherit the V1 retry clock");
+  assert.equal(db._domainWorkItems[0].state, "READY");
+  assert.equal(db._domainWorkItems[0].nextAttemptAt, null);
+});
+
+test("A1/A4 source discovery suppresses stale V1 diagnostic metadata when V2 arrives after claim", async () => {
+  const now = new Date("2026-08-21T12:00:00.000Z");
+  const submission = baseSubmission({
+    id: "source-discovery-v2-race", customOrderId: null, telegramSourceAccountId: null, telegramSourceUserId: null,
+    telegramMessageIds: [813], ofMediaIds: [], pipelineBlockedCode: null, pipelineBlockedAt: null, pipelineNextAttemptAt: null,
+  });
+  const domainItem = {
+    id: "dwi-source-discovery-v2-race", agencyId: "agency-1", workClass: "CUSTOM_SOURCE_PIPELINE",
+    objectType: "CustomContentSubmission", objectId: submission.id, parentObjectId: null, partitionKey: "creator-1",
+    creatorId: "creator-1", accountId: null, requestedRevision: 1n, completedRevision: 0n, claimedRevision: 0n,
+    ownerToken: null, claimFence: 0n, leaseUntil: new Date(0), activeGeneration: "phase2_domain_work_v1",
+    projectionVersion: "phase2_domain_work_v1", state: "READY", availableAt: new Date("2026-08-21T11:00:00.000Z"),
+    nextAttemptAt: null, attempts: 0, progressCursor: null,
+  };
+  const db = fakeDb({ submissions: [submission], domainWorkItems: [domainItem] });
+  const originalFindFirst = db.customContentSubmission.findFirst.bind(db.customContentSubmission);
+  let injectedV2 = false;
+  db.customContentSubmission.findFirst = async (args) => {
+    if (!injectedV2 && String(args?.where?.id || "") === submission.id && db._domainWorkItems[0].state === "CLAIMED") {
+      injectedV2 = true;
+      db._domainWorkItems[0].requestedRevision = 2n;
+    }
+    return originalFindFirst(args);
+  };
+
+  const result = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db,
+  });
+  assert.equal(injectedV2, true, "fixture must publish V2 after the V1 claim is held");
+  assert.equal(result.items.length, 0);
+  assert.equal(result.blockedItems.length, 0, "superseded V1 diagnostics must not be surfaced as the current blocker");
+  assert.equal(db._submissions[0].pipelineBlockedCode, null);
+  assert.equal(db._submissions[0].pipelineNextAttemptAt, null);
+  assert.equal(db._domainWorkItems[0].requestedRevision, 2n);
+  assert.equal(db._domainWorkItems[0].state, "READY");
+  assert.equal(db._domainWorkItems[0].nextAttemptAt, null);
+});
+
+test("A43 standalone source work is claimed from DomainWork, heartbeated, and ACKed without a CustomOrder", async () => {
+  const now = new Date("2026-08-21T12:00:00.000Z");
+  const submission = baseSubmission({
+    id: "submission-standalone-domain",
+    customOrderId: null,
+    telegramMessageIds: [301],
+    ofMediaIds: ["of-301"],
+    executionProfileRevision: 1,
+    executionPinnedAt: new Date("2026-08-21T11:00:00.000Z"),
+    executionVaultFolderId: "vault-1",
+    executionRelayRecipient: null,
+  });
+  const domainItem = {
+    id: "dwi-source-standalone",
+    agencyId: "agency-1",
+    workClass: "CUSTOM_SOURCE_PIPELINE",
+    objectType: "CustomContentSubmission",
+    objectId: submission.id,
+    parentObjectId: null,
+    partitionKey: "creator-1",
+    creatorId: "creator-1",
+    accountId: "tg-1",
+    requestedRevision: 1n,
+    completedRevision: 0n,
+    claimedRevision: 0n,
+    ownerToken: null,
+    claimFence: 0n,
+    leaseUntil: new Date(0),
+    activeGeneration: "phase2_domain_work_v1",
+    projectionVersion: "phase2_domain_work_v1",
+    state: "READY",
+    availableAt: new Date("2026-08-21T11:00:00.000Z"),
+    nextAttemptAt: null,
+    attempts: 0,
+    progressCursor: null,
+  };
+  const db = fakeDb({ submissions: [submission], domainWorkItems: [domainItem] });
+
+  const claim = await claimCustomContentSubmissionUploadWork({
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db,
+  });
+  assert.equal(claim.authority, "CUSTOM_SOURCE_PIPELINE_DOMAIN_WORK_V1");
+  assert.equal(claim.items.length, 1);
+  assert.equal(claim.items[0].kind, "FINALIZE_LIBRARY");
+  assert.equal(claim.items[0].submission.id, submission.id);
+  assert.equal(claim.items[0].submission.customOrderId, null, "standalone source work must not require a fake CustomOrder");
+  assert.equal(claim.items[0].sourceWorkClaim.id, domainItem.id);
+  assert.equal(db._domainWorkItems[0].state, "CLAIMED");
+
+  const heartbeat = await heartbeatCustomContentSubmissionSourceWork({
+    agencyId: "agency-1", member, deviceId: "device-1", submissionId: submission.id,
+    sourceWorkClaim: claim.items[0].sourceWorkClaim, now: new Date("2026-08-21T12:00:30.000Z"), db,
+  });
+  assert.equal(heartbeat.ok, true);
+  assert.equal(db._domainWorkItems[0].state, "CLAIMED");
+
+  const settled = await reportCustomContentSubmissionExecutionAttempt({
+    agencyId: "agency-1", member, submissionId: submission.id, success: true,
+    sourceWorkClaim: claim.items[0].sourceWorkClaim, workKind: "FINALIZE_LIBRARY",
+    executionProfileRevision: 1, now: new Date("2026-08-21T12:01:00.000Z"), db,
+  });
+  assert.equal(settled.sourceWorkSettled, true);
+  assert.equal(settled.sourceWorkLost, false);
+  assert.equal(db._domainWorkItems[0].state, "DONE");
+  assert.equal(BigInt(db._domainWorkItems[0].completedRevision), 1n);
 });

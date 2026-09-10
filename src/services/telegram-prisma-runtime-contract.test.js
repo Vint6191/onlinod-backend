@@ -63,7 +63,8 @@ test("TelegramDeliveryIntent convergence never filters impossible null customOrd
   const repair = functionBlock(delivery, "repairCustomModelCommunicationConvergence", "markTelegramDeliveryProvenNotSent");
   const retry = functionBlock(delivery, "repairPrecommitProviderBlockedIntents", "listTelegramDeliveryWork");
   assert.match(repair, /repairPrecommitProviderBlockedIntents/);
-  assert.match(repair, /ensureAutomaticReminderIntents/);
+  assert.doesNotMatch(repair, /ensureAutomaticReminderIntents/);
+  assert.match(scheduler, /maybePlanDueCustomReminderWork/);
   assert.match(retry, /telegramDeliveryIntent\.findMany/);
   assert.doesNotMatch(repair, /customOrderId:\s*\{\s*not:\s*null\s*\}/);
   assert.doesNotMatch(retry, /customOrderId:\s*\{\s*not:\s*null\s*\}/);
@@ -74,17 +75,16 @@ test("TelegramDeliveryIntent convergence never filters impossible null customOrd
   assert.match(submission, /customOrderId\s+String\?/);
 });
 
-test("Telegram/custom convergence isolates one agency failure from later agencies", () => {
-  const marker = "async function runTelegramConfirmedProjectionSweep";
-  const start = scheduler.indexOf(marker);
-  assert.ok(start >= 0, "scheduler convergence sweep must exist");
-  const end = scheduler.indexOf("\nasync function ", start + marker.length);
-  const block = scheduler.slice(start, end > start ? end : undefined);
-  assert.match(block, /agencyFailures/);
-  assert.match(block, /for \(const agency of agencies \|\| \[\]\)/);
+test("Telegram/custom convergence isolates one failed work item while preserving fair admission for later agencies", () => {
+  const block = functionBlock(scheduler, "runTelegramConfirmedProjectionSweep", "runTelegramConfirmedProjectionMaintenanceSweep");
+  assert.match(block, /claimDomainWorkBatch\(\{[\s\S]*TELEGRAM_CONFIRMED_PROJECTION/);
+  assert.match(block, /perAgencyQuantum:\s*5/);
+  assert.match(block, /for \(const item of claim\?\.items \|\| \[\]\)/);
   assert.match(block, /try\s*\{/);
   assert.match(block, /catch \(error\)/);
-  assert.match(block, /agencyFailures\.push/);
+  assert.match(block, /failDomainWorkClaim/);
+  assert.match(block, /continue|report\.failed/);
+  assert.doesNotMatch(block, /for \(const agency of agencies/, "current projection no longer owns an agency-wide sweep");
 });
 
 

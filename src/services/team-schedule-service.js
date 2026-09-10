@@ -8,6 +8,8 @@ const { assertManagementCommitAuthority } = require("./management-commit-authori
 const { getRetentionSettings } = require("./retention-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { retainedDetailFrom, latestAvailableFrom, clampRangeToAvailableFrom, coverageState } = require("./team-historical-range-authority-service");
+const { supportsScheduleScaleRead, buildScheduleScaleRead } = require("./team-schedule-scale-read-service");
+const { phase2CoverageStatus, FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION } = require("./phase2-work-coverage-authority-service");
 
 const MAX_OPEN_COVERAGE_MS = 12 * 60 * 60 * 1000;
 const MAX_SHIFT_MS = 36 * 60 * 60 * 1000;
@@ -239,23 +241,42 @@ function responseRangeWhere(range, allowedCreatorIds) {
   return where;
 }
 
-function matchShiftActual(shift, actualSessions, responseCases, nowMs) {
+function memberCreatorKey(memberId, creatorId) {
+  return `${String(memberId || "")}\u001f${String(creatorId || "")}`;
+}
+
+function indexRowsByMemberCreator(rows) {
+  const map = new Map();
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const key = memberCreatorKey(row.memberId, row.creatorId);
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(row);
+  }
+  return map;
+}
+
+function rowsForShift(index, memberId, creatorIds) {
+  const out = [];
+  for (const creatorId of creatorIds) {
+    const rows = index.get(memberCreatorKey(memberId, creatorId));
+    if (rows?.length) out.push(...rows);
+  }
+  return out;
+}
+
+function matchShiftActual(shift, actualSessionIndex, responseCaseIndex, nowMs) {
   const startMs = new Date(shift.startsAt).getTime();
   const endMs = new Date(shift.endsAt).getTime();
   const creatorIds = new Set((shift.creators || []).map((link) => String(link.creatorId || link.creator?.id || "")).filter(Boolean));
-  const relevant = actualSessions.filter((session) => {
-    if (String(session.memberId) !== String(shift.memberId)) return false;
-    if (!creatorIds.has(String(session.creatorId))) return false;
-    return session._startMs < endMs && session._endMs > startMs;
-  });
+  const candidateSessions = rowsForShift(actualSessionIndex, shift.memberId, creatorIds);
+  const relevant = candidateSessions.filter((session) => session._startMs < endMs && session._endMs > startMs);
   const presenceIntervals = relevant.map((session) => interval(Math.max(startMs, session._startMs), Math.min(endMs, session._endMs))).filter(Boolean);
   const actualPresenceSeconds = unionSeconds(presenceIntervals);
   const plannedSeconds = Math.max(0, Math.round((endMs - startMs) / 1000));
   const firstActualMs = relevant.length ? Math.min(...relevant.map((row) => Math.max(startMs, row._startMs))) : null;
   const lastActualMs = relevant.length ? Math.max(...relevant.map((row) => Math.min(endMs, row._endMs))) : null;
-  const responseRows = responseCases.filter((row) => {
-    if (String(row.memberId || "") !== String(shift.memberId)) return false;
-    if (!creatorIds.has(String(row.creatorId || ""))) return false;
+  const candidateResponses = rowsForShift(responseCaseIndex, shift.memberId, creatorIds);
+  const responseRows = candidateResponses.filter((row) => {
     const replyAt = new Date(row.replyAt).getTime();
     return Number.isFinite(replyAt) && replyAt >= startMs && replyAt <= endMs;
   });
@@ -290,10 +311,13 @@ function matchShiftActual(shift, actualSessions, responseCases, nowMs) {
 async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds = null, canManageSchedule = false, now = new Date(), db = prisma } = {}) {
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
   const range = resolveRange(rangeKey, authorityNow);
-  const [retentionPolicy, projectionCoverage] = await Promise.all([
+  const [retentionPolicy, projectionCoverage, dialogGenerationStatus, responseRepairStatus] = await Promise.all([
     getRetentionSettings({ db }),
     db.teamProjectionCoverage.findUnique({ where: { agencyId } }),
+    phase2CoverageStatus({ db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_DIALOG_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.TEAM_DIALOG_PROJECTION }),
+    phase2CoverageStatus({ db, agencyId, family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR, generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR }),
   ]);
+  const currentResponseGeneration = dialogGenerationStatus?.ready === true && responseRepairStatus?.ready === true;
   if (retentionPolicy?.ok !== true) throw error("TEAM_RETENTION_POLICY_UNAVAILABLE", "Team retention policy is unavailable", 503);
   if (!projectionCoverage) throw error("TEAM_PROJECTION_COVERAGE_UNAVAILABLE", "Team projection coverage is unavailable", 503);
   const detailDays = Number(retentionPolicy.settings?.teamCanonicalDetailDays || 180);
@@ -310,6 +334,28 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
   const includeCreatorWhere = Array.isArray(allowedCreatorIds)
     ? { where: creatorScopeWhere(allowedCreatorIds), select: { creatorId: true, creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } } } }
     : { select: { creatorId: true, creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } } } };
+
+  if (supportsScheduleScaleRead(db)) {
+    const context = await loadScheduleContext({ agencyId, allowedCreatorIds, canManageSchedule, db });
+    const scaled = await buildScheduleScaleRead({ db, agencyId, queryRange, authorityNow, allowedCreatorIds, context, includeCreatorWhere, currentResponseGeneration });
+    return {
+      ok: true,
+      asOf: authorityNow.toISOString(),
+      range: rangeForClient(range),
+      retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
+      historicalCoverage: scheduleCoverage,
+      creatorScope: Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, 10000) : "all",
+      context,
+      summary: scaled.summary,
+      shifts: scaled.shifts,
+      creators: scaled.creators,
+      members: scaled.members,
+      handoffs: scaled.handoffs,
+      overlaps: scaled.overlaps,
+      detailCoverage: scaled.detailCoverage,
+      source: "team_shift_scale_sql_v2",
+    };
+  }
 
   const [coverageRows, shifts, responseCases, context] = await Promise.all([
     findAllById(db.teamCoverageSession, {
@@ -328,8 +374,11 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
     }),
     db.teamResponseCase?.findMany
       ? findAllById(db.teamResponseCase, {
-          where: { agencyId, ...responseRangeWhere(queryRange, allowedCreatorIds) },
-          select: { id: true, creatorId: true, memberId: true, replyAt: true, slaEligible: true, sla15Pass: true, wallClockSeconds: true },
+          where: {
+            agencyId, ...responseRangeWhere(queryRange, allowedCreatorIds),
+            ...(currentResponseGeneration ? { derivationVersion: "team_response_v2", projectionState: { in: ["FULL", "INCOMPLETE_HISTORY"] } } : {}),
+          },
+          select: { id: true, creatorId: true, memberId: true, replyAt: true, slaEligible: true, sla15Pass: true, wallClockSeconds: true, projectionState: true, derivationVersion: true },
         })
       : Promise.resolve([]),
     loadScheduleContext({ agencyId, allowedCreatorIds, canManageSchedule, db }),
@@ -430,6 +479,11 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
     });
   }
 
+  // R9: build one bounded lookup index once. A shift now touches only rows for its
+  // member+creator set instead of filtering the entire detail arrays for every shift.
+  const actualSessionIndex = indexRowsByMemberCreator(actualSessions);
+  const responseCaseIndex = indexRowsByMemberCreator(responseCases || []);
+
   shifts.sort((a, b) => new Date(a.startsAt).getTime() - new Date(b.startsAt).getTime() || String(a.id).localeCompare(String(b.id)));
   const plannedShifts = shifts.map((row) => {
     const visibleCreators = (row.creators || []).map((link) => ({
@@ -438,7 +492,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
       username: link.creator?.username || null,
       avatarUrl: link.creator?.avatarUrl || null,
     })).filter((item) => item.id);
-    const enriched = matchShiftActual({ ...row, creators: row.creators }, actualSessions, responseCases || [], nowMs);
+    const enriched = matchShiftActual({ ...row, creators: row.creators }, actualSessionIndex, responseCaseIndex, nowMs);
     return {
       id: String(row.id),
       revision: Number(row.revision || 1),
@@ -691,6 +745,8 @@ async function cancelTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
 }
 
 module.exports = {
+  indexRowsByMemberCreator,
+  matchShiftActual,
   MAX_OPEN_COVERAGE_MS,
   MAX_SHIFT_MS,
   MIN_SHIFT_MS,

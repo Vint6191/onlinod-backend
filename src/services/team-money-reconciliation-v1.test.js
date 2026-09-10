@@ -421,3 +421,64 @@ test("automatic Tip reconciliation re-reads a manual resolution at the row lock 
   assert.equal(fx.getAttribution().attributedMemberId, "manager-selected-member");
   assert.equal(fx.getAttribution().resolvedSource, "manual_manager_resolution");
 });
+
+test("A36: durable PPV fact reconstructs the same protected root after old TTL deletion", async () => {
+  const fx = dbFixture({ sent: manualSent("different-member") });
+  fx.db.teamMoneyAttributionFact = {
+    async findMany() {
+      return [{
+        id: "fact-old-ppv", agencyId: "agency-1", sourceType: "PPV", sourceRowId: "deleted-root-ppv", rootId: null,
+        externalId: "notification-1", creatorId: "creator-1", memberId: "manager-selected-member", userId: "user-manager",
+        fanId: "of-fan-1", dialogId: "of-fan-1", amountCents: 2500, currency: "USD",
+        occurredAt: new Date("2026-08-12T10:00:00Z"), businessStatus: "attributed", financialStatus: "done",
+        attributionActive: true, creatorSaleId: "sale-1", financialTransactionId: "financial-1",
+        attributionBasis: "MIGRATION_FACT_BASELINE", sourceUpdatedAt: new Date("2026-08-13T10:00:00Z"),
+      }];
+    },
+  };
+  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  assert.equal(result.preservedManualResolution, true);
+  assert.equal(fx.getPurchase().id, "deleted-root-ppv");
+  assert.equal(fx.getPurchase().migrationBaselineProtected, true);
+  assert.equal(fx.getPurchase().attributedMemberId, "manager-selected-member");
+  assert.equal(fx.getPurchaseCreates(), 1, "recovery must reconstruct one stable root, not create a new generation");
+});
+
+test("A36: durable Tip fact reconstructs the same protected root after old TTL deletion", async () => {
+  const fx = tipDbFixture({ exactSent: tipSent({ memberId: "different-member" }) });
+  fx.db.teamMoneyAttributionFact = {
+    async findMany() {
+      return [{
+        id: "fact-old-tip", agencyId: "agency-1", sourceType: "TIP", sourceRowId: "deleted-root-tip", rootId: null,
+        externalId: "tip-notification-1", creatorId: "creator-1", memberId: "manager-selected-member", userId: "user-manager",
+        fanId: "of-fan-1", dialogId: "of-fan-1", amountCents: 1000, currency: "USD",
+        occurredAt: new Date("2026-08-12T11:00:00Z"), businessStatus: "attributed", financialStatus: "done",
+        attributionActive: true, creatorTipId: "creator-tip-1", attributionBasis: "MIGRATION_FACT_BASELINE",
+        sourceUpdatedAt: new Date("2026-08-13T11:00:00Z"),
+      }];
+    },
+  };
+  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  assert.equal(result.preservedManualResolution, true);
+  assert.equal(fx.getAttribution().id, "deleted-root-tip");
+  assert.equal(fx.getAttribution().migrationBaselineProtected, true);
+  assert.equal(fx.getAttribution().attributedMemberId, "manager-selected-member");
+  assert.equal(fx.getTipCreates(), 1);
+});
+
+test("A38: multiple durable money generations fail closed instead of arbitrary merge", async () => {
+  const fx = dbFixture({ sent: null });
+  fx.db.teamMoneyAttributionFact = {
+    async findMany() {
+      return [
+        { id: "f1", sourceRowId: "root-a", creatorSaleId: "sale-1", sourceUpdatedAt: new Date("2026-08-12T10:00:00Z") },
+        { id: "f2", sourceRowId: "root-b", creatorSaleId: "sale-1", sourceUpdatedAt: new Date("2026-08-12T11:00:00Z") },
+      ];
+    },
+  };
+  await assert.rejects(
+    () => reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" }),
+    (err) => err?.code === "TEAM_MONEY_ROOT_MIGRATION_AMBIGUOUS",
+  );
+  assert.equal(fx.getPurchase(), null);
+});

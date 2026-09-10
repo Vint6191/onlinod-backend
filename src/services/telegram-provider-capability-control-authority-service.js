@@ -6,7 +6,6 @@ const {
   DEBT,
   requireProviderOperationalBackfillReady,
   dirtyOrderIdsForAccount,
-  reconcileProviderOperationalDebtForOrder,
   findStandaloneIncompleteSource,
   listProviderOperationalDebtForAccount,
 } = require("./provider-operational-debt-authority-service");
@@ -61,19 +60,16 @@ async function findHardPinnedIntentBlocker({ agencyId, accountId, db }) {
   };
 }
 
-async function reconcileAccountDirtyWork({ agencyId, accountId, db }) {
+async function assertAccountDirtyWorkDrained({ agencyId, accountId, db }) {
   const ids = await dirtyOrderIdsForAccount({ agencyId, accountId, db, limit: MAX_SYNC_DIRTY_RECONCILE + 1 });
-  const bounded = ids.slice(0, MAX_SYNC_DIRTY_RECONCILE);
-  for (const orderId of bounded) {
-    // Retirement needs current provider locators immediately, but must not consume the
-    // recurring dirty marker that also asks maintenance to repair derived reminder state.
-    await reconcileProviderOperationalDebtForOrder({ agencyId, orderId, db, markClean: false });
-  }
-  if (ids.length > MAX_SYNC_DIRTY_RECONCILE) {
-    throw maintenancePendingError(
+  if (ids.length) {
+    const error = maintenancePendingError(
       "PROVIDER_OPERATIONAL_DEBT_RECONCILE_PENDING",
       "Provider current-work reconciliation is still draining; retry account retirement after maintenance catches up",
     );
+    error.pendingOrderIds = ids.slice(0, MAX_SYNC_DIRTY_RECONCILE);
+    error.pendingCountLowerBound = ids.length;
+    throw error;
   }
 }
 
@@ -155,11 +151,11 @@ async function findTelegramProviderCapabilityBlocker({ agencyId, accountId, db }
   const hardIntent = await findHardPinnedIntentBlocker({ agencyId, accountId: target, db });
   if (hardIntent) return hardIntent;
 
-  if (!db.providerOperationalDebt || !db.maintenanceLaneState) {
+  if (!db.providerOperationalDebt || !db.phase2WorkCoverage) {
     throw maintenancePendingError("PROVIDER_OPERATIONAL_DEBT_STORAGE_UNAVAILABLE", "Provider operational current-work authority is unavailable");
   }
-  await requireProviderOperationalBackfillReady({ db });
-  await reconcileAccountDirtyWork({ agencyId, accountId: target, db });
+  await requireProviderOperationalBackfillReady({ db, agencyId });
+  await assertAccountDirtyWorkDrained({ agencyId, accountId: target, db });
 
   const debtRows = await listProviderOperationalDebtForAccount({
     agencyId, accountId: target, db, limit: MAX_DEBT_REVALIDATION + 1,

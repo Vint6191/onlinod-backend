@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
-const { reconcileCreatorSaleToTeam, reconcileCreatorTipToTeam } = require("./team-money-reconciliation-service");
+const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectFanIdentity } = require("./fan-data-authority-service");
 const {
   COLLECTOR_TYPES, collectionCommand, acceptFinancialGeneration, completeFinancialCollection, recordFinancialCollectionFailure,
@@ -354,10 +354,10 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
           // Exact Team PPV ownership is derived from CreatorSale.messageId.
           // The payout row only enriches that canonical sale with financial
           // status/identity; no chatter-recency heuristic is introduced here.
-          await reconcileCreatorSaleToTeam({ db: tx, saleId: projectedFact.id });
+          await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "PPV", sourceId: projectedFact.id, now });
         }
         if (row.factType === "TIP" && projectedFact?.id) {
-          await reconcileCreatorTipToTeam({ db: tx, tipId: projectedFact.id });
+          await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "TIP", sourceId: projectedFact.id, now });
         }
         projected += 1;
         affectedDates.push(row.occurredAt);

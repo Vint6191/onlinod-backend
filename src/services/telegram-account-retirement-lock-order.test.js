@@ -23,17 +23,18 @@ function assertBefore(text, left, right, message) {
 test("normal Telegram retirement serializes Agency before account and Custom blockers", () => {
   const body = bodyBetween("async function removeTelegramMtprotoAccount", "async function forceRetireLostTelegramMtprotoAccount");
   const begin = body.slice(body.indexOf("const beginRetirement = async (tx)"), body.indexOf("await client.$transaction((tx) => beginRetirement(tx)"));
-  assertBefore(begin, "lockAgencyPipelineLifecycle", "agencyTelegramMtprotoAccount.updateMany", "ACTIVE -> RETIRING must acquire Agency lifecycle fence before the account row");
-  assertBefore(begin, "agencyTelegramMtprotoAccount.updateMany", "assertTelegramAccountNoBusinessBlockers", "account row must still fence new provider work before the blocker scan");
+  assertBefore(begin, "lockAgencyPipelineLifecycle", "lockTelegramAccountLifecycleRow", "ACTIVE -> RETIRING must acquire Agency lifecycle fence before the account row");
+  assertBefore(begin, "lockTelegramAccountLifecycleRow", "assertTelegramAccountNoBusinessBlockers", "account row must still fence new provider work before the blocker scan");
 
   const finish = body.slice(body.indexOf("const retire = async (tx)"));
-  assertBefore(finish, "lockAgencyPipelineLifecycle", "assertTelegramAccountNoBusinessBlockers", "RETIRING -> RETIRED blocker scan must also be Agency-first");
+  assertBefore(finish, "lockAgencyPipelineLifecycle", "lockTelegramAccountLifecycleRow", "RETIRING -> RETIRED must reacquire the account row after Agency lifecycle");
+  assertBefore(finish, "lockTelegramAccountLifecycleRow", "assertTelegramAccountNoBusinessBlockers", "final blocker scan must run under the account row fence");
   assertBefore(finish, "assertTelegramAccountNoBusinessBlockers", "agencyTelegramMtprotoAccount.delete", "hard delete must remain after the full blocker scan");
 });
 
 test("force retirement uses the same Agency-first lifecycle order", () => {
   const body = bodyBetween("async function forceRetireLostTelegramMtprotoAccount", "async function readTelegramMtprotoAccountSecret");
-  assertBefore(body, "lockAgencyPipelineLifecycle", "agencyTelegramMtprotoAccount.updateMany", "force retirement must acquire Agency lifecycle fence before the account row");
-  assertBefore(body, "agencyTelegramMtprotoAccount.updateMany", "assertTelegramAccountNoBusinessBlockers", "force retirement must preserve account-before-blocker serialization after the Agency fence");
+  assertBefore(body, "lockAgencyPipelineLifecycle", "lockTelegramAccountLifecycleRow", "force retirement must acquire Agency lifecycle fence before the account row");
+  assertBefore(body, "lockTelegramAccountLifecycleRow", "assertTelegramAccountNoBusinessBlockers", "force retirement must preserve account-before-blocker serialization after the Agency fence");
   assertBefore(body, "assertTelegramAccountNoBusinessBlockers", "agencyTelegramMtprotoAccount.delete", "force hard delete must remain after blockers");
 });

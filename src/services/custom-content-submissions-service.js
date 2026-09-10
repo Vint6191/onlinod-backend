@@ -13,6 +13,15 @@ const { fenceCustomModelObligationTransition, supersedePrecommitInitialReference
 const { adjudicateHumanModelResponseOverride } = require("./custom-model-instruction-override-authority-service");
 const { reprojectCustomReminderSchedule } = require("./custom-order-reminders");
 const { assertCustomManagementCreatorAccess } = require("./custom-management-access-authority-service");
+const {
+  WORK_CLASS: PHASE2_WORK_CLASS,
+  claimDomainWorkBatch,
+  lockDomainWorkClaimForCommit,
+  heartbeatDomainWorkClaim,
+  ackDomainWorkClaim,
+  failDomainWorkClaim,
+  yieldDomainWorkClaim,
+} = require("./domain-work-authority-service");
 
 const MAX_TELEGRAM_MESSAGES = 50;
 const MAX_COMMENT = 4_000;
@@ -1156,7 +1165,7 @@ async function pendingFinalizeRows({ agencyId, scope, limit, now = new Date(), d
  * no extra claim/status/device fields are persisted for upload execution.
  */
 
-async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, deviceId, submissionId, expectedIndex, expectedTelegramMessageId, accessEpoch = null, now = new Date(), db = null, reserveWrite = null } = {}) {
+async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, deviceId, submissionId, expectedIndex, expectedTelegramMessageId, sourceWorkClaim = null, accessEpoch = null, now = new Date(), db = null, reserveWrite = null } = {}) {
   if (!agencyId || !member?.id || !member?.userId) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
@@ -1167,8 +1176,32 @@ async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, devi
   if (!/^[1-9]\d{0,9}$/.test(expectedSourceId) || Number(expectedSourceId) > MAX_TELEGRAM_MESSAGE_ID) {
     throw fail("CUSTOM_SUBMISSION_UPLOAD_SOURCE_REQUIRED", "expectedTelegramMessageId must be the Telegram source id from the claimed upload work", 400);
   }
+  const parsedSourceClaim = parseSourcePipelineDomainClaim(sourceWorkClaim);
+  if (!parsedSourceClaim) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_REQUIRED", "A current source-pipeline work claim is required before reserving a new relay write", 409);
 
   return withSubmissionSourceLock({ db: client, agencyId, submissionId: id, work: async (lockedClient) => {
+    // Submission row is locked before DomainWork to preserve the trigger lock order:
+    // submission mutations may publish DomainWork in the same transaction. Holding both
+    // locks through reserve admission prevents a reclaimed/expired Desktop from creating
+    // a NEW external write after it lost execution ownership.
+    const guarded = await lockDomainWorkClaimForCommit({
+      db: lockedClient,
+      item: parsedSourceClaim,
+      ownerToken: parsedSourceClaim.ownerToken,
+      fallbackNow: now,
+    });
+    if (guarded?.lost
+        || String(guarded?.item?.agencyId || "") !== String(agencyId)
+        || String(guarded?.item?.workClass || "") !== PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE
+        || String(guarded?.item?.objectType || "") !== "CustomContentSubmission"
+        || String(guarded?.item?.objectId || "") !== id) {
+      throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim no longer authorizes a new relay write", 409);
+    }
+    const renewed = await heartbeatDomainWorkClaim({
+      db: lockedClient, item: guarded.item, ownerToken: parsedSourceClaim.ownerToken,
+      leaseMs: SOURCE_PIPELINE_DOMAIN_LEASE_MS, fallbackNow: guarded.authorityNow || now,
+    });
+    if (!renewed?.renewed) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim expired before relay reserve", 409);
     let row = await assertNewRelayWorkAllowed({ db: lockedClient, agencyId, submissionId: id });
     await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: lockedClient });
     const nextIndex = nextUploadIndex(row);
@@ -1308,7 +1341,7 @@ async function resolveCustomContentSubmissionRelayWriteMatched({ agencyId, membe
   });
 }
 
-async function claimCustomContentSubmissionUploadWork({ agencyId, member, deviceId, leases, limit = 1, now = new Date(), db = null } = {}) {
+async function claimCustomContentSubmissionUploadWorkLegacyDiscovery({ agencyId, member, deviceId, leases, limit = 1, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
@@ -1498,21 +1531,442 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
   };
 }
 
+
+const SOURCE_PIPELINE_DOMAIN_LEASE_MS = 3 * 60 * 1000;
+const SOURCE_PIPELINE_HEARTBEAT_LEASE_MS = 3 * 60 * 1000;
+const SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS = 15 * 1000;
+const SOURCE_PIPELINE_CLAIM_MULTIPLIER = 3;
+
+function serializeSourcePipelineDomainClaim(item, ownerToken) {
+  if (!item?.id) return null;
+  return {
+    id: String(item.id),
+    ownerToken: String(ownerToken || item.ownerToken || ""),
+    claimFence: String(item.claimFence ?? "0"),
+    claimedRevision: String(item.claimedRevision ?? "0"),
+    leaseUntil: item.leaseUntil ? new Date(item.leaseUntil).toISOString() : null,
+  };
+}
+
+function parseSourcePipelineDomainClaim(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = String(value.id || "").trim();
+  const ownerToken = String(value.ownerToken || "").trim();
+  let claimFence;
+  let claimedRevision;
+  try { claimFence = BigInt(String(value.claimFence ?? "")); } catch (_) { return null; }
+  try { claimedRevision = BigInt(String(value.claimedRevision ?? "")); } catch (_) { return null; }
+  if (!id || !ownerToken || claimFence < 0n || claimedRevision < 0n) return null;
+  return { id, ownerToken, claimFence, claimedRevision };
+}
+
+async function assertSourcePipelineDomainClaim({ db, agencyId, submissionId, claim }) {
+  const parsed = parseSourcePipelineDomainClaim(claim);
+  if (!parsed) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_REQUIRED", "A valid source-pipeline work claim is required", 409);
+  const row = await db?.domainWorkItem?.findFirst?.({
+    where: {
+      id: parsed.id,
+      agencyId: String(agencyId),
+      workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+      objectType: "CustomContentSubmission",
+      objectId: String(submissionId),
+    },
+    select: {
+      id: true, agencyId: true, workClass: true, objectType: true, objectId: true,
+      ownerToken: true, claimFence: true, claimedRevision: true, requestedRevision: true,
+      activeGeneration: true, leaseUntil: true, state: true,
+    },
+  });
+  if (!row
+      || String(row.ownerToken || "") !== parsed.ownerToken
+      || BigInt(row.claimFence || 0) !== parsed.claimFence
+      || BigInt(row.claimedRevision || 0) !== parsed.claimedRevision) {
+    throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim is no longer current", 409);
+  }
+  return { ...row, claimFence: parsed.claimFence, claimedRevision: parsed.claimedRevision, ownerToken: parsed.ownerToken };
+}
+
+async function sourcePipelineFinalized({ db, agencyId, submission, order }) {
+  const mediaIds = ofMediaIds(submission?.ofMediaIds);
+  if (!mediaIds.length || !hasCurrentVaultSettlement(submission)) return false;
+  if (!db?.creatorMediaAsset?.findMany) return false;
+  const assets = await db.creatorMediaAsset.findMany({
+    where: { agencyId, creatorId: submission.creatorId, mediaId: { in: mediaIds }, source: "CUSTOM" },
+    take: mediaIds.length,
+  });
+  const byMediaId = new Map((assets || []).map((asset) => [String(asset.mediaId), asset]));
+  return mediaIds.every((mediaId) => customAssetMatchesPipelineProjection(submission, byMediaId.get(String(mediaId)), order || null));
+}
+
+async function loadExactSourcePipelineContext({ db, agencyId, submissionId }) {
+  const submission = await db.customContentSubmission.findFirst({ where: { id: String(submissionId), agencyId: String(agencyId) } });
+  if (!submission) return { submission: null, order: null, creator: null };
+  const [order, creator] = await Promise.all([
+    submission.customOrderId && db?.customOrder?.findFirst
+      ? db.customOrder.findFirst({ where: { id: submission.customOrderId, agencyId: String(agencyId), creatorId: submission.creatorId }, select: { id: true, type: true, status: true, fanDeliveredAt: true, creatorId: true, priceCents: true } })
+      : Promise.resolve(null),
+    db.creatorAccount.findFirst({ where: { id: submission.creatorId, agencyId: String(agencyId), deletedAt: null }, select: { id: true, username: true, customsVaultFolderId: true } }),
+  ]);
+  return { submission, order, creator };
+}
+
+async function releaseSourcePipelineClaimAsRetry({ db, item, ownerToken, retryAt, error = null, now = new Date() }) {
+  return failDomainWorkClaim({ db, item, ownerToken, error: error || Object.assign(new Error("CUSTOM_SOURCE_PIPELINE_RETRY"), { code: "CUSTOM_SOURCE_PIPELINE_RETRY" }), retryAt, fallbackNow: now });
+}
+
+async function settleClaimedSourcePipelineFailure({
+  db, agencyId, submissionId, item, ownerToken, code, error = null, now = new Date(), fallbackRetryAt = null,
+} = {}) {
+  const normalizedCode = String(code || error?.code || "CUSTOM_SOURCE_PIPELINE_RETRY");
+  return withSubmissionPipelineLock({ db, agencyId, submissionId, work: async (lockedDb) => {
+    // Canonical source writers/triggers lock Submission before DomainWork. Keep the
+    // same order here so an old worker cannot publish retry metadata after a newer
+    // canonical revision has already become authoritative.
+    const guarded = await lockDomainWorkClaimForCommit({ db: lockedDb, item, ownerToken, fallbackNow: now });
+    if (guarded?.lost) return { lost: true, stale: true, superseded: false, report: null };
+
+    const renewed = await heartbeatDomainWorkClaim({
+      db: lockedDb, item: guarded.item, ownerToken, leaseMs: SOURCE_PIPELINE_DOMAIN_LEASE_MS,
+      fallbackNow: guarded.authorityNow || now,
+    });
+    if (!renewed?.renewed) return { lost: true, stale: true, superseded: false, report: null };
+
+    // V1 diagnostics belong only to V1. If V2 already exists, release V2 immediately
+    // and do not write V1 pipelineBlockedCode/pipelineNextAttemptAt onto the submission.
+    if (guarded.newerRevision === true) {
+      const settlement = await failDomainWorkClaim({
+        db: lockedDb, item: guarded.item, ownerToken,
+        error: error || Object.assign(new Error(normalizedCode), { code: normalizedCode }),
+        retryAt: null, fallbackNow: guarded.authorityNow || now,
+      });
+      return {
+        lost: settlement?.lost === true, stale: false, superseded: settlement?.lost !== true,
+        report: null, settlement,
+      };
+    }
+
+    const report = await reportSubmissionExecutionAttempt({
+      db: lockedDb, agencyId, submissionId, success: false, code: normalizedCode, now,
+    });
+    const retryAt = report?.nextAttemptAt
+      ? new Date(report.nextAttemptAt)
+      : (fallbackRetryAt ? new Date(fallbackRetryAt) : new Date(now.getTime() + SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS));
+    const settlement = await failDomainWorkClaim({
+      db: lockedDb, item: guarded.item, ownerToken,
+      error: error || Object.assign(new Error(normalizedCode), { code: normalizedCode }),
+      retryAt, fallbackNow: guarded.authorityNow || now,
+    });
+    return { lost: settlement?.lost === true, stale: false, superseded: false, report, settlement };
+  } });
+}
+
+async function exactSourcePipelineWork({ agencyId, member, validAccountIds, item, ownerToken, now, db }) {
+  const submissionId = String(item.objectId || "").trim();
+  if (!submissionId) {
+    await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: now });
+    return { item: null, blocked: null };
+  }
+
+  let context = await loadExactSourcePipelineContext({ db, agencyId, submissionId });
+  if (!context.submission) {
+    await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: now });
+    return { item: null, blocked: null };
+  }
+  await requireCreatorAccess({ agencyId, member, creatorId: context.submission.creatorId, db });
+
+  const retryAt = context.submission.pipelineNextAttemptAt ? new Date(context.submission.pipelineNextAttemptAt) : null;
+  if (retryAt && Number.isFinite(retryAt.getTime()) && retryAt > now) {
+    await yieldDomainWorkClaim({ db, item, ownerToken, availableAt: retryAt, fallbackNow: now });
+    return { item: null, blocked: null };
+  }
+
+  // Durable provider proof is projected before deciding whether another external
+  // source step exists. A crash after provider commit but before media projection
+  // therefore cannot cause the next Desktop to upload the Telegram file again.
+  try {
+    await recoverConfirmedRelayProjectionForSubmission({ agencyId, submissionId, db });
+  } catch (error) {
+    if (!String(error?.code || "").startsWith("CUSTOM_")) throw error;
+    const settled = await settleClaimedSourcePipelineFailure({
+      db, agencyId, submissionId, item, ownerToken, code: String(error.code), error, now,
+      fallbackRetryAt: new Date(now.getTime() + SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS),
+    });
+    if (settled?.lost || settled?.superseded) return { item: null, blocked: null };
+    return { item: null, blocked: { submissionId, code: String(error.code), message: String(error.message || error.code) } };
+  }
+
+  context = await loadExactSourcePipelineContext({ db, agencyId, submissionId });
+  const row = context.submission;
+  if (!row) {
+    await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: now });
+    return { item: null, blocked: null };
+  }
+  const currentDisposition = String(row.pipelineDisposition || ACTIVE).toUpperCase();
+  const mediaIds = ofMediaIds(row.ofMediaIds);
+  const telegramIds = Array.isArray(row.telegramMessageIds) ? row.telegramMessageIds : [];
+  const activeLive = currentDisposition === ACTIVE && submissionAllowsNewPipelineWork(row, context.order);
+  const salvage = currentDisposition === SALVAGE;
+
+  if (!activeLive && !salvage) {
+    await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: now });
+    return { item: null, blocked: null };
+  }
+  if (!context.creator) {
+    const error = Object.assign(new Error("Creator is retired while Custom source work remains"), { code: "CREATOR_RETIRED" });
+    await releaseSourcePipelineClaimAsRetry({ db, item, ownerToken, retryAt: new Date(now.getTime() + SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS), error, now });
+    return { item: null, blocked: { submissionId, code: error.code, message: error.message } };
+  }
+
+  const nextIndex = activeLive ? nextUploadIndex(row) : null;
+  if (nextIndex !== null) {
+    const sourceAccountId = String(row.telegramSourceAccountId || "").trim();
+    const sourceUserId = String(row.telegramSourceUserId || "").trim();
+    const telegramMessageId = Number(telegramIds[nextIndex]);
+    if (!sourceAccountId || !/^\d{1,20}$/.test(sourceUserId) || !Number.isInteger(telegramMessageId) || telegramMessageId <= 0) {
+      const code = "CUSTOM_SUBMISSION_SOURCE_IDENTITY_REQUIRED";
+      const sourceError = Object.assign(new Error(code), { code });
+      const settled = await settleClaimedSourcePipelineFailure({
+        db, agencyId, submissionId, item, ownerToken, code, error: sourceError, now,
+        fallbackRetryAt: new Date(now.getTime() + SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS),
+      });
+      if (settled?.lost || settled?.superseded) return { item: null, blocked: null };
+      return { item: null, blocked: { submissionId, code, message: "This submission has no pinned Telegram source account/user identity." } };
+    }
+    if (!validAccountIds.includes(sourceAccountId)) {
+      // Runtime ownership is ephemeral capability, not a reason to mutate canonical
+      // submission state. Release the durable readiness claim quickly so the Desktop
+      // that actually owns this account can pick the exact same work item.
+      await yieldDomainWorkClaim({ db, item, ownerToken, availableAt: new Date(now.getTime() + SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS), fallbackNow: now });
+      return { item: null, blocked: null };
+    }
+    try {
+      const profile = await ensureSubmissionExecutionProfile({ db, agencyId, submission: row, now, requireRelayRecipient: true });
+      const current = profile.submission;
+      return {
+        item: {
+          kind: "UPLOAD_MEDIA",
+          submission: serializeSubmission(current),
+          creatorId: String(current.creatorId),
+          accountId: sourceAccountId,
+          telegramSourceUserId: sourceUserId,
+          creatorUsername: context.creator.username || null,
+          folderId: String(profile.vaultFolderId),
+          recipient: String(profile.relayRecipient),
+          executionProfileRevision: Number(current.executionProfileRevision || 0),
+          expectedIndex: nextIndex,
+          telegramMessageId: String(telegramMessageId),
+          sourceWorkClaim: serializeSourcePipelineDomainClaim(item, ownerToken),
+        },
+        blocked: null,
+      };
+    } catch (error) {
+      if (!String(error?.code || "").startsWith("CUSTOM_SUBMISSION_") && String(error?.code || "") !== "CREATOR_NOT_FOUND") throw error;
+      const code = String(error.code || "CUSTOM_SUBMISSION_BLOCKED");
+      const settled = await settleClaimedSourcePipelineFailure({
+        db, agencyId, submissionId, item, ownerToken, code, error, now,
+        fallbackRetryAt: new Date(now.getTime() + SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS),
+      });
+      if (settled?.lost || settled?.superseded) return { item: null, blocked: null };
+      return { item: null, blocked: { submissionId, code, message: String(error.message || code) } };
+    }
+  }
+
+  // SALVAGE with no confirmed provider media has no external source work left.
+  if (!mediaIds.length) {
+    await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: now });
+    return { item: null, blocked: null };
+  }
+
+  const finalized = await sourcePipelineFinalized({ db, agencyId, submission: row, order: context.order });
+  if (finalized) {
+    await ackDomainWorkClaim({ db, item, ownerToken, fallbackNow: now });
+    return { item: null, blocked: null };
+  }
+
+  try {
+    const profile = await ensureSubmissionExecutionProfile({ db, agencyId, submission: row, now, requireRelayRecipient: false });
+    const current = profile.submission;
+    return {
+      item: {
+        kind: "FINALIZE_LIBRARY",
+        submission: serializeSubmission(current),
+        creatorId: String(current.creatorId),
+        accountId: String(current.telegramSourceAccountId || ""),
+        creatorUsername: context.creator.username || null,
+        folderId: String(profile.vaultFolderId),
+        recipient: String(profile.relayRecipient || ""),
+        executionProfileRevision: Number(current.executionProfileRevision || 0),
+        expectedIndex: null,
+        telegramMessageId: null,
+        sourceWorkClaim: serializeSourcePipelineDomainClaim(item, ownerToken),
+      },
+      blocked: null,
+    };
+  } catch (error) {
+    if (!String(error?.code || "").startsWith("CUSTOM_SUBMISSION_") && String(error?.code || "") !== "CREATOR_NOT_FOUND") throw error;
+    const code = String(error.code || "CUSTOM_SUBMISSION_BLOCKED");
+    const settled = await settleClaimedSourcePipelineFailure({
+      db, agencyId, submissionId, item, ownerToken, code, error, now,
+      fallbackRetryAt: new Date(now.getTime() + SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS),
+    });
+    if (settled?.lost || settled?.superseded) return { item: null, blocked: null };
+    return { item: null, blocked: { submissionId, code, message: String(error.message || code) } };
+  }
+}
+
+async function claimCustomContentSubmissionUploadWork({ agencyId, member, deviceId, leases, limit = 1, now = new Date(), db = null } = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  // Reduced historical unit adapters predate DomainWork. Production Prisma always
+  // exposes DomainWorkItem after the Phase 2 migration; keeping this branch only
+  // avoids turning unrelated old fixture shape into a fake production fallback.
+  if (!client?.domainWorkItem?.updateMany) {
+    return claimCustomContentSubmissionUploadWorkLegacyDiscovery({ agencyId, member, deviceId, leases, limit, now, db: client });
+  }
+
+  const normalizedDeviceId = identifier(deviceId, "deviceId", { max: 180 });
+  const requestedLeases = runtimeLeaseInputs(leases);
+  const take = uploadWorkLimit(limit);
+  const requestedByAccount = new Map(requestedLeases.map((row) => [row.accountId, row.claimToken]));
+  const leaseIds = [...requestedByAccount.keys()];
+  const leaseRows = [];
+  for (let offset = 0; offset < leaseIds.length; offset += RUNTIME_LEASE_QUERY_CHUNK) {
+    const ids = leaseIds.slice(offset, offset + RUNTIME_LEASE_QUERY_CHUNK);
+    if (!ids.length) continue;
+    leaseRows.push(...await client.agencyTelegramMtprotoAccount.findMany({
+      where: { agencyId, id: { in: ids }, runtimeClaimedByDeviceId: normalizedDeviceId, runtimeClaimUntil: { gt: now } },
+      select: { id: true, runtimeClaimToken: true, runtimeLeaseUserId: true, runtimeLeaseMemberId: true, runtimeLeaseAccessEpoch: true, runtimeLeaseCreatorId: true },
+      take: ids.length,
+    }));
+  }
+  const scope = await allowedCreatorScope({ agencyId, member, db: client });
+  const currentUserId = String(member.userId || "");
+  const currentMemberId = String(member.id || "");
+  const currentAccessEpoch = Number(member.accessEpoch);
+  const scopedCreatorIds = new Set(scope.creatorIds || []);
+  const validAccountIds = leaseRows.filter((row) => {
+    const anchorCreatorId = String(row.runtimeLeaseCreatorId || "");
+    return requestedByAccount.get(String(row.id)) === String(row.runtimeClaimToken || "")
+      && String(row.runtimeLeaseUserId || "") === currentUserId
+      && String(row.runtimeLeaseMemberId || "") === currentMemberId
+      && Number.isInteger(currentAccessEpoch)
+      && Number(row.runtimeLeaseAccessEpoch) === currentAccessEpoch
+      && Boolean(anchorCreatorId)
+      && (scope.broad || scopedCreatorIds.has(anchorCreatorId));
+  }).map((row) => String(row.id));
+
+  const maxClaims = Math.max(take, Math.min(36, take * SOURCE_PIPELINE_CLAIM_MULTIPLIER));
+  const claimed = await claimDomainWorkBatch({
+    db: client,
+    workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+    agencyId: String(agencyId),
+    objectType: "CustomContentSubmission",
+    creatorIds: scope.broad ? null : Array.from(scopedCreatorIds),
+    limit: maxClaims,
+    perAgencyQuantum: maxClaims,
+    perPartitionQuantum: Math.min(3, maxClaims),
+    leaseMs: SOURCE_PIPELINE_DOMAIN_LEASE_MS,
+    fallbackNow: now,
+  });
+  const items = [];
+  const blockedItems = [];
+  for (const claimedItem of claimed?.items || []) {
+    if (items.length >= take) {
+      await yieldDomainWorkClaim({ db: client, item: claimedItem, ownerToken: claimed.ownerToken, availableAt: now, fallbackNow: now }).catch(() => undefined);
+      continue;
+    }
+    const resolved = await exactSourcePipelineWork({
+      agencyId: String(agencyId), member, validAccountIds,
+      item: claimedItem, ownerToken: claimed.ownerToken, now, db: client,
+    });
+    if (resolved?.item) items.push(resolved.item);
+    if (resolved?.blocked) blockedItems.push(resolved.blocked);
+  }
+  return { ok: true, items, blocked: blockedItems[0] || null, blockedItems, serverNow: new Date(now).toISOString(), authority: "CUSTOM_SOURCE_PIPELINE_DOMAIN_WORK_V1" };
+}
+
+async function heartbeatCustomContentSubmissionSourceWork({ agencyId, member, deviceId, submissionId, sourceWorkClaim, now = new Date(), db = null } = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  identifier(deviceId, "deviceId", { max: 180 });
+  const id = identifier(submissionId, "submissionId", { max: 180 });
+  const client = db || require("../prisma");
+  const submission = await client.customContentSubmission.findFirst({ where: { id, agencyId }, select: { id: true, creatorId: true } });
+  if (!submission) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: submission.creatorId, db: client });
+  const item = await assertSourcePipelineDomainClaim({ db: client, agencyId, submissionId: id, claim: sourceWorkClaim });
+  const result = await heartbeatDomainWorkClaim({ db: client, item, ownerToken: item.ownerToken, leaseMs: SOURCE_PIPELINE_HEARTBEAT_LEASE_MS, fallbackNow: now });
+  if (result?.lost) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim was lost", 409);
+  return { ok: true, leaseUntil: result.leaseUntil ? new Date(result.leaseUntil).toISOString() : null };
+}
+
 async function reportCustomContentSubmissionExecutionAttempt({
-  agencyId, member, submissionId, success, code = null,
+  agencyId, member, submissionId, success, code = null, sourceWorkClaim = null,
   workKind = null, expectedIndex = null, executionProfileRevision = null,
   now = new Date(), db = null,
 } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const id = identifier(submissionId, "submissionId", { max: 180 });
-  const row = await client.customContentSubmission.findFirst({ where: { id, agencyId }, select: { id: true, creatorId: true } });
-  if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
-  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
-  return reportSubmissionExecutionAttempt({
-    db: client, agencyId, submissionId: id, success: success === true, code, now,
-    expectedWorkKind: workKind, expectedIndex, expectedExecutionProfileRevision: executionProfileRevision,
-  });
+  const parsedSourceClaim = parseSourcePipelineDomainClaim(sourceWorkClaim);
+  if (!parsedSourceClaim) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_REQUIRED", "A current source-pipeline work claim is required for an execution report", 409);
+
+  // Keep execution-report projection and DomainWork settlement in one transaction.
+  // Lock order is Submission -> DomainWork, matching the submission triggers that can
+  // publish DomainWork. A reclaim before the DomainWork lock is observed as stale; a
+  // reclaim after it must wait until the report+settlement transaction commits.
+  return withSubmissionPipelineLock({ db: client, agencyId, submissionId: id, work: async (lockedClient) => {
+    const row = await lockedClient.customContentSubmission.findFirst({ where: { id, agencyId }, select: { id: true, creatorId: true } });
+    if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+    await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: lockedClient });
+
+    const guarded = await lockDomainWorkClaimForCommit({
+      db: lockedClient, item: parsedSourceClaim, ownerToken: parsedSourceClaim.ownerToken, fallbackNow: now,
+    });
+    if (guarded?.lost
+        || String(guarded?.item?.agencyId || "") !== String(agencyId)
+        || String(guarded?.item?.workClass || "") !== PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE
+        || String(guarded?.item?.objectType || "") !== "CustomContentSubmission"
+        || String(guarded?.item?.objectId || "") !== id) {
+      throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim is no longer current", 409);
+    }
+    const renewed = await heartbeatDomainWorkClaim({
+      db: lockedClient, item: guarded.item, ownerToken: parsedSourceClaim.ownerToken,
+      leaseMs: SOURCE_PIPELINE_DOMAIN_LEASE_MS, fallbackNow: guarded.authorityNow || now,
+    });
+    if (!renewed?.renewed) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim expired before execution settlement", 409);
+
+    // A V1 failure must not write its submission retry clock after a V2 canonical
+    // invalidation has already raised requestedRevision. Otherwise DomainWork V2 would
+    // be READY immediately but exactSourcePipelineWork would read the stale
+    // pipelineNextAttemptAt and yield V2 behind V1's backoff. Success is different:
+    // it may represent completion/projection of an already-authorized exact effect, so
+    // the normal current-stage/profile guards are allowed to accept it and ACK only V1.
+    if (success !== true && guarded.newerRevision === true) {
+      const settlement = await failDomainWorkClaim({
+        db: lockedClient,
+        item: guarded.item,
+        ownerToken: parsedSourceClaim.ownerToken,
+        error: Object.assign(new Error(String(code || "CUSTOM_SUBMISSION_EXECUTION_FAILED")), { code: String(code || "CUSTOM_SUBMISSION_EXECUTION_FAILED") }),
+        retryAt: null,
+        fallbackNow: guarded.authorityNow || now,
+      });
+      if (settlement?.lost) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim was lost before superseded failure settlement", 409);
+      return { ok: true, success: false, nextAttemptAt: null, sourceWorkSettled: true, sourceWorkLost: false, sourceWorkSuperseded: true };
+    }
+
+    const report = await reportSubmissionExecutionAttempt({
+      db: lockedClient, agencyId, submissionId: id, success: success === true, code, now,
+      expectedWorkKind: workKind, expectedIndex, expectedExecutionProfileRevision: executionProfileRevision,
+    });
+    const settlement = success === true
+      ? await ackDomainWorkClaim({ db: lockedClient, item: guarded.item, ownerToken: parsedSourceClaim.ownerToken, fallbackNow: guarded.authorityNow || now })
+      : await failDomainWorkClaim({
+        db: lockedClient, item: guarded.item, ownerToken: parsedSourceClaim.ownerToken, error: Object.assign(new Error(String(code || "CUSTOM_SUBMISSION_EXECUTION_FAILED")), { code: String(code || "CUSTOM_SUBMISSION_EXECUTION_FAILED") }),
+        retryAt: report?.nextAttemptAt ? new Date(report.nextAttemptAt) : null, fallbackNow: guarded.authorityNow || now,
+      });
+    if (settlement?.lost) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim was lost before execution settlement", 409);
+    return { ...report, sourceWorkSettled: true, sourceWorkLost: false, sourceWorkSuperseded: settlement?.superseded === true || settlement?.newerRevision === true };
+  } });
 }
 
 async function assertCustomSubmissionTelegramSourceAccess({ agencyId, member, submissionId, creatorId, accountId, messageIds, db = null } = {}) {
@@ -1588,6 +2042,7 @@ module.exports = {
   assignCustomContentSubmission,
   assertCustomSubmissionTelegramSourceAccess,
   claimCustomContentSubmissionUploadWork,
+  heartbeatCustomContentSubmissionSourceWork,
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   createCustomContentSubmissionFromInboundEvent,

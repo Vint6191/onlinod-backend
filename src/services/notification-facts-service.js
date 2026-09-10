@@ -5,7 +5,7 @@ const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { projectSubscriptionFacts, rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
-const { reconcileCreatorSalesToTeam, reconcileCreatorTipsToTeam } = require("./team-money-reconciliation-service");
+const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectFanIdentityBatch } = require("./fan-data-authority-service");
 
 const SERVICE_VERSION = "notification-facts-v1-history-v8-known-boundary";
@@ -846,11 +846,11 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
       // effect when Team models are available.
       if (groups.sale.length) {
         const persistedSales = await existingFacts(tx, "creatorSale", job.creatorId, groups.sale);
-        await reconcileCreatorSalesToTeam({ db: tx, saleIds: persistedSales.map((row) => row.id) });
+        for (const row of persistedSales) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "PPV", sourceId: row.id, now });
       }
       if (groups.tip.length) {
         const persistedTips = await existingFacts(tx, "creatorTip", job.creatorId, groups.tip);
-        await reconcileCreatorTipsToTeam({ db: tx, tipIds: persistedTips.map((row) => row.id) });
+        for (const row of persistedTips) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "TIP", sourceId: row.id, now });
       }
       const subscription = await persistFactGroup(tx, {
         model: "creatorSubscriptionEvent", facts: groups.subscription, job, deviceId, fanRecordIds, now,

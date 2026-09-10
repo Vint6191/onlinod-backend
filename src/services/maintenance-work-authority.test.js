@@ -26,7 +26,10 @@ function makeDb(now = new Date("2026-09-09T20:00:00.000Z")) {
         const current = rows.get(where.key);
         if (!current) return { count: 0 };
         if (where.generation && current.generation !== where.generation) return { count: 0 };
+        if (where.activeGeneration && current.activeGeneration !== where.activeGeneration) return { count: 0 };
         if (where.ownerToken && current.ownerToken !== where.ownerToken) return { count: 0 };
+        if (where.claimFence != null && BigInt(current.claimFence ?? -1) !== BigInt(where.claimFence)) return { count: 0 };
+        if (where.leaseUntil?.gt && !(current.leaseUntil > where.leaseUntil.gt)) return { count: 0 };
         if (Object.prototype.hasOwnProperty.call(where, "completedAt") && where.completedAt === null && current.completedAt != null) return { count: 0 };
         rows.set(where.key, { ...current, ...data, updatedAt: new Date(now) });
         return { count: 1 };
@@ -57,14 +60,24 @@ test("one-time maintenance generation completes durably and is not reclaimed", a
   assert.equal(fx.rows.get("legacy").progress.cleared, 7);
 });
 
-test("generation change explicitly reopens a completed maintenance lane", async () => {
+test("generation change requires explicit activation and old generation cannot steal it", async () => {
   const fx = makeDb();
   await authority.runMaintenanceLane({ db: fx.db, key: "lane", generation: "v1", oneTime: true, work: async () => ({ complete: true }) });
-  let ran = false;
-  const next = await authority.runMaintenanceLane({ db: fx.db, key: "lane", generation: "v2", oneTime: true, work: async () => { ran = true; return { complete: true }; } });
-  assert.equal(next.complete, true);
-  assert.equal(ran, true);
-  assert.equal(fx.rows.get("lane").generation, "v2");
+
+  const implicit = await authority.claimMaintenanceLane({ db: fx.db, key: "lane", generation: "v2", ownerToken: "v2-before-activation" });
+  assert.equal(implicit.acquired, false);
+  assert.equal(implicit.reason, "inactive_generation");
+
+  const activated = await authority.activateMaintenanceLaneGeneration({ db: fx.db, key: "lane", generation: "v2", expectedGeneration: "v1" });
+  assert.equal(activated.activated, true);
+  const v2 = await authority.claimMaintenanceLane({ db: fx.db, key: "lane", generation: "v2", ownerToken: "v2-owner", leaseMs: 120_000 });
+  assert.equal(v2.acquired, true);
+
+  const staleV1 = await authority.claimMaintenanceLane({ db: fx.db, key: "lane", generation: "v1", ownerToken: "v1-stale", leaseMs: 120_000 });
+  assert.equal(staleV1.acquired, false);
+  assert.equal(staleV1.reason, "inactive_generation");
+  assert.equal(fx.rows.get("lane").activeGeneration, "v2");
+  assert.equal(fx.rows.get("lane").ownerToken, "v2-owner");
 });
 
 test("live lease prevents another replica from owning the same lane", async () => {

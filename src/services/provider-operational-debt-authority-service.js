@@ -24,6 +24,19 @@ const DEBT = Object.freeze({
   CUSTOM_EXTERNAL_PROJECTION_DEBT: "CUSTOM_EXTERNAL_PROJECTION_DEBT",
 });
 
+// Order reconciliation owns only provider-capability/current-thread semantics.
+// External Custom proof projection has its own lifecycle and must never be deleted
+// by an order rebuild (R2 ownership boundary).
+const ORDER_OWNED_DEBT_CLASSES = Object.freeze([
+  DEBT.UNKNOWN_EXTERNAL_OUTCOME,
+  DEBT.PINNED_CANCELLATION_FOLLOWUP,
+  DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY,
+  DEBT.CANCELLATION_FOLLOWUP_DEBT,
+  DEBT.INCOMPLETE_SOURCE_RELAY,
+  DEBT.CONFIRMED_PROJECTION_DEBT,
+  DEBT.PROVIDER_BINDING_RETRY,
+]);
+
 function clean(value, max = 180) {
   const out = String(value == null ? "" : value).trim();
   return out ? out.slice(0, max) : "";
@@ -126,24 +139,27 @@ async function buildOrderDebtCandidates({ agencyId, order, intents, submissions,
     if (intent.providerBindingRetryAt && ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(state)) add({ accountId: intent.accountId, debtClass: DEBT.PROVIDER_BINDING_RETRY, objectType: "TelegramDeliveryIntent", objectId: intent.id, customSubmissionId: intent.customSubmissionId, intentId: intent.id, reason: clean(intent.outcomeReason, 500) || state });
   }
 
-  const pendingContent = String(order?.status || "").toUpperCase() === "PENDING" && String(order?.type || "CONTENT").toUpperCase() === "CONTENT";
-  if (pendingContent) {
+  const orderType = String(order?.type || "CONTENT").toUpperCase();
+  const pendingSupported = String(order?.status || "").toUpperCase() === "PENDING" && ["CONTENT", "CALL", "PHYSICAL"].includes(orderType);
+  if (pendingSupported) {
     const accountIds = new Set();
     const task = latest((intents || []).filter((row) => String(row.kind) === "TASK" && String(row.state) === "CONFIRMED"), "confirmedAt");
     if (task?.accountId) accountIds.add(String(task.accountId));
-    for (const revision of (intents || []).filter((row) => String(row.kind) === "REVISION_REQUEST" && ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT", "COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"].includes(String(row.state)))) {
-      if (revision.accountId) accountIds.add(String(revision.accountId));
-    }
-    for (const submission of submissions || []) {
-      if (String(submission.pipelineDisposition || "ACTIVE").toUpperCase() !== "ACTIVE") continue;
-      if (["WAITING_REVIEW", "REVISION_REQUESTED"].includes(String(submission.reviewStatus || "WAITING_REVIEW").toUpperCase()) && submission.telegramSourceAccountId) accountIds.add(String(submission.telegramSourceAccountId));
-      const sourceCount = Array.isArray(submission.telegramMessageIds) ? submission.telegramMessageIds.length : 0;
-      const mediaCount = Array.isArray(submission.ofMediaIds) ? submission.ofMediaIds.length : 0;
-      if (submission.telegramSourceAccountId && sourceCount > 0 && mediaCount < sourceCount) {
-        add({ accountId: submission.telegramSourceAccountId, debtClass: DEBT.INCOMPLETE_SOURCE_RELAY, objectType: "CustomContentSubmission", objectId: submission.id, customSubmissionId: submission.id, reason: "ACTIVE_SOURCE_MEDIA_INCOMPLETE" });
+    if (orderType === "CONTENT") {
+      for (const revision of (intents || []).filter((row) => String(row.kind) === "REVISION_REQUEST" && ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT", "COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"].includes(String(row.state)))) {
+        if (revision.accountId) accountIds.add(String(revision.accountId));
+      }
+      for (const submission of submissions || []) {
+        if (String(submission.pipelineDisposition || "ACTIVE").toUpperCase() !== "ACTIVE") continue;
+        if (["WAITING_REVIEW", "REVISION_REQUESTED"].includes(String(submission.reviewStatus || "WAITING_REVIEW").toUpperCase()) && submission.telegramSourceAccountId) accountIds.add(String(submission.telegramSourceAccountId));
+        const sourceCount = Array.isArray(submission.telegramMessageIds) ? submission.telegramMessageIds.length : 0;
+        const mediaCount = Array.isArray(submission.ofMediaIds) ? submission.ofMediaIds.length : 0;
+        if (submission.telegramSourceAccountId && sourceCount > 0 && mediaCount < sourceCount) {
+          add({ accountId: submission.telegramSourceAccountId, debtClass: DEBT.INCOMPLETE_SOURCE_RELAY, objectType: "CustomContentSubmission", objectId: submission.id, customSubmissionId: submission.id, reason: "ACTIVE_SOURCE_MEDIA_INCOMPLETE" });
+        }
       }
     }
-    for (const accountId of accountIds) add({ accountId, debtClass: DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY, objectType: "CustomOrder", objectId: order.id, reason: "CURRENT_PENDING_CONTENT" });
+    for (const accountId of accountIds) add({ accountId, debtClass: DEBT.CURRENT_PROVIDER_THREAD_CAPABILITY, objectType: "CustomOrder", objectId: order.id, reason: `CURRENT_PENDING_${orderType}` });
   }
 
   if (String(order?.status || "").toUpperCase() === "CANCELLED" && !order?.telegramCancellationWaivedAt) {
@@ -175,14 +191,14 @@ async function reconcileProviderOperationalDebtForOrder({ agencyId, orderId, db,
     }
     const facts = await loadOrderFacts({ agencyId, orderId, db: tx });
     if (!facts.order) {
-      await tx.providerOperationalDebt?.deleteMany?.({ where: { agencyId, customOrderId: String(orderId) } });
+      await tx.providerOperationalDebt?.deleteMany?.({ where: { agencyId, customOrderId: String(orderId), debtClass: { in: ORDER_OWNED_DEBT_CLASSES } } });
       return { ok: true, missing: true, projected: 0 };
     }
     const candidates = await buildOrderDebtCandidates({ agencyId, ...facts, db: tx });
     if (!tx.providerOperationalDebt?.deleteMany || !tx.providerOperationalDebt?.createMany) {
       const error = new Error("ProviderOperationalDebt storage is required"); error.code = "PROVIDER_OPERATIONAL_DEBT_STORAGE_REQUIRED"; throw error;
     }
-    await tx.providerOperationalDebt.deleteMany({ where: { agencyId, customOrderId: String(orderId) } });
+    await tx.providerOperationalDebt.deleteMany({ where: { agencyId, customOrderId: String(orderId), debtClass: { in: ORDER_OWNED_DEBT_CLASSES } } });
     if (candidates.length) await tx.providerOperationalDebt.createMany({ data: candidates, skipDuplicates: true });
     if (markClean && tx.customOrder?.updateMany) {
       await tx.customOrder.updateMany({
@@ -195,12 +211,12 @@ async function reconcileProviderOperationalDebtForOrder({ agencyId, orderId, db,
   return runDbTransaction(db, run, { isolationLevel: "Serializable" });
 }
 
-async function selectProviderOperationalBackfillBatch({ db, cursor = null, limit = DEFAULT_BATCH_SIZE } = {}) {
+async function selectProviderOperationalBackfillBatch({ db, agencyId = null, cursor = null, limit = DEFAULT_BATCH_SIZE } = {}) {
   const take = bounded(limit);
   if (!db?.customOrder?.findMany) return [];
   return db.customOrder.findMany({
-    where: cursor ? { id: { gt: String(cursor) } } : {},
-    select: { id: true, agencyId: true, status: true, type: true },
+    where: { ...(agencyId ? { agencyId: String(agencyId) } : {}), ...(cursor ? { id: { gt: String(cursor) } } : {}) },
+    select: { id: true, agencyId: true, creatorId: true, status: true, type: true },
     orderBy: { id: "asc" },
     take,
   });
@@ -218,22 +234,27 @@ async function selectProviderOperationalDirtyBatch({ db, limit = DEFAULT_BATCH_S
 }
 
 
-async function customExternalProofBackfillReady({ db, generation = CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_GENERATION } = {}) {
-  const row = await db?.maintenanceLaneState?.findUnique?.({ where: { key: CUSTOM_EXTERNAL_PROOF_BACKFILL_LANE_KEY } });
-  return Boolean(row && String(row.generation || "") === String(generation) && row.completedAt);
+async function customExternalProofBackfillReady({ db, agencyId } = {}) {
+  const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, phase2CoverageStatus } = require("./phase2-work-coverage-authority-service");
+  if (!String(agencyId || "").trim()) return false;
+  const status = await phase2CoverageStatus({ db, agencyId: String(agencyId), family: PHASE2_COVERAGE_FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.CUSTOM_EXTERNAL_PROJECTION });
+  return status.ready;
 }
 
-async function providerOperationalBackfillReady({ db, generation = PROVIDER_OPERATIONAL_BACKFILL_GENERATION } = {}) {
-  const row = await db?.maintenanceLaneState?.findUnique?.({ where: { key: PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY } });
-  return Boolean(row && String(row.generation || "") === String(generation) && row.completedAt);
+async function providerOperationalBackfillReady({ db, agencyId } = {}) {
+  const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, phase2CoverageStatus } = require("./phase2-work-coverage-authority-service");
+  if (!String(agencyId || "").trim()) return false;
+  const status = await phase2CoverageStatus({ db, agencyId: String(agencyId), family: PHASE2_COVERAGE_FAMILY.PROVIDER_OPERATIONAL, generation: PHASE2_COVERAGE_GENERATION.PROVIDER_OPERATIONAL });
+  return status.ready;
 }
 
-async function requireProviderOperationalBackfillReady({ db } = {}) {
-  if (await providerOperationalBackfillReady({ db })) return true;
-  const error = new Error("Provider operational current-work backfill is not complete");
-  error.code = "PROVIDER_OPERATIONAL_DEBT_BACKFILL_INCOMPLETE";
-  error.status = 503;
-  throw error;
+async function requireProviderOperationalBackfillReady({ db, agencyId } = {}) {
+  const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, requirePhase2CoverageReady } = require("./phase2-work-coverage-authority-service");
+  if (!String(agencyId || "").trim()) {
+    const error = new Error("Provider operational coverage requires agency scope"); error.code = "PROVIDER_OPERATIONAL_DEBT_COVERAGE_SCOPE_REQUIRED"; error.status = 500; throw error;
+  }
+  await requirePhase2CoverageReady({ db, agencyId: String(agencyId), family: PHASE2_COVERAGE_FAMILY.PROVIDER_OPERATIONAL, generation: PHASE2_COVERAGE_GENERATION.PROVIDER_OPERATIONAL, code: "PROVIDER_OPERATIONAL_DEBT_BACKFILL_INCOMPLETE" });
+  return true;
 }
 
 async function dirtyOrderIdsForAccount({ agencyId, accountId, db, limit = DEFAULT_BATCH_SIZE } = {}) {
@@ -254,8 +275,11 @@ async function dirtyOrderIdsForAccount({ agencyId, accountId, db, limit = DEFAUL
     );
     return (rows || []).map((row) => String(row.id)).filter(Boolean);
   }
-  const rows = await db?.customOrder?.findMany?.({ where: { agencyId, providerOperationalDirty: true }, select: { id: true }, orderBy: { id: "asc" }, take }) || [];
-  return rows.map((row) => String(row.id));
+  const rows = await db?.customOrder?.findMany?.({ where: { agencyId, providerOperationalDirty: true }, select: { id: true, providerOperationalDirty: true }, orderBy: { id: "asc" }, take }) || [];
+  // Reduced doubles cannot reproduce the production account-reference EXISTS clauses. Treat a
+  // row as dirty only when the double explicitly returns the marker; omitted fields are UNKNOWN,
+  // not proof of current reconciliation debt.
+  return rows.filter((row) => row?.providerOperationalDirty === true).map((row) => String(row.id));
 }
 
 async function reconcileDirtyProviderOrdersForAccount({ agencyId, accountId, db, limit = DEFAULT_BATCH_SIZE } = {}) {
@@ -377,6 +401,7 @@ async function listProviderOperationalDebtForAccount({ agencyId, accountId, db, 
 
 module.exports = {
   DEBT,
+  ORDER_OWNED_DEBT_CLASSES,
   PROVIDER_OPERATIONAL_PROJECTION_VERSION,
   PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY,
   PROVIDER_OPERATIONAL_BACKFILL_GENERATION,
