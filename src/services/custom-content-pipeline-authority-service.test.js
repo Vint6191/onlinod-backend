@@ -102,6 +102,27 @@ async function seedPipelineProviderAuthority(db, agencyId) {
       return { agencyId, family: key.family, generation: key.generation, active: true, enumerationState: "COMPLETE", completedAt: new Date("2026-09-09T20:00:00.000Z") };
     },
   };
+  // Retirement fixtures intentionally model a fully converged provider workset.
+  // Historical COMPLETE alone is no longer current convergence proof; mirror the
+  // production DomainWork delegates and prove that no current-generation external
+  // projection DWI remains instead of making UNKNOWN look like ZERO.
+  db.phase2WorkGenerationAuthority = {
+    async findUnique() { return { activeGeneration: "phase2_domain_work_v3_actual55" }; },
+  };
+  db.phase2WorkFamilyState = {
+    async findUnique({ where }) {
+      const key = where?.agencyId_workClass;
+      if (!key || String(key.agencyId) !== String(agencyId)) return null;
+      if (String(key.workClass) !== "CUSTOM_EXTERNAL_PROJECTION") return null;
+      return {
+        agencyId, workClass: key.workClass, activeGeneration: "phase2_domain_work_v3_actual55",
+        outstandingCount: 0, requestedSequence: 1n, convergedSequence: 1n,
+      };
+    },
+  };
+  db.domainWorkItem = {
+    async findFirst() { return null; },
+  };
 }
 async function creatorCustomPipelineBlockers(args) {
   await seedPipelineProviderAuthority(args.db, args.agencyId);

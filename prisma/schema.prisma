@@ -367,6 +367,7 @@ model Agency {
   phase2DomainWorkItems DomainWorkItem[]
   phase2WorkCoverages Phase2WorkCoverage[]
   phase2DependencyStates Phase2DependencyState[]
+  phase2BroadClaimPartitionStates Phase2WorkBroadClaimPartitionState[]
 
   @@index([deletedAt])
 }
@@ -497,7 +498,6 @@ model CreatorAccount {
   teamDialogSessions TeamDialogSession[]
   teamResponseCases TeamResponseCase[]
   teamPendingDialogStates TeamPendingDialogState[]
-  teamShiftLinks TeamShiftCreator[]
   messageTemplateUsageEvents MessageTemplateUsageEvent[]
   vaultUnsortedSnapshots VaultUnsortedSnapshot[]
   presenceSnapshot CreatorPresenceSnapshot?
@@ -573,6 +573,7 @@ model CreatorAccount {
   taskActivities CreatorTaskActivity[]
   customOrders CustomOrder[]
   customContentSubmissions CustomContentSubmission[]
+  teamShiftLinks TeamShiftCreator[] @relation("TeamShiftCreatorActiveCreator")
 
   @@unique([agencyId, id], map: "CreatorAccount_agencyId_id_key")
   @@index([agencyId])
@@ -2181,8 +2182,8 @@ model DomainWorkItem {
   accountId          String?
   requestedRevision  BigInt   @default(1)
   completedRevision  BigInt   @default(0)
-  activeGeneration   String   @default("phase2_domain_work_v2_actual53")
-  projectionVersion  String   @default("phase2_domain_work_v2_actual53")
+  activeGeneration   String   @default("phase2_domain_work_v3_actual55")
+  projectionVersion  String   @default("phase2_domain_work_v3_actual55")
   state              String   @default("READY")
   isOutstanding      Boolean  @default(true)
   availableAt        DateTime @default(now())
@@ -2232,12 +2233,30 @@ model Phase2WorkFamilyState {
   requestedSequence BigInt   @default(0)
   convergedSequence BigInt   @default(0)
   lastRequestedAt   DateTime?
+  lastBroadClaimedAt DateTime?
   lastConvergedAt   DateTime?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
   @@unique([agencyId, workClass], map: "Phase2WorkFamilyState_identity_key")
   @@index([agencyId, outstandingCount, workClass], map: "Phase2WorkFamilyState_outstanding_idx")
+}
+
+model Phase2WorkBroadClaimPartitionState {
+  id               String   @id
+  agencyId         String
+  workClass        String
+  partitionKey     String
+  activeGeneration String
+  lastClaimedAt    DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  @@unique([agencyId, workClass, partitionKey], map: "Phase2WorkBroadClaimPartitionState_identity_key")
+  @@index([agencyId, workClass, activeGeneration, lastClaimedAt, partitionKey], map: "Phase2WorkBroadClaimPartitionState_claim_idx")
+  @@index([workClass, activeGeneration, lastClaimedAt, agencyId, partitionKey], map: "Phase2WorkBroadClaimPartitionState_recovery_idx")
 }
 
 model DomainWorkReadyPartition {
@@ -3253,15 +3272,19 @@ model TeamShift {
 }
 
 model TeamShiftCreator {
-  shiftId   String
-  creatorId String
-  createdAt DateTime @default(now())
+  shiftId      String
+  // Durable historical identity. It intentionally survives Creator hard-delete.
+  creatorId    String
+  // Live referential edge. Hard-delete nulls this without erasing the schedule fact.
+  creatorRefId String?
+  createdAt    DateTime @default(now())
 
-  shift   TeamShift       @relation(fields: [shiftId], references: [id], onDelete: Cascade)
-  creator CreatorAccount  @relation(fields: [creatorId], references: [id], onDelete: Restrict)
+  shift   TeamShift        @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+  creator CreatorAccount?  @relation("TeamShiftCreatorActiveCreator", fields: [creatorRefId], references: [id], onDelete: SetNull)
 
   @@id([shiftId, creatorId])
   @@index([creatorId, shiftId])
+  @@index([creatorRefId, shiftId])
 }
 
 model AnalyticsSnapshot {
@@ -5144,6 +5167,7 @@ model TeamSentMessageLedger {
   @@index([agencyId, memberId, sentAt])
   @@index([agencyId, isPpv, sentAt])
   @@index([agencyId, dialogId, sentAt])
+  @@index([agencyId, creatorId, dialogId, sentAt, telemetryEventId, id], map: "TeamSentMessageLedger_temporal_order_v3_idx")
 }
 
 model TeamCoverageSession {

@@ -39,6 +39,6 @@ test("historical enumeration does not activate until exact money work has conver
   const body = functionBlock("runTeamMoneyReconciliationCoverageEnumerationUnit", "runTeamReadSummaryCoverageEnumerationUnit");
   assert.match(body, /hasOutstandingDomainWork/);
   assert.match(body, /PHASE2_WORK_CLASS\.TEAM_MONEY_RECONCILIATION/);
-  assert.match(body, /if \(outstanding\)/);
-  assert.ok(body.indexOf("if (outstanding)") < body.indexOf("markPhase2CoverageComplete"));
+  assert.match(body, /if \(outstanding !== false\)/);
+  assert.ok(body.indexOf("if (outstanding !== false)") < body.indexOf("markPhase2CoverageComplete"));
 });

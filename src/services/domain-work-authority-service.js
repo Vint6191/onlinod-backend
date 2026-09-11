@@ -4,8 +4,8 @@ const { createHash, randomUUID } = require("node:crypto");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 
-const DOMAIN_WORK_GENERATION = "phase2_domain_work_v2_actual53";
-const DOMAIN_WORK_PROJECTION_VERSION = "phase2_domain_work_v2_actual53";
+const DOMAIN_WORK_GENERATION = "phase2_domain_work_v3_actual55";
+const DOMAIN_WORK_PROJECTION_VERSION = "phase2_domain_work_v3_actual55";
 const DEFAULT_LEASE_MS = 2 * 60 * 1000;
 const MAX_BATCH = 100;
 
@@ -24,6 +24,7 @@ const WORK_CLASS = Object.freeze({
   HISTORICAL_ENUMERATION: "HISTORICAL_ENUMERATION",
   RETENTION: "RETENTION",
   DESTRUCTIVE_CREATOR_CLEANUP: "DESTRUCTIVE_CREATOR_CLEANUP",
+  DESTRUCTIVE_AGENCY_CLEANUP: "DESTRUCTIVE_AGENCY_CLEANUP",
 });
 
 const STATE = Object.freeze({ READY: "READY", CLAIMED: "CLAIMED", BLOCKED: "BLOCKED", RECONCILE_REQUIRED: "RECONCILE_REQUIRED", DONE: "DONE" });
@@ -147,7 +148,12 @@ async function publishDomainWork({ db = null, ...input } = {}) {
          "isOutstanding"=TRUE,
          "availableAt"=LEAST("DomainWorkItem"."availableAt",EXCLUDED."availableAt"),
          "nextAttemptAt"=NULL,
-         "progressCursor"=CASE WHEN "DomainWorkItem"."state"='CLAIMED' THEN "DomainWorkItem"."progressCursor" ELSE NULL END,
+         "progressCursor"=CASE
+           WHEN "DomainWorkItem"."state"='CLAIMED' THEN "DomainWorkItem"."progressCursor"
+           WHEN "DomainWorkItem"."workClass"='TEAM_DIALOG_PROJECTION'
+             AND ("DomainWorkItem"."progressCursor"->'pendingRepair') IS NOT NULL
+             THEN "DomainWorkItem"."progressCursor"
+           ELSE NULL END,
          "errorClass"=NULL,"lastError"=NULL,"terminalCause"=NULL,"updatedAt"=CURRENT_TIMESTAMP
        RETURNING *`,
       row.id,row.agencyId,row.workClass,row.objectType,row.objectId,row.parentObjectId,row.partitionKey,row.creatorId,row.accountId,
@@ -175,7 +181,10 @@ async function publishDomainWork({ db = null, ...input } = {}) {
       dependencyRevision: row.dependencyRevision > asBigInt(existing.dependencyRevision) ? row.dependencyRevision : asBigInt(existing.dependencyRevision),
       state: String(existing.state) === STATE.CLAIMED ? STATE.CLAIMED : STATE.READY, isOutstanding: true,
       availableAt: asDate(existing.availableAt) && asDate(existing.availableAt) < row.availableAt ? existing.availableAt : row.availableAt,
-      nextAttemptAt: null, progressCursor: String(existing.state) === STATE.CLAIMED ? existing.progressCursor ?? null : null,
+      nextAttemptAt: null,
+      progressCursor: String(existing.state) === STATE.CLAIMED
+        ? existing.progressCursor ?? null
+        : (String(existing.workClass) === WORK_CLASS.TEAM_DIALOG_PROJECTION && existing.progressCursor?.pendingRepair ? existing.progressCursor : null),
       errorClass: null, lastError: null, terminalCause: null,
     },
   });
@@ -201,10 +210,36 @@ async function activeDomainWorkGeneration({ db, workClass, fallback = DOMAIN_WOR
   return clean(fallback, 120) || DOMAIN_WORK_GENERATION;
 }
 
+async function probeCurrentDomainWorkPresence({ db, agencyId, workClass, activeGeneration }) {
+  const a = clean(agencyId, 180);
+  const klass = clean(workClass, 120);
+  const generation = clean(activeGeneration, 120);
+  if (!a || !klass || !generation) return null;
+  if (db?.domainWorkItem?.findFirst) {
+    const row = await db.domainWorkItem.findFirst({
+      where: { agencyId: a, workClass: klass, activeGeneration: generation, isOutstanding: true },
+      select: { id: true },
+    });
+    return Boolean(row);
+  }
+  if (typeof db?.$queryRawUnsafe === "function") {
+    try {
+      const rows = await db.$queryRawUnsafe(
+        `SELECT 1 AS present FROM "DomainWorkItem"
+          WHERE "agencyId"=$1 AND "workClass"=$2 AND "activeGeneration"=$3 AND "isOutstanding"=TRUE
+          LIMIT 1`,
+        a, klass, generation,
+      );
+      return Array.isArray(rows) ? rows.length > 0 : null;
+    } catch (_) {}
+  }
+  return null;
+}
+
 async function domainWorkFamilyState({ db = null, agencyId, workClass } = {}) {
   if (!db) db = require("../prisma");
   const a = clean(agencyId, 180); const klass = clean(workClass, 120);
-  if (!a || !klass) return { fresh: false, outstandingCount: null, state: "UNKNOWN" };
+  if (!a || !klass) return { fresh: false, outstandingCount: null, hasOutstanding: null, state: "UNKNOWN" };
   let row = null;
   if (db?.phase2WorkFamilyState?.findUnique) {
     row = await db.phase2WorkFamilyState.findUnique({
@@ -219,19 +254,88 @@ async function domainWorkFamilyState({ db = null, agencyId, workClass } = {}) {
       row = rows?.[0] || null;
     } catch (_) {}
   }
-  if (!row) return { fresh: true, outstandingCount: 0, state: "NO_LIVE_WORK", row: null };
+
+  const activeGeneration = await activeDomainWorkGeneration({ db, workClass: klass, fallback: DOMAIN_WORK_GENERATION });
+  if (!row) {
+    // Missing family-state is not proof of zero. Probe exactly one physically-current
+    // DWI identity; this is bounded and indexed, not a lifetime-history scan.
+    const present = await probeCurrentDomainWorkPresence({ db, agencyId: a, workClass: klass, activeGeneration });
+    if (present === true) {
+      return { fresh: false, outstandingCount: null, hasOutstanding: true, state: "FAMILY_STATE_MISSING", row: null, activeGeneration };
+    }
+    if (present === false) {
+      return { fresh: true, outstandingCount: 0, hasOutstanding: false, state: "NO_LIVE_WORK", row: null, activeGeneration };
+    }
+    return { fresh: false, outstandingCount: null, hasOutstanding: null, state: "UNKNOWN", row: null, activeGeneration };
+  }
+
   const outstandingCount = Math.max(0, Number(row.outstandingCount || 0));
   const requestedSequence = asBigInt(row.requestedSequence, 0n);
   const convergedSequence = asBigInt(row.convergedSequence, 0n);
-  const fresh = outstandingCount === 0 && convergedSequence >= requestedSequence;
+  const familyGeneration = clean(row.activeGeneration, 120);
+
+  // Phase2WorkGenerationAuthority is the generation authority. A stale family row is
+  // never allowed to certify current work from its old counters.  However, if the
+  // physically-current generation proves zero, the stale projection is equivalent to
+  // a missing family row and must not create permanent liveness debt after a generation
+  // cutover.  Current DWI truth wins in both directions.
+  if (familyGeneration && String(familyGeneration) !== String(activeGeneration)) {
+    const present = await probeCurrentDomainWorkPresence({ db, agencyId: a, workClass: klass, activeGeneration });
+    if (present === false) {
+      return {
+        fresh: true,
+        outstandingCount: 0,
+        hasOutstanding: false,
+        requestedSequence,
+        convergedSequence,
+        state: "NO_LIVE_WORK_STALE_FAMILY_PROJECTION",
+        row,
+        activeGeneration,
+        familyGeneration,
+      };
+    }
+    return {
+      fresh: false,
+      outstandingCount: present === true ? Math.max(1, outstandingCount) : null,
+      hasOutstanding: present === true ? true : null,
+      requestedSequence,
+      convergedSequence,
+      state: present === true ? "FAMILY_STATE_GENERATION_STALE" : "FAMILY_STATE_GENERATION_UNPROVEN",
+      row,
+      activeGeneration,
+      familyGeneration,
+    };
+  }
+
+  const projectedFresh = outstandingCount === 0 && convergedSequence >= requestedSequence;
+  if (projectedFresh) {
+    // Projection ZERO is a release boundary, so prove it against the physical current
+    // DWI workset. This catches a missing/undercounted family row repaired by a scoped
+    // ACK and any other projection drift without making hot non-zero reads scan history.
+    const present = await probeCurrentDomainWorkPresence({ db, agencyId: a, workClass: klass, activeGeneration });
+    if (present === true) {
+      return {
+        fresh: false, outstandingCount, hasOutstanding: true, requestedSequence, convergedSequence,
+        state: "FAMILY_STATE_FALSE_ZERO", row, activeGeneration, familyGeneration: familyGeneration || activeGeneration,
+      };
+    }
+    if (present !== false) {
+      return {
+        fresh: false, outstandingCount: null, hasOutstanding: null, requestedSequence, convergedSequence,
+        state: "FAMILY_STATE_ZERO_UNPROVEN", row, activeGeneration, familyGeneration: familyGeneration || activeGeneration,
+      };
+    }
+  }
+
   return {
-    fresh, outstandingCount, requestedSequence, convergedSequence,
-    state: fresh ? "FRESH" : "STALE", row,
+    fresh: projectedFresh, outstandingCount, hasOutstanding: outstandingCount > 0, requestedSequence, convergedSequence,
+    state: projectedFresh ? "FRESH" : "STALE", row, activeGeneration, familyGeneration: familyGeneration || activeGeneration,
   };
 }
 
 async function hasOutstandingDomainWork({ db = null, agencyId, workClass } = {}) {
   const status = await domainWorkFamilyState({ db, agencyId, workClass });
+  if (typeof status.hasOutstanding === "boolean") return status.hasOutstanding;
   return status.outstandingCount == null ? null : status.outstandingCount > 0;
 }
 
@@ -300,10 +404,14 @@ async function claimDomainWorkBatch({
 
   const rawCapable = typeof db?.$queryRawUnsafe === "function";
 
-  // F54-01 + ready-head lock order: creator-scoped execution is tenant-scoped.
-  // Requiring the agency here both keeps the direct creator index bounded and
-  // guarantees that one claim transaction can acquire the agency head authority
-  // before it locks any DWI row/partition.
+  // Actual55 Root A: ready-head rows are no longer execution authority.  They were
+  // introduced as a physical admission optimization, but making correctness depend
+  // on their mutable MIN created the F55-01/F55-02/F55-05 failure cluster (Prisma
+  // VOID decoding, Agency-wide serialization and row/advisory lock inversion).
+  // Production admission now starts from physically-current isOutstanding DWI rows.
+  // Creator-scoped workers seek their exact creator identities; broad workers first
+  // choose a due Agency from the small per-family convergence set, then rank only a
+  // bounded current-DWI window for partition fairness.
   if (rawCapable && normalizedCreatorIds.length) {
     const scopedAgencyId = clean(agencyId, 180);
     if (!scopedAgencyId) {
@@ -315,15 +423,13 @@ async function claimDomainWorkBatch({
       if (typeof tx?.$queryRawUnsafe !== "function") {
         return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_raw_storage_unavailable" };
       }
-      await tx.$queryRawUnsafe(`SELECT "phase2_lock_domain_work_agency_head"($1,$2)`, scopedAgencyId, klass);
       const params = [klass, authorityNow, String(generation), ownerToken, leaseUntil, partitionQuantum, take];
       const creatorValues = normalizedCreatorIds.map((value) => {
         params.push(value);
         return `($${params.length})`;
       }).join(",");
-      let scopedWorkFilter = "";
       params.push(scopedAgencyId);
-      scopedWorkFilter += ` AND d."agencyId"=$${params.length}`;
+      let scopedWorkFilter = ` AND d."agencyId"=$${params.length}`;
       if (objectType) {
         params.push(String(objectType));
         scopedWorkFilter += ` AND d."objectType"=$${params.length}`;
@@ -367,17 +473,13 @@ async function claimDomainWorkBatch({
     });
   }
 
-  // Production broad claims are intentionally split into one agency per DB
-  // transaction.  The returned logical batch still spans several agencies and
-  // keeps one ownerToken, but no transaction can accumulate head locks for A then
-  // later request B while a peer owns B and waits for A.  This removes the
-  // multi-agency advisory-lock cycle without introducing a platform-global mutex.
   if (rawCapable && typeof db?.$transaction === "function") {
     const claimed = [];
     const seenAgencies = [];
     const maxAgencies = agencyId ? 1 : Math.max(1, Math.min(take, 100));
     let firstAuthorityNow = null;
     let lastLeaseUntil = null;
+    let recoveryProbeUsed = false;
 
     for (let attempt = 0; attempt < maxAgencies && claimed.length < take; attempt += 1) {
       const remaining = take - claimed.length;
@@ -386,40 +488,109 @@ async function claimDomainWorkBatch({
         const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
         if (typeof tx?.$queryRawUnsafe !== "function") return { agencyId: null, authorityNow, leaseUntil, items: [] };
 
-        const headParams = [klass, authorityNow, String(generation)];
-        let headFilter = "";
-        if (agencyId) {
-          headParams.push(String(agencyId));
-          headFilter += ` AND a."agencyId"=$${headParams.length}`;
+        let selectedAgency = clean(agencyId, 180);
+        let recoveredAgencyNeedsFamilyRebuild = false;
+        if (!selectedAgency) {
+          let rows = [];
+          // INT7 recovery admission is driven by the compact partition catalog, not
+          // by a negative scan of the complete physical DWI backlog. This allows a
+          // missing/stale/false-zero family projection to compete with healthy Agencies
+          // without making every normal broad claim O(all outstanding work). Catalog
+          // metadata is never execution truth: a physical due DWI is re-proven with
+          // EXISTS before an Agency can be admitted.
+          if (!recoveryProbeUsed) {
+            recoveryProbeUsed = true;
+            const recoveryParams = [klass, authorityNow, String(generation)];
+            let recoveryExcluded = "";
+            if (seenAgencies.length) {
+              const placeholders = seenAgencies.map((value) => { recoveryParams.push(value); return `$${recoveryParams.length}`; }).join(",");
+              recoveryExcluded = ` AND f."agencyId" NOT IN (${placeholders})`;
+            }
+            rows = await tx.$queryRawUnsafe(
+              `SELECT f."agencyId"
+                 FROM "Phase2WorkBroadClaimPartitionState" f
+                 LEFT JOIN "Phase2WorkFamilyState" s
+                   ON s."agencyId"=f."agencyId" AND s."workClass"=f."workClass"
+                WHERE f."workClass"=$1 AND f."activeGeneration"=$3${recoveryExcluded}
+                  AND (s."agencyId" IS NULL OR s."activeGeneration" IS DISTINCT FROM $3 OR s."outstandingCount"<=0)
+                  AND EXISTS (
+                    SELECT 1 FROM "DomainWorkItem" d
+                     WHERE d."agencyId"=f."agencyId" AND d."workClass"=$1 AND d."activeGeneration"=$3
+                       AND d."partitionKey"=f."partitionKey" AND d."isOutstanding"=TRUE
+                       AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                       AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)
+                     LIMIT 1
+                  )
+                ORDER BY f."lastClaimedAt" ASC NULLS FIRST,f."agencyId" ASC,f."partitionKey" ASC
+                LIMIT 1`, ...recoveryParams,
+            );
+            selectedAgency = clean(rows?.[0]?.agencyId, 180);
+            recoveredAgencyNeedsFamilyRebuild = Boolean(selectedAgency);
+          }
+
+          if (!selectedAgency) {
+            const agencyParams = [klass, authorityNow, String(generation)];
+            let excluded = "";
+            if (seenAgencies.length) {
+              const placeholders = seenAgencies.map((value) => { agencyParams.push(value); return `$${agencyParams.length}`; }).join(",");
+              excluded = ` AND s."agencyId" NOT IN (${placeholders})`;
+            }
+            rows = await tx.$queryRawUnsafe(
+              `SELECT s."agencyId"
+                 FROM "Phase2WorkFamilyState" s
+                WHERE s."workClass"=$1
+                  AND s."activeGeneration"=$3
+                  AND s."outstandingCount">0${excluded}
+                  AND EXISTS (
+                    SELECT 1 FROM "DomainWorkItem" d
+                     WHERE d."agencyId"=s."agencyId" AND d."workClass"=$1 AND d."activeGeneration"=$3
+                       AND d."isOutstanding"=TRUE
+                       AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                       AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)
+                     LIMIT 1
+                  )
+                ORDER BY s."lastBroadClaimedAt" ASC NULLS FIRST,s."lastRequestedAt" ASC NULLS FIRST,s."agencyId" ASC
+                LIMIT 1`, ...agencyParams,
+            );
+            selectedAgency = clean(rows?.[0]?.agencyId, 180);
+          }
+
+          // If both derived projections are absent/corrupt, fail safe but remain
+          // self-healing: only after catalog recovery and normal family scheduling
+          // find nothing do we admit one earliest physical due Agency. This query does
+          // not prove a negative over the backlog; LIMIT 1 can stop at the first due
+          // row and the subsequent claim rebuilds both derived projections.
+          if (!selectedAgency) {
+            const physicalParams = [klass, authorityNow, String(generation)];
+            let physicalExcluded = "";
+            if (seenAgencies.length) {
+              const placeholders = seenAgencies.map((value) => { physicalParams.push(value); return `$${physicalParams.length}`; }).join(",");
+              physicalExcluded = ` AND d."agencyId" NOT IN (${placeholders})`;
+            }
+            rows = await tx.$queryRawUnsafe(
+              `SELECT d."agencyId"
+                 FROM "DomainWorkItem" d
+                WHERE d."workClass"=$1 AND d."activeGeneration"=$3 AND d."isOutstanding"=TRUE${physicalExcluded}
+                  AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                  AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)
+                ORDER BY d."availableAt",d."agencyId",d."partitionKey",d."id" LIMIT 1`, ...physicalParams,
+            );
+            selectedAgency = clean(rows?.[0]?.agencyId, 180);
+            recoveredAgencyNeedsFamilyRebuild = Boolean(selectedAgency);
+          }
         }
-        if (seenAgencies.length) {
-          const excluded = seenAgencies.map((value) => { headParams.push(value); return `$${headParams.length}`; }).join(",");
-          headFilter += ` AND a."agencyId" NOT IN (${excluded})`;
-        }
-        const heads = await tx.$queryRawUnsafe(
-          `SELECT a."agencyId"
-             FROM "DomainWorkReadyAgency" a
-            WHERE a."workClass"=$1
-              AND a."activeGeneration"=$3
-              AND a."nextDueAt" <= $2${headFilter}
-            ORDER BY a."nextDueAt",a."agencyId"
-            LIMIT 1`, ...headParams,
-        );
-        const selectedAgency = clean(heads?.[0]?.agencyId, 180);
         if (!selectedAgency) return { agencyId: null, authorityNow, leaseUntil, items: [] };
 
-        // All DWI writers acquire this agency authority before any partition
-        // authority.  Re-read the head after the lock so selection cannot rely on
-        // a pre-lock snapshot that became stale while waiting.
-        await tx.$queryRawUnsafe(`SELECT "phase2_lock_domain_work_agency_head"($1,$2)`, selectedAgency, klass);
-        const eligible = await tx.$queryRawUnsafe(
-          `SELECT 1 AS ok FROM "DomainWorkReadyAgency" a
-            WHERE a."agencyId"=$1 AND a."workClass"=$2 AND a."activeGeneration"=$3 AND a."nextDueAt" <= $4
-            LIMIT 1`, selectedAgency, klass, String(generation), authorityNow,
-        );
-        if (!eligible?.length) return { agencyId: selectedAgency, authorityNow, leaseUntil, items: [] };
 
-        const params = [klass, authorityNow, String(generation), selectedAgency, quantum, partitionQuantum, Math.min(remaining, take), ownerToken, leaseUntil];
+
+        const agencyTake = Math.max(1, Math.min(remaining, quantum));
+        // Select a small rotating set of physical partition heads, then lock only
+        // rows from those partitions. The old 4096-row prefix could be monopolized
+        // by one hot partition and also locked thousands of rows that would not be
+        // claimed. Fairness state is scheduling metadata only; DWI remains work truth.
+        const partitionsNeeded = Math.max(1, Math.ceil(agencyTake / partitionQuantum));
+        const partitionSelectionCap = Math.min(256, Math.max(partitionsNeeded, partitionsNeeded * 2));
+        const params = [klass, authorityNow, String(generation), selectedAgency, partitionSelectionCap, partitionQuantum, agencyTake, ownerToken, leaseUntil];
         let workFilter = "";
         if (objectType) {
           params.push(String(objectType));
@@ -430,52 +601,171 @@ async function claimDomainWorkBatch({
           workFilter += ` AND d."objectId" IN (${placeholders})`;
         }
 
-        const rows = await tx.$queryRawUnsafe(
-          `WITH partitions AS (
-             SELECT p."partitionKey",p."nextDueAt"
-               FROM "DomainWorkReadyPartition" p
-              WHERE p."agencyId"=$4
-                AND p."workClass"=$1
-                AND p."activeGeneration"=$3
-                AND p."nextDueAt" <= $2
-              ORDER BY p."nextDueAt",p."partitionKey"
+        // INT7: broad scheduling starts from the durable partition catalog, not from
+        // DISTINCT ON over the complete outstanding DWI workset. The catalog is only
+        // admission metadata: every selected partition is re-proven against physical
+        // due DWI before any row is locked/claimed. This keeps the hot path bounded by
+        // partition metadata + the requested claim quantum rather than by queue depth.
+        let rows = await tx.$queryRawUnsafe(
+          `WITH selected_partitions AS MATERIALIZED (
+             SELECT f."partitionKey"
+               FROM "Phase2WorkBroadClaimPartitionState" f
+              WHERE f."agencyId"=$4 AND f."workClass"=$1 AND f."activeGeneration"=$3
+                AND EXISTS (
+                  SELECT 1 FROM "DomainWorkItem" d
+                   WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
+                     AND d."partitionKey"=f."partitionKey"
+                     AND d."isOutstanding"=TRUE
+                     AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                     AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
+                   LIMIT 1
+                )
+              ORDER BY f."lastClaimedAt" ASC NULLS FIRST,f."partitionKey" ASC
               LIMIT $5
-           ), candidates AS (
-             SELECT d."id",d."availableAt"
-               FROM partitions p
+           ), candidates AS MATERIALIZED (
+             SELECT picked."id",picked."availableAt",p."partitionKey"
+               FROM selected_partitions p
                CROSS JOIN LATERAL (
                  SELECT d."id",d."availableAt"
                    FROM "DomainWorkItem" d
-                  WHERE d."agencyId"=$4
-                    AND d."workClass"=$1
+                  WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
                     AND d."partitionKey"=p."partitionKey"
                     AND d."isOutstanding"=TRUE
-                    AND d."activeGeneration"=$3
                     AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                    AND d."availableAt" <= $2
-                    AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
+                    AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
                   ORDER BY d."availableAt",d."id"
                   FOR UPDATE OF d SKIP LOCKED
                   LIMIT $6
-               ) d
-              ORDER BY d."availableAt",d."id"
+               ) picked
+              ORDER BY picked."availableAt",picked."id"
               LIMIT $7
+           ), claimed AS (
+             UPDATE "DomainWorkItem" d SET
+               "state"='CLAIMED',"ownerToken"=$8,"claimFence"=d."claimFence"+1,
+               "claimedRevision"=d."requestedRevision","leaseUntil"=$9,"attempts"=d."attempts"+1,
+               "updatedAt"=CURRENT_TIMESTAMP
+              FROM candidates c WHERE d."id"=c."id"
+             RETURNING d.*
+           ), partition_touch AS (
+             UPDATE "Phase2WorkBroadClaimPartitionState" f
+                SET "lastClaimedAt"=$2,"updatedAt"=CURRENT_TIMESTAMP
+               FROM (SELECT DISTINCT "partitionKey" FROM claimed) c
+              WHERE f."agencyId"=$4 AND f."workClass"=$1 AND f."activeGeneration"=$3
+                AND f."partitionKey"=c."partitionKey"
+             RETURNING 1
+           ), family_touch AS (
+             UPDATE "Phase2WorkFamilyState" s
+                SET "lastBroadClaimedAt"=$2,"updatedAt"=CURRENT_TIMESTAMP
+              WHERE s."agencyId"=$4 AND s."workClass"=$1 AND s."activeGeneration"=$3
+                AND EXISTS (SELECT 1 FROM claimed)
+             RETURNING 1
            )
-           UPDATE "DomainWorkItem" d SET
-             "state"='CLAIMED',"ownerToken"=$8,"claimFence"=d."claimFence"+1,
-             "claimedRevision"=d."requestedRevision","leaseUntil"=$9,"attempts"=d."attempts"+1,
-             "updatedAt"=CURRENT_TIMESTAMP
-            FROM candidates c WHERE d."id"=c."id"
-           RETURNING d.*`, ...params,
+           SELECT c.* FROM claimed c`, ...params,
         );
+
+        // Corrupt/missing catalog metadata must never hide physical current work.
+        // If the bounded catalog lane produced nothing, claim exactly one physical due
+        // row directly. The DWI catalog trigger repairs that partition in the same
+        // transaction, so this is a self-healing exceptional path rather than a second
+        // work authority or an O(all partitions) steady-state scan.
+        if (Number(rows?.length || 0) === 0) {
+          rows = await tx.$queryRawUnsafe(
+            `WITH candidate AS MATERIALIZED (
+               SELECT d."id",d."partitionKey",d."availableAt"
+                 FROM "DomainWorkItem" d
+                WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
+                  AND d."isOutstanding"=TRUE
+                  AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                  AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
+                ORDER BY d."availableAt",d."partitionKey",d."id"
+                FOR UPDATE OF d SKIP LOCKED
+                LIMIT 1
+             ), claimed AS (
+               UPDATE "DomainWorkItem" d SET
+                 "state"='CLAIMED',"ownerToken"=$8,"claimFence"=d."claimFence"+1,
+                 "claimedRevision"=d."requestedRevision","leaseUntil"=$9,"attempts"=d."attempts"+1,
+                 "updatedAt"=CURRENT_TIMESTAMP
+                FROM candidate c WHERE d."id"=c."id"
+               RETURNING d.*
+             ), partition_touch AS (
+               INSERT INTO "Phase2WorkBroadClaimPartitionState"(
+                 "id","agencyId","workClass","partitionKey","activeGeneration","lastClaimedAt","createdAt","updatedAt"
+               )
+               SELECT 'p2wbcps_' || md5($4 || E'\x1f' || $1 || E'\x1f' || c."partitionKey"),
+                      $4,$1,c."partitionKey",$3,$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                 FROM (SELECT DISTINCT "partitionKey" FROM claimed) c
+               ON CONFLICT ("agencyId","workClass","partitionKey") DO UPDATE SET
+                 "activeGeneration"=EXCLUDED."activeGeneration",
+                 "lastClaimedAt"=EXCLUDED."lastClaimedAt",
+                 "updatedAt"=CURRENT_TIMESTAMP
+               RETURNING 1
+             ), family_touch AS (
+               UPDATE "Phase2WorkFamilyState" s
+                  SET "lastBroadClaimedAt"=$2,"updatedAt"=CURRENT_TIMESTAMP
+                WHERE s."agencyId"=$4 AND s."workClass"=$1 AND s."activeGeneration"=$3
+                  AND EXISTS (SELECT 1 FROM claimed)
+               RETURNING 1
+             )
+             SELECT c.* FROM claimed c`, ...params,
+          );
+        }
+
+        // Recovery must obey the same global lock order as publication/settlement:
+        // DWI row first, family projection second. Repairing family-state before the
+        // claim would introduce FamilyState -> DWI while normal settlement is
+        // DWI -> FamilyState, recreating a deadlock cycle on the exceptional path.
+        // The family rebuild is a bounded lower-bound sample (max 1024 current rows),
+        // never an all-outstanding COUNT inside the claim transaction. If more work
+        // exists, INT6 physical false-zero detection will re-enter this recovery path
+        // after the sampled lower bound drains; release still requires physical zero.
+        if (recoveredAgencyNeedsFamilyRebuild && Number(rows?.length || 0) > 0) {
+          await tx.$queryRawUnsafe(
+            `WITH bounded_live AS MATERIALIZED (
+               SELECT d."updatedAt"
+                 FROM "DomainWorkItem" d
+                WHERE d."agencyId"=$1 AND d."workClass"=$2 AND d."activeGeneration"=$3
+                  AND d."isOutstanding"=TRUE
+                LIMIT 1024
+             ), live AS MATERIALIZED (
+               SELECT COUNT(*)::integer AS n,MAX("updatedAt") AS "lastRequestedAt"
+                 FROM bounded_live
+             )
+             INSERT INTO "Phase2WorkFamilyState"(
+               "id","agencyId","workClass","activeGeneration","outstandingCount",
+               "requestedSequence","convergedSequence","lastRequestedAt","lastConvergedAt","createdAt","updatedAt"
+             )
+             SELECT 'p2wfs_' || md5($1 || E'\x1f' || $2),$1,$2,$3,live.n,1,0,
+                    live."lastRequestedAt",NULL,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+               FROM live WHERE live.n>0
+             ON CONFLICT ("agencyId","workClass") DO UPDATE SET
+               "activeGeneration"=EXCLUDED."activeGeneration",
+               "outstandingCount"=EXCLUDED."outstandingCount",
+               "requestedSequence"=GREATEST(
+                 "Phase2WorkFamilyState"."requestedSequence",
+                 "Phase2WorkFamilyState"."convergedSequence"+1
+               ),
+               "convergedSequence"=LEAST(
+                 "Phase2WorkFamilyState"."convergedSequence",
+                 GREATEST(
+                   "Phase2WorkFamilyState"."requestedSequence",
+                   "Phase2WorkFamilyState"."convergedSequence"+1
+                 )-1
+               ),
+               "lastRequestedAt"=COALESCE(EXCLUDED."lastRequestedAt","Phase2WorkFamilyState"."lastRequestedAt"),
+               "lastConvergedAt"=NULL,
+               "updatedAt"=CURRENT_TIMESTAMP
+             RETURNING "agencyId"`,
+            selectedAgency, klass, String(generation),
+          );
+        }
         return { agencyId: selectedAgency, authorityNow, leaseUntil, items: rows || [] };
       });
 
-      if (!tranche?.agencyId) break;
-      seenAgencies.push(String(tranche.agencyId));
       if (!firstAuthorityNow) firstAuthorityNow = tranche.authorityNow || null;
-      lastLeaseUntil = tranche.leaseUntil || lastLeaseUntil;
-      if (tranche.items?.length) claimed.push(...tranche.items.slice(0, remaining));
+      if (tranche.leaseUntil) lastLeaseUntil = tranche.leaseUntil;
+      if (!tranche.agencyId) break;
+      seenAgencies.push(tranche.agencyId);
+      claimed.push(...(tranche.items || []));
       if (agencyId) break;
     }
     return { ownerToken, authorityNow: firstAuthorityNow, leaseUntil: lastLeaseUntil, items: claimed.slice(0, take) };
@@ -715,7 +1005,7 @@ async function saveDomainWorkProgress({ db = null, item, ownerToken = null, prog
   });
 }
 
-async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progressCursor = undefined, availableAt = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
+async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progressCursor = undefined, availableAt = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION, preserveProgressOnNewerRevision = false } = {}) {
   if (!db) db = require("../prisma");
   if (!item?.id) return { yielded: false, lost: true };
   return runDbTransaction(db, async (tx) => {
@@ -731,13 +1021,18 @@ async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progre
     if (Number(yielded?.count || 0) === 1) return { yielded: true, lost: false, newerRevision: false, availableAt: due };
 
     // A continuation deadline belongs to the claimed revision only. If V2 arrived,
-    // discard V1 cursor/delay and make V2 immediately eligible.
+    // make V2 immediately eligible. Most consumers must discard the V1 cursor, but
+    // bounded Team historical repair may explicitly carry a semantic-prefix cursor
+    // across a newer live-tail revision. The repair itself revalidates its reply
+    // boundary before using that cursor, so a boundary-changing revision rebases.
+    const reopenedData = {
+      state: STATE.READY, ownerToken: null, leaseUntil: authorityNow, availableAt: authorityNow, nextAttemptAt: null,
+      errorClass: null, lastError: null,
+      progressCursor: preserveProgressOnNewerRevision === true && progressCursor !== undefined ? progressCursor : null,
+    };
     const reopened = await tx.domainWorkItem?.updateMany?.({
       where: { ...baseWhere, requestedRevision: { gt: asBigInt(item.claimedRevision) } },
-      data: {
-        state: STATE.READY, ownerToken: null, leaseUntil: authorityNow, availableAt: authorityNow, nextAttemptAt: null,
-        errorClass: null, lastError: null, progressCursor: null,
-      },
+      data: reopenedData,
     });
     return Number(reopened?.count || 0) === 1
       ? { yielded: true, lost: false, newerRevision: true, availableAt: authorityNow }

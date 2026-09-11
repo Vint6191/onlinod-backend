@@ -20,7 +20,7 @@ function claimedItem(overrides = {}) {
     completedRevision: 0n,
     claimedRevision: 1n,
     claimFence: 7n,
-    activeGeneration: "phase2_domain_work_v2_actual53",
+    activeGeneration: "phase2_domain_work_v3_actual55",
     ownerToken: "owner_v1",
     leaseUntil: new Date("2030-01-01T00:10:00.000Z"),
     ...overrides,

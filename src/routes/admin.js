@@ -74,10 +74,6 @@ const {
 } = require("../services/custom-content-pipeline-authority-service");
 const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
-const {
-  purgeAgencyPhase2ProviderLedgersForHardDelete,
-  purgeAgencyPhase2CurrentWorkRootsAfterCascade,
-} = require("../services/phase2-destructive-delete-authority-service");
 const { publishDomainWork, WORK_CLASS: PHASE2_WORK_CLASS } = require("../services/domain-work-authority-service");
 
 const router = express.Router();
@@ -646,44 +642,65 @@ router.delete("/agencies/:id", async (req, res) => {
 
     const before = await prisma.agency.findUnique({
       where: { id: req.params.id },
-      include: { members: true, creators: { include: { sessionState: { select: { status: true, portableReady: true, revision: true, updatedAt: true } } } } },
+      ...(hard ? {
+        // Hard delete is now an asynchronous bounded lifecycle. Do not materialize
+        // every member/creator into HTTP memory before scheduling tenant cleanup.
+        select: {
+          id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true,
+          deletedAt: true, deletedReason: true, createdAt: true, updatedAt: true,
+        },
+      } : {
+        include: { members: true, creators: { include: { sessionState: { select: { status: true, portableReady: true, revision: true, updatedAt: true } } } } },
+      }),
     });
     if (!before) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
 
     if (hard) {
+      const scheduledAt = new Date();
       await prisma.$transaction(async (tx) => {
-        // Hard deletion may destroy historical rows, but MASS can represent a
-        // future external effect. Serialize with NEW MASS creation and refuse to
-        // destroy the only cancellation/reconciliation authority while such an
-        // effect is pending or unknown.
-        await lockAgencyPipelineLifecycleExclusive({ db: tx, agencyId: before.id, allowDeleted: true });
-        // Destructive history removal is allowed only after every live/unknown
-        // Custom external-write authority has converged. Otherwise the Agency
-        // cascade would erase AutomationDelivery evidence for a provider effect
-        // that may already be COMMITTING. Terminal history may still be destroyed.
+        // Hard Agency deletion is a durable lifecycle, never a tenant-wide HTTP
+        // transaction. First establish the same exclusive lifecycle barrier used by
+        // soft retirement, reject UNKNOWN/future external effects, revoke live auth,
+        // and publish one restartable destructive work identity in the same commit.
+        const lifecycle = await lockAgencyPipelineLifecycleExclusive({ db: tx, agencyId: before.id, allowDeleted: true });
         await assertAgencyCustomPipelineRetirable({ db: tx, agencyId: before.id });
-        await assertAgencyMassCampaignRetirable({ db: tx, agencyId: before.id, requireFreshProviderSnapshot: !before.deletedAt });
-        // Phase 2 provider ledgers intentionally have no Agency FK because normal
-        // retirement/reconciliation must preserve provider evidence. Hard delete is
-        // the explicit destructive exception. Purge them only after the unknown-effect
-        // guards above and in this same transaction; any later cascade/FK failure rolls
-        // the purge back together with the Agency deletion.
-        await purgeAgencyPhase2ProviderLedgersForHardDelete({ db: tx, agencyId: before.id });
-        await tx.agency.delete({ where: { id: before.id } });
-        // DomainWorkItem cascades fire AFTER DELETE maintenance triggers. Those
-        // triggers may recreate zero-count Phase2WorkFamilyState/Ready* rows while
-        // the Agency delete statement is running, so remove those non-FK current
-        // roots only after the cascade has fully completed, in the same TX.
-        await purgeAgencyPhase2CurrentWorkRootsAfterCascade({ db: tx, agencyId: before.id });
-      });
+        await assertAgencyMassCampaignRetirable({ db: tx, agencyId: before.id, requireFreshProviderSnapshot: !lifecycle.deletedAt });
+        if (!lifecycle.deletedAt) {
+          await tx.agency.update({
+            where: { id: before.id },
+            data: { deletedAt: scheduledAt, deletedReason: reason, status: "LOCKED" },
+          });
+        }
+        await tx.refreshSession.updateMany({
+          where: { agencyId: before.id, revokedAt: null },
+          data: { revokedAt: scheduledAt },
+        });
+        await publishDomainWork({
+          db: tx,
+          agencyId: before.id,
+          workClass: PHASE2_WORK_CLASS.DESTRUCTIVE_AGENCY_CLEANUP,
+          objectType: "Phase2AgencyDestructiveCleanup",
+          objectId: before.id,
+          partitionKey: before.id,
+          creatorId: null,
+          availableAt: scheduledAt,
+        });
+      }, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 });
       await adminLog(req, {
         agencyId: before.id,
-        action: "admin.agency_hard_deleted",
+        action: "admin.agency_hard_delete_scheduled",
         targetType: "agency",
         targetId: before.id,
         before, after: null, reason,
       });
-      return res.json({ ok: true, hard: true, deleted: before });
+      return res.status(202).json({
+        ok: true,
+        hard: true,
+        pending: true,
+        deleting: before,
+        destructive: true,
+        cleanupAuthority: "DESTRUCTIVE_AGENCY_CLEANUP",
+      });
     }
 
     const deletedAt = new Date();
@@ -746,6 +763,27 @@ router.post("/agencies/:id/restore", async (req, res) => {
         const error = new Error("Agency is not deleted");
         error.code = "AGENCY_NOT_DELETED";
         error.status = 409;
+        throw error;
+      }
+      // A hard-delete request is an irreversible destructive intent. The Agency
+      // row intentionally shares deletedAt with ordinary retirement, so restore
+      // must consult the durable destructive authority before re-enabling it.
+      // The Agency lifecycle barrier serializes this check with hard-delete
+      // publication and with the final destructive worker.
+      const destructive = await tx.domainWorkItem.findFirst({
+        where: {
+          agencyId: before.id,
+          workClass: PHASE2_WORK_CLASS.DESTRUCTIVE_AGENCY_CLEANUP,
+          objectType: "Phase2AgencyDestructiveCleanup",
+          objectId: before.id,
+        },
+        select: { id: true, state: true, isOutstanding: true },
+      });
+      if (destructive) {
+        const error = new Error("Agency hard deletion has started and cannot be restored");
+        error.code = "AGENCY_DESTRUCTIVE_DELETE_IRREVERSIBLE";
+        error.status = 409;
+        error.details = { workId: destructive.id, state: destructive.state, outstanding: destructive.isOutstanding };
         throw error;
       }
       return tx.agency.update({

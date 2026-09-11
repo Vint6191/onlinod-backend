@@ -232,7 +232,9 @@ async function phase2CoverageStatus({ db = null, agencyId, family, generation } 
 async function requirePhase2CoverageReady({ db = null, agencyId, family, generation, code = "PHASE2_COVERAGE_INCOMPLETE" } = {}) {
   if (!db) db = require("../prisma");
   const status = await phase2CoverageStatus({ db, agencyId, family, generation });
-  if (status.ready) return status.row;
+  // This guard protects a current business action, not merely completion of the
+  // historical enumerator. A live family that is stale/unknown must fail closed.
+  if (status.currentReady === true) return status.row;
   const error = new Error(`Phase 2 ${family} coverage is not complete for agency ${agencyId}`);
   error.code = code; error.status = 503; error.coverageState = status.state;
   throw error;

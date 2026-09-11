@@ -60,7 +60,11 @@ function makeTransactionalRaceDb() {
     if (where.dialogId && row.dialogId !== where.dialogId) return false;
     if (where.messageId && row.messageId !== where.messageId) return false;
     if (where.source?.in && !where.source.in.includes(row.source)) return false;
-    if (where.sentAt && !matchesDate(row.sentAt, where.sentAt)) return false;
+    if (where.sentAt instanceof Date) {
+      if (new Date(row.sentAt).getTime() !== where.sentAt.getTime()) return false;
+    } else if (where.sentAt && !matchesDate(row.sentAt, where.sentAt)) return false;
+    if (where.telemetryEventId === null && row.telemetryEventId != null) return false;
+    if (where.telemetryEventId?.lt && !(String(row.telemetryEventId || "") < String(where.telemetryEventId.lt))) return false;
     if (where.NOT?.messageId && row.messageId === where.NOT.messageId) return false;
     return true;
   }
@@ -80,6 +84,13 @@ function makeTransactionalRaceDb() {
         const direction = Array.isArray(orderBy) ? orderBy[0]?.sentAt : orderBy?.sentAt;
         if (direction === "desc") rows.reverse();
         return rows[0] || null;
+      },
+      async findMany({ where, orderBy }) {
+        const rows = ledgers.filter((row) => ledgerMatches(row, where));
+        rows.sort((a, b) => new Date(a.sentAt) - new Date(b.sentAt) || String(a.telemetryEventId || "").localeCompare(String(b.telemetryEventId || "")) || String(a.id).localeCompare(String(b.id)));
+        const direction = Array.isArray(orderBy) ? orderBy[0]?.sentAt : orderBy?.sentAt;
+        if (direction === "desc") rows.reverse();
+        return rows;
       },
     },
     teamActivityEvent: {

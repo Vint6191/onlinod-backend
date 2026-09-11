@@ -37,7 +37,7 @@ function claimedSourceDomainWork(submissionId, overrides = {}) {
     objectType: "CustomContentSubmission", objectId: submissionId, parentObjectId: null, partitionKey: "creator-1",
     creatorId: "creator-1", accountId: "tg-1", requestedRevision: 1n, completedRevision: 0n, claimedRevision: 1n,
     ownerToken: "source-worker", claimFence: 1n, leaseUntil: new Date("2026-08-21T14:00:00.000Z"),
-    activeGeneration: "phase2_domain_work_v2_actual53", projectionVersion: "phase2_domain_work_v2_actual53", state: "CLAIMED",
+    activeGeneration: "phase2_domain_work_v3_actual55", projectionVersion: "phase2_domain_work_v3_actual55", state: "CLAIMED",
     availableAt: new Date("2026-08-21T12:00:00.000Z"), nextAttemptAt: null, attempts: 1, progressCursor: null,
     ...overrides,
   };
@@ -2195,8 +2195,8 @@ test("A1/A4 source discovery suppresses stale V1 diagnostic metadata when V2 arr
     id: "dwi-source-discovery-v2-race", agencyId: "agency-1", workClass: "CUSTOM_SOURCE_PIPELINE",
     objectType: "CustomContentSubmission", objectId: submission.id, parentObjectId: null, partitionKey: "creator-1",
     creatorId: "creator-1", accountId: null, requestedRevision: 1n, completedRevision: 0n, claimedRevision: 0n,
-    ownerToken: null, claimFence: 0n, leaseUntil: new Date(0), activeGeneration: "phase2_domain_work_v2_actual53",
-    projectionVersion: "phase2_domain_work_v2_actual53", state: "READY", availableAt: new Date("2026-08-21T11:00:00.000Z"),
+    ownerToken: null, claimFence: 0n, leaseUntil: new Date(0), activeGeneration: "phase2_domain_work_v3_actual55",
+    projectionVersion: "phase2_domain_work_v3_actual55", state: "READY", availableAt: new Date("2026-08-21T11:00:00.000Z"),
     nextAttemptAt: null, attempts: 0, progressCursor: null,
   };
   const db = fakeDb({ submissions: [submission], domainWorkItems: [domainItem] });
@@ -2251,8 +2251,8 @@ test("A43 standalone source work is claimed from DomainWork, heartbeated, and AC
     ownerToken: null,
     claimFence: 0n,
     leaseUntil: new Date(0),
-    activeGeneration: "phase2_domain_work_v2_actual53",
-    projectionVersion: "phase2_domain_work_v2_actual53",
+    activeGeneration: "phase2_domain_work_v3_actual55",
+    projectionVersion: "phase2_domain_work_v3_actual55",
     state: "READY",
     availableAt: new Date("2026-08-21T11:00:00.000Z"),
     nextAttemptAt: null,

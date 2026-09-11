@@ -8,6 +8,7 @@ const {
   PROVIDER_OPERATIONAL_BACKFILL_LANE_KEY,
   reconcileProviderOperationalDebtForOrder,
   providerOperationalBackfillReady,
+  customExternalProofBackfillReady,
   requireProviderOperationalBackfillReady,
 } = require("./provider-operational-debt-authority-service");
 
@@ -136,4 +137,19 @@ test("provider operational authority fails closed until one-time current-debt ba
   fx.completeBackfill();
   assert.equal(await providerOperationalBackfillReady({ db: fx.db, agencyId: "agency-1" }), true);
   assert.equal(await requireProviderOperationalBackfillReady({ db: fx.db, agencyId: "agency-1" }), true);
+});
+
+
+test("INT6 custom external proof readiness cannot use historical COMPLETE as live convergence proof", async () => {
+  const workGeneration = "phase2_domain_work_v3_actual55";
+  let live = true;
+  const db = {
+    phase2WorkCoverage: { async findUnique() { return { active: true, enumerationState: "COMPLETE", completedAt: new Date("2026-09-11T00:00:00Z") }; } },
+    phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: workGeneration }; } },
+    phase2WorkFamilyState: { async findUnique() { return { activeGeneration: workGeneration, outstandingCount: 0, requestedSequence: 3n, convergedSequence: 3n }; } },
+    domainWorkItem: { async findFirst() { return live ? { id: "live-proof-work" } : null; } },
+  };
+  assert.equal(await customExternalProofBackfillReady({ db, agencyId: "agency-1" }), false);
+  live = false;
+  assert.equal(await customExternalProofBackfillReady({ db, agencyId: "agency-1" }), true);
 });

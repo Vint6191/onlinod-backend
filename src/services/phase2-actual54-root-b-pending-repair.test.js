@@ -91,7 +91,9 @@ test("F54-04 scheduler persists pending repair progress on DomainWork yield", ()
   const scheduler = fs.readFileSync(path.join(__dirname, "job-scheduler.js"), "utf8");
   const authority = fs.readFileSync(path.join(__dirname, "team-dialog-projection-authority-service.js"), "utf8");
   assert.match(scheduler, /progressCursor:\s*item\?\.progressCursor/);
-  assert.match(scheduler, /progressCursor:\s*result\?\.nextProgressCursor/);
+  assert.match(scheduler, /const nextProgressCursor = result\?\.nextProgressCursor \|\| null/);
+  assert.match(scheduler, /progressCursor:\s*nextProgressCursor/);
+  assert.match(scheduler, /preserveProgressOnNewerRevision:\s*Boolean\(nextProgressCursor\?\.pendingRepair\)/);
   assert.match(authority, /pendingRepair:\s*\{\s*eventId:/);
   assert.match(authority, /repairProgress/);
 });
@@ -99,4 +101,50 @@ test("F54-04 scheduler persists pending repair progress on DomainWork yield", ()
 test("F54-04 resumed pending repair does not replay sibling response projection on every page", () => {
   const authority = fs.readFileSync(path.join(__dirname, "team-dialog-projection-authority-service.js"), "utf8");
   assert.match(authority, /if \(!repairEventId\) await applyTeamResponseProjection\(row, db\)/);
+});
+
+test("F55-04 reply-boundary change explicitly rebases a preserved repair cursor", async () => {
+  let currentReply = { id: "ledger-r1", sentAt: d("2026-09-10T09:58:00Z"), telemetryEventId: "reply-event-a", source: "manual" };
+  const rawArgs = [];
+  let rawCall = 0;
+  const state = {
+    id: "pending-r", agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", fanId: "fan-1",
+    status: "PENDING", projectionRevision: 1n, projectionState: "FULL",
+  };
+  const db = {
+    async $executeRawUnsafe() { return 1; },
+    async $queryRawUnsafe(sql, ...args) {
+      assert.match(String(sql), /LIMIT \$8/);
+      rawArgs.push(args);
+      rawCall += 1;
+      return [
+        { id: `event-${rawCall}-a`, messageId: `m-${rawCall}-a`, fanId: "fan-1", ts: d("2026-09-10T10:00:00Z") },
+        { id: `event-${rawCall}-b`, messageId: `m-${rawCall}-b`, fanId: "fan-1", ts: d("2026-09-10T10:01:00Z") },
+      ];
+    },
+    teamSentMessageLedger: { async findFirst() { return currentReply; } },
+    teamActivityEvent: {
+      async findFirst() { return null; },
+      async update() { return {}; },
+      async findMany() { throw new Error("unbounded history path forbidden"); },
+    },
+    teamPendingDialogState: {
+      async findUnique() { return state; },
+      async update({ data }) { Object.assign(state, data); return state; },
+      async upsert({ create, update }) { Object.assign(state, Object.keys(state).length ? update : create); return state; },
+    },
+  };
+
+  const first = await applyTeamPendingProjection(late, db, { executeRepair: true, repairLimit: 2 });
+  assert.equal(first.complete, false);
+  assert.equal(first.progress.replyEventId, "reply-event-a");
+  assert.equal(first.progress.cursorId, "event-1-b");
+
+  currentReply = { id: "ledger-r2", sentAt: d("2026-09-10T09:59:00Z"), telemetryEventId: "reply-event-z", source: "manual" };
+  const second = await applyTeamPendingProjection(late, db, { executeRepair: true, repairLimit: 2, repairProgress: first.progress });
+  assert.equal(second.complete, false);
+  assert.equal(second.progress.replyEventId, "reply-event-z");
+  assert.equal(second.progress.incomingCount, 2, "boundary change must restart/rebase rather than append old prefix");
+  assert.equal(rawArgs[1][5], null, "cursorAt must reset when reply boundary changes");
+  assert.equal(rawArgs[1][6], "", "cursorId must reset when reply boundary changes");
 });

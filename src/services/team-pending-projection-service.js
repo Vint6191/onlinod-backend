@@ -86,9 +86,10 @@ async function latestManualReply({ agencyId, creatorId, dialogId, db = prisma })
       dialogId,
       source: { in: MANUAL_SOURCES },
     },
-    // Reply-to-reply chronology stays on the durable ledger identity.
-    // telemetryEventId is used only when a reply must be compared to TeamActivityEvent.
-    orderBy: [{ sentAt: "desc" }, { id: "desc" }],
+    // Modern Team chronology is one cross-family order: (sentAt, telemetryEventId).
+    // Ledger id remains a storage identity and is only a deterministic fallback for
+    // historical rows whose cross-family order is explicitly treated as incomplete.
+    orderBy: [{ sentAt: "desc" }, { telemetryEventId: { sort: "desc", nulls: "last" } }, { id: "desc" }],
   });
 }
 
@@ -133,14 +134,15 @@ async function loadIncomingAfter({ agencyId, creatorId, dialogId, after, afterEv
   return out;
 }
 
-async function loadSeenAfter({ agencyId, creatorId, dialogId, after, db = prisma }) {
+async function loadSeenAfter({ agencyId, creatorId, dialogId, after, afterEventId = null, db = prisma }) {
   if (typeof db?.$queryRawUnsafe === "function") {
     const rows = await db.$queryRawUnsafe(`
       WITH dedup AS (
         SELECT DISTINCT ON (COALESCE(NULLIF(e."localId",''),e."id")) e."id",e."localId",e."memberId",e."ts"
           FROM "TeamActivityEvent" e
          WHERE e."agencyId"=$1 AND e."creatorId"=$2 AND e."dialogId"=$3
-           AND e."eventKind"='DIALOG_SEEN' AND e."memberId" IS NOT NULL AND e."ts">=$4
+           AND e."eventKind"='DIALOG_SEEN' AND e."memberId" IS NOT NULL
+           AND (e."ts">$4 OR (e."ts"=$4 AND $5::text IS NOT NULL AND e."id">$5))
          ORDER BY COALESCE(NULLIF(e."localId",''),e."id"),e."ts" ASC,e."id" ASC
       ), ranked AS (
         SELECT d.*,row_number() OVER (ORDER BY d."ts",d."id") AS rn_first,
@@ -148,16 +150,31 @@ async function loadSeenAfter({ agencyId, creatorId, dialogId, after, db = prisma
           FROM dedup d
       )
       SELECT "id","localId","memberId","ts" FROM ranked WHERE rn_first=1 OR rn_last=1 ORDER BY "ts","id"`,
-      agencyId,creatorId,dialogId,after);
+      agencyId,creatorId,dialogId,after,clean(afterEventId, 220));
     return rows || [];
   }
   const rows = await db.teamActivityEvent.findMany({
-    where: { agencyId, creatorId, dialogId, eventKind: "DIALOG_SEEN", memberId: { not: null }, ts: { gte: after } },
+    where: {
+      agencyId, creatorId, dialogId, eventKind: "DIALOG_SEEN", memberId: { not: null },
+      OR: [{ ts: { gt: after } }, ...(afterEventId ? [{ ts: after, id: { gt: clean(afterEventId, 220) } }] : [])],
+    },
     orderBy: [{ ts: "asc" }, { id: "asc" }],
   });
   return dedupeSeen(rows);
 }
 
+
+async function findHistoricalReplyPeerAtExactBoundary({ agencyId, creatorId, dialogId, at, excludeMessageId = null, db = prisma }) {
+  at = dateOrNull(at);
+  if (!at || !db?.teamSentMessageLedger?.findFirst) return null;
+  return db.teamSentMessageLedger.findFirst({
+    where: {
+      agencyId, creatorId, dialogId, source: { in: MANUAL_SOURCES }, sentAt: at, telemetryEventId: null,
+      ...(excludeMessageId ? { NOT: { messageId: excludeMessageId } } : {}),
+    },
+    orderBy: [{ id: "asc" }],
+  });
+}
 
 async function findIncomingAtExactBoundary({ agencyId, creatorId, dialogId, at, db = prisma }) {
   at = dateOrNull(at);
@@ -219,8 +236,11 @@ async function loadIncomingRepairPage({ agencyId, creatorId, dialogId, replyAt =
   });
 }
 
-async function loadSeenEdgesBounded({ agencyId, creatorId, dialogId, after, db = prisma }) {
-  const where = { agencyId, creatorId, dialogId, eventKind: "DIALOG_SEEN", memberId: { not: null }, ts: { gte: after } };
+async function loadSeenEdgesBounded({ agencyId, creatorId, dialogId, after, afterEventId = null, db = prisma }) {
+  const where = {
+    agencyId, creatorId, dialogId, eventKind: "DIALOG_SEEN", memberId: { not: null },
+    OR: [{ ts: { gt: after } }, ...(afterEventId ? [{ ts: after, id: { gt: clean(afterEventId, 220) } }] : [])],
+  };
   if (db?.teamActivityEvent?.findFirst) {
     const first = await db.teamActivityEvent.findFirst({ where, orderBy: [{ ts: "asc" }, { id: "asc" }] });
     const last = await db.teamActivityEvent.findFirst({ where, orderBy: [{ ts: "desc" }, { id: "desc" }] });
@@ -277,6 +297,18 @@ async function repairPendingDialogBatchUnlocked({ agencyId, creatorId, dialogId,
 
   const reply = await latestManualReply({ agencyId, creatorId, dialogId, db });
   const boundary = replyBoundary(reply);
+  if (boundary.at && boundary.eventId) {
+    const historicalPeer = await findHistoricalReplyPeerAtExactBoundary({
+      agencyId, creatorId, dialogId, at: boundary.at, excludeMessageId: clean(reply?.messageId, 220), db,
+    });
+    if (historicalPeer) {
+      const ambiguous = await findIncomingAtExactBoundary({ agencyId, creatorId, dialogId, at: boundary.at, db });
+      if (ambiguous) {
+        const result = await writeAmbiguousPendingBoundary({ agencyId, creatorId, dialogId, fanId, reply, sourceEventId, sample: ambiguous, db });
+        return { ...result, repairPending: false, complete: true, progress: null };
+      }
+    }
+  }
   if (boundary.at && !boundary.eventId) {
     const ambiguous = await findIncomingAtExactBoundary({ agencyId, creatorId, dialogId, at: boundary.at, db });
     if (ambiguous) {
@@ -342,7 +374,7 @@ async function repairPendingDialogBatchUnlocked({ agencyId, creatorId, dialogId,
 
   const firstAt = dateOrNull(first.ts); const lastAt = dateOrNull(last?.ts) || firstAt;
   if (!firstAt) return { skipped: true, complete: true, reason: "incoming_without_time" };
-  const seen = await loadSeenEdgesBounded({ agencyId, creatorId, dialogId, after: firstAt, db });
+  const seen = await loadSeenEdgesBounded({ agencyId, creatorId, dialogId, after: firstAt, afterEventId: clean(first.id, 220), db });
   const firstSeenMemberId = clean(seen.first?.memberId, 160);
   const lastSeenMemberId = clean(seen.last?.memberId, 160);
   const ownerReason = lastSeenMemberId
@@ -382,6 +414,15 @@ async function reconcilePendingDialogUnlocked({ agencyId, creatorId, dialogId, f
   const reply = await latestManualReply({ agencyId, creatorId, dialogId, db });
   const replyAt = dateOrNull(reply?.sentAt);
   const replyEventId = canonicalReplyEventId(reply);
+  if (replyAt && replyEventId) {
+    const historicalPeer = await findHistoricalReplyPeerAtExactBoundary({
+      agencyId, creatorId, dialogId, at: replyAt, excludeMessageId: clean(reply?.messageId, 220), db,
+    });
+    if (historicalPeer) {
+      const ambiguous = await findIncomingAtExactBoundary({ agencyId, creatorId, dialogId, at: replyAt, db });
+      if (ambiguous) return writeAmbiguousPendingBoundary({ agencyId, creatorId, dialogId, fanId, reply, sourceEventId, sample: ambiguous, db });
+    }
+  }
   if (replyAt && !replyEventId) {
     const ambiguous = await findIncomingAtExactBoundary({ agencyId, creatorId, dialogId, at: replyAt, db });
     if (ambiguous) return writeAmbiguousPendingBoundary({ agencyId, creatorId, dialogId, fanId, reply, sourceEventId, sample: ambiguous, db });
@@ -429,7 +470,7 @@ async function reconcilePendingDialogUnlocked({ agencyId, creatorId, dialogId, f
   const lastIncomingAt = dateOrNull(last.ts) || firstIncomingAt;
   if (!firstIncomingAt) return { skipped: true, reason: "incoming_without_time" };
 
-  const seen = await loadSeenAfter({ agencyId, creatorId, dialogId, after: firstIncomingAt, db });
+  const seen = await loadSeenAfter({ agencyId, creatorId, dialogId, after: firstIncomingAt, afterEventId: clean(first?.id, 220), db });
   const firstSeen = seen[0] || null;
   const lastSeen = seen[seen.length - 1] || null;
   const firstSeenMemberId = clean(firstSeen?.memberId, 160);
@@ -540,7 +581,7 @@ async function applyIncrementalPendingEventUnlocked({ row, existing, agencyId, c
     // If seen evidence is already durable (for example replay/out-of-order ingest),
     // recover its first/last edges with two bounded index seeks rather than replaying
     // the whole dialog.
-    const seenEdges = await loadSeenEdgesBounded({ agencyId, creatorId, dialogId, after: eventAt, db });
+    const seenEdges = await loadSeenEdgesBounded({ agencyId, creatorId, dialogId, after: eventAt, afterEventId: eventId, db });
     const firstSeenMemberId = clean(seenEdges.first?.memberId, 160);
     const lastSeenMemberId = clean(seenEdges.last?.memberId, 160);
     const data = {
@@ -587,6 +628,23 @@ async function applyIncrementalPendingEventUnlocked({ row, existing, agencyId, c
 
   if (kind === "MESSAGE_SEND_CONFIRMED" && isManualConfirmed(row)) {
     if (!existing) return { status: "CLEAR", row: null, ignored: true };
+    const episodeOrder = existing.firstIncomingAt
+      ? compareCanonicalEventOrder(eventAt, eventId, existing.firstIncomingAt, existing.firstIncomingEventId)
+      : 1;
+    if (episodeOrder === null) {
+      const updated = await db.teamPendingDialogState.update({
+        where: { id: existing.id },
+        data: { ...marker, projectionRevision: BigInt(existing.projectionRevision || 0) + 1n, projectionState: "INCOMPLETE_HISTORY" },
+      });
+      return { status: String(updated.status || "PENDING"), row: updated, incremental: true, incompleteHistory: true };
+    }
+    if (episodeOrder <= 0) {
+      const updated = await db.teamPendingDialogState.update({
+        where: { id: existing.id },
+        data: { ...marker, projectionRevision: BigInt(existing.projectionRevision || 0) + 1n },
+      });
+      return { status: String(updated.status || "PENDING"), row: updated, incremental: true, ignoredPreEpisodeReply: true };
+    }
     const data = {
       ...marker,
       status: "CLEAR",

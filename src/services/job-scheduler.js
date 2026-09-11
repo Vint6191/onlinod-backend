@@ -631,7 +631,7 @@ async function runCustomSourcePipelineCoverageEnumerationUnit({ db, item, ownerT
   const outstanding = await hasOutstandingDomainWork({
     db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
   });
-  if (outstanding) {
+  if (outstanding !== false) {
     await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastSubmissionId: nextCursor }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
   }
@@ -812,7 +812,7 @@ async function runTeamMoneyReconciliationCoverageEnumerationUnit({ db, item, own
   const outstanding = await hasOutstandingDomainWork({
     db, agencyId, workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION,
   });
-  if (outstanding) {
+  if (outstanding !== false) {
     await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId, family, generation, enumeratedThrough: "sources_enumerated" });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { phase: "verify" }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
   }
@@ -861,7 +861,7 @@ async function runTeamReadSummaryCoverageEnumerationUnit({ db, item, ownerToken,
   const outstanding = await hasOutstandingDomainWork({
     db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY,
   });
-  if (Number(missing?.length || 0) > 0 || outstanding) {
+  if (Number(missing?.length || 0) > 0 || outstanding !== false) {
     await markPhase2CoverageRunning({ db, workItem: item, ownerToken, agencyId: item.agencyId, family, generation, enumeratedThrough: nextCursor });
     return yieldDomainWorkClaim({ db, item, ownerToken, progressCursor: { lastFactId: nextCursor }, availableAt: new Date(now.getTime() + 1000), fallbackNow: new Date() });
   }
@@ -1330,9 +1330,11 @@ async function runTeamDialogProjectionSweep({ now = new Date(), db = prisma } = 
       });
       report.projected += Number(result?.projected || 0);
       if (result?.hasMore) {
+        const nextProgressCursor = result?.nextProgressCursor || null;
         const yielded = await yieldDomainWorkClaim({
           db, item, ownerToken: claim.ownerToken, availableAt: now,
-          progressCursor: result?.nextProgressCursor || null, fallbackNow: new Date(),
+          progressCursor: nextProgressCursor, fallbackNow: new Date(),
+          preserveProgressOnNewerRevision: Boolean(nextProgressCursor?.pendingRepair),
         });
         if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
       } else {
@@ -1393,6 +1395,47 @@ async function runTeamMoneyReconciliationSweep({ now = new Date(), db = prisma }
       if (result?.ok === false) throw Object.assign(new Error(result?.code || "TEAM_MONEY_RECONCILIATION_FAILED"), { code: result?.code || "TEAM_MONEY_RECONCILIATION_FAILED" });
       const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
       if (ack?.lost) report.lostOwnership += 1;
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
+}
+
+async function runAgencyDestructiveCleanupSweep({ now = new Date(), db = prisma } = {}) {
+  const { processAgencyHardDeleteWorkItem } = require("./phase2-destructive-delete-authority-service");
+  const claim = await claimDomainWorkBatch({
+    db, workClass: PHASE2_WORK_CLASS.DESTRUCTIVE_AGENCY_CLEANUP,
+    limit: 2, perAgencyQuantum: 1, perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000, fallbackNow: now,
+  });
+  const report = { ok: true, selected: Number(claim?.items?.length || 0), completed: 0, yielded: 0, deletedRows: 0, workUnits: 0, failed: 0, lostOwnership: 0 };
+  for (const item of claim?.items || []) {
+    try {
+      const result = await processAgencyHardDeleteWorkItem({ db, item, ownerToken: claim.ownerToken, batchSize: 250, fallbackNow: now });
+      report.deletedRows += Number(result?.deleted || 0);
+      report.workUnits += Number(result?.workUnits || 0);
+      if (result?.lost) { report.lostOwnership += 1; continue; }
+      if (result?.ok === false) throw Object.assign(new Error(result?.code || "AGENCY_DESTRUCTIVE_CLEANUP_FAILED"), { code: result?.code || "AGENCY_DESTRUCTIVE_CLEANUP_FAILED" });
+      if (result?.complete) {
+        // Final Agency deletion cascades this very DomainWorkItem. Its absence is the
+        // terminal proof, so attempting a post-delete ACK would manufacture a false lost-owner event.
+        if (result?.identityDeleted) report.completed += 1;
+        else {
+          const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+          if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
+        }
+      } else {
+        const delayMs = String(result?.phase || "").startsWith("WAIT_") ? 1000 : 250;
+        const yielded = await yieldDomainWorkClaim({
+          db, item, ownerToken: claim.ownerToken,
+          progressCursor: { phase: result?.phase || "CLEANUP", deletedRows: report.deletedRows, workUnits: report.workUnits },
+          availableAt: new Date(now.getTime() + delayMs), fallbackNow: new Date(),
+        });
+        if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+      }
     } catch (error) {
       const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
       if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
@@ -1780,6 +1823,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
     // this rotation is only a resource/fairness budget, never business truth. A restart may
     // change which lane runs first, but no lane loses work because claims/cursors stay durable.
     const lanes = [
+      ["agencyDestructiveCleanup", () => runAgencyDestructiveCleanupSweep({ db, now })],
       ["creatorDestructiveCleanup", () => runCreatorDestructiveCleanupSweep({ db, now })],
       ["providerOperationalBackfill", () => maybeBackfillProviderOperationalDebt({ db, now })],
       ["dependencyFanout", () => maybeRunPhase2DependencyFanout({ db, now })],
@@ -2004,6 +2048,7 @@ module.exports = {
   runTeamResponseRangeRepairSweep,
   runTeamMoneyReconciliationSweep,
   runTeamReadSummarySweep,
+  runAgencyDestructiveCleanupSweep,
   runCreatorDestructiveCleanupSweep,
   maybeRunRetentionSweep,
   maybeReconcileHistoricalTeamMoney,

@@ -304,3 +304,69 @@ test("A46: retired Actual52 maintenance owner drains before new DomainWork can e
   assert.equal(admitted.items.length, 1);
   assert.equal(admitted.items[0].ownerToken, "new-worker");
 });
+
+test("F55-04: bounded repair may preserve a semantic cursor across a newer live-tail revision", async () => {
+  const fx = makeDb();
+  const t0 = new Date("2026-09-11T00:00:00.000Z");
+  await authority.publishDomainWork({ db: fx.db, ...base, workClass: authority.WORK_CLASS.TEAM_DIALOG_PROJECTION, objectType: "CreatorDialog", objectId: '["creator-1","dialog-1"]', availableAt: t0 });
+  const claim = await authority.claimDomainWorkBatch({ db: fx.db, workClass: authority.WORK_CLASS.TEAM_DIALOG_PROJECTION, ownerToken: "team-worker-v1", fallbackNow: t0, leaseMs: 60_000 });
+  const v1 = claim.items[0];
+  const progress = { pendingRepair: { eventId: "event-old", cursor: { version: "team_pending_repair_v1", replyAt: null, cursorAt: "2026-09-10T00:00:00.000Z", cursorId: "event-100" } } };
+
+  await authority.publishDomainWork({ db: fx.db, ...base, workClass: authority.WORK_CLASS.TEAM_DIALOG_PROJECTION, objectType: "CreatorDialog", objectId: '["creator-1","dialog-1"]', availableAt: new Date(t0.getTime() + 1000) });
+  const yielded = await authority.yieldDomainWorkClaim({
+    db: fx.db, item: v1, ownerToken: "team-worker-v1", progressCursor: progress,
+    preserveProgressOnNewerRevision: true,
+    availableAt: new Date(t0.getTime() + 300_000), fallbackNow: new Date(t0.getTime() + 2000),
+  });
+
+  assert.equal(yielded.lost, false);
+  assert.equal(yielded.newerRevision, true);
+  const current = fx.rows.get(v1.id);
+  assert.equal(current.state, authority.STATE.READY);
+  assert.deepEqual(current.progressCursor, progress);
+  assert.equal(new Date(current.availableAt).getTime(), t0.getTime() + 2000, "new revision must still wake immediately");
+});
+
+test("F55-04: repeated live revisions cannot starve a bounded Team repair cursor", async () => {
+  const fx = makeDb();
+  const t0 = new Date("2026-09-11T01:00:00.000Z");
+  const identity = { ...base, workClass: authority.WORK_CLASS.TEAM_DIALOG_PROJECTION, objectType: "CreatorDialog", objectId: '["creator-1","dialog-hot"]' };
+  await authority.publishDomainWork({ db: fx.db, ...identity, availableAt: t0 });
+  let expectedCursor = null;
+  for (let page = 1; page <= 3; page += 1) {
+    const claim = await authority.claimDomainWorkBatch({ db: fx.db, workClass: identity.workClass, ownerToken: `team-worker-${page}`, fallbackNow: new Date(t0.getTime() + page * 1000), leaseMs: 60_000 });
+    assert.equal(claim.items.length, 1);
+    const item = claim.items[0];
+    expectedCursor = { pendingRepair: { eventId: "event-late", cursor: { version: "team_pending_repair_v1", replyAt: null, cursorAt: `2026-09-11T00:00:0${page}.000Z`, cursorId: `event-${page * 100}` } } };
+    await authority.publishDomainWork({ db: fx.db, ...identity, availableAt: new Date(t0.getTime() + page * 1000 + 100) });
+    const yielded = await authority.yieldDomainWorkClaim({
+      db: fx.db, item, ownerToken: `team-worker-${page}`, progressCursor: expectedCursor,
+      preserveProgressOnNewerRevision: true,
+      availableAt: new Date(t0.getTime() + 60_000), fallbackNow: new Date(t0.getTime() + page * 1000 + 200),
+    });
+    assert.equal(yielded.newerRevision, true);
+    assert.deepEqual(fx.rows.get(item.id).progressCursor, expectedCursor);
+  }
+  const current = [...fx.rows.values()].find((row) => row.objectId === identity.objectId);
+  assert.deepEqual(current.progressCursor, expectedCursor, "repair prefix must advance despite a live revision between every page");
+});
+
+test("F55-04: live publication while repair work is READY preserves only the pending-repair prefix", async () => {
+  const fx = makeDb();
+  const t0 = new Date("2026-09-11T02:00:00.000Z");
+  const identity = { ...base, workClass: authority.WORK_CLASS.TEAM_DIALOG_PROJECTION, objectType: "CreatorDialog", objectId: '["creator-1","dialog-ready"]' };
+  await authority.publishDomainWork({ db: fx.db, ...identity, availableAt: t0 });
+  const claim = await authority.claimDomainWorkBatch({ db: fx.db, workClass: identity.workClass, ownerToken: "team-ready", fallbackNow: t0, leaseMs: 60_000 });
+  const item = claim.items[0];
+  const progress = { pendingRepair: { eventId: "event-old", cursor: { version: "team_pending_repair_v1", replyAt: null, cursorId: "event-100" } } };
+  await authority.yieldDomainWorkClaim({ db: fx.db, item, ownerToken: "team-ready", progressCursor: progress, availableAt: t0, fallbackNow: new Date(t0.getTime() + 1000) });
+  assert.deepEqual(fx.rows.get(item.id).progressCursor, progress);
+
+  await authority.publishDomainWork({ db: fx.db, ...identity, availableAt: new Date(t0.getTime() + 2000) });
+  assert.deepEqual(fx.rows.get(item.id).progressCursor, progress, "ordinary live-tail publication must not erase proven repair prefix");
+
+  fx.rows.get(item.id).progressCursor = { genericCursor: "unsafe" };
+  await authority.publishDomainWork({ db: fx.db, ...identity, availableAt: new Date(t0.getTime() + 3000) });
+  assert.equal(fx.rows.get(item.id).progressCursor, null, "non-repair cursors keep generic revision invalidation semantics");
+});

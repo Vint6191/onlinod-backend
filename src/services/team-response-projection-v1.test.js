@@ -45,7 +45,9 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
       if (where.id.lte && !(id <= String(where.id.lte))) return false;
     }
     if (where.source?.in && !where.source.in.includes(row.source)) return false;
-    if (where.sentAt && !matchesDate(row.sentAt, where.sentAt)) return false;
+    if (where.sentAt instanceof Date) {
+      if (new Date(row.sentAt).getTime() !== where.sentAt.getTime()) return false;
+    } else if (where.sentAt && !matchesDate(row.sentAt, where.sentAt)) return false;
     if (where.NOT?.messageId && row.messageId === where.NOT.messageId) return false;
     if (Array.isArray(where.OR) && !where.OR.some((branch) => ledgerMatches(row, branch))) return false;
     return true;
@@ -196,6 +198,7 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
 
 function reply(overrides = {}) {
   return {
+    id: "ledger-default",
     agencyId: "agency-1",
     creatorId: "creator-1",
     memberId: "member-a",
@@ -204,12 +207,14 @@ function reply(overrides = {}) {
     messageId: "reply-1",
     sentAt: date("2026-08-12T09:02:00.000Z"),
     source: "manual",
+    telemetryEventId: "event-reply-default",
     ...overrides,
   };
 }
 
 function incoming(at = "2026-08-12T09:00:00.000Z", overrides = {}) {
   return {
+    id: "event-incoming-default",
     agencyId: "agency-1",
     creatorId: "creator-1",
     memberId: null,
@@ -342,6 +347,36 @@ test("F54-03 mixed historical/modern same-time replies keep ledger order and do 
   assert.equal(result?.projectionState, "INCOMPLETE_HISTORY");
   assert.equal(result?.repairReason, "CROSS_FAMILY_ORDER_UNPROVEN");
   assert.equal(result?.slaEligible, false);
+});
+
+test("INT5 F55-03 incomparable same-time historical/modern replies cannot both own a strictly earlier incoming episode", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const historical = reply({ id: "ledger-h", messageId: "reply-h", sentAt: date(at), telemetryEventId: null });
+  const modern = reply({ id: "ledger-m", messageId: "reply-m", sentAt: date(at), telemetryEventId: "event-z" });
+  const event = incoming("2026-08-12T08:59:59.000Z", { id: "event-in", messageId: "incoming-before-cluster" });
+
+  for (const current of [modern, historical]) {
+    const { db, responseCases } = makeDb({ ledgers: [historical, modern], events: [event] });
+    const result = await service.deriveResponseCaseForReply(current, db);
+    assert.equal(result?.projectionState, "INCOMPLETE_HISTORY");
+    assert.equal(result?.repairReason, "CROSS_FAMILY_ORDER_UNPROVEN");
+    assert.equal(responseCases.length, 2, "both competing same-time reply cases must be fenced incomplete");
+    assert.deepEqual(new Set(responseCases.map((row) => row.projectionState)), new Set(["INCOMPLETE_HISTORY"]));
+  }
+});
+
+test("INT5 F55-03 one historical reply makes the whole 3-way same-time reply cluster incomplete", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const modernA = reply({ id: "ledger-a", messageId: "reply-a", sentAt: date(at), telemetryEventId: "event-a" });
+  const historical = reply({ id: "ledger-h", messageId: "reply-h", sentAt: date(at), telemetryEventId: null });
+  const modernZ = reply({ id: "ledger-z", messageId: "reply-z", sentAt: date(at), telemetryEventId: "event-z" });
+  const event = incoming("2026-08-12T08:59:59.000Z", { id: "event-in", messageId: "incoming-before-cluster" });
+  const { db, responseCases } = makeDb({ ledgers: [modernZ, historical, modernA], events: [event] });
+  const result = await service.deriveResponseCaseForReply(historical, db);
+  assert.equal(result?.projectionState, "INCOMPLETE_HISTORY");
+  assert.equal(responseCases.length, 3);
+  assert.deepEqual(new Set(responseCases.map((row) => row.replyMessageId)), new Set(["reply-a", "reply-h", "reply-z"]));
+  assert.ok(responseCases.every((row) => row.projectionState === "INCOMPLETE_HISTORY"));
 });
 
 test("dialog projection stores active dwell separately from wall-clock dwell", async () => {
@@ -519,4 +554,35 @@ test("bounded response range repair derives FULL v2 when exact reply and incomin
   assert.equal(fx.responseCases[0].repairReason, null);
   assert.equal(fx.responseCases[0].incomingCount, 1);
   assert.equal(fx.responseCases[0].classification, "FRESH");
+});
+
+
+test("F55-03 modern reply family uses telemetry identity, not ledger identity, for same-time chronology", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const earlierByTelemetry = reply({ id: "ledger-z", messageId: "reply-r2", sentAt: date(at), telemetryEventId: "event-a" });
+  const laterByTelemetry = reply({ id: "ledger-a", messageId: "reply-r1", sentAt: date(at), telemetryEventId: "event-z" });
+  const event = incoming(at, { id: "event-m", messageId: "incoming-middle" });
+
+  for (const ledgers of [[laterByTelemetry, earlierByTelemetry], [earlierByTelemetry, laterByTelemetry]]) {
+    const fx = makeDb({ ledgers, events: [event] });
+    const result = await service.deriveResponseCaseForReply(laterByTelemetry, fx.db);
+    assert.equal(result?.projectionState, "FULL");
+    assert.equal(result?.incomingCount, 1);
+    assert.equal(result?.firstIncomingMessageId, "incoming-middle");
+  }
+});
+
+test("F55-03 same-time DIALOG_SEEN before incoming by event id is not response seen evidence", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const r = reply({ id: "ledger-r", sentAt: date("2026-08-12T09:01:00.000Z"), telemetryEventId: "event-z" });
+  const fx = makeDb({
+    ledgers: [r],
+    events: [
+      incoming(at, { id: "event-m", messageId: "incoming-m" }),
+      { id: "event-a", agencyId: "agency-1", creatorId: "creator-1", memberId: "member-a", dialogId: "fan-1", eventKind: "DIALOG_SEEN", ts: date(at) },
+    ],
+  });
+  const result = await service.deriveResponseCaseForReply(r, fx.db);
+  assert.equal(result?.classification, "UNKNOWN");
+  assert.equal(result?.seenResponseSeconds, null);
 });

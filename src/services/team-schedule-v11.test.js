@@ -148,7 +148,15 @@ test("Schedule is relational, additive and exposes an explicit granular manage p
   assert.match(service, /findAllById\(db\.teamResponseCase/);
   assert.doesNotMatch(service, /take:\s*(?:10000|50000)/, "Schedule reads must not silently truncate at legacy fixed caps");
   assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
-  assert.match(migration, /TeamShiftCreator_creatorId_fkey[^;]+ON DELETE RESTRICT/i, "hard creator deletion must not silently erase historical planned-shift links");
+  assert.match(migration, /TeamShiftCreator_creatorId_fkey[^;]+ON DELETE RESTRICT/i, "original schedule schema explicitly protected historical planned-shift links");
+  const destructiveMigration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260911170000_phase2_actual55_fresh_source_destructive_fences/migration.sql"), "utf8");
+  assert.match(destructiveMigration, /DROP CONSTRAINT IF EXISTS "TeamShiftCreator_creatorId_fkey"/);
+  assert.match(destructiveMigration, /ADD COLUMN IF NOT EXISTS "creatorRefId" TEXT/);
+  assert.match(destructiveMigration, /TeamShiftCreator_creatorRefId_fkey[\s\S]*ON DELETE SET NULL/);
   assert.doesNotMatch(schema.slice(schema.indexOf("model TeamShift {"), schema.indexOf("model AnalyticsSnapshot {")), /creatorIds\s+Json/i, "creator assignments must stay relational");
-  assert.match(schema.slice(schema.indexOf("model TeamShiftCreator {"), schema.indexOf("model AnalyticsSnapshot {")), /creator CreatorAccount\s+@relation\([^\n]+onDelete: Restrict\)/);
+  const shiftCreator = schema.slice(schema.indexOf("model TeamShiftCreator {"), schema.indexOf("model AnalyticsSnapshot {"));
+  assert.match(shiftCreator, /creatorId\s+String/, "historical creator identity must survive hard delete");
+  assert.match(shiftCreator, /creatorRefId\s+String\?/, "live creator reference must be nullable");
+  assert.match(shiftCreator, /creator CreatorAccount\?[^\n]+creatorRefId[^\n]+onDelete: SetNull/, "hard delete must detach live identity without deleting planned-shift history");
+  assert.match(service, /creatorId, creatorRefId: creatorId/, "new schedule assignments must populate both historical id and live creator reference");
 });

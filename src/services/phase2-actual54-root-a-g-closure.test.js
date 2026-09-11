@@ -15,102 +15,95 @@ const {
 
 function productionDb(now) {
   const sql = [];
+  let agencySelections = 0;
   const db = {
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
     async $transaction(work) { return work(db); },
     async $queryRawUnsafe(statement) {
-      sql.push(String(statement));
-      if (String(statement).includes("clock_timestamp")) return [{ authorityNow: now }];
+      const text = String(statement); sql.push(text);
+      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.includes('FROM "Phase2WorkFamilyState" s')) {
+        agencySelections += 1;
+        return agencySelections === 1 ? [{ agencyId: "agency-1" }] : [];
+      }
       return [];
     },
   };
   return { db, sql };
 }
 
-test("F54-01 creator-scoped claim constrains physical discovery before unrelated ready heads", async () => {
+test("F54-01/F55-01 creator-scoped claim is direct DWI admission with no ready-head/advisory dependency", async () => {
   const now = new Date("2026-09-11T00:00:00.000Z");
   const fx = productionDb(now);
   await authority.claimDomainWorkBatch({
-    db: fx.db,
-    workClass: authority.WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
-    agencyId: "agency-1",
-    creatorIds: ["creator-91", "creator-92", "creator-93", "creator-94", "creator-95"],
-    objectType: "CustomContentSubmission",
-    ownerToken: "scoped-worker",
-    limit: 15,
-    perPartitionQuantum: 3,
-    fallbackNow: now,
+    db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+    agencyId: "agency-1", creatorIds: ["creator-91", "creator-92"],
+    objectType: "CustomContentSubmission", ownerToken: "scoped-worker",
+    limit: 10, perPartitionQuantum: 2, fallbackNow: now,
   });
   const claimSql = fx.sql.find((entry) => entry.includes('UPDATE "DomainWorkItem"'));
   assert.ok(claimSql);
   assert.match(claimSql, /WITH scoped_creators\("creatorId"\) AS/);
   assert.match(claimSql, /d\."creatorId"=c\."creatorId"/);
-  assert.match(claimSql, /CROSS JOIN LATERAL/);
-  assert.match(claimSql, /LIMIT \$6/);
-  assert.doesNotMatch(claimSql, /DomainWorkReadyAgency/);
-  assert.doesNotMatch(claimSql, /DomainWorkReadyPartition/);
-  const agencyLockIndex = fx.sql.findIndex((entry) => entry.includes('phase2_lock_domain_work_agency_head'));
-  const claimIndex = fx.sql.findIndex((entry) => entry.includes('UPDATE "DomainWorkItem"'));
-  assert.ok(agencyLockIndex >= 0 && claimIndex > agencyLockIndex, "creator-scoped claim must acquire tenant head authority before DWI row locks");
+  assert.match(claimSql, /FOR UPDATE OF d SKIP LOCKED/);
+  assert.doesNotMatch(fx.sql.join("\n"), /phase2_lock_domain_work_agency_head/);
+  assert.doesNotMatch(fx.sql.join("\n"), /DomainWorkReadyAgency|DomainWorkReadyPartition/);
 });
 
-test("F54-02 ready-head migration serializes tenant before partition and avoids multi-row claim lock cycles", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911004500_phase2_actual54_root_a_g_closure", "migration.sql"), "utf8");
-  assert.match(migration, /phase2_lock_domain_work_partition_head/);
-  assert.match(migration, /phase2_lock_domain_work_agency_head/);
-  assert.match(migration, /CREATE OR REPLACE FUNCTION "phase2_lock_domain_work_mutation_scope"/);
-  assert.match(migration, /CREATE TRIGGER "trg_00_phase2_domain_work_mutation_scope"[\s\S]*BEFORE INSERT OR UPDATE OR DELETE ON "DomainWorkItem"/,
-    "tenant authority must be acquired before family-state/ready-head AFTER triggers for every DWI mutation");
-  assert.match(migration, /phase2:dwra-scope:/, "agency head authority must be tenant-scoped across work classes");
-  assert.match(migration, /pg_advisory_xact_lock\(hashtextextended/);
-  const partitionRefresh = migration.slice(
-    migration.indexOf('CREATE OR REPLACE FUNCTION "phase2_refresh_domain_work_partition_head"'),
-    migration.indexOf('CREATE OR REPLACE FUNCTION "phase2_domain_work_ready_head_trigger"'),
-  );
-  assert.ok(partitionRefresh.indexOf('phase2_lock_domain_work_agency_head') < partitionRefresh.indexOf('phase2_lock_domain_work_partition_head'),
-    "partition refresh must globally order tenant authority before partition authority");
-  const trigger = migration.slice(
-    migration.indexOf('CREATE OR REPLACE FUNCTION "phase2_domain_work_ready_head_trigger"'),
-    migration.indexOf('-- F54-02 cutover barrier:'),
-  );
-  assert.match(trigger, /agencyId\/workClass authority identity is immutable/);
-  assert.ok(trigger.indexOf('phase2_lock_domain_work_agency_head') < trigger.indexOf('IF TG_OP=\'UPDATE\' AND OLD."partitionKey"'),
-    "row trigger must acquire tenant authority before partition transition locks");
-  assert.match(trigger, /IF old_key <= new_key THEN/);
-  assert.match(trigger, /PERFORM "phase2_refresh_domain_work_partition_head"\(OLD/);
-  assert.match(trigger, /PERFORM "phase2_refresh_domain_work_partition_head"\(NEW/);
-  assert.match(migration, /phase2_repair_domain_work_partition_head_once/);
-  assert.match(migration, /pg_advisory_lock\(v_lock\)/);
-  assert.match(migration, /pg_advisory_unlock\(v_lock\)/);
-  assert.match(migration, /FROM "DomainWorkReadyPartition" p[\s\S]*UNION[\s\S]*FROM "DomainWorkItem" d/);
-  assert.match(migration, /phase2_repair_domain_work_agency_head_once/);
-  assert.match(migration, /DROP FUNCTION "phase2_repair_domain_work_partition_head_once"/);
-  assert.match(migration, /DROP FUNCTION "phase2_repair_domain_work_agency_head_once"/);
-  const repairLoop = migration.slice(migration.indexOf('DO $phase2_repair_partition_heads$'), migration.indexOf('$phase2_repair_partition_heads$;', migration.indexOf('DO $phase2_repair_partition_heads$')) + '$phase2_repair_partition_heads$;'.length);
-  assert.equal((repairLoop.match(/PERFORM "phase2_repair_domain_work_partition_head_once"/g) || []).length, 1,
-    "migration must revalidate each partition head once, not duplicate lock/recompute work");
+test("F55/INT7 Root A broad claim rotates Agency through bounded partition catalog without a hot-prefix workset scan", async () => {
+  const now = new Date("2026-09-11T00:00:00.000Z");
+  const fx = productionDb(now);
+  await authority.claimDomainWorkBatch({
+    db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
+    ownerToken: "broad-worker", limit: 25, perAgencyQuantum: 5, perPartitionQuantum: 2, fallbackNow: now,
+  });
+  const discovery = fx.sql.find((entry) => entry.includes('FROM "Phase2WorkFamilyState" s'));
+  const claimSql = fx.sql.find((entry) => entry.includes('WITH selected_partitions AS MATERIALIZED'));
+  assert.ok(discovery);
+  assert.ok(claimSql);
+  assert.match(discovery, /"outstandingCount">0/);
+  assert.match(discovery, /EXISTS \([\s\S]*FROM "DomainWorkItem" d/);
+  assert.match(discovery, /"lastBroadClaimedAt" ASC NULLS FIRST/);
+  assert.match(claimSql, /FROM "Phase2WorkBroadClaimPartitionState" f/);
+  assert.match(claimSql, /AND EXISTS \([\s\S]*FROM "DomainWorkItem" d/);
+  assert.match(claimSql, /ORDER BY f\."lastClaimedAt" ASC NULLS FIRST/);
+  assert.match(claimSql, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT \$6/);
+  assert.doesNotMatch(claimSql, /row_number\(\)/i);
+  assert.doesNotMatch(claimSql, /partition_heads|DISTINCT ON \(d\."partitionKey"\)/);
+  assert.doesNotMatch(claimSql, /LIMIT 4096/i);
+  assert.doesNotMatch(claimSql, /DomainWorkReadyAgency|DomainWorkReadyPartition/);
+  assert.doesNotMatch(fx.sql.join("\n"), /phase2_lock_domain_work_agency_head/);
 });
 
-test("F54-02 production broad claim never mutates more than one agency per DB transaction", () => {
-  const source = fs.readFileSync(path.join(__dirname, "domain-work-authority-service.js"), "utf8");
-  const start = source.indexOf('Production broad claims are intentionally split into one agency per DB');
-  const end = source.indexOf('// Adapter/unit fallback.', start);
-  assert.ok(start >= 0 && end > start);
-  const broad = source.slice(start, end);
-  assert.match(broad, /runDbTransaction\(db, async \(tx\) =>/);
-  assert.match(broad, /SELECT a\."agencyId"[\s\S]*LIMIT 1/);
-  assert.match(broad, /phase2_lock_domain_work_agency_head/);
-  assert.match(broad, /d\."agencyId"=\$4/);
-  assert.doesNotMatch(broad, /WITH agencies AS/, "one SQL UPDATE must not aggregate multiple agency lock domains");
+test("F55 Root A migration retires ready-head execution authority and fences old binaries with v3", () => {
+  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911142000_phase2_actual55_root_a_execution_authority", "migration.sql"), "utf8");
+  assert.match(migration, /LOCK TABLE "DomainWorkItem" IN SHARE ROW EXCLUSIVE MODE/);
+  assert.match(migration, /DROP TRIGGER IF EXISTS "trg_00_phase2_domain_work_mutation_scope"/);
+  assert.match(migration, /DROP TRIGGER IF EXISTS "trg_phase2_domain_work_ready_head"/);
+  assert.match(migration, /phase2_domain_work_v3_actual55/);
+  assert.match(migration, /DELETE FROM "DomainWorkReadyPartition"/);
+  assert.match(migration, /DELETE FROM "DomainWorkReadyAgency"/);
+  assert.match(migration, /DomainWorkItem_current_broad_due_v3_idx/);
+  assert.match(migration, /Phase2WorkFamilyState_claim_v3_idx/);
 });
 
-test("F54-01 scoped current-work index is partial and creator-addressable", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911004500_phase2_actual54_root_a_g_closure", "migration.sql"), "utf8");
-  assert.match(migration, /DomainWorkItem_scoped_creator_due_current_idx/);
-  assert.match(migration, /"agencyId","workClass","activeGeneration","creatorId","availableAt","id"/);
-  assert.match(migration, /WHERE "isOutstanding"=TRUE AND "creatorId" IS NOT NULL/);
+test("INT5 Root A migration installs durable non-authoritative broad-claim fairness state", () => {
+  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911183000_phase2_actual55_int5_claim_temporal_destructive_closure", "migration.sql"), "utf8");
+  assert.match(migration, /ADD COLUMN IF NOT EXISTS "lastBroadClaimedAt"/);
+  assert.match(migration, /CREATE TABLE IF NOT EXISTS "Phase2WorkBroadClaimPartitionState"/);
+  assert.match(migration, /DomainWorkItem_current_agency_partition_due_v3_idx/);
+  assert.match(migration, /Phase2WorkFamilyState_claim_v3_idx/);
+});
+
+test("INT7 Root A migration keeps partition catalog derived and non-authoritative", () => {
+  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911190000_phase2_actual55_int7_broad_partition_catalog", "migration.sql"), "utf8");
+  assert.match(migration, /phase2_track_domain_work_broad_partition/);
+  assert.match(migration, /AFTER INSERT OR UPDATE OF/);
+  assert.match(migration, /WHERE d\."isOutstanding"=TRUE/);
+  assert.match(migration, /Phase2WorkBroadClaimPartitionState/);
+  assert.doesNotMatch(migration, /DomainWorkReadyAgency|DomainWorkReadyPartition/);
 });
 
 test("F54-06 preflight cannot be green when coverage is explicitly not converged", () => {
@@ -123,59 +116,30 @@ test("F54-06 behavioral preflight exits non-zero when seed and manifest exist bu
   const now = new Date("2026-09-11T00:00:00.000Z");
   const fingerprint = coverageManifestFingerprint();
   const db = {
-    agency: {
-      async findUnique() { return { id: "agency-1", deletedAt: null }; },
-      async findMany() { return [{ id: "agency-1" }]; },
-    },
-    maintenanceLaneState: {
-      async findUnique({ where }) {
-        if (where.key !== COVERAGE_SEED_LANE_KEY) return null;
-        return {
-          key: COVERAGE_SEED_LANE_KEY, generation: COVERAGE_SEED_GENERATION, activeGeneration: COVERAGE_SEED_GENERATION,
-          completedAt: now, ownerToken: null, leaseUntil: null, cursor: null,
-          progress: { manifestVersion: COVERAGE_MANIFEST_VERSION, manifestFingerprint: fingerprint },
-          lastOutcome: "COMPLETE", lastError: null, updatedAt: now,
-        };
-      },
-    },
-    phase2WorkCoverage: {
-      async findMany() {
-        return COVERAGE_MANIFEST.map(([family, generation], index) => ({
-          agencyId: "agency-1", family, generation, active: true,
-          enumerationState: index === 0 ? "RUNNING" : "COMPLETE",
-          enumeratedThrough: null, projectedThrough: null, unresolvedCount: 0,
-          completedAt: index === 0 ? null : now, updatedAt: now,
-        }));
-      },
-    },
+    agency: { async findUnique() { return { id: "agency-1", deletedAt: null }; }, async findMany() { return [{ id: "agency-1" }]; } },
+    maintenanceLaneState: { async findUnique({ where }) {
+      if (where.key !== COVERAGE_SEED_LANE_KEY) return null;
+      return { key: COVERAGE_SEED_LANE_KEY, generation: COVERAGE_SEED_GENERATION, activeGeneration: COVERAGE_SEED_GENERATION,
+        completedAt: now, ownerToken: null, leaseUntil: null, cursor: null,
+        progress: { manifestVersion: COVERAGE_MANIFEST_VERSION, manifestFingerprint: fingerprint }, lastOutcome: "COMPLETE", lastError: null, updatedAt: now };
+    } },
+    phase2WorkCoverage: { async findMany() { return COVERAGE_MANIFEST.map(([family, generation], index) => ({
+      agencyId: "agency-1", family, generation, active: true, enumerationState: index === 0 ? "RUNNING" : "COMPLETE",
+      enumeratedThrough: null, projectedThrough: null, unresolvedCount: 0, completedAt: index === 0 ? null : now, updatedAt: now,
+    })); } },
   };
-  const previousExitCode = process.exitCode;
-  let output = "";
+  const previousExitCode = process.exitCode; let output = "";
   try {
     process.exitCode = undefined;
-    const report = await runCoveragePreflight({
-      prisma: db,
+    const report = await runCoveragePreflight({ prisma: db,
       env: { ONLINOD_PHASE2_COVERAGE_PREFLIGHT: "1", ONLINOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID: "agency-1" },
-      stdout: { write(chunk) { output += String(chunk); } },
-    });
+      stdout: { write(chunk) { output += String(chunk); } } });
     assert.equal(report.coverage.manifestSeeded, true);
     assert.equal(report.coverage.convergenceComplete, false);
     assert.equal(report.ok, false);
     assert.equal(process.exitCode, 2);
     assert.match(output, /CURRENT_MANIFEST_COVERAGE_NOT_CONVERGED/);
-  } finally {
-    process.exitCode = previousExitCode;
-  }
-});
-
-test("F54-02 migration cutover table barrier prevents old uncommitted trigger generations from racing head revalidation", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911004500_phase2_actual54_root_a_g_closure", "migration.sql"), "utf8");
-  const begin = migration.indexOf("BEGIN;");
-  const barrier = migration.indexOf('LOCK TABLE "DomainWorkItem" IN SHARE ROW EXCLUSIVE MODE');
-  const repair = migration.indexOf('phase2_repair_domain_work_partition_head_once');
-  const commit = migration.lastIndexOf("COMMIT;");
-  assert.ok(begin >= 0 && barrier > begin && repair > barrier && commit > repair,
-    "DWI writers must be quiesced in the same explicit migration transaction before legacy heads are revalidated");
+  } finally { process.exitCode = previousExitCode; }
 });
 
 test("Root A historical enumeration exception path uses the actual DomainWork owner token", () => {
@@ -185,54 +149,12 @@ test("Root A historical enumeration exception path uses the actual DomainWork ow
   assert.ok(start >= 0 && end > start);
   const body = scheduler.slice(start, end);
   assert.match(body, /markPhase2CoverageFailed\(\{ db, workItem: item, ownerToken: claim\.ownerToken,/);
-  assert.doesNotMatch(body, /markPhase2CoverageFailed\(\{ db, workItem: item, ownerToken, agencyId:/,
-    "historical enumeration catch must not reference an undefined ownerToken and strand the claim until lease expiry");
-});
-
-test("F54-02 broad logical batch preserves throughput via bounded one-agency transactions", async () => {
-  const now = new Date("2026-09-11T00:00:00.000Z");
-  let transactions = 0;
-  let agencySelections = 0;
-  let lockedAgency = null;
-  const db = {
-    phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
-    phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy" }]; } },
-    maintenanceLaneState: { async findMany() { return []; } },
-    async $transaction(work) { transactions += 1; return work(db); },
-    async $queryRawUnsafe(statement, ...args) {
-      const text = String(statement);
-      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('SELECT a."agencyId"') && text.includes('FROM "DomainWorkReadyAgency"')) {
-        agencySelections += 1;
-        if (agencySelections === 1) return [{ agencyId: "agency-a" }];
-        if (agencySelections === 2) return [{ agencyId: "agency-b" }];
-        return [];
-      }
-      if (text.includes('phase2_lock_domain_work_agency_head')) { lockedAgency = String(args[0]); return []; }
-      if (text.includes('SELECT 1 AS ok FROM "DomainWorkReadyAgency"')) return [{ ok: 1 }];
-      if (text.includes('UPDATE "DomainWorkItem"')) {
-        return [{ id: `work-${lockedAgency}`, agencyId: lockedAgency, ownerToken: "multi-agency-worker", state: "CLAIMED" }];
-      }
-      return [];
-    },
-  };
-  const result = await authority.claimDomainWorkBatch({
-    db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
-    ownerToken: "multi-agency-worker", limit: 2, perAgencyQuantum: 1, perPartitionQuantum: 1, fallbackNow: now,
-  });
-  assert.deepEqual(result.items.map((row) => row.agencyId), ["agency-a", "agency-b"]);
-  assert.equal(transactions, 2, "logical batch should span agencies without sharing their DB transaction/lock domain");
-  assert.equal(result.ownerToken, "multi-agency-worker");
 });
 
 test("F54-01 creator-scoped raw claim is fail-closed without tenant agency scope", async () => {
   const now = new Date("2026-09-11T00:00:00.000Z");
   const fx = productionDb(now);
-  await assert.rejects(
-    authority.claimDomainWorkBatch({
-      db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
-      creatorIds: ["creator-1"], ownerToken: "scoped-no-agency", fallbackNow: now,
-    }),
-    (error) => error?.code === "DOMAIN_WORK_SCOPED_AGENCY_REQUIRED",
-  );
+  await assert.rejects(authority.claimDomainWorkBatch({ db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+    creatorIds: ["creator-1"], ownerToken: "scoped-no-agency", fallbackNow: now }),
+  (error) => error?.code === "DOMAIN_WORK_SCOPED_AGENCY_REQUIRED");
 });

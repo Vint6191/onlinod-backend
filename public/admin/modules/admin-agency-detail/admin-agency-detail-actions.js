@@ -84,7 +84,7 @@
       R().toast(result?.error || "Hard delete failed");
       return;
     }
-    R().toast("agency hard-deleted — redirecting to list");
+    R().toast(result?.pending ? "agency hard-delete scheduled — cleanup is running" : "agency hard-deleted");
     setTimeout(() => R().pushSection("agencies"), 800);
   }
 

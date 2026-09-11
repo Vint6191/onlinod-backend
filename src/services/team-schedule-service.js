@@ -675,7 +675,7 @@ async function createTeamShift({ agencyId, actorUserId, actorMemberId, actorMemb
       data: {
         agencyId, memberId: targets.member.id, startsAt: window.startsAt, endsAt: window.endsAt, timezone,
         status: "PLANNED", note, createdByUserId: actorUserId || null, updatedByUserId: actorUserId || null,
-        creators: { create: targets.creatorIds.map((creatorId) => ({ creatorId })) },
+        creators: { create: targets.creatorIds.map((creatorId) => ({ creatorId, creatorRefId: creatorId })) },
       },
       include: { creators: { select: { creatorId: true } } },
     });
@@ -715,7 +715,7 @@ async function updateTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
     });
     await tx.teamShiftCreator.deleteMany({ where: { shiftId: id } });
     if (targets.creatorIds.length) {
-      await tx.teamShiftCreator.createMany({ data: targets.creatorIds.map((creatorId) => ({ shiftId: id, creatorId })), skipDuplicates: true });
+      await tx.teamShiftCreator.createMany({ data: targets.creatorIds.map((creatorId) => ({ shiftId: id, creatorId, creatorRefId: creatorId })), skipDuplicates: true });
     }
     const updated = await tx.teamShift.update({
       where: { id },

@@ -529,7 +529,7 @@ async function compactTeamProjectionAuthorityForAgency({ db = prisma, agencyId, 
     family: PHASE2_COVERAGE_FAMILY.TEAM_RESPONSE_RANGE_REPAIR,
     generation: PHASE2_COVERAGE_GENERATION.TEAM_RESPONSE_RANGE_REPAIR,
   });
-  if (!coverage.ready) {
+  if (coverage.currentReady !== true) {
     return { agencyId, skipped: true, reason: "response_repair_coverage_incomplete", deleted: 0, hasMore: false, watermarkAdvanced: false };
   }
 

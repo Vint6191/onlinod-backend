@@ -63,3 +63,32 @@ test("complete coverage is not republished by manual maintenance request", async
   assert.equal(result.requested,false);
   assert.equal(fx.workRows.size,0);
 });
+
+
+test("INT6 current coverage guard rejects historical COMPLETE while live DomainWork is still outstanding", async () => {
+  const generation = cov.GENERATION.CUSTOM_EXTERNAL_PROJECTION;
+  const workGeneration = "phase2_domain_work_v3_actual55";
+  let live = true;
+  const coverage = {
+    active: true, enumerationState: "COMPLETE", completedAt: new Date("2026-09-11T00:00:00Z"),
+  };
+  const db = {
+    phase2WorkCoverage: { async findUnique() { return coverage; } },
+    phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: workGeneration }; } },
+    phase2WorkFamilyState: { async findUnique() { return { activeGeneration: workGeneration, outstandingCount: 0, requestedSequence: 4n, convergedSequence: 4n }; } },
+    domainWorkItem: { async findFirst() { return live ? { id: "live-custom-external" } : null; } },
+  };
+
+  let status = await cov.phase2CoverageStatus({ db, agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation });
+  assert.equal(status.ready, true, "historical compatibility bit remains COMPLETE");
+  assert.equal(status.currentReady, false, "live outstanding work must keep current authority stale");
+  await assert.rejects(
+    () => cov.requirePhase2CoverageReady({ db, agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation }),
+    (error) => error?.code === "PHASE2_COVERAGE_INCOMPLETE",
+  );
+
+  live = false;
+  status = await cov.phase2CoverageStatus({ db, agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation });
+  assert.equal(status.currentReady, true);
+  assert.ok(await cov.requirePhase2CoverageReady({ db, agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation }));
+});

@@ -184,21 +184,57 @@ async function upsertDialogSession(row, db = prisma) {
   });
 }
 
-async function findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, replyLedgerId = null, replyEventId = null, db }) {
-  const stableLedgerId = clean(replyLedgerId, 220);
-  // Reply-family order is always (sentAt, ledger id). telemetryEventId is only
-  // the bridge for cross-family incoming<->reply comparison. Mixing the two
-  // identities here can skip historical same-time replies with no bridge.
-  const sameInstantClause = stableLedgerId ? { sentAt: replyAt, id: { lt: stableLedgerId } } : null;
+async function findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, replyEventId = null, db }) {
+  const eventId = clean(replyEventId, 220);
+  // Modern manual replies participate in the same TeamActivityEvent chronology as
+  // incoming/seen facts. Ledger id is storage identity only; it must never compete
+  // with telemetryEventId as a second same-time chronology authority.
+  const sameInstantClause = eventId ? { sentAt: replyAt, telemetryEventId: { lt: eventId } } : null;
   const row = await db.teamSentMessageLedger.findFirst({
     where: {
       agencyId, creatorId, dialogId, source: { in: ["manual", "manual_chat"] },
       OR: [{ sentAt: { lt: replyAt } }, ...(sameInstantClause ? [sameInstantClause] : [])],
       ...(replyMessageId ? { NOT: { messageId: replyMessageId } } : {}),
     },
-    orderBy: [{ sentAt: "desc" }, { id: "desc" }],
+    orderBy: [{ sentAt: "desc" }, { telemetryEventId: { sort: "desc", nulls: "last" } }, { id: "desc" }],
   });
   return row || null;
+}
+
+async function findHistoricalReplyAtBoundary({ agencyId, creatorId, dialogId, at, excludeMessageId = null, db }) {
+  at = dateOrNull(at);
+  if (!at) return null;
+  return db.teamSentMessageLedger.findFirst({
+    where: {
+      agencyId, creatorId, dialogId, source: { in: ["manual", "manual_chat"] }, sentAt: at, telemetryEventId: null,
+      ...(excludeMessageId ? { NOT: { messageId: excludeMessageId } } : {}),
+    },
+    orderBy: [{ id: "asc" }],
+  });
+}
+
+async function findSameTimeReplyPeers({ agencyId, creatorId, dialogId, at, excludeMessageId = null, db }) {
+  at = dateOrNull(at);
+  if (!at) return [];
+  const rows = await db.teamSentMessageLedger.findMany({
+    where: {
+      agencyId, creatorId, dialogId, source: { in: ["manual", "manual_chat"] }, sentAt: at,
+      ...(excludeMessageId ? { NOT: { messageId: excludeMessageId } } : {}),
+    },
+    orderBy: [{ telemetryEventId: { sort: "asc", nulls: "last" } }, { id: "asc" }],
+  });
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function findStrictPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, db }) {
+  return db.teamSentMessageLedger.findFirst({
+    where: {
+      agencyId, creatorId, dialogId, source: { in: ["manual", "manual_chat"] },
+      sentAt: { lt: replyAt },
+      ...(replyMessageId ? { NOT: { messageId: replyMessageId } } : {}),
+    },
+    orderBy: [{ sentAt: "desc" }, { telemetryEventId: { sort: "desc", nulls: "last" } }, { id: "desc" }],
+  });
 }
 
 async function findIncomingAtBoundary({ agencyId, creatorId, dialogId, at, db }) {
@@ -298,6 +334,22 @@ async function findIncomingEpisode({ agencyId, creatorId, dialogId, fromExclusiv
   return out;
 }
 
+async function findIncomingAffectedByUnorderedSameTimeReplies({ agencyId, creatorId, dialogId, replyAt, replyMessageId, db }) {
+  const previous = await findStrictPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, db });
+  const previousEventId = canonicalReplyEventId(previous);
+  const episode = await findIncomingEpisode({
+    agencyId, creatorId, dialogId,
+    fromExclusive: previous?.sentAt || null,
+    fromExclusiveEventId: previousEventId,
+    // Passing no upper event id intentionally means strictly-before replyAt here.
+    // Equal-time incoming is checked separately because a historical reply peer cannot
+    // be canonically ordered against it either.
+    replyAt, replyEventId: null, db,
+  });
+  if (episode.length) return episode[0];
+  return findIncomingAtBoundary({ agencyId, creatorId, dialogId, at: replyAt, db });
+}
+
 async function findCoverageAt({ agencyId, creatorId, memberId, at, db }) {
   return db.teamCoverageSession.findFirst({
     where: {
@@ -342,19 +394,43 @@ async function findOtherCoverageAt({ agencyId, creatorId, memberId, at, db }) {
   });
 }
 
-async function findSeenAt({ agencyId, creatorId, dialogId, memberId, incomingAt, replyAt, db }) {
+async function findSeenAt({ agencyId, creatorId, dialogId, memberId, incomingAt, incomingEventId, replyAt, replyEventId, db }) {
+  const lowerId = clean(incomingEventId, 220);
+  const upperId = clean(replyEventId, 220);
+  if (!incomingAt || !replyAt) return { at: null, ambiguous: false };
+
+  // Historical/reduced adapters may not carry the incoming event id. Timestamp
+  // order still proves strictly later seen facts; only exact-time evidence is
+  // ambiguous without the canonical id bridge.
+  if (!lowerId) {
+    const equalIncomingSeen = await db.teamActivityEvent.findFirst({
+      where: { agencyId, creatorId, dialogId, memberId, eventKind: "DIALOG_SEEN", ts: incomingAt },
+      orderBy: [{ id: "asc" }],
+    });
+    if (equalIncomingSeen) return { at: null, ambiguous: true, row: equalIncomingSeen };
+  }
+
+  // A historical reply has no canonical TeamActivityEvent identity. Seen evidence
+  // at that exact timestamp therefore cannot be ordered relative to the reply.
+  if (!upperId) {
+    const equalReplySeen = await db.teamActivityEvent.findFirst({
+      where: { agencyId, creatorId, dialogId, memberId, eventKind: "DIALOG_SEEN", ts: replyAt },
+      orderBy: [{ id: "asc" }],
+    });
+    if (equalReplySeen) return { at: null, ambiguous: true, row: equalReplySeen };
+  }
+
+  const lower = lowerId
+    ? { OR: [{ ts: { gt: incomingAt } }, { ts: incomingAt, id: { gt: lowerId } }] }
+    : { ts: { gt: incomingAt } };
+  const upper = upperId
+    ? { OR: [{ ts: { lt: replyAt } }, { ts: replyAt, id: { lt: upperId } }] }
+    : { ts: { lt: replyAt } };
   const row = await db.teamActivityEvent.findFirst({
-    where: {
-      agencyId,
-      creatorId,
-      dialogId,
-      memberId,
-      eventKind: "DIALOG_SEEN",
-      ts: { gte: incomingAt, lte: replyAt },
-    },
+    where: { agencyId, creatorId, dialogId, memberId, eventKind: "DIALOG_SEEN", AND: [lower, upper] },
     orderBy: [{ ts: "asc" }, { id: "asc" }],
   });
-  return dateOrNull(row?.ts);
+  return { at: dateOrNull(row?.ts), ambiguous: false, row: row || null };
 }
 
 async function deriveResponseCaseForReplyUnlocked(reply, db = prisma, options = {}) {
@@ -370,9 +446,42 @@ async function deriveResponseCaseForReplyUnlocked(reply, db = prisma, options = 
 
   const replyEventId = canonicalReplyEventId(reply);
   const previousReply = await findPreviousManualReply({
-    agencyId, creatorId, dialogId, replyAt, replyMessageId, replyLedgerId: clean(reply?.id, 220), replyEventId, db,
+    agencyId, creatorId, dialogId, replyAt, replyMessageId, replyEventId, db,
   });
   const previousReplyEventId = canonicalReplyEventId(previousReply);
+
+  // A same-time cluster containing a historical reply has no total order. The
+  // ambiguity matters even when the incoming episode is strictly earlier than the
+  // shared reply timestamp: without the missing telemetry identity we cannot prove
+  // which same-time reply owns that episode. Fail both competing cases closed so a
+  // stale FULL case cannot survive merely because it was projected first.
+  const sameTimeReplyPeers = await findSameTimeReplyPeers({
+    agencyId, creatorId, dialogId, at: replyAt, excludeMessageId: replyMessageId, db,
+  });
+  const sameTimeClusterHasHistorical = !replyEventId || sameTimeReplyPeers.some((peer) => !canonicalReplyEventId(peer));
+  if (sameTimeReplyPeers.length && sameTimeClusterHasHistorical) {
+    const sample = await findIncomingAffectedByUnorderedSameTimeReplies({
+      agencyId, creatorId, dialogId, replyAt, replyMessageId, db,
+    });
+    if (sample) {
+      // One missing telemetry identity makes the whole same-time reply cluster
+      // non-total: the historical reply can be before, between or after any modern
+      // peers. Fence every competing case, not just the first peer we happened to read.
+      for (const peer of sameTimeReplyPeers) {
+        await writeCrossFamilyOrderIncomplete({ reply: peer, sample, db });
+      }
+      return writeCrossFamilyOrderIncomplete({ reply, sample, db });
+    }
+  }
+  if (previousReply?.sentAt) {
+    const previousHistoricalPeer = await findHistoricalReplyAtBoundary({
+      agencyId, creatorId, dialogId, at: previousReply.sentAt, excludeMessageId: clean(previousReply?.messageId, 220), db,
+    });
+    if (previousHistoricalPeer) {
+      const sample = await findIncomingAtBoundary({ agencyId, creatorId, dialogId, at: previousReply.sentAt, db });
+      if (sample) return writeCrossFamilyOrderIncomplete({ reply, sample, db });
+    }
+  }
 
   // Timestamp alone cannot order two different canonical event families. Modern
   // ledgers bridge to TeamActivityEvent through telemetryEventId. Historical rows
@@ -425,12 +534,19 @@ async function deriveResponseCaseForReplyUnlocked(reply, db = prisma, options = 
   const lastIncomingAt = dateOrNull(lastIncoming.ts) || incomingAt;
   if (!incomingAt) return null;
 
-  const [coverageAtIncoming, coverageAfterIncoming, otherCoverageAtIncoming, seenAt] = await Promise.all([
+  const [coverageAtIncoming, coverageAfterIncoming, otherCoverageAtIncoming, seenEvidence] = await Promise.all([
     findCoverageAt({ agencyId, creatorId, memberId, at: incomingAt, db }),
     findCoverageStartedAfter({ agencyId, creatorId, memberId, after: incomingAt, before: replyAt, db }),
     findOtherCoverageAt({ agencyId, creatorId, memberId, at: incomingAt, db }),
-    findSeenAt({ agencyId, creatorId, dialogId, memberId, incomingAt, replyAt, db }),
+    findSeenAt({
+      agencyId, creatorId, dialogId, memberId, incomingAt, incomingEventId: clean(firstIncoming?.id, 220),
+      replyAt, replyEventId, db,
+    }),
   ]);
+  if (seenEvidence?.ambiguous) {
+    return writeCrossFamilyOrderIncomplete({ reply, sample: firstIncoming, db, reason: "CROSS_FAMILY_SEEN_ORDER_UNPROVEN" });
+  }
+  const seenAt = seenEvidence?.at || null;
 
   let classification = "UNKNOWN";
   let coverage = coverageAtIncoming || coverageAfterIncoming || null;
@@ -634,15 +750,24 @@ async function recomputeSuccessorReply(reply, db = prisma) {
   const agencyId = clean(reply?.agencyId,160); const creatorId = clean(reply?.creatorId,160);
   const dialogId = clean(reply?.dialogId || reply?.fanId,160); const sentAt = dateOrNull(reply?.sentAt);
   if (!agencyId || !creatorId || !dialogId || !sentAt) return null;
-  const stableId = clean(reply?.id, 220);
+  const eventId = canonicalReplyEventId(reply);
   const upper = new Date(sentAt.getTime() + RESPONSE_LOOKBACK_MS);
-  const sameInstant = stableId ? { sentAt, id: { gt: stableId } } : null;
+
+  const historicalPeer = await findHistoricalReplyAtBoundary({
+    agencyId, creatorId, dialogId, at: sentAt, excludeMessageId: clean(reply?.messageId, 220), db,
+  });
+  if (historicalPeer) {
+    const sample = await findIncomingAtBoundary({ agencyId, creatorId, dialogId, at: sentAt, db });
+    if (sample) return deriveResponseCaseForReply(historicalPeer, db);
+  }
+
+  const sameInstant = eventId ? { sentAt, telemetryEventId: { gt: eventId } } : null;
   const successor = await db.teamSentMessageLedger.findFirst({
     where: {
       agencyId, creatorId, dialogId, source: { in: ["manual","manual_chat"] },
       OR: [{ sentAt: { gt: sentAt, lte: upper } }, ...(sameInstant ? [sameInstant] : [])],
     },
-    orderBy: [{ sentAt: "asc" }, { id: "asc" }],
+    orderBy: [{ sentAt: "asc" }, { telemetryEventId: { sort: "asc", nulls: "last" } }, { id: "asc" }],
   });
   return successor ? deriveResponseCaseForReply(successor, db) : null;
 }
@@ -659,7 +784,7 @@ async function recomputeRepliesForCoverage(session, db = prisma) {
       source: { in: ["manual", "manual_chat"] },
       sentAt: { gte: lower, lte: upper },
     },
-    orderBy: [{ sentAt: "asc" }, { id: "asc" }],
+    orderBy: [{ sentAt: "asc" }, { telemetryEventId: { sort: "asc", nulls: "last" } }, { id: "asc" }],
   });
   let count = 0;
   for (const reply of replies || []) {

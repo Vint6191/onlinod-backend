@@ -172,7 +172,7 @@ test("super-admin hard creator delete is a durable bounded lifecycle, not one li
   assert.doesNotMatch(block, /purgeCreatorPhase2ResidualsForHardDelete/);
 });
 
-test("super-admin hard Agency delete atomically purges all Phase2 provider ledgers after blockers and before Agency cascade", () => {
+test("super-admin hard Agency delete publishes bounded destructive authority after lifecycle blockers", () => {
   const admin = source("routes/admin.js");
   const routeStart = admin.indexOf('router.delete("/agencies/:id"');
   const routeEnd = admin.indexOf('router.post("/agencies/:id/restore"', routeStart);
@@ -183,9 +183,11 @@ test("super-admin hard Agency delete atomically purges all Phase2 provider ledge
   assert.match(block, /prisma\.\$transaction\s*\(\s*async\s*\(tx\)/);
   const customFence = block.indexOf("assertAgencyCustomPipelineRetirable");
   const massFence = block.indexOf("assertAgencyMassCampaignRetirable");
-  const providerPurge = block.indexOf("purgeAgencyPhase2ProviderLedgersForHardDelete");
-  const agencyDelete = block.indexOf("tx.agency.delete");
-  assert.ok(customFence >= 0 && massFence > customFence, "hard Agency delete must converge Custom then MASS future-effect authority before history destruction");
-  assert.ok(providerPurge > massFence, "provider-ledger purge must remain behind every unknown-effect blocker");
-  assert.ok(agencyDelete > providerPurge, "provider purge and Agency cascade must share one transaction in rollback-safe order");
+  const barrier = block.indexOf("tx.agency.update");
+  const publishCleanup = block.indexOf("DESTRUCTIVE_AGENCY_CLEANUP");
+  assert.ok(customFence >= 0 && massFence > customFence, "hard Agency delete must converge Custom then MASS authority first");
+  assert.ok(barrier > massFence, "durable Agency DELETING barrier must follow blockers");
+  assert.ok(publishCleanup > barrier, "bounded Agency cleanup must be published after the barrier in the same transaction");
+  assert.doesNotMatch(block, /tx\.agency\.delete/);
+  assert.doesNotMatch(block, /purgeAgencyPhase2ProviderLedgersForHardDelete/);
 });

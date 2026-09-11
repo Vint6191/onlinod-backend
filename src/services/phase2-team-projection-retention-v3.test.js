@@ -9,7 +9,7 @@ delete require.cache[prismaPath];
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: {} };
 const { compactTeamProjectionAuthorityForAgency } = require(retentionPath);
 
-function fixture({ pageFull = false } = {}) {
+function fixture({ pageFull = false, liveRepairWork = false } = {}) {
   const calls = { deletedResponse: [], deletedDialog: [], deletedCoverage: [], coverageUpdate: null, retainedUpdate: null };
   const limitRows = pageFull ? Array.from({ length: 2 }, (_, i) => ({ id: `r${i + 1}` })) : [{ id: "r1" }];
   const db = {
@@ -17,6 +17,15 @@ function fixture({ pageFull = false } = {}) {
     phase2WorkCoverage: {
       async findUnique() { return { active: true, enumerationState: "COMPLETE", completedAt: new Date("2026-09-01T00:00:00Z") }; },
       async updateMany({ where, data }) { calls.retainedUpdate = { where, data }; return { count: 1 }; },
+    },
+    phase2WorkGenerationAuthority: {
+      async findUnique() { return { activeGeneration: "phase2_domain_work_v3_actual55" }; },
+    },
+    phase2WorkFamilyState: {
+      async findUnique() { return { activeGeneration: "phase2_domain_work_v3_actual55", outstandingCount: 0, requestedSequence: 5n, convergedSequence: 5n }; },
+    },
+    domainWorkItem: {
+      async findFirst() { return liveRepairWork ? { id: "live-response-repair" } : null; },
     },
     teamResponseCase: {
       async findMany({ where, take }) {
@@ -79,5 +88,17 @@ test("projection compaction is fail-closed while bounded response repair coverag
   assert.equal(result.skipped, true);
   assert.equal(result.reason, "response_repair_coverage_incomplete");
   assert.equal(calls.deletedResponse.length, 0);
+  assert.equal(calls.coverageUpdate, null);
+});
+
+
+test("INT6 projection compaction cannot purge while response repair is historically complete but live-stale", async () => {
+  const { db, calls } = fixture({ pageFull: false, liveRepairWork: true });
+  const result = await compactTeamProjectionAuthorityForAgency({ db, agencyId: "agency-1", cutoff: new Date("2025-09-09T00:00:00Z"), batchSize: 2 });
+  assert.equal(result.skipped, true);
+  assert.equal(result.reason, "response_repair_coverage_incomplete");
+  assert.equal(calls.deletedResponse.length, 0);
+  assert.equal(calls.deletedDialog.length, 0);
+  assert.equal(calls.deletedCoverage.length, 0);
   assert.equal(calls.coverageUpdate, null);
 });

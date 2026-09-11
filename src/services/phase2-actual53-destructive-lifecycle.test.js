@@ -17,40 +17,33 @@ function slice(source, start, end) {
   return source.slice(from, to);
 }
 
-test("F53-11 Agency hard delete removes proof roots before cascade and trigger-maintained current-work roots after cascade", () => {
-  const prePurge = slice(
-    destructive,
-    "async function purgeAgencyPhase2ProviderLedgersForHardDelete",
-    "async function purgeAgencyPhase2CurrentWorkRootsAfterCascade",
-  );
-  for (const delegate of [
-    "teamSentMessageLedger",
-    "teamPpvPurchaseLedger",
-    "teamTipLedger",
-    "teamPpvResolveJob",
-    "providerOperationalDebt",
-    "telegramDeliveryIntent",
-    "telegramInboundEvent",
-  ]) assert.match(prePurge, new RegExp(`"${delegate}"`));
-  for (const delegate of ["phase2WorkFamilyState", "domainWorkReadyPartition", "domainWorkReadyAgency"]) {
-    assert.doesNotMatch(prePurge, new RegExp(`"${delegate}"`));
-  }
-
-  const postPurge = slice(
-    destructive,
-    "async function purgeAgencyPhase2CurrentWorkRootsAfterCascade",
-    "// Legacy bounded compatibility purge",
-  );
-  for (const delegate of ["phase2WorkFamilyState", "domainWorkReadyPartition", "domainWorkReadyAgency"]) {
-    assert.match(postPurge, new RegExp(`"${delegate}"`));
-  }
-
+test("F55-07 Agency hard delete is a durable bounded DomainWork lifecycle, not one tenant-wide route transaction", () => {
   const route = slice(admin, 'router.delete("/agencies/:id"', '// POST /agencies/:id/restore');
-  const blockers = route.indexOf("assertAgencyMassCampaignRetirable");
-  const preAt = route.indexOf("purgeAgencyPhase2ProviderLedgersForHardDelete");
-  const deleteAt = route.indexOf("tx.agency.delete");
-  const postAt = route.indexOf("purgeAgencyPhase2CurrentWorkRootsAfterCascade");
-  assert.ok(blockers >= 0 && preAt > blockers && deleteAt > preAt && postAt > deleteAt);
+  const hardStart = route.indexOf("if (hard) {");
+  const softStart = route.indexOf("const deletedAt", hardStart);
+  const hard = route.slice(hardStart, softStart);
+  const customFence = hard.indexOf("assertAgencyCustomPipelineRetirable");
+  const massFence = hard.indexOf("assertAgencyMassCampaignRetirable");
+  const barrier = hard.indexOf("tx.agency.update");
+  const publish = hard.indexOf("DESTRUCTIVE_AGENCY_CLEANUP");
+  assert.ok(customFence >= 0 && massFence > customFence);
+  assert.ok(barrier > massFence, "Agency DELETING barrier must follow external-effect guards");
+  assert.ok(publish > barrier, "durable Agency cleanup must be published in the barrier transaction");
+  assert.doesNotMatch(hard, /tx\.agency\.delete/);
+  assert.doesNotMatch(hard, /purgeAgencyPhase2ProviderLedgersForHardDelete/);
+
+  const worker = slice(
+    destructive,
+    "async function processAgencyHardDeleteWorkItem",
+    "async function processCreatorHardDeleteWorkItem",
+  );
+  assert.match(worker, /ensureAgencyCreatorCleanupBatch/);
+  assert.match(worker, /purgeAgencyNonFkTenantBatch/);
+  assert.match(worker, /purgeAgencyDomainWorkBatch/);
+  assert.match(worker, /purgeRootCascadeDescendantsBatch/);
+  assert.match(worker, /rootCascadeRowsRemain/);
+  assert.match(worker, /tx\.agency\.delete/);
+  assert.match(worker, /purgeAgencyPhase2CurrentWorkRootsAfterCascade/);
 });
 
 test("F53-12 Creator hard delete worker is bounded, restartable, claim-fenced and zero-gated", () => {

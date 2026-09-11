@@ -118,7 +118,7 @@ test("F53-17 stale sameInstant R1 cannot supersede reminder B published by concu
   fx.work.set(`seed-a`, {
     id: "seed-a", agencyId: "agency-1", workClass: "CUSTOM_REMINDER", objectType: "CustomReminderObligation",
     objectId: initialAId, parentObjectId: "order-1", partitionKey: "creator-1", creatorId: "creator-1",
-    requestedRevision: 1n, completedRevision: 0n, activeGeneration: "phase2_domain_work_v2_actual53", projectionVersion: "phase2_domain_work_v2_actual53",
+    requestedRevision: 1n, completedRevision: 0n, activeGeneration: "phase2_domain_work_v3_actual55", projectionVersion: "phase2_domain_work_v3_actual55",
     state: "READY", isOutstanding: true, availableAt: new Date("2026-09-10T14:30:00.000Z"), claimFence: 0n, claimedRevision: 0n,
   });
 

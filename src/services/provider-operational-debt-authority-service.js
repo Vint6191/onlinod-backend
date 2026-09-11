@@ -238,14 +238,14 @@ async function customExternalProofBackfillReady({ db, agencyId } = {}) {
   const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, phase2CoverageStatus } = require("./phase2-work-coverage-authority-service");
   if (!String(agencyId || "").trim()) return false;
   const status = await phase2CoverageStatus({ db, agencyId: String(agencyId), family: PHASE2_COVERAGE_FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation: PHASE2_COVERAGE_GENERATION.CUSTOM_EXTERNAL_PROJECTION });
-  return status.ready;
+  return status.currentReady === true;
 }
 
 async function providerOperationalBackfillReady({ db, agencyId } = {}) {
   const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, phase2CoverageStatus } = require("./phase2-work-coverage-authority-service");
   if (!String(agencyId || "").trim()) return false;
   const status = await phase2CoverageStatus({ db, agencyId: String(agencyId), family: PHASE2_COVERAGE_FAMILY.PROVIDER_OPERATIONAL, generation: PHASE2_COVERAGE_GENERATION.PROVIDER_OPERATIONAL });
-  return status.ready;
+  return status.currentReady === true;
 }
 
 async function requireProviderOperationalBackfillReady({ db, agencyId } = {}) {
