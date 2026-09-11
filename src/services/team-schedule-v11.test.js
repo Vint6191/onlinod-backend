@@ -74,6 +74,10 @@ test("Schedule read model combines planned shifts with actual coverage without i
   assert.equal(payload.handoffs[0].gapSeconds, 5 * 60);
   assert.equal(payload.summary.openSessions, 0, "a 26h orphan must not stay LIVE forever");
   assert.equal(payload.summary.staleOpenSessions, 1);
+  assert.equal(payload.projectionAuthority.dialogOutstanding, 0);
+  assert.equal(payload.projectionAuthority.responseOutstanding, 0);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload.projectionAuthority, "dialogOutstandingCount"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(payload.projectionAuthority, "responseOutstandingCount"), false);
   const staleCreator = payload.creators.find((row) => row.creatorId === "creator-2");
   assert.equal(staleCreator.activeNow, false);
   assert.equal(staleCreator.staleOpenSessions, 1);

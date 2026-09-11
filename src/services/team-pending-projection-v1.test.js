@@ -28,16 +28,21 @@ function makeDb({ events = [], ledgers = [] } = {}) {
     if (typeof where.eventKind === "string" && row.eventKind !== where.eventKind) return false;
     if (where.eventKind?.in && !where.eventKind.in.includes(row.eventKind)) return false;
     if (where.memberId?.not === null && row.memberId == null) return false;
-    if (where.ts && !matchDate(row.ts, where.ts)) return false;
     if (where.id?.in && !where.id.in.includes(row.id)) return false;
-    if (Array.isArray(where.OR)) {
-      const ok = where.OR.some((branch) => {
-        if (Object.prototype.hasOwnProperty.call(branch, "pendingProjectionVersion") && branch.pendingProjectionVersion === null) return row.pendingProjectionVersion == null;
-        if (branch.pendingProjectionVersion?.not) return row.pendingProjectionVersion !== branch.pendingProjectionVersion.not;
-        return false;
-      });
-      if (!ok) return false;
+    if (where.id && typeof where.id === "object") {
+      const id = String(row.id || "");
+      if (where.id.gt && !(id > String(where.id.gt))) return false;
+      if (where.id.lt && !(id < String(where.id.lt))) return false;
     }
+    if (where.ts instanceof Date) {
+      if (new Date(row.ts).getTime() !== where.ts.getTime()) return false;
+    } else if (where.ts && !matchDate(row.ts, where.ts)) return false;
+    if (Object.prototype.hasOwnProperty.call(where, "pendingProjectionVersion")) {
+      if (where.pendingProjectionVersion === null && row.pendingProjectionVersion != null) return false;
+      if (where.pendingProjectionVersion?.not && row.pendingProjectionVersion === where.pendingProjectionVersion.not) return false;
+    }
+    if (Array.isArray(where.OR) && !where.OR.some((branch) => eventMatches(row, branch))) return false;
+    if (Array.isArray(where.AND) && !where.AND.every((branch) => eventMatches(row, branch))) return false;
     return true;
   }
 
@@ -45,7 +50,16 @@ function makeDb({ events = [], ledgers = [] } = {}) {
     if (where.agencyId && row.agencyId !== where.agencyId) return false;
     if (where.creatorId && row.creatorId !== where.creatorId) return false;
     if (where.dialogId && row.dialogId !== where.dialogId) return false;
+    if (where.messageId && row.messageId !== where.messageId) return false;
     if (where.source?.in && !where.source.in.includes(row.source)) return false;
+    if (Object.prototype.hasOwnProperty.call(where, "telemetryEventId")) {
+      if (where.telemetryEventId === null && row.telemetryEventId != null) return false;
+      if (where.telemetryEventId && typeof where.telemetryEventId === "object") {
+        const id = String(row.telemetryEventId || "");
+        if (where.telemetryEventId.gt && !(id > String(where.telemetryEventId.gt))) return false;
+        if (where.telemetryEventId.lt && !(id < String(where.telemetryEventId.lt))) return false;
+      }
+    }
     return true;
   }
 
@@ -68,6 +82,12 @@ function makeDb({ events = [], ledgers = [] } = {}) {
         if (Array.isArray(orderBy) && orderBy[0]?.ts === "desc") rows.reverse();
         if (!Array.isArray(orderBy) && orderBy?.ts === "desc") rows.reverse();
         return rows.slice(0, take || rows.length);
+      },
+      async findFirst({ where = {}, orderBy }) {
+        let rows = activity.filter((row) => eventMatches(row, where)).slice();
+        rows.sort((a, b) => new Date(a.ts || 0) - new Date(b.ts || 0) || String(a.id).localeCompare(String(b.id)));
+        if (Array.isArray(orderBy) && orderBy[0]?.ts === "desc") rows.reverse();
+        return rows[0] || null;
       },
       async update({ where, data }) {
         const row = activity.find((item) => item.id === where.id);
@@ -225,6 +245,28 @@ test("late-arriving incoming telemetry cannot reopen an episode that a durable m
   await service.applyTeamPendingProjection(inc, fx.db);
   assert.equal(fx.states.length, 0, "latest manual reply is the durable episode boundary");
   assert.equal(fx.activity[0].pendingProjectionVersion, "team_pending_v2");
+});
+
+test("F54-03 pending reply boundary uses cross-family telemetry id at equal timestamps", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const before = incoming("event-a", at, "m-before");
+  const after = incoming("event-z", at, "m-after");
+  const ledger = { id: "ledger-r", agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", memberId: "member-a", messageId: "reply", source: "manual", sentAt: d(at), telemetryEventId: "event-b" };
+  const fx = makeDb({ events: [after, before], ledgers: [ledger] });
+  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: fx.db });
+  assert.equal(result.status, "PENDING");
+  assert.equal(result.row.incomingCount, 1);
+  assert.equal(result.row.firstIncomingMessageId, "m-after");
+});
+
+test("F54-03 pending historical equal-time boundary without telemetry id is explicit incomplete", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const event = incoming("event-a", at, "m-ambiguous");
+  const ledger = { id: "legacy-r", agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", memberId: "member-a", messageId: "reply", source: "manual", sentAt: d(at), telemetryEventId: null };
+  const fx = makeDb({ events: [event], ledgers: [ledger] });
+  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: fx.db });
+  assert.equal(result.incompleteHistory, true);
+  assert.equal(result.row.projectionState, "INCOMPLETE_HISTORY");
 });
 
 test("historical backfill groups raw events by dialog and marks durable progress", async () => {

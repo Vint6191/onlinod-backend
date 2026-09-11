@@ -283,6 +283,12 @@ async function claimDomainWorkBatch({
   const take = bounded(limit);
   const quantum = bounded(perAgencyQuantum, 10, take);
   const partitionQuantum = bounded(perPartitionQuantum, 2, quantum);
+  const normalizedObjectIds = Array.from(new Set((Array.isArray(objectIds) ? objectIds : []).map((value) => clean(value, 240)).filter(Boolean)));
+  const normalizedCreatorIds = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map((value) => clean(value, 180)).filter(Boolean)));
+  if (Array.isArray(creatorIds) && !normalizedCreatorIds.length) {
+    return { ownerToken, authorityNow: null, leaseUntil: null, items: [] };
+  }
+
   const activeGeneration = await activeDomainWorkGeneration({ db, workClass: klass, fallback: generation });
   if (String(activeGeneration) !== String(generation)) {
     return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true, reason: "unsupported_domain_work_generation", activeGeneration };
@@ -291,73 +297,58 @@ async function claimDomainWorkBatch({
   if (!drain.ready) {
     return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true, reason: drain.reason || "legacy_executor_drain", legacyExecutors: drain.lanes || [] };
   }
-  return runDbTransaction(db, async (tx) => {
-    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
-    const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
-    if (typeof tx?.$queryRawUnsafe === "function") {
-      const normalizedObjectIds = Array.from(new Set((Array.isArray(objectIds) ? objectIds : []).map((value) => clean(value, 240)).filter(Boolean)));
-      const normalizedCreatorIds = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map((value) => clean(value, 180)).filter(Boolean)));
-      if (Array.isArray(creatorIds) && !normalizedCreatorIds.length) {
-        return { ownerToken, authorityNow, leaseUntil, items: [] };
-      }
 
-      const maxAgencies = Math.max(1, Math.min(take, 100));
-      const params = [klass, authorityNow, String(generation), maxAgencies, quantum, partitionQuantum, take, ownerToken, leaseUntil];
-      let agencyHeadFilter = "";
-      let workFilter = "";
-      if (agencyId) {
-        params.push(String(agencyId));
-        agencyHeadFilter = ` AND a."agencyId"=$${params.length}`;
+  const rawCapable = typeof db?.$queryRawUnsafe === "function";
+
+  // F54-01 + ready-head lock order: creator-scoped execution is tenant-scoped.
+  // Requiring the agency here both keeps the direct creator index bounded and
+  // guarantees that one claim transaction can acquire the agency head authority
+  // before it locks any DWI row/partition.
+  if (rawCapable && normalizedCreatorIds.length) {
+    const scopedAgencyId = clean(agencyId, 180);
+    if (!scopedAgencyId) {
+      throw Object.assign(new Error("creator-scoped DomainWork claim requires agencyId"), { code: "DOMAIN_WORK_SCOPED_AGENCY_REQUIRED" });
+    }
+    return runDbTransaction(db, async (tx) => {
+      const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+      const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
+      if (typeof tx?.$queryRawUnsafe !== "function") {
+        return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_raw_storage_unavailable" };
       }
+      await tx.$queryRawUnsafe(`SELECT "phase2_lock_domain_work_agency_head"($1,$2)`, scopedAgencyId, klass);
+      const params = [klass, authorityNow, String(generation), ownerToken, leaseUntil, partitionQuantum, take];
+      const creatorValues = normalizedCreatorIds.map((value) => {
+        params.push(value);
+        return `($${params.length})`;
+      }).join(",");
+      let scopedWorkFilter = "";
+      params.push(scopedAgencyId);
+      scopedWorkFilter += ` AND d."agencyId"=$${params.length}`;
       if (objectType) {
         params.push(String(objectType));
-        workFilter += ` AND d."objectType"=$${params.length}`;
+        scopedWorkFilter += ` AND d."objectType"=$${params.length}`;
       }
       if (normalizedObjectIds.length) {
         const placeholders = normalizedObjectIds.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
-        workFilter += ` AND d."objectId" IN (${placeholders})`;
-      }
-      if (normalizedCreatorIds.length) {
-        const placeholders = normalizedCreatorIds.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
-        workFilter += ` AND d."creatorId" IN (${placeholders})`;
+        scopedWorkFilter += ` AND d."objectId" IN (${placeholders})`;
       }
 
       const rows = await tx.$queryRawUnsafe(
-        `WITH agencies AS (
-           SELECT a."agencyId",a."nextDueAt"
-             FROM "DomainWorkReadyAgency" a
-            WHERE a."workClass"=$1
-              AND a."activeGeneration"=$3
-              AND a."nextDueAt" <= $2${agencyHeadFilter}
-            ORDER BY a."nextDueAt",a."agencyId"
-            LIMIT $4
-         ), partitions AS (
-           SELECT a."agencyId",p."partitionKey",p."nextDueAt"
-             FROM agencies a
-             CROSS JOIN LATERAL (
-               SELECT p."partitionKey",p."nextDueAt"
-                 FROM "DomainWorkReadyPartition" p
-                WHERE p."agencyId"=a."agencyId"
-                  AND p."workClass"=$1
-                  AND p."activeGeneration"=$3
-                  AND p."nextDueAt" <= $2
-                ORDER BY p."nextDueAt",p."partitionKey"
-                LIMIT $5
-             ) p
+        `WITH scoped_creators("creatorId") AS (
+           VALUES ${creatorValues}
          ), candidates AS (
            SELECT d."id",d."availableAt"
-             FROM partitions p
+             FROM scoped_creators c
              CROSS JOIN LATERAL (
                SELECT d."id",d."availableAt"
                  FROM "DomainWorkItem" d
-                WHERE d."agencyId"=p."agencyId"
-                  AND d."workClass"=$1
-                  AND d."partitionKey"=p."partitionKey"
-                  AND d."isOutstanding"=TRUE
+                WHERE d."workClass"=$1
                   AND d."activeGeneration"=$3
+                  AND d."creatorId"=c."creatorId"
+                  AND d."isOutstanding"=TRUE
                   AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
                   AND d."availableAt" <= $2
-                  AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
+                  AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${scopedWorkFilter}
                 ORDER BY d."availableAt",d."id"
                 FOR UPDATE OF d SKIP LOCKED
                 LIMIT $6
@@ -366,14 +357,135 @@ async function claimDomainWorkBatch({
             LIMIT $7
          )
          UPDATE "DomainWorkItem" d SET
-           "state"='CLAIMED',"ownerToken"=$8,"claimFence"=d."claimFence"+1,
-           "claimedRevision"=d."requestedRevision","leaseUntil"=$9,"attempts"=d."attempts"+1,
+           "state"='CLAIMED',"ownerToken"=$4,"claimFence"=d."claimFence"+1,
+           "claimedRevision"=d."requestedRevision","leaseUntil"=$5,"attempts"=d."attempts"+1,
            "updatedAt"=CURRENT_TIMESTAMP
           FROM candidates c WHERE d."id"=c."id"
          RETURNING d.*`, ...params,
       );
       return { ownerToken, authorityNow, leaseUntil, items: rows || [] };
+    });
+  }
+
+  // Production broad claims are intentionally split into one agency per DB
+  // transaction.  The returned logical batch still spans several agencies and
+  // keeps one ownerToken, but no transaction can accumulate head locks for A then
+  // later request B while a peer owns B and waits for A.  This removes the
+  // multi-agency advisory-lock cycle without introducing a platform-global mutex.
+  if (rawCapable && typeof db?.$transaction === "function") {
+    const claimed = [];
+    const seenAgencies = [];
+    const maxAgencies = agencyId ? 1 : Math.max(1, Math.min(take, 100));
+    let firstAuthorityNow = null;
+    let lastLeaseUntil = null;
+
+    for (let attempt = 0; attempt < maxAgencies && claimed.length < take; attempt += 1) {
+      const remaining = take - claimed.length;
+      const tranche = await runDbTransaction(db, async (tx) => {
+        const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+        const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
+        if (typeof tx?.$queryRawUnsafe !== "function") return { agencyId: null, authorityNow, leaseUntil, items: [] };
+
+        const headParams = [klass, authorityNow, String(generation)];
+        let headFilter = "";
+        if (agencyId) {
+          headParams.push(String(agencyId));
+          headFilter += ` AND a."agencyId"=$${headParams.length}`;
+        }
+        if (seenAgencies.length) {
+          const excluded = seenAgencies.map((value) => { headParams.push(value); return `$${headParams.length}`; }).join(",");
+          headFilter += ` AND a."agencyId" NOT IN (${excluded})`;
+        }
+        const heads = await tx.$queryRawUnsafe(
+          `SELECT a."agencyId"
+             FROM "DomainWorkReadyAgency" a
+            WHERE a."workClass"=$1
+              AND a."activeGeneration"=$3
+              AND a."nextDueAt" <= $2${headFilter}
+            ORDER BY a."nextDueAt",a."agencyId"
+            LIMIT 1`, ...headParams,
+        );
+        const selectedAgency = clean(heads?.[0]?.agencyId, 180);
+        if (!selectedAgency) return { agencyId: null, authorityNow, leaseUntil, items: [] };
+
+        // All DWI writers acquire this agency authority before any partition
+        // authority.  Re-read the head after the lock so selection cannot rely on
+        // a pre-lock snapshot that became stale while waiting.
+        await tx.$queryRawUnsafe(`SELECT "phase2_lock_domain_work_agency_head"($1,$2)`, selectedAgency, klass);
+        const eligible = await tx.$queryRawUnsafe(
+          `SELECT 1 AS ok FROM "DomainWorkReadyAgency" a
+            WHERE a."agencyId"=$1 AND a."workClass"=$2 AND a."activeGeneration"=$3 AND a."nextDueAt" <= $4
+            LIMIT 1`, selectedAgency, klass, String(generation), authorityNow,
+        );
+        if (!eligible?.length) return { agencyId: selectedAgency, authorityNow, leaseUntil, items: [] };
+
+        const params = [klass, authorityNow, String(generation), selectedAgency, quantum, partitionQuantum, Math.min(remaining, take), ownerToken, leaseUntil];
+        let workFilter = "";
+        if (objectType) {
+          params.push(String(objectType));
+          workFilter += ` AND d."objectType"=$${params.length}`;
+        }
+        if (normalizedObjectIds.length) {
+          const placeholders = normalizedObjectIds.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
+          workFilter += ` AND d."objectId" IN (${placeholders})`;
+        }
+
+        const rows = await tx.$queryRawUnsafe(
+          `WITH partitions AS (
+             SELECT p."partitionKey",p."nextDueAt"
+               FROM "DomainWorkReadyPartition" p
+              WHERE p."agencyId"=$4
+                AND p."workClass"=$1
+                AND p."activeGeneration"=$3
+                AND p."nextDueAt" <= $2
+              ORDER BY p."nextDueAt",p."partitionKey"
+              LIMIT $5
+           ), candidates AS (
+             SELECT d."id",d."availableAt"
+               FROM partitions p
+               CROSS JOIN LATERAL (
+                 SELECT d."id",d."availableAt"
+                   FROM "DomainWorkItem" d
+                  WHERE d."agencyId"=$4
+                    AND d."workClass"=$1
+                    AND d."partitionKey"=p."partitionKey"
+                    AND d."isOutstanding"=TRUE
+                    AND d."activeGeneration"=$3
+                    AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                    AND d."availableAt" <= $2
+                    AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
+                  ORDER BY d."availableAt",d."id"
+                  FOR UPDATE OF d SKIP LOCKED
+                  LIMIT $6
+               ) d
+              ORDER BY d."availableAt",d."id"
+              LIMIT $7
+           )
+           UPDATE "DomainWorkItem" d SET
+             "state"='CLAIMED',"ownerToken"=$8,"claimFence"=d."claimFence"+1,
+             "claimedRevision"=d."requestedRevision","leaseUntil"=$9,"attempts"=d."attempts"+1,
+             "updatedAt"=CURRENT_TIMESTAMP
+            FROM candidates c WHERE d."id"=c."id"
+           RETURNING d.*`, ...params,
+        );
+        return { agencyId: selectedAgency, authorityNow, leaseUntil, items: rows || [] };
+      });
+
+      if (!tranche?.agencyId) break;
+      seenAgencies.push(String(tranche.agencyId));
+      if (!firstAuthorityNow) firstAuthorityNow = tranche.authorityNow || null;
+      lastLeaseUntil = tranche.leaseUntil || lastLeaseUntil;
+      if (tranche.items?.length) claimed.push(...tranche.items.slice(0, remaining));
+      if (agencyId) break;
     }
+    return { ownerToken, authorityNow: firstAuthorityNow, leaseUntil: lastLeaseUntil, items: claimed.slice(0, take) };
+  }
+
+  // Adapter/unit fallback. Production PostgreSQL uses the raw paths above; keep
+  // the bounded in-memory admission model for lightweight storage adapters.
+  return runDbTransaction(db, async (tx) => {
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
     if (!tx?.domainWorkItem?.findMany || !tx?.domainWorkItem?.updateMany) {
       return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_storage_unavailable" };
     }
@@ -386,8 +498,8 @@ async function claimDomainWorkBatch({
         availableAt: { lte: authorityNow },
         ...(agencyId ? { agencyId: String(agencyId) } : {}),
         ...(objectType ? { objectType: String(objectType) } : {}),
-        ...(Array.isArray(objectIds) ? { objectId: { in: Array.from(new Set(objectIds.map((value) => String(value || "").trim()).filter(Boolean))) } } : {}),
-        ...(Array.isArray(creatorIds) ? { creatorId: { in: Array.from(new Set(creatorIds.map((value) => String(value || "").trim()).filter(Boolean))) } } : {}),
+        ...(normalizedObjectIds.length ? { objectId: { in: normalizedObjectIds } } : {}),
+        ...(Array.isArray(creatorIds) ? { creatorId: { in: normalizedCreatorIds } } : {}),
       },
       orderBy: [{ availableAt: "asc" }, { id: "asc" }], take: Math.min(MAX_BATCH * 10, Math.max(take, take * 10)),
     });

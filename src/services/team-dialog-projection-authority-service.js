@@ -109,27 +109,48 @@ async function markDialogEventProjected(row, db) {
   return Number(changed?.count || 0);
 }
 
-async function projectCreatorDialogWorkItem({ agencyId, creatorId, dialogId, db = prisma, limit = 100 } = {}) {
+async function projectCreatorDialogWorkItem({ agencyId, creatorId, dialogId, db = prisma, limit = 100, progressCursor = null } = {}) {
   agencyId = clean(agencyId,160); creatorId = clean(creatorId,160); dialogId = clean(dialogId,160);
   if (!agencyId || !creatorId || !dialogId) throw Object.assign(new Error("TEAM_DIALOG_WORK_IDENTITY_REQUIRED"), { code: "TEAM_DIALOG_WORK_IDENTITY_REQUIRED" });
   const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 100)));
   if (!db?.teamActivityEvent?.findMany) throw Object.assign(new Error("TEAM_DIALOG_EVENT_STORAGE_REQUIRED"), { code: "TEAM_DIALOG_EVENT_STORAGE_REQUIRED" });
-  const rows = await db.teamActivityEvent.findMany({
-    where: {
-      agencyId, creatorId, dialogId,
-      AND: [relevantDialogEventWhere(), unprojectedDialogWhere()],
-    },
-    orderBy: [{ ts: "asc" }, { id: "asc" }], take,
-  });
+
+  const repairEventId = clean(progressCursor?.pendingRepair?.eventId, 220);
+  let rows;
+  if (repairEventId && db?.teamActivityEvent?.findFirst) {
+    const resume = await db.teamActivityEvent.findFirst({
+      where: { id: repairEventId, agencyId, creatorId, dialogId, AND: [relevantDialogEventWhere(), unprojectedDialogWhere()] },
+    });
+    rows = resume ? [resume] : [];
+  } else {
+    rows = await db.teamActivityEvent.findMany({
+      where: { agencyId, creatorId, dialogId, AND: [relevantDialogEventWhere(), unprojectedDialogWhere()] },
+      orderBy: [{ ts: "asc" }, { id: "asc" }], take,
+    });
+  }
+
   let projected = 0;
   for (const row of rows || []) {
     if (isRelevantDialogEvent(row)) {
-      await applyTeamResponseProjection(row, db);
-      await applyTeamPendingProjection(row, db);
+      // Response projection was already committed before a pending repair cursor
+      // can be yielded. Do not replay that sibling projection on every bounded
+      // pending-repair page; a failed response projection never reaches this cursor.
+      if (!repairEventId) await applyTeamResponseProjection(row, db);
+      const repairProgress = repairEventId === clean(row?.id, 220) ? progressCursor?.pendingRepair?.cursor || null : null;
+      const pending = await applyTeamPendingProjection(row, db, { executeRepair: true, repairProgress, repairLimit: take });
+      if (pending?.complete === false) {
+        return {
+          ok: true, selected: Number(rows?.length || 0), projected, hasMore: true,
+          nextProgressCursor: { pendingRepair: { eventId: clean(row?.id, 220), cursor: pending?.progress || repairProgress || null } },
+        };
+      }
     }
     projected += await markDialogEventProjected(row, db);
   }
-  return { ok: true, selected: Number(rows?.length || 0), projected, hasMore: Number(rows?.length || 0) >= take };
+  // A resumed repair intentionally selects only its source event. Yield once after
+  // completion so the same DWI claim can continue any other unprojected events.
+  const resumed = Boolean(repairEventId);
+  return { ok: true, selected: Number(rows?.length || 0), projected, hasMore: resumed || Number(rows?.length || 0) >= take, nextProgressCursor: null };
 }
 
 async function projectCoverageResponseWorkItem({ agencyId, eventId, db = prisma, cursor = null, limit = 100 } = {}) {

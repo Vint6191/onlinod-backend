@@ -2,6 +2,7 @@
 
 const prisma = require("../prisma");
 const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
+const { canonicalReplyEventId } = require("./team-event-order-authority");
 
 const RESPONSE_DERIVATION_VERSION = "team_response_v2";
 const RESPONSE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -183,17 +184,16 @@ async function upsertDialogSession(row, db = prisma) {
   });
 }
 
-async function findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, replyLedgerId = null, db }) {
-  const stableId = clean(replyLedgerId, 220);
+async function findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, replyLedgerId = null, replyEventId = null, db }) {
+  const stableLedgerId = clean(replyLedgerId, 220);
+  // Reply-family order is always (sentAt, ledger id). telemetryEventId is only
+  // the bridge for cross-family incoming<->reply comparison. Mixing the two
+  // identities here can skip historical same-time replies with no bridge.
+  const sameInstantClause = stableLedgerId ? { sentAt: replyAt, id: { lt: stableLedgerId } } : null;
   const row = await db.teamSentMessageLedger.findFirst({
     where: {
-      agencyId,
-      creatorId,
-      dialogId,
-      source: { in: ["manual", "manual_chat"] },
-      OR: stableId
-        ? [{ sentAt: { lt: replyAt } }, { sentAt: replyAt, id: { lt: stableId } }]
-        : [{ sentAt: { lt: replyAt } }],
+      agencyId, creatorId, dialogId, source: { in: ["manual", "manual_chat"] },
+      OR: [{ sentAt: { lt: replyAt } }, ...(sameInstantClause ? [sameInstantClause] : [])],
       ...(replyMessageId ? { NOT: { messageId: replyMessageId } } : {}),
     },
     orderBy: [{ sentAt: "desc" }, { id: "desc" }],
@@ -201,8 +201,58 @@ async function findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt,
   return row || null;
 }
 
-async function findIncomingEpisode({ agencyId, creatorId, dialogId, fromExclusive, replyAt, db }) {
-  const floor = new Date(Math.max(replyAt.getTime() - RESPONSE_LOOKBACK_MS, fromExclusive?.getTime?.() || 0));
+async function findIncomingAtBoundary({ agencyId, creatorId, dialogId, at, db }) {
+  at = dateOrNull(at);
+  if (!at || !db?.teamActivityEvent?.findFirst) return null;
+  const row = await db.teamActivityEvent.findFirst({
+    where: { agencyId, creatorId, dialogId, eventKind: "FAN_MESSAGE_RECEIVED", ts: at },
+    orderBy: [{ id: "asc" }],
+  });
+  return dateOrNull(row?.ts)?.getTime?.() === at.getTime() ? row : null;
+}
+
+async function writeCrossFamilyOrderIncomplete({ reply, sample, db, reason = "CROSS_FAMILY_ORDER_UNPROVEN" }) {
+  const agencyId = clean(reply?.agencyId, 160); const creatorId = clean(reply?.creatorId, 160);
+  const memberId = clean(reply?.memberId, 160); const dialogId = clean(reply?.dialogId || reply?.fanId, 160);
+  const replyMessageId = clean(reply?.messageId, 220); const replyAt = dateOrNull(reply?.sentAt || reply?.ts);
+  if (!agencyId || !creatorId || !memberId || !dialogId || !replyMessageId || !replyAt) return null;
+  const existing = await db.teamResponseCase.findUnique?.({ where: { agencyId_creatorId_replyMessageId: { agencyId, creatorId, replyMessageId } } });
+  if (existing) {
+    return db.teamResponseCase.update({
+      where: { id: existing.id },
+      data: {
+        derivationVersion: RESPONSE_DERIVATION_VERSION,
+        projectionRevision: BigInt(existing.projectionRevision || 0) + 1n,
+        projectionState: "INCOMPLETE_HISTORY", repairReason: reason,
+        slaEligible: false, sla5Pass: null, sla15Pass: null,
+      },
+    });
+  }
+  const incomingAt = dateOrNull(sample?.ts) || replyAt;
+  return db.teamResponseCase.upsert({
+    where: { agencyId_creatorId_replyMessageId: { agencyId, creatorId, replyMessageId } },
+    create: {
+      agencyId, creatorId, memberId, dialogId, fanId: clean(reply?.fanId || sample?.fanId || dialogId, 160),
+      replyMessageId, firstIncomingMessageId: clean(sample?.messageId, 220), incomingCount: 1,
+      incomingAt, lastIncomingAt: incomingAt, replyAt, seenAt: null, coverageId: null, coverageStartedAt: null,
+      handoffFromMemberId: null, classification: "UNKNOWN", wallClockSeconds: Math.max(0, secondsBetween(incomingAt, replyAt) || 0),
+      coverageResponseSeconds: null, seenResponseSeconds: null, slaEligible: false, sla5Pass: null, sla15Pass: null,
+      derivationVersion: RESPONSE_DERIVATION_VERSION, projectionRevision: 1n,
+      projectionState: "INCOMPLETE_HISTORY", repairReason: reason,
+    },
+    update: {
+      derivationVersion: RESPONSE_DERIVATION_VERSION, projectionState: "INCOMPLETE_HISTORY", repairReason: reason,
+      slaEligible: false, sla5Pass: null, sla15Pass: null,
+    },
+  });
+}
+
+async function findIncomingEpisode({ agencyId, creatorId, dialogId, fromExclusive, fromExclusiveEventId = null, replyAt, replyEventId = null, db }) {
+  const lookbackFloor = new Date(Math.max(0, replyAt.getTime() - RESPONSE_LOOKBACK_MS));
+  const previousAt = dateOrNull(fromExclusive);
+  const floor = previousAt && previousAt > lookbackFloor ? previousAt : lookbackFloor;
+  const floorEventId = previousAt && floor.getTime() === previousAt.getTime() ? clean(fromExclusiveEventId, 220) : null;
+  const upperEventId = clean(replyEventId, 220);
   if (typeof db?.$queryRawUnsafe === "function") {
     const rows = await db.$queryRawUnsafe(`
       WITH dedup AS (
@@ -210,7 +260,9 @@ async function findIncomingEpisode({ agencyId, creatorId, dialogId, fromExclusiv
                e."id",e."messageId",e."localId",e."fanId",e."ts"
           FROM "TeamActivityEvent" e
          WHERE e."agencyId"=$1 AND e."creatorId"=$2 AND e."dialogId"=$3
-           AND e."eventKind"='FAN_MESSAGE_RECEIVED' AND e."ts">$4 AND e."ts"<=$5
+           AND e."eventKind"='FAN_MESSAGE_RECEIVED'
+           AND (e."ts">$4 OR (e."ts"=$4 AND $5::text IS NOT NULL AND e."id">$5))
+           AND (e."ts"<$6 OR (e."ts"=$6 AND $7::text IS NOT NULL AND e."id"<$7))
          ORDER BY COALESCE(NULLIF(e."messageId",''),NULLIF(e."localId",''),e."id"),e."ts" ASC,e."id" ASC
       ), ranked AS (
         SELECT d.*,row_number() OVER (ORDER BY d."ts",d."id") AS rn_first,
@@ -219,13 +271,22 @@ async function findIncomingEpisode({ agencyId, creatorId, dialogId, fromExclusiv
       )
       SELECT "id","messageId","localId","fanId","ts","total"
         FROM ranked WHERE rn_first=1 OR rn_last=1 ORDER BY "ts","id"`,
-      agencyId,creatorId,dialogId,floor,replyAt);
+      agencyId, creatorId, dialogId, floor, floorEventId, replyAt, upperEventId);
     const out = (rows || []).map((row) => ({ id: row.id, messageId: row.messageId, localId: row.localId, fanId: row.fanId, ts: row.ts }));
     out.episodeCount = Number(rows?.[0]?.total || 0);
     return out;
   }
+  const lowerOr = [{ ts: { gt: floor } }];
+  if (floorEventId) lowerOr.push({ ts: floor, id: { gt: floorEventId } });
+  const upperOr = [{ ts: { lt: replyAt } }];
+  if (upperEventId) upperOr.push({ ts: replyAt, id: { lt: upperEventId } });
   const rows = await db.teamActivityEvent.findMany({
-    where: { agencyId, creatorId, dialogId, eventKind: "FAN_MESSAGE_RECEIVED", ts: { gt: floor, lte: replyAt } },
+    where: {
+      agencyId, creatorId, dialogId, eventKind: "FAN_MESSAGE_RECEIVED",
+      ...(!floorEventId && !upperEventId
+        ? { ts: { gt: floor, lt: replyAt } }
+        : { AND: [{ OR: lowerOr }, { OR: upperOr }] }),
+    },
     orderBy: [{ ts: "asc" }, { id: "asc" }],
   });
   const out = []; const seen = new Set();
@@ -307,14 +368,29 @@ async function deriveResponseCaseForReplyUnlocked(reply, db = prisma, options = 
     return null;
   }
 
-  const previousReply = await findPreviousManualReply({ agencyId, creatorId, dialogId, replyAt, replyMessageId, replyLedgerId: clean(reply?.id, 220), db });
+  const replyEventId = canonicalReplyEventId(reply);
+  const previousReply = await findPreviousManualReply({
+    agencyId, creatorId, dialogId, replyAt, replyMessageId, replyLedgerId: clean(reply?.id, 220), replyEventId, db,
+  });
+  const previousReplyEventId = canonicalReplyEventId(previousReply);
+
+  // Timestamp alone cannot order two different canonical event families. Modern
+  // ledgers bridge to TeamActivityEvent through telemetryEventId. Historical rows
+  // without that bridge fail explicit INCOMPLETE_HISTORY if an equal-time incoming
+  // makes the boundary genuinely ambiguous.
+  if (!replyEventId) {
+    const sample = await findIncomingAtBoundary({ agencyId, creatorId, dialogId, at: replyAt, db });
+    if (sample) return writeCrossFamilyOrderIncomplete({ reply, sample, db });
+  }
+  if (previousReply?.sentAt && !previousReplyEventId) {
+    const sample = await findIncomingAtBoundary({ agencyId, creatorId, dialogId, at: previousReply.sentAt, db });
+    if (sample) return writeCrossFamilyOrderIncomplete({ reply, sample, db });
+  }
+
   const incoming = await findIncomingEpisode({
-    agencyId,
-    creatorId,
-    dialogId,
-    fromExclusive: previousReply?.sentAt || null,
-    replyAt,
-    db,
+    agencyId, creatorId, dialogId,
+    fromExclusive: previousReply?.sentAt || null, fromExclusiveEventId: previousReplyEventId,
+    replyAt, replyEventId, db,
   });
   if (!incoming.length) {
     if (db.teamResponseCase?.findUnique && db.teamResponseCase?.update) {
@@ -529,38 +605,42 @@ async function findReplyLedgerByEvent(row, db) {
 }
 
 async function recomputeNextReplyForObservation(row, db = prisma) {
-  const agencyId = clean(row?.agencyId, 160);
-  const creatorId = clean(row?.creatorId, 160);
-  const dialogId = clean(row?.dialogId || row?.fanId, 160);
-  const after = dateOrNull(row?.ts);
-  if (!agencyId || !creatorId || !dialogId || !after) return null;
+  const agencyId = clean(row?.agencyId, 160); const creatorId = clean(row?.creatorId, 160);
+  const dialogId = clean(row?.dialogId || row?.fanId, 160); const after = dateOrNull(row?.ts);
+  const eventId = clean(row?.id, 220);
+  if (!agencyId || !creatorId || !dialogId || !after || !eventId) return null;
+  const upper = new Date(after.getTime() + RESPONSE_LOOKBACK_MS);
+
+  // A historical reply without telemetryEventId at exactly the incoming timestamp
+  // is not comparable across families. Derive it explicitly as incomplete rather
+  // than silently skipping it in favor of a later reply.
+  const ambiguous = await db.teamSentMessageLedger.findFirst({
+    where: { agencyId, creatorId, dialogId, source: { in: ["manual", "manual_chat"] }, sentAt: after, telemetryEventId: null },
+    orderBy: [{ id: "asc" }],
+  });
+  if (ambiguous) return deriveResponseCaseForReply(ambiguous, db);
+
   const reply = await db.teamSentMessageLedger.findFirst({
     where: {
-      agencyId,
-      creatorId,
-      dialogId,
-      source: { in: ["manual", "manual_chat"] },
-      sentAt: { gte: after, lte: new Date(after.getTime() + RESPONSE_LOOKBACK_MS) },
+      agencyId, creatorId, dialogId, source: { in: ["manual", "manual_chat"] },
+      OR: [{ sentAt: { gt: after, lte: upper } }, { sentAt: after, telemetryEventId: { gt: eventId } }],
     },
-    orderBy: [{ sentAt: "asc" }, { id: "asc" }],
+    orderBy: [{ sentAt: "asc" }, { telemetryEventId: { sort: "asc", nulls: "last" } }, { id: "asc" }],
   });
   return reply ? deriveResponseCaseForReply(reply, db) : null;
 }
 
 async function recomputeSuccessorReply(reply, db = prisma) {
-  const agencyId = clean(reply?.agencyId,160);
-  const creatorId = clean(reply?.creatorId,160);
-  const dialogId = clean(reply?.dialogId || reply?.fanId,160);
-  const sentAt = dateOrNull(reply?.sentAt);
+  const agencyId = clean(reply?.agencyId,160); const creatorId = clean(reply?.creatorId,160);
+  const dialogId = clean(reply?.dialogId || reply?.fanId,160); const sentAt = dateOrNull(reply?.sentAt);
   if (!agencyId || !creatorId || !dialogId || !sentAt) return null;
   const stableId = clean(reply?.id, 220);
   const upper = new Date(sentAt.getTime() + RESPONSE_LOOKBACK_MS);
+  const sameInstant = stableId ? { sentAt, id: { gt: stableId } } : null;
   const successor = await db.teamSentMessageLedger.findFirst({
     where: {
       agencyId, creatorId, dialogId, source: { in: ["manual","manual_chat"] },
-      OR: stableId
-        ? [{ sentAt: { gt: sentAt, lte: upper } }, { sentAt, id: { gt: stableId } }]
-        : [{ sentAt: { gt: sentAt, lte: upper } }],
+      OR: [{ sentAt: { gt: sentAt, lte: upper } }, ...(sameInstant ? [sameInstant] : [])],
     },
     orderBy: [{ sentAt: "asc" }, { id: "asc" }],
   });

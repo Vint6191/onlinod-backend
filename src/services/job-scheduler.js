@@ -963,7 +963,7 @@ async function maybeRunPhase2HistoricalEnumeration({ db = prisma, now = new Date
       else if (result?.failed) report.failed += 1;
       else report.completed += 1;
     } catch (error) {
-      await markPhase2CoverageFailed({ db, workItem: item, ownerToken, agencyId: item.agencyId,
+      await markPhase2CoverageFailed({ db, workItem: item, ownerToken: claim.ownerToken, agencyId: item.agencyId,
         family: String(item.objectId || "").split(":")[0], generation: String(item.objectId || "").split(":").slice(1).join(":"), unresolvedCount: 1 }).catch(() => {});
       const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: new Date() }).catch(() => ({ lost: true }));
       if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
@@ -1325,10 +1325,15 @@ async function runTeamDialogProjectionSweep({ now = new Date(), db = prisma } = 
       if (String(item.objectType) !== "CreatorDialog") throw Object.assign(new Error("TEAM_DIALOG_WORK_TYPE_UNSUPPORTED"), { code: "TEAM_DIALOG_WORK_TYPE_UNSUPPORTED" });
       const identity = parseDialogWorkObjectId(item.objectId);
       if (!identity) throw Object.assign(new Error("TEAM_DIALOG_WORK_IDENTITY_INVALID"), { code: "TEAM_DIALOG_WORK_IDENTITY_INVALID" });
-      const result = await projectCreatorDialogWorkItem({ agencyId: String(item.agencyId), ...identity, db, limit: 100 });
+      const result = await projectCreatorDialogWorkItem({
+        agencyId: String(item.agencyId), ...identity, db, limit: 100, progressCursor: item?.progressCursor || null,
+      });
       report.projected += Number(result?.projected || 0);
       if (result?.hasMore) {
-        const yielded = await yieldDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, availableAt: now, fallbackNow: new Date() });
+        const yielded = await yieldDomainWorkClaim({
+          db, item, ownerToken: claim.ownerToken, availableAt: now,
+          progressCursor: result?.nextProgressCursor || null, fallbackNow: new Date(),
+        });
         if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
       } else {
         const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });

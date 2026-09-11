@@ -29,6 +29,14 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
     if (where.dialogId && row.dialogId !== where.dialogId) return false;
     if (where.memberId && row.memberId !== where.memberId) return false;
     if (where.messageId && row.messageId !== where.messageId) return false;
+    if (Object.prototype.hasOwnProperty.call(where, "telemetryEventId")) {
+      if (where.telemetryEventId === null && row.telemetryEventId != null) return false;
+      if (where.telemetryEventId && typeof where.telemetryEventId === "object") {
+        const id = String(row.telemetryEventId || "");
+        if (where.telemetryEventId.gt && !(id > String(where.telemetryEventId.gt))) return false;
+        if (where.telemetryEventId.lt && !(id < String(where.telemetryEventId.lt))) return false;
+      }
+    }
     if (where.id) {
       const id = String(row.id || row.messageId || "");
       if (where.id.gt && !(id > String(where.id.gt))) return false;
@@ -43,11 +51,20 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
     return true;
   }
 
-  function eventMatches(row, where) {
+  function eventMatches(row, where = {}) {
     for (const key of ["agencyId", "creatorId", "dialogId", "memberId", "eventKind"]) {
       if (where[key] !== undefined && row[key] !== where[key]) return false;
     }
-    if (where.ts && !matchesDate(row.ts, where.ts)) return false;
+    if (where.id && typeof where.id === "object") {
+      const id = String(row.id || "");
+      if (where.id.gt && !(id > String(where.id.gt))) return false;
+      if (where.id.lt && !(id < String(where.id.lt))) return false;
+    }
+    if (where.ts instanceof Date) {
+      if (new Date(row.ts).getTime() !== where.ts.getTime()) return false;
+    } else if (where.ts && !matchesDate(row.ts, where.ts)) return false;
+    if (Array.isArray(where.OR) && !where.OR.some((branch) => eventMatches(row, branch))) return false;
+    if (Array.isArray(where.AND) && !where.AND.every((branch) => eventMatches(row, branch))) return false;
     return true;
   }
 
@@ -86,16 +103,16 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
       },
     },
     teamActivityEvent: {
-      async findMany({ where, orderBy }) {
+      async findMany({ where, orderBy, take }) {
         const rows = events.filter((row) => eventMatches(row, where));
-        rows.sort((a, b) => new Date(a.ts) - new Date(b.ts));
-        if (orderBy?.ts === "desc") rows.reverse();
-        return rows;
+        rows.sort((a, b) => new Date(a.ts) - new Date(b.ts) || String(a.id || "").localeCompare(String(b.id || "")));
+        if (orderBy?.ts === "desc" || (Array.isArray(orderBy) && orderBy[0]?.ts === "desc")) rows.reverse();
+        return rows.slice(0, take || rows.length);
       },
       async findFirst({ where, orderBy }) {
         const rows = events.filter((row) => eventMatches(row, where));
-        rows.sort((a, b) => new Date(a.ts) - new Date(b.ts));
-        if (orderBy?.ts === "desc") rows.reverse();
+        rows.sort((a, b) => new Date(a.ts) - new Date(b.ts) || String(a.id || "").localeCompare(String(b.id || "")));
+        if (orderBy?.ts === "desc" || (Array.isArray(orderBy) && orderBy[0]?.ts === "desc")) rows.reverse();
         return rows[0] || null;
       },
     },
@@ -287,6 +304,44 @@ test("multiple fan messages after previous manual reply form one response episod
   assert.equal(result.incomingCount, 3);
   assert.equal(result.firstIncomingMessageId, "incoming-1");
   assert.equal(result.lastIncomingAt.toISOString(), "2026-08-12T09:01:00.000Z");
+});
+
+test("F54-03 incoming and manual reply at the same timestamp use one canonical telemetry-id order", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const r = reply({ id: "ledger-r", sentAt: date(at), telemetryEventId: "event-b" });
+  const before = incoming(at, { id: "event-a", messageId: "incoming-before" });
+  const after = incoming(at, { id: "event-z", messageId: "incoming-after" });
+
+  for (const physicalOrder of [[before, after], [after, before]]) {
+    const { db, responseCases } = makeDb({ ledgers: [r], events: physicalOrder });
+    const result = await service.deriveResponseCaseForReply(r, db);
+    assert.equal(result?.projectionState, "FULL");
+    assert.equal(result?.incomingCount, 1);
+    assert.equal(result?.firstIncomingMessageId, "incoming-before");
+    assert.equal(responseCases.length, 1);
+  }
+});
+
+test("F54-03 historical equal-time reply without telemetry identity is explicit INCOMPLETE_HISTORY", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const r = reply({ id: "legacy-ledger", sentAt: date(at), telemetryEventId: null });
+  const { db } = makeDb({ ledgers: [r], events: [incoming(at, { id: "event-a", messageId: "incoming-ambiguous" })] });
+  const result = await service.deriveResponseCaseForReply(r, db);
+  assert.equal(result?.projectionState, "INCOMPLETE_HISTORY");
+  assert.equal(result?.repairReason, "CROSS_FAMILY_ORDER_UNPROVEN");
+  assert.equal(result?.slaEligible, false);
+});
+
+test("F54-03 mixed historical/modern same-time replies keep ledger order and do not skip an ambiguous previous boundary", async () => {
+  const at = "2026-08-12T09:00:00.000Z";
+  const previous = reply({ id: "ledger-a", messageId: "reply-prev", sentAt: date(at), telemetryEventId: null });
+  const current = reply({ id: "ledger-z", messageId: "reply-current", sentAt: date(at), telemetryEventId: "event-z" });
+  const event = incoming(at, { id: "event-m", messageId: "incoming-between" });
+  const { db } = makeDb({ ledgers: [previous, current], events: [event] });
+  const result = await service.deriveResponseCaseForReply(current, db);
+  assert.equal(result?.projectionState, "INCOMPLETE_HISTORY");
+  assert.equal(result?.repairReason, "CROSS_FAMILY_ORDER_UNPROVEN");
+  assert.equal(result?.slaEligible, false);
 });
 
 test("dialog projection stores active dwell separately from wall-clock dwell", async () => {

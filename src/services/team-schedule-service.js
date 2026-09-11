@@ -334,8 +334,8 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
           : "TRANSITION",
     fresh: responseProjectionFresh,
     historicalReady: dialogGenerationStatus?.historicalReady === true && responseRepairStatus?.historicalReady === true,
-    dialogOutstandingCount: Number(dialogGenerationStatus?.live?.outstandingCount || 0),
-    responseOutstandingCount: Number(responseRepairStatus?.live?.outstandingCount || 0),
+    dialogOutstanding: Number(dialogGenerationStatus?.live?.outstandingCount || 0),
+    responseOutstanding: Number(responseRepairStatus?.live?.outstandingCount || 0),
     generation: "team_response_v2",
   };
   if (retentionPolicy?.ok !== true) throw error("TEAM_RETENTION_POLICY_UNAVAILABLE", "Team retention policy is unavailable", 503);

@@ -18,8 +18,14 @@ function productionClaimDb(now) {
     maintenanceLaneState: { async findMany() { return []; } },
     async $transaction(work) { return work(db); },
     async $queryRawUnsafe(statement) {
-      sql.push(String(statement));
-      if (String(statement).includes("clock_timestamp")) return [{ authorityNow: now }];
+      const text = String(statement);
+      sql.push(text);
+      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.includes('SELECT a."agencyId"') && text.includes('FROM "DomainWorkReadyAgency"')) {
+        const alreadyExcluded = text.includes('NOT IN');
+        return alreadyExcluded ? [] : [{ agencyId: "agency-1" }];
+      }
+      if (text.includes('SELECT 1 AS ok FROM "DomainWorkReadyAgency"')) return [{ ok: 1 }];
       return [];
     },
   };
@@ -34,18 +40,21 @@ test("F53-02 production claim discovers bounded current agency/partition heads b
     ownerToken: "actual53-worker", limit: 25, perAgencyQuantum: 5, perPartitionQuantum: 2, fallbackNow: now,
   });
   assert.deepEqual(result.items, []);
+  const agencyDiscovery = fx.sql.find((entry) => entry.includes('SELECT a."agencyId"') && entry.includes('FROM "DomainWorkReadyAgency"'));
+  const agencyLock = fx.sql.find((entry) => entry.includes('phase2_lock_domain_work_agency_head'));
   const claimSql = fx.sql.find((entry) => entry.includes('UPDATE "DomainWorkItem"'));
+  assert.ok(agencyDiscovery, "production broad claim must select one bounded agency tranche");
+  assert.ok(agencyLock, "selected agency authority must be locked before DWI mutation");
   assert.ok(claimSql, "production SQL claim path must execute");
-  assert.match(claimSql, /FROM "DomainWorkReadyAgency"/);
+  assert.match(agencyDiscovery, /ORDER BY a\."nextDueAt",a\."agencyId"[\s\S]*LIMIT 1/);
   assert.match(claimSql, /FROM "DomainWorkReadyPartition"/);
+  assert.match(claimSql, /d\."agencyId"=\$4/);
   assert.match(claimSql, /"isOutstanding"=TRUE/);
   assert.match(claimSql, /FOR UPDATE OF d SKIP LOCKED/);
+  assert.doesNotMatch(claimSql, /DomainWorkReadyAgency/, "one DB transaction must mutate DWI for only the selected agency");
   assert.doesNotMatch(claimSql, /row_number\s*\(/i, "claim must not rank the whole eligible universe before LIMIT");
-  const firstDwi = claimSql.indexOf('FROM "DomainWorkItem"');
-  const agencyLimit = claimSql.indexOf('LIMIT $4');
-  const partitionLimit = claimSql.indexOf('LIMIT $5');
-  assert.ok(agencyLimit >= 0 && partitionLimit >= 0 && agencyLimit < firstDwi && partitionLimit < firstDwi,
-    "agency and partition candidate bounds must be applied before touching DWI candidates");
+  assert.ok(fx.sql.indexOf(agencyDiscovery) < fx.sql.indexOf(agencyLock) && fx.sql.indexOf(agencyLock) < fx.sql.indexOf(claimSql),
+    "broad claim lock order must be bounded agency discovery -> agency authority -> partition/DWI claim");
 });
 
 test("F53-06 expired legacy owner does not block the new generation", async () => {

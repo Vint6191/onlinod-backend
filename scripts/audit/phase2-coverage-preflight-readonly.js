@@ -25,8 +25,8 @@ const LEGACY_SEED_IDENTITIES = Object.freeze([
   Object.freeze({ key: "phase2_coverage_seed_v2", generation: "phase2_coverage_seed_v2" }),
 ]);
 
-function envFlag(name) {
-  return String(process.env[name] || "").trim() === "1";
+function envFlag(name, env = process.env) {
+  return String(env?.[name] || "").trim() === "1";
 }
 
 function clean(value) {
@@ -42,6 +42,10 @@ function positiveInt(value, fallback, max = 500) {
 
 function identityKey(agencyId, family, generation) {
   return `${agencyId}\u001f${family}\u001f${generation}`;
+}
+
+function coveragePreflightPasses({ currentSeedComplete = false, manifestSeeded = false, convergenceComplete = false } = {}) {
+  return currentSeedComplete === true && manifestSeeded === true && convergenceComplete === true;
 }
 
 async function readLane(prisma, key) {
@@ -152,31 +156,32 @@ async function inspectAgencies(prisma, requestedAgencyId, sampleLimit) {
   };
 }
 
-async function main() {
-  if (!envFlag("ONLINOD_PHASE2_COVERAGE_PREFLIGHT")) {
+async function runCoveragePreflight({ prisma = null, env = process.env, stdout = process.stdout } = {}) {
+  if (!envFlag("ONLINOD_PHASE2_COVERAGE_PREFLIGHT", env)) {
     throw new Error("ONLINOD_PHASE2_COVERAGE_PREFLIGHT=1_REQUIRED");
   }
 
-  const prisma = require("../../src/prisma");
-  const requestedAgencyId = clean(process.env.ONLINOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID);
-  const sampleLimit = positiveInt(process.env.ONLINOD_PHASE2_COVERAGE_PREFLIGHT_SAMPLE_LIMIT, 50);
+  const ownsPrisma = !prisma;
+  const db = prisma || require("../../src/prisma");
+  const requestedAgencyId = clean(env?.ONLINOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID);
+  const sampleLimit = positiveInt(env?.ONLINOD_PHASE2_COVERAGE_PREFLIGHT_SAMPLE_LIMIT, 50);
 
   try {
     if (requestedAgencyId) {
-      const agency = await prisma.agency.findUnique({
+      const agency = await db.agency.findUnique({
         where: { id: requestedAgencyId },
         select: { id: true, deletedAt: true },
       });
       if (!agency || agency.deletedAt) throw new Error("ONLINOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_NOT_FOUND");
     }
 
-    const currentLane = await readLane(prisma, COVERAGE_SEED_LANE_KEY);
+    const currentLane = await readLane(db, COVERAGE_SEED_LANE_KEY);
     const legacyLanes = [];
     for (const identity of LEGACY_SEED_IDENTITIES) {
-      legacyLanes.push({ ...identity, row: await readLane(prisma, identity.key) });
+      legacyLanes.push({ ...identity, row: await readLane(db, identity.key) });
     }
 
-    const coverage = await inspectAgencies(prisma, requestedAgencyId, sampleLimit);
+    const coverage = await inspectAgencies(db, requestedAgencyId, sampleLimit);
     const legacyCompleted = legacyLanes.some(({ row }) => row?.completedAt != null);
     const expectedManifestFingerprint = coverageManifestFingerprint();
     const currentProgress = currentLane?.progress && typeof currentLane.progress === "object" && !Array.isArray(currentLane.progress)
@@ -202,7 +207,7 @@ async function main() {
     if (!convergenceComplete) reasons.push("CURRENT_MANIFEST_COVERAGE_NOT_CONVERGED");
 
     const report = {
-      ok: currentSeedComplete && manifestSeeded,
+      ok: coveragePreflightPasses({ currentSeedComplete, manifestSeeded, convergenceComplete }),
       mode: "READ_ONLY_MIGRATION_PREFLIGHT",
       manifest: {
         version: COVERAGE_MANIFEST_VERSION,
@@ -226,14 +231,23 @@ async function main() {
       generatedAt: new Date().toISOString(),
     };
 
-    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    stdout.write(`${JSON.stringify(report, null, 2)}\n`);
     if (!report.ok) process.exitCode = 2;
+    return report;
   } finally {
-    if (typeof prisma.$disconnect === "function") await prisma.$disconnect();
+    if (ownsPrisma && typeof db.$disconnect === "function") await db.$disconnect();
   }
 }
 
-main().catch((error) => {
-  console.error("[phase2-coverage-preflight-readonly]", error?.stack || error?.message || error);
-  process.exitCode = 1;
-});
+async function main() {
+  return runCoveragePreflight();
+}
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error("[phase2-coverage-preflight-readonly]", error?.stack || error?.message || error);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { coveragePreflightPasses, runCoveragePreflight };
