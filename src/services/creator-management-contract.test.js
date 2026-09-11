@@ -68,35 +68,39 @@ test("agency removal requires two consequences and only the username phrase", ()
   assert.match(source, /CREATOR_DELETE_PHRASE_REQUIRED/);
 });
 
-test("agency removal revokes live access but preserves creator history transactionally", () => {
+test("agency removal revokes current access through canonical Creator lifecycle without Agency-wide scans", () => {
   const source = read("routes/creators.js");
+  const lifecycle = read("services/creator-lifecycle-authority-service.js");
+  const scope = read("services/creator-access-scope-authority-service.js");
   const removal = source.slice(source.indexOf('router.delete("/:id"'), source.indexOf('router.post("/:id/complete-connection"'));
   assert.match(removal, /prisma\.\$transaction/);
-  assert.match(removal, /scanRowsById/);
-  assert.doesNotMatch(removal, /take:\s*10000/, "creator retirement cleanup must scan member/invitation assignments to exhaustion");
-  assert.match(removal, /removeCreatorFromAssignedCreators/);
-  assert.match(removal, /agencyMember\.update/);
-  assert.match(removal, /retireCreatorCryptoMaterialOnRemoval/);
-  assert.match(removal, /deviceCreatorBinding\.updateMany/);
-  assert.doesNotMatch(removal, /creatorConnectSession|CreatorConnectSession|accessSnapshot|AccessSnapshot/);
-  assert.match(removal, /status: \{ in: \["SCHEDULED", "CLAIMED", "FAILED"\] \}/);
-  assert.match(removal, /creatorAccount\.update/);
-  assert.match(removal, /status: "DISABLED", deletedAt: removedAt/);
+  assert.match(removal, /retireCreatorWithinTransaction/);
+  assert.doesNotMatch(removal, /scanRowsById|agencyMember\.findMany|agencyInvitation\.findMany/);
+  assert.match(lifecycle, /retireCreatorCurrentAccess/);
+  assert.match(scope, /UPDATE "AgencyMember"[\s\S]*phase2_remove_creator_from_access_scope/);
+  assert.match(scope, /UPDATE "AgencyInvitation"[\s\S]*phase2_remove_creator_from_access_scope/);
+  assert.match(lifecycle, /retireCreatorCryptoMaterialOnRemoval/);
+  assert.match(lifecycle, /deviceCreatorBinding\.updateMany/);
+  assert.match(lifecycle, /jobInstance\.updateMany/);
+  assert.match(lifecycle, /status: \{ in: \["SCHEDULED", "CLAIMED", "FAILED"\] \}/);
+  assert.match(lifecycle, /creatorAccount\.update/);
+  assert.match(lifecycle, /status: "DISABLED", deletedAt: retiredAt/);
   assert.doesNotMatch(removal, /creatorAccount\.delete|crmProfile\.(?:delete|deleteMany)|crmNote\.(?:delete|deleteMany)|dialogMessageLedger\.(?:delete|deleteMany)/);
   assert.match(removal, /creator\.removed_from_agency/);
   assert.match(removal, /messageHistoryPreserved: true/);
   assert.match(removal, /crmDataPreserved: true/);
-  assert.match(removal, /timeout: 120_000/);
-  assert.match(source, /cursor:\s*\{\s*id:\s*cursorId\s*\}/);
-  assert.match(source, /skip:\s*1/);
+  assert.match(removal, /timeout: 30_000/);
 });
 
-test("agency removal is retry-safe using the archived creator row", () => {
+test("agency removal retry re-enters the canonical idempotent lifecycle to converge partial legacy state", () => {
   const source = read("routes/creators.js");
+  const lifecycle = read("services/creator-lifecycle-authority-service.js");
   const removal = source.slice(source.indexOf('router.delete("/:id"'), source.indexOf('router.post("/:id/complete-connection"'));
-  assert.match(removal, /if \(existing\.deletedAt\)/);
-  assert.match(removal, /alreadyRemoved: true/);
+  assert.doesNotMatch(removal, /if \(existing\.deletedAt\)[\s\S]{0,300}return res\.json/);
+  assert.match(removal, /retireCreatorWithinTransaction/);
+  assert.match(removal, /alreadyRemoved: result\.alreadyRetired === true/);
   assert.match(removal, /historyPreserved: true/);
-  assert.doesNotMatch(removal, /\bpartition\b/);
+  assert.match(lifecycle, /alreadyRetired: Boolean\(current\.deletedAt\)/);
+  assert.match(lifecycle, /retireCreatorCryptoMaterialOnRemoval/);
   assert.doesNotMatch(removal, /auditLog\.findFirst|deletionPhraseFromAudit/);
 });

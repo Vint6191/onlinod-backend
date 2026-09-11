@@ -24,7 +24,7 @@ function productionDb(now) {
     async $queryRawUnsafe(statement) {
       const text = String(statement); sql.push(text);
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('FROM "Phase2WorkFamilyState" s')) {
+      if (text.includes('SELECT f."agencyId"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) {
         agencySelections += 1;
         return agencySelections === 1 ? [{ agencyId: "agency-1" }] : [];
       }
@@ -59,13 +59,13 @@ test("F55/INT7 Root A broad claim rotates Agency through bounded partition catal
     db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
     ownerToken: "broad-worker", limit: 25, perAgencyQuantum: 5, perPartitionQuantum: 2, fallbackNow: now,
   });
-  const discovery = fx.sql.find((entry) => entry.includes('FROM "Phase2WorkFamilyState" s'));
+  const discovery = fx.sql.find((entry) => entry.includes('SELECT f."agencyId"') && entry.includes('FROM "Phase2WorkBroadClaimPartitionState" f'));
   const claimSql = fx.sql.find((entry) => entry.includes('WITH selected_partitions AS MATERIALIZED'));
   assert.ok(discovery);
   assert.ok(claimSql);
-  assert.match(discovery, /"outstandingCount">0/);
   assert.match(discovery, /EXISTS \([\s\S]*FROM "DomainWorkItem" d/);
-  assert.match(discovery, /"lastBroadClaimedAt" ASC NULLS FIRST/);
+  assert.match(discovery, /"lastClaimedAt" ASC NULLS FIRST/);
+  assert.doesNotMatch(fx.sql.join("\n"), /FROM "Phase2WorkFamilyState" s/);
   assert.match(claimSql, /FROM "Phase2WorkBroadClaimPartitionState" f/);
   assert.match(claimSql, /AND EXISTS \([\s\S]*FROM "DomainWorkItem" d/);
   assert.match(claimSql, /ORDER BY f\."lastClaimedAt" ASC NULLS FIRST/);

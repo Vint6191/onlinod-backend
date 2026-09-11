@@ -9,7 +9,7 @@ const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: {} };
 const schedule = require("./team-schedule-service");
 
-function dbForRead() {
+function dbForRead({ shiftMemberScope = "all" } = {}) {
   const coverage = [
     {
       id: "cov-a", agencyId: "agency-1", creatorId: "creator-1", memberId: "member-a", coverageId: "coverage-a", deviceId: "dev-1",
@@ -36,8 +36,8 @@ function dbForRead() {
     teamCoverageSession: { async findMany() { return coverage; } },
     teamShift: { async findMany() { return [{
       id: "shift-1", agencyId: "agency-1", memberId: "member-a", startsAt: new Date("2026-08-12T09:00:00Z"), endsAt: new Date("2026-08-12T17:00:00Z"), timezone: "Europe/Kyiv", status: "PLANNED", note: "day shift", createdAt: new Date("2026-08-11T10:00:00Z"), updatedAt: new Date("2026-08-11T10:00:00Z"), cancelledAt: null,
-      member: { id: "member-a", displayName: "Marina", roleKey: "chatter", user: { name: "Marina", email: "m@example.test" } },
-      creators: [{ creatorId: "creator-1", creator: { id: "creator-1", displayName: "Vilgelmina", username: "vilgelmina", avatarUrl: null } }],
+      member: { id: "member-a", displayName: "Marina", roleKey: "chatter", assignedCreators: shiftMemberScope, user: { name: "Marina", email: "m@example.test" } },
+      creators: [{ creatorId: "creator-1", creatorRefId: "creator-1", creator: { id: "creator-1", displayName: "Vilgelmina", username: "vilgelmina", avatarUrl: null } }],
     }]; } },
     teamResponseCase: { async findMany() { return [
       { creatorId: "creator-1", memberId: "member-a", replyAt: new Date("2026-08-12T10:00:00Z"), slaEligible: true, sla15Pass: true, wallClockSeconds: 120 },
@@ -82,6 +82,19 @@ test("Schedule read model combines planned shifts with actual coverage without i
   assert.equal(staleCreator.activeNow, false);
   assert.equal(staleCreator.staleOpenSessions, 1);
   assert.equal(staleCreator.sessions[0].durationSeconds, 12 * 60 * 60, "stale open coverage is capped at the same 12h bound as response projection");
+});
+
+
+test("current planned Schedule drops a historical shift when its member no longer has access to the live Creator", async () => {
+  const payload = await schedule.buildTeamSchedule({
+    agencyId: "agency-1",
+    rangeKey: "7d",
+    now: new Date("2026-08-13T12:00:00Z"),
+    db: dbForRead({ shiftMemberScope: [] }),
+    canManageSchedule: true,
+  });
+  assert.equal(payload.shifts.length, 0);
+  assert.equal(payload.summary.plannedShifts, 0);
 });
 
 

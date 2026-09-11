@@ -291,18 +291,19 @@ test("MASS retirement blockers release unresolved historical write only after it
 });
 
 
-test("soft and hard admin removal preserve MASS future-effect authority until blockers are settled", () => {
+test("soft and hard creator removal preserve MASS future-effect authority through canonical lifecycle", () => {
   const root = path.resolve(__dirname, "..");
   const admin = fs.readFileSync(path.join(root, "routes/admin.js"), "utf8");
   const creators = fs.readFileSync(path.join(root, "routes/creators.js"), "utf8");
+  const lifecycle = fs.readFileSync(path.join(__dirname, "creator-lifecycle-authority-service.js"), "utf8");
   const agencyHard = admin.slice(admin.indexOf('if (hard) {', admin.indexOf('router.delete("/agencies/:id"')), admin.indexOf('const deletedAt = new Date();', admin.indexOf('router.delete("/agencies/:id"')));
   assert.match(agencyHard, /lockAgencyPipelineLifecycle/);
   assert.match(agencyHard, /assertAgencyCustomPipelineRetirable/);
   assert.match(agencyHard, /assertAgencyMassCampaignRetirable/);
-  const creatorDelete = admin.slice(admin.indexOf('const deletedAt = new Date();', admin.indexOf('router.delete("/creators/:id"')), admin.indexOf('// ═+\n// DEVICES', admin.indexOf('router.delete("/creators/:id"')));
-  assert.match(creatorDelete, /if \(hard\)[\s\S]*lockCreatorPipelineLifecycle[\s\S]*assertCreatorCustomPipelineRetirable[\s\S]*assertCreatorMassCampaignRetirable/);
-  assert.match(creatorDelete, /else \{[\s\S]*assertCreatorMassCampaignRetirable/);
-  assert.match(creators, /router\.delete\("\/:id"[\s\S]*assertCreatorMassCampaignRetirable/);
+  assert.match(admin, /router\.delete\("\/creators\/:id"[\s\S]*retireCreatorWithinTransaction\(\{/);
+  assert.match(creators, /router\.delete\("\/:id"[\s\S]*retireCreatorWithinTransaction\(\{/);
+  assert.match(lifecycle, /assertCreatorCustomPipelineRetirable\(\{/);
+  assert.match(lifecycle, /assertCreatorMassCampaignRetirable\(\{[\s\S]*requireFreshProviderSnapshot/);
   assert.match(admin, /if \(err\?\.status && err\?\.code\)[\s\S]*Agency removal is blocked/);
 });
 

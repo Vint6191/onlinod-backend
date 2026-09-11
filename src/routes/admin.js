@@ -63,16 +63,18 @@ const { signAccessToken } = require("../utils/tokens");
 const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 const { TIER_CATALOG } = require("../services/billing-catalog-service");
-const { retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
+const { retireCreatorWithinTransaction, publishCreatorRetirementControlEvents } = require("../services/creator-lifecycle-authority-service");
+const {
+  removeMember: removeTeamMember,
+  updateMemberAccessByPlatformAdmin,
+} = require("../services/team-administration-service");
 const {
   agencyCustomPipelineBlockers,
   assertAgencyCustomPipelineRetirable,
-  assertCreatorCustomPipelineRetirable,
   lockAgencyPipelineLifecycle,
   lockAgencyPipelineLifecycleExclusive,
-  lockCreatorPipelineLifecycle,
 } = require("../services/custom-content-pipeline-authority-service");
-const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
+const { assertAgencyMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const { publishDomainWork, WORK_CLASS: PHASE2_WORK_CLASS } = require("../services/domain-work-authority-service");
 
@@ -976,52 +978,14 @@ router.patch("/members/:memberId/role", async (req, res) => {
     });
     if (!snapshot) return res.status(404).json({ ok: false, code: "MEMBER_NOT_FOUND", error: "Member not found" });
 
-    const mutation = await prisma.$transaction(async (tx) => {
-      // Platform-admin role changes are canonical access mutations too. The
-      // Agency row is the stable serialization root shared with role config,
-      // Creator retirement and Customs management commits.
-      await lockAgencyPipelineLifecycle({ db: tx, agencyId: snapshot.agencyId, allowDeleted: true });
-      const before = await tx.agencyMember.findUnique({
-        where: { id: snapshot.id },
-        include: { user: true },
-      });
-      if (!before) {
-        const error = new Error("Member not found");
-        error.code = "MEMBER_NOT_FOUND";
-        error.status = 404;
-        throw error;
-      }
-
-      if (memberIsCanonicalOwner(before) && input.role !== "OWNER") {
-        const otherOwners = await tx.agencyMember.count({
-          where: {
-            agencyId: before.agencyId,
-            deletedAt: null,
-            deactivatedAt: null,
-            id: { not: before.id },
-            OR: [{ role: "OWNER" }, { roleKey: "owner" }],
-          },
-        });
-        if (otherOwners === 0) {
-          const error = new Error("Cannot demote the last OWNER");
-          error.code = "LAST_OWNER";
-          error.status = 409;
-          throw error;
-        }
-      }
-
-      const updated = await tx.agencyMember.update({
-        where: { id: before.id },
-        data: {
-          role: input.role,
-          roleKey: canonicalMemberRoleKeyFromLegacy(input.role),
-          accessEpoch: { increment: 1 },
-        },
-      });
-      return { before, updated };
-    }, { isolationLevel: "Serializable" });
-
-    publishAdminMemberAccessEpoch(req, mutation.updated);
+    const mutation = await updateMemberAccessByPlatformAdmin({
+      agencyId: snapshot.agencyId,
+      memberId: snapshot.id,
+      legacyRole: input.role,
+      roleKey: canonicalMemberRoleKeyFromLegacy(input.role),
+      actorDeviceId: req.auth?.deviceId || null,
+      db: prisma,
+    });
     await adminLog(req, {
       agencyId: mutation.before.agencyId,
       action: "admin.member_role_changed",
@@ -1050,20 +1014,22 @@ router.patch("/members/:memberId/permissions", async (req, res) => {
     const before = await prisma.agencyMember.findUnique({ where: { id: req.params.memberId } });
     if (!before) return res.status(404).json({ ok: false, code: "MEMBER_NOT_FOUND", error: "Member not found" });
 
-    const updated = await prisma.agencyMember.update({
-      where: { id: before.id },
-      data: { permissions: input.permissions, accessEpoch: { increment: 1 } },
+    const mutation = await updateMemberAccessByPlatformAdmin({
+      agencyId: before.agencyId,
+      memberId: before.id,
+      permissions: input.permissions,
+      actorDeviceId: req.auth?.deviceId || null,
+      db: prisma,
     });
-    publishAdminMemberAccessEpoch(req, updated);
 
     await adminLog(req, {
       agencyId: before.agencyId,
       action: "admin.member_permissions_changed",
       targetType: "member",
       targetId: before.id,
-      before, after: updated, reason: input.reason || null,
+      before: mutation.before, after: mutation.updated, reason: input.reason || null,
     });
-    return res.json({ ok: true, member: updated });
+    return res.json({ ok: true, member: mutation.updated });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     return res.status(500).json({ ok: false, code: "MEMBER_PERMS_FAILED", error: err?.message || "Failed" });
@@ -1072,49 +1038,30 @@ router.patch("/members/:memberId/permissions", async (req, res) => {
 
 router.delete("/members/:memberId", async (req, res) => {
   try {
-    const before = await prisma.agencyMember.findUnique({
-      where: { id: req.params.memberId },
-      include: { user: true },
-    });
+    const before = await prisma.agencyMember.findUnique({ where: { id: req.params.memberId }, include: { user: true } });
     if (!before) return res.status(404).json({ ok: false, code: "MEMBER_NOT_FOUND", error: "Member not found" });
 
-    // Last OWNER guard.
-    if (memberIsCanonicalOwner(before)) {
-      const otherOwners = await prisma.agencyMember.count({
-        where: {
-          agencyId: before.agencyId,
-          deletedAt: null,
-          deactivatedAt: null,
-          id: { not: before.id },
-          OR: [{ role: "OWNER" }, { roleKey: "owner" }],
-        },
-      });
-      if (otherOwners === 0) {
-        return res.status(409).json({ ok: false, code: "LAST_OWNER", error: "Cannot remove the last OWNER" });
-      }
-    }
-
-    const revokedCreatorIds = await adminMemberCreatorIds(before);
-    await prisma.agencyMember.delete({ where: { id: before.id } });
-
-    // Kill all refresh sessions for this user/agency pair.
-    await prisma.refreshSession.updateMany({
-      where: { userId: before.userId, agencyId: before.agencyId, revokedAt: null },
-      data: { revokedAt: new Date() },
+    const result = await removeTeamMember({
+      agencyId: before.agencyId,
+      memberId: before.id,
+      platformAdmin: true,
+      actorUserId: null,
+      actorDeviceId: req.auth?.deviceId || null,
+      db: prisma,
     });
-    publishAdminCreatorRevokes(req, before, revokedCreatorIds, "MEMBER_REMOVED");
-    publishAdminMemberAccessEpoch(req, before, Math.max(1, Number(before.accessEpoch || 1) + 1));
 
     await adminLog(req, {
       agencyId: before.agencyId,
       action: "admin.member_kicked",
       targetType: "member",
       targetId: before.id,
-      before, after: null,
+      before,
+      after: { id: before.id, deletedAt: result.deletedAt, accessEpoch: result.accessEpoch, historicalAttributionPreserved: true },
       reason: String(req.query.reason || req.body?.reason || "").slice(0, 500) || null,
     });
-    return res.json({ ok: true });
+    return res.json({ ok: true, softDeleted: true, historyPreserved: true });
   } catch (err) {
+    if (err?.status && err?.code) return res.status(Number(err.status)).json({ ok: false, code: String(err.code), error: err.message || "Member removal is blocked", ...(err.details ? { details: err.details } : {}) });
     return res.status(500).json({ ok: false, code: "MEMBER_DELETE_FAILED", error: err?.message || "Failed" });
   }
 });
@@ -1227,32 +1174,62 @@ const userPatchSchema = z.object({
 router.patch("/users/:id", async (req, res) => {
   try {
     const input = userPatchSchema.parse(req.body);
-    const before = await prisma.user.findUnique({ where: { id: req.params.id } });
-    if (!before) return res.status(404).json({ ok: false, code: "USER_NOT_FOUND", error: "User not found" });
+    const mutation = await prisma.$transaction(async (tx) => {
+      if (typeof tx?.$queryRawUnsafe === "function") {
+        const locked = await tx.$queryRawUnsafe(`SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE`, req.params.id);
+        if (!Array.isArray(locked) || !locked.length) return null;
+      }
+      const before = await tx.user.findUnique({ where: { id: req.params.id } });
+      if (!before) return null;
 
-    const data = {};
-    if (input.name !== undefined) data.name = input.name;
-    if (input.disabled === true)  { data.disabledAt = before.disabledAt || new Date(); data.disabledReason = input.disabledReason || null; }
-    if (input.disabled === false) { data.disabledAt = null; data.disabledReason = null; }
+      const data = {};
+      if (input.name !== undefined) data.name = input.name;
+      if (input.disabled === true)  { data.disabledAt = before.disabledAt || new Date(); data.disabledReason = input.disabledReason || null; }
+      if (input.disabled === false) { data.disabledAt = null; data.disabledReason = null; }
+      const updated = await tx.user.update({ where: { id: before.id }, data });
 
-    const updated = await prisma.user.update({ where: { id: before.id }, data });
+      const lifecycleChanged = input.disabled !== undefined && Boolean(before.disabledAt) !== Boolean(updated.disabledAt);
+      let memberEpochs = [];
+      if (lifecycleChanged) {
+        // Persistent User eligibility is part of current Team/access authority.
+        // Bump every live membership epoch in the same commit so connected clients
+        // cannot retain a stale actionable identity after disable/re-enable.
+        if (typeof tx?.$queryRawUnsafe === "function") {
+          memberEpochs = await tx.$queryRawUnsafe(`
+            UPDATE "AgencyMember"
+               SET "accessEpoch"="accessEpoch"+1, "updatedAt"=CURRENT_TIMESTAMP
+             WHERE "userId"=$1 AND "deletedAt" IS NULL
+             RETURNING "id","agencyId","userId","accessEpoch"
+          `, before.id);
+        } else {
+          const memberships = await tx.agencyMember.findMany({ where: { userId: before.id, deletedAt: null }, select: { id: true, agencyId: true, userId: true, accessEpoch: true } });
+          for (const member of memberships || []) {
+            const row = await tx.agencyMember.update({ where: { id: member.id }, data: { accessEpoch: { increment: 1 } }, select: { id: true, agencyId: true, userId: true, accessEpoch: true } });
+            memberEpochs.push(row);
+          }
+        }
+      }
 
-    if (input.disabled === true) {
-      // Kill all refresh sessions on disable.
-      await prisma.refreshSession.updateMany({
-        where: { userId: before.id, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-    }
+      if (input.disabled === true) {
+        await tx.refreshSession.updateMany({
+          where: { userId: before.id, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+      }
+      return { before, updated, memberEpochs, lifecycleChanged };
+    }, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 });
+
+    if (!mutation) return res.status(404).json({ ok: false, code: "USER_NOT_FOUND", error: "User not found" });
+    for (const member of mutation.memberEpochs || []) publishAdminMemberAccessEpoch(req, member, member.accessEpoch);
 
     await adminLog(req, {
       agencyId: null,
       action: "admin.user_updated",
       targetType: "user",
-      targetId: before.id,
-      before, after: updated, reason: input.reason || null,
+      targetId: mutation.before.id,
+      before: mutation.before, after: mutation.updated, reason: input.reason || null,
     });
-    return res.json({ ok: true, user: updated });
+    return res.json({ ok: true, user: mutation.updated });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     return res.status(500).json({ ok: false, code: "USER_UPDATE_FAILED", error: err?.message || "Failed" });
@@ -1651,67 +1628,23 @@ router.delete("/creators/:id", async (req, res) => {
   if (!before) return res.status(404).json({ ok: false, error: "Creator not found" });
 
   const deletedAt = new Date();
+  let lifecycleResult;
   try {
-    await prisma.$transaction(async (tx) => {
+    lifecycleResult = await prisma.$transaction(async (tx) => {
       await lockAgencyBillingMutation(tx, before.agencyId);
-    if (hard) {
-      // Actual53/F53-12: a hard Creator removal is a durable lifecycle, not one
-      // all-history transaction. First establish the DELETING barrier and revoke
-      // live crypto/session authority, then publish one restartable bounded cleanup
-      // work item in the SAME transaction. The worker rechecks UNKNOWN external
-      // effects before every chunk and performs the final identity delete only after
-      // current/proof/cascade roots reach zero.
-      await lockCreatorPipelineLifecycle({ db: tx, agencyId: before.agencyId, creatorId: before.id, allowDeleted: true });
-      await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
-      await assertCreatorMassCampaignRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id, requireFreshProviderSnapshot: !before.deletedAt });
-      if (!before.deletedAt) {
-        await retireCreatorCryptoMaterialOnRemoval({
-          db: tx,
-          agencyId: before.agencyId,
-          creatorId: before.id,
-          retiredAt: deletedAt,
-          actorUserId: null,
-          sourceRequestId: `admin-creator-hard-removal:${before.id}:${deletedAt.getTime()}`,
-          revokeReason: "ADMIN_CREATOR_HARD_DELETE_PENDING",
-        });
-        await tx.creatorAccount.update({ where: { id: before.id }, data: { deletedAt, status: "DISABLED" } });
-      }
-      await publishDomainWork({
-        db: tx,
-        agencyId: before.agencyId,
-        workClass: PHASE2_WORK_CLASS.DESTRUCTIVE_CREATOR_CLEANUP,
-        objectType: "Phase2CreatorDestructiveCleanup",
-        objectId: before.id,
-        partitionKey: before.id,
-        // Deliberately NULL: creator-scoped residual cleanup must not delete the
-        // cleanup authority that is performing that cleanup.
-        creatorId: null,
-        availableAt: deletedAt,
-      });
-    } else {
-      await lockCreatorPipelineLifecycle({ db: tx, agencyId: before.agencyId, creatorId: before.id, allowDeleted: true });
-      await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
-      await assertCreatorMassCampaignRetirable({ db: tx, agencyId: before.agencyId, creatorId: before.id });
-      await retireCreatorCryptoMaterialOnRemoval({
-        db: tx,
+      const retirement = await retireCreatorWithinTransaction({
+        tx,
         agencyId: before.agencyId,
         creatorId: before.id,
-        retiredAt: deletedAt,
         actorUserId: null,
-        sourceRequestId: `admin-creator-removal:${before.id}:${deletedAt.getTime()}`,
-        revokeReason: "ADMIN_CREATOR_REMOVED",
+        mode: hard ? "HARD" : "SOFT",
+        retiredAt: deletedAt,
+        sourceRequestId: `admin-creator-${hard ? "hard-" : ""}removal:${before.id}:${deletedAt.getTime()}`,
+        revokeReason: hard ? "ADMIN_CREATOR_HARD_DELETE_PENDING" : "ADMIN_CREATOR_REMOVED",
       });
-      await tx.creatorAccount.update({
-        where: { id: before.id },
-        data: { deletedAt, status: "DISABLED" },
-      });
-    }
-
-    // Creator deletion changes the set of billable product access immediately.
-    // Recompute the aggregate in the same transaction rather than waiting for
-    // the hourly scheduler or the old cached currentPeriodEnd.
       await syncAgencyBillingAggregate(tx, before.agencyId, deletedAt);
-    });
+      return retirement;
+    }, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 });
   } catch (error) {
     if (error?.status && error?.code) {
       return res.status(Number(error.status)).json({
@@ -1723,6 +1656,15 @@ router.delete("/creators/:id", async (req, res) => {
     }
     throw error;
   }
+
+  publishCreatorRetirementControlEvents({
+    agencyId: before.agencyId,
+    creatorId: before.id,
+    reason: hard ? "ADMIN_CREATOR_HARD_DELETE_PENDING" : "ADMIN_CREATOR_REMOVED",
+    memberEpochs: lifecycleResult?.memberEpochs || [],
+    sourceDeviceId: req.auth?.deviceId || null,
+    requestId: req.headers?.["x-request-id"] || null,
+  });
 
   await adminLog(req, {
     agencyId: before.agencyId,

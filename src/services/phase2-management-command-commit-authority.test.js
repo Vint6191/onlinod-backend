@@ -36,6 +36,10 @@ function baseDb({ livePermissions }) {
         if (!select) return { ...creator };
         const out = {}; for (const [key, enabled] of Object.entries(select)) if (enabled) out[key] = creator[key]; return out;
       },
+      async findMany({ where }) {
+        const ids = Array.isArray(where?.id?.in) ? where.id.in.map(String) : [];
+        return ids.includes(creator.id) && where.agencyId === creator.agencyId ? [{ id: creator.id }] : [];
+      },
       async update() { mutations += 1; return { ...creator }; },
       async updateMany() { mutations += 1; return { count: 1 }; },
     },

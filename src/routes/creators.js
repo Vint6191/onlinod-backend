@@ -10,9 +10,8 @@ const { creatorManagementRequired } = require("../middleware/creator-management-
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { audit } = require("../services/audit-service");
 const { scheduleInitialJobsForCreator } = require("../services/job-scheduler");
-const { agencyRemovalPhrase, removeCreatorFromAssignedCreators, retireCreatorCryptoMaterialOnRemoval } = require("../services/creator-agency-removal");
-const { assertCreatorCustomPipelineRetirable, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("../services/custom-content-pipeline-authority-service");
-const { assertCreatorMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
+const { agencyRemovalPhrase } = require("../services/creator-agency-removal");
+const { retireCreatorWithinTransaction, publishCreatorRetirementControlEvents } = require("../services/creator-lifecycle-authority-service");
 const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
 const { updateCreatorTelegramContact } = require("../services/creator-telegram-contact-authority-service");
 const { bumpAgencyAccessEpoch } = require("../services/access-epoch-service");
@@ -534,75 +533,20 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
       return res.status(400).json({ ok: false, code: "CREATOR_DELETE_PHRASE_REQUIRED", error: "Agency removal phrase does not match", expectedPhrase });
     }
 
-    if (existing.deletedAt) {
-      return res.json({
-        ok: true,
-        creatorId: existing.id,
-        removedFromMemberAssignments: 0,
-        historyPreserved: true,
-        alreadyRemoved: true,
-      });
-    }
-
     const removedAt = new Date();
     const result = await prisma.$transaction(async (tx) => {
-      // Global Custom lifecycle order is Agency -> Member/Creator -> provider rows.
-      // Creator removal also rewrites member creator scopes, so taking Creator first
-      // can deadlock a concurrent Custom management commit that already holds the
-      // member access fence and is waiting for this Creator row. Serialize at the
-      // Agency root before either side reaches member/creator rows.
-      await lockAgencyPipelineLifecycle({ db: tx, agencyId: req.auth.agencyId, allowDeleted: true });
-      await lockCreatorPipelineLifecycle({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id, allowDeleted: true });
-      await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id });
-      await assertCreatorMassCampaignRetirable({ db: tx, agencyId: req.auth.agencyId, creatorId: existing.id });
-      const members = await scanRowsById({
-        delegate: tx.agencyMember,
-        where: { agencyId: req.auth.agencyId, deletedAt: null },
-        select: { id: true, assignedCreators: true },
-      });
-      let removedFromMemberAssignments = 0;
-      for (const member of members) {
-        const next = removeCreatorFromAssignedCreators(member.assignedCreators, existing.id);
-        if (!next.changed) continue;
-        await tx.agencyMember.update({ where: { id: member.id }, data: { assignedCreators: next.value } });
-        removedFromMemberAssignments += 1;
-      }
-
-      const pendingInvitations = await scanRowsById({
-        delegate: tx.agencyInvitation,
-        where: { agencyId: req.auth.agencyId, claimedAt: null, revokedAt: null },
-        select: { id: true, assignedCreators: true },
-      });
-      let removedFromInvitationAssignments = 0;
-      for (const invitation of pendingInvitations) {
-        const next = removeCreatorFromAssignedCreators(invitation.assignedCreators, existing.id);
-        if (!next.changed) continue;
-        await tx.agencyInvitation.update({ where: { id: invitation.id }, data: { assignedCreators: next.value } });
-        removedFromInvitationAssignments += 1;
-      }
-
-      const cryptoRetirement = await retireCreatorCryptoMaterialOnRemoval({
-        db: tx,
+      const retirement = await retireCreatorWithinTransaction({
+        tx,
         agencyId: req.auth.agencyId,
         creatorId: existing.id,
-        retiredAt: removedAt,
         actorUserId: req.auth.userId,
+        mode: "SOFT",
+        retiredAt: removedAt,
         sourceRequestId: `creator-removal:${existing.id}:${removedAt.getTime()}`,
         revokeReason: "CREATOR_REMOVED_FROM_AGENCY",
+        managementActorMember: req.auth.membership,
+        managementPermissionKey: "creators.manage",
       });
-      await tx.deviceCreatorBinding.updateMany({ where: { creatorId: existing.id }, data: { status: "REVOKED" } });
-      await tx.jobInstance.updateMany({
-        where: { creatorId: existing.id, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
-        data: { status: "CANCELLED", completedAt: removedAt, leaseUntil: null, leaseTokenHash: null, claimedAt: null, claimedByDeviceId: null },
-      });
-
-      await tx.creatorAccount.update({
-        where: { id: existing.id },
-        data: { status: "DISABLED", deletedAt: removedAt },
-      });
-      // Removal changes both broad creator scope and explicit assignments. One
-      // monotonic epoch bump covers every live member after the transaction.
-      await bumpAgencyAccessEpoch({ db: tx, agencyId: req.auth.agencyId });
       await tx.auditLog.create({
         data: {
           agencyId: req.auth.agencyId,
@@ -613,20 +557,29 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
           metadata: {
             username: existing.username,
             remoteId: existing.remoteId,
-            removedFromMemberAssignments,
-            removedFromInvitationAssignments,
-            ...cryptoRetirement,
+            removedFromMemberAssignments: retirement.removedFromMemberAssignments,
+            removedFromInvitationAssignments: retirement.removedFromInvitationAssignments,
+            revokedCanonicalSessionCount: retirement.revokedCanonicalSessionCount,
+            retiredCanonicalSessionSecretCount: retirement.retiredCanonicalSessionSecretCount,
+            revokedCreatorKeyWrapCount: retirement.revokedCreatorKeyWrapCount,
+            retiredDedicatedProxyCount: retirement.retiredDedicatedProxyCount,
             historyPreserved: true,
             messageHistoryPreserved: true,
             crmDataPreserved: true,
           },
         },
       });
-      return { removedFromMemberAssignments, removedFromInvitationAssignments, ...cryptoRetirement };
-    }, { maxWait: 10_000, timeout: 120_000 });
+      return retirement;
+    }, { maxWait: 10_000, timeout: 30_000 });
 
-    publishCreatorRevoked(req, existing.id, "CREATOR_REMOVED_FROM_AGENCY");
-    await publishAgencyAccessEpochEvents(req);
+    publishCreatorRetirementControlEvents({
+      agencyId: req.auth.agencyId,
+      creatorId: existing.id,
+      reason: "CREATOR_REMOVED_FROM_AGENCY",
+      memberEpochs: result.memberEpochs,
+      sourceDeviceId: req.auth?.deviceId || null,
+      requestId: req.headers?.["x-request-id"] || null,
+    });
 
     return res.json({
       ok: true,
@@ -638,6 +591,7 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
       revokedCreatorKeyWrapCount: result.revokedCreatorKeyWrapCount,
       retiredDedicatedProxyCount: result.retiredDedicatedProxyCount,
       historyPreserved: true,
+      alreadyRemoved: result.alreadyRetired === true,
     });
   } catch (err) {
     if (err?.issues) {

@@ -10,7 +10,7 @@ const {
   cleanFunctions,
   ensureRoleExists,
   lockTeamRoleLifecycle,
-  roleKeyToLegacy,
+  materializeInvitationMemberWithinTransaction,
 } = require("../services/team-administration-service");
 const { validateAssignedCreators } = require("../services/team-access-control");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
@@ -129,53 +129,18 @@ router.post("/claim", authRequired, async (req, res) => {
       }
       const functions = cleanFunctions(currentInvite.functions);
 
-      const existing = await tx.agencyMember.findUnique({ where: { agencyId_userId: { agencyId: inv.agencyId, userId } } });
-      let member;
-      let restored = false;
-
-      if (existing && !existing.deletedAt) {
-        const error = new Error(existing.deactivatedAt
-          ? "Your membership is deactivated. A manager must reactivate it before you can sign in."
-          : "You are already a member of this agency");
-        error.status = 409;
-        error.code = existing.deactivatedAt ? "MEMBER_DEACTIVATED" : "ALREADY_MEMBER";
-        error.details = { memberId: existing.id };
-        throw error;
-      }
-
-      if (existing?.deletedAt) {
-        member = await tx.agencyMember.update({
-          where: { id: existing.id },
-          data: {
-            deletedAt: null,
-            deactivatedAt: null,
-            roleKey,
-            role: roleKeyToLegacy(roleKey),
-            displayName: currentInvite.displayName || existing.displayName || me.name || null,
-            assignedCreators: creatorScope.value,
-            accessEpoch: { increment: 1 },
-            commission: currentInvite.commission ?? existing.commission ?? { kind: "none" },
-            lastSeenLabel: "just rejoined",
-          },
-        });
-        restored = true;
-      } else {
-        const initials = String(currentInvite.displayName || me.name || me.email || "??").trim().slice(0, 2).toUpperCase();
-        member = await tx.agencyMember.create({
-          data: {
-            agencyId: currentInvite.agencyId,
-            userId,
-            role: roleKeyToLegacy(roleKey),
-            roleKey,
-            displayName: currentInvite.displayName || me.name || null,
-            initials,
-            tone: "amber",
-            commission: currentInvite.commission || { kind: "none" },
-            assignedCreators: creatorScope.value,
-            lastSeenLabel: "just joined",
-          },
-        });
-      }
+      const membership = await materializeInvitationMemberWithinTransaction({
+        tx,
+        agencyId: currentInvite.agencyId,
+        userId,
+        roleKey,
+        displayName: currentInvite.displayName || me.name || null,
+        initials: String(currentInvite.displayName || me.name || me.email || "??").trim().slice(0, 2).toUpperCase(),
+        commission: currentInvite.commission ?? { kind: "none" },
+        assignedCreators: creatorScope.value,
+      });
+      const member = membership.member;
+      const restored = membership.restored;
 
       await tx.teamMemberFunction.deleteMany({ where: { agencyId: currentInvite.agencyId, memberId: member.id } });
       if (functions.length) {

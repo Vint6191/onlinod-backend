@@ -33,6 +33,14 @@ function providerTestMatches(row, where = {}) {
 
 function markProviderBackfillsComplete(db, agencyId = "agency-1") {
   db.providerOperationalDebt = db.providerOperationalDebt || { findMany: async () => [], count: async () => 0 };
+  if (!db.domainWorkItem) {
+    const work = new Map();
+    db.domainWorkItem = {
+      async findUnique() { return null; },
+      async upsert({ create }) { work.set(create.id, { ...create }); return { ...create }; },
+      async update({ where, data }) { const current = work.get(where.id) || { id: where.id }; const next = { ...current, ...data }; work.set(where.id, next); return next; },
+    };
+  }
   db.phase2WorkCoverage = {
     async findUnique({ where }) {
       const key = where?.agencyId_family_generation;
@@ -269,8 +277,10 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
     runtimeClaimedByDeviceId: null, runtimeClaimToken: null, runtimeClaimUntil: null,
     runtimeLeaseUserId: null, runtimeLeaseMemberId: null, runtimeLeaseAccessEpoch: null, runtimeLeaseCreatorId: null,
   };
-  await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
-  assert.equal(stored, null);
+  const scheduled = await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
+  assert.equal(scheduled.retired, false);
+  assert.equal(scheduled.detachPending, true);
+  assert.equal(stored?.lifecycleState, "RETIRING");
 });
 
 test("Telegram account deletion is fail-closed while Customs delivery/thread/source authority still depends on it", async () => {
@@ -357,7 +367,8 @@ test("Telegram account deletion is fail-closed while Customs delivery/thread/sou
     } };
     db.telegramInboundEvent = { findFirst: async () => null };
     const result = await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
-    assert.equal(result.retired, true, "SALVAGE forbids NEW source relay, so a partial historical source must not retain Telegram credentials forever");
+    assert.equal(result.retired, false, "SALVAGE can release the account into bounded retirement without retaining it as ACTIVE");
+    assert.equal(result.detachPending, true);
   }
 
   {
@@ -389,7 +400,8 @@ test("Telegram account deletion is fail-closed while Customs delivery/thread/sou
       return null;
     } };
     const result = await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-1", db });
-    assert.equal(result.retired, true);
+    assert.equal(result.retired, false);
+  assert.equal(result.detachPending, true);
   }
 });
 
@@ -689,8 +701,10 @@ test("F43 force retirement is explicit, audited, and impossible while server blo
   await assert.rejects(() => service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "PC destroyed", acknowledgeLostObservations: false, db: clean }), (error) => error?.code === "SETTINGS_TELEGRAM_FORCE_RETIRE_ACK_REQUIRED");
   const result = await service.forceRetireLostTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-lost", reason: "PC destroyed", acknowledgeLostObservations: true, db: clean });
   assert.equal(result.forced, true);
-  assert.equal(clean._get().account, null);
-  assert.equal(clean._get().creators[0].telegramAccountId, null);
+  assert.equal(result.retired, false);
+  assert.equal(result.detachPending, true);
+  assert.equal(clean._get().account?.lifecycleState, "RETIRING");
+  assert.equal(clean._get().creators[0].telegramAccountId, "tg-lost");
   assert.equal(requiredAuditSeen, true);
 });
 
@@ -909,9 +923,10 @@ test("precommit TASK account binding is refreshable and does not pin a retiring 
   };
 
   const retired = await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-old", db, now: new Date("2026-09-06T15:00:00.000Z") });
-  assert.equal(retired.retired, true);
-  assert.equal(account, null, "stale precommit TASK binding must not pin the old account");
-  assert.equal(creators[0].telegramAccountId, null);
+  assert.equal(retired.retired, false);
+  assert.equal(retired.detachPending, true);
+  assert.equal(account?.lifecycleState, "RETIRING", "stale precommit TASK binding must allow bounded retirement to start");
+  assert.equal(creators[0].telegramAccountId, "tg-old", "creator detachment is delegated to bounded retirement work");
   assert.equal(intents[0].state, "PLANNED", "same durable TASK remains available for later provider rebind");
   assert.equal(intents[0].commitStartedAt, null);
 });
@@ -1011,10 +1026,9 @@ test("cancelled historical no-TASK revision blocks Telegram account retirement u
   // With exact cancellation follow-up planned, this specific debt no longer blocks. We only call
   // the internal lifecycle again far enough to prove the blocker changed; delete is intentionally
   // still unavailable in this narrow fixture, so the expected failure must no longer be IN_USE.
-  await assert.rejects(
-    () => service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-old", db }),
-    (error) => error?.code !== "SETTINGS_TELEGRAM_ACCOUNT_IN_USE",
-  );
+  const scheduled = await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-old", db });
+  assert.equal(scheduled.retired, false);
+  assert.equal(scheduled.detachPending, true);
 });
 
 test("production retirement retains last revision-capable provider through V1/V2 review and releases it after APPROVED", async () => {
@@ -1108,8 +1122,9 @@ test("production retirement retains last revision-capable provider through V1/V2
     const latest = v2 || v1;
     latest.reviewStatus = "APPROVED";
     const retired = await service.removeTelegramMtprotoAccount({ agencyId: "agency-1", member: owner, accountId: "tg-last", db, now: new Date("2026-09-08T00:21:00Z") });
-    assert.equal(retired.retired, true, `${version.toUpperCase()} APPROVED should release future-revision retention when no other debt exists`);
-    assert.equal(accounts.length, 0);
+    assert.equal(retired.retired, false, `${version.toUpperCase()} APPROVED should enter bounded retirement when no other debt exists`);
+    assert.equal(retired.detachPending, true);
+    assert.equal(accounts[0]?.lifecycleState, "RETIRING");
   };
 
   await runScenario({ version: "v1" });

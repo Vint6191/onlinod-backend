@@ -144,10 +144,12 @@ test("creator crypto retirement is idempotent and does not keep incrementing an 
   assert.equal(state.proxies.find((row) => row.id === "proxy-dedicated").version, 8);
 });
 
-test("both agency and platform-admin soft-delete paths call crypto retirement inside their creator delete transaction", () => {
+test("both agency and platform-admin soft-delete paths share canonical crypto retirement inside creator lifecycle", () => {
   const creators = fs.readFileSync(path.join(__dirname, "..", "routes", "creators.js"), "utf8");
   const admin = fs.readFileSync(path.join(__dirname, "..", "routes", "admin.js"), "utf8");
-  assert.match(creators, /retireCreatorCryptoMaterialOnRemoval\(\{[\s\S]*?db: tx,[\s\S]*?creatorId: existing\.id,[\s\S]*?retiredAt: removedAt/);
-  assert.match(admin, /retireCreatorCryptoMaterialOnRemoval\(\{[\s\S]*?db: tx,[\s\S]*?creatorId: before\.id,[\s\S]*?retiredAt: deletedAt/);
+  const lifecycle = fs.readFileSync(path.join(__dirname, "creator-lifecycle-authority-service.js"), "utf8");
+  assert.match(creators, /retireCreatorWithinTransaction\(\{/);
+  assert.match(admin, /retireCreatorWithinTransaction\(\{/);
+  assert.match(lifecycle, /retireCreatorCryptoMaterialOnRemoval\(\{[\s\S]*?db: tx,[\s\S]*?creatorId: creator,[\s\S]*?retiredAt/);
   assert.doesNotMatch(creators, /accessSnapshot|AccessSnapshot|creatorConnectSession|CreatorConnectSession/);
 });

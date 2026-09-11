@@ -27,6 +27,19 @@ function normalizedScope(value) {
   if (!Array.isArray(value)) return null;
   return Array.from(new Set(value.map(String).map((v) => v.trim()).filter(Boolean)));
 }
+function memberAllowsCreator(member, creatorId) {
+  const id = String(creatorId || "").trim();
+  if (!member || !id) return false;
+  const value = member.assignedCreators;
+  if (value === null || value === undefined || value === "all") return true;
+  if (Array.isArray(value)) return value.map(String).includes(id);
+  if (typeof value === "object") {
+    if (value.all === true || String(value.mode || "").toLowerCase() === "all") return true;
+    const ids = Array.isArray(value.creatorIds) ? value.creatorIds : (Array.isArray(value.ids) ? value.ids : []);
+    return ids.map(String).includes(id);
+  }
+  return false;
+}
 function supportsScheduleScaleRead(db) {
   return typeof db?.$queryRawUnsafe === "function";
 }
@@ -42,6 +55,9 @@ function coverageBaseSql() {
            (c."endedAt" IS NULL AND $4::timestamp >= c."startedAt" AND $4::timestamp <= c."startedAt" + INTERVAL '12 hours') AS active_now,
            (c."endedAt" IS NULL AND $4::timestamp > c."startedAt" + INTERVAL '12 hours') AS stale_open
       FROM "TeamCoverageSession" c
+      JOIN "CreatorAccount" ca ON ca."id"=c."creatorId" AND ca."agencyId"=c."agencyId" AND ca."deletedAt" IS NULL
+      JOIN "AgencyMember" am ON am."id"=c."memberId" AND am."agencyId"=c."agencyId" AND am."deletedAt" IS NULL AND am."deactivatedAt" IS NULL
+      JOIN "User" au ON au."id"=am."userId" AND au."disabledAt" IS NULL
      WHERE c."agencyId"=$1
        AND ($5::text[] IS NULL OR c."creatorId" = ANY($5::text[]))
        AND c."startedAt" <= $3::timestamp
@@ -125,14 +141,20 @@ async function loadHandoffDetails({ db, agencyId, range, authorityNow, allowedCr
 async function loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, currentResponseGeneration = false }) {
   if (!shiftIds.length) return [];
   const sql = `WITH selected AS (
-      SELECT s."id",s."memberId",s."startsAt",s."endsAt" FROM "TeamShift" s WHERE s."agencyId"=$1 AND s."id"=ANY($2::text[])
+      SELECT s."id",s."memberId",s."startsAt",s."endsAt",m."assignedCreators" AS member_scope
+        FROM "TeamShift" s
+        JOIN "AgencyMember" m ON m."id"=s."memberId" AND m."agencyId"=s."agencyId" AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
+        JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
+       WHERE s."agencyId"=$1 AND s."id"=ANY($2::text[])
     ), cbase AS (
       SELECT s."id" AS shift_id,c."id" AS session_id,
              GREATEST(c."startedAt",s."startsAt") AS seg_start,
              LEAST(CASE WHEN c."endedAt" IS NOT NULL THEN c."endedAt" ELSE LEAST($3::timestamp,c."startedAt"+INTERVAL '12 hours') END,s."endsAt") AS seg_end
         FROM selected s JOIN "TeamShiftCreator" sc ON sc."shiftId"=s."id"
-        JOIN "TeamCoverageSession" c ON c."agencyId"=$1 AND c."creatorId"=sc."creatorId" AND c."memberId"=s."memberId"
-       WHERE c."startedAt"<s."endsAt" AND CASE WHEN c."endedAt" IS NOT NULL THEN c."endedAt" ELSE LEAST($3::timestamp,c."startedAt"+INTERVAL '12 hours') END>s."startsAt"
+        JOIN "CreatorAccount" ca ON ca."id"=sc."creatorRefId" AND ca."agencyId"=$1 AND ca."deletedAt" IS NULL
+        JOIN "TeamCoverageSession" c ON c."agencyId"=$1 AND c."creatorId"=sc."creatorRefId" AND sc."creatorRefId" IS NOT NULL AND c."memberId"=s."memberId"
+       WHERE "phase2_scope_allows_creator"(s.member_scope,sc."creatorRefId")
+         AND c."startedAt"<s."endsAt" AND CASE WHEN c."endedAt" IS NOT NULL THEN c."endedAt" ELSE LEAST($3::timestamp,c."startedAt"+INTERVAL '12 hours') END>s."startsAt"
     ), valid AS (SELECT * FROM cbase WHERE seg_end>seg_start), ordered AS (
       SELECT v.*,MAX(seg_end) OVER(PARTITION BY shift_id ORDER BY seg_start,seg_end,session_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_max_end FROM valid v
     ), marked AS (SELECT o.*,CASE WHEN prev_max_end IS NULL OR seg_start>prev_max_end THEN 1 ELSE 0 END AS new_group FROM ordered o),
@@ -147,7 +169,9 @@ async function loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, currentR
              COUNT(*) FILTER(WHERE r."slaEligible"=TRUE AND r."sla15Pass"=TRUE AND COALESCE(r."projectionState",'FULL')='FULL')::bigint AS sla15_passes,
              COUNT(*) FILTER(WHERE COALESCE(r."projectionState",'FULL')<>'FULL')::bigint AS incomplete_responses
         FROM selected s JOIN "TeamShiftCreator" sc ON sc."shiftId"=s."id"
-        JOIN "TeamResponseCaseCurrent" r ON r."agencyId"=$1 AND r."creatorId"=sc."creatorId" AND r."memberId"=s."memberId" AND r."replyAt">=s."startsAt" AND r."replyAt"<=s."endsAt"
+        JOIN "CreatorAccount" ca ON ca."id"=sc."creatorRefId" AND ca."agencyId"=$1 AND ca."deletedAt" IS NULL
+        JOIN "TeamResponseCaseCurrent" r ON r."agencyId"=$1 AND r."creatorId"=sc."creatorRefId" AND sc."creatorRefId" IS NOT NULL AND r."memberId"=s."memberId" AND r."replyAt">=s."startsAt" AND r."replyAt"<=s."endsAt"
+         AND "phase2_scope_allows_creator"(s.member_scope,sc."creatorRefId")
          AND ($4::boolean=FALSE OR (r."derivationVersion"='team_response_v2' AND r."projectionState" IN ('FULL','INCOMPLETE_HISTORY')))
        GROUP BY s."id"
     )
@@ -161,16 +185,26 @@ async function loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, currentR
 async function loadPlanSummary({ db, agencyId, range, authorityNow, allowedCreatorIds }) {
   const scope = normalizedScope(allowedCreatorIds);
   const sql = `WITH selected AS (
-      SELECT s."id",s."status",s."startsAt",s."endsAt" FROM "TeamShift" s
+      SELECT s."id",s."memberId",s."status",s."startsAt",s."endsAt",m."assignedCreators" AS member_scope FROM "TeamShift" s
+       JOIN "AgencyMember" m ON m."id"=s."memberId" AND m."agencyId"=s."agencyId" AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
+       JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
        WHERE s."agencyId"=$1 AND s."startsAt"<=$3::timestamp AND ($2::timestamp IS NULL OR s."endsAt">=$2::timestamp)
-         AND ($5::text[] IS NULL OR EXISTS(SELECT 1 FROM "TeamShiftCreator" sc0 WHERE sc0."shiftId"=s."id" AND sc0."creatorId"=ANY($5::text[])))
+         AND EXISTS(
+           SELECT 1 FROM "TeamShiftCreator" sc0
+            JOIN "CreatorAccount" ca0 ON ca0."id"=sc0."creatorRefId" AND ca0."agencyId"=s."agencyId" AND ca0."deletedAt" IS NULL
+            WHERE sc0."shiftId"=s."id" AND sc0."creatorRefId" IS NOT NULL
+              AND "phase2_scope_allows_creator"(m."assignedCreators",sc0."creatorRefId")
+              AND ($5::text[] IS NULL OR sc0."creatorRefId"=ANY($5::text[]))
+         )
     ), cbase AS (
       SELECT s."id" AS shift_id,GREATEST(c."startedAt",s."startsAt") AS seg_start,
              LEAST(CASE WHEN c."endedAt" IS NOT NULL THEN c."endedAt" ELSE LEAST($4::timestamp,c."startedAt"+INTERVAL '12 hours') END,s."endsAt") AS seg_end
         FROM selected s JOIN "TeamShiftCreator" sc ON sc."shiftId"=s."id"
-        JOIN "TeamCoverageSession" c ON c."agencyId"=$1 AND c."creatorId"=sc."creatorId"
+        JOIN "CreatorAccount" ca ON ca."id"=sc."creatorRefId" AND ca."agencyId"=$1 AND ca."deletedAt" IS NULL
+        JOIN "TeamCoverageSession" c ON c."agencyId"=$1 AND c."creatorId"=sc."creatorRefId" AND sc."creatorRefId" IS NOT NULL
         JOIN "TeamShift" sx ON sx."id"=s."id" AND c."memberId"=sx."memberId"
-       WHERE c."startedAt"<s."endsAt" AND CASE WHEN c."endedAt" IS NOT NULL THEN c."endedAt" ELSE LEAST($4::timestamp,c."startedAt"+INTERVAL '12 hours') END>s."startsAt"
+       WHERE "phase2_scope_allows_creator"(s.member_scope,sc."creatorRefId")
+         AND c."startedAt"<s."endsAt" AND CASE WHEN c."endedAt" IS NOT NULL THEN c."endedAt" ELSE LEAST($4::timestamp,c."startedAt"+INTERVAL '12 hours') END>s."startsAt"
     ), valid AS(SELECT * FROM cbase WHERE seg_end>seg_start), ordered AS(
       SELECT v.*,MAX(seg_end) OVER(PARTITION BY shift_id ORDER BY seg_start,seg_end ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_max_end FROM valid v
     ), marked AS(SELECT o.*,CASE WHEN prev_max_end IS NULL OR seg_start>prev_max_end THEN 1 ELSE 0 END AS new_group FROM ordered o),
@@ -192,23 +226,47 @@ async function loadPlanSummary({ db, agencyId, range, authorityNow, allowedCreat
 }
 
 async function loadVisibleShifts({ db, agencyId, queryRange, allowedCreatorIds, includeCreatorWhere }) {
-  const where = queryRange.startAt
-    ? { startsAt: { lte: queryRange.endAt }, endsAt: { gte: queryRange.startAt } }
-    : { startsAt: { lte: queryRange.endAt } };
-  if (Array.isArray(allowedCreatorIds)) {
-    const ids = normalizedScope(allowedCreatorIds) || [];
-    where.creators = { some: { creatorId: { in: ids.length ? ids : ["__none__"] } } };
-  }
-  const rows = await db.teamShift.findMany({
-    where: { agencyId, ...where },
+  const scope = normalizedScope(allowedCreatorIds);
+  const startAt = queryRange.startAt ? new Date(queryRange.startAt) : null;
+  const endAt = new Date(queryRange.endAt);
+  const ids = await query(db, `
+    SELECT s."id" AS visible_shift_id
+      FROM "TeamShift" s
+      JOIN "AgencyMember" m
+        ON m."id"=s."memberId" AND m."agencyId"=s."agencyId"
+       AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
+      JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
+     WHERE s."agencyId"=$1
+       AND s."startsAt"<=$3::timestamp
+       AND ($2::timestamp IS NULL OR s."endsAt">=$2::timestamp)
+       AND EXISTS (
+         SELECT 1
+           FROM "TeamShiftCreator" sc
+           JOIN "CreatorAccount" ca
+             ON ca."id"=sc."creatorRefId" AND ca."agencyId"=s."agencyId" AND ca."deletedAt" IS NULL
+          WHERE sc."shiftId"=s."id"
+            AND sc."creatorRefId" IS NOT NULL
+            AND "phase2_scope_allows_creator"(m."assignedCreators",sc."creatorRefId")
+            AND ($4::text[] IS NULL OR sc."creatorRefId"=ANY($4::text[]))
+       )
+     ORDER BY s."startsAt",s."id"
+     LIMIT ${SHIFT_DETAIL_LIMIT + 1}`, [String(agencyId), startAt, endAt, scope]);
+  const orderedIds = (ids || []).map((row) => String(row.visible_shift_id || row.visibleShiftId || row.id || "")).filter(Boolean);
+  const selectedIds = orderedIds.slice(0, SHIFT_DETAIL_LIMIT);
+  if (!selectedIds.length) return { rows: [], complete: orderedIds.length <= SHIFT_DETAIL_LIMIT, limit: SHIFT_DETAIL_LIMIT };
+  const loaded = await db.teamShift.findMany({
+    where: { agencyId, id: { in: selectedIds } },
     include: {
-      member: { select: { id: true, displayName: true, roleKey: true, user: { select: { name: true, email: true } } } },
+      member: { select: { id: true, displayName: true, roleKey: true, assignedCreators: true, user: { select: { name: true, email: true } } } },
       creators: includeCreatorWhere,
     },
-    orderBy: [{ startsAt: "asc" }, { id: "asc" }],
-    take: SHIFT_DETAIL_LIMIT + 1,
   });
-  return { rows: rows.slice(0, SHIFT_DETAIL_LIMIT), complete: rows.length <= SHIFT_DETAIL_LIMIT, limit: SHIFT_DETAIL_LIMIT };
+  const byId = new Map((loaded || []).map((row) => [String(row.id), row]));
+  const rows = selectedIds.map((id) => byId.get(id)).filter(Boolean).map((row) => ({
+    ...row,
+    creators: (row.creators || []).filter((link) => memberAllowsCreator(row.member, link.creatorRefId || link.creator?.id)),
+  })).filter((row) => row.creators.length > 0);
+  return { rows, complete: orderedIds.length <= SHIFT_DETAIL_LIMIT, limit: SHIFT_DETAIL_LIMIT };
 }
 
 function memberNameFromContext(context, memberId) {
@@ -242,7 +300,10 @@ async function buildScheduleScaleRead({ db, agencyId, queryRange, authorityNow, 
   const nowMs = new Date(authorityNow).getTime();
   const shifts = visible.rows.map((row) => {
     const m = metrics.get(String(row.id)) || {};
-    const creatorLinks = (row.creators || []).map((link) => creatorFromContext(context, link.creatorId || link.creator?.id)).filter((x) => x.id);
+    const creatorLinks = (row.creators || [])
+      .filter((link) => memberAllowsCreator(row.member, link.creatorRefId || link.creator?.id))
+      .map((link) => creatorFromContext(context, link.creatorRefId || link.creator?.id))
+      .filter((x) => x.id);
     const plannedSeconds = Math.max(0, Math.round((new Date(row.endsAt)-new Date(row.startsAt))/1000));
     const actualPresenceSeconds = Math.max(0, Math.round(num(m.actual_seconds)));
     const firstActualAt = iso(m.first_actual); const lastActualAt = iso(m.last_actual);

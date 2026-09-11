@@ -4,6 +4,7 @@ const prisma = require("../prisma");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { phase2CoverageStatus, FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION } = require("./phase2-work-coverage-authority-service");
+const { normalizeAssignedCreators } = require("./team-access-control");
 
 const CURRENT_PENDING_DERIVATION_VERSION = "team_pending_v2";
 
@@ -278,6 +279,103 @@ async function summarizePendingWhere({ where, now = new Date(), db = prisma, fal
   };
 }
 
+
+function memberHasCurrentCreatorAccess(member, creatorId) {
+  if (!member || member.deletedAt || member.deactivatedAt || member.user?.disabledAt) return false;
+  const normalized = normalizeAssignedCreators(member.assignedCreators);
+  if (normalized.mode === "all") return true;
+  return normalized.creatorIds.map(String).includes(String(creatorId || ""));
+}
+
+async function operationalOwnerMapForRows({ agencyId, rows, db = prisma }) {
+  const ownerIds = Array.from(new Set((rows || []).map((row) => clean(row?.ownerMemberId, 160)).filter(Boolean)));
+  if (!ownerIds.length || !db.agencyMember?.findMany) return new Map();
+  const members = await db.agencyMember.findMany({
+    where: {
+      agencyId,
+      id: { in: ownerIds },
+      deletedAt: null,
+      deactivatedAt: null,
+      user: { is: { disabledAt: null } },
+    },
+    select: { id: true, assignedCreators: true, deletedAt: true, deactivatedAt: true, user: { select: { disabledAt: true } } },
+  });
+  const membersById = new Map((members || []).map((member) => [String(member.id), member]));
+  const result = new Map();
+  for (const row of rows || []) {
+    const ownerId = clean(row?.ownerMemberId, 160);
+    if (!ownerId) continue;
+    const member = membersById.get(ownerId);
+    if (memberHasCurrentCreatorAccess(member, row?.creatorId)) result.set(String(row.id), ownerId);
+  }
+  return result;
+}
+
+async function summarizeOperationalPending({ agencyId, allowedCreatorIds = null, memberId = null, ownership = "all", now = new Date(), db = prisma, fallbackRows = [] } = {}) {
+  if (typeof db?.$queryRawUnsafe !== "function") return summarizePendingRows(fallbackRows, { now });
+  const creatorIds = Array.isArray(allowedCreatorIds)
+    ? Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)))
+    : null;
+  const targetMemberId = clean(memberId, 160);
+  const unassignedOnly = !targetMemberId && String(ownership || "all").toLowerCase() === "unassigned";
+  const nowDate = now instanceof Date ? now : new Date(now || Date.now());
+  try {
+    const result = await db.$queryRawUnsafe(`
+      WITH current_pending AS (
+        SELECT p.*,
+               CASE WHEN m."id" IS NOT NULL
+                          AND u."id" IS NOT NULL
+                          AND "phase2_scope_allows_creator"(m."assignedCreators",p."creatorId")
+                    THEN p."ownerMemberId" ELSE NULL END AS operational_owner
+          FROM "TeamPendingDialogStateCurrent" p
+          JOIN "CreatorAccount" c
+            ON c."id"=p."creatorId" AND c."agencyId"=p."agencyId" AND c."deletedAt" IS NULL
+          LEFT JOIN "AgencyMember" m
+            ON m."id"=p."ownerMemberId" AND m."agencyId"=p."agencyId"
+           AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
+          LEFT JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
+         WHERE p."agencyId"=$1
+           AND p."status"='PENDING'
+           AND p."derivationVersion"=$2
+           AND p."projectionState" IN ('FULL','INCOMPLETE_HISTORY')
+           AND ($3::text[] IS NULL OR p."creatorId"=ANY($3::text[]))
+      ), filtered AS (
+        SELECT * FROM current_pending
+         WHERE ($4::text IS NULL OR operational_owner=$4)
+           AND ($5::boolean=FALSE OR operational_owner IS NULL)
+      )
+      SELECT COUNT(*)::bigint AS pending_dialogs,
+             COALESCE(SUM(GREATEST(1,"incomingCount")),0)::bigint AS pending_messages,
+             COUNT(*) FILTER(WHERE operational_owner IS NULL)::bigint AS unassigned_dialogs,
+             COUNT(*) FILTER(WHERE operational_owner IS NOT NULL)::bigint AS seen_dialogs,
+             COUNT(*) FILTER(WHERE "projectionState"='INCOMPLETE_HISTORY')::bigint AS incomplete_history,
+             COUNT(*) FILTER(WHERE "firstIncomingAt" <= $6)::bigint AS older_15m,
+             COUNT(*) FILTER(WHERE "firstIncomingAt" <= $7)::bigint AS older_60m,
+             MIN("firstIncomingAt") AS oldest_pending_at
+        FROM filtered
+    `, String(agencyId), CURRENT_PENDING_DERIVATION_VERSION, creatorIds, targetMemberId, unassignedOnly,
+      new Date(nowDate.getTime() - 15 * 60 * 1000), new Date(nowDate.getTime() - 60 * 60 * 1000));
+    const row = Array.isArray(result) ? result[0] : result;
+    const oldestPendingAt = row?.oldest_pending_at || row?.oldestPendingAt || null;
+    const incomplete = Number(row?.incomplete_history || row?.incompleteHistory || 0);
+    return {
+      source: "team_pending_dialog_v2_operational",
+      pendingDialogs: Number(row?.pending_dialogs || row?.pendingDialogs || 0),
+      pendingIncomingMessages: Number(row?.pending_messages || row?.pendingMessages || 0),
+      unassignedDialogs: Number(row?.unassigned_dialogs || row?.unassignedDialogs || 0),
+      seenDialogs: Number(row?.seen_dialogs || row?.seenDialogs || 0),
+      incompleteHistoryDialogs: incomplete,
+      historyCompleteness: incomplete > 0 ? "PARTIAL" : "FULL",
+      olderThan15m: Number(row?.older_15m || row?.older15m || 0),
+      olderThan60m: Number(row?.older_60m || row?.older60m || 0),
+      oldestPendingAt,
+      oldestPendingSeconds: secondsSince(oldestPendingAt, nowDate),
+    };
+  } catch (_) {
+    return summarizePendingRows(fallbackRows, { now: nowDate });
+  }
+}
+
 async function memberNamesForRows({ agencyId, rows, db = prisma }) {
   const ids = new Set();
   for (const row of rows || []) {
@@ -288,8 +386,8 @@ async function memberNamesForRows({ agencyId, rows, db = prisma }) {
   }
   if (!ids.size || !db.agencyMember?.findMany) return new Map();
   const members = await db.agencyMember.findMany({
-    where: { agencyId, id: { in: Array.from(ids) }, deletedAt: null },
-    select: { id: true, displayName: true, user: { select: { name: true } } },
+    where: { agencyId, id: { in: Array.from(ids) }, deletedAt: null, deactivatedAt: null, user: { is: { disabledAt: null } } },
+    select: { id: true, displayName: true, user: { select: { name: true, disabledAt: true } } },
   });
   return new Map((members || []).map((member) => [member.id, member.displayName || member.user?.name || null]));
 }
@@ -338,17 +436,32 @@ async function listTeamPendingDialogs({
     status: "PENDING",
     ...generationWhere,
     ...creatorScopeWhere(allowedCreatorIds),
-    ...(normalizedMemberId ? { ownerMemberId: normalizedMemberId } : {}),
-    ...(!normalizedMemberId && normalizedOwnership === "unassigned" ? { ownerMemberId: null } : {}),
+    // Required Creator relation is historical storage; current reads additionally
+    // require the referenced Creator to remain operational.
+    creator: { is: { deletedAt: null } },
   };
-  const rows = await db.teamPendingDialogState.findMany({
+  const requestedLimit = clampLimit(limit);
+  // Ownership is derived from *current* Member/User/access eligibility. Do not use
+  // ownerMemberId as a DB truth predicate because a disabled/deactivated/out-of-scope
+  // owner must behave as unassigned while historical attribution remains intact.
+  const candidateLimit = (normalizedMemberId || normalizedOwnership === "unassigned")
+    ? Math.min(500, Math.max(requestedLimit, requestedLimit * 4))
+    : requestedLimit;
+  const candidates = await db.teamPendingDialogState.findMany({
     where,
     orderBy: [{ firstIncomingAt: "asc" }, { id: "asc" }],
-    take: clampLimit(limit),
+    take: candidateLimit,
   });
+  const operationalOwners = await operationalOwnerMapForRows({ agencyId, rows: candidates, db });
+  const rows = candidates.filter((row) => {
+    const owner = operationalOwners.get(String(row.id)) || null;
+    if (normalizedMemberId) return owner === normalizedMemberId;
+    if (normalizedOwnership === "unassigned") return owner === null;
+    return true;
+  }).slice(0, requestedLimit);
   const [names, summary, identities] = await Promise.all([
     memberNamesForRows({ agencyId, rows, db }),
-    summarizePendingWhere({ where, now, db, fallbackRows: rows }),
+    summarizeOperationalPending({ agencyId, allowedCreatorIds, memberId: normalizedMemberId, ownership: normalizedOwnership, now, db, fallbackRows: rows }),
     pendingIdentityMaps({ agencyId, rows, db }),
   ]);
   return {
@@ -381,10 +494,10 @@ async function listTeamPendingDialogs({
       lastSeenAt: row.lastSeenAt || null,
       lastSeenMemberId: row.lastSeenMemberId || null,
       lastSeenMemberName: names.get(row.lastSeenMemberId) || null,
-      ownerMemberId: row.ownerMemberId || null,
-      ownerMemberName: names.get(row.ownerMemberId) || null,
-      ownerAssignedAt: row.ownerAssignedAt || null,
-      ownerReason: row.ownerReason || null,
+      ownerMemberId: operationalOwners.get(String(row.id)) || null,
+      ownerMemberName: names.get(operationalOwners.get(String(row.id))) || null,
+      ownerAssignedAt: operationalOwners.has(String(row.id)) ? (row.ownerAssignedAt || null) : null,
+      ownerReason: row.ownerMemberId && !operationalOwners.has(String(row.id)) ? "OPERATIONAL_OWNER_INELIGIBLE" : (row.ownerReason || null),
       ageSeconds: secondsSince(row.firstIncomingAt, now),
       creatorDisplayName: identities.creatorMap.get(row.creatorId)?.displayName || null,
       creatorUsername: identities.creatorMap.get(row.creatorId)?.username || null,
@@ -420,4 +533,7 @@ module.exports = {
   listTeamPendingDialogs,
   repairStaleLegacyBootstrapPendingBatch,
   pendingIdentityMaps,
+  memberHasCurrentCreatorAccess,
+  operationalOwnerMapForRows,
+  summarizeOperationalPending,
 };

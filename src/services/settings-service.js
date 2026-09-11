@@ -645,6 +645,20 @@ async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, ses
   return { available: true, account: publicTelegramAccount({ ...account, lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null }, Boolean(cleanSession)) };
 }
 
+async function scheduleTelegramAccountRetirementFanout({ tx, agencyId, accountId, now = new Date() }) {
+  await publishDomainWork({
+    db: tx,
+    agencyId,
+    workClass: PHASE2_WORK_CLASS.DEPENDENCY_FANOUT,
+    objectType: "TelegramAccountRetirement",
+    objectId: String(accountId),
+    parentObjectId: String(accountId),
+    partitionKey: `telegram-account:${String(accountId)}`,
+    accountId: String(accountId),
+    availableAt: now,
+  });
+}
+
 async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = null, now = new Date() }) {
   ensureTelegramManager(member);
   const id = String(accountId || "").trim();
@@ -726,9 +740,16 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
         retirementRequestedAt: current.retirementRequestedAt ? new Date(current.retirementRequestedAt).toISOString() : null,
       };
     }
-    await tx.creatorAccount.updateMany({ where: { agencyId, telegramAccountId: id }, data: { telegramAccountId: null } });
-    await tx.agencyTelegramMtprotoAccount.delete({ where: { id } });
-    return { ok: true, retired: true, lifecycleState: "RETIRED", drainRequired: false, drainCompleted: true, retirementRequestedAt: current.retirementRequestedAt ? new Date(current.retirementRequestedAt).toISOString() : null };
+    await scheduleTelegramAccountRetirementFanout({ tx, agencyId, accountId: id, now });
+    return {
+      ok: true,
+      retired: false,
+      lifecycleState: "RETIRING",
+      drainRequired: false,
+      drainCompleted: true,
+      detachPending: true,
+      retirementRequestedAt: current.retirementRequestedAt ? new Date(current.retirementRequestedAt).toISOString() : null,
+    };
   };
   return client.$transaction((tx) => retire(tx), { isolationLevel: "Serializable" });
 }
@@ -773,9 +794,17 @@ async function forceRetireLostTelegramMtprotoAccount({ agencyId, member, account
       db: tx,
       required: true,
     });
-    await tx.creatorAccount.updateMany({ where: { agencyId, telegramAccountId: id }, data: { telegramAccountId: null } });
-    await tx.agencyTelegramMtprotoAccount.delete({ where: { id } });
-    return { ok: true, retired: true, forced: true, lifecycleState: "RETIRED", drainRequired: false, drainCompleted: false, retirementRequestedAt: null };
+    await scheduleTelegramAccountRetirementFanout({ tx, agencyId, accountId: id, now });
+    return {
+      ok: true,
+      retired: false,
+      forced: true,
+      lifecycleState: "RETIRING",
+      drainRequired: false,
+      drainCompleted: false,
+      detachPending: true,
+      retirementRequestedAt: locked.retirementRequestedAt ? new Date(locked.retirementRequestedAt).toISOString() : null,
+    };
   }, { isolationLevel: "Serializable" });
 }
 

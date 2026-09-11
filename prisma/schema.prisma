@@ -2211,6 +2211,8 @@ model DomainWorkItem {
   @@index([agencyId, partitionKey, state, availableAt, id], map: "DomainWorkItem_partition_due_idx")
   @@index([agencyId, dependencyKind, dependencyKey, dependencyRevision, id], map: "DomainWorkItem_dependency_idx")
   @@index([state, availableAt, id], map: "DomainWorkItem_global_due_idx")
+  @@index([agencyId, workClass, activeGeneration, id], map: "DomainWorkItem_current_family_probe_idx")
+  @@index([workClass, activeGeneration, agencyId, partitionKey, availableAt, id], map: "DomainWorkItem_current_broad_due_idx")
 }
 
 model Phase2WorkGenerationAuthority {

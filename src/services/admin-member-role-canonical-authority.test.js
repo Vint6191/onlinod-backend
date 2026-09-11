@@ -14,25 +14,27 @@ function range(start, end) {
   return admin.slice(a, b);
 }
 
-test("super-admin legacy role mutation writes canonical roleKey in the same accessEpoch update", () => {
+test("super-admin legacy role mutation delegates canonical role/access semantics to Team authority", () => {
   assert.match(admin, /function canonicalMemberRoleKeyFromLegacy/);
   assert.match(admin, /OWNER"\) return "owner"/);
   assert.match(admin, /ADMIN" \|\| value === "MANAGER"\) return "manager"/);
   const body = range('router.patch("/members/:memberId/role"', 'const memberPermsSchema');
-  assert.match(body, /prisma\.\$transaction\(async \(tx\) =>/);
-  assert.match(body, /lockAgencyPipelineLifecycle\(\{ db: tx, agencyId: snapshot\.agencyId, allowDeleted: true \}\)/);
-  assert.match(body, /role: input\.role,[\s\S]*roleKey: canonicalMemberRoleKeyFromLegacy\(input\.role\),[\s\S]*accessEpoch: \{ increment: 1 \}/);
+  assert.match(body, /updateMemberAccessByPlatformAdmin\(\{/);
+  assert.match(body, /legacyRole: input\.role/);
+  assert.match(body, /roleKey: canonicalMemberRoleKeyFromLegacy\(input\.role\)/);
+  assert.doesNotMatch(body, /agencyMember\.update|agencyMember\.delete/);
 });
 
-test("super-admin last-owner guards recognize both canonical and legacy owner generations", () => {
-  assert.match(admin, /function memberIsCanonicalOwner/);
-  for (const body of [
-    range('router.patch("/members/:memberId/role"', 'const memberPermsSchema'),
-    range('router.delete("/members/:memberId"', '// ════════════════════════════════════════════════════════════\n// USERS'),
-  ]) {
-    assert.match(body, /memberIsCanonicalOwner\(before\)/);
-    assert.match(body, /deletedAt: null/);
-    assert.match(body, /deactivatedAt: null/);
-    assert.match(body, /OR: \[\{ role: "OWNER" \}, \{ roleKey: "owner" \}\]/);
-  }
+test("super-admin member removal and role changes share canonical owner-safety and retention authority", () => {
+  const team = fs.readFileSync(path.join(__dirname, "team-administration-service.js"), "utf8");
+  const roleBody = range('router.patch("/members/:memberId/role"', 'const memberPermsSchema');
+  const deleteBody = range('router.delete("/members/:memberId"', '// ════════════════════════════════════════════════════════════\n// USERS');
+  assert.match(roleBody, /updateMemberAccessByPlatformAdmin/);
+  assert.match(deleteBody, /removeTeamMember/);
+  assert.match(deleteBody, /platformAdmin:\s*true/);
+  assert.doesNotMatch(deleteBody, /agencyMember\.delete/);
+  assert.match(team, /team-owner-safety:/);
+  assert.match(team, /assertOwnerSafety/);
+  assert.match(team, /deletedAt, deactivatedAt: deletedAt, accessEpoch: \{ increment: 1 \}/);
+  assert.match(team, /historicalAttributionPreserved:\s*true/);
 });

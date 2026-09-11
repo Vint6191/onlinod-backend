@@ -75,6 +75,12 @@ function fakeDb({ lifecycleState = "ACTIVE", accountExists = true } = {}) {
       },
     },
     creatorAccount: {
+      async findMany({ where }) {
+        const ids = Array.isArray(where?.id?.in) ? where.id.in : [];
+        if (!ids.includes(creator.id) || where?.agencyId !== creator.agencyId) return [];
+        if (where?.deletedAt === null && creator.deletedAt) return [];
+        return [{ id: creator.id }];
+      },
       async findFirst({ where, select = null }) {
         if (where.id !== creator.id || where.agencyId !== creator.agencyId) return null;
         if (where.deletedAt === null && creator.deletedAt) return null;
@@ -211,7 +217,7 @@ test("creator retirement winning first blocks a concurrently queued Telegram reb
   });
   allowCommitResolve();
   await retirement;
-  await assert.rejects(assignment, (error) => ["CREATOR_RETIRED", "CREATOR_NOT_FOUND"].includes(error?.code));
+  await assert.rejects(assignment, (error) => ["MANAGEMENT_CREATOR_RETIRED", "CREATOR_RETIRED", "CREATOR_NOT_FOUND"].includes(error?.code));
   assert.equal(db._state().creator.telegramContact, "@old");
   assert.equal(db._state().creator.telegramAccountId, null);
 });

@@ -671,8 +671,9 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
 
   const ownerDemoted = isOwner(target) && nextRoleKey !== "owner";
   const updated = await serializableTeamTransaction(db, async (tx) => {
+    const creatorCommitIds = creatorScope?.normalized?.mode === "scoped" ? creatorScope.normalized.creatorIds : [];
     const admission = await assertManagementCommitAuthority({
-      tx, agencyId, actorMember, permissionKey: "workspace.manage_members",
+      tx, agencyId, actorMember, permissionKey: "workspace.manage_members", creatorIds: creatorCommitIds,
     });
     const liveActor = requireLiveTeamActor(admission.member);
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
@@ -682,7 +683,18 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
     if (patch.roleKey !== undefined) await lockTeamRoleLifecycle({ tx, agencyId, roleKey: nextRoleKey, mode: "share" });
     await assertActorCanAssignRole({ agencyId, actorMember: liveActor, roleKey: nextRoleKey, db: tx });
     await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey, db: tx });
-    assertActorCanGrantCreatorScope({ actorMember: liveActor, targetMember: liveTarget, assignedCreators: creatorScope ? creatorScope.value : liveTarget.assignedCreators });
+    let committedCreatorScope = creatorScope;
+    if (creatorScope && creatorScope.normalized?.mode === "scoped") {
+      committedCreatorScope = await validateAssignedCreators({ agencyId, assignedCreators: creatorScope.value, db: tx });
+      if (!committedCreatorScope.ok) {
+        const error = new Error(`Creator scope changed while this request was in flight: ${committedCreatorScope.unknownCreatorIds.join(", ")}`);
+        error.code = "MANAGEMENT_CREATOR_RETIRED";
+        error.status = 409;
+        error.details = { unknownCreatorIds: committedCreatorScope.unknownCreatorIds };
+        throw error;
+      }
+    }
+    assertActorCanGrantCreatorScope({ actorMember: liveActor, targetMember: liveTarget, assignedCreators: committedCreatorScope ? committedCreatorScope.value : liveTarget.assignedCreators });
     const liveOwnerDemoted = isOwner(liveTarget) && nextRoleKey !== "owner";
     if (liveOwnerDemoted) {
       await requireOwnerPossessionForCryptoDestructiveTeamMutation({
@@ -694,8 +706,8 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
       data: {
         ...(patch.displayName !== undefined ? { displayName: patch.displayName || null } : {}),
         ...(patch.roleKey !== undefined ? { roleKey: nextRoleKey, role: roleKeyToLegacy(nextRoleKey) } : {}),
-        ...(creatorScope ? { assignedCreators: creatorScope.value } : {}),
-        ...((patch.roleKey !== undefined || creatorScope) ? { accessEpoch: { increment: 1 } } : {}),
+        ...(committedCreatorScope ? { assignedCreators: committedCreatorScope.value } : {}),
+        ...((patch.roleKey !== undefined || committedCreatorScope) ? { accessEpoch: { increment: 1 } } : {}),
       },
     });
     if (liveOwnerDemoted) {
@@ -816,7 +828,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
   return { id: target.id, status, deactivatedAt };
 }
 
-async function removeMember({ agencyId, memberId, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
+async function removeMember({ agencyId, memberId, actorMember = null, actorUserId: actorId = null, actorDeviceId = null, actorProof = null, platformAdmin = false, db = prisma }) {
   const target = await db.agencyMember.findFirst({ where: { id: memberId, agencyId, deletedAt: null } });
   if (!target) {
     const error = new Error("Member not found");
@@ -824,48 +836,216 @@ async function removeMember({ agencyId, memberId, actorMember, actorUserId: acto
     error.status = 404;
     throw error;
   }
-  assertActorCanManageMember({ actorMember, targetMember: target });
-  if (target.id === actorMember?.id) {
-    const error = new Error("You cannot remove your own membership");
-    error.code = "CANNOT_REMOVE_SELF";
-    error.status = 409;
-    throw error;
+  if (!platformAdmin) {
+    assertActorCanManageMember({ actorMember, targetMember: target });
+    if (target.id === actorMember?.id) {
+      const error = new Error("You cannot remove your own membership");
+      error.code = "CANNOT_REMOVE_SELF";
+      error.status = 409;
+      throw error;
+    }
+    await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
   }
-  await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
+
   const deletedAt = new Date();
   const removalMutation = await serializableTeamTransaction(db, async (tx) => {
-    const admission = await assertManagementCommitAuthority({
-      tx, agencyId, actorMember, permissionKey: "workspace.manage_members",
-    });
-    const liveActor = requireLiveTeamActor(admission.member);
+    let liveActor = null;
+    if (platformAdmin) {
+      const barrier = await lockAgencyLifecycleBarrier({ db: tx, agencyId, mode: "shared" });
+      if (!barrier.row || barrier.row.deletedAt) {
+        const error = new Error("Agency is no longer active"); error.code = "AGENCY_RETIRED"; error.status = 409; throw error;
+      }
+      // One owner-safety mutex makes the invariant explicit even on engines/test
+      // adapters that do not model PostgreSQL SERIALIZABLE write-skew detection.
+      if (typeof tx?.$executeRawUnsafe === "function") {
+        await lockDbAdvisoryXact({ db: tx, key: `team-owner-safety:${String(agencyId)}`, mode: "exclusive" });
+      }
+      if (typeof tx?.$queryRawUnsafe === "function") {
+        await tx.$queryRawUnsafe(`SELECT "id" FROM "AgencyMember" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE`, String(target.id), String(agencyId));
+      }
+    } else {
+      const admission = await assertManagementCommitAuthority({ tx, agencyId, actorMember, permissionKey: "workspace.manage_members" });
+      liveActor = requireLiveTeamActor(admission.member);
+    }
+
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
-    assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
-    if (liveTarget.id === liveActor.id) { const error = new Error("You cannot remove your own membership"); error.code = "CANNOT_REMOVE_SELF"; error.status = 409; throw error; }
+    if (!platformAdmin) {
+      assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
+      if (liveTarget.id === liveActor.id) { const error = new Error("You cannot remove your own membership"); error.code = "CANNOT_REMOVE_SELF"; error.status = 409; throw error; }
+    }
     await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey: null, removing: true, db: tx });
-    if (isOwner(liveTarget)) {
-      await requireOwnerPossessionForCryptoDestructiveTeamMutation({
-        tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
-      });
+    if (isOwner(liveTarget) && !platformAdmin) {
+      await requireOwnerPossessionForCryptoDestructiveTeamMutation({ tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof });
     }
     const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deletedAt, deactivatedAt: deletedAt, accessEpoch: { increment: 1 } } });
     await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deletedAt });
     await tx.refreshSession.updateMany({ where: { userId: liveTarget.userId, agencyId, revokedAt: null }, data: { revokedAt: deletedAt } });
     return updatedMember || { ...liveTarget, deletedAt, deactivatedAt: deletedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
   });
+
   const revokedCreatorIds = await accessibleCreatorIdsForMember({ db, agencyId, member: target });
   publishTargetedCreatorRevokes({ agencyId, creatorIds: revokedCreatorIds, member: target, reason: "MEMBER_REMOVED", sourceDeviceId: actorDeviceId });
   publishMemberAccessEpoch({ agencyId, member: removalMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
   await audit({
     agencyId,
-    actorUserId: actorId,
-    action: "team.member.removed",
+    actorUserId: platformAdmin ? null : actorId,
+    action: platformAdmin ? "team.member.removed_by_platform_admin" : "team.member.removed",
     targetType: "agency_member",
     targetId: target.id,
-    metadata: { actorMemberId: actorMember?.id || null, roleKey: memberRoleKey(target), historicalAttributionPreserved: true },
+    metadata: { actorMemberId: platformAdmin ? null : actorMember?.id || null, roleKey: memberRoleKey(target), historicalAttributionPreserved: true, platformAdmin: Boolean(platformAdmin) },
     db,
   });
-  return { id: target.id, deletedAt };
+  return { id: target.id, deletedAt, accessEpoch: removalMutation?.accessEpoch || null };
+}
+
+
+async function updateMemberAccessByPlatformAdmin({
+  agencyId,
+  memberId,
+  legacyRole = undefined,
+  roleKey = undefined,
+  permissions = undefined,
+  actorDeviceId = null,
+  db = prisma,
+} = {}) {
+  const mutation = await serializableTeamTransaction(db, async (tx) => {
+    const barrier = await lockAgencyLifecycleBarrier({ db: tx, agencyId, mode: "shared" });
+    if (!barrier.row || barrier.row.deletedAt) {
+      const error = new Error("Agency is no longer active");
+      error.code = "AGENCY_RETIRED";
+      error.status = 409;
+      throw error;
+    }
+    // Role/lifecycle mutations share the same owner-safety serialization root as
+    // platform-admin removal. Permissions-only changes also row-lock the target.
+    if (roleKey !== undefined && typeof tx?.$executeRawUnsafe === "function") {
+      await lockDbAdvisoryXact({ db: tx, key: `team-owner-safety:${String(agencyId)}`, mode: "exclusive" });
+    }
+    if (typeof tx?.$queryRawUnsafe === "function") {
+      await tx.$queryRawUnsafe(`SELECT "id" FROM "AgencyMember" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE`, String(memberId), String(agencyId));
+    }
+    const before = await tx.agencyMember.findFirst({ where: { id: memberId, agencyId, deletedAt: null } });
+    if (!before) {
+      const error = new Error("Member not found");
+      error.code = "MEMBER_NOT_FOUND";
+      error.status = 404;
+      throw error;
+    }
+    const nextRoleKey = roleKey === undefined ? memberRoleKey(before) : String(roleKey || "").trim().toLowerCase();
+    if (roleKey !== undefined) {
+      await assertOwnerSafety({ agencyId, targetMember: before, nextRoleKey, removing: false, db: tx });
+    }
+    const ownerDemoted = isOwner(before) && nextRoleKey !== "owner";
+    const data = { accessEpoch: { increment: 1 } };
+    if (legacyRole !== undefined) data.role = legacyRole;
+    if (roleKey !== undefined) data.roleKey = nextRoleKey;
+    if (permissions !== undefined) data.permissions = permissions;
+    const updated = await tx.agencyMember.update({ where: { id: before.id }, data });
+    if (ownerDemoted) {
+      await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: before.userId, revokedAt: new Date() });
+    }
+    return { before, updated };
+  });
+  publishMemberAccessEpoch({ agencyId, member: mutation.updated, sourceDeviceId: actorDeviceId });
+  return mutation;
+}
+
+async function materializeInvitationMemberWithinTransaction({
+  tx,
+  agencyId,
+  userId,
+  roleKey,
+  displayName = null,
+  initials = null,
+  tone = "amber",
+  commission = null,
+  assignedCreators = [],
+  permissions = undefined,
+} = {}) {
+  if (!tx || !agencyId || !userId || !roleKey) {
+    const error = new Error("Invitation membership lifecycle context is required");
+    error.code = "INVITATION_MEMBER_LIFECYCLE_CONTEXT_REQUIRED";
+    error.status = 500;
+    throw error;
+  }
+
+  // Caller must already hold lockTeamRoleLifecycle(), which also owns the shared
+  // Agency lifecycle barrier. From there the canonical invitation materializer
+  // takes User -> membership-row locks so persistent User disable and concurrent
+  // invitation restores cannot race the commit.
+  if (typeof tx.$queryRawUnsafe === "function") {
+    const users = await tx.$queryRawUnsafe(
+      `SELECT "id" FROM "User" WHERE "id"=$1 AND "disabledAt" IS NULL FOR SHARE`,
+      String(userId),
+    );
+    if (!Array.isArray(users) || users.length !== 1) {
+      const error = new Error("User is disabled or no longer exists");
+      error.code = "USER_DISABLED";
+      error.status = 403;
+      throw error;
+    }
+    await tx.$queryRawUnsafe(
+      `SELECT "id" FROM "AgencyMember" WHERE "agencyId"=$1 AND "userId"=$2 FOR UPDATE`,
+      String(agencyId),
+      String(userId),
+    );
+  } else if (tx.user?.findUnique) {
+    const user = await tx.user.findUnique({ where: { id: userId }, select: { id: true, disabledAt: true } });
+    if (!user || user.disabledAt) {
+      const error = new Error("User is disabled or no longer exists");
+      error.code = "USER_DISABLED";
+      error.status = 403;
+      throw error;
+    }
+  }
+
+  const existing = await tx.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId } } });
+  if (existing && !existing.deletedAt) {
+    const error = new Error(existing.deactivatedAt
+      ? "Your membership is deactivated. A manager must reactivate it before you can sign in."
+      : "You are already a member of this agency");
+    error.status = 409;
+    error.code = existing.deactivatedAt ? "MEMBER_DEACTIVATED" : "ALREADY_MEMBER";
+    error.details = { memberId: existing.id };
+    throw error;
+  }
+
+  if (existing?.deletedAt) {
+    const member = await tx.agencyMember.update({
+      where: { id: existing.id },
+      data: {
+        deletedAt: null,
+        deactivatedAt: null,
+        roleKey,
+        role: roleKeyToLegacy(roleKey),
+        displayName: displayName || existing.displayName || null,
+        assignedCreators,
+        accessEpoch: { increment: 1 },
+        commission: commission ?? existing.commission ?? { kind: "none" },
+        lastSeenLabel: "just rejoined",
+        ...(permissions !== undefined ? { permissions } : {}),
+      },
+    });
+    return { member, restored: true };
+  }
+
+  const member = await tx.agencyMember.create({
+    data: {
+      agencyId,
+      userId,
+      role: roleKeyToLegacy(roleKey),
+      roleKey,
+      displayName: displayName || null,
+      initials: String(initials || displayName || "??").trim().slice(0, 2).toUpperCase(),
+      tone,
+      commission: commission || { kind: "none" },
+      assignedCreators,
+      lastSeenLabel: "just joined",
+      ...(permissions !== undefined ? { permissions } : {}),
+    },
+  });
+  return { member, restored: false };
 }
 
 function invitationUrl(rawToken) {
@@ -1328,6 +1508,8 @@ module.exports = {
   updateMemberSettings,
   setMemberStatus,
   removeMember,
+  updateMemberAccessByPlatformAdmin,
+  materializeInvitationMemberWithinTransaction,
   createInvitation,
   reissueInvitation,
   revokeInvitation,

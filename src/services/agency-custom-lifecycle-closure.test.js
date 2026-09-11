@@ -59,22 +59,25 @@ test("every production NEW Custom/provider work origin takes the Agency lifecycl
 
 
 
-test("product creator removal joins the Agency lifecycle fence before Creator/member scope mutation", () => {
+test("product creator removal delegates to the canonical Agency -> Creator -> scope lifecycle authority", () => {
   const creators = source("routes/creators.js");
+  const lifecycle = source("services/creator-lifecycle-authority-service.js");
+  const scope = source("services/creator-access-scope-authority-service.js");
   const start = creators.indexOf('router.delete("/:id"');
   const end = creators.indexOf('router.post("/:id/complete-connection"', start);
   assert.ok(start >= 0 && end > start, "product creator removal route must exist");
   const route = creators.slice(start, end);
-  const agencyFence = route.indexOf("lockAgencyPipelineLifecycle");
-  const creatorFence = route.indexOf("lockCreatorPipelineLifecycle");
-  const memberScopeWrite = route.indexOf("removeCreatorFromAssignedCreators");
-  const epochBump = route.indexOf("bumpAgencyAccessEpoch");
-  const creatorDelete = route.indexOf("creatorAccount.update");
-  assert.ok(agencyFence >= 0, "creator removal must serialize at the Agency root");
-  assert.ok(creatorFence > agencyFence, "creator removal lock order must be Agency -> Creator");
-  assert.ok(memberScopeWrite > creatorFence, "member creator-scope rewrites must happen only after lifecycle fences");
-  assert.ok(creatorDelete > creatorFence, "creator soft-delete must happen only after lifecycle fences");
-  assert.ok(epochBump > memberScopeWrite, "effective creator-scope changes must bump live member accessEpoch in the same transaction");
+  assert.match(route, /retireCreatorWithinTransaction\(\{/);
+  assert.doesNotMatch(route, /scanRowsById|removeCreatorFromAssignedCreators/);
+  const agencyFence = lifecycle.indexOf("lockAgencyPipelineLifecycle");
+  const creatorFence = lifecycle.indexOf("lockCreatorPipelineLifecycle");
+  const scopeWrite = lifecycle.indexOf("await retireCreatorCurrentAccess");
+  const creatorDelete = lifecycle.indexOf("creatorAccount.update");
+  assert.ok(agencyFence >= 0 && creatorFence > agencyFence, "canonical lifecycle order must be Agency -> Creator");
+  assert.ok(scopeWrite > creatorFence, "current scope revocation must happen under the Creator lifecycle fence");
+  assert.ok(creatorDelete > scopeWrite, "Creator retirement follows current access revocation in the same transaction");
+  assert.match(scope, /"accessEpoch"=m\."accessEpoch"\+1/);
+  assert.match(scope, /phase2_remove_creator_from_access_scope/);
 });
 test("creator Telegram rebinding uses the global Agency -> Creator -> TelegramAccount lifecycle order", () => {
   const contact = source("services/creator-telegram-contact-authority-service.js");
@@ -151,25 +154,22 @@ test("first execution-profile pin and both mutable defaults share one commit-ord
     "relay-recipient publication must join the same fence before its workspace write");
 });
 
-test("super-admin hard creator delete is a durable bounded lifecycle, not one lifetime destructive transaction", () => {
+test("super-admin hard creator delete delegates to the same durable bounded lifecycle authority", () => {
   const admin = source("routes/admin.js");
+  const lifecycle = source("services/creator-lifecycle-authority-service.js");
   const routeStart = admin.indexOf('router.delete("/creators/:id"');
   const routeEnd = admin.indexOf("// ════════════════════════════════════════════════════════════\n// DEVICES", routeStart);
   const route = admin.slice(routeStart, routeEnd);
-  const hardAt = route.indexOf("if (hard) {");
-  const softAt = route.indexOf("} else {", hardAt);
-  const block = route.slice(hardAt, softAt);
-  const customFence = block.indexOf("assertCreatorCustomPipelineRetirable");
-  const massFence = block.indexOf("assertCreatorMassCampaignRetirable");
-  const barrier = block.indexOf("creatorAccount.update");
-  const publishCleanup = block.indexOf("DESTRUCTIVE_CREATOR_CLEANUP");
-  assert.ok(customFence >= 0, "hard delete must refuse active/unknown Custom external-write authority before destructive lifecycle starts");
-  assert.ok(massFence > customFence, "Custom and MASS future-effect authorities must both converge before destructive lifecycle starts");
-  assert.ok(barrier > massFence, "DELETING barrier must be committed only after the external-effect guards");
-  assert.ok(publishCleanup > barrier, "bounded cleanup work must be published in the same transaction after the barrier");
-  assert.doesNotMatch(block, /collectCreatorPhase2DestructiveScope/);
-  assert.doesNotMatch(block, /creatorAccount\.delete/);
-  assert.doesNotMatch(block, /purgeCreatorPhase2ResidualsForHardDelete/);
+  assert.match(route, /retireCreatorWithinTransaction\(\{[\s\S]*?mode: hard \? "HARD" : "SOFT"/);
+  const customFence = lifecycle.indexOf("assertCreatorCustomPipelineRetirable");
+  const massFence = lifecycle.indexOf("assertCreatorMassCampaignRetirable");
+  const barrier = lifecycle.indexOf("creatorAccount.update");
+  const publishCleanup = lifecycle.indexOf("WORK_CLASS.DESTRUCTIVE_CREATOR_CLEANUP");
+  assert.ok(customFence >= 0, "canonical lifecycle must refuse active/unknown Custom external-write authority");
+  assert.ok(massFence > customFence, "Custom and MASS future-effect authorities converge before destructive publication");
+  assert.ok(barrier > massFence, "Creator retirement barrier follows external-effect guards");
+  assert.ok(publishCleanup > barrier, "bounded cleanup work is published only after the retirement barrier");
+  assert.doesNotMatch(route, /collectCreatorPhase2DestructiveScope|creatorAccount\.delete|purgeCreatorPhase2ResidualsForHardDelete/);
 });
 
 test("super-admin hard Agency delete publishes bounded destructive authority after lifecycle blockers", () => {

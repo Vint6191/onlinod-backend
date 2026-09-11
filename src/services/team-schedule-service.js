@@ -166,6 +166,20 @@ function normalizeAssignedScope(value) {
   return normalized.mode === "all" ? null : normalized.creatorIds;
 }
 
+function memberAllowsCurrentCreator(member, creatorId) {
+  const id = String(creatorId || "").trim();
+  if (!member || !id) return false;
+  const scope = normalizeAssignedCreators(member.assignedCreators);
+  return scope.mode === "all" || scope.creatorIds.map(String).includes(id);
+}
+
+function filterShiftCurrentCreatorLinks(row) {
+  const creators = (row?.creators || []).filter((link) =>
+    memberAllowsCurrentCreator(row?.member, link?.creatorRefId || link?.creator?.id),
+  );
+  return creators.length ? { ...row, creators } : null;
+}
+
 function intersectScope(a, b) {
   if (!Array.isArray(a)) return Array.isArray(b) ? [...b] : null;
   if (!Array.isArray(b)) return [...a];
@@ -189,10 +203,10 @@ async function loadScheduleContext({ agencyId, allowedCreatorIds = null, canMana
       select: { id: true, displayName: true, username: true, avatarUrl: true },
     }),
     findAllById(db.agencyMember, {
-      where: { agencyId, deletedAt: null, deactivatedAt: null },
+      where: { agencyId, deletedAt: null, deactivatedAt: null, user: { is: { disabledAt: null } } },
       select: {
         id: true, displayName: true, roleKey: true, assignedCreators: true,
-        user: { select: { name: true, email: true } },
+        user: { select: { name: true, email: true, disabledAt: true } },
         teamFunctions: { select: { functionKey: true }, orderBy: { functionKey: "asc" } },
       },
     }),
@@ -228,9 +242,15 @@ function plannedShiftWhere(range, allowedCreatorIds) {
   const where = range.startAt
     ? { startsAt: { lte: range.endAt }, endsAt: { gte: range.startAt } }
     : { startsAt: { lte: range.endAt } };
+  where.member = { is: { deletedAt: null, deactivatedAt: null, user: { is: { disabledAt: null } } } };
+  // Historical creatorId is attribution only. Current schedule eligibility is
+  // represented by creatorRefId *and* a live Creator relation. The explicit
+  // relation predicate is defensive against pre-cutover soft-retirement rows.
   if (Array.isArray(allowedCreatorIds)) {
     const ids = uniqueIds(allowedCreatorIds, 10000);
-    where.creators = { some: { creatorId: { in: ids.length ? ids : ["__none__"] } } };
+    where.creators = { some: { creatorRefId: { in: ids.length ? ids : ["__none__"] }, creator: { is: { deletedAt: null } } } };
+  } else {
+    where.creators = { some: { creatorRefId: { not: null }, creator: { is: { deletedAt: null } } } };
   }
   return where;
 }
@@ -267,7 +287,9 @@ function rowsForShift(index, memberId, creatorIds) {
 function matchShiftActual(shift, actualSessionIndex, responseCaseIndex, nowMs) {
   const startMs = new Date(shift.startsAt).getTime();
   const endMs = new Date(shift.endsAt).getTime();
-  const creatorIds = new Set((shift.creators || []).map((link) => String(link.creatorId || link.creator?.id || "")).filter(Boolean));
+  // Never use historical creatorId as current operational input. creatorRefId
+  // is the live edge; lifecycle retirement removes it from current reads.
+  const creatorIds = new Set((shift.creators || []).map((link) => String(link.creatorRefId || link.creator?.id || "")).filter(Boolean));
   const candidateSessions = rowsForShift(actualSessionIndex, shift.memberId, creatorIds);
   const relevant = candidateSessions.filter((session) => session._startMs < endMs && session._endMs > startMs);
   const presenceIntervals = relevant.map((session) => interval(Math.max(startMs, session._startMs), Math.min(endMs, session._endMs))).filter(Boolean);
@@ -351,9 +373,16 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
   const queryRange = retainedRange || { ...range, startAt: new Date(0), endAt: new Date(0) };
   const scheduleCoverage = { ...coverageState(range, detailAvailableFrom), source: "bounded_team_schedule_detail_v1" };
   const nowMs = authorityNow.getTime();
-  const includeCreatorWhere = Array.isArray(allowedCreatorIds)
-    ? { where: creatorScopeWhere(allowedCreatorIds), select: { creatorId: true, creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } } } }
-    : { select: { creatorId: true, creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } } } };
+  const scopedCreatorIds = Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, 10000) : null;
+  const includeCreatorWhere = Array.isArray(scopedCreatorIds)
+    ? {
+        where: { creatorRefId: { in: scopedCreatorIds.length ? scopedCreatorIds : ["__none__"] }, creator: { is: { deletedAt: null } } },
+        select: { creatorId: true, creatorRefId: true, creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } } },
+      }
+    : {
+        where: { creatorRefId: { not: null }, creator: { is: { deletedAt: null } } },
+        select: { creatorId: true, creatorRefId: true, creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } } },
+      };
 
   if (supportsScheduleScaleRead(db)) {
     const context = await loadScheduleContext({ agencyId, allowedCreatorIds, canManageSchedule, db });
@@ -380,7 +409,11 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
 
   const [coverageRows, shifts, responseCases, context] = await Promise.all([
     findAllById(db.teamCoverageSession, {
-      where: { agencyId, ...rangeOverlapWhere(queryRange), ...creatorScopeWhere(allowedCreatorIds) },
+      where: {
+        agencyId, ...rangeOverlapWhere(queryRange), ...creatorScopeWhere(allowedCreatorIds),
+        creator: { is: { deletedAt: null } },
+        member: { is: { deletedAt: null, deactivatedAt: null, user: { is: { disabledAt: null } } } },
+      },
       include: {
         member: { select: { id: true, displayName: true, roleKey: true, user: { select: { name: true, email: true } } } },
         creator: { select: { id: true, displayName: true, username: true, avatarUrl: true } },
@@ -389,7 +422,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
     findAllById(db.teamShift, {
       where: { agencyId, ...plannedShiftWhere(queryRange, allowedCreatorIds) },
       include: {
-        member: { select: { id: true, displayName: true, roleKey: true, user: { select: { name: true, email: true } } } },
+        member: { select: { id: true, displayName: true, roleKey: true, assignedCreators: true, user: { select: { name: true, email: true } } } },
         creators: includeCreatorWhere,
       },
     }),
@@ -397,6 +430,8 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
       ? findAllById(db.teamResponseCase, {
           where: {
             agencyId, ...responseRangeWhere(queryRange, allowedCreatorIds),
+            creator: { is: { deletedAt: null } },
+            member: { is: { deletedAt: null, deactivatedAt: null, user: { is: { disabledAt: null } } } },
             ...(currentResponseGeneration ? { derivationVersion: "team_response_v2", projectionState: { in: ["FULL", "INCOMPLETE_HISTORY"] } } : {}),
           },
           select: { id: true, creatorId: true, memberId: true, replyAt: true, slaEligible: true, sla15Pass: true, wallClockSeconds: true, projectionState: true, derivationVersion: true },
@@ -505,11 +540,12 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
   const actualSessionIndex = indexRowsByMemberCreator(actualSessions);
   const responseCaseIndex = indexRowsByMemberCreator(responseCases || []);
 
-  shifts.sort((a, b) => new Date(a.startsAt).getTime() - new Date(b.startsAt).getTime() || String(a.id).localeCompare(String(b.id)));
-  const plannedShifts = shifts.map((row) => {
+  const operationalShifts = shifts.map(filterShiftCurrentCreatorLinks).filter(Boolean);
+  operationalShifts.sort((a, b) => new Date(a.startsAt).getTime() - new Date(b.startsAt).getTime() || String(a.id).localeCompare(String(b.id)));
+  const plannedShifts = operationalShifts.map((row) => {
     const visibleCreators = (row.creators || []).map((link) => ({
-      id: String(link.creatorId || link.creator?.id),
-      name: creatorName(link.creator, link.creatorId),
+      id: String(link.creatorRefId || link.creator?.id || ""),
+      name: creatorName(link.creator, link.creatorRefId),
       username: link.creator?.username || null,
       avatarUrl: link.creator?.avatarUrl || null,
     })).filter((item) => item.id);
@@ -603,8 +639,8 @@ async function assertShiftTargets({ agencyId, memberId, creatorIds, actorAllowed
 
   const [member, creators] = await Promise.all([
     db.agencyMember.findFirst({
-      where: { id: targetMemberId, agencyId, deletedAt: null, deactivatedAt: null },
-      select: { id: true, assignedCreators: true, displayName: true, user: { select: { name: true, email: true } } },
+      where: { id: targetMemberId, agencyId, deletedAt: null, deactivatedAt: null, user: { is: { disabledAt: null } } },
+      select: { id: true, assignedCreators: true, displayName: true, user: { select: { name: true, email: true, disabledAt: true } } },
     }),
     db.creatorAccount.findMany({ where: { agencyId, deletedAt: null, id: { in: ids } }, select: { id: true }, take: 1000 }),
   ]);
@@ -651,7 +687,7 @@ async function lockShiftForUpdate({ tx, agencyId, shiftId }) {
   }
   const row = await tx.teamShift.findFirst({
     where: { id: shiftId, agencyId },
-    include: { creators: { select: { creatorId: true } } },
+    include: { creators: { select: { creatorId: true, creatorRefId: true } } },
   });
   if (!row) throw error("TEAM_SCHEDULE_SHIFT_NOT_FOUND", "Shift was not found", 404);
   return row;
@@ -701,7 +737,7 @@ async function updateTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
       throw error("TEAM_SCHEDULE_SHIFT_CANCELLED", "Cancelled shifts are immutable", 409);
     }
     const memberId = input?.memberId ?? existing.memberId;
-    const creatorIds = input?.creatorIds ?? existing.creators.map((row) => row.creatorId);
+    const creatorIds = input?.creatorIds ?? existing.creators.map((row) => row.creatorRefId).filter(Boolean);
     const window = validateShiftWindow(input?.startsAt ?? existing.startsAt, input?.endsAt ?? existing.endsAt);
     const timezone = validTimezone(input?.timezone ?? existing.timezone ?? "UTC");
     const note = input && Object.prototype.hasOwnProperty.call(input, "note") ? clean(input.note, 500) : existing.note;
@@ -747,7 +783,7 @@ async function cancelTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
       throw error("STALE_COMMAND_TARGET", "Shift changed since you opened it; refresh and retry", 409, { expectedRevision: expected, currentRevision });
     }
     if (String(existing.status || "").toUpperCase() === "CANCELLED") return { existing, updated: existing, alreadyCancelled: true };
-    const creatorIds = (existing.creators || []).map((row) => String(row.creatorId));
+    const creatorIds = (existing.creators || []).map((row) => row.creatorRefId).filter(Boolean).map(String);
     await assertManagementCommitAuthority({
       tx, agencyId, actorMember: admittedActor, permissionKey: "workspace.manage_schedule", creatorIds,
     });

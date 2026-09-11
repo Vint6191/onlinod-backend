@@ -13,6 +13,7 @@ const {
   lockCreatorPipelineLifecycle,
 } = require("./custom-content-pipeline-authority-service");
 const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("./mass-campaign-authority-service");
+const { retireCreatorWithinTransaction } = require("./creator-lifecycle-authority-service");
 
 const CREATOR_DELETE_BATCH = 250;
 const AGENCY_DELETE_BATCH = 250;
@@ -744,18 +745,19 @@ async function ensureAgencyCreatorCleanupBatch({ tx, agencyId, now, limit = 10 }
   for (const row of rows || []) {
     const creatorId = String(row?.id || "").trim();
     if (!creatorId) continue;
-    if (!row.deletedAt) {
-      await tx.creatorAccount.update({ where: { id: creatorId }, data: { deletedAt: now, status: "DISABLED" } });
-    }
-    await publishDomainWork({
-      db: tx,
+    // Agency destruction is a privileged mode of the same Creator lifecycle, not
+    // a second writer. This performs scope/invitation cleanup, Team live-edge
+    // retirement, crypto/session revocation, device/job cancellation and child
+    // destructive publication under the same canonical transition.
+    await retireCreatorWithinTransaction({
+      tx,
       agencyId,
-      workClass: WORK_CLASS.DESTRUCTIVE_CREATOR_CLEANUP,
-      objectType: "Phase2CreatorDestructiveCleanup",
-      objectId: creatorId,
-      partitionKey: creatorId,
-      creatorId: null,
-      availableAt: now,
+      creatorId,
+      actorUserId: null,
+      mode: "HARD",
+      retiredAt: now,
+      sourceRequestId: `agency-destructive:${agencyId}:creator:${creatorId}:${now.getTime()}`,
+      revokeReason: "AGENCY_DESTRUCTIVE_CREATOR_RETIREMENT",
     });
     creatorIds.push(creatorId);
   }
@@ -790,6 +792,13 @@ async function processAgencyHardDeleteWorkItem({ db, item, ownerToken, batchSize
     await assertAgencyMassCampaignRetirable({ db: tx, agencyId, requireFreshProviderSnapshot: false });
     const claim = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow: now });
     if (claim?.lost) return { ok: false, lost: true, code: claim.code || "DOMAIN_WORK_CLAIM_LOST" };
+
+    // DestructiveInternalAuthority: mark only this claimed transaction as the
+    // authorized Agency cleanup executor. DB fences require both this local token
+    // and the durable destructive DWI, so ordinary/stale writers remain blocked.
+    if (typeof tx?.$queryRawUnsafe === "function") {
+      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
+    }
 
     // Agency destruction composes the existing Creator destructive lifecycle instead of
     // bypassing it. At most 10 Creator cleanup authorities are published in one transaction.
@@ -869,6 +878,14 @@ async function processCreatorHardDeleteWorkItem({ db, item, ownerToken, batchSiz
     await assertCreatorMassCampaignRetirable({ db: tx, agencyId, creatorId, requireFreshProviderSnapshot: false });
     const claim = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow });
     if (claim?.lost) return { ok: false, lost: true, code: claim.code || "DOMAIN_WORK_CLAIM_LOST" };
+
+    // Creator cleanup gets an explicit transaction-local authorization token.
+    // Trigger policy may suppress cleanup-generated invalidations only for this
+    // claimed destructive transaction, never merely because deletion is pending.
+    if (typeof tx?.$queryRawUnsafe === "function") {
+      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_creator_id',$1,true) AS value`, creatorId);
+      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
+    }
 
     let remaining = limit;
     const nonFk = await purgeCreatorNonFkPhase2Batch({ tx, agencyId, creatorId, limit: remaining });

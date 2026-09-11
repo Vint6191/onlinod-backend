@@ -49,7 +49,13 @@ function attachManagementAuthority(tx, { agencyId = "agency-1", actor = null } =
     tx.$queryRawUnsafe = async function phase2AuthorityQuery(sql, ...args) {
       const text = String(sql || "");
       if (text.includes('FROM "Agency"')) return [activeAgency(args[0] || agencyId)];
+      if (text.includes('FROM "CreatorAccount"')) {
+        const creatorId = String(args[0] || "");
+        const targetAgencyId = String(args[1] || agencyId);
+        return creatorId && targetAgencyId === String(agencyId) ? [{ id: creatorId }] : [];
+      }
       if (text.includes('FROM "AgencyMember"')) return normalizedActor ? [{ id: normalizedActor.id }] : [];
+      if (text.includes('FROM "User"')) return normalizedActor ? [{ id: normalizedActor.userId }] : [];
       return originalUnsafe(sql, ...args);
     };
   }
@@ -62,6 +68,21 @@ function attachManagementAuthority(tx, { agencyId = "agency-1", actor = null } =
   }
   if (!tx.agencyRoleOverride) tx.agencyRoleOverride = { async findUnique() { return null; } };
   if (!tx.agencySubPermissionOverride) tx.agencySubPermissionOverride = { async findMany() { return []; } };
+
+  // Management commit authority now proves referenced Creator identities at commit
+  // time. Test fixtures that are not exercising Creator retirement should model
+  // that storage independently from the actor's creator scope. Scope is checked
+  // later against the live member row; storage existence is a separate fact.
+  const existingCreator = tx.creatorAccount || {};
+  if (typeof existingCreator.findMany !== "function") {
+    tx.creatorAccount = {
+      ...existingCreator,
+      async findMany(args = {}) {
+        const ids = Array.isArray(args?.where?.id?.in) ? args.where.id.in : [];
+        return ids.map((id) => ({ id: String(id) }));
+      },
+    };
+  }
 
   const existingMember = tx.agencyMember || {};
   const originalFindFirst = typeof existingMember.findFirst === "function" ? existingMember.findFirst.bind(existingMember) : null;

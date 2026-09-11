@@ -48,7 +48,11 @@ test("invitation claim writes role, creator scope, functions and claimedMemberId
   assert.match(route, /tx\.teamMemberFunction\.deleteMany/);
   assert.match(route, /tx\.teamMemberFunction\.createMany/);
   assert.match(route, /claimedMemberId:\s*member\.id/);
-  assert.match(route, /MEMBER_DEACTIVATED/);
+  assert.match(route, /materializeInvitationMemberWithinTransaction/);
+  const team = read("src/services/team-administration-service.js");
+  assert.match(team, /MEMBER_DEACTIVATED/);
+  assert.match(team, /SELECT "id" FROM "User"[\s\S]*"disabledAt" IS NULL FOR SHARE/);
+  assert.match(team, /SELECT "id" FROM "AgencyMember"[\s\S]*FOR UPDATE/);
   assert.match(route, /INVITE_CREATOR_SCOPE_STALE/);
   assert.match(route, /ensureRoleExists\(\{ agencyId: currentInvite\.agencyId, roleKey: currentInvite\.roleKey, db: tx \}\)/);
   assert.match(route, /validateAssignedCreators\(\{[\s\S]*assignedCreators: currentInvite\.assignedCreators[\s\S]*db: tx/);
@@ -75,7 +79,10 @@ test("creator scope is authoritative for creator listing and automation broad ac
   assert.match(creators, /allowedCreatorScope/);
   assert.match(creators, /CREATOR_CREATE_REQUIRES_ALL_SCOPE/);
   assert.match(creators, /requireCreatorAccess/);
-  assert.match(creators, /pendingInvitations/);
+  assert.match(creators, /retireCreatorWithinTransaction/);
+  const scope = read("src/services/creator-access-scope-authority-service.js");
+  assert.match(scope, /UPDATE "AgencyMember"[\s\S]*phase2_remove_creator_from_access_scope/);
+  assert.match(scope, /UPDATE "AgencyInvitation"[\s\S]*phase2_remove_creator_from_access_scope/);
 });
 
 
@@ -95,6 +102,7 @@ test("invite registration path enforces the same role, creator-scope and functio
   assert.match(auth, /ensureRoleExists\(\{ agencyId: inv\.agencyId, roleKey: inv\.roleKey, db: tx \}\)/);
   assert.match(auth, /validateAssignedCreators\(\{[\s\S]*assignedCreators: inv\.assignedCreators/);
   assert.match(auth, /const functions = cleanFunctions\(inv\.functions\)/);
+  assert.match(auth, /materializeInvitationMemberWithinTransaction/);
   assert.match(auth, /tx\.teamMemberFunction\.createMany/);
   assert.match(auth, /tokenHash: hashInviteToken\(inviteToken\)/);
   assert.match(auth, /claimedMemberId: member\.id/);

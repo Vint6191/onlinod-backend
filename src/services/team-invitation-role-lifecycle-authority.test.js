@@ -40,8 +40,10 @@ test("authenticated invitation claim holds custom-role lifecycle through member 
   const body = invitations.slice(start);
   assert.match(body, /lockTeamRoleLifecycle\(\{ tx, agencyId: currentInvite\.agencyId, roleKey: currentInvite\.roleKey, mode: "share" \}\)/);
   assertBefore(body, "lockTeamRoleLifecycle", "ensureRoleExists", "role must be fenced before role resolution");
-  assertBefore(body, "lockTeamRoleLifecycle", "agencyMember.update", "role fence must precede restored-member assignment");
-  assertBefore(body, "lockTeamRoleLifecycle", "agencyMember.create", "role fence must precede new-member assignment");
+  assertBefore(body, "lockTeamRoleLifecycle", "materializeInvitationMemberWithinTransaction", "role fence must precede canonical member materialization");
+  assert.match(team, /materializeInvitationMemberWithinTransaction[\s\S]*AgencyMember" WHERE "agencyId"=\$1 AND "userId"=\$2 FOR UPDATE/);
+  assert.match(team, /materializeInvitationMemberWithinTransaction[\s\S]*agencyMember\.update/);
+  assert.match(team, /materializeInvitationMemberWithinTransaction[\s\S]*agencyMember\.create/);
   assertBefore(body, "lockTeamRoleLifecycle", "agencyInvitation.updateMany", "role fence must remain held through claim CAS");
 });
 
@@ -52,7 +54,7 @@ test("registration invitation claim uses the same custom-role lifecycle capabili
   const body = auth.slice(start, end);
   assert.match(body, /lockTeamRoleLifecycle\(\{ tx, agencyId: inv\.agencyId, roleKey: inv\.roleKey, mode: "share" \}\)/);
   assertBefore(body, "lockTeamRoleLifecycle", "ensureRoleExists", "registration must fence the role before resolution");
-  assertBefore(body, "lockTeamRoleLifecycle", "agencyMember.create", "registration must hold role fence before member creation");
+  assertBefore(body, "lockTeamRoleLifecycle", "materializeInvitationMemberWithinTransaction", "registration must hold role fence before canonical member materialization");
   assertBefore(body, "lockTeamRoleLifecycle", "agencyInvitation.updateMany", "registration must hold role fence through invitation claim CAS");
 });
 

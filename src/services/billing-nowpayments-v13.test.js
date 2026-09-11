@@ -1136,12 +1136,15 @@ test("V13.3.1 expiry scheduler reconciles future ACTIVE aggregates and does not 
 });
 
 
-test("V13.3.1 creator soft/hard delete recomputes billing aggregate in the delete transaction", () => {
+test("V13.3.1 creator soft/hard delete recomputes billing aggregate in the canonical delete transaction", () => {
   const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{[\s\S]*?deleted: before,[\s\S]*?historyPreserved: true[\s\S]*?\n  \}\);\n\}\);/)?.[0] || "";
+  const lifecycle = fs.readFileSync(path.join(__dirname, "creator-lifecycle-authority-service.js"), "utf8");
   assert.match(deleteRoute, /prisma\.\$transaction/);
+  assert.match(deleteRoute, /retireCreatorWithinTransaction\(\{/);
   assert.match(deleteRoute, /syncAgencyBillingAggregate\(tx, before\.agencyId, deletedAt\)/);
-  assert.match(deleteRoute, /tx\.creatorAccount\.update/);
-  assert.match(deleteRoute, /DESTRUCTIVE_CREATOR_CLEANUP/);
+  assert.ok(deleteRoute.indexOf("retireCreatorWithinTransaction") < deleteRoute.indexOf("syncAgencyBillingAggregate"));
+  assert.match(lifecycle, /creatorAccount\.update\(\{[\s\S]*?status: "DISABLED", deletedAt: retiredAt/);
+  assert.match(lifecycle, /WORK_CLASS\.DESTRUCTIVE_CREATOR_CLEANUP/);
   assert.doesNotMatch(deleteRoute, /tx\.creatorAccount\.delete/);
 });
 

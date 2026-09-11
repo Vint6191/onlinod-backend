@@ -16,6 +16,10 @@ function identityDb({ contact = "@model", updateCount = 1 } = {}) {
     agency: { async findUnique({ where }) { return where.id === "agency_1" ? { id: "agency_1", deletedAt: null, status: "ACTIVE" } : null; } },
     agencyMember: { async findFirst({ where }) { return (!where.id || where.id === owner.id) && (!where.userId || where.userId === owner.userId) ? { ...owner, deletedAt: null, deactivatedAt: null } : null; } },
     creatorAccount: {
+      async findMany({ where }) {
+        const ids = Array.isArray(where?.id?.in) ? where.id.in : [];
+        return ids.includes(creator.id) && where?.agencyId === creator.agencyId && (!Object.prototype.hasOwnProperty.call(where, "deletedAt") || where.deletedAt !== null || creator.deletedAt == null) ? [{ id: creator.id }] : [];
+      },
       async updateMany({ where, data }) {
         updates.push({ where, data });
         if (updateCount !== 1 || where.id !== creator.id || where.agencyId !== creator.agencyId || where.telegramContact !== creator.telegramContact) return { count: 0 };

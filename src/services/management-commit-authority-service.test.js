@@ -23,9 +23,12 @@ function loadAuthority({ permission = true } = {}) {
   }
 }
 
-function dbWith(member) {
+function dbWith(member, { liveCreatorIds = ["creator-1"] } = {}) {
   return {
     agency: { findUnique: async () => ({ id: "agency-1", deletedAt: null, status: "ACTIVE" }) },
+    creatorAccount: {
+      findMany: async ({ where }) => (where?.id?.in || []).filter((id) => liveCreatorIds.includes(id)).map((id) => ({ id })),
+    },
     agencyMember: { findFirst: async ({ where }) => member && where.id === member.id && where.userId === member.userId ? { ...member } : null },
   };
 }
@@ -85,4 +88,23 @@ test("ManagementCommitAuthority ownerOrAdmin contract accepts explicit ADMIN", a
   const { assertManagementCommitAuthority } = loadAuthority();
   const out = await assertManagementCommitAuthority({ tx: dbWith(admitted), agencyId: "agency-1", actorMember: admitted, ownerOrAdmin: true });
   assert.equal(out.member.id, admitted.id);
+});
+
+test("ManagementCommitAuthority validates scope without SHARE lock when canonical Creator FOR UPDATE is already owned", async () => {
+  const { assertManagementCommitAuthority } = loadAuthority();
+  const sql = [];
+  const db = dbWith(admitted);
+  db.$queryRawUnsafe = async (query, ...args) => {
+    sql.push(String(query));
+    if (String(query).includes('FROM "User"')) return [{ id: admitted.userId }];
+    if (String(query).includes('FROM "AgencyMember"')) return [{ id: admitted.id }];
+    throw new Error(`unexpected raw query: ${query}`);
+  };
+  const out = await assertManagementCommitAuthority({
+    tx: db, agencyId: "agency-1", actorMember: admitted, permissionKey: "creators.manage",
+    creatorIds: ["creator-1"], agencyAlreadyLocked: true, creatorRowsAlreadyLocked: true,
+  });
+  assert.equal(out.member.id, admitted.id);
+  assert.equal(sql.some((query) => query.includes('FROM "CreatorAccount"')), false);
+  assert.equal(sql.some((query) => query.includes('FROM "User"') && query.includes('FOR SHARE')), true);
 });

@@ -52,6 +52,7 @@ const {
   currentDependencyRevision,
   hasOutstandingDomainWork,
 } = require("./domain-work-authority-service");
+const { processTelegramAccountRetirementFanout } = require("./telegram-account-retirement-fanout-service");
 const {
   FAMILY: PHASE2_COVERAGE_FAMILY,
   GENERATION: PHASE2_COVERAGE_GENERATION,
@@ -1144,6 +1145,25 @@ async function maybeRunPhase2DependencyFanout({ db = prisma, now = new Date() } 
   const report = { ok: true, selected: Number(claim?.items?.length || 0), published: 0, sourcePublished: 0, reminderReprojected: 0, completed: 0, yielded: 0, failed: 0, lostOwnership: 0 };
   for (const item of claim?.items || []) {
     try {
+      if (String(item.objectType) === "TelegramAccountRetirement") {
+        const retirement = await processTelegramAccountRetirementFanout({ db, item, now });
+        if (retirement.complete === false) {
+          const yielded = await yieldDomainWorkClaim({
+            db,
+            item,
+            ownerToken: claim.ownerToken,
+            progressCursor: retirement.progressCursor || null,
+            availableAt: now,
+            fallbackNow: new Date(),
+          });
+          if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
+        } else {
+          const ack = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: new Date() });
+          if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
+        }
+        continue;
+      }
+
       if (String(item.objectType) === "TeamSentMessageLedger") {
         const moneyFanout = await processTeamMoneyEvidenceFanout({ db, item, now });
         report.published += Number(moneyFanout?.published || 0);

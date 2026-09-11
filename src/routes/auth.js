@@ -18,7 +18,7 @@ const {
   revokeRefreshToken,
 } = require("../services/auth-service");
 const { resolveEffectivePermissions, validateAssignedCreators } = require("../services/team-access-control");
-const { cleanFunctions, ensureRoleExists, lockTeamRoleLifecycle } = require("../services/team-administration-service");
+const { cleanFunctions, ensureRoleExists, lockTeamRoleLifecycle, materializeInvitationMemberWithinTransaction } = require("../services/team-administration-service");
 const { audit } = require("../services/audit-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 
@@ -213,21 +213,18 @@ router.post("/register", async (req, res) => {
           throw err;
         }
         const functions = cleanFunctions(inv.functions);
-        const member = await tx.agencyMember.create({
-          data: {
-            userId: user.id,
-            agencyId: inv.agencyId,
-            role: roleKeyToLegacy(roleKey),
-            roleKey,
-            displayName: inv.displayName || input.name || null,
-            initials: initialsFrom(inv.displayName || input.name || email),
-            tone: "amber",
-            commission: inv.commission || { kind: "none" },
-            assignedCreators: creatorScope.value,
-            permissions: {},
-            lastSeenLabel: "just joined",
-          },
+        const membership = await materializeInvitationMemberWithinTransaction({
+          tx,
+          agencyId: inv.agencyId,
+          userId: user.id,
+          roleKey,
+          displayName: inv.displayName || input.name || null,
+          initials: initialsFrom(inv.displayName || input.name || email),
+          commission: inv.commission || { kind: "none" },
+          assignedCreators: creatorScope.value,
+          permissions: {},
         });
+        const member = membership.member;
         if (functions.length) {
           await tx.teamMemberFunction.createMany({
             data: functions.map((functionKey) => ({ agencyId: inv.agencyId, memberId: member.id, functionKey })),

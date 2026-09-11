@@ -22,7 +22,7 @@ function productionClaimDb(now) {
       const text = String(statement);
       sql.push(text);
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('FROM "Phase2WorkFamilyState" s')) {
+      if (text.includes('SELECT f."agencyId"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) {
         agencySelections += 1;
         return agencySelections === 1 ? [{ agencyId: "agency-1" }] : [];
       }
@@ -32,38 +32,27 @@ function productionClaimDb(now) {
   return { db, sql };
 }
 
-test("F53-02/F55/INT7 Root A production claim uses bounded partition catalog admission without ready-head authority", async () => {
+test("F56 CUT A broad claim uses current partition projection without FamilyState execution authority", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const fx = productionClaimDb(now);
   const result = await authority.claimDomainWorkBatch({
     db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
-    ownerToken: "actual55-worker", limit: 25, perAgencyQuantum: 5, perPartitionQuantum: 2, fallbackNow: now,
+    ownerToken: "actual56-worker", limit: 25, perAgencyQuantum: 5, perPartitionQuantum: 2, fallbackNow: now,
   });
   assert.deepEqual(result.items, []);
-  const agencyDiscovery = fx.sql.find((entry) => entry.includes('FROM "Phase2WorkFamilyState" s'));
+  const agencyDiscovery = fx.sql.find((entry) => entry.includes('SELECT f."agencyId"') && entry.includes('FROM "Phase2WorkBroadClaimPartitionState" f'));
   const claimSql = fx.sql.find((entry) => entry.includes('WITH selected_partitions AS MATERIALIZED'));
-  assert.ok(agencyDiscovery, "production broad claim must choose a current Agency from family state");
+  assert.ok(agencyDiscovery, "production broad claim must choose Agency from current partition projection");
   assert.ok(claimSql, "production SQL claim path must execute");
-  assert.match(agencyDiscovery, /"lastBroadClaimedAt" ASC NULLS FIRST/);
+  assert.match(agencyDiscovery, /AND EXISTS \([\s\S]*FROM "DomainWorkItem" d/);
+  assert.match(agencyDiscovery, /ORDER BY f\."lastClaimedAt" ASC NULLS FIRST/);
   assert.match(claimSql, /FROM "Phase2WorkBroadClaimPartitionState" f/);
-  assert.match(claimSql, /AND EXISTS \([\s\S]*FROM "DomainWorkItem" d/);
-  assert.match(claimSql, /ORDER BY f\."lastClaimedAt" ASC NULLS FIRST/);
-  assert.doesNotMatch(claimSql, /DISTINCT ON \(d\."partitionKey"\)/);
   assert.match(claimSql, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT \$6/);
-  assert.match(claimSql, /d\."agencyId"=\$4/);
-  assert.match(claimSql, /"isOutstanding"=TRUE/);
-  assert.doesNotMatch(claimSql, /row_number\(\)/i);
-  assert.doesNotMatch(claimSql, /LIMIT 4096/i);
+  assert.doesNotMatch(fx.sql.join("\n"), /FROM "Phase2WorkFamilyState" s/);
   assert.doesNotMatch(fx.sql.join("\n"), /DomainWorkReadyAgency|DomainWorkReadyPartition/);
-  assert.doesNotMatch(fx.sql.join("\n"), /phase2_lock_domain_work_agency_head/);
-  const recoveryAdmission = fx.sql.filter((entry) => entry.includes('FROM "Phase2WorkBroadClaimPartitionState" f') && entry.includes('LEFT JOIN "Phase2WorkFamilyState" s'));
-  assert.equal(recoveryAdmission.length, 1,
-    "family-state recovery admission is capped at one catalog probe per broad claim batch");
-  assert.doesNotMatch(recoveryAdmission[0], /SELECT d\."agencyId"[\s\S]*LEFT JOIN "Phase2WorkFamilyState"/,
-    "normal negative recovery must not scan the complete DWI backlog");
 });
 
-test("INT7 Root A double-projection fallback rebuilds missing/stale family state after physical DWI claim in lock order", async () => {
+test("F56 CUT A physical fallback repairs only the missing current partition projection", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const sql = [];
   const db = {
@@ -74,35 +63,29 @@ test("INT7 Root A double-projection fallback rebuilds missing/stale family state
     async $queryRawUnsafe(statement) {
       const text = String(statement); sql.push(text);
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('FROM "Phase2WorkBroadClaimPartitionState" f') && text.includes('LEFT JOIN "Phase2WorkFamilyState" s')) return [];
-      if (text.includes('FROM "Phase2WorkFamilyState" s')) return [];
+      if (text.includes('SELECT f."agencyId"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [];
       if (text.includes('SELECT d."agencyId"') && text.includes('FROM "DomainWorkItem" d')) return [{ agencyId: "agency-recovered" }];
-      if (text.includes('WITH selected_partitions AS MATERIALIZED')) return [{ id: "claimed-recovery-row", agencyId: "agency-recovered", partitionKey: "creator-recovered" }];
-      if (text.includes('INSERT INTO "Phase2WorkFamilyState"')) return [{ agencyId: "agency-recovered" }];
+      if (text.includes('WITH selected_partitions AS MATERIALIZED')) return [];
+      if (text.includes('WITH candidate AS MATERIALIZED') && text.includes('INSERT INTO "Phase2WorkBroadClaimPartitionState"')) {
+        return [{ id: "claimed-recovery-row", agencyId: "agency-recovered", partitionKey: "creator-recovered" }];
+      }
       return [];
     },
   };
-  await authority.claimDomainWorkBatch({
+  const result = await authority.claimDomainWorkBatch({
     db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION, ownerToken: "recovery-worker",
     limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, fallbackNow: now,
   });
-  const repair = sql.find((entry) => entry.includes('INSERT INTO "Phase2WorkFamilyState"'));
-  const claim = sql.find((entry) => entry.includes('WITH selected_partitions AS MATERIALIZED'));
-  assert.ok(repair, "physical recovery must reconstruct family-state after a successful physical claim");
-  assert.ok(sql.indexOf(claim) < sql.indexOf(repair), "recovery must preserve DWI -> family-state lock order");
-  assert.match(repair, /WITH bounded_live AS MATERIALIZED/);
-  assert.match(repair, /LIMIT 1024/);
-  assert.match(repair, /COUNT\(\*\)::integer/);
-  assert.doesNotMatch(repair, /COUNT\(\*\)::integer AS n,MAX\(d\."updatedAt"\)[\s\S]*FROM "DomainWorkItem" d/);
-  assert.match(repair, /"requestedSequence"=GREATEST/);
-  assert.match(repair, /"convergedSequence"=LEAST/);
-  assert.ok(claim, "recovered Agency must continue through normal bounded claim");
+  assert.equal(result.items.length, 1);
+  const fallback = sql.find((entry) => entry.includes('WITH candidate AS MATERIALIZED') && entry.includes('INSERT INTO "Phase2WorkBroadClaimPartitionState"'));
+  assert.ok(fallback);
+  assert.match(fallback, /FOR UPDATE OF d SKIP LOCKED/);
+  assert.doesNotMatch(sql.join("\n"), /INSERT INTO "Phase2WorkFamilyState"|UPDATE "Phase2WorkFamilyState"/);
 });
 
-test("INT7 Root A catalog recovery candidate cannot starve behind continuously healthy Agencies", async () => {
+test("F56 CUT A current partition candidate is admitted without FamilyState starvation gate", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const sql = [];
-  let healthySelections = 0;
   let claimedAgency = null;
   const db = {
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
@@ -112,36 +95,21 @@ test("INT7 Root A catalog recovery candidate cannot starve behind continuously h
     async $queryRawUnsafe(statement, ...params) {
       const text = String(statement); sql.push(text);
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('FROM "Phase2WorkBroadClaimPartitionState" f') && text.includes('LEFT JOIN "Phase2WorkFamilyState" s')) {
-        return [{ agencyId: "agency-recovery" }];
-      }
-      if (text.includes('FROM "Phase2WorkFamilyState" s')) {
-        healthySelections += 1;
-        return [{ agencyId: "agency-always-healthy" }];
-      }
+      if (text.includes('SELECT f."agencyId"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [{ agencyId: "agency-current" }];
       if (text.includes('WITH selected_partitions AS MATERIALIZED')) {
         claimedAgency = params[3];
-        return [{ id: "recovery-work", agencyId: claimedAgency, partitionKey: "creator-recovery" }];
+        return [{ id: "work-1", agencyId: claimedAgency, partitionKey: "creator-1" }];
       }
-      if (text.includes('INSERT INTO "Phase2WorkFamilyState"')) return [{ agencyId: "agency-recovery" }];
       return [];
     },
   };
-
   const result = await authority.claimDomainWorkBatch({
-    db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION, ownerToken: "int6-starvation-proof",
+    db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION, ownerToken: "cut-a",
     limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, fallbackNow: now,
   });
   assert.equal(result.items.length, 1);
-  assert.equal(claimedAgency, "agency-recovery", "broken family projection must be admitted even while a healthy Agency is available");
-  assert.equal(healthySelections, 0, "recovery candidate is self-healed before normal family-state scheduling can starve it");
-  const recovery = sql.find((entry) => entry.includes('FROM "Phase2WorkBroadClaimPartitionState" f') && entry.includes('LEFT JOIN "Phase2WorkFamilyState" s'));
-  assert.ok(recovery);
-  assert.match(recovery, /s\."agencyId" IS NULL/);
-  assert.match(recovery, /s\."activeGeneration" IS DISTINCT FROM \$3/);
-  assert.match(recovery, /s\."outstandingCount"<=0/);
-  assert.match(recovery, /AND EXISTS \([\s\S]*FROM "DomainWorkItem" d[\s\S]*LIMIT 1/);
-  assert.match(recovery, /ORDER BY f\."lastClaimedAt" ASC NULLS FIRST/);
+  assert.equal(claimedAgency, "agency-current");
+  assert.doesNotMatch(sql.join("\n"), /Phase2WorkFamilyState/);
 });
 
 test("INT7 Root A partition catalog is populated by a non-authoritative DWI trigger and bootstrap seed", () => {
@@ -280,7 +248,7 @@ test("INT6 Root A projected family zero cannot false-green while current DWI sti
   };
   const state = await authority.domainWorkFamilyState({ db, agencyId: "agency-1", workClass });
   assert.equal(state.fresh, false);
-  assert.equal(state.state, "FAMILY_STATE_FALSE_ZERO");
+  assert.equal(state.state, "CURRENT_WORK_PRESENT");
   assert.equal(state.hasOutstanding, true);
   assert.equal(await authority.hasOutstandingDomainWork({ db, agencyId: "agency-1", workClass }), true);
 });
@@ -296,16 +264,15 @@ test("INT6 Root A stale family projection defers to physical current-generation 
   };
   let state = await authority.domainWorkFamilyState({ db, agencyId: "agency-1", workClass });
   assert.equal(state.fresh, true);
-  assert.equal(state.state, "NO_LIVE_WORK_STALE_FAMILY_PROJECTION");
+  assert.equal(state.state, "NO_LIVE_WORK");
   assert.equal(state.hasOutstanding, false);
   assert.equal(state.outstandingCount, 0);
   assert.equal(state.activeGeneration, generation);
-  assert.equal(state.familyGeneration, "retired-generation");
-
+  
   live = true;
   state = await authority.domainWorkFamilyState({ db, agencyId: "agency-1", workClass });
   assert.equal(state.fresh, false);
-  assert.equal(state.state, "FAMILY_STATE_GENERATION_STALE");
+  assert.equal(state.state, "CURRENT_WORK_PRESENT");
   assert.equal(state.hasOutstanding, true);
 });
 
@@ -319,7 +286,7 @@ test("INT5 Root A missing family-state never false-greens while current DWI is o
   };
   const state = await authority.domainWorkFamilyState({ db, agencyId: "agency-1", workClass });
   assert.equal(state.fresh, false);
-  assert.equal(state.state, "FAMILY_STATE_MISSING");
+  assert.equal(state.state, "CURRENT_WORK_PRESENT");
   assert.equal(state.hasOutstanding, true);
   assert.equal(await authority.hasOutstandingDomainWork({ db, agencyId: "agency-1", workClass }), true);
 });

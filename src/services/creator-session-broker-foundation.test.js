@@ -42,10 +42,13 @@ test("V20.22 server exposes canonical broker with legacy AccessSnapshot routes p
 test("creator removal revokes and zeroes the new canonical credential envelope through the centralized retirement lifecycle", () => {
   const creators = read("src/routes/creators.js");
   const admin = read("src/routes/admin.js");
+  const lifecycle = read("src/services/creator-lifecycle-authority-service.js");
   const retirement = read("src/services/creator-agency-removal.js");
   for (const source of [creators, admin]) {
-    assert.match(source, /retireCreatorCryptoMaterialOnRemoval\(\{/);
+    assert.match(source, /retireCreatorWithinTransaction\(\{/);
+    assert.doesNotMatch(source, /retireCreatorCryptoMaterialOnRemoval\(\{/);
   }
+  assert.match(lifecycle, /retireCreatorCryptoMaterialOnRemoval\(\{[\s\S]*?db: tx,[\s\S]*?creatorId: creator,[\s\S]*?retiredAt/);
   assert.match(retirement, /creatorSessionState\.updateMany/);
   assert.match(retirement, /status: "REVOKED"/);
   assert.match(retirement, /encryptedPayload: null/);
