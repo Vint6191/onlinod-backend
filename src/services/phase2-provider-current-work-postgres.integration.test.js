@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { authorizeFixtureTransaction, withFixtureAuthorities, cleanupAgencyFixture } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 function token(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -46,6 +47,7 @@ test("Phase2 PostgreSQL provider current-work triggers preserve exact dirty/debt
   const prisma = require("../prisma");
   try {
     await rollbackTx(prisma, async (tx) => {
+      await authorizeFixtureTransaction(tx, { team: true, creator: true });
       const agency = { id: token("phase2_agency") };
       const user = { id: token("phase2_user") };
       const member = { id: token("phase2_member") };

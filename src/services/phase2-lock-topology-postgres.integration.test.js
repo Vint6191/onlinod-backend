@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { withFixtureAuthorities, cleanupAgencyFixture } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 function deferred() {
   let resolve;
@@ -23,7 +24,7 @@ test("Phase2 PostgreSQL lock topology: same-Agency shared work is parallel and e
   let exclusive = null;
   let agency = null;
   try {
-    agency = await prisma.agency.create({ data: { name: `Phase2 lock PG ${Date.now()} ${Math.random().toString(16).slice(2)}` }, select: { id: true } });
+    agency = await withFixtureAuthorities(prisma, { team: true }, (tx) => tx.agency.create({ data: { name: `Phase2 lock PG ${Date.now()} ${Math.random().toString(16).slice(2)}` }, select: { id: true } }));
 
     const firstLocked = deferred();
     releaseFirst = deferred();
@@ -102,7 +103,7 @@ test("Phase2 PostgreSQL lock topology: same-Agency shared work is parallel and e
     releaseFirst?.resolve();
     await Promise.allSettled([first, secondShared, rowWriter, exclusive].filter(Boolean));
     if (agency?.id) {
-      try { await prisma.agency.delete({ where: { id: agency.id } }); } catch (_) {}
+      try { await cleanupAgencyFixture(prisma, { agencyId: agency.id }); } catch (_) {}
     }
     if (typeof prisma.$disconnect === "function") await prisma.$disconnect();
   }

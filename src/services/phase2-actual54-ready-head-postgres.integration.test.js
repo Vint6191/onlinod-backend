@@ -5,11 +5,12 @@ const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
 const authority = require("./domain-work-authority-service");
+const { withFixtureAuthorities, cleanupAgencyFixture } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 function token(prefix) { return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`; }
 
 async function cleanupAgency(db, agencyId) {
-  await db.agency.delete({ where: { id: agencyId } }).catch(() => undefined);
+  await cleanupAgencyFixture(db, { agencyId }).catch(() => undefined);
 }
 
 test("F55-01 PostgreSQL/Prisma: production broad and creator-scoped claims execute without VOID decoding", { skip: !enabled }, async () => {
@@ -18,7 +19,7 @@ test("F55-01 PostgreSQL/Prisma: production broad and creator-scoped claims execu
   const agencyId = token("p2_actual55_claim_agency");
   const creatorId = token("creator");
   try {
-    await db.agency.create({ data: { id: agencyId, name: agencyId } });
+    await withFixtureAuthorities(db, { team: true }, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
     await authority.publishDomainWork({ db, agencyId, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
       objectType: "Actual55BroadClaim", objectId: token("broad"), partitionKey: creatorId, creatorId, availableAt: new Date(Date.now() - 1000) });
     const broad = await authority.claimDomainWorkBatch({ db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
@@ -47,7 +48,7 @@ test("F55-05 PostgreSQL: publish same identity racing ACK converges without advi
   const db2 = new PrismaClient();
   const agencyId = token("p2_actual55_publish_ack");
   try {
-    await db1.agency.create({ data: { id: agencyId, name: agencyId } });
+    await withFixtureAuthorities(db1, { team: true }, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
     for (let i = 0; i < 12; i += 1) {
       const objectId = token(`race_${i}`);
       await authority.publishDomainWork({ db: db1, agencyId, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
@@ -80,7 +81,7 @@ test("INT7 PostgreSQL: missing broad partition catalog self-heals from one physi
   const creatorId = token("creator_catalog");
   const objectId = token("catalog_work");
   try {
-    await db.agency.create({ data: { id: agencyId, name: agencyId } });
+    await withFixtureAuthorities(db, { team: true }, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
     await authority.publishDomainWork({ db, agencyId, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
       objectType: "Actual55Int7CatalogFallback", objectId, partitionKey: creatorId, creatorId,
       availableAt: new Date(Date.now() - 1000) });

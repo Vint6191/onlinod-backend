@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { authorizeFixtureTransaction, withFixtureAuthorities, cleanupAgencyFixture } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 function token(prefix) { return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`; }
 function deferred() { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; }
 async function mustStillWait(promise, ms = 75) {
@@ -14,19 +15,21 @@ async function mustStillWait(promise, ms = 75) {
 
 async function createFixture(db, ids) {
   const now = new Date("2026-09-10T10:00:00.000Z");
-  await db.$executeRawUnsafe(`INSERT INTO "User" ("id","email","passwordHash","createdAt","updatedAt") VALUES ($1,$2,'p2',clock_timestamp(),clock_timestamp())`, ids.userId, `${ids.userId}@phase2.invalid`);
-  await db.$executeRawUnsafe(`INSERT INTO "Agency" ("id","name","plan","status","createdAt","updatedAt") VALUES ($1,$2,'trial','TRIAL',clock_timestamp(),clock_timestamp())`, ids.agencyId, `P2 response authority ${ids.agencyId}`);
-  await db.$executeRawUnsafe(`INSERT INTO "AgencyMember" ("id","agencyId","userId","role","accessEpoch","createdAt","updatedAt") VALUES ($1,$2,$3,'OWNER',1,clock_timestamp(),clock_timestamp())`, ids.memberId, ids.agencyId, ids.userId);
-  await db.$executeRawUnsafe(`INSERT INTO "CreatorAccount" ("id","agencyId","displayName","status","connectionState","connectionGeneration","createdAt","updatedAt") VALUES ($1,$2,$3,'DRAFT','ENROLLMENT_REQUIRED',0,clock_timestamp(),clock_timestamp())`, ids.creatorId, ids.agencyId, ids.creatorId);
-  await db.teamActivityEvent.create({ data: {
-    id: ids.incomingId, agencyId: ids.agencyId, creatorId: ids.creatorId, dialogId: ids.dialogId, fanId: ids.dialogId,
-    type: "fan_message_received", eventKind: "FAN_MESSAGE_RECEIVED", messageId: ids.incomingMessageId, ts: new Date(now.getTime() - 120_000), source: "phase2_pg_test",
-  }});
-  return db.teamSentMessageLedger.create({ data: {
-    id: ids.replyLedgerId, agencyId: ids.agencyId, accountId: ids.accountId, creatorId: ids.creatorId,
-    memberId: ids.memberId, dialogId: ids.dialogId, fanId: ids.dialogId, messageId: ids.replyMessageId,
-    localSeed: ids.replyLedgerId, sentAt: now, source: "manual",
-  }});
+  return withFixtureAuthorities(db, { team: true, creator: true }, async (tx) => {
+    await tx.$executeRawUnsafe(`INSERT INTO "User" ("id","email","passwordHash","createdAt","updatedAt") VALUES ($1,$2,'p2',clock_timestamp(),clock_timestamp())`, ids.userId, `${ids.userId}@phase2.invalid`);
+    await tx.$executeRawUnsafe(`INSERT INTO "Agency" ("id","name","plan","status","createdAt","updatedAt") VALUES ($1,$2,'trial','TRIAL',clock_timestamp(),clock_timestamp())`, ids.agencyId, `P2 response authority ${ids.agencyId}`);
+    await tx.$executeRawUnsafe(`INSERT INTO "AgencyMember" ("id","agencyId","userId","role","accessEpoch","createdAt","updatedAt") VALUES ($1,$2,$3,'OWNER',1,clock_timestamp(),clock_timestamp())`, ids.memberId, ids.agencyId, ids.userId);
+    await tx.$executeRawUnsafe(`INSERT INTO "CreatorAccount" ("id","agencyId","displayName","status","connectionState","connectionGeneration","createdAt","updatedAt") VALUES ($1,$2,$3,'DRAFT','ENROLLMENT_REQUIRED',0,clock_timestamp(),clock_timestamp())`, ids.creatorId, ids.agencyId, ids.creatorId);
+    await tx.teamActivityEvent.create({ data: {
+      id: ids.incomingId, agencyId: ids.agencyId, creatorId: ids.creatorId, dialogId: ids.dialogId, fanId: ids.dialogId,
+      type: "fan_message_received", eventKind: "FAN_MESSAGE_RECEIVED", messageId: ids.incomingMessageId, ts: new Date(now.getTime() - 120_000), source: "phase2_pg_test",
+    }});
+    return tx.teamSentMessageLedger.create({ data: {
+      id: ids.replyLedgerId, agencyId: ids.agencyId, accountId: ids.accountId, creatorId: ids.creatorId,
+      memberId: ids.memberId, dialogId: ids.dialogId, fanId: ids.dialogId, messageId: ids.replyMessageId,
+      localSeed: ids.replyLedgerId, sentAt: now, source: "manual",
+    }});
+  });
 }
 
 async function cleanupFixture(db, ids) {
@@ -34,8 +37,7 @@ async function cleanupFixture(db, ids) {
   await db.teamCoverageSession.deleteMany({ where: { agencyId: ids.agencyId } }).catch(() => undefined);
   await db.teamSentMessageLedger.deleteMany({ where: { agencyId: ids.agencyId } }).catch(() => undefined);
   await db.teamActivityEvent.deleteMany({ where: { agencyId: ids.agencyId } }).catch(() => undefined);
-  await db.agency.delete({ where: { id: ids.agencyId } }).catch(() => undefined);
-  await db.user.delete({ where: { id: ids.userId } }).catch(() => undefined);
+  await cleanupAgencyFixture(db, { agencyId: ids.agencyId, userIds: [ids.userId] }).catch(() => undefined);
 }
 
 test("A32/A33 PostgreSQL: response and coverage production writers wait for their stable advisory commit authorities", { skip: !enabled }, async () => {

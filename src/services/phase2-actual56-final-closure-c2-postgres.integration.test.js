@@ -42,6 +42,13 @@ async function bounded(promise, label, ms = 7_500) {
   }
 }
 
+async function withTeamGeneration(db, workFn, options = undefined) {
+  return db.$transaction(async (tx) => {
+    await release.assertTeamControlPlaneWriteAdmission(tx);
+    return workFn(tx);
+  }, options);
+}
+
 async function cleanupAgency(db, agencyId) {
   try {
     await work.publishDomainWork({
@@ -54,6 +61,7 @@ async function cleanupAgency(db, agencyId) {
       availableAt: new Date(Date.now() - 1_000),
     });
     await db.$transaction(async (tx) => {
+      await release.assertTeamControlPlaneWriteAdmission(tx);
       await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
       await tx.agency.delete({ where: { id: agencyId } });
     });
@@ -71,33 +79,35 @@ async function createTeamFixture(db, { withRole = false, withCreators = 0 } = {}
   const memberBId = token("c2_member_b");
   const roleKey = withRole ? token("role").slice(0, 80).toLowerCase() : null;
 
-  await db.agency.create({ data: { id: agencyId, name: agencyId } });
-  await db.user.createMany({
-    data: [
-      { id: userAId, email: `${userAId}@example.test`, passwordHash: "integration" },
-      { id: userBId, email: `${userBId}@example.test`, passwordHash: "integration" },
-    ],
-  });
-  await db.agencyMember.createMany({
-    data: [
-      { id: memberAId, agencyId, userId: userAId, role: "OWNER", roleKey: "owner", assignedCreators: "all" },
-      { id: memberBId, agencyId, userId: userBId, role: "MANAGER", roleKey: roleKey || "manager", assignedCreators: "all" },
-    ],
-  });
-  if (roleKey) {
-    await db.agencyCustomRole.create({
-      data: { id: token("c2_role"), agencyId, key: roleKey, label: "C2 integration role", access: {} },
-    });
-  }
-
   const creatorIds = [];
-  for (let index = 0; index < withCreators; index += 1) {
-    const creatorId = token(`c2_creator_${index}`);
-    await release.runCreatorAccountWriteTransaction(db, (tx) => tx.creatorAccount.create({
-      data: { id: creatorId, agencyId, displayName: creatorId, username: token(`c2_username_${index}`) },
-    }));
-    creatorIds.push(creatorId);
-  }
+  await withTeamGeneration(db, async (tx) => {
+    await tx.agency.create({ data: { id: agencyId, name: agencyId } });
+    await tx.user.createMany({
+      data: [
+        { id: userAId, email: `${userAId}@example.test`, passwordHash: "integration" },
+        { id: userBId, email: `${userBId}@example.test`, passwordHash: "integration" },
+      ],
+    });
+    await tx.agencyMember.createMany({
+      data: [
+        { id: memberAId, agencyId, userId: userAId, role: "OWNER", roleKey: "owner", assignedCreators: "all" },
+        { id: memberBId, agencyId, userId: userBId, role: "MANAGER", roleKey: roleKey || "manager", assignedCreators: "all" },
+      ],
+    });
+    if (roleKey) {
+      await tx.agencyCustomRole.create({
+        data: { id: token("c2_role"), agencyId, key: roleKey, label: "C2 integration role", access: {} },
+      });
+    }
+    if (withCreators > 0) await release.authorizeCreatorAccountWrite(tx);
+    for (let index = 0; index < withCreators; index += 1) {
+      const creatorId = token(`c2_creator_${index}`);
+      await tx.creatorAccount.create({
+        data: { id: creatorId, agencyId, displayName: creatorId, username: token(`c2_username_${index}`) },
+      });
+      creatorIds.push(creatorId);
+    }
+  });
 
   const [memberA, memberB] = await Promise.all([
     db.agencyMember.findUnique({ where: { id: memberAId } }),
@@ -206,7 +216,7 @@ test("C2 PostgreSQL: Creator retirement wins before stale scope-add/claim can re
   await withTwoClients(async (left, right) => {
     const fx = await createTeamFixture(left, { withCreators: 1 });
     const [creatorId] = fx.creatorIds;
-    await left.agencyMember.update({ where: { id: fx.memberBId }, data: { assignedCreators: [creatorId] } });
+    await withTeamGeneration(left, (tx) => tx.agencyMember.update({ where: { id: fx.memberBId }, data: { assignedCreators: [creatorId] } }));
     const before = await left.agencyMember.findUnique({ where: { id: fx.memberBId }, select: { accessEpoch: true } });
     const retiredLocked = deferred();
     const releaseRetirement = deferred();
@@ -264,6 +274,7 @@ test("C2 PostgreSQL: cross-Agency User disable keeps User -> Member suffix and c
 
     try {
       const disable = left.$transaction(async (tx) => {
+        await release.assertTeamControlPlaneWriteAdmission(tx);
         await tx.$queryRawUnsafe(`SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE`, fx.userAId);
         await tx.user.update({ where: { id: fx.userAId }, data: { disabledAt: new Date(), sessionsRevokedAt: new Date() } });
         userLocked.resolve();
@@ -304,7 +315,7 @@ test("C2 PostgreSQL: overlapping Creator retirements touching one Member seriali
   await withTwoClients(async (left, right) => {
     const fx = await createTeamFixture(left, { withCreators: 2 });
     const [creatorA, creatorB] = fx.creatorIds;
-    await left.agencyMember.update({ where: { id: fx.memberBId }, data: { assignedCreators: [creatorA, creatorB] } });
+    await withTeamGeneration(left, (tx) => tx.agencyMember.update({ where: { id: fx.memberBId }, data: { assignedCreators: [creatorA, creatorB] } }));
     const before = await left.agencyMember.findUnique({ where: { id: fx.memberBId }, select: { accessEpoch: true } });
     const firstLocked = deferred();
     const releaseFirst = deferred();
@@ -361,7 +372,7 @@ test("C2 PostgreSQL: scope removal can commit before Creator retirement without 
   await withTwoClients(async (left, right) => {
     const fx = await createTeamFixture(left, { withCreators: 1 });
     const [creatorId] = fx.creatorIds;
-    await left.agencyMember.update({ where: { id: fx.memberBId }, data: { assignedCreators: [creatorId] } });
+    await withTeamGeneration(left, (tx) => tx.agencyMember.update({ where: { id: fx.memberBId }, data: { assignedCreators: [creatorId] } }));
     const before = await left.agencyMember.findUnique({ where: { id: fx.memberBId }, select: { accessEpoch: true } });
     const scopeRemoved = deferred();
     const releaseScope = deferred();
@@ -506,6 +517,7 @@ test("C2 PostgreSQL: direct disable of the sole operational OWNER is rejected in
     try {
       await assert.rejects(
         () => left.$transaction(async (tx) => {
+          await release.assertTeamControlPlaneWriteAdmission(tx);
           await tx.$queryRawUnsafe(`SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE`, fx.userAId);
           await assertUserDisableOwnerSafetyPg({ tx, userId: fx.userAId });
           await tx.user.update({ where: { id: fx.userAId }, data: { disabledAt: new Date() } });
@@ -524,16 +536,17 @@ test("C2 PostgreSQL: direct disable of the sole operational OWNER is rejected in
 test("C2 PostgreSQL: concurrent User-disable vs other OWNER demotion cannot commit zero operational OWNERs", { skip: !enabled }, async () => {
   await withTwoClients(async (left, right) => {
     const fx = await createTeamFixture(left);
-    await left.agencyMember.update({
+    await withTeamGeneration(left, (tx) => tx.agencyMember.update({
       where: { id: fx.memberBId },
       data: { role: "OWNER", roleKey: "owner" },
-    });
+    }));
 
     const disableReadComplete = deferred();
     const finishDisable = deferred();
 
     try {
       const disable = left.$transaction(async (tx) => {
+        await release.assertTeamControlPlaneWriteAdmission(tx);
         await tx.$queryRawUnsafe(`SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE`, fx.userBId);
         await assertUserDisableOwnerSafetyPg({ tx, userId: fx.userBId });
         disableReadComplete.resolve();

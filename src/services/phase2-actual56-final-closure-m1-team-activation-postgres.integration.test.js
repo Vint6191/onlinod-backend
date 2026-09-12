@@ -21,6 +21,41 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function token(prefix) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function isFenceError(error, marker) {
+  const text = [error?.message, error?.meta?.message, error?.meta?.code, error?.code].filter(Boolean).join(" ");
+  return text.includes(marker) || text.includes("55000");
+}
+
+async function withTeamGeneration(db, workFn) {
+  return db.$transaction(async (tx) => {
+    await tx.$queryRawUnsafe(
+      `SELECT set_config($1,$2,true) AS value`,
+      release.TEAM_CONTROL_PLANE_DB_SETTING,
+      release.TEAM_CONTROL_PLANE_GENERATION,
+    );
+    return workFn(tx);
+  });
+}
+
+async function cleanupAgency(db, agencyId) {
+  if (!agencyId) return;
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
+      await tx.$queryRawUnsafe(
+        `SELECT set_config($1,$2,true) AS value`,
+        release.TEAM_CONTROL_PLANE_DB_SETTING,
+        release.TEAM_CONTROL_PLANE_GENERATION,
+      );
+      await tx.agency.delete({ where: { id: agencyId } });
+    });
+  } catch (_) {}
+}
+
 async function writeState(db, state, snapshot = null) {
   return db.$transaction(async (tx) => {
     await lockDbAdvisoryXact({ db: tx, key: release.TEAM_CONTROL_PLANE_RELEASE_FENCE_KEY, mode: "exclusive" });
@@ -64,10 +99,16 @@ test("M1 rolling PostgreSQL: DRAINING blocks the new C2 graph and activation ser
   const { PrismaClient } = require("@prisma/client");
   const left = new PrismaClient();
   const right = new PrismaClient();
+  const agencyId = token("m1_activation_agency");
+  const userId = token("m1_activation_user");
+  const memberId = token("m1_activation_member");
   const original = await release.readTeamControlPlaneReleaseAuthority(left);
   assert.ok(original, "TEAM_CONTROL_PLANE release authority must exist after migration");
 
   try {
+    const physicalFence = await release.readTeamControlPlaneDbFenceStatus(left);
+    assert.equal(physicalFence.ready, true, `physical Team DB fence must be complete: ${JSON.stringify(physicalFence)}`);
+
     await writeState(left, "DRAINING");
 
     await assert.rejects(
@@ -76,7 +117,7 @@ test("M1 rolling PostgreSQL: DRAINING blocks the new C2 graph and activation ser
       "new binary must fail on release admission before it can reach Agency lifecycle locking",
     );
 
-    const activated = await release.activateTeamControlPlaneAfterDrain(left, { confirmOldBinaryDrained: true });
+    const activated = await release.activateTeamControlPlaneAfterDrain(left);
     assert.equal(activated.activated || activated.alreadyActive, true);
 
     await assert.rejects(
@@ -84,6 +125,22 @@ test("M1 rolling PostgreSQL: DRAINING blocks the new C2 graph and activation ser
       (error) => error?.code === "AGENCY_NOT_FOUND",
       "after activation the request must cross release admission and reach the Agency lifecycle proof",
     );
+
+    await assert.rejects(
+      left.agency.create({ data: { id: agencyId, name: agencyId } }),
+      (error) => isFenceError(error, "PHASE2_INCOMPATIBLE_TEAM_CONTROL_PLANE_WRITER"),
+      "an old binary must be physically unable to create a live Agency after ACTIVE",
+    );
+    await withTeamGeneration(left, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
+    await left.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "integration" } });
+    await assert.rejects(
+      left.agencyMember.create({ data: { id: memberId, agencyId, userId, role: "OWNER", assignedCreators: "all" } }),
+      (error) => isFenceError(error, "PHASE2_INCOMPATIBLE_TEAM_CONTROL_PLANE_WRITER"),
+      "an old binary remains physically unable to write Team authority after ACTIVE",
+    );
+    await withTeamGeneration(left, (tx) => tx.agencyMember.create({
+      data: { id: memberId, agencyId, userId, role: "OWNER", assignedCreators: "all" },
+    }));
 
     const sharedHeld = deferred();
     const releaseShared = deferred();
@@ -95,7 +152,7 @@ test("M1 rolling PostgreSQL: DRAINING blocks the new C2 graph and activation ser
     });
     await sharedHeld.promise;
 
-    const activation = release.activateTeamControlPlaneAfterDrain(right, { confirmOldBinaryDrained: true })
+    const activation = release.activateTeamControlPlaneAfterDrain(right)
       .finally(() => { activationSettled = true; });
     await delay(120);
     assert.equal(activationSettled, false, "exclusive activation fence must wait for an admitted shared transaction");
@@ -105,6 +162,7 @@ test("M1 rolling PostgreSQL: DRAINING blocks the new C2 graph and activation ser
     const repeated = await activation;
     assert.equal(repeated.alreadyActive, true);
   } finally {
+    await cleanupAgency(left, agencyId);
     try { await writeState(left, null, original); } catch (_) {}
     await Promise.allSettled([left.$disconnect(), right.$disconnect()]);
   }

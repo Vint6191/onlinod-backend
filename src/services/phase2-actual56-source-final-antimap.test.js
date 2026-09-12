@@ -55,6 +55,31 @@ test("SOURCE FINAL anti-map: all Team role-definition writers stay in canonical 
   ], "Role lifecycle writers must not bypass canonical C2 ordering");
 });
 
+test("SOURCE FINAL anti-map: every DB-fenced Team topology table writer is classified", () => {
+  exact(filesMatching(/teamMemberFunction\.(?:create|createMany|upsert|update|updateMany|delete|deleteMany)\s*\(|(?:INSERT INTO|UPDATE|DELETE FROM)\s+"TeamMemberFunction"/), [
+    "src/routes/auth.js",
+    "src/routes/invitations.js",
+    "src/services/team-administration-service.js",
+  ], "TeamMemberFunction writers must enter M1 admission through Team topology/admin authority");
+  exact(filesMatching(/agencyInvitation\.(?:create|createMany|upsert|update|updateMany|delete|deleteMany)\s*\(|(?:INSERT INTO|UPDATE|DELETE FROM)\s+"AgencyInvitation"/), [
+    "src/routes/auth.js",
+    "src/routes/invitations.js",
+    "src/services/creator-access-scope-authority-service.js",
+    "src/services/team-administration-service.js",
+  ], "AgencyInvitation writers must remain release-gated");
+  exact(filesMatching(/agencySubPermissionOverride\.(?:create|createMany|upsert|update|updateMany|delete|deleteMany)\s*\(|(?:INSERT INTO|UPDATE|DELETE FROM)\s+"AgencySubPermissionOverride"/), [
+    "src/services/team-administration-service.js",
+  ], "Sub-permission writers must remain canonical Team Administration");
+  exact(filesMatching(/agency\.(?:create|createMany|upsert)\s*\(|INSERT INTO\s+"Agency"/), [
+    "src/routes/auth.js",
+  ], "New live Agency creation must remain inside the M1-gated Agency + OWNER bootstrap transaction");
+  exact(filesMatching(/agency\.delete(?:Many)?\s*\(|DELETE FROM\s+"Agency"/), [
+    "src/services/phase2-destructive-delete-authority-service.js",
+  ], "Physical Agency identity deletion must remain under M1 + destructive authority");
+  exact(filesMatching(/user\.delete(?:Many)?\s*\(|DELETE FROM\s+"User"/), [],
+    "A future physical User delete must be explicitly classified under terminal Team authority");
+});
+
 test("SOURCE FINAL anti-map: every CreatorAccount storage mutator is classified", () => {
   exact(filesMatching(/creatorAccount\.(?:create|createMany|upsert|update|updateMany|delete|deleteMany)\s*\(|(?:INSERT INTO|UPDATE|DELETE FROM)\s+"CreatorAccount"/), [
     "src/routes/creators.js",
@@ -82,6 +107,7 @@ test("SOURCE FINAL anti-map: authority-changing rolling-release admission is con
     "src/routes/auth.js",
     "src/services/creator-lifecycle-authority-service.js",
     "src/services/phase2-destructive-delete-authority-service.js",
+    "src/services/access-epoch-service.js",
     "src/services/phase2-release-compatibility-authority-service.js",
     "src/services/team-administration-service.js",
     "src/services/team-control-plane-authority-service.js",

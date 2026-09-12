@@ -8,7 +8,7 @@ const { buildDesktopBootstrap, accessibleCreatorIdSet } = require("../services/d
 const { buildDesktopSecretDelta } = require("../services/desktop-secret-delta-service");
 const { audit } = require("../services/audit-service");
 const { waitForDesktopControlEvents } = require("../services/desktop-control-events");
-const { readCurrentDesktopMemberAuthority, withStableDesktopCurrentAccess } = require("../services/desktop-current-access-authority-service");
+const { desktopAuthorityProof, readCurrentDesktopMemberAuthority, withStableDesktopCurrentAccess } = require("../services/desktop-current-access-authority-service");
 const { currentCreatorCatalogGeneration } = require("../services/creator-human-management-authority-service");
 
 const router = express.Router();
@@ -56,7 +56,10 @@ async function filterAuthorizedControlEventsStable(req, events, maxAttempts = CO
     readGeneration: () => currentCreatorCatalogGeneration({ db: prisma, agencyId }),
     work: (member) => filterAuthorizedControlEvents(req, events, member),
   });
-  return result.value;
+  return {
+    events: result.value,
+    authority: desktopAuthorityProof(result.member, result.generation),
+  };
 }
 
 router.get("/control/events", async (req, res) => {
@@ -80,9 +83,15 @@ router.get("/control/events", async (req, res) => {
     // The long-poll may outlive the auth-middleware Member snapshot by up to
     // 25 seconds. Re-read current Member/User/Agency authority after the wait
     // before exposing creator-scoped metadata or JOB_AVAILABLE hints.
-    const events = await filterAuthorizedControlEventsStable(req, result.events);
+    const filtered = await filterAuthorizedControlEventsStable(req, result.events);
     res.setHeader("Cache-Control", "no-store, private");
-    return res.json({ ok: true, streamId: result.streamId, cursor: result.cursor, events });
+    return res.json({
+      ok: true,
+      streamId: result.streamId,
+      cursor: result.cursor,
+      events: filtered.events,
+      authority: filtered.authority,
+    });
   } catch (error) {
     if (error?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues[0]?.message || "Validation error", issues: error.issues });
     const status = Number(error?.status) || 500;

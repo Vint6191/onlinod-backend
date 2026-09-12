@@ -51,6 +51,7 @@ const { createRequestObservabilityMiddleware } = require("./middleware/request-o
 const prisma = require("./prisma");
 const logger = require("./utils/logger");
 const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
+const { TEAM_CONTROL_PLANE_GENERATION, readTeamControlPlaneReleaseAuthority, readTeamControlPlaneDbFenceStatus } = require("./services/phase2-release-compatibility-authority-service");
 const { startRecurringScheduler } = require("./services/job-scheduler");
 
 const legacyAnalyticsRoutes = createLegacyGoneRouter("analytics_snapshots", "/api/home + /api/stats");
@@ -151,6 +152,9 @@ app.use(express.static(path.join(__dirname, "..", "public")));
 app.get("/health", async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
+    // Liveness is deliberately independent from release readiness. A process
+    // in TEAM_CONTROL_PLANE=DRAINING must stay observable while operators
+    // diagnose/repair/activate it. Use /ready for authority-write readiness.
     return res.json({
       ok: true,
       status: "healthy",
@@ -172,16 +176,87 @@ app.get("/health", async (_req, res) => {
   }
 });
 
+app.get("/ready", async (_req, res) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    const [release, dbFence] = await Promise.all([
+      readTeamControlPlaneReleaseAuthority(prisma),
+      readTeamControlPlaneDbFenceStatus(prisma),
+    ]);
+    const teamReady = Boolean(
+      release
+      && release.requiredGeneration === TEAM_CONTROL_PLANE_GENERATION
+      && String(release.activationState || "").toUpperCase() === "ACTIVE"
+      && dbFence.ready
+    );
+    return res.status(teamReady ? 200 : 503).json({
+      ok: teamReady,
+      status: teamReady ? "ready" : "not_ready",
+      service: "onlinod-backend",
+      version: "0.8.0-server-stores",
+      database: "ok",
+      teamControlPlane: {
+        ready: teamReady,
+        expectedGeneration: TEAM_CONTROL_PLANE_GENERATION,
+        requiredGeneration: release?.requiredGeneration || null,
+        state: release?.activationState || null,
+        drainStartedAt: release?.drainStartedAt || null,
+        activatedAt: release?.activatedAt || null,
+        dbFence: {
+          ready: dbFence.ready,
+          expectedTriggerCount: dbFence.expectedTriggerCount,
+          observedTriggerCount: dbFence.observedTriggerCount,
+          missingTriggers: dbFence.missingTriggers,
+          mismatchedTriggers: dbFence.mismatchedTriggers,
+          unexpectedTriggers: dbFence.unexpectedTriggers,
+          functionProofValid: dbFence.functionProofValid,
+        },
+      },
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("[ready] database/release check failed:", err?.message || err);
+    return res.status(503).json({
+      ok: false,
+      status: "not_ready",
+      service: "onlinod-backend",
+      version: "0.8.0-server-stores",
+      database: "error",
+      teamControlPlane: { ready: false, expectedGeneration: TEAM_CONTROL_PLANE_GENERATION, requiredGeneration: null, state: null, dbFence: null },
+      time: new Date().toISOString(),
+    });
+  }
+});
+
 app.get("/health/details", async (_req, res) => {
   if (process.env.ONLINOD_EXPOSE_HEALTH_DETAILS !== "1") {
     return res.status(404).json({ ok: false, code: "NOT_FOUND" });
   }
   try {
     await prisma.$queryRaw`SELECT 1`;
-    return res.json(buildBackendHealthSnapshot({ database: "ok" }));
+    const [release, dbFence] = await Promise.all([
+      readTeamControlPlaneReleaseAuthority(prisma),
+      readTeamControlPlaneDbFenceStatus(prisma),
+    ]);
+    const teamReady = Boolean(
+      release
+      && release.requiredGeneration === TEAM_CONTROL_PLANE_GENERATION
+      && String(release.activationState || "").toUpperCase() === "ACTIVE"
+      && dbFence.ready
+    );
+    const snapshot = buildBackendHealthSnapshot({ database: "ok" });
+    snapshot.teamControlPlane = {
+      ready: teamReady,
+      expectedGeneration: TEAM_CONTROL_PLANE_GENERATION,
+      authority: release,
+      dbFence,
+    };
+    return res.json(snapshot);
   } catch (err) {
-    logger.warn("health details database check failed", { error: err?.message || String(err) });
-    return res.status(503).json(buildBackendHealthSnapshot({ database: "error" }));
+    logger.warn("health details database/release check failed", { error: err?.message || String(err) });
+    const snapshot = buildBackendHealthSnapshot({ database: "error" });
+    snapshot.teamControlPlane = { ready: false, expectedGeneration: TEAM_CONTROL_PLANE_GENERATION, authority: null, dbFence: null };
+    return res.status(503).json(snapshot);
   }
 });
 

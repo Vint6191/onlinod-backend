@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { authorizeFixtureTransaction, withFixtureAuthorities, cleanupAgencyFixture } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 async function rollbackTx(prisma, work, sentinel) {
   try {
@@ -26,6 +27,7 @@ test("Phase2 PostgreSQL historical authority: DB triggers create durable project
   const prisma = require("../prisma");
   try {
     await rollbackTx(prisma, async (tx) => {
+      await authorizeFixtureTransaction(tx, { team: true });
       const agency = { id: token("phase2_agency") };
       await tx.$executeRawUnsafe(
         `INSERT INTO "Agency" ("id","name","plan","status","createdAt","updatedAt")

@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { withFixtureAuthorities, cleanupAgencyFixture } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 function token(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -30,7 +31,7 @@ test("A49/A20 PostgreSQL: opposite money-root reassignments do not deadlock and 
   const creatorId = token("p2_roll_lock_creator");
   const day = new Date("2026-09-01T12:00:00.000Z");
   try {
-    await db1.agency.create({ data: { id: agencyId, name: `Phase2 rollup lock ${agencyId}` } });
+    await withFixtureAuthorities(db1, { team: true }, (tx) => tx.agency.create({ data: { id: agencyId, name: `Phase2 rollup lock ${agencyId}` } }));
     await db1.teamMoneyAttributionFact.createMany({ data: [
       {
         id: factA, agencyId, sourceType: "PPV", sourceRowId: sourceA, creatorId, memberId: "member-a",
@@ -69,7 +70,7 @@ test("A49/A20 PostgreSQL: opposite money-root reassignments do not deadlock and 
     assert.deepEqual(lifetimeByMember.get("member-a"), { amount: 2000n, count: 1 });
     assert.deepEqual(lifetimeByMember.get("member-b"), { amount: 1000n, count: 1 });
   } finally {
-    try { await db1.agency.delete({ where: { id: agencyId } }); } catch (_) {}
+    try { await cleanupAgencyFixture(db1, { agencyId }); } catch (_) {}
     await Promise.allSettled([db1.$disconnect(), db2.$disconnect()]);
   }
 });

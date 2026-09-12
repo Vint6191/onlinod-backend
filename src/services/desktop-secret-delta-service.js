@@ -5,7 +5,8 @@ const { isOwner } = require("./team-access-control");
 const { assertCreatorSessionTargetActive, publicState } = require("./creator-session-broker-service");
 const { profilePublic } = require("./creator-network-profile-service");
 const { opaqueProxyCredentialEnvelope } = require("./proxy-credentials");
-const { readCurrentDesktopMemberAuthority } = require("./desktop-current-access-authority-service");
+const { desktopAuthorityProof, readCurrentDesktopMemberAuthority } = require("./desktop-current-access-authority-service");
+const { currentCreatorCatalogGeneration } = require("./creator-human-management-authority-service");
 
 function codedError(code, message, status = 409, extra = null) {
   const error = new Error(message);
@@ -209,8 +210,10 @@ async function buildDesktopSecretDelta({ db, agencyId, userId, member, deviceId,
     }
     const requestsById = new Map(normalized.map((x) => [x.creatorId, x]));
     await assertBatchKeyAccess({ tx, agencyId, userId, deviceId, member: liveMember, rows, requestsById });
+    const creatorCatalogGeneration = await currentCreatorCatalogGeneration({ db: tx, agencyId });
     return {
       ok: true,
+      authority: desktopAuthorityProof(liveMember, creatorCatalogGeneration),
       items: normalized.map((request) => {
         const row = byId.get(request.creatorId);
         return {

@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { withFixtureAuthorities, cleanupAgencyFixture } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 function token(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -26,7 +27,7 @@ test("A1/A4 PostgreSQL: superseded failure cannot delay V2 and reclaimed owner f
   const reclaimObjectId = token("p2_domain_reclaim");
 
   try {
-    await db1.agency.create({ data: { id: agencyId, name: `Phase2 domain settlement ${agencyId}` } });
+    await withFixtureAuthorities(db1, { team: true }, (tx) => tx.agency.create({ data: { id: agencyId, name: `Phase2 domain settlement ${agencyId}` } }));
 
     await publishDomainWork({
       db: db1,
@@ -134,7 +135,7 @@ test("A1/A4 PostgreSQL: superseded failure cannot delay V2 and reclaimed owner f
     assert.equal(currentGuard.current, true);
     assert.equal(currentGuard.lost, false);
   } finally {
-    try { await db1.agency.delete({ where: { id: agencyId } }); } catch (_) {}
+    try { await cleanupAgencyFixture(db1, { agencyId }); } catch (_) {}
     await Promise.allSettled([db1.$disconnect(), db2.$disconnect()]);
   }
 });

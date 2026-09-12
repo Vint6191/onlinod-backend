@@ -16,6 +16,17 @@ function isFenceError(error, marker) {
   return text.includes(marker) || text.includes("55000");
 }
 
+async function withTeamGeneration(db, workFn) {
+  return db.$transaction(async (tx) => {
+    await tx.$queryRawUnsafe(
+      `SELECT set_config($1,$2,true) AS value`,
+      release.TEAM_CONTROL_PLANE_DB_SETTING,
+      release.TEAM_CONTROL_PLANE_GENERATION,
+    );
+    return workFn(tx);
+  });
+}
+
 async function cleanupAgency(db, agencyId) {
   try {
     await work.publishDomainWork({
@@ -29,6 +40,7 @@ async function cleanupAgency(db, agencyId) {
     });
     await db.$transaction(async (tx) => {
       await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
+      await tx.$queryRawUnsafe(`SELECT set_config($1,$2,true) AS value`, release.TEAM_CONTROL_PLANE_DB_SETTING, release.TEAM_CONTROL_PLANE_GENERATION);
       await tx.agency.delete({ where: { id: agencyId } });
     });
   } catch (_) {
@@ -41,6 +53,7 @@ test("M1 PostgreSQL: old Creator/Member/executor writers fail closed while new g
   const { PrismaClient } = require("@prisma/client");
   const db = new PrismaClient();
   const agencyId = token("m1_agency");
+  const bareAgencyId = token("m1_bare_agency");
   const userId = token("m1_user");
   const memberId = token("m1_member");
   const creatorId = token("m1_creator");
@@ -49,9 +62,40 @@ test("M1 PostgreSQL: old Creator/Member/executor writers fail closed while new g
   const objectB = token("ready_claim");
 
   try {
-    await db.agency.create({ data: { id: agencyId, name: agencyId } });
+    await assert.rejects(
+      db.agency.create({ data: { id: agencyId, name: agencyId } }),
+      (error) => isFenceError(error, "PHASE2_INCOMPATIBLE_TEAM_CONTROL_PLANE_WRITER"),
+      "old Team binary must not create a live Agency without v2 generation after the DB cutover",
+    );
+    await withTeamGeneration(db, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
+    await withTeamGeneration(db, (tx) => tx.agency.create({ data: { id: bareAgencyId, name: bareAgencyId } }));
     await db.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "integration" } });
-    await db.agencyMember.create({ data: { id: memberId, agencyId, userId, role: "OWNER", assignedCreators: "all" } });
+
+    await assert.rejects(
+      db.agency.delete({ where: { id: bareAgencyId } }),
+      (error) => isFenceError(error, "PHASE2_INCOMPATIBLE_TEAM_CONTROL_PLANE_WRITER"),
+      "old Team binary must not physically delete Agency identity after the v2 DB cutover",
+    );
+    await withTeamGeneration(db, (tx) => tx.agency.delete({ where: { id: bareAgencyId } }));
+
+    await assert.rejects(
+      db.agencyMember.create({ data: { id: memberId, agencyId, userId, role: "OWNER", assignedCreators: "all" } }),
+      (error) => isFenceError(error, "PHASE2_INCOMPATIBLE_TEAM_CONTROL_PLANE_WRITER"),
+      "old Team binary must not create AgencyMember after the v2 DB cutover",
+    );
+    await withTeamGeneration(db, (tx) => tx.agencyMember.create({
+      data: { id: memberId, agencyId, userId, role: "OWNER", assignedCreators: "all" },
+    }));
+
+    await assert.rejects(
+      db.agencyMember.update({ where: { id: memberId }, data: { deactivatedAt: new Date() } }),
+      (error) => isFenceError(error, "PHASE2_INCOMPATIBLE_TEAM_CONTROL_PLANE_WRITER"),
+      "old Team binary must not update AgencyMember after the v2 DB cutover",
+    );
+    await withTeamGeneration(db, (tx) => tx.agencyMember.update({
+      where: { id: memberId },
+      data: { accessEpoch: { increment: 1 } },
+    }));
 
     await release.runCreatorAccountWriteTransaction(db, (tx) => tx.creatorAccount.create({
       data: { id: creatorId, agencyId, displayName: "M1", username: token("m1_username") },
@@ -69,12 +113,17 @@ test("M1 PostgreSQL: old Creator/Member/executor writers fail closed while new g
     assert.equal((await db.creatorAccount.findUnique({ where: { id: creatorId }, select: { notes: true } })).notes, "new-binary-write");
 
     await assert.rejects(
-      db.agencyMember.delete({ where: { id: memberId } }),
+      withTeamGeneration(db, (tx) => tx.agencyMember.delete({ where: { id: memberId } })),
       (error) => isFenceError(error, "PHASE2_AGENCY_MEMBER_PHYSICAL_DELETE_RETIRED"),
-      "old platform-admin physical Member DELETE must be DB-fenced",
+      "even a v2 Team generation token must not resurrect retired physical Member DELETE",
     );
-    await db.agencyMember.update({ where: { id: memberId }, data: { deactivatedAt: new Date() } });
-    assert.ok((await db.agencyMember.findUnique({ where: { id: memberId }, select: { deactivatedAt: true } })).deactivatedAt);
+    assert.ok(await db.agencyMember.findUnique({ where: { id: memberId }, select: { id: true } }));
+
+    await assert.rejects(
+      db.user.update({ where: { id: userId }, data: { disabledAt: new Date() } }),
+      (error) => isFenceError(error, "PHASE2_INCOMPATIBLE_TEAM_CONTROL_PLANE_WRITER"),
+      "old Team binary must not mutate authority-changing User lifecycle state",
+    );
 
     const a = await work.publishDomainWork({
       db, agencyId, workClass, objectType: "M1Rolling", objectId: objectA,
@@ -118,6 +167,7 @@ test("M1 PostgreSQL: old Creator/Member/executor writers fail closed while new g
       assert.equal(item.claimExecutionGeneration, release.DOMAIN_WORK_EXECUTOR_GENERATION);
     }
   } finally {
+    try { await withTeamGeneration(db, (tx) => tx.agency.delete({ where: { id: bareAgencyId } })); } catch (_) {}
     await cleanupAgency(db, agencyId);
     await db.$disconnect();
   }

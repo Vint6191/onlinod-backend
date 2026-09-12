@@ -62,6 +62,24 @@ test("M1 release token is transaction-local and installed before new Creator wri
   assert.deepEqual(calls[0].args, ["onlinod.phase2_creator_writer_generation", release.CREATOR_ACCOUNT_WRITER_GENERATION]);
 });
 
+test("M1 Creator/Domain generation helpers reject root Prisma because their tokens are transaction-local", async () => {
+  const rootClient = {
+    async $transaction() { throw new Error("must not be reached"); },
+    async $disconnect() {},
+    async $queryRawUnsafe() { throw new Error("must not be reached"); },
+  };
+  await assert.rejects(
+    release.authorizeCreatorAccountWrite(rootClient),
+    (error) => error?.code === "PHASE2_RELEASE_TRANSACTION_REQUIRED"
+      && error?.setting === "onlinod.phase2_creator_writer_generation",
+  );
+  await assert.rejects(
+    release.authorizeDomainWorkExecutor(rootClient),
+    (error) => error?.code === "PHASE2_RELEASE_TRANSACTION_REQUIRED"
+      && error?.setting === "onlinod.phase2_domain_executor_generation",
+  );
+});
+
 test("M1 every direct new-binary CreatorAccount mutation is release-authorized or exact destructive cleanup", () => {
   const uncovered = [];
   for (const entry of productionCreatorMutationFiles()) {

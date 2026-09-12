@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { isOwner } = require("./team-access-control");
 const { assignedCreatorIds, hasBroadCreatorAccess, canAccessCreator, allowedCreatorScope } = require("../middleware/automation-permissions");
+const { readCurrentDesktopMemberAuthority } = require("./desktop-current-access-authority-service");
 
 const DEVICE_KEY_ALGORITHM = "x25519-spki-der-v1";
 const WRAP_ALGORITHM = "x25519-hkdf-sha256-aes-256-gcm-v1";
@@ -72,14 +73,27 @@ function requireOwner(member) {
   if (!isOwner(member)) throw codedError("CRYPTO_OWNER_REQUIRED", "Workspace owner approval is required for encryption key management", 403);
 }
 
+async function readCurrentCryptoMember({
+  db, agencyId, userId, code = "CRYPTO_MEMBER_INACTIVE",
+  message = "Agency membership, User, or Agency is no longer operationally active",
+}) {
+  try {
+    return await readCurrentDesktopMemberAuthority({ db, agencyId, userId });
+  } catch (error) {
+    if (error?.code === "DESKTOP_MEMBER_AUTHORITY_REVOKED") throw codedError(code, message, 403);
+    throw error;
+  }
+}
+
 async function withFreshOwnerRead({ db, agencyId, userId, member, read, conflictCode = "CRYPTO_OWNER_READ_CONFLICT" }) {
   const actorUserId = clean(userId, 180);
   if (!actorUserId) throw codedError("CRYPTO_ACTOR_USER_REQUIRED", "Authenticated agency user is required for owner crypto reads", 403);
   return serializableTransaction(db, async (tx) => {
-    const liveMember = await tx.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId: actorUserId } } });
-    if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) {
-      throw codedError("CRYPTO_APPROVER_INACTIVE", "Agency member is no longer active", 403);
-    }
+    const liveMember = await readCurrentCryptoMember({
+      db: tx, agencyId, userId: actorUserId,
+      code: "CRYPTO_APPROVER_INACTIVE",
+      message: "Agency membership, User, or Agency is no longer operationally active",
+    });
     requireOwner(liveMember);
     return read(tx, liveMember);
   }, conflictCode);
@@ -463,8 +477,11 @@ async function initializeAgencyCryptoRoot({ db, agencyId, userId, member, device
   const actorDeviceId = clean(deviceId, 180);
   if (!actorDeviceId) throw codedError("CRYPTO_DEVICE_REQUIRED", "deviceId is required", 400);
   return serializableTransaction(db, async (tx) => {
-    const liveMember = await tx.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId } } });
-    if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) throw codedError("CRYPTO_APPROVER_INACTIVE", "Agency member is no longer active", 403);
+    const liveMember = await readCurrentCryptoMember({
+      db: tx, agencyId, userId,
+      code: "CRYPTO_APPROVER_INACTIVE",
+      message: "Agency membership, User, or Agency is no longer operationally active",
+    });
     requireOwner(liveMember);
     const existingRoot = await tx.agencyCryptoRoot.findUnique({ where: { agencyId } });
     if (existingRoot) throw codedError("CRYPTO_ROOT_ALREADY_INITIALIZED", "Agency encryption root is already initialized", 409, { current: publicRoot(existingRoot) });
@@ -502,10 +519,7 @@ async function getCryptoStatus({ db, agencyId, userId, member, deviceId }) {
     // creatorWraps are encrypted AMK/CDK material that the requesting device
     // can decrypt. Membership, creator scope, device identity, active root and
     // wrap rows therefore have to come from one authoritative snapshot.
-    const liveMember = await tx.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId: actorUserId } } });
-    if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) {
-      throw codedError("CRYPTO_MEMBER_INACTIVE", "Agency membership is no longer active", 403);
-    }
+    const liveMember = await readCurrentCryptoMember({ db: tx, agencyId, userId: actorUserId });
     const actorIdentity = await requireCryptoIdentityForUser({ db: tx, agencyId, userId: actorUserId, deviceId });
     const identity = actorIdentity.identity;
     const root = await tx.agencyCryptoRoot.findUnique({ where: { agencyId } });
@@ -756,8 +770,11 @@ async function recoverOwnerDevice({ db, agencyId, userId, member, deviceId, root
   if (!actorDeviceId) throw codedError("CRYPTO_DEVICE_REQUIRED", "deviceId is required", 400);
   const wrap = normalizeWrapEnvelope(ownerWrap);
   return serializableTransaction(db, async (tx) => {
-    const liveMember = await tx.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId } } });
-    if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) throw codedError("CRYPTO_APPROVER_INACTIVE", "Agency member is no longer active", 403);
+    const liveMember = await readCurrentCryptoMember({
+      db: tx, agencyId, userId,
+      code: "CRYPTO_APPROVER_INACTIVE",
+      message: "Agency membership, User, or Agency is no longer operationally active",
+    });
     requireOwner(liveMember);
     const root = await tx.agencyCryptoRoot.findUnique({ where: { agencyId } });
     if (!root || Number(root.version) !== Number(rootVersion)) throw codedError("CRYPTO_ROOT_VERSION_CONFLICT", "Recovery envelope is stale", 409, { current: publicRoot(root) });
@@ -824,8 +841,15 @@ async function pendingDevicesSnapshot({ db, agencyId, member }) {
 async function targetMemberForDevice({ db, agencyId, targetDeviceId }) {
   const identity = await db.deviceCryptoIdentity.findUnique({ where: cryptoIdentityWhere(agencyId, targetDeviceId) });
   if (!identity) throw codedError("CRYPTO_TARGET_IDENTITY_REQUIRED", "Target device has no crypto identity in this agency", 404);
-  const member = await db.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId: identity.userId } } });
-  if (!member || member.deletedAt || member.deactivatedAt) throw codedError("CRYPTO_TARGET_MEMBER_INACTIVE", "Target crypto identity member is not active in this agency", 409);
+  let member;
+  try {
+    member = await readCurrentDesktopMemberAuthority({ db, agencyId, userId: identity.userId });
+  } catch (error) {
+    if (error?.code === "DESKTOP_MEMBER_AUTHORITY_REVOKED") {
+      throw codedError("CRYPTO_TARGET_MEMBER_INACTIVE", "Target crypto identity member is not operationally active in this agency", 409);
+    }
+    throw error;
+  }
   // WorkerDevice is mutable telemetry and may have moved to another workspace or
   // been deleted/recreated. Approval authority is the durable agency-scoped
   // crypto identity plus its immutable member binding, not the telemetry row.
@@ -1056,7 +1080,9 @@ async function requireLiveCryptoCreator({ db, agencyId, creatorId }) {
 }
 
 async function getCreatorKeyState({ db, agencyId, creatorId, deviceId, member, userId }) {
-  const liveMember = userId ? await db.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId } } }) : member;
+  const liveMember = userId
+    ? await readCurrentCryptoMember({ db, agencyId, userId })
+    : member;
   if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) throw codedError("CRYPTO_MEMBER_INACTIVE", "Agency membership is no longer active", 403);
   if (!isOwner(liveMember) && !canAccessCreator(liveMember, creatorId)) throw codedError("CRYPTO_CREATOR_ACCESS_REVOKED", "This member no longer has access to the creator encryption key", 403, { creatorId });
   await requireLiveCryptoCreator({ db, agencyId, creatorId });
@@ -1083,7 +1109,9 @@ async function getCreatorKeyState({ db, agencyId, creatorId, deviceId, member, u
 async function assertDeviceCanUseCreatorKey({ db, agencyId, creatorId, keyVersion, deviceId, member }) {
   const version = Math.floor(Number(keyVersion));
   if (!Number.isInteger(version) || version < 1) throw codedError("CRYPTO_CREATOR_KEY_VERSION_INVALID", "Creator key version must be positive", 400);
-  const liveMember = member?.userId ? await db.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId: member.userId } } }) : member;
+  const liveMember = member?.userId
+    ? await readCurrentCryptoMember({ db, agencyId, userId: member.userId })
+    : member;
   if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) throw codedError("CRYPTO_MEMBER_INACTIVE", "Agency membership is no longer active", 403);
   if (!isOwner(liveMember) && !canAccessCreator(liveMember, creatorId)) throw codedError("CRYPTO_CREATOR_ACCESS_REVOKED", "This member no longer has access to the creator encryption key", 403, { creatorId });
   await requireLiveCryptoCreator({ db, agencyId, creatorId });
@@ -1121,7 +1149,11 @@ async function requireOwnerCryptoActor({ db, agencyId, userId, member, deviceId 
   // that will commit the key mutation so OWNER authority cannot race demotion,
   // deactivation or removal.
   const liveMember = userId
-    ? await db.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId } } })
+    ? await readCurrentCryptoMember({
+      db, agencyId, userId,
+      code: "CRYPTO_APPROVER_INACTIVE",
+      message: "Agency membership, User, or Agency is no longer operationally active",
+    })
     : member;
   if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) {
     throw codedError("CRYPTO_APPROVER_INACTIVE", "Agency member is no longer active", 403);

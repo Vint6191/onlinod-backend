@@ -609,39 +609,6 @@ function publishRoleMemberAccessEpochs({ agencyId, members, sourceDeviceId = nul
   }
 }
 
-async function accessibleCreatorIdsForMember({ db, agencyId, member }) {
-  if (!member) return [];
-  const normalized = normalizeAssignedCreators(member.assignedCreators);
-  const broad = isOwner(member) || normalized.mode === "all";
-  if (!broad) return normalized.creatorIds;
-  if (typeof db?.creatorAccount?.findMany !== "function") return [];
-  const rows = await db.creatorAccount.findMany({
-    where: { agencyId, deletedAt: null },
-    select: { id: true },
-    take: 10000,
-  });
-  return rows.map((row) => String(row.id || "").trim()).filter(Boolean);
-}
-
-function publishTargetedCreatorRevokes({ agencyId, creatorIds, member, reason, sourceDeviceId = null }) {
-  for (const creatorId of Array.from(new Set(creatorIds || []))) {
-    if (!creatorId) continue;
-    try {
-      publishDesktopControlEvent({
-        type: "CREATOR_REVOKED",
-        agencyId,
-        creatorId,
-        reason,
-        targetUserId: member?.userId || member?.user?.id || null,
-        targetMemberId: member?.id || null,
-        sourceDeviceId,
-      });
-    } catch (error) {
-      console.error("[team/control-creator-revoke] failed:", error);
-    }
-  }
-}
-
 async function updateMemberSettings({ agencyId, memberId, patch, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
   const target = await db.agencyMember.findFirst({
     where: { id: memberId, agencyId, deletedAt: null },
@@ -791,16 +758,9 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
 
   const after = memberToClient(updated);
   if (patch.roleKey !== undefined || creatorScope) {
-    const beforeAccess = await accessibleCreatorIdsForMember({ db, agencyId, member: target });
-    const afterAccess = await accessibleCreatorIdsForMember({ db, agencyId, member: updated });
-    const afterSet = new Set(afterAccess);
-    publishTargetedCreatorRevokes({
-      agencyId,
-      creatorIds: beforeAccess.filter((creatorId) => !afterSet.has(creatorId)),
-      member: updated,
-      reason: "CREATOR_ACCESS_REMOVED",
-      sourceDeviceId: actorDeviceId,
-    });
+    // One durable Member.accessEpoch change is the correctness fact. Control
+    // delivery is only a wakeup; do not amplify a broad revoke into one event
+    // per Creator. Desktop recomputes the authoritative catalog from generations.
     publishMemberAccessEpoch({ agencyId, member: updated, sourceDeviceId: actorDeviceId });
   }
   await audit({
@@ -871,10 +831,6 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
     }
     return updatedMember || { ...liveTarget, deactivatedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
   });
-  if (status === "deactivated") {
-    const revokedCreatorIds = await accessibleCreatorIdsForMember({ db, agencyId, member: target });
-    publishTargetedCreatorRevokes({ agencyId, creatorIds: revokedCreatorIds, member: target, reason: "MEMBER_DEACTIVATED", sourceDeviceId: actorDeviceId });
-  }
   publishMemberAccessEpoch({ agencyId, member: statusMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
   await audit({
     agencyId,
@@ -939,8 +895,6 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
     return updatedMember || { ...liveTarget, deletedAt, deactivatedAt: deletedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
   });
 
-  const revokedCreatorIds = await accessibleCreatorIdsForMember({ db, agencyId, member: target });
-  publishTargetedCreatorRevokes({ agencyId, creatorIds: revokedCreatorIds, member: target, reason: "MEMBER_REMOVED", sourceDeviceId: actorDeviceId });
   publishMemberAccessEpoch({ agencyId, member: removalMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
   await audit({
     agencyId,

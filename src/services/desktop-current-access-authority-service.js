@@ -17,6 +17,14 @@ function desktopMemberAuthorityFingerprint(member) {
   ]);
 }
 
+function desktopAuthorityProof(member, creatorCatalogGeneration) {
+  const generation = Number(creatorCatalogGeneration);
+  return {
+    accessEpoch: normalizedAccessEpoch(member?.accessEpoch),
+    creatorCatalogGeneration: Number.isInteger(generation) && generation >= 0 ? generation : 0,
+  };
+}
+
 function desktopMemberAuthorityRevokedError() {
   const error = new Error("Desktop member authority is no longer operationally eligible");
   error.code = "DESKTOP_MEMBER_AUTHORITY_REVOKED";
@@ -80,6 +88,7 @@ async function withStableDesktopCurrentAccess({
 
 module.exports = {
   desktopMemberAuthorityFingerprint,
+  desktopAuthorityProof,
   desktopMemberAuthorityRevokedError,
   desktopCurrentAccessSnapshotUnstableError,
   readCurrentDesktopMemberAuthority,

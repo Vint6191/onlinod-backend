@@ -84,37 +84,6 @@ const { publishDomainWork, WORK_CLASS: PHASE2_WORK_CLASS } = require("../service
 const router = express.Router();
 
 
-async function adminMemberCreatorIds(member) {
-  const raw = member?.assignedCreators;
-  const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
-  const broad = member?.role === "OWNER" || member?.roleKey === "owner" || raw === null || raw === undefined || raw === "all" || obj?.all === true || String(obj?.mode || "").toLowerCase() === "all";
-  if (!broad) {
-    const ids = Array.isArray(raw) ? raw : (Array.isArray(obj?.creatorIds) ? obj.creatorIds : Array.isArray(obj?.ids) ? obj.ids : []);
-    return Array.from(new Set(ids.map(String).map((id) => id.trim()).filter(Boolean)));
-  }
-  const rows = await prisma.creatorAccount.findMany({ where: { agencyId: member.agencyId, deletedAt: null }, select: { id: true }, take: 10000 });
-  return rows.map((row) => String(row.id || "").trim()).filter(Boolean);
-}
-
-function publishAdminCreatorRevokes(req, member, creatorIds, reason) {
-  for (const creatorId of creatorIds) {
-    try {
-      publishDesktopControlEvent({
-        type: "CREATOR_REVOKED",
-        agencyId: member.agencyId,
-        creatorId,
-        reason,
-        targetUserId: member.userId || member.user?.id || null,
-        targetMemberId: member.id,
-        sourceDeviceId: req.auth?.deviceId || null,
-        requestId: req.headers?.["x-request-id"] || null,
-      });
-    } catch (error) {
-      console.error("[admin/control-creator-revoke] failed:", error);
-    }
-  }
-}
-
 function canonicalMemberRoleKeyFromLegacy(role) {
   const value = String(role || "").trim().toUpperCase();
   if (value === "OWNER") return "owner";
@@ -663,6 +632,11 @@ router.delete("/agencies/:id", async (req, res) => {
     if (hard) {
       const scheduledAt = new Date();
       await prisma.$transaction(async (tx) => {
+        // Agency deletedAt is Team current-authority state and is DB-generation
+        // fenced by migration 08000. Join release admission before the Agency
+        // lifecycle barrier so DRAINING fails cleanly instead of surfacing the
+        // low-level PostgreSQL generation trigger.
+        await assertTeamControlPlaneWriteAdmission(tx);
         // Hard Agency deletion is a durable lifecycle, never a tenant-wide HTTP
         // transaction. First establish the same exclusive lifecycle barrier used by
         // soft retirement, reject UNKNOWN/future external effects, revoke live auth,
@@ -710,6 +684,10 @@ router.delete("/agencies/:id", async (req, res) => {
 
     const deletedAt = new Date();
     const updated = await prisma.$transaction(async (tx) => {
+      // Agency retirement removes Team current authority. Join the DB-enforced
+      // release generation before the lifecycle lock for the same reason as hard
+      // retirement and restore.
+      await assertTeamControlPlaneWriteAdmission(tx);
       // Agency retirement takes the lifecycle barrier exclusively while every NEW
       // durable Custom/source path holds the same barrier in shared mode. If new work
       // wins first it is visible to the blocker scan; if retirement wins first later

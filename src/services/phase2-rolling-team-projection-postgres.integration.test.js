@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { authorizeFixtureTransaction, withFixtureAuthorities, cleanupAgencyFixture } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 function token(prefix) { return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`; }
 
 async function rollbackTx(prisma, fn) {
@@ -19,6 +20,7 @@ test("A34/A46 PostgreSQL: Actual52 projection UPSERT/DELETE cannot touch current
   const prisma = require("../prisma");
   try {
     await rollbackTx(prisma, async (tx) => {
+      await authorizeFixtureTransaction(tx, { team: true, creator: true });
       const agencyId = token("p2_roll_agency");
       const userId = token("p2_roll_user");
       const memberId = token("p2_roll_member");

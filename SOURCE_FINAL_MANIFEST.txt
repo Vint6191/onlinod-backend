@@ -3,23 +3,22 @@ SOURCE FINAL CANDIDATE
 
 EXACT BASE
 Desktop:
-  56(5).zip
+  56(8).zip
   SHA-256 ca12169093ec4164b593c38e58cfe8a17c406ebce0cb0030f3f91b608c9616a1
-  UNCHANGED by this candidate.
 
 Backend:
-  onlinod-backend-main - 2026-09-11T232952.254(2).zip
-  SHA-256 2cf3f25dcb05903b5594bd8927c028ae144b01bf5be6bb6a7debd03287869e82
+  onlinod-backend-main - 2026-09-12T122405.599(2).zip
+  SHA-256 f58950a5907231629b1e62557fe52263fa6bf822be31157d259f15b256abfe01
 
-This archive is a cumulative overlay containing only added/modified files relative to that exact backend base.
+Current C6/M1 audit checkpoints are cumulative changed-file overlays relative to those exact bases.
 No nested backend/backend package. Removed files: 0.
 
 SOURCE CLOSURE VERDICT
-  NEW FUNDAMENTAL PHASE-2 ROOT: NO
-  ARCHITECTURAL CONVERGENCE: YES
-  SOURCE CLOSED: YES — candidate source boundary is converged after independent destructive anti-map.
+  NEW FUNDAMENTAL PHASE-2 ROOT: NO after the second C6 destructive pass.
+  ARCHITECTURAL CONVERGENCE: CANDIDATE — C6 local authorization boundary is converged; the fresh M1 destructive pass found no new authority class and closed remaining tails inside the same DB release boundary.
+  SOURCE CLOSED: NO — fresh-actual destructive re-audit is still required after M1 integration.
   PHASE 2 CLOSED: NO — real PostgreSQL / migration / scale gates remain unexecuted in this environment.
-  READY FOR PRODUCTION CUTOVER: NO until those gates pass and the rolling activation procedure is executed against the real migrated environment.
+  READY FOR PRODUCTION CUTOVER: NO until those gates pass against the real migrated environment.
 
 CLOSED SOURCE CLASSES
 A. C1 CURRENT WORK PROJECTION CONSERVATION
@@ -46,19 +45,30 @@ D. C5 CREATOR HUMAN MANAGEMENT COMMIT AUTHORITY
 - create / metadata / avatar / connection human mutations revalidate commit-time management authority
 - direct CreatorAccount writer surface is classified and M1 release-fenced
 
-E. C6 BOUNDED CREATOR CATALOG INVALIDATION
-- AgencyCreatorCatalogState replaces O(all-members) creator-create invalidation
-- Creator membership changes bump one Agency generation transactionally
-- Desktop bootstrap returns a stable Member-authority + creator-generation snapshot
-- Desktop current-access authority is shared by bootstrap/secrets/control
-- control long-poll filters against a stable Member/User/Agency + creator-generation snapshot
-- Desktop Actual56 remains unchanged; existing heartbeat uses /api/desktop/bootstrap for bounded convergence
+E. C6 DURABLE DESKTOP ACCESS REVOCATION + LOCAL AUTHORIZATION COMMIT AUTHORITY
+- AgencyCreatorCatalogState replaces O(all-members) creator-create invalidation; Member accessEpoch and Agency creatorCatalogGeneration remain independent freshness axes
+- Desktop carries durable auth-scope incarnation in addition to server generations so logout/relogin cannot inherit stale local authorization material
+- secret/key/network/partition/session/browser/runtime/OF execution publication is fenced by local authorization permits and per-Creator commit barriers
+- terminal revoke uses FENCE -> drain/PURGE -> forget/reset and persists cleanup debt across crash until acknowledged
+- persistent Chromium re-authorization under a new auth incarnation purges the old authenticated profile before publishing a new authorization edge
+- bootstrap/secrets/control share current Member/User/Agency authority; control events are bounded wakeup hints, never correctness authority
+- lossy process-local control buffers are repaired by durable generation proof on the next poll/heartbeat
 
 F. M1 ROLLING RELEASE COMPATIBILITY
 - DB release generations fence incompatible CreatorAccount writers and new DomainWork ownership
-- TEAM_CONTROL_PLANE migration publishes DRAINING, never auto-ACTIVE
+- every Team generation token is transaction-local; canonical admission rejects a root/autocommit Prisma client instead of pretending set_config(..., true) survived until later DML
+- operator preflight is available before Prisma migration deploy and reports every live Agency that lacks an operational OWNER
+- migration 08000 first takes the same exclusive PostgreSQL release advisory fence used by activation, then establishes one multi-table cutover lock across all fenced Team/current-authority tables
+- under that release + table-lock serialization point migration 08000 repeats the operational-OWNER preflight BEFORE publishing the v2 database fence; bad legacy data aborts the migration before v2/DRAINING becomes visible
+- the same migration atomically installs 8 Team generation triggers and publishes v2/DRAINING
+- lifecycle trigger coverage includes User.disabledAt UPDATE/DELETE and Agency INSERT/deletedAt UPDATE/DELETE; an incompatible old binary cannot create a new ownerless live Agency or bypass the fence through terminal physical deletion
+- physical fence proof validates trigger name, table, function, enabled state AND required event coverage rather than trusting release-row metadata alone
+- PostgreSQL integration fixtures use the same transaction-local Team/Creator generation authority as production; intentional bare old-writer cases remain explicit negative tests
+- incompatible old Team binaries cannot mutate current authority after the migration transaction commits because they cannot mint the transaction-local v2 generation
 - new-binary Team current-authority writes fail closed before the incompatible lock graph while DRAINING
-- explicit activation uses exclusive release fence and operational-OWNER preflight
+- v2/DRAINING exposes no Team mutation authority: the PostgreSQL trigger itself requires activationState=ACTIVE in addition to exact generation/token; bad OWNER data must be repaired before 08000
+- explicit activation uses the exclusive release fence, verifies the physical PostgreSQL trigger fence even for idempotent already-ACTIVE activation, and rechecks the operational-OWNER invariant
+- /ready requires ACTIVE + exact generation + complete physical DB trigger fence; liveness remains independent
 - destructive Agency work yields during intentional DRAINING instead of recording false failure
 
 FINAL SOURCE ANTI-MAP
@@ -66,6 +76,7 @@ The final invariant test freezes the physical production surfaces for:
 - DomainWorkItem mutators
 - AgencyMember mutators
 - Team role-definition mutators
+- every DB-fenced Team topology table writer, including new Agency creation, physical Agency deletion and the explicit absence of a physical User delete writer
 - CreatorAccount mutators
 - current OperationalPending consumers
 - M1 release-admitted Team authority writers
@@ -73,25 +84,34 @@ The final invariant test freezes the physical production surfaces for:
 A new direct surface breaks closure tests until explicitly classified.
 
 VERIFICATION
-Phase2 + desktop current-access/bootstrap/secrets/control/accessEpoch:
-  126 tests
-  110 PASS
+Current Actual56 backend closure regression in this checkpoint:
+  125 tests
+  109 PASS
   0 FAIL
   16 SKIP
 
+The 16 SKIP entries are real PostgreSQL opt-in acceptance tests; they are not counted as PASS.
+The stale checkpoint-R broad CREATOR_REVOKED source-shape assertion was updated to the current C6 bounded-wakeup contract and now passes.
+
 Final physical source anti-map:
-  7 / 7 PASS
+  8 / 8 PASS
 
-Changed/added JavaScript syntax:
-  65 / 65 PASS
+Full Phase2 backend test surface after the final M1 source cut:
+  306 tests
+  279 PASS
+  0 FAIL
+  27 SKIP
 
-Full src/services/*.test.js regression:
-  2304 tests
-  2248 PASS
-  26 FAIL
-  30 SKIP
-The exact 26 FAIL names are identical 1:1 to the pre-existing checkpoint-15 baseline.
-NEW full-suite FAIL names introduced by this candidate: 0.
+The broader 27 SKIPs include the same opt-in/integration families that require external PostgreSQL or other acceptance environment; there are no source failures in the Phase2 surface.
+
+Extended all-backend differential regression:
+  INTERMEDIATE 12 worktree: 2378 tests => 2253 PASS / 95 FAIL / 30 SKIP
+  INTERMEDIATE 11 baseline: 2376 tests => 2251 PASS / 95 FAIL / 30 SKIP
+  Normalized failure-title multiset: EXACTLY IDENTICAL; new failures = 0, resolved failures = 0.
+The 95 failures are pre-existing historical/extraction/dependency failures outside this Phase2 cut (including missing local dependencies such as jsonwebtoken); they are not treated as Phase2 acceptance PASS.
+
+Cumulative changed Backend JavaScript syntax relative to the exact base:
+  29 / 29 PASS
 
 REAL POSTGRESQL GATES STILL OPEN (16 SKIPPED TESTS)
 - C2: 10 forced multi-connection Team/Member/Role/Creator/User/OWNER interleavings
@@ -110,16 +130,34 @@ ADDITIONAL DEPLOYMENT/MIGRATION GATES STILL REQUIRED
 - multi-replica/soak proof where applicable
 
 M1 ROLLING CUTOVER CONTRACT
-1. Apply migrations. TEAM_CONTROL_PLANE must remain DRAINING.
-2. Start/deploy the new binary; Team authority-changing writes remain fail-closed while DRAINING.
-3. Drain every incompatible old backend binary from request/work execution.
-4. Verify migrated PostgreSQL gates/preflight.
-5. Activate explicitly only after old binaries are actually drained:
-   npm run phase2:team-control-plane -- --activate --confirm-old-binary-drained
-6. Confirm TEAM_CONTROL_PLANE is ACTIVE and then run post-activation forced interleavings/soak.
+0. BEFORE Prisma migration deploy, run:
+   npm run phase2:team-control-plane -- --preflight-migration
+   Require safe=true and no blocker Agency. Repair bad legacy OWNER data on the pre-08000 compatible side before continuing.
+1. Apply migrations. Migration 08000 first takes the exclusive Team release advisory fence, then the multi-table PostgreSQL cutover locks, repeats the same operational-OWNER preflight, installs the complete v2 Team trigger fence and commits TEAM_CONTROL_PLANE=DRAINING in the same transaction.
+2. If the hard migration guard still rejects 08000 and Prisma records the migration as failed, DO NOT deploy the v2 application. Repair the legacy data on the pre-08000 compatible side; then, after confirming the failed migration was rolled back by PostgreSQL, mark that migration rolled back with:
+   npx prisma migrate resolve --rolled-back 20260912008000_phase2_actual56_team_db_generation_fence
+   Re-run --preflight-migration and prisma migrate deploy.
+3. After migration commit, incompatible old binaries may remain alive briefly for reads, but they are no longer correctness writers: PostgreSQL rejects their Team/current-authority writes.
+4. Deploy/start the new binary. /health remains liveness-only; /ready must remain 503 while DRAINING.
+5. Inspect:
+   npm run phase2:team-control-plane
+   Require dbFence.ready=true and zero blocker Agencies. There is intentionally no v2 DRAINING Team-repair writer: if this invariant is not clean after a committed 08000, treat it as DB/manual-corruption or an acceptance failure and DO NOT activate.
+6. Activate explicitly after diagnostics are clean:
+   npm run phase2:team-control-plane -- --activate
+   Activation re-verifies physical trigger identity/event coverage and the operational-OWNER invariant in the exclusive release transaction, including the idempotent already-ACTIVE path.
+7. Confirm /ready=200 and then run the real PostgreSQL old/new-writer, release-fence, migration/restart and scale acceptance gates.
+
+ROLLBACK BOUNDARY
+- BEFORE migration 08000 commits, the old binary/database generation remains the rollback side.
+- AFTER migration 08000 commits, DO NOT perform a binary-only rollback to an incompatible old backend: the database intentionally rejects its Team writes.
+- Post-08000 rollback requires a compatible forward-fix binary or an explicit tested database/schema recovery procedure.
+- Process drain remains operational hygiene after the DB cutover; it is no longer the correctness proof for Team writer compatibility.
 
 DO NOT
+- run migration 08000 without the explicit operator preflight first; the migration repeats the check as a hard safety guard, not as the preferred discovery mechanism
+- deploy the v2 application while migration 08000 is recorded failed
 - auto-activate TEAM_CONTROL_PLANE during startup
+- treat an incompatible old binary as a valid post-08000 binary-only rollback target
 - treat WEB_CONCURRENCY=1 as rolling compatibility proof
 - treat these 16 SKIPs as PASS
 - call PHASE 2 fully CLOSED before PostgreSQL/migration/scale acceptance actually passes

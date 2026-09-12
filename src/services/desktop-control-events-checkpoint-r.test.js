@@ -73,7 +73,7 @@ test("R: legacy creator-session revision channel is a filtered view of the exact
   });
 });
 
-test("R: backend wiring publishes access, revoke, network, key and job invalidations after mutation boundaries", () => {
+test("R: backend wiring uses bounded access wakeups for Team changes and exact creator revoke for Creator lifecycle", () => {
   const root = path.resolve(__dirname, "..");
   const read = (file) => fs.readFileSync(path.join(root, file), "utf8");
   const desktop = read("routes/desktop.js");
@@ -93,8 +93,8 @@ test("R: backend wiring publishes access, revoke, network, key and job invalidat
   assert.match(desktop, /readGeneration:\s*\(\) => currentCreatorCatalogGeneration/);
   assert.match(desktop, /work:\s*\(member\) => filterAuthorizedControlEvents\(req, events, member\)/);
   assert.match(team, /ACCESS_EPOCH_CHANGED/);
-  assert.match(team, /CREATOR_REVOKED/);
-  assert.match(lifecycle, /CREATOR_REVOKED/);
+  assert.doesNotMatch(team, /CREATOR_REVOKED/, "broad Team mutations must converge through durable access/catalog generations, not per-Creator revoke fanout");
+  assert.match(lifecycle, /CREATOR_REVOKED/, "exact Creator retirement may still emit a bounded wakeup hint");
   assert.doesNotMatch(creators, /publishAgencyAccessEpochEvents|bumpAgencyAccessEpoch/);
   assert.match(network, /NETWORK_REVISION_CHANGED/);
   assert.match(keyring, /KEY_VERSION_CHANGED/);

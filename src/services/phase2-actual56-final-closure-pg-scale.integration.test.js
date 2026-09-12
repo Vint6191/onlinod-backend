@@ -35,6 +35,14 @@ async function bounded(promise, label, ms = 10_000) {
   }
 }
 
+async function withTeamGeneration(db, workFn, options = undefined) {
+  const release = require("./phase2-release-compatibility-authority-service");
+  return db.$transaction(async (tx) => {
+    await release.assertTeamControlPlaneWriteAdmission(tx);
+    return workFn(tx);
+  }, options);
+}
+
 async function withClients(count, run) {
   const { PrismaClient } = require("@prisma/client");
   const clients = Array.from({ length: count }, () => new PrismaClient());
@@ -58,14 +66,14 @@ async function cleanupAgency(db, agencyId, userIds = []) {
       availableAt: new Date(Date.now() - 1_000),
     });
     await db.$transaction(async (tx) => {
+      const release = require("./phase2-release-compatibility-authority-service");
+      await release.assertTeamControlPlaneWriteAdmission(tx);
       await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
       await tx.agency.delete({ where: { id: agencyId } });
+      if (userIds.length) await tx.user.deleteMany({ where: { id: { in: userIds } } });
     });
   } catch (_) {
     // Disposable integration DB: cleanup must never hide the closure assertion.
-  }
-  if (userIds.length) {
-    try { await db.user.deleteMany({ where: { id: { in: userIds } } }); } catch (_) {}
   }
 }
 
@@ -89,7 +97,7 @@ test("C1 PostgreSQL: concurrent final settlements conserve current partition mem
     const leftSettled = deferred();
     let rightFinished = false;
     try {
-      await left.agency.create({ data: { id: agencyId, name: agencyId } });
+      await withTeamGeneration(left, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
       const a = await work.publishDomainWork({ db: left, agencyId, workClass, objectType: "C1Conservation", objectId: token("a"), partitionKey, activeGeneration: generation });
       const b = await work.publishDomainWork({ db: left, agencyId, workClass, objectType: "C1Conservation", objectId: token("b"), partitionKey, activeGeneration: generation });
       assert.equal(Number((await projectionRow(left, agencyId, workClass, partitionKey))?.outstandingCount), 2);
@@ -128,7 +136,7 @@ test("C1 PostgreSQL: settle-vs-republish and delete-vs-settle end exactly at phy
     const releaseSettle = deferred();
     const settled = deferred();
     try {
-      await left.agency.create({ data: { id: agencyId, name: agencyId } });
+      await withTeamGeneration(left, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
       const objectId = token("republish");
       const item = await work.publishDomainWork({ db: left, agencyId, workClass, objectType: "C1Republish", objectId, partitionKey, activeGeneration: generation });
 
@@ -175,15 +183,17 @@ test("C3/C4 PostgreSQL: operational owner filtering is complete beyond 500 globa
     const memberB = token("pending_member_b");
     const userIds = [userA, userB];
     try {
-      await db.agency.create({ data: { id: agencyId, name: agencyId } });
-      await db.user.createMany({ data: [
-        { id: userA, email: `${userA}@example.test`, passwordHash: "integration" },
-        { id: userB, email: `${userB}@example.test`, passwordHash: "integration" },
-      ] });
-      await db.agencyMember.createMany({ data: [
-        { id: memberA, agencyId, userId: userA, role: "OWNER", roleKey: "owner", assignedCreators: "all" },
-        { id: memberB, agencyId, userId: userB, role: "MANAGER", roleKey: "manager", assignedCreators: "all" },
-      ] });
+      await withTeamGeneration(db, async (tx) => {
+        await tx.agency.create({ data: { id: agencyId, name: agencyId } });
+        await tx.user.createMany({ data: [
+          { id: userA, email: `${userA}@example.test`, passwordHash: "integration" },
+          { id: userB, email: `${userB}@example.test`, passwordHash: "integration" },
+        ] });
+        await tx.agencyMember.createMany({ data: [
+          { id: memberA, agencyId, userId: userA, role: "OWNER", roleKey: "owner", assignedCreators: "all" },
+          { id: memberB, agencyId, userId: userB, role: "MANAGER", roleKey: "manager", assignedCreators: "all" },
+        ] });
+      });
       await release.runCreatorAccountWriteTransaction(db, (tx) => tx.creatorAccount.create({
         data: { id: creatorId, agencyId, displayName: creatorId, username: token("pending_username") },
       }));
@@ -207,7 +217,7 @@ test("C3/C4 PostgreSQL: operational owner filtering is complete beyond 500 globa
       assert.ok(memberRead.rows.every((row) => row.ownerMemberId === memberB));
       assert.equal(memberRead.summary.pendingDialogs, 20);
 
-      await db.user.update({ where: { id: userB }, data: { disabledAt: new Date() } });
+      await withTeamGeneration(db, (tx) => tx.user.update({ where: { id: userB }, data: { disabledAt: new Date() } }));
       const disabledMemberRead = await listTeamPendingDialogs({ agencyId, memberId: memberB, limit: 10, db });
       assert.equal(disabledMemberRead.rows.length, 0);
       assert.equal(disabledMemberRead.summary.pendingDialogs, 0);
@@ -234,11 +244,13 @@ test("C6 PostgreSQL scale: one Creator create does not rewrite 500 unrelated Age
     const userIds = Array.from({ length: 500 }, (_, i) => token(`c6_user_${i}`));
     const memberIds = Array.from({ length: 500 }, (_, i) => token(`c6_member_${i}`));
     try {
-      await db.agency.create({ data: { id: agencyId, name: agencyId } });
-      await db.user.createMany({ data: userIds.map((id) => ({ id, email: `${id}@example.test`, passwordHash: "integration" })) });
-      await db.agencyMember.createMany({ data: memberIds.map((id, i) => ({
-        id, agencyId, userId: userIds[i], role: i === 0 ? "OWNER" : "CHATTER", roleKey: i === 0 ? "owner" : "chatter", assignedCreators: "all",
-      })) });
+      await withTeamGeneration(db, async (tx) => {
+        await tx.agency.create({ data: { id: agencyId, name: agencyId } });
+        await tx.user.createMany({ data: userIds.map((id) => ({ id, email: `${id}@example.test`, passwordHash: "integration" })) });
+        await tx.agencyMember.createMany({ data: memberIds.map((id, i) => ({
+          id, agencyId, userId: userIds[i], role: i === 0 ? "OWNER" : "CHATTER", roleKey: i === 0 ? "owner" : "chatter", assignedCreators: "all",
+        })) });
+      });
       const actorMember = await db.agencyMember.findUnique({ where: { id: memberIds[0] } });
       const beforeRows = await db.$queryRawUnsafe(`SELECT "id",xmin::text AS xmin,"accessEpoch" FROM "AgencyMember" WHERE "agencyId"=$1 ORDER BY "id"`, agencyId);
       const before = new Map(beforeRows.map((row) => [String(row.id), { xmin: String(row.xmin), accessEpoch: Number(row.accessEpoch) }]));
