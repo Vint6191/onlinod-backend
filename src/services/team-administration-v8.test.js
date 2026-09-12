@@ -29,9 +29,11 @@ test("V8 Team routes expose atomic member settings, status, reissue and explicit
 
 test("V8 service protects owner, self-removal, creator-scope escalation, session revocation and historical attribution", () => {
   const service = read("src/services/team-administration-service.js");
+  const ownerAuthority = read("src/services/team-operational-owner-authority-service.js");
   assert.match(service, /CANNOT_DEACTIVATE_SELF/);
   assert.match(service, /CANNOT_REMOVE_SELF/);
-  assert.match(service, /LAST_OWNER/);
+  assert.match(ownerAuthority, /LAST_OWNER/);
+  assert.match(service, /assertOperationalOwnerRemovalSafety/);
   assert.match(service, /OWNER_MANAGEMENT_REQUIRED/);
   assert.match(service, /CREATOR_SCOPE_ESCALATION/);
   assert.match(service, /ROLE_PRIVILEGE_ESCALATION/);
@@ -162,7 +164,7 @@ test("V8 never creates or reissues OWNER invitations", () => {
 test("V20.19 owner demotion, deactivation and removal revoke owner-root distribution in the same team transaction", () => {
   const service = read("src/services/team-administration-service.js");
   assert.match(service, /revokeOwnerRootAccessForMember/);
-  assert.match(service, /const liveOwnerDemoted = isOwner\(liveTarget\) && nextRoleKey !== "owner"/);
+  assert.match(service, /const liveOwnerDemoted = isOwner\(liveTarget\) && liveNextRoleKey !== "owner"/);
   assert.match(service, /if \(liveOwnerDemoted\)[\s\S]*revokeOwnerRootAccessForMember/);
   assert.match(service, /status === "deactivated"[\s\S]*revokeOwnerRootAccessForMember/);
   assert.match(service, /deletedAt, deactivatedAt: deletedAt[\s\S]*revokeOwnerRootAccessForMember/);

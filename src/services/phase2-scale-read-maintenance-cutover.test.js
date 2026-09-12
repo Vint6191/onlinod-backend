@@ -13,7 +13,7 @@ test("Team snapshot authority aggregates heavy summary work in PostgreSQL", () =
   assert.match(analytics, /GROUP BY d\."memberId"/);
   assert.match(analytics, /percentile_cont\(0\.5\)/);
   assert.match(analytics, /ROW_NUMBER\(\) OVER \(PARTITION BY g\."memberId"/);
-  assert.match(analytics, /GROUP BY GROUPING SETS \(\(p\."ownerMemberId"\), \(\)\)/);
+  assert.match(analytics, /FROM "TeamOperationalPendingCurrent" p[\s\S]*GROUP BY GROUPING SETS \(\(p\."operationalOwnerMemberId"\), \(\)\)/);
   assert.match(analytics, /includeMoney \? loadMoneySummarySql[\s\S]*: Promise\.resolve\(\[\]\)/);
   assert.doesNotMatch(analytics, /for \(let i = 0; i < num\(m\.responseSamples/);
 });

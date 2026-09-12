@@ -4,6 +4,7 @@ const { assertDeviceCanUseCreatorKey } = require("./client-e2e-keyring-service")
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { CREATOR_CONNECTION_STATES, creatorConnectionLockKey } = require("./creator-connection-authority");
+const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
 
 async function runSessionSerializable(db, work) {
   const options = { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 };
@@ -488,6 +489,7 @@ async function revokeCreatorSessionInTransaction({ tx, agencyId, creatorId, acto
       ? CREATOR_CONNECTION_STATES.RECONNECT_REQUIRED
       : CREATOR_CONNECTION_STATES.ENROLLMENT_REQUIRED;
     if (String(creator.connectionState || "") === nextConnectionState) return;
+    await authorizeCreatorAccountWrite(tx);
     await tx.creatorAccount.updateMany({
       where: { id: creatorId, agencyId, deletedAt: null },
       data: {

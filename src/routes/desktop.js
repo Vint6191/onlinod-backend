@@ -8,6 +8,8 @@ const { buildDesktopBootstrap, accessibleCreatorIdSet } = require("../services/d
 const { buildDesktopSecretDelta } = require("../services/desktop-secret-delta-service");
 const { audit } = require("../services/audit-service");
 const { waitForDesktopControlEvents } = require("../services/desktop-control-events");
+const { readCurrentDesktopMemberAuthority, withStableDesktopCurrentAccess } = require("../services/desktop-current-access-authority-service");
+const { currentCreatorCatalogGeneration } = require("../services/creator-human-management-authority-service");
 
 const router = express.Router();
 router.use(authRequired);
@@ -16,7 +18,7 @@ const controlCursorSchema = z.coerce.number().int().min(0).max(Number.MAX_SAFE_I
 const controlWaitSchema = z.coerce.number().int().min(250).max(25_000);
 const controlDeviceSchema = z.string().trim().min(1).max(180);
 
-async function filterAuthorizedControlEvents(req, events) {
+async function filterAuthorizedControlEvents(req, events, member) {
   const creatorProtectedTypes = new Set([
     "SESSION_REVISION_CHANGED",
     "NETWORK_REVISION_CHANGED",
@@ -29,7 +31,7 @@ async function filterAuthorizedControlEvents(req, events) {
   const allowedIds = await accessibleCreatorIdSet({
     db: prisma,
     agencyId: req.auth.agencyId,
-    member: req.auth.membership || req.member,
+    member,
     creatorIds,
   });
   return (Array.isArray(events) ? events : []).filter((event) => {
@@ -39,6 +41,22 @@ async function filterAuthorizedControlEvents(req, events) {
     if (creatorProtectedTypes.has(type) || type === "JOB_AVAILABLE") return allowedIds.has(String(event?.creatorId || ""));
     return false;
   });
+}
+
+const CONTROL_ACCESS_SNAPSHOT_ATTEMPTS = 4;
+
+async function filterAuthorizedControlEventsStable(req, events, maxAttempts = CONTROL_ACCESS_SNAPSHOT_ATTEMPTS) {
+  const agencyId = req.auth.agencyId;
+  const result = await withStableDesktopCurrentAccess({
+    db: prisma,
+    agencyId,
+    userId: req.auth.userId,
+    memberId: req.auth.membership?.id || req.member?.id || null,
+    maxAttempts,
+    readGeneration: () => currentCreatorCatalogGeneration({ db: prisma, agencyId }),
+    work: (member) => filterAuthorizedControlEvents(req, events, member),
+  });
+  return result.value;
 }
 
 router.get("/control/events", async (req, res) => {
@@ -59,7 +77,10 @@ router.get("/control/events", async (req, res) => {
       afterSeq,
       waitMs,
     });
-    const events = await filterAuthorizedControlEvents(req, result.events);
+    // The long-poll may outlive the auth-middleware Member snapshot by up to
+    // 25 seconds. Re-read current Member/User/Agency authority after the wait
+    // before exposing creator-scoped metadata or JOB_AVAILABLE hints.
+    const events = await filterAuthorizedControlEventsStable(req, result.events);
     res.setHeader("Cache-Control", "no-store, private");
     return res.json({ ok: true, streamId: result.streamId, cursor: result.cursor, events });
   } catch (error) {

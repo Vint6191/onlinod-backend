@@ -4,6 +4,7 @@ const { audit } = require("./audit-service");
 const { lockActiveTelegramAccountReference } = require("./telegram-account-reference-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 
@@ -16,10 +17,11 @@ async function updateCreatorTelegramContact({ agencyId, actorMember, actorUserId
     // This prevents a stale pre-retirement read from re-attaching an account/contact after the
     // creator or Agency has been retired, and avoids the inverse Creator <-> TelegramAccount edge.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
-    await assertManagementCommitAuthority({
-      tx, agencyId, actorMember, permissionKey: "creators.manage", creatorIds: [creatorId], agencyAlreadyLocked: true,
-    });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
+    await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "creators.manage", creatorIds: [creatorId],
+      agencyAlreadyLocked: true, creatorRowsAlreadyLocked: true,
+    });
 
     const existing = await tx.creatorAccount.findFirst({
       where: { id: String(creatorId), agencyId, deletedAt: null },
@@ -41,6 +43,7 @@ async function updateCreatorTelegramContact({ agencyId, actorMember, actorUserId
     }
 
     const contactChanged = existing.telegramContact !== telegramContact;
+    await authorizeCreatorAccountWrite(tx);
     const creator = await tx.creatorAccount.update({
       where: { id: existing.id },
       data: {

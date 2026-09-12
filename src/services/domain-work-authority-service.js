@@ -3,6 +3,7 @@
 const { createHash, randomUUID } = require("node:crypto");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { DOMAIN_WORK_EXECUTOR_GENERATION, authorizeDomainWorkExecutor } = require("./phase2-release-compatibility-authority-service");
 
 const DOMAIN_WORK_GENERATION = "phase2_domain_work_v3_actual55";
 const DOMAIN_WORK_PROJECTION_VERSION = "phase2_domain_work_v3_actual55";
@@ -283,37 +284,87 @@ async function hasOutstandingDomainWork({ db = null, agencyId, workClass } = {})
 
 async function legacyExecutorDrainStatus({ db, workClass, fallbackNow = new Date() }) {
   const klass = clean(workClass, 120);
-  if (!LEGACY_DRAIN_WORK_CLASSES.has(klass)) return { ready: true, lanes: [] };
+  const needsLegacyLaneDrain = LEGACY_DRAIN_WORK_CLASSES.has(klass);
   const authorityNow = await dbAuthorityNow({ db, fallbackNow });
 
+  // Two independent rolling fences coexist here:
+  // 1) the older maintenance-lane generation fence only applies to the historical
+  //    lane-backed work classes listed in LEGACY_DRAIN_WORK_CLASSES;
+  // 2) the Actual56 release-generation fence applies to EVERY DomainWork class.
+  // A live pre-migration DWI claim must drain before the new binary acquires any
+  // work of the same class, including DEPENDENCY_FANOUT and destructive classes.
   if (db?.phase2LegacyExecutorFence?.findMany && db?.maintenanceLaneState?.findMany) {
-    const fences = await db.phase2LegacyExecutorFence.findMany({ select: { laneKey: true } });
-    const keys = (fences || []).map((row) => clean(row?.laneKey, 180)).filter(Boolean);
-    if (!keys.length) return { ready: false, lanes: [], reason: "legacy_executor_fence_uninitialized" };
-    const rows = await db.maintenanceLaneState.findMany({
-      where: { key: { in: keys }, ownerToken: { not: null }, leaseUntil: { gt: authorityNow } },
-      select: { key: true, generation: true, ownerToken: true, leaseUntil: true },
-    });
-    return { ready: !(rows || []).length, lanes: rows || [], reason: (rows || []).length ? "legacy_executor_drain" : null };
+    let rows = [];
+    if (needsLegacyLaneDrain) {
+      const fences = await db.phase2LegacyExecutorFence.findMany({ select: { laneKey: true } });
+      const keys = (fences || []).map((row) => clean(row?.laneKey, 180)).filter(Boolean);
+      if (!keys.length) return { ready: false, lanes: [], reason: "legacy_executor_fence_uninitialized" };
+      rows = await db.maintenanceLaneState.findMany({
+        where: { key: { in: keys }, ownerToken: { not: null }, leaseUntil: { gt: authorityNow } },
+        select: { key: true, generation: true, ownerToken: true, leaseUntil: true },
+      });
+    }
+
+    let domainRows = [];
+    if (db?.phase2ReleaseCompatibilityAuthority?.findUnique && db?.domainWorkItem?.findMany) {
+      const authority = await db.phase2ReleaseCompatibilityAuthority.findUnique({
+        where: { scope: "DOMAIN_WORK_EXECUTOR" }, select: { requiredGeneration: true },
+      });
+      const required = clean(authority?.requiredGeneration, 120);
+      if (!required) return { ready: false, lanes: [], reason: "release_executor_fence_uninitialized" };
+      domainRows = await db.domainWorkItem.findMany({
+        where: {
+          workClass: klass, isOutstanding: true, state: STATE.CLAIMED, leaseUntil: { gt: authorityNow },
+          OR: [{ claimExecutionGeneration: null }, { claimExecutionGeneration: { not: required } }],
+        },
+        select: { id: true, claimExecutionGeneration: true, ownerToken: true, leaseUntil: true },
+        orderBy: [{ leaseUntil: "asc" }, { id: "asc" }], take: 100,
+      });
+    }
+    const legacy = [
+      ...(rows || []),
+      ...(domainRows || []).map((row) => ({ key: row.id, generation: row.claimExecutionGeneration || "legacy", ownerToken: row.ownerToken, leaseUntil: row.leaseUntil, domainWork: true })),
+    ];
+    return { ready: legacy.length === 0, lanes: legacy, reason: legacy.length ? "legacy_executor_drain" : null };
   }
 
   if (typeof db?.$queryRawUnsafe === "function") {
-    let rows;
     try {
-      rows = await db.$queryRawUnsafe(`
-        SELECT m."key",m."generation",m."ownerToken",m."leaseUntil"
-          FROM "MaintenanceLaneState" m
-          JOIN "Phase2LegacyExecutorFence" f ON f."laneKey"=m."key"
-         WHERE m."ownerToken" IS NOT NULL
-           AND m."leaseUntil" > $1
-         ORDER BY m."key" ASC`, authorityNow);
+      let rows = [];
+      if (needsLegacyLaneDrain) {
+        rows = await db.$queryRawUnsafe(`
+          SELECT m."key",m."generation",m."ownerToken",m."leaseUntil"
+            FROM "MaintenanceLaneState" m
+            JOIN "Phase2LegacyExecutorFence" f ON f."laneKey"=m."key"
+           WHERE m."ownerToken" IS NOT NULL
+             AND m."leaseUntil" > $1
+           ORDER BY m."key" ASC`, authorityNow);
+      }
+      const domainRows = await db.$queryRawUnsafe(`
+        WITH release_authority AS (
+          SELECT "requiredGeneration"
+            FROM "Phase2ReleaseCompatibilityAuthority"
+           WHERE "scope"='DOMAIN_WORK_EXECUTOR'
+           LIMIT 1
+        )
+        SELECT d."id" AS "key",COALESCE(d."claimExecutionGeneration",'legacy') AS "generation",d."ownerToken",d."leaseUntil"
+          FROM "DomainWorkItem" d
+          CROSS JOIN release_authority a
+         WHERE d."workClass"=$2
+           AND d."isOutstanding"=TRUE
+           AND d."state"='CLAIMED'
+           AND d."leaseUntil">$1
+           AND d."claimExecutionGeneration" IS DISTINCT FROM a."requiredGeneration"
+         ORDER BY d."leaseUntil" ASC,d."id" ASC
+         LIMIT 100`, authorityNow, klass);
+      const legacy = [...(rows || []), ...(domainRows || []).map((row) => ({ ...row, domainWork: true }))];
+      return { ready: legacy.length === 0, lanes: legacy, reason: legacy.length ? "legacy_executor_drain" : null };
     } catch (error) {
-      const wrapped = new Error("Phase2 legacy executor fence is unavailable");
-      wrapped.code = "PHASE2_LEGACY_EXECUTOR_FENCE_REQUIRED";
+      const wrapped = new Error("Phase2 rolling executor fence is unavailable");
+      wrapped.code = "PHASE2_RELEASE_EXECUTOR_FENCE_REQUIRED";
       wrapped.cause = error;
       throw wrapped;
     }
-    return { ready: !(rows || []).length, lanes: rows || [], reason: (rows || []).length ? "legacy_executor_drain" : null };
   }
 
   return { ready: true, lanes: [], skipped: true, reason: "legacy_executor_fence_adapter_unavailable" };
@@ -365,6 +416,7 @@ async function claimDomainWorkBatch({
       if (typeof tx?.$queryRawUnsafe !== "function") {
         return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_raw_storage_unavailable" };
       }
+      await authorizeDomainWorkExecutor(tx);
       const params = [klass, authorityNow, String(generation), ownerToken, leaseUntil, partitionQuantum, take];
       const creatorValues = normalizedCreatorIds.map((value) => {
         params.push(value);
@@ -428,6 +480,7 @@ async function claimDomainWorkBatch({
         const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
         const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
         if (typeof tx?.$queryRawUnsafe !== "function") return { agencyId: null, authorityNow, leaseUntil, items: [] };
+        await authorizeDomainWorkExecutor(tx);
 
         let selectedAgency = clean(agencyId, 180);
         if (!selectedAgency) {
@@ -542,39 +595,96 @@ async function claimDomainWorkBatch({
         );
 
         if (Number(rows?.length || 0) === 0) {
-          rows = await tx.$queryRawUnsafe(
-            `WITH candidate AS MATERIALIZED (
-               SELECT d."id",d."partitionKey",d."availableAt"
-                 FROM "DomainWorkItem" d
-                WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
-                  AND d."isOutstanding"=TRUE
-                  AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                  AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
-                ORDER BY d."availableAt",d."partitionKey",d."id"
-                FOR UPDATE OF d SKIP LOCKED
-                LIMIT 1
-             ), claimed AS (
-               UPDATE "DomainWorkItem" d SET
-                 "state"='CLAIMED',"ownerToken"=$8,"claimFence"=d."claimFence"+1,
-                 "claimedRevision"=d."requestedRevision","leaseUntil"=$9,"attempts"=d."attempts"+1,
-                 "updatedAt"=CURRENT_TIMESTAMP
-                FROM candidate c WHERE d."id"=c."id"
-               RETURNING d.*
-             ), partition_touch AS (
-               INSERT INTO "Phase2WorkBroadClaimPartitionState"(
-                 "id","agencyId","workClass","partitionKey","activeGeneration","lastClaimedAt","createdAt","updatedAt"
-               )
-               SELECT 'p2wbcps_' || md5($4 || E'\x1f' || $1 || E'\x1f' || c."partitionKey"),
-                      $4,$1,c."partitionKey",$3,$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
-                 FROM (SELECT DISTINCT "partitionKey" FROM claimed) c
-               ON CONFLICT ("agencyId","workClass","partitionKey") DO UPDATE SET
-                 "activeGeneration"=EXCLUDED."activeGeneration",
-                 "lastClaimedAt"=EXCLUDED."lastClaimedAt",
-                 "updatedAt"=CURRENT_TIMESTAMP
-               RETURNING 1
-             )
-             SELECT c.* FROM claimed c`, ...params,
+          // Exceptional repair must participate in the same partition transition
+          // fence as the DWI trigger. First lock one due physical DWI row; normal
+          // DWI mutations also own their row before the AFTER trigger takes the
+          // partition advisory lock, so this preserves one DWI-row -> partition
+          // lock order and cannot invert against publish/settle.
+          const repairDiscoveryParams = [klass, authorityNow, String(generation), selectedAgency];
+          let repairDiscoveryFilter = "";
+          if (objectType) {
+            repairDiscoveryParams.push(String(objectType));
+            repairDiscoveryFilter += ` AND d."objectType"=$${repairDiscoveryParams.length}`;
+          }
+          if (normalizedObjectIds.length) {
+            const placeholders = normalizedObjectIds.map((value) => {
+              repairDiscoveryParams.push(value);
+              return `$${repairDiscoveryParams.length}`;
+            }).join(",");
+            repairDiscoveryFilter += ` AND d."objectId" IN (${placeholders})`;
+          }
+
+          const repairCandidates = await tx.$queryRawUnsafe(
+            `SELECT d."id",d."partitionKey"
+               FROM "DomainWorkItem" d
+              WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
+                AND d."isOutstanding"=TRUE
+                AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${repairDiscoveryFilter}
+              ORDER BY d."availableAt",d."partitionKey",d."id"
+              FOR UPDATE OF d SKIP LOCKED
+              LIMIT 1`,
+            ...repairDiscoveryParams,
           );
+          const repairWorkId = clean(repairCandidates?.[0]?.id, 240);
+          const repairPartitionKey = clean(repairCandidates?.[0]?.partitionKey, 1000);
+
+          if (repairWorkId && repairPartitionKey) {
+            if (typeof tx?.$executeRawUnsafe !== "function") {
+              throw Object.assign(new Error("DomainWork partition repair requires executeRaw lock support"), {
+                code: "DOMAIN_WORK_PARTITION_REPAIR_LOCK_REQUIRED",
+              });
+            }
+
+            // This MUST be a separate statement after the candidate row lock and
+            // before COUNT. If it waits for an in-flight transition, the following
+            // statement receives a fresh READ COMMITTED snapshot after that
+            // transition commits. The DB wrapper uses the exact same 64-bit key as
+            // phase2_track_domain_work_current_partition().
+            await tx.$executeRawUnsafe(
+              `SELECT "phase2_lock_domain_work_current_partition"($1,$2,$3)`,
+              selectedAgency,klass,repairPartitionKey,
+            );
+
+            const repairParams = [
+              klass,authorityNow,String(generation),selectedAgency,
+              ownerToken,leaseUntil,repairWorkId,repairPartitionKey,
+            ];
+            rows = await tx.$queryRawUnsafe(
+              `WITH claimed AS (
+                 UPDATE "DomainWorkItem" d SET
+                   "state"='CLAIMED',"ownerToken"=$5,"claimFence"=d."claimFence"+1,
+                   "claimedRevision"=d."requestedRevision","leaseUntil"=$6,"attempts"=d."attempts"+1,
+                   "updatedAt"=CURRENT_TIMESTAMP
+                  WHERE d."id"=$7 AND d."agencyId"=$4 AND d."workClass"=$1
+                    AND d."activeGeneration"=$3 AND d."partitionKey"=$8 AND d."isOutstanding"=TRUE
+                    AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
+                    AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)
+                 RETURNING d.*
+               ), partition_repair AS MATERIALIZED (
+                 SELECT $8::text AS "partitionKey",COUNT(d."id")::INTEGER AS "outstandingCount"
+                   FROM "DomainWorkItem" d
+                  WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
+                    AND d."partitionKey"=$8 AND d."isOutstanding"=TRUE
+               ), partition_touch AS (
+                 INSERT INTO "Phase2WorkBroadClaimPartitionState"(
+                   "id","agencyId","workClass","partitionKey","activeGeneration","outstandingCount","lastClaimedAt","createdAt","updatedAt"
+                 )
+                 SELECT 'p2wbcps_' || md5($4 || E'\x1f' || $1 || E'\x1f' || c."partitionKey"),
+                        $4,$1,c."partitionKey",$3,c."outstandingCount",$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+                   FROM partition_repair c
+                  WHERE c."outstandingCount" > 0
+                 ON CONFLICT ("agencyId","workClass","partitionKey") DO UPDATE SET
+                   "activeGeneration"=EXCLUDED."activeGeneration",
+                   "outstandingCount"=EXCLUDED."outstandingCount",
+                   "lastClaimedAt"=EXCLUDED."lastClaimedAt",
+                   "updatedAt"=CURRENT_TIMESTAMP
+                 RETURNING 1
+               )
+               SELECT c.* FROM claimed c`,
+              ...repairParams,
+            );
+          }
         }
         return { agencyId: selectedAgency, authorityNow, leaseUntil, items: rows || [] };
       });
@@ -594,6 +704,7 @@ async function claimDomainWorkBatch({
   return runDbTransaction(db, async (tx) => {
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
+    await authorizeDomainWorkExecutor(tx);
     if (!tx?.domainWorkItem?.findMany || !tx?.domainWorkItem?.updateMany) {
       return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_storage_unavailable" };
     }

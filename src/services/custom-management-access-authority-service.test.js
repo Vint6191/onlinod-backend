@@ -7,12 +7,17 @@ function dbFor(currentMember) {
   const locks = [];
   return {
     get locks() { return locks.slice(); },
+    creatorAccount: {
+      findMany: async ({ where }) => (where.id.in || []).map((id) => ({ id })),
+    },
     agencyMember: {
       findFirst: async ({ where }) => where.id === currentMember.id && where.userId === currentMember.userId && where.agencyId === currentMember.agencyId
         ? { ...currentMember, permissions: { ...(currentMember.permissions || {}) } } : null,
     },
     async $queryRawUnsafe(sql) {
       if (/FROM "Agency"/.test(sql)) { locks.push("AGENCY"); return [{ id: currentMember.agencyId, deletedAt: null, status: "ACTIVE" }]; }
+      if (/FROM "CreatorAccount"/.test(sql) && /FOR UPDATE/.test(sql)) { locks.push("CREATOR"); return [{ id: "creator-a", agencyId: currentMember.agencyId, deletedAt: null, status: "READY" }]; }
+      if (/FROM "User"/.test(sql) && /FOR SHARE/.test(sql)) { locks.push("USER"); return [{ id: currentMember.userId }]; }
       assert.match(sql, /AgencyMember[\s\S]*FOR SHARE/);
       locks.push("MEMBER");
       return [{ id: currentMember.id }];
@@ -25,7 +30,7 @@ test("current scoped manager may mutate an assigned creator and membership row i
   const db=dbFor({ ...requestMember });
   const result=await assertCustomManagementCreatorAccess({agencyId:"agency-1",actorMember:requestMember,creatorId:"creator-a",permissionKey:"content.review_customs",db});
   assert.equal(result.creatorId,"creator-a");
-  assert.deepEqual(db.locks,["AGENCY","MEMBER"]);
+  assert.deepEqual(db.locks,["AGENCY","CREATOR","USER","MEMBER"]);
 });
 
 test("current scoped manager cannot mutate another creator even with the feature permission", async () => {

@@ -21,8 +21,12 @@ test("D accessEpoch is a durable monotonic AgencyMember field", () => {
   assert.match(migration, /ALTER TABLE "AgencyMember"[\s\S]*ADD COLUMN "accessEpoch" INTEGER NOT NULL DEFAULT 1/);
 });
 
-test("D creator-set changes bump access epoch or revoke scoped access transactionally", () => {
-  assert.match(creators, /createCreatorDraft\(\{[\s\S]*beforeCommit: async \(tx\) => \{[\s\S]*bumpAgencyAccessEpoch\(\{ db: tx, agencyId: req\.auth\.agencyId \}\)/);
+test("D creator-set changes use bounded catalog generation while scoped revoke still bumps affected member epochs", () => {
+  const catalogMigration = read("prisma/migrations/20260912004000_phase2_actual56_creator_management_catalog_authority/migration.sql");
+  assert.match(creators, /createCreatorDraft\(\{[\s\S]*beforeCreate: async \(tx\) => \{[\s\S]*assertHumanCreatorCreateAuthority/);
+  assert.doesNotMatch(creators, /bumpAgencyAccessEpoch|publishAgencyAccessEpochEvents|scanRowsById/);
+  assert.match(catalogMigration, /AgencyCreatorCatalogState/);
+  assert.match(catalogMigration, /phase2_bump_creator_catalog_generation/);
   assert.match(creators, /router\.delete\("\/:id"[\s\S]*retireCreatorWithinTransaction\(\{/);
   const lifecycle = read("src/services/creator-lifecycle-authority-service.js");
   const scope = read("src/services/creator-access-scope-authority-service.js");

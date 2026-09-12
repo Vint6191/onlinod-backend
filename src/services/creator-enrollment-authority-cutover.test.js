@@ -66,10 +66,19 @@ function makeDb() {
 
   const tx = {
     $executeRawUnsafe: async () => 1,
+    agency: { findUnique: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null },
     agencyMember: {
       findUnique: async ({ where }) => {
         const key = where.agencyId_userId || {};
         return key.agencyId === member.agencyId && key.userId === member.userId ? clone(member) : null;
+      },
+      findFirst: async ({ where }) => {
+        if (where?.id && where.id !== member.id) return null;
+        if (where?.userId && where.userId !== member.userId) return null;
+        if (where?.agencyId && where.agencyId !== member.agencyId) return null;
+        if (where?.deletedAt === null && member.deletedAt) return null;
+        if (where?.deactivatedAt === null && member.deactivatedAt) return null;
+        return clone(member);
       },
     },
     creatorAccount: {
@@ -143,12 +152,12 @@ async function draft(ctx, username) {
   return createCreatorDraft({ db: ctx.db, agencyId: "agency-1", displayName: username, username });
 }
 async function begin(ctx, creatorId) {
-  return beginCreatorConnection({ db: ctx.db, agencyId: "agency-1", creatorId, userId: "user-1", deviceId: "device-1" });
+  return beginCreatorConnection({ db: ctx.db, agencyId: "agency-1", creatorId, userId: "user-1", actorMember: ctx.member, deviceId: "device-1" });
 }
 async function complete(ctx, creator, remoteId, username) {
   const current = ctx.creator(creator.id);
   return completeCreatorConnection({
-    db: ctx.db, agencyId: "agency-1", creatorId: creator.id, userId: "user-1",
+    db: ctx.db, agencyId: "agency-1", creatorId: creator.id, userId: "user-1", actorMember: ctx.member,
     connectionGeneration: current.connectionGeneration, remoteId, username,
     platformDisplayName: username, avatarUrl: `https://img/${username}.jpg`,
   });

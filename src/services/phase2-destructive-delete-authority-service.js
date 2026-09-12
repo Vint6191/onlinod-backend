@@ -14,6 +14,7 @@ const {
 } = require("./custom-content-pipeline-authority-service");
 const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("./mass-campaign-authority-service");
 const { retireCreatorWithinTransaction } = require("./creator-lifecycle-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
 
 const CREATOR_DELETE_BATCH = 250;
 const AGENCY_DELETE_BATCH = 250;
@@ -783,6 +784,18 @@ async function processAgencyHardDeleteWorkItem({ db, item, ownerToken, batchSize
   const now = fallbackNow instanceof Date ? fallbackNow : new Date(fallbackNow || Date.now());
 
   return runDbTransaction(db, async (tx) => {
+    // Agency destructive cleanup also mutates Team current topology through child
+    // Creator retirement. Keep it outside the new C2 graph until release ACTIVE.
+    // DRAINING is an intentional deployment dependency, not a failed destructive
+    // attempt: yield this durable work instead of polluting retry/error telemetry.
+    try {
+      await assertTeamControlPlaneWriteAdmission(tx);
+    } catch (error) {
+      if (error?.code === "TEAM_CONTROL_PLANE_DRAINING") {
+        return { ok: true, complete: false, phase: "WAIT_TEAM_CONTROL_PLANE_RELEASE" };
+      }
+      throw error;
+    }
     await lockAgencyPipelineLifecycleExclusive({ db: tx, agencyId, allowDeleted: true });
     const agency = await tx.agency.findUnique({ where: { id: agencyId }, select: { id: true, deletedAt: true, status: true } });
     if (!agency) return { ok: true, complete: true, alreadyDeleted: true, identityDeleted: true, phase: "IDENTITY_ABSENT" };

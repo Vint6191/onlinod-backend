@@ -1,6 +1,8 @@
 "use strict";
 
-async function processTelegramAccountRetirementFanout({ db, item, now = new Date(), batchSize = 50 } = {}) {
+const { runCreatorAccountWriteTransaction } = require("./phase2-release-compatibility-authority-service");
+
+async function processTelegramAccountRetirementFanoutInContext({ db, item, now = new Date(), batchSize = 50 } = {}) {
   const agencyId = String(item?.agencyId || "").trim();
   const accountId = String(item?.objectId || item?.accountId || "").trim();
   if (!agencyId || !accountId) {
@@ -65,6 +67,12 @@ async function processTelegramAccountRetirementFanout({ db, item, now = new Date
     }
   }
   return { complete: true, detached: 0 };
+}
+
+async function processTelegramAccountRetirementFanout({ db, item, now = new Date(), batchSize = 50 } = {}) {
+  return runCreatorAccountWriteTransaction(db, (tx) =>
+    processTelegramAccountRetirementFanoutInContext({ db: tx, item, now, batchSize }),
+  );
 }
 
 module.exports = { processTelegramAccountRetirementFanout };

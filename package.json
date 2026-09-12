@@ -23,7 +23,8 @@
     "maintenance:purge-stuck-deliveries": "node scripts/maintenance/purge-stuck-deliveries.js",
     "db:baseline:v20.22": "node scripts/database/generate-production-baseline-v20-22.js",
     "audit:phase2-scale": "node scripts/audit/phase2-scale-readonly.js",
-    "audit:phase2-coverage-preflight": "node scripts/audit/phase2-coverage-preflight-readonly.js"
+    "audit:phase2-coverage-preflight": "node scripts/audit/phase2-coverage-preflight-readonly.js",
+    "phase2:team-control-plane": "node scripts/maintenance/phase2-team-control-plane-activation.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

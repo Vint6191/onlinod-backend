@@ -1,5 +1,7 @@
 "use strict";
 
+const { lockTeamControlPlaneTopology, teamControlPlaneTopologyLockKey } = require("./team-control-plane-authority-service");
+
 function clean(value, max = 180) {
   const text = String(value == null ? "" : value).trim();
   return text ? text.slice(0, max) : "";
@@ -12,6 +14,18 @@ function epoch(value) {
 
 function explicitScopeContainmentSql(columnSql, param) {
   return `(${columnSql} @> jsonb_build_array(${param}::text) OR ${columnSql} @> jsonb_build_object('ids',jsonb_build_array(${param}::text)) OR ${columnSql} @> jsonb_build_object('creatorIds',jsonb_build_array(${param}::text)))`;
+}
+
+function creatorAccessTopologyLockKey(agencyId) {
+  return teamControlPlaneTopologyLockKey(agencyId);
+}
+
+async function lockCreatorAccessTopology({ tx, agencyId } = {}) {
+  // Backward-compatible alias retained for checkpoint-13 callers/tests. The
+  // underlying advisory identity is now the canonical Team control-plane fence.
+  // Callers that already own the Agency lifecycle barrier may reacquire it shared
+  // without changing lock order.
+  return lockTeamControlPlaneTopology({ tx, agencyId, agencyAlreadyLocked: false, allowDeleted: true });
 }
 
 async function retireCreatorCurrentAccess({ tx, agencyId, creatorId } = {}) {
@@ -86,4 +100,4 @@ async function retireCreatorCurrentAccess({ tx, agencyId, creatorId } = {}) {
   };
 }
 
-module.exports = { retireCreatorCurrentAccess };
+module.exports = { retireCreatorCurrentAccess, lockCreatorAccessTopology, creatorAccessTopologyLockKey };

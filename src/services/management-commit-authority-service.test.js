@@ -8,7 +8,10 @@ function loadAuthority({ permission = true } = {}) {
   const original = Module._load;
   Module._load = function(request, parent, isMain) {
     if (request === "../middleware/automation-permissions") {
-      return { canAccessCreator: (member, creatorId) => member?.assignedCreators === "all" || (Array.isArray(member?.assignedCreators) && member.assignedCreators.includes(creatorId)) };
+      return {
+        canAccessCreator: (member, creatorId) => member?.assignedCreators === "all" || (Array.isArray(member?.assignedCreators) && member.assignedCreators.includes(creatorId)),
+        hasBroadCreatorAccess: (member) => member?.assignedCreators === "all" || member?.assignedCreators == null,
+      };
     }
     if (request === "./team-access-control") {
       return { canUsePermission: async () => permission, isOwner: (member) => String(member?.roleKey || "").toLowerCase() === "owner" || String(member?.role || "").toUpperCase() === "OWNER" };
@@ -107,4 +110,20 @@ test("ManagementCommitAuthority validates scope without SHARE lock when canonica
   assert.equal(out.member.id, admitted.id);
   assert.equal(sql.some((query) => query.includes('FROM "CreatorAccount"')), false);
   assert.equal(sql.some((query) => query.includes('FROM "User"') && query.includes('FOR SHARE')), true);
+});
+
+
+test("ManagementCommitAuthority rechecks all-creators scope at Creator-create commit", async () => {
+  const { assertManagementCommitAuthority } = loadAuthority();
+  await assert.rejects(
+    () => assertManagementCommitAuthority({
+      tx: dbWith(admitted), agencyId: "agency-1", actorMember: admitted, permissionKey: "creators.manage", requireBroadCreatorScope: true,
+    }),
+    (error) => error?.code === "MANAGEMENT_BROAD_CREATOR_SCOPE_REQUIRED" && error?.status === 403,
+  );
+  const broad = { ...admitted, assignedCreators: "all" };
+  const out = await assertManagementCommitAuthority({
+    tx: dbWith(broad), agencyId: "agency-1", actorMember: broad, permissionKey: "creators.manage", requireBroadCreatorScope: true,
+  });
+  assert.equal(out.member.id, broad.id);
 });

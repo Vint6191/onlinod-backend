@@ -2,6 +2,12 @@
 
 const { assignedCreatorIds, hasBroadCreatorAccess } = require("../middleware/automation-permissions");
 const { normalizedAccessEpoch } = require("./access-epoch-service");
+const { currentCreatorCatalogGeneration } = require("./creator-human-management-authority-service");
+const {
+  desktopMemberAuthorityFingerprint,
+  desktopMemberAuthorityRevokedError,
+  readCurrentDesktopMemberAuthority,
+} = require("./desktop-current-access-authority-service");
 
 const CREATOR_RUNTIME_INCLUDE = Object.freeze({
   sessionState: {
@@ -51,6 +57,49 @@ async function listAccessibleCreatorRows({ db, agencyId, member }) {
   });
 }
 
+const CREATOR_CATALOG_SNAPSHOT_ATTEMPTS = 4;
+
+function creatorCatalogSnapshotError() {
+  const error = new Error("Creator catalog changed continuously while desktop bootstrap was being built");
+  error.code = "CREATOR_CATALOG_SNAPSHOT_UNSTABLE";
+  error.status = 503;
+  error.retryable = true;
+  return error;
+}
+
+async function readStableAccessibleCreatorCatalog({ db, agencyId, userId, member, maxAttempts = CREATOR_CATALOG_SNAPSHOT_ATTEMPTS }) {
+  const attempts = Math.max(1, Math.min(10, Number(maxAttempts) || CREATOR_CATALOG_SNAPSHOT_ATTEMPTS));
+  const memberId = String(member?.id || "").trim();
+  const expectedUserId = String(userId || member?.userId || "").trim();
+  if (!memberId || !expectedUserId) throw desktopMemberAuthorityRevokedError();
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    // Creator membership and member-specific access are separate authorities.
+    // Read both sides of the creator query so a scope/role/User lifecycle commit
+    // cannot pair an obsolete creator list with a newer accessEpoch.
+    const memberBefore = await readCurrentDesktopMemberAuthority({
+      db, agencyId, userId: expectedUserId, memberId,
+    });
+    const generationBefore = await currentCreatorCatalogGeneration({ db, agencyId });
+    const creators = await listAccessibleCreatorRows({ db, agencyId, member: memberBefore });
+    const generationAfter = await currentCreatorCatalogGeneration({ db, agencyId });
+    const memberAfter = await readCurrentDesktopMemberAuthority({
+      db, agencyId, userId: expectedUserId, memberId,
+    });
+
+    if (generationBefore === generationAfter
+        && desktopMemberAuthorityFingerprint(memberBefore) === desktopMemberAuthorityFingerprint(memberAfter)) {
+      return {
+        creators,
+        member: memberAfter,
+        accessEpoch: normalizedAccessEpoch(memberAfter.accessEpoch),
+        creatorCatalogGeneration: generationAfter,
+      };
+    }
+  }
+  throw creatorCatalogSnapshotError();
+}
+
 async function accessibleCreatorIdSet({ db, agencyId, member, creatorIds }) {
   const requested = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map((value) => String(value || "").trim()).filter(Boolean)));
   if (requested.length === 0) return new Set();
@@ -93,12 +142,14 @@ async function buildDesktopBootstrap({ db, agencyId, userId, member, deviceId })
     error.status = 401;
     throw error;
   }
-  const creators = await listAccessibleCreatorRows({ db, agencyId, member });
-  const accessEpoch = normalizedAccessEpoch(member.accessEpoch);
+  const { creators, creatorCatalogGeneration, accessEpoch } = await readStableAccessibleCreatorCatalog({
+    db, agencyId, userId, member,
+  });
   return {
     ok: true,
     bootstrapVersion: 1,
     accessEpoch,
+    creatorCatalogGeneration,
     scope: {
       agencyId: String(agencyId),
       userId: String(userId),
@@ -109,6 +160,7 @@ async function buildDesktopBootstrap({ db, agencyId, userId, member, deviceId })
     manifest: {
       version: 1,
       accessEpoch,
+      creatorCatalogGeneration,
       creators: creators.map(creatorManifestEntry),
     },
   };
@@ -117,6 +169,9 @@ async function buildDesktopBootstrap({ db, agencyId, userId, member, deviceId })
 module.exports = {
   CREATOR_RUNTIME_INCLUDE,
   listAccessibleCreatorRows,
+  desktopMemberAuthorityFingerprint,
+  readCurrentDesktopMemberAuthority,
+  readStableAccessibleCreatorCatalog,
   accessibleCreatorIdSet,
   creatorManifestEntry,
   buildDesktopBootstrap,

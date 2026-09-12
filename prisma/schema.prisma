@@ -368,8 +368,18 @@ model Agency {
   phase2WorkCoverages Phase2WorkCoverage[]
   phase2DependencyStates Phase2DependencyState[]
   phase2BroadClaimPartitionStates Phase2WorkBroadClaimPartitionState[]
+  creatorCatalogState AgencyCreatorCatalogState?
 
   @@index([deletedAt])
+}
+
+
+model AgencyCreatorCatalogState {
+  agencyId    String   @id
+  generation  Int      @default(1)
+  updatedAt   DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 }
 
 
@@ -2170,6 +2180,17 @@ model MaintenanceLaneState {
   @@index([nextRunAt, completedAt], map: "MaintenanceLaneState_due_idx")
 }
 
+model Phase2ReleaseCompatibilityAuthority {
+  scope                 String    @id
+  requiredGeneration    String
+  activationState       String    @default("ACTIVE")
+  drainStartedAt        DateTime?
+  activatedAt           DateTime? @default(now())
+  activationConfirmedAt DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+}
+
 model DomainWorkItem {
   id                 String   @id
   agencyId           String
@@ -2192,6 +2213,7 @@ model DomainWorkItem {
   claimFence         BigInt   @default(0)
   leaseUntil         DateTime?
   claimedRevision    BigInt   @default(0)
+  claimExecutionGeneration String?
   progressCursor     Json?
   dependencyKind     String?
   dependencyKey      String?
@@ -2250,6 +2272,7 @@ model Phase2WorkBroadClaimPartitionState {
   workClass        String
   partitionKey     String
   activeGeneration String
+  outstandingCount Int      @default(0)
   lastClaimedAt    DateTime?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt

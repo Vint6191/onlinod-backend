@@ -5,6 +5,7 @@ const { isOwner } = require("./team-access-control");
 const { assertCreatorSessionTargetActive, publicState } = require("./creator-session-broker-service");
 const { profilePublic } = require("./creator-network-profile-service");
 const { opaqueProxyCredentialEnvelope } = require("./proxy-credentials");
+const { readCurrentDesktopMemberAuthority } = require("./desktop-current-access-authority-service");
 
 function codedError(code, message, status = 409, extra = null) {
   const error = new Error(message);
@@ -171,9 +172,16 @@ async function buildDesktopSecretDelta({ db, agencyId, userId, member, deviceId,
   const normalized = normalizeRequests(requests);
   if (!normalized.length) return { ok: true, items: [] };
   return serializableRead(db, async (tx) => {
-    const liveMember = await tx.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId } } });
-    if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) {
-      throw codedError("DESKTOP_SECRET_MEMBER_INACTIVE", "Agency membership is no longer active", 403);
+    let liveMember;
+    try {
+      liveMember = await readCurrentDesktopMemberAuthority({
+        db: tx, agencyId, userId, memberId: member?.id || null,
+      });
+    } catch (error) {
+      if (error?.code === "DESKTOP_MEMBER_AUTHORITY_REVOKED") {
+        throw codedError("DESKTOP_SECRET_MEMBER_INACTIVE", "Agency membership, User, or Agency is no longer operationally active", 403);
+      }
+      throw error;
     }
     const ids = normalized.map((x) => x.creatorId);
     const rows = await tx.creatorAccount.findMany({

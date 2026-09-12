@@ -80,10 +80,19 @@ function makeConnectedDb() {
 
   const tx = {
     $executeRawUnsafe: async () => 1,
+    agency: { findUnique: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null },
     agencyMember: {
       findUnique: async ({ where }) => {
         const key = where.agencyId_userId || {};
         return key.agencyId === member.agencyId && key.userId === member.userId ? clone(member) : null;
+      },
+      findFirst: async ({ where }) => {
+        if (where?.id && where.id !== member.id) return null;
+        if (where?.userId && where.userId !== member.userId) return null;
+        if (where?.agencyId && where.agencyId !== member.agencyId) return null;
+        if (where?.deletedAt === null && member.deletedAt) return null;
+        if (where?.deactivatedAt === null && member.deactivatedAt) return null;
+        return clone(member);
       },
     },
     creatorAccount: {
@@ -135,9 +144,9 @@ function profileInput(overrides = {}) {
   };
 }
 
-function revokeInput(overrides = {}) {
+function revokeInput(ctx, overrides = {}) {
   return {
-    agencyId: "agency-1", creatorId: "creator-1", userId: "user-1",
+    agencyId: "agency-1", creatorId: "creator-1", userId: "user-1", actorMember: ctx.member,
     deviceId: "device-a", baseRevision: 7, requestId: "revoke-request-1", reason: "test",
     ...overrides,
   };
@@ -147,7 +156,7 @@ test("assigned chatter with creator access cannot perform destructive global rev
   const ctx = makeConnectedDb();
   ctx.member.permissions["creators.manage"] = false;
   await assert.rejects(
-    revokeCreatorConnection({ db: ctx.db, ...revokeInput() }),
+    revokeCreatorConnection({ db: ctx.db, ...revokeInput(ctx) }),
     (error) => error?.code === "CREATOR_MANAGEMENT_FORBIDDEN" && error?.status === 403,
   );
   assert.equal(ctx.session.status, "ACTIVE");
@@ -157,7 +166,7 @@ test("assigned chatter with creator access cannot perform destructive global rev
 
 test("live manager authority can revoke canonical and project RECONNECT_REQUIRED", async () => {
   const ctx = makeConnectedDb();
-  const result = await revokeCreatorConnection({ db: ctx.db, ...revokeInput() });
+  const result = await revokeCreatorConnection({ db: ctx.db, ...revokeInput(ctx) });
   assert.equal(result.state.status, "REVOKED");
   assert.equal(ctx.session.status, "REVOKED");
   assert.equal(ctx.session.encryptedPayload, null);
@@ -169,7 +178,7 @@ test("management permission lost after admission but before destructive mutation
   await assert.rejects(
     revokeCreatorConnection({
       db: ctx.db,
-      ...revokeInput(),
+      ...revokeInput(ctx),
       beforeRevoke: async () => { ctx.member.permissions["creators.manage"] = false; },
     }),
     (error) => error?.code === "CREATOR_MANAGEMENT_FORBIDDEN" && error?.status === 403,
@@ -183,7 +192,7 @@ test("member deactivation after admission but before destructive mutation preven
   await assert.rejects(
     revokeCreatorConnection({
       db: ctx.db,
-      ...revokeInput(),
+      ...revokeInput(ctx),
       beforeRevoke: async () => { ctx.member.deactivatedAt = new Date(); },
     }),
     (error) => error?.code === "CREATOR_CONNECTION_MEMBER_INACTIVE" && error?.status === 403,

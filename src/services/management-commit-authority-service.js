@@ -1,8 +1,9 @@
 "use strict";
 
-const { canAccessCreator } = require("../middleware/automation-permissions");
+const { canAccessCreator, hasBroadCreatorAccess } = require("../middleware/automation-permissions");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
+const { lockLiveTeamControlPlaneCreators } = require("./team-control-plane-authority-service");
 
 function fail(code, message, status = 403, details = null) {
   const error = Object.assign(new Error(message), { code, status });
@@ -94,6 +95,7 @@ async function assertManagementCommitAuthority({
   ownerOrAdmin = false,
   agencyAlreadyLocked = false,
   creatorRowsAlreadyLocked = false,
+  requireBroadCreatorScope = false,
 }) {
   if (!tx || !agencyId) throw fail("MANAGEMENT_COMMIT_CONTEXT_REQUIRED", "Management commit context is required", 500);
   if (!agencyAlreadyLocked) await lockAgencyLifecycle({ tx, agencyId });
@@ -103,47 +105,12 @@ async function assertManagementCommitAuthority({
   // writer and Creator retirement obeys one order: Agency -> Creator -> Member.
   // FOR SHARE conflicts with both Creator FOR UPDATE and non-key lifecycle UPDATE
   // (deletedAt/status) while still allowing concurrent read-side scope proofs.
-  const targets = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : [creatorIds]).map((id) => clean(id)).filter(Boolean))).sort();
-  if (targets.length) {
-    if (creatorRowsAlreadyLocked) {
-      // Caller owns the canonical Creator FOR UPDATE lifecycle lock already.
-      // Re-acquiring FOR SHARE before that lock would create a SHARE->UPDATE
-      // upgrade topology. A plain in-transaction live-state proof is enough here:
-      // the existing FOR UPDATE fence prevents retirement/state from changing.
-      if (!tx?.creatorAccount?.findMany) {
-        throw fail("MANAGEMENT_CREATOR_STORAGE_REQUIRED", "Creator storage is required for commit-time authorization", 500);
-      }
-      const rows = await tx.creatorAccount.findMany({
-        where: { agencyId: String(agencyId), deletedAt: null, id: { in: targets } },
-        select: { id: true },
-        take: targets.length,
-      });
-      const live = new Set(rows.map((row) => String(row.id)));
-      const missing = targets.filter((id) => !live.has(id));
-      if (missing.length) throw fail("MANAGEMENT_CREATOR_RETIRED", "Creator is no longer active", 409, { creatorIds: missing });
-    } else if (typeof tx?.$queryRawUnsafe === "function") {
-      for (const creatorId of targets) {
-        const locked = await tx.$queryRawUnsafe(
-          `SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL FOR SHARE`,
-          creatorId,
-          String(agencyId),
-        );
-        if (!Array.isArray(locked) || locked.length !== 1) {
-          throw fail("MANAGEMENT_CREATOR_RETIRED", "Creator is no longer active", 409, { creatorIds: [creatorId] });
-        }
-      }
-    } else if (tx?.creatorAccount?.findMany) {
-      const rows = await tx.creatorAccount.findMany({
-        where: { agencyId: String(agencyId), deletedAt: null, id: { in: targets } },
-        select: { id: true },
-        take: targets.length,
-      });
-      const live = new Set(rows.map((row) => String(row.id)));
-      const missing = targets.filter((id) => !live.has(id));
-      if (missing.length) throw fail("MANAGEMENT_CREATOR_RETIRED", "Creator is no longer active", 409, { creatorIds: missing });
-    } else {
-      throw fail("MANAGEMENT_CREATOR_STORAGE_REQUIRED", "Creator storage is required for commit-time authorization", 500);
-    }
+  const creatorLock = creatorRowsAlreadyLocked
+    ? { creatorIds: Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : [creatorIds]).map((id) => clean(id)).filter(Boolean))).sort(), missingCreatorIds: [] }
+    : await lockLiveTeamControlPlaneCreators({ tx, agencyId, creatorIds, mode: "share" });
+  const targets = creatorLock.creatorIds;
+  if (creatorLock.missingCreatorIds.length) {
+    throw fail("MANAGEMENT_CREATOR_RETIRED", "Creator is no longer active", 409, { creatorIds: creatorLock.missingCreatorIds });
   }
 
   const member = await lockLiveActor({ tx, agencyId, actorMember });
@@ -153,6 +120,9 @@ async function assertManagementCommitAuthority({
   }
   if (permissionKey && !(await canUsePermission({ member, key: permissionKey, db: tx }))) {
     throw fail("MANAGEMENT_PERMISSION_REVOKED", `${permissionKey} permission is required`, 403, { permissionKey });
+  }
+  if (requireBroadCreatorScope && !hasBroadCreatorAccess(member)) {
+    throw fail("MANAGEMENT_BROAD_CREATOR_SCOPE_REQUIRED", "All-creators scope is required for this management command", 403);
   }
 
   const denied = targets.filter((creatorId) => !canAccessCreator(member, creatorId));

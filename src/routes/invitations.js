@@ -14,6 +14,7 @@ const {
 } = require("../services/team-administration-service");
 const { validateAssignedCreators } = require("../services/team-access-control");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
+const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = require("../services/team-control-plane-authority-service");
 
 const router = express.Router();
 
@@ -100,9 +101,11 @@ router.post("/claim", authRequired, async (req, res) => {
         // capability used by Team Administration until member + invite claim
         // commit, so custom-role deletion cannot race an invitation that was
         // validated just before expiry. Preset roles intentionally no-op here.
-        await lockTeamRoleLifecycle({ tx, agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, mode: "share" });
+        await lockTeamControlPlaneTopology({ tx, agencyId: currentInvite.agencyId });
+        await lockTeamRoleLifecycle({ tx, agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, mode: "share", agencyAlreadyLocked: true });
         roleKey = await ensureRoleExists({ agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, db: tx });
-      } catch (_) {
+      } catch (lockError) {
+        if (String(lockError?.code || "").startsWith("TEAM_CONTROL_PLANE_")) throw lockError;
         const error = new Error("Invitation role is no longer available");
         error.status = 409;
         error.code = "INVITE_ROLE_STALE";
@@ -125,6 +128,19 @@ router.post("/claim", authRequired, async (req, res) => {
         error.status = 409;
         error.code = "INVITE_CREATOR_SCOPE_STALE";
         error.details = { unknownCreatorIds: creatorScope.unknownCreatorIds };
+        throw error;
+      }
+      const creatorLocks = await lockLiveTeamControlPlaneCreators({
+        tx,
+        agencyId: currentInvite.agencyId,
+        creatorIds: creatorScope.normalized?.mode === "scoped" ? creatorScope.normalized.creatorIds : [],
+        mode: "share",
+      });
+      if (creatorLocks.missingCreatorIds.length) {
+        const error = new Error("Invitation contains creators that are no longer available");
+        error.status = 409;
+        error.code = "INVITE_CREATOR_SCOPE_STALE";
+        error.details = { unknownCreatorIds: creatorLocks.missingCreatorIds };
         throw error;
       }
       const functions = cleanFunctions(currentInvite.functions);

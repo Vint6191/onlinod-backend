@@ -2,11 +2,13 @@
 
 const { retireCreatorCryptoMaterialOnRemoval } = require("./creator-agency-removal");
 const { retireCreatorCurrentAccess } = require("./creator-access-scope-authority-service");
+const { lockTeamControlPlaneTopology } = require("./team-control-plane-authority-service");
 const { assertCreatorCustomPipelineRetirable, lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
 const { assertCreatorMassCampaignRetirable } = require("./mass-campaign-authority-service");
 const { publishDomainWork, WORK_CLASS } = require("./domain-work-authority-service");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { authorizeCreatorAccountWrite, assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
 
 function clean(value, max = 220) {
   const text = String(value == null ? "" : value).trim();
@@ -24,13 +26,22 @@ async function retireCreatorWithinTransaction({
   revokeReason = null,
   managementActorMember = null,
   managementPermissionKey = null,
+  agencyAlreadyLocked = false,
 } = {}) {
   const agency = clean(agencyId);
   const creator = clean(creatorId);
   const hard = String(mode || "SOFT").toUpperCase() === "HARD";
   if (!tx || !agency || !creator) throw Object.assign(new Error("Creator lifecycle transaction context is required"), { code: "CREATOR_LIFECYCLE_CONTEXT_REQUIRED", status: 500 });
 
-  await lockAgencyPipelineLifecycle({ db: tx, agencyId: agency, allowDeleted: true });
+  // Release admission must precede even the Agency lifecycle prefix. The topology
+  // service repeats this check as a fail-closed invariant for future callers.
+  await assertTeamControlPlaneWriteAdmission(tx);
+  if (!agencyAlreadyLocked) await lockAgencyPipelineLifecycle({ db: tx, agencyId: agency, allowDeleted: true });
+  // Creator retirement mutates Team current-authority topology: it removes this
+  // Creator from live Member/Invitation scopes and severs current Team edges.
+  // Join the Agency-wide Team control-plane fence after the Agency lifecycle
+  // barrier and before any Role/Creator/User/Member rows.
+  await lockTeamControlPlaneTopology({ tx, agencyId: agency, agencyAlreadyLocked: true, allowDeleted: true });
   await lockCreatorPipelineLifecycle({ db: tx, agencyId: agency, creatorId: creator, allowDeleted: true });
   const current = await tx.creatorAccount.findFirst({ where: { id: creator, agencyId: agency }, select: { id: true, deletedAt: true, status: true } });
   if (!current) throw Object.assign(new Error("Creator not found"), { code: "CREATOR_NOT_FOUND", status: 404 });
@@ -81,6 +92,7 @@ async function retireCreatorWithinTransaction({
     data: { status: "CANCELLED", completedAt: retiredAt, leaseUntil: null, leaseTokenHash: null, claimedAt: null, claimedByDeviceId: null },
   });
   if (!current.deletedAt) {
+    await authorizeCreatorAccountWrite(tx);
     await tx.creatorAccount.update({ where: { id: creator }, data: { status: "DISABLED", deletedAt: retiredAt } });
   }
 

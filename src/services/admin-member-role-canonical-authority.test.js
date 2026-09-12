@@ -33,7 +33,8 @@ test("super-admin member removal and role changes share canonical owner-safety a
   assert.match(deleteBody, /removeTeamMember/);
   assert.match(deleteBody, /platformAdmin:\s*true/);
   assert.doesNotMatch(deleteBody, /agencyMember\.delete/);
-  assert.match(team, /team-owner-safety:/);
+  assert.match(team, /lockTeamControlPlaneTopology/);
+  assert.doesNotMatch(team, /team-owner-safety:/);
   assert.match(team, /assertOwnerSafety/);
   assert.match(team, /deletedAt, deactivatedAt: deletedAt, accessEpoch: \{ increment: 1 \}/);
   assert.match(team, /historicalAttributionPreserved:\s*true/);

@@ -21,6 +21,7 @@ test("F56-09/F56-10 creator retirement uses indexed inverse scope and one commit
   const lifecycle = read("services/creator-lifecycle-authority-service.js");
   const scope = read("services/creator-access-scope-authority-service.js");
   const management = read("services/management-commit-authority-service.js");
+  const teamControl = read("services/team-control-plane-authority-service.js");
   const removal = slice(creators, 'router.delete("/:id"', 'router.post("/:id/complete-connection"');
 
   assert.match(removal, /retireCreatorWithinTransaction/);
@@ -34,7 +35,9 @@ test("F56-09/F56-10 creator retirement uses indexed inverse scope and one commit
   assert.match(migration, /AgencyMember_phase2_creator_scope_fence/);
   assert.match(migration, /AgencyInvitation_phase2_creator_scope_fence/);
   assert.match(migration, /phase2_fence_creator_access_scope[\s\S]*deletedAt" IS NULL[\s\S]*FOR SHARE/);
-  assert.match(management, /CreatorAccount[\s\S]*FOR SHARE/);
+  assert.match(management, /lockLiveTeamControlPlaneCreators/);
+  assert.match(teamControl, /CreatorAccount[\s\S]*FOR SHARE/);
+  assert.match(teamControl, /normalizeCreatorIds[\s\S]*\.sort\(\)/);
   assert.match(removal, /managementActorMember:\s*req\.auth\.membership/);
   assert.match(lifecycle, /assertManagementCommitAuthority\([\s\S]*creatorRowsAlreadyLocked:\s*true/);
   assert.match(lifecycle, /retireCreatorCurrentAccess/);
@@ -53,7 +56,8 @@ test("F56-11 platform admin member lifecycle/access delegates to Team authority 
   assert.doesNotMatch(deletion, /agencyMember\.delete/);
   assert.match(role, /updateMemberAccessByPlatformAdmin/);
   assert.match(perms, /updateMemberAccessByPlatformAdmin/);
-  assert.match(team, /team-owner-safety:/);
+  assert.match(team, /lockTeamControlPlaneTopology/);
+  assert.doesNotMatch(team, /team-owner-safety:/);
   assert.match(team, /assertOwnerSafety\([\s\S]*removing:\s*true/);
   assert.match(team, /deletedAt, deactivatedAt: deletedAt, accessEpoch: \{ increment: 1 \}/);
   assert.match(team, /historicalAttributionPreserved:\s*true/);
@@ -83,7 +87,9 @@ test("F56-06/F56-07 Team current reads consume live Creator Member User and acce
   assert.match(schedule, /filterShiftCurrentCreatorLinks/);
   assert.match(pending, /creator:\s*\{ is:\s*\{ deletedAt:\s*null \} \}/);
   assert.match(pending, /OPERATIONAL_OWNER_INELIGIBLE/);
-  assert.match(pending, /phase2_scope_allows_creator/);
+  const operationalMigration = read("../prisma/migrations/20260912003000_phase2_actual56_operational_pending_authority/migration.sql");
+  assert.match(operationalMigration, /phase2_scope_allows_creator/);
+  assert.match(pending, /TeamOperationalPendingCurrent/);
   assert.match(admin, /UPDATE "AgencyMember"[\s\S]*"accessEpoch"="accessEpoch"\+1/);
   assert.match(admin, /SELECT "id" FROM "User" WHERE "id"=\$1 FOR UPDATE/);
 });
@@ -118,8 +124,8 @@ test("invitation restore uses canonical MemberLifecycleAuthority with live User 
   const invitations = read("routes/invitations.js");
   const auth = read("routes/auth.js");
   const team = read("services/team-administration-service.js");
-  assert.match(invitations, /lockTeamRoleLifecycle\(\{ tx, agencyId: currentInvite\.agencyId[\s\S]*materializeInvitationMemberWithinTransaction\(\{/);
-  assert.match(auth, /lockTeamRoleLifecycle\(\{ tx, agencyId: inv\.agencyId[\s\S]*materializeInvitationMemberWithinTransaction\(\{/);
+  assert.match(invitations, /lockTeamControlPlaneTopology\(\{ tx, agencyId: currentInvite\.agencyId[\s\S]*lockTeamRoleLifecycle\(\{ tx, agencyId: currentInvite\.agencyId[\s\S]*lockLiveTeamControlPlaneCreators\([\s\S]*materializeInvitationMemberWithinTransaction\(\{/);
+  assert.match(auth, /lockTeamControlPlaneTopology\(\{ tx, agencyId: inv\.agencyId[\s\S]*lockTeamRoleLifecycle\(\{ tx, agencyId: inv\.agencyId[\s\S]*lockLiveTeamControlPlaneCreators\([\s\S]*materializeInvitationMemberWithinTransaction\(\{/);
   const helper = slice(team, "async function materializeInvitationMemberWithinTransaction", "function invitationUrl");
   assert.match(helper, /FROM "User"[\s\S]*"disabledAt" IS NULL FOR SHARE/);
   assert.match(helper, /FROM "AgencyMember"[\s\S]*FOR UPDATE/);

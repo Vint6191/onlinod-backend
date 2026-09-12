@@ -2,7 +2,10 @@
 
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient, whereForRange } = require("./range-service");
-const { summarizePendingRows } = require("./team-pending-read-service");
+const {
+  summarizePendingRows, operationalOwnerMapForRows,
+  CURRENT_PENDING_DERIVATION_VERSION, CURRENT_PENDING_PROJECTION_STATES, currentPendingProjectionWhere,
+} = require("./team-pending-read-service");
 const { getRetentionSettings } = require("./retention-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { coverageState, buildProjectionDetailAuthority } = require("./team-historical-range-authority-service");
@@ -565,12 +568,38 @@ async function loadProjectedDialogSessions({ agencyId, range, allowedCreatorIds 
 
 async function loadProjectedPendingStates({ agencyId, allowedCreatorIds = null }) {
   try {
+    const creatorIds = Array.isArray(allowedCreatorIds)
+      ? Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)))
+      : null;
+    if (typeof prisma?.$queryRawUnsafe === "function") {
+      const rows = await prisma.$queryRawUnsafe(`
+        SELECT o.*
+          FROM "TeamOperationalPendingCurrent" o
+         WHERE o."agencyId"=$1 AND o."status"='PENDING'
+           AND o."derivationVersion"=$2
+           AND o."projectionState"=ANY($3::text[])
+           AND ($4::text[] IS NULL OR o."creatorId"=ANY($4::text[]))
+         ORDER BY o."firstIncomingAt" ASC NULLS LAST,o."id" ASC
+      `, String(agencyId), CURRENT_PENDING_DERIVATION_VERSION, CURRENT_PENDING_PROJECTION_STATES, creatorIds);
+      return {
+        available: true,
+        rows: (rows || []).map((row) => ({ ...row, ownerMemberId: row.operationalOwnerMemberId || null })),
+      };
+    }
     if (!prisma.teamPendingDialogState?.findMany) return { available: false, rows: [] };
     const rows = await findAllById(prisma.teamPendingDialogState, {
-      where: { agencyId, status: "PENDING", ...creatorScopeWhere(allowedCreatorIds) },
+      where: {
+        agencyId,
+        status: "PENDING",
+        ...currentPendingProjectionWhere(),
+        ...creatorScopeWhere(allowedCreatorIds),
+        creator: { is: { deletedAt: null } },
+      },
     });
-    rows.sort((a, b) => new Date(a.firstIncomingAt || 0).getTime() - new Date(b.firstIncomingAt || 0).getTime());
-    return { available: true, rows };
+    const owners = await operationalOwnerMapForRows({ agencyId, rows, db: prisma });
+    const projected = rows.map((row) => ({ ...row, ownerMemberId: owners.get(String(row.id)) || null }));
+    projected.sort((a, b) => new Date(a.firstIncomingAt || 0).getTime() - new Date(b.firstIncomingAt || 0).getTime());
+    return { available: true, rows: projected };
   } catch (_) {
     return { available: false, rows: [] };
   }
@@ -816,28 +845,31 @@ async function loadDialogSummarySql({ agencyId, range, allowedCreatorIds = null,
 }
 
 async function loadPendingSummarySql({ agencyId, allowedCreatorIds = null, authorityNow, currentGenerationOnly = false }) {
-  const where = sqlScopedWhere({
-    alias: "p", agencyId, allowedCreatorIds,
-    extra: [
-      `p."status" = 'PENDING'`,
-      ...(currentGenerationOnly ? [`p."derivationVersion"='team_pending_v2'`, `p."projectionState" IN ('FULL','INCOMPLETE_HISTORY')`] : []),
-    ],
-  });
-  if (where.empty) return [];
-  const params = [...where.params, new Date(authorityNow)];
-  const nowRef = `$${params.length}`;
+  const creatorIds = Array.isArray(allowedCreatorIds)
+    ? Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)))
+    : null;
+  if (creatorIds && creatorIds.length === 0) return [];
+  const params = [String(agencyId), creatorIds, new Date(authorityNow)];
+  const nowRef = `$3`;
+  const generationSql = currentGenerationOnly
+    ? `AND p."derivationVersion"='team_pending_v2' AND p."projectionState" IN ('FULL','INCOMPLETE_HISTORY')`
+    : "";
   const sql = `
-    SELECT GROUPING(p."ownerMemberId")::int AS "isTotal", p."ownerMemberId" AS "memberId",
+    SELECT GROUPING(p."operationalOwnerMemberId")::int AS "isTotal",
+           p."operationalOwnerMemberId" AS "memberId",
            COUNT(*)::bigint AS "pendingDialogs",
            COALESCE(SUM(GREATEST(1,p."incomingCount")),0)::bigint AS "pendingIncomingMessages",
-           COUNT(*) FILTER (WHERE p."ownerMemberId" IS NULL)::bigint AS "unassignedDialogs",
-           COUNT(*) FILTER (WHERE p."firstSeenAt" IS NOT NULL)::bigint AS "seenDialogs",
+           COUNT(*) FILTER (WHERE p."operationalOwnerMemberId" IS NULL)::bigint AS "unassignedDialogs",
+           COUNT(*) FILTER (WHERE p."operationalOwnerMemberId" IS NOT NULL)::bigint AS "seenDialogs",
            COUNT(*) FILTER (WHERE p."firstIncomingAt" <= ${nowRef} - INTERVAL '15 minutes')::bigint AS "olderThan15m",
            COUNT(*) FILTER (WHERE p."firstIncomingAt" <= ${nowRef} - INTERVAL '60 minutes')::bigint AS "olderThan60m",
            MIN(p."firstIncomingAt") AS "oldestPendingAt"
-    FROM "TeamPendingDialogStateCurrent" p
-    WHERE ${where.sql}
-    GROUP BY GROUPING SETS ((p."ownerMemberId"), ())
+      FROM "TeamOperationalPendingCurrent" p
+     WHERE p."agencyId"=$1
+       AND ($2::text[] IS NULL OR p."creatorId"=ANY($2::text[]))
+       AND p."status"='PENDING'
+       ${generationSql}
+     GROUP BY GROUPING SETS ((p."operationalOwnerMemberId"), ())
   `;
   return teamScaleQuery("pending_summary", sql, params);
 }

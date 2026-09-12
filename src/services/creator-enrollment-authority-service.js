@@ -8,6 +8,11 @@ const {
   revokeCreatorSessionInTransaction,
 } = require("./creator-session-broker-service");
 const { CREATOR_CONNECTION_STATES, creatorConnectionLockKey } = require("./creator-connection-authority");
+const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
+const {
+  lockHumanCreatorMutation,
+  assertHumanCreatorMutationAuthorityAfterLocks,
+} = require("./creator-human-management-authority-service");
 
 const SERIALIZABLE = Object.freeze({ isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 });
 
@@ -81,24 +86,29 @@ async function runSerializable(db, work) {
   );
 }
 
-async function requireLiveConnectionAuthority({ tx, agencyId, creatorId, userId }) {
-  const member = await tx.agencyMember.findUnique({
-    where: { agencyId_userId: { agencyId, userId } },
-  });
-  if (!member || member.deletedAt || member.deactivatedAt) {
-    throw codedError("CREATOR_CONNECTION_MEMBER_INACTIVE", "Agency membership is no longer active", 403);
+function translateConnectionManagementError(error) {
+  const code = String(error?.code || "");
+  if (code === "MANAGEMENT_PERMISSION_REVOKED") return codedError("CREATOR_MANAGEMENT_FORBIDDEN", "Creator management permission is required", 403, { cause: error });
+  if (code === "MANAGEMENT_ACCESS_REVOKED" || code === "MANAGEMENT_USER_DISABLED") return codedError("CREATOR_CONNECTION_MEMBER_INACTIVE", "Agency membership is no longer active", 403, { cause: error });
+  if (code === "MANAGEMENT_CREATOR_SCOPE_REVOKED") return codedError("CREATOR_ACCESS_FORBIDDEN", "Creator access was revoked before connection commit", 403, { cause: error });
+  if (code === "MANAGEMENT_CREATOR_RETIRED") return codedError("CREATOR_NOT_FOUND", "Creator not found", 404, { cause: error });
+  return error;
+}
+
+async function lockHumanConnectionMutation(input) {
+  try {
+    return await lockHumanCreatorMutation(input);
+  } catch (error) {
+    throw translateConnectionManagementError(error);
   }
-  if (!(await canUsePermission({ member, key: "creators.manage", db: tx }))) {
-    throw codedError("CREATOR_MANAGEMENT_FORBIDDEN", "Creator management permission is required", 403);
+}
+
+async function reassertHumanConnectionMutation(input) {
+  try {
+    return await assertHumanCreatorMutationAuthorityAfterLocks(input);
+  } catch (error) {
+    throw translateConnectionManagementError(error);
   }
-  const creator = await tx.creatorAccount.findFirst({
-    where: { id: creatorId, agencyId, deletedAt: null },
-  });
-  if (!creator) throw codedError("CREATOR_NOT_FOUND", "Creator not found", 404);
-  if (!canAccessCreator(member, creator.id)) {
-    throw codedError("CREATOR_ACCESS_FORBIDDEN", "Creator access was revoked before connection commit", 403);
-  }
-  return { member, creator };
 }
 
 async function requireLiveCreatorAccess({ tx, agencyId, creatorId, userId }) {
@@ -118,12 +128,14 @@ async function requireLiveCreatorAccess({ tx, agencyId, creatorId, userId }) {
   return { member, creator };
 }
 
-async function createCreatorDraft({ db, agencyId, displayName, username, notes = null, beforeCommit = null }) {
+async function createCreatorDraft({ db, agencyId, displayName, username, notes = null, beforeCreate = null, beforeCommit = null }) {
   const expectedUsername = normalizeUsername(username);
   const internalName = clean(displayName, 120);
   if (!expectedUsername || !internalName) throw codedError("CREATOR_ENROLLMENT_INPUT_INVALID", "Display name and expected OnlyFans username are required", 400);
   try {
     return await runSerializable(db, async (tx) => {
+      if (typeof beforeCreate === "function") await beforeCreate(tx);
+      await authorizeCreatorAccountWrite(tx);
       const creator = await tx.creatorAccount.create({
         data: {
           agencyId,
@@ -151,10 +163,10 @@ async function createCreatorDraft({ db, agencyId, displayName, username, notes =
   }
 }
 
-async function beginCreatorConnection({ db, agencyId, creatorId, userId, deviceId = null }) {
+async function beginCreatorConnection({ db, agencyId, creatorId, userId, actorMember, deviceId = null }) {
   return runSerializable(db, async (tx) => {
+    const { creator } = await lockHumanConnectionMutation({ tx, agencyId, creatorId, actorMember });
     await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
-    const { creator } = await requireLiveConnectionAuthority({ tx, agencyId, creatorId, userId });
     const state = String(creator.connectionState || CREATOR_CONNECTION_STATES.ENROLLMENT_REQUIRED);
     const hasImmutableIdentity = Boolean(clean(creator.remoteId, 160));
 
@@ -252,7 +264,7 @@ function assertCanonicalForConnection({ creator, canonical, remoteId, connection
 }
 
 async function completeCreatorConnection({
-  db, agencyId, creatorId, userId, connectionGeneration, remoteId, username, platformDisplayName = null, avatarUrl = null,
+  db, agencyId, creatorId, userId, actorMember, connectionGeneration, remoteId, username, platformDisplayName = null, avatarUrl = null,
 }) {
   const identity = clean(remoteId, 160);
   const observedUsername = normalizeUsername(username);
@@ -260,8 +272,8 @@ async function completeCreatorConnection({
 
   try {
     return await runSerializable(db, async (tx) => {
+      const { creator } = await lockHumanConnectionMutation({ tx, agencyId, creatorId, actorMember });
       await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
-      const { creator } = await requireLiveConnectionAuthority({ tx, agencyId, creatorId, userId });
       const generation = Number(connectionGeneration);
 
       // Lost HTTP acknowledgement after a successful commit is idempotent.
@@ -402,6 +414,7 @@ async function observeCreatorPlatformProfile({
         throw codedError("CREATOR_PROFILE_AUTHORITY_CHANGED", "Creator profile authority changed before commit", 409);
       }
       const nextAvatar = clean(avatarUrl, 2000) || null;
+      await authorizeCreatorAccountWrite(tx);
       const updated = await tx.creatorAccount.update({
         where: { id: liveCreator.id },
         data: {
@@ -424,15 +437,14 @@ async function observeCreatorPlatformProfile({
 }
 
 async function revokeCreatorConnection({
-  db, agencyId, creatorId, userId, deviceId, baseRevision, requestId, reason, beforeRevoke = null,
+  db, agencyId, creatorId, userId, actorMember, deviceId, baseRevision, requestId, reason, beforeRevoke = null,
 }) {
   return runSerializable(db, async (tx) => {
+    await lockHumanConnectionMutation({ tx, agencyId, creatorId, actorMember });
     await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
-    await requireLiveConnectionAuthority({ tx, agencyId, creatorId, userId });
     if (typeof beforeRevoke === "function") await beforeRevoke(tx);
-    // Destructive authority is checked again immediately before the broker
-    // mutation so middleware/request admission is never the correctness fence.
-    await requireLiveConnectionAuthority({ tx, agencyId, creatorId, userId });
+    // Re-check actor authority immediately before the destructive broker mutation.
+    await reassertHumanConnectionMutation({ tx, agencyId, creatorId, actorMember });
     return revokeCreatorSessionInTransaction({
       tx, agencyId, creatorId, actorUserId: userId, deviceId, baseRevision, requestId, reason,
     });

@@ -50,7 +50,8 @@ test("runtime completion is identity-bound, generation-fenced and committed by o
   assert.match(service, /canonical\.status !== "ACTIVE"/);
   assert.match(service, /canonical\.platformUserId/);
   assert.match(service, /creatorConnectionLockKey\(agencyId, creatorId\)/);
-  assert.match(service, /requireLiveConnectionAuthority/);
+  assert.match(service, /lockHumanConnectionMutation/);
+  assert.match(service, /reassertHumanConnectionMutation/);
   assert.match(service, /CREATOR_CONNECTION_GENERATION_STALE/);
   assert.match(service, /connectionState: CREATOR_CONNECTION_STATES\.CONNECTED/);
   assert.match(service, /connectedSessionRevision: Number\(canonical\.revision\)/);

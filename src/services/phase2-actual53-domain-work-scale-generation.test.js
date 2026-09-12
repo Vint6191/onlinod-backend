@@ -52,21 +52,26 @@ test("F56 CUT A broad claim uses current partition projection without FamilyStat
   assert.doesNotMatch(fx.sql.join("\n"), /DomainWorkReadyAgency|DomainWorkReadyPartition/);
 });
 
-test("F56 CUT A physical fallback repairs only the missing current partition projection", async () => {
+test("F56 CUT A physical fallback repairs only the locked missing current partition projection", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const sql = [];
+  const execute = [];
   const db = {
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
     async $transaction(work) { return work(db); },
+    async $executeRawUnsafe(statement, ...params) { execute.push({ sql: String(statement), params }); return 1; },
     async $queryRawUnsafe(statement) {
       const text = String(statement); sql.push(text);
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
       if (text.includes('SELECT f."agencyId"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [];
       if (text.includes('SELECT d."agencyId"') && text.includes('FROM "DomainWorkItem" d')) return [{ agencyId: "agency-recovered" }];
       if (text.includes('WITH selected_partitions AS MATERIALIZED')) return [];
-      if (text.includes('WITH candidate AS MATERIALIZED') && text.includes('INSERT INTO "Phase2WorkBroadClaimPartitionState"')) {
+      if (text.includes('SELECT d."id",d."partitionKey"') && text.includes('FOR UPDATE OF d SKIP LOCKED')) {
+        return [{ id: "repair-work", partitionKey: "creator-recovered" }];
+      }
+      if (text.includes('WITH claimed AS (') && text.includes('partition_repair AS MATERIALIZED')) {
         return [{ id: "claimed-recovery-row", agencyId: "agency-recovered", partitionKey: "creator-recovered" }];
       }
       return [];
@@ -77,9 +82,15 @@ test("F56 CUT A physical fallback repairs only the missing current partition pro
     limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, fallbackNow: now,
   });
   assert.equal(result.items.length, 1);
-  const fallback = sql.find((entry) => entry.includes('WITH candidate AS MATERIALIZED') && entry.includes('INSERT INTO "Phase2WorkBroadClaimPartitionState"'));
+  const rowLock = sql.find((entry) => entry.includes('SELECT d."id",d."partitionKey"') && entry.includes('FOR UPDATE OF d SKIP LOCKED'));
+  const fallback = sql.find((entry) => entry.includes('WITH claimed AS (') && entry.includes('partition_repair AS MATERIALIZED'));
+  assert.ok(rowLock);
   assert.ok(fallback);
-  assert.match(fallback, /FOR UPDATE OF d SKIP LOCKED/);
+  assert.equal(execute.length, 1);
+  assert.match(execute[0].sql, /phase2_lock_domain_work_current_partition/);
+  assert.deepEqual(execute[0].params, ["agency-recovered", authority.WORK_CLASS.CUSTOM_COMMUNICATION, "creator-recovered"]);
+  assert.match(fallback, /COUNT\(d\."id"\)::INTEGER AS "outstandingCount"/);
+  assert.match(fallback, /WHERE c\."outstandingCount" > 0/);
   assert.doesNotMatch(sql.join("\n"), /INSERT INTO "Phase2WorkFamilyState"|UPDATE "Phase2WorkFamilyState"/);
 });
 
@@ -132,9 +143,10 @@ test("INT7 Root A partition catalog is populated by a non-authoritative DWI trig
   assert.doesNotMatch(migration, /DomainWorkReadyAgency|DomainWorkReadyPartition/);
 });
 
-test("INT7 Root A catalog miss falls back to one physical SKIP LOCKED DWI instead of rebuilding all partition heads", async () => {
+test("INT7 Root A catalog miss locks one physical DWI then repairs that partition under the shared fence", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const sql = [];
+  const execute = [];
   let normalCatalogClaim = 0;
   let physicalFallback = 0;
   const db = {
@@ -142,14 +154,16 @@ test("INT7 Root A catalog miss falls back to one physical SKIP LOCKED DWI instea
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
     async $transaction(work) { return work(db); },
+    async $executeRawUnsafe(statement, ...params) { execute.push({ sql: String(statement), params }); return 1; },
     async $queryRawUnsafe(statement) {
       const text = String(statement); sql.push(text);
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('LEFT JOIN "Phase2WorkFamilyState" s') && text.includes('SELECT d."agencyId"')) return [];
-      if (text.includes('FROM "Phase2WorkFamilyState" s')) return [{ agencyId: "agency-1" }];
       if (text.includes('WITH selected_partitions AS MATERIALIZED')) { normalCatalogClaim += 1; return []; }
-      if (text.includes('WITH candidate AS MATERIALIZED') && text.includes('LIMIT 1')) {
+      if (text.includes('SELECT d."id",d."partitionKey"') && text.includes('FOR UPDATE OF d SKIP LOCKED')) {
         physicalFallback += 1;
+        return [{ id: "fallback-work", partitionKey: "creator-fallback" }];
+      }
+      if (text.includes('WITH claimed AS (') && text.includes('partition_repair AS MATERIALIZED')) {
         return [{ id: "fallback-row", agencyId: "agency-1", partitionKey: "creator-fallback" }];
       }
       return [];
@@ -162,11 +176,14 @@ test("INT7 Root A catalog miss falls back to one physical SKIP LOCKED DWI instea
   assert.equal(result.items.length, 1);
   assert.equal(normalCatalogClaim, 1);
   assert.equal(physicalFallback, 1);
+  assert.equal(execute.length, 1);
   const normal = sql.find((entry) => entry.includes('WITH selected_partitions AS MATERIALIZED'));
-  const fallback = sql.find((entry) => entry.includes('WITH candidate AS MATERIALIZED') && entry.includes('LIMIT 1'));
-  assert.ok(normal); assert.ok(fallback);
+  const rowLock = sql.find((entry) => entry.includes('SELECT d."id",d."partitionKey"') && entry.includes('FOR UPDATE OF d SKIP LOCKED'));
+  const fallback = sql.find((entry) => entry.includes('WITH claimed AS (') && entry.includes('partition_repair AS MATERIALIZED'));
+  assert.ok(normal); assert.ok(rowLock); assert.ok(fallback);
   assert.doesNotMatch(normal, /partition_heads|DISTINCT ON \(d\."partitionKey"\)/);
-  assert.match(fallback, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT 1/);
+  assert.match(rowLock, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT 1/);
+  assert.match(execute[0].sql, /phase2_lock_domain_work_current_partition/);
   assert.match(fallback, /INSERT INTO "Phase2WorkBroadClaimPartitionState"/);
   assert.match(fallback, /ON CONFLICT \("agencyId","workClass","partitionKey"\) DO UPDATE/);
 });

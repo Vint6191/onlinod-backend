@@ -3,9 +3,15 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
-const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
+const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = require("./team-control-plane-authority-service");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
+const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
+const {
+  assertOperationalOwnerRemovalSafety,
+  assertUserDisableOwnerSafety,
+} = require("./team-operational-owner-authority-service");
 const { audit } = require("./audit-service");
 const {
   revokeOwnerRootAccessForMember,
@@ -106,7 +112,24 @@ const DELEGATED_PERMISSION_KEYS = Object.freeze(
 );
 
 async function serializableTeamTransaction(db, fn) {
-  return db.$transaction(fn, { isolationLevel: "Serializable" });
+  try {
+    return await db.$transaction(async (tx) => {
+      // Rolling-release admission is wider than the steady-state topology mutex.
+      // During DRAINING every Team control-plane writer must stop before its first
+      // Role/Creator/User/Member lock, including invitation and role-metadata paths
+      // that intentionally do not need Agency-wide topology serialization once ACTIVE.
+      await assertTeamControlPlaneWriteAdmission(tx);
+      return fn(tx);
+    }, { isolationLevel: "Serializable" });
+  } catch (error) {
+    if (String(error?.code || "") === "P2034") {
+      const conflict = new Error("Team control-plane state changed concurrently; refresh and retry");
+      conflict.code = "TEAM_CONTROL_PLANE_SERIALIZATION_CONFLICT";
+      conflict.status = 409;
+      throw conflict;
+    }
+    throw error;
+  }
 }
 
 function requireLiveTeamActor(actor) {
@@ -456,22 +479,9 @@ async function assertOwnerSafety({ agencyId, targetMember, nextRoleKey = null, r
   const currentlyOwner = isOwner(targetMember);
   const remainsOwner = !removing && (nextRoleKey === null || String(nextRoleKey).toLowerCase() === "owner");
   if (!currentlyOwner || remainsOwner) return;
-  const otherOwners = await db.agencyMember.count({
-    where: {
-      agencyId,
-      deletedAt: null,
-      deactivatedAt: null,
-      id: { not: targetMember.id },
-      OR: [{ roleKey: "owner" }, { role: "OWNER" }],
-    },
-  });
-  if (otherOwners === 0) {
-    const error = new Error("Cannot demote, deactivate, or remove the last active OWNER");
-    error.code = "LAST_OWNER";
-    error.status = 409;
-    throw error;
-  }
+  return assertOperationalOwnerRemovalSafety({ db, agencyId, memberId: targetMember.id });
 }
+
 
 
 function normalizedEpoch(value, fallback = 1) {
@@ -520,34 +530,35 @@ function roleNotFoundError() {
   return error;
 }
 
-async function lockTeamRoleLifecycle({ tx, agencyId, roleKey, mode = "share" }) {
-  // Role lifecycle is role-local, not an Agency-row mutex. All ordinary Team work
-  // first joins the shared Agency lifecycle barrier so destructive Agency retirement
-  // cannot race it. A role-specific advisory RW lock then serializes assignment/claim
-  // readers against role configuration/deletion writers, including preset roles that
-  // have no AgencyCustomRole row of their own.
+async function lockTeamRoleLifecycle({ tx, agencyId, roleKey, mode = "share", agencyAlreadyLocked = false }) {
+  // Role lifecycle is role-local, not an Agency-row mutex. Standalone callers join
+  // the shared Agency lifecycle barrier here. Team-control-plane callers already own
+  // Agency -> topology and pass agencyAlreadyLocked=true, so Role is the next real
+  // lock edge rather than a redundant topology -> Agency reacquisition.
   const key = String(roleKey || "").trim().toLowerCase();
   const write = mode === "update";
-  const agencyBarrier = await lockAgencyLifecycleBarrier({ db: tx, agencyId, mode: "shared" });
+  let agencyBarrier = null;
+  if (!agencyAlreadyLocked) {
+    agencyBarrier = await lockAgencyLifecycleBarrier({ db: tx, agencyId, mode: "shared" });
+    if (!agencyBarrier.row) {
+      const error = new Error("Agency not found");
+      error.code = "AGENCY_NOT_FOUND";
+      error.status = 404;
+      throw error;
+    }
+    if (agencyBarrier.row.deletedAt) {
+      const error = new Error("Agency was deleted");
+      error.code = "AGENCY_DELETED";
+      error.status = 409;
+      throw error;
+    }
+  }
   if (typeof tx?.$executeRawUnsafe === "function") {
     await lockDbAdvisoryXact({
       db: tx,
       key: `team-role-lifecycle:${String(agencyId)}:${key || "__missing__"}`,
       mode: write ? "exclusive" : "shared",
     });
-  }
-
-  if (!agencyBarrier.row) {
-    const error = new Error("Agency not found");
-    error.code = "AGENCY_NOT_FOUND";
-    error.status = 404;
-    throw error;
-  }
-  if (agencyBarrier.row.deletedAt) {
-    const error = new Error("Agency was deleted");
-    error.code = "AGENCY_DELETED";
-    error.status = 409;
-    throw error;
   }
 
   if (!key || PRESET_ROLE_SET.has(key)) return { agencyId: String(agencyId), roleKey: key, preset: true };
@@ -565,6 +576,15 @@ async function lockTeamRoleLifecycle({ tx, agencyId, roleKey, mode = "share" }) 
   const row = await tx?.agencyCustomRole?.findUnique?.({ where: { agencyId_key: { agencyId, key } } });
   if (!row) throw roleNotFoundError();
   return row;
+}
+
+async function lockTeamRoleLifecycles({ tx, agencyId, roleKeys = [], mode = "share", agencyAlreadyLocked = false }) {
+  const keys = Array.from(new Set((Array.isArray(roleKeys) ? roleKeys : [roleKeys])
+    .map((value) => String(value || "").trim().toLowerCase())
+    .filter(Boolean))).sort();
+  const rows = [];
+  for (const roleKey of keys) rows.push(await lockTeamRoleLifecycle({ tx, agencyId, roleKey, mode, agencyAlreadyLocked }));
+  return rows;
 }
 
 async function bumpLiveRoleMemberAccessEpochs({ tx, agencyId, roleKey }) {
@@ -669,23 +689,34 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
   const nextFunctions = patch.functions === undefined ? null : cleanFunctions(patch.functions);
   const before = memberToClient(target);
 
-  const ownerDemoted = isOwner(target) && nextRoleKey !== "owner";
   const updated = await serializableTeamTransaction(db, async (tx) => {
-    const creatorCommitIds = creatorScope?.normalized?.mode === "scoped" ? creatorScope.normalized.creatorIds : [];
-    const admission = await assertManagementCommitAuthority({
-      tx, agencyId, actorMember, permissionKey: "workspace.manage_members", creatorIds: creatorCommitIds,
-    });
-    const liveActor = requireLiveTeamActor(admission.member);
+    // Every writer of AgencyMember current-authority state joins one narrow
+    // Agency control-plane fence. This removes Member<->Member, Role<->Member
+    // and Creator<->Member lock cycles without serializing ordinary chats,
+    // Customs, Telegram business work, or read-only management checks.
+    await lockTeamControlPlaneTopology({ tx, agencyId });
+
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found in this agency"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
-    assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
-    if ((nextRoleKey === "owner" || isOwner(liveTarget)) && !isOwner(liveActor)) { const error = new Error("Only OWNER can promote or demote an OWNER"); error.code = "OWNER_ROLE_CHANGE_REQUIRED"; error.status = 403; throw error; }
-    if (patch.roleKey !== undefined) await lockTeamRoleLifecycle({ tx, agencyId, roleKey: nextRoleKey, mode: "share" });
-    await assertActorCanAssignRole({ agencyId, actorMember: liveActor, roleKey: nextRoleKey, db: tx });
-    await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey, db: tx });
-    let committedCreatorScope = creatorScope;
-    if (creatorScope && creatorScope.normalized?.mode === "scoped") {
-      committedCreatorScope = await validateAssignedCreators({ agencyId, assignedCreators: creatorScope.value, db: tx });
+
+    const liveNextRoleKey = patch.roleKey === undefined ? memberRoleKey(liveTarget) : nextRoleKey;
+    if (patch.roleKey !== undefined) {
+      // Role assignment must fence both the role being left and the role being
+      // entered. Deterministic role-key ordering makes X->Y and Y->X safe.
+      await lockTeamRoleLifecycles({
+        tx,
+        agencyId,
+        roleKeys: [memberRoleKey(liveTarget), liveNextRoleKey],
+        mode: "share",
+        agencyAlreadyLocked: true,
+      });
+    }
+
+    let committedCreatorScope = null;
+    if (liveNextRoleKey === "owner") {
+      committedCreatorScope = { ok: true, value: "all", normalized: { mode: "all", creatorIds: [] } };
+    } else if (patch.assignedCreators !== undefined) {
+      committedCreatorScope = await validateAssignedCreators({ agencyId, assignedCreators: patch.assignedCreators, db: tx });
       if (!committedCreatorScope.ok) {
         const error = new Error(`Creator scope changed while this request was in flight: ${committedCreatorScope.unknownCreatorIds.join(", ")}`);
         error.code = "MANAGEMENT_CREATOR_RETIRED";
@@ -694,18 +725,45 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
         throw error;
       }
     }
-    assertActorCanGrantCreatorScope({ actorMember: liveActor, targetMember: liveTarget, assignedCreators: committedCreatorScope ? committedCreatorScope.value : liveTarget.assignedCreators });
-    const liveOwnerDemoted = isOwner(liveTarget) && nextRoleKey !== "owner";
+
+    const creatorCommitIds = committedCreatorScope?.normalized?.mode === "scoped" ? committedCreatorScope.normalized.creatorIds : [];
+    const admission = await assertManagementCommitAuthority({
+      tx,
+      agencyId,
+      actorMember,
+      permissionKey: "workspace.manage_members",
+      creatorIds: creatorCommitIds,
+      agencyAlreadyLocked: true,
+    });
+    const liveActor = requireLiveTeamActor(admission.member);
+
+    assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
+    if ((liveNextRoleKey === "owner" || isOwner(liveTarget)) && !isOwner(liveActor)) {
+      const error = new Error("Only OWNER can promote or demote an OWNER");
+      error.code = "OWNER_ROLE_CHANGE_REQUIRED";
+      error.status = 403;
+      throw error;
+    }
+    await assertActorCanAssignRole({ agencyId, actorMember: liveActor, roleKey: liveNextRoleKey, db: tx });
+    await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey: liveNextRoleKey, db: tx });
+    assertActorCanGrantCreatorScope({
+      actorMember: liveActor,
+      targetMember: liveTarget,
+      assignedCreators: committedCreatorScope ? committedCreatorScope.value : liveTarget.assignedCreators,
+    });
+
+    const liveOwnerDemoted = isOwner(liveTarget) && liveNextRoleKey !== "owner";
     if (liveOwnerDemoted) {
       await requireOwnerPossessionForCryptoDestructiveTeamMutation({
         tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
       });
     }
+
     const row = await tx.agencyMember.update({
       where: { id: liveTarget.id },
       data: {
         ...(patch.displayName !== undefined ? { displayName: patch.displayName || null } : {}),
-        ...(patch.roleKey !== undefined ? { roleKey: nextRoleKey, role: roleKeyToLegacy(nextRoleKey) } : {}),
+        ...(patch.roleKey !== undefined ? { roleKey: liveNextRoleKey, role: roleKeyToLegacy(liveNextRoleKey) } : {}),
         ...(committedCreatorScope ? { assignedCreators: committedCreatorScope.value } : {}),
         ...((patch.roleKey !== undefined || committedCreatorScope) ? { accessEpoch: { increment: 1 } } : {}),
       },
@@ -780,22 +838,24 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
 
   const deactivatedAt = status === "deactivated" ? new Date() : null;
   const statusMutation = await serializableTeamTransaction(db, async (tx) => {
-    const admission = await assertManagementCommitAuthority({
-      tx, agencyId, actorMember, permissionKey: "workspace.manage_members",
-    });
-    const liveActor = requireLiveTeamActor(admission.member);
+    await lockTeamControlPlaneTopology({ tx, agencyId });
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
+
+    if (status !== "deactivated") {
+      // Reactivation makes this membership live for role-derived authorization.
+      // Fence the assigned role before any User/Member row locks so a concurrent
+      // role revoke cannot hold Role -> wait Member while we hold Member -> Role.
+      await lockTeamRoleLifecycle({ tx, agencyId, roleKey: memberRoleKey(liveTarget), mode: "share", agencyAlreadyLocked: true });
+    }
+
+    const admission = await assertManagementCommitAuthority({
+      tx, agencyId, actorMember, permissionKey: "workspace.manage_members", agencyAlreadyLocked: true,
+    });
+    const liveActor = requireLiveTeamActor(admission.member);
     assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
     if (liveTarget.id === liveActor.id && status === "deactivated") { const error = new Error("You cannot deactivate your own active membership"); error.code = "CANNOT_DEACTIVATE_SELF"; error.status = 409; throw error; }
     if (status === "deactivated") await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey: null, removing: true, db: tx });
-    if (status !== "deactivated") {
-      // Reactivation moves the member back into the live set consumed by role
-      // epoch invalidation. Serialize with role configuration writers so a
-      // concurrent revoke cannot scan the member while inactive and then
-      // commit after reactivation without a subsequent epoch bump.
-      await lockTeamRoleLifecycle({ tx, agencyId, roleKey: memberRoleKey(liveTarget), mode: "share" });
-    }
     if (status === "deactivated" && isOwner(liveTarget)) {
       await requireOwnerPossessionForCryptoDestructiveTeamMutation({
         tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
@@ -849,22 +909,13 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
 
   const deletedAt = new Date();
   const removalMutation = await serializableTeamTransaction(db, async (tx) => {
+    await lockTeamControlPlaneTopology({ tx, agencyId });
+
     let liveActor = null;
-    if (platformAdmin) {
-      const barrier = await lockAgencyLifecycleBarrier({ db: tx, agencyId, mode: "shared" });
-      if (!barrier.row || barrier.row.deletedAt) {
-        const error = new Error("Agency is no longer active"); error.code = "AGENCY_RETIRED"; error.status = 409; throw error;
-      }
-      // One owner-safety mutex makes the invariant explicit even on engines/test
-      // adapters that do not model PostgreSQL SERIALIZABLE write-skew detection.
-      if (typeof tx?.$executeRawUnsafe === "function") {
-        await lockDbAdvisoryXact({ db: tx, key: `team-owner-safety:${String(agencyId)}`, mode: "exclusive" });
-      }
-      if (typeof tx?.$queryRawUnsafe === "function") {
-        await tx.$queryRawUnsafe(`SELECT "id" FROM "AgencyMember" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE`, String(target.id), String(agencyId));
-      }
-    } else {
-      const admission = await assertManagementCommitAuthority({ tx, agencyId, actorMember, permissionKey: "workspace.manage_members" });
+    if (!platformAdmin) {
+      const admission = await assertManagementCommitAuthority({
+        tx, agencyId, actorMember, permissionKey: "workspace.manage_members", agencyAlreadyLocked: true,
+      });
       liveActor = requireLiveTeamActor(admission.member);
     }
 
@@ -874,6 +925,10 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
       assertActorCanManageMember({ actorMember: liveActor, targetMember: liveTarget });
       if (liveTarget.id === liveActor.id) { const error = new Error("You cannot remove your own membership"); error.code = "CANNOT_REMOVE_SELF"; error.status = 409; throw error; }
     }
+
+    // The Team control-plane fence now serializes every owner/member lifecycle
+    // mutation, so a second owner-safety advisory root would only introduce a
+    // competing lock order. Evaluate the invariant under this single topology.
     await assertOwnerSafety({ agencyId, targetMember: liveTarget, nextRoleKey: null, removing: true, db: tx });
     if (isOwner(liveTarget) && !platformAdmin) {
       await requireOwnerPossessionForCryptoDestructiveTeamMutation({ tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof });
@@ -910,21 +965,8 @@ async function updateMemberAccessByPlatformAdmin({
   db = prisma,
 } = {}) {
   const mutation = await serializableTeamTransaction(db, async (tx) => {
-    const barrier = await lockAgencyLifecycleBarrier({ db: tx, agencyId, mode: "shared" });
-    if (!barrier.row || barrier.row.deletedAt) {
-      const error = new Error("Agency is no longer active");
-      error.code = "AGENCY_RETIRED";
-      error.status = 409;
-      throw error;
-    }
-    // Role/lifecycle mutations share the same owner-safety serialization root as
-    // platform-admin removal. Permissions-only changes also row-lock the target.
-    if (roleKey !== undefined && typeof tx?.$executeRawUnsafe === "function") {
-      await lockDbAdvisoryXact({ db: tx, key: `team-owner-safety:${String(agencyId)}`, mode: "exclusive" });
-    }
-    if (typeof tx?.$queryRawUnsafe === "function") {
-      await tx.$queryRawUnsafe(`SELECT "id" FROM "AgencyMember" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE`, String(memberId), String(agencyId));
-    }
+    await lockTeamControlPlaneTopology({ tx, agencyId });
+
     const before = await tx.agencyMember.findFirst({ where: { id: memberId, agencyId, deletedAt: null } });
     if (!before) {
       const error = new Error("Member not found");
@@ -934,7 +976,13 @@ async function updateMemberAccessByPlatformAdmin({
     }
     const nextRoleKey = roleKey === undefined ? memberRoleKey(before) : String(roleKey || "").trim().toLowerCase();
     if (roleKey !== undefined) {
+      // Platform-admin role writes obey the same Role -> Member suffix as normal
+      // Team mutations. The Agency topology fence already owns owner-safety.
+      await lockTeamRoleLifecycle({ tx, agencyId, roleKey: nextRoleKey, mode: "share", agencyAlreadyLocked: true });
       await assertOwnerSafety({ agencyId, targetMember: before, nextRoleKey, removing: false, db: tx });
+    }
+    if (typeof tx?.$queryRawUnsafe === "function") {
+      await tx.$queryRawUnsafe(`SELECT "id" FROM "AgencyMember" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE`, String(memberId), String(agencyId));
     }
     const ownerDemoted = isOwner(before) && nextRoleKey !== "owner";
     const data = { accessEpoch: { increment: 1 } };
@@ -970,10 +1018,11 @@ async function materializeInvitationMemberWithinTransaction({
     throw error;
   }
 
-  // Caller must already hold lockTeamRoleLifecycle(), which also owns the shared
-  // Agency lifecycle barrier. From there the canonical invitation materializer
-  // takes User -> membership-row locks so persistent User disable and concurrent
-  // invitation restores cannot race the commit.
+  // Caller must already hold the Team control-plane topology fence, the assigned
+  // Role lifecycle lock, and every explicit Creator scope row in canonical order.
+  // From there the materializer acquires User -> AgencyMember, so the DB scope
+  // trigger is only a safety-net re-lock of already-held Creator SHARE rows rather
+  // than the first Member -> Creator edge in the transaction.
   if (typeof tx.$queryRawUnsafe === "function") {
     const users = await tx.$queryRawUnsafe(
       `SELECT "id" FROM "User" WHERE "id"=$1 AND "disabledAt" IS NULL FOR SHARE`,
@@ -1343,7 +1392,8 @@ async function setRoleAccess({ agencyId, roleKey, zoneKey, levelKey, actorMember
   }
   const level = String(levelKey).toLowerCase();
   const roleMutation = await serializableTeamTransaction(db, async (tx) => {
-    await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update" });
+    await lockTeamControlPlaneTopology({ tx, agencyId });
+    await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update", agencyAlreadyLocked: true });
     const commit = await assertManagementCommitAuthority({
       tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
     });
@@ -1384,7 +1434,8 @@ async function setRolePermission({ agencyId, roleKey, permissionKey, value, acto
     throw error;
   }
   const roleMutation = await serializableTeamTransaction(db, async (tx) => {
-    await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update" });
+    await lockTeamControlPlaneTopology({ tx, agencyId });
+    await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update", agencyAlreadyLocked: true });
     const commit = await assertManagementCommitAuthority({
       tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
     });
@@ -1423,7 +1474,8 @@ async function resetRole({ agencyId, roleKey, actorMember, actorUserId: actorId,
     throw error;
   }
   const roleMutation = await serializableTeamTransaction(db, async (tx) => {
-    await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update" });
+    await lockTeamControlPlaneTopology({ tx, agencyId });
+    await lockTeamRoleLifecycle({ tx, agencyId, roleKey: key, mode: "update", agencyAlreadyLocked: true });
     const commit = await assertManagementCommitAuthority({
       tx, agencyId, actorMember, permissionKey: "workspace.edit_roles", agencyAlreadyLocked: true,
     });
@@ -1509,6 +1561,7 @@ module.exports = {
   setMemberStatus,
   removeMember,
   updateMemberAccessByPlatformAdmin,
+  assertUserDisableOwnerSafety,
   materializeInvitationMemberWithinTransaction,
   createInvitation,
   reissueInvitation,

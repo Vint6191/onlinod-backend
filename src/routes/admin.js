@@ -64,9 +64,12 @@ const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, r
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 const { TIER_CATALOG } = require("../services/billing-catalog-service");
 const { retireCreatorWithinTransaction, publishCreatorRetirementControlEvents } = require("../services/creator-lifecycle-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("../services/phase2-release-compatibility-authority-service");
+const { assertAgencyHasOperationalOwner } = require("../services/team-operational-owner-authority-service");
 const {
   removeMember: removeTeamMember,
   updateMemberAccessByPlatformAdmin,
+  assertUserDisableOwnerSafety,
 } = require("../services/team-administration-service");
 const {
   agencyCustomPipelineBlockers,
@@ -760,6 +763,10 @@ router.post("/agencies/:id/restore", async (req, res) => {
     if (!before.deletedAt) return res.status(409).json({ ok: false, code: "AGENCY_NOT_DELETED", error: "Agency is not deleted" });
 
     const updated = await prisma.$transaction(async (tx) => {
+      // Agency restore re-enables every current Team authority edge. Join M1
+      // release admission before the Agency lifecycle lock, but do not take the
+      // steady-state Team topology mutex for this Agency-level lifecycle action.
+      await assertTeamControlPlaneWriteAdmission(tx);
       const lifecycle = await lockAgencyPipelineLifecycleExclusive({ db: tx, agencyId: before.id, allowDeleted: true });
       if (!lifecycle.deletedAt) {
         const error = new Error("Agency is not deleted");
@@ -788,6 +795,12 @@ router.post("/agencies/:id/restore", async (req, res) => {
         error.details = { workId: destructive.id, state: destructive.state, outstanding: destructive.isOutstanding };
         throw error;
       }
+      await assertAgencyHasOperationalOwner({
+        db: tx,
+        agencyId: before.id,
+        code: "AGENCY_RESTORE_REQUIRES_OPERATIONAL_OWNER",
+        message: "Agency cannot be restored without an operational OWNER",
+      });
       return tx.agency.update({
         where: { id: before.id },
         data: { deletedAt: null, deletedReason: null, status: "TRIAL" },
@@ -1175,6 +1188,12 @@ router.patch("/users/:id", async (req, res) => {
   try {
     const input = userPatchSchema.parse(req.body);
     const mutation = await prisma.$transaction(async (tx) => {
+      if (input.disabled !== undefined) {
+        // Persistent User eligibility is Team current-authority state. During an
+        // incompatible rolling release it joins the shared release fence, but it
+        // deliberately remains outside every per-Agency topology mutex.
+        await assertTeamControlPlaneWriteAdmission(tx);
+      }
       if (typeof tx?.$queryRawUnsafe === "function") {
         const locked = await tx.$queryRawUnsafe(`SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE`, req.params.id);
         if (!Array.isArray(locked) || !locked.length) return null;
@@ -1184,6 +1203,14 @@ router.patch("/users/:id", async (req, res) => {
 
       const data = {};
       if (input.name !== undefined) data.name = input.name;
+      if (input.disabled === true && !before.disabledAt) {
+        // User.disable removes current Team authority across every Agency at once.
+        // Validate the operational OWNER invariant inside this same Serializable
+        // transaction after the User row is locked and before eligibility changes.
+        // Do not take per-Agency topology mutexes here: one User can belong to
+        // multiple Agencies, and User -> Member remains the cross-Agency order.
+        await assertUserDisableOwnerSafety({ tx, userId: before.id });
+      }
       if (input.disabled === true)  { data.disabledAt = before.disabledAt || new Date(); data.disabledReason = input.disabledReason || null; }
       if (input.disabled === false) { data.disabledAt = null; data.disabledReason = null; }
       const updated = await tx.user.update({ where: { id: before.id }, data });
@@ -1232,6 +1259,22 @@ router.patch("/users/:id", async (req, res) => {
     return res.json({ ok: true, user: mutation.updated });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
+    if (String(err?.code || "") === "P2034") {
+      return res.status(409).json({
+        ok: false,
+        code: "TEAM_CONTROL_PLANE_SERIALIZATION_CONFLICT",
+        error: "Team owner state changed concurrently; refresh and retry",
+      });
+    }
+    const status = Number(err?.status);
+    if (Number.isFinite(status) && status >= 400 && status < 600) {
+      return res.status(status).json({
+        ok: false,
+        code: err.code || "USER_UPDATE_FAILED",
+        error: err?.message || "Failed",
+        ...(err?.details ? { details: err.details } : {}),
+      });
+    }
     return res.status(500).json({ ok: false, code: "USER_UPDATE_FAILED", error: err?.message || "Failed" });
   }
 });
@@ -1631,6 +1674,13 @@ router.delete("/creators/:id", async (req, res) => {
   let lifecycleResult;
   try {
     lifecycleResult = await prisma.$transaction(async (tx) => {
+      // M1 release gate is outside the C2 lock graph. During DRAINING the new
+      // binary must fail before Agency lifecycle/billing locks are acquired.
+      await assertTeamControlPlaneWriteAdmission(tx);
+      // Total prefix for admin Creator retirement: Agency lifecycle barrier ->
+      // Agency billing row -> Creator lifecycle row -> affected Member rows.
+      // Never hold the billing row while waiting to join the lifecycle barrier.
+      await lockAgencyPipelineLifecycle({ db: tx, agencyId: before.agencyId, allowDeleted: true });
       await lockAgencyBillingMutation(tx, before.agencyId);
       const retirement = await retireCreatorWithinTransaction({
         tx,
@@ -1641,6 +1691,7 @@ router.delete("/creators/:id", async (req, res) => {
         retiredAt: deletedAt,
         sourceRequestId: `admin-creator-${hard ? "hard-" : ""}removal:${before.id}:${deletedAt.getTime()}`,
         revokeReason: hard ? "ADMIN_CREATOR_HARD_DELETE_PENDING" : "ADMIN_CREATOR_REMOVED",
+        agencyAlreadyLocked: true,
       });
       await syncAgencyBillingAggregate(tx, before.agencyId, deletedAt);
       return retirement;

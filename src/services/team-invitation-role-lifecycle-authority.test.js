@@ -21,6 +21,7 @@ const team = read("team-administration-service.js");
 const agencyLifecycle = read("agency-lifecycle-barrier-service.js");
 const invitations = read("../routes/invitations.js");
 const auth = read("../routes/auth.js");
+const teamControl = read("team-control-plane-authority-service.js");
 
 test("role lifecycle fence is exported as the shared assignment capability with an exclusive writer mode", () => {
   assert.match(team, /async function lockTeamRoleLifecycle/);
@@ -32,13 +33,18 @@ test("role lifecycle fence is exported as the shared assignment capability with 
   assert.doesNotMatch(agencyLifecycle, /"FOR SHARE"/);
   assert.match(agencyLifecycle, /FROM "Agency" WHERE "id" = \$1/);
   assert.match(team, /\n\s*lockTeamRoleLifecycle,\n/);
+  assert.match(teamControl, /phase2:creator-access-topology:/);
 });
 
 test("authenticated invitation claim holds custom-role lifecycle through member assignment and claim CAS", () => {
   const start = invitations.indexOf('router.post("/claim"');
   assert.ok(start >= 0, "claim route missing");
   const body = invitations.slice(start);
-  assert.match(body, /lockTeamRoleLifecycle\(\{ tx, agencyId: currentInvite\.agencyId, roleKey: currentInvite\.roleKey, mode: "share" \}\)/);
+  assert.match(body, /lockTeamControlPlaneTopology\(\{ tx, agencyId: currentInvite\.agencyId \}\)/);
+  assert.match(body, /lockTeamRoleLifecycle\(\{ tx, agencyId: currentInvite\.agencyId, roleKey: currentInvite\.roleKey, mode: "share", agencyAlreadyLocked: true \}\)/);
+  assertBefore(body, "lockTeamControlPlaneTopology", "lockTeamRoleLifecycle", "topology must precede role lifecycle");
+  assertBefore(body, "lockTeamRoleLifecycle", "lockLiveTeamControlPlaneCreators", "role must precede creator scope row locks");
+  assertBefore(body, "lockLiveTeamControlPlaneCreators", "materializeInvitationMemberWithinTransaction", "Creator rows must precede User/Member materialization");
   assertBefore(body, "lockTeamRoleLifecycle", "ensureRoleExists", "role must be fenced before role resolution");
   assertBefore(body, "lockTeamRoleLifecycle", "materializeInvitationMemberWithinTransaction", "role fence must precede canonical member materialization");
   assert.match(team, /materializeInvitationMemberWithinTransaction[\s\S]*AgencyMember" WHERE "agencyId"=\$1 AND "userId"=\$2 FOR UPDATE/);
@@ -52,7 +58,11 @@ test("registration invitation claim uses the same custom-role lifecycle capabili
   const end = auth.indexOf('router.post("/login"', start);
   assert.ok(start >= 0 && end > start, "register route range missing");
   const body = auth.slice(start, end);
-  assert.match(body, /lockTeamRoleLifecycle\(\{ tx, agencyId: inv\.agencyId, roleKey: inv\.roleKey, mode: "share" \}\)/);
+  assert.match(body, /lockTeamControlPlaneTopology\(\{ tx, agencyId: inv\.agencyId \}\)/);
+  assert.match(body, /lockTeamRoleLifecycle\(\{ tx, agencyId: inv\.agencyId, roleKey: inv\.roleKey, mode: "share", agencyAlreadyLocked: true \}\)/);
+  assertBefore(body, "lockTeamControlPlaneTopology", "lockTeamRoleLifecycle", "registration topology must precede role lifecycle");
+  assertBefore(body, "lockTeamRoleLifecycle", "lockLiveTeamControlPlaneCreators", "registration role must precede Creator rows");
+  assertBefore(body, "lockLiveTeamControlPlaneCreators", "materializeInvitationMemberWithinTransaction", "registration Creator rows must precede User/Member materialization");
   assertBefore(body, "lockTeamRoleLifecycle", "ensureRoleExists", "registration must fence the role before resolution");
   assertBefore(body, "lockTeamRoleLifecycle", "materializeInvitationMemberWithinTransaction", "registration must hold role fence before canonical member materialization");
   assertBefore(body, "lockTeamRoleLifecycle", "agencyInvitation.updateMany", "registration must hold role fence through invitation claim CAS");

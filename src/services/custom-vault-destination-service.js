@@ -5,6 +5,7 @@ const { requireCreatorAccess } = require("../middleware/automation-permissions")
 const { canUsePermission } = require("./team-access-control");
 const { lockCustomExecutionDefaults } = require("./custom-content-pipeline-authority-service");
 const { assertCustomManagementCreatorAccess } = require("./custom-management-access-authority-service");
+const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
 
 const MAX_FOLDER_ID = 180;
 
@@ -61,6 +62,7 @@ async function setCustomVaultDestination({ agencyId, member, creatorId: rawCreat
     if (previousFolderId === nextFolderId) {
       return { previousFolderId, creator: { id: cid, customsVaultFolderId: nextFolderId } };
     }
+    await authorizeCreatorAccountWrite(tx);
     const changed = await tx.creatorAccount.updateMany({ where: { id: cid, agencyId, deletedAt: null, updatedAt: current.updatedAt }, data: { customsVaultFolderId: nextFolderId } });
     if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_VAULT_DESTINATION_CONFLICT", "Creator Vault destination changed concurrently; reload and retry", 409);
     await lockCustomExecutionDefaults({ db: tx, agencyId });

@@ -38,7 +38,7 @@ function fakeDb() {
     },
   ];
   const tx = {
-    agencyMember: { findUnique: async () => { hit("member"); return member; } },
+    agencyMember: { findFirst: async () => { hit("member"); return member; } },
     creatorAccount: { findMany: async () => { hit("creators"); return rows; } },
     deviceCryptoIdentity: { findUnique: async () => { hit("identity"); return { agencyId: "agency-1", deviceId: "device-1", userId: "user-1", status: "ACTIVE", revokedAt: null }; } },
     agencyCryptoRoot: { findUnique: async () => { hit("root"); return { agencyId: "agency-1", version: 1, status: "ACTIVE" }; } },
@@ -67,6 +67,20 @@ test("F batch secret delta reads multiple creator components with fixed query fa
   assert.equal(result.items[1].network.proxy.username, null);
   assert.equal(result.items[1].network.proxy.password, null);
   assert.deepEqual(Object.fromEntries(counts), { member: 1, creators: 1, identity: 1, root: 1, ownerWraps: 1 });
+});
+
+test("F secret delta fails closed when current Member/User/Agency authority is no longer live", async () => {
+  const tx = {
+    agencyMember: { findFirst: async () => null },
+  };
+  const db = { $transaction: async (work) => work(tx) };
+  await assert.rejects(
+    () => buildDesktopSecretDelta({
+      db, agencyId: "agency-1", userId: "user-1", deviceId: "device-1", member: { id: "member-1", userId: "user-1" },
+      requests: [{ creatorId: "creator-a", session: true }],
+    }),
+    (error) => error?.code === "DESKTOP_SECRET_MEMBER_INACTIVE" && error?.status === 403,
+  );
 });
 
 test("F duplicate creator requests are merged before database work", async () => {

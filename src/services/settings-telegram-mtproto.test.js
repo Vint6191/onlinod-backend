@@ -528,6 +528,7 @@ test("Telegram planning and account retirement serialize on the account row so n
         return [{ ...account }];
       }
       if (/FROM "Agency"/.test(text)) return params[0] === "agency-1" ? [{ id: "agency-1", deletedAt: null, status: "ACTIVE" }] : [];
+      if (/FROM "User"/.test(text) && /FOR SHARE/.test(text)) return params[0] === owner.userId ? [{ id: owner.userId }] : [];
       if (/FROM "CreatorAccount"/.test(text) && /FOR UPDATE/.test(text)) return params[0] === creator.id ? [{ id: creator.id, agencyId: creator.agencyId, deletedAt: null, status: creator.status }] : [];
       if (/FROM "CustomOrder"/.test(text) && /FOR UPDATE/.test(text)) return params[0] === order.id ? [{ id: order.id }] : [];
       // Provider current-work SQL in this focused race has no dirty/external rows.

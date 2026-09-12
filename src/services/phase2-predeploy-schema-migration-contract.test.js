@@ -11,6 +11,21 @@ const migrationFiles = [
   "20260909211500_phase2_current_work_coordination",
   "20260910023000_phase2_authority_execution_consolidation",
   "20260910211500_phase2_actual53_final_closure",
+  "20260911142000_phase2_actual55_root_a_execution_authority",
+  "20260911150000_phase2_actual55_root_b_temporal_repair",
+  "20260911162000_phase2_actual55_root_e_destructive_lifecycle",
+  "20260911170000_phase2_actual55_fresh_source_destructive_fences",
+  "20260911183000_phase2_actual55_int5_claim_temporal_destructive_closure",
+  "20260911190000_phase2_actual55_int7_broad_partition_catalog",
+  "20260911210000_phase2_actual56_cut_a_current_work_topology",
+  "20260911213000_phase2_actual56_cut_e_lifecycle_access_authority",
+  "20260912001000_phase2_actual56_current_partition_conservation",
+  "20260912002000_phase2_actual56_management_lock_topology",
+  "20260912003000_phase2_actual56_operational_pending_authority",
+  "20260912004000_phase2_actual56_creator_management_catalog_authority",
+  "20260912005000_phase2_actual56_rolling_release_fence",
+  "20260912006000_phase2_actual56_partition_counter_zero_transition",
+  "20260912007000_phase2_actual56_team_control_plane_release_activation",
 ].map((name) => fs.readFileSync(path.join(ROOT, "prisma", "migrations", name, "migration.sql"), "utf8"));
 const migration = migrationFiles.join("\n");
 
@@ -39,14 +54,12 @@ function updateOfTriggers() {
   const pieces = migration.split(/(?=CREATE TRIGGER\s+)/g);
   for (const piece of pieces) {
     if (!/^CREATE TRIGGER\s+/m.test(piece) || !/UPDATE OF/.test(piece)) continue;
-    const table = piece.match(/\nON\s+"([^"]+)"/);
-    const cols = piece.match(/UPDATE OF([\s\S]*?)\nON\s+"[^"]+"/);
-    const name = piece.match(/CREATE TRIGGER\s+"([^"]+)"/);
-    assert.ok(table && cols && name, `cannot parse UPDATE OF trigger:\n${piece.slice(0, 300)}`);
+    const header = piece.match(/CREATE TRIGGER\s+(?:"([^"]+)"|([A-Za-z0-9_]+))[\s\S]*?UPDATE OF([\s\S]*?)\s+ON\s+"([^"]+)"/);
+    assert.ok(header, `cannot parse UPDATE OF trigger:\n${piece.slice(0, 300)}`);
     out.push({
-      name: name[1],
-      table: table[1],
-      columns: Array.from(cols[1].matchAll(/"([^"]+)"/g), (m) => m[1]),
+      name: header[1] || header[2],
+      table: header[4],
+      columns: Array.from(header[3].matchAll(/"([^"]+)"/g), (m) => m[1]),
     });
   }
   return out;
@@ -84,7 +97,7 @@ test("Phase2 trigger UPDATE OF columns exist in current Prisma models", () => {
 
 test("Phase2 current-work table DDL matches Prisma storage fields", () => {
   const models = schemaModels();
-  for (const table of ["MaintenanceLaneState", "ProviderOperationalDebt", "DomainWorkItem", "Phase2WorkCoverage", "Phase2DependencyState"]) {
+  for (const table of ["MaintenanceLaneState", "ProviderOperationalDebt", "DomainWorkItem", "Phase2WorkCoverage", "Phase2DependencyState", "Phase2ReleaseCompatibilityAuthority"]) {
     const ddl = cumulativeTableColumns(table);
     const fields = models.get(table);
     assert.ok(fields, `Prisma model ${table} missing`);

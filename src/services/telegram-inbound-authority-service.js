@@ -8,7 +8,7 @@ const { resolveTelegramAccountId } = require("./custom-order-reminders");
 const { createCustomContentSubmissionFromInboundEvent, assignCustomContentSubmission } = require("./custom-content-submissions-service");
 const { providerMessageEventId, resolveTelegramCustomThread, targetAllowedByThreadContext } = require("./custom-telegram-thread-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
-const { lockCurrentAgencyMember } = require("./custom-management-access-authority-service");
+const { assertCustomManagementCreatorAccess, lockCurrentAgencyMember } = require("./custom-management-access-authority-service");
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 4000) { const text = String(value == null ? "" : value).trim(); return text ? text.slice(0, max) : ""; }
@@ -546,14 +546,23 @@ async function resolveTelegramInboundReview({ agencyId, member, eventId: inputEv
   const targetId = clean(customOrderId, 180);
   if (!targetId) throw fail("TELEGRAM_INBOUND_REVIEW_ORDER_REQUIRED", "customOrderId is required for ASSIGN_TO_CONTENT_ORDER");
   const assign = async (tx) => {
-    const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });
     const fresh = await tx.telegramInboundEvent.findFirst({ where: { id: eventId, agencyId } });
     if (!fresh || String(fresh.projectionState) !== "REVIEW_REQUIRED" || fresh.submissionId) throw fail("TELEGRAM_INBOUND_REVIEW_RACE", "Telegram inbound review changed concurrently; refresh the queue", 409);
-    const auth = await authorizeTelegramInboundException({ agencyId, member: currentMember, row: fresh, write: true, db: tx });
     const target = await tx.customOrder.findFirst({ where: { id: targetId, agencyId } });
     if (!target) throw fail("TELEGRAM_INBOUND_REVIEW_ORDER_NOT_FOUND", "Target CustomOrder was not found", 404);
     if (String(target.type || "") !== "CONTENT" || String(target.status || "") !== "PENDING") throw fail("TELEGRAM_INBOUND_REVIEW_ORDER_INVALID", "Target must be a pending CONTENT CustomOrder", 409);
-    await requireCreatorAccess({ agencyId, member: currentMember, creatorId: target.creatorId, db: tx });
+
+    // ASSIGN_TO_CONTENT_ORDER is a Creator-scoped human mutation. Own the same
+    // total prefix as every other Customs management command before the actor row:
+    //   Agency lifecycle -> target Creator FOR UPDATE -> live User/Member/scope.
+    // The old order locked Member first and later re-entered assignment code that
+    // locked Creator, which could deadlock against Creator retirement
+    // (Creator FOR UPDATE -> affected Member FOR UPDATE).
+    const access = await assertCustomManagementCreatorAccess({
+      agencyId, actorMember: member, creatorId: target.creatorId, permissionKey: "content.review_customs", db: tx,
+    });
+    const currentMember = access.member;
+    const auth = await authorizeTelegramInboundException({ agencyId, member: currentMember, row: fresh, write: true, db: tx });
 
     const context = auth.context;
     const explicitUnprovenOverride = ["NO_ACTIVE_THREAD", "DIRECT_REPLY_UNRESOLVED"].includes(String(context.type || "")) && auth.scope?.broad;

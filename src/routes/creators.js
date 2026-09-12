@@ -14,76 +14,19 @@ const { agencyRemovalPhrase } = require("../services/creator-agency-removal");
 const { retireCreatorWithinTransaction, publishCreatorRetirementControlEvents } = require("../services/creator-lifecycle-authority-service");
 const { setCreatorTelegramUserId } = require("../services/creator-telegram-identity");
 const { updateCreatorTelegramContact } = require("../services/creator-telegram-contact-authority-service");
-const { bumpAgencyAccessEpoch } = require("../services/access-epoch-service");
-const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const {
   createCreatorDraft,
   beginCreatorConnection,
   completeCreatorConnection,
   observeCreatorPlatformProfile,
 } = require("../services/creator-enrollment-authority-service");
+const {
+  assertHumanCreatorCreateAuthority,
+  lockHumanCreatorMutation,
+  currentCreatorCatalogGeneration,
+} = require("../services/creator-human-management-authority-service");
 
 const router = express.Router();
-
-const CREATOR_CONTROL_SCAN_BATCH = 500;
-
-async function scanRowsById({ delegate, where, select }) {
-  const rows = [];
-  let cursorId = null;
-  while (true) {
-    const page = await delegate.findMany({
-      where,
-      select,
-      orderBy: { id: "asc" },
-      take: CREATOR_CONTROL_SCAN_BATCH,
-      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
-    });
-    if (!page.length) break;
-    rows.push(...page);
-    cursorId = String(page[page.length - 1].id);
-    if (page.length < CREATOR_CONTROL_SCAN_BATCH) break;
-  }
-  return rows;
-}
-
-async function publishAgencyAccessEpochEvents(req) {
-  const members = await scanRowsById({
-    delegate: prisma.agencyMember,
-    where: { agencyId: req.auth.agencyId, deletedAt: null, deactivatedAt: null },
-    select: { id: true, userId: true, accessEpoch: true },
-  });
-  for (const member of members) {
-    try {
-      publishDesktopControlEvent({
-        type: "ACCESS_EPOCH_CHANGED",
-        agencyId: req.auth.agencyId,
-        accessEpoch: member.accessEpoch,
-        targetUserId: member.userId,
-        targetMemberId: member.id,
-        sourceDeviceId: req.auth?.deviceId || null,
-        requestId: req.headers?.["x-request-id"] || null,
-      });
-    } catch (error) {
-      console.error("[creators/control-access-epoch] failed:", error);
-    }
-  }
-}
-
-function publishCreatorRevoked(req, creatorId, reason) {
-  try {
-    publishDesktopControlEvent({
-      type: "CREATOR_REVOKED",
-      agencyId: req.auth.agencyId,
-      creatorId,
-      reason,
-      sourceDeviceId: req.auth?.deviceId || null,
-      requestId: req.headers?.["x-request-id"] || null,
-    });
-  } catch (error) {
-    console.error("[creators/control-revoke] failed:", error);
-  }
-}
-
 
 const uploadsDir = path.join(__dirname, "..", "..", "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
@@ -186,7 +129,7 @@ function jsonRecord(value) {
 }
 
 
-async function findCreatorConflict({ agencyId, remoteId = null, username = null, excludeId = null }) {
+async function findCreatorConflict({ db = prisma, agencyId, remoteId = null, username = null, excludeId = null }) {
   const or = [];
   if (remoteId) or.push({ remoteId: String(remoteId) });
   if (username) {
@@ -198,7 +141,7 @@ async function findCreatorConflict({ agencyId, remoteId = null, username = null,
     );
   }
   if (!or.length) return null;
-  return prisma.creatorAccount.findFirst({
+  return db.creatorAccount.findFirst({
     where: {
       agencyId,
       deletedAt: null,
@@ -315,11 +258,12 @@ router.post("/", creatorManagementRequired, async (req, res) => {
       displayName: input.displayName,
       username,
       notes: input.notes || null,
-      beforeCommit: async (tx) => {
-      // The agency creator set is part of broad-access members' authorization
-      // graph. Bump all live members once so every desktop can detect that its
-      // cached creator manifest is no longer current.
-        await bumpAgencyAccessEpoch({ db: tx, agencyId: req.auth.agencyId });
+      beforeCreate: async (tx) => {
+        await assertHumanCreatorCreateAuthority({
+          tx,
+          agencyId: req.auth.agencyId,
+          actorMember: req.auth.membership,
+        });
       },
     });
 
@@ -331,9 +275,8 @@ router.post("/", creatorManagementRequired, async (req, res) => {
       targetId: creator.id,
       metadata: { username: creator.username, status: creator.status },
     });
-    await publishAgencyAccessEpochEvents(req);
-
-    return res.status(201).json({ ok: true, creator });
+    const creatorCatalogGeneration = await currentCreatorCatalogGeneration({ db: prisma, agencyId: req.auth.agencyId });
+    return res.status(201).json({ ok: true, creator, creatorCatalogGeneration });
   } catch (err) {
     console.error("[creators/create] failed:", err);
     return creatorErrorResponse(res, err, "CREATOR_CREATE_FAILED", "Failed to create creator");
@@ -458,40 +401,55 @@ router.patch("/:id", creatorManagementRequired, creatorAccessRequired, async (re
   try {
     const input = updateSchema.parse(req.body);
 
-    const existing = await prisma.creatorAccount.findFirst({
-      where: {
-        id: req.params.id,
-        agencyId: req.auth.agencyId,
-        deletedAt: null,
-      },
+    // Admission reads remain useful for fast UX, but they are not the commit
+    // authority. The transaction below re-locks Agency -> Creator -> actor.
+    const admitted = await prisma.creatorAccount.findFirst({
+      where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null },
     });
-
-    if (!existing) {
+    if (!admitted) {
       return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
     }
 
-    const nextUsername = input.username === undefined ? existing.username : normalizeUsername(input.username);
-    if (input.username !== undefined && existing.remoteId && normalizeUsername(existing.platformUsername || existing.username) !== nextUsername) {
-      return res.status(409).json({
-        ok: false,
-        code: "CREATOR_PLATFORM_USERNAME_OBSERVATION_REQUIRED",
-        error: "Connected creator username is updated only from verified platform identity observations",
+    const creator = await prisma.$transaction(async (tx) => {
+      const locked = await lockHumanCreatorMutation({
+        tx,
+        agencyId: req.auth.agencyId,
+        creatorId: req.params.id,
+        actorMember: req.auth.membership,
       });
-    }
-    const conflict = await findCreatorConflict({ agencyId: req.auth.agencyId, username: nextUsername, excludeId: existing.id });
-    if (conflict) {
-      return res.status(409).json({ ok: false, code: "CREATOR_ALREADY_EXISTS", error: "This OnlyFans creator is already connected", creatorId: conflict.id });
-    }
+      const existing = locked.creator || await tx.creatorAccount.findFirst({
+        where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null },
+      });
+      if (!existing) {
+        const error = Object.assign(new Error("Creator not found"), { code: "CREATOR_NOT_FOUND", status: 404 });
+        throw error;
+      }
 
-    const creator = await prisma.creatorAccount.update({
-      where: { id: existing.id },
-      data: {
-        displayName: input.displayName === undefined ? undefined : input.displayName.trim(),
-        username: input.username === undefined ? undefined : nextUsername,
-        enrollmentExpectedUsername: input.username === undefined || existing.remoteId ? undefined : nextUsername,
-        notes: input.notes === undefined ? undefined : input.notes || null,
-      },
-    });
+      const nextUsername = input.username === undefined ? existing.username : normalizeUsername(input.username);
+      if (input.username !== undefined && existing.remoteId && normalizeUsername(existing.platformUsername || existing.username) !== nextUsername) {
+        const error = Object.assign(new Error("Connected creator username is updated only from verified platform identity observations"), {
+          code: "CREATOR_PLATFORM_USERNAME_OBSERVATION_REQUIRED", status: 409,
+        });
+        throw error;
+      }
+      const conflict = await findCreatorConflict({ db: tx, agencyId: req.auth.agencyId, username: nextUsername, excludeId: existing.id });
+      if (conflict) {
+        const error = Object.assign(new Error("This OnlyFans creator is already connected"), {
+          code: "CREATOR_ALREADY_EXISTS", status: 409, creatorId: conflict.id,
+        });
+        throw error;
+      }
+
+      return tx.creatorAccount.update({
+        where: { id: existing.id },
+        data: {
+          displayName: input.displayName === undefined ? undefined : input.displayName.trim(),
+          username: input.username === undefined ? undefined : nextUsername,
+          enrollmentExpectedUsername: input.username === undefined || existing.remoteId ? undefined : nextUsername,
+          notes: input.notes === undefined ? undefined : input.notes || null,
+        },
+      });
+    }, { maxWait: 10_000, timeout: 30_000 });
 
     await audit({
       agencyId: req.auth.agencyId,
@@ -615,6 +573,7 @@ router.post("/:id/begin-connection", creatorManagementRequired, creatorAccessReq
       agencyId: req.auth.agencyId,
       creatorId: req.params.id,
       userId: req.auth.userId,
+      actorMember: req.auth.membership,
       deviceId: req.auth?.deviceId || null,
     });
     if (!result.unchanged) {
@@ -642,6 +601,7 @@ router.post("/:id/complete-connection", creatorManagementRequired, creatorAccess
       agencyId: req.auth.agencyId,
       creatorId: req.params.id,
       userId: req.auth.userId,
+      actorMember: req.auth.membership,
       connectionGeneration: input.connectionGeneration,
       remoteId: input.remoteId,
       username: input.username,
@@ -706,19 +666,15 @@ router.post("/:id/platform-profile", creatorAccessRequired, async (req, res) => 
 });
 
 router.post("/:id/avatar", creatorManagementRequired, creatorAccessRequired, upload.single("avatar"), async (req, res) => {
+  let committed = false;
   try {
     const existing = await prisma.creatorAccount.findFirst({
-      where: {
-        id: req.params.id,
-        agencyId: req.auth.agencyId,
-        deletedAt: null,
-      },
+      where: { id: req.params.id, agencyId: req.auth.agencyId, deletedAt: null },
     });
-
     if (!existing) {
+      safeUnlink(req.file?.path);
       return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
     }
-
     if (!req.file) {
       return res.status(400).json({ ok: false, code: "AVATAR_MISSING", error: "Avatar file is required" });
     }
@@ -730,15 +686,24 @@ router.post("/:id/avatar", creatorManagementRequired, creatorAccessRequired, upl
     }
 
     const avatarUrl = `${publicBaseUrl(req)}/uploads/${req.file.filename}`;
-    const creator = await prisma.creatorAccount.update({
-      where: { id: existing.id },
-      data: { avatarUrl },
-    });
-
+    const creator = await prisma.$transaction(async (tx) => {
+      await lockHumanCreatorMutation({
+        tx,
+        agencyId: req.auth.agencyId,
+        creatorId: req.params.id,
+        actorMember: req.auth.membership,
+      });
+      return tx.creatorAccount.update({
+        where: { id: req.params.id },
+        data: { avatarUrl },
+      });
+    }, { maxWait: 10_000, timeout: 30_000 });
+    committed = true;
     return res.json({ ok: true, avatarUrl, creator });
   } catch (err) {
+    if (!committed) safeUnlink(req.file?.path);
     console.error("[creators/avatar] failed:", err);
-    return res.status(500).json({ ok: false, code: "AVATAR_UPLOAD_FAILED", error: "Failed to upload avatar" });
+    return creatorErrorResponse(res, err, "AVATAR_UPLOAD_FAILED", "Failed to upload avatar");
   }
 });
 

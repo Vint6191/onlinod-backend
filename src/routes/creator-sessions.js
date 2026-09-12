@@ -241,6 +241,7 @@ router.post("/:creatorId/revoke", creatorManagementRequired, async (req, res) =>
       agencyId: req.auth.agencyId,
       creatorId: creator.id,
       userId: req.auth.userId,
+      actorMember: req.auth.membership,
       deviceId: device.id,
       baseRevision: input.baseRevision,
       requestId: input.requestId,

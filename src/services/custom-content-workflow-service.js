@@ -535,22 +535,22 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
   if (typeof client?.$transaction !== "function") throw fail("CUSTOM_RETIRED_ORDER_RESOLUTION_TRANSACTION_REQUIRED", "Legacy Custom resolution requires transactional audit authority", 500);
 
   return client.$transaction(async (tx) => {
-    const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });
-    await requireWorkflowWrite({ agencyId, member: currentMember, db: tx });
-    const scope = await allowedCreatorScope({ agencyId, member: currentMember, db: tx });
-    if (!scope?.broad) throw fail("CUSTOM_RETIRED_ORDER_RESOLUTION_BROAD_SCOPE_REQUIRED", "Only broad-scope managers can resolve historical Customs for a retired creator", 403);
-
+    // Even the historical compatibility resolver obeys the canonical prefix. Read
+    // the immutable target identity first, then Agency -> Creator -> Member.
     const initial = await tx.customOrder.findFirst({
       where: { id, agencyId },
       select: { id: true, creatorId: true, status: true, type: true, dialogId: true, telegramTaskMessageId: true },
     });
     if (!initial) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order was not found", 404);
-
-    // Global lifecycle lock order is Agency -> Creator. allowDeleted is intentional here:
-    // this is the one audited compatibility workflow whose purpose is to adjudicate debt
-    // left behind by versions that retired CreatorAccount before resolving its Customs.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
     const creator = await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: initial.creatorId, allowDeleted: true });
+    const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx, agencyAlreadyLocked: true });
+    await requireWorkflowWrite({ agencyId, member: currentMember, db: tx });
+    const scope = await allowedCreatorScope({ agencyId, member: currentMember, db: tx });
+    if (!scope?.broad) throw fail("CUSTOM_RETIRED_ORDER_RESOLUTION_BROAD_SCOPE_REQUIRED", "Only broad-scope managers can resolve historical Customs for a retired creator", 403);
+
+    // allowDeleted is intentional here: this audited compatibility workflow
+    // adjudicates debt left behind by versions that retired CreatorAccount first.
     if (!creator.deletedAt) throw fail("CUSTOM_RETIRED_ORDER_CREATOR_ACTIVE", "This compatibility resolution is only valid for an already-retired creator", 409);
     await lockAutomationWriteCommitFence({ db: tx, agencyId });
 

@@ -9,16 +9,22 @@ const root = path.join(__dirname, "..", "..");
 const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
 
 const migration = read("prisma/migrations/20260911210000_phase2_actual56_cut_a_current_work_topology/migration.sql");
+const conservationMigration = read("prisma/migrations/20260912001000_phase2_actual56_current_partition_conservation/migration.sql");
+const zeroTransitionMigration = read("prisma/migrations/20260912006000_phase2_actual56_partition_counter_zero_transition/migration.sql");
 const domainWork = read("src/services/domain-work-authority-service.js");
 const settings = read("src/services/settings-service.js");
 const scheduler = read("src/services/job-scheduler.js");
 const retirementFanout = read("src/services/telegram-account-retirement-fanout-service.js");
 
-test("F56-01 partition fairness projection is current-only rather than lifetime catalog", () => {
+test("F56-01 partition fairness projection is current-only and race-safe", () => {
   assert.match(migration, /DELETE FROM "Phase2WorkBroadClaimPartitionState";/);
-  assert.match(migration, /IF NOT EXISTS \([\s\S]*"DomainWorkItem" d[\s\S]*"isOutstanding"=TRUE[\s\S]*\) THEN[\s\S]*DELETE FROM "Phase2WorkBroadClaimPartitionState"/);
   assert.match(migration, /JOIN "Phase2WorkGenerationAuthority" g/);
   assert.match(migration, /CREATE INDEX IF NOT EXISTS "DomainWorkItem_current_broad_due_idx"/);
+  assert.match(zeroTransitionMigration, /"outstandingCount"=f\."outstandingCount"-1/);
+  assert.match(zeroTransitionMigration, /f\."outstandingCount" > 1/);
+  assert.match(zeroTransitionMigration, /f\."outstandingCount" = 1/);
+  assert.match(zeroTransitionMigration, /"outstandingCount"\+1/);
+  assert.doesNotMatch(conservationMigration, /IF NOT EXISTS \([\s\S]*"DomainWorkItem" d/);
   assert.doesNotMatch(domainWork, /partition_heads|DISTINCT ON \(d\."partitionKey"\)|LIMIT 4096/i);
 });
 

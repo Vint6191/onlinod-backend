@@ -74,11 +74,12 @@ test("role lifecycle serializes assignment/invites against configuration writers
 
   const memberMutation = bodyBetween("async function updateMemberSettings", "async function setMemberStatus");
   const memberCommit = memberMutation.slice(memberMutation.indexOf("serializableTeamTransaction"));
-  assert.match(memberCommit, /lockTeamRoleLifecycle\(\{ tx, agencyId, roleKey: nextRoleKey, mode: "share" \}\)/);
+  assert.match(memberCommit, /lockTeamControlPlaneTopology\(\{ tx, agencyId \}\)/);
+  assert.match(memberCommit, /lockTeamRoleLifecycles\([\s\S]*roleKeys: \[memberRoleKey\(liveTarget\), liveNextRoleKey\][\s\S]*agencyAlreadyLocked: true/);
   assertBefore(memberCommit, "lockTeamRoleLifecycle", "assertActorCanAssignRole", "role existence must stay locked through member assignment");
 
   const statusMutation = bodyBetween("async function setMemberStatus", "async function removeMember");
-  assert.match(statusMutation, /status !== "deactivated"[\s\S]*lockTeamRoleLifecycle\(\{ tx, agencyId, roleKey: memberRoleKey\(liveTarget\), mode: "share" \}\)/);
+  assert.match(statusMutation, /lockTeamControlPlaneTopology\(\{ tx, agencyId \}\)[\s\S]*status !== "deactivated"[\s\S]*lockTeamRoleLifecycle\(\{ tx, agencyId, roleKey: memberRoleKey\(liveTarget\), mode: "share", agencyAlreadyLocked: true \}\)/);
 
   const inviteMutation = bodyBetween("async function createInvitation", "async function reissueInvitation");
   assert.match(inviteMutation, /serializableTeamTransaction/);
@@ -95,11 +96,11 @@ test("role lifecycle serializes assignment/invites against configuration writers
     ["async function setRolePermission", "async function resetRole"],
   ]) {
     const body = bodyBetween(start, end);
-    assert.match(body, /lockTeamRoleLifecycle\(\{ tx, agencyId, roleKey: key, mode: "update" \}\)/);
+    assert.match(body, /lockTeamControlPlaneTopology\(\{ tx, agencyId \}\)[\s\S]*lockTeamRoleLifecycle\(\{ tx, agencyId, roleKey: key, mode: "update", agencyAlreadyLocked: true \}\)/);
   }
 
   const reset = bodyBetween("async function resetRole", "async function deleteCustomRole");
-  assert.match(reset, /lockTeamRoleLifecycle\(\{ tx, agencyId, roleKey: key, mode: "update" \}\)/);
+  assert.match(reset, /lockTeamControlPlaneTopology\(\{ tx, agencyId \}\)[\s\S]*lockTeamRoleLifecycle\(\{ tx, agencyId, roleKey: key, mode: "update", agencyAlreadyLocked: true \}\)/);
 
   const metadata = bodyBetween("async function updateRoleMetadata", "async function setRoleAccess");
   assert.match(metadata, /serializableTeamTransaction/);

@@ -7,6 +7,14 @@ const { phase2CoverageStatus, FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2
 const { normalizeAssignedCreators } = require("./team-access-control");
 
 const CURRENT_PENDING_DERIVATION_VERSION = "team_pending_v2";
+const CURRENT_PENDING_PROJECTION_STATES = Object.freeze(["FULL", "INCOMPLETE_HISTORY"]);
+
+function currentPendingProjectionWhere() {
+  return {
+    derivationVersion: CURRENT_PENDING_DERIVATION_VERSION,
+    projectionState: { in: [...CURRENT_PENDING_PROJECTION_STATES] },
+  };
+}
 
 const LEGACY_BOOTSTRAP_SOURCE = "crm_pending_bootstrap_v1";
 const LEGACY_BOOTSTRAP_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
@@ -311,8 +319,67 @@ async function operationalOwnerMapForRows({ agencyId, rows, db = prisma }) {
   return result;
 }
 
+function unknownOperationalPendingSummary({ now = new Date(), reason = "OPERATIONAL_OWNER_UNAVAILABLE" } = {}) {
+  return {
+    source: "team_pending_dialog_v2_operational",
+    availability: "UNKNOWN",
+    reason,
+    pendingDialogs: null,
+    pendingIncomingMessages: null,
+    unassignedDialogs: null,
+    seenDialogs: null,
+    incompleteHistoryDialogs: null,
+    historyCompleteness: "UNKNOWN",
+    olderThan15m: null,
+    olderThan60m: null,
+    oldestPendingAt: null,
+    oldestPendingSeconds: null,
+    asOf: now,
+  };
+}
+
+async function loadOperationalPendingRows({ agencyId, allowedCreatorIds = null, memberId = null, ownership = "all", limit = 100, db = prisma } = {}) {
+  if (typeof db?.$queryRawUnsafe !== "function") return { available: false, rows: null };
+  const creatorIds = Array.isArray(allowedCreatorIds)
+    ? Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)))
+    : null;
+  const targetMemberId = clean(memberId, 160);
+  const unassignedOnly = !targetMemberId && String(ownership || "all").toLowerCase() === "unassigned";
+  const take = clampLimit(limit);
+  try {
+    const rows = await db.$queryRawUnsafe(`
+      SELECT o.*
+        FROM "TeamOperationalPendingCurrent" o
+       WHERE o."agencyId"=$1
+         AND o."status"='PENDING'
+         AND o."derivationVersion"=$2
+         AND o."projectionState" IN ('FULL','INCOMPLETE_HISTORY')
+         AND ($3::text[] IS NULL OR o."creatorId"=ANY($3::text[]))
+         AND ($4::text IS NULL OR o."ownerMemberId"=$4)
+         AND ($4::text IS NULL OR o."operationalOwnerMemberId"=$4)
+         AND ($5::boolean=FALSE OR o."operationalOwnerMemberId" IS NULL)
+       ORDER BY o."firstIncomingAt" ASC NULLS LAST,o."id" ASC
+       LIMIT $6
+    `, String(agencyId), CURRENT_PENDING_DERIVATION_VERSION, creatorIds, targetMemberId, unassignedOnly, take);
+    return { available: true, rows: Array.isArray(rows) ? rows : [] };
+  } catch (error) {
+    return { available: false, rows: null, error };
+  }
+}
+
 async function summarizeOperationalPending({ agencyId, allowedCreatorIds = null, memberId = null, ownership = "all", now = new Date(), db = prisma, fallbackRows = [] } = {}) {
-  if (typeof db?.$queryRawUnsafe !== "function") return summarizePendingRows(fallbackRows, { now });
+  if (typeof db?.$queryRawUnsafe !== "function") {
+    // Lightweight adapters do not have the SQL current-owner authority. We may
+    // derive current ownership only when the caller supplied rows and Member/User
+    // storage exists; otherwise fail semantically as UNKNOWN, never resurrect raw
+    // historical ownerMemberId.
+    if (!Array.isArray(fallbackRows) || !fallbackRows.length || !db?.agencyMember?.findMany) {
+      return unknownOperationalPendingSummary({ now, reason: "POSTGRES_OPERATIONAL_OWNER_REQUIRED" });
+    }
+    const owners = await operationalOwnerMapForRows({ agencyId, rows: fallbackRows, db });
+    const projected = fallbackRows.map((row) => ({ ...row, ownerMemberId: owners.get(String(row.id)) || null }));
+    return { ...summarizePendingRows(projected, { now }), source: "team_pending_dialog_v2_operational_fallback", availability: "PARTIAL" };
+  }
   const creatorIds = Array.isArray(allowedCreatorIds)
     ? Array.from(new Set(allowedCreatorIds.map(String).map((id) => id.trim()).filter(Boolean)))
     : null;
@@ -321,33 +388,22 @@ async function summarizeOperationalPending({ agencyId, allowedCreatorIds = null,
   const nowDate = now instanceof Date ? now : new Date(now || Date.now());
   try {
     const result = await db.$queryRawUnsafe(`
-      WITH current_pending AS (
-        SELECT p.*,
-               CASE WHEN m."id" IS NOT NULL
-                          AND u."id" IS NOT NULL
-                          AND "phase2_scope_allows_creator"(m."assignedCreators",p."creatorId")
-                    THEN p."ownerMemberId" ELSE NULL END AS operational_owner
-          FROM "TeamPendingDialogStateCurrent" p
-          JOIN "CreatorAccount" c
-            ON c."id"=p."creatorId" AND c."agencyId"=p."agencyId" AND c."deletedAt" IS NULL
-          LEFT JOIN "AgencyMember" m
-            ON m."id"=p."ownerMemberId" AND m."agencyId"=p."agencyId"
-           AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
-          LEFT JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
-         WHERE p."agencyId"=$1
-           AND p."status"='PENDING'
-           AND p."derivationVersion"=$2
-           AND p."projectionState" IN ('FULL','INCOMPLETE_HISTORY')
-           AND ($3::text[] IS NULL OR p."creatorId"=ANY($3::text[]))
-      ), filtered AS (
-        SELECT * FROM current_pending
-         WHERE ($4::text IS NULL OR operational_owner=$4)
-           AND ($5::boolean=FALSE OR operational_owner IS NULL)
+      WITH filtered AS (
+        SELECT o.*
+          FROM "TeamOperationalPendingCurrent" o
+         WHERE o."agencyId"=$1
+           AND o."status"='PENDING'
+           AND o."derivationVersion"=$2
+           AND o."projectionState" IN ('FULL','INCOMPLETE_HISTORY')
+           AND ($3::text[] IS NULL OR o."creatorId"=ANY($3::text[]))
+           AND ($4::text IS NULL OR o."ownerMemberId"=$4)
+           AND ($4::text IS NULL OR o."operationalOwnerMemberId"=$4)
+           AND ($5::boolean=FALSE OR o."operationalOwnerMemberId" IS NULL)
       )
       SELECT COUNT(*)::bigint AS pending_dialogs,
              COALESCE(SUM(GREATEST(1,"incomingCount")),0)::bigint AS pending_messages,
-             COUNT(*) FILTER(WHERE operational_owner IS NULL)::bigint AS unassigned_dialogs,
-             COUNT(*) FILTER(WHERE operational_owner IS NOT NULL)::bigint AS seen_dialogs,
+             COUNT(*) FILTER(WHERE "operationalOwnerMemberId" IS NULL)::bigint AS unassigned_dialogs,
+             COUNT(*) FILTER(WHERE "operationalOwnerMemberId" IS NOT NULL)::bigint AS seen_dialogs,
              COUNT(*) FILTER(WHERE "projectionState"='INCOMPLETE_HISTORY')::bigint AS incomplete_history,
              COUNT(*) FILTER(WHERE "firstIncomingAt" <= $6)::bigint AS older_15m,
              COUNT(*) FILTER(WHERE "firstIncomingAt" <= $7)::bigint AS older_60m,
@@ -360,6 +416,7 @@ async function summarizeOperationalPending({ agencyId, allowedCreatorIds = null,
     const incomplete = Number(row?.incomplete_history || row?.incompleteHistory || 0);
     return {
       source: "team_pending_dialog_v2_operational",
+      availability: "FULL",
       pendingDialogs: Number(row?.pending_dialogs || row?.pendingDialogs || 0),
       pendingIncomingMessages: Number(row?.pending_messages || row?.pendingMessages || 0),
       unassignedDialogs: Number(row?.unassigned_dialogs || row?.unassignedDialogs || 0),
@@ -371,8 +428,8 @@ async function summarizeOperationalPending({ agencyId, allowedCreatorIds = null,
       oldestPendingAt,
       oldestPendingSeconds: secondsSince(oldestPendingAt, nowDate),
     };
-  } catch (_) {
-    return summarizePendingRows(fallbackRows, { now: nowDate });
+  } catch (error) {
+    return unknownOperationalPendingSummary({ now: nowDate, reason: clean(error?.code || error?.message, 160) || "OPERATIONAL_OWNER_SQL_FAILED" });
   }
 }
 
@@ -406,10 +463,7 @@ async function pendingProjectionAuthority({ agencyId, db = prisma } = {}) {
     status,
     // Production Prisma maps this model to TeamPendingDialogStateCurrent. Never broaden
     // a current reader to legacy/unknown generations when coverage cannot be proven.
-    where: {
-      derivationVersion: CURRENT_PENDING_DERIVATION_VERSION,
-      projectionState: { in: ["FULL", "INCOMPLETE_HISTORY"] },
-    },
+    where: currentPendingProjectionWhere(),
   };
 }
 
@@ -441,24 +495,40 @@ async function listTeamPendingDialogs({
     creator: { is: { deletedAt: null } },
   };
   const requestedLimit = clampLimit(limit);
-  // Ownership is derived from *current* Member/User/access eligibility. Do not use
-  // ownerMemberId as a DB truth predicate because a disabled/deactivated/out-of-scope
-  // owner must behave as unassigned while historical attribution remains intact.
-  const candidateLimit = (normalizedMemberId || normalizedOwnership === "unassigned")
-    ? Math.min(500, Math.max(requestedLimit, requestedLimit * 4))
-    : requestedLimit;
-  const candidates = await db.teamPendingDialogState.findMany({
-    where,
-    orderBy: [{ firstIncomingAt: "asc" }, { id: "asc" }],
-    take: candidateLimit,
+  // Production ownership filtering happens in the canonical SQL authority *before*
+  // LIMIT. This avoids the old global-prefix-500 completeness bug.
+  const operational = await loadOperationalPendingRows({
+    agencyId, allowedCreatorIds, memberId: normalizedMemberId, ownership: normalizedOwnership,
+    limit: requestedLimit, db,
   });
-  const operationalOwners = await operationalOwnerMapForRows({ agencyId, rows: candidates, db });
-  const rows = candidates.filter((row) => {
-    const owner = operationalOwners.get(String(row.id)) || null;
-    if (normalizedMemberId) return owner === normalizedMemberId;
-    if (normalizedOwnership === "unassigned") return owner === null;
-    return true;
-  }).slice(0, requestedLimit);
+  let rows;
+  let operationalOwners;
+  let operationalReadUnavailable = false;
+  if (operational.available) {
+    rows = operational.rows || [];
+    operationalOwners = new Map(rows.filter((row) => row.operationalOwnerMemberId).map((row) => [String(row.id), String(row.operationalOwnerMemberId)]));
+  } else if (typeof db?.$queryRawUnsafe === "function") {
+    // Production PostgreSQL was unable to evaluate current operational ownership.
+    // Fail closed instead of resurrecting the old bounded historical-owner scan.
+    rows = [];
+    operationalOwners = new Map();
+    operationalReadUnavailable = true;
+  } else {
+    // Adapter/test fallback derives eligibility from current Member/User storage. It
+    // never treats historical ownerMemberId as current truth by itself.
+    const candidates = await db.teamPendingDialogState.findMany({
+      where,
+      orderBy: [{ firstIncomingAt: "asc" }, { id: "asc" }],
+      take: requestedLimit,
+    });
+    operationalOwners = await operationalOwnerMapForRows({ agencyId, rows: candidates, db });
+    rows = candidates.filter((row) => {
+      const owner = operationalOwners.get(String(row.id)) || null;
+      if (normalizedMemberId) return owner === normalizedMemberId;
+      if (normalizedOwnership === "unassigned") return owner === null;
+      return true;
+    }).slice(0, requestedLimit);
+  }
   const [names, summary, identities] = await Promise.all([
     memberNamesForRows({ agencyId, rows, db }),
     summarizeOperationalPending({ agencyId, allowedCreatorIds, memberId: normalizedMemberId, ownership: normalizedOwnership, now, db, fallbackRows: rows }),
@@ -475,7 +545,9 @@ async function listTeamPendingDialogs({
       outstandingCount: projectionAuthority.status?.live?.outstandingCount ?? null,
       generation: CURRENT_PENDING_DERIVATION_VERSION,
     },
-    summary,
+    summary: operationalReadUnavailable
+      ? unknownOperationalPendingSummary({ now, reason: "OPERATIONAL_OWNER_SQL_FAILED" })
+      : summary,
     rows: (rows || []).map((row) => ({
       id: row.id,
       creatorId: row.creatorId,
@@ -525,7 +597,8 @@ async function listTeamPendingDialogs({
 }
 
 module.exports = {
-  CURRENT_PENDING_DERIVATION_VERSION, pendingProjectionAuthority, pendingProjectionAuthorityWhere,
+  CURRENT_PENDING_DERIVATION_VERSION, CURRENT_PENDING_PROJECTION_STATES, currentPendingProjectionWhere,
+  pendingProjectionAuthority, pendingProjectionAuthorityWhere,
   creatorScopeWhere,
   secondsSince,
   summarizePendingRows,
@@ -535,5 +608,7 @@ module.exports = {
   pendingIdentityMaps,
   memberHasCurrentCreatorAccess,
   operationalOwnerMapForRows,
+  loadOperationalPendingRows,
+  unknownOperationalPendingSummary,
   summarizeOperationalPending,
 };

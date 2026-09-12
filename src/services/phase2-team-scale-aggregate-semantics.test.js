@@ -101,7 +101,7 @@ function makePrisma({ queryLog }) {
         return [{ ...row, isTotal: 0, memberId: "member-a" }, { ...row, isTotal: 1, memberId: null }];
       }
       if (/WITH grouped AS/.test(sql) && /TeamDialogSession/.test(sql)) return [];
-      if (/FROM "TeamPendingDialogStateCurrent" p/.test(sql)) {
+      if (/FROM "TeamOperationalPendingCurrent" p/.test(sql) || /FROM "TeamPendingDialogStateCurrent" p/.test(sql)) {
         return [{ isTotal: 1, memberId: null, pendingDialogs: 0n, pendingIncomingMessages: 0n, unassignedDialogs: 0n, seenDialogs: 0n, olderThan15m: 0n, olderThan60m: 0n, oldestPendingAt: null }];
       }
       if (/FROM "TeamMoneyAttributionFact" m/.test(sql) && /GROUPING SETS/.test(sql)) {

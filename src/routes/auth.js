@@ -21,6 +21,8 @@ const { resolveEffectivePermissions, validateAssignedCreators } = require("../se
 const { cleanFunctions, ensureRoleExists, lockTeamRoleLifecycle, materializeInvitationMemberWithinTransaction } = require("../services/team-administration-service");
 const { audit } = require("../services/audit-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
+const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = require("../services/team-control-plane-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("../services/phase2-release-compatibility-authority-service");
 
 const router = express.Router();
 
@@ -185,9 +187,11 @@ router.post("/register", async (req, res) => {
           // Registration-time invitation claim is also a durable role
           // assignment. Keep custom-role deletion behind the same shared
           // lifecycle fence until the new member and claimed invite commit.
-          await lockTeamRoleLifecycle({ tx, agencyId: inv.agencyId, roleKey: inv.roleKey, mode: "share" });
+          await lockTeamControlPlaneTopology({ tx, agencyId: inv.agencyId });
+          await lockTeamRoleLifecycle({ tx, agencyId: inv.agencyId, roleKey: inv.roleKey, mode: "share", agencyAlreadyLocked: true });
           roleKey = await ensureRoleExists({ agencyId: inv.agencyId, roleKey: inv.roleKey, db: tx });
-        } catch (_) {
+        } catch (lockError) {
+          if (String(lockError?.code || "").startsWith("TEAM_CONTROL_PLANE_")) throw lockError;
           const err = new Error("Invitation role is no longer available");
           err.status = 409;
           err.code = "INVITE_ROLE_STALE";
@@ -210,6 +214,19 @@ router.post("/register", async (req, res) => {
           err.status = 409;
           err.code = "INVITE_CREATOR_SCOPE_STALE";
           err.details = { unknownCreatorIds: creatorScope.unknownCreatorIds };
+          throw err;
+        }
+        const creatorLocks = await lockLiveTeamControlPlaneCreators({
+          tx,
+          agencyId: inv.agencyId,
+          creatorIds: creatorScope.normalized?.mode === "scoped" ? creatorScope.normalized.creatorIds : [],
+          mode: "share",
+        });
+        if (creatorLocks.missingCreatorIds.length) {
+          const err = new Error("Invitation contains creators that are no longer available");
+          err.status = 409;
+          err.code = "INVITE_CREATOR_SCOPE_STALE";
+          err.details = { unknownCreatorIds: creatorLocks.missingCreatorIds };
           throw err;
         }
         const functions = cleanFunctions(inv.functions);
@@ -273,6 +290,10 @@ router.post("/register", async (req, res) => {
         };
       }
 
+      // New Agency + OWNER bootstrap creates Team current authority. During an
+      // incompatible rolling release it must not become a new authority surface
+      // until the old binary has been drained and TEAM_CONTROL_PLANE is ACTIVE.
+      await assertTeamControlPlaneWriteAdmission(tx);
       const agency = await tx.agency.create({
         data: {
           name: input.agencyName || "Onlinod Agency",
@@ -348,6 +369,9 @@ router.post("/register", async (req, res) => {
     if (err?.issues) return validationError(res, err);
     if (err?.code && String(err.code).startsWith("INVITE_")) {
       return res.status(err.status || 400).json({ ok: false, code: err.code, error: err.message });
+    }
+    if (err?.code && String(err.code).startsWith("TEAM_CONTROL_PLANE_") && Number(err?.status) >= 400 && Number(err?.status) < 600) {
+      return res.status(Number(err.status)).json({ ok: false, code: err.code, error: err.message });
     }
     console.error("[auth/register] failed:", err);
     return res.status(500).json({ ok: false, code: "REGISTER_FAILED", error: "Registration failed" });

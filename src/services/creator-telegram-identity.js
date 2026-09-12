@@ -2,6 +2,7 @@
 
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
+const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
 
 function normalizeTelegramUserId(value) {
   const text = String(value ?? "").trim();
@@ -47,6 +48,7 @@ async function setCreatorTelegramUserId({ agencyId, actorMember, creatorId, tele
 
   return client.$transaction(async (tx) => {
     await lockAgencyPipelineLifecycle({ db: tx, agencyId: agency });
+    await lockCreatorPipelineLifecycle({ db: tx, agencyId: agency, creatorId: id });
     await assertManagementCommitAuthority({
       tx,
       agencyId: agency,
@@ -54,8 +56,10 @@ async function setCreatorTelegramUserId({ agencyId, actorMember, creatorId, tele
       permissionKey: "creators.manage",
       creatorIds: [id],
       agencyAlreadyLocked: true,
+      creatorRowsAlreadyLocked: true,
     });
-    await lockCreatorPipelineLifecycle({ db: tx, agencyId: agency, creatorId: id });
+
+    await authorizeCreatorAccountWrite(tx);
 
     // Bind the resolved Telegram identity only if the creator still has exactly the
     // contact that Desktop resolved. The commit-time management guard above and

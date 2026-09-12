@@ -1,0 +1,125 @@
+ONLINOD — PHASE 2 / ACTUAL56
+SOURCE FINAL CANDIDATE
+
+EXACT BASE
+Desktop:
+  56(5).zip
+  SHA-256 ca12169093ec4164b593c38e58cfe8a17c406ebce0cb0030f3f91b608c9616a1
+  UNCHANGED by this candidate.
+
+Backend:
+  onlinod-backend-main - 2026-09-11T232952.254(2).zip
+  SHA-256 2cf3f25dcb05903b5594bd8927c028ae144b01bf5be6bb6a7debd03287869e82
+
+This archive is a cumulative overlay containing only added/modified files relative to that exact backend base.
+No nested backend/backend package. Removed files: 0.
+
+SOURCE CLOSURE VERDICT
+  NEW FUNDAMENTAL PHASE-2 ROOT: NO
+  ARCHITECTURAL CONVERGENCE: YES
+  SOURCE CLOSED: YES — candidate source boundary is converged after independent destructive anti-map.
+  PHASE 2 CLOSED: NO — real PostgreSQL / migration / scale gates remain unexecuted in this environment.
+  READY FOR PRODUCTION CUTOVER: NO until those gates pass and the rolling activation procedure is executed against the real migrated environment.
+
+CLOSED SOURCE CLASSES
+A. C1 CURRENT WORK PROJECTION CONSERVATION
+- conserved per-partition outstandingCount
+- race-safe final zero transition
+- normal transitions and exceptional physical repair share DWI-row -> partition-fence ordering
+- destructive/raw settlement surfaces classified and trigger-covered
+
+B. C2 TEAM CONTROL-PLANE TOTAL LOCK ORDER
+- canonical topology ordering for Member/Role/Creator current-authority writers
+- invitation claim/restore and Creator retirement converge on compatible order
+- operational OWNER = live Member + live User
+- User disable and Agency restore cannot produce a live Agency with zero operational OWNER
+- Serializable conflicts surface as controlled retryable conflicts rather than stale success
+
+C. C3/C4 ONE OPERATIONAL PENDING AUTHORITY
+- TeamOperationalPendingCurrent applies live Creator + live Member + live User + current scope
+- owner/member predicates occur before LIMIT
+- Team Pending list/summary and Team Analytics/alerts reuse current operational owner semantics
+- historical owner is attribution only, not degraded current truth
+- member-specific SQL includes raw-owner predicate to expose existing owner-first index to PostgreSQL planner
+
+D. C5 CREATOR HUMAN MANAGEMENT COMMIT AUTHORITY
+- create / metadata / avatar / connection human mutations revalidate commit-time management authority
+- direct CreatorAccount writer surface is classified and M1 release-fenced
+
+E. C6 BOUNDED CREATOR CATALOG INVALIDATION
+- AgencyCreatorCatalogState replaces O(all-members) creator-create invalidation
+- Creator membership changes bump one Agency generation transactionally
+- Desktop bootstrap returns a stable Member-authority + creator-generation snapshot
+- Desktop current-access authority is shared by bootstrap/secrets/control
+- control long-poll filters against a stable Member/User/Agency + creator-generation snapshot
+- Desktop Actual56 remains unchanged; existing heartbeat uses /api/desktop/bootstrap for bounded convergence
+
+F. M1 ROLLING RELEASE COMPATIBILITY
+- DB release generations fence incompatible CreatorAccount writers and new DomainWork ownership
+- TEAM_CONTROL_PLANE migration publishes DRAINING, never auto-ACTIVE
+- new-binary Team current-authority writes fail closed before the incompatible lock graph while DRAINING
+- explicit activation uses exclusive release fence and operational-OWNER preflight
+- destructive Agency work yields during intentional DRAINING instead of recording false failure
+
+FINAL SOURCE ANTI-MAP
+The final invariant test freezes the physical production surfaces for:
+- DomainWorkItem mutators
+- AgencyMember mutators
+- Team role-definition mutators
+- CreatorAccount mutators
+- current OperationalPending consumers
+- M1 release-admitted Team authority writers
+- shared Desktop current-access authority
+A new direct surface breaks closure tests until explicitly classified.
+
+VERIFICATION
+Phase2 + desktop current-access/bootstrap/secrets/control/accessEpoch:
+  126 tests
+  110 PASS
+  0 FAIL
+  16 SKIP
+
+Final physical source anti-map:
+  7 / 7 PASS
+
+Changed/added JavaScript syntax:
+  65 / 65 PASS
+
+Full src/services/*.test.js regression:
+  2304 tests
+  2248 PASS
+  26 FAIL
+  30 SKIP
+The exact 26 FAIL names are identical 1:1 to the pre-existing checkpoint-15 baseline.
+NEW full-suite FAIL names introduced by this candidate: 0.
+
+REAL POSTGRESQL GATES STILL OPEN (16 SKIPPED TESTS)
+- C2: 10 forced multi-connection Team/Member/Role/Creator/User/OWNER interleavings
+- C1: 2 current-partition conservation interleavings
+- C3/C4: 1 >500-row operational-owner/current-lifecycle test
+- C6: 1 500-member Creator-create scale test
+- M1: 1 migrated-PostgreSQL old/new writer/executor compatibility test
+- M1: 1 isolated DRAINING/activation release-fence test
+
+ADDITIONAL DEPLOYMENT/MIGRATION GATES STILL REQUIRED
+- actual large production-like migration rehearsal from the relevant pre-cut Actual55/56 schema/data shape
+- EXPLAIN/ANALYZE for final OperationalPending SQL on production-like data
+- Creator-create transaction/lock timing at 500+ members
+- Telegram retirement restart/load proof
+- destructive cleanup multi-connection/restart proof
+- multi-replica/soak proof where applicable
+
+M1 ROLLING CUTOVER CONTRACT
+1. Apply migrations. TEAM_CONTROL_PLANE must remain DRAINING.
+2. Start/deploy the new binary; Team authority-changing writes remain fail-closed while DRAINING.
+3. Drain every incompatible old backend binary from request/work execution.
+4. Verify migrated PostgreSQL gates/preflight.
+5. Activate explicitly only after old binaries are actually drained:
+   npm run phase2:team-control-plane -- --activate --confirm-old-binary-drained
+6. Confirm TEAM_CONTROL_PLANE is ACTIVE and then run post-activation forced interleavings/soak.
+
+DO NOT
+- auto-activate TEAM_CONTROL_PLANE during startup
+- treat WEB_CONCURRENCY=1 as rolling compatibility proof
+- treat these 16 SKIPs as PASS
+- call PHASE 2 fully CLOSED before PostgreSQL/migration/scale acceptance actually passes
