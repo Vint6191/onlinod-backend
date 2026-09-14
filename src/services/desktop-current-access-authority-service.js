@@ -3,15 +3,35 @@
 const { assignedCreatorIds, hasBroadCreatorAccess } = require("../middleware/automation-permissions");
 const { normalizedAccessEpoch } = require("./access-epoch-service");
 
+function stableBooleanRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out = {};
+  for (const key of Object.keys(value).sort()) {
+    if (typeof value[key] === "boolean") out[key] = value[key];
+  }
+  return out;
+}
+
+function desktopMemberAuthorizationIdentity(member) {
+  return {
+    accessEpoch: normalizedAccessEpoch(member?.accessEpoch),
+    role: String(member?.role || "").toUpperCase(),
+    roleKey: String(member?.roleKey || "").toLowerCase(),
+    directPermissions: stableBooleanRecord(member?.permissions),
+  };
+}
+
 function desktopMemberAuthorityFingerprint(member) {
   const broad = hasBroadCreatorAccess(member);
   const creatorIds = broad
     ? []
     : Array.from(new Set(assignedCreatorIds(member).map(String).filter(Boolean))).sort();
+  const identity = desktopMemberAuthorizationIdentity(member);
   return JSON.stringify([
-    normalizedAccessEpoch(member?.accessEpoch),
-    String(member?.role || "").toUpperCase(),
-    String(member?.roleKey || "").toLowerCase(),
+    identity.accessEpoch,
+    identity.role,
+    identity.roleKey,
+    identity.directPermissions,
     broad ? "all" : "scoped",
     creatorIds,
   ]);
@@ -51,6 +71,7 @@ async function readCurrentDesktopMemberAuthority({ db, agencyId, userId, memberI
       role: true,
       roleKey: true,
       assignedCreators: true,
+      permissions: true,
       accessEpoch: true,
     },
   });
@@ -87,6 +108,8 @@ async function withStableDesktopCurrentAccess({
 }
 
 module.exports = {
+  stableBooleanRecord,
+  desktopMemberAuthorizationIdentity,
   desktopMemberAuthorityFingerprint,
   desktopAuthorityProof,
   desktopMemberAuthorityRevokedError,

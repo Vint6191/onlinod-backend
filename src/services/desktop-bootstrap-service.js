@@ -2,6 +2,7 @@
 
 const { assignedCreatorIds, hasBroadCreatorAccess } = require("../middleware/automation-permissions");
 const { normalizedAccessEpoch } = require("./access-epoch-service");
+const { resolveEffectivePermissions } = require("./team-access-control");
 const { currentCreatorCatalogGeneration } = require("./creator-human-management-authority-service");
 const {
   desktopMemberAuthorityFingerprint,
@@ -59,6 +60,16 @@ async function listAccessibleCreatorRows({ db, agencyId, member }) {
 
 const CREATOR_CATALOG_SNAPSHOT_ATTEMPTS = 4;
 
+function normalizeEffectivePermissions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const out = {};
+  for (const key of Object.keys(value).sort()) {
+    if (typeof value[key] === "boolean") out[key] = value[key];
+  }
+  return out;
+}
+
+
 function creatorCatalogSnapshotError() {
   const error = new Error("Creator catalog changed continuously while desktop bootstrap was being built");
   error.code = "CREATOR_CATALOG_SNAPSHOT_UNSTABLE";
@@ -82,6 +93,9 @@ async function readStableAccessibleCreatorCatalog({ db, agencyId, userId, member
     });
     const generationBefore = await currentCreatorCatalogGeneration({ db, agencyId });
     const creators = await listAccessibleCreatorRows({ db, agencyId, member: memberBefore });
+    const effectivePermissions = normalizeEffectivePermissions(
+      await resolveEffectivePermissions({ member: memberBefore, db }),
+    );
     const generationAfter = await currentCreatorCatalogGeneration({ db, agencyId });
     const memberAfter = await readCurrentDesktopMemberAuthority({
       db, agencyId, userId: expectedUserId, memberId,
@@ -93,6 +107,9 @@ async function readStableAccessibleCreatorCatalog({ db, agencyId, userId, member
         creators,
         member: memberAfter,
         accessEpoch: normalizedAccessEpoch(memberAfter.accessEpoch),
+        role: String(memberAfter.role || "").toUpperCase() || null,
+        roleKey: String(memberAfter.roleKey || "").toLowerCase() || null,
+        effectivePermissions,
         creatorCatalogGeneration: generationAfter,
       };
     }
@@ -142,7 +159,7 @@ async function buildDesktopBootstrap({ db, agencyId, userId, member, deviceId })
     error.status = 401;
     throw error;
   }
-  const { creators, creatorCatalogGeneration, accessEpoch } = await readStableAccessibleCreatorCatalog({
+  const { creators, creatorCatalogGeneration, accessEpoch, role, roleKey, effectivePermissions } = await readStableAccessibleCreatorCatalog({
     db, agencyId, userId, member,
   });
   return {
@@ -150,6 +167,14 @@ async function buildDesktopBootstrap({ db, agencyId, userId, member, deviceId })
     bootstrapVersion: 1,
     accessEpoch,
     creatorCatalogGeneration,
+    authorization: {
+      accessEpoch,
+      role,
+      roleKey,
+      effectivePermissions,
+      creatorCatalogGeneration,
+      allowedCreatorIds: creators.map((creator) => String(creator.id)),
+    },
     scope: {
       agencyId: String(agencyId),
       userId: String(userId),
@@ -161,6 +186,11 @@ async function buildDesktopBootstrap({ db, agencyId, userId, member, deviceId })
       version: 1,
       accessEpoch,
       creatorCatalogGeneration,
+      authorization: {
+        role,
+        roleKey,
+        effectivePermissions,
+      },
       creators: creators.map(creatorManifestEntry),
     },
   };
@@ -173,6 +203,7 @@ module.exports = {
   readCurrentDesktopMemberAuthority,
   readStableAccessibleCreatorCatalog,
   accessibleCreatorIdSet,
+  normalizeEffectivePermissions,
   creatorManifestEntry,
   buildDesktopBootstrap,
 };

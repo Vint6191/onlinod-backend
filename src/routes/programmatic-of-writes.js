@@ -24,6 +24,7 @@ const {
   closeProgrammaticWriteUnresolved,
   resolveProgrammaticWriteUnresolvedMatched,
   getProgrammaticWrite,
+  inspectProgrammaticWriteByIdempotency,
 } = require("../services/programmatic-of-write-authority-service");
 
 const router = express.Router();
@@ -281,6 +282,30 @@ router.post("/:writeId/resolve-unresolved-matched", async (req, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
     return sendError(res, error, "PROGRAMMATIC_WRITE_RESOLVE_UNRESOLVED_FAILED");
+  }
+});
+
+
+router.get("/by-idempotency", async (req, res) => {
+  try {
+    const input = z.object({
+      creatorId: z.string().min(1).max(180),
+      kind: z.string().min(1).max(80),
+      idempotencyKey: z.string().min(3).max(500),
+      payloadFingerprint: z.string().min(8).max(200),
+      deviceId: z.string().min(1).max(180),
+    }).parse(req.query || {});
+    const { normalized } = await publicKindAccess(req, input.kind, input.creatorId, input.deviceId);
+    return res.json(await inspectProgrammaticWriteByIdempotency({
+      agencyId: req.auth.agencyId,
+      creatorId: input.creatorId,
+      kind: normalized,
+      idempotencyKey: input.idempotencyKey,
+      payloadFingerprint: input.payloadFingerprint,
+    }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+    return sendError(res, error, "PROGRAMMATIC_WRITE_INSPECT_FAILED");
   }
 });
 

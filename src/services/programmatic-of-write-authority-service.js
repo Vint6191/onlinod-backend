@@ -1833,6 +1833,34 @@ async function resolveProgrammaticWriteUnresolvedMatched(input) {
   }, { timeout: 30_000 });
 }
 
+async function inspectProgrammaticWriteByIdempotency({ agencyId, creatorId, kind: kindInput, idempotencyKey: keyInput, payloadFingerprint: fingerprintInput, db = prisma }) {
+  const { key: kind, config } = productKind(kindInput);
+  const normalizedAgencyId = clean(agencyId, 180);
+  const normalizedCreatorId = clean(creatorId, 180);
+  const idempotencyKey = clean(keyInput, 500);
+  const payloadFingerprint = clean(fingerprintInput, 200);
+  if (!normalizedAgencyId || !normalizedCreatorId || !idempotencyKey || !payloadFingerprint) {
+    throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_INSPECT_INVALID", "Programmatic write creator, idempotency key and payload fingerprint are required", 400);
+  }
+  assertProgrammaticIdempotencyNamespace(kind, config, normalizedCreatorId, idempotencyKey);
+  const delivery = await db.automationDelivery.findUnique({ where: { idempotencyKey } });
+  if (!delivery) return { ok: true, delivery: null };
+  const sameIdentity = delivery.agencyId === normalizedAgencyId
+    && delivery.creatorId === normalizedCreatorId
+    && delivery.actionType === config.actionType
+    && delivery.originKind === config.originKind
+    && delivery.moduleKey === config.moduleKey
+    && delivery.executionKind === config.executionKind
+    && delivery.reconciliationKind === config.reconciliationKind;
+  if (!sameIdentity) {
+    throw new ProgrammaticOfWriteAuthorityError("IDEMPOTENCY_CONFLICT", "Idempotency key is already bound to another programmatic write authority identity", 409);
+  }
+  if (clean(delivery.payloadFingerprint, 200) !== payloadFingerprint) {
+    throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_PAYLOAD_MISMATCH", "Programmatic write payload fingerprint does not match the durable authority", 409);
+  }
+  return { ok: true, delivery: publicDelivery(delivery) };
+}
+
 async function getProgrammaticWrite({ agencyId, userId, memberId, accessEpoch, creatorId, writeId, db = prisma }) {
   const delivery = await db.automationDelivery.findFirst({ where: { id: writeId, agencyId, creatorId, originKind: { not: "AUTOMATION" } } });
   if (!delivery) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_FOUND", "Programmatic write not found", 404);
@@ -1871,4 +1899,5 @@ module.exports = {
   resolveProgrammaticWriteUnresolvedMatched,
   sweepExpiredProgrammaticWriteLeases,
   getProgrammaticWrite,
+  inspectProgrammaticWriteByIdempotency,
 };

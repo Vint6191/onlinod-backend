@@ -31,6 +31,7 @@ function fixture(rows, memberAuthority) {
     role: "OWNER",
     roleKey: "owner",
     assignedCreators: null,
+    permissions: {},
     accessEpoch: 12,
     ...(memberAuthority || {}),
   };
@@ -40,6 +41,9 @@ function fixture(rows, memberAuthority) {
       agencyMember: {
         findFirst: async (input) => { calls.push({ memberAuthority: input }); return { ...authority }; },
       },
+      agencySubPermissionOverride: { findMany: async () => [] },
+      agencyRoleOverride: { findUnique: async () => null },
+      agencyCustomRole: { findUnique: async () => null },
       creatorAccount: {
         findMany: async (input) => {
           calls.push({ creators: input });
@@ -65,6 +69,11 @@ test("desktop bootstrap is user-scoped, batch, metadata-only and carries accessE
 
   assert.equal(fx.calls.filter((entry) => entry.creators).length, 1, "bootstrap creator retrieval must be one batch query, never a per-creator loop");
   assert.equal(result.accessEpoch, 12);
+  assert.equal(result.authorization.accessEpoch, 12);
+  assert.equal(result.authorization.role, "OWNER");
+  assert.equal(result.authorization.roleKey, "owner");
+  assert.deepEqual(result.authorization.allowedCreatorIds, ["a", "b"]);
+  assert.equal(result.authorization.effectivePermissions["content.manage_vault"], true);
   assert.deepEqual(result.scope, { agencyId: "agency-1", userId: "user-1", memberId: "member-1", deviceId: "device-a" });
   assert.equal(result.creators.length, 2);
   assert.equal(result.manifest.creators.length, 2);
@@ -108,6 +117,9 @@ test("desktop bootstrap rejects stale middleware membership and returns the fres
   ];
   const db = {
     agencyMember: { async findFirst() { return { ...states[Math.min(memberRead++, states.length - 1)] }; } },
+    agencySubPermissionOverride: { findMany: async () => [] },
+    agencyRoleOverride: { findUnique: async () => null },
+    agencyCustomRole: { findUnique: async () => null },
     creatorAccount: {
       async findMany(input) {
         const ids = input.where?.id?.in || [];
@@ -121,6 +133,30 @@ test("desktop bootstrap rejects stale middleware membership and returns the fres
   });
   assert.equal(result.accessEpoch, 10);
   assert.deepEqual(result.creators.map((row) => row.id), ["b"]);
+});
+
+test("desktop bootstrap never publishes a new accessEpoch with permissions from the previous member revision", async () => {
+  const rows = [creator("a")];
+  let read = 0;
+  const states = [
+    { id: "member-4", userId: "user-4", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: { creatorIds: ["a"] }, permissions: { "content.manage_vault": true }, accessEpoch: 20 },
+    { id: "member-4", userId: "user-4", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: { creatorIds: ["a"] }, permissions: { "content.manage_vault": false }, accessEpoch: 21 },
+    { id: "member-4", userId: "user-4", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: { creatorIds: ["a"] }, permissions: { "content.manage_vault": false }, accessEpoch: 21 },
+    { id: "member-4", userId: "user-4", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: { creatorIds: ["a"] }, permissions: { "content.manage_vault": false }, accessEpoch: 21 },
+  ];
+  const db = {
+    agencyMember: { async findFirst() { return { ...states[Math.min(read++, states.length - 1)] }; } },
+    agencySubPermissionOverride: { findMany: async () => [] },
+    agencyRoleOverride: { findUnique: async () => null },
+    agencyCustomRole: { findUnique: async () => null },
+    creatorAccount: { async findMany() { return rows; } },
+  };
+  const result = await buildDesktopBootstrap({
+    db, agencyId: "agency-1", userId: "user-4", deviceId: "device-d",
+    member: states[0],
+  });
+  assert.equal(result.authorization.accessEpoch, 21);
+  assert.equal(result.authorization.effectivePermissions["content.manage_vault"], false);
 });
 
 test("manifest normalizes absent session/key/network without inventing secrets", () => {
