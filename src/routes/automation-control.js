@@ -4,6 +4,9 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { requireAuthDevice } = require("../middleware/auth");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const { capabilityFreshnessWindow } = require("../services/capability-freshness-authority-service");
+const { withRealtimeIngestGenerationFence } = require("../services/realtime-ingest-generation-fence-service");
 const { canUsePermission } = require("../services/team-access-control");
 const { automationCreatorParamRequired, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { attachAutomationAudit } = require("../middleware/automation-audit");
@@ -429,47 +432,102 @@ router.post("/bumps/:creatorId/plan-auto", seniorRequired, async (req, res) => {
     return serviceError(res, error, "BUMPS_PLAN_AUTO_FAILED");
   }
 });
-router.post("/bumps/:creatorId/events", seniorRequired, async (req, res) => {
+const runtimeEventSchema = z.object({
+  deviceId: z.string().min(1).max(160),
+  accessEpoch: z.number().int().min(0),
+  events: z.array(z.record(z.unknown())).max(500),
+});
+
+async function handleBumpRuntimeEvents(req, res) {
   try {
-    const input = z.object({
-      deviceId: z.string().min(1).max(160),
-      events: z.array(z.record(z.unknown())).max(500),
-    }).parse(req.body || {});
+    const input = runtimeEventSchema.parse(req.body || {});
     // Defense in depth: even an older desktop build may submit the full
     // normalized WS event. Strip message text, media and profile payloads
     // before any Automation service can observe them.
     const safeEvents = sanitizeAutomationRuntimeEvents(input.events, 500);
-    const freshAfter = new Date(Date.now() - 5 * 60_000);
-    const binding = await prisma.deviceCreatorBinding.findFirst({
-      where: {
-        agencyId: req.auth.agencyId,
-        creatorId: req.params.creatorId,
-        deviceId: input.deviceId,
-        status: "ACTIVE",
-        realtimeReady: true,
-        lastSeenAt: { gte: freshAfter },
-        device: { agencyId: req.auth.agencyId, userId: req.auth.userId, lastSeenAt: { gte: freshAfter } },
-      },
-      select: { id: true },
-    });
-    if (!binding) {
-      return res.status(403).json({
+    const memberAccessEpoch = req.automationMember?.accessEpoch;
+    if (!Number.isInteger(memberAccessEpoch)) {
+      return res.status(409).json({
         ok: false,
-        code: "RUNTIME_EVENT_DEVICE_NOT_READY",
-        error: "Runtime events require a fresh active device/creator binding",
+        code: "RUNTIME_EVENT_AUTHORIZATION_GENERATION_REQUIRED",
+        error: "Runtime events require a current member authorization generation",
       });
     }
+    // Runtime events are CURRENT operational automation triggers, not replayable
+    // historical facts. The receive-time Desktop generation must equal the
+    // server generation that admits and commits this batch. This also rejects an
+    // in-flight old-generation request that reaches a replica after accessEpoch
+    // has already advanced.
+    if (input.accessEpoch !== memberAccessEpoch) {
+      return res.status(409).json({
+        ok: false,
+        code: "RUNTIME_EVENT_AUTHORIZATION_GENERATION_STALE",
+        error: "Runtime event authorization generation is stale",
+      });
+    }
+    const assertRealtimeBinding = async (db) => {
+      const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
+      const freshnessWindow = capabilityFreshnessWindow(authorityNow, 5 * 60_000);
+      const binding = await db.deviceCreatorBinding.findFirst({
+        where: {
+          agencyId: req.auth.agencyId,
+          creatorId: req.params.creatorId,
+          deviceId: input.deviceId,
+          status: "ACTIVE",
+          realtimeReady: true,
+          accessEpoch: input.accessEpoch,
+          lastSeenAt: freshnessWindow,
+          device: { agencyId: req.auth.agencyId, userId: req.auth.userId, lastSeenAt: freshnessWindow },
+        },
+        select: { id: true },
+      });
+      if (!binding) {
+        throw Object.assign(new Error("Runtime events require a fresh active device/creator binding"), {
+          code: "RUNTIME_EVENT_DEVICE_NOT_READY",
+          status: 403,
+        });
+      }
+      return binding;
+    };
+
+    // Fast admission rejects stale reporters before event classification. Every
+    // durable event section repeats this check inside a member-generation
+    // transaction so accessEpoch cannot change between admission and commit.
+    try {
+      await assertRealtimeBinding(prisma);
+    } catch (error) {
+      return res.status(Number(error?.status) || 403).json({ ok: false, code: error?.code || "RUNTIME_EVENT_DEVICE_NOT_READY", error: error?.message || "Runtime event device is not ready" });
+    }
+    const commitFence = (work) => withRealtimeIngestGenerationFence({
+      db: prisma,
+      agencyId: req.auth.agencyId,
+      userId: req.auth.userId,
+      memberId: req.automationMember?.id,
+      accessEpoch: input.accessEpoch,
+      creatorId: req.params.creatorId,
+      work: async ({ tx }) => {
+        await assertRealtimeBinding(tx);
+        return work(tx);
+      },
+    });
     return res.json(await processRuntimeEvents({
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
       userId: req.auth.userId,
       events: safeEvents,
+      commitFence,
     }));
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "BUMPS_EVENTS_FAILED");
   }
-});
+}
+
+// Keep the legacy path mounted but fail-closed: old Desktop builds do not send
+// accessEpoch and therefore fail schema validation on a new backend. New Desktop
+// uses the versioned path, so new Desktop -> old Backend is a 404/no mutation.
+router.post("/bumps/:creatorId/events", seniorRequired, handleBumpRuntimeEvents);
+router.post("/bumps/:creatorId/events/current-authorized", seniorRequired, handleBumpRuntimeEvents);
 router.post("/bumps/:creatorId/reply-scan", seniorRequired, async (req, res) => {
   try {
     const input = z.object({ limit: z.number().int().min(1).max(500).optional() }).parse(req.body || {});

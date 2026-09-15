@@ -566,3 +566,80 @@ test("validated COMPLETED relay proof protects live CUSTOM media before asset/su
   assert.equal(deleted, 0, "proof-owned live CUSTOM metadata must not be deleted before projection repair");
   assert.deepEqual(assets[0].folderIds, ["vault-pinned", "other"]);
 });
+
+test("INT2.8 usage commit guard runs inside each source transaction before media mutation", async () => {
+  const { db, assets, transactionCalls, usageLocks } = usageDb({ rawSql: true });
+  const events = [];
+  const result = await replaceUsageSources({
+    agencyId: AGENCY_ID,
+    creatorId: CREATOR_ID,
+    db,
+    commitGuard: async (tx) => {
+      assert.equal(tx, db);
+      assert.equal(usageLocks.length, events.filter((event) => event === "guard").length);
+      events.push("guard");
+    },
+    sources: [
+      {
+        sourceKey: "guard-a",
+        sourceRevision: "2026-09-14T20:00:00.000Z",
+        capturedAt: "2026-09-14T20:00:00.000Z",
+        items: [{ mediaId: "m1", sentCount: 1, soldCount: 0, notOpenedCount: 0, freeCount: 1, revenueCents: 0, uniqueBuyers: 0 }],
+      },
+      {
+        sourceKey: "guard-b",
+        sourceRevision: "2026-09-14T20:01:00.000Z",
+        capturedAt: "2026-09-14T20:01:00.000Z",
+        items: [{ mediaId: "m1", sentCount: 2, soldCount: 0, notOpenedCount: 0, freeCount: 2, revenueCents: 0, uniqueBuyers: 0 }],
+      },
+    ],
+  });
+
+  assert.equal(result.acceptedSources, 2);
+  assert.deepEqual(events, ["guard", "guard"]);
+  assert.equal(transactionCalls.length, 2);
+  assert.equal(usageLocks.length, 2);
+  assert.equal(assets.get("m1").sentCount, 3);
+});
+
+test("INT2.8 authorization generation change between source commits fails closed without undoing an already valid source", async () => {
+  const { db, assets, contributions, usageLocks } = usageDb({ rawSql: true });
+  let guards = 0;
+  await assert.rejects(
+    () => replaceUsageSources({
+      agencyId: AGENCY_ID,
+      creatorId: CREATOR_ID,
+      db,
+      commitGuard: async () => {
+        guards += 1;
+        if (guards === 2) {
+          const error = new Error("stale authorization generation");
+          error.code = "EXECUTION_ACCESS_EPOCH_STALE";
+          error.status = 409;
+          throw error;
+        }
+      },
+      sources: [
+        {
+          sourceKey: "generation-a",
+          sourceRevision: "2026-09-14T21:00:00.000Z",
+          capturedAt: "2026-09-14T21:00:00.000Z",
+          items: [{ mediaId: "m1", sentCount: 4, soldCount: 0, notOpenedCount: 0, freeCount: 4, revenueCents: 0, uniqueBuyers: 0 }],
+        },
+        {
+          sourceKey: "generation-b",
+          sourceRevision: "2026-09-14T21:01:00.000Z",
+          capturedAt: "2026-09-14T21:01:00.000Z",
+          items: [{ mediaId: "m1", sentCount: 8, soldCount: 0, notOpenedCount: 0, freeCount: 8, revenueCents: 0, uniqueBuyers: 0 }],
+        },
+      ],
+    }),
+    (error) => error?.code === "EXECUTION_ACCESS_EPOCH_STALE" && error?.status === 409,
+  );
+
+  assert.equal(guards, 2);
+  assert.equal(usageLocks.length, 1, "stale generation must fail before the second media advisory lock");
+  assert.equal(assets.get("m1").sentCount, 4);
+  assert.equal(contributions.some((row) => row.sourceKey === "generation-a"), true);
+  assert.equal(contributions.some((row) => row.sourceKey === "generation-b"), false);
+});

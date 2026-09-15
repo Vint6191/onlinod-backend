@@ -158,6 +158,68 @@ function isCanonicalV13(event) {
     && cleanString(event.source, 80) === TEAM_V13_SOURCE;
 }
 
+function authorizationGenerationProof(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const authorizationScopeIncarnation = cleanString(value.authorizationScopeIncarnation, 220);
+  const accessEpoch = Number(value.accessEpoch);
+  const creatorCatalogGeneration = Number(value.creatorCatalogGeneration);
+  if (!authorizationScopeIncarnation || !Number.isInteger(accessEpoch) || accessEpoch < 0
+      || !Number.isInteger(creatorCatalogGeneration) || creatorCatalogGeneration < 0) return null;
+  return { authorizationScopeIncarnation, accessEpoch, creatorCatalogGeneration };
+}
+
+function sameAuthorizationGenerationProof(left, right) {
+  return Boolean(left && right
+    && left.authorizationScopeIncarnation === right.authorizationScopeIncarnation
+    && left.accessEpoch === right.accessEpoch
+    && left.creatorCatalogGeneration === right.creatorCatalogGeneration);
+}
+
+function terminalPerformanceClosure(event) {
+  const eventKind = cleanString(event?.eventKind, 80)?.toUpperCase() || "";
+  if (eventKind !== "COVERAGE_ENDED" && eventKind !== "DIALOG_SESSION") return null;
+  const metadata = event?.metadata && typeof event.metadata === "object" && !Array.isArray(event.metadata) ? event.metadata : null;
+  const marker = metadata?.authorizationTerminalClosure;
+  if (!marker || typeof marker !== "object" || Array.isArray(marker) || Number(marker.version) !== 1) return null;
+  const startedUnder = authorizationGenerationProof(marker.startedUnder);
+  const coverageId = cleanString(event.coverageId || metadata?.coverageId, 220);
+  const boundaryOffsetSeconds = Number(marker.boundaryOffsetSeconds);
+  if (!startedUnder || !coverageId || !Number.isFinite(boundaryOffsetSeconds) || boundaryOffsetSeconds < 0) return null;
+  return {
+    eventKind,
+    coverageId,
+    startedUnder,
+    boundaryOffsetSeconds: Math.min(24 * 60 * 60, Math.round(boundaryOffsetSeconds)),
+  };
+}
+
+async function hasDurableTerminalClosureProof({ db, agencyId, deviceId, member, creatorId, event }) {
+  const closure = terminalPerformanceClosure(event);
+  if (!closure || !member?.id || !member?.userId) return false;
+  const start = await db.teamActivityEvent.findFirst({
+    where: {
+      agencyId,
+      deviceId,
+      memberId: member.id,
+      userId: member.userId,
+      creatorId,
+      coverageId: closure.coverageId,
+      eventKind: "COVERAGE_STARTED",
+      actionSource: "MANUAL",
+      lifecycle: "OBSERVED",
+    },
+    orderBy: [{ ts: "asc" }, { id: "asc" }],
+    select: { extra: true, startedAt: true, ts: true },
+  });
+  const startMetadata = start?.extra?.metadata && typeof start.extra.metadata === "object" && !Array.isArray(start.extra.metadata)
+    ? start.extra.metadata
+    : null;
+  const startedUnder = authorizationGenerationProof(startMetadata?.authorizationGeneration);
+  const coverageStartedAt = optionalDate(start?.startedAt) || optionalDate(start?.ts);
+  if (!sameAuthorizationGenerationProof(startedUnder, closure.startedUnder) || !coverageStartedAt) return null;
+  return { closure, coverageStartedAt };
+}
+
 function telemetryAdmissionError(code, message, status = 403) {
   const error = new Error(message);
   error.code = code;
@@ -238,10 +300,27 @@ function activitySemanticEventKey({ eventKind, creatorId, accountId, messageId, 
   return null;
 }
 
-function canonicalHumanSessionTimes({ eventKind, authorityNow, durationSeconds, rawStartedAt, rawEndedAt }) {
+function canonicalHumanSessionTimes({
+  eventKind, authorityNow, durationSeconds, rawStartedAt, rawEndedAt, terminalClosureProof = null, rawMetadata = null,
+}) {
   if (!HUMAN_ACTIVITY_KINDS.has(eventKind)) return { startedAt: rawStartedAt, endedAt: rawEndedAt };
   const at = new Date(authorityNow);
   if (eventKind === "COVERAGE_STARTED") return { startedAt: at, endedAt: null };
+
+  if (terminalClosureProof && (eventKind === "COVERAGE_ENDED" || eventKind === "DIALOG_SESSION")) {
+    const coverageStartedAt = optionalDate(terminalClosureProof.coverageStartedAt);
+    const boundaryOffsetSeconds = Math.max(0, Math.min(24 * 60 * 60, Number(terminalClosureProof.closure?.boundaryOffsetSeconds) || 0));
+    if (coverageStartedAt) {
+      const terminalAt = new Date(Math.min(at.getTime(), coverageStartedAt.getTime() + boundaryOffsetSeconds * 1000));
+      if (eventKind === "COVERAGE_ENDED") return { startedAt: coverageStartedAt, endedAt: terminalAt };
+      const wallSeconds = Math.max(0, Math.min(24 * 60 * 60, Number(rawMetadata?.wallSeconds ?? durationSeconds) || 0));
+      return {
+        startedAt: new Date(Math.max(coverageStartedAt.getTime(), terminalAt.getTime() - wallSeconds * 1000)),
+        endedAt: terminalAt,
+      };
+    }
+  }
+
   if (eventKind === "COVERAGE_ENDED" || eventKind === "DIALOG_SESSION") {
     const seconds = Math.max(0, Math.min(24 * 60 * 60, Number(durationSeconds) || 0));
     return { startedAt: new Date(at.getTime() - seconds * 1000), endedAt: at };
@@ -249,7 +328,7 @@ function canonicalHumanSessionTimes({ eventKind, authorityNow, durationSeconds, 
   return { startedAt: null, endedAt: null };
 }
 
-function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authenticatedMember, authorityNow }) {
+function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authenticatedMember, authorityNow, terminalClosureProof = null }) {
   const eventKind = cleanString(event.eventKind, 80)?.toUpperCase() || "";
   const actionSource = cleanString(event.actionSource, 40)?.toUpperCase() || "";
   const lifecycle = cleanString(event.lifecycle, 40)?.toUpperCase() || "";
@@ -324,6 +403,8 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
     durationSeconds,
     rawStartedAt: optionalDate(event.startedAt),
     rawEndedAt: optionalDate(event.endedAt),
+    terminalClosureProof,
+    rawMetadata: event.metadata,
   });
   const canonicalCreatorId = creator?.id || null;
   const canonicalAccountId = cleanString(event.accountId || event.creatorId, 160);
@@ -471,7 +552,28 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
         });
         const creator = await resolveCreator({ agencyId, event, strict: true, db: tx });
         if (!creator) return { rejected: "creator_not_found" };
-        if (!canAccessCreator(liveMember, creator.id)) return { rejected: "creator_access_forbidden" };
+        const terminalClosure = terminalPerformanceClosure(event);
+        const terminalClosureProof = terminalClosure
+          ? await hasDurableTerminalClosureProof({
+            db: tx,
+            agencyId,
+            deviceId,
+            member: liveMember,
+            creatorId: creator.id,
+            event,
+          })
+          : null;
+        if (terminalClosure && !terminalClosureProof) return { rejected: "authorization_terminal_closure_unproven" };
+        if (!canAccessCreator(liveMember, creator.id)) {
+          // Only COVERAGE_ENDED can bypass a later creator revoke: the durable
+          // matching COVERAGE_STARTED row proves an already-existing server
+          // session that this event can only terminate. DIALOG_SESSION has no
+          // durable START row of its own, so accepting it after revoke would
+          // create a new performance record rather than close proven state.
+          if (!terminalClosureProof || terminalClosureProof.closure.eventKind !== "COVERAGE_ENDED") {
+            return { rejected: "creator_access_forbidden" };
+          }
+        }
 
         const authorityNow = await dbAuthorityNow({ db: tx });
         const result = normalizeCanonicalCore({
@@ -481,6 +583,7 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
           creator,
           authenticatedMember: liveMember,
           authorityNow,
+          terminalClosureProof,
         });
         if (!result.row) return { rejected: result.reason || "invalid_contract" };
         const row = result.row;

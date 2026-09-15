@@ -4,6 +4,7 @@ const prisma = require("../prisma");
 const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const { withHeartbeatMemberGeneration } = require("../services/device-heartbeat-generation-service");
 const { updateObservationFromHeartbeat, recordRealtimeObservationPing, realtimeFrameSampleAt } = require("../services/team-observation-service");
 const {
   OFFLINE_DIALOG_RECOVERY_GAP_MS,
@@ -15,6 +16,13 @@ const {
 
 const router = express.Router();
 router.use(authRequired);
+
+
+function optionalNonNegativeInt(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
+}
 
 const heartbeatSchema = z.object({
   deviceId: z.string().min(3).max(160),
@@ -49,7 +57,7 @@ const heartbeatSchema = z.object({
 });
 
 
-async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowedCreatorIds = null, now = new Date() }) {
+async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowedCreatorIds = null, currentAccessEpoch = null, now = new Date(), db = prisma }) {
   const list = Array.isArray(accounts) ? accounts : [];
   let accepted = 0;
   let rejected = 0;
@@ -74,7 +82,7 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowed
       continue;
     }
 
-    const creator = await prisma.creatorAccount.findFirst({
+    const creator = await db.creatorAccount.findFirst({
       where: { agencyId, deletedAt: null, status: "READY", OR: or },
       select: { id: true },
     });
@@ -84,13 +92,18 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowed
       continue;
     }
 
-    const sessionReadReady = account?.sessionReadReady === true;
+    const accessEpoch = optionalNonNegativeInt(account?.accessEpoch);
+    const expectedAccessEpoch = optionalNonNegativeInt(currentAccessEpoch);
+    const generationCurrent = expectedAccessEpoch !== null && accessEpoch === expectedAccessEpoch;
+    // A device heartbeat proves process liveness. Creator capability telemetry is
+    // revision-sensitive and must not be published from a stale member access
+    // generation even when the creator remains inside the newly allowed scope.
+    const sessionReadReady = generationCurrent && account?.sessionReadReady === true;
     const sessionWriteReady = sessionReadReady && account?.sessionWriteReady === true;
-    const realtimeReady = account?.realtimeHealthy === true;
-    const pageLocalReady = account?.pageLocalReady === true;
-    const browserMaterialized = account?.browserMaterialized === true;
+    const realtimeReady = generationCurrent && account?.realtimeHealthy === true;
+    const pageLocalReady = generationCurrent && account?.pageLocalReady === true;
+    const browserMaterialized = generationCurrent && account?.browserMaterialized === true;
     const browserPresentable = browserMaterialized && account?.browserPresentable === true;
-    const accessEpoch = Number.isInteger(Number(account?.accessEpoch)) ? Number(account.accessEpoch) : null;
     const sessionProofEpoch = Number.isInteger(Number(account?.sessionProofEpoch)) ? Number(account.sessionProofEpoch) : null;
     const canonicalRevision = Number.isInteger(Number(account?.canonicalRevision)) ? Number(account.canonicalRevision) : null;
     const networkRevision = Number.isInteger(Number(account?.networkRevision)) ? Number(account.networkRevision) : null;
@@ -100,11 +113,11 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowed
     // current AgencyMember before this function was called. Realtime coverage
     // is still based only on the durable inbound-frame observation timestamp,
     // observation timestamp, and only when a healthy listener comes back.
-    const realtimeFrameAt = account?.realtimeHealthy === true
+    const realtimeFrameAt = realtimeReady
       ? realtimeFrameSampleAt(account, now)
       : null;
     if (realtimeFrameAt) {
-      const observation = await prisma.teamObservationState.findUnique({
+      const observation = await db.teamObservationState.findUnique({
         where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
         select: { lastRealtimeEventAt: true },
       }).catch(() => null);
@@ -116,7 +129,7 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowed
       }
     }
 
-    await prisma.deviceCreatorBinding.upsert({
+    await db.deviceCreatorBinding.upsert({
       where: { deviceId_creatorId: { deviceId, creatorId: creator.id } },
       create: {
         deviceId,
@@ -177,7 +190,7 @@ async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowed
   }
 
   // Mark bindings not seen in this heartbeat as stale instead of deleting.
-  await prisma.deviceCreatorBinding.updateMany({
+  await db.deviceCreatorBinding.updateMany({
     where: {
       agencyId,
       deviceId,
@@ -212,51 +225,57 @@ router.post("/heartbeat", async (req, res) => {
     });
     const agencyId = input.agencyId || input.activeAgencyId || req.auth.agencyId;
 
-    let heartbeatMembership = req.auth.membership;
-    if (agencyId !== req.auth.agencyId) {
-      heartbeatMembership = await prisma.agencyMember.findFirst({
-        where: { userId: req.auth.userId, agencyId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
-      });
-
-      if (!heartbeatMembership) {
-        return res.status(403).json({ ok: false, code: "DEVICE_AGENCY_FORBIDDEN", error: "User has no access to this agency" });
-      }
-    }
-
-    const creatorScope = await allowedCreatorScope({ agencyId, member: heartbeatMembership });
-    const allowedCreatorIds = creatorScope.broad ? null : new Set(creatorScope.creatorIds);
-    // PostgreSQL receipt time is the shared freshness authority for device and
-    // creator capability telemetry. Replica wall clocks are provenance only.
     const heartbeatAt = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
 
-    const device = await prisma.workerDevice.upsert({
-      where: { id: boundDeviceId },
-      create: {
-        id: boundDeviceId,
-        agencyId,
-        userId: req.auth.userId,
-        deviceName: input.deviceName || null,
-        platform: input.platform || null,
-        appVersion: input.appVersion || null,
-        lastSeenAt: heartbeatAt,
-      },
-      update: {
-        agencyId,
-        userId: req.auth.userId,
-        deviceName: input.deviceName || undefined,
-        platform: input.platform || undefined,
-        appVersion: input.appVersion || undefined,
-        lastSeenAt: heartbeatAt,
+    // Device liveness and creator capability remain different facts, but a move
+    // of the device row into another agency is itself agency-scoped state. Commit
+    // the device row and revision-sensitive creator capability under the same
+    // current-membership generation lock. Stale reported account accessEpoch can
+    // still record liveness while all creator capabilities remain false; an
+    // inactive/revoked target membership cannot mutate device.agencyId at all.
+    const capabilityCommit = await withHeartbeatMemberGeneration({
+      agencyId,
+      userId: req.auth.userId,
+      memberId: agencyId === req.auth.agencyId ? (req.auth.membership?.id || null) : null,
+      work: async ({ tx, member, accessEpoch }) => {
+        const device = await tx.workerDevice.upsert({
+          where: { id: boundDeviceId },
+          create: {
+            id: boundDeviceId,
+            agencyId,
+            userId: req.auth.userId,
+            deviceName: input.deviceName || null,
+            platform: input.platform || null,
+            appVersion: input.appVersion || null,
+            lastSeenAt: heartbeatAt,
+          },
+          update: {
+            agencyId,
+            userId: req.auth.userId,
+            deviceName: input.deviceName || undefined,
+            platform: input.platform || undefined,
+            appVersion: input.appVersion || undefined,
+            lastSeenAt: heartbeatAt,
+          },
+        });
+        const creatorScope = await allowedCreatorScope({ agencyId, member, db: tx });
+        const allowedCreatorIds = creatorScope.broad ? null : new Set(creatorScope.creatorIds);
+        const bindings = await syncDeviceCreatorBindings({
+          agencyId,
+          deviceId: boundDeviceId,
+          accounts: input.accounts,
+          allowedCreatorIds,
+          currentAccessEpoch: accessEpoch,
+          now: heartbeatAt,
+          db: tx,
+        });
+        return { device, bindings, accessEpoch };
       },
     });
 
-    const bindings = await syncDeviceCreatorBindings({
-      agencyId,
-      deviceId: boundDeviceId,
-      accounts: input.accounts,
-      allowedCreatorIds,
-      now: heartbeatAt,
-    });
+    const device = capabilityCommit.device;
+    const bindings = capabilityCommit.bindings;
+    const currentAccessEpoch = capabilityCommit.accessEpoch;
 
     const dialogRecovery = [];
     const recoveryDecisions = new Map();
@@ -292,36 +311,117 @@ router.post("/heartbeat", async (req, res) => {
     const realtimeAccounts = realtimeBindings.map((entry) => entry.account);
     let observation = null;
     try {
-      // Notification catch-up and dialog recovery use the same truthful
-      // realtime coverage set. A merely loaded/authenticated tab no longer
-      // masks a dead WebSocket.
-      observation = await updateObservationFromHeartbeat({
+      observation = await withHeartbeatMemberGeneration({
         agencyId,
-        deviceId: boundDeviceId,
-        accounts: realtimeAccounts,
+        userId: req.auth.userId,
+        memberId: agencyId === req.auth.agencyId ? (req.auth.membership?.id || null) : null,
+        expectedAccessEpoch: currentAccessEpoch,
+        work: async ({ tx }) => {
+          // Notification catch-up and dialog recovery use the same truthful
+          // realtime coverage set. This second generation fence is intentional:
+          // offline-recovery scheduling above may take time, so a revision change
+          // during that middle phase must prevent stale coverage publication.
+          const nextObservation = await updateObservationFromHeartbeat({
+            agencyId,
+            deviceId: boundDeviceId,
+            accounts: realtimeAccounts,
+            now: heartbeatAt,
+            db: tx,
+          });
+          const realtimePings = [];
+          for (const entry of realtimeBindings) {
+            const decision = recoveryDecisions.get(entry.creatorId) || null;
+            realtimePings.push(await recordRealtimeObservationPing({
+              agencyId,
+              deviceId: boundDeviceId,
+              account: entry.account,
+              now: heartbeatAt,
+              advanceRealtimeCoverage: !shouldPreserveRealtimeCoverage(decision),
+              db: tx,
+            }));
+          }
+          nextObservation.realtimeHealthy = realtimePings.filter((item) => item?.ok).length;
+          nextObservation.realtimeCoverageAdvanced = realtimePings.filter((item) => item?.coverageAdvanced).length;
+          nextObservation.realtimeCoverageFenced = realtimePings.filter((item) => item?.ok && !item?.coverageAdvanced).length;
+          return nextObservation;
+        },
       });
-      const realtimePings = [];
-      for (const entry of realtimeBindings) {
-        const decision = recoveryDecisions.get(entry.creatorId) || null;
-        realtimePings.push(await recordRealtimeObservationPing({
-          agencyId,
-          deviceId: boundDeviceId,
-          account: entry.account,
-          now: heartbeatAt,
-          // lastRealtimeEventAt means contiguous, reconciled coverage. A live
-          // WS can be healthy again while an older offline hole is paused,
-          // cancelled, running or waiting to be scheduled. Preserve the old
-          // boundary until that hole is actually settled.
-          advanceRealtimeCoverage: !shouldPreserveRealtimeCoverage(decision),
-        }));
-      }
-      observation.realtimeHealthy = realtimePings.filter((item) => item?.ok).length;
-      observation.realtimeCoverageAdvanced = realtimePings.filter((item) => item?.coverageAdvanced).length;
-      observation.realtimeCoverageFenced = realtimePings.filter((item) => item?.ok && !item?.coverageAdvanced).length;
     } catch (err) {
-      console.warn("[devices/heartbeat] observation update failed:", err?.message || err);
-      observation = { ok: false, code: "OBSERVATION_UPDATE_FAILED" };
+      if (err?.code === "DEVICE_HEARTBEAT_ACCESS_EPOCH_STALE") {
+        observation = { ok: false, code: "OBSERVATION_ACCESS_EPOCH_STALE" };
+      } else {
+        console.warn("[devices/heartbeat] observation update failed:", err?.message || err);
+        observation = { ok: false, code: "OBSERVATION_UPDATE_FAILED" };
+      }
     }
+
+    // Revision correctness is state-based. DeviceCommand remains only a wakeup
+    // hint: every successful heartbeat returns the current canonical session
+    // manifest for creators that this authenticated membership may access. No
+    // encrypted payload, cookie value, IV/tag or credential hash is exposed.
+    const requestedCreatorIds = Array.from(new Set((input.accounts || [])
+      .flatMap((account) => [account?.creatorId, account?.accountId])
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)))
+      .slice(0, 10000);
+    const manifestRows = await withHeartbeatMemberGeneration({
+      agencyId,
+      userId: req.auth.userId,
+      memberId: agencyId === req.auth.agencyId ? (req.auth.membership?.id || null) : null,
+      work: async ({ tx, member }) => {
+        const manifestScope = await allowedCreatorScope({ agencyId, member, db: tx });
+        const manifestAllowedCreatorIds = manifestScope.broad ? null : new Set(manifestScope.creatorIds);
+        const scopedCreatorIds = manifestAllowedCreatorIds
+          ? requestedCreatorIds.filter((id) => manifestAllowedCreatorIds.has(id))
+          : requestedCreatorIds;
+        return scopedCreatorIds.length ? tx.creatorAccount.findMany({
+          where: {
+            agencyId,
+            deletedAt: null,
+            id: { in: scopedCreatorIds },
+          },
+          select: {
+            id: true,
+            remoteId: true,
+            sessionState: {
+              select: {
+                status: true,
+                revision: true,
+                payloadVersion: true,
+                platformUserId: true,
+                capturedByDeviceId: true,
+                updatedAt: true,
+              },
+            },
+            networkProfile: {
+              select: {
+                mode: true,
+                proxyEndpointId: true,
+                version: true,
+                updatedAt: true,
+              },
+            },
+          },
+          take: 10000,
+        }) : [];
+      },
+    });
+    const creatorSessions = manifestRows.map((creator) => ({
+      creatorId: creator.id,
+      revision: creator.sessionState?.revision || 0,
+      status: creator.sessionState?.status || "MISSING",
+      payloadVersion: creator.sessionState?.payloadVersion || null,
+      platformUserId: creator.sessionState?.platformUserId || creator.remoteId || null,
+      capturedByDeviceId: creator.sessionState?.capturedByDeviceId || null,
+      updatedAt: creator.sessionState?.updatedAt || null,
+    }));
+    const creatorNetworks = manifestRows.map((creator) => ({
+      creatorId: creator.id,
+      mode: creator.networkProfile?.mode || "DIRECT",
+      version: creator.networkProfile?.version || 0,
+      proxyEndpointId: creator.networkProfile?.proxyEndpointId || null,
+      updatedAt: creator.networkProfile?.updatedAt || null,
+    }));
 
     const commands = await prisma.deviceCommand.findMany({
       where: {
@@ -349,65 +449,6 @@ router.post("/heartbeat", async (req, res) => {
       if (Array.isArray(payload.creatorIds)) revokedCreatorIds.push(...payload.creatorIds.map(String));
       if (Array.isArray(payload.partitions)) revokedPartitions.push(...payload.partitions.map(String));
     }
-
-    // Revision correctness is state-based. DeviceCommand remains only a wakeup
-    // hint: every successful heartbeat returns the current canonical session
-    // manifest for creators that this authenticated membership may access. No
-    // encrypted payload, cookie value, IV/tag or credential hash is exposed.
-    const requestedCreatorIds = Array.from(new Set((input.accounts || [])
-      .flatMap((account) => [account?.creatorId, account?.accountId])
-      .map((value) => String(value || "").trim())
-      .filter(Boolean)))
-      .slice(0, 10000);
-    const scopedCreatorIds = allowedCreatorIds
-      ? requestedCreatorIds.filter((id) => allowedCreatorIds.has(id))
-      : requestedCreatorIds;
-    const manifestRows = scopedCreatorIds.length ? await prisma.creatorAccount.findMany({
-      where: {
-        agencyId,
-        deletedAt: null,
-        id: { in: scopedCreatorIds },
-      },
-      select: {
-        id: true,
-        remoteId: true,
-        sessionState: {
-          select: {
-            status: true,
-            revision: true,
-            payloadVersion: true,
-            platformUserId: true,
-            capturedByDeviceId: true,
-            updatedAt: true,
-          },
-        },
-        networkProfile: {
-          select: {
-            mode: true,
-            proxyEndpointId: true,
-            version: true,
-            updatedAt: true,
-          },
-        },
-      },
-      take: 10000,
-    }) : [];
-    const creatorSessions = manifestRows.map((creator) => ({
-      creatorId: creator.id,
-      revision: creator.sessionState?.revision || 0,
-      status: creator.sessionState?.status || "MISSING",
-      payloadVersion: creator.sessionState?.payloadVersion || null,
-      platformUserId: creator.sessionState?.platformUserId || creator.remoteId || null,
-      capturedByDeviceId: creator.sessionState?.capturedByDeviceId || null,
-      updatedAt: creator.sessionState?.updatedAt || null,
-    }));
-    const creatorNetworks = manifestRows.map((creator) => ({
-      creatorId: creator.id,
-      mode: creator.networkProfile?.mode || "DIRECT",
-      version: creator.networkProfile?.version || 0,
-      proxyEndpointId: creator.networkProfile?.proxyEndpointId || null,
-      updatedAt: creator.networkProfile?.updatedAt || null,
-    }));
 
     return res.json({
       ok: true,

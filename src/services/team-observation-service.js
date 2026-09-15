@@ -130,8 +130,8 @@ function computeCatchupWindow(prev, now = new Date()) {
   };
 }
 
-async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = new Date() }) {
-  const creator = await resolveCreatorForObservation({ agencyId, account });
+async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = new Date(), db = prisma }) {
+  const creator = await resolveCreatorForObservation({ agencyId, account, db });
   if (!creator?.id) return { ok: false, code: "CREATOR_NOT_FOUND" };
 
   const accountId =
@@ -141,7 +141,7 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
     160
   );
 
-  const prev = await prisma.teamObservationState
+  const prev = await db.teamObservationState
     .findUnique({
       where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
     })
@@ -157,7 +157,7 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
     lastObservedAt: maxDate(now, prev?.lastObservedAt),
   };
 
-  let state = await prisma.teamObservationState.upsert({
+  let state = await db.teamObservationState.upsert({
     where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
     create: {
       agencyId,
@@ -185,15 +185,15 @@ async function upsertObservationHeartbeat({ agencyId, deviceId, account, now = n
   };
 }
 
-async function updateObservationFromHeartbeat({ agencyId, deviceId, accounts = [] }) {
+async function updateObservationFromHeartbeat({ agencyId, deviceId, accounts = [], now = new Date(), db = prisma }) {
   const list = Array.isArray(accounts) ? accounts : [];
-  const now = new Date();
+  const current = dateOrNull(now) || new Date();
   const results = [];
   for (const account of list) {
     const status = String(account?.status || "").toUpperCase();
     if (status && status !== "READY") continue;
     try {
-      const result = await upsertObservationHeartbeat({ agencyId, deviceId, account, now });
+      const result = await upsertObservationHeartbeat({ agencyId, deviceId, account, now: current, db });
       results.push(result);
     } catch (err) {
       results.push({ ok: false, code: "OBSERVATION_HEARTBEAT_FAILED", error: err?.message || String(err) });

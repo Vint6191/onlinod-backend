@@ -17,8 +17,9 @@ function segment(startNeedle, endNeedle) {
 test('V20.17 heartbeat canonical manifest is authorized by creator scope, not DeviceCreatorBinding', () => {
   const heartbeat = segment('router.post("/heartbeat"', '// Legacy endpoint intentionally cannot mutate realtime coverage.');
   assert.match(devicesRoute, /allowedCreatorScope/);
-  assert.match(heartbeat, /allowedCreatorScope\(\{ agencyId, member: heartbeatMembership \}\)/);
-  assert.match(heartbeat, /requestedCreatorIds\.filter\(\(id\) => allowedCreatorIds\.has\(id\)\)/);
+  assert.match(heartbeat, /const manifestRows = await withHeartbeatMemberGeneration\(\{/);
+  assert.match(heartbeat, /work: async \(\{ tx, member \}\) => \{[\s\S]*allowedCreatorScope\(\{ agencyId, member, db: tx \}\)/);
+  assert.match(heartbeat, /requestedCreatorIds\.filter\(\(id\) => manifestAllowedCreatorIds\.has\(id\)\)/);
 
   const manifest = segment('// Revision correctness is state-based.', 'return res.json({');
   assert.doesNotMatch(manifest, /deviceCreatorBinding\.(find|findMany|findFirst)/i,
@@ -43,11 +44,14 @@ test('V20.17 heartbeat returns current state as correctness source while command
   assert.match(heartbeat, /revision: creator\.sessionState\?\.revision \|\| 0/);
 });
 
-test('V20.17 cross-agency heartbeat resolves the actual target membership before manifest authorization', () => {
+test('V20.17 cross-agency device mutation and manifest are both generation-fenced', () => {
   const heartbeat = segment('router.post("/heartbeat"', '// Legacy endpoint intentionally cannot mutate realtime coverage.');
-  const membershipAt = heartbeat.indexOf('heartbeatMembership = await prisma.agencyMember.findFirst');
-  const scopeAt = heartbeat.indexOf('allowedCreatorScope({ agencyId, member: heartbeatMembership })');
-  assert.ok(membershipAt >= 0 && scopeAt > membershipAt,
-    'target-agency membership must be resolved before creator scope is calculated');
-  assert.match(heartbeat, /DEVICE_AGENCY_FORBIDDEN/);
+  const capabilityAt = heartbeat.indexOf('const capabilityCommit = await withHeartbeatMemberGeneration');
+  const deviceAt = heartbeat.indexOf('tx.workerDevice.upsert', capabilityAt);
+  const manifestAt = heartbeat.indexOf('const manifestRows = await withHeartbeatMemberGeneration', deviceAt);
+  const scopeAt = heartbeat.indexOf('allowedCreatorScope({ agencyId, member, db: tx })', manifestAt);
+  assert.ok(capabilityAt >= 0 && deviceAt > capabilityAt,
+    'target-agency device row may mutate only after current membership is locked and reread');
+  assert.ok(manifestAt > deviceAt && scopeAt > manifestAt,
+    'manifest authorization must be re-resolved under a current member generation');
 });

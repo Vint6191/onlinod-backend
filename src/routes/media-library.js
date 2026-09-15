@@ -3,7 +3,8 @@
 const express = require("express");
 const { z } = require("zod");
 const { automationCreatorParamRequired } = require("../middleware/automation-permissions");
-const { requireProductPermission, requireProductDevice } = require("../middleware/product-access");
+const { requireProductPermission, requireProductDevice, currentAccessEpoch } = require("../middleware/product-access");
+const { assertExecutionAccessFence } = require("../services/execution-access-fence-service");
 const {
   getMediaMetadata,
   searchMediaLibrary,
@@ -54,6 +55,7 @@ const usageItemSchema = z.object({
   lastSoldAt: z.string().max(100).nullable().optional(),
 });
 const usageSourcesSchema = z.object({
+  accessEpoch: z.number().int().min(0),
   sources: z.array(z.object({
     sourceKey: z.string().min(1).max(240),
     sourceRevision: z.string().min(1).max(100),
@@ -151,19 +153,47 @@ router.get("/:creatorId/storylines", async (req, res) => {
   }
 });
 
-router.put("/:creatorId/usage-sources", async (req, res) => {
+async function putCurrentAuthorizedUsageSources(req, res) {
   try {
     requireProductDevice(req, req.auth?.deviceId);
     const input = usageSourcesSchema.parse(req.body || {});
+    const admittedAccessEpoch = currentAccessEpoch(req);
+    if (!Number.isInteger(admittedAccessEpoch) || input.accessEpoch !== admittedAccessEpoch) {
+      const error = new Error("Media Library usage sync authorization generation is stale");
+      error.code = "MEDIA_LIBRARY_USAGE_AUTHORIZATION_STALE";
+      error.status = 409;
+      throw error;
+    }
+    const memberId = String(req.auth?.memberId || req.auth?.membership?.id || "").trim();
+    const userId = String(req.auth?.userId || "").trim();
+    const creatorId = String(req.params.creatorId || "").trim();
+    const commitGuard = async (tx) => assertExecutionAccessFence({
+      db: tx,
+      agencyId: req.auth.agencyId,
+      userId,
+      memberId,
+      accessEpoch: input.accessEpoch,
+      creatorId,
+      lock: true,
+    });
     return res.json(await replaceUsageSources({
       agencyId: req.auth.agencyId,
-      creatorId: req.params.creatorId,
+      creatorId,
       sources: input.sources,
+      commitGuard,
     }));
   } catch (error) {
     return sendError(res, error, "MEDIA_LIBRARY_USAGE_SYNC_FAILED");
   }
-});
+}
+
+// New Desktop builds use a versioned path so they fail closed against an old
+// backend replica instead of having accessEpoch stripped by the legacy Zod
+// object and committing without generation proof during a rolling deploy.
+router.put("/:creatorId/usage-sources/current-authorized", putCurrentAuthorizedUsageSources);
+// The legacy path remains mounted only with the same mandatory proof. Old
+// Desktop builds therefore fail closed after the backend rollout.
+router.put("/:creatorId/usage-sources", putCurrentAuthorizedUsageSources);
 
 router.post("/:creatorId/folders/mutate", vaultManagementRequired, async (req, res) => {
   try {

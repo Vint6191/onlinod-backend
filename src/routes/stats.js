@@ -23,6 +23,7 @@ const { ensureAnalyticsFreshness } = require("../services/analytics-collection-p
 const { normalizeCreatorOverviewRangeKey } = require("../services/analytics-range-contract");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { capabilityFreshnessWindow } = require("../services/capability-freshness-authority-service");
+const { assertRealtimeIngestGenerationCurrent, withRealtimeIngestGenerationFence } = require("../services/realtime-ingest-generation-fence-service");
 const {
   startManualNotificationScan,
   stopManualNotificationScan,
@@ -123,46 +124,6 @@ async function loadAgencyAccess(req, res, agencyId) {
   }
   const scope = await allowedCreatorScope({ agencyId: agency.id, member, db: prisma });
   return { agency, member, scope };
-}
-
-async function requireFreshAnalyticsReporter({ req, creator, suppliedDeviceId }) {
-  const userId = actorUserId(req);
-  const boundDeviceId = requireAuthDevice(req, suppliedDeviceId, {
-    requiredCode: "ANALYTICS_DEVICE_BOUND_TOKEN_REQUIRED",
-    mismatchCode: "DEVICE_IDENTITY_MISMATCH",
-  });
-  const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
-  const freshnessWindow = capabilityFreshnessWindow(authorityNow, 10 * 60 * 1000);
-  const device = await prisma.workerDevice.findFirst({
-    where: { id: boundDeviceId, userId, agencyId: creator.agencyId, lastSeenAt: freshnessWindow },
-    select: { id: true },
-  });
-  if (!device) {
-    const error = new Error("The authenticated reporting device is not active in this agency");
-    error.code = "ANALYTICS_DEVICE_FORBIDDEN";
-    error.status = 403;
-    throw error;
-  }
-  const member = req.auth?.membership || req.member || null;
-  const binding = await prisma.deviceCreatorBinding.findFirst({
-    where: {
-      deviceId: device.id,
-      creatorId: creator.id,
-      agencyId: creator.agencyId,
-      status: "ACTIVE",
-      sessionReadReady: true,
-      lastSeenAt: freshnessWindow,
-      ...(Number.isInteger(Number(member?.accessEpoch)) ? { accessEpoch: Number(member.accessEpoch) } : {}),
-    },
-    select: { id: true },
-  });
-  if (!binding) {
-    const error = new Error("The authenticated reporting device has no fresh SESSION_READ capability for this creator");
-    error.code = "ANALYTICS_CREATOR_CAPABILITY_STALE";
-    error.status = 409;
-    throw error;
-  }
-  return device;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -517,26 +478,60 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
       requiredCode: "LIVE_NOTIFICATION_DEVICE_BOUND_TOKEN_REQUIRED",
       mismatchCode: "DEVICE_IDENTITY_MISMATCH",
     });
-    const authorityNow = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
-    const freshnessWindow = capabilityFreshnessWindow(authorityNow, 10 * 60 * 1000);
-    const device = await prisma.workerDevice.findFirst({
-      where: { id: boundDeviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: freshnessWindow },
-      select: { id: true },
-    });
-    if (!device) return res.status(403).json({ ok: false, code: "LIVE_NOTIFICATION_DEVICE_FORBIDDEN", error: "The authenticated reporting device is not owned by this agency member" });
-    const binding = await prisma.deviceCreatorBinding.findFirst({
-      where: {
-        deviceId: device.id,
-        creatorId: ctx.creator.id,
+    const memberAccessEpoch = ctx.member?.accessEpoch;
+    if (!Number.isInteger(memberAccessEpoch)) {
+      return res.status(409).json({ ok: false, code: "LIVE_NOTIFICATION_AUTHORIZATION_GENERATION_REQUIRED", error: "Live notifications require a current member authorization generation" });
+    }
+    const assertLiveBinding = async (db) => {
+      const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
+      const freshnessWindow = capabilityFreshnessWindow(authorityNow, 10 * 60 * 1000);
+      const device = await db.workerDevice.findFirst({
+        where: { id: boundDeviceId, userId, agencyId: ctx.creator.agencyId, lastSeenAt: freshnessWindow },
+        select: { id: true },
+      });
+      if (!device) {
+        throw Object.assign(new Error("The authenticated reporting device is not owned by this agency member"), {
+          code: "LIVE_NOTIFICATION_DEVICE_FORBIDDEN",
+          status: 403,
+        });
+      }
+      const binding = await db.deviceCreatorBinding.findFirst({
+        where: {
+          deviceId: device.id,
+          creatorId: ctx.creator.id,
+          agencyId: ctx.creator.agencyId,
+          status: "ACTIVE",
+          realtimeReady: true,
+          accessEpoch: memberAccessEpoch,
+          lastSeenAt: freshnessWindow,
+        },
+        select: { id: true },
+      });
+      if (!binding) {
+        throw Object.assign(new Error("The authenticated reporting device has no fresh REALTIME capability for this creator"), {
+          code: "LIVE_NOTIFICATION_REALTIME_UNAVAILABLE",
+          status: 409,
+        });
+      }
+      return device;
+    };
+    let device;
+    try {
+      device = await assertLiveBinding(prisma);
+    } catch (error) {
+      return res.status(Number(error?.status) || 403).json({ ok: false, code: error?.code || "LIVE_NOTIFICATION_REALTIME_UNAVAILABLE", error: error?.message || "Live notification reporter is not ready" });
+    }
+    const commitGuard = async (tx) => {
+      await assertRealtimeIngestGenerationCurrent({
+        db: tx,
         agencyId: ctx.creator.agencyId,
-        status: "ACTIVE",
-        realtimeReady: true,
-        ...(Number.isInteger(Number(ctx.member?.accessEpoch)) ? { accessEpoch: Number(ctx.member.accessEpoch) } : {}),
-        lastSeenAt: freshnessWindow,
-      },
-      select: { id: true },
-    });
-    if (!binding) return res.status(409).json({ ok: false, code: "LIVE_NOTIFICATION_REALTIME_UNAVAILABLE", error: "The authenticated reporting device has no fresh REALTIME capability for this creator" });
+        userId,
+        memberId: ctx.member?.id,
+        accessEpoch: memberAccessEpoch,
+        creatorId: ctx.creator.id,
+      });
+      await assertLiveBinding(tx);
+    };
 
     const grouped = new Map();
     const dates = [];
@@ -569,6 +564,7 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
       const typeHash = crypto.createHash("sha256").update(`${input.batchId}|${type}`).digest("hex").slice(0, 24);
       const result = await ingestNotificationFacts({
         db: prisma,
+        commitGuard,
         job: logicalJob,
         deviceId: device.id,
         result: {
@@ -585,12 +581,23 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
       });
       results.push({ type, ...result });
     }
-    await recordNotificationSocketEvent({
+    await withRealtimeIngestGenerationFence({
       db: prisma,
       agencyId: ctx.creator.agencyId,
+      userId,
+      memberId: ctx.member?.id,
+      accessEpoch: memberAccessEpoch,
       creatorId: ctx.creator.id,
-      deviceId: device.id,
-      occurredAt: dates.length ? new Date(Math.max(...dates.map((date) => date.getTime()))) : observedAt,
+      work: async ({ tx }) => {
+        const currentDevice = await assertLiveBinding(tx);
+        return recordNotificationSocketEvent({
+          db: tx,
+          agencyId: ctx.creator.agencyId,
+          creatorId: ctx.creator.id,
+          deviceId: currentDevice.id,
+          occurredAt: dates.length ? new Date(Math.max(...dates.map((date) => date.getTime()))) : observedAt,
+        });
+      },
     });
     return res.json({ ok: true, creatorId: ctx.creator.id, batchId: input.batchId, results });
   } catch (error) {

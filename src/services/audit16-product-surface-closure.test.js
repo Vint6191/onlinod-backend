@@ -109,7 +109,11 @@ test("Audit16 Stats, Traffic and Fan Data use canonical creator scope and canoni
   const liveNext = stats.indexOf("\nrouter.", liveStart + 1);
   const liveRoute = stats.slice(liveStart, liveNext === -1 ? stats.length : liveNext);
   assert.match(liveRoute, /mismatchCode:\s*"DEVICE_IDENTITY_MISMATCH"/);
-  assert.match(liveRoute, /accessEpoch:\s*Number\(ctx\.member\.accessEpoch\)/);
+  assert.match(liveRoute, /const memberAccessEpoch = ctx\.member\?\.accessEpoch/);
+  assert.match(liveRoute, /Number\.isInteger\(memberAccessEpoch\)/);
+  assert.match(liveRoute, /accessEpoch:\s*memberAccessEpoch/);
+  assert.match(liveRoute, /commitGuard/);
+  assert.match(liveRoute, /assertRealtimeIngestGenerationCurrent/);
   assert.match(liveRoute, /res\.status\(Number\(error\?\.status\) \|\| 500\)/);
   assert.doesNotMatch(liveRoute, /requireRefreshPermission/);
   assert.match(stats, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);

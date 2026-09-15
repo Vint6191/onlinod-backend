@@ -733,13 +733,16 @@ async function triggerPendingReplyScan({ agencyId, creatorId, limit = 100, db = 
   return { ok: true, scheduled: changed.count, at: now };
 }
 
-async function processRuntimeEvents({ agencyId, creatorId, events = [], userId = null, db = prisma }) {
+async function processRuntimeEvents({ agencyId, creatorId, events = [], userId = null, db = prisma, commitFence = null }) {
   const rows = Array.isArray(events) ? events.slice(0, 500) : [];
   const summary = { ok: true, received: rows.length, onlineObserved: 0, replies: 0, planned: 0, ignored: 0, errors: [] };
   const onlineIds = new Set();
   let onlineObservedAt = null;
   const subscriptionByFan = new Map();
   const replies = [];
+  const runCommit = typeof commitFence === "function"
+    ? commitFence
+    : async (work) => work(db);
 
   for (const event of rows) {
     const type = clean(event?.type, 80);
@@ -763,17 +766,18 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
 
   try {
     if (onlineIds.size) {
-      const observed = await recordOnlineObservations({
+      const observed = await runCommit((commitDb) => recordOnlineObservations({
         agencyId,
         creatorId,
         fanIds: [...onlineIds],
         observedAt: onlineObservedAt || new Date(),
         metadata: { source: "ws" },
-        db,
-      });
-      summary.onlineObserved += observed.count;
-      const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
-      if (control.effective.bumpsEnabled && control.modules.bumps.settings.automatic && control.modules.bumps.settings.onlineEnabled) {
+        db: commitDb,
+      }));
+      summary.onlineObserved += Number(observed?.count || 0);
+      const plannedCount = await runCommit(async (commitDb) => {
+        const control = await getAutomationControlSnapshot({ agencyId, creatorId, db: commitDb });
+        if (!control.effective.bumpsEnabled || !control.modules.bumps.settings.automatic || !control.modules.bumps.settings.onlineEnabled) return 0;
         const planned = await planBumps({
           agencyId,
           creatorId,
@@ -781,10 +785,11 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
           source: "online",
           fanIds: observed.fanIds,
           limit: observed.fanIds.length,
-          db,
+          db: commitDb,
         });
-        summary.planned += Number(planned.planned || 0);
-      }
+        return Number(planned.planned || 0);
+      });
+      summary.planned += Number(plannedCount || 0);
     }
   } catch (error) {
     summary.errors.push({ type: "presence_online", code: error?.code || "event_failed", error: String(error?.message || error).slice(0, 500) });
@@ -794,15 +799,15 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
     try {
       const fanId = clean(event.fanId, 160);
       if (!fanId) { summary.ignored += 1; continue; }
-      const reply = await markBumpReply({
+      const reply = await runCommit((commitDb) => markBumpReply({
         agencyId,
         creatorId,
         fanId,
         messageId: event.messageId,
         repliedAt: event.createdAt || event.changedAt || new Date(),
         source: clean(event.source, 80) || "ws",
-        db,
-      });
+        db: commitDb,
+      }));
       if (reply.matched) summary.replies += 1;
     } catch (error) {
       summary.errors.push({ type: "chat_message_received", code: error?.code || "event_failed", error: String(error?.message || error).slice(0, 500) });
@@ -821,9 +826,10 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
           fan: object(event.fanSnapshot),
         },
       }));
-      const observed = await recordDetailedObservations({ agencyId, creatorId, observations, db });
-      const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
-      if (control.effective.bumpsEnabled && control.modules.bumps.settings.automatic && control.modules.bumps.settings.subscriptionEventsEnabled) {
+      const observed = await runCommit((commitDb) => recordDetailedObservations({ agencyId, creatorId, observations, db: commitDb }));
+      const plannedCount = await runCommit(async (commitDb) => {
+        const control = await getAutomationControlSnapshot({ agencyId, creatorId, db: commitDb });
+        if (!control.effective.bumpsEnabled || !control.modules.bumps.settings.automatic || !control.modules.bumps.settings.subscriptionEventsEnabled) return 0;
         const planned = await planBumps({
           agencyId,
           creatorId,
@@ -831,10 +837,11 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
           source: "subscription_event",
           fanIds: observed.fanIds,
           limit: observed.fanIds.length,
-          db,
+          db: commitDb,
         });
-        summary.planned += Number(planned.planned || 0);
-      }
+        return Number(planned.planned || 0);
+      });
+      summary.planned += Number(plannedCount || 0);
     } catch (error) {
       summary.errors.push({ type: "subscription_created", code: error?.code || "event_failed", error: String(error?.message || error).slice(0, 500) });
     }

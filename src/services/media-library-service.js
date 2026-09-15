@@ -612,7 +612,7 @@ async function replaceUsageSourceTx(tx, { agencyId, creatorId, source }) {
   };
 }
 
-async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma }) {
+async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma, commitGuard = null }) {
   const id = await requireCreator(db, agencyId, creatorId);
   const normalized = (Array.isArray(sources) ? sources : [])
     .slice(0, MAX_USAGE_SOURCES)
@@ -635,7 +635,10 @@ async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma }
   // revisions make them cheap stale no-ops on the next attempt.
   for (const source of normalized) {
     const sourceResult = await db.$transaction(
-      (tx) => replaceUsageSourceTx(tx, { agencyId, creatorId: id, source }),
+      async (tx) => {
+        if (typeof commitGuard === "function") await commitGuard(tx);
+        return replaceUsageSourceTx(tx, { agencyId, creatorId: id, source });
+      },
       MEDIA_LIBRARY_USAGE_TRANSACTION_OPTIONS,
     );
     if (sourceResult.stale) {

@@ -672,7 +672,7 @@ function terminalReplayResponse(batch, result, job) {
   };
 }
 
-async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
+async function ingestNotificationFacts({ job, deviceId, result, db = prisma, commitGuard = null }) {
   if (!job?.id || !job?.agencyId || !job?.creatorId) throw new Error("Notification facts require a creator-scoped job");
   if (!Array.isArray(result?.events)) {
     throw Object.assign(new Error("Notification events must be an explicit array"), { code: "NOTIFICATION_EVENTS_ARRAY_REQUIRED" });
@@ -816,6 +816,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma }) {
 
   try {
     const applyFacts = async (tx) => {
+      if (typeof commitGuard === "function") await commitGuard(tx);
       // Serialize duplicate deliveries inside the same database transaction.
       // Re-read after acquiring the lock: another request may have committed
       // after our pre-transaction ensureBatch() read.

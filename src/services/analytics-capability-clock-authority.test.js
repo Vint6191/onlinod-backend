@@ -56,11 +56,12 @@ test("live Notification fact reporter gates REALTIME capability against PostgreS
   const start = source.indexOf('router.post("/creators/:creatorId/notifications/live"');
   assert.ok(start >= 0);
   const block = source.slice(start);
-  assert.match(block, /authorityNow = await dbAuthorityNow\(\{ db: prisma/);
+  assert.match(block, /const assertLiveBinding = async \(db\) => \{[\s\S]*authorityNow = await dbAuthorityNow\(\{ db/);
   assert.match(block, /freshnessWindow = capabilityFreshnessWindow\(authorityNow, 10 \* 60 \* 1000\)/);
   assert.match(block, /lastSeenAt: freshnessWindow/);
   assert.match(block, /realtimeReady: true/);
-  assert.doesNotMatch(block.slice(0, block.indexOf("const grouped =")), /Date\.now\(\)/);
-  assert.match(block, /ingestNotificationFacts/);
-  assert.match(block, /recordNotificationSocketEvent/);
+  assert.match(block, /const commitGuard = async \(tx\)[\s\S]*await assertLiveBinding\(tx\)/);
+  assert.doesNotMatch(block.slice(block.indexOf("const assertLiveBinding"), block.indexOf("const grouped =")), /Date\.now\(\)/);
+  assert.match(block, /ingestNotificationFacts\(\{[\s\S]*commitGuard/);
+  assert.match(block, /withRealtimeIngestGenerationFence\(\{[\s\S]*recordNotificationSocketEvent/);
 });

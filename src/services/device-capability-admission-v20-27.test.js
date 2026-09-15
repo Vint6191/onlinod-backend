@@ -8,17 +8,21 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "..");
 const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
 
-test("heartbeat fences token device and member creator scope before writing capability telemetry", () => {
+test("heartbeat keeps liveness distinct from capability while committing agency-scoped device state under current membership", () => {
   const source = read("routes/devices.js");
   const heartbeatStart = source.indexOf('router.post("/heartbeat"');
   const block = source.slice(heartbeatStart);
   const authDeviceAt = block.indexOf("requireAuthDevice(req, input.deviceId");
-  const scopeAt = block.indexOf("allowedCreatorScope({ agencyId, member: heartbeatMembership })");
-  const upsertAt = block.indexOf("prisma.workerDevice.upsert");
-  const syncAt = block.indexOf("syncDeviceCreatorBindings({");
-  assert.ok(authDeviceAt >= 0 && scopeAt > authDeviceAt, "device identity must be established before scope");
-  assert.ok(upsertAt > scopeAt, "member creator scope must be resolved before WorkerDevice mutation");
-  assert.ok(syncAt > upsertAt, "binding/capability telemetry is written only after access authority");
+  const generationAt = block.indexOf("const capabilityCommit = await withHeartbeatMemberGeneration");
+  const upsertAt = block.indexOf("tx.workerDevice.upsert", generationAt);
+  const scopeAt = block.indexOf("allowedCreatorScope({ agencyId, member, db: tx })", upsertAt);
+  const syncAt = block.indexOf("syncDeviceCreatorBindings({", scopeAt);
+  assert.ok(authDeviceAt >= 0 && generationAt > authDeviceAt, "device identity must be bound before the membership generation transaction");
+  assert.ok(upsertAt > generationAt, "agency-scoped device liveness mutation must occur inside current membership generation");
+  assert.ok(scopeAt > upsertAt && syncAt > scopeAt, "creator capability telemetry follows current member scope in the same transaction");
+  assert.match(block.slice(generationAt, syncAt + 400), /currentAccessEpoch: accessEpoch[\s\S]*db: tx/);
+  assert.match(source, /const generationCurrent = expectedAccessEpoch !== null && accessEpoch === expectedAccessEpoch/);
+  assert.match(source, /const realtimeReady = generationCurrent && account\?\.realtimeHealthy === true/);
   assert.match(source, /allowedCreatorIds && !allowedCreatorIds\.has\(creator\.id\)/);
   assert.doesNotMatch(source, /status\s*&&\s*status\s*!==\s*["']READY["']/);
 });

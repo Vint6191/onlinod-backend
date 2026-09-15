@@ -7,6 +7,7 @@ const { canonicalReplyEventId } = require("./team-event-order-authority");
 const RESPONSE_DERIVATION_VERSION = "team_response_v2";
 const RESPONSE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_OPEN_COVERAGE_MS = 12 * 60 * 60 * 1000;
+const COVERAGE_RECONCILE_END_REASON = "server_reconciled_next_coverage_start";
 
 function clean(value, max = 220) {
   const s = String(value ?? "").trim();
@@ -36,6 +37,19 @@ function extraOf(row) {
 function metadataOf(row) {
   const extra = extraOf(row);
   return extra?.metadata && typeof extra.metadata === "object" && !Array.isArray(extra.metadata) ? extra.metadata : {};
+}
+
+function isAuthorizationTerminalClosure(row) {
+  const marker = metadataOf(row)?.authorizationTerminalClosure;
+  return Boolean(marker && typeof marker === "object" && !Array.isArray(marker) && Number(marker.version) === 1);
+}
+
+function minDate(left, right) {
+  const a = dateOrNull(left);
+  const b = dateOrNull(right);
+  if (!a) return b;
+  if (!b) return a;
+  return a <= b ? a : b;
 }
 
 function isManualConfirmed(row) {
@@ -93,7 +107,26 @@ async function upsertCoverageSessionUnlocked(row, db = prisma) {
     return db.teamCoverageSession.create({ data });
   }
 
-  const nextEndedAt = endedAt || existing.endedAt || null;
+  const mergedStartedAt = existing.startedAt && existing.startedAt <= startedAt ? existing.startedAt : startedAt;
+  let nextEndedAt = endedAt || existing.endedAt || null;
+  let nextEndReason = endReason || existing.endReason || null;
+  if (endedAt && isAuthorizationTerminalClosure(row)) {
+    const reportedDurationSeconds = Math.max(0, Math.min(24 * 60 * 60, Number(row.durationSeconds) || 0));
+    const durationBoundEnd = new Date(mergedStartedAt.getTime() + reportedDurationSeconds * 1000);
+    const terminalEnd = minDate(endedAt, durationBoundEnd);
+    nextEndedAt = minDate(existing.endedAt, terminalEnd);
+    if (existing.endedAt && nextEndedAt && nextEndedAt.getTime() === existing.endedAt.getTime()) {
+      nextEndReason = existing.endReason || nextEndReason;
+    }
+  } else if (endedAt && existing.endedAt && existing.endReason === COVERAGE_RECONCILE_END_REASON) {
+    // A server-side orphan reconciliation is an upper bound.  A delayed normal
+    // END may prove an earlier finish, but it must never reopen/extend the old
+    // coverage across the next proven START boundary.
+    nextEndedAt = minDate(existing.endedAt, endedAt);
+    if (nextEndedAt && nextEndedAt.getTime() === existing.endedAt.getTime()) {
+      nextEndReason = existing.endReason;
+    }
+  }
   return db.teamCoverageSession.update({
     where: { id: existing.id },
     data: {
@@ -101,15 +134,14 @@ async function upsertCoverageSessionUnlocked(row, db = prisma) {
       memberId: existing.memberId || memberId,
       userId: existing.userId || data.userId,
       deviceId: existing.deviceId || data.deviceId,
-      startedAt: existing.startedAt && existing.startedAt <= startedAt ? existing.startedAt : startedAt,
+      startedAt: mergedStartedAt,
       endedAt: nextEndedAt,
-      durationSeconds: nextEndedAt ? secondsBetween(existing.startedAt && existing.startedAt <= startedAt ? existing.startedAt : startedAt, nextEndedAt) : existing.durationSeconds,
+      durationSeconds: nextEndedAt ? secondsBetween(mergedStartedAt, nextEndedAt) : existing.durationSeconds,
       startReason: existing.startReason || startReason,
-      endReason: endReason || existing.endReason,
+      endReason: nextEndReason,
     },
   });
 }
-
 
 function coverageSessionFenceKey(row) {
   const agencyId = clean(row?.agencyId, 160);
@@ -118,18 +150,98 @@ function coverageSessionFenceKey(row) {
   return `team-coverage:${agencyId}:${coverageId}`;
 }
 
-async function upsertCoverageSession(row, db = prisma) {
+function coverageStreamFenceKey(row) {
+  const agencyId = clean(row?.agencyId, 160);
+  const memberId = clean(row?.memberId, 160);
+  const deviceId = clean(row?.deviceId, 160);
+  if (!agencyId || !memberId || !deviceId) return null;
+  return `team-coverage-stream:${agencyId}:${memberId}:${deviceId}`;
+}
+
+async function reconcilePriorOpenCoverageOnStart(row, db) {
+  if (!isCanonicalKind(row, "COVERAGE_STARTED")) return [];
+  const agencyId = clean(row?.agencyId, 160);
+  const memberId = clean(row?.memberId, 160);
+  const deviceId = clean(row?.deviceId, 160);
+  const coverageId = clean(row?.coverageId || row?.correlationId || row?.localId, 220);
+  const startedAt = dateOrNull(row?.startedAt) || dateOrNull(row?.ts);
+  if (!agencyId || !memberId || !deviceId || !coverageId || !startedAt) return [];
+
+  // Desktop owns one human workspace coverage stream per member/device.  If a
+  // process crash or local SQLite failure loses the previous terminal row, the
+  // next proven START is a durable upper bound for that orphan: old coverage
+  // must not bridge into the new generation.  Reconcile every open predecessor,
+  // not only the newest one, so repeated historical crashes converge as well.
+  const candidates = await db.teamCoverageSession.findMany({
+    where: {
+      agencyId,
+      memberId,
+      deviceId,
+      source: "team_v13",
+      endedAt: null,
+      coverageId: { not: coverageId },
+      startedAt: { lte: startedAt },
+    },
+    orderBy: [{ coverageId: "asc" }],
+  });
+
+  const reconciled = [];
+  for (const candidate of candidates || []) {
+    const priorCoverageId = clean(candidate?.coverageId, 220);
+    if (!priorCoverageId) continue;
+    const priorFenceKey = coverageSessionFenceKey({ agencyId, coverageId: priorCoverageId });
+    if (priorFenceKey && typeof db?.$executeRawUnsafe === "function") {
+      // Use the same per-coverage lock as a normal delayed END.  This prevents
+      // START-reconciliation and a late END from racing on a stale pre-lock read.
+      await lockDbAdvisoryXact({ db, key: priorFenceKey, mode: "exclusive" });
+    }
+    const current = await db.teamCoverageSession.findUnique({
+      where: { agencyId_coverageId: { agencyId, coverageId: priorCoverageId } },
+    });
+    if (!current || current.endedAt) continue;
+    const currentStartedAt = dateOrNull(current.startedAt);
+    if (!currentStartedAt || currentStartedAt > startedAt) continue;
+    const staleCapEnd = new Date(currentStartedAt.getTime() + MAX_OPEN_COVERAGE_MS);
+    const reconciledEnd = minDate(startedAt, staleCapEnd);
+    if (!reconciledEnd) continue;
+    const closed = await db.teamCoverageSession.update({
+      where: { id: current.id },
+      data: {
+        endedAt: reconciledEnd,
+        durationSeconds: secondsBetween(currentStartedAt, reconciledEnd),
+        endReason: COVERAGE_RECONCILE_END_REASON,
+      },
+    });
+    reconciled.push(closed);
+  }
+  return reconciled;
+}
+
+async function upsertCoverageSessionWithReconciliation(row, db = prisma) {
   const fenceKey = coverageSessionFenceKey(row);
-  if (!fenceKey) return upsertCoverageSessionUnlocked(row, db);
+  if (!fenceKey) return { session: await upsertCoverageSessionUnlocked(row, db), reconciled: [] };
   return runDbTransaction(db, async (tx) => {
+    const streamFenceKey = isCanonicalKind(row, "COVERAGE_STARTED") ? coverageStreamFenceKey(row) : null;
+    if (streamFenceKey && typeof tx?.$executeRawUnsafe === "function") {
+      // Serialize STARTs for the same human/device stream before touching any
+      // individual coverage identity.  Every START then has one deterministic
+      // reconciliation point for an orphan left by a prior crashed process.
+      await lockDbAdvisoryXact({ db: tx, key: streamFenceKey, mode: "exclusive" });
+    }
+    const reconciled = streamFenceKey ? await reconcilePriorOpenCoverageOnStart(row, tx) : [];
     // COVERAGE_STARTED and COVERAGE_ENDED are separate canonical events and can be
     // claimed by different replicas. Serialize their read/merge/write cycle by the
     // stable coverage identity so a late START cannot erase a committed END.
     if (typeof tx?.$executeRawUnsafe === "function") {
       await lockDbAdvisoryXact({ db: tx, key: fenceKey, mode: "exclusive" });
     }
-    return upsertCoverageSessionUnlocked(row, tx);
+    const session = await upsertCoverageSessionUnlocked(row, tx);
+    return { session, reconciled };
   });
+}
+
+async function upsertCoverageSession(row, db = prisma) {
+  return (await upsertCoverageSessionWithReconciliation(row, db)).session;
 }
 
 async function upsertDialogSession(row, db = prisma) {
@@ -819,9 +931,12 @@ async function applyTeamResponseProjection(row, db = prisma) {
   const kind = String(row.eventKind).toUpperCase();
 
   if (kind === "COVERAGE_STARTED" || kind === "COVERAGE_ENDED") {
-    const session = await upsertCoverageSession(row, db);
-    if (session) await recomputeRepliesForCoverage(session, db);
-    return session;
+    const result = await upsertCoverageSessionWithReconciliation(row, db);
+    for (const reconciled of result.reconciled || []) {
+      await recomputeRepliesForCoverage(reconciled, db);
+    }
+    if (result.session) await recomputeRepliesForCoverage(result.session, db);
+    return result.session;
   }
 
   if (kind === "DIALOG_SESSION") {
