@@ -23,6 +23,7 @@ const { audit } = require("../services/audit-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = require("../services/team-control-plane-authority-service");
 const { assertTeamControlPlaneWriteAdmission } = require("../services/phase2-release-compatibility-authority-service");
+const { acquireAuthorizationUserLock } = require("../services/authorization-session-authority-service");
 
 const router = express.Router();
 
@@ -40,6 +41,7 @@ const loginSchema = z.object({
   rememberDevice: z.boolean().optional(),
   deviceId: z.string().max(160).optional().nullable(),
   client: z.string().max(80).optional().nullable(),
+  authorizationScopeIncarnation: z.string().min(8).max(220).optional().nullable(),
 });
 
 const verifyCodeSchema = z.object({
@@ -55,6 +57,7 @@ const refreshSchema = z.object({
   refreshToken: z.string().min(20),
   deviceId: z.string().max(160).optional().nullable(),
   client: z.string().max(80).optional().nullable(),
+  authorizationScopeIncarnation: z.string().min(8).max(220).optional().nullable(),
 });
 
 const resetPasswordSchema = z.object({
@@ -479,18 +482,14 @@ router.post("/login", async (req, res) => {
       return res.status(401).json({ ok: false, code: "NO_AGENCY", error: "User has no agency" });
     }
 
-    const updatedUser = await prisma.user.update({
-      where: { id: user.id },
-      data: { lastLoginAt: new Date() },
-    });
-
     const tokens = await issueLoginTokens({
-      user: updatedUser,
+      user,
       membership,
       req,
       rememberDevice: input.rememberDevice === true,
       deviceId: input.deviceId || null,
       client: input.client || null,
+      authorizationScopeIncarnation: input.authorizationScopeIncarnation || null,
     });
     const effectivePermissions = await resolveEffectivePermissions({ member: membership, db: prisma });
 
@@ -500,7 +499,8 @@ router.post("/login", async (req, res) => {
       refreshToken: tokens.refreshToken,
       accessTokenExpiresAt: tokens.accessTokenExpiresAt,
       refreshTokenExpiresAt: tokens.refreshTokenExpiresAt,
-      user: publicUser(updatedUser),
+      authorizationSessionId: tokens.authorizationSessionId || null,
+      user: publicUser(tokens.user || user),
       agency: membership.agency,
       activeAgency: membership.agency,
       activeAgencyId: membership.agencyId,
@@ -511,6 +511,10 @@ router.post("/login", async (req, res) => {
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
+    const status = Number(err?.status);
+    if (Number.isFinite(status) && status >= 400 && status < 600) {
+      return res.status(status).json({ ok: false, code: err.code || "LOGIN_AUTHORIZATION_CHANGED", error: err?.message || "Login authorization changed" });
+    }
     console.error("[auth/login] failed:", err);
     return res.status(500).json({ ok: false, code: "LOGIN_FAILED", error: "Login failed" });
   }
@@ -524,6 +528,7 @@ router.post("/refresh", async (req, res) => {
       req,
       deviceId: input.deviceId || null,
       client: input.client || null,
+      authorizationScopeIncarnation: input.authorizationScopeIncarnation || null,
     });
     if (!result.ok) return res.status(401).json(result);
     const effectivePermissions = await resolveEffectivePermissions({ member: result.membership, db: prisma });
@@ -534,6 +539,7 @@ router.post("/refresh", async (req, res) => {
       refreshToken: result.refreshToken,
       accessTokenExpiresAt: result.accessTokenExpiresAt,
       refreshTokenExpiresAt: result.refreshTokenExpiresAt,
+      authorizationSessionId: result.authorizationSessionId || null,
       user: publicUser(result.user),
       agency: result.membership.agency,
       activeAgency: result.membership.agency,
@@ -607,6 +613,7 @@ router.post("/reset-password", async (req, res) => {
     const revokedAt = new Date();
 
     await prisma.$transaction(async (tx) => {
+      await acquireAuthorizationUserLock(tx, { userId: record.userId });
       await tx.authToken.update({ where: { id: record.id }, data: { usedAt: revokedAt } });
       // Password reset is account recovery, so unlike an in-app password change
       // it intentionally invalidates every device, including already-issued
@@ -638,6 +645,7 @@ router.get("/me", authRequired, async (req, res) => {
       activeAgencyId: req.auth.agencyId,
       activeMemberId: req.auth.memberId,
       accessEpoch: Number(req.auth.membership?.accessEpoch || 1),
+      authorizationSessionId: req.auth.authorizationSessionId || null,
       role: req.auth.role,
       permissions: effectivePermissions,
     });

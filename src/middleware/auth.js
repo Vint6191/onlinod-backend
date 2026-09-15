@@ -19,6 +19,7 @@ async function authRequired(req, res, next) {
     const decoded = verifyAccessToken(token);
 
     const boundDeviceId = decoded.deviceId ? String(decoded.deviceId).trim().slice(0, 160) : null;
+    const authorizationSessionId = decoded.authorizationSessionId ? String(decoded.authorizationSessionId).trim().slice(0, 220) : null;
     const membership = await prisma.agencyMember.findFirst({
       where: {
         userId: decoded.userId,
@@ -36,8 +37,11 @@ async function authRequired(req, res, next) {
                 deviceId: boundDeviceId,
                 revokedAt: null,
                 expiresAt: { gt: new Date() },
+                ...(authorizationSessionId
+                  ? { authorizationSessionId }
+                  : { authorizationSessionId: null }),
               },
-              select: { id: true },
+              select: { id: true, authorizationSessionId: true },
               take: 1,
             },
           },
@@ -114,6 +118,7 @@ async function authRequired(req, res, next) {
       memberId: membership.id,
       role: membership.role,
       deviceId: decoded.deviceId ? String(decoded.deviceId) : null,
+      authorizationSessionId,
       permissions: membership.permissions || {},
       user: membership.user,
       agency: membership.agency,

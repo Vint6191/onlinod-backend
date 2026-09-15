@@ -80,6 +80,7 @@ const {
 const { assertAgencyMassCampaignRetirable } = require("../services/mass-campaign-authority-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const { publishDomainWork, WORK_CLASS: PHASE2_WORK_CLASS } = require("../services/domain-work-authority-service");
+const { acquireAuthorizationUserLock } = require("../services/authorization-session-authority-service");
 
 const router = express.Router();
 
@@ -1266,20 +1267,24 @@ router.post("/users/:id/force-logout", async (req, res) => {
 
     const now = new Date();
 
-    const [updatedUser, sessionResult, devices] = await Promise.all([
-      prisma.user.update({
+    const mutation = await prisma.$transaction(async (tx) => {
+      await acquireAuthorizationUserLock(tx, { userId: user.id });
+      const updatedUser = await tx.user.update({
         where: { id: user.id },
         data: { sessionsRevokedAt: now },
-      }),
-      prisma.refreshSession.updateMany({
+      });
+      const sessionResult = await tx.refreshSession.updateMany({
         where: { userId: user.id, revokedAt: null },
         data: { revokedAt: now },
-      }),
-      prisma.workerDevice.findMany({
+      });
+      const devices = await tx.workerDevice.findMany({
         where: { userId: user.id },
         select: { id: true, agencyId: true },
-        take: 10000}),
-    ]);
+        take: 10000,
+      });
+      return { updatedUser, sessionResult, devices };
+    });
+    const { updatedUser, sessionResult, devices } = mutation;
 
     let queuedDeviceCommands = 0;
 
@@ -1345,13 +1350,15 @@ router.post("/users/:id/reset-password", async (req, res) => {
     const tempPassword = newToken(9).slice(0, 14);
     const passwordHash = await bcrypt.hash(tempPassword, 12);
 
-    await prisma.$transaction([
-      prisma.user.update({ where: { id: user.id }, data: { passwordHash } }),
-      prisma.refreshSession.updateMany({
+    await prisma.$transaction(async (tx) => {
+      await acquireAuthorizationUserLock(tx, { userId: user.id });
+      const revokedAt = new Date();
+      await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
+      await tx.refreshSession.updateMany({
         where: { userId: user.id, revokedAt: null },
-        data: { revokedAt: new Date() },
-      }),
-    ]);
+        data: { revokedAt },
+      });
+    });
 
     await adminLog(req, {
       agencyId: null,
@@ -1758,21 +1765,25 @@ router.post("/devices/:id/kick", async (req, res) => {
     const device = await prisma.workerDevice.findUnique({ where: { id: req.params.id } });
     if (!device) return res.status(404).json({ ok: false, code: "DEVICE_NOT_FOUND", error: "Device not found" });
 
-    // Queue command for Electron to pick up on next heartbeat.
-    const command = await prisma.deviceCommand.create({
-      data: {
-        deviceId: device.id,
-        agencyId: device.agencyId,
-        command: "FORCE_LOGOUT",
-        payload: { reason: req.body?.reason || "admin kick" },
-        issuedByAdmin: req.admin.id,
-      },
-    });
-
-    // Also revoke refresh sessions for this user immediately.
-    await prisma.refreshSession.updateMany({
-      where: { userId: device.userId, agencyId: device.agencyId, revokedAt: null },
-      data: { revokedAt: new Date() },
+    // Queue the command and revoke auth authority in one user-serialized
+    // transaction. A concurrent login/refresh cannot publish a replacement
+    // session behind the revoke statement and survive a physically later kick.
+    const command = await prisma.$transaction(async (tx) => {
+      await acquireAuthorizationUserLock(tx, { userId: device.userId });
+      const created = await tx.deviceCommand.create({
+        data: {
+          deviceId: device.id,
+          agencyId: device.agencyId,
+          command: "FORCE_LOGOUT",
+          payload: { reason: req.body?.reason || "admin kick" },
+          issuedByAdmin: req.admin.id,
+        },
+      });
+      await tx.refreshSession.updateMany({
+        where: { userId: device.userId, agencyId: device.agencyId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      return created;
     });
 
     await adminLog(req, {

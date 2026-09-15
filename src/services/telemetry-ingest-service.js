@@ -123,7 +123,7 @@ function compactObject(value) {
   return Object.keys(out).length ? out : null;
 }
 
-async function resolveCreator({ agencyId, event, strict = false, db = prisma }) {
+async function resolveCreator({ agencyId, event, strict = false, allowRetired = false, db = prisma }) {
   const candidates = [];
   const accountId = cleanString(event.accountId, 160);
   const explicitCreatorId = cleanString(event.creatorId, 160);
@@ -142,8 +142,8 @@ async function resolveCreator({ agencyId, event, strict = false, db = prisma }) 
   for (const where of candidates) {
     try {
       const creator = await db.creatorAccount.findFirst({
-        where: { agencyId, deletedAt: null, ...where },
-        select: { id: true, username: true, remoteId: true },
+        where: { agencyId, ...(allowRetired ? {} : { deletedAt: null }), ...where },
+        select: { id: true, username: true, remoteId: true, deletedAt: true, status: true },
       });
       if (creator) return creator;
     } catch (err) {
@@ -175,6 +175,83 @@ function sameAuthorizationGenerationProof(left, right) {
     && left.creatorCatalogGeneration === right.creatorCatalogGeneration);
 }
 
+function humanAuthorizationCapture(event) {
+  const metadata = event?.metadata && typeof event.metadata === "object" && !Array.isArray(event.metadata) ? event.metadata : null;
+  const marker = metadata?.authorizationCapture;
+  if (!marker || typeof marker !== "object" || Array.isArray(marker) || Number(marker.version) !== 1) return null;
+  const semantics = cleanString(marker.semantics, 40)?.toUpperCase() || "";
+  const generation = authorizationGenerationProof(marker);
+  const localAuthorizationRevision = marker.localAuthorizationRevision == null ? null : Number(marker.localAuthorizationRevision);
+  if (!generation || !["CURRENT_HUMAN", "TERMINAL_CLOSURE"].includes(semantics)) return null;
+  if (localAuthorizationRevision !== null && (!Number.isInteger(localAuthorizationRevision) || localAuthorizationRevision < 0)) return null;
+  return { ...generation, semantics, localAuthorizationRevision };
+}
+
+async function accessGenerationEndedAt({ db, memberId, agencyId, userId, accessEpoch }) {
+  if (!db || typeof db.$queryRawUnsafe !== "function") return null;
+  const rows = await db.$queryRawUnsafe(
+    `SELECT "endedAt"
+       FROM "AgencyMemberAccessEpochBoundary"
+      WHERE "memberId"=$1
+        AND "agencyId"=$2
+        AND "userId"=$3
+        AND "accessEpoch"=$4
+      LIMIT 1`,
+    memberId, agencyId, userId, accessEpoch,
+  );
+  return optionalDate(Array.isArray(rows) ? rows[0]?.endedAt : null);
+}
+
+async function authorizationSessionEndedAt({ db, authorizationSessionId, agencyId, userId }) {
+  if (!db || typeof db.$queryRawUnsafe !== "function" || !authorizationSessionId) return null;
+  const rows = await db.$queryRawUnsafe(
+    `SELECT
+        (SELECT b."endedAt"
+           FROM "AuthorizationSessionBoundary" b
+          WHERE b."authorizationSessionId"=$1
+            AND b."agencyId"=$2
+            AND b."userId"=$3
+          LIMIT 1) AS "revokedEndedAt",
+        (SELECT MAX(r."expiresAt")
+           FROM "RefreshSession" r
+          WHERE r."authorizationSessionId"=$1
+            AND r."agencyId"=$2
+            AND r."userId"=$3) AS "naturalExpiresAt",
+        clock_timestamp() AS "dbNow"`,
+    authorizationSessionId, agencyId, userId,
+  );
+  const row = Array.isArray(rows) ? rows[0] : null;
+  const revokedEndedAt = optionalDate(row?.revokedEndedAt);
+  const naturalExpiresAt = optionalDate(row?.naturalExpiresAt);
+  const dbNow = optionalDate(row?.dbNow);
+
+  // Expiry is itself a server-owned end of authority even when no UPDATE fires.
+  // A later revoke must never move that end forward. Conversely, if there is no
+  // explicit revoke boundary and the latest lineage expiry is still in the
+  // future, fail closed: a differing current lineage proves some other boundary
+  // should exist and we must not invent it from a future expiry.
+  if (revokedEndedAt && naturalExpiresAt) {
+    return new Date(Math.min(revokedEndedAt.getTime(), naturalExpiresAt.getTime()));
+  }
+  if (revokedEndedAt) return revokedEndedAt;
+  if (naturalExpiresAt && dbNow && naturalExpiresAt.getTime() <= dbNow.getTime()) return naturalExpiresAt;
+  return null;
+}
+
+async function creatorCatalogGenerationEndedAt({ db, agencyId, generation }) {
+  if (!db || typeof db.$queryRawUnsafe !== "function") return null;
+  const rows = await db.$queryRawUnsafe(
+    `SELECT "endedAt"
+       FROM "AgencyCreatorCatalogGenerationBoundary"
+      WHERE "agencyId"=$1
+        AND "generation"=$2
+      LIMIT 1`,
+    agencyId, generation,
+  );
+  return optionalDate(Array.isArray(rows) ? rows[0]?.endedAt : null);
+}
+
+
 function terminalPerformanceClosure(event) {
   const eventKind = cleanString(event?.eventKind, 80)?.toUpperCase() || "";
   if (eventKind !== "COVERAGE_ENDED" && eventKind !== "DIALOG_SESSION") return null;
@@ -193,7 +270,9 @@ function terminalPerformanceClosure(event) {
   };
 }
 
-async function hasDurableTerminalClosureProof({ db, agencyId, deviceId, member, creatorId, event }) {
+async function hasDurableTerminalClosureProof({
+  db, agencyId, deviceId, member, creator, event, admittedAuthorizationSessionId, currentCreatorCatalogGeneration,
+}) {
   const closure = terminalPerformanceClosure(event);
   if (!closure || !member?.id || !member?.userId) return false;
   const start = await db.teamActivityEvent.findFirst({
@@ -202,7 +281,7 @@ async function hasDurableTerminalClosureProof({ db, agencyId, deviceId, member, 
       deviceId,
       memberId: member.id,
       userId: member.userId,
-      creatorId,
+      creatorId: creator?.id,
       coverageId: closure.coverageId,
       eventKind: "COVERAGE_STARTED",
       actionSource: "MANUAL",
@@ -217,7 +296,59 @@ async function hasDurableTerminalClosureProof({ db, agencyId, deviceId, member, 
   const startedUnder = authorizationGenerationProof(startMetadata?.authorizationGeneration);
   const coverageStartedAt = optionalDate(start?.startedAt) || optionalDate(start?.ts);
   if (!sameAuthorizationGenerationProof(startedUnder, closure.startedUnder) || !coverageStartedAt) return null;
-  return { closure, coverageStartedAt };
+
+  // Every component of the captured human authorization generation has its
+  // own server-owned end boundary. A terminal closure that crosses a changed
+  // component must prove that boundary; otherwise an old Desktop fact could be
+  // resurrected under a newer login/member/catalog generation.
+  let authorizationSessionEnded = null;
+  if (closure.startedUnder.authorizationScopeIncarnation !== admittedAuthorizationSessionId) {
+    authorizationSessionEnded = await authorizationSessionEndedAt({
+      db,
+      authorizationSessionId: closure.startedUnder.authorizationScopeIncarnation,
+      agencyId,
+      userId: member.userId,
+    });
+    if (!authorizationSessionEnded) return null;
+  }
+
+  let memberGenerationEndedAt = null;
+  if (Number(closure.startedUnder.accessEpoch) !== Number(member.accessEpoch)) {
+    memberGenerationEndedAt = await accessGenerationEndedAt({
+      db, memberId: member.id, agencyId, userId: member.userId, accessEpoch: closure.startedUnder.accessEpoch,
+    });
+    if (!memberGenerationEndedAt) return null;
+  }
+
+  let creatorCatalogGenerationEnded = null;
+  if (Number(closure.startedUnder.creatorCatalogGeneration) !== Number(currentCreatorCatalogGeneration)) {
+    creatorCatalogGenerationEnded = await creatorCatalogGenerationEndedAt({
+      db, agencyId, generation: closure.startedUnder.creatorCatalogGeneration,
+    });
+    if (!creatorCatalogGenerationEnded) return null;
+  }
+
+  const creatorRetiredAt = optionalDate(creator?.deletedAt);
+  // Creator retirement canonically advances AgencyCreatorCatalogState in the
+  // same retirement transaction. When that DB-clock generation boundary exists
+  // it supersedes the application-created CreatorAccount.deletedAt timestamp,
+  // which may have been computed before waiting on transaction/authority locks.
+  // Keep deletedAt only as a conservative fallback for inconsistent/legacy data
+  // where no catalog boundary is available.
+  const effectiveCreatorRetiredAt = creatorCatalogGenerationEnded || creatorRetiredAt;
+  const endCandidates = [authorizationSessionEnded, memberGenerationEndedAt, effectiveCreatorRetiredAt].filter(Boolean);
+  const authorizationEndedAt = endCandidates.length
+    ? new Date(Math.min(...endCandidates.map((value) => value.getTime())))
+    : null;
+  return {
+    closure,
+    coverageStartedAt,
+    authorizationEndedAt,
+    authorizationSessionEndedAt: authorizationSessionEnded,
+    memberGenerationEndedAt,
+    creatorCatalogGenerationEndedAt: creatorCatalogGenerationEnded,
+    creatorRetiredAt,
+  };
 }
 
 function telemetryAdmissionError(code, message, status = 403) {
@@ -228,26 +359,89 @@ function telemetryAdmissionError(code, message, status = 403) {
 }
 
 async function loadLiveTelemetryMember({ db, agencyId, memberId, userId, admittedAccessEpoch }) {
-  const live = await db.agencyMember.findFirst({
-    where: {
-      id: memberId,
-      agencyId,
-      userId,
-      deletedAt: null,
-      deactivatedAt: null,
-      agency: { deletedAt: null },
-    },
-    select: {
-      id: true, userId: true, agencyId: true, accessEpoch: true, role: true, roleKey: true,
-      assignedCreators: true, permissions: true, deletedAt: true, deactivatedAt: true,
-    },
-  });
+  let live = null;
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(
+      `SELECT m."id", m."userId", m."agencyId", m."accessEpoch", m."role", m."roleKey",
+              m."assignedCreators", m."permissions", m."deletedAt", m."deactivatedAt"
+         FROM "AgencyMember" m
+         JOIN "Agency" a ON a."id"=m."agencyId"
+        WHERE m."id"=$1
+          AND m."agencyId"=$2
+          AND m."userId"=$3
+          AND m."deletedAt" IS NULL
+          AND m."deactivatedAt" IS NULL
+          AND a."deletedAt" IS NULL
+        LIMIT 1
+        FOR SHARE OF m`,
+      memberId, agencyId, userId,
+    );
+    live = Array.isArray(rows) ? rows.find((row) => row && row.id && row.accessEpoch !== undefined) || null : null;
+  }
+  if (!live && db?.agencyMember?.findFirst) {
+    // Reduced test doubles often expose $queryRawUnsafe only for DB clock
+    // authority. Production PostgreSQL returns the member row from the locked
+    // SELECT above; this fallback preserves unit-test compatibility without
+    // weakening the production commit fence.
+    live = await db.agencyMember.findFirst({
+      where: {
+        id: memberId, agencyId, userId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null },
+      },
+      select: {
+        id: true, userId: true, agencyId: true, accessEpoch: true, role: true, roleKey: true,
+        assignedCreators: true, permissions: true, deletedAt: true, deactivatedAt: true,
+      },
+    });
+  }
   if (!live) throw telemetryAdmissionError("TELEMETRY_MEMBER_STALE", "Agency membership is no longer active");
   if (Number(live.accessEpoch || 1) !== Number(admittedAccessEpoch || 1)) {
     throw telemetryAdmissionError("TELEMETRY_ACCESS_EPOCH_STALE", "Creator access changed while telemetry batch was in flight");
   }
   return live;
 }
+
+async function lockLiveAuthorizationSession({ db, agencyId, userId, deviceId, authorizationSessionId }) {
+  if (!authorizationSessionId) throw telemetryAdmissionError("TELEMETRY_AUTHORIZATION_SESSION_REQUIRED", "Authorization session lineage is required", 401);
+  if (typeof db?.$queryRawUnsafe !== "function") return { authorizationSessionId };
+  const rows = await db.$queryRawUnsafe(
+    `SELECT "id", "authorizationSessionId"
+       FROM "RefreshSession"
+      WHERE "userId"=$1
+        AND "agencyId"=$2
+        AND "deviceId"=$3
+        AND "authorizationSessionId"=$4
+        AND "revokedAt" IS NULL
+        AND "expiresAt" > clock_timestamp()
+      ORDER BY "createdAt" DESC
+      LIMIT 1
+      FOR SHARE`,
+    userId, agencyId, deviceId, authorizationSessionId,
+  );
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (!row) throw telemetryAdmissionError("TELEMETRY_AUTHORIZATION_SESSION_STALE", "Login authorization generation changed while telemetry was in flight");
+  return row;
+}
+
+async function lockCreatorCatalogGeneration({ db, agencyId }) {
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(
+      `SELECT "generation"
+         FROM "AgencyCreatorCatalogState"
+        WHERE "agencyId"=$1
+        LIMIT 1
+        FOR SHARE`,
+      agencyId,
+    );
+    const row = Array.isArray(rows) ? rows.find((item) => item && item.generation !== undefined) : null;
+    if (row) return Number(row.generation);
+  }
+  if (db?.agencyCreatorCatalogState?.findUnique) {
+    const row = await db.agencyCreatorCatalogState.findUnique({ where: { agencyId }, select: { generation: true } });
+    if (row) return Number(row.generation);
+  }
+  throw telemetryAdmissionError("TELEMETRY_CREATOR_CATALOG_STALE", "Creator catalog generation is unavailable");
+}
+
 
 function canonicalNeedsHumanActor(eventKind, actionSource) {
   if (HUMAN_ACTIVITY_KINDS.has(eventKind)) return true;
@@ -257,6 +451,12 @@ function canonicalNeedsHumanActor(eventKind, actionSource) {
     return actionSource === "MANUAL";
   }
   return false;
+}
+
+function eventRequiresHumanAuthorizationCapture(event) {
+  const eventKind = cleanString(event?.eventKind, 80)?.toUpperCase() || "";
+  const actionSource = cleanString(event?.actionSource, 40)?.toUpperCase() || "";
+  return canonicalNeedsHumanActor(eventKind, actionSource);
 }
 
 function canonicalMustNotHaveHumanActor(eventKind, actionSource) {
@@ -311,7 +511,12 @@ function canonicalHumanSessionTimes({
     const coverageStartedAt = optionalDate(terminalClosureProof.coverageStartedAt);
     const boundaryOffsetSeconds = Math.max(0, Math.min(24 * 60 * 60, Number(terminalClosureProof.closure?.boundaryOffsetSeconds) || 0));
     if (coverageStartedAt) {
-      const terminalAt = new Date(Math.min(at.getTime(), coverageStartedAt.getTime() + boundaryOffsetSeconds * 1000));
+      const serverGenerationEnd = optionalDate(terminalClosureProof.authorizationEndedAt);
+      const terminalAt = new Date(Math.min(
+        at.getTime(),
+        coverageStartedAt.getTime() + boundaryOffsetSeconds * 1000,
+        serverGenerationEnd ? serverGenerationEnd.getTime() : Number.POSITIVE_INFINITY,
+      ));
       if (eventKind === "COVERAGE_ENDED") return { startedAt: coverageStartedAt, endedAt: terminalAt };
       const wallSeconds = Math.max(0, Math.min(24 * 60 * 60, Number(rawMetadata?.wallSeconds ?? durationSeconds) || 0));
       return {
@@ -396,16 +601,21 @@ function normalizeCanonicalCore({ agencyId, deviceId, event, creator, authentica
     metadata,
   });
 
-  const durationSeconds = nonNegativeInt(event.durationSeconds);
+  const reportedDurationSeconds = nonNegativeInt(event.durationSeconds);
   const sessionTimes = canonicalHumanSessionTimes({
     eventKind,
     authorityNow: ts,
-    durationSeconds,
+    durationSeconds: reportedDurationSeconds,
     rawStartedAt: optionalDate(event.startedAt),
     rawEndedAt: optionalDate(event.endedAt),
     terminalClosureProof,
     rawMetadata: event.metadata,
   });
+  let durationSeconds = reportedDurationSeconds;
+  if (terminalClosureProof && sessionTimes.startedAt && sessionTimes.endedAt && durationSeconds !== null) {
+    const canonicalWallSeconds = Math.max(0, Math.round((sessionTimes.endedAt.getTime() - sessionTimes.startedAt.getTime()) / 1000));
+    durationSeconds = Math.min(durationSeconds, canonicalWallSeconds);
+  }
   const canonicalCreatorId = creator?.id || null;
   const canonicalAccountId = cleanString(event.accountId || event.creatorId, 160);
   const canonicalMessageId = cleanString(event.messageId, 220);
@@ -510,7 +720,91 @@ async function persistCanonicalTeamEventRow({ db, row }) {
   }
 }
 
-async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, admittedAccessEpoch = 1, events = [] }) {
+const TEAM_TELEMETRY_TX_CHUNK_SIZE = 16;
+
+async function ingestCanonicalTeamEventInTx({
+  tx, agencyId, deviceId, event, liveMember, admittedAuthorizationSessionId, currentCreatorCatalogGeneration,
+}) {
+  const eventKind = cleanString(event.eventKind, 80)?.toUpperCase() || "";
+  const actionSource = cleanString(event.actionSource, 40)?.toUpperCase() || "";
+  const requiresHuman = canonicalNeedsHumanActor(eventKind, actionSource);
+  const authorizationCapture = requiresHuman ? humanAuthorizationCapture(event) : null;
+  if (requiresHuman && !authorizationCapture) return { rejected: "human_authorization_capture_required" };
+  if (authorizationCapture?.semantics === "CURRENT_HUMAN") {
+    const exactGeneration = authorizationCapture.authorizationScopeIncarnation === admittedAuthorizationSessionId
+      && Number(authorizationCapture.accessEpoch) === Number(liveMember.accessEpoch)
+      && Number(authorizationCapture.creatorCatalogGeneration) === Number(currentCreatorCatalogGeneration);
+    if (!exactGeneration) return { rejected: "human_authorization_generation_stale" };
+  }
+
+  const terminalClosure = terminalPerformanceClosure(event);
+  // Normal/current telemetry must resolve only a live Creator. A terminal
+  // closure may resolve a retired Creator solely so the server can prove
+  // and clamp an already-existing performance session to the canonical
+  // Creator retirement boundary.
+  const creator = await resolveCreator({ agencyId, event, strict: true, allowRetired: Boolean(terminalClosure), db: tx });
+  if (!creator) return { rejected: "creator_not_found" };
+  if (authorizationCapture?.semantics === "TERMINAL_CLOSURE") {
+    if (!terminalClosure || !sameAuthorizationGenerationProof(authorizationCapture, terminalClosure.startedUnder)) {
+      return { rejected: "authorization_terminal_capture_mismatch" };
+    }
+  } else if (terminalClosure) {
+    return { rejected: "authorization_terminal_capture_required" };
+  }
+
+  const terminalClosureProof = terminalClosure
+    ? await hasDurableTerminalClosureProof({
+      db: tx,
+      agencyId,
+      deviceId,
+      member: liveMember,
+      creator,
+      event,
+      admittedAuthorizationSessionId,
+      currentCreatorCatalogGeneration,
+    })
+    : null;
+  if (terminalClosure && !terminalClosureProof) return { rejected: "authorization_terminal_closure_unproven" };
+
+  const creatorRetired = Boolean(optionalDate(creator.deletedAt));
+  if (creatorRetired) {
+    // Retirement is creator-wide even for OWNER/all-scope members. Only a
+    // proven COVERAGE_ENDED may terminate the already-existing durable
+    // session after retirement. DIALOG_SESSION has no independent durable
+    // START proof and remains fail-closed.
+    if (!terminalClosureProof || terminalClosureProof.closure.eventKind !== "COVERAGE_ENDED") {
+      return { rejected: "creator_retired" };
+    }
+  } else if (!canAccessCreator(liveMember, creator.id)) {
+    // Only COVERAGE_ENDED can bypass a later scoped creator revoke: the
+    // durable matching COVERAGE_STARTED row proves an already-existing
+    // server session that this event can only terminate. DIALOG_SESSION
+    // has no durable START row of its own, so accepting it after revoke
+    // would create a new performance record rather than close proven state.
+    if (!terminalClosureProof || terminalClosureProof.closure.eventKind !== "COVERAGE_ENDED") {
+      return { rejected: "creator_access_forbidden" };
+    }
+  }
+
+  const authorityNow = await dbAuthorityNow({ db: tx });
+  const result = normalizeCanonicalCore({
+    agencyId,
+    deviceId,
+    event,
+    creator,
+    authenticatedMember: liveMember,
+    authorityNow,
+    terminalClosureProof,
+  });
+  if (!result.row) return { rejected: result.reason || "invalid_contract" };
+  const row = result.row;
+
+  return persistCanonicalTeamEventRow({ db: tx, row });
+}
+
+async function ingestTeamEvents({
+  agencyId, deviceId, userId, memberId = null, admittedAccessEpoch = 1, admittedAuthorizationSessionId = null, events = [],
+}) {
   const input = Array.isArray(events) ? events : [];
   let inserted = 0;
   let duplicated = 0;
@@ -528,7 +822,10 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
     rejectedByReason[reason] = (rejectedByReason[reason] || 0) + 1;
     rejectedEvents.push({ localId: cleanString(event?.localId, 160), reason });
   };
+  const candidates = [];
 
+  // Contract-only rejects do not need a database transaction. Everything that
+  // can affect authority/projections enters a bounded SERIALIZABLE chunk below.
   for (const rawEvent of input) {
     const event = stripInternalEventFields(rawEvent);
     if (!event || typeof event !== "object") {
@@ -539,10 +836,19 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
       reject(event, "legacy_telemetry_disabled");
       continue;
     }
+    candidates.push(event);
+  }
 
-    let durable = null;
+  for (let offset = 0; offset < candidates.length; offset += TEAM_TELEMETRY_TX_CHUNK_SIZE) {
+    const chunk = candidates.slice(offset, offset + TEAM_TELEMETRY_TX_CHUNK_SIZE);
+    let outcomes = null;
     try {
-      durable = await runDbTransaction(prisma, async (tx) => {
+      outcomes = await runDbTransaction(prisma, async (tx) => {
+        // One current member-generation SHARE lock owns this bounded chunk. A
+        // concurrent accessEpoch mutation cannot pass the chunk and then let
+        // stale human events physically commit afterward. The small fixed chunk
+        // bound prevents one 1000-event request from holding the generation lock
+        // for the entire HTTP batch.
         const liveMember = await loadLiveTelemetryMember({
           db: tx,
           agencyId,
@@ -550,100 +856,46 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
           userId,
           admittedAccessEpoch,
         });
-        const creator = await resolveCreator({ agencyId, event, strict: true, db: tx });
-        if (!creator) return { rejected: "creator_not_found" };
-        const terminalClosure = terminalPerformanceClosure(event);
-        const terminalClosureProof = terminalClosure
-          ? await hasDurableTerminalClosureProof({
-            db: tx,
-            agencyId,
-            deviceId,
-            member: liveMember,
-            creatorId: creator.id,
-            event,
-          })
+        const chunkHasHumanPerformance = chunk.some((event) => eventRequiresHumanAuthorizationCapture(event));
+        if (chunkHasHumanPerformance) {
+          await lockLiveAuthorizationSession({
+            db: tx, agencyId, userId, deviceId, authorizationSessionId: admittedAuthorizationSessionId,
+          });
+        }
+        const currentCreatorCatalogGeneration = chunkHasHumanPerformance
+          ? await lockCreatorCatalogGeneration({ db: tx, agencyId })
           : null;
-        if (terminalClosure && !terminalClosureProof) return { rejected: "authorization_terminal_closure_unproven" };
-        if (!canAccessCreator(liveMember, creator.id)) {
-          // Only COVERAGE_ENDED can bypass a later creator revoke: the durable
-          // matching COVERAGE_STARTED row proves an already-existing server
-          // session that this event can only terminate. DIALOG_SESSION has no
-          // durable START row of its own, so accepting it after revoke would
-          // create a new performance record rather than close proven state.
-          if (!terminalClosureProof || terminalClosureProof.closure.eventKind !== "COVERAGE_ENDED") {
-            return { rejected: "creator_access_forbidden" };
-          }
-        }
-
-        const authorityNow = await dbAuthorityNow({ db: tx });
-        const result = normalizeCanonicalCore({
-          agencyId,
-          deviceId,
-          event,
-          creator,
-          authenticatedMember: liveMember,
-          authorityNow,
-          terminalClosureProof,
-        });
-        if (!result.row) return { rejected: result.reason || "invalid_contract" };
-        const row = result.row;
-
-        if (row.localId) {
-          const exists = await tx.teamActivityEvent.findFirst({
-            where: { agencyId: row.agencyId, deviceId: row.deviceId, localId: row.localId },
+        const results = [];
+        for (const event of chunk) {
+          const durable = await ingestCanonicalTeamEventInTx({
+            tx, agencyId, deviceId, event, liveMember, admittedAuthorizationSessionId, currentCreatorCatalogGeneration,
           });
-          if (exists) {
-            // localId is the durable idempotency identity for this device.  Once committed,
-            // every replay projection must come from the stored canonical event, never from
-            // a newly supplied payload carrying the same localId.  Otherwise a mutated replay
-            // could change money/Custom/response side effects without changing TeamActivityEvent.
-            const durableRow = exists;
-            await applyLedgerSideEffects(durableRow, tx);
-            await dispatchTeamProjectionForDurableEvent(durableRow, tx);
-            await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
-            await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
-            return { row: durableRow, duplicated: true };
-          }
+          results.push({ event, durable });
         }
-        try {
-          const created = await tx.teamActivityEvent.create({ data: row });
-          const durableRow = { ...row, id: created.id };
-          await applyLedgerSideEffects(durableRow, tx);
-          await dispatchTeamProjectionForDurableEvent(durableRow, tx);
-          await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
-            await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
-          return { row: durableRow, inserted: true };
-        } catch (err) {
-          if (err?.code !== "P2002" || !row.localId) throw err;
-          const exists = await tx.teamActivityEvent.findFirst({
-            where: { agencyId: row.agencyId, deviceId: row.deviceId, localId: row.localId },
-          });
-          if (!exists) throw err;
-          const durableRow = exists;
-          await applyLedgerSideEffects(durableRow, tx);
-          await dispatchTeamProjectionForDurableEvent(durableRow, tx);
-          await projectCustomDeliveryFromTeamEvent(durableRow, { db: tx });
-            await projectNativeMassWriteFromTeamEvent(durableRow, { db: tx });
-          return { row: durableRow, duplicated: true };
-        }
+        return results;
       }, serializableTxOptions());
     } catch (err) {
-      if (["TELEMETRY_MEMBER_STALE", "TELEMETRY_ACCESS_EPOCH_STALE"].includes(err?.code)) throw err;
+      if ([
+        "TELEMETRY_MEMBER_STALE", "TELEMETRY_ACCESS_EPOCH_STALE",
+        "TELEMETRY_AUTHORIZATION_SESSION_REQUIRED", "TELEMETRY_AUTHORIZATION_SESSION_STALE",
+        "TELEMETRY_CREATOR_CATALOG_STALE",
+      ].includes(err?.code)) throw err;
       throw err;
     }
 
-    if (durable?.rejected) {
-      reject(event, durable.rejected);
-      continue;
+    for (const { event, durable } of outcomes || []) {
+      if (durable?.rejected) {
+        reject(event, durable.rejected);
+        continue;
+      }
+      if (!durable?.row) {
+        reject(event, "durable_event_missing");
+        continue;
+      }
+      if (durable.inserted) inserted += 1;
+      if (durable.duplicated) duplicated += 1;
+      if (durable.row.localId) acknowledgedLocalIds.push(durable.row.localId);
     }
-    if (!durable?.row) {
-      reject(event, "durable_event_missing");
-      continue;
-    }
-
-    if (durable.inserted) inserted += 1;
-    if (durable.duplicated) duplicated += 1;
-    if (durable.row.localId) acknowledgedLocalIds.push(durable.row.localId);
   }
 
   return {
@@ -661,6 +913,8 @@ async function ingestTeamEvents({ agencyId, deviceId, userId, memberId = null, a
 module.exports = {
   TEAM_V13_VERSION,
   TEAM_V13_SOURCE,
+  TEAM_TELEMETRY_TX_CHUNK_SIZE,
+  eventRequiresHumanAuthorizationCapture,
   ingestTeamEvents,
   normalizeCanonicalCore,
   persistCanonicalTeamEventRow,

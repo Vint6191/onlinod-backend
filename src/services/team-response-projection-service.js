@@ -256,8 +256,17 @@ async function upsertDialogSession(row, db = prisma) {
   if (!agencyId || !creatorId || !memberId || !dialogId || !sessionId || !startedAt || !endedAt) return null;
 
   const meta = metadataOf(row);
-  const wallSeconds = Math.max(0, Number(meta.wallSeconds ?? secondsBetween(startedAt, endedAt) ?? 0) || 0);
-  const activeSeconds = Math.max(0, Number(meta.activeSeconds ?? row.durationSeconds ?? 0) || 0);
+  const canonicalWallSeconds = Math.max(0, Number(secondsBetween(startedAt, endedAt) ?? 0) || 0);
+  let wallSeconds = Math.max(0, Number(meta.wallSeconds ?? canonicalWallSeconds) || 0);
+  let activeSeconds = Math.max(0, Number(meta.activeSeconds ?? row.durationSeconds ?? 0) || 0);
+  if (isAuthorizationTerminalClosure(row)) {
+    // Raw Desktop wall/active counters are evidence, not authority for the
+    // post-revoke interval. The canonical row chronology is already clamped to
+    // the durable server access-generation boundary, so terminal dialog metrics
+    // must never exceed that bounded chronology.
+    wallSeconds = Math.min(wallSeconds, canonicalWallSeconds);
+    activeSeconds = Math.min(activeSeconds, wallSeconds);
+  }
   const activityEvents = Math.max(0, Math.round(Number(meta.activityEvents ?? 0) || 0));
   const seenAt = dateOrNull(meta.seenAt);
   const endReason = clean(meta.endReason || meta.reason || null, 120);

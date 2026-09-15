@@ -450,6 +450,19 @@ model AgencyMember {
   @@index([deactivatedAt])
 }
 
+model AgencyMemberAccessEpochBoundary {
+  memberId        String
+  agencyId        String
+  userId          String
+  accessEpoch     Int
+  nextAccessEpoch Int
+  endedAt         DateTime
+  createdAt       DateTime @default(now())
+
+  @@id([memberId, accessEpoch])
+  @@index([agencyId, userId, endedAt])
+}
+
 model TeamMemberFunction {
   id          String   @id @default(cuid())
   agencyId    String
@@ -945,6 +958,10 @@ model RefreshSession {
   client     String?
   rememberDevice Boolean @default(false)
   impersonatedByAdminId String?
+  // Stable server-issued login lineage. Refresh-token rotation preserves this
+  // value; logout/relogin creates a different lineage. Legacy pre-cutover rows
+  // are NULL and may be adopted exactly once during rolling upgrade.
+  authorizationSessionId String?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -952,7 +969,30 @@ model RefreshSession {
   @@index([agencyId])
   @@index([expiresAt])
   @@index([deviceId])
+  @@index([authorizationSessionId])
   @@index([impersonatedByAdminId])
+}
+
+model AuthorizationSessionBoundary {
+  authorizationSessionId String   @id
+  userId                 String
+  agencyId               String
+  deviceId               String?
+  endedAt                DateTime
+  createdAt              DateTime @default(now())
+
+  @@index([agencyId, userId, endedAt])
+}
+
+model AgencyCreatorCatalogGenerationBoundary {
+  agencyId        String
+  generation      Int
+  nextGeneration  Int
+  endedAt         DateTime
+  createdAt       DateTime @default(now())
+
+  @@id([agencyId, generation])
+  @@index([agencyId, endedAt])
 }
 
 

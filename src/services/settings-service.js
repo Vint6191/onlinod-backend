@@ -3,6 +3,7 @@
 const bcrypt = require("bcryptjs");
 const prisma = require("../prisma");
 const { publicUser, issuePasswordReset } = require("./auth-service");
+const { acquireAuthorizationUserLock, withAuthorizationUserLock } = require("./authorization-session-authority-service");
 const { audit } = require("./audit-service");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./telegram-mtproto-credentials");
@@ -219,6 +220,7 @@ async function changeAccountPassword({ agencyId, userId, currentPassword, newPas
   const now = new Date();
   const deviceId = clean(currentDeviceId, 160);
   await client.$transaction(async (tx) => {
+    await acquireAuthorizationUserLock(tx, { userId });
     await tx.user.update({ where: { id: userId }, data: { passwordHash } });
     await tx.refreshSession.updateMany({
       where: {
@@ -254,14 +256,16 @@ async function logoutAccountDevice({ agencyId, userId, targetDeviceId, currentDe
     throw err;
   }
   const now = new Date();
-  const result = await client.refreshSession.updateMany({
+  const result = await withAuthorizationUserLock({ db: client, userId, work: async (tx) => tx.refreshSession.updateMany({
     // Account-level device logout is intentionally not scoped to the current
     // agency. It signs this user's logical device out everywhere without
     // touching another user, WorkerDevice telemetry, creator bindings or any
-    // E2E crypto identity/wrap state.
+    // E2E crypto identity/wrap state. The user advisory fence composes with
+    // login/refresh publication so a same-user rotation cannot appear behind
+    // this revoke statement's snapshot and survive a physically later logout.
     where: { userId, deviceId: target, revokedAt: null },
     data: { revokedAt: now },
-  });
+  }) });
   if (!result.count) {
     const err = new Error("Device has no active account session");
     err.code = "SETTINGS_DEVICE_NOT_ACTIVE";
@@ -291,14 +295,19 @@ async function logoutOtherAccountDevices({ agencyId, userId, currentDeviceId, db
     throw err;
   }
   const now = new Date();
-  const active = await client.refreshSession.findMany({
-    where: { userId, revokedAt: null, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
-    select: { deviceId: true },
-  });
-  const result = await client.refreshSession.updateMany({
-    where: { userId, revokedAt: null, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
-    data: { revokedAt: now },
-  });
+  const mutation = await withAuthorizationUserLock({ db: client, userId, work: async (tx) => {
+    const active = await tx.refreshSession.findMany({
+      where: { userId, revokedAt: null, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
+      select: { deviceId: true },
+    });
+    const result = await tx.refreshSession.updateMany({
+      where: { userId, revokedAt: null, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
+      data: { revokedAt: now },
+    });
+    return { active, result };
+  } });
+  const active = mutation.active;
+  const result = mutation.result;
   const loggedOutDeviceIds = Array.from(new Set(active.map((row) => clean(row.deviceId, 160)).filter(Boolean))).sort();
   await audit({
     agencyId,
@@ -328,7 +337,10 @@ async function revokeAccountSession({ agencyId, userId, sessionId, currentDevice
     const result = await logoutAccountDevice({ agencyId, userId, targetDeviceId, currentDeviceId, db: client });
     return { ok: true, currentDeviceRevoked: result.currentDeviceLoggedOut };
   }
-  await client.refreshSession.update({ where: { id: session.id }, data: { revokedAt: new Date() } });
+  await withAuthorizationUserLock({ db: client, userId, work: async (tx) => tx.refreshSession.updateMany({
+    where: { id: session.id, userId, revokedAt: null },
+    data: { revokedAt: new Date() },
+  }) });
   await audit({ agencyId, actorUserId: userId, action: "settings.account.session_revoked", targetType: "refresh_session", targetId: session.id, metadata: { deviceId: null, client: session.client || null, currentDeviceRevoked: false }, db: client });
   return { ok: true, currentDeviceRevoked: false };
 }

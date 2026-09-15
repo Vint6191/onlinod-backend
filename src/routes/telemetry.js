@@ -2,7 +2,7 @@
 
 const express = require("express");
 const { z } = require("zod");
-const { ingestTeamEvents } = require("../services/telemetry-ingest-service");
+const { ingestTeamEvents, eventRequiresHumanAuthorizationCapture } = require("../services/telemetry-ingest-service");
 const prisma = require("../prisma");
 const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-capabilities");
 const { requireAuthDevice } = require("../middleware/auth");
@@ -14,7 +14,7 @@ const ingestSchema = z.object({
   events: z.array(z.any()).max(1000),
 });
 
-router.post("/events/ingest", async (req, res) => {
+async function ingestCurrentAuthorized(req, res) {
   try {
     const input = ingestSchema.parse(req.body || {});
     const agencyId = req.auth.agencyId;
@@ -29,6 +29,7 @@ router.post("/events/ingest", async (req, res) => {
       userId: req.auth.userId,
       memberId: req.auth.memberId || null,
       admittedAccessEpoch: Number(req.auth.membership?.accessEpoch || 1),
+      admittedAuthorizationSessionId: req.auth.authorizationSessionId || null,
       events: input.events,
     });
 
@@ -39,6 +40,32 @@ router.post("/events/ingest", async (req, res) => {
     if (status >= 500) console.error("[telemetry/ingest] failed:", err);
     return res.status(status).json({ ok: false, code: err?.code || "TELEMETRY_INGEST_FAILED", error: err?.message || "Failed" });
   }
+}
+
+// Rolling activation: old Desktop versions use /events/ingest and do not carry
+// durable human authorization-generation provenance. Returning a non-2xx retry
+// gate preserves their SQLite outbox; returning 200 + row rejection would make
+// legacy clients dead-letter still-valid human performance during mixed rollout.
+router.post("/events/ingest", async (req, res, next) => {
+  try {
+    const input = ingestSchema.parse(req.body || {});
+    if (input.events.some((event) => eventRequiresHumanAuthorizationCapture(event))) {
+      return res.status(409).json({
+        ok: false,
+        code: "TELEMETRY_CLIENT_UPGRADE_REQUIRED",
+        error: "Human performance telemetry requires the current generation-aware Desktop client",
+      });
+    }
+    return ingestCurrentAuthorized(req, res);
+  } catch (error) {
+    return next(error);
+  }
+});
+router.post("/events/ingest/current-authorized", (req, res) => {
+  if (!req.auth?.authorizationSessionId) {
+    return res.status(401).json({ ok: false, code: "AUTHORIZATION_SESSION_REQUIRED", error: "Current authorization session lineage is required" });
+  }
+  return ingestCurrentAuthorized(req, res);
 });
 
 function telemetryCreatorScope(member) {

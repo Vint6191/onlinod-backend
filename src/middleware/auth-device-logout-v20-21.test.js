@@ -4,10 +4,10 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const Module = require("node:module");
 
-function loadAuthMiddleware({ membership, decoded }) {
+function loadAuthMiddleware({ membership, decoded, onMembershipQuery = null }) {
   const original = Module._load;
   Module._load = function(request, parent, isMain) {
-    if (request === "../prisma") return { agencyMember: { findFirst: async () => membership } };
+    if (request === "../prisma") return { agencyMember: { findFirst: async (args) => { onMembershipQuery?.(args); return membership; } } };
     if (request === "../utils/tokens") return { verifyAccessToken: () => decoded };
     if (request === "../utils/device-binding") return { requireBoundAccessDevice: () => ({}) };
     return original.call(this, request, parent, isMain);
@@ -61,4 +61,33 @@ test("same access JWT remains valid while its own device has an active refresh l
   assert.equal(state.status, 200);
   assert.equal(req.auth.deviceId, "device-a");
   assert.equal("refreshSessions" in req.auth.user, false, "refresh lineage is internal auth state, not exposed downstream");
+});
+
+
+test("lineaged access JWT requires that exact authorizationSessionId, not merely any live row on the device", async () => {
+  let query = null;
+  const auth = loadAuthMiddleware({
+    membership: membership([{ id: "refresh-b", authorizationSessionId: "scope-B" }]),
+    decoded: { ...decoded, authorizationSessionId: "scope-A" },
+    onMembershipQuery: (args) => { query = args; },
+  });
+  const { state, res } = responseRecorder();
+  await auth.authRequired({ headers: { authorization: "Bearer token" } }, res, () => {});
+  assert.equal(query.where.userId, "user-1");
+  const refreshWhere = query.include.user.include.refreshSessions.where;
+  assert.equal(refreshWhere.deviceId, "device-a");
+  assert.equal(refreshWhere.authorizationSessionId, "scope-A");
+});
+
+test("legacy JWT can only match a legacy NULL-lineage refresh row during rolling upgrade", async () => {
+  let query = null;
+  const auth = loadAuthMiddleware({
+    membership: membership([{ id: "legacy-refresh" }]),
+    decoded,
+    onMembershipQuery: (args) => { query = args; },
+  });
+  const { res } = responseRecorder();
+  await auth.authRequired({ headers: { authorization: "Bearer token" } }, res, () => {});
+  const refreshWhere = query.include.user.include.refreshSessions.where;
+  assert.equal(refreshWhere.authorizationSessionId, null);
 });

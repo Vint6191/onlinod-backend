@@ -8,16 +8,24 @@ const ledgerPath = require.resolve("./team-ppv-ledger-service");
 const projectionPath = require.resolve("./team-response-projection-service");
 const servicePath = require.resolve("./telemetry-ingest-service");
 
-function loadService({ failSideEffects = 0, failCreatorLookup = false, assignedCreators = undefined } = {}) {
+function loadService({ failSideEffects = 0, failSideEffectAt = null, failCreatorLookup = false, assignedCreators = undefined } = {}) {
   const created = [];
   const rows = [];
   const sideEffects = [];
   const projections = [];
-  const sideEffectState = { failuresRemaining: failSideEffects };
+  const sideEffectState = { failuresRemaining: failSideEffects, failAt: failSideEffectAt, calls: 0 };
   const authority = { accessEpoch: 1, assignedCreators, afterCommit: null, transactions: 0 };
   const prisma = {
     async $queryRawUnsafe(sql) {
-      if (/clock_timestamp/i.test(String(sql || ""))) return [{ authorityNow: new Date("2026-08-11T20:00:30.000Z") }];
+      const text = String(sql || "");
+      if (/FROM "RefreshSession"/i.test(text) && /FOR SHARE/i.test(text)) return [{ id: "refresh-current", authorizationSessionId: "scope-A" }];
+      if (/FROM "AgencyCreatorCatalogState"/i.test(text) && /FOR SHARE/i.test(text)) return [{ generation: 3 }];
+      if (/FROM "AgencyMember"/i.test(text) && /FOR SHARE OF m/i.test(text)) return [{
+        id: "member-1", userId: "user-1", agencyId: "agency-1", accessEpoch: authority.accessEpoch,
+        role: "CHATTER", roleKey: "chatter", assignedCreators: authority.assignedCreators, permissions: {},
+        deletedAt: null, deactivatedAt: null,
+      }];
+      if (/clock_timestamp/i.test(text)) return [{ authorityNow: new Date("2026-08-11T20:00:30.000Z") }];
       return [];
     },
     async $transaction(work) {
@@ -83,8 +91,9 @@ function loadService({ failSideEffects = 0, failCreatorLookup = false, assignedC
     loaded: true,
     exports: { async applyLedgerSideEffects(row) {
       sideEffects.push(row);
-      if (sideEffectState.failuresRemaining > 0) {
-        sideEffectState.failuresRemaining -= 1;
+      sideEffectState.calls += 1;
+      if (sideEffectState.failuresRemaining > 0 || sideEffectState.calls === sideEffectState.failAt) {
+        if (sideEffectState.failuresRemaining > 0) sideEffectState.failuresRemaining -= 1;
         throw new Error("synthetic ledger failure");
       }
     } },
@@ -115,6 +124,12 @@ function canonical(overrides = {}) {
     localId: "local-1",
     actorMemberId: "member-1",
     actorUserId: "user-1",
+    metadata: {
+      authorizationCapture: {
+        version: 1, semantics: "CURRENT_HUMAN", authorizationScopeIncarnation: "scope-A",
+        accessEpoch: 1, creatorCatalogGeneration: 3, localAuthorizationRevision: 1,
+      },
+    },
     ...overrides,
   };
 }
@@ -126,6 +141,7 @@ async function ingest(service, events, overrides = {}) {
     userId: "user-1",
     memberId: "member-1",
     admittedAccessEpoch: 1,
+    admittedAuthorizationSessionId: "scope-A",
     events,
     ...overrides,
   });
@@ -296,6 +312,27 @@ test("v13 event and ownership projections roll back atomically when a side effec
   assert.equal(sideEffects.length, 2, "retry replays the projection only after live authority is revalidated");
 });
 
+test("F59-SCALE-1 fatal side effect rolls back only the bounded chunk and the chunk retries idempotently", async () => {
+  const { service, rows, sideEffectState, authority } = loadService({ failSideEffectAt: 2 });
+  const events = [
+    canonical({ localId: "chunk-retry-1", messageId: "chunk-retry-message-1" }),
+    canonical({ localId: "chunk-retry-2", messageId: "chunk-retry-message-2" }),
+    canonical({ localId: "chunk-retry-3", messageId: "chunk-retry-message-3" }),
+  ];
+
+  await assert.rejects(() => ingest(service, events), /synthetic ledger failure/);
+  assert.equal(rows.length, 0, "a fatal DB/projection error rolls back the whole bounded transaction chunk");
+  assert.equal(authority.transactions, 0, "the failed chunk is not counted as committed by the transaction double");
+
+  sideEffectState.failAt = null;
+  const retry = await ingest(service, events);
+  assert.equal(retry.inserted, 3);
+  assert.equal(retry.duplicated, 0);
+  assert.equal(rows.length, 3);
+  assert.equal(new Set(rows.map((row) => row.localId)).size, 3);
+  assert.equal(authority.transactions, 1);
+});
+
 test("v13 mixed batch returns exact per-row acknowledgement identities", async () => {
   const { service, rows } = loadService();
   const result = await ingest(service, [
@@ -338,20 +375,90 @@ test("Audit15 rejects v13 provenance for an unassigned creator before durable si
   assert.equal(sideEffects.length, 0);
 });
 
-test("Audit15 accessEpoch change between batch events fences remaining stale telemetry", async () => {
+test("Audit15 accessEpoch change between bounded chunks fences remaining stale telemetry", async () => {
   const { service, rows, authority } = loadService({ assignedCreators: ["creator-1"] });
+  const size = service.TEAM_TELEMETRY_TX_CHUNK_SIZE;
+  assert.equal(size, 16, "regression envelope assumes the production bounded chunk size");
   authority.afterCommit = (count) => {
     if (count === 1) authority.accessEpoch = 2;
   };
+  const events = Array.from({ length: size + 1 }, (_, index) => canonical({
+    localId: `epoch-${index + 1}`,
+    messageId: `epoch-message-${index + 1}`,
+  }));
   await assert.rejects(
-    () => ingest(service, [
-      canonical({ localId: "epoch-first", messageId: "epoch-message-1" }),
-      canonical({ localId: "epoch-second", messageId: "epoch-message-2" }),
-    ]),
+    () => ingest(service, events),
     (error) => error?.code === "TELEMETRY_ACCESS_EPOCH_STALE"
   );
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].localId, "epoch-first");
+  assert.equal(rows.length, size, "the first SHARE-locked chunk commits entirely under G1");
+  assert.equal(authority.transactions, 1, "the stale second chunk must fail before commit");
+  assert.equal(rows.at(-1).localId, `epoch-${size}`);
+});
+
+test("F59-SCALE-1 batches 100 current telemetry events into bounded SERIALIZABLE chunks", async () => {
+  const { service, rows, authority } = loadService({ assignedCreators: ["creator-1"] });
+  const events = Array.from({ length: 100 }, (_, index) => canonical({
+    localId: `scale-100-${index}`,
+    messageId: `scale-100-message-${index}`,
+  }));
+  const result = await ingest(service, events);
+  assert.equal(result.accepted, 100);
+  assert.equal(result.skipped, 0);
+  assert.equal(rows.length, 100);
+  assert.equal(authority.transactions, Math.ceil(100 / service.TEAM_TELEMETRY_TX_CHUNK_SIZE));
+  assert.ok(authority.transactions <= 7, `100 events should require <=7 transactions, got ${authority.transactions}`);
+});
+
+test("F59-SCALE-1 1000-event request is bounded to <=63 SERIALIZABLE transactions without losing acknowledgements", async () => {
+  const { service, rows, authority } = loadService({ assignedCreators: ["creator-1"] });
+  const events = Array.from({ length: 1000 }, (_, index) => canonical({
+    localId: `scale-1000-${index}`,
+    messageId: `scale-1000-message-${index}`,
+  }));
+  const result = await ingest(service, events);
+  assert.equal(result.accepted, 1000);
+  assert.equal(result.skipped, 0);
+  assert.equal(result.acknowledgedLocalIds.length, 1000);
+  assert.equal(new Set(result.acknowledgedLocalIds).size, 1000);
+  assert.equal(rows.length, 1000);
+  assert.equal(authority.transactions, Math.ceil(1000 / service.TEAM_TELEMETRY_TX_CHUNK_SIZE));
+  assert.ok(authority.transactions <= 63, `1000 events should require <=63 transactions, got ${authority.transactions}`);
+});
+
+test("F59-SCALE-1 eight simultaneous 1000-event worker streams stay bounded to 504 SERIALIZABLE chunks with exact acknowledgements", async () => {
+  const workerCount = 8;
+  const eventsPerWorker = 1000;
+  const workers = Array.from({ length: workerCount }, (_, workerIndex) => {
+    const harness = loadService({ assignedCreators: ["creator-1"] });
+    const events = Array.from({ length: eventsPerWorker }, (_, index) => canonical({
+      localId: `scale-worker-${workerIndex}-${index}`,
+      messageId: `scale-worker-message-${workerIndex}-${index}`,
+    }));
+    return { ...harness, events };
+  });
+
+  const startedAt = process.hrtime.bigint();
+  const results = await Promise.all(workers.map(({ service, events }) => ingest(service, events)));
+  const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1_000_000;
+
+  let totalTransactions = 0;
+  let totalRows = 0;
+  for (let index = 0; index < workers.length; index += 1) {
+    const result = results[index];
+    const harness = workers[index];
+    assert.equal(result.accepted, eventsPerWorker);
+    assert.equal(result.skipped, 0);
+    assert.equal(result.acknowledgedLocalIds.length, eventsPerWorker);
+    assert.equal(new Set(result.acknowledgedLocalIds).size, eventsPerWorker);
+    assert.equal(harness.rows.length, eventsPerWorker);
+    assert.equal(harness.authority.transactions, Math.ceil(eventsPerWorker / harness.service.TEAM_TELEMETRY_TX_CHUNK_SIZE));
+    totalTransactions += harness.authority.transactions;
+    totalRows += harness.rows.length;
+  }
+  assert.equal(totalRows, workerCount * eventsPerWorker);
+  assert.equal(totalTransactions, workerCount * Math.ceil(eventsPerWorker / workers[0].service.TEAM_TELEMETRY_TX_CHUNK_SIZE));
+  assert.equal(totalTransactions, 504, "8 x 1000 source-envelope events must remain 504 bounded chunks at size 16");
+  assert.ok(Number.isFinite(elapsedMs) && elapsedMs >= 0);
 });
 
 test("A37 provider replay outside admission horizon is rejected instead of re-timestamped and recounted", async () => {

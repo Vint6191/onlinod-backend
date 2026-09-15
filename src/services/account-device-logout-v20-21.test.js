@@ -52,6 +52,7 @@ function mutableDb(rows, workerDevices = []) {
     return true;
   };
   const db = {
+    $executeRawUnsafe: async () => 1,
     user: {
       findUnique: async () => ({ id: "user-1", email: "owner@example.com", passwordHash: "old-hash" }),
       update: async ({ where, data }) => { userWrites.push({ where, data }); return { id: where.id, email: "owner@example.com", ...data }; },

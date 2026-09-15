@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { isOwner } = require("./team-access-control");
 const { assignedCreatorIds, hasBroadCreatorAccess, canAccessCreator, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { readCurrentDesktopMemberAuthority } = require("./desktop-current-access-authority-service");
+const { acquireAuthorizationUserLock } = require("./authorization-session-authority-service");
 
 const DEVICE_KEY_ALGORITHM = "x25519-spki-der-v1";
 const WRAP_ALGORITHM = "x25519-hkdf-sha256-aes-256-gcm-v1";
@@ -1723,6 +1724,11 @@ async function retireCurrentDeviceIdentity({ db, agencyId, userId, deviceId }) {
   // approval/grant to create a current AMK/CDK wrap that this retirement then
   // revokes without reporting the corresponding strong-rotation debt.
   return serializableTransaction(db, async (tx) => {
+    // Authorization lock is outermost relative to crypto-row mutation. Login
+    // and refresh take the same user lock before publishing a replacement
+    // session, so device retirement cannot race a new auth chain behind its
+    // refresh-session revoke snapshot.
+    await acquireAuthorizationUserLock(tx, { userId });
     // Durable crypto identity is the authority here. WorkerDevice is mutable
     // current telemetry and may presently belong to another workspace on the
     // same physical PC; it must never block retirement of this agency-scoped

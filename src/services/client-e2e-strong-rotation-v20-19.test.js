@@ -160,6 +160,7 @@ function makeDb({ targetOwner = false } = {}) {
 
   const db = {
     $transaction: async (fn) => fn(db),
+    $executeRawUnsafe: async () => 1,
     workerDevice: {
       findFirst: async ({ where }) => clone([...state.devices.values()].find((row) => match(where, row)) || null),
       findMany: async ({ where }) => [...state.devices.values()].filter((row) => match(where, row)).map(clone),

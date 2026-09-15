@@ -33,7 +33,17 @@ function loadIngest({ startGeneration = GENERATION, assignedCreators = [] } = {}
   }];
   const prisma = {
     async $queryRawUnsafe(sql) {
-      if (/clock_timestamp/i.test(String(sql || ""))) return [{ authorityNow: new Date("2026-09-15T02:30:00.000Z") }];
+      const text = String(sql || "");
+      if (/FROM "RefreshSession"/i.test(text) && /FOR SHARE/i.test(text)) return [{ id: "refresh-current", authorizationSessionId: "scope-A" }];
+      if (/FROM "AgencyCreatorCatalogState"/i.test(text) && /FOR SHARE/i.test(text)) return [{ generation: 3 }];
+      if (/AuthorizationSessionBoundary/i.test(text)) return [{ endedAt: new Date("2026-09-15T02:05:00.000Z") }];
+      if (/AgencyCreatorCatalogGenerationBoundary/i.test(text)) return [{ endedAt: new Date("2026-09-15T02:05:00.000Z") }];
+      if (/FROM "AgencyMember"/i.test(text) && /FOR SHARE OF m/i.test(text)) return [{
+        id: "member-1", userId: "user-1", agencyId: "agency-1", accessEpoch: 1,
+        role: "CHATTER", roleKey: "chatter", assignedCreators, permissions: {}, deletedAt: null, deactivatedAt: null,
+      }];
+      if (/AgencyMemberAccessEpochBoundary/i.test(text)) return [{ endedAt: new Date("2026-09-15T02:05:00.000Z") }];
+      if (/clock_timestamp/i.test(text)) return [{ authorityNow: new Date("2026-09-15T02:30:00.000Z") }];
       return [];
     },
     async $transaction(work) { return work(prisma); },
@@ -109,6 +119,7 @@ function terminalCoverage(overrides = {}) {
       startReason: "dialog_activity",
       endReason: "authorization_quarantined",
       authorizationGeneration: GENERATION,
+      authorizationCapture: { version: 1, semantics: "TERMINAL_CLOSURE", ...GENERATION, localAuthorizationRevision: null },
       authorizationTerminalClosure: {
         version: 1,
         reason: "authorization_quarantined",
@@ -123,7 +134,7 @@ function terminalCoverage(overrides = {}) {
 async function ingest(service, event) {
   return service.ingestTeamEvents({
     agencyId: "agency-1", deviceId: "device-1", userId: "user-1", memberId: "member-1",
-    admittedAccessEpoch: 1, events: [event],
+    admittedAccessEpoch: 1, admittedAuthorizationSessionId: "scope-A", events: [event],
   });
 }
 
@@ -140,6 +151,12 @@ test("INT2.6 mismatched generation cannot use terminal closure as creator-access
   const event = terminalCoverage({
     localId: "end-mismatch",
     metadata: {
+      authorizationGeneration: { ...GENERATION, accessEpoch: GENERATION.accessEpoch + 1 },
+      authorizationCapture: {
+        version: 1, semantics: "TERMINAL_CLOSURE",
+        ...GENERATION, accessEpoch: GENERATION.accessEpoch + 1,
+        localAuthorizationRevision: null,
+      },
       authorizationTerminalClosure: {
         version: 1,
         reason: "authorization_quarantined",
@@ -157,7 +174,17 @@ test("INT2.6 mismatched generation cannot use terminal closure as creator-access
 
 test("INT2.6 marker never bypasses revoked creator for a non-terminal event", async () => {
   const { service } = loadIngest({ assignedCreators: [] });
-  const event = terminalCoverage({ eventKind: "USER_ACTIVITY", localId: "fake-terminal-user-activity" });
+  const event = terminalCoverage({
+    eventKind: "USER_ACTIVITY", localId: "fake-terminal-user-activity",
+    metadata: {
+      authorizationGeneration: { authorizationScopeIncarnation: "scope-A", accessEpoch: 1, creatorCatalogGeneration: 3 },
+      authorizationCapture: {
+        version: 1, semantics: "CURRENT_HUMAN",
+        authorizationScopeIncarnation: "scope-A", accessEpoch: 1, creatorCatalogGeneration: 3,
+        localAuthorizationRevision: 1,
+      },
+    },
+  });
   const result = await ingest(service, event);
   assert.equal(result.accepted, 0);
   assert.equal(result.rejectedByReason.creator_access_forbidden, 1);
@@ -170,6 +197,8 @@ test("INT2.6 revoked creator cannot use terminal DIALOG_SESSION to create a new 
     correlationId: "dialog-session-revoked", durationSeconds: 45,
     metadata: {
       wallSeconds: 120, activeSeconds: 45, coverageId: "coverage-1",
+      authorizationGeneration: GENERATION,
+      authorizationCapture: { version: 1, semantics: "TERMINAL_CLOSURE", ...GENERATION, localAuthorizationRevision: null },
       authorizationTerminalClosure: {
         version: 1, reason: "authorization_quarantined", startedUnder: GENERATION, boundaryOffsetSeconds: 300,
       },
@@ -194,6 +223,8 @@ test("INT2.6 delayed terminal DIALOG_SESSION is anchored before the authorizatio
       wallSeconds: 120,
       activeSeconds: 45,
       coverageId: "coverage-1",
+      authorizationGeneration: GENERATION,
+      authorizationCapture: { version: 1, semantics: "TERMINAL_CLOSURE", ...GENERATION, localAuthorizationRevision: null },
       authorizationTerminalClosure: {
         version: 1,
         reason: "authorization_quarantined",
