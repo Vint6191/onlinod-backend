@@ -112,7 +112,7 @@ function assertDefinition(spec, row) {
 
 async function prerequisiteState(db) {
   const tableRows = await db.$queryRawUnsafe(`
-    SELECT to_regclass(format('%I.%I', current_schema(), 'RefreshSession')) AS relation
+    SELECT to_regclass(format('%I.%I', current_schema(), 'RefreshSession'))::text AS relation
   `);
   if (!tableRows?.[0]?.relation) return { ready: false, tableExists: false, populated: false, missingColumns: REQUIRED_COLUMNS };
   const columnRows = await db.$queryRawUnsafe(`

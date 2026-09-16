@@ -37,6 +37,7 @@ test("INT60.4 migration: online ensure builds every F60 current/history index CO
   assert.match(source, /fresh\/empty schema missing prerequisites/);
   assert.match(source, /populated RefreshSession is missing online-index prerequisite columns/);
   assert.match(source, /SELECT EXISTS\(SELECT 1 FROM "RefreshSession" LIMIT 1\)/);
+  assert.match(source, /to_regclass\([\s\S]*?\)::text AS relation/, "Prisma raw queries must not return PostgreSQL regclass values directly");
   assert.doesNotMatch(source, /\$transaction\s*\(/, "CREATE INDEX CONCURRENTLY ensure must stay outside Prisma transactions");
 });
 

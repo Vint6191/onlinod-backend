@@ -229,6 +229,7 @@ function sourceGate() {
     "src/services/actual60-int60-5-runtime-evidence-receipt.test.js",
     "src/services/actual60-int60-5-refreshsession-mutation-antimap.test.js",
     "src/services/actual60-int60-6-runtime-closure-integrity.test.js",
+    "src/services/actual60-int60-7-prisma-regclass-preflight.test.js",
   ], {
     ONLINOD_AUDIT_EVIDENCE_PATH: "",
     DATABASE_URL: "",
