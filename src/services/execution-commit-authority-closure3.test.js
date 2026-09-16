@@ -85,20 +85,25 @@ test("Closure3 JobPlanningRepository is fail-closed for any producer key outside
 });
 
 function candidateDb() {
-  let row = null;
+  const rows = [];
   return {
-    get row() { return row; },
+    get row() { return rows[0] || null; },
+    get rows() { return rows.map((row) => ({ ...row })); },
     $queryRawUnsafe: async () => { throw new Error("void deserialization"); },
     $executeRawUnsafe: async () => 1,
     sfsTargetCandidate: {
-      async findUnique({ where }) {
-        const key = where.creatorId_username;
-        if (!row || row.creatorId !== key.creatorId || row.username !== key.username) return null;
-        return { ...row };
+      async findFirst({ where }) {
+        return rows.find((row) => Object.entries(where || {}).every(([key, value]) => row[key] === value)) || null;
       },
-      async upsert({ create, update }) {
-        if (!row) row = { id: "candidate-1", usedForever: false, generation: 0, ...create };
-        else row = { ...row, ...update };
+      async update({ where, data }) {
+        const index = rows.findIndex((row) => row.id === where.id);
+        if (index < 0) throw new Error("candidate missing");
+        rows[index] = { ...rows[index], ...data };
+        return { ...rows[index] };
+      },
+      async create({ data }) {
+        const row = { id: `candidate-${rows.length + 1}`, usedForever: false, generation: 0, ...data };
+        rows.push(row);
         return { ...row };
       },
     },
@@ -116,6 +121,7 @@ function loadSfsForDiscovery(db, ensurePlannedJob = async () => ({ job: { id: "p
   }));
   ids.push(cacheModule("./job-planning-repository", { ensurePlannedJob, createPlannedJobIfAbsent: async () => ({ job: null, created: false }) }));
   ids.push(cacheModule("./automation-pacing-service", { nextAutomationWriteSlot: async () => new Date() }));
+  ids.push(cacheModule("./fan-data-authority-service", { projectFanObservationBatch: async () => ({ ok: true, projected: 1 }) }));
   const service = fresh("./sfs-service");
   return { service, cleanup() { restore(require.resolve("./sfs-service")); for (const id of ids) restore(id); } };
 }
@@ -145,9 +151,9 @@ test("Closure3 SFS discovery observation authority keeps T2 current when delayed
     const { applySfsDiscoveryChunk } = loaded.service;
     const t1 = "2026-08-31T10:00:00.000Z";
     const t2 = "2026-08-31T10:05:00.000Z";
-    const newer = await applySfsDiscoveryChunk({ db, job: { id: "job-B", agencyId: "a1", creatorId: "c1" }, chunkResult: sfsChunk(t2, "T2") });
+    const newer = await applySfsDiscoveryChunk({ db, job: { id: "job-B", agencyId: "a1", creatorId: "c1", createdAt: new Date(t2) }, chunkResult: sfsChunk("2099-01-01T00:00:00.000Z", "T2") });
     assert.equal(newer.applied, 1);
-    const stale = await applySfsDiscoveryChunk({ db, job: { id: "job-A", agencyId: "a1", creatorId: "c1" }, chunkResult: sfsChunk(t1, "T1") });
+    const stale = await applySfsDiscoveryChunk({ db, job: { id: "job-A", agencyId: "a1", creatorId: "c1", createdAt: new Date(t1) }, chunkResult: sfsChunk("2100-01-01T00:00:00.000Z", "T1") });
     assert.equal(stale.sideEffect, "STALE_NOOP");
     assert.equal(db.row.displayName, "Name T2");
     assert.equal(db.row.avatarUrl, "https://cdn.example/T2.jpg");

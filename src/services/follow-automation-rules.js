@@ -11,9 +11,15 @@ function evaluateRefollowCandidate(candidate, settings, now = new Date()) {
   if (candidate.blocked || candidate.ofBlocked) return { eligible: false, code: "blocked" };
   if (candidate.ignored) return { eligible: false, code: "ignored" };
   if (candidate.state === "STALE") return { eligible: false, code: "stale_candidate" };
+  if (candidate.ofBlocked === null || candidate.ofBlocked === undefined ||
+      candidate.restricted === null || candidate.restricted === undefined ||
+      candidate.performer === null || candidate.performer === undefined ||
+      candidate.subscribePriceCents === null || candidate.subscribePriceCents === undefined) {
+    return { eligible: false, code: "safety_state_unknown" };
+  }
   if (candidate.restricted) return { eligible: false, code: "restricted" };
   if (candidate.performer) return { eligible: false, code: "performer" };
-  if (Number(candidate.subscribePriceCents || 0) > 0) return { eligible: false, code: "paid_subscription_required" };
+  if (Number(candidate.subscribePriceCents) > 0) return { eligible: false, code: "paid_subscription_required" };
   if (settings.refollowEnabled !== true) return { eligible: false, code: "refollow_disabled" };
   if (candidate.phase && !["IDLE", "WAIT_RETURN", "DONE"].includes(candidate.phase)) {
     return { eligible: false, code: "active_delivery" };

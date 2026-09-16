@@ -24,6 +24,8 @@ const {
 const {
   readFanCurrentMap,
   validateBumpCurrentRelationship,
+  bumpRequiredFields,
+  buildFanCurrentFieldFence,
 } = require("./fan-current-consumer-service");
 
 const ACTIVE_ACTION_STATUSES = [...ACTIVE_WRITE_WORKFLOW_STATUSES];
@@ -461,7 +463,12 @@ async function recordDetailedObservations({ agencyId, creatorId, observations, s
     })
     .filter(Boolean);
   if (authorityItems.length) {
-    await projectFanObservationBatch(db, { agencyId, creatorId, sourceDeviceId: clean(sourceDeviceId, 180), items: authorityItems });
+    await projectFanObservationBatch(db, {
+      agencyId, creatorId, sourceDeviceId: clean(sourceDeviceId, 180), items: authorityItems,
+      allowedSources: ["PRESENCE_HINT", "LIVE_NOTIFICATION"],
+      observedAtPolicy: "SERVER_RECEIPT",
+      receivedAt: new Date(),
+    });
   }
 
   const existingRows = ids.length ? await db.automationBumpFanState.findMany({
@@ -523,6 +530,7 @@ async function validateBumpDelivery({ delivery, control = null, now = new Date()
   const snapshot = control || await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: BUMPS_MODULE_KEY, db });
   const payload = object(delivery.payload);
   const state = await db.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId: delivery.creatorId, fanId: delivery.fanId } } });
+  let fanCurrentFence = null;
   if (delivery.actionType === SEND_ACTION) {
     if (!delivery.dialogId) return { ok: false, terminal: true, status: "SKIPPED", code: "missing_dialog" };
     const template = object(payload.template);
@@ -546,9 +554,10 @@ async function validateBumpDelivery({ delivery, control = null, now = new Date()
       creatorId: delivery.creatorId,
       fanIds: [delivery.fanId || delivery.targetId],
     });
+    const current = currentByFan.get(String(delivery.fanId || delivery.targetId || "")) || null;
     const currentDecision = validateBumpCurrentRelationship({
       candidate: { fanId: delivery.fanId || delivery.targetId, dialogId: delivery.dialogId },
-      current: currentByFan.get(String(delivery.fanId || delivery.targetId || "")) || null,
+      current,
       source,
       now,
     });
@@ -568,6 +577,7 @@ async function validateBumpDelivery({ delivery, control = null, now = new Date()
       }
       return { ok: false, terminal: currentDecision.terminal !== false, status: "SKIPPED", code: currentDecision.code };
     }
+    fanCurrentFence = buildFanCurrentFieldFence(current, bumpRequiredFields(source));
     if (source === "online") {
       const observed = state?.lastOnlineAt;
       if (!observed || observed.getTime() < now.getTime() - snapshot.modules.bumps.settings.onlineObservationTtlMs) {
@@ -585,7 +595,7 @@ async function validateBumpDelivery({ delivery, control = null, now = new Date()
     if (!state?.pendingMessageId || state.pendingMessageId !== messageId) return { ok: false, terminal: true, status: "SKIPPED", code: "cancel_not_needed" };
     if (state.lastAnyRepliedAt && state.lastAnyRepliedAt > (delivery.createdAt || new Date(0))) return { ok: false, terminal: true, status: "SKIPPED", code: "replied" };
   }
-  return { ok: true };
+  return { ok: true, ...(fanCurrentFence ? { fanCurrentFence } : {}) };
 }
 
 async function finalizeBumpSend({ delivery, result, db = prisma }) {

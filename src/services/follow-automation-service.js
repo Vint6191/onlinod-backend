@@ -25,6 +25,8 @@ const { readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-auth
 const {
   readFanCurrentMap,
   evaluateRefollowCurrent,
+  refollowRequiredFields,
+  buildFanCurrentFieldFence,
 } = require("./fan-current-consumer-service");
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
@@ -185,6 +187,7 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
   };
   const skip = (code) => { summary.skipped[code] = (summary.skipped[code] || 0) + 1; };
   const refreshFanIds = new Set();
+  const refreshFields = new Set();
   let cursorId = null;
   const batchSize = fanId ? 1 : 500;
   for (;;) {
@@ -209,7 +212,10 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
       const eligibility = evaluateRefollowCurrent(candidate, current, settings, now);
       if (!eligibility.eligible) {
         skip(eligibility.code);
-        if (eligibility.refreshRequired === true && candidate.fanId && refreshFanIds.size < 500) refreshFanIds.add(String(candidate.fanId));
+        if (eligibility.refreshRequired === true && candidate.fanId && refreshFanIds.size < 500) {
+          refreshFanIds.add(String(candidate.fanId));
+          for (const field of eligibility.refreshFields || []) refreshFields.add(String(field));
+        }
         if (fanId) await db.followAutomationCandidate.update({
           where: { id: candidate.id },
           data: { eligibilityReason: eligibility.code, latestError: eligibility.code },
@@ -270,7 +276,11 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
     cursorId = candidates[candidates.length - 1].id;
     if (fanId || candidates.length < batchSize || capacity <= 0 || refreshFanIds.size >= 500) break;
   }
-  return { ok: true, creatorId, source, summary, refreshFanIds: [...refreshFanIds].slice(0, 500) };
+  return {
+    ok: true, creatorId, source, summary,
+    refreshFanIds: [...refreshFanIds].slice(0, 500),
+    refreshFields: [...refreshFields],
+  };
 }
 
 async function scheduleRefollowCurrentRefresh({
@@ -322,6 +332,7 @@ async function planFollowAutomation(input) {
     fanIds: result.refreshFanIds,
     priority: input.priority || 65,
     trigger: "planning",
+    refreshFields: result.refreshFields || [],
     scheduleFanRefresh: input.scheduleFanRefresh || scheduleFanDataPointRefresh,
   });
   if (!fanRefresh.requested) return { ...result, refreshFanIds: [] };
@@ -389,7 +400,11 @@ async function validateFollowAutomationDelivery({ delivery, control, now = new D
     },
   });
   if (completedToday >= settings.dailyLimit) return { ok: false, terminal: false, code: "daily_limit", retryAt: future(24 * 60 * 60_000, dayStart(now)) };
-  return { ok: true, candidate };
+  return {
+    ok: true,
+    candidate,
+    fanCurrentFence: buildFanCurrentFieldFence(current, refollowRequiredFields(current)),
+  };
 }
 
 async function finalizeFollowAutomationSuccess({ delivery, outcomeCode, result = {}, db = prisma, now = new Date() }) {
@@ -528,13 +543,22 @@ async function countCanonicalEligibleRefollowCandidates({ agencyId, creatorId, s
       AND (c."phase" IS NULL OR c."phase" IN ('IDLE', 'WAIT_RETURN', 'DONE'))
       AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= $3)
       AND COALESCE(c."nudgeCount", 0) < $4
-      AND r."observedAt" IS NOT NULL
+      AND r."fanSubscriptionActiveAuthorityVersion" IS NOT NULL
+      AND r."creatorFollowsFanAuthorityVersion" IS NOT NULL
+      AND r."blockedAuthorityVersion" IS NOT NULL
+      AND r."restrictedAuthorityVersion" IS NOT NULL
+      AND r."performerAuthorityVersion" IS NOT NULL
+      AND r."subscribePriceCentsAuthorityVersion" IS NOT NULL
       AND r."fanSubscriptionActive" = false
       AND r."creatorFollowsFan" = true
-      AND COALESCE(r."blocked", false) = false
-      AND COALESCE(r."restricted", false) = false
-      AND COALESCE(r."performer", false) = false
-      AND COALESCE(r."subscribePriceCents", 0) <= 0
+      AND r."blocked" IS NOT NULL
+      AND r."restricted" IS NOT NULL
+      AND r."performer" IS NOT NULL
+      AND r."subscribePriceCents" IS NOT NULL
+      AND r."blocked" = false
+      AND r."restricted" = false
+      AND r."performer" = false
+      AND r."subscribePriceCents" <= 0
     `,
     agencyId, creatorId, now, Number(settings.maxNudgesPerFan || 1),
   );

@@ -3,6 +3,7 @@
 const { readFanCurrent } = require("./fan-data-authority-service");
 const { evaluateCandidate, subscriptionBucket } = require("./follow-back-rules");
 const { evaluateRefollowCandidate } = require("./follow-automation-rules");
+const { targetEligibility } = require("./sfs-rules");
 
 
 const FAN_CURRENT_FRESHNESS_CLASS = Object.freeze({
@@ -23,6 +24,10 @@ const FAN_CURRENT_UNKNOWN_POLICY = Object.freeze({
     missingRelationship: "FAIL_CLOSED_POINT_REFRESH_REQUIRED",
     fanSubscriptionActive: "POINT_REFRESH_REQUIRED",
     creatorFollowsFan: "POINT_REFRESH_REQUIRED_WHEN_UNFOLLOW_ADMISSION_DEPENDS_ON_EDGE",
+    blocked: "POINT_REFRESH_REQUIRED_BEFORE_UNFOLLOW",
+    restricted: "POINT_REFRESH_REQUIRED_BEFORE_UNFOLLOW",
+    performer: "POINT_REFRESH_REQUIRED_BEFORE_UNFOLLOW",
+    subscribePriceCents: "POINT_REFRESH_REQUIRED_BEFORE_UNFOLLOW",
   }),
   bumps: Object.freeze({
     missingRelationship: "FAIL_CLOSED_POINT_REFRESH_REQUIRED",
@@ -35,6 +40,26 @@ const FAN_CURRENT_UNKNOWN_POLICY = Object.freeze({
     fanSubscriptionActive: "POINT_REFRESH_REQUIRED_WHEN_POLICY_DEPENDS_ON_STATE",
     fanSubscriptionType: "POINT_REFRESH_REQUIRED_WHEN_POLICY_DEPENDS_ON_BUCKET",
   }),
+  sfs: Object.freeze({
+    missingRelationship: "FAIL_CLOSED_POINT_REFRESH_REQUIRED",
+    creatorFollowsFan: "POINT_REFRESH_REQUIRED",
+    subscribePriceCents: "POINT_REFRESH_REQUIRED_WHEN_FREE_TARGET_POLICY_DEPENDS_ON_PRICE",
+  }),
+});
+
+const RELATIONSHIP_VERSION_COLUMNS = Object.freeze({
+  fanSubscribesToCreator: "fanSubscribesToCreatorAuthorityVersion",
+  fanSubscriptionActive: "fanSubscriptionActiveAuthorityVersion",
+  fanSubscriptionType: "fanSubscriptionTypeAuthorityVersion",
+  fanSubscriptionExpiresAt: "fanSubscriptionExpiresAtAuthorityVersion",
+  creatorFollowsFan: "creatorFollowsFanAuthorityVersion",
+  creatorFollowExpiresAt: "creatorFollowExpiresAtAuthorityVersion",
+  canReceiveChatMessage: "canReceiveChatMessageAuthorityVersion",
+  blocked: "blockedAuthorityVersion",
+  restricted: "restrictedAuthorityVersion",
+  performer: "performerAuthorityVersion",
+  lastSeenAt: "lastSeenAtAuthorityVersion",
+  subscribePriceCents: "subscribePriceCentsAuthorityVersion",
 });
 
 function key(value) { return String(value ?? "").trim(); }
@@ -46,11 +71,86 @@ function asDate(value) {
   return Number.isFinite(parsed.getTime()) ? parsed : null;
 }
 
-function classifyRelationshipFreshness(current, { now = new Date(), maxAgeMs = null, allowStale = false } = {}) {
+function uniqueRelationshipFields(fields = []) {
+  return [...new Set((fields || []).map(key).filter((field) => RELATIONSHIP_VERSION_COLUMNS[field]))];
+}
+
+function relationshipFieldAuthority(current, field) {
+  const rel = relationship(current);
+  const authority = rel?.fieldAuthority?.[field];
+  if (!authority || typeof authority !== "object") return null;
+  const authorityVersion = key(authority.authorityVersion);
+  if (!authorityVersion) return null;
+  return {
+    authorityVersion,
+    observedAt: asDate(authority.observedAt),
+    source: key(authority.source) || null,
+  };
+}
+
+function classifyRelationshipFreshness(current, { now = new Date(), maxAgeMs = null, allowStale = false, requiredFields = null } = {}) {
   const rel = relationship(current);
   if (!rel) {
-    return { freshnessClass: FAN_CURRENT_FRESHNESS_CLASS.UNKNOWN, refreshRequired: true, code: "fan_current_unknown" };
+    return { freshnessClass: FAN_CURRENT_FRESHNESS_CLASS.UNKNOWN, refreshRequired: true, code: "fan_current_unknown", refreshFields: uniqueRelationshipFields(requiredFields || []) };
   }
+
+  const exactFields = uniqueRelationshipFields(requiredFields || []);
+  if (exactFields.length) {
+    const missing = [];
+    const fieldObservedAt = {};
+    for (const field of exactFields) {
+      const authority = relationshipFieldAuthority(current, field);
+      if (!authority?.authorityVersion || !authority.observedAt) {
+        missing.push(field);
+        continue;
+      }
+      fieldObservedAt[field] = authority.observedAt;
+    }
+    if (missing.length) {
+      return {
+        freshnessClass: FAN_CURRENT_FRESHNESS_CLASS.UNKNOWN,
+        refreshRequired: true,
+        code: "fan_current_field_provenance_unknown",
+        refreshFields: missing,
+        fieldObservedAt,
+      };
+    }
+
+    const ageLimit = maxAgeMs === null || maxAgeMs === undefined ? null : Number(maxAgeMs);
+    if (ageLimit !== null && Number.isFinite(ageLimit) && ageLimit >= 0) {
+      const authorityNow = asDate(now) || new Date();
+      const staleFields = exactFields.filter((field) => fieldObservedAt[field].getTime() < authorityNow.getTime() - ageLimit);
+      if (staleFields.length) {
+        if (allowStale) {
+          return {
+            freshnessClass: FAN_CURRENT_FRESHNESS_CLASS.STALE_BUT_ALLOWED_BY_PRODUCT,
+            refreshRequired: false,
+            code: "fan_current_stale_allowed",
+            refreshFields: staleFields,
+            fieldObservedAt,
+          };
+        }
+        return {
+          freshnessClass: FAN_CURRENT_FRESHNESS_CLASS.POINT_REFRESH_REQUIRED,
+          refreshRequired: true,
+          code: "fan_current_stale",
+          refreshFields: staleFields,
+          fieldObservedAt,
+        };
+      }
+    }
+    return {
+      freshnessClass: FAN_CURRENT_FRESHNESS_CLASS.FRESH_ENOUGH,
+      refreshRequired: false,
+      code: "fan_current_fresh",
+      refreshFields: [],
+      fieldObservedAt,
+    };
+  }
+
+  // Compatibility path for callers that only ask whether a relationship row has
+  // aggregate provenance. Phase-3 executable consumers pass requiredFields and
+  // therefore never use an unrelated field's row-wide observedAt for freshness.
   const observedAt = asDate(rel.observedAt);
   if (!observedAt) {
     return { freshnessClass: FAN_CURRENT_FRESHNESS_CLASS.UNKNOWN, refreshRequired: true, code: "fan_current_provenance_unknown" };
@@ -67,6 +167,92 @@ function classifyRelationshipFreshness(current, { now = new Date(), maxAgeMs = n
   }
   return { freshnessClass: FAN_CURRENT_FRESHNESS_CLASS.FRESH_ENOUGH, refreshRequired: false, code: "fan_current_fresh", observedAt };
 }
+
+function followBackRequiredFields(settings = {}) {
+  const fields = ["creatorFollowsFan"];
+  if ((settings.activeSubscribers === true) !== (settings.expiredSubscribers === true)) fields.push("fanSubscriptionActive");
+  if ((settings.freeSubscribers === true) !== (settings.paidSubscribers === true)) fields.push("fanSubscriptionType");
+  return uniqueRelationshipFields(fields);
+}
+
+function refollowRequiredFields(current) {
+  const rel = relationship(current);
+  if (!rel) {
+    return uniqueRelationshipFields([
+      "fanSubscriptionActive", "creatorFollowsFan", "blocked", "restricted", "performer", "subscribePriceCents",
+    ]);
+  }
+  // Admission is staged: current subscription state alone can reject a returned
+  // fan. Safety/price/follow fields become required only for an expired fan that
+  // could actually cross into UNFOLLOW. This keeps the field fence exact.
+  if (rel.fanSubscriptionActive !== false) return ["fanSubscriptionActive"];
+  return uniqueRelationshipFields([
+    "fanSubscriptionActive", "creatorFollowsFan", "blocked", "restricted", "performer", "subscribePriceCents",
+  ]);
+}
+
+function likesRequiredFields(settings = {}, current = null) {
+  const rel = relationship(current);
+  const fields = ["fanSubscriptionActive"];
+  if (rel?.fanSubscriptionActive !== false && (settings.freeSubscribers === true) !== (settings.paidSubscribers === true)) fields.push("fanSubscriptionType");
+  return uniqueRelationshipFields(fields);
+}
+
+function bumpRequiredFields(source) {
+  const fields = ["canReceiveChatMessage"];
+  if (source === "paid_subscriber" || source === "free_subscriber") fields.push("fanSubscriptionActive", "fanSubscriptionType");
+  return uniqueRelationshipFields(fields);
+}
+
+function sfsRequiredFields(settings = {}) {
+  const fields = ["creatorFollowsFan"];
+  if (settings.freeTargetsOnly === true) fields.push("subscribePriceCents");
+  return uniqueRelationshipFields(fields);
+}
+
+function buildFanCurrentFieldFence(current, requiredFields) {
+  const fields = uniqueRelationshipFields(requiredFields);
+  if (!current || !fields.length) return null;
+  const versions = {};
+  for (const field of fields) {
+    const authority = relationshipFieldAuthority(current, field);
+    if (!authority?.authorityVersion) return null;
+    versions[field] = authority.authorityVersion;
+  }
+  const fanId = key(current.onlyFansUserId);
+  const creatorId = key(current.creatorId);
+  if (!fanId || !creatorId) return null;
+  return { creatorId, onlyFansUserId: fanId, versions };
+}
+
+async function assertFanCurrentFieldFence({ db, agencyId, fence }) {
+  if (!fence || !db) return { ok: true };
+  const creatorId = key(fence.creatorId);
+  const fanId = key(fence.onlyFansUserId);
+  const fields = uniqueRelationshipFields(Object.keys(fence.versions || {}));
+  if (!creatorId || !fanId || !fields.length) return { ok: false, code: "fan_current_fence_invalid", changedFields: fields };
+
+  let row = null;
+  if (typeof db.$queryRawUnsafe === "function") {
+    const columns = fields.map((field) => `"${RELATIONSHIP_VERSION_COLUMNS[field]}"`).join(", ");
+    const rows = await db.$queryRawUnsafe(
+      `SELECT ${columns} FROM "CreatorFanRelationshipCurrent" WHERE "agencyId" = $1 AND "creatorId" = $2 AND "onlyFansUserId" = $3 FOR SHARE`,
+      agencyId, creatorId, fanId,
+    );
+    row = rows?.[0] || null;
+  } else if (db.creatorFanRelationshipCurrent?.findUnique) {
+    row = await db.creatorFanRelationshipCurrent.findUnique({
+      where: { creatorId_onlyFansUserId: { creatorId, onlyFansUserId: fanId } },
+    });
+    if (row && key(row.agencyId) !== key(agencyId)) row = null;
+  }
+  if (!row) return { ok: false, code: "fan_current_fence_missing", changedFields: fields };
+
+  const changedFields = fields.filter((field) => key(row[RELATIONSHIP_VERSION_COLUMNS[field]]) !== key(fence.versions[field]));
+  if (changedFields.length) return { ok: false, code: "fan_current_fence_stale", changedFields };
+  return { ok: true, fields };
+}
+
 
 async function readFanCurrentMap(db, { agencyId, creatorId, fanIds = [] } = {}) {
   const ids = [...new Set((fanIds || []).map(key).filter(Boolean))];
@@ -88,7 +274,8 @@ function followBackDecisionCandidate(candidate, current) {
 }
 
 function evaluateFollowBackCurrent(candidate, current, settings, now = new Date(), freshnessPolicy = {}) {
-  const freshness = classifyRelationshipFreshness(current, { now, ...freshnessPolicy });
+  const requiredFields = followBackRequiredFields(settings);
+  const freshness = classifyRelationshipFreshness(current, { now, ...freshnessPolicy, requiredFields });
   const decision = followBackDecisionCandidate(candidate, current);
   if (!decision || freshness.refreshRequired === true) {
     return {
@@ -96,7 +283,7 @@ function evaluateFollowBackCurrent(candidate, current, settings, now = new Date(
       code: freshness.code || "fan_current_unknown",
       retryable: true,
       refreshRequired: true,
-      refreshFields: ["creatorFollowsFan", "fanSubscriptionActive", "fanSubscriptionType"],
+      refreshFields: freshness.refreshFields?.length ? freshness.refreshFields : requiredFields,
       unknownPolicy: FAN_CURRENT_UNKNOWN_POLICY.follow_back.missingRelationship,
       freshnessClass: freshness.freshnessClass,
     };
@@ -113,9 +300,11 @@ function refollowDecisionCandidate(candidate, current, { phase = null } = {}) {
     fanSubscriptionActive: rel.fanSubscriptionActive,
     fanSubscriptionType: rel.fanSubscriptionType,
     creatorFollowsFan: rel.creatorFollowsFan,
-    ofBlocked: rel.blocked === true,
-    restricted: rel.restricted === true,
-    performer: rel.performer === true,
+    // Preserve canonical tri-state values. UNKNOWN must never be collapsed to
+    // safe false / free zero before the admission policy sees it.
+    ofBlocked: rel.blocked,
+    restricted: rel.restricted,
+    performer: rel.performer,
     subscribePriceCents: rel.subscribePriceCents,
   };
 }
@@ -133,12 +322,13 @@ function refollowRefreshRequired(code, refreshFields, freshnessClass = FAN_CURRE
 }
 
 function evaluateRefollowCurrent(candidate, current, settings, now = new Date(), options = {}) {
-  const freshness = classifyRelationshipFreshness(current, { now, ...(options.freshnessPolicy || {}) });
+  const requiredFields = refollowRequiredFields(current);
+  const freshness = classifyRelationshipFreshness(current, { now, ...(options.freshnessPolicy || {}), requiredFields });
   const rel = relationship(current);
   if (!rel || freshness.refreshRequired === true) {
     return refollowRefreshRequired(
       freshness.code || "fan_current_unknown",
-      ["fanSubscriptionActive", "creatorFollowsFan"],
+      freshness.refreshFields?.length ? freshness.refreshFields : requiredFields,
       freshness.freshnessClass,
     );
   }
@@ -157,6 +347,20 @@ function evaluateRefollowCurrent(candidate, current, settings, now = new Date(),
       ["creatorFollowsFan"],
       freshness.freshnessClass,
     );
+  }
+  // Hard safety/business-admission facts are tri-state. A canonical field can
+  // have valid provenance while its value is still UNKNOWN/null. Do not turn
+  // UNKNOWN into safe false / free zero; refresh exactly the missing facts.
+  if (rel.fanSubscriptionActive === false) {
+    const unknownSafetyFields = ["blocked", "restricted", "performer", "subscribePriceCents"]
+      .filter((field) => rel[field] === null || rel[field] === undefined);
+    if (unknownSafetyFields.length) {
+      return refollowRefreshRequired(
+        "refollow_safety_state_unknown",
+        unknownSafetyFields,
+        freshness.freshnessClass,
+      );
+    }
   }
   const decision = refollowDecisionCandidate(candidate, current, options);
   if (!decision) return refollowRefreshRequired("fan_current_unknown", ["fanSubscriptionActive", "creatorFollowsFan"]);
@@ -177,13 +381,14 @@ function likesRefreshRequired(code, unknownPolicy, refreshFields) {
 
 function evaluateLikesCurrent(current, settings = {}, now = new Date(), freshnessPolicy = {}) {
   const rel = relationship(current);
-  const freshness = classifyRelationshipFreshness(current, { now, ...freshnessPolicy });
+  const requiredFields = likesRequiredFields(settings, current);
+  const freshness = classifyRelationshipFreshness(current, { now, ...freshnessPolicy, requiredFields });
   if (!rel || freshness.refreshRequired === true) {
     return {
       ...likesRefreshRequired(
         freshness.code || "fan_current_unknown",
         FAN_CURRENT_UNKNOWN_POLICY.likes.missingRelationship,
-        ["fanSubscriptionActive", "fanSubscriptionType"],
+        freshness.refreshFields?.length ? freshness.refreshFields : requiredFields,
       ),
       freshnessClass: freshness.freshnessClass,
     };
@@ -270,13 +475,14 @@ function bumpRefreshRequired(code, source, fields = null, freshnessClass = FAN_C
 }
 
 function validateBumpCurrentRelationship({ candidate, current, source, now = new Date(), freshnessPolicy = {} }) {
-  const freshness = classifyRelationshipFreshness(current, { now, ...freshnessPolicy });
+  const requiredFields = bumpRequiredFields(source);
+  const freshness = classifyRelationshipFreshness(current, { now, ...freshnessPolicy, requiredFields });
   const canonical = canonicalBumpCandidate(candidate, current);
   if (!canonical || freshness.refreshRequired === true) {
     return bumpRefreshRequired(
       freshness.code || "fan_current_unknown",
       source,
-      bumpRefreshFields(source),
+      freshness.refreshFields?.length ? freshness.refreshFields : requiredFields,
       freshness.freshnessClass,
     );
   }
@@ -303,6 +509,61 @@ function validateBumpCurrentRelationship({ candidate, current, source, now = new
     if (!type.includes("free")) return { ok: false, terminal: true, code: "fan_not_free_current", candidate: canonical };
   }
   return { ok: true, candidate: canonical, freshnessClass: freshness.freshnessClass };
+}
+
+function sfsRefreshRequired(code, fields, freshnessClass = FAN_CURRENT_FRESHNESS_CLASS.UNKNOWN) {
+  return {
+    eligible: false,
+    retryable: true,
+    refreshRequired: true,
+    refreshFields: uniqueRelationshipFields(fields),
+    freshnessClass,
+    code,
+  };
+}
+
+function evaluateSfsFollowCurrent(candidate, current, settings = {}, now = new Date(), freshnessPolicy = {}) {
+  const requiredFields = sfsRequiredFields(settings);
+  const freshness = classifyRelationshipFreshness(current, { now, requiredFields, ...freshnessPolicy });
+  if (freshness.refreshRequired) {
+    return {
+      ...sfsRefreshRequired(freshness.code || "sfs_fan_current_unknown", freshness.refreshFields?.length ? freshness.refreshFields : requiredFields, freshness.freshnessClass),
+      candidate,
+      current,
+    };
+  }
+  const rel = relationship(current);
+  if (!rel) return { ...sfsRefreshRequired("sfs_fan_current_unknown", requiredFields), candidate, current };
+  if (rel.creatorFollowsFan === null || rel.creatorFollowsFan === undefined) {
+    return { ...sfsRefreshRequired("sfs_follow_edge_unknown", ["creatorFollowsFan"], freshness.freshnessClass), candidate, current };
+  }
+  if (settings.freeTargetsOnly === true && (rel.subscribePriceCents === null || rel.subscribePriceCents === undefined)) {
+    return { ...sfsRefreshRequired("sfs_price_unknown", ["subscribePriceCents"], freshness.freshnessClass), candidate, current };
+  }
+
+  const canonicalCandidate = {
+    ...candidate,
+    creatorFollowing: rel.creatorFollowsFan,
+    subscribePriceCents: rel.subscribePriceCents,
+  };
+  const code = targetEligibility(canonicalCandidate, settings, now);
+  if (code === "following_unknown") {
+    return { ...sfsRefreshRequired("sfs_follow_edge_unknown", ["creatorFollowsFan"], freshness.freshnessClass), candidate: canonicalCandidate, current };
+  }
+  if (code === "price_unknown") {
+    return { ...sfsRefreshRequired("sfs_price_unknown", ["subscribePriceCents"], freshness.freshnessClass), candidate: canonicalCandidate, current };
+  }
+  return {
+    eligible: code === "eligible",
+    retryable: false,
+    refreshRequired: false,
+    refreshFields: [],
+    freshnessClass: freshness.freshnessClass,
+    code,
+    candidate: canonicalCandidate,
+    current,
+    requiredFields,
+  };
 }
 
 async function validateFollowBackDeliveryCurrent({ db, delivery, settings, now = new Date() }) {
@@ -340,13 +601,22 @@ async function validateFollowBackDeliveryCurrent({ db, delivery, settings, now =
       } : {}),
     };
   }
-  return { ok: true, candidate, current };
+  const requiredFields = followBackRequiredFields(settings);
+  return { ok: true, candidate, current, fanCurrentFence: buildFanCurrentFieldFence(current, requiredFields) };
 }
 
 module.exports = {
   FAN_CURRENT_FRESHNESS_CLASS,
   FAN_CURRENT_UNKNOWN_POLICY,
   classifyRelationshipFreshness,
+  relationshipFieldAuthority,
+  followBackRequiredFields,
+  refollowRequiredFields,
+  likesRequiredFields,
+  bumpRequiredFields,
+  sfsRequiredFields,
+  buildFanCurrentFieldFence,
+  assertFanCurrentFieldFence,
   readFanCurrentMap,
   followBackDecisionCandidate,
   evaluateFollowBackCurrent,
@@ -358,5 +628,7 @@ module.exports = {
   canonicalBumpCandidate,
   validateBumpCurrentRelationship,
   bumpRefreshRequired,
+  evaluateSfsFollowCurrent,
+  sfsRefreshRequired,
   validateFollowBackDeliveryCurrent,
 };

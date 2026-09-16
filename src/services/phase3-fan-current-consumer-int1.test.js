@@ -22,11 +22,43 @@ const {
   validateBumpCurrentRelationship,
 } = require("./fan-current-consumer-service");
 
+const RELATIONSHIP_VERSION_FIELDS = Object.freeze({
+  fanSubscribesToCreator: "fanSubscribesToCreatorAuthorityVersion",
+  fanSubscriptionActive: "fanSubscriptionActiveAuthorityVersion",
+  fanSubscriptionType: "fanSubscriptionTypeAuthorityVersion",
+  fanSubscriptionExpiresAt: "fanSubscriptionExpiresAtAuthorityVersion",
+  creatorFollowsFan: "creatorFollowsFanAuthorityVersion",
+  creatorFollowExpiresAt: "creatorFollowExpiresAtAuthorityVersion",
+  canReceiveChatMessage: "canReceiveChatMessageAuthorityVersion",
+  blocked: "blockedAuthorityVersion",
+  restricted: "restrictedAuthorityVersion",
+  performer: "performerAuthorityVersion",
+  lastSeenAt: "lastSeenAtAuthorityVersion",
+  subscribePriceCents: "subscribePriceCentsAuthorityVersion",
+});
+
+function authorityVersion(field, observedAt = new Date("2026-09-16T10:00:00.000Z")) {
+  return `${observedAt.toISOString()}|0700|USER_PROFILE|test-${field}`;
+}
+
+function versionedRelationshipRow(fields, observedAt = new Date("2026-09-16T10:00:00.000Z")) {
+  const row = { observedAt, source: "USER_PROFILE", ...fields };
+  for (const [field, versionField] of Object.entries(RELATIONSHIP_VERSION_FIELDS)) {
+    if (Object.prototype.hasOwnProperty.call(fields || {}, field)) row[versionField] = authorityVersion(field, observedAt);
+  }
+  return row;
+}
+
 function current(relationship) {
-  const rel = relationship && typeof relationship === "object"
-    ? { observedAt: new Date("2026-09-16T10:00:00.000Z"), ...relationship }
-    : relationship;
-  return { onlyFansUserId: "fan-1", relationship: rel, platformIdentity: null, value: null };
+  if (!relationship || typeof relationship !== "object") return { onlyFansUserId: "fan-1", creatorId: "creator-1", relationship, platformIdentity: null, value: null };
+  const observedAt = relationship.observedAt instanceof Date ? relationship.observedAt : new Date("2026-09-16T10:00:00.000Z");
+  const fieldAuthority = {};
+  for (const field of Object.keys(RELATIONSHIP_VERSION_FIELDS)) {
+    if (!Object.prototype.hasOwnProperty.call(relationship, field)) continue;
+    fieldAuthority[field] = { authorityVersion: authorityVersion(field, observedAt), observedAt, source: "USER_PROFILE" };
+  }
+  const rel = { observedAt, source: "USER_PROFILE", ...relationship, fieldAuthority: { ...fieldAuthority, ...(relationship.fieldAuthority || {}) } };
+  return { onlyFansUserId: "fan-1", creatorId: "creator-1", relationship: rel, platformIdentity: null, value: null };
 }
 
 test("Phase3 Follow Back eligibility is canonical-current, not candidate-copy current", () => {
@@ -119,12 +151,12 @@ test("Phase3 Likes commit validation rejects stale audience state from canonical
     contentType: "post", contentId: "post-1", snapshotRunId: "run-1", state: "ELIGIBLE",
     isFavorite: false, canToggleFavorite: true, canViewMedia: true, cooldownUntil: null,
   };
-  const relationshipCurrent = {
+  const relationshipCurrent = versionedRelationshipRow({
     fanSubscribesToCreator: true, fanSubscriptionActive: true, fanSubscriptionType: "free",
     fanSubscriptionExpiresAt: null, creatorFollowsFan: false, creatorFollowExpiresAt: null,
     canReceiveChatMessage: true, blocked: false, restricted: false, performer: false,
-    lastSeenAt: null, subscribePriceCents: 0, observedAt: new Date("2026-09-16T10:00:00.000Z"), source: "SUBSCRIBER_DIRECTORY",
-  };
+    lastSeenAt: null, subscribePriceCents: 0,
+  });
   const db = {
     automationContentCandidate: { async findFirst() { return candidate; } },
     subscriberDirectoryState: { async findFirst() { return { currentRunId: "run-1", publishedAt: new Date() }; } },
@@ -165,7 +197,7 @@ test("Phase3 Likes commit validation makes missing canonical current retryable i
   assert.ok(result.retryAt instanceof Date);
   assert.equal(result.refreshRequired, true);
   assert.deepEqual(result.refreshFanIds, ["fan-missing"]);
-  assert.deepEqual(result.refreshFields, ["fanSubscriptionActive", "fanSubscriptionType"]);
+  assert.deepEqual(result.refreshFields, ["fanSubscriptionActive"]);
 });
 
 test("Phase3 Likes UNKNOWN decisions carry explicit bounded refresh requirements", () => {
@@ -262,13 +294,13 @@ test("Phase3 Follow Back missing/provenance-unknown canonical relationship fails
   assert.equal(missing.eligible, false);
   assert.equal(missing.retryable, true);
   assert.equal(missing.refreshRequired, true);
-  assert.deepEqual(missing.refreshFields, ["creatorFollowsFan", "fanSubscriptionActive", "fanSubscriptionType"]);
+  assert.deepEqual(missing.refreshFields, ["creatorFollowsFan", "fanSubscriptionActive"]);
 
   const noProvenance = evaluateFollowBackCurrent(candidate, {
     onlyFansUserId: "fan-1",
     relationship: { creatorFollowsFan: false, fanSubscriptionActive: true, fanSubscriptionType: "paid" },
   }, settings, new Date("2026-09-16T12:00:00.000Z"));
-  assert.equal(noProvenance.code, "fan_current_provenance_unknown");
+  assert.equal(noProvenance.code, "fan_current_field_provenance_unknown");
   assert.equal(noProvenance.refreshRequired, true);
 });
 
@@ -326,13 +358,13 @@ test("Phase3 Refollow missing/unprovenanced canonical current fails closed and r
   assert.equal(missing.eligible, false);
   assert.equal(missing.retryable, true);
   assert.equal(missing.refreshRequired, true);
-  assert.deepEqual(missing.refreshFields, ["fanSubscriptionActive", "creatorFollowsFan"]);
+  assert.deepEqual(missing.refreshFields, ["fanSubscriptionActive", "creatorFollowsFan", "blocked", "restricted", "performer", "subscribePriceCents"]);
 
   const noProvenance = evaluateRefollowCurrent(candidate, {
     onlyFansUserId: "fan-1",
     relationship: { fanSubscriptionActive: false, creatorFollowsFan: true },
   }, settings, new Date("2026-09-16T12:00:00.000Z"), { phase: "IDLE" });
-  assert.equal(noProvenance.code, "fan_current_provenance_unknown");
+  assert.equal(noProvenance.code, "fan_current_field_provenance_unknown");
   assert.equal(noProvenance.refreshRequired, true);
 });
 
@@ -342,15 +374,15 @@ test("Phase3 Refollow refreshes only the edge required for expired-fan UNFOLLOW 
     subscribePriceCents: 0, phase: "IDLE", state: "CANDIDATE", nudgeCount: 0,
   };
   const settings = { refollowEnabled: true, maxNudgesPerFan: 2 };
-  const unknownSubscription = evaluateRefollowCurrent(candidate, current({ fanSubscriptionActive: null, creatorFollowsFan: true }), settings, new Date(), { phase: "IDLE" });
+  const unknownSubscription = evaluateRefollowCurrent(candidate, current({ fanSubscriptionActive: null, creatorFollowsFan: true, blocked: false, restricted: false, performer: false, subscribePriceCents: 0 }), settings, new Date(), { phase: "IDLE" });
   assert.equal(unknownSubscription.code, "fan_subscription_state_unknown");
   assert.deepEqual(unknownSubscription.refreshFields, ["fanSubscriptionActive"]);
 
-  const unknownFollowEdge = evaluateRefollowCurrent(candidate, current({ fanSubscriptionActive: false, creatorFollowsFan: null }), settings, new Date(), { phase: "IDLE" });
+  const unknownFollowEdge = evaluateRefollowCurrent(candidate, current({ fanSubscriptionActive: false, creatorFollowsFan: null, blocked: false, restricted: false, performer: false, subscribePriceCents: 0 }), settings, new Date(), { phase: "IDLE" });
   assert.equal(unknownFollowEdge.code, "creator_follow_state_unknown");
   assert.deepEqual(unknownFollowEdge.refreshFields, ["creatorFollowsFan"]);
 
-  const returnedFan = evaluateRefollowCurrent(candidate, current({ fanSubscriptionActive: true, creatorFollowsFan: null }), settings, new Date(), { phase: "IDLE" });
+  const returnedFan = evaluateRefollowCurrent(candidate, current({ fanSubscriptionActive: true, creatorFollowsFan: null, blocked: false, restricted: false, performer: false, subscribePriceCents: 0 }), settings, new Date(), { phase: "IDLE" });
   assert.equal(returnedFan.code, "fan_active");
   assert.equal(returnedFan.refreshRequired, undefined);
 });
@@ -401,7 +433,7 @@ test("Phase3 Bump missing/unprovenanced current requests only source-required re
     current: { onlyFansUserId: "fan-1", relationship: { canReceiveChatMessage: true, fanSubscriptionActive: true, fanSubscriptionType: "paid" } },
     source: "paid_subscriber",
   });
-  assert.equal(noProvenance.code, "fan_current_provenance_unknown");
+  assert.equal(noProvenance.code, "fan_current_field_provenance_unknown");
   assert.equal(noProvenance.refreshRequired, true);
 });
 
@@ -521,7 +553,8 @@ test("Phase3 fresh-source read metrics cannot resurrect unprovenanced Follow Bac
   const source = fs.readFileSync(path.join(__dirname, "follow-back-service.js"), "utf8");
   const fn = source.match(/async function countEligibleCandidates[\s\S]*?return Number\(rows\?\.\[0\]\?\.count \|\| 0\);\n}/)?.[0] || "";
   assert.match(fn, /JOIN "CreatorFanRelationshipCurrent" r/);
-  assert.match(fn, /r\."observedAt" IS NOT NULL/);
+  assert.match(fn, /creatorFollowsFanAuthorityVersion/);
+  assert.doesNotMatch(fn, /r\."observedAt" IS NOT NULL/);
   assert.doesNotMatch(source, /function automaticEligibilityWhere\(/);
 });
 
@@ -529,7 +562,9 @@ test("Phase3 Refollow eligible metric is canonical-current instead of candidate 
   const source = fs.readFileSync(path.join(__dirname, "follow-automation-service.js"), "utf8");
   const helper = source.match(/async function countCanonicalEligibleRefollowCandidates[\s\S]*?return Number\(rows\?\.\[0\]\?\.count \|\| 0\);\n}/)?.[0] || "";
   assert.match(helper, /JOIN "CreatorFanRelationshipCurrent" r/);
-  assert.match(helper, /r\."observedAt" IS NOT NULL/);
+  assert.match(helper, /fanSubscriptionActiveAuthorityVersion/);
+  assert.match(helper, /creatorFollowsFanAuthorityVersion/);
+  assert.doesNotMatch(helper, /r\."observedAt" IS NOT NULL/);
   assert.match(helper, /r\."fanSubscriptionActive" = false/);
   assert.match(helper, /r\."creatorFollowsFan" = true/);
   assert.match(source, /metrics[\s\S]*countCanonicalEligibleRefollowCandidates\(\{ agencyId, creatorId, settings, now, db \}\)/);
@@ -591,7 +626,8 @@ test("Phase3 Likes read model and eligible metric use canonical current audience
   const source = fs.readFileSync(path.join(__dirname, "likes-service.js"), "utf8");
   const helper = source.match(/async function countCanonicalEligibleLikeCandidates[\s\S]*?return Number\(rows\?\.\[0\]\?\.count \|\| 0\);\n}/)?.[0] || "";
   assert.match(helper, /JOIN "CreatorFanRelationshipCurrent" r/);
-  assert.match(helper, /r\."observedAt" IS NOT NULL/);
+  assert.match(helper, /fanSubscriptionActiveAuthorityVersion/);
+  assert.doesNotMatch(helper, /r\."observedAt" IS NOT NULL/);
   assert.match(helper, /c\."state" IN \('ELIGIBLE', 'DISCOVERED'\)/);
   assert.match(source, /countCanonicalEligibleLikeCandidates\(\{ agencyId, creatorId, settings, db \}\)/);
   assert.match(source, /listLikes[\s\S]*readFanCurrentMap[\s\S]*evaluateLikesCurrent/);

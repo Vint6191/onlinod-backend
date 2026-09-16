@@ -2,7 +2,8 @@
 
 const express = require("express");
 const prisma = require("../prisma");
-const { requireProductCreator } = require("../middleware/product-access");
+const { requireProductCreator, requireProductDevice, currentAccessEpoch } = require("../middleware/product-access");
+const { assertExecutionAccessFence } = require("../services/execution-access-fence-service");
 const { readFanCurrent, scheduleFanDataPointRefresh, onlyFansUserId, projectFanObservationBatch } = require("../services/fan-data-authority-service");
 
 const router = express.Router();
@@ -29,12 +30,31 @@ router.post("/observations", async (req, res) => {
   try {
     const creatorId = clean(req.body?.creatorId);
     const creator = await requireProductCreator(req, creatorId);
+    const sourceDeviceId = requireProductDevice(req, req.auth?.deviceId, {
+      requiredCode: "FAN_DATA_DEVICE_BOUND_TOKEN_REQUIRED",
+      mismatchCode: "FAN_DATA_DEVICE_IDENTITY_MISMATCH",
+    });
     const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 100) : [];
-    const result = await projectFanObservationBatch(prisma, {
-      agencyId: creator.agencyId,
-      creatorId: creator.id,
-      sourceDeviceId: clean(req.auth?.deviceId),
-      items,
+    const receivedAt = new Date();
+    const result = await prisma.$transaction(async (tx) => {
+      await assertExecutionAccessFence({
+        db: tx,
+        agencyId: creator.agencyId,
+        creatorId: creator.id,
+        userId: req.auth.userId,
+        memberId: req.auth.memberId,
+        accessEpoch: currentAccessEpoch(req),
+        lock: true,
+      });
+      return projectFanObservationBatch(tx, {
+        agencyId: creator.agencyId,
+        creatorId: creator.id,
+        sourceDeviceId,
+        items,
+        allowedSources: ["USER_PROFILE"],
+        observedAtPolicy: "SERVER_RECEIPT",
+        receivedAt,
+      });
     });
     return res.json({ ok: true, creatorId: creator.id, ...result });
   } catch (error) {

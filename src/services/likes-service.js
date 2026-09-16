@@ -7,7 +7,7 @@ const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob } = require("./job-planning-repository");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
-const { readFanCurrentMap, evaluateLikesCurrent } = require("./fan-current-consumer-service");
+const { readFanCurrentMap, evaluateLikesCurrent, likesRequiredFields, buildFanCurrentFieldFence } = require("./fan-current-consumer-service");
 const { scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
@@ -568,7 +568,8 @@ async function validateLikeDelivery({ delivery, control, now = new Date(), db = 
     creatorId: delivery.creatorId,
     fanIds: [candidate.ownerFanId],
   });
-  const currentEligibility = evaluateLikesCurrent(currentByFan.get(String(candidate.ownerFanId || "")) || null, settings, now);
+  const current = currentByFan.get(String(candidate.ownerFanId || "")) || null;
+  const currentEligibility = evaluateLikesCurrent(current, settings, now);
   if (!currentEligibility.eligible) {
     return {
       ok: false,
@@ -591,7 +592,11 @@ async function validateLikeDelivery({ delivery, control, now = new Date(), db = 
     const retryAt = new Date(dayStart(now)); retryAt.setDate(retryAt.getDate() + 1);
     return { ok: false, terminal: false, code: "daily_limit", retryAt };
   }
-  return { ok: true, candidate };
+  return {
+    ok: true,
+    candidate,
+    fanCurrentFence: buildFanCurrentFieldFence(current, likesRequiredFields(settings, current)),
+  };
 }
 
 async function updateLikeCandidateFromDelivery({ delivery, state, status, failureCode = null, result = {}, db = prisma }) {
@@ -640,7 +645,8 @@ async function countCanonicalEligibleLikeCandidates({ agencyId, creatorId, setti
       AND c."creatorId" = $2
       AND c."contentType" = 'post'
       AND c."state" IN ('ELIGIBLE', 'DISCOVERED')
-      AND r."observedAt" IS NOT NULL
+      AND r."fanSubscriptionActiveAuthorityVersion" IS NOT NULL
+      AND (NOT $7 OR r."fanSubscriptionActive" IS FALSE OR r."fanSubscriptionTypeAuthorityVersion" IS NOT NULL)
       AND CASE
         WHEN r."fanSubscriptionActive" IS FALSE THEN $4
         WHEN r."fanSubscriptionActive" IS TRUE THEN
@@ -661,7 +667,7 @@ async function countCanonicalEligibleLikeCandidates({ agencyId, creatorId, setti
           END
       END
     `,
-    agencyId, creatorId, allowActive, allowExpired, allowFree, allowPaid,
+    agencyId, creatorId, allowActive, allowExpired, allowFree, allowPaid, allowFree !== allowPaid,
   );
   return Number(rows?.[0]?.count || 0);
 }

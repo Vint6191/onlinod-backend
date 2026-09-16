@@ -467,7 +467,9 @@ async function countEligibleCandidates({ agencyId, creatorId, settings, now = ne
       AND c."blocked" = false
       AND c."ignored" = false
       AND c."state" <> 'STALE'
-      AND r."observedAt" IS NOT NULL
+      AND r."creatorFollowsFanAuthorityVersion" IS NOT NULL
+      AND (NOT $8 OR r."fanSubscriptionActiveAuthorityVersion" IS NOT NULL)
+      AND (NOT $9 OR r."fanSubscriptionTypeAuthorityVersion" IS NOT NULL)
       AND COALESCE(c."generation", 1) <= 1
       AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= $3)
       AND COALESCE(r."creatorFollowsFan", false) = false
@@ -485,6 +487,8 @@ async function countEligibleCandidates({ agencyId, creatorId, settings, now = ne
     settings.expiredSubscribers === true,
     settings.freeSubscribers === true,
     settings.paidSubscribers === true,
+    (settings.activeSubscribers === true) !== (settings.expiredSubscribers === true),
+    (settings.freeSubscribers === true) !== (settings.paidSubscribers === true),
   );
   return Number(rows?.[0]?.count || 0);
 }
@@ -496,7 +500,9 @@ async function countCanonicalAlreadyFollowed({ agencyId, creatorId, db = prisma 
     FROM "FollowBackCandidate" c
     JOIN "CreatorFanRelationshipCurrent" r
       ON r."creatorId" = c."creatorId" AND r."onlyFansUserId" = c."fanId"
-    WHERE c."agencyId" = $1 AND c."creatorId" = $2 AND r."creatorFollowsFan" = true
+    WHERE c."agencyId" = $1 AND c."creatorId" = $2
+      AND r."creatorFollowsFanAuthorityVersion" IS NOT NULL
+      AND r."creatorFollowsFan" = true
     `,
     agencyId, creatorId,
   );

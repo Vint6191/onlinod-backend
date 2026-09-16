@@ -107,15 +107,36 @@ function normalizeSfsTarget(value, sourcePostIds = []) {
   const targetUserId = clean(row.id ?? row.userId ?? row.fanId, 160);
   const username = cleanUsername(row.username ?? row.userName);
   if (!targetUserId || !username) return null;
-  const price = Number(row.subscribePrice ?? row.subscriptionPrice ?? row.price ?? 0);
+
+  let subscribePriceCents = null;
+  if (Object.prototype.hasOwnProperty.call(row, "subscribePriceCents")) {
+    const cents = Number(row.subscribePriceCents);
+    subscribePriceCents = Number.isSafeInteger(cents) && cents >= 0 ? cents : null;
+  } else {
+    const rawPrice = row.subscribePrice ?? row.subscriptionPrice ?? row.price;
+    if (rawPrice !== null && rawPrice !== undefined && rawPrice !== "") {
+      const price = Number(rawPrice);
+      subscribePriceCents = Number.isFinite(price) && price >= 0 ? Math.round(price * 100) : null;
+    }
+  }
+
+  let creatorFollowing = null;
+  if (Object.prototype.hasOwnProperty.call(row, "subscribedBy")) {
+    creatorFollowing = typeof row.subscribedBy === "boolean" ? row.subscribedBy : null;
+  } else if (Object.prototype.hasOwnProperty.call(row, "subscribedByCreator")) {
+    creatorFollowing = typeof row.subscribedByCreator === "boolean" ? row.subscribedByCreator : null;
+  } else if (Object.prototype.hasOwnProperty.call(row, "creatorFollowing")) {
+    creatorFollowing = typeof row.creatorFollowing === "boolean" ? row.creatorFollowing : null;
+  }
+
   return {
     targetUserId,
     username,
     displayName: clean(row.name ?? row.displayName, 240),
     avatarUrl: clean(row.avatar ?? row.avatarUrl, 1000),
-    subscribePriceCents: Number.isFinite(price) ? Math.max(0, Math.round(price * 100)) : 0,
+    subscribePriceCents,
     isWantComments: typeof row.isWantComments === "boolean" ? row.isWantComments : null,
-    creatorFollowing: row.subscribedBy === true || row.subscribedByCreator === true,
+    creatorFollowing,
     sourcePostIds: [...new Set((Array.isArray(sourcePostIds) ? sourcePostIds : []).map((id) => clean(id, 160)).filter(Boolean))].slice(0, 100),
   };
 }
@@ -126,11 +147,28 @@ function targetEligibility(candidate, settings, now = new Date()) {
   if (candidate.blocked) return "blocked";
   if (candidate.ignored) return "ignored";
   if (settings.oneTargetForever && candidate.usedForever) return "used_forever";
-  if (settings.freeTargetsOnly && Number(candidate.subscribePriceCents || 0) > 0) return "paid_target";
+
+  const observedAt = candidate.discoveryObservedAt || candidate.lastSeenAt || null;
+  if (observedAt && settings?.discoveryFreshnessHours) {
+    const observedMs = new Date(observedAt).getTime();
+    const maxAgeMs = Number(settings.discoveryFreshnessHours) * 60 * 60_000;
+    if (Number.isFinite(observedMs) && Number.isFinite(maxAgeMs) && maxAgeMs > 0 && now.getTime() - observedMs > maxAgeMs) {
+      return "target_profile_stale";
+    }
+  }
+
+  if (settings.freeTargetsOnly) {
+    if (candidate.subscribePriceCents === null || candidate.subscribePriceCents === undefined) return "price_unknown";
+    if (Number(candidate.subscribePriceCents) > 0) return "paid_target";
+  }
+  if (candidate.creatorFollowing === null || candidate.creatorFollowing === undefined) return "following_unknown";
   if (candidate.creatorFollowing === true) return "already_following";
-  if (candidate.isWantComments === false) return "comments_disabled";
+  if (settings.commentsEnabled !== false) {
+    if (candidate.isWantComments === null || candidate.isWantComments === undefined) return "comments_unknown";
+    if (candidate.isWantComments === false) return "comments_disabled";
+  }
   if (candidate.cooldownUntil && new Date(candidate.cooldownUntil).getTime() > now.getTime()) return "cooldown";
-  if (["QUEUED", "FOLLOWING", "SCANNING", "ACTING", "UNFOLLOW_DUE", "UNFOLLOWING"].includes(String(candidate.state || ""))) return "active_delivery";
+  if (["QUEUED", "FOLLOWING", "SCANNING", "ACTING", "UNFOLLOW_DUE", "UNFOLLOWING", "RECOVERY_REQUIRED"].includes(String(candidate.state || ""))) return "active_delivery";
   return "eligible";
 }
 
@@ -150,10 +188,22 @@ function isRealUserComment(value, { creatorRemoteId, targetUserId } = {}) {
   return { eligible: true, reason: "eligible", commentId, authorId, username: clean(author.username, 160) };
 }
 
-function shouldStartSfsSagaAfterFollow(outcomeCode, result = {}) {
+function classifySfsFollowEffectOwnership({ outcomeCode, result = {}, delivery = null } = {}) {
   const code = String(outcomeCode || "").trim().toLowerCase();
-  if (code !== "already_followed") return true;
-  return object(result).recoveredAfterAmbiguousWrite === true;
+  const facts = object(result);
+  // Cleanup ownership is intentionally stricter than desired-state/idempotency.
+  // Only a positively completed SFS FOLLOW that crossed the server-owned write
+  // commit boundary may authorize a future inverse UNFOLLOW. A later provider
+  // readback of "followed" after an ambiguous attempt never proves who created
+  // that relationship.
+  if (code === "followed" && delivery?.writeCommitAt) return "OWNED";
+  if (code === "already_followed") return "PREEXISTING";
+  if (code === "followed_recovered" || facts.recoveredAfterAmbiguousWrite === true) return "AMBIGUOUS_UNOWNED";
+  return "UNPROVEN";
+}
+
+function shouldStartSfsSagaAfterFollow(outcomeCode, result = {}, delivery = null) {
+  return classifySfsFollowEffectOwnership({ outcomeCode, result, delivery }) === "OWNED";
 }
 
 function sfsTargetGenerationKey(creatorId, targetUserId, generation) {
@@ -177,6 +227,7 @@ module.exports = {
   normalizeSfsTarget,
   targetEligibility,
   isRealUserComment,
+  classifySfsFollowEffectOwnership,
   shouldStartSfsSagaAfterFollow,
   sfsTargetGenerationKey,
   sfsCommentKey,

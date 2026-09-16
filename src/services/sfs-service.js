@@ -7,6 +7,7 @@ const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { runDbTransaction, withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { projectFanObservationBatch, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
   getAutomationControlSnapshot,
@@ -15,14 +16,18 @@ const {
   normalizeSfsSettings,
 } = require("./automation-control-service");
 const {
-  targetEligibility,
   normalizeSfsTarget,
-  shouldStartSfsSagaAfterFollow,
+  classifySfsFollowEffectOwnership,
   sfsTargetGenerationKey,
   sfsCommentKey,
   sfsCommentLikeKey,
   sfsUnfollowKey,
 } = require("./sfs-rules");
+const {
+  readFanCurrentMap,
+  evaluateSfsFollowCurrent,
+  buildFanCurrentFieldFence,
+} = require("./fan-current-consumer-service");
 const {
   SFS_MODULE_KEY,
   SFS_DISCOVERY_JOB_KEY,
@@ -44,6 +49,49 @@ function randomBetween(min, max) { const lo = Math.max(0, int(min)); const hi = 
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
 function monthStart(date = new Date()) { return new Date(date.getFullYear(), date.getMonth(), 1); }
 
+function currentSfsCleanupOwnership(delivery, candidate) {
+  const payload = object(delivery?.payload);
+  const metadata = object(candidate?.metadata);
+  if (payload.legacyMigration === true && metadata.legacyMigration === true) {
+    return { owned: true, kind: "LEGACY_ADOPTED", followDeliveryId: null };
+  }
+  const followDeliveryId = clean(payload.followDeliveryId, 160);
+  const owned = payload.safetyCleanup === true
+    && payload.effectOwnership === "OWNED"
+    && followDeliveryId
+    && metadata.followEffectOwnership === "OWNED"
+    && clean(metadata.followEffectDeliveryId, 160) === followDeliveryId
+    && Number(metadata.followEffectGeneration) === Number(delivery?.generation)
+    && candidate?.safetyUnfollowDeliveryId === delivery?.id;
+  return { owned: Boolean(owned), kind: owned ? "OWNED" : "UNPROVEN", followDeliveryId };
+}
+
+async function resolveSfsCleanupOwnership({ delivery, candidate, db }) {
+  const explicit = currentSfsCleanupOwnership(delivery, candidate);
+  if (explicit.owned) return explicit;
+  if (!delivery || !candidate || !db?.automationDelivery?.findFirst) return explicit;
+
+  // Backward-compatible proof for cleanup rows created before INT4.3C. We only
+  // adopt a cleanup when the original SFS FOLLOW is itself a server-recorded
+  // completed write with a writeCommitAt and an explicit direct provider success
+  // code. Ambiguous/recovered/already-followed outcomes are intentionally excluded.
+  const original = await db.automationDelivery.findFirst({
+    where: {
+      agencyId: delivery.agencyId,
+      creatorId: delivery.creatorId,
+      moduleKey: SFS_MODULE_KEY,
+      actionType: SFS_FOLLOW_TARGET_ACTION_TYPE,
+      fanId: candidate.targetUserId,
+      generation: delivery.generation,
+      status: "COMPLETED",
+    },
+    orderBy: { finishedAt: "desc" },
+    select: { id: true, result: true, writeCommitAt: true },
+  });
+  if (!original?.writeCommitAt || String(object(original.result).code || "").trim().toLowerCase() !== "followed") return explicit;
+  return { owned: true, kind: "ADOPTED_SERVER_PROOF", followDeliveryId: original.id };
+}
+
 async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   const freshAfter = new Date(Date.now() - 2 * 60_000);
   return db.deviceCreatorBinding.count({
@@ -52,6 +100,20 @@ async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
 }
 async function withCreatorLock(db, agencyId, creatorId, fn) {
   return withDbAdvisoryXactLock({ db, key: `p14:sfs:${agencyId}:${creatorId}`, work: fn, options: { timeout: 30_000 } });
+}
+
+async function scheduleSfsCurrentRefresh({ agencyId, creatorId, fanIds = [], refreshFields = [], reason = "sfs_current_refresh_required" }) {
+  const ids = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
+  if (!ids.length) return { requested: false, fanIds: [] };
+  try {
+    const decision = await scheduleFanDataPointRefresh({
+      agencyId, creatorId, onlyFansUserIds: ids, reason, priority: 90,
+      params: { consumer: "sfs", trigger: "planning", refreshFields: [...new Set((refreshFields || []).map((value) => clean(value, 80)).filter(Boolean))] },
+    });
+    return { requested: true, fanIds: ids, decision };
+  } catch {
+    return { requested: false, fanIds: ids };
+  }
 }
 
 async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force = false, source = "manual", priority = 75, db = prisma }) {
@@ -81,25 +143,61 @@ async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force 
   return { ok: true, created: job?.status === "SCHEDULED", reason: "scheduled", job };
 }
 
-async function applySfsDiscoveryChunk({ db = prisma, job, chunkResult }) {
+async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunkResult, projectFanObservations = projectFanObservationBatch }) {
   if (!job?.creatorId || !job?.agencyId) throw new Error("SFS discovery job is missing creator scope");
   const payload = object(chunkResult);
   if (payload.kind !== "sfs_target_profile") return { applied: 0 };
   const target = normalizeSfsTarget(payload.target, payload.sourcePostIds);
   if (!target) return { applied: 0 };
-  const observedAt = dateOrNull(payload.observedAt);
-  if (!observedAt) throw new Error("SFS_DISCOVERY_OBSERVED_AT_REQUIRED");
+  const producerObservedAt = dateOrNull(payload.observedAt);
+  const receivedAt = new Date();
+  // Job creation/claim time is server-owned and orders overlapping discovery
+  // generations without trusting Desktop wall-clock timestamps.
+  const observedAt = dateOrNull(job.createdAt) || dateOrNull(job.claimedAt) || receivedAt;
   const sourceJobId = clean(job.id, 180);
   if (!sourceJobId) throw new Error("SFS_DISCOVERY_SOURCE_JOB_REQUIRED");
 
-  return withDbAdvisoryXactLock({
+  const suppliedObservation = object(payload.fanObservation);
+  const identityFacts = Object.keys(object(suppliedObservation.identity)).length
+    ? object(suppliedObservation.identity)
+    : { username: target.username, platformDisplayName: target.displayName, avatarUrl: target.avatarUrl };
+  const suppliedRelationship = object(suppliedObservation.relationship);
+  const relationshipFacts = Object.keys(suppliedRelationship).length ? suppliedRelationship : {
+    ...(target.creatorFollowing !== null && target.creatorFollowing !== undefined ? { creatorFollowsFan: target.creatorFollowing } : {}),
+    ...(target.subscribePriceCents !== null && target.subscribePriceCents !== undefined ? { subscribePriceCents: target.subscribePriceCents } : {}),
+  };
+  const valueFacts = object(suppliedObservation.value);
+  // Source and chronology are re-owned by the server job envelope. The producer
+  // payload contributes facts only.
+  const canonicalItem = {
+    onlyFansUserId: target.targetUserId,
+    ...(Object.keys(identityFacts).length ? { identity: { ...identityFacts, source: "USER_PROFILE", observedAt } } : {}),
+    ...(Object.keys(relationshipFacts).length ? { relationship: { ...relationshipFacts, source: "USER_PROFILE", observedAt } } : {}),
+    ...(Object.keys(valueFacts).length ? { value: { ...valueFacts, source: "USER_PROFILE", observedAt } } : {}),
+  };
+
+  // Keep SFS projection locking separate from FanData locking. Automation
+  // settlement can touch FanData before SFS workflow state; overlapping those
+  // lock orders here would create an avoidable cross-domain deadlock class.
+  const candidateResult = await withDbAdvisoryXactLock({
     db,
-    key: `a13:sfs-discovery:${job.agencyId}:${job.creatorId}:${target.username}`,
+    key: `p14:sfs-target:${job.agencyId}:${job.creatorId}:${target.targetUserId}`,
     options: { timeout: 30_000 },
     work: async (tx) => {
-      const existing = await tx.sfsTargetCandidate.findUnique({
-        where: { creatorId_username: { creatorId: job.creatorId, username: target.username } },
+      // targetUserId is the stable opaque SFS identity. Username is mutable profile
+      // data and must never select another target's historical workflow state.
+      let existing = await tx.sfsTargetCandidate.findFirst({
+        where: { creatorId: job.creatorId, targetUserId: target.targetUserId },
       });
+      if (!existing) {
+        // One-way adoption for unresolved pre-cutover rows only. A recycled
+        // username that already belongs to another non-null targetUserId is never
+        // merged into this identity.
+        existing = await tx.sfsTargetCandidate.findFirst({
+          where: { creatorId: job.creatorId, username: target.username, targetUserId: null },
+        });
+      }
+
       const currentObservedAt = dateOrNull(existing?.discoveryObservedAt);
       const currentSourceJobId = clean(existing?.discoverySourceJobId, 180) || "";
       if (currentObservedAt) {
@@ -119,28 +217,39 @@ async function applySfsDiscoveryChunk({ db = prisma, job, chunkResult }) {
       }
 
       const usedForever = existing?.usedForever === true;
-      const row = await tx.sfsTargetCandidate.upsert({
-        where: { creatorId_username: { creatorId: job.creatorId, username: target.username } },
-        create: {
-          agencyId: job.agencyId, creatorId: job.creatorId, targetUserId: target.targetUserId, username: target.username,
-          displayName: target.displayName, avatarUrl: target.avatarUrl, subscribePriceCents: target.subscribePriceCents,
-          isWantComments: target.isWantComments, creatorFollowing: target.creatorFollowing, sourcePostIds: target.sourcePostIds,
-          state: "CANDIDATE", phase: "DISCOVERY", eligibilityReason: null, discoveredAt: observedAt, lastSeenAt: observedAt,
-          discoveryObservedAt: observedAt, discoverySourceJobId: sourceJobId,
-          metadata: { discoveryJobId: sourceJobId, profileHash: payload.profileHash || null },
+      const data = {
+        targetUserId: target.targetUserId, username: target.username, displayName: target.displayName, avatarUrl: target.avatarUrl,
+        subscribePriceCents: target.subscribePriceCents, isWantComments: target.isWantComments,
+        creatorFollowing: target.creatorFollowing, sourcePostIds: target.sourcePostIds, lastSeenAt: observedAt,
+        discoveryObservedAt: observedAt, discoverySourceJobId: sourceJobId,
+        ...(usedForever ? {} : { state: existing?.state === "STALE" ? "CANDIDATE" : existing?.state || "CANDIDATE" }),
+        metadata: {
+          ...object(existing?.metadata), discoveryJobId: sourceJobId, profileHash: payload.profileHash || null,
+          producerObservedAt: producerObservedAt?.toISOString() || null, observationTimeBasis: "SERVER_JOB_GENERATION",
         },
-        update: {
-          targetUserId: target.targetUserId, displayName: target.displayName, avatarUrl: target.avatarUrl,
-          subscribePriceCents: target.subscribePriceCents, isWantComments: target.isWantComments,
-          creatorFollowing: target.creatorFollowing, sourcePostIds: target.sourcePostIds, lastSeenAt: observedAt,
-          discoveryObservedAt: observedAt, discoverySourceJobId: sourceJobId,
-          ...(usedForever ? {} : { state: existing?.state === "STALE" ? "CANDIDATE" : existing?.state || "CANDIDATE" }),
-          metadata: { ...object(existing?.metadata), discoveryJobId: sourceJobId, profileHash: payload.profileHash || null },
-        },
-      });
-      return { applied: 1, candidateId: row.id, observedAt: observedAt.toISOString() };
+      };
+      const row = existing
+        ? await tx.sfsTargetCandidate.update({ where: { id: existing.id }, data })
+        : await tx.sfsTargetCandidate.create({ data: {
+          agencyId: job.agencyId, creatorId: job.creatorId, ...data,
+          state: "CANDIDATE", phase: "DISCOVERY", eligibilityReason: null, discoveredAt: observedAt,
+        } });
+      return { applied: 1, candidateId: row.id, observedAt: observedAt.toISOString(), targetUserId: target.targetUserId };
     },
   });
+
+  if (candidateResult.applied !== 1) return candidateResult;
+  const fanProjection = await projectFanObservations(db, {
+    agencyId: job.agencyId,
+    creatorId: job.creatorId,
+    sourceDeviceId: clean(deviceId, 180),
+    sourceJobId,
+    items: [canonicalItem],
+    allowedSources: ["USER_PROFILE"],
+    observedAtPolicy: "TRUSTED_INPUT",
+    receivedAt,
+  });
+  return { ...candidateResult, fanProjection };
 }
 
 async function applySfsDiscoveryCompletion({ job, result, db = prisma }) {
@@ -205,31 +314,50 @@ async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId 
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: SFS_MODULE_KEY, db });
   const settings = normalizeSfsSettings(control.modules.sfs.settings);
   if (!settings.huntingEnabled) return { ok: false, created: 0, reason: "hunting_disabled" };
-  return withCreatorLock(db, agencyId, creatorId, async (tx) => {
+  const result = await withCreatorLock(db, agencyId, creatorId, async (tx) => {
     const today = dayStart();
     const startedToday = await tx.automationDelivery.count({
       where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_FOLLOW_TARGET_ACTION_TYPE, createdAt: { gte: today }, status: { not: "CANCELED" } },
     });
     let remaining = Math.max(0, settings.dailyLimit - startedToday);
-    if (!remaining) return { ok: true, created: 0, reason: "daily_limit", dailyLimit: settings.dailyLimit };
+    if (!remaining) return { ok: true, created: 0, reason: "daily_limit", dailyLimit: settings.dailyLimit, refreshFanIds: [], refreshFields: [] };
     const candidates = await tx.sfsTargetCandidate.findMany({
       where: { agencyId, creatorId, ...(candidateId ? { id: candidateId } : {}) },
       orderBy: [{ discoveredAt: "asc" }, { updatedAt: "asc" }], take: Math.min(500, Math.max(1, Number(limit) || 20) * 5),
     });
-    const created = []; const skipped = [];
+    const currentByFan = await readFanCurrentMap(tx, {
+      agencyId,
+      creatorId,
+      fanIds: candidates.map((candidate) => candidate.targetUserId).filter(Boolean),
+    });
+    const created = []; const skipped = []; const refreshFanIds = new Set(); const refreshFields = new Set();
+    const now = new Date();
     for (const candidate of candidates) {
       if (!remaining) break;
-      const reason = targetEligibility(candidate, settings);
-      if (reason !== "eligible") {
-        if (["paid_target", "comments_disabled"].includes(reason)) {
+      const current = currentByFan.get(String(candidate.targetUserId || "")) || null;
+      const eligibility = evaluateSfsFollowCurrent(candidate, current, settings, now);
+      const reason = eligibility.code;
+      if (!eligibility.eligible) {
+        if (eligibility.refreshRequired === true && candidate.targetUserId) {
+          refreshFanIds.add(String(candidate.targetUserId));
+          for (const field of eligibility.refreshFields || []) refreshFields.add(field);
+        }
+        if (reason === "already_following") {
           await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
-            usedForever: true, state: "SKIPPED", phase: "DONE", eligibilityReason: reason,
-            completedAt: candidate.completedAt || new Date(), latestError: null,
+            creatorFollowing: true, state: "SKIPPED", phase: "DONE", eligibilityReason: "already_following", latestError: null,
+          } });
+        } else if (["paid_target", "comments_disabled"].includes(reason)) {
+          // Current ineligibility is not historical consumption. The same opaque
+          // target may become eligible later (price/comments policy can change),
+          // so oneTargetForever is reserved for a completed owned SFS cycle.
+          await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
+            usedForever: false, state: "SKIPPED", phase: "DONE", eligibilityReason: reason,
+            completedAt: null, latestError: null,
           } });
         } else if (!["blocked", "ignored", "active_delivery", "cooldown", "used_forever"].includes(reason)) {
           await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: { eligibilityReason: reason } });
         }
-        skipped.push({ id: candidate.id, reason }); continue;
+        skipped.push({ id: candidate.id, reason, refreshRequired: eligibility.refreshRequired === true, refreshFields: eligibility.refreshFields || [] }); continue;
       }
       if (!candidate.targetUserId) { skipped.push({ id: candidate.id, reason: "invalid_target" }); continue; }
       const active = await tx.automationDelivery.findFirst({
@@ -247,7 +375,7 @@ async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId 
         delivery = await tx.automationDelivery.create({ data: {
           agencyId, creatorId, originKind: "AUTOMATION", moduleKey: SFS_MODULE_KEY, actionType: SFS_FOLLOW_TARGET_ACTION_TYPE,
           targetId: candidate.targetUserId, fanId: candidate.targetUserId, idempotencyKey, generation, priority,
-          payload: { candidateId: candidate.id, username: candidate.username, source, requestedByUserId: userId, originalFollowing: candidate.creatorFollowing === true },
+          payload: { candidateId: candidate.id, username: candidate.username, source, requestedByUserId: userId, originalFollowing: eligibility.current?.relationship?.creatorFollowsFan === true },
           status: "QUEUED", scheduledAt: new Date(), notBefore, maxAttempts: settings.maxAttempts, createdByUserId: userId,
         } });
       } catch (error) {
@@ -260,8 +388,14 @@ async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId 
       } });
       created.push({ candidateId: candidate.id, deliveryId: delivery.id, notBefore }); remaining -= 1;
     }
-    return { ok: true, created: created.length, items: created, skipped, dailyLimit: settings.dailyLimit, remaining };
+    return { ok: true, created: created.length, items: created, skipped, dailyLimit: settings.dailyLimit, remaining, refreshFanIds: [...refreshFanIds].slice(0, 500), refreshFields: [...refreshFields] };
   });
+  if (!result?.refreshFanIds?.length) return { ...result, fanRefresh: { requested: false, fanIds: [] } };
+  const fanRefresh = await scheduleSfsCurrentRefresh({
+    agencyId, creatorId, fanIds: result.refreshFanIds, refreshFields: result.refreshFields,
+    reason: "sfs_planning_current_refresh_required",
+  });
+  return { ...result, fanRefresh };
 }
 
 async function scheduleTargetScan({ delivery, candidate, settings, now, db }) {
@@ -289,7 +423,10 @@ async function scheduleTargetScan({ delivery, candidate, settings, now, db }) {
   return planned.job;
 }
 
-async function createSafetyUnfollow({ delivery, candidate, settings, now, db }) {
+async function createSafetyUnfollow({ delivery, candidate, settings, now, db, effectOwnership }) {
+  if (effectOwnership !== "OWNED" || !delivery?.id || !delivery?.writeCommitAt) {
+    throw Object.assign(new Error("SFS cleanup requires server-owned follow effect proof"), { code: "sfs_cleanup_effect_unowned" });
+  }
   const idempotencyKey = sfsUnfollowKey(delivery.creatorId, candidate.targetUserId, delivery.generation);
   const notBefore = new Date(now.getTime() + settings.safetyUnfollowMs);
   let cleanup;
@@ -298,7 +435,10 @@ async function createSafetyUnfollow({ delivery, candidate, settings, now, db }) 
       agencyId: delivery.agencyId, creatorId: delivery.creatorId, originKind: "AUTOMATION", moduleKey: SFS_MODULE_KEY,
       actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE, targetId: candidate.targetUserId, fanId: candidate.targetUserId,
       idempotencyKey, generation: delivery.generation, priority: 120,
-      payload: { candidateId: candidate.id, safetyCleanup: true, originalFollowing: object(delivery.payload).originalFollowing === true },
+      payload: {
+        candidateId: candidate.id, safetyCleanup: true, originalFollowing: false,
+        effectOwnership: "OWNED", followDeliveryId: delivery.id, followGeneration: delivery.generation,
+      },
       status: "QUEUED", scheduledAt: now, notBefore, maxAttempts: 20,
     } });
   } catch (error) {
@@ -432,7 +572,14 @@ async function applySfsTargetScanCompletion({ job, result, db = prisma }) {
       where: { id: candidate.safetyUnfollowDeliveryId, status: { in: ["QUEUED", "RETRY_SCHEDULED", "PAUSED"] } },
       data: {
         notBefore: unfollowAt, status: "QUEUED", failureCode: null, lastError: null,
-        payload: { candidateId: candidate.id, safetyCleanup: true, originalFollowing: object(candidate.metadata).originalFollowing === true, plannedAfterScan: true },
+        payload: {
+          candidateId: candidate.id, safetyCleanup: true, originalFollowing: false, plannedAfterScan: true,
+          ...(object(candidate.metadata).followEffectOwnership === "OWNED" ? {
+            effectOwnership: "OWNED",
+            followDeliveryId: clean(object(candidate.metadata).followEffectDeliveryId, 160),
+            followGeneration: Number(object(candidate.metadata).followEffectGeneration) || candidateGeneration,
+          } : {}),
+        },
       },
     });
     await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
@@ -451,14 +598,49 @@ async function validateSfsDelivery({ delivery, control, now = new Date(), db = p
   if (!candidate) return { ok: false, terminal: true, code: "invalid_target" };
   if (isSfsCleanupDelivery(delivery)) {
     if (candidate.completedAt || candidate.state === "COMPLETED") return { ok: false, terminal: true, code: "already_unfollowed" };
-    return { ok: true, candidate };
+    const cleanupOwnership = await resolveSfsCleanupOwnership({ delivery, candidate, db });
+    if (!cleanupOwnership.owned) {
+      return { ok: false, terminal: true, code: "cleanup_effect_ownership_unproven", candidate, cleanupOwnership };
+    }
+    return { ok: true, candidate, cleanupOwnership };
   }
   if (!control?.effective?.sfsEnabled) return { ok: false, terminal: true, code: "module_disabled" };
   if (candidate.blocked) return { ok: false, terminal: true, code: "blocked" };
   if (candidate.ignored) return { ok: false, terminal: true, code: "ignored" };
   if (candidate.generation !== delivery.generation) return { ok: false, terminal: true, code: "stale_candidate" };
   if (delivery.notBefore && delivery.notBefore.getTime() > now.getTime()) return { ok: false, terminal: false, code: "not_before", retryAt: delivery.notBefore };
-  return { ok: true, candidate };
+  if (delivery.actionType !== SFS_FOLLOW_TARGET_ACTION_TYPE) return { ok: true, candidate };
+
+  const settings = normalizeSfsSettings(control.modules.sfs.settings);
+  const currentByFan = await readFanCurrentMap(db, {
+    agencyId: delivery.agencyId,
+    creatorId: delivery.creatorId,
+    fanIds: [candidate.targetUserId || delivery.targetId || delivery.fanId].filter(Boolean),
+  });
+  const current = currentByFan.get(String(candidate.targetUserId || delivery.targetId || delivery.fanId || "")) || null;
+  const eligibility = evaluateSfsFollowCurrent(candidate, current, settings, now);
+  if (!eligibility.eligible) {
+    if (eligibility.code === "already_following") {
+      return { ok: false, terminal: true, code: "already_followed", candidate, current };
+    }
+    if (eligibility.refreshRequired === true) {
+      return {
+        ok: false, terminal: false, code: eligibility.code || "sfs_fan_current_unknown",
+        retryAt: new Date(now.getTime() + 30_000), candidate, current,
+        refreshRequired: true,
+        refreshFanIds: candidate.targetUserId ? [String(candidate.targetUserId)] : [],
+        refreshFields: eligibility.refreshFields || [],
+        freshnessClass: eligibility.freshnessClass || null,
+      };
+    }
+    return { ok: false, terminal: true, code: eligibility.code || "sfs_target_ineligible", candidate, current };
+  }
+  return {
+    ok: true,
+    candidate,
+    current,
+    fanCurrentFence: buildFanCurrentFieldFence(current, eligibility.requiredFields || []),
+  };
 }
 
 async function finalizeSfsSuccess({ delivery, outcomeCode, result = {}, db = prisma, now = new Date() }) {
@@ -467,22 +649,32 @@ async function finalizeSfsSuccess({ delivery, outcomeCode, result = {}, db = pri
   const candidate = candidateId ? await db.sfsTargetCandidate.findUnique({ where: { id: candidateId } }) : null;
   if (!candidate) return null;
   if (delivery.actionType === SFS_FOLLOW_TARGET_ACTION_TYPE) {
-    if (!shouldStartSfsSagaAfterFollow(outcomeCode, result)) {
+    const effectOwnership = classifySfsFollowEffectOwnership({ outcomeCode, result, delivery });
+    if (effectOwnership !== "OWNED") {
+      const eligibilityReason = effectOwnership === "PREEXISTING" ? "already_following" : "follow_ownership_unproven";
       return db.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
-        state: "SKIPPED", phase: "DONE", creatorFollowing: true, eligibilityReason: "already_following",
+        state: "SKIPPED", phase: "DONE", creatorFollowing: true, eligibilityReason, usedForever: false, completedAt: null,
         latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: "SKIPPED", latestError: null,
-        metadata: { ...object(candidate.metadata), followOutcome: outcomeCode, manualFollowPreservedAt: now.toISOString() },
+        metadata: {
+          ...object(candidate.metadata), followOutcome: outcomeCode, followEffectOwnership: effectOwnership,
+          followEffectDeliveryId: delivery.id, followEffectGeneration: delivery.generation, cleanupAuthorized: false,
+          relationshipPreservedAt: now.toISOString(),
+        },
       } });
     }
     const control = await getAutomationControlSnapshot({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, db });
     const settings = normalizeSfsSettings(control.modules.sfs.settings);
     const scanJob = await scheduleTargetScan({ delivery, candidate, settings, now, db });
-    const cleanup = await createSafetyUnfollow({ delivery, candidate, settings, now, db });
+    const cleanup = await createSafetyUnfollow({ delivery, candidate, settings, now, db, effectOwnership });
     return db.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
       state: "SCANNING", phase: "SCAN", creatorFollowing: true, scanJobId: scanJob.id,
       safetyUnfollowDeliveryId: cleanup.id, unfollowAt: cleanup.notBefore,
       latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: "COMPLETED", latestError: null,
-      metadata: { ...object(candidate.metadata), originalFollowing: object(delivery.payload).originalFollowing === true, followedAt: now.toISOString(), followOutcome: outcomeCode },
+      metadata: {
+        ...object(candidate.metadata), originalFollowing: false, followedAt: now.toISOString(), followOutcome: outcomeCode,
+        followEffectOwnership: "OWNED", followEffectDeliveryId: delivery.id, followEffectGeneration: delivery.generation,
+        cleanupAuthorized: true, cleanupAuthorizedAt: now.toISOString(), cleanupDeliveryId: cleanup.id,
+      },
     } });
   }
   if (delivery.actionType === SFS_COMMENT_POST_ACTION_TYPE || delivery.actionType === SFS_LIKE_COMMENT_ACTION_TYPE) {
@@ -492,10 +684,24 @@ async function finalizeSfsSuccess({ delivery, outcomeCode, result = {}, db = pri
     } });
   }
   if (delivery.actionType === SFS_UNFOLLOW_TARGET_ACTION_TYPE) {
+    const cleanupOwnership = await resolveSfsCleanupOwnership({ delivery, candidate, db });
+    if (!cleanupOwnership.owned) {
+      return db.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
+        state: "RECOVERY_REQUIRED", phase: "UNFOLLOW", creatorFollowing: false, usedForever: false, completedAt: null, unfollowAt: null,
+        latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: "COMPLETED", latestError: "cleanup_effect_ownership_unproven_after_write",
+        metadata: {
+          ...object(candidate.metadata), unfollowedAt: now.toISOString(), unfollowOutcome: outcomeCode, result: object(result),
+          cleanupEffectOwnership: cleanupOwnership.kind, cleanupOwnershipIncidentAt: now.toISOString(),
+        },
+      } });
+    }
     return db.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
       state: "COMPLETED", phase: "DONE", creatorFollowing: false, usedForever: true, completedAt: now, unfollowAt: null,
       latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: "COMPLETED", latestError: null,
-      metadata: { ...object(candidate.metadata), unfollowedAt: now.toISOString(), unfollowOutcome: outcomeCode, result: object(result) },
+      metadata: {
+        ...object(candidate.metadata), unfollowedAt: now.toISOString(), unfollowOutcome: outcomeCode, result: object(result),
+        cleanupEffectOwnership: cleanupOwnership.kind, cleanupFollowDeliveryId: cleanupOwnership.followDeliveryId,
+      },
     } });
   }
   return null;
@@ -511,9 +717,24 @@ async function finalizeSfsFailure({ delivery, failureCode, retryable, db = prism
     latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: retryable ? "RETRY_SCHEDULED" : "FAILED", latestError: failureCode,
   } });
 }
-async function finalizeSfsTerminal({ delivery, status, failureCode, db = prisma }) {
+async function finalizeSfsTerminal({ delivery, status, failureCode, db = prisma, now = new Date() }) {
   if (!delivery || delivery.moduleKey !== SFS_MODULE_KEY) return null;
   const candidateId = clean(object(delivery.payload).candidateId, 160); if (!candidateId) return null;
+  if (delivery.actionType === SFS_FOLLOW_TARGET_ACTION_TYPE && status === "SKIPPED" && ["already_followed", "followed_recovered"].includes(failureCode)) {
+    const effectOwnership = failureCode === "already_followed" ? "PREEXISTING" : "AMBIGUOUS_UNOWNED";
+    const candidate = typeof db.sfsTargetCandidate.findFirst === "function"
+      ? await db.sfsTargetCandidate.findFirst({ where: { id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId } })
+      : null;
+    return db.sfsTargetCandidate.updateMany({ where: { id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId }, data: {
+      state: "SKIPPED", phase: "DONE", creatorFollowing: true, usedForever: false, completedAt: null,
+      eligibilityReason: failureCode === "already_followed" ? "already_following" : "follow_ownership_unproven",
+      latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: "SKIPPED", latestError: null,
+      metadata: {
+        ...object(candidate?.metadata), followOutcome: failureCode, followEffectOwnership: effectOwnership, followEffectDeliveryId: delivery.id,
+        followEffectGeneration: delivery.generation, cleanupAuthorized: false, relationshipPreservedAt: now.toISOString(),
+      },
+    } });
+  }
   return db.sfsTargetCandidate.updateMany({ where: { id: candidateId }, data: {
     state: isSfsCleanupDelivery(delivery) ? "RECOVERY_REQUIRED" : status,
     latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode,
@@ -555,10 +776,26 @@ async function listSfs({ agencyId, creatorId, search = "", state = null, offset 
     ]),
   ]);
   const [candidates, used, recoveryRequired, queued, running, commentsToday, likesToday, targetsToday, targetsMonth, failed] = metricsRows;
+  const currentByFan = await readFanCurrentMap(db, { agencyId, creatorId, fanIds: items.map((item) => item.targetUserId).filter(Boolean) });
+  const decisionRows = items.map((item) => {
+    const current = currentByFan.get(String(item.targetUserId || "")) || null;
+    const decision = evaluateSfsFollowCurrent(item, current, settings, new Date());
+    const rel = current?.relationship || null;
+    return {
+      ...item,
+      relationship: rel,
+      creatorFollowing: rel?.creatorFollowsFan ?? null,
+      subscribePriceCents: rel?.subscribePriceCents ?? null,
+      currentEligibility: decision.code,
+      eligible: decision.eligible === true,
+      currentRefreshRequired: decision.refreshRequired === true,
+      currentRefreshFields: decision.refreshFields || [],
+    };
+  });
   return {
     ok: true, creatorId, control, settings, worker: { ready: ready > 0, readyDevices: ready }, discovery,
     metrics: { candidates, used, recoveryRequired, queued, running, commentsToday, likesToday, targetsToday, targetsMonth, failed },
-    items: items.map((item) => ({ ...item, currentEligibility: targetEligibility(item, settings), eligible: targetEligibility(item, settings) === "eligible" })),
+    items: decisionRows,
     count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count,
   };
 }
@@ -603,19 +840,23 @@ async function adoptLegacySfsUnfollow({ agencyId, creatorId, targetUserId, targe
   await requireCreator(agencyId, creatorId, db);
   const username = String(clean(targetUsername, 80) || `legacy_${targetId}`).replace(/^@+/, "").toLowerCase();
   const dueAt = dateOrNull(runAfter) || new Date();
-  return runDbTransaction(db, async (tx) => {
-    const candidate = await tx.sfsTargetCandidate.upsert({
-      where: { creatorId_username: { creatorId, username } },
-      create: {
+  return withDbAdvisoryXactLock({
+    db,
+    key: `p14:sfs-target:${agencyId}:${creatorId}:${targetId}`,
+    options: { timeout: 30_000 },
+    work: async (tx) => {
+    let candidate = await tx.sfsTargetCandidate.findFirst({ where: { creatorId, targetUserId: targetId } });
+    if (!candidate) candidate = await tx.sfsTargetCandidate.findFirst({ where: { creatorId, username, targetUserId: null } });
+    candidate = candidate
+      ? await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
+        targetUserId: targetId, username, state: "UNFOLLOW_DUE", phase: "UNFOLLOW", creatorFollowing: true,
+        usedForever: true, unfollowAt: dueAt, metadata: { ...object(candidate.metadata), legacyMigration: true, sourceJobId },
+      } })
+      : await tx.sfsTargetCandidate.create({ data: {
         agencyId, creatorId, targetUserId: targetId, username, state: "UNFOLLOW_DUE", phase: "UNFOLLOW",
         creatorFollowing: true, usedForever: true, generation: 1, unfollowAt: dueAt,
         metadata: { legacyMigration: true, sourceJobId },
-      },
-      update: {
-        targetUserId: targetId, state: "UNFOLLOW_DUE", phase: "UNFOLLOW", creatorFollowing: true,
-        usedForever: true, unfollowAt: dueAt, metadata: { legacyMigration: true, sourceJobId },
-      },
-    });
+      } });
     const generation = Math.max(1, candidate.generation || 1);
     const idempotencyKey = sfsUnfollowKey(creatorId, targetId, generation);
     let delivery;
@@ -641,6 +882,7 @@ async function adoptLegacySfsUnfollow({ agencyId, creatorId, targetUserId, targe
       data: { status: "canceled", claimedByDeviceId: null, claimedAt: null, completedAt: new Date(), error: "P14_SFS_UNFOLLOW_ADOPTED" },
     }).catch(() => null);
     return { ok: true, created: true, candidateId: candidate.id, deliveryId: delivery?.id || null, notBefore: dueAt };
+    },
   });
 }
 

@@ -47,7 +47,7 @@ const ROUTE_MANIFEST = Object.freeze([
   route("/api/analytics", ROUTE_CLASS.LEGACY_GONE, "routes/analytics.js", "410 tombstone; AnalyticsSnapshot is non-authoritative archive", { replacement: "/api/home + /api/stats" }),
   route("/api/traffic", ROUTE_CLASS.CREATOR_DEVICE, "routes/traffic.js", "creator scope + traffic.* permissions; device binding on machine ingress"),
   route("/api/subscribers", ROUTE_CLASS.CREATOR, "routes/subscribers.js", "creator scope + automation.manage for mutations"),
-  route("/api/fan-data", ROUTE_CLASS.CREATOR, "routes/fan-data.js", "canonical creator scope"),
+  route("/api/fan-data", ROUTE_CLASS.CREATOR, "routes/fan-data.js", "canonical creator scope; /observations additionally requires device-bound trusted producer ingress"),
   route("/api/automation", ROUTE_CLASS.CREATOR_DEVICE, "routes/automation-control.js", "creator scope + canonical automation permissions + execution device"),
   route("/api/programmatic-of-write-settlement", ROUTE_CLASS.PUBLIC, "routes/programmatic-of-write-settlement.js", "settlement-only random capability for an already-authorized MASS or exact Custom manual commit; cannot mint new external work"),
   route("/api/programmatic-of-writes", ROUTE_CLASS.CREATOR_DEVICE, "routes/programmatic-of-writes.js", "shared non-idempotent external-write commit authority; product-specific creator/permission adapters + signed device"),

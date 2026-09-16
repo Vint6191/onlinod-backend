@@ -9,7 +9,8 @@ const automationControlService = require("./automation-control-service");
 const { assertAutomationEnabled, getAutomationControlSnapshot } = automationControlService;
 const normalizeFollowBackSettings = automationControlService.normalizeFollowBackSettings || ((value) => value || {});
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
-const { validateFollowBackDeliveryCurrent } = require("./fan-current-consumer-service");
+const { buildAutomationEffectTimeEvidence, sanitizeAutomationSettlementResult } = require("./automation-effect-time-service");
+const { validateFollowBackDeliveryCurrent, assertFanCurrentFieldFence } = require("./fan-current-consumer-service");
 const { projectFanRelationship, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
@@ -731,7 +732,11 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
       }
       if (candidate.moduleKey === SFS_MODULE_KEY) {
         const validation = await validateSfsDelivery({ delivery: candidate, control, now });
-        if (validation.ok === false) { await applySfsValidationTransition(candidate, validation, now); continue; }
+        if (validation.ok === false) {
+          if (validation.refreshRequired === true) await scheduleValidationFanRefresh(candidate, validation, "claim");
+          await applySfsValidationTransition(candidate, validation, now);
+          continue;
+        }
       }
     }
 
@@ -927,8 +932,9 @@ async function validateActionDelivery(input) {
   if (delivery.moduleKey === SFS_MODULE_KEY) {
     const validation = await validateSfsDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
+      if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "validate");
       await applySfsValidationTransition(delivery, validation, new Date(), { userId: input.userId });
-      throw new ActionDeliveryError(validation.code || "SFS_VALIDATION_FAILED", validation.code || "SFS delivery validation failed");
+      throw validationActionError(delivery, validation, "SFS_VALIDATION_FAILED", "SFS delivery validation failed");
     }
   }
   return { ok: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, control: control.effective };
@@ -950,6 +956,7 @@ async function prepareWriteActionDelivery(input) {
     if (delivery.status !== "RUNNING") throw new ActionDeliveryError("DELIVERY_NOT_RUNNING", `Delivery status is ${delivery.status}`);
     const control = await assertDeliveryControl(delivery, { db: tx });
     const now = new Date();
+    let fanCurrentFence = null;
     if (delivery.moduleKey === "follow_back") {
       const validation = await validateFollowBackDeliveryCurrent({
         db: tx,
@@ -958,22 +965,39 @@ async function prepareWriteActionDelivery(input) {
         now,
       });
       if (validation.ok === false) throw validationActionError(delivery, validation, "FOLLOW_BACK_VALIDATION_FAILED", "Follow Back delivery validation failed");
+      fanCurrentFence = validation.fanCurrentFence || fanCurrentFence;
     }
     if (delivery.moduleKey === "bumps") {
       const validation = await validateBumpDelivery({ delivery, control, now, db: tx });
       if (validation.ok === false) throw validationActionError(delivery, validation, "BUMP_VALIDATION_FAILED", "Bump delivery validation failed");
+      fanCurrentFence = validation.fanCurrentFence || fanCurrentFence;
     }
     if (delivery.moduleKey === "likes") {
       const validation = await validateLikeDelivery({ delivery, control, now, db: tx });
       if (validation.ok === false) throw validationActionError(delivery, validation, "LIKE_VALIDATION_FAILED", "Like delivery validation failed");
+      fanCurrentFence = validation.fanCurrentFence || fanCurrentFence;
     }
     if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
       const validation = await validateFollowAutomationDelivery({ delivery, control, now, db: tx });
       if (validation.ok === false) throw validationActionError(delivery, validation, "FOLLOW_AUTOMATION_VALIDATION_FAILED", "Follow Automation delivery validation failed");
+      fanCurrentFence = validation.fanCurrentFence || fanCurrentFence;
     }
     if (delivery.moduleKey === SFS_MODULE_KEY) {
       const validation = await validateSfsDelivery({ delivery, control, now, db: tx });
-      if (validation.ok === false) throw new ActionDeliveryError(validation.code || "SFS_VALIDATION_FAILED", validation.code || "SFS delivery validation failed");
+      if (validation.ok === false) {
+        const error = validationActionError(delivery, validation, "SFS_VALIDATION_FAILED", "SFS delivery validation failed");
+        if (validation.code === "already_followed") error.sfsTerminal = { delivery, validation };
+        throw error;
+      }
+      fanCurrentFence = validation.fanCurrentFence || fanCurrentFence;
+    }
+    if (fanCurrentFence) {
+      const currentFence = await assertFanCurrentFieldFence({ db: tx, agencyId: delivery.agencyId, fence: fanCurrentFence });
+      if (currentFence.ok === false) {
+        const error = new ActionDeliveryError("FAN_CURRENT_COMMIT_FENCE_STALE", "Required fan current fields changed before write commit permit");
+        error.fanCurrentChangedFields = currentFence.changedFields || [];
+        throw error;
+      }
     }
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "RUNNING", claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision, claimUntil: { gt: now } },
@@ -987,6 +1011,9 @@ async function prepareWriteActionDelivery(input) {
     return { ok: true, duplicate: false, id: committing.id, status: committing.status, leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt };
     }, { timeout: 30_000 });
   } catch (error) {
+    if (error?.sfsTerminal?.delivery && error?.sfsTerminal?.validation) {
+      await applySfsValidationTransition(error.sfsTerminal.delivery, error.sfsTerminal.validation, new Date(), { userId: input.userId });
+    }
     if (error?.fanRefresh?.delivery && error?.fanRefresh?.validation) {
       await scheduleValidationFanRefresh(error.fanRefresh.delivery, error.fanRefresh.validation, "prepare_write");
     }
@@ -994,9 +1021,14 @@ async function prepareWriteActionDelivery(input) {
   }
 }
 
-async function projectKnownRelationshipOutcome({ db, delivery, outcomeCode, now }) {
-  if (!delivery?.creatorId || !(delivery.targetId || delivery.fanId)) return;
+async function projectKnownRelationshipOutcome({ db, delivery, effectTime, outcomeCode = null }) {
+  if (!delivery?.creatorId || !(delivery.targetId || delivery.fanId) || !effectTime?.authorityObservedAt) return;
   const action = String(delivery.actionType || "");
+  const code = String(outcomeCode || "").trim().toLowerCase();
+  // SFS compensation ownership is stricter than desired-state observation.
+  // An ambiguous/already-followed completion may prove current provider state via
+  // USER_PROFILE feedback, but it must never masquerade as a known owned write.
+  if (action === "SFS_FOLLOW_TARGET" && code !== "followed") return;
   let creatorFollowsFan = null;
   if (["FOLLOW_BACK", "FOLLOW_FAN", "SFS_FOLLOW_TARGET"].includes(action)) creatorFollowsFan = true;
   if (["UNFOLLOW_FAN", "SFS_UNFOLLOW_TARGET"].includes(action)) creatorFollowsFan = false;
@@ -1006,7 +1038,7 @@ async function projectKnownRelationshipOutcome({ db, delivery, outcomeCode, now 
     creatorId: delivery.creatorId,
     onlyFansUserId: delivery.targetId || delivery.fanId,
     creatorFollowsFan,
-    observedAt: now,
+    observedAt: effectTime.authorityObservedAt,
     source: "AUTOMATION_WRITE_RESULT",
     sourceJobId: delivery.id,
   });
@@ -1037,9 +1069,14 @@ async function completeActionDelivery(input) {
   const delivery = await requireLease({ ...input, allowTerminal: true, allowCommittedSettlement: true });
   if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   const now = new Date();
-  const result = object(input.result);
+  const clientResult = object(input.result);
+  const effectTime = buildAutomationEffectTimeEvidence(delivery, clientResult, now);
+  const result = sanitizeAutomationSettlementResult(clientResult, effectTime);
   const outcomeCode = clean(input.outcomeCode, 120) || clean(result.code, 120) || null;
-  const terminalStatus = input.status === "SKIPPED" ? "SKIPPED" : "COMPLETED";
+  let terminalStatus = input.status === "SKIPPED" ? "SKIPPED" : "COMPLETED";
+  if (delivery.moduleKey === SFS_MODULE_KEY && delivery.actionType === "SFS_FOLLOW_TARGET" && String(outcomeCode || "").trim().toLowerCase() !== "followed") {
+    terminalStatus = "SKIPPED";
+  }
   const finalDelivery = await prisma.$transaction(async (tx) => {
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
@@ -1066,7 +1103,7 @@ async function completeActionDelivery(input) {
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before completion");
     const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
     if (current && terminalStatus === "COMPLETED") {
-      await projectKnownRelationshipOutcome({ db: tx, delivery: current, outcomeCode, now });
+      await projectKnownRelationshipOutcome({ db: tx, delivery: current, effectTime, outcomeCode });
     }
     if (current?.moduleKey === "bumps") {
       if (current.actionType === "SEND_MESSAGE" && terminalStatus === "COMPLETED") {
@@ -1296,8 +1333,28 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
   }
   if (delivery.moduleKey === SFS_MODULE_KEY) {
     const validation = await validateSfsDelivery({ delivery, control, now: retryAt });
-    if (validation.ok === false && validation.terminal === true && validation.code !== "already_unfollowed") {
+    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry");
+    if (validation.ok === false && validation.terminal === true && !["already_unfollowed", "already_followed"].includes(validation.code)) {
       throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `SFS delivery is no longer valid: ${validation.code || "validation_failed"}`);
+    }
+    if (validation.ok === false && validation.code === "already_followed") {
+      const now = new Date();
+      const latest = await prisma.$transaction(async (tx) => {
+        await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
+        const changed = await tx.automationDelivery.updateMany({
+          where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
+          data: {
+            status: "SKIPPED", failureCode: "already_followed", lastError: null, finishedAt: now,
+            claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
+            result: { ...object(delivery.result), code: "already_followed", idempotent: true, completedAt: now.toISOString() },
+          },
+        });
+        if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before idempotent SFS completion");
+        const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+        await finalizeSfsTerminal({ delivery: current, status: "SKIPPED", failureCode: "already_followed", db: tx, now });
+        return current;
+      });
+      return { ok: true, duplicate: true, delivery: latest };
     }
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }

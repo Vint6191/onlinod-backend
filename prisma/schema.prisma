@@ -4476,11 +4476,14 @@ model SfsTargetCandidate {
   id                       String   @id @default(cuid())
   agencyId                 String
   creatorId                String
+  /// Stable SFS identity is (creatorId,targetUserId). The DB unique index is
+  /// installed by the INT4.3A migration because Prisma 5 cannot express a
+  /// compound @@unique containing this nullable archaeology-compatible field.
   targetUserId             String?
   username                 String
   displayName              String?
   avatarUrl                String?
-  subscribePriceCents      Int      @default(0)
+  subscribePriceCents      Int?
   isWantComments           Boolean?
   creatorFollowing         Boolean?
   sourcePostIds            Json     @default("[]")
@@ -4513,7 +4516,7 @@ model SfsTargetCandidate {
   agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
-  @@unique([creatorId, username])
+  @@index([creatorId, username])
   @@index([agencyId, creatorId, state])
   @@index([creatorId, targetUserId])
   @@index([creatorId, phase])

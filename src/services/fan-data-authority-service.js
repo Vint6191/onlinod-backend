@@ -116,6 +116,30 @@ function authorityVersion(observedAt, source, value) {
   return `${at.toISOString()}|${priority}|${normalizedSource}|${digest}`;
 }
 
+function parseAuthorityVersion(version) {
+  const raw = text(version, 500);
+  if (!raw) return null;
+  const parts = raw.split("|");
+  const observedAt = date(parts[0]);
+  if (!observedAt) return { authorityVersion: raw, observedAt: null, source: null, priority: null };
+  const priority = Number(parts[1]);
+  return {
+    authorityVersion: raw,
+    observedAt,
+    source: text(parts[2], 80) || null,
+    priority: Number.isFinite(priority) ? priority : null,
+  };
+}
+
+function relationshipFieldAuthority(row) {
+  if (!row) return {};
+  const result = {};
+  for (const [field, versionField] of RELATIONSHIP_FIELDS) {
+    result[field] = parseAuthorityVersion(row[versionField]);
+  }
+  return result;
+}
+
 function newerVersionWhere(field, version) {
   return { OR: [{ [field]: null }, { [field]: { lt: version } }] };
 }
@@ -891,36 +915,132 @@ function numberOrNull(value) {
   return Number.isSafeInteger(number) ? number : null;
 }
 
-async function projectFanObservationBatch(db, { agencyId, creatorId, sourceDeviceId = null, sourceJobId = null, items = [] } = {}) {
-  if (!text(agencyId, 180) || !text(creatorId, 180)) throw new Error("Invalid fan observation batch scope");
-  const rows = Array.isArray(items) ? items.slice(0, 500) : [];
+class FanDataObservationBoundaryError extends Error {
+  constructor(code, message, status = 400) {
+    super(message);
+    this.name = "FanDataObservationBoundaryError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+const BATCH_IDENTITY_FACT_KEYS = Object.freeze([
+  "username", "platformDisplayName", "displayName", "avatarUrl", "headerUrl", "activityObservedAt",
+]);
+const BATCH_RELATIONSHIP_FACT_KEYS = Object.freeze(RELATIONSHIP_FIELDS.map(([field]) => field));
+const BATCH_VALUE_FACT_KEYS = Object.freeze([
+  "availability", "totalSpentCents", "platformReportedTotalSpendCents",
+  "messagesSpentCents", "subscriptionsSpentCents", "tipsSpentCents", "postsSpentCents", "streamsSpentCents",
+  "lastActivityAt",
+]);
+
+function ownFacts(input, keys) {
+  const out = {};
+  if (!input || typeof input !== "object") return out;
+  for (const key of keys) if (Object.prototype.hasOwnProperty.call(input, key)) out[key] = input[key];
+  return out;
+}
+
+function trustedBatchSource(rawSource, allowedSources) {
+  const source = text(rawSource, 80);
+  if (!source) throw new FanDataObservationBoundaryError("FAN_DATA_OBSERVATION_SOURCE_REQUIRED", "Fan observation source is required");
+  const allowed = new Set((Array.isArray(allowedSources) ? allowedSources : []).map((value) => text(value, 80)).filter(Boolean));
+  if (!allowed.size) {
+    throw new FanDataObservationBoundaryError("FAN_DATA_OBSERVATION_PRODUCER_POLICY_REQUIRED", "Fan observation producer policy is required", 500);
+  }
+  if (!allowed.has(source)) {
+    throw new FanDataObservationBoundaryError("FAN_DATA_OBSERVATION_SOURCE_FORBIDDEN", `Fan observation source ${source} is not allowed for this producer`, 403);
+  }
+  return source;
+}
+
+function batchObservedAt(rawObservedAt, { observedAtPolicy, receivedAt }) {
+  const receipt = date(receivedAt) || new Date();
+  if (observedAtPolicy === "SERVER_RECEIPT") return receipt;
+  if (observedAtPolicy !== "TRUSTED_INPUT") {
+    throw new FanDataObservationBoundaryError("FAN_DATA_OBSERVATION_TIME_POLICY_REQUIRED", "Fan observation time policy is required", 500);
+  }
+  const parsed = date(rawObservedAt);
+  if (!parsed) throw new FanDataObservationBoundaryError("FAN_DATA_OBSERVATION_TIME_INVALID", "Fan observation timestamp is invalid");
+  return parsed;
+}
+
+function normalizeBatchObservation(raw, envelope) {
+  const externalId = onlyFansUserId(raw?.onlyFansUserId);
+  if (!externalId) return null;
+  const common = {
+    agencyId: envelope.agencyId,
+    creatorId: envelope.creatorId,
+    onlyFansUserId: externalId,
+    sourceDeviceId: envelope.sourceDeviceId,
+    sourceJobId: envelope.sourceJobId,
+  };
+  const normalized = { onlyFansUserId: externalId };
+  for (const [kind, keys] of [
+    ["identity", BATCH_IDENTITY_FACT_KEYS],
+    ["relationship", BATCH_RELATIONSHIP_FACT_KEYS],
+    ["value", BATCH_VALUE_FACT_KEYS],
+  ]) {
+    const input = raw?.[kind];
+    if (!input || typeof input !== "object") continue;
+    const source = trustedBatchSource(input.source, envelope.allowedSources);
+    const observedAt = batchObservedAt(input.observedAt, envelope);
+    normalized[kind] = { ...ownFacts(input, keys), source, observedAt, ...common };
+  }
+  return normalized;
+}
+
+async function projectFanObservationBatch(db, {
+  agencyId, creatorId, sourceDeviceId = null, sourceJobId = null, items = [],
+  allowedSources = null, observedAtPolicy = null, receivedAt = new Date(),
+} = {}) {
+  const scopedAgencyId = text(agencyId, 180);
+  const scopedCreatorId = text(creatorId, 180);
+  if (!scopedAgencyId || !scopedCreatorId) throw new Error("Invalid fan observation batch scope");
+  const envelope = {
+    agencyId: scopedAgencyId,
+    creatorId: scopedCreatorId,
+    sourceDeviceId: text(sourceDeviceId, 180),
+    sourceJobId: text(sourceJobId, 180),
+    allowedSources,
+    observedAtPolicy,
+    receivedAt: date(receivedAt) || new Date(),
+  };
+  // Validate and strip the entire producer payload before any DB mutation. Nested
+  // objects own facts only; tenant/creator/fan/provenance/source/time authority is
+  // supplied by the trusted envelope and can never be reintroduced by spread order.
+  const rows = (Array.isArray(items) ? items.slice(0, 500) : [])
+    .map((raw) => normalizeBatchObservation(raw, envelope))
+    .filter(Boolean);
   const apply = async (tx) => {
     let identityProjected = 0;
     let relationshipProjected = 0;
     let valueProjected = 0;
     const touchedFanIds = [];
-    for (const raw of rows) {
-      const externalId = onlyFansUserId(raw?.onlyFansUserId);
-      if (!externalId) continue;
-      const identity = raw.identity && typeof raw.identity === "object" ? raw.identity : null;
-      const relationship = raw.relationship && typeof raw.relationship === "object" ? raw.relationship : null;
-      const value = raw.value && typeof raw.value === "object" ? raw.value : null;
-      const common = { agencyId, creatorId, onlyFansUserId: externalId, sourceDeviceId, sourceJobId };
+    for (const row of rows) {
+      const identity = row.identity || null;
+      const relationship = row.relationship || null;
+      const value = row.value || null;
+      const common = {
+        agencyId: scopedAgencyId, creatorId: scopedCreatorId, onlyFansUserId: row.onlyFansUserId,
+        sourceDeviceId: envelope.sourceDeviceId, sourceJobId: envelope.sourceJobId,
+      };
       if (identity) {
-        await projectFanIdentity(tx, { ...common, ...identity });
+        await projectFanIdentity(tx, { ...identity, ...common });
         identityProjected += 1;
       } else if (relationship || value) {
-        await ensureFanRecord(tx, { ...common, observedAt: relationship?.observedAt || value?.observedAt || new Date(), source: relationship?.source || value?.source || "UNKNOWN" });
+        const evidence = relationship || value;
+        await ensureFanRecord(tx, { ...evidence, ...common });
       }
       if (relationship) {
-        await projectFanRelationship(tx, { ...common, ...relationship });
+        await projectFanRelationship(tx, { ...relationship, ...common });
         relationshipProjected += 1;
       }
       if (value) {
-        await projectFanValue(tx, { ...common, ...value });
+        await projectFanValue(tx, { ...value, ...common });
         valueProjected += 1;
       }
-      touchedFanIds.push(externalId);
+      touchedFanIds.push(row.onlyFansUserId);
     }
     return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
   };
@@ -931,13 +1051,35 @@ async function projectFanObservationBatch(db, { agencyId, creatorId, sourceDevic
 async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult }) {
   if (!job?.creatorId || !job?.agencyId) throw new Error("fan_data_point_refresh job is missing creator scope");
   if (text(chunkResult?.kind, 80) !== "fan_data_point_refresh") throw new Error("Unsupported fan data point refresh chunk");
+  const requestedFanIds = [...new Set((Array.isArray(job?.params?.fanIds) ? job.params.fanIds : []).map(onlyFansUserId).filter(Boolean))];
+  if (!requestedFanIds.length) {
+    throw new FanDataObservationBoundaryError(
+      "FAN_DATA_POINT_REFRESH_SCOPE_REQUIRED",
+      "Fan data point refresh job is missing its server-requested fan scope",
+      409,
+    );
+  }
+  const requestedFanSet = new Set(requestedFanIds);
   const items = Array.isArray(chunkResult?.items) ? chunkResult.items : [];
+  const returnedFanIds = items.map((item) => onlyFansUserId(item?.onlyFansUserId)).filter(Boolean);
+  const outOfScopeFanIds = [...new Set(returnedFanIds.filter((fanId) => !requestedFanSet.has(fanId)))];
+  if (outOfScopeFanIds.length) {
+    throw new FanDataObservationBoundaryError(
+      "FAN_DATA_POINT_REFRESH_FAN_SCOPE_MISMATCH",
+      "Fan data point refresh result contains a fan outside the server-requested scope",
+      403,
+    );
+  }
+  const receivedAt = new Date();
   const result = await projectFanObservationBatch(db, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     sourceDeviceId: deviceId,
     sourceJobId: job.id,
     items,
+    allowedSources: ["USER_PROFILE"],
+    observedAtPolicy: "SERVER_RECEIPT",
+    receivedAt,
   });
   const successfulValueIds = items
     .filter((item) => item?.value && typeof item.value === "object" && normalizeAvailability(item.value.availability) === VALUE_AVAILABILITY.AVAILABLE)
@@ -946,7 +1088,7 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
   if (successfulValueIds.length && db.trafficSourceMember?.updateMany) {
     await db.trafficSourceMember.updateMany({
       where: { agencyId: job.agencyId, creatorId: job.creatorId, fanId: { in: successfulValueIds } },
-      data: { needsValueRefresh: false, lastValueFetchedAt: date(chunkResult.observedAt) || new Date() },
+      data: { needsValueRefresh: false, lastValueFetchedAt: receivedAt },
     });
   }
   return { type: "fan_data_point_refresh", ...result };
@@ -1011,6 +1153,7 @@ async function readFanCurrent(db, { agencyId, creatorId, onlyFansUserIds }) {
       subscribePriceCents: fan.relationshipCurrent.subscribePriceCents,
       observedAt: fan.relationshipCurrent.observedAt,
       source: fan.relationshipCurrent.source,
+      fieldAuthority: relationshipFieldAuthority(fan.relationshipCurrent),
     } : null,
     value: fan.valueCurrent ? {
       platformReportedTotalSpendCents: numberOrNull(fan.valueCurrent.platformReportedTotalSpendCents),
@@ -1030,6 +1173,7 @@ async function readFanCurrent(db, { agencyId, creatorId, onlyFansUserIds }) {
 module.exports = {
   IDENTITY_SOURCE_PRIORITY,
   VALUE_AVAILABILITY,
+  FanDataObservationBoundaryError,
   FAN_DATA_POINT_REFRESH_JOB_KEY,
   onlyFansUserId,
   projectFanIdentity,
@@ -1041,4 +1185,6 @@ module.exports = {
   applyFanDataPointRefreshChunk,
   scheduleFanDataPointRefresh,
   readFanCurrent,
+  parseAuthorityVersion,
+  relationshipFieldAuthority,
 };

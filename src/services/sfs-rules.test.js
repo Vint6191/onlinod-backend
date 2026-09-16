@@ -3,7 +3,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
   normalizeSfsSettings, extractSfsUsernames, normalizeSfsTarget, targetEligibility,
-  isRealUserComment, shouldStartSfsSagaAfterFollow, sfsCommentKey,
+  isRealUserComment, classifySfsFollowEffectOwnership, shouldStartSfsSagaAfterFollow, sfsCommentKey,
 } = require("./sfs-rules");
 
 test("SFS defaults keep safe pacing and cleanup", () => {
@@ -26,12 +26,16 @@ test("SFS target normalization preserves free and comments flags", () => {
   assert.equal(row.isWantComments, true);
 });
 
-test("SFS eligibility is explicit", () => {
+test("SFS eligibility is explicit and UNKNOWN fails closed", () => {
   const settings = normalizeSfsSettings({});
-  assert.equal(targetEligibility({ usedForever: true }, settings), "used_forever");
-  assert.equal(targetEligibility({ subscribePriceCents: 100 }, settings), "paid_target");
-  assert.equal(targetEligibility({ isWantComments: false }, settings), "comments_disabled");
-  assert.equal(targetEligibility({ state: "CANDIDATE" }, settings), "eligible");
+  const fresh = new Date();
+  assert.equal(targetEligibility({ usedForever: true }, settings, fresh), "used_forever");
+  assert.equal(targetEligibility({ subscribePriceCents: 100, discoveryObservedAt: fresh }, settings, fresh), "paid_target");
+  assert.equal(targetEligibility({ subscribePriceCents: 0, creatorFollowing: false, isWantComments: false, discoveryObservedAt: fresh }, settings, fresh), "comments_disabled");
+  assert.equal(targetEligibility({ subscribePriceCents: null, creatorFollowing: false, isWantComments: true, discoveryObservedAt: fresh }, settings, fresh), "price_unknown");
+  assert.equal(targetEligibility({ subscribePriceCents: 0, creatorFollowing: null, isWantComments: true, discoveryObservedAt: fresh }, settings, fresh), "following_unknown");
+  assert.equal(targetEligibility({ subscribePriceCents: 0, creatorFollowing: false, isWantComments: null, discoveryObservedAt: fresh }, settings, fresh), "comments_unknown");
+  assert.equal(targetEligibility({ subscribePriceCents: 0, creatorFollowing: false, isWantComments: true, discoveryObservedAt: fresh, state: "CANDIDATE" }, settings, fresh), "eligible");
 });
 
 test("SFS likes only normal user comments", () => {
@@ -45,10 +49,15 @@ test("SFS idempotency includes generation", () => {
 });
 
 
-test("manual already-followed target does not start an SFS cleanup saga", () => {
-  assert.equal(shouldStartSfsSagaAfterFollow("already_followed", {}), false);
-  assert.equal(shouldStartSfsSagaAfterFollow("already_followed", { recoveredAfterAmbiguousWrite: true }), true);
-  assert.equal(shouldStartSfsSagaAfterFollow("followed", {}), true);
+test("SFS cleanup starts only from a server-committed direct follow success", () => {
+  const committed = { writeCommitAt: new Date("2026-09-16T10:00:00.000Z") };
+  assert.equal(classifySfsFollowEffectOwnership({ outcomeCode: "followed", delivery: committed }), "OWNED");
+  assert.equal(classifySfsFollowEffectOwnership({ outcomeCode: "followed", delivery: {} }), "UNPROVEN");
+  assert.equal(classifySfsFollowEffectOwnership({ outcomeCode: "already_followed", delivery: committed }), "PREEXISTING");
+  assert.equal(classifySfsFollowEffectOwnership({ outcomeCode: "followed_recovered", result: { recoveredAfterAmbiguousWrite: true }, delivery: committed }), "AMBIGUOUS_UNOWNED");
+  assert.equal(shouldStartSfsSagaAfterFollow("already_followed", {}, committed), false);
+  assert.equal(shouldStartSfsSagaAfterFollow("followed_recovered", { recoveredAfterAmbiguousWrite: true }, committed), false);
+  assert.equal(shouldStartSfsSagaAfterFollow("followed", {}, committed), true);
 });
 
 test("SFS does not follow targets when every action is disabled", () => {
