@@ -11,7 +11,8 @@ const normalizeFollowBackSettings = automationControlService.normalizeFollowBack
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { buildAutomationEffectTimeEvidence, sanitizeAutomationSettlementResult } = require("./automation-effect-time-service");
 const { validateFollowBackDeliveryCurrent, assertFanCurrentFieldFence } = require("./fan-current-consumer-service");
-const { projectFanRelationship, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
 const {
@@ -67,6 +68,13 @@ const DEFAULT_LEASE_MS = 3 * 60_000;
 const MIN_LEASE_MS = 30_000;
 const MAX_LEASE_MS = 10 * 60_000;
 const MAX_RECONCILIATION_WAIT_MS = 30 * 60_000;
+const PROFILE_OBSERVATION_ACTION_TYPES = new Set([
+  "FOLLOW_BACK",
+  UNFOLLOW_FAN_ACTION_TYPE,
+  FOLLOW_FAN_ACTION_TYPE,
+  "SFS_FOLLOW_TARGET",
+  "SFS_UNFOLLOW_TARGET",
+]);
 
 class ActionDeliveryError extends Error {
   constructor(code, message, status = 409) {
@@ -666,7 +674,9 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
   if (!creatorIds.length) return { delivery: null, reason: "no_ready_creator" };
   const allowedActionTypes = [...new Set((Array.isArray(actionTypes) ? actionTypes : []).map((item) => clean(item, 80)).filter(Boolean))];
   if (!allowedActionTypes.length) return { delivery: null, reason: "no_capabilities" };
-  const now = new Date();
+  // claimedAt is a fallback causal generation for action profile observations.
+  // Keep it on the same PostgreSQL clock authority as attemptStartedAt.
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   const candidates = await fairCandidates({ agencyId: device.agencyId, creatorIds, actionTypes: allowedActionTypes, now });
   for (const candidate of candidates) {
     const reconciliationClaim = deliveryRequiresReconciliation(candidate);
@@ -846,6 +856,43 @@ async function lockDeliveryExecutionAccess({ db, delivery, userId }) {
   }
 }
 
+async function authorizeActionProfileObservation({
+  deliveryId,
+  userId,
+  deviceId,
+  leaseToken,
+  leaseRevision,
+  creatorId,
+  onlyFansUserIds = [],
+  db = prisma,
+}) {
+  const delivery = await requireLease({
+    deliveryId,
+    userId,
+    deviceId,
+    leaseToken,
+    leaseRevision,
+    db,
+    lockAccess: true,
+  });
+  if (delivery.creatorId !== creatorId) {
+    throw new ActionDeliveryError("FAN_DATA_OBSERVATION_CREATOR_SCOPE_MISMATCH", "Profile observation creator does not match the active delivery", 403);
+  }
+  if (!PROFILE_OBSERVATION_ACTION_TYPES.has(String(delivery.actionType || ""))) {
+    throw new ActionDeliveryError("FAN_DATA_OBSERVATION_ACTION_SCOPE_FORBIDDEN", "Delivery action is not allowed to publish a USER_PROFILE observation", 403);
+  }
+  const targetId = clean(delivery.targetId || delivery.fanId, 180);
+  const fanIds = [...new Set((Array.isArray(onlyFansUserIds) ? onlyFansUserIds : []).map((value) => clean(value, 180)).filter(Boolean))];
+  if (!targetId || fanIds.length !== 1 || fanIds[0] !== targetId) {
+    throw new ActionDeliveryError("FAN_DATA_OBSERVATION_TARGET_SCOPE_MISMATCH", "Profile observation fan does not match the active delivery target", 403);
+  }
+  const attemptStartedAt = validDate(object(delivery.result).attemptStartedAt, validDate(delivery.claimedAt, validDate(delivery.createdAt, null)));
+  if (!attemptStartedAt) {
+    throw new ActionDeliveryError("FAN_DATA_OBSERVATION_CAUSAL_GENERATION_MISSING", "Active delivery is missing its server-owned observation generation", 409);
+  }
+  return { delivery, targetId, causalObservedAt: attemptStartedAt };
+}
+
 async function renewActionLease(input) {
   return prisma.$transaction(async (tx) => {
     const delivery = await requireLease({ ...input, db: tx, lockAccess: true });
@@ -869,12 +916,15 @@ async function renewActionLease(input) {
 }
 
 async function startActionDelivery(input) {
-  const now = new Date();
   const running = await prisma.$transaction(async (tx) => {
+    // attemptStartedAt participates in FanData SERVER_GENERATION ordering for
+    // action-scoped /users/:fanId observations. PostgreSQL, not the Node
+    // process clock, owns that durable cross-replica generation timestamp.
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const delivery = await requireLease({ ...input, db: tx, lockAccess: true });
     const reconciliationLease = deliveryRequiresReconciliation(delivery);
     if (!reconciliationLease) await assertDeliveryControl(delivery, { db: tx });
-    if (delivery.notBefore.getTime() > Date.now()) throw new ActionDeliveryError("DELIVERY_NOT_DUE", "Delivery is not due yet");
+    if (delivery.notBefore.getTime() > now.getTime()) throw new ActionDeliveryError("DELIVERY_NOT_DUE", "Delivery is not due yet");
     if (delivery.status === "RUNNING") return delivery;
     if (delivery.status === "COMMITTING") throw new ActionDeliveryError("DELIVERY_ALREADY_COMMITTING", "Delivery already crossed the write commit boundary");
     const updated = await tx.automationDelivery.updateMany({
@@ -1021,26 +1071,42 @@ async function prepareWriteActionDelivery(input) {
   }
 }
 
-async function projectKnownRelationshipOutcome({ db, delivery, effectTime, outcomeCode = null }) {
-  if (!delivery?.creatorId || !(delivery.targetId || delivery.fanId) || !effectTime?.authorityObservedAt) return;
+function relationshipEffectRefreshTarget(delivery) {
+  if (!delivery?.creatorId || !(delivery.targetId || delivery.fanId)) return null;
+  const result = object(delivery.result);
+  if (result.fanDataReconcileRequired !== true) return null;
   const action = String(delivery.actionType || "");
-  const code = String(outcomeCode || "").trim().toLowerCase();
+  const code = String(result.code || delivery.failureCode || "").trim().toLowerCase();
   // SFS compensation ownership is stricter than desired-state observation.
   // An ambiguous/already-followed completion may prove current provider state via
   // USER_PROFILE feedback, but it must never masquerade as a known owned write.
-  if (action === "SFS_FOLLOW_TARGET" && code !== "followed") return;
-  let creatorFollowsFan = null;
-  if (["FOLLOW_BACK", "FOLLOW_FAN", "SFS_FOLLOW_TARGET"].includes(action)) creatorFollowsFan = true;
-  if (["UNFOLLOW_FAN", "SFS_UNFOLLOW_TARGET"].includes(action)) creatorFollowsFan = false;
-  if (creatorFollowsFan === null) return;
-  await projectFanRelationship(db, {
+  if (action === "SFS_FOLLOW_TARGET" && code !== "followed") return null;
+  if (!["FOLLOW_BACK", "FOLLOW_FAN", "SFS_FOLLOW_TARGET", "UNFOLLOW_FAN", "SFS_UNFOLLOW_TARGET"].includes(action)) return null;
+  return {
     agencyId: delivery.agencyId,
     creatorId: delivery.creatorId,
     onlyFansUserId: delivery.targetId || delivery.fanId,
-    creatorFollowsFan,
-    observedAt: effectTime.authorityObservedAt,
-    source: "AUTOMATION_WRITE_RESULT",
-    sourceJobId: delivery.id,
+    deliveryId: delivery.id,
+    effectCausalLowerAt: clean(result.effectCausalLowerAt, 120),
+    effectCausalUpperAt: clean(result.effectCausalUpperAt, 120),
+  };
+}
+
+async function ensureRelationshipEffectFanRefresh(delivery) {
+  const target = relationshipEffectRefreshTarget(delivery);
+  if (!target) return null;
+  return scheduleFanDataPointRefresh({
+    agencyId: target.agencyId,
+    creatorId: target.creatorId,
+    onlyFansUserIds: [target.onlyFansUserId],
+    reason: "automation_relationship_effect_reconcile",
+    priority: 110,
+    params: {
+      causalBarrierKey: `automation-effect:${target.deliveryId}`,
+      sourceDeliveryId: target.deliveryId,
+      effectCausalLowerAt: target.effectCausalLowerAt,
+      effectCausalUpperAt: target.effectCausalUpperAt,
+    },
   });
 }
 
@@ -1067,7 +1133,10 @@ async function updateCandidateFromTerminal(delivery, status, failureCode, db = p
 
 async function completeActionDelivery(input) {
   const delivery = await requireLease({ ...input, allowTerminal: true, allowCommittedSettlement: true });
-  if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
+  if (TERMINAL_STATUSES.includes(delivery.status)) {
+    await ensureRelationshipEffectFanRefresh(delivery);
+    return { ok: true, duplicate: true, delivery };
+  }
   const now = new Date();
   const clientResult = object(input.result);
   const effectTime = buildAutomationEffectTimeEvidence(delivery, clientResult, now);
@@ -1102,9 +1171,6 @@ async function completeActionDelivery(input) {
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before completion");
     const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
-    if (current && terminalStatus === "COMPLETED") {
-      await projectKnownRelationshipOutcome({ db: tx, delivery: current, effectTime, outcomeCode });
-    }
     if (current?.moduleKey === "bumps") {
       if (current.actionType === "SEND_MESSAGE" && terminalStatus === "COMPLETED") {
         const finalized = await finalizeBumpSend({ delivery: current, result, db: tx });
@@ -1137,6 +1203,7 @@ async function completeActionDelivery(input) {
     await updateCandidateFromTerminal(latest, terminalStatus, outcomeCode, tx);
     return latest;
   }, { timeout: 30_000 });
+  await ensureRelationshipEffectFanRefresh(finalDelivery);
   return { ok: true, duplicate: false, delivery: finalDelivery };
 }
 
@@ -1512,5 +1579,6 @@ module.exports = {
   retrySafeFailures,
   cancelActionDelivery,
   releaseClaimByAdmin,
+  authorizeActionProfileObservation,
   __test: { requireLiveAutomationManagementActor, requireLease },
 };

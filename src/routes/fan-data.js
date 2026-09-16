@@ -2,8 +2,9 @@
 
 const express = require("express");
 const prisma = require("../prisma");
-const { requireProductCreator, requireProductDevice, currentAccessEpoch } = require("../middleware/product-access");
-const { assertExecutionAccessFence } = require("../services/execution-access-fence-service");
+const { requireProductCreator, requireProductDevice } = require("../middleware/product-access");
+const { authorizeActionProfileObservation } = require("../services/automation-action-delivery-service");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { readFanCurrent, scheduleFanDataPointRefresh, onlyFansUserId, projectFanObservationBatch } = require("../services/fan-data-authority-service");
 
 const router = express.Router();
@@ -35,25 +36,35 @@ router.post("/observations", async (req, res) => {
       mismatchCode: "FAN_DATA_DEVICE_IDENTITY_MISMATCH",
     });
     const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 100) : [];
-    const receivedAt = new Date();
+    const deliveryId = clean(req.body?.deliveryId);
+    const leaseToken = clean(req.body?.leaseToken, 2000);
+    const leaseRevision = Number(req.body?.leaseRevision);
+    if (!deliveryId || !leaseToken || !Number.isInteger(leaseRevision)) {
+      return res.status(400).json({ ok: false, code: "FAN_DATA_OBSERVATION_ACTION_SCOPE_REQUIRED", error: "Action-scoped profile observation requires delivery lease proof" });
+    }
+    const fanIds = [...new Set(items.map((item) => onlyFansUserId(item?.onlyFansUserId)).filter(Boolean))];
     const result = await prisma.$transaction(async (tx) => {
-      await assertExecutionAccessFence({
+      const receivedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+      const scope = await authorizeActionProfileObservation({
         db: tx,
-        agencyId: creator.agencyId,
-        creatorId: creator.id,
+        deliveryId,
         userId: req.auth.userId,
-        memberId: req.auth.memberId,
-        accessEpoch: currentAccessEpoch(req),
-        lock: true,
+        deviceId: sourceDeviceId,
+        leaseToken,
+        leaseRevision,
+        creatorId: creator.id,
+        onlyFansUserIds: fanIds,
       });
       return projectFanObservationBatch(tx, {
         agencyId: creator.agencyId,
         creatorId: creator.id,
         sourceDeviceId,
+        sourceDeliveryId: scope.delivery.id,
         items,
         allowedSources: ["USER_PROFILE"],
-        observedAtPolicy: "SERVER_RECEIPT",
+        observedAtPolicy: "SERVER_GENERATION",
         receivedAt,
+        causalObservedAt: scope.causalObservedAt,
       });
     });
     return res.json({ ok: true, creatorId: creator.id, ...result });

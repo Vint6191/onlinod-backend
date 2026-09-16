@@ -105,12 +105,13 @@ test("Phase3 prepare-write has Follow Back canonical fence and Refollow keeps co
   assert.match(follow, /UNFOLLOW_FAN_ACTION_TYPE[\s\S]*readFanCurrentMap[\s\S]*evaluateRefollowCurrent/);
 });
 
-test("Phase3 known relationship write results heal canonical FanDataAuthority", () => {
+test("Phase3 known relationship write results heal canonical FanDataAuthority through causal refresh", () => {
   const source = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
-  assert.match(source, /AUTOMATION_WRITE_RESULT/);
-  assert.match(source, /FOLLOW_BACK[\s\S]*FOLLOW_FAN[\s\S]*SFS_FOLLOW_TARGET/);
-  assert.match(source, /UNFOLLOW_FAN[\s\S]*SFS_UNFOLLOW_TARGET/);
-  assert.match(source, /projectKnownRelationshipOutcome\([\s\S]*terminalStatus === "COMPLETED"/);
+  assert.match(source, /relationshipEffectRefreshTarget/);
+  assert.match(source, /FOLLOW_BACK[\s\S]*FOLLOW_FAN[\s\S]*SFS_FOLLOW_TARGET[\s\S]*UNFOLLOW_FAN[\s\S]*SFS_UNFOLLOW_TARGET/);
+  assert.match(source, /fanDataReconcileRequired/);
+  assert.match(source, /ensureRelationshipEffectFanRefresh\(finalDelivery\)/);
+  assert.match(source, /automation_relationship_effect_reconcile/);
 });
 
 

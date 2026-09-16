@@ -151,9 +151,11 @@ async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunk
   if (!target) return { applied: 0 };
   const producerObservedAt = dateOrNull(payload.observedAt);
   const receivedAt = new Date();
-  // Job creation/claim time is server-owned and orders overlapping discovery
-  // generations without trusting Desktop wall-clock timestamps.
-  const observedAt = dateOrNull(job.createdAt) || dateOrNull(job.claimedAt) || receivedAt;
+  // SFS discovery uses the immutable PostgreSQL-owned job creation timestamp as
+  // its causal generation. Claim/start/receipt order is execution/transport
+  // order and must never make an older discovery generation appear newer.
+  const observedAt = dateOrNull(job.createdAt);
+  if (!observedAt) throw new Error("SFS_DISCOVERY_CAUSAL_GENERATION_REQUIRED");
   const sourceJobId = clean(job.id, 180);
   if (!sourceJobId) throw new Error("SFS_DISCOVERY_SOURCE_JOB_REQUIRED");
 

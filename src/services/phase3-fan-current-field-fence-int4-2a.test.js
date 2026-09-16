@@ -142,7 +142,7 @@ test("INT4.2A exact field fence ignores unrelated G2 but rejects required-field 
 
 test("INT4.2A prepare-write binds exact fan field fence before AutomationDelivery COMMITTING update", () => {
   const source = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
-  const prepare = source.slice(source.indexOf("async function prepareWriteActionDelivery"), source.indexOf("async function projectKnownRelationshipOutcome"));
+  const prepare = source.slice(source.indexOf("async function prepareWriteActionDelivery"), source.indexOf("async function ensureRelationshipEffectFanRefresh"));
   const validationAt = prepare.indexOf("validateFollowBackDeliveryCurrent");
   const fenceAt = prepare.indexOf("assertFanCurrentFieldFence");
   const committingUpdateAt = prepare.indexOf("status: \"COMMITTING\"");

@@ -92,6 +92,7 @@ function sanitizeAutomationRuntimeEvent(raw) {
     source,
     fanId,
     dialogId: clean(event.dialogId, 160) || fanId,
+    providerEventId: clean(event.providerEventId || event.notificationId || event.externalEventId || event.eventHash, 240),
     createdAt: isoOrNull(event.createdAt || event.occurredAt || event.ts),
     relationship: subscriptionRelationshipObservation(event),
   });

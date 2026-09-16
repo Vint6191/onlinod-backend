@@ -9,28 +9,27 @@ function date(value) {
 /**
  * Build server-owned temporal provenance for a known automation write result.
  *
- * Canonical FanData chronology must never be advanced by settlement time or by
- * an arbitrary producer wall clock. The server write-commit permit is the
- * trusted lower-bound timestamp for the physical effect. A producer timestamp
- * is retained only as bounded evidence when it falls inside the server-owned
- * [writeCommitAt, settlementReceivedAt] interval; it never owns canonical
- * ordering.
+ * A write permit is only a lower bound and settlement receipt is only an upper
+ * bound for the physical OF effect. Neither timestamp is the effect time. The
+ * Desktop timestamp is retained as bounded forensic evidence only; it never
+ * owns canonical FanData ordering. Relationship current is healed by a new
+ * server-generated point refresh scheduled after successful settlement.
  */
 function buildAutomationEffectTimeEvidence(delivery, result, settlementReceivedAt = new Date()) {
-  const writeCommitAt = date(delivery?.writeCommitAt);
-  if (!writeCommitAt) return null;
-  const receiptAt = date(settlementReceivedAt) || new Date();
+  const lowerAt = date(delivery?.writeCommitAt);
+  if (!lowerAt) return null;
+  const upperAt = date(settlementReceivedAt) || new Date();
   const raw = result && typeof result === "object" && !Array.isArray(result) ? result : {};
   const producerAt = date(raw.effectObservedAt);
   const producerTimeAccepted = Boolean(
     producerAt
-    && producerAt.getTime() >= writeCommitAt.getTime()
-    && producerAt.getTime() <= receiptAt.getTime(),
+    && producerAt.getTime() >= lowerAt.getTime()
+    && producerAt.getTime() <= upperAt.getTime(),
   );
   return {
-    authorityObservedAt: writeCommitAt,
-    effectTimeBasis: "SERVER_WRITE_COMMIT_LOWER_BOUND",
-    settlementReceivedAt: receiptAt,
+    causalLowerAt: lowerAt,
+    causalUpperAt: upperAt,
+    effectTimeBasis: "SERVER_CAUSAL_INTERVAL_RECONCILE",
     producerEffectObservedAt: producerTimeAccepted ? producerAt : null,
     producerTimeAccepted,
   };
@@ -42,11 +41,12 @@ function sanitizeAutomationSettlementResult(result, evidence) {
   if (!evidence) return rest;
   return {
     ...rest,
-    effectAuthorityObservedAt: evidence.authorityObservedAt.toISOString(),
     effectTimeBasis: evidence.effectTimeBasis,
-    settlementReceivedAt: evidence.settlementReceivedAt.toISOString(),
+    effectCausalLowerAt: evidence.causalLowerAt.toISOString(),
+    effectCausalUpperAt: evidence.causalUpperAt.toISOString(),
     producerEffectObservedAt: evidence.producerEffectObservedAt?.toISOString?.() || null,
     producerEffectObservedAtAccepted: evidence.producerTimeAccepted === true,
+    fanDataReconcileRequired: true,
   };
 }
 

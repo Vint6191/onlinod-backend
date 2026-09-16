@@ -224,7 +224,7 @@ test("INT4.3B SFS planner/read model use canonical current and bounded refresh o
 
 test("INT4.3B SFS exact field fence and refresh are wired through claim/validate/prepare/retry", () => {
   const source = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
-  const prepare = source.slice(source.indexOf("async function prepareWriteActionDelivery"), source.indexOf("async function projectKnownRelationshipOutcome"));
+  const prepare = source.slice(source.indexOf("async function prepareWriteActionDelivery"), source.indexOf("async function ensureRelationshipEffectFanRefresh"));
   const sfsValidationAt = prepare.indexOf("validateSfsDelivery");
   const fenceAssignAt = prepare.indexOf("fanCurrentFence = validation.fanCurrentFence", sfsValidationAt);
   const fenceAssertAt = prepare.indexOf("assertFanCurrentFieldFence", sfsValidationAt);

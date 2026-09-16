@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const Module = require("node:module");
 
-function loadBumpWithStubs(captures) {
+function loadBump(captures) {
   const originalLoad = Module._load;
   Module._load = function load(request, parent, isMain) {
     if (parent?.filename?.endsWith("bump-service.js")) {
@@ -17,7 +17,7 @@ function loadBumpWithStubs(captures) {
       if (request === "./automation-pacing-service") return { nextAutomationWriteSlot: async () => new Date() };
       if (request === "./custom-content-delivery-service") return { classifyProgrammaticCustomMediaProvenance: async () => ({ ok: true, customMediaIds: [] }) };
       if (request === "./bump-rules") return {
-        stableFingerprint: () => "fingerprint",
+        stableFingerprint: (value) => require("node:crypto").createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 32),
         taskToTemplate: (x) => x,
         triggerEnabled: () => true,
         templateTiming: () => ({}),
@@ -37,7 +37,7 @@ function loadBumpWithStubs(captures) {
         validateBumpCurrentRelationship: () => ({ ok: false, code: "fan_current_unknown" }),
       };
       if (request === "./db-time-authority-service") return {
-        dbAuthorityNow: async () => new Date("2026-09-16T10:10:00.000Z"),
+        dbAuthorityNow: async () => new Date("2026-09-16T18:30:00.000Z"),
       };
       if (request === "./fan-data-authority-service") return {
         projectFanObservationBatch: async (_db, args) => {
@@ -68,9 +68,9 @@ function fakeDb(captures) {
   };
 }
 
-test("Phase3 subscription runtime evidence reconciles canonical relationship without transport-order projection", async () => {
+test("INT5.1B delayed subscription event is trigger evidence plus causal-barrier refresh, never direct FanData relationship truth", async () => {
   const captures = { authority: [], refresh: [], bumpState: [] };
-  const { processRuntimeEvents } = loadBumpWithStubs(captures);
+  const { processRuntimeEvents } = loadBump(captures);
   const result = await processRuntimeEvents({
     agencyId: "agency-1",
     creatorId: "creator-1",
@@ -81,7 +81,10 @@ test("Phase3 subscription runtime evidence reconciles canonical relationship wit
       source: "ws_frame",
       fanId: "fan-1",
       dialogId: "fan-1",
-      createdAt: "2026-09-16T10:00:00.000Z",
+      providerEventId: "notification-77",
+      // Intentionally old: transport arrives much later. This must not be restamped
+      // as new canonical relationship truth by server receipt order.
+      createdAt: "2026-09-16T17:00:00.000Z",
       relationship: {
         fanSubscribesToCreator: true,
         fanSubscriptionActive: true,
@@ -89,67 +92,57 @@ test("Phase3 subscription runtime evidence reconciles canonical relationship wit
       },
     }],
   });
+
   assert.equal(result.errors.length, 0);
-  assert.equal(captures.authority.length, 0, "subscription event must not invent a scalar LIVE_NOTIFICATION winner");
+  assert.equal(captures.authority.length, 0);
   assert.equal(captures.refresh.length, 1);
   assert.deepEqual(captures.refresh[0].onlyFansUserIds, ["fan-1"]);
   assert.equal(captures.refresh[0].reason, "bump_runtime_subscription_event_reconcile");
-  assert.match(captures.refresh[0].params.causalBarrierKey, /^runtime-subscription:/);
+  assert.equal(captures.refresh[0].now.toISOString(), "2026-09-16T18:30:00.000Z");
+  assert.match(captures.refresh[0].params.causalBarrierKey, /^runtime-subscription:[a-f0-9]{32}$/);
   assert.deepEqual(captures.refresh[0].params.refreshFields, [
     "fanSubscribesToCreator", "fanSubscriptionActive", "fanSubscriptionType", "canReceiveChatMessage",
   ]);
+  assert.equal(result.subscriptionReconcile.fanIds[0], "fan-1");
+
   assert.equal(captures.bumpState.length, 1);
   assert.equal(Object.prototype.hasOwnProperty.call(captures.bumpState[0].create, "lastOnlineAt"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(captures.bumpState[0].update, "lastOnlineAt"), false);
-  const metadata = captures.bumpState[0].create.metadata;
-  assert.equal(metadata.source, "ws_frame");
-  assert.equal(metadata.dialogId, "fan-1");
-  assert.equal(Object.prototype.hasOwnProperty.call(metadata, "relationship"), false);
-  assert.equal(Object.prototype.hasOwnProperty.call(metadata, "subscriptionType"), false);
-  assert.equal(Object.prototype.hasOwnProperty.call(metadata, "isActive"), false);
+  assert.equal(captures.bumpState[0].create.metadata.providerEventId, "notification-77");
+  assert.equal(captures.bumpState[0].create.metadata.providerOccurredAt, "2026-09-16T17:00:00.000Z");
 });
 
-test("Phase3 online runtime evidence becomes activity-only FanData observation", async () => {
+test("INT5.1B future-skewed presence cannot pin private lastOnlineAt beyond PostgreSQL authority time", async () => {
   const captures = { authority: [], refresh: [], bumpState: [] };
-  const { processRuntimeEvents } = loadBumpWithStubs(captures);
+  const { processRuntimeEvents } = loadBump(captures);
   const result = await processRuntimeEvents({
     agencyId: "agency-1",
     creatorId: "creator-1",
+    sourceDeviceId: "device-1",
     db: fakeDb(captures),
     events: [{
       type: "presence_online",
-      source: "ws",
-      fanIds: ["fan-2"],
-      createdAt: "2026-09-16T10:05:00.000Z",
+      source: "ws_frame",
+      fanIds: ["fan-future"],
+      createdAt: "2099-01-01T00:00:00.000Z",
     }],
   });
+
   assert.equal(result.errors.length, 0);
+  assert.equal(captures.bumpState.length, 1);
+  assert.equal(captures.bumpState[0].create.lastOnlineAt.toISOString(), "2026-09-16T18:30:00.000Z");
   assert.equal(captures.authority.length, 1);
-  assert.deepEqual(captures.authority[0].items, [{
-    onlyFansUserId: "fan-2",
-    identity: {
-      observedAt: new Date("2026-09-16T10:05:00.000Z"),
-      activityObservedAt: new Date("2026-09-16T10:05:00.000Z"),
-      source: "PRESENCE_HINT",
-    },
-  }]);
+  assert.deepEqual(captures.authority[0].allowedSources, ["PRESENCE_HINT"]);
+  assert.equal(captures.authority[0].observedAtPolicy, "SERVER_RECEIPT");
+  assert.equal(captures.authority[0].receivedAt.toISOString(), "2026-09-16T18:30:00.000Z");
 });
 
-test("Phase3 Bump and Hidden Online current-looking flats are no longer independent current authority", () => {
-  const root = __dirname;
-  const bump = fs.readFileSync(path.join(root, "bump-service.js"), "utf8");
-  const current = fs.readFileSync(path.join(root, "fan-current-consumer-service.js"), "utf8");
-  const subscriber = fs.readFileSync(path.join(root, "subscriber-directory-service.js"), "utf8");
-
-  assert.match(bump, /BUMP_PRIVATE_RELATIONSHIP_KEYS/);
-  assert.match(bump, /subscriptionType:\s*null,[\s\S]*isActive:\s*null,[\s\S]*canReceiveChatMessage:\s*null/);
-  assert.doesNotMatch(bump, /subscriptionType:\s*clean\(fan\.subscriptionType\s*\|\|\s*metadata\.subscriptionType/);
-  assert.match(current, /username:\s*identity\.username\s*\?\?\s*candidate\.username/);
-  assert.match(current, /subscriptionType:\s*rel\.fanSubscriptionType/);
-
-  assert.match(subscriber, /canReceiveChatMessage:\s*current\?\.relationship\?\.canReceiveChatMessage\s*\?\?\s*null/);
-  assert.match(subscriber, /isActive:\s*current\?\.relationship\?\.fanSubscriptionActive\s*\?\?\s*null/);
-  assert.match(subscriber, /subscribedOn:\s*current\?\.relationship\?\.fanSubscribesToCreator\s*\?\?\s*null/);
-  assert.match(subscriber, /subscribedBy:\s*current\?\.relationship\?\.creatorFollowsFan\s*\?\?\s*null/);
-  assert.match(subscriber, /subscriptionType:\s*current\?\.relationship\?\.fanSubscriptionType\s*\?\?\s*null/);
+test("INT5.1B source contract has no direct LIVE_NOTIFICATION relationship projection in Bump runtime", () => {
+  const source = fs.readFileSync(path.join(__dirname, "bump-service.js"), "utf8");
+  assert.match(source, /allowedSources:\s*\["PRESENCE_HINT"\]/);
+  assert.doesNotMatch(source, /allowedSources:\s*\[[^\]]*"LIVE_NOTIFICATION"/);
+  assert.match(source, /bump_runtime_subscription_event_reconcile/);
+  assert.match(source, /causalBarrierKey:\s*`runtime-subscription:\$\{barrier\}`/);
+  assert.match(source, /updateLastOnlineAt:\s*false/);
+  assert.match(source, /fanObservation:\s*null/);
 });

@@ -142,14 +142,20 @@ test("INT4.1A source/time producer policy is mandatory for generic canonical bat
 
 test("INT4.1A direct observation ingress is device-bound and access-fenced at DB commit", () => {
   const route = fs.readFileSync(path.join(__dirname, "../routes/fan-data.js"), "utf8");
+  const actions = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
   const manifest = fs.readFileSync(path.join(__dirname, "../route-manifest.js"), "utf8");
   assert.match(route, /requireProductDevice\(req, req\.auth\?\.deviceId/);
   assert.match(route, /prisma\.\$transaction\(async \(tx\)/);
-  assert.match(route, /assertExecutionAccessFence\(\{/);
-  assert.match(route, /accessEpoch:\s*currentAccessEpoch\(req\)/);
-  assert.match(route, /lock:\s*true/);
+  assert.match(route, /authorizeActionProfileObservation\(\{/);
+  assert.match(route, /deliveryId/);
+  assert.match(route, /leaseToken/);
+  assert.match(route, /leaseRevision/);
+  assert.match(actions, /async function authorizeActionProfileObservation/);
+  assert.match(actions, /requireLease\(\{[\s\S]*lockAccess:\s*true/);
+  assert.match(actions, /FAN_DATA_OBSERVATION_TARGET_SCOPE_MISMATCH/);
   assert.match(route, /allowedSources:\s*\["USER_PROFILE"\]/);
-  assert.match(route, /observedAtPolicy:\s*"SERVER_RECEIPT"/);
+  assert.match(route, /observedAtPolicy:\s*"SERVER_GENERATION"/);
+  assert.match(route, /causalObservedAt:\s*scope\.causalObservedAt/);
   assert.match(manifest, /\/api\/fan-data[\s\S]*ROUTE_CLASS\.CREATOR[\s\S]*observations additionally requires device-bound/);
 });
 
@@ -160,8 +166,10 @@ test("INT4.1A point refresh and runtime observation producers use explicit narro
   const refreshEnd = authority.indexOf("async function scheduleFanDataPointRefresh", refreshStart);
   const refresh = authority.slice(refreshStart, refreshEnd);
   assert.match(refresh, /allowedSources:\s*\["USER_PROFILE"\]/);
-  assert.match(refresh, /observedAtPolicy:\s*"SERVER_RECEIPT"/);
-  assert.match(bump, /allowedSources:\s*\["PRESENCE_HINT",\s*"LIVE_NOTIFICATION"\]/);
+  assert.match(refresh, /observedAtPolicy:\s*"SERVER_GENERATION"/);
+  assert.match(refresh, /causalObservedAt = date\(job\.createdAt\)/);
+  assert.match(bump, /allowedSources:\s*\["PRESENCE_HINT"\]/);
+  assert.doesNotMatch(bump, /allowedSources:\s*\[[^\]]*"LIVE_NOTIFICATION"/);
   assert.match(bump, /observedAtPolicy:\s*"SERVER_RECEIPT"/);
 });
 
@@ -172,6 +180,7 @@ test("INT4.4A point refresh chunk cannot escape the server-requested fan set", a
     id: "refresh-job-1",
     agencyId: "agency-a",
     creatorId: "creator-a",
+    createdAt: new Date("2026-09-16T15:00:00.000Z"),
     params: { fanIds: ["fan-a"] },
   };
   await assert.rejects(
@@ -197,7 +206,7 @@ test("INT4.4A point refresh requires a server-requested fan scope", async () => 
   await assert.rejects(
     () => applyFanDataPointRefreshChunk({
       db,
-      job: { id: "refresh-job-legacy", agencyId: "agency-a", creatorId: "creator-a", params: {} },
+      job: { id: "refresh-job-legacy", agencyId: "agency-a", creatorId: "creator-a", createdAt: new Date("2026-09-16T15:00:00.000Z"), params: {} },
       deviceId: "device-a",
       chunkResult: { kind: "fan_data_point_refresh", items: [] },
     }),
@@ -206,16 +215,17 @@ test("INT4.4A point refresh requires a server-requested fan scope", async () => 
 });
 
 
-test("INT4.4A point refresh value bookkeeping uses server receipt time, not producer wall clock", async () => {
+test("INT4.4A point refresh value bookkeeping uses PostgreSQL receipt time, not producer/process wall clock", async () => {
   const db = makeDb();
+  const authorityNow = new Date("2026-09-16T18:45:00.000Z");
+  db.$queryRawUnsafe = async () => [{ authorityNow }];
   let trafficUpdate = null;
   db.trafficSourceMember = {
     updateMany: async (input) => { trafficUpdate = input; return { count: 1 }; },
   };
-  const before = Date.now();
   await applyFanDataPointRefreshChunk({
     db,
-    job: { id: "refresh-job-value", agencyId: "agency-a", creatorId: "creator-a", params: { fanIds: ["fan-a"] } },
+    job: { id: "refresh-job-value", agencyId: "agency-a", creatorId: "creator-a", createdAt: new Date("2026-09-16T15:00:00.000Z"), params: { fanIds: ["fan-a"] } },
     deviceId: "device-a",
     chunkResult: {
       kind: "fan_data_point_refresh",
@@ -226,8 +236,64 @@ test("INT4.4A point refresh value bookkeeping uses server receipt time, not prod
       }],
     },
   });
-  const after = Date.now();
   assert.ok(trafficUpdate?.data?.lastValueFetchedAt instanceof Date);
-  assert.ok(trafficUpdate.data.lastValueFetchedAt.getTime() >= before && trafficUpdate.data.lastValueFetchedAt.getTime() <= after);
+  assert.equal(trafficUpdate.data.lastValueFetchedAt.toISOString(), authorityNow.toISOString());
   assert.notEqual(trafficUpdate.data.lastValueFetchedAt.toISOString(), "2099-01-01T00:00:00.000Z");
+});
+
+test("INT5.1A point refresh canonical time is server job generation, not delayed receipt or client clock", async () => {
+  const db = makeDb();
+  const generationAt = new Date("2026-09-16T15:00:00.000Z");
+  const delayedClaimAt = new Date("2026-09-16T18:00:00.000Z");
+  const delayedStartAt = new Date("2026-09-16T18:05:00.000Z");
+  db.$queryRawUnsafe = async () => [{ authorityNow: new Date("2026-09-16T18:10:00.000Z") }];
+  await applyFanDataPointRefreshChunk({
+    db,
+    job: { id: "refresh-causal", agencyId: "agency-a", creatorId: "creator-a", createdAt: generationAt, claimedAt: delayedClaimAt, startedAt: delayedStartAt, params: { fanIds: ["fan-a"] } },
+    deviceId: "device-a",
+    chunkResult: {
+      kind: "fan_data_point_refresh",
+      items: [{
+        onlyFansUserId: "fan-a",
+        relationship: { creatorFollowsFan: true, source: "USER_PROFILE", observedAt: "2099-01-01T00:00:00.000Z" },
+      }],
+    },
+  });
+  assert.equal(db.relationship.observedAt.toISOString(), generationAt.toISOString());
+});
+
+
+test("INT5.1C FanData server generations use durable DB-owned clocks rather than replica process time", () => {
+  const actions = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
+  const route = fs.readFileSync(path.join(__dirname, "../routes/fan-data.js"), "utf8");
+  const authority = fs.readFileSync(path.join(__dirname, "fan-data-authority-service.js"), "utf8");
+  const subscriber = fs.readFileSync(path.join(__dirname, "subscriber-directory-service.js"), "utf8");
+  const sfs = fs.readFileSync(path.join(__dirname, "sfs-service.js"), "utf8");
+
+  const claimStart = actions.indexOf("async function claimActionDelivery");
+  const claimEnd = actions.indexOf("async function renewActionLease", claimStart);
+  const claim = actions.slice(claimStart, claimEnd);
+  assert.match(claim, /const now = await dbAuthorityNow\(\{ db: prisma, fallbackNow: new Date\(\) \}\)/);
+
+  const startStart = actions.indexOf("async function startActionDelivery");
+  const startEnd = actions.indexOf("async function validateActionDelivery", startStart);
+  const start = actions.slice(startStart, startEnd);
+  assert.match(start, /const now = await dbAuthorityNow\(\{ db: tx, fallbackNow: new Date\(\) \}\)/);
+  assert.match(start, /attemptStartedAt: now\.toISOString\(\)/);
+  assert.match(start, /delivery\.notBefore\.getTime\(\) > now\.getTime\(\)/);
+
+  assert.match(route, /const receivedAt = await dbAuthorityNow\(\{ db: tx, fallbackNow: new Date\(\) \}\)/);
+
+  const refreshStart = authority.indexOf("async function applyFanDataPointRefreshChunk");
+  const refreshEnd = authority.indexOf("async function scheduleFanDataPointRefresh", refreshStart);
+  const refresh = authority.slice(refreshStart, refreshEnd);
+  assert.match(refresh, /const receivedAt = await dbAuthorityNow\(\{ db, fallbackNow: new Date\(\) \}\)/);
+  assert.match(refresh, /const causalObservedAt = date\(job\.createdAt\)/);
+  assert.doesNotMatch(refresh, /causalObservedAt = date\(job\.startedAt\)/);
+  assert.doesNotMatch(refresh, /causalObservedAt = date\(job\.claimedAt\)/);
+
+  assert.match(subscriber, /const observedAt = dateOrNull\(run\.createdAt\) \|\| dateOrNull\(job\.createdAt\)/);
+  assert.match(subscriber, /SUBSCRIBER_SCAN_CAUSAL_GENERATION_REQUIRED/);
+  assert.match(sfs, /const observedAt = dateOrNull\(job\.createdAt\)/);
+  assert.match(sfs, /SFS_DISCOVERY_CAUSAL_GENERATION_REQUIRED/);
 });

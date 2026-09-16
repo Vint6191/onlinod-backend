@@ -225,7 +225,7 @@ async function ensureSubscriberScanDue({ agencyId, creatorId, priority = 10, now
   });
 }
 
-function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt }) {
+function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt, producerObservedAt = null }) {
   const raw = object(item);
   const fanId = clean(raw.fanId ?? raw.userId ?? raw.id, 120);
   if (!fanId) return null;
@@ -256,6 +256,8 @@ function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt }) {
   const metadata = {
     ...object(raw.metadata),
     fanDataObservedFields: { identity: observedIdentityFields, relationship: observedRelationshipFields, value: observedValueFields },
+    fanDataObservationTimeBasis: "SERVER_SCAN_GENERATION",
+    producerObservedAt: producerObservedAt?.toISOString?.() || null,
   };
   const normalized = {
     runId,
@@ -514,9 +516,22 @@ async function applySubscriberScanChunk({ db, job, chunkResult }) {
   const nextOffset = integer(chunk.nextOffset, offset, offset, 10_000_000);
   const hasMore = chunk.hasMore === true;
   const itemsInput = Array.isArray(chunk.items) ? chunk.items.slice(0, MAX_PAGE_ITEMS) : [];
-  const observedAt = dateOrNull(chunk.observedAt) || new Date();
+  const producerObservedAt = dateOrNull(chunk.observedAt);
+  // Subscriber Directory is a server-issued generation. Every page in a run
+  // shares the same canonical generation time, so a delayed page from an older
+  // run cannot future-poison FanData merely because the Desktop clock is fast
+  // or because transport completes later. The Desktop timestamp is retained in
+  // metadata for forensics only.
+  const observedAt = dateOrNull(run.createdAt) || dateOrNull(job.createdAt);
+  if (!observedAt) throw new Error("SUBSCRIBER_SCAN_CAUSAL_GENERATION_REQUIRED");
   const items = itemsInput
-    .map((item) => normalizeChunkItem(item, { runId, agencyId: run.agencyId, creatorId: run.creatorId, observedAt }))
+    .map((item) => normalizeChunkItem(item, {
+      runId,
+      agencyId: run.agencyId,
+      creatorId: run.creatorId,
+      observedAt,
+      producerObservedAt,
+    }))
     .filter(Boolean);
   const contentHash = clean(chunk.contentHash, 128) || hashJson(items.map((item) => [item.fanId, item.contentHash]));
   const existingPage = await db.subscriberScanPage.findUnique({ where: { runId_offset: { runId, offset } } });

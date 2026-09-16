@@ -5,6 +5,7 @@ const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adop
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { projectFanObservationBatch, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { classifyProgrammaticCustomMediaProvenance } = require("./custom-content-delivery-service");
@@ -422,14 +423,23 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
   return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
-async function recordDetailedObservations({ agencyId, creatorId, observations, sourceDeviceId = null, db = prisma }) {
+async function recordDetailedObservations({
+  agencyId, creatorId, observations, sourceDeviceId = null, updateLastOnlineAt = true, db = prisma,
+}) {
   await requireCreator(agencyId, creatorId, db);
+  const authorityReceivedAt = await dbAuthorityNow({ db, fallbackNow: new Date() });
   const byFan = new Map();
   for (const raw of Array.isArray(observations) ? observations : []) {
     const fanId = clean(raw?.fanId, 160);
     if (!fanId) continue;
     const previous = byFan.get(fanId);
-    const observedAt = date(raw?.observedAt) || new Date();
+    const producerObservedAt = date(raw?.observedAt);
+    // Runtime activity timestamps are useful for ordering a private trigger, but
+    // they are not a distributed clock authority. Preserve delayed older events
+    // while clamping a future-skewed producer clock to PostgreSQL receipt time.
+    const observedAt = producerObservedAt && producerObservedAt <= authorityReceivedAt
+      ? producerObservedAt
+      : authorityReceivedAt;
     if (!previous || observedAt >= previous.observedAt) {
       byFan.set(fanId, {
         fanId,
@@ -465,9 +475,9 @@ async function recordDetailedObservations({ agencyId, creatorId, observations, s
   if (authorityItems.length) {
     await projectFanObservationBatch(db, {
       agencyId, creatorId, sourceDeviceId: clean(sourceDeviceId, 180), items: authorityItems,
-      allowedSources: ["PRESENCE_HINT", "LIVE_NOTIFICATION"],
+      allowedSources: ["PRESENCE_HINT"],
       observedAtPolicy: "SERVER_RECEIPT",
-      receivedAt: new Date(),
+      receivedAt: authorityReceivedAt,
     });
   }
 
@@ -489,8 +499,16 @@ async function recordDetailedObservations({ agencyId, creatorId, observations, s
     const dialogId = clean(row.dialogId || incoming.dialogId || object(incoming.fan).dialogId || existing?.dialogId || row.fanId, 160) || row.fanId;
     await db.automationBumpFanState.upsert({
       where: { creatorId_fanId: { creatorId, fanId: row.fanId } },
-      create: { agencyId, creatorId, fanId: row.fanId, dialogId, lastOnlineAt: row.observedAt, metadata: mergedMetadata },
-      update: { dialogId, lastOnlineAt: row.observedAt, metadata: mergedMetadata },
+      create: {
+        agencyId, creatorId, fanId: row.fanId, dialogId,
+        ...(updateLastOnlineAt ? { lastOnlineAt: row.observedAt } : {}),
+        metadata: mergedMetadata,
+      },
+      update: {
+        dialogId,
+        ...(updateLastOnlineAt ? { lastOnlineAt: row.observedAt } : {}),
+        metadata: mergedMetadata,
+      },
     });
   }
   return { ok: true, count: rows.length, fanIds: ids, authorityProjected: authorityItems.length };
@@ -511,6 +529,7 @@ async function recordOnlineObservations({ agencyId, creatorId, fanIds, observedA
       fanObservation: { identity: { observedAt: at, activityObservedAt: at, source: "PRESENCE_HINT" } },
     })),
     sourceDeviceId,
+    updateLastOnlineAt: true,
     db,
   });
 }
@@ -990,27 +1009,51 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
 
   if (subscriptionByFan.size) {
     try {
-      const observations = [...subscriptionByFan.entries()].map(([fanId, event]) => {
-        const observedAt = date(event.createdAt || event.occurredAt || event.ts) || new Date();
-        const relationship = object(event.relationship);
-        return {
-          fanId,
+      const entries = [...subscriptionByFan.entries()];
+      const observations = entries.map(([fanId, event]) => ({
+        fanId,
+        dialogId: clean(event.dialogId, 160) || fanId,
+        observedAt: date(event.createdAt || event.occurredAt || event.ts),
+        metadata: {
+          source: clean(event.source, 80) || "subscription_event",
           dialogId: clean(event.dialogId, 160) || fanId,
-          observedAt,
-          metadata: {
-            source: clean(event.source, 80) || "subscription_event",
-            dialogId: clean(event.dialogId, 160) || fanId,
+          providerEventId: clean(event.providerEventId || event.notificationId || event.externalEventId, 240),
+          providerOccurredAt: date(event.createdAt || event.occurredAt || event.ts)?.toISOString?.() || null,
+        },
+        // A notification proves that an event was reported, but transport order,
+        // producer clock and provider-observation order are not one causal clock.
+        // Do not invent a scalar LIVE_NOTIFICATION winner. Reconcile current
+        // relationship from a new server-issued provider profile generation.
+        fanObservation: null,
+      }));
+      const observed = await runCommit((commitDb) => recordDetailedObservations({
+        agencyId, creatorId, observations, sourceDeviceId, updateLastOnlineAt: false, db: commitDb,
+      }));
+
+      const refreshDecision = await runCommit(async (commitDb) => {
+        const authorityNow = await dbAuthorityNow({ db: commitDb, fallbackNow: new Date() });
+        const barrier = stableFingerprint(entries.map(([fanId, event]) => ({
+          fanId,
+          providerEventId: clean(event.providerEventId || event.notificationId || event.externalEventId, 240),
+          providerOccurredAt: date(event.createdAt || event.occurredAt || event.ts)?.toISOString?.() || null,
+        })).sort((a, b) => String(a.fanId).localeCompare(String(b.fanId))));
+        return scheduleFanDataPointRefresh({
+          agencyId,
+          creatorId,
+          onlyFansUserIds: observed.fanIds,
+          reason: "bump_runtime_subscription_event_reconcile",
+          priority: 98,
+          now: authorityNow,
+          params: {
+            consumer: "bumps_runtime",
+            trigger: "subscription_created",
+            causalBarrierKey: `runtime-subscription:${barrier}`,
+            refreshFields: ["fanSubscribesToCreator", "fanSubscriptionActive", "fanSubscriptionType", "canReceiveChatMessage"],
           },
-          fanObservation: {
-            relationship: {
-              ...relationship,
-              observedAt,
-              source: "LIVE_NOTIFICATION",
-            },
-          },
-        };
+        });
       });
-      const observed = await runCommit((commitDb) => recordDetailedObservations({ agencyId, creatorId, observations, sourceDeviceId, db: commitDb }));
+      summary.subscriptionReconcile = { fanIds: observed.fanIds, decision: refreshDecision };
+
       const plannedCount = await runCommit(async (commitDb) => {
         const control = await getAutomationControlSnapshot({ agencyId, creatorId, db: commitDb });
         if (!control.effective.bumpsEnabled || !control.modules.bumps.settings.automatic || !control.modules.bumps.settings.subscriptionEventsEnabled) return 0;

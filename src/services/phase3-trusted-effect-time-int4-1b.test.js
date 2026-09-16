@@ -12,29 +12,31 @@ const {
 const commitAt = new Date("2026-09-16T10:00:00.000Z");
 const receiptAt = new Date("2026-09-16T10:01:00.000Z");
 
-test("INT4.1B canonical automation result chronology is server commit time, not delayed settlement", () => {
+test("INT5.1A automation result keeps a causal interval instead of inventing scalar effect time", () => {
   const evidence = buildAutomationEffectTimeEvidence(
     { writeCommitAt: commitAt },
     { effectObservedAt: "2026-09-16T10:00:01.000Z" },
     receiptAt,
   );
-  assert.equal(evidence.authorityObservedAt.toISOString(), commitAt.toISOString());
-  assert.equal(evidence.settlementReceivedAt.toISOString(), receiptAt.toISOString());
+  assert.equal(evidence.causalLowerAt.toISOString(), commitAt.toISOString());
+  assert.equal(evidence.causalUpperAt.toISOString(), receiptAt.toISOString());
   assert.equal(evidence.producerEffectObservedAt.toISOString(), "2026-09-16T10:00:01.000Z");
   assert.equal(evidence.producerTimeAccepted, true);
-  assert.equal(evidence.effectTimeBasis, "SERVER_WRITE_COMMIT_LOWER_BOUND");
+  assert.equal(evidence.effectTimeBasis, "SERVER_CAUSAL_INTERVAL_RECONCILE");
+  assert.equal(Object.prototype.hasOwnProperty.call(evidence, "authorityObservedAt"), false);
 });
 
-test("INT4.1B future or pre-permit producer clock cannot own canonical chronology", () => {
+test("INT5.1A future or pre-permit producer clock remains forensic-only", () => {
   for (const effectObservedAt of ["2099-01-01T00:00:00.000Z", "2026-09-16T09:59:59.000Z"]) {
     const evidence = buildAutomationEffectTimeEvidence({ writeCommitAt: commitAt }, { effectObservedAt }, receiptAt);
-    assert.equal(evidence.authorityObservedAt.toISOString(), commitAt.toISOString());
+    assert.equal(evidence.causalLowerAt.toISOString(), commitAt.toISOString());
+    assert.equal(evidence.causalUpperAt.toISOString(), receiptAt.toISOString());
     assert.equal(evidence.producerEffectObservedAt, null);
     assert.equal(evidence.producerTimeAccepted, false);
   }
 });
 
-test("INT4.1B settlement result strips raw producer time and stores explicit temporal provenance", () => {
+test("INT5.1A settlement result stores interval provenance and requires canonical reconcile", () => {
   const evidence = buildAutomationEffectTimeEvidence(
     { writeCommitAt: commitAt },
     { code: "followed", effectObservedAt: "2026-09-16T10:00:01.000Z" },
@@ -42,13 +44,15 @@ test("INT4.1B settlement result strips raw producer time and stores explicit tem
   );
   const stored = sanitizeAutomationSettlementResult({ code: "followed", effectObservedAt: "2026-09-16T10:00:01.000Z" }, evidence);
   assert.equal(stored.effectObservedAt, undefined);
-  assert.equal(stored.effectAuthorityObservedAt, commitAt.toISOString());
+  assert.equal(stored.effectAuthorityObservedAt, undefined);
+  assert.equal(stored.effectCausalLowerAt, commitAt.toISOString());
+  assert.equal(stored.effectCausalUpperAt, receiptAt.toISOString());
   assert.equal(stored.producerEffectObservedAt, "2026-09-16T10:00:01.000Z");
-  assert.equal(stored.settlementReceivedAt, receiptAt.toISOString());
-  assert.equal(stored.effectTimeBasis, "SERVER_WRITE_COMMIT_LOWER_BOUND");
+  assert.equal(stored.effectTimeBasis, "SERVER_CAUSAL_INTERVAL_RECONCILE");
+  assert.equal(stored.fanDataReconcileRequired, true);
 });
 
-test("INT4.1B idempotent preflight without write permit does not manufacture AUTOMATION_WRITE_RESULT time", () => {
+test("INT5.1A idempotent preflight without write permit does not manufacture effect interval", () => {
   const evidence = buildAutomationEffectTimeEvidence(
     { writeCommitAt: null },
     { code: "already_followed", effectObservedAt: "2026-09-16T10:00:01.000Z" },
@@ -57,11 +61,12 @@ test("INT4.1B idempotent preflight without write permit does not manufacture AUT
   assert.equal(evidence, null);
 });
 
-test("INT4.1B relationship projector consumes trusted effect authority time rather than settlement now", () => {
+test("INT5.1A known relationship write heals FanData through a post-effect causal-barrier refresh", () => {
   const source = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
   assert.match(source, /buildAutomationEffectTimeEvidence\(delivery, clientResult, now\)/);
   assert.match(source, /sanitizeAutomationSettlementResult\(clientResult, effectTime\)/);
-  assert.match(source, /projectKnownRelationshipOutcome\(\{ db: tx, delivery: current, effectTime, outcomeCode \}\)/);
-  assert.match(source, /observedAt:\s*effectTime\.authorityObservedAt/);
-  assert.doesNotMatch(source, /projectFanRelationship\([\s\S]{0,400}observedAt:\s*now[\s\S]{0,160}AUTOMATION_WRITE_RESULT/);
+  assert.match(source, /ensureRelationshipEffectFanRefresh\(finalDelivery\)/);
+  assert.match(source, /causalBarrierKey:\s*`automation-effect:\$\{target\.deliveryId\}`/);
+  assert.doesNotMatch(source, /projectKnownRelationshipOutcome/);
+  assert.doesNotMatch(source, /source:\s*"AUTOMATION_WRITE_RESULT"/);
 });

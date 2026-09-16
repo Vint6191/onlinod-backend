@@ -1896,20 +1896,23 @@ model CreatorFanRelationshipCurrent {
   source                   String
   sourceDeviceId           String?
   sourceJobId              String?
+  sourceDeliveryId         String?
   scanRunId                String?
   createdAt                DateTime @default(now())
   updatedAt                DateTime @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   fan          CreatorFan     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: Cascade)
-  sourceDevice WorkerDevice?  @relation("CreatorFanRelationshipCurrentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
-  sourceJob    JobInstance?   @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  sourceDevice   WorkerDevice?       @relation("CreatorFanRelationshipCurrentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob      JobInstance?        @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  sourceDelivery AutomationDelivery? @relation("CreatorFanRelationshipCurrentCollectedByDelivery", fields: [sourceDeliveryId], references: [id], onDelete: SetNull)
 
   @@unique([creatorId, onlyFansUserId])
   @@unique([creatorId, fanRecordId], map: "CreatorFanRelationshipCurrent_creatorId_fanRecordId_key")
   @@index([agencyId, creatorId, observedAt])
   @@index([sourceDeviceId])
   @@index([sourceJobId])
+  @@index([sourceDeliveryId])
 }
 
 model CreatorFanValueCurrent {
@@ -1938,20 +1941,23 @@ model CreatorFanValueCurrent {
   lastActivityAtAuthorityVersion  String?
   sourceDeviceId         String?
   sourceJobId            String?
+  sourceDeliveryId       String?
   scanRunId              String?
   createdAt              DateTime @default(now())
   updatedAt              DateTime @updatedAt
 
   creator      CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   fan          CreatorFan     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: Cascade)
-  sourceDevice WorkerDevice?   @relation("CreatorFanValueCurrentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
-  sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  sourceDevice   WorkerDevice?       @relation("CreatorFanValueCurrentCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
+  sourceJob      JobInstance?        @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
+  sourceDelivery AutomationDelivery? @relation("CreatorFanValueCurrentCollectedByDelivery", fields: [sourceDeliveryId], references: [id], onDelete: SetNull)
 
   @@unique([creatorId, fanRecordId], map: "CreatorFanValueCurrent_creatorId_fanId_key")
   @@index([agencyId, creatorId, valueObservedAt], map: "CreatorFanValueCurrent_agencyId_creatorId_fetchedAt_idx")
   @@index([creatorId, platformReportedTotalSpendCents], map: "CreatorFanValueCurrent_creatorId_totalNetCents_idx")
   @@index([sourceDeviceId])
   @@index([sourceJobId])
+  @@index([sourceDeliveryId])
 }
 
 model CreatorNotificationSyncState {
@@ -4311,6 +4317,8 @@ model AutomationDelivery {
 
   agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  fanRelationshipObservations CreatorFanRelationshipCurrent[] @relation("CreatorFanRelationshipCurrentCollectedByDelivery")
+  fanValueObservations        CreatorFanValueCurrent[]        @relation("CreatorFanValueCurrentCollectedByDelivery")
 
   @@index([agencyId, status])
   @@index([agencyId, moduleKey, actionType, status])

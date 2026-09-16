@@ -458,8 +458,10 @@ test("current value aggregates exclude unavailable or malformed observations", (
 
 test("point refresh scheduler scopes dedupe to the exact fan-id batch instead of creator-wide loss", () => {
   const service = read("src/services/fan-data-authority-service.js");
-  assert.match(service, /const rangeKey = `fan-data:\$\{crypto\.createHash/);
+  assert.match(service, /const fanSetHash = crypto\.createHash/);
   assert.match(service, /ids\.join\("\\n"\)/);
+  assert.match(service, /const causalBarrierKey = text\(params\?\.causalBarrierKey/);
+  assert.match(service, /const rangeKey = causalBarrierHash \? `fan-data:\$\{fanSetHash\}:\$\{causalBarrierHash\}` : `fan-data:\$\{fanSetHash\}`/);
   assert.match(service, /params:\s*\{ \.\.\.stableParams, fanIds: ids, rangeKey/);
   assert.match(service, /delete stableParams\.scheduledFromObservationAt/);
 });
