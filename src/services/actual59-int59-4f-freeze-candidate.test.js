@@ -15,6 +15,7 @@ const telemetry = read("src/services/telemetry-ingest-service.js");
 const telemetryRoute = read("src/routes/telemetry.js");
 const lineageMigration = read("prisma/migrations/20260915193000_actual59_int59_3_authorization_lineage_catalog_boundary/migration.sql");
 const memberMigration = read("prisma/migrations/20260915131500_actual59_team_authorization_generation_boundary/migration.sql");
+const refreshScaleMigration = read("prisma/migrations/20260916011500_actual60_refreshsession_hot_cold_scale/migration.sql");
 
 function between(text, start, end) {
   const a = text.indexOf(start);
@@ -87,9 +88,12 @@ test("INT59.4F freeze candidate: CURRENT_HUMAN commit authority is conjunctive a
   assert.match(telemetry, /TELEMETRY_CREATOR_CATALOG_STALE/);
 });
 
-test("INT59.4F freeze candidate: terminal performance can only cross a generation through server-owned end boundaries", () => {
+test("INT59.4F/Actual60 freeze candidate: terminal performance uses server-owned boundaries and indexed lineage expiry history", () => {
   assert.match(telemetry, /AuthorizationSessionBoundary/);
-  assert.match(telemetry, /MAX\(r\."expiresAt"\)/);
+  assert.doesNotMatch(telemetry, /MAX\(r\."expiresAt"\)/);
+  assert.match(telemetry, /ORDER BY r\."expiresAt" DESC[\s\S]*LIMIT 1/);
+  assert.match(refreshScaleMigration, /RefreshSession_authorization_history_idx/);
+  assert.match(refreshScaleMigration, /RefreshSession_live_authorization_lookup_idx/);
   assert.match(telemetry, /AgencyMemberAccessEpochBoundary/);
   assert.match(telemetry, /AgencyCreatorCatalogGenerationBoundary/);
   assert.match(telemetry, /authorization_terminal_closure_unproven/);

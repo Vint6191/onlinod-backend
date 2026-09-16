@@ -621,7 +621,7 @@ router.post("/reset-password", async (req, res) => {
       // lineage; sessionsRevokedAt covers legacy/unbound access tokens.
       await tx.user.update({ where: { id: record.userId }, data: { passwordHash, sessionsRevokedAt: revokedAt } });
       await tx.refreshSession.updateMany({
-        where: { userId: record.userId, revokedAt: null },
+        where: { userId: record.userId, revokedAt: null, expiresAt: { gt: revokedAt } },
         data: { revokedAt },
       });
     });

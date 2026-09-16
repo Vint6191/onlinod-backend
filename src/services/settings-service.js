@@ -226,6 +226,7 @@ async function changeAccountPassword({ agencyId, userId, currentPassword, newPas
       where: {
         userId,
         revokedAt: null,
+        expiresAt: { gt: now },
         ...(deviceId ? { OR: [{ deviceId: { not: deviceId } }, { deviceId: null }] } : {}),
       },
       data: { revokedAt: now },
@@ -263,7 +264,7 @@ async function logoutAccountDevice({ agencyId, userId, targetDeviceId, currentDe
     // E2E crypto identity/wrap state. The user advisory fence composes with
     // login/refresh publication so a same-user rotation cannot appear behind
     // this revoke statement's snapshot and survive a physically later logout.
-    where: { userId, deviceId: target, revokedAt: null },
+    where: { userId, deviceId: target, revokedAt: null, expiresAt: { gt: now } },
     data: { revokedAt: now },
   }) });
   if (!result.count) {
@@ -297,11 +298,11 @@ async function logoutOtherAccountDevices({ agencyId, userId, currentDeviceId, db
   const now = new Date();
   const mutation = await withAuthorizationUserLock({ db: client, userId, work: async (tx) => {
     const active = await tx.refreshSession.findMany({
-      where: { userId, revokedAt: null, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
+      where: { userId, revokedAt: null, expiresAt: { gt: now }, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
       select: { deviceId: true },
     });
     const result = await tx.refreshSession.updateMany({
-      where: { userId, revokedAt: null, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
+      where: { userId, revokedAt: null, expiresAt: { gt: now }, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
       data: { revokedAt: now },
     });
     return { active, result };

@@ -1781,7 +1781,7 @@ async function retireCurrentDeviceIdentity({ db, agencyId, userId, deviceId }) {
     // are still bounded by their normal short expiry, while every crypto-secret
     // endpoint is blocked immediately by the REVOKED crypto identity above.
     await tx.refreshSession.updateMany({
-      where: { userId, agencyId, deviceId: id, revokedAt: null },
+      where: { userId, agencyId, deviceId: id, revokedAt: null, expiresAt: { gt: now } },
       data: { revokedAt: now },
     });
 

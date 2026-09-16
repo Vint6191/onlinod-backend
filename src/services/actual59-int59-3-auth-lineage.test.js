@@ -147,15 +147,15 @@ test("legacy adoption revokes every other active NULL-lineage chain on the same 
   assert.equal(result.ok, true);
   const updates = calls.filter(([kind]) => kind === "updateMany").map(([, args]) => args);
   assert.equal(updates.length, 2);
-  assert.deepEqual(updates[1].where, {
-    userId: "user-1",
-    agencyId: "agency-1",
-    deviceId: "device-a",
-    revokedAt: null,
-    authorizationSessionId: null,
-    id: { not: "replacement" },
-  });
+  assert.equal(updates[1].where.userId, "user-1");
+  assert.equal(updates[1].where.agencyId, "agency-1");
+  assert.equal(updates[1].where.deviceId, "device-a");
+  assert.equal(updates[1].where.revokedAt, null);
+  assert.equal(updates[1].where.authorizationSessionId, null);
+  assert.deepEqual(updates[1].where.id, { not: "replacement" });
+  assert.ok(updates[1].where.expiresAt?.gt instanceof Date, "legacy cleanup must ignore already-expired historical NULL-lineage rows");
   assert.ok(updates[1].data.revokedAt instanceof Date);
+  assert.equal(updates[1].where.expiresAt.gt.getTime(), updates[1].data.revokedAt.getTime());
 });
 
 

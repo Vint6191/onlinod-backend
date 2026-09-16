@@ -212,11 +212,13 @@ async function authorizationSessionEndedAt({ db, authorizationSessionId, agencyI
             AND b."agencyId"=$2
             AND b."userId"=$3
           LIMIT 1) AS "revokedEndedAt",
-        (SELECT MAX(r."expiresAt")
+        (SELECT r."expiresAt"
            FROM "RefreshSession" r
           WHERE r."authorizationSessionId"=$1
             AND r."agencyId"=$2
-            AND r."userId"=$3) AS "naturalExpiresAt",
+            AND r."userId"=$3
+          ORDER BY r."expiresAt" DESC
+          LIMIT 1) AS "naturalExpiresAt",
         clock_timestamp() AS "dbNow"`,
     authorizationSessionId, agencyId, userId,
   );
@@ -412,7 +414,6 @@ async function lockLiveAuthorizationSession({ db, agencyId, userId, deviceId, au
         AND "authorizationSessionId"=$4
         AND "revokedAt" IS NULL
         AND "expiresAt" > clock_timestamp()
-      ORDER BY "createdAt" DESC
       LIMIT 1
       FOR SHARE`,
     userId, agencyId, deviceId, authorizationSessionId,

@@ -825,8 +825,8 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
     if (status === "deactivated") {
       await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deactivatedAt });
       await tx.refreshSession.updateMany({
-        where: { userId: liveTarget.userId, agencyId, revokedAt: null },
-        data: { revokedAt: new Date() },
+        where: { userId: liveTarget.userId, agencyId, revokedAt: null, expiresAt: { gt: deactivatedAt } },
+        data: { revokedAt: deactivatedAt },
       });
     }
     return updatedMember || { ...liveTarget, deactivatedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
@@ -891,7 +891,7 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
     }
     const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deletedAt, deactivatedAt: deletedAt, accessEpoch: { increment: 1 } } });
     await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deletedAt });
-    await tx.refreshSession.updateMany({ where: { userId: liveTarget.userId, agencyId, revokedAt: null }, data: { revokedAt: deletedAt } });
+    await tx.refreshSession.updateMany({ where: { userId: liveTarget.userId, agencyId, revokedAt: null, expiresAt: { gt: deletedAt } }, data: { revokedAt: deletedAt } });
     return updatedMember || { ...liveTarget, deletedAt, deactivatedAt: deletedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
   });
 

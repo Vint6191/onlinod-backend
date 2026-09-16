@@ -237,6 +237,7 @@ async function issueLoginTokens({
           agencyId: membership.agencyId,
           deviceId: boundDeviceId,
           revokedAt: null,
+          expiresAt: { gt: new Date() },
           id: { not: created.id },
         },
         data: { revokedAt: new Date() },
@@ -351,6 +352,7 @@ async function revokeRefreshReuseScope(session, now = new Date()) {
     where: {
       userId: session.userId,
       revokedAt: null,
+      expiresAt: { gt: now },
       ...(boundDeviceId ? { deviceId: boundDeviceId } : {}),
     },
     data: { revokedAt: now },
@@ -519,6 +521,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
             agencyId: session.agencyId,
             deviceId: effectiveDeviceId,
             revokedAt: null,
+            expiresAt: { gt: rotationNow },
             authorizationSessionId: null,
             id: { not: replacement.id },
           },
@@ -582,11 +585,12 @@ async function revokeRefreshToken(refreshToken) {
       agencyId: session.agencyId,
       deviceId: boundDeviceId,
     });
+    const revokeNow = new Date();
     await tx.refreshSession.updateMany({
       where: boundDeviceId
-        ? { userId: session.userId, deviceId: boundDeviceId, revokedAt: null }
+        ? { userId: session.userId, deviceId: boundDeviceId, revokedAt: null, expiresAt: { gt: revokeNow } }
         : { id: session.id, revokedAt: null },
-      data: { revokedAt: new Date() },
+      data: { revokedAt: revokeNow },
     });
   } });
   return { ok: true };

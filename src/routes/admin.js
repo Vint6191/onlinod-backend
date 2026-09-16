@@ -652,7 +652,7 @@ router.delete("/agencies/:id", async (req, res) => {
           });
         }
         await tx.refreshSession.updateMany({
-          where: { agencyId: before.id, revokedAt: null },
+          where: { agencyId: before.id, revokedAt: null, expiresAt: { gt: scheduledAt } },
           data: { revokedAt: scheduledAt },
         });
         await publishDomainWork({
@@ -711,7 +711,7 @@ router.delete("/agencies/:id", async (req, res) => {
       // Revoke all refresh sessions in the same commit that removes business
       // authority; no half-retired agency can remain live after a crash.
       await tx.refreshSession.updateMany({
-        where: { agencyId: before.id, revokedAt: null },
+        where: { agencyId: before.id, revokedAt: null, expiresAt: { gt: deletedAt } },
         data: { revokedAt: deletedAt },
       });
       return row;
@@ -1217,9 +1217,10 @@ router.patch("/users/:id", async (req, res) => {
       }
 
       if (input.disabled === true) {
+        const sessionRevokedAt = new Date();
         await tx.refreshSession.updateMany({
-          where: { userId: before.id, revokedAt: null },
-          data: { revokedAt: new Date() },
+          where: { userId: before.id, revokedAt: null, expiresAt: { gt: sessionRevokedAt } },
+          data: { revokedAt: sessionRevokedAt },
         });
       }
       return { before, updated, memberEpochs, lifecycleChanged };
@@ -1274,7 +1275,7 @@ router.post("/users/:id/force-logout", async (req, res) => {
         data: { sessionsRevokedAt: now },
       });
       const sessionResult = await tx.refreshSession.updateMany({
-        where: { userId: user.id, revokedAt: null },
+        where: { userId: user.id, revokedAt: null, expiresAt: { gt: now } },
         data: { revokedAt: now },
       });
       const devices = await tx.workerDevice.findMany({
@@ -1355,7 +1356,7 @@ router.post("/users/:id/reset-password", async (req, res) => {
       const revokedAt = new Date();
       await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
       await tx.refreshSession.updateMany({
-        where: { userId: user.id, revokedAt: null },
+        where: { userId: user.id, revokedAt: null, expiresAt: { gt: revokedAt } },
         data: { revokedAt },
       });
     });
@@ -1779,9 +1780,10 @@ router.post("/devices/:id/kick", async (req, res) => {
           issuedByAdmin: req.admin.id,
         },
       });
+      const sessionRevokedAt = new Date();
       await tx.refreshSession.updateMany({
-        where: { userId: device.userId, agencyId: device.agencyId, revokedAt: null },
-        data: { revokedAt: new Date() },
+        where: { userId: device.userId, agencyId: device.agencyId, revokedAt: null, expiresAt: { gt: sessionRevokedAt } },
+        data: { revokedAt: sessionRevokedAt },
       });
       return created;
     });
