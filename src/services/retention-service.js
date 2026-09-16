@@ -22,6 +22,8 @@ const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const DEFAULT_BATCH_SIZE = 2000;
+const REFRESH_SESSION_RETENTION_MAX_BATCHES = 100;
+const REFRESH_SESSION_RETENTION_MIN_BATCHES = 100;
 const RETENTION_SETTING_KEY = "retention.policy.v1";
 // Retention is destructive cluster work. A short transaction-level advisory
 // lock serializes lease claim only; the long-running sweep itself is owned by
@@ -54,6 +56,16 @@ const RETENTION_FIELDS = Object.freeze({
     min: 100,
     max: 10000,
     hint: "Rows deleted per batch. Larger is faster but locks longer.",
+  },
+
+  refreshSessionRawHistoryDays: {
+    label: "Refresh-session raw token history",
+    unit: "days after token expiry",
+    env: "ONLINOD_REFRESH_SESSION_RAW_HISTORY_DAYS",
+    fallback: 30,
+    min: 7,
+    max: 3650,
+    hint: "Keep revoked/expired raw refresh-token rows for reuse/security evidence after their original expiry. Ended authorization lineages are compacted into AuthorizationSessionBoundary before raw rows are purged.",
   },
 
   teamIntermediateDays: {
@@ -509,6 +521,113 @@ async function deleteByIdsInBatches({ model, where, orderBy, batchSize, label, m
     if (finiteMax != null && batches >= finiteMax) { hasMore = true; break; }
   }
   return { label, deleted: total, batches, hasMore };
+}
+
+async function purgeRefreshSessionHistoryBatch({ db = prisma, cutoff, batchSize = DEFAULT_BATCH_SIZE } = {}) {
+  if (!(cutoff instanceof Date) || !Number.isFinite(cutoff.getTime())) {
+    throw new Error("REFRESH_SESSION_RETENTION_CUTOFF_REQUIRED");
+  }
+  const limit = Math.max(1, Math.min(10_000, Math.floor(Number(batchSize) || DEFAULT_BATCH_SIZE)));
+  return runDbTransaction(db, async (tx) => {
+    if (typeof tx?.$queryRawUnsafe !== "function" || typeof tx?.$executeRawUnsafe !== "function" || !tx?.refreshSession?.deleteMany) {
+      throw new Error("REFRESH_SESSION_RETENTION_DB_CAPABILITY_REQUIRED");
+    }
+    const rows = await tx.$queryRawUnsafe(
+      `SELECT r."id", r."authorizationSessionId"
+         FROM "RefreshSession" r
+        WHERE r."expiresAt" < $1
+        ORDER BY r."expiresAt" ASC, r."id" ASC
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED`,
+      cutoff,
+      limit,
+    );
+    const candidates = Array.isArray(rows) ? rows : [];
+    if (!candidates.length) return { deleted: 0, materializedBoundaries: 0, candidateCount: 0 };
+
+    const lineageIds = [...new Set(candidates
+      .map((row) => String(row?.authorizationSessionId || "").trim())
+      .filter(Boolean))];
+    let materializedBoundaries = 0;
+    if (lineageIds.length) {
+      const placeholders = lineageIds.map((_, index) => `$${index + 1}`).join(", ");
+      materializedBoundaries = Number(await tx.$executeRawUnsafe(
+        `INSERT INTO "AuthorizationSessionBoundary" (
+           "authorizationSessionId", "userId", "agencyId", "deviceId", "endedAt"
+         )
+         SELECT terminal."authorizationSessionId", terminal."userId", terminal."agencyId", terminal."deviceId", terminal."expiresAt"
+           FROM (
+             SELECT DISTINCT ON (r."authorizationSessionId")
+                    r."authorizationSessionId", r."userId", r."agencyId", r."deviceId", r."expiresAt"
+               FROM "RefreshSession" r
+              WHERE r."authorizationSessionId" IN (${placeholders})
+                AND NOT EXISTS (
+                  SELECT 1
+                    FROM "RefreshSession" live
+                   WHERE live."authorizationSessionId" = r."authorizationSessionId"
+                     AND live."expiresAt" > clock_timestamp()
+                )
+              ORDER BY r."authorizationSessionId", r."expiresAt" DESC, r."createdAt" DESC, r."id" DESC
+           ) terminal
+         ON CONFLICT ("authorizationSessionId") DO UPDATE
+           SET "endedAt" = LEAST("AuthorizationSessionBoundary"."endedAt", EXCLUDED."endedAt")`,
+        ...lineageIds,
+      ));
+    }
+
+    const ids = candidates.map((row) => row.id).filter(Boolean);
+    const deleted = ids.length
+      ? Number((await tx.refreshSession.deleteMany({ where: { id: { in: ids } } }))?.count || 0)
+      : 0;
+    if (deleted !== ids.length) {
+      const error = new Error(`REFRESH_SESSION_RETENTION_DELETE_COUNT_MISMATCH expected=${ids.length} actual=${deleted}`);
+      error.code = "REFRESH_SESSION_RETENTION_DELETE_COUNT_MISMATCH";
+      throw error;
+    }
+    return { deleted, materializedBoundaries, candidateCount: candidates.length };
+  });
+}
+
+async function runRefreshSessionRetentionSweep(options = {}) {
+  const authorityNow = sweepNow(options);
+  const cfg = await resolveSweepConfig(options);
+  const db = options.db || prisma;
+  const cutoff = daysAgo(cfg.refreshSessionRawHistoryDays, authorityNow);
+  const batchSize = Math.max(100, Math.min(10_000, Number(cfg.batchSize) || DEFAULT_BATCH_SIZE));
+  const configuredMaxBatches = Number(process.env.ONLINOD_REFRESH_SESSION_RETENTION_MAX_BATCHES) || REFRESH_SESSION_RETENTION_MAX_BATCHES;
+  // Scale invariant: even at the minimum configurable retention batch size (100),
+  // an hourly PARTIAL catch-up cycle must be able to drain at least 10k raw
+  // rotations. This prevents an operator override from silently reducing the
+  // lifecycle below the 1000+ active-worker envelope (a continuously active
+  // client can rotate at most ~96 times/day with the 15-minute access TTL).
+  const maxBatches = Math.max(REFRESH_SESSION_RETENTION_MIN_BATCHES, Math.min(1000, Math.floor(configuredMaxBatches)));
+  let totalDeleted = 0;
+  let materializedBoundaries = 0;
+  let batches = 0;
+  let hasMore = false;
+
+  while (batches < maxBatches) {
+    const batch = await purgeRefreshSessionHistoryBatch({ db, cutoff, batchSize });
+    totalDeleted += Number(batch.deleted || 0);
+    materializedBoundaries += Number(batch.materializedBoundaries || 0);
+    if (!batch.candidateCount) break;
+    batches += 1;
+    if (batch.candidateCount < batchSize) break;
+    if (batches >= maxBatches) hasMore = true;
+  }
+
+  return summarizeSweep("authSessions", [{
+    label: `refreshSession.raw_after_expiry_${cfg.refreshSessionRawHistoryDays}d`,
+    deleted: totalDeleted,
+    batches,
+    hasMore,
+    saturated: hasMore && batches >= maxBatches,
+    materializedBoundaries,
+    cutoff,
+    batchSize,
+    maxBatches,
+    workBudgetRows: batchSize * maxBatches,
+  }]);
 }
 
 function maxDate(a, b) {
@@ -1344,6 +1463,7 @@ async function runRetentionSweep(options = {}) {
     ["automation", runAutomationRetentionSweep],
     ["dialogIntelligence", runDialogIntelligenceRetentionSweep],
     ["auditLogs", runAuditLogRetentionSweep],
+    ["authSessions", runRefreshSessionRetentionSweep],
     ["creatorTaskActivity", runCreatorTaskActivityRetentionSweep],
     ["analyticsExecution", runAnalyticsExecutionRetentionSweep],
   ];
@@ -1420,6 +1540,8 @@ module.exports = {
   runAutomationRetentionSweep,
   runDialogIntelligenceRetentionSweep,
   runAuditLogRetentionSweep,
+  runRefreshSessionRetentionSweep,
+  purgeRefreshSessionHistoryBatch,
   runCreatorTaskActivityRetentionSweep,
   runAnalyticsExecutionRetentionSweep,
   getRetentionSettings,

@@ -1782,7 +1782,7 @@ router.post("/devices/:id/kick", async (req, res) => {
       });
       const sessionRevokedAt = new Date();
       await tx.refreshSession.updateMany({
-        where: { userId: device.userId, agencyId: device.agencyId, revokedAt: null, expiresAt: { gt: sessionRevokedAt } },
+        where: { userId: device.userId, agencyId: device.agencyId, deviceId: device.id, revokedAt: null, expiresAt: { gt: sessionRevokedAt } },
         data: { revokedAt: sessionRevokedAt },
       });
       return created;

@@ -233,7 +233,20 @@ test("Actual60 PostgreSQL scale: large rotation history stays off live authoriza
       `terminal history plan must use ordered lineage history index; got ${JSON.stringify(historyIndexes)}`);
     assertBoundedLookupPlan(historyPlan, "terminal lineage history");
 
-    console.log(`# ACTUAL60_REFRESHSESSION_SCALE historyRows=${historyRows} expiredUnrevokedRows=${expiredUnrevokedRows} liveIndexes=${liveIndexes.join(",")} legacyIndexes=${legacyIndexes.join(",")} userLiveIndexes=${userLiveIndexes.join(",")} agencyLiveIndexes=${agencyLiveIndexes.join(",")} userHistoryIndexes=${userHistoryIndexes.join(",")} historyIndexes=${historyIndexes.join(",")}`);
+    const retentionPlan = await explainJson(db,
+      `SELECT r."id", r."authorizationSessionId"
+         FROM "RefreshSession" r
+        WHERE r."expiresAt" < $1
+        ORDER BY r."expiresAt" ASC, r."id" ASC
+        LIMIT 2000`,
+      new Date(Date.now() + 24 * 60 * 60 * 1000),
+    );
+    const retentionIndexes = collectIndexNames(retentionPlan);
+    assert.ok(retentionIndexes.includes("RefreshSession_expiresAt_idx"),
+      `retention candidate scan must use the expiry index rather than raw history scan; got ${JSON.stringify(retentionIndexes)}`);
+    assertBoundedLookupPlan(retentionPlan, "retention expiry candidate scan", { maxRowsRemoved: 4, maxBufferBlocks: 512, maxReturned: 2000 });
+
+    console.log(`# ACTUAL60_REFRESHSESSION_SCALE historyRows=${historyRows} expiredUnrevokedRows=${expiredUnrevokedRows} liveIndexes=${liveIndexes.join(",")} legacyIndexes=${legacyIndexes.join(",")} userLiveIndexes=${userLiveIndexes.join(",")} agencyLiveIndexes=${agencyLiveIndexes.join(",")} userHistoryIndexes=${userHistoryIndexes.join(",")} historyIndexes=${historyIndexes.join(",")} retentionIndexes=${retentionIndexes.join(",")}`);
   } finally {
     try { await db.user.delete({ where: { id: userId } }); } catch (_) {}
     await db.$disconnect();

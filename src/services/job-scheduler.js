@@ -121,10 +121,14 @@ function retentionBreakdown(result, laneNames) {
   for (const name of laneNames) {
     const lane = result?.[name];
     if (!lane) continue;
+    const items = Array.isArray(lane.items) ? lane.items : [];
     out[name] = {
       totalDeleted: Number(lane.totalDeleted || 0),
-      items: Object.fromEntries((Array.isArray(lane.items) ? lane.items : [])
+      items: Object.fromEntries(items
         .map((item) => [String(item?.label || "unknown"), Number(item?.deleted || 0)])),
+      hasMore: lane?.hasMore === true,
+      saturated: items.filter((item) => item?.saturated === true).map((item) => String(item?.label || "unknown")),
+      workBudgetRows: items.reduce((max, item) => Math.max(max, Number(item?.workBudgetRows || 0)), 0),
     };
     if (lane.error) out[name].error = String(lane.error);
   }
@@ -147,17 +151,17 @@ async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) 
 
   try {
     const result = await runRetentionSweep({ minIntervalMs: force ? 0 : retentionWindowMs });
-    const laneNames = ["teamActivity", "teamLedgers", "traffic", "automation", "dialogIntelligence", "auditLogs", "creatorTaskActivity", "analyticsExecution"];
+    const laneNames = ["teamActivity", "teamLedgers", "traffic", "automation", "dialogIntelligence", "auditLogs", "authSessions", "creatorTaskActivity", "analyticsExecution"];
     const laneSummary = laneNames
       .map((name) => `${name}=${Number(result?.[name]?.totalDeleted || 0)}`)
       .join(", ");
     const breakdown = JSON.stringify(retentionBreakdown(result, laneNames));
     if (result?.ok === false) {
-      console.warn(`[scheduler] retention sweep partial/failed in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; ${laneSummary}; errors=${JSON.stringify(result.laneErrors || result.coordinationError || [])}; breakdown=${breakdown}`);
+      console.warn(`[scheduler] retention sweep partial/failed in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; remainingWork=${result?.remainingWork === true}; ${laneSummary}; errors=${JSON.stringify(result.laneErrors || result.coordinationError || [])}; breakdown=${breakdown}`);
     } else if (result?.skipped) {
       console.log(`[scheduler] retention sweep skipped in ${Date.now() - startedAt}ms — reason=${result.reason || "unknown"}`);
     } else {
-      console.log(`[scheduler] retention sweep done in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; ${laneSummary}; breakdown=${breakdown}`);
+      console.log(`[scheduler] retention sweep done in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; remainingWork=${result?.remainingWork === true}; ${laneSummary}; breakdown=${breakdown}`);
     }
     return { ...result, windowMs: retentionWindowMs };
   } catch (err) {

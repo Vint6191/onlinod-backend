@@ -276,6 +276,7 @@ test("F55-07 Agency non-FK anti-map classifies every non-cascade agencyId carrie
   const directSetNull = relationEdges.filter((edge) => edge.parent === "Agency" && edge.action === "SetNull").map((edge) => edge.child);
   const boundedTenantRoots = [
     "ProviderOperationalDebt", "TelegramDeliveryIntent", "TelegramInboundEvent", "RefreshSession",
+    "AuthorizationSessionBoundary", "AgencyMemberAccessEpochBoundary", "AgencyCreatorCatalogGenerationBoundary",
     "AnalyticsCollectionDemand", "DeviceCommand", "AutomationTask", "AutomationJob", "AutomationEvent",
     "ContentUsageEvent", "BumpDeliveryStat", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
   ];
@@ -393,6 +394,14 @@ test("F55-07 fresh-source DB fence blocks late inserts into non-FK tenant roots 
     "AnalyticsCollectionDemand", "DeviceCommand", "AutomationTask", "AutomationJob", "AutomationEvent",
     "ContentUsageEvent", "BumpDeliveryStat", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
   ]) assert.match(migration, new RegExp(`'${table}'`));
+  const boundaryFence = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260916034500_actual60_int60_8_authorization_boundary_destructive_fence/migration.sql"), "utf8");
+  for (const table of [
+    "AuthorizationSessionBoundary", "AgencyMemberAccessEpochBoundary", "AgencyCreatorCatalogGenerationBoundary",
+  ]) {
+    assert.match(boundaryFence, new RegExp(`'${table}'`));
+  }
+  assert.match(boundaryFence, /phase2_fence_non_fk_tenant_insert_during_agency_delete/);
+  assert.match(boundaryFence, /BEFORE INSERT OR UPDATE/);
   // Current-work roots are maintained by DomainWorkItem triggers and are purged
   // after final Agency cascade; fencing them would deadlock hard-delete publication.
   assert.doesNotMatch(migration, /'Phase2WorkFamilyState'/);

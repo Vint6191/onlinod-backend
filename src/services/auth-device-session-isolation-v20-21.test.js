@@ -37,21 +37,27 @@ function loadAuthService(prisma) {
 test("normal refresh-token logout revokes the whole logical device, not another device", async () => {
   const calls = [];
   const prisma = {
+    $transaction: async (work) => work(prisma),
+    $executeRawUnsafe: async () => 1,
     refreshSession: {
-      findUnique: async () => ({ id: "s-a1", userId: "user-1", deviceId: "device-a", revokedAt: null }),
+      findUnique: async () => ({ id: "s-a1", userId: "user-1", agencyId: "agency-1", deviceId: "device-a", revokedAt: null }),
       updateMany: async ({ where, data }) => { calls.push({ where, data }); return { count: 2 }; },
     },
   };
   const auth = loadAuthService(prisma);
   await auth.revokeRefreshToken("token-a");
   assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].where, { userId: "user-1", deviceId: "device-a", revokedAt: null });
+  assert.equal(calls[0].where.userId, "user-1");
   assert.equal(calls[0].where.deviceId, "device-a");
+  assert.equal(calls[0].where.revokedAt, null);
+  assert.ok(calls[0].where.expiresAt?.gt instanceof Date, "device logout must only revoke still-live refresh rows");
 });
 
 test("reuse of a revoked device-bound refresh token is contained to that device", async () => {
   const updates = [];
   const prisma = {
+    $transaction: async (work) => work(prisma),
+    $executeRawUnsafe: async () => 1,
     refreshSession: {
       findUnique: async () => ({
         id: "s-a1", userId: "user-1", agencyId: "agency-1", deviceId: "device-a",
@@ -66,13 +72,18 @@ test("reuse of a revoked device-bound refresh token is contained to that device"
   assert.equal(result.ok, false);
   assert.equal(result.code, "REFRESH_REUSED");
   assert.equal(updates.length, 1);
-  assert.deepEqual(updates[0].where, { userId: "user-1", revokedAt: null, deviceId: "device-a" });
+  assert.equal(updates[0].where.userId, "user-1");
+  assert.equal(updates[0].where.revokedAt, null);
+  assert.equal(updates[0].where.deviceId, "device-a");
+  assert.ok(updates[0].where.expiresAt?.gt instanceof Date, "reuse containment must ignore already-expired history");
   assert.ok(!("OR" in updates[0].where), "reuse containment must never widen to other devices");
 });
 
 test("legacy unbound refresh-token reuse retains account-wide fallback", async () => {
   const updates = [];
   const prisma = {
+    $transaction: async (work) => work(prisma),
+    $executeRawUnsafe: async () => 1,
     refreshSession: {
       findUnique: async () => ({
         id: "legacy", userId: "user-1", agencyId: "agency-1", deviceId: null,
@@ -85,5 +96,8 @@ test("legacy unbound refresh-token reuse retains account-wide fallback", async (
   const auth = loadAuthService(prisma);
   const result = await auth.refreshAccessToken({ refreshToken: "old-legacy", req: { headers: {}, ip: "127.0.0.1" } });
   assert.equal(result.code, "REFRESH_REUSED");
-  assert.deepEqual(updates[0].where, { userId: "user-1", revokedAt: null });
+  assert.equal(updates[0].where.userId, "user-1");
+  assert.equal(updates[0].where.revokedAt, null);
+  assert.ok(updates[0].where.expiresAt?.gt instanceof Date, "legacy fallback must still only revoke live account sessions");
+  assert.equal(updates[0].where.deviceId, undefined);
 });

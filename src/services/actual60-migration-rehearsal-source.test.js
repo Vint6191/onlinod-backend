@@ -30,8 +30,9 @@ test("Actual60 migration rehearsal: uses a disposable PostgreSQL schema and a re
   assert.match(source, /name < scaleMigration/);
   assert.match(source, /deploy-pre-scale-prerequisites/);
   assert.match(source, /20260916014500_actual60_refreshsession_current_write_history_scale/);
+  assert.match(source, /20260916034500_actual60_int60_8_authorization_boundary_destructive_fence/);
   assert.match(source, /copyMigrationSet\(fullWorkspace, \(name\) => name <= throughMigration\)/);
-  assert.match(source, /deploy-through-int60\.4-schema-first/);
+  assert.match(source, /deploy-through-int60\.8-schema-first/);
   assert.match(source, /redeploy-idempotence-schema/);
   assert.match(source, /redeploy-idempotence-online-index-ensure/);
 });
@@ -64,7 +65,7 @@ test("Actual60 migration rehearsal: populated Prisma scale migrations do not bui
   assert.match(source, /prematureIndexes/);
   assert.match(source, /populated-table F60 migration built indexes before online ensure/);
   assert.ok(
-    source.indexOf("deploy-through-int60.4-schema-first") < source.indexOf("await proveOnlineIndexEnsure("),
+    source.indexOf("deploy-through-int60.8-schema-first") < source.indexOf("await proveOnlineIndexEnsure("),
     "schema migration must finish before online index ensure",
   );
 });
@@ -96,4 +97,29 @@ test("Actual60 migration rehearsal: never runs destructive rehearsal operations 
   assert.match(source, /new PrismaClient\(\{ datasources: \{ db: \{ url: rehearsalUrl \} \} \}\)/);
   assert.doesNotMatch(source, /DROP DATABASE/);
   assert.doesNotMatch(source, /TRUNCATE/);
+});
+
+
+test("Actual60 migration rehearsal: includes INT60.8 authorization-boundary destructive fences in runtime proof", () => {
+  const source = read("scripts/audit/actual60-migration-rehearsal.js");
+  assert.match(source, /phase2_non_fk_tenant_insert_fence/);
+  assert.match(source, /AuthorizationSessionBoundary/);
+  assert.match(source, /AgencyMemberAccessEpochBoundary/);
+  assert.match(source, /AgencyCreatorCatalogGenerationBoundary/);
+  assert.match(source, /authorization boundary destructive fence mismatch/);
+});
+
+
+test("Actual60 migration rehearsal: INT60.8 destructive boundary fences are behaviorally enforced, not only present in pg_trigger", () => {
+  const source = read("scripts/audit/actual60-migration-rehearsal.js");
+  assert.match(source, /DESTRUCTIVE_AGENCY_CLEANUP/);
+  assert.match(source, /Phase2AgencyDestructiveCleanup/);
+  assert.match(source, /authorization boundary destructive fence did not block/);
+  assert.match(source, /PHASE2_AGENCY_DESTRUCTIVE_DELETE_IN_PROGRESS/);
+  assert.match(source, /authorization boundary destructive fence leaked rows/);
+  for (const table of [
+    "AuthorizationSessionBoundary",
+    "AgencyMemberAccessEpochBoundary",
+    "AgencyCreatorCatalogGenerationBoundary",
+  ]) assert.match(source, new RegExp(table));
 });

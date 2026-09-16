@@ -11,7 +11,8 @@ const schemaSource = path.join(root, "prisma", "schema.prisma");
 const lineageMigration = "20260915193000_actual59_int59_3_authorization_lineage_catalog_boundary";
 const scaleMigration = "20260916011500_actual60_refreshsession_hot_cold_scale";
 const liveUserMigration = "20260916013000_actual60_refreshsession_live_user_scale";
-const throughMigration = "20260916014500_actual60_refreshsession_current_write_history_scale";
+const currentWriteHistoryMigration = "20260916014500_actual60_refreshsession_current_write_history_scale";
+const throughMigration = "20260916034500_actual60_int60_8_authorization_boundary_destructive_fence";
 const enabled = process.env.ONLINOD_ACTUAL60_MIGRATION_REHEARSAL === "1";
 const databaseUrl = String(process.env.DATABASE_URL || "").trim();
 const prismaCli = path.join(root, "node_modules", ".bin", process.platform === "win32" ? "prisma.cmd" : "prisma");
@@ -163,7 +164,7 @@ async function main() {
   if (!enabled) fail("ONLINOD_ACTUAL60_MIGRATION_REHEARSAL=1 is required", 3);
   if (!databaseUrl) fail("DATABASE_URL is required", 3);
   if (!fs.existsSync(schemaSource)) fail("prisma/schema.prisma is missing");
-  for (const requiredMigration of [lineageMigration, scaleMigration, liveUserMigration, throughMigration]) {
+  for (const requiredMigration of [lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, throughMigration]) {
     if (!fs.existsSync(path.join(migrationsRoot, requiredMigration, "migration.sql"))) {
       fail(`target migration ${requiredMigration} is missing`);
     }
@@ -302,7 +303,7 @@ async function main() {
     // table the F60 migration SQL must not build blocking indexes; it records
     // the migration step and leaves physical construction to Stage D.
     const fullSchema = copyMigrationSet(fullWorkspace, (name) => name <= throughMigration);
-    run("deploy-through-int60.4-schema-first", requireLocalPrismaCli(),
+    run("deploy-through-int60.8-schema-first", requireLocalPrismaCli(),
       ["migrate", "deploy", "--schema", fullSchema],
       { DATABASE_URL: rehearsalUrl });
 
@@ -400,11 +401,11 @@ async function main() {
     const migrationLedger = await rehearsal.$queryRawUnsafe(`
       SELECT migration_name, finished_at, rolled_back_at
         FROM "_prisma_migrations"
-       WHERE migration_name IN ($1, $2, $3, $4)
+       WHERE migration_name IN ($1, $2, $3, $4, $5)
        ORDER BY migration_name
-    `, lineageMigration, scaleMigration, liveUserMigration, throughMigration);
+    `, lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, throughMigration);
     const ledgerNames = migrationLedger.map((row) => row.migration_name);
-    if (JSON.stringify(ledgerNames) !== JSON.stringify([lineageMigration, scaleMigration, liveUserMigration, throughMigration])
+    if (JSON.stringify(ledgerNames) !== JSON.stringify([lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, throughMigration])
         || migrationLedger.some((row) => !row.finished_at || row.rolled_back_at)) {
       fail(`migration ledger mismatch got=${JSON.stringify(migrationLedger)}`);
     }
@@ -431,6 +432,96 @@ async function main() {
     ];
     if (JSON.stringify(triggerNames) !== JSON.stringify(expectedTriggers)) {
       fail(`boundary trigger set mismatch got=${JSON.stringify(triggerNames)}`);
+    }
+
+    const destructiveBoundaryFences = await rehearsal.$queryRawUnsafe(`
+      SELECT c.relname AS table_name, count(*)::int AS count
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1
+         AND NOT t.tgisinternal
+         AND t.tgname = 'phase2_non_fk_tenant_insert_fence'
+         AND c.relname IN (
+           'AuthorizationSessionBoundary',
+           'AgencyMemberAccessEpochBoundary',
+           'AgencyCreatorCatalogGenerationBoundary'
+         )
+       GROUP BY c.relname
+       ORDER BY c.relname
+    `, schemaName);
+    const expectedBoundaryFenceTables = [
+      "AgencyCreatorCatalogGenerationBoundary",
+      "AgencyMemberAccessEpochBoundary",
+      "AuthorizationSessionBoundary",
+    ];
+    if (JSON.stringify(destructiveBoundaryFences.map((row) => row.table_name)) !== JSON.stringify(expectedBoundaryFenceTables)
+        || destructiveBoundaryFences.some((row) => Number(row.count) !== 1)) {
+      fail(`authorization boundary destructive fence mismatch got=${JSON.stringify(destructiveBoundaryFences)}`);
+    }
+
+    // Catalog presence is not enough: prove the newly attached INT60.8 fences
+    // actually reject late compact-history recreation after durable Agency
+    // destructive intent. This is the failure mode retention can create if a
+    // boundary materialization races after proof-zero/hard-delete admission.
+    const fenceAgencyId = `a60_fence_agency_${stamp}`;
+    const fenceWorkId = `a60_fence_work_${stamp}`;
+    await rehearsal.$executeRawUnsafe(`
+      INSERT INTO "Agency"("id","name","plan","status","createdAt","updatedAt")
+      VALUES ($1,$2,'trial','TRIAL',clock_timestamp(),clock_timestamp())
+    `, fenceAgencyId, `A60 fence ${stamp}`);
+    await rehearsal.$executeRawUnsafe(`
+      INSERT INTO "DomainWorkItem"(
+        "id","agencyId","workClass","objectType","objectId","partitionKey",
+        "requestedRevision","completedRevision","activeGeneration","projectionVersion",
+        "state","isOutstanding","availableAt","claimFence","claimedRevision",
+        "dependencyRevision","attempts","createdAt","updatedAt"
+      ) VALUES (
+        $1,$2,'DESTRUCTIVE_AGENCY_CLEANUP','Phase2AgencyDestructiveCleanup',$2,$2,
+        1,0,'phase2_domain_work_v3_actual55','phase2_domain_work_v3_actual55',
+        'READY',true,clock_timestamp(),0,0,0,0,clock_timestamp(),clock_timestamp()
+      )
+    `, fenceWorkId, fenceAgencyId);
+
+    const fencedInsertCases = [
+      {
+        table: "AuthorizationSessionBoundary",
+        sql: `INSERT INTO "AuthorizationSessionBoundary"("authorizationSessionId","userId","agencyId","deviceId","endedAt") VALUES ($1,$2,$3,$4,clock_timestamp())`,
+        args: [`a60_fence_lineage_${stamp}`, `a60_fence_user_${stamp}`, fenceAgencyId, `a60_fence_device_${stamp}`],
+      },
+      {
+        table: "AgencyMemberAccessEpochBoundary",
+        sql: `INSERT INTO "AgencyMemberAccessEpochBoundary"("memberId","agencyId","userId","accessEpoch","nextAccessEpoch","endedAt") VALUES ($1,$2,$3,1,2,clock_timestamp())`,
+        args: [`a60_fence_member_${stamp}`, fenceAgencyId, `a60_fence_user_${stamp}`],
+      },
+      {
+        table: "AgencyCreatorCatalogGenerationBoundary",
+        sql: `INSERT INTO "AgencyCreatorCatalogGenerationBoundary"("agencyId","generation","nextGeneration","endedAt") VALUES ($1,1,2,clock_timestamp())`,
+        args: [fenceAgencyId],
+      },
+    ];
+    for (const entry of fencedInsertCases) {
+      let blocked = false;
+      try {
+        await rehearsal.$executeRawUnsafe(entry.sql, ...entry.args);
+      } catch (error) {
+        const text = String(error?.message || error);
+        blocked = /PHASE2_AGENCY_DESTRUCTIVE_DELETE_IN_PROGRESS/.test(text);
+        if (!blocked) throw error;
+      }
+      if (!blocked) fail(`authorization boundary destructive fence did not block ${entry.table}`);
+    }
+    const leakedBoundaryRows = await rehearsal.$queryRawUnsafe(`
+      SELECT
+        (SELECT count(*)::int FROM "AuthorizationSessionBoundary" WHERE "agencyId"=$1) AS authorization_session,
+        (SELECT count(*)::int FROM "AgencyMemberAccessEpochBoundary" WHERE "agencyId"=$1) AS member_epoch,
+        (SELECT count(*)::int FROM "AgencyCreatorCatalogGenerationBoundary" WHERE "agencyId"=$1) AS creator_catalog
+    `, fenceAgencyId);
+    const leaked = leakedBoundaryRows?.[0] || {};
+    if (Number(leaked.authorization_session || 0) !== 0
+        || Number(leaked.member_epoch || 0) !== 0
+        || Number(leaked.creator_catalog || 0) !== 0) {
+      fail(`authorization boundary destructive fence leaked rows got=${JSON.stringify(leaked)}`);
     }
 
     // Re-run BOTH stages, matching npm run prisma:migrate idempotence rather

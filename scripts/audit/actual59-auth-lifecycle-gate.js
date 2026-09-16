@@ -230,6 +230,9 @@ function sourceGate() {
     "src/services/actual60-int60-5-refreshsession-mutation-antimap.test.js",
     "src/services/actual60-int60-6-runtime-closure-integrity.test.js",
     "src/services/actual60-int60-7-prisma-regclass-preflight.test.js",
+    "src/services/actual60-int60-8-refreshsession-retention.test.js",
+    "src/services/phase2-actual55-root-e-closure.test.js",
+    "src/services/auth-device-session-isolation-v20-21.test.js",
   ], {
     ONLINOD_AUDIT_EVIDENCE_PATH: "",
     DATABASE_URL: "",
@@ -273,6 +276,10 @@ function scaleGate() {
   run("postgres-refreshsession-hot-cold-scale", process.execPath, ["--test", "src/services/actual60-refreshsession-scale-postgres.integration.test.js"], {
     DATABASE_URL: auditDatabaseUrl,
     ONLINOD_ACTUAL60_REFRESHSESSION_SCALE_INTEGRATION: "1",
+  }, { exactTests: 1 });
+  run("postgres-refreshsession-retention", process.execPath, ["--test", "src/services/actual60-int60-8-refreshsession-retention-postgres.integration.test.js"], {
+    DATABASE_URL: auditDatabaseUrl,
+    ONLINOD_ACTUAL60_REFRESHSESSION_RETENTION_INTEGRATION: "1",
   }, { exactTests: 1 });
 }
 

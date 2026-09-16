@@ -42,6 +42,24 @@ function refreshDaysForRememberDevice(rememberDevice) {
   return refreshTokenDays();
 }
 
+async function authorizationSessionWasUsed(db, authorizationSessionId) {
+  const normalized = String(authorizationSessionId || "").trim();
+  if (!normalized) return false;
+  const raw = await db.refreshSession.findFirst({
+    where: { authorizationSessionId: normalized },
+    select: { id: true },
+  });
+  if (raw) return true;
+  if (db.authorizationSessionBoundary?.findUnique) {
+    const boundary = await db.authorizationSessionBoundary.findUnique({
+      where: { authorizationSessionId: normalized },
+      select: { authorizationSessionId: true },
+    });
+    if (boundary) return true;
+  }
+  return false;
+}
+
 async function getPrimaryMembership(userId) {
   return prisma.agencyMember.findFirst({
     where: {
@@ -199,10 +217,7 @@ async function issueLoginTokens({
       // not merely a device-local label. Serialize its first publication and
       // reject any historical reuse before creating the login refresh session.
       await acquireAuthorizationLineageLock(tx, authorizationSessionId);
-      const collision = await tx.refreshSession.findFirst({
-        where: { authorizationSessionId },
-        select: { id: true },
-      });
+      const collision = await authorizationSessionWasUsed(tx, authorizationSessionId);
       if (collision) {
         const error = new Error("Authorization generation was already used by another session");
         error.code = "AUTHORIZATION_SESSION_COLLISION";
@@ -456,10 +471,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
         // Backend-first rollout invents a hidden random lineage that the old
         // client cannot persist and the upgraded client can never adopt.
         authorizationSessionId = requestedIncarnation;
-        const collision = await tx.refreshSession.findFirst({
-          where: { authorizationSessionId },
-          select: { id: true },
-        });
+        const collision = await authorizationSessionWasUsed(tx, authorizationSessionId);
         if (collision) {
           const error = new Error("AUTHORIZATION_SESSION_COLLISION");
           error.code = "AUTHORIZATION_SESSION_COLLISION";

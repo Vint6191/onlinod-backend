@@ -13,6 +13,7 @@ const CRITICAL_FILES = [
   "prisma/migrations/20260916011500_actual60_refreshsession_hot_cold_scale/migration.sql",
   "prisma/migrations/20260916013000_actual60_refreshsession_live_user_scale/migration.sql",
   "prisma/migrations/20260916014500_actual60_refreshsession_current_write_history_scale/migration.sql",
+  "prisma/migrations/20260916034500_actual60_int60_8_authorization_boundary_destructive_fence/migration.sql",
   "scripts/audit/actual59-auth-lifecycle-gate.js",
   "scripts/audit/actual60-runtime-evidence.js",
   "scripts/audit/actual60-runtime-evidence-verify.js",
@@ -21,7 +22,11 @@ const CRITICAL_FILES = [
   "scripts/database/actual60-refreshsession-online-index-preflight.js",
   "src/middleware/auth.js",
   "src/routes/auth.js",
+  "src/routes/admin.js",
   "src/services/auth-service.js",
+  "src/services/retention-service.js",
+  "src/services/job-scheduler.js",
+  "src/services/phase2-destructive-delete-authority-service.js",
   "src/services/authorization-session-authority-service.js",
   "src/services/settings-service.js",
   "src/services/team-administration-service.js",
@@ -44,9 +49,13 @@ const CRITICAL_FILES = [
   "src/services/actual60-int60-5-runtime-evidence-receipt.test.js",
   "src/services/actual60-int60-5-refreshsession-mutation-antimap.test.js",
   "src/services/actual60-int60-6-runtime-closure-integrity.test.js",
+  "src/services/actual60-int60-8-refreshsession-retention.test.js",
+  "src/services/phase2-actual55-root-e-closure.test.js",
+  "src/services/auth-device-session-isolation-v20-21.test.js",
   "src/services/actual59-team-authorization-generation-postgres.integration.test.js",
   "src/services/actual59-int59-4f-telemetry-scale-postgres.integration.test.js",
   "src/services/actual60-refreshsession-scale-postgres.integration.test.js",
+  "src/services/actual60-int60-8-refreshsession-retention-postgres.integration.test.js",
 ];
 
 function sha256File(file) {
@@ -117,6 +126,7 @@ const REQUIRED_CLOSURE_GATES = Object.freeze([
   "postgres-runtime-fingerprint-scale",
   "postgres-telemetry-scale",
   "postgres-refreshsession-hot-cold-scale",
+  "postgres-refreshsession-retention",
 ]);
 
 function validateClosureReceipt(receipt, { currentSource = false } = {}) {
@@ -145,6 +155,7 @@ function validateClosureReceipt(receipt, { currentSource = false } = {}) {
     "postgres-forced-interleavings": 10,
     "postgres-telemetry-scale": 3,
     "postgres-refreshsession-hot-cold-scale": 1,
+    "postgres-refreshsession-retention": 2,
   };
   for (const [label, expected] of Object.entries(exactTapCounts)) {
     const tests = byLabel.get(label)?.tap?.tests;

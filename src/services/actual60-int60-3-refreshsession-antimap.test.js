@@ -30,6 +30,7 @@ const expectedTouchpoints = [
   "src/services/authorization-session-authority-service.js",
   "src/services/client-e2e-keyring-service.js",
   "src/services/phase2-destructive-delete-authority-service.js",
+  "src/services/retention-service.js",
   "src/services/settings-service.js",
   "src/services/team-administration-service.js",
   "src/services/telemetry-ingest-service.js",
@@ -48,6 +49,7 @@ test("INT60.3 RefreshSession anti-map: hot/current readers remain distinct from 
   const auth = fs.readFileSync(path.join(root, "src/middleware/auth.js"), "utf8");
   const telemetry = fs.readFileSync(path.join(root, "src/services/telemetry-ingest-service.js"), "utf8");
   const settings = fs.readFileSync(path.join(root, "src/services/settings-service.js"), "utf8");
+  const retention = fs.readFileSync(path.join(root, "src/services/retention-service.js"), "utf8");
   const impersonate = fs.readFileSync(path.join(root, "src/routes/impersonate.js"), "utf8");
 
   assert.match(auth, /refreshSessions:[\s\S]*revokedAt:\s*null[\s\S]*expiresAt:\s*\{\s*gt:/);
@@ -55,6 +57,8 @@ test("INT60.3 RefreshSession anti-map: hot/current readers remain distinct from 
   assert.doesNotMatch(telemetry, /MAX\s*\(\s*r\."expiresAt"\s*\)/i);
   assert.match(telemetry, /ORDER BY r\."expiresAt" DESC[\s\S]*LIMIT 1/);
   assert.match(settings, /getAccountSettings[\s\S]*refreshSession\.findMany[\s\S]*expiresAt:\s*\{\s*gt:\s*now/);
+  assert.match(retention, /runRefreshSessionRetentionSweep/);
+  assert.match(retention, /INSERT INTO "AuthorizationSessionBoundary"[\s\S]*refreshSession\.deleteMany/);
 
   // Admin impersonation remains a separate, intentionally-unbound product
   // surface carried as a master-roadmap lead. It must not be silently folded

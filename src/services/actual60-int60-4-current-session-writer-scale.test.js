@@ -36,7 +36,7 @@ test("INT60.4 scale: admin account lifecycle writers exclude expired-unrevoked h
   const kickStart = source.indexOf('payload: { reason: req.body?.reason || "admin kick" }');
   assert.ok(kickStart >= 0);
   const kick = source.slice(kickStart, kickStart + 1800);
-  assert.match(kick, /sessionRevokedAt[\s\S]*userId:\s*device\.userId,\s*agencyId:\s*device\.agencyId,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*sessionRevokedAt\s*\}/);
+  assert.match(kick, /sessionRevokedAt[\s\S]*userId:\s*device\.userId,\s*agencyId:\s*device\.agencyId,\s*deviceId:\s*device\.id,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*sessionRevokedAt\s*\}/);
 });
 
 test("INT60.4 scale: account recovery, crypto retirement and Team removal mutate only live session rows", () => {
