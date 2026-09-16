@@ -21,7 +21,11 @@ const {
   refollowUnfollowKey,
   refollowFollowKey,
 } = require("./follow-automation-rules");
-const { readFanCurrent } = require("./fan-data-authority-service");
+const { readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const {
+  readFanCurrentMap,
+  evaluateRefollowCurrent,
+} = require("./fan-current-consumer-service");
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
@@ -180,6 +184,7 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
     completedToday, activeCycles, workerCount: await sessionWriteWorkerCount({ agencyId, creatorId, db }),
   };
   const skip = (code) => { summary.skipped[code] = (summary.skipped[code] || 0) + 1; };
+  const refreshFanIds = new Set();
   let cursorId = null;
   const batchSize = fanId ? 1 : 500;
   for (;;) {
@@ -194,10 +199,17 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
     });
     if (!candidates.length) break;
     summary.scanned += candidates.length;
+    const currentByFan = await readFanCurrentMap(db, {
+      agencyId,
+      creatorId,
+      fanIds: candidates.map((candidate) => candidate.fanId),
+    });
     for (const candidate of candidates) {
-      const eligibility = evaluateRefollowCandidate(candidate, settings, now);
+      const current = currentByFan.get(String(candidate.fanId || "")) || null;
+      const eligibility = evaluateRefollowCurrent(candidate, current, settings, now);
       if (!eligibility.eligible) {
         skip(eligibility.code);
+        if (eligibility.refreshRequired === true && candidate.fanId && refreshFanIds.size < 500) refreshFanIds.add(String(candidate.fanId));
         if (fanId) await db.followAutomationCandidate.update({
           where: { id: candidate.id },
           data: { eligibilityReason: eligibility.code, latestError: eligibility.code },
@@ -256,19 +268,64 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
       }
     }
     cursorId = candidates[candidates.length - 1].id;
-    if (fanId || candidates.length < batchSize || capacity <= 0) break;
+    if (fanId || candidates.length < batchSize || capacity <= 0 || refreshFanIds.size >= 500) break;
   }
-  return { ok: true, creatorId, source, summary };
+  return { ok: true, creatorId, source, summary, refreshFanIds: [...refreshFanIds].slice(0, 500) };
+}
+
+async function scheduleRefollowCurrentRefresh({
+  agencyId,
+  creatorId,
+  fanIds = [],
+  priority = 65,
+  trigger = "planning",
+  refreshFields = [],
+  scheduleFanRefresh = scheduleFanDataPointRefresh,
+} = {}) {
+  const refreshFanIds = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
+  if (!refreshFanIds.length) return { fanIds: [], requested: 0, decision: null };
+  try {
+    const decision = await scheduleFanRefresh({
+      agencyId,
+      creatorId,
+      onlyFansUserIds: refreshFanIds,
+      reason: "refollow_current_unknown",
+      priority: Math.max(85, Number(priority) || 65),
+      params: {
+        consumer: "follow_automation",
+        trigger: clean(trigger, 80) || "planning",
+        ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
+      },
+    });
+    return { fanIds: refreshFanIds, requested: refreshFanIds.length, decision };
+  } catch (error) {
+    return {
+      fanIds: refreshFanIds,
+      requested: refreshFanIds.length,
+      decision: null,
+      error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
+    };
+  }
 }
 
 async function planFollowAutomation(input) {
   const db = input.db || prisma;
-  return withDbAdvisoryXactLock({
+  const result = await withDbAdvisoryXactLock({
     db,
     key: `follow_automation_plan:${input.agencyId}:${input.creatorId}`,
     options: { timeout: 30_000 },
     work: (tx) => planFollowAutomationLocked({ ...input, db: tx }),
   });
+  const fanRefresh = await scheduleRefollowCurrentRefresh({
+    agencyId: input.agencyId,
+    creatorId: input.creatorId,
+    fanIds: result.refreshFanIds,
+    priority: input.priority || 65,
+    trigger: "planning",
+    scheduleFanRefresh: input.scheduleFanRefresh || scheduleFanDataPointRefresh,
+  });
+  if (!fanRefresh.requested) return { ...result, refreshFanIds: [] };
+  return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
 async function ensureAutomaticFollowAutomation({ agencyId, creatorId, source = "recurring_sweep" }) {
@@ -291,7 +348,7 @@ async function validateFollowAutomationDelivery({ delivery, control, now = new D
   if (Number(candidate.generation) !== Number(delivery.generation)) return { ok: false, terminal: true, status: "SKIPPED", code: "stale_candidate" };
   if (delivery.actionType === FOLLOW_FAN_ACTION_TYPE) {
     if (!object(delivery.payload).recovery) return { ok: false, terminal: true, status: "SKIPPED", code: "invalid_payload" };
-    if (!["FOLLOW", "RECOVERY"].includes(candidate.phase) && candidate.creatorFollowsFan !== true) {
+    if (!["FOLLOW", "RECOVERY"].includes(candidate.phase)) {
       return { ok: false, terminal: false, code: "recovery_state_mismatch", retryAt: future(60_000, now) };
     }
     return { ok: true, candidate };
@@ -302,10 +359,28 @@ async function validateFollowAutomationDelivery({ delivery, control, now = new D
   });
   if (!directory?.currentRunId || candidate.snapshotRunId !== directory.currentRunId) return { ok: false, terminal: true, status: "SKIPPED", code: "stale_candidate" };
   const settings = normalizeFollowAutomationSettings(control.modules.follow.settings);
-  const eligibility = evaluateRefollowCandidate({ ...candidate, phase: "IDLE" }, settings, now);
+  const currentByFan = await readFanCurrentMap(db, {
+    agencyId: delivery.agencyId,
+    creatorId: delivery.creatorId,
+    fanIds: [delivery.targetId || delivery.fanId],
+  });
+  const current = currentByFan.get(String(delivery.targetId || delivery.fanId || "")) || null;
+  const eligibility = evaluateRefollowCurrent(candidate, current, settings, now, { phase: "IDLE" });
   if (!eligibility.eligible) {
-    const retryable = eligibility.code === "cooldown";
-    return { ok: false, terminal: !retryable, status: "SKIPPED", code: eligibility.code, retryAt: retryable ? candidate.cooldownUntil : null };
+    const retryable = eligibility.retryable === true || eligibility.code === "cooldown";
+    return {
+      ok: false,
+      terminal: !retryable,
+      status: "SKIPPED",
+      code: eligibility.code,
+      retryAt: retryable ? (eligibility.code === "cooldown" ? candidate.cooldownUntil : future(30_000, now)) : null,
+      ...(eligibility.refreshRequired === true ? {
+        refreshRequired: true,
+        refreshFanIds: [String(delivery.targetId || delivery.fanId || candidate.fanId)].filter(Boolean),
+        refreshFields: eligibility.refreshFields || [],
+        freshnessClass: eligibility.freshnessClass || null,
+      } : {}),
+    };
   }
   const completedToday = await db.automationDelivery.count({
     where: {
@@ -437,6 +512,35 @@ async function setFollowAutomationCandidateState({ agencyId, creatorId, fanId, a
   return db.followAutomationCandidate.update({ where: { id: candidate.id }, data });
 }
 
+async function countCanonicalEligibleRefollowCandidates({ agencyId, creatorId, settings, now = new Date(), db = prisma }) {
+  if (settings?.refollowEnabled !== true) return 0;
+  const rows = await db.$queryRawUnsafe(
+    `
+    SELECT COUNT(*)::bigint AS "count"
+    FROM "FollowAutomationCandidate" c
+    JOIN "CreatorFanRelationshipCurrent" r
+      ON r."creatorId" = c."creatorId" AND r."onlyFansUserId" = c."fanId"
+    WHERE c."agencyId" = $1
+      AND c."creatorId" = $2
+      AND c."blocked" = false
+      AND c."ignored" = false
+      AND c."state" <> 'STALE'
+      AND (c."phase" IS NULL OR c."phase" IN ('IDLE', 'WAIT_RETURN', 'DONE'))
+      AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= $3)
+      AND COALESCE(c."nudgeCount", 0) < $4
+      AND r."observedAt" IS NOT NULL
+      AND r."fanSubscriptionActive" = false
+      AND r."creatorFollowsFan" = true
+      AND COALESCE(r."blocked", false) = false
+      AND COALESCE(r."restricted", false) = false
+      AND COALESCE(r."performer", false) = false
+      AND COALESCE(r."subscribePriceCents", 0) <= 0
+    `,
+    agencyId, creatorId, now, Number(settings.maxNudgesPerFan || 1),
+  );
+  return Number(rows?.[0]?.count || 0);
+}
+
 async function listFollowAutomation({ agencyId, creatorId, search = "", state = null, offset = 0, limit = 100, db = prisma }) {
   await requireCreator(agencyId, creatorId, db);
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
@@ -460,7 +564,7 @@ async function listFollowAutomation({ agencyId, creatorId, search = "", state = 
     sessionWriteWorkerCount({ agencyId, creatorId, db }),
     Promise.all([
       db.followAutomationCandidate.count({ where: { agencyId, creatorId } }),
-      db.followAutomationCandidate.count({ where: { agencyId, creatorId, state: "CANDIDATE" } }),
+      countCanonicalEligibleRefollowCandidates({ agencyId, creatorId, settings, now, db }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: UNFOLLOW_FAN_ACTION_TYPE, status: { in: ["QUEUED", "RETRY_SCHEDULED"] } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, actionType: FOLLOW_FAN_ACTION_TYPE, status: { in: ["QUEUED", "RETRY_SCHEDULED"] } } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, status: { in: ["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] } } }),
@@ -477,8 +581,8 @@ async function listFollowAutomation({ agencyId, creatorId, search = "", state = 
   });
   const currentByFan = new Map(currentRows.map((row) => [String(row.onlyFansUserId), row]));
   const mapped = items.map((item) => {
-    const eligibility = evaluateRefollowCandidate(item, settings, now);
     const current = currentByFan.get(String(item.fanId)) || null;
+    const eligibility = evaluateRefollowCurrent(item, current, settings, now);
     return {
       ...item,
       eligible: eligibility.eligible,
@@ -486,11 +590,11 @@ async function listFollowAutomation({ agencyId, creatorId, search = "", state = 
       platformIdentity: current?.platformIdentity || null,
       relationship: current?.relationship || null,
       value: current?.value || null,
-      // Compatibility aliases only; automation decisions use explicit relationship vocabulary.
-      subscriptionType: item.fanSubscriptionType ?? null,
-      isActive: item.fanSubscriptionActive ?? null,
-      subscribedByCreator: item.creatorFollowsFan ?? null,
-      subscribedOn: item.fanSubscribesToCreator ?? null,
+      // Compatibility aliases are derived from canonical current relationship at response time.
+      subscriptionType: current?.relationship?.fanSubscriptionType ?? null,
+      isActive: current?.relationship?.fanSubscriptionActive ?? null,
+      subscribedByCreator: current?.relationship?.creatorFollowsFan ?? null,
+      subscribedOn: current?.relationship?.fanSubscribesToCreator ?? null,
     };
   });
   return {
@@ -510,6 +614,7 @@ module.exports = {
   FOLLOW_FAN_ACTION_TYPE,
   refreshFollowAutomationProjection,
   planFollowAutomation,
+  scheduleRefollowCurrentRefresh,
   ensureAutomaticFollowAutomation,
   validateFollowAutomationDelivery,
   finalizeFollowAutomationSuccess,

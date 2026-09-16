@@ -5,8 +5,12 @@ const prisma = require("../prisma");
 const { canUsePermission, isOwner, normalizeAssignedCreators } = require("./team-access-control");
 const { requireCreatorAccess, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
-const { assertAutomationEnabled, getAutomationControlSnapshot } = require("./automation-control-service");
+const automationControlService = require("./automation-control-service");
+const { assertAutomationEnabled, getAutomationControlSnapshot } = automationControlService;
+const normalizeFollowBackSettings = automationControlService.normalizeFollowBackSettings || ((value) => value || {});
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { validateFollowBackDeliveryCurrent } = require("./fan-current-consumer-service");
+const { projectFanRelationship, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
 const {
@@ -73,6 +77,39 @@ class ActionDeliveryError extends Error {
 }
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
+
+async function scheduleValidationFanRefresh(delivery, validation, trigger = "validation") {
+  if (!delivery || validation?.refreshRequired !== true) return null;
+  const fanIds = [...new Set((validation.refreshFanIds || [delivery.fanId || delivery.targetId])
+    .map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
+  if (!fanIds.length) return null;
+  try {
+    return await scheduleFanDataPointRefresh({
+      agencyId: delivery.agencyId,
+      creatorId: delivery.creatorId,
+      onlyFansUserIds: fanIds,
+      reason: `${delivery.moduleKey || "fan"}_current_refresh_required`,
+      priority: 90,
+      params: {
+        consumer: delivery.moduleKey || "automation",
+        trigger,
+        ...(Array.isArray(validation.refreshFields) && validation.refreshFields.length
+          ? { refreshFields: [...new Set(validation.refreshFields.map((value) => clean(value, 80)).filter(Boolean))] }
+          : {}),
+      },
+    });
+  } catch {
+    // Admission remains fail-closed even if scheduling itself is temporarily unavailable.
+    return null;
+  }
+}
+
+function validationActionError(delivery, validation, fallbackCode, fallbackMessage) {
+  const error = new ActionDeliveryError(validation?.code || fallbackCode, validation?.code || fallbackMessage);
+  if (validation?.refreshRequired === true) error.fanRefresh = { delivery, validation };
+  return error;
+}
+
 function deliveryRequiresReconciliation(delivery) {
   const result = object(delivery?.result);
   return delivery?.status === "RECONCILE_REQUIRED"
@@ -670,15 +707,27 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
       }
       if (candidate.moduleKey === "bumps") {
         const validation = await validateBumpDelivery({ delivery: candidate, control, now });
-        if (validation.ok === false) { await applyBumpValidationTransition(candidate, validation, now); continue; }
+        if (validation.ok === false) {
+          if (validation.refreshRequired === true) await scheduleValidationFanRefresh(candidate, validation, "claim");
+          await applyBumpValidationTransition(candidate, validation, now);
+          continue;
+        }
       }
       if (candidate.moduleKey === "likes") {
         const validation = await validateLikeDelivery({ delivery: candidate, control, now });
-        if (validation.ok === false) { await applyLikeValidationTransition(candidate, validation, now); continue; }
+        if (validation.ok === false) {
+          if (validation.refreshRequired === true) await scheduleValidationFanRefresh(candidate, validation, "claim");
+          await applyLikeValidationTransition(candidate, validation, now);
+          continue;
+        }
       }
       if (candidate.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
         const validation = await validateFollowAutomationDelivery({ delivery: candidate, control, now });
-        if (validation.ok === false) { await applyFollowAutomationValidationTransition(candidate, validation, now); continue; }
+        if (validation.ok === false) {
+          if (validation.refreshRequired === true) await scheduleValidationFanRefresh(candidate, validation, "claim");
+          await applyFollowAutomationValidationTransition(candidate, validation, now);
+          continue;
+        }
       }
       if (candidate.moduleKey === SFS_MODULE_KEY) {
         const validation = await validateSfsDelivery({ delivery: candidate, control, now });
@@ -839,25 +888,40 @@ async function validateActionDelivery(input) {
   const delivery = await requireLease(input);
   if (deliveryRequiresReconciliation(delivery)) return { ok: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, reconciliationRequired: true };
   const control = await assertDeliveryControl(delivery);
+  if (delivery.moduleKey === "follow_back") {
+    const validation = await validateFollowBackDeliveryCurrent({
+      db: prisma,
+      delivery,
+      settings: normalizeFollowBackSettings(control.modules.follow_back.settings),
+      now: new Date(),
+    });
+    if (validation.ok === false) {
+      if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "validate");
+      throw validationActionError(delivery, validation, "FOLLOW_BACK_VALIDATION_FAILED", "Follow Back delivery validation failed");
+    }
+  }
   if (delivery.moduleKey === "bumps") {
     const validation = await validateBumpDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
+      if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "validate");
       await applyBumpValidationTransition(delivery, validation, new Date(), { userId: input.userId });
-      throw new ActionDeliveryError(validation.code || "BUMP_VALIDATION_FAILED", validation.code || "Bump delivery validation failed");
+      throw validationActionError(delivery, validation, "BUMP_VALIDATION_FAILED", "Bump delivery validation failed");
     }
   }
   if (delivery.moduleKey === "likes") {
     const validation = await validateLikeDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
+      if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "validate");
       await applyLikeValidationTransition(delivery, validation, new Date(), { userId: input.userId });
-      throw new ActionDeliveryError(validation.code || "LIKE_VALIDATION_FAILED", validation.code || "Like delivery validation failed");
+      throw validationActionError(delivery, validation, "LIKE_VALIDATION_FAILED", "Like delivery validation failed");
     }
   }
   if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
     const validation = await validateFollowAutomationDelivery({ delivery, control, now: new Date() });
     if (validation.ok === false) {
+      if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "validate");
       await applyFollowAutomationValidationTransition(delivery, validation, new Date(), { userId: input.userId });
-      throw new ActionDeliveryError(validation.code || "FOLLOW_AUTOMATION_VALIDATION_FAILED", validation.code || "Follow Automation delivery validation failed");
+      throw validationActionError(delivery, validation, "FOLLOW_AUTOMATION_VALIDATION_FAILED", "Follow Automation delivery validation failed");
     }
   }
   if (delivery.moduleKey === SFS_MODULE_KEY) {
@@ -871,7 +935,8 @@ async function validateActionDelivery(input) {
 }
 
 async function prepareWriteActionDelivery(input) {
-  return prisma.$transaction(async (tx) => {
+  try {
+    return await prisma.$transaction(async (tx) => {
     let delivery = await requireLease({ ...input, db: tx, lockAccess: true });
     await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId });
     // The control writer holds the same transaction-scoped fence. Re-read the
@@ -885,17 +950,26 @@ async function prepareWriteActionDelivery(input) {
     if (delivery.status !== "RUNNING") throw new ActionDeliveryError("DELIVERY_NOT_RUNNING", `Delivery status is ${delivery.status}`);
     const control = await assertDeliveryControl(delivery, { db: tx });
     const now = new Date();
+    if (delivery.moduleKey === "follow_back") {
+      const validation = await validateFollowBackDeliveryCurrent({
+        db: tx,
+        delivery,
+        settings: normalizeFollowBackSettings(control.modules.follow_back.settings),
+        now,
+      });
+      if (validation.ok === false) throw validationActionError(delivery, validation, "FOLLOW_BACK_VALIDATION_FAILED", "Follow Back delivery validation failed");
+    }
     if (delivery.moduleKey === "bumps") {
       const validation = await validateBumpDelivery({ delivery, control, now, db: tx });
-      if (validation.ok === false) throw new ActionDeliveryError(validation.code || "BUMP_VALIDATION_FAILED", validation.code || "Bump delivery validation failed");
+      if (validation.ok === false) throw validationActionError(delivery, validation, "BUMP_VALIDATION_FAILED", "Bump delivery validation failed");
     }
     if (delivery.moduleKey === "likes") {
       const validation = await validateLikeDelivery({ delivery, control, now, db: tx });
-      if (validation.ok === false) throw new ActionDeliveryError(validation.code || "LIKE_VALIDATION_FAILED", validation.code || "Like delivery validation failed");
+      if (validation.ok === false) throw validationActionError(delivery, validation, "LIKE_VALIDATION_FAILED", "Like delivery validation failed");
     }
     if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
       const validation = await validateFollowAutomationDelivery({ delivery, control, now, db: tx });
-      if (validation.ok === false) throw new ActionDeliveryError(validation.code || "FOLLOW_AUTOMATION_VALIDATION_FAILED", validation.code || "Follow Automation delivery validation failed");
+      if (validation.ok === false) throw validationActionError(delivery, validation, "FOLLOW_AUTOMATION_VALIDATION_FAILED", "Follow Automation delivery validation failed");
     }
     if (delivery.moduleKey === SFS_MODULE_KEY) {
       const validation = await validateSfsDelivery({ delivery, control, now, db: tx });
@@ -911,7 +985,31 @@ async function prepareWriteActionDelivery(input) {
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_COMMIT_PERMIT_STALE", "Delivery changed before write commit permit");
     const committing = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
     return { ok: true, duplicate: false, id: committing.id, status: committing.status, leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt };
-  }, { timeout: 30_000 });
+    }, { timeout: 30_000 });
+  } catch (error) {
+    if (error?.fanRefresh?.delivery && error?.fanRefresh?.validation) {
+      await scheduleValidationFanRefresh(error.fanRefresh.delivery, error.fanRefresh.validation, "prepare_write");
+    }
+    throw error;
+  }
+}
+
+async function projectKnownRelationshipOutcome({ db, delivery, outcomeCode, now }) {
+  if (!delivery?.creatorId || !(delivery.targetId || delivery.fanId)) return;
+  const action = String(delivery.actionType || "");
+  let creatorFollowsFan = null;
+  if (["FOLLOW_BACK", "FOLLOW_FAN", "SFS_FOLLOW_TARGET"].includes(action)) creatorFollowsFan = true;
+  if (["UNFOLLOW_FAN", "SFS_UNFOLLOW_TARGET"].includes(action)) creatorFollowsFan = false;
+  if (creatorFollowsFan === null) return;
+  await projectFanRelationship(db, {
+    agencyId: delivery.agencyId,
+    creatorId: delivery.creatorId,
+    onlyFansUserId: delivery.targetId || delivery.fanId,
+    creatorFollowsFan,
+    observedAt: now,
+    source: "AUTOMATION_WRITE_RESULT",
+    sourceJobId: delivery.id,
+  });
 }
 
 async function updateCandidateFromTerminal(delivery, status, failureCode, db = prisma) {
@@ -967,6 +1065,9 @@ async function completeActionDelivery(input) {
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before completion");
     const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    if (current && terminalStatus === "COMPLETED") {
+      await projectKnownRelationshipOutcome({ db: tx, delivery: current, outcomeCode, now });
+    }
     if (current?.moduleKey === "bumps") {
       if (current.actionType === "SEND_MESSAGE" && terminalStatus === "COMPLETED") {
         const finalized = await finalizeBumpSend({ delivery: current, result, db: tx });
@@ -1146,6 +1247,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
   let retryAt = new Date();
   if (delivery.moduleKey === "bumps") {
     const validation = await validateBumpDelivery({ delivery, control, now: retryAt });
+    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry");
     if (validation.ok === false && validation.terminal === true) {
       throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Bump delivery is no longer valid: ${validation.code || "validation_failed"}`);
     }
@@ -1186,6 +1288,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
   }
   if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
     const validation = await validateFollowAutomationDelivery({ delivery, control, now: retryAt });
+    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry");
     if (validation.ok === false && validation.terminal === true) {
       throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Follow Automation delivery is no longer valid: ${validation.code || "validation_failed"}`);
     }

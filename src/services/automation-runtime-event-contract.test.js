@@ -47,14 +47,22 @@ test("presence and subscription events are reduced to the Automation contract", 
     fanId: "fan-2",
     dialogId: "dialog-2",
     createdAt: "2026-07-27T11:00:00Z",
-    fanSnapshot: { name: "not required" },
+    eventType: "paid_subscribed",
+    isPaidSubscription: true,
+    fanSnapshot: { name: "not required", canReceiveChatMessage: true },
     amount: 99,
+    relationship: { fanSubscriptionType: "paid", canReceiveChatMessage: false, creatorFollowsFan: true },
   }), {
     type: "subscription_created",
     source: "ws",
     fanId: "fan-2",
     dialogId: "dialog-2",
     createdAt: "2026-07-27T11:00:00.000Z",
+    relationship: {
+      fanSubscribesToCreator: true,
+      fanSubscriptionActive: true,
+      fanSubscriptionType: "paid",
+    },
   });
 });
 

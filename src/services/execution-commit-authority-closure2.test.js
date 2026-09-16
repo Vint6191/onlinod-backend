@@ -148,6 +148,7 @@ function loadActionService(db) {
     getAutomationControlSnapshot: async () => control,
   });
   cacheModule("./automation-write-commit-fence-service", { lockAutomationWriteCommitFence: async () => ({ ok: true }) });
+  cacheModule("./fan-current-consumer-service", { validateFollowBackDeliveryCurrent: async () => ({ ok: true }) });
   cacheModule("./automation-pacing-service", { claimPacingRetryAt: async () => null });
   cacheModule("./bump-service", {
     validateBumpDelivery: async () => ({ ok: true }), finalizeBumpSend: async () => null, finalizeBumpDelete: async () => null,

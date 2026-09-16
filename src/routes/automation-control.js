@@ -514,6 +514,7 @@ async function handleBumpRuntimeEvents(req, res) {
       agencyId: req.auth.agencyId,
       creatorId: req.params.creatorId,
       userId: req.auth.userId,
+      sourceDeviceId: input.deviceId,
       events: safeEvents,
       commitFence,
     }));

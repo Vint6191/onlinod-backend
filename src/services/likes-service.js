@@ -7,6 +7,8 @@ const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob } = require("./job-planning-repository");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { readFanCurrentMap, evaluateLikesCurrent } = require("./fan-current-consumer-service");
+const { scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
   getAutomationControlSnapshot,
@@ -56,22 +58,6 @@ function roundRobin(groups) {
     }
   }
   return out;
-}
-function subscriptionWhere(settings) {
-  const and = [];
-  if (settings.activeSubscribers && !settings.expiredSubscribers) and.push({ OR: [{ isActive: true }, { isActive: null }] });
-  else if (!settings.activeSubscribers && settings.expiredSubscribers) and.push({ isActive: false });
-  else if (!settings.activeSubscribers && !settings.expiredSubscribers) and.push({ id: "__none__" });
-  if (!settings.expiredSubscribers) and.push({ OR: [{ subscriptionType: null }, { NOT: { subscriptionType: { contains: "expired", mode: "insensitive" } } }] });
-  if (!settings.freeSubscribers) and.push({ OR: [{ subscriptionType: null }, { NOT: { subscriptionType: { contains: "free", mode: "insensitive" } } }] });
-  if (!settings.paidSubscribers) and.push({ OR: [
-    { subscriptionType: null },
-    { AND: [
-      { NOT: { subscriptionType: { contains: "paid", mode: "insensitive" } } },
-      { NOT: { subscriptionType: { contains: "active", mode: "insensitive" } } },
-    ] },
-  ] });
-  return and;
 }
 async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   const freshAfter = new Date(Date.now() - 2 * 60_000);
@@ -124,7 +110,6 @@ async function eligibleDiscoveryFans({ agencyId, creatorId, settings, snapshotRu
       creatorId,
       runId: snapshotRunId,
       ...(requested.length ? { fanId: { in: requested } } : {}),
-      AND: subscriptionWhere(settings),
     },
     orderBy: [{ observedAt: "desc" }, { fanId: "asc" }],
     select: { fanId: true, username: true, name: true, avatarUrl: true, subscriptionType: true, isActive: true, metadata: true },
@@ -381,10 +366,11 @@ async function planLikesLocked({ db, agencyId, creatorId, userId = null, candida
       ],
     },
     orderBy: [{ publishedAt: "desc" }, { discoveredAt: "desc" }],
-    take: Math.min(2000, Math.max(capacity * 4, 100)),
+    take: Math.min(500, Math.max(capacity * 4, 100)),
   });
   const blocked = await currentBlockedFans({ agencyId, creatorId, fanIds: [...new Set(candidates.map((row) => row.ownerFanId))], db });
   const skipped = {};
+  const refreshFanIds = new Set();
   if (blocked.size) {
     const blockedIds = [...blocked];
     await db.automationContentCandidate.updateMany({
@@ -394,12 +380,27 @@ async function planLikesLocked({ db, agencyId, creatorId, userId = null, candida
     skipped.blocked = candidates.filter((candidate) => blocked.has(candidate.ownerFanId)).length;
   }
   const available = candidates.filter((candidate) => !blocked.has(candidate.ownerFanId));
+  const currentByFan = await readFanCurrentMap(db, {
+    agencyId,
+    creatorId,
+    fanIds: [...new Set(available.map((candidate) => candidate.ownerFanId).filter(Boolean))],
+  });
+  const currentEligible = [];
+  for (const candidate of available) {
+    const eligibility = evaluateLikesCurrent(currentByFan.get(String(candidate.ownerFanId || "")) || null, settings, now);
+    if (!eligibility.eligible) {
+      skipped[eligibility.code] = (skipped[eligibility.code] || 0) + 1;
+      if (eligibility.refreshRequired === true && candidate.ownerFanId) refreshFanIds.add(String(candidate.ownerFanId));
+      continue;
+    }
+    currentEligible.push(candidate);
+  }
   let selected;
   if (ids.length) {
-    selected = available.slice(0, capacity);
+    selected = currentEligible.slice(0, capacity);
   } else {
     const byFan = new Map();
-    for (const candidate of available) {
+    for (const candidate of currentEligible) {
       const list = byFan.get(candidate.ownerFanId) || [];
       if (list.length < settings.postsPerFanMax) list.push(candidate);
       byFan.set(candidate.ownerFanId, list);
@@ -461,12 +462,78 @@ async function planLikesLocked({ db, agencyId, creatorId, userId = null, candida
     capacity -= 1;
     if (!capacity) break;
   }
-  return { ok: true, created: planned > 0, reason: planned ? "planned" : "no_eligible_candidates", planned, skipped };
+  return {
+    ok: true,
+    created: planned > 0,
+    reason: planned ? "planned" : "no_eligible_candidates",
+    planned,
+    skipped,
+    refreshFanIds: [...refreshFanIds].slice(0, 500),
+  };
+}
+
+async function scheduleLikesCurrentRefresh({
+  agencyId,
+  creatorId,
+  fanIds = [],
+  priority = 60,
+  trigger = "planning",
+  reason = "likes_current_unknown",
+  refreshFields = [],
+  scheduleFanRefresh = scheduleFanDataPointRefresh,
+} = {}) {
+  const refreshFanIds = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
+  if (!refreshFanIds.length) return { fanIds: [], requested: 0, decision: null };
+
+  // One bounded job request per planning batch. The point-refresh authority then
+  // coalesces an identical opaque fan-id set, so repeated planning never becomes
+  // a provider /users call per candidate.
+  try {
+    const decision = await scheduleFanRefresh({
+      agencyId,
+      creatorId,
+      onlyFansUserIds: refreshFanIds,
+      reason: clean(reason, 120) || "likes_current_unknown",
+      priority: Math.max(85, Number(priority) || 60),
+      params: {
+        consumer: "likes",
+        trigger: clean(trigger, 80) || "planning",
+        ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
+      },
+    });
+    return { fanIds: refreshFanIds, requested: refreshFanIds.length, decision };
+  } catch (error) {
+    return {
+      fanIds: refreshFanIds,
+      requested: refreshFanIds.length,
+      decision: null,
+      error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
+    };
+  }
 }
 
 async function planLikes(input) {
-  const { db = prisma, agencyId, creatorId } = input;
-  return withCreatorLock(db, agencyId, creatorId, (tx) => planLikesLocked({ ...input, db: tx }));
+  const {
+    db = prisma,
+    agencyId,
+    creatorId,
+    priority = 60,
+    scheduleFanRefresh = scheduleFanDataPointRefresh,
+  } = input;
+  const result = await withCreatorLock(db, agencyId, creatorId, (tx) => planLikesLocked({ ...input, db: tx }));
+
+  // Refresh scheduling happens only after the planning transaction releases its
+  // creator advisory lock. Unknown current facts therefore fail closed first,
+  // then request one bounded canonical refresh batch out of transaction.
+  const fanRefresh = await scheduleLikesCurrentRefresh({
+    agencyId,
+    creatorId,
+    fanIds: result.refreshFanIds,
+    priority,
+    scheduleFanRefresh,
+  });
+  if (!fanRefresh.requested) return { ...result, refreshFanIds: [] };
+  return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
 async function ensureAutomaticLikes({ agencyId, creatorId, source = "automatic", db = prisma }) {
@@ -496,6 +563,27 @@ async function validateLikeDelivery({ delivery, control, now = new Date(), db = 
   const blocked = await currentBlockedFans({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanIds: [candidate.ownerFanId], db });
   if (blocked.has(candidate.ownerFanId)) return { ok: false, terminal: true, status: "CANCELED", code: "blocked_or_ignored" };
   const settings = normalizeLikesSettings(control.modules.likes.settings);
+  const currentByFan = await readFanCurrentMap(db, {
+    agencyId: delivery.agencyId,
+    creatorId: delivery.creatorId,
+    fanIds: [candidate.ownerFanId],
+  });
+  const currentEligibility = evaluateLikesCurrent(currentByFan.get(String(candidate.ownerFanId || "")) || null, settings, now);
+  if (!currentEligibility.eligible) {
+    return {
+      ok: false,
+      terminal: currentEligibility.retryable !== true,
+      status: "SKIPPED",
+      code: currentEligibility.code,
+      ...(currentEligibility.retryable === true ? { retryAt: new Date(now.getTime() + 30_000) } : {}),
+      ...(currentEligibility.refreshRequired === true ? {
+        refreshRequired: true,
+        refreshFanIds: candidate.ownerFanId ? [String(candidate.ownerFanId)] : [],
+        refreshFields: currentEligibility.refreshFields || [],
+        freshnessClass: currentEligibility.freshnessClass || null,
+      } : {}),
+    };
+  }
   const completedToday = await db.automationDelivery.count({
     where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: LIKES_MODULE_KEY, actionType: LIKE_POST_ACTION_TYPE, status: "COMPLETED", finishedAt: { gte: dayStart(now) }, id: { not: delivery.id } },
   });
@@ -536,9 +624,52 @@ async function prepareLikeRetry({ delivery, db = prisma }) {
   await updateLikeCandidateFromDelivery({ delivery, state: "QUEUED", status: "QUEUED", failureCode: null, db });
 }
 
+async function countCanonicalEligibleLikeCandidates({ agencyId, creatorId, settings, db = prisma }) {
+  const allowActive = settings?.activeSubscribers === true;
+  const allowExpired = settings?.expiredSubscribers === true;
+  const allowFree = settings?.freeSubscribers === true;
+  const allowPaid = settings?.paidSubscribers === true;
+  if (!allowActive && !allowExpired) return 0;
+  const rows = await db.$queryRawUnsafe(
+    `
+    SELECT COUNT(*)::bigint AS "count"
+    FROM "AutomationContentCandidate" c
+    JOIN "CreatorFanRelationshipCurrent" r
+      ON r."creatorId" = c."creatorId" AND r."onlyFansUserId" = c."ownerFanId"
+    WHERE c."agencyId" = $1
+      AND c."creatorId" = $2
+      AND c."contentType" = 'post'
+      AND c."state" IN ('ELIGIBLE', 'DISCOVERED')
+      AND r."observedAt" IS NOT NULL
+      AND CASE
+        WHEN r."fanSubscriptionActive" IS FALSE THEN $4
+        WHEN r."fanSubscriptionActive" IS TRUE THEN
+          $3 AND CASE
+            WHEN $5 AND $6 THEN true
+            WHEN $5 THEN lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%free%'
+            WHEN $6 THEN lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%paid%'
+              OR lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%active%'
+            ELSE false
+          END
+        ELSE
+          ($3 AND $4) AND CASE
+            WHEN $5 AND $6 THEN true
+            WHEN $5 THEN lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%free%'
+            WHEN $6 THEN lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%paid%'
+              OR lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%active%'
+            ELSE false
+          END
+      END
+    `,
+    agencyId, creatorId, allowActive, allowExpired, allowFree, allowPaid,
+  );
+  return Number(rows?.[0]?.count || 0);
+}
+
 async function listLikes({ agencyId, creatorId, search = "", state = null, offset = 0, limit = 100, db = prisma }) {
   await requireCreator(agencyId, creatorId, db);
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
+  const settings = normalizeLikesSettings(control.modules.likes.settings);
   const where = {
     agencyId, creatorId, contentType: "post",
     ...(state ? { state } : {}),
@@ -555,7 +686,7 @@ async function listLikes({ agencyId, creatorId, search = "", state = null, offse
     db.automationContentCandidate.count({ where }),
     Promise.all([
       db.automationContentCandidate.count({ where: { agencyId, creatorId, contentType: "post" } }),
-      db.automationContentCandidate.count({ where: { agencyId, creatorId, contentType: "post", state: "ELIGIBLE" } }),
+      countCanonicalEligibleLikeCandidates({ agencyId, creatorId, settings, db }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "QUEUED" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: "CLAIMED" } }),
       db.automationDelivery.count({ where: { agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, status: { in: ["RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] } } }),
@@ -567,15 +698,33 @@ async function listLikes({ agencyId, creatorId, search = "", state = null, offse
     sessionWriteWorkerCount({ agencyId, creatorId, db }),
     db.jobInstance.findFirst({ where: { agencyId, creatorId, jobKey: LIKES_DISCOVERY_JOB_KEY }, orderBy: { createdAt: "desc" }, select: { id: true, status: true, progress: true, lastError: true, createdAt: true, completedAt: true } }),
   ]);
+  const currentByFan = await readFanCurrentMap(db, {
+    agencyId,
+    creatorId,
+    fanIds: items.map((item) => item.ownerFanId).filter(Boolean),
+  });
+  const publicItems = items.map((item) => {
+    const current = currentByFan.get(String(item.ownerFanId || "")) || null;
+    const audience = evaluateLikesCurrent(current, settings, now);
+    const workflowEligible = item.state === "ELIGIBLE" || item.state === "DISCOVERED";
+    return {
+      ...item,
+      eligible: workflowEligible && audience.eligible === true,
+      currentEligibility: audience.code,
+      platformIdentity: current?.platformIdentity || null,
+      relationship: current?.relationship || null,
+      value: current?.value || null,
+    };
+  });
   return {
-    ok: true, creatorId, control, settings: control.modules.likes.settings,
+    ok: true, creatorId, control, settings,
     worker: { ready: worker > 0, readyDevices: worker },
     discovery: lastJob,
     metrics: {
       candidates: metrics[0], eligible: metrics[1], queued: metrics[2], claimed: metrics[3], running: metrics[4],
       likedToday: metrics[5], likedThisMonth: metrics[6], failed: metrics[7], skipped: metrics[8],
     },
-    items, count, offset, nextOffset: offset + items.length, hasMore: offset + items.length < count,
+    items: publicItems, count, offset, nextOffset: offset + publicItems.length, hasMore: offset + publicItems.length < count,
   };
 }
 
@@ -613,6 +762,7 @@ module.exports = {
   applyLikesDiscoveryCompletion,
   recordLikesDiscoveryFailure,
   planLikes,
+  scheduleLikesCurrentRefresh,
   ensureAutomaticLikes,
   validateLikeDelivery,
   finalizeLikeSuccess,

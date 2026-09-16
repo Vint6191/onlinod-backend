@@ -15,7 +15,11 @@ const {
 } = require("./automation-control-service");
 const { listActionDeliveries, retryActionDelivery } = require("./automation-action-delivery-service");
 const { evaluateCandidate } = require("./follow-back-rules");
-const { readFanCurrent } = require("./fan-data-authority-service");
+const { readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const {
+  readFanCurrentMap,
+  evaluateFollowBackCurrent,
+} = require("./fan-current-consumer-service");
 
 const FOLLOW_BACK_ACTION_TYPE = "FOLLOW_BACK";
 const ACTIVE_DELIVERY_STATUSES = [...ACTIVE_WRITE_WORKFLOW_STATUSES];
@@ -130,42 +134,6 @@ async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
 }
 
 
-function automaticEligibilityWhere(settings, now = new Date()) {
-  const and = [
-    { OR: [{ creatorFollowsFan: false }, { creatorFollowsFan: null }] },
-    { OR: [{ cooldownUntil: null }, { cooldownUntil: { lte: now } }] },
-  ];
-  if (settings.activeSubscribers && !settings.expiredSubscribers) {
-    and.push({ OR: [{ fanSubscriptionActive: true }, { fanSubscriptionActive: null }] });
-  } else if (!settings.activeSubscribers && settings.expiredSubscribers) {
-    and.push({ fanSubscriptionActive: false });
-  } else if (!settings.activeSubscribers && !settings.expiredSubscribers) {
-    and.push({ id: "__no_eligible_subscription_state__" });
-  }
-  if (!settings.expiredSubscribers) {
-    and.push({ OR: [{ fanSubscriptionType: null }, { NOT: { fanSubscriptionType: { contains: "expired", mode: "insensitive" } } }] });
-  }
-  if (!settings.freeSubscribers) {
-    and.push({ OR: [{ fanSubscriptionType: null }, { NOT: { fanSubscriptionType: { contains: "free", mode: "insensitive" } } }] });
-  }
-  if (!settings.paidSubscribers) {
-    and.push({ OR: [
-      { fanSubscriptionType: null },
-      { AND: [
-        { NOT: { fanSubscriptionType: { contains: "paid", mode: "insensitive" } } },
-        { NOT: { fanSubscriptionType: { contains: "active", mode: "insensitive" } } },
-      ] },
-    ] });
-  }
-  return {
-    blocked: false,
-    ignored: false,
-    state: { not: "STALE" },
-    generation: { lte: 1 },
-    AND: and,
-  };
-}
-
 async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = null, source = "manual", priority = 60 }) {
   await requireCreator(agencyId, creatorId, db);
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, db });
@@ -191,7 +159,13 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
     agencyId,
     creatorId,
     snapshotRunId: state.currentRunId,
-    ...(fanId ? { fanId } : automaticEligibilityWhere(settings)),
+    ...(fanId ? { fanId } : {
+      blocked: false,
+      ignored: false,
+      state: { not: "STALE" },
+      generation: { lte: 1 },
+      OR: [{ cooldownUntil: null }, { cooldownUntil: { lte: new Date() } }],
+    }),
   };
 
   const summary = {
@@ -205,6 +179,7 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
     workerCount: await sessionWriteWorkerCount({ agencyId, creatorId, db }),
   };
   const skip = (code) => { summary.skipped[code] = (summary.skipped[code] || 0) + 1; };
+  const refreshFanIds = new Set();
 
   let cursorId = null;
   let exhausted = false;
@@ -218,11 +193,18 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
     });
     if (!candidates.length) break;
     summary.scanned += candidates.length;
+    const currentByFan = await readFanCurrentMap(db, {
+      agencyId,
+      creatorId,
+      fanIds: candidates.map((candidate) => candidate.fanId),
+    });
 
     for (const candidate of candidates) {
-      const eligibility = evaluateCandidate(candidate, settings);
+      const current = currentByFan.get(String(candidate.fanId || "")) || null;
+      const eligibility = evaluateFollowBackCurrent(candidate, current, settings);
       if (!eligibility.eligible) {
         skip(eligibility.code);
+        if (eligibility.refreshRequired === true && candidate.fanId && refreshFanIds.size < 500) refreshFanIds.add(String(candidate.fanId));
         // The projection remains the source of discovery metadata. For broad
         // planning sweeps we expose the calculated skip code in the summary/UI
         // without issuing thousands of no-op row updates. Manual fan actions do
@@ -286,7 +268,7 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
               fanId: candidate.fanId,
               username: candidate.username,
               displayName: candidate.displayName,
-              subscriptionType: candidate.fanSubscriptionType,
+              subscriptionType: current?.relationship?.fanSubscriptionType ?? null,
               snapshotRunId: candidate.snapshotRunId,
               source,
             },
@@ -322,19 +304,64 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
     }
 
     cursorId = candidates[candidates.length - 1].id;
-    exhausted = fanId || candidates.length < batchSize;
+    exhausted = fanId || candidates.length < batchSize || refreshFanIds.size >= 500;
   }
-  return { ok: true, creatorId, source, summary };
+  return { ok: true, creatorId, source, summary, refreshFanIds: [...refreshFanIds].slice(0, 500) };
+}
+
+async function scheduleFollowBackCurrentRefresh({
+  agencyId,
+  creatorId,
+  fanIds = [],
+  priority = 60,
+  trigger = "planning",
+  refreshFields = [],
+  scheduleFanRefresh = scheduleFanDataPointRefresh,
+} = {}) {
+  const refreshFanIds = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
+  if (!refreshFanIds.length) return { fanIds: [], requested: 0, decision: null };
+  try {
+    const decision = await scheduleFanRefresh({
+      agencyId,
+      creatorId,
+      onlyFansUserIds: refreshFanIds,
+      reason: "follow_back_current_unknown",
+      priority: Math.max(85, Number(priority) || 60),
+      params: {
+        consumer: "follow_back",
+        trigger: clean(trigger, 80) || "planning",
+        ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
+      },
+    });
+    return { fanIds: refreshFanIds, requested: refreshFanIds.length, decision };
+  } catch (error) {
+    return {
+      fanIds: refreshFanIds,
+      requested: refreshFanIds.length,
+      decision: null,
+      error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
+    };
+  }
 }
 
 async function planFollowBack(input) {
   const db = input.db || prisma;
-  return withDbAdvisoryXactLock({
+  const result = await withDbAdvisoryXactLock({
     db,
     key: `follow_back_plan:${input.agencyId}:${input.creatorId}`,
     options: { timeout: 30_000 },
     work: (tx) => planFollowBackLocked({ ...input, db: tx }),
   });
+  const fanRefresh = await scheduleFollowBackCurrentRefresh({
+    agencyId: input.agencyId,
+    creatorId: input.creatorId,
+    fanIds: result.refreshFanIds,
+    priority: input.priority || 60,
+    trigger: "planning",
+    scheduleFanRefresh: input.scheduleFanRefresh || scheduleFanDataPointRefresh,
+  });
+  if (!fanRefresh.requested) return { ...result, refreshFanIds: [] };
+  return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
 async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurring_sweep" }) {
@@ -387,8 +414,8 @@ async function setCandidateState({ agencyId, creatorId, fanId, action }) {
       data: {
         blocked: false,
         ignored: false,
-        state: candidate.creatorFollowsFan ? "FOLLOWED" : "CANDIDATE",
-        eligibilityReason: candidate.creatorFollowsFan ? "already_followed" : (candidate.fanSubscriptionActive === false ? "expired_subscriber" : "active_subscriber"),
+        state: "CANDIDATE",
+        eligibilityReason: "restored",
       },
     });
     return { ok: true, candidate: updated };
@@ -428,38 +455,50 @@ async function setCandidateState({ agencyId, creatorId, fanId, action }) {
 }
 
 
-async function countEligibleCandidates({ agencyId, creatorId, settings, now = new Date() }) {
-  const rows = await prisma.$queryRawUnsafe(
+async function countEligibleCandidates({ agencyId, creatorId, settings, now = new Date(), db = prisma }) {
+  const rows = await db.$queryRawUnsafe(
     `
     SELECT COUNT(*)::bigint AS "count"
-    FROM "FollowBackCandidate"
-    WHERE "agencyId" = $1
-      AND "creatorId" = $2
-      AND "blocked" = false
-      AND "ignored" = false
-      AND "state" <> 'STALE'
-      AND ("cooldownUntil" IS NULL OR "cooldownUntil" <= $3)
-      AND COALESCE("subscribedByCreator", false) = false
-      AND COALESCE("generation", 1) <= 1
+    FROM "FollowBackCandidate" c
+    JOIN "CreatorFanRelationshipCurrent" r
+      ON r."creatorId" = c."creatorId" AND r."onlyFansUserId" = c."fanId"
+    WHERE c."agencyId" = $1
+      AND c."creatorId" = $2
+      AND c."blocked" = false
+      AND c."ignored" = false
+      AND c."state" <> 'STALE'
+      AND r."observedAt" IS NOT NULL
+      AND COALESCE(c."generation", 1) <= 1
+      AND (c."cooldownUntil" IS NULL OR c."cooldownUntil" <= $3)
+      AND COALESCE(r."creatorFollowsFan", false) = false
+      AND CASE WHEN r."fanSubscriptionActive" IS FALSE THEN $5 ELSE $4 END
       AND CASE
-        WHEN "isActive" IS FALSE THEN $5
-        ELSE $4
-      END
-      AND CASE
-        WHEN lower(COALESCE("subscriptionType", '')) LIKE '%expired%' THEN $5
-        WHEN lower(COALESCE("subscriptionType", '')) LIKE '%free%' THEN $6
-        WHEN lower(COALESCE("subscriptionType", '')) LIKE '%paid%'
-          OR lower(COALESCE("subscriptionType", '')) LIKE '%active%' THEN $7
+        WHEN lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%expired%' THEN $5
+        WHEN lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%free%' THEN $6
+        WHEN lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%paid%'
+          OR lower(COALESCE(r."fanSubscriptionType", '')) LIKE '%active%' THEN $7
         ELSE true
       END
     `,
-    agencyId,
-    creatorId,
-    now,
+    agencyId, creatorId, now,
     settings.activeSubscribers === true,
     settings.expiredSubscribers === true,
     settings.freeSubscribers === true,
     settings.paidSubscribers === true,
+  );
+  return Number(rows?.[0]?.count || 0);
+}
+
+async function countCanonicalAlreadyFollowed({ agencyId, creatorId, db = prisma }) {
+  const rows = await db.$queryRawUnsafe(
+    `
+    SELECT COUNT(*)::bigint AS "count"
+    FROM "FollowBackCandidate" c
+    JOIN "CreatorFanRelationshipCurrent" r
+      ON r."creatorId" = c."creatorId" AND r."onlyFansUserId" = c."fanId"
+    WHERE c."agencyId" = $1 AND c."creatorId" = $2 AND r."creatorFollowsFan" = true
+    `,
+    agencyId, creatorId,
   );
   return Number(rows?.[0]?.count || 0);
 }
@@ -503,8 +542,8 @@ async function listFollowBack({ agencyId, creatorId, search = "", state = null, 
       select: { updatedAt: true, status: true },
     }),
     prisma.followBackCandidate.count({ where: { agencyId, creatorId } }),
-    countEligibleCandidates({ agencyId, creatorId, settings, now }),
-    prisma.followBackCandidate.count({ where: { agencyId, creatorId, creatorFollowsFan: true } }),
+    countEligibleCandidates({ agencyId, creatorId, settings, now, db: prisma }),
+    countCanonicalAlreadyFollowed({ agencyId, creatorId, db: prisma }),
   ]);
   const statusCounts = Object.fromEntries(deliveriesByStatus.map((row) => [row.status, row._count._all]));
   const currentRows = await readFanCurrent(prisma, {
@@ -512,8 +551,8 @@ async function listFollowBack({ agencyId, creatorId, search = "", state = null, 
   });
   const currentByFan = new Map(currentRows.map((row) => [String(row.onlyFansUserId), row]));
   const publicItems = items.map((item) => {
-    const eligibility = evaluateCandidate(item, settings, now);
     const current = currentByFan.get(String(item.fanId || '')) || null;
+    const eligibility = evaluateFollowBackCurrent(item, current, settings, now);
     return {
       ...item,
       currentEligibility: eligibility.code,
@@ -526,10 +565,10 @@ async function listFollowBack({ agencyId, creatorId, search = "", state = null, 
       avatarUrl: current?.platformIdentity?.avatarUrl ?? item.avatarUrl ?? null,
       platformReportedTotalSpendCents: current?.value?.platformReportedTotalSpendCents ?? null,
       valueAvailability: current?.value?.availability ?? 'NOT_FETCHED',
-      // Compatibility aliases only; canonical relationship vocabulary lives on relationship/current fields.
-      subscriptionType: item.fanSubscriptionType ?? null,
-      isActive: item.fanSubscriptionActive ?? null,
-      subscribedByCreator: item.creatorFollowsFan ?? null,
+      // Compatibility aliases are derived from the canonical relationship at response time.
+      subscriptionType: current?.relationship?.fanSubscriptionType ?? null,
+      isActive: current?.relationship?.fanSubscriptionActive ?? null,
+      subscribedByCreator: current?.relationship?.creatorFollowsFan ?? null,
     };
   });
   return {
@@ -594,6 +633,7 @@ module.exports = {
   evaluateCandidate,
   refreshFollowBackProjection,
   planFollowBack,
+  scheduleFollowBackCurrentRefresh,
   ensureAutomaticFollowBack,
   setCandidateState,
   retryCandidateDelivery,

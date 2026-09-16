@@ -34,6 +34,21 @@ function idList(value, maxItems = 5_000) {
 function compact(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== null && item !== undefined));
 }
+function subscriptionRelationshipObservation(event) {
+  const explicit = object(event.relationship);
+  let fanSubscriptionType = clean(explicit.fanSubscriptionType, 100);
+  if (!fanSubscriptionType) {
+    if (event.isPaidSubscription === true || /paid/i.test(String(event.eventType || ""))) fanSubscriptionType = "paid";
+    else if (event.isFreeSubscription === true || /free/i.test(String(event.eventType || ""))) fanSubscriptionType = "free";
+  }
+  return compact({
+    // The event itself proves a current subscription edge. Keep this as typed
+    // relationship evidence rather than retaining any raw/private profile snapshot.
+    fanSubscribesToCreator: true,
+    fanSubscriptionActive: true,
+    fanSubscriptionType,
+  });
+}
 
 /**
  * Return the smallest server-safe event required by Automation.
@@ -78,6 +93,7 @@ function sanitizeAutomationRuntimeEvent(raw) {
     fanId,
     dialogId: clean(event.dialogId, 160) || fanId,
     createdAt: isoOrNull(event.createdAt || event.occurredAt || event.ts),
+    relationship: subscriptionRelationshipObservation(event),
   });
 }
 

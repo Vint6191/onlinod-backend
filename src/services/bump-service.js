@@ -4,6 +4,7 @@ const prisma = require("../prisma");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { projectFanObservationBatch, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { classifyProgrammaticCustomMediaProvenance } = require("./custom-content-delivery-service");
@@ -20,6 +21,10 @@ const {
   getAutomationControlSnapshot,
   requireCreator,
 } = require("./automation-control-service");
+const {
+  readFanCurrentMap,
+  validateBumpCurrentRelationship,
+} = require("./fan-current-consumer-service");
 
 const ACTIVE_ACTION_STATUSES = [...ACTIVE_WRITE_WORKFLOW_STATUSES];
 const SEND_ACTION = "SEND_MESSAGE";
@@ -27,6 +32,29 @@ const DELETE_ACTION = "DELETE_MESSAGE";
 const SOURCE_KEYS = new Set(["online", "hidden_online", "paid_subscriber", "free_subscriber", "subscription_event", "manual"]);
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
+const BUMP_PRIVATE_RELATIONSHIP_KEYS = new Set([
+  "subscriptionType", "isActive", "canReceiveChatMessage", "fanSubscribesToCreator",
+  "fanSubscriptionActive", "fanSubscriptionType", "fanSubscriptionExpiresAt",
+  "creatorFollowsFan", "creatorFollowExpiresAt", "subscribedOn", "subscribedBy",
+  "subscribedByCreator", "blocked", "restricted", "performer", "subscribePriceCents",
+]);
+function stripPrivateRelationshipMetadata(value) {
+  const input = object(value);
+  const output = {};
+  for (const [key, item] of Object.entries(input)) {
+    if (BUMP_PRIVATE_RELATIONSHIP_KEYS.has(key)) continue;
+    if (key === "fan") {
+      const fan = {};
+      for (const [fanKey, fanValue] of Object.entries(object(item))) {
+        if (!BUMP_PRIVATE_RELATIONSHIP_KEYS.has(fanKey)) fan[fanKey] = fanValue;
+      }
+      if (Object.keys(fan).length) output.fan = fan;
+      continue;
+    }
+    output[key] = item;
+  }
+  return output;
+}
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
 function int(value, fallback, min, max) { const n = Number(value); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback; }
 function date(value) { const d = value instanceof Date ? value : new Date(value || 0); return Number.isFinite(d.getTime()) ? d : null; }
@@ -161,9 +189,11 @@ async function loadCandidates({ agencyId, creatorId, source, fanIds = [], limit 
         dialogId: row.dialogId || clean(metadata.dialogId, 160) || row.fanId,
         username: clean(fan.username || fan.userName || metadata.username, 160),
         displayName: clean(fan.name || fan.displayName || metadata.displayName, 200),
-        subscriptionType: clean(fan.subscriptionType || metadata.subscriptionType, 80),
-        isActive: typeof fan.isActive === "boolean" ? fan.isActive : (typeof metadata.isActive === "boolean" ? metadata.isActive : null),
-        canReceiveChatMessage: typeof fan.canReceiveChatMessage === "boolean" ? fan.canReceiveChatMessage : metadata.canReceiveChatMessage !== false,
+        // Relationship-looking metadata is historical trigger evidence only.
+        // Current relationship fields are overlaid exclusively from FanDataAuthority.
+        subscriptionType: null,
+        isActive: null,
+        canReceiveChatMessage: null,
         snapshotRunId: null,
         observedAt: row.lastOnlineAt || row.updatedAt,
         metadata,
@@ -192,11 +222,46 @@ async function loadCandidates({ agencyId, creatorId, source, fanIds = [], limit 
 }
 
 
+async function scheduleBumpCurrentRefresh({
+  agencyId,
+  creatorId,
+  fanIds = [],
+  priority = 60,
+  trigger = "planning",
+  refreshFields = [],
+  scheduleFanRefresh = scheduleFanDataPointRefresh,
+} = {}) {
+  const refreshFanIds = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
+  if (!refreshFanIds.length) return { fanIds: [], requested: 0, decision: null };
+  try {
+    const decision = await scheduleFanRefresh({
+      agencyId,
+      creatorId,
+      onlyFansUserIds: refreshFanIds,
+      reason: "bump_current_unknown",
+      priority: Math.max(85, Number(priority) || 60),
+      params: {
+        consumer: "bumps",
+        trigger: clean(trigger, 80) || "planning",
+        ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
+      },
+    });
+    return { fanIds: refreshFanIds, requested: refreshFanIds.length, decision };
+  } catch (error) {
+    return {
+      fanIds: refreshFanIds,
+      requested: refreshFanIds.length,
+      decision: null,
+      error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
+    };
+  }
+}
 
-async function planBumps({ agencyId, creatorId, userId = null, source = "manual", fanIds = [], limit = null, manual = false, db = prisma }) {
+
+async function planBumps({ agencyId, creatorId, userId = null, source = "manual", fanIds = [], limit = null, manual = false, db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
   const normalizedSource = sourceKey(source);
   await requireCreator(agencyId, creatorId, db);
-  return withDbAdvisoryXactLock({ db, key: `p11:bumps:${agencyId}:${creatorId}`, work: async (tx) => {
+  const result = await withDbAdvisoryXactLock({ db, key: `p11:bumps:${agencyId}:${creatorId}`, work: async (tx) => {
     const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, db: tx });
     const settings = control.modules.bumps.settings;
     const sourceEnabled = normalizedSource === "online" ? settings.onlineEnabled
@@ -221,6 +286,11 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
     };
     const candidates = await loadCandidates({ agencyId, creatorId, source: normalizedSource, fanIds, limit: take, db: tx });
     if (!candidates.length) return { ok: true, source: normalizedSource, planned: 0, skipped: [{ code: "no_candidates" }] };
+    const currentByFan = await readFanCurrentMap(tx, {
+      agencyId,
+      creatorId,
+      fanIds: candidates.map((candidate) => candidate.fanId),
+    });
 
     const reservedToday = await tx.automationDelivery.count({
       where: {
@@ -238,11 +308,24 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
     });
     const planned = [];
     const skipped = [];
+    const refreshFanIds = new Set();
+    const refreshFields = new Set();
 
     for (const candidate of candidates) {
       if (remaining <= 0) { skipped.push({ fanId: candidate.fanId, code: "daily_limit" }); continue; }
+      const current = currentByFan.get(String(candidate.fanId || "")) || null;
+      const currentDecision = validateBumpCurrentRelationship({ candidate, current, source: normalizedSource, now: new Date() });
+      if (!currentDecision.ok) {
+        skipped.push({ fanId: candidate.fanId, code: currentDecision.code });
+        if (currentDecision.refreshRequired === true && candidate.fanId) {
+          refreshFanIds.add(String(candidate.fanId));
+          for (const field of currentDecision.refreshFields || []) refreshFields.add(String(field));
+        }
+        continue;
+      }
+      const canonicalCandidate = currentDecision.candidate;
       const fanState = await tx.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId, fanId: candidate.fanId } } });
-      const skip = eligibility({ candidate, fanState, settings, source: normalizedSource, now: new Date() });
+      const skip = eligibility({ candidate: canonicalCandidate, fanState, settings, source: normalizedSource, now: new Date() });
       if (skip) { skipped.push({ fanId: candidate.fanId, code: skip }); continue; }
       const active = await tx.automationDelivery.findFirst({
         where: { agencyId, creatorId, moduleKey: BUMPS_MODULE_KEY, actionType: SEND_ACTION, targetId: candidate.fanId, status: { in: ACTIVE_ACTION_STATUSES } },
@@ -272,7 +355,7 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
           dialogId: candidate.dialogId,
           username: candidate.username || null,
           displayName: candidate.displayName || null,
-          subscriptionType: candidate.subscriptionType || null,
+          subscriptionType: canonicalCandidate.subscriptionType || null,
         },
         template,
         timing,
@@ -313,11 +396,31 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
         else throw error;
       }
     }
-    return { ok: true, source: normalizedSource, planned: planned.length, items: planned, skipped, dailyRemaining: remaining };
+    return {
+      ok: true,
+      source: normalizedSource,
+      planned: planned.length,
+      items: planned,
+      skipped,
+      dailyRemaining: remaining,
+      refreshFanIds: [...refreshFanIds].slice(0, 500),
+      refreshFields: [...refreshFields],
+    };
   }, options: { timeout: 30_000 } });
+  const fanRefresh = await scheduleBumpCurrentRefresh({
+    agencyId,
+    creatorId,
+    fanIds: result.refreshFanIds,
+    priority: sourcePriority(normalizedSource, manual),
+    trigger: "planning",
+    refreshFields: result.refreshFields || [],
+    scheduleFanRefresh,
+  });
+  if (!fanRefresh.requested) return { ...result, refreshFanIds: [], refreshFields: [] };
+  return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
-async function recordDetailedObservations({ agencyId, creatorId, observations, db = prisma }) {
+async function recordDetailedObservations({ agencyId, creatorId, observations, sourceDeviceId = null, db = prisma }) {
   await requireCreator(agencyId, creatorId, db);
   const byFan = new Map();
   for (const raw of Array.isArray(observations) ? observations : []) {
@@ -329,14 +432,38 @@ async function recordDetailedObservations({ agencyId, creatorId, observations, d
       byFan.set(fanId, {
         fanId,
         observedAt,
-        metadata: object(raw?.metadata),
+        metadata: stripPrivateRelationshipMetadata(raw?.metadata),
         dialogId: clean(raw?.dialogId, 160),
+        fanObservation: object(raw?.fanObservation),
       });
     }
     if (byFan.size >= 5000) break;
   }
   const rows = [...byFan.values()];
   const ids = rows.map((row) => row.fanId);
+
+  // Strong runtime evidence converges back into the canonical authority first.
+  // AutomationBumpFanState remains workflow/trigger state and never owns current
+  // fan relationship truth.
+  const authorityItems = rows
+    .map((row) => {
+      const observation = object(row.fanObservation);
+      const identity = object(observation.identity);
+      const relationship = object(observation.relationship);
+      const value = object(observation.value);
+      if (!Object.keys(identity).length && !Object.keys(relationship).length && !Object.keys(value).length) return null;
+      return {
+        onlyFansUserId: row.fanId,
+        ...(Object.keys(identity).length ? { identity } : {}),
+        ...(Object.keys(relationship).length ? { relationship } : {}),
+        ...(Object.keys(value).length ? { value } : {}),
+      };
+    })
+    .filter(Boolean);
+  if (authorityItems.length) {
+    await projectFanObservationBatch(db, { agencyId, creatorId, sourceDeviceId: clean(sourceDeviceId, 180), items: authorityItems });
+  }
+
   const existingRows = ids.length ? await db.automationBumpFanState.findMany({
     where: { agencyId, creatorId, fanId: { in: ids } },
     select: { fanId: true, dialogId: true, metadata: true },
@@ -344,8 +471,8 @@ async function recordDetailedObservations({ agencyId, creatorId, observations, d
   const existingByFan = new Map(existingRows.map((row) => [row.fanId, row]));
   for (const row of rows) {
     const existing = existingByFan.get(row.fanId);
-    const previous = object(existing?.metadata);
-    const incoming = row.metadata;
+    const previous = stripPrivateRelationshipMetadata(existing?.metadata);
+    const incoming = stripPrivateRelationshipMetadata(row.metadata);
     const mergedFan = { ...object(previous.fan), ...object(incoming.fan) };
     const mergedMetadata = {
       ...previous,
@@ -359,15 +486,24 @@ async function recordDetailedObservations({ agencyId, creatorId, observations, d
       update: { dialogId, lastOnlineAt: row.observedAt, metadata: mergedMetadata },
     });
   }
-  return { ok: true, count: rows.length, fanIds: ids };
+  return { ok: true, count: rows.length, fanIds: ids, authorityProjected: authorityItems.length };
 }
 
-async function recordOnlineObservations({ agencyId, creatorId, fanIds, observedAt = new Date(), metadata = {}, db = prisma }) {
+async function recordOnlineObservations({ agencyId, creatorId, fanIds, observedAt = new Date(), metadata = {}, sourceDeviceId = null, db = prisma }) {
   const ids = [...new Set((Array.isArray(fanIds) ? fanIds : []).map((x) => clean(x, 160)).filter(Boolean))].slice(0, 5000);
+  const at = date(observedAt) || new Date();
   return recordDetailedObservations({
     agencyId,
     creatorId,
-    observations: ids.map((fanId) => ({ fanId, observedAt, metadata })),
+    observations: ids.map((fanId) => ({
+      fanId,
+      observedAt: at,
+      metadata,
+      // Presence is temporal activity evidence only; it must not manufacture
+      // identity or subscription relationship facts.
+      fanObservation: { identity: { observedAt: at, activityObservedAt: at, source: "PRESENCE_HINT" } },
+    })),
+    sourceDeviceId,
     db,
   });
 }
@@ -405,6 +541,33 @@ async function validateBumpDelivery({ delivery, control = null, now = new Date()
     if (state?.pendingMessageId && state.pendingDeliveryId !== delivery.id) return { ok: false, terminal: true, status: "SKIPPED", code: "pending_reply" };
     if (state?.cooldownUntil && state.cooldownUntil > now) return { ok: false, terminal: false, code: "fan_cooldown", retryAt: state.cooldownUntil };
     const source = sourceKey(payload.source);
+    const currentByFan = await readFanCurrentMap(db, {
+      agencyId: delivery.agencyId,
+      creatorId: delivery.creatorId,
+      fanIds: [delivery.fanId || delivery.targetId],
+    });
+    const currentDecision = validateBumpCurrentRelationship({
+      candidate: { fanId: delivery.fanId || delivery.targetId, dialogId: delivery.dialogId },
+      current: currentByFan.get(String(delivery.fanId || delivery.targetId || "")) || null,
+      source,
+      now,
+    });
+    if (!currentDecision.ok) {
+      if (currentDecision.refreshRequired === true) {
+        return {
+          ok: false,
+          terminal: false,
+          status: "SKIPPED",
+          code: currentDecision.code,
+          retryAt: new Date(now.getTime() + 30_000),
+          refreshRequired: true,
+          refreshFanIds: [String(delivery.fanId || delivery.targetId || "")].filter(Boolean),
+          refreshFields: currentDecision.refreshFields || [],
+          freshnessClass: currentDecision.freshnessClass || null,
+        };
+      }
+      return { ok: false, terminal: currentDecision.terminal !== false, status: "SKIPPED", code: currentDecision.code };
+    }
     if (source === "online") {
       const observed = state?.lastOnlineAt;
       if (!observed || observed.getTime() < now.getTime() - snapshot.modules.bumps.settings.onlineObservationTtlMs) {
@@ -733,7 +896,7 @@ async function triggerPendingReplyScan({ agencyId, creatorId, limit = 100, db = 
   return { ok: true, scheduled: changed.count, at: now };
 }
 
-async function processRuntimeEvents({ agencyId, creatorId, events = [], userId = null, db = prisma, commitFence = null }) {
+async function processRuntimeEvents({ agencyId, creatorId, events = [], userId = null, sourceDeviceId = null, db = prisma, commitFence = null }) {
   const rows = Array.isArray(events) ? events.slice(0, 500) : [];
   const summary = { ok: true, received: rows.length, onlineObserved: 0, replies: 0, planned: 0, ignored: 0, errors: [] };
   const onlineIds = new Set();
@@ -772,6 +935,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
         fanIds: [...onlineIds],
         observedAt: onlineObservedAt || new Date(),
         metadata: { source: "ws" },
+        sourceDeviceId,
         db: commitDb,
       }));
       summary.onlineObserved += Number(observed?.count || 0);
@@ -816,17 +980,27 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
 
   if (subscriptionByFan.size) {
     try {
-      const observations = [...subscriptionByFan.entries()].map(([fanId, event]) => ({
-        fanId,
-        dialogId: clean(event.dialogId, 160) || fanId,
-        observedAt: date(event.createdAt || event.occurredAt || event.ts) || new Date(),
-        metadata: {
-          source: clean(event.source, 80) || "subscription_event",
+      const observations = [...subscriptionByFan.entries()].map(([fanId, event]) => {
+        const observedAt = date(event.createdAt || event.occurredAt || event.ts) || new Date();
+        const relationship = object(event.relationship);
+        return {
+          fanId,
           dialogId: clean(event.dialogId, 160) || fanId,
-          fan: object(event.fanSnapshot),
-        },
-      }));
-      const observed = await runCommit((commitDb) => recordDetailedObservations({ agencyId, creatorId, observations, db: commitDb }));
+          observedAt,
+          metadata: {
+            source: clean(event.source, 80) || "subscription_event",
+            dialogId: clean(event.dialogId, 160) || fanId,
+          },
+          fanObservation: {
+            relationship: {
+              ...relationship,
+              observedAt,
+              source: "LIVE_NOTIFICATION",
+            },
+          },
+        };
+      });
+      const observed = await runCommit((commitDb) => recordDetailedObservations({ agencyId, creatorId, observations, sourceDeviceId, db: commitDb }));
       const plannedCount = await runCommit(async (commitDb) => {
         const control = await getAutomationControlSnapshot({ agencyId, creatorId, db: commitDb });
         if (!control.effective.bumpsEnabled || !control.modules.bumps.settings.automatic || !control.modules.bumps.settings.subscriptionEventsEnabled) return 0;
@@ -977,6 +1151,7 @@ module.exports = {
   DELETE_ACTION,
   ACTIVE_ACTION_STATUSES,
   planBumps,
+  scheduleBumpCurrentRefresh,
   activeTemplates,
   planConfiguredBumpsNow,
   summarizePlanningSkips,

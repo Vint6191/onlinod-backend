@@ -387,12 +387,14 @@ test("Subscriber Directory production bulk path carries the same per-field autho
   assert.doesNotMatch(serializedRows, /"canReceiveChatMessage":null/);
 });
 
-test("presence is temporal-only and cannot write canonical identity or value", () => {
-  const presence = read("src/services/presence-service.js");
-  assert.doesNotMatch(presence, /projectFanIdentity/);
-  assert.doesNotMatch(presence, /projectFanValue/);
-  assert.doesNotMatch(presence, /PRESENCE_HINT/);
-  assert.doesNotMatch(presence, /<\s*1000[^\n]*\*\s*100/);
+test("presence legacy fan-authority generation remains physically absent", () => {
+  const legacy = path.join(ROOT, "src/services/presence-service.js");
+  assert.equal(fs.existsSync(legacy), false, "deleted presence-service.js must not return as a fan-current authority");
+  const production = [
+    read("src/server.js"),
+    read("src/route-manifest.js"),
+  ].join("\n");
+  assert.doesNotMatch(production, /presence-service/);
 });
 
 test("Team pending identity comes only from canonical CreatorFan, not Follow candidates", () => {

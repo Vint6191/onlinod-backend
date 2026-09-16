@@ -774,6 +774,14 @@ async function listHiddenOnline({
         : null,
       platformReportedTotalSpendCents: current?.value?.platformReportedTotalSpendCents ?? null,
       valueAvailability: current?.value?.availability ?? 'NOT_FETCHED',
+      // Legacy flat aliases are response-time derivations of canonical current.
+      // lastSeenIsNull remains immutable snapshot/cohort evidence.
+      canReceiveChatMessage: current?.relationship?.canReceiveChatMessage ?? null,
+      isActive: current?.relationship?.fanSubscriptionActive ?? null,
+      subscribedOn: current?.relationship?.fanSubscribesToCreator ?? null,
+      subscribedBy: current?.relationship?.creatorFollowsFan ?? null,
+      subscriptionType: current?.relationship?.fanSubscriptionType ?? null,
+      lastSeenAt: current?.relationship?.lastSeenAt ?? null,
       metadata: object(item.metadata),
     };
   });

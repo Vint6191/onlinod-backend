@@ -3,7 +3,7 @@
 const express = require("express");
 const prisma = require("../prisma");
 const { requireProductCreator } = require("../middleware/product-access");
-const { readFanCurrent, scheduleFanDataPointRefresh, onlyFansUserId } = require("../services/fan-data-authority-service");
+const { readFanCurrent, scheduleFanDataPointRefresh, onlyFansUserId, projectFanObservationBatch } = require("../services/fan-data-authority-service");
 
 const router = express.Router();
 
@@ -22,6 +22,24 @@ router.post("/current", async (req, res) => {
   } catch (error) {
     console.error("[fan-data/current] failed:", error);
     return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "FAN_DATA_CURRENT_FAILED", error: error?.message || "Fan data read failed" });
+  }
+});
+
+router.post("/observations", async (req, res) => {
+  try {
+    const creatorId = clean(req.body?.creatorId);
+    const creator = await requireProductCreator(req, creatorId);
+    const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 100) : [];
+    const result = await projectFanObservationBatch(prisma, {
+      agencyId: creator.agencyId,
+      creatorId: creator.id,
+      sourceDeviceId: clean(req.auth?.deviceId),
+      items,
+    });
+    return res.json({ ok: true, creatorId: creator.id, ...result });
+  } catch (error) {
+    console.error("[fan-data/observations] failed:", error);
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "FAN_DATA_OBSERVATION_INGEST_FAILED", error: error?.message || "Fan observation ingest failed" });
   }
 });
 

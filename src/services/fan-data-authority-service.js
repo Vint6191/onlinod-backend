@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 
 const IDENTITY_SOURCE_PRIORITY = Object.freeze({
+  AUTOMATION_WRITE_RESULT: 900,
   USER_PROFILE: 700,
   SUBSCRIBER_DIRECTORY: 600,
   LIVE_MESSAGE: 500,
