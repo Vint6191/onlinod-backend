@@ -32,7 +32,7 @@ test("Actual60 F60-SCALE-1: authRequired live lineage proof has exact current-st
   assert.match(block, /agencyId:\s*decoded\.agencyId/);
   assert.match(block, /deviceId:\s*boundDeviceId/);
   assert.match(block, /revokedAt:\s*null/);
-  assert.match(block, /expiresAt:\s*\{\s*gt:\s*new Date\(\)\s*\}/);
+  assert.match(block, /expiresAt:\s*\{\s*gt:\s*authorizationNow\s*\}/);
   assert.match(block, /authorizationSessionId/);
   assert.match(block, /take:\s*1/);
 });
@@ -128,7 +128,7 @@ test("Actual60 F60-SCALE-1: current-session mutation paths ignore expired-unrevo
   const loginStart = auth.indexOf("async function issueLoginTokens");
   const loginEnd = auth.indexOf("async function verifyEmailByToken", loginStart);
   const login = auth.slice(loginStart, loginEnd);
-  assert.match(login, /deviceId:\s*boundDeviceId[\s\S]*revokedAt:\s*null[\s\S]*expiresAt:\s*\{\s*gt:\s*new Date\(\)\s*\}/);
+  assert.match(login, /deviceId:\s*boundDeviceId[\s\S]*revokedAt:\s*null[\s\S]*expiresAt:\s*\{\s*gt:\s*publicationNow\s*\}/);
 
   const reuseStart = auth.indexOf("async function revokeRefreshReuseScope");
   const reuseEnd = auth.indexOf("async function refreshAccessToken", reuseStart);

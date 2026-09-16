@@ -55,6 +55,9 @@ function prismaFor(session, { collision = null, authorityRow = undefined, locked
   const raw = async (sql, ...params) => {
     const text = String(sql);
     calls.push(["raw", { sql: text, params }]);
+    if (/clock_timestamp\(\) AS "authorityNow"/i.test(text)) {
+      return [{ authorityNow: new Date() }];
+    }
     if (/FROM "AgencyMember" m/i.test(text) && /FOR SHARE OF m,u,a/i.test(text)) {
       if (authorityRow === null) return [];
       return [authorityRow || { memberId: "member-1", accessEpoch: 1, memberDeletedAt: null, memberDeactivatedAt: null, userDisabledAt: null, passwordHash: "pw-hash", agencyDeletedAt: null }];
@@ -272,7 +275,8 @@ test("legacy adoption serializes both the device replacement and the globally un
   });
   assert.equal(result.ok, true);
   const locks = calls.filter(([kind]) => kind === "exec").map(([, args]) => args.params[0]);
-  assert.deepEqual(locks.slice(0, 3), [
+  assert.deepEqual(locks.slice(0, 4), [
+    "actual60:release-activation:AUTHORIZATION_HISTORY_PURGE",
     "authorization-user:user-1",
     "authorization-device:user-1:agency-1:device-a",
     "authorization-lineage:desktop-scope-A",

@@ -14,11 +14,13 @@ const CRITICAL_FILES = [
   "prisma/migrations/20260916013000_actual60_refreshsession_live_user_scale/migration.sql",
   "prisma/migrations/20260916014500_actual60_refreshsession_current_write_history_scale/migration.sql",
   "prisma/migrations/20260916034500_actual60_int60_8_authorization_boundary_destructive_fence/migration.sql",
+  "prisma/migrations/20260916050000_actual60_int60_10_auth_history_rollout_fence/migration.sql",
   "scripts/audit/actual59-auth-lifecycle-gate.js",
   "scripts/audit/actual60-runtime-evidence.js",
   "scripts/audit/actual60-runtime-evidence-verify.js",
   "scripts/audit/actual60-postgres-fingerprint.js",
   "scripts/audit/actual60-migration-rehearsal.js",
+  "scripts/maintenance/actual60-auth-history-purge-activation.js",
   "scripts/database/actual60-refreshsession-online-index-preflight.js",
   "src/middleware/auth.js",
   "src/routes/auth.js",
@@ -28,6 +30,7 @@ const CRITICAL_FILES = [
   "src/services/job-scheduler.js",
   "src/services/phase2-destructive-delete-authority-service.js",
   "src/services/authorization-session-authority-service.js",
+  "src/services/actual60-authorization-history-rollout-service.js",
   "src/services/settings-service.js",
   "src/services/team-administration-service.js",
   "src/services/telemetry-ingest-service.js",
@@ -50,9 +53,11 @@ const CRITICAL_FILES = [
   "src/services/actual60-int60-5-refreshsession-mutation-antimap.test.js",
   "src/services/actual60-int60-6-runtime-closure-integrity.test.js",
   "src/services/actual60-int60-8-refreshsession-retention.test.js",
+  "src/services/actual60-int60-10-rolling-time-authority.test.js",
   "src/services/phase2-actual55-root-e-closure.test.js",
   "src/services/auth-device-session-isolation-v20-21.test.js",
   "src/services/actual59-team-authorization-generation-postgres.integration.test.js",
+  "src/services/actual60-int60-10-rollout-postgres.integration.test.js",
   "src/services/actual59-int59-4f-telemetry-scale-postgres.integration.test.js",
   "src/services/actual60-refreshsession-scale-postgres.integration.test.js",
   "src/services/actual60-int60-8-refreshsession-retention-postgres.integration.test.js",
@@ -141,7 +146,7 @@ function validateClosureReceipt(receipt, { currentSource = false } = {}) {
     const gate = byLabel.get(label);
     if (!gate) { errors.push(`missing required gate ${label}`); continue; }
     if (gate.exitCode !== 0) errors.push(`${label} exitCode=${gate.exitCode}`);
-    if (["source-freeze-candidate", "postgres-forced-interleavings", "postgres-telemetry-scale", "postgres-refreshsession-hot-cold-scale"].includes(label)) {
+    if (["source-freeze-candidate", "postgres-forced-interleavings", "postgres-telemetry-scale", "postgres-refreshsession-hot-cold-scale", "postgres-refreshsession-retention"].includes(label)) {
       const tap = gate.tap;
       if (!tap) { errors.push(`${label} TAP summary missing`); continue; }
       if (tap.fail !== 0) errors.push(`${label} fail=${tap.fail}`);
@@ -152,7 +157,7 @@ function validateClosureReceipt(receipt, { currentSource = false } = {}) {
   const sourceTests = byLabel.get("source-freeze-candidate")?.tap?.tests;
   if (!Number.isInteger(sourceTests) || sourceTests < 128) errors.push(`source-freeze-candidate tests=${sourceTests}, expected at least 128`);
   const exactTapCounts = {
-    "postgres-forced-interleavings": 10,
+    "postgres-forced-interleavings": 13,
     "postgres-telemetry-scale": 3,
     "postgres-refreshsession-hot-cold-scale": 1,
     "postgres-refreshsession-retention": 2,

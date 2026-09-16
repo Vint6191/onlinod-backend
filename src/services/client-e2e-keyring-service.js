@@ -5,6 +5,7 @@ const { isOwner } = require("./team-access-control");
 const { assignedCreatorIds, hasBroadCreatorAccess, canAccessCreator, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { readCurrentDesktopMemberAuthority } = require("./desktop-current-access-authority-service");
 const { acquireAuthorizationUserLock } = require("./authorization-session-authority-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const DEVICE_KEY_ALGORITHM = "x25519-spki-der-v1";
 const WRAP_ALGORITHM = "x25519-hkdf-sha256-aes-256-gcm-v1";
@@ -1760,7 +1761,7 @@ async function retireCurrentDeviceIdentity({ db, agencyId, userId, deviceId }) {
       .filter(Boolean))).sort();
     const targetHadOwnerRoot = Boolean(root && activeOwnerWraps.some((row) => Number(row.rootVersion || 0) === Number(root.version || 0)));
     const idempotent = identity.status === "REVOKED";
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
 
     if (!idempotent) {
       await tx.deviceCryptoIdentity.update({

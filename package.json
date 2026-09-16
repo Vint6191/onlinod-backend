@@ -26,7 +26,8 @@
     "audit:phase2-coverage-preflight": "node scripts/audit/phase2-coverage-preflight-readonly.js",
     "phase2:team-control-plane": "node scripts/maintenance/phase2-team-control-plane-activation.js",
     "audit:auth-lifecycle": "node scripts/audit/actual59-auth-lifecycle-gate.js",
-    "audit:auth-runtime-verify": "node scripts/audit/actual60-runtime-evidence-verify.js"
+    "audit:auth-runtime-verify": "node scripts/audit/actual60-runtime-evidence-verify.js",
+    "maintenance:auth-history-purge": "node scripts/maintenance/actual60-auth-history-purge-activation.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

@@ -8,6 +8,7 @@ const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = requi
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const {
   assertOperationalOwnerRemovalSafety,
   assertUserDisableOwnerSafety,
@@ -796,8 +797,9 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
   }
   if (status === "deactivated") await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
 
-  const deactivatedAt = status === "deactivated" ? new Date() : null;
+  let deactivatedAt = null;
   const statusMutation = await serializableTeamTransaction(db, async (tx) => {
+    deactivatedAt = status === "deactivated" ? await dbAuthorityNow({ db: tx, fallbackNow: new Date() }) : null;
     await lockTeamControlPlaneTopology({ tx, agencyId });
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
@@ -863,8 +865,9 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
     await assertOwnerSafety({ agencyId, targetMember: target, nextRoleKey: null, removing: true, db });
   }
 
-  const deletedAt = new Date();
+  let deletedAt = null;
   const removalMutation = await serializableTeamTransaction(db, async (tx) => {
+    deletedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     await lockTeamControlPlaneTopology({ tx, agencyId });
 
     let liveActor = null;

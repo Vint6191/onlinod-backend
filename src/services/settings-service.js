@@ -150,7 +150,7 @@ function accountDevicesFromSessions({ sessions, workerDevices, currentDeviceId }
 
 async function getAccountSettings({ userId, currentDeviceId = null, db = null }) {
   const client = db || prisma;
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: client, fallbackNow: new Date() });
   const [user, sessions, workerDevices] = await Promise.all([
     client.user.findUnique({ where: { id: userId } }),
     client.refreshSession.findMany({
@@ -217,10 +217,10 @@ async function changeAccountPassword({ agencyId, userId, currentPassword, newPas
     throw err;
   }
   const passwordHash = await bcrypt.hash(next, 12);
-  const now = new Date();
   const deviceId = clean(currentDeviceId, 160);
   await client.$transaction(async (tx) => {
     await acquireAuthorizationUserLock(tx, { userId });
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     await tx.user.update({ where: { id: userId }, data: { passwordHash } });
     await tx.refreshSession.updateMany({
       where: {
@@ -256,17 +256,15 @@ async function logoutAccountDevice({ agencyId, userId, targetDeviceId, currentDe
     err.code = "SETTINGS_DEVICE_REQUIRED";
     throw err;
   }
-  const now = new Date();
-  const result = await withAuthorizationUserLock({ db: client, userId, work: async (tx) => tx.refreshSession.updateMany({
-    // Account-level device logout is intentionally not scoped to the current
-    // agency. It signs this user's logical device out everywhere without
-    // touching another user, WorkerDevice telemetry, creator bindings or any
-    // E2E crypto identity/wrap state. The user advisory fence composes with
-    // login/refresh publication so a same-user rotation cannot appear behind
-    // this revoke statement's snapshot and survive a physically later logout.
-    where: { userId, deviceId: target, revokedAt: null, expiresAt: { gt: now } },
-    data: { revokedAt: now },
-  }) });
+  const result = await withAuthorizationUserLock({ db: client, userId, work: async (tx) => {
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+    return tx.refreshSession.updateMany({
+      // Account-level device logout is intentionally not scoped to the current
+      // agency. PostgreSQL time is the cross-replica liveness authority.
+      where: { userId, deviceId: target, revokedAt: null, expiresAt: { gt: now } },
+      data: { revokedAt: now },
+    });
+  } });
   if (!result.count) {
     const err = new Error("Device has no active account session");
     err.code = "SETTINGS_DEVICE_NOT_ACTIVE";
@@ -295,8 +293,8 @@ async function logoutOtherAccountDevices({ agencyId, userId, currentDeviceId, db
     err.code = "SETTINGS_CURRENT_DEVICE_REQUIRED";
     throw err;
   }
-  const now = new Date();
   const mutation = await withAuthorizationUserLock({ db: client, userId, work: async (tx) => {
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const active = await tx.refreshSession.findMany({
       where: { userId, revokedAt: null, expiresAt: { gt: now }, OR: [{ deviceId: { not: current } }, { deviceId: null }] },
       select: { deviceId: true },

@@ -4,6 +4,8 @@ const { randomToken, randomCode, sha256, addMinutes, addDays } = require("../uti
 const { signAccessToken, refreshTokenDays } = require("../utils/tokens");
 const { resolveRefreshDeviceBinding } = require("../utils/device-binding");
 const { verificationEmail, passwordResetEmail } = require("./email-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { authorizeAuthorizationHistoryPublisher } = require("./actual60-authorization-history-rollout-service");
 const {
   acquireAuthorizationUserLock,
   acquireAuthorizationDeviceLock,
@@ -165,7 +167,8 @@ async function createRefreshSession({
   db = prisma,
 }) {
   const refreshToken = randomToken(48);
-  const expiresAt = addDays(refreshDaysForRememberDevice(rememberDevice));
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  const expiresAt = new Date(authorityNow.getTime() + refreshDaysForRememberDevice(rememberDevice) * 24 * 60 * 60 * 1000);
 
   const row = await db.refreshSession.create({
     data: {
@@ -197,6 +200,7 @@ async function issueLoginTokens({
   const requestedAuthorizationSessionId = String(authorizationScopeIncarnation || "").trim().slice(0, 220) || null;
   const authorizationSessionId = requestedAuthorizationSessionId;
   const committed = await prisma.$transaction(async (tx) => {
+    await authorizeAuthorizationHistoryPublisher(tx);
     // Canonical lock order for authentication publication:
     // user -> device -> current User/Member/Agency rows.  The user lock is
     // shared by refresh rotation and refresh-only logout/revoke writers; the
@@ -226,9 +230,10 @@ async function issueLoginTokens({
       }
     }
 
+    const publicationNow = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const updatedUser = await tx.user.update({
       where: { id: user.id },
-      data: { lastLoginAt: new Date() },
+      data: { lastLoginAt: publicationNow },
     });
 
     // Publish the new lineage first. Revoking older same-device lineages after
@@ -252,10 +257,10 @@ async function issueLoginTokens({
           agencyId: membership.agencyId,
           deviceId: boundDeviceId,
           revokedAt: null,
-          expiresAt: { gt: new Date() },
+          expiresAt: { gt: publicationNow },
           id: { not: created.id },
         },
-        data: { revokedAt: new Date() },
+        data: { revokedAt: publicationNow },
       });
     }
     return { ...created, user: updatedUser };
@@ -361,17 +366,20 @@ async function verifyEmailByCode({ email, code }) {
   };
 }
 
-async function revokeRefreshReuseScope(session, now = new Date()) {
+async function revokeRefreshReuseScope(session) {
   const boundDeviceId = String(session?.deviceId || "").trim();
-  return withAuthorizationUserLock({ db: prisma, userId: session.userId, work: async (tx) => tx.refreshSession.updateMany({
-    where: {
-      userId: session.userId,
-      revokedAt: null,
-      expiresAt: { gt: now },
-      ...(boundDeviceId ? { deviceId: boundDeviceId } : {}),
-    },
-    data: { revokedAt: now },
-  }) });
+  return withAuthorizationUserLock({ db: prisma, userId: session.userId, work: async (tx) => {
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+    return tx.refreshSession.updateMany({
+      where: {
+        userId: session.userId,
+        revokedAt: null,
+        expiresAt: { gt: now },
+        ...(boundDeviceId ? { deviceId: boundDeviceId } : {}),
+      },
+      data: { revokedAt: now },
+    });
+  } });
 }
 
 async function refreshAccessToken({ refreshToken, req, deviceId = null, client = null, authorizationScopeIncarnation = null }) {
@@ -382,14 +390,14 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
     include: { user: true },
   });
 
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
 
   if (!session || session.expiresAt < now) {
     return { ok: false, code: "REFRESH_INVALID", error: "Refresh token is invalid or expired" };
   }
 
   if (session.revokedAt) {
-    await revokeRefreshReuseScope(session, now);
+    await revokeRefreshReuseScope(session);
     return { ok: false, code: "REFRESH_REUSED", error: "Refresh token reuse detected. Please sign in again." };
   }
 
@@ -428,6 +436,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
 
   try {
     const rotated = await prisma.$transaction(async (tx) => {
+      await authorizeAuthorizationHistoryPublisher(tx);
       await acquireAuthorizationUserLock(tx, { userId: session.userId });
       await acquireAuthorizationDeviceLock(tx, {
         userId: session.userId, agencyId: session.agencyId, deviceId: effectiveDeviceId,
@@ -479,8 +488,8 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
         }
       }
 
-      const nextExpiresAt = addDays(refreshDaysForRememberDevice(session.rememberDevice));
-      const rotationNow = new Date();
+      const rotationNow = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+      const nextExpiresAt = new Date(rotationNow.getTime() + refreshDaysForRememberDevice(session.rememberDevice) * 24 * 60 * 60 * 1000);
 
       // Replacement first: the DB boundary trigger on the old token observes
       // another live row with the same lineage and therefore does not terminate
@@ -559,7 +568,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
       return { ok: false, code: String(error.code), error: error?.message || "Authorization changed. Please sign in again." };
     }
     if (error?.code === "REFRESH_REUSED") {
-      await revokeRefreshReuseScope({ ...session, deviceId: effectiveDeviceId || session.deviceId }, now);
+      await revokeRefreshReuseScope({ ...session, deviceId: effectiveDeviceId || session.deviceId });
       return { ok: false, code: "REFRESH_REUSED", error: "Refresh token reuse detected. Please sign in again." };
     }
     throw error;
@@ -597,7 +606,7 @@ async function revokeRefreshToken(refreshToken) {
       agencyId: session.agencyId,
       deviceId: boundDeviceId,
     });
-    const revokeNow = new Date();
+    const revokeNow = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     await tx.refreshSession.updateMany({
       where: boundDeviceId
         ? { userId: session.userId, deviceId: boundDeviceId, revokedAt: null, expiresAt: { gt: revokeNow } }

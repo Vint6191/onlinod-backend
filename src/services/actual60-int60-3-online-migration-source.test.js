@@ -64,7 +64,7 @@ test("INT60.4 migration rehearsal: starts before lineage, preserves legacy NULL 
   assert.match(source, /deploy-pre-lineage/);
   assert.match(source, /deploy-pre-scale-prerequisites/);
   assert.match(source, /pre-lineage legacy RefreshSession was silently reclassified/);
-  assert.match(source, /deploy-through-int60\.8-schema-first/);
+  assert.match(source, /deploy-through-int60\.10-schema-first/);
   assert.match(source, /populated-table F60 migration built indexes before online ensure/);
   assert.match(source, /LOCK TABLE "RefreshSession" IN ROW EXCLUSIVE MODE/);
   assert.match(source, /ShareUpdateExclusiveLock/);

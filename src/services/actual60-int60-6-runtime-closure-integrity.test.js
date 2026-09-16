@@ -64,9 +64,10 @@ test("INT60.6 closure integrity: a blocked run overwrites a stale green receipt 
 
 test("INT60.6 closure integrity: empirical TAP gates reject skips and pin exact PG/scale test counts", () => {
   assert.match(source, /empirical closure does not accept skipped tests/);
-  assert.match(source, /postgres-forced-interleavings[\s\S]*exactTests:\s*10/);
+  assert.match(source, /postgres-forced-interleavings[\s\S]*exactTests:\s*13/);
   assert.match(source, /postgres-telemetry-scale[\s\S]*exactTests:\s*3/);
   assert.match(source, /postgres-refreshsession-hot-cold-scale[\s\S]*exactTests:\s*1/);
+  assert.match(source, /postgres-refreshsession-retention[\s\S]*exactTests:\s*2/);
 });
 
 test("INT60.6 closure integrity: all mode self-migrates disposable audit DB before correctness and scale", () => {
@@ -79,17 +80,23 @@ test("INT60.6 closure integrity: all mode self-migrates disposable audit DB befo
   assert.ok(block.indexOf("prisma-migrate-deploy") < block.indexOf("postgres-forced-interleavings"));
 });
 
+test("INT60.10 closure integrity: standalone verifier applies zero-skip semantics to retention evidence too", () => {
+  const evidenceSource = fs.readFileSync(path.join(root, "scripts/audit/actual60-runtime-evidence.js"), "utf8");
+  assert.match(evidenceSource, /postgres-refreshsession-retention/);
+  assert.match(evidenceSource, /\["source-freeze-candidate", "postgres-forced-interleavings", "postgres-telemetry-scale", "postgres-refreshsession-hot-cold-scale", "postgres-refreshsession-retention"\]\.includes\(label\)/);
+});
+
 test("INT60.6 closure integrity: verifier rejects skipped empirical evidence and missing required gates", () => {
   const bad = {
     format: "ONLINOD_ACTUAL60_AUTH_RUNTIME_EVIDENCE_V2",
     status: "PASSED",
     mode: "all",
-    gates: [{ label: "postgres-forced-interleavings", exitCode: 0, tap: { tests: 10, pass: 0, fail: 0, skipped: 10 } }],
+    gates: [{ label: "postgres-forced-interleavings", exitCode: 0, tap: { tests: 13, pass: 0, fail: 0, skipped: 13 } }],
     targets: {}, postgres: {}, failure: null, sourceSha256: {},
   };
   const result = evidence.validateClosureReceipt(bad);
   assert.equal(result.ok, false);
-  assert.ok(result.errors.some((entry) => /skipped=10/.test(entry)));
+  assert.ok(result.errors.some((entry) => /skipped=13/.test(entry)));
   assert.ok(result.errors.some((entry) => /missing required gate/.test(entry)));
 });
 

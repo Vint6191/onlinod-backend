@@ -12,7 +12,8 @@ const lineageMigration = "20260915193000_actual59_int59_3_authorization_lineage_
 const scaleMigration = "20260916011500_actual60_refreshsession_hot_cold_scale";
 const liveUserMigration = "20260916013000_actual60_refreshsession_live_user_scale";
 const currentWriteHistoryMigration = "20260916014500_actual60_refreshsession_current_write_history_scale";
-const throughMigration = "20260916034500_actual60_int60_8_authorization_boundary_destructive_fence";
+const retentionFenceMigration = "20260916034500_actual60_int60_8_authorization_boundary_destructive_fence";
+const throughMigration = "20260916050000_actual60_int60_10_auth_history_rollout_fence";
 const enabled = process.env.ONLINOD_ACTUAL60_MIGRATION_REHEARSAL === "1";
 const databaseUrl = String(process.env.DATABASE_URL || "").trim();
 const prismaCli = path.join(root, "node_modules", ".bin", process.platform === "win32" ? "prisma.cmd" : "prisma");
@@ -164,7 +165,7 @@ async function main() {
   if (!enabled) fail("ONLINOD_ACTUAL60_MIGRATION_REHEARSAL=1 is required", 3);
   if (!databaseUrl) fail("DATABASE_URL is required", 3);
   if (!fs.existsSync(schemaSource)) fail("prisma/schema.prisma is missing");
-  for (const requiredMigration of [lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, throughMigration]) {
+  for (const requiredMigration of [lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, retentionFenceMigration, throughMigration]) {
     if (!fs.existsSync(path.join(migrationsRoot, requiredMigration, "migration.sql"))) {
       fail(`target migration ${requiredMigration} is missing`);
     }
@@ -303,7 +304,7 @@ async function main() {
     // table the F60 migration SQL must not build blocking indexes; it records
     // the migration step and leaves physical construction to Stage D.
     const fullSchema = copyMigrationSet(fullWorkspace, (name) => name <= throughMigration);
-    run("deploy-through-int60.8-schema-first", requireLocalPrismaCli(),
+    run("deploy-through-int60.10-schema-first", requireLocalPrismaCli(),
       ["migrate", "deploy", "--schema", fullSchema],
       { DATABASE_URL: rehearsalUrl });
 
@@ -401,11 +402,11 @@ async function main() {
     const migrationLedger = await rehearsal.$queryRawUnsafe(`
       SELECT migration_name, finished_at, rolled_back_at
         FROM "_prisma_migrations"
-       WHERE migration_name IN ($1, $2, $3, $4, $5)
+       WHERE migration_name IN ($1, $2, $3, $4, $5, $6)
        ORDER BY migration_name
-    `, lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, throughMigration);
+    `, lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, retentionFenceMigration, throughMigration);
     const ledgerNames = migrationLedger.map((row) => row.migration_name);
-    if (JSON.stringify(ledgerNames) !== JSON.stringify([lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, throughMigration])
+    if (JSON.stringify(ledgerNames) !== JSON.stringify([lineageMigration, scaleMigration, liveUserMigration, currentWriteHistoryMigration, retentionFenceMigration, throughMigration])
         || migrationLedger.some((row) => !row.finished_at || row.rolled_back_at)) {
       fail(`migration ledger mismatch got=${JSON.stringify(migrationLedger)}`);
     }
@@ -432,6 +433,34 @@ async function main() {
     ];
     if (JSON.stringify(triggerNames) !== JSON.stringify(expectedTriggers)) {
       fail(`boundary trigger set mismatch got=${JSON.stringify(triggerNames)}`);
+    }
+
+    const authHistoryReleaseRows = await rehearsal.$queryRawUnsafe(`
+      SELECT "requiredGeneration","activationState"
+        FROM "Phase2ReleaseCompatibilityAuthority"
+       WHERE "scope"='AUTHORIZATION_HISTORY_PURGE'
+    `);
+    if (!Array.isArray(authHistoryReleaseRows) || authHistoryReleaseRows.length !== 1
+        || authHistoryReleaseRows[0].requiredGeneration !== "actual60_auth_history_publisher_v1"
+        || String(authHistoryReleaseRows[0].activationState || "").toUpperCase() !== "DRAINING") {
+      fail(`authorization-history rollout authority must start DRAINING got=${JSON.stringify(authHistoryReleaseRows)}`);
+    }
+    const authHistoryFenceRows = await rehearsal.$queryRawUnsafe(`
+      SELECT t.tgname AS name, c.relname AS table_name, p.proname AS function_name
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid=t.tgrelid
+        JOIN pg_namespace n ON n.oid=c.relnamespace
+        JOIN pg_proc p ON p.oid=t.tgfoid
+       WHERE n.nspname=$1
+         AND NOT t.tgisinternal
+         AND t.tgname IN ('actual60_auth_history_refresh_insert','actual60_auth_history_refresh_adoption')
+       ORDER BY t.tgname
+    `, schemaName);
+    if (JSON.stringify(authHistoryFenceRows.map((row) => row.name)) !== JSON.stringify([
+      "actual60_auth_history_refresh_adoption",
+      "actual60_auth_history_refresh_insert",
+    ]) || authHistoryFenceRows.some((row) => row.table_name !== "RefreshSession" || row.function_name !== "actual60_require_auth_history_publisher_generation")) {
+      fail(`authorization-history publisher fence mismatch got=${JSON.stringify(authHistoryFenceRows)}`);
     }
 
     const destructiveBoundaryFences = await rehearsal.$queryRawUnsafe(`

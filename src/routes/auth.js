@@ -24,6 +24,7 @@ const { publishDesktopControlEvent } = require("../services/desktop-control-even
 const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = require("../services/team-control-plane-authority-service");
 const { assertTeamControlPlaneWriteAdmission } = require("../services/phase2-release-compatibility-authority-service");
 const { acquireAuthorizationUserLock } = require("../services/authorization-session-authority-service");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
 
 const router = express.Router();
 
@@ -610,10 +611,10 @@ router.post("/reset-password", async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(input.password, 12);
-    const revokedAt = new Date();
 
     await prisma.$transaction(async (tx) => {
       await acquireAuthorizationUserLock(tx, { userId: record.userId });
+      const revokedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       await tx.authToken.update({ where: { id: record.id }, data: { usedAt: revokedAt } });
       // Password reset is account recovery, so unlike an in-app password change
       // it intentionally invalidates every device, including already-issued

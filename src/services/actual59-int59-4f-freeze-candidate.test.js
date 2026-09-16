@@ -68,7 +68,7 @@ test("INT59.4F freeze candidate: auth publication lock order is monotonic and re
 
 test("INT59.4F freeze candidate: access JWT lineage is admitted only through an active exact RefreshSession generation", () => {
   assert.match(authMiddleware, /authorizationSessionId\s*=\s*decoded\.authorizationSessionId/);
-  assert.match(authMiddleware, /refreshSessions:[\s\S]*?agencyId:\s*decoded\.agencyId[\s\S]*?deviceId:\s*boundDeviceId[\s\S]*?revokedAt:\s*null[\s\S]*?expiresAt:\s*\{\s*gt:\s*new Date\(\)\s*\}/);
+  assert.match(authMiddleware, /refreshSessions:[\s\S]*?agencyId:\s*decoded\.agencyId[\s\S]*?deviceId:\s*boundDeviceId[\s\S]*?revokedAt:\s*null[\s\S]*?expiresAt:\s*\{\s*gt:\s*authorizationNow\s*\}/);
   assert.match(authMiddleware, /authorizationSessionId\s*\?\s*\{\s*authorizationSessionId\s*\}\s*:\s*\{\s*authorizationSessionId:\s*null\s*\}/);
   assert.match(authMiddleware, /if \(boundDeviceId\)[\s\S]*?SESSION_REVOKED/);
 });

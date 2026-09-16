@@ -16,6 +16,7 @@ const { purgeExpiredTipLedger } = require("./team-tip-ledger-service");
 const { compactAutomationDeliveries } = require("./automation-history-service");
 const { withDbAdvisoryXactLock, runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { authorizationHistoryPurgeActivationStatus } = require("./actual60-authorization-history-rollout-service");
 const { runMaintenanceLane } = require("./maintenance-work-authority");
 const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, phase2CoverageStatus } = require("./phase2-work-coverage-authority-service");
 
@@ -592,6 +593,17 @@ async function runRefreshSessionRetentionSweep(options = {}) {
   const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
   const db = options.db || prisma;
+  const activation = await authorizationHistoryPurgeActivationStatus(db);
+  if (!activation.active) {
+    return summarizeSweep("authSessions", [{
+      label: "refreshSession.raw_purge_activation_pending",
+      deleted: 0,
+      batches: 0,
+      hasMore: false,
+      activationState: String(activation?.row?.activationState || "MISSING"),
+      requiredGeneration: String(activation?.row?.requiredGeneration || ""),
+    }]);
+  }
   const cutoff = daysAgo(cfg.refreshSessionRawHistoryDays, authorityNow);
   const batchSize = Math.max(100, Math.min(10_000, Number(cfg.batchSize) || DEFAULT_BATCH_SIZE));
   const configuredMaxBatches = Number(process.env.ONLINOD_REFRESH_SESSION_RETENTION_MAX_BATCHES) || REFRESH_SESSION_RETENTION_MAX_BATCHES;

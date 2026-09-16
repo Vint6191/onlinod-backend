@@ -1,6 +1,7 @@
 const prisma = require("../prisma");
 const { verifyAccessToken } = require("../utils/tokens");
 const { requireBoundAccessDevice } = require("../utils/device-binding");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
 
 async function authRequired(req, res, next) {
   try {
@@ -20,6 +21,7 @@ async function authRequired(req, res, next) {
 
     const boundDeviceId = decoded.deviceId ? String(decoded.deviceId).trim().slice(0, 160) : null;
     const authorizationSessionId = decoded.authorizationSessionId ? String(decoded.authorizationSessionId).trim().slice(0, 220) : null;
+    const authorizationNow = boundDeviceId ? await dbAuthorityNow({ db: prisma, fallbackNow: new Date() }) : null;
     const membership = await prisma.agencyMember.findFirst({
       where: {
         userId: decoded.userId,
@@ -36,7 +38,7 @@ async function authRequired(req, res, next) {
                 agencyId: decoded.agencyId,
                 deviceId: boundDeviceId,
                 revokedAt: null,
-                expiresAt: { gt: new Date() },
+                expiresAt: { gt: authorizationNow },
                 ...(authorizationSessionId
                   ? { authorizationSessionId }
                   : { authorizationSessionId: null }),

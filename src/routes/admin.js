@@ -61,6 +61,7 @@ const prisma    = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
 const { signAccessToken } = require("../utils/tokens");
 const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 const { TIER_CATALOG } = require("../services/billing-catalog-service");
 const { retireCreatorWithinTransaction, publishCreatorRetirementControlEvents } = require("../services/creator-lifecycle-authority-service");
@@ -631,8 +632,9 @@ router.delete("/agencies/:id", async (req, res) => {
     if (!before) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
 
     if (hard) {
-      const scheduledAt = new Date();
+      let scheduledAt = null;
       await prisma.$transaction(async (tx) => {
+        scheduledAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
         // Agency deletedAt is Team current-authority state and is DB-generation
         // fenced by migration 08000. Join release admission before the Agency
         // lifecycle barrier so DRAINING fails cleanly instead of surfacing the
@@ -683,8 +685,9 @@ router.delete("/agencies/:id", async (req, res) => {
       });
     }
 
-    const deletedAt = new Date();
+    let deletedAt = null;
     const updated = await prisma.$transaction(async (tx) => {
+      deletedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       // Agency retirement removes Team current authority. Join the DB-enforced
       // release generation before the lifecycle lock for the same reason as hard
       // retirement and restore.
@@ -1217,7 +1220,7 @@ router.patch("/users/:id", async (req, res) => {
       }
 
       if (input.disabled === true) {
-        const sessionRevokedAt = new Date();
+        const sessionRevokedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
         await tx.refreshSession.updateMany({
           where: { userId: before.id, revokedAt: null, expiresAt: { gt: sessionRevokedAt } },
           data: { revokedAt: sessionRevokedAt },
@@ -1266,10 +1269,11 @@ router.post("/users/:id/force-logout", async (req, res) => {
       return res.status(404).json({ ok: false, code: "USER_NOT_FOUND", error: "User not found" });
     }
 
-    const now = new Date();
+    let now = null;
 
     const mutation = await prisma.$transaction(async (tx) => {
       await acquireAuthorizationUserLock(tx, { userId: user.id });
+      now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       const updatedUser = await tx.user.update({
         where: { id: user.id },
         data: { sessionsRevokedAt: now },
@@ -1353,7 +1357,7 @@ router.post("/users/:id/reset-password", async (req, res) => {
 
     await prisma.$transaction(async (tx) => {
       await acquireAuthorizationUserLock(tx, { userId: user.id });
-      const revokedAt = new Date();
+      const revokedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
       await tx.refreshSession.updateMany({
         where: { userId: user.id, revokedAt: null, expiresAt: { gt: revokedAt } },
@@ -1780,7 +1784,7 @@ router.post("/devices/:id/kick", async (req, res) => {
           issuedByAdmin: req.admin.id,
         },
       });
-      const sessionRevokedAt = new Date();
+      const sessionRevokedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       await tx.refreshSession.updateMany({
         where: { userId: device.userId, agencyId: device.agencyId, deviceId: device.id, revokedAt: null, expiresAt: { gt: sessionRevokedAt } },
         data: { revokedAt: sessionRevokedAt },

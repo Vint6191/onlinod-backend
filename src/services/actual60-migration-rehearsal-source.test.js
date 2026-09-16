@@ -32,7 +32,7 @@ test("Actual60 migration rehearsal: uses a disposable PostgreSQL schema and a re
   assert.match(source, /20260916014500_actual60_refreshsession_current_write_history_scale/);
   assert.match(source, /20260916034500_actual60_int60_8_authorization_boundary_destructive_fence/);
   assert.match(source, /copyMigrationSet\(fullWorkspace, \(name\) => name <= throughMigration\)/);
-  assert.match(source, /deploy-through-int60\.8-schema-first/);
+  assert.match(source, /deploy-through-int60\.10-schema-first/);
   assert.match(source, /redeploy-idempotence-schema/);
   assert.match(source, /redeploy-idempotence-online-index-ensure/);
 });
@@ -65,7 +65,7 @@ test("Actual60 migration rehearsal: populated Prisma scale migrations do not bui
   assert.match(source, /prematureIndexes/);
   assert.match(source, /populated-table F60 migration built indexes before online ensure/);
   assert.ok(
-    source.indexOf("deploy-through-int60.8-schema-first") < source.indexOf("await proveOnlineIndexEnsure("),
+    source.indexOf("deploy-through-int60.10-schema-first") < source.indexOf("await proveOnlineIndexEnsure("),
     "schema migration must finish before online index ensure",
   );
 });

@@ -231,6 +231,7 @@ function sourceGate() {
     "src/services/actual60-int60-6-runtime-closure-integrity.test.js",
     "src/services/actual60-int60-7-prisma-regclass-preflight.test.js",
     "src/services/actual60-int60-8-refreshsession-retention.test.js",
+    "src/services/actual60-int60-10-rolling-time-authority.test.js",
     "src/services/phase2-actual55-root-e-closure.test.js",
     "src/services/auth-device-session-isolation-v20-21.test.js",
   ], {
@@ -260,10 +261,10 @@ function pgGate() {
     run("prisma-migrate-deploy", requireLocalPrismaCli(), ["migrate", "deploy"], { DATABASE_URL: auditDatabaseUrl });
     run("refreshsession-online-index-ensure", process.execPath, ["scripts/database/actual60-refreshsession-online-index-preflight.js"], { DATABASE_URL: auditDatabaseUrl });
   }
-  run("postgres-forced-interleavings", process.execPath, ["--test", "src/services/actual59-team-authorization-generation-postgres.integration.test.js"], {
+  run("postgres-forced-interleavings", process.execPath, ["--test", "src/services/actual59-team-authorization-generation-postgres.integration.test.js", "src/services/actual60-int60-10-rollout-postgres.integration.test.js"], {
     DATABASE_URL: auditDatabaseUrl,
     ONLINOD_POSTGRES_INTEGRATION: "1",
-  }, { exactTests: 10 });
+  }, { exactTests: 13 });
 }
 
 function scaleGate() {
@@ -280,7 +281,7 @@ function scaleGate() {
   run("postgres-refreshsession-retention", process.execPath, ["--test", "src/services/actual60-int60-8-refreshsession-retention-postgres.integration.test.js"], {
     DATABASE_URL: auditDatabaseUrl,
     ONLINOD_ACTUAL60_REFRESHSESSION_RETENTION_INTEGRATION: "1",
-  }, { exactTests: 1 });
+  }, { exactTests: 2 });
 }
 
 let terminalStatus = "PASSED";

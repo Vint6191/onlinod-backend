@@ -26,6 +26,7 @@ const expectedTouchpoints = [
   "src/routes/admin.js",
   "src/routes/auth.js",
   "src/routes/impersonate.js",
+  "src/services/actual60-authorization-history-rollout-service.js",
   "src/services/auth-service.js",
   "src/services/authorization-session-authority-service.js",
   "src/services/client-e2e-keyring-service.js",
