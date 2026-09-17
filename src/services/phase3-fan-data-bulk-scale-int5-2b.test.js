@@ -59,6 +59,13 @@ function bulkDb() {
   };
 }
 
+
+function splitSqlCalls(calls) {
+  const locks = calls.filter((call) => /pg_advisory_xact_lock/.test(call.sql));
+  const writes = calls.filter((call) => !/pg_advisory_xact_lock/.test(call.sql));
+  return { locks, writes };
+}
+
 async function projectCount(count) {
   const db = bulkDb();
   const items = Array.from({ length: count }, (_, index) => fullObservation(index));
@@ -80,15 +87,17 @@ test("generic FanData full-profile projection has constant bounded SQL topology 
   for (const count of [1, 10, 100, 500]) {
     const { db, result } = await projectCount(count);
     assert.equal(result.projected, count);
-    assert.equal(db.calls.length, 4, `expected four SQL statements for ${count} fans`);
-    assert.ok(db.calls[0].sql.includes('INSERT INTO "CreatorFan"'));
-    assert.ok(db.calls[1].sql.includes('UPDATE "CreatorFan"'));
-    assert.ok(db.calls[2].sql.includes('INSERT INTO "CreatorFanRelationshipCurrent"'));
-    assert.ok(db.calls[3].sql.includes('INSERT INTO "CreatorFanValueCurrent"'));
+    const { locks, writes } = splitSqlCalls(db.calls);
+    assert.equal(locks.length, 1, `expected one shared authority lock for ${count} fans`);
+    assert.equal(writes.length, 4, `expected four projection SQL statements for ${count} fans`);
+    assert.ok(writes[0].sql.includes('INSERT INTO "CreatorFan"'));
+    assert.ok(writes[1].sql.includes('UPDATE "CreatorFan"'));
+    assert.ok(writes[2].sql.includes('INSERT INTO "CreatorFanRelationshipCurrent"'));
+    assert.ok(writes[3].sql.includes('INSERT INTO "CreatorFanValueCurrent"'));
 
-    const fanRows = JSON.parse(db.calls[0].args[0]);
-    const relationshipRows = JSON.parse(db.calls[2].args[0]);
-    const valueRows = JSON.parse(db.calls[3].args[0]);
+    const fanRows = JSON.parse(writes[0].args[0]);
+    const relationshipRows = JSON.parse(writes[2].args[0]);
+    const valueRows = JSON.parse(writes[3].args[0]);
     assert.equal(fanRows.length, count);
     assert.equal(relationshipRows.length, count);
     assert.equal(valueRows.length, count);
@@ -109,9 +118,11 @@ test("duplicate fan observations are collapsed before SQL and preserve newest pe
     allowedSources: ["USER_PROFILE"], observedAtPolicy: "TRUSTED_INPUT",
   });
   assert.equal(result.projected, 2);
-  assert.equal(db.calls.length, 4);
+  const { locks, writes } = splitSqlCalls(db.calls);
+  assert.equal(locks.length, 1);
+  assert.equal(writes.length, 4);
 
-  const relationshipRows = JSON.parse(db.calls[2].args[0]);
+  const relationshipRows = JSON.parse(writes[2].args[0]);
   assert.equal(relationshipRows.length, 1);
   assert.equal(relationshipRows[0].creatorFollowsFan, true);
   assert.equal(relationshipRows[0].blocked, false);
@@ -133,8 +144,10 @@ test("partial relationship observation remains partial in bulk SQL row", async (
     agencyId: "agency-1", creatorId: "creator-1", items: [item],
     allowedSources: ["USER_PROFILE"], observedAtPolicy: "TRUSTED_INPUT",
   });
-  assert.equal(db.calls.length, 3);
-  const relationshipRows = JSON.parse(db.calls[2].args[0]);
+  const { locks, writes } = splitSqlCalls(db.calls);
+  assert.equal(locks.length, 1);
+  assert.equal(writes.length, 3);
+  const relationshipRows = JSON.parse(writes[2].args[0]);
   const row = relationshipRows[0];
   assert.equal(row.canReceiveChatMessage, false);
   assert.ok(row.canReceiveChatMessageAuthorityVersion);

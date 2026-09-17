@@ -4,7 +4,7 @@ const prisma = require("../prisma");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
-const { projectFanObservationBatch, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { projectFanObservationBatch, scheduleFanDataPointRefresh, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
@@ -472,13 +472,16 @@ async function recordDetailedObservations({
       };
     })
     .filter(Boolean);
-  if (authorityItems.length) {
-    await projectFanObservationBatch(db, {
-      agencyId, creatorId, sourceDeviceId: clean(sourceDeviceId, 180), items: authorityItems,
+  let authorityProjected = 0;
+  for (let offset = 0; offset < authorityItems.length; offset += FAN_DATA_OBSERVATION_BATCH_MAX) {
+    const chunk = authorityItems.slice(offset, offset + FAN_DATA_OBSERVATION_BATCH_MAX);
+    const projected = await projectFanObservationBatch(db, {
+      agencyId, creatorId, sourceDeviceId: clean(sourceDeviceId, 180), items: chunk,
       allowedSources: ["PRESENCE_HINT"],
       observedAtPolicy: "SERVER_RECEIPT",
       receivedAt: authorityReceivedAt,
     });
+    authorityProjected += Number(projected?.projected || 0);
   }
 
   const existingRows = ids.length ? await db.automationBumpFanState.findMany({
@@ -511,7 +514,7 @@ async function recordDetailedObservations({
       },
     });
   }
-  return { ok: true, count: rows.length, fanIds: ids, authorityProjected: authorityItems.length };
+  return { ok: true, count: rows.length, fanIds: ids, authorityProjected };
 }
 
 async function recordOnlineObservations({ agencyId, creatorId, fanIds, observedAt = new Date(), metadata = {}, sourceDeviceId = null, db = prisma }) {

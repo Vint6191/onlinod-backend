@@ -40,6 +40,7 @@ function loadBumpWithStubs(captures) {
         dbAuthorityNow: async () => new Date("2026-09-16T10:10:00.000Z"),
       };
       if (request === "./fan-data-authority-service") return {
+        FAN_DATA_OBSERVATION_BATCH_MAX: 500,
         projectFanObservationBatch: async (_db, args) => {
           captures.authority.push(args);
           return { ok: true, projected: args.items.length };

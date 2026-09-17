@@ -9,12 +9,14 @@ function read(relative) {
   return fs.readFileSync(path.join(__dirname, "..", relative), "utf8");
 }
 
-test("INT5.1A Subscriber Directory canonical chronology uses server scan generation, not Desktop wall clock", () => {
+test("INT5.1A/INT5.4C Subscriber Directory canonical chronology is server-owned and provider-read ordered", () => {
   const source = fs.readFileSync(path.join(__dirname, "subscriber-directory-service.js"), "utf8");
   assert.match(source, /const producerObservedAt = dateOrNull\(chunk\.observedAt\)/);
-  assert.match(source, /const observedAt = dateOrNull\(run\.createdAt\) \|\| dateOrNull\(job\.createdAt\)/);
-  assert.match(source, /SUBSCRIBER_SCAN_CAUSAL_GENERATION_REQUIRED/);
-  assert.match(source, /fanDataObservationTimeBasis:\s*"SERVER_SCAN_GENERATION"/);
+  assert.match(source, /observationTokenRequired = Number\(job\?\.params\?\.observationTokenVersion/);
+  assert.match(source, /consumeObservationToken\(\{/);
+  assert.match(source, /purpose:\s*"subscriber_directory_page"/);
+  assert.match(source, /SERVER_PROVIDER_READ_TOKEN/);
+  assert.match(source, /SERVER_SCAN_GENERATION_LEGACY/);
   assert.match(source, /producerObservedAt:\s*producerObservedAt\?\.toISOString/);
   assert.doesNotMatch(source, /const observedAt = dateOrNull\(chunk\.observedAt\) \|\| new Date\(\)/);
 });

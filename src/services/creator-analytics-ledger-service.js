@@ -745,7 +745,13 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     unchanged += duplicateClaimers;
 
     for (const claimer of uniqueClaimers.values()) {
-      const seenAt = claimer.attributedAt || serverReceivedAt;
+      // `attributedAt` is historical campaign membership provenance, not the time
+      // at which this scan observed the fan's current profile fields. Reusing the
+      // event timestamp as FanData chronology makes a later username/avatar read
+      // look like the same causal generation and can trip the same-generation
+      // contradiction fence. Canonical identity freshness is therefore stamped
+      // from the PostgreSQL-owned receipt clock for this claimer page.
+      const identityObservedAt = serverReceivedAt;
       const fan = await projectFanIdentity(tx, {
         agencyId: job.agencyId,
         creatorId: job.creatorId,
@@ -753,8 +759,8 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         username: claimer.username,
         platformDisplayName: claimer.displayName,
         avatarUrl: claimer.avatarUrl,
-        observedAt: seenAt,
-        activityObservedAt: seenAt,
+        observedAt: identityObservedAt,
+        activityObservedAt: identityObservedAt,
         source: "CAMPAIGN_CLAIMER",
       });
 
@@ -850,9 +856,34 @@ function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
     displayName: text(item.displayName, 500),
     avatarUrl: text(item.avatarUrl, 1200),
     headerUrl: text(item.headerUrl, 1200),
-    identitySource: text(item.identitySource, 80) || "USER_PROFILE",
-    valueSource: text(item.valueSource ?? item.source, 80) || "USER_PROFILE",
   };
+}
+
+async function assertCampaignFanValueScope(tx, job, scanRunId, onlyFansUserIds) {
+  const ids = [...new Set((onlyFansUserIds || []).map((value) => text(value, 180)).filter(Boolean))];
+  if (!ids.length) return;
+  if (!tx.creatorCampaignFan?.findMany) {
+    const error = new Error("Campaign fan value evidence store is unavailable");
+    error.code = "CAMPAIGN_FAN_VALUE_SCOPE_STORE_UNAVAILABLE";
+    throw error;
+  }
+  const rows = await tx.creatorCampaignFan.findMany({
+    where: {
+      creatorId: job.creatorId,
+      sourceJobId: job.id,
+      sourceScanRunId: scanRunId,
+      fan: { onlyFansUserId: { in: ids } },
+    },
+    select: { fan: { select: { onlyFansUserId: true } } },
+    take: ids.length,
+  });
+  const proven = new Set((rows || []).map((row) => text(row?.fan?.onlyFansUserId, 180)).filter(Boolean));
+  const unproven = ids.filter((id) => !proven.has(id));
+  if (unproven.length) {
+    const error = new Error("Campaign fan value is outside the server-proven claimer scope");
+    error.code = "CAMPAIGN_FAN_VALUE_SCOPE_MISMATCH";
+    throw error;
+  }
 }
 
 async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }) {
@@ -868,7 +899,7 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, au
     avatarUrl: item.avatarUrl,
     headerUrl: item.headerUrl,
     observedAt,
-    source: item.identitySource || "USER_PROFILE",
+    source: "CAMPAIGN_CLAIMER",
   });
   const projected = await projectFanValue(tx, {
     agencyId: job.agencyId,
@@ -883,7 +914,7 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, au
     lastActivityAt: item.lastActivityAt,
     availability: "AVAILABLE",
     observedAt,
-    source: item.valueSource || "USER_PROFILE",
+    source: "CAMPAIGN_CLAIMER",
     sourceDeviceId: deviceId || null,
     sourceJobId: job.id,
     scanRunId,
@@ -915,6 +946,7 @@ async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
+    await assertCampaignFanValueScope(tx, job, scanRunId, [item.onlyFansUserId]);
     const authorityObservedAt = await dbAuthorityNow({ db: tx, fallbackNow: observedAt });
     return upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt });
   });
@@ -940,6 +972,7 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation, received: values.length, available: 0, unavailable: 0, applied: [] };
+    await assertCampaignFanValueScope(tx, job, scanRunId, normalized.map((item) => item.onlyFansUserId));
     const authorityObservedAt = await dbAuthorityNow({ db: tx, fallbackNow: observedAt });
     const applied = [];
     for (const item of normalized) applied.push(await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }));

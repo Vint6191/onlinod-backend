@@ -7,6 +7,7 @@ const { refreshFollowAutomationProjection } = require("./follow-automation-servi
 const { ensureAutomaticBumps } = require("./bump-service");
 const { projectSubscriberDirectoryRun, readFanCurrent } = require("./fan-data-authority-service");
 const { createPlannedJob, publishPlannedJobAvailable } = require("./job-planning-repository");
+const { consumeFanObservationToken } = require("./fan-observation-token-service");
 
 const SUBSCRIBER_DIRECTORY_JOB_KEY = "subscriber_directory_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING"];
@@ -161,6 +162,8 @@ async function scheduleSubscriberScan({
           pageLimit: normalizedLimit,
           scanEveryDays: normalizedEveryDays,
           reason: clean(reason, 160) || "subscriber_directory_refresh",
+          observationTokenVersion: 1,
+          observationReadLeaseVersion: 1,
         },
         priority: integer(priority, 20, 0, 200),
         scheduledAt: now,
@@ -225,7 +228,10 @@ async function ensureSubscriberScanDue({ agencyId, creatorId, priority = 10, now
   });
 }
 
-function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt, producerObservedAt = null }) {
+function normalizeChunkItem(item, {
+  runId, agencyId, creatorId, observedAt, producerObservedAt = null,
+  observationTimeBasis = "SERVER_SCAN_GENERATION_LEGACY",
+}) {
   const raw = object(item);
   const fanId = clean(raw.fanId ?? raw.userId ?? raw.id, 120);
   if (!fanId) return null;
@@ -256,7 +262,7 @@ function normalizeChunkItem(item, { runId, agencyId, creatorId, observedAt, prod
   const metadata = {
     ...object(raw.metadata),
     fanDataObservedFields: { identity: observedIdentityFields, relationship: observedRelationshipFields, value: observedValueFields },
-    fanDataObservationTimeBasis: "SERVER_SCAN_GENERATION",
+    fanDataObservationTimeBasis: observationTimeBasis,
     producerObservedAt: producerObservedAt?.toISOString?.() || null,
   };
   const normalized = {
@@ -500,7 +506,9 @@ async function publishRun(db, run, { jobId, scanEveryDays }) {
   return { ...summary, fanDataProjection, followBackProjection, followAutomationProjection };
 }
 
-async function applySubscriberScanChunk({ db, job, chunkResult }) {
+async function applySubscriberScanChunk({
+  db, job, deviceId = null, chunkResult, consumeObservationToken = consumeFanObservationToken,
+}) {
   if (job.jobKey !== SUBSCRIBER_DIRECTORY_JOB_KEY) return null;
   const chunk = object(chunkResult);
   if (chunk.kind !== "subscriber_directory_page") throw new Error("Unsupported subscriber directory chunk");
@@ -517,23 +525,9 @@ async function applySubscriberScanChunk({ db, job, chunkResult }) {
   const hasMore = chunk.hasMore === true;
   const itemsInput = Array.isArray(chunk.items) ? chunk.items.slice(0, MAX_PAGE_ITEMS) : [];
   const producerObservedAt = dateOrNull(chunk.observedAt);
-  // Subscriber Directory is a server-issued generation. Every page in a run
-  // shares the same canonical generation time, so a delayed page from an older
-  // run cannot future-poison FanData merely because the Desktop clock is fast
-  // or because transport completes later. The Desktop timestamp is retained in
-  // metadata for forensics only.
-  const observedAt = dateOrNull(run.createdAt) || dateOrNull(job.createdAt);
-  if (!observedAt) throw new Error("SUBSCRIBER_SCAN_CAUSAL_GENERATION_REQUIRED");
-  const items = itemsInput
-    .map((item) => normalizeChunkItem(item, {
-      runId,
-      agencyId: run.agencyId,
-      creatorId: run.creatorId,
-      observedAt,
-      producerObservedAt,
-    }))
-    .filter(Boolean);
-  const contentHash = clean(chunk.contentHash, 128) || hashJson(items.map((item) => [item.fanId, item.contentHash]));
+
+  // Lost-response replay must be idempotent even though observation tokens are
+  // one-time. Detect an already committed page before attempting token consume.
   const existingPage = await db.subscriberScanPage.findUnique({ where: { runId_offset: { runId, offset } } });
   if (existingPage) {
     return {
@@ -543,6 +537,51 @@ async function applySubscriberScanChunk({ db, job, chunkResult }) {
       hasMore: existingPage.hasMore,
     };
   }
+
+  const normalizedFanIds = itemsInput.map((item) => clean(object(item).fanId ?? object(item).userId ?? object(item).id, 120));
+  if (normalizedFanIds.some((fanId) => !fanId)) throw new Error("SUBSCRIBER_SCAN_FAN_ID_REQUIRED");
+  if (new Set(normalizedFanIds).size !== normalizedFanIds.length) throw new Error("SUBSCRIBER_SCAN_DUPLICATE_FAN_IN_PAGE");
+
+  // INT5.4C-1C: every non-empty provider page receives chronology only after
+  // the provider read completed. The token is lease/device/purpose/exact-fan
+  // scope bound, so job/run creation order is no longer used as current truth.
+  const observationTokenRequired = Number(job?.params?.observationTokenVersion || 0) >= 1;
+  let observedAt = null;
+  let observationTimeBasis = "SERVER_PROVIDER_READ_TOKEN";
+  if (normalizedFanIds.length && observationTokenRequired) {
+    if (!clean(chunk.observationToken, 500)) throw new Error("SUBSCRIBER_SCAN_OBSERVATION_TOKEN_REQUIRED");
+    const consumed = await consumeObservationToken({
+      db,
+      job,
+      deviceId,
+      leaseRevision: job.leaseRevision,
+      token: chunk.observationToken,
+      purpose: "subscriber_directory_page",
+      subjects: normalizedFanIds,
+    });
+    observedAt = dateOrNull(consumed?.observedAt);
+  } else if (normalizedFanIds.length) {
+    // Rollout compatibility for subscriber jobs created before the token cutover.
+    observedAt = dateOrNull(run.createdAt) || dateOrNull(job.createdAt);
+    observationTimeBasis = "SERVER_SCAN_GENERATION_LEGACY";
+  } else {
+    // Empty terminal pages carry no FanData facts, so no chronology token exists.
+    observedAt = dateOrNull(run.createdAt) || dateOrNull(job.createdAt) || new Date();
+    observationTimeBasis = observationTokenRequired ? "NO_FAN_FACTS" : "SERVER_SCAN_GENERATION_LEGACY";
+  }
+  if (!observedAt) throw new Error("SUBSCRIBER_SCAN_CAUSAL_GENERATION_REQUIRED");
+
+  const items = itemsInput
+    .map((item) => normalizeChunkItem(item, {
+      runId,
+      agencyId: run.agencyId,
+      creatorId: run.creatorId,
+      observedAt,
+      producerObservedAt,
+      observationTimeBasis,
+    }))
+    .filter(Boolean);
+  const contentHash = clean(chunk.contentHash, 128) || hashJson(items.map((item) => [item.fanId, item.contentHash]));
   const hiddenCount = items.filter((item) => item.lastSeenIsNull).length;
   await db.subscriberScanPage.create({
     data: { runId, offset, nextOffset, itemCount: items.length, hiddenCount, hasMore, contentHash },

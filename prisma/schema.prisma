@@ -3155,6 +3155,54 @@ model JobInstance {
 }
 
 
+model FanObservationClock {
+  id             Int      @id
+  lastObservedAt DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model FanObservationToken {
+  id            BigInt   @id @default(autoincrement())
+  token         String   @unique @default(cuid())
+  jobId         String?
+  deliveryId    String?
+  agencyId      String?
+  creatorId     String?
+  deviceId      String
+  leaseRevision Int
+  purpose       String
+  scopeHash     String
+  observedAt    DateTime @default(now())
+  consumedAt    DateTime?
+  createdAt     DateTime @default(now())
+
+  @@index([jobId, leaseRevision])
+  @@index([jobId, consumedAt])
+  @@index([creatorId, observedAt])
+  @@index([createdAt])
+}
+
+
+model FanObservationReadLease {
+  creatorId     String   @id
+  agencyId      String?
+  token         String   @unique
+  requestId     String
+  jobId         String?
+  deliveryId    String?
+  deviceId      String
+  leaseRevision Int
+  purpose       String
+  acquiredAt    DateTime @default(now())
+  expiresAt     DateTime
+  updatedAt     DateTime @updatedAt
+
+  @@index([expiresAt])
+  @@index([jobId, leaseRevision])
+  @@index([deliveryId, leaseRevision])
+}
+
+
 model CreatorTaskActivity {
   id          String   @id @default(cuid())
   agencyId    String

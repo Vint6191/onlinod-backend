@@ -8,6 +8,9 @@ const {
   JobLeaseError,
   claimJob,
   renewLease,
+  acquireJobFanObservationReadLease,
+  releaseJobObservationReadLease,
+  issueFanObservationToken,
   progressJob,
   completeJob,
   failJob,
@@ -91,6 +94,31 @@ const leaseMutationSchema = z.object({
   chunkResult: z.unknown().optional(),
 });
 
+
+const observationTokenSchema = z.object({
+  deviceId: deviceSchema,
+  leaseToken: tokenSchema,
+  leaseRevision: leaseRevisionSchema,
+  purpose: z.string().min(1).max(120),
+  subjects: z.array(z.string().min(1).max(180)).min(1).max(500),
+  readLeaseToken: tokenSchema.optional().nullable(),
+});
+
+const observationReadLeaseAcquireSchema = z.object({
+  deviceId: deviceSchema,
+  leaseToken: tokenSchema,
+  leaseRevision: leaseRevisionSchema,
+  purpose: z.string().min(1).max(120),
+  requestId: z.string().min(16).max(200),
+});
+
+const observationReadLeaseReleaseSchema = z.object({
+  deviceId: deviceSchema,
+  leaseToken: tokenSchema,
+  leaseRevision: leaseRevisionSchema,
+  readLeaseToken: tokenSchema,
+});
+
 const completeSchema = z.object({
   deviceId: deviceSchema,
   leaseToken: tokenSchema,
@@ -153,6 +181,64 @@ router.post("/:id/lease/renew", async (req, res, next) => {
       continuation: input.continuation,
     });
     return res.json({ ok: true, lease });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
+  }
+});
+
+
+router.post("/:id/observation-read-lease/acquire", async (req, res, next) => {
+  try {
+    const input = observationReadLeaseAcquireSchema.parse(req.body);
+    const lease = await acquireJobFanObservationReadLease({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      deviceId: input.deviceId,
+      leaseToken: input.leaseToken,
+      leaseRevision: input.leaseRevision,
+      purpose: input.purpose,
+      requestId: input.requestId,
+    });
+    return res.json({ ok: true, ...lease });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
+  }
+});
+
+router.post("/:id/observation-read-lease/release", async (req, res, next) => {
+  try {
+    const input = observationReadLeaseReleaseSchema.parse(req.body);
+    const released = await releaseJobObservationReadLease({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      deviceId: input.deviceId,
+      leaseToken: input.leaseToken,
+      leaseRevision: input.leaseRevision,
+      readLeaseToken: input.readLeaseToken,
+    });
+    return res.json({ ok: true, ...released });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }
+  }
+});
+
+router.post("/:id/observation-token", async (req, res, next) => {
+  try {
+    const input = observationTokenSchema.parse(req.body);
+    const issued = await issueFanObservationToken({
+      jobId: req.params.id,
+      userId: actorUserId(req),
+      deviceId: input.deviceId,
+      leaseToken: input.leaseToken,
+      leaseRevision: input.leaseRevision,
+      purpose: input.purpose,
+      subjects: input.subjects,
+      readLeaseToken: input.readLeaseToken || null,
+    });
+    return res.json({ ok: true, token: issued.token, observedAt: issued.observedAt });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }

@@ -454,6 +454,72 @@ test("campaign completion replay can promote a formerly partial audit batch", as
   assert.equal(harness.updated.at(-1).status, "COMMITTED");
 });
 
+test("campaign claimer identity freshness uses PostgreSQL receipt time, not historical attribution time", async () => {
+  const authorityNow = new Date("2026-08-09T12:34:56.789Z");
+  const attributedAt = "2026-07-01T00:00:00.000Z";
+  const harness = batchHarness();
+  const fanUpdates = [];
+  harness.tx.$queryRawUnsafe = async (sql) => {
+    if (/clock_timestamp\(\)/.test(String(sql))) return [{ authorityNow }];
+    if (/pg_advisory_xact_lock/.test(String(sql))) return [];
+    throw new Error(`Unexpected raw query: ${String(sql)}`);
+  };
+  harness.tx.$executeRawUnsafe = async () => 1;
+  harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
+  harness.tx.creatorCampaignFan = {
+    findUnique: async () => null,
+    upsert: async ({ create }) => create,
+  };
+  const fanRow = {
+    id: "fan-db-1",
+    creatorId: "creator-1",
+    onlyFansUserId: "fan-1",
+    username: "alpha",
+    displayName: "Alpha",
+    avatarUrl: null,
+    headerUrl: null,
+    lastSeenAt: new Date("2026-06-01T00:00:00.000Z"),
+    usernameAuthorityVersion: null,
+    displayNameAuthorityVersion: null,
+    avatarAuthorityVersion: null,
+    headerAuthorityVersion: null,
+    identityAuthorityVersion: null,
+  };
+  harness.tx.creatorFan = {
+    findUnique: async () => fanRow,
+    updateMany: async (args) => { fanUpdates.push(args); return { count: 1 }; },
+  };
+
+  await ingestCampaignChunk({
+    db: harness.db,
+    job: campaignJob("scan-identity-receipt", "2026-08-09T12:00:00.000Z"),
+    deviceId: "device-1",
+    chunk: {
+      kind: "campaign_claimers_page",
+      schemaVersion: 4,
+      collectorVersion: "campaigns-v6",
+      scanRunId: "scan-identity-receipt",
+      batchKey: "run:scan-identity-receipt:claimers:1",
+      externalCampaignId: "campaign-1",
+      campaignComplete: true,
+      scannerRejected: 0,
+      claimers: [{
+        id: "claim-1",
+        attributedAt,
+        user: { id: "fan-1", username: "beta", name: "Beta" },
+      }],
+    },
+  });
+
+  const usernameWrite = fanUpdates.find((entry) => entry?.data?.username === "beta");
+  const aggregateWrite = fanUpdates.find((entry) => entry?.data?.identityObservedAt instanceof Date);
+  assert.ok(usernameWrite, "campaign claimer identity must project username");
+  assert.ok(aggregateWrite, "campaign claimer identity must advance aggregate identity metadata");
+  assert.match(usernameWrite.data.usernameAuthorityVersion, new RegExp(`^${authorityNow.toISOString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\|`));
+  assert.equal(aggregateWrite.data.identityObservedAt.toISOString(), authorityNow.toISOString());
+  assert.notEqual(aggregateWrite.data.identityObservedAt.toISOString(), attributedAt);
+});
+
 test("campaign fan attribution keeps the earliest confirmed attribution date", async () => {
   const harness = batchHarness();
   let updateData = null;
@@ -523,6 +589,9 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
       findUnique: async () => null,
       upsert: async ({ create }) => ({ id: "campaign-state-fan-value", ...create }),
     },
+    creatorCampaignFan: {
+      findMany: async ({ where }) => where.fan.onlyFansUserId.in.map((onlyFansUserId) => ({ fan: { onlyFansUserId } })),
+    },
     creatorFan: {
       findUnique: async () => ({ id: "fan-db-1" }),
       updateMany: async () => ({ count: 1 }),
@@ -560,7 +629,7 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
   assert.equal(upsertData.platformReportedTotalSpendCents, 187920n);
   assert.equal(upsertData.messagesSpentCents, 118480n);
   assert.equal(upsertData.tipsSpentCents, 69440n);
-  assert.equal(upsertData.source, "USER_PROFILE");
+  assert.equal(upsertData.source, "CAMPAIGN_CLAIMER");
   assert.equal(upsertData.valueObservedAt.toISOString(), authorityNow.toISOString());
   assert.notEqual(upsertData.valueObservedAt.toISOString(), "2026-08-08T18:01:00.000Z", "Desktop observedAt is provenance only");
 });
@@ -574,6 +643,9 @@ test("campaign fan value batch applies multiple current snapshots under one anal
     creatorCampaignCollectionState: {
       findUnique: async () => null,
       upsert: async ({ create }) => ({ id: "campaign-state-batch", ...create }),
+    },
+    creatorCampaignFan: {
+      findMany: async ({ where }) => where.fan.onlyFansUserId.in.map((onlyFansUserId) => ({ fan: { onlyFansUserId } })),
     },
     creatorFan: {
       findUnique: async ({ where }) => ({ id: `fan-${where.creatorId_onlyFansUserId.onlyFansUserId}` }),
@@ -603,6 +675,71 @@ test("campaign fan value batch applies multiple current snapshots under one anal
   assert.equal(locks, 2);
   assert.equal(upserts.length, 2);
   assert.deepEqual(upserts.map((row) => row.platformReportedTotalSpendCents), [100n, 250n]);
+});
+
+
+test("campaign fan value source is server-assigned and fan scope is proven by current claimer evidence", async () => {
+  const authorityNow = new Date("2026-08-08T18:02:30.000Z");
+  const sources = [];
+  const allowedFanId = "211347786";
+  const db = {
+    $executeRawUnsafe: async () => 1,
+    $queryRawUnsafe: async () => [{ authorityNow }],
+    creatorCampaignCollectionState: {
+      findUnique: async () => null,
+      upsert: async ({ create }) => ({ id: "campaign-state-scope", ...create }),
+    },
+    creatorCampaignFan: {
+      findMany: async ({ where }) => {
+        const requested = where.fan.onlyFansUserId.in;
+        return requested.includes(allowedFanId) ? [{ fan: { onlyFansUserId: allowedFanId } }] : [];
+      },
+    },
+    creatorFan: {
+      findUnique: async ({ where }) => ({ id: `fan-${where.creatorId_onlyFansUserId.onlyFansUserId}` }),
+      updateMany: async ({ data }) => { if (data.identitySource) sources.push(data.identitySource); return { count: 1 }; },
+    },
+    creatorFanValueCurrent: {
+      findUnique: async () => null,
+      create: async ({ data }) => { sources.push(data.source); return data; },
+      updateMany: async () => ({ count: 1 }),
+    },
+  };
+  const baseChunk = {
+    kind: "campaign_fan_value",
+    schemaVersion: 4,
+    collectorVersion: "campaigns-v6",
+    scanRunId: "scope-run",
+    scanStartedAt: "2026-08-08T18:00:00.000Z",
+    observedAt: "2026-08-08T18:01:00.000Z",
+    batchKey: "run:scope-run:fan-value:abc",
+    fanOnlyFansUserId: allowedFanId,
+    available: true,
+    totalNetCents: 100,
+    messagesNetCents: 0,
+    subscriptionsNetCents: 0,
+    tipsNetCents: 0,
+    postsNetCents: 0,
+    streamsNetCents: 0,
+    identitySource: "AUTOMATION_WRITE_RESULT",
+    valueSource: "AUTOMATION_WRITE_RESULT",
+    source: "AUTOMATION_WRITE_RESULT",
+  };
+  const scopedJob = { ...campaignJob("scope-run", "2026-08-08T18:00:00.000Z"), id: "job-scope" };
+  const accepted = await ingestCampaignFanValueChunk({ db, job: scopedJob, deviceId: "device-1", chunk: baseChunk });
+  assert.equal(accepted.available, true);
+  assert.ok(sources.length >= 1);
+  assert.ok(sources.every((source) => source === "CAMPAIGN_CLAIMER"), `unexpected source classes: ${sources.join(",")}`);
+
+  await assert.rejects(
+    ingestCampaignFanValueChunk({
+      db,
+      job: scopedJob,
+      deviceId: "device-1",
+      chunk: { ...baseChunk, fanOnlyFansUserId: "999999", batchKey: "run:scope-run:fan-value:wrong" },
+    }),
+    (error) => error?.code === "CAMPAIGN_FAN_VALUE_SCOPE_MISMATCH",
+  );
 });
 
 test("message-day sync records the reporting device and never closes the current UTC day", async () => {

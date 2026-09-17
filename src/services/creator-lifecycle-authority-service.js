@@ -91,6 +91,9 @@ async function retireCreatorWithinTransaction({
     where: { creatorId: creator, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
     data: { status: "CANCELLED", completedAt: retiredAt, leaseUntil: null, leaseTokenHash: null, claimedAt: null, claimedByDeviceId: null },
   });
+  if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+    await tx.fanObservationReadLease.deleteMany({ where: { creatorId: creator } });
+  }
   if (!current.deletedAt) {
     await authorizeCreatorAccountWrite(tx);
     await tx.creatorAccount.update({ where: { id: creator }, data: { status: "DISABLED", deletedAt: retiredAt } });

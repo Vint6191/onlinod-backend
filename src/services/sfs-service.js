@@ -8,6 +8,7 @@ const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-r
 const { runDbTransaction, withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { projectFanObservationBatch, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { consumeFanObservationToken } = require("./fan-observation-token-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
   getAutomationControlSnapshot,
@@ -124,7 +125,7 @@ async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force 
   const bucketMs = settings.discoveryFreshnessHours * 60 * 60_000;
   const bucket = force ? Date.now() : Math.floor(Date.now() / bucketMs);
   const idempotencyKey = `sfs_discovery:${creatorId}:${bucket}`;
-  const params = { source, force, requestedByUserId: userId, wallScanPosts: settings.wallScanPosts };
+  const params = { source, force, requestedByUserId: userId, wallScanPosts: settings.wallScanPosts, observationTokenVersion: 1, observationReadLeaseVersion: 1 };
   const planned = await ensurePlannedJob({
     db,
     jobKey: SFS_DISCOVERY_JOB_KEY,
@@ -143,7 +144,7 @@ async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force 
   return { ok: true, created: job?.status === "SCHEDULED", reason: "scheduled", job };
 }
 
-async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunkResult, projectFanObservations = projectFanObservationBatch }) {
+async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunkResult, projectFanObservations = projectFanObservationBatch, consumeObservationToken = consumeFanObservationToken }) {
   if (!job?.creatorId || !job?.agencyId) throw new Error("SFS discovery job is missing creator scope");
   const payload = object(chunkResult);
   if (payload.kind !== "sfs_target_profile") return { applied: 0 };
@@ -151,11 +152,31 @@ async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunk
   if (!target) return { applied: 0 };
   const producerObservedAt = dateOrNull(payload.observedAt);
   const receivedAt = new Date();
-  // SFS discovery uses the immutable PostgreSQL-owned job creation timestamp as
-  // its causal generation. Claim/start/receipt order is execution/transport
-  // order and must never make an older discovery generation appear newer.
-  const observedAt = dateOrNull(job.createdAt);
-  if (!observedAt) throw new Error("SFS_DISCOVERY_CAUSAL_GENERATION_REQUIRED");
+  const params = object(job.params);
+  const observationTokenVersion = int(params.observationTokenVersion, 0);
+  let observedAt = null;
+  let observationTimeBasis = "SERVER_JOB_GENERATION";
+  if (observationTokenVersion >= 1) {
+    const observationToken = clean(payload.observationToken, 500);
+    if (!observationToken) throw new Error("SFS_DISCOVERY_OBSERVATION_TOKEN_REQUIRED");
+    const consumed = await consumeObservationToken({
+      db,
+      job,
+      deviceId,
+      leaseRevision: Number(job.leaseRevision),
+      token: observationToken,
+      purpose: SFS_DISCOVERY_JOB_KEY,
+      subjects: [target.targetUserId],
+    });
+    observedAt = dateOrNull(consumed?.observedAt);
+    observationTimeBasis = "SERVER_PROVIDER_READ_TOKEN";
+    if (!observedAt) throw new Error("SFS_DISCOVERY_OBSERVATION_TIME_REQUIRED");
+  } else {
+    // Upgrade compatibility only: jobs created before the token cutover keep
+    // their immutable server generation so deploy does not break in-flight work.
+    observedAt = dateOrNull(job.createdAt);
+    if (!observedAt) throw new Error("SFS_DISCOVERY_CAUSAL_GENERATION_REQUIRED");
+  }
   const sourceJobId = clean(job.id, 180);
   if (!sourceJobId) throw new Error("SFS_DISCOVERY_SOURCE_JOB_REQUIRED");
 
@@ -227,7 +248,7 @@ async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunk
         ...(usedForever ? {} : { state: existing?.state === "STALE" ? "CANDIDATE" : existing?.state || "CANDIDATE" }),
         metadata: {
           ...object(existing?.metadata), discoveryJobId: sourceJobId, profileHash: payload.profileHash || null,
-          producerObservedAt: producerObservedAt?.toISOString() || null, observationTimeBasis: "SERVER_JOB_GENERATION",
+          producerObservedAt: producerObservedAt?.toISOString() || null, observationTimeBasis,
         },
       };
       const row = existing
@@ -821,17 +842,40 @@ async function setSfsCandidateState({ agencyId, creatorId, candidateId, action, 
           : null;
     if (!data) throw Object.assign(new Error("Unsupported SFS candidate action"), { code: "invalid_action", status: 400 });
     const updated = await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data });
-    if (["ignore", "block"].includes(action)) await tx.automationDelivery.updateMany({
-      where: {
+    if (["ignore", "block"].includes(action)) {
+      const deliveryWhere = {
         agencyId, creatorId, moduleKey: SFS_MODULE_KEY, fanId: candidate.targetUserId || "__none__",
         status: { in: PRECOMMIT_MUTABLE_STATUSES }, actionType: { not: SFS_UNFOLLOW_TARGET_ACTION_TYPE },
-      },
-      data: {
-        status: "CANCELED", failureCode: action === "block" ? "blocked" : "ignored",
-        lastError: `SFS candidate ${action}d`, finishedAt: new Date(),
-        claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
-      },
-    });
+      };
+      if (typeof tx.automationDelivery.findMany !== "function") {
+        await tx.automationDelivery.updateMany({
+          where: deliveryWhere,
+          data: {
+            status: "CANCELED", failureCode: action === "block" ? "blocked" : "ignored",
+            lastError: `SFS candidate ${action}d`, finishedAt: new Date(),
+            claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
+          },
+        });
+      } else {
+        const deliveries = await tx.automationDelivery.findMany({
+          where: deliveryWhere,
+          select: { id: true, leaseRevision: true },
+        });
+        for (const row of deliveries) {
+          const changed = await tx.automationDelivery.updateMany({
+            where: { id: row.id, leaseRevision: row.leaseRevision, status: { in: PRECOMMIT_MUTABLE_STATUSES } },
+            data: {
+              status: "CANCELED", failureCode: action === "block" ? "blocked" : "ignored",
+              lastError: `SFS candidate ${action}d`, finishedAt: new Date(),
+              claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
+            },
+          });
+          if (changed.count && typeof tx.fanObservationReadLease?.deleteMany === "function") {
+            await tx.fanObservationReadLease.deleteMany({ where: { deliveryId: row.id, leaseRevision: row.leaseRevision } });
+          }
+        }
+      }
+    }
     return { ok: true, item: updated };
   } });
 }

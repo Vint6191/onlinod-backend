@@ -60,7 +60,9 @@ test("campaign scanner persists fresh OF fan value as typed current state, not o
   assert.match(migration, /CreatorFanValueCurrent_sourceDeviceId_fkey/);
   assert.match(migration, /CreatorFanValueCurrent_sourceJobId_fkey/);
   assert.match(ledger, /ingestCampaignFanValueChunk/);
-  assert.match(ledger, /valueSource: text\(item\.valueSource \?\? item\.source, 80\) \|\| "USER_PROFILE"/);
+  assert.doesNotMatch(ledger, /valueSource: text\(item\.valueSource \?\? item\.source/);
+  assert.match(ledger, /source: "CAMPAIGN_CLAIMER"/);
+  assert.match(ledger, /CAMPAIGN_FAN_VALUE_SCOPE_MISMATCH/);
   assert.match(ledger, /platformReportedFanSpendCents/);
   assert.doesNotMatch(schema.slice(schema.indexOf("model CreatorCampaignFan"), schema.indexOf("model CreatorEarningsDaily")), /totalNetCents|messagesNetCents|tipsNetCents/);
 });

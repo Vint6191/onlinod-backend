@@ -2,6 +2,8 @@
 
 const crypto = require("node:crypto");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { consumeFanObservationToken } = require("./fan-observation-token-service");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
 
 const IDENTITY_SOURCE_PRIORITY = Object.freeze({
   AUTOMATION_WRITE_RESULT: 900,
@@ -16,6 +18,10 @@ const IDENTITY_SOURCE_PRIORITY = Object.freeze({
   TRAFFIC_LEGACY_MIGRATION: 50,
   UNKNOWN: 0,
 });
+
+const FAN_DATA_POINT_REFRESH_CHUNK_MAX = 20;
+const FAN_DATA_POINT_REFRESH_MAX_FANS = 500;
+const FAN_DATA_OBSERVATION_BATCH_MAX = 500;
 
 const VALUE_AVAILABILITY = Object.freeze({
   AVAILABLE: "AVAILABLE",
@@ -132,6 +138,47 @@ function parseAuthorityVersion(version) {
   };
 }
 
+function authorityFactIdentity(version) {
+  const raw = text(version, 500);
+  if (!raw) return null;
+  const parts = raw.split("|");
+  const observedAt = date(parts[0]);
+  const source = text(parts[2], 80);
+  const digest = text(parts[3], 128);
+  if (!observedAt || !source || !digest) return null;
+  return { observedAt: observedAt.toISOString(), source, digest };
+}
+
+function sameGenerationContradiction(leftVersion, rightVersion) {
+  const left = authorityFactIdentity(leftVersion);
+  const right = authorityFactIdentity(rightVersion);
+  return Boolean(
+    left && right
+    && left.observedAt === right.observedAt
+    && left.source === right.source
+    && left.digest !== right.digest
+  );
+}
+
+function fanDataConflict(kind, fanId, field, currentVersion, incomingVersion) {
+  const error = new FanDataObservationBoundaryError(
+    "FAN_DATA_SAME_GENERATION_CONFLICT",
+    `Contradictory ${kind} fact for fan ${fanId} field ${field} has the same observation generation and source`,
+    409,
+  );
+  error.details = { kind, fanId, field, currentVersion, incomingVersion };
+  return error;
+}
+
+function chooseAuthorityEntry(current, candidate, context) {
+  if (!candidate?.version) return current || null;
+  if (current?.version && sameGenerationContradiction(current.version, candidate.version)) {
+    throw fanDataConflict(context.kind, context.fanId, context.field, current.version, candidate.version);
+  }
+  if (!current?.version || candidate.version > current.version) return candidate;
+  return current;
+}
+
 function relationshipFieldAuthority(row) {
   if (!row) return {};
   const result = {};
@@ -214,6 +261,7 @@ async function projectFanIdentity(tx, observation) {
   const observedAt = date(observation.observedAt);
   if (!externalId || !observedAt) throw new Error("Invalid FanIdentityObservation");
   const source = text(observation.source, 80) || "UNKNOWN";
+  await lockFanAuthorityScope(tx, observation.creatorId, [externalId]);
   const fan = await ensureFanRecord(tx, observation);
   await projectFanActivity(tx, fan.id, observation.activityObservedAt);
 
@@ -230,6 +278,7 @@ async function projectFanIdentity(tx, observation) {
     const value = incoming[incomingField];
     if (value === null) continue;
     const version = authorityVersion(observedAt, source, value);
+    assertStoredVersionCompatible("identity", externalId, incomingField, fan[versionField], version);
     const result = await tx.creatorFan.updateMany({
       where: { id: fan.id, ...newerVersionWhere(versionField, version) },
       data: { [dbField]: value, [versionField]: version },
@@ -342,12 +391,20 @@ async function projectFanRelationship(tx, observation) {
   const observedAt = date(observation.observedAt);
   if (!externalId || !observedAt) throw new Error("Invalid CreatorFanRelationshipObservation");
   const source = text(observation.source, 80) || "UNKNOWN";
+  await lockFanAuthorityScope(tx, observation.creatorId, [externalId]);
   const fan = await ensureFanRecord(tx, { ...observation, username: null, platformDisplayName: null });
   const where = { creatorId_onlyFansUserId: { creatorId: observation.creatorId, onlyFansUserId: externalId } };
   const fields = relationshipData(observation);
   if (!Object.keys(fields).length) return tx.creatorFanRelationshipCurrent.findUnique({ where });
   const observationVersion = authorityVersion(observedAt, source, fields);
   let existing = await tx.creatorFanRelationshipCurrent.findUnique({ where });
+  if (existing) {
+    for (const [field, versionField] of RELATIONSHIP_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(fields, field)) continue;
+      const version = authorityVersion(observedAt, source, fields[field]);
+      assertStoredVersionCompatible("relationship", externalId, field, existing[versionField], version);
+    }
+  }
   if (!existing) {
     const create = {
       agencyId: observation.agencyId, creatorId: observation.creatorId, fanRecordId: fan.id, onlyFansUserId: externalId,
@@ -429,6 +486,7 @@ async function projectFanValue(tx, observation) {
   const externalId = onlyFansUserId(observation.onlyFansUserId);
   const observedAt = date(observation.observedAt);
   if (!externalId || !observedAt) throw new Error("Invalid CreatorFanValueObservation");
+  await lockFanAuthorityScope(tx, observation.creatorId, [externalId]);
   const fan = await ensureFanRecord(tx, { ...observation, username: null, platformDisplayName: null });
   const where = { creatorId_fanRecordId: { creatorId: observation.creatorId, fanRecordId: fan.id } };
   const source = text(observation.source, 80) || "UNKNOWN";
@@ -472,6 +530,21 @@ async function projectFanValue(tx, observation) {
   }
 
   let existing = await tx.creatorFanValueCurrent.findUnique({ where });
+  if (existing) {
+    assertStoredVersionCompatible("value", externalId, "availability", existing.availabilityAuthorityVersion, availabilityVersion);
+    if (availability === VALUE_AVAILABILITY.AVAILABLE) {
+      for (const [field, versionField] of VALUE_FIELDS) {
+        const value = numeric[field];
+        if (value === null) continue;
+        assertStoredVersionCompatible("value", externalId, field, existing[versionField], authorityVersion(observedAt, source, value));
+      }
+    }
+    if (lastActivityPresent && (observation.lastActivityAt === null || lastActivityAt)) {
+      assertStoredVersionCompatible(
+        "value", externalId, "lastActivityAt", existing.lastActivityAtAuthorityVersion, authorityVersion(observedAt, source, lastActivityAt),
+      );
+    }
+  }
   if (!existing) {
     try {
       existing = await tx.creatorFanValueCurrent.create({ data: base });
@@ -937,6 +1010,72 @@ const BATCH_VALUE_FACT_KEYS = Object.freeze([
   "lastActivityAt",
 ]);
 
+async function lockFanAuthorityScope(tx, creatorId, fanIds) {
+  const ids = [...new Set((fanIds || []).map(onlyFansUserId).filter(Boolean))];
+  if (!ids.length || typeof tx?.$executeRawUnsafe !== "function") return;
+  // Same-generation conflict detection must serialize the read-before-write
+  // boundary, but FanData does not own a second advisory-lock implementation.
+  // A single creator-scoped key keeps the bulk path O(1) in lock statements and
+  // routes physical lock semantics through the project-wide DB lock authority.
+  await lockDbAdvisoryXact({ db: tx, key: `fan_data_authority:${String(creatorId)}` });
+}
+
+function assertStoredVersionCompatible(kind, fanId, field, currentVersion, incomingVersion) {
+  if (currentVersion && incomingVersion && sameGenerationContradiction(currentVersion, incomingVersion)) {
+    throw fanDataConflict(kind, fanId, field, currentVersion, incomingVersion);
+  }
+}
+
+async function assertNoPersistedBulkAuthorityConflicts(tx, { creatorId, fanRows, relationshipRows, valueRows }) {
+  const fanIds = [...new Set([
+    ...fanRows.map((row) => row.onlyFansUserId),
+    ...relationshipRows.map((row) => row.onlyFansUserId),
+    ...valueRows.map((row) => row.onlyFansUserId),
+  ])].filter(Boolean);
+  if (!fanIds.length) return;
+
+  const currentFans = typeof tx?.creatorFan?.findMany === "function"
+    ? await tx.creatorFan.findMany({ where: { creatorId, onlyFansUserId: { in: fanIds } } })
+    : [];
+  const fanByExternalId = new Map((currentFans || []).map((row) => [String(row.onlyFansUserId), row]));
+
+  for (const incoming of fanRows) {
+    const current = fanByExternalId.get(String(incoming.onlyFansUserId));
+    if (!current) continue;
+    for (const [incomingField, _dbField, versionField] of IDENTITY_FIELDS) {
+      assertStoredVersionCompatible("identity", incoming.onlyFansUserId, incomingField, current[versionField], incoming[versionField]);
+    }
+  }
+
+  const currentRelationships = typeof tx?.creatorFanRelationshipCurrent?.findMany === "function"
+    ? await tx.creatorFanRelationshipCurrent.findMany({ where: { creatorId, onlyFansUserId: { in: fanIds } } })
+    : [];
+  const relationshipByExternalId = new Map((currentRelationships || []).map((row) => [String(row.onlyFansUserId), row]));
+  for (const incoming of relationshipRows) {
+    const current = relationshipByExternalId.get(String(incoming.onlyFansUserId));
+    if (!current) continue;
+    for (const [field, versionField] of RELATIONSHIP_FIELDS) {
+      assertStoredVersionCompatible("relationship", incoming.onlyFansUserId, field, current[versionField], incoming[versionField]);
+    }
+  }
+
+  const fanRecordIds = [...new Set((currentFans || []).map((row) => row.id).filter(Boolean))];
+  const currentValues = fanRecordIds.length && typeof tx?.creatorFanValueCurrent?.findMany === "function"
+    ? await tx.creatorFanValueCurrent.findMany({ where: { creatorId, fanRecordId: { in: fanRecordIds } } })
+    : [];
+  const fanExternalIdByRecordId = new Map((currentFans || []).map((row) => [String(row.id), String(row.onlyFansUserId)]));
+  const valueByExternalId = new Map((currentValues || []).map((row) => [fanExternalIdByRecordId.get(String(row.fanRecordId)), row]));
+  for (const incoming of valueRows) {
+    const current = valueByExternalId.get(String(incoming.onlyFansUserId));
+    if (!current) continue;
+    assertStoredVersionCompatible("value", incoming.onlyFansUserId, "availability", current.availabilityAuthorityVersion, incoming.availabilityAuthorityVersion);
+    for (const [field, versionField] of VALUE_FIELDS) {
+      assertStoredVersionCompatible("value", incoming.onlyFansUserId, field, current[versionField], incoming[versionField]);
+    }
+    assertStoredVersionCompatible("value", incoming.onlyFansUserId, "lastActivityAt", current.lastActivityAtAuthorityVersion, incoming.lastActivityAtAuthorityVersion);
+  }
+}
+
 function ownFacts(input, keys) {
   const out = {};
   if (!input || typeof input !== "object") return out;
@@ -1011,7 +1150,8 @@ function normalizeBatchObservation(raw, envelope) {
   return normalized;
 }
 
-function maxVersionEntry(current, candidate) {
+function maxVersionEntry(current, candidate, context = null) {
+  if (context) return chooseAuthorityEntry(current, candidate, context);
   if (!candidate?.version) return current || null;
   if (!current?.version || candidate.version > current.version) return candidate;
   return current;
@@ -1057,7 +1197,11 @@ function buildGenericFanObservationBulkRows(rows, { agencyId, creatorId, sourceD
           if (value === null) continue;
           const version = authorityVersion(observedAt, source, value);
           const previous = fan.identityFields[versionField];
-          if (!previous || version > previous.version) fan.identityFields[versionField] = { dbField, value, version };
+          fan.identityFields[versionField] = chooseAuthorityEntry(
+            previous,
+            { dbField, value, version },
+            { kind: "identity", fanId, field: incomingField },
+          );
         }
         if (Object.values(incoming).some((value) => value !== null)) {
           const version = authorityVersion(observedAt, source, incoming);
@@ -1082,7 +1226,11 @@ function buildGenericFanObservationBulkRows(rows, { agencyId, creatorId, sourceD
           const value = facts[field];
           const version = authorityVersion(observedAt, source, value);
           const previous = aggregate.fields[versionField];
-          if (!previous || version > previous.version) aggregate.fields[versionField] = { field, value, version };
+          aggregate.fields[versionField] = chooseAuthorityEntry(
+            previous,
+            { field, value, version },
+            { kind: "relationship", fanId, field },
+          );
         }
         const version = authorityVersion(observedAt, source, facts);
         aggregate.aggregate = maxVersionEntry(aggregate.aggregate, {
@@ -1115,22 +1263,28 @@ function buildGenericFanObservationBulkRows(rows, { agencyId, creatorId, sourceD
         const availabilityVersion = authorityVersion(observedAt, source, normalized.availability);
         aggregate.availability = maxVersionEntry(aggregate.availability, {
           version: availabilityVersion, value: normalized.availability,
-        });
+        }, { kind: "value", fanId, field: "availability" });
         if (normalized.availability === VALUE_AVAILABILITY.AVAILABLE) {
           for (const [field, versionField] of VALUE_FIELDS) {
             const fieldValue = normalized.numeric[field];
             if (fieldValue === null) continue;
             const version = authorityVersion(observedAt, source, fieldValue);
             const previous = aggregate.fields[versionField];
-            if (!previous || version > previous.version) aggregate.fields[versionField] = { field, value: fieldValue, version };
+            aggregate.fields[versionField] = chooseAuthorityEntry(
+              previous,
+              { field, value: fieldValue, version },
+              { kind: "value", fanId, field },
+            );
           }
         }
         if (normalized.lastActivityPresent && (value.lastActivityAt === null || normalized.lastActivityAt)) {
           const version = authorityVersion(observedAt, source, normalized.lastActivityAt);
           const previous = aggregate.fields.lastActivityAtAuthorityVersion;
-          if (!previous || version > previous.version) {
-            aggregate.fields.lastActivityAtAuthorityVersion = { field: "lastActivityAt", value: normalized.lastActivityAt, version };
-          }
+          aggregate.fields.lastActivityAtAuthorityVersion = chooseAuthorityEntry(
+            previous,
+            { field: "lastActivityAt", value: normalized.lastActivityAt, version },
+            { kind: "value", fanId, field: "lastActivityAt" },
+          );
         }
         const version = authorityVersion(observedAt, source, normalized.observedFields);
         aggregate.aggregate = maxVersionEntry(aggregate.aggregate, {
@@ -1207,6 +1361,9 @@ function buildGenericFanObservationBulkRows(rows, { agencyId, creatorId, sourceD
 
 async function applyGenericFanObservationBulkSql(tx, rows, scope) {
   const { fanRows, relationshipRows, valueRows } = buildGenericFanObservationBulkRows(rows, scope);
+  const fanIds = [...new Set(rows.map((row) => row.onlyFansUserId).filter(Boolean))];
+  await lockFanAuthorityScope(tx, scope.creatorId, fanIds);
+  await assertNoPersistedBulkAuthorityConflicts(tx, { creatorId: scope.creatorId, fanRows, relationshipRows, valueRows });
   if (fanRows.length) {
     const json = JSON.stringify(fanRows);
     await tx.$executeRawUnsafe(`
@@ -1293,7 +1450,7 @@ async function applyGenericFanObservationBulkSql(tx, rows, scope) {
         "relationshipAuthorityVersion","fanSubscribesToCreatorAuthorityVersion","fanSubscriptionActiveAuthorityVersion","fanSubscriptionTypeAuthorityVersion",
         "fanSubscriptionExpiresAtAuthorityVersion","creatorFollowsFanAuthorityVersion","creatorFollowExpiresAtAuthorityVersion","canReceiveChatMessageAuthorityVersion",
         "blockedAuthorityVersion","restrictedAuthorityVersion","performerAuthorityVersion","lastSeenAtAuthorityVersion","subscribePriceCentsAuthorityVersion",
-        "observedAt","source","sourceDeviceId","sourceJobId","scanRunId","createdAt","updatedAt"
+        "observedAt","source","sourceDeviceId","sourceJobId","sourceDeliveryId","scanRunId","createdAt","updatedAt"
       )
       SELECT
         "id","agencyId","creatorId","fanRecordId","onlyFansUserId",
@@ -1434,7 +1591,15 @@ async function projectFanObservationBatch(db, {
   // Validate and strip the entire producer payload before any DB mutation. Nested
   // objects own facts only; tenant/creator/fan/provenance/source/time authority is
   // supplied by the trusted envelope and can never be reintroduced by spread order.
-  const rows = (Array.isArray(items) ? items.slice(0, 500) : [])
+  const inputItems = Array.isArray(items) ? items : [];
+  if (inputItems.length > FAN_DATA_OBSERVATION_BATCH_MAX) {
+    throw new FanDataObservationBoundaryError(
+      "FAN_DATA_OBSERVATION_BATCH_TOO_LARGE",
+      `Fan observation batch exceeds ${FAN_DATA_OBSERVATION_BATCH_MAX} observations`,
+      413,
+    );
+  }
+  const rows = inputItems
     .map((raw) => normalizeBatchObservation(raw, envelope))
     .filter(Boolean);
   const apply = async (tx) => {
@@ -1490,7 +1655,28 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
   }
   const requestedFanSet = new Set(requestedFanIds);
   const items = Array.isArray(chunkResult?.items) ? chunkResult.items : [];
-  const returnedFanIds = items.map((item) => onlyFansUserId(item?.onlyFansUserId)).filter(Boolean);
+  if (items.length > FAN_DATA_POINT_REFRESH_CHUNK_MAX) {
+    throw new FanDataObservationBoundaryError(
+      "FAN_DATA_POINT_REFRESH_CHUNK_TOO_LARGE",
+      `Fan data point refresh chunk exceeds ${FAN_DATA_POINT_REFRESH_CHUNK_MAX} observations`,
+      413,
+    );
+  }
+  const returnedFanIds = items.map((item) => onlyFansUserId(item?.onlyFansUserId));
+  if (returnedFanIds.some((fanId) => !fanId)) {
+    throw new FanDataObservationBoundaryError(
+      "FAN_DATA_POINT_REFRESH_FAN_ID_REQUIRED",
+      "Fan data point refresh result contains an invalid fan id",
+      400,
+    );
+  }
+  if (new Set(returnedFanIds).size !== returnedFanIds.length) {
+    throw new FanDataObservationBoundaryError(
+      "FAN_DATA_POINT_REFRESH_DUPLICATE_FAN",
+      "Fan data point refresh result contains duplicate fan observations in one causal chunk",
+      409,
+    );
+  }
   const outOfScopeFanIds = [...new Set(returnedFanIds.filter((fanId) => !requestedFanSet.has(fanId)))];
   if (outOfScopeFanIds.length) {
     throw new FanDataObservationBoundaryError(
@@ -1499,24 +1685,51 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
       403,
     );
   }
-  // The immutable job creation timestamp is the causal generation for this
-  // refresh. Claim/start/receipt can be arbitrarily delayed, so using them
-  // would let an older refresh become newer merely because it executed later.
-  // JobInstance.createdAt is PostgreSQL-owned (@default(now())).
+  // INT5.4C-1A: chronology is acquired after the provider reads complete, not
+  // from job creation order. The one-time token is lease/device/scope bound and
+  // carries a globally monotonic PostgreSQL-owned observedAt. This prevents an
+  // older job that physically reads later from losing merely because it was
+  // scheduled earlier.
   const receivedAt = await dbAuthorityNow({ db, fallbackNow: new Date() });
-  const causalObservedAt = date(job.createdAt);
-  if (!causalObservedAt) {
-    throw new FanDataObservationBoundaryError(
-      "FAN_DATA_POINT_REFRESH_CAUSAL_GENERATION_REQUIRED",
-      "Fan data point refresh job is missing its server-owned generation time",
-      409,
-    );
+  let causalObservedAt = null;
+  const observationTokenRequired = Number(job?.params?.observationTokenVersion || 0) >= 1;
+  if (items.length && observationTokenRequired) {
+    try {
+      const consumedToken = await consumeFanObservationToken({
+        db,
+        job,
+        deviceId,
+        leaseRevision: job.leaseRevision,
+        token: chunkResult?.observationToken,
+        purpose: "fan_data_point_refresh",
+        subjects: returnedFanIds,
+      });
+      causalObservedAt = date(consumedToken.observedAt);
+    } catch (error) {
+      throw new FanDataObservationBoundaryError(
+        "FAN_DATA_POINT_REFRESH_OBSERVATION_TOKEN_INVALID",
+        error?.message || "Fan data point refresh observation token is invalid",
+        409,
+      );
+    }
+  } else if (items.length) {
+    // Rollout compatibility for jobs created before INT5.4C-1A deployment. New
+    // schedules always carry observationTokenVersion=1 and cannot use this path.
+    causalObservedAt = date(job.createdAt);
+  } else {
+    causalObservedAt = receivedAt;
   }
+  if (!causalObservedAt) throw new FanDataObservationBoundaryError(
+    "FAN_DATA_POINT_REFRESH_OBSERVATION_TIME_REQUIRED",
+    "Fan data point refresh is missing server-owned observation chronology",
+    409,
+  );
   const result = await projectFanObservationBatch(db, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     sourceDeviceId: deviceId,
     sourceJobId: job.id,
+    sourceDeliveryId: text(job?.params?.sourceDeliveryId, 180),
     items,
     allowedSources: ["USER_PROFILE"],
     observedAtPolicy: "SERVER_GENERATION",
@@ -1538,7 +1751,14 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
 
 async function scheduleFanDataPointRefresh({ agencyId, creatorId, onlyFansUserIds = [], reason = "fan_data_point_refresh", priority = 95, now = new Date(), params = {} } = {}) {
   if (!text(agencyId, 180) || !text(creatorId, 180)) return { created: false, reason: "missing_scope" };
-  const ids = [...new Set((onlyFansUserIds || []).map(onlyFansUserId).filter(Boolean))].sort().slice(0, 500);
+  const ids = [...new Set((onlyFansUserIds || []).map(onlyFansUserId).filter(Boolean))].sort();
+  if (ids.length > FAN_DATA_POINT_REFRESH_MAX_FANS) {
+    throw new FanDataObservationBoundaryError(
+      "FAN_DATA_POINT_REFRESH_TOO_LARGE",
+      `Fan data point refresh exceeds ${FAN_DATA_POINT_REFRESH_MAX_FANS} fans`,
+      413,
+    );
+  }
   if (!ids.length) return { created: false, reason: "no_fan_ids" };
   const { ensureSingleJob } = require("./job-scheduler");
   // Generic creator-wide coalescing would drop a second refresh batch while a
@@ -1557,7 +1777,7 @@ async function scheduleFanDataPointRefresh({ agencyId, creatorId, onlyFansUserId
     jobKey: FAN_DATA_POINT_REFRESH_JOB_KEY,
     creatorId,
     agencyId,
-    params: { ...stableParams, fanIds: ids, rangeKey, requestReason: text(reason, 120) || "fan_data_point_refresh" },
+    params: { ...stableParams, fanIds: ids, rangeKey, requestReason: text(reason, 120) || "fan_data_point_refresh", observationTokenVersion: 1, observationReadLeaseVersion: 1 },
     priority,
     now,
     freshnessWindowMs: 2 * 60 * 1000,
@@ -1620,6 +1840,8 @@ async function readFanCurrent(db, { agencyId, creatorId, onlyFansUserIds }) {
 module.exports = {
   IDENTITY_SOURCE_PRIORITY,
   VALUE_AVAILABILITY,
+  FAN_DATA_OBSERVATION_BATCH_MAX,
+  FAN_DATA_POINT_REFRESH_MAX_FANS,
   FanDataObservationBoundaryError,
   FAN_DATA_POINT_REFRESH_JOB_KEY,
   onlyFansUserId,

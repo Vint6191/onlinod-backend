@@ -12,6 +12,14 @@ const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fe
 const { buildAutomationEffectTimeEvidence, sanitizeAutomationSettlementResult } = require("./automation-effect-time-service");
 const { validateFollowBackDeliveryCurrent, assertFanCurrentFieldFence } = require("./fan-current-consumer-service");
 const { scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { createActionFanObservationToken } = require("./fan-observation-token-service");
+const {
+  FanObservationReadLeaseError,
+  FAN_OBSERVATION_READ_LEASE_TTL_MS,
+  acquireFanObservationReadLease,
+  completeDeliveryFanObservationReadLease,
+  releaseDeliveryFanObservationReadLease,
+} = require("./fan-observation-read-lease-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
@@ -68,6 +76,7 @@ const DEFAULT_LEASE_MS = 3 * 60_000;
 const MIN_LEASE_MS = 30_000;
 const MAX_LEASE_MS = 10 * 60_000;
 const MAX_RECONCILIATION_WAIT_MS = 30 * 60_000;
+const ACTION_PROFILE_OBSERVATION_PURPOSE = "action_user_profile";
 const PROFILE_OBSERVATION_ACTION_TYPES = new Set([
   "FOLLOW_BACK",
   UNFOLLOW_FAN_ACTION_TYPE,
@@ -280,6 +289,11 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
         finishedAt: now, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, lastCheckedAt: now, result,
       } });
       if (!changedRow.count) return null;
+      if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+        await tx.fanObservationReadLease.deleteMany({
+          where: { deliveryId: row.id, leaseRevision: row.leaseRevision },
+        });
+      }
       const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
       await updateModuleCandidateProgress(current, "FAILED", failureCode, tx);
       await updateCandidateFromTerminal(current, "FAILED", failureCode, tx);
@@ -316,6 +330,11 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
         data: { status: nextStatus, failureCode, failureCategory, lastError: mustReconcile ? "Action outcome must be reconciled after lost commit/reconciliation lease" : "Action lease expired", notBefore: terminal ? row.notBefore : retryAt, finishedAt: terminal ? now : null, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, result: nextResult },
       });
       if (!updated.count) return null;
+      if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+        await tx.fanObservationReadLease.deleteMany({
+          where: { deliveryId: row.id, leaseRevision: row.leaseRevision },
+        });
+      }
       const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
       await updateModuleCandidateProgress(current, nextStatus, failureCode, tx);
       if (!mustReconcile) {
@@ -856,6 +875,65 @@ async function lockDeliveryExecutionAccess({ db, delivery, userId }) {
   }
 }
 
+function actionReadLeaseError(error) {
+  if (error instanceof FanObservationReadLeaseError) {
+    const wrapped = new ActionDeliveryError(error.code, error.message, error.status);
+    if (Number.isFinite(Number(error.retryAfterMs))) wrapped.retryAfterMs = Number(error.retryAfterMs);
+    return wrapped;
+  }
+  return error;
+}
+
+async function lockCurrentActionProfileLease({ db, delivery, deviceId, leaseToken, leaseRevision, now }) {
+  const rows = await db.$queryRawUnsafe(`
+    SELECT "id" FROM "AutomationDelivery"
+    WHERE "id" = $1
+      AND "status" = 'RUNNING'
+      AND "claimedByDeviceId" = $2
+      AND "leaseTokenHash" = $3
+      AND "leaseRevision" = $4
+      AND "claimUntil" > $5
+    FOR UPDATE
+  `, delivery.id, deviceId, hashToken(leaseToken), Number(leaseRevision), now);
+  if (!rows?.[0]) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before profile observation read boundary", 409);
+}
+
+async function acquireActionProfileObservationReadLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, db = prisma }) {
+  const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  return db.$transaction(async (tx) => {
+    const delivery = await requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, db: tx, lockAccess: true });
+    if (delivery.status !== "RUNNING") throw new ActionDeliveryError("FAN_DATA_OBSERVATION_DELIVERY_NOT_RUNNING", "Profile observation read lease requires a RUNNING delivery", 409);
+    if (!PROFILE_OBSERVATION_ACTION_TYPES.has(String(delivery.actionType || ""))) {
+      throw new ActionDeliveryError("FAN_DATA_OBSERVATION_ACTION_SCOPE_FORBIDDEN", "Delivery action is not allowed to observe USER_PROFILE", 403);
+    }
+    if (Number(object(delivery.result).profileObservationReadLeaseVersion || 0) < 1) {
+      throw new ActionDeliveryError("FAN_OBSERVATION_READ_LEASE_NOT_REQUIRED", "Delivery does not use the cross-device profile observation read lease", 409);
+    }
+    await lockCurrentActionProfileLease({ db: tx, delivery, deviceId, leaseToken, leaseRevision, now });
+    const requestId = `obs-read-action:${delivery.id}:${delivery.leaseRevision}:${ACTION_PROFILE_OBSERVATION_PURPOSE}`;
+    try {
+      return await acquireFanObservationReadLease({
+        db: tx, deliveryId: delivery.id, agencyId: delivery.agencyId, creatorId: delivery.creatorId, deviceId,
+        leaseRevision, purpose: ACTION_PROFILE_OBSERVATION_PURPOSE, requestId,
+      });
+    } catch (error) { throw actionReadLeaseError(error); }
+  }, { timeout: 30_000 });
+}
+
+async function releaseActionProfileObservationReadLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, readLeaseToken, db = prisma }) {
+  // Release is deliberately allowed after the delivery itself changed/expired:
+  // the read-lease token + delivery/device/revision tuple is the cleanup authority.
+  // This prevents admin release / lease expiry racing an in-flight OF read from
+  // parking the entire creator observation lane until TTL.
+  const { device } = await requireOwnedSeniorDevice({ userId, deviceId, db });
+  const delivery = await db.automationDelivery.findUnique({ where: { id: deliveryId } });
+  if (!delivery) return { released: false };
+  if (delivery.agencyId !== device.agencyId) throw new ActionDeliveryError("DELIVERY_DEVICE_AGENCY_MISMATCH", "Delivery belongs to another agency", 403);
+  try {
+    return await releaseDeliveryFanObservationReadLease({ db, delivery, deviceId, leaseRevision, readLeaseToken });
+  } catch (error) { throw actionReadLeaseError(error); }
+}
+
 async function authorizeActionProfileObservation({
   deliveryId,
   userId,
@@ -893,11 +971,56 @@ async function authorizeActionProfileObservation({
   return { delivery, targetId, causalObservedAt: attemptStartedAt };
 }
 
+async function issueActionProfileObservationToken({
+  deliveryId,
+  userId,
+  deviceId,
+  leaseToken,
+  leaseRevision,
+  readLeaseToken = null,
+  db = prisma,
+}) {
+  const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  return db.$transaction(async (tx) => {
+    const delivery = await requireLease({
+      deliveryId, userId, deviceId, leaseToken, leaseRevision, lockAccess: true, db: tx,
+    });
+    if (delivery.status !== "RUNNING") {
+      throw new ActionDeliveryError("FAN_DATA_OBSERVATION_DELIVERY_NOT_RUNNING", "Profile observation token requires a RUNNING delivery", 409);
+    }
+    if (!PROFILE_OBSERVATION_ACTION_TYPES.has(String(delivery.actionType || ""))) {
+      throw new ActionDeliveryError("FAN_DATA_OBSERVATION_ACTION_SCOPE_FORBIDDEN", "Delivery action is not allowed to observe USER_PROFILE", 403);
+    }
+    const targetId = clean(delivery.targetId || delivery.fanId, 180);
+    if (!targetId) {
+      throw new ActionDeliveryError("FAN_DATA_OBSERVATION_TARGET_SCOPE_MISSING", "Profile observation delivery is missing its target fan", 409);
+    }
+    const readLeaseRequired = Number(object(delivery.result).profileObservationReadLeaseVersion || 0) >= 1;
+    if (readLeaseRequired) {
+      if (!clean(readLeaseToken, 500)) {
+        throw new ActionDeliveryError("FAN_OBSERVATION_READ_LEASE_REQUIRED", "Profile observation token requires the active cross-device read lease", 409);
+      }
+      await lockCurrentActionProfileLease({ db: tx, delivery, deviceId, leaseToken, leaseRevision, now });
+      try {
+        const issued = await completeDeliveryFanObservationReadLease({
+          db: tx, delivery, deviceId, leaseRevision, readLeaseToken,
+          purpose: ACTION_PROFILE_OBSERVATION_PURPOSE, subjects: [targetId],
+        });
+        return { ok: true, token: issued.token, observedAt: issued.observedAt, targetId };
+      } catch (error) { throw actionReadLeaseError(error); }
+    }
+    const issued = await createActionFanObservationToken({
+      db: tx, delivery, deviceId, leaseRevision, purpose: ACTION_PROFILE_OBSERVATION_PURPOSE, subjects: [targetId],
+    });
+    return { ok: true, token: issued.token, observedAt: issued.observedAt, targetId };
+  }, { timeout: 30_000 });
+}
+
 async function renewActionLease(input) {
   return prisma.$transaction(async (tx) => {
     const delivery = await requireLease({ ...input, db: tx, lockAccess: true });
     if (delivery.status !== "COMMITTING" && !deliveryRequiresReconciliation(delivery)) await assertDeliveryControl(delivery, { allowRunningUnfollow: true, db: tx });
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const nextLeaseUntil = new Date(now.getTime() + leaseDuration(input.leaseMs));
     const result = await tx.automationDelivery.updateMany({
       where: {
@@ -911,15 +1034,22 @@ async function renewActionLease(input) {
       data: { claimUntil: nextLeaseUntil, lastCheckedAt: now },
     });
     if (!result.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery lease changed before renewal");
+    if (typeof tx.fanObservationReadLease?.updateMany === "function") {
+      await tx.fanObservationReadLease.updateMany({
+        where: { deliveryId: delivery.id, deviceId: input.deviceId, leaseRevision: input.leaseRevision },
+        data: { expiresAt: new Date(now.getTime() + FAN_OBSERVATION_READ_LEASE_TTL_MS) },
+      });
+    }
     return { ok: true, id: delivery.id, leaseRevision: delivery.leaseRevision, leaseUntil: nextLeaseUntil };
   }, { timeout: 30_000 });
 }
 
 async function startActionDelivery(input) {
   const running = await prisma.$transaction(async (tx) => {
-    // attemptStartedAt participates in FanData SERVER_GENERATION ordering for
-    // action-scoped /users/:fanId observations. PostgreSQL, not the Node
-    // process clock, owns that durable cross-replica generation timestamp.
+    // attemptStartedAt remains rollout compatibility only for deliveries that
+    // were already RUNNING before this server cutover. For every newly-started
+    // profile-reading action the Backend itself marks post-provider-read tokens
+    // mandatory; client capability input is informational, never chronology authority.
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const delivery = await requireLease({ ...input, db: tx, lockAccess: true });
     const reconciliationLease = deliveryRequiresReconciliation(delivery);
@@ -929,7 +1059,7 @@ async function startActionDelivery(input) {
     if (delivery.status === "COMMITTING") throw new ActionDeliveryError("DELIVERY_ALREADY_COMMITTING", "Delivery already crossed the write commit boundary");
     const updated = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "CLAIMED", leaseRevision: input.leaseRevision, claimedByDeviceId: input.deviceId },
-      data: { status: "RUNNING", lastCheckedAt: now, result: { ...object(delivery.result), ...(reconciliationLease ? { outcomeState: "RECONCILE_REQUIRED", reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString() } : { attemptStartedAt: now.toISOString() }), attemptLeaseRevision: delivery.leaseRevision } },
+      data: { status: "RUNNING", lastCheckedAt: now, result: { ...object(delivery.result), ...(reconciliationLease ? { outcomeState: "RECONCILE_REQUIRED", reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString() } : { attemptStartedAt: now.toISOString() }), ...(PROFILE_OBSERVATION_ACTION_TYPES.has(String(delivery.actionType || "")) ? { profileObservationTokenVersion: 1, profileObservationReadLeaseVersion: 1 } : {}), attemptLeaseRevision: delivery.leaseRevision } },
     });
     if (!updated.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before start");
     const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
@@ -1257,6 +1387,11 @@ async function failActionDelivery(input) {
       },
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before failure update");
+    if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+      await tx.fanObservationReadLease.deleteMany({
+        where: { deliveryId: delivery.id, deviceId: input.deviceId, leaseRevision: input.leaseRevision },
+      });
+    }
     const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
     if (reconcile) {
       await updateModuleCandidateProgress(current, "RECONCILE_REQUIRED", failureCode, tx);
@@ -1296,6 +1431,11 @@ async function releaseActionDelivery(input) {
       },
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery changed before release");
+    if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+      await tx.fanObservationReadLease.deleteMany({
+        where: { deliveryId: delivery.id, deviceId: input.deviceId, leaseRevision: input.leaseRevision },
+      });
+    }
     const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
     await updateModuleCandidateProgress(current, nextStatus, clean(input.reason, 500), tx);
     return current;
@@ -1494,6 +1634,11 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
       },
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before cancel");
+    if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+      await tx.fanObservationReadLease.deleteMany({
+        where: { deliveryId: delivery.id, leaseRevision: delivery.leaseRevision },
+      });
+    }
     const latest = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
     if (latest?.moduleKey === "bumps") {
       await finalizeBumpTerminal({ delivery: latest, status: "CANCELED", failureCode: "canceled", db: tx });
@@ -1526,6 +1671,11 @@ async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId }) {
       data: { status: "QUEUED", notBefore: new Date(Date.now() + 15_000), claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, attempts: { decrement: 1 }, lastError: "Claim released by administrator" },
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before administrative release");
+    if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+      await tx.fanObservationReadLease.deleteMany({
+        where: { deliveryId: delivery.id, leaseRevision: delivery.leaseRevision },
+      });
+    }
     const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
     await updateModuleCandidateProgress(current, "QUEUED", "claim_released", tx);
     return current;
@@ -1580,5 +1730,8 @@ module.exports = {
   cancelActionDelivery,
   releaseClaimByAdmin,
   authorizeActionProfileObservation,
+  acquireActionProfileObservationReadLease,
+  releaseActionProfileObservationReadLease,
+  issueActionProfileObservationToken,
   __test: { requireLiveAutomationManagementActor, requireLease },
 };

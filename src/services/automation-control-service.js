@@ -382,6 +382,11 @@ async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey
         },
       });
       if (!updated.count) return false;
+      if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+        await tx.fanObservationReadLease.deleteMany({
+          where: { deliveryId: row.id, leaseRevision: row.leaseRevision },
+        });
+      }
       const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
       await projectControlDeliveryState(tx, current, "PAUSED", failureCode);
       return true;
@@ -451,6 +456,11 @@ async function cancelAutomationJobsForControl({ agencyId, creatorId = null, modu
         },
       });
       if (!updated.count) return false;
+      if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+        await tx.fanObservationReadLease.deleteMany({
+          where: { jobId: job.id, leaseRevision: job.leaseRevision },
+        });
+      }
       await recordJobFailure({ db: tx, job, error: reason || failureCode || "control_cancelled", terminal: true });
       return true;
     });

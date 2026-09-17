@@ -110,7 +110,7 @@ test("identity field clocks reject delayed identity while preserving newer curre
   assert.equal(tx.fan.identitySource, "USER_PROFILE");
 });
 
-test("equal identity timestamp uses source quality and deterministic value hash as tie-breakers", async () => {
+test("equal identity timestamp may use source quality, but same-source contradictions are not hash-ordered", async () => {
   const tx = authorityTx({ fan: baseFan() });
   await projectIdentity(tx, "2026-08-30T12:00:00Z", "CAMPAIGN_CLAIMER", { username: "campaign" });
   await projectIdentity(tx, "2026-08-30T12:00:00Z", "USER_PROFILE", { username: "profile" });

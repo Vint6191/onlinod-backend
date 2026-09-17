@@ -20,6 +20,13 @@ function bulkDb() {
   };
 }
 
+
+function splitSqlCalls(calls) {
+  const locks = calls.filter((call) => /pg_advisory_xact_lock/.test(call.sql));
+  const writes = calls.filter((call) => !/pg_advisory_xact_lock/.test(call.sql));
+  return { locks, writes };
+}
+
 function profile(fanId) {
   return {
     onlyFansUserId: fanId,
@@ -52,16 +59,18 @@ test("INT5.3A action profile provenance uses AutomationDelivery FK, never source
     receivedAt: new Date("2026-09-16T19:00:05.000Z"),
   });
   assert.equal(result.projected, 1);
-  assert.equal(db.calls.length, 4);
+  const { locks, writes } = splitSqlCalls(db.calls);
+  assert.equal(locks.length, 1);
+  assert.equal(writes.length, 4);
 
-  const relationshipRows = JSON.parse(db.calls[2].args[0]);
-  const valueRows = JSON.parse(db.calls[3].args[0]);
+  const relationshipRows = JSON.parse(writes[2].args[0]);
+  const valueRows = JSON.parse(writes[3].args[0]);
   assert.equal(relationshipRows[0].sourceDeliveryId, "delivery-1");
   assert.equal(relationshipRows[0].sourceJobId, null);
   assert.equal(valueRows[0].sourceDeliveryId, "delivery-1");
   assert.equal(valueRows[0].sourceJobId, null);
-  assert.match(db.calls[2].sql, /"sourceDeliveryId"/);
-  assert.match(db.calls[3].sql, /"sourceDeliveryId"/);
+  assert.match(writes[2].sql, /"sourceDeliveryId"/);
+  assert.match(writes[3].sql, /"sourceDeliveryId"/);
 });
 
 test("INT5.3A malformed ID-only observation is ignored before bulk SQL", async () => {
@@ -91,8 +100,10 @@ test("INT5.3A generic bulk rows are ordered by opaque fan id for deterministic l
     causalObservedAt: new Date("2026-09-16T19:00:00.000Z"),
     receivedAt: new Date("2026-09-16T19:00:05.000Z"),
   });
+  const { locks, writes } = splitSqlCalls(db.calls);
+  assert.equal(locks.length, 1);
   for (const callIndex of [0, 2, 3]) {
-    const ids = JSON.parse(db.calls[callIndex].args[0]).map((row) => row.onlyFansUserId);
+    const ids = JSON.parse(writes[callIndex].args[0]).map((row) => row.onlyFansUserId);
     assert.deepEqual(ids, ["fan-a", "fan-m", "fan-z"]);
   }
 });

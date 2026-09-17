@@ -32,6 +32,9 @@ const {
   retrySafeFailures,
   cancelActionDelivery,
   releaseClaimByAdmin,
+  acquireActionProfileObservationReadLease,
+  releaseActionProfileObservationReadLease,
+  issueActionProfileObservationToken,
 } = require("../services/automation-action-delivery-service");
 const {
   planFollowBack,
@@ -759,6 +762,16 @@ const workerLeaseSchema = z.object({
   leaseRevision: z.number().int().min(1),
   leaseMs: z.number().int().min(30_000).max(10 * 60_000).optional(),
 });
+const workerStartSchema = workerLeaseSchema.extend({
+  profileObservationTokenVersion: z.literal(1).optional(),
+  profileObservationReadLeaseVersion: z.literal(1).optional(),
+});
+const workerReadLeaseReleaseSchema = workerLeaseSchema.extend({
+  readLeaseToken: z.string().min(16).max(500),
+});
+const workerProfileObservationTokenSchema = workerLeaseSchema.extend({
+  readLeaseToken: z.string().min(16).max(500).optional(),
+});
 router.post("/worker/claim", async (req, res) => {
   try {
     const input = z.object({
@@ -777,8 +790,35 @@ router.post("/worker/:id/renew", async (req, res) => {
   catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_RENEW_FAILED"); }
 });
 router.post("/worker/:id/start", async (req, res) => {
-  try { const input = workerLeaseSchema.parse(req.body || {}); return res.json(await startActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
+  try { const input = workerStartSchema.parse(req.body || {}); return res.json(await startActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
   catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_START_FAILED"); }
+});
+router.post("/worker/:id/profile-observation-read-lease/acquire", async (req, res) => {
+  try {
+    const input = workerLeaseSchema.parse(req.body || {});
+    return res.json({ ok: true, ...(await acquireActionProfileObservationReadLease({ deliveryId: req.params.id, userId: req.auth.userId, ...input })) });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "ACTION_PROFILE_OBSERVATION_READ_LEASE_FAILED");
+  }
+});
+router.post("/worker/:id/profile-observation-read-lease/release", async (req, res) => {
+  try {
+    const input = workerReadLeaseReleaseSchema.parse(req.body || {});
+    return res.json({ ok: true, ...(await releaseActionProfileObservationReadLease({ deliveryId: req.params.id, userId: req.auth.userId, ...input })) });
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "ACTION_PROFILE_OBSERVATION_READ_LEASE_RELEASE_FAILED");
+  }
+});
+router.post("/worker/:id/profile-observation-token", async (req, res) => {
+  try {
+    const input = workerProfileObservationTokenSchema.parse(req.body || {});
+    return res.json(await issueActionProfileObservationToken({ deliveryId: req.params.id, userId: req.auth.userId, ...input }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return validationError(res, error);
+    return serviceError(res, error, "ACTION_PROFILE_OBSERVATION_TOKEN_FAILED");
+  }
 });
 router.post("/worker/:id/validate", async (req, res) => {
   try { const input = workerLeaseSchema.parse(req.body || {}); return res.json(await validateActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }

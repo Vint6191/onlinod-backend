@@ -432,23 +432,43 @@ async function setCandidateState({ agencyId, creatorId, fanId, action }) {
         ? { ignored: true, blocked: false, state: "IGNORED", eligibilityReason: "ignored" }
         : { blocked: true, ignored: false, state: "BLOCKED", eligibilityReason: "blocked" };
       const updated = await tx.followBackCandidate.update({ where: { id: candidate.id }, data });
-      await tx.automationDelivery.updateMany({
-        where: {
-          agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, targetId: fanId,
-          status: { in: PRECOMMIT_MUTABLE_STATUSES },
-        },
-        data: {
-          status: "CANCELED",
-          failureCode: normalized === "block" ? "blocked" : "ignored",
-          lastError: `Candidate ${normalized}d`,
-          finishedAt: new Date(),
-          claimedByDeviceId: null,
-          claimedAt: null,
-          claimUntil: null,
-          leaseTokenHash: null,
-          leaseRevision: { increment: 1 },
-        },
-      });
+      const deliveryWhere = {
+        agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, targetId: fanId,
+        status: { in: PRECOMMIT_MUTABLE_STATUSES },
+      };
+      if (typeof tx.automationDelivery.findMany !== "function") {
+        // Legacy/in-memory TransactionClient adapter used by semantic tests. Production Prisma
+        // always exposes findMany; this compatibility path preserves the pre-existing atomic
+        // status fence but has no read-lease store to reconcile.
+        await tx.automationDelivery.updateMany({
+          where: deliveryWhere,
+          data: {
+            status: "CANCELED",
+            failureCode: normalized === "block" ? "blocked" : "ignored",
+            lastError: `Candidate ${normalized}d`, finishedAt: new Date(),
+            claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
+          },
+        });
+      } else {
+        const deliveries = await tx.automationDelivery.findMany({
+          where: deliveryWhere,
+          select: { id: true, leaseRevision: true },
+        });
+        for (const row of deliveries) {
+          const changed = await tx.automationDelivery.updateMany({
+            where: { id: row.id, leaseRevision: row.leaseRevision, status: { in: PRECOMMIT_MUTABLE_STATUSES } },
+            data: {
+              status: "CANCELED",
+              failureCode: normalized === "block" ? "blocked" : "ignored",
+              lastError: `Candidate ${normalized}d`, finishedAt: new Date(),
+              claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 },
+            },
+          });
+          if (changed.count && typeof tx.fanObservationReadLease?.deleteMany === "function") {
+            await tx.fanObservationReadLease.deleteMany({ where: { deliveryId: row.id, leaseRevision: row.leaseRevision } });
+          }
+        }
+      }
       return { ok: true, candidate: updated };
     },
   });

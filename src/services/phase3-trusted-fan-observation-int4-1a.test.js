@@ -155,7 +155,10 @@ test("INT4.1A direct observation ingress is device-bound and access-fenced at DB
   assert.match(actions, /FAN_DATA_OBSERVATION_TARGET_SCOPE_MISMATCH/);
   assert.match(route, /allowedSources:\s*\["USER_PROFILE"\]/);
   assert.match(route, /observedAtPolicy:\s*"SERVER_GENERATION"/);
-  assert.match(route, /causalObservedAt:\s*scope\.causalObservedAt/);
+  assert.match(route, /let causalObservedAt = scope\.causalObservedAt/);
+  assert.match(route, /consumeActionFanObservationToken\(\{/);
+  assert.match(route, /causalObservedAt = consumed\.observedAt/);
+  assert.match(route, /causalObservedAt,\s*\n\s*\}\);/);
   assert.match(manifest, /\/api\/fan-data[\s\S]*ROUTE_CLASS\.CREATOR[\s\S]*observations additionally requires device-bound/);
 });
 
@@ -269,6 +272,7 @@ test("INT5.1C FanData server generations use durable DB-owned clocks rather than
   const authority = fs.readFileSync(path.join(__dirname, "fan-data-authority-service.js"), "utf8");
   const subscriber = fs.readFileSync(path.join(__dirname, "subscriber-directory-service.js"), "utf8");
   const sfs = fs.readFileSync(path.join(__dirname, "sfs-service.js"), "utf8");
+  const observationTokens = fs.readFileSync(path.join(__dirname, "fan-observation-token-service.js"), "utf8");
 
   const claimStart = actions.indexOf("async function claimActionDelivery");
   const claimEnd = actions.indexOf("async function renewActionLease", claimStart);
@@ -288,12 +292,24 @@ test("INT5.1C FanData server generations use durable DB-owned clocks rather than
   const refreshEnd = authority.indexOf("async function scheduleFanDataPointRefresh", refreshStart);
   const refresh = authority.slice(refreshStart, refreshEnd);
   assert.match(refresh, /const receivedAt = await dbAuthorityNow\(\{ db, fallbackNow: new Date\(\) \}\)/);
-  assert.match(refresh, /const causalObservedAt = date\(job\.createdAt\)/);
+  assert.match(refresh, /observationTokenRequired = Number\(job\?\.params\?\.observationTokenVersion/);
+  assert.match(refresh, /consumeFanObservationToken/);
+  assert.match(refresh, /causalObservedAt = date\(consumedToken\.observedAt\)/);
+  assert.match(refresh, /causalObservedAt = date\(job\.createdAt\)/);
   assert.doesNotMatch(refresh, /causalObservedAt = date\(job\.startedAt\)/);
   assert.doesNotMatch(refresh, /causalObservedAt = date\(job\.claimedAt\)/);
 
-  assert.match(subscriber, /const observedAt = dateOrNull\(run\.createdAt\) \|\| dateOrNull\(job\.createdAt\)/);
+  assert.match(subscriber, /observationTokenRequired = Number\(job\?\.params\?\.observationTokenVersion/);
+  assert.match(subscriber, /consumeObservationToken/);
+  assert.match(subscriber, /purpose:\s*"subscriber_directory_page"/);
+  assert.match(subscriber, /SERVER_PROVIDER_READ_TOKEN/);
+  assert.match(subscriber, /SERVER_SCAN_GENERATION_LEGACY/);
   assert.match(subscriber, /SUBSCRIBER_SCAN_CAUSAL_GENERATION_REQUIRED/);
-  assert.match(sfs, /const observedAt = dateOrNull\(job\.createdAt\)/);
+  assert.match(sfs, /observationTokenVersion = int\(params\.observationTokenVersion, 0\)/);
+  assert.match(sfs, /consumeObservationToken/);
+  assert.match(sfs, /observedAt = dateOrNull\(consumed\?\.observedAt\)/);
+  assert.match(sfs, /observedAt = dateOrNull\(job\.createdAt\)/);
   assert.match(sfs, /SFS_DISCOVERY_CAUSAL_GENERATION_REQUIRED/);
+  assert.match(observationTokens, /FanObservationClock/);
+  assert.match(observationTokens, /INTERVAL '1 millisecond'/);
 });

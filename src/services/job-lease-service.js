@@ -11,6 +11,14 @@ const { completeNotificationSync } = require("./notification-sync-state-service"
 const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { capabilityFreshnessWindow, isCapabilityTimestampFresh } = require("./capability-freshness-authority-service");
+const { createFanObservationToken } = require("./fan-observation-token-service");
+const {
+  FanObservationReadLeaseError,
+  FAN_OBSERVATION_READ_LEASE_TTL_MS,
+  acquireFanObservationReadLease: acquireCreatorObservationReadLease,
+  completeJobFanObservationReadLease,
+  releaseJobFanObservationReadLease,
+} = require("./fan-observation-read-lease-service");
 
 const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 const MIN_LEASE_MS = 30 * 1000;
@@ -21,6 +29,12 @@ const JOB_CHUNK_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 
 const JOB_COMPLETION_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
 const DIALOG_DISCOVERY_DIALOG_ID = "__dialog_discovery__";
+const FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY = Object.freeze({
+  fan_data_point_refresh: "fan_data_point_refresh",
+  sfs_target_discovery: "sfs_target_discovery",
+  subscriber_directory_scan: "subscriber_directory_page",
+});
+const FAN_OBSERVATION_READ_LEASE_JOB_KEYS = new Set(Object.keys(FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY));
 
 class JobLeaseError extends Error {
   constructor(code, message, status = 409) {
@@ -324,6 +338,11 @@ async function sweepExpiredLeases(now = null) {
         data,
       });
       if (!updated.count) return false;
+      if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+        await tx.fanObservationReadLease.deleteMany({
+          where: { jobId: job.id, leaseRevision: job.leaseRevision },
+        });
+      }
       await recordJobFailure({ db: tx, job, error: "lease expired", terminal, retryAfterAt: terminal ? null : data.nextRunAt });
       return true;
     }, JOB_COMPLETION_TRANSACTION_OPTIONS);
@@ -385,6 +404,9 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
         status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,
         leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 }, leaseMemberId: member.id, leaseAccessEpoch: Number(member.accessEpoch || 1), startedAt: candidate.startedAt || now, lastError: null,
         progress: clearWaitProgress(candidate.progress),
+        ...(FAN_OBSERVATION_READ_LEASE_JOB_KEYS.has(String(candidate.jobKey || "")) ? {
+          params: { ...object(candidate.params), observationTokenVersion: 1, observationReadLeaseVersion: 1 },
+        } : {}),
       },
     });
     if (!updated.count) continue;
@@ -437,6 +459,103 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   job.continuation = normalizeLeaseContinuation(job.continuation);
   return job;
 }
+function observationReadPurpose(job, requestedPurpose) {
+  const expected = FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY[String(job?.jobKey || "")] || null;
+  const requested = clean(requestedPurpose, 120);
+  if (!expected || requested !== expected) {
+    throw new JobLeaseError("FAN_OBSERVATION_READ_LEASE_PURPOSE_FORBIDDEN", "Job is not allowed to acquire this observation read lease", 403);
+  }
+  return expected;
+}
+
+function readLeaseError(error) {
+  if (error instanceof FanObservationReadLeaseError) {
+    const wrapped = new JobLeaseError(error.code, error.message, error.status);
+    if (Number.isFinite(Number(error.retryAfterMs))) wrapped.retryAfterMs = Number(error.retryAfterMs);
+    return wrapped;
+  }
+  return error;
+}
+
+async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leaseToken, leaseRevision, purpose, requestId }) {
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });
+  if (Number(job?.params?.observationReadLeaseVersion || 0) < 1) {
+    throw new JobLeaseError("FAN_OBSERVATION_READ_LEASE_NOT_REQUIRED", "Job does not use the cross-device observation read lease", 409);
+  }
+  const normalizedPurpose = observationReadPurpose(job, purpose);
+  return prisma.$transaction(async (tx) => {
+    try {
+      await assertExecutionAccessFence({
+        db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
+        accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock: true,
+      });
+      const current = await tx.jobInstance.findFirst({
+        where: {
+          id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: hashToken(leaseToken),
+          leaseRevision, leaseUntil: { gt: now },
+        },
+        select: { id: true },
+      });
+      if (!current) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before observation read acquisition", 409);
+      return await acquireCreatorObservationReadLease({
+        db: tx, jobId: job.id, agencyId: job.agencyId, creatorId: job.creatorId, deviceId, leaseRevision,
+        purpose: normalizedPurpose, requestId,
+      });
+    } catch (error) {
+      if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
+      throw readLeaseError(error);
+    }
+  }, JOB_CHUNK_TRANSACTION_OPTIONS);
+}
+
+async function releaseJobObservationReadLease({ jobId, userId, deviceId, leaseToken, leaseRevision, readLeaseToken }) {
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired: true, now });
+  try {
+    return await releaseJobFanObservationReadLease({ db: prisma, job, deviceId, leaseRevision, readLeaseToken });
+  } catch (error) { throw readLeaseError(error); }
+}
+
+async function issueFanObservationToken({ jobId, userId, deviceId, leaseToken, leaseRevision, purpose, subjects, readLeaseToken = null }) {
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });
+  return prisma.$transaction(async (tx) => {
+    try {
+      await assertExecutionAccessFence({
+        db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
+        accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock: true,
+      });
+    } catch (error) {
+      if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
+      throw error;
+    }
+    const readLeaseRequired = Number(job?.params?.observationReadLeaseVersion || 0) >= 1;
+    if (readLeaseRequired) {
+      const current = await tx.jobInstance.findFirst({
+        where: {
+          id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: hashToken(leaseToken),
+          leaseRevision, leaseUntil: { gt: now },
+        },
+        select: { id: true },
+      });
+      if (!current) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before observation read completion", 409);
+    }
+    if (readLeaseRequired) {
+      const normalizedPurpose = observationReadPurpose(job, purpose);
+      if (!clean(readLeaseToken, 500)) {
+        throw new JobLeaseError("FAN_OBSERVATION_READ_LEASE_REQUIRED", "Observation token requires the active cross-device read lease", 409);
+      }
+      try {
+        return await completeJobFanObservationReadLease({
+          db: tx, job, deviceId, leaseRevision, readLeaseToken, purpose: normalizedPurpose, subjects,
+        });
+      } catch (error) { throw readLeaseError(error); }
+    }
+    return createFanObservationToken({ db: tx, job, deviceId, leaseRevision, purpose, subjects });
+  }, JOB_CHUNK_TRANSACTION_OPTIONS);
+}
+
 async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation }) {
   const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   const job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });
@@ -471,6 +590,17 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
       data,
     });
     if (!result.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before renewal");
+    // A causal read can legitimately outlive one OF request because the global
+    // request gate and safe-read retries are bounded independently. The normal
+    // 60s job keepalive extends the durable creator fence while this exact job
+    // lease/revision remains alive, preventing TTL expiry from reopening a
+    // cross-device causal race mid-read.
+    if (typeof tx.fanObservationReadLease?.updateMany === "function") {
+      await tx.fanObservationReadLease.updateMany({
+        where: { jobId: job.id, deviceId, leaseRevision },
+        data: { expiresAt: new Date(now.getTime() + FAN_OBSERVATION_READ_LEASE_TTL_MS) },
+      });
+    }
     const updated = await tx.jobInstance.findUnique({ where: { id: job.id } });
     return { superseded: false, updated };
   }, JOB_CHUNK_TRANSACTION_OPTIONS);
@@ -956,6 +1086,11 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
       data,
     });
     if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before failure report");
+    if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+      await tx.fanObservationReadLease.deleteMany({
+        where: { jobId: job.id, deviceId, leaseRevision },
+      });
+    }
     await recordJobFailure({ db: tx, job, error: errorText, terminal, retryAfterAt: terminal ? null : data.nextRunAt });
   }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   return { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", terminal, retryAt: terminal ? null : data.nextRunAt };
@@ -1004,6 +1139,11 @@ async function releaseJob({ jobId, userId, deviceId, leaseToken, leaseRevision, 
       },
     });
     if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before release");
+    if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+      await tx.fanObservationReadLease.deleteMany({
+        where: { jobId: job.id, deviceId, leaseRevision },
+      });
+    }
   }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   return { id: job.id, status: "SCHEDULED", retryAt: new Date(now.getTime() + delay), attempts: job.attempts };
 }
@@ -1011,6 +1151,9 @@ module.exports = {
   JobLeaseError,
   claimJob,
   renewLease,
+  acquireJobFanObservationReadLease,
+  releaseJobObservationReadLease,
+  issueFanObservationToken,
   progressJob,
   completeJob,
   failJob,
