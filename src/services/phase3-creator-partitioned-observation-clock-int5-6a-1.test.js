@@ -20,8 +20,8 @@ function tokenDb(start = "2026-09-17T18:00:00.000Z") {
       queries.push({ sql, creatorId });
       assert.match(sql, /INSERT INTO "FanObservationCreatorClock"/);
       assert.match(sql, /ON CONFLICT \("creatorId"\) DO UPDATE/);
-      assert.match(sql, /legacy_cutover_floor/);
-      assert.doesNotMatch(sql, /UPDATE "FanObservationClock"/);
+      assert.match(sql, /clock_mode/);
+      assert.match(sql, /active_creator_step/);
       const previous = clocks.get(creatorId) || new Date(start);
       const next = new Date(previous.getTime() + 1);
       clocks.set(creatorId, next);
@@ -81,7 +81,7 @@ test("INT5.6A-1 current observation token issue fails closed without creator sco
   assert.equal(db.queries.length, 0);
 });
 
-test("INT5.6A-1 migration is additive and current source has no singleton clock issue path", () => {
+test("INT5.6A-1 creator clock remains the steady-state writer behind the explicit rolling bridge", () => {
   const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260917190000_phase3_creator_partitioned_observation_clock/migration.sql"), "utf8");
   const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
   const service = fs.readFileSync(path.join(__dirname, "fan-observation-token-service.js"), "utf8");
@@ -92,8 +92,8 @@ test("INT5.6A-1 migration is additive and current source has no singleton clock 
   assert.match(schema, /model FanObservationCreatorClock[\s\S]*creatorId\s+String\s+@id/);
   assert.match(schema, /model LegacyFanObservationClock[\s\S]*@@map\("FanObservationClock"\)/);
   assert.match(service, /INSERT INTO "FanObservationCreatorClock"/);
-  assert.match(service, /legacy_cutover_floor/);
-  assert.match(service, /FROM "FanObservationClock"/);
+  assert.match(service, /active_creator_step/);
+  assert.match(service, /phase3\.fanObservationCreatorClockV1/);
   assert.match(service, /normalizedCreatorId/);
-  assert.doesNotMatch(service, /UPDATE "FanObservationClock"/);
+  assert.match(service, /m\."active" = true/);
 });

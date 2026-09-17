@@ -1133,6 +1133,7 @@ function normalizeBatchObservation(raw, envelope) {
     sourceDeviceId: envelope.sourceDeviceId,
     sourceJobId: envelope.sourceJobId,
     sourceDeliveryId: envelope.sourceDeliveryId,
+    scanRunId: envelope.scanRunId,
   };
   const normalized = { onlyFansUserId: externalId };
   for (const [kind, keys] of [
@@ -1571,7 +1572,7 @@ async function applyGenericFanObservationBulkSql(tx, rows, scope) {
 
 
 async function projectFanObservationBatch(db, {
-  agencyId, creatorId, sourceDeviceId = null, sourceJobId = null, sourceDeliveryId = null, items = [],
+  agencyId, creatorId, sourceDeviceId = null, sourceJobId = null, sourceDeliveryId = null, scanRunId = null, items = [],
   allowedSources = null, observedAtPolicy = null, receivedAt = new Date(), causalObservedAt = null,
 } = {}) {
   const scopedAgencyId = text(agencyId, 180);
@@ -1583,6 +1584,7 @@ async function projectFanObservationBatch(db, {
     sourceDeviceId: text(sourceDeviceId, 180),
     sourceJobId: text(sourceJobId, 180),
     sourceDeliveryId: text(sourceDeliveryId, 180),
+    scanRunId: text(scanRunId, 180),
     allowedSources,
     observedAtPolicy,
     receivedAt: date(receivedAt) || new Date(),

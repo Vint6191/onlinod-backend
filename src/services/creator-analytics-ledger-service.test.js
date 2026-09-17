@@ -6,7 +6,7 @@ const Module = require("node:module");
 
 const originalLoad = Module._load;
 Module._load = function(request, parent, isMain) {
-  if (request === "../prisma" && (parent?.filename?.endsWith("creator-analytics-ledger-service.js") || parent?.filename?.endsWith("analytics-collector-control-service.js"))) return {};
+  if (request === "../prisma" && (parent?.filename?.endsWith("creator-analytics-ledger-service.js") || parent?.filename?.endsWith("analytics-collector-control-service.js") || parent?.filename?.endsWith("campaign-causal-activation-service.js"))) return {};
   return originalLoad.call(this, request, parent, isMain);
 };
 const {
@@ -458,13 +458,13 @@ test("campaign claimer identity freshness uses PostgreSQL receipt time, not hist
   const authorityNow = new Date("2026-08-09T12:34:56.789Z");
   const attributedAt = "2026-07-01T00:00:00.000Z";
   const harness = batchHarness();
-  const fanUpdates = [];
+  const rawSql = [];
   harness.tx.$queryRawUnsafe = async (sql) => {
     if (/clock_timestamp\(\)/.test(String(sql))) return [{ authorityNow }];
     if (/pg_advisory_xact_lock/.test(String(sql))) return [];
     throw new Error(`Unexpected raw query: ${String(sql)}`);
   };
-  harness.tx.$executeRawUnsafe = async () => 1;
+  harness.tx.$executeRawUnsafe = async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; };
   harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
   harness.tx.creatorCampaignFan = {
     findUnique: async () => null,
@@ -487,7 +487,7 @@ test("campaign claimer identity freshness uses PostgreSQL receipt time, not hist
   };
   harness.tx.creatorFan = {
     findUnique: async () => fanRow,
-    updateMany: async (args) => { fanUpdates.push(args); return { count: 1 }; },
+    updateMany: async () => ({ count: 1 }),
   };
 
   await ingestCampaignChunk({
@@ -511,28 +511,32 @@ test("campaign claimer identity freshness uses PostgreSQL receipt time, not hist
     },
   });
 
-  const usernameWrite = fanUpdates.find((entry) => entry?.data?.username === "beta");
-  const aggregateWrite = fanUpdates.find((entry) => entry?.data?.identityObservedAt instanceof Date);
-  assert.ok(usernameWrite, "campaign claimer identity must project username");
-  assert.ok(aggregateWrite, "campaign claimer identity must advance aggregate identity metadata");
-  assert.match(usernameWrite.data.usernameAuthorityVersion, new RegExp(`^${authorityNow.toISOString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\|`));
-  assert.equal(aggregateWrite.data.identityObservedAt.toISOString(), authorityNow.toISOString());
-  assert.notEqual(aggregateWrite.data.identityObservedAt.toISOString(), attributedAt);
+  const fanSql = rawSql.find((entry) => /INSERT INTO "CreatorFan"/.test(entry.sql));
+  assert.ok(fanSql, "campaign claimer identity must use canonical bulk projection");
+  const [fanWrite] = JSON.parse(fanSql.args[0]);
+  assert.equal(fanWrite.username, "beta");
+  assert.ok(fanWrite.usernameAuthorityVersion.startsWith(`${authorityNow.toISOString()}|`));
+  assert.equal(new Date(fanWrite.identityObservedAt).toISOString(), authorityNow.toISOString());
+  assert.notEqual(new Date(fanWrite.identityObservedAt).toISOString(), attributedAt);
 });
 
 test("campaign claimer causal job consumes exact token and projects token chronology", async () => {
   const authorityNow = new Date("2026-08-09T12:34:56.789Z");
   const tokenObservedAt = new Date("2026-08-09T12:34:55.123Z");
   const harness = batchHarness();
-  const fanUpdates = [];
+  const rawSql = [];
   let tokenDeletes = 0;
   harness.tx.$queryRawUnsafe = async (sql) => {
     if (/clock_timestamp\(\)/.test(String(sql))) return [{ authorityNow }];
     if (/pg_advisory_xact_lock/.test(String(sql))) return [];
     throw new Error(`Unexpected raw query: ${String(sql)}`);
   };
-  harness.tx.$executeRawUnsafe = async () => 1;
-  harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
+  harness.tx.$executeRawUnsafe = async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; };
+  let frontierWrite = null;
+  harness.tx.creatorCampaign = {
+    findUnique: async () => ({ id: "campaign-db-1" }),
+    update: async ({ where, data }) => { frontierWrite = { where, data }; return { id: where.id, ...data }; },
+  };
   harness.tx.creatorCampaignFan = { findUnique: async () => null, upsert: async ({ create }) => create };
   const fanRow = {
     id: "fan-db-1", creatorId: "creator-1", onlyFansUserId: "fan-1", username: "alpha", displayName: "Alpha",
@@ -542,7 +546,7 @@ test("campaign claimer causal job consumes exact token and projects token chrono
   };
   harness.tx.creatorFan = {
     findUnique: async () => fanRow,
-    updateMany: async (args) => { fanUpdates.push(args); return { count: 1 }; },
+    updateMany: async () => ({ count: 1 }),
   };
   const crypto = require("node:crypto");
   const scopeHash = crypto.createHash("sha256").update("campaign_claimers_page|fan-1").digest("hex");
@@ -571,20 +575,22 @@ test("campaign claimer causal job consumes exact token and projects token chrono
     chunk: {
       kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v7",
       scanRunId: "scan-identity-token", batchKey: "run:scan-identity-token:claimers:1",
-      externalCampaignId: "campaign-1", campaignComplete: true, scannerRejected: 0,
+      externalCampaignId: "campaign-1", pageNumber: 1, campaignComplete: true, scannerRejected: 0,
       observationToken: "campaign-token-1",
       claimers: [{ id: "claim-1", attributedAt: "2026-07-01T00:00:00.000Z", user: { id: "fan-1", username: "beta", name: "Beta" } }],
     },
   });
 
   assert.equal(tokenDeletes, 1, "campaign token must be consumed exactly once inside ingest transaction");
-  const usernameWrite = fanUpdates.find((entry) => entry?.data?.username === "beta");
-  const aggregateWrite = fanUpdates.find((entry) => entry?.data?.identityObservedAt instanceof Date);
-  assert.ok(usernameWrite);
-  assert.ok(aggregateWrite);
-  assert.match(usernameWrite.data.usernameAuthorityVersion, new RegExp(`^${tokenObservedAt.toISOString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\|`));
-  assert.equal(aggregateWrite.data.identityObservedAt.toISOString(), tokenObservedAt.toISOString());
-  assert.notEqual(aggregateWrite.data.identityObservedAt.toISOString(), authorityNow.toISOString());
+  const expectedFrontierHash = require("node:crypto").createHash("sha256").update(JSON.stringify(["fan-1"])).digest("hex");
+  assert.deepEqual(frontierWrite, { where: { id: "campaign-db-1" }, data: { catchupFrontierHash: expectedFrontierHash } });
+  const fanSql = rawSql.find((entry) => /INSERT INTO "CreatorFan"/.test(entry.sql));
+  assert.ok(fanSql);
+  const [fanWrite] = JSON.parse(fanSql.args[0]);
+  assert.equal(fanWrite.username, "beta");
+  assert.ok(fanWrite.usernameAuthorityVersion.startsWith(`${tokenObservedAt.toISOString()}|`));
+  assert.equal(new Date(fanWrite.identityObservedAt).toISOString(), tokenObservedAt.toISOString());
+  assert.notEqual(new Date(fanWrite.identityObservedAt).toISOString(), authorityNow.toISOString());
 });
 
 test("campaign claimer causal job fails closed when exact token is missing", async () => {
@@ -725,11 +731,10 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
 });
 
 
-test("campaign fan value batch applies multiple current snapshots under one analytics lock", async () => {
-  let locks = 0;
-  const upserts = [];
+test("campaign fan value batch applies 20 current snapshots with constant bounded lock topology", async () => {
+  const rawSql = [];
   const db = {
-    $executeRawUnsafe: async () => { locks += 1; return 1; },
+    $executeRawUnsafe: async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; },
     creatorCampaignCollectionState: {
       findUnique: async () => null,
       upsert: async ({ create }) => ({ id: "campaign-state-batch", ...create }),
@@ -748,7 +753,7 @@ test("campaign fan value batch applies multiple current snapshots under one anal
     },
     creatorFanValueCurrent: {
       findUnique: async () => null,
-      create: async ({ data }) => { upserts.push(data); return data; },
+      findMany: async () => [],
       updateMany: async () => ({ count: 1 }),
     },
   };
@@ -759,17 +764,23 @@ test("campaign fan value batch applies multiple current snapshots under one anal
       schemaVersion: 4, collectorVersion: "campaigns-v6",
       scanRunId: "batch-run", scanStartedAt: "2026-08-08T18:00:00.000Z", observedAt: "2026-08-08T18:01:00.000Z",
       batchKey: "run:batch-run:fan-values:abc",
-      values: [
-        { fanOnlyFansUserId: "1", available: true, observedAt: "2026-08-08T18:01:00.000Z", totalNetCents: 100, messagesNetCents: 0, subscriptionsNetCents: 0, tipsNetCents: 0, postsNetCents: 0, streamsNetCents: 0 },
-        { fanOnlyFansUserId: "2", available: true, observedAt: "2026-08-08T18:01:00.000Z", totalNetCents: 250, messagesNetCents: 0, subscriptionsNetCents: 0, tipsNetCents: 0, postsNetCents: 0, streamsNetCents: 0 },
-      ],
+      values: Array.from({ length: 20 }, (_, index) => ({
+        fanOnlyFansUserId: String(index + 1), available: true, observedAt: "2026-08-08T18:01:00.000Z",
+        totalNetCents: 100 + index, messagesNetCents: 0, subscriptionsNetCents: 0, tipsNetCents: 0, postsNetCents: 0, streamsNetCents: 0,
+      })),
     },
   });
-  assert.equal(result.received, 2);
-  assert.equal(result.available, 2);
-  assert.equal(locks, 2);
-  assert.equal(upserts.length, 2);
-  assert.deepEqual(upserts.map((row) => row.platformReportedTotalSpendCents), [100n, 250n]);
+  assert.equal(result.received, 20);
+  assert.equal(result.available, 20);
+  const lockSql = rawSql.filter((entry) => /pg_advisory_xact_lock/.test(entry.sql));
+  assert.equal(lockSql.length, 3, "two fixed Campaign/collector locks + one canonical FanData lock");
+  const valueSql = rawSql.filter((entry) => /INSERT INTO "CreatorFanValueCurrent"/.test(entry.sql));
+  assert.equal(valueSql.length, 1, "the entire fan-value batch must use one bounded value upsert statement");
+  const valueRows = JSON.parse(valueSql[0].args[0]);
+  assert.equal(valueRows.length, 20);
+  const valueByFan = new Map(valueRows.map((row) => [row.onlyFansUserId, row.platformReportedTotalSpendCents]));
+  assert.equal(valueByFan.get("1"), "100");
+  assert.equal(valueByFan.get("20"), "119");
 });
 
 
@@ -1532,10 +1543,11 @@ test("INT5.6A-4 causal campaign profile value consumes exact token and projects 
     findUnique: async () => fanRow,
     updateMany: async () => ({ count: 1 }),
   };
-  let valueCreate = null;
+  const rawSql = [];
+  harness.tx.$executeRawUnsafe = async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; };
   harness.tx.creatorFanValueCurrent = {
     findUnique: async () => null,
-    create: async ({ data }) => { valueCreate = data; return data; },
+    findMany: async () => [],
     updateMany: async () => ({ count: 1 }),
   };
   const crypto = require("node:crypto");
@@ -1572,9 +1584,12 @@ test("INT5.6A-4 causal campaign profile value consumes exact token and projects 
   });
   assert.equal(result.available, 1);
   assert.equal(tokenDeletes, 1);
-  assert.ok(valueCreate);
-  assert.equal(valueCreate.valueObservedAt.toISOString(), tokenObservedAt.toISOString());
-  assert.notEqual(valueCreate.valueObservedAt.toISOString(), authorityNow.toISOString());
+  const valueSql = rawSql.find((entry) => /INSERT INTO "CreatorFanValueCurrent"/.test(entry.sql));
+  assert.ok(valueSql);
+  const [valueRow] = JSON.parse(valueSql.args[0]);
+  assert.equal(new Date(valueRow.valueObservedAt).toISOString(), tokenObservedAt.toISOString());
+  assert.notEqual(new Date(valueRow.valueObservedAt).toISOString(), authorityNow.toISOString());
+  assert.equal(valueRow.scanRunId, "fan-value-causal");
 });
 
 test("INT5.6A-4 committed campaign fan-value replay returns before one-shot token consumption", async () => {
@@ -1610,7 +1625,8 @@ test("INT5.6A-4 embedded claimer value reuses claimer-page causal chronology wit
   const authorityNow = new Date("2026-09-17T16:10:10.000Z");
   const tokenObservedAt = new Date("2026-09-17T16:10:05.000Z");
   const harness = batchHarness({ authorityNow });
-  harness.tx.$executeRawUnsafe = async () => 1;
+  const rawSql = [];
+  harness.tx.$executeRawUnsafe = async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; };
   harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
   harness.tx.creatorCampaignFan = { findUnique: async () => null, upsert: async ({ create }) => create };
   const fanRow = {
@@ -1620,10 +1636,9 @@ test("INT5.6A-4 embedded claimer value reuses claimer-page causal chronology wit
     headerAuthorityVersion: null, identityAuthorityVersion: null,
   };
   harness.tx.creatorFan = { findUnique: async () => fanRow, updateMany: async () => ({ count: 1 }) };
-  let valueCreate = null;
   harness.tx.creatorFanValueCurrent = {
     findUnique: async () => null,
-    create: async ({ data }) => { valueCreate = data; return data; },
+    findMany: async () => [],
     updateMany: async () => ({ count: 1 }),
   };
   const crypto = require("node:crypto");
@@ -1653,7 +1668,9 @@ test("INT5.6A-4 embedded claimer value reuses claimer-page causal chronology wit
     },
   });
   assert.equal(tokenDeletes, 1, "the claimer page token is consumed once for both identity and embedded value");
-  assert.ok(valueCreate);
-  assert.equal(valueCreate.valueObservedAt.toISOString(), tokenObservedAt.toISOString());
-  assert.notEqual(valueCreate.valueObservedAt.toISOString(), authorityNow.toISOString());
+  const valueSql = rawSql.find((entry) => /INSERT INTO "CreatorFanValueCurrent"/.test(entry.sql));
+  assert.ok(valueSql);
+  const [valueWrite] = JSON.parse(valueSql.args[0]);
+  assert.equal(new Date(valueWrite.valueObservedAt).toISOString(), tokenObservedAt.toISOString());
+  assert.notEqual(new Date(valueWrite.valueObservedAt).toISOString(), authorityNow.toISOString());
 });

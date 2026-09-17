@@ -247,36 +247,30 @@ test("completed history preserves only an explicitly forced FULL rebuild", async
   assert.equal(active[0].status, "CLAIMED");
 });
 
-test("campaign catch-up compares OF stats against actual stored memberships and keeps per-campaign known frontiers", async () => {
+test("campaign catch-up reads only bounded compact campaign frontier hashes", async () => {
+  let query = null;
+  const hashA = "a".repeat(64);
+  const hashB = "b".repeat(64);
   const db = {
     creatorCampaign: {
-      async findMany() {
+      async findMany(args) {
+        query = args;
         return [
-          { id: "db-a", externalCampaignId: "campaign-a", _count: { fans: 72 } },
-          { id: "db-b", externalCampaignId: "campaign-b", _count: { fans: 4 } },
-        ];
-      },
-    },
-    async $queryRawUnsafe() {
-      return [
-        { externalCampaignId: "campaign-a", onlyFansUserId: "fan-72" },
-        { externalCampaignId: "campaign-a", onlyFansUserId: "fan-71" },
-        { externalCampaignId: "campaign-b", onlyFansUserId: "fan-b4" },
-      ];
-    },
-    creatorFanValueCurrent: {
-      async findMany() {
-        return [
-          { fan: { onlyFansUserId: "fan-72" } },
-          { fan: { onlyFansUserId: "fan-b4" } },
+          { externalCampaignId: "campaign-a", catchupFrontierHash: hashA },
+          { externalCampaignId: "campaign-b", catchupFrontierHash: hashB },
+          { externalCampaignId: "campaign-c", catchupFrontierHash: null },
         ];
       },
     },
   };
   const state = await campaignCatchupState(db, "creator-1");
-  assert.deepEqual(state.knownCampaignFanCounts, { "campaign-a": 72, "campaign-b": 4 });
-  assert.deepEqual(state.knownClaimersByCampaign["campaign-a"], ["fan-72", "fan-71"]);
-  assert.deepEqual(state.knownClaimersByCampaign["campaign-b"], ["fan-b4"]);
+  assert.deepEqual(query, {
+    where: { creatorId: "creator-1" },
+    orderBy: [{ collectedAt: "desc" }],
+    take: 2_000,
+    select: { externalCampaignId: true, catchupFrontierHash: true },
+  });
+  assert.deepEqual(state.knownClaimerFrontierHashes, { "campaign-a": hashA, "campaign-b": hashB });
 });
 
 test("recurring analytics uses fixed head catch-ups only after initial history is ready", async () => {
@@ -292,9 +286,9 @@ test("recurring analytics uses fixed head catch-ups only after initial history i
     async findMany() { return [{ externalTransactionId: "t-3" }, { externalTransactionId: "t-2" }]; },
   };
   db.creatorCampaign = {
-    async findMany() { return [{ id: "db-a", externalCampaignId: "campaign-a", _count: { fans: 72 } }]; },
+    async findMany() { return [{ externalCampaignId: "campaign-a", catchupFrontierHash: "a".repeat(64) }]; },
   };
-  db.$queryRawUnsafe = rawQueryWithAuthorityNow([{ externalCampaignId: "campaign-a", onlyFansUserId: "fan-72" }]);
+  db.$queryRawUnsafe = rawQueryWithAuthorityNow([]);
 
   const result = await ensureRecurringCreatorAnalyticsCatchups({
     db,
@@ -318,8 +312,9 @@ test("recurring analytics uses fixed head catch-ups only after initial history i
   assert.equal(campaigns.collectionType, "CAMPAIGNS");
   assert.equal(campaigns.collectionRequestedAt, "2026-08-09T12:00:00.000Z");
   assert.ok(campaigns.collectionGeneration);
-  assert.deepEqual(campaigns.knownCampaignFanCounts, { "campaign-a": 72 });
-  assert.deepEqual(campaigns.knownClaimersByCampaign, { "campaign-a": ["fan-72"] });
+  assert.equal(Object.prototype.hasOwnProperty.call(campaigns, "knownCampaignFanCounts"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(campaigns, "knownClaimersByCampaign"), false);
+  assert.deepEqual(campaigns.knownClaimerFrontierHashes, { "campaign-a": "a".repeat(64) });
   assert.equal(JSON.stringify(campaigns).includes("HOT"), false);
   assert.equal(JSON.stringify(campaigns).includes("WARM"), false);
   assert.equal(JSON.stringify(campaigns).includes("COLD"), false);

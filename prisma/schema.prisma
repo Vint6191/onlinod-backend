@@ -2870,6 +2870,7 @@ model CreatorCampaign {
   endedAt            DateTime?
   claimersCount      Int?
   clicksCount        Int?
+  catchupFrontierHash String? @db.VarChar(64)
   sourceScanRunId    String?
   sourceScanStartedAt DateTime?
   collectedAt        DateTime @default(now())

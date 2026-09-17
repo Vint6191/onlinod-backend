@@ -16,7 +16,7 @@ test("INT5.6A-2 fetch_campaigns is a causal-read job with two exact server-owned
   const jobs = source("src/services/job-lease-service.js");
   assert.match(jobs, /fetch_campaigns:\s*Object\.freeze\(\["campaign_claimers_page", "campaign_fan_values"\]\)/);
   assert.match(jobs, /FAN_OBSERVATION_READ_LEASE_JOB_KEYS = new Set\(Object\.keys\(FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY\)\)/);
-  assert.match(jobs, /FAN_OBSERVATION_READ_LEASE_JOB_KEYS\.has\(String\(candidate\.jobKey \|\| ""\)\)[\s\S]*observationTokenVersion: 1, observationReadLeaseVersion: 1/,
+  assert.match(jobs, /FAN_OBSERVATION_READ_LEASE_JOB_KEYS\.has\(String\(candidate\.jobKey \|\| ""\)\)[\s\S]*observationTokenVersion:\s*1,\s*observationReadLeaseVersion:\s*1/,
     "first post-cutover claim must upgrade queued campaign jobs before execution");
   assert.match(jobs, /const allowed = FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY\[String\(job\?\.jobKey \|\| ""\)\] \|\| null/);
   assert.match(jobs, /!Array\.isArray\(allowed\)[\s\S]*!allowed\.includes\(requested\)/);

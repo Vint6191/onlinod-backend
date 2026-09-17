@@ -52,6 +52,31 @@ function clean(value, max = 500) {
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
+function boundedCampaignFrontierHashes(value) {
+  const out = {};
+  let count = 0;
+  for (const [rawKey, rawHash] of Object.entries(object(value))) {
+    if (count >= 2_000) break;
+    const campaignId = clean(rawKey, 220);
+    const hash = String(rawHash || "").trim().toLowerCase();
+    if (!campaignId || !/^[0-9a-f]{64}$/.test(hash)) continue;
+    out[campaignId] = hash;
+    count += 1;
+  }
+  return out;
+}
+function campaignClaimParams(value) {
+  const params = { ...object(value) };
+  // Retire the old O(campaign fan history) catch-up hints at the claim fence so
+  // already-SCHEDULED pre-cutover jobs cannot leak oversized params to a new
+  // Desktop. Missing compact hints only causes a safe provider rescan.
+  delete params.knownCampaignFanCounts;
+  delete params.knownClaimersByCampaign;
+  const hashes = boundedCampaignFrontierHashes(params.knownClaimerFrontierHashes);
+  if (Object.keys(hashes).length) params.knownClaimerFrontierHashes = hashes;
+  else delete params.knownClaimerFrontierHashes;
+  return params;
+}
 function waitKind(reason) {
   const text = String(reason || "").toLowerCase();
   if (text.includes("creator execution context unavailable")) return "creator_context";
@@ -351,14 +376,21 @@ async function sweepExpiredLeases(now = null) {
   }
   return changed;
 }
-async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds = [], dialogDiscoveryOnly = false }) {
+async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds = [], dialogDiscoveryOnly = false, capabilities = {} }) {
   const { device, member } = await requireOwnedDevice({ userId, deviceId });
   const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   await sweepExpiredLeases(now);
   if (!isCapabilityTimestampFresh(device.lastSeenAt, now, 5 * 60 * 1000)) return { job: null, reason: "device-stale" };
   const creatorIds = await scopedCreatorIds({ device, member, now });
   if (!creatorIds.length) return { job: null, reason: "no-creators-visible" };
-  const allowedJobKeys = filterClaimableDesktopJobKeys(jobKeys);
+  let allowedJobKeys = filterClaimableDesktopJobKeys(jobKeys);
+  // Campaign causal-v1 is an explicit wire capability. A Desktop that does not
+  // advertise it must never receive fetch_campaigns from a bridge-capable Backend.
+  // Unknown claim fields are stripped by old Backends, so new Desktop -> old Backend
+  // remains rolling-compatible until the durable activation barrier is executed.
+  if (capabilities?.campaignCausalObservationV1 !== true) {
+    allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
+  }
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
   const explicitlyExcluded = new Set(
     (Array.isArray(excludedCreatorIds) ? excludedCreatorIds : [])
@@ -406,7 +438,11 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
         leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 }, leaseMemberId: member.id, leaseAccessEpoch: Number(member.accessEpoch || 1), startedAt: candidate.startedAt || now, lastError: null,
         progress: clearWaitProgress(candidate.progress),
         ...(FAN_OBSERVATION_READ_LEASE_JOB_KEYS.has(String(candidate.jobKey || "")) ? {
-          params: { ...object(candidate.params), observationTokenVersion: 1, observationReadLeaseVersion: 1 },
+          params: {
+            ...(String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : object(candidate.params)),
+            observationTokenVersion: 1,
+            observationReadLeaseVersion: 1,
+          },
         } : {}),
       },
     });

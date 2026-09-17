@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
-const { projectFanIdentity, projectFanValue } = require("./fan-data-authority-service");
+const { projectFanIdentity, projectFanValue, projectFanObservationBatch } = require("./fan-data-authority-service");
 const { displayRangeBounds, scanContractFromJob } = require("./analytics-range-contract");
 const {
   collectionCommand, COLLECTOR_TYPES, acceptCampaignGeneration, completeCampaignCollection,
@@ -12,10 +12,11 @@ const {
 const { evaluateCollectionState, evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
 const { earningsFreshnessLimitMs, trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
-const { consumeFanObservationToken } = require("./fan-observation-token-service");
+const { consumeFanObservationToken, consumeFanObservationTokensBatch } = require("./fan-observation-token-service");
+const { campaignCausalV1State } = require("./campaign-causal-activation-service");
 
-const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v7";
-const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", CAMPAIGN_COLLECTOR_VERSION]);
+const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v8";
+const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", "campaigns-v7", CAMPAIGN_COLLECTOR_VERSION]);
 const CAMPAIGN_SCHEMA_VERSION = 4;
 const EARNINGS_COLLECTOR_VERSION = "earnings-v4";
 const EARNINGS_SCHEMA_VERSION = 4;
@@ -105,6 +106,10 @@ function requireJob(job) {
 }
 function checksum(value) {
   return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+function campaignClaimerFrontierHash(fanIds) {
+  const normalized = [...new Set(array(fanIds).map((value) => text(value, 180)).filter(Boolean))].sort();
+  return checksum(normalized);
 }
 function proofMessage(proof) {
   return Object.entries(proof)
@@ -780,7 +785,8 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     const duplicateClaimers = rawRows.length - backendRejected - uniqueClaimers.size;
     unchanged += duplicateClaimers;
 
-    const observationTokenRequired = Number(object(job.params).observationTokenVersion || 0) >= 1;
+    const activation = await campaignCausalV1State({ db: tx, lockForCommit: true });
+    const observationTokenRequired = activation.active === true || Number(object(job.params).observationTokenVersion || 0) >= 1;
     let identityObservedAt = serverReceivedAt;
     if (uniqueClaimers.size && observationTokenRequired) {
       const observationToken = text(payload.observationToken, 500);
@@ -798,28 +804,70 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       if (!identityObservedAt) throw new Error("CAMPAIGN_CLAIMER_OBSERVATION_TIME_INVALID");
     }
 
-    for (const claimer of uniqueClaimers.values()) {
-      // `attributedAt` is historical campaign membership provenance, not the time
-      // at which this scan observed the fan's current profile fields. New causal
-      // jobs stamp identity freshness from the server-issued post-read observation
-      // token. Receipt time remains only the legacy fallback for pre-cutover jobs.
-      const fan = await projectFanIdentity(tx, {
-        agencyId: job.agencyId,
-        creatorId: job.creatorId,
-        onlyFansUserId: claimer.onlyFansUserId,
+    const claimerObservations = [...uniqueClaimers.values()].map((claimer) => ({
+      onlyFansUserId: claimer.onlyFansUserId,
+      identity: {
         username: claimer.username,
         platformDisplayName: claimer.displayName,
         avatarUrl: claimer.avatarUrl,
         observedAt: identityObservedAt,
         activityObservedAt: identityObservedAt,
         source: "CAMPAIGN_CLAIMER",
+      },
+      ...(claimer.embeddedValue?.available === true ? {
+        value: {
+          availability: "AVAILABLE",
+          totalSpentCents: claimer.embeddedValue.values.totalSpentCents,
+          messagesSpentCents: claimer.embeddedValue.values.messagesSpentCents,
+          subscriptionsSpentCents: claimer.embeddedValue.values.subscriptionsSpentCents,
+          tipsSpentCents: claimer.embeddedValue.values.tipsSpentCents,
+          postsSpentCents: claimer.embeddedValue.values.postsSpentCents,
+          streamsSpentCents: claimer.embeddedValue.values.streamsSpentCents,
+          lastActivityAt: claimer.embeddedValue.lastActivityAt,
+          observedAt: identityObservedAt,
+          source: "CAMPAIGN_CLAIMER",
+        },
+      } : {}),
+    }));
+    if (claimerObservations.length) {
+      await projectFanObservationBatch(tx, {
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        sourceDeviceId: deviceId || null,
+        sourceJobId: job.id,
+        scanRunId,
+        items: claimerObservations,
+        allowedSources: ["CAMPAIGN_CLAIMER"],
+        observedAtPolicy: "TRUSTED_INPUT",
+        receivedAt: serverReceivedAt,
       });
-      if (claimer.embeddedValue?.available === true) {
-        await projectCampaignFanValueCurrent({
-          tx, job, deviceId, scanRunId, item: claimer.embeddedValue, observedAt: identityObservedAt,
-        });
-      }
+    }
 
+    let projectedFans = [];
+    const projectedFanIds = [...uniqueClaimers.keys()];
+    if (projectedFanIds.length && typeof tx.creatorFan?.findMany === "function") {
+      projectedFans = await tx.creatorFan.findMany({
+        where: { creatorId: job.creatorId, onlyFansUserId: { in: projectedFanIds } },
+        select: { id: true, onlyFansUserId: true },
+        take: projectedFanIds.length,
+      });
+    } else if (projectedFanIds.length && typeof tx.creatorFan?.findUnique === "function") {
+      projectedFans = (await Promise.all(projectedFanIds.map(async (onlyFansUserId) => {
+        const fan = await tx.creatorFan.findUnique({
+          where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId } },
+          select: { id: true, onlyFansUserId: true },
+        });
+        return fan ? { ...fan, onlyFansUserId: fan.onlyFansUserId || onlyFansUserId } : null;
+      }))).filter(Boolean);
+    }
+    const fanByOnlyFansUserId = new Map(projectedFans.map((fan) => [String(fan.onlyFansUserId), fan]));
+
+    for (const claimer of uniqueClaimers.values()) {
+      // `attributedAt` is historical campaign membership provenance, not the time
+      // at which this scan observed the fan's current profile fields. FanData above
+      // is projected in one canonical bulk phase; membership remains historical.
+      const fan = fanByOnlyFansUserId.get(String(claimer.onlyFansUserId));
+      if (!fan?.id) throw new Error("CAMPAIGN_CLAIMER_FAN_PROJECTION_MISSING");
       const where = { campaignId_fanRecordId: { campaignId: saved.id, fanRecordId: fan.id } };
       const existing = await tx.creatorCampaignFan.findUnique({
         where,
@@ -866,6 +914,18 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       });
       if (existing) updated += 1;
       else inserted += 1;
+    }
+
+    const claimerPageNumber = integer(payload.pageNumber, 10_000);
+    if (claimerPageNumber === 1 && rejected === 0) {
+      // Persist only a compact, server-derived fingerprint of the normalized
+      // provider head page. Catch-up planning never needs to walk membership
+      // history or ship fan-id frontiers through JobInstance.params. A missing
+      // fingerprint fails safe to scanning the Campaign.
+      await tx.creatorCampaign.update({
+        where: { id: saved.id },
+        data: { catchupFrontierHash: campaignClaimerFrontierHash([...uniqueClaimers.keys()]) },
+      });
     }
 
     // Campaign attribution is historical. A later OF response may be partial,
@@ -996,7 +1056,9 @@ function campaignFanValueObservationTokenRequired(job) {
 }
 
 async function campaignFanValueAuthorityObservedAt({ tx, job, deviceId, item, fallbackObservedAt }) {
-  if (item.available !== true || !campaignFanValueObservationTokenRequired(job)) return fallbackObservedAt;
+  if (item.available !== true) return fallbackObservedAt;
+  const activation = await campaignCausalV1State({ db: tx, lockForCommit: true });
+  if (!activation.active && !campaignFanValueObservationTokenRequired(job)) return fallbackObservedAt;
   if (!item.observationToken) throw new Error("CAMPAIGN_FAN_VALUE_OBSERVATION_TOKEN_REQUIRED");
   const consumed = await consumeFanObservationToken({
     db: tx,
@@ -1102,20 +1164,82 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
     if (replay && ["COMMITTED", "PARTIAL"].includes(batch.status)) {
       return { replay: true, batchId: batch.id, status: batch.status, received: normalized.length };
     }
-    const applied = [];
-    for (const item of normalized) {
-      const authorityObservedAt = await campaignFanValueAuthorityObservedAt({
-        tx, job, deviceId, item, fallbackObservedAt: serverReceivedAt,
+    const availableItems = normalized.filter((item) => item.available === true);
+    const activation = await campaignCausalV1State({ db: tx, lockForCommit: true });
+    const observationTokenRequired = activation.active === true || campaignFanValueObservationTokenRequired(job);
+    let authorityTimes = availableItems.map(() => serverReceivedAt);
+    if (availableItems.length && observationTokenRequired) {
+      for (const item of availableItems) {
+        if (!item.observationToken) throw new Error("CAMPAIGN_FAN_VALUE_OBSERVATION_TOKEN_REQUIRED");
+      }
+      const consumed = await consumeFanObservationTokensBatch({
+        db: tx,
+        job,
+        deviceId,
+        leaseRevision: Number(job.leaseRevision),
+        requests: availableItems.map((item) => ({
+          token: item.observationToken,
+          purpose: "campaign_fan_values",
+          subjects: [item.onlyFansUserId],
+        })),
       });
-      applied.push(await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }));
+      authorityTimes = consumed.map((entry) => {
+        const observedAt = strictDate(entry?.observedAt);
+        if (!observedAt) throw new Error("CAMPAIGN_FAN_VALUE_OBSERVATION_TIME_INVALID");
+        return observedAt;
+      });
     }
-    const available = applied.filter((row) => row.available === true).length;
-    const unavailable = applied.length - available;
-    const replayedRows = applied.filter((row) => row.replay === true).length;
+
+    if (availableItems.length) {
+      const observations = availableItems.map((item, index) => {
+        const observedAt = authorityTimes[index];
+        return {
+          onlyFansUserId: item.onlyFansUserId,
+          identity: {
+            username: item.username,
+            platformDisplayName: item.displayName,
+            avatarUrl: item.avatarUrl,
+            headerUrl: item.headerUrl,
+            observedAt,
+            source: "CAMPAIGN_CLAIMER",
+          },
+          value: {
+            availability: "AVAILABLE",
+            totalSpentCents: item.values.totalSpentCents,
+            messagesSpentCents: item.values.messagesSpentCents,
+            subscriptionsSpentCents: item.values.subscriptionsSpentCents,
+            tipsSpentCents: item.values.tipsSpentCents,
+            postsSpentCents: item.values.postsSpentCents,
+            streamsSpentCents: item.values.streamsSpentCents,
+            lastActivityAt: item.lastActivityAt,
+            observedAt,
+            source: "CAMPAIGN_CLAIMER",
+          },
+        };
+      });
+      await projectFanObservationBatch(tx, {
+        agencyId: job.agencyId,
+        creatorId: job.creatorId,
+        sourceDeviceId: deviceId || null,
+        sourceJobId: job.id,
+        scanRunId,
+        items: observations,
+        allowedSources: ["CAMPAIGN_CLAIMER"],
+        observedAtPolicy: "TRUSTED_INPUT",
+        receivedAt: serverReceivedAt,
+      });
+    }
+
+    const authorityTimeByFan = new Map(availableItems.map((item, index) => [item.onlyFansUserId, authorityTimes[index]]));
+    const applied = normalized.map((item) => item.available === true
+      ? { available: true, replay: false, fetchedAt: authorityTimeByFan.get(item.onlyFansUserId) || serverReceivedAt }
+      : { available: false, reasonCode: item.reasonCode });
+    const available = availableItems.length;
+    const unavailable = normalized.length - available;
     await finishBatch(tx, batch.id, {
       received: normalized.length,
-      inserted: Math.max(0, available - replayedRows),
-      unchanged: unavailable + replayedRows,
+      inserted: available,
+      unchanged: unavailable,
     });
     return { replay: false, batchId: batch.id, received: normalized.length, available, unavailable, applied, superseded: false };
   });
@@ -1140,7 +1264,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   if (expectedCampaignBatches === null || expectedClaimerBatches === null || expectedCampaignCount === null) {
     throw new Error("Campaign completion counters are invalid");
   }
-  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v7`;
+  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v8`;
   if (key.length > 240) throw new Error("Campaign completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
@@ -1164,6 +1288,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
       where: {
         sourceJobId: job.id,
         dataType: "CAMPAIGNS",
+        collectorVersion: payload.collectorVersion,
         idempotencyKey: { startsWith: batchPrefix },
         NOT: { id: batch.id },
       },

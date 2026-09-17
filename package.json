@@ -27,7 +27,9 @@
     "phase2:team-control-plane": "node scripts/maintenance/phase2-team-control-plane-activation.js",
     "audit:auth-lifecycle": "node scripts/audit/actual59-auth-lifecycle-gate.js",
     "audit:auth-runtime-verify": "node scripts/audit/actual60-runtime-evidence-verify.js",
-    "maintenance:auth-history-purge": "node scripts/maintenance/actual60-auth-history-purge-activation.js"
+    "maintenance:auth-history-purge": "node scripts/maintenance/actual60-auth-history-purge-activation.js",
+    "phase3:activate-campaign-causal-v1": "node scripts/phase3-activate-campaign-causal-v1.js",
+    "phase3:activate-observation-creator-clock-v1": "node scripts/phase3-activate-observation-creator-clock-v1.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

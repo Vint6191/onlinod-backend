@@ -26,7 +26,8 @@ const CAMPAIGN_JOB_KEY = "fetch_campaigns";
 const ANALYTICS_SYNC_VERSION = 1;
 const NOTIFICATION_KNOWN_ID_LIMIT = 300;
 const FINANCIAL_KNOWN_ID_LIMIT = 300;
-const CAMPAIGN_FRONTIER_PER_CAMPAIGN = 100;
+const CAMPAIGN_CATCHUP_HINT_CAMPAIGN_LIMIT = 2_000;
+const CAMPAIGN_FRONTIER_HASH_RE = /^[0-9a-f]{64}$/;
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -287,62 +288,26 @@ async function recentKnownTransactionIds(db, creatorId) {
 }
 
 async function campaignCatchupState(db, creatorId) {
-  if (!db?.creatorCampaign?.findMany) return { knownCampaignFanCounts: {}, knownClaimersByCampaign: {} };
+  if (!db?.creatorCampaign?.findMany) return { knownClaimerFrontierHashes: {} };
+  // Catch-up planning must never walk CreatorCampaignFan history. The Desktop
+  // physically caps one collection at 2,000 Campaigns, so the planner reads at
+  // most that many compact CreatorCampaign rows using the existing
+  // (creatorId, collectedAt) index. A missing/invalid fingerprint is not a
+  // negative fact: the Desktop simply scans that Campaign.
   const campaigns = await db.creatorCampaign.findMany({
     where: { creatorId },
-    select: { id: true, externalCampaignId: true, _count: { select: { fans: true } } },
+    orderBy: [{ collectedAt: "desc" }],
+    take: CAMPAIGN_CATCHUP_HINT_CAMPAIGN_LIMIT,
+    select: { externalCampaignId: true, catchupFrontierHash: true },
   });
-  const knownCampaignFanCounts = {};
-  const campaignIds = new Map();
+  const knownClaimerFrontierHashes = {};
   for (const row of campaigns) {
-    const externalId = clean(row.externalCampaignId, 220);
-    if (!externalId) continue;
-    knownCampaignFanCounts[externalId] = Number(row?._count?.fans || 0);
-    campaignIds.set(row.id, externalId);
+    const externalId = clean(row?.externalCampaignId, 220);
+    const hash = String(row?.catchupFrontierHash || "").trim().toLowerCase();
+    if (!externalId || !CAMPAIGN_FRONTIER_HASH_RE.test(hash)) continue;
+    knownClaimerFrontierHashes[externalId] = hash;
   }
-
-  const knownClaimersByCampaign = {};
-  if (campaigns.length && typeof db.$queryRawUnsafe === "function") {
-    const rows = await db.$queryRawUnsafe(`
-      SELECT ranked."externalCampaignId", ranked."onlyFansUserId"
-      FROM (
-        SELECT c."externalCampaignId", f."onlyFansUserId",
-               ROW_NUMBER() OVER (
-                 PARTITION BY cf."campaignId"
-                 ORDER BY cf."attributedAt" DESC NULLS LAST, cf."createdAt" DESC, cf."id" DESC
-               ) AS rn
-        FROM "CreatorCampaignFan" cf
-        JOIN "CreatorCampaign" c ON c."id" = cf."campaignId" AND c."creatorId" = cf."creatorId"
-        JOIN "CreatorFan" f ON f."id" = cf."fanId" AND f."creatorId" = cf."creatorId"
-        WHERE cf."creatorId" = $1
-      ) ranked
-      WHERE ranked.rn <= $2
-      ORDER BY ranked."externalCampaignId", ranked.rn
-    `, creatorId, CAMPAIGN_FRONTIER_PER_CAMPAIGN);
-    for (const row of rows || []) {
-      const campaignId = clean(row.externalCampaignId, 220);
-      const fanId = clean(row.onlyFansUserId, 180);
-      if (!campaignId || !fanId) continue;
-      if (!knownClaimersByCampaign[campaignId]) knownClaimersByCampaign[campaignId] = [];
-      knownClaimersByCampaign[campaignId].push(fanId);
-    }
-  } else if (db?.creatorCampaignFan?.findMany) {
-    const rows = await db.creatorCampaignFan.findMany({
-      where: { creatorId },
-      orderBy: [{ attributedAt: "desc" }, { createdAt: "desc" }],
-      take: Math.min(20_000, Math.max(2_000, campaigns.length * CAMPAIGN_FRONTIER_PER_CAMPAIGN)),
-      select: { campaignId: true, fan: { select: { onlyFansUserId: true } } },
-    });
-    for (const row of rows) {
-      const campaignId = campaignIds.get(row.campaignId);
-      const fanId = clean(row?.fan?.onlyFansUserId, 180);
-      if (!campaignId || !fanId) continue;
-      if (!knownClaimersByCampaign[campaignId]) knownClaimersByCampaign[campaignId] = [];
-      if (knownClaimersByCampaign[campaignId].length < CAMPAIGN_FRONTIER_PER_CAMPAIGN) knownClaimersByCampaign[campaignId].push(fanId);
-    }
-  }
-
-  return { knownCampaignFanCounts, knownClaimersByCampaign };
+  return { knownClaimerFrontierHashes };
 }
 
 function retryDisposition(state, now = new Date()) {
@@ -452,8 +417,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
       fanValueBatchSize: 20,
       observationTokenVersion: 1,
       observationReadLeaseVersion: 1,
-      knownCampaignFanCounts: catchup.knownCampaignFanCounts,
-      knownClaimersByCampaign: catchup.knownClaimersByCampaign,
+      knownClaimerFrontierHashes: catchup.knownClaimerFrontierHashes,
     };
     const scheduled = await scheduleIfIdle({
       db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: CAMPAIGN_COLLECTION_FRESHNESS_MS,

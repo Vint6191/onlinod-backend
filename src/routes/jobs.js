@@ -81,6 +81,9 @@ const claimSchema = z.object({
   // Desktop request the shared job key without accidentally claiming legacy
   // per-dialog jobs that belong to the batch pipeline.
   dialogDiscoveryOnly: z.boolean().optional(),
+  capabilities: z.object({
+    campaignCausalObservationV1: z.boolean().optional().default(false),
+  }).passthrough().optional().default({}),
 });
 
 const leaseMutationSchema = z.object({
@@ -158,6 +161,7 @@ router.post("/claim", async (req, res, next) => {
       jobKeys: input.jobKeys,
       excludedCreatorIds: input.excludedCreatorIds,
       dialogDiscoveryOnly: input.dialogDiscoveryOnly === true,
+      capabilities: input.capabilities,
     });
     return res.json({ ok: true, ...claimed });
   } catch (error) {

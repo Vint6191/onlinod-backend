@@ -169,8 +169,8 @@ test("INT5.5D-1 source wiring makes new point-refresh jobs read-lease required a
   const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
   const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260917150000_phase3_fan_observation_read_lease/migration.sql"), "utf8");
 
-  assert.match(authority, /observationTokenVersion: 1, observationReadLeaseVersion: 1/);
-  assert.match(jobs, /FAN_OBSERVATION_READ_LEASE_JOB_KEYS\.has\(String\(candidate\.jobKey[\s\S]*observationTokenVersion: 1, observationReadLeaseVersion: 1/, "first claim after cutover must upgrade all causal-read jobs before execution");
+  assert.match(authority, /observationTokenVersion:\s*1,\s*observationReadLeaseVersion:\s*1/);
+  assert.match(jobs, /FAN_OBSERVATION_READ_LEASE_JOB_KEYS\.has\(String\(candidate\.jobKey[\s\S]*observationTokenVersion:\s*1,\s*observationReadLeaseVersion:\s*1/, "first claim after cutover must upgrade all causal-read jobs before execution");
   assert.match(jobs, /readLeaseRequired = Number\(job\?\.params\?\.observationReadLeaseVersion \|\| 0\) >= 1/);
   assert.match(jobs, /FAN_OBSERVATION_READ_LEASE_REQUIRED/);
   assert.match(jobs, /fanObservationReadLease\.updateMany\([\s\S]*expiresAt: new Date\(now\.getTime\(\) \+ FAN_OBSERVATION_READ_LEASE_TTL_MS\)/, "normal job keepalive must extend an in-flight causal read fence");

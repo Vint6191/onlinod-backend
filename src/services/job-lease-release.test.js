@@ -1266,7 +1266,14 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
   const authorityNow = new Date("2035-04-05T06:07:08.900Z");
   const candidate = {
     id: "job-db-clock-claim", jobKey: "fetch_campaigns", scope: "creator", creatorId: "creator-1", agencyId: "agency-1",
-    idempotencyKey: "db-clock-claim", params: {}, priority: 90, attempts: 0, leaseRevision: 4,
+    idempotencyKey: "db-clock-claim", params: {
+      knownCampaignFanCounts: { "campaign-old": 999999 },
+      knownClaimersByCampaign: { "campaign-old": ["fan-1", "fan-2"] },
+      knownClaimerFrontierHashes: {
+        "campaign-keep": "a".repeat(64),
+        "campaign-invalid": "not-a-hash",
+      },
+    }, priority: 90, attempts: 0, leaseRevision: 4,
     startedAt: null, workId: null, continuation: null, progress: null, status: "SCHEDULED",
     nextRunAt: new Date("2035-04-05T06:00:00.000Z"),
   };
@@ -1291,13 +1298,16 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"] });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true } });
   assert.equal(result.reason, "claimed");
   assert.equal(updateData.claimedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.startedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.leaseUntil.toISOString(), new Date(authorityNow.getTime() + 60_000).toISOString());
-  assert.deepEqual(updateData.params, { observationTokenVersion: 1, observationReadLeaseVersion: 1 },
-    "legacy queued campaign jobs must be upgraded to the causal-read protocol at claim time");
+  assert.deepEqual(updateData.params, {
+    knownClaimerFrontierHashes: { "campaign-keep": "a".repeat(64) },
+    observationTokenVersion: 1,
+    observationReadLeaseVersion: 1,
+  }, "legacy queued campaign jobs must drop unbounded catch-up hints and upgrade to causal-read protocol at claim time");
 });
 
 test("cooperative job retry timing uses PostgreSQL authority instead of replica wall clock", async () => {
@@ -1346,7 +1356,7 @@ test("job claim creator capability freshness uses the same PostgreSQL authority 
     jobInstance: { findMany: async () => [], findFirst: async () => null },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"] });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true } });
   assert.equal(result.reason, "no-work");
   assert.equal(bindingWhere.lastSeenAt.gte.toISOString(), new Date(authorityNow.getTime() - 2 * 60_000).toISOString());
   assert.equal(bindingWhere.lastSeenAt.lte.toISOString(), new Date(authorityNow.getTime() + 5 * 60_000).toISOString());
@@ -1361,6 +1371,6 @@ test("job claim rejects future-poisoned device heartbeat before creator capabili
     jobInstance: { findMany: async () => [] },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"] });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true } });
   assert.equal(result.reason, "device-stale");
 });
