@@ -1296,6 +1296,8 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
   assert.equal(updateData.claimedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.startedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.leaseUntil.toISOString(), new Date(authorityNow.getTime() + 60_000).toISOString());
+  assert.deepEqual(updateData.params, { observationTokenVersion: 1, observationReadLeaseVersion: 1 },
+    "legacy queued campaign jobs must be upgraded to the causal-read protocol at claim time");
 });
 
 test("cooperative job retry timing uses PostgreSQL authority instead of replica wall clock", async () => {

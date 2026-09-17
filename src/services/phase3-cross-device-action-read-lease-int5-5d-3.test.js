@@ -28,7 +28,7 @@ function memoryDb() {
       if (/FROM "FanObservationReadLease"/.test(sql) && /FOR UPDATE/.test(sql)) {
         return readLease && readLease.creatorId === args[0] && readLease.expiresAt.getTime() > Date.now() ? [{ ...readLease }] : [];
       }
-      if (/UPDATE "FanObservationClock"/.test(sql)) {
+      if (/INSERT INTO "FanObservationCreatorClock"/.test(sql)) {
         clock = new Date(clock.getTime() + 1);
         return [{ lastObservedAt: new Date(clock) }];
       }

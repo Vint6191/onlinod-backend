@@ -3155,8 +3155,19 @@ model JobInstance {
 }
 
 
-model FanObservationClock {
+// Legacy singleton clock retained only so an old binary can finish a rolling
+// deployment after the additive creator-clock migration lands. Current code
+// never issues FanData observation time from this platform-global row.
+model LegacyFanObservationClock {
   id             Int      @id
+  lastObservedAt DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@map("FanObservationClock")
+}
+
+model FanObservationCreatorClock {
+  creatorId      String   @id
   lastObservedAt DateTime @default(now())
   updatedAt      DateTime @updatedAt
 }

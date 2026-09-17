@@ -12,6 +12,7 @@ const {
 const { evaluateCollectionState, evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
 const { earningsFreshnessLimitMs, trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { consumeFanObservationToken } = require("./fan-observation-token-service");
 
 const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v7";
 const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", CAMPAIGN_COLLECTOR_VERSION]);
@@ -600,19 +601,46 @@ function normalizeCampaign(raw) {
 }
 function normalizeClaimer(raw) {
   const row = object(raw);
-  const user = object(row.user || row.fan || row.subscriber || row);
-  const onlyFansUserId = text(user.id ?? user.userId ?? row.userId ?? row.fanId, 180);
+  const nestedUser = object(row.user || row.fan || row.subscriber);
+  const hasNestedUser = Object.keys(nestedUser).length > 0;
+  const user = hasNestedUser ? nestedUser : row;
+  // Desktop's canonical flattened claimer contract is { id: claimerId, userId: fanId }.
+  // Never let the attribution row id masquerade as the OnlyFans user id.
+  const onlyFansUserId = text(hasNestedUser
+    ? (user.id ?? user.userId ?? row.userId ?? row.fanId)
+    : (row.userId ?? row.fanId ?? row.id), 180);
   if (!onlyFansUserId) return null;
   const attributedAtRaw = row.attributedAt ?? row.createdAt ?? row.created_at ?? row.claimedAt;
   const attributedAt = attributedAtRaw == null ? null : strictDate(attributedAtRaw);
   if (attributedAtRaw != null && !attributedAt) return null;
+  const username = text(user.username, 200);
+  const displayName = text(user.name ?? user.displayName, 500);
+  const avatarUrl = text(user.avatar ?? user.avatarUrl ?? object(user.avatarThumbs).c144 ?? object(user.avatarThumbs).c50, 1200);
+  const embeddedRaw = object(row.embeddedValue);
+  let embeddedValue = null;
+  if (Object.keys(embeddedRaw).length) {
+    try {
+      embeddedValue = normalizeCampaignFanValueItem({
+        ...embeddedRaw,
+        fanOnlyFansUserId: onlyFansUserId,
+        available: true,
+        username,
+        displayName,
+        avatarUrl,
+      }, embeddedRaw.observedAt);
+    } catch {
+      return null;
+    }
+    if (embeddedValue.available !== true) return null;
+  }
   return {
     onlyFansUserId,
-    username: text(user.username, 200),
-    displayName: text(user.name ?? user.displayName, 500),
-    avatarUrl: text(user.avatar ?? user.avatarUrl ?? object(user.avatarThumbs).c144 ?? object(user.avatarThumbs).c50, 1200),
+    username,
+    displayName,
+    avatarUrl,
     externalClaimerId: text(row.id ?? row.claimerId, 220),
     attributedAt,
+    embeddedValue,
   };
 }
 
@@ -739,19 +767,42 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         backendRejected += 1;
         continue;
       }
-      uniqueClaimers.set(claimer.onlyFansUserId, claimer);
+      const existingClaimer = uniqueClaimers.get(claimer.onlyFansUserId);
+      uniqueClaimers.set(claimer.onlyFansUserId, existingClaimer ? {
+        ...existingClaimer,
+        ...claimer,
+        username: claimer.username || existingClaimer.username || null,
+        displayName: claimer.displayName || existingClaimer.displayName || null,
+        avatarUrl: claimer.avatarUrl || existingClaimer.avatarUrl || null,
+        embeddedValue: claimer.embeddedValue || existingClaimer.embeddedValue || null,
+      } : claimer);
     }
     const duplicateClaimers = rawRows.length - backendRejected - uniqueClaimers.size;
     unchanged += duplicateClaimers;
 
+    const observationTokenRequired = Number(object(job.params).observationTokenVersion || 0) >= 1;
+    let identityObservedAt = serverReceivedAt;
+    if (uniqueClaimers.size && observationTokenRequired) {
+      const observationToken = text(payload.observationToken, 500);
+      if (!observationToken) throw new Error("CAMPAIGN_CLAIMER_OBSERVATION_TOKEN_REQUIRED");
+      const consumed = await consumeFanObservationToken({
+        db: tx,
+        job,
+        deviceId,
+        leaseRevision: Number(job.leaseRevision),
+        token: observationToken,
+        purpose: "campaign_claimers_page",
+        subjects: [...uniqueClaimers.keys()],
+      });
+      identityObservedAt = strictDate(consumed.observedAt);
+      if (!identityObservedAt) throw new Error("CAMPAIGN_CLAIMER_OBSERVATION_TIME_INVALID");
+    }
+
     for (const claimer of uniqueClaimers.values()) {
       // `attributedAt` is historical campaign membership provenance, not the time
-      // at which this scan observed the fan's current profile fields. Reusing the
-      // event timestamp as FanData chronology makes a later username/avatar read
-      // look like the same causal generation and can trip the same-generation
-      // contradiction fence. Canonical identity freshness is therefore stamped
-      // from the PostgreSQL-owned receipt clock for this claimer page.
-      const identityObservedAt = serverReceivedAt;
+      // at which this scan observed the fan's current profile fields. New causal
+      // jobs stamp identity freshness from the server-issued post-read observation
+      // token. Receipt time remains only the legacy fallback for pre-cutover jobs.
       const fan = await projectFanIdentity(tx, {
         agencyId: job.agencyId,
         creatorId: job.creatorId,
@@ -763,6 +814,11 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         activityObservedAt: identityObservedAt,
         source: "CAMPAIGN_CLAIMER",
       });
+      if (claimer.embeddedValue?.available === true) {
+        await projectCampaignFanValueCurrent({
+          tx, job, deviceId, scanRunId, item: claimer.embeddedValue, observedAt: identityObservedAt,
+        });
+      }
 
       const where = { campaignId_fanRecordId: { campaignId: saved.id, fanRecordId: fan.id } };
       const existing = await tx.creatorCampaignFan.findUnique({
@@ -832,7 +888,8 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
 function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
   const item = object(payload);
   // Desktop observation time is retained as provenance only. Canonical FanData
-  // ordering is stamped from PostgreSQL receipt time inside the ingest tx.
+  // ordering is server-owned: causal jobs consume the post-read token chronology;
+  // pre-cutover legacy jobs retain PostgreSQL receipt time as their rollout fallback.
   const clientObservedAt = strictDate(item.observedAt ?? inheritedObservedAt);
   const onlyFansUserId = text(item.fanOnlyFansUserId, 180);
   if (!clientObservedAt || !onlyFansUserId) throw new Error("Invalid campaign fan value item contract");
@@ -852,6 +909,7 @@ function normalizeCampaignFanValueItem(payload, inheritedObservedAt = null) {
   if (item.lastActivityAt != null && !lastActivityAt) throw new Error("Campaign fan value lastActivityAt is invalid");
   return {
     available: true, clientObservedAt, onlyFansUserId, values, lastActivityAt,
+    observationToken: text(item.observationToken, 500),
     username: text(item.username, 200),
     displayName: text(item.displayName, 500),
     avatarUrl: text(item.avatarUrl, 1200),
@@ -886,22 +944,10 @@ async function assertCampaignFanValueScope(tx, job, scanRunId, onlyFansUserIds) 
   }
 }
 
-async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }) {
-  if (item.available !== true) return { available: false, reasonCode: item.reasonCode };
-  const observedAt = strictDate(authorityObservedAt);
-  if (!observedAt) throw new Error("Campaign fan value authority receipt time is invalid");
-  const fan = await projectFanIdentity(tx, {
-    agencyId: job.agencyId,
-    creatorId: job.creatorId,
-    onlyFansUserId: item.onlyFansUserId,
-    username: item.username,
-    platformDisplayName: item.displayName,
-    avatarUrl: item.avatarUrl,
-    headerUrl: item.headerUrl,
-    observedAt,
-    source: "CAMPAIGN_CLAIMER",
-  });
-  const projected = await projectFanValue(tx, {
+async function projectCampaignFanValueCurrent({ tx, job, deviceId, scanRunId, item, observedAt }) {
+  const authorityObservedAt = strictDate(observedAt);
+  if (!authorityObservedAt) throw new Error("Campaign fan value authority time is invalid");
+  return projectFanValue(tx, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     onlyFansUserId: item.onlyFansUserId,
@@ -913,18 +959,57 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, au
     streamsSpentCents: item.values.streamsSpentCents,
     lastActivityAt: item.lastActivityAt,
     availability: "AVAILABLE",
-    observedAt,
+    observedAt: authorityObservedAt,
     source: "CAMPAIGN_CLAIMER",
     sourceDeviceId: deviceId || null,
     sourceJobId: job.id,
     scanRunId,
   });
+}
+
+async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }) {
+  if (item.available !== true) return { available: false, reasonCode: item.reasonCode };
+  const observedAt = strictDate(authorityObservedAt);
+  if (!observedAt) throw new Error("Campaign fan value authority time is invalid");
+  const fan = await projectFanIdentity(tx, {
+    agencyId: job.agencyId,
+    creatorId: job.creatorId,
+    onlyFansUserId: item.onlyFansUserId,
+    username: item.username,
+    platformDisplayName: item.displayName,
+    avatarUrl: item.avatarUrl,
+    headerUrl: item.headerUrl,
+    observedAt,
+    source: "CAMPAIGN_CLAIMER",
+  });
+  const projected = await projectCampaignFanValueCurrent({ tx, job, deviceId, scanRunId, item, observedAt });
   return {
     replay: projected.replay,
     available: true,
     fanRecordId: fan.id,
     fetchedAt: projected.record?.valueObservedAt || observedAt,
   };
+}
+
+function campaignFanValueObservationTokenRequired(job) {
+  return Number(object(job?.params).observationTokenVersion || 0) >= 1;
+}
+
+async function campaignFanValueAuthorityObservedAt({ tx, job, deviceId, item, fallbackObservedAt }) {
+  if (item.available !== true || !campaignFanValueObservationTokenRequired(job)) return fallbackObservedAt;
+  if (!item.observationToken) throw new Error("CAMPAIGN_FAN_VALUE_OBSERVATION_TOKEN_REQUIRED");
+  const consumed = await consumeFanObservationToken({
+    db: tx,
+    job,
+    deviceId,
+    leaseRevision: Number(job.leaseRevision),
+    token: item.observationToken,
+    purpose: "campaign_fan_values",
+    subjects: [item.onlyFansUserId],
+  });
+  const observedAt = strictDate(consumed.observedAt);
+  if (!observedAt) throw new Error("CAMPAIGN_FAN_VALUE_OBSERVATION_TIME_INVALID");
+  return observedAt;
 }
 
 async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }) {
@@ -935,20 +1020,45 @@ async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
   const scanStartedAt = command.requestedAt;
-  const observedAt = new Date();
+  const processObservedAt = new Date();
   if (
     !batchKey || !scanRunId || scanRunId !== command.generation ||
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
   ) throw new Error("Invalid campaign fan value chunk contract");
   if (!batchKey.startsWith(`run:${scanRunId}:`)) throw new Error("Campaign fan value batch key does not match scan run");
-  const item = normalizeCampaignFanValueItem(payload, observedAt);
+  const item = normalizeCampaignFanValueItem(payload, processObservedAt);
+  const idempotencyKey = `campaigns:${job.id}:${batchKey}`;
+  if (idempotencyKey.length > 240) throw new Error("Campaign fan value idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
     await assertCampaignFanValueScope(tx, job, scanRunId, [item.onlyFansUserId]);
-    const authorityObservedAt = await dbAuthorityNow({ db: tx, fallbackNow: observedAt });
-    return upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt });
+    const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: processObservedAt });
+    const { batch, replay } = await beginBatch(tx, {
+      job,
+      deviceId,
+      idempotencyKey,
+      dataType: "CAMPAIGNS",
+      rangeFrom: scanStartedAt,
+      rangeTo: serverReceivedAt,
+      collectorVersion: payload.collectorVersion,
+      schemaVersion: payload.schemaVersion,
+      payload,
+    });
+    if (replay && ["COMMITTED", "PARTIAL"].includes(batch.status)) {
+      return { replay: true, batchId: batch.id, status: batch.status };
+    }
+    const authorityObservedAt = await campaignFanValueAuthorityObservedAt({
+      tx, job, deviceId, item, fallbackObservedAt: serverReceivedAt,
+    });
+    const applied = await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt });
+    await finishBatch(tx, batch.id, {
+      received: 1,
+      inserted: applied.available === true && applied.replay !== true ? 1 : 0,
+      unchanged: applied.available !== true || applied.replay === true ? 1 : 0,
+    });
+    return { ...applied, replay: false, batchId: batch.id, superseded: false };
   });
 }
 
@@ -960,23 +1070,54 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
   const scanStartedAt = command.requestedAt;
-  const observedAt = new Date();
+  const processObservedAt = new Date();
   const values = array(payload.values);
   if (
     !batchKey || !scanRunId || scanRunId !== command.generation || values.length < 1 || values.length > 20 ||
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion)
   ) throw new Error("Invalid campaign fan values batch contract");
   if (!batchKey.startsWith(`run:${scanRunId}:`)) throw new Error("Campaign fan values batch key does not match scan run");
-  const normalized = values.map((value) => normalizeCampaignFanValueItem(value, observedAt));
+  const normalized = values.map((value) => normalizeCampaignFanValueItem(value, processObservedAt));
+  const normalizedIds = normalized.map((item) => item.onlyFansUserId);
+  if (new Set(normalizedIds).size !== normalizedIds.length) throw new Error("CAMPAIGN_FAN_VALUE_DUPLICATE_FAN");
+  const idempotencyKey = `campaigns:${job.id}:${batchKey}`;
+  if (idempotencyKey.length > 240) throw new Error("Campaign fan values idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation, received: values.length, available: 0, unavailable: 0, applied: [] };
-    await assertCampaignFanValueScope(tx, job, scanRunId, normalized.map((item) => item.onlyFansUserId));
-    const authorityObservedAt = await dbAuthorityNow({ db: tx, fallbackNow: observedAt });
+    await assertCampaignFanValueScope(tx, job, scanRunId, normalizedIds);
+    const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: processObservedAt });
+    const { batch, replay } = await beginBatch(tx, {
+      job,
+      deviceId,
+      idempotencyKey,
+      dataType: "CAMPAIGNS",
+      rangeFrom: scanStartedAt,
+      rangeTo: serverReceivedAt,
+      collectorVersion: payload.collectorVersion,
+      schemaVersion: payload.schemaVersion,
+      payload,
+    });
+    if (replay && ["COMMITTED", "PARTIAL"].includes(batch.status)) {
+      return { replay: true, batchId: batch.id, status: batch.status, received: normalized.length };
+    }
     const applied = [];
-    for (const item of normalized) applied.push(await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }));
-    return { replay: applied.every((row) => row.replay === true), received: normalized.length, available: applied.filter((row) => row.available === true).length, unavailable: applied.filter((row) => row.available !== true).length, applied };
+    for (const item of normalized) {
+      const authorityObservedAt = await campaignFanValueAuthorityObservedAt({
+        tx, job, deviceId, item, fallbackObservedAt: serverReceivedAt,
+      });
+      applied.push(await upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }));
+    }
+    const available = applied.filter((row) => row.available === true).length;
+    const unavailable = applied.length - available;
+    const replayedRows = applied.filter((row) => row.replay === true).length;
+    await finishBatch(tx, batch.id, {
+      received: normalized.length,
+      inserted: Math.max(0, available - replayedRows),
+      unchanged: unavailable + replayedRows,
+    });
+    return { replay: false, batchId: batch.id, received: normalized.length, available, unavailable, applied, superseded: false };
   });
 }
 

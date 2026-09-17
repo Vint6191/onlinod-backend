@@ -31,17 +31,33 @@ function observationScopeHash({ purpose, subjects }) {
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
-async function nextObservationTime(db) {
+async function nextObservationTime(db, { creatorId }) {
+  const normalizedCreatorId = clean(creatorId, 180);
+  if (!normalizedCreatorId) throw new Error("FAN_OBSERVATION_TOKEN_CREATOR_REQUIRED");
   const rows = await db.$queryRawUnsafe(`
-    UPDATE "FanObservationClock"
+    WITH legacy_cutover_floor AS (
+      SELECT "lastObservedAt"
+      FROM "FanObservationClock"
+      WHERE "id" = 1
+    )
+    INSERT INTO "FanObservationCreatorClock" ("creatorId", "lastObservedAt", "updatedAt")
+    VALUES (
+      $1,
+      GREATEST(
+        CURRENT_TIMESTAMP,
+        COALESCE((SELECT "lastObservedAt" FROM legacy_cutover_floor), CURRENT_TIMESTAMP)
+      ),
+      CURRENT_TIMESTAMP
+    )
+    ON CONFLICT ("creatorId") DO UPDATE
     SET "lastObservedAt" = GREATEST(
           CURRENT_TIMESTAMP,
-          "lastObservedAt" + INTERVAL '1 millisecond'
+          "FanObservationCreatorClock"."lastObservedAt" + INTERVAL '1 millisecond',
+          COALESCE((SELECT "lastObservedAt" FROM legacy_cutover_floor), CURRENT_TIMESTAMP)
         ),
         "updatedAt" = CURRENT_TIMESTAMP
-    WHERE "id" = 1
     RETURNING "lastObservedAt"
-  `);
+  `, normalizedCreatorId);
   const observedAt = rows?.[0]?.lastObservedAt instanceof Date
     ? rows[0].lastObservedAt
     : new Date(rows?.[0]?.lastObservedAt);
@@ -77,13 +93,14 @@ async function createScopedFanObservationToken({ db, jobId = null, deliveryId = 
   const normalizedPurpose = clean(purpose, 120);
   const normalizedSubjects = normalizeSubjects(subjects);
   const owner = tokenOwner({ jobId, deliveryId });
-  if (!normalizedPurpose || !clean(deviceId, 200) || !Number.isInteger(Number(leaseRevision))) {
+  const normalizedCreatorId = clean(creatorId, 180);
+  if (!normalizedPurpose || !normalizedCreatorId || !clean(deviceId, 200) || !Number.isInteger(Number(leaseRevision))) {
     throw new Error("FAN_OBSERVATION_TOKEN_SCOPE_INVALID");
   }
   if (!normalizedSubjects.length) throw new Error("FAN_OBSERVATION_TOKEN_SUBJECT_REQUIRED");
   const scopeHash = observationScopeHash({ purpose: normalizedPurpose, subjects: normalizedSubjects });
   await cleanupStaleFanObservationTokens(db);
-  const observedAt = await nextObservationTime(db);
+  const observedAt = await nextObservationTime(db, { creatorId: normalizedCreatorId });
   const token = crypto.randomBytes(32).toString("base64url");
   await db.fanObservationToken.create({
     data: {
@@ -91,7 +108,7 @@ async function createScopedFanObservationToken({ db, jobId = null, deliveryId = 
       jobId: owner.jobId,
       deliveryId: owner.deliveryId,
       agencyId: clean(agencyId, 180),
-      creatorId: clean(creatorId, 180),
+      creatorId: normalizedCreatorId,
       deviceId: clean(deviceId, 200),
       leaseRevision: Number(leaseRevision),
       purpose: normalizedPurpose,

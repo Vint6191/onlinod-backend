@@ -520,6 +520,91 @@ test("campaign claimer identity freshness uses PostgreSQL receipt time, not hist
   assert.notEqual(aggregateWrite.data.identityObservedAt.toISOString(), attributedAt);
 });
 
+test("campaign claimer causal job consumes exact token and projects token chronology", async () => {
+  const authorityNow = new Date("2026-08-09T12:34:56.789Z");
+  const tokenObservedAt = new Date("2026-08-09T12:34:55.123Z");
+  const harness = batchHarness();
+  const fanUpdates = [];
+  let tokenDeletes = 0;
+  harness.tx.$queryRawUnsafe = async (sql) => {
+    if (/clock_timestamp\(\)/.test(String(sql))) return [{ authorityNow }];
+    if (/pg_advisory_xact_lock/.test(String(sql))) return [];
+    throw new Error(`Unexpected raw query: ${String(sql)}`);
+  };
+  harness.tx.$executeRawUnsafe = async () => 1;
+  harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
+  harness.tx.creatorCampaignFan = { findUnique: async () => null, upsert: async ({ create }) => create };
+  const fanRow = {
+    id: "fan-db-1", creatorId: "creator-1", onlyFansUserId: "fan-1", username: "alpha", displayName: "Alpha",
+    avatarUrl: null, headerUrl: null, lastSeenAt: new Date("2026-06-01T00:00:00.000Z"),
+    usernameAuthorityVersion: null, displayNameAuthorityVersion: null, avatarAuthorityVersion: null,
+    headerAuthorityVersion: null, identityAuthorityVersion: null,
+  };
+  harness.tx.creatorFan = {
+    findUnique: async () => fanRow,
+    updateMany: async (args) => { fanUpdates.push(args); return { count: 1 }; },
+  };
+  const crypto = require("node:crypto");
+  const scopeHash = crypto.createHash("sha256").update("campaign_claimers_page|fan-1").digest("hex");
+  harness.tx.fanObservationToken = {
+    findUnique: async ({ where }) => where.token === "campaign-token-1" ? {
+      id: 77n, token: "campaign-token-1", jobId: "job-1", deliveryId: null, deviceId: "device-1",
+      leaseRevision: 9, purpose: "campaign_claimers_page", scopeHash, observedAt: tokenObservedAt, consumedAt: null,
+    } : null,
+    deleteMany: async ({ where }) => {
+      assert.equal(where.token, "campaign-token-1");
+      assert.equal(where.jobId, "job-1");
+      assert.equal(where.deviceId, "device-1");
+      assert.equal(where.leaseRevision, 9);
+      assert.equal(where.purpose, "campaign_claimers_page");
+      assert.equal(where.scopeHash, scopeHash);
+      tokenDeletes += 1;
+      return { count: 1 };
+    },
+  };
+  const causalJob = campaignJob("scan-identity-token", "2026-08-09T12:00:00.000Z");
+  causalJob.leaseRevision = 9;
+  causalJob.params = { ...causalJob.params, observationTokenVersion: 1, observationReadLeaseVersion: 1 };
+
+  await ingestCampaignChunk({
+    db: harness.db, job: causalJob, deviceId: "device-1",
+    chunk: {
+      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v7",
+      scanRunId: "scan-identity-token", batchKey: "run:scan-identity-token:claimers:1",
+      externalCampaignId: "campaign-1", campaignComplete: true, scannerRejected: 0,
+      observationToken: "campaign-token-1",
+      claimers: [{ id: "claim-1", attributedAt: "2026-07-01T00:00:00.000Z", user: { id: "fan-1", username: "beta", name: "Beta" } }],
+    },
+  });
+
+  assert.equal(tokenDeletes, 1, "campaign token must be consumed exactly once inside ingest transaction");
+  const usernameWrite = fanUpdates.find((entry) => entry?.data?.username === "beta");
+  const aggregateWrite = fanUpdates.find((entry) => entry?.data?.identityObservedAt instanceof Date);
+  assert.ok(usernameWrite);
+  assert.ok(aggregateWrite);
+  assert.match(usernameWrite.data.usernameAuthorityVersion, new RegExp(`^${tokenObservedAt.toISOString().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\|`));
+  assert.equal(aggregateWrite.data.identityObservedAt.toISOString(), tokenObservedAt.toISOString());
+  assert.notEqual(aggregateWrite.data.identityObservedAt.toISOString(), authorityNow.toISOString());
+});
+
+test("campaign claimer causal job fails closed when exact token is missing", async () => {
+  const harness = batchHarness();
+  harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
+  harness.tx.creatorCampaignFan = { findUnique: async () => null, upsert: async () => ({}) };
+  const causalJob = campaignJob("scan-token-required");
+  causalJob.leaseRevision = 4;
+  causalJob.params = { ...causalJob.params, observationTokenVersion: 1, observationReadLeaseVersion: 1 };
+  await assert.rejects(() => ingestCampaignChunk({
+    db: harness.db, job: causalJob, deviceId: "device-1",
+    chunk: {
+      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v7",
+      scanRunId: "scan-token-required", batchKey: "run:scan-token-required:claimers:1",
+      externalCampaignId: "campaign-1", campaignComplete: true, scannerRejected: 0,
+      claimers: [{ id: "claim-1", user: { id: "fan-1", username: "beta" } }],
+    },
+  }), /CAMPAIGN_CLAIMER_OBSERVATION_TOKEN_REQUIRED/);
+});
+
 test("campaign fan attribution keeps the earliest confirmed attribution date", async () => {
   const harness = batchHarness();
   let updateData = null;
@@ -589,6 +674,11 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
       findUnique: async () => null,
       upsert: async ({ create }) => ({ id: "campaign-state-fan-value", ...create }),
     },
+    analyticsIngestBatch: {
+      findUnique: async () => null,
+      create: async ({ data }) => ({ id: "fan-value-batch", status: "RECEIVED", ...data }),
+      update: async ({ data }) => data,
+    },
     creatorCampaignFan: {
       findMany: async ({ where }) => where.fan.onlyFansUserId.in.map((onlyFansUserId) => ({ fan: { onlyFansUserId } })),
     },
@@ -644,6 +734,11 @@ test("campaign fan value batch applies multiple current snapshots under one anal
       findUnique: async () => null,
       upsert: async ({ create }) => ({ id: "campaign-state-batch", ...create }),
     },
+    analyticsIngestBatch: {
+      findUnique: async () => null,
+      create: async ({ data }) => ({ id: "fan-value-batch", status: "RECEIVED", ...data }),
+      update: async ({ data }) => data,
+    },
     creatorCampaignFan: {
       findMany: async ({ where }) => where.fan.onlyFansUserId.in.map((onlyFansUserId) => ({ fan: { onlyFansUserId } })),
     },
@@ -688,6 +783,11 @@ test("campaign fan value source is server-assigned and fan scope is proven by cu
     creatorCampaignCollectionState: {
       findUnique: async () => null,
       upsert: async ({ create }) => ({ id: "campaign-state-scope", ...create }),
+    },
+    analyticsIngestBatch: {
+      findUnique: async () => null,
+      create: async ({ data }) => ({ id: "fan-value-batch", status: "RECEIVED", ...data }),
+      update: async ({ data }) => data,
     },
     creatorCampaignFan: {
       findMany: async ({ where }) => {
@@ -1412,4 +1512,148 @@ test("earnings ordering prefers DB authorityRequestedAt over legacy requestedAt 
   assert.equal(upserts[0].create.sourceScanRequestedAt.toISOString(), authorityAt);
   assert.notEqual(upserts[0].create.sourceScanRequestedAt.toISOString(), legacyFuture);
   assert.equal(upserts[0].create.collectedAt.toISOString(), "2026-08-06T11:32:00.000Z");
+});
+
+test("INT5.6A-4 causal campaign profile value consumes exact token and projects token chronology", async () => {
+  const authorityNow = new Date("2026-09-17T16:00:10.000Z");
+  const tokenObservedAt = new Date("2026-09-17T16:00:05.000Z");
+  const harness = batchHarness({ authorityNow });
+  harness.tx.$executeRawUnsafe = async () => 1;
+  harness.tx.creatorCampaignFan = {
+    findMany: async ({ where }) => where.fan.onlyFansUserId.in.map((onlyFansUserId) => ({ fan: { onlyFansUserId } })),
+  };
+  const fanRow = {
+    id: "fan-db-1", creatorId: "creator-1", onlyFansUserId: "fan-1", username: "old", displayName: "Old",
+    avatarUrl: null, headerUrl: null, lastSeenAt: new Date("2026-09-01T00:00:00.000Z"),
+    usernameAuthorityVersion: null, displayNameAuthorityVersion: null, avatarAuthorityVersion: null,
+    headerAuthorityVersion: null, identityAuthorityVersion: null,
+  };
+  harness.tx.creatorFan = {
+    findUnique: async () => fanRow,
+    updateMany: async () => ({ count: 1 }),
+  };
+  let valueCreate = null;
+  harness.tx.creatorFanValueCurrent = {
+    findUnique: async () => null,
+    create: async ({ data }) => { valueCreate = data; return data; },
+    updateMany: async () => ({ count: 1 }),
+  };
+  const crypto = require("node:crypto");
+  const scopeHash = crypto.createHash("sha256").update("campaign_fan_values|fan-1").digest("hex");
+  let tokenDeletes = 0;
+  harness.tx.fanObservationToken = {
+    findUnique: async ({ where }) => where.token === "fan-value-token-1" ? {
+      id: 901n, token: "fan-value-token-1", jobId: "job-1", deliveryId: null, deviceId: "device-1",
+      leaseRevision: 12, purpose: "campaign_fan_values", scopeHash, observedAt: tokenObservedAt, consumedAt: null,
+    } : null,
+    deleteMany: async ({ where }) => {
+      assert.equal(where.token, "fan-value-token-1");
+      assert.equal(where.purpose, "campaign_fan_values");
+      assert.equal(where.scopeHash, scopeHash);
+      tokenDeletes += 1;
+      return { count: 1 };
+    },
+  };
+  const causalJob = campaignJob("fan-value-causal", "2026-09-17T16:00:00.000Z");
+  causalJob.leaseRevision = 12;
+  causalJob.params = { ...causalJob.params, observationTokenVersion: 1, observationReadLeaseVersion: 1 };
+  const result = await ingestCampaignFanValuesBatchChunk({
+    db: harness.db, job: causalJob, deviceId: "device-1",
+    chunk: {
+      kind: "campaign_fan_values_batch", schemaVersion: 4, collectorVersion: "campaigns-v7",
+      scanRunId: "fan-value-causal", batchKey: "run:fan-value-causal:fan-values:1",
+      values: [{
+        fanOnlyFansUserId: "fan-1", available: true, observedAt: "2026-09-17T15:59:00.000Z",
+        observationToken: "fan-value-token-1", username: "new", displayName: "New",
+        totalNetCents: 12345, messagesNetCents: 10000, subscriptionsNetCents: 0, tipsNetCents: 2345,
+        postsNetCents: 0, streamsNetCents: 0,
+      }],
+    },
+  });
+  assert.equal(result.available, 1);
+  assert.equal(tokenDeletes, 1);
+  assert.ok(valueCreate);
+  assert.equal(valueCreate.valueObservedAt.toISOString(), tokenObservedAt.toISOString());
+  assert.notEqual(valueCreate.valueObservedAt.toISOString(), authorityNow.toISOString());
+});
+
+test("INT5.6A-4 committed campaign fan-value replay returns before one-shot token consumption", async () => {
+  const crypto = require("node:crypto");
+  const chunk = {
+    kind: "campaign_fan_values_batch", schemaVersion: 4, collectorVersion: "campaigns-v7",
+    scanRunId: "fan-value-replay", batchKey: "run:fan-value-replay:fan-values:1",
+    values: [{
+      fanOnlyFansUserId: "fan-1", available: true, observedAt: "2026-09-17T15:59:00.000Z",
+      observationToken: "already-consumed-token", totalNetCents: 100,
+    }],
+  };
+  const payloadChecksum = crypto.createHash("sha256").update(JSON.stringify(chunk)).digest("hex");
+  const harness = batchHarness({
+    authorityNow: new Date("2026-09-17T16:00:10.000Z"),
+    existingBatch: { id: "fan-value-replay-batch", status: "COMMITTED", payloadChecksum },
+  });
+  harness.tx.$executeRawUnsafe = async () => 1;
+  harness.tx.creatorCampaignFan = { findMany: async () => [{ fan: { onlyFansUserId: "fan-1" } }] };
+  let tokenLookups = 0;
+  harness.tx.fanObservationToken = {
+    findUnique: async () => { tokenLookups += 1; throw new Error("token must not be touched on committed replay"); },
+  };
+  const causalJob = campaignJob("fan-value-replay", "2026-09-17T16:00:00.000Z");
+  causalJob.leaseRevision = 13;
+  causalJob.params = { ...causalJob.params, observationTokenVersion: 1, observationReadLeaseVersion: 1 };
+  const result = await ingestCampaignFanValuesBatchChunk({ db: harness.db, job: causalJob, deviceId: "device-1", chunk });
+  assert.equal(result.replay, true);
+  assert.equal(tokenLookups, 0);
+});
+
+test("INT5.6A-4 embedded claimer value reuses claimer-page causal chronology without a fake second token", async () => {
+  const authorityNow = new Date("2026-09-17T16:10:10.000Z");
+  const tokenObservedAt = new Date("2026-09-17T16:10:05.000Z");
+  const harness = batchHarness({ authorityNow });
+  harness.tx.$executeRawUnsafe = async () => 1;
+  harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
+  harness.tx.creatorCampaignFan = { findUnique: async () => null, upsert: async ({ create }) => create };
+  const fanRow = {
+    id: "fan-db-1", creatorId: "creator-1", onlyFansUserId: "fan-1", username: "old", displayName: "Old",
+    avatarUrl: null, headerUrl: null, lastSeenAt: new Date("2026-09-01T00:00:00.000Z"),
+    usernameAuthorityVersion: null, displayNameAuthorityVersion: null, avatarAuthorityVersion: null,
+    headerAuthorityVersion: null, identityAuthorityVersion: null,
+  };
+  harness.tx.creatorFan = { findUnique: async () => fanRow, updateMany: async () => ({ count: 1 }) };
+  let valueCreate = null;
+  harness.tx.creatorFanValueCurrent = {
+    findUnique: async () => null,
+    create: async ({ data }) => { valueCreate = data; return data; },
+    updateMany: async () => ({ count: 1 }),
+  };
+  const crypto = require("node:crypto");
+  const scopeHash = crypto.createHash("sha256").update("campaign_claimers_page|fan-1").digest("hex");
+  let tokenDeletes = 0;
+  harness.tx.fanObservationToken = {
+    findUnique: async ({ where }) => where.token === "claimer-token-embedded" ? {
+      id: 902n, token: "claimer-token-embedded", jobId: "job-1", deliveryId: null, deviceId: "device-1",
+      leaseRevision: 14, purpose: "campaign_claimers_page", scopeHash, observedAt: tokenObservedAt, consumedAt: null,
+    } : null,
+    deleteMany: async () => { tokenDeletes += 1; return { count: 1 }; },
+  };
+  const causalJob = campaignJob("claimer-embedded", "2026-09-17T16:10:00.000Z");
+  causalJob.leaseRevision = 14;
+  causalJob.params = { ...causalJob.params, observationTokenVersion: 1, observationReadLeaseVersion: 1 };
+  await ingestCampaignChunk({
+    db: harness.db, job: causalJob, deviceId: "device-1",
+    chunk: {
+      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v7",
+      scanRunId: "claimer-embedded", batchKey: "run:claimer-embedded:claimers:1",
+      externalCampaignId: "campaign-1", campaignComplete: true, scannerRejected: 0,
+      observationToken: "claimer-token-embedded",
+      claimers: [{
+        id: "claim-1", userId: "fan-1", username: "beta", displayName: "Beta",
+        embeddedValue: { totalNetCents: 777, messagesNetCents: 700, tipsNetCents: 77, observedAt: "2026-09-17T16:09:59.000Z" },
+      }],
+    },
+  });
+  assert.equal(tokenDeletes, 1, "the claimer page token is consumed once for both identity and embedded value");
+  assert.ok(valueCreate);
+  assert.equal(valueCreate.valueObservedAt.toISOString(), tokenObservedAt.toISOString());
+  assert.notEqual(valueCreate.valueObservedAt.toISOString(), authorityNow.toISOString());
 });

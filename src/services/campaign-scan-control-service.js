@@ -117,6 +117,8 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
       claimerPageSize: 50,
       maxClaimerPages: 10_000,
       fanValueBatchSize: 20,
+      observationTokenVersion: 1,
+      observationReadLeaseVersion: 1,
     };
     const scheduled = await scheduleJobNow({
       db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId, params, priority: 100, now: authorityNow, bucketMs: 1,
@@ -133,22 +135,43 @@ async function stopManualCampaignScan({ db = prisma, creatorId, now = new Date()
   if (!active) return { job: null, action: "idle" };
   if (active.status === "PAUSED") return { job: active, action: "already_paused" };
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
-  const result = await db.jobInstance.updateMany({
-    where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED"] } },
-    data: {
-      status: "PAUSED",
-      claimedAt: null,
-      claimedByDeviceId: null,
-      leaseUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-      workId: null,
-      completedAt: null,
-      lastError: null,
-      lastProgressAt: active.lastProgressAt || authorityNow,
-    },
-  });
-  if (!result.count) {
+  const pause = async (tx) => {
+    const result = await tx.jobInstance.updateMany({
+      where: {
+        id: active.id,
+        status: { in: ["SCHEDULED", "CLAIMED"] },
+        leaseRevision: active.leaseRevision,
+      },
+      data: {
+        status: "PAUSED",
+        claimedAt: null,
+        claimedByDeviceId: null,
+        leaseUntil: null,
+        leaseTokenHash: null,
+        leaseRevision: { increment: 1 },
+        workId: null,
+        completedAt: null,
+        lastError: null,
+        lastProgressAt: active.lastProgressAt || authorityNow,
+      },
+    });
+    if (!result.count) return { changed: false };
+    if (active.status === "CLAIMED" && active.claimedByDeviceId && typeof tx.fanObservationReadLease?.deleteMany === "function") {
+      await tx.fanObservationReadLease.deleteMany({
+        where: {
+          creatorId,
+          jobId: active.id,
+          deviceId: active.claimedByDeviceId,
+          leaseRevision: active.leaseRevision,
+        },
+      });
+    }
+    return { changed: true };
+  };
+  const outcome = typeof db.$transaction === "function"
+    ? await db.$transaction(pause)
+    : await pause(db);
+  if (!outcome.changed) {
     const current = await db.jobInstance.findUnique({ where: { id: active.id } });
     return { job: current, action: current?.status === "PAUSED" ? "already_paused" : "changed" };
   }

@@ -30,9 +30,10 @@ const JOB_COMPLETION_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, time
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
 const DIALOG_DISCOVERY_DIALOG_ID = "__dialog_discovery__";
 const FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY = Object.freeze({
-  fan_data_point_refresh: "fan_data_point_refresh",
-  sfs_target_discovery: "sfs_target_discovery",
-  subscriber_directory_scan: "subscriber_directory_page",
+  fan_data_point_refresh: Object.freeze(["fan_data_point_refresh"]),
+  sfs_target_discovery: Object.freeze(["sfs_target_discovery"]),
+  subscriber_directory_scan: Object.freeze(["subscriber_directory_page"]),
+  fetch_campaigns: Object.freeze(["campaign_claimers_page", "campaign_fan_values"]),
 });
 const FAN_OBSERVATION_READ_LEASE_JOB_KEYS = new Set(Object.keys(FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY));
 
@@ -460,12 +461,12 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   return job;
 }
 function observationReadPurpose(job, requestedPurpose) {
-  const expected = FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY[String(job?.jobKey || "")] || null;
+  const allowed = FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY[String(job?.jobKey || "")] || null;
   const requested = clean(requestedPurpose, 120);
-  if (!expected || requested !== expected) {
+  if (!Array.isArray(allowed) || !requested || !allowed.includes(requested)) {
     throw new JobLeaseError("FAN_OBSERVATION_READ_LEASE_PURPOSE_FORBIDDEN", "Job is not allowed to acquire this observation read lease", 403);
   }
-  return expected;
+  return requested;
 }
 
 function readLeaseError(error) {

@@ -310,6 +310,6 @@ test("INT5.1C FanData server generations use durable DB-owned clocks rather than
   assert.match(sfs, /observedAt = dateOrNull\(consumed\?\.observedAt\)/);
   assert.match(sfs, /observedAt = dateOrNull\(job\.createdAt\)/);
   assert.match(sfs, /SFS_DISCOVERY_CAUSAL_GENERATION_REQUIRED/);
-  assert.match(observationTokens, /FanObservationClock/);
+  assert.match(observationTokens, /FanObservationCreatorClock/);
   assert.match(observationTokens, /INTERVAL '1 millisecond'/);
 });

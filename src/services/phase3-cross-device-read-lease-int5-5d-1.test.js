@@ -37,7 +37,7 @@ function memoryDb() {
           ? [{ ...readLease }]
           : [];
       }
-      if (/UPDATE "FanObservationClock"/.test(sql)) {
+      if (/INSERT INTO "FanObservationCreatorClock"/.test(sql)) {
         clock = new Date(clock.getTime() + 1);
         return [{ lastObservedAt: new Date(clock) }];
       }
@@ -114,6 +114,9 @@ test("INT5.5D-1 read lease is idempotent for one acquire request and fenced by d
   const replay = await acquireFanObservationReadLease(input);
   assert.equal(replay.acquired, true);
   assert.equal(replay.token, first.token, "lost acquire response can be retried without rotating ownership");
+
+  const nextLogicalRead = await acquireFanObservationReadLease({ ...input, requestId: "next-logical-read-0002" });
+  assert.equal(nextLogicalRead.acquired, false, "a different logical read must not replay a still-live lease even for the same owner and purpose");
 
   await assert.rejects(() => completeJobFanObservationReadLease({
     db, job: job("job-a"), deviceId: "device-b", leaseRevision: 9,
