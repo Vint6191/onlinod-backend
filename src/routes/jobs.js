@@ -19,6 +19,12 @@ const {
 
 const router = express.Router();
 
+const JOB_SERVER_CAPABILITIES = Object.freeze({
+  campaignCausalObservationV1: true,
+  campaignServerFanRefreshV1: true,
+  campaignResumablePaginationV1: true,
+});
+
 router.use((req, res, next) => {
   const suppliedDeviceId = req.body && typeof req.body === "object" ? req.body.deviceId : null;
   if (suppliedDeviceId === undefined || suppliedDeviceId === null) return next();
@@ -83,6 +89,8 @@ const claimSchema = z.object({
   dialogDiscoveryOnly: z.boolean().optional(),
   capabilities: z.object({
     campaignCausalObservationV1: z.boolean().optional().default(false),
+    campaignServerFanRefreshV1: z.boolean().optional().default(false),
+    campaignResumablePaginationV1: z.boolean().optional().default(false),
   }).passthrough().optional().default({}),
 });
 
@@ -163,7 +171,7 @@ router.post("/claim", async (req, res, next) => {
       dialogDiscoveryOnly: input.dialogDiscoveryOnly === true,
       capabilities: input.capabilities,
     });
-    return res.json({ ok: true, ...claimed });
+    return res.json({ ok: true, ...claimed, serverCapabilities: JOB_SERVER_CAPABILITIES });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }

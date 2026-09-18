@@ -308,6 +308,66 @@ test("progress checkpoint uses bounded transaction options and reuses update res
 });
 
 
+test("Campaign progress accepts server-proven deep frontier and advances durable continuation to the next Campaign", async () => {
+  const token = "lease-token";
+  const now = new Date();
+  const job = {
+    id: "campaign-deep-boundary", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_campaigns",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 7,
+    leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, progress: { current: 0 },
+    continuation: { driverPhase: "execute", jobContinuation: { collectorVersion: "campaigns-v9", campaignIndex: 0, truncated: false } },
+    workId: "campaign-work", params: {},
+  };
+  let updatePayload = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async () => ({ count: 1 }),
+      update: async ({ data }) => {
+        updatePayload = data;
+        return { ...job, continuation: data.continuation, progress: { current: 1 }, leaseUntil: new Date(now.getTime() + 120_000) };
+      },
+    },
+    $transaction: async (callback) => callback(db),
+  };
+  const { progressJob } = loadService({
+    db,
+    applyJobChunk: async () => ({
+      serverDeepBoundaryReached: true,
+      externalCampaignId: "campaign-a",
+    }),
+  });
+  const requested = {
+    driverPhase: "execute",
+    jobContinuation: {
+      collectorVersion: "campaigns-v9",
+      phase: "claimers",
+      campaigns: [{ id: "campaign-a", scanClaimers: true }, { id: "campaign-b", scanClaimers: true }],
+      campaignIndex: 0,
+      claimerOffset: 100,
+      claimerPage: 2,
+      claimerBatchCount: 2,
+      fanValuesDiscovered: 75,
+      truncated: true,
+    },
+  };
+  const result = await progressJob({
+    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 7,
+    leaseMs: 60_000, workId: "campaign-work", progress: { current: 1 }, continuation: requested,
+    chunkResult: { kind: "campaign_claimers_page", externalCampaignId: "campaign-a" },
+  });
+  assert.equal(updatePayload.continuation.driverPhase, "execute");
+  assert.equal(updatePayload.continuation.jobContinuation.campaignIndex, 1);
+  assert.equal(updatePayload.continuation.jobContinuation.claimerOffset, 0);
+  assert.equal(updatePayload.continuation.jobContinuation.claimerPage, 0);
+  assert.equal(updatePayload.continuation.jobContinuation.claimerBatchCount, 2);
+  assert.equal(updatePayload.continuation.jobContinuation.fanValuesDiscovered, 75);
+  assert.equal(updatePayload.continuation.jobContinuation.truncated, false, "server-proven boundary clears only truncation introduced by the current uncommitted page");
+  assert.deepEqual(result.continuation, updatePayload.continuation);
+});
+
 test("vault completion keeps publication fenced with a longer bounded transaction", async () => {
   const token = "lease-token";
   const now = new Date();
@@ -1298,7 +1358,7 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true } });
   assert.equal(result.reason, "claimed");
   assert.equal(updateData.claimedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.startedAt.toISOString(), authorityNow.toISOString());
@@ -1307,7 +1367,8 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     knownClaimerFrontierHashes: { "campaign-keep": "a".repeat(64) },
     observationTokenVersion: 1,
     observationReadLeaseVersion: 1,
-  }, "legacy queued campaign jobs must drop unbounded catch-up hints and upgrade to causal-read protocol at claim time");
+    campaignResumablePaginationVersion: 1,
+  }, "legacy queued campaign jobs must drop unbounded catch-up hints/page caps and upgrade to causal/resumable protocol at claim time");
 });
 
 test("cooperative job retry timing uses PostgreSQL authority instead of replica wall clock", async () => {
@@ -1356,7 +1417,7 @@ test("job claim creator capability freshness uses the same PostgreSQL authority 
     jobInstance: { findMany: async () => [], findFirst: async () => null },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true } });
   assert.equal(result.reason, "no-work");
   assert.equal(bindingWhere.lastSeenAt.gte.toISOString(), new Date(authorityNow.getTime() - 2 * 60_000).toISOString());
   assert.equal(bindingWhere.lastSeenAt.lte.toISOString(), new Date(authorityNow.getTime() + 5 * 60_000).toISOString());
@@ -1371,6 +1432,84 @@ test("job claim rejects future-poisoned device heartbeat before creator capabili
     jobInstance: { findMany: async () => [] },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true } });
   assert.equal(result.reason, "device-stale");
+});
+
+test("Campaign v10 server no-progress signal advances to the next Campaign and marks only this traversal truncated", async () => {
+  const token = "lease-token";
+  const now = new Date();
+  const job = {
+    id: "campaign-no-progress", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_campaigns",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 11,
+    leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, progress: { current: 0 },
+    continuation: { driverPhase: "execute", jobContinuation: { collectorVersion: "campaigns-v10", campaignIndex: 0, truncated: false } },
+    workId: "campaign-work", params: {},
+  };
+  let updatePayload = null;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async () => ({ count: 1 }),
+      update: async ({ data }) => {
+        updatePayload = data;
+        return { ...job, continuation: data.continuation, progress: { current: 1 }, leaseUntil: new Date(now.getTime() + 120_000) };
+      },
+    },
+    $transaction: async (callback) => callback(db),
+  };
+  const { progressJob } = loadService({
+    db,
+    applyJobChunk: async () => ({ serverNoProgressDetected: true, externalCampaignId: "campaign-a" }),
+  });
+  const requested = {
+    driverPhase: "execute",
+    jobContinuation: {
+      collectorVersion: "campaigns-v10",
+      phase: "claimers",
+      campaigns: [{ id: "campaign-a", scanClaimers: true }, { id: "campaign-b", scanClaimers: true }],
+      campaignIndex: 0,
+      claimerOffset: 500_050,
+      claimerPage: 10_001,
+      claimerBatchCount: 10_001,
+      fanValuesDiscovered: 123,
+      truncated: false,
+    },
+  };
+  const result = await progressJob({
+    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 11,
+    leaseMs: 60_000, workId: "campaign-work", progress: { current: 1 }, continuation: requested,
+    chunkResult: { kind: "campaign_claimers_page", externalCampaignId: "campaign-a" },
+  });
+  assert.equal(updatePayload.continuation.jobContinuation.campaignIndex, 1);
+  assert.equal(updatePayload.continuation.jobContinuation.claimerOffset, 0);
+  assert.equal(updatePayload.continuation.jobContinuation.claimerPage, 0);
+  assert.equal(updatePayload.continuation.jobContinuation.claimerBatchCount, 10_001);
+  assert.equal(updatePayload.continuation.jobContinuation.truncated, true);
+  assert.deepEqual(result.continuation, updatePayload.continuation);
+});
+
+test("Campaign claim rejects a worker missing resumable-pagination capability before leasing work", async () => {
+  const authorityNow = new Date("2040-01-02T03:04:05.000Z");
+  let candidateReads = 0;
+  const db = {
+    $queryRawUnsafe: async () => [{ authorityNow }],
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: authorityNow }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 1 }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+    deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
+    jobInstance: {
+      findMany: async () => [],
+      findFirst: async () => { candidateReads += 1; return null; },
+    },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({
+    userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"],
+    capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true },
+  });
+  assert.equal(result.reason, "no-capabilities");
+  assert.equal(candidateReads, 0, "an old v9 worker must not even enter Campaign candidate arbitration");
 });

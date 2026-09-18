@@ -581,6 +581,7 @@ model CreatorAccount {
   earningsDaily CreatorEarningsDaily[]
   campaigns CreatorCampaign[]
   campaignMemberships CreatorCampaignFan[]
+  campaignFanRefreshWork CreatorCampaignFanRefreshWork[]
   messagesDaily CreatorMessagesDaily[]
   dailyMetrics CreatorDailyMetrics[]
   localMessageCoverage CreatorLocalMessageCoverage[]
@@ -2031,6 +2032,31 @@ model CreatorFinancialCollectionState {
   @@index([creatorId, lastCatchupCompletedAt], map: "CreatorFinancialCollectionState_creator_catchup_idx")
 }
 
+
+model CreatorCampaignFanRefreshWork {
+  id               String   @id @default(cuid())
+  agencyId         String
+  creatorId        String
+  scanRunId        String   @db.VarChar(120)
+  scanStartedAt    DateTime
+  onlyFansUserId   String   @db.VarChar(180)
+  campaignJobId    String
+  refreshJobId     String?
+  freshnessCutoffAt DateTime
+  scheduledAt      DateTime @default(now())
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  creator     CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  campaignJob JobInstance     @relation("CampaignFanRefreshCampaignJob", fields: [campaignJobId], references: [id], onDelete: Cascade)
+  refreshJob  JobInstance?    @relation("CampaignFanRefreshPointJob", fields: [refreshJobId], references: [id], onDelete: SetNull)
+
+  @@unique([creatorId, scanRunId, onlyFansUserId], map: "CreatorCampaignFanRefreshWork_creator_run_fan_key")
+  @@index([creatorId, scanRunId], map: "CreatorCampaignFanRefreshWork_creator_run_idx")
+  @@index([refreshJobId], map: "CreatorCampaignFanRefreshWork_refreshJob_idx")
+  @@index([campaignJobId], map: "CreatorCampaignFanRefreshWork_campaignJob_idx")
+}
+
 model CreatorCampaignCollectionState {
   id                     String                  @id @default(cuid())
   agencyId               String
@@ -2042,9 +2068,15 @@ model CreatorCampaignCollectionState {
   baselineVerifiedAt     DateTime?
   baselineGeneration     String?
   lastCatchupCompletedAt DateTime?
-  lastCatchupGeneration  String?
-  lastCompleteScanRunId  String?
-  retryAfterAt           DateTime?
+  lastCatchupGeneration       String?
+  lastCompleteScanRunId       String?
+  campaignProofScanRunId      String?   @db.VarChar(120)
+  campaignProofCollectorVersion String? @db.VarChar(80)
+  campaignProofCampaignBatches Int      @default(0)
+  campaignProofClaimerBatches  Int      @default(0)
+  campaignProofRejectedBatches Int      @default(0)
+  campaignProofRejectedRows    Int      @default(0)
+  retryAfterAt                 DateTime?
   lastErrorCode          String?
   lastErrorMessage       String?
   sourceDeviceId         String?
@@ -2870,8 +2902,15 @@ model CreatorCampaign {
   endedAt            DateTime?
   claimersCount      Int?
   clicksCount        Int?
-  catchupFrontierHash String? @db.VarChar(64)
-  sourceScanRunId    String?
+  catchupFrontierHash            String?   @db.VarChar(64)
+  catchupFrontierFanIds          Json?
+  catchupFrontierRunId           String?   @db.VarChar(120)
+  catchupFrontierStartedAt       DateTime?
+  stagedCatchupFrontierHash      String?   @db.VarChar(64)
+  stagedCatchupFrontierFanIds    Json?
+  stagedCatchupFrontierRunId     String?   @db.VarChar(120)
+  stagedCatchupFrontierStartedAt DateTime?
+  sourceScanRunId                String?
   sourceScanStartedAt DateTime?
   collectedAt        DateTime @default(now())
   sourceDeviceId     String?
@@ -3142,6 +3181,8 @@ model JobInstance {
   creatorFinancialTransactions CreatorFinancialTransaction[]
   creatorFanValues CreatorFanValueCurrent[]
   creatorFanRelationships CreatorFanRelationshipCurrent[]
+  campaignFanRefreshCampaignWork CreatorCampaignFanRefreshWork[] @relation("CampaignFanRefreshCampaignJob")
+  campaignFanRefreshPointWork CreatorCampaignFanRefreshWork[] @relation("CampaignFanRefreshPointJob")
   creatorEarningsTotals CreatorEarningsTotal[]
 
   @@index([status, nextRunAt])

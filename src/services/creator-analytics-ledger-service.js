@@ -13,10 +13,12 @@ const { evaluateCollectionState, evaluateAggregateCollectionState, stateVocabula
 const { earningsFreshnessLimitMs, trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { consumeFanObservationToken, consumeFanObservationTokensBatch } = require("./fan-observation-token-service");
-const { campaignCausalV1State } = require("./campaign-causal-activation-service");
+const { campaignCausalV1State, enterCampaignWriterGeneration } = require("./campaign-causal-activation-service");
+const { enqueueUniqueCampaignFanRefreshes } = require("./campaign-fan-refresh-queue-service");
 
-const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v8";
-const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", "campaigns-v7", CAMPAIGN_COLLECTOR_VERSION]);
+const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v10";
+const CAMPAIGN_SERVER_REFRESH_COLLECTOR_VERSIONS = new Set(["campaigns-v9", CAMPAIGN_COLLECTOR_VERSION]);
+const CAMPAIGN_COMPAT_COLLECTOR_VERSIONS = new Set(["campaigns-v5", "campaigns-v6", "campaigns-v7", "campaigns-v8", "campaigns-v9", CAMPAIGN_COLLECTOR_VERSION]);
 const CAMPAIGN_SCHEMA_VERSION = 4;
 const EARNINGS_COLLECTOR_VERSION = "earnings-v4";
 const EARNINGS_SCHEMA_VERSION = 4;
@@ -107,9 +109,48 @@ function requireJob(job) {
 function checksum(value) {
   return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
+function campaignClaimerFrontierFanIds(value) {
+  return [...new Set(array(value).map((item) => text(item, 180)).filter(Boolean))].sort().slice(0, 50);
+}
 function campaignClaimerFrontierHash(fanIds) {
-  const normalized = [...new Set(array(fanIds).map((value) => text(value, 180)).filter(Boolean))].sort();
-  return checksum(normalized);
+  return checksum(campaignClaimerFrontierFanIds(fanIds));
+}
+
+function campaignCompletionProofFromState(state, scanRunId, collectorVersion) {
+  const row = object(state);
+  const matches =
+    text(row.campaignProofScanRunId, 120) === scanRunId &&
+    text(row.campaignProofCollectorVersion, 80) === collectorVersion;
+  return {
+    matches,
+    campaignBatches: matches ? integer(row.campaignProofCampaignBatches, 1_000_000) ?? 0 : 0,
+    claimerBatches: matches ? integer(row.campaignProofClaimerBatches) ?? 0 : 0,
+    rejectedBatches: matches ? integer(row.campaignProofRejectedBatches, 1_000_000) ?? 0 : 0,
+    rejectedRows: matches ? integer(row.campaignProofRejectedRows, 100_000_000) ?? 0 : 0,
+  };
+}
+
+async function recordCampaignCompletionProofBatch(tx, { job, scanRunId, collectorVersion, kind, rejectedRows = 0, state = null }) {
+  if (!['campaigns_page', 'campaign_claimers_page'].includes(kind)) return null;
+  const previous = campaignCompletionProofFromState(
+    state || await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } }),
+    scanRunId,
+    collectorVersion,
+  );
+  const rejected = integer(rejectedRows, 10_000);
+  if (rejected === null) throw new Error('Campaign completion proof rejectedRows is invalid');
+  const data = {
+    campaignProofScanRunId: scanRunId,
+    campaignProofCollectorVersion: collectorVersion,
+    campaignProofCampaignBatches: previous.campaignBatches + (kind === 'campaigns_page' ? 1 : 0),
+    campaignProofClaimerBatches: previous.claimerBatches + (kind === 'campaign_claimers_page' ? 1 : 0),
+    campaignProofRejectedBatches: previous.rejectedBatches + (rejected > 0 ? 1 : 0),
+    campaignProofRejectedRows: previous.rejectedRows + rejected,
+  };
+  return tx.creatorCampaignCollectionState.update({
+    where: { creatorId: job.creatorId },
+    data,
+  });
 }
 function proofMessage(proof) {
   return Object.entries(proof)
@@ -676,6 +717,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
   if (kind === "campaign_claimers_page" && !externalCampaignId) throw new Error("Campaign claimer page is missing externalCampaignId");
 
   return inTransaction(db, async (tx) => {
+    await enterCampaignWriterGeneration({ db: tx });
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
@@ -755,12 +797,25 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         rejected ? "PARTIAL" : "COMMITTED",
         rejected ? "CAMPAIGN_PAGE_REJECTED_ROWS" : null,
       );
+      await recordCampaignCompletionProofBatch(tx, {
+        job, scanRunId, collectorVersion: payload.collectorVersion, kind, rejectedRows: rejected, state: generation.state,
+      });
       return { replay: false, batchId: batch.id, inserted, updated, unchanged, rejected, superseded: false };
     }
 
     const saved = await tx.creatorCampaign.findUnique({
       where: { creatorId_externalCampaignId: { creatorId: job.creatorId, externalCampaignId } },
-      select: { id: true },
+      select: {
+        id: true,
+        catchupFrontierHash: true,
+        catchupFrontierFanIds: true,
+        catchupFrontierRunId: true,
+        catchupFrontierStartedAt: true,
+        stagedCatchupFrontierHash: true,
+        stagedCatchupFrontierFanIds: true,
+        stagedCatchupFrontierRunId: true,
+        stagedCatchupFrontierStartedAt: true,
+      },
     });
     if (!saved) throw new Error("Campaign claimer page references an unknown campaign");
     const uniqueClaimers = new Map();
@@ -848,19 +903,21 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     if (projectedFanIds.length && typeof tx.creatorFan?.findMany === "function") {
       projectedFans = await tx.creatorFan.findMany({
         where: { creatorId: job.creatorId, onlyFansUserId: { in: projectedFanIds } },
-        select: { id: true, onlyFansUserId: true },
+        select: { id: true, onlyFansUserId: true, valueCurrent: { select: { valueObservedAt: true } } },
         take: projectedFanIds.length,
       });
     } else if (projectedFanIds.length && typeof tx.creatorFan?.findUnique === "function") {
       projectedFans = (await Promise.all(projectedFanIds.map(async (onlyFansUserId) => {
         const fan = await tx.creatorFan.findUnique({
           where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId } },
-          select: { id: true, onlyFansUserId: true },
+          select: { id: true, onlyFansUserId: true, valueCurrent: { select: { valueObservedAt: true } } },
         });
         return fan ? { ...fan, onlyFansUserId: fan.onlyFansUserId || onlyFansUserId } : null;
       }))).filter(Boolean);
     }
     const fanByOnlyFansUserId = new Map(projectedFans.map((fan) => [String(fan.onlyFansUserId), fan]));
+    let historicalMembershipBoundaryReached = false;
+    let currentRunMembershipProgress = 0;
 
     for (const claimer of uniqueClaimers.values()) {
       // `attributedAt` is historical campaign membership provenance, not the time
@@ -871,11 +928,34 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       const where = { campaignId_fanRecordId: { campaignId: saved.id, fanRecordId: fan.id } };
       const existing = await tx.creatorCampaignFan.findUnique({
         where,
-        select: { id: true, sourceScanStartedAt: true, externalClaimerId: true, attributedAt: true },
+        select: { id: true, sourceScanRunId: true, sourceScanStartedAt: true, externalClaimerId: true, attributedAt: true },
       });
       if (isNewerGeneration(existing, scanStartedAt)) {
         unchanged += 1;
         continue;
+      }
+      const existingScanStartedAt = strictDate(existing?.sourceScanStartedAt);
+      const alreadyObservedInCurrentRun =
+        existing?.sourceScanRunId === scanRunId &&
+        existingScanStartedAt &&
+        existingScanStartedAt.getTime() === scanStartedAt.getTime();
+      const canonicalFrontierStartedAt = strictDate(saved.catchupFrontierStartedAt);
+      if (
+        CAMPAIGN_SERVER_REFRESH_COLLECTOR_VERSIONS.has(payload.collectorVersion) &&
+        String(payload.campaignMode || '').toLowerCase() === 'catchup' &&
+        Boolean(saved.catchupFrontierHash) &&
+        Boolean(saved.catchupFrontierRunId) &&
+        canonicalFrontierStartedAt &&
+        existingScanStartedAt &&
+        existingScanStartedAt.getTime() <= canonicalFrontierStartedAt.getTime()
+      ) {
+        // Exact prior membership is a bounded server-side deep frontier. The
+        // current page is fully ingested before this proof is acted on, so all
+        // newly prepended claimers on the page are retained. Unlike head-only
+        // anchors, this survives arbitrary page shifts, deleted head anchors,
+        // and missing claimedAt timestamps without moving fan-id history into
+        // JobInstance.params.
+        historicalMembershipBoundaryReached = true;
       }
       const existingAttributedAt = existing?.attributedAt ? strictDate(existing.attributedAt) : null;
       const attributedAt = existingAttributedAt && claimer.attributedAt
@@ -912,19 +992,97 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
           sourceJobId: job.id,
         },
       });
+      if (alreadyObservedInCurrentRun !== true) currentRunMembershipProgress += 1;
       if (existing) updated += 1;
       else inserted += 1;
     }
 
-    const claimerPageNumber = integer(payload.pageNumber, 10_000);
-    if (claimerPageNumber === 1 && rejected === 0) {
-      // Persist only a compact, server-derived fingerprint of the normalized
-      // provider head page. Catch-up planning never needs to walk membership
-      // history or ship fan-id frontiers through JobInstance.params. A missing
-      // fingerprint fails safe to scanning the Campaign.
+    let fanRefreshQueue = null;
+    if (CAMPAIGN_SERVER_REFRESH_COLLECTOR_VERSIONS.has(payload.collectorVersion) && uniqueClaimers.size) {
+      const refreshCandidates = [...uniqueClaimers.values()]
+        .filter((claimer) => claimer.embeddedValue?.available !== true)
+        .map((claimer) => ({
+          onlyFansUserId: claimer.onlyFansUserId,
+          valueObservedAt: fanByOnlyFansUserId.get(String(claimer.onlyFansUserId))?.valueCurrent?.valueObservedAt || null,
+        }));
+      fanRefreshQueue = await enqueueUniqueCampaignFanRefreshes({
+        db: tx, job, scanRunId, scanStartedAt, candidates: refreshCandidates, now: serverReceivedAt,
+      });
+    }
+
+    const claimerPageNumber = integer(payload.pageNumber);
+    const pageFrontierFanIds = campaignClaimerFrontierFanIds([...uniqueClaimers.keys()]);
+    const canonicalFrontierFanIds = campaignClaimerFrontierFanIds(saved.catchupFrontierFanIds);
+    const canonicalFrontierSet = new Set(canonicalFrontierFanIds);
+    const exactAnchorBoundaryReached =
+      canonicalFrontierSet.size > 0 &&
+      pageFrontierFanIds.some((fanId) => canonicalFrontierSet.has(fanId));
+    const serverDeepBoundaryReached =
+      CAMPAIGN_SERVER_REFRESH_COLLECTOR_VERSIONS.has(payload.collectorVersion) &&
+      String(payload.campaignMode || '').toLowerCase() === 'catchup' &&
+      rejected === 0 &&
+      (exactAnchorBoundaryReached || historicalMembershipBoundaryReached);
+    const serverNoProgressDetected =
+      payload.collectorVersion === CAMPAIGN_COLLECTOR_VERSION &&
+      payload.sourceHasMore === true &&
+      serverDeepBoundaryReached !== true &&
+      currentRunMembershipProgress === 0;
+    const knownBoundaryReached = payload.knownBoundaryReached === true || serverDeepBoundaryReached;
+    const campaignComplete = (payload.campaignComplete === true || serverDeepBoundaryReached) && rejected === 0;
+    const firstPageFrontierFanIds = claimerPageNumber === 1 && rejected === 0 ? pageFrontierFanIds : null;
+    const firstPageFrontierHash = firstPageFrontierFanIds
+      ? campaignClaimerFrontierHash(firstPageFrontierFanIds)
+      : null;
+    const stagedStartedAt = strictDate(saved.stagedCatchupFrontierStartedAt);
+    const stagedFrontierMatchesGeneration =
+      Boolean(saved.stagedCatchupFrontierHash) &&
+      saved.stagedCatchupFrontierRunId === scanRunId &&
+      Boolean(stagedStartedAt) &&
+      stagedStartedAt.getTime() === scanStartedAt.getTime();
+    const stagedFrontierFanIds = stagedFrontierMatchesGeneration
+      ? campaignClaimerFrontierFanIds(saved.stagedCatchupFrontierFanIds)
+      : [];
+    const frontierToPublish = firstPageFrontierHash || (
+      campaignComplete && stagedFrontierMatchesGeneration
+        ? text(saved.stagedCatchupFrontierHash, 64)
+        : null
+    );
+    const frontierFanIdsToPublish = firstPageFrontierFanIds || (
+      campaignComplete && stagedFrontierMatchesGeneration
+        ? stagedFrontierFanIds
+        : null
+    );
+
+    if (firstPageFrontierHash && !campaignComplete) {
+      // Stage the normalized head-page fingerprint, but do not publish it as
+      // the canonical catch-up frontier until this Campaign reaches a proven
+      // boundary. If the job crashes after page 1, a replacement generation
+      // continues to see the previous canonical frontier and therefore scans
+      // again instead of skipping the unobserved tail.
       await tx.creatorCampaign.update({
         where: { id: saved.id },
-        data: { catchupFrontierHash: campaignClaimerFrontierHash([...uniqueClaimers.keys()]) },
+        data: {
+          stagedCatchupFrontierHash: firstPageFrontierHash,
+          stagedCatchupFrontierFanIds: firstPageFrontierFanIds,
+          stagedCatchupFrontierRunId: scanRunId,
+          stagedCatchupFrontierStartedAt: scanStartedAt,
+        },
+      });
+    } else if (campaignComplete && frontierToPublish) {
+      // Publish only after the provider boundary is proven in the same scan
+      // generation. Clearing the staged fields makes recovery idempotent.
+      await tx.creatorCampaign.update({
+        where: { id: saved.id },
+        data: {
+          catchupFrontierHash: frontierToPublish,
+          catchupFrontierFanIds: frontierFanIdsToPublish || [],
+          catchupFrontierRunId: scanRunId,
+          catchupFrontierStartedAt: scanStartedAt,
+          stagedCatchupFrontierHash: null,
+          stagedCatchupFrontierFanIds: null,
+          stagedCatchupFrontierRunId: null,
+          stagedCatchupFrontierStartedAt: null,
+        },
       });
     }
 
@@ -933,7 +1091,6 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     // campaign -> fan fact from a scanner page. New scans only add or refresh
     // evidence. CreatorCampaign.isActive is reconciled separately after a fully
     // proven campaign-list scan.
-    const campaignComplete = payload.campaignComplete === true && rejected === 0;
     await finishBatch(
       tx,
       batch.id,
@@ -941,7 +1098,13 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       rejected ? "PARTIAL" : "COMMITTED",
       rejected ? "CAMPAIGN_CLAIMER_PAGE_REJECTED_ROWS" : null,
     );
-    return { replay: false, batchId: batch.id, inserted, updated, unchanged, rejected, campaignComplete, superseded: false };
+    await recordCampaignCompletionProofBatch(tx, {
+      job, scanRunId, collectorVersion: payload.collectorVersion, kind, rejectedRows: rejected, state: generation.state,
+    });
+    return {
+      replay: false, batchId: batch.id, inserted, updated, unchanged, rejected, campaignComplete,
+      knownBoundaryReached, serverDeepBoundaryReached, serverNoProgressDetected, externalCampaignId, fanRefreshQueue, superseded: false,
+    };
   });
 }
 
@@ -1092,6 +1255,7 @@ async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }
   const idempotencyKey = `campaigns:${job.id}:${batchKey}`;
   if (idempotencyKey.length > 240) throw new Error("Campaign fan value idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
+    await enterCampaignWriterGeneration({ db: tx });
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
@@ -1145,6 +1309,7 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
   const idempotencyKey = `campaigns:${job.id}:${batchKey}`;
   if (idempotencyKey.length > 240) throw new Error("Campaign fan values idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
+    await enterCampaignWriterGeneration({ db: tx });
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation, received: values.length, available: 0, unavailable: 0, applied: [] };
@@ -1259,14 +1424,15 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
     throw new Error("Invalid campaign completion contract");
   }
   const expectedCampaignBatches = integer(payload.campaignBatchCount, 50);
-  const expectedClaimerBatches = integer(payload.claimerBatchCount, 1_000_000);
+  const expectedClaimerBatches = integer(payload.claimerBatchCount);
   const expectedCampaignCount = integer(payload.campaignCount, 2_000);
   if (expectedCampaignBatches === null || expectedClaimerBatches === null || expectedCampaignCount === null) {
     throw new Error("Campaign completion counters are invalid");
   }
-  const key = `campaigns:${job.id}:run:${scanRunId}:completion:v8`;
+  const key = `campaigns:${job.id}:run:${scanRunId}:completion:${payload.collectorVersion}`;
   if (key.length > 240) throw new Error("Campaign completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
+    await enterCampaignWriterGeneration({ db: tx });
     await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
     const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { complete: true, replay: false, superseded: true, proof: { newerGeneration: generation.state?.activeGeneration || null } };
@@ -1283,31 +1449,25 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
       payload,
     });
 
-    const batchPrefix = `campaigns:${job.id}:run:${scanRunId}:`;
-    const pageBatches = await tx.analyticsIngestBatch.findMany({
-      where: {
-        sourceJobId: job.id,
-        dataType: "CAMPAIGNS",
-        collectorVersion: payload.collectorVersion,
-        idempotencyKey: { startsWith: batchPrefix },
-        NOT: { id: batch.id },
-      },
-      select: { idempotencyKey: true, status: true, rejectedRows: true },
-    });
-    const campaignBatches = pageBatches.filter((item) => item.idempotencyKey.includes(":campaigns:"));
-    const claimerBatches = pageBatches.filter((item) => item.idempotencyKey.includes(":claimers:"));
-    const allCommitted = pageBatches.every((item) => item.status === "COMMITTED" && item.rejectedRows === 0);
+    // Completion proof is incrementally maintained in CreatorCampaignCollectionState
+    // when each campaign/claimer page batch becomes terminal. Do not fetch the
+    // entire AnalyticsIngestBatch history for a long-running Campaign collection.
+    const incrementalProof = campaignCompletionProofFromState(generation.state, scanRunId, payload.collectorVersion);
+    const allCommitted = incrementalProof.rejectedBatches === 0;
     const observedCampaignCount = await tx.creatorCampaign.count({
       where: { creatorId: job.creatorId, sourceScanRunId: scanRunId, sourceScanStartedAt: scanStartedAt },
     });
     const proof = {
       expectedCampaignBatches,
-      observedCampaignBatches: campaignBatches.length,
+      observedCampaignBatches: incrementalProof.campaignBatches,
       expectedClaimerBatches,
-      observedClaimerBatches: claimerBatches.length,
+      observedClaimerBatches: incrementalProof.claimerBatches,
       expectedCampaignCount,
       observedCampaignCount,
       allCommitted,
+      rejectedBatches: incrementalProof.rejectedBatches,
+      rejectedRows: incrementalProof.rejectedRows,
+      proofRunMatches: incrementalProof.matches,
       fanValuesComplete: payload.fanValuesComplete === true,
       fanValuesRequested: integer(payload.fanValuesRequested, 100_000_000),
       fanValuesFetched: integer(payload.fanValuesFetched, 100_000_000),
@@ -1319,8 +1479,8 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
       payload.fanValuesComplete === true &&
       payload.truncated !== true &&
       allCommitted &&
-      campaignBatches.length === expectedCampaignBatches &&
-      claimerBatches.length === expectedClaimerBatches &&
+      incrementalProof.campaignBatches === expectedCampaignBatches &&
+      incrementalProof.claimerBatches === expectedClaimerBatches &&
       observedCampaignCount === expectedCampaignCount;
     const desiredBatchStatus = complete ? "COMMITTED" : "PARTIAL";
     if (!replay || batch.status !== desiredBatchStatus) {

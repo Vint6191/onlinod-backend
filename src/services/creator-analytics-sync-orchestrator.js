@@ -247,10 +247,10 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
       pageSize: 50,
       maxPages: 40,
       claimerPageSize: 50,
-      maxClaimerPages: 10_000,
       fanValueBatchSize: 20,
       observationTokenVersion: 1,
       observationReadLeaseVersion: 1,
+      campaignResumablePaginationVersion: 1,
     };
     const scheduled = await scheduleIfIdle({
       db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: 60_000,
@@ -413,10 +413,10 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
       pageSize: 50,
       maxPages: 40,
       claimerPageSize: 50,
-      maxClaimerPages: 10_000,
       fanValueBatchSize: 20,
       observationTokenVersion: 1,
       observationReadLeaseVersion: 1,
+      campaignResumablePaginationVersion: 1,
       knownClaimerFrontierHashes: catchup.knownClaimerFrontierHashes,
     };
     const scheduled = await scheduleIfIdle({

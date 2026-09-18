@@ -6,7 +6,7 @@ const path = require("node:path");
 const Module = require("node:module");
 const originalLoad = Module._load;
 Module._load = function(request, parent, isMain) {
-  if (request === "../prisma" && (parent?.filename?.endsWith("creator-analytics-ledger-service.js") || parent?.filename?.endsWith("analytics-collector-control-service.js"))) return {};
+  if (request === "../prisma" && (parent?.filename?.endsWith("creator-analytics-ledger-service.js") || parent?.filename?.endsWith("analytics-collector-control-service.js") || parent?.filename?.endsWith("campaign-causal-activation-service.js"))) return {};
   return originalLoad.call(this, request, parent, isMain);
 };
 const { normalizeEarningsRow, normalizeCampaign, normalizeMessageDay } = require("./creator-analytics-ledger-service");
@@ -67,7 +67,7 @@ test("campaign transport is page-oriented and notification engagement is accepte
   assert.doesNotMatch(resultService, /creatorEarningsSnapshot|canWriteLegacySnapshot|legacyUniqueFansKnown/);
   const ledger = fs.readFileSync(path.join(root, "src/services/creator-analytics-ledger-service.js"), "utf8");
   assert.match(ledger, /Analytics idempotency conflict/);
-  assert.match(ledger, /CAMPAIGN_COLLECTOR_VERSION = "campaigns-v8"/);
+  assert.match(ledger, /CAMPAIGN_COLLECTOR_VERSION = "campaigns-v10"/);
   assert.match(ledger, /campaigns-v6/);
   assert.match(ledger, /campaigns-v7/);
   assert.match(ledger, /CAMPAIGN_COMPAT_COLLECTOR_VERSIONS/);

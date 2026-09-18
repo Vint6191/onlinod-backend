@@ -72,10 +72,45 @@ function campaignClaimParams(value) {
   // Desktop. Missing compact hints only causes a safe provider rescan.
   delete params.knownCampaignFanCounts;
   delete params.knownClaimersByCampaign;
+  // Retire the old terminal 10k claimer-page cap from already-queued jobs.
+  // campaigns-v10 keeps page/offset in O(1) durable continuation and relies on
+  // exact server-side no-progress detection instead of a completeness cap.
+  delete params.maxClaimerPages;
   const hashes = boundedCampaignFrontierHashes(params.knownClaimerFrontierHashes);
   if (Object.keys(hashes).length) params.knownClaimerFrontierHashes = hashes;
   else delete params.knownClaimerFrontierHashes;
   return params;
+}
+function campaignServerBoundaryContinuation(value, externalCampaignId, previousValue = null, { forceTruncated = false } = {}) {
+  const driver = object(value);
+  if (driver.driverPhase !== "execute") return null;
+  const current = object(driver.jobContinuation);
+  if (!["campaigns-v9", "campaigns-v10"].includes(String(current.collectorVersion || ""))) return null;
+  const campaignId = clean(externalCampaignId, 220);
+  if (!campaignId || !Array.isArray(current.campaigns)) return null;
+  const currentIndex = Math.max(0, Math.floor(Number(current.campaignIndex) || 0));
+  let matchedIndex = -1;
+  for (let index = currentIndex; index < current.campaigns.length && index < 2_000; index += 1) {
+    const row = object(current.campaigns[index]);
+    if (clean(row.id, 220) === campaignId) {
+      matchedIndex = index;
+      break;
+    }
+  }
+  if (matchedIndex < 0) return null;
+  const previousDriver = object(previousValue);
+  const previous = previousDriver.driverPhase === "execute" ? object(previousDriver.jobContinuation) : {};
+  return {
+    ...current,
+    phase: "claimers",
+    campaignIndex: matchedIndex + 1,
+    claimerOffset: 0,
+    claimerPage: 0,
+    // A proven deep boundary preserves prior truncation. Exact server no-progress
+    // detection instead marks this Campaign partial so a buggy provider cannot
+    // loop forever after the old page-count cap is removed.
+    truncated: forceTruncated === true || previous.truncated === true,
+  };
 }
 function waitKind(reason) {
   const text = String(reason || "").toLowerCase();
@@ -388,7 +423,11 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   // advertise it must never receive fetch_campaigns from a bridge-capable Backend.
   // Unknown claim fields are stripped by old Backends, so new Desktop -> old Backend
   // remains rolling-compatible until the durable activation barrier is executed.
-  if (capabilities?.campaignCausalObservationV1 !== true) {
+  if (
+    capabilities?.campaignCausalObservationV1 !== true ||
+    capabilities?.campaignServerFanRefreshV1 !== true ||
+    capabilities?.campaignResumablePaginationV1 !== true
+  ) {
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
@@ -442,6 +481,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
             ...(String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : object(candidate.params)),
             observationTokenVersion: 1,
             observationReadLeaseVersion: 1,
+            ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignResumablePaginationVersion: 1 } : {}),
           },
         } : {}),
       },
@@ -693,6 +733,11 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     if (!updatedFence.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before progress");
 
     const sideEffect = await applyJobChunk({ db: tx, job, deviceId, userId, chunkResult });
+    const campaignBoundaryOverride = sideEffect?.serverDeepBoundaryReached === true
+      ? campaignServerBoundaryContinuation(requestedContinuation, sideEffect.externalCampaignId, job.continuation)
+      : sideEffect?.serverNoProgressDetected === true
+        ? campaignServerBoundaryContinuation(requestedContinuation, sideEffect.externalCampaignId, job.continuation, { forceTruncated: true })
+        : null;
     let updated = null;
     if (sideEffect?.completeAfterCommit === true) {
       updated = await tx.jobInstance.update({
@@ -705,13 +750,13 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           },
         },
       });
-    } else if (sideEffect?.jobContinuationOverride) {
+    } else if (campaignBoundaryOverride || sideEffect?.jobContinuationOverride) {
       updated = await tx.jobInstance.update({
         where: { id: job.id },
         data: {
           continuation: {
             driverPhase: "execute",
-            jobContinuation: sideEffect.jobContinuationOverride,
+            jobContinuation: campaignBoundaryOverride || sideEffect.jobContinuationOverride,
           },
         },
       });

@@ -144,6 +144,7 @@ test("INT5.7A-5 a full 50-claimer page uses one canonical FanData lock for ident
     creatorCampaignCollectionState: {
       findUnique: async () => null,
       upsert: async ({ create }) => ({ id: "state-1", ...create }),
+      update: async ({ data }) => ({ id: "state-1", ...data }),
     },
     creatorCampaign: {
       findUnique: async () => ({ id: "campaign-db-1" }),

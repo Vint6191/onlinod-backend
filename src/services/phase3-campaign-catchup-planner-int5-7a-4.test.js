@@ -33,8 +33,9 @@ test("INT5.7A-4 Campaign catch-up planner is bounded to 2,000 compact CreatorCam
 test("INT5.7A-4 stores a compact server-derived first-page frontier fingerprint, never fan-id history", () => {
   assert.match(schema, /catchupFrontierHash\s+String\?\s+@db\.VarChar\(64\)/);
   assert.match(migration, /ADD COLUMN IF NOT EXISTS "catchupFrontierHash" VARCHAR\(64\)/);
-  assert.match(ledger, /function campaignClaimerFrontierHash\(fanIds\)[\s\S]*new Set[\s\S]*\.sort\(\)[\s\S]*checksum\(normalized\)/);
-  assert.match(ledger, /claimerPageNumber === 1 && rejected === 0[\s\S]*catchupFrontierHash: campaignClaimerFrontierHash\(\[\.\.\.uniqueClaimers\.keys\(\)\]\)/);
+  assert.match(ledger, /function campaignClaimerFrontierFanIds\(value\)[\s\S]*new Set[\s\S]*\.sort\(\)[\s\S]*slice\(0, 50\)/);
+  assert.match(ledger, /function campaignClaimerFrontierHash\(fanIds\)[\s\S]*checksum\(campaignClaimerFrontierFanIds\(fanIds\)\)/);
+  assert.match(ledger, /firstPageFrontierFanIds = claimerPageNumber === 1 && rejected === 0[\s\S]*firstPageFrontierHash = firstPageFrontierFanIds[\s\S]*campaignClaimerFrontierHash\(firstPageFrontierFanIds\)/);
 });
 
 test("INT5.7A-4 claim fence strips legacy unbounded fan/count maps from already queued Campaign jobs", () => {
@@ -66,7 +67,6 @@ test("INT5.7A-4 worst legal compact planner payload stays comfortably below one 
     pageSize: 50,
     maxPages: 40,
     claimerPageSize: 50,
-    maxClaimerPages: 10_000,
     fanValueBatchSize: 20,
     observationTokenVersion: 1,
     observationReadLeaseVersion: 1,

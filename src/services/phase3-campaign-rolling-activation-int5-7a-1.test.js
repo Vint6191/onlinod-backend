@@ -57,7 +57,8 @@ test("INT5.7A-1 activation runtime set-based cutover revokes old owners and acti
     $queryRawUnsafe: async (sql) => {
       rawCall += 1;
       events.push(["sql", String(sql)]);
-      if (rawCall === 1) return [{ value: { active: false, epoch: 3 } }];
+      if (rawCall === 1) return []; // live Campaign JobInstance rows locked first
+      if (rawCall === 2) return [{ value: { active: false, epoch: 3, writerGenerationActive: false } }];
       return [{ revoked: 1, stamped: 2 }];
     },
     systemSetting: {
@@ -71,12 +72,16 @@ test("INT5.7A-1 activation runtime set-based cutover revokes old owners and acti
     },
   };
   const result = await activateCampaignCausalV1({ db, activatedBy: "test" });
-  assert.deepEqual(result, { active: true, alreadyActive: false, epoch: 4, revoked: 1, stamped: 2 });
-  const cutoverSql = events[1][1];
+  assert.deepEqual(result, { active: true, writerGenerationActive: true, writerGeneration: 1, alreadyActive: false, epoch: 4, revoked: 1, stamped: 2 });
+  assert.match(events[0][1], /JobInstance[\s\S]*FOR UPDATE/);
+  assert.match(events[1][1], /SystemSetting[\s\S]*FOR UPDATE/);
+  const cutoverSql = events[2][1];
   assert.match(cutoverSql, /DELETE FROM "FanObservationReadLease"[\s\S]*r\."leaseRevision" = c\."leaseRevision"/);
   assert.match(cutoverSql, /"leaseRevision" = j\."leaseRevision" \+ 1/);
   assert.match(cutoverSql, /"status" = 'SCHEDULED'/);
   assert.match(cutoverSql, /observationTokenVersion/);
   assert.equal(events.at(-1)[0], "activate");
   assert.equal(events.at(-1)[1].data.value.active, true);
+  assert.equal(events.at(-1)[1].data.value.writerGenerationActive, true);
+  assert.equal(events.at(-1)[1].data.value.writerGeneration, 1);
 });
