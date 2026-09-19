@@ -25,6 +25,7 @@ function clean(value, max = 180) {
   return out && out.length <= max ? out : null;
 }
 function asDate(value) {
+  if (value === null || value === undefined || value === "") return null;
   const date = value instanceof Date ? value : new Date(value);
   return Number.isFinite(date.getTime()) ? date : null;
 }
@@ -1296,11 +1297,189 @@ async function promoteQueuedCampaignFanRefreshDemands({ db, now = null, maxJobs 
   return { promotedJobs, promotedFans, reason: promotedJobs ? "promoted" : "capacity_saturated" };
 }
 
-async function recordCampaignFanRefreshChunk({ db, job, chunkResult } = {}) {
+function supportsSetBasedCampaignFanRefreshTerminal(db) {
+  return typeof db?.$queryRawUnsafe === "function"
+    && typeof db?.$executeRawUnsafe === "function"
+    && typeof db?.creatorFanRefreshDemand?.findMany === "function"
+    && typeof db?.creatorCampaignFanRefreshWork?.updateMany === "function"
+    && Boolean(db?.creatorCampaignCollectionState);
+}
+
+async function transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId, now, error } = {}) {
+  const jobId = clean(refreshJobId, 180);
+  if (!jobId) return { applied: 0, workTransitioned: 0, coverageRunsUpdated: 0, topology: "set_based_v1" };
+  const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
+  const errorText = clean(error, 1000) || "refresh job finished without a fresh terminal value";
+  const rows = await db.$queryRawUnsafe(`
+    WITH candidate AS (
+      SELECT d."id", d."creatorId", d."retryAttempts"
+      FROM "CreatorFanRefreshDemand" d
+      WHERE d."activeRefreshJobId" = $1
+        AND NOT (
+          COALESCE(d."activeRefreshRevision", 0) > 0
+          AND d."requestedRevision" > d."activeRefreshRevision"
+        )
+      ORDER BY d."id" ASC
+      FOR UPDATE OF d
+    ), work_before AS (
+      SELECT w."id", w."demandId", w."creatorId", w."scanRunId"
+      FROM "CreatorCampaignFanRefreshWork" w
+      JOIN candidate c ON c."id" = w."demandId"
+      WHERE w."status" = 'QUEUED'
+      ORDER BY w."id" ASC
+      FOR UPDATE OF w
+    ), planned_delta AS (
+      SELECT "creatorId", "scanRunId", COUNT(*)::int AS "failedCount"
+      FROM work_before
+      GROUP BY "creatorId", "scanRunId"
+    ), current_guard AS (
+      SELECT p."creatorId", p."scanRunId", p."failedCount",
+             s."fanValueOutstanding" >= p."failedCount" AS "outstandingSafe"
+      FROM planned_delta p
+      JOIN "CreatorCampaignCollectionState" s
+        ON s."creatorId" = p."creatorId"
+       AND s."fanValueCoverageScanRunId" = p."scanRunId"
+    ), unsafe AS (
+      SELECT COUNT(*)::int AS "count"
+      FROM current_guard
+      WHERE NOT "outstandingSafe"
+    ), demand_update AS (
+      UPDATE "CreatorFanRefreshDemand" d
+      SET "status" = 'FAILED',
+          "activeRefreshJobId" = NULL,
+          "activeRefreshRevision" = NULL,
+          "lastFailedAt" = $2,
+          "retryAttempts" = d."retryAttempts" + 1,
+          "nextRetryAt" = CASE
+            WHEN d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN NULL
+            ELSE $2 + make_interval(mins => LEAST(30, (1 << LEAST(4, GREATEST(0, d."retryAttempts")))))
+          END,
+          "quarantinedAt" = CASE
+            WHEN d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN $2
+            ELSE NULL
+          END,
+          "lastOutcome" = CASE
+            WHEN d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN 'QUARANTINED'
+            ELSE 'RETRY_BACKOFF'
+          END,
+          "lastError" = $3,
+          "updatedAt" = $2
+      FROM candidate c
+      WHERE d."id" = c."id"
+        AND (SELECT "count" FROM unsafe) = 0
+      RETURNING d."id", d."creatorId"
+    ), work_update AS (
+      UPDATE "CreatorCampaignFanRefreshWork" w
+      SET "status" = 'FAILED',
+          "outcome" = 'FAILED',
+          "observedAt" = NULL,
+          "completedAt" = $2,
+          "lastError" = $3,
+          "updatedAt" = $2
+      FROM work_before wb
+      JOIN demand_update du ON du."id" = wb."demandId"
+      WHERE w."id" = wb."id"
+        AND (SELECT "count" FROM unsafe) = 0
+      RETURNING w."id", wb."creatorId", wb."scanRunId"
+    ), actual_delta AS (
+      SELECT "creatorId", "scanRunId", COUNT(*)::int AS "failedCount"
+      FROM work_update
+      GROUP BY "creatorId", "scanRunId"
+    ), coverage_update AS (
+      UPDATE "CreatorCampaignCollectionState" s
+      SET "fanValueOutstanding" = s."fanValueOutstanding" - d."failedCount",
+          "fanValueFailed" = s."fanValueFailed" + d."failedCount",
+          "fanValueFreshnessStatus" = CASE
+            WHEN s."fanValueOutstanding" - d."failedCount" > 0 THEN 'QUEUED'::"AnalyticsCoverageStatus"
+            ELSE 'PARTIAL'::"AnalyticsCoverageStatus"
+          END,
+          "fanValueCoverageUpdatedAt" = $2,
+          "status" = CASE
+            WHEN s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus" THEN 'PARTIAL'::"AnalyticsCoverageStatus"
+            ELSE s."status"
+          END,
+          "retryAfterAt" = CASE
+            WHEN s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus" THEN NULL
+            ELSE s."retryAfterAt"
+          END,
+          "lastErrorCode" = CASE
+            WHEN s."membershipCoverageStatus" <> 'COMPLETE'::"AnalyticsCoverageStatus" THEN s."lastErrorCode"
+            WHEN s."fanValueOutstanding" - d."failedCount" > 0 THEN 'CAMPAIGN_FAN_VALUE_REFRESH_PENDING'
+            ELSE 'CAMPAIGN_FAN_VALUE_REFRESH_PARTIAL'
+          END,
+          "lastErrorMessage" = CASE
+            WHEN s."membershipCoverageStatus" <> 'COMPLETE'::"AnalyticsCoverageStatus" THEN s."lastErrorMessage"
+            WHEN s."fanValueOutstanding" - d."failedCount" > 0
+              THEN 'Campaign membership is complete; ' || (s."fanValueOutstanding" - d."failedCount")::text || ' FanData refreshes are still outstanding'
+            ELSE 'Campaign membership is complete; ' || (s."fanValueFailed" + d."failedCount")::text || ' FanData refreshes failed'
+          END,
+          "updatedAt" = $2
+      FROM actual_delta d
+      WHERE s."creatorId" = d."creatorId"
+        AND s."fanValueCoverageScanRunId" = d."scanRunId"
+        AND s."fanValueOutstanding" >= d."failedCount"
+        AND (SELECT "count" FROM unsafe) = 0
+      RETURNING s."creatorId", d."scanRunId"
+    )
+    SELECT
+      (SELECT "count" FROM unsafe) AS "coverageTransitionLost",
+      (SELECT COUNT(*)::int FROM demand_update) AS "applied",
+      (SELECT COUNT(*)::int FROM work_update) AS "workTransitioned",
+      (SELECT COUNT(*)::int FROM coverage_update) AS "coverageRunsUpdated"
+  `, jobId, effectiveNow, errorText);
+  const result = Array.isArray(rows) && rows[0] ? rows[0] : {};
+  if (Math.max(0, Number(result.coverageTransitionLost || 0)) > 0) {
+    throw new Error("CAMPAIGN_FAN_REFRESH_TERMINAL_COVERAGE_TRANSITION_LOST");
+  }
+  return {
+    applied: Math.max(0, Number(result.applied || 0)),
+    workTransitioned: Math.max(0, Number(result.workTransitioned || 0)),
+    coverageRunsUpdated: Math.max(0, Number(result.coverageRunsUpdated || 0)),
+    topology: "set_based_v1",
+  };
+}
+
+async function recordCampaignFanRefreshChunk({ db, job, chunkResult, applied: projectionReceipt = null } = {}) {
   if (!db?.creatorFanRefreshDemand?.findMany || String(job?.jobKey || "") !== "fan_data_point_refresh") return null;
   const items = Array.isArray(chunkResult?.items) ? chunkResult.items : [];
-  const ids = [...new Set(items.map((item) => clean(item?.onlyFansUserId, 180)).filter(Boolean))];
+  const ids = [...new Set(items.map((item) => clean(item?.onlyFansUserId, 180)).filter(Boolean))].sort();
   if (!ids.length) return { applied: 0 };
+
+  // Production point-refresh chunks have already committed their canonical FanData
+  // projection before this hook runs. That projection invokes the same canonical
+  // Campaign-demand reconciler for every value observation. Keep this hook only
+  // as an idempotent set-based catch-up for item ids whose canonical value may
+  // already be fresh; never re-enter the legacy per-demand writer after a trusted
+  // canonical projection. This removes the hidden O(N) half of partial 25/50
+  // success while preserving direct/in-memory adapter compatibility below.
+  const canonicalProjectionCommitted = projectionReceipt?.type === "fan_data_point_refresh" && projectionReceipt?.ok === true;
+  const productionSetBasedAdapter = typeof db?.$queryRawUnsafe === "function"
+    && Boolean(db?.creatorFanRefreshDemand?.findMany)
+    && Boolean(db?.creatorCampaignFanRefreshWork)
+    && Boolean(db?.creatorCampaignCollectionState);
+  if (canonicalProjectionCommitted && productionSetBasedAdapter) {
+    const canonicalValueIds = new Set(items
+      .filter((item) => item?.value && typeof item.value === "object")
+      .map((item) => clean(item?.onlyFansUserId, 180))
+      .filter(Boolean));
+    const catchUpIds = ids.filter((fanId) => !canonicalValueIds.has(fanId));
+    if (!catchUpIds.length) {
+      return {
+        applied: 0,
+        topology: "canonical_projection_v1",
+        reconciliation: { healed: 0, reason: "canonical_projection_already_reconciled" },
+      };
+    }
+    const reconciliation = await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
+      db, creatorId: job.creatorId, fanIds: catchUpIds,
+    });
+    return {
+      applied: Math.max(0, Number(reconciliation?.healed || 0)),
+      topology: "canonical_set_based_catchup_v1",
+      reconciliation,
+    };
+  }
+
   const fans = await db.creatorFan.findMany({
     where: { creatorId: job.creatorId, onlyFansUserId: { in: ids } },
     include: { valueCurrent: true },
@@ -1362,25 +1541,40 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
   if (superseded.length) {
     followUpJobId = await scheduleDemandRefreshJob({ db, job, demands: superseded, scheduledAt: now, planner });
   }
-  for (const demand of failed) {
-    const { retryAttempts, quarantined, nextRetryAt, quarantinedAt, lastOutcome } = campaignFanRefreshFailurePlan(demand, now);
-    await db.creatorFanRefreshDemand.update({
-      where: { id: demand.id },
-      data: {
-        status: DEMAND_STATUS.FAILED,
-        activeRefreshJobId: null,
-        activeRefreshRevision: null,
-        lastFailedAt: now,
-        retryAttempts,
-        nextRetryAt,
-        quarantinedAt,
-        lastOutcome,
-        lastError: `fan_data_point_refresh completed without satisfying requested freshness${result?.errors ? `; errors=${Number(result.errors)}` : ""}`,
-      },
-    });
-    await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: "refresh job finished without a fresh terminal value", now });
+  const errorText = `fan_data_point_refresh completed without satisfying requested freshness${result?.errors ? `; errors=${Number(result.errors)}` : ""}`;
+  let terminal = { applied: 0, topology: "none" };
+  if (failed.length && supportsSetBasedCampaignFanRefreshTerminal(db)) {
+    terminal = await transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId: job.id, now, error: errorText });
+  } else {
+    for (const demand of failed) {
+      const { retryAttempts, quarantined, nextRetryAt, quarantinedAt, lastOutcome } = campaignFanRefreshFailurePlan(demand, now);
+      await db.creatorFanRefreshDemand.update({
+        where: { id: demand.id },
+        data: {
+          status: DEMAND_STATUS.FAILED,
+          activeRefreshJobId: null,
+          activeRefreshRevision: null,
+          lastFailedAt: now,
+          retryAttempts,
+          nextRetryAt,
+          quarantinedAt,
+          lastOutcome,
+          lastError: errorText,
+        },
+      });
+      await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: "refresh job finished without a fresh terminal value", now });
+    }
+    terminal = { applied: failed.length, topology: "adapter_fallback" };
   }
-  return { applied: failed.length, rescheduled: followUpJobId ? superseded.length : 0, deferred: followUpJobId ? 0 : superseded.length, followUpJobId };
+  return {
+    applied: terminal.applied,
+    rescheduled: followUpJobId ? superseded.length : 0,
+    deferred: followUpJobId ? 0 : superseded.length,
+    followUpJobId,
+    topology: terminal.topology,
+    workTransitioned: terminal.workTransitioned || 0,
+    coverageRunsUpdated: terminal.coverageRunsUpdated || 0,
+  };
 }
 
 async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = true, planner = null } = {}) {
@@ -1399,17 +1593,32 @@ async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = t
   }
   let followUpJobId = null;
   if (superseded.length) followUpJobId = await scheduleDemandRefreshJob({ db, job, demands: superseded, scheduledAt: now, planner });
-  for (const demand of failed) {
-    const { retryAttempts, quarantined, nextRetryAt, quarantinedAt, lastOutcome } = campaignFanRefreshFailurePlan(demand, now);
-    await db.creatorFanRefreshDemand.update({ where: { id: demand.id }, data: {
-      status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, activeRefreshRevision: null,
-      lastFailedAt: now, retryAttempts, nextRetryAt, quarantinedAt,
-      lastOutcome,
-      lastError: clean(error?.message || error, 1000),
-    } });
-    await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: error?.message || error, now });
+  const errorText = clean(error?.message || error, 1000) || "fan_data_point_refresh failed";
+  let failedTransition = { applied: 0, topology: "none" };
+  if (failed.length && supportsSetBasedCampaignFanRefreshTerminal(db)) {
+    failedTransition = await transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId: job.id, now, error: errorText });
+  } else {
+    for (const demand of failed) {
+      const { retryAttempts, quarantined, nextRetryAt, quarantinedAt, lastOutcome } = campaignFanRefreshFailurePlan(demand, now);
+      await db.creatorFanRefreshDemand.update({ where: { id: demand.id }, data: {
+        status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, activeRefreshRevision: null,
+        lastFailedAt: now, retryAttempts, nextRetryAt, quarantinedAt,
+        lastOutcome,
+        lastError: errorText,
+      } });
+      await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: errorText, now });
+    }
+    failedTransition = { applied: failed.length, topology: "adapter_fallback" };
   }
-  return { applied: failed.length, rescheduled: followUpJobId ? superseded.length : 0, deferred: followUpJobId ? 0 : superseded.length, followUpJobId };
+  return {
+    applied: failedTransition.applied,
+    rescheduled: followUpJobId ? superseded.length : 0,
+    deferred: followUpJobId ? 0 : superseded.length,
+    followUpJobId,
+    topology: failedTransition.topology,
+    workTransitioned: failedTransition.workTransitioned || 0,
+    coverageRunsUpdated: failedTransition.coverageRunsUpdated || 0,
+  };
 }
 
 module.exports = {
@@ -1430,5 +1639,5 @@ module.exports = {
   finalizeCampaignFanRefreshJob,
   recordCampaignFanRefreshJobFailure,
   reconcileCampaignFanValueCoverage,
-  _test: { scheduleDemandRefreshJob, campaignFanRefreshRetryDelayMs, campaignFanRefreshFailurePlan, shouldResetCampaignRefreshJob },
+  _test: { scheduleDemandRefreshJob, transitionCampaignFanRefreshTerminalSetBased, supportsSetBasedCampaignFanRefreshTerminal, campaignFanRefreshRetryDelayMs, campaignFanRefreshFailurePlan, shouldResetCampaignRefreshJob },
 };

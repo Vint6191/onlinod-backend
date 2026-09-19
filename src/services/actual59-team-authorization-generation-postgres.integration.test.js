@@ -279,7 +279,7 @@ test("Actual59 INT59.4B PostgreSQL: one advisory device identity serializes conc
     await first.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "integration" } });
 
     const tx1 = first.$transaction(async (tx) => {
-      await tx.$queryRawUnsafe(`SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))`, key);
+      await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))`, key);
       await tx.refreshSession.create({
         data: { userId, agencyId, tokenHash: token("hash_a"), deviceId, authorizationSessionId: "lineage-A", expiresAt: new Date(Date.now()+60_000) },
       });
@@ -294,7 +294,7 @@ test("Actual59 INT59.4B PostgreSQL: one advisory device identity serializes conc
     await firstLocked.promise;
     let secondAcquired = false;
     const tx2 = second.$transaction(async (tx) => {
-      await tx.$queryRawUnsafe(`SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))`, key);
+      await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtextextended($1::text,0))`, key);
       secondAcquired = true;
       const created = await tx.refreshSession.create({
         data: { userId, agencyId, tokenHash: token("hash_b"), deviceId, authorizationSessionId: "lineage-B", expiresAt: new Date(Date.now()+60_000) },

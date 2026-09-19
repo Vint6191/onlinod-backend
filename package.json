@@ -11,7 +11,7 @@
     "dev": "node src/server.js",
     "start": "node src/server.js",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "node scripts/database/phase3-fandata-delivery-provenance-online-preflight.js && prisma migrate deploy && node scripts/database/actual60-refreshsession-online-index-preflight.js",
+    "prisma:migrate": "node scripts/database/phase3-fandata-delivery-provenance-online-preflight.js && node scripts/database/phase3-campaign-coverage-generation-online-preflight.js && prisma migrate deploy && node scripts/database/actual60-refreshsession-online-index-preflight.js",
     "prisma:dev": "prisma migrate dev",
     "prisma:push": "prisma db push",
     "postinstall": "prisma generate",

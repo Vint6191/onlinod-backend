@@ -59,8 +59,13 @@ test("INT5.5C-1 snapshot/cohort stores are not promoted back into canonical curr
   assert.match(subscriber, /Legacy flat aliases are response-time derivations of canonical current/);
 });
 
-test("INT5.5C-1 production migration command keeps online provenance preflight ahead of Prisma deploy", () => {
+test("INT5.5C-1 production migration command keeps online preflights ahead of Prisma deploy", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(SRC, "..", "package.json"), "utf8"));
   const migrate = String(pkg.scripts?.["prisma:migrate"] || "");
-  assert.match(migrate, /phase3-fandata-delivery-provenance-online-preflight\.js\s+&&\s+prisma migrate deploy/);
+  const provenance = migrate.indexOf("phase3-fandata-delivery-provenance-online-preflight.js");
+  const campaignCoverage = migrate.indexOf("phase3-campaign-coverage-generation-online-preflight.js");
+  const deploy = migrate.indexOf("prisma migrate deploy");
+  assert.ok(provenance >= 0, "provenance online preflight must remain present");
+  assert.ok(campaignCoverage > provenance, "campaign coverage preflight must run after provenance preflight");
+  assert.ok(deploy > campaignCoverage, "all online preflights must complete before Prisma deploy");
 });
