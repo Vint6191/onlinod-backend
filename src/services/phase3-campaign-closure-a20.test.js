@@ -13,6 +13,13 @@ for (const count of [1, 20, 500]) {
   test(`A20 canonical observation healing keeps constant production SQL topology for ${count} matching demands`, async () => {
     let rawCalls = 0;
     const db = {
+      // Production-shaped capability surface: the set-based path requires the
+      // Prisma delegates it coordinates in addition to raw SQL. This keeps a
+      // specialized clock-only $queryRawUnsafe test harness from masquerading
+      // as the production adapter.
+      creatorFanRefreshDemand: { findMany: async () => [] },
+      creatorCampaignFanRefreshWork: {},
+      creatorCampaignCollectionState: {},
       $queryRawUnsafe: async (sql, creatorId, fanIds) => {
         rawCalls += 1;
         assert.match(sql, /WITH candidate AS/);

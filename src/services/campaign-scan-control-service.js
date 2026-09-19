@@ -272,11 +272,11 @@ function campaignForClient(row) {
   };
 }
 
-async function readManualCampaignScan({ db = prisma, creator, limit = 100, offset = 0 }) {
+async function readManualCampaignScan({ db = prisma, creator, limit = 100, offset = 0, generationReadAttempt = 0 }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   const jobs = await recentJobs(db, creator.id, null, 60);
   const job = jobs[0] || null;
-  const collectorStatus = jobStatus(job);
+  const manualCollectorStatus = jobStatus(job);
   const safeLimit = Math.max(1, Math.min(200, integer(limit, 100, 200)));
   const safeOffset = Math.max(0, Math.min(1_000_000, integer(offset, 0, 1_000_000)));
   const progress = object(job?.progress);
@@ -296,6 +296,19 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const coverageMatches = Boolean(resultScanRunId && currentCoverageScanRunId === resultScanRunId);
   const canonicalCoveragePresent = Boolean(currentCoverageScanRunId);
   const manualGenerationSuperseded = Boolean(resultScanRunId && currentCoverageScanRunId && resultScanRunId !== currentCoverageScanRunId);
+  const currentCoverageSourceJobId = clean(collectionState?.fanValueCoverageSourceJobId ?? collectionState?.sourceJobId, 220);
+  const currentCoverageOwnerKind = clean(collectionState?.fanValueCoverageOwnerKind, 32);
+  const currentCoverageCollectorVersion = clean(collectionState?.fanValueCoverageCollectorVersion, 80);
+  const currentCoverageDelegated = canonicalCoveragePresent && collectionState?.fanValueCoverageDelegated === true;
+  let currentCoverageJob = null;
+  if (currentCoverageSourceJobId && typeof db.jobInstance?.findUnique === "function") {
+    currentCoverageJob = await db.jobInstance.findUnique({ where: { id: currentCoverageSourceJobId } });
+  }
+  const currentCoverageCollectorStatus = currentCoverageJob ? jobStatus(currentCoverageJob) : null;
+  const currentCoverageOwnsPresentation = canonicalCoveragePresent && (!coverageMatches || !job);
+  const collectorStatus = currentCoverageOwnsPresentation
+    ? (currentCoverageCollectorStatus || manualCollectorStatus)
+    : manualCollectorStatus;
   // The endpoint presents two independent authorities: the selected manual job
   // remains the provider traversal history, while FanData counters always come
   // from the creator's current canonical coverage generation when one exists.
@@ -312,7 +325,8 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const campaignFrontierTarget = integer(collectionState?.campaignFrontierTargetCount, 0, 100_000_000);
   const campaignFrontierCompleted = integer(collectionState?.campaignFrontierCompletedCount, 0, 100_000_000);
   const campaignFrontierDeferred = integer(collectionState?.campaignFrontierDeferredCount, 0, 100_000_000);
-  const fanRefreshDelegated = result.fanRefreshDelegated === true || ["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"].includes(continuation.collectorVersion);
+  const manualFanRefreshDelegated = result.fanRefreshDelegated === true || ["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"].includes(continuation.collectorVersion);
+  const fanRefreshDelegated = canonicalCoveragePresent ? currentCoverageDelegated : manualFanRefreshDelegated;
   const membershipCoverageStatus = clean(collectionState?.membershipCoverageStatus, 40) || "MISSING";
   const fanValuesComplete = canonicalCoveragePresent
     ? fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"
@@ -356,11 +370,27 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const presentation = deriveCampaignPresentationStatus({
     collectorStatus, fanRefreshDelegated, membershipCoverageStatus, campaignFrontierFreshnessStatus,
     fanValuesComplete, fanValuesOutstanding, fanValueFreshnessStatus, retryableFailedDemands: failedRefreshDemands,
+    currentCoverageAuthoritative: canonicalCoveragePresent,
   });
   const { status, coverageStatus, refreshPending } = presentation;
   const refreshRecoveryAvailable = failedRefreshDemands > 0 || quarantinedRefreshDemands > 0;
   const stateErrorCode = clean(collectionState?.lastErrorCode, 120);
   const stateErrorMessage = clean(collectionState?.lastErrorMessage, 1000);
+  if (canonicalCoveragePresent && typeof db.creatorCampaignCollectionState?.findUnique === "function") {
+    const endState = await db.creatorCampaignCollectionState.findUnique({
+      where: { creatorId: creator.id },
+      select: { fanValueCoverageScanRunId: true },
+    });
+    const endCoverageScanRunId = clean(endState?.fanValueCoverageScanRunId, 120);
+    if (endCoverageScanRunId !== currentCoverageScanRunId) {
+      if (generationReadAttempt < 2) {
+        return readManualCampaignScan({ db, creator, limit, offset, generationReadAttempt: generationReadAttempt + 1 });
+      }
+      const error = new Error("CAMPAIGN_COVERAGE_READ_GENERATION_UNSTABLE");
+      error.code = "CAMPAIGN_COVERAGE_READ_GENERATION_UNSTABLE";
+      throw error;
+    }
+  }
   return {
     ok: true,
     creatorId: creator.id,
@@ -370,6 +400,12 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     coverageStatus,
     refreshPending,
     manual: Boolean(job),
+    manualCollectorStatus,
+    currentCoverageCollectorStatus,
+    currentCoverageOwnerKind,
+    currentCoverageCollectorVersion,
+    currentCoverageSourceJobId,
+    currentCoverageDelegated,
     phase: clean(continuation.phase, 40) || (["COMPLETE", "PARTIAL", "REFRESH_PENDING"].includes(status) ? "complete" : "campaigns"),
     campaignPagesScanned: integer(continuation.page ?? result.campaignBatchCount, 0, 10_000),
     campaignIndex: integer(continuation.campaignIndex ?? result.campaignCount, 0, 10_000),

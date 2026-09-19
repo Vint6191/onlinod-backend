@@ -29,6 +29,22 @@ function date(value) {
 function mode(value) {
   return String(value || "").trim().toLowerCase() === "catchup" ? "catchup" : "full";
 }
+function campaignCollectorVersionFromJob(job) {
+  const continuationEnvelope = object(job?.continuation);
+  const continuation = continuationEnvelope.driverPhase === "execute" ? object(continuationEnvelope.jobContinuation) : continuationEnvelope;
+  const result = object(job?.result);
+  return clean(continuation.collectorVersion ?? result.collectorVersion, 80);
+}
+function campaignFanCoverageAuthorityFromJob(job) {
+  const params = object(job?.params);
+  return {
+    delegated: Number(params.campaignFreshnessCoverageVersion || 0) >= 1,
+    ownerKind: params.manualCampaignScan === true ? "MANUAL" : "AUTOMATIC",
+    collectorVersion: campaignCollectorVersionFromJob(job),
+    sourceJobId: clean(job?.id, 220),
+  };
+}
+
 
 function collectorPlanningProofAt(collectorType, collectionMode, state) {
   const requestedMode = mode(collectionMode);
@@ -260,10 +276,16 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null } = 
     if (authority === "CURRENT" && String(existing?.status || "").toUpperCase() === "FAILED" && !existing?.retryAfterAt) {
       return { accepted: false, stale: true, terminal: true, command, state: existing };
     }
+    const coverageAuthority = campaignFanCoverageAuthorityFromJob(job);
     const data = {
       status: "SCANNING", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: null,
       membershipCoverageStatus: "SCANNING", membershipCoverageCompletedAt: null,
-      fanValueCoverageScanRunId: command.generation, fanValueFreshnessCutoffAt: null, fanValueFreshnessStatus: "MISSING",
+      fanValueCoverageScanRunId: command.generation,
+      fanValueCoverageDelegated: coverageAuthority.delegated,
+      fanValueCoverageOwnerKind: coverageAuthority.ownerKind,
+      fanValueCoverageCollectorVersion: coverageAuthority.collectorVersion,
+      fanValueCoverageSourceJobId: coverageAuthority.sourceJobId,
+      fanValueFreshnessCutoffAt: null, fanValueFreshnessStatus: "MISSING",
       fanValueExpected: 0, fanValueAlreadyFresh: 0, fanValueQueued: 0, fanValueSucceeded: 0,
       fanValueUnavailable: 0, fanValueFailed: 0, fanValueOutstanding: 0, fanValueCoverageUpdatedAt: null,
       campaignFrontierPlanRunId: null, campaignFrontierFreshnessStatus: "MISSING",
@@ -288,8 +310,11 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
     }
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const success = complete === true;
+    const coverageAuthority = campaignFanCoverageAuthorityFromJob(job);
     const common = {
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
+      fanValueCoverageDelegated: coverageAuthority.delegated, fanValueCoverageOwnerKind: coverageAuthority.ownerKind,
+      fanValueCoverageCollectorVersion: coverageAuthority.collectorVersion, fanValueCoverageSourceJobId: coverageAuthority.sourceJobId,
       membershipCoverageStatus: membershipComplete ? "COMPLETE" : "PARTIAL",
       membershipCoverageCompletedAt: membershipComplete ? now : null,
       retryAfterAt: null,
@@ -315,8 +340,11 @@ async function recordCampaignCollectionFailure({ db = prisma, job, error, termin
     const current = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
     if (commandAuthority(current, command) === "STALE" || completedForCommand(current, command)) return current;
     const retryAt = terminal ? null : date(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000);
+    const coverageAuthority = campaignFanCoverageAuthorityFromJob(job);
     const data = {
       status: "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
+      fanValueCoverageDelegated: coverageAuthority.delegated, fanValueCoverageOwnerKind: coverageAuthority.ownerKind,
+      fanValueCoverageCollectorVersion: coverageAuthority.collectorVersion, fanValueCoverageSourceJobId: coverageAuthority.sourceJobId,
       lastErrorCode: "CAMPAIGN_COLLECTION_FAILED", lastErrorMessage: clean(error?.message || error, 2000), sourceJobId: clean(job.id, 220),
     };
     return tx.creatorCampaignCollectionState.upsert({

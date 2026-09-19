@@ -172,7 +172,8 @@ test("INT5.8A-4 source retains server-refresh compatibility while current Campai
   assert.match(route, /campaignServerFanRefreshV1/);
   assert.match(route, /serverCapabilities: JOB_SERVER_CAPABILITIES/);
   assert.match(lease, /campaignServerFanRefreshV1 !== true/);
-  assert.match(control, /const fanRefreshDelegated = result\.fanRefreshDelegated === true \|\| \["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"\]\.includes\(continuation\.collectorVersion\)/);
+  assert.match(control, /const manualFanRefreshDelegated = result\.fanRefreshDelegated === true \|\| \["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"\]\.includes\(continuation\.collectorVersion\)/);
+  assert.match(control, /const fanRefreshDelegated = canonicalCoveragePresent \? currentCoverageDelegated : manualFanRefreshDelegated/);
   assert.match(freshnessPolicy, /CAMPAIGN_FAN_VALUE_FRESHNESS_MS/);
   assert.match(freshnessPolicy, /CREATOR_ANALYTICS_CAMPAIGN_FAN_VALUE_FRESHNESS_MS/);
   const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260918023500_phase3_campaign_server_fan_refresh_queue/migration.sql"), "utf8");

@@ -1233,6 +1233,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       }));
       fanRefreshQueue = await enqueueUniqueCampaignFanRefreshes({
         db: tx, job, scanRunId, scanStartedAt, candidates: refreshCandidates, now: serverReceivedAt,
+        collectorVersion: payload.collectorVersion,
       });
     }
 

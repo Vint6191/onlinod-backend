@@ -2129,6 +2129,10 @@ model CreatorCampaignCollectionState {
   membershipCoverageStatus     AnalyticsCoverageStatus @default(MISSING)
   membershipCoverageCompletedAt DateTime?
   fanValueCoverageScanRunId    String?   @db.VarChar(120)
+  fanValueCoverageDelegated    Boolean   @default(false)
+  fanValueCoverageOwnerKind    String?   @db.VarChar(32)
+  fanValueCoverageCollectorVersion String? @db.VarChar(80)
+  fanValueCoverageSourceJobId  String?
   fanValueFreshnessCutoffAt    DateTime?
   fanValueFreshnessStatus      AnalyticsCoverageStatus @default(MISSING)
   fanValueExpected             Int       @default(0)

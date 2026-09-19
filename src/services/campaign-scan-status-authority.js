@@ -9,6 +9,7 @@ function deriveCampaignPresentationStatus({
   fanValuesOutstanding = 0,
   fanValueFreshnessStatus = "MISSING",
   retryableFailedDemands = 0,
+  currentCoverageAuthoritative = false,
 } = {}) {
   const normalizedCollector = String(collectorStatus || "IDLE").toUpperCase();
   const normalizedMembership = String(membershipCoverageStatus || "MISSING").toUpperCase();
@@ -26,7 +27,13 @@ function deriveCampaignPresentationStatus({
     : refreshPending ? "PENDING"
       : (normalizedMembership === "MISSING" && normalizedFan === "MISSING" ? "MISSING" : "PARTIAL");
   let status = normalizedCollector;
-  if (normalizedCollector === "COMPLETE") {
+  const collectorActive = ["RUNNING", "QUEUED", "PAUSED"].includes(normalizedCollector);
+  if (currentCoverageAuthoritative === true && !collectorActive) {
+    // Current canonical coverage is the operational authority. A stale/missing
+    // manual collector must not hide automatic delegated debt or keep an old
+    // FAILED/PARTIAL header after a newer generation becomes complete.
+    status = coverageComplete ? "COMPLETE" : refreshPending ? "REFRESH_PENDING" : normalizedCollector;
+  } else if (normalizedCollector === "COMPLETE") {
     if (fanRefreshDelegated === true) {
       status = coverageComplete ? "COMPLETE" : refreshPending ? "REFRESH_PENDING" : "PARTIAL";
     } else if (fanValuesComplete !== true) {
