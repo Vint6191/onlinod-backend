@@ -88,7 +88,7 @@ test("generic FanData full-profile projection has constant bounded SQL topology 
     const { db, result } = await projectCount(count);
     assert.equal(result.projected, count);
     const { locks, writes } = splitSqlCalls(db.calls);
-    assert.equal(locks.length, 1, `expected one shared authority lock for ${count} fans`);
+    assert.equal(locks.length, 2, `expected constant Campaign -> FanData authority locks for ${count} fans`);
     assert.equal(writes.length, 4, `expected four projection SQL statements for ${count} fans`);
     assert.ok(writes[0].sql.includes('INSERT INTO "CreatorFan"'));
     assert.ok(writes[1].sql.includes('UPDATE "CreatorFan"'));
@@ -119,7 +119,7 @@ test("duplicate fan observations are collapsed before SQL and preserve newest pe
   });
   assert.equal(result.projected, 2);
   const { locks, writes } = splitSqlCalls(db.calls);
-  assert.equal(locks.length, 1);
+  assert.equal(locks.length, 2);
   assert.equal(writes.length, 4);
 
   const relationshipRows = JSON.parse(writes[2].args[0]);

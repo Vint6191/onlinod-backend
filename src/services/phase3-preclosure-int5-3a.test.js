@@ -60,7 +60,7 @@ test("INT5.3A action profile provenance uses AutomationDelivery FK, never source
   });
   assert.equal(result.projected, 1);
   const { locks, writes } = splitSqlCalls(db.calls);
-  assert.equal(locks.length, 1);
+  assert.equal(locks.length, 2);
   assert.equal(writes.length, 4);
 
   const relationshipRows = JSON.parse(writes[2].args[0]);
@@ -101,7 +101,7 @@ test("INT5.3A generic bulk rows are ordered by opaque fan id for deterministic l
     receivedAt: new Date("2026-09-16T19:00:05.000Z"),
   });
   const { locks, writes } = splitSqlCalls(db.calls);
-  assert.equal(locks.length, 1);
+  assert.equal(locks.length, 2);
   for (const callIndex of [0, 2, 3]) {
     const ids = JSON.parse(writes[callIndex].args[0]).map((row) => row.onlyFansUserId);
     assert.deepEqual(ids, ["fan-a", "fan-m", "fan-z"]);

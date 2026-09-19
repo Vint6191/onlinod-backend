@@ -235,7 +235,7 @@ test("INT5.7A-5 a full 50-claimer page uses one canonical FanData lock for ident
   });
   assert.equal(result.inserted, 50);
   const locks = rawSql.filter((entry) => /pg_advisory_xact_lock/.test(entry.sql));
-  assert.equal(locks.length, 3, "two fixed Campaign/collector locks + one FanData authority lock");
+  assert.equal(locks.length, 2, "one transaction-wide Campaign lock + one FanData authority lock");
   const fanUpserts = rawSql.filter((entry) => /INSERT INTO "CreatorFan"/.test(entry.sql));
   const valueUpserts = rawSql.filter((entry) => /INSERT INTO "CreatorFanValueCurrent"/.test(entry.sql));
   const membershipUpserts = rawSql.filter((entry) => /INSERT INTO "CreatorCampaignFan"/.test(entry.sql));

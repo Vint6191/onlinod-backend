@@ -103,8 +103,8 @@ for (const fanCount of [1, 20, 50]) {
     assert.equal(result.queued, fanCount);
     assert.equal(result.scheduled, fanCount);
     assert.equal(calls.raw, 4, "revision/lock/capacity/bind SQL topology must be constant");
-    assert.equal(calls.execute, 1, "capacity advisory lock must remain one bounded call");
-    assert.equal(calls.total, 11, "A20.11 removes the pre-demand state write while keeping queue topology constant");
+    assert.equal(calls.execute, 2, "campaign transaction authority + capacity advisory lock remain bounded");
+    assert.equal(calls.total, 12, "A20.12 adds one transaction-wide Campaign authority call while keeping queue topology constant");
   });
 }
 
@@ -156,7 +156,12 @@ for (const demandCount of [1, 20, 50]) {
 
 function topologyRecoveryDb(rawResult, counter) {
   return {
-    $executeRawUnsafe: async () => 1,
+    $executeRawUnsafe: async (sql, ...args) => {
+      counter.execute = (counter.execute || 0) + 1;
+      assert.match(String(sql), /pg_advisory_xact_lock/);
+      assert.deepEqual(args[0], ["analytics-collector:campaigns:c1"]);
+      return 1;
+    },
     creatorFanRefreshDemand: {
       findMany: async () => [],
       updateMany: async () => ({ count: 0 }),
@@ -165,8 +170,13 @@ function topologyRecoveryDb(rawResult, counter) {
       updateMany: async () => ({ count: 0 }),
     },
     creatorCampaignCollectionState: {},
-    async $queryRawUnsafe(sql, now, force, creatorId, limit) {
+    async $queryRawUnsafe(sql, ...args) {
       counter.calls += 1;
+      if (/SELECT DISTINCT d\."creatorId"/.test(sql)) {
+        assert.ok(args[0] instanceof Date);
+        return [{ creatorId: "c1" }];
+      }
+      const [now, force, creatorId, limit, creatorIds] = args;
       assert.match(sql, /FOR UPDATE SKIP LOCKED/);
       assert.match(sql, /failed_work AS/);
       assert.match(sql, /work_update AS/);
@@ -177,6 +187,7 @@ function topologyRecoveryDb(rawResult, counter) {
       assert.equal(force, false);
       assert.equal(creatorId, null);
       assert.ok(limit >= 1);
+      assert.deepEqual(creatorIds, ["c1"]);
       return [rawResult];
     },
   };
@@ -196,10 +207,11 @@ for (const demandCount of [1, 20, 200]) {
       now: new Date("2040-01-02T01:00:00.000Z"),
       maxDemands: demandCount,
     });
-    assert.equal(counter.calls, 1);
+    assert.equal(counter.calls, 2);
+    assert.equal(counter.execute, 1);
     assert.equal(result.recovered, demandCount);
     assert.equal(result.requeuedWork, demandCount);
-    assert.equal(result.topology, "set_based_v1");
+    assert.equal(result.topology, "set_based_v2");
   });
 }
 
@@ -210,7 +222,8 @@ test("A20.3 failed-demand recovery fails closed on current coverage counter mism
     () => recoverFailedCampaignFanRefreshDemands({ db, now: new Date("2040-01-02T01:00:00.000Z"), maxDemands: 20 }),
     /CAMPAIGN_FAN_REFRESH_REQUEUE_COVERAGE_TRANSITION_LOST/,
   );
-  assert.equal(counter.calls, 1);
+  assert.equal(counter.calls, 2);
+  assert.equal(counter.execute, 1);
 });
 
 test("A20.3 source has deterministic set-based queue/recovery locking and no production per-demand binding loop", () => {

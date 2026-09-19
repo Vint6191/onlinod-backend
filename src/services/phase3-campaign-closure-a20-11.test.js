@@ -70,7 +70,7 @@ test("A20.11 current-generation lookup index is online for populated DBs and mig
   assert.match(migration, /CREATE INDEX IF NOT EXISTS "CreatorCampaignFanRefreshWork_creator_run_id_idx"/);
   assert.match(migration, /IF NOT EXISTS \(SELECT 1 FROM "CreatorCampaignFanRefreshWork" LIMIT 1\)/);
   assert.match(preflightSource, /CREATE INDEX CONCURRENTLY IF NOT EXISTS/);
-  assert.match(preflightSource, /ensureCurrentRunLookupIndex\(db\)/);
+  assert.match(preflightSource, /withIndexLifecycleAuthority\(db,[\s\S]*ensureCurrentRunLookupIndex\(lifecycleDb\)/);
   assert.equal(preflight.CURRENT_RUN_INDEX_NAME, "CreatorCampaignFanRefreshWork_creator_run_id_idx");
 });
 
@@ -84,7 +84,7 @@ test("A20.11 seeded physical proof models a large current generation and gates i
   assert.match(runner, /ONLINOD_A20_SEED_CURRENT_ROWS/);
   assert.match(runner, /currentGenerationRows/);
   assert.match(runner, /currentRunIndexUsed/);
-  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 26/);
+  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 28/);
   assert.match(runner, /phase3-campaign-closure-a20-11\.integration\.test\.js/);
   assert.match(runner, /A20_11_PREFLIGHT_RUNTIME_AVAILABILITY_PASS/);
   const availability = source("scripts/audit/phase3-a20-preflight-runtime-availability.js");

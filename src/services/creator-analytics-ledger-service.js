@@ -15,6 +15,7 @@ const {
   CAMPAIGN_ACTIVE_FRONTIER_FRESHNESS_MS, CAMPAIGN_INACTIVE_FRONTIER_FRESHNESS_MS, CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
 } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { acquireCampaignTransactionLock, withCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 const { consumeFanObservationToken, consumeFanObservationTokensBatch } = require("./fan-observation-token-service");
 const { campaignCausalV1State, enterCampaignWriterGeneration } = require("./campaign-causal-activation-service");
 const { enqueueUniqueCampaignFanRefreshes, campaignFanValueCoverageFromState } = require("./campaign-fan-refresh-queue-service");
@@ -932,7 +933,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
 
   return inTransaction(db, async (tx) => {
     await enterCampaignWriterGeneration({ db: tx });
-    await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
+    await acquireCampaignTransactionLock(tx, job.creatorId);
 
     // Current selective Campaign claimer writes are only legal after the server
     // has issued this exact Campaign as a target for this scanRun. Perform this
@@ -965,7 +966,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       }
     }
 
-    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
+    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId, campaignLockHeld: true });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
     const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: processObservedAt });
     const { batch, replay } = await beginBatch(tx, {
@@ -1170,6 +1171,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         allowedSources: ["CAMPAIGN_CLAIMER"],
         observedAtPolicy: "TRUSTED_INPUT",
         receivedAt: serverReceivedAt,
+        campaignLockHeld: true,
       });
     }
 
@@ -1548,8 +1550,8 @@ async function ingestCampaignFanValueChunk({ db = prisma, job, deviceId, chunk }
   if (idempotencyKey.length > 240) throw new Error("Campaign fan value idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await enterCampaignWriterGeneration({ db: tx });
-    await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
-    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
+    await acquireCampaignTransactionLock(tx, job.creatorId);
+    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId, campaignLockHeld: true });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation };
     await assertCampaignFanValueScope(tx, job, scanRunId, [item.onlyFansUserId]);
     const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: processObservedAt });
@@ -1602,8 +1604,8 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
   if (idempotencyKey.length > 240) throw new Error("Campaign fan values idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await enterCampaignWriterGeneration({ db: tx });
-    await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
-    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
+    await acquireCampaignTransactionLock(tx, job.creatorId);
+    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId, campaignLockHeld: true });
     if (!generation.accepted) return { replay: false, superseded: true, generation: generation.command.generation, received: values.length, available: 0, unavailable: 0, applied: [] };
     await assertCampaignFanValueScope(tx, job, scanRunId, normalizedIds);
     const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: processObservedAt });
@@ -1684,6 +1686,7 @@ async function ingestCampaignFanValuesBatchChunk({ db = prisma, job, deviceId, c
         allowedSources: ["CAMPAIGN_CLAIMER"],
         observedAtPolicy: "TRUSTED_INPUT",
         receivedAt: serverReceivedAt,
+        campaignLockHeld: true,
       });
     }
 
@@ -1908,7 +1911,7 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
   });
 }
 
-async function loadCampaignDirectorySegment({ db = prisma, job, chunk }) {
+async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaignLockHeld = false }) {
   requireJob(job);
   const payload = object(chunk);
   if (text(payload.kind, 80) !== "campaign_directory_segment") throw new Error("Unsupported campaign directory segment request");
@@ -1919,6 +1922,16 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk }) {
     payload.collectorVersion !== CAMPAIGN_COLLECTOR_VERSION ||
     !scanRunId || scanRunId !== command.generation
   ) throw new Error("Invalid campaign directory segment contract");
+
+  if (!_campaignLockHeld && typeof db?.$transaction === "function") {
+    return withCampaignTransactionLock({
+      db,
+      creatorId: job.creatorId,
+      work: (tx) => loadCampaignDirectorySegment({ db: tx, job, chunk, _campaignLockHeld: true }),
+      options: { maxWait: 30_000, timeout: 60_000 },
+    });
+  }
+  if (!_campaignLockHeld) await acquireCampaignTransactionLock(db, job.creatorId);
 
   const driver = object(job.continuation);
   const durable = driver.driverPhase === "execute" ? object(driver.jobContinuation) : {};
@@ -1946,7 +1959,7 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk }) {
     // generation or reset run-level coverage. Validate the exact directory
     // generation/revision first, then accept the new tranche generation.
     if (reuse) directory = await campaignDirectoryAuthority(db, { job, command, scanRunId, durable, now: authorityNow });
-    const generation = await acceptCampaignGeneration({ db, job });
+    const generation = await acceptCampaignGeneration({ db, job, campaignLockHeld: true });
     if (!generation.accepted) throw new Error("Campaign directory segment belongs to a stale collection generation");
     if (!directory) directory = await campaignDirectoryAuthority(db, { job, command, scanRunId, durable, now: authorityNow });
   } else {
@@ -2021,8 +2034,8 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   if (key.length > 240) throw new Error("Campaign completion idempotency key exceeds 240 characters");
   return inTransaction(db, async (tx) => {
     await enterCampaignWriterGeneration({ db: tx });
-    await acquireAnalyticsLock(tx, "creator-campaigns", job.creatorId);
-    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId });
+    await acquireCampaignTransactionLock(tx, job.creatorId);
+    const generation = await acceptCampaignGeneration({ db: tx, job, deviceId, campaignLockHeld: true });
     if (!generation.accepted) return { complete: true, replay: false, superseded: true, proof: { newerGeneration: generation.state?.activeGeneration || null } };
     const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: processObservedAt });
     const { batch, replay } = await beginBatch(tx, {
@@ -2168,7 +2181,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
       });
     }
     const collectionState = await completeCampaignCollection({
-      db: tx, job, deviceId, complete, membershipComplete: currentMembershipComplete, scanRunId,
+      db: tx, job, deviceId, complete, membershipComplete: currentMembershipComplete, scanRunId, campaignLockHeld: true,
     });
     return { batchId: batch.id, complete, providerTraversalComplete, replay, superseded: false, protocolCurrent, proof, collectionStateId: collectionState?.state?.id || null };
   });

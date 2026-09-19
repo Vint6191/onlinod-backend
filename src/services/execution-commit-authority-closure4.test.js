@@ -65,6 +65,7 @@ test("Closure4 production has zero queryRaw transaction advisory locks and one s
   assert.deepEqual(offenders, []);
   assert.deepEqual(lockSources.sort(), [
     "services/automation-write-commit-fence-service.js",
+    "services/campaign-transaction-lock-service.js",
     "services/creator-analytics-ledger-service.js",
     "services/db-transaction-service.js",
     "services/notification-facts-service.js",

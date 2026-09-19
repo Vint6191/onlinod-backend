@@ -11,10 +11,11 @@ const ROOT = path.resolve(__dirname, "../..");
 const PRISMA_DIR = path.join(ROOT, "prisma");
 const A13_CUTOFF = "20260919010000_phase3_provider_gate_durable_waiter_fairness_v1";
 const PRE_A20_2_CUTOFF = "20260919113000_phase3_campaign_refresh_recovery_status_v1";
-const EXPECTED_PROOF_TEST_COUNT = 26;
+const EXPECTED_PROOF_TEST_COUNT = 28;
 const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
+const INDEX_LIFECYCLE_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-index-lifecycle-concurrency.js");
 const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js"),
   path.join(ROOT, "src/services/phase3-provider-topology-postgres-int5-9a-16.integration.test.js"),
@@ -25,6 +26,7 @@ const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-4.integration.test.js"),
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-5.integration.test.js"),
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-11.integration.test.js"),
+  path.join(ROOT, "src/services/phase3-campaign-closure-a20-12.integration.test.js"),
 ];
 
 function fail(message, code = 3) {
@@ -171,6 +173,10 @@ function main() {
   try {
     const cleanUrl = withSchema(audit, cleanSchema);
     run("clean-current-migrate", cli, ["migrate", "deploy", "--schema", cleanSchemaFile], { DATABASE_URL: cleanUrl });
+    const indexAbsentConcurrency = run("clean-current-index-lifecycle-absent", process.execPath, [INDEX_LIFECYCLE_CONCURRENCY_PROOF, "absent"], { DATABASE_URL: cleanUrl });
+    if (!String(indexAbsentConcurrency.stdout || "").includes("A20_12_INDEX_ABSENT_CONCURRENCY_PASS")) {
+      fail("clean-current index lifecycle absent/concurrent proof did not emit PASS marker");
+    }
     const preflightConcurrency = run("clean-current-preflight-concurrency", process.execPath, [PREFLIGHT_CONCURRENCY_PROOF], { DATABASE_URL: cleanUrl });
     if (!String(preflightConcurrency.stdout || "").includes("A20_9_PREFLIGHT_CONCURRENCY_PASS")) {
       fail("clean-current preflight concurrency proof did not emit PASS marker");
@@ -197,6 +203,10 @@ function main() {
       fail("seeded preflight runtime-availability proof did not emit PASS marker");
     }
     run("seeded-a20-2-online-preflight", process.execPath, [COVERAGE_PREFLIGHT], seedEnv);
+    const indexInvalidRecovery = run("seeded-index-lifecycle-invalid-recovery", process.execPath, [INDEX_LIFECYCLE_CONCURRENCY_PROOF, "invalid"], seedEnv);
+    if (!String(indexInvalidRecovery.stdout || "").includes("A20_12_INDEX_INVALID_RECOVERY_PASS")) {
+      fail("seeded index lifecycle invalid recovery proof did not emit PASS marker");
+    }
     addMigrationsAfter(seededRollingPrisma, PRE_A20_2_CUTOFF);
     run("seeded-a20-2-to-current-migrate", cli, ["migrate", "deploy", "--schema", seededRollingSchemaFile], { DATABASE_URL: seededRollingUrl });
     const seededVerify = run("seeded-a20-2-backfill-verify", process.execPath, ["scripts/audit/phase3-a20-seeded-rolling-coverage.js", "verify"], seedEnv);
@@ -212,6 +222,8 @@ function main() {
       ok: true, cleanSchema, rollingSchema, seededRollingSchema,
       a13Cutoff: A13_CUTOFF, preA20_2Cutoff: PRE_A20_2_CUTOFF,
       expectedProofTests: EXPECTED_PROOF_TEST_COUNT,
+      indexLifecycleAbsent: { pass: true, durationMs: indexAbsentConcurrency.durationMs },
+      indexLifecycleInvalidRecovery: { pass: true, durationMs: indexInvalidRecovery.durationMs },
       preflightConcurrency: { pass: true, durationMs: preflightConcurrency.durationMs },
       preflightRuntimeAvailability: { pass: true, durationMs: runtimeAvailability.durationMs },
       cleanProof, rollingProof, seededProof, migrationMetrics: migrationMetric,

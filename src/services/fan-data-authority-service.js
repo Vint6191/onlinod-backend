@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { consumeFanObservationToken } = require("./fan-observation-token-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
+const { acquireCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 
 const IDENTITY_SOURCE_PRIORITY = Object.freeze({
   AUTOMATION_WRITE_RESULT: 900,
@@ -1573,7 +1574,7 @@ async function applyGenericFanObservationBulkSql(tx, rows, scope) {
 
 async function projectFanObservationBatch(db, {
   agencyId, creatorId, sourceDeviceId = null, sourceJobId = null, sourceDeliveryId = null, scanRunId = null, items = [],
-  allowedSources = null, observedAtPolicy = null, receivedAt = new Date(), causalObservedAt = null,
+  allowedSources = null, observedAtPolicy = null, receivedAt = new Date(), causalObservedAt = null, campaignLockHeld = false,
 } = {}) {
   const scopedAgencyId = text(agencyId, 180);
   const scopedCreatorId = text(creatorId, 180);
@@ -1611,6 +1612,19 @@ async function projectFanObservationBatch(db, {
     const touchedFanIds = rows.map((row) => row.onlyFansUserId);
     const valueFanIds = rows.filter((row) => row.value).map((row) => row.onlyFansUserId);
 
+    // Campaign freshness reconciliation mutates creator-wide Campaign demand /
+    // work / collection-state authority. Acquire that creator lock before the
+    // FanData authority lock taken by the bulk projector, so every value path
+    // has the same global order: campaign creator -> FanData creator -> demand
+    // -> work -> collection state. This closes the mixed-page deadlock where a
+    // Campaign ingest held collection state while another value writer held
+    // FanData/demand authority and waited back on Campaign state.
+    let campaignAuthorityHeld = campaignLockHeld === true;
+    if (valueFanIds.length && typeof tx.$executeRawUnsafe === "function" && !campaignAuthorityHeld) {
+      await acquireCampaignTransactionLock(tx, scopedCreatorId);
+      campaignAuthorityHeld = true;
+    }
+
     // PostgreSQL production path: one bounded JSONB upsert set per canonical table,
     // independent of fan/field count. In-memory/unit adapters keep the semantic
     // projector fallback below so tests can exercise authority behavior without SQL.
@@ -1622,7 +1636,7 @@ async function projectFanObservationBatch(db, {
       if (valueFanIds.length) {
         const { reconcileCampaignFanRefreshDemandsFromCanonicalObservations } = require("./campaign-fan-refresh-queue-service");
         await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
-          db: tx, creatorId: scopedCreatorId, fanIds: valueFanIds, now: envelope.receivedAt,
+          db: tx, creatorId: scopedCreatorId, fanIds: valueFanIds, now: envelope.receivedAt, _campaignLockHeld: campaignAuthorityHeld,
         });
       }
       return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
@@ -1648,7 +1662,7 @@ async function projectFanObservationBatch(db, {
     if (valueFanIds.length && tx.creatorFanRefreshDemand?.findMany) {
       const { reconcileCampaignFanRefreshDemandsFromCanonicalObservations } = require("./campaign-fan-refresh-queue-service");
       await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
-        db: tx, creatorId: scopedCreatorId, fanIds: valueFanIds, now: envelope.receivedAt,
+        db: tx, creatorId: scopedCreatorId, fanIds: valueFanIds, now: envelope.receivedAt, _campaignLockHeld: campaignAuthorityHeld,
       });
     }
     return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };

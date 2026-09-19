@@ -76,7 +76,7 @@ for (const demandCount of [1, 20, 50]) {
     assert.equal(calls["demand.findMany"], 1);
     assert.equal(calls["demand.update"] || 0, 0);
     assert.equal(calls["work.updateMany"] || 0, 0);
-    assert.equal(calls.total, 4, "full terminal DB-call topology must not grow with demand count");
+    assert.equal(calls.total, 5, "campaign authority + terminal DB-call topology must not grow with demand count");
   });
 }
 
@@ -99,7 +99,7 @@ for (const demandCount of [1, 20, 50]) {
     assert.equal(result.workTransitioned, demandCount);
     assert.equal(result.topology, "set_based_v1");
     assert.equal(calls.raw, 3);
-    assert.equal(calls.total, 4);
+    assert.equal(calls.total, 5);
   });
 }
 
@@ -118,7 +118,7 @@ test("A20.5 partial 25/50 completion terminalizes only the remaining active dema
   });
   assert.equal(result.applied, 25);
   assert.equal(result.topology, "set_based_v1");
-  assert.equal(calls.total, 4);
+  assert.equal(calls.total, 5);
 });
 
 test("A20.5 terminal transition fails closed when current coverage cannot absorb the planned decrement", async () => {

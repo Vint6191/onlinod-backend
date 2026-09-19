@@ -66,7 +66,7 @@ test("INT5.4B point refresh accepts exactly one bounded 20-fan chunk with O(1) b
   assert.equal(result.projected, 20);
   const locks = db.calls.filter((call) => /pg_advisory_xact_lock/.test(call.sql));
   const writes = db.calls.filter((call) => !/pg_advisory_xact_lock/.test(call.sql));
-  assert.equal(locks.length, 1, "20-fan point refresh must acquire one shared authority lock");
+  assert.equal(locks.length, 2, "20-fan point refresh must acquire Campaign creator authority before the FanData authority lock");
   assert.equal(writes.length, 4, "20-fan point refresh must stay on the four-statement production bulk path");
 });
 

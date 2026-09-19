@@ -4,6 +4,11 @@ const crypto = require("node:crypto");
 const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { fanDataRefreshScheduleAvailable } = require("./provider-capacity-authority-service");
+const {
+  acquireCampaignTransactionLock,
+  acquireCampaignTransactionLocks,
+  withCampaignTransactionLock,
+} = require("./campaign-transaction-lock-service");
 
 const CAMPAIGN_FAN_REFRESH_QUEUE_VERSION = 2;
 const CAMPAIGN_FAN_REFRESH_JOB_MAX = 50;
@@ -508,10 +513,21 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
   };
 }
 
-async function reconcileCampaignFanRefreshDemandsFromCanonicalObservations({ db, creatorId, fanIds = [], now = null } = {}) {
+async function reconcileCampaignFanRefreshDemandsFromCanonicalObservations({ db, creatorId, fanIds = [], now = null, _campaignLockHeld = false } = {}) {
   const scopedCreatorId = clean(creatorId, 180);
   const ids = [...new Set((Array.isArray(fanIds) ? fanIds : []).map((value) => clean(value, 180)).filter(Boolean))].sort();
   if (!scopedCreatorId || !ids.length) return { healed: 0, reason: "nothing_to_reconcile" };
+  if (!_campaignLockHeld && typeof db?.$transaction === "function") {
+    return withCampaignTransactionLock({
+      db,
+      creatorId: scopedCreatorId,
+      work: (tx) => reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
+        db: tx, creatorId: scopedCreatorId, fanIds: ids, now, _campaignLockHeld: true,
+      }),
+      options: { maxWait: 30_000, timeout: 60_000 },
+    });
+  }
+  if (!_campaignLockHeld) await acquireCampaignTransactionLock(db, scopedCreatorId);
   const productionSetBasedAdapter = typeof db?.$queryRawUnsafe === "function"
     && Boolean(db?.creatorFanRefreshDemand?.findMany)
     && Boolean(db?.creatorCampaignFanRefreshWork)
@@ -626,9 +642,30 @@ function supportsSetBasedCampaignFanRefreshRecovery(db) {
     && Boolean(db?.creatorFanRefreshDemand?.findMany);
 }
 
-async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creatorId = null, force = false, maxDemands = 200 } = {}) {
+async function discoverFailedCampaignFanRefreshCreatorIds({ db, now, force = false, maxDemands = 200 } = {}) {
+  const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
+  const limit = Math.max(1, Math.min(2000, Number(maxDemands) || 200));
+  const rows = await db.$queryRawUnsafe(`
+    SELECT DISTINCT d."creatorId"
+    FROM "CreatorFanRefreshDemand" d
+    WHERE d."status" = 'FAILED'
+      AND d."activeRefreshJobId" IS NULL
+      AND ($2::boolean = TRUE OR (
+        d."quarantinedAt" IS NULL
+        AND d."nextRetryAt" IS NOT NULL
+        AND d."nextRetryAt" <= $1
+      ))
+    ORDER BY d."creatorId" ASC
+    LIMIT $3
+  `, effectiveNow, force === true, limit);
+  return [...new Set((Array.isArray(rows) ? rows : []).map((row) => clean(row?.creatorId, 180)).filter(Boolean))].sort();
+}
+
+async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creatorId = null, lockedCreatorIds = [], force = false, maxDemands = 200 } = {}) {
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
   const scopedCreatorId = clean(creatorId, 180);
+  const creatorIds = [...new Set((Array.isArray(lockedCreatorIds) ? lockedCreatorIds : []).map((value) => clean(value, 180)).filter(Boolean))].sort();
+  if (!scopedCreatorId && !creatorIds.length) return { recovered: 0, requeuedWork: 0, coverageRunsUpdated: 0, reason: "none_due", topology: "set_based_v2" };
   const limit = Math.max(1, Math.min(2000, Number(maxDemands) || 200));
   const rows = await db.$queryRawUnsafe(`
     WITH candidate AS (
@@ -642,6 +679,7 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
           AND d."nextRetryAt" <= $1
         ))
         AND ($3::text IS NULL OR d."creatorId" = $3)
+        AND ($3::text IS NOT NULL OR d."creatorId" = ANY($5::text[]))
       ORDER BY COALESCE(d."nextRetryAt", d."lastFailedAt", d."updatedAt") ASC, d."id" ASC
       FOR UPDATE SKIP LOCKED
       LIMIT $4
@@ -724,7 +762,7 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
       (SELECT COUNT(*)::int FROM demand_update) AS "recovered",
       (SELECT COUNT(*)::int FROM work_update) AS "requeuedWork",
       (SELECT COUNT(*)::int FROM coverage_update) AS "coverageRunsUpdated"
-  `, effectiveNow, force === true, scopedCreatorId, limit);
+  `, effectiveNow, force === true, scopedCreatorId, limit, creatorIds);
   const result = Array.isArray(rows) && rows[0] ? rows[0] : {};
   if (Math.max(0, Number(result.coverageTransitionLost || 0)) > 0) {
     throw new Error("CAMPAIGN_FAN_REFRESH_REQUEUE_COVERAGE_TRANSITION_LOST");
@@ -735,14 +773,29 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
     requeuedWork: Math.max(0, Number(result.requeuedWork || 0)),
     coverageRunsUpdated: Math.max(0, Number(result.coverageRunsUpdated || 0)),
     reason: recovered ? (force ? "manual_repair_queued" : "retry_due_queued") : "none_due",
-    topology: "set_based_v1",
+    topology: "set_based_v2",
   };
 }
 
-async function recoverFailedCampaignFanRefreshDemands({ db, now = null, creatorId = null, force = false, maxDemands = 200 } = {}) {
+async function recoverFailedCampaignFanRefreshDemands({ db, now = null, creatorId = null, force = false, maxDemands = 200, _transactionWrapped = false } = {}) {
   if (!db?.creatorFanRefreshDemand?.findMany) return { recovered: 0, requeuedWork: 0, reason: "adapter_unsupported" };
   if (supportsSetBasedCampaignFanRefreshRecovery(db)) {
-    return recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creatorId, force, maxDemands });
+    if (!_transactionWrapped && typeof db?.$transaction === "function") {
+      return db.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({
+        db: tx, now, creatorId, force, maxDemands, _transactionWrapped: true,
+      }), { maxWait: 30_000, timeout: 60_000 });
+    }
+    const scopedCreatorId = clean(creatorId, 180);
+    let lockedCreatorIds;
+    if (scopedCreatorId) {
+      await acquireCampaignTransactionLock(db, scopedCreatorId);
+      lockedCreatorIds = [scopedCreatorId];
+    } else {
+      lockedCreatorIds = await discoverFailedCampaignFanRefreshCreatorIds({ db, now, force, maxDemands });
+      if (!lockedCreatorIds.length) return { recovered: 0, requeuedWork: 0, coverageRunsUpdated: 0, reason: "none_due", topology: "set_based_v2" };
+      await acquireCampaignTransactionLocks(db, lockedCreatorIds);
+    }
+    return recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creatorId: scopedCreatorId, lockedCreatorIds, force, maxDemands });
   }
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
   const scopedCreatorId = clean(creatorId, 180);
@@ -1003,7 +1056,7 @@ async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner
   return refreshJobId;
 }
 
-async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStartedAt, candidates = [], now = new Date(), planner = null, collectorVersion = null } = {}) {
+async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStartedAt, candidates = [], now = new Date(), planner = null, collectorVersion = null, _campaignLockHeld = false } = {}) {
   const creatorId = clean(job?.creatorId, 180);
   const agencyId = clean(job?.agencyId, 180);
   const campaignJobId = clean(job?.id, 180);
@@ -1012,6 +1065,17 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
   const scheduledAt = asDate(now) || new Date();
   const cutoff = new Date(runStartedAt.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS);
   if (!db || !creatorId || !agencyId || !campaignJobId || !runId || !runStartedAt) throw new Error("CAMPAIGN_FAN_REFRESH_QUEUE_SCOPE_INVALID");
+  if (!_campaignLockHeld && typeof db?.$transaction === "function") {
+    return withCampaignTransactionLock({
+      db,
+      creatorId,
+      work: (tx) => enqueueUniqueCampaignFanRefreshes({
+        db: tx, job, scanRunId, scanStartedAt, candidates, now, planner, collectorVersion, _campaignLockHeld: true,
+      }),
+      options: { maxWait: 30_000, timeout: 60_000 },
+    });
+  }
+  if (!_campaignLockHeld) await acquireCampaignTransactionLock(db, creatorId);
 
   const params = job?.params && typeof job.params === "object" && !Array.isArray(job.params) ? job.params : {};
   const coverageAuthority = {
@@ -1456,8 +1520,18 @@ async function transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId, 
   };
 }
 
-async function recordCampaignFanRefreshChunk({ db, job, chunkResult, applied: projectionReceipt = null } = {}) {
+async function recordCampaignFanRefreshChunk({ db, job, chunkResult, applied: projectionReceipt = null, _campaignLockHeld = false } = {}) {
   if (!db?.creatorFanRefreshDemand?.findMany || String(job?.jobKey || "") !== "fan_data_point_refresh") return null;
+  const creatorId = clean(job?.creatorId, 180);
+  if (creatorId && !_campaignLockHeld && typeof db?.$transaction === "function") {
+    return withCampaignTransactionLock({
+      db,
+      creatorId,
+      work: (tx) => recordCampaignFanRefreshChunk({ db: tx, job, chunkResult, applied: projectionReceipt, _campaignLockHeld: true }),
+      options: { maxWait: 30_000, timeout: 60_000 },
+    });
+  }
+  if (creatorId && !_campaignLockHeld) await acquireCampaignTransactionLock(db, creatorId);
   const items = Array.isArray(chunkResult?.items) ? chunkResult.items : [];
   const ids = [...new Set(items.map((item) => clean(item?.onlyFansUserId, 180)).filter(Boolean))].sort();
   if (!ids.length) return { applied: 0 };
@@ -1537,8 +1611,18 @@ async function recordCampaignFanRefreshChunk({ db, job, chunkResult, applied: pr
   return { applied };
 }
 
-async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner = null } = {}) {
+async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner = null, _campaignLockHeld = false } = {}) {
   if (!db?.creatorFanRefreshDemand?.findMany || String(job?.jobKey || "") !== "fan_data_point_refresh") return null;
+  const creatorId = clean(job?.creatorId, 180);
+  if (creatorId && !_campaignLockHeld && typeof db?.$transaction === "function") {
+    return withCampaignTransactionLock({
+      db,
+      creatorId,
+      work: (tx) => finalizeCampaignFanRefreshJob({ db: tx, job, result, planner, _campaignLockHeld: true }),
+      options: { maxWait: 30_000, timeout: 60_000 },
+    });
+  }
+  if (creatorId && !_campaignLockHeld) await acquireCampaignTransactionLock(db, creatorId);
   await lockDemandRowsByRefreshJob(db, job.id);
   const demands = await db.creatorFanRefreshDemand.findMany({ where: { activeRefreshJobId: job.id } });
   if (!demands.length) return { applied: 0, rescheduled: 0 };
@@ -1594,8 +1678,18 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
   };
 }
 
-async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = true, planner = null } = {}) {
+async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = true, planner = null, _campaignLockHeld = false } = {}) {
   if (!terminal || !db?.creatorFanRefreshDemand?.findMany || String(job?.jobKey || "") !== "fan_data_point_refresh") return null;
+  const creatorId = clean(job?.creatorId, 180);
+  if (creatorId && !_campaignLockHeld && typeof db?.$transaction === "function") {
+    return withCampaignTransactionLock({
+      db,
+      creatorId,
+      work: (tx) => recordCampaignFanRefreshJobFailure({ db: tx, job, error, terminal, planner, _campaignLockHeld: true }),
+      options: { maxWait: 30_000, timeout: 60_000 },
+    });
+  }
+  if (creatorId && !_campaignLockHeld) await acquireCampaignTransactionLock(db, creatorId);
   await lockDemandRowsByRefreshJob(db, job.id);
   const demands = await db.creatorFanRefreshDemand.findMany({ where: { activeRefreshJobId: job.id } });
   if (!demands.length) return { applied: 0, rescheduled: 0 };

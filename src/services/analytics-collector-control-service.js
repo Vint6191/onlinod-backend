@@ -4,6 +4,7 @@ const { randomUUID } = require("node:crypto");
 const prisma = require("../prisma");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { campaignTransactionLockKey } = require("./campaign-transaction-lock-service");
 
 const COLLECTION_CONTRACT_VERSION = 1;
 const COLLECTOR_TYPES = Object.freeze({
@@ -151,6 +152,7 @@ function collectionCommand(job, expectedType) {
 }
 
 function collectorLockKey(type, creatorId) {
+  if (type === COLLECTOR_TYPES.CAMPAIGNS) return campaignTransactionLockKey(creatorId);
   return `analytics-collector:${String(type || "unknown").toLowerCase()}:${String(creatorId || "missing")}`;
 }
 
@@ -264,9 +266,9 @@ async function recordFinancialCollectionFailure({ db = prisma, job, error, termi
   }});
 }
 
-async function acceptCampaignGeneration({ db = prisma, job, deviceId = null } = {}) {
+async function acceptCampaignGeneration({ db = prisma, job, deviceId = null, campaignLockHeld = false } = {}) {
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
-  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: job.creatorId, work: async (tx) => {
+  const work = async (tx) => {
     const existing = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
     const authority = commandAuthority(existing, command);
     if (authority === "STALE") return { accepted: false, stale: true, command, state: existing };
@@ -297,12 +299,14 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null } = 
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...data }, update: data,
     });
     return { accepted: true, stale: false, command, state };
-  }});
+  };
+  if (campaignLockHeld) return work(db);
+  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: job.creatorId, work });
 }
 
-async function completeCampaignCollection({ db = prisma, job, deviceId = null, complete, membershipComplete = false, scanRunId } = {}) {
+async function completeCampaignCollection({ db = prisma, job, deviceId = null, complete, membershipComplete = false, scanRunId, campaignLockHeld = false } = {}) {
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
-  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: job.creatorId, work: async (tx) => {
+  const work = async (tx) => {
     const current = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
     if (commandAuthority(current, command) === "STALE") return { applied: false, stale: true, command, state: current };
     if (complete === true && completedForCommand(current, command)) {
@@ -330,7 +334,9 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData }, update: { ...common, ...successData },
     });
     return { applied: true, stale: false, command, state };
-  }});
+  };
+  if (campaignLockHeld) return work(db);
+  return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: job.creatorId, work });
 }
 
 async function recordCampaignCollectionFailure({ db = prisma, job, error, terminal = true, retryAfterAt = null } = {}) {

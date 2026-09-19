@@ -1310,7 +1310,7 @@ test("campaign fan value batch applies 20 current snapshots with constant bounde
   assert.equal(result.received, 20);
   assert.equal(result.available, 20);
   const lockSql = rawSql.filter((entry) => /pg_advisory_xact_lock/.test(entry.sql));
-  assert.equal(lockSql.length, 3, "two fixed Campaign/collector locks + one canonical FanData lock");
+  assert.equal(lockSql.length, 2, "one transaction-wide Campaign lock + one canonical FanData lock");
   const valueSql = rawSql.filter((entry) => /INSERT INTO "CreatorFanValueCurrent"/.test(entry.sql));
   assert.equal(valueSql.length, 1, "the entire fan-value batch must use one bounded value upsert statement");
   const valueRows = JSON.parse(valueSql[0].args[0]);
@@ -1815,11 +1815,9 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
       campaigns: [],
     },
   });
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 1);
   assert.match(calls[0][0], /pg_advisory_xact_lock/);
-  assert.match(calls[0][1], /^-?\d+$/);
-  assert.match(calls[1][0], /pg_advisory_xact_lock/);
-  assert.equal(calls[1][1], "analytics-collector:campaigns:creator-1");
+  assert.equal(calls[0][1], "analytics-collector:campaigns:creator-1");
 });
 
 
