@@ -17,7 +17,10 @@ function deriveCampaignPresentationStatus({
   const coverageComplete = normalizedMembership === "COMPLETE"
     && normalizedFrontier === "COMPLETE"
     && fanValuesComplete === true;
-  const refreshPending = normalizedCollector === "COMPLETE" && fanRefreshDelegated === true && !coverageComplete
+  // Delegated FanData debt has its own lifecycle. A terminal provider collector
+  // (COMPLETE/PARTIAL/FAILED/CANCELLED) must never hide outstanding or retryable
+  // server-side work from the reader/UI.
+  const refreshPending = fanRefreshDelegated === true && !coverageComplete
     && (Math.max(0, Number(fanValuesOutstanding || 0)) > 0 || normalizedFan === "QUEUED" || Math.max(0, Number(retryableFailedDemands || 0)) > 0);
   const coverageStatus = coverageComplete ? "COMPLETE"
     : refreshPending ? "PENDING"

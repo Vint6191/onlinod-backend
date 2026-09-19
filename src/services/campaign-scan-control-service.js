@@ -292,15 +292,21 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const directoryDiscovery = campaignDirectoryDiscoveryCapacityState(collectionState, capacityNow);
   const campaignRefs = Array.isArray(continuation.campaigns) ? continuation.campaigns : [];
   const resultScanRunId = clean(result.scanRunId ?? continuation.scanRunId, 120);
-  const coverageMatches = Boolean(resultScanRunId && collectionState?.fanValueCoverageScanRunId === resultScanRunId);
-  const fanValuesExpected = coverageMatches ? integer(collectionState.fanValueExpected, 0, 100_000_000) : integer(result.fanValuesTotal ?? continuation.fanValuesDiscovered, 0, 100_000_000);
-  const fanValuesAlreadyFresh = coverageMatches ? integer(collectionState.fanValueAlreadyFresh, 0, 100_000_000) : 0;
-  const fanValuesQueued = coverageMatches ? integer(collectionState.fanValueQueued, 0, 100_000_000) : integer(result.fanValuesRequested ?? continuation.fanValuesRequested, 0, 100_000_000);
-  const fanValuesSucceeded = coverageMatches ? integer(collectionState.fanValueSucceeded, 0, 100_000_000) : integer(result.fanValuesFetched ?? continuation.fanValuesFetched, 0, 100_000_000);
-  const fanValuesUnavailable = coverageMatches ? integer(collectionState.fanValueUnavailable, 0, 100_000_000) : integer(result.fanValuesUnavailable ?? continuation.fanValuesUnavailable, 0, 100_000_000);
-  const fanValuesFailed = coverageMatches ? integer(collectionState.fanValueFailed, 0, 100_000_000) : 0;
-  const fanValuesOutstanding = coverageMatches ? integer(collectionState.fanValueOutstanding, 0, 100_000_000) : Math.max(0, fanValuesQueued - fanValuesSucceeded - fanValuesUnavailable);
-  const fanValueFreshnessStatus = coverageMatches ? clean(collectionState.fanValueFreshnessStatus, 40) || "MISSING" : "MISSING";
+  const currentCoverageScanRunId = clean(collectionState?.fanValueCoverageScanRunId, 120);
+  const coverageMatches = Boolean(resultScanRunId && currentCoverageScanRunId === resultScanRunId);
+  const canonicalCoveragePresent = Boolean(currentCoverageScanRunId);
+  const manualGenerationSuperseded = Boolean(resultScanRunId && currentCoverageScanRunId && resultScanRunId !== currentCoverageScanRunId);
+  // The endpoint presents two independent authorities: the selected manual job
+  // remains the provider traversal history, while FanData counters always come
+  // from the creator's current canonical coverage generation when one exists.
+  const fanValuesExpected = canonicalCoveragePresent ? integer(collectionState.fanValueExpected, 0, 100_000_000) : integer(result.fanValuesTotal ?? continuation.fanValuesDiscovered, 0, 100_000_000);
+  const fanValuesAlreadyFresh = canonicalCoveragePresent ? integer(collectionState.fanValueAlreadyFresh, 0, 100_000_000) : 0;
+  const fanValuesQueued = canonicalCoveragePresent ? integer(collectionState.fanValueQueued, 0, 100_000_000) : integer(result.fanValuesRequested ?? continuation.fanValuesRequested, 0, 100_000_000);
+  const fanValuesSucceeded = canonicalCoveragePresent ? integer(collectionState.fanValueSucceeded, 0, 100_000_000) : integer(result.fanValuesFetched ?? continuation.fanValuesFetched, 0, 100_000_000);
+  const fanValuesUnavailable = canonicalCoveragePresent ? integer(collectionState.fanValueUnavailable, 0, 100_000_000) : integer(result.fanValuesUnavailable ?? continuation.fanValuesUnavailable, 0, 100_000_000);
+  const fanValuesFailed = canonicalCoveragePresent ? integer(collectionState.fanValueFailed, 0, 100_000_000) : 0;
+  const fanValuesOutstanding = canonicalCoveragePresent ? integer(collectionState.fanValueOutstanding, 0, 100_000_000) : Math.max(0, fanValuesQueued - fanValuesSucceeded - fanValuesUnavailable);
+  const fanValueFreshnessStatus = canonicalCoveragePresent ? clean(collectionState.fanValueFreshnessStatus, 40) || "MISSING" : "MISSING";
   const campaignFrontierFreshnessStatus = clean(collectionState?.campaignFrontierFreshnessStatus, 40) || "MISSING";
   const campaignFrontierDue = integer(collectionState?.campaignFrontierDueCount, 0, 100_000_000);
   const campaignFrontierTarget = integer(collectionState?.campaignFrontierTargetCount, 0, 100_000_000);
@@ -308,7 +314,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const campaignFrontierDeferred = integer(collectionState?.campaignFrontierDeferredCount, 0, 100_000_000);
   const fanRefreshDelegated = result.fanRefreshDelegated === true || ["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"].includes(continuation.collectorVersion);
   const membershipCoverageStatus = clean(collectionState?.membershipCoverageStatus, 40) || "MISSING";
-  const fanValuesComplete = coverageMatches
+  const fanValuesComplete = canonicalCoveragePresent
     ? fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"
     : fanRefreshDelegated ? false : result.fanValuesComplete === true;
   let failedRefreshDemands = 0;
@@ -381,7 +387,11 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     fanValuesFailed,
     fanValuesOutstanding,
     fanValueFreshnessStatus,
-    fanValueFreshnessCutoffAt: coverageMatches ? iso(collectionState.fanValueFreshnessCutoffAt) : null,
+    fanValueFreshnessCutoffAt: canonicalCoveragePresent ? iso(collectionState.fanValueFreshnessCutoffAt) : null,
+    manualScanRunId: resultScanRunId,
+    currentCoverageScanRunId,
+    coverageMatchesManualGeneration: coverageMatches,
+    manualGenerationSuperseded,
     campaignFrontierFreshnessStatus,
     campaignFrontierDue,
     campaignFrontierTarget,

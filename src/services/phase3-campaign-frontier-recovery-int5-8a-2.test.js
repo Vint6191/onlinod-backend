@@ -55,8 +55,11 @@ test("INT5.8A-2 current planner no longer consumes canonical frontier as orderin
 
 test("INT5.8A-2 manual Campaign reader converges on server-owned freshness coverage with legacy result/continuation fallback", () => {
   const control = read("src/services/campaign-scan-control-service.js");
-  assert.match(control, /const coverageMatches = Boolean\(resultScanRunId && collectionState\?\.fanValueCoverageScanRunId === resultScanRunId\)/);
-  assert.match(control, /const fanValuesExpected = coverageMatches \? integer\(collectionState\.fanValueExpected[\s\S]*?: integer\(result\.fanValuesTotal \?\? continuation\.fanValuesDiscovered/);
-  assert.match(control, /const fanValuesComplete = coverageMatches[\s\S]*fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"[\s\S]*: fanRefreshDelegated \? false : result\.fanValuesComplete === true/);
+  assert.match(control, /const currentCoverageScanRunId = clean\(collectionState\?\.fanValueCoverageScanRunId, 120\)/);
+  assert.match(control, /const coverageMatches = Boolean\(resultScanRunId && currentCoverageScanRunId === resultScanRunId\)/);
+  assert.match(control, /const canonicalCoveragePresent = Boolean\(currentCoverageScanRunId\)/);
+  assert.match(control, /const manualGenerationSuperseded = Boolean\(resultScanRunId && currentCoverageScanRunId && resultScanRunId !== currentCoverageScanRunId\)/);
+  assert.match(control, /const fanValuesExpected = canonicalCoveragePresent \? integer\(collectionState\.fanValueExpected[\s\S]*?: integer\(result\.fanValuesTotal \?\? continuation\.fanValuesDiscovered/);
+  assert.match(control, /const fanValuesComplete = canonicalCoveragePresent[\s\S]*fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"[\s\S]*: fanRefreshDelegated \? false : result\.fanValuesComplete === true/);
   assert.match(control, /deriveCampaignPresentationStatus\(\{[\s\S]*collectorStatus[\s\S]*fanValuesComplete[\s\S]*\}\)/);
 });

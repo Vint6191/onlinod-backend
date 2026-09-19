@@ -1609,6 +1609,7 @@ async function projectFanObservationBatch(db, {
     const relationshipProjected = rows.reduce((count, row) => count + (row.relationship ? 1 : 0), 0);
     const valueProjected = rows.reduce((count, row) => count + (row.value ? 1 : 0), 0);
     const touchedFanIds = rows.map((row) => row.onlyFansUserId);
+    const valueFanIds = rows.filter((row) => row.value).map((row) => row.onlyFansUserId);
 
     // PostgreSQL production path: one bounded JSONB upsert set per canonical table,
     // independent of fan/field count. In-memory/unit adapters keep the semantic
@@ -1618,10 +1619,10 @@ async function projectFanObservationBatch(db, {
         agencyId: scopedAgencyId, creatorId: scopedCreatorId,
         sourceDeviceId: envelope.sourceDeviceId, sourceJobId: envelope.sourceJobId, sourceDeliveryId: envelope.sourceDeliveryId,
       });
-      if (valueProjected > 0 && touchedFanIds.length) {
+      if (valueFanIds.length) {
         const { reconcileCampaignFanRefreshDemandsFromCanonicalObservations } = require("./campaign-fan-refresh-queue-service");
         await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
-          db: tx, creatorId: scopedCreatorId, fanIds: touchedFanIds, now: envelope.receivedAt,
+          db: tx, creatorId: scopedCreatorId, fanIds: valueFanIds, now: envelope.receivedAt,
         });
       }
       return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
@@ -1644,10 +1645,10 @@ async function projectFanObservationBatch(db, {
       if (relationship) await projectFanRelationship(tx, { ...relationship, ...common });
       if (value) await projectFanValue(tx, { ...value, ...common });
     }
-    if (valueProjected > 0 && touchedFanIds.length && tx.creatorFanRefreshDemand?.findMany) {
+    if (valueFanIds.length && tx.creatorFanRefreshDemand?.findMany) {
       const { reconcileCampaignFanRefreshDemandsFromCanonicalObservations } = require("./campaign-fan-refresh-queue-service");
       await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
-        db: tx, creatorId: scopedCreatorId, fanIds: touchedFanIds, now: envelope.receivedAt,
+        db: tx, creatorId: scopedCreatorId, fanIds: valueFanIds, now: envelope.receivedAt,
       });
     }
     return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };

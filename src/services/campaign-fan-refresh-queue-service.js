@@ -315,10 +315,187 @@ async function transitionRecoveredWorkForDemand(db, { demand, outcome, observedA
   return { queued, failed, scanRunIds: [...byRun.keys()] };
 }
 
+async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBased({ db, creatorId, fanIds, now }) {
+  const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
+  const rows = await db.$queryRawUnsafe(`
+    WITH candidate AS (
+      SELECT d."id" AS "demandId",
+             d."requestedRevision",
+             d."creatorId",
+             d."onlyFansUserId",
+             v."fetchedAt" AS "observedAt",
+             CASE WHEN UPPER(COALESCE(v."availability", '')) = 'AVAILABLE' THEN 'SUCCEEDED' ELSE 'UNAVAILABLE' END AS "outcome"
+      FROM "CreatorFanRefreshDemand" d
+      JOIN "CreatorFan" f
+        ON f."creatorId" = d."creatorId" AND f."onlyFansUserId" = d."onlyFansUserId"
+      JOIN "CreatorFanValueCurrent" v
+        ON v."creatorId" = f."creatorId" AND v."fanId" = f."id"
+      WHERE d."creatorId" = $1
+        AND d."onlyFansUserId" = ANY($2::text[])
+        AND d."status" IN ('QUEUED', 'FAILED')
+        AND d."satisfiedRevision" < d."requestedRevision"
+        AND v."fetchedAt" >= d."requestedFreshnessCutoffAt"
+      FOR UPDATE OF d
+    ), demand_update AS (
+      UPDATE "CreatorFanRefreshDemand" d
+      SET "status" = CASE WHEN c."outcome" = 'SUCCEEDED' THEN 'COMPLETE' ELSE 'UNAVAILABLE' END,
+          "satisfiedRevision" = c."requestedRevision",
+          "activeRefreshJobId" = NULL,
+          "activeRefreshRevision" = NULL,
+          "lastObservedAt" = c."observedAt",
+          "lastOutcome" = c."outcome",
+          "lastCompletedAt" = $3,
+          "lastFailedAt" = NULL,
+          "retryAttempts" = 0,
+          "nextRetryAt" = NULL,
+          "lastRetryAt" = NULL,
+          "quarantinedAt" = NULL,
+          "lastError" = NULL,
+          "updatedAt" = $3
+      FROM candidate c
+      WHERE d."id" = c."demandId"
+      RETURNING d."id", c."outcome", c."observedAt"
+    ), work_before AS (
+      SELECT w."id", w."scanRunId", w."status" AS "oldStatus", du."outcome", du."observedAt"
+      FROM "CreatorCampaignFanRefreshWork" w
+      JOIN demand_update du ON du."id" = w."demandId"
+      WHERE w."status" IN ('QUEUED', 'FAILED')
+        AND du."observedAt" >= w."freshnessCutoffAt"
+      FOR UPDATE OF w
+    ), work_update AS (
+      UPDATE "CreatorCampaignFanRefreshWork" w
+      SET "status" = wb."outcome",
+          "outcome" = wb."outcome",
+          "observedAt" = wb."observedAt",
+          "completedAt" = $3,
+          "lastError" = NULL,
+          "updatedAt" = $3
+      FROM work_before wb
+      WHERE w."id" = wb."id"
+      RETURNING w."id", wb."scanRunId", wb."oldStatus", wb."outcome"
+    ), delta AS (
+      SELECT "scanRunId",
+             COUNT(*) FILTER (WHERE "oldStatus" = 'QUEUED')::int AS "queuedDone",
+             COUNT(*) FILTER (WHERE "oldStatus" = 'FAILED')::int AS "failedDone",
+             COUNT(*) FILTER (WHERE "outcome" = 'SUCCEEDED')::int AS "succeededDone",
+             COUNT(*) FILTER (WHERE "outcome" = 'UNAVAILABLE')::int AS "unavailableDone"
+      FROM work_update
+      GROUP BY "scanRunId"
+    ), coverage_guard AS (
+      SELECT d."scanRunId",
+             s."fanValueOutstanding" >= d."queuedDone" AS "outstandingSafe",
+             s."fanValueFailed" >= d."failedDone" AS "failedSafe"
+      FROM delta d
+      JOIN "CreatorCampaignCollectionState" s
+        ON s."creatorId" = $1 AND s."fanValueCoverageScanRunId" = d."scanRunId"
+    ), coverage_update AS (
+      UPDATE "CreatorCampaignCollectionState" s
+      SET "fanValueOutstanding" = GREATEST(0, s."fanValueOutstanding" - d."queuedDone"),
+          "fanValueFailed" = GREATEST(0, s."fanValueFailed" - d."failedDone"),
+          "fanValueSucceeded" = s."fanValueSucceeded" + d."succeededDone",
+          "fanValueUnavailable" = s."fanValueUnavailable" + d."unavailableDone",
+          "fanValueCoverageUpdatedAt" = $3,
+          "fanValueFreshnessStatus" = CASE
+            WHEN GREATEST(0, s."fanValueOutstanding" - d."queuedDone") > 0 THEN 'QUEUED'::"AnalyticsCoverageStatus"
+            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0 THEN 'PARTIAL'::"AnalyticsCoverageStatus"
+            ELSE 'COMPLETE'::"AnalyticsCoverageStatus"
+          END,
+          "status" = CASE
+            WHEN s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
+             AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+              THEN 'COMPLETE'::"AnalyticsCoverageStatus"
+            WHEN s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+              THEN 'PARTIAL'::"AnalyticsCoverageStatus"
+            ELSE s."status"
+          END,
+          "retryAfterAt" = CASE WHEN s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus" THEN NULL ELSE s."retryAfterAt" END,
+          "lastErrorCode" = CASE
+            WHEN s."membershipCoverageStatus" <> 'COMPLETE'::"AnalyticsCoverageStatus" THEN s."lastErrorCode"
+            WHEN GREATEST(0, s."fanValueOutstanding" - d."queuedDone") > 0 THEN 'CAMPAIGN_FAN_VALUE_REFRESH_PENDING'
+            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0 THEN 'CAMPAIGN_FAN_VALUE_REFRESH_PARTIAL'
+            ELSE NULL
+          END,
+          "lastErrorMessage" = CASE
+            WHEN s."membershipCoverageStatus" <> 'COMPLETE'::"AnalyticsCoverageStatus" THEN s."lastErrorMessage"
+            WHEN GREATEST(0, s."fanValueOutstanding" - d."queuedDone") > 0
+              THEN 'Campaign membership is complete; ' || GREATEST(0, s."fanValueOutstanding" - d."queuedDone")::text || ' FanData refreshes are still outstanding'
+            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0
+              THEN 'Campaign membership is complete; ' || GREATEST(0, s."fanValueFailed" - d."failedDone")::text || ' FanData refreshes failed'
+            ELSE NULL
+          END,
+          "lastCompleteScanRunId" = CASE
+            WHEN s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
+             AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+              THEN d."scanRunId"
+            ELSE s."lastCompleteScanRunId"
+          END,
+          "baselineVerifiedAt" = CASE
+            WHEN s."mode" = 'full'
+             AND s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
+             AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+              THEN $3 ELSE s."baselineVerifiedAt" END,
+          "baselineGeneration" = CASE
+            WHEN s."mode" = 'full'
+             AND s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
+             AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+              THEN s."activeGeneration" ELSE s."baselineGeneration" END,
+          "lastCatchupCompletedAt" = CASE
+            WHEN s."mode" = 'catchup'
+             AND s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
+             AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+              THEN $3 ELSE s."lastCatchupCompletedAt" END,
+          "lastCatchupGeneration" = CASE
+            WHEN s."mode" = 'catchup'
+             AND s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
+             AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+              THEN s."activeGeneration" ELSE s."lastCatchupGeneration" END,
+          "updatedAt" = $3
+      FROM delta d
+      WHERE s."creatorId" = $1
+        AND s."fanValueCoverageScanRunId" = d."scanRunId"
+        AND s."fanValueOutstanding" >= d."queuedDone"
+        AND s."fanValueFailed" >= d."failedDone"
+      RETURNING d."scanRunId"
+    )
+    SELECT
+      (SELECT COUNT(*)::int FROM demand_update) AS "healed",
+      (SELECT COUNT(*)::int FROM work_update) AS "workTransitioned",
+      (SELECT COUNT(*)::int FROM coverage_update) AS "coverageRunsUpdated",
+      (SELECT COUNT(*)::int FROM coverage_guard WHERE NOT "outstandingSafe" OR NOT "failedSafe") AS "coverageTransitionLost"
+  `, creatorId, fanIds, effectiveNow);
+  const result = Array.isArray(rows) && rows[0] ? rows[0] : {};
+  const lost = Math.max(0, Number(result.coverageTransitionLost || 0));
+  if (lost > 0) throw new Error("CAMPAIGN_FAN_REFRESH_RECOVERY_COVERAGE_TRANSITION_LOST");
+  const healed = Math.max(0, Number(result.healed || 0));
+  return {
+    healed,
+    workTransitioned: Math.max(0, Number(result.workTransitioned || 0)),
+    coverageRunsUpdated: Math.max(0, Number(result.coverageRunsUpdated || 0)),
+    reason: healed ? "canonical_observation_healed" : "no_fresh_observation",
+    topology: "set_based_v1",
+  };
+}
+
 async function reconcileCampaignFanRefreshDemandsFromCanonicalObservations({ db, creatorId, fanIds = [], now = null } = {}) {
   const scopedCreatorId = clean(creatorId, 180);
   const ids = [...new Set((Array.isArray(fanIds) ? fanIds : []).map((value) => clean(value, 180)).filter(Boolean))].sort();
-  if (!db?.creatorFanRefreshDemand?.findMany || !db?.creatorFan?.findMany || !scopedCreatorId || !ids.length) return { healed: 0, reason: "nothing_to_reconcile" };
+  if (!scopedCreatorId || !ids.length) return { healed: 0, reason: "nothing_to_reconcile" };
+  if (typeof db?.$queryRawUnsafe === "function") {
+    return reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBased({ db, creatorId: scopedCreatorId, fanIds: ids, now });
+  }
+  if (!db?.creatorFanRefreshDemand?.findMany || !db?.creatorFan?.findMany) return { healed: 0, reason: "adapter_unsupported" };
   await lockDemandRowsByFanIds(db, scopedCreatorId, ids);
   const demands = await db.creatorFanRefreshDemand.findMany({
     where: {
@@ -364,7 +541,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservations({ db,
     await transitionRecoveredWorkForDemand(db, { demand, outcome, observedAt, now: effectiveNow });
     healed += 1;
   }
-  return { healed, reason: healed ? "canonical_observation_healed" : "no_fresh_observation" };
+  return { healed, reason: healed ? "canonical_observation_healed" : "no_fresh_observation", topology: "adapter_fallback" };
 }
 
 async function requeueFailedWorkForDemand(db, { demand, now }) {

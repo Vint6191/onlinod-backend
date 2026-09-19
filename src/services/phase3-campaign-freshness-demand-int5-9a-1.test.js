@@ -225,7 +225,7 @@ test("INT5.9A-1 source removes fake delegated completion and makes Campaign/over
   assert.match(queue, /activeRefreshJobId[\s\S]*FOR UPDATE/);
   assert.match(queue, /creatorFanRefreshDemand\.createMany/);
   assert.doesNotMatch(queue, /P2002/);
-  assert.match(control, /const fanValuesComplete = coverageMatches[\s\S]*fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"[\s\S]*: fanRefreshDelegated \? false/);
+  assert.match(control, /const fanValuesComplete = canonicalCoveragePresent[\s\S]*fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"[\s\S]*: fanRefreshDelegated \? false/);
   assert.match(control, /collectorStatus[\s\S]*coverageStatus[\s\S]*refreshPending/);
   assert.match(migration, /CAMPAIGN_FRESHNESS_COVERAGE_REBUILD_REQUIRED/);
   assert.doesNotMatch(migration, /Backfill coverage for the currently tracked run only/);
